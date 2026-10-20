@@ -93,7 +93,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 
 from tradepartner.backtest.costs import Commissions, buy_notional_after_costs
-from tradepartner.backtest.engine import Plan
+from tradepartner.backtest.engine import NO_T0_BAR, Plan
 from tradepartner.backtest.portfolio import (
     apply_rebalance_band,
     hold_membership,
@@ -399,7 +399,9 @@ def remainder(
     - any other sell: the latest order's submitted quantity minus its filled
       quantity, adjusted by the splits with ex-date in (the order's session, S]
       (a notional order: its notional minus its filled value);
-    - a buy: its `target_notional` minus the filled value over all its orders.
+    - a buy: its `target_notional` minus the filled value over all its orders;
+    - a whole cover (a `buy` + `short` with no `target_notional`, item 14 (d)):
+      the quantity branch of a long full exit.
 
     Before any order it is the plan: the buy's target, or the sell's planned
     notional or split-adjusted planned quantity. `order_events` are not read (a
@@ -410,7 +412,8 @@ def remainder(
     _check_session(session)
     price = _price(price_of, decision.security_id)
     mine = _orders_of(decision, orders)
-    if decision.side == _BUY:
+    cover = decision.side == _BUY and decision.position_side == SHORT
+    if decision.side == _BUY and not (cover and decision.target_notional is None):
         if decision.target_notional is None:
             raise ValueError(f"buy decision {decision.decision_id} has no target_notional")
         target = _finite(
@@ -419,10 +422,10 @@ def remainder(
         spent = sum(_filled(order, fills)[1] for order in mine)
         notional = _clamp(target - spent, target)
         return Remainder(quantity=notional / price, notional=notional)
-    if decision.side != _SELL:
+    if decision.side not in (_SELL, _BUY):
         raise ValueError(f"decision {decision.decision_id} has side {decision.side!r}")
     what = f"decision {decision.decision_id}"
-    if decision.planned_notional is not None:
+    if decision.planned_notional is not None and not cover:
         planned = _finite(decision.planned_notional, f"{what} notional", non_negative=True)
         sold = sum(_filled(order, fills)[1] for order in mine)
         notional = _clamp(planned - sold, planned)
@@ -1054,7 +1057,12 @@ def _signals(plan: Plan) -> tuple[Signal, ...]:
                 raise ValueError(f"{sid} is excluded for both {reason_of[sid]!r} and {reason!r}")
             reason_of[sid] = reason
     excluded = set(reason_of)
-    if set(plan.scores) | excluded != members or set(plan.scores) & excluded:
+    # Candidates with no T_0 bar are not universe members (the universe's rule 6 dropped
+    # them); they are recorded beside the members (#1997), never inside n_universe.
+    outside = set(plan.exclusions.get(NO_T0_BAR, ()))
+    if outside & members:
+        raise ValueError(f"{sorted(outside & members)} are members and excluded as {NO_T0_BAR}")
+    if set(plan.scores) | (excluded - outside) != members or set(plan.scores) & excluded:
         raise ValueError("the plan's scores and exclusions do not partition its members")
     if not set(plan.targets) <= set(plan.scores):
         raise ValueError("the plan has targets that are not scored members")

@@ -94,6 +94,24 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # A post-registration key: frozen at `false` when absent, never from live
     # Settings, and outside the promotion identity.
     ("adjust.apply_spin_offs", False, 31),
+    # T238: the `momentum` buy/hold buffer (backtest spec amendment #657). 0.0 is no
+    # buffer, so no stored canonical set or fingerprint moves; a post-registration own key.
+    ("strategy.hold_top_fraction", 0.0, 34),
+    # T219: the signed-book section (backtest spec amendment #1872, item 1). A section
+    # listed by no family, so each key is left out of the canonical set and the
+    # fingerprint at its default and no stored registration moves; every key is in
+    # `POST_REGISTRATION_PORTFOLIO_KEYS` below.
+    ("portfolio.side", "long_only", 34),
+    ("portfolio.gross_exposure", 1.0, 34),
+    ("portfolio.net_exposure", 1.0, 34),
+    ("portfolio.short_min_price", 5.0, 34),
+    ("portfolio.short_cover_weight", 0.10, 34),
+    # T221: the declared borrow fee and its sensitivity rates (backtest spec amendment
+    # #1872, item 6). Post-registration cost keys: not required of a file, frozen at these
+    # defaults when absent, never from live Settings, outside the promotion identity. At
+    # 0.0 and [] no stored canonical set or fingerprint moves.
+    ("costs.borrow_bps_per_year", 0.0, 34),
+    ("costs.borrow_sensitivity_bps", [], 34),
 )
 
 #: Keys added to a family's own listed section **after** that family's first
@@ -113,6 +131,7 @@ POST_REGISTRATION_OWN_KEYS: Final[frozenset[str]] = frozenset(
         "strategy.signal_delay_sessions",
         "strategy.placebo",
         "strategy.placebo_seed",
+        "strategy.hold_top_fraction",
     }
 )
 
@@ -125,12 +144,30 @@ POST_REGISTRATION_COST_KEYS: Final[frozenset[str]] = frozenset(
         "costs.spread_bps",
         "costs.impact_coeff",
         "costs.adv_sessions",
+        "costs.borrow_bps_per_year",
+        "costs.borrow_sensitivity_bps",
     }
 )
 
 #: T211c: the opt-in `adjust.apply_spin_offs` (backtest spec amendment #1894). A
 #: post-registration key like `POST_REGISTRATION_COST_KEYS`, not in its own section.
 POST_REGISTRATION_ADJUST_KEYS: Final[frozenset[str]] = frozenset({"adjust.apply_spin_offs"})
+
+#: T219: the five `portfolio.*` keys (backtest spec amendment #1872, item 1). A
+#: post-registration set beside `POST_REGISTRATION_COST_KEYS`, for a section listed by no
+#: family: not required of a file or a sweep's fixed block, frozen at their table default
+#: when absent, never from live `Settings`. Disjoint from the other post-registration sets
+#: and from `LAB_BASELINE_FROZEN_KEYS`. Pinned by value in
+#: `tests/backtest/test_frozen_defaults.py`.
+POST_REGISTRATION_PORTFOLIO_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "portfolio.side",
+        "portfolio.gross_exposure",
+        "portfolio.net_exposure",
+        "portfolio.short_min_price",
+        "portfolio.short_cover_weight",
+    }
+)
 
 #: `costs.*` keys a ruled family's file may set higher than its rules' value (a cost
 #: assumption may only get harsher), as `costs.per_side_bps` may; `adv_sessions` is not
@@ -140,6 +177,7 @@ HIGHER_ALLOWED_COST_KEYS: Final[frozenset[str]] = frozenset(
         "costs.per_side_bps",
         "costs.spread_bps",
         "costs.impact_coeff",
+        "costs.borrow_bps_per_year",
     }
 )
 
@@ -205,15 +243,25 @@ LAB_BASELINE_FROZEN_KEYS: Final[frozenset[str]] = frozenset(
 FAMILY_SIGNAL_SECTIONS: Final[dict[HypothesisFamily, str]] = dict(_CONFIG_FAMILY_SIGNAL_SECTIONS)
 
 #: Single keys the fingerprint reads besides the sections below (spec "Fingerprint").
+#: The `portfolio.*` keys (T219, spec amendment #1872) are here under the #1792 rules: a
+#: long/short variant is a new hypothesis identity, so a non-default value must move the
+#: fingerprint while a long-only book (every key at its default) leaves it unchanged.
 _FINGERPRINT_KEYS: Final = (
     "execution.fill_price",
     "costs.per_side_bps",
     "costs.spread_bps",
     "costs.impact_coeff",
     "costs.adv_sessions",
+    "costs.borrow_bps_per_year",
+    "costs.borrow_sensitivity_bps",
     "holdout.start",
     "holdout.end",
     "adjust.apply_spin_offs",
+    "portfolio.side",
+    "portfolio.gross_exposure",
+    "portfolio.net_exposure",
+    "portfolio.short_min_price",
+    "portfolio.short_cover_weight",
 )
 _FINGERPRINT_SECTIONS: Final = ("schedule", "universe")
 

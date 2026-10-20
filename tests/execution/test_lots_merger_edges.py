@@ -20,10 +20,13 @@ from .test_lots_adjustments import (
 
 
 def test_a_stock_merger_keeps_the_targets_wash_sale() -> None:
-    """Hand values: 03-03 buy 10 SEC_T @ 30; 03-04 sell 5 @ 20 (loss 50); 03-05
-    buy 5 @ 20 (a replacement inside the window); 03-07 the merger re-keys the
-    open lots to SEC_A. The loss is still flagged against the repurchase lot (its quantity is in the
-    acquirer's units after the merger; unit normalisation is #1980)."""
+    """Hand values: 03-03 buy 10 SEC_T @ 30; 03-04 sell 5 @ 20 (loss 50, closing
+    5 of the lot); 03-05 buy 5 @ 20 (a replacement inside the window); 03-07 the
+    merger re-keys the lots to SEC_A at 0.5 (10 target -> 5 acquirer). The
+    target's two lots are 2.5 acquirer shares each, and the sale's 5 shares are
+    2.5 acquirer shares; the partly sold lot's unsold rest (2.5) is the first
+    replacement in acquisition order under the literal rule, so it absorbs the
+    whole loss before the 03-05 repurchase is reached (#1980)."""
     book = Book()
     book.trade("buy", 10, 30.0, D0303, security_id="SEC_T")
     book.trade("sell", 5, 20.0, D0304, security_id="SEC_T")
@@ -33,7 +36,7 @@ def test_a_stock_merger_keeps_the_targets_wash_sale() -> None:
     _, disposals, flags = book.run(D0312)
 
     assert [(d.realised_pnl, d.quantity) for d in disposals] == [(-50.0, 5.0)]
-    assert [(f.disposal_id, f.replacement_lot_id) for f in flags] == [(1, 2)]
+    assert [(f.disposal_id, f.replacement_lot_id) for f in flags] == [(1, 1)]
 
 
 def test_a_second_receipt_of_one_merger_raises() -> None:

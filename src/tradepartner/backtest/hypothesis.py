@@ -141,6 +141,9 @@ FROZEN_SECTIONS: Final = (
     "gap",
     "holdout",
     "metrics",
+    # T219 (backtest spec amendment #1872, item 1): a section listed by no family, so a
+    # file may name its keys but each is left out of the canonical set at its default.
+    "portfolio",
 )
 #: Single frozen keys outside those sections.
 FROZEN_SINGLE_KEYS: Final = ("execution.fill_price", "benchmarks", "alpaca.historical_feed")
@@ -208,27 +211,91 @@ def required_keys(family: str) -> frozenset[str]:
     """The config keys a `family` hypothesis file must name (besides `in_sample_start`):
     every key of its listed sections (`FAMILIES[family].sections`) not in
     `frozen.POST_REGISTRATION_OWN_KEYS`, plus every `costs.*` key not in
-    `frozen.POST_REGISTRATION_COST_KEYS` (those are frozen at their table default when
-    absent, never required). Raises `KeyError` for an unlisted family (ADR 0014 point 2:
-    the momentum fallback goes)."""
+    `frozen.POST_REGISTRATION_COST_KEYS` and every `portfolio.*` key not in
+    `frozen.POST_REGISTRATION_PORTFOLIO_KEYS` (all those are frozen at their table default
+    when absent, never required). Raises `KeyError` for an unlisted family (ADR 0014
+    point 2: the momentum fallback goes)."""
     keys = set(REQUIRED_SINGLE_KEYS)
-    for section in (*FAMILIES[family].sections, "costs"):  # type: ignore[index]
+    for section in (*FAMILIES[family].sections, "costs", "portfolio"):  # type: ignore[index]
         keys.update(_section_keys(section))
-    return frozenset(keys - frozen.POST_REGISTRATION_OWN_KEYS - frozen.POST_REGISTRATION_COST_KEYS)
+    return frozenset(
+        keys
+        - frozen.POST_REGISTRATION_OWN_KEYS
+        - frozen.POST_REGISTRATION_COST_KEYS
+        - frozen.POST_REGISTRATION_PORTFOLIO_KEYS
+    )
 
 
 #: Keys that are one family's rule although other families list their section
 #: (backtest spec amendment #1358, item 1): `oracle` and `combined` read `strategy.*`,
 #: but B10's turnover screen is `momentum`'s alone, so any other family's frozen value
 #: must be the table default (1.0, no screen).
-FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {"strategy.turnover_top_fraction": "momentum"}
+FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {
+    "strategy.turnover_top_fraction": "momentum",
+    "strategy.hold_top_fraction": "momentum",
+}
 
 
 #: Frozen keys a registration may store but no signal applies yet: `load_frozen` refuses
 #: a value other than the table default, so no run or paper plan records results under a
 #: label its signal ignores. `strategy.turnover_top_fraction` left it at T165c (#1358);
-#: `adjust.apply_spin_offs` (T211c, spec amendment #1894) enters until T211e applies it.
-NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset({"adjust.apply_spin_offs"})
+#: `adjust.apply_spin_offs` entered at T211c and left at T211e (#1894);
+#: `strategy.hold_top_fraction` (T238, spec amendment #657) until T239 applies it.
+NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset({"strategy.hold_top_fraction"})
+
+
+#: The borrow-rate grid a `long_short` file must cover (spec amendment #1872, item 6):
+#: the 0 bp reference, the 30 bp easy-to-borrow line and the 300 bp hard-to-borrow stress.
+BORROW_GRID_BPS: Final = (0.0, 30.0, 300.0)
+
+
+def long_short_refusal(params: Mapping[str, Any]) -> str | None:
+    """Why a `long_short` file's frozen values `params` may not be registered, or None
+    (backtest spec amendment #1872, items 1 and 6; T221). The message starts with the
+    refusal's name, `refused_portfolio` or `refused_borrow_rate`. A `long_only` set (the
+    default, or a key absent) takes no branch here.
+
+    `refused_portfolio`: the family's weighting is `hold`, `strategy.rebalance_band` is
+    non-zero, or `strategy.hold_top_fraction` is not its default (none is specified for
+    a signed book). `refused_borrow_rate`: the headline `costs.borrow_bps_per_year` is
+    not above 0, or {0, 30, 300} is not inside the headline and
+    `costs.borrow_sensitivity_bps` together."""
+    if params.get("portfolio.side", "long_only") != "long_short":
+        return None
+    defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    if params.get("strategy.weighting", "equal") == "hold":
+        return (
+            "refused_portfolio: portfolio.side is 'long_short' with strategy.weighting "
+            "'hold'; a hold book is not specified for a signed book"
+        )
+    band = params.get("strategy.rebalance_band", 0.0)
+    if not frozen.is_default(band, defaults["strategy.rebalance_band"]):
+        return (
+            f"refused_portfolio: portfolio.side is 'long_short' with strategy.rebalance_band "
+            f"{band!r}; a no-trade band is not specified for a signed book"
+        )
+    buffer = params.get("strategy.hold_top_fraction", 0.0)
+    if not frozen.is_default(buffer, defaults["strategy.hold_top_fraction"]):
+        return (
+            f"refused_portfolio: portfolio.side is 'long_short' with "
+            f"strategy.hold_top_fraction {buffer!r}; a buffered signed book is not specified"
+        )
+    headline = params.get("costs.borrow_bps_per_year", 0.0)
+    sensitivity = params.get("costs.borrow_sensitivity_bps", [])
+    if not (isinstance(headline, int | float) and not isinstance(headline, bool) and headline > 0):
+        return (
+            f"refused_borrow_rate: costs.borrow_bps_per_year is {headline!r}; a long_short "
+            "file declares a headline borrow fee above 0 bp (0 bp is a reference line only)"
+        )
+    covered = {float(headline), *(float(v) for v in sensitivity)}
+    missing = [bps for bps in BORROW_GRID_BPS if bps not in covered]
+    if missing:
+        return (
+            f"refused_borrow_rate: the headline {headline!r} and costs.borrow_sensitivity_bps "
+            f"{list(sensitivity)!r} do not cover {[int(b) for b in missing]} bp of the "
+            "0 / 30 / 300 bp grid"
+        )
+    return None
 
 
 def family_only_refusal(family: str, params: Mapping[str, Any]) -> str | None:
@@ -409,6 +476,7 @@ def frozen_params(parsed: HypothesisFile, settings: Settings) -> dict[str, Any]:
             frozen.POST_REGISTRATION_OWN_KEYS
             | frozen.POST_REGISTRATION_COST_KEYS
             | frozen.POST_REGISTRATION_ADJUST_KEYS
+            | frozen.POST_REGISTRATION_PORTFOLIO_KEYS
         )
         if key not in parsed.file_params and key.partition(".")[0] not in inert
     }
@@ -706,6 +774,9 @@ def register(
     settings = settings if settings is not None else get_settings()
     parsed = parse_file(path)
     params = frozen_params(parsed, settings)
+    refusal = long_short_refusal(params)
+    if refusal is not None:
+        raise HypothesisFileError(f"{path}: {refusal}")
     canonical = frozen.canonical_frozen_set(params, parsed.family)
     fingerprint = frozen.fingerprint(parsed.family, params, parsed.in_sample_start)
     if parsed.family not in settings.hypotheses.families:

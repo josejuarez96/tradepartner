@@ -45,6 +45,7 @@ from tradepartner.execution.window import (
     WindowCommandRefused,
     settle_order,
 )
+from tradepartner.store import registry
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.journal import OrderEventRow, append
 
@@ -289,8 +290,12 @@ def lagging_window(env: Env, tmp_path: Path, *, hold: bool) -> tuple[str, str]:
         frozen["risk.max_rejections_per_run"] = 0
         frozen["risk.max_fill_lag_sessions"] = 2
         conn.execute(
-            "UPDATE paper_windows SET frozen_json = ? WHERE window_id = ?",
-            [json.dumps(frozen, sort_keys=True), env.window.window_id],  # type: ignore[union-attr]
+            "UPDATE paper_windows SET frozen_json = ?, frozen_sha256 = ? WHERE window_id = ?",
+            [
+                json.dumps(frozen, sort_keys=True),
+                registry.params_sha256(frozen),
+                env.window.window_id,  # type: ignore[union-attr]
+            ],
         )
     assert FROZEN.max_fill_lag_sessions == 1  # the test overrides it to 2 above
     spft, trns = buy_id(env, F_0, "SEC_SPLIT_FUTURE"), buy_id(env, F_0, "SEC_TRANSFER")

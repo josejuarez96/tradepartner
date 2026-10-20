@@ -34,23 +34,26 @@ journal. Nothing here reads a clock or the store.
 - **Wash-sale scan.** Each loss disposal, in disposal order (R13), is matched
   to acquisitions of the same `security_id` in any account of the ledger whose
   local trade date is at most `WASH_SALE_WINDOW_DAYS` from its own, before or
-  after (R1), in acquisition order (R11). A replacement share absorbs at most
-  one loss (R13), and shares closed by the same sale are never its own
-  replacement. Taken literally (an owner question on #308), the unsold rest
-of a lot, or another fill of the same order, bought inside the window does
-count as a replacement. Each disposal is scanned on its own, so a loss and a gain closed
-  the same day are flagged and reported apart, never netted (R14); a December
-  sale is matched to a January purchase like any other (R15). Each match is a
-  `WashSaleFlag` with the replacement lot, the matched quantity and the
-  disallowed amount (the loss per share times that quantity). Because
-  `rebuild` runs over every fill, a later acquisition re-scans every earlier
-  loss.
+  after (R1), in acquisition order (R11). The disposal's sale and the shares it
+  closed are scaled to today's share units - the units a replacement lot
+  reports - before matching (#1980), so a split or a stock merger between them
+  never matches in mixed units; `matched_quantity` is therefore in those units.
+  A replacement share absorbs at most one loss (R13), and shares closed by the
+  same sale are never its own replacement. Taken literally (an owner question
+  on #308), the unsold rest of a lot, or another fill of the same order, bought
+  inside the window does count as a replacement. Each disposal is scanned on
+  its own, so a loss and a gain closed the same day are flagged and reported
+  apart, never netted (R14); a December sale is matched to a January purchase
+  like any other (R15). Each match is a `WashSaleFlag` with the replacement
+  lot, the matched quantity and the disallowed amount (the loss per share times
+  that quantity). Because `rebuild` runs over every fill, a later acquisition
+  re-scans every earlier loss.
 
 - **Adjustments (#516, spec req 13; long lots only).** `rebuild` also takes the
   window's journaled `adjustments`, the `live_actions_as_of(close(S-1))` frame
   (its `split` rows) and the session S (`through`). Within a session the order
   is split, `cash_in_lieu`, fills, other adjustments (the positions ledger's).
-  A **split** scales every open lot's quantity and keeps its basis and date;
+  A **split** scales every lot's quantity and keeps its basis and date;
   **cash in lieu** rounds the name's exact holding down to whole shares and
   disposes of the fraction FIFO at the journaled cash; **`corporate_action_cash`**
   closes the name's lots FIFO as one sale at its cash; a **spin-off receipt**
@@ -98,6 +101,7 @@ WASH_SALE_WINDOW_DAYS = 30
 
 _EXCHANGE_TZ = ZoneInfo("America/New_York")
 _ZERO = Fraction(0)
+_ONE = Fraction(1)
 
 # Event ranks within one session, the positions ledger's own order.
 _RANK_SPLIT = 0
@@ -175,7 +179,10 @@ class Disposal:
 @dataclass(frozen=True)
 class WashSaleFlag:
     """One replacement lot matched to one loss disposal, the
-    `wash_sale_flags` row without `scanned_at` and its journal timestamps."""
+    `wash_sale_flags` row without `scanned_at` and its journal timestamps.
+    `matched_quantity` is in today's share units (the replacement lot's), so a
+    split or stock merger between the sale and the lot never leaves it mixed
+    (#1980)."""
 
     flag_id: int
     disposal_id: int
@@ -209,6 +216,11 @@ class _OpenLot:
 
     lot_id: int
     security_id: str
+    #: The security whose share units `quantity`/`acquired` are in. A merger
+    #: re-keys it to the acquirer for every lot, even one already fully sold,
+    #: while `security_id`/`symbol`/`cusip` keep the target's on a sold lot so
+    #: its own sale still reconciles (#1980).
+    unit_security: str
     symbol: str
     cusip: str | None
     trade_at: datetime
@@ -218,6 +230,10 @@ class _OpenLot:
     book_id: str
     position_side: str
     acquired: Fraction
+    #: What the `Lot` row reports as its quantity: `acquired`, except that a
+    #: merger leaves a lot sold before it in its own security's units, so the
+    #: row never mixes the target's symbol with the acquirer's count (#1980).
+    reported_quantity: Fraction
     reported_basis: Fraction
     quantity: Fraction
     basis: Fraction
@@ -235,7 +251,7 @@ class _OpenLot:
             cusip=self.cusip,
             trade_at=self.trade_at,
             trade_date_local=self.trade_date_local,
-            quantity=float(self.acquired),
+            quantity=float(self.reported_quantity),
             cost_basis=float(self.reported_basis),
             fill_id=self.fill_id,
             client_order_id=self.client_order_id,
@@ -260,6 +276,11 @@ class _Ledger:
         self.disposals: list[Disposal] = []
         self.disposal_security: dict[int, str] = {}
         self.same_sale: dict[int, dict[int, Fraction]] = {}
+        #: Each disposal's factor from its sale's share units to today's (a
+        #: split or a merger after it scales it; #1980).
+        self.disposal_units: dict[int, Fraction] = {}
+        #: Its security today, so a merger re-keys it with the lots it made.
+        self.disposals_by_security: dict[str, list[int]] = {}
         self.longs: dict[str, list[_OpenLot]] = {}
         self.shorts: dict[str, list[_OpenLot]] = {}
         self.no_replacement: set[int] = set()  # lots no purchase made (never a replacement)
@@ -283,6 +304,7 @@ class _Ledger:
         lot = _OpenLot(
             lot_id=len(self.lots) + 1,
             security_id=security_id,
+            unit_security=security_id,
             symbol=symbol,
             cusip=None if asset is None else asset.cusip,
             trade_at=trade_at,
@@ -292,6 +314,7 @@ class _Ledger:
             book_id=book_id,
             position_side=position_side,
             acquired=quantity,
+            reported_quantity=quantity,
             reported_basis=basis,
             quantity=quantity,
             basis=basis,
@@ -337,6 +360,8 @@ class _Ledger:
             self.disposals.append(disposal)
             self.disposal_security[disposal.disposal_id] = held.security_id
             self.same_sale[disposal.disposal_id] = this_sale
+            self.disposal_units[disposal.disposal_id] = _ONE
+            self.disposals_by_security.setdefault(held.security_id, []).append(disposal.disposal_id)
 
     def refuse_short(self, security_id: str, what: str) -> None:
         if self.shorts.get(security_id):
@@ -394,9 +419,30 @@ class _Ledger:
 
     def split(self, security_id: str, ratio: Fraction) -> None:
         self.refuse_short(security_id, "split")
-        for lot in self.longs.get(security_id, []):
-            lot.quantity *= ratio
-            lot.acquired *= ratio
+        for lot in self.lots:
+            if lot.unit_security == security_id and lot.position_side == LONG:
+                lot.quantity *= ratio
+                lot.acquired *= ratio
+                if lot.security_id == security_id:
+                    lot.reported_quantity *= ratio
+        self._rescale_disposals(security_id, ratio)
+
+    def _rescale_disposals(self, security_id: str, ratio: Fraction) -> None:
+        """A split scales every lot's quantity but leaves a disposal's recorded
+        sale in its own units (#1980); record the factor so the wash-sale scan
+        can read the disposal, and the shares it closed, in today's units."""
+        for disposal_id in self.disposals_by_security.get(security_id, []):
+            self.disposal_units[disposal_id] *= ratio
+
+    def _rekey_disposals(self, target: str, acquirer: str, ratio: Fraction) -> None:
+        """A merger re-keys the target's lots to the acquirer at `ratio`; its
+        disposals move with them, into the acquirer's units and under every
+        later acquirer split (#1980)."""
+        moved = self.disposals_by_security.pop(target, [])
+        for disposal_id in moved:
+            self.disposal_units[disposal_id] *= ratio
+        if moved:
+            self.disposals_by_security.setdefault(acquirer, []).extend(moved)
 
     # -- adjustments -------------------------------------------------------------
 
@@ -440,9 +486,12 @@ class _Ledger:
         )
 
     def merge(self, removal: AdjustmentRow, receipt: AdjustmentRow) -> None:
-        """A stock merger (spec amendment #1762 item 5): the target's open lots
+        """A stock merger (spec amendment #1762 item 5): the target's lots
         become acquirer lots at the ratio of the two quantities, basis and
-        acquisition instant carried, with no disposal."""
+        acquisition instant carried, with no disposal. Every lot still open
+        becomes an acquirer lot; a lot already fully sold keeps the target's
+        symbol and CUSIP so its own sale still reconciles, but moves into the
+        acquirer's share units so a later acquirer split scales it (#1980)."""
         target, acquirer = _security(removal), _security(receipt)
         self.refuse_short(target, removal.kind)
         self.refuse_short(acquirer, receipt.kind)
@@ -463,12 +512,18 @@ class _Ledger:
         ratio = _exact(receipt.quantity) / removed
         symbol = self.symbol_of(acquirer)
         asset = self.assets.get(symbol)
-        for lot in held:
-            lot.security_id, lot.symbol = acquirer, symbol
-            lot.identities.add(acquirer)
-            lot.cusip = None if asset is None else asset.cusip
+        for lot in self.lots:
+            if lot.unit_security != target or lot.position_side != LONG:
+                continue
+            lot.unit_security = acquirer
             lot.quantity *= ratio
             lot.acquired *= ratio
+        for lot in held:
+            lot.security_id, lot.symbol = acquirer, symbol
+            lot.cusip = None if asset is None else asset.cusip
+            lot.reported_quantity *= ratio
+            lot.identities.add(acquirer)
+        self._rekey_disposals(target, acquirer, ratio)
         merged = self.longs.setdefault(acquirer, [])
         merged.extend(held)
         merged.sort(key=lambda lot: (lot.trade_at, lot.lot_id))
@@ -653,6 +708,8 @@ def rebuild(
             state.disposal_security,
             state.no_replacement,
             {lot.lot_id: lot.identities for lot in state.lots},
+            state.disposal_units,
+            {lot.lot_id: lot.acquired for lot in state.lots},
         ),
     )
 
@@ -852,10 +909,17 @@ def _wash_sale_flags(
     disposal_security: Mapping[int, str],
     no_replacement: set[int],
     identities: Mapping[int, set[str]],
+    disposal_units: Mapping[int, Fraction],
+    lot_acquired: Mapping[int, Fraction],
 ) -> list[WashSaleFlag]:
     """Match each loss disposal, in disposal order, to replacement shares in
     acquisition order; each share absorbs one loss (module docstring). A lot no
-    purchase made (a spin-off child, a carried residue) is never a replacement."""
+    purchase made (a spin-off child, a carried residue) is never a replacement.
+    A disposal's sale and the shares it closed are scaled to today's share units
+    first (#1980), so a split or merger in between never matches more, or
+    fewer, shares than the loss covers. `lot_acquired` is each lot's exact
+    `acquired`, never the rounded float a `Lot` reports, so a reverse split's
+    non-terminating ratio cannot leave a float remainder (#1980)."""
     by_acquisition = sorted(
         (lot for lot in lot_list if lot.position_side == LONG and lot.lot_id not in no_replacement),
         key=lambda lot: (lot.trade_at, lot.lot_id),
@@ -868,7 +932,8 @@ def _wash_sale_flags(
             continue
         security = disposal_security[disposal.disposal_id]
         sold_here = same_sale[disposal.disposal_id]
-        quantity = _dec(disposal.quantity)
+        scale = disposal_units[disposal.disposal_id]
+        quantity = sold_here[disposal.lot_id] * scale
         unmatched = quantity
         for lot in by_acquisition:
             if unmatched == _ZERO:
@@ -877,9 +942,9 @@ def _wash_sale_flags(
             if security not in identities[lot.lot_id] or days_apart > WASH_SALE_WINDOW_DAYS:
                 continue
             available = (
-                _dec(lot.quantity)
+                lot_acquired[lot.lot_id]
                 - absorbed.get(lot.lot_id, _ZERO)
-                - sold_here.get(lot.lot_id, _ZERO)
+                - sold_here.get(lot.lot_id, _ZERO) * scale
             )
             matched = min(unmatched, available)
             if matched <= _ZERO:

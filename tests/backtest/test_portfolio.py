@@ -9,8 +9,10 @@ import pytest
 from tradepartner.backtest.portfolio import (
     _selected_count,
     apply_rebalance_band,
+    buffered_targets,
     drifted_weights,
     hold_membership,
+    signed_target_weights,
     target_weights,
     trades_from,
 )
@@ -247,3 +249,230 @@ def test_hold_target_names_zero_means_the_top_fraction_count() -> None:
 def test_hold_membership_refuses_bad_inputs(hold_sessions: int, session: int) -> None:
     with pytest.raises(ValueError):
         hold_membership(("X",), {}, session, hold_sessions, 1, 1.0)
+
+
+# --- the buy/hold buffer's retention rule (backtest spec amendment #657, item 2) ---------
+
+
+def _ranked(order: str) -> dict[str, float]:
+    """Scores that rank `order`'s letters first to last (the first scores highest)."""
+    return {name: float(len(order) - i) for i, name in enumerate(order)}
+
+
+def test_buffered_targets_first_plan_is_the_unbuffered_top() -> None:
+    """Ten names A to J, top 0.2 and hold 0.4, P = empty: the top 2, 1/2 each."""
+    targets, n_retained = buffered_targets(_ranked("ABCDEFGHIJ"), set(), 0.2, 0.4)
+    assert targets == {"A": 0.5, "B": 0.5}
+    assert n_retained == 0
+
+
+def test_buffered_targets_keeps_between_top_and_hold_and_sells_below_hold() -> None:
+    """After a re-rank to C, D, A, E, B: A (3rd, inside the hold cut of 4) is kept, B
+    (5th, below it) is sold, so the book is {A, C, D} at 1/3 with one retained."""
+    scores = _ranked("CDAEBFGHIJ")
+    targets, n_retained = buffered_targets(scores, {"A", "B"}, 0.2, 0.4)
+    assert targets == {"A": 1 / 3, "C": 1 / 3, "D": 1 / 3}
+    assert n_retained == 1
+
+
+def test_buffered_targets_does_not_retain_a_previous_name_absent_from_the_scores() -> None:
+    targets, n_retained = buffered_targets(_ranked("CDAEBFGHIJ"), {"A", "ZZ"}, 0.2, 0.4)
+    assert targets == {"A": 1 / 3, "C": 1 / 3, "D": 1 / 3}
+    assert n_retained == 1
+    assert "ZZ" not in targets
+
+
+def test_buffered_targets_does_not_count_a_name_already_in_the_top_as_retained() -> None:
+    targets, n_retained = buffered_targets(_ranked("ABCDEFGHIJ"), {"A", "B"}, 0.2, 0.4)
+    assert targets == {"A": 0.5, "B": 0.5}
+    assert n_retained == 0
+
+
+def test_buffered_targets_ties_break_by_security_id() -> None:
+    scores = {"B": 1.0, "A": 1.0, "C": 1.0, "D": 1.0}
+    targets, _ = buffered_targets(scores, set(), 0.25, 0.5)
+    assert targets == {"A": 1.0}
+    # Hold cut is the top 2 by (score desc, id asc): A, B. B was held, so it stays.
+    targets, n_retained = buffered_targets(scores, {"B"}, 0.25, 0.5)
+    assert targets == {"A": 0.5, "B": 0.5}
+    assert n_retained == 1
+
+
+@pytest.mark.parametrize("hold", [0.0])
+@pytest.mark.parametrize("previous", [set(), {"A"}, {"A", "Z"}])
+@pytest.mark.parametrize(
+    "scores",
+    [{}, {"A": 1.0}, {"A": 0.1, "B": 0.5, "C": -0.2, "D": 0.3}, _scores(37)],
+)
+def test_buffered_targets_at_zero_hold_is_target_weights(
+    scores: dict[str, float], previous: set[str], hold: float
+) -> None:
+    assert buffered_targets(scores, previous, 0.1, hold) == (
+        target_weights(scores, 0.1, "equal"),
+        0,
+    )
+
+
+def test_buffered_targets_hold_equal_to_top_is_the_unbuffered_book() -> None:
+    scores = _ranked("CDAEBFGHIJ")
+    targets, n_retained = buffered_targets(scores, {"A", "B"}, 0.2, 0.2)
+    assert targets == target_weights(scores, 0.2, "equal")
+    assert n_retained == 0
+
+
+def test_buffered_targets_full_hold_keeps_every_ranked_previous_name() -> None:
+    targets, n_retained = buffered_targets(_ranked("CDAEBFGHIJ"), {"A", "B", "J"}, 0.2, 1.0)
+    assert set(targets) == {"A", "B", "C", "D", "J"}
+    assert n_retained == 3
+
+
+def test_buffered_targets_weights_sum_to_at_most_one() -> None:
+    targets, _ = buffered_targets(_scores(30), {f"S{i:04d}" for i in range(24, 30)}, 0.1, 0.5)
+    assert math.fsum(targets.values()) <= 1.0
+    assert list(targets) == sorted(targets)
+
+
+@pytest.mark.parametrize(
+    ("top", "hold"), [(0.2, 0.1), (0.2, 1.5), (0.2, -0.1), (0.2, float("nan")), (0.0, 0.5)]
+)
+def test_buffered_targets_refuses_bad_fractions(top: float, hold: float) -> None:
+    with pytest.raises(ValueError):
+        buffered_targets({"A": 1.0}, set(), top, hold)
+
+
+def test_buffered_targets_refuses_a_non_finite_score() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        buffered_targets({"A": float("nan")}, set(), 0.2, 0.4)
+
+
+# --- signed target weights (T219; backtest spec amendment #1872, item 2) --------------
+#
+# `_scores(n)` above scores S0000..S{n-1} ascending, so the rank order is
+# S{n-1}, S{n-2}, ..., S0000. Every value below is computed by hand.
+
+
+def test_signed_target_weights_50_50_by_hand() -> None:
+    """gross 1.0, net 0.0, ten names, top_fraction 0.2: the top two are long at +0.25
+    each and the bottom two short at -0.25 each, so each leg sums to 0.5."""
+    scores = _scores(10)
+    targets = signed_target_weights(scores, 0.2, 1.0, 0.0, eligible=scores)
+    assert targets == {"S0009": 0.25, "S0008": 0.25, "S0000": -0.25, "S0001": -0.25}
+
+
+def test_signed_target_weights_gross_1_net_0_4_by_hand() -> None:
+    """gross 1.0 with net 0.4: the long leg is (1.0 + 0.4)/2 = 0.7 over two names, so
+    +0.35 each; the short leg -(1.0 - 0.4)/2 = -0.3, so -0.15 each. Σ |w| = 1.0 and
+    Σ w = 0.4."""
+    scores = _scores(10)
+    targets = signed_target_weights(scores, 0.2, 1.0, 0.4, eligible=scores)
+    assert targets == pytest.approx({"S0009": 0.35, "S0008": 0.35, "S0000": -0.15, "S0001": -0.15})
+
+
+def test_signed_target_weights_skips_an_ineligible_low_scorer() -> None:
+    """Eight names, top_fraction 0.25: the long leg is S0007 and S0006 (k_L = 2), and
+    the short leg's two lowest eligible names would be S0000 and S0001, but S0001 is
+    ineligible (under the price floor), so S0002 takes its place."""
+    scores = _scores(8)
+    eligible = [sid for sid in scores if sid != "S0001"]
+    targets = signed_target_weights(scores, 0.25, 1.0, 0.0, eligible=eligible)
+    assert targets == {"S0007": 0.25, "S0006": 0.25, "S0000": -0.25, "S0002": -0.25}
+    assert "S0001" not in targets
+
+
+def test_signed_target_weights_short_leg_takes_what_remains() -> None:
+    """Four names, top_fraction 0.5: k_L = 2 (S0003, S0002) and k_S = 2, but only
+    S0001 is eligible outside the long leg (S0000 is under the floor), so the short
+    leg is S0001 alone at -(gross - net)/2/1 = -0.5."""
+    scores = _scores(4)
+    targets = signed_target_weights(scores, 0.5, 1.0, 0.0, eligible=["S0003", "S0002", "S0001"])
+    assert targets == {"S0003": 0.25, "S0002": 0.25, "S0001": -0.5}
+
+
+def test_signed_target_weights_with_no_eligible_names_is_long_only() -> None:
+    """No eligible name: the short leg is empty and the long leg keeps its
+    (gross + net)/2 share."""
+    targets = signed_target_weights(_scores(4), 0.5, 1.0, 0.4, eligible=[])
+    assert targets == pytest.approx({"S0003": 0.35, "S0002": 0.35})
+
+
+def test_signed_target_weights_ties_break_by_security_id() -> None:
+    """All four scores equal: the rank is by `security_id` ascending, so the one long
+    name is A and the one lowest-scored (short) name is D."""
+    targets = signed_target_weights(
+        {"A": 1.0, "B": 1.0, "C": 1.0, "D": 1.0}, 0.25, 1.0, 0.0, eligible=["A", "B", "C", "D"]
+    )
+    assert targets == {"A": 0.5, "D": -0.5}
+
+
+@pytest.mark.parametrize(("gross", "net"), [(1.0, 0.0), (1.0, 0.4), (0.8, -0.2)])
+def test_signed_target_weights_legs_are_disjoint_and_sums_hold(gross: float, net: float) -> None:
+    """Σ |w| = gross, Σ w = net, the legs are disjoint, and every short name is
+    eligible."""
+    scores = _scores(12)
+    eligible = [sid for sid in scores if sid != "S0005"]
+    targets = signed_target_weights(scores, 0.25, gross, net, eligible=eligible)
+    long_leg = {sid for sid, weight in targets.items() if weight > 0}
+    short_leg = {sid for sid, weight in targets.items() if weight < 0}
+    assert not (long_leg & short_leg)
+    assert short_leg <= set(eligible)
+    assert math.fsum(targets.values()) == pytest.approx(net)
+    assert math.fsum(abs(weight) for weight in targets.values()) == pytest.approx(gross)
+    assert list(targets) == sorted(targets)
+
+
+@pytest.mark.parametrize(
+    "scores",
+    [{}, _scores(3), _scores(7), {"X": 1.0, "Y": 1.0, "Z": 1.0}],
+)
+@pytest.mark.parametrize("fraction", [0.1, 0.5, 1.0])
+def test_signed_target_weights_long_only_is_target_weights_exactly(
+    scores: dict[str, float], fraction: float
+) -> None:
+    """gross == net == 1.0 is the `long_only` book (spec item 1), so the result is
+    `target_weights`' output exactly and `eligible` is not read."""
+    assert signed_target_weights(scores, fraction, 1.0, 1.0, eligible=[]) == target_weights(
+        scores, fraction, "equal"
+    )
+
+
+def test_signed_target_weights_a_sub_unit_gross_keeps_the_gross_share() -> None:
+    """gross 0.5, net 0.5 (a signed book with no short leg): the long leg carries the
+    0.5 gross share at (0.5 + 0.5)/2/2 = 0.25 each, not the whole book."""
+    targets = signed_target_weights(_scores(4), 0.5, 0.5, 0.5, eligible=["S0003", "S0002"])
+    assert targets == {"S0003": 0.25, "S0002": 0.25}
+    assert math.fsum(targets.values()) == pytest.approx(0.5)
+
+
+def test_signed_target_weights_a_fully_short_book_has_no_zero_long_entries() -> None:
+    """gross 0.4, net -0.4: the long leg's (0.4 - 0.4)/2 = 0 weight is dropped, so the
+    result holds only the short leg, at -(0.4 - -0.4)/2/2 = -0.2 each."""
+    scores = _scores(4)
+    targets = signed_target_weights(scores, 0.5, 0.4, -0.4, eligible=scores)
+    assert targets == {"S0000": pytest.approx(-0.2), "S0001": pytest.approx(-0.2)}
+    assert list(targets) == sorted(targets)
+
+
+@pytest.mark.parametrize("bad", [0.0, -0.1, 1.5])
+def test_signed_target_weights_rejects_a_bad_fraction(bad: float) -> None:
+    with pytest.raises(ValueError, match="top_fraction"):
+        signed_target_weights({"A": 1.0}, bad, 1.0, 0.0, eligible=["A"])
+
+
+def test_signed_target_weights_rejects_non_finite_inputs() -> None:
+    with pytest.raises(ValueError, match="score"):
+        signed_target_weights({"A": float("nan")}, 0.5, 1.0, 0.0, eligible=["A"])
+    with pytest.raises(ValueError, match="gross"):
+        signed_target_weights({"A": 1.0}, 0.5, float("inf"), 0.0, eligible=["A"])
+    with pytest.raises(ValueError, match="net"):
+        signed_target_weights({"A": 1.0}, 0.5, 1.0, float("nan"), eligible=["A"])
+
+
+@pytest.mark.parametrize(
+    ("gross", "net"),
+    [(0.0, 0.0), (-0.5, -0.5), (1.0, 1.5), (0.4, -0.5)],
+)
+def test_signed_target_weights_rejects_an_exposure_out_of_range(gross: float, net: float) -> None:
+    """A `net` outside `[-gross, gross]` would make a "short" leg's weight a long buy,
+    so the pure function refuses it as the config validator does (spec item 1)."""
+    with pytest.raises(ValueError, match=r"gross|net"):
+        signed_target_weights({"A": 1.0}, 0.5, gross, net, eligible=["A"])

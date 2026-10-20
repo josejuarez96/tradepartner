@@ -22,6 +22,10 @@ this order, raising `PromotionRefused` before anything is written:
    file shares), so no key inside or outside the fingerprint can differ from what
    won, and a `FROZEN_KEY_DEFAULTS` entry the file writes out at its default changes
    nothing;
+6a. `refused_benchmark_pending` (T221, backtest spec amendment #1872, item 8): a file
+   whose frozen `portfolio.side` is `long_short`, until the ADR 0005 amendment that ADR
+   0024 item 7 requires lands and its PR flips `LONG_SHORT_BENCHMARK_LANDED`. A
+   `long_only` file takes no new branch;
 7. a file without a `## Sweep provenance` section whose `**Sweep:**` line names this
    sweep's slug, registration id and the family's declared count n and whose
    `**Variant:**` line names the argmax variant's slug at rank 1
@@ -74,6 +78,7 @@ from tradepartner.store.lab_schema import require_lab
 from tradepartner.store.registry import HypothesisRecord
 
 __all__ = [
+    "LONG_SHORT_BENCHMARK_LANDED",
     "PROVENANCE_HEADING",
     "PromotionOutcome",
     "PromotionRefused",
@@ -84,6 +89,11 @@ __all__ = [
 
 #: The section a promoted file must carry (`docs/templates/hypothesis.md`).
 PROVENANCE_HEADING: Final = "## Sweep provenance"
+
+#: Whether the ADR 0005 amendment on the yardstick for a book with a short leg (ADR 0024
+#: item 7; backtest spec open question 24) has landed. `promote` refuses a `long_short`
+#: file `refused_benchmark_pending` until it has; the amendment's PR flips this constant.
+LONG_SHORT_BENCHMARK_LANDED: Final = False
 
 _SWEEP_LINE: Final = re.compile(
     r"\*\*Sweep:\*\*\s*`([^`]+)`,\s*registration id\s+(\d+);.*?declared count n\s*=\s*(\d+)"
@@ -278,6 +288,15 @@ def promote(
     variant = registry.get_hypothesis(conn, argmax.slug)
     parsed = hypothesis.parse_file(file)
     params = hypothesis.frozen_params(parsed, settings)
+    if params.get("portfolio.side", "long_only") == "long_short" and not (
+        LONG_SHORT_BENCHMARK_LANDED
+    ):
+        raise PromotionRefused(
+            f"{file}: refused_benchmark_pending: portfolio.side is 'long_short' and the "
+            "ADR 0005 amendment that names the yardstick for a book with a short leg has "
+            "not landed (ADR 0024 item 7); a market-neutral book trails SPY by the equity "
+            "premium by construction"
+        )
     differences = hypothesis.frozen_set_differences(parsed, params, variant)
     if differences:
         raise PromotionRefused(

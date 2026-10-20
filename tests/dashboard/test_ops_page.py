@@ -14,6 +14,7 @@ import subprocess
 import sys
 import textwrap
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -167,6 +168,12 @@ def _seed(store_path: Path) -> None:
                 reason="below_cut",
                 **_stamp(2),
             ),
+        )
+        conn.execute(
+            "INSERT INTO listings (security_id, ticker, exchange, valid_from, known_at, "
+            "ingested_at, source, provenance) VALUES ('BBB', 'BBB', 'NYSE', ?, ?, ?, "
+            "'fixture', 'filing')",
+            [_S_MINUS_1, _at(1), _at(1)],
         )
 
         order = OrderRow(
@@ -373,11 +380,102 @@ def test_render_kpis_and_switch_chip(monkeypatch: pytest.MonkeyPatch, seeded_sto
 def test_render_ranking_hero_and_table(monkeypatch: pytest.MonkeyPatch, seeded_store: Path) -> None:
     at = _app(monkeypatch, seeded_store)
     assert not at.exception
-    rows = _dataframe_with_columns(at, "security_id", "selected", "signal_reason")
-    assert set(rows["security_id"].to_list()) == {"BBB", "CCC"}
-    by_security = rows.set_index("security_id")
+    rows = _dataframe_with_columns(at, "ticker", "selected", "signal_reason")
+    assert set(rows["ticker"].to_list()) == {"BBB", "Ticker unavailable (CCC)"}
+    by_security = rows.set_index("ticker")
     assert bool(by_security.loc["BBB", "selected"]) is True
-    assert bool(by_security.loc["CCC", "selected"]) is False
+    assert bool(by_security.loc["Ticker unavailable (CCC)", "selected"]) is False
+    assert "No separate reason recorded" in by_security.loc["BBB", "decision_reason"]
+
+
+def test_ranking_uses_known_ticker_for_security_id(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    with duckdb.connect(str(seeded_store)) as conn:
+        conn.execute(
+            "INSERT INTO listings (security_id, ticker, exchange, valid_from, known_at, "
+            "ingested_at, source, provenance) VALUES ('CCC', 'CEE', 'NYSE', ?, ?, ?, "
+            "'fixture', 'filing')",
+            [_S_MINUS_1, _at(-1), _at(-1)],
+        )
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    ranking = _dataframe_with_columns(at, "ticker", "selected")
+    assert set(ranking["ticker"].to_list()) == {"BBB", "CEE"}
+    assert "security_id" not in ranking.columns
+
+
+def test_ranking_uses_ticker_known_at_plan_time(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    with duckdb.connect(str(seeded_store)) as conn:
+        conn.execute(
+            "INSERT INTO listings (security_id, ticker, exchange, valid_from, known_at, "
+            "ingested_at, source, provenance) VALUES "
+            "('CCC', 'OLD', 'NYSE', ?, ?, ?, 'fixture', 'filing'), "
+            "('CCC', 'NEW', 'NYSE', ?, ?, ?, 'fixture', 'filing')",
+            [ops.previous_session(_S_MINUS_1), _at(1), _at(1), _S_MINUS_1, _at(6), _at(6)],
+        )
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    ranking = _dataframe_with_columns(at, "ticker", "selected")
+    assert set(ranking["ticker"].to_list()) == {"BBB", "OLD"}
+
+
+def _add_order_for_unlisted_ranked_name(store_path: Path, *, order_minute: int) -> None:
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        (run_id,) = conn.execute("SELECT run_id FROM paper_plans").fetchone()
+        decision_id = append(
+            conn,
+            DecisionRow(
+                run_id=run_id,
+                rebalance_session=_S_MINUS_1,
+                security_id="CCC",
+                side="buy",
+                whole_share=True,
+                decision="trade",
+                **_stamp(0),
+            ),
+        )
+        assert decision_id is not None
+        append(
+            conn,
+            OrderRow(
+                client_order_id="tp-ccc-buy-1",
+                decision_id=decision_id,
+                run_id=run_id,
+                session=_S_MINUS_1,
+                attempt=1,
+                phase="buy",
+                security_id="CCC",
+                symbol="CEE",
+                side="buy",
+                quantity=1.0,
+                sells_in_flight_at_submit=False,
+                **_stamp(order_minute),
+            ),
+        )
+
+
+def test_ranking_does_not_use_order_symbol_recorded_after_plan(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _add_order_for_unlisted_ranked_name(seeded_store, order_minute=4)
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    ranking = _dataframe_with_columns(at, "ticker", "selected")
+    assert set(ranking["ticker"].to_list()) == {"BBB", "Ticker unavailable (CCC)"}
+
+
+def test_ranking_uses_order_symbol_known_before_plan(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _add_order_for_unlisted_ranked_name(seeded_store, order_minute=1)
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    ranking = _dataframe_with_columns(at, "ticker", "selected")
+    assert set(ranking["ticker"].to_list()) == {"BBB", "CEE"}
 
 
 def test_render_fills_card(monkeypatch: pytest.MonkeyPatch, seeded_store: Path) -> None:
@@ -387,11 +485,59 @@ def test_render_fills_card(monkeypatch: pytest.MonkeyPatch, seeded_store: Path) 
     assert fills["broker_fill_id"].to_list() == ["brk-1"]
 
 
+def test_open_rebalance_order_explains_fill_timing(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    settings = Settings(_env_file=None, store={"path": str(seeded_store)})
+    with open_for_write(settings) as conn:
+        decision_id = append(
+            conn,
+            DecisionRow(
+                run_id=1,
+                rebalance_session=_S_MINUS_1,
+                security_id="0002023554",
+                side="buy",
+                whole_share=False,
+                decision="trade",
+                **_stamp(8),
+            ),
+        )
+        assert decision_id is not None
+        append(
+            conn,
+            OrderRow(
+                client_order_id="tp-buy-pending",
+                decision_id=decision_id,
+                run_id=1,
+                session=_S_MINUS_1,
+                attempt=1,
+                phase="buy",
+                security_id="0002023554",
+                symbol="AAPL",
+                side="buy",
+                notional=494.0,
+                sells_in_flight_at_submit=False,
+                **_stamp(9),
+            ),
+        )
+        append(
+            conn, OrderEventRow(client_order_id="tp-buy-pending", status="accepted", **_stamp(10))
+        )
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    assert "Fills are recorded at the next scheduled run" in _text(at)
+    assert "08:05 ET" not in _text(at)
+    [picker] = at.selectbox
+    assert any(option.startswith("AAPL") for option in picker.options)
+    assert any("tp-buy-pending" in option for option in picker.options)
+    assert all("0002023554" not in option for option in picker.options)
+
+
 def test_render_chain_detail_view(monkeypatch: pytest.MonkeyPatch, seeded_store: Path) -> None:
     at = _app(monkeypatch, seeded_store)
     assert not at.exception
     [picker] = at.selectbox
-    assert picker.options == ["tp-buy-1"]
+    assert picker.options == ["BBB #1 (tp-buy-1)"]
     chain = _dataframe_with_columns(at, "kind", "detail")
     assert set(chain["kind"].to_list()) >= {"order", "order_event", "fill"}
 
@@ -579,6 +725,38 @@ def test_one_book_shows_its_summary_row_and_no_selector(
     summary = _dataframe_with_columns(at, "book", "next_rebalance", "kill_switch")
     assert summary["book"].to_list() == ["main"]
     assert all(sb.key != ops_page.BOOK_KEY for sb in at.selectbox)
+
+
+def test_summary_names_traded_rebalance_without_marking_next_daily_one_done(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    settings = Settings(_env_file=None, store={"path": str(seeded_store)})
+    with duckdb.connect(str(seeded_store), read_only=True) as conn:
+        (row,) = ops.book_summaries(conn, settings)
+    today = datetime(2026, 10, 30, 14, tzinfo=UTC)
+    monkeypatch.setattr(ops, "utc_now", lambda: today)
+    row = replace(
+        row,
+        last_run_kind="rebalance",
+        last_run_status="ok",
+        last_run_session=today.date(),
+        next_rebalance_session=today.date(),
+    )
+    (label,) = ops_page._summary_table((row,))["next_rebalance"].to_list()
+    assert label == "2026-10-30; rebalance 2026-10-29 traded today"
+
+
+def test_summary_names_rebalance_run_with_no_orders(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _add_book_b(seeded_store)
+    monkeypatch.setattr(ops, "utc_now", lambda: _T0)
+    settings = Settings(_env_file=None, store={"path": str(seeded_store)})
+    with duckdb.connect(str(seeded_store), read_only=True) as conn:
+        b = next(row for row in ops.book_summaries(conn, settings) if row.book_id == "b")
+    (label,) = ops_page._summary_table((b,))["next_rebalance"].to_list()
+    assert f"rebalance {ops.previous_session(_S_MINUS_1)} ran today with no orders" in label
+    assert "traded today" not in label
 
 
 def test_two_books_list_two_summary_rows_and_the_selector_switches_the_sections(

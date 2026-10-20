@@ -48,10 +48,19 @@ FROZEN_SECTIONS = (
     "gap",
     "holdout",
     "metrics",
+    "portfolio",
 )
 FROZEN_SINGLE_KEYS = ("execution.fill_price", "benchmarks", "alpaca.historical_feed")
 #: T210's post-registration `costs.*` keys (#1792): frozen, never required of a file.
-LATE_COST_KEYS = frozenset({"costs.spread_bps", "costs.impact_coeff", "costs.adv_sessions"})
+LATE_COST_KEYS = frozenset(
+    {
+        "costs.spread_bps",
+        "costs.impact_coeff",
+        "costs.adv_sessions",
+        "costs.borrow_bps_per_year",
+        "costs.borrow_sensitivity_bps",
+    }
+)
 
 
 def _spec_frozen_keys() -> set[str]:
@@ -651,6 +660,9 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "master.chain_window_sessions",
             "master.chain_max_price_ratio",
             "adjust.apply_spin_offs",
+            "strategy.hold_top_fraction",
+            "portfolio.",
+            "costs.borrow",
         ),
     ],
     ids=["today", "pre-lab"],
@@ -1337,6 +1349,14 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "master.chain_window_sessions",
         "master.chain_max_price_ratio",
         "adjust.apply_spin_offs",
+        "strategy.hold_top_fraction",
+        "portfolio.side",
+        "portfolio.gross_exposure",
+        "portfolio.net_exposure",
+        "portfolio.short_min_price",
+        "portfolio.short_cover_weight",
+        "costs.borrow_bps_per_year",
+        "costs.borrow_sensitivity_bps",
     )
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     record = registry.register_hypothesis(
@@ -1366,10 +1386,11 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
 def test_a_screened_registration_runs_at_its_frozen_fraction(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
-    """T165c applies the key (#1358), so nothing but T211c's opt-in spin-off key is in
-    `NOT_YET_APPLIED_KEYS` and a registration at 0.20 loads at 0.20 (until T165c,
-    quant-auditor on #1387 had it refused)."""
-    assert frozenset({"adjust.apply_spin_offs"}) == hypothesis.NOT_YET_APPLIED_KEYS
+    """T165c applies the key (#1358) and T211e applies `adjust.apply_spin_offs` (#1894),
+    so only T238's `strategy.hold_top_fraction` (until T239) is in `NOT_YET_APPLIED_KEYS`
+    and a registration at 0.20 loads at 0.20 (until T165c, quant-auditor on #1387 had it
+    refused)."""
+    assert frozenset({"strategy.hold_top_fraction"}) == hypothesis.NOT_YET_APPLIED_KEYS
     _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
     assert loaded.strategy.turnover_top_fraction == 0.20
@@ -1607,7 +1628,13 @@ def test_on_the_lab_the_h1_twins_unchanged_file_is_refused_under_the_new_default
 
 # --- the cost terms: the post-registration `costs.*` carve-out (#1792, T210) ---------
 
-COST_TERMS = {"costs.spread_bps": 0.0, "costs.impact_coeff": 0.0, "costs.adv_sessions": 20}
+COST_TERMS = {
+    "costs.spread_bps": 0.0,
+    "costs.impact_coeff": 0.0,
+    "costs.adv_sessions": 20,
+    "costs.borrow_bps_per_year": 0.0,
+    "costs.borrow_sensitivity_bps": [],
+}
 HYPOTHESES = H1_FILE.parent
 B9_FILE = HYPOTHESES / "b9-earnings-reaction-drift.md"
 #: The registered files whose family is wired on main, and the fixture twins. B9's
@@ -1702,7 +1729,9 @@ def test_h1s_unchanged_file_registered_before_the_terms_writes_nothing(
     later = {
         *COST_TERMS,
         *(k for k in hypothesis.frozen_keys() if k.startswith("master.chain")),
+        *(k for k in hypothesis.frozen_keys() if k.startswith("portfolio.")),
         "adjust.apply_spin_offs",
+        "strategy.hold_top_fraction",
     }
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     stored = registry.register_hypothesis(
@@ -1883,10 +1912,10 @@ def _spin_offs_file(tmp_path: Path, slug: str, value: str) -> Path:
     return path
 
 
-def test_apply_spin_offs_is_post_registration_and_not_yet_applied() -> None:
+def test_apply_spin_offs_is_post_registration_and_applied() -> None:
     """The key is a post-registration member (spec amendment #1894, item 3): not
-    required of a file, and in `NOT_YET_APPLIED_KEYS` until T211e applies it."""
-    assert SPIN_OFFS_KEY in hypothesis.NOT_YET_APPLIED_KEYS
+    required of a file, and no longer in `NOT_YET_APPLIED_KEYS` once T211e applies it."""
+    assert SPIN_OFFS_KEY not in hypothesis.NOT_YET_APPLIED_KEYS
     assert SPIN_OFFS_KEY in frozen.POST_REGISTRATION_ADJUST_KEYS
     for family in sorted(config.FAMILIES):
         required = hypothesis.required_keys(family)
@@ -1914,12 +1943,14 @@ def test_a_file_naming_the_key_freezes_its_value(
     assert record.params[SPIN_OFFS_KEY] is True
 
 
-def test_load_frozen_refuses_true_until_t211e(
+def test_load_frozen_accepts_true_once_t211e_applies_it(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
+    """T211e wires the key, so `load_frozen` yields a `true` registration (spec amendment
+    #1894, item 3), where T211c refused it."""
     _register(conn, _spin_offs_file(tmp_path, SLUG, "true"), settings)
-    with pytest.raises(HypothesisFileError, match=SPIN_OFFS_KEY):
-        hypothesis.load_frozen(conn, SLUG, settings=settings)
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
+    assert loaded.adjust.apply_spin_offs is True
 
 
 def test_load_frozen_accepts_false(
@@ -1928,3 +1959,279 @@ def test_load_frozen_accepts_false(
     _register(conn, _spin_offs_file(tmp_path, SLUG, "false"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
     assert loaded.adjust.apply_spin_offs is False
+
+
+# --- T238: the `momentum` buy/hold buffer key (backtest spec amendment #657) ------------
+
+BUFFER_KEY = "strategy.hold_top_fraction"
+
+
+def _with_buffer(tmp_path: Path, source: Path, slug: str, value: str) -> Path:
+    """`source` with `hold_top_fraction = <value>` added to its `[strategy]` table."""
+    text = source.read_text()
+    assert "\n[strategy]\n" in text
+    path = tmp_path / "hypotheses" / f"{slug}.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(
+        text.replace("\n[strategy]\n", f"\n[strategy]\nhold_top_fraction = {value}\n", 1)
+    )
+    return path
+
+
+def test_the_buffer_key_is_family_only_post_registration_and_not_yet_applied() -> None:
+    assert hypothesis.FAMILY_ONLY_KEYS[BUFFER_KEY] == "momentum"
+    assert BUFFER_KEY in hypothesis.NOT_YET_APPLIED_KEYS
+    assert BUFFER_KEY in frozen.POST_REGISTRATION_OWN_KEYS
+    for family in ("momentum", "oracle", "combined"):
+        assert BUFFER_KEY in hypothesis.family_frozen_keys(family)  # frozen, not required
+        assert BUFFER_KEY not in hypothesis.required_keys(family)
+
+
+@pytest.mark.parametrize(
+    ("source", "slug", "family"),
+    [(COMBINED_FIXTURE, COMBINED_SLUG, "combined"), (FIXTURE, SLUG, "oracle")],
+)
+def test_another_family_naming_the_buffer_is_refused_naming_the_key(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    source: Path,
+    slug: str,
+    family: str,
+) -> None:
+    path = _with_buffer(tmp_path, source, slug, "0.20")
+    path.write_text(path.read_text().replace('family = "momentum"', f'family = "{family}"'))
+    with pytest.raises(HypothesisFileError, match=f"{BUFFER_KEY} is a 'momentum' rule"):
+        _register(conn, path, settings)
+    assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (0,)
+
+
+def test_a_file_without_the_buffer_freezes_zero_not_the_live_value(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    live = settings.model_copy(
+        update={"strategy": settings.strategy.model_copy(update={"hold_top_fraction": 0.3})}
+    )
+    assert _register(conn, FIXTURE, live).params[BUFFER_KEY] == 0.0
+    assert hypothesis.load_frozen(conn, SLUG, settings=live).strategy.hold_top_fraction == 0.0
+
+
+def test_a_value_equal_to_top_fraction_registers_as_the_default(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    record = _register(conn, _with_buffer(tmp_path, FIXTURE, SLUG, "0.10"), settings)
+    assert record.params[BUFFER_KEY] == 0.0
+
+
+def test_a_value_between_zero_and_top_fraction_is_refused(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    with pytest.raises(HypothesisFileError, match=r"fail validation.*hold_top_fraction"):
+        _register(conn, _with_buffer(tmp_path, FIXTURE, SLUG, "0.05"), settings)
+
+
+def test_load_frozen_refuses_a_buffered_registration_until_t239(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """No run or paper plan records results under a buffer the engine ignores."""
+    record = _register(conn, _with_buffer(tmp_path, FIXTURE, SLUG, "0.20"), settings)
+    assert record.params[BUFFER_KEY] == 0.2
+    with pytest.raises(HypothesisFileError, match=BUFFER_KEY):
+        hypothesis.load_frozen(conn, SLUG, settings=settings)
+
+
+# --- the `portfolio` section (T219; backtest spec amendment #1872, item 1) ------------
+
+
+def test_portfolio_keys_are_allowed_and_frozen_at_their_defaults(
+    tmp_path: Path, settings: Settings
+) -> None:
+    """A file may name the five keys (`frozen_keys` includes the section), and absent
+    they freeze at their table defaults: a file naming `side` at its default is the same
+    registration as one that omits it (`frozen_params`' `fixed` map reads the table, not
+    live `Settings`, which the guard keeps at its defaults until T223)."""
+    text = FIXTURE.read_text().replace("\n```\n", '\n[portfolio]\nside = "long_only"\n```\n', 1)
+    parsed = hypothesis.parse_file(_copy(tmp_path, text))
+    explicit = hypothesis.frozen_params(parsed, settings)
+    twin = hypothesis.frozen_params(hypothesis.parse_file(FIXTURE), settings)
+    assert explicit == twin
+    assert explicit["portfolio.side"] == "long_only"
+    assert explicit["portfolio.short_min_price"] == 5.0
+    table = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    for key in frozen.POST_REGISTRATION_PORTFOLIO_KEYS:
+        assert explicit[key] == table[key], key
+
+
+def test_a_non_default_portfolio_value_is_refused_until_t223(
+    tmp_path: Path, settings: Settings
+) -> None:
+    """T219's #1788 guard: the engine reads none of the five until T223, so a
+    `long_short` file cannot register (`_overlay` fails validation naming T223)."""
+    text = FIXTURE.read_text().replace("\n```\n", '\n[portfolio]\nside = "long_short"\n```\n', 1)
+    parsed = hypothesis.parse_file(_copy(tmp_path, text))
+    with pytest.raises(HypothesisFileError, match="T223"):
+        hypothesis.frozen_params(parsed, settings)
+
+
+# --- the long/short refusals (T221; backtest spec amendment #1872, items 1 and 6) -----
+
+#: A 50/50 book's frozen values on top of the fixture's: the headline 30 bp, the grid's
+#: other two lines in the sensitivity list.
+LONG_SHORT_5050: dict[str, Any] = {
+    "portfolio.side": "long_short",
+    "portfolio.net_exposure": 0.0,
+    "costs.borrow_bps_per_year": 30.0,
+    "costs.borrow_sensitivity_bps": [0.0, 300.0],
+}
+
+
+def _long_short(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
+    """`frozen_params` returns the fixture's values with a long/short book on top: the
+    #1788 guard (T223 removes it) refuses a `long_short` file before `register` could
+    see it, so the guard is stepped round, as T222's tests do with `PortfolioConfig`."""
+    real = hypothesis.frozen_params
+    changed = {**LONG_SHORT_5050, **{k.replace("__", "."): v for k, v in overrides.items()}}
+
+    def patched(parsed: hypothesis.HypothesisFile, settings: Settings) -> dict[str, Any]:
+        return {**real(parsed, settings), **changed}
+
+    monkeypatch.setattr(hypothesis, "frozen_params", patched)
+
+
+def _hypotheses(conn: duckdb.DuckDBPyConnection) -> int:
+    return int(conn.execute("SELECT count(*) FROM hypotheses").fetchone()[0])  # type: ignore[index]
+
+
+def test_a_valid_5050_file_registers(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _long_short(monkeypatch)
+    record = _register(conn, _copy(tmp_path), settings)
+    assert record.params["portfolio.side"] == "long_short"
+    assert record.params["costs.borrow_bps_per_year"] == 30.0
+    assert record.params["costs.borrow_sensitivity_bps"] == [0.0, 300.0]
+    assert _hypotheses(conn) == 1
+
+
+@pytest.mark.parametrize(
+    ("headline", "sensitivity"),
+    [(30.0, [0.0, 300.0]), (300.0, [0.0, 30.0]), (100.0, [0.0, 30.0, 300.0]), (30.0, [300.0, 0])],
+)
+def test_every_headline_with_the_grid_covered_registers(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    headline: float,
+    sensitivity: list[float],
+) -> None:
+    _long_short(
+        monkeypatch,
+        costs__borrow_bps_per_year=headline,
+        costs__borrow_sensitivity_bps=sensitivity,
+    )
+    _register(conn, _copy(tmp_path), settings)
+    assert _hypotheses(conn) == 1
+
+
+@pytest.mark.parametrize(
+    ("headline", "sensitivity"),
+    [
+        (0.0, [0.0, 30.0, 300.0]),  # a 0 bp headline is a reference line only
+        (30.0, [0.0]),  # 300 bp missing
+        (30.0, [300.0]),  # 0 bp missing
+        (300.0, [0.0]),  # 30 bp missing
+        (30.0, []),
+        (100.0, [0.0, 30.0]),
+    ],
+)
+def test_a_missing_borrow_line_is_refused_by_name_before_any_write(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    headline: float,
+    sensitivity: list[float],
+) -> None:
+    _long_short(
+        monkeypatch,
+        costs__borrow_bps_per_year=headline,
+        costs__borrow_sensitivity_bps=sensitivity,
+    )
+    path = _copy(tmp_path)
+    with pytest.raises(HypothesisFileError, match=rf"^{re.escape(str(path))}: refused_borrow_rate"):
+        _register(conn, path, settings)
+    assert _hypotheses(conn) == 0
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"strategy__weighting": "hold"},
+        {"strategy__rebalance_band": 0.02},
+        {"strategy__hold_top_fraction": 0.2},
+    ],
+)
+def test_a_hold_a_band_or_a_buffer_on_a_signed_book_is_refused_by_name_before_any_write(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    override: dict[str, Any],
+) -> None:
+    _long_short(monkeypatch, **override)
+    path = _copy(tmp_path)
+    with pytest.raises(HypothesisFileError, match=rf"^{re.escape(str(path))}: refused_portfolio"):
+        _register(conn, path, settings)
+    assert _hypotheses(conn) == 0
+
+
+def test_refused_portfolio_comes_before_refused_borrow_rate(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _long_short(monkeypatch, strategy__rebalance_band=0.02, costs__borrow_bps_per_year=0.0)
+    with pytest.raises(HypothesisFileError, match="refused_portfolio"):
+        _register(conn, _copy(tmp_path), settings)
+
+
+def test_a_long_only_file_takes_no_new_branch(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """Hold, a band, a buffer and a 0 bp borrow headline are no concern of a long-only
+    book's registration (the refusals read `portfolio.side` first)."""
+    for params in (
+        {},
+        {"strategy.weighting": "hold", "strategy.rebalance_band": 0.02},
+        {"strategy.hold_top_fraction": 0.2, "costs.borrow_bps_per_year": 0.0},
+        {"portfolio.side": "long_only", "costs.borrow_sensitivity_bps": []},
+    ):
+        assert hypothesis.long_short_refusal(params) is None
+    _register(conn, _copy(tmp_path), settings)
+    assert _hypotheses(conn) == 1
+
+
+def test_borrow_keys_are_frozen_at_their_defaults_when_a_file_omits_them(
+    settings: Settings,
+) -> None:
+    params = hypothesis.frozen_params(hypothesis.parse_file(FIXTURE), settings)
+    assert params["costs.borrow_bps_per_year"] == 0.0
+    assert params["costs.borrow_sensitivity_bps"] == []
+    required = hypothesis.required_keys("momentum")
+    assert not {"costs.borrow_bps_per_year", "costs.borrow_sensitivity_bps"} & required
+
+
+def test_a_file_may_name_the_borrow_keys(tmp_path: Path, settings: Settings) -> None:
+    text = FIXTURE.read_text().replace(
+        "per_side_bps = 15.0",
+        "per_side_bps = 15.0\nborrow_bps_per_year = 30.0\nborrow_sensitivity_bps = [0.0, 300.0]",
+        1,
+    )
+    params = hypothesis.frozen_params(hypothesis.parse_file(_copy(tmp_path, text)), settings)
+    assert params["costs.borrow_bps_per_year"] == 30.0
+    assert params["costs.borrow_sensitivity_bps"] == [0.0, 300.0]

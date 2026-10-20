@@ -128,6 +128,7 @@ def test_family_reads_and_counts() -> None:
         "no_facts": (),
         "stale_facts": (),
         "malformed": (),
+        "no_t0_bar": (),
     }
     assert [c.method for c in provider.calls] == [
         "universe",
@@ -249,6 +250,7 @@ def test_combined_reads_prices_facts_and_sics_only() -> None:
         "no_facts": (),
         "stale_facts": (),
         "malformed": (),
+        "no_t0_bar": (),
         "one_signal_only": (),
     }
     # The count table takes the two sub-signals' counts plus `n_combined`.

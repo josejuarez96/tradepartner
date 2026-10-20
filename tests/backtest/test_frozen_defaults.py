@@ -333,9 +333,23 @@ RISK_FREE_KEYS = (
 #: T209a's three post-registration own-section keys (backtest spec amendment #1731).
 HOLD_KEYS = ("strategy.hold_sessions", "strategy.hold_target_names", "strategy.rebalance_band")
 #: T210's three post-registration `costs.*` keys (backtest spec amendment #1792).
-COST_KEYS = ("costs.spread_bps", "costs.impact_coeff", "costs.adv_sessions")
+COST_KEYS = (
+    "costs.spread_bps",
+    "costs.impact_coeff",
+    "costs.adv_sessions",
+    "costs.borrow_bps_per_year",
+    "costs.borrow_sensitivity_bps",
+)
 #: T217's three post-registration own-section keys (backtest spec amendment #1820).
 SHOCK_KEYS = ("strategy.signal_delay_sessions", "strategy.placebo", "strategy.placebo_seed")
+#: T219's five post-registration `portfolio.*` keys (backtest spec amendment #1872).
+PORTFOLIO_KEYS = (
+    "portfolio.side",
+    "portfolio.gross_exposure",
+    "portfolio.net_exposure",
+    "portfolio.short_min_price",
+    "portfolio.short_cover_weight",
+)
 #: T187's successor-chain keys (#821), table entries at version 31.
 CHAIN_KEYS = (
     "master.chains",
@@ -352,6 +366,8 @@ COMBINED_LATER_KEYS = (
     *SHOCK_KEYS,
     *CHAIN_KEYS,
     "adjust.apply_spin_offs",
+    "strategy.hold_top_fraction",
+    *PORTFOLIO_KEYS,
 )
 
 
@@ -396,6 +412,8 @@ LATER_KEYS = (
     *SHOCK_KEYS,
     *CHAIN_KEYS,
     "adjust.apply_spin_offs",
+    "strategy.hold_top_fraction",
+    *PORTFOLIO_KEYS,
 )
 
 
@@ -603,6 +621,8 @@ def test_b3_fingerprint_canonical_set_and_hash_are_pinned(
                     *COST_KEYS,
                     *CHAIN_KEYS,
                     "adjust.apply_spin_offs",
+                    "strategy.hold_top_fraction",
+                    *PORTFOLIO_KEYS,
                 ),
             )
         )
@@ -628,6 +648,7 @@ def test_oracle_fingerprint_and_canonical_set_are_pinned() -> None:
 # --- the turnover key and decision 13's carve-out (#1358, T165) ----------------------
 
 TURNOVER_KEY = "strategy.turnover_top_fraction"
+BUFFER_KEY = "strategy.hold_top_fraction"
 
 
 def test_turnover_entry_is_last_and_pinned_by_value() -> None:
@@ -636,7 +657,10 @@ def test_turnover_entry_is_last_and_pinned_by_value() -> None:
 
 def test_post_registration_own_keys_pinned_and_each_a_listed_table_key() -> None:
     """Append-only (removing a member moves every stored own-section fingerprint)."""
-    assert frozenset({TURNOVER_KEY, *HOLD_KEYS, *SHOCK_KEYS}) == frozen.POST_REGISTRATION_OWN_KEYS
+    assert (
+        frozenset({TURNOVER_KEY, *HOLD_KEYS, *SHOCK_KEYS, BUFFER_KEY})
+        == frozen.POST_REGISTRATION_OWN_KEYS
+    )
     table = {key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS}
     listed = {section for spec in config.FAMILIES.values() for section in spec.sections}
     for key in frozen.POST_REGISTRATION_OWN_KEYS:
@@ -915,7 +939,7 @@ def test_cost_term_entries_are_last_and_pinned_by_value() -> None:
     (#1818) takes 29 and lands first; T187's four chain entries and T211c's
     spin-off key follow them."""
     assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:26], COST_ENTRIES)
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:-5], COST_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:-13], COST_ENTRIES)
 
 
 def test_post_registration_cost_keys_pinned_and_each_a_costs_table_key() -> None:
@@ -933,7 +957,14 @@ def test_higher_allowed_cost_keys_pinned() -> None:
     """The keys a ruled family's file may set higher than its rules' (a cost assumption
     may only get harsher); `adv_sessions` is not one."""
     assert (
-        frozenset({"costs.per_side_bps", "costs.spread_bps", "costs.impact_coeff"})
+        frozenset(
+            {
+                "costs.per_side_bps",
+                "costs.spread_bps",
+                "costs.impact_coeff",
+                "costs.borrow_bps_per_year",
+            }
+        )
         == frozen.HIGHER_ALLOWED_COST_KEYS
     )
 
@@ -1042,7 +1073,7 @@ def test_the_chain_entries_are_pinned_and_move_no_fingerprint() -> None:
         assert table[key] == (default, version), key
     settings = _defaults_settings()
     keys = CHAIN_KEYS
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-5:-1], CHAIN_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-13:-9], CHAIN_ENTRIES)
     for family, params in (
         ("momentum", _new_params(settings)),
         ("combined", _combined_params(settings)),
@@ -1064,9 +1095,10 @@ def test_the_chain_entries_are_pinned_and_move_no_fingerprint() -> None:
 APPLY_SPIN_OFFS_KEY = "adjust.apply_spin_offs"
 
 
-def test_apply_spin_offs_entry_is_last_and_pinned_by_value() -> None:
-    """Appended at version 31 at its default."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-1:], ((APPLY_SPIN_OFFS_KEY, False, 31),))
+def test_apply_spin_offs_entry_is_pinned_by_value() -> None:
+    """Appended at version 31 at its default; T238's buffer entry and T219's five
+    `portfolio.*` entries follow it."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-9:-8], ((APPLY_SPIN_OFFS_KEY, False, 31),))
 
 
 def test_post_registration_adjust_keys_pinned_and_each_an_adjust_table_key() -> None:
@@ -1143,3 +1175,197 @@ def test_a_file_naming_true_is_a_new_fingerprint(tmp_path: Path, settings: Setti
     )
     canonical = frozen.canonical_frozen_set(params, "momentum")
     assert canonical == {**twin_canonical, APPLY_SPIN_OFFS_KEY: True}
+
+
+# --- the `momentum` buy/hold buffer key (backtest spec amendment #657, T238) -----------
+
+
+def test_buffer_entry_is_pinned_by_value() -> None:
+    """Appended after the spin-off key, at the schema version current when it landed;
+    T219's five `portfolio.*` entries follow it."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-8:-7], ((BUFFER_KEY, 0.0, 34),))
+    assert BUFFER_KEY in hypothesis.frozen_keys()
+
+
+def test_buffer_at_its_default_leaves_every_pinned_hash_and_set(tmp_path: Path) -> None:
+    """Absent, `0.0` and a value equal to `top_fraction` (0.10 on the twin) are one
+    hypothesis: the TWIN's fingerprint and canonical set, with no buffer key in the set."""
+    from tradepartner.store import registry
+
+    settings = _defaults_settings()
+    twin = _new_params(settings)
+    assert twin[BUFFER_KEY] == 0.0
+    for line in (None, "hold_top_fraction = 0.0", "hold_top_fraction = 0.10"):
+        params = hypothesis.frozen_params(
+            hypothesis.parse_file(_twin_with(tmp_path, line)), settings
+        )
+        assert params == twin, line
+        assert frozen.fingerprint("momentum", params, date(2017, 1, 31)) == TWIN_FINGERPRINT
+        canonical = frozen.canonical_frozen_set(params, "momentum")
+        assert BUFFER_KEY not in canonical
+        assert registry.params_sha256(canonical) == TWIN_PRE_LAB_PARAMS_SHA256
+    # H1 and `combined` keep their pinned fingerprints.
+    parsed = hypothesis.parse_file(H1_FILE)
+    h1 = hypothesis.frozen_params(parsed, settings)
+    assert frozen.fingerprint("momentum", h1, parsed.in_sample_start) == H1_FINGERPRINT
+    assert BUFFER_KEY not in frozen.canonical_frozen_set(_combined_params(settings), "combined")
+
+
+def test_buffer_at_a_non_default_value_is_another_hypothesis(tmp_path: Path) -> None:
+    from tradepartner.store import registry
+
+    settings = _defaults_settings()
+    twin = _new_params(settings)
+    twin_canonical = frozen.canonical_frozen_set(twin, "momentum")
+    start = date(2017, 1, 31)
+    seen = {TWIN_FINGERPRINT}
+    for value in ("0.20", "0.30"):
+        params = hypothesis.frozen_params(
+            hypothesis.parse_file(_twin_with(tmp_path, f"hold_top_fraction = {value}")), settings
+        )
+        assert params[BUFFER_KEY] == float(value)
+        fingerprint = frozen.fingerprint("momentum", params, start)
+        assert fingerprint not in seen
+        seen.add(fingerprint)
+        canonical = frozen.canonical_frozen_set(params, "momentum")
+        assert canonical[BUFFER_KEY] == float(value)
+        assert {k: v for k, v in canonical.items() if k != BUFFER_KEY} == twin_canonical
+        assert registry.params_sha256(canonical) != TWIN_PRE_LAB_PARAMS_SHA256
+
+
+# --- the `portfolio` section (backtest spec amendment #1872, T219) --------------------
+
+PORTFOLIO_ENTRIES = (
+    ("portfolio.side", "long_only", 34),
+    ("portfolio.gross_exposure", 1.0, 34),
+    ("portfolio.net_exposure", 1.0, 34),
+    ("portfolio.short_min_price", 5.0, 34),
+    ("portfolio.short_cover_weight", 0.10, 34),
+)
+
+
+def test_portfolio_entries_are_pinned_by_value() -> None:
+    """Appended after T238's buffer entry (T221's two borrow entries follow them), at the
+    schema version current when they landed, in the spec item 1 order."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-7:-2], PORTFOLIO_ENTRIES)
+    for key, _default, _version in PORTFOLIO_ENTRIES:
+        assert key in hypothesis.frozen_keys()
+
+
+def test_post_registration_portfolio_keys_pinned_and_each_a_portfolio_table_key() -> None:
+    """Append-only, disjoint from the other post-registration sets and the baseline."""
+    assert frozenset(PORTFOLIO_KEYS) == frozen.POST_REGISTRATION_PORTFOLIO_KEYS
+    table = {key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    for key in frozen.POST_REGISTRATION_PORTFOLIO_KEYS:
+        assert key in table
+        assert key.partition(".")[0] == "portfolio"
+    for other in (
+        frozen.POST_REGISTRATION_OWN_KEYS,
+        frozen.POST_REGISTRATION_COST_KEYS,
+        frozen.POST_REGISTRATION_ADJUST_KEYS,
+        frozen.LAB_BASELINE_FROZEN_KEYS,
+    ):
+        assert not frozen.POST_REGISTRATION_PORTFOLIO_KEYS & other
+
+
+def test_portfolio_keys_are_fingerprint_keys() -> None:
+    assert set(PORTFOLIO_KEYS) <= set(frozen._FINGERPRINT_KEYS)
+    assert "portfolio" not in frozen._FINGERPRINT_SECTIONS
+
+
+def test_portfolio_at_its_defaults_moves_no_canonical_set_or_fingerprint(
+    settings: Settings,
+) -> None:
+    """`portfolio` is listed by no family, so every key is left out of the canonical set
+    at its default and the twin's fingerprint is unchanged."""
+    params = _new_params(settings)
+    for key, default, _version in PORTFOLIO_ENTRIES:
+        assert frozen.is_default(params[key], default), key
+    without = _before(params, PORTFOLIO_KEYS)
+    for family in ("momentum", "combined"):
+        assert frozen.fingerprint(family, params, IN_SAMPLE_START) == frozen.fingerprint(
+            family, without, IN_SAMPLE_START
+        )
+        assert frozen.canonical_frozen_set(params, family) == frozen.canonical_frozen_set(
+            without, family
+        )
+        assert not set(PORTFOLIO_KEYS) & set(frozen.canonical_frozen_set(params, family))
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("portfolio.side", "long_short"),
+        ("portfolio.gross_exposure", 0.5),
+        ("portfolio.net_exposure", 0.4),
+        ("portfolio.short_min_price", 3.0),
+        ("portfolio.short_cover_weight", 0.2),
+    ],
+)
+def test_a_non_default_portfolio_key_is_kept_and_moves_the_fingerprint(
+    settings: Settings, key: str, value: object
+) -> None:
+    """Kept in the canonical set (the guard refuses it in a file until T223, so the
+    params mapping is edited directly) and a new fingerprint: a long/short variant is a
+    new hypothesis identity."""
+    params = _new_params(settings)
+    twin_canonical = frozen.canonical_frozen_set(params, "momentum")
+    twin_fingerprint = frozen.fingerprint("momentum", params, IN_SAMPLE_START)
+    moved = {**params, key: value}
+    assert frozen.canonical_frozen_set(moved, "momentum") == {**twin_canonical, key: value}
+    assert frozen.fingerprint("momentum", moved, IN_SAMPLE_START) != twin_fingerprint
+
+
+# --- the borrow keys (backtest spec amendment #1872, item 6; T221) ---------------------
+
+BORROW_ENTRIES = (
+    ("costs.borrow_bps_per_year", 0.0, 34),
+    ("costs.borrow_sensitivity_bps", [], 34),
+)
+
+
+def test_borrow_entries_are_last_and_pinned_by_value() -> None:
+    """Appended after T219's `portfolio.*` entries, at the current schema version; both
+    are post-registration cost keys, the headline alone may only rise."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-2:], BORROW_ENTRIES)
+    for key, _default, _version in BORROW_ENTRIES:
+        assert key in hypothesis.frozen_keys()
+        assert key in frozen.POST_REGISTRATION_COST_KEYS
+        assert key in frozen._FINGERPRINT_KEYS
+    assert "costs.borrow_bps_per_year" in frozen.HIGHER_ALLOWED_COST_KEYS
+    assert "costs.borrow_sensitivity_bps" not in frozen.HIGHER_ALLOWED_COST_KEYS
+
+
+def test_borrow_keys_at_their_defaults_move_no_canonical_set_or_fingerprint(
+    settings: Settings,
+) -> None:
+    params = _new_params(settings)
+    for key, default, _version in BORROW_ENTRIES:
+        assert frozen.is_default(params[key], default), key
+    without = _before(params, tuple(k for k, _d, _v in BORROW_ENTRIES))
+    for family in ("momentum", "combined"):
+        assert frozen.fingerprint(family, params, IN_SAMPLE_START) == frozen.fingerprint(
+            family, without, IN_SAMPLE_START
+        )
+        assert frozen.canonical_frozen_set(params, family) == frozen.canonical_frozen_set(
+            without, family
+        )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("costs.borrow_bps_per_year", 30.0), ("costs.borrow_sensitivity_bps", [0.0, 300.0])],
+)
+def test_a_non_default_borrow_key_moves_the_fingerprint_but_not_the_promotion_identity(
+    settings: Settings, key: str, value: object
+) -> None:
+    from tradepartner.backtest import promotion
+
+    params = _new_params(settings)
+    moved = {**params, key: value}
+    assert frozen.fingerprint("momentum", moved, IN_SAMPLE_START) != frozen.fingerprint(
+        "momentum", params, IN_SAMPLE_START
+    )
+    assert promotion.promotion_identity(
+        "momentum", moved, IN_SAMPLE_START
+    ) == promotion.promotion_identity("momentum", params, IN_SAMPLE_START)

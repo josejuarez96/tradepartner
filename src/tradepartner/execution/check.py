@@ -254,15 +254,52 @@ def _rebalance_count_line(
         if e.run_id in runs and runs[e.run_id].invoked_by == _SCHEDULER
     }
     all_executed_sessions = {e.rebalance_session for e in executed}
+    missed_sessions = {e.rebalance_session for e in events if e.status == "missed"}
     tty_only_sessions = sorted(all_executed_sessions - scheduler_sessions)
     executed_run_ids = {e.run_id for e in executed}
-    no_trade_runs = sorted(
-        run.session
+    decision_sessions = {
+        row.decision.decision_id: row.decision.rebalance_session
+        for row in store_journal.decisions_for(conn, window_id)
+    }
+    order_sessions: dict[int, set[date | None]] = {}
+    for order in store_journal.orders_for(conn, window_id=window_id):
+        order_sessions.setdefault(order.run_id, set()).add(decision_sessions.get(order.decision_id))
+    order_run_ids = set(order_sessions)
+    uncounted_runs = [
+        run
         for run in runs.values()
         if run.session is not None
         and run.invoked_by == _SCHEDULER
         and run.kind in (_REBALANCE, _CATCH_UP)
         and run.run_id not in executed_run_ids
+    ]
+    no_trade_runs = sorted(
+        run.session
+        for run in uncounted_runs
+        if run.session is not None and run.run_id not in order_run_ids
+    )
+    missed_runs = sorted(
+        run.session
+        for run in uncounted_runs
+        if run.session is not None
+        and run.run_id in order_run_ids
+        and order_sessions[run.run_id] & missed_sessions
+    )
+    awaiting_runs = sorted(
+        run.session
+        for run in uncounted_runs
+        if run.session is not None
+        and run.run_id in order_run_ids
+        and not order_sessions[run.run_id] & missed_sessions
+        and not all(session in all_executed_sessions for session in order_sessions[run.run_id])
+    )
+    recorded_runs = sorted(
+        run.session
+        for run in uncounted_runs
+        if run.session is not None
+        and run.run_id in order_run_ids
+        and not order_sessions[run.run_id] & missed_sessions
+        and all(session in all_executed_sessions for session in order_sessions[run.run_id])
     )
 
     count = len(scheduler_sessions)
@@ -278,6 +315,17 @@ def _rebalance_count_line(
     if no_trade_runs:
         no_trade_text = ", ".join(s.isoformat() for s in no_trade_runs)
         detail += f"; no-trade fill-session runs, listed not counted: [{no_trade_text}]"
+    if awaiting_runs:
+        submitted_text = ", ".join(s.isoformat() for s in awaiting_runs)
+        detail += f"; submitted-order runs awaiting recorded fills, not counted: [{submitted_text}]"
+    if missed_runs:
+        missed_text = ", ".join(s.isoformat() for s in missed_runs)
+        detail += f"; submitted-order runs, rebalance missed, not counted: [{missed_text}]"
+    if recorded_runs:
+        recorded_text = ", ".join(s.isoformat() for s in recorded_runs)
+        detail += (
+            f"; submitted-order runs, fills recorded by a later run, not counted: [{recorded_text}]"
+        )
     return CheckLine(name="rebalance_count", passed=passed, query=query, detail=detail)
 
 

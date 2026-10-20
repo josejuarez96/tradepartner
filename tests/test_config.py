@@ -37,6 +37,7 @@ from tradepartner.config import (
     ExecutionConfig,
     HypothesisFamily,
     PaperConfig,
+    PortfolioConfig,
     ProfitabilityConfig,
     ReferenceName,
     RiskConfig,
@@ -1235,6 +1236,7 @@ def test_lab_defaults() -> None:
         "strategy.weighting",
         "strategy.signal_total_return",
         "strategy.turnover_top_fraction",
+        "strategy.hold_top_fraction",
         "schedule.rebalance_cadence",
         "schedule.signal_anchor",
     ]
@@ -1472,6 +1474,7 @@ def test_default_sweepable_keys_derives_at_today_s_value() -> None:
         "strategy.weighting",
         "strategy.signal_total_return",
         "strategy.turnover_top_fraction",
+        "strategy.hold_top_fraction",
         "schedule.rebalance_cadence",
         "schedule.signal_anchor",
     )
@@ -1489,8 +1492,13 @@ def test_momentum_family_spec() -> None:
     assert spec.engine_ready is True
     assert spec.paper_ready is True
     # B10's screen (#1358): its reason and counts, reported only below 1.0.
-    assert spec.exclusion_reasons == ("no_history", "no_turnover")
-    assert spec.count_names == ("n_excluded_no_history", "n_screened", "n_excluded_no_turnover")
+    assert spec.exclusion_reasons == ("no_history", "no_turnover", "no_t0_bar")
+    assert spec.count_names == (
+        "n_excluded_no_history",
+        "n_screened",
+        "n_excluded_no_turnover",
+        "n_retained",
+    )
     assert spec.benchmark == "MTUM"
     assert spec.sweepable_keys == (
         "strategy.formation_months",
@@ -1499,6 +1507,7 @@ def test_momentum_family_spec() -> None:
         "strategy.weighting",
         "strategy.signal_total_return",
         "strategy.turnover_top_fraction",
+        "strategy.hold_top_fraction",
     )
 
 
@@ -1528,7 +1537,13 @@ def test_profitability_family_spec() -> None:
     assert spec.parent is None
     assert spec.engine_ready is True
     assert spec.paper_ready is True
-    assert spec.exclusion_reasons == ("sector", "no_facts", "stale_facts", "malformed")
+    assert spec.exclusion_reasons == (
+        "sector",
+        "no_facts",
+        "stale_facts",
+        "malformed",
+        "no_t0_bar",
+    )
     assert spec.count_names == (
         "n_ranked",
         "n_excluded_no_facts",
@@ -1597,6 +1612,7 @@ def test_combined_family_spec() -> None:
         "stale_facts",
         "malformed",
         "one_signal_only",
+        "no_t0_bar",
     )
     assert spec.count_names == (
         "n_excluded_no_history",
@@ -2955,3 +2971,214 @@ def test_a_window_frozen_with_a_bad_short_key_is_refused(key: str, value: float)
     assert getattr(frozen_risk(_window(_frozen_today())), key) == _SHORT_KEYS[key]
     with pytest.raises(ValueError, match=key):
         frozen_risk(_window(_frozen_today(**{key: value})))
+
+
+# --- the known-answer index check (#1598, T243) ---------------------------------
+
+
+def test_index_check_defaults_are_the_amendments_eight_keys() -> None:
+    cfg = Settings(_env_file=None).index_check
+    assert cfg.model_dump() == {
+        "start_month": "2019-08",
+        "end_month": "2026-09",
+        "check_only_symbols": ["RSP"],
+        "equal_benchmark": "RSP",
+        "cap_benchmark": "SPY",
+        "worst_months": 10,
+        "names_per_month": 5,
+        "extreme_name_return": 0.60,
+    }
+
+
+def test_index_check_refuses_a_symbol_in_both_lists() -> None:
+    with pytest.raises(ValueError, match=r"index_check\.check_only_symbols \['RSP'\]"):
+        Settings(_env_file=None, benchmarks=["SPY", "RSP"])
+    with pytest.raises(ValueError, match="also in benchmarks"):
+        Settings(_env_file=None, index_check={"check_only_symbols": ["SPY"]})
+    assert Settings(_env_file=None, benchmarks=["SPY"]).benchmarks == ["SPY"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"start_month": "2019-13"},
+        {"end_month": "2026-9"},
+        {"start_month": "2026-09", "end_month": "2019-08"},
+        {"worst_months": 0},
+        {"names_per_month": 0},
+        {"extreme_name_return": 0.0},
+        {"extreme_name_return": float("nan")},
+        {"unknown_key": 1},
+    ],
+)
+def test_invalid_index_check_config_is_rejected(bad: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, index_check=bad)
+
+
+def test_index_check_is_in_no_hypothesis_key_set() -> None:
+    from tradepartner.backtest.frozen import FROZEN_KEY_DEFAULTS
+
+    assert not [k for k, _, _ in FROZEN_KEY_DEFAULTS if k.startswith("index_check")]
+
+
+# --- the buy/hold buffer key (backtest spec amendment #657, T238) ----------------------
+
+
+def test_hold_top_fraction_defaults_to_no_buffer() -> None:
+    for s in (_settings().strategy, StrategyConfig()):
+        assert s.hold_top_fraction == 0.0
+        assert type(s.hold_top_fraction) is float
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({"hold_top_fraction": 0.0}, 0.0),
+        ({"hold_top_fraction": 0.20}, 0.20),
+        ({"hold_top_fraction": 1.0}, 1.0),
+        ({"top_fraction": 0.2, "hold_top_fraction": 0.2}, 0.0),  # normalised
+        ({"top_fraction": 0.10, "hold_top_fraction": 0.10}, 0.0),
+        ({"top_fraction": 1.0, "hold_top_fraction": 1.0}, 0.0),
+        ({"top_fraction": 0.3, "hold_top_fraction": 0.3000001}, 0.3000001),
+    ],
+)
+def test_hold_top_fraction_accepts_zero_or_top_to_one(
+    override: dict[str, float], expected: float
+) -> None:
+    assert StrategyConfig(**override).hold_top_fraction == expected  # type: ignore[arg-type]
+    validated = Settings.model_validate({"strategy": override}).strategy
+    assert validated.hold_top_fraction == expected
+
+
+def test_hold_top_fraction_below_top_is_refused_naming_both_keys() -> None:
+    with pytest.raises(ValidationError, match=r"hold_top_fraction.*top_fraction"):
+        StrategyConfig(top_fraction=0.10, hold_top_fraction=0.05)
+    with pytest.raises(ValidationError, match=r"hold_top_fraction.*top_fraction"):
+        StrategyConfig(hold_top_fraction=0.05)  # the default top_fraction is 0.10
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5, float("nan"), float("inf")])
+def test_hold_top_fraction_rejects_out_of_range_values(bad: float) -> None:
+    with pytest.raises(ValidationError):
+        StrategyConfig(hold_top_fraction=bad)
+
+
+def test_hold_top_fraction_with_hold_weighting_is_refused() -> None:
+    with pytest.raises(ValidationError, match=r"hold_top_fraction.*hold"):
+        StrategyConfig(weighting="hold", hold_top_fraction=0.20)
+    # Normalised to the default, it is not a non-default value.
+    assert StrategyConfig(weighting="hold", hold_top_fraction=0.10).hold_top_fraction == 0.0
+    assert StrategyConfig(weighting="hold").hold_top_fraction == 0.0
+
+
+def test_momentum_family_gains_the_buffer_key_and_count() -> None:
+    spec = FAMILIES["momentum"]
+    assert spec.sweepable_keys[-1] == "strategy.hold_top_fraction"
+    assert spec.count_names[-1] == "n_retained"
+    for other in ("oracle", "profitability", "combined"):
+        assert "strategy.hold_top_fraction" not in FAMILIES[other].sweepable_keys  # type: ignore[index]
+        assert "n_retained" not in FAMILIES[other].count_names  # type: ignore[index]
+
+
+# --- the `portfolio` section (T219; backtest spec amendment #1872, item 1) -------------
+
+
+def test_portfolio_defaults() -> None:
+    """The five keys load at the values the spec's Config keys list gives."""
+    for p in (_settings().portfolio, PortfolioConfig()):
+        assert p.side == "long_only"
+        assert p.gross_exposure == pytest.approx(1.0)
+        assert p.net_exposure == pytest.approx(1.0)
+        assert p.short_min_price == pytest.approx(5.0)
+        assert p.short_cover_weight == pytest.approx(0.10)
+    assert set(get_args(PortfolioConfig.model_fields["side"].annotation)) == {
+        "long_only",
+        "long_short",
+    }
+
+
+def test_portfolio_is_a_settings_section() -> None:
+    assert Settings.model_fields["portfolio"].annotation is PortfolioConfig
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"side": "long_short"},
+        {"gross_exposure": 0.5, "net_exposure": 0.5},
+        {"net_exposure": 0.5},
+        {"short_min_price": 3.0},
+        {"short_cover_weight": 0.2},
+    ],
+)
+def test_portfolio_refuses_each_non_default_until_t223(override: dict[str, object]) -> None:
+    """T219's #1788 guard: the engine reads none of the five until T223, so a non-default
+    value raises naming T223, through `PortfolioConfig` and through
+    `Settings.model_validate`, which registration goes through (T223 removes the guard)."""
+    with pytest.raises(ValidationError, match="T223"):
+        PortfolioConfig(**override)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="T223"):
+        Settings.model_validate({"portfolio": override})
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"side": "bogus"},
+        {"gross_exposure": 0.0},
+        {"gross_exposure": 1.5},
+        {"net_exposure": 2.0},
+        {"short_min_price": 0.0},
+        {"short_min_price": -1.0},
+        {"short_cover_weight": 0.0},
+        {"short_cover_weight": 1.5},
+    ],
+)
+def test_portfolio_rejects_out_of_range_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        PortfolioConfig(**override)  # type: ignore[arg-type]
+
+
+def test_portfolio_exposure_relation_is_pinned_for_t223() -> None:
+    """The guard refuses every non-default value today, so the relation
+    (`net_exposure` in `[-gross, gross]`, equal to it under `long_only`) is pinned by
+    calling the validator directly on constructed values (T223 removes the guard and the
+    relation becomes the live check)."""
+    row = {"short_min_price": 5.0, "short_cover_weight": 0.10}
+    outside = PortfolioConfig.model_construct(
+        side="long_short", gross_exposure=0.5, net_exposure=0.8, **row
+    )
+    with pytest.raises(ValueError, match="net_exposure"):
+        PortfolioConfig._validate_exposures(outside)
+    long_only = PortfolioConfig.model_construct(
+        side="long_only", gross_exposure=1.0, net_exposure=0.5, **row
+    )
+    with pytest.raises(ValueError, match="long_only"):
+        PortfolioConfig._validate_exposures(long_only)
+
+
+# --- the borrow keys (T221; backtest spec amendment #1872, item 6) ----------------------
+
+
+def test_borrow_key_defaults() -> None:
+    """A long-only book pays no borrow and lists no sensitivity rate."""
+    for costs in (_settings().costs, CostsConfig()):
+        assert costs.borrow_bps_per_year == pytest.approx(0.0)
+        assert costs.borrow_sensitivity_bps == []
+
+
+def test_borrow_keys_accept_non_negative_rates() -> None:
+    costs = CostsConfig(borrow_bps_per_year=30.0, borrow_sensitivity_bps=[0.0, 30.0, 300.0])
+    assert costs.borrow_bps_per_year == pytest.approx(30.0)
+    assert costs.borrow_sensitivity_bps == [0.0, 30.0, 300.0]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"borrow_bps_per_year": -1.0}, {"borrow_sensitivity_bps": [30.0, -0.5]}],
+)
+def test_a_negative_borrow_rate_is_refused(override: dict[str, object]) -> None:
+    """A negative fee would pay the short book to hold its positions."""
+    with pytest.raises(ValueError, match="borrow"):
+        CostsConfig(**override)  # type: ignore[arg-type]
