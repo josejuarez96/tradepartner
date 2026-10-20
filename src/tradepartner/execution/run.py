@@ -260,6 +260,7 @@ from tradepartner.execution.reconcile_run import (
     reconcile_now,
     settle_pending_unresolved,
     unresolved_orders,
+    verify_frozen_sha256,
 )
 from tradepartner.execution.risk import OpenSell, unfilled_sells
 from tradepartner.execution.symbols import broker_symbol
@@ -1468,6 +1469,9 @@ class _Run:
     # --- the steps -----------------------------------------------------------------
 
     def _steps(self) -> RunOutcome:
+        # First, before any broker read: limits edited after `paper start` halt the
+        # run (a `LimitBreachError`, the halt path) and nothing is sent (#1984).
+        verify_frozen_sha256(self.window)
         account = self._broker_call(Broker.account.__name__, self.broker.account)
         if account.account_id != self.window.account_id:
             raise ReconciliationError(
