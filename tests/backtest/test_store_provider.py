@@ -549,6 +549,49 @@ def test_the_spin_off_reads_see_nothing_known_after_t(store: Store) -> None:
     assert unvalued.is_empty() and late.is_empty()
 
 
+def test_a_second_child_of_one_parent_is_late_on_its_own(store: Store) -> None:
+    """The fixture's `spinoff` row is the parent's first child; a second child's row, first
+    known later, is late on its own — the late match keys the child, not just the parent
+    (spec amendment #1894, items 2 and 4)."""
+    with open_for_write(Settings(_env_file=None, store={"path": str(store.path)})) as conn:
+        insert_row(
+            conn,
+            "corporate_actions",
+            {
+                "security_id": "SEC_SPINOFF_CHILD2",
+                "action_type": "spinoff",
+                "ex_date": date(2018, 12, 13),
+                "ratio_or_amount": 0.1,
+                "announced_at": None,
+                "source_action_id": "SEC_TICKCHANGE",
+                "cancelled": False,
+                "known_at": datetime(2018, 12, 20, 21, 0, tzinfo=UTC),
+                "ingested_at": datetime(2018, 12, 20, 21, 10, tzinfo=UTC),
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+    try:
+        with store.provider() as provider:
+            late = provider.late_spin_offs(
+                session_close(date(2018, 12, 14)),
+                session_close(date(2018, 12, 21)),
+                ["SEC_TICKCHANGE"],
+            )
+        # The first child was known at `t_prev`; only the second, known 2018-12-20, is late.
+        assert late.rows() == [
+            (
+                "SEC_TICKCHANGE",
+                date(2018, 12, 13),
+                0.1,
+                datetime(2018, 12, 20, 21, 0, tzinfo=UTC),
+            )
+        ]
+    finally:
+        with open_for_write(Settings(_env_file=None, store={"path": str(store.path)})) as conn:
+            conn.execute("DELETE FROM corporate_actions WHERE security_id = 'SEC_SPINOFF_CHILD2'")
+
+
 def test_static_listing_count(store: Store) -> None:
     ids = ["SEC_STATIC_PRE2019", "SEC_DUAL_A", "SEC_SPY"]
     with store.provider() as provider:

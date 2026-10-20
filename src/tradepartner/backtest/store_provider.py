@@ -127,8 +127,11 @@ Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 
 _ACTION_KEY: Final = ("security_id", "action_type", "ex_date")
 _LATE_COLUMNS: Final = ("security_id", "ex_date", "ratio_or_amount", "known_at")
-#: `late_spin_offs`'s empty frame: the parent in `security_id`, the same four columns.
+#: `late_spin_offs`'s frame while it is read: the child in `security_id` (the action's
+#: own key), the parent re-keyed, so the two children of one parent on one ex-date stay
+#: two rows and a late second one is not swallowed by the first.
 _LATE_SPIN_OFF_SCHEMA: Final[dict[str, Any]] = {
+    "child": pl.Utf8,
     "security_id": pl.Utf8,
     "ex_date": pl.Date,
     "ratio_or_amount": pl.Float64,
@@ -141,17 +144,19 @@ def _latest_spin_offs(
     conn: duckdb.DuckDBPyConnection, at: datetime, parents: Sequence[str]
 ) -> pl.DataFrame:
     """The latest-revision `spinoff` rows as of `at` whose **parent** is in `parents`, one
-    row per action identity, the parent re-keyed into `security_id` (spec amendment #1894,
-    item 2: a `spinoff` row's `security_id` is the child, its parent is in
-    `source_action_id`). Rows are keyed by `_ACTION_IDENTITY_PARTITION` and a cancelled
-    revision is dropped, exactly as `adjusted_prices_as_of` reads the table, so a re-dated
-    or cancelled row cannot count twice; the two children of one parent on one ex-date are
-    two rows. `parents` empty selects nothing, as `_security_filter` gives."""
+    row per action identity, the child kept in `child` and the parent re-keyed into
+    `security_id` (spec amendment #1894, item 2: a `spinoff` row's `security_id` is the
+    child, its parent is in `source_action_id`). Rows are keyed by
+    `_ACTION_IDENTITY_PARTITION` and a cancelled revision is dropped, exactly as
+    `adjusted_prices_as_of` reads the table, so a re-dated or cancelled row cannot count
+    twice; the two children of one parent on one ex-date are two rows. `parents` empty
+    selects nothing, as `_security_filter` gives."""
     if not parents:
         return pl.DataFrame(schema=_LATE_SPIN_OFF_SCHEMA)
     return conn.execute(
         f"""
-        SELECT source_action_id AS security_id, ex_date, ratio_or_amount, known_at
+        SELECT security_id AS child, source_action_id AS security_id, ex_date,
+               ratio_or_amount, known_at
         FROM (
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY {_ACTION_IDENTITY_PARTITION} ORDER BY known_at DESC
@@ -161,7 +166,7 @@ def _latest_spin_offs(
               AND source_action_id IN (SELECT unnest(?))
         )
         WHERE _rn = 1 AND NOT cancelled
-        ORDER BY security_id, ex_date
+        ORDER BY security_id, ex_date, child
         """,
         [at, list(parents)],
     ).pl()
@@ -349,10 +354,11 @@ class StoreProvider:
             raise ValueError(f"t_prev {t_prev.isoformat()} is not before t {t.isoformat()}")
         conn = self._at(t)
         prev_session = last_completed_session(t_prev)
-        known_before = _latest_spin_offs(conn, t_prev, wanted).select("security_id", "ex_date")
+        key = ["child", "security_id", "ex_date"]
+        known_before = _latest_spin_offs(conn, t_prev, wanted).select(key)
         late = (
             _latest_spin_offs(conn, t, wanted)
-            .join(known_before, on=["security_id", "ex_date"], how="anti")
+            .join(known_before, on=key, how="anti")
             .filter(pl.col("ex_date") <= prev_session)
         )
         return late.select(_LATE_COLUMNS).sort("security_id", "ex_date")

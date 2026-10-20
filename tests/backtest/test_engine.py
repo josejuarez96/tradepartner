@@ -509,8 +509,8 @@ class TestSpinOffs:
     spin-off is a dividend in kind (item 2), and a late one matches a late dividend
     (item 4).
 
-    The store's own frames are the hand fixture of `tests/lookahead/test_spin_off.py`: a
-    parent P flat at 100, a child C whose ex-date close is 20, a ratio of 0.5, so
+    The store's own frames are the hand fixture of `tests/lookahead/test_spin_off.py`: the
+    held parent A flat at 100, a child C whose ex-date close is 20, a ratio of 0.5, so
     D = r x C = 10 and the factor is 0.9. `test_a_valued_spin_off_equals_the_dividend_in_kind`
     reads them through `adjusted_prices_as_of`, so the engine's equity over the two is
     the store's frame equality, not a stand-in's."""
@@ -569,15 +569,16 @@ class TestSpinOffs:
         return pl.DataFrame(rows, schema=schema, orient="row")
 
     def _store_frames(self) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-        """`(spin_off, unadjusted, dividend)`: the store's frames for P over the module
-        sessions, once with the `spinoff` row (child C at 20, ratio 0.5, ex 2024-02-15),
-        once without it, and once with the dividend of r x C = 10 in its place."""
+        """`(spin_off, unadjusted, dividend)`: the store's frames for the held name A over
+        the module sessions, once with the `spinoff` row (child C at 20, ratio 0.5, ex
+        2024-02-15), once without it, and once with the dividend of r x C = 10 in its
+        place. The parent is A, the member the engine actually holds."""
         conn = duckdb.connect(":memory:")
         configure_connection(conn)
         schema.init_schema(conn)
         for session in SESSIONS:
             conn_bar = self.P - self.D if session >= self.EX else self.P
-            insert_row(conn, "prices_daily", self._bar("P", session, conn_bar))
+            insert_row(conn, "prices_daily", self._bar("A", session, conn_bar))
         for session in SESSIONS:
             if session >= self.EX:
                 insert_row(conn, "prices_daily", self._bar("C", session, self.D / self.RATIO))
@@ -590,7 +591,7 @@ class TestSpinOffs:
                 "ex_date": self.EX,
                 "ratio_or_amount": self.RATIO,
                 "announced_at": None,
-                "source_action_id": "P",
+                "source_action_id": "A",
                 "cancelled": False,
                 "known_at": session_close(self.EX),
                 "ingested_at": session_close(self.EX),
@@ -601,17 +602,17 @@ class TestSpinOffs:
         settings = Settings(_env_file=None)
         t = session_close(T2)
         spin = adjusted_prices_as_of(
-            conn, t, ["P"], include_dividends=True, include_spin_offs=True, settings=settings
+            conn, t, ["A"], include_dividends=True, include_spin_offs=True, settings=settings
         )
         unadjusted = adjusted_prices_as_of(
-            conn, t, ["P"], include_dividends=True, settings=settings
+            conn, t, ["A"], include_dividends=True, settings=settings
         )
         conn.execute("DELETE FROM corporate_actions")
         insert_row(
             conn,
             "corporate_actions",
             {
-                "security_id": "P",
+                "security_id": "A",
                 "action_type": "dividend",
                 "ex_date": self.EX,
                 "ratio_or_amount": self.D,
@@ -624,7 +625,7 @@ class TestSpinOffs:
                 "provenance": "action",
             },
         )
-        dividend = adjusted_prices_as_of(conn, t, ["P"], include_dividends=True, settings=settings)
+        dividend = adjusted_prices_as_of(conn, t, ["A"], include_dividends=True, settings=settings)
         conn.close()
         return spin, unadjusted, dividend
 
@@ -738,6 +739,7 @@ class TestSpinOffs:
             levels=[0.0],
         )[0.0]
         assert _equity(on) == pytest.approx(_equity(off), rel=1e-12)
+        assert all(row.n_targets == 1 for row in on.rebalances)  # A is held, not cash
         assert all(row.counts.get("n_spin_offs_unvalued") == 0 for row in on.rebalances)
         assert all(row.counts.get("n_late_spin_offs") == 0 for row in on.rebalances)
         assert all("n_spin_offs_unvalued" not in row.counts for row in off.rebalances)
@@ -772,6 +774,7 @@ class TestSpinOffs:
             self._provider(dividend_row=dividend_row), self._params(on=False), end=T4, levels=[0.0]
         )[0.0]
         assert _equity(on) == pytest.approx(_equity(off), rel=1e-12)
+        assert all(row.n_targets == 1 for row in on.rebalances)  # A is held, not cash
         # The ex-date drop is never restated: the loss is permanent.
         assert _equity(on)[T1] == pytest.approx(
             _equity(on)[F0] * (self.P - self.D) / self.P, rel=1e-9
