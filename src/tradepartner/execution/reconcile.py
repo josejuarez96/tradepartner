@@ -79,7 +79,16 @@ difference an allowance absorbs is listed under `allowed`.
   name. It is not journaled when the cash does not show it. Beside an ended
   listing the proceeds take the cash first, and the dividends are journaled
   beside them only when the cash exceeds the proceeds' cap (#400). A
-  negative amount due raises `ValueError`.
+  negative amount due raises `ValueError` unless the name is a short in
+  `Ledger.short_holdings`, where the due is negative (-quantity x amount) and
+  the cash band is [due, 0]: no debit passes and journals nothing, the whole
+  due debited passes and journals a negative `dividend_cash`, and a positive
+  due on a short raises (T233, paper spec item 10).
+- A short (`Ledger.short_holdings`) is compared as a negative quantity against
+  the broker's. Any difference no own fill explains (a buy-in, a recall, an
+  external add, a broker long) is a `short_external_change` mismatch on the
+  name, never adopted; our own lagging fills explain it through the allowances
+  above. A cash merger on a short is not explained here (#1930): it halts.
 - A held name with an equal-amount dividend group the reviewed list does not
   explain (`explanations.dividend_findings`, #1625) is an
   `unexplained_dividend_group` mismatch whatever the cash shows: the caller
@@ -542,6 +551,14 @@ def compare(
     mismatches += _order_mismatches(open_orders, lagging, order_id_prefix)
 
     expected = dict(ledger.positions)
+    # A short is signed negative here, so the broker's negative quantity compares
+    # against it directly and the lag bands (a buy widens up, a sell down) read
+    # a cover or an open the right way round (T233).
+    shorts = frozenset(name for name, held in ledger.short_holdings.items() if held > q_tol)
+    for name in shorts:
+        if name in expected and abs(expected[name]) > q_tol:
+            raise ValueError(f"{name} is held long and short in one ledger")
+        expected[name] = -_finite(ledger.short_holdings[name], f"short quantity of {name}")
     broker: dict[str, float] = {}
     for symbol, position in positions.items():
         security_id = security_of.get(symbol)
@@ -649,13 +666,25 @@ def compare(
         name: _finite(amount, f"dividend due on {name}")
         for name, amount in sorted(explanations.dividends.items())
     }
-    negative = sorted(name for name, amount in dividends.items() if amount < 0)
+    # A short's due is negative (-quantity x amount; item 10) and its cash band is
+    # [due, 0]; a long's is [0, due]. A negative due on any other name, or a
+    # positive one on a short, is the caller's fault.
+    negative = sorted(
+        name for name, amount in dividends.items() if amount < 0 and name not in shorts
+    )
     if negative:
         raise ValueError(f"dividend due is negative for {negative}")
+    positive_short = sorted(
+        name for name, amount in dividends.items() if amount > 0 and name in shorts
+    )
+    if positive_short:
+        raise ValueError(f"dividend due is positive for the short {positive_short}")
     credited = math.fsum(dividends.values())
     if deferring and dividends:
-        # A credit while an allowance is open is allowed, never journaled (#399).
-        cash_band.widen(credited)
+        # A credit (or a short's debit) while an allowance is open is allowed,
+        # never journaled (#399).
+        for amount in dividends.values():
+            cash_band.widen(amount)
         allowed += [
             Allowed("deferred dividend", amount, name) for name, amount in dividends.items()
         ]
@@ -686,9 +715,20 @@ def compare(
         for name in removed:
             expected.pop(name)
     elif not cash_ok and dividends and not deferring:
-        if abs(difference_decimal - Decimal(str(credited))) <= cash_bound:
-            cash_ok = True
-            explained += _dividend_adjustments(dividends)
+        # Everything paid, then the longs' credits alone, then the shorts' debits
+        # alone; the first that the difference matches is journaled.
+        subsets = (
+            dividends,
+            {n: a for n, a in dividends.items() if n not in shorts},
+            {n: a for n, a in dividends.items() if n in shorts},
+        )
+        for subset in subsets:
+            if subset and abs(difference_decimal - Decimal(str(math.fsum(subset.values())))) <= (
+                cash_bound
+            ):
+                cash_ok = True
+                explained += _dividend_adjustments(subset)
+                break
     if not cash_ok:
         mismatches.append(Mismatch("cash", f"broker {account.cash}, ledger {ledger.cash}"))
     elif abs(difference_decimal) > cash_bound and deferring:
@@ -732,6 +772,7 @@ def compare(
             band,
             explanations.symbols.get(security_id),
             q_tol,
+            short=security_id in shorts,
         )
         if found:
             mismatches.append(found)
@@ -942,6 +983,8 @@ def _position_mismatch(
     band: _Band,
     symbol: str | None,
     tolerance: float,
+    *,
+    short: bool = False,
 ) -> Mismatch | None:
     held = abs(expected) > tolerance
     if symbol is None:
@@ -952,7 +995,11 @@ def _position_mismatch(
         )
     if band.allows((broker or 0.0) - expected, tolerance):
         return None
-    if broker is None:
+    if short:
+        # Any short change our own fills do not explain: a buy-in, a recall, an
+        # external add, or the wrong sign (paper spec items 9 and 10).
+        kind = "short_external_change"
+    elif broker is None:
         kind = "ledger_only_position"
     elif not held:
         kind = "broker_only_position"
