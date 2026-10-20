@@ -1491,7 +1491,7 @@ def test_momentum_family_spec() -> None:
     assert spec.engine_ready is True
     assert spec.paper_ready is True
     # B10's screen (#1358): its reason and counts, reported only below 1.0.
-    assert spec.exclusion_reasons == ("no_history", "no_turnover")
+    assert spec.exclusion_reasons == ("no_history", "no_turnover", "no_t0_bar")
     assert spec.count_names == (
         "n_excluded_no_history",
         "n_screened",
