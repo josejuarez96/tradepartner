@@ -1526,11 +1526,27 @@ class _Run:
             plan = self._plan(lagging)
             if plan.no_t0_bar:
                 # #1997: a candidate with no T_0 bar was excluded, visibly; the run goes on.
-                self._alert(
-                    "missing_candidate_bar",
-                    f"rebalance {plan.rebalance_session.isoformat()}: universe candidate(s) "
-                    "with no T_0 bar excluded as excluded_no_t0_bar: " + ", ".join(plan.no_t0_bar),
+                # #2023: a held one is kept at its quantity (a `skip_zero` decision), not sold.
+                kept = sorted(
+                    {
+                        d.security_id
+                        for d in plan.decisions
+                        if d.decision == "skip_zero" and d.security_id in plan.no_t0_bar
+                    }
                 )
+                others = [sid for sid in plan.no_t0_bar if sid not in kept]
+                message = (
+                    f"rebalance {plan.rebalance_session.isoformat()}: universe candidate(s) "
+                    "with no T_0 bar excluded as excluded_no_t0_bar: " + ", ".join(plan.no_t0_bar)
+                )
+                if kept:
+                    message += (
+                        "; held and kept at their current quantity until the next rebalance; "
+                        "re-ingest the bar or the next rebalance sells them: " + ", ".join(kept)
+                    )
+                    if others:
+                        message += "; not kept: " + ", ".join(others)
+                self._alert("missing_candidate_bar", message)
             # The halt path's write-off back-fill prices every name now decided.
             self.write_offs = WriteOffContext(
                 self.window_id, actions, self._pending_prices(actions).__getitem__, self.session
