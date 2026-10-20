@@ -1473,7 +1473,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         paper_ready=True,
         # `no_turnover` and its two counts are B10's screen, reported only when
         # `strategy.turnover_top_fraction` is below 1.0 (backtest spec amendment #1358).
-        exclusion_reasons=("no_history", "no_turnover"),
+        exclusion_reasons=("no_history", "no_turnover", "no_t0_bar"),
         count_names=("n_excluded_no_history", "n_screened", "n_excluded_no_turnover"),
         benchmark="MTUM",
         sweepable_keys=(
@@ -1491,7 +1491,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         parent=None,
         engine_ready=True,
         paper_ready=True,
-        exclusion_reasons=("no_history",),
+        exclusion_reasons=("no_history", "no_t0_bar"),
         count_names=("n_excluded_no_history",),
         benchmark="MTUM",
         sweepable_keys=(),
@@ -1504,7 +1504,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         # Paper-ready by the owner's word in ADR 0017 part D (ADR 0014 point 5, T152).
         paper_ready=True,
         # The four reasons `gross_profitability` may report (`backtest/signals.py:225`).
-        exclusion_reasons=("sector", "no_facts", "stale_facts", "malformed"),
+        exclusion_reasons=("sector", "no_facts", "stale_facts", "malformed", "no_t0_bar"),
         # The six count names of spec amendment #720 (T85d).
         count_names=(
             "n_ranked",
@@ -1538,6 +1538,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
             "stale_facts",
             "malformed",
             "one_signal_only",
+            "no_t0_bar",
         ),
         # Both sub-signals' counts plus `n_combined` (T130).
         count_names=(

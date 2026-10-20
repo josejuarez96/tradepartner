@@ -1520,6 +1520,13 @@ class _Run:
         elif self._due() is not None:
             plan = self._plan(lagging)
             rebalance = plan.rebalance_session
+            if plan.no_t0_bar:
+                # #1997: a candidate with no T_0 bar was excluded, visibly; the run goes on.
+                self._alert(
+                    "missing_candidate_bar",
+                    f"rebalance {plan.rebalance_session.isoformat()}: universe candidate(s) "
+                    "with no T_0 bar excluded as excluded_no_t0_bar: " + ", ".join(plan.no_t0_bar),
+                )
             # The halt path's write-off back-fill prices every name now decided.
             self.write_offs = WriteOffContext(
                 self.window_id, actions, self._pending_prices(actions).__getitem__, self.session

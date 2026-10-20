@@ -1489,7 +1489,7 @@ def test_momentum_family_spec() -> None:
     assert spec.engine_ready is True
     assert spec.paper_ready is True
     # B10's screen (#1358): its reason and counts, reported only below 1.0.
-    assert spec.exclusion_reasons == ("no_history", "no_turnover")
+    assert spec.exclusion_reasons == ("no_history", "no_turnover", "no_t0_bar")
     assert spec.count_names == ("n_excluded_no_history", "n_screened", "n_excluded_no_turnover")
     assert spec.benchmark == "MTUM"
     assert spec.sweepable_keys == (
@@ -1528,7 +1528,13 @@ def test_profitability_family_spec() -> None:
     assert spec.parent is None
     assert spec.engine_ready is True
     assert spec.paper_ready is True
-    assert spec.exclusion_reasons == ("sector", "no_facts", "stale_facts", "malformed")
+    assert spec.exclusion_reasons == (
+        "sector",
+        "no_facts",
+        "stale_facts",
+        "malformed",
+        "no_t0_bar",
+    )
     assert spec.count_names == (
         "n_ranked",
         "n_excluded_no_facts",
@@ -1597,6 +1603,7 @@ def test_combined_family_spec() -> None:
         "stale_facts",
         "malformed",
         "one_signal_only",
+        "no_t0_bar",
     )
     assert spec.count_names == (
         "n_excluded_no_history",
