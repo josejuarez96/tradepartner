@@ -97,7 +97,9 @@ def signed_target_weights(
     `gross_exposure` there at the default), and the result is `target_weights`' output
     exactly. A `gross == net` below 1.0 is still a signed book with no short leg: its
     long leg carries the `gross` share, not the whole book. Raises `ValueError` for a
-    `top_fraction` outside `(0, 1]` or a non-finite score, `gross` or `net`.
+    `top_fraction` outside `(0, 1]`, a non-finite score, `gross` or `net`, a `gross` at
+    or below 0, or a `net` outside `[-gross, gross]` (outside that range a "short" leg's
+    weight would turn into a long buy).
     """
     if not (0 < top_fraction <= 1):
         raise ValueError(f"top_fraction must be in (0, 1], got {top_fraction}")
@@ -107,6 +109,10 @@ def signed_target_weights(
     for name, value in (("gross", gross), ("net", net)):
         if not math.isfinite(value):
             raise ValueError(f"{name} must be finite, got {value}")
+    if gross <= 0:
+        raise ValueError(f"gross must be positive, got {gross}")
+    if not (-gross <= net <= gross):
+        raise ValueError(f"net must be in [{-gross}, {gross}], got {net}")
     if gross == net == 1.0:
         return target_weights(scores, top_fraction, "equal")
     if not scores:

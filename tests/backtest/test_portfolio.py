@@ -465,3 +465,14 @@ def test_signed_target_weights_rejects_non_finite_inputs() -> None:
         signed_target_weights({"A": 1.0}, 0.5, float("inf"), 0.0, eligible=["A"])
     with pytest.raises(ValueError, match="net"):
         signed_target_weights({"A": 1.0}, 0.5, 1.0, float("nan"), eligible=["A"])
+
+
+@pytest.mark.parametrize(
+    ("gross", "net"),
+    [(0.0, 0.0), (-0.5, -0.5), (1.0, 1.5), (0.4, -0.5)],
+)
+def test_signed_target_weights_rejects_an_exposure_out_of_range(gross: float, net: float) -> None:
+    """A `net` outside `[-gross, gross]` would make a "short" leg's weight a long buy,
+    so the pure function refuses it as the config validator does (spec item 1)."""
+    with pytest.raises(ValueError, match=r"gross|net"):
+        signed_target_weights({"A": 1.0}, 0.5, gross, net, eligible=["A"])
