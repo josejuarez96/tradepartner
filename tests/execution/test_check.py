@@ -408,21 +408,54 @@ def test_rebalance_count_lists_tty_and_no_trade_runs_without_counting_them(
     assert str(T1) in line.detail.split("no-trade fill-session runs")[-1]
 
 
-def test_rebalance_count_calls_a_run_with_orders_submitted_not_no_trade(settings: Settings) -> None:
+def test_rebalance_count_clears_awaiting_when_later_run_records_fills(settings: Settings) -> None:
     with open_for_write(settings) as conn:
-        _build_passing_fixture(conn, extra_no_trade_run=True)
+        _build_passing_fixture(conn, extra_no_trade_run=True, t1_executed_by=None)
+        fill_day = next_session(T1)
+        conn.execute(
+            "UPDATE paper_runs SET session = ?, kind = 'rebalance' WHERE run_id = 12", [fill_day]
+        )
         _insert_decision(conn, 12, 12, T1)
         conn.execute(
             "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, "
             "phase, security_id, symbol, side, notional, sells_in_flight_at_submit, "
             "known_at, ingested_at) VALUES ('pending-12', 12, 12, ?, 1, 'buy', "
             "'SEC_A', 'AAA', 'buy', 1000.0, FALSE, ?, ?)",
-            [T1, _utc(T1), _utc(T1)],
+            [fill_day, _utc(fill_day), _utc(fill_day)],
+        )
+        _insert_run(conn, 13, next_session(fill_day), kind="mark")
+        _insert_rebalance_event(conn, T1, 13)
+    with open_read_only(settings) as conn:
+        line = next(line for line in check(conn, settings) if line.name == "rebalance_count")
+    assert line.passed
+    assert line.detail.startswith(f"2 scheduler-executed rebalance session(s) [{T0}, {T1}]")
+    assert (
+        f"submitted-order runs, fills recorded by a later run, not counted: [{fill_day}]"
+        in line.detail
+    )
+    assert "awaiting recorded fills" not in line.detail
+    assert f"no-trade fill-session runs, listed not counted: [{fill_day}]" not in line.detail
+
+
+def test_rebalance_count_keeps_awaiting_until_fills_are_recorded(settings: Settings) -> None:
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn, extra_no_trade_run=True)
+        fill_day = next_session(T2)
+        conn.execute(
+            "UPDATE paper_runs SET session = ?, kind = 'rebalance' WHERE run_id = 12", [fill_day]
+        )
+        _insert_decision(conn, 12, 12, T2)
+        conn.execute(
+            "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, "
+            "phase, security_id, symbol, side, notional, sells_in_flight_at_submit, "
+            "known_at, ingested_at) VALUES ('pending-12', 12, 12, ?, 1, 'buy', "
+            "'SEC_A', 'AAA', 'buy', 1000.0, FALSE, ?, ?)",
+            [fill_day, _utc(fill_day), _utc(fill_day)],
         )
     with open_read_only(settings) as conn:
         line = next(line for line in check(conn, settings) if line.name == "rebalance_count")
-    assert f"submitted-order runs awaiting recorded fills, not counted: [{T1}]" in line.detail
-    assert f"no-trade fill-session runs, listed not counted: [{T1}]" not in line.detail
+    assert line.passed
+    assert f"submitted-order runs awaiting recorded fills, not counted: [{fill_day}]" in line.detail
 
 
 def test_two_executed_rows_on_one_rebalance_session_count_once(settings: Settings) -> None:

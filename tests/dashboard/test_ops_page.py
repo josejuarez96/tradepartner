@@ -14,6 +14,7 @@ import subprocess
 import sys
 import textwrap
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -445,9 +446,11 @@ def test_open_rebalance_order_explains_fill_timing(
         )
     at = _app(monkeypatch, seeded_store)
     assert not at.exception
-    assert "Fills are recorded at the next scheduled run (08:05 ET)" in _text(at)
+    assert "Fills are recorded at the next scheduled run" in _text(at)
+    assert "08:05 ET" not in _text(at)
     [picker] = at.selectbox
     assert any(option.startswith("AAPL") for option in picker.options)
+    assert any("tp-buy-pending" in option for option in picker.options)
     assert all("0002023554" not in option for option in picker.options)
 
 
@@ -455,7 +458,7 @@ def test_render_chain_detail_view(monkeypatch: pytest.MonkeyPatch, seeded_store:
     at = _app(monkeypatch, seeded_store)
     assert not at.exception
     [picker] = at.selectbox
-    assert picker.options == ["BBB #1"]
+    assert picker.options == ["BBB #1 (tp-buy-1)"]
     chain = _dataframe_with_columns(at, "kind", "detail")
     assert set(chain["kind"].to_list()) >= {"order", "order_event", "fill"}
 
@@ -643,6 +646,25 @@ def test_one_book_shows_its_summary_row_and_no_selector(
     summary = _dataframe_with_columns(at, "book", "next_rebalance", "kill_switch")
     assert summary["book"].to_list() == ["main"]
     assert all(sb.key != ops_page.BOOK_KEY for sb in at.selectbox)
+
+
+def test_summary_names_traded_rebalance_without_marking_next_daily_one_done(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    settings = Settings(_env_file=None, store={"path": str(seeded_store)})
+    with duckdb.connect(str(seeded_store), read_only=True) as conn:
+        (row,) = ops.book_summaries(conn, settings)
+    today = datetime(2026, 10, 30, 14, tzinfo=UTC)
+    monkeypatch.setattr(ops, "utc_now", lambda: today)
+    row = replace(
+        row,
+        last_run_kind="rebalance",
+        last_run_status="ok",
+        last_run_session=today.date(),
+        next_rebalance_session=today.date(),
+    )
+    (label,) = ops_page._summary_table((row,))["next_rebalance"].to_list()
+    assert label == "2026-10-30; rebalance 2026-10-29 traded today"
 
 
 def test_two_books_list_two_summary_rows_and_the_selector_switches_the_sections(

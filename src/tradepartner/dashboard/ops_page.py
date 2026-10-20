@@ -138,11 +138,12 @@ def _summary_table(summaries: tuple[ops.BookSummary, ...]) -> pl.DataFrame:
                 "kill_switch": _switch_text(row.switch_state),
                 "last_run": row.last_run_status,
                 "next_rebalance": (
-                    f"{row.next_rebalance_session} (today (done))"
-                    if row.last_run_kind == "rebalance"
-                    and row.last_run_status == "ok"
-                    and row.last_run_session == row.next_rebalance_session
-                    else str(row.next_rebalance_session or "-")
+                    str(row.next_rebalance_session or "-")
+                    + (
+                        f"; rebalance {traded} traded today"
+                        if (traded := ops.rebalance_traded_today(row)) is not None
+                        else ""
+                    )
                 ),
             }
             for row in summaries
@@ -312,7 +313,7 @@ def _chains_card(data: OpsData, symbols: dict[str, str]) -> None:
             st.caption("No orders yet in this window.")
             return
         labels = [
-            f"{symbols.get(c.client_order_id, 'Ticker unavailable')} #{i + 1}"
+            f"{symbols.get(c.client_order_id, 'Ticker unavailable')} #{i + 1} ({c.client_order_id})"
             for i, c in enumerate(data.chains)
         ]
         picked = st.selectbox(
@@ -384,7 +385,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
 
     _kpis(data)
     if data.open_orders_count and data.last_run_kind == "rebalance":
-        st.info("Fills are recorded at the next scheduled run (08:05 ET)")
+        st.info("Fills are recorded at the next scheduled run")
     symbols = _symbols(conn, data)
     palette = theme.palette()
     _ranking_hero(data, palette, symbols)

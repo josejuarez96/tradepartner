@@ -265,6 +265,17 @@ class BookSummary:
     next_rebalance_session: date | None
 
 
+def rebalance_traded_today(row: BookSummary) -> date | None:
+    """The rebalance traded by today's completed fill-session run, if any."""
+    if (
+        row.last_run_kind != "rebalance"
+        or row.last_run_status != "ok"
+        or row.last_run_session != utc_now().astimezone(_NEW_YORK).date()
+    ):
+        return None
+    return previous_session(row.last_run_session)
+
+
 def _latest(plans: list[PaperPlanRow]) -> PaperPlanRow | None:
     if not plans:
         return None

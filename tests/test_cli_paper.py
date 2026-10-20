@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import re
 from collections.abc import Callable
 from dataclasses import replace
@@ -1599,20 +1600,49 @@ def test_status_all_prints_one_summary_line_per_book(
 
 
 @pytest.mark.usefixtures("started")
+@pytest.mark.parametrize(
+    ("cadence", "rebalance_day", "fill_day", "next_day"),
+    [
+        ("month_end", date(2026, 10, 30), date(2026, 11, 2), date(2026, 11, 30)),
+        ("week_end", date(2026, 10, 30), date(2026, 11, 2), date(2026, 11, 6)),
+        ("daily", date(2026, 10, 29), date(2026, 10, 30), date(2026, 10, 30)),
+    ],
+)
 def test_status_summary_labels_completed_rebalance_and_fill_lag(
-    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _Clock,
+    factory: _Factory,
+    cadence: str,
+    rebalance_day: date,
+    fill_day: date,
+    next_day: date,
 ) -> None:
-    """The morning summary must explain today's submitted orders and fill lag."""
-    run_at = datetime(2026, 10, 30, 14, tzinfo=UTC)
+    """A run trades yesterday's rebalance on its fill session at every cadence."""
+    run_at = datetime.combine(fill_day, datetime.min.time(), tzinfo=UTC) + timedelta(hours=14)
     monkeypatch.setattr(ops, "utc_now", lambda: run_at)
     with open_for_write(_settings()) as conn:
         window = journal.latest_window(conn, "main")
         assert window is not None and window.window_id is not None
+        params = conn.execute(
+            "SELECT params_json FROM hypotheses WHERE hypothesis_id = ?",
+            [window.hypothesis_id],
+        ).fetchone()
+        assert params is not None
+        updated = json.loads(params[0])
+        updated["schedule.rebalance_cadence"] = cadence
+        conn.execute(
+            "UPDATE hypotheses SET params_json = ? WHERE hypothesis_id = ?",
+            [json.dumps(updated), window.hypothesis_id],
+        )
+        conn.execute(
+            "UPDATE paper_windows SET first_rebalance_session = ? WHERE window_id = ?",
+            [rebalance_day, window.window_id],
+        )
         run_id = journal.append(
             conn,
             journal.PaperRunRow(
                 window_id=window.window_id,
-                session=run_at.date(),
+                session=fill_day,
                 kind="rebalance",
                 started_at=run_at,
                 invoked_by="scheduler",
@@ -1637,7 +1667,7 @@ def test_status_summary_labels_completed_rebalance_and_fill_lag(
             conn,
             DecisionRow(
                 run_id=run_id,
-                rebalance_session=run_at.date(),
+                rebalance_session=rebalance_day,
                 security_id="0002023554",
                 side="buy",
                 whole_share=False,
@@ -1653,7 +1683,7 @@ def test_status_summary_labels_completed_rebalance_and_fill_lag(
                 client_order_id="tp-main-20261030-0002023554-buy-1",
                 decision_id=decision_id,
                 run_id=run_id,
-                session=run_at.date(),
+                session=fill_day,
                 attempt=1,
                 phase="buy",
                 security_id="0002023554",
@@ -1666,10 +1696,14 @@ def test_status_summary_labels_completed_rebalance_and_fill_lag(
             ),
         )
     out = _paper(clock, factory, "status", "--all")
-    assert "today (done)" in out.output
-    assert "Fills are recorded at the next scheduled run (08:05 ET)" in out.output
+    assert f"next rebalance {next_day}" in out.output
+    assert f"rebalance {rebalance_day} traded today" in out.output
+    assert f"next rebalance {next_day} (today (done))" not in out.output
+    assert "Fills are recorded at the next scheduled run" in out.output
+    assert "08:05 ET" not in out.output
     detail = _paper(clock, factory, "status")
-    assert "Fills are recorded at the next scheduled run (08:05 ET)" in detail.output
+    assert "Fills are recorded at the next scheduled run" in detail.output
+    assert "08:05 ET" not in detail.output
 
 
 def test_status_all_with_no_window(clock: _Clock, factory: _Factory) -> None:

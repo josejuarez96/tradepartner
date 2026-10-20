@@ -1607,22 +1607,18 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
             if state.engaged
             else ("run in progress" if state.run_in_progress else "released")
         )
-        rebalance = _fmt(row.next_rebalance_session)
-        if (
-            row.last_run_kind == "rebalance"
-            and row.last_run_status == "ok"
-            and row.last_run_session == row.next_rebalance_session
-        ):
-            rebalance += " (today (done))"
+        traded = ops.rebalance_traded_today(row)
         line = (
             f"book {row.book_id}: window {row.window.window_id} "
             f"{'open' if row.is_open else 'closed'}; positions {row.positions_count}; "
             f"open orders {row.open_orders_count}; kill switch {switch_text}; "
             f"last run {_fmt(row.last_run_status)}; "
-            f"next rebalance {rebalance}"
+            f"next rebalance {_fmt(row.next_rebalance_session)}"
         )
+        if traded is not None:
+            line += f"; rebalance {traded} traded today"
         if row.open_orders_count and row.last_run_kind == "rebalance":
-            line += "; Fills are recorded at the next scheduled run (08:05 ET)"
+            line += "; Fills are recorded at the next scheduled run"
         lines.append(line)
     return lines
 
@@ -1652,7 +1648,7 @@ def _status_lines(
         f"positions {data.positions_count} (value {data.positions_value:.2f}); open orders "
         f"{data.open_orders_count}; targets {data.targets_count}",
         *(
-            ["Fills are recorded at the next scheduled run (08:05 ET)"]
+            ["Fills are recorded at the next scheduled run"]
             if data.open_orders_count and data.last_run_kind == "rebalance"
             else []
         ),
