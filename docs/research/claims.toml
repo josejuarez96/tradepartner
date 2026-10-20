@@ -3075,6 +3075,79 @@ scope = "one appendix row (−0.25%/month low-fee, −0.17 net, 2006-2020); a le
 source = "docs/research/2026-10-10-beyond-long-only.md"
 section = "Proposed claims for claims.toml"
 
+# ===== 2026-10-20-candlestick-patterns.md =====
+# CS- entries: #1944, desk review of the candlestick literature (revision 2, scope per ADR 0024: long and short, any universe); no TradePartner data was read.
+
+[[claim]]
+id = "CS-1"
+statement = "With a fixed exit, most named candlestick patterns have no edge in large US stocks, long or short: 28 bullish and bearish signals on DJIA stocks, 1992-2002, held 2-10 days, are no better than chance under a 500-series bootstrap (Marshall, Young & Rose 2006), and with next-open entry and a day-3 exit six of eight three-day reversal patterns earn zero or less before costs on 26 surviving DJIA stocks, 1992-2012, while the morning star (long) and evening star (short) earn about +0.47% and +0.63% gross per trade, and about +1.01% and +1.11% on 19 surviving NASDAQ-100 stocks (Lu, Chen & Hsu 2015, Tables 4 and 7, gross = net + 0.5%)."
+kind = "empirical"
+grade = "MIXED"
+scope = "Large US stocks (DJIA, NASDAQ-100 survivors), daily OHLC, long and short, fixed exit 2-10 days; 1992-2012; gross"
+source = "docs/research/2026-10-20-candlestick-patterns.md"
+section = "1. What the evidence says, after realistic costs"
+note = "Revision 2 of #1944 (draft graded this NOT SUPPORTED, before the per-pattern tables were read). Horton (2009, 349 US stocks, no better than random) agrees with the null but was read only through two theses (UNVERIFIED). Trade-weighted gross: Dow 0.23% (long 0.15, short 0.29), NASDAQ-100 0.56% (long 0.46, short 0.65). Survivor-only samples flatter longs and understate shorts. Stars were singled out after reading the tables (a fork, CS-3)."
+
+[[claim]]
+id = "CS-2"
+statement = "The large averaged-exit (Caginalp-Laurent) candlestick profits are not usable evidence of a tradable edge: Caginalp & Laurent (1998) report 0.9% per trade long and 0.27% short over about two days in S&P 500 stocks, 1992-1996, but buy at the close that completes the pattern, and Lu, Chen & Hsu's (2015) CL-3 figures (e.g. morning star +1.81% net, 91% winning, 1% VaR -0.95%) cannot be reconciled with their fixed-exit MYR-3 figures on the same trades (+0.47% gross, 51% winning, 1% VaR -8.51%)."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "Averaged 1-3-day exit; US large caps; 1992-2012"
+source = "docs/research/2026-10-20-candlestick-patterns.md"
+section = "1. What the evidence says, after realistic costs"
+note = "Revision 2 of #1944 (draft graded this MIXED). The irreconcilability is the report's inference from the published tables, not the authors' statement; it would need day-1 and day-2 gains of about 3% on most trades. Conflicts with the authors' own conclusion that the CL exit is profitable after 0.5% costs and Step-SPA."
+
+[[claim]]
+id = "CS-3"
+statement = "Candlestick studies try 8 to 83 rules (Lu, Chen & Hsu report 8 patterns x 3 trend definitions x 4 exits x 2 markets x 2 cost levels = 384 cells), correct with a per-rule bootstrap, Step-SPA within each table of 8 (as read), Bonferroni or SSPA, and none found uses a deflated Sharpe; the exit rule, which decides the result, is an uncorrected fork."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Six candlestick studies read in full text, abstract or summary, plus Bajgrowicz & Scaillet (2012) on technical rules in general"
+source = "docs/research/2026-10-20-candlestick-patterns.md"
+section = "3. Data snooping"
+note = "Lu, Chen & Hsu's Step-SPA family is the report's reading of §3.1, UNVERIFIED in the appendix; their significance marks are attached to negative means in the extracted tables. Bajgrowicz & Scaillet (JFE 2012): technical rules' in-sample gains on the DJIA are offset by low costs and the best rules cannot be picked ahead of time. Jiang, Kelly & Xiu (2023) use a date split, not a multiple-testing correction."
+
+[[claim]]
+id = "CS-4"
+statement = "No US study tests named candlestick patterns as a filter on another signal, with a volume condition, or in small and mid caps net of costs; the indirect evidence is stronger signals on volatile NASDAQ-100 survivors than on the DJIA (Lu, Chen & Hsu), learned OHLC predictability about five times stronger equal-weighted than value-weighted (Jiang, Kelly & Xiu), some patterns working in small liquid Chinese stocks (costs not stated), and oscillator filters not helping in Thai stocks."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "US equities; filter, volume and small/mid-cap variants of daily candlestick signals"
+source = "docs/research/2026-10-20-candlestick-patterns.md"
+section = "2. Any form that survives?"
+note = "Small caps cost far more to trade than 15 bp per side (HO-14) and more of them are hard to borrow (LS-6)."
+
+[[claim]]
+id = "CS-5"
+statement = "At 15 bp per side (30 bp a round trip) plus 0.4-3.6 bp of borrow per 3-day short at 30-300 bp a year, named candlestick trades fail a 3x-cost line (90 bp) in every cut once the published fixed-exit gross is cut by the 58% post-publication decline (QI-2): all eight patterns pooled 0.10% (Dow) and 0.24% (NASDAQ-100), stars 0.23% and 0.45%, shorts on NASDAQ-100 0.27%; only the NASDAQ-100 stars clear break-even, and without the decline they clear the 3x line (1.06%)."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Desk arithmetic on Lu, Chen & Hsu's fixed-exit tables (survivors, 1992-2012); no store read, no measured fills; long and short; ADR 0023 rung 1"
+source = "docs/research/2026-10-20-candlestick-patterns.md"
+section = "2. Any form that survives?"
+note = "Our cost model, not evidence. A hard-to-borrow name at 30% a year adds about 36 bp per 3-day short; names outside the top 1,000 cost more than 15 bp per side. A fully invested book of 3-day trades pays about 25% a year at 30 bp a round trip. Revision 2 of #1944 (draft scored the long side only)."
+
+[[claim]]
+id = "CS-6"
+statement = "Candlestick rules do not survive costs intraday or in Japan: on 5-minute bars of the DJIA 30 (April 2010 to April 2011, 83 rules) no single rule beats buy-and-hold after a 0.05% one-way cost under SSPA (Duvinage, Mazza & Petitjean 2013), and in the 100 largest Tokyo stocks over 1975-2004 the strategies show no value in the full period, its three decades, or bull and bear markets (Marshall, Young & Cahan 2008)."
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "Intraday US large caps; Japanese large caps, daily"
+source = "docs/research/2026-10-20-candlestick-patterns.md"
+section = "1. What the evidence says, after realistic costs"
+note = "Duvinage details from CXO Advisory's summary of the 2012 working paper (Tier 2), consistent with the journal abstract; the paper was paywalled. Marshall, Young & Cahan from a 2006 seminar abstract and a Lund thesis (which gives 1975-2002); paper behind a login. A JSE study (Mukansi, 2010-2019) finds no pattern beats passive benchmarks after fees."
+
+[[claim]]
+id = "CS-7"
+statement = "A convolutional network reading 5-, 20- and 60-day daily OHLC-plus-volume chart images of CRSP stocks predicts returns out of sample over 2001-2019 beyond momentum and reversal: the 20-day-hold decile long-short earns a Sharpe ratio of 2.35 equal-weighted and 0.45 value-weighted, weekly rebalancing 4.9-7.2 and 1.4-1.7, with turnover of about 175% a month like short-term reversal's and no transaction costs charged (Jiang, Kelly & Xiu 2023)."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "US stocks, CRSP 1993-2019 (test 2001-2019), gross, long-short deciles; learned OHLC features, not named candlestick patterns; net of costs untested"
+source = "docs/research/2026-10-20-candlestick-patterns.md"
+section = "1. What the evidence says, after realistic costs"
+note = "One Tier 1 source; no published net-of-cost or post-2019 replication found (three GitHub replications, Tier 3). Forecasts correlate most with dollar volume, size, reversal and illiquidity; the short decile earns about 0 to -2% a year EW. Any test falls under the ML validation brief's stage gates."
+
 # ===== TradePartner's own results (TP-) =====
 
 [[claim]]
