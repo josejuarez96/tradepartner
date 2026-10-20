@@ -44,8 +44,8 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   month through the same `StorePriceSource`. It needs the Alpaca keys, prints
   one line per month and exits like `ingest`; a refused symbol or identity is
   a usage error (2), with nothing fetched.
-- `tradepartner index-check [--start YYYY-MM] [--end YYYY-MM] [--store PATH]
-  [--out PATH]` runs `backtest.index_check_store.run_index_check` (backtest spec
+- `tradepartner index-check [--start YYYY-MM] [--end YYYY-MM] [--out PATH]` runs
+  `backtest.index_check_store.run_index_check` (backtest spec
   amendment #1598, plan T245): the whole universe, equal and cap weight, against RSP
   and SPY by year and month, on read-only connections. **Never a trial**: it opens no
   handle and writes nothing to any store (`--out` writes a JSON file of the same
@@ -390,6 +390,7 @@ from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource, Symb
 from tradepartner.adapters.rates import RateSource
 from tradepartner.adapters.stamp_repair import ManifestRow
 from tradepartner.backfill import BenchmarkSeed, HoleFill, backfill, backfill_benchmark, fill_holes
+from tradepartner.backtest import index_check as ic
 from tradepartner.backtest import index_check_store as idx
 from tradepartner.backtest import lab, promotion, sweep_report
 from tradepartner.backtest import sweep as lab_sweep
@@ -1824,9 +1825,17 @@ def _pct(x: float | None) -> str:
     return "" if x is None else f"{x * 100:+.2f}%"
 
 
-def _lvl(row: Any, name: str) -> str:
-    """A level cell: `·` for a protected row, whose type has no such field."""
-    return _pct(getattr(row, name)) if hasattr(row, name) else _LEVEL_WITHHELD
+def _levels(row: ic.MonthRow | ic.YearRow) -> list[str]:
+    """The four level cells (EW, its benchmark, CW, its benchmark): `·` for a protected
+    row, whose type has no level field."""
+    if isinstance(row, ic.DevMonthRow | ic.DevYearRow):
+        return [
+            _pct(row.equal_return),
+            _pct(row.equal_bench_return),
+            _pct(row.cap_return),
+            _pct(row.cap_bench_return),
+        ]
+    return [_LEVEL_WITHHELD] * 4
 
 
 def _grid(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
@@ -1878,12 +1887,12 @@ def _index_check_lines(report: idx.IndexCheckReport, code_version: str) -> list[
             members = ""
         else:
             label, members = str(y.year), str(report.year_members[y.year])
+        ew, ewb, cw, cwb = _levels(y)
         year_rows.append(
             [
                 label, str(y.months), members,
-                _lvl(y, "equal_return"), _lvl(y, "equal_bench_return"),
-                _pct(y.equal_gap), _pct(y.equal_te),
-                _lvl(y, "cap_return"), _lvl(y, "cap_bench_return"), _pct(y.cap_gap), _pct(y.cap_te),
+                ew, ewb, _pct(y.equal_gap), _pct(y.equal_te),
+                cw, cwb, _pct(y.cap_gap), _pct(y.cap_te),
             ]
         )  # fmt: skip
     lines += _grid(year_headers, year_rows)
@@ -1895,11 +1904,11 @@ def _index_check_lines(report: idx.IndexCheckReport, code_version: str) -> list[
     month_rows: list[list[str]] = []
     for m in report.months:
         census = " ".join(f"{k}={v}" for k, v in report.census[m.month].items() if v)
+        ew, ewb, cw, cwb = _levels(m)
         month_rows.append(
             [
                 m.month, str(m.n_members), str(m.n_no_cap),
-                _lvl(m, "equal_return"), _lvl(m, "equal_bench_return"), _pct(m.equal_gap),
-                _lvl(m, "cap_return"), _lvl(m, "cap_bench_return"), _pct(m.cap_gap),
+                ew, ewb, _pct(m.equal_gap), cw, cwb, _pct(m.cap_gap),
                 census or "-",
             ]
         )  # fmt: skip
@@ -1909,7 +1918,7 @@ def _index_check_lines(report: idx.IndexCheckReport, code_version: str) -> list[
         for w in report.worst[book]:
             lines.append(f"{w.month}  gap {_pct(w.gap)}")
             for n in w.names:
-                r = f"  r {_pct(n.row.name_return)}" if hasattr(n.row, "name_return") else ""
+                r = f"  r {_pct(n.row.name_return)}" if isinstance(n.row, ic.DevNameRow) else ""
                 flags = f"  {' '.join(n.flags)}" if n.flags else ""
                 who = f"{n.row.ticker} ({n.row.security_id})"
                 lines.append(f"    {who}  c {_pct(n.row.contribution)}{r}{flags}")
@@ -4559,9 +4568,6 @@ def make_app(
         end: Annotated[
             str | None, typer.Option(help="last month, YYYY-MM (default: index_check.end_month)")
         ] = None,
-        store: Annotated[
-            Path | None, typer.Option(help="read this store instead of the configured one")
-        ] = None,
         out: Annotated[
             Path | None, typer.Option(help="also write the masked report as JSON to this path")
         ] = None,
@@ -4571,8 +4577,6 @@ def make_app(
         Never a trial: it opens no handle, writes no store, and months after the protected
         edge print gaps only."""
         s = settings()
-        if store is not None:
-            s = s.model_copy(update={"store": s.store.model_copy(update={"path": str(store)})})
         if (missing := _store_missing(s)) is not None:
             raise missing
         try:

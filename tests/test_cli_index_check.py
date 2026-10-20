@@ -67,7 +67,7 @@ def table(output: str, first_header: str) -> list[dict[str, str]]:
 def test_the_option_set_is_pinned() -> None:
     command = typer.main.get_command(cli.make_app()).commands["index-check"]  # type: ignore[attr-defined]
     flags = {opt for param in command.params for opt in param.opts}
-    assert flags == {"--start", "--end", "--store", "--out"}
+    assert flags == {"--start", "--end", "--out"}
 
 
 def test_it_prints_the_header_and_the_tables(store: Settings) -> None:
@@ -123,12 +123,8 @@ def test_a_run_writes_no_row_to_the_store(store: Settings) -> None:
     assert counts() == before
 
 
-def test_store_points_the_check_at_another_store(tmp_path: Path, store: Settings) -> None:
-    elsewhere = settings_for(tmp_path / "nothing-here.duckdb")
-    code, out = invoke(elsewhere, "--start", JUNE, "--end", JULY, "--store", store.store.path)
-    assert code == 0, out
-    assert f"store: {store.store.path}" in out
-    code, out = invoke(elsewhere, "--start", JUNE, "--end", JULY)
+def test_it_reads_the_configured_store_and_a_missing_one_exits_1(tmp_path: Path) -> None:
+    code, out = invoke(settings_for(tmp_path / "nothing-here.duckdb"), "--start", JUNE)
     assert code == 1 and "no store at" in out
 
 
