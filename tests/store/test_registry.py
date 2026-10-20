@@ -1268,6 +1268,59 @@ def test_a_borrow_status_row_and_a_spinoff_move_no_trial_vintage(
         assert registry.data_vintage(fixture_store, cutoff) == before[cutoff], cutoff
 
 
+def test_a_spinoff_row_moves_the_vintage_only_under_spin_offs(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """T211d (spec amendment #1894, item 6): a `spinoff` row is a fact a
+    spin-off-reading trial reads, so `data_vintage(..., spin_offs=True)` counts
+    it while the default `spin_offs=False` -- the release vintages' call -- does
+    not: the same row moves the vintage from its own `known_at` on only under
+    the flag, and from its own `ingested_at`."""
+    cutoffs = _fixture_cutoffs(fixture_store)
+    before = {cutoff: registry.data_vintage(fixture_store, cutoff) for cutoff in cutoffs}
+    _action(
+        fixture_store,
+        "spinoff",
+        "SEC_SPINOFF_READ",
+        known_at=_PIN_KNOWN,
+        ingested_at=_LATE_INGEST,
+    )
+    assert registry.store_max_ingested_at(fixture_store) == _LATE_INGEST
+    for cutoff in cutoffs:
+        assert registry.data_vintage(fixture_store, cutoff) == before[cutoff], cutoff
+        reading = registry.data_vintage(fixture_store, cutoff, spin_offs=True)
+        if cutoff < _PIN_KNOWN:
+            assert reading == before[cutoff], cutoff
+        else:
+            assert reading == _LATE_INGEST, cutoff
+
+
+def test_a_spinoff_row_stales_only_a_trial_that_reads_spin_offs(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """T211d (item 6): `open_trial` records the trial's frozen
+    `adjust.apply_spin_offs` and `_store_changed` reads it back, so a `spinoff`
+    row known in-window stales a `true` trial and leaves a `false` one current."""
+    _register(conn, settings, slug="h1")
+    _register(conn, settings, slug="h2", params=_params(**{"adjust.apply_spin_offs": True}))
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    plain = _open(conn, settings, tmp_path, slug="h1")
+    reading = _open(conn, settings, tmp_path, slug="h2")
+    _action(
+        conn,
+        "spinoff",
+        "SEC_SPINOFF_READ",
+        known_at=_T0.replace(hour=0),
+        ingested_at=_T0.replace(hour=13),  # known in-window, ingested after the open
+    )
+    assert registry.write_result(conn, reading, registry.ResultStatistics(dsr=0.9)) == "failed"
+    assert registry.write_result(conn, plain, registry.ResultStatistics(dsr=0.9)) == "ok"
+    assert conn.execute(
+        "SELECT status, message FROM trial_results WHERE trial_id = ?",
+        [reading.trial_id],
+    ).fetchone() == ("failed", registry.STORE_CHANGED_MESSAGE)
+
+
 def test_a_split_and_a_bar_still_move_the_trial_vintage(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -1763,6 +1816,42 @@ def test_an_imported_after_row_moves_no_vintage(
     registry.import_release(conn, group)
     assert registry.data_vintage(conn, _T0) == trial.data_vintage
     assert registry.write_result(conn, trial, registry.ResultStatistics(dsr=0.9)) == "ok"
+
+
+def test_a_spinoff_row_moves_no_release_vintage(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """T211d (item 6): the release-level vintages (`registry.py:1728`, `1767`)
+    stay `spin_offs=False`, so a `spinoff` row moves neither the `before` row's
+    nor the `after` row's recorded vintage: both read the price bar's ingest."""
+    _register(conn, settings)
+    price = _T0.replace(hour=1)
+    _price(conn, "A", _T0.replace(hour=0), price)
+    backup = _connect(tmp_path / "backup.duckdb")
+    _price(backup, "A", _T0.replace(hour=0), price)
+    spin = _T0.replace(hour=2)
+    for target in (conn, backup):
+        _action(
+            target,
+            "spinoff",
+            "SEC_SPINOFF_REL",
+            known_at=_T0.replace(hour=0),
+            ingested_at=spin,
+        )
+    assert registry.store_max_ingested_at(conn) == spin
+    registry.open_data_release(
+        conn, backup, name="spinoff-ignored", backup_path="b.duckdb", reason="repair"
+    )
+    (before,) = registry.data_releases(conn)
+    assert datetime.fromisoformat(before.values["data_vintage"]) == price
+    registry.close_data_release(
+        conn,
+        name="spinoff-ignored",
+        sessions_from=date(2026, 9, 24),
+        sessions_to=date(2026, 9, 25),
+    )
+    after = next(r for r in registry.data_releases(conn) if r.stage == "after")
+    assert datetime.fromisoformat(after.values["data_vintage"]) == price
 
 
 def test_record_rows_are_never_open_and_say_whether_the_vintage_matches(
