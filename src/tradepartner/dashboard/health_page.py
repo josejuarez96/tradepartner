@@ -301,7 +301,15 @@ def _integrity_card(report: HealthReport) -> None:
         st.subheader("Integrity checks")
         for check in report.integrity:
             if check.passed:
-                theme.status_badge(f"{check.rule}: pass", "good")
+                pending = len(report.duplicate_dividends.pending)
+                if check.rule == "duplicate_dividends" and pending:
+                    theme.status_badge(
+                        f"duplicate_dividends: pass ({pending} pending repair; "
+                        "each payment is still counted twice)",
+                        "warning",
+                    )
+                else:
+                    theme.status_badge(f"{check.rule}: pass", "good")
             else:
                 theme.status_badge(f"{check.rule}: fail ({check.violations.height})", "critical")
         label, tone = coverage_badge(report.coverage_reference)
