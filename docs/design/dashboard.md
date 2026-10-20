@@ -70,6 +70,7 @@ Interaction defaults: every chart with a plot has a hover layer; hit targets are
 | 2 (T21) | Data health | coverage, gaps, delisted names present, last update | bars per session: rows ingested and missing share against `max_missing_share` | integrity checks as status chips; per-source staleness; gap report table |
 | 3 (T43, T44) | Backtest, trial registry | CAGR, max drawdown, Sharpe and deflated Sharpe, cost drag | equity curve of the hypothesis (accent) against SPY and MTUM (muted), log scale toggle | drawdown chart; monthly returns bars; cost breakdown; trial registry table with holdout flag |
 | 4 | Operations, override | positions, open orders, today's signals, kill-switch state | today's signal ranking with in/out reasons | fills table; journal chain per order; alerts list; the override form (the only write) |
+| 4 (T252) | Performance | equity, cumulative return, daily P&L, versus SPY | equity curve rebased to 100 at the base session: the book (accent), SPY (muted, dashed), the tracking trial's line over its own span once `paper report` has run | daily P&L bars (latest day in the accent); the tracking state: `not yet`, `report due` or the trial line; a `benchmark unavailable` chip when SPY has no bar; a book selector when more than one book has a window |
 | 6 | Review | calibration, loss attribution, override count | paper versus backtest drift | override log with outcomes; attribution table |
 
 ## Streamlit implementation notes
