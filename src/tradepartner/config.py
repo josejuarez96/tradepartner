@@ -1829,9 +1829,9 @@ class MetricsConfig(BaseModel):
     risk_free_rate: float = 0.0
     #: Where the per-period risk-free rate comes from (backtest spec amendment
     #: 2026-10-11, #1498): `constant` reads `risk_free_rate`; `store` reads the `rates`
-    #: table. The live default flips to `store` with T170d; the frozen-key table entry
-    #: stays `constant`.
-    risk_free_source: Literal["constant", "store"] = "constant"
+    #: table. The live default flipped to `store` with T170d (#2011); the frozen-key
+    #: table entry stays `constant` (a registration stored before it read `constant`).
+    risk_free_source: Literal["constant", "store"] = "store"
     #: The `rates.series` id a `store` trial reads.
     risk_free_series: str = "DTB3"
     #: Quote basis of the stored rate: `discount` (DTB3's) or `yield`.

@@ -174,7 +174,11 @@ class TestRiskFreeRead:
 
     def test_constant_never_calls_rates(self) -> None:
         provider = _provider()
-        results = _run(provider, _params(metrics={"risk_free_rate": 0.02}), levels=(0.0, 15.0))
+        results = _run(
+            provider,
+            _params(metrics={"risk_free_source": "constant", "risk_free_rate": 0.02}),
+            levels=(0.0, 15.0),
+        )
         assert [c for c in provider.calls if c.method == "rates"] == []
         assert all(result.rates is None for result in results.values())
 
@@ -221,7 +225,7 @@ class TestRiskFreeRead:
         provider = dataclasses.replace(_provider(), rate_rows=frame)
         variants = [
             (_params(metrics={"risk_free_source": "store"}), _handle()),
-            (_params(), _handle(2)),
+            (_params(metrics={"risk_free_source": "constant"}), _handle(2)),
             (
                 _params(metrics={"risk_free_source": "store", "risk_free_series": "OTHER"}),
                 _handle(3),
@@ -1623,7 +1627,9 @@ TWIN_FILE = Path(__file__).parents[1] / "fixtures" / "hypotheses" / "fixture-mom
 
 def _twin_settings() -> Settings:
     """The momentum fixture twin's (H1's) signal, cost and gap keys over the defaults,
-    as its registration freezes them; the holdout is the defaults', outside this run."""
+    as its registration freezes them; the holdout is the defaults', outside this run.
+    The risk-free source is H1's frozen `constant` (its table default), not the live
+    `store` default T170d set (#2011)."""
     from tradepartner.backtest import hypothesis
 
     parsed = hypothesis.parse_file(TWIN_FILE)
@@ -1632,6 +1638,7 @@ def _twin_settings() -> Settings:
         section, _, name = key.partition(".")
         if section != "holdout":
             nested.setdefault(section, {})[name] = value
+    nested.setdefault("metrics", {}).setdefault("risk_free_source", "constant")
     return Settings(_env_file=None, **nested)  # type: ignore[arg-type]
 
 

@@ -1168,11 +1168,11 @@ def test_metrics_defaults() -> None:
     assert m.red_flag_excess_cagr_pp == pytest.approx(3.0)
 
 
-def test_metrics_risk_free_keys_default_to_constant_dtb3_discount() -> None:
-    """Backtest spec amendment #1498 (T170b); the live source flips to `store` in T170d."""
+def test_metrics_risk_free_keys_default_to_store_dtb3_discount() -> None:
+    """Backtest spec amendment #1498 (T170b); the live source flipped to `store` in T170d."""
     m = _settings().metrics
     assert (m.risk_free_source, m.risk_free_series, m.risk_free_basis) == (
-        "constant",
+        "store",
         "DTB3",
         "discount",
     )

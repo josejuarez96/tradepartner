@@ -511,5 +511,6 @@ def test_the_reference_metrics_at_the_defaults_are_unchanged() -> None:
         _env_file=None,
         strategy={"top_fraction": 0.5},
         costs={"per_side_bps": 15.0, "sensitivity_per_side_bps": [0.0, 30.0, 100.0]},
+        metrics={"risk_free_source": "constant"},  # the digest's source, pre-T170d (#2011)
     )
     assert test_engine_costs._metrics_digest(default) == test_engine_costs.REFERENCE_METRICS_SHA256
