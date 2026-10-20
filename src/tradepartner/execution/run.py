@@ -173,6 +173,13 @@ only the first of the two alerts (rare under current settings). The batch's
 status (`skipped_kill_switch` when the wrapper read the switch engaged) is
 the run's.
 
+**The fill-price band** (#1981). Every collection of the run (step 3, step 7b and the
+wrapper's sells and buys collections) passes `collect` a `PriceBand`: a fill it
+journals outside `paper.max_fill_price_deviation` (run-time, default 0.25) of its
+reference price raises `SystemFaultError` naming
+`fill_price_outside_band`, so the run takes the halt path (a `halted` alert, the kill
+switch) before the next phase sizes anything on the bad fill's cash.
+
 **Steps 8 and 9.** `reconcile_now` again, cut the same way, then the result row:
 `ok`, or the batch's `skipped_kill_switch` (after its `kill_switch` alert, as at step 6).
 
@@ -239,6 +246,7 @@ from tradepartner.execution.alerts import Alerter
 from tradepartner.execution.collect import (
     Collected,
     Connect,
+    PriceBand,
     WriteOffContext,
     collect,
     lag_verdict,
@@ -1526,11 +1534,27 @@ class _Run:
             plan = self._plan(lagging)
             if plan.no_t0_bar:
                 # #1997: a candidate with no T_0 bar was excluded, visibly; the run goes on.
-                self._alert(
-                    "missing_candidate_bar",
-                    f"rebalance {plan.rebalance_session.isoformat()}: universe candidate(s) "
-                    "with no T_0 bar excluded as excluded_no_t0_bar: " + ", ".join(plan.no_t0_bar),
+                # #2023: a held one is kept at its quantity (a `skip_zero` decision), not sold.
+                kept = sorted(
+                    {
+                        d.security_id
+                        for d in plan.decisions
+                        if d.decision == "skip_zero" and d.security_id in plan.no_t0_bar
+                    }
                 )
+                others = [sid for sid in plan.no_t0_bar if sid not in kept]
+                message = (
+                    f"rebalance {plan.rebalance_session.isoformat()}: universe candidate(s) "
+                    "with no T_0 bar excluded as excluded_no_t0_bar: " + ", ".join(plan.no_t0_bar)
+                )
+                if kept:
+                    message += (
+                        "; held and kept at their current quantity until the next rebalance; "
+                        "re-ingest the bar or the next rebalance sells them: " + ", ".join(kept)
+                    )
+                    if others:
+                        message += "; not kept: " + ", ".join(others)
+                self._alert("missing_candidate_bar", message)
             # The halt path's write-off back-fill prices every name now decided.
             self.write_offs = WriteOffContext(
                 self.window_id, actions, self._pending_prices(actions).__getitem__, self.session
@@ -1635,6 +1659,37 @@ class _Run:
             }
             return planning.reference_prices(conn, self.session, names, actions)
 
+    def _price_band(self, orders: Sequence[OrderRow]) -> PriceBand | None:
+        """The fill-price band of one of this run's collections (#1981), None until
+        the step-1 write-off context exists. Its reference prices cover the names
+        decided in a pending rebalance (the context's) and the names of `orders`
+        themselves, so a forced exit's or a stop run's sell is judged as well; a
+        name with no bar at all has no price and is not judged."""
+        context = self.write_offs
+        if context is None:
+            return None
+        prices: dict[str, float] = {}
+        names = sorted({o.security_id for o in orders})
+        with open_read_only(self.settings, retry=True) as conn:
+            try:
+                prices = planning.reference_prices(
+                    conn, context.session, names, context.actions_as_of
+                )
+            except ValueError:  # one name has no bar: price the others one by one
+                for name in names:
+                    with suppress(ValueError):
+                        prices.update(
+                            planning.reference_prices(
+                                conn, context.session, [name], context.actions_as_of
+                            )
+                        )
+        return PriceBand(
+            prices.__getitem__,
+            context.actions_as_of,
+            context.session,
+            self.settings.paper.max_fill_price_deviation,
+        )
+
     def _collect(self) -> Collected:
         """Step 3's collection, the rejection cap and the lag bound."""
         with open_read_only(self.settings, retry=True) as conn:
@@ -1655,10 +1710,12 @@ class _Run:
                 self.frozen,
                 self.settings,
                 write_offs=self.write_offs,
+                price_band=self._price_band(orders),
             )
         )
         if collected.rejections:
             raise RejectionCapError("; ".join(b.message for b in collected.rejections))
+        self._note_unjudged(collected)
         self._lag_bound(collected)
         return collected
 
@@ -1800,6 +1857,7 @@ class _Run:
             if not orders:
                 return
             collected = self._halting(partial(self._collect_orders, orders))
+            self._note_unjudged(collected)
             if collected.rejections:
                 raise RejectionCapError("; ".join(b.message for b in collected.rejections))
             now = self.gate.read_clock()
@@ -1818,6 +1876,14 @@ class _Run:
                 return
             self.sleep(min(paper.poll_interval_seconds, (deadline - now).total_seconds()))
 
+    def _note_unjudged(self, collected: Collected) -> None:
+        """A note for the fills the price band had no reference price for (#1981)."""
+        if collected.unjudged:
+            self.notes.append(
+                "fill-price band: no reference price for "
+                + ", ".join(sorted(set(collected.unjudged)))
+            )
+
     def _collect_orders(self, orders: Sequence[OrderRow]) -> Collected:
         return collect(
             self.broker,
@@ -1829,6 +1895,7 @@ class _Run:
             self.frozen,
             self.settings,
             write_offs=self.write_offs,
+            price_band=self._price_band(orders),
         )
 
     def _unspent_cash(self, rebalances: Sequence[date]) -> None:

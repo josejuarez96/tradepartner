@@ -762,7 +762,9 @@ def test_a_shares_fact_accepted_after_close_t_i_reaches_only_plans_after_t_i(
 #: Recompute with `harness.template_fingerprint` after any fixture-universe change.
 #: T187 (#821) moved it only by hashing the new, empty `successor_chains` table's name;
 #: every other table's rows are main's (without that table it is main's fb9b651c...).
-TEMPLATE_FINGERPRINT = "ed654fea7eab0e9b71ee197b5f5bbb1b42ed1ee6376b4a46d41bd944d290fdd9"
+#: T248c (#1762) moved it only by hashing the new `mergers` table's name and its two fixture
+#: rows; with that table left out the hash is the previous pin, ed654fea...0fdd9.
+TEMPLATE_FINGERPRINT = "fb39b57878d6ca9613c3ad334b98dffdf8451c08b2dd4f38e98796cd3d2dcef1"
 
 
 def _bar_revisions(conn: duckdb.DuckDBPyConnection, sid: str, session: date) -> int:

@@ -1166,10 +1166,35 @@ def test_repair_judges_spinoff_parent_and_child_separately_from_dividend(
                 "provenance": "action",
             },
         )
+        insert_row(
+            conn,
+            "mergers",
+            {
+                "security_id": DEAD,
+                "kind": "cash",
+                "acquirer_security_id": None,
+                "acquiree_symbol": "DEAD",
+                "acquiree_cusip": "",
+                "acquirer_symbol": "",
+                "acquirer_cusip": "",
+                "share_ratio": None,
+                "cash_per_share": 5.0,
+                "effective_date": ex,
+                "process_date": ex,
+                "payable_date": None,
+                "source_action_id": "merger-1",
+                "known_at": session_close(ex),
+                "ingested_at": session_close(ex),
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
     dry = repair_resolution(store, clock=lambda: RUN, dry_run=True)
     assert dry.found.spinoffs == {(DEAD, ex): 1}
     assert dry.unjudged_symbol_changes == 1
     assert "1 symbol_changes rows unjudged" in dry.summary()
+    assert dry.unjudged_mergers == 1
+    assert "1 mergers rows unjudged" in dry.summary()
     assert (child, ex) in dry.found.actions
     assert (child, ex) not in dry.found.spinoffs
     assert dry.action_rows == 3  # one existing bad dividend, one same-day, one spin-off
@@ -1179,6 +1204,7 @@ def test_repair_judges_spinoff_parent_and_child_separately_from_dividend(
         "SELECT action_type, security_id FROM corporate_actions "
         "WHERE ex_date='2021-06-15' ORDER BY 1,2",
     ) == [("spinoff", child)]
+    assert _rows(store, "SELECT count(*) FROM mergers") == [(1,)]  # never deleted
 
 
 def test_repair_deletes_only_the_bad_parents_spinoff_of_a_shared_child(

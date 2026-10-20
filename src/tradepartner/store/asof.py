@@ -1086,6 +1086,45 @@ def symbol_changes_as_of(
     ).pl()
 
 
+def mergers_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None = None,
+) -> pl.DataFrame:
+    """Latest merger revision per identity known at ``t`` (#1762, T248c).
+
+    Identity is the acquiree and Alpaca's id (the table's unique index without
+    its stamp). The filter applies to the latest revision, after it is chosen:
+    a row is kept when its acquiree **or** its acquirer is in ``security_ids``
+    (``None`` means no filter, an empty sequence no rows). Sorted by
+    ``(security_id, effective_date)``, with every table column. Two ids for one
+    acquiree and one ``effective_date`` are both returned; the reader never
+    picks one. A store before schema 35 has no ``mergers`` table, so this read
+    raises.
+    """
+    t = _validate_t(t)
+    params: list[Any] = [t]
+    where = "_rn = 1"
+    if security_ids is not None:
+        # Each filter is "AND <column> IN (...)" or "AND FALSE"; the two are ORed.
+        acquiree = _security_filter(security_ids, params)
+        acquirer = _security_filter(security_ids, params, column="acquirer_security_id")
+        where += f" AND (({acquiree[4:]}) OR ({acquirer[4:]}))"
+    return conn.execute(
+        f"""
+        SELECT * EXCLUDE (_rn) FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY security_id, source_action_id ORDER BY known_at DESC
+            ) AS _rn
+            FROM mergers
+            WHERE known_at <= ?
+        ) WHERE {where}
+        ORDER BY security_id, effective_date, source_action_id
+        """,
+        params,
+    ).pl()
+
+
 def rates_as_of(
     conn: duckdb.DuckDBPyConnection, t: datetime, series: str | None = None
 ) -> pl.DataFrame:

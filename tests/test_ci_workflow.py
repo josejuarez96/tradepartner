@@ -89,9 +89,11 @@ def test_the_checks_job_token_is_read_only() -> None:
 
 
 def test_tests_run_in_parallel_inside_each_shard() -> None:
-    """#581: each shard job still runs its slice with xdist."""
-    text = CI.read_text()
-    assert "run: uv run pytest -n auto" in text
+    """#2056: CI shards use xdist worksteal and skip the redundant count pass."""
+    shard = _job("pytest-shard", "checks")
+    assert "run: uv run pytest -n auto --dist worksteal --durations=0 --durations-min=1.0" in shard
+    assert "Collected count (this shard)" not in shard
+    assert "--collect-only" not in shard
 
 
 def test_checks_is_a_thin_aggregator_over_fast_and_shards() -> None:
