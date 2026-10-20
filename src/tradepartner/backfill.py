@@ -971,12 +971,49 @@ def _window_names(
         if live and row["ticker"] == settings.ingest.reference_symbol:
             reference = sid
     ids.update(_led(resolver, rows, ids, window, benchmarks, types, settings))
+    ids.update(_chained(resolver, rows, ids, window, benchmarks, types, settings))
     if reference is not None:
         ids.add(reference)
     static_only = listed - filed - benchmarks
     before = first - timedelta(days=1)
     may_count = _may_count(conn, t, (before.replace(day=1), before), earliest, benchmarks)
     return sorted(ids), sorted(listed), static_only, may_count, reference
+
+
+def _chained(
+    resolver: ListingResolver,
+    rows: list[dict[str, Any]],
+    ids: Collection[str],
+    window: tuple[date, date],
+    benchmarks: set[str],
+    types: Mapping[str, set[str]],
+    settings: Settings,
+) -> set[str]:
+    """The securities not in `ids` whose rule-9 window (#821, T187b,
+    `resolver.chain_windows`) meets `window` under an Alpaca symbol, when the
+    listing row at the window's end passes `_fetched`: a chained successor's
+    sessions between its predecessor's span end and its first listing row,
+    which today resolve to nobody and are the successor's hole."""
+    by_security: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for listing_row in rows:
+        by_security[listing_row["security_id"]].append(listing_row)
+    sessions = _sessions_in(window)
+    out: set[str] = set()
+    for sid in by_security:
+        if sid in ids:
+            continue
+        for chain in resolver.chain_windows(sid):
+            if alpaca_symbol(chain.ticker) is None:
+                continue
+            row = next(
+                (r for r in by_security[sid] if r["valid_from"] == chain.end),
+                None,
+            )
+            if row is None or not _fetched(sid, row, benchmarks, types, settings):
+                continue
+            if any(chain.start <= day < chain.end for day in sessions):
+                out.add(sid)
+    return out
 
 
 def _led(

@@ -16,6 +16,13 @@ Two subcommands:
 - ``run``: the repair. Dry run by default: no request, no write, a JSON report
   of the counts and the SGML requests each step will make. ``--apply`` makes
   the requests and writes.
+- ``shift-unrepaired`` (#1382): ``--from`` an earlier release's unrepaired list;
+  every listed record whose stamp is still the listed one moves later by New
+  York's UTC offset (4 h EDT, 5 h EST), with no SGML request. It can only move
+  a stamp later. The owner runs it as a named data release (e.g.
+  ``restamp-1382a3``, the 39 CIKs left by ``restamp-1382a2``); the store then
+  takes the manifest through ``ingest --restamp-from``. Same backup, window
+  and read-instant refusals as ``restamp-unrepaired``.
 - ``restamp-unrepaired`` (#1553): ``--from`` an earlier release's
   ``<manifest>.unrepaired.csv.gz``; every listed record is re-read from its
   own SGML header through step 4's per-filing path (`restamp_filing`), so its
@@ -1424,6 +1431,77 @@ def run_unrepaired(args: argparse.Namespace, fetch: Fetch | None = None) -> dict
     return report
 
 
+# --- shift-unrepaired (#1382) ------------------------------------------------
+
+
+def plan_shift(
+    source: Path, listed: Sequence[ManifestRow]
+) -> tuple[UnrepairedPlan, dict[Key, ManifestRow], list[ManifestRow]]:
+    """The shift of an unrepaired list: each listed record whose file stamp is
+    still the listed ``old_stamp`` moves later by New York's offset
+    (`shift_stamp`, a ``shift`` row). A record whose stamp has changed since
+    the list (an earlier release or an ingest) is not shifted again and is
+    listed ``unrepaired`` with the reason, as is one with no stamped record."""
+    base = plan_unrepaired(source, listed)
+    old = {(r.cik, r.accession): r.old_stamp for r in listed}
+    rows: dict[Key, ManifestRow] = {}
+    left = [
+        ManifestRow(r.cik, r.accession, r.old_stamp, r.old_stamp, "unrepaired", "no stamped record")
+        for r in base.missing
+    ]
+    for cik, accession in base.keys:
+        stamp = base.files[cik].stamps[accession]
+        assert stamp is not None
+        if stamp != old[(cik, accession)]:
+            left.append(
+                ManifestRow(
+                    cik, accession, stamp, stamp, "unrepaired", "stamp changed since the list"
+                )
+            )
+            continue
+        rows[(cik, accession)] = ManifestRow(
+            cik, accession, stamp, shift_stamp(stamp), "shift", "unrepaired list, shifted late"
+        )
+    left.sort(key=lambda r: (r.cik, r.accession))
+    return base, rows, left
+
+
+def run_shift_unrepaired(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
+    """The ``shift-unrepaired`` subcommand (#1382): every record of an earlier
+    release's unrepaired list moves later by New York's UTC offset, with no SGML
+    request. It can only move a stamp later. Dry run unless ``--apply``;
+    writes under ``--release`` as ``run`` does (backup, window and read-instant
+    refusals, manifest, ``.unrepaired.csv.gz`` for what it did not shift)."""
+    report: dict[str, Any] = {
+        "release": args.release,
+        "mode": "shift-unrepaired",
+        "from": str(args.source),
+        "apply": args.apply,
+    }
+    release = _open_release(args, report)
+    listed = load_unrepaired(args.source)
+    base, rows, left = plan_shift(
+        release.backup if args.apply and args.resume else release.live, listed
+    )
+    report.update(base.report(args.window_start))
+    report.update(requests=0, requests_floor=0, to_shift=len(rows))
+    if not args.apply:
+        return report
+    _refuse_window(rows.values(), args.window_start, release.allowed)
+    if release.precheck is not None:
+        _refuse_instants(rows.values(), release.precheck)
+    _make_backup(release, args)
+    counts = {
+        "shift": len(rows),
+        "unrepaired": len(left),
+        "unrepaired_ciks": len({r.cik for r in left}),
+        "requests_made": 0,
+    }
+    outcome = Outcome(rows, left, sorted({r.cik for r in left}), counts, [])
+    _write_release(release, args, base.files, outcome, report)
+    return report
+
+
 def _date(text: str) -> date:
     return date.fromisoformat(text)
 
@@ -1463,6 +1541,16 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--window-earlier-ok", type=Path, default=None, metavar="PRECHECK_JSON")
     u.add_argument("--apply", action="store_true")
     u.add_argument("--resume", action="store_true")
+    sh = sub.add_parser(
+        "shift-unrepaired",
+        help="shift an unrepaired list later by the New York offset, no requests (#1382)",
+    )
+    sh.add_argument("--from", dest="source", type=Path, required=True, metavar="UNREPAIRED_CSV")
+    sh.add_argument("--window-start", type=_date, required=True)
+    sh.add_argument("--release", required=True)
+    sh.add_argument("--window-earlier-ok", type=Path, default=None, metavar="PRECHECK_JSON")
+    sh.add_argument("--apply", action="store_true")
+    sh.add_argument("--resume", action="store_true")
     return parser
 
 
@@ -1478,7 +1566,8 @@ def main(argv: Sequence[str] | None = None, *, fetch: Fetch | None = None) -> in
             n = export_bulk_written(args.cache_dir, args.out, day=args.day)
             print(json.dumps({"exported": n, "out": str(args.out)}))
             return 0
-        command = run_unrepaired if args.command == "restamp-unrepaired" else run
+        commands = {"restamp-unrepaired": run_unrepaired, "shift-unrepaired": run_shift_unrepaired}
+        command = commands.get(args.command, run)
         print(json.dumps(command(args, fetch), indent=2, sort_keys=True))
     except RepairStop as stop:
         print(f"repair_stamps: stopped: {stop}", file=sys.stderr)

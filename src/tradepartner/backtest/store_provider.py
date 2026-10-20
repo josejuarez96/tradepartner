@@ -107,10 +107,12 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.store import registry
 from tradepartner.store.asof import (
     _ACTION_IDENTITY_PARTITION,
+    _chains_registered,
     _latest_as_of,
     adjusted_prices_as_of,
     dropped_dividends_as_of,
     listings_as_of,
+    live_chains,
     marking_changed_ids_as_of,
     prices_as_of,
     rates_as_of,
@@ -263,6 +265,13 @@ class StoreProvider:
         t = check_t(t)
         return self._step_universe(t)
 
+    def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        """The live successor chains known at `t` (#821, T187b): the
+        `(predecessor_id, successor_id)` pairs the engine renames its books
+        through before building the step's marking ids."""
+        t = check_t(t)
+        return live_chains(self._at(t), t)
+
     def adjusted_prices(
         self,
         t: datetime,
@@ -326,7 +335,10 @@ class StoreProvider:
         prev_session = last_completed_session(t_prev)
 
         def dividends(at: datetime) -> pl.DataFrame:
-            actions = _latest_as_of(conn, "corporate_actions", _ACTION_KEY, at, wanted)
+            with _chains_registered(conn, at) as chains:
+                actions = _latest_as_of(
+                    conn, "corporate_actions", _ACTION_KEY, at, wanted, chains=chains
+                )
             return actions.filter(pl.col("action_type") == "dividend")
 
         known_before = dividends(t_prev).select("security_id", "ex_date")

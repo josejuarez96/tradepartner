@@ -396,7 +396,8 @@ def _dividends(
     through: date,
     reviewed: Sequence[ReviewedGroup],
 ) -> tuple[dict[str, float], dict[str, str]]:
-    """Cash due per name for dividends with ex-date in (base session, S], less
+    """Cash due per name for dividends with ex-date in (base session, S] (negative
+    for a name held short before the ex-date), less
     any the journal already holds as `dividend_cash` on or after the ex-date,
     and the held names with an equal-amount dividend group the reviewed list
     does not explain (#1625, #1613), each with its detail.
@@ -444,15 +445,32 @@ def _dividends(
         if before not in holdings:
             holdings[before] = _ledger(state, actions, window, before, tolerance)
         held = holdings[before].positions.get(row["security_id"], 0.0)
-        if held > tolerance:
+        short = holdings[before].short_holdings.get(row["security_id"], 0.0)
+        if held > tolerance or short > tolerance:
             key = (row["security_id"], row["ex_date"], float(row["ratio_or_amount"]))
             if key in unexplained:
                 if unexplained[key] not in findings[row["security_id"]]:
                     findings[row["security_id"]].append(unexplained[key])
                 continue
-            due[row["security_id"]] += held * float(row["ratio_or_amount"])
+            # A short owes the dividend: -quantity x amount (#1928, item 10).
+            due[row["security_id"]] += (
+                held * float(row["ratio_or_amount"])
+                if held > tolerance
+                else -short * float(row["ratio_or_amount"])
+            )
+    # `compare` signs a due against the book at S: a short's due is negative only
+    # while the name is still held short, a long's positive only while it is not.
+    # A short covered (or a long flipped short) after the ex-date has a due of
+    # the wrong sign there, which would raise; leave it unexplained instead, so
+    # the cash it moved halts as a `cash` mismatch as before (#1928).
+    short_now = _ledger(state, actions, window, through, tolerance).short_holdings
     return (
-        {name: amount for name, amount in sorted(due.items()) if amount > 0},
+        {
+            name: amount
+            for name, amount in sorted(due.items())
+            if (amount < 0 and short_now.get(name, 0.0) > tolerance)
+            or (amount > 0 and short_now.get(name, 0.0) <= tolerance)
+        },
         {name: "; ".join(details) for name, details in sorted(findings.items())},
     )
 

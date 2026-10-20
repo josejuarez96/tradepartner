@@ -112,6 +112,14 @@ class DataProvider(Protocol):
         """`universe_as_of(t)`: members and exclusions at the session closing at `t`."""
         ...
 
+    def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        """The live successor chains known at `t` (#821, T187b), as
+        `(predecessor_id, successor_id)` pairs. The engine renames its books,
+        its plans' targets and their `held_on`/`marked_at` keys through each
+        pair at the first step whose read sees it, before the marking ids are
+        built, so a chained predecessor becomes its successor at one point."""
+        ...
+
     def adjusted_prices(
         self,
         t: datetime,

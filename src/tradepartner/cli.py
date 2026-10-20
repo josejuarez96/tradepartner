@@ -466,6 +466,7 @@ from tradepartner.research.labeling import frame as labeling_frame
 from tradepartner.research.labeling import gold, job, review, scoring
 from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET, REVERSED_OPTION_SET
 from tradepartner.retract import RetractRefused, master_retract
+from tradepartner.store import backup as store_backup_module
 from tradepartner.store import (
     journal,
     lab_queries,
@@ -789,6 +790,7 @@ def _print_report(report: HealthReport) -> None:
     for row in pairs.iter_rows(named=True):
         echo(f"  {row['security_id']}@{row['valid_from']} {row['ticker']}/{row['next_ticker']}")
     _print_duplicate_dividends(report)
+    _print_successor_chains(report)
     _print_borrow(report)
     _print_figi_types(report)
     echo(f"settings: {report.settings}")
@@ -815,6 +817,34 @@ def _print_duplicate_dividends(report: HealthReport) -> None:
             ticker = g.reviewed.ticker if g.reviewed is not None and g.reviewed.ticker else "-"
             ids = ", ".join(i.source_action_id for i in g.identities)
             typer.echo(f"  {g.security_id}@{g.ex_date} {ticker} {g.amount!r} ({ids})")
+
+
+def _print_successor_chains(report: HealthReport) -> None:
+    """The `successor_chains` block (#1922, T187c): each live chain with its
+    hand-over day and close ratio, the predecessor facts dated after the
+    hand-over, and the latest EDGAR run's candidates beside them. The price
+    breaks are the command's warning, not a failure."""
+    block = report.successor_chains
+    typer.echo(f"successor chains: {block.count} live" if block.count else "successor chains: none")
+    for row in block.frame.iter_rows(named=True):
+        ratio = "no ratio (a close is missing)" if row["ratio"] is None else f"{row['ratio']:.2f}"
+        handover = "none" if row["handover"] is None else row["handover"].isoformat()
+        typer.echo(
+            f"  {row['predecessor_id']} -> {row['successor_id']}: handed over {handover}, "
+            f"close ratio {ratio} ({row['evidence_form']} {row['evidence_accession']})"
+        )
+    for fact in block.predecessor_facts.iter_rows(named=True):
+        typer.echo(
+            f"  {fact['predecessor_id']} {fact['fact_name']} {fact['value']:.0f} "
+            f"as of {fact['as_of_date']} (dated after the hand-over)"
+        )
+    if block.candidates:
+        typer.echo(
+            f"chain candidates from the latest EDGAR run: {len(block.candidates)}: "
+            f"{', '.join(block.candidates)}"
+        )
+    else:
+        typer.echo("chain candidates from the latest EDGAR run: none")
 
 
 def _coverage_verdict(block: CoverageReference | None) -> str:
@@ -2430,6 +2460,17 @@ def make_app(
                 "(`tradepartner repair-dividends`); each still counts its payment twice",
                 err=True,
             )
+        for row in report.successor_chains.frame.filter(pl.col("price_break")).iter_rows(
+            named=True
+        ):
+            limit = s.master.chain_max_price_ratio
+            typer.echo(
+                f"warning: chain_price_break: {row['successor_id']} closed x{row['ratio']:.2f} "
+                f"against {row['predecessor_id']}'s last close, outside the allowed range "
+                f"(master.chain_max_price_ratio {limit:g}, so x{1 / limit:.2f} to x{limit:.2f}); "
+                "check the chain before relying on it",
+                err=True,
+            )
         if check and not report.ok:
             raise _fail(f"health check failed: {', '.join(report.failures)}", 1)
 
@@ -2872,7 +2913,9 @@ def make_app(
         order_sessions: Annotated[
             int, typer.Option(help="M: the sessions with a live fill it needs (1 to N)")
         ],
-        reason: Annotated[str, typer.Option(help="why, naming the strategy that goes live first")],
+        reason: Annotated[
+            str, typer.Option(help="why the span opens now; names no live strategy (T163 picks it)")
+        ],
     ) -> None:
         """Open (or restart) the shakedown span with its two thresholds (ADR 0017 E)."""
         decision_id = _shakedown_write(
@@ -3262,6 +3305,29 @@ def make_app(
                 f"{r.run_id}  {r.slug}  {r.kind}  {r.split}  {r.outcome}  {_fmt(r.verdict)}  "
                 f"{basis}  {_flag_names(r)}  {message}"
             )
+
+    store_app = typer.Typer(no_args_is_help=True, help="Look after the store file.")
+    app.add_typer(store_app, name="store")
+
+    @store_app.command("backup")
+    def store_backup() -> None:
+        """Copy the store to `<store>.bak-YYYYMMDD-HHMM` (UTC), verify it byte for byte
+        and write a manifest beside it. Refuses while the store is in use. Deletes nothing."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        commit, dirty = registry.code_version()
+        try:
+            result = store_backup_module.backup_store(
+                s, now=clock(), git_commit=commit, code_dirty=dirty
+            )
+        except store_backup_module.BackupError as exc:
+            raise _fail(f"backup refused: {exc}", 1) from exc
+        typer.echo(f"copy matches the store byte for byte: {result.copy_path}")
+        if result.wal_copy_path is not None:
+            typer.echo(f"log copy: {result.wal_copy_path}")
+        typer.echo(f"manifest: {result.manifest_path}")
+        typer.echo(f"code commit {result.git_commit}, schema version {result.schema_version}")
 
     dataset_app = typer.Typer(no_args_is_help=True, help="Register research datasets.")
     app.add_typer(dataset_app, name="dataset")
@@ -4082,7 +4148,17 @@ def make_app(
         """Open the book's tracking trial and compare paper with it (spec req 10)."""
         chosen = _checked_book(book)
         s = paper_settings()
-        result = _paper_call(s, lambda: paper_report.report(s, lambda: open_read_only(s), chosen))
+
+        def run_report() -> paper_report.Report | str:
+            try:
+                return paper_report.report(s, lambda: open_read_only(s), chosen)
+            except paper_report.NothingToCompareYet as exc:
+                return str(exc)  # a plain message, not a failure (#1923)
+
+        result = _paper_call(s, run_report)
+        if isinstance(result, str):
+            _echo_scrubbed(result, s)
+            return
         comparison, row = result.comparison, result.paper_report
         lines = [
             f"paper report: trial {row.trial_id} through {row.through_session}; rule "

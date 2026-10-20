@@ -574,7 +574,8 @@ def test_tracking_window_on_or_before_holdout_end_is_refused(
     assert (outcome.status, outcome.results) == ("refused_window", None)
     assert calls == []
     trial = _row(read(), "trials", outcome.trial_id)
-    assert trial["kind"] == "in_sample"
+    # #1923: a refused tracking run is still a tracking row, never an `in_sample` one.
+    assert trial["kind"] == "tracking"
 
 
 # --- the development boundary (ADR 0016 points 2 and 4; plan T142b) -----------------

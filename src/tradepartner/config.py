@@ -373,6 +373,14 @@ class EdgarConfig(BaseModel):
     # its SGML header's ACCEPTANCE-DATETIME (the master acceptance); on a
     # mismatch each new stamp is taken from its own SGML header instead.
     stamp_sgml_check: bool = True
+    # #1686: after this many consecutive runs in which none of a CIK's three
+    # newest SGML anchors can be read (404/410 or unparseable), the CIK's new
+    # stamps are cached as the per-CIK API served them. That stamp is late by
+    # New York's UTC offset (4 h EDT, 5 h EST) or exact, never early, so the
+    # fallback delays a row and cannot look ahead. Counted per CIK on disk
+    # (`sgml_unread/v1.json`), reset by any run whose anchor reads, and
+    # reported on the run's message (`stamps from API fallback`).
+    stamp_sgml_fallback_runs: int = Field(default=3, ge=1)
     # The longer range asked once for a stamp check's header that the first
     # `header_bytes` cut before `</SEC-HEADER>` (a Form 4 with many owners).
     stamp_header_bytes: int = Field(default=65536, gt=0)

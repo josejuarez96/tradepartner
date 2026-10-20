@@ -46,16 +46,17 @@ run on a session after its horizon's last session:
 
 `due_outcomes` is pure. `write_outcomes_and_lots` is its I/O edge: it reads the
 window's rows through `store.journal`, rebuilds the lot ledger over the
-window's live fills, appends the due outcomes, and appends the rebuilt
+window's live fills, its adjustments and the splits in `actions` (req 13),
+appends the due outcomes, and appends the rebuilt
 `lots`, `disposals` and `wash_sale_flags` as one new set, stamped with one
 clock reading, only when the set differs from the latest one journaled (so a
 rebuild that changes nothing appends nothing, and the current ledger is the
 set with the latest `known_at`). A changed set whose clock reading does not
 advance past the latest set's is not appended (it would merge with it), is
 reported like an error, and holds `realised_pnl` back like one. A
-`LotLedgerError` (a sale beyond the fill-built holding: a split, spin-off
-receipt, stock merger or carried residue, which lots do not take yet) never
-fails the run: the writer passes its message to `on_lot_error` (the caller
+`LotLedgerError` (a sale beyond the holding the fills and the window's
+adjustments build, or a corporate action the ledger does not take, such as one
+on a short lot) never fails the run: the writer passes its message to `on_lot_error` (the caller
 alerts and dedupes), writes no lot rows and holds `realised_pnl` back until
 the ledger rebuilds.
 """
@@ -476,7 +477,16 @@ def write_outcomes_and_lots(
         ledger: LotLedger | None
         lot_error: str | None = None
         try:
-            ledger = rebuild(fills, orders, assets, account)
+            ledger = rebuild(
+                fills,
+                orders,
+                assets,
+                account,
+                adjustments=journal.adjustments_for(conn, window_id, through_session=session),
+                actions=actions,
+                through=session,
+                symbols={o.security_id: o.symbol for o in orders},
+            )
         except LotLedgerError as exc:
             ledger, lot_error = None, str(exc)
         lot_rows = 0

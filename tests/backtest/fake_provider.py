@@ -178,6 +178,7 @@ class FakeProvider:
     shares_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_SHARES_SCHEMA))
     split_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_SPLIT_SCHEMA))
     rate_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_RATE_SCHEMA))
+    chain_pairs: tuple[tuple[str, str], ...] = ()
     calls: list[Call] = field(default_factory=list)
 
     def _record(self, method: str, t: datetime, **kwargs: Any) -> datetime:
@@ -193,6 +194,10 @@ class FakeProvider:
         """Every `t` and `t_prev` passed to the provider so far."""
         times = {call.t for call in self.calls}
         return times | {call.t_prev for call in self.calls if call.t_prev is not None}
+
+    def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        self._record("chains", t)
+        return self.chain_pairs
 
     def universe(self, t: datetime) -> Universe:
         t = self._record("universe", t)

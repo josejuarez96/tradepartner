@@ -316,6 +316,7 @@ from tradepartner.universe import SHARES_FACT, member_links_title
 
 OK, STALE, FAILED, LOCKED = "ok", "stale", "failed", "locked"
 ACTIONS_FILLED = "filled"
+ACTIONS_MODE = "actions"  # the actions backfill's run rows (#1676)
 MODE = "session"
 #: The price side's `ingestion_runs.source`. Its `MODE` runs alone count as
 #: the paper run's fresh prices (staleness and the clock floor, #1440 Q3).
@@ -947,7 +948,7 @@ def ingest_actions_backfill(
             clock,
             f"actions;since={since};through={last}",
             dry_run,
-            mode="actions",
+            mode=ACTIONS_MODE,
             prepare=prepare,
             success_status=ACTIONS_FILLED,
         )
@@ -1588,6 +1589,8 @@ def _source_counts(filings: FilingSource) -> str:
         ("stamp_check_mismatched_ciks", "CIKs stamped from SGML"),  # #1494
         ("stamps_from_sgml", "stamps from SGML"),
         ("stamps_sgml_unread", "stamps unread in SGML"),
+        ("stamps_api_fallback", "stamps from API fallback"),  # #1686
+        ("stamp_fallback_ciks", "CIKs on API fallback"),
         ("stamps_sgml_overlong", "stamps with overlong SGML headers"),
         ("stamp_check_unread_ciks", "CIKs stamped unchecked"),
         ("facts_bulk_keyless", "keyless bulk facts"),  # #599: facts but no `cik`

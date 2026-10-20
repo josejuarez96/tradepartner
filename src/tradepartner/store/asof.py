@@ -39,6 +39,38 @@ listed today; #859's retraction is a later task) would drop out here too,
 the same way every other function in this module defers to whatever that
 one function decides a security's existence is.
 
+**Successor chains (amendment 2026-10-12, #821; plan T187b).** One
+`successor_chains` row per chained successor makes one continuous security
+out of a 1:1 successor-CIK reorganisation. `live_chains(conn, t)` returns
+the `(predecessor_id, successor_id)` pairs whose live, unretracted chain row
+is known at `t` (`schema.successor_chains`'s rule: the successor's
+unretracted row with the greatest `ingested_at`, unless a retraction was
+written after it). The six as-of reads keyed by security
+(`prices_as_of`, `adjusted_prices_as_of`, `live_actions_as_of`,
+`price_jumps_as_of`, `dropped_dividends_as_of`, `facts_as_of`) apply the
+chains **known at `t`** with one shared helper: the predecessor's rows are
+re-keyed to the successor and dropped from the predecessor, so a read for
+the predecessor returns nothing and one for the successor returns both
+histories; a key the two share is the successor's own row. The
+`security_ids` filter and the id-keyed `universe.accepted_price_jumps`
+entries are mapped the same way, so an entry naming a predecessor still
+excuses its re-keyed row under the successor. A chained successor's **own**
+bar on a session before its first listing row's `valid_from` reads absent
+until a live chain naming that successor is known at `t`: the shares a fill
+writes into the rule-9 hole are its history only once the chain explains
+them, so a read before the chain's `known_at` must not serve them (the
+hiding needs no chain, only that the store names the id as a chained
+successor, so a store with no `successor_chains` rows is unaffected).
+`listings_as_of`, `securities_as_of`, `statement_facts_as_of`, `filing_events_as_of` and the
+delisting/classification reads are **unchanged**: the predecessor stays a
+security that rule 2 excludes as delisted. A predecessor fact dated after
+the hand-over (the successor's first listing row's `valid_from`) reads under
+the successor only while no fact of the successor's own is known at `t` (the
+cut-off is the successor fact's `known_at`, not its date), so a subsidiary
+that keeps filing a nominal count is cut off by the successor's first own
+fact. When no chain is known at `t` the reads build exactly the SQL they
+built before this amendment, so a store with no chains is byte-identical.
+
 **Return type: `polars.DataFrame`.** ADR 0004 adopts polars for
 dataframes, and it is already a T1 runtime dependency. Every function
 builds its frame straight from DuckDB (`conn.execute(sql, params).pl()`),
@@ -239,8 +271,9 @@ multiplies `open`/`high`/`low`/`close` by that factor directly in SQL.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Final
 from zoneinfo import ZoneInfo
@@ -306,6 +339,19 @@ _EXCHANGE_TZ = ZoneInfo("America/New_York")
 #: sessions under, for a dividend's prior-close gap (#72).
 _SESSIONS_VIEW = "_asof_xnys_sessions"
 
+#: Name of the temporary view `_chains_registered` exposes the live successor
+#: chains under, for the six chain-aware reads to LEFT JOIN (#821, T187b).
+_CHAINS_VIEW = "_asof_chains"
+
+#: Name of the temporary view `_chains_registered` exposes the chained
+#: successors whose own bars must stay hidden until their chain is known under
+#: (#821, T187b): their id and the first session their own later listings allow.
+_PRE_LISTING_VIEW = "_asof_pre_listing"
+
+#: The successor-chain master table (#821, T187). A store below schema 31 has
+#: no such table and no chain; `live_chains` returns nothing there.
+_CHAINS_TABLE = "successor_chains"
+
 #: The ingest source whose `ingestion_runs` rows record a borrow snapshot's
 #: observation (spec Amendment 2026-10-11, #1506, ADR 0021 point 3: "rows
 #: record change; the run row records the observation"). T171c writes those
@@ -350,8 +396,10 @@ def _validate_t(t: datetime) -> datetime:
     return ensure_tz_aware_utc(t, field_name="T")
 
 
-def _security_filter(security_ids: Sequence[str] | None, params: list[Any]) -> str:
-    """`"AND security_id IN (?, ?, ...)"` (appending placeholders' values to
+def _security_filter(
+    security_ids: Sequence[str] | None, params: list[Any], *, column: str = "security_id"
+) -> str:
+    """`"AND <column> IN (?, ?, ...)"` (appending placeholders' values to
     `params` in the order they'll be bound), `"AND FALSE"` if
     `security_ids` is an empty sequence (an empty `IN ()` is a DuckDB
     syntax error, and the correct answer to "restrict to no securities" is
@@ -359,30 +407,245 @@ def _security_filter(security_ids: Sequence[str] | None, params: list[Any]) -> s
     Callers that need the filter more than once in the same query call
     this once per occurrence, appending to the same `params` list in the
     order the clauses appear in the SQL text (DuckDB binds `?`
-    positionally)."""
+    positionally). `column` is the expression the filter applies to: the
+    chain-aware reads pass the mapped `security_id` (#821)."""
     if security_ids is None:
         return ""
     if not security_ids:
         return "AND FALSE"
     params.extend(security_ids)
     placeholders = ", ".join("?" for _ in security_ids)
-    return f"AND security_id IN ({placeholders})"
+    return f"AND {column} IN ({placeholders})"
 
 
-def _spin_off_actions_filter(security_ids: Sequence[str] | None, params: list[Any]) -> str:
+def _has_table(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
+    """Whether `conn`'s store has `table` (a read-only connection to a store
+    below the table's schema version serves the rest of the reads)."""
+    rows = conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+    return table in {name for (name,) in rows}
+
+
+def live_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[tuple[str, str], ...]:
+    """The `(predecessor_id, successor_id)` pairs whose live chain is known
+    at `t` (#821, T187b): sorted by successor. The live chain is the
+    successor's unretracted `successor_chains` row with the greatest
+    `ingested_at`, unless a later row (a retraction) was written after it
+    (`schema.successor_chains`); only rows with `known_at <= t` are read, so
+    a chain reads absent at every `t` before its evidence stamp. A store
+    below schema 31 has no `successor_chains` table and no chain.
+
+    `t` must be tz-aware (a bare date raises `TypeError`)."""
+    t = _validate_t(t)
+    if not _has_table(conn, _CHAINS_TABLE):
+        return ()
+    rows = conn.execute(
+        f"""
+        SELECT predecessor_id, successor_id FROM {_CHAINS_TABLE} c
+        WHERE NOT retracted AND known_at <= ?
+          AND NOT EXISTS (
+              SELECT 1 FROM {_CHAINS_TABLE} n
+              WHERE n.successor_id = c.successor_id AND n.ingested_at > c.ingested_at
+          )
+        ORDER BY successor_id
+        """,
+        [t],
+    ).fetchall()
+    return tuple((str(predecessor), str(successor)) for predecessor, successor in rows)
+
+
+@dataclass(frozen=True)
+class LiveChains:
+    """The chains a single chain-aware read applies (#821, T187b): `pairs`
+    maps `predecessor_id` to `successor_id`, `handovers` maps a successor to
+    the `valid_from` of its first listing row under the predecessor's ticker
+    (the hand-over day a predecessor fact is judged against; a successor with
+    no such row known at `t` is absent, so every predecessor fact is its
+    own). `pre_listing` maps a chained successor with **no** live chain at `t`
+    to the `valid_from` of its first own listing row known at `t`, so the
+    price reads hide its own bars before that session (the rule-9 hole bars a
+    fill wrote, which are its history only once its chain is known). Empty
+    (`bool(LiveChains())` false) when no chain is known at `t`, in which case
+    the reads build their pre-#821 SQL, except that `pre_listing` may still be
+    non-empty when the store has chain rows that are not live at `t`."""
+
+    pairs: Mapping[str, str] = field(default_factory=dict)
+    handovers: Mapping[str, date] = field(default_factory=dict)
+    pre_listing: Mapping[str, date] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return bool(self.pairs)
+
+    def map_id(self, security_id: str) -> str:
+        """`security_id` as the chained read keys it: the successor's id when
+        it is a chained predecessor, else itself."""
+        return self.pairs.get(security_id, security_id)
+
+    def hide_sql(self, alias: str = "t") -> str:
+        """SQL `AND` clause dropping `alias`'s own bars on a session before the
+        successor's first own listing row (`pre_listing`); empty when nothing
+        is hidden. Applied to both the chained and the unchained SQL, since a
+        chained successor's hole bars must stay hidden until its chain is
+        known (#821)."""
+        if not self.pre_listing:
+            return ""
+        return (
+            f"AND NOT EXISTS (SELECT 1 FROM {_PRE_LISTING_VIEW} pl "
+            f"WHERE pl.successor_id = {alias}.security_id "
+            f"AND {alias}.session < pl.first_session)"
+        )
+
+    def mapped_entry(self, entry: str, parse: Any) -> tuple[str, date]:
+        """A `<security_id>@<date>` config entry (`universe.accepted_price_jumps`)
+        with its id mapped through the chain, so an entry naming a predecessor
+        applies to the successor's re-keyed row (#821)."""
+        security_id, day = parse(entry)
+        return self.map_id(security_id), day
+
+
+#: A read with no chain known at its `t` (skip the chain SQL entirely).
+_NO_CHAINS = LiveChains()
+
+
+def _chain_id(alias: str = "t") -> str:
+    """SQL: `alias`'s `security_id` mapped through the live chain view."""
+    return f"COALESCE({_CHAINS_VIEW}.successor_id, {alias}.security_id)"
+
+
+def _chain_join(alias: str = "t") -> str:
+    """SQL: the `LEFT JOIN` that attaches the live chain to a row's
+    `security_id`."""
+    return f"LEFT JOIN {_CHAINS_VIEW} ON {_CHAINS_VIEW}.predecessor_id = {alias}.security_id"
+
+
+def _chain_own(alias: str = "t") -> str:
+    """SQL: 0 for a row of the successor itself, 1 for a re-keyed predecessor
+    row, so a key the two share is the successor's own row (#821)."""
+    return f"CASE WHEN {_CHAINS_VIEW}.successor_id IS NULL THEN 0 ELSE 1 END"
+
+
+def _chain_mapped_key(key_columns: Sequence[str], alias: str = "t") -> str:
+    """`key_columns` with `security_id` replaced by the mapped id (#821)."""
+    return ", ".join(
+        _chain_id(alias) if column == "security_id" else column for column in key_columns
+    )
+
+
+@contextmanager
+def _chains_registered(conn: duckdb.DuckDBPyConnection, t: datetime) -> Iterator[LiveChains]:
+    """Expose the live chains known at `t` to SQL as `_CHAINS_VIEW` (its
+    `predecessor_id`, `successor_id` and `handover`) and the chained
+    successors whose own bars stay hidden *and* have no live chain at `t` as
+    `_PRE_LISTING_VIEW` (`successor_id`, `first_session`), for the block, then
+    drop both. Yields the `LiveChains`; when neither is needed nothing is
+    registered and the reads build their pre-#821 SQL. `live_chains` is read
+    once here, and the hand-over day is derived from the listings known at `t`
+    (the successor's first listing row under the predecessor's ticker and
+    exchange)."""
+    chains = _live_chains_at(conn, t)
+    pre_listing = _pre_listing_at(conn, t, chains)
+    if not chains.pairs and not pre_listing:
+        yield _NO_CHAINS
+        return
+    chains_frame = pl.DataFrame(
+        {
+            "predecessor_id": [pred for pred in chains.pairs],
+            "successor_id": [chains.pairs[pred] for pred in chains.pairs],
+            "handover": [chains.handovers.get(chains.pairs[pred]) for pred in chains.pairs],
+        },
+        schema={
+            "predecessor_id": pl.Utf8,
+            "successor_id": pl.Utf8,
+            "handover": pl.Date,
+        },
+    )
+    pre_frame = pl.DataFrame(
+        {
+            "successor_id": list(pre_listing),
+            "first_session": list(pre_listing.values()),
+        },
+        schema={"successor_id": pl.Utf8, "first_session": pl.Date},
+    )
+    conn.register(_CHAINS_VIEW, chains_frame)
+    conn.register(_PRE_LISTING_VIEW, pre_frame)
+    try:
+        yield LiveChains(chains.pairs, chains.handovers, pre_listing)
+    finally:
+        conn.unregister(_CHAINS_VIEW)
+        conn.unregister(_PRE_LISTING_VIEW)
+
+
+def _pre_listing_at(
+    conn: duckdb.DuckDBPyConnection, t: datetime, chains: LiveChains
+) -> dict[str, date]:
+    """The chained successors whose own bars a price read must hide at `t`:
+    every `successor_id` named by a `successor_chains` row (live or not, less
+    those with a live chain at `t`), mapped to the earliest `valid_from` its
+    `listings` rows give. Read without a `known_at` filter on purpose: the rule
+    only ever **hides** a bar, never shows one, so a listing row known after
+    `t` cannot leak a later bar into a read; it is what keeps a filled rule-9
+    hole bar hidden before its chain is known. See `LiveChains.pre_listing`."""
+    if not _has_table(conn, _CHAINS_TABLE) or not _has_table(conn, "listings"):
+        return {}
+    rows = conn.execute(f"SELECT DISTINCT successor_id FROM {_CHAINS_TABLE}").fetchall()
+    successors = sorted({str(successor) for (successor,) in rows} - set(chains.pairs.values()))
+    if not successors:
+        return {}
+    first = conn.execute(
+        "SELECT security_id, MIN(valid_from) FROM listings "
+        "WHERE security_id IN (SELECT unnest(?)) GROUP BY security_id",
+        [successors],
+    ).fetchall()
+    return {str(successor): valid_from for successor, valid_from in first}
+
+
+def _live_chains_at(conn: duckdb.DuckDBPyConnection, t: datetime) -> LiveChains:
+    """`live_chains(t)` with each successor's hand-over day, read from the
+    listings known at `t`: the predecessor's last listing row's ticker and
+    exchange matched by the successor's earliest such row (as
+    `store.master.build_chains`)."""
+    pairs = live_chains(conn, t)
+    if not pairs:
+        return _NO_CHAINS
+    listings = listings_as_of(conn, t).select("security_id", "ticker", "exchange", "valid_from")
+    by_security: dict[str, list[tuple[str, str, date]]] = {}
+    for security_id, ticker, exchange, valid_from in listings.iter_rows():
+        by_security.setdefault(security_id, []).append((ticker, exchange, valid_from))
+    handovers: dict[str, date] = {}
+    for predecessor, successor in pairs:
+        predecessor_rows = by_security.get(predecessor, [])
+        successor_rows = by_security.get(successor, [])
+        if not predecessor_rows or not successor_rows:
+            continue
+        last = max(predecessor_rows, key=lambda row: row[2])
+        matches = [row[2] for row in successor_rows if row[0] == last[0] and row[1] == last[1]]
+        if matches:
+            handovers[successor] = min(matches)
+    return LiveChains(dict(pairs), handovers)
+
+
+def _spin_off_actions_filter(
+    security_ids: Sequence[str] | None, params: list[Any], *, mapped: bool = False
+) -> str:
     """`_security_filter` for `latest_actions` when it also reads `spinoff`
     rows: a split or dividend is selected by its `security_id`, a spin-off
-    by its parent in `source_action_id` (its `security_id` is the child).
-    Same `None` / empty-sequence rules."""
+    by its parent. Same `None` / empty-sequence rules. With `mapped` (a live
+    chain at `t`, #821) both keys go through `_CHAINS_VIEW`: the row's
+    `security_id` (a split's or dividend's security, a spin-off's child)
+    through the join on `security_id`, and a spin-off's parent through the
+    `pchain` join on `source_action_id` the chained `latest_actions` adds."""
     if security_ids is None:
         return ""
     if not security_ids:
         return "AND FALSE"
     params.extend(security_ids)
     placeholders = ", ".join("?" for _ in security_ids)
+    if mapped:
+        row = f"COALESCE({_CHAINS_VIEW}.successor_id, security_id)"
+        parent = "COALESCE(pchain.successor_id, source_action_id)"
+    else:
+        row, parent = "security_id", "source_action_id"
     return (
-        "AND (CASE WHEN action_type = 'spinoff' THEN source_action_id ELSE security_id END)"
-        f" IN ({placeholders})"
+        f"AND (CASE WHEN action_type = 'spinoff' THEN {parent} ELSE {row} END) IN ({placeholders})"
     )
 
 
@@ -394,6 +657,7 @@ def _latest_as_of(
     security_ids: Sequence[str] | None,
     *,
     sessions_from: date | None = None,
+    chains: LiveChains | None = None,
 ) -> pl.DataFrame:
     """The latest-revision-as-of-`t` rows of `table`, as a `polars.
     DataFrame` sorted by `key_columns`: one row per distinct `key_columns`
@@ -412,16 +676,23 @@ def _latest_as_of(
     sessions_from`. It is applied before choosing the latest revision, which
     gives the same rows as filtering after it because `session` must be a
     key column: every revision of a key shares its session (#1305).
-    """
-    partition = ", ".join(key_columns)
+
+    `chains`, when a non-empty `LiveChains`, re-keys the predecessor's rows
+    to the successor (and drops them from the predecessor) before the latest
+    revision is chosen, and the `security_ids` filter applies to the mapped
+    id; a key the two share is the successor's own row (#821)."""
+    chained = bool(chains)
     params: list[Any] = [t]
-    security_filter = _security_filter(security_ids, params)
     session_filter = ""
     if sessions_from is not None:
         if "session" not in key_columns:
             raise ValueError(f"sessions_from needs `session` in the key of {table}")
         if isinstance(sessions_from, datetime):
             raise TypeError(f"sessions_from must be a session date, not {sessions_from!r}")
+    security_filter = _security_filter(
+        security_ids, params, column=_chain_id() if chained else "security_id"
+    )
+    if sessions_from is not None:
         params.append(sessions_from)
         session_filter = "AND session >= ?"
     # A retraction (#859) is the latest revision of its key, so the filter
@@ -432,18 +703,45 @@ def _latest_as_of(
     retractable = table in RETRACTABLE_TABLES and has_retracted(conn, table)
     excluded = "_rn, retracted" if retractable else "_rn"
     live = "AND NOT retracted" if retractable else ""
+    hide = chains.hide_sql("t") if chains is not None and "session" in key_columns else ""
+    if chained:
+        assert chains is not None  # bool(chains) is True
+        # The join and the id filter live in the inner query (they read the
+        # chain view); the row after it already carries the mapped id, so the
+        # partition and order use `key_columns` as written.
+        partition = ", ".join(key_columns)
+        sql = f"""
+            SELECT * EXCLUDE ({excluded}, _own) FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY {partition}
+                    ORDER BY _own, known_at DESC
+                ) AS _rn
+                FROM (
+                    SELECT * REPLACE ({_chain_id()} AS security_id), {_chain_own()} AS _own
+                    FROM {table} t {_chain_join()}
+                    WHERE t.known_at <= ?
+                    {security_filter}
+                    {session_filter}
+                    {hide}
+                )
+            )
+            WHERE _rn = 1 {live}
+            ORDER BY {partition}
+        """
+        return conn.execute(sql, params).pl()
     sql = f"""
         SELECT * EXCLUDE ({excluded}) FROM (
             SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY {partition} ORDER BY known_at DESC
+                PARTITION BY {", ".join(key_columns)} ORDER BY known_at DESC
             ) AS _rn
-            FROM {table}
-            WHERE known_at <= ?
+            FROM {table} t
+            WHERE t.known_at <= ?
             {security_filter}
             {session_filter}
+            {hide}
         )
         WHERE _rn = 1 {live}
-        ORDER BY {partition}
+        ORDER BY {", ".join(key_columns)}
     """
     return conn.execute(sql, params).pl()
 
@@ -459,25 +757,46 @@ def live_actions_as_of(
     event appears once, at its latest ex-date; no ex-date filter is applied.
 
     `t` must be tz-aware (a bare date raises `TypeError`); `security_ids`
-    as in `_latest_as_of`.
+    as in `_latest_as_of`. A live chain known at `t` (#821) re-keys the
+    predecessor's actions to the successor; the successor's own action wins
+    a shared identity.
     """
     t = _validate_t(t)
-    params: list[Any] = [t]
-    security_filter = _security_filter(security_ids, params)
-    sql = f"""
-        SELECT * EXCLUDE (_rn) FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY {_ACTION_IDENTITY_PARTITION}
-                ORDER BY known_at DESC
-            ) AS _rn
-            FROM corporate_actions
-            WHERE known_at <= ?
-            {security_filter}
-        )
-        WHERE _rn = 1 AND NOT cancelled
-        ORDER BY security_id, action_type, ex_date, source_action_id
-    """
-    return conn.execute(sql, params).pl()
+    with _chains_registered(conn, t) as chains:
+        params: list[Any] = [t]
+        if chains:
+            security_filter = _security_filter(security_ids, params, column=_chain_id())
+            sql = f"""
+                SELECT * EXCLUDE (_rn, _own) FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY {_ACTION_IDENTITY_PARTITION} ORDER BY _own, known_at DESC
+                    ) AS _rn
+                    FROM (
+                        SELECT * REPLACE ({_chain_id()} AS security_id), {_chain_own()} AS _own
+                        FROM corporate_actions t {_chain_join()}
+                        WHERE t.known_at <= ?
+                        {security_filter}
+                    )
+                )
+                WHERE _rn = 1 AND NOT cancelled
+                ORDER BY security_id, action_type, ex_date, source_action_id
+            """
+        else:
+            security_filter = _security_filter(security_ids, params)
+            sql = f"""
+                SELECT * EXCLUDE (_rn) FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY {_ACTION_IDENTITY_PARTITION}
+                        ORDER BY known_at DESC
+                    ) AS _rn
+                    FROM corporate_actions
+                    WHERE known_at <= ?
+                    {security_filter}
+                )
+                WHERE _rn = 1 AND NOT cancelled
+                ORDER BY security_id, action_type, ex_date, source_action_id
+            """
+        return conn.execute(sql, params).pl()
 
 
 def prices_as_of(
@@ -504,11 +823,22 @@ def prices_as_of(
     (`_latest_as_of`), so a reader that needs only a recent window does not
     read and convert the whole history (#1305). The bars it keeps are exactly
     the unbounded read's bars from that session on.
+
+    A live chain known at `t` (#821) re-keys the predecessor's bars to the
+    successor and drops them from the predecessor; the successor's own bar
+    wins a shared session.
     """
     t = _validate_t(t)
-    frame = _latest_as_of(
-        conn, "prices_daily", _PRICE_KEY, t, security_ids, sessions_from=sessions_from
-    )
+    with _chains_registered(conn, t) as chains:
+        frame = _latest_as_of(
+            conn,
+            "prices_daily",
+            _PRICE_KEY,
+            t,
+            security_ids,
+            sessions_from=sessions_from,
+            chains=chains,
+        )
     return _traded(frame) if traded_only else frame
 
 
@@ -638,32 +968,53 @@ def price_jumps_as_of(
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
     cfg = settings.universe
-    params: list[Any] = [t]
-    security_filter = _security_filter(security_ids, params)
-    params += [cfg.max_jump_ratio, cfg.min_jump_ratio]
-    sql = f"""
-        WITH latest AS (
-            SELECT security_id, session, close, volume, ROW_NUMBER() OVER (
-                PARTITION BY security_id, session ORDER BY known_at DESC
-            ) AS _rn
-            FROM prices_daily
-            WHERE known_at <= ?
-            {security_filter}
-        ), traded AS (
-            SELECT security_id, session, close,
-                LAG(session) OVER w AS prev_session,
-                LAG(close) OVER w AS prev_close
-            FROM latest
-            WHERE _rn = 1 AND volume > 0
-            WINDOW w AS (PARTITION BY security_id ORDER BY session)
-        )
-        SELECT security_id, prev_session, session, prev_close, close,
-            close / prev_close AS ratio
-        FROM traded
-        WHERE prev_close > 0 AND (close / prev_close > ? OR close / prev_close < ?)
-        ORDER BY security_id, session
-    """
-    candidates = conn.execute(sql, params).pl()
+    with _chains_registered(conn, t) as chains:
+        params: list[Any] = [t]
+        hide = chains.hide_sql("b")
+        if chains:
+            security_filter = _security_filter(security_ids, params, column=_chain_id("b"))
+            latest = f"""
+                SELECT security_id, session, close, volume, ROW_NUMBER() OVER (
+                    PARTITION BY security_id, session ORDER BY _own, known_at DESC
+                ) AS _rn
+                FROM (
+                    SELECT * REPLACE ({_chain_id("b")} AS security_id), {_chain_own("b")} AS _own
+                    FROM prices_daily b {_chain_join("b")}
+                    WHERE b.known_at <= ?
+                    {security_filter}
+                    {hide}
+                )
+            """
+        else:
+            security_filter = _security_filter(security_ids, params)
+            latest = f"""
+                SELECT security_id, session, close, volume, ROW_NUMBER() OVER (
+                    PARTITION BY security_id, session ORDER BY known_at DESC
+                ) AS _rn
+                FROM prices_daily b
+                WHERE b.known_at <= ?
+                {security_filter}
+                {hide}
+            """
+        params += [cfg.max_jump_ratio, cfg.min_jump_ratio]
+        sql = f"""
+            WITH latest AS (
+                {latest}
+            ), traded AS (
+                SELECT security_id, session, close,
+                    LAG(session) OVER w AS prev_session,
+                    LAG(close) OVER w AS prev_close
+                FROM latest
+                WHERE _rn = 1 AND volume > 0
+                WINDOW w AS (PARTITION BY security_id ORDER BY session)
+            )
+            SELECT security_id, prev_session, session, prev_close, close,
+                close / prev_close AS ratio
+            FROM traded
+            WHERE prev_close > 0 AND (close / prev_close > ? OR close / prev_close < ?)
+            ORDER BY security_id, session
+        """
+        candidates = conn.execute(sql, params).pl()
     if candidates.is_empty():
         return pl.DataFrame(schema=_JUMP_SCHEMA)
     candidate_ids = candidates["security_id"].unique().sort().to_list()
@@ -682,7 +1033,9 @@ def price_jumps_as_of(
         "security_id", "action_type", "ex_date", "ratio_or_amount"
     ).iter_rows():
         by_security.setdefault(sid, []).append((kind, ex_date, amount))
-    accepted = {parse_accepted_jump(entry) for entry in cfg.accepted_price_jumps}
+    accepted = {
+        chains.mapped_entry(entry, parse_accepted_jump) for entry in cfg.accepted_price_jumps
+    }
     rows: list[dict[str, Any]] = []
     for row in candidates.iter_rows(named=True):
         splits, dividends = 1.0, 0.0
@@ -785,34 +1138,90 @@ def facts_as_of(
     Rows with no accession are untouched. The per-date collapse runs on what
     is left, so a stale re-dated row can never shadow another filing's row
     on the same date.
+
+    **A live chain at `t` (#821)** re-keys the predecessor's facts to the
+    successor. A predecessor fact dated on or before the hand-over (the
+    successor's first listing row's `valid_from`) is always the successor's; a
+    later one only while no fact of the successor's own is known at `t` (the
+    cut-off is that fact's `known_at`, not its date), so a subsidiary that
+    keeps filing a nominal count is cut off by the successor's first own fact.
     """
     t = _validate_t(t)
-    params: list[Any] = [t]
-    security_filter = _security_filter(security_ids, params)
     partition = ", ".join(_FACT_KEY)
-    sql = f"""
-        WITH known AS (
-            SELECT *, MAX(ingested_at) OVER (
-                PARTITION BY security_id, fact_name, class_member, filing_accession
-            ) AS _latest_ingest
-            FROM facts
-            WHERE known_at <= ?
-            {security_filter}
-        ),
-        current AS (
-            SELECT * EXCLUDE (_latest_ingest) FROM known
-            WHERE filing_accession IS NULL OR ingested_at = _latest_ingest
-        )
-        SELECT * EXCLUDE (_rn) FROM (
-            SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY {partition} ORDER BY known_at DESC
-            ) AS _rn
-            FROM current
-        )
-        WHERE _rn = 1
-        ORDER BY {partition}
-    """
-    return conn.execute(sql, params).pl()
+    with _chains_registered(conn, t) as chains:
+        if chains:
+            assert chains is not None
+            params: list[Any] = [t]
+            security_filter = _security_filter(security_ids, params, column=_chain_id("f"))
+            params.append(t)
+            sql = f"""
+                WITH mapped AS (
+                    SELECT * REPLACE ({_chain_id("f")} AS security_id),
+                        {_chain_own("f")} AS _own,
+                        {_CHAINS_VIEW}.successor_id AS _successor,
+                        {_CHAINS_VIEW}.handover AS _handover
+                    FROM facts f {_chain_join("f")}
+                    WHERE f.known_at <= ?
+                    {security_filter}
+                ),
+                successor_first AS (
+                    SELECT security_id AS successor, MIN(known_at) AS cutoff
+                    FROM facts
+                    WHERE known_at <= ?
+                      AND security_id IN (SELECT DISTINCT successor_id FROM {_CHAINS_VIEW})
+                    GROUP BY security_id
+                ),
+                kept AS (
+                    SELECT m.* EXCLUDE (_successor, _handover) FROM mapped m
+                    LEFT JOIN successor_first s ON s.successor = m._successor
+                    WHERE m._own = 0 OR m._handover IS NULL OR m.as_of_date <= m._handover
+                        OR s.cutoff IS NULL
+                ),
+                known AS (
+                    SELECT *, MAX(ingested_at) OVER (
+                        PARTITION BY security_id, fact_name, class_member, filing_accession
+                    ) AS _latest_ingest
+                    FROM kept
+                ),
+                current AS (
+                    SELECT * EXCLUDE (_latest_ingest) FROM known
+                    WHERE filing_accession IS NULL OR ingested_at = _latest_ingest
+                )
+                SELECT * EXCLUDE (_rn, _own) FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY {partition} ORDER BY _own, known_at DESC
+                    ) AS _rn
+                    FROM current
+                )
+                WHERE _rn = 1
+                ORDER BY {partition}
+            """
+            return conn.execute(sql, params).pl()
+        params = [t]
+        security_filter = _security_filter(security_ids, params)
+        sql = f"""
+            WITH known AS (
+                SELECT *, MAX(ingested_at) OVER (
+                    PARTITION BY security_id, fact_name, class_member, filing_accession
+                ) AS _latest_ingest
+                FROM facts
+                WHERE known_at <= ?
+                {security_filter}
+            ),
+            current AS (
+                SELECT * EXCLUDE (_latest_ingest) FROM known
+                WHERE filing_accession IS NULL OR ingested_at = _latest_ingest
+            )
+            SELECT * EXCLUDE (_rn) FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY {partition} ORDER BY known_at DESC
+                ) AS _rn
+                FROM current
+            )
+            WHERE _rn = 1
+            ORDER BY {partition}
+        """
+        return conn.execute(sql, params).pl()
 
 
 def listings_as_of(
@@ -1053,7 +1462,13 @@ def borrow_status_as_of(
 
 
 def _adjusted_ctes(
-    action_types: str, bars_filter: str, actions_filter: str, *, spin_offs: bool = False
+    action_types: str,
+    bars_filter: str,
+    actions_filter: str,
+    *,
+    chained: bool = False,
+    hide: str = "",
+    spin_offs: bool = False,
 ) -> str:
     """The CTEs `adjusted_prices_as_of` shares between its validation query
     (checks `event_factor` before anything calls `LN()` on it) and its main
@@ -1067,6 +1482,11 @@ def _adjusted_ctes(
     queries inside `_sessions_registered`, which provides the
     `_SESSIONS_VIEW` the gap CTE reads.
 
+    With `chained` the bars and actions are re-keyed through `_CHAINS_VIEW`
+    first (#821), so a predecessor's splits and dividends adjust the
+    successor's bars; `hide` is the bar-hiding clause of a chained successor
+    whose chain is not known yet.
+
     `spin_offs=True` (the opt-in read, #1894) adds two CTEs and one `?`
     (`t`): `child_close`, the child's latest bar on E known at `t`, read
     whether or not the child is in the read's ids, and `keyed_actions`,
@@ -1077,8 +1497,104 @@ def _adjusted_ctes(
     `no_child_close`. `spin_ratio` and `child_close` carry r and C for
     `_raise_on_invalid_factor`.
     """
+    if chained:
+        extra_join = (
+            f"LEFT JOIN {_CHAINS_VIEW} pchain ON pchain.predecessor_id = a.source_action_id"
+            if spin_offs
+            else ""
+        )
+        parent_key = (
+            "COALESCE(pchain.successor_id, a.source_action_id)"
+            if spin_offs
+            else "a.source_action_id"
+        )
+        latest_bars = f"""
+        latest_bars AS (
+            SELECT * EXCLUDE (_rn, _own) FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY security_id, session ORDER BY _own, known_at DESC
+                ) AS _rn
+                FROM (
+                    SELECT * REPLACE ({_chain_id("b")} AS security_id), {_chain_own("b")} AS _own
+                    FROM prices_daily b {_chain_join("b")}
+                    WHERE b.known_at <= ?
+                    {bars_filter}
+                    {hide}
+                )
+            )
+            WHERE _rn = 1
+        ),"""
+        latest_actions = f"""
+        latest_actions AS (
+            SELECT * EXCLUDE (_rn, _own) FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY {_ACTION_IDENTITY_PARTITION} ORDER BY _own, known_at DESC
+                ) AS _rn
+                FROM (
+                    SELECT * REPLACE ({_chain_id("a")} AS security_id),
+                        {parent_key} AS parent_key,
+                        {_chain_own("a")} AS _own
+                    FROM corporate_actions a {_chain_join("a")}
+                    {extra_join}
+                    WHERE a.known_at <= ?
+                    {actions_filter}
+                )
+            )
+            WHERE _rn = 1 AND NOT cancelled AND ex_date <= ?
+              AND action_type IN ({action_types})
+        ),"""
+    else:
+        latest_bars = f"""
+        latest_bars AS (
+            SELECT * EXCLUDE (_rn) FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY security_id, session ORDER BY known_at DESC
+                ) AS _rn
+                FROM prices_daily b
+                WHERE b.known_at <= ?
+                {bars_filter}
+                {hide}
+            )
+            WHERE _rn = 1
+        ),"""
+        latest_actions = f"""
+        latest_actions AS (
+            SELECT * EXCLUDE (_rn) FROM (
+                SELECT *, source_action_id AS parent_key, ROW_NUMBER() OVER (
+                    PARTITION BY {_ACTION_IDENTITY_PARTITION}
+                    ORDER BY known_at DESC
+                ) AS _rn
+                FROM corporate_actions
+                WHERE known_at <= ?
+                {actions_filter}
+            )
+            WHERE _rn = 1 AND NOT cancelled AND ex_date <= ?
+              AND action_type IN ({action_types})
+        ),"""
+
     if spin_offs:
-        spin_ctes = """
+        if chained:
+            child_close = f"""
+        child_close AS (
+            SELECT security_id, session, close FROM (
+                SELECT COALESCE(cc.successor_id, p.security_id) AS security_id,
+                    p.session, p.close,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(cc.successor_id, p.security_id), p.session
+                        ORDER BY p.known_at DESC
+                    ) AS _rn
+                FROM prices_daily p
+                LEFT JOIN {_CHAINS_VIEW} cc ON cc.predecessor_id = p.security_id
+                WHERE p.known_at <= ?
+                  AND (COALESCE(cc.successor_id, p.security_id), p.session) IN (
+                      SELECT security_id, ex_date FROM latest_actions
+                      WHERE action_type = 'spinoff'
+                  )
+            )
+            WHERE _rn = 1
+        ),"""
+        else:
+            child_close = """
         child_close AS (
             SELECT security_id, session, close FROM (
                 SELECT security_id, session, close, ROW_NUMBER() OVER (
@@ -1092,12 +1608,13 @@ def _adjusted_ctes(
                   )
             )
             WHERE _rn = 1
-        ),
+        ),"""
+        spin_ctes = f"""{child_close}
         -- A spin-off is keyed by its parent; D = r x C is its amount.
         keyed_actions AS (
             SELECT
                 CASE WHEN la.action_type = 'spinoff'
-                    THEN la.source_action_id ELSE la.security_id END AS security_id,
+                    THEN la.parent_key ELSE la.security_id END AS security_id,
                 la.security_id AS child_id,
                 la.ex_date,
                 la.action_type,
@@ -1120,35 +1637,13 @@ def _adjusted_ctes(
     else:
         spin_ctes, action_source, extra_cols, no_child = "", "latest_actions", "", ""
     return f"""
-        latest_bars AS (
-            SELECT * EXCLUDE (_rn) FROM (
-                SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY security_id, session ORDER BY known_at DESC
-                ) AS _rn
-                FROM prices_daily
-                WHERE known_at <= ?
-                {bars_filter}
-            )
-            WHERE _rn = 1
-        ),
+        {latest_bars}
         -- Latest revision per action identity (#108): the source's id when
         -- it gave one, else (action_type, ex_date). The ex-date, type and
         -- cancelled filters apply to that latest revision, never before
         -- choosing it: a re-date into the future, or a cancel, must retire
         -- an older revision rather than leave it standing.
-        latest_actions AS (
-            SELECT * EXCLUDE (_rn) FROM (
-                SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY {_ACTION_IDENTITY_PARTITION}
-                    ORDER BY known_at DESC
-                ) AS _rn
-                FROM corporate_actions
-                WHERE known_at <= ?
-                {actions_filter}
-            )
-            WHERE _rn = 1 AND NOT cancelled AND ex_date <= ?
-              AND action_type IN ({action_types})
-        ),{spin_ctes}
+        {latest_actions}{spin_ctes}
         -- `pb` (the ASOF-joined nearest bar with session < ex_date) is
         -- only read by the dividend branch; for a split row it is
         -- harmlessly present but unused. See this module's docstring on
@@ -1236,6 +1731,7 @@ def _adjusted_params(
     *,
     include_dividends: bool,
     include_spin_offs: bool = False,
+    chains: LiveChains | None = None,
 ) -> tuple[str, list[Any]]:
     """`_adjusted_ctes`' SQL and its bind parameters, in placeholder order:
     `t` and the bars filter (`latest_bars`), `t`, the actions filter and
@@ -1247,7 +1743,9 @@ def _adjusted_params(
 
     Both limits only matter for a dividend, so a splits-only query binds
     `0` and `1.0` and never loads settings (`get_settings()` rereads the
-    environment on every call).
+    environment on every call). With a non-empty `chains` the bars and
+    actions are re-keyed through the live chain view (#821) and the id
+    filters use the mapped column.
     """
     t_session = t.astimezone(_EXCHANGE_TZ).date()
     action_types = "'split', 'dividend'" if include_dividends else "'split'"
@@ -1258,20 +1756,31 @@ def _adjusted_params(
         adjust = (settings or get_settings()).adjust
         max_gap, max_share = adjust.max_prior_close_gap_sessions, adjust.max_dividend_to_prior_close
 
+    chained = bool(chains)
+    hide = chains.hide_sql("b") if chains is not None else ""
+    bar_column = _chain_id("b") if chained else "security_id"
+    action_column = _chain_id("a") if chained else "security_id"
     params: list[Any] = [t]
-    bars_filter = _security_filter(security_ids, params)
+    bars_filter = _security_filter(security_ids, params, column=bar_column)
     params.append(t)
     actions_filter = (
-        _spin_off_actions_filter(security_ids, params)
+        _spin_off_actions_filter(security_ids, params, mapped=chained)
         if include_spin_offs
-        else _security_filter(security_ids, params)
+        else _security_filter(security_ids, params, column=action_column)
     )
     params.append(t_session)
     if include_spin_offs:
         params.append(t)
     params += [max_gap, max_share]
     return (
-        _adjusted_ctes(action_types, bars_filter, actions_filter, spin_offs=include_spin_offs),
+        _adjusted_ctes(
+            action_types,
+            bars_filter,
+            actions_filter,
+            chained=chained,
+            hide=hide,
+            spin_offs=include_spin_offs,
+        ),
         params,
     )
 
@@ -1381,19 +1890,21 @@ def adjusted_prices_as_of(
         )
     if isinstance(sessions_from, datetime):
         raise TypeError(f"sessions_from must be a session date, not a datetime: {sessions_from!r}")
-    common_ctes, params = _adjusted_params(
-        t,
-        security_ids,
-        settings,
-        include_dividends=include_dividends,
-        include_spin_offs=include_spin_offs,
-    )
-    with _sessions_registered(conn, include_dividends=include_dividends):
-        _raise_on_invalid_factor(conn, common_ctes, params, spin_offs=include_spin_offs)
-        frame = conn.execute(
-            _adjusted_select(common_ctes, bounded=sessions_from is not None),
-            [*params, sessions_from] if sessions_from is not None else params,
-        ).pl()
+    with _chains_registered(conn, t) as chains:
+        common_ctes, params = _adjusted_params(
+            t,
+            security_ids,
+            settings,
+            include_dividends=include_dividends,
+            include_spin_offs=include_spin_offs,
+            chains=chains,
+        )
+        with _sessions_registered(conn, include_dividends=include_dividends):
+            _raise_on_invalid_factor(conn, common_ctes, params, spin_offs=include_spin_offs)
+            frame = conn.execute(
+                _adjusted_select(common_ctes, bounded=sessions_from is not None),
+                [*params, sessions_from] if sessions_from is not None else params,
+            ).pl()
     return _traded(frame) if traded_only else frame
 
 
@@ -1514,23 +2025,26 @@ def dropped_dividends_as_of(
     what is a drop and what is bad data.
     """
     t = _validate_t(t)
-    common_ctes, params = _adjusted_params(t, security_ids, settings, include_dividends=True)
-    sql = f"""
-        WITH {common_ctes}
-        SELECT
-            security_id,
-            ex_date,
-            ratio_or_amount,
-            prior_session,
-            gap_sessions,
-            drop_reason AS reason
-        FROM event_factor
-        WHERE drop_reason IS NOT NULL
-        ORDER BY security_id, ex_date
-    """
-    with _sessions_registered(conn, include_dividends=True):
-        _raise_on_invalid_factor(conn, common_ctes, params)
-        return conn.execute(sql, params).pl()
+    with _chains_registered(conn, t) as chains:
+        common_ctes, params = _adjusted_params(
+            t, security_ids, settings, include_dividends=True, chains=chains
+        )
+        sql = f"""
+            WITH {common_ctes}
+            SELECT
+                security_id,
+                ex_date,
+                ratio_or_amount,
+                prior_session,
+                gap_sessions,
+                drop_reason AS reason
+            FROM event_factor
+            WHERE drop_reason IS NOT NULL
+            ORDER BY security_id, ex_date
+        """
+        with _sessions_registered(conn, include_dividends=True):
+            _raise_on_invalid_factor(conn, common_ctes, params)
+            return conn.execute(sql, params).pl()
 
 
 def unvalued_spin_offs_as_of(
@@ -1553,20 +2067,26 @@ def unvalued_spin_offs_as_of(
     does (a non-positive or non-finite ratio or child close).
     """
     t = _validate_t(t)
-    common_ctes, params = _adjusted_params(
-        t, security_ids, settings, include_dividends=True, include_spin_offs=True
-    )
-    sql = f"""
-        WITH {common_ctes}
-        SELECT
-            security_id AS parent,
-            child_id AS child,
-            ex_date,
-            drop_reason AS reason
-        FROM event_factor
-        WHERE action_type = 'spinoff' AND drop_reason IS NOT NULL
-        ORDER BY parent, ex_date, child
-    """
-    with _sessions_registered(conn, include_dividends=True):
-        _raise_on_invalid_factor(conn, common_ctes, params, spin_offs=True)
-        return conn.execute(sql, params).pl()
+    with _chains_registered(conn, t) as chains:
+        common_ctes, params = _adjusted_params(
+            t,
+            security_ids,
+            settings,
+            include_dividends=True,
+            include_spin_offs=True,
+            chains=chains,
+        )
+        sql = f"""
+            WITH {common_ctes}
+            SELECT
+                security_id AS parent,
+                child_id AS child,
+                ex_date,
+                drop_reason AS reason
+            FROM event_factor
+            WHERE action_type = 'spinoff' AND drop_reason IS NOT NULL
+            ORDER BY parent, ex_date, child
+        """
+        with _sessions_registered(conn, include_dividends=True):
+            _raise_on_invalid_factor(conn, common_ctes, params, spin_offs=True)
+            return conn.execute(sql, params).pl()
