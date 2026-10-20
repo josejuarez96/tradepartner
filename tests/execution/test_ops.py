@@ -1863,6 +1863,7 @@ def _p_seed(
     marks: dict[date, float] | None = None,
     report: bool = True,
     spy: dict[date, float] | None = None,
+    report_known: datetime = _P_KNOWN,
 ) -> None:
     """Hypothesis 1 (daily cadence, base cost 5 bps), the window, its marks (cash only),
     SPY bars, and, with `report`, a two-rebalance tracking trial and its `paper_reports` row."""
@@ -1944,9 +1945,9 @@ def _p_seed(
                     window_id=_P_WINDOW_ID,
                     trial_id=7,
                     through_session=_PT1,
-                    run_at=_P_KNOWN,
-                    known_at=_P_KNOWN,
-                    ingested_at=_P_KNOWN,
+                    run_at=report_known,
+                    known_at=report_known,
+                    ingested_at=report_known,
                 ),
             )
 
@@ -2203,3 +2204,15 @@ def test_performance_data_writes_nothing_and_opens_no_trial(journal_settings: Se
 def test_the_performance_read_imports_no_trial_writer() -> None:
     text = Path(ops.__file__).read_text()
     assert "run_hypothesis" not in text and "backtest.run" not in text
+
+
+def test_the_cards_as_of_covers_the_report_row_it_draws(journal_settings: Settings) -> None:
+    """A report row stamped after every other journal row moves the card's "as of" to
+    its `known_at`, and the tracking count is read at that time (10-05 12:00 UTC is
+    before 10-05's close, so three daily rebalances 09-30, 10-01, 10-02 have closed)."""
+    late = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    _p_seed(journal_settings, report_known=late)
+    data = _p_read(journal_settings)
+    assert data is not None
+    assert data.as_of == late
+    assert data.tracking_n == 3 and data.tracking_state == "drawn"

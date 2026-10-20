@@ -1200,7 +1200,10 @@ def performance_data(
     if window is None or window.window_id is None or header.as_of is None:
         return None
     window_id = window.window_id
-    as_of = header.as_of
+    report = _latest_report(conn, window_id)
+    #: The card's "as of" covers the report row it draws too, so the trial line is never
+    #: newer than the header, and SPY and the rebalance count are read at that same time.
+    as_of = header.as_of if report is None else max(header.as_of, report.known_at)
 
     base_session = _base_session(window.started_at)
     marks = _equity_by_session(conn, window_id)
@@ -1209,7 +1212,6 @@ def performance_data(
     )
     equity = {**marks, base_session: base_value} if marks else {}
 
-    report = _latest_report(conn, window_id)
     tracking_n = _tracking_count(conn, window, as_of)
     state: TrackingState
     if report is not None:
