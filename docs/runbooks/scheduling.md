@@ -462,21 +462,21 @@ The flag accepts **only those rejection-cap verdicts**, on the runs this release
 
 ### The kill-switch drill (ADR 0017 part E.4)
 
-The drill proves, on the real store, that an engaged switch stops a scheduled run from submitting anything. It is one of the seven shakedown lines (E.4) and is run **once, on book `main`, on an H1 fill session** inside the shakedown span (the first session after a month-end; not H1's first fill session, which is the evidence run and must trade). `main` hosts it because it is the fastest book that is not a forward exam: the drill costs H1 at most one rebalance (delayed to a catch-up run, or `missed` with reason `kill_switch` if the catch-up lapses), reported by `paper report` and never an exam result. The owner times it.
+The drill proves, on the real store, that an engaged switch stops a scheduled run from submitting anything. It is one of the seven shakedown lines (E.4) and is run **once, on book `daily`, on one daily-book session** inside the shakedown span: **2026-10-27** (owner decision 2026-10-20, #2086). `daily` hosts it because it is a fast book that is not a forward exam: the drill costs it at most one rebalance (delayed to a catch-up run, or `missed` with reason `kill_switch` if the catch-up lapses), reported by `paper report` and never an exam result. The owner times it.
 
-1. **Before the scheduled run, on the fill session** (after the previous session's ingest, before the job's start, 08:05 ET with today's plist), engage the switch yourself:
+1. **Before the scheduled run, on the 2026-10-27 session** (after the previous session's ingest, before the job's start, 08:05 ET with today's plist), engage the switch yourself:
    ```bash
-   uv run tradepartner paper kill --book main --reason "drill"
+   uv run tradepartner paper kill --book daily --reason "drill"
    ```
-   The `--reason` is journaled; the `kill_switch` row it writes has `state = engaged` and `source = owner`, which is what E.4 reads. Confirm with `uv run tradepartner paper status --book main` that the switch shows engaged. Engage it **only** for `main`: `--all` would drill every book and cost each its rebalance.
-2. **Let the scheduled run skip.** Do not start the run yourself and do not `kickstart` it: the line needs a run with `invoked_by = 'scheduler'` (and a kickstart inside the window can trade if the switch is not engaged). The job still collects, reconciles and marks, and submits nothing; `main`'s result is `skipped_kill_switch` (exit 0) with **no `orders` row**. Check it in `paper status --book main` after the run. Any other book with an open window runs normally in the same job.
+   The `--reason` is journaled; the `kill_switch` row it writes has `state = engaged` and `source = owner`, which is what E.4 reads. Confirm with `uv run tradepartner paper status --book daily` that the switch shows engaged. Engage it **only** for `daily`: `--all` would drill every book and cost each its rebalance.
+2. **Let the scheduled run skip.** Do not start the run yourself and do not `kickstart` it: the line needs a run with `invoked_by = 'scheduler'` (and a kickstart inside the window can trade if the switch is not engaged). The job still collects, reconciles and marks, and submits nothing; `daily`'s result is `skipped_kill_switch` (exit 0) with **no `orders` row**. Check it in `paper status --book daily` after the run. Any other book with an open window runs normally in the same job.
 3. **Resume the same day**, once the run has finished (never before it, or the run trades):
    ```bash
-   uv run tradepartner paper resume --book main --reason "drill complete: <what you checked>"
+   uv run tradepartner paper resume --book daily --reason "drill complete: <what you checked>"
    ```
    Resume settles, collects, reconciles and appends the `released` row, exactly as in "Kill switch" above; if reconciliation fails it refuses and the switch stays engaged, so find out why before trying again. The `released` row is the third thing E.4 reads. The drilled rebalance trades on a later catch-up run if the catch-up window allows it, else it is logged `missed` (reason `kill_switch`).
 
-Nothing in the drill bypasses a risk check or releases the switch without a reconciliation. If the drilled session shows an `orders` row for `main`, or the run's result is anything but `skipped_kill_switch`, stop and treat it as an incident: that is a kill-switch defect, not a drill result.
+Nothing in the drill bypasses a risk check or releases the switch without a reconciliation. If the drilled session shows an `orders` row for `daily`, or the run's result is anything but `skipped_kill_switch`, stop and treat it as an incident: that is a kill-switch defect, not a drill result.
 
 ### The shakedown: the span, notes and `paper shakedown`
 
