@@ -466,6 +466,7 @@ from tradepartner.research.labeling import frame as labeling_frame
 from tradepartner.research.labeling import gold, job, review, scoring
 from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET, REVERSED_OPTION_SET
 from tradepartner.retract import RetractRefused, master_retract
+from tradepartner.store import backup as store_backup_module
 from tradepartner.store import (
     journal,
     lab_queries,
@@ -3304,6 +3305,32 @@ def make_app(
                 f"{r.run_id}  {r.slug}  {r.kind}  {r.split}  {r.outcome}  {_fmt(r.verdict)}  "
                 f"{basis}  {_flag_names(r)}  {message}"
             )
+
+    store_app = typer.Typer(no_args_is_help=True, help="Look after the store file.")
+    app.add_typer(store_app, name="store")
+
+    @store_app.command("backup")
+    def store_backup() -> None:
+        """Copy the store to `<store>.bak-YYYYMMDD-HHMM` (UTC), verify it byte for byte
+        and write a manifest beside it. Refuses while the store is in use. Deletes nothing."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            commit = "unknown"
+        try:
+            result = store_backup_module.backup_store(s, now=clock(), git_commit=commit)
+        except store_backup_module.BackupError as exc:
+            raise _fail(f"backup refused: {exc}", 1) from exc
+        typer.echo(f"copy matches the store byte for byte: {result.copy_path}")
+        if result.wal_copy_path is not None:
+            typer.echo(f"log copy: {result.wal_copy_path}")
+        typer.echo(f"manifest: {result.manifest_path}")
+        typer.echo(f"code commit {result.git_commit}, schema version {result.schema_version}")
 
     dataset_app = typer.Typer(no_args_is_help=True, help="Register research datasets.")
     app.add_typer(dataset_app, name="dataset")
