@@ -2955,3 +2955,52 @@ def test_a_window_frozen_with_a_bad_short_key_is_refused(key: str, value: float)
     assert getattr(frozen_risk(_window(_frozen_today())), key) == _SHORT_KEYS[key]
     with pytest.raises(ValueError, match=key):
         frozen_risk(_window(_frozen_today(**{key: value})))
+
+
+# --- the known-answer index check (#1598, T243) ---------------------------------
+
+
+def test_index_check_defaults_are_the_amendments_eight_keys() -> None:
+    cfg = Settings(_env_file=None).index_check
+    assert cfg.model_dump() == {
+        "start_month": "2019-08",
+        "end_month": "2026-09",
+        "check_only_symbols": ["RSP"],
+        "equal_benchmark": "RSP",
+        "cap_benchmark": "SPY",
+        "worst_months": 10,
+        "names_per_month": 5,
+        "extreme_name_return": 0.60,
+    }
+
+
+def test_index_check_refuses_a_symbol_in_both_lists() -> None:
+    with pytest.raises(ValueError, match=r"index_check\.check_only_symbols \['RSP'\]"):
+        Settings(_env_file=None, benchmarks=["SPY", "RSP"])
+    with pytest.raises(ValueError, match="also in benchmarks"):
+        Settings(_env_file=None, index_check={"check_only_symbols": ["SPY"]})
+    assert Settings(_env_file=None, benchmarks=["SPY"]).benchmarks == ["SPY"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"start_month": "2019-13"},
+        {"end_month": "2026-9"},
+        {"start_month": "2026-09", "end_month": "2019-08"},
+        {"worst_months": 0},
+        {"names_per_month": 0},
+        {"extreme_name_return": 0.0},
+        {"extreme_name_return": float("nan")},
+        {"unknown_key": 1},
+    ],
+)
+def test_invalid_index_check_config_is_rejected(bad: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, index_check=bad)
+
+
+def test_index_check_is_in_no_hypothesis_key_set() -> None:
+    from tradepartner.backtest.frozen import FROZEN_KEY_DEFAULTS
+
+    assert not [k for k, _, _ in FROZEN_KEY_DEFAULTS if k.startswith("index_check")]
