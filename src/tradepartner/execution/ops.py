@@ -227,6 +227,8 @@ class OpsData:
     positions_count: int = 0
     positions_value: float = 0.0
     open_orders_count: int = 0
+    last_run_kind: str | None = None
+    last_run_session: date | None = None
     targets_count: int = 0
     switch_state: SwitchState | None = None
     ranking: tuple[RankedSignal, ...] = field(default_factory=tuple)
@@ -255,6 +257,8 @@ class BookSummary:
     #: The latest run's result status, `"unfinished"` while it has none, None
     #: before the window's first run.
     last_run_status: str | None
+    last_run_kind: str | None
+    last_run_session: date | None
     #: The first rebalance session at the window's cadence whose close is after
     #: now, never before the window's first rebalance; None for a window that is
     #: no longer open or whose cadence cannot be read.
@@ -814,6 +818,7 @@ def page_data(
     released_at = max((r.at for r in kill_switch_rows if r.state == "released"), default=None)
     runs_with_results = _runs_for_switch(conn, window_id, released_at=released_at)
     runs = [rw.run for rw in runs_with_results]
+    latest_run = max(runs, key=lambda r: r.run_id or 0, default=None)
     results = [rw.result for rw in runs_with_results if rw.result is not None]
 
     s_minus_1 = _required_run_session(utc_now())
@@ -862,6 +867,8 @@ def page_data(
         positions_count=positions_count,
         positions_value=positions_value,
         open_orders_count=open_orders_count,
+        last_run_kind=latest_run.kind if latest_run is not None else None,
+        last_run_session=latest_run.session if latest_run is not None else None,
         targets_count=targets_count,
         switch_state=switch_state,
         ranking=ranking,
@@ -938,6 +945,8 @@ def _summary(conn: duckdb.DuckDBPyConnection, settings: Settings, book: str) -> 
         open_orders_count=_open_orders_count(conn, window_id),
         switch_state=switch_state,
         last_run_status=last_run_status,
+        last_run_kind=latest_run.run.kind if latest_run is not None else None,
+        last_run_session=latest_run.run.session if latest_run is not None else None,
         next_rebalance_session=(
             _next_rebalance_session(conn, window, utc_now()) if is_open else None
         ),

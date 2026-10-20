@@ -256,13 +256,24 @@ def _rebalance_count_line(
     all_executed_sessions = {e.rebalance_session for e in executed}
     tty_only_sessions = sorted(all_executed_sessions - scheduler_sessions)
     executed_run_ids = {e.run_id for e in executed}
-    no_trade_runs = sorted(
-        run.session
+    order_run_ids = {order.run_id for order in store_journal.orders_for(conn, window_id=window_id)}
+    uncounted_runs = [
+        run
         for run in runs.values()
         if run.session is not None
         and run.invoked_by == _SCHEDULER
         and run.kind in (_REBALANCE, _CATCH_UP)
         and run.run_id not in executed_run_ids
+    ]
+    no_trade_runs = sorted(
+        run.session
+        for run in uncounted_runs
+        if run.session is not None and run.run_id not in order_run_ids
+    )
+    submitted_runs = sorted(
+        run.session
+        for run in uncounted_runs
+        if run.session is not None and run.run_id in order_run_ids
     )
 
     count = len(scheduler_sessions)
@@ -278,6 +289,9 @@ def _rebalance_count_line(
     if no_trade_runs:
         no_trade_text = ", ".join(s.isoformat() for s in no_trade_runs)
         detail += f"; no-trade fill-session runs, listed not counted: [{no_trade_text}]"
+    if submitted_runs:
+        submitted_text = ", ".join(s.isoformat() for s in submitted_runs)
+        detail += f"; submitted-order runs awaiting recorded fills, not counted: [{submitted_text}]"
     return CheckLine(name="rebalance_count", passed=passed, query=query, detail=detail)
 
 

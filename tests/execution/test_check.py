@@ -408,6 +408,23 @@ def test_rebalance_count_lists_tty_and_no_trade_runs_without_counting_them(
     assert str(T1) in line.detail.split("no-trade fill-session runs")[-1]
 
 
+def test_rebalance_count_calls_a_run_with_orders_submitted_not_no_trade(settings: Settings) -> None:
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn, extra_no_trade_run=True)
+        _insert_decision(conn, 12, 12, T1)
+        conn.execute(
+            "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, "
+            "phase, security_id, symbol, side, notional, sells_in_flight_at_submit, "
+            "known_at, ingested_at) VALUES ('pending-12', 12, 12, ?, 1, 'buy', "
+            "'SEC_A', 'AAA', 'buy', 1000.0, FALSE, ?, ?)",
+            [T1, _utc(T1), _utc(T1)],
+        )
+    with open_read_only(settings) as conn:
+        line = next(line for line in check(conn, settings) if line.name == "rebalance_count")
+    assert f"submitted-order runs awaiting recorded fills, not counted: [{T1}]" in line.detail
+    assert f"no-trade fill-session runs, listed not counted: [{T1}]" not in line.detail
+
+
 def test_two_executed_rows_on_one_rebalance_session_count_once(settings: Settings) -> None:
     with open_for_write(settings) as conn:
         _build_passing_fixture(conn, duplicate_t0_run=True)

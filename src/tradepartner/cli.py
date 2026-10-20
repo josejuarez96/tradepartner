@@ -798,6 +798,12 @@ def _print_report(report: HealthReport) -> None:
     echo("integrity:")
     for check in report.integrity:
         verdict = "pass" if check.passed else f"FAIL ({check.violations.height} rows)"
+        if (
+            check.rule == "duplicate_dividends"
+            and check.passed
+            and report.duplicate_dividends.pending
+        ):
+            verdict += f" ({len(report.duplicate_dividends.pending)} pending repair)"
         echo(f"  {check.rule}: {verdict}")
     echo(f"  {COVERAGE_REFERENCE_NAMES}: {_coverage_verdict(report.coverage_reference)}")
     echo(f"  {INDEX_MEMBERS_MISSING}: {_index_verdict(report.coverage_reference)}")
@@ -1601,13 +1607,23 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
             if state.engaged
             else ("run in progress" if state.run_in_progress else "released")
         )
-        lines.append(
+        rebalance = _fmt(row.next_rebalance_session)
+        if (
+            row.last_run_kind == "rebalance"
+            and row.last_run_status == "ok"
+            and row.last_run_session == row.next_rebalance_session
+        ):
+            rebalance += " (today (done))"
+        line = (
             f"book {row.book_id}: window {row.window.window_id} "
             f"{'open' if row.is_open else 'closed'}; positions {row.positions_count}; "
             f"open orders {row.open_orders_count}; kill switch {switch_text}; "
             f"last run {_fmt(row.last_run_status)}; "
-            f"next rebalance {_fmt(row.next_rebalance_session)}"
+            f"next rebalance {rebalance}"
         )
+        if row.open_orders_count and row.last_run_kind == "rebalance":
+            line += "; Fills are recorded at the next scheduled run (08:05 ET)"
+        lines.append(line)
     return lines
 
 
@@ -1635,6 +1651,11 @@ def _status_lines(
         + ("; STALE: no run for S-1" if data.stale else ""),
         f"positions {data.positions_count} (value {data.positions_value:.2f}); open orders "
         f"{data.open_orders_count}; targets {data.targets_count}",
+        *(
+            ["Fills are recorded at the next scheduled run (08:05 ET)"]
+            if data.open_orders_count and data.last_run_kind == "rebalance"
+            else []
+        ),
         f"kill switch {switch_text} (causes: {causes})",
         "reconciliation "
         + ("n/a" if recon is None else f"{recon.reconciliation_id} {recon.status} at {recon.at}"),
@@ -2447,7 +2468,9 @@ def make_app(
                 f"the store has no usable schema; run `tradepartner ingest`: {exc}", 1
             ) from None
         _print_report(report)
+        warnings = 0
         if (count := _quarantined(report)) > 0:
+            warnings += 1
             typer.echo(
                 f"warning: the last EDGAR run reports {count} quarantined accessions; "
                 "they get no further request until their failed_filings.json entries "
@@ -2455,6 +2478,7 @@ def make_app(
                 err=True,
             )
         if pending := len(report.duplicate_dividends.pending):
+            warnings += 1
             typer.echo(
                 f"warning: {pending} listed duplicate dividend keys are pending repair "
                 "(`tradepartner repair-dividends`); each still counts its payment twice",
@@ -2463,6 +2487,7 @@ def make_app(
         for row in report.successor_chains.frame.filter(pl.col("price_break")).iter_rows(
             named=True
         ):
+            warnings += 1
             limit = s.master.chain_max_price_ratio
             typer.echo(
                 f"warning: chain_price_break: {row['successor_id']} closed x{row['ratio']:.2f} "
@@ -2471,8 +2496,17 @@ def make_app(
                 "check the chain before relying on it",
                 err=True,
             )
-        if check and not report.ok:
-            raise _fail(f"health check failed: {', '.join(report.failures)}", 1)
+        if check:
+            failures = len(report.failures)
+            if failures:
+                typer.echo(f"health check failed: {', '.join(report.failures)}", err=True)
+            typer.echo(
+                "health: OK"
+                if not failures and not warnings
+                else f"health: {failures} failures, {warnings} warnings"
+            )
+            if failures:
+                raise typer.Exit(1)
 
     @app.command()
     def dashboard() -> None:

@@ -1598,6 +1598,80 @@ def test_status_all_prints_one_summary_line_per_book(
     )
 
 
+@pytest.mark.usefixtures("started")
+def test_status_summary_labels_completed_rebalance_and_fill_lag(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    """The morning summary must explain today's submitted orders and fill lag."""
+    run_at = datetime(2026, 10, 30, 14, tzinfo=UTC)
+    monkeypatch.setattr(ops, "utc_now", lambda: run_at)
+    with open_for_write(_settings()) as conn:
+        window = journal.latest_window(conn, "main")
+        assert window is not None and window.window_id is not None
+        run_id = journal.append(
+            conn,
+            journal.PaperRunRow(
+                window_id=window.window_id,
+                session=run_at.date(),
+                kind="rebalance",
+                started_at=run_at,
+                invoked_by="scheduler",
+                code_version="test",
+                known_at=run_at,
+                ingested_at=run_at,
+            ),
+        )
+        assert run_id is not None
+        journal.append(
+            conn,
+            journal.PaperRunResultRow(
+                run_id=run_id,
+                finished_at=run_at,
+                status="ok",
+                clock_fault=False,
+                known_at=run_at,
+                ingested_at=run_at,
+            ),
+        )
+        decision_id = journal.append(
+            conn,
+            DecisionRow(
+                run_id=run_id,
+                rebalance_session=run_at.date(),
+                security_id="0002023554",
+                side="buy",
+                whole_share=False,
+                decision="trade",
+                known_at=run_at,
+                ingested_at=run_at,
+            ),
+        )
+        assert decision_id is not None
+        journal.append(
+            conn,
+            OrderRow(
+                client_order_id="tp-main-20261030-0002023554-buy-1",
+                decision_id=decision_id,
+                run_id=run_id,
+                session=run_at.date(),
+                attempt=1,
+                phase="buy",
+                security_id="0002023554",
+                symbol="AAPL",
+                side="buy",
+                notional=494.0,
+                sells_in_flight_at_submit=False,
+                known_at=run_at,
+                ingested_at=run_at,
+            ),
+        )
+    out = _paper(clock, factory, "status", "--all")
+    assert "today (done)" in out.output
+    assert "Fills are recorded at the next scheduled run (08:05 ET)" in out.output
+    detail = _paper(clock, factory, "status")
+    assert "Fills are recorded at the next scheduled run (08:05 ET)" in detail.output
+
+
 def test_status_all_with_no_window(clock: _Clock, factory: _Factory) -> None:
     out = _paper(clock, factory, "status", "--all")
     assert (out.exit_code, out.output) == (0, "paper status: no paper window yet\n")
