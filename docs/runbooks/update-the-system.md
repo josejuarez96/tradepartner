@@ -42,10 +42,12 @@ git diff HEAD origin/main -- src/tradepartner/store/schema.py | grep '^[-+]CURRE
 launchctl list | grep com.tradepartner
 ```
 
-Each line is `PID  exit-code  label`. The first column must be `-` (idle) on every line. A number there means that job is running: wait a few minutes and run the line again. Write down the labels it lists (the ingest job, the paper job, and any per-book or `collect` job you installed). Then unload all of them:
+Each line is `PID  exit-code  label`. The first column must be `-` (idle) on every line. A number there means that job is running: wait a few minutes and run the line again. The labels it lists are the jobs that are loaded now (the ingest job, the paper job, and any per-book or `collect` job). Save that list, then unload exactly those jobs:
 
 ```bash
-for L in $(launchctl list | awk '/com\.tradepartner/ {print $3}'); do launchctl bootout gui/$(id -u)/$L; done
+launchctl list | awk '/com\.tradepartner/ {print $3}' > "$STORE_PATH.jobs"
+cat "$STORE_PATH.jobs"
+for L in $(cat "$STORE_PATH.jobs"); do launchctl bootout gui/$(id -u)/$L; done
 launchctl list | grep com.tradepartner || echo "all jobs unloaded"
 ```
 
@@ -79,11 +81,11 @@ uv sync
 **6. Load the jobs again.**
 
 ```bash
-for P in ~/Library/LaunchAgents/com.tradepartner.*.plist; do launchctl bootstrap gui/$(id -u) "$P"; done
+for L in $(cat "$STORE_PATH.jobs"); do launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/$L.plist; done
 launchctl list | grep com.tradepartner
 ```
 
-Every label you wrote down in step 3 must be listed again. A job you had already switched off on purpose before the update (`launchctl disable`) will refuse to load; that is fine, leave it off. The jobs run whatever code is checked out, so the next scheduled run uses the new code. Do not run `kickstart` to test it ([scheduling](scheduling.md), "Install, test, remove").
+Only the jobs saved in step 3 come back, so a plist you had parked on disk stays off. Every label in `$STORE_PATH.jobs` must be listed again. (In a new Terminal window, run step 1's `STORE_PATH=` line first.) A job you had already switched off on purpose before the update (`launchctl disable`) will refuse to load; that is fine, leave it off. The jobs run whatever code is checked out, so the next scheduled run uses the new code. Do not run `kickstart` to test it ([scheduling](scheduling.md), "Install, test, remove").
 
 **7. Check it.**
 
