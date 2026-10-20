@@ -691,6 +691,35 @@ def test_a_recorded_submit_refusal_is_raised_typed_with_no_key_in_it(
         assert secret not in text
 
 
+@pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
+def test_a_wash_trade_403_is_a_reconciliation_fault_by_code_and_message(side: Side) -> None:
+    """#1949: 403 40310000 'potential wash trade detected' is typed on either side,
+    and the error names it; the same code with another message is not."""
+    body = {"code": 40310000, "message": "potential wash trade detected. use complex orders"}
+    broker, http = _broker()
+    http.route("GET", "/v2/orders:by_client_order_id", _by_client_id({}))
+    http.route("POST", "/v2/orders", (403, body))
+    with pytest.raises(ReconciliationError, match="wash trade"):
+        broker.submit(_request(side=side))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "insufficient buying power",
+        "opg orders must be submitted after 7:00pm and before 9:28am",
+        "bracket orders do not support extended hours trading",
+    ],
+)
+def test_other_40310000_messages_are_not_typed_as_a_wash_trade(message: str) -> None:
+    broker, http = _broker()
+    http.route("GET", "/v2/orders:by_client_order_id", _by_client_id({}))
+    http.route("POST", "/v2/orders", (403, {"code": 40310000, "message": message}))
+    with pytest.raises(AlpacaTradingError) as err:
+        broker.submit(_request())
+    assert not isinstance(err.value, ReconciliationError)
+
+
 #: The three per-name refusals of the allowlist (paper spec amendment 2026-10-18
 #: item 2, T202), each as Alpaca answers `POST /v2/orders`: the 404 / 40410000 of an
 #: asset it does not know, and the 403 / 40310000 refusals told apart by message
