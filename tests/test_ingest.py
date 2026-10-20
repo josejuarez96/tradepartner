@@ -4841,7 +4841,13 @@ def test_actions_backfill_floor_dry_run_and_idempotent_month(
         calls
         == [
             (
-                (CorporateActionsType.SPIN_OFF, CorporateActionsType.NAME_CHANGE),
+                (
+                    CorporateActionsType.SPIN_OFF,
+                    CorporateActionsType.NAME_CHANGE,
+                    CorporateActionsType.CASH_MERGER,
+                    CorporateActionsType.STOCK_MERGER,
+                    CorporateActionsType.STOCK_AND_CASH_MERGER,
+                ),
                 date(2020, 6, 1),
                 date(2020, 6, 30),
             )
@@ -6366,3 +6372,119 @@ def test_a_month_end_name_change_missed_by_a_transport_error_is_asked_again_next
     assert windows[1][0] <= day <= windows[1][1]
     with duckdb.connect(str(fixture_store_path)) as conn:
         assert conn.execute("SELECT count(*) FROM symbol_changes").fetchone()[0] == 1
+
+
+def test_daily_fixture_stores_both_mergers_at_their_stamps_once(
+    fixture_store_path: Path,
+) -> None:
+    """The symbol-less daily request stores the fixture's cash merger (its
+    acquiree delisted) and stock merger at the close after their
+    `process_date`, a run before the stamp stores nothing (no look-ahead),
+    and a re-run adds zero rows."""
+    from tradepartner.adapters.fixture_prices import FixturePriceSource
+    from tradepartner.adapters.prices import announcement_date_known_at
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    prices = FixturePriceSource(Path(__file__).parent / "fixtures" / "universe")
+    cash_stamp = announcement_date_known_at(date(2018, 7, 25))
+    stock_stamp = announcement_date_known_at(date(2020, 2, 14))
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute("DELETE FROM mergers")
+    cash = _run(settings, prices=prices, now=cash_stamp + timedelta(hours=1), source="alpaca")
+    assert cash.ok, cash.runs
+    stock = _run(settings, prices=prices, now=stock_stamp + timedelta(hours=1), source="alpaca")
+    assert stock.ok, stock.runs
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute(
+            "SELECT security_id, source_action_id, known_at FROM mergers ORDER BY known_at"
+        ).fetchall() == [
+            ("SEC_CLEAN_MERGER", "fixture-merger-cash-1", cash_stamp),
+            ("SEC_DIV_CANCELLED", "fixture-merger-stock-1", stock_stamp),
+        ]
+    again = _run(settings, prices=prices, now=stock_stamp + timedelta(hours=1), source="alpaca")
+    assert again.ok
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute("SELECT count(*) FROM mergers").fetchone() == (2,)
+
+
+def test_daily_run_before_a_mergers_stamp_stores_nothing(fixture_store_path: Path) -> None:
+    from tradepartner.adapters.fixture_prices import FixturePriceSource
+    from tradepartner.adapters.prices import announcement_date_known_at
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    prices = FixturePriceSource(Path(__file__).parent / "fixtures" / "universe")
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute("DELETE FROM mergers")
+    stamp = announcement_date_known_at(date(2018, 7, 25))
+    run = _run(settings, prices=prices, now=stamp - timedelta(hours=1), source="alpaca")
+    assert run.ok, run.runs
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute("SELECT count(*) FROM mergers").fetchone() == (0,)
+
+
+def test_actions_backfill_writes_a_symbol_less_cash_merger_once(
+    fixture_store_path: Path,
+) -> None:
+    from alpaca.data.enums import CorporateActionsType
+
+    from tradepartner.adapters.prices import announcement_date_known_at
+    from tradepartner.ingest import ingest_actions_backfill
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    asked: list[tuple[CorporateActionsType, ...]] = []
+
+    def scan(types: Sequence[CorporateActionsType], start: date, end: date) -> dict[str, Any]:
+        asked.append(tuple(types))
+        return {
+            "cash_mergers": [
+                {
+                    "id": "cash-2020-1",
+                    "acquiree_symbol": "SPY",
+                    "acquiree_cusip": "ACQ",
+                    "rate": 12.5,
+                    "effective_date": "2020-06-16",
+                    "process_date": "2020-06-16",
+                    "payable_date": "2020-06-17",
+                }
+            ]
+        }
+
+    now = datetime(2020, 7, 2, 20, tzinfo=UTC)
+    kwargs: dict[str, Any] = {
+        "since": date(2020, 6, 1),
+        "through": date(2020, 6, 30),
+        "clock": lambda: now,
+        "scan": scan,
+    }
+    dry = ingest_actions_backfill(settings, dry_run=True, **kwargs)
+    assert dry.runs[0].rows_added == 1
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM mergers WHERE security_id='SEC_SPY'"
+        ).fetchone() == (0,)
+    first = ingest_actions_backfill(settings, **kwargs)
+    second = ingest_actions_backfill(settings, **kwargs)
+    assert first.runs[0].rows_added == 1 and second.runs[0].rows_added == 0
+    assert {"CASH_MERGER", "STOCK_MERGER", "STOCK_AND_CASH_MERGER"} <= {t.name for t in asked[0]}
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute(
+            "SELECT kind, cash_per_share, known_at FROM mergers WHERE security_id='SEC_SPY'"
+        ).fetchall() == [("cash", 12.5, announcement_date_known_at(date(2020, 6, 16)))]
+
+
+def test_store_price_source_delegates_mergers() -> None:
+    from tradepartner.cli import StorePriceSource
+
+    class Inner:
+        last_actions_report = "report"
+
+        def mergers(self, start: date, end: date) -> list[Any]:
+            return [(start, end)]
+
+    source = StorePriceSource(Settings(_env_file=None))
+    assert source.last_actions_report is None
+    source._inner = Inner()  # type: ignore[assignment]
+    assert source.mergers(date(2020, 1, 1), date(2020, 1, 2)) == [
+        (date(2020, 1, 1), date(2020, 1, 2))
+    ]
+    assert source.last_actions_report == "report"
