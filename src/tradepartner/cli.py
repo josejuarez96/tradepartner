@@ -789,6 +789,7 @@ def _print_report(report: HealthReport) -> None:
     for row in pairs.iter_rows(named=True):
         echo(f"  {row['security_id']}@{row['valid_from']} {row['ticker']}/{row['next_ticker']}")
     _print_duplicate_dividends(report)
+    _print_successor_chains(report)
     _print_borrow(report)
     _print_figi_types(report)
     echo(f"settings: {report.settings}")
@@ -815,6 +816,34 @@ def _print_duplicate_dividends(report: HealthReport) -> None:
             ticker = g.reviewed.ticker if g.reviewed is not None and g.reviewed.ticker else "-"
             ids = ", ".join(i.source_action_id for i in g.identities)
             typer.echo(f"  {g.security_id}@{g.ex_date} {ticker} {g.amount!r} ({ids})")
+
+
+def _print_successor_chains(report: HealthReport) -> None:
+    """The `successor_chains` block (#1922, T187c): each live chain with its
+    hand-over day and close ratio, the predecessor facts dated after the
+    hand-over, and the latest EDGAR run's candidates beside them. The price
+    breaks are the command's warning, not a failure."""
+    block = report.successor_chains
+    typer.echo(f"successor chains: {block.count} live" if block.count else "successor chains: none")
+    for row in block.frame.iter_rows(named=True):
+        ratio = "no ratio (a close is missing)" if row["ratio"] is None else f"{row['ratio']:.2f}"
+        handover = "none" if row["handover"] is None else row["handover"].isoformat()
+        typer.echo(
+            f"  {row['predecessor_id']} -> {row['successor_id']}: handed over {handover}, "
+            f"close ratio {ratio} ({row['evidence_form']} {row['evidence_accession']})"
+        )
+    for fact in block.predecessor_facts.iter_rows(named=True):
+        typer.echo(
+            f"  {fact['predecessor_id']} {fact['fact_name']} {fact['value']:.0f} "
+            f"as of {fact['as_of_date']} (dated after the hand-over)"
+        )
+    if block.candidates:
+        typer.echo(
+            f"chain candidates from the latest EDGAR run: {len(block.candidates)}: "
+            f"{', '.join(block.candidates)}"
+        )
+    else:
+        typer.echo("chain candidates from the latest EDGAR run: none")
 
 
 def _coverage_verdict(block: CoverageReference | None) -> str:
@@ -2428,6 +2457,17 @@ def make_app(
             typer.echo(
                 f"warning: {pending} listed duplicate dividend keys are pending repair "
                 "(`tradepartner repair-dividends`); each still counts its payment twice",
+                err=True,
+            )
+        for row in report.successor_chains.frame.filter(pl.col("price_break")).iter_rows(
+            named=True
+        ):
+            limit = s.master.chain_max_price_ratio
+            typer.echo(
+                f"warning: chain_price_break: {row['successor_id']} closed x{row['ratio']:.2f} "
+                f"against {row['predecessor_id']}'s last close, outside the allowed range "
+                f"(master.chain_max_price_ratio {limit:g}, so x{1 / limit:.2f} to x{limit:.2f}); "
+                "check the chain before relying on it",
                 err=True,
             )
         if check and not report.ok:

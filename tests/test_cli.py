@@ -1188,6 +1188,89 @@ def test_health_prints_the_shares_outlier_review_list(
     assert "shares outliers before 2019-03-01: 2 to review, 2 in all" in capped.output
 
 
+def _chain_store(settings: Settings) -> None:
+    """Add the successor-chain overlay (three live chains, one price break at
+    the default 1.15 limit) to the fixture store behind `settings`."""
+    from conftest import load_chain_overlay
+
+    with open_for_write(settings) as conn:
+        load_chain_overlay(conn)
+
+
+def test_health_prints_the_successor_chains_block_and_the_price_break_warning(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#1922: every live chain is listed with its hand-over day and close
+    ratio (hand-computed 19.33/15.41 = 1.25, 19.65/20.52 = 0.96,
+    19.27/19.87 = 0.97), the latest EDGAR run's candidates sit beside it, and
+    the one break is a `warning: chain_price_break` line, never a failure."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    _chain_store(settings)
+    _run_row(
+        settings,
+        "r1",
+        "edgar",
+        "ok",
+        T_END - timedelta(days=1),
+        "x; chain_candidates: 1: 0001000017",
+    )
+    for args in (["health"], ["health", "--check"]):
+        result = _invoke(settings, args, clock=lambda: T_END)
+        assert result.exit_code == 0, result.output  # a warning, not a failed rule
+        out = result.output
+        assert "successor chains: 3 live" in out
+        assert "0001000010 -> 0001000011: handed over 2020-02-04, close ratio 1.25" in out
+        assert "0001000012 -> 0001000013" in out and "close ratio 0.96" in out
+        assert "0001000014 -> 0001000015" in out and "close ratio 0.97" in out
+        assert "chain candidates from the latest EDGAR run: 1: 0001000017" in out
+        assert out.count("warning: chain_price_break") == 1
+        assert "warning: chain_price_break: 0001000011 closed x1.25 against 0001000010" in out
+
+
+def test_health_prints_the_predecessor_facts_after_a_handover(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#1922: the subsidiary case -- a predecessor fact dated after the
+    hand-over is listed under its chain."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    _chain_store(settings)
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "facts",
+            {
+                "security_id": "0001000010",
+                "fact_name": "shares_outstanding",
+                "as_of_date": date(2020, 3, 2),
+                "value": 4.2e8,
+                "known_at": session_close(date(2020, 3, 2)),
+                "ingested_at": session_close(date(2020, 3, 2)),
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    result = _invoke(settings, ["health"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "0001000010 shares_outstanding 420000000 as of 2020-03-02" in result.output
+
+
+def test_health_says_so_when_there_are_no_chains_and_no_break(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#1922: with no chain rows the block says none and prints no warning;
+    a loose ratio limit clears the break."""
+    plain = _settings(tmp_path, store=fixture_store_path)
+    result = _invoke(plain, ["health", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "successor chains: none" in result.output
+    assert "chain_price_break" not in result.output
+    _chain_store(plain)
+    loose = _settings(tmp_path, store=fixture_store_path, master={"chain_max_price_ratio": 1.30})
+    result = _invoke(loose, ["health", "--check"], clock=lambda: T_END)
+    assert "successor chains: 3 live" in result.output
+    assert "chain_price_break" not in result.output
+
+
 def test_health_warns_when_the_last_edgar_run_reports_quarantined_accessions(
     tmp_path: Path, fixture_store_path: Path
 ) -> None:
