@@ -94,6 +94,9 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # A post-registration key: frozen at `false` when absent, never from live
     # Settings, and outside the promotion identity.
     ("adjust.apply_spin_offs", False, 31),
+    # T238: the `momentum` buy/hold buffer (backtest spec amendment #657). 0.0 is no
+    # buffer, so no stored canonical set or fingerprint moves; a post-registration own key.
+    ("strategy.hold_top_fraction", 0.0, 34),
 )
 
 #: Keys added to a family's own listed section **after** that family's first
@@ -113,6 +116,7 @@ POST_REGISTRATION_OWN_KEYS: Final[frozenset[str]] = frozenset(
         "strategy.signal_delay_sessions",
         "strategy.placebo",
         "strategy.placebo_seed",
+        "strategy.hold_top_fraction",
     }
 )
 
