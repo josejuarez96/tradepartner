@@ -422,6 +422,62 @@ def test_ranking_uses_ticker_known_at_plan_time(
     assert set(ranking["ticker"].to_list()) == {"BBB", "OLD"}
 
 
+def _add_order_for_unlisted_ranked_name(store_path: Path, *, order_minute: int) -> None:
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        (run_id,) = conn.execute("SELECT run_id FROM paper_plans").fetchone()
+        decision_id = append(
+            conn,
+            DecisionRow(
+                run_id=run_id,
+                rebalance_session=_S_MINUS_1,
+                security_id="CCC",
+                side="buy",
+                whole_share=True,
+                decision="trade",
+                **_stamp(0),
+            ),
+        )
+        assert decision_id is not None
+        append(
+            conn,
+            OrderRow(
+                client_order_id="tp-ccc-buy-1",
+                decision_id=decision_id,
+                run_id=run_id,
+                session=_S_MINUS_1,
+                attempt=1,
+                phase="buy",
+                security_id="CCC",
+                symbol="CEE",
+                side="buy",
+                quantity=1.0,
+                sells_in_flight_at_submit=False,
+                **_stamp(order_minute),
+            ),
+        )
+
+
+def test_ranking_does_not_use_order_symbol_recorded_after_plan(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _add_order_for_unlisted_ranked_name(seeded_store, order_minute=4)
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    ranking = _dataframe_with_columns(at, "ticker", "selected")
+    assert set(ranking["ticker"].to_list()) == {"BBB", "Ticker unavailable (CCC)"}
+
+
+def test_ranking_uses_order_symbol_known_before_plan(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _add_order_for_unlisted_ranked_name(seeded_store, order_minute=1)
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    ranking = _dataframe_with_columns(at, "ticker", "selected")
+    assert set(ranking["ticker"].to_list()) == {"BBB", "CEE"}
+
+
 def test_render_fills_card(monkeypatch: pytest.MonkeyPatch, seeded_store: Path) -> None:
     at = _app(monkeypatch, seeded_store)
     assert not at.exception

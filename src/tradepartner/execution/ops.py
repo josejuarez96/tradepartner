@@ -957,8 +957,7 @@ def _summary(conn: duckdb.DuckDBPyConnection, settings: Settings, book: str) -> 
             "SELECT EXISTS (SELECT 1 FROM orders WHERE run_id = ?)",
             [latest_run.run.run_id],
         ).fetchone()
-        assert order_exists is not None
-        last_run_has_orders = bool(order_exists[0])
+        last_run_has_orders = bool(order_exists[0]) if order_exists else False
     return BookSummary(
         book_id=book,
         window=window,
