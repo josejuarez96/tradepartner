@@ -1,7 +1,7 @@
 """Fixture `PriceSource`: replays the fixture universe's recorded price rows
 (spec req 6, plan T7).
 
-Reads three CSVs from a fixture directory (the T5 universe in
+Reads these CSVs from a fixture directory (the T5 universe in
 `tests/fixtures/universe/` by default layout):
 
 - `securities.csv` (**required**): the set of `security_id`s the source
@@ -13,6 +13,8 @@ Reads three CSVs from a fixture directory (the T5 universe in
   `source_action_id` and `cancelled` columns (#108) are optional too: an
   empty or absent id means the source gave none, an absent `cancelled`
   means `FALSE`.
+- `mergers.csv` (optional; #1762): Alpaca merger records, replayed by
+  `process_date` through `mergers()`.
 
 **Replay, not snapshot.** A real source returns today's values; ingest
 (T16) turns a changed value into a revision with `prices.revision_of`. A
@@ -74,6 +76,7 @@ from pathlib import Path
 from tradepartner.adapters.prices import (
     Bar,
     CorporateAction,
+    Merger,
     PriceSource,
     SymbolChange,
     UnknownSecurityIdError,
@@ -88,6 +91,7 @@ _SECURITIES_CSV = "securities.csv"
 _PRICES_CSV = "prices_daily.csv"
 _ACTIONS_CSV = "corporate_actions.csv"
 _SYMBOL_CHANGES_CSV = "symbol_changes.csv"
+_MERGERS_CSV = "mergers.csv"
 
 _COMMON_COLUMNS = ("security_id", "known_at", "ingested_at", "source", "provenance")
 _PRICES_COLUMNS = (*_COMMON_COLUMNS, "session", "open", "high", "low", "close", "volume")
@@ -105,6 +109,22 @@ _SYMBOL_CHANGES_COLUMNS = (
     "old_cusip",
     "new_cusip",
     "process_date",
+    "source_action_id",
+)
+
+_MERGERS_COLUMNS = (
+    *_COMMON_COLUMNS,
+    "kind",
+    "acquirer_security_id",
+    "acquiree_symbol",
+    "acquiree_cusip",
+    "acquirer_symbol",
+    "acquirer_cusip",
+    "share_ratio",
+    "cash_per_share",
+    "effective_date",
+    "process_date",
+    "payable_date",
     "source_action_id",
 )
 
@@ -242,6 +262,92 @@ def _load_actions(path: Path, known_ids: frozenset[str]) -> list[_Row[CorporateA
             raise FixtureContractError(f"{where}: {exc}") from exc
         rows.append(_Row(action, ingested_at, where))
     return rows
+
+
+def _load_mergers(path: Path, known_ids: frozenset[str]) -> list[Merger]:
+    """The rows of `mergers.csv` (#1762) as `Merger`s, in ingest order per
+    identity, under the table's stamp bound (contract rule 2): an
+    identity's first row is stamped exactly
+    `announcement_date_known_at(process_date)`, never earlier (Alpaca gives no
+    time, and the effective date is not when the terms were knowable); each
+    later row is a revision whose values differ and whose `known_at` is its
+    own `ingested_at`, after the row before it (rule 3)."""
+    history: defaultdict[tuple[str, str], list[tuple[Merger, datetime, str]]] = defaultdict(list)
+    for where, row in _read_csv(path, _MERGERS_COLUMNS):
+        known_at, ingested_at = _check_common(
+            row, provenance="action", known_ids=known_ids, where=where
+        )
+        acquirer_id = row["acquirer_security_id"] or None
+        if acquirer_id is not None and acquirer_id not in known_ids:
+            raise FixtureContractError(
+                f"{where}: acquirer_security_id {acquirer_id!r} is not in {_SECURITIES_CSV}"
+            )
+
+        def number(column: str, row: dict[str, str] = row, where: str = where) -> float | None:
+            if not row[column]:
+                return None
+            try:
+                return float(row[column])
+            except ValueError as exc:
+                raise FixtureContractError(
+                    f"{where}: {column} {row[column]!r} is not a number"
+                ) from exc
+
+        try:
+            merger = Merger(
+                security_id=row["security_id"],
+                kind=row["kind"],
+                acquirer_security_id=acquirer_id,
+                acquiree_symbol=row["acquiree_symbol"],
+                acquiree_cusip=row["acquiree_cusip"],
+                acquirer_symbol=row["acquirer_symbol"],
+                acquirer_cusip=row["acquirer_cusip"],
+                share_ratio=number("share_ratio"),
+                cash_per_share=number("cash_per_share"),
+                effective_date=_parse_date(
+                    row["effective_date"], column="effective_date", where=where
+                ),
+                process_date=_parse_date(row["process_date"], column="process_date", where=where),
+                payable_date=(
+                    _parse_date(row["payable_date"], column="payable_date", where=where)
+                    if row["payable_date"]
+                    else None
+                ),
+                known_at=known_at,
+                source=row["source"],
+                source_action_id=row["source_action_id"],
+            )
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, FixtureContractError):
+                raise
+            raise FixtureContractError(f"{where}: {exc}") from exc
+        history[merger.key].append((merger, ingested_at, where))
+    mergers: list[Merger] = []
+    for rows in history.values():
+        rows.sort(key=lambda r: (r[1], r[0].known_at))
+        previous: Merger | None = None
+        for merger, ingested_at, where in rows:
+            if previous is None:
+                if merger.known_at != announcement_date_known_at(merger.process_date):
+                    raise FixtureContractError(
+                        f"{where}: a first-seen merger is stamped "
+                        f"{announcement_date_known_at(merger.process_date).isoformat()} "
+                        f"(the close after process_date {merger.process_date.isoformat()}), "
+                        f"not {merger.known_at.isoformat()}"
+                    )
+            else:
+                if merger.same_values(previous):
+                    raise FixtureContractError(
+                        f"{where}: a repeat of {merger.key} that revises nothing"
+                    )
+                if merger.known_at != ingested_at or merger.known_at <= previous.known_at:
+                    raise FixtureContractError(
+                        f"{where}: a revision of {merger.key} is stamped at its own "
+                        "ingested_at, after the row before it"
+                    )
+            previous = merger
+            mergers.append(merger)
+    return mergers
 
 
 def _check_bar_first_seen(row: _Row[Bar]) -> None:
@@ -465,6 +571,14 @@ class FixturePriceSource(PriceSource):
             for changes in self._changes.values():
                 changes.sort(key=lambda c: (c.process_date, c.old_symbol, c.known_at))
 
+        mergers_path = fixtures_dir / _MERGERS_CSV
+        self._mergers: list[Merger] = (
+            _load_mergers(mergers_path, self._known_ids) if mergers_path.is_file() else []
+        )
+        self._mergers.sort(
+            key=lambda m: (m.security_id, m.effective_date, m.source_action_id, m.known_at)
+        )
+
         self._bars: defaultdict[str, list[Bar]] = defaultdict(list)
         for bar in _check_history(bar_rows, lambda b: b.key, _check_bar_first_seen):
             self._bars[bar.security_id].append(bar)
@@ -534,3 +648,10 @@ class FixturePriceSource(PriceSource):
             for change in self._changes.get(security_id, [])
             if start <= change.process_date <= end
         ]
+
+    def mergers(self, start: date, end: date) -> list[Merger]:
+        """Every recorded merger row (first-seen and revisions) with
+        `start <= process_date <= end`, sorted by `(security_id,
+        effective_date, source_action_id, known_at)`."""
+        check_request([], start, end)
+        return [m for m in self._mergers if start <= m.process_date <= end]

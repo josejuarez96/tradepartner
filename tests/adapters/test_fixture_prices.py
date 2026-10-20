@@ -1044,3 +1044,188 @@ class TestRoundTrip:
         adj_f = adjusted_prices_as_of(fixture_store, t, ids, include_dividends=True)
         assert adj_a.drop("ingested_at").equals(adj_f.drop("ingested_at"))
         assert isinstance(adj_a, pl.DataFrame)
+
+
+_MERGERS_HEADER = [
+    "security_id",
+    "kind",
+    "acquirer_security_id",
+    "acquiree_symbol",
+    "acquiree_cusip",
+    "acquirer_symbol",
+    "acquirer_cusip",
+    "share_ratio",
+    "cash_per_share",
+    "effective_date",
+    "process_date",
+    "payable_date",
+    "source_action_id",
+    "known_at",
+    "ingested_at",
+    "source",
+    "provenance",
+]
+
+
+def _merger_row(**overrides: object) -> dict[str, object]:
+    # Process date Fri 2020-10-16: stamped Mon 2020-10-19 20:00 UTC.
+    row: dict[str, object] = {
+        "security_id": "SEC_A",
+        "kind": "cash",
+        "acquirer_security_id": "",
+        "acquiree_symbol": "AAA",
+        "acquiree_cusip": "SYNTH-A",
+        "acquirer_symbol": "",
+        "acquirer_cusip": "",
+        "share_ratio": "",
+        "cash_per_share": 12.5,
+        "effective_date": "2020-10-15",
+        "process_date": "2020-10-16",
+        "payable_date": "",
+        "source_action_id": "m-1",
+        "known_at": "2020-10-19T20:00:00+00:00",
+        "ingested_at": "2020-10-19T20:10:00+00:00",
+        "source": "alpaca",
+        "provenance": "action",
+    }
+    row.update(overrides)
+    return row
+
+
+def _merger_dir(tmp_path: Path, rows: Iterable[Mapping[str, object]]) -> Path:
+    fixtures = _write_fixture_dir(tmp_path, securities=("SEC_A", "SEC_B"))
+    _write_csv(fixtures / "mergers.csv", _MERGERS_HEADER, rows)
+    return fixtures
+
+
+def _fresh(tmp_path: Path, name: str) -> Path:
+    path = tmp_path / name
+    path.mkdir()
+    return path
+
+
+class TestFixtureMergers:
+    """T248b (#1762): `mergers.csv`, replayed by `process_date`, under the
+    table's stamp bound (contract rule 2)."""
+
+    def test_no_file_means_no_mergers(self, tmp_path: Path) -> None:
+        source = FixturePriceSource(_write_fixture_dir(tmp_path))
+        assert source.mergers(FAR_PAST, FAR_FUTURE) == []
+
+    def test_the_committed_universe_loads_with_or_without_the_table(
+        self, source: FixturePriceSource
+    ) -> None:
+        # T248c adds the committed file; either way the call is well formed.
+        assert isinstance(source.mergers(FAR_PAST, FAR_FUTURE), list)
+
+    def test_a_cash_and_a_stock_merger_are_read(self, tmp_path: Path) -> None:
+        stock = _merger_row(
+            security_id="SEC_B",
+            kind="stock",
+            acquirer_security_id="SEC_A",
+            acquirer_symbol="AAA",
+            share_ratio=0.5,
+            cash_per_share="",
+            payable_date="2020-10-15",
+            source_action_id="m-2",
+        )
+        source = FixturePriceSource(_merger_dir(tmp_path, [stock, _merger_row()]))
+        cash, stock_merger = source.mergers(FAR_PAST, FAR_FUTURE)
+        assert (cash.security_id, cash.kind, cash.cash_per_share, cash.share_ratio) == (
+            "SEC_A",
+            "cash",
+            12.5,
+            None,
+        )
+        assert cash.acquirer_security_id is None and cash.payable_date is None
+        assert (stock_merger.kind, stock_merger.share_ratio, stock_merger.acquirer_security_id) == (
+            "stock",
+            0.5,
+            "SEC_A",
+        )
+        assert stock_merger.payable_date == date(2020, 10, 15)
+        assert cash.known_at == announcement_date_known_at(date(2020, 10, 16))
+        assert cash.known_at == datetime(2020, 10, 19, 20, tzinfo=UTC)
+
+    def test_rows_are_returned_by_process_date_whatever_the_effective_date(
+        self, tmp_path: Path
+    ) -> None:
+        source = FixturePriceSource(_merger_dir(tmp_path, [_merger_row()]))
+        assert len(source.mergers(date(2020, 10, 16), date(2020, 10, 16))) == 1
+        assert source.mergers(date(2020, 10, 15), date(2020, 10, 15)) == []  # the effective date
+        assert source.mergers(date(2020, 10, 17), FAR_FUTURE) == []
+
+    def test_bad_arguments_are_refused(self, tmp_path: Path) -> None:
+        source = FixturePriceSource(_merger_dir(tmp_path, []))
+        with pytest.raises(ValueError, match="after end"):
+            source.mergers(FAR_FUTURE, FAR_PAST)
+
+    def test_a_first_seen_row_stamped_before_the_close_after_process_date_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # No look-ahead: stamped at the close of the process date itself, or
+        # at the effective date, is earlier than the stamp rule allows.
+        for stamp in ("2020-10-16T20:00:00+00:00", "2020-10-15T20:00:00+00:00"):
+            row = _merger_row(known_at=stamp, ingested_at="2020-10-19T20:10:00+00:00")
+            with pytest.raises(FixtureContractError, match=r"mergers\.csv:2.*first-seen"):
+                FixturePriceSource(_merger_dir(_fresh(tmp_path, stamp[:10]), [row]))
+
+    def test_a_first_seen_row_stamped_later_than_the_rule_is_refused_too(
+        self, tmp_path: Path
+    ) -> None:
+        row = _merger_row(
+            known_at="2020-10-20T20:00:00+00:00", ingested_at="2020-10-20T20:10:00+00:00"
+        )
+        with pytest.raises(FixtureContractError, match="first-seen"):
+            FixturePriceSource(_merger_dir(tmp_path, [row]))
+
+    def test_a_revision_is_stamped_at_its_own_ingested_at(self, tmp_path: Path) -> None:
+        revision = _merger_row(
+            cash_per_share=13.0,
+            known_at="2020-10-21T14:00:00+00:00",
+            ingested_at="2020-10-21T14:00:00+00:00",
+        )
+        source = FixturePriceSource(_merger_dir(tmp_path, [revision, _merger_row()]))
+        assert [m.cash_per_share for m in source.mergers(FAR_PAST, FAR_FUTURE)] == [12.5, 13.0]
+
+    @pytest.mark.parametrize(
+        ("changes", "match"),
+        [
+            ({"known_at": "2020-10-19T20:00:00+00:00"}, "own ingested_at"),  # back-dated
+            ({"cash_per_share": 12.5, "known_at": "2020-10-21T14:00:00+00:00"}, "revises nothing"),
+        ],
+    )
+    def test_a_bad_revision_is_refused(
+        self, tmp_path: Path, changes: dict[str, object], match: str
+    ) -> None:
+        revision = _merger_row(
+            cash_per_share=13.0,
+            known_at="2020-10-21T14:00:00+00:00",
+            ingested_at="2020-10-21T14:00:00+00:00",
+        )
+        revision.update(changes)
+        with pytest.raises(FixtureContractError, match=match):
+            FixturePriceSource(_merger_dir(tmp_path, [_merger_row(), revision]))
+
+    @pytest.mark.parametrize(
+        ("changes", "match"),
+        [
+            ({"security_id": "SEC_NOPE"}, "not in securities.csv"),
+            ({"acquirer_security_id": "SEC_NOPE"}, "acquirer_security_id"),
+            ({"provenance": "bar"}, "provenance"),
+            ({"kind": "swap"}, "kind"),
+            ({"kind": "stock", "share_ratio": 1.0, "cash_per_share": ""}, "acquirer_security_id"),
+            ({"cash_per_share": 0}, "positive"),
+            ({"cash_per_share": "abc"}, "not a number"),
+            ({"share_ratio": 1.0}, "share_ratio"),
+            ({"process_date": "soon"}, "process_date"),
+            ({"source_action_id": ""}, "source_action_id"),
+            ({"known_at": "2020-10-19T20:00:00", "ingested_at": "2020-10-19T20:10:00"}, "tz-aware"),
+            ({"ingested_at": "2020-10-19T19:00:00+00:00"}, "after ingested_at"),
+        ],
+    )
+    def test_a_row_that_breaks_the_contract_is_refused(
+        self, tmp_path: Path, changes: dict[str, object], match: str
+    ) -> None:
+        with pytest.raises(FixtureContractError, match=match):
+            FixturePriceSource(_merger_dir(tmp_path, [_merger_row(**changes)]))
