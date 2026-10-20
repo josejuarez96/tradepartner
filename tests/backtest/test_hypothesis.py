@@ -651,6 +651,7 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "master.chain_window_sessions",
             "master.chain_max_price_ratio",
             "adjust.apply_spin_offs",
+            "strategy.hold_top_fraction",
         ),
     ],
     ids=["today", "pre-lab"],
@@ -1337,6 +1338,7 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "master.chain_window_sessions",
         "master.chain_max_price_ratio",
         "adjust.apply_spin_offs",
+        "strategy.hold_top_fraction",
     )
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     record = registry.register_hypothesis(
@@ -1367,9 +1369,10 @@ def test_a_screened_registration_runs_at_its_frozen_fraction(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
     """T165c applies the key (#1358) and T211e applies `adjust.apply_spin_offs` (#1894),
-    so `NOT_YET_APPLIED_KEYS` is empty and a registration at 0.20 loads at 0.20 (until
-    T165c, quant-auditor on #1387 had it refused)."""
-    assert frozenset() == hypothesis.NOT_YET_APPLIED_KEYS
+    so only T238's `strategy.hold_top_fraction` (until T239) is in `NOT_YET_APPLIED_KEYS`
+    and a registration at 0.20 loads at 0.20 (until T165c, quant-auditor on #1387 had it
+    refused)."""
+    assert frozenset({"strategy.hold_top_fraction"}) == hypothesis.NOT_YET_APPLIED_KEYS
     _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
     assert loaded.strategy.turnover_top_fraction == 0.20
@@ -1703,6 +1706,7 @@ def test_h1s_unchanged_file_registered_before_the_terms_writes_nothing(
         *COST_TERMS,
         *(k for k in hypothesis.frozen_keys() if k.startswith("master.chain")),
         "adjust.apply_spin_offs",
+        "strategy.hold_top_fraction",
     }
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     stored = registry.register_hypothesis(
@@ -1930,3 +1934,82 @@ def test_load_frozen_accepts_false(
     _register(conn, _spin_offs_file(tmp_path, SLUG, "false"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
     assert loaded.adjust.apply_spin_offs is False
+
+
+# --- T238: the `momentum` buy/hold buffer key (backtest spec amendment #657) ------------
+
+BUFFER_KEY = "strategy.hold_top_fraction"
+
+
+def _with_buffer(tmp_path: Path, source: Path, slug: str, value: str) -> Path:
+    """`source` with `hold_top_fraction = <value>` added to its `[strategy]` table."""
+    text = source.read_text()
+    assert "\n[strategy]\n" in text
+    path = tmp_path / "hypotheses" / f"{slug}.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(
+        text.replace("\n[strategy]\n", f"\n[strategy]\nhold_top_fraction = {value}\n", 1)
+    )
+    return path
+
+
+def test_the_buffer_key_is_family_only_post_registration_and_not_yet_applied() -> None:
+    assert hypothesis.FAMILY_ONLY_KEYS[BUFFER_KEY] == "momentum"
+    assert BUFFER_KEY in hypothesis.NOT_YET_APPLIED_KEYS
+    assert BUFFER_KEY in frozen.POST_REGISTRATION_OWN_KEYS
+    for family in ("momentum", "oracle", "combined"):
+        assert BUFFER_KEY in hypothesis.family_frozen_keys(family)  # frozen, not required
+        assert BUFFER_KEY not in hypothesis.required_keys(family)
+
+
+@pytest.mark.parametrize(
+    ("source", "slug", "family"),
+    [(COMBINED_FIXTURE, COMBINED_SLUG, "combined"), (FIXTURE, SLUG, "oracle")],
+)
+def test_another_family_naming_the_buffer_is_refused_naming_the_key(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    source: Path,
+    slug: str,
+    family: str,
+) -> None:
+    path = _with_buffer(tmp_path, source, slug, "0.20")
+    path.write_text(path.read_text().replace('family = "momentum"', f'family = "{family}"'))
+    with pytest.raises(HypothesisFileError, match=f"{BUFFER_KEY} is a 'momentum' rule"):
+        _register(conn, path, settings)
+    assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (0,)
+
+
+def test_a_file_without_the_buffer_freezes_zero_not_the_live_value(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    live = settings.model_copy(
+        update={"strategy": settings.strategy.model_copy(update={"hold_top_fraction": 0.3})}
+    )
+    assert _register(conn, FIXTURE, live).params[BUFFER_KEY] == 0.0
+    assert hypothesis.load_frozen(conn, SLUG, settings=live).strategy.hold_top_fraction == 0.0
+
+
+def test_a_value_equal_to_top_fraction_registers_as_the_default(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    record = _register(conn, _with_buffer(tmp_path, FIXTURE, SLUG, "0.10"), settings)
+    assert record.params[BUFFER_KEY] == 0.0
+
+
+def test_a_value_between_zero_and_top_fraction_is_refused(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    with pytest.raises(HypothesisFileError, match=r"fail validation.*hold_top_fraction"):
+        _register(conn, _with_buffer(tmp_path, FIXTURE, SLUG, "0.05"), settings)
+
+
+def test_load_frozen_refuses_a_buffered_registration_until_t239(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """No run or paper plan records results under a buffer the engine ignores."""
+    record = _register(conn, _with_buffer(tmp_path, FIXTURE, SLUG, "0.20"), settings)
+    assert record.params[BUFFER_KEY] == 0.2
+    with pytest.raises(HypothesisFileError, match=BUFFER_KEY):
+        hypothesis.load_frozen(conn, SLUG, settings=settings)

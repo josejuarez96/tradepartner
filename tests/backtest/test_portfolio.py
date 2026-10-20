@@ -9,6 +9,7 @@ import pytest
 from tradepartner.backtest.portfolio import (
     _selected_count,
     apply_rebalance_band,
+    buffered_targets,
     drifted_weights,
     hold_membership,
     target_weights,
@@ -247,3 +248,97 @@ def test_hold_target_names_zero_means_the_top_fraction_count() -> None:
 def test_hold_membership_refuses_bad_inputs(hold_sessions: int, session: int) -> None:
     with pytest.raises(ValueError):
         hold_membership(("X",), {}, session, hold_sessions, 1, 1.0)
+
+
+# --- the buy/hold buffer's retention rule (backtest spec amendment #657, item 2) ---------
+
+
+def _ranked(order: str) -> dict[str, float]:
+    """Scores that rank `order`'s letters first to last (the first scores highest)."""
+    return {name: float(len(order) - i) for i, name in enumerate(order)}
+
+
+def test_buffered_targets_first_plan_is_the_unbuffered_top() -> None:
+    """Ten names A to J, top 0.2 and hold 0.4, P = empty: the top 2, 1/2 each."""
+    targets, n_retained = buffered_targets(_ranked("ABCDEFGHIJ"), set(), 0.2, 0.4)
+    assert targets == {"A": 0.5, "B": 0.5}
+    assert n_retained == 0
+
+
+def test_buffered_targets_keeps_between_top_and_hold_and_sells_below_hold() -> None:
+    """After a re-rank to C, D, A, E, B: A (3rd, inside the hold cut of 4) is kept, B
+    (5th, below it) is sold, so the book is {A, C, D} at 1/3 with one retained."""
+    scores = _ranked("CDAEBFGHIJ")
+    targets, n_retained = buffered_targets(scores, {"A", "B"}, 0.2, 0.4)
+    assert targets == {"A": 1 / 3, "C": 1 / 3, "D": 1 / 3}
+    assert n_retained == 1
+
+
+def test_buffered_targets_does_not_retain_a_previous_name_absent_from_the_scores() -> None:
+    targets, n_retained = buffered_targets(_ranked("CDAEBFGHIJ"), {"A", "ZZ"}, 0.2, 0.4)
+    assert targets == {"A": 1 / 3, "C": 1 / 3, "D": 1 / 3}
+    assert n_retained == 1
+    assert "ZZ" not in targets
+
+
+def test_buffered_targets_does_not_count_a_name_already_in_the_top_as_retained() -> None:
+    targets, n_retained = buffered_targets(_ranked("ABCDEFGHIJ"), {"A", "B"}, 0.2, 0.4)
+    assert targets == {"A": 0.5, "B": 0.5}
+    assert n_retained == 0
+
+
+def test_buffered_targets_ties_break_by_security_id() -> None:
+    scores = {"B": 1.0, "A": 1.0, "C": 1.0, "D": 1.0}
+    targets, _ = buffered_targets(scores, set(), 0.25, 0.5)
+    assert targets == {"A": 1.0}
+    # Hold cut is the top 2 by (score desc, id asc): A, B. B was held, so it stays.
+    targets, n_retained = buffered_targets(scores, {"B"}, 0.25, 0.5)
+    assert targets == {"A": 0.5, "B": 0.5}
+    assert n_retained == 1
+
+
+@pytest.mark.parametrize("hold", [0.0])
+@pytest.mark.parametrize("previous", [set(), {"A"}, {"A", "Z"}])
+@pytest.mark.parametrize(
+    "scores",
+    [{}, {"A": 1.0}, {"A": 0.1, "B": 0.5, "C": -0.2, "D": 0.3}, _scores(37)],
+)
+def test_buffered_targets_at_zero_hold_is_target_weights(
+    scores: dict[str, float], previous: set[str], hold: float
+) -> None:
+    assert buffered_targets(scores, previous, 0.1, hold) == (
+        target_weights(scores, 0.1, "equal"),
+        0,
+    )
+
+
+def test_buffered_targets_hold_equal_to_top_is_the_unbuffered_book() -> None:
+    scores = _ranked("CDAEBFGHIJ")
+    targets, n_retained = buffered_targets(scores, {"A", "B"}, 0.2, 0.2)
+    assert targets == target_weights(scores, 0.2, "equal")
+    assert n_retained == 0
+
+
+def test_buffered_targets_full_hold_keeps_every_ranked_previous_name() -> None:
+    targets, n_retained = buffered_targets(_ranked("CDAEBFGHIJ"), {"A", "B", "J"}, 0.2, 1.0)
+    assert set(targets) == {"A", "B", "C", "D", "J"}
+    assert n_retained == 3
+
+
+def test_buffered_targets_weights_sum_to_at_most_one() -> None:
+    targets, _ = buffered_targets(_scores(30), {f"S{i:04d}" for i in range(24, 30)}, 0.1, 0.5)
+    assert math.fsum(targets.values()) <= 1.0
+    assert list(targets) == sorted(targets)
+
+
+@pytest.mark.parametrize(
+    ("top", "hold"), [(0.2, 0.1), (0.2, 1.5), (0.2, -0.1), (0.2, float("nan")), (0.0, 0.5)]
+)
+def test_buffered_targets_refuses_bad_fractions(top: float, hold: float) -> None:
+    with pytest.raises(ValueError):
+        buffered_targets({"A": 1.0}, set(), top, hold)
+
+
+def test_buffered_targets_refuses_a_non_finite_score() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        buffered_targets({"A": float("nan")}, set(), 0.2, 0.4)

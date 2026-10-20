@@ -33,7 +33,7 @@ from tradepartner.backtest.costs import Commissions
 from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.plan import BuyCosts
-from tradepartner.execution.risk import PhaseOrder, Skips, Violations, check_phase
+from tradepartner.execution.risk import OpenSell, PhaseOrder, Skips, Violations, check_phase
 from tradepartner.store import schema
 from tradepartner.store.journal import DecisionRow, OrderRow
 
@@ -510,3 +510,100 @@ def test_the_hand_long_short_batch_passes_every_rule() -> None:
     assert [o.security_id for o in result.orders] == ["B", "C"]
     assert result.orders[0].position_side == _SHORT
     assert result.orders[1].position_side == schema.LONG
+
+
+# --- #1960: a held short as `Ledger.short_holdings`, the way `ledger.replay` keeps it -------
+
+
+def _held_ledger(d_short: float = 4.0) -> Ledger:
+    """The hand book as the replay builds it: A long 40 in `positions`, D short
+    4 in `short_holdings` (unsigned); cash 10,000."""
+    return Ledger(positions={"A": 40.0}, short_holdings={"D": d_short}, cash=10_000.0, through=_S)
+
+
+def test_the_negative_position_and_the_short_holding_read_the_same() -> None:
+    """The two spellings of the hand book give one verdict on a mixed batch."""
+    batch = [_cover("D", 2.0), _order("C", "buy", 2, notional=400.0, target_weight=0.04)]
+    for ledger in (_short_ledger(), _held_ledger()):
+        _passes(_check(batch, ledger=ledger))
+        assert _rules(_check([_cover("D", 5.0)], ledger=ledger)) == {
+            "cover_within_holding",
+            "cover_sum_within_holding",
+        }
+
+
+def test_a_cover_within_a_short_holding_passes_and_one_over_breaches() -> None:
+    _passes(_check([_cover("D", 4.0, full_exit=True)], ledger=_held_ledger()))
+    assert "cover_within_holding" in _rules(_check([_cover("D", 5.0)], ledger=_held_ledger()))
+    assert "cover_within_holding" in _rules(_check([_cover("B", 1.0)], ledger=_held_ledger()))
+
+
+def test_cover_sum_counts_the_short_holding() -> None:
+    """An open cover of 3 and a cover of 2 are 5 over the held 4."""
+    open_covers = [OpenSell("D", 3.0), OpenSell("D", 0.0)]
+    result = _check([_cover("D", 2.0)], ledger=_held_ledger(), open_covers=open_covers)
+    assert _rules(result) == {"cover_sum_within_holding"}
+
+
+def test_buys_are_within_cash_less_a_short_holding() -> None:
+    """The held short D (4 x 100) is owed back: cash 800 leaves $400."""
+    poor = _account(cash=800.0)
+    ledger = _held_ledger()
+    _passes(
+        _check(
+            [_order("C", "buy", 2, notional=400.0, target_weight=0.04)], ledger=ledger, account=poor
+        )
+    )
+    assert _rules(
+        _check(
+            [_order("C", "buy", 2, notional=400.01, target_weight=0.04)],
+            ledger=ledger,
+            account=poor,
+        )
+    ) == {"buys_within_cash"}
+
+
+@pytest.mark.parametrize(
+    "orders",
+    [
+        [_order("D", "buy", 2, notional=50.0, target_weight=0.005)],  # long buy of a held short
+        [_short_open("A", 1.0)],  # short open of a held long
+    ],
+    ids=["buy_a_short", "short_a_long"],
+)
+def test_one_side_per_name_sees_a_short_holding(orders: list[PhaseOrder]) -> None:
+    assert "one_side_per_name" in _rules(_check(orders, ledger=_held_ledger()))
+
+
+def test_a_name_held_long_and_short_is_one_side_per_name() -> None:
+    """A journal that left a name in both books is not netted away."""
+    ledger = Ledger(
+        positions={"A": 40.0, "D": 3.0}, short_holdings={"D": 4.0}, cash=10_000.0, through=_S
+    )
+    assert "one_side_per_name" in _rules(_check([_cover("D", 1.0)], ledger=ledger))
+
+
+def test_max_short_weight_counts_the_short_holding() -> None:
+    """D short 4 held, 1 more opened: 500 / 10,000 passes; 2 more breaches."""
+    _passes(_check([_short_open("D", 1.0)], ledger=_held_ledger()))
+    assert _rules(_check([_short_open("D", 2.0)], ledger=_held_ledger())) == {"max_short_weight"}
+
+
+def test_gross_exposure_counts_a_short_holding_over_signed_equity() -> None:
+    orders = [_short_open("B", 20.0)]
+    ledger = _held_ledger()
+    assert _rules(_check(orders, RiskConfig(max_gross_exposure=0.115), ledger=ledger)) == {
+        "max_gross_exposure"
+    }
+    _passes(_check(orders, RiskConfig(max_gross_exposure=0.122), ledger=ledger))
+    _passes(
+        _check(
+            [_cover("D", 4.0, full_exit=True)], RiskConfig(max_gross_exposure=0.05), ledger=ledger
+        )
+    )
+
+
+def test_a_long_sell_beside_a_short_holding_stays_within_the_long_holding() -> None:
+    assert "sell_within_holding" in _rules(
+        _check([_order("D", "sell", 1, quantity=1.0)], ledger=_held_ledger())
+    )

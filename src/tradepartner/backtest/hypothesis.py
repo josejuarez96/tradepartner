@@ -221,14 +221,18 @@ def required_keys(family: str) -> frozenset[str]:
 #: (backtest spec amendment #1358, item 1): `oracle` and `combined` read `strategy.*`,
 #: but B10's turnover screen is `momentum`'s alone, so any other family's frozen value
 #: must be the table default (1.0, no screen).
-FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {"strategy.turnover_top_fraction": "momentum"}
+FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {
+    "strategy.turnover_top_fraction": "momentum",
+    "strategy.hold_top_fraction": "momentum",
+}
 
 
 #: Frozen keys a registration may store but no signal applies yet: `load_frozen` refuses
 #: a value other than the table default, so no run or paper plan records results under a
-#: label its signal ignores. `strategy.turnover_top_fraction` left it at T165c (#1358) and
-#: `adjust.apply_spin_offs` at T211e (#1894), so it is empty today.
-NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset()
+#: label its signal ignores. `strategy.turnover_top_fraction` left it at T165c (#1358);
+#: `adjust.apply_spin_offs` entered at T211c and left at T211e (#1894);
+#: `strategy.hold_top_fraction` (T238, spec amendment #657) until T239 applies it.
+NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset({"strategy.hold_top_fraction"})
 
 
 def family_only_refusal(family: str, params: Mapping[str, Any]) -> str | None:

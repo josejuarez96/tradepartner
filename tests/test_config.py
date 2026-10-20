@@ -1235,6 +1235,7 @@ def test_lab_defaults() -> None:
         "strategy.weighting",
         "strategy.signal_total_return",
         "strategy.turnover_top_fraction",
+        "strategy.hold_top_fraction",
         "schedule.rebalance_cadence",
         "schedule.signal_anchor",
     ]
@@ -1472,6 +1473,7 @@ def test_default_sweepable_keys_derives_at_today_s_value() -> None:
         "strategy.weighting",
         "strategy.signal_total_return",
         "strategy.turnover_top_fraction",
+        "strategy.hold_top_fraction",
         "schedule.rebalance_cadence",
         "schedule.signal_anchor",
     )
@@ -1490,7 +1492,12 @@ def test_momentum_family_spec() -> None:
     assert spec.paper_ready is True
     # B10's screen (#1358): its reason and counts, reported only below 1.0.
     assert spec.exclusion_reasons == ("no_history", "no_turnover")
-    assert spec.count_names == ("n_excluded_no_history", "n_screened", "n_excluded_no_turnover")
+    assert spec.count_names == (
+        "n_excluded_no_history",
+        "n_screened",
+        "n_excluded_no_turnover",
+        "n_retained",
+    )
     assert spec.benchmark == "MTUM"
     assert spec.sweepable_keys == (
         "strategy.formation_months",
@@ -1499,6 +1506,7 @@ def test_momentum_family_spec() -> None:
         "strategy.weighting",
         "strategy.signal_total_return",
         "strategy.turnover_top_fraction",
+        "strategy.hold_top_fraction",
     )
 
 
@@ -2955,3 +2963,62 @@ def test_a_window_frozen_with_a_bad_short_key_is_refused(key: str, value: float)
     assert getattr(frozen_risk(_window(_frozen_today())), key) == _SHORT_KEYS[key]
     with pytest.raises(ValueError, match=key):
         frozen_risk(_window(_frozen_today(**{key: value})))
+
+
+# --- the buy/hold buffer key (backtest spec amendment #657, T238) ----------------------
+
+
+def test_hold_top_fraction_defaults_to_no_buffer() -> None:
+    for s in (_settings().strategy, StrategyConfig()):
+        assert s.hold_top_fraction == 0.0
+        assert type(s.hold_top_fraction) is float
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({"hold_top_fraction": 0.0}, 0.0),
+        ({"hold_top_fraction": 0.20}, 0.20),
+        ({"hold_top_fraction": 1.0}, 1.0),
+        ({"top_fraction": 0.2, "hold_top_fraction": 0.2}, 0.0),  # normalised
+        ({"top_fraction": 0.10, "hold_top_fraction": 0.10}, 0.0),
+        ({"top_fraction": 1.0, "hold_top_fraction": 1.0}, 0.0),
+        ({"top_fraction": 0.3, "hold_top_fraction": 0.3000001}, 0.3000001),
+    ],
+)
+def test_hold_top_fraction_accepts_zero_or_top_to_one(
+    override: dict[str, float], expected: float
+) -> None:
+    assert StrategyConfig(**override).hold_top_fraction == expected  # type: ignore[arg-type]
+    validated = Settings.model_validate({"strategy": override}).strategy
+    assert validated.hold_top_fraction == expected
+
+
+def test_hold_top_fraction_below_top_is_refused_naming_both_keys() -> None:
+    with pytest.raises(ValidationError, match=r"hold_top_fraction.*top_fraction"):
+        StrategyConfig(top_fraction=0.10, hold_top_fraction=0.05)
+    with pytest.raises(ValidationError, match=r"hold_top_fraction.*top_fraction"):
+        StrategyConfig(hold_top_fraction=0.05)  # the default top_fraction is 0.10
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5, float("nan"), float("inf")])
+def test_hold_top_fraction_rejects_out_of_range_values(bad: float) -> None:
+    with pytest.raises(ValidationError):
+        StrategyConfig(hold_top_fraction=bad)
+
+
+def test_hold_top_fraction_with_hold_weighting_is_refused() -> None:
+    with pytest.raises(ValidationError, match=r"hold_top_fraction.*hold"):
+        StrategyConfig(weighting="hold", hold_top_fraction=0.20)
+    # Normalised to the default, it is not a non-default value.
+    assert StrategyConfig(weighting="hold", hold_top_fraction=0.10).hold_top_fraction == 0.0
+    assert StrategyConfig(weighting="hold").hold_top_fraction == 0.0
+
+
+def test_momentum_family_gains_the_buffer_key_and_count() -> None:
+    spec = FAMILIES["momentum"]
+    assert spec.sweepable_keys[-1] == "strategy.hold_top_fraction"
+    assert spec.count_names[-1] == "n_retained"
+    for other in ("oracle", "profitability", "combined"):
+        assert "strategy.hold_top_fraction" not in FAMILIES[other].sweepable_keys  # type: ignore[index]
+        assert "n_retained" not in FAMILIES[other].count_names  # type: ignore[index]
