@@ -150,45 +150,54 @@ strategy-lab spec's defaults, as the owner decided (structural reading of #1957)
   - The buffered book beating H1 trial 2 by more than the whole prior range (2 pp/yr) net
     of costs. The buffer only re-weights and retains; a large gain points at the retention
     path, not at an edge.
-  - `turnover_monthly` **above** H1's 32.4 %. More retention cannot trade more.
+  - `turnover_monthly` **above** H1's 32.4 %. Retention resets every target to the common
+    weight, so a buffered book could in principle trade more; a turnover above H1's is
+    unexpected and points at the retention rule, not at the buffer's cost saving.
   - `n_retained` zero every rebalance: the buffer never binds, so the variant is H1 in all
     but its frozen set. (Its fingerprint still differs, so the run is a distinct trial.)
-  - A `n_retained` equal to the whole book: nothing was ever sold, which the rule does not
-    do (a name outside the top fifth is dropped).
+  - `n_targets − n_retained` not equal to `k` at every rebalance, where `k` is the count
+    `top_fraction` selects (`n_retained = |targets_i ∖ ranked[:k]|`, spec amendment #657
+    item 2). The top-k ranked names are always targets, so the difference must be `k`; any
+    other value means the top-k names were not all bought or the count is wrong.
   - Any variant with a `kind=holdout` trial. `sweep run` cannot spend the holdout (req 2,
     req 5(a)).
 
 ## Power arithmetic per variant count
 
-The `momentum` family's N before this sweep is **9**: H1's two `ok` in-sample trials (trial
+The `momentum` family's N before this sweep is **11**: H1's two `ok` in-sample trials (trial
 2 carries `n_trials = 2`; H1's holdout trial does not count), the first sweep's six `ok`
-variants (T114, run 4, trials 11-16), and the daily shakedown's one `ok` in-sample trial
-(trial 17; [paper plan](../plans/paper-trading.md), T160). After this sweep, with its one
-variant `ok`, **N = 10**. V comes from the distinct (parameter hash, window) pairs; the
-family's V is read at registration and its floor is `lab.min_sharpe_variance_annual` (0.04,
-a standard deviation of 0.2 in annual Sharpe). At N = 10 the expected maximum Sharpe of a
-null grid is about `√V · ((1 − γ)·Φ⁻¹(1 − 1/10) + γ·Φ⁻¹(1 − 1/(10e)))` ≈ **1.58 · √V**:
-about **0.32** annual at the V floor, and more if the family's real spread is wider.
+variants (T114, run 4, trials 11-16), the daily shakedown's one `ok` in-sample trial (trial
+17; [paper plan](../plans/paper-trading.md), T160), and the long/short spike's two
+configurations (T218, a registered exploratory `return` run in `momentum`, `ok`, counted by
+research-registry req 9 as `research.family_run_count`; [report](../research/2026-10-20-long-short-spike.md)).
+After this sweep, with its one variant `ok`, **N = 12**. V comes from the distinct
+(parameter hash, window) pairs; the family's V is read at registration and its floor is
+`lab.min_sharpe_variance_annual` (0.04, a standard deviation of 0.2 in annual Sharpe). At
+N = 12 the expected maximum Sharpe of a null grid is about
+`√V · ((1 − γ)·Φ⁻¹(1 − 1/12) + γ·Φ⁻¹(1 − 1/(12e)))` ≈ **1.66 · √V**: about **0.33** annual
+at the V floor, and more if the family's real spread is wider.
 
 The excess Sharpe has an 8.4 % tracking error (H1's figure) over 40 monthly returns. A
 variant needs an annual excess Sharpe at or above SR* for its `dsr_excess` to reach 0.5,
-roughly **+2.6 pp/yr** of excess at the V floor. That is more than two and a half times the
-top of the prior range. **The sweep cannot separate an edge inside the prior from
-selection.** A promotion at `promote_at_least = 0.5` is reachable only by a result well
-outside H1's prior, which would read as a red flag before it read as an edge. The sweep's
-real product is the buffer's turnover and cost answer, not a promotion.
+roughly **+2.8 pp/yr** of excess at the V floor. That is nearly three times the top of the
+prior range. **The sweep cannot separate an edge inside the prior from selection.** A
+promotion at `promote_at_least = 0.5` is reachable only by a result well outside H1's prior,
+which would read as a red flag before it read as an edge. The sweep's real product is the
+buffer's turnover and cost answer, not a promotion.
 
 ## Prior-evidence disclosure
 
 Results already seen before registration:
 1. **Novy-Marx & Velikov's published 10/20 buffer figures** (via G1, and quoted in the
    spec amendment): turnover 34.52 % → 18.82 %/month and net 0.68 → 0.85 %/month, a
-   **value-weighted decile long-short** book, 1963-2012. It is the only buffer result seen,
-   and it is gross of the specific costs modelled here.
-2. **The rung-1 cost note on #657** (spec open question 32, 2026-10-20): at 15 bp per side
-   the buffer saves 4.71 bp/month of cost (31.4 bp/month at 100 bp/side) against the
-   published long-short turnover; the note states the 18.8 % is the published book's, not
-   H1's, and that H1's own turnover needs the engine (T239).
+   **value-weighted decile long-short** book, 1963-2012. It is the only buffer result seen;
+   it is net of Novy-Marx & Velikov's own cost model, not of this engine's 15 bp per side.
+2. **The rung-1 cost note on [#657](https://github.com/josejuarez96/tradepartner/issues/657)**
+   (spec open question 32, 2026-10-20, computed by a command from the configured
+   `CostsConfig().per_side_bps` = 15 bp per side): the buffer saves 4.71 bp/month of cost
+   (31.4 bp/month at 100 bp/side) against the published long-short turnover. The note states
+   the 18.8 % is the published book's, not H1's, and that H1's own turnover needs the engine
+   (T239).
 3. **H1's in-sample trials on the owner's store** (2020-08-31 to 2023-12-29, the same window
    this variant runs): trial 2 has base-level `excess_cagr_spy` −5.77 pp/yr,
    `sharpe_annual_excess_spy` −0.27, `turnover_monthly` 32.4 %; trial 1 is nearly identical
@@ -201,7 +210,13 @@ Results already seen before registration:
    T160, trial 17): a 12-1 momentum book at `top_fraction = 0.20`, `daily`, run once over the
    default window as a machine test, −6.13 pp/yr in sample. Same family and window; disclosed
    because seen.
-7. **Ladder ledger disclosure (rule L3).** The mechanism here is the published buy/hold
+7. **The long/short spike** ([report](../research/2026-10-20-long-short-spike.md), T218,
+   2026-10-19): a registered exploratory `return` run on H1's ranking, the same window, two
+   configurations (a 50/50 long/short book and a SPY-hedged control). The net spread at 30 bp
+   borrow is −6.82 pp/yr and the pre-declared kill rule holds, so the long/short `momentum`
+   idea is killed. Same family and window; disclosed because seen, and counted in the family's
+   N above.
+8. **Ladder ledger disclosure (rule L3).** The mechanism here is the published buy/hold
    buffer, taken from H1 and G1's evidence, not a rung 1-3 screen; the
    [ladder ledger](../research/hypothesis-backlog.md#ladder-ledger) names no row for it
    (its rows are B9, IRRX, Q1 and L-1). There is therefore no ledger look or batch
