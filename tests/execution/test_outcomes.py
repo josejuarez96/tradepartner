@@ -30,6 +30,7 @@ from tradepartner.execution.outcomes import (
 )
 from tradepartner.store import journal, schema
 from tradepartner.store.journal import (
+    AdjustmentRow,
     DecisionRow,
     FillRow,
     JournalRow,
@@ -856,6 +857,198 @@ def test_a_lot_ledger_error_alerts_and_the_outcomes_still_run(
         (buy, "position_return")
     }
     assert sell
+
+
+# --- #516: the writer passes the window's adjustments and splits to the lot ledger --
+
+
+def test_a_spinoff_receipt_sold_whole_writes_its_realised_pnl(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#516 (req 13 "Adjustments"): the sale above, now with its receipt
+    journaled (2 SEC_KID on 2026-09-15, no basis terms). The writer reads the
+    window's adjustments, so the lot ledger builds and the sale's realised P&L
+    is written: a zero-basis lot's P&L is its proceeds, 2 x 5 = 10."""
+    book = Book()
+    sell = book.order("SEC_KID", "sell", "filled", [(2.0, 5.0)])
+    _journal(conn, book)
+    receipt_day = date(2026, 9, 15)
+    append(
+        conn,
+        AdjustmentRow(
+            window_id=1,
+            run_id=1,
+            session=receipt_day,
+            kind="spinoff_receipt",
+            security_id="SEC_KID",
+            quantity=2.0,
+            explanation_json='{"explanation": "spin-off child of SEC_P", "reconciliation_id": 1}',
+            known_at=_utc(receipt_day, 21),
+            ingested_at=_utc(receipt_day, 21),
+        ),
+    )
+    errors: list[str] = []
+
+    result = write_outcomes_and_lots(
+        conn,
+        1,
+        ACCOUNT,
+        {},
+        book.price_of,
+        DUE,
+        _clock,
+        on_lot_error=errors.append,
+        cadence=CADENCE,
+    )
+
+    assert errors == []
+    assert result.lot_error is None
+    assert (_count(conn, "lots"), _count(conn, "disposals")) == (1, 1)
+    realised = {(r.client_order_id, r.kind): r for r in outcomes_for(conn, 1)}
+    assert realised[(sell, "realised_pnl")].value == pytest.approx(10.0)
+
+
+def _adjust(
+    conn: duckdb.DuckDBPyConnection,
+    kind: str,
+    session: date,
+    security_id: str,
+    quantity: float,
+    cash: float | None = None,
+    *,
+    window_id: int = 1,
+) -> None:
+    append(
+        conn,
+        AdjustmentRow(
+            window_id=window_id,
+            run_id=None,
+            session=session,
+            kind=kind,
+            security_id=security_id,
+            quantity=quantity,
+            cash=cash,
+            known_at=_utc(session, 21),
+            ingested_at=_utc(session, 21),
+        ),
+    )
+
+
+def _write(conn: duckdb.DuckDBPyConnection, book: Book, errors: list[str]) -> None:
+    write_outcomes_and_lots(
+        conn,
+        1,
+        ACCOUNT,
+        {},
+        book.price_of,
+        DUE,
+        _clock,
+        on_lot_error=errors.append,
+        cadence=CADENCE,
+    )
+
+
+def test_a_carried_residue_sold_whole_writes_its_realised_pnl(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#516: 3 SEC_R carried in (dated at the previous stop session, 2026-09-28)
+    and sold whole at 20 on F_i: a zero-basis lot, realised P&L = proceeds = 60."""
+    book = Book()
+    sell = book.order("SEC_R", "sell", "filled", [(3.0, 20.0)])
+    _journal(conn, book)
+    _adjust(conn, "carried_residue", date(2026, 9, 28), "SEC_R", 3.0)
+    errors: list[str] = []
+
+    _write(conn, book, errors)
+
+    assert errors == []
+    realised = {(r.client_order_id, r.kind): r for r in outcomes_for(conn, 1)}
+    assert realised[(sell, "realised_pnl")].value == pytest.approx(60.0)
+
+
+def test_a_position_removed_for_cash_writes_its_disposal_and_no_order_pnl(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#516: 10 SEC_D bought at 50 on 2026-09-01 (an order of an earlier
+    rebalance), then its listing ends: `corporate_action_cash` -10 for 420 on
+    2026-10-05. No lot error; one lot and one disposal (proceeds 420, pnl -80)
+    are written, and the removal adds no realised P&L to the buy order."""
+    book = Book()
+    buy = book.order("SEC_D", "buy", "filled", [(10.0, 50.0)], session=date(2026, 9, 1))
+    _journal(conn, book)
+    _adjust(conn, "corporate_action_cash", date(2026, 10, 5), "SEC_D", -10.0, 420.0)
+    errors: list[str] = []
+
+    _write(conn, book, errors)
+
+    assert errors == []
+    assert (_count(conn, "lots"), _count(conn, "disposals")) == (1, 1)
+    row = conn.execute("SELECT quantity, proceeds, realised_pnl, fill_id FROM disposals").fetchone()
+    assert row == (pytest.approx(10.0), pytest.approx(420.0), pytest.approx(-80.0), None)
+    assert (buy, "realised_pnl") not in {(r.client_order_id, r.kind) for r in outcomes_for(conn, 1)}
+
+
+def test_the_writer_reads_only_its_own_windows_adjustments(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#516 (req 13: a rebuild stays per window): a receipt journaled in window
+    2 does not explain window 1's sale of SEC_KID, which still raises."""
+    book = Book()
+    book.order("SEC_KID", "sell", "filled", [(2.0, 5.0)])
+    _journal(conn, book)
+    append(
+        conn,
+        PaperWindowRow(
+            window_id=2,
+            hypothesis_id=1,
+            first_rebalance_session=T_I,
+            account_id="acct-2",
+            book_id="fx",
+            starting_cash=10_000.0,
+            starting_equity=10_000.0,
+            code_version="t",
+            started_at=STAMP,
+            frozen_json="{}",
+            frozen_sha256="0" * 64,
+            known_at=STAMP,
+            ingested_at=STAMP,
+        ),
+    )
+    _adjust(conn, "spinoff_receipt", date(2026, 9, 15), "SEC_KID", 2.0, window_id=2)
+    errors: list[str] = []
+
+    _write(conn, book, errors)
+
+    assert len(errors) == 1 and "more than the ledger holds" in errors[0]
+
+
+def test_a_split_adjusted_sale_writes_its_realised_pnl(conn: duckdb.DuckDBPyConnection) -> None:
+    """#516: 10 SEC_A bought at 100 on 2026-09-01, a 2:1 split ex 2026-09-15 in
+    the `actions` frame, the 20 shares sold at 55 on F_i. The writer passes the
+    frame (and the session) to the lot ledger: realised P&L 1100 - 1000 = 100,
+    no lot error."""
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)], session=date(2026, 9, 1))
+    sell = book.order("SEC_A", "sell", "filled", [(20.0, 55.0)])
+    _journal(conn, book)
+    errors: list[str] = []
+
+    write_outcomes_and_lots(
+        conn,
+        1,
+        ACCOUNT,
+        {},
+        book.price_of,
+        DUE,
+        _clock,
+        on_lot_error=errors.append,
+        actions=_split("SEC_A", date(2026, 9, 15), 2.0),
+        cadence=CADENCE,
+    )
+
+    assert errors == []
+    realised = {(r.client_order_id, r.kind): r for r in outcomes_for(conn, 1)}
+    assert realised[(sell, "realised_pnl")].value == pytest.approx(100.0)
 
 
 def test_a_bad_split_ratio_raises() -> None:
