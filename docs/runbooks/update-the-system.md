@@ -45,7 +45,7 @@ launchctl list | grep com.tradepartner
 Each line is `PID  exit-code  label`. The first column must be `-` (idle) on every line. A number there means that job is running: wait a few minutes and run the line again. The labels it lists are the jobs that are loaded now (the ingest job, the paper job, and any per-book or `collect` job). Save that list, then unload exactly those jobs:
 
 ```bash
-launchctl list | awk '/com\.tradepartner/ {print $3}' > "$STORE_PATH.jobs"
+[ -s "$STORE_PATH.jobs" ] && echo "stop: $STORE_PATH.jobs already lists jobs from an earlier run; read it, then delete it" || launchctl list | awk '/com\.tradepartner/ {print $3}' > "$STORE_PATH.jobs"
 cat "$STORE_PATH.jobs"
 for L in $(cat "$STORE_PATH.jobs"); do launchctl bootout gui/$(id -u)/$L; done
 launchctl list | grep com.tradepartner || echo "all jobs unloaded"
@@ -105,7 +105,7 @@ launchctl print gui/$(id -u)/com.tradepartner.ingest | grep "last exit code"
 launchctl print gui/$(id -u)/com.tradepartner.paper | grep "last exit code"
 ```
 
-Both should say 0 (what other codes mean: [scheduling](scheduling.md), "What a `paper run` exit code means"). Delete the step 4 copy only after both runs finished `ok`, with its exact name (no wildcard, and never a release copy):
+(For a per-book job, use its own label from `$STORE_PATH.jobs`.) Both should say 0 (what other codes mean: [scheduling](scheduling.md), "What a `paper run` exit code means"). When you have finished, also delete `$STORE_PATH.jobs`. Delete the step 4 copy only after both runs finished `ok`, with its exact name (no wildcard, and never a release copy):
 
 ```bash
 rm "$STORE_PATH.bak-YYYYMMDD-HHMM" "$STORE_PATH.bak-YYYYMMDD-HHMM.commit"
@@ -122,7 +122,7 @@ Use this when the store file is damaged by something else: a disk fault, a power
 
 Do not start by restoring. The damaged file may still be the best record you have.
 
-**1. Stop writing.** Do Part 1, step 3 now (list, confirm idle, unload every job). Close the dashboard and any other session that uses the store.
+**1. Stop writing.** In the same Terminal window, set `STORE_PATH` (the `STORE_PATH=` line from Part 1, step 1), then do Part 1, step 3 (list, confirm idle, unload every job). Close the dashboard and any other session that uses the store.
 
 **2. Keep what is there.** Move the damaged files aside; do not delete them.
 
