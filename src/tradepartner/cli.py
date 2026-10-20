@@ -44,6 +44,17 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   month through the same `StorePriceSource`. It needs the Alpaca keys, prints
   one line per month and exits like `ingest`; a refused symbol or identity is
   a usage error (2), with nothing fetched.
+- `tradepartner index-check [--start YYYY-MM] [--end YYYY-MM] [--out PATH]` runs
+  `backtest.index_check_store.run_index_check` (backtest spec
+  amendment #1598, plan T245): the whole universe, equal and cap weight, against RSP
+  and SPY by year and month, on read-only connections. **Never a trial**: it opens no
+  handle and writes nothing to any store (`--out` writes a JSON file of the same
+  masked report). Months after the protected edge print gaps only, with `·` for the
+  levels and no level key in the JSON. The option set is pinned (no score, filter or
+  name list). Exit 0 when printed, 1 when a month fails (`missing_benchmark_bar
+  <symbol> <session>`, a `universe_as_of` error) or the store is missing or busy, 2 on
+  a refusal before any month is read (`refused_window`, `refused_rank_by`, a SPY or
+  RSP identity error).
 - `tradepartner health [--check] [--jumps-before DATE]` prints
   `health.health_report` at the current time; `--jumps-before` limits the
   price-jump review list (#787) to sessions before DATE, and the
@@ -379,6 +390,8 @@ from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource, Symb
 from tradepartner.adapters.rates import RateSource
 from tradepartner.adapters.stamp_repair import ManifestRow
 from tradepartner.backfill import BenchmarkSeed, HoleFill, backfill, backfill_benchmark, fill_holes
+from tradepartner.backtest import index_check as ic
+from tradepartner.backtest import index_check_store as idx
 from tradepartner.backtest import lab, promotion, sweep_report
 from tradepartner.backtest import sweep as lab_sweep
 from tradepartner.backtest.frozen import frozen_values
@@ -1800,6 +1813,116 @@ def _lots_report_lines(report: lots_reconcile.Report, ledger: _LedgerSet) -> lis
             + " ".join(f"{name} {figures[name]}" for name in lots_reconcile.FIGURES)
         )
     lines.append(f"result: {'clean' if report.clean else 'differences'}")
+    return lines
+
+
+# --- backtest: index-check (plan T245) ---------------------------------------------
+
+#: The cell of a protected row's level column: the level is withheld (spec #1598, item 5).
+_LEVEL_WITHHELD = "\u00b7"
+
+
+def _pct(x: float | None) -> str:
+    return "" if x is None else f"{x * 100:+.2f}%"
+
+
+def _levels(row: ic.MonthRow | ic.YearRow) -> list[str]:
+    """The four level cells (EW, its benchmark, CW, its benchmark): `·` for a protected
+    row, whose type has no level field."""
+    if isinstance(row, ic.DevMonthRow | ic.DevYearRow):
+        return [
+            _pct(row.equal_return),
+            _pct(row.equal_bench_return),
+            _pct(row.cap_return),
+            _pct(row.cap_bench_return),
+        ]
+    return [_LEVEL_WITHHELD] * 4
+
+
+def _grid(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
+    """A ` | `-separated table with padded columns."""
+    widths = [
+        max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(headers)
+    ]
+
+    def line(cells: Sequence[str]) -> str:
+        return " | ".join(c.ljust(w) for c, w in zip(cells, widths, strict=True)).rstrip()
+
+    return [line(headers), "-+-".join("-" * w for w in widths), *(line(r) for r in rows)]
+
+
+def _index_check_lines(report: idx.IndexCheckReport, code_version: str) -> list[str]:
+    """The printed report (spec #1598, item 6): header, by-year, zone totals, by-month,
+    worst months with their names."""
+    head = report.header
+    eq, cap = head.equal_benchmark, head.cap_benchmark
+    edge = (
+        f"{head.edge.isoformat()} ({head.edge_source})"
+        if head.edge is not None
+        else "none in the store (every month is protected)"
+    )
+    vintage = head.data_vintage.isoformat() if head.data_vintage else "none"
+    lines = [
+        f"index-check {head.start_month} to {head.end_month} (not a trial, nothing written)",
+        f"store: {head.store_path}",
+        f"schema version: {head.schema_version}",
+        f"code version: {code_version}",
+        f"data vintage at close(T_end): {vintage}",
+        f"universe: {json.dumps(head.universe, sort_keys=True)}",
+        f"adjust.apply_spin_offs: {head.apply_spin_offs}",
+        f"edge E: {edge}",
+        idx.PROTECTED_LINE,
+        idx.CAP_CAVEAT,
+        "",
+        "by year (levels in percent; `\u00b7` = withheld)",
+    ]
+    year_headers = [
+        "year", "months", "members",
+        "EW", eq, f"EW-{eq}", "TE",
+        "CW", cap, f"CW-{cap}", "TE",
+    ]  # fmt: skip
+    year_rows: list[list[str]] = []
+    for y in (*report.years, *report.zones):
+        if y.year is None:
+            label = "protected total" if y.protected else "development total"
+            members = ""
+        else:
+            label, members = str(y.year), str(report.year_members[y.year])
+        ew, ewb, cw, cwb = _levels(y)
+        year_rows.append(
+            [
+                label, str(y.months), members,
+                ew, ewb, _pct(y.equal_gap), _pct(y.equal_te),
+                cw, cwb, _pct(y.cap_gap), _pct(y.cap_te),
+            ]
+        )  # fmt: skip
+    lines += _grid(year_headers, year_rows)
+    lines += ["", "by month"]
+    month_headers = [
+        "month", "members", "n_no_cap",
+        "EW", eq, f"EW-{eq}", "CW", cap, f"CW-{cap}", "flags",
+    ]  # fmt: skip
+    month_rows: list[list[str]] = []
+    for m in report.months:
+        census = " ".join(f"{k}={v}" for k, v in report.census[m.month].items() if v)
+        ew, ewb, cw, cwb = _levels(m)
+        month_rows.append(
+            [
+                m.month, str(m.n_members), str(m.n_no_cap),
+                ew, ewb, _pct(m.equal_gap), cw, cwb, _pct(m.cap_gap),
+                census or "-",
+            ]
+        )  # fmt: skip
+    lines += _grid(month_headers, month_rows)
+    for book, label in ((idx.EQUAL, f"equal weight vs {eq}"), (idx.CAP, f"cap weight vs {cap}")):
+        lines += ["", f"worst months, {label} (largest |gap|)"]
+        for w in report.worst[book]:
+            lines.append(f"{w.month}  gap {_pct(w.gap)}")
+            for n in w.names:
+                r = f"  r {_pct(n.row.name_return)}" if isinstance(n.row, ic.DevNameRow) else ""
+                flags = f"  {' '.join(n.flags)}" if n.flags else ""
+                who = f"{n.row.ticker} ({n.row.security_id})"
+                lines.append(f"    {who}  c {_pct(n.row.contribution)}{r}{flags}")
     return lines
 
 
@@ -4437,6 +4560,46 @@ def make_app(
             echo(line)
         if not report.clean:
             raise typer.Exit(LOTS_RECONCILE_DIFFERENCE_EXIT)
+
+    @app.command("index-check")
+    def index_check_(
+        start: Annotated[
+            str | None, typer.Option(help="first month, YYYY-MM (default: index_check.start_month)")
+        ] = None,
+        end: Annotated[
+            str | None, typer.Option(help="last month, YYYY-MM (default: index_check.end_month)")
+        ] = None,
+        out: Annotated[
+            Path | None, typer.Option(help="also write the masked report as JSON to this path")
+        ] = None,
+    ) -> None:
+        """The known-answer index check: the whole universe against RSP and SPY (#1598).
+
+        Never a trial: it opens no handle, writes no store, and months after the protected
+        edge print gaps only."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            report = idx.run_index_check(s, now=clock(), start=start, end=end)
+        except idx.IndexCheckRefused as exc:
+            raise _fail(_scrubbed(str(exc), s), USAGE_ERROR) from None
+        except idx.IndexCheckFailed as exc:
+            raise _fail(_scrubbed(f"index-check failed: {exc}", s), 1) from None
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except duckdb.Error as exc:
+            raise _fail(
+                _scrubbed(f"index-check failed: {type(exc).__name__}: {exc}", s), 1
+            ) from None
+        version = _code_version_text()
+        for line in _index_check_lines(report, version):
+            typer.echo(_scrubbed(line, s))
+        if out is not None:
+            payload = idx.report_dict(report)
+            payload["header"]["code_version"] = version
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     return app
 
