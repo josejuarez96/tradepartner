@@ -2351,6 +2351,14 @@ class PaperConfig(BaseModel):
     #: with the window's length. Read at run time, never frozen; `paper report`
     #: keeps the full window (its `paper_reports` row is the record).
     status_slippage_sessions: int = Field(default=20, gt=0)
+    #: The fill-price sanity band (#1981): a fill journaled by a run whose price is
+    #: further than this fraction from the order's reference price (the close of S-1,
+    #: split-adjusted) halts the run with a `fill_price_outside_band` fault. 0.25 is
+    #: conservative: an overnight gap past a quarter of the prior close is rare for a
+    #: liquid US equity, so a normal opening gap never trips it, while a 100x or 0.01x
+    #: fill (a broker-side bad print, a unit error) is far outside. Read at run time,
+    #: never frozen, so the open windows see it.
+    max_fill_price_deviation: float = Field(default=0.25, gt=0, lt=1)
 
     @field_validator("min_rebalances")
     @classmethod

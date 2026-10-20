@@ -253,7 +253,7 @@ from tradepartner.errors import (
 )
 from tradepartner.execution import phases, switch
 from tradepartner.execution.alerts import Alerter
-from tradepartner.execution.collect import Connect, WriteOffContext, collect
+from tradepartner.execution.collect import Connect, PriceBand, WriteOffContext, collect
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.plan import BuyCosts, DecisionState, decision_state, residue
 from tradepartner.execution.planning import current_listings, reference_prices
@@ -851,7 +851,7 @@ class RiskGatedBroker:
             )
             skips, counted = (*skips, *refused), counted + len(refused)
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
-                self._await_sells(run, [row for row, _ in gated.to_submit])
+                self._await_sells(run, [row for row, _ in gated.to_submit], book)
         if not any(d.side == _BUY for d in decisions):
             return BatchOutcome(_OK, tuple(submitted), skips)
         bought = self._buys(run, rows, rebalance, sold, len(submitted), counted, len(decisions))
@@ -951,6 +951,7 @@ class RiskGatedBroker:
                 price_of=book.price_of,
                 session=run.session,
             ),
+            price_band=self._price_band(run, book),
         )
         after = self._read_book(run, rows)
         written = tuple(
@@ -1608,7 +1609,7 @@ class RiskGatedBroker:
             book_id=self._run_book(run),
         )
 
-    def _await_sells(self, run: PaperRunRow, sells: Sequence[OrderRow]) -> None:
+    def _await_sells(self, run: PaperRunRow, sells: Sequence[OrderRow], book: _Book) -> None:
         """Poll this run's sells until each is terminal or
         `paper.sell_wait_seconds` has passed since the open, then collect them."""
         assert run.session is not None
@@ -1627,7 +1628,17 @@ class RiskGatedBroker:
             if not waiting or now >= deadline:
                 break
             self._sleep(min(paper.poll_interval_seconds, (deadline - now).total_seconds()))
-        self._collect(run, sells)
+        self._collect(run, sells, price_band=self._price_band(run, book))
+
+    def _price_band(self, run: PaperRunRow, book: _Book) -> PriceBand:
+        """The fill-price band (#1981) over the book's reference prices."""
+        assert run.session is not None
+        return PriceBand(
+            book.price_of,
+            book.actions,
+            run.session,
+            self._settings.paper.max_fill_price_deviation,
+        )
 
     def _collect(
         self,
@@ -1635,6 +1646,7 @@ class RiskGatedBroker:
         orders: Sequence[OrderRow],
         *,
         write_offs: WriteOffContext | None = None,
+        price_band: PriceBand | None = None,
     ) -> tuple[int, ...]:
         """Collect this phase's orders (T58); a rejection verdict raises
         `RejectionCapError` naming the submitting run. `write_offs`, when given,
@@ -1657,6 +1669,7 @@ class RiskGatedBroker:
             self._frozen,
             self._settings,
             write_offs=write_offs,
+            price_band=price_band,
         )
         if collected.rejections:
             raise RejectionCapError("; ".join(b.message for b in collected.rejections))
