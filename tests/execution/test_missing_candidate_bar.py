@@ -13,6 +13,7 @@ import pytest
 
 from execution.test_run_trade import F_0, T_0, Env, at, env, window  # noqa: F401
 from tradepartner.config import FAMILIES
+from tradepartner.execution import marks
 from tradepartner.execution.alerts import ALERT_KINDS
 from tradepartner.store.journal import PaperWindowRow
 
@@ -125,12 +126,11 @@ def test_a_reused_plan_raises_no_second_alert(env: Env, window: PaperWindowRow) 
     assert len(env.alerts("missing_candidate_bar")) == 1
 
 
-def test_a_held_name_with_no_bar_at_the_session_before_fails_the_run_not_the_plan(
+def test_a_held_name_with_no_bar_fails_the_run_at_the_marks_when_the_stale_limit_is_0(
     env: Env, window: PaperWindowRow
 ) -> None:
-    """Pins the boundary the amendment names (owner question #2023): on F_1 = the
-    session after T_1, a held name missing its T_1 bar is also its S-1 bar, so the
-    reference-price read fails the run before any plan; no exclusion, no alert, no order."""
+    """A window frozen before #1763 reads `paper.max_stale_mark_sessions` as 0: a held
+    name missing its S-1 bar (= T_1 here) fails the run at the marks, before any plan."""
     env.run(at(F_0))
     orders = len(env.orders())
     drop_bar(env, TRNS, date(2019, 5, 31))
@@ -138,3 +138,21 @@ def test_a_held_name_with_no_bar_at_the_session_before_fails_the_run_not_the_pla
         env.run(at(date(2019, 6, 3)), prices={"TRNS": 50.0})
     assert env.alerts("missing_candidate_bar") == []
     assert len(env.orders()) == orders
+
+
+def test_a_held_name_with_no_bar_is_recorded_alerted_and_still_sold_whole(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pins the behavior the amendment leaves unchanged (owner question #2023): with the
+    default frozen `paper.max_stale_mark_sessions = 3` the run goes on, rule 6 drops the
+    held name, it is recorded and alerted, and the plan sells it whole."""
+    monkeypatch.setattr(marks, "frozen_max_stale_mark_sessions", lambda _window: 3)
+    env.run(at(F_0))
+    drop_bar(env, TRNS, date(2019, 5, 31))
+    outcome = env.run(at(date(2019, 6, 3)), prices={"TRNS": 50.0})
+    assert outcome.status == "ok"
+    assert signal_reasons(env)[TRNS] == "excluded_no_t0_bar"
+    assert len(env.alerts("missing_candidate_bar")) == 1
+    run_id = env.latest_run()
+    sells = [o for o in env.orders() if o[1] == TRNS and o[2] == "sell" and o[5] == run_id]
+    assert sells
