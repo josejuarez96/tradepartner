@@ -73,6 +73,8 @@ def _check_fill_price(fill_price: str) -> None:
 def _check_positions(positions: Mapping[str, float], *, signed: bool = False) -> None:
     for sid, value in positions.items():
         if not (math.isfinite(value) and (signed or value >= 0)):
+            if signed:
+                raise ValueError(f"position {sid} must be finite, got {value}")
             raise ValueError(f"position {sid} must be non-negative and finite, got {value}")
 
 

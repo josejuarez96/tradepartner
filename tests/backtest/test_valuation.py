@@ -47,21 +47,30 @@ D2, D5, D6, D7, D8 = (date(2024, 2, d) for d in (2, 5, 6, 7, 8))
 T1 = date(2024, 2, 29)
 
 
-def test_signed_short_split_and_dividend_marks_to_hand_values() -> None:
-    split = _frame([("S", F0, 25.0, 25.0), ("S", D2, 25.0, 25.0)])
-    values = value_positions({"S": -50.0}, split, F0, fill_price="close", through=D2, signed=True)
-    assert _values(values, "S") == pytest.approx({F0: -50.0, D2: -50.0}, abs=1e-9)
+def test_signed_short_split_and_dividend_marks_to_hand_values(
+    store: duckdb.DuckDBPyConnection,
+) -> None:
+    _split_and_dividend_store(store)
+    frame = adjusted_prices_as_of(store, session_close(D7), ["A"], include_dividends=True)
+    marked = _values(
+        value_positions({"A": -1000.0}, frame, F0, fill_price="close", through=D7, signed=True),
+        "A",
+    )
+    # The 2:1 split cancels; 10 short shares become 20 short shares.
+    assert marked[D5] == pytest.approx(-1060.0, abs=1e-9)
+    # On the $1 ex-date, paying the dividend from cash exactly matches the mark.
+    cash_paid_d6 = -20.0 * 52.0 - 20.0 * 1.0
+    assert marked[D6] - cash_paid_d6 == pytest.approx(0.0, abs=1e-9)
+    # After the stock rises, the adjusted mark re-shorts the dividend at 53 - 1.
+    cash_paid_d7 = -20.0 * 54.0 - 20.0 * 1.0
+    assert marked[D7] - cash_paid_d7 == pytest.approx(20.0 * 1.0 * (1.0 - 54.0 / 52.0), abs=1e-9)
 
-    # Raw prior close 100, D=2, factor=.98; adjusted prior=98, ex raw close=99.
-    dividend = _frame([("S", F0, 98.0, 98.0), ("S", D2, 99.0, 99.0)])
-    marked = value_positions(
-        {"S": -50.0}, dividend, F0, fill_price="close", through=D2, signed=True
-    )
-    marked_equity = 100.0 + _values(marked, "S")[D2]
-    cash_payment_equity = 100.0 - 50.0 * 99.0 / 100.0 - 0.5 * 2.0
-    assert marked_equity - cash_payment_equity == pytest.approx(
-        0.5 * 2.0 * (1.0 - 99.0 / (100.0 - 2.0)), abs=1e-9
-    )
+
+def test_signed_position_validation_names_non_finite_value() -> None:
+    with pytest.raises(ValueError, match="position A must be finite"):
+        value_positions(
+            {"A": float("nan")}, _frame([]), F0, fill_price="close", through=D2, signed=True
+        )
 
 
 def test_signed_carry_to_fill_preserves_negative_value() -> None:

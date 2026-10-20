@@ -118,6 +118,19 @@ def test_signed_short_open_and_cover_each_pay_cost() -> None:
     assert covered.cost_paid == pytest.approx(0.5, abs=1e-9)
 
 
+def test_signed_cover_refuses_debit_balance_after_missed_sell() -> None:
+    # Equity is 100, but M has no fill bar and covering S needs 150 from cash of 50.
+    with pytest.raises(ValueError, match="covers on 2024-03-01"):
+        _fill(
+            {"M": 200.0, "S": -150.0},
+            50.0,
+            {"L": 1.0},
+            {"S": 10.0, "L": 10.0},
+            per_side_bps=0,
+            signed=True,
+        )
+
+
 # --- zero terms are today's fill to the last bit -----------------------------------
 
 #: A sell (A leaves the targets, sold whole), a trim (B from 40% to 30%), two buys (C, D)

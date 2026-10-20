@@ -36,6 +36,11 @@ def test_borrow_fee_hand_values_and_friday_to_monday() -> None:
     assert borrow_fee({"A": -600.0}, 0.0, 3) == 0.0
 
 
+def test_borrow_fee_rejects_long_value() -> None:
+    with pytest.raises(ValueError, match="short values must be non-positive"):
+        borrow_fee({"A": 100.0}, 30.0, 1)
+
+
 # (notional, shares): a whole-share buy, a whole-share sell, a fractional buy.
 THREE_TRADES = [(10_000.0, 100.0), (2_500.0, 50.0), (333.33, 3.3333)]
 

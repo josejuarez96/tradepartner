@@ -296,6 +296,8 @@ def _apply_signed_trades(
             continue
         notional = min(-current, desired[sid] - current)
         execute(sid, notional, price, cost_of(sid, notional, price))
+    if cash < 0:
+        raise ValueError(f"the covers on {fill_session.isoformat()} overdraw cash")
 
     for sid in names:
         current = held.get(sid, 0.0)

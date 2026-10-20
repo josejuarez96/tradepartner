@@ -34,6 +34,8 @@ from tradepartner.calendar import all_sessions
 from tradepartner.config import CostsConfig, Settings
 
 BPS_PER_UNIT = 10_000
+# Backtest spec amendment #1872 item 6: borrow uses calendar days and a 360-day year.
+BORROW_DAY_COUNT = 360
 
 
 def borrow_fee(short_values: Mapping[str, float], bps_per_year: float, calendar_days: int) -> float:
@@ -44,12 +46,14 @@ def borrow_fee(short_values: Mapping[str, float], bps_per_year: float, calendar_
         raise ValueError("calendar_days must be non-negative")
     if any(not math.isfinite(value) for value in short_values.values()):
         raise ValueError("short values must be finite")
+    if any(value > 0 for value in short_values.values()):
+        raise ValueError("short values must be non-positive")
     return (
         math.fsum(abs(value) for value in short_values.values())
         * bps_per_year
         / BPS_PER_UNIT
         * calendar_days
-        / 360
+        / BORROW_DAY_COUNT
     )
 
 
