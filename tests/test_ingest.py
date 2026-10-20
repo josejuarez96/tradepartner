@@ -6254,3 +6254,85 @@ def test_an_unjudged_entry_is_refused_and_writes_nothing() -> None:
         assert conn.execute("SELECT count(*) FROM successor_chains").fetchone() == (0,)
     finally:
         conn.close()
+
+
+def _transport_failing_prices(
+    root: Path, change: Any, windows: list[tuple[date, date]], fail_on: date
+) -> Any:
+    """A fixture price source behaving as `AlpacaPriceSource.symbol_changes`
+    does on a transport error (#1676): `[]` and a report naming the category,
+    for the run whose window ends on `fail_on`; the change is found when asked
+    again over a window that covers its day."""
+    from tradepartner.adapters.alpaca_prices import ActionsParse
+    from tradepartner.adapters.fixture_prices import FixturePriceSource
+
+    class Flaky(FixturePriceSource):
+        def symbol_changes(self, security_ids: Sequence[str], start: date, end: date) -> Any:
+            windows.append((start, end))
+            if end == fail_on:
+                self.report = ActionsParse((), (), (), unanswered_categories=("name_changes",))
+                return []
+            self.report = None
+            return [change] if start <= change.process_date <= end else []
+
+        def resolution_summary(self) -> str:
+            base = super().resolution_summary()
+            if self.report is None:
+                return base
+            return base + "; name_changes request unanswered (transport error)"
+
+    prices = Flaky(root)
+    prices.report = None
+    return prices
+
+
+def test_a_missed_days_name_change_is_asked_again_and_applied_next_run(
+    fixture_store_path: Path,
+) -> None:
+    """#1676: a transport error on the name-change request leaves the day's
+    prices stored with a warning in the run's message; the next run's window
+    still covers the missed day, finds the change, and stores it, known no
+    earlier than its announcement close (no look-ahead)."""
+    from tradepartner.adapters.prices import SymbolChange, announcement_date_known_at
+    from tradepartner.calendar import next_session
+    from tradepartner.store.asof import symbol_changes_as_of
+
+    day = date(2018, 11, 8)
+    known_at = announcement_date_known_at(day)
+    change = SymbolChange(
+        "SEC_TICKCHANGE", "TCKB", "TCKC", "SYNTH-NEW", "SYNTH-NEWER", day, known_at, "alpaca", "r1"
+    )
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    windows: list[tuple[date, date]] = []
+    prices = _transport_failing_prices(
+        Path(__file__).parent / "fixtures" / "universe", change, windows, day
+    )
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute("DELETE FROM symbol_changes")
+    first = _run(
+        settings, prices=prices, now=datetime(2018, 11, 8, 22, tzinfo=UTC), source="alpaca"
+    )
+    assert first.ok, first.runs
+    assert "name_changes request unanswered" in first.runs[0].message
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert (
+            conn.execute("SELECT count(*) FROM prices_daily WHERE session = ?", [day]).fetchone()[0]
+            > 0
+        )
+        assert conn.execute("SELECT count(*) FROM symbol_changes").fetchone()[0] == 0
+    next_day = next_session(day)
+    second = _run(
+        settings, prices=prices, now=datetime(2018, 11, 9, 22, tzinfo=UTC), source="alpaca"
+    )
+    assert second.ok, second.runs
+    assert next_day == date(2018, 11, 9)
+    # The re-ask window starts before the missed day: no cursor moved past it.
+    assert windows[0][0] <= day and windows[1][0] <= day <= windows[1][1]
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute("SELECT security_id, known_at FROM symbol_changes").fetchall() == [
+            ("SEC_TICKCHANGE", known_at)
+        ]
+        # No look-ahead: invisible before its known_at, visible at it.
+        before = known_at - timedelta(seconds=1)
+        assert symbol_changes_as_of(conn, before).height == 0
+        assert symbol_changes_as_of(conn, known_at).height == 1
