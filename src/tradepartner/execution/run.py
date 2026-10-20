@@ -161,9 +161,11 @@ test of step 3 runs again (its rows written the same either way); only its
 to cash and the broker's cash read here would be a false positive (T63f).
 Otherwise one `unspent_cash` alert at most, naming every rebalance reaching
 `executed` here whose cash exceeds the frozen `risk.max_unspent_cash_fraction`
-of the broker's equity read at that moment. The cash is the batch's
-`BatchOutcome.cash_left` for the batch's own rebalance when its buys phase
-read the cash, else the broker's cash read with that equity. A rebalance
+of the broker's equity read at that moment. The cash is the broker's, read with
+that equity after the run's own collection (#1982), less the market value of any
+shorts held (their proceeds are collateral, not idle): the batch's
+`BatchOutcome.cash_left` is the cash at sizing, before a buy the broker cancelled
+or expired went terminal, so it cannot show the cash that stayed idle. A rebalance
 gets one `executed` row, so this call site names it at most once; a run
 reaching `executed` for a rebalance at step 3 and another (or the same one)
 here calls `_unspent_cash` twice, and the alerter's (kind, run) dedupe keeps
@@ -1490,7 +1492,7 @@ class _Run:
             )
         )
         collected = self._collect()
-        self._unspent_cash(self._executed(actions, prices), {})
+        self._unspent_cash(self._executed(actions, prices))
         if self.kind == _STOP:
             self._stop_missed()
         reconciliation = self._reconcile()
@@ -1517,13 +1519,11 @@ class _Run:
             lagging=lagging,
             notes=self.notes,
         )
-        rebalance: date | None = None
         if self.kind == _STOP:
             self.submit_begun = True
             batch = stop_step(context)
         elif self._due() is not None:
             plan = self._plan(lagging)
-            rebalance = plan.rebalance_session
             # The halt path's write-off back-fill prices every name now decided.
             self.write_offs = WriteOffContext(
                 self.window_id, actions, self._pending_prices(actions).__getitem__, self.session
@@ -1541,8 +1541,7 @@ class _Run:
             )
             executed = self._executed(actions, prices)
             if self.kind != _STOP:
-                cash_left = {rebalance: batch.cash_left} if rebalance is not None else {}
-                self._unspent_cash(executed, cash_left)
+                self._unspent_cash(executed)
         self._reconcile()
         if batch is not None and batch.status == SKIPPED_KILL_SWITCH:
             return self._skipped()
@@ -1825,15 +1824,14 @@ class _Run:
             write_offs=self.write_offs,
         )
 
-    def _unspent_cash(
-        self, rebalances: Sequence[date], cash_left: Mapping[date, float | None]
-    ) -> None:
+    def _unspent_cash(self, rebalances: Sequence[date]) -> None:
         """One `unspent_cash` alert, at most, for every rebalance in
         `rebalances` reaching `executed` here whose cash exceeds the frozen
         `risk.max_unspent_cash_fraction` of the broker's equity (module
-        docstring): the cash for a rebalance is `cash_left[rebalance]`, this
-        run's buys phase's, when it is given and not None, else the broker's
-        cash, read once with the equity for every rebalance in this call.
+        docstring): the cash is the broker's, read once with the equity for every
+        rebalance in this call, so it is the cash after the run's collection
+        (#1982), less the market value of any shorts held (their proceeds are
+        collateral, not idle).
 
         The alerter dedupes on (kind, run), so a run reaching `executed` for
         more than one rebalance at one call site must not call `_alert` more
@@ -1849,16 +1847,14 @@ class _Run:
             return
         account = self._broker_call(Broker.account.__name__, self.broker.account)
         bound = self.frozen.max_unspent_cash_fraction * account.equity
-        over = [
-            (t_i, account.cash if cash_left.get(t_i) is None else cash_left[t_i])
-            for t_i in rebalances
-        ]
-        over = [(t_i, cash) for t_i, cash in over if cash is not None and cash > bound]
-        if not over:
+        # A short sale's proceeds sit in cash as collateral, not idle: leave the
+        # shorts' market value out (None, a long-only adapter, is zero).
+        cash = max(account.cash - abs(account.short_market_value or 0.0), 0.0)
+        if cash <= bound:
             return
         named = "; ".join(
             f"rebalance {t_i.isoformat()} executed with {cash:.2f} cash unspent"
-            for t_i, cash in over
+            for t_i in rebalances
         )
         self._alert(
             _UNSPENT_CASH,

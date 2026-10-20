@@ -7,7 +7,7 @@ non-negative, weights sum to at most 1, and the remainder is cash.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Literal
@@ -65,6 +65,47 @@ def target_weights(
     selected = ranked[: _selected_count(len(ranked), top_fraction)]
     weight = _equal_weight(len(selected))
     return {sid: weight for sid in sorted(selected)}
+
+
+def buffered_targets(
+    scores: Mapping[str, float],
+    previous: Collection[str],
+    top_fraction: float,
+    hold_top_fraction: float,
+) -> tuple[dict[str, float], int]:
+    """Targets under the buy/hold buffer, and the number of retained names (backtest
+    spec amendment #657, item 2).
+
+    `ranked` is the scored names by score descending, ties by `security_id` ascending;
+    n = |ranked|, k = the `top_fraction` count and h = the `hold_top_fraction` count
+    (the same count rule, so h >= k). The targets are `ranked[:k]` plus every name of
+    `previous` (the previous plan's targets) that is in `ranked[:h]`, each at the
+    `equal` weight 1 / |targets|. A previous name that is not scored is never kept.
+    `n_retained` is the number of targets outside `ranked[:k]`.
+
+    `hold_top_fraction` 0.0 means no buffer: the result is `target_weights`' output with
+    zero retained, and `previous` is not read. Otherwise it must be in
+    [`top_fraction`, 1]. Raises `ValueError` for a bad fraction or a non-finite score.
+    """
+    if hold_top_fraction == 0.0:
+        return target_weights(scores, top_fraction, "equal"), 0
+    if not (0 < top_fraction <= 1):
+        raise ValueError(f"top_fraction must be in (0, 1], got {top_fraction}")
+    if not (top_fraction <= hold_top_fraction <= 1):
+        raise ValueError(
+            f"hold_top_fraction must be 0.0 or in [{top_fraction}, 1], got {hold_top_fraction}"
+        )
+    for sid, score in scores.items():
+        if not math.isfinite(score):
+            raise ValueError(f"score for {sid} must be finite, got {score}")
+    if not scores:
+        return {}, 0
+    ranked = sorted(scores, key=lambda sid: (-scores[sid], sid))
+    top = set(ranked[: _selected_count(len(ranked), top_fraction)])
+    kept = set(ranked[: _selected_count(len(ranked), hold_top_fraction)]) & set(previous)
+    targets = top | kept
+    weight = _equal_weight(len(targets))
+    return {sid: weight for sid in sorted(targets)}, len(targets - top)
 
 
 def drifted_weights(position_values: Mapping[str, float], cash: float) -> dict[str, float]:

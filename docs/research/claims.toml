@@ -3215,3 +3215,14 @@ source = "docs/research/2026-10-18-b9-kill-b3-retirement.md"
 section = "1. B9 (earnings-reaction drift) is killed at rungs 1 and 2"
 bears_on = ["hyp:b9-earnings-reaction-drift", "backlog:B9", "adr:0023"]
 note = "Resolves SH-6 (MIXED) against B9 for the long-only, top-1,000 construction; SH-5 and SH-2 already pointed the same way. Conflicts with the value-weighted file only through the yardstick choice. The hypothesis file was never registered and is left as filed. IRRX's rung 2 stands separately as IL-2 (INSUFFICIENT; parked behind T198, not killed)."
+
+[[claim]]
+id = "TP-7"
+statement = "The long/short `momentum` idea on H1's ranking was killed by its own pre-declared rule: the 50/50 book (0.5 x H1's top-decile long leg - 0.5 x the bottom-decile short leg among names with a raw close of at least $5), 2020-08-31 to 2023-12-29, 40 monthly periods, 15 bp per side and 30 bp a year of borrow, has a net spread of -6.82 pp/yr (95% one-sided-bound interval -24.91 to +11.27, standard error 11.0) against the rule's kill lines of below 0 or an upper bound below +2.0; the gross spread is -4.02 pp/yr (long leg +6.8%/yr gross, short leg +8.6%/yr gross), and the book CAGR at 30 bp is -3.0% with volatility 11.8%."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "One registered exploratory run on the owner's store (registration 1 long-short-spike, dataset 1, run 1, outcome ok, 2026-10-19), in-sample only, holdout untouched; one pre-declared design, no DSR, no selection; the interval spans zero (40 months can kill by the rule, not confirm a negative spread); flat declared borrow, not a quoted locate cost; the point estimate decided (the upper bound was not below +2.0); the kill is kill-only and gates nothing, the signed-engine build (T219 onward) proceeds (owner, 2026-10-19, #1876)"
+source = "docs/research/2026-10-20-long-short-spike.md"
+section = "Answer"
+bears_on = ["hyp:h1-momentum-12-1", "backlog:B12", "adr:0024"]
+note = "Kills only the long/short `momentum` idea on this ranking; other rankings and composites are untested, and B12 stays the full measurement. No comparison with LS-3 or the beyond-long-only prior is made: the control and the book excess over T-bills were not recorded. The secondary values and three red flags (max_short_weight, n_delisted_short, the control against B11) are unread; they could reopen the verdict if they show a broken run. A later long/short `momentum` hypothesis file discloses this run in its preamble."
