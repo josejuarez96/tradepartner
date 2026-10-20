@@ -6488,3 +6488,61 @@ def test_store_price_source_delegates_mergers() -> None:
         (date(2020, 1, 1), date(2020, 1, 2))
     ]
     assert source.last_actions_report == "report"
+
+
+def test_daily_run_after_the_acquirees_delisting_still_stores_its_merger(
+    fixture_store_path: Path,
+) -> None:
+    """The request is symbol-less, so an acquiree delisted before the run's
+    session (and so absent from the names asked for) is still stored."""
+    from tradepartner.adapters.fixture_prices import FixturePriceSource
+    from tradepartner.adapters.prices import announcement_date_known_at
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    prices = FixturePriceSource(Path(__file__).parent / "fixtures" / "universe")
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute("DELETE FROM mergers")
+        delisted = conn.execute(
+            "SELECT effective_on FROM delistings WHERE security_id = 'SEC_CLEAN_MERGER'"
+        ).fetchone()
+    assert delisted is not None
+    now = datetime(2018, 8, 10, 22, tzinfo=UTC)
+    assert now.date() > delisted[0]
+    run = _run(settings, prices=prices, now=now, source="alpaca")
+    assert run.ok, run.runs
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute(
+            "SELECT security_id, known_at FROM mergers WHERE security_id = 'SEC_CLEAN_MERGER'"
+        ).fetchall() == [("SEC_CLEAN_MERGER", announcement_date_known_at(date(2018, 7, 25)))]
+        assert conn.execute(
+            "SELECT count(*) FROM prices_daily WHERE security_id = 'SEC_CLEAN_MERGER' "
+            "AND session = DATE '2018-08-10'"
+        ).fetchone() == (0,)
+
+
+def test_an_unresolved_merger_is_stored_by_a_later_run_with_the_same_stamp(
+    fixture_store_path: Path,
+) -> None:
+    """A record the resolver could not place is not stored; once a later run's
+    request returns it, it is stored at its own stamp, not at that run's clock."""
+    from tradepartner.adapters.fixture_prices import FixturePriceSource
+    from tradepartner.adapters.prices import announcement_date_known_at
+
+    class Late(FixturePriceSource):
+        answer = False
+
+        def mergers(self, start: date, end: date) -> list[Any]:
+            return super().mergers(start, end) if self.answer else []
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    prices = Late(Path(__file__).parent / "fixtures" / "universe")
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute("DELETE FROM mergers")
+    stamp = announcement_date_known_at(date(2018, 7, 25))
+    assert _run(settings, prices=prices, now=stamp + timedelta(hours=1), source="alpaca").ok
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute("SELECT count(*) FROM mergers").fetchone() == (0,)
+    prices.answer = True
+    assert _run(settings, prices=prices, now=stamp + timedelta(days=3), source="alpaca").ok
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute("SELECT known_at FROM mergers").fetchall() == [(stamp,)]
