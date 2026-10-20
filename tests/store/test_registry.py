@@ -28,6 +28,7 @@ import pytest
 
 from tradepartner.config import Cadence, Settings
 from tradepartner.store import journal, registry, schema
+from tradepartner.store.benchmarks import CHECK_ONLY_IDS
 from tradepartner.store.db import insert_row
 
 _T0 = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
@@ -2309,3 +2310,47 @@ def test_a_shakedown_note_refuses_an_unknown_alert(conn: duckdb.DuckDBPyConnecti
         with pytest.raises(ValueError):
             registry.record_decision(conn, kind="shakedown_note", reason="r", values=values)
     assert _decision_count(conn) == 0
+
+
+def test_a_check_only_security_moves_no_trial_vintage_under_either_spin_offs_value(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """T243 (backtest spec amendment #1598, item 3; question 37): a `BENCH:RSP` bar,
+    dividend, split and spin-off, all known before the cutoffs, leave `data_vintage`
+    unchanged at every cutoff for both `spin_offs` values, while the same rows under a
+    universe id move it from their `known_at` on (so the exclusion is not vacuous)."""
+    assert "BENCH:RSP" in CHECK_ONLY_IDS
+    cutoffs = _fixture_cutoffs(fixture_store)
+    before = {
+        (cutoff, flag): registry.data_vintage(fixture_store, cutoff, spin_offs=flag)
+        for cutoff in cutoffs
+        for flag in (False, True)
+    }
+    _price(fixture_store, "BENCH:RSP", _PIN_KNOWN, _LATE_INGEST)
+    for kind in ("dividend", "split", "spinoff"):
+        _action(fixture_store, kind, "BENCH:RSP", known_at=_PIN_KNOWN, ingested_at=_LATE_INGEST)
+    assert registry.store_max_ingested_at(fixture_store) == _LATE_INGEST
+    for (cutoff, flag), expected in before.items():
+        assert registry.data_vintage(fixture_store, cutoff, spin_offs=flag) == expected
+
+    _price(fixture_store, "SEC_UNIVERSE_CONTROL", _PIN_KNOWN, _LATE_INGEST)
+    for flag in (False, True):
+        for cutoff in cutoffs:
+            vintage = registry.data_vintage(fixture_store, cutoff, spin_offs=flag)
+            assert vintage == (before[(cutoff, flag)] if cutoff < _PIN_KNOWN else _LATE_INGEST)
+
+
+def test_a_check_only_dividend_alone_moves_nothing_but_a_universe_dividend_does(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The `corporate_actions` clause on its own, both flags: one dividend row."""
+    cutoff = _PIN_KNOWN + timedelta(days=1)
+    before = {f: registry.data_vintage(fixture_store, cutoff, spin_offs=f) for f in (False, True)}
+    _action(fixture_store, "dividend", "BENCH:RSP", known_at=_PIN_KNOWN, ingested_at=_LATE_INGEST)
+    for flag in (False, True):
+        assert registry.data_vintage(fixture_store, cutoff, spin_offs=flag) == before[flag]
+    _action(
+        fixture_store, "dividend", "SEC_DIV_CONTROL", known_at=_PIN_KNOWN, ingested_at=_LATE_INGEST
+    )
+    for flag in (False, True):
+        assert registry.data_vintage(fixture_store, cutoff, spin_offs=flag) == _LATE_INGEST

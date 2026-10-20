@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import re
 import tomllib
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import duckdb
@@ -102,6 +104,25 @@ def test_page_shows_filename_listing_block(
     monkeypatch: pytest.MonkeyPatch, store_path: Path
 ) -> None:
     assert "Filing-name listings" in _text(_app(monkeypatch, store_path))
+
+
+def test_integrity_card_explains_a_listed_duplicate_pending_repair(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    original = health_page.load_health_view
+
+    def with_pending(*args: Any, **kwargs: Any) -> health_page.HealthView:
+        view = original(*args, **kwargs)
+        report = replace(view.report, duplicate_dividends=SimpleNamespace(pending=(object(),)))
+        return replace(view, report=report)
+
+    monkeypatch.setattr(health_page, "load_health_view", with_pending)
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    assert (
+        "duplicate_dividends: pass (1 pending repair; each payment is still counted twice)"
+        in _text(at)
+    )
 
 
 def _connect(store_path: Path) -> duckdb.DuckDBPyConnection:

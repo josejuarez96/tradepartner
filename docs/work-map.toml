@@ -1456,3 +1456,17 @@ why = "The check only finds defects when it runs on the owner's store (#1598)."
 [task.T247]
 what = "A dashboard page for the index check, built only if the owner asks for it."
 why = "A page is convenient but optional; the CLI output is the record (#1598)."
+
+[task.T250]
+what = "The per-book performance arithmetic, pure: rebase a series, the daily P&L, the cumulative return and the excess over a benchmark."
+why = "The dashboard's performance card must show hand-checkable numbers computed from the journal, not from a trial (#2006)."
+unblocks = ["task:T251"]
+
+[task.T251]
+what = "The performance read, read-only: the window's marks, SPY total return and the latest report's tracking trial."
+why = "The card needs the journal's equity series and SPY without opening a trial or writing (#2006)."
+unblocks = ["task:T252"]
+
+[task.T252]
+what = "The Performance page on the dashboard: the equity curve, daily P&L, SPY and the book's backtest tracking, per book."
+why = "No screen showed a book's equity, gain or loss, or its comparison with SPY; the owner sees them outside Alpaca (#2006)."
