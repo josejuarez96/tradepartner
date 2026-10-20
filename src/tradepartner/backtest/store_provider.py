@@ -106,6 +106,7 @@ from tradepartner.calendar import last_completed_session
 from tradepartner.config import Settings, get_settings
 from tradepartner.store import registry
 from tradepartner.store.asof import (
+    _ACTION_IDENTITY_PARTITION,
     _latest_as_of,
     adjusted_prices_as_of,
     dropped_dividends_as_of,
@@ -140,25 +141,26 @@ def _latest_spin_offs(
     conn: duckdb.DuckDBPyConnection, at: datetime, parents: Sequence[str]
 ) -> pl.DataFrame:
     """The latest-revision `spinoff` rows as of `at` whose **parent** is in `parents`, one
-    row per `(child, ex_date)`, the parent re-keyed into `security_id` (spec amendment
-    #1894, item 2: a `spinoff` row's `security_id` is the child, its parent is in
-    `source_action_id`). A later revision of a row wins, as `_latest_as_of` gives for
-    `late_dividends`; the two children of one parent on one ex-date are two rows.
-    `parents` empty selects nothing, as `_security_filter` gives."""
+    row per action identity, the parent re-keyed into `security_id` (spec amendment #1894,
+    item 2: a `spinoff` row's `security_id` is the child, its parent is in
+    `source_action_id`). Rows are keyed by `_ACTION_IDENTITY_PARTITION` and a cancelled
+    revision is dropped, exactly as `adjusted_prices_as_of` reads the table, so a re-dated
+    or cancelled row cannot count twice; the two children of one parent on one ex-date are
+    two rows. `parents` empty selects nothing, as `_security_filter` gives."""
     if not parents:
         return pl.DataFrame(schema=_LATE_SPIN_OFF_SCHEMA)
     return conn.execute(
-        """
+        f"""
         SELECT source_action_id AS security_id, ex_date, ratio_or_amount, known_at
         FROM (
             SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY security_id, action_type, ex_date ORDER BY known_at DESC
+                PARTITION BY {_ACTION_IDENTITY_PARTITION} ORDER BY known_at DESC
             ) AS _rn
             FROM corporate_actions
             WHERE known_at <= ? AND action_type = 'spinoff'
               AND source_action_id IN (SELECT unnest(?))
         )
-        WHERE _rn = 1
+        WHERE _rn = 1 AND NOT cancelled
         ORDER BY security_id, ex_date
         """,
         [at, list(parents)],

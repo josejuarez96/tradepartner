@@ -309,9 +309,10 @@ def load_trial_view(
         [trial_id, base],
     )
     counts = registry.rebalance_counts(conn, trial_id)
-    for row in rebalances:
-        session = counts.get(row["session"], {})
-        row.update({name: session.get(name) for name in _SPIN_OFF_COUNTS})
+    if any(name in session for session in counts.values() for name in _SPIN_OFF_COUNTS):
+        for row in rebalances:
+            written = counts.get(row["session"], {})
+            row.update({name: written.get(name) for name in _SPIN_OFF_COUNTS})
     metrics = _rows(
         conn,
         "SELECT * FROM trial_metrics WHERE trial_id = ? ORDER BY series, cost_per_side_bps, metric",
