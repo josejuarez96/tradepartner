@@ -245,6 +245,7 @@ from tradepartner.adapters.openfigi_raw import map_tickers
 from tradepartner.adapters.prices import (
     Bar,
     CorporateAction,
+    Merger,
     PriceSource,
     SymbolChange,
     spinoff_known_at_floor,
@@ -898,7 +899,13 @@ def ingest_actions_backfill(
     if isinstance(through, datetime) or not isinstance(through, date) or through < since:
         raise ValueError("through must be a date on or after since")
     fetch = scan or partial(alpaca_raw.corporate_actions_scan, settings=settings)
-    types = (CorporateActionsType.SPIN_OFF, CorporateActionsType.NAME_CHANGE)
+    types = (
+        CorporateActionsType.SPIN_OFF,
+        CorporateActionsType.NAME_CHANGE,
+        CorporateActionsType.CASH_MERGER,
+        CorporateActionsType.STOCK_MERGER,
+        CorporateActionsType.STOCK_AND_CASH_MERGER,
+    )
 
     def run_month(first: date, last: date) -> SourceRun:
         prepared: dict[str, Any] = {}
@@ -927,6 +934,8 @@ def ingest_actions_backfill(
             added += _add_symbol_changes(
                 conn, parsed.symbol_changes, ingested_at=stamp, stats=counts
             )
+            added += _add_mergers(conn, parsed.mergers, ingested_at=stamp, stats=counts)
+            _count_merger_report(counts, parsed)
             counts["actions_unresolved"] = len(parsed.unresolved)
             counts["actions_self_spinoff"] = parsed.self_spinoff
             counts["actions_spinoff_revisions"] = parsed.spinoff_revisions
@@ -937,7 +946,8 @@ def ingest_actions_backfill(
             return (
                 added,
                 f"{first}..{last}: {len(parsed.actions)} spin-off action(s), "
-                f"{len(parsed.symbol_changes)} name change(s); {message}",
+                f"{len(parsed.symbol_changes)} name change(s), "
+                f"{len(parsed.mergers)} merger(s); {message}",
             )
 
         return _run_source(
@@ -2940,6 +2950,8 @@ class _PriceFetch:
     runs: tuple[tuple[date, date], ...]
     actions: tuple[CorporateAction, ...]
     symbol_changes: tuple[SymbolChange, ...]
+    mergers: tuple[Merger, ...]
+    merger_report: Any
     action_window: tuple[date, date]
     covered: tuple[date, date]
     ingested_at: datetime
@@ -3004,6 +3016,13 @@ def _fetch_prices(
     lag = timedelta(days=settings.alpaca.actions_process_lag_days)
     changes = prices.symbol_changes(every, action_window[0] - lag, action_window[1])
     change_summary = prices.resolution_summary()
+    # Mergers (#1762): one symbol-less request over `process_date` from one lag
+    # before the session, because an acquiree is usually delisted before Alpaca
+    # processes its record and so is absent from `every`. Identity makes the
+    # overlap with earlier runs add nothing.
+    mergers = prices.mergers(session - lag, session)
+    merger_report = getattr(prices, "last_actions_report", None)
+    merger_summary = prices.resolution_summary()
     have = {bar.security_id for bar in bars if bar.session == session}
     with _price_read(settings) as conn:
         plan = _replay_plan(conn, actions, action_window)
@@ -3034,11 +3053,16 @@ def _fetch_prices(
     seen = set(action_summary.split("; "))
     if extra := [part for part in change_summary.split("; ") if part and part not in seen]:
         message += f"; {'; '.join(extra)}"
+    seen |= set(change_summary.split("; "))
+    if extra := [part for part in merger_summary.split("; ") if part and part not in seen]:
+        message += f"; {'; '.join(extra)}"
     return _PriceFetch(
         tuple(bars),
         tuple(runs),
         tuple(actions),
         tuple(changes),
+        tuple(mergers),
+        merger_report,
         action_window,
         covered,
         ingested_at,
@@ -3174,6 +3198,8 @@ def _write_prices(conn: duckdb.DuckDBPyConnection, fetched: _PriceFetch) -> tupl
         stats=stats,
     )
     added += _add_symbol_changes(conn, fetched.symbol_changes, ingested_at=at, stats=stats)
+    added += _add_mergers(conn, fetched.mergers, ingested_at=at, stats=stats)
+    _count_merger_report(stats, fetched.merger_report)
     counts = "; ".join(f"{key}={value}" for key, value in sorted(stats.items()))
     return added, fetched.message + (f"; {counts}" if counts else "")
 
@@ -3793,6 +3819,135 @@ def _add_symbol_changes(
             insert_row(conn, "symbol_changes", revision)
             added += 1
     return added
+
+
+def _merger_row(merger: Merger, ingested_at: datetime) -> Row:
+    return {
+        "security_id": merger.security_id,
+        "kind": merger.kind,
+        "acquirer_security_id": merger.acquirer_security_id,
+        "acquiree_symbol": merger.acquiree_symbol,
+        "acquiree_cusip": merger.acquiree_cusip,
+        "acquirer_symbol": merger.acquirer_symbol,
+        "acquirer_cusip": merger.acquirer_cusip,
+        "share_ratio": merger.share_ratio,
+        "cash_per_share": merger.cash_per_share,
+        "effective_date": merger.effective_date,
+        "process_date": merger.process_date,
+        "payable_date": merger.payable_date,
+        "source_action_id": merger.source_action_id,
+        "known_at": merger.known_at,
+        "ingested_at": ingested_at,
+        "source": merger.source,
+        "provenance": "action",
+    }
+
+
+_MERGER_VALUES = (
+    "kind",
+    "acquirer_security_id",
+    "acquiree_symbol",
+    "acquiree_cusip",
+    "acquirer_symbol",
+    "acquirer_cusip",
+    "share_ratio",
+    "cash_per_share",
+    "effective_date",
+    "process_date",
+    "payable_date",
+)
+
+
+def _same_merger(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+    return all(a[field] == b[field] for field in _MERGER_VALUES)
+
+
+def _add_mergers(
+    conn: duckdb.DuckDBPyConnection,
+    mergers: Sequence[Merger],
+    *,
+    ingested_at: datetime,
+    stats: dict[str, int] | None = None,
+) -> int:
+    """Write the newly knowable mergers and the revisions of their identity
+    `(security_id, source_action_id)` (spec "Mergers", #1762); return the
+    rows added.
+
+    A first row keeps the stamp its record carries (the close after its
+    `process_date`); a record whose stamp is after `ingested_at` is skipped
+    and counted `actions_not_yet_known`, never clamped. A later row of a
+    stored identity that differs in a value is a revision stamped at
+    `ingested_at` (`_current`); a repeat adds nothing. Two ids of one deal
+    (one acquiree, one `effective_date`) are both stored; the pairs of the
+    securities written to are counted `merger_conflict` from the store, so a
+    pair split over two runs counts as one that arrives together.
+    """
+    ids = sorted({merger.security_id for merger in mergers})
+    if not ids:
+        return 0
+    cursor = conn.execute("SELECT * FROM mergers WHERE list_contains(?, security_id)", [ids])
+    names = [column[0] for column in cursor.description]
+    history: dict[_Identity, list[Row]] = defaultdict(list)
+    for values in cursor.fetchall():
+        row = dict(zip(names, values, strict=True))
+        history[(row["security_id"], row["source_action_id"])].append(row)
+    for rows in history.values():
+        rows.sort(key=lambda row: row["known_at"])
+    incoming: dict[_Identity, list[Row]] = defaultdict(list)
+    for merger in sorted(mergers, key=lambda m: m.known_at):
+        if merger.known_at > ingested_at:
+            if stats is not None:
+                stats["actions_not_yet_known"] = stats.get("actions_not_yet_known", 0) + 1
+            continue
+        incoming[(merger.security_id, merger.source_action_id)].append(
+            _merger_row(merger, ingested_at)
+        )
+    added = 0
+    for identity, rows in incoming.items():
+        past = list(history.get(identity, []))
+        if not past:
+            first = rows[0]
+            insert_row(conn, "mergers", first)
+            past.append(first)
+            added += 1
+        for revision in _current(rows[-1], past, ingested_at, _same_merger):
+            insert_row(conn, "mergers", revision)
+            added += 1
+    if stats is not None:
+        stats["mergers_stored"] = stats.get("mergers_stored", 0) + added
+        pairs = conn.execute(
+            """
+            SELECT count(*) FROM (
+                SELECT security_id, effective_date FROM (
+                    SELECT security_id, source_action_id, effective_date FROM mergers
+                    WHERE list_contains(?, security_id)
+                    QUALIFY row_number() OVER (
+                        PARTITION BY security_id, source_action_id ORDER BY known_at DESC
+                    ) = 1
+                )
+                GROUP BY security_id, effective_date
+                HAVING count(*) > 1
+            )
+            """,
+            [ids],
+        ).fetchone()
+        assert pairs is not None
+        stats["merger_conflict"] = stats.get("merger_conflict", 0) + int(pairs[0])
+    return added
+
+
+def _count_merger_report(stats: dict[str, int], report: Any) -> None:
+    """Add the merger parse's own counts (refused, unresolved, same-company,
+    ambiguous stamps) to the run's `stats`; `report` is the source's
+    `ActionsParse`, `None` when the source keeps none."""
+    if report is None:
+        return
+    stats["merger_rows_refused"] = stats.get("merger_rows_refused", 0) + len(
+        report.merger_rows_refused
+    )
+    stats["actions_unresolved"] = stats.get("actions_unresolved", 0) + len(report.unresolved)
+    stats["merger_self"] = stats.get("merger_self", 0) + report.merger_self
+    stats["merger_unordered"] = stats.get("merger_unordered", 0) + len(report.merger_unordered)
 
 
 # --- writing only what changes an as-of read --------------------------------

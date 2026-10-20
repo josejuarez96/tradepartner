@@ -386,7 +386,13 @@ from tradepartner.adapters.edgar import parse_sgml_header
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.filings import FilingHeader
 from tradepartner.adapters.fred_rates import FredRateSource
-from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource, SymbolChange
+from tradepartner.adapters.prices import (
+    Bar,
+    CorporateAction,
+    Merger,
+    PriceSource,
+    SymbolChange,
+)
 from tradepartner.adapters.rates import RateSource
 from tradepartner.adapters.stamp_repair import ManifestRow
 from tradepartner.backfill import BenchmarkSeed, HoleFill, backfill, backfill_benchmark, fill_holes
@@ -578,6 +584,15 @@ class StorePriceSource(PriceSource):
     ) -> list[SymbolChange]:
         """`AlpacaPriceSource.symbol_changes` over the store's listings."""
         return self._source().symbol_changes(security_ids, start, end)
+
+    def mergers(self, start: date, end: date) -> list[Merger]:
+        """`AlpacaPriceSource.mergers` over the store's listings (#1762)."""
+        return self._source().mergers(start, end)
+
+    @property
+    def last_actions_report(self) -> Any:
+        """The inner source's latest actions report, `None` before a fetch."""
+        return None if self._inner is None else self._inner.last_actions_report
 
     def resolution_summary(self) -> str:
         """`AlpacaPriceSource.resolution_summary`, `""` before the first fetch."""

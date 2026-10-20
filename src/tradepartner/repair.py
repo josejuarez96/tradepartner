@@ -281,6 +281,7 @@ class RepairResult:
     action_keys_checked: int
     dry_run: bool
     unjudged_symbol_changes: int = 0
+    unjudged_mergers: int = 0
     chains: tuple[ChainLine, ...] = ()
 
     @property
@@ -305,7 +306,8 @@ class RepairResult:
             f"({len(self.found.actions) + len(self.found.spinoffs)} of "
             f"{self.action_keys_checked} keys) that the "
             f"resolver no longer assigns to their security, on {len(named)} securities{shown}; "
-            f"{self.unjudged_symbol_changes} symbol_changes rows unjudged"
+            f"{self.unjudged_symbol_changes} symbol_changes rows unjudged; "
+            f"{self.unjudged_mergers} mergers rows unjudged"
         )
 
     def lines(self) -> list[str]:
@@ -508,12 +510,15 @@ def repair_resolution(
         unjudged_row = conn.execute("SELECT count(*) FROM symbol_changes").fetchone()
         assert unjudged_row is not None
         unjudged = int(unjudged_row[0])
+        mergers_row = conn.execute("SELECT count(*) FROM mergers").fetchone()
+        assert mergers_row is not None
         result = RepairResult(
             found=found,
             bar_keys_checked=bars.seen,
             action_keys_checked=actions.seen + len(spin_rows),
             dry_run=dry_run,
             unjudged_symbol_changes=unjudged,
+            unjudged_mergers=int(mergers_row[0]),
             chains=_chain_lines(conn, started),
         )
         if not dry_run:
