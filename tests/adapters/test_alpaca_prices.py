@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+import requests
+from alpaca.common.exceptions import APIError
 
 from tradepartner.adapters.alpaca_prices import (
     AlpacaPriceSource,
@@ -3141,6 +3143,35 @@ class TestAlpacaPriceSource:
         assert source.symbol_changes(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31)) == []
         assert source.last_actions_report is not None
         assert source.last_actions_report.malformed_categories == ("name_changes",)
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            requests.ConnectionError("down"),
+            requests.Timeout("slow"),
+            OSError("reset"),
+            APIError('{"message": "bad gateway"}'),
+        ],
+    )
+    def test_a_transport_error_on_the_name_change_request_is_counted_not_raised(
+        self, error: Exception
+    ) -> None:
+        # #1676: the daily run's own name-change request tolerates a network
+        # error: no raise, a warning in the summary, nothing returned.
+        def fetch_name_changes(_s: list[str], _a: date, _b: date) -> dict[str, object]:
+            raise error
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS),
+            fetch_actions=_Recorded().actions,
+            fetch_name_changes=fetch_name_changes,
+            settings=_settings(),
+        )
+        assert source.symbol_changes(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31)) == []
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.unanswered_categories == ("name_changes",)
+        assert source.last_actions_report.malformed_categories == ()
+        assert "name_changes request unanswered" in source.resolution_summary()
 
     def test_spinoff_is_kept_when_only_its_parent_is_requested(self) -> None:
         # #1673 (1): a partial request (backfill, replay subset) that asks
