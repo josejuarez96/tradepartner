@@ -520,9 +520,7 @@ def _rule_differences(
     return differences
 
 
-def _release_refusal(
-    conn: duckdb.DuckDBPyConnection, path: Path, params: Mapping[str, Any]
-) -> None:
+def release_refusal(conn: duckdb.DuckDBPyConnection, path: Path, params: Mapping[str, Any]) -> None:
     """A new registration naming `data.release_id` must name a `data_release` the store
     holds (version 18): a typo or an invented name would otherwise freeze a release the
     data never had (T214)."""
@@ -795,7 +793,7 @@ def register(
             f"{parsed.slug!r} (same frozen set and fingerprint, new doc hash) is refused; "
             "the registered file is the record"
         )
-    _release_refusal(conn, path, params)
+    release_refusal(conn, path, params)
     if is_lab_initialised(conn):
         _lab_refusal(conn, path, parsed, params, fingerprint, promotion_of, operations_of)
         if operations_of is not None:

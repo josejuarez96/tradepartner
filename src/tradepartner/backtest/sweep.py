@@ -451,6 +451,15 @@ def parse_sweep_file(path: Path, settings: Settings | None = None) -> SweepFile:
         raise SweepFileError(
             f"{path}: keys outside the frozen list are refused: {', '.join(unknown)}"
         )
+    if frozen.has_release(fixed):
+        replaced = sorted(
+            k for k in fixed if k.partition(".")[0] in frozen.RELEASE_REPLACED_SECTIONS
+        )
+        if replaced:
+            raise SweepFileError(
+                f"{path}: {frozen.RELEASE_ID_KEY} replaces the master keys; "
+                f"remove {', '.join(replaced)}"
+            )
     inert = frozen.inert_sections(family)
     inert_fixed = sorted(k for k in fixed if k.partition(".")[0] in inert)
     if inert_fixed:
@@ -664,6 +673,10 @@ class SweepRegistrationError(ValueError):
     written."""
 
 
+class ReleaseNotClosedError(SweepRegistrationError):
+    """`data.release_id` names no closed `data_release` row (T214)."""
+
+
 class NoFamilyRulesError(SweepRegistrationError):
     """The sweep's family has registered hypotheses but no `family_rules` row: a store
     the lab migration did not populate. A family with neither is a new family."""
@@ -777,7 +790,10 @@ def _rule_differences(
     if file.parent_family is not None and file.parent_family != rules.parent_family:
         differences.append(f"parent_family (the family's is {rules.parent_family!r})")
     defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    released = frozen.has_release(params)
     for key, rule in sorted(rules.fixed_params.items()):
+        if released and key.partition(".")[0] in frozen.RELEASE_REPLACED_SECTIONS:
+            continue  # the data release replaces these keys (T214)
         value = params.get(key)
         if key in frozen.HIGHER_ALLOWED_COST_KEYS:
             if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
@@ -982,6 +998,11 @@ def register(
     existing = _existing_registration(conn, parsed, variants)
     if existing is not None:
         return existing
+    for variant in variants:
+        try:
+            hypothesis.release_refusal(conn, file, variant.frozen_set)
+        except hypothesis.HypothesisFileError as exc:
+            raise ReleaseNotClosedError(str(exc)) from exc
     boundary = registry.boundary_date(conn)
     if boundary is not None and parsed.in_sample_start >= boundary:
         raise DevelopmentBoundaryError(
