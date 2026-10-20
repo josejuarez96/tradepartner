@@ -8,6 +8,10 @@ of equity idle, the rebalance read `executed` and no alert was written, because
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
+
 from execution.test_run_stop import buy_id
 from execution.test_run_trade import F_0, Env, at
 from execution.test_run_trade import _no_env_file as _no_env_file  # autouse
@@ -64,4 +68,33 @@ def test_a_fully_filled_rebalance_raises_no_unspent_cash_alert(
     env: Env, window: PaperWindowRow
 ) -> None:
     env.run(at(F_0))
+    assert env.alerts("unspent_cash") == []
+
+
+def test_a_held_shorts_proceeds_are_not_idle_cash(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The broker's cash holds a short sale's proceeds as collateral: a cancelled buy's
+    idle cash is netted against the shorts' market value, so a book whose cash is all
+    short proceeds raises no alert."""
+    real = env.fake.account
+
+    def with_shorts() -> object:
+        account = real()
+        return replace(account, short_market_value=-account.cash)
+
+    monkeypatch.setattr(env.fake, "account", with_shorts)
+    env.fill_on_sleep = False
+    victim = buy_id(env, F_0, "SEC_TRANSFER")
+    done: list[bool] = []
+
+    def hook(_now: object) -> None:
+        if not done:
+            env.fake.cancel(victim)
+            done.append(True)
+        env.fill_open()
+
+    env.on_sleep.append(hook)
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(env.latest_run())
     assert env.alerts("unspent_cash") == []

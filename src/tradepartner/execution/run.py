@@ -162,7 +162,8 @@ to cash and the broker's cash read here would be a false positive (T63f).
 Otherwise one `unspent_cash` alert at most, naming every rebalance reaching
 `executed` here whose cash exceeds the frozen `risk.max_unspent_cash_fraction`
 of the broker's equity read at that moment. The cash is the broker's, read with
-that equity after the run's own collection (#1982): the batch's
+that equity after the run's own collection (#1982), less the market value of any
+shorts held (their proceeds are collateral, not idle): the batch's
 `BatchOutcome.cash_left` is the cash at sizing, before a buy the broker cancelled
 or expired went terminal, so it cannot show the cash that stayed idle. A rebalance
 gets one `executed` row, so this call site names it at most once; a run
@@ -1825,7 +1826,8 @@ class _Run:
         `risk.max_unspent_cash_fraction` of the broker's equity (module
         docstring): the cash is the broker's, read once with the equity for every
         rebalance in this call, so it is the cash after the run's collection
-        (#1982).
+        (#1982), less the market value of any shorts held (their proceeds are
+        collateral, not idle).
 
         The alerter dedupes on (kind, run), so a run reaching `executed` for
         more than one rebalance at one call site must not call `_alert` more
@@ -1841,10 +1843,13 @@ class _Run:
             return
         account = self._broker_call(Broker.account.__name__, self.broker.account)
         bound = self.frozen.max_unspent_cash_fraction * account.equity
-        if account.cash <= bound:
+        # A short sale's proceeds sit in cash as collateral, not idle: leave the
+        # shorts' market value out (None, a long-only adapter, is zero).
+        cash = max(account.cash - abs(account.short_market_value or 0.0), 0.0)
+        if cash <= bound:
             return
         named = "; ".join(
-            f"rebalance {t_i.isoformat()} executed with {account.cash:.2f} cash unspent"
+            f"rebalance {t_i.isoformat()} executed with {cash:.2f} cash unspent"
             for t_i in rebalances
         )
         self._alert(
