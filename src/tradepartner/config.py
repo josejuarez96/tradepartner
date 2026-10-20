@@ -1635,7 +1635,7 @@ class DataConfig(BaseModel):
     for none. A hypothesis registered with a non-empty id freezes it in place of the
     `master`, `gap` and `adjust` sections; `""` leaves those sections as stored. Like
     `holdout.*` it is set by a hypothesis file, never by the environment, and is
-    absent from `.env.example` beyond a comment.
+    not listed in `.env.example`.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
