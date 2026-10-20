@@ -7,6 +7,7 @@ assignment against one real collection and cover the shard item order.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -179,18 +180,21 @@ def test_shard_collection_orders_kept_items(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_real_collection_shards_partition_the_full_suite(monkeypatch: pytest.MonkeyPatch) -> None:
-    """One real collection, then the same assignment as each CI shard uses (#2056)."""
-    count = 8
+    """One real collection, then each CI shard's actual deselection hook (#2056)."""
+    workflow = (_ROOT_DIR / ".github" / "workflows" / "ci.yml").read_text()
+    count_match = re.search(r"(?m)^  PYTEST_SHARD_COUNT:\s*(\d+)\s*$", workflow)
+    assert count_match, "CI workflow has no PYTEST_SHARD_COUNT"
+    count = int(count_match.group(1))
     monkeypatch.delenv("PYTEST_SHARD_INDEX", raising=False)
     monkeypatch.delenv("PYTEST_SHARD_COUNT", raising=False)
     monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
 
     class Collector:
         def __init__(self) -> None:
-            self.nodeids: list[str] = []
+            self.session: pytest.Session | None = None
 
         def pytest_collection_finish(self, session: pytest.Session) -> None:
-            self.nodeids = [item.nodeid for item in session.items]
+            self.session = session
 
     collector = Collector()
     result = pytest.main(
@@ -198,19 +202,24 @@ def test_real_collection_shards_partition_the_full_suite(monkeypatch: pytest.Mon
         plugins=[collector],
     )
     assert result == pytest.ExitCode.OK
-    full = collector.nodeids
-    unit_by_nodeid = {
-        nodeid: nodeid if nodeid.split("::")[0] in _SPLIT_BY_TEST else nodeid.split("::")[0]
-        for nodeid in full
-    }
-    units = set(unit_by_nodeid.values())
-    shards = []
+    assert collector.session is not None
+    session = collector.session
+    full_items = list(session.items)
+    full = [item.nodeid for item in full_items]
+    units = {_shard_unit(item, session.config.rootpath) for item in full_items}
+    shards: list[list[str]] = []
+    monkeypatch.setenv("PYTEST_SHARD_COUNT", str(count))
     for index in range(count):
-        assignment = shard_assignment(units, shard_count=count)
-        shards.append([nodeid for nodeid in full if assignment[unit_by_nodeid[nodeid]] == index])
-    flat = [nodeid for shard in shards for nodeid in shard]
-    assert len(flat) == len(set(flat)), "a test is collected by more than one shard"
-    assert set(flat) == set(full)
+        monkeypatch.setenv("PYTEST_SHARD_INDEX", str(index))
+        kept = full_items.copy()
+        pytest_collection_modifyitems(session.config, kept)
+        shards.append([item.nodeid for item in kept])
+    shard_sets = [set(shard) for shard in shards]
+    assert all(
+        shard_sets[i].isdisjoint(shard_sets[j]) for i in range(count) for j in range(i + 1, count)
+    ), "a test is collected by more than one shard"
+    assert sum(map(len, shards)) == sum(map(len, shard_sets)), "a shard has duplicate tests"
+    assert set().union(*shard_sets) == set(full)
     assert len(full) == len(set(full))
     assert len(full) > 1000, "collection looks empty or truncated"
     # no stale weight keys: every listed unit is a real file or nodeid (a renamed test or
