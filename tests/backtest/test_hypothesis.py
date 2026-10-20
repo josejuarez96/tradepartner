@@ -47,6 +47,7 @@ FROZEN_SECTIONS = (
     "master",
     "gap",
     "holdout",
+    "data",
     "metrics",
 )
 FROZEN_SINGLE_KEYS = ("execution.fill_price", "benchmarks", "alpaca.historical_feed")
@@ -651,6 +652,7 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "master.chain_window_sessions",
             "master.chain_max_price_ratio",
             "adjust.apply_spin_offs",
+            "data.release_id",
         ),
     ],
     ids=["today", "pre-lab"],
@@ -1337,6 +1339,7 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "master.chain_window_sessions",
         "master.chain_max_price_ratio",
         "adjust.apply_spin_offs",
+        "data.release_id",
     )
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     record = registry.register_hypothesis(
@@ -1703,6 +1706,7 @@ def test_h1s_unchanged_file_registered_before_the_terms_writes_nothing(
         *COST_TERMS,
         *(k for k in hypothesis.frozen_keys() if k.startswith("master.chain")),
         "adjust.apply_spin_offs",
+        "data.release_id",
     }
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     stored = registry.register_hypothesis(
@@ -1928,3 +1932,161 @@ def test_load_frozen_accepts_false(
     _register(conn, _spin_offs_file(tmp_path, SLUG, "false"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
     assert loaded.adjust.apply_spin_offs is False
+
+
+# --- T214: `data.release_id` replaces the master keys ---------------
+
+RELEASE_KEY = "data.release_id"
+_REPLACED_PREFIXES = ("master.",)
+_RELEASE_AT = datetime(2026, 10, 25, tzinfo=UTC)
+
+
+def _release_file(tmp_path: Path, release: str, *, keep_sections: bool = False) -> Path:
+    text = FIXTURE.read_text()
+    if not keep_sections:
+        kept: list[str] = []
+        skipping = False
+        for line in text.splitlines():
+            if line.startswith("["):
+                skipping = line.strip("[] ") in {"master"}
+            elif line.startswith("```"):
+                skipping = False
+            if not skipping:
+                kept.append(line)
+        text = "\n".join(kept) + "\n"
+    path = tmp_path / "hypotheses" / f"{SLUG}.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(text.replace("\n```\n", f'\n[data]\nrelease_id = "{release}"\n```\n', 1))
+    return path
+
+
+def _close_release(conn: duckdb.DuckDBPyConnection, name: str = "rel-1") -> None:
+    """A closed `data_release` (`after` row) named `name` in `conn`."""
+    registry.import_release(
+        conn,
+        [
+            {
+                "name": name,
+                "stage": "after",
+                "made_at": datetime(2026, 10, 25, tzinfo=UTC),
+                "reason": "t",
+            }
+        ],
+    )
+
+
+def test_a_release_registration_stores_the_id_and_none_of_the_three_sections(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _close_release(conn)
+    record = _register(conn, _release_file(tmp_path, "rel-1"), settings)
+    assert record.params[RELEASE_KEY] == "rel-1"
+    assert not [k for k in record.params if k.startswith(_REPLACED_PREFIXES)]
+    assert "gap.count_share_threshold" in record.params  # holdout.py reads it
+    assert "adjust.max_dividend_to_prior_close" in record.params
+    expected = set(hypothesis.family_frozen_keys("momentum")) - {
+        k for k in hypothesis.frozen_keys() if k.startswith(_REPLACED_PREFIXES)
+    }
+    assert set(record.params) == expected
+
+
+def test_a_release_registration_loads_and_verifies(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A run reads the sections it no longer stores from live `Settings`, and the loaded
+    settings still match the stored hash."""
+    _close_release(conn)
+    record = _register(conn, _release_file(tmp_path, "rel-1"), settings)
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
+    assert loaded.data.release_id == "rel-1"
+    assert hypothesis.frozen_hash_matches(loaded, record.params_sha256, family="momentum")
+    again = _register(conn, _release_file(tmp_path, "rel-1"), settings)
+    assert again == record
+
+
+def test_a_file_naming_the_id_and_a_replaced_key_is_refused(
+    tmp_path: Path, settings: Settings
+) -> None:
+    path = _release_file(tmp_path, "rel-1", keep_sections=True)
+    text = path.read_text().replace(
+        "\n[data]\n", "\n[master]\nkeep_successors = true\n\n[data]\n", 1
+    )
+    path.write_text(text)
+    with pytest.raises(HypothesisFileError, match="replaces the master keys"):
+        hypothesis.parse_file(path)
+
+
+def test_a_file_without_the_id_freezes_the_default_whatever_env_says(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA__RELEASE_ID", "from-env")
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "no.env"))
+    live = Settings()
+    assert live.data.release_id == "from-env"
+    params = hypothesis.frozen_params(hypothesis.parse_file(FIXTURE), live)
+    assert params[RELEASE_KEY] == ""
+    assert [k for k in params if k.startswith(_REPLACED_PREFIXES)]
+
+
+def test_the_id_is_not_required_of_a_file() -> None:
+    for family in sorted(config.FAMILIES):
+        assert RELEASE_KEY not in hypothesis.required_keys(family)
+
+
+def test_an_id_naming_no_closed_release_is_refused(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A typo or an invented name would freeze a release the data never had; an
+    open (`before`-only) release is not the store's release yet."""
+    path = _release_file(tmp_path, "rel-1")
+    with pytest.raises(HypothesisFileError, match="names no closed data_release"):
+        _register(conn, path, settings)
+    registry.import_release(
+        conn,
+        [
+            {
+                "name": "rel-1",
+                "stage": "before",
+                "made_at": datetime(2026, 10, 24, tzinfo=UTC),
+                "reason": "t",
+            }
+        ],
+    )
+    with pytest.raises(HypothesisFileError, match="names no closed data_release"):
+        _register(conn, path, settings)
+    assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (0,)
+
+
+def test_family_rules_that_fix_the_three_sections_accept_a_release_set(
+    settings: Settings,
+) -> None:
+    """The re-recording the task exists for: a family whose rules fix `master.*`, `gap.*`
+    and `adjust.*` does not refuse a set that replaced them with the id (the key still
+    differing from the rules' stays refused when no id is named)."""
+    parsed = hypothesis.parse_file(FIXTURE)
+    plain = hypothesis.frozen_params(parsed, settings)
+    fixed = {k: v for k, v in plain.items() if k.startswith(FORBIDDEN_AXIS_PREFIXES)}
+    assert {k for k in fixed if k.startswith(_REPLACED_PREFIXES)}
+    assert fixed
+    rules = lab_registry.FamilyRules(
+        family="momentum",
+        first_hypothesis_id=1,
+        parent_family=None,
+        holdout_start=parsed.holdout_start,
+        holdout_end=parsed.holdout_end,
+        in_sample_start=parsed.in_sample_start,
+        fixed_params=fixed,
+        fixed_params_sha256="x",
+        max_family_holdout_spends=1,
+        max_family_promotions=1,
+        min_sharpe_variance_annual=0.0,
+        axis_lattice={},
+        sr_star_seed_annual=None,
+        registered_at=datetime(2026, 10, 1, tzinfo=UTC),
+    )
+    assert hypothesis._rule_differences(parsed, plain, rules) == []
+    released = {k: v for k, v in plain.items() if not k.startswith(_REPLACED_PREFIXES)}
+    released[RELEASE_KEY] = "rel-1"
+    assert hypothesis._rule_differences(parsed, released, rules) == []
+    ungated = {k: v for k, v in plain.items() if not k.startswith(_REPLACED_PREFIXES)}
+    assert hypothesis._rule_differences(parsed, ungated, rules) != []

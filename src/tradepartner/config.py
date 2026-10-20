@@ -1627,6 +1627,29 @@ class HoldoutConfig(BaseModel):
         return self
 
 
+class DataConfig(BaseModel):
+    """The named data release the store is at (backtest spec, "The data-release id";
+    ADR 0023 D8; T214).
+
+    `release_id` is the name of a `data_release` decision (schema version 18), or `""`
+    for none. A hypothesis registered with a non-empty id freezes it in place of the
+    ingest-time `master.*` keys (owner, #1958); `""` leaves them as stored. Like
+    `holdout.*` it is set by a hypothesis file, never by the environment, and is
+    not listed in `.env.example`.
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    release_id: str = ""
+
+    @field_validator("release_id")
+    @classmethod
+    def _validate_release_id(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("data.release_id must not have leading or trailing whitespace")
+        return value
+
+
 class BacktestConfig(BaseModel):
     """Engine settings (spec reqs 4 and 5).
 
@@ -2423,6 +2446,7 @@ class Settings(BaseSettings):
     combined: CombinedConfig = Field(default_factory=CombinedConfig)
     costs: CostsConfig = Field(default_factory=CostsConfig)
     holdout: HoldoutConfig = Field(default_factory=HoldoutConfig)
+    data: DataConfig = Field(default_factory=DataConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)

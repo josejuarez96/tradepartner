@@ -1234,3 +1234,59 @@ def test_the_three_rule_differences_agree_on_the_cost_terms(
                 assert "costs.adv_sessions (not fixed by the family rules)" in found[name], case
             if refused == {"costs.spread_bps"}:
                 assert "costs.spread_bps (lower than the family's 5.0)" in found[name], case
+
+
+# ── T214 (#1970): `data.release_id` in a sweep ──────────────────────────────────────
+
+_DATA_EDIT = ("[gap]\n", '[data]\nrelease_id = "rel-1"\n\n[gap]\n')
+
+
+def _close_release(conn: duckdb.DuckDBPyConnection, name: str = "rel-1") -> None:
+    registry.import_release(
+        conn,
+        [
+            {
+                "name": name,
+                "stage": "after",
+                "made_at": datetime(2026, 10, 25, tzinfo=UTC),
+                "reason": "t",
+            }
+        ],
+    )
+
+
+def test_a_release_sweep_registers_under_rules_that_fix_master_keys(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """The family rules fix `master.*`; a variant that replaced them with the id is not
+    refused for lacking them, and stores the id, no `master.*` and its `gap.*`."""
+    _close_release(ready)
+    rules = lab_registry.family_rules(ready, "momentum")
+    assert rules is not None
+    assert any(k.startswith("master.") for k in rules.fixed_params)
+    path = _copy(tmp_path, SWEEP_SOURCE, _DATA_EDIT)
+    result = register(ready, path, settings, registered_by="test")
+    assert result.hypotheses
+    for record in result.hypotheses:
+        assert record.params["data.release_id"] == "rel-1"
+        assert not [k for k in record.params if k.startswith("master.")]
+        assert record.params["gap.count_share_threshold"] == 0.05
+
+
+def test_a_release_sweep_naming_no_closed_release_is_refused_and_writes_nothing(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    path = _copy(tmp_path, SWEEP_SOURCE, _DATA_EDIT)
+    _refused(ready, path, settings, sweep.ReleaseNotClosedError, "names no closed data_release")
+
+
+def test_a_sweep_naming_the_id_and_a_master_key_is_refused(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _close_release(ready)
+    edit = (
+        "[gap]\n",
+        '[data]\nrelease_id = "rel-1"\n\n[master]\nkeep_successors = true\n\n[gap]\n',
+    )
+    with pytest.raises(SweepFileError, match="replaces the master keys"):
+        sweep.parse_sweep_file(_copy(tmp_path, SWEEP_SOURCE, edit), settings)

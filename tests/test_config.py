@@ -2955,3 +2955,13 @@ def test_a_window_frozen_with_a_bad_short_key_is_refused(key: str, value: float)
     assert getattr(frozen_risk(_window(_frozen_today())), key) == _SHORT_KEYS[key]
     with pytest.raises(ValueError, match=key):
         frozen_risk(_window(_frozen_today(**{key: value})))
+
+
+def test_data_release_id_defaults_to_none_and_rejects_padding() -> None:
+    """`data.release_id` (T214): `""` is no release; a padded name is refused."""
+    assert Settings(_env_file=None).data.release_id == ""
+    assert Settings(_env_file=None, data={"release_id": "rel-1"}).data.release_id == "rel-1"
+    with pytest.raises(ValidationError, match="whitespace"):
+        Settings(_env_file=None, data={"release_id": " rel-1"})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, data={"release_id": "x", "extra": 1})
