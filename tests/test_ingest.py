@@ -54,7 +54,7 @@ from tradepartner.adapters.prices import (
     bar_known_at,
 )
 from tradepartner.adapters.rates import RateObservation, rate_known_at
-from tradepartner.calendar import all_sessions
+from tradepartner.calendar import all_sessions, next_session, session_close
 from tradepartner.config import BorrowConfig, Settings, secret_values
 from tradepartner.health import filing_event_counts, statement_counts
 from tradepartner.ingest import (
@@ -88,6 +88,7 @@ from tradepartner.ingest import (
 )
 from tradepartner.store.asof import (
     ASSETS_SOURCE,
+    adjusted_prices_as_of,
     facts_as_of,
     live_actions_as_of,
     prices_as_of,
@@ -97,6 +98,7 @@ from tradepartner.store.classify import build_classifications, classifications_a
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.master import Chain, MasterBuild, build_chains, build_master
 from tradepartner.store.schema import init_schema
+from tradepartner.universe import _split_factors
 
 
 def test_openfigi_revisions_errors_and_unmapped(settings: Settings) -> None:
@@ -776,7 +778,68 @@ def test_first_run_writes_both_sources_and_their_run_rows(
     fetched = {sid for call in prices.calls for sid in call[1]}
     assert fetched == {ACME, DUAL, DUAL_B, SPY}
     assert ("bars", tuple(sorted(fetched)), SESSION, SESSION) in prices.calls
-    assert ("actions", tuple(sorted(fetched)), date(2019, 6, 1), SESSION) in prices.calls
+    assert (
+        "actions",
+        tuple(sorted(fetched)),
+        date(2019, 6, 1),
+        next_session(SESSION),
+    ) in prices.calls
+
+
+def test_evening_ingest_stores_next_session_split_without_early_adjustment(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    ex = next_session(SESSION)  # Friday 2019-06-28 -> Monday 2019-07-01
+
+    @dataclass
+    class RangedPrices(_Prices):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            return [
+                action
+                for action in super().corporate_actions(security_ids, start, end)
+                if start <= action.ex_date <= end
+            ]
+
+    split = CorporateAction(
+        ACME,
+        ActionType.SPLIT,
+        ex,
+        2.0,
+        session_close(SESSION),
+        "alpaca",
+        source_action_id="split-monday",
+    )
+    prices = RangedPrices(actions=[split])
+    assert _run(settings, prices).ok
+    assert ("actions", tuple(sorted(IDS)), date(2019, 6, 1), ex) in prices.calls
+    assert read("SELECT ex_date, known_at FROM corporate_actions") == [(ex, session_close(SESSION))]
+
+    prior = date(2019, 6, 27)
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "prices_daily",
+            {
+                **_bar(ACME, prior, NOW),
+                "known_at": session_close(prior),
+            },
+        )
+
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        conn.execute("SET TimeZone='UTC'")
+        cut = session_close(SESSION)
+        assert live_actions_as_of(conn, cut, [ACME]).height == 1
+        raw = prices_as_of(conn, cut, [ACME])
+        adjusted = adjusted_prices_as_of(conn, cut, [ACME])
+        assert raw.select("session", "close").rows() == [(prior, 10.0), (SESSION, 20.0)]
+        assert adjusted.select("session", "close").rows() == [(prior, 10.0), (SESSION, 20.0)]
+        assert _split_factors(conn, cut, [ACME], SESSION) == {}
+        assert adjusted_prices_as_of(conn, session_close(ex), [ACME]).select(
+            "session", "close"
+        ).rows() == [(prior, 5.0), (SESSION, 10.0)]
+        assert _split_factors(conn, session_close(ex), [ACME], ex) == {ACME: [(ex, 2.0)]}
 
 
 def test_every_row_is_known_by_its_ingested_at_which_is_the_run_clock(
