@@ -52,6 +52,7 @@ from pydantic import (
     SerializerFunctionWrapHandler,
     StrictBool,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_serializer,
     model_validator,
@@ -1350,6 +1351,13 @@ class StrategyConfig(BaseModel):
     `signal_delay_sessions`, `placebo` and `placebo_seed` are the kill ladder's rung-4
     delay and rung-5 placebo (ADR 0023; backtest spec amendment #1820): post-registration
     own-section keys, inert at their defaults and read by the engine's plan step.
+
+    `hold_top_fraction` is the `momentum` buy/hold buffer (backtest spec amendment #657):
+    0.0 (the default) is no buffer; otherwise a name held at the last rebalance stays
+    while it ranks inside this share, and `top_fraction <= value <= 1` is required. A
+    value equal to `top_fraction` is normalised to 0.0, so the two spellings of "no
+    buffer" are one hypothesis. It is a rule of `equal` weighting and a
+    post-registration own-section key.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1366,6 +1374,27 @@ class StrategyConfig(BaseModel):
     signal_delay_sessions: int = Field(default=0, ge=0)
     placebo: Literal["none", "shuffle", "random_entry"] = "none"
     placebo_seed: int = Field(default=0, ge=0)
+    hold_top_fraction: float = Field(default=0.0, ge=0, le=1)
+
+    @field_validator("hold_top_fraction")
+    @classmethod
+    def _validate_hold_top_fraction(cls, value: float, info: ValidationInfo) -> float:
+        top = info.data.get("top_fraction")
+        if top is None or value == 0.0:
+            return value
+        if value == top:
+            return 0.0
+        if value < top:
+            raise ValueError(
+                f"strategy.hold_top_fraction ({value}) must be 0.0 or at least "
+                f"strategy.top_fraction ({top})"
+            )
+        if info.data.get("weighting") == "hold":
+            raise ValueError(
+                f"strategy.hold_top_fraction ({value}) is a rule of equal weighting; "
+                "strategy.weighting = 'hold' has its own exit rule"
+            )
+        return value
 
     @model_validator(mode="after")
     def _validate_formation_window(self) -> StrategyConfig:
@@ -1474,7 +1503,14 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         # `no_turnover` and its two counts are B10's screen, reported only when
         # `strategy.turnover_top_fraction` is below 1.0 (backtest spec amendment #1358).
         exclusion_reasons=("no_history", "no_turnover"),
-        count_names=("n_excluded_no_history", "n_screened", "n_excluded_no_turnover"),
+        # `n_retained` is the buffer's count, reported only when `strategy.hold_top_fraction`
+        # is non-zero (backtest spec amendment #657).
+        count_names=(
+            "n_excluded_no_history",
+            "n_screened",
+            "n_excluded_no_turnover",
+            "n_retained",
+        ),
         benchmark="MTUM",
         sweepable_keys=(
             "strategy.formation_months",
@@ -1483,6 +1519,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
             "strategy.weighting",
             "strategy.signal_total_return",
             "strategy.turnover_top_fraction",
+            "strategy.hold_top_fraction",
         ),
     ),
     "oracle": FamilySpec(
