@@ -156,6 +156,7 @@ _SKIP_BELOW_ONE_SHARE = "skip_below_one_share"
 _SKIP_BELOW_MINIMUM = "skip_below_minimum"
 _SKIP_DELISTED = "skip_delisted"
 _SKIP_NOT_BORROWABLE = "skip_not_borrowable"
+_SKIP_SHORT_PRICE = "skip_short_price"
 #: An order's intent (`side`, `position_side`) -> Alpaca's `position_intent` (item 3).
 _INTENTS: dict[tuple[str, str], PositionIntent] = {
     (_SELL, LONG): PositionIntent.SELL_TO_CLOSE,
@@ -294,13 +295,21 @@ def _id(decision: DecisionRow) -> int:
 
 
 def _held_and_residue(
-    decision: DecisionRow, ledger: Ledger, residues: Mapping[str, float]
+    decision: DecisionRow,
+    ledger: Ledger,
+    residues: Mapping[str, float],
+    *,
+    flip_close: bool = False,
 ) -> tuple[float, float]:
     """The holding on S and the residue effective for this sell: 0 for a
-    `delisted` or `untargeted_receipt` forced exit (`_WHOLE_HOLDING_REASONS`),
-    else `plan.residue`. Raises if the residue is above the holding."""
+    `delisted` or `untargeted_receipt` forced exit (`_WHOLE_HOLDING_REASONS`)
+    and for a long-to-short flip's close (`flip_close`, #1959: the name is
+    never long and short at once), else `plan.residue`. Raises if the residue
+    is above the holding."""
     sid = decision.security_id
     held = _finite(ledger.positions.get(sid, 0.0), f"holding of {sid}")
+    if flip_close:
+        return held, 0.0
     if decision.decision == _FORCED_EXIT and decision.reason in _WHOLE_HOLDING_REASONS:
         return held, 0.0
     residue = _finite(residues.get(sid, 0.0), f"residue of {sid}")
@@ -442,6 +451,11 @@ def sell_orders(
         if twice:
             raise ValueError(f"two {kind} decisions for {twice} in one phase")
 
+    # A flip's close (#1959): a short-open trade of the name is among `decisions`
+    # (a short open the planner skipped has no side, so no short follows).
+    short_opened = {
+        d.security_id for d in decisions if d.side == _SELL and d.position_side == SHORT
+    }
     open_sold = risk.open_sold(open_sells, quantity_decimals)
     covered = risk.open_sold(open_covers, quantity_decimals)
     orders: list[PhaseOrder] = []
@@ -465,7 +479,12 @@ def sell_orders(
             residue = 0.0
             sold = covered.get(sid, Decimal(0))
         else:
-            held, residue = _held_and_residue(decision, ledger, residues)
+            held, residue = _held_and_residue(
+                decision,
+                ledger,
+                residues,
+                flip_close=full_exit and decision.decision != _FORCED_EXIT and sid in short_opened,
+            )
             sold = open_sold.get(sid, Decimal(0))
         if full_exit:
             whole = decision.whole_share or cover
@@ -527,6 +546,7 @@ def buy_orders(
     session: date,
     ended: Collection[str] = (),
     held_shorts: Mapping[str, float] = {},
+    short_min_price: float | None = None,
 ) -> PhaseOrders:
     """The buys phase's orders, skips, deferred ids and cash left on S =
     `session` (module docstring).
@@ -555,7 +575,12 @@ def buy_orders(
     held short shares per name (`Ledger.short_holdings`): they are valued at
     `price_of` and deducted from `cash` before the long buys are sized, floored
     at 0, so the long buys are sized within free cash (ADR 0010's restated cash
-    rule; `cash_left` is then of that free cash). A `buy` + `short` (a cover)
+    rule; `cash_left` is then of that free cash). `short_min_price` is the
+    window's frozen `portfolio.short_min_price` (#1969): a short open whose
+    reference price is below it is `skip_short_price` (counted in the cap),
+    after the borrow check and before one share (item 14 (e)); a price equal to
+    it is ordered, `None` checks nothing, and a negative or non-finite value
+    raises `ValueError`. A `buy` + `short` (a cover)
     is the sells phase's and is no order here.
 
     A **flip**'s second leg waits on its first: a short open of a name with a
@@ -568,6 +593,10 @@ def buy_orders(
     """
     _check_session(session)
     _finite(cash, "cash")
+    if short_min_price is not None and not (
+        math.isfinite(short_min_price) and short_min_price >= 0
+    ):
+        raise ValueError(f"short_min_price is {short_min_price!r}")
     if (
         planned_sells.orders or planned_sells.skips or planned_sells.held
     ) and planned_sells.session != session:
@@ -621,6 +650,9 @@ def buy_orders(
             skips.append(Skip(_id(decision), sid, _SKIP_NOT_BORROWABLE))
             continue
         price = _price(price_of, sid)
+        if short_min_price is not None and price < short_min_price:
+            skips.append(Skip(_id(decision), sid, _SKIP_SHORT_PRICE))
+            continue
         quantity = float(math.floor(_finite(attempt.remainder.quantity, f"remainder of {sid}")))
         if quantity < 1:
             skips.append(Skip(_id(decision), sid, _SKIP_BELOW_ONE_SHARE))
