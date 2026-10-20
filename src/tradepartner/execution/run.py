@@ -1545,7 +1545,7 @@ class _Run:
                         "re-ingest the bar or the next rebalance sells them: " + ", ".join(kept)
                     )
                     if others:
-                        message += "; not held: " + ", ".join(others)
+                        message += "; not kept: " + ", ".join(others)
                 self._alert("missing_candidate_bar", message)
             # The halt path's write-off back-fill prices every name now decided.
             self.write_offs = WriteOffContext(
