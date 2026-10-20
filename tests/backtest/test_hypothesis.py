@@ -48,6 +48,7 @@ FROZEN_SECTIONS = (
     "gap",
     "holdout",
     "metrics",
+    "portfolio",
 )
 FROZEN_SINGLE_KEYS = ("execution.fill_price", "benchmarks", "alpaca.historical_feed")
 #: T210's post-registration `costs.*` keys (#1792): frozen, never required of a file.
@@ -652,6 +653,7 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "master.chain_max_price_ratio",
             "adjust.apply_spin_offs",
             "strategy.hold_top_fraction",
+            "portfolio.",
         ),
     ],
     ids=["today", "pre-lab"],
@@ -1339,6 +1341,11 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "master.chain_max_price_ratio",
         "adjust.apply_spin_offs",
         "strategy.hold_top_fraction",
+        "portfolio.side",
+        "portfolio.gross_exposure",
+        "portfolio.net_exposure",
+        "portfolio.short_min_price",
+        "portfolio.short_cover_weight",
     )
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     record = registry.register_hypothesis(
@@ -1707,6 +1714,7 @@ def test_h1s_unchanged_file_registered_before_the_terms_writes_nothing(
     later = {
         *COST_TERMS,
         *(k for k in hypothesis.frozen_keys() if k.startswith("master.chain")),
+        *(k for k in hypothesis.frozen_keys() if k.startswith("portfolio.")),
         "adjust.apply_spin_offs",
         "strategy.hold_top_fraction",
     }
@@ -2013,3 +2021,31 @@ def test_load_frozen_refuses_a_buffered_registration_until_t239(
     assert record.params[BUFFER_KEY] == 0.2
     with pytest.raises(HypothesisFileError, match=BUFFER_KEY):
         hypothesis.load_frozen(conn, SLUG, settings=settings)
+
+
+# --- the `portfolio` section (T219; backtest spec amendment #1872, item 1) ------------
+
+
+def test_portfolio_keys_are_allowed_and_frozen_at_their_defaults(
+    tmp_path: Path, settings: Settings
+) -> None:
+    """A file may name the five keys (`frozen_keys` includes the section), and absent
+    they are frozen at their table defaults, never from live `Settings`."""
+    text = FIXTURE.read_text().replace("\n```\n", '\n[portfolio]\nside = "long_only"\n```\n', 1)
+    parsed = hypothesis.parse_file(_copy(tmp_path, text))
+    explicit = hypothesis.frozen_params(parsed, settings)
+    twin = hypothesis.frozen_params(hypothesis.parse_file(FIXTURE), settings)
+    assert explicit == twin
+    assert explicit["portfolio.side"] == "long_only"
+    assert explicit["portfolio.short_min_price"] == 5.0
+
+
+def test_a_non_default_portfolio_value_is_refused_until_t223(
+    tmp_path: Path, settings: Settings
+) -> None:
+    """T219's #1788 guard: the engine reads none of the five until T223, so a
+    `long_short` file cannot register (`_overlay` fails validation naming T223)."""
+    text = FIXTURE.read_text().replace("\n```\n", '\n[portfolio]\nside = "long_short"\n```\n', 1)
+    parsed = hypothesis.parse_file(_copy(tmp_path, text))
+    with pytest.raises(HypothesisFileError, match="T223"):
+        hypothesis.frozen_params(parsed, settings)

@@ -1455,6 +1455,67 @@ class CombinedConfig(BaseModel):
     weighting: Literal["equal"] = "equal"
 
 
+class PortfolioConfig(_ClosedConfig):
+    """The signed-book keys, the frozen section `portfolio` (backtest spec amendment
+    #1872, item 1).
+
+    `side` selects a long-only or a long/short book. `gross_exposure` is the sum of the
+    absolute target weights, in `(0, 1.0]`: the upper bound is ADR 0024 item 4's
+    placeholder, "so a backtest never tests what paper cannot hold". `net_exposure` is
+    the sum of the signed target weights, in `[-gross, gross]` and equal to
+    `gross_exposure` under `long_only`. `short_min_price` is the shortability proxy's
+    price floor in dollars (item 3; Alpaca's own $5 maintenance line), and
+    `short_cover_weight` the drift cover's short-value share of equity (item 7).
+
+    The section is listed by no family and is a post-registration section under the
+    2026-10-09 and #1792 rules, so every key is left out of the canonical set and the
+    fingerprint at its default and no stored registration moves. Until the engine reads
+    all five (T223) `_refuse_until_wired` refuses any non-default value, the #1788
+    guard, so no `long_short` trial can run on a half-built engine.
+    """
+
+    side: Literal["long_only", "long_short"] = "long_only"
+    gross_exposure: float = Field(default=1.0, gt=0, le=1.0)
+    net_exposure: float = Field(default=1.0, ge=-1.0, le=1.0)
+    short_min_price: float = Field(default=5.0, gt=0)
+    short_cover_weight: float = Field(default=0.10, gt=0, le=1.0)
+
+    @model_validator(mode="after")
+    def _refuse_until_wired(self) -> PortfolioConfig:
+        """The #1788 guard (T209a, T217): the engine reads none of the five until T223,
+        so a non-default value would name a book no run builds. T223 removes this."""
+        for name in (
+            "side",
+            "gross_exposure",
+            "net_exposure",
+            "short_min_price",
+            "short_cover_weight",
+        ):
+            value = getattr(self, name)
+            if value != PortfolioConfig.model_fields[name].default:
+                raise ValueError(
+                    f"portfolio.{name} = {value!r} is not wired until T223: the engine "
+                    "still builds a long-only book"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_exposures(self) -> PortfolioConfig:
+        """`net_exposure` in `[-gross, gross]`, equal to `gross_exposure` under
+        `long_only` (spec item 1). Live once T223's guard goes."""
+        if not (-self.gross_exposure <= self.net_exposure <= self.gross_exposure):
+            raise ValueError(
+                f"portfolio.net_exposure ({self.net_exposure}) must be in "
+                f"[{-self.gross_exposure}, {self.gross_exposure}]"
+            )
+        if self.side == "long_only" and self.net_exposure != self.gross_exposure:
+            raise ValueError(
+                f"portfolio.net_exposure ({self.net_exposure}) must equal "
+                f"portfolio.gross_exposure ({self.gross_exposure}) under 'long_only'"
+            )
+        return self
+
+
 # --- The family registry (ADR 0014; T128) ------------------------------------
 #
 # One table from which every per-family table derives. Each entry pins:
@@ -2483,6 +2544,9 @@ class Settings(BaseSettings):
     # #1506 (T171c): the borrow-status snapshot, after `health` for the same reason.
     borrow: BorrowConfig = Field(default_factory=BorrowConfig)
     openfigi: OpenfigiConfig = Field(default_factory=OpenfigiConfig)
+    # T219 (backtest spec amendment #1872): the signed-book section, after the other
+    # appended sections for the same reason.
+    portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)

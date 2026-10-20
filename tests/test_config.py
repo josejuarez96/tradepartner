@@ -37,6 +37,7 @@ from tradepartner.config import (
     ExecutionConfig,
     HypothesisFamily,
     PaperConfig,
+    PortfolioConfig,
     ProfitabilityConfig,
     ReferenceName,
     RiskConfig,
@@ -3022,3 +3023,80 @@ def test_momentum_family_gains_the_buffer_key_and_count() -> None:
     for other in ("oracle", "profitability", "combined"):
         assert "strategy.hold_top_fraction" not in FAMILIES[other].sweepable_keys  # type: ignore[index]
         assert "n_retained" not in FAMILIES[other].count_names  # type: ignore[index]
+
+
+# --- the `portfolio` section (T219; backtest spec amendment #1872, item 1) -------------
+
+
+def test_portfolio_defaults() -> None:
+    """The five keys load at the values the spec's Config keys list gives."""
+    for p in (_settings().portfolio, PortfolioConfig()):
+        assert p.side == "long_only"
+        assert p.gross_exposure == pytest.approx(1.0)
+        assert p.net_exposure == pytest.approx(1.0)
+        assert p.short_min_price == pytest.approx(5.0)
+        assert p.short_cover_weight == pytest.approx(0.10)
+    assert set(get_args(PortfolioConfig.model_fields["side"].annotation)) == {
+        "long_only",
+        "long_short",
+    }
+
+
+def test_portfolio_is_a_settings_section() -> None:
+    assert Settings.model_fields["portfolio"].annotation is PortfolioConfig
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"side": "long_short"},
+        {"gross_exposure": 0.5, "net_exposure": 0.5},
+        {"net_exposure": 0.5},
+        {"short_min_price": 3.0},
+        {"short_cover_weight": 0.2},
+    ],
+)
+def test_portfolio_refuses_each_non_default_until_t223(override: dict[str, object]) -> None:
+    """T219's #1788 guard: the engine reads none of the five until T223, so a non-default
+    value raises naming T223, through `PortfolioConfig` and through
+    `Settings.model_validate`, which registration goes through (T223 removes the guard)."""
+    with pytest.raises(ValidationError, match="T223"):
+        PortfolioConfig(**override)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="T223"):
+        Settings.model_validate({"portfolio": override})
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"side": "bogus"},
+        {"gross_exposure": 0.0},
+        {"gross_exposure": 1.5},
+        {"net_exposure": 2.0},
+        {"short_min_price": 0.0},
+        {"short_min_price": -1.0},
+        {"short_cover_weight": 0.0},
+        {"short_cover_weight": 1.5},
+    ],
+)
+def test_portfolio_rejects_out_of_range_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        PortfolioConfig(**override)  # type: ignore[arg-type]
+
+
+def test_portfolio_exposure_relation_is_pinned_for_t223() -> None:
+    """The guard refuses every non-default value today, so the relation
+    (`net_exposure` in `[-gross, gross]`, equal to it under `long_only`) is pinned by
+    calling the validator directly on constructed values (T223 removes the guard and the
+    relation becomes the live check)."""
+    row = {"short_min_price": 5.0, "short_cover_weight": 0.10}
+    outside = PortfolioConfig.model_construct(
+        side="long_short", gross_exposure=0.5, net_exposure=0.8, **row
+    )
+    with pytest.raises(ValueError, match="net_exposure"):
+        PortfolioConfig._validate_exposures(outside)
+    long_only = PortfolioConfig.model_construct(
+        side="long_only", gross_exposure=1.0, net_exposure=0.5, **row
+    )
+    with pytest.raises(ValueError, match="long_only"):
+        PortfolioConfig._validate_exposures(long_only)

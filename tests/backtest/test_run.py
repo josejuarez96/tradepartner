@@ -760,6 +760,7 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
                 "master.chain_max_price_ratio",
                 "adjust.apply_spin_offs",
                 "strategy.hold_top_fraction",
+                "portfolio.",
             )
         )
     }
@@ -875,6 +876,7 @@ def _register_more(
             "master.chain_max_price_ratio",
             "adjust.apply_spin_offs",
             "strategy.hold_top_fraction",
+            "portfolio.",
         )
         params = {k: v for k, v in params.items() if not k.startswith(later)}
     with open_for_write(_store(path)) as conn:

@@ -1,7 +1,9 @@
 """Portfolio construction and trades (backtest spec reqs 3 and 4).
 
 Pure functions over plain mappings keyed by `security_id`. Long-only: every weight is
-non-negative, weights sum to at most 1, and the remainder is cash.
+non-negative, weights sum to at most 1, and the remainder is cash. A signed book
+(`portfolio.side = "long_short"`, spec amendment #1872) builds through
+`signed_target_weights`.
 """
 
 from __future__ import annotations
@@ -65,6 +67,59 @@ def target_weights(
     selected = ranked[: _selected_count(len(ranked), top_fraction)]
     weight = _equal_weight(len(selected))
     return {sid: weight for sid in sorted(selected)}
+
+
+def signed_target_weights(
+    scores: Mapping[str, float],
+    top_fraction: float,
+    gross: float,
+    net: float,
+    eligible: Collection[str],
+) -> dict[str, float]:
+    """Signed target weights for a long/short book (backtest spec amendment #1872,
+    item 2).
+
+    `ranked` is the scored names by score descending, ties by `security_id` ascending, as
+    `target_weights` ranks them. The **long leg** is the top `k_L` ranked names, `k_L`
+    the count `top_fraction` selects from them, each at `(gross + net) / 2 / k_L`. The
+    **short leg** is chosen after it: `k_S` is the count `top_fraction` selects from the
+    eligible names (`eligible`, the names that pass item 3's price proxy), and the leg is
+    the `k_S` lowest-scored eligible names not in the long leg, each at
+    `-(gross - net) / 2 / k_S`. An ineligible low scorer is skipped and the next-lowest
+    eligible name takes its place; a name is never in both legs; when fewer than `k_S`
+    eligible names remain outside the long leg, the short leg takes those that remain and
+    `k_S` is that count. The legs are disjoint, Σ |w| = `gross` and Σ w = `net`, and the
+    result is ordered by `security_id`.
+
+    When `gross == net` the short leg carries no weight: this is the `long_only` book
+    (spec item 1 makes `net_exposure` equal `gross_exposure` there), and the result is
+    `target_weights`' output exactly. Raises `ValueError` for a `top_fraction` outside
+    `(0, 1]` or a non-finite score, `gross` or `net`.
+    """
+    if not (0 < top_fraction <= 1):
+        raise ValueError(f"top_fraction must be in (0, 1], got {top_fraction}")
+    for sid, score in scores.items():
+        if not math.isfinite(score):
+            raise ValueError(f"score for {sid} must be finite, got {score}")
+    for name, value in (("gross", gross), ("net", net)):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite, got {value}")
+    if gross == net:
+        return target_weights(scores, top_fraction, "equal")
+    if not scores:
+        return {}
+    ranked = sorted(scores, key=lambda sid: (-scores[sid], sid))
+    long_leg = ranked[: _selected_count(len(ranked), top_fraction)]
+    in_long = set(long_leg)
+    eligible_set = set(eligible)
+    eligible_ranked = [sid for sid in ranked if sid in eligible_set]
+    k_short = _selected_count(len(eligible_ranked), top_fraction)
+    short_leg = [sid for sid in reversed(eligible_ranked) if sid not in in_long][:k_short]
+    targets = {sid: (gross + net) / 2 / len(long_leg) for sid in long_leg}
+    if short_leg:
+        short_weight = -(gross - net) / 2 / len(short_leg)
+        targets.update({sid: short_weight for sid in short_leg})
+    return {sid: targets[sid] for sid in sorted(targets)}
 
 
 def buffered_targets(
