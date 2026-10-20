@@ -720,6 +720,19 @@ class TestSpinOffs:
             call.method for call in off_provider.calls
         }
 
+    def test_a_mixed_opt_in_read_group_is_refused(self) -> None:
+        """One provider holds one frozen `Settings`, so its `adjust.apply_spin_offs`
+        decides the group's frames while each variant's own decides its counts: a group
+        mixing the flag would count spin-offs no read served (item 3)."""
+        variants = [
+            (self._params(on=True), _handle()),
+            (self._params(on=False), _handle(2)),
+        ]
+        provider = self._provider()
+        with pytest.raises(ValueError, match="apply_spin_offs"):
+            engine.run_many(variants, provider, T0, T3, (0.0,), family="momentum")
+        assert provider.calls == []
+
     def test_a_valued_spin_off_equals_the_dividend_in_kind(self) -> None:
         """The store's `spinoff` frame equals its dividend of r x C to 1e-12, and the
         engine's equity over each is equal: a valued row (no unvalued or late listing)

@@ -1267,6 +1267,15 @@ def _check_variants(
     cadences = {params.schedule.rebalance_cadence for params, _ in variants}
     if len(cadences) != 1:
         raise ValueError(f"a read group runs at one cadence, got {sorted(cadences)}")
+    # One provider holds one frozen Settings, so its `adjust.apply_spin_offs` decides the
+    # group's frames while each variant's own decides its counts (#1894, item 3): a mixed
+    # group would count spin-offs it never read, so it is refused before any read.
+    spin_offs = {params.adjust.apply_spin_offs for params, _ in variants}
+    if len(spin_offs) != 1:
+        raise ValueError(
+            "a read group reads one provider: every variant needs the same "
+            f"adjust.apply_spin_offs, got {sorted(spin_offs)}"
+        )
     return levels
 
 
