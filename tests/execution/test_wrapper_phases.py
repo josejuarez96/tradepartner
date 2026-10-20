@@ -16,6 +16,7 @@ from decimal import ROUND_DOWN, Decimal
 from typing import Any, Protocol
 
 import duckdb
+import polars as pl
 import pytest
 
 from tradepartner import calendar
@@ -32,6 +33,7 @@ from tradepartner.errors import (
 )
 from tradepartner.execution import switch, wrapper
 from tradepartner.execution.alerts import Alerter
+from tradepartner.execution.collect import PriceBand
 from tradepartner.execution.plan import State
 from tradepartner.execution.wrapper import BatchOutcome, RiskGatedBroker
 from tradepartner.store.db import insert_row, open_for_write
@@ -340,6 +342,54 @@ def _execute(
     exits: tuple[DecisionRow, ...] = (),
 ) -> BatchOutcome:
     return gate.execute(env.run, decisions, exits)
+
+
+def test_wrapper_collection_notes_a_fill_without_a_reference(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """A wrapper-journaled fill with no readable reference reaches the run notes."""
+    decision = _decision(env, A, "buy", notional=100.0)
+    coid = "fx-unjudged-buy"
+    placed = env.fake.submit(OrderRequest(coid, SYMBOLS[A], Side.BUY, quantity=1.0))
+    assert decision.decision_id is not None
+    assert env.run.run_id is not None
+    order = OrderRow(
+        client_order_id=coid,
+        decision_id=decision.decision_id,
+        run_id=env.run.run_id,
+        session=S,
+        attempt=1,
+        phase="buy",
+        security_id=A,
+        symbol=SYMBOLS[A],
+        side="buy",
+        quantity=1.0,
+        sells_in_flight_at_submit=False,
+        known_at=env.run.started_at,
+        ingested_at=env.run.started_at,
+    )
+    _append(
+        env.settings,
+        order,
+        OrderEventRow(
+            client_order_id=coid,
+            status="pending",
+            known_at=env.run.started_at,
+            ingested_at=env.run.started_at,
+        ),
+        OrderEventRow(
+            client_order_id=coid,
+            status="accepted",
+            broker_order_id=placed.broker_order_id,
+            known_at=env.run.started_at,
+            ingested_at=env.run.started_at,
+        ),
+    )
+    env.fake.simulate_fill(coid)
+    band = PriceBand({}.__getitem__, pl.DataFrame(), S, 0.25)
+    notes: list[str] = []
+    _gate(env, alerter_conn)._collect(env.run, [order], price_band=band, notes=notes)
+    assert notes == [f"fill-price band: no reference price for {coid}"]
 
 
 # --- the reference price ---------------------------------------------------------------
