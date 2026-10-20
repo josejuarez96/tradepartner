@@ -1345,6 +1345,8 @@ def test_health_lists_equal_amount_dividends_and_warns_on_pending(
     checked = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
     assert checked.exit_code == 0, checked.output  # pending is a warning, not a failure
     assert "warning: 1 listed duplicate dividend keys are pending repair" in checked.output
+    assert checked.output.rstrip().endswith("health: 0 failures, 1 warnings")
+    assert "duplicate_dividends: pass (1 pending repair)" in checked.output
 
 
 def test_health_does_not_warn_when_the_last_edgar_run_quarantined_nothing(
