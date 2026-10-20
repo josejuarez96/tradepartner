@@ -25,7 +25,7 @@ from backtest.fake_provider import FakeProvider
 from tradepartner.backtest import engine
 from tradepartner.backtest.engine import BacktestResult, Plan, run
 from tradepartner.backtest.provider import GapReading
-from tradepartner.backtest.schedule import fill_session
+from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.calendar import all_sessions, previous_session, session_close
 from tradepartner.config import PortfolioConfig, Settings
 from tradepartner.store import delistings
@@ -381,6 +381,57 @@ def test_the_borrow_fee_over_a_weekend_is_three_days(monkeypatch: pytest.MonkeyP
     assert cash[date(2024, 3, 1)] - cash[monday] == pytest.approx(
         3 * (cash[monday] - cash[tuesday])
     )
+
+
+def test_the_carry_window_to_the_fill_is_charged_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The plan-to-fill session (T_i, F_i] is charged on the positions held at close(T_i),
+    so a monthly book is not one session short each rebalance and a daily book is not free
+    (its fill session is the step's own end)."""
+    _install_plan(monkeypatch, {T0: {SEC: -0.5}, T1: {SEC: 0.0}})
+    provider = _provider(_bars({SEC: [(HISTORY_START, 100.0)]}))
+    settings = _signed(costs={"per_side_bps": 0.0, "borrow_bps_per_year": BORROW_BPS})
+    result = run(settings, provider, T0, T2, test_engine._handle(), [0.0], family="momentum")[0.0]
+    cash = _cash(result)
+    short = abs(_value(result, SEC, T1))
+    # T1 -> F1 covers the short; the carried close(T1) value is charged one day first.
+    assert cash[T1] - cash[F1] == pytest.approx(short + short * BORROW_BPS / 1e4 / 360, abs=1e-9)
+    assert cash[T1] - cash[F1] > short
+
+
+def test_a_daily_signed_book_pays_the_borrow_fee_each_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    days = rebalance_sessions(date(2024, 3, 1), date(2024, 3, 7), "daily")
+    cover = days[-1]
+    targets = {session: {SEC: -0.5} for session in days[:-1]}
+    targets[days[-2]] = {SEC: 0.0}  # the plan whose fill (the last session) covers
+    _install_plan(monkeypatch, targets)
+    provider = _provider(_bars({SEC: [(HISTORY_START, 100.0)]}))
+    settings = _signed(
+        schedule={"rebalance_cadence": "daily"},
+        costs={"per_side_bps": 0.0, "borrow_bps_per_year": BORROW_BPS},
+    )
+    result = run(
+        settings, provider, days[0], cover, test_engine._handle(), [0.0], family="momentum"
+    )[0.0]
+    cash = _cash(result)
+    previous = previous_session(cover)
+    short = abs(_value(result, SEC, previous))
+    # The final cover pays one day's fee on the previous close's short before it fills.
+    assert cash[previous] - cash[cover] == pytest.approx(
+        short + short * BORROW_BPS / 1e4 / 360, abs=1e-9
+    )
+    # And the days before it are charged too: a zero-borrow twin, everything else equal,
+    # ends strictly richer (pre-fix the two runs were byte-identical at a daily cadence).
+    free_provider = _provider(_bars({SEC: [(HISTORY_START, 100.0)]}))
+    free = run(
+        _signed(schedule={"rebalance_cadence": "daily"}, costs={"per_side_bps": 0.0}),
+        free_provider,
+        days[0],
+        cover,
+        test_engine._handle(),
+        [0.0],
+        family="momentum",
+    )[0.0]
+    assert _equity(result)[cover] < _equity(free)[cover]
 
 
 # --- the free-cash accrual (item 6, "no rebate") --------------------------------------

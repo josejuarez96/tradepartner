@@ -66,11 +66,12 @@ plan T222): the same loop carries signed dollar values. Under `long_short` `_ste
 the positions with `value_positions(signed=True)`, trades with `apply_trades(signed=True)`
 (the long buys capped by free cash, cash minus the short magnitudes), and keeps a
 zero-excluded position set, so a short is a negative value; a short holding is recorded
-in `held_on` too, so the dividend counts see it. At every session after the fill the book
-pays the borrow fee (`costs.borrow_bps_per_year`, calendar days over a 360-day year, on
-the previous close's short values) and, under `cash_rate = "store"`, accrues `rf(s)` on
-free cash only (the short proceeds earn nothing). A session whose equity is not positive
-raises `ValueError` naming the session (a `failed` trial), never a silent ruin. `_exits`
+in `held_on` too, so the dividend counts see it. At every session after the plan's read the
+book pays the borrow fee (`costs.borrow_bps_per_year`, calendar days over a 360-day year,
+on the previous close's short values, the carry window from the plan to the fill
+included) and, under `cash_rate = "store"`, accrues `rf(s)` on free cash only (the short
+proceeds earn nothing). A session whose equity is not positive raises `ValueError` naming
+the session (a `failed` trial), never a silent ruin. `_exits`
 covers a delisted short at its last close and a stale one at its last bar's close like a
 long, and its cost is a magnitude, so the sign only decides which way cash moves. Under
 `long_only` (`side` at its default) no new branch is taken and every pinned run is
@@ -538,6 +539,11 @@ def _short_value(positions: Mapping[str, float]) -> float:
     return math.fsum(-value for value in positions.values() if value < 0)
 
 
+def _shorts(positions: Mapping[str, float]) -> dict[str, float]:
+    """The short positions (negative values) of a signed book, keyed by security."""
+    return {sid: value for sid, value in positions.items() if value < 0}
+
+
 def _shorts_by_session(values: pl.DataFrame) -> dict[date, dict[str, float]]:
     """Each session's short positions (negative values), keyed by security.
 
@@ -779,9 +785,10 @@ def _step(
 
     Under `portfolio.side = "long_short"` the book is signed (spec amendment #1872, items
     4 to 6): the same carries, fills and marks take `signed=True`, a short is a negative
-    value kept in the position set and in `held_on`, every session after the fill pays
-    the borrow fee and accrues `rf(s)` on free cash only, and an equity that is not
-    positive ends the run with a `ValueError` naming the session."""
+    value kept in the position set and in `held_on`, every session after the plan's read
+    pays the borrow fee (the carry window to the fill included) and accrues `rf(s)` on
+    free cash only, and an equity that is not positive ends the run with a `ValueError`
+    naming the session."""
     signed = params.portfolio.side == "long_short"
     fill_price = params.execution.fill_price
     carried = carry_to_fill(
@@ -802,6 +809,18 @@ def _step(
         else:
             for session in _sessions(plan.session, plan.fill_session)[1:]:
                 held_cash *= 1 + accruals[session]
+    borrow_bps = params.costs.borrow_bps_per_year
+    if signed and borrow_bps > 0:
+        # The carry window (T_i, F_i] is charged too, on the positions held at
+        # close(T_i) (`book.positions`): the short pays for every session it is held, so
+        # a daily book (whose fill session is the step's end) is not charged nothing, and
+        # a monthly book is not charged from the fill only and missing one session each
+        # rebalance. The post-fill loop then charges from the fill on (item 6).
+        carried_shorts = _shorts(book.positions)
+        for session in _sessions(plan.session, plan.fill_session)[1:]:
+            held_cash -= borrow_fee(
+                carried_shorts, borrow_bps, (session - previous_session(session)).days
+            )
     targets, aside = _book_targets(book, plan, index, carried, held_cash, construction)
     adv = (
         adv_by_security(raw, plan.session, params.costs.adv_sessions)
@@ -833,7 +852,6 @@ def _step(
     values = _book_exits(values, exits)
     totals = dict(values.group_by("session").agg(pl.col("value").sum()).iter_rows())
     shorts = _shorts_by_session(values) if signed else {}
-    borrow_bps = params.costs.borrow_bps_per_year
     cash = fill.cash
     for session in _sessions(plan.fill_session, end):
         if session > plan.fill_session:
