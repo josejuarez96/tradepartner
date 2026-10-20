@@ -179,7 +179,10 @@ class Disposal:
 @dataclass(frozen=True)
 class WashSaleFlag:
     """One replacement lot matched to one loss disposal, the
-    `wash_sale_flags` row without `scanned_at` and its journal timestamps."""
+    `wash_sale_flags` row without `scanned_at` and its journal timestamps.
+    `matched_quantity` is in today's share units (the replacement lot's), so a
+    split or stock merger between the sale and the lot never leaves it mixed
+    (#1980)."""
 
     flag_id: int
     disposal_id: int
@@ -478,11 +481,10 @@ class _Ledger:
     def merge(self, removal: AdjustmentRow, receipt: AdjustmentRow) -> None:
         """A stock merger (spec amendment #1762 item 5): the target's lots
         become acquirer lots at the ratio of the two quantities, basis and
-        acquisition instant carried, with no disposal. Every lot of the target
-        moves into the acquirer's share units and identities, so a later
-        acquirer split scales it too (#1980); only the lots still open take the
-        acquirer's symbol and CUSIP, so a sale before the merger still
-        reconciles against the target's."""
+        acquisition instant carried, with no disposal. Every lot still open
+        becomes an acquirer lot; a lot already fully sold keeps the target's
+        symbol and CUSIP so its own sale still reconciles, but moves into the
+        acquirer's share units so a later acquirer split scales it (#1980)."""
         target, acquirer = _security(removal), _security(receipt)
         self.refuse_short(target, removal.kind)
         self.refuse_short(acquirer, receipt.kind)
@@ -507,12 +509,12 @@ class _Ledger:
             if lot.unit_security != target or lot.position_side != LONG:
                 continue
             lot.unit_security = acquirer
-            lot.identities.add(acquirer)
             lot.quantity *= ratio
             lot.acquired *= ratio
         for lot in held:
             lot.security_id, lot.symbol = acquirer, symbol
             lot.cusip = None if asset is None else asset.cusip
+            lot.identities.add(acquirer)
         self._rekey_disposals(target, acquirer, ratio)
         merged = self.longs.setdefault(acquirer, [])
         merged.extend(held)

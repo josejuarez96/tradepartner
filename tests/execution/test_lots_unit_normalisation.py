@@ -116,10 +116,11 @@ def test_a_merger_scales_a_lot_sold_before_it_and_keeps_the_target_symbol() -> N
       03-04 sell 10 SEC_T @ 20  closes lot 1 whole: proceeds 200, pnl -100
       03-05 buy  5 SEC_T @ 20   lot 2: basis 100 (open at the merger)
       03-07 merger 5 SEC_T -> 2.5 SEC_A at 0.5
-      03-10 2:1 split on SEC_A
+      03-10 3:1 split on SEC_A
 
-    Lot 1 keeps SEC_T / TGT but its acquired quantity is 10 x 0.5 x 2 = 10 (both
-    events scale it); lot 2 becomes SEC_A / ACQ with 5 x 0.5 x 2 = 5 shares.
+    Lot 1 keeps SEC_T / TGT but its acquired quantity is 10 x 0.5 x 3 = 15 (both
+    events scale it); lot 2 becomes SEC_A / ACQ with 5 x 0.5 x 3 = 7.5 shares.
+    A split whose ratio cancels the merger's would not tell the two apart.
     """
     book = Book()
     book.trade("buy", 10, 30.0, D0303, security_id="SEC_T")
@@ -127,9 +128,39 @@ def test_a_merger_scales_a_lot_sold_before_it_and_keeps_the_target_symbol() -> N
     book.trade("buy", 5, 20.0, D0305, security_id="SEC_T")
     _merge(book, D0307, 5.0, 2.5)
 
-    lot_list, _, _ = book.run(D0312, _splits(("SEC_A", D0310, 2.0)))
+    lot_list, _, _ = book.run(D0312, _splits(("SEC_A", D0310, 3.0)))
 
     assert [(lot.lot_id, lot.security_id, lot.symbol, lot.quantity) for lot in lot_list] == [
-        (1, "SEC_T", "TGT", 10.0),
-        (2, "SEC_A", "ACQ", 5.0),
+        (1, "SEC_T", "TGT", 15.0),
+        (2, "SEC_A", "ACQ", 7.5),
+    ]
+
+
+def test_a_lot_sold_before_a_merger_is_not_an_acquirer_replacement() -> None:
+    """A lot fully sold before a merger is not held into the acquirer, so it is
+    not a replacement for a later acquirer loss; only a target lot still open at
+    the merger is. Hand values:
+
+      03-03 buy 5 SEC_T @ 30   lot 1: basis 150
+      03-03 buy 5 SEC_T @ 30   lot 2: basis 150
+      03-04 sell 5 SEC_T @ 40  closes lot 1: proceeds 200, pnl +50 (a gain)
+      03-05 buy 5 SEC_A @ 40   lot 3: basis 200
+      03-05 sell 5 SEC_A @ 30  closes lot 3: proceeds 150, pnl -50 (loss)
+      03-07 merger 5 SEC_T -> 2.5 SEC_A at 0.5 (only lot 2 is open)
+
+    The acquirer loss is replaced by lot 2 (2.5 acquirer shares, 25 disallowed),
+    not by lot 1, sold the day before the merger.
+    """
+    book = Book()
+    book.trade("buy", 5, 30.0, D0303, security_id="SEC_T")
+    book.trade("buy", 5, 30.0, D0303, security_id="SEC_T")
+    book.trade("sell", 5, 40.0, D0304, security_id="SEC_T")
+    book.trade("buy", 5, 40.0, D0305, security_id="SEC_A")
+    book.trade("sell", 5, 30.0, D0305, security_id="SEC_A")
+    _merge(book, D0307, 5.0, 2.5)
+
+    _, _, flags = book.run(D0312)
+
+    assert [(f.replacement_lot_id, f.matched_quantity, f.disallowed_amount) for f in flags] == [
+        (2, 2.5, 25.0)
     ]
