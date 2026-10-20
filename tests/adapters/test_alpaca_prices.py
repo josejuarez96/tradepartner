@@ -22,6 +22,7 @@ import pytest
 
 from tradepartner.adapters.alpaca_prices import (
     AlpacaPriceSource,
+    ChainWindow,
     ListingResolver,
     RegistrantEvidence,
     TickerSpan,
@@ -4848,3 +4849,70 @@ class TestARenameNeverCostsItsOwnSessions:
         assert resolver.report.symbol_changes_followed == 1
         assert resolver.report.symbol_changes_refused == 0
         assert resolver.resolve("ALIT", date(2021, 12, 1)) == self.ALIGHT
+
+
+class TestSuccessorChains:
+    """Rule 9 (#821, plan T187b): a chained successor's first span under the
+    predecessor's ticker starts on the predecessor's span end."""
+
+    _PRE = "0000000001"
+    _POST = "0000000002"
+
+    def _listings(self) -> list[dict[str, object]]:
+        return [
+            _listing(self._PRE, "CHNA", date(2019, 1, 8)),
+            _listing(self._POST, "CHNA", date(2020, 2, 4)),
+        ]
+
+    @staticmethod
+    def _last_bar(security_id: str, start: date, before: date) -> date | None:
+        # The predecessor's last bar before the successor's listing row (2020-02-04);
+        # rule 8 cuts its span to the next session (2020-01-06).
+        return date(2020, 1, 3) if security_id == TestSuccessorChains._PRE else None
+
+    def test_with_the_chain_the_successor_gets_the_hole_sessions(self) -> None:
+        resolver = ListingResolver(
+            self._listings(),
+            last_bar=self._last_bar,
+            handover_sessions=5,
+            chains=((self._PRE, self._POST),),
+        )
+        # Rule 8 cut the predecessor at 2020-01-06; rule 9 starts the successor there.
+        assert resolver.resolve("CHNA", date(2020, 1, 3)) == self._PRE
+        assert resolver.resolve("CHNA", date(2020, 1, 6)) == self._POST
+        assert resolver.resolve("CHNA", date(2020, 2, 3)) == self._POST
+        assert resolver.chain_windows(self._POST) == (
+            ChainWindow(self._POST, "CHNA", date(2020, 1, 6), date(2020, 2, 4)),
+        )
+        assert resolver.report.chain_early_starts == 1
+        assert "1 chained spans started early" in resolver.report.summary()
+
+    def test_without_the_chain_the_hole_resolves_to_nobody(self) -> None:
+        resolver = ListingResolver(self._listings(), last_bar=self._last_bar, handover_sessions=5)
+        assert resolver.resolve("CHNA", date(2020, 1, 6)) is None
+        assert resolver.resolve("CHNA", date(2020, 2, 3)) is None
+        assert resolver.chain_windows(self._POST) == ()
+        assert resolver.report.chain_early_starts == 0
+
+    def test_a_predecessor_that_runs_to_the_successors_row_moves_nothing(self) -> None:
+        # The predecessor's span end (its last bar's next session, 2019-01-08) is not
+        # earlier than the successor's first listing row, so rule 9 has no hole to give.
+        resolver = ListingResolver(
+            [
+                _listing(self._PRE, "CHNA", date(2019, 1, 8)),
+                _listing(self._POST, "CHNA", date(2019, 1, 8)),
+            ],
+            last_bar=lambda sid, start, before: date(2019, 1, 7) if sid == self._PRE else None,
+            handover_sessions=5,
+            chains=((self._PRE, self._POST),),
+        )
+        assert resolver.report.chain_early_starts == 0
+
+    def test_accepted_relistings_names_a_predecessor_rekeyed_to_its_successor(self) -> None:
+        resolver = ListingResolver(
+            self._listings(),
+            accepted_relistings=[self._PRE],
+            chains=((self._PRE, self._POST),),
+        )
+        assert self._POST in resolver._accepted
+        assert self._PRE not in resolver._accepted

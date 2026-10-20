@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 import polars as pl
@@ -1259,9 +1259,12 @@ def test_the_twin_pin_fails_if_the_screen_reads_or_runs_at_the_default(
     assert _run_digest(results[0.0]) != TWIN_RUN_DIGESTS[0.0]
 
 
-#: The provider methods the twin's run calls: no turnover read.
+#: The provider methods the twin's run calls: no turnover read. `chains` (#821,
+#: T187b) is the engine's once-per-step live successor-chain read; it is empty on
+#: the fake and changes no run digest, only the call log.
 TWIN_CALL_METHODS = {
     "universe",
+    "chains",
     "adjusted_prices",
     "raw_prices",
     "static_listing_count",
@@ -1271,8 +1274,8 @@ TWIN_CALL_METHODS = {
     "dropped_dividends",
     "late_dividends",
 }
-TWIN_N_CALLS = 37
-TWIN_CALL_LOG_SHA256 = "0ddf16574afb66249b0115c32bdd659dddb9259ed87abf2bf2c2500d6d003665"
+TWIN_N_CALLS = 41
+TWIN_CALL_LOG_SHA256 = "84941e2098cbff6122a610b8b2a0b2b63f13a7a8c6a23378fb25116ac867f25a"
 #: Per cost level: a SHA-256 over the equity, rebalance (counts included), weight and
 #: target rows, floats rounded to nine places.
 TWIN_RUN_DIGESTS = {
@@ -1287,3 +1290,72 @@ TWIN_FINAL_EQUITY = {
     60.0: 113295.2130230013,
     100.0: 111947.28992016679,
 }
+
+
+class TestSuccessorChains:
+    """The engine's rename of a chained predecessor (#821, plan T187b)."""
+
+    def _variant(self) -> engine._Variant:
+        from tradepartner.backtest.provider import GapReading
+
+        variant = engine._Variant(settings=_params(), handle=_handle())
+        variant.plan = engine.Plan(
+            session=T0,
+            fill_session=T1,
+            targets={"PRE": 1.0},
+            n_universe=1,
+            n_static_listings=0,
+            n_excluded_no_history=0,
+            gap=GapReading(count_share=0.0, size_share=0.0),
+            members=("PRE",),
+            scores={"PRE": 1.0},
+            excluded_no_history=(),
+        )
+        variant.books = [engine._Book(level=0.0, cash=0.0)]
+        book = variant.books[0]
+        book.positions = {"PRE": 1234.0}
+        book.marked_at = {"PRE": T0}
+        book.held_since = {"PRE": T0}
+        book.entries = {"PRE": 1}
+        book.held_on = {"PRE": {T0}}
+        variant.last_stitched = {"PRE": T0}
+        variant.targets = {T1: {"PRE": 1.0}}
+        return variant
+
+    def test_a_held_predecessor_is_renamed_to_its_successor(self) -> None:
+        variant = self._variant()
+        engine._rename_chained(variant, (("PRE", "POST"),))
+        book = variant.books[0]
+        assert book.positions == {"POST": 1234.0}  # one share for one share
+        assert book.marked_at == {"POST": T0}
+        assert book.held_since == {"POST": T0}
+        assert book.entries == {"POST": 1}
+        assert book.held_on == {"POST": {T0}}
+        assert variant.plan is not None and variant.plan.targets == {"POST": 1.0}
+        assert variant.targets == {T1: {"POST": 1.0}}
+        assert variant.last_stitched == {"POST": T0}
+        assert book.chained_positions == 1
+
+    def test_the_count_lands_on_the_rebalance_row_then_resets(self) -> None:
+        variant = self._variant()
+        book = variant.books[0]
+        engine._rename_chained(variant, (("PRE", "POST"),))
+        plan = cast(engine.Plan, variant.plan)
+        counts = engine._rebalance_counts(plan, book)
+        assert counts["n_chained_positions"] == 1
+        assert book.chained_positions == 0
+        # A step with no chain writes the plan's counts unchanged (no extra row).
+        assert engine._rebalance_counts(plan, book) is plan.counts
+
+    def test_the_map_is_idempotent(self) -> None:
+        variant = self._variant()
+        engine._rename_chained(variant, (("PRE", "POST"),))
+        engine._rename_chained(variant, (("PRE", "POST"),))
+        assert variant.books[0].positions == {"POST": 1234.0}
+        assert variant.books[0].chained_positions == 1  # not counted twice
+
+    def test_a_collision_sums_the_values(self) -> None:
+        variant = self._variant()
+        variant.books[0].positions = {"PRE": 100.0, "POST": 25.0}
+        engine._rename_chained(variant, (("PRE", "POST"),))
+        assert variant.books[0].positions == {"POST": 125.0}

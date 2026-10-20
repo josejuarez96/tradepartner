@@ -110,6 +110,7 @@ from tradepartner.store.asof import (
     facts_as_of,
     listings_as_of,
     live_actions_as_of,
+    live_chains,
     symbol_changes_as_of,
 )
 from tradepartner.store.db import open_for_write, utc_now
@@ -141,9 +142,11 @@ def store_resolver(
     ends known then (#793) and `at`'s day as the run's day, and
     `alpaca.rename_lead_days` (#843) and `alpaca.accepted_relistings`
     (#943); while `alpaca.first_span_lead` is on (#974), each security's
-    first session (`first_sessions`); and the `symbol_changes` known at
+    first session (`first_sessions`); the `symbol_changes` known at
     `at` (#1696, `symbol_changes_as_of`), followed where the listings lag
-    them."""
+    them; and the live successor chains known at `at` (#821, T187b,
+    `asof.live_chains`), whose rule 9 gives a successor the sessions between
+    its predecessor's span end and its first listing row."""
     at = ensure_tz_aware_utc(at, field_name="at")
     evidence = registrant_evidence(
         facts_as_of(conn, at).iter_rows(named=True),
@@ -165,6 +168,7 @@ def store_resolver(
         last_bar=functools.partial(last_bar, conn, at),
         handover_sessions=settings.master.transfer_window_sessions,
         symbol_changes=_symbol_changes(conn, at),
+        chains=live_chains(conn, at),
     )
 
 
@@ -255,6 +259,20 @@ def misattributed(
 
 
 @dataclass(frozen=True)
+class ChainLine:
+    """A live successor chain the run applied (#821, plan T187b): the
+    predecessor, its successor, and the continuation ratio of the successor's
+    first close to the predecessor's last close (the hand-over's one-share-for-
+    one-share ratio; `None` when either has no bar known at the run). The dry
+    run lists it so the owner sees why the pair's hole bars are no longer
+    proposed for deletion."""
+
+    predecessor_id: str
+    successor_id: str
+    ratio: float | None
+
+
+@dataclass(frozen=True)
 class RepairResult:
     """What `repair_resolution` found and, unless `dry_run`, deleted."""
 
@@ -263,6 +281,7 @@ class RepairResult:
     action_keys_checked: int
     dry_run: bool
     unjudged_symbol_changes: int = 0
+    chains: tuple[ChainLine, ...] = ()
 
     @property
     def bar_rows(self) -> int:
@@ -306,7 +325,34 @@ class RepairResult:
             days = bars.get(sid, [])
             span = f" {min(days)}..{max(days)}" if days else ""
             out.append(f"  {sid}: {rows[sid]} bar rows{span}, {actions[sid]} action rows")
+        for chain in self.chains:
+            ratio = "-" if chain.ratio is None else f"{chain.ratio:.4f}"
+            out.append(
+                f"  chain {chain.predecessor_id}->{chain.successor_id}: "
+                f"ratio {ratio} (the successor continues the predecessor)"
+            )
         return out
+
+
+def _chain_lines(conn: duckdb.DuckDBPyConnection, at: datetime) -> tuple[ChainLine, ...]:
+    """The live successor chains known at `at` and their hand-over ratio (#821,
+    T187b): the successor's first close over the predecessor's last close, read
+    from `prices_daily` known at `at` (`None` when either has no bar)."""
+    lines = []
+    for predecessor, successor in live_chains(conn, at):
+
+        def edge(security_id: str, order: str) -> float | None:
+            row = conn.execute(
+                f"SELECT close FROM prices_daily WHERE security_id = ? AND known_at <= ? "
+                f"ORDER BY session {order} LIMIT 1",
+                [security_id, at],
+            ).fetchone()
+            return None if row is None else float(row[0])
+
+        first, last = edge(successor, "ASC"), edge(predecessor, "DESC")
+        ratio = None if first is None or not last else first / last
+        lines.append(ChainLine(predecessor, successor, ratio))
+    return tuple(lines)
 
 
 class RepairRefused(ValueError):
@@ -468,6 +514,7 @@ def repair_resolution(
             action_keys_checked=actions.seen + len(spin_rows),
             dry_run=dry_run,
             unjudged_symbol_changes=unjudged,
+            chains=_chain_lines(conn, started),
         )
         if not dry_run:
             if (result.bar_rows, result.action_rows) != expect:
