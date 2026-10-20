@@ -1,6 +1,6 @@
 # Long/short spike: H1's momentum ranking as a 50/50 book is killed (T218)
 
-**Date:** 2026-10-20  ·  **Issue:** #1876 (run result), #2013 (this report)  ·  **Status:** COMPLETE  ·  **Kind:** a registered exploratory `return` run, one run, two configurations  ·  **Experiment:** [long-short-spike](../experiments/long-short-spike.md) (backtest plan T218)
+**Date:** 2026-10-20  ·  **Issue:** #1876 (run result), #2013 (this report)  ·  **Status:** PARTIAL (the kill verdict and the recorded primary, leg and red-flag numbers are complete; the secondary values and three red flags are unread, see Open items)  ·  **Kind:** a registered exploratory `return` run, one run, two configurations  ·  **Experiment:** [long-short-spike](../experiments/long-short-spike.md) (backtest plan T218)
 
 ## Answer
 
@@ -36,9 +36,9 @@ Every number below is the recorded result (the orchestrator's comment on #1876, 
 | Book CAGR at 30 bp borrow (`book_cagr_b30`) | -3.0% a year |
 | Book volatility at 30 bp (`book_vol_b30`) | 11.8% a year |
 
-Reading it: a short leg that returns +8.6% a year gross costs the book that much, so the stock-picked short half lost money on this window. The bottom decile of a 12-1 momentum ranking, in a top-1,000 universe from late 2020 to the end of 2023, rose faster than the top decile. That is the size-tilt and junk-rally pattern the experiment file expected to check against the equal-weighted universe. The gross spread (-4.02) is already negative before any cost; trading and borrow take it to -6.82. The CAGRs are geometric, the spread is an arithmetic mean scaled to the 50/50 book, so the leg figures do not subtract to the spread.
+Reading it: on this window the bottom-decile short leg returned more (+8.6% a year gross) than the top-decile long leg (+6.8%), so the short half lost money and the gross spread (-4.02) is already negative before any cost. Trading and borrow take it to -6.82. The spread is the full long-minus-short figure (2 x (book - 0.5 x T-bill), before cash interest); the leg CAGRs are geometric and the book holds each leg at half of equity, so the leg figures do not subtract to the spread. No explanation of why the short leg rose is offered: the comparison with the equal-weighted universe was not recorded.
 
-The secondary values not quoted here (the b = 0 and b = 300 lines, the SPY-hedged control, the short leg against the equal-weighted universe, the worst short month, the drift-cover counts, the delisted-short count, the book minus hedged control) are in the artifact above. They were not copied into this report, and the B12 park-rule readout and the control comparison are therefore not stated here. They are for the record only; the kill rule does not read them.
+The secondary values are in the artifact and were not copied into this report: the b = 0 and b = 300 lines, the book's excess over T-bills, the SPY-hedged control and the book minus hedged control, the short leg against the equal-weighted universe, the worst short month, `max_short_weight` and the cover count, and `n_delisted_short`. The plan's report list asks for them, so this report is partial until they are posted from the artifact (Open items). The kill rule does not read them.
 
 ## Red flags (the experiment file's list)
 
@@ -51,7 +51,7 @@ The secondary values not quoted here (the b = 0 and b = 300 lines, the SPY-hedge
 | `meta.rf_source` | must read `store` | `store` | yes |
 | `meta.max_read_t` | not after close(2023-12-29) | 2023-12-29 21:00 UTC | yes (see below) |
 
-The experiment file and the owner sheet said "not after 20:00 UTC". 21:00 UTC is the 16:00 close on 2023-12-29, which is in EST (UTC-5); 20:00 UTC assumed EDT. The read is at the close, not after it. A `floor_replaced_share` of exactly 0.0 means the $5 floor replaced no name in any month, which fits a top-1,000 universe whose own rule already removes sub-$5 names (ADR 0006). The remaining flags in the file (`max_short_weight`, `n_delisted_short`, the control against B11's hedged line) are secondary values in the artifact and are not reported here.
+The experiment file and the owner sheet said "not after 20:00 UTC". 21:00 UTC is the 16:00 close on 2023-12-29, which is in EST (UTC-5); 20:00 UTC assumed EDT. The read is at the close, not after it. A `floor_replaced_share` of exactly 0.0 means the $5 floor replaced no name in any month, which fits a top-1,000 universe whose own rule already removes sub-$5 names (ADR 0006). Three flags are **not read**: `max_short_weight` (and the cover count), `n_delisted_short` (including a delisted short with a large gain at its last close) and the control against B11's hedged line. They exist to catch a broken run, and the primary is only as good as the run behind it, so the verdict stands on the recorded flags above and is open to these three.
 
 ## The engine check
 
@@ -68,7 +68,11 @@ I did not re-run the check for this report; the figures are the experiment file'
 
 - **Closed:** no long/short `momentum` hypothesis file is written on H1's ranking. The idea is retired under its registration; no variant runs under this slug. A later long/short `momentum` hypothesis discloses this run in its preamble (the experiment file's retirement condition). The run counts in `momentum`'s N (research-registry req 9).
 - **Not closed:** the signed-engine build (T219 to T224) and the paper plan's gated side are unaffected. Other long/short ideas (other rankings, composites with profitability, a different floor or fee) are not tested by this run and are not killed by it. B12 remains the full decomposition if it is run, and its park rule is not evaluated here.
-- **Consistent with the priors.** LS-3 (NOT SUPPORTED: in large caps, single-stock shorts add no net value over an index hedge of the long leg) and the beyond-long-only report's prior of about -2 pp/yr (range -7 to +3) against T-bills for a dollar-neutral momentum composite. The recorded net spread, -6.82 pp/yr, is at the bottom of that range, with an interval that contains all of it. This is one in-sample window, and the long leg had already been seen (H1's trials 1 and 2).
+- **No comparison with the priors is made.** LS-3 (single-stock shorts versus an index hedge of the long leg) needs the control and the book minus hedged control, which were not recorded; and the beyond-long-only prior (about -2 pp/yr, range -7 to +3) is the book's excess over T-bills, whose counterpart (`book_excess_rf_b30`) was not recorded, not the net spread. The recorded `spy_cagr` (11.1%) is above the short leg's gross 8.6%, so the run says nothing in favour of LS-3 on this window until the control is read. The long leg had already been seen (H1's trials 1 and 2).
+
+## Open items
+
+- Post the artifact's full summary on #1876 (the owner or the orchestrator; this report's author does not read the main checkout), then add the unread secondary values and the three unread red flags to this report in a follow-up. Any of them showing a broken run (a missed split in a short, a delisted short with a large gain) would reopen the verdict.
 
 ## Caveats
 
