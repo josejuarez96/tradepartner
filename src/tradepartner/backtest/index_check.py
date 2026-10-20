@@ -33,6 +33,8 @@ EdgeSource = Literal["development_boundary", "holdout_start"]
 
 def equal_weights(security_ids: Sequence[str]) -> dict[str, float]:
     """1/|M| per member; empty for no members."""
+    if len(set(security_ids)) != len(security_ids):
+        raise ValueError("duplicate security_id in the members")
     n = len(security_ids)
     return {s: 1.0 / n for s in security_ids}
 
@@ -65,7 +67,14 @@ def name_return(entry_mark: float | None, end_mark: float | None) -> tuple[float
 
 
 def index_return(weights: Mapping[str, float], returns: Mapping[str, float]) -> float:
-    """R = sum w_j (1 + r_j) - 1, rebalanced at the start of the month."""
+    """R = sum w_j (1 + r_j) - 1, rebalanced at the start of the month.
+
+    The weights must be non-empty and sum to 1; otherwise the month has no book and
+    the result would be a spurious -100 %, so it raises.
+    """
+    total = math.fsum(weights.values())
+    if not weights or abs(total - 1.0) > 1e-9:
+        raise ValueError(f"weights must be non-empty and sum to 1, got {total}")
     return math.fsum(w * (1.0 + returns[s]) for s, w in weights.items()) - 1.0
 
 

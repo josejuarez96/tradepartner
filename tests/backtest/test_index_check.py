@@ -245,3 +245,19 @@ def test_development_rows_show_levels() -> None:
 def test_year_gap_of_no_months_is_zero_and_empty_rejects_rows() -> None:
     assert ic.year_gap([]) == 0.0
     assert ic.year_rows([]) == []
+
+
+def test_index_return_refuses_an_empty_or_unnormalised_book() -> None:
+    with pytest.raises(ValueError, match="sum to 1"):
+        ic.index_return({}, {})
+    with pytest.raises(ValueError, match="sum to 1"):
+        ic.index_return({"A": 0.5}, {"A": 0.1})
+    cw, _ = ic.cap_weights({"A": None})
+    with pytest.raises(ValueError, match="sum to 1"):
+        ic.index_return(cw, {})
+
+
+def test_equal_weights_refuse_duplicate_ids() -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        ic.equal_weights(["A", "B", "A"])
+    assert ic.equal_weights([]) == {}
