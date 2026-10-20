@@ -491,7 +491,10 @@ def _rule_differences(
         if ours != theirs
     ]
     defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    released = frozen.has_release(params)
     for key, rule in sorted(rules.fixed_params.items()):
+        if released and key.partition(".")[0] in frozen.RELEASE_REPLACED_SECTIONS:
+            continue  # the data release replaces these sections (T214)
         value = params.get(key)
         if key in frozen.HIGHER_ALLOWED_COST_KEYS:
             if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
@@ -515,6 +518,21 @@ def _rule_differences(
         and not (key in defaults and frozen._cost_key_allows(key, value, defaults[key]))
     )
     return differences
+
+
+def _release_refusal(
+    conn: duckdb.DuckDBPyConnection, path: Path, params: Mapping[str, Any]
+) -> None:
+    """A new registration naming `data.release_id` must name a `data_release` the store
+    holds (version 18): a typo or an invented name would otherwise freeze a release the
+    data never had (T214)."""
+    if not frozen.has_release(params):
+        return
+    name = params[frozen.RELEASE_ID_KEY]
+    if not any(r.name == name and r.stage == "after" for r in registry.data_releases(conn)):
+        raise HypothesisFileError(
+            f"{path}: {frozen.RELEASE_ID_KEY} {name!r} names no closed data_release in the store"
+        )
 
 
 def _anchor_refusal(
@@ -777,6 +795,7 @@ def register(
             f"{parsed.slug!r} (same frozen set and fingerprint, new doc hash) is refused; "
             "the registered file is the record"
         )
+    _release_refusal(conn, path, params)
     if is_lab_initialised(conn):
         _lab_refusal(conn, path, parsed, params, fingerprint, promotion_of, operations_of)
         if operations_of is not None:

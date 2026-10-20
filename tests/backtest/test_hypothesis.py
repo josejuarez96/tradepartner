@@ -1938,6 +1938,7 @@ def test_load_frozen_accepts_false(
 
 RELEASE_KEY = "data.release_id"
 _REPLACED_PREFIXES = ("master.", "gap.", "adjust.")
+_RELEASE_AT = datetime(2026, 10, 25, tzinfo=UTC)
 
 
 def _release_file(tmp_path: Path, release: str, *, keep_sections: bool = False) -> Path:
@@ -1959,9 +1960,25 @@ def _release_file(tmp_path: Path, release: str, *, keep_sections: bool = False) 
     return path
 
 
+def _close_release(conn: duckdb.DuckDBPyConnection, name: str = "rel-1") -> None:
+    """A closed `data_release` (`after` row) named `name` in `conn`."""
+    registry.import_release(
+        conn,
+        [
+            {
+                "name": name,
+                "stage": "after",
+                "made_at": datetime(2026, 10, 25, tzinfo=UTC),
+                "reason": "t",
+            }
+        ],
+    )
+
+
 def test_a_release_registration_stores_the_id_and_none_of_the_three_sections(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
+    _close_release(conn)
     record = _register(conn, _release_file(tmp_path, "rel-1"), settings)
     assert record.params[RELEASE_KEY] == "rel-1"
     assert not [k for k in record.params if k.startswith(_REPLACED_PREFIXES)]
@@ -1976,6 +1993,7 @@ def test_a_release_registration_loads_and_verifies(
 ) -> None:
     """A run reads the sections it no longer stores from live `Settings`, and the loaded
     settings still match the stored hash."""
+    _close_release(conn)
     record = _register(conn, _release_file(tmp_path, "rel-1"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
     assert loaded.data.release_id == "rel-1"
@@ -2007,3 +2025,62 @@ def test_a_file_without_the_id_freezes_the_default_whatever_env_says(
 def test_the_id_is_not_required_of_a_file() -> None:
     for family in sorted(config.FAMILIES):
         assert RELEASE_KEY not in hypothesis.required_keys(family)
+
+
+def test_an_id_naming_no_closed_release_is_refused(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A typo or an invented name would freeze a release the data never had; an
+    open (`before`-only) release is not the store's release yet."""
+    path = _release_file(tmp_path, "rel-1")
+    with pytest.raises(HypothesisFileError, match="names no closed data_release"):
+        _register(conn, path, settings)
+    registry.import_release(
+        conn,
+        [
+            {
+                "name": "rel-1",
+                "stage": "before",
+                "made_at": datetime(2026, 10, 24, tzinfo=UTC),
+                "reason": "t",
+            }
+        ],
+    )
+    with pytest.raises(HypothesisFileError, match="names no closed data_release"):
+        _register(conn, path, settings)
+    assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (0,)
+
+
+def test_family_rules_that_fix_the_three_sections_accept_a_release_set(
+    settings: Settings,
+) -> None:
+    """The re-recording the task exists for: a family whose rules fix `master.*`, `gap.*`
+    and `adjust.*` does not refuse a set that replaced them with the id (the key still
+    differing from the rules' stays refused when no id is named)."""
+    parsed = hypothesis.parse_file(FIXTURE)
+    plain = hypothesis.frozen_params(parsed, settings)
+    fixed = {k: v for k, v in plain.items() if k.startswith(FORBIDDEN_AXIS_PREFIXES)}
+    assert {k for k in fixed if k.startswith(_REPLACED_PREFIXES)}
+    assert fixed
+    rules = lab_registry.FamilyRules(
+        family="momentum",
+        first_hypothesis_id=1,
+        parent_family=None,
+        holdout_start=parsed.holdout_start,
+        holdout_end=parsed.holdout_end,
+        in_sample_start=parsed.in_sample_start,
+        fixed_params=fixed,
+        fixed_params_sha256="x",
+        max_family_holdout_spends=1,
+        max_family_promotions=1,
+        min_sharpe_variance_annual=0.0,
+        axis_lattice={},
+        sr_star_seed_annual=None,
+        registered_at=datetime(2026, 10, 1, tzinfo=UTC),
+    )
+    assert hypothesis._rule_differences(parsed, plain, rules) == []
+    released = {k: v for k, v in plain.items() if not k.startswith(_REPLACED_PREFIXES)}
+    released[RELEASE_KEY] = "rel-1"
+    assert hypothesis._rule_differences(parsed, released, rules) == []
+    ungated = {k: v for k, v in plain.items() if not k.startswith(_REPLACED_PREFIXES)}
+    assert hypothesis._rule_differences(parsed, ungated, rules) != []
