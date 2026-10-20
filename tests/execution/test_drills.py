@@ -10,7 +10,9 @@ import pytest
 import requests
 from alpaca.common.exceptions import APIError
 
+from tradepartner.adapters.alpaca_trading_raw import AlpacaTradingError
 from tradepartner.adapters.broker import Asset, OrderRequest
+from tradepartner.adapters.broker_refusals import typed_refusal
 from tradepartner.adapters.fake_broker import PartialFill, Reject, SetPosition, Vanish
 from tradepartner.config import RiskConfig
 from tradepartner.errors import AssetNotTradableError, ReconciliationError
@@ -256,6 +258,47 @@ def test_sell_refused_after_position_changes_is_reconciliation_fault(
     orders, events, fills = journal(env)
     assert len(orders) > len(before[0]) and len(fills) == len(before[2])
     assert any(status == "pending" for _, status in events)
+
+
+def test_wash_trade_refusal_halts_with_a_reconciliation_alert_naming_it(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """#1949 (owner decision 2026-10-19): Alpaca's 403 40310000 'potential wash trade
+    detected' is our own open orders in conflict: a reconciliation fault, no skip."""
+    bought(env)
+    assert window.window_id is not None
+    stamp = at(F_0, 22)
+    env.append(
+        OverrideRow(
+            window_id=window.window_id,
+            made_at=stamp,
+            rebalance_session=date(2019, 5, 31),
+            security_id="SEC_TRANSFER",
+            kind="exclude_name",
+            reason="drill the wash-trade refusal on a sell",
+            known_at=stamp,
+            ingested_at=stamp,
+        )
+    )
+
+    def wash_on_sell(request: OrderRequest) -> None:
+        if request.side.value == "sell" and request.symbol == "TRNS":
+            refusal = AlpacaTradingError(
+                403,
+                '{"code":40310000,"message":"potential wash trade detected. use complex orders"}',
+                retried=False,
+            )
+            typed = typed_refusal(refusal, request)
+            assert typed is not None
+            raise typed
+
+    env.fake.on_submit = wash_on_sell
+    with pytest.raises(ReconciliationError):
+        env.run(at(date(2019, 6, 3)))
+    assert env.result(env.latest_run())[:2] == ("halted", "ReconciliationError")
+    alerts = env.alerts("reconciliation")
+    assert len(alerts) == 1 and env.alerts("halted") == [] and env.alerts("skipped") == []
+    assert "wash trade" in str(alerts)
 
 
 def test_ack_timeout_stays_pending_until_next_run(env: Env, window: PaperWindowRow) -> None:

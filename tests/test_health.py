@@ -501,6 +501,35 @@ def test_last_ingests_reports_last_ok_and_latest_run_per_source(
     assert alpaca.latest_message == "SPY missing"
 
 
+def test_last_ingests_shows_the_daily_alpaca_run_not_an_actions_backfill_month(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #1676: an actions-backfill month (mode `actions`, status `filled`) run
+    # after the latest daily run must not be the latest Alpaca run.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    insert_row(
+        fixture_store,
+        "ingestion_runs",
+        {
+            "run_id": "a2",
+            "started_at": day2,
+            "finished_at": day2 + timedelta(minutes=5),
+            "status": "filled",
+            "source": "alpaca",
+            "mode": "actions",
+            "rows_added": 0,
+            "chunk_cursor": "actions;since=2020-06-01;through=2020-06-30",
+            "message": "month",
+        },
+    )
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day1
+    assert alpaca.last_ok_cursor == "2020-06-29"
+
+
 def test_last_ingests_ignores_a_run_not_finished_at_t(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:

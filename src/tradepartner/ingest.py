@@ -316,6 +316,7 @@ from tradepartner.universe import SHARES_FACT, member_links_title
 
 OK, STALE, FAILED, LOCKED = "ok", "stale", "failed", "locked"
 ACTIONS_FILLED = "filled"
+ACTIONS_MODE = "actions"  # the actions backfill's run rows (#1676)
 MODE = "session"
 #: The price side's `ingestion_runs.source`. Its `MODE` runs alone count as
 #: the paper run's fresh prices (staleness and the clock floor, #1440 Q3).
@@ -947,7 +948,7 @@ def ingest_actions_backfill(
             clock,
             f"actions;since={since};through={last}",
             dry_run,
-            mode="actions",
+            mode=ACTIONS_MODE,
             prepare=prepare,
             success_status=ACTIONS_FILLED,
         )
