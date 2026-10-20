@@ -748,7 +748,7 @@ class RiskGatedBroker:
         is a fault for the caller's halt path. A batch that skipped a name for one
         of the three per-name reasons writes one `skipped` alert naming each name
         and its reason (T202)."""
-        outcome = self._trade(run, decisions, forced_exits, notes)
+        outcome = self._trade(run, decisions, forced_exits, notes if notes is not None else [])
         self._alert_skips(run, outcome.skips)
         return outcome
 
@@ -776,7 +776,7 @@ class RiskGatedBroker:
         run: PaperRunRow,
         decisions: Sequence[DecisionRow],
         forced_exits: Sequence[DecisionRow],
-        notes: list[str] | None,
+        notes: list[str],
     ) -> BatchOutcome:
         """`execute`'s two phases."""
         if run.run_id is None or run.session is None:
@@ -885,7 +885,7 @@ class RiskGatedBroker:
         prior_orders: int,
         prior_skips: int,
         plan_decisions: int,
-        notes: list[str] | None,
+        notes: list[str],
     ) -> BatchOutcome:
         """The buys phase, read after the sells' collection (module docstring)."""
         assert run.session is not None
@@ -1623,7 +1623,7 @@ class RiskGatedBroker:
         )
 
     def _await_sells(
-        self, run: PaperRunRow, sells: Sequence[OrderRow], book: _Book, notes: list[str] | None
+        self, run: PaperRunRow, sells: Sequence[OrderRow], book: _Book, notes: list[str]
     ) -> None:
         """Poll this run's sells until each is terminal or
         `paper.sell_wait_seconds` has passed since the open, then collect them."""
@@ -1660,9 +1660,9 @@ class RiskGatedBroker:
         run: PaperRunRow,
         orders: Sequence[OrderRow],
         *,
+        notes: list[str],
         write_offs: WriteOffContext | None = None,
         price_band: PriceBand | None = None,
-        notes: list[str] | None = None,
     ) -> tuple[int, ...]:
         """Collect this phase's orders (T58); a rejection verdict raises
         `RejectionCapError` naming the submitting run. `write_offs`, when given,
@@ -1687,8 +1687,7 @@ class RiskGatedBroker:
             write_offs=write_offs,
             price_band=price_band,
         )
-        if notes is not None:
-            note_unjudged(collected, notes)
+        note_unjudged(collected, notes)
         if collected.rejections:
             raise RejectionCapError("; ".join(b.message for b in collected.rejections))
         return collected.written_off

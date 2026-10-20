@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
+from types import SimpleNamespace
 from typing import Any, Protocol
 
 import duckdb
@@ -31,6 +32,7 @@ from tradepartner.errors import (
     SkipCapError,
     SystemFaultError,
 )
+from tradepartner.execution import run as run_module
 from tradepartner.execution import switch, wrapper
 from tradepartner.execution.alerts import Alerter
 from tradepartner.execution.collect import PriceBand
@@ -386,9 +388,46 @@ def test_wrapper_collection_notes_a_fill_without_a_reference(
         ),
     )
     env.fake.simulate_fill(coid)
+    # collect catches the KeyError from an unread or unpriced reference.
     band = PriceBand({}.__getitem__, pl.DataFrame(), S, 0.25)
     notes: list[str] = []
     _gate(env, alerter_conn)._collect(env.run, [order], price_band=band, notes=notes)
+    assert notes == [f"fill-price band: no reference price for {coid}"]
+
+
+@pytest.mark.parametrize("side", ["sell", "buy"])
+def test_run_notes_receive_unjudged_wrapper_phase_fills(
+    env: Env,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+    side: str,
+) -> None:
+    """The run's notes survive the public wrapper path for both collections."""
+    if side == "sell":
+        _hold(env, A, 10.0)
+        decisions = [
+            _decision(env, A, "sell", notional=500.0),
+            _decision(env, B, "buy", notional=3000.0),
+        ]
+        victim = A
+    else:
+        decisions = [_decision(env, A, "buy", notional=3000.0)]
+        victim = A
+    env.fake.script(FillAt())
+    gate = _gate(env, alerter_conn)
+    # Keep phase sizing priced, but make the collection's reference unreadable.
+    monkeypatch.setattr(
+        gate, "_price_band", lambda _run, _book: PriceBand({}.__getitem__, pl.DataFrame(), S, 0.25)
+    )
+    notes: list[str] = []
+    context = SimpleNamespace(gate=gate, run=env.run, notes=notes)
+    outcome = run_module._execute(context, decisions, ())  # type: ignore[arg-type]
+    assert outcome.status == "ok"
+    ((coid,),) = _query(
+        env.settings,
+        "SELECT client_order_id FROM orders WHERE run_id = ? AND security_id = ? AND side = ?",
+        [env.run.run_id, victim, side],
+    )
     assert notes == [f"fill-price band: no reference price for {coid}"]
 
 
