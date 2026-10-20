@@ -19,9 +19,12 @@ import duckdb
 import pytest
 from conftest import version_4_store
 
+from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.calendar import next_session, previous_session
 from tradepartner.config import Settings
 from tradepartner.execution import ops
+from tradepartner.execution.marks import UnreadableMarkError
+from tradepartner.execution.plan import stop_session
 from tradepartner.store import schema
 from tradepartner.store.db import open_for_write, open_read_only, utc_now
 from tradepartner.store.journal import (
@@ -33,6 +36,7 @@ from tradepartner.store.journal import (
     OrderRow,
     OutcomeRow,
     PaperPlanRow,
+    PaperReportRow,
     PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
@@ -1811,3 +1815,404 @@ def test_the_switch_reads_the_books_own_run_lock(
     assert main.switch_state is not None and not main.switch_state.run_in_progress
     assert summaries["b"].switch_state.run_in_progress
     assert not summaries["main"].switch_state.run_in_progress
+
+
+# --- the performance read (plan T251, spec amendment 2026-10-20, #2006) --------------
+#
+# Hand values. Daily cadence, so every session is a rebalance session. Window opened
+# Tue 2026-09-29 10:00 ET (after that day's open), so B = Mon 09-28 (it carries
+# starting_equity 100,000); three marks: 09-29 100,500, 09-30 101,500, 10-01 99,200.
+# SPY closes (no dividends, no splits): 09-28 5,000, 09-29 5,050, 09-30 5,150,
+# 10-01 5,050. Excess = 100 * (P_t/P_B - S_t/S_B): 0, -0.5, -1.5, -1.8 pp. The
+# tracking trial runs T_0 = 09-30 to 10-01 with equity 100,000 / 102,000, so rebased to
+# equity_at(T_0) = 101,500 it reads 101,500 / 103,530.
+
+_PB = date(2026, 9, 28)
+_PT0 = date(2026, 9, 30)
+_PT1 = date(2026, 10, 1)
+_P_MARKS = {date(2026, 9, 29): 100_500.0, _PT0: 101_500.0, _PT1: 99_200.0}
+_P_SPY = {_PB: 5_000.0, date(2026, 9, 29): 5_050.0, _PT0: 5_150.0, _PT1: 5_050.0}
+_P_KNOWN = datetime(2026, 10, 2, 12, 0, tzinfo=UTC)
+_P_WINDOW_ID = 1
+
+
+def _p_window(
+    started_at: datetime = datetime(2026, 9, 29, 14, 0, tzinfo=UTC),
+    first: date = _PT0,
+) -> PaperWindowRow:
+    return PaperWindowRow(
+        window_id=_P_WINDOW_ID,
+        hypothesis_id=1,
+        first_rebalance_session=first,
+        account_id="PA1",
+        starting_cash=100_000.0,
+        starting_equity=100_000.0,
+        code_version="test",
+        started_at=started_at,
+        frozen_json="{}",
+        frozen_sha256="0" * 64,
+        known_at=started_at,
+        ingested_at=started_at,
+    )
+
+
+def _p_seed(
+    settings: Settings,
+    *,
+    window: PaperWindowRow | None = None,
+    marks: dict[date, float] | None = None,
+    report: bool = True,
+    spy: dict[date, float] | None = None,
+    report_known: datetime = _P_KNOWN,
+) -> None:
+    """Hypothesis 1 (daily cadence, base cost 5 bps), the window, its marks (cash only),
+    SPY bars, and, with `report`, a two-rebalance tracking trial and its `paper_reports` row."""
+    window = window or _p_window()
+    marks = _P_MARKS if marks is None else marks
+    spy = _P_SPY if spy is None else spy
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "INSERT INTO hypotheses (hypothesis_id, slug, family, title, doc_path, doc_sha256, "
+            "params_json, params_sha256, in_sample_start, holdout_start, holdout_end, "
+            "registered_at, registered_by) VALUES (1, 'h-perf', 'momentum', 'perf', "
+            "'docs/hypotheses/h-perf.md', repeat('0', 64), ?, repeat('0', 64), "
+            "?, ?, ?, ?, 'test')",
+            [
+                '{"costs.per_side_bps": 5.0, "schedule.rebalance_cadence": "daily"}',
+                _PB,
+                _PB,
+                _PB,
+                _P_KNOWN,
+            ],
+        )
+        append(conn, window)  # type: ignore[arg-type]
+        run_id = append(
+            conn,
+            PaperRunRow(
+                window_id=_P_WINDOW_ID,
+                session=date(2026, 10, 2),
+                kind="rebalance",
+                started_at=_P_KNOWN,
+                invoked_by="scheduler",
+                code_version="abc",
+                known_at=_P_KNOWN,
+                ingested_at=_P_KNOWN,
+            ),
+        )
+        assert run_id is not None
+        for session, equity in marks.items():
+            append(
+                conn,
+                PositionDailyRow(
+                    run_id=run_id,
+                    session=session,
+                    security_id=None,
+                    quantity=0.0,
+                    cash=equity,
+                    known_at=_P_KNOWN,
+                    ingested_at=_P_KNOWN,
+                ),
+            )
+        for session, close in spy.items():
+            stamp = datetime.combine(session, datetime.min.time(), tzinfo=UTC) + timedelta(hours=21)
+            conn.execute(
+                "INSERT INTO prices_daily (security_id, session, open, high, low, close, "
+                "volume, known_at, ingested_at, source, provenance) "
+                "VALUES ('SEC_SPY', ?, ?, ?, ?, ?, 1, ?, ?, 'alpaca', 'bar')",
+                [session, close, close, close, close, stamp, stamp],
+            )
+        if report:
+            conn.execute(
+                "INSERT INTO trials (trial_id, hypothesis_id, kind, started_at, start_session, "
+                "end_session, code_version, synthetic, run_by) VALUES "
+                "(7, 1, 'tracking', ?, ?, ?, 'test', FALSE, 'test')",
+                [_P_KNOWN, _PT0, _PT1],
+            )
+            for session, equity in ((_PT0, 100_000.0), (_PT1, 102_000.0)):
+                conn.execute(
+                    "INSERT INTO trial_equity (trial_id, series, cost_per_side_bps, session, "
+                    "equity) VALUES (7, 'strategy', 5.0, ?, ?)",
+                    [session, equity],
+                )
+            conn.execute(
+                "INSERT INTO trial_equity (trial_id, series, cost_per_side_bps, session, equity) "
+                "VALUES (7, 'strategy', 25.0, ?, 1.0), (7, 'benchmark', 5.0, ?, 1.0)",
+                [_PT0, _PT0],
+            )
+            append(
+                conn,
+                PaperReportRow(
+                    window_id=_P_WINDOW_ID,
+                    trial_id=7,
+                    through_session=_PT1,
+                    run_at=report_known,
+                    known_at=report_known,
+                    ingested_at=report_known,
+                ),
+            )
+
+
+def _p_read(settings: Settings) -> ops.PerformanceData | None:
+    with open_read_only(settings) as conn:
+        return ops.performance_data(conn, settings)
+
+
+def _approx_rows(rows: tuple[tuple[date, float], ...], expected: list[tuple[date, float]]) -> None:
+    assert [d for d, _ in rows] == [d for d, _ in expected]
+    assert [v for _, v in rows] == pytest.approx([v for _, v in expected])
+
+
+def test_performance_data_series_lengths_and_hand_values(journal_settings: Settings) -> None:
+    _p_seed(journal_settings)
+    data = _p_read(journal_settings)
+    assert data is not None and data.window is not None
+    assert (data.base_session, data.base_value) == (_PB, 100_000.0)
+    _approx_rows(
+        data.equity,
+        [(_PB, 100_000.0), (date(2026, 9, 29), 100_500.0), (_PT0, 101_500.0), (_PT1, 99_200.0)],
+    )
+    _approx_rows(
+        data.daily_pnl,
+        [(date(2026, 9, 29), 500.0), (_PT0, 1_000.0), (_PT1, -2_300.0)],
+    )
+    assert data.cumulative_return_pct == pytest.approx(-0.8)
+    # SPY total return, rebased to 100 at B, selected at the equity sessions
+    _approx_rows(
+        data.benchmark_index,
+        [(_PB, 100.0), (date(2026, 9, 29), 101.0), (_PT0, 103.0), (_PT1, 101.0)],
+    )
+    _approx_rows(
+        data.excess_pp,
+        [(_PB, 0.0), (date(2026, 9, 29), -0.5), (_PT0, -1.5), (_PT1, -1.8)],
+    )
+    assert data.benchmark_error is None
+    # the trial line rebases to equity_at(T_0) = 101,500, not starting_equity; only its span
+    assert data.tracking_state == "drawn" and data.tracking_trial_id == 7
+    assert data.trial_span == (_PT0, _PT1)
+    _approx_rows(data.trial_line, [(_PT0, 101_500.0), (_PT1, 103_530.0)])
+    _approx_rows(data.trial_index, [(_PT0, 101.5), (_PT1, 103.53)])
+    assert data.tracking_n == 2
+    assert data.is_open is True
+
+
+def test_extra_benchmark_sessions_are_ignored(journal_settings: Settings) -> None:
+    _p_seed(journal_settings, spy={**_P_SPY, date(2026, 10, 2): 9_999.0, date(2026, 9, 25): 1.0})
+    data = _p_read(journal_settings)
+    assert data is not None
+    assert len(data.benchmark_index) == 4 and data.benchmark_error is None
+
+
+def test_base_session_for_a_start_before_the_open_and_after_the_close(
+    journal_settings: Settings,
+) -> None:
+    # 08:00 ET on Tue 09-29, before the open: B is Mon 09-28, which carries starting_equity
+    _p_seed(journal_settings, window=_p_window(datetime(2026, 9, 29, 12, 0, tzinfo=UTC)))
+    before = _p_read(journal_settings)
+    assert before is not None
+    assert (before.base_session, before.base_value) == (_PB, 100_000.0)
+    assert len(before.equity) == 4
+
+
+def test_base_value_is_the_first_marks_equity_when_the_window_opened_after_the_close(
+    journal_settings: Settings,
+) -> None:
+    # 17:00 ET on Tue 09-29, after that day's close: B is 09-29 and the first mark is B,
+    # so the base value is equity_at(B), not starting_equity
+    _p_seed(
+        journal_settings,
+        window=_p_window(datetime(2026, 9, 29, 21, 0, tzinfo=UTC)),
+        report=False,
+    )
+    after = _p_read(journal_settings)
+    assert after is not None
+    assert (after.base_session, after.base_value) == (date(2026, 9, 29), 100_500.0)
+    _approx_rows(
+        after.equity,
+        [(date(2026, 9, 29), 100_500.0), (_PT0, 101_500.0), (_PT1, 99_200.0)],
+    )
+    _approx_rows(
+        after.excess_pp,
+        [
+            (date(2026, 9, 29), 0.0),
+            (_PT0, 100 * (101_500 / 100_500 - 5_150 / 5_050)),
+            (_PT1, 100 * (99_200 / 100_500 - 5_050 / 5_050)),
+        ],
+    )
+
+
+def test_a_window_with_no_mark_has_a_base_and_no_series(journal_settings: Settings) -> None:
+    _p_seed(journal_settings, marks={}, report=False)
+    data = _p_read(journal_settings)
+    assert data is not None
+    assert (data.base_session, data.base_value) == (_PB, 100_000.0)
+    assert data.equity == () and data.daily_pnl == () and data.benchmark_index == ()
+    assert data.cumulative_return_pct is None and data.benchmark_error is None
+
+
+def test_tracking_states_without_a_report_row(journal_settings: Settings) -> None:
+    # two daily rebalances done by the as-of (09-30 and 10-01): the report is due
+    _p_seed(journal_settings, report=False)
+    done = _p_read(journal_settings)
+    assert done is not None
+    assert (done.tracking_state, done.tracking_n) == ("report_due", 2)
+    assert done.trial_line == () and done.trial_span is None and done.tracking_trial_id is None
+
+
+def test_tracking_not_yet_counts_by_paper_reports_rule(journal_settings: Settings) -> None:
+    # T_0 on 10-01: only one rebalance session (10-01) has closed by the as-of
+    _p_seed(journal_settings, window=_p_window(first=_PT1), report=False)
+    data = _p_read(journal_settings)
+    assert data is not None
+    assert (data.tracking_state, data.tracking_n) == ("not_yet", 1)
+
+
+def test_tracking_count_ignores_a_missed_rebalance_and_a_row_draws_the_line(
+    journal_settings: Settings,
+) -> None:
+    # the only journaled run is 10-02's; no run ever traded 09-30 or 10-01, a missed
+    # rebalance: the count is the schedule's (paper report's rule), and the row draws the line
+    _p_seed(journal_settings)
+    data = _p_read(journal_settings)
+    assert data is not None
+    assert data.tracking_n == 2 and data.tracking_state == "drawn"
+    assert len(data.trial_line) == 2
+
+
+def test_tracking_count_stops_before_the_stop_session(journal_settings: Settings) -> None:
+    _p_seed(journal_settings, report=False)
+    requested = datetime(2026, 10, 1, 15, 0, tzinfo=UTC)
+    assert stop_session(requested) == _PT1
+    with open_for_write(journal_settings) as conn:
+        append(
+            conn,
+            PaperWindowStopRow(
+                window_id=_P_WINDOW_ID,
+                at=requested,
+                state="requested",
+                known_at=_P_KNOWN,
+                ingested_at=_P_KNOWN,
+            ),
+        )
+    data = _p_read(journal_settings)
+    assert data is not None
+    # the last completed rebalance strictly before the stop session 10-01 is 09-30
+    assert data.tracking_n == len(rebalance_sessions(_PT0, _PT0, "daily")) == 1
+    assert data.tracking_state == "not_yet"
+
+
+def test_a_book_with_no_window_returns_none(journal_settings: Settings) -> None:
+    assert _p_read(journal_settings) is None
+    with open_read_only(journal_settings) as conn:
+        assert ops.performance_data(conn, journal_settings, "other") is None
+
+
+def test_an_unresolvable_spy_identity_is_the_benchmark_error(journal_settings: Settings) -> None:
+    _p_seed(journal_settings)
+    with open_for_write(journal_settings) as conn:
+        conn.execute("DELETE FROM listings WHERE ticker = 'SPY'")
+    data = _p_read(journal_settings)
+    assert data is not None
+    assert data.benchmark_error is not None and "SPY" in data.benchmark_error
+    assert data.benchmark_index == () and data.excess_pp == ()
+    assert len(data.equity) == 4  # the book's own series stand
+
+
+def test_a_missing_spy_session_is_the_benchmark_error_naming_it(
+    journal_settings: Settings,
+) -> None:
+    spy = {s: v for s, v in _P_SPY.items() if s != _PT0}
+    _p_seed(journal_settings, spy=spy)
+    data = _p_read(journal_settings)
+    assert data is not None
+    assert data.benchmark_error == "benchmark unavailable for 2026-09-30"
+    assert data.benchmark_index == () and len(data.equity) == 4
+
+
+def test_a_dividend_after_the_base_enters_the_spy_line(journal_settings: Settings) -> None:
+    """Total return, not price only: a dividend ex 09-30 lowers the earlier closes."""
+    _p_seed(journal_settings)
+    stamp = datetime(2026, 9, 29, 21, 0, tzinfo=UTC)
+    with open_for_write(journal_settings) as conn:
+        columns = [
+            r[0]
+            for r in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'corporate_actions' ORDER BY ordinal_position"
+            ).fetchall()
+        ]
+        values: dict[str, object] = {
+            "security_id": "SEC_SPY",
+            "action_type": "dividend",
+            "ex_date": _PT0,
+            "ratio_or_amount": 51.5,
+            "source_action_id": "d1",
+            "announced_at": stamp,
+            "known_at": stamp,
+            "ingested_at": stamp,
+            "source": "alpaca",
+            "provenance": "action",
+        }
+        used = [c for c in columns if c in values]
+        conn.execute(
+            f"INSERT INTO corporate_actions ({', '.join(used)}) "
+            f"VALUES ({', '.join('?' for _ in used)})",
+            [values[c] for c in used],
+        )
+    data = _p_read(journal_settings)
+    assert data is not None and data.benchmark_error is None
+    # factor (1 - 51.5/5050) on closes before the ex-date: B and 09-29 fall ~1%
+    factor = 1 - 51.5 / 5_050
+    got = dict(data.benchmark_index)
+    assert got[_PT0] == pytest.approx(100 * 5_150 / (5_000 * factor))
+    assert got[_PB] == pytest.approx(100.0)
+
+
+def test_an_unreadable_mark_propagates(journal_settings: Settings) -> None:
+    _p_seed(journal_settings)
+    with open_for_write(journal_settings) as conn:
+        conn.execute("UPDATE positions_daily SET cash = NULL WHERE session = ?", [_PT0])
+    with open_read_only(journal_settings) as conn, pytest.raises(UnreadableMarkError):
+        ops.performance_data(conn, journal_settings)
+
+
+def _row_counts(settings: Settings) -> dict[str, int]:
+    with open_read_only(settings) as conn:
+        tables = [
+            str(r[0])
+            for r in conn.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'main' AND table_type = 'BASE TABLE'"
+            ).fetchall()
+        ]
+        return {
+            t: int(conn.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0])  # type: ignore[index]
+            for t in tables
+        }
+
+
+def test_performance_data_writes_nothing_and_opens_no_trial(journal_settings: Settings) -> None:
+    _p_seed(journal_settings)
+    before = _row_counts(journal_settings)
+    assert _p_read(journal_settings) is not None
+    assert _row_counts(journal_settings) == before
+    assert before["trials"] == 1  # the seeded tracking trial and no other
+    with open_read_only(journal_settings) as conn:
+        version = conn.execute("SELECT max(version) FROM schema_version").fetchone()
+    assert version is not None and version[0] == schema.CURRENT_SCHEMA_VERSION
+
+
+def test_the_performance_read_imports_no_trial_writer() -> None:
+    text = Path(ops.__file__).read_text()
+    assert "run_hypothesis" not in text and "backtest.run" not in text
+
+
+def test_the_cards_as_of_covers_the_report_row_it_draws(journal_settings: Settings) -> None:
+    """A report row stamped after every other journal row moves the card's "as of" to
+    its `known_at`, and the tracking count is read at that time (10-05 12:00 UTC is
+    before 10-05's close, so three daily rebalances 09-30, 10-01, 10-02 have closed)."""
+    late = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    _p_seed(journal_settings, report_known=late)
+    data = _p_read(journal_settings)
+    assert data is not None
+    assert data.as_of == late
+    assert data.tracking_n == 3 and data.tracking_state == "drawn"
