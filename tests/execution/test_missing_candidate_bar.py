@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+
 from execution.test_run_trade import F_0, T_0, Env, at, env, window  # noqa: F401
 from tradepartner.config import FAMILIES
 from tradepartner.execution.alerts import ALERT_KINDS
@@ -121,3 +123,18 @@ def test_a_reused_plan_raises_no_second_alert(env: Env, window: PaperWindowRow) 
     env.run(at(F_0, 12, 0), prices={})
     env.run(at(F_0, 13, 0), prices={})
     assert len(env.alerts("missing_candidate_bar")) == 1
+
+
+def test_a_held_name_with_no_bar_at_the_session_before_fails_the_run_not_the_plan(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Pins the boundary the amendment names (owner question #2023): on F_1 = the
+    session after T_1, a held name missing its T_1 bar is also its S-1 bar, so the
+    reference-price read fails the run before any plan; no exclusion, no alert, no order."""
+    env.run(at(F_0))
+    orders = len(env.orders())
+    drop_bar(env, TRNS, date(2019, 5, 31))
+    with pytest.raises(ValueError, match=TRNS):
+        env.run(at(date(2019, 6, 3)), prices={"TRNS": 50.0})
+    assert env.alerts("missing_candidate_bar") == []
+    assert len(env.orders()) == orders
