@@ -1616,7 +1616,8 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
             f"next rebalance {_fmt(row.next_rebalance_session)}"
         )
         if traded is not None:
-            line += f"; rebalance {traded} traded today"
+            result = "traded today" if row.last_run_has_orders else "ran today with no orders"
+            line += f"; rebalance {traded} {result}"
         if row.open_orders_count and row.last_run_kind == "rebalance":
             line += "; Fills are recorded at the next scheduled run"
         lines.append(line)

@@ -169,6 +169,12 @@ def _seed(store_path: Path) -> None:
                 **_stamp(2),
             ),
         )
+        conn.execute(
+            "INSERT INTO listings (security_id, ticker, exchange, valid_from, known_at, "
+            "ingested_at, source, provenance) VALUES ('BBB', 'BBB', 'NYSE', ?, ?, ?, "
+            "'fixture', 'filing')",
+            [_S_MINUS_1, _at(1), _at(1)],
+        )
 
         order = OrderRow(
             client_order_id="tp-buy-1",
@@ -397,6 +403,23 @@ def test_ranking_uses_known_ticker_for_security_id(
     ranking = _dataframe_with_columns(at, "ticker", "selected")
     assert set(ranking["ticker"].to_list()) == {"BBB", "CEE"}
     assert "security_id" not in ranking.columns
+
+
+def test_ranking_uses_ticker_known_at_plan_time(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    with duckdb.connect(str(seeded_store)) as conn:
+        conn.execute(
+            "INSERT INTO listings (security_id, ticker, exchange, valid_from, known_at, "
+            "ingested_at, source, provenance) VALUES "
+            "('CCC', 'OLD', 'NYSE', ?, ?, ?, 'fixture', 'filing'), "
+            "('CCC', 'NEW', 'NYSE', ?, ?, ?, 'fixture', 'filing')",
+            [ops.previous_session(_S_MINUS_1), _at(1), _at(1), _S_MINUS_1, _at(6), _at(6)],
+        )
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    ranking = _dataframe_with_columns(at, "ticker", "selected")
+    assert set(ranking["ticker"].to_list()) == {"BBB", "OLD"}
 
 
 def test_render_fills_card(monkeypatch: pytest.MonkeyPatch, seeded_store: Path) -> None:
@@ -665,6 +688,19 @@ def test_summary_names_traded_rebalance_without_marking_next_daily_one_done(
     )
     (label,) = ops_page._summary_table((row,))["next_rebalance"].to_list()
     assert label == "2026-10-30; rebalance 2026-10-29 traded today"
+
+
+def test_summary_names_rebalance_run_with_no_orders(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _add_book_b(seeded_store)
+    monkeypatch.setattr(ops, "utc_now", lambda: _T0)
+    settings = Settings(_env_file=None, store={"path": str(seeded_store)})
+    with duckdb.connect(str(seeded_store), read_only=True) as conn:
+        b = next(row for row in ops.book_summaries(conn, settings) if row.book_id == "b")
+    (label,) = ops_page._summary_table((b,))["next_rebalance"].to_list()
+    assert f"rebalance {ops.previous_session(_S_MINUS_1)} ran today with no orders" in label
+    assert "traded today" not in label
 
 
 def test_two_books_list_two_summary_rows_and_the_selector_switches_the_sections(
