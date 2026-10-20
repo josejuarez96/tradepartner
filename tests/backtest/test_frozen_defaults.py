@@ -352,6 +352,7 @@ COMBINED_LATER_KEYS = (
     *SHOCK_KEYS,
     *CHAIN_KEYS,
     "adjust.apply_spin_offs",
+    "data.release_id",
 )
 
 
@@ -396,6 +397,7 @@ LATER_KEYS = (
     *SHOCK_KEYS,
     *CHAIN_KEYS,
     "adjust.apply_spin_offs",
+    "data.release_id",
 )
 
 
@@ -603,6 +605,7 @@ def test_b3_fingerprint_canonical_set_and_hash_are_pinned(
                     *COST_KEYS,
                     *CHAIN_KEYS,
                     "adjust.apply_spin_offs",
+                    "data.release_id",
                 ),
             )
         )
@@ -915,7 +918,7 @@ def test_cost_term_entries_are_last_and_pinned_by_value() -> None:
     (#1818) takes 29 and lands first; T187's four chain entries and T211c's
     spin-off key follow them."""
     assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:26], COST_ENTRIES)
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:-5], COST_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:-6], COST_ENTRIES)
 
 
 def test_post_registration_cost_keys_pinned_and_each_a_costs_table_key() -> None:
@@ -1042,7 +1045,7 @@ def test_the_chain_entries_are_pinned_and_move_no_fingerprint() -> None:
         assert table[key] == (default, version), key
     settings = _defaults_settings()
     keys = CHAIN_KEYS
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-5:-1], CHAIN_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-6:-2], CHAIN_ENTRIES)
     for family, params in (
         ("momentum", _new_params(settings)),
         ("combined", _combined_params(settings)),
@@ -1064,9 +1067,9 @@ def test_the_chain_entries_are_pinned_and_move_no_fingerprint() -> None:
 APPLY_SPIN_OFFS_KEY = "adjust.apply_spin_offs"
 
 
-def test_apply_spin_offs_entry_is_last_and_pinned_by_value() -> None:
-    """Appended at version 31 at its default."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-1:], ((APPLY_SPIN_OFFS_KEY, False, 31),))
+def test_apply_spin_offs_entry_is_pinned_by_value() -> None:
+    """Appended at version 31 at its default (T214's `data.release_id` follows it)."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-2:-1], ((APPLY_SPIN_OFFS_KEY, False, 31),))
 
 
 def test_post_registration_adjust_keys_pinned_and_each_an_adjust_table_key() -> None:

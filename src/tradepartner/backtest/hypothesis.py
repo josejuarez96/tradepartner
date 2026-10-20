@@ -140,6 +140,7 @@ FROZEN_SECTIONS: Final = (
     "master",
     "gap",
     "holdout",
+    "data",
     "metrics",
 )
 #: Single frozen keys outside those sections.
@@ -202,6 +203,25 @@ def family_frozen_keys(family: str) -> tuple[str, ...]:
     """`frozen_keys()` less `family`'s inert sections: what a registration stores."""
     inert = frozen.inert_sections(family)
     return tuple(k for k in frozen_keys() if k.partition(".")[0] not in inert)
+
+
+def _release_dropped(params: Mapping[str, Any]) -> dict[str, Any]:
+    """`params` less the `master`, `gap` and `adjust` keys when they freeze a data
+    release (`frozen.has_release`, T214): the id replaces those sections."""
+    if not frozen.has_release(params):
+        return dict(params)
+    return {
+        k: v
+        for k, v in params.items()
+        if k.partition(".")[0] not in frozen.RELEASE_REPLACED_SECTIONS
+    }
+
+
+def _release_dropped_keys(values: Mapping[str, Any], inert: frozenset[str]) -> list[str]:
+    """The frozen keys a registration with `values` must store: `frozen_keys()` less the
+    inert sections and, for a data-release registration, the replaced ones."""
+    skipped = inert | frozen.RELEASE_REPLACED_SECTIONS if frozen.has_release(values) else inert
+    return [k for k in frozen_keys() if k.partition(".")[0] not in skipped]
 
 
 def required_keys(family: str) -> frozenset[str]:
@@ -304,6 +324,15 @@ def parse_file(path: Path) -> HypothesisFile:
             f"{path}: keys of another family's signal section are refused for "
             f"family {family!r}: {', '.join(inert)}"
         )
+    if frozen.has_release(flat):
+        replaced = sorted(
+            k for k in flat if k.partition(".")[0] in frozen.RELEASE_REPLACED_SECTIONS
+        )
+        if replaced:
+            raise HypothesisFileError(
+                f"{path}: {frozen.RELEASE_ID_KEY} replaces the master, gap and adjust "
+                f"sections; remove {', '.join(replaced)}"
+            )
     required = required_keys(family) | {"slug", "family", "title", "in_sample_start"}
     missing = sorted(required - set(flat))
     if missing:
@@ -371,7 +400,7 @@ def frozen_params_of(settings: Settings, *, family: str) -> dict[str, Any]:
     for key in family_frozen_keys(family):
         section, _, field = key.partition(".")
         params[key] = dumped[section][field] if field else dumped[section]
-    return params
+    return _release_dropped(params)
 
 
 def frozen_hash_matches(settings: Settings, stored_sha256: str, *, family: str) -> bool:
@@ -409,6 +438,7 @@ def frozen_params(parsed: HypothesisFile, settings: Settings) -> dict[str, Any]:
             frozen.POST_REGISTRATION_OWN_KEYS
             | frozen.POST_REGISTRATION_COST_KEYS
             | frozen.POST_REGISTRATION_ADJUST_KEYS
+            | frozen.POST_REGISTRATION_DATA_KEYS
         )
         if key not in parsed.file_params and key.partition(".")[0] not in inert
     }
@@ -783,7 +813,7 @@ def load_frozen(
         )
     values = frozen.frozen_values(record)
     inert = frozen.inert_sections(record.family)
-    expected = {k for k in frozen_keys() if k.partition(".")[0] not in inert}
+    expected = set(_release_dropped_keys(values, inert))
     if set(values) != expected:
         drift = sorted(set(values) ^ expected)
         raise HypothesisFileError(

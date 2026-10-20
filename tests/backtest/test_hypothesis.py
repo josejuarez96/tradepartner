@@ -47,6 +47,7 @@ FROZEN_SECTIONS = (
     "master",
     "gap",
     "holdout",
+    "data",
     "metrics",
 )
 FROZEN_SINGLE_KEYS = ("execution.fill_price", "benchmarks", "alpaca.historical_feed")
@@ -651,6 +652,7 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "master.chain_window_sessions",
             "master.chain_max_price_ratio",
             "adjust.apply_spin_offs",
+            "data.release_id",
         ),
     ],
     ids=["today", "pre-lab"],
@@ -1337,6 +1339,7 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "master.chain_window_sessions",
         "master.chain_max_price_ratio",
         "adjust.apply_spin_offs",
+        "data.release_id",
     )
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     record = registry.register_hypothesis(
@@ -1703,6 +1706,7 @@ def test_h1s_unchanged_file_registered_before_the_terms_writes_nothing(
         *COST_TERMS,
         *(k for k in hypothesis.frozen_keys() if k.startswith("master.chain")),
         "adjust.apply_spin_offs",
+        "data.release_id",
     }
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     stored = registry.register_hypothesis(
@@ -1928,3 +1932,78 @@ def test_load_frozen_accepts_false(
     _register(conn, _spin_offs_file(tmp_path, SLUG, "false"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
     assert loaded.adjust.apply_spin_offs is False
+
+
+# --- T214: `data.release_id` replaces the master, gap and adjust sections ---------------
+
+RELEASE_KEY = "data.release_id"
+_REPLACED_PREFIXES = ("master.", "gap.", "adjust.")
+
+
+def _release_file(tmp_path: Path, release: str, *, keep_sections: bool = False) -> Path:
+    text = FIXTURE.read_text()
+    if not keep_sections:
+        kept: list[str] = []
+        skipping = False
+        for line in text.splitlines():
+            if line.startswith("["):
+                skipping = line.strip("[] ") in {"master", "gap", "adjust"}
+            elif line.startswith("```"):
+                skipping = False
+            if not skipping:
+                kept.append(line)
+        text = "\n".join(kept) + "\n"
+    path = tmp_path / "hypotheses" / f"{SLUG}.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(text.replace("\n```\n", f'\n[data]\nrelease_id = "{release}"\n```\n', 1))
+    return path
+
+
+def test_a_release_registration_stores_the_id_and_none_of_the_three_sections(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    record = _register(conn, _release_file(tmp_path, "rel-1"), settings)
+    assert record.params[RELEASE_KEY] == "rel-1"
+    assert not [k for k in record.params if k.startswith(_REPLACED_PREFIXES)]
+    expected = set(hypothesis.family_frozen_keys("momentum")) - {
+        k for k in hypothesis.frozen_keys() if k.startswith(_REPLACED_PREFIXES)
+    }
+    assert set(record.params) == expected
+
+
+def test_a_release_registration_loads_and_verifies(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A run reads the sections it no longer stores from live `Settings`, and the loaded
+    settings still match the stored hash."""
+    record = _register(conn, _release_file(tmp_path, "rel-1"), settings)
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
+    assert loaded.data.release_id == "rel-1"
+    assert hypothesis.frozen_hash_matches(loaded, record.params_sha256, family="momentum")
+    again = _register(conn, _release_file(tmp_path, "rel-1"), settings)
+    assert again == record
+
+
+def test_a_file_naming_the_id_and_a_replaced_key_is_refused(
+    tmp_path: Path, settings: Settings
+) -> None:
+    path = _release_file(tmp_path, "rel-1", keep_sections=True)
+    with pytest.raises(HypothesisFileError, match="replaces the master, gap and adjust"):
+        hypothesis.parse_file(path)
+
+
+def test_a_file_without_the_id_freezes_the_default_whatever_env_says(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA__RELEASE_ID", "from-env")
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "no.env"))
+    live = Settings()
+    assert live.data.release_id == "from-env"
+    params = hypothesis.frozen_params(hypothesis.parse_file(FIXTURE), live)
+    assert params[RELEASE_KEY] == ""
+    assert [k for k in params if k.startswith(_REPLACED_PREFIXES)]
+
+
+def test_the_id_is_not_required_of_a_file() -> None:
+    for family in sorted(config.FAMILIES):
+        assert RELEASE_KEY not in hypothesis.required_keys(family)

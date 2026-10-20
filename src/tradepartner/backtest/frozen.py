@@ -94,6 +94,10 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # A post-registration key: frozen at `false` when absent, never from live
     # Settings, and outside the promotion identity.
     ("adjust.apply_spin_offs", False, 31),
+    # T214: the named data release (backtest spec, "The data-release id"; ADR 0023 D8).
+    # `""` is none: the `master`, `gap` and `adjust` sections stay as stored. A
+    # non-empty id replaces those three sections (`RELEASE_REPLACED_SECTIONS`).
+    ("data.release_id", "", 34),
 )
 
 #: Keys added to a family's own listed section **after** that family's first
@@ -131,6 +135,16 @@ POST_REGISTRATION_COST_KEYS: Final[frozenset[str]] = frozenset(
 #: T211c: the opt-in `adjust.apply_spin_offs` (backtest spec amendment #1894). A
 #: post-registration key like `POST_REGISTRATION_COST_KEYS`, not in its own section.
 POST_REGISTRATION_ADJUST_KEYS: Final[frozenset[str]] = frozenset({"adjust.apply_spin_offs"})
+
+#: T214: `data.release_id`, a post-registration key like the cost and adjust sets: frozen
+#: at its table default when a file leaves it out, never from live `Settings`, outside the
+#: promotion identity.
+POST_REGISTRATION_DATA_KEYS: Final[frozenset[str]] = frozenset({"data.release_id"})
+
+#: The frozen key naming the data release (T214) and the sections a non-empty id
+#: replaces in the frozen set (backtest spec, "The data-release id").
+RELEASE_ID_KEY: Final = "data.release_id"
+RELEASE_REPLACED_SECTIONS: Final[frozenset[str]] = frozenset({"master", "gap", "adjust"})
 
 #: `costs.*` keys a ruled family's file may set higher than its rules' value (a cost
 #: assumption may only get harsher), as `costs.per_side_bps` may; `adv_sessions` is not
@@ -214,6 +228,7 @@ _FINGERPRINT_KEYS: Final = (
     "holdout.start",
     "holdout.end",
     "adjust.apply_spin_offs",
+    RELEASE_ID_KEY,
 )
 _FINGERPRINT_SECTIONS: Final = ("schedule", "universe")
 
@@ -237,11 +252,19 @@ def frozen_values(record: _HasParams) -> dict[str, Any]:
     return _overlay_defaults(record.params, record.family)
 
 
+def has_release(params: Mapping[str, Any]) -> bool:
+    """`params` freeze a data release: `data.release_id` is present and not its table
+    default (`""`). Such a set carries no `master.*`, `gap.*` or `adjust.*` key."""
+    return RELEASE_ID_KEY in params and not is_default(params[RELEASE_ID_KEY], "")
+
+
 def _overlay_defaults(params: Mapping[str, Any], family: str) -> dict[str, Any]:
-    inert = inert_sections(family)
+    skipped = inert_sections(family)
+    if has_release(params):
+        skipped = skipped | RELEASE_REPLACED_SECTIONS
     values = dict(params)
     for key, default in _defaults().items():
-        if _section(key) not in inert:
+        if _section(key) not in skipped:
             values.setdefault(key, default)
     return values
 
@@ -276,6 +299,8 @@ def canonical_frozen_set(params: Mapping[str, Any], family: str) -> dict[str, An
     the sections `family` does not list left out whole."""
     own = _own_sections(family)
     inert = _all_sections() - own
+    if has_release(params):
+        inert = inert | RELEASE_REPLACED_SECTIONS
     defaults = _defaults()
 
     def dropped(key: str, value: Any) -> bool:

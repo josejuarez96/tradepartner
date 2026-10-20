@@ -759,6 +759,7 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
                 "master.chain_window_sessions",
                 "master.chain_max_price_ratio",
                 "adjust.apply_spin_offs",
+                "data.release_id",
             )
         )
     }
@@ -873,6 +874,7 @@ def _register_more(
             "master.chain_window_sessions",
             "master.chain_max_price_ratio",
             "adjust.apply_spin_offs",
+            "data.release_id",
         )
         params = {k: v for k, v in params.items() if not k.startswith(later)}
     with open_for_write(_store(path)) as conn:
