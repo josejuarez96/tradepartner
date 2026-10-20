@@ -1433,3 +1433,26 @@ why = "ADR 0023's ladder needs a one-session delay at rung 4 and placebos at run
 what = "The plan edits of 2026-10-18: dependencies rewritten by need (T202, T206, T208, T210, T211), T209 split, one data sitting, T195 out of T198's gate, T114, T160 and T172d ticked, three wording fixes, and the new lines T215 to T217."
 why = "Six dependency chains were written for file order, not need; the alignment puts T202, T206, T209a, T210 and T211 on the ready frontier and makes the critical path honest (T161 onward)."
 unblocks = ["task:T202", "task:T206", "task:T209a", "task:T210", "task:T211", "task:T215", "task:T216", "task:T217"]
+
+[task.T243]
+what = "RSP stored as a check-only series: backfilled like MTUM, refused to every trial, and left out of every trial's data vintage."
+why = "The equal-weight known-answer check needs RSP's total return from stored bars, without adding a trial series or staling every counted trial (#1598)."
+unblocks = ["task:T245"]
+
+[task.T244]
+what = "The index check's pure arithmetic: equal and cap weights, month and year gaps, tracking error, per-name contributions and the protected-month rows."
+why = "The known-answer check's numbers must be hand-checkable before they touch the store (#1598)."
+unblocks = ["task:T245"]
+
+[task.T245]
+what = "`tradepartner index-check`: the whole universe against RSP and SPY by year and month, read-only, with flags on the names behind the worst months and gaps only in protected years."
+why = "Every trial rests on the data, universe and return arithmetic; this is the one check of them against a known answer, and it is never a trial (#1598)."
+unblocks = ["task:T246"]
+
+[task.T246]
+what = "Owner: backfill RSP and run the index check on the real store; the output goes on #1598 and each new defect becomes an issue."
+why = "The check only finds defects when it runs on the owner's store (#1598)."
+
+[task.T247]
+what = "A dashboard page for the index check, built only if the owner asks for it."
+why = "A page is convenient but optional; the CLI output is the record (#1598)."
