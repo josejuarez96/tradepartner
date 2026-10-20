@@ -277,6 +277,8 @@ def _load_mergers(path: Path, known_ids: frozenset[str]) -> list[Merger]:
         known_at, ingested_at = _check_common(
             row, provenance="action", known_ids=known_ids, where=where
         )
+        if row["source"] != "alpaca":
+            raise FixtureContractError(f"{where}: source {row['source']!r}, expected 'alpaca'")
         acquirer_id = row["acquirer_security_id"] or None
         if acquirer_id is not None and acquirer_id not in known_ids:
             raise FixtureContractError(

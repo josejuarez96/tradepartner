@@ -1213,6 +1213,7 @@ class TestFixtureMergers:
             ({"security_id": "SEC_NOPE"}, "not in securities.csv"),
             ({"acquirer_security_id": "SEC_NOPE"}, "acquirer_security_id"),
             ({"provenance": "bar"}, "provenance"),
+            ({"source": "edgar"}, "source"),
             ({"kind": "swap"}, "kind"),
             ({"kind": "stock", "share_ratio": 1.0, "cash_per_share": ""}, "acquirer_security_id"),
             ({"cash_per_share": 0}, "positive"),

@@ -5351,12 +5351,19 @@ class TestMergerSource:
         assert [m.source_action_id for m in result] == ["a"]
         assert source.last_actions_report.unresolved == (("GONE", date(2020, 10, 16)),)
 
-    def test_a_delisted_acquiree_still_resolves(self) -> None:
-        # The acquiree's listing ended before Alpaca processed the record
-        # (open question 41): resolution is on the session before the
-        # effective date, not on the run's day.
-        source = self._source({"cash_mergers": [_cash_merger(process_date="2020-12-01")]})
-        assert len(source.mergers(date(2020, 12, 1), date(2020, 12, 1))) == 1
+    def test_the_acquiree_resolves_at_its_effective_date_not_the_run_day(self) -> None:
+        # The record is processed long after the deal closed (open question
+        # 41), and the ticker has since passed to another company: the
+        # acquiree is the holder the session before the effective date.
+        source = self._source(
+            {"cash_mergers": [_cash_merger(process_date="2020-12-01")]},
+            listings=[
+                *_MERGER_LISTINGS,
+                _listing("LATER", "TARG", date(2020, 11, 2)),
+            ],
+        )
+        [m] = source.mergers(date(2020, 12, 1), date(2020, 12, 1))
+        assert m.security_id == "ACQE"
 
     def test_bad_arguments_are_refused(self) -> None:
         source = self._source({})
