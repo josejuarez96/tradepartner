@@ -265,6 +265,16 @@ def _shard_unit(item: pytest.Item, rootdir: Path) -> str:
     return item.nodeid if rel in _SPLIT_BY_TEST else rel
 
 
+def _order_shard_items(items: list[pytest.Item], rootdir: Path) -> None:
+    """Run heavier shard units first, preserving collection order within each unit."""
+
+    def priority(item: pytest.Item) -> tuple[float, str]:
+        unit = _shard_unit(item, rootdir)
+        return (-_HEAVY_TEST_FILE_WEIGHTS.get(unit, _DEFAULT_TEST_FILE_WEIGHT), unit)
+
+    items.sort(key=priority)
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Keep only this shard's items, when CI sets `PYTEST_SHARD_INDEX`/`_COUNT` (#1112).
 
@@ -280,8 +290,6 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         return
     shard_count = int(count_raw)
     shard_index = int(index_raw)
-    if shard_count <= 1:
-        return
     if not 0 <= shard_index < shard_count:
         raise ValueError(
             f"{_SHARD_INDEX_ENV}={shard_index} out of range for {_SHARD_COUNT_ENV}={shard_count}"
@@ -294,6 +302,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         unit = _shard_unit(item, rootdir)
         (kept if assignment[unit] == shard_index else deselected).append(item)
+    _order_shard_items(kept, rootdir)
     items[:] = kept
     if deselected:
         config.hook.pytest_deselected(items=deselected)
