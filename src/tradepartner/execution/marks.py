@@ -364,7 +364,7 @@ def marks_for(
                 # fault halts the run without the switch; repairing the bar clears it.
                 raise StaleDataError(
                     f"bad close for held {security_id} at close({session}): {price!r}; "
-                    "no mark written; delete the bad bar (repair-bars) and refill it"
+                    "no mark written; remove the bad bar (repair-bars) and refill it"
                 )
             quantity = book.positions[security_id]
             marks.append(
