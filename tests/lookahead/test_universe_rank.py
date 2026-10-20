@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 
 import duckdb
 import pytest
+from conftest import PROBE_CHUNKS, assert_chunks_are_the_probe_set, probe_chunk
 
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 from tradepartner.calendar import last_completed_session, session_close
@@ -51,12 +52,26 @@ def _ids(u: Universe) -> list[str]:
     return u.members.sort("company_rank", "security_id")["security_id"].to_list()
 
 
-def test_dollar_volume_universe_is_invariant_under_truncation(
-    fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
+#: `probe_timestamps` on the fixture store, pinned: the nine chunks cover exactly these.
+PROBE_COUNT = 1942
+PROBE_DIGEST = "f8ccd42c8faaea4b04835e4161798c90701298e1a924f450b147b3058563ccef"
+
+
+def test_dollar_volume_chunks_are_the_pinned_probe_set(
+    fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
+    """No probe dropped or repeated: the chunks' union is the original probe set."""
+    assert_chunks_are_the_probe_set(probe_timestamps(fixture_store), PROBE_COUNT, PROBE_DIGEST)
+
+
+@pytest.mark.parametrize("chunk", range(PROBE_CHUNKS))
+def test_dollar_volume_universe_is_invariant_under_truncation(
+    fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore, chunk: int
+) -> None:
+    """One strided ninth of the pinned full probe set, with the original comparisons."""
     seen_members = 0
     skipped: set[bool] = set()
-    for t in probe_timestamps(fixture_store):
+    for t in probe_chunk(probe_timestamps(fixture_store), chunk):
         full = universe_as_of(fixture_store, t, _SETTINGS)
         cut = universe_as_of(truncated.at(t), t, _SETTINGS)
         assert full.members.equals(cut.members), f"members disagree at T={t!r}"

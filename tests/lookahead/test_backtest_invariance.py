@@ -1,12 +1,12 @@
 """No look-ahead for the full backtest run (backtest spec req 13, "Look-ahead"; plan T40),
 at every rebalance cadence (strategy-lab spec req 6; plan T98b).
 
-**Cadences.** Every test runs once per `Case` in `CASES`, one per cadence (`month_end`,
+**Cadences.** Every check covers each `Case` in `CASES`, one per cadence (`month_end`,
 `week_end`, `daily`), with `schedule.rebalance_cadence` frozen to it. `month_end` walks
 the whole fixture range as T40 did; `week_end` and `daily` walk a window of about thirty
 rebalances around the teeth case (`Case`), because the walk runs `run(end=T_i)` from the
-window's first rebalance for every T_i (quadratic in the rebalance count) and CI runs it
-once per worker that draws a truncation or prefix test. A later axis
+window's first rebalance for every T_i (quadratic in the rebalance count). The two
+walks split those T_i across three strided items apiece. A later axis
 (the strategy family, T85e) extends `Case` and `CASES`, not the tests.
 
 **Families** (T85e, extended by T130). The three cadence cases run `family="momentum"`; the
@@ -22,15 +22,17 @@ close (2019-03-01) would see it. `combined` composes momentum's price read with 
 read, so both the seeded bar revisions and the 10-K reach its plans.
 
 `engine.run` over a `StoreProvider` on the fixture universe, at every rebalance
-session T_i of the case's window:
+session T_i of the case's window (the truncation and prefix walks are split into
+three strided chunks each, whose union is every T_i):
 
-- **Truncation invariance**: `run(end=T_i)` on the full store equals `run(end=T_i)`
+- **Truncation invariance**: the prefix through T_i of `run(end=T_n)` equals `run(end=T_i)`
   with the data connection factory yielding `TruncatedStore.at(close(T_i))` and the
   registry connection the untruncated store (the truncated one has no registry
   tables). Equity, weights, rebalances, position values, marking frames and targets
-  are compared whole, at every cost level.
-- **Prefix invariance**: `run(end=T_i)` equals the prefix through T_i of
-  `run(end=T_n)`.
+  are compared whole, at every cost level. Together with the prefix test, this still
+  proves the original full-store-versus-truncated-store equality at every T_i.
+- **Prefix invariance**: `run(end=T_i)` on the full store equals the prefix through T_i
+  of `run(end=T_n)`, completing the original truncation guarantee above.
 - **The development boundary** (ADR 0016 point 2; plan T142b): with a boundary row in
   the store (a non-session day inside the walk), the run over the default window the
   callers build from it (`holdout.default_in_sample_window` with
@@ -414,14 +416,6 @@ def fixture(
 
 
 @pytest.fixture(scope="module")
-def full_runs(fixture: Fixture) -> dict[date, Results]:
-    """`run(end=T_i)` on the full store for every T_i after the first: the walk's cost,
-    read only by the truncation and prefix tests (under xdist each worker that runs one
-    of them builds it again)."""
-    return {end: fixture.run(end) for end in fixture.sessions[1:]}
-
-
-@pytest.fixture(scope="module")
 def longest(fixture: Fixture) -> Results:
     """`run(end=T_n)` on the full store, for the tests that need only that run."""
     return fixture.run(fixture.sessions[-1])
@@ -490,24 +484,38 @@ def test_the_run_is_not_vacuous(fixture: Fixture, longest: Results) -> None:
     assert len(entitled) >= len(seeded) - 2
 
 
+WALK_CHUNKS = 3
+
+
+@pytest.mark.parametrize("chunk", range(WALK_CHUNKS))
 def test_truncation_invariance_at_every_rebalance(
-    fixture: Fixture, full_runs: dict[date, Results]
+    fixture: Fixture, longest: Results, chunk: int
 ) -> None:
+    """Each T_i cut equals the longest-run prefix at both costs, in three strided
+    chunks. The prefix test must stay in the suite: it proves each full-store
+    `run(end=T_i)` equals that prefix, so together the tests retain the original
+    full-store-versus-cut equality at every T_i."""
     truncated = TruncatedStore(fixture.conn)
     try:
-        for end, full in full_runs.items():
+        for end in fixture.sessions[1:][chunk::WALK_CHUNKS]:
             cut_conn = truncated.at(fixture.read_time(end))
             cut = fixture.run(end, connect=_factory(cut_conn))
-            _assert_same(cut, full, f"run(end={end}) on the store truncated to close({end})")
+            prefix = {level: _prefix(result, end) for level, result in longest.items()}
+            _assert_same(cut, prefix, f"run(end={end}) on the store truncated to close({end})")
     finally:
         truncated.close()
 
 
+@pytest.mark.parametrize("chunk", range(WALK_CHUNKS))
 def test_prefix_invariance_at_every_rebalance(
-    fixture: Fixture, full_runs: dict[date, Results]
+    fixture: Fixture, longest: Results, chunk: int
 ) -> None:
-    longest = full_runs[fixture.sessions[-1]]
-    for end, shorter in full_runs.items():
+    """Each full-store `run(end=T_i)` equals the longest-run prefix at both costs,
+    in three strided chunks. The truncation test compares the cut run with that
+    same prefix, so together the tests retain the original cut-versus-full equality
+    at every T_i."""
+    for end in fixture.sessions[1:][chunk::WALK_CHUNKS]:
+        shorter = fixture.run(end)
         prefix = {level: _prefix(result, end) for level, result in longest.items()}
         _assert_same(shorter, prefix, f"run(end={end}) against the prefix of the full run")
 
