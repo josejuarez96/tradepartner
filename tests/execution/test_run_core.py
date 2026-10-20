@@ -953,6 +953,13 @@ def _unresolved_events(env: Env) -> list[tuple[str, str | None]]:
     ]
 
 
+def _wide_fill_band(env: Env) -> None:
+    """These cases fill SPY at the harness's flat `PRICE`, not its store close: widen
+    the #1981 fill-price band (a run-time key) so the fixture's price is not judged."""
+    paper = env.settings.paper.model_copy(update={"max_fill_price_deviation": 0.99})
+    env.settings = env.settings.model_copy(update={"paper": paper})
+
+
 def test_step_3_acknowledges_and_collects_an_unresolved_order_the_broker_knows(
     env: Env, exits_done: list[object]
 ) -> None:
@@ -961,6 +968,7 @@ def test_step_3_acknowledges_and_collects_an_unresolved_order_the_broker_knows(
     one fill and its terminal event, so both reconciliations are `ok` (cash
     100,000 - 1 x 100 on both sides) and the run is `ok`, never engaged."""
     _unresolved(env)
+    _wide_fill_band(env)
     env.clock.now = _at(MON, 14)
     placed = env.fake.submit(OrderRequest(UNRESOLVED, "SPY", Side.BUY, quantity=1.0))
     env.fake.simulate_fill(UNRESOLVED)
@@ -1881,6 +1889,7 @@ def test_a_late_fill_collected_at_step_3_does_not_halt_step_4(
     fill of an earlier run's order that step 3 collects today (known after
     close(S-1)) is in the ledger it reconciles (#488's corrected guidance)."""
     window = _marked(env)
+    _wide_fill_band(env)
     earlier = env.past_run(window, _at(MON))
     env.order(earlier, "tp-late", _at(MON))
     env.fake.simulate_fill("tp-late")  # filled Monday; nothing collected it yet

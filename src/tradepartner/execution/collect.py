@@ -109,7 +109,7 @@ from __future__ import annotations
 import bisect
 import json
 import math
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -128,6 +128,7 @@ from tradepartner.store.journal import (
     DecisionEventRow,
     FillCursorRow,
     FillRow,
+    OrderedFill,
     OrderEventRow,
     OrderRow,
     ReconciliationRow,
@@ -553,6 +554,33 @@ def _back_fill_write_offs(
         )
         written.append(decision.decision_id)
     return tuple(written)
+
+
+def fill_band_violations(
+    fills: Iterable[OrderedFill], reference: Mapping[str, float], band: float
+) -> tuple[str, ...]:
+    """One message per fill whose price is outside `reference x (1 +- band)` (#1981).
+
+    Pure. `reference` maps a `security_id` to the order's reference price (the
+    split-adjusted close of S-1) and `band` is the configured
+    `paper.max_fill_price_deviation`. The bounds are inclusive, so a fill exactly at
+    the band edge passes. A fill of a name without a reference, or a non-finite or
+    non-positive fill price, is a violation too: a band that cannot judge a fill
+    must not wave it through. Each message names the order, the security, the fill
+    price, the reference and the band."""
+    out = []
+    for item in fills:
+        fill = item.fill
+        ref = reference.get(item.security_id)
+        price = fill.price
+        if ref is None or not math.isfinite(ref) or ref <= 0:
+            out.append(f"{fill.client_order_id} ({item.security_id}): no usable reference price")
+        elif not (math.isfinite(price) and ref * (1 - band) <= price <= ref * (1 + band)):
+            out.append(
+                f"{fill.client_order_id} ({item.security_id}): fill price {price} is outside "
+                f"{band:.0%} of the reference price {ref}"
+            )
+    return tuple(out)
 
 
 def rejection_breaches(

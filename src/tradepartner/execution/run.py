@@ -171,6 +171,13 @@ only the first of the two alerts (rare under current settings). The batch's
 status (`skipped_kill_switch` when the wrapper read the switch engaged) is
 the run's.
 
+**The fill-price band** (#1981). After step 3's collection and after step 7b's, every
+fill the run journaled is compared with its security's reference price on S: one
+outside `paper.max_fill_price_deviation` (run-time, default 0.25), or one the band
+cannot price, raises `SystemFaultError` naming `fill_price_outside_band`, so the run
+takes the halt path (a `halted` alert, the kill switch). The journal and the broker
+agree on a bad fill, so no reconciliation can see it.
+
 **Steps 8 and 9.** `reconcile_now` again, cut the same way, then the result row:
 `ok`, or the batch's `skipped_kill_switch` (after its `kill_switch` alert, as at step 6).
 
@@ -239,6 +246,7 @@ from tradepartner.execution.collect import (
     Connect,
     WriteOffContext,
     collect,
+    fill_band_violations,
     lag_verdict,
 )
 from tradepartner.execution.ledger import Ledger, from_journal
@@ -1486,6 +1494,7 @@ class _Run:
             )
         )
         collected = self._collect()
+        self._fill_band(actions)
         self._unspent_cash(self._executed(actions, prices), {})
         if self.kind == _STOP:
             self._stop_missed()
@@ -1531,6 +1540,7 @@ class _Run:
             batch = exits_step(context)
         if batch is not None:
             self._collect_own()
+            self._fill_band(actions)
             prices = self._pending_prices(actions)
             self.write_offs = WriteOffContext(
                 self.window_id, actions, prices.__getitem__, self.session
@@ -1624,6 +1634,34 @@ class _Run:
                 and d.decision.rebalance_session not in settled
             }
             return planning.reference_prices(conn, self.session, names, actions)
+
+    def _fill_band(self, actions: pl.DataFrame) -> None:
+        """The fill-price sanity band (#1981; module docstring, step 3): every
+        fill this run journaled (its `known_at` at or after the run's start) must
+        sit within `paper.max_fill_price_deviation` of its security's reference
+        price on S. A fill outside it, or one the band cannot price, raises
+        `SystemFaultError` naming `fill_price_outside_band`, which takes the halt
+        path (`halted` alert, kill switch). A fill an earlier run journaled is not
+        judged again, so a halt is not repeated by the next run."""
+        with open_read_only(self.settings, retry=True) as conn:
+            fills = [
+                f
+                for f in store_journal.fills_for(conn, window_id=self.window_id)
+                if f.fill.known_at >= self.run.started_at
+            ]
+            if not fills:
+                return
+            try:
+                reference = planning.reference_prices(
+                    conn, self.session, {f.security_id for f in fills}, actions
+                )
+            except ValueError as exc:
+                raise SystemFaultError(
+                    f"fill_price_outside_band: no reference price for a fill ({exc})"
+                ) from exc
+        found = fill_band_violations(fills, reference, self.settings.paper.max_fill_price_deviation)
+        if found:
+            raise SystemFaultError("fill_price_outside_band: " + "; ".join(found))
 
     def _collect(self) -> Collected:
         """Step 3's collection, the rejection cap and the lag bound."""
