@@ -4092,3 +4092,259 @@ def test_chain_known_at_ge_successor_rows_fails_when_the_derived_row_is_later(
     )
     violations = _chain_rule(chain_fixture_store, CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS)
     assert {(v["predecessor_id"], v["successor_id"]) for v in violations} == {CHAIN_IDS}
+
+
+# --- Mergers (#1762, T248e) ------------------------------------------------
+
+_MERGER_RULES = (
+    "mergers_known_at_from_process_date",
+    "mergers_rates_match_kind",
+    "mergers_acquirer",
+    "mergers_unique",
+)
+CASH_MERGER = "fixture-merger-cash-1"
+STOCK_MERGER = "fixture-merger-stock-1"
+
+
+def _merger_copy(
+    conn: duckdb.DuckDBPyConnection, action_id: str, replace: str, params: list[Any] | None = None
+) -> None:
+    """Insert a copy of the merger `action_id` with `replace` (a DuckDB
+    `REPLACE` list) applied."""
+    conn.execute(
+        f"INSERT INTO mergers SELECT * REPLACE ({replace}) FROM mergers "
+        "WHERE source_action_id = ? ORDER BY known_at LIMIT 1",
+        [*(params or []), action_id],
+    )
+
+
+def _merger_failed(report: HealthReport) -> set[str]:
+    return _failed(report.integrity) & set(_MERGER_RULES)
+
+
+def test_merger_rules_are_integrity_rules_and_pass_on_the_fixture(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    assert set(_MERGER_RULES) <= set(INTEGRITY_RULES)
+    report = health_report(fixture_store, T_END, settings)
+    assert report.ok, report.failures
+    assert _merger_failed(report) == set()
+
+
+def test_a_merger_first_row_with_the_wrong_stamp_fails(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    loose_store.execute(
+        "UPDATE mergers SET known_at = TIMESTAMPTZ '2018-07-25 20:00:00+00', "
+        "ingested_at = TIMESTAMPTZ '2018-07-26 20:10:00+00' WHERE source_action_id = ?",
+        [CASH_MERGER],
+    )
+    report = health_report(loose_store, T_END, settings)
+    assert _merger_failed(report) == {"mergers_known_at_from_process_date"}
+    assert not report.ok
+
+
+def test_a_legitimate_merger_revision_passes_and_a_mis_stamped_one_fails(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    revised = datetime(2018, 8, 2, 21, 5, tzinfo=UTC)
+    _merger_copy(
+        fixture_store,
+        CASH_MERGER,
+        "? AS known_at, ? AS ingested_at, 63.0 AS cash_per_share",
+        [revised, revised],
+    )
+    report = health_report(fixture_store, T_END, settings)
+    assert report.ok, report.failures
+    # A revision stamped before its own ingest, and one not after the row before.
+    fixture_store.execute(
+        "UPDATE mergers SET ingested_at = ingested_at + INTERVAL 1 HOUR WHERE known_at = ?",
+        [revised],
+    )
+    report = health_report(fixture_store, T_END, settings)
+    assert _merger_failed(report) == {"mergers_known_at_from_process_date"}
+
+
+def test_a_merger_revision_stamped_before_the_first_row_fails(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    early = datetime(2018, 7, 26, 19, 0, tzinfo=UTC)
+    _merger_copy(
+        loose_store,
+        CASH_MERGER,
+        "? AS known_at, ? AS ingested_at, 63.0 AS cash_per_share",
+        [early, early],
+    )
+    report = health_report(loose_store, T_END, settings)
+    assert _merger_failed(report) == {"mergers_known_at_from_process_date"}
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "cash_per_share = NULL",  # cash kind without its rate
+        "share_ratio = 0.5",  # cash kind with a share ratio
+        "cash_per_share = -1",  # not positive
+        "cash_per_share = 'NaN'",  # not finite
+        "kind = 'stock'",  # stock kind with no ratio
+        "kind = 'merger'",  # a kind outside the set
+    ],
+)
+def test_merger_rates_that_do_not_match_the_kind_fail(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings, assignment: str
+) -> None:
+    loose_store.execute(
+        f"UPDATE mergers SET {assignment} WHERE source_action_id = ?",
+        [CASH_MERGER],
+    )
+    report = health_report(loose_store, T_END, settings)
+    assert "mergers_rates_match_kind" in _merger_failed(report)
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    ["acquirer_security_id = NULL", "acquirer_security_id = security_id"],
+)
+def test_a_stock_merger_without_an_acquirer_or_with_itself_fails(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings, assignment: str
+) -> None:
+    loose_store.execute(
+        f"UPDATE mergers SET {assignment} WHERE source_action_id = ?",
+        [STOCK_MERGER],
+    )
+    report = health_report(loose_store, T_END, settings)
+    assert _merger_failed(report) == {"mergers_acquirer"}
+
+
+def test_a_cash_merger_may_have_no_acquirer(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    [(acquirer,)] = fixture_store.execute(
+        "SELECT acquirer_security_id FROM mergers WHERE source_action_id = ?", [CASH_MERGER]
+    ).fetchall()
+    assert acquirer is None
+    assert health_report(fixture_store, T_END, settings).ok
+
+
+def test_two_merger_rows_with_one_identity_and_one_stamp_fail(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _merger_copy(loose_store, CASH_MERGER, "63.0 AS cash_per_share")
+    report = health_report(loose_store, T_END, settings)
+    assert "mergers_unique" in _merger_failed(report)
+
+
+def test_a_merger_with_a_provenance_other_than_action_fails_the_common_rule(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    loose_store.execute("UPDATE mergers SET provenance = 'bar'")
+    report = health_report(loose_store, T_END, settings)
+    assert PROVENANCE_ALLOWED in _failed(report.integrity)
+
+
+def test_the_mergers_block_on_the_fixture(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    block = health_report(fixture_store, T_END, settings).mergers
+    assert block.rows_by_kind == {"cash": 1, "stock": 1, "stock_and_cash": 0}
+    assert block.latest_known_at == datetime(2020, 2, 18, 21, 0, tzinfo=UTC)
+    assert block.run_counts == {}
+    assert block.conflicts.is_empty()
+    # The stock merger's acquiree keeps trading after its effective date; the
+    # cash merger's does not.
+    assert block.after_effective["security_id"].to_list() == ["SEC_DIV_CANCELLED"]
+    [row] = block.after_effective.to_dicts()
+    assert row["effective_date"] == date(2020, 2, 14)
+    assert row["bars"] > 0
+    assert row["last_bar"] > date(2020, 2, 14)
+
+
+def test_the_mergers_block_reads_only_rows_known_at_t(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    before_stock = session_close(date(2020, 2, 14))
+    block = health_report(fixture_store, before_stock, settings).mergers
+    assert block.rows_by_kind == {"cash": 1, "stock": 0, "stock_and_cash": 0}
+    assert block.latest_known_at == datetime(2018, 7, 26, 20, 0, tzinfo=UTC)
+    assert block.after_effective.is_empty()
+
+
+def test_the_mergers_block_counts_the_last_alpaca_run(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    start = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(
+        fixture_store, "old", "alpaca", "ok", start - timedelta(days=1), message="mergers_stored=9"
+    )
+    _run(
+        fixture_store,
+        "last",
+        "alpaca",
+        "ok",
+        start,
+        message=(
+            "x; actions_not_yet_known=4; actions_unresolved=3; merger_rows_refused=1; "
+            "merger_self=2; mergers_stored=5"
+        ),
+    )
+    block = health_report(fixture_store, T_END + timedelta(hours=3), settings).mergers
+    assert block.run_counts == {
+        "stored": 5,
+        "refused": 1,
+        "unresolved": 3,
+        "merger_self": 2,
+        "not_yet_known": 4,
+    }
+
+
+def test_a_run_message_without_merger_counts_reads_zeros(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    start = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "last", "alpaca", "ok", start, message="nothing to say")
+    block = health_report(fixture_store, T_END + timedelta(hours=3), settings).mergers
+    assert block.run_counts == dict.fromkeys(
+        ("stored", "refused", "unresolved", "merger_self", "not_yet_known"), 0
+    )
+
+
+def test_two_ids_for_one_deal_are_a_conflict_pair_and_do_not_fail_check(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _merger_copy(fixture_store, STOCK_MERGER, "'fixture-merger-stock-2' AS source_action_id")
+    report = health_report(fixture_store, T_END, settings)
+    assert report.ok, report.failures
+    [row] = report.mergers.conflicts.to_dicts()
+    assert row["security_id"] == "SEC_DIV_CANCELLED"
+    assert row["effective_date"] == date(2020, 2, 14)
+    assert row["ids"] == ["fixture-merger-stock-1", "fixture-merger-stock-2"]
+    assert report.mergers.rows_by_kind["stock"] == 2
+
+
+def test_a_revision_that_moves_the_effective_date_ends_a_conflict(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _merger_copy(fixture_store, STOCK_MERGER, "'fixture-merger-stock-2' AS source_action_id")
+    revised = datetime(2020, 3, 2, 21, 5, tzinfo=UTC)
+    _merger_copy(
+        fixture_store,
+        "fixture-merger-stock-2",
+        "? AS known_at, ? AS ingested_at, DATE '2020-03-20' AS effective_date",
+        [revised, revised],
+    )
+    report = health_report(fixture_store, T_END, settings)
+    assert report.ok, report.failures
+    assert report.mergers.conflicts.is_empty()
+
+
+def test_a_store_without_the_mergers_table_reports_an_empty_block(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    fixture_store.execute("DELETE FROM schema_version WHERE version = 35")
+    fixture_store.execute("DROP TABLE mergers")
+    report = health_report(fixture_store, T_END, settings)
+    assert report.ok, report.failures
+    assert report.mergers.rows_by_kind == {"cash": 0, "stock": 0, "stock_and_cash": 0}
+    assert report.mergers.latest_known_at is None
+    assert report.mergers.conflicts.is_empty()
+    assert report.mergers.after_effective.is_empty()

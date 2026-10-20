@@ -99,7 +99,7 @@ from __future__ import annotations
 
 import bisect
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from typing import Final, TypeVar, cast
@@ -120,6 +120,7 @@ from tradepartner.backtest.portfolio import (
     _equal_weight,
     _selected_count,
     apply_rebalance_band,
+    buffered_targets,
     drifted_weights,
     hold_membership,
     target_weights,
@@ -436,12 +437,50 @@ def plan(
     params: Settings,
     session: date,
     family: HypothesisFamily,
+    *,
+    previous_targets: Collection[str] | None = None,
 ) -> Plan:
     """The plan at rebalance session `session` (a rebalance session at the frozen
     `schedule.rebalance_cadence`), read at close(`session`): universe, family signal,
     targets and the gap, from `params` (the frozen hypothesis parameters). The backtest
-    loop calls exactly this function (`_plan`) at every rebalance it plans."""
-    return _plan(provider, params, session, family)
+    loop calls exactly this function (`_plan`) at every rebalance it plans.
+
+    `previous_targets` is the previous plan's targets of the same run, the buffer's
+    carried state (spec amendment #657, item 4). At the default
+    `strategy.hold_top_fraction` it is ignored and the call is unchanged. For a
+    registration with the buffer on it is required: a call that omits it (leaves it
+    `None`) raises `ValueError` naming the key, and an explicit empty mapping means a
+    run's first plan (`P = ∅`). The paper planner calls this without the argument, so a
+    buffered window's plan trial fails closed rather than trading an unbuffered plan
+    under a buffered label."""
+    return _apply_buffer(_plan(provider, params, session, family), params, previous_targets)
+
+
+def _apply_buffer(built: Plan, params: Settings, previous_targets: Collection[str] | None) -> Plan:
+    """`built` with the `momentum` buy/hold buffer applied (spec amendment #657, item 2).
+
+    At the default `strategy.hold_top_fraction` (0.0) `built` is returned unchanged and
+    no new path runs. Otherwise the targets are rebuilt from `buffered_targets` over the
+    plan's own `scores` (already past B10's screen, rung 4's delay and rung 5's placebo)
+    under `equal` weighting, so a held name is reset to the common weight, and
+    `n_retained` joins the plan's counts, reported only here (item 2). `previous_targets`
+    is the previous plan's targets after the successor-chain renaming; `None` is the
+    omitted argument, refused so no run records results under a buffered label."""
+    hold = params.strategy.hold_top_fraction
+    if hold == 0.0:
+        return built
+    if previous_targets is None:
+        raise ValueError(
+            "engine.plan needs previous_targets for a registration with "
+            f"strategy.hold_top_fraction = {hold!r} (the buy/hold buffer); pass the "
+            "previous plan's targets, or an empty mapping for a run's first plan"
+        )
+    targets, n_retained = buffered_targets(
+        built.scores, previous_targets, params.strategy.top_fraction, hold
+    )
+    counts = dict(built.counts)
+    counts["n_retained"] = n_retained
+    return replace(built, targets=targets, counts=counts)
 
 
 def _no_benchmark_members(plan: Plan, benchmarks: Mapping[str, str]) -> Plan:
@@ -1468,7 +1507,13 @@ def _plan_all(
 ) -> dict[int, Plan]:
     """Each open variant's plan at `session`, from one signal read for the group: with
     several variants, each one's reader first says what it reads (`_Requests`), and
-    each keyed read is made once for their union before any variant plans."""
+    each keyed read is made once for their union before any variant plans.
+
+    Each variant's plan carries the buffer (`_apply_buffer`): its `previous_targets` is
+    the plan the run loop carries for it, `variant.plan`, which is `None` at the run's
+    first plan and the previous step's plan -- already renamed through the live
+    successor chains by `_rename_chained` -- at every later one (spec amendment #657,
+    items 2 and 4)."""
     if len(group) > 1:
         strategy = signal_for(family)
         cadence = group[0].settings.schedule.rebalance_cadence
@@ -1489,8 +1534,11 @@ def _plan_all(
             view.share(key, asked)
     plans: dict[int, Plan] = {}
     for variant in list(group):
+        previous = () if variant.plan is None else variant.plan.targets
         try:
-            plans[variant.trial_id] = _plan(view, variant.settings, session, family)
+            plans[variant.trial_id] = _apply_buffer(
+                _plan(view, variant.settings, session, family), variant.settings, previous
+            )
         except _ReadError:
             raise
         except Exception as exc:
