@@ -6336,3 +6336,33 @@ def test_a_missed_days_name_change_is_asked_again_and_applied_next_run(
         before = known_at - timedelta(seconds=1)
         assert symbol_changes_as_of(conn, before).height == 0
         assert symbol_changes_as_of(conn, known_at).height == 1
+
+
+def test_a_month_end_name_change_missed_by_a_transport_error_is_asked_again_next_month(
+    fixture_store_path: Path,
+) -> None:
+    """#1676 audit: the re-ask crosses a month boundary because the window
+    starts `alpaca.actions_process_lag_days` (default 90) before the month."""
+    from tradepartner.adapters.prices import SymbolChange, announcement_date_known_at
+
+    day = date(2018, 11, 30)
+    change = SymbolChange(
+        "SEC_TICKCHANGE", "TCKB", "TCKC", "S-NEW", "S-NEWER", day,
+        announcement_date_known_at(day), "alpaca", "month-end",
+    )  # fmt: skip
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    windows: list[tuple[date, date]] = []
+    prices = _transport_failing_prices(
+        Path(__file__).parent / "fixtures" / "universe", change, windows, day
+    )
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute("DELETE FROM symbol_changes")
+    assert _run(
+        settings, prices=prices, now=datetime(2018, 11, 30, 22, tzinfo=UTC), source="alpaca"
+    ).ok
+    assert _run(
+        settings, prices=prices, now=datetime(2018, 12, 3, 22, tzinfo=UTC), source="alpaca"
+    ).ok
+    assert windows[1][0] <= day <= windows[1][1]
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute("SELECT count(*) FROM symbol_changes").fetchone()[0] == 1
