@@ -404,7 +404,7 @@ from tradepartner.config import (
     parse_accepted_same_day_pair,
 )
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
-from tradepartner.ingest import DERIVED_FACTS, MODE, OK, SOURCES
+from tradepartner.ingest import ACTIONS_MODE, DERIVED_FACTS, MODE, OK, SOURCES
 from tradepartner.store.asof import (
     _FACT_KEY,
     _PRICE_KEY,
@@ -2499,15 +2499,16 @@ def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestSt
     `t` (finished at or before `t`); `ingest.SOURCES` first, then any other
     source. A `master-retract` run row (mode `retract`, #859) is not an
     ingest and is left out, so it never hides the latest EDGAR run's status
-    or quarantine count."""
+    or quarantine count; so is an actions-backfill month (mode `actions`,
+    status `filled`, #1676), so it never shows as the latest Alpaca run."""
     t = _validate_t(t)
     runs = conn.execute(
         """
         SELECT source, status, started_at, finished_at, chunk_cursor, message
-        FROM ingestion_runs WHERE coalesce(finished_at, started_at) <= ? AND mode <> ?
+        FROM ingestion_runs WHERE coalesce(finished_at, started_at) <= ? AND mode NOT IN (?, ?)
         ORDER BY started_at, run_id
         """,
-        [t, RETRACT],
+        [t, RETRACT, ACTIONS_MODE],
     ).fetchall()
     by_source: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
     for run in runs:
