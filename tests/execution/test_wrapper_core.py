@@ -1252,8 +1252,8 @@ def test_a_short_decision_halts_the_batch_before_any_submit(
     with pytest.raises(LimitBreachError, match="refused_position_side") as raised:
         _execute(gate, env, rows)
     message = str(raised.value)
-    # Both the journaled decision and the order `to_risk` built from it are named.
-    assert f"order of decision {short_id} " in message
+    # The journaled decision is named (T230: a `buy` + `short` is a cover in the sells
+    # phase, which the wrapper does not route yet, so no order is built from it).
     assert f"refused_position_side: decision {short_id} " in message
     assert "SEC_DUAL_B" not in message
     assert _submits(env.fake) == []
