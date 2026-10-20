@@ -428,15 +428,20 @@ def test_explanations_read_only_rows_known_at_close_of_the_previous_session(
 
 # --- spin-off children in an open window (#1896) -----------------------------
 
+#: A spin-off's ex-date whose session-before is the session the parent was bought
+#: on (BOUGHT_AT), so the ledger held it before the ex-date.
+EX = previous_session(S)
+
 
 def test_explanations_offer_a_spinoff_of_a_held_parent(
     journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
 ) -> None:
-    """#1896: a stored `spinoff` known at close(S-1) whose parent the ledger held
-    on the session before the ex-date is offered, keyed by child to
-    `(parent, ratio)` (the `execution.window` convention)."""
+    """#1896: a stored `spinoff` known at close(S-1) (stamped at the adapter's
+    floor, the close before its ex-date) whose parent the ledger held on the
+    session before the ex-date is offered, keyed by child to `(parent, ratio)`
+    (the `execution.window` convention)."""
     _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
-    _spinoff(journal_settings, MTUM, SPY, 0.4, CUT - timedelta(minutes=1))
+    _spinoff(journal_settings, MTUM, SPY, 0.4, CUT, ex_date=EX)
 
     with open_read_only(journal_settings) as conn:
         found = explanations_as_of(
@@ -456,7 +461,7 @@ def test_explanations_leave_a_spinoff_of_a_parent_not_held_out(
 ) -> None:
     """#1896: the ledger holds no `SPY`, so its stored spin-off is not offered and
     a broker-booked child stays a mismatch (never a guess)."""
-    _spinoff(journal_settings, MTUM, SPY, 0.4, CUT - timedelta(minutes=1))
+    _spinoff(journal_settings, MTUM, SPY, 0.4, CUT, ex_date=EX)
 
     with open_read_only(journal_settings) as conn:
         found = explanations_as_of(
@@ -471,18 +476,43 @@ def test_explanations_leave_a_spinoff_of_a_parent_not_held_out(
     assert found.spinoffs == {}
 
 
+def test_a_spinoff_whose_row_lands_after_its_ex_date_is_still_offered(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """#1896: a spin-off's row is stamped the close after Alpaca's date-only
+    `process_date`, so an `ok` reconciliation can sit on or after the ex-date
+    before the row lands. The read is bounded by the cutoff, not the base
+    session, so the spin-off is still offered and the child is not lost for
+    good."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _ok_base(journal_settings, open_window, at=CUT, broker_cash=99_000.0)
+    _spinoff(journal_settings, MTUM, SPY, 0.4, CUT, ex_date=EX)
+
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            S,
+            as_of=CUT,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+
+    assert found.spinoffs == {MTUM: (SPY, 0.4)}
+
+
 def test_a_broker_booked_spinoff_child_journals_a_spinoff_receipt(
     journal_settings: Settings,
     fake: BookedFake,
     open_window: PaperWindowRow,
     fixed_clock: FixedClock,
 ) -> None:
-    """#1896: 10 `SPY` held, a stored 0.4 `SPY` -> `MTUM` spin-off known at
-    close(S-1), and the broker's 4.0 `MTUM` child journals the `spinoff_receipt`
-    the ledger then holds (cash unchanged: a receipt is shares, not cash)."""
+    """#1896: 10 `SPY` held, a 0.4 `SPY` -> `MTUM` spin-off known at close(S-1),
+    and the broker's 4.0 `MTUM` child journals the `spinoff_receipt` the ledger
+    then holds (cash unchanged: a receipt is shares, not cash)."""
     fake.activities = [FUNDING]
     _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
-    _spinoff(journal_settings, MTUM, SPY, 0.4, CUT - timedelta(minutes=1))
+    _spinoff(journal_settings, MTUM, SPY, 0.4, CUT, ex_date=EX)
     fake.extra_quantity = {"MTUM": 4.0}
 
     result = _reconcile(journal_settings, fake, open_window, fixed_clock)
@@ -508,7 +538,7 @@ def test_a_wrong_spinoff_ratio_still_halts(
     books 4.0: the ratio is wrong, so the child is a mismatch, never accepted."""
     fake.activities = [FUNDING]
     _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
-    _spinoff(journal_settings, MTUM, SPY, 0.25, CUT - timedelta(minutes=1))
+    _spinoff(journal_settings, MTUM, SPY, 0.25, CUT, ex_date=EX)
     fake.extra_quantity = {"MTUM": 4.0}
 
     with pytest.raises(ReconciliationError, match="broker_only_position"):
@@ -526,7 +556,32 @@ def test_a_spinoff_child_of_a_parent_not_held_still_halts(
     """#1896: the ledger never held `SPY`, so its spin-off explains nothing and
     the broker's `MTUM` child halts as a `broker_only_position`."""
     fake.activities = [FUNDING]
-    _spinoff(journal_settings, MTUM, SPY, 0.4, CUT - timedelta(minutes=1))
+    _spinoff(journal_settings, MTUM, SPY, 0.4, CUT, ex_date=EX)
+    fake.extra_quantity = {"MTUM": 4.0}
+
+    with pytest.raises(ReconciliationError, match="broker_only_position"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_a_spinoff_of_a_parent_moved_since_the_ex_date_still_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1896: the parent must be held, unchanged, on the session before the
+    ex-date and at S, so `compare`'s `parent held x ratio` bound uses the basis
+    the distribution was earned in; a parent bought up since then is not offered
+    and the broker's child halts."""
+    fake.activities = [FUNDING]
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 5.0})
+    later = datetime(2026, 9, 30, 15, 0, tzinfo=UTC)  # after the ex-date's session-before
+    _order(journal_settings, run_id, "tp-more", SPY, "SPY", 5.0, at=later)
+    fake.submit(OrderRequest("tp-more", "SPY", Side.BUY, quantity=5.0))
+    fake.simulate_fill("tp-more")
+    _spinoff(journal_settings, MTUM, SPY, 0.4, CUT, ex_date=EX)
     fake.extra_quantity = {"MTUM": 4.0}
 
     with pytest.raises(ReconciliationError, match="broker_only_position"):
@@ -545,7 +600,7 @@ def test_a_spinoff_known_only_after_close_s_minus_1_still_halts(
     invisible at the cut, so the broker's child stays a mismatch."""
     fake.activities = [FUNDING]
     _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
-    _spinoff(journal_settings, MTUM, SPY, 0.4, CUT + timedelta(minutes=1))
+    _spinoff(journal_settings, MTUM, SPY, 0.4, CUT + timedelta(minutes=1), ex_date=EX)
     fake.extra_quantity = {"MTUM": 4.0}
 
     with pytest.raises(ReconciliationError, match="broker_only_position"):

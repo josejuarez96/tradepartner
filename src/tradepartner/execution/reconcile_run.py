@@ -74,12 +74,16 @@ as_of`:
   the session before the ex-date. A dividend the journal already holds as a
   `dividend_cash` row dated on or after its ex-date is never offered again.
 - `spinoffs`: each stored `spinoff` action known at close(S-1) with an ex-date
-  in `(base session, S]` and whose parent the ledger held on the session before
-  the ex-date, keyed by child `security_id` to `(parent security_id, shares
-  per parent share)` (the `execution.window` convention). A child the broker
-  books is journaled a `spinoff_receipt`; a row known only after close(S-1), a
-  wrong ratio, or a child for a parent the ledger never held stays an
-  `unknown_symbol` or `broker_only_position` mismatch (never a guess).
+  on or before S and whose parent the ledger held on the session before the
+  ex-date (still held, unchanged, at the stated session), keyed by child
+  `security_id` to `(parent security_id, shares per parent share)` (the
+  `execution.window` convention). There is no lower ex-date bound: a spin-off's
+  row is stamped on the close after Alpaca's date-only `process_date`, so it can
+  arrive weeks after the ex-date and a later `ok` reconciliation must not hide
+  it. A child the broker books is journaled a `spinoff_receipt`; a row known
+  only after close(S-1), a wrong ratio, a child for a parent the ledger never
+  held, or a parent moved since the ex-date stays an `unknown_symbol` or
+  `broker_only_position` mismatch (never a guess).
 - `reference_prices`: the raw close of the latest bar at or before S-1 per
   name, which bounds an ended name's proceeds and a pending order's reach.
 
@@ -488,30 +492,32 @@ def _spinoffs(
     tolerance: float,
     through: date,
 ) -> dict[str, tuple[str, float]]:
-    """Each `spinoff` action (#1894, #1896) whose ex-date falls in the window's
-    stated span and whose parent the ledger held, keyed by child `security_id`
-    to `(parent security_id, shares per parent share)`: the store convention
-    `execution.window` reads between windows (child is the row's `security_id`,
-    parent its `source_action_id`, ratio its `ratio_or_amount`).
+    """Each `spinoff` action (#1894, #1896) effective by `session` whose parent
+    the ledger held, keyed by child `security_id` to `(parent security_id,
+    shares per parent share)`: the store convention `execution.window` reads
+    between windows (child is the row's `security_id`, parent its
+    `source_action_id`, ratio its `ratio_or_amount`).
 
-    The read reuses `_dividends`' bounds: only rows `known_at <= close(S-1)`
-    (they come from `live_actions_as_of`, so a row known later is invisible and
-    its child stays a mismatch, never a guess) with `ex_date` in
-    `(base session, S]`, the "explained only since the last known state" bound.
+    The rows come from `live_actions_as_of(close(S-1))`, so only those known at
+    the run's cutoff are offered: a row known later is invisible and its child
+    stays a mismatch, never a guess. There is no lower ex-date bound (#1896): a
+    spin-off's row is stamped on the close after Alpaca's date-only
+    `process_date`, which can land weeks after the ex-date, and a later `ok`
+    reconciliation must not hide it once the child appears.
+
     A row is offered only when the ledger held its parent on the session before
     the ex-date (the session the distribution was earned in), so a child for a
-    parent this window never held explains nothing. The ratio is read as
-    stored: a wrong one leaves the broker's child outside `parent x ratio` and
-    `reconcile.compare` fails closed on it."""
-    base = state.base(through)
-    stated = base.at if base is not None else window.started_at
-    after = stated.astimezone(_NEW_YORK).date()
+    parent this window never held explains nothing, and only when that holding
+    still equals the ledger's stated holding, so `reconcile.compare`'s
+    `parent held x ratio` bound is computed from the same basis and a
+    since-moved parent fails closed. The ratio is read as stored: a wrong one
+    leaves the broker's child outside that bound and `compare` fails closed."""
     rows = actions.filter(
         (pl.col("action_type") == _SPINOFF)
-        & (pl.col("ex_date") > after)
         & (pl.col("ex_date") <= session)
         & (pl.col("source_action_id") != "")
     )
+    stated = _ledger(state, actions, window, through, tolerance).positions
     spinoffs: dict[str, tuple[str, float]] = {}
     holdings: dict[date, Ledger] = {}
     for row in rows.iter_rows(named=True):
@@ -519,7 +525,8 @@ def _spinoffs(
         before = previous_session(row["ex_date"])
         if before not in holdings:
             holdings[before] = _ledger(state, actions, window, before, tolerance)
-        if holdings[before].positions.get(parent, 0.0) > tolerance:
+        held = holdings[before].positions.get(parent, 0.0)
+        if held > tolerance and abs(held - stated.get(parent, 0.0)) <= tolerance:
             spinoffs[row["security_id"]] = (parent, float(row["ratio_or_amount"]))
     return spinoffs
 
