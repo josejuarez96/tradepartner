@@ -139,7 +139,12 @@ from tradepartner.execution.collect import (
 )
 from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.reconcile import OK
-from tradepartner.execution.reconcile_run import command_session, frozen_risk, reconcile_now
+from tradepartner.execution.reconcile_run import (
+    command_session,
+    frozen_risk,
+    reconcile_now,
+    verify_frozen_sha256,
+)
 from tradepartner.store.journal import (
     FillRow,
     OrderEventRow,
@@ -530,7 +535,8 @@ def resume(
     `TypeError` before anything. `connect` opens a write chunk
     (`lambda: store.db.open_for_write(settings)`). Raises `ValueError` for a
     blank `reason` before anything, `LockHeld` while another process holds the
-    run lock, `ClockError` for a bad clock reading, and whatever the broker or
+    run lock, `LimitBreachError` when the window's `frozen_json` no longer hashes to
+    its `frozen_sha256` (#2017), `ClockError` for a bad clock reading, and whatever the broker or
     the store raises; a refusal is an outcome, never an exception. `book_id`
     (default `paper.book_id`, `ValueError` outside the token grammar) names the
     book: its run lock and its open window only (ADR 0017 B.3 and B.5)."""
@@ -545,6 +551,9 @@ def resume(
         if window is None:
             return ResumeOutcome(NO_WINDOW, None, ("no_window: no paper window is open",))
         window_id = _window_id(window)
+        # Before the first read or write: limits edited after `paper start` refuse
+        # the resume with the run's `LimitBreachError` (#1984, #2017).
+        verify_frozen_sha256(window)
         frozen = frozen_risk(window)
         now = _read_clock(clock)
         stamps = _MonotonicStamps(now)
