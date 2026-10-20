@@ -959,6 +959,7 @@ class TestRefusals:
                     "master.chain_max_price_ratio",
                     "adjust.apply_spin_offs",
                     "strategy.hold_top_fraction",
+                    "portfolio.",
                 )
             )
         }

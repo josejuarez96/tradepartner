@@ -141,6 +141,9 @@ FROZEN_SECTIONS: Final = (
     "gap",
     "holdout",
     "metrics",
+    # T219 (backtest spec amendment #1872, item 1): a section listed by no family, so a
+    # file may name its keys but each is left out of the canonical set at its default.
+    "portfolio",
 )
 #: Single frozen keys outside those sections.
 FROZEN_SINGLE_KEYS: Final = ("execution.fill_price", "benchmarks", "alpaca.historical_feed")
@@ -208,13 +211,19 @@ def required_keys(family: str) -> frozenset[str]:
     """The config keys a `family` hypothesis file must name (besides `in_sample_start`):
     every key of its listed sections (`FAMILIES[family].sections`) not in
     `frozen.POST_REGISTRATION_OWN_KEYS`, plus every `costs.*` key not in
-    `frozen.POST_REGISTRATION_COST_KEYS` (those are frozen at their table default when
-    absent, never required). Raises `KeyError` for an unlisted family (ADR 0014 point 2:
-    the momentum fallback goes)."""
+    `frozen.POST_REGISTRATION_COST_KEYS` and every `portfolio.*` key not in
+    `frozen.POST_REGISTRATION_PORTFOLIO_KEYS` (all those are frozen at their table default
+    when absent, never required). Raises `KeyError` for an unlisted family (ADR 0014
+    point 2: the momentum fallback goes)."""
     keys = set(REQUIRED_SINGLE_KEYS)
-    for section in (*FAMILIES[family].sections, "costs"):  # type: ignore[index]
+    for section in (*FAMILIES[family].sections, "costs", "portfolio"):  # type: ignore[index]
         keys.update(_section_keys(section))
-    return frozenset(keys - frozen.POST_REGISTRATION_OWN_KEYS - frozen.POST_REGISTRATION_COST_KEYS)
+    return frozenset(
+        keys
+        - frozen.POST_REGISTRATION_OWN_KEYS
+        - frozen.POST_REGISTRATION_COST_KEYS
+        - frozen.POST_REGISTRATION_PORTFOLIO_KEYS
+    )
 
 
 #: Keys that are one family's rule although other families list their section
@@ -415,6 +424,7 @@ def frozen_params(parsed: HypothesisFile, settings: Settings) -> dict[str, Any]:
             frozen.POST_REGISTRATION_OWN_KEYS
             | frozen.POST_REGISTRATION_COST_KEYS
             | frozen.POST_REGISTRATION_ADJUST_KEYS
+            | frozen.POST_REGISTRATION_PORTFOLIO_KEYS
         )
         if key not in parsed.file_params and key.partition(".")[0] not in inert
     }
