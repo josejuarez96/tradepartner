@@ -6,7 +6,6 @@ F_0 = 2019-05-01, the plan buys DUALB, SPFT, TRNS a third each.
 
 from __future__ import annotations
 
-from contextlib import suppress
 from datetime import date
 
 import pytest
@@ -78,6 +77,7 @@ def test_a_bad_close_on_an_unheld_candidate_never_reaches_the_plan_as_a_target(
     price at ingest, so only a direct store write reaches the signal, and the
     candidate is ranked out, never bought."""
     set_close(env, "SEC_TRANSFER", T_0, bad)
-    with suppress(Exception):  # a halt is safe too
-        env.run(at(F_0), prices={"TRNS": 50.0})
-    assert "SEC_TRANSFER" not in {o[1] for o in env.orders()}
+    outcome = env.run(at(F_0), prices={"TRNS": 50.0})
+    assert outcome.status == "ok"
+    bought_ids = {o[1] for o in env.orders()}
+    assert bought_ids and "SEC_TRANSFER" not in bought_ids

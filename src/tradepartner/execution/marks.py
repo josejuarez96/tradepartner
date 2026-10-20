@@ -361,10 +361,10 @@ def marks_for(
                 # A bad bar is never persisted as a mark (#1983): a stored 0,
                 # negative or NaN close would value the book wrongly and engage
                 # a false drawdown that outlives the bar's repair. The data
-                # fault halts the run without the switch; a re-ingest clears it.
+                # fault halts the run without the switch; repairing the bar clears it.
                 raise StaleDataError(
                     f"bad close for held {security_id} at close({session}): {price!r}; "
-                    "no mark written, re-ingest the bar"
+                    "no mark written; delete the bad bar (repair-bars) and refill it"
                 )
             quantity = book.positions[security_id]
             marks.append(
