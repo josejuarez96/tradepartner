@@ -164,3 +164,24 @@ def test_a_lot_sold_before_a_merger_is_not_an_acquirer_replacement() -> None:
     assert [(f.replacement_lot_id, f.matched_quantity, f.disallowed_amount) for f in flags] == [
         (2, 2.5, 25.0)
     ]
+
+
+def test_a_reverse_split_leaves_no_spurious_self_match() -> None:
+    """The scan stays exact through a non-terminating ratio: a lot fully sold
+    before a 1:3 reverse split is 10/3 target shares on both sides, so it must
+    not flag itself over a float remainder (the `Lot` reports
+    `3.3333333333333335`). Hand values:
+
+      03-03 buy 10 @ 100   lot 1: basis 1000
+      03-05 sell 10 @ 90    closes lot 1 whole: proceeds 900, pnl -100 (a loss)
+      03-07 1:3 split       lot 1's acquired quantity is 10/3 today
+
+    Nothing was bought inside the window, so no flag.
+    """
+    book = Book()
+    book.trade("buy", 10, 100.0, D0303)
+    book.trade("sell", 10, 90.0, D0305)
+
+    _, _, flags = book.run(D0312, _splits(("SEC_X", D0307, 1 / 3)))
+
+    assert flags == []

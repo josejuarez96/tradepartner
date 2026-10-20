@@ -701,6 +701,7 @@ def rebuild(
             state.no_replacement,
             {lot.lot_id: lot.identities for lot in state.lots},
             state.disposal_units,
+            {lot.lot_id: lot.acquired for lot in state.lots},
         ),
     )
 
@@ -901,13 +902,16 @@ def _wash_sale_flags(
     no_replacement: set[int],
     identities: Mapping[int, set[str]],
     disposal_units: Mapping[int, Fraction],
+    lot_acquired: Mapping[int, Fraction],
 ) -> list[WashSaleFlag]:
     """Match each loss disposal, in disposal order, to replacement shares in
     acquisition order; each share absorbs one loss (module docstring). A lot no
     purchase made (a spin-off child, a carried residue) is never a replacement.
     A disposal's sale and the shares it closed are scaled to today's share units
     first (#1980), so a split or merger in between never matches more, or
-    fewer, shares than the loss covers."""
+    fewer, shares than the loss covers. `lot_acquired` is each lot's exact
+    `acquired`, never the rounded float a `Lot` reports, so a reverse split's
+    non-terminating ratio cannot leave a float remainder (#1980)."""
     by_acquisition = sorted(
         (lot for lot in lot_list if lot.position_side == LONG and lot.lot_id not in no_replacement),
         key=lambda lot: (lot.trade_at, lot.lot_id),
@@ -930,7 +934,7 @@ def _wash_sale_flags(
             if security not in identities[lot.lot_id] or days_apart > WASH_SALE_WINDOW_DAYS:
                 continue
             available = (
-                _dec(lot.quantity)
+                lot_acquired[lot.lot_id]
                 - absorbed.get(lot.lot_id, _ZERO)
                 - sold_here.get(lot.lot_id, _ZERO) * scale
             )
