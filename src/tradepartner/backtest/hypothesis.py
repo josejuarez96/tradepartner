@@ -330,8 +330,8 @@ def parse_file(path: Path) -> HypothesisFile:
         )
         if replaced:
             raise HypothesisFileError(
-                f"{path}: {frozen.RELEASE_ID_KEY} replaces the master section; "
-                f"sections; remove {', '.join(replaced)}"
+                f"{path}: {frozen.RELEASE_ID_KEY} replaces the master keys; "
+                f"remove {', '.join(replaced)}"
             )
     required = required_keys(family) | {"slug", "family", "title", "in_sample_start"}
     missing = sorted(required - set(flat))

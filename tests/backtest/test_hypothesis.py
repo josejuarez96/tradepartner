@@ -2012,7 +2012,7 @@ def test_a_file_naming_the_id_and_a_replaced_key_is_refused(
         "\n[data]\n", "\n[master]\nkeep_successors = true\n\n[data]\n", 1
     )
     path.write_text(text)
-    with pytest.raises(HypothesisFileError, match="replaces the master section"):
+    with pytest.raises(HypothesisFileError, match="replaces the master keys"):
         hypothesis.parse_file(path)
 
 
