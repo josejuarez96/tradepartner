@@ -73,9 +73,17 @@ as_of`:
   start. The cash due is the amount per share times the ledger's holding at
   the session before the ex-date. A dividend the journal already holds as a
   `dividend_cash` row dated on or after its ex-date is never offered again.
-- `spinoffs`: always empty until T48b records broker receipts, although
-  the store now holds spin-off actions. A child the broker books is an
-  `unknown_symbol` or `broker_only_position` mismatch until that task.
+- `spinoffs`: each stored `spinoff` action known at close(S-1) with an ex-date
+  on or before S and whose parent the ledger held on the session before the
+  ex-date (still held, unchanged, at the stated session), keyed by child
+  `security_id` to `(parent security_id, shares per parent share)` (the
+  `execution.window` convention). There is no lower ex-date bound: a spin-off's
+  row is stamped on the close after Alpaca's date-only `process_date`, so it can
+  arrive weeks after the ex-date and a later `ok` reconciliation must not hide
+  it. A child the broker books is journaled a `spinoff_receipt`; a row known
+  only after close(S-1), a wrong ratio, a child for a parent the ledger never
+  held, or a parent moved since the ex-date stays an `unknown_symbol` or
+  `broker_only_position` mismatch (never a guess).
 - `reference_prices`: the raw close of the latest bar at or before S-1 per
   name, which bounds an ended name's proceeds and a pending order's reach.
 
@@ -163,6 +171,7 @@ _NEW_YORK = ZoneInfo("America/New_York")
 _DIVIDEND = "dividend"
 _DIVIDEND_CASH = "dividend_cash"
 _SPLIT = "split"
+_SPINOFF = "spinoff"
 _RISK_PREFIX = "risk."
 _FAULT_TYPE = ReconciliationError.__name__
 
@@ -500,6 +509,53 @@ def _dividends(
     )
 
 
+def _spinoffs(
+    state: _JournalState,
+    actions: pl.DataFrame,
+    window: PaperWindowRow,
+    session: date,
+    tolerance: float,
+    through: date,
+) -> dict[str, tuple[str, float]]:
+    """Each `spinoff` action (#1894, #1896) effective by `session` whose parent
+    the ledger held, keyed by child `security_id` to `(parent security_id,
+    shares per parent share)`: the store convention `execution.window` reads
+    between windows (child is the row's `security_id`, parent its
+    `source_action_id`, ratio its `ratio_or_amount`).
+
+    The rows come from `live_actions_as_of(close(S-1))`, so only those known at
+    the run's cutoff are offered: a row known later is invisible and its child
+    stays a mismatch, never a guess. There is no lower ex-date bound (#1896): a
+    spin-off's row is stamped on the close after Alpaca's date-only
+    `process_date`, which can land weeks after the ex-date, and a later `ok`
+    reconciliation must not hide it once the child appears.
+
+    A row is offered only when the ledger held its parent on the session before
+    the ex-date (the session the distribution was earned in), so a child for a
+    parent this window never held explains nothing, and only when that holding
+    still equals the ledger's stated holding, so `reconcile.compare`'s
+    `parent held x ratio` bound is computed from the same basis and a
+    since-moved parent fails closed. The ratio is read as stored: a wrong one
+    leaves the broker's child outside that bound and `compare` fails closed."""
+    rows = actions.filter(
+        (pl.col("action_type") == _SPINOFF)
+        & (pl.col("ex_date") <= session)
+        & (pl.col("source_action_id") != "")
+    )
+    stated = _ledger(state, actions, window, through, tolerance).positions
+    spinoffs: dict[str, tuple[str, float]] = {}
+    holdings: dict[date, Ledger] = {}
+    for row in rows.iter_rows(named=True):
+        parent = row["source_action_id"]
+        before = previous_session(row["ex_date"])
+        if before not in holdings:
+            holdings[before] = _ledger(state, actions, window, before, tolerance)
+        held = holdings[before].positions.get(parent, 0.0)
+        if held > tolerance and abs(held - stated.get(parent, 0.0)) <= tolerance:
+            spinoffs[row["security_id"]] = (parent, float(row["ratio_or_amount"]))
+    return spinoffs
+
+
 def _stock_dividends(
     actions: pl.DataFrame, session: date, max_rate: float, max_lag_sessions: int
 ) -> dict[str, tuple[date, date, float]]:
@@ -578,7 +634,7 @@ def _explanations(
     return Explanations(
         symbols=symbols,
         ended=ended,
-        spinoffs={},
+        spinoffs=_spinoffs(state, actions, window, session, tolerance, through),
         dividends=dividends,
         dividend_findings=findings,
         reference_prices=_reference_prices(conn, cut, priced, previous_session(session)),

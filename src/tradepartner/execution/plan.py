@@ -93,7 +93,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 
 from tradepartner.backtest.costs import Commissions, buy_notional_after_costs
-from tradepartner.backtest.engine import Plan
+from tradepartner.backtest.engine import NO_T0_BAR, Plan
 from tradepartner.backtest.portfolio import (
     apply_rebalance_band,
     hold_membership,
@@ -1057,7 +1057,12 @@ def _signals(plan: Plan) -> tuple[Signal, ...]:
                 raise ValueError(f"{sid} is excluded for both {reason_of[sid]!r} and {reason!r}")
             reason_of[sid] = reason
     excluded = set(reason_of)
-    if set(plan.scores) | excluded != members or set(plan.scores) & excluded:
+    # Candidates with no T_0 bar are not universe members (the universe's rule 6 dropped
+    # them); they are recorded beside the members (#1997), never inside n_universe.
+    outside = set(plan.exclusions.get(NO_T0_BAR, ()))
+    if outside & members:
+        raise ValueError(f"{sorted(outside & members)} are members and excluded as {NO_T0_BAR}")
+    if set(plan.scores) | (excluded - outside) != members or set(plan.scores) & excluded:
         raise ValueError("the plan's scores and exclusions do not partition its members")
     if not set(plan.targets) <= set(plan.scores):
         raise ValueError("the plan has targets that are not scored members")

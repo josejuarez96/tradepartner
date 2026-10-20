@@ -744,6 +744,7 @@ class TestPublicPlan:
         assert public.exclusions == {
             "no_history": public.excluded_no_history,
             "no_turnover": (),
+            "no_t0_bar": (),
         }
         assert public.counts == {"n_excluded_no_history": public.n_excluded_no_history}
 

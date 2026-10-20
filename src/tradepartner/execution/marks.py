@@ -51,6 +51,7 @@ import polars as pl
 from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.calendar import all_sessions, next_session, previous_session, session_close
 from tradepartner.config import Cadence
+from tradepartner.errors import StaleDataError
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.switch import ENGAGED, FAULTED_RUN_STATUSES, RELEASED
 from tradepartner.store.asof import prices_as_of
@@ -287,7 +288,8 @@ def marks_for(
     alert. A gap longer than the limit, or a name with no earlier bar at all,
     raises. Every other missing bar (an untradable name's gap before its last
     bar, or a name with no bar at all) raises `ValueError`, so a stale mark is
-    never carried silently.
+    never carried silently. A held name whose priced close is not finite and
+    positive raises `StaleDataError` naming the security and session (#1983).
     """
     books = {session: ledger(session) for session in sessions}
     own: dict[date, dict[str, float]] = {}
@@ -354,6 +356,15 @@ def marks_for(
                     session.isoformat(),
                     stale_session.isoformat(),
                     flag,
+                )
+            if not (math.isfinite(price) and price > 0):
+                # A bad bar is never persisted as a mark (#1983): a stored 0,
+                # negative or NaN close would value the book wrongly and engage
+                # a false drawdown that outlives the bar's repair. The data
+                # fault halts the run without the switch; repairing the bar clears it.
+                raise StaleDataError(
+                    f"bad close for held {security_id} at close({session}): {price!r}; "
+                    "no mark written; remove the bad bar (repair-bars) and refill it"
                 )
             quantity = book.positions[security_id]
             marks.append(

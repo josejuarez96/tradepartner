@@ -79,7 +79,7 @@ import json
 import math
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from functools import partial
 from typing import Literal, Protocol, cast
@@ -187,6 +187,9 @@ class PlanOutcome:
     status: Literal["planned", "reused", "lagging"]
     decisions: tuple[DecisionRow, ...] = ()
     plan_trial_id: int | None = None
+    #: Candidates with no T_0 bar, excluded as `excluded_no_t0_bar` (#1997); the run
+    #: raises `missing_candidate_bar` for them. Empty for `reused` and `lagging`.
+    no_t0_bar: tuple[str, ...] = ()
 
 
 # --- the kind ------------------------------------------------------------------------
@@ -726,7 +729,11 @@ def _plan_at(
 ) -> engine.Plan:
     lend = partial(_lend, conn)
     with StoreProvider(lend, handle, params, registry_connect=lend) as provider:
-        return engine.plan(provider, params, t_i, family=family)
+        plan = engine.plan(provider, params, t_i, family=family)
+        lost = engine.no_t0_bar_candidates(provider, params, t_i)
+    if not lost:
+        return plan
+    return replace(plan, exclusions={**plan.exclusions, engine.NO_T0_BAR: lost})
 
 
 def _close_ok(conn: duckdb.DuckDBPyConnection, handle: registry.TrialHandle) -> None:
@@ -867,4 +874,6 @@ def plan_rebalance(
         _rollback(conn)
         raise
     conn.commit()
-    return PlanOutcome(t_i, "planned", rows, handle.trial_id)
+    return PlanOutcome(
+        t_i, "planned", rows, handle.trial_id, tuple(plan.exclusions.get(engine.NO_T0_BAR, ()))
+    )
