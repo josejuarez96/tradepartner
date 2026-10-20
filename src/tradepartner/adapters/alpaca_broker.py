@@ -97,6 +97,7 @@ from zoneinfo import ZoneInfo
 
 from tradepartner.adapters.alpaca_prices import master_symbol
 from tradepartner.adapters.alpaca_trading_raw import (
+    DUPLICATE_MESSAGE,
     AlpacaPaperGuardError,
     AlpacaTradingError,
     AlpacaTradingRaw,
@@ -161,7 +162,7 @@ _SIMPLE_ORDER_CLASS = "simple"
 _DUPLICATE_STATUS = 422
 _DUPLICATE_CODE = 40010001
 #: Exact message in tests/fixtures/alpaca/paper/duplicate_client_order_id.json.
-_DUPLICATE_MESSAGE = "client_order_id must be unique"
+_DUPLICATE_MESSAGE = DUPLICATE_MESSAGE
 #: A cancel refused because the order is no longer cancelable, or gone.
 _CANCEL_REFUSALS = frozenset({_NOT_FOUND, _DUPLICATE_STATUS})
 #: `fills(None)` reads from here.

@@ -55,7 +55,9 @@ OPEN_ORDERS_LIMIT = 500
 ACTIVITIES_PAGE_SIZE = 100
 _RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _DUPLICATE_STATUS_CODE = 422
-_DUPLICATE_ERROR_CODE = 40010001  # "client_order_id must be unique" (recorded, T48b)
+_DUPLICATE_ERROR_CODE = 40010001  # shared with three other refusals (#1884, #1901)
+#: Exact message in tests/fixtures/alpaca/paper/duplicate_client_order_id.json.
+DUPLICATE_MESSAGE = "client_order_id must be unique"
 
 
 class AlpacaPaperCredentialsError(RuntimeError):
@@ -229,7 +231,9 @@ def _describe(error: APIError | requests.RequestException) -> tuple[int | None, 
 
 def _is_duplicate(error: AlpacaTradingError) -> bool:
     """Alpaca's duplicate `client_order_id` refusal: 422 whose JSON body's `code` is
-    40010001. Fails closed: an unparseable or non-object body is not a duplicate."""
+    40010001 and `message` is `DUPLICATE_MESSAGE` (the code is shared with a bad
+    intent, a zero qty and two trail fields, #1901). Fails closed: an unparseable or
+    non-object body is not a duplicate."""
     if error.status_code != _DUPLICATE_STATUS_CODE:
         return False
     try:
@@ -239,7 +243,11 @@ def _is_duplicate(error: AlpacaTradingError) -> bool:
     if not isinstance(body, dict):
         return False
     code = body.get("code")
-    return type(code) is int and code == _DUPLICATE_ERROR_CODE
+    return (
+        type(code) is int
+        and code == _DUPLICATE_ERROR_CODE
+        and body.get("message") == DUPLICATE_MESSAGE
+    )
 
 
 def market_day_order(
