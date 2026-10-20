@@ -36,6 +36,8 @@ from tradepartner.dashboard import header, theme
 from tradepartner.execution import ops
 from tradepartner.execution.ops import OpsData, OrderChain, RankedSignal
 from tradepartner.execution.switch import SwitchState
+from tradepartner.store import journal
+from tradepartner.store.asof import listings_as_of
 from tradepartner.store.journal import AlertRow, ReconciliationRow
 from tradepartner.store.schema import SchemaVersionError
 
@@ -61,10 +63,10 @@ _SUMMARY_SCHEMA: dict[str, pl.DataType] = {
     "open_orders": pl.Int64(),
     "kill_switch": pl.Utf8(),
     "last_run": pl.Utf8(),
-    "next_rebalance": pl.Date(),
+    "next_rebalance": pl.Utf8(),
 }
 _RANKING_SCHEMA: dict[str, pl.DataType] = {
-    "security_id": pl.Utf8(),
+    "ticker": pl.Utf8(),
     "rank": pl.Int64(),
     "score": pl.Float64(),
     "signal_reason": pl.Utf8(),
@@ -73,7 +75,6 @@ _RANKING_SCHEMA: dict[str, pl.DataType] = {
     "selected": pl.Boolean(),
 }
 _FILLS_SCHEMA: dict[str, pl.DataType] = {
-    "security_id": pl.Utf8(),
     "symbol": pl.Utf8(),
     "side": pl.Utf8(),
     "quantity": pl.Float64(),
@@ -125,6 +126,10 @@ def _switch_text(state: SwitchState) -> str:
     return "run in progress" if state.run_in_progress else "released"
 
 
+def _rebalance_result(row: ops.BookSummary) -> str:
+    return "traded today" if row.last_run_has_orders else "ran today with no orders"
+
+
 def _summary_table(summaries: tuple[ops.BookSummary, ...]) -> pl.DataFrame:
     return pl.DataFrame(
         [
@@ -136,7 +141,14 @@ def _summary_table(summaries: tuple[ops.BookSummary, ...]) -> pl.DataFrame:
                 "open_orders": row.open_orders_count,
                 "kill_switch": _switch_text(row.switch_state),
                 "last_run": row.last_run_status,
-                "next_rebalance": row.next_rebalance_session,
+                "next_rebalance": (
+                    str(row.next_rebalance_session or "-")
+                    + (
+                        f"; rebalance {traded} {_rebalance_result(row)}"
+                        if (traded := ops.rebalance_traded_today(row)) is not None
+                        else ""
+                    )
+                ),
             }
             for row in summaries
         ],
@@ -184,16 +196,38 @@ def _kpis(data: OpsData) -> None:
         _switch_badge(data.switch_state)
 
 
-def _ranking_table(ranking: tuple[RankedSignal, ...]) -> pl.DataFrame:
+def _symbols(conn: duckdb.DuckDBPyConnection, data: OpsData) -> dict[str, str]:
+    """Ranking tickers known at the plan, with submitted order symbols as fallback."""
+    ids = {r.security_id for r in data.ranking}
+    symbols: dict[str, str] = {}
+    if data.plan_known_at is not None and ids:
+        listings = listings_as_of(conn, data.plan_known_at, sorted(ids))
+        for row in (
+            listings.filter(pl.col("valid_from") <= data.plan_known_at.date())
+            .sort("valid_from")
+            .iter_rows(named=True)
+        ):
+            symbols[str(row["security_id"])] = str(row["ticker"])
+    if data.window is not None and data.window.window_id is not None:
+        limit = max(len(data.chains), len(data.ranking), len(data.fills), 1)
+        for order in journal.orders_for(conn, window_id=data.window.window_id, limit=limit):
+            if data.plan_known_at is not None and order.known_at <= data.plan_known_at:
+                symbols.setdefault(order.security_id, order.symbol)
+            symbols[order.client_order_id] = order.symbol
+    return symbols
+
+
+def _ranking_table(ranking: tuple[RankedSignal, ...], symbols: dict[str, str]) -> pl.DataFrame:
     return pl.DataFrame(
         [
             {
-                "security_id": r.security_id,
+                "ticker": symbols.get(r.security_id, f"Ticker unavailable ({r.security_id})"),
                 "rank": r.rank,
                 "score": r.score,
                 "signal_reason": r.signal_reason,
                 "decision": r.decision,
-                "decision_reason": r.decision_reason,
+                "decision_reason": r.decision_reason
+                or "No separate reason recorded; see signal reason",
                 "selected": r.selected,
             }
             for r in ranking
@@ -202,22 +236,22 @@ def _ranking_table(ranking: tuple[RankedSignal, ...]) -> pl.DataFrame:
     )
 
 
-def _ranking_hero(data: OpsData, palette: theme.Palette) -> None:
+def _ranking_hero(data: OpsData, palette: theme.Palette, symbols: dict[str, str]) -> None:
     with st.container(border=True):
         st.subheader("Signal ranking")
         if not data.ranking:
             st.caption("No ranking yet for this window.")
             return
-        table = _ranking_table(data.ranking)
+        table = _ranking_table(data.ranking, symbols)
         scored = table.filter(pl.col("score").is_not_null())
         if scored.is_empty():
             st.caption("No scored names in the latest plan.")
         else:
             chart = (
-                alt.Chart(scored.to_pandas())
+                alt.Chart(scored.sort("rank").head(20).to_pandas())
                 .mark_bar(cornerRadiusEnd=4)
                 .encode(
-                    x=alt.X("security_id:N", title=None, sort="-y"),
+                    x=alt.X("ticker:N", title=None, sort="-y", axis=alt.Axis(labelAngle=-45)),
                     y=alt.Y("score:Q", title="score"),
                     color=alt.Color(
                         "selected:N",
@@ -227,7 +261,7 @@ def _ranking_hero(data: OpsData, palette: theme.Palette) -> None:
                         legend=alt.Legend(title=None),
                     ),
                     tooltip=[
-                        alt.Tooltip("security_id:N"),
+                        alt.Tooltip("ticker:N"),
                         alt.Tooltip("score:Q"),
                         alt.Tooltip("signal_reason:N"),
                         alt.Tooltip("decision:N"),
@@ -236,7 +270,9 @@ def _ranking_hero(data: OpsData, palette: theme.Palette) -> None:
                 )
             )
             st.altair_chart(theme.style(chart, palette), theme=None, width="stretch")
-            st.caption("Accent bars are the target set (in); the rest are out.")
+            st.caption(
+                "Top 20 scored names shown; the table has every name. Accent bars are targets."
+            )
         st.dataframe(table, hide_index=True)
 
 
@@ -244,7 +280,6 @@ def _fills_table(data: OpsData) -> pl.DataFrame:
     return pl.DataFrame(
         [
             {
-                "security_id": f.security_id,
                 "symbol": f.symbol,
                 "side": f.side,
                 "quantity": f.fill.quantity,
@@ -276,15 +311,20 @@ def _chain_table(chain: OrderChain) -> pl.DataFrame:
     )
 
 
-def _chains_card(data: OpsData) -> None:
+def _chains_card(data: OpsData, symbols: dict[str, str]) -> None:
     with st.container(border=True):
         st.subheader("Order chain")
         if not data.chains:
             st.caption("No orders yet in this window.")
             return
-        ids = [c.client_order_id for c in data.chains]
-        picked = st.selectbox("Order", ids, key="ops_chain_order")
-        chain = next(c for c in data.chains if c.client_order_id == picked)
+        labels = [
+            f"{symbols.get(c.client_order_id, 'Ticker unavailable')} #{i + 1} ({c.client_order_id})"
+            for i, c in enumerate(data.chains)
+        ]
+        picked = st.selectbox(
+            "Order", range(len(data.chains)), format_func=lambda i: labels[i], key="ops_chain_order"
+        )
+        chain = data.chains[int(picked)]
         st.dataframe(_chain_table(chain), hide_index=True)
         if data.chains_capped:
             st.caption("Some steps are not shown; the window has more than the row limit.")
@@ -349,12 +389,15 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
         theme.status_badge("stale: no run yet for the required session", "warning")
 
     _kpis(data)
+    if data.open_orders_count and data.last_run_kind == "rebalance":
+        st.info("Fills are recorded at the next scheduled run")
+    symbols = _symbols(conn, data)
     palette = theme.palette()
-    _ranking_hero(data, palette)
+    _ranking_hero(data, palette, symbols)
     left, right = st.columns(2)
     with left:
         _fills_card(data)
-        _chains_card(data)
+        _chains_card(data, symbols)
     with right:
         _alerts_card(data)
         _reconciliation_card(data.reconciliation)

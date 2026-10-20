@@ -133,6 +133,7 @@ from tradepartner.calendar import (
     session_close,
 )
 from tradepartner.config import Cadence, Settings, get_settings
+from tradepartner.store.benchmarks import CHECK_ONLY_IDS
 from tradepartner.store.db import configure_connection, insert_row, utc_now
 from tradepartner.store.schema import (
     REBALANCE_COUNT_COLUMNS,
@@ -503,6 +504,8 @@ def code_tree_sha256(repo_dir: Path | None = None) -> str | None:
 # not a store table until that task lands) are written by ingests nothing a
 # registered trial reads. `openfigi_types` (#1713, T189c) joins them: a
 # check-only table whose one reader is the `health` types block.
+# `mergers` (#1762, T248c) joins them: its one reader is the paper
+# reconciliation, so a merger backfill stales no trial.
 # `tests/store/test_registry.py` pins that this list
 # and the exclusions together cover every fact table.
 _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
@@ -521,6 +524,14 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
     "successor_chains",
 )
 
+#: The rows of a check-only security (`store.benchmarks.CHECK_ONLY_IDS`: RSP, stored for
+#: the index check alone; backtest spec amendment #1598, item 3, question 37) are left
+#: out of the vintage under both `spin_offs` values. This is exact, since no trial can
+#: read them; counted, the one RSP backfill would stale every counted trial.
+_NOT_CHECK_ONLY: Final = (
+    " AND security_id NOT IN (" + ", ".join(f"'{s}'" for s in sorted(CHECK_ONLY_IDS)) + ")"
+)
+
 #: The rows of `corporate_actions` a trial can read: the action types that
 #: move a price series. A `spinoff` row (#1506, T172) is written by the
 #: corporate-actions ingests and read by `window.start` alone until a trial opts
@@ -528,7 +539,8 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
 #: #1894, item 6; T211d), so at the default `False` it must not stale a trial.
 #: Every other trial table contributes all of its rows.
 _TRIAL_TABLE_ROWS: Final[dict[str, str]] = {
-    "corporate_actions": " AND action_type IN ('split', 'dividend')",
+    "corporate_actions": f" AND action_type IN ('split', 'dividend'){_NOT_CHECK_ONLY}",
+    "prices_daily": _NOT_CHECK_ONLY,
     # #821 (T187): a chain's retraction changes the reads from the stamp it
     # withdraws, since a moved chain reads absent before its new stamp
     # (`schema.successor_chains`), so it counts from `withdrawn_known_at`.
@@ -553,8 +565,8 @@ def data_vintage(
     store happens to have -- with a table absent from the store skipped, and
     with `corporate_actions` counted only for its `split` and `dividend` rows
     and a `successor_chains` retraction counted from its `withdrawn_known_at`
-    (`_TRIAL_TABLE_ROWS`; #821). Writing a `borrow_status` or `symbol_changes` row
-    therefore moves no trial's vintage, while `store_max_ingested_at` below
+    (`_TRIAL_TABLE_ROWS`; #821). Writing a `borrow_status`, `symbol_changes` or
+    `mergers` row therefore moves no trial's vintage, while `store_max_ingested_at` below
     stays whole over every fact table: it is the store's state, not a trial's.
 
     `spin_offs` (backtest spec amendment #1894, item 6; T211d) adds the
@@ -568,7 +580,12 @@ def data_vintage(
         raise ValueError(f"cutoff must be timezone-aware, got {cutoff!r}")
     rows = _TRIAL_TABLE_ROWS
     if spin_offs:
-        rows = {**rows, "corporate_actions": " AND action_type IN ('split', 'dividend', 'spinoff')"}
+        rows = {
+            **rows,
+            "corporate_actions": (
+                f" AND action_type IN ('split', 'dividend', 'spinoff'){_NOT_CHECK_ONLY}"
+            ),
+        }
     present = set(_present_fact_tables(conn))
     tables = [table for table in _TRIAL_FACT_TABLES if table in present]
     facts: datetime | None = None

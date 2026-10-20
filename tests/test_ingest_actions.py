@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pytest
@@ -531,3 +532,86 @@ def test_symbol_change_revision_is_stamped_at_ingest(
     assert conn.execute(
         "SELECT new_cusip, known_at FROM symbol_changes ORDER BY known_at"
     ).fetchall() == [("B", first), ("C", revised)]
+
+
+def _merger(**over: Any) -> Any:
+    from tradepartner.adapters.prices import Merger
+
+    values: dict[str, Any] = {
+        "security_id": "ACQUIREE",
+        "kind": "cash",
+        "acquirer_security_id": None,
+        "acquiree_symbol": "TGT",
+        "acquiree_cusip": "",
+        "acquirer_symbol": "",
+        "acquirer_cusip": "",
+        "share_ratio": None,
+        "cash_per_share": 10.0,
+        "effective_date": date(2020, 12, 1),
+        "process_date": date(2020, 12, 1),
+        "payable_date": None,
+        "known_at": datetime(2020, 12, 2, 21, tzinfo=UTC),
+        "source": "alpaca",
+        "source_action_id": "m-1",
+    }
+    return Merger(**{**values, **over})
+
+
+def test_merger_is_stored_at_its_stamp_and_never_early(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """No look-ahead: a record stamped after the run's clock is skipped and
+    counted; at the stamp it is stored with exactly that `known_at`; a repeat
+    adds nothing."""
+    from tradepartner.ingest import _add_mergers
+    from tradepartner.store.asof import mergers_as_of
+
+    row = _merger()
+    stamp = row.known_at
+    stats: dict[str, int] = {}
+    early = stamp - timedelta(microseconds=1)
+    assert _add_mergers(conn, [row], ingested_at=early, stats=stats) == 0
+    assert stats["actions_not_yet_known"] == 1
+    assert conn.execute("SELECT count(*) FROM mergers").fetchone() == (0,)
+    assert _add_mergers(conn, [row], ingested_at=stamp) == 1
+    assert _add_mergers(conn, [row], ingested_at=stamp + timedelta(days=1)) == 0
+    assert conn.execute("SELECT known_at, ingested_at, provenance FROM mergers").fetchall() == [
+        (stamp, stamp, "action")
+    ]
+    assert mergers_as_of(conn, early).height == 0
+    assert mergers_as_of(conn, stamp).height == 1
+
+
+def test_merger_revision_is_stamped_at_ingest(conn: duckdb.DuckDBPyConnection) -> None:
+    from tradepartner.ingest import _add_mergers
+
+    row = _merger()
+    first = row.known_at
+    assert _add_mergers(conn, [row], ingested_at=first) == 1
+    revised = first + timedelta(days=2)
+    assert _add_mergers(conn, [replace(row, cash_per_share=11.0)], ingested_at=revised) == 1
+    assert conn.execute(
+        "SELECT cash_per_share, known_at FROM mergers ORDER BY known_at"
+    ).fetchall() == [(10.0, first), (11.0, revised)]
+
+
+@pytest.mark.parametrize("together", [True, False])
+def test_two_ids_of_one_deal_are_both_stored_and_counted(
+    conn: duckdb.DuckDBPyConnection, together: bool
+) -> None:
+    """One acquiree and one `effective_date` under two ids: both stored and
+    counted `merger_conflict`, whether they arrive in one run or in two."""
+    from tradepartner.ingest import _add_mergers
+
+    a = _merger()
+    b = _merger(kind="stock", acquirer_security_id="BUYER", share_ratio=2.0, cash_per_share=None)
+    b = replace(b, source_action_id="m-2")
+    at = a.known_at + timedelta(days=1)
+    stats: dict[str, int] = {}
+    if together:
+        assert _add_mergers(conn, [a, b], ingested_at=at, stats=stats) == 2
+    else:
+        assert _add_mergers(conn, [a], ingested_at=at) == 1
+        assert _add_mergers(conn, [b], ingested_at=at + timedelta(days=1), stats=stats) == 1
+    assert stats["merger_conflict"] == 1
+    assert conn.execute("SELECT count(*) FROM mergers").fetchone() == (2,)

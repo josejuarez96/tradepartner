@@ -52,6 +52,7 @@ from pydantic import (
     SerializerFunctionWrapHandler,
     StrictBool,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_serializer,
     model_validator,
@@ -1076,6 +1077,43 @@ class BorrowConfig(_ClosedConfig):
     raw_dir: str = Field(default_factory=_default_alpaca_assets_dir)
 
 
+_MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+
+
+class IndexCheckConfig(_ClosedConfig):
+    """The known-answer index check (backtest spec amendment 2026-10-19, #1598).
+
+    **Not frozen** and part of no hypothesis: the check is never a trial and no
+    registered canonical set, fingerprint or hash includes these keys. `start_month`
+    and `end_month` are the default window (the owner, 2026-10-12);
+    `check_only_symbols` are benchmark series stored for the check alone, which no
+    trial can read (`store.benchmarks.CHECK_ONLY_IDS`), so a symbol here may not also
+    be in `benchmarks` (`Settings` refuses the overlap); `equal_benchmark` and
+    `cap_benchmark` are the series the equal- and cap-weight books are compared with.
+    `worst_months` months are listed per weighting, each with `names_per_month`
+    names plus every name whose return is at least `extreme_name_return` (the first
+    pass's 60 % screen).
+    """
+
+    start_month: str = Field(default="2019-08", pattern=_MONTH_PATTERN)
+    end_month: str = Field(default="2026-09", pattern=_MONTH_PATTERN)
+    check_only_symbols: list[str] = Field(default_factory=lambda: ["RSP"])
+    equal_benchmark: str = Field(default="RSP", min_length=1)
+    cap_benchmark: str = Field(default="SPY", min_length=1)
+    worst_months: int = Field(default=10, ge=1)
+    names_per_month: int = Field(default=5, ge=1)
+    extreme_name_return: float = Field(default=0.60, gt=0.0)
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> IndexCheckConfig:
+        if self.end_month < self.start_month:
+            raise ValueError(
+                f"index_check.end_month ({self.end_month}) must not be before "
+                f"start_month ({self.start_month})"
+            )
+        return self
+
+
 class OpenfigiConfig(_ClosedConfig):
     """Current types check; unset limits use documented keyed/keyless limits."""
 
@@ -1350,6 +1388,13 @@ class StrategyConfig(BaseModel):
     `signal_delay_sessions`, `placebo` and `placebo_seed` are the kill ladder's rung-4
     delay and rung-5 placebo (ADR 0023; backtest spec amendment #1820): post-registration
     own-section keys, inert at their defaults and read by the engine's plan step.
+
+    `hold_top_fraction` is the `momentum` buy/hold buffer (backtest spec amendment #657):
+    0.0 (the default) is no buffer; otherwise a name held at the last rebalance stays
+    while it ranks inside this share, and `top_fraction <= value <= 1` is required. A
+    value equal to `top_fraction` is normalised to 0.0, so the two spellings of "no
+    buffer" are one hypothesis. It is a rule of `equal` weighting and a
+    post-registration own-section key.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1366,6 +1411,27 @@ class StrategyConfig(BaseModel):
     signal_delay_sessions: int = Field(default=0, ge=0)
     placebo: Literal["none", "shuffle", "random_entry"] = "none"
     placebo_seed: int = Field(default=0, ge=0)
+    hold_top_fraction: float = Field(default=0.0, ge=0, le=1)
+
+    @field_validator("hold_top_fraction")
+    @classmethod
+    def _validate_hold_top_fraction(cls, value: float, info: ValidationInfo) -> float:
+        top = info.data.get("top_fraction")
+        if top is None or value == 0.0:
+            return value
+        if value == top:
+            return 0.0
+        if value < top:
+            raise ValueError(
+                f"strategy.hold_top_fraction ({value}) must be 0.0 or at least "
+                f"strategy.top_fraction ({top})"
+            )
+        if info.data.get("weighting") == "hold":
+            raise ValueError(
+                f"strategy.hold_top_fraction ({value}) is a rule of equal weighting; "
+                "strategy.weighting = 'hold' has its own exit rule"
+            )
+        return value
 
     @model_validator(mode="after")
     def _validate_formation_window(self) -> StrategyConfig:
@@ -1426,6 +1492,67 @@ class CombinedConfig(BaseModel):
     weighting: Literal["equal"] = "equal"
 
 
+class PortfolioConfig(_ClosedConfig):
+    """The signed-book keys, the frozen section `portfolio` (backtest spec amendment
+    #1872, item 1).
+
+    `side` selects a long-only or a long/short book. `gross_exposure` is the sum of the
+    absolute target weights, in `(0, 1.0]`: the upper bound is ADR 0024 item 4's
+    placeholder, "so a backtest never tests what paper cannot hold". `net_exposure` is
+    the sum of the signed target weights, in `[-gross, gross]` and equal to
+    `gross_exposure` under `long_only`. `short_min_price` is the shortability proxy's
+    price floor in dollars (item 3; Alpaca's own $5 maintenance line), and
+    `short_cover_weight` the drift cover's short-value share of equity (item 7).
+
+    The section is listed by no family and is a post-registration section under the
+    2026-10-09 and #1792 rules, so every key is left out of the canonical set and the
+    fingerprint at its default and no stored registration moves. Until the engine reads
+    all five (T223) `_refuse_until_wired` refuses any non-default value, the #1788
+    guard, so no `long_short` trial can run on a half-built engine.
+    """
+
+    side: Literal["long_only", "long_short"] = "long_only"
+    gross_exposure: float = Field(default=1.0, gt=0, le=1.0)
+    net_exposure: float = Field(default=1.0, ge=-1.0, le=1.0)
+    short_min_price: float = Field(default=5.0, gt=0)
+    short_cover_weight: float = Field(default=0.10, gt=0, le=1.0)
+
+    @model_validator(mode="after")
+    def _refuse_until_wired(self) -> PortfolioConfig:
+        """The #1788 guard (T209a, T217): the engine reads none of the five until T223,
+        so a non-default value would name a book no run builds. T223 removes this."""
+        for name in (
+            "side",
+            "gross_exposure",
+            "net_exposure",
+            "short_min_price",
+            "short_cover_weight",
+        ):
+            value = getattr(self, name)
+            if value != PortfolioConfig.model_fields[name].default:
+                raise ValueError(
+                    f"portfolio.{name} = {value!r} is not wired until T223: the engine "
+                    "still builds a long-only book"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_exposures(self) -> PortfolioConfig:
+        """`net_exposure` in `[-gross, gross]`, equal to `gross_exposure` under
+        `long_only` (spec item 1). Live once T223's guard goes."""
+        if not (-self.gross_exposure <= self.net_exposure <= self.gross_exposure):
+            raise ValueError(
+                f"portfolio.net_exposure ({self.net_exposure}) must be in "
+                f"[{-self.gross_exposure}, {self.gross_exposure}]"
+            )
+        if self.side == "long_only" and self.net_exposure != self.gross_exposure:
+            raise ValueError(
+                f"portfolio.net_exposure ({self.net_exposure}) must equal "
+                f"portfolio.gross_exposure ({self.gross_exposure}) under 'long_only'"
+            )
+        return self
+
+
 # --- The family registry (ADR 0014; T128) ------------------------------------
 #
 # One table from which every per-family table derives. Each entry pins:
@@ -1473,8 +1600,15 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         paper_ready=True,
         # `no_turnover` and its two counts are B10's screen, reported only when
         # `strategy.turnover_top_fraction` is below 1.0 (backtest spec amendment #1358).
-        exclusion_reasons=("no_history", "no_turnover"),
-        count_names=("n_excluded_no_history", "n_screened", "n_excluded_no_turnover"),
+        exclusion_reasons=("no_history", "no_turnover", "no_t0_bar"),
+        # `n_retained` is the buffer's count, reported only when `strategy.hold_top_fraction`
+        # is non-zero (backtest spec amendment #657).
+        count_names=(
+            "n_excluded_no_history",
+            "n_screened",
+            "n_excluded_no_turnover",
+            "n_retained",
+        ),
         benchmark="MTUM",
         sweepable_keys=(
             "strategy.formation_months",
@@ -1483,6 +1617,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
             "strategy.weighting",
             "strategy.signal_total_return",
             "strategy.turnover_top_fraction",
+            "strategy.hold_top_fraction",
         ),
     ),
     "oracle": FamilySpec(
@@ -1491,7 +1626,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         parent=None,
         engine_ready=True,
         paper_ready=True,
-        exclusion_reasons=("no_history",),
+        exclusion_reasons=("no_history", "no_t0_bar"),
         count_names=("n_excluded_no_history",),
         benchmark="MTUM",
         sweepable_keys=(),
@@ -1504,7 +1639,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         # Paper-ready by the owner's word in ADR 0017 part D (ADR 0014 point 5, T152).
         paper_ready=True,
         # The four reasons `gross_profitability` may report (`backtest/signals.py:225`).
-        exclusion_reasons=("sector", "no_facts", "stale_facts", "malformed"),
+        exclusion_reasons=("sector", "no_facts", "stale_facts", "malformed", "no_t0_bar"),
         # The six count names of spec amendment #720 (T85d).
         count_names=(
             "n_ranked",
@@ -1538,6 +1673,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
             "stale_facts",
             "malformed",
             "one_signal_only",
+            "no_t0_bar",
         ),
         # Both sub-signals' counts plus `n_combined` (T130).
         count_names=(
@@ -1602,6 +1738,14 @@ class CostsConfig(BaseModel):
     `per_side_bps`, `impact_coeff` scales `sqrt(notional / ADV)` market impact, and
     `adv_sessions` is the window (in XNYS sessions) over which ADV is measured. Both new
     rate keys are `ge=0`; `adv_sessions` must hold at least one session.
+
+    Amendment 2026-10-19 (#1872) item 6 (T221): `borrow_bps_per_year` is the declared
+    headline borrow fee on a short book's value, in basis points a year (default 0.0, so
+    a long-only book pays none), and `borrow_sensitivity_bps` lists further rates, each
+    run as one more reported-only book. Both are non-negative; a `long_short` file is
+    refused `refused_borrow_rate` at registration unless its headline is above 0 and
+    {0, 30, 300} is inside the headline and the sensitivities together. The engine reads
+    them at T222.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1615,6 +1759,8 @@ class CostsConfig(BaseModel):
     sensitivity_per_side_bps: list[Annotated[float, Field(ge=0)]] = Field(
         default_factory=lambda: [0.0, 30.0, 60.0, 100.0]
     )
+    borrow_bps_per_year: float = Field(default=0.0, ge=0)
+    borrow_sensitivity_bps: list[Annotated[float, Field(ge=0)]] = Field(default_factory=list)
 
 
 class HoldoutConfig(BaseModel):
@@ -2446,6 +2592,11 @@ class Settings(BaseSettings):
     # #1506 (T171c): the borrow-status snapshot, after `health` for the same reason.
     borrow: BorrowConfig = Field(default_factory=BorrowConfig)
     openfigi: OpenfigiConfig = Field(default_factory=OpenfigiConfig)
+    # #1598 (T243): the known-answer index check; not frozen, part of no hypothesis.
+    index_check: IndexCheckConfig = Field(default_factory=IndexCheckConfig)
+    # T219 (backtest spec amendment #1872): the signed-book section, after the other
+    # appended sections for the same reason.
+    portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
@@ -2498,6 +2649,19 @@ class Settings(BaseSettings):
         # raises a plain `ValueError` whose message names only the bad key, never a
         # secret (code-review finding on #952).
         self._validate_lab_sweepable_keys()
+        # Also a plain attribute read and raise, for the same reason (T243).
+        self._validate_check_only_symbols()
+
+    def _validate_check_only_symbols(self) -> None:
+        """`index_check.check_only_symbols` may not overlap `benchmarks` (backtest
+        spec amendment #1598, item 3): a check-only series must stay out of every
+        trial's reach, and `benchmarks` is the trial list."""
+        overlap = sorted(set(self.index_check.check_only_symbols) & set(self.benchmarks))
+        if overlap:
+            raise ValueError(
+                f"index_check.check_only_symbols {overlap} also in benchmarks: a check-only "
+                "series must not be a trial benchmark"
+            )
 
     def _validate_lab_sweepable_keys(self) -> None:
         """`lab.sweepable_keys` (strategy-lab spec req 1; Amendment 2026-10-05 (#952,

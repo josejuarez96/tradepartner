@@ -28,6 +28,7 @@ import pytest
 
 from tradepartner.config import Cadence, Settings
 from tradepartner.store import journal, registry, schema
+from tradepartner.store.benchmarks import CHECK_ONLY_IDS
 from tradepartner.store.db import insert_row
 
 _T0 = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
@@ -1119,10 +1120,11 @@ def test_every_fact_table_is_classified_for_trial_vintage(
         included = set(registry._TRIAL_FACT_TABLES)
         # Outside the trial vintage: `rates` (#1538, T169b: stored for later
         # consumers), `borrow_status` (#1506, T171) and `symbol_changes`
-        # (#1506, the 2026-10-11 amendment) -- none is read by a reader a
-        # registered trial uses. `successor_chains` (#821, T187) is inside
-        # the vintage: its rows move the chained reads a trial sees.
-        excluded = {"rates", "borrow_status", "symbol_changes", "openfigi_types"}
+        # (#1506, the 2026-10-11 amendment) and `mergers` (#1762, T248c) --
+        # none is read by a reader a registered trial uses. `successor_chains`
+        # (#821, T187) is inside the vintage: its rows move the chained reads a
+        # trial sees.
+        excluded = {"rates", "borrow_status", "symbol_changes", "openfigi_types", "mergers"}
         assert included.isdisjoint(excluded)
         # An included name must be a store table, and every store table must
         # be classified on one side. `symbol_changes` is the amendment's
@@ -1266,6 +1268,64 @@ def test_a_borrow_status_row_and_a_spinoff_move_no_trial_vintage(
     assert registry.store_max_ingested_at(fixture_store) == _LATE_INGEST
     for cutoff in cutoffs:
         assert registry.data_vintage(fixture_store, cutoff) == before[cutoff], cutoff
+
+
+def test_a_merger_row_moves_no_trial_vintage(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The vintage rule (spec amendment 2026-10-19, #1762, T248c): `data_vintage`
+    is unchanged at every fixture cutoff, under either `spin_offs`, by a `mergers`
+    row with a later `ingested_at` (a revision of the fixture's cash merger, and a
+    new stock merger), because no trial reads the table; `store_max_ingested_at`
+    is the store's state and moves."""
+    cutoffs = _fixture_cutoffs(fixture_store)
+    assert "mergers" in _tables(fixture_store)
+    assert fixture_store.execute("SELECT count(*) FROM mergers").fetchone() == (2,)
+    before = {
+        (cutoff, flag): registry.data_vintage(fixture_store, cutoff, spin_offs=flag)
+        for cutoff in cutoffs
+        for flag in (False, True)
+    }
+    row = {
+        "security_id": "SEC_CLEAN_MERGER",
+        "kind": "cash",
+        "acquirer_security_id": None,
+        "acquiree_symbol": "CLNM",
+        "acquiree_cusip": "",
+        "acquirer_symbol": "",
+        "acquirer_cusip": "",
+        "share_ratio": None,
+        "cash_per_share": 63.0,
+        "effective_date": date(2018, 7, 25),
+        "process_date": date(2018, 7, 25),
+        "payable_date": None,
+        "source_action_id": "fixture-merger-cash-1",
+        "known_at": _LATE_INGEST,
+        "ingested_at": _LATE_INGEST,
+        "source": "alpaca",
+        "provenance": "action",
+    }
+    insert_row(fixture_store, "mergers", row)
+    insert_row(
+        fixture_store,
+        "mergers",
+        row
+        | {
+            "security_id": "SEC_DIV_REVISED",
+            "kind": "stock",
+            "acquirer_security_id": "SEC_SPLIT_PLAIN",
+            "share_ratio": 2.0,
+            "cash_per_share": None,
+            "source_action_id": "pin-stock",
+            "known_at": _PIN_KNOWN,
+        },
+    )
+    assert registry.store_max_ingested_at(fixture_store) == _LATE_INGEST
+    for cutoff in cutoffs:
+        for flag in (False, True):
+            assert (
+                registry.data_vintage(fixture_store, cutoff, spin_offs=flag) == before[cutoff, flag]
+            ), (cutoff, flag)
 
 
 def test_a_spinoff_row_moves_the_vintage_only_under_spin_offs(
@@ -2309,3 +2369,47 @@ def test_a_shakedown_note_refuses_an_unknown_alert(conn: duckdb.DuckDBPyConnecti
         with pytest.raises(ValueError):
             registry.record_decision(conn, kind="shakedown_note", reason="r", values=values)
     assert _decision_count(conn) == 0
+
+
+def test_a_check_only_security_moves_no_trial_vintage_under_either_spin_offs_value(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """T243 (backtest spec amendment #1598, item 3; question 37): a `BENCH:RSP` bar,
+    dividend, split and spin-off, all known before the cutoffs, leave `data_vintage`
+    unchanged at every cutoff for both `spin_offs` values, while the same rows under a
+    universe id move it from their `known_at` on (so the exclusion is not vacuous)."""
+    assert "BENCH:RSP" in CHECK_ONLY_IDS
+    cutoffs = _fixture_cutoffs(fixture_store)
+    before = {
+        (cutoff, flag): registry.data_vintage(fixture_store, cutoff, spin_offs=flag)
+        for cutoff in cutoffs
+        for flag in (False, True)
+    }
+    _price(fixture_store, "BENCH:RSP", _PIN_KNOWN, _LATE_INGEST)
+    for kind in ("dividend", "split", "spinoff"):
+        _action(fixture_store, kind, "BENCH:RSP", known_at=_PIN_KNOWN, ingested_at=_LATE_INGEST)
+    assert registry.store_max_ingested_at(fixture_store) == _LATE_INGEST
+    for (cutoff, flag), expected in before.items():
+        assert registry.data_vintage(fixture_store, cutoff, spin_offs=flag) == expected
+
+    _price(fixture_store, "SEC_UNIVERSE_CONTROL", _PIN_KNOWN, _LATE_INGEST)
+    for flag in (False, True):
+        for cutoff in cutoffs:
+            vintage = registry.data_vintage(fixture_store, cutoff, spin_offs=flag)
+            assert vintage == (before[(cutoff, flag)] if cutoff < _PIN_KNOWN else _LATE_INGEST)
+
+
+def test_a_check_only_dividend_alone_moves_nothing_but_a_universe_dividend_does(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The `corporate_actions` clause on its own, both flags: one dividend row."""
+    cutoff = _PIN_KNOWN + timedelta(days=1)
+    before = {f: registry.data_vintage(fixture_store, cutoff, spin_offs=f) for f in (False, True)}
+    _action(fixture_store, "dividend", "BENCH:RSP", known_at=_PIN_KNOWN, ingested_at=_LATE_INGEST)
+    for flag in (False, True):
+        assert registry.data_vintage(fixture_store, cutoff, spin_offs=flag) == before[flag]
+    _action(
+        fixture_store, "dividend", "SEC_DIV_CONTROL", known_at=_PIN_KNOWN, ingested_at=_LATE_INGEST
+    )
+    for flag in (False, True):
+        assert registry.data_vintage(fixture_store, cutoff, spin_offs=flag) == _LATE_INGEST

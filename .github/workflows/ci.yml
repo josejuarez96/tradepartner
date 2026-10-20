@@ -35,7 +35,8 @@ concurrency:
 # Pytest shard count (#1112): tests/conftest.py's `pytest_collection_modifyitems` buckets
 # test FILES (not individual tests, so a file's module/session fixtures build once per
 # shard, never once per shard that happens to draw one of its tests) across this many
-# shards by a static, duration-weighted assignment. 8, not the original 4: a real CI run
+# shards by a static, duration-weighted assignment. 10 (GitHub Pro allows ~40 concurrent
+# jobs; #2037's rebalance measured shards at 9-21 min at 8), not the original 4: a real CI run
 # at 4 put tests/lookahead/test_backtest_invariance.py's shard at 24.6 min (the other three
 # shards, each with no single file anywhere near as heavy, ran 7-11 min) — the weight table
 # predicts additive cost well for ordinary files, but badly for this one outlier, which is
@@ -47,7 +48,7 @@ concurrency:
 # targeted runs and local `uv run pytest` never set the shard env vars, so they always see
 # the whole suite.
 env:
-  PYTEST_SHARD_COUNT: 8
+  PYTEST_SHARD_COUNT: 10
 
 jobs:
   # The "are tests needed" decision, split out of checks-fast (#1753) so the pytest shards
@@ -142,7 +143,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     env:
       PYTEST_SHARD_INDEX: ${{ matrix.shard }}
     steps:
@@ -154,14 +155,10 @@ jobs:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
       - name: Install
         run: uv sync --locked
-      # Printed so a run's shard counts can be summed and compared against the unsharded
-      # `pytest --collect-only -q` count (verified by hand on this issue's PR).
-      - name: Collected count (this shard)
-        run: uv run pytest --collect-only -q | tail -1
-      # xdist: one worker per core; each test already gets its own tmp_path (#581). The
-      # durations table is what tests/conftest.py's shard weights are re-measured from.
+      # xdist: one worker per core with work stealing; each test gets its own tmp_path
+      # (#581). The header prints the collected count; durations re-measure shard weights.
       - name: Tests (this shard)
-        run: uv run pytest -n auto --durations=0 --durations-min=1.0
+        run: uv run pytest -n auto --dist worksteal --durations=0 --durations-min=1.0
 
   # Required check name every piece of merge tooling reads literally: the `protect-main`
   # ruleset, scripts/ready_pr.py's `checks_state`, and scripts/merge_train.py's

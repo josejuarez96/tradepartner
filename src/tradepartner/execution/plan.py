@@ -93,7 +93,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 
 from tradepartner.backtest.costs import Commissions, buy_notional_after_costs
-from tradepartner.backtest.engine import Plan
+from tradepartner.backtest.engine import NO_T0_BAR, Plan
 from tradepartner.backtest.portfolio import (
     apply_rebalance_band,
     hold_membership,
@@ -399,7 +399,9 @@ def remainder(
     - any other sell: the latest order's submitted quantity minus its filled
       quantity, adjusted by the splits with ex-date in (the order's session, S]
       (a notional order: its notional minus its filled value);
-    - a buy: its `target_notional` minus the filled value over all its orders.
+    - a buy: its `target_notional` minus the filled value over all its orders;
+    - a whole cover (a `buy` + `short` with no `target_notional`, item 14 (d)):
+      the quantity branch of a long full exit.
 
     Before any order it is the plan: the buy's target, or the sell's planned
     notional or split-adjusted planned quantity. `order_events` are not read (a
@@ -410,7 +412,8 @@ def remainder(
     _check_session(session)
     price = _price(price_of, decision.security_id)
     mine = _orders_of(decision, orders)
-    if decision.side == _BUY:
+    cover = decision.side == _BUY and decision.position_side == SHORT
+    if decision.side == _BUY and not (cover and decision.target_notional is None):
         if decision.target_notional is None:
             raise ValueError(f"buy decision {decision.decision_id} has no target_notional")
         target = _finite(
@@ -419,10 +422,10 @@ def remainder(
         spent = sum(_filled(order, fills)[1] for order in mine)
         notional = _clamp(target - spent, target)
         return Remainder(quantity=notional / price, notional=notional)
-    if decision.side != _SELL:
+    if decision.side not in (_SELL, _BUY):
         raise ValueError(f"decision {decision.decision_id} has side {decision.side!r}")
     what = f"decision {decision.decision_id}"
-    if decision.planned_notional is not None:
+    if decision.planned_notional is not None and not cover:
         planned = _finite(decision.planned_notional, f"{what} notional", non_negative=True)
         sold = sum(_filled(order, fills)[1] for order in mine)
         notional = _clamp(planned - sold, planned)
@@ -1054,7 +1057,12 @@ def _signals(plan: Plan) -> tuple[Signal, ...]:
                 raise ValueError(f"{sid} is excluded for both {reason_of[sid]!r} and {reason!r}")
             reason_of[sid] = reason
     excluded = set(reason_of)
-    if set(plan.scores) | excluded != members or set(plan.scores) & excluded:
+    # Candidates with no T_0 bar are not universe members (the universe's rule 6 dropped
+    # them); they are recorded beside the members (#1997), never inside n_universe.
+    outside = set(plan.exclusions.get(NO_T0_BAR, ()))
+    if outside & members:
+        raise ValueError(f"{sorted(outside & members)} are members and excluded as {NO_T0_BAR}")
+    if set(plan.scores) | (excluded - outside) != members or set(plan.scores) & excluded:
         raise ValueError("the plan's scores and exclusions do not partition its members")
     if not set(plan.targets) <= set(plan.scores):
         raise ValueError("the plan has targets that are not scored members")
@@ -1138,6 +1146,53 @@ def _short_skip(
     return None
 
 
+def kept_effective_weights(
+    targets: Mapping[str, float],
+    drifted: Mapping[str, float],
+    band: float,
+    kept: Collection[str],
+    *,
+    side: str = _LONG_ONLY,
+) -> dict[str, float]:
+    """The planned weights when `kept` held names are not traded (paper spec amendment
+    2026-10-20, #2023, item 2; plan T253).
+
+    A kept name keeps its current weight, and that weight comes off the budget the traded
+    names share, as `apply_rebalance_band` does for a name inside the band. A traded name's
+    weight is its plan target t times `min(1, max(0, 1 - W_K - H) / T)`: W_K the kept names'
+    current weights, H the current weights of the names held inside the band
+    (|t - current| <= band * t; 0 at a band of 0), T the traded names' targets. The kept
+    names themselves are not in the result. With an empty `kept` this is
+    `apply_rebalance_band(targets, drifted, band)` exactly. A non-empty `kept` under
+    `long_short` raises `ValueError` (unreachable until T235 wires `side`).
+    """
+    if not kept:
+        return apply_rebalance_band(targets, drifted, band)
+    if side != _LONG_ONLY:
+        raise ValueError(f"a kept name is built for {_LONG_ONLY!r} only, not {side!r}")
+    if not (math.isfinite(band) and 0 <= band < 1):
+        raise ValueError(f"rebalance_band must be in [0, 1), got {band}")
+    held_within: dict[str, float] = {}
+    traded: dict[str, float] = {}
+    for sid in sorted({*targets, *drifted} - set(kept)):
+        desired = targets.get(sid, 0.0)
+        held = drifted.get(sid, 0.0)
+        if band > 0 and abs(desired - held) <= band * desired:
+            held_within[sid] = held
+        else:
+            traded[sid] = desired
+    kept_total = math.fsum(drifted.get(sid, 0.0) for sid in kept)
+    budget = max(0.0, 1.0 - kept_total - math.fsum(held_within.values()))
+    traded_total = math.fsum(traded.values())
+    scale = min(1.0, budget / traded_total) if traded_total > 0 else 0.0
+    effective = {sid: weight for sid, weight in held_within.items() if weight != 0}
+    for sid, weight in traded.items():
+        scaled = weight * scale
+        if scaled != 0:
+            effective[sid] = scaled
+    return effective
+
+
 def decisions_from(
     plan: Plan,
     ledger: Ledger,
@@ -1188,6 +1243,13 @@ def decisions_from(
     column stays the engine's `plan.targets` weight, and exits and entries are
     unchanged (the band never holds back an exit or a new entry). A band of 0.0
     is today's plan byte for byte.
+
+    A **kept** name (spec amendment 2026-10-20, #2023; T253) is a held name that is one of
+    `plan.exclusions["no_t0_bar"]` (its only missing bar is the read session's) and that no
+    earlier rule claims (not in `open_forced_exits`, not delisted, no override). It gets a
+    `skip_zero` decision, `target_weight` the engine's 0 and `drifted_weight` its weight at S,
+    and no order; the other names are weighted by `kept_effective_weights`. Under `hold`
+    nothing is kept (a live held name is already `skip_zero`).
 
     `hold` is the hold book of a `weighting = "hold"` window (`HoldBook`), or
     None for the default `equal` weighting; the two are exclusive and `hold`
@@ -1297,8 +1359,24 @@ def decisions_from(
         if hold is None
         else set()
     )
+
+    def ended(sid: str) -> bool:
+        if sid not in listings_at:
+            return False
+        end = listings_at[sid]
+        return end is None or end <= previous
+
+    kept: frozenset[str] = frozenset()
     if hold is None:
-        effective = apply_rebalance_band(plan.targets, drifted, band)
+        kept = frozenset(
+            sid
+            for sid in plan.exclusions.get(NO_T0_BAR, ())
+            if (sid in held or sid in held_short)
+            and sid not in open_forced_exits
+            and not ended(sid)
+            and sid not in named
+        )
+        effective = kept_effective_weights(plan.targets, drifted, band, kept, side=side)
         entering: frozenset[str] = frozenset()
         exiting: frozenset[str] = frozenset()
         hold_weight = 0.0
@@ -1326,12 +1404,6 @@ def decisions_from(
         hold_weight = 1.0 / count if count > 0 else 0.0
         effective = {}
         names = held | set(entering)
-
-    def ended(sid: str) -> bool:
-        if sid not in listings_at:
-            return False
-        end = listings_at[sid]
-        return end is None or end <= previous
 
     def whole_share(sid: str, *, required: bool) -> bool:
         if sid not in assets:
@@ -1416,6 +1488,8 @@ def decisions_from(
                 intent = _Intent(_BUY if delta > 0 else _SELL, abs(delta))
             else:
                 intent = _Intent(_BUY, 0.0)  # a live held name is never re-weighted
+        elif sid in kept:
+            intent = _Intent(_BUY, 0.0)  # kept: no order, `skip_zero` at its current weight
         elif held_side(sid) is not None and sid not in universe:
             intent = close_of(sid, _LEFT_UNIVERSE)
         elif held_side(sid) is not None and sid not in targets:

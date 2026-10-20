@@ -66,9 +66,11 @@ orders left to submit). In order:
      inherits the refusal. Anything but `long` and `short` is always refused.
    - the short side (T231; only reachable when lifted). An intent is
      (`side`, `position_side`): `sell` + `short` opens a short, `buy` + `short`
-     covers one; a held short is a negative `Ledger.positions` quantity, and
-     equity is cash + long value - short value (computed here: `Ledger.equity`
-     refuses a negative position). A short open or cover by notional or by a
+     covers one; a held short is `Ledger.short_holdings` (unsigned, what
+     `ledger.replay` builds) or a negative `Ledger.positions` quantity (the
+     broker's sign), read here as one signed book, and equity is cash + long
+     value - short value (computed here: `Ledger.equity` refuses a negative
+     position). A short open or cover by notional or by a
      fractional quantity is a `ValueError`, a short open marked as an exit too;
      a full cover (`full_exit`, a `forced_exit` too) is a buy that may be
      marked as an exit, and is exempt from `max_order_notional_fraction`. The
@@ -564,14 +566,23 @@ def _check_short_shape(order: PhaseOrder) -> None:
         raise ValueError(f"{what} marked as an exit")
 
 
+def _signed_book(ledger: Ledger) -> dict[str, float]:
+    """Held quantities with a short as a negative: `positions` (a negative one is
+    kept) less `short_holdings`, which `ledger.replay` keeps unsigned (#1960)."""
+    book = dict(ledger.positions)
+    for name, quantity in ledger.short_holdings.items():
+        book[name] = book.get(name, 0.0) - quantity
+    return book
+
+
 def _sides_violations(
-    left: Sequence[PhaseOrder], positions: Mapping[str, float]
+    left: Sequence[PhaseOrder], positions: Mapping[str, float], both: Sequence[str] = ()
 ) -> list[tuple[str, str]]:
     """`one_side_per_name` breaches as (name, detail): a short open of a held long,
     a long buy of a held short, a name with both a long and a short order, and a
     name both closed and opened in one phase when a short is in it (a long's trim
     and top-up stay legal; a flip is a close in one phase, an open in the next)."""
-    found: list[tuple[str, str]] = []
+    found: list[tuple[str, str]] = [(name, "held long and held short") for name in both]
     closes: set[str] = set()
     opens: set[str] = set()
     shorts: set[str] = set()
@@ -728,10 +739,12 @@ def check_phase(
             _SKIP_CAP,
         )
 
-    marks = {name: price_of(name) for name in ledger.positions}
-    if any(q < 0 for q in ledger.positions.values()):
-        # `Ledger.equity` refuses a short until T232: cash + long - short here.
-        equity = ledger.cash + sum(q * marks[name] for name, q in ledger.positions.items())
+    book = _signed_book(ledger)
+    both = sorted(n for n in ledger.short_holdings if ledger.positions.get(n, 0.0) > 0)
+    marks = {name: price_of(name) for name in book}
+    if any(q < 0 for q in book.values()):
+        # cash + long - short at the marks, over the one signed book (#1960).
+        equity = ledger.cash + sum(q * marks[name] for name, q in book.items())
     else:
         equity = ledger.equity(marks)
     if not equity > 0:
@@ -751,7 +764,7 @@ def check_phase(
         if count > 1:
             breach("one_order_per_name_side", f"{count} {side} orders for {name}")
 
-    after: dict[str, float] = defaultdict(float, ledger.positions)
+    after: dict[str, float] = defaultdict(float, book)
     sold: dict[str, float] = defaultdict(float)
     bought: dict[str, tuple[float, float]] = {}
     over_weight: dict[str, str] = {}
@@ -767,9 +780,7 @@ def check_phase(
                 f"{frozen.max_order_notional_fraction} of equity {equity:.2f}",
             )
         if is_short and order.side == _BUY:
-            held_short = round_down(
-                max(-ledger.positions.get(order.security_id, 0.0), 0.0), quantity_decimals
-            )
+            held_short = round_down(max(-book.get(order.security_id, 0.0), 0.0), quantity_decimals)
             if order.shares() > held_short:
                 breach(
                     "cover_within_holding",
@@ -801,7 +812,7 @@ def check_phase(
                 order.notional, order.quantity, order.price, order.whole_share, frozen, costs
             )
         else:
-            holding = ledger.positions.get(order.security_id, 0.0)
+            holding = book.get(order.security_id, 0.0)
             allowed = round_down(max(holding, 0.0), quantity_decimals)
             if order.shares() > allowed:
                 breach(
@@ -812,7 +823,7 @@ def check_phase(
             after[order.security_id] -= order.shares()
 
     for name, (price, value) in bought.items():
-        held = max(ledger.positions.get(name, 0.0), 0.0) * price + value
+        held = max(book.get(name, 0.0), 0.0) * price + value
         if held > frozen.max_position_weight * equity:
             over_weight.setdefault(
                 name,
@@ -824,17 +835,17 @@ def check_phase(
 
     open_covered = open_sold(open_covers, quantity_decimals)
     for name, total in covered.items():
-        held = round_down(max(-ledger.positions.get(name, 0.0), 0.0), quantity_decimals)
+        held = round_down(max(-book.get(name, 0.0), 0.0), quantity_decimals)
         total_exact = _dec(total) + open_covered.get(name, Decimal(0))
         if total_exact > _dec(held):
             breach(
                 "cover_sum_within_holding",
                 f"{name} covers and open covers of {total_exact} over the held short {held}",
             )
-    for name, detail in _sides_violations(left, ledger.positions):
+    for name, detail in _sides_violations(left, book, both):
         breach("one_side_per_name", f"{name} {detail}")
     for name, shares in opened.items():
-        held_value = (max(-ledger.positions.get(name, 0.0), 0.0) + shares) * price_of(name)
+        held_value = (max(-book.get(name, 0.0), 0.0) + shares) * price_of(name)
         if held_value > frozen.max_short_weight * equity:
             breach(
                 "max_short_weight",
@@ -853,7 +864,7 @@ def check_phase(
     # capped there never breaches here on float drift alone (#605).
     open_by_name = open_sold(open_sells, quantity_decimals)
     for name, total in sold.items():
-        holding = round_down(max(ledger.positions.get(name, 0.0), 0.0), quantity_decimals)
+        holding = round_down(max(book.get(name, 0.0), 0.0), quantity_decimals)
         total_exact = _dec(total) + open_by_name.get(name, Decimal(0))
         if total_exact > _dec(holding):
             breach(
@@ -884,7 +895,7 @@ def check_phase(
 
     # The held shorts are owed back: only the cash above their value is spendable.
     held_shorts = sum(
-        (_dec(-q) * _dec(price_of(name)) for name, q in ledger.positions.items() if q < 0),
+        (_dec(-q) * _dec(price_of(name)) for name, q in book.items() if q < 0),
         Decimal(0),
     )
     spendable = _dec(account.cash) - held_shorts

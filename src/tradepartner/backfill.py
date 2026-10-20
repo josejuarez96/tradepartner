@@ -108,7 +108,8 @@ changes.
 **One benchmark** (#840): `backfill_benchmark(settings, prices=...,
 symbol=..., since=...)` is the owner's one-off for a configured benchmark
 the store lacks (MTUM is in no EDGAR snapshot, so the master never seeds
-it). It refuses a symbol outside `benchmarks`. If no benchmark security
+it). It refuses a symbol outside `benchmarks` and
+`index_check.check_only_symbols` (RSP, #1598). If no benchmark security
 lists the symbol it seeds one first, from the owner's `BenchmarkSeed`
 (cik, name, exchange): `BENCH:<symbol>`, `benchmark = TRUE`, source
 `config`, a `snapshot_static` listing from the calendar's first session
@@ -1115,9 +1116,10 @@ def backfill_benchmark(
     """Seed (if missing) and backfill one configured benchmark; see the module
     docstring. Raises `ValueError` (before any fetch) for a symbol outside
     `benchmarks`, a missing benchmark with no `seed`, or a taken identity."""
-    if symbol not in settings.benchmarks:
+    allowed = [*settings.benchmarks, *settings.index_check.check_only_symbols]
+    if symbol not in allowed:
         raise ValueError(
-            f"{symbol!r} is not a configured benchmark ({', '.join(settings.benchmarks)})"
+            f"{symbol!r} is not a configured benchmark or check-only symbol ({', '.join(allowed)})"
         )
     if isinstance(since, datetime) or not isinstance(since, date):
         raise TypeError(f"since must be a date, got {since!r}")

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import re
 from collections.abc import Callable
 from dataclasses import replace
@@ -1596,6 +1597,117 @@ def test_status_all_prints_one_summary_line_per_book(
         "book main: window 1 open; positions 0; open orders 0; kill switch released; "
         "last run n/a; next rebalance 2026-10-30\n"
     )
+
+
+@pytest.mark.usefixtures("started")
+@pytest.mark.parametrize(
+    ("cadence", "rebalance_day", "fill_day", "next_day", "has_orders"),
+    [
+        ("month_end", date(2026, 10, 30), date(2026, 11, 2), date(2026, 11, 30), True),
+        ("week_end", date(2026, 10, 30), date(2026, 11, 2), date(2026, 11, 6), True),
+        ("daily", date(2026, 10, 29), date(2026, 10, 30), date(2026, 10, 30), True),
+        ("daily", date(2026, 10, 29), date(2026, 10, 30), date(2026, 10, 30), False),
+    ],
+)
+def test_status_summary_labels_completed_rebalance_and_fill_lag(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _Clock,
+    factory: _Factory,
+    cadence: str,
+    rebalance_day: date,
+    fill_day: date,
+    next_day: date,
+    has_orders: bool,
+) -> None:
+    """A fill-session run names its own rebalance and whether it placed orders."""
+    run_at = datetime.combine(fill_day, datetime.min.time(), tzinfo=UTC) + timedelta(hours=14)
+    monkeypatch.setattr(ops, "utc_now", lambda: run_at)
+    with open_for_write(_settings()) as conn:
+        window = journal.latest_window(conn, "main")
+        assert window is not None and window.window_id is not None
+        params = conn.execute(
+            "SELECT params_json FROM hypotheses WHERE hypothesis_id = ?",
+            [window.hypothesis_id],
+        ).fetchone()
+        assert params is not None
+        updated = json.loads(params[0])
+        updated["schedule.rebalance_cadence"] = cadence
+        conn.execute(
+            "UPDATE hypotheses SET params_json = ? WHERE hypothesis_id = ?",
+            [json.dumps(updated), window.hypothesis_id],
+        )
+        conn.execute(
+            "UPDATE paper_windows SET first_rebalance_session = ? WHERE window_id = ?",
+            [rebalance_day, window.window_id],
+        )
+        run_id = journal.append(
+            conn,
+            journal.PaperRunRow(
+                window_id=window.window_id,
+                session=fill_day,
+                kind="rebalance",
+                started_at=run_at,
+                invoked_by="scheduler",
+                code_version="test",
+                known_at=run_at,
+                ingested_at=run_at,
+            ),
+        )
+        assert run_id is not None
+        journal.append(
+            conn,
+            journal.PaperRunResultRow(
+                run_id=run_id,
+                finished_at=run_at,
+                status="ok",
+                clock_fault=False,
+                known_at=run_at,
+                ingested_at=run_at,
+            ),
+        )
+        decision_id = journal.append(
+            conn,
+            DecisionRow(
+                run_id=run_id,
+                rebalance_session=rebalance_day,
+                security_id="0002023554",
+                side="buy",
+                whole_share=False,
+                decision="trade",
+                known_at=run_at,
+                ingested_at=run_at,
+            ),
+        )
+        assert decision_id is not None
+        if has_orders:
+            journal.append(
+                conn,
+                OrderRow(
+                    client_order_id="tp-main-20261030-0002023554-buy-1",
+                    decision_id=decision_id,
+                    run_id=run_id,
+                    session=fill_day,
+                    attempt=1,
+                    phase="buy",
+                    security_id="0002023554",
+                    symbol="AAPL",
+                    side="buy",
+                    notional=494.0,
+                    sells_in_flight_at_submit=False,
+                    known_at=run_at,
+                    ingested_at=run_at,
+                ),
+            )
+    out = _paper(clock, factory, "status", "--all")
+    assert f"next rebalance {next_day}" in out.output
+    expected = "traded today" if has_orders else "ran today with no orders"
+    assert f"rebalance {rebalance_day} {expected}" in out.output
+    assert f"next rebalance {next_day} (today (done))" not in out.output
+    assert ("Fills are recorded at the next scheduled run" in out.output) == has_orders
+    assert "08:05 ET" not in out.output
+    detail = _paper(clock, factory, "status")
+    assert ("Fills are recorded at the next scheduled run" in detail.output) == has_orders
+    assert "08:05 ET" not in detail.output
 
 
 def test_status_all_with_no_window(clock: _Clock, factory: _Factory) -> None:
