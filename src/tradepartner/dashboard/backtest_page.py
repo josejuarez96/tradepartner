@@ -100,6 +100,12 @@ _REBALANCE_COLUMNS: Final = (
     "n_excluded_no_history",
 )
 
+#: The spin-off counts (the 2026-10-19 spin-off amendment, item 5; T211e):
+#: `trial_rebalance_counts` names, written only by a trial whose frozen
+#: `adjust.apply_spin_offs` is true, so they have no fixed `trial_rebalances` column and
+#: are merged into the table here.
+_SPIN_OFF_COUNTS: Final = ("n_spin_offs_unvalued", "n_late_spin_offs")
+
 Row = dict[str, Any]
 
 #: `trial_results.sharpe_unit` values; NULL (a pre-version-15 row) reads as monthly.
@@ -302,6 +308,11 @@ def load_trial_view(
         "WHERE trial_id = ? AND cost_per_side_bps = ? ORDER BY session",
         [trial_id, base],
     )
+    counts = registry.rebalance_counts(conn, trial_id)
+    if any(name in session for session in counts.values() for name in _SPIN_OFF_COUNTS):
+        for row in rebalances:
+            written = counts.get(row["session"], {})
+            row.update({name: written.get(name) for name in _SPIN_OFF_COUNTS})
     metrics = _rows(
         conn,
         "SELECT * FROM trial_metrics WHERE trial_id = ? ORDER BY series, cost_per_side_bps, metric",
@@ -528,7 +539,10 @@ def _render_results(view: TrialView) -> None:
             st.warning(f"Today's {row.basis} DSR not recomputed: {row.today_error}")
 
     st.subheader("Per rebalance")
-    st.caption("Survivorship gap, universe size, static-listing reliance and late dividends.")
+    st.caption(
+        "Survivorship gap, universe size, static-listing reliance, late dividends and, "
+        "under `adjust.apply_spin_offs`, the unvalued and late spin-off counts."
+    )
     st.dataframe(pl.DataFrame(view.rebalances), hide_index=True)
 
     if view.weights is not None:

@@ -723,11 +723,15 @@ def _step(
     params: Settings,
     construction: _Construction,
     accruals: Mapping[date, float] | None,
+    spin_offs: tuple[pl.DataFrame, pl.DataFrame] | None = None,
 ) -> None:
     """Carry, fill, value and exit one cost level through the period (T_i, T_{i+1}].
 
     `index` is the plan's place among the rebalance sessions (a hold-mode book's clock);
-    `accruals` is the cash accrual of each session after T_0, None for a cash rate of 0."""
+    `accruals` is the cash accrual of each session after T_0, None for a cash rate of 0.
+    `spin_offs` is the step's `(unvalued, late)` spin-off reads, present only under the
+    trial's `adjust.apply_spin_offs` (spec amendment #1894, item 5), so a trial without
+    the key writes neither count and its rows are byte-identical."""
     fill_price = params.execution.fill_price
     carried = carry_to_fill(
         book.positions,
@@ -785,6 +789,21 @@ def _step(
         plan.session < ex <= end and _held_before(book, sid, ex)
         for sid, ex in dropped.select("security_id", "ex_date").iter_rows()
     )
+    # The two spin-off counts (spec amendment #1894, item 4 and 5): parents held on the
+    # ex-date, written only under the opt-in key. A valued spin-off is already in the
+    # frame (a dividend in kind, item 2), so it is neither read nor counted.
+    counts = _rebalance_counts(plan, book)
+    if spin_offs is not None:
+        unvalued, late_spin = spin_offs
+        counts = dict(counts)
+        counts["n_spin_offs_unvalued"] = sum(
+            plan.session < ex <= end and _held_before(book, sid, ex)
+            for sid, ex in unvalued.select("security_id", "ex_date").iter_rows()
+        )
+        counts["n_late_spin_offs"] = sum(
+            _held_before(book, sid, ex)
+            for sid, ex in late_spin.select("security_id", "ex_date").iter_rows()
+        )
 
     book.cash = cash
     previous_positions = set(book.positions)
@@ -829,7 +848,7 @@ def _step(
             n_stale_exits=sum(e.stale for e in exits),
             n_dropped_dividends=n_dropped,
             n_late_dividends=n_late,
-            counts=_rebalance_counts(plan, book),
+            counts=counts,
         )
     )
 
@@ -973,8 +992,10 @@ def _keyed_call(provider: DataProvider, key: _Key, ids: list[str], bound: date |
         if bound is None:
             return provider.adjusted_prices(t, ids, include_dividends)
         return provider.adjusted_prices(t, ids, include_dividends, sessions_from=bound)
-    if method == "late_dividends":
-        return provider.late_dividends(t, cast(datetime, args[1]), ids)
+    if method == "late_dividends" or method == "late_spin_offs":
+        return cast(Callable[[datetime, datetime, list[str]], object], getattr(provider, method))(
+            t, cast(datetime, args[1]), ids
+        )
     read = cast(Callable[[datetime, list[str]], object], getattr(provider, cast(str, method)))
     return read(t, ids)
 
@@ -1130,6 +1151,12 @@ class _SharedReads:
     def late_dividends(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         return cast(pl.DataFrame, self._read(("late_dividends", t_prev, t), ids))
 
+    def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return cast(pl.DataFrame, self._read(("unvalued_spin_offs", t), ids))
+
+    def late_spin_offs(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return cast(pl.DataFrame, self._read(("late_spin_offs", t_prev, t), ids))
+
     def static_listing_count(self, t: datetime, ids: Sequence[str]) -> int:
         return self._once(
             ("static_listing_count", t, tuple(ids)),
@@ -1217,6 +1244,12 @@ class _Requests:
     def late_dividends(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         return self._ask(("late_dividends", t_prev, t), ids)
 
+    def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return self._ask(("unvalued_spin_offs", t), ids)
+
+    def late_spin_offs(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return self._ask(("late_spin_offs", t_prev, t), ids)
+
     def static_listing_count(self, t: datetime, ids: Sequence[str]) -> int:
         return self.view.static_listing_count(t, ids)
 
@@ -1264,7 +1297,7 @@ class _Variant:
 
 
 def _check_variants(
-    variants: Sequence[tuple[Settings, TrialHandle]], cost_levels: Sequence[float]
+    variants: Sequence[tuple[Settings, TrialHandle]], cost_levels: Sequence[float], provider: object
 ) -> list[float]:
     """Every refusal before any read; the checked cost levels."""
     if not variants:
@@ -1297,6 +1330,27 @@ def _check_variants(
     cadences = {params.schedule.rebalance_cadence for params, _ in variants}
     if len(cadences) != 1:
         raise ValueError(f"a read group runs at one cadence, got {sorted(cadences)}")
+    # One provider holds one frozen Settings, so its `adjust.apply_spin_offs` decides the
+    # group's frames while each variant's own decides its counts (#1894, item 3): a mixed
+    # group would count spin-offs it never read, so it is refused before any read.
+    spin_offs = {params.adjust.apply_spin_offs for params, _ in variants}
+    if len(spin_offs) != 1:
+        raise ValueError(
+            "a read group reads one provider: every variant needs the same "
+            f"adjust.apply_spin_offs, got {sorted(spin_offs)}"
+        )
+    # The provider's own frozen `Settings` decide its frames; a provider built from other
+    # settings would serve frames the variant's counts do not match (#1894, item 3). A
+    # provider with no `settings` (a fake) carries no flag to check.
+    provider_settings = getattr(provider, "settings", None)
+    if provider_settings is not None:
+        flag = variants[0][0].adjust.apply_spin_offs
+        if provider_settings.adjust.apply_spin_offs != flag:
+            raise ValueError(
+                "the provider's adjust.apply_spin_offs "
+                f"({provider_settings.adjust.apply_spin_offs}) differs from the variants' "
+                f"({flag}): its frames would not carry the spin-off factor the counts assume"
+            )
     return levels
 
 
@@ -1375,7 +1429,7 @@ def run_many(
     `()` (#1448: a summary-level sweep writes neither). Nothing else changes.
     """
     signal_for(family)
-    levels = _check_variants(variants, cost_levels)
+    levels = _check_variants(variants, cost_levels, provider)
     cadence = variants[0][0].schedule.rebalance_cadence
     sessions = rebalance_sessions(start, end, cadence)
     if len(sessions) < 2:
@@ -1498,6 +1552,11 @@ def _run_group(
         view.share(("listing_ends", t), [(ids, None) for ids, _, _ in own])
         view.share(("dropped_dividends", t), [(ids, None) for ids, _, _ in own])
         view.share(("late_dividends", t_prev, t), [(held, None) for _, _, held in own])
+        # A spin-off read happens only under the opt-in key (#1894, item 3), so a group
+        # with no `adjust.apply_spin_offs = true` variant makes none and stays byte-identical.
+        if any(variant.settings.adjust.apply_spin_offs for variant in group):
+            view.share(("unvalued_spin_offs", t), [(ids, None) for ids, _, _ in own])
+            view.share(("late_spin_offs", t_prev, t), [(held, None) for _, _, held in own])
         last = index == len(sessions) - 1
         next_plans = {} if last else _plan_all(view, group, step_end, family, failed)
         for variant in list(group):
@@ -1663,6 +1722,12 @@ def _variant_step(
     ended = _ended(view.listing_ends(t, ids), step_end)
     dropped = view.dropped_dividends(t, ids)
     late = view.late_dividends(t_prev, t, ever_held)
+    spin_offs: tuple[pl.DataFrame, pl.DataFrame] | None = None
+    if params.adjust.apply_spin_offs:
+        spin_offs = (
+            view.unvalued_spin_offs(t, ids),
+            view.late_spin_offs(t_prev, t, ever_held),
+        )
     if next_plan is not None:
         next_plan = _no_benchmark_members(next_plan, benchmarks)
     if variant.keep_frames:
@@ -1689,6 +1754,7 @@ def _variant_step(
             params,
             construction,
             variant.accruals,
+            spin_offs,
         )
         _benchmark_step(book, plan, step_end, frame, raw, params)
     if next_plan is not None:

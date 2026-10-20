@@ -239,11 +239,9 @@ FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {
 #: Frozen keys a registration may store but no signal applies yet: `load_frozen` refuses
 #: a value other than the table default, so no run or paper plan records results under a
 #: label its signal ignores. `strategy.turnover_top_fraction` left it at T165c (#1358);
-#: `adjust.apply_spin_offs` (T211c, spec amendment #1894) enters until T211e applies it;
+#: `adjust.apply_spin_offs` entered at T211c and left at T211e (#1894);
 #: `strategy.hold_top_fraction` (T238, spec amendment #657) until T239 applies it.
-NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset(
-    {"adjust.apply_spin_offs", "strategy.hold_top_fraction"}
-)
+NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset({"strategy.hold_top_fraction"})
 
 
 #: The borrow-rate grid a `long_short` file must cover (spec amendment #1872, item 6):

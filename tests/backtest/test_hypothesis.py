@@ -1386,13 +1386,11 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
 def test_a_screened_registration_runs_at_its_frozen_fraction(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
-    """T165c applies the key (#1358), so nothing but T211c's opt-in spin-off key is in
-    `NOT_YET_APPLIED_KEYS` and a registration at 0.20 loads at 0.20 (until T165c,
-    quant-auditor on #1387 had it refused)."""
-    assert (
-        frozenset({"adjust.apply_spin_offs", "strategy.hold_top_fraction"})
-        == hypothesis.NOT_YET_APPLIED_KEYS
-    )
+    """T165c applies the key (#1358) and T211e applies `adjust.apply_spin_offs` (#1894),
+    so only T238's `strategy.hold_top_fraction` (until T239) is in `NOT_YET_APPLIED_KEYS`
+    and a registration at 0.20 loads at 0.20 (until T165c, quant-auditor on #1387 had it
+    refused)."""
+    assert frozenset({"strategy.hold_top_fraction"}) == hypothesis.NOT_YET_APPLIED_KEYS
     _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
     assert loaded.strategy.turnover_top_fraction == 0.20
@@ -1914,10 +1912,10 @@ def _spin_offs_file(tmp_path: Path, slug: str, value: str) -> Path:
     return path
 
 
-def test_apply_spin_offs_is_post_registration_and_not_yet_applied() -> None:
+def test_apply_spin_offs_is_post_registration_and_applied() -> None:
     """The key is a post-registration member (spec amendment #1894, item 3): not
-    required of a file, and in `NOT_YET_APPLIED_KEYS` until T211e applies it."""
-    assert SPIN_OFFS_KEY in hypothesis.NOT_YET_APPLIED_KEYS
+    required of a file, and no longer in `NOT_YET_APPLIED_KEYS` once T211e applies it."""
+    assert SPIN_OFFS_KEY not in hypothesis.NOT_YET_APPLIED_KEYS
     assert SPIN_OFFS_KEY in frozen.POST_REGISTRATION_ADJUST_KEYS
     for family in sorted(config.FAMILIES):
         required = hypothesis.required_keys(family)
@@ -1945,12 +1943,14 @@ def test_a_file_naming_the_key_freezes_its_value(
     assert record.params[SPIN_OFFS_KEY] is True
 
 
-def test_load_frozen_refuses_true_until_t211e(
+def test_load_frozen_accepts_true_once_t211e_applies_it(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
+    """T211e wires the key, so `load_frozen` yields a `true` registration (spec amendment
+    #1894, item 3), where T211c refused it."""
     _register(conn, _spin_offs_file(tmp_path, SLUG, "true"), settings)
-    with pytest.raises(HypothesisFileError, match=SPIN_OFFS_KEY):
-        hypothesis.load_frozen(conn, SLUG, settings=settings)
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
+    assert loaded.adjust.apply_spin_offs is True
 
 
 def test_load_frozen_accepts_false(
