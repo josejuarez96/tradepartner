@@ -29,12 +29,14 @@ docstring):
   fraction of the parent's basis that moves to the child (`parent_security_id`,
   `basis_allocation`); then the parent's open lots give up that fraction and
   total basis is conserved.
-- **Stock mergers** (no store data yet, #1762): written against a proposed
-  journal shape, two `stock_merger` adjustment rows on one session (the target's
-  negative quantity, the acquirer's positive quantity), both naming
-  `target_security_id` and `acquirer_security_id` in `explanation_json`. The
-  target's open lots become acquirer lots at the ratio of the two quantities,
-  basis and acquisition instant carried, with no disposal.
+- **Stock mergers** (paper spec amendment #1762, item 5; build line T249b): the
+  journal shape is item 5's pair, both rows naming the merger id in
+  `explanation_json` (key `merger_id`, this lock's assumption): a
+  `corporate_action_cash` row removing the acquiree and a `merger_receipt` row
+  adding the acquirer. Paired by the merger id, the acquiree's open lots become
+  acquirer lots at the ratio of the two quantities, basis and acquisition
+  instant carried, with no disposal. A `corporate_action_cash` naming a merger
+  id with no receipt (a cash merger, item 2) stays a disposal at its cash.
 - **Carried residue** opens a zero-basis lot on its session that is never a
   wash-sale replacement; **`corporate_action_cash`** closes the name's open
   lots FIFO as one sale at the journaled cash.
@@ -539,26 +541,37 @@ def test_a_spinoff_with_a_basis_allocation_moves_that_share_of_the_parents_basis
     assert parent.cost_basis + child.cost_basis == pytest.approx(1000.0)
 
 
-# --- stock mergers (proposed journal shape, #1762) -------------------------------
+# --- stock mergers (paper spec amendment #1762 item 5, T249b) --------------------
 
-_MERGER = {"target_security_id": "SEC_T", "acquirer_security_id": "SEC_A"}
+#: Item 5: "Two rows are journaled, both naming the merger id". The key name
+#: `merger_id` is this lock's assumption (the spec names no key).
+_MERGER = {"merger_id": "alpaca-merger-1"}
 
 
-def _merge(book: Book, session: date, removed: float, received: float) -> None:
-    """The proposed shape: two `stock_merger` rows on one session, the target's
-    shares out (signed delta) and the acquirer's in, both naming the pair."""
-    book.adjust("stock_merger", session, "SEC_T", quantity=-removed, explanation=_MERGER)
-    book.adjust("stock_merger", session, "SEC_A", quantity=received, explanation=_MERGER)
+def _merge(book: Book, session: date, removed: float, received: float, cash: float = 0.0) -> None:
+    """Item 5's pair on one session: a `corporate_action_cash` row removing the
+    acquiree (signed delta, with the cash difference) and a `merger_receipt`
+    row adding the acquirer's shares, both naming the merger id."""
+    book.adjust(
+        "corporate_action_cash",
+        session,
+        "SEC_T",
+        quantity=-removed,
+        cash=cash,
+        explanation=_MERGER,
+    )
+    book.adjust("merger_receipt", session, "SEC_A", quantity=received, explanation=_MERGER)
 
 
 def test_a_stock_merger_converts_target_lots_at_the_ratio() -> None:
-    """SEC_T merges into SEC_A at 0.5 acquirer shares per target share
-    (journal shape proposed here; `stock_merger` is not yet an `adjustments`
-    kind, #1762). Hand values:
+    """SEC_T merges into SEC_A at 0.5 acquirer shares per target share, stock
+    only, whole shares, no cash (item 5's rows; `merger_receipt` joins the
+    `adjustments` kinds in T249b). Hand values:
 
       03-03 buy SEC_T 10 @ 30      lot: basis 300
-      03-07 merger: -10 SEC_T, +5 SEC_A   -> an SEC_A lot of 5, basis 300, still dated 03-03
-                                          no disposal (a tax-free exchange)
+      03-07 corporate_action_cash -10 SEC_T, cash 0 + merger_receipt +5 SEC_A
+                                   -> an SEC_A lot of 5, basis 300, still dated 03-03
+                                      no disposal (a tax-free exchange)
       03-12 sell SEC_A 5 @ 70      proceeds 350, pnl 350 - 300 = +50
     """
     book = Book()
@@ -576,6 +589,24 @@ def test_a_stock_merger_converts_target_lots_at_the_ratio() -> None:
         for d in disposals
     ] == [(acquired.lot_id, 5.0, 350.0, 50.0, D0312, sale)]
     assert flags == []
+
+
+def test_a_cash_merger_removal_without_a_receipt_is_still_a_disposal() -> None:
+    """Item 2's cash merger: one `corporate_action_cash` row naming the merger
+    id and no `merger_receipt`. It closes the lot as a sale at its cash:
+    10 @ 30 (basis 300) removed for 320, pnl +20."""
+    book = Book()
+    book.trade("buy", 10, 30.0, D0303, security_id="SEC_T")
+    book.adjust(
+        "corporate_action_cash", D0307, "SEC_T", quantity=-10.0, cash=320.0, explanation=_MERGER
+    )
+
+    lot_list, disposals, _ = book.run(D0312)
+
+    assert _of("SEC_A", lot_list) == []
+    assert [(d.quantity, d.proceeds, d.realised_pnl, d.trade_date_local) for d in disposals] == [
+        (10.0, 320.0, 20.0, D0307)
+    ]
 
 
 def test_after_a_stock_merger_the_target_is_no_longer_held() -> None:
@@ -740,8 +771,9 @@ def test_a_spinoff_whose_named_parent_is_held_short_raises() -> None:
 def test_a_stock_merger_of_an_open_short_lot_raises() -> None:
     book = Book()
     _short_open(book, "SEC_T")
-    # A short's signed deltas: the 10 short target shares out (+10), 5 acquirer
-    # shares short in (-5).
+    # Item 6: a stock merger on a short halts at reconciliation, so these rows
+    # should never be journaled; if they were (the short's signed deltas: +10
+    # target out, -5 acquirer in), the lot ledger still halts.
     _merge(book, D0307, -10.0, -5.0)
 
     with pytest.raises(LotLedgerError, match="short lot"):
