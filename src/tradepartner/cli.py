@@ -4082,7 +4082,17 @@ def make_app(
         """Open the book's tracking trial and compare paper with it (spec req 10)."""
         chosen = _checked_book(book)
         s = paper_settings()
-        result = _paper_call(s, lambda: paper_report.report(s, lambda: open_read_only(s), chosen))
+
+        def run_report() -> paper_report.Report | str:
+            try:
+                return paper_report.report(s, lambda: open_read_only(s), chosen)
+            except paper_report.NothingToCompareYet as exc:
+                return str(exc)  # a plain message, not a failure (#1923)
+
+        result = _paper_call(s, run_report)
+        if isinstance(result, str):
+            _echo_scrubbed(result, s)
+            return
         comparison, row = result.comparison, result.paper_report
         lines = [
             f"paper report: trial {row.trial_id} through {row.through_session}; rule "

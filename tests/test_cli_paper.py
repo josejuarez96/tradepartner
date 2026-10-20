@@ -1679,6 +1679,25 @@ def test_report_passes_the_book_and_prints_the_same_lines(
     assert books == [None, "b"]
 
 
+def test_report_with_nothing_to_compare_prints_a_plain_message_and_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    """#1923: fewer than two rebalances is not a failure; the owner reads one plain
+    line (no traceback, no trial id) and the exit code is 0."""
+
+    def fake_report(*_a: Any, **_k: Any) -> Any:
+        raise paper_report.NothingToCompareYet(
+            "paper report: nothing to compare yet; the first rebalance is 2026-10-30"
+        )
+
+    monkeypatch.setattr(paper_report, "report", fake_report)
+    out = _paper(clock, factory, "report", "--book", "main")
+    assert out.exit_code == 0
+    assert out.output == (
+        "paper report: nothing to compare yet; the first rebalance is 2026-10-30\n"
+    )
+
+
 def test_report_prints_slippage_na_when_the_line_could_not_be_computed(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:

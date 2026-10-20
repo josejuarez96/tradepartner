@@ -716,6 +716,12 @@ class Report:
     slippage_note: str | None = None
 
 
+class NothingToCompareYet(Exception):
+    """A book with fewer than two rebalance sessions through the last completed one
+    has no period to compare (#1923). `report` raises it before any trial opens, so
+    nothing is written: no refused `in_sample` row, no failed tracking row."""
+
+
 def _local_date(at: datetime) -> date:
     return at.astimezone(_NEW_YORK).date()
 
@@ -882,7 +888,10 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
     front, before the tracking trial runs, so a bad freeze fails fast rather
     than after paying for a trial run; quant-auditor finding on PR #525; `paper
     start` writes it since #526, so only a window started earlier lacks it), or
-    when the tracking trial does not finish `ok`.
+    when the tracking trial does not finish `ok`. Raises `NothingToCompareYet`, with
+    nothing written, when fewer than two rebalance sessions fall in `[T_0, last
+    completed T]` (#1923): the engine needs two, and a refused or failed trial row is
+    noise in the registry.
 
     "Last completed T" is capped strictly before the window's stop session
     (req 15), when it has one: a stopped window's `last completed T` is never
@@ -907,6 +916,12 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
         stop_session = _stop_session_of(store_journal.window_stops_for(conn, window_id))
         while stop_session is not None and last_t >= stop_session:
             last_t = _before(last_t, cadence)
+
+    if last_t < t0 or len(rebalance_sessions(t0, last_t, cadence)) < 2:
+        raise NothingToCompareYet(
+            f"paper report: nothing to compare yet for book {book!r}; a report needs at "
+            f"least two rebalances and the first is {t0} (last completed: {last_t})"
+        )
 
     outcome = run_hypothesis(
         hypothesis.slug,
