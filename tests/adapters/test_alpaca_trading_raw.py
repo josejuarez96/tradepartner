@@ -462,6 +462,26 @@ def test_a_retried_submit_refused_422_for_anything_but_a_duplicate_is_raised(
     assert [name for name, _ in client.calls] == ["submit_order", "submit_order"]
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "invalid position_intent specified",
+        "qty must be > 0",
+        "trailing stop orders cannot specify both trail_price and trail_percent",
+    ],
+)
+def test_a_retried_submit_refused_40010001_for_another_reason_is_raised(message: str) -> None:
+    """#1901: 40010001 is shared by four refusals; only the 'client_order_id must be
+    unique' message means the first attempt landed."""
+    body = json.dumps({"code": 40010001, "message": message})
+    client = FakeClient(fail_with=[requests.ReadTimeout("slow"), _api_error(422, body)])
+    with pytest.raises(AlpacaTradingError) as err:
+        _raw(client=client).submit_order(_request())
+    assert err.value.status_code == 422 and err.value.retried
+    assert err.value.body == body
+    assert [name for name, _ in client.calls] == ["submit_order", "submit_order"]
+
+
 def test_a_duplicate_on_the_first_submit_attempt_is_raised() -> None:
     client = FakeClient(fail_with=[_recorded_duplicate()])
     with pytest.raises(AlpacaTradingError) as err:
