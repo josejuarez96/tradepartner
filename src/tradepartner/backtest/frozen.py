@@ -173,10 +173,12 @@ POST_REGISTRATION_PORTFOLIO_KEYS: Final[frozenset[str]] = frozenset(
 
 #: Frozen keys left out of every canonical frozen set (and so of the fingerprint, the
 #: canonical-set hash and the V pair key) **whatever their value** (owner decision (a),
-#: #2011, T170d). The risk-free series changes only the excess-return metrics, never a
-#: trade; keeping it out lets the live default flip to `store` without moving H1's, B3's
-#: or the TWIN's pins. The keys stay frozen: `params` and `params_sha256` still carry
-#: them, and `load_frozen` still runs a registration at its stored source.
+#: #2011, T170d). Under `backtest.cash_rate = 0.0` the risk-free series changes only the
+#: excess-return metrics; under `backtest.cash_rate = store` the series and basis also
+#: set the cash accrual, so equity moves while the pair does not (owner question #2085).
+#: Keeping them out lets the live default flip to `store` without moving H1's, B3's or
+#: the TWIN's pins. The keys stay frozen: `params` and `params_sha256` still carry them,
+#: and `load_frozen` still runs a registration at its stored source.
 CANONICAL_EXCLUDED_KEYS: Final[frozenset[str]] = frozenset(
     {
         "metrics.risk_free_source",
