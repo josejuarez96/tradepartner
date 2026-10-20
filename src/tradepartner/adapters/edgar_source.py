@@ -339,7 +339,7 @@ from tradepartner.adapters.filings import (
 )
 from tradepartner.calendar import is_session, next_session
 from tradepartner.config import Settings, clean_message
-from tradepartner.health import clock_suspect
+from tradepartner.health import EDGAR_FILING_DATE_CUTOFF, clock_suspect
 from tradepartner.store.master import _is_plain_common
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -453,6 +453,28 @@ class _Submissions:
     # #576: the API answered 200 `{}` for the payload or a page, so a missing
     # accession is not evidence the filing is unstampable.
     empty: bool = False
+
+
+def _fallback_stamp(record: SubmissionRecord) -> SubmissionRecord:
+    """#1686: `record` for the API fallback, its stamp never earlier than the
+    true acceptance where that can be shown. SEC's API serves stamps late by
+    New York's offset, or exact; a stamp that fits only a clock moved early (a
+    session day before `EDGAR_FILING_DATE_CUTOFF` New York, the filing dated a
+    later day) is moved late by the offset, which lands it on the true time.
+    An early stamp that still fits its filing date cannot be told apart from a
+    true one and is kept as served."""
+    at, filed = record.accepted_at, record.filing_date
+    if at is None or filed is None:
+        return record
+    local = at.astimezone(_EASTERN)
+    if (
+        is_session(local.date())
+        and local.time() < EDGAR_FILING_DATE_CUTOFF
+        and filed > local.date()
+        and (offset := local.utcoffset()) is not None
+    ):
+        return replace(record, accepted_at=at - offset)
+    return record
 
 
 def _filing_date_or_none(value: Any) -> date | None:
@@ -893,7 +915,11 @@ class EdgarFilingSource(FilingSource):
                 self.stamp_check_unread_ciks += 1
                 return checked
             if self._unread_run_reached(cik):
-                self.stamps_api_fallback += len(stamped)  # #1686: the API stamp, late
+                # #1686: the API stamp, which is late or exact (never earlier
+                # than true) unless it is provably early (`_fallback_stamp`).
+                for record in stamped:
+                    checked[record.accession] = _fallback_stamp(record)
+                self.stamps_api_fallback += len(stamped)
                 self.stamp_fallback_ciks += 1
                 return checked
             for record in stamped:

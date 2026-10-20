@@ -12,7 +12,8 @@ transport: a synthetic payload, and synthetic SGML headers routed by URL.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -21,7 +22,7 @@ import pytest
 from edgar_transport import EdgarRouter, edgar_settings
 
 from tradepartner.adapters.edgar import UnstampedFiling, sgml_acceptance
-from tradepartner.adapters.edgar_source import EdgarFilingSource, SubmissionRecord
+from tradepartner.adapters.edgar_source import EdgarFilingSource, SubmissionRecord, _fallback_stamp
 from tradepartner.config import Settings
 from tradepartner.ingest import _source_counts
 
@@ -393,3 +394,34 @@ def test_one_run_counts_a_cik_once_even_if_stamped_twice(tmp_path: Path) -> None
     source._stamp(_kept())
     source._stamp(_kept())
     assert source.stamps_api_fallback == 0  # one run, so still below N=2
+
+
+def test_no_lookahead_a_provably_early_api_stamp_is_moved_by_the_offset() -> None:
+    """The API served early (the zip's #1382 direction) and no header can prove
+    it. A filing accepted 18:00 ET (22:00Z, EDT) is dated the next day; stamped
+    14:00 ET it fits only a clock moved early, so the fallback adds New York's
+    offset and lands on the true acceptance, never before it."""
+    true_at = datetime(2026, 10, 9, 22, tzinfo=UTC)
+    early = SubmissionRecord(
+        "0001628280-26-065999", "8-K", "d.htm", False, true_at - EDT, None, date(2026, 10, 10)
+    )
+    assert _fallback_stamp(early).accepted_at == true_at
+    # EST: 18:00 ET Feb 20 is 23:00Z
+    true_est = datetime(2026, 2, 20, 23, tzinfo=UTC)
+    early_est = replace(early, accepted_at=true_est - EST, filing_date=date(2026, 2, 21))
+    assert _fallback_stamp(early_est).accepted_at == true_est
+
+
+def test_an_api_stamp_that_fits_the_filing_date_is_kept_as_served() -> None:
+    late = SubmissionRecord(
+        "0001628280-26-065998",
+        "8-K",
+        "d.htm",
+        False,
+        datetime(2026, 10, 9, 20, 3, tzinfo=UTC) + EDT,
+        None,
+        date(2026, 10, 9),
+    )
+    assert _fallback_stamp(late).accepted_at == late.accepted_at
+    assert _fallback_stamp(replace(late, accepted_at=None)).accepted_at is None
+    assert _fallback_stamp(replace(late, filing_date=None)).accepted_at == late.accepted_at
