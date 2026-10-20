@@ -1,6 +1,6 @@
 # Runbook: the owner's guide to using TradePartner
 
-**For:** Jose, as the user, not as a developer  ·  **Date:** 2026-10-19  ·  **Issue:** [#1932](https://github.com/josejuarez96/tradepartner/issues/1932)  ·  **Checked against:** the CLI's `--help` on `origin/main` at `a2b4ed4d`
+**For:** Jose, as the user, not as a developer  ·  **Date:** 2026-10-20  ·  **Issue:** [#1932](https://github.com/josejuarez96/tradepartner/issues/1932)  ·  **Checked against:** merged code and PRs on `origin/main` at `2bcc6989`, 2026-10-20
 
 This is the one page to read to run TradePartner yourself. It shows how the parts connect, which command to type at each step, and where to look. It does not replace the detailed runbooks. It points to them.
 
@@ -164,6 +164,17 @@ Rare flags: `--override-gap --gap-reason "<why>"` runs past the survivorship-gap
 | `no_window` | No open window. Normal before `paper start` or after a stop. |
 | `unspent_cash` | Informational. |
 | `lot_ledger`, `stale_mark`, `skipped`, `pending_unresolved` | Not yet in the scheduling runbook's alert table (NOT VERIFIED what to do). Ask Claude. |
+
+### What the daily run can tell you, and what to do
+
+| What you see | Meaning and first step |
+|---|---|
+| `paper run`: `halted` with “the frozen limits were edited after `paper start`”; `paper resume` refuses with the same message | The book's frozen settings row changed after start. No order was placed by that run or resume. Ask Claude to restore the original row; a resume alone cannot fix it. |
+| `unspent_cash`: “rebalance … executed with … cash unspent” | A broker-cancelled or expired buy can leave cash idle. Check Alpaca's order status and the book's cash. The cash was not spent; the unfilled buy may still be labeled `unfunded` in the journal until [#2020](https://github.com/josejuarez96/tradepartner/issues/2020) is fixed. |
+| `missing_candidate_bar`: “universe candidate(s) with no T_0 bar excluded as excluded_no_t0_bar” | That name had no bar on the rebalance day and was excluded. Check the missing price. **Until T253 lands**, a held name in this case is still sold today; you chose to hold it instead when T253 ships. |
+| Reconciliation shows `spinoff_receipt` | Alpaca booked a spin-off child. A matching known action is explained and does not halt the book. Check the child and share count in the Reconciliation card. |
+| `stale_data`: “bad close for held …; no mark written” | A held name's zero, negative or invalid close was never saved as its mark. Ask Claude to repair and refill that bar before the next run. |
+| `paper check`: “rebalance missed” or “fills recorded by a later run”; `paper status`: “rebalance … traded today” | A missed rebalance does not count; later fills appear on a later run. Check the dated run and Alpaca orders. Status also says “ran today with no orders” when appropriate; ranking shows tickers from the plan's date. |
 
 Alerts reach the store and a macOS notification only. Email is built but not configured, so **away from the Mac you hear nothing.**
 
