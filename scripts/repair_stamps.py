@@ -1445,7 +1445,10 @@ def plan_shift(
     base = plan_unrepaired(source, listed)
     old = {(r.cik, r.accession): r.old_stamp for r in listed}
     rows: dict[Key, ManifestRow] = {}
-    left = list(base.missing)
+    left = [
+        ManifestRow(r.cik, r.accession, r.old_stamp, r.old_stamp, "unrepaired", "no stamped record")
+        for r in base.missing
+    ]
     for cik, accession in base.keys:
         stamp = base.files[cik].stamps[accession]
         assert stamp is not None
@@ -1545,7 +1548,6 @@ def build_parser() -> argparse.ArgumentParser:
     sh.add_argument("--from", dest="source", type=Path, required=True, metavar="UNREPAIRED_CSV")
     sh.add_argument("--window-start", type=_date, required=True)
     sh.add_argument("--release", required=True)
-    sh.add_argument("--max-requests", type=int, default=DEFAULT_MAX_REQUESTS)
     sh.add_argument("--window-earlier-ok", type=Path, default=None, metavar="PRECHECK_JSON")
     sh.add_argument("--apply", action="store_true")
     sh.add_argument("--resume", action="store_true")
