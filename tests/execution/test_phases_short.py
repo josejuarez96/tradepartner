@@ -38,6 +38,7 @@ from tradepartner.config import RiskConfig
 from tradepartner.execution.ids import client_order_id
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.phases import (
+    HeldSell,
     PhaseOrder,
     PhaseOrders,
     buy_orders,
@@ -305,6 +306,7 @@ def _sells(
     *,
     states: Mapping[int, DecisionState] | None = None,
     open_covers: Sequence[OpenSell] = (),
+    assets: Mapping[str, Asset] | None = None,
 ) -> PhaseOrders:
     return sell_orders(
         decisions,
@@ -314,7 +316,7 @@ def _sells(
         (),
         ACTIONS,
         _price,
-        {d.security_id: BORROWABLE for d in decisions},
+        assets if assets is not None else {d.security_id: BORROWABLE for d in decisions},
         FROZEN,
         session=S,
         quantity_decimals=DECIMALS,
@@ -428,6 +430,22 @@ def test_a_cover_is_capped_by_the_held_short_less_its_open_covers() -> None:
     ]
 
 
+def test_a_cover_never_reads_the_borrow_flags() -> None:
+    # Item 6 checks borrow on a `sell_to_open` only: a short that turned hard to
+    # borrow (or not shortable) is still covered, never skipped `skip_not_borrowable`.
+    whole_cover = _whole_cover(1, "SEC_1", 3.0)
+    partial = _partial_cover(2, "SEC_2", 250.0)
+    assets = {"SEC_1": NOT_ETB, "SEC_2": _asset(shortable=False, easy_to_borrow=False)}
+    result = _sells(
+        [whole_cover, partial], longs={}, shorts={"SEC_1": 3.0, "SEC_2": 10.0}, assets=assets
+    )
+    assert _rows(result) == [
+        (1, "SEC_1", "buy", SHORT, 3.0, None),
+        (2, "SEC_2", "buy", SHORT, 2.0, None),
+    ]
+    assert result.skips == ()
+
+
 def test_a_partial_cover_under_one_share_is_skip_below_one_share() -> None:
     # Item 3, every cover whole-share: 50 / 100 = 0.5 floors to 0 shares, on a
     # fractionable name, so the cover is skipped, not sent as 0.5.
@@ -496,31 +514,44 @@ def test_a_flips_open_is_ordered_in_the_buy_phase_once_its_close_has_filled() ->
     _assert_whole_share_shorts(result)
 
 
-@pytest.mark.parametrize("close_filled", ["in_flight", "partly_filled_and_expired"])
+@pytest.mark.parametrize(
+    "close_filled",
+    [
+        "in_flight_this_run",
+        "in_flight_from_an_earlier_run",
+        "partly_filled_and_expired",
+        "held_this_run",
+    ],
+)
 def test_a_flips_open_is_not_ordered_while_its_close_has_not_fully_filled(
     close_filled: str,
 ) -> None:
     """Item 14 (d), #1904: the open is not ordered on this run and its decision
     stays open (no order, no skip row, not deferred), so a name is never long
-    and short at once."""
+    and short at once. Nothing raises "both sells and buys" for a flip, whether
+    this run's sell phase ordered the close, held it, or never saw it (in
+    flight from an earlier run)."""
     close = _long_sell(1, "SEC_F", quantity=4.0)
     short_open = _short_open(2, "SEC_F", 1000.0)
     order = _order(close, 4.0)
-    if close_filled == "in_flight":
+    sells = _close_order_phase(close, 4.0)
+    if close_filled.startswith("in_flight"):
         state = _state(close, [order], _events(order))  # accepted, nothing terminal
         assert state.state is State.IN_FLIGHT
-    else:
+        if close_filled == "in_flight_from_an_earlier_run":
+            sells = PhaseOrders((), ())  # this run's sell phase had nothing to attempt
+    elif close_filled == "partly_filled_and_expired":
         # 2 of 4 filled, then expired: 2 shares (200 >= the 1.0 minimum) left.
         state = _state(close, [order], _events(order, "expired"), [_fill(order, 2.0, PRICE)])
         assert state.state is State.OPEN
+    else:
+        # The sell phase held the close (#719): no order, no skip, still open.
+        state = _state(close)
+        assert state.state is State.OPEN
+        sells = PhaseOrders((), (), session=S, held=(HeldSell(1, "SEC_F", 4.0, 0.0, "dust"),))
     open_state = _state(short_open)
     assert open_state.state is State.OPEN
-    result = _buys(
-        [close, short_open],
-        10_000.0,
-        states={1: state, 2: open_state},
-        sells=_close_order_phase(close, 4.0),
-    )
+    result = _buys([close, short_open], 10_000.0, states={1: state, 2: open_state}, sells=sells)
     assert result.orders == ()
     assert result.skips == ()
     assert result.deferred == ()
