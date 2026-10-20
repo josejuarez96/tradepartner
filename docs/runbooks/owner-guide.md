@@ -125,7 +125,7 @@ Rare flags: `--override-gap --gap-reason "<why>"` runs past the survivorship-gap
 | 3. Sign off the survivorship gap | `decision gap-signoff --trial <id> --reason "<why the gap is acceptable>"` | Read the gap on the Backtest page first. |
 | 4. Prepare the book's account | One new Alpaca paper account per book; its keys go in `.env` as `ALPACA_PAPER_BOOKS__<TOKEN>__API_KEY` and `..._API_SECRET`, `<TOKEN>` being the book token in capitals (for book `daily`: `ALPACA_PAPER_BOOKS__DAILY__API_KEY`). Book `main` uses `ALPACA_PAPER_API_KEY`/`_SECRET` | The account must be flat: no positions and no open orders. **`.env` is secret:** keep it `chmod 600` and edit it yourself. Never paste a key into a chat, a command, a plist, an issue or a commit. Claude never reads it. |
 | 5. Start the window | `paper start --hypothesis <slug> --book <token>` | Refused, among other reasons: for a sweep variant (promote it or use an operations file); for a family that cannot paper trade yet; without the gap sign-off; before the holdout's end (or, for a forward exam, its start); on an open window; on another book's account; on a non-flat account; on an account too small for the minimum order; or if live costs or fill price differ from the file. |
-| 6. The scheduler | `~/Library/LaunchAgents/com.tradepartner.paper.plist`, beside `com.tradepartner.ingest.plist` ([scheduling](scheduling.md)) | One job runs every open book, in token order. A new book needs no plist change. Keep the Mac on power and awake overnight. |
+| 6. The scheduler | `~/Library/LaunchAgents/com.tradepartner.paper.plist`, beside `com.tradepartner.ingest.plist` ([scheduling](scheduling.md)) | One job runs every open book, in token order. A new book needs no plist change. Keep the Mac on power with sleep off ([scheduling](scheduling.md), "Sleep versus power-off"). |
 
 **What runs, and when (times in ET; launchd uses the Mac's local clock).**
 - **18:30, ingest:** brings prices, filings and the T-bill rate up to that day.
@@ -140,7 +140,7 @@ Rare flags: `--override-gap --gap-reason "<why>"` runs past the survivorship-gap
 - **Never place, cancel or change an order in Alpaca's dashboard.** The journal would no longer match the broker, and the book halts on reconciliation. The one hand action allowed at Alpaca is the account reset after `abandon`. If `abandon` refuses because of open orders, ask Claude.
 - `paper abandon --book <token> --reason "<why stop could not finish>"` is the last resort, only when `stop` cannot complete. It ends the window without selling. Afterwards, reset that Alpaca paper account until it is strictly flat, and check whether the reset changed the account id or the keys in `.env` ([scheduling](scheduling.md), "`abandon`").
 
-**Toward live.** `decision shakedown-span --sessions 10 --order-sessions 5 --reason "<why the span opens now>"` opens the span (N = 10 and M = 5 are decided). The reason names no live strategy: the live book is chosen later, in T163. (The command's own help text still says to name one; it is out of date.) `decision shakedown-note --alert <id> --reason "<what happened>"` covers only a `stale_data` or `missed_run` alert inside the span. A note never excuses a mismatch or a halt; those restart the span. The kill-switch drill runs once. `paper shakedown` must then exit 0. As of 10-19 no span is open. Live trading (Phase 6) also needs its own ADR, the taxable cash account (#813) and a safety review. The live book is chosen from what survives, never by comparing paper books.
+**Toward live.** `decision shakedown-span --sessions 10 --order-sessions 5 --reason "<why the span opens now>"` opens the span (N = 10 and M = 5 are decided). The reason names no live strategy: the live book is chosen later, in T163. `decision shakedown-note --alert <id> --reason "<what happened>"` covers only a `stale_data` or `missed_run` alert inside the span. A note never excuses a mismatch or a halt; those restart the span. The kill-switch drill runs once. `paper shakedown` must then exit 0. As of 10-19 no span is open. Live trading (Phase 6) also needs its own ADR, the taxable cash account (#813) and a safety review. The live book is chosen from what survives, never by comparing paper books.
 
 ## 4. Daily and weekly operating card
 
@@ -157,7 +157,7 @@ Rare flags: `--override-gap --gap-reason "<why>"` runs past the survivorship-gap
 | `rejection_cap`, `skip_cap` | Too many orders refused or names skipped. Find out why before resuming. |
 | `drawdown` | The book fell more than `risk.max_drawdown` (30%) from its peak. The switch engaged itself. Resume (this resets the peak to the equity at the last mark), then decide whether to `paper stop`. If you mean to stop, run `paper stop` straight after the resume: the next run in the submit window can trade again. |
 | `stale_data` | Ingest was late. No action. The next run proceeds once data catches up. Inside a shakedown span, add a `decision shakedown-note` for it. |
-| `missed_run`, `missed_rebalance` | The Mac was off or asleep, or a stop rule held the rebalance. Check the reason. Keep the Mac awake (#1759). |
+| `missed_run`, `missed_rebalance` | The Mac was off or asleep, or a stop rule held the rebalance. Check the reason. Keep the Mac awake on power: sleep off, no repeating wake ([scheduling](scheduling.md), "Sleep versus power-off"). |
 | `kill_switch` | The switch changed state. `paper status` shows why. |
 | `kill_switch_write_failed` | The store may be damaged. This one arrives only as a macOS notification, never in the store. Stop. Ask Claude before anything else. |
 | `locked` | Two runs overlapped. Usually harmless. |
@@ -186,6 +186,9 @@ Alerts reach the store and a macOS notification only. Email is built but not con
 - Open PRs waiting on you (class B needs your word), and the newest handover comment on #836.
 - Alpaca's account history for the money side.
 
+### Updating the system (pulling new code)
+You can do this yourself: [update-the-system](update-the-system.md), Part 1. It checks for a store change, copies the store first, pulls, loads the jobs again and verifies. If the store file is ever damaged (disk fault, power loss), Part 2 is the restore.
+
 ## 5. What needs Claude today
 
 | Task | Why it needs Claude |
@@ -194,7 +197,7 @@ Alerts reach the store and a macOS notification only. Email is built but not con
 | A new kind of signal | It is code: a plan task, then a build. |
 | The script for a non-backtest experiment | No `experiment run` command exists. |
 | Diagnosing a halt | Every real halt so far (10-12, 10-13, 10-16) needed an agent PR to fix the cause. Resuming you can do alone. |
-| Pulling new code, schema migrations, backups | Any write migrates the store silently. Copy the store first ([scheduling](scheduling.md), "Before pulling a schema migration"). The orchestrator does this today. |
+| Diagnosing a damaged store | [update-the-system](update-the-system.md) Part 2 has the restore steps, but a damaged store is risky. Keep the damaged files and ask Claude before you restore. |
 | Data releases and repairs | Owner-run on your store, with Claude's checklist ([data-releases](data-releases.md); [benchmark-backfill](benchmark-backfill.md) once). |
 | Reading a result in plain words | The pages show numbers, not a verdict sentence. |
 
@@ -204,7 +207,7 @@ Alerts reach the store and a macOS notification only. Email is built but not con
 
 | Concept | Command | Dashboard page | Doc |
 |---|---|---|---|
-| Data and its health | `ingest`, `health --check` | Data health | [scheduling](scheduling.md), [data-releases](data-releases.md) |
+| Data and its health | `ingest`, `health --check` | Data health | [scheduling](scheduling.md), [data-releases](data-releases.md), [update-the-system](update-the-system.md) |
 | Ideas and evidence | none | none | [hypothesis-backlog](../research/hypothesis-backlog.md), [claims.toml](../research/claims.toml), [research loop](../ways-of-working/research-program.md) |
 | Sweep (new idea) | `sweep register / run / status / report / promote / retire` | Trial registry | [strategy-lab spec](../specs/strategy-lab.md), [sweep template](../templates/sweep.md) |
 | Hypothesis and trial | `hypothesis register`, `backtest`, `trials` | Backtest, Trial registry | [backtest spec](../specs/backtest.md), [hypothesis template](../templates/hypothesis.md), `docs/hypotheses/` |

@@ -34,34 +34,17 @@ Sources run in order, `edgar` then `alpaca`, and **the run stops at the first so
 
 ## Before pulling a schema migration
 
-**Any write connection migrates the store** (T49's docstring): there is no separate `migrate` command to notice running, and no prompt — the very first scheduled `ingest` or `paper run` whose code is past a schema bump just migrates the store as a side effect of its normal write. The store may already be waiting on **version 5** (T49, merged) if no write has run against it since that merge; [#365](https://github.com/josejuarez96/tradepartner/issues/365) (version 6) and [#377](https://github.com/josejuarez96/tradepartner/issues/377) (a `CHECK` enum change, also a migration) are the next ones coming. If you can't tell from the plan whether a `git pull` will bump `CURRENT_SCHEMA_VERSION`, check before pulling:
+**Any write connection migrates the store** (T49's docstring): there is no separate `migrate` command and no prompt. The first scheduled `ingest` or `paper run` whose code is past a schema bump migrates the store as a side effect of its normal write, and older code cannot read the store afterwards. The code's version is `CURRENT_SCHEMA_VERSION` in `src/tradepartner/store/schema.py` (34 on 2026-10-19). Check before you pull:
 
 ```bash
-git fetch origin && git diff HEAD origin/main -- src/tradepartner/store/schema.py | grep CURRENT_SCHEMA_VERSION
+git fetch origin && git diff HEAD origin/main -- src/tradepartner/store/schema.py | grep '^[-+]CURRENT_SCHEMA_VERSION ='
 ```
 
-Any output there means the pull migrates the store on its next write; if you have already pulled a version bump and are not sure whether a write has run against the store since, take the copy anyway — it costs nothing to have an extra one. Before that pull, **stop both jobs, confirm neither is mid-run, and only then copy the store file**, so a migration you need to back out of still has a clean pre-migration copy to restore from:
+Any output means the pull migrates the store on its next write. If you have already pulled a bump and are not sure a write has run since, take the copy anyway: an extra one costs nothing.
 
-```bash
-cd ~/Projects/tradepartner
-launchctl disable gui/$(id -u)/com.tradepartner.ingest
-launchctl disable gui/$(id -u)/com.tradepartner.paper   # once installed
-launchctl print gui/$(id -u)/com.tradepartner.ingest | grep state   # confirm not "running"
-launchctl print gui/$(id -u)/com.tradepartner.paper | grep state    # once installed; same check
+**The full routine is its own page: [update-the-system](update-the-system.md).** It has the exact commands to unload every job and confirm it is idle, copy the store (the file, its `.wal`, and the commit you were on), pull, `uv sync`, load the jobs again, and check with `paper status --all` and `health --check`. Its Part 2 is the restore, for a bad update and for a store damaged by a disk fault or power loss.
 
-STORE_PATH=$(uv run python -c "from tradepartner.config import get_settings; print(get_settings().store.path)")
-cp "$STORE_PATH" "$STORE_PATH.bak-$(date +%Y%m%d)"
-[ -f "$STORE_PATH.wal" ] && cp "$STORE_PATH.wal" "$STORE_PATH.wal.bak-$(date +%Y%m%d)"
-git rev-parse HEAD > "$STORE_PATH.bak-$(date +%Y%m%d).commit"   # the pre-migration commit, for a restore
-
-git pull
-launchctl enable gui/$(id -u)/com.tradepartner.ingest
-launchctl enable gui/$(id -u)/com.tradepartner.paper   # once installed
-```
-
-`disable`/`enable` persist the on/off state across reboots and are reversed in the same call shape used in "Install, test, remove" and "To pause the job" below; re-enabling immediately after the pull is what lets the next scheduled run actually happen and migrate the store — disabled jobs never run, so there is nothing to wait on before re-enabling. This reads the store path the running settings actually use (respecting `STORE__PATH` in `.env` if you've set it, per "PATH, working directory and `.env`" below) rather than assuming the default `data/tradepartner.duckdb`, and copies no secret — only the store file and its write-ahead log, if DuckDB has left one. Keep the dated copies until you've confirmed the next scheduled `ingest` and `paper run` both completed `ok` on the new version, then delete them.
-
-**To restore from a copy:** disable both jobs and confirm neither is mid-run (as above), `git checkout` the commit recorded in the matching `.commit` file (the code you were on when you took that copy — code past the migration expects the new schema, so restoring the file alone is not enough), delete any live `<path>.wal` so DuckDB doesn't replay it onto the restored file, then copy the dated backup (and its `.wal.bak-DATE` counterpart, if one exists) back over the live path. Re-enable the jobs only once you've decided which code they should run next. If any window traded between the copy and the restore, expect a `reconciliation` alert on the next run until you have sorted out what the broker did in the gap — the run halts and the switch engages rather than silently losing track of an order.
+Two rules stay true here. Unloaded jobs never run, so load them again right after the pull; the next scheduled run then migrates the store. And after a restore, if a window traded between the copy and the restore, expect a `reconciliation` alert on the next run until you have sorted out what the broker did in the gap: the run halts and the switch engages rather than silently losing track of an order.
 
 ## After an EDGAR cache version bump
 
@@ -193,20 +176,21 @@ A `StartCalendarInterval` job behaves differently depending on the Mac's state a
 | Powered off | **The run is skipped.** Nothing runs at the next boot. |
 | Logged out | The job does not run (LaunchAgents need your login session). |
 
-A scheduled wake shortly before 18:30 makes the sleeping case run on time. This needs admin rights, so run it yourself in Terminal:
+**Two jobs, one Mac: keep it awake on power (#1759).** The ingest runs at 18:30 and the paper run at 08:05 the next morning. macOS keeps **one** repeating wake event, so a wake cannot cover both: a wake at 18:28 leaves the Mac asleep at 08:05 (the paper run slips outside its submit window), and a wake at 08:00 moves that evening's ingest to the morning, where it runs beside the paper job and the run that waits for the store lock may end `locked` (and a coalesced ingest that finishes after 08:05 halts that day's paper run with `stale_data`). So do not use a wake for this. Stop the Mac sleeping while it is on power, and remove any old wake. Run these yourself in Terminal; they need admin rights:
 
 ```bash
-sudo pmset repeat wake MTWRFSU 18:28:00
-pmset -g sched          # confirm
+sudo pmset -c sleep 0          # never sleep on the charger (the display may still sleep)
+sudo pmset repeat cancel       # clears all repeating wake, power-on, sleep and shutdown events
+pmset -g custom                # confirm: under "AC Power", sleep is 0
+pmset -g sched                 # confirm: no repeating event listed
 ```
 
-- **Use `wake`, not `wakeorpoweron`.** Powering on a Mac that is off stops at the login screen (or the FileVault unlock), where no LaunchAgent runs, so it only gives a false sense of coverage. Leave the Mac asleep, not off.
-- **The wake is two minutes before the job** so the Mac has little time to idle back to sleep first. `caffeinate -i` in the plist then keeps it awake for the run.
-- **`pmset` keeps a single repeating wake event**, so this replaces any existing one.
+The same setting is in System Settings: Battery (a laptop) or Energy (a desktop), Options, "Prevent automatic sleeping on power adapter when the display is off". `caffeinate -i` in each plist still holds the Mac awake for the run itself, and costs nothing when the Mac is already awake.
 
-Also keep the Mac on power:
-- **A laptop on battery with the lid closed** may not wake fully for a scheduled event. Leave the lid open on power, or use it in clamshell mode with a display and power attached.
-- **Check the first week's log.** A run that started without network, because Wi-Fi had not reconnected yet, fails its sources and shows it there. If that happens, move the wake earlier.
+- **The Mac must stay on power and logged in.** Powered off, the run is skipped (table above). A laptop on battery with the lid closed may not wake fully for a scheduled event: leave the lid open on power, or use it in clamshell mode with a display and power attached.
+- **A restart needs your login.** After a restart the Mac stops at the login screen (or the FileVault unlock) and no LaunchAgent runs until you log in. Log in after any restart, then check the next morning's `paper status --all`.
+- **If you would rather let the Mac sleep,** you accept that one of the two jobs runs late: pick `sudo pmset repeat wake MTWRFSU 18:28:00` and the paper run does not happen on time, or a wake at 08:00 and the ingest does not. This runbook does not recommend either.
+- **Check the first week's log.** A run that started without network, because Wi-Fi had not reconnected yet, fails its sources and shows it there. If the Mac was restarted, that is the likely cause.
 
 ## Logs
 
@@ -273,7 +257,7 @@ So "outside the submit window" is the time-based condition under which a `paper 
 
 The job must start **after the previous session's `ingest` has completed** (the scheduler assumption in the spec's "Users & usage") and **inside the submit window**, so schedule it a few minutes after the window opens: that gives margin for `uv sync` and the clock pre-check without eating into the window reserved for sells-then-buys. With today's placeholder defaults (open at 9:30 ET, window opens at 8:00 ET) that means roughly **08:05 ET**; the 18:30 ET ingest job from the previous evening is long finished by then, unless that evening's run itself ran late or coalesced on a wake (see "Sleep versus power-off" above) — a coalesced ingest finishing after 08:05 halts that day's paper run with `stale_data` instead; the kill switch does not engage for it, and on a fill session the rebalance stays `pending` for catch-up.
 
-**Wake coverage for two jobs.** `pmset repeat` holds only one repeating wake event (see "Sleep versus power-off" above), and the ingest job already claims the evening one (18:28 ET). Scheduling a second `pmset repeat wake` entry for the paper job's morning start **replaces** that evening entry, not adds to it. Rather than juggle two wake times, keep the Mac on power without sleeping overnight once the paper job is installed (Settings > Energy, "Prevent automatic sleeping on power adapter"); `caffeinate -i` in each plist is then enough to survive the run itself. If you still prefer letting the Mac sleep, pick one `pmset repeat wake` time that comfortably precedes both jobs' needs and accept that a wake timed only for the evening ingest can leave the morning paper job starting late or outside the submit window.
+**Wake coverage for two jobs.** One wake cannot cover both the 18:30 ingest and the 08:05 paper run, because macOS keeps a single repeating wake (see "Sleep versus power-off" above, which has the commands). Keep the Mac on power with sleep off (`sudo pmset -c sleep 0`) and remove any old wake (`sudo pmset repeat cancel`). `caffeinate -i` in each plist is then enough to survive the run itself.
 
 ### The paper plist
 
@@ -540,12 +524,10 @@ A failing line is not a reason to edit a threshold: fix the cause, note the aler
 
 ### `abandon`: the last resort, and the strictly-flat rule after it
 
-**Pending T64b/T67** — `paper abandon`, the `abandoned` window state and this strictly-flat rule are scheduled as a dated amendment to [the spec](../specs/paper-trading.md) and are not yet built; the shape below is fixed by [T64b](../plans/paper-trading.md)'s plan line and is not yet confirmed CLI behavior.
-
 `paper stop --reason` is the normal, code-driven way to close a window flat: it liquidates through the ordinary wrapper path and only ever carries forward listed residues (`dust`/`untradable`) matched both ways. Reach for `abandon` only when `stop` itself cannot complete — for example, unresolved mismatches or held positions that `reconcile_now` cannot explain and `stop`'s own checks therefore refuse. `abandon` does not place or cancel any order itself: it records a `paper_window_stops` row with `state = abandoned`, your `--reason` as the ADR-style note, and `residues_json` listing every position still held and every unresolved mismatch at that moment. It does not clean anything up.
 
 ```bash
-uv run tradepartner paper abandon --reason "why stop could not close this window cleanly"   # (built by T64b/T67)
+uv run tradepartner paper abandon --reason "why stop could not close this window cleanly"   # add --book <token> for a book other than main
 ```
 
 **After an `abandoned` window, the account must be strictly flat before the next `paper start` — no residue is carried forward, unlike a normal `closed` window.** The owner never trades by hand (spec req 14), so the one approved way to reach that strictly-flat state is **resetting the paper account at Alpaca directly** (its paper-account reset in the Alpaca dashboard), not placing manual offsetting trades. Do this before attempting the next `paper start`; it will otherwise refuse on a non-flat account. **Check whether the reset changes the account id or issues new paper keys.** `paper start` checks `account().account_id` and records it for the new window, and if Alpaca issued new `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` values, update them in `.env` before running `paper start` again — only `.env`, never a command line, a commit, or this runbook.
