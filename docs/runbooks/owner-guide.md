@@ -187,7 +187,7 @@ Alerts reach the store and a macOS notification only. Email is built but not con
 - Alpaca's account history for the money side.
 
 ### Updating the system (pulling new code)
-You can do this yourself: [update-the-system](update-the-system.md), Part 1. It checks for a store change, copies the store first, pulls, re-enables the jobs and verifies. If the store file is ever damaged (disk fault, power loss), Part 2 is the restore.
+You can do this yourself: [update-the-system](update-the-system.md), Part 1. It checks for a store change, copies the store first, pulls, loads the jobs again and verifies. If the store file is ever damaged (disk fault, power loss), Part 2 is the restore.
 
 ## 5. What needs Claude today
 

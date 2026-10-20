@@ -37,14 +37,14 @@ Sources run in order, `edgar` then `alpaca`, and **the run stops at the first so
 **Any write connection migrates the store** (T49's docstring): there is no separate `migrate` command and no prompt. The first scheduled `ingest` or `paper run` whose code is past a schema bump migrates the store as a side effect of its normal write, and older code cannot read the store afterwards. The code's version is `CURRENT_SCHEMA_VERSION` in `src/tradepartner/store/schema.py` (34 on 2026-10-19). Check before you pull:
 
 ```bash
-git fetch origin && git diff HEAD origin/main -- src/tradepartner/store/schema.py | grep CURRENT_SCHEMA_VERSION
+git fetch origin && git diff HEAD origin/main -- src/tradepartner/store/schema.py | grep '^[-+]CURRENT_SCHEMA_VERSION ='
 ```
 
 Any output means the pull migrates the store on its next write. If you have already pulled a bump and are not sure a write has run since, take the copy anyway: an extra one costs nothing.
 
-**The full routine is its own page: [update-the-system](update-the-system.md).** It has the exact commands to stop both jobs and confirm they are idle, copy the store (the file, its `.wal`, and the commit you were on), pull, `uv sync`, re-enable the jobs, and check with `paper status --all` and `health --check`. Its Part 2 is the restore, for a bad update and for a store damaged by a disk fault or power loss.
+**The full routine is its own page: [update-the-system](update-the-system.md).** It has the exact commands to unload every job and confirm it is idle, copy the store (the file, its `.wal`, and the commit you were on), pull, `uv sync`, load the jobs again, and check with `paper status --all` and `health --check`. Its Part 2 is the restore, for a bad update and for a store damaged by a disk fault or power loss.
 
-Two rules stay true here. Disabled jobs never run, so re-enable them right after the pull and the next scheduled run migrates the store. And after a restore, if a window traded between the copy and the restore, expect a `reconciliation` alert on the next run until you have sorted out what the broker did in the gap: the run halts and the switch engages rather than silently losing track of an order.
+Two rules stay true here. Unloaded jobs never run, so load them again right after the pull; the next scheduled run then migrates the store. And after a restore, if a window traded between the copy and the restore, expect a `reconciliation` alert on the next run until you have sorted out what the broker did in the gap: the run halts and the switch engages rather than silently losing track of an order.
 
 ## After an EDGAR cache version bump
 
@@ -180,7 +180,7 @@ A `StartCalendarInterval` job behaves differently depending on the Mac's state a
 
 ```bash
 sudo pmset -c sleep 0          # never sleep on the charger (the display may still sleep)
-sudo pmset repeat cancel       # remove any repeating wake or power-on event you set earlier
+sudo pmset repeat cancel       # clears all repeating wake, power-on, sleep and shutdown events
 pmset -g custom                # confirm: under "AC Power", sleep is 0
 pmset -g sched                 # confirm: no repeating event listed
 ```
