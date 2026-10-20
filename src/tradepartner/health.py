@@ -117,6 +117,19 @@ here is this module's and is stated once:
   `rates.plausible_range_percent` warns on the page; none fails `--check`.
   The stamp, unique key and finite value are integrity rules below.
 
+- **Mergers** (`mergers`, #1762, T248e): the latest revision of each identity
+  known at `t` counted by kind, the latest `known_at`, and the latest Alpaca
+  run's figures (stored, refused, unresolved, `merger_self`, not yet known).
+  Report-only lists, neither failing `--check`: the `merger_conflict` pairs
+  (two ids, one acquiree, one `effective_date`, which the paper reader halts
+  on) and the acquirees with a bar after their `effective_date` (a wrong
+  resolution or a broken deal). The integrity rules `mergers_known_at_from_
+  process_date` (a first row stamped `announcement_date_known_at(process_
+  date)`, a later row at its own `ingested_at` strictly after the row before
+  it), `mergers_rates_match_kind`, `mergers_acquirer` (a stock kind names an
+  acquirer, never the acquiree) and `mergers_unique` (one row per identity
+  and stamp) run over every stored row.
+
 - **Coverage against a named reference** (`coverage_reference`, #1541,
   T180): the one check that compares the store with a list outside its own
   derivation, `coverage.reference_names` (`CIK:TICKER[:FROM[:TO]]`, the
@@ -415,6 +428,7 @@ from tradepartner.store.asof import (
     borrow_status_as_of,
     listings_as_of,
     live_actions_as_of,
+    mergers_as_of,
     price_jumps_as_of,
     prices_as_of,
     statement_facts_as_of,
@@ -501,6 +515,14 @@ RATE_UNIQUE = "rates_unique"
 RATE_VALUE_FINITE = "rates_value_finite"
 SPINOFF_KNOWN_AT_FLOOR = "spinoff_known_at_floor"
 SYMBOL_CHANGE_KNOWN_AT = "symbol_changes_known_at_from_process_date"
+#: The merger rules (#1762, T248e), over raw `mergers` rows: the stamp
+#: (`announcement_date_known_at` of the first row's `process_date`, a later
+#: row's own `ingested_at` after the row before it), the rates against the
+#: kind, the acquirer, and one row per identity and stamp.
+MERGER_KNOWN_AT = "mergers_known_at_from_process_date"
+MERGER_RATES_MATCH_KIND = "mergers_rates_match_kind"
+MERGER_ACQUIRER = "mergers_acquirer"
+MERGER_UNIQUE = "mergers_unique"
 #: The duplicate-dividends rule (#1613, T186b): `duplicate_dividends`.
 DUPLICATE_DIVIDENDS = "duplicate_dividends"
 #: The borrow-status key rule (#1506, T171e): `borrow_status_unique`.
@@ -547,6 +569,10 @@ INTEGRITY_RULES: tuple[str, ...] = (
     RATE_VALUE_FINITE,
     SPINOFF_KNOWN_AT_FLOOR,
     SYMBOL_CHANGE_KNOWN_AT,
+    MERGER_KNOWN_AT,
+    MERGER_RATES_MATCH_KIND,
+    MERGER_ACQUIRER,
+    MERGER_UNIQUE,
     DUPLICATE_DIVIDENDS,
     BORROW_STATUS_UNIQUE,
     CHAIN_IDS_DISTINCT_CIKS,
@@ -953,6 +979,100 @@ class BorrowHealth:
                 f"{self.stale_sessions} sessions old; maximum {self.max_stale_sessions}"
             )
         return tuple(out)
+
+
+@dataclass(frozen=True, eq=False)
+class MergersHealth:
+    """The mergers block (module docstring, "Mergers", #1762, T248e): report
+    only. `rows_by_kind` counts the latest revision of each identity known at
+    `t`; `run_counts` is the latest Alpaca run's merger figures (empty with no
+    run); `conflicts` lists two ids of one acquiree and one `effective_date`
+    (the paper reader halts on them); `after_effective` lists the acquirees
+    with a bar after their effective date (a wrong resolution or a broken
+    deal). Neither list fails `--check`."""
+
+    rows_by_kind: dict[str, int]
+    latest_known_at: datetime | None
+    run_counts: dict[str, int]
+    conflicts: pl.DataFrame
+    after_effective: pl.DataFrame
+
+
+#: The merger kinds, in the order the block shows them (the table's `CHECK`).
+MERGER_KINDS: tuple[str, ...] = ("cash", "stock", "stock_and_cash")
+#: The stock kinds, which must name an acquirer and carry a share ratio.
+_MERGER_STOCK_KINDS: tuple[str, ...] = ("stock", "stock_and_cash")
+#: The Alpaca run-message figure behind each `MergersHealth.run_counts` key
+#: (`ingest._add_mergers`, `ingest._count_merger_report`).
+_MERGER_RUN_COUNTS: dict[str, str] = {
+    "mergers_stored": "stored",
+    "merger_rows_refused": "refused",
+    "actions_unresolved": "unresolved",
+    "merger_self": "merger_self",
+    "actions_not_yet_known": "not_yet_known",
+}
+_MERGER_COUNT = re.compile(r"\b(\w+)=(\d+)\b")
+_MERGER_CONFLICT_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "effective_date": pl.Date,
+    "ids": pl.List(pl.Utf8),
+}
+_MERGER_AFTER_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "kind": pl.Utf8,
+    "effective_date": pl.Date,
+    "bars": pl.Int64,
+    "last_bar": pl.Date,
+}
+
+
+def _mergers_report(
+    conn: duckdb.DuckDBPyConnection, t: datetime, ingests: tuple[IngestStatus, ...]
+) -> MergersHealth:
+    """The mergers block at `t` (module docstring, "Mergers")."""
+    message = next((i.latest_message for i in ingests if i.source == "alpaca"), None)
+    run_counts: dict[str, int] = {}
+    if any(i.source == "alpaca" and i.latest_status is not None for i in ingests):
+        found = {name: int(n) for name, n in _MERGER_COUNT.findall(message or "")}
+        run_counts = {label: found.get(key, 0) for key, label in _MERGER_RUN_COUNTS.items()}
+    kinds = dict.fromkeys(MERGER_KINDS, 0)
+    empty = MergersHealth(
+        kinds,
+        None,
+        run_counts,
+        pl.DataFrame(schema=_MERGER_CONFLICT_SCHEMA),
+        pl.DataFrame(schema=_MERGER_AFTER_SCHEMA),
+    )
+    if "mergers" not in _present_tables(conn):
+        return empty
+    latest = mergers_as_of(conn, t)
+    stamp = conn.execute("SELECT max(known_at) FROM mergers WHERE known_at <= ?", [t]).fetchone()
+    for kind, count in Counter(latest["kind"].to_list()).items():
+        kinds[kind] = kinds.get(kind, 0) + count
+    conflicts = (
+        latest.group_by("security_id", "effective_date")
+        .agg(pl.col("source_action_id").sort().alias("ids"))
+        .filter(pl.col("ids").list.len() > 1)
+        .sort("security_id", "effective_date")
+    )
+    after: list[dict[str, Any]] = []
+    for row in (
+        latest.select("security_id", "kind", "effective_date").unique().iter_rows(named=True)
+    ):
+        found_bars = conn.execute(
+            "SELECT count(DISTINCT session), max(session) FROM prices_daily "
+            "WHERE security_id = ? AND session > ? AND known_at <= ?",
+            [row["security_id"], row["effective_date"], t],
+        ).fetchone()
+        if found_bars is not None and found_bars[0]:
+            after.append({**row, "bars": int(found_bars[0]), "last_bar": found_bars[1]})
+    return MergersHealth(
+        kinds,
+        None if stamp is None else stamp[0],
+        run_counts,
+        conflicts.select(list(_MERGER_CONFLICT_SCHEMA)).cast(pl.Schema(_MERGER_CONFLICT_SCHEMA)),
+        pl.DataFrame(after, schema=_MERGER_AFTER_SCHEMA).sort("security_id", "effective_date"),
+    )
 
 
 _FIGI_DISAGREEMENT_SCHEMA: dict[str, Any] = {
@@ -1667,6 +1787,7 @@ class HealthReport:
     filing_events: FilingEvents
     rates: RatesHealth
     borrow: BorrowHealth
+    mergers: MergersHealth
     figi_types: FigiTypes
     duplicate_dividends: DuplicateDividends
     filename_listings: FilenameListings
@@ -1762,6 +1883,7 @@ def health_report(
         filing_events=_filing_events_report(conn, settings, ingests),
         rates=_rates_report(conn, t, settings),
         borrow=_borrow_report(conn, t, session, settings),
+        mergers=_mergers_report(conn, t, ingests),
         figi_types=_figi_types_report(conn, t, session, settings, current, classes),
         duplicate_dividends=dividends,
         filename_listings=_filename_listings(conn, t, listings),
@@ -2847,6 +2969,7 @@ def _integrity_checks(
         SESSION_HOLES: _session_holes(conn, t, settings),
         **_rate_rules(conn),
         **_new_action_stamp_rules(conn),
+        **_merger_rules(conn),
         DUPLICATE_DIVIDENDS: dividends.violations,
         BORROW_STATUS_UNIQUE: _borrow_duplicates(conn),
         **_chain_rule_rows(conn, t),
@@ -2953,6 +3076,89 @@ def _new_action_stamp_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.Dat
         SPINOFF_KNOWN_AT_FLOOR: pl.DataFrame(bad_spin, schema=_ACTION_STAMP_SCHEMA),
         SYMBOL_CHANGE_KNOWN_AT: pl.DataFrame(bad_change, schema=_ACTION_STAMP_SCHEMA),
     }
+
+
+_MERGER_KEY_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "source_action_id": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+
+
+def _merger_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
+    """The merger rules (spec "Mergers", T248e) over every stored row, so a
+    store migrated or edited by hand is caught after the `CHECK`."""
+    rows = (
+        conn.execute(
+            """
+            SELECT security_id, source_action_id, kind, acquirer_security_id, share_ratio,
+                cash_per_share, process_date, known_at, ingested_at,
+                ROW_NUMBER() OVER w AS rn, LAG(known_at) OVER w AS previous_known
+            FROM mergers
+            WINDOW w AS (PARTITION BY security_id, source_action_id ORDER BY known_at)
+            """
+        ).fetchall()
+        if "mergers" in _present_tables(conn)
+        else []
+    )
+    violations: dict[str, list[dict[str, Any]]] = {
+        MERGER_KNOWN_AT: [],
+        MERGER_RATES_MATCH_KIND: [],
+        MERGER_ACQUIRER: [],
+        MERGER_UNIQUE: [],
+    }
+    seen: set[tuple[str, str, datetime]] = set()
+    for (
+        security_id,
+        action_id,
+        kind,
+        acquirer,
+        ratio,
+        cash,
+        process_date,
+        stamp,
+        ingested,
+        rn,
+        previous,
+    ) in rows:
+        key = {"security_id": security_id, "source_action_id": action_id, "known_at": stamp}
+        if rn == 1:
+            try:
+                expected = announcement_date_known_at(process_date)
+            except (ValueError, IndexError):
+                expected = None
+            stamped = stamp == expected
+        else:
+            stamped = stamp == ingested and stamp > previous
+        if not stamped:
+            violations[MERGER_KNOWN_AT].append(key)
+        if not _merger_rates_match(kind, ratio, cash):
+            violations[MERGER_RATES_MATCH_KIND].append(key)
+        if (kind in _MERGER_STOCK_KINDS and acquirer is None) or acquirer == security_id:
+            violations[MERGER_ACQUIRER].append(key)
+        identity = (security_id, action_id, stamp)
+        if identity in seen:
+            violations[MERGER_UNIQUE].append(key)
+        seen.add(identity)
+    return {
+        rule: pl.DataFrame(found, schema=_MERGER_KEY_SCHEMA) for rule, found in violations.items()
+    }
+
+
+def _merger_rates_match(kind: str, ratio: float | None, cash: float | None) -> bool:
+    """Whether the two rates fit `kind` (the `mergers` table's `CHECK`): a
+    stock kind has a share ratio, a cash kind a cash amount, each positive
+    and finite, and no other rate."""
+    if kind not in MERGER_KINDS:
+        return False
+    wants_ratio = kind in _MERGER_STOCK_KINDS
+    wants_cash = kind in ("cash", "stock_and_cash")
+    for value, wanted in ((ratio, wants_ratio), (cash, wants_cash)):
+        if (value is not None) != wanted:
+            return False
+        if value is not None and not (math.isfinite(value) and value > 0):
+            return False
+    return True
 
 
 _BORROW_KEY_SCHEMA: dict[str, Any] = {
