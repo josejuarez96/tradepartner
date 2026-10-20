@@ -716,3 +716,124 @@ def test_a_short_dividend_known_after_close_of_the_previous_session_is_not_offer
         reconcile_command(
             journal_settings, lambda: open_for_write(journal_settings), short_fake, fixed_clock
         )
+
+
+COVER_AT = datetime(2026, 10, 1, 13, 45, tzinfo=UTC)  # on the ex-date, after the open
+
+
+def _cover_10_spy(settings: Settings, fake: ShortFake, window: PaperWindowRow) -> None:
+    """Journal and fill a `buy_to_close` of the 10 SPY at 100 on the ex-date:
+    ledger and broker both flat, cash 100,000."""
+    (run_id,) = _append(
+        settings,
+        PaperRunRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            session=COVER_AT.date(),
+            kind="rebalance",
+            started_at=COVER_AT,
+            invoked_by="scheduler",
+            code_version="test",
+            known_at=COVER_AT,
+            ingested_at=COVER_AT,
+        ),
+    )
+    assert run_id is not None
+    (decision_id,) = _append(
+        settings,
+        DecisionRow(
+            run_id=run_id,
+            rebalance_session=COVER_AT.date(),
+            security_id=SPY,
+            side="buy",
+            planned_quantity=10.0,
+            whole_share=True,
+            decision="trade",
+            position_side="short",
+            known_at=COVER_AT,
+            ingested_at=COVER_AT,
+        ),
+    )
+    assert decision_id is not None
+    coid = "tp-20261001-SEC_SPY-cover-1"
+    _append(
+        settings,
+        OrderRow(
+            client_order_id=coid,
+            decision_id=decision_id,
+            run_id=run_id,
+            session=COVER_AT.date(),
+            attempt=1,
+            phase="sell",
+            security_id=SPY,
+            symbol="SPY",
+            side="buy",
+            quantity=10.0,
+            position_side="short",
+            sells_in_flight_at_submit=False,
+            known_at=COVER_AT,
+            ingested_at=COVER_AT,
+        ),
+        *(
+            OrderEventRow(client_order_id=coid, status=s, known_at=COVER_AT, ingested_at=COVER_AT)
+            for s in ("pending", "accepted", "filled")
+        ),
+        FillRow(
+            client_order_id=coid,
+            filled_at=COVER_AT,
+            quantity=10.0,
+            price=PRICE,
+            price_implied=False,
+            broker_fill_id=f"fill-{coid}",
+            source="broker_feed",
+            known_at=COVER_AT,
+            ingested_at=COVER_AT,
+        ),
+    )
+    fake.submit(
+        OrderRequest(
+            coid, "SPY", Side.BUY, quantity=10.0, position_intent=PositionIntent.BUY_TO_CLOSE
+        )
+    )
+    fake.simulate_fill(coid)
+    assert "SPY" not in fake.positions()
+    assert fake.account().cash == pytest.approx(100_000.0)
+
+
+def test_a_short_covered_on_the_ex_date_with_no_debit_still_passes(
+    journal_settings: Settings,
+    short_fake: ShortFake,
+    short_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The due (owed on the 09-30 short) has the wrong sign against the flat
+    book at S, so it is not offered: as on main, an undebited dividend passes."""
+    _short_10_spy(journal_settings, short_fake, short_window)
+    _cover_10_spy(journal_settings, short_fake, short_window)
+    _short_dividend(journal_settings, 0.5)
+
+    result = reconcile_command(
+        journal_settings, lambda: open_for_write(journal_settings), short_fake, fixed_clock
+    )
+
+    assert result.status == OK
+    assert _dividend_cash(journal_settings, short_window) == []
+
+
+def test_a_short_covered_on_the_ex_date_with_a_debit_halts_as_a_cash_mismatch(
+    journal_settings: Settings,
+    short_fake: ShortFake,
+    short_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A `ReconciliationError` (so the switch engages), never a bare `ValueError`."""
+    _short_10_spy(journal_settings, short_fake, short_window)
+    _cover_10_spy(journal_settings, short_fake, short_window)
+    _short_dividend(journal_settings, 0.5)
+    short_fake.extra_cash = -5.0
+
+    with pytest.raises(ReconciliationError, match="cash"):
+        reconcile_command(
+            journal_settings, lambda: open_for_write(journal_settings), short_fake, fixed_clock
+        )
+    (row,) = _rows(journal_settings, short_window)
+    assert row.status == MISMATCH

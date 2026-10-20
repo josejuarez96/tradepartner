@@ -458,8 +458,19 @@ def _dividends(
                 if held > tolerance
                 else -short * float(row["ratio_or_amount"])
             )
+    # `compare` signs a due against the book at S: a short's due is negative only
+    # while the name is still held short, a long's positive only while it is not.
+    # A short covered (or a long flipped short) after the ex-date has a due of
+    # the wrong sign there, which would raise; leave it unexplained instead, so
+    # the cash it moved halts as a `cash` mismatch as before (#1928).
+    short_now = _ledger(state, actions, window, through, tolerance).short_holdings
     return (
-        {name: amount for name, amount in sorted(due.items()) if amount != 0},
+        {
+            name: amount
+            for name, amount in sorted(due.items())
+            if (amount < 0 and short_now.get(name, 0.0) > tolerance)
+            or (amount > 0 and short_now.get(name, 0.0) <= tolerance)
+        },
         {name: "; ".join(details) for name, details in sorted(findings.items())},
     )
 
