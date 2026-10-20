@@ -254,6 +254,7 @@ def _rebalance_count_line(
         if e.run_id in runs and runs[e.run_id].invoked_by == _SCHEDULER
     }
     all_executed_sessions = {e.rebalance_session for e in executed}
+    missed_sessions = {e.rebalance_session for e in events if e.status == "missed"}
     tty_only_sessions = sorted(all_executed_sessions - scheduler_sessions)
     executed_run_ids = {e.run_id for e in executed}
     decision_sessions = {
@@ -277,11 +278,19 @@ def _rebalance_count_line(
         for run in uncounted_runs
         if run.session is not None and run.run_id not in order_run_ids
     )
+    missed_runs = sorted(
+        run.session
+        for run in uncounted_runs
+        if run.session is not None
+        and run.run_id in order_run_ids
+        and order_sessions[run.run_id] & missed_sessions
+    )
     awaiting_runs = sorted(
         run.session
         for run in uncounted_runs
         if run.session is not None
         and run.run_id in order_run_ids
+        and not order_sessions[run.run_id] & missed_sessions
         and not all(session in all_executed_sessions for session in order_sessions[run.run_id])
     )
     recorded_runs = sorted(
@@ -289,6 +298,7 @@ def _rebalance_count_line(
         for run in uncounted_runs
         if run.session is not None
         and run.run_id in order_run_ids
+        and not order_sessions[run.run_id] & missed_sessions
         and all(session in all_executed_sessions for session in order_sessions[run.run_id])
     )
 
@@ -308,6 +318,9 @@ def _rebalance_count_line(
     if awaiting_runs:
         submitted_text = ", ".join(s.isoformat() for s in awaiting_runs)
         detail += f"; submitted-order runs awaiting recorded fills, not counted: [{submitted_text}]"
+    if missed_runs:
+        missed_text = ", ".join(s.isoformat() for s in missed_runs)
+        detail += f"; submitted-order runs, rebalance missed, not counted: [{missed_text}]"
     if recorded_runs:
         recorded_text = ", ".join(s.isoformat() for s in recorded_runs)
         detail += (
