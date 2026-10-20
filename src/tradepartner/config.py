@@ -1077,6 +1077,43 @@ class BorrowConfig(_ClosedConfig):
     raw_dir: str = Field(default_factory=_default_alpaca_assets_dir)
 
 
+_MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+
+
+class IndexCheckConfig(_ClosedConfig):
+    """The known-answer index check (backtest spec amendment 2026-10-19, #1598).
+
+    **Not frozen** and part of no hypothesis: the check is never a trial and no
+    registered canonical set, fingerprint or hash includes these keys. `start_month`
+    and `end_month` are the default window (the owner, 2026-10-12);
+    `check_only_symbols` are benchmark series stored for the check alone, which no
+    trial can read (`store.benchmarks.CHECK_ONLY_IDS`), so a symbol here may not also
+    be in `benchmarks` (`Settings` refuses the overlap); `equal_benchmark` and
+    `cap_benchmark` are the series the equal- and cap-weight books are compared with.
+    `worst_months` months are listed per weighting, each with `names_per_month`
+    names plus every name whose return is at least `extreme_name_return` (the first
+    pass's 60 % screen).
+    """
+
+    start_month: str = Field(default="2019-08", pattern=_MONTH_PATTERN)
+    end_month: str = Field(default="2026-09", pattern=_MONTH_PATTERN)
+    check_only_symbols: list[str] = Field(default_factory=lambda: ["RSP"])
+    equal_benchmark: str = Field(default="RSP", min_length=1)
+    cap_benchmark: str = Field(default="SPY", min_length=1)
+    worst_months: int = Field(default=10, ge=1)
+    names_per_month: int = Field(default=5, ge=1)
+    extreme_name_return: float = Field(default=0.60, gt=0.0)
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> IndexCheckConfig:
+        if self.end_month < self.start_month:
+            raise ValueError(
+                f"index_check.end_month ({self.end_month}) must not be before "
+                f"start_month ({self.start_month})"
+            )
+        return self
+
+
 class OpenfigiConfig(_ClosedConfig):
     """Current types check; unset limits use documented keyed/keyless limits."""
 
@@ -2484,6 +2521,8 @@ class Settings(BaseSettings):
     # #1506 (T171c): the borrow-status snapshot, after `health` for the same reason.
     borrow: BorrowConfig = Field(default_factory=BorrowConfig)
     openfigi: OpenfigiConfig = Field(default_factory=OpenfigiConfig)
+    # #1598 (T243): the known-answer index check; not frozen, part of no hypothesis.
+    index_check: IndexCheckConfig = Field(default_factory=IndexCheckConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
@@ -2536,6 +2575,19 @@ class Settings(BaseSettings):
         # raises a plain `ValueError` whose message names only the bad key, never a
         # secret (code-review finding on #952).
         self._validate_lab_sweepable_keys()
+        # Also a plain attribute read and raise, for the same reason (T243).
+        self._validate_check_only_symbols()
+
+    def _validate_check_only_symbols(self) -> None:
+        """`index_check.check_only_symbols` may not overlap `benchmarks` (backtest
+        spec amendment #1598, item 3): a check-only series must stay out of every
+        trial's reach, and `benchmarks` is the trial list."""
+        overlap = sorted(set(self.index_check.check_only_symbols) & set(self.benchmarks))
+        if overlap:
+            raise ValueError(
+                f"index_check.check_only_symbols {overlap} also in benchmarks: a check-only "
+                "series must not be a trial benchmark"
+            )
 
     def _validate_lab_sweepable_keys(self) -> None:
         """`lab.sweepable_keys` (strategy-lab spec req 1; Amendment 2026-10-05 (#952,

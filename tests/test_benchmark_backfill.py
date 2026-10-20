@@ -154,6 +154,41 @@ def test_a_symbol_outside_the_benchmarks_is_refused_before_any_fetch(settings: S
     assert _read(settings, "SELECT count(*) FROM securities") == [(0,)]
 
 
+RSP = "BENCH:RSP"
+RSP_SEED = BenchmarkSeed(cik="0001350487", name="Invesco S&P 500 Equal Weight ETF", exchange="NYSE")
+
+
+def test_a_check_only_symbol_is_seeded_and_backfilled(settings: Settings) -> None:
+    prices = _History()
+    result = _run(settings, prices, symbol="RSP", seed=RSP_SEED)
+    assert (result.security_id, result.seeded, result.ok) == (RSP, True, True)
+    assert all(ids == {RSP} for ids in prices.fetched.values())
+    assert _read(settings, "SELECT security_id, benchmark, source FROM securities") == [
+        (RSP, True, "config")
+    ]
+    assert _read(settings, "SELECT count(*) FROM prices_daily WHERE security_id = 'BENCH:RSP'")[0][
+        0
+    ] == len(_sessions(SINCE, date(2019, 6, 28)))
+
+
+def test_a_check_only_symbol_resolves_only_for_the_index_check(settings: Settings) -> None:
+    _run(settings, _History(), symbol="RSP", seed=RSP_SEED)
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        with pytest.raises(BenchmarkIdentityError, match="check-only"):
+            benchmark_security_ids(conn, ["RSP"], start=SINCE, through=date(2019, 6, 28))
+        ids = benchmark_security_ids(
+            conn, ["RSP"], start=SINCE, through=date(2019, 6, 28), check_only=True
+        )
+    assert ids == {"RSP": RSP}
+
+
+def test_a_symbol_in_neither_list_is_refused_with_rsp_configured(settings: Settings) -> None:
+    prices = _History()
+    with pytest.raises(ValueError, match="not a configured benchmark or check-only"):
+        _run(settings, prices, symbol="IWM", seed=RSP_SEED)
+    assert prices.calls == []
+
+
 def test_a_missing_benchmark_without_a_seed_is_refused(settings: Settings) -> None:
     prices = _History()
     with pytest.raises(ValueError, match="MTUM is not in the store"):
