@@ -1470,3 +1470,7 @@ unblocks = ["task:T252"]
 [task.T252]
 what = "The Performance page on the dashboard: the equity curve, daily P&L, SPY and the book's backtest tracking, per book."
 why = "No screen showed a book's equity, gain or loss, or its comparison with SPY; the owner sees them outside Alpaca (#2006)."
+
+[task.T253]
+what = "A held name whose rebalance-session bar is missing from a partial ingest is kept at its quantity for that rebalance, not sold."
+why = "A data gap should not realize a sale in a paper book of 200 names, and one missing bar should not halt it (#2023)."
