@@ -40,21 +40,20 @@ journal. Nothing here reads a clock or the store.
   never matches in mixed units; `matched_quantity` is therefore in those units.
   A replacement share absorbs at most one loss (R13), and shares closed by the
   same sale are never its own replacement. Taken literally (an owner question
-  on #308), the unsold rest
-of a lot, or another fill of the same order, bought inside the window does
-count as a replacement. Each disposal is scanned on its own, so a loss and a gain closed
-  the same day are flagged and reported apart, never netted (R14); a December
-  sale is matched to a January purchase like any other (R15). Each match is a
-  `WashSaleFlag` with the replacement lot, the matched quantity and the
-  disallowed amount (the loss per share times that quantity). Because
-  `rebuild` runs over every fill, a later acquisition re-scans every earlier
-  loss.
+  on #308), the unsold rest of a lot, or another fill of the same order, bought
+  inside the window does count as a replacement. Each disposal is scanned on
+  its own, so a loss and a gain closed the same day are flagged and reported
+  apart, never netted (R14); a December sale is matched to a January purchase
+  like any other (R15). Each match is a `WashSaleFlag` with the replacement
+  lot, the matched quantity and the disallowed amount (the loss per share times
+  that quantity). Because `rebuild` runs over every fill, a later acquisition
+  re-scans every earlier loss.
 
 - **Adjustments (#516, spec req 13; long lots only).** `rebuild` also takes the
   window's journaled `adjustments`, the `live_actions_as_of(close(S-1))` frame
   (its `split` rows) and the session S (`through`). Within a session the order
   is split, `cash_in_lieu`, fills, other adjustments (the positions ledger's).
-  A **split** scales every open lot's quantity and keeps its basis and date;
+  A **split** scales every lot's quantity and keeps its basis and date;
   **cash in lieu** rounds the name's exact holding down to whole shares and
   disposes of the fraction FIFO at the journaled cash; **`corporate_action_cash`**
   closes the name's lots FIFO as one sale at its cash; a **spin-off receipt**
@@ -471,11 +470,13 @@ class _Ledger:
         )
 
     def merge(self, removal: AdjustmentRow, receipt: AdjustmentRow) -> None:
-        """A stock merger (spec amendment #1762 item 5): the target's lots
+        """A stock merger (spec amendment #1762 item 5): the target's open lots
         become acquirer lots at the ratio of the two quantities, basis and
-        acquisition instant carried, with no disposal. Every lot is re-keyed,
-        not just the open ones, so a lot's `acquired` and the wash-sale scan
-        stay in the acquirer's units (#1980)."""
+        acquisition instant carried, with no disposal. Every lot of the target is
+        given the acquirer as an identity and scaled, so the wash-sale scan stays
+        in the acquirer's units (#1980); only the open ones take the acquirer's
+        symbol and CUSIP, so a sale before the merger still reconciles against
+        the target's symbol."""
         target, acquirer = _security(removal), _security(receipt)
         self.refuse_short(target, removal.kind)
         self.refuse_short(acquirer, receipt.kind)
@@ -499,11 +500,12 @@ class _Ledger:
         for lot in self.lots:
             if lot.security_id != target or lot.position_side != LONG:
                 continue
-            lot.security_id, lot.symbol = acquirer, symbol
             lot.identities.add(acquirer)
-            lot.cusip = None if asset is None else asset.cusip
             lot.quantity *= ratio
             lot.acquired *= ratio
+        for lot in held:
+            lot.security_id, lot.symbol = acquirer, symbol
+            lot.cusip = None if asset is None else asset.cusip
         self._rekey_disposals(target, acquirer, ratio)
         merged = self.longs.setdefault(acquirer, [])
         merged.extend(held)

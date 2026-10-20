@@ -102,3 +102,30 @@ def test_the_shares_the_same_sale_closed_are_scaled_too() -> None:
     assert [(f.replacement_lot_id, f.matched_quantity, f.disallowed_amount) for f in flags] == [
         (1, 8.0, 40.0)
     ]
+
+
+def test_a_merger_keeps_the_target_symbol_on_a_lot_sold_before_it() -> None:
+    """The 1099-B reconcile matches a sale to its lot's symbol and CUSIP
+    (`lots_reconcile._same_sale`), so a lot fully sold before a merger keeps the
+    target's; only the lots open at the merger take the acquirer's. Hand values:
+
+      03-03 buy 10 SEC_T @ 30   lot 1: basis 300
+      03-04 sell 10 SEC_T @ 20  closes lot 1 whole: proceeds 200, pnl -100
+      03-05 buy  5 SEC_T @ 20   lot 2: basis 100 (open at the merger)
+      03-07 merger 5 SEC_T -> 2.5 SEC_A at 0.5
+
+    Lot 1 keeps SEC_T / TGT (its acquired quantity scaled to 5 for the scan);
+    lot 2 becomes SEC_A / ACQ with 2.5 shares.
+    """
+    book = Book()
+    book.trade("buy", 10, 30.0, D0303, security_id="SEC_T")
+    book.trade("sell", 10, 20.0, D0304, security_id="SEC_T")
+    book.trade("buy", 5, 20.0, D0305, security_id="SEC_T")
+    _merge(book, D0307, 5.0, 2.5)
+
+    lot_list, _, _ = book.run(D0312)
+
+    assert [(lot.lot_id, lot.security_id, lot.symbol, lot.quantity) for lot in lot_list] == [
+        (1, "SEC_T", "TGT", 5.0),
+        (2, "SEC_A", "ACQ", 2.5),
+    ]
