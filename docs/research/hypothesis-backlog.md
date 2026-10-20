@@ -151,6 +151,7 @@ Parked ideas are listed at the end with the reason.
 | LLM-generated return signals | No post-cutoff net evidence; barred by ADR 0008 | HO-9, QI-8, ER-17 INSUFFICIENT |
 | Deep learning on prices, RL trading | No general evidence for standalone alpha | QI-22 INSUFFICIENT |
 | Diversified futures trend | SUPPORTED, but outside a long-only equity system's scope (charter) | QI-13 SUPPORTED |
+| Daily candlestick patterns (engulfing, hammer, doji, harami, stars, soldiers) | Proposed by #1944, the owner's merge decides. Fixed-exit tests find no value in large US stocks; the positive results rest on a 1-3-day averaged exit, survivors or pre-2013 data, and look like short-term reversal (SH-1, SH-2); the published gross per trade after the post-publication haircut is about our 30 bp round trip, under a 3x-cost line. Needs an OHLC signal and per-position holds (size M). Revisit only with a post-2012, survivorship-free US net-of-cost study. [report](2026-10-20-candlestick-patterns.md) | CS-1, CS-6 NOT SUPPORTED; CS-2 MIXED; CS-4 INSUFFICIENT; CS-3, CS-5 |
 
 ## Ladder ledger
 
@@ -186,6 +187,7 @@ The record of looks before rung 4 (rules L1 to L5 of the [strategy-discovery rep
 | B9 | 2026-10-18 (backfill) | extension; owner/agent | market reaction at the 8-K 2.02 acceptance predicts a 20-session drift | CZ `AnnouncementReturn`, size-screened, 2010-2024; kill: long leg < 0.10 %/mo or t < 1.0, break-even <= 6 bp | 2 (size-screened, then the value-weighted file, reported and not used) | killed at rungs 1-2 | [note](2026-10-18-b9-kill-b3-retirement.md), TP-6 |
 | IRRX | 2026-10-18 (backfill) | paper; agent | announcement-adjusted industry-relative reversal | a CZ long leg; none exists | 2 (the FAJ spreads; the plain-reversal proxy) | rung 2 INSUFFICIENT; parked | [retry](2026-10-18-irrx-rung2-retry.md), IL-2 |
 | Q1 | 2026-10-19 | extension; agent | lowest net share issuance (largest net repurchasers) is underpriced | CZ `ShareIss1Y`, size-screened (ex NYSE p20), long leg, 2010-01..2019-12; kill: < 0.10 %/mo or t < 1.0 | 0 (declared, not read) | rung 1-2 pre-analysis written | [note](2026-10-19-q1-repurchasers-rung12.md) |
+| L-1 | 2026-10-20 | paper; owner (#1944) | three-day reversal candles after a short decline predict a 1-3-day bounce | none read: desk arithmetic on published per-trade figures; kill: haircut gross per trade < 90 bp (3x a 30 bp round trip) | 0 (no series read) | rung 1 fails the 3x line on published figures; proposed parked | [report](2026-10-20-candlestick-patterns.md), CS-5 |
 
 Backfilled rows were not written before their read; their declared read is reconstructed from the notes.
 
@@ -196,6 +198,7 @@ Backfilled rows were not written before their read; their declared read is recon
 | 2026-10-09 | agent workflow | 10 short-horizon candidates (8 not recommended; count from the discovery report's D1, not re-counted) | 3 (B9, B10, IRRX) | [short-horizon](2026-10-09-short-horizon-candidates.md) |
 | 2026-10-10 | agent workflow (7 scouts, 3 skeptics each) | 7 long-short and hedged candidates | 0 (B11 is a decomposition of existing trials, not a candidate) | [beyond long-only](2026-10-10-beyond-long-only.md) |
 | 2026-10-19 | agent | 1 (Q1, chosen for kill-cost) | 1 | [discovery report](2026-10-19-strategy-discovery.md) |
+| 2026-10-20 | owner (#1944) | 1 (daily candlestick patterns) | 0 (desk rung 1 only, L-1) | [candlestick report](2026-10-20-candlestick-patterns.md) |
 
 ## Changing this file
 

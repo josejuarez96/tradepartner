@@ -3075,6 +3075,69 @@ scope = "one appendix row (−0.25%/month low-fee, −0.17 net, 2006-2020); a le
 source = "docs/research/2026-10-10-beyond-long-only.md"
 section = "Proposed claims for claims.toml"
 
+# ===== 2026-10-20-candlestick-patterns.md =====
+# CS- entries: #1944, desk review of the candlestick literature; no TradePartner data was read.
+
+[[claim]]
+id = "CS-1"
+statement = "Daily candlestick signals scored with a fixed exit day show no value in large US stocks: 28 single-day and multi-day signals on DJIA stocks, 1992-2002, with 2-, 5- and 10-day holds, are no better than chance under a 500-series bootstrap (Marshall, Young & Rose 2006), and on 26 surviving DJIA stocks, 1992-2012, the fixed-day exits (MYR-3, MYR-10) give negative or insignificant returns at 0.5% round-trip cost (Lu, Chen & Hsu 2015)."
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "Large US stocks (DJIA), daily OHLC, long and short signals, fixed exit 2-10 days after the signal; 1992-2012"
+source = "docs/research/2026-10-20-candlestick-patterns.md"
+section = "1. What the evidence says, after realistic costs"
+note = "Conflicts with CS-2: Lu, Chen & Hsu read the fixed-exit null as an artefact of the exit rule. MYR 2006 read in the authors' companion preprint. Consistent with CS-6 (intraday, Japan)."
+
+[[claim]]
+id = "CS-2"
+statement = "Three-day reversal patterns after a short trend, scored with an exit averaged over the next three closes (the Caginalp-Laurent exit), earned about 0.9% per trade before costs in S&P 500 stocks over 1992-1996 (bought at the close that completes the pattern) and 0.19% to 0.45% per trade net of a 0.5% round trip (three white soldiers, by trend definition) after a Step-SPA test on 26 surviving DJIA stocks over 1992-2012 (next-open entry), with performance described as poor in 2006-2012."
+kind = "empirical"
+grade = "MIXED"
+scope = "Large US stocks, survivors only (Lu, Chen & Hsu) or 1992-1996 pre-decimal (Caginalp & Laurent); long and short legs; no post-2012 or survivorship-free US test found"
+source = "docs/research/2026-10-20-candlestick-patterns.md"
+section = "1. What the evidence says, after realistic costs"
+note = "Conflicts with CS-1. Same entry with a fixed day-3 exit (MYR-3) is not profitable, so the edge sits in days 1-2 after the signal (the report's reading): a short-term-reversal shape, which SH-1 grades NOT SUPPORTED in large US stocks and SH-2 finds eaten by costs at high turnover. Exit-rule choice is an unadjusted fork (CS-3)."
+
+[[claim]]
+id = "CS-3"
+statement = "Candlestick studies try 8 to 28 patterns and up to 12 trend-and-exit combinations per pattern (Lu, Chen & Hsu: 8 patterns x 3 trend definitions x 4 holding strategies); their corrections are a per-rule bootstrap (Marshall, Young & Rose), Step-SPA within each table of 8 patterns (Lu, Chen & Hsu, as read) and SSPA (Duvinage et al., intraday); none found uses a deflated Sharpe, and the choice between exit rules is not corrected for."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Four candlestick studies read in full text or abstract, plus Bajgrowicz & Scaillet (2012) on technical rules in general"
+source = "docs/research/2026-10-20-candlestick-patterns.md"
+section = "3. Data snooping"
+note = "Whether Lu, Chen & Hsu's Step-SPA covers all 96 combinations or each table of 8 is the report's reading of §3.1, UNVERIFIED in the appendix. Bajgrowicz & Scaillet (JFE 2012): with a false discovery rate, technical rules' in-sample performance on the DJIA is offset by low costs and the best rules cannot be picked ahead of time."
+
+[[claim]]
+id = "CS-4"
+statement = "No US evidence tests candlesticks as a filter on another signal, in small caps, or with a volume condition net of costs; the indirect evidence is a larger net return on 19 surviving NASDAQ-100 stocks (Lu, Chen & Hsu), some patterns working in small liquid Chinese stocks (Zhu, Atri & Yegen 2016, costs not stated), and RSI, stochastic and MFI filters not helping in Thai SET50 stocks (Tharavanij et al. 2017)."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "US equities; filter, small-cap and volume variants of daily candlestick signals"
+source = "docs/research/2026-10-20-candlestick-patterns.md"
+section = "2. Any form that survives?"
+note = "Lu, Chen & Hsu find the trend definition does not change their result. Small caps cost far more to trade than 15 bp per side (HO-14)."
+
+[[claim]]
+id = "CS-5"
+statement = "At 15 bp per side a 1-3-day candlestick trade needs more than 30 bp gross per round trip to break even and about 90 bp to clear a 3x-cost line; the published gross per trade (about 0.7-1.0%) cut by the 58% post-publication decline (QI-2) is about 30-40 bp, so a standalone signal sits at break-even and below the 3x line."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Desk arithmetic on published figures (CL 1998 0.9% gross; Lu, Chen & Hsu net plus their 0.5% cost); no store read, no measured turnover or fills; long-only"
+source = "docs/research/2026-10-20-candlestick-patterns.md"
+section = "2. Any form that survives?"
+note = "ADR 0023 rung-1 shape; the 3x line is the one the Q1 note used. A fully invested book of 2-day trades makes about 125 round trips a year, about 37% a year of cost at 30 bp each (arithmetic)."
+
+[[claim]]
+id = "CS-6"
+statement = "Candlestick rules do not survive costs outside the daily US tests either: on 5-minute bars of the DJIA 30 no single rule beats buy-and-hold after costs under SSPA (Duvinage, Mazza & Petitjean 2013), and in Japan over 1975-2004 the strategies show no value in the full period, its three decades, or bull and bear markets (Marshall, Young & Cahan 2008)."
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "Intraday US large caps; Japanese equities, daily"
+source = "docs/research/2026-10-20-candlestick-patterns.md"
+section = "1. What the evidence says, after realistic costs"
+note = "Duvinage from the abstract (sample period and cost level from a secondary summary, UNVERIFIED); Marshall, Young & Cahan from a 2006 seminar abstract, UNVERIFIED against the paper. Positive results in Taiwan (Lu, Shiu & Liu 2012) and China (Deng et al. 2022) state no costs in their abstracts."
+
 # ===== TradePartner's own results (TP-) =====
 
 [[claim]]
