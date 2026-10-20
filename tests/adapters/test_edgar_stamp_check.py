@@ -12,7 +12,8 @@ transport: a synthetic payload, and synthetic SGML headers routed by URL.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -21,7 +22,7 @@ import pytest
 from edgar_transport import EdgarRouter, edgar_settings
 
 from tradepartner.adapters.edgar import UnstampedFiling, sgml_acceptance
-from tradepartner.adapters.edgar_source import EdgarFilingSource, SubmissionRecord
+from tradepartner.adapters.edgar_source import EdgarFilingSource, SubmissionRecord, _fallback_stamp
 from tradepartner.config import Settings
 from tradepartner.ingest import _source_counts
 
@@ -310,3 +311,117 @@ def test_a_short_unclosed_header_is_unread_not_overlong(settings: Settings) -> N
     assert accession not in stamps
     assert source.stamps_sgml_unread == 1
     assert source.stamps_sgml_overlong == 0
+
+
+# --- #1686: the API-stamp fallback after N unread runs ------------------------------
+
+
+def _all_404() -> dict[str, int]:
+    return {a: 404 for a, _, _ in FILINGS}
+
+
+def _fallback_settings(tmp_path: Path, runs: int = 3) -> Settings:
+    return edgar_settings(tmp_path / "cache", stamp_sgml_check=True, stamp_sgml_fallback_runs=runs)
+
+
+def _run_once(settings: Settings, router: EdgarRouter) -> EdgarFilingSource:
+    source = EdgarFilingSource(settings, client=router.client(), clock=lambda: CLOCK)
+    source._stamp(_kept())
+    return source
+
+
+def test_the_fallback_run_count_is_config_and_defaults_above_one() -> None:
+    assert Settings(_env_file=None).edgar.stamp_sgml_fallback_runs >= 2
+
+
+def test_stamps_are_left_out_until_the_nth_consecutive_unread_run(tmp_path: Path) -> None:
+    settings = _fallback_settings(tmp_path, runs=3)
+    router = _router(SHIFTED, _all_404())
+    for _ in range(2):
+        source = _run_once(settings, router)  # a fresh source each run: the count persists
+        assert source.stamps_api_fallback == 0
+        assert not (Path(settings.edgar.cache_dir) / "stamps").exists() or not list(
+            (Path(settings.edgar.cache_dir) / "stamps").glob(f"*/{CIK}.json")
+        )
+    source = _run_once(settings, router)
+    assert source.stamps_api_fallback == len(FILINGS)
+    assert source.stamp_fallback_ciks == 1
+    assert {a: row[3] for a, row in _cached(settings).items()} == {
+        a: (at + _offset(at)).isoformat() for a, _, at in FILINGS
+    }
+    assert "stamps from API fallback: 3" in _source_counts(source)
+    assert "CIKs on API fallback: 1" in _source_counts(source)
+
+
+def test_no_lookahead_a_fallback_stamp_is_never_earlier_than_the_true_acceptance(
+    tmp_path: Path,
+) -> None:
+    """The API serves stamps late by New York's offset (4 h EDT, 5 h EST) or
+    exact, never early, so the fallback can only delay a row."""
+    settings = _fallback_settings(tmp_path, runs=1)
+    _run_once(settings, _router(SHIFTED, _all_404()))
+    cached = _cached(settings)
+    for accession, _, true_at in FILINGS:
+        stamped = datetime.fromisoformat(str(cached[accession][3]))
+        assert stamped >= true_at
+        assert stamped - true_at == _offset(true_at)
+
+
+def test_a_readable_anchor_resets_the_unread_count(tmp_path: Path) -> None:
+    settings = _fallback_settings(tmp_path, runs=2)
+    _run_once(settings, _router(SHIFTED, _all_404()))  # 1 unread run
+    _run_once(settings, _router(SHIFTED))  # readable: proven stamps cached, count reset
+    for path in (Path(settings.edgar.cache_dir) / "stamps").glob(f"*/{CIK}.json"):
+        path.unlink()  # the same accessions are unstamped again
+    source = _run_once(settings, _router(SHIFTED, _all_404()))  # 1 unread run again
+    assert source.stamps_api_fallback == 0
+    assert not list((Path(settings.edgar.cache_dir) / "stamps").glob(f"*/{CIK}.json"))
+
+
+def test_no_acceptance_headers_are_not_an_unread_run(tmp_path: Path) -> None:
+    """Pre-2001 headers are kept unchecked as before; they never touch the count."""
+    settings = _fallback_settings(tmp_path, runs=1)
+    no_stamp = {a: _header(a, form, None) for a, form, _ in FILINGS}
+    source = _run_once(settings, _router({}, dict(no_stamp)))
+    assert source.stamp_check_unread_ciks == 1
+    assert source.stamps_api_fallback == 0
+
+
+def test_one_run_counts_a_cik_once_even_if_stamped_twice(tmp_path: Path) -> None:
+    settings = _fallback_settings(tmp_path, runs=2)
+    router = _router(SHIFTED, _all_404())
+    source = EdgarFilingSource(settings, client=router.client(), clock=lambda: CLOCK)
+    source._stamp(_kept())
+    source._stamp(_kept())
+    assert source.stamps_api_fallback == 0  # one run, so still below N=2
+
+
+def test_no_lookahead_a_provably_early_api_stamp_is_moved_by_the_offset() -> None:
+    """The API served early (the zip's #1382 direction) and no header can prove
+    it. A filing accepted 18:00 ET (22:00Z, EDT) is dated the next day; stamped
+    14:00 ET it fits only a clock moved early, so the fallback adds New York's
+    offset and lands on the true acceptance, never before it."""
+    true_at = datetime(2026, 10, 9, 22, tzinfo=UTC)
+    early = SubmissionRecord(
+        "0001628280-26-065999", "8-K", "d.htm", False, true_at - EDT, None, date(2026, 10, 10)
+    )
+    assert _fallback_stamp(early).accepted_at == true_at
+    # EST: 18:00 ET Feb 20 is 23:00Z
+    true_est = datetime(2026, 2, 20, 23, tzinfo=UTC)
+    early_est = replace(early, accepted_at=true_est - EST, filing_date=date(2026, 2, 21))
+    assert _fallback_stamp(early_est).accepted_at == true_est
+
+
+def test_an_api_stamp_that_fits_the_filing_date_is_kept_as_served() -> None:
+    late = SubmissionRecord(
+        "0001628280-26-065998",
+        "8-K",
+        "d.htm",
+        False,
+        datetime(2026, 10, 9, 20, 3, tzinfo=UTC) + EDT,
+        None,
+        date(2026, 10, 9),
+    )
+    assert _fallback_stamp(late).accepted_at == late.accepted_at
+    assert _fallback_stamp(replace(late, accepted_at=None)).accepted_at is None
+    assert _fallback_stamp(replace(late, filing_date=None)).accepted_at == late.accepted_at
