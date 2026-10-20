@@ -91,7 +91,11 @@ _HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
     "tests/lookahead/test_asof_invariance.py": 583.0,
     "tests/test_config.py": 561.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_truncation_invariance_at_every_rebalance[month_end]": 544.0,
+    "test_truncation_invariance_at_every_rebalance[month_end-0]": 181.3,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[month_end-1]": 181.3,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[month_end-2]": 181.3,
     "tests/lookahead/test_backtest_plan_timing.py": 475.0,
     "tests/execution/test_run_exits.py": 454.0,
     "tests/backtest/test_results.py": 449.0,
@@ -101,30 +105,62 @@ _HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
     "tests/execution/test_run_trade.py": 414.0,
     "tests/execution/test_crash_resume.py": 409.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_truncation_invariance_at_every_rebalance[week_end]": 379.0,
+    "test_truncation_invariance_at_every_rebalance[week_end-0]": 126.3,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[week_end-1]": 126.3,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[week_end-2]": 126.3,
     "tests/store/test_journal_schema.py": 378.0,
     "tests/backtest/test_lab.py": 368.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_truncation_invariance_at_every_rebalance[daily]": 357.0,
+    "test_truncation_invariance_at_every_rebalance[daily-0]": 119.0,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[daily-1]": 119.0,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[daily-2]": 119.0,
     "tests/lookahead/test_universe_rank.py": 343.0,
     "tests/store/test_registry.py": 325.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_truncation_invariance_at_every_rebalance[momentum-turnover]": 323.0,
+    "test_truncation_invariance_at_every_rebalance[momentum-turnover-0]": 107.7,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[momentum-turnover-1]": 107.7,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[momentum-turnover-2]": 107.7,
     "tests/execution/test_run_core.py": 316.0,
     "tests/test_llm_boundary.py": 315.0,
     "tests/store/test_schema.py": 299.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_truncation_invariance_at_every_rebalance[combined]": 297.0,
+    "test_truncation_invariance_at_every_rebalance[combined-0]": 99.0,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[combined-1]": 99.0,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[combined-2]": 99.0,
     "tests/backtest/test_holdout.py": 287.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_prefix_invariance_at_every_rebalance[daily]": 286.0,
+    "test_prefix_invariance_at_every_rebalance[daily-0]": 95.3,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_prefix_invariance_at_every_rebalance[daily-1]": 95.3,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_prefix_invariance_at_every_rebalance[daily-2]": 95.3,
     "tests/test_cli_backtest.py": 281.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_prefix_invariance_at_every_rebalance[combined]": 261.0,
+    "test_prefix_invariance_at_every_rebalance[combined-0]": 87.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_prefix_invariance_at_every_rebalance[month_end]": 257.0,
+    "test_prefix_invariance_at_every_rebalance[combined-1]": 87.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_truncation_invariance_at_every_rebalance[profitability]": 250.0,
+    "test_prefix_invariance_at_every_rebalance[combined-2]": 87.0,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_prefix_invariance_at_every_rebalance[month_end-0]": 85.7,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_prefix_invariance_at_every_rebalance[month_end-1]": 85.7,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_prefix_invariance_at_every_rebalance[month_end-2]": 85.7,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[profitability-0]": 83.3,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[profitability-1]": 83.3,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[profitability-2]": 83.3,
     "tests/test_ingest.py": 244.0,
     "tests/execution/test_window_stop.py": 243.0,
     "tests/test_merge_train.py": 243.0,
@@ -135,13 +171,21 @@ _HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
     "tests/execution/test_accept_rejections_boundary.py": 225.0,
     "tests/execution/test_wrapper_phases.py": 224.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_prefix_invariance_at_every_rebalance[week_end]": 217.0,
+    "test_prefix_invariance_at_every_rebalance[week_end-0]": 72.3,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_prefix_invariance_at_every_rebalance[week_end-1]": 72.3,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_prefix_invariance_at_every_rebalance[week_end-2]": 72.3,
     "tests/execution/test_run_stop.py": 210.0,
     "tests/execution/test_drills.py": 207.0,
     "tests/adapters/test_fixture_prices.py": 203.0,
     "tests/test_cli_sweep.py": 201.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_prefix_invariance_at_every_rebalance[momentum-turnover]": 199.0,
+    "test_prefix_invariance_at_every_rebalance[momentum-turnover-0]": 66.3,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_prefix_invariance_at_every_rebalance[momentum-turnover-1]": 66.3,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_prefix_invariance_at_every_rebalance[momentum-turnover-2]": 66.3,
     "tests/execution/test_resume.py": 184.0,
     "tests/execution/test_risk.py": 183.0,
     "tests/adapters/test_edgar_source_cik.py": 181.0,
@@ -174,7 +218,11 @@ _HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
     "test_revisions_known_after_t_i_leave_run_to_t_i_unchanged[week_end]": 123.0,
     "tests/execution/test_window_start.py": 122.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_prefix_invariance_at_every_rebalance[profitability]": 122.0,
+    "test_prefix_invariance_at_every_rebalance[profitability-0]": 40.7,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_prefix_invariance_at_every_rebalance[profitability-1]": 40.7,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_prefix_invariance_at_every_rebalance[profitability-2]": 40.7,
     "tests/lookahead/test_backtest_invariance.py::"
     "test_revisions_known_after_t_i_leave_run_to_t_i_unchanged[month_end]": 117.0,
     "tests/adapters/test_edgar_filename.py": 116.0,
