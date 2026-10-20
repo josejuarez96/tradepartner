@@ -61,6 +61,8 @@ def name_return(entry_mark: float | None, end_mark: float | None) -> tuple[float
         return 0.0, True
     if end_mark is None:
         raise ValueError("a name with an entry mark must have an end mark")
+    if not math.isfinite(entry_mark) or not math.isfinite(end_mark):
+        raise ValueError(f"marks must be finite, got {entry_mark} and {end_mark}")
     if not entry_mark > 0 or not end_mark > 0:
         raise ValueError(f"marks must be positive, got {entry_mark} and {end_mark}")
     return end_mark / entry_mark - 1.0, False
@@ -126,15 +128,18 @@ def listed_names(
     returns: Mapping[str, float],
     names_per_month: int,
     extreme_name_return: float,
+    *,
+    member_ids: Sequence[str],
 ) -> list[str]:
     """The top `names_per_month` by |c_j| (ties by `security_id`), plus every member
-    with |r_j| at or over `extreme_name_return`, in |c_j| order."""
+    with |r_j| at or over `extreme_name_return`, in |c_j| order. Members without
+    a weight have zero contribution, and ties are broken by `security_id`."""
 
     def key(s: str) -> tuple[float, str]:
-        return (-abs(contribs[s]), s)
+        return (-abs(contribs.get(s, 0.0)), s)
 
     top = sorted(contribs, key=key)[: max(names_per_month, 0)]
-    extreme = [s for s in contribs if abs(returns[s]) >= extreme_name_return]
+    extreme = [s for s in member_ids if abs(returns[s]) >= extreme_name_return]
     return sorted(set(top) | set(extreme), key=key)
 
 

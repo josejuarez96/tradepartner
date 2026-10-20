@@ -80,6 +80,12 @@ def test_name_return_rejects_an_entry_without_an_end() -> None:
         ic.name_return(0.0, 1.0)
 
 
+@pytest.mark.parametrize("entry,end", [(10.0, math.inf), (math.inf, 10.0)])
+def test_name_return_rejects_infinite_marks(entry: float, end: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        ic.name_return(entry, end)
+
+
 def test_hand_case_equal_weight() -> None:
     m1, m2 = _calc("2020-01", M1, B1), _calc("2020-02", M2, B2)
     assert m1.equal.index == pytest.approx(0.04 / 3, abs=TOL)
@@ -172,13 +178,29 @@ def test_listed_names_top_by_abs_contribution_then_extremes_ties_by_security_id(
     c = {"s3": 0.02, "s1": -0.02, "s2": 0.02, "s4": 0.001, "s5": 0.0005}
     r = {"s1": 0.1, "s2": 0.1, "s3": 0.1, "s4": 0.7, "s5": -0.6}
     # top 2 by |c|: ties s1, s2, s3 broken by id; extremes s4 and s5 added.
-    assert ic.listed_names(c, r, names_per_month=2, extreme_name_return=0.6) == [
+    assert ic.listed_names(
+        c, r, names_per_month=2, extreme_name_return=0.6, member_ids=list(r)
+    ) == [
         "s1",
         "s2",
         "s4",
         "s5",
     ]
-    assert ic.listed_names(c, r, names_per_month=1, extreme_name_return=2.0) == ["s1"]
+    assert ic.listed_names(
+        c, r, names_per_month=1, extreme_name_return=2.0, member_ids=list(r)
+    ) == ["s1"]
+
+
+def test_listed_names_include_extreme_members_without_a_cap_weight() -> None:
+    contribs = {"weighted_b": 0.2, "weighted_a": 0.1}
+    returns = {"weighted_a": 0.1, "weighted_b": 0.2, "z": -0.6, "a": 0.7}
+    assert ic.listed_names(
+        contribs,
+        returns,
+        names_per_month=1,
+        extreme_name_return=0.6,
+        member_ids=list(returns),
+    ) == ["weighted_b", "a", "z"]
 
 
 def test_protected_edge_is_the_earlier_of_the_two_sources() -> None:

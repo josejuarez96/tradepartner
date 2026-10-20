@@ -268,6 +268,36 @@ def test_a_member_without_a_cap_is_left_out_of_the_cap_book_and_counted(
     assert "DUALB" in names(report, JULY, ics.EQUAL)
 
 
+def test_extreme_no_cap_member_is_listed_from_start_of_month_members(
+    open_store: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = ics.universe_as_of
+    seen: list[datetime] = []
+
+    def no_cap_for_b(conn: duckdb.DuckDBPyConnection, t: datetime, s: Settings) -> Any:
+        seen.append(t)
+        universe = real(conn, t, s)
+        members = universe.members.with_columns(
+            pl.when(pl.col("security_id") == "SEC_DUAL_B")
+            .then(None)
+            .otherwise(pl.col("market_cap"))
+            .alias("market_cap")
+        )
+        return type(universe)(**{**universe.__dict__, "members": members})
+
+    monkeypatch.setattr(ics, "universe_as_of", no_cap_for_b)
+    cfg = open_store.model_copy(
+        update={
+            "index_check": open_store.index_check.model_copy(update={"extreme_name_return": 0.0})
+        }
+    )
+    report = run(cfg, JULY, JULY)
+    assert seen == [session_close(date(2019, 6, 28))]
+    dual_b = names(report, JULY, ics.CAP)["DUALB"]
+    assert dual_b.row.contribution == 0.0
+    assert "extreme" in dual_b.flags
+
+
 # ---- the arithmetic on the store ---------------------------------------------------------
 
 
