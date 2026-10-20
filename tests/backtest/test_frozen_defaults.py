@@ -783,7 +783,8 @@ def test_risk_free_keys_are_frozen_and_none_enters_the_fingerprint() -> None:
 
 def test_risk_free_keys_leave_every_canonical_set_and_fingerprint_where_they_were() -> None:
     """H1's and the TWIN's canonical set, fingerprint and hash do not move: the three keys
-    at their defaults are left out of the canonical set; a `store` trial shares the pair."""
+    are left out of the canonical set whatever their value (owner decision (a), #2011,
+    T170d), so a `store` trial, the live default since T170d, shares the pair."""
     settings = _defaults_settings()
     current = _new_params(settings)
     assert all(k in current for k in RISK_FREE_KEYS)
@@ -793,8 +794,15 @@ def test_risk_free_keys_leave_every_canonical_set_and_fingerprint_where_they_wer
     canonical = frozen.canonical_frozen_set(current, "momentum")
     assert canonical == frozen.canonical_frozen_set(without, "momentum")
     assert not set(RISK_FREE_KEYS) & set(canonical)
-    store = {**current, "metrics.risk_free_source": "store"}
-    assert frozen.fingerprint("momentum", store, date(2017, 1, 31)) == TWIN_FINGERPRINT
+    for other in (
+        {"metrics.risk_free_source": "constant"},
+        {"metrics.risk_free_source": "store"},
+        {"metrics.risk_free_series": "DGS3MO", "metrics.risk_free_basis": "yield"},
+    ):
+        varied = {**current, **other}
+        assert frozen.fingerprint("momentum", varied, date(2017, 1, 31)) == TWIN_FINGERPRINT
+        assert frozen.canonical_frozen_set(varied, "momentum") == canonical
+    assert frozenset(RISK_FREE_KEYS) == frozen.CANONICAL_EXCLUDED_KEYS
 
 
 # --- `universe.rank_by` (ADR 0023 D4, T212) ------------------------------------------

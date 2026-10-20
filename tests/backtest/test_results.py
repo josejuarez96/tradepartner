@@ -70,8 +70,11 @@ def _settings(tmp_path: Path, **overrides: Any) -> Settings:
         "costs": {"per_side_bps": BASE, "sensitivity_per_side_bps": [0.0, 30.0]},
         "holdout": {"start": HOLDOUT[0], "end": HOLDOUT[1]},
     }
+    # These cases were written under the `constant` source; T170d (#2011) flipped the
+    # live default to `store`, which the fakes here serve no rates for.
+    metrics = {"risk_free_source": "constant", **overrides.pop("metrics", {})}
     values.update(overrides)
-    return Settings(_env_file=None, **values)
+    return Settings(_env_file=None, metrics=metrics, **values)
 
 
 def _prices(seed: int) -> pl.DataFrame:
