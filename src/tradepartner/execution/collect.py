@@ -261,6 +261,14 @@ class Collected:
         return tuple(r for r in self.readings if r.lagging)
 
 
+def note_unjudged(collected: Collected, notes: list[str]) -> None:
+    """Record fills whose reference price was unavailable to the band."""
+    if collected.unjudged:
+        notes.append(
+            "fill-price band: no reference price for " + ", ".join(sorted(set(collected.unjudged)))
+        )
+
+
 @dataclass(frozen=True)
 class LagVerdict:
     """An order's lag bound: its anchor (None when no reconciliation listed it),
