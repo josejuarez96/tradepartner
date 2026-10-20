@@ -960,6 +960,7 @@ class TestRefusals:
                     "adjust.apply_spin_offs",
                     "strategy.hold_top_fraction",
                     "portfolio.",
+                    "costs.borrow",
                 )
             )
         }

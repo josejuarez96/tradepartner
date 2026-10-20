@@ -106,6 +106,12 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     ("portfolio.net_exposure", 1.0, 34),
     ("portfolio.short_min_price", 5.0, 34),
     ("portfolio.short_cover_weight", 0.10, 34),
+    # T221: the declared borrow fee and its sensitivity rates (backtest spec amendment
+    # #1872, item 6). Post-registration cost keys: not required of a file, frozen at these
+    # defaults when absent, never from live Settings, outside the promotion identity. At
+    # 0.0 and [] no stored canonical set or fingerprint moves.
+    ("costs.borrow_bps_per_year", 0.0, 34),
+    ("costs.borrow_sensitivity_bps", [], 34),
 )
 
 #: Keys added to a family's own listed section **after** that family's first
@@ -138,6 +144,8 @@ POST_REGISTRATION_COST_KEYS: Final[frozenset[str]] = frozenset(
         "costs.spread_bps",
         "costs.impact_coeff",
         "costs.adv_sessions",
+        "costs.borrow_bps_per_year",
+        "costs.borrow_sensitivity_bps",
     }
 )
 
@@ -169,6 +177,7 @@ HIGHER_ALLOWED_COST_KEYS: Final[frozenset[str]] = frozenset(
         "costs.per_side_bps",
         "costs.spread_bps",
         "costs.impact_coeff",
+        "costs.borrow_bps_per_year",
     }
 )
 
@@ -243,6 +252,8 @@ _FINGERPRINT_KEYS: Final = (
     "costs.spread_bps",
     "costs.impact_coeff",
     "costs.adv_sessions",
+    "costs.borrow_bps_per_year",
+    "costs.borrow_sensitivity_bps",
     "holdout.start",
     "holdout.end",
     "adjust.apply_spin_offs",

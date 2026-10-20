@@ -890,3 +890,31 @@ def test_the_spin_offs_key_moves_the_fingerprint_but_not_the_promotion_identity(
     assert promotion.promotion_identity(
         "momentum", spin, IN_SAMPLE_START
     ) == promotion.promotion_identity("momentum", base, IN_SAMPLE_START)
+
+
+# --- the long/short benchmark refusal (T221; backtest spec amendment #1872, item 8) -----
+
+
+def test_a_long_short_file_is_refused_benchmark_pending_and_writes_nothing(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Until the ADR 0005 amendment lands (`LONG_SHORT_BENCHMARK_LANDED`), by name, as the
+    first word after the path. The #1788 guard refuses a `long_short` file before
+    `promote` could see it, so `frozen_params` is stepped round."""
+    sweep, variants = _won(lab)
+    path = lab.promoted_file(sweep, variants[0])
+    real = hypothesis.frozen_params
+    monkeypatch.setattr(
+        hypothesis,
+        "frozen_params",
+        lambda parsed, settings: {**real(parsed, settings), "portfolio.side": "long_short"},
+    )
+    assert promotion.LONG_SHORT_BENCHMARK_LANDED is False
+    _refused(lab, path, rf"^{re.escape(str(path))}: refused_benchmark_pending")
+
+
+def test_a_long_only_file_promotes_as_before(lab: Lab) -> None:
+    """The constant is not consulted for a long-only file: the winner promotes."""
+    sweep, variants = _won(lab)
+    outcome = lab.promote(lab.promoted_file(sweep, variants[0]))
+    assert frozen.frozen_values(outcome.promoted)["portfolio.side"] == "long_only"
