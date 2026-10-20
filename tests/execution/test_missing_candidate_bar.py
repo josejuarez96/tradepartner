@@ -67,13 +67,13 @@ def test_a_complete_ingest_raises_nothing(env: Env, window: PaperWindowRow) -> N
 
 
 def test_a_t0_bar_known_after_the_cut_does_not_count(env: Env, window: PaperWindowRow) -> None:
-    """No look-ahead: TRNS's T_0 bar exists in the store but was ingested after the
-    run's read, so as of the cut it is missing and the name is still a candidate."""
+    """No look-ahead: TRNS's T_0 bar exists in the store and was ingested before the
+    run, but after the plan's read time (close of T_0): as of the cut it is missing."""
     with env.connect() as conn:
         conn.execute(
             "UPDATE prices_daily SET known_at = ?, ingested_at = ? "
             "WHERE security_id = ? AND session = ?",
-            [at(F_0, 23), at(F_0, 23), TRNS, T_0],
+            [at(T_0, 23), at(T_0, 23), TRNS, T_0],
         )
     env.run(at(F_0), prices={})
     assert signal_reasons(env)[TRNS] == "excluded_no_t0_bar"
@@ -103,3 +103,21 @@ def test_the_exclusion_leaves_n_universe_unchanged(env: Env, window: PaperWindow
         [env.latest_run()],
     )[0][0]
     assert n_universe == members
+
+
+def test_the_kill_switch_stays_clear_and_the_alert_precedes_the_first_order(
+    env: Env, window: PaperWindowRow
+) -> None:
+    drop_bar(env, TRNS, T_0)
+    env.run(at(F_0), prices={})
+    assert env.query("SELECT count(*) FROM kill_switch")[0][0] == 0
+    first_order = env.query("SELECT min(known_at) FROM orders")[0][0]
+    alert_at = env.query("SELECT \"at\" FROM alerts WHERE kind = 'missing_candidate_bar'")[0][0]
+    assert alert_at <= first_order
+
+
+def test_a_reused_plan_raises_no_second_alert(env: Env, window: PaperWindowRow) -> None:
+    drop_bar(env, TRNS, T_0)
+    env.run(at(F_0, 12, 0), prices={})
+    env.run(at(F_0, 13, 0), prices={})
+    assert len(env.alerts("missing_candidate_bar")) == 1
