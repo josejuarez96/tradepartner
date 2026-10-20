@@ -344,6 +344,7 @@ from __future__ import annotations
 
 import functools
 import itertools
+import math
 import re
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
@@ -358,6 +359,7 @@ from tradepartner.adapters.prices import (
     ActionType,
     Bar,
     CorporateAction,
+    Merger,
     PriceSource,
     SymbolChange,
     UnknownSecurityIdError,
@@ -2250,6 +2252,201 @@ class ActionsParse:
     spinoff_revisions: int = 0
     spinoff_unordered: tuple[str, ...] = ()
     spinoffs_unrequested: int = 0
+    #: #1762 (spec "Mergers"): the records read from `cash_mergers`,
+    #: `stock_mergers` and `stock_and_cash_mergers`; the rows refused, each
+    #: named "id kind SYMBOL: why" (a bad row never fails the payload); two
+    #: ids for one acquiree and one effective date, both returned and named
+    #: "SYMBOL effective_date"; acquirers that resolve to the acquiree,
+    #: counted and not stored; identities left out because two differing
+    #: rows share one stamp, named "SYMBOL id".
+    mergers: tuple[Merger, ...] = ()
+    merger_rows_refused: tuple[str, ...] = ()
+    merger_conflict: tuple[str, ...] = ()
+    merger_self: int = 0
+    merger_unordered: tuple[str, ...] = ()
+
+
+#: Alpaca's merger categories and the `Merger.kind` of each (spec "Mergers").
+_MERGER_CATEGORIES = {
+    "cash_mergers": "cash",
+    "stock_mergers": "stock",
+    "stock_and_cash_mergers": "stock_and_cash",
+}
+#: The rate fields each kind must carry, and the ones it must not.
+_MERGER_RATES = {
+    "cash": ({"rate"}, {"acquirer_rate", "acquiree_rate", "cash_rate"}),
+    "stock": ({"acquirer_rate", "acquiree_rate"}, {"rate", "cash_rate"}),
+    "stock_and_cash": ({"acquirer_rate", "acquiree_rate", "cash_rate"}, {"rate"}),
+}
+
+
+class _MergerRefused(Exception):
+    """One merger row cannot be stored; the message says why."""
+
+
+def _merger_text(row: Mapping[str, Any], field: str, *, required: bool) -> str:
+    value = row.get(field)
+    if value is None or value == "":
+        if required:
+            raise _MergerRefused(f"no {field}")
+        return ""
+    if not isinstance(value, str):
+        raise _MergerRefused(f"{field} is not text")
+    return value
+
+
+def _merger_date(row: Mapping[str, Any], field: str) -> date:
+    value = row.get(field)
+    try:
+        if not isinstance(value, str):
+            raise ValueError
+        return date.fromisoformat(value)
+    except ValueError:
+        raise _MergerRefused(f"{field} missing or unparsable") from None
+
+
+def _merger_rate(row: Mapping[str, Any], field: str) -> float:
+    value = row[field]
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise _MergerRefused(f"{field} is not a positive finite number")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise _MergerRefused(f"{field} is not a positive finite number")
+    return number
+
+
+def _parse_mergers(
+    payload: Mapping[str, Any],
+    holder: Resolve,
+    *,
+    process_start: date | None,
+    process_end: date | None,
+) -> dict[str, Any]:
+    """`Merger` records from the three merger categories (spec "Mergers",
+    parsing). The acquiree resolves on the last session before the effective
+    date, the acquirer on the first session on or after it, both through
+    `holder`. Rows are kept by `process_date` in `[process_start,
+    process_end]`, whatever the effective date, and stamped by
+    `announcement_date_known_at(process_date)`. A bad row is named in
+    `refused` and the others are kept; an unresolved acquiree (or the
+    acquirer of a stock kind) is reported, not returned."""
+    refused: list[str] = []
+    unresolved: list[tuple[str, date]] = []
+    merger_self = 0
+    # (acquiree, Alpaca id) -> known_at -> record: a repeat is one record,
+    # differing rows are revisions in stamp order; a stamp with two
+    # differing rows has no order, so the identity is left out (#1673 rule).
+    records: dict[tuple[str, str], dict[datetime, Merger]] = defaultdict(dict)
+    unordered: dict[tuple[str, str], str] = {}
+    for category, kind in _MERGER_CATEGORIES.items():
+        rows = payload.get(category, [])
+        if not isinstance(rows, list):
+            raise ValueError(f"category {category!r} is not a list")
+        for row in rows:
+            name = f"{category} row"
+            if isinstance(row, Mapping):
+                name = f"{row.get('id') or 'no id'} {kind} {row.get('acquiree_symbol') or '?'}"
+            try:
+                if not isinstance(row, Mapping):
+                    raise _MergerRefused("row is not an object")
+                process_date = _merger_date(row, "process_date")
+                if (process_start is not None and process_date < process_start) or (
+                    process_end is not None and process_date > process_end
+                ):
+                    continue
+                action_id = row.get("id")
+                if not isinstance(action_id, str) or not action_id:
+                    raise _MergerRefused("no id")
+                effective_date = _merger_date(row, "effective_date")
+                payable_date = None
+                if row.get("payable_date") not in (None, ""):
+                    payable_date = _merger_date(row, "payable_date")
+                wanted, forbidden = _MERGER_RATES[kind]
+                present = {f for f in wanted | forbidden if row.get(f) is not None}
+                if present != wanted:
+                    raise _MergerRefused("rates do not match the kind")
+                rates = {f: _merger_rate(row, f) for f in sorted(wanted)}
+                acquiree_symbol = _merger_text(row, "acquiree_symbol", required=True)
+                acquirer_symbol = _merger_text(row, "acquirer_symbol", required=False)
+                acquiree_cusip = _merger_text(row, "acquiree_cusip", required=False)
+                acquirer_cusip = _merger_text(row, "acquirer_cusip", required=False)
+                if kind != "cash" and not acquirer_symbol:
+                    raise _MergerRefused("a stock kind with an empty acquirer_symbol")
+                if kind == "stock_and_cash" and rates["acquiree_rate"] != 1:
+                    raise _MergerRefused("a stock_and_cash row with acquiree_rate != 1")
+                if acquirer_symbol and acquirer_symbol == acquiree_symbol:
+                    raise _MergerRefused(
+                        f"acquirer_symbol equals acquiree_symbol "
+                        f"(acquiree cusip {acquiree_cusip!r}, acquirer cusip {acquirer_cusip!r})"
+                    )
+                known_at = announcement_date_known_at(process_date)
+                acquiree = holder(acquiree_symbol, previous_session(effective_date))
+                acquirer_day = (
+                    effective_date if is_session(effective_date) else next_session(effective_date)
+                )
+                acquirer = holder(acquirer_symbol, acquirer_day) if acquirer_symbol else None
+            except _MergerRefused as why:
+                refused.append(f"{name}: {why}")
+                continue
+            except DateOutOfBounds:
+                refused.append(f"{name}: a date outside the calendar")
+                continue
+            if acquiree is None:
+                unresolved.append((acquiree_symbol, effective_date))
+            if acquirer is None and kind != "cash":
+                unresolved.append((acquirer_symbol, effective_date))
+            if acquiree is None or (acquirer is None and kind != "cash"):
+                continue
+            if acquirer == acquiree:
+                merger_self += 1
+                continue
+            if kind == "cash":
+                share_ratio, cash = None, rates["rate"]
+            elif kind == "stock":
+                share_ratio, cash = rates["acquirer_rate"] / rates["acquiree_rate"], None
+            else:
+                share_ratio, cash = rates["acquirer_rate"], rates["cash_rate"]
+            merger = Merger(
+                security_id=acquiree,
+                kind=kind,
+                acquirer_security_id=acquirer,
+                acquiree_symbol=acquiree_symbol,
+                acquiree_cusip=acquiree_cusip,
+                acquirer_symbol=acquirer_symbol,
+                acquirer_cusip=acquirer_cusip,
+                share_ratio=share_ratio,
+                cash_per_share=cash,
+                effective_date=effective_date,
+                process_date=process_date,
+                payable_date=payable_date,
+                known_at=known_at,
+                source=_ACTIONS_SOURCE,
+                source_action_id=action_id,
+            )
+            held = records[merger.key].setdefault(known_at, merger)
+            if not held.same_values(merger):
+                unordered[merger.key] = f"{acquiree_symbol} {action_id}"
+    mergers = [
+        records[identity][stamp]
+        for identity in sorted(records)
+        if identity not in unordered
+        for stamp in sorted(records[identity])
+    ]
+    deals: dict[tuple[str, date], set[str]] = defaultdict(set)
+    symbols: dict[tuple[str, date], str] = {}
+    for m in mergers:
+        deals[(m.security_id, m.effective_date)].add(m.source_action_id)
+        symbols[(m.security_id, m.effective_date)] = m.acquiree_symbol
+    conflict = sorted(f"{symbols[d]} {d[1]}" for d, ids in deals.items() if len(ids) > 1)
+    mergers.sort(key=lambda m: (m.security_id, m.effective_date, m.source_action_id, m.known_at))
+    return {
+        "mergers": tuple(mergers),
+        "refused": tuple(refused),
+        "unresolved": tuple(unresolved),
+        "self": merger_self,
+        "conflict": tuple(conflict),
+        "unordered": tuple(sorted(unordered.values())),
+    }
 
 
 @_fail_closed
@@ -2310,6 +2507,9 @@ def parse_corporate_actions(
     def holder(symbol: str, day: date) -> str | None:
         result = resolve(symbol, day)
         return result if result is not None else lead(symbol, day) if lead is not None else None
+
+    merged = _parse_mergers(payload, holder, process_start=process_start, process_end=process_end)
+    unresolved.extend(merged["unresolved"])
 
     # Split ex-dates by resolved security and by symbol, so a split paid as
     # a stock dividend (listed in both categories) is adjusted once (#1618).
@@ -2404,6 +2604,8 @@ def parse_corporate_actions(
             action_type = ActionType.DIVIDEND
         elif category in ("spin_offs", "name_changes"):
             action_type = None
+        elif category in _MERGER_CATEGORIES:
+            continue  # read by `_parse_mergers`
         else:
             if not isinstance(rows, list):
                 raise ValueError(f"category {category!r} is not a list")
@@ -2562,6 +2764,11 @@ def parse_corporate_actions(
         tuple(stock_refused),
         spinoff_revisions=spinoff_revisions,
         spinoff_unordered=tuple(sorted(unordered.values())),
+        mergers=merged["mergers"],
+        merger_rows_refused=merged["refused"],
+        merger_conflict=merged["conflict"],
+        merger_self=merged["self"],
+        merger_unordered=merged["unordered"],
     )
 
 
@@ -2618,6 +2825,8 @@ class FetchBars(Protocol):
 
 
 FetchActions = Callable[[list[str], date, date], Mapping[str, Any]]
+#: A symbol-less merger scan over a `process_date` range (#1762).
+FetchMergers = Callable[[date, date], Mapping[str, Any]]
 
 
 def _default_fetch_bars(
@@ -2660,6 +2869,25 @@ def _default_fetch_name_changes(
     return alpaca_raw._merge_batches(alpaca_raw._drop_actions_seen_in_earlier_batches(batches))
 
 
+def _default_fetch_mergers(start: date, end: date, *, settings: Settings) -> Mapping[str, Any]:
+    """One symbol-less, fully paged request for the three merger types over
+    the `process_date` range `[start, end]` (spec "Mergers", #1762)."""
+    from alpaca.data.enums import CorporateActionsType
+
+    from tradepartner.adapters import alpaca_raw
+
+    return alpaca_raw.corporate_actions_scan(
+        [
+            CorporateActionsType.CASH_MERGER,
+            CorporateActionsType.STOCK_MERGER,
+            CorporateActionsType.STOCK_AND_CASH_MERGER,
+        ],
+        start,
+        end,
+        settings=settings,
+    )
+
+
 def _transport_errors() -> tuple[type[BaseException], ...]:
     """The errors a request to Alpaca raises on the wire (#1676): a network
     failure (`requests.RequestException`, an `OSError`) or an API refusal."""
@@ -2691,6 +2919,7 @@ class AlpacaPriceSource(PriceSource):
         fetch_bars: FetchBars = _default_fetch_bars,
         fetch_actions: FetchActions = _default_fetch_actions,
         fetch_name_changes: FetchActions | None = None,
+        fetch_mergers: FetchMergers | None = None,
         settings: Settings | None = None,
         fill_handovers: bool = False,
     ) -> None:
@@ -2706,6 +2935,9 @@ class AlpacaPriceSource(PriceSource):
             fetch_actions
             if fetch_actions is not _default_fetch_actions
             else functools.partial(_default_fetch_name_changes, settings=settings)
+        )
+        self._fetch_mergers = fetch_mergers or functools.partial(
+            _default_fetch_mergers, settings=settings
         )
         self._lag = timedelta(days=settings.alpaca.actions_process_lag_days)
         self._alpaca = settings.alpaca
@@ -3006,7 +3238,7 @@ class AlpacaPriceSource(PriceSource):
         payload = {
             category: rows
             for category, rows in fetched.items()
-            if category not in ("name_changes", "spin_offs")
+            if category not in ("name_changes", "spin_offs", *_MERGER_CATEGORIES)
         }
         lead = functools.partial(self._resolver.lead, actions=True)  # #974: no rename lead
         parsed = parse_corporate_actions(
@@ -3110,3 +3342,36 @@ class AlpacaPriceSource(PriceSource):
             return []
         self.last_actions_report = parsed
         return [change for change in parsed.symbol_changes if change.security_id in ids]
+
+    def mergers(self, start: date, end: date) -> list[Merger]:
+        """Mergers with `start <= process_date <= end` (spec "Mergers",
+        #1762): one symbol-less request, because an acquiree is usually
+        delisted before Alpaca processes its record and a per-symbol request
+        would almost never ask for it. Only rows whose acquiree (and, for a
+        stock kind, acquirer) resolve are returned; the rest are on
+        `last_actions_report`. A malformed response or a transport error is
+        counted there and returns nothing, as for name changes (#1506,
+        #1676); the next run's range still covers the days."""
+        self.last_actions_report = None
+        check_request([], start, end)
+        try:
+            payload = self._fetch_mergers(start, end)
+            parsed = parse_corporate_actions(
+                {c: payload.get(c, []) for c in _MERGER_CATEGORIES},
+                self._resolver.resolve_action,  # #1696: no action on a renamer's old ticker
+                functools.partial(self._resolver.lead, actions=True),
+                process_start=start,
+                process_end=end,
+            )
+        except (ValueError, TypeError, AttributeError):
+            self.last_actions_report = ActionsParse(
+                (), (), (), malformed_categories=tuple(_MERGER_CATEGORIES)
+            )
+            return []
+        except _transport_errors():
+            self.last_actions_report = ActionsParse(
+                (), (), (), unanswered_categories=tuple(_MERGER_CATEGORIES)
+            )
+            return []
+        self.last_actions_report = parsed
+        return list(parsed.mergers)

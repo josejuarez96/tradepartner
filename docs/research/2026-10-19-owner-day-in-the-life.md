@@ -269,6 +269,8 @@ Filing: the orchestrator files the "no task yet" items it and the owner choose t
 - **Not Alpaca:** "why this trade", "versus the backtest", "versus SPY", alerts, halts and anything about research. Only our system knows these.
 
 ## (c) Part 2 checklist: re-walk after the first real fills (Tue 10-20 onward)
+[Part 2 re-walk, 2026-10-20](2026-10-20-owner-day-in-the-life-part2.md) records what was visible after the first orders filled.
+
 - [ ] Before reading Alpaca's chart, note each window's start (daily: window 5, opened 10-18; main: window 6, opened 10-18) and read from there.
 - [ ] Morning of 10-20: does `paper status --all` show the daily book's positions and `last run ok`? Is the `stale` badge on Operations gone or explained?
 - [ ] Does the Fills card list the 10-20 fills with symbols and prices? Do they match Alpaca's Activities tab line for line?
