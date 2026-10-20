@@ -71,6 +71,16 @@ path's read, `paper resume`'s settlement). In order:
    since the committed cursor means no later collection judges those
    rejections again; without a verdict the back-fill's error propagates as is.
 
+5. **The fill-price band** (#1981; with `price_band` given, a run's collectors), after
+   the collection has committed: every fill this call journaled must sit within
+   `paper.max_fill_price_deviation` of its order's reference price (the split-adjusted
+   close of S-1, moved back to the order's session for a late fill). A fill outside it,
+   raises `SystemFaultError` naming
+   `fill_price_outside_band` (a rejection verdict of the call is named in the message),
+   so the caller halts. The journal and the broker agree on a bad fill, so no
+   reconciliation can see it. `paper resume` and the halt path's read pass no band:
+   the owner looks at a resume, and the halt has already happened.
+
 Every clock reading is checked (ADR 0007 point 4): an exception, a
 non-`datetime` or a naive value becomes `ClockError`, and so does a write
 stamp earlier than the reading taken for the skew check.
@@ -128,6 +138,7 @@ from tradepartner.store.journal import (
     DecisionEventRow,
     FillCursorRow,
     FillRow,
+    OrderedFill,
     OrderEventRow,
     OrderRow,
     ReconciliationRow,
@@ -158,6 +169,8 @@ _SKIP_REFUSAL_REASONS = frozenset(
 _BUY = "buy"
 _WRITTEN_OFF = "written_off"
 _UNFUNDED = "unfunded"
+_SPLIT = "split"
+_FILL_BAND_FAULT = "fill_price_outside_band"
 _BROKER_FEED = "broker_feed"
 _BROKER_STATUS = "broker_status"
 #: The `mismatches_json` key under which a reconciliation lists its lagging
@@ -216,6 +229,18 @@ class WriteOffContext:
 
 
 @dataclass(frozen=True)
+class PriceBand:
+    """The fill-price sanity band (#1981): the reference price on `session` (a pure
+    lookup over data already loaded, as `WriteOffContext.price_of`), the splits known
+    at close(S-1), and the configured `paper.max_fill_price_deviation`."""
+
+    price_of: Callable[[str], float]
+    actions_as_of: pl.DataFrame
+    session: date
+    deviation: float
+
+
+@dataclass(frozen=True)
 class Collected:
     """What one collection saw and wrote."""
 
@@ -227,6 +252,8 @@ class Collected:
     readings: tuple[OrderReading, ...]
     rejections: tuple[RejectionBreach, ...]
     written_off: tuple[int, ...]
+    #: `client_order_id`s of fills the price band could not judge (no reference price).
+    unjudged: tuple[str, ...] = ()
 
     @property
     def lagging(self) -> tuple[OrderReading, ...]:
@@ -255,6 +282,7 @@ def collect(
     settings: Settings,
     *,
     write_offs: WriteOffContext | None = None,
+    price_band: PriceBand | None = None,
 ) -> Collected:
     """Collect fills and the terminal events of `orders` (module docstring).
 
@@ -339,6 +367,10 @@ def collect(
             # rejections again: the verdict leaves with the failure (#396).
             raise RejectionCapError("; ".join(b.message for b in rejections)) from exc
 
+    unjudged: tuple[str, ...] = ()
+    if price_band is not None:
+        unjudged = _judge_fill_band(connect, orders, journaled, price_band, rejections)
+
     return Collected(
         since=since,
         collected_through=through,
@@ -348,7 +380,36 @@ def collect(
         readings=tuple(collected),
         rejections=rejections,
         written_off=written_off,
+        unjudged=unjudged,
     )
+
+
+def _judge_fill_band(
+    connect: Connect,
+    orders: Sequence[OrderRow],
+    journaled: Sequence[str],
+    band: PriceBand,
+    rejections: Sequence[RejectionBreach],
+) -> tuple[str, ...]:
+    """Return the ids of the fills the band could not price (a note for the caller);
+    raise `SystemFaultError` naming `fill_price_outside_band` for a fill this
+    collection journaled outside the band (#1981). It runs after the collection has
+    committed, so the fill is journaled as the broker holds it; a rejection verdict
+    of the same collection is named in the message, never dropped."""
+    if not journaled:
+        return ()
+    new = set(journaled)
+    with connect() as conn:
+        fills = [
+            f
+            for f in fills_for(conn, client_order_ids=[o.client_order_id for o in orders])
+            if f.fill.broker_fill_id in new
+        ]
+    found = fill_band_violations(fills, band)
+    if found:
+        verdicts = [b.message for b in rejections]
+        raise SystemFaultError("; ".join([_FILL_BAND_FAULT + ": " + "; ".join(found), *verdicts]))
+    return tuple(f.fill.client_order_id for f in fills if _unpriced(f, band))
 
 
 def _refuse_shapes(readings: Iterable[Order]) -> None:
@@ -553,6 +614,72 @@ def _back_fill_write_offs(
         )
         written.append(decision.decision_id)
     return tuple(written)
+
+
+def fill_band_violations(fills: Iterable[OrderedFill], band: PriceBand) -> tuple[str, ...]:
+    """One message per fill whose price is outside `reference x (1 +- deviation)`
+    (#1981).
+
+    Pure over `band.price_of`. The reference of a fill is its security's reference
+    price on `band.session`, moved back to the order's own session when the order is
+    older (a fill collected a session late): `price_of` divides by the splits with
+    ex-date up to `band.session`, so the order's reference is that times the split
+    ratios with ex-date in (order session, `band.session`]. The bounds are
+    inclusive. A non-finite fill price is a violation. A fill of a name with no
+    usable reference (`price_of` raises, as for an exit of an unpriced name, #569, or
+    a held name outside the pending rebalance) is not judged: there is nothing to
+    compare it with, and halting every such exit would stop the book. Each message names the
+    order, the security, the fill price, the reference and the deviation."""
+    out = []
+    for item in fills:
+        fill = item.fill
+        who = f"{fill.client_order_id} ({item.security_id})"
+        ref = _reference(item, band)
+        if ref is None:
+            continue  # a name with no reference (an exit of an unpriced name) is not judged
+        price = fill.price
+        if not (
+            math.isfinite(price)
+            and ref * (1 - band.deviation) <= price <= ref * (1 + band.deviation)
+        ):
+            out.append(
+                f"{who}: fill price {price} is outside {band.deviation:.0%} of the "
+                f"reference price {ref}"
+            )
+    return tuple(out)
+
+
+def _reference(item: OrderedFill, band: PriceBand) -> float | None:
+    """The fill's reference price, or None when the band has none for its name."""
+    try:
+        ref = band.price_of(item.security_id) * _split_factor(
+            band.actions_as_of, item.security_id, item.order_session, band.session
+        )
+    except (KeyError, ValueError):
+        return None
+    return ref if math.isfinite(ref) and ref > 0 else None
+
+
+def _unpriced(item: OrderedFill, band: PriceBand) -> bool:
+    return _reference(item, band) is None
+
+
+def _split_factor(
+    actions_as_of: pl.DataFrame, security_id: str, after: date | None, upto: date
+) -> float:
+    """The product of the split ratios of `security_id` with ex-date in
+    (`after`, `upto`]; 1.0 when `after` is None or not before `upto`."""
+    if after is None or after >= upto:
+        return 1.0
+    factor = 1.0
+    for row in actions_as_of.iter_rows(named=True):
+        if (
+            row["security_id"] == security_id
+            and row["action_type"] == _SPLIT
+            and after < row["ex_date"] <= upto
+        ):
+            factor *= float(row["ratio_or_amount"])
+    return factor
 
 
 def rejection_breaches(
