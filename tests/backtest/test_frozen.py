@@ -15,7 +15,8 @@ from tradepartner.config import Settings
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "hypotheses" / "fixture-momentum.md"
 START = date(2019, 11, 29)
 KEY = "data.release_id"
-REPLACED = ("master.", "gap.", "adjust.")
+REPLACED = ("master.",)
+KEPT = ("gap.", "adjust.")
 
 
 def _params(settings: Settings, release: str | None = None) -> dict[str, Any]:
@@ -49,7 +50,7 @@ def test_registration_before_the_key_is_read_with_its_three_sections_as_stored(
 
     stored = {k: v for k, v in _params(settings).items() if k != KEY}
     sections = {k for k in stored if k.startswith(REPLACED)}
-    assert sections  # master.*, gap.* and adjust.* are all there
+    assert sections  # master.* is there
     values = frozen.frozen_values(_Record(stored))
     assert sections <= set(values)
     assert values[KEY] == ""
@@ -69,6 +70,9 @@ def test_registration_after_the_key_records_the_id_and_no_replaced_key(settings:
     params = _params(settings, "release-2026-10")
     assert params[KEY] == "release-2026-10"
     assert not [k for k in params if k.startswith(REPLACED)]
+    assert [k for k in params if k.startswith("gap.")]  # read-time keys stay frozen
+    assert "gap.count_share_threshold" in params
+    assert "adjust.max_prior_close_gap_sessions" in params
     assert KEY in frozen.canonical_frozen_set(params, "momentum")
     values = frozen.frozen_values(_Record(params))
     assert not [k for k in values if k.startswith(REPLACED)]  # no default overlaid back

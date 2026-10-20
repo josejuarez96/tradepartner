@@ -206,7 +206,7 @@ def family_frozen_keys(family: str) -> tuple[str, ...]:
 
 
 def _release_dropped(params: Mapping[str, Any]) -> dict[str, Any]:
-    """`params` less the `master`, `gap` and `adjust` keys when they freeze a data
+    """`params` less the `master` keys when they freeze a data
     release (`frozen.has_release`, T214): the id replaces those sections."""
     if not frozen.has_release(params):
         return dict(params)
@@ -330,7 +330,7 @@ def parse_file(path: Path) -> HypothesisFile:
         )
         if replaced:
             raise HypothesisFileError(
-                f"{path}: {frozen.RELEASE_ID_KEY} replaces the master, gap and adjust "
+                f"{path}: {frozen.RELEASE_ID_KEY} replaces the master section; "
                 f"sections; remove {', '.join(replaced)}"
             )
     required = required_keys(family) | {"slug", "family", "title", "in_sample_start"}

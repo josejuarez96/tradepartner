@@ -95,8 +95,8 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # Settings, and outside the promotion identity.
     ("adjust.apply_spin_offs", False, 31),
     # T214: the named data release (backtest spec, "The data-release id"; ADR 0023 D8).
-    # `""` is none: the `master`, `gap` and `adjust` sections stay as stored. A
-    # non-empty id replaces those three sections (`RELEASE_REPLACED_SECTIONS`).
+    # `""` is none: the `master` section stays as stored. A non-empty id replaces the
+    # ingest-time `master.*` keys only (owner, #1958; `RELEASE_REPLACED_SECTIONS`).
     ("data.release_id", "", 34),
 )
 
@@ -144,7 +144,7 @@ POST_REGISTRATION_DATA_KEYS: Final[frozenset[str]] = frozenset({"data.release_id
 #: The frozen key naming the data release (T214) and the sections a non-empty id
 #: replaces in the frozen set (backtest spec, "The data-release id").
 RELEASE_ID_KEY: Final = "data.release_id"
-RELEASE_REPLACED_SECTIONS: Final[frozenset[str]] = frozenset({"master", "gap", "adjust"})
+RELEASE_REPLACED_SECTIONS: Final[frozenset[str]] = frozenset({"master"})
 
 #: `costs.*` keys a ruled family's file may set higher than its rules' value (a cost
 #: assumption may only get harsher), as `costs.per_side_bps` may; `adv_sessions` is not
@@ -254,7 +254,7 @@ def frozen_values(record: _HasParams) -> dict[str, Any]:
 
 def has_release(params: Mapping[str, Any]) -> bool:
     """`params` freeze a data release: `data.release_id` is present and not its table
-    default (`""`). Such a set carries no `master.*`, `gap.*` or `adjust.*` key."""
+    default (`""`). Such a set carries no `master.*` key."""
     return RELEASE_ID_KEY in params and not is_default(params[RELEASE_ID_KEY], "")
 
 

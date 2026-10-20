@@ -1934,10 +1934,10 @@ def test_load_frozen_accepts_false(
     assert loaded.adjust.apply_spin_offs is False
 
 
-# --- T214: `data.release_id` replaces the master, gap and adjust sections ---------------
+# --- T214: `data.release_id` replaces the master keys ---------------
 
 RELEASE_KEY = "data.release_id"
-_REPLACED_PREFIXES = ("master.", "gap.", "adjust.")
+_REPLACED_PREFIXES = ("master.",)
 _RELEASE_AT = datetime(2026, 10, 25, tzinfo=UTC)
 
 
@@ -1948,7 +1948,7 @@ def _release_file(tmp_path: Path, release: str, *, keep_sections: bool = False) 
         skipping = False
         for line in text.splitlines():
             if line.startswith("["):
-                skipping = line.strip("[] ") in {"master", "gap", "adjust"}
+                skipping = line.strip("[] ") in {"master"}
             elif line.startswith("```"):
                 skipping = False
             if not skipping:
@@ -1982,6 +1982,8 @@ def test_a_release_registration_stores_the_id_and_none_of_the_three_sections(
     record = _register(conn, _release_file(tmp_path, "rel-1"), settings)
     assert record.params[RELEASE_KEY] == "rel-1"
     assert not [k for k in record.params if k.startswith(_REPLACED_PREFIXES)]
+    assert "gap.count_share_threshold" in record.params  # holdout.py reads it
+    assert "adjust.max_dividend_to_prior_close" in record.params
     expected = set(hypothesis.family_frozen_keys("momentum")) - {
         k for k in hypothesis.frozen_keys() if k.startswith(_REPLACED_PREFIXES)
     }
@@ -2006,7 +2008,11 @@ def test_a_file_naming_the_id_and_a_replaced_key_is_refused(
     tmp_path: Path, settings: Settings
 ) -> None:
     path = _release_file(tmp_path, "rel-1", keep_sections=True)
-    with pytest.raises(HypothesisFileError, match="replaces the master, gap and adjust"):
+    text = path.read_text().replace(
+        "\n[data]\n", "\n[master]\nkeep_successors = true\n\n[data]\n", 1
+    )
+    path.write_text(text)
+    with pytest.raises(HypothesisFileError, match="replaces the master section"):
         hypothesis.parse_file(path)
 
 

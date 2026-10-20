@@ -1633,7 +1633,7 @@ class DataConfig(BaseModel):
 
     `release_id` is the name of a `data_release` decision (schema version 18), or `""`
     for none. A hypothesis registered with a non-empty id freezes it in place of the
-    `master`, `gap` and `adjust` sections; `""` leaves those sections as stored. Like
+    ingest-time `master.*` keys (owner, #1958); `""` leaves them as stored. Like
     `holdout.*` it is set by a hypothesis file, never by the environment, and is
     not listed in `.env.example`.
     """
