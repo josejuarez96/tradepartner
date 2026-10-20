@@ -310,3 +310,86 @@ def test_a_short_unclosed_header_is_unread_not_overlong(settings: Settings) -> N
     assert accession not in stamps
     assert source.stamps_sgml_unread == 1
     assert source.stamps_sgml_overlong == 0
+
+
+# --- #1686: the API-stamp fallback after N unread runs ------------------------------
+
+
+def _all_404() -> dict[str, int]:
+    return {a: 404 for a, _, _ in FILINGS}
+
+
+def _fallback_settings(tmp_path: Path, runs: int = 3) -> Settings:
+    return edgar_settings(tmp_path / "cache", stamp_sgml_check=True, stamp_sgml_fallback_runs=runs)
+
+
+def _run_once(settings: Settings, router: EdgarRouter) -> EdgarFilingSource:
+    source = EdgarFilingSource(settings, client=router.client(), clock=lambda: CLOCK)
+    source._stamp(_kept())
+    return source
+
+
+def test_the_fallback_run_count_is_config_and_defaults_above_one() -> None:
+    assert Settings(_env_file=None).edgar.stamp_sgml_fallback_runs >= 2
+
+
+def test_stamps_are_left_out_until_the_nth_consecutive_unread_run(tmp_path: Path) -> None:
+    settings = _fallback_settings(tmp_path, runs=3)
+    router = _router(SHIFTED, _all_404())
+    for _ in range(2):
+        source = _run_once(settings, router)  # a fresh source each run: the count persists
+        assert source.stamps_api_fallback == 0
+        assert not (Path(settings.edgar.cache_dir) / "stamps").exists() or not list(
+            (Path(settings.edgar.cache_dir) / "stamps").glob(f"*/{CIK}.json")
+        )
+    source = _run_once(settings, router)
+    assert source.stamps_api_fallback == len(FILINGS)
+    assert source.stamp_fallback_ciks == 1
+    assert {a: row[3] for a, row in _cached(settings).items()} == {
+        a: (at + _offset(at)).isoformat() for a, _, at in FILINGS
+    }
+    assert "stamps from API fallback: 3" in _source_counts(source)
+    assert "CIKs on API fallback: 1" in _source_counts(source)
+
+
+def test_no_lookahead_a_fallback_stamp_is_never_earlier_than_the_true_acceptance(
+    tmp_path: Path,
+) -> None:
+    """The API serves stamps late by New York's offset (4 h EDT, 5 h EST) or
+    exact, never early, so the fallback can only delay a row."""
+    settings = _fallback_settings(tmp_path, runs=1)
+    _run_once(settings, _router(SHIFTED, _all_404()))
+    cached = _cached(settings)
+    for accession, _, true_at in FILINGS:
+        stamped = datetime.fromisoformat(str(cached[accession][3]))
+        assert stamped >= true_at
+        assert stamped - true_at == _offset(true_at)
+
+
+def test_a_readable_anchor_resets_the_unread_count(tmp_path: Path) -> None:
+    settings = _fallback_settings(tmp_path, runs=2)
+    _run_once(settings, _router(SHIFTED, _all_404()))  # 1 unread run
+    _run_once(settings, _router(SHIFTED))  # readable: proven stamps cached, count reset
+    for path in (Path(settings.edgar.cache_dir) / "stamps").glob(f"*/{CIK}.json"):
+        path.unlink()  # the same accessions are unstamped again
+    source = _run_once(settings, _router(SHIFTED, _all_404()))  # 1 unread run again
+    assert source.stamps_api_fallback == 0
+    assert not list((Path(settings.edgar.cache_dir) / "stamps").glob(f"*/{CIK}.json"))
+
+
+def test_no_acceptance_headers_are_not_an_unread_run(tmp_path: Path) -> None:
+    """Pre-2001 headers are kept unchecked as before; they never touch the count."""
+    settings = _fallback_settings(tmp_path, runs=1)
+    no_stamp = {a: _header(a, form, None) for a, form, _ in FILINGS}
+    source = _run_once(settings, _router({}, dict(no_stamp)))
+    assert source.stamp_check_unread_ciks == 1
+    assert source.stamps_api_fallback == 0
+
+
+def test_one_run_counts_a_cik_once_even_if_stamped_twice(tmp_path: Path) -> None:
+    settings = _fallback_settings(tmp_path, runs=2)
+    router = _router(SHIFTED, _all_404())
+    source = EdgarFilingSource(settings, client=router.client(), clock=lambda: CLOCK)
+    source._stamp(_kept())
+    source._stamp(_kept())
+    assert source.stamps_api_fallback == 0  # one run, so still below N=2

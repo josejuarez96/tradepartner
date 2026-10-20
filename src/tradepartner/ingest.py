@@ -1588,6 +1588,8 @@ def _source_counts(filings: FilingSource) -> str:
         ("stamp_check_mismatched_ciks", "CIKs stamped from SGML"),  # #1494
         ("stamps_from_sgml", "stamps from SGML"),
         ("stamps_sgml_unread", "stamps unread in SGML"),
+        ("stamps_api_fallback", "stamps from API fallback"),  # #1686
+        ("stamp_fallback_ciks", "CIKs on API fallback"),
         ("stamps_sgml_overlong", "stamps with overlong SGML headers"),
         ("stamp_check_unread_ciks", "CIKs stamped unchecked"),
         ("facts_bulk_keyless", "keyless bulk facts"),  # #599: facts but no `cik`

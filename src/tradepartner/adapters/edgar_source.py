@@ -672,6 +672,11 @@ class EdgarFilingSource(FilingSource):
         self.stamps_from_sgml = 0
         self.stamps_sgml_unread = 0
         self.stamps_sgml_overlong = 0
+        # #1686: after `edgar.stamp_sgml_fallback_runs` consecutive runs with no
+        # readable anchor, a CIK's stamps are cached as the API served them.
+        self.stamps_api_fallback = 0
+        self.stamp_fallback_ciks = 0
+        self._unread_counted: set[str] = set()
         # #599: a payload with `facts` but no `cik` (SEC ships this shape for
         # a few CIKs, identically from the zip and the API): identified by
         # the CIK it was requested under, not treated as absent.
@@ -887,11 +892,16 @@ class EdgarFilingSource(FilingSource):
             if all(miss is _HeaderMiss.NO_ACCEPTANCE for miss in headers.values()):
                 self.stamp_check_unread_ciks += 1
                 return checked
+            if self._unread_run_reached(cik):
+                self.stamps_api_fallback += len(stamped)  # #1686: the API stamp, late
+                self.stamp_fallback_ciks += 1
+                return checked
             for record in stamped:
                 del checked[record.accession]
                 reason = headers.get(record.accession)
                 self._count_sgml_miss(reason if isinstance(reason, _HeaderMiss) else None)
             return checked
+        self._clear_unread_runs(cik)  # an anchor read: the run count restarts
         if agrees:
             return checked
         self.stamp_check_mismatched_ciks += 1
@@ -907,6 +917,32 @@ class EdgarFilingSource(FilingSource):
                 del checked[record.accession]
                 self._count_sgml_miss(truth)
         return checked
+
+    def _unread_path(self) -> Path:
+        return self._cache / "sgml_unread" / "v1.json"
+
+    def _unread_runs(self) -> dict[str, int]:
+        try:
+            data = json.loads(self._unread_path().read_bytes())
+            return {str(cik): int(n) for cik, n in data.items()}
+        except (OSError, ValueError, AttributeError, TypeError):
+            return {}  # absent or unreadable: the count starts again
+
+    def _unread_run_reached(self, cik: str) -> bool:
+        """#1686: count this run (once per CIK per source) as one with no
+        readable anchor and say whether the count reached
+        `edgar.stamp_sgml_fallback_runs`."""
+        runs = self._unread_runs()
+        if cik not in self._unread_counted:
+            self._unread_counted.add(cik)
+            runs[cik] = runs.get(cik, 0) + 1
+            edgar_raw.write_atomic(self._unread_path(), json.dumps(runs).encode("utf-8"))
+        return runs.get(cik, 0) >= self._settings.edgar.stamp_sgml_fallback_runs
+
+    def _clear_unread_runs(self, cik: str) -> None:
+        runs = self._unread_runs()
+        if runs.pop(cik, None) is not None:
+            edgar_raw.write_atomic(self._unread_path(), json.dumps(runs).encode("utf-8"))
 
     def _count_sgml_miss(self, reason: _HeaderMiss | None) -> None:
         """Count a skipped stamp by whether its own header exceeded the cap."""
