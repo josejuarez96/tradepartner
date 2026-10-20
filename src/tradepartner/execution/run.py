@@ -1633,14 +1633,32 @@ class _Run:
             }
             return planning.reference_prices(conn, self.session, names, actions)
 
-    def _price_band(self) -> PriceBand | None:
-        """The fill-price band of this run's collections (#1981), None until the
-        step-1 write-off context exists."""
+    def _price_band(self, orders: Sequence[OrderRow]) -> PriceBand | None:
+        """The fill-price band of one of this run's collections (#1981), None until
+        the step-1 write-off context exists. Its reference prices cover the names
+        decided in a pending rebalance (the context's) and the names of `orders`
+        themselves, so a forced exit's or a stop run's sell is judged as well; a
+        name with no bar at all has no price and is not judged."""
         context = self.write_offs
         if context is None:
             return None
+        prices: dict[str, float] = {}
+        names = sorted({o.security_id for o in orders})
+        with open_read_only(self.settings, retry=True) as conn:
+            try:
+                prices = planning.reference_prices(
+                    conn, context.session, names, context.actions_as_of
+                )
+            except ValueError:  # one name has no bar: price the others one by one
+                for name in names:
+                    with suppress(ValueError):
+                        prices.update(
+                            planning.reference_prices(
+                                conn, context.session, [name], context.actions_as_of
+                            )
+                        )
         return PriceBand(
-            context.price_of,
+            prices.__getitem__,
             context.actions_as_of,
             context.session,
             self.settings.paper.max_fill_price_deviation,
@@ -1666,7 +1684,7 @@ class _Run:
                 self.frozen,
                 self.settings,
                 write_offs=self.write_offs,
-                price_band=self._price_band(),
+                price_band=self._price_band(orders),
             )
         )
         if collected.rejections:
@@ -1841,7 +1859,7 @@ class _Run:
             self.frozen,
             self.settings,
             write_offs=self.write_offs,
-            price_band=self._price_band(),
+            price_band=self._price_band(orders),
         )
 
     def _unspent_cash(

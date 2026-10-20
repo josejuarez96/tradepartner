@@ -12,7 +12,7 @@ from datetime import UTC, date, datetime
 import polars as pl
 import pytest
 
-from execution.test_run_stop import buy_id, sell_id
+from execution.test_run_stop import MAY_3, buy_id, request_stop, sell_id
 from execution.test_run_trade import F_0, T_0, Env, at, bought
 from execution.test_run_trade import _no_env_file as _no_env_file  # autouse
 from execution.test_run_trade import env as env
@@ -134,6 +134,30 @@ def test_a_bad_sell_fill_halts_before_any_buy_is_sized_on_its_cash(
     run_id = env.latest_run()
     assert env.result(run_id)[0] == "halted"
     assert [o for o in env.orders() if o[5] == run_id and o[2] == "buy"] == []
+
+
+@pytest.mark.parametrize("factor", [100.0, 0.01])
+def test_a_stop_runs_forced_exit_filled_at_a_bad_price_halts(
+    env: Env, window: PaperWindowRow, factor: float
+) -> None:
+    """A `window_stop` exit is no pending-rebalance name, yet its fill is judged: the
+    run's collection prices the names of the orders it collects."""
+    bought(env)
+    request_stop(env, at(F_0, 22, 0))
+    victim = sell_id(env, MAY_3, "SEC_TRANSFER")
+    env.fill_on_sleep = False
+
+    def hook(_now: object) -> None:
+        for o in env.fake.open_orders():
+            if o.client_order_id == victim:
+                env.fake.apply(victim, FillAt(env.prices["TRNS"] * factor))
+            else:
+                env.fake.simulate_fill(o.client_order_id)
+
+    env.on_sleep.append(hook)
+    with pytest.raises(SystemFaultError, match="fill_price_outside_band"):
+        env.run(at(MAY_3))
+    assert env.result(env.latest_run())[0] == "halted"
 
 
 def _ordered(
