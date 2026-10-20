@@ -75,7 +75,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from fractions import Fraction
 from functools import partial
@@ -221,6 +221,8 @@ class _OpenLot:
     reported_basis: Fraction
     quantity: Fraction
     basis: Fraction
+    #: Every security the lot has been (a merger re-keys it), for the wash-sale scan.
+    identities: set[str] = field(default_factory=set)
 
     def to_lot(self, account: LedgerAccount) -> Lot:
         return Lot(
@@ -293,6 +295,7 @@ class _Ledger:
             reported_basis=basis,
             quantity=quantity,
             basis=basis,
+            identities={security_id},
         )
         self.lots.append(lot)
         book = self.shorts if position_side == SHORT else self.longs
@@ -462,6 +465,7 @@ class _Ledger:
         asset = self.assets.get(symbol)
         for lot in held:
             lot.security_id, lot.symbol = acquirer, symbol
+            lot.identities.add(acquirer)
             lot.cusip = None if asset is None else asset.cusip
             lot.quantity *= ratio
             lot.acquired *= ratio
@@ -648,6 +652,7 @@ def rebuild(
             state.same_sale,
             state.disposal_security,
             state.no_replacement,
+            {lot.lot_id: lot.identities for lot in state.lots},
         ),
     )
 
@@ -697,8 +702,8 @@ def _events(
             )
         )
     window = [r for r in adjustments if through is None or r.session <= through]
-    removals = {_merger_id(r) for r in window if r.kind == _CORPORATE_ACTION_CASH} - {None}
-    receipts = {_merger_id(r): r for r in window if r.kind == _MERGER_RECEIPT}
+    removals = _by_merger(window, _CORPORATE_ACTION_CASH, unique=False)
+    receipts = _by_merger(window, _MERGER_RECEIPT, unique=True)
     for row in window:
         action = _adjustment_event(row, removals, receipts)
         if action is not None:
@@ -707,9 +712,29 @@ def _events(
     return events
 
 
+def _by_merger(
+    window: Sequence[AdjustmentRow], kind: str, *, unique: bool
+) -> dict[str | None, AdjustmentRow]:
+    """The `kind` rows keyed by their merger id. When `unique`, two rows of one
+    id raise (a merger has one receipt, and a second would be lost); later
+    cash-only removal rows naming an id are allowed (item 2)."""
+    found: dict[str | None, AdjustmentRow] = {}
+    for row in window:
+        merger = _merger_id(row)
+        if row.kind != kind or merger is None:
+            continue
+        if unique and merger in found:
+            raise LotLedgerError(
+                f"merger {merger!r} has two {kind} rows ({_describe(found[merger])} and "
+                f"{_describe(row)}): the lot ledger takes one removal and one receipt"
+            )
+        found[merger] = row
+    return found
+
+
 def _adjustment_event(
     row: AdjustmentRow,
-    removals: set[str | None],
+    removals: Mapping[str | None, AdjustmentRow],
     receipts: Mapping[str | None, AdjustmentRow],
 ) -> _Event | None:
     """The ledger action an adjustment makes, or None when it has no lot effect
@@ -826,6 +851,7 @@ def _wash_sale_flags(
     same_sale: Mapping[int, Mapping[int, Fraction]],
     disposal_security: Mapping[int, str],
     no_replacement: set[int],
+    identities: Mapping[int, set[str]],
 ) -> list[WashSaleFlag]:
     """Match each loss disposal, in disposal order, to replacement shares in
     acquisition order; each share absorbs one loss (module docstring). A lot no
@@ -848,7 +874,7 @@ def _wash_sale_flags(
             if unmatched == _ZERO:
                 break
             days_apart = abs((lot.trade_date_local - disposal.trade_date_local).days)
-            if lot.security_id != security or days_apart > WASH_SALE_WINDOW_DAYS:
+            if security not in identities[lot.lot_id] or days_apart > WASH_SALE_WINDOW_DAYS:
                 continue
             available = (
                 _dec(lot.quantity)
