@@ -6531,15 +6531,23 @@ def test_an_unresolved_merger_is_stored_by_a_later_run_with_the_same_stamp(
     class Late(FixturePriceSource):
         answer = False
 
+        last_actions_report: Any = None
+
         def mergers(self, start: date, end: date) -> list[Any]:
-            return super().mergers(start, end) if self.answer else []
+            from tradepartner.adapters.alpaca_prices import ActionsParse
+
+            if self.answer:
+                return super().mergers(start, end)
+            self.last_actions_report = ActionsParse((), (("CLNM", date(2018, 7, 25)),), ())
+            return []
 
     settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
     prices = Late(Path(__file__).parent / "fixtures" / "universe")
     with duckdb.connect(str(fixture_store_path)) as conn:
         conn.execute("DELETE FROM mergers")
     stamp = announcement_date_known_at(date(2018, 7, 25))
-    assert _run(settings, prices=prices, now=stamp + timedelta(hours=1), source="alpaca").ok
+    first = _run(settings, prices=prices, now=stamp + timedelta(hours=1), source="alpaca")
+    assert first.ok and "actions_unresolved=1" in first.runs[-1].message, first.runs
     with duckdb.connect(str(fixture_store_path)) as conn:
         assert conn.execute("SELECT count(*) FROM mergers").fetchone() == (0,)
     prices.answer = True
