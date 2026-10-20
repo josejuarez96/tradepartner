@@ -1435,7 +1435,7 @@ why = "Six dependency chains were written for file order, not need; the alignmen
 unblocks = ["task:T202", "task:T206", "task:T209a", "task:T210", "task:T211", "task:T215", "task:T216", "task:T217"]
 
 [task.T250]
-what = "RSP stored as a reference series: backfilled like MTUM, refused to every trial, and left out of every trial's data vintage."
+what = "RSP stored as a check-only series: backfilled like MTUM, refused to every trial, and left out of every trial's data vintage."
 why = "The equal-weight known-answer check needs RSP's total return from stored bars, without adding a trial series or staling every counted trial (#1598)."
 unblocks = ["task:T252"]
 
