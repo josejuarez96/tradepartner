@@ -63,7 +63,7 @@ from tradepartner.execution.reconcile import (
     compare,
 )
 from tradepartner.execution.reconcile_run import reconcile_command
-from tradepartner.store.db import open_for_write, open_read_only
+from tradepartner.store.db import insert_row, open_for_write, open_read_only
 from tradepartner.store.journal import (
     DecisionRow,
     FillRow,
@@ -72,6 +72,7 @@ from tradepartner.store.journal import (
     PaperRunRow,
     PaperWindowRow,
     ReconciliationRow,
+    adjustments_for,
     append,
     kill_switch_events_for,
     reconciliations_for,
@@ -604,3 +605,114 @@ def test_a_buy_in_on_the_fake_halts_as_short_external_change_and_engages(
         "fault",
         "ReconciliationError",
     )
+
+
+# --- the caller offers a short's negative dividend due (#1928) ---------------
+
+EX_DATE = date(2026, 10, 1)  # the conftest clock's session; the short is held 09-30
+DIVIDEND_KNOWN = datetime(2026, 9, 29, 20, 0, tzinfo=UTC)  # before close(S-1)
+
+
+def _short_dividend(settings: Settings, amount: float, known_at: datetime = DIVIDEND_KNOWN) -> None:
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "corporate_actions",
+            {
+                "security_id": SPY,
+                "action_type": "dividend",
+                "ex_date": EX_DATE,
+                "ratio_or_amount": amount,
+                "source_action_id": "",
+                "known_at": known_at,
+                "ingested_at": known_at,
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+
+
+def _dividend_cash(settings: Settings, window: PaperWindowRow) -> list[float | None]:
+    with open_read_only(settings) as conn:
+        return [
+            a.cash
+            for a in adjustments_for(conn, window.window_id)  # type: ignore[arg-type]
+            if a.kind == "dividend_cash"
+        ]
+
+
+def test_a_debited_short_dividend_passes_paper_reconcile_and_journals_the_debit(
+    journal_settings: Settings,
+    short_fake: ShortFake,
+    short_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A short of 10 held before the ex-date owes 10 x 0.5 = 5; the broker
+    debits it (cash 101,000 - 5). The caller offers -5, so the run is `ok` and
+    journals one `dividend_cash` of -5, once."""
+    _short_10_spy(journal_settings, short_fake, short_window)
+    _short_dividend(journal_settings, 0.5)
+    short_fake.extra_cash = -5.0
+
+    result = reconcile_command(
+        journal_settings, lambda: open_for_write(journal_settings), short_fake, fixed_clock
+    )
+
+    assert result.status == OK
+    assert _dividend_cash(journal_settings, short_window) == [pytest.approx(-5.0)]
+    fixed_clock.advance(minutes=5)
+    again = reconcile_command(
+        journal_settings, lambda: open_for_write(journal_settings), short_fake, fixed_clock
+    )
+    assert again.status == OK
+    assert len(_dividend_cash(journal_settings, short_window)) == 1
+
+
+def test_an_undebited_short_dividend_passes_paper_reconcile_and_journals_nothing(
+    journal_settings: Settings,
+    short_fake: ShortFake,
+    short_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _short_10_spy(journal_settings, short_fake, short_window)
+    _short_dividend(journal_settings, 0.5)
+
+    result = reconcile_command(
+        journal_settings, lambda: open_for_write(journal_settings), short_fake, fixed_clock
+    )
+
+    assert result.status == OK
+    assert _dividend_cash(journal_settings, short_window) == []
+
+
+def test_a_short_dividend_debit_beyond_the_due_is_a_cash_mismatch(
+    journal_settings: Settings,
+    short_fake: ShortFake,
+    short_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _short_10_spy(journal_settings, short_fake, short_window)
+    _short_dividend(journal_settings, 0.5)
+    short_fake.extra_cash = -8.0
+
+    with pytest.raises(ReconciliationError, match="cash"):
+        reconcile_command(
+            journal_settings, lambda: open_for_write(journal_settings), short_fake, fixed_clock
+        )
+
+
+def test_a_short_dividend_known_after_close_of_the_previous_session_is_not_offered(
+    journal_settings: Settings,
+    short_fake: ShortFake,
+    short_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """No look-ahead: a dividend learned after close(S-1) explains no debit."""
+    _short_10_spy(journal_settings, short_fake, short_window)
+    _short_dividend(journal_settings, 0.5, known_at=datetime(2026, 9, 30, 21, 0, tzinfo=UTC))
+    short_fake.extra_cash = -5.0
+
+    with pytest.raises(ReconciliationError, match="cash"):
+        reconcile_command(
+            journal_settings, lambda: open_for_write(journal_settings), short_fake, fixed_clock
+        )
