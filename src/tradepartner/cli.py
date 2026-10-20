@@ -2912,7 +2912,9 @@ def make_app(
         order_sessions: Annotated[
             int, typer.Option(help="M: the sessions with a live fill it needs (1 to N)")
         ],
-        reason: Annotated[str, typer.Option(help="why, naming the strategy that goes live first")],
+        reason: Annotated[
+            str, typer.Option(help="why the span opens now; names no live strategy (T163 picks it)")
+        ],
     ) -> None:
         """Open (or restart) the shakedown span with its two thresholds (ADR 0017 E)."""
         decision_id = _shakedown_write(
