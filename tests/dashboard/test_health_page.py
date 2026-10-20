@@ -641,3 +641,41 @@ def test_the_not_computed_card_warns_while_the_index_threshold_is_set(
     text = _text(at)
     assert "Not computed" in text
     assert f"`health --check` enforces {INDEX_MEMBERS_MISSING}" in text
+
+
+# --- Mergers (#1762, T248e) ----------------------------------------------------
+
+
+def test_mergers_card_shows_the_block(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> None:
+    """Rows by kind, the latest `known_at`, the last run's counts, and the
+    stock merger's acquiree as the one with a bar after its effective date."""
+    _write(
+        store_path,
+        "INSERT INTO ingestion_runs VALUES (?, ?, ?, 'ok', 'alpaca', 'daily', 1, ?, ?)",
+        [
+            "merger-1",
+            FINISHED - timedelta(hours=2),
+            FINISHED - timedelta(hours=2),
+            "2020-06-30",
+            "mergers_stored=1; merger_rows_refused=2; actions_unresolved=3; merger_self=0",
+        ],
+    )
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Mergers" in text
+    assert "cash 1 · stock 1 · stock_and_cash 0" in text
+    assert "Latest known at 2020-02-18 21:00 UTC" in text
+    assert "Last run: merger_self 0, not_yet_known 0, refused 2, stored 1, unresolved 3" in text
+    assert "Merger conflicts (0)" in text
+    assert "Acquirees with a bar after their effective date (1)" in text
+    after = [df.value for df in at.dataframe if "effective_date" in df.value.columns]
+    assert [list(f["security_id"]) for f in after] == [["SEC_DIV_CANCELLED"]]
+
+
+def test_mergers_card_with_no_run_says_never(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    assert "Last run: never" in _text(at)

@@ -507,13 +507,15 @@ def _month(
 
     def listed(weights: Mapping[str, float], bench_return: float) -> tuple[ListedName, ...]:
         contribs = ic.contributions(weights, returns, bench_return)
-        names = ic.listed_names(contribs, returns, cfg.names_per_month, cfg.extreme_name_return)
+        names = ic.listed_names(
+            contribs, returns, cfg.names_per_month, cfg.extreme_name_return, member_ids=member_ids
+        )
         return tuple(
             ListedName(
                 ic.name_row(
                     sid,
                     str(listing[sid]["ticker"]) if sid in listing else tickers[sid],
-                    contribs[sid],
+                    contribs.get(sid, 0.0),
                     returns[sid],
                     protected=protected,
                 ),

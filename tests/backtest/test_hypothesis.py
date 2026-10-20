@@ -1387,10 +1387,10 @@ def test_a_screened_registration_runs_at_its_frozen_fraction(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
     """T165c applies the key (#1358) and T211e applies `adjust.apply_spin_offs` (#1894),
-    so only T238's `strategy.hold_top_fraction` (until T239) is in `NOT_YET_APPLIED_KEYS`
-    and a registration at 0.20 loads at 0.20 (until T165c, quant-auditor on #1387 had it
-    refused)."""
-    assert frozenset({"strategy.hold_top_fraction"}) == hypothesis.NOT_YET_APPLIED_KEYS
+    and T239 applies `strategy.hold_top_fraction` (#657), so `NOT_YET_APPLIED_KEYS` is
+    empty and a registration at 0.20 loads at 0.20 (until T165c, quant-auditor on #1387
+    had it refused)."""
+    assert frozenset() == hypothesis.NOT_YET_APPLIED_KEYS
     _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
     assert loaded.strategy.turnover_top_fraction == 0.20
@@ -1978,9 +1978,9 @@ def _with_buffer(tmp_path: Path, source: Path, slug: str, value: str) -> Path:
     return path
 
 
-def test_the_buffer_key_is_family_only_post_registration_and_not_yet_applied() -> None:
+def test_the_buffer_key_is_family_only_and_post_registration() -> None:
     assert hypothesis.FAMILY_ONLY_KEYS[BUFFER_KEY] == "momentum"
-    assert BUFFER_KEY in hypothesis.NOT_YET_APPLIED_KEYS
+    assert BUFFER_KEY not in hypothesis.NOT_YET_APPLIED_KEYS  # T239 applies it
     assert BUFFER_KEY in frozen.POST_REGISTRATION_OWN_KEYS
     for family in ("momentum", "oracle", "combined"):
         assert BUFFER_KEY in hypothesis.family_frozen_keys(family)  # frozen, not required
@@ -2030,14 +2030,14 @@ def test_a_value_between_zero_and_top_fraction_is_refused(
         _register(conn, _with_buffer(tmp_path, FIXTURE, SLUG, "0.05"), settings)
 
 
-def test_load_frozen_refuses_a_buffered_registration_until_t239(
+def test_load_frozen_loads_a_buffered_registration_after_t239(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
-    """No run or paper plan records results under a buffer the engine ignores."""
+    """T239 applies the key, so a `momentum` registration at 0.20 loads at 0.20: the run
+    records results under a buffer the engine reads (before T239 this was refused)."""
     record = _register(conn, _with_buffer(tmp_path, FIXTURE, SLUG, "0.20"), settings)
     assert record.params[BUFFER_KEY] == 0.2
-    with pytest.raises(HypothesisFileError, match=BUFFER_KEY):
-        hypothesis.load_frozen(conn, SLUG, settings=settings)
+    assert hypothesis.load_frozen(conn, SLUG, settings=settings).strategy.hold_top_fraction == 0.2
 
 
 # --- the `portfolio` section (T219; backtest spec amendment #1872, item 1) ------------

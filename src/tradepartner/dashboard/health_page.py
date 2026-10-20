@@ -11,7 +11,10 @@ unclassifiable and `snapshot_static` reliance, settings, statement facts
 is on, the last EDGAR run's `statement_*` counts and a warning badge while
 `statement_vintage_late > 0`), the borrow-status block (issue 1506,
 T171e: the switch, rows, the latest observation, the shortable and ETB
-counts at it, the last run and the stale and switch warnings), the coverage
+counts at it, the last run and the stale and switch warnings), the mergers
+block (issue 1762, T248e: rows by kind, the latest `known_at`, the last
+run's counts, and the report-only conflict and bar-after-effective-date
+lists), the coverage
 check against the named
 reference (issue 1541, T180: "not computed" until the viewer presses its
 button, since it costs one universe read per sample session; never computed
@@ -540,6 +543,26 @@ def _borrow_card(report: HealthReport) -> None:
             theme.status_badge(warning, "warning")
 
 
+def _mergers_card(report: HealthReport) -> None:
+    """The mergers block (issue 1762, T248e): rows by kind, the latest
+    `known_at`, the last Alpaca run's counts and the two report-only lists."""
+    mergers = report.mergers
+    with st.container(border=True):
+        st.subheader("Mergers")
+        st.markdown(" · ".join(f"{kind} {n}" for kind, n in mergers.rows_by_kind.items()))
+        st.caption(f"Latest known at {header.when(mergers.latest_known_at)}")
+        counts = ", ".join(f"{k} {v}" for k, v in sorted(mergers.run_counts.items()))
+        st.caption(f"Last run: {counts or 'never'}")
+        st.markdown(f"Merger conflicts ({mergers.conflicts.height})")
+        if mergers.conflicts.height:
+            st.dataframe(mergers.conflicts, hide_index=True)
+        st.markdown(
+            f"Acquirees with a bar after their effective date ({mergers.after_effective.height})"
+        )
+        if mergers.after_effective.height:
+            st.dataframe(mergers.after_effective, hide_index=True)
+
+
 def _tables(report: HealthReport) -> None:
     st.subheader("Gap report")
     st.dataframe(report.gaps.rows, hide_index=True)
@@ -586,6 +609,7 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
         _statement_card(view.report)
         _rates_card(view.report)
         _borrow_card(view.report)
+        _mergers_card(view.report)
         _coverage_card(
             view.report,
             settings.coverage.check_enabled,
