@@ -213,6 +213,11 @@ class _OpenLot:
 
     lot_id: int
     security_id: str
+    #: The security whose share units `quantity`/`acquired` are in. A merger
+    #: re-keys it to the acquirer for every lot, even one already fully sold,
+    #: while `security_id`/`symbol`/`cusip` keep the target's on a sold lot so
+    #: its own sale still reconciles (#1980).
+    unit_security: str
     symbol: str
     cusip: str | None
     trade_at: datetime
@@ -292,6 +297,7 @@ class _Ledger:
         lot = _OpenLot(
             lot_id=len(self.lots) + 1,
             security_id=security_id,
+            unit_security=security_id,
             symbol=symbol,
             cusip=None if asset is None else asset.cusip,
             trade_at=trade_at,
@@ -406,7 +412,7 @@ class _Ledger:
     def split(self, security_id: str, ratio: Fraction) -> None:
         self.refuse_short(security_id, "split")
         for lot in self.lots:
-            if lot.security_id == security_id and lot.position_side == LONG:
+            if lot.unit_security == security_id and lot.position_side == LONG:
                 lot.quantity *= ratio
                 lot.acquired *= ratio
         self._rescale_disposals(security_id, ratio)
@@ -470,13 +476,13 @@ class _Ledger:
         )
 
     def merge(self, removal: AdjustmentRow, receipt: AdjustmentRow) -> None:
-        """A stock merger (spec amendment #1762 item 5): the target's open lots
+        """A stock merger (spec amendment #1762 item 5): the target's lots
         become acquirer lots at the ratio of the two quantities, basis and
-        acquisition instant carried, with no disposal. Every lot of the target is
-        given the acquirer as an identity and scaled, so the wash-sale scan stays
-        in the acquirer's units (#1980); only the open ones take the acquirer's
-        symbol and CUSIP, so a sale before the merger still reconciles against
-        the target's symbol."""
+        acquisition instant carried, with no disposal. Every lot of the target
+        moves into the acquirer's share units and identities, so a later
+        acquirer split scales it too (#1980); only the lots still open take the
+        acquirer's symbol and CUSIP, so a sale before the merger still
+        reconciles against the target's."""
         target, acquirer = _security(removal), _security(receipt)
         self.refuse_short(target, removal.kind)
         self.refuse_short(acquirer, receipt.kind)
@@ -498,8 +504,9 @@ class _Ledger:
         symbol = self.symbol_of(acquirer)
         asset = self.assets.get(symbol)
         for lot in self.lots:
-            if lot.security_id != target or lot.position_side != LONG:
+            if lot.unit_security != target or lot.position_side != LONG:
                 continue
+            lot.unit_security = acquirer
             lot.identities.add(acquirer)
             lot.quantity *= ratio
             lot.acquired *= ratio
