@@ -143,12 +143,13 @@ def test_a_held_name_with_no_bar_fails_the_run_at_the_marks_when_the_stale_limit
     orders = len(env.orders())
     drop_bar(env, TRNS, date(2019, 5, 31))
     with pytest.raises(ValueError, match=TRNS):
-        env.run(at(date(2019, 6, 3)), prices={"TRNS": 50.0})
+        env.run(at(date(2019, 6, 3)), prices={"TRNS": TRNS_PX})
     assert env.alerts("missing_candidate_bar") == []
     assert len(env.orders()) == orders
 
 
 T_1 = date(2019, 5, 31)  # the rebalance after F_0; its fill session is F_1
+TRNS_PX = 26.36  # near its last close, 2019-05-30: inside the fill-price band (#1981)
 F_1 = date(2019, 6, 3)
 T_2, F_2 = date(2019, 6, 28), date(2019, 7, 1)
 
@@ -236,7 +237,7 @@ def hold_trns_without_t1_bar(env: Env) -> dict[str, object]:
 def test_a_held_name_with_no_bar_is_kept_not_sold(env: Env, window3: PaperWindowRow) -> None:
     hold_trns_without_t1_bar(env)
     quantity = env.held()["TRNS"]
-    outcome = env.run(at(F_1), prices={"TRNS": 50.0})
+    outcome = env.run(at(F_1), prices={"TRNS": TRNS_PX})
     assert outcome.status == "ok"
     run_id = env.latest_run()
     assert signal_reasons(env)[TRNS] == "excluded_no_t0_bar"
@@ -278,7 +279,7 @@ def test_the_target_comparison_writes_no_row_against_a_trial_that_lacks_the_bar(
     env: Env, window3: PaperWindowRow
 ) -> None:
     hold_trns_without_t1_bar(env)
-    env.run(at(F_1), prices={"TRNS": 50.0})
+    env.run(at(F_1), prices={"TRNS": TRNS_PX})
     with env.connect() as conn:
         decisions = tuple(d.decision for d in journal.decisions_for(conn, window3.window_id or 0))
         plans = tuple(journal.plans_for(conn, window3.window_id or 0))
@@ -298,9 +299,9 @@ def test_the_target_comparison_writes_no_row_against_a_trial_that_lacks_the_bar(
 
 def test_a_same_day_rerun_reuses_the_decision(env: Env, window3: PaperWindowRow) -> None:
     hold_trns_without_t1_bar(env)
-    env.run(at(F_1, 12, 0), prices={"TRNS": 50.0})
+    env.run(at(F_1, 12, 0), prices={"TRNS": TRNS_PX})
     before = decisions_at(env, T_1)
-    env.run(at(F_1, 13, 0), prices={"TRNS": 50.0})
+    env.run(at(F_1, 13, 0), prices={"TRNS": TRNS_PX})
     assert decisions_at(env, T_1) == before
     assert len(env.alerts("missing_candidate_bar")) == 1
 
@@ -308,7 +309,7 @@ def test_a_same_day_rerun_reuses_the_decision(env: Env, window3: PaperWindowRow)
 def test_a_catch_up_plan_keeps_it_too(env: Env, window3: PaperWindowRow) -> None:
     hold_trns_without_t1_bar(env)
     catch_up = date(2019, 6, 4)
-    outcome = env.run(at(catch_up), prices={"TRNS": 50.0})
+    outcome = env.run(at(catch_up), prices={"TRNS": TRNS_PX})
     assert outcome.kind == "catch_up"
     assert decisions_at(env, T_1)[TRNS][0] == "skip_zero"
     assert trns_orders(env, env.latest_run()) == []
@@ -318,11 +319,11 @@ def test_at_the_next_rebalance_the_name_is_a_member_once_reingested(
     env: Env, window3: PaperWindowRow
 ) -> None:
     row = hold_trns_without_t1_bar(env)
-    env.run(at(F_1), prices={"TRNS": 50.0})
+    env.run(at(F_1), prices={"TRNS": TRNS_PX})
     assert decisions_at(env, T_1)[TRNS][0] == "skip_zero"
     reingest(env, row, at(F_1, 20, 0))
     keep_wndx_trading(env)
-    env.run(at(F_2), prices={"TRNS": 50.0})
+    env.run(at(F_2), prices={"TRNS": TRNS_PX})
     # Planned by the ordinary rules: nothing is excluded or kept for TRNS any more. (The
     # fixture's TRNS leaves the universe at T_2 for its own reasons, so it is not a member
     # there; the member case is the unit test's.)
@@ -340,9 +341,9 @@ def test_at_the_next_rebalance_with_the_bar_still_missing_it_is_sold_left_univer
     env: Env, window3: PaperWindowRow
 ) -> None:
     hold_trns_without_t1_bar(env)
-    env.run(at(F_1), prices={"TRNS": 50.0})
+    env.run(at(F_1), prices={"TRNS": TRNS_PX})
     keep_wndx_trading(env)
-    env.run(at(F_2), prices={"TRNS": 50.0})
+    env.run(at(F_2), prices={"TRNS": TRNS_PX})
     later = decisions_at(env, T_2)[TRNS]
     assert (later[0], later[3]) == ("trade", "left_universe")
     assert TRNS not in [
@@ -380,8 +381,8 @@ def test_a_t1_bar_known_after_the_cut_still_makes_the_name_kept(
             [at(T_1, 23), at(T_1, 23), TRNS, T_1],
         )
     drop_bar(truncated, TRNS, T_1)
-    env.run(at(F_1), prices={"TRNS": 50.0})
-    truncated.run(at(F_1), prices={"TRNS": 50.0})
+    env.run(at(F_1), prices={"TRNS": TRNS_PX})
+    truncated.run(at(F_1), prices={"TRNS": TRNS_PX})
     assert decisions_at(env, T_1)[TRNS][0] == "skip_zero"
     assert signal_reasons(env)[TRNS] == "excluded_no_t0_bar"
     assert decisions_at(env, T_1) == decisions_at(truncated, T_1)
