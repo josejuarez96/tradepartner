@@ -88,13 +88,16 @@ def signed_target_weights(
     `-(gross - net) / 2 / k_S`. An ineligible low scorer is skipped and the next-lowest
     eligible name takes its place; a name is never in both legs; when fewer than `k_S`
     eligible names remain outside the long leg, the short leg takes those that remain and
-    `k_S` is that count. The legs are disjoint, Σ |w| = `gross` and Σ w = `net`, and the
-    result is ordered by `security_id`.
+    `k_S` is that count. The legs are disjoint, each name with a non-zero target has one
+    weight, and the result is ordered by `security_id`. When both legs are full the long
+    leg sums to `(gross + net) / 2` and the short leg to `-(gross - net) / 2`, so
+    Σ |w| = `gross` and Σ w = `net`; a truncated or empty leg scales its own share.
 
-    When `gross == net` the short leg carries no weight: this is the `long_only` book
-    (spec item 1 makes `net_exposure` equal `gross_exposure` there), and the result is
-    `target_weights`' output exactly. Raises `ValueError` for a `top_fraction` outside
-    `(0, 1]` or a non-finite score, `gross` or `net`.
+    `gross == net == 1.0` is the `long_only` book (spec item 1 makes `net_exposure` equal
+    `gross_exposure` there at the default), and the result is `target_weights`' output
+    exactly. A `gross == net` below 1.0 is still a signed book with no short leg: its
+    long leg carries the `gross` share, not the whole book. Raises `ValueError` for a
+    `top_fraction` outside `(0, 1]` or a non-finite score, `gross` or `net`.
     """
     if not (0 < top_fraction <= 1):
         raise ValueError(f"top_fraction must be in (0, 1], got {top_fraction}")
@@ -104,7 +107,7 @@ def signed_target_weights(
     for name, value in (("gross", gross), ("net", net)):
         if not math.isfinite(value):
             raise ValueError(f"{name} must be finite, got {value}")
-    if gross == net:
+    if gross == net == 1.0:
         return target_weights(scores, top_fraction, "equal")
     if not scores:
         return {}
@@ -115,10 +118,14 @@ def signed_target_weights(
     eligible_ranked = [sid for sid in ranked if sid in eligible_set]
     k_short = _selected_count(len(eligible_ranked), top_fraction)
     short_leg = [sid for sid in reversed(eligible_ranked) if sid not in in_long][:k_short]
-    targets = {sid: (gross + net) / 2 / len(long_leg) for sid in long_leg}
+    targets: dict[str, float] = {}
+    long_weight = (gross + net) / 2 / len(long_leg)
+    if long_weight:
+        targets.update({sid: long_weight for sid in long_leg})
     if short_leg:
         short_weight = -(gross - net) / 2 / len(short_leg)
-        targets.update({sid: short_weight for sid in short_leg})
+        if short_weight:
+            targets.update({sid: short_weight for sid in short_leg})
     return {sid: targets[sid] for sid in sorted(targets)}
 
 

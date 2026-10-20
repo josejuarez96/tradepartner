@@ -428,11 +428,28 @@ def test_signed_target_weights_legs_are_disjoint_and_sums_hold(gross: float, net
 def test_signed_target_weights_long_only_is_target_weights_exactly(
     scores: dict[str, float], fraction: float
 ) -> None:
-    """gross == net is the `long_only` book (spec item 1), so the result is
+    """gross == net == 1.0 is the `long_only` book (spec item 1), so the result is
     `target_weights`' output exactly and `eligible` is not read."""
     assert signed_target_weights(scores, fraction, 1.0, 1.0, eligible=[]) == target_weights(
         scores, fraction, "equal"
     )
+
+
+def test_signed_target_weights_a_sub_unit_gross_keeps_the_gross_share() -> None:
+    """gross 0.5, net 0.5 (a signed book with no short leg): the long leg carries the
+    0.5 gross share at (0.5 + 0.5)/2/2 = 0.25 each, not the whole book."""
+    targets = signed_target_weights(_scores(4), 0.5, 0.5, 0.5, eligible=["S0003", "S0002"])
+    assert targets == {"S0003": 0.25, "S0002": 0.25}
+    assert math.fsum(targets.values()) == pytest.approx(0.5)
+
+
+def test_signed_target_weights_a_fully_short_book_has_no_zero_long_entries() -> None:
+    """gross 0.4, net -0.4: the long leg's (0.4 - 0.4)/2 = 0 weight is dropped, so the
+    result holds only the short leg, at -(0.4 - -0.4)/2/2 = -0.2 each."""
+    scores = _scores(4)
+    targets = signed_target_weights(scores, 0.5, 0.4, -0.4, eligible=scores)
+    assert targets == {"S0000": pytest.approx(-0.2), "S0001": pytest.approx(-0.2)}
+    assert list(targets) == sorted(targets)
 
 
 @pytest.mark.parametrize("bad", [0.0, -0.1, 1.5])

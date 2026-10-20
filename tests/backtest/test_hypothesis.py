@@ -2030,7 +2030,9 @@ def test_portfolio_keys_are_allowed_and_frozen_at_their_defaults(
     tmp_path: Path, settings: Settings
 ) -> None:
     """A file may name the five keys (`frozen_keys` includes the section), and absent
-    they are frozen at their table defaults, never from live `Settings`."""
+    they freeze at their table defaults: a file naming `side` at its default is the same
+    registration as one that omits it (`frozen_params`' `fixed` map reads the table, not
+    live `Settings`, which the guard keeps at its defaults until T223)."""
     text = FIXTURE.read_text().replace("\n```\n", '\n[portfolio]\nside = "long_only"\n```\n', 1)
     parsed = hypothesis.parse_file(_copy(tmp_path, text))
     explicit = hypothesis.frozen_params(parsed, settings)
@@ -2038,6 +2040,9 @@ def test_portfolio_keys_are_allowed_and_frozen_at_their_defaults(
     assert explicit == twin
     assert explicit["portfolio.side"] == "long_only"
     assert explicit["portfolio.short_min_price"] == 5.0
+    table = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    for key in frozen.POST_REGISTRATION_PORTFOLIO_KEYS:
+        assert explicit[key] == table[key], key
 
 
 def test_a_non_default_portfolio_value_is_refused_until_t223(
