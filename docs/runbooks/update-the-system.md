@@ -57,17 +57,10 @@ Unloaded jobs do not run. Your plist files are untouched.
 
 ```bash
 df -h .
-DAY=$(date +%Y%m%d-%H%M)
-if [ -e "$STORE_PATH.bak-$DAY" ]; then echo "a copy with this name exists: wait a minute and run again"; else
-  cp "$STORE_PATH" "$STORE_PATH.bak-$DAY"
-  [ -f "$STORE_PATH.wal" ] && cp "$STORE_PATH.wal" "$STORE_PATH.wal.bak-$DAY"
-  git rev-parse HEAD > "$STORE_PATH.bak-$DAY.commit"
-  cmp "$STORE_PATH" "$STORE_PATH.bak-$DAY" && echo "copy matches"
-  echo "copy is $STORE_PATH.bak-$DAY"
-fi
+uv run tradepartner store backup
 ```
 
-`copy matches` must print. Write down the copy's name (it holds the date and time). The `.commit` file records the code you were on, which a restore needs. This copy is a plain safety copy. A copy made for a data release keeps its own name and rules ([data-releases](data-releases.md)). Never overwrite or delete a release copy.
+The command refuses if anything has the store open (go back to step 3), refuses if a copy with the same minute already exists, and never deletes or overwrites anything. It copies the store and its `.wal` file (if there is one) to `$STORE_PATH.bak-YYYYMMDD-HHMM` (the time is UTC, not your local time), checks the copy byte for byte, and writes `$STORE_PATH.bak-YYYYMMDD-HHMM.manifest.json` beside it with the code commit, the schema version and the file sizes. `copy matches the store byte for byte` must print. Write down the copy's name. The manifest records the code you were on, which a restore needs. This copy is a plain safety copy. A copy made for a data release keeps its own name and rules ([data-releases](data-releases.md)). Never overwrite or delete a release copy. The command runs only when you start it; there is no schedule.
 
 **5. Pull and sync.**
 
@@ -108,7 +101,7 @@ launchctl print gui/$(id -u)/com.tradepartner.paper | grep "last exit code"
 (For a per-book job, use its own label from `$STORE_PATH.jobs`.) Both should say 0 (what other codes mean: [scheduling](scheduling.md), "What a `paper run` exit code means"). When you have finished, also delete `$STORE_PATH.jobs`. Delete the step 4 copy only after both runs finished `ok`, with its exact name (no wildcard, and never a release copy):
 
 ```bash
-rm "$STORE_PATH.bak-YYYYMMDD-HHMM" "$STORE_PATH.bak-YYYYMMDD-HHMM.commit"
+rm "$STORE_PATH.bak-YYYYMMDD-HHMM" "$STORE_PATH.bak-YYYYMMDD-HHMM.manifest.json"
 [ -f "$STORE_PATH.wal.bak-YYYYMMDD-HHMM" ] && rm "$STORE_PATH.wal.bak-YYYYMMDD-HHMM"
 ```
 
@@ -143,7 +136,7 @@ Never reuse a `damaged-` folder: it may hold the only record of what was lost.
 ls -lt "$(dirname "$STORE_PATH")"
 ```
 
-Candidates, newest first: a `.bak-YYYYMMDD-HHMM` copy from Part 1, a `tradepartner.<release>.duckdb` from a data release ([data-releases](data-releases.md)), or a Time Machine copy. A `.bak-YYYYMMDD-HHMM` copy has the `.commit` file naming the code it belongs to. If there is no copy at all, stop. Ask Claude before doing anything else. The damaged files you moved aside are the only data left.
+Candidates, newest first: a `.bak-YYYYMMDD-HHMM` copy from Part 1, a `tradepartner.<release>.duckdb` from a data release ([data-releases](data-releases.md)), or a Time Machine copy. A `.bak-YYYYMMDD-HHMM` copy has a `.manifest.json` file naming the code it belongs to. If there is no copy at all, stop. Ask Claude before doing anything else. The damaged files you moved aside are the only data left.
 
 **4. Restore from your own copy.** The log file is the one trap. If a `.wal` from the damaged store stays next to the restored file, DuckDB replays it onto the copy. This block refuses to run until step 2 has moved both files away. Replace `YYYYMMDD-HHMM` with the copy's date and time, and run it in the same Terminal window as step 2:
 
@@ -153,14 +146,14 @@ BAK="$STORE_PATH.bak-YYYYMMDD-HHMM"
 if [ -e "$STORE_PATH" ] || [ -e "$STORE_PATH.wal" ]; then echo "stop: do step 2 first"; else
   cp "$BAK" "$STORE_PATH"
   [ -f "$STORE_PATH.wal.bak-YYYYMMDD-HHMM" ] && cp "$STORE_PATH.wal.bak-YYYYMMDD-HHMM" "$STORE_PATH.wal"
-  cat "$BAK.commit"
+  cat "$BAK.manifest.json"
 fi
 ```
 
-The last line prints the commit the copy was taken under. If it differs from the commit you are on now (`git rev-parse HEAD`), and your update crossed a store-version change, check out that commit before any job loads, because newer code upgrades the store on its next write and the upgrade cannot be undone:
+The last line prints the manifest, which holds the commit (`git_commit`) the copy was taken under. If it differs from the commit you are on now (`git rev-parse HEAD`), and your update crossed a store-version change, check out that commit before any job loads, because newer code upgrades the store on its next write and the upgrade cannot be undone:
 
 ```bash
-git checkout "$(cat "$BAK.commit")"
+git checkout "$(uv run python -c 'import json,sys; print(json.load(open(sys.argv[1]))["git_commit"])' "$BAK.manifest.json")"
 uv sync
 ```
 
@@ -187,4 +180,4 @@ These only read. If they fail, put the files back from `$DAMAGED` and ask Claude
 
 - How DuckDB behaves on every kind of damaged file. The steps above assume only that a clean copy exists, not that a damaged file can be repaired.
 - Whether a Time Machine copy of a store that was open while it was copied is consistent. Prefer your own `.bak-YYYYMMDD-HHMM` copy, which you took with the jobs stopped.
-- A backup command and a backup schedule do not exist. Today the copy is by hand. A follow-up issue ([#1939](https://github.com/josejuarez96/tradepartner/issues/1939)) asks for them.
+- A backup schedule does not exist; the copy runs only when you start `store backup`. Copies of a store made while it was open are refused, not repaired.
