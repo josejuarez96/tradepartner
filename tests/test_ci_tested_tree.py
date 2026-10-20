@@ -21,7 +21,7 @@ SHA = "m" * 40
 PARENT = "p" * 40
 HEAD = "h" * 40
 TREE = "t" * 40
-SHARDS = 8
+SHARDS = 10
 
 
 def _run(name: str, suite: int = 1, conclusion: str = "success", **kw: Any) -> dict[str, Any]:
@@ -211,18 +211,18 @@ def test_main_prints_skip_only_when_decided(
 @pytest.mark.parametrize(
     ("argv", "env", "api"),
     [
-        ([], {"GITHUB_REPOSITORY": REPO, "PYTEST_SHARD_COUNT": "8"}, FakeApi()),
-        ([SHA], {"PYTEST_SHARD_COUNT": "8"}, FakeApi()),
+        ([], {"GITHUB_REPOSITORY": REPO, "PYTEST_SHARD_COUNT": "10"}, FakeApi()),
+        ([SHA], {"PYTEST_SHARD_COUNT": "10"}, FakeApi()),
         ([SHA], {"GITHUB_REPOSITORY": REPO}, FakeApi()),
         ([SHA], {"GITHUB_REPOSITORY": REPO, "PYTEST_SHARD_COUNT": "eight"}, FakeApi()),
         (
             [SHA],
-            {"GITHUB_REPOSITORY": REPO, "PYTEST_SHARD_COUNT": "8"},
+            {"GITHUB_REPOSITORY": REPO, "PYTEST_SHARD_COUNT": "10"},
             FakeApi(**{f"repos/{REPO}/git/commits/{SHA}": RuntimeError("HTTP 502")}),
         ),
         (
             [SHA],
-            {"GITHUB_REPOSITORY": REPO, "PYTEST_SHARD_COUNT": "8"},
+            {"GITHUB_REPOSITORY": REPO, "PYTEST_SHARD_COUNT": "10"},
             FakeApi(**{f"repos/{REPO}/commits/{SHA}/pulls": {"message": "Not Found"}}),
         ),
     ],
