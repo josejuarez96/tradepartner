@@ -164,7 +164,11 @@ class TestRiskFreeRead:
 
     def test_constant_never_calls_rates(self) -> None:
         provider = _provider()
-        results = _run(provider, _params(metrics={"risk_free_rate": 0.02}), levels=(0.0, 15.0))
+        results = _run(
+            provider,
+            _params(metrics={"risk_free_source": "constant", "risk_free_rate": 0.02}),
+            levels=(0.0, 15.0),
+        )
         assert [c for c in provider.calls if c.method == "rates"] == []
         assert all(result.rates is None for result in results.values())
 

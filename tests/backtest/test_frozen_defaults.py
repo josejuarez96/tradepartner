@@ -61,11 +61,25 @@ def test_frozen_keys_outside_the_baseline_all_have_table_entries() -> None:
     assert table <= keys
 
 
+RISK_FREE_SOURCE_KEY = "metrics.risk_free_source"
+
+
 def test_table_defaults_are_the_config_defaults() -> None:
     dumped = Settings(_env_file=None).model_dump(mode="json")  # type: ignore[call-arg]
     for key, default, _version in frozen.FROZEN_KEY_DEFAULTS:
         section, _, name = key.partition(".")
+        if key == RISK_FREE_SOURCE_KEY:
+            continue  # the one exception (T170d, #2011): see the test below
         assert frozen.is_default(dumped[section][name], default), key
+
+
+def test_risk_free_source_is_the_one_default_the_table_does_not_follow() -> None:
+    """T170d (#2011): the live default is `store`; the table entry stays `constant`, the
+    value a registration stored before the key read, so no stored fingerprint moves."""
+    dumped = Settings(_env_file=None).model_dump(mode="json")  # type: ignore[call-arg]
+    assert dumped["metrics"]["risk_free_source"] == "store"
+    table = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    assert table[RISK_FREE_SOURCE_KEY] == "constant"
 
 
 def test_frozen_module_is_a_leaf() -> None:
