@@ -139,6 +139,7 @@ from tradepartner.calendar import (
     next_session,
     previous_session,
     session_close,
+    sessions_in_month_window,
 )
 from tradepartner.config import Cadence, HypothesisFamily, Settings
 from tradepartner.store.delistings import DELISTED
@@ -365,6 +366,46 @@ def _plan(
         excluded_no_history=no_history,
         counts=dict(signal.counts),
         exclusions=exclusions,
+    )
+
+
+#: The `Plan.exclusions` key for a universe candidate with no bar at the read session
+#: (paper spec amendment 2026-10-20, #1997).
+NO_T0_BAR: Final = "no_t0_bar"
+
+
+def no_t0_bar_candidates(
+    provider: DataProvider, params: Settings, session: date
+) -> tuple[str, ...]:
+    """Securities the universe dropped only because the read session's (T_0) bar is
+    missing (#1997): rule 6 (`history`, `missing_bars`) with every other session of the
+    history window present. Sorted ids, read at the same `t` as `plan`'s universe.
+
+    A partial ingest (SPY present, one name's T_0 bar absent) drops such a name with no
+    trace; the paper planner records it as `excluded_no_t0_bar` and alerts. They are not
+    universe members, so `Plan.n_universe` and the targets are untouched. Pure over the
+    provider's as-of reads: bars known at `t` only."""
+    cadence = params.schedule.rebalance_cadence
+    read = _read_session(session, params.strategy.signal_delay_sessions, cadence)
+    t = read_time(read, cadence)
+    universe = provider.universe(t)
+    dropped = universe.exclusions.filter(
+        (pl.col("rule_name") == "history") & (pl.col("reason") == "missing_bars")
+    )["security_id"].to_list()
+    if not dropped:
+        return ()
+    history = set(sessions_in_month_window(universe.session, params.universe.min_history_months))
+    bars = provider.raw_prices(t, sorted(dropped)).filter(pl.col("session") <= universe.session)
+    have: dict[str, set[date]] = {}
+    for sid, day in bars.select("security_id", "session").iter_rows():
+        have.setdefault(sid, set()).add(day)
+    return tuple(
+        sorted(
+            sid
+            for sid in dropped
+            if universe.session not in have.get(sid, set())
+            and history - {universe.session} <= have.get(sid, set())
+        )
     )
 
 
