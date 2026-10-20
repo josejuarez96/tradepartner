@@ -118,9 +118,12 @@ def test_a_merger_scales_a_lot_sold_before_it_and_keeps_the_target_symbol() -> N
       03-07 merger 5 SEC_T -> 2.5 SEC_A at 0.5
       03-10 3:1 split on SEC_A
 
-    Lot 1 keeps SEC_T / TGT but its acquired quantity is 10 x 0.5 x 3 = 15 (both
-    events scale it); lot 2 becomes SEC_A / ACQ with 5 x 0.5 x 3 = 7.5 shares.
-    A split whose ratio cancels the merger's would not tell the two apart.
+    Lot 1 keeps SEC_T / TGT and reports the 10 TGT shares it bought (the row
+    never mixes the target's symbol with the acquirer's count); the scan sees it
+    as 10 x 0.5 x 3 = 15 acquirer units: its loss of 100 is 15 units, matched
+    against lot 2's 5 x 0.5 x 3 = 7.5, so 100 x 7.5 / 15 = 50 is disallowed.
+    Lot 2 becomes SEC_A / ACQ with 7.5 shares. A split whose ratio cancels the
+    merger's would not tell the two apart.
     """
     book = Book()
     book.trade("buy", 10, 30.0, D0303, security_id="SEC_T")
@@ -128,11 +131,14 @@ def test_a_merger_scales_a_lot_sold_before_it_and_keeps_the_target_symbol() -> N
     book.trade("buy", 5, 20.0, D0305, security_id="SEC_T")
     _merge(book, D0307, 5.0, 2.5)
 
-    lot_list, _, _ = book.run(D0312, _splits(("SEC_A", D0310, 3.0)))
+    lot_list, _, flags = book.run(D0312, _splits(("SEC_A", D0310, 3.0)))
 
     assert [(lot.lot_id, lot.security_id, lot.symbol, lot.quantity) for lot in lot_list] == [
-        (1, "SEC_T", "TGT", 15.0),
+        (1, "SEC_T", "TGT", 10.0),
         (2, "SEC_A", "ACQ", 7.5),
+    ]
+    assert [(f.replacement_lot_id, f.matched_quantity, f.disallowed_amount) for f in flags] == [
+        (2, 7.5, 50.0)
     ]
 
 

@@ -230,6 +230,10 @@ class _OpenLot:
     book_id: str
     position_side: str
     acquired: Fraction
+    #: What the `Lot` row reports as its quantity: `acquired`, except that a
+    #: merger leaves a lot sold before it in its own security's units, so the
+    #: row never mixes the target's symbol with the acquirer's count (#1980).
+    reported_quantity: Fraction
     reported_basis: Fraction
     quantity: Fraction
     basis: Fraction
@@ -247,7 +251,7 @@ class _OpenLot:
             cusip=self.cusip,
             trade_at=self.trade_at,
             trade_date_local=self.trade_date_local,
-            quantity=float(self.acquired),
+            quantity=float(self.reported_quantity),
             cost_basis=float(self.reported_basis),
             fill_id=self.fill_id,
             client_order_id=self.client_order_id,
@@ -310,6 +314,7 @@ class _Ledger:
             book_id=book_id,
             position_side=position_side,
             acquired=quantity,
+            reported_quantity=quantity,
             reported_basis=basis,
             quantity=quantity,
             basis=basis,
@@ -418,6 +423,8 @@ class _Ledger:
             if lot.unit_security == security_id and lot.position_side == LONG:
                 lot.quantity *= ratio
                 lot.acquired *= ratio
+                if lot.security_id == security_id:
+                    lot.reported_quantity *= ratio
         self._rescale_disposals(security_id, ratio)
 
     def _rescale_disposals(self, security_id: str, ratio: Fraction) -> None:
@@ -514,6 +521,7 @@ class _Ledger:
         for lot in held:
             lot.security_id, lot.symbol = acquirer, symbol
             lot.cusip = None if asset is None else asset.cusip
+            lot.reported_quantity *= ratio
             lot.identities.add(acquirer)
         self._rekey_disposals(target, acquirer, ratio)
         merged = self.longs.setdefault(acquirer, [])
@@ -925,7 +933,7 @@ def _wash_sale_flags(
         security = disposal_security[disposal.disposal_id]
         sold_here = same_sale[disposal.disposal_id]
         scale = disposal_units[disposal.disposal_id]
-        quantity = _dec(disposal.quantity) * scale
+        quantity = sold_here[disposal.lot_id] * scale
         unmatched = quantity
         for lot in by_acquisition:
             if unmatched == _ZERO:
