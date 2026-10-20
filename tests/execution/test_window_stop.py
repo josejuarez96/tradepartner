@@ -44,7 +44,7 @@ from tradepartner.execution.window import (
     override,
     stop,
 )
-from tradepartner.store import schema
+from tradepartner.store import registry, schema
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.delistings import listing_ends_as_of
@@ -127,8 +127,8 @@ def _new_window(
         starting_equity=100_000.0,
         code_version="test",
         started_at=started,
-        frozen_json=_frozen_json(),
-        frozen_sha256="0" * 64,
+        frozen_json=(text := _frozen_json()),
+        frozen_sha256=registry.params_sha256(json.loads(text)),
         known_at=started,
         ingested_at=started,
     )
