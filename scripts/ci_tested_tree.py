@@ -4,7 +4,7 @@
 CI's ``checks-fast`` job runs this on every push to ``main``. A squash merge of a PR whose
 branch already contained ``main`` (``ready_pr.py`` merges it in) produces a commit whose
 tree is exactly the PR head's tree, and that tree already passed the full sharded suite on
-the PR. Running all eight shards again on main adds nothing, so the shards are skipped,
+the PR. Running all ten shards again on main adds nothing, so the shards are skipped,
 but only when every one of these holds:
 
 1. exactly one merged PR into ``main`` has this commit as its ``merge_commit_sha``;
@@ -23,7 +23,7 @@ non-linear history), which is what makes the ancestry in (2) enough.
 
 Usage (CI)::
 
-    GH_TOKEN=... GITHUB_REPOSITORY=owner/repo PYTEST_SHARD_COUNT=8 \\
+    GH_TOKEN=... GITHUB_REPOSITORY=owner/repo PYTEST_SHARD_COUNT=10 \\
         python3 scripts/ci_tested_tree.py <sha>
 
 Standard library only: it runs before ``uv sync`` could matter, on the runner's python3.
