@@ -1818,3 +1818,100 @@ class TestSuccessorChains:
         variant.books[0].positions = {"PRE": 100.0, "POST": 25.0}
         engine._rename_chained(variant, (("PRE", "POST"),))
         assert variant.books[0].positions == {"POST": 125.0}
+
+    def test_spin_off_counts_follow_only_the_chain_known_at_the_step(
+        self, chain_fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        """A held predecessor has one late and one unvalued spin-off after rename.
+
+        The fixture's live 1:1 chain supplies the IDs. The rows remain keyed to the
+        stored predecessor; the book is keyed to the successor. Without that live
+        chain, neither row is entitled to the successor's held sessions.
+        """
+        predecessor, successor = chain_fixture_store.execute(
+            "SELECT predecessor_id, successor_id FROM successor_chains "
+            "WHERE successor_id = '0001000011'"
+        ).fetchone()
+        variant = self._variant()
+        book = variant.books[0]
+        book.positions = {predecessor: 1234.0}
+        book.held_on = {predecessor: {date(2020, 2, 5), date(2020, 2, 6)}}
+        engine._rename_chained(variant, ((predecessor, successor),))
+        late_ex = date(2020, 2, 6)  # held on the prior session, February 5
+        unvalued_ex = date(2020, 2, 7)  # held on the prior session, February 6
+        assert engine._held_before(book, predecessor, late_ex) is False
+        assert engine._held_before(book, predecessor, unvalued_ex) is False
+        assert engine._held_before(book, successor, late_ex) is True
+        assert engine._held_before(book, successor, unvalued_ex) is True
+        unvalued = pl.DataFrame({"security_id": [predecessor], "ex_date": [unvalued_ex]})
+        late = pl.DataFrame({"security_id": [predecessor], "ex_date": [late_ex]})
+        expected_missing = {"n_spin_offs_unvalued": 0, "n_late_spin_offs": 0}
+        expected_live = {"n_spin_offs_unvalued": 1, "n_late_spin_offs": 1}
+        assert (
+            engine._spin_off_counts(book, date(2020, 2, 5), unvalued_ex, (unvalued, late), ())
+            == expected_missing
+        )
+        live = ((predecessor, successor),)
+        assert (
+            engine._spin_off_counts(book, date(2020, 2, 5), unvalued_ex, (unvalued, late), live)
+            == expected_live
+        )
+
+    def test_a_renamed_parent_counts_both_spin_off_rows_in_the_run(self) -> None:
+        """The chain arrives at T2, after the held parent's ex-dates at T1/T2."""
+        predecessor, successor = "PRE", "POST"
+        prices = pl.concat(
+            [
+                _price_rows()
+                .filter(pl.col("security_id") == "A")
+                .with_columns(pl.lit(sid).alias("security_id"))
+                for sid in (predecessor, successor)
+            ]
+        )
+        unvalued = pl.DataFrame(
+            {
+                "security_id": [predecessor],
+                "child": ["CHILD"],
+                "ex_date": [date(2024, 3, 15)],
+                "reason": ["no_child_close"],
+                "known_at": [session_close(date(2024, 3, 20))],
+            },
+            schema_overrides={"known_at": pl.Datetime("us", "UTC")},
+        )
+        late = pl.DataFrame(
+            {
+                "security_id": [predecessor],
+                "ex_date": [date(2024, 2, 15)],
+                "ratio_or_amount": [0.5],
+                "known_at": [session_close(date(2024, 3, 5))],
+            },
+            schema_overrides={"known_at": pl.Datetime("us", "UTC")},
+        )
+
+        class _StepChainProvider(FakeProvider):
+            def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+                self._record("chains", t)
+                return ((predecessor, successor),) if t >= read_time(T2) else ()
+
+            def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+                # StoreProvider's adjusted read can report a raw predecessor parent
+                # for the requested successor; keep that raw ID in this fake row.
+                wanted = [*ids, predecessor] if successor in ids else ids
+                return super().unvalued_spin_offs(t, wanted)
+
+        provider = _StepChainProvider(
+            prices=prices,
+            members={T0: [predecessor], T1: [predecessor], T2: [successor]},
+            benchmarks={},
+            unvalued_spin_offs_rows=unvalued,
+            late_spin_offs_rows=late,
+        )
+        settings = _params(
+            strategy={"top_fraction": 1.0},
+            costs={"per_side_bps": 0.0},
+            adjust={"apply_spin_offs": True},
+        )
+        result = _run(provider, settings, end=T2, levels=[0.0])[0.0]
+        assert [row.n_targets for row in result.rebalances] == [1, 1]
+        assert [row.counts["n_spin_offs_unvalued"] for row in result.rebalances] == [0, 1]
+        assert [row.counts["n_late_spin_offs"] for row in result.rebalances] == [0, 1]
