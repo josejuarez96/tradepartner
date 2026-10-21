@@ -89,6 +89,13 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   (`store/dividend_reviews.csv`) with an ex-date on or before `--to`, counts
   the later ones deferred, and lists every stale entry (a dry run exits 1 on
   any; a real run refuses).
+- `tradepartner action-retract --security <id> --action-id <source id>
+  --reason <text> [--reinstate] (--dry-run | --expect-known-at <iso>)` runs
+  `action_retract.retract_action` (#2092, data-foundation plan T262): it
+  withdraws one stored corporate action the source withdrew (or reinstates
+  it) as a `cancelled` revision known at the clock, never back-dated. The dry
+  run prints the latest revision and the `--expect-known-at` a real run needs;
+  a real run refuses (exit 1, nothing written) on any other latest revision.
 - `tradepartner delete-master-rows --manifest <csv> --release <name>
   [--dry-run]` runs `repair.delete_master_rows` (#1682 lever B,
   data-foundation plan T191): it deletes the reviewed manifest's never-true
@@ -379,6 +386,7 @@ import httpx
 import polars as pl
 import typer
 
+from tradepartner.action_retract import retract_action
 from tradepartner.adapters import alpaca_raw, edgar_raw
 from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
 from tradepartner.adapters.broker import Broker
@@ -2421,6 +2429,71 @@ def make_app(
         if result.stale:
             raise _fail(
                 f"{len(result.stale)} stale list entries: re-review them before a real run", 1
+            )
+
+    @app.command("action-retract")
+    def action_retract_(
+        security: Annotated[str, typer.Option(help="the action's security_id")],
+        action_id: Annotated[
+            str, typer.Option(help="the source's action id (a spin-off's: its parent)")
+        ],
+        reason: Annotated[
+            str | None, typer.Option(help="why it is withdrawn or reinstated (required)")
+        ] = None,
+        reinstate: Annotated[bool, typer.Option(help="make a withdrawn action live again")] = False,
+        dry_run: Annotated[
+            bool, typer.Option(help="show the latest revision and change nothing")
+        ] = False,
+        expect_known_at: Annotated[
+            str | None,
+            typer.Option(help="the dry run's latest known_at (required to write)"),
+        ] = None,
+    ) -> None:
+        """Withdraw a corporate action the source withdrew, from now on (#2092)."""
+        if _blank_text(reason):
+            raise _fail("pass --reason: why the action is withdrawn or reinstated", USAGE_ERROR)
+        assert reason is not None
+        expected: datetime | None = None
+        if not dry_run:
+            if expect_known_at is None:
+                raise _fail(
+                    "run --dry-run first, then pass its latest known_at as --expect-known-at",
+                    USAGE_ERROR,
+                )
+            try:
+                expected = datetime.fromisoformat(expect_known_at)
+            except ValueError:
+                raise _fail(
+                    f"--expect-known-at {expect_known_at!r} is not an ISO datetime", USAGE_ERROR
+                ) from None
+            if expected.tzinfo is None:
+                raise _fail(f"--expect-known-at {expect_known_at!r} has no UTC offset", USAGE_ERROR)
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            result = retract_action(
+                s,
+                security_id=security,
+                source_action_id=action_id,
+                reason=reason,
+                reinstate=reinstate,
+                clock=clock,
+                dry_run=dry_run,
+                expect_known_at=expected,
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RepairRefused as exc:
+            raise _fail(f"refused: {exc}", 1) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+        typer.echo(result.summary())
+        if dry_run:
+            flag = " --reinstate" if reinstate else ""
+            typer.echo(
+                f"to write it: action-retract --security {security} --action-id {action_id}"
+                f"{flag} --reason ... --expect-known-at {result.latest_known_at.isoformat()}"
             )
 
     @app.command("delete-master-rows")
