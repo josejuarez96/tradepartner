@@ -15,7 +15,7 @@ from typing import Any, cast
 import duckdb
 import polars as pl
 import pytest
-from conftest import load_universe_fixtures
+from conftest import load_chain_overlay, load_universe_fixtures
 from polars.testing import assert_frame_equal
 
 from backtest.fake_provider import FakeProvider
@@ -1857,15 +1857,120 @@ class TestSuccessorChains:
             == expected_live
         )
 
-    def test_a_renamed_parent_counts_both_spin_off_rows_in_the_run(self) -> None:
-        """The chain arrives at T2, after the held parent's ex-dates at T1/T2."""
-        predecessor, successor = "PRE", "POST"
+    def test_spin_off_counts_follow_two_live_hops_without_look_ahead(self) -> None:
+        """A's two rows count under C only once both chain hops are live."""
+        book = self._variant().books[0]
+        book.held_on = {"C": {date(2020, 2, 5), date(2020, 2, 6)}}
+        late = pl.DataFrame({"security_id": ["A"], "ex_date": [date(2020, 2, 6)]})
+        unvalued = pl.DataFrame({"security_id": ["A"], "ex_date": [date(2020, 2, 7)]})
+        start, end = date(2020, 2, 5), date(2020, 2, 7)
+        one_hop = (("A", "B"),)
+        two_hops = (*one_hop, ("B", "C"))
+        assert engine._spin_off_held_ids(("C",), one_hop) == ("C",)
+        assert engine._spin_off_counts(book, start, end, (unvalued, late), one_hop) == {
+            "n_spin_offs_unvalued": 0,
+            "n_late_spin_offs": 0,
+        }
+        assert engine._spin_off_held_ids(("C",), two_hops) == ("A", "B", "C")
+        assert engine._spin_off_counts(book, start, end, (unvalued, late), two_hops) == {
+            "n_spin_offs_unvalued": 1,
+            "n_late_spin_offs": 1,
+        }
+        # When both hops arrive together, the engine's one-hop rename leaves B held.
+        book.held_on = {"B": {date(2020, 2, 5), date(2020, 2, 6)}}
+        assert engine._spin_off_held_ids(("B",), two_hops) == ("A", "B")
+        assert engine._spin_off_counts(book, start, end, (unvalued, late), two_hops) == {
+            "n_spin_offs_unvalued": 1,
+            "n_late_spin_offs": 1,
+        }
+
+    def test_spin_off_parent_cycle_does_not_follow_forever(self) -> None:
+        book = self._variant().books[0]
+        book.held_on = {"C": {date(2020, 2, 5)}}
+        cycle = (("A", "B"), ("B", "A"))
+        late = pl.DataFrame({"security_id": ["A"], "ex_date": [date(2020, 2, 6)]})
+        empty = pl.DataFrame(schema={"security_id": pl.String, "ex_date": pl.Date})
+        assert engine._spin_off_held_ids(("C",), cycle) == ("C",)
+        assert (
+            engine._spin_off_counts(book, date(2020, 2, 5), date(2020, 2, 6), (empty, late), cycle)[
+                "n_late_spin_offs"
+            ]
+            == 0
+        )
+
+    @pytest.mark.usefixtures("_no_env_file")
+    def test_late_chained_spin_off_reads_from_temp_store(self, fixture_store_path: Path) -> None:
+        """The real provider selects the predecessor's late action after rename."""
+        conn = duckdb.connect(str(fixture_store_path))
+        try:
+            load_chain_overlay(conn)
+            predecessor, successor = "0001000010", "0001000011"
+            known = session_close(date(2020, 2, 7))
+            insert_row(
+                conn,
+                "corporate_actions",
+                {
+                    "security_id": "CHAIN_SPIN_CHILD",
+                    "action_type": "spinoff",
+                    "ex_date": date(2020, 2, 6),
+                    "ratio_or_amount": 0.5,
+                    "announced_at": None,
+                    "source_action_id": predecessor,
+                    "cancelled": False,
+                    "known_at": known,
+                    "ingested_at": known,
+                    "source": "alpaca",
+                    "provenance": "action",
+                },
+            )
+            settings = _params(adjust={"apply_spin_offs": True})
+            # StoreProvider validates a registered trial handle on construction.
+            hypothesis = registry.register_hypothesis(
+                conn,
+                slug="h-chain-late-spin",
+                family="momentum",
+                title="late chained spin off",
+                doc_path="docs/hypotheses/h-chain-late-spin.md",
+                doc_sha256="0" * 64,
+                params={"costs.per_side_bps": 15.0},
+                in_sample_start=date(2020, 1, 31),
+                holdout_start=date(2021, 1, 1),
+                holdout_end=date(2022, 1, 1),
+                registered_by="test",
+                settings=settings,
+            )
+            handle = registry.open_trial(
+                conn,
+                hypothesis_id=hypothesis.hypothesis_id,
+                kind="in_sample",
+                start_session=date(2020, 1, 31),
+                end_session=date(2020, 2, 28),
+                data_cutoff=session_close(date(2020, 2, 28)),
+                synthetic=True,
+                run_by="test",
+                settings=settings,
+            )
+            connect = _lend(conn)
+            with StoreProvider(connect, handle, settings, registry_connect=connect) as provider:
+                chains = provider.chains(known)
+                assert (predecessor, successor) in chains
+                ids = engine._spin_off_held_ids((successor,), chains)
+                assert predecessor in ids
+                late = provider.late_spin_offs(session_close(date(2020, 2, 6)), known, ids)
+            assert late.select("security_id", "ex_date").rows() == [(predecessor, date(2020, 2, 6))]
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize("same_step", [False, True], ids=["separate-steps", "same-step"])
+    def test_a_two_hop_parent_counts_both_spin_off_rows_in_the_run(self, same_step: bool) -> None:
+        """Both rows count whether the two hops arrive together or separately."""
+        predecessor, middle, successor = "PRE", "MID", "POST"
         prices = pl.concat(
             [
                 _price_rows()
                 .filter(pl.col("security_id") == "A")
                 .with_columns(pl.lit(sid).alias("security_id"))
-                for sid in (predecessor, successor)
+                for sid in (predecessor, middle, successor)
             ]
         )
         unvalued = pl.DataFrame(
@@ -1891,17 +1996,24 @@ class TestSuccessorChains:
         class _StepChainProvider(FakeProvider):
             def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
                 self._record("chains", t)
-                return ((predecessor, successor),) if t >= read_time(T2) else ()
+                first = ((predecessor, middle),)
+                if t >= read_time(T2):
+                    return (*first, (middle, successor))
+                return () if same_step else first
 
             def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
-                # StoreProvider's adjusted read can report a raw predecessor parent
-                # for the requested successor; keep that raw ID in this fake row.
-                wanted = [*ids, predecessor] if successor in ids else ids
+                # The store re-keys this parent to the successor; this fake keeps
+                # the raw predecessor to exercise the count's mapping too.
+                wanted = [*ids, predecessor] if successor in ids or middle in ids else ids
                 return super().unvalued_spin_offs(t, wanted)
 
         provider = _StepChainProvider(
             prices=prices,
-            members={T0: [predecessor], T1: [predecessor], T2: [successor]},
+            members={
+                T0: [predecessor],
+                T1: [predecessor if same_step else middle],
+                T2: [successor],
+            },
             benchmarks={},
             unvalued_spin_offs_rows=unvalued,
             late_spin_offs_rows=late,
