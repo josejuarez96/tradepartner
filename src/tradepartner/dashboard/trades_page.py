@@ -43,17 +43,18 @@ def _slippage_text(row: blotter.BlotterRow) -> str:
 
 
 def _table(data: blotter.SessionBlotter) -> pd.DataFrame:
-    """The seven columns in the design's Trades row."""
+    """Eight columns, with rank present even for orders lacking slippage."""
     return pd.DataFrame(
         [
             {
                 "ticker": row.symbol,
                 "side": row.side,
-                "shares": f"{row.filled_quantity:,.4f}" if row.filled_quantity else "—",
-                "fill price": f"{row.fill_price:,.2f}" if row.fill_price is not None else "—",
+                "shares": row.filled_quantity,
+                "fill price": row.fill_price,
                 "status": row.status,
                 "slippage (bp)": _slippage_text(row),
                 "reason": row.reason or row.decision,
+                "signal rank": row.signal_rank,
             }
             for row in data.rows
         ]
@@ -63,26 +64,26 @@ def _table(data: blotter.SessionBlotter) -> pd.DataFrame:
 def _kpis(data: blotter.SessionBlotter) -> None:
     """Four comparable session measures; summary includes any capped rows."""
     tiles = st.columns(4)
-    tiles[0].metric("Orders", len(data.rows))
-    tiles[1].metric("Filled", sum(row.filled_quantity > 0 for row in data.rows))
+    suffix = " shown" if data.capped else ""
+    tiles[0].metric(f"Orders{suffix}", len(data.rows))
+    tiles[1].metric(f"Filled{suffix}", sum(row.filled_quantity > 0 for row in data.rows))
     notional = sum(
         row.filled_quantity * row.fill_price for row in data.rows if row.fill_price is not None
     )
-    tiles[2].metric("Notional traded", f"{notional:,.2f}")
+    tiles[2].metric(f"Notional traded{suffix}", f"{notional:,.2f}")
     weighted = data.summary.overall.wmean_bp
     tiles[3].metric("Slippage (bp)", f"{weighted:+.2f}" if weighted is not None else "n/a")
 
 
-def _hero(data: blotter.SessionBlotter) -> None:
-    """Slippage bars; the greatest absolute move receives the accent."""
+def _chart_frame(data: blotter.SessionBlotter) -> pd.DataFrame:
+    """One category per order, even when several orders share a ticker."""
     numeric = [row for row in data.rows if row.slippage_bp is not None]
-    if not numeric:
-        return
     largest = max(numeric, key=lambda row: abs(row.slippage_bp or 0.0)).client_order_id
-    frame = pd.DataFrame(
+    return pd.DataFrame(
         [
             {
                 "order": row.client_order_id,
+                "order label": f"{row.symbol} · {row.side} · {row.client_order_id}",
                 "ticker": row.symbol,
                 "side": row.side,
                 "slippage": row.slippage_bp,
@@ -92,6 +93,13 @@ def _hero(data: blotter.SessionBlotter) -> None:
             for row in numeric
         ]
     )
+
+
+def _hero(data: blotter.SessionBlotter) -> None:
+    """Per-order slippage bars; the greatest absolute move receives the accent."""
+    if not any(row.slippage_bp is not None for row in data.rows):
+        return
+    frame = _chart_frame(data)
     palette = theme.palette()
     with st.container(border=True):
         st.subheader("Slippage vs session open (bp)")
@@ -99,7 +107,7 @@ def _hero(data: blotter.SessionBlotter) -> None:
             alt.Chart(frame)
             .mark_bar(cornerRadiusEnd=4)
             .encode(
-                x=alt.X("ticker:N", sort=None, title=None),
+                x=alt.X("order label:N", sort=None, title=None),
                 y=alt.Y("slippage:Q", title="bp · adverse positive"),
                 color=alt.Color(
                     "highlight:N",
@@ -158,7 +166,15 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
     _hero(data)
     with st.container(border=True):
         st.subheader("Orders")
-        st.dataframe(_table(data), hide_index=True)
+        st.dataframe(
+            _table(data),
+            hide_index=True,
+            column_config={
+                "shares": st.column_config.NumberColumn("shares", format="%.4f"),
+                "fill price": st.column_config.NumberColumn("fill price", format="%.2f"),
+                "signal rank": st.column_config.NumberColumn("signal rank", format="%d"),
+            },
+        )
         if data.capped:
             st.caption(
                 f"Showing the newest {_ROW_LIMIT} orders; slippage includes the full session."

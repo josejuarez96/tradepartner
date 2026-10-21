@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -130,7 +131,11 @@ def test_older_session_changes_rows_and_missing_slippage_is_text(
         lambda conn, wid, session, now, limit: (
             _data(_row("NEW", 12.5))
             if session == _NEW
-            else _data(_row("PENDING", None, "pending"), _row("NOBAR", None, "no bar"))
+            else _data(
+                _row("PENDING", None, "pending"),
+                _row("NOBAR", None, "no bar"),
+                _row("NOFILL", None, "no fill"),
+            )
         ),
     )
     at = _app(monkeypatch, path)
@@ -146,10 +151,49 @@ def test_older_session_changes_rows_and_missing_slippage_is_text(
         "status",
         "slippage (bp)",
         "reason",
+        "signal rank",
     ]
-    assert list(table["ticker"]) == ["PENDING", "NOBAR"]
-    assert list(table["slippage (bp)"]) == ["pending", "no bar"]
+    assert list(table["ticker"]) == ["PENDING", "NOBAR", "NOFILL"]
+    assert list(table["slippage (bp)"]) == ["pending", "no bar", "no fill"]
+    assert list(table["signal rank"]) == [2, 2, 2]
+    assert list(table["shares"]) == [0.0, 0.0, 0.0]
     assert not at.get("vega_lite_chart")
+
+
+def test_each_order_has_a_distinct_bar_and_largest_absolute_slippage_is_accented(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = _store(tmp_path / "trades.duckdb")
+    first = _row("AAPL", 12.5)
+    second = replace(first, client_order_id="order-AAPL-sell", side="sell", slippage_bp=-20.0)
+    monkeypatch.setattr(blotter, "sessions", lambda conn, wid: (_NEW,))
+    monkeypatch.setattr(
+        blotter,
+        "session_blotter",
+        lambda conn, wid, session, now, limit: _data(first, second),
+    )
+    at = _app(monkeypatch, path)
+    assert not at.exception
+    frame = trades_page._chart_frame(_data(first, second))
+    assert frame["order label"].is_unique
+    assert list(frame["highlight"]) == [False, True]
+    chart = str(at.get("vega_lite_chart")[0].proto.spec)
+    assert "order label" in chart
+
+
+def test_capped_tiles_label_shown_rows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = _store(tmp_path / "trades.duckdb")
+    monkeypatch.setattr(blotter, "sessions", lambda conn, wid: (_NEW,))
+    monkeypatch.setattr(
+        blotter,
+        "session_blotter",
+        lambda conn, wid, session, now, limit: replace(_data(_row("AAPL", 12.5)), capped=True),
+    )
+    at = _app(monkeypatch, path)
+    assert not at.exception
+    labels = [metric.label for metric in at.metric]
+    assert labels == ["Orders shown", "Filled shown", "Notional traded shown", "Slippage (bp)"]
+    assert any("showing the newest" in caption.value.lower() for caption in at.caption)
 
 
 def test_empty_book_shows_panel_without_chart(
