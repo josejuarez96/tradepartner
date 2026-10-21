@@ -358,3 +358,11 @@ def test_read_scopes_fills_to_session_ids(
     result = blotter.session_blotter(conn, 1, SESSION, AFTER, 1)
     assert [r.client_order_id for r in result.rows] == ["here"]
     assert seen == [{"here"}]
+
+
+def test_malformed_sell_decision_raises_journal_integrity_error(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    order(conn, run(conn), "bad-sell", "sell", reason="exclude_name")
+    with pytest.raises(journal.JournalIntegrityError, match="neither a full exit nor a trim"):
+        blotter.session_blotter(conn, 1, SESSION, AFTER, 10)
