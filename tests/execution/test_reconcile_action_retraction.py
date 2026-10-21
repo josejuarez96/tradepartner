@@ -31,6 +31,7 @@ from execution.test_reconcile_run import (
 )
 from tradepartner.action_retract import retract_action
 from tradepartner.adapters.fake_broker import FakeBroker
+from tradepartner.calendar import next_session, session_close
 from tradepartner.config import Settings
 from tradepartner.errors import ReconciliationError
 from tradepartner.execution.reconcile import MISMATCH, OK
@@ -123,3 +124,33 @@ def test_without_the_cancel_the_next_session_still_halts(
 
     with pytest.raises(ReconciliationError, match="quantity"):
         _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+
+
+def test_a_cancel_written_after_close_s_also_costs_s_plus_1(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The owner acts at 19:00 ET on S, after close(S): S+1's cut close(S) is
+    before the cancel, so S+1 halts too; S+2's cut close(S+1) is after it."""
+    _held_with_a_withdrawn_split(journal_settings, fake, open_window)
+    late = session_close(S) + timedelta(hours=3)
+    retract_action(
+        journal_settings,
+        security_id=SPY,
+        source_action_id=AID,
+        reason="Alpaca withdrew the split",
+        clock=lambda: late,
+        expect_known_at=CUT,
+    )
+    fixed_clock.now = NEXT_MORNING
+    with pytest.raises(ReconciliationError, match="quantity"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+
+    s3 = next_session(S2)
+    fixed_clock.now = datetime.combine(s3, NEXT_MORNING.timetz())
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, session=s3)
+
+    assert result.status == OK
+    assert result.broker_cash == pytest.approx(100_000.0 - 10.0 * PRICE)

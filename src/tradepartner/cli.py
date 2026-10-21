@@ -2454,6 +2454,8 @@ def make_app(
             raise _fail("pass --reason: why the action is withdrawn or reinstated", USAGE_ERROR)
         assert reason is not None
         expected: datetime | None = None
+        if dry_run and expect_known_at is not None:
+            raise _fail("--dry-run and --expect-known-at are exclusive: pass one", USAGE_ERROR)
         if not dry_run:
             if expect_known_at is None:
                 raise _fail(

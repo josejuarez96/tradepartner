@@ -126,6 +126,7 @@ def test_a_dry_run_names_the_latest_revision_and_writes_nothing(store: Settings)
     assert result.dry_run
     assert (result.action_type, result.ex_date, result.ratio_or_amount) == ("split", EX, 2.0)
     assert result.latest_known_at == KNOWN
+    assert "cancelled False" in result.summary()
     assert result.summary().startswith(f"would withdraw {SID} split {AID} ex-date 2026-10-02")
     assert len(_actions(store)) == 1
     assert _runs(store) == []
@@ -317,6 +318,8 @@ def test_the_command_dry_run_then_withdraws(store: Settings) -> None:
     assert dry.output.startswith(f"would withdraw {SID} split {AID}")
     assert f"--expect-known-at {KNOWN.isoformat()}" in dry.output
 
+    both = runner.invoke(app, [*base, *reason, "--dry-run", "--expect-known-at", KNOWN.isoformat()])
+    assert both.exit_code == cli.USAGE_ERROR
     unguarded = runner.invoke(app, [*base, *reason])
     assert unguarded.exit_code == cli.USAGE_ERROR
     assert "--expect-known-at" in unguarded.output

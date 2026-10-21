@@ -55,6 +55,8 @@ class ActionRetraction:
     source_action_id: str
     #: True for a reinstatement, False for a withdrawal.
     reinstate: bool
+    #: The latest revision's stored `cancelled` before the run.
+    cancelled: bool
     action_type: str
     ex_date: date
     ratio_or_amount: float
@@ -73,7 +75,8 @@ class ActionRetraction:
         return (
             f"{verb} {self.security_id} {self.action_type} {self.source_action_id} "
             f"ex-date {self.ex_date.isoformat()} ratio {self.ratio_or_amount!r} "
-            f"(latest revision known at {self.latest_known_at.isoformat()}) "
+            f"(latest revision known at {self.latest_known_at.isoformat()}, "
+            f"cancelled {self.cancelled}) "
             f"from {self.at.isoformat()}"
         )
 
@@ -175,6 +178,7 @@ def retract_action(
             security_id=security_id,
             source_action_id=source_action_id,
             reinstate=reinstate,
+            cancelled=bool(latest["cancelled"]),
             action_type=str(latest["action_type"]),
             ex_date=latest["ex_date"],
             ratio_or_amount=float(latest["ratio_or_amount"]),
