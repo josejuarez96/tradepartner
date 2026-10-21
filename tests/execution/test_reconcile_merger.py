@@ -25,6 +25,7 @@ from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ReconciliationError
+from tradepartner.execution import reconcile_run as reconcile_module
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.reconcile import (
     MERGER_CONFLICT,
@@ -611,6 +612,30 @@ def test_the_bands_proceeds_count_toward_a_row_known_later_inside_its_window(
     assert _open(journal_settings, open_window, S3).mergers == {}
 
 
+def test_stock_merger_known_after_band_removal_gets_no_unchecked_cil_allowance(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The band removed 10 target shares before any receipt was validated.
+    Its later stock merger has zero cash due, so a $100 credit must halt
+    even when no acquirer reference price exists."""
+    _hold(journal_settings, fake, open_window)
+    _delisting(journal_settings, MTUM, KNOWN)
+    _removed(fake)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S).status == OK
+    _merger(journal_settings, known_at=session_close(S), kind="stock", acquirer=SPY)
+    monkeypatch.setattr(reconcile_module, "_reference_prices", lambda *_args, **_kwargs: {})
+
+    assert _open(journal_settings, open_window, S2).mergers == {}
+    fake.extra_cash = 100.0
+    assert [m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S2)] == [
+        "cash"
+    ]
+
+
 def test_a_row_stored_after_its_window_for_a_band_removal_opens_nothing(
     journal_settings: Settings,
     fake: BookedFake,
@@ -889,6 +914,37 @@ def test_stock_and_cash_receipt_and_base_cash_due() -> None:
     ]
 
 
+def test_stock_and_cash_whole_receipt_without_price_halts_before_journaling() -> None:
+    """Ten target shares give five whole shares and 625 cash; even with no
+    fractional due the removal's sale fraction needs an acquirer price."""
+    result = _compare(
+        Ledger(positions={MTUM: HELD}, cash=LEDGER_CASH, through=S),
+        {"SPY": 5.0},
+        LEDGER_CASH + DUE,
+        {MTUM: _merger_open(kind="stock_and_cash", acquirer=SPY, share_ratio=0.5)},
+        reference_prices={MTUM: 100.0},
+    )
+    assert result.status == "mismatch"
+    assert "quantity" in [m.kind for m in result.mismatches]
+    assert result.adjustments == ()
+
+
+def test_same_session_stock_and_cash_cil_is_journaled_separately_from_boot() -> None:
+    """The 675 cash difference is 625 base cash plus a 50 CIL activity;
+    the lot rebuild needs the CIL portion named on the removal row."""
+    cil = CashActivity("merger-cil", "CIL", S, "executed", 50.0, "SPY")
+    result = _compare(
+        Ledger(positions={MTUM: HELD}, cash=LEDGER_CASH, through=S),
+        {"SPY": 2.0},
+        LEDGER_CASH + 675.0,
+        {MTUM: _merger_open(kind="stock_and_cash", acquirer=SPY, share_ratio=0.25)},
+        activities=(cil,),
+    )
+    assert result.status == OK
+    assert result.adjustments[0].merger_terms is not None
+    assert result.adjustments[0].merger_terms["same_session_cil_cash"] == 50.0
+
+
 def test_unpaid_stock_cil_closes_quietly_after_window(
     journal_settings: Settings,
     fake: BookedFake,
@@ -931,6 +987,7 @@ def _compare(
     activities: tuple[CashActivity, ...] = (),
     dividends: dict[str, float] | None = None,
     lagging: tuple[JournalOpenOrder, ...] = (),
+    reference_prices: dict[str, float] | None = None,
 ) -> Reconciliation:
     window = _window()
     at = datetime(2026, 10, 1, 14, tzinfo=UTC)
@@ -942,7 +999,9 @@ def _compare(
         Account(account_id="PA1", cash=cash, buying_power=cash, equity=cash, as_of=at),
         Explanations(
             symbols={MTUM: "MTUM", SPY: "SPY"},
-            reference_prices={MTUM: 100.0, SPY: 100.0},
+            reference_prices=reference_prices
+            if reference_prices is not None
+            else {MTUM: 100.0, SPY: 100.0},
             mergers=mergers,
             activities=activities,
             dividends=dividends or {},

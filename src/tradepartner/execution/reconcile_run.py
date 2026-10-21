@@ -898,14 +898,11 @@ def _mergers(
     first_known = _merger_first_known(conn, cut, sorted({r["security_id"] for r in rows}))
     # A merger's own rows by (acquiree, id), the table's identity.
     own: dict[tuple[str, str], list[AdjustmentRow]] = defaultdict(list)
-    receipts: dict[tuple[str, str], list[AdjustmentRow]] = defaultdict(list)
     band: dict[str, list[AdjustmentRow]] = defaultdict(list)
     for adjustment in state.adjustments:
         merger_id = _merger_id_of(adjustment)
         if merger_id is not None:
             own[(adjustment.security_id or "", merger_id)].append(adjustment)
-            if adjustment.kind == "merger_receipt" and adjustment.security_id is not None:
-                receipts[(adjustment.security_id, merger_id)].append(adjustment)
         elif (
             adjustment.kind == _CORPORATE_ACTION_CASH
             and adjustment.security_id is not None
@@ -953,27 +950,25 @@ def _mergers(
             removed_quantity = -removal.quantity
             rate = row["cash_per_share"] if row["cash_per_share"] is not None else 0.0
             upper_value = removed_quantity * float(rate)
-            if row["kind"] != "cash" and row["acquirer_security_id"] is not None:
-                acquirer = str(row["acquirer_security_id"])
-                receipt_rows = receipts.get((acquirer, merger_id), [])
-                receipt = next((a for a in receipt_rows if a.session == removal.session), None)
-                shares_due = removed_quantity * float(row["share_ratio"])
-                received = (
-                    receipt.quantity
-                    if receipt is not None and receipt.quantity is not None
-                    else 0.0
-                )
-                fractional = max(shares_due - received, 0.0)
-                if fractional > tolerance:
-                    prices = _reference_prices(
-                        conn, _cut(removal.session), [acquirer], previous_session(removal.session)
-                    )
-                    price = prices.get(acquirer)
-                    if price is None:
-                        raise ValueError(
-                            f"merger {merger_id} receipt lacks acquirer reference price"
-                        )
-                    upper_value += fractional * price * (1 + whole_share_price_buffer)
+            if not from_band and row["kind"] != "cash":
+                try:
+                    terms = json.loads(removal.explanation_json or "{}")
+                except (ValueError, TypeError):
+                    terms = {}
+                if isinstance(terms, dict):
+                    fractional = terms.get("fractional_shares")
+                    price = terms.get("acquirer_price")
+                    if (
+                        isinstance(fractional, int | float)
+                        and not isinstance(fractional, bool)
+                        and math.isfinite(fractional)
+                        and fractional > tolerance
+                        and isinstance(price, int | float)
+                        and not isinstance(price, bool)
+                        and math.isfinite(price)
+                        and price > 0
+                    ):
+                        upper_value += fractional * price * (1 + whole_share_price_buffer)
             upper = Decimal(str(upper_value))
             paid = Decimal(str(journaled)) >= upper - bound
             closed = any(

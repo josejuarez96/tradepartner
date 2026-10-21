@@ -511,7 +511,14 @@ class _Ledger:
         terms = _explanation(removal)
         kind = terms.get("merger_kind", "stock")
         removal_cash = _cash(removal)
-        boot = removal_cash if kind == "stock_and_cash" else _ZERO
+        same_session_cil = (
+            _merger_number(terms.get("same_session_cil_cash", 0), removal, "same_session_cil_cash")
+            if kind == "stock_and_cash"
+            else _ZERO
+        )
+        if same_session_cil > removal_cash:
+            raise LotLedgerError(f"merger {_describe(removal)} has CIL above its removal cash")
+        boot = removal_cash - same_session_cil if kind == "stock_and_cash" else _ZERO
         if boot > _ZERO:
             price = _merger_number(terms.get("acquirer_price"), removal, "acquirer_price")
             if price <= _ZERO:
@@ -561,7 +568,7 @@ class _Ledger:
         self.longs[target] = []
         cil_cash = sum(
             (_cash(row) for row in cash_rows if row.quantity is None),
-            removal_cash if kind == "stock" else _ZERO,
+            removal_cash if kind == "stock" else same_session_cil,
         )
         if cil_cash > _ZERO:
             fractional = _merger_number(
@@ -577,7 +584,11 @@ class _Ledger:
                 lot.basis -= basis
                 lot.reported_basis -= basis
                 closed_cil.append((lot, sold, basis))
-            cil_row = next((row for row in reversed(cash_rows) if row.cash), removal)
+            cil_row = max(
+                (row for row in cash_rows if row.quantity is None and row.cash),
+                key=lambda row: (row.session, _adjustment_key(row)),
+                default=removal,
+            )
             self.dispose(
                 closed_cil,
                 lambda sold: cil_cash * sold / fractional,
@@ -830,9 +841,17 @@ def _events(
     removals = _by_merger(window, _CORPORATE_ACTION_CASH, unique=False)
     receipts = _by_merger(window, _MERGER_RECEIPT, unique=True)
     cash_rows: dict[str, list[AdjustmentRow]] = {}
+    quantity_removals = {
+        merger_id
+        for row in window
+        if row.kind == _CORPORATE_ACTION_CASH and row.quantity is not None
+        if (merger_id := _merger_id(row)) is not None
+    }
     for row in window:
         merger_id = _merger_id(row)
         if merger_id is not None and row.kind == _CORPORATE_ACTION_CASH:
+            if row.quantity is None and merger_id not in quantity_removals:
+                raise LotLedgerError(f"merger cash {_describe(row)} has no merger removal row")
             cash_rows.setdefault(merger_id, []).append(row)
     for row in window:
         action = _adjustment_event(row, removals, receipts, cash_rows)

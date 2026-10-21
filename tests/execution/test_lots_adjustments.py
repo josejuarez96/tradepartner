@@ -945,3 +945,53 @@ def test_zero_share_merger_disposes_all_lots_for_removal_and_later_cil_cash() ->
         (4.0, 60.0, -20.0),
         (6.0, 90.0, -30.0),
     ]
+
+
+def test_band_removal_followed_by_merger_cash_holds_back_lots() -> None:
+    """A band removal has no merger id. Later merger cash cannot be dropped:
+    its 150 proceeds would otherwise leave a false 200 loss."""
+    book = Book()
+    book.trade("buy", 10, 20.0, D0303, security_id="SEC_T")
+    book.adjust("corporate_action_cash", D0307, "SEC_T", quantity=-10, cash=0)
+    book.adjust("corporate_action_cash", D0310, "SEC_T", cash=150, explanation=_MERGER)
+
+    with pytest.raises(LotLedgerError, match="no merger removal"):
+        book.run(D0310)
+
+
+def test_same_session_stock_and_cash_cil_sells_fraction_separately() -> None:
+    """Cash 90 contains 60 boot and 30 CIL. With four whole and one
+    fractional share, boot sells 40 basis; CIL then sells 32 carried basis.
+    The four acquirer shares retain 128 basis."""
+    book = Book()
+    book.trade("buy", 10, 20.0, D0303, security_id="SEC_T")
+    terms = {
+        **_MERGER,
+        "merger_kind": "stock_and_cash",
+        "acquirer_price": 60.0,
+        "fractional_shares": 1.0,
+        "same_session_cil_cash": 30.0,
+    }
+    book.adjust("corporate_action_cash", D0307, "SEC_T", quantity=-10, cash=90, explanation=terms)
+    book.adjust("merger_receipt", D0307, "SEC_A", quantity=4, explanation=_MERGER)
+
+    lot_list, disposals, _ = book.run(D0310)
+    assert [(r.quantity, r.cost_basis) for r in _of("SEC_A", lot_list)] == [(4.0, 128.0)]
+    assert [(d.proceeds, d.realised_pnl) for d in disposals] == [(60.0, 20.0), (30.0, -2.0)]
+
+
+def test_later_cil_date_is_independent_of_adjustment_input_order() -> None:
+    """Two later payments of 20 and 30 sell the same half share. The sale
+    is stamped on the latest payment, March 12, whichever row arrived first."""
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303, security_id="SEC_T")
+    terms = {**_MERGER, "merger_kind": "stock", "fractional_shares": 0.5}
+    book.adjust("corporate_action_cash", D0307, "SEC_T", quantity=-10, cash=0, explanation=terms)
+    book.adjust("merger_receipt", D0307, "SEC_A", quantity=2, explanation=_MERGER)
+    book.adjust("corporate_action_cash", D0310, "SEC_T", cash=20, explanation=_MERGER)
+    book.adjust("corporate_action_cash", D0312, "SEC_T", cash=30, explanation=_MERGER)
+
+    first = book.run(D0312)
+    reversed_order = book.run(D0312, adjustments=list(reversed(book.adjustments)))
+    assert first == reversed_order
+    assert first[1][0].trade_date_local == D0312

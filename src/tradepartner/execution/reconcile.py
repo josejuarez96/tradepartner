@@ -808,6 +808,28 @@ def compare(
             Allowed("deferred dividend", amount, name) for name, amount in dividends.items()
         ]
     merger_cap = math.fsum(due.cap for due in dues)
+    cil_symbols: dict[str, set[str]] = {}
+    for merger_due in dues:
+        if merger_due.held is None or merger_due.merger.kind != "stock_and_cash":
+            continue
+        for candidate_name in (merger_due.name, merger_due.merger.acquirer):
+            if candidate_name is not None and candidate_name in explanations.symbols:
+                cil_symbols.setdefault(explanations.symbols[candidate_name], set()).add(
+                    merger_due.merger.merger_id
+                )
+    merger_cil: dict[str, float] = {}
+    for activity in activities:
+        ids = cil_symbols.get(activity.symbol or "", set())
+        if (
+            activity.activity_type == _CASH_IN_LIEU
+            and activity.status == _EXECUTED
+            and activity.net_amount is not None
+            and activity.net_amount > 0
+            and not _inside_base(activity, explanations)
+            and len(ids) == 1
+        ):
+            merger_id = next(iter(ids))
+            merger_cil[merger_id] = merger_cil.get(merger_id, 0.0) + activity.net_amount
     if deferring and dues:
         # A merger's removal and credit while an allowance is open are allowed,
         # never journaled; the next reconciliation without one journals them.
@@ -840,6 +862,7 @@ def compare(
             expected,
             explanations.reference_prices,
             buffer,
+            merger_cil,
         )
         explained += journaled
         mismatches += _merger_final_checks(dues, journaled, cash_bound, explanations.symbols)
@@ -1043,7 +1066,9 @@ def _merger_dues(
                     continue
                 fractional = max(due_shares - receipt, 0.0)
                 price = reference_prices.get(acquirer)
-                if fractional > q_tol and price is None:
+                if (fractional > q_tol or merger.kind == "stock_and_cash") and (
+                    price is None or not math.isfinite(price) or price <= 0
+                ):
                     invalid.append(
                         (
                             name,
@@ -1078,6 +1103,7 @@ def _merger_cash(
     expected: Mapping[str, float],
     reference_prices: Mapping[str, float],
     buffer: float,
+    merger_cil: Mapping[str, float],
 ) -> tuple[bool, list[ProposedAdjustment]]:
     """Whether the cash difference is explained with open mergers present, and
     the rows it journals (#1762 items 2 and 4). The mergers read the cash left
@@ -1122,7 +1148,7 @@ def _merger_cash(
             left = rest - take
             if not -bound <= left <= top + bound:
                 continue
-            rows = _merger_adjustments(dues, float(take))
+            rows = _merger_adjustments(dues, float(take), merger_cil)
             if removed:
                 proceeds = float(min(max(left, Decimal(0)), band_cap))
                 rows += _ended_adjustments(removed, expected, value, proceeds)
@@ -1146,7 +1172,9 @@ def _merger_cash(
     return False, []
 
 
-def _merger_adjustments(dues: Sequence[_MergerDue], take: float) -> list[ProposedAdjustment]:
+def _merger_adjustments(
+    dues: Sequence[_MergerDue], take: float, merger_cil: Mapping[str, float]
+) -> list[ProposedAdjustment]:
     """The rows the mergers journal: `take` shared in order, each up to its cap;
     a removal always (its quantity, whatever cash it took), a payment only when
     it took cash."""
@@ -1165,6 +1193,11 @@ def _merger_adjustments(dues: Sequence[_MergerDue], take: float) -> list[Propose
                     acquirer_price=due.reference_price,
                     fractional_shares=max(due.held * merger.share_ratio - due.receipt, 0.0),
                 )
+                if merger.kind == "stock_and_cash":
+                    terms["same_session_cil_cash"] = min(
+                        cash,
+                        max(merger_cil.get(merger.merger_id, 0.0), cash - due.lower),
+                    )
             rows.append(
                 ProposedAdjustment(
                     "corporate_action_cash",
