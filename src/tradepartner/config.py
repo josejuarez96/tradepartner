@@ -1510,9 +1510,7 @@ class PortfolioConfig(_ClosedConfig):
 
     The section is listed by no family and is a post-registration section under the
     2026-10-09 and #1792 rules, so every key is left out of the canonical set and the
-    fingerprint at its default and no stored registration moves. Until the engine reads
-    all five (T223) `_refuse_until_wired` refuses any non-default value, the #1788
-    guard, so no `long_short` trial can run on a half-built engine.
+    fingerprint at its default and no stored registration moves.
     """
 
     side: Literal["long_only", "long_short"] = "long_only"
@@ -1522,28 +1520,9 @@ class PortfolioConfig(_ClosedConfig):
     short_cover_weight: float = Field(default=0.10, gt=0, le=1.0)
 
     @model_validator(mode="after")
-    def _refuse_until_wired(self) -> PortfolioConfig:
-        """The #1788 guard (T209a, T217): the engine reads none of the five until T223,
-        so a non-default value would name a book no run builds. T223 removes this."""
-        for name in (
-            "side",
-            "gross_exposure",
-            "net_exposure",
-            "short_min_price",
-            "short_cover_weight",
-        ):
-            value = getattr(self, name)
-            if value != PortfolioConfig.model_fields[name].default:
-                raise ValueError(
-                    f"portfolio.{name} = {value!r} is not wired until T223: the engine "
-                    "still builds a long-only book"
-                )
-        return self
-
-    @model_validator(mode="after")
     def _validate_exposures(self) -> PortfolioConfig:
         """`net_exposure` in `[-gross, gross]`, equal to `gross_exposure` under
-        `long_only` (spec item 1). Live once T223's guard goes."""
+        `long_only` (spec item 1)."""
         if not (-self.gross_exposure <= self.net_exposure <= self.gross_exposure):
             raise ValueError(
                 f"portfolio.net_exposure ({self.net_exposure}) must be in "

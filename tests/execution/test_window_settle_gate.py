@@ -4,6 +4,7 @@ req 17, #571; plan T84b). The fixtures are `test_window_settle.py`'s."""
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -33,7 +34,7 @@ from tradepartner.adapters.fake_broker import (
     SetPosition,
     Vanish,
 )
-from tradepartner.errors import ClockError
+from tradepartner.errors import ClockError, SystemFaultError
 from tradepartner.execution.resume import RELEASED, resume
 from tradepartner.execution.window import (
     ACCOUNT_MISMATCH,
@@ -105,6 +106,35 @@ def test_a_fill_of_the_order_the_journal_lacks_is_refused_unjournaled_fill(s: Se
     s.engage()
     message = s.refused(UNJOURNALED_FILL, "tp-a")
     assert "fake-fill-1" in message
+
+
+@pytest.mark.parametrize("changed", [{"quantity": 9.5}, {"price": 101.0}])
+def test_a_known_fill_read_back_with_changed_terms_halts_before_settle(
+    s: Settle, changed: dict[str, float]
+) -> None:
+    s.held()
+    s.place("tp-a")
+    s.fake.apply("tp-a", Vanish())
+    s.engage()
+    before = s.counts()
+    s.fake._fills[0] = replace(s.fake._fills[0], **changed)
+
+    with pytest.raises(SystemFaultError, match=r"broker fill fake-fill-1 reads"):
+        s.settle("tp-a")
+
+    assert s.counts() == before
+    assert s.query("SELECT quantity, price FROM fills WHERE broker_fill_id = 'fake-fill-1'") == [
+        (10.0, 100.0)
+    ]
+
+
+def test_a_known_fill_read_back_unchanged_allows_settle(s: Settle) -> None:
+    s.held()
+    s.place("tp-a")
+    s.fake.apply("tp-a", Vanish())
+    s.engage()
+
+    assert not s.settle("tp-a").reset
 
 
 # --- (3) no unexplained position -------------------------------------------------------------
