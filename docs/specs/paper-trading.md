@@ -283,7 +283,7 @@ The paper vehicle is the registered H1 (long-only 12-1 momentum, top decile equa
    - *Equity while `.WI`.* The ledger does not hold the child, but the parent's close has already dropped by the child's value, so the ledger's equity (`marks.py`) is understated by about parent quantity × ratio × the child's price.
      - That equity is read by the drawdown switch (`switch.drawdown_peak` and its rule), by the rebalance's sizing, by `positions_daily` and by req 10's tracking report.
      - A large enough spin-off can therefore engage the drawdown switch. That fails closed.
-     - This rule does not re-derive the marks of those sessions after the receipt. The dip stays in the record, and the alert row's `Allowed` entry names its cause.
+     - This rule does not re-derive the marks of those sessions after the receipt. The dip stays in the record, and the reconciliation row's `Allowed` entry names its cause.
      - Before this amendment, the book halted in this state instead.
    - *Why it is not journaled.* A journaled receipt is a ledger position under `X`. `exits.forced_exits` would then sell it whole as `untargeted_receipt` by sending an order for `X`, a symbol the broker does not hold. That order is rejected, or on a margin account it opens a short. The rule fails closed instead: once the broker holds the child regular-way as `X`, the next reconciliation journals the receipt by #2033 item 2, once.
    - *Outside the band.* A wrong quantity is still `broker_only_position`.
