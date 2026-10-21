@@ -312,7 +312,7 @@ why = "The acceptance criteria every Phase 2 task answers to."
 [spec.paper-trading]
 what = "What Phase 4 builds and how we know it is done: the risk-gated broker wrapper, the Alpaca paper adapter, the scheduled tracking run, the journal, the operations and override pages, alerts and the wash-sale lot ledger."
 why = "The acceptance criteria every Phase 4 task answers to; a passed paper shakedown under these rules (ADR 0017) is the MVP's finish line, with the tracking check reported per book."
-unblocks = ["phase:4"]
+unblocks = ["phase:4", "task:T263"]
 
 [spec.strategy-lab]
 what = "What the strategy lab builds and how we know it is done: sweeps registered from one file as grids of variants, cadence as a frozen hypothesis parameter, and the storage and compute rules for thousands of trials (the shadow-paper replay is deferred to a follow-up spec)."
@@ -965,7 +965,7 @@ unblocks = ["task:T71b", "task:T163"]
 [task.T163]
 what = "The Phase 6 ADR: one live book through a per-book endpoint while the global alpaca.paper guard stays true, with separate keys, settled cash, frozen stops and a strategy chosen by its own exam."
 why = "Nothing in ADR 0017 enables live orders; real money needs a reviewed book-specific record after the shakedown, kill-ladder and cash-account gates."
-unblocks = ["adr:0025", "task:T163b", "task:T163c", "task:T263", "task:T264", "task:T265", "phase:6"]
+unblocks = ["adr:0025", "task:T163b", "task:T163c", "task:T264", "task:T265", "phase:6"]
 
 [task.T163b]
 what = "The per-book live switch: default-off owner enable, separate live keys and broker facts, and independent checks in the broker factory and both adapters."
@@ -1359,7 +1359,7 @@ unblocks = ["research:2026-10-10-beyond-long-only", "phase:6"]
 [adr.0025]
 what = "One guarded live book on a taxable cash account, selected from kill-ladder survivors by exam of record and tracking evidence after the shakedown."
 why = "The live switch and settled-cash build need one frozen strategy choice, endpoint boundary, stop rule and tax entry gate before a real order."
-unblocks = ["task:T163b", "task:T163c", "task:T263", "task:T264", "task:T265", "phase:6"]
+unblocks = ["task:T163b", "task:T163c", "task:T264", "task:T265", "phase:6"]
 
 [task.T200]
 what = "A1: the raw trading client retries 5xx and connection errors with bounded backoff and the duplicate read-back by client_order_id before any re-send."
