@@ -898,6 +898,14 @@ def all_fill_ids(conn: duckdb.DuckDBPyConnection) -> frozenset[str]:
     return frozenset(row[0] for row in conn.execute("SELECT broker_fill_id FROM fills").fetchall())
 
 
+def all_fill_terms(conn: duckdb.DuckDBPyConnection) -> dict[str, tuple[float, float]]:
+    """Every journaled `broker_fill_id`'s (quantity, price), superseded rows included:
+    the collectors' check that a known fill reads back unchanged (#2149)."""
+    require_journal(conn)
+    rows = conn.execute("SELECT broker_fill_id, quantity, price FROM fills").fetchall()
+    return {row[0]: (float(row[1]), float(row[2])) for row in rows if row[0] is not None}
+
+
 # --- Readers (plan T49c) -------------------------------------------------------------
 #
 # Reads only. Every reader calls `require_journal` first, so a version-4 store

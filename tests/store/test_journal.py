@@ -136,7 +136,7 @@ def test_fills_is_selected_only_inside_the_accessor_and_all_fill_ids() -> None:
         if isinstance(node, ast.Expr | ast.Assign)
         and isinstance(getattr(node, "value", None), ast.Constant)
     ]
-    assert readers == {"fills_for", "all_fill_ids"}
+    assert readers == {"fills_for", "all_fill_ids", "all_fill_terms"}
     assert not any(
         re.search(r"\b(FROM|JOIN)\s+fills\b", str(getattr(c, "value", ""))) for c in top_level
     )
