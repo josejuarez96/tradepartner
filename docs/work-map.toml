@@ -963,17 +963,34 @@ why = "This is the Phase 4 exit and the Phase 6 entry: the machine shown ready b
 unblocks = ["task:T71b", "task:T163"]
 
 [task.T163]
-what = "The Phase 6 ADR: the live book as one more book on the live endpoint, the guard lifted for that book only, live keys, settled cash, the stop criteria frozen into its window, and which strategy goes live from its exam of record."
-why = "Nothing in ADR 0017 lifts the alpaca.paper guard; real money needs its own record, after the shakedown and the compliance, stop-criteria and cash-account gates."
-unblocks = ["adr:0025", "task:T163b", "task:T163c", "phase:6"]
+what = "The Phase 6 ADR: one live book through a per-book endpoint while the global alpaca.paper guard stays true, with separate keys, settled cash, frozen stops and a strategy chosen by its own exam."
+why = "Nothing in ADR 0017 enables live orders; real money needs a reviewed book-specific record after the shakedown, kill-ladder and cash-account gates."
+unblocks = ["adr:0025", "task:T163b", "task:T163c", "task:T263", "task:T264", "task:T265", "phase:6"]
 
 [task.T163b]
-what = "The live switch for one named book: the guard, the live key names, a paper=False client behind that book's config and a second guard in the adapter, broker facts recorded on the live endpoint."
+what = "The per-book live switch: default-off owner enable, separate live keys and broker facts, and independent checks in the broker factory and both adapters."
 why = "The first live order goes through the same wrapper and journal as paper; only the endpoint and the keys differ, and both are guarded twice."
+unblocks = ["task:T264", "task:T265", "phase:6"]
 
 [task.T163c]
-what = "A settled-cash read for the buys phase of a cash account, so the live book never buys with unsettled sale proceeds."
+what = "A verified settled-cash bound at live start and every buys phase, plus a pinned long-only refusal."
 why = "The live account is a taxable cash account (#813) while paper is margin; buying on unsettled proceeds is a good-faith violation the paper book can never show."
+unblocks = ["task:T264", "task:T265", "phase:6"]
+
+[task.T263]
+what = "Freeze T+1 cash settlement into a newly registered live-eligible hypothesis, its exam and its tracking trial."
+why = "A live residual can stop real orders only if its own examined backtest accounts for cash that cannot be reused on the sale day."
+unblocks = ["task:T264", "phase:6"]
+
+[task.T264]
+what = "Add tracking as a kill-switch source and engage it automatically when the live book breaches its frozen residual bound."
+why = "ADR 0005's Live stop must halt orders in code, not only appear in a report."
+unblocks = ["phase:6"]
+
+[task.T265]
+what = "Carry taxable live lots across windows and refuse start until the successor-security policy and adviser confirmation are recorded."
+why = "The first taxable order must not begin a ledger that loses basis or misses a replacement in a later window."
+unblocks = ["phase:6"]
 
 
 [issue.1506]
@@ -1342,7 +1359,7 @@ unblocks = ["research:2026-10-10-beyond-long-only", "phase:6"]
 [adr.0025]
 what = "One guarded live book on a taxable cash account, selected from kill-ladder survivors by exam of record and tracking evidence after the shakedown."
 why = "The live switch and settled-cash build need one frozen strategy choice, endpoint boundary, stop rule and tax entry gate before a real order."
-unblocks = ["task:T163b", "task:T163c", "phase:6"]
+unblocks = ["task:T163b", "task:T163c", "task:T263", "task:T264", "task:T265", "phase:6"]
 
 [task.T200]
 what = "A1: the raw trading client retries 5xx and connection errors with bounded backoff and the duplicate read-back by client_order_id before any re-send."
