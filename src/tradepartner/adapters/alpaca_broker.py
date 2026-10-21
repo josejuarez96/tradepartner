@@ -635,6 +635,16 @@ def _fold_correction(activity: Mapping[str, Any], fills: list[Fill], order_ids: 
             f"fill correction {activity['id']!r} of order {order_id!r} has no earlier fill"
         )
     corrected = fills[index]
+    if activity["symbol"] != corrected.symbol:
+        raise ValueError(
+            f"fill correction {activity['id']!r} symbol {activity['symbol']!r} "
+            f"disagrees with {corrected.symbol!r}"
+        )
+    if activity["side"] != corrected.side.value:
+        raise ValueError(
+            f"fill correction {activity['id']!r} side {activity['side']!r} "
+            f"disagrees with {corrected.side.value!r}"
+        )
     if price != corrected.price:
         raise ValueError(
             f"fill correction {activity['id']!r} at {price} corrects a fill at {corrected.price}"
