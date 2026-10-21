@@ -307,6 +307,7 @@ def test_page_is_in_the_shell_navigation(
         "Trial registry",
         "Research",
         _PAGE,
+        "Trades",
         "Performance",
         "Override",
     ]

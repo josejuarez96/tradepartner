@@ -217,6 +217,7 @@ def test_render_ok_state_shows_navigation_and_placeholder_page(
         "Trial registry",
         "Research",
         "Operations",
+        "Trades",
         "Performance",
         "Override",
     ]
