@@ -17,6 +17,14 @@ from tradepartner.store.journal import DecisionRow, OrderedFill, OrderEventRow, 
 _NEW_YORK = ZoneInfo("America/New_York")
 
 
+def _full_exit(decision: DecisionRow) -> bool:
+    """`is_full_exit`, with a malformed sell reported as a journal integrity error."""
+    try:
+        return is_full_exit(decision)
+    except ValueError as exc:
+        raise journal.JournalIntegrityError(str(exc)) from exc
+
+
 @dataclass(frozen=True)
 class BlotterRow:
     """One journaled order and its live execution and plan details."""
@@ -195,7 +203,7 @@ def session_blotter(
             fills_by_id.get(order.client_order_id, []),
             events_by_id.get(order.client_order_id, []),
             (decisions[order.decision_id].decision, decisions[order.decision_id].reason),
-            None if is_full_exit(decisions[order.decision_id]) else ranks.get(order.decision_id),
+            None if _full_exit(decisions[order.decision_id]) else ranks.get(order.decision_id),
             opens,
             now,
         )
