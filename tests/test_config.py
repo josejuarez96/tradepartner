@@ -1845,6 +1845,8 @@ def test_alpaca_trading_defaults() -> None:
     assert a.trading_requests_per_minute == pytest.approx(150.0)
     assert a.trading_request_timeout_seconds == pytest.approx(30.0)
     assert a.trading_max_retries == 3
+    assert a.trading_retry_backoff_seconds == pytest.approx(1.0)
+    assert a.trading_retry_backoff_max_seconds == pytest.approx(8.0)
     # Broker facts the recording task (T48b) set: 9 decimals, accepted and filled
     # on paper (tests/fixtures/alpaca/paper/buy_fractional.json, flatten.json);
     # 128 characters, Alpaca's documented `client_order_id` limit.
@@ -1883,6 +1885,10 @@ def test_alpaca_broker_facts_may_still_be_unset() -> None:
         {"trading_requests_per_minute": 0},
         {"trading_request_timeout_seconds": 0},
         {"trading_max_retries": -1},
+        {"trading_retry_backoff_seconds": 0},
+        {"trading_retry_backoff_max_seconds": 0},
+        {"trading_retry_backoff_seconds": float("inf")},
+        {"trading_retry_backoff_max_seconds": float("inf")},
         {"quantity_decimals": -1},
         {"client_order_id_max_length": 0},
         {"trading_request_timeout_seconds": float("inf")},
