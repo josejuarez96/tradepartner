@@ -258,6 +258,7 @@ class _MergerDue:
     cap: float
     lower: float
     receipt: float | None = None
+    reference_price: float | None = None
 
 
 @dataclass(frozen=True)
@@ -351,6 +352,8 @@ class ProposedAdjustment:
     #: The merger id a merger's `corporate_action_cash` row names (#1762, T249);
     #: None for every other row, and then left out of `mismatches_json`.
     merger_id: str | None = None
+    #: Point-in-time merger terms carried into the lot journal (#2151).
+    merger_terms: Mapping[str, object] | None = None
 
 
 def _adjustment_json(adjustment: ProposedAdjustment) -> dict[str, object]:
@@ -358,6 +361,8 @@ def _adjustment_json(adjustment: ProposedAdjustment) -> dict[str, object]:
     entry = dict(vars(adjustment))
     if entry.get("merger_id") is None:
         entry.pop("merger_id", None)
+    if entry.get("merger_terms") is None:
+        entry.pop("merger_terms", None)
     return entry
 
 
@@ -893,7 +898,7 @@ def compare(
         allowed.append(Allowed("cash within the open allowances", float(difference_decimal)))
 
     if deferring:
-        for adjustment in [a for a in explained if a.kind in ("spinoff_receipt", "merger_receipt")]:
+        for adjustment in [a for a in explained if a.kind == "spinoff_receipt"]:
             allowed.append(
                 Allowed(
                     "deferred spin-off receipt", adjustment.quantity or 0.0, adjustment.security_id
@@ -1020,7 +1025,13 @@ def _merger_dues(
                     continue
                 receipt = broker.get(acquirer, 0.0) - expected.get(acquirer, 0.0)
                 due_shares = held * _finite(ratio, f"share ratio of merger {merger.merger_id}")
-                if not (q_tol < receipt <= due_shares + q_tol and receipt > due_shares - 1 - q_tol):
+                if abs(receipt) <= q_tol:
+                    receipt = 0.0
+                if not (
+                    0 <= receipt <= due_shares + q_tol
+                    and receipt > due_shares - 1 - q_tol
+                    and (receipt > 0 or due_shares < 1)
+                ):
                     invalid.append(
                         (
                             name,
@@ -1042,7 +1053,11 @@ def _merger_dues(
                     )
                     continue
                 upper += fractional * (price or 0.0) * (1 + buffer)
-            dues.append(_MergerDue(name, merger, held, upper, upper, held * rate, receipt))
+            dues.append(
+                _MergerDue(
+                    name, merger, held, upper, upper, held * rate, receipt, price if stock else None
+                )
+            )
         else:
             removed = _finite(merger.removed_quantity, f"removed quantity of {merger.merger_id}")
             journaled = _finite(merger.journaled_cash, f"journaled cash of {merger.merger_id}")
@@ -1142,6 +1157,14 @@ def _merger_adjustments(dues: Sequence[_MergerDue], take: float) -> list[Propose
         left -= cash
         merger = due.merger
         if due.held is not None:
+            terms: dict[str, object] = {"merger_kind": merger.kind}
+            if due.receipt is not None and merger.share_ratio is not None:
+                terms.update(
+                    acquirer_security_id=merger.acquirer,
+                    share_ratio=merger.share_ratio,
+                    acquirer_price=due.reference_price,
+                    fractional_shares=max(due.held * merger.share_ratio - due.receipt, 0.0),
+                )
             rows.append(
                 ProposedAdjustment(
                     "corporate_action_cash",
@@ -1150,9 +1173,10 @@ def _merger_adjustments(dues: Sequence[_MergerDue], take: float) -> list[Propose
                     cash,
                     f"merger {merger.merger_id}: {due.held} acquiree shares removed",
                     merger_id=merger.merger_id,
+                    merger_terms=terms,
                 )
             )
-            if due.receipt is not None and merger.acquirer is not None:
+            if due.receipt is not None and due.receipt > 0 and merger.acquirer is not None:
                 rows.append(
                     ProposedAdjustment(
                         "merger_receipt",
@@ -1170,7 +1194,7 @@ def _merger_adjustments(dues: Sequence[_MergerDue], take: float) -> list[Propose
                     due.name,
                     None,
                     cash,
-                    f"cash merger {merger.merger_id}: cash paid after the removal",
+                    f"merger {merger.merger_id}: cash paid after the removal",
                     merger_id=merger.merger_id,
                 )
             )

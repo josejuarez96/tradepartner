@@ -468,13 +468,13 @@ class _Ledger:
             book_id=None,
         )
 
-    def removal(self, row: AdjustmentRow) -> None:
+    def removal(self, row: AdjustmentRow, cash_total: Fraction | None = None) -> None:
         """A position removed for cash: one FIFO sale at the journaled cash."""
         security = _security(row)
         self.refuse_short(security, row.kind)
         _require_long_delta(row, negative=True)
         removed = -_exact(row.quantity)
-        cash = _cash(row)
+        cash = _cash(row) if cash_total is None else cash_total
         closed = _close_fifo(self.longs.get(security, []), removed, _describe(row))
         self.dispose(
             closed,
@@ -485,23 +485,21 @@ class _Ledger:
             book_id=None,
         )
 
-    def merge(self, removal: AdjustmentRow, receipt: AdjustmentRow) -> None:
-        """A stock merger (spec amendment #1762 item 5): the target's lots
-        become acquirer lots at the ratio of the two quantities, basis and
-        acquisition instant carried, with no disposal. Every lot still open
-        becomes an acquirer lot; a lot already fully sold keeps the target's
-        symbol and CUSIP so its own sale still reconciles, but moves into the
-        acquirer's share units so a later acquirer split scales it (#1980)."""
+    def merge(
+        self,
+        removal: AdjustmentRow,
+        receipt: AdjustmentRow,
+        cash_rows: Sequence[AdjustmentRow] = (),
+    ) -> None:
+        """Carry each target lot into the acquirer, disposing of the portion
+        sold for removal cash and, later, for cash in lieu (#2151). A lot
+        already fully sold keeps its target identity, but its share units
+        follow the acquirer for later splits (#1980)."""
         target, acquirer = _security(removal), _security(receipt)
         self.refuse_short(target, removal.kind)
         self.refuse_short(acquirer, receipt.kind)
         _require_long_delta(removal, negative=True)
         _require_long_delta(receipt, negative=False)
-        if removal.cash not in (None, 0):
-            raise LotLedgerError(
-                f"stock merger {_describe(removal)} carries cash {removal.cash!r}: cash with a "
-                f"stock merger is not covered by the lot ledger"
-            )
         held = self.longs.get(target, [])
         removed = -_exact(removal.quantity)
         total = sum((lot.quantity for lot in held), _ZERO)
@@ -509,14 +507,47 @@ class _Ledger:
             raise LotLedgerError(
                 f"stock merger {_describe(removal)} removes {removed} but the ledger holds {total}"
             )
-        ratio = _exact(receipt.quantity) / removed
+        received = _exact(receipt.quantity)
+        terms = _explanation(removal)
+        kind = terms.get("merger_kind", "stock")
+        removal_cash = _cash(removal)
+        boot = removal_cash if kind == "stock_and_cash" else _ZERO
+        if boot > _ZERO:
+            price = _merger_number(terms.get("acquirer_price"), removal, "acquirer_price")
+            if price <= _ZERO:
+                raise LotLedgerError(f"merger {_describe(removal)} has no positive acquirer price")
+            sold_fraction = boot / (boot + received * price)
+        else:
+            sold_fraction = _ZERO
+        if sold_fraction >= _ONE:
+            raise LotLedgerError(f"merger {_describe(removal)} has no basis left for its receipt")
+        if sold_fraction:
+            closed: list[tuple[_OpenLot, Fraction, Fraction]] = []
+            for lot in held:
+                sold = lot.quantity * sold_fraction
+                basis = lot.basis * sold_fraction
+                lot.quantity -= sold
+                lot.basis -= basis
+                lot.reported_basis -= basis
+                closed.append((lot, sold, basis))
+            self.dispose(
+                closed,
+                lambda sold: boot * sold / (removed * sold_fraction),
+                trade_at=_session_at(removal),
+                fill_id=None,
+                client_order_id=_placeholder(removal),
+                book_id=None,
+            )
+        ratio = received / removed
+        open_ratio = received / (removed * (_ONE - sold_fraction))
         symbol = self.symbol_of(acquirer)
         asset = self.assets.get(symbol)
+        held_ids = {lot.lot_id for lot in held}
         for lot in self.lots:
             if lot.unit_security != target or lot.position_side != LONG:
                 continue
             lot.unit_security = acquirer
-            lot.quantity *= ratio
+            lot.quantity *= open_ratio if lot.lot_id in held_ids else ratio
             lot.acquired *= ratio
         for lot in held:
             lot.security_id, lot.symbol = acquirer, symbol
@@ -528,6 +559,33 @@ class _Ledger:
         merged.extend(held)
         merged.sort(key=lambda lot: (lot.trade_at, lot.lot_id))
         self.longs[target] = []
+        cil_cash = sum(
+            (_cash(row) for row in cash_rows if row.quantity is None),
+            removal_cash if kind == "stock" else _ZERO,
+        )
+        if cil_cash > _ZERO:
+            fractional = _merger_number(
+                terms.get("fractional_shares"), removal, "fractional_shares"
+            )
+            if fractional <= _ZERO:
+                raise LotLedgerError(f"merger {_describe(removal)} has CIL but no fraction")
+            cil_fraction = fractional / (received + fractional)
+            closed_cil: list[tuple[_OpenLot, Fraction, Fraction]] = []
+            for lot in held:
+                sold = fractional * lot.quantity / received
+                basis = lot.basis * cil_fraction
+                lot.basis -= basis
+                lot.reported_basis -= basis
+                closed_cil.append((lot, sold, basis))
+            cil_row = next((row for row in reversed(cash_rows) if row.cash), removal)
+            self.dispose(
+                closed_cil,
+                lambda sold: cil_cash * sold / fractional,
+                trade_at=_session_at(cil_row),
+                fill_id=None,
+                client_order_id=_placeholder(cil_row),
+                book_id=None,
+            )
 
     def spinoff(self, row: AdjustmentRow) -> None:
         """A spin-off child: one zero-basis lot on the session, unless the row
@@ -642,6 +700,16 @@ def _allocation(value: object, row: AdjustmentRow) -> Fraction:
 def _merger_id(row: AdjustmentRow) -> str | None:
     value = _explanation(row).get(_MERGER_KEY)
     return value if isinstance(value, str) else None
+
+
+def _merger_number(value: object, row: AdjustmentRow, key: str) -> Fraction:
+    """A finite nonnegative merger term journaled at receipt time."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise LotLedgerError(f"merger {_describe(row)} lacks {key}")
+    number = _exact(float(value))
+    if number < _ZERO:
+        raise LotLedgerError(f"merger {_describe(row)} has negative {key}")
+    return number
 
 
 def _adjustment_key(row: AdjustmentRow) -> tuple[object, ...]:
@@ -761,8 +829,13 @@ def _events(
     window = [r for r in adjustments if through is None or r.session <= through]
     removals = _by_merger(window, _CORPORATE_ACTION_CASH, unique=False)
     receipts = _by_merger(window, _MERGER_RECEIPT, unique=True)
+    cash_rows: dict[str, list[AdjustmentRow]] = {}
     for row in window:
-        action = _adjustment_event(row, removals, receipts)
+        merger_id = _merger_id(row)
+        if merger_id is not None and row.kind == _CORPORATE_ACTION_CASH:
+            cash_rows.setdefault(merger_id, []).append(row)
+    for row in window:
+        action = _adjustment_event(row, removals, receipts, cash_rows)
         if action is not None:
             rank = _RANK_CASH_IN_LIEU if row.kind == _CASH_IN_LIEU else _RANK_ADJUSTMENT
             events.append(((row.session, rank, *_adjustment_key(row)), action))
@@ -793,6 +866,7 @@ def _adjustment_event(
     row: AdjustmentRow,
     removals: Mapping[str | None, AdjustmentRow],
     receipts: Mapping[str | None, AdjustmentRow],
+    cash_rows: Mapping[str, Sequence[AdjustmentRow]],
 ) -> _Event | None:
     """The ledger action an adjustment makes, or None when it has no lot effect
     (a dividend, a fee) or is half of a merger the removal row carries out."""
@@ -800,8 +874,18 @@ def _adjustment_event(
         return partial(_Ledger.cash_in_lieu, row=row)
     if row.kind == _CORPORATE_ACTION_CASH:
         merger = _merger_id(row)
+        if row.quantity is None and merger is not None:
+            return None  # included with its merger's removal when the ledger rebuilds
         if merger is not None and merger in receipts:
-            return partial(_Ledger.merge, removal=row, receipt=receipts[merger])
+            return partial(
+                _Ledger.merge,
+                removal=row,
+                receipt=receipts[merger],
+                cash_rows=cash_rows.get(merger, ()),
+            )
+        if merger is not None:
+            cash_total = sum((_cash(cash_row) for cash_row in cash_rows[merger]), _ZERO)
+            return partial(_Ledger.removal, row=row, cash_total=cash_total)
         return partial(_Ledger.removal, row=row)
     if row.kind == _MERGER_RECEIPT:
         if _merger_id(row) in removals:

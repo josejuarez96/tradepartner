@@ -957,22 +957,23 @@ def _mergers(
                 acquirer = str(row["acquirer_security_id"])
                 receipt_rows = receipts.get((acquirer, merger_id), [])
                 receipt = next((a for a in receipt_rows if a.session == removal.session), None)
-                if receipt is not None and receipt.quantity is not None:
-                    shares_due = removed_quantity * float(row["share_ratio"])
-                    fractional = max(shares_due - receipt.quantity, 0.0)
-                    if fractional > tolerance:
-                        prices = _reference_prices(
-                            conn,
-                            _cut(receipt.session),
-                            [acquirer],
-                            previous_session(receipt.session),
+                shares_due = removed_quantity * float(row["share_ratio"])
+                received = (
+                    receipt.quantity
+                    if receipt is not None and receipt.quantity is not None
+                    else 0.0
+                )
+                fractional = max(shares_due - received, 0.0)
+                if fractional > tolerance:
+                    prices = _reference_prices(
+                        conn, _cut(removal.session), [acquirer], previous_session(removal.session)
+                    )
+                    price = prices.get(acquirer)
+                    if price is None:
+                        raise ValueError(
+                            f"merger {merger_id} receipt lacks acquirer reference price"
                         )
-                        price = prices.get(acquirer)
-                        if price is None:
-                            raise ValueError(
-                                f"merger {merger_id} receipt lacks acquirer reference price"
-                            )
-                        upper_value += fractional * price * (1 + whole_share_price_buffer)
+                    upper_value += fractional * price * (1 + whole_share_price_buffer)
             upper = Decimal(str(upper_value))
             paid = Decimal(str(journaled)) >= upper - bound
             closed = any(
@@ -1100,13 +1101,18 @@ def _open_orders(
 
 
 def _explanation_json(
-    text: str, reconciliation_id: int | None, merger_id: str | None = None
+    text: str,
+    reconciliation_id: int | None,
+    merger_id: str | None = None,
+    merger_terms: Mapping[str, object] | None = None,
 ) -> str:
     """An adjustment's `explanation_json`: its text, the reconciliation that
     journaled it and, for a merger's row, the merger id (#1762, T249)."""
     payload: dict[str, object] = {"explanation": text, "reconciliation_id": reconciliation_id}
     if merger_id is not None:
         payload["merger_id"] = merger_id
+    if merger_terms is not None:
+        payload.update(merger_terms)
     return json.dumps(payload, sort_keys=True, allow_nan=False)
 
 
@@ -1250,7 +1256,10 @@ def reconcile_now(
                     quantity=adjustment.quantity,
                     cash=adjustment.cash,
                     explanation_json=_explanation_json(
-                        adjustment.explanation, reconciliation_id, adjustment.merger_id
+                        adjustment.explanation,
+                        reconciliation_id,
+                        adjustment.merger_id,
+                        adjustment.merger_terms,
                     ),
                     book_id=window.book_id,
                     broker_activity_id=adjustment.broker_activity_id,
