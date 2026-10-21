@@ -70,6 +70,23 @@ def test_shortability_uses_raw_close_of_scored_names_and_counts_below_floor(
     assert raw_calls[0].ids == ("A", "B", "C", "D")
 
 
+def test_unpriced_scored_name_is_ineligible_but_not_counted_below_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _scores(monkeypatch)
+    bars = test_engine_short._bars(
+        {
+            "A": [(test_engine_short.HISTORY_START, 100.0)],
+            "B": [(test_engine_short.HISTORY_START, 10.0)],
+            "C": [(test_engine_short.HISTORY_START, 4.0)],
+            "D": [(test_engine_short.HISTORY_START, 5.0)],
+        }
+    ).filter(~((pl.col("security_id") == "C") & (pl.col("session") == test_engine_short.T0)))
+    got = plan(_plan_provider(bars), _settings(), test_engine_short.T0, "momentum")
+    assert got.targets == {"A": 0.5, "D": -0.5}
+    assert got.counts["n_short_below_price"] == 0
+
+
 def _borrow_params(headline: float, sensitivity: list[float]) -> Settings:
     base = test_engine_short._signed(
         costs={
@@ -310,3 +327,138 @@ def test_drift_cover_charges_the_cover_cost(monkeypatch: pytest.MonkeyPatch) -> 
     # Short open $50,000 costs $50; the cash-capped long costs $50/1.001;
     # 500 short shares covered at $130 cost $65.
     assert result.rebalances[0].cost_paid == pytest.approx(50 + 50 / 1.001 + 65, abs=1e-9)
+
+
+def test_held_short_halted_across_rebalance_keeps_last_mark_without_crashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The as-of decision read needs the held bar before the rebalance session."""
+    test_engine_short._install_plan(
+        monkeypatch,
+        {
+            test_engine_short.T0: {"A": 0.5, "B": -0.5},
+            test_engine_short.T1: {"A": 0.5, "B": -0.5},
+        },
+    )
+    bars = test_engine_short._bars(
+        {
+            "A": [(test_engine_short.HISTORY_START, 100.0)],
+            "B": [(test_engine_short.HISTORY_START, 100.0)],
+        }
+    ).filter(
+        ~(
+            (pl.col("security_id") == "B")
+            & pl.col("session").is_between(date(2024, 2, 27), test_engine_short.F1)
+        )
+    )
+    result = run(
+        _borrow_params(0.0, []),
+        test_engine_short._provider(bars),
+        test_engine_short.T0,
+        test_engine_short.T2,
+        test_engine._handle(),
+        [0.0],
+        family="momentum",
+    )[0.0]
+    assert test_engine_short._value(result, "B", test_engine_short.F1) == -50_000.0
+    assert result.rebalances[1].counts["n_drift_covers"] == 0
+
+
+def test_drift_cover_waits_for_next_bar_inside_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_engine_short._install_plan(monkeypatch, {test_engine_short.T0: {"A": 0.5, "B": -0.5}})
+    resume = date(2024, 2, 7)
+    bars = test_engine_short._bars(
+        {
+            "A": [(test_engine_short.HISTORY_START, 100.0)],
+            "B": [
+                (test_engine_short.HISTORY_START, 100.0),
+                (SPIKE, 150.0),
+                (resume, 130.0),
+            ],
+        }
+    ).filter(
+        ~(
+            (pl.col("security_id") == "B")
+            & pl.col("session").is_between(date(2024, 2, 5), date(2024, 2, 6))
+        )
+    )
+    base = _borrow_params(0.0, [])
+    params = base.model_copy(
+        update={"portfolio": base.portfolio.model_copy(update={"short_cover_weight": 0.6})}
+    )
+    result = run(
+        params,
+        test_engine_short._provider(bars),
+        test_engine_short.T0,
+        test_engine_short.T1,
+        test_engine._handle(),
+        [0.0],
+        family="momentum",
+    )[0.0]
+    assert test_engine_short._value(result, "B", date(2024, 2, 5)) == -75_000.0
+    assert test_engine_short._value(result, "B", date(2024, 2, 6)) == -75_000.0
+    assert test_engine_short._value(result, "B", resume) == 0.0
+    assert test_engine_short._cash(result)[resume] == pytest.approx(35_000.0, abs=1e-9)
+    assert result.rebalances[0].counts["n_drift_covers"] == 1
+
+
+def test_drift_cover_waits_for_bar_after_rebalance(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_engine_short._install_plan(
+        monkeypatch,
+        {test_engine_short.T0: {"A": 0.5, "B": -0.5}, test_engine_short.T1: {}},
+    )
+    resume = date(2024, 3, 4)
+    bars = test_engine_short._bars(
+        {
+            "A": [(test_engine_short.HISTORY_START, 100.0)],
+            "B": [
+                (test_engine_short.HISTORY_START, 100.0),
+                (test_engine_short.T1, 150.0),
+                (resume, 130.0),
+            ],
+        }
+    ).filter(~((pl.col("security_id") == "B") & (pl.col("session") == test_engine_short.F1)))
+    base = _borrow_params(0.0, [])
+    params = base.model_copy(
+        update={"portfolio": base.portfolio.model_copy(update={"short_cover_weight": 0.6})}
+    )
+    result = run(
+        params,
+        test_engine_short._provider(bars),
+        test_engine_short.T0,
+        test_engine_short.T2,
+        test_engine._handle(),
+        [0.0],
+        family="momentum",
+    )[0.0]
+    assert test_engine_short._value(result, "B", test_engine_short.F1) == -75_000.0
+    assert test_engine_short._value(result, "B", resume) == 0.0
+    # The T1 plan also sells A for $50,000; covering B at $130 then leaves $85,000.
+    assert test_engine_short._cash(result)[resume] == pytest.approx(85_000.0, abs=1e-9)
+    assert result.rebalances[1].counts["n_drift_covers"] == 1
+
+
+def test_stale_exit_clears_unfilled_drift_cover(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_engine_short._install_plan(monkeypatch, {test_engine_short.T0: {"A": 0.5, "B": -0.5}})
+    bars = test_engine_short._bars(
+        {
+            "A": [(test_engine_short.HISTORY_START, 100.0)],
+            "B": [(test_engine_short.HISTORY_START, 100.0), (SPIKE, 150.0)],
+        }
+    ).filter(~((pl.col("security_id") == "B") & (pl.col("session") > SPIKE)))
+    base = _borrow_params(0.0, [])
+    params = base.model_copy(
+        update={"portfolio": base.portfolio.model_copy(update={"short_cover_weight": 0.6})}
+    )
+    result = run(
+        params,
+        test_engine_short._provider(bars),
+        test_engine_short.T0,
+        test_engine_short.T1,
+        test_engine._handle(),
+        [0.0],
+        family="momentum",
+    )[0.0]
+    assert result.rebalances[0].n_stale_exits == 1
+    assert result.rebalances[0].counts["n_drift_covers"] == 0
+    assert test_engine_short._value(result, "B", test_engine_short.T1) == 0.0

@@ -397,6 +397,8 @@ def _plan(
         eligible = {
             sid for sid in scores if closes.get(sid, 0.0) >= params.portfolio.short_min_price
         }
+        # An unpriced name is ineligible, but it has no observed close below the
+        # floor and therefore is not part of the below-price count.
         counts["n_short_below_price"] = sum(
             sid in closes and closes[sid] < params.portfolio.short_min_price for sid in scores
         )
@@ -916,7 +918,8 @@ def _step(
     value kept in the position set and in `held_on`, every session after the plan's read
     pays the borrow fee (the carry window to the fill included) and accrues `rf(s)` on
     free cash only, and an equity that is not positive ends the run with a `ValueError`
-    naming the session."""
+    naming the session. A drift cover remains pending through missing bars until its
+    next fill bar or the ordinary stale exit."""
     signed = params.portfolio.side == "long_short"
     fill_price = params.execution.fill_price
     carried = carry_to_fill(
@@ -958,13 +961,19 @@ def _step(
     prefill_drift_cost = 0.0
     prefill_drift_value = 0.0
     if signed and book.pending_covers:
+        waiting: set[str] = set()
         for sid in sorted(book.pending_covers):
             value = carried.get(sid, 0.0)
             if value >= 0:
                 continue
+            if _price_on(frame, sid, plan.fill_session, fill_price) is None:
+                # A held name without a fill bar keeps its last mark, as in
+                # apply_trades. Its pending cover travels into the session loop.
+                waiting.add(sid)
+                continue
             raw_fill = _price_on(raw, sid, plan.fill_session, fill_price)
             if raw_fill is None:
-                raise ValueError(f"{sid} has no raw bar on drift cover {plan.fill_session}")
+                raise ValueError(f"{sid} has a bar on {plan.fill_session} but no raw bar")
             cost = trade_cost(
                 -value,
                 -value / raw_fill,
@@ -979,7 +988,7 @@ def _step(
             prefill_drift_cost += cost
             del carried[sid]
             n_drift += 1
-        book.pending_covers.clear()
+        book.pending_covers = waiting
     targets, aside = _book_targets(book, plan, index, carried, held_cash, construction)
     fill = _fill_to_targets(
         carried, held_cash, targets, aside, frame, raw, plan, book, params, adv, signed=signed
@@ -1008,7 +1017,8 @@ def _step(
     shorts = _shorts_by_session(values) if signed else {}
     cash = fill.cash
     drift_exits: list[_Exit] = []
-    pending: set[str] = set()
+    pending: set[str] = set(book.pending_covers)
+    book.pending_covers.clear()
     covered: set[str] = set()
     for session in _sessions(plan.fill_session, end):
         if session > plan.fill_session:
@@ -1026,12 +1036,19 @@ def _step(
                 book.borrow_paid += fee
         if signed and pending:
             previous = previous_session(session)
+            completed: set[str] = set()
             for sid in sorted(pending):
                 if sid not in shorts.get(previous, {}) and sid not in fill.positions:
+                    completed.add(sid)
                     continue
                 source = shorts.get(previous, {})
                 held_value = source.get(sid, book.positions.get(sid, 0.0))
                 if held_value >= 0:
+                    completed.add(sid)
+                    continue
+                if _price_on(frame, sid, session, fill_price) is None:
+                    # The order cannot fill during a halt. Keep it pending until
+                    # the next bar or until the ordinary stale exit removes it.
                     continue
                 marked = book.marked_at.get(sid, previous)
                 if session > plan.fill_session:
@@ -1051,7 +1068,7 @@ def _step(
                 )[sid]
                 raw_fill = _price_on(raw, sid, session, fill_price)
                 if raw_fill is None:
-                    raise ValueError(f"{sid} has no raw bar on drift cover {session}")
+                    raise ValueError(f"{sid} has a bar on {session} but no raw bar")
                 cost = trade_cost(
                     -at_fill,
                     -at_fill / raw_fill,
@@ -1064,6 +1081,7 @@ def _step(
                 cash += at_fill - cost
                 drift_exits.append(_Exit(sid, session, at_fill, cost, False))
                 covered.add(sid)
+                completed.add(sid)
                 n_drift += 1
                 exits = [e for e in exits if e.security_id != sid or e.session < session]
                 for day in _sessions(session, end):
@@ -1071,7 +1089,7 @@ def _step(
                     if not row.is_empty():
                         totals[day] = totals.get(day, 0.0) - float(row["value"].item())
                     shorts.get(day, {}).pop(sid, None)
-            pending.clear()
+            pending.difference_update(completed)
         proceeds = [e.value - e.cost for e in exits if e.session == session]
         cash = math.fsum([cash, *proceeds])
         equity = math.fsum([cash, totals.get(session, 0.0)])
@@ -1113,13 +1131,13 @@ def _step(
                 asof_equity = cash + asof_net
                 if asof_equity <= 0:
                     raise ValueError(f"the book's equity is gone on {session}")
-                pending = {
+                pending.update(
                     sid
                     for sid, value in asof_values.select("security_id", "value").iter_rows()
                     if value < 0 and -value / asof_equity > params.portfolio.short_cover_weight
-                }
+                )
     if signed:
-        book.pending_covers = pending
+        book.pending_covers = {sid for sid in pending if sid in shorts.get(end, {})}
         if drift_exits:
             values = _book_exits(values, drift_exits)
     before = math.fsum([held_cash, *carried.values()])
@@ -2127,7 +2145,8 @@ def _variant_step(
     cadence = params.schedule.rebalance_cadence
     t, t_prev = read_time(step_end, cadence), read_time(plan.session, cadence)
     ids, marked, ever_held = (list(part) for part in _marking_ids(variant, benchmarks))
-    frame = view.marking_prices(t, marked, _marking_bound(variant, step_end, family, marked))
+    marking_bound = _marking_bound(variant, step_end, family, marked)
+    frame = view.marking_prices(t, marked, marking_bound)
     raw = view.raw_prices(t, marked)
     ended = _ended(view.listing_ends(t, ids), step_end)
     dropped = view.dropped_dividends(t, ids)
@@ -2158,7 +2177,7 @@ def _variant_step(
     if params.portfolio.side == "long_short":
         decisions = {
             session: view.adjusted_prices(
-                session_close(session), marked, True, sessions_from=plan.session
+                session_close(session), marked, True, sessions_from=marking_bound
             )
             for session in _sessions(plan.fill_session, step_end)
         }
