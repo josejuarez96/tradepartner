@@ -986,3 +986,57 @@ def test_a_band_removal_before_the_effective_date_is_not_the_mergers(
     _merger(journal_settings, known_at=session_close(S), effective=S3, payable=S3)
 
     assert _open(journal_settings, open_window, S4).mergers == {}
+
+
+def _beside_an_ended_name(spy_held: float, credit: float) -> Reconciliation:
+    """`MTUM` removed by its merger with 625 due, `SPY` (at 100) ended in the same
+    session, and `credit` the only cash."""
+    ledger = Ledger(positions={MTUM: HELD, SPY: spy_held}, cash=LEDGER_CASH, through=S)
+    at = datetime(2026, 10, 1, 14, tzinfo=UTC)
+    cash = LEDGER_CASH + credit
+    return compare(
+        ledger,
+        {},
+        (),
+        (),
+        Account(account_id="PA1", cash=cash, buying_power=cash, equity=cash, as_of=at),
+        Explanations(
+            symbols={MTUM: "MTUM", SPY: "SPY"},
+            ended=frozenset({SPY}),
+            reference_prices={MTUM: 100.0, SPY: 100.0},
+            mergers={MTUM: _merger_open()},
+            activity_seen_before=date(2026, 9, 29),
+        ),
+        _window(),
+        FROZEN,
+        order_id_prefix="tp",
+    )
+
+
+def test_an_ambiguous_split_between_a_merger_and_an_ended_name_halts_on_cash() -> None:
+    """10 `SPY` ended (cap 1,020) and 700 credited: "the merger paid in full, 75
+    proceeds" and "the merger paid nothing, 700 proceeds" both fit, so nothing is
+    guessed: `cash`, nothing journaled."""
+    result = _beside_an_ended_name(10.0, 700.0)
+
+    assert [m.kind for m in result.mismatches] == ["cash"]
+    assert result.adjustments == ()
+
+
+def test_the_due_paid_in_full_beside_an_ended_name_is_journaled_when_unambiguous() -> None:
+    """1 `SPY` ended (cap 102) and 625 + 50 credited: only "paid in full" fits."""
+    result = _beside_an_ended_name(1.0, DUE + 50.0)
+
+    assert result.status == OK
+    rows = {(a.security_id, a.merger_id): a.cash for a in result.adjustments}
+    assert rows == {(MTUM, M1): DUE, (SPY, None): pytest.approx(50.0)}
+
+
+def test_a_payment_within_the_cash_bound_of_the_due_journals_the_cash_received() -> None:
+    ledger = Ledger(positions={MTUM: HELD}, cash=LEDGER_CASH, through=S)
+
+    result = _compare(ledger, {}, LEDGER_CASH + DUE - 0.005, {MTUM: _merger_open()})
+
+    assert result.status == OK
+    (row,) = result.adjustments
+    assert row.cash == pytest.approx(DUE - 0.005, abs=1e-9)

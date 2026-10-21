@@ -1007,7 +1007,10 @@ def _merger_cash(
     name's proceeds take the rest, in [0, its cap], and with no ended name the
     rest must be within the cash bound. So a credited dividend or an ended
     name's proceeds are never booked as a merger's part payment when they
-    explain the cash alone. A removal is journaled whatever it takes; a
+    explain the cash alone. With an ended name beside a merger that may take
+    cash, only a split where exactly one of "paid in full" and "paid nothing"
+    fits is journaled; any other split is ambiguous and fails closed on `cash`.
+    A removal is journaled whatever it takes; a
     cash-only row only when it takes cash. Two mergers taking cash at once share
     it in acquiree order, each up to its cap: their sum is right, the split
     between the ids may not be."""
@@ -1020,26 +1023,44 @@ def _merger_cash(
     value = [expected[name] * reference_prices.get(name, 0.0) for name in removed]
     band_cap = Decimal(str(math.fsum(value) * (1 + buffer)))
     cap = Decimal(str(merger_cap))
-    readings = [(mode, chosen) for mode in ("full", "none", "part") for chosen in options]
-    for mode, chosen in readings:
-        rest = difference - Decimal(str(math.fsum(chosen.values())))
-        if mode == "full":
-            take = cap
-        elif mode == "none":
-            take = Decimal(0)
-        else:
-            take = min(max(rest, Decimal(0)), cap) if rest > bound else Decimal(0)
-        left = rest - take
-        top = band_cap if removed else Decimal(0)
-        if not -bound <= left <= top + bound:
-            continue
-        rows = _merger_adjustments(dues, float(take))
-        if removed:
-            proceeds = float(min(max(left, Decimal(0)), band_cap))
-            rows += _ended_adjustments(removed, expected, value, proceeds)
-        if chosen:
-            rows += _dividend_adjustments(chosen)
-        return True, rows
+    top = band_cap if removed else Decimal(0)
+
+    def reading(mode: str) -> list[ProposedAdjustment] | None:
+        """The rows of the first dividend option that fits `mode`, else None."""
+        for chosen in options:
+            rest = difference - Decimal(str(math.fsum(chosen.values())))
+            if mode == "full":
+                # Paid in full: the cash received when it is within the bound of
+                # the due (never more than the due), else the due itself.
+                take = min(max(rest, Decimal(0)), cap) if abs(rest - cap) <= bound else cap
+            elif mode == "none":
+                take = Decimal(0)
+            else:
+                take = min(max(rest, Decimal(0)), cap) if rest > bound else Decimal(0)
+            left = rest - take
+            if not -bound <= left <= top + bound:
+                continue
+            rows = _merger_adjustments(dues, float(take))
+            if removed:
+                proceeds = float(min(max(left, Decimal(0)), band_cap))
+                rows += _ended_adjustments(removed, expected, value, proceeds)
+            if chosen:
+                rows += _dividend_adjustments(chosen)
+            return rows
+        return None
+
+    if removed and cap > 0:
+        # An ended name beside a merger that may take cash: only an unambiguous
+        # split is journaled (the mergers paid in full or paid nothing, exactly
+        # one of the two fitting); anything else fails closed on `cash`.
+        full, none = reading("full"), reading("none")
+        if (full is None) == (none is None):
+            return False, []
+        return True, full if full is not None else none or []
+    for mode in ("full", "none", "part"):
+        rows = reading(mode)
+        if rows is not None:
+            return True, rows
     return False, []
 
 
