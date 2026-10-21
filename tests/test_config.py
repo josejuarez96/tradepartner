@@ -3136,14 +3136,13 @@ def test_portfolio_is_a_settings_section() -> None:
         {"short_cover_weight": 0.2},
     ],
 )
-def test_portfolio_refuses_each_non_default_until_t223(override: dict[str, object]) -> None:
-    """T219's #1788 guard: the engine reads none of the five until T223, so a non-default
-    value raises naming T223, through `PortfolioConfig` and through
-    `Settings.model_validate`, which registration goes through (T223 removes the guard)."""
-    with pytest.raises(ValidationError, match="T223"):
-        PortfolioConfig(**override)  # type: ignore[arg-type]
-    with pytest.raises(ValidationError, match="T223"):
-        Settings.model_validate({"portfolio": override})
+def test_portfolio_accepts_each_valid_non_default_after_t223(override: dict[str, object]) -> None:
+    """The five keys now reach the engine through both validation paths."""
+    if override == {"net_exposure": 0.5}:
+        override = {"side": "long_short", **override}
+    direct = PortfolioConfig(**override)  # type: ignore[arg-type]
+    from_settings = Settings.model_validate({"portfolio": override}).portfolio
+    assert direct == from_settings
 
 
 @pytest.mark.parametrize(
@@ -3165,21 +3164,12 @@ def test_portfolio_rejects_out_of_range_values(override: dict[str, object]) -> N
 
 
 def test_portfolio_exposure_relation_is_pinned_for_t223() -> None:
-    """The guard refuses every non-default value today, so the relation
-    (`net_exposure` in `[-gross, gross]`, equal to it under `long_only`) is pinned by
-    calling the validator directly on constructed values (T223 removes the guard and the
-    relation becomes the live check)."""
+    """The live validator enforces the gross/net relation."""
     row = {"short_min_price": 5.0, "short_cover_weight": 0.10}
-    outside = PortfolioConfig.model_construct(
-        side="long_short", gross_exposure=0.5, net_exposure=0.8, **row
-    )
-    with pytest.raises(ValueError, match="net_exposure"):
-        PortfolioConfig._validate_exposures(outside)
-    long_only = PortfolioConfig.model_construct(
-        side="long_only", gross_exposure=1.0, net_exposure=0.5, **row
-    )
-    with pytest.raises(ValueError, match="long_only"):
-        PortfolioConfig._validate_exposures(long_only)
+    with pytest.raises(ValidationError, match="net_exposure"):
+        PortfolioConfig(side="long_short", gross_exposure=0.5, net_exposure=0.8, **row)
+    with pytest.raises(ValidationError, match="long_only"):
+        PortfolioConfig(side="long_only", gross_exposure=1.0, net_exposure=0.5, **row)
 
 
 # --- the borrow keys (T221; backtest spec amendment #1872, item 6) ----------------------

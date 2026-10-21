@@ -1305,9 +1305,8 @@ def test_portfolio_at_its_defaults_moves_no_canonical_set_or_fingerprint(
 def test_a_non_default_portfolio_key_is_kept_and_moves_the_fingerprint(
     settings: Settings, key: str, value: object
 ) -> None:
-    """Kept in the canonical set (the guard refuses it in a file until T223, so the
-    params mapping is edited directly) and a new fingerprint: a long/short variant is a
-    new hypothesis identity."""
+    """A changed portfolio key enters the canonical set and moves the fingerprint:
+    a long/short variant has a new hypothesis identity."""
     params = _new_params(settings)
     twin_canonical = frozen.canonical_frozen_set(params, "momentum")
     twin_fingerprint = frozen.fingerprint("momentum", params, IN_SAMPLE_START)
