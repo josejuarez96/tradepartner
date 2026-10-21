@@ -1687,7 +1687,7 @@ def _status_lines(
         *paper_slippage.slippage_report_lines(fill_slippage),
         f"alerts ({len(data.alerts)}{', capped' if data.alerts_capped else ''}):",
     ]
-    lines += [f"  {a.at} {a.kind} {a.session}: {a.message}" for a in data.alerts]
+    lines += [f"  #{a.alert_id} {a.at} {a.kind} {a.session}: {a.message}" for a in data.alerts]
     return lines
 
 
