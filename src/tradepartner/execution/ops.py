@@ -30,6 +30,15 @@ performance card: the window's equity from the base session B, SPY total return,
 report`'s tracking count and the latest report row's trial line. It writes nothing and
 opens no trial; `None` for a book with no window.
 
+**Waiting on the owner** (plan T256, amendment 2026-10-20 #2096, item 1).
+`waiting_on_owner(conn, settings, now)` is the "waiting on me" read: for every book
+with an open window (`book_ids`, then that book's latest window, skipped when
+`_is_open` says it is closed), the rows `execution.waiting.build` needs, then the
+open shakedown span's alerts. It honours `now` (never the wall clock) and stays
+narrow: it never calls `page_data`, `_summary`, `book_summaries` or
+`performance_data`, and reads only the aggregates `waiting.py`'s kinds name. It
+writes nothing, opens no trial and calls no broker method.
+
 **Journal not initialised.** A version-4 store no write has migrated yet
 raises `store.journal.JournalNotInitialised` from the first read; this module
 catches it and returns an `OpsData` with `journal_not_initialised=True` and
@@ -117,9 +126,10 @@ from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.calendar import is_session, previous_session, session_close
 from tradepartner.config import Cadence, Settings
-from tradepartner.execution import lock, performance
+from tradepartner.execution import lock, performance, shakedown, waiting
 from tradepartner.execution.marks import equity_at
 from tradepartner.execution.plan import stop_session as stop_session_of_request
+from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.execution.switch import FAULTED_RUN_STATUSES, SwitchState, derive
 from tradepartner.execution.window import window_cadence
 from tradepartner.store import journal, registry
@@ -146,6 +156,7 @@ from tradepartner.store.journal import (
     SignalRow,
 )
 from tradepartner.store.schema import DEFAULT_BOOK_ID, SchemaVersionError
+from tradepartner.timeutil import ensure_tz_aware_utc
 
 __all__ = [
     "BookSummary",
@@ -158,6 +169,7 @@ __all__ = [
     "book_summaries",
     "page_data",
     "performance_data",
+    "waiting_on_owner",
 ]
 
 _NEW_YORK = ZoneInfo("America/New_York")
@@ -1282,3 +1294,145 @@ def performance_data(
         trial_index=tuple(performance.rebase(dict(trial_rows), base_value)) if trial_rows else (),
         trial_error=trial_error,
     )
+
+
+# --- waiting on the owner (plan T256) ---------------------------------------------
+
+
+def _waiting_switch(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, book: str, window: PaperWindowRow
+) -> waiting.SwitchFacts:
+    """`switch.derive` over the bounded rows, exactly as `_summary` calls it."""
+    assert window.window_id is not None
+    rows = _kill_switch_rows_for(conn, window.window_id)
+    released_at = max((r.at for r in rows if r.state == "released"), default=None)
+    runs = _runs_for_switch(conn, window.window_id, released_at=released_at)
+    state = derive(
+        window,
+        rows,
+        [rw.run for rw in runs],
+        [rw.result for rw in runs if rw.result is not None],
+        reading_run=None,
+        lock_free=_lock_free(settings, book),
+    )
+    return waiting.SwitchFacts(window=window, state=state, kill_switch_rows=rows, runs=tuple(runs))
+
+
+def _waiting_lag(
+    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, s_minus_1: date
+) -> waiting.LagFacts:
+    """The window's frozen risk (always read, so an unreadable `frozen_json` shows
+    as `unreadable` even with no order open), its non-terminal orders and, only
+    when one is open, its reconciliations for `collect.lag_verdict`."""
+    assert window.window_id is not None
+    frozen = frozen_risk(window)
+    orders = journal.non_terminal_orders(conn, window_id=window.window_id)
+    reconciliations = journal.reconciliations_for(conn, window.window_id) if orders else []
+    return waiting.LagFacts(
+        orders=tuple(orders),
+        reconciliations=tuple(reconciliations),
+        session=s_minus_1,
+        frozen=frozen,
+    )
+
+
+def _waiting_report(
+    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, now: datetime
+) -> waiting.ReportFacts:
+    """`performance_data`'s `report_due` inputs at `now`: the tracking count, whether
+    a `paper_reports` row exists, and (only when a report is due) the window's
+    second rebalance session."""
+    assert window.window_id is not None
+    count = _tracking_count(conn, window, now)
+    has_report = bool(journal.paper_reports_for(conn, window.window_id))
+    second: date | None = None
+    if not has_report and count is not None and count >= _REPORT_MIN_REBALANCES:
+        first = window.first_rebalance_session
+        sessions = rebalance_sessions(first, first + _REPORT_SEARCH, window_cadence(conn, window))
+        second = sessions[1]
+    return waiting.ReportFacts(
+        tracking_count=count,
+        has_report=has_report,
+        minimum=_REPORT_MIN_REBALANCES,
+        second_rebalance=second,
+    )
+
+
+def _waiting_book(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    book: str,
+    window: PaperWindowRow,
+    now: datetime,
+) -> waiting.BookFacts:
+    """One open window's facts. Each section is read on its own, so a `ValueError`
+    (an `UnreadableMarkError` included) in one leaves the others and becomes the
+    book's `unreadable` item."""
+    assert window.window_id is not None
+    s_minus_1 = _required_run_session(now)
+    errors: list[str] = []
+    switch: waiting.SwitchFacts | None = None
+    lag: waiting.LagFacts | None = None
+    report: waiting.ReportFacts | None = None
+    try:
+        switch = _waiting_switch(conn, settings, book, window)
+    except ValueError as exc:
+        errors.append(str(exc))
+    try:
+        lag = _waiting_lag(conn, window, s_minus_1)
+    except ValueError as exc:
+        errors.append(str(exc))
+    stale, _ = _stale_and_last_updated(conn, window.window_id, s_minus_1)
+    run = waiting.RunFacts(stale=stale, session=s_minus_1, window_started_at=window.started_at)
+    try:
+        report = _waiting_report(conn, window, now)
+    except ValueError as exc:
+        errors.append(str(exc))
+    return waiting.BookFacts(
+        book_id=book, switch=switch, lag=lag, run=run, report=report, errors=tuple(errors)
+    )
+
+
+def _waiting_span(conn: duckdb.DuckDBPyConnection, now: datetime) -> waiting.SpanFacts | None:
+    """The open shakedown span's candidate alerts, or None with no `shakedown_span`
+    row. Every book's alerts count (the shakedown judges every book), each read at
+    or before `now`; the noted ids are `shakedown._noted_alerts`'s, imported."""
+    if registry.shakedown_span(conn) is None:
+        return None
+    span = shakedown.read_span(conn, now)
+    book_column = "book_id" if _alerts_have_book(conn) else f"'{DEFAULT_BOOK_ID}'"
+    rows = conn.execute(
+        f'SELECT alert_id, {book_column}, kind, session, "at" FROM alerts '
+        'WHERE list_contains(?, kind) AND "at" >= ? AND "at" <= ? ORDER BY alert_id',
+        [list(waiting.NOTED_ALERT_KINDS), span.start_at, now],
+    ).fetchall()
+    return waiting.SpanFacts(
+        start_at=span.start_at,
+        alerts=tuple(
+            waiting.SpanAlert(alert_id=r[0], book_id=r[1], kind=r[2], session=r[3], at=r[4])
+            for r in rows
+        ),
+        noted=frozenset(shakedown._noted_alerts(conn)),
+        now=now,
+    )
+
+
+def waiting_on_owner(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime
+) -> tuple[waiting.WaitingItem, ...]:
+    """What every book with an open window is waiting on the owner for at `now`
+    (module docstring, "Waiting on the owner"; the kinds and their order are
+    `execution.waiting`'s). Empty when nothing is, and on a store with no journal;
+    a journal too old to read raises `SchemaVersionError`. Reads only."""
+    now = ensure_tz_aware_utc(now, field_name="now")
+    try:
+        books = book_ids(conn)
+    except JournalNotInitialised:
+        return ()
+    facts: list[waiting.BookFacts] = []
+    for book in books:
+        window = journal.latest_window(conn, book)
+        if window is None or window.window_id is None or not _is_open(conn, window.window_id):
+            continue
+        facts.append(_waiting_book(conn, settings, book, window, now))
+    return waiting.build(facts, _waiting_span(conn, now))
