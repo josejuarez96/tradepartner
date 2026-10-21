@@ -482,6 +482,8 @@ Nothing in the drill bypasses a risk check or releases the switch without a reco
 
 The Phase 4 exit is [ADR 0017](../decisions/0017-fast-paper-and-machine-readiness-gate.md) part E: `tradepartner paper shakedown` exits 0 on the real store with all seven lines passed over every book, and the Phase 4 retro records the output.
 
+**Day by day:** the owner's checklist for the T162 span (2026-10-22 to 11-04) is [shakedown.md](shakedown.md).
+
 **Open the span** with one owner decision:
 
 ```bash
@@ -492,7 +494,7 @@ uv run tradepartner decision shakedown-span --sessions 10 --order-sessions 5 --r
 
 **A `mismatch` reconciliation or a real halt inside the span restarts it**: the span then starts at the session after the `released` kill-switch row that followed it. Fix the cause and resume; open a new `shakedown-span` row only if you want the count to start later.
 
-**Annotate an alert** that the span would otherwise fail on, by the alert's id as `paper status` lists it (a `stale_data` or `missed_run` alert):
+**Annotate an alert** that the span would otherwise fail on, by the alert's id (`paper status` does not print it, #2095; [shakedown.md](shakedown.md) shows a read-only query) (a `stale_data` or `missed_run` alert):
 
 ```bash
 uv run tradepartner decision shakedown-note --alert <alert id> --reason "what happened and why it is accepted"
