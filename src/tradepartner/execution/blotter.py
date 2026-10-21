@@ -10,8 +10,9 @@ import duckdb
 
 from tradepartner.calendar import session_close
 from tradepartner.execution import slippage
+from tradepartner.execution.plan import is_full_exit
 from tradepartner.store import journal
-from tradepartner.store.journal import OrderedFill, OrderEventRow, OrderRow
+from tradepartner.store.journal import DecisionRow, OrderedFill, OrderEventRow, OrderRow
 
 _NEW_YORK = ZoneInfo("America/New_York")
 
@@ -80,10 +81,13 @@ def _row(
     note: str | None = None
     if session_close(order.session) > now:
         note = "pending"
-    elif not fills or price is None:
+    elif not fills:
         note = "no fill"
     elif any(item.fill.filled_at.astimezone(_NEW_YORK).date() != order.session for item in fills):
         note = "off session"
+    elif price is None:
+        # summarise counts a present order with non-positive volume as no_bar.
+        note = "no bar"
     else:
         open_price = opens.get((order.security_id, order.session))
         if open_price is None or open_price <= 0:
@@ -124,35 +128,74 @@ def session_blotter(
     if limit <= 0:
         raise ValueError("limit must be positive")
     session_close(session)  # Require a trading session even for an empty read.
-    orders = [o for o in journal.orders_for(conn, window_id=window_id) if o.session == session]
-    orders.sort(key=lambda o: (o.known_at, o.client_order_id), reverse=True)
-    all_fills = journal.fills_for(conn, window_id=window_id)
-    fills = [item for item in all_fills if item.order_session == session]
-    opens = slippage.read_opens(conn, fills) if fills else {}
-    summary = slippage.summarise(fills, opens, now)
+    journal._require_orders_have_runs(conn)
+    where = "t.session = ? AND t.run_id IN (SELECT run_id FROM paper_runs WHERE window_id = ?)"
+    orders = journal._select(
+        conn,
+        OrderRow,
+        where,
+        [session, window_id],
+        order="t.known_at DESC, t.client_order_id DESC",
+        limit=limit + 1,
+    )
     shown = orders[:limit]
     ids = [o.client_order_id for o in shown]
+    # The summary covers the full session. Fetch its IDs by session in SQL,
+    # then let the journal's sole fill reader validate and load only those IDs.
+    session_ids = [
+        row[0]
+        for row in conn.execute(
+            "SELECT o.client_order_id FROM orders o JOIN paper_runs r ON r.run_id = o.run_id "
+            "WHERE r.window_id = ? AND o.session = ? ORDER BY o.client_order_id",
+            [window_id, session],
+        ).fetchall()
+    ]
+    fills = (
+        journal.fills_for(conn, window_id=window_id, client_order_ids=session_ids)
+        if session_ids
+        else []
+    )
+    opens = slippage.read_opens(conn, fills) if fills else {}
+    summary = slippage.summarise(fills, opens, now)
     events_by_id: dict[str, list[OrderEventRow]] = {}
     for event in journal.order_events_for(conn, window_id=window_id, client_order_ids=ids):
         events_by_id.setdefault(event.client_order_id, []).append(event)
     fills_by_id: dict[str, list[OrderedFill]] = {}
     for item in fills:
         fills_by_id.setdefault(item.fill.client_order_id, []).append(item)
+    decision_ids = [o.decision_id for o in shown]
     decisions = {
-        entry.decision.decision_id: (entry.decision.decision, entry.decision.reason)
-        for entry in journal.decisions_for(conn, window_id)
+        d.decision_id: d
+        for d in journal._select(
+            conn, DecisionRow, "list_contains(?, t.decision_id)", [decision_ids]
+        )
     }
-    ranks: dict[tuple[int, str], int | None] = {}
-    for run_id in {o.run_id for o in shown}:
-        for signal in journal.signals_for(conn, run_id):
-            ranks[(run_id, signal.security_id)] = signal.rank
+    for order in shown:
+        if order.decision_id not in decisions:
+            raise journal.JournalIntegrityError(
+                f"order {order.client_order_id!r} has no decision {order.decision_id}"
+            )
+    # A catch-up order's run is not necessarily its plan's run. The decision
+    # names that run; require its matching paper_plan before using its signal.
+    rank_rows = conn.execute(
+        "SELECT d.decision_id, s.rank FROM decisions d "
+        "JOIN paper_plans p ON p.run_id = d.run_id "
+        "AND p.rebalance_session = d.rebalance_session "
+        "JOIN signals s ON s.run_id = p.run_id "
+        "AND s.rebalance_session = p.rebalance_session "
+        "AND s.security_id = d.security_id "
+        "WHERE list_contains(?, d.decision_id) "
+        "AND p.run_id IN (SELECT run_id FROM paper_runs WHERE window_id = ?)",
+        [decision_ids, window_id],
+    ).fetchall()
+    ranks = {decision_id: rank for decision_id, rank in rank_rows}
     rows = tuple(
         _row(
             order,
             fills_by_id.get(order.client_order_id, []),
             events_by_id.get(order.client_order_id, []),
-            decisions[order.decision_id],
-            ranks.get((order.run_id, order.security_id)),
+            (decisions[order.decision_id].decision, decisions[order.decision_id].reason),
+            None if is_full_exit(decisions[order.decision_id]) else ranks.get(order.decision_id),
             opens,
             now,
         )

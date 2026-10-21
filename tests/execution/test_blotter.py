@@ -17,6 +17,7 @@ from tradepartner.store.journal import (
     FillRow,
     OrderEventRow,
     OrderRow,
+    PaperPlanRow,
     PaperRunRow,
     SignalRow,
 )
@@ -72,11 +73,13 @@ def order(
     reason: str | None = None,
     quantity: float | None = 2.0,
     notional: float | None = None,
+    order_run_id: int | None = None,
 ) -> None:
     decision_id = journal.append(
         db,
         DecisionRow(
             run_id=run_id,
+            rebalance_session=session,
             security_id=symbol,
             side=side,
             whole_share=True,
@@ -91,7 +94,7 @@ def order(
         OrderRow(
             client_order_id=oid,
             decision_id=decision_id,
-            run_id=run_id,
+            run_id=order_run_id or run_id,
             session=session,
             attempt=1,
             phase="buy" if side == "buy" else "sell",
@@ -105,6 +108,18 @@ def order(
         ),
     )
     if rank is not None:
+        journal.append(
+            db,
+            PaperPlanRow(
+                run_id=run_id,
+                plan_trial_id=1,
+                rebalance_session=session,
+                n_universe=1,
+                n_targets=1,
+                n_orders_below_min_at_live_capital=0,
+                **stamp(),
+            ),
+        )
         journal.append(
             db,
             SignalRow(
@@ -158,7 +173,7 @@ def bar(db: duckdb.DuckDBPyConnection, symbol: str, open_: float, at: datetime) 
 def test_hand_values_status_reasons_scope_and_summary(conn: duckdb.DuckDBPyConnection) -> None:
     first = run(conn)
     other_window = run(conn, 2)
-    order(conn, first, "buy", "buy", rank=3, reason="left_targets")
+    order(conn, first, "buy", "buy", rank=3)
     order(conn, first, "sell", "sell", symbol="BBB", quantity=None, notional=99.5)
     order(conn, first, "reject", "buy", symbol="CCC", reason="left_universe")
     order(conn, first, "old", "buy", session=OTHER, symbol="DDD")
@@ -176,7 +191,7 @@ def test_hand_values_status_reasons_scope_and_summary(conn: duckdb.DuckDBPyConne
     assert rows["buy"].filled_quantity == 2.0
     assert rows["buy"].slippage_bp == pytest.approx(100.0)
     assert rows["buy"].signal_rank == 3
-    assert (rows["buy"].decision, rows["buy"].reason) == ("trade", "left_targets")
+    assert (rows["buy"].decision, rows["buy"].reason) == ("trade", None)
     assert (rows["sell"].notional, rows["sell"].quantity) == (99.5, None)
     assert rows["sell"].slippage_bp == pytest.approx(50.0)
     assert (rows["reject"].status, rows["reject"].fill_price) == ("rejected", None)
@@ -215,6 +230,8 @@ def test_superseded_fill_cap_and_read_only(conn: duckdb.DuckDBPyConnection) -> N
     fill(conn, "buy", 101.0, superseded_by=implied)
     bar(conn, "AAA", 100.0, session_close(SESSION))
     order(conn, rid, "second", "buy", symbol="BBB")
+    fill(conn, "second", 102.0)
+    bar(conn, "BBB", 100.0, session_close(SESSION))
     before = {
         name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
         for name in ("orders", "order_events", "fills", "signals", "decisions", "trials")
@@ -222,7 +239,7 @@ def test_superseded_fill_cap_and_read_only(conn: duckdb.DuckDBPyConnection) -> N
     result = blotter.session_blotter(conn, 1, SESSION, AFTER, 1)
     assert result.capped
     assert len(result.rows) == 1
-    assert result.summary.overall.count == 1
+    assert result.summary.overall.count == 2
     full = {r.client_order_id: r for r in blotter.session_blotter(conn, 1, SESSION, AFTER, 10).rows}
     assert full["buy"].fill_price == pytest.approx(100.0)
     assert before == {
@@ -254,3 +271,90 @@ def test_implied_fill_only_affects_vwap_and_first_terminal_status(
     assert row.fill_price == pytest.approx(100.5)
     assert row.slippage_bp == pytest.approx(50.0)
     assert row.status == "filled"
+
+
+def test_catch_up_uses_decisions_plan_rank_and_exit_has_none(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    planning_run = run(conn)
+    catch_up_run = run(conn)
+    order(conn, planning_run, "catchup", "buy", rank=7, order_run_id=catch_up_run)
+    exit_plan_run = run(conn)
+    order(conn, exit_plan_run, "exit", "sell", symbol="EXIT", rank=2, reason="left_targets")
+    rows = {r.client_order_id: r for r in blotter.session_blotter(conn, 1, SESSION, AFTER, 10).rows}
+    assert rows["catchup"].signal_rank == 7
+    assert rows["exit"].signal_rank is None
+
+
+def test_missing_decision_raises_journal_integrity_error(conn: duckdb.DuckDBPyConnection) -> None:
+    rid = run(conn)
+    journal.append(
+        conn,
+        OrderRow(
+            client_order_id="orphan-decision",
+            decision_id=999,
+            run_id=rid,
+            session=SESSION,
+            attempt=1,
+            phase="buy",
+            security_id="AAA",
+            symbol="AAA",
+            side="buy",
+            quantity=1.0,
+            sells_in_flight_at_submit=False,
+            **stamp(),
+        ),
+    )
+    with pytest.raises(journal.JournalIntegrityError, match=r"orphan-decision.*decision"):
+        blotter.session_blotter(conn, 1, SESSION, AFTER, 10)
+
+
+def test_zero_quantity_live_fill_is_a_no_bar_exclusion(conn: duckdb.DuckDBPyConnection) -> None:
+    rid = run(conn)
+    order(conn, rid, "zero", "buy")
+    stored_order = journal.orders_for(conn, window_id=1)[0]
+    fake = journal.OrderedFill(
+        FillRow(
+            client_order_id="zero",
+            filled_at=AT,
+            quantity=0.0,
+            price=100.0,
+            price_implied=False,
+            broker_fill_id="zero",
+            source="broker_feed",
+            **stamp(),
+        ),
+        side="buy",
+        security_id="AAA",
+        symbol="AAA",
+        run_id=rid,
+        window_id=1,
+        order_session=SESSION,
+    )
+    opens = {("AAA", SESSION): 100.0}
+    assert slippage.summarise([fake], opens, AFTER).no_bar == 1
+    row = blotter._row(stored_order, [fake], [], ("trade", None), None, opens, AFTER)
+    assert row.slippage_note == "no bar"
+
+
+def test_read_scopes_fills_to_session_ids(
+    conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rid = run(conn)
+    order(conn, rid, "here", "buy")
+    order(conn, rid, "other-day", "buy", session=OTHER, symbol="BBB")
+    another = run(conn, 2)
+    order(conn, another, "other-window", "buy", symbol="CCC")
+    real = journal.fills_for
+    seen: list[set[str]] = []
+
+    def scoped_fills(
+        db: duckdb.DuckDBPyConnection, *, window_id: int, client_order_ids: list[str]
+    ) -> list[journal.OrderedFill]:
+        seen.append(set(client_order_ids))
+        return real(db, window_id=window_id, client_order_ids=client_order_ids)
+
+    monkeypatch.setattr(blotter.journal, "fills_for", scoped_fills)
+    result = blotter.session_blotter(conn, 1, SESSION, AFTER, 1)
+    assert [r.client_order_id for r in result.rows] == ["here"]
+    assert seen == [{"here"}]
