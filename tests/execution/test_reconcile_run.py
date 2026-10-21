@@ -825,8 +825,9 @@ def test_a_split_known_at_close_of_the_previous_session_explains_the_new_quantit
     open_window: PaperWindowRow,
     fixed_clock: FixedClock,
 ) -> None:
+    fake.activities = [FUNDING]  # deposit just before the window starts
     _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
-    _split(journal_settings, SPY, 2.0, CUT - timedelta(minutes=1))
+    _split(journal_settings, SPY, 2.0, CUT)
     fake.extra_quantity["SPY"] = 10.0  # the broker booked the 2:1 split
 
     result = _reconcile(journal_settings, fake, open_window, fixed_clock)
@@ -834,6 +835,22 @@ def test_a_split_known_at_close_of_the_previous_session_explains_the_new_quantit
     assert result.status == OK
     assert result.adjustments == ()  # the ledger applies a split itself
     assert _adjustments(journal_settings, open_window) == []
+
+
+def test_no_split_keeps_the_original_quantity_at_reconcile(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    fake.activities = [FUNDING]
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert result.adjustments == ()
+    assert fake.positions()["SPY"].quantity == 10.0
 
 
 def test_a_split_known_only_after_close_of_the_previous_session_is_a_mismatch(

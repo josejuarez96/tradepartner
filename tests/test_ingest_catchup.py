@@ -128,7 +128,7 @@ def test_a_full_run_fetches_no_extra_sessions(
     assert run.status == OK, run.message
     bars = [call for call in prices.calls if call[0] == "bars"]
     assert bars == [("bars", tuple(sorted(IDS)), D, D)]
-    assert ("actions", tuple(sorted(IDS)), D.replace(day=1), D) in prices.calls
+    assert ("actions", tuple(sorted(IDS)), D.replace(day=1), next_session(D)) in prices.calls
     assert "catch-up: none" in run.message
     assert _sessions_stored(read) == set(_sessions(D6, D))
 
@@ -159,7 +159,7 @@ def test_a_caught_up_session_brings_its_month_of_actions(
     run = _alpaca(settings, prices).runs[-1]
     assert run.status == OK, run.message
     assert ("bars", tuple(sorted(IDS)), MAY_31, MAY_31) in prices.calls
-    assert ("actions", tuple(sorted(IDS)), date(2019, 5, 1), D) in prices.calls
+    assert ("actions", tuple(sorted(IDS)), date(2019, 5, 1), next_session(D)) in prices.calls
     assert _sessions_stored(read) == {*hole, MAY_31, D}
 
 

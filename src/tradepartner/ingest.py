@@ -3006,7 +3006,8 @@ def _fetch_prices(
             if first <= bar.session <= last
             and not (bar.session == session and bar.security_id in gap_only)
         ]
-    action_window = (runs[0][0].replace(day=1), session)
+    # The next XNYS session's actions are already knowable at today's close.
+    action_window = (runs[0][0].replace(day=1), next_session(session))
     actions = prices.corporate_actions(every, *action_window)
     action_summary = prices.resolution_summary()
     # A name change is asked for by `process_date` from one lag before the
@@ -3014,7 +3015,7 @@ def _fetch_prices(
     # stamped the next session's close, so the next month's first run must
     # still ask for it. Identity makes the overlap add nothing.
     lag = timedelta(days=settings.alpaca.actions_process_lag_days)
-    changes = prices.symbol_changes(every, action_window[0] - lag, action_window[1])
+    changes = prices.symbol_changes(every, action_window[0] - lag, session)
     change_summary = prices.resolution_summary()
     # Mergers (#1762): one symbol-less request over `process_date` from one lag
     # before the session, because an acquiree is usually delisted before Alpaca
