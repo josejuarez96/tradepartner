@@ -78,7 +78,7 @@ def _signed(**overrides: Any) -> Settings:
         gross_exposure=1.0,
         net_exposure=0.0,
         short_min_price=5.0,
-        short_cover_weight=0.10,
+        short_cover_weight=1.0,
     )
     return base.model_copy(update={"portfolio": portfolio})
 
