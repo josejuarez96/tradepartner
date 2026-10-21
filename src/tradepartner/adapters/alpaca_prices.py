@@ -384,6 +384,21 @@ _DIVIDEND_CATEGORIES = frozenset({"cash_dividends"})
 #: rows a resolution repair may judge).
 BAR_SOURCES = frozenset(f"alpaca_{feed}" for feed in _FEEDS)
 ACTIONS_SOURCE = _ACTIONS_SOURCE
+#: The suffix Alpaca puts on a when-issued symbol (#2112): a new spin-off
+#: child is named `MSGR.WI` in `spin_offs.new_symbol` (and can be held under
+#: it at the broker) before it trades regular-way as `MSGR`, the ticker the
+#: master lists. `execution.reconcile_run` reads the same suffix.
+WHEN_ISSUED_SUFFIX = ".WI"
+
+
+def regular_way_symbol(symbol: str) -> str:
+    """`symbol` without a trailing `WHEN_ISSUED_SUFFIX` (`MSGR.WI` -> `MSGR`),
+    else `symbol` as given (#2112). A bare `.WI` has no root and is returned
+    as given."""
+    if symbol.endswith(WHEN_ISSUED_SUFFIX) and len(symbol) > len(WHEN_ISSUED_SUFFIX):
+        return symbol[: -len(WHEN_ISSUED_SUFFIX)]
+    return symbol
+
 
 Resolve = Callable[[str, date], str | None]
 
@@ -2481,6 +2496,10 @@ def parse_corporate_actions(
     `stock_dividend_echo_tolerance` with `1 < amount < max`) is skipped
     and counted in `stock_ratio_cash`.
 
+    A `spin_offs` row's child is resolved under `regular_way_symbol(new_symbol)`
+    on its ex-date, so a when-issued `MSGR.WI` is the master's `MSGR` (#2112);
+    with no such listing that session it is unresolved under Alpaca's symbol.
+
     Several `spin_offs` rows of one identity (child, parent) are revisions
     of one record (#1673; spec "Spin-offs": a second distribution from the
     same parent to the same child is a revision of the first). Each distinct
@@ -2627,7 +2646,9 @@ def parse_corporate_actions(
                         row, "source_rate", positive=True
                     )
                     parent = holder(row["source_symbol"], previous_session(ex_date))
-                    child = holder(row["new_symbol"], ex_date)
+                    # A when-issued child (`MSGR.WI`) is resolved under its
+                    # regular-way root on its own first session (#2112).
+                    child = holder(regular_way_symbol(row["new_symbol"]), ex_date)
                     if parent is None:
                         unresolved.append((row["source_symbol"], ex_date))
                     if child is None:

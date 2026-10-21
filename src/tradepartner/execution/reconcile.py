@@ -65,7 +65,9 @@ difference an allowance absorbs is listed under `allowed`.
 - A spin-off child (`explanations.spinoffs`: child to parent and ratio) explains
   a broker position the ledger lacks when it is at most parent held x ratio and
   less than one share below it (cash in lieu of a fraction): a `spinoff_receipt`
-  adjustment adds it.
+  adjustment adds it. A child the caller mapped to its when-issued broker
+  symbol (`X.WI`, #2112) inside that band is `Allowed` ("when-issued spin-off
+  child") and never journaled, until a reconciliation sees it regular-way.
 - A ticker change known at close(S-1) (`explanations.symbol_changes`,
   `security_id` to `(old symbol, new symbol)`) is the one identity explanation
   (#1761): the caller has mapped the name to the broker's new symbol from the
@@ -141,6 +143,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 
+from tradepartner.adapters.alpaca_prices import WHEN_ISSUED_SUFFIX
 from tradepartner.adapters.broker import (
     TERMINAL_STATUSES,
     Account,
@@ -190,6 +193,9 @@ _DIVIDEND_TYPES = frozenset(
     {"DIV", "DIVCGL", "DIVCGS", "DIVNRA", "DIVROC", "DIVTW", "DIVFEE", "DIVTXEX"}
 )
 _CORPORATE_ACTION_TYPES = frozenset({"SSP", "SSO", "MA", "NC", "SC", "REORG"})
+#: The when-issued suffix (#2112): a spin-off child the caller mapped to `X.WI`
+#: is allowed, never journaled (`compare`'s spin-off rule).
+_WHEN_ISSUED = WHEN_ISSUED_SUFFIX
 
 
 def _cash_bound(cash_tolerance: float, fills_since_base: int) -> Decimal:
@@ -753,6 +759,14 @@ def compare(
             and received > due - 1
         ):
             expected[child] = received
+            if explanations.symbols.get(child, "").endswith(_WHEN_ISSUED):
+                # Held under its when-issued symbol (#2112): allowed, never
+                # journaled, so the ledger never holds a name its order path
+                # would trade under the regular-way ticker the broker does not
+                # hold yet. The first `ok` reconciliation that sees it
+                # regular-way journals the receipt.
+                allowed.append(Allowed("when-issued spin-off child", received, child))
+                continue
             explained.append(
                 ProposedAdjustment(
                     "spinoff_receipt", child, received, None, f"spin-off child of {parent}"
