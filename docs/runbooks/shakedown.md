@@ -58,16 +58,18 @@ During the span, do **not**: pull a schema bump into the job checkout, run a dat
 It restarts the span. Do not write a note; do not edit a threshold.
 1. Read the alert and `~/Library/Logs/tradepartner/paper.err.log`; fix the cause (see [alert kinds](scheduling.md#what-each-alert-kind-means-and-what-you-do)).
 2. Resume the book: `uv run tradepartner paper resume --book <book> --reason "root cause and what you checked"` ([full steps](scheduling.md#kill-switch-engage-and-the-resume-procedure)). Resume reconciles first and refuses if that fails.
-3. The new span starts at the session after the `released` row. Tell the orchestrator the new end date: ten sessions are needed from there, with the drill and 5 order sessions inside (a halt after the drill needs the drill kept: E.4 reads the span's rows).
+3. The new span starts at the session after the `released` row. Tell the orchestrator the new end date: ten sessions are needed from there, with the drill and 5 order sessions inside (E.4 reads only the span's rows, so a restart after 10-27 needs a new drill on `daily` inside the new span).
 4. Open a new `shakedown-span` row only if you want the count to start later; the restart is automatic.
 
 ## 4. 10-27: the drill, on `daily`
 
 Follow [the kill-switch drill](scheduling.md#the-kill-switch-drill-adr-0017-part-e4) exactly: `paper kill --book daily --reason "drill"` after the 10-26 evening ingest and before 08:05 on 10-27; let the scheduled run skip (no `kickstart`); `paper resume --book daily --reason "drill complete: ..."` once it has finished. An `orders` row for `daily`, or any result but `skipped_kill_switch`, is an incident: stop and tell the orchestrator.
 
-## 5. The end (after the 11-04 08:05 run)
+## 5. The end (after the 11-04 close and the 18:30 ingest)
 
-- [ ] Every book ran ok on 11-04 and reconciliation is `ok` (section 3).
+The span ends at the last completed session, so run the gate only once 11-04 has closed (the evening of 11-04 or later), never at 08:05 on 11-04: it would see nine sessions and E.1 fails.
+
+- [ ] Every book ran ok on the morning of 11-04 and reconciliation is `ok` (section 3).
 - [ ] `uv run tradepartner paper shakedown`. Exit 0 and seven `PASS` lines (E.1 to E.7) is the goal. Check the exit code with `echo $?` directly after.
 - [ ] If a line fails, read what it names; fix the cause, write a note if one is allowed, or restart the span. Never edit a threshold.
 - [ ] Exit 0: paste the seven lines on #1352 and tell the orchestrator. They go in the Phase 4 retro with the per-book run-time table and the span's `shakedown-span` and `shakedown-note` decisions. Only then does the data-foundation plan's one data sitting run.
