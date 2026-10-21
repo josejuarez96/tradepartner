@@ -619,6 +619,79 @@ def test_a_spinoff_known_only_after_the_cutoff_still_halts(
     assert _adjustments(journal_settings, open_window) == []
 
 
+#: The chained successor of `SPY` in the #2127 cases: the id the ledger holds
+#: once the 1:1 chain (`SPY` -> `SUCC`) is known at the cutoff.
+SUCC = "SEC_SUCC"
+
+
+def _chain(settings: Settings, predecessor: str, successor: str, known_at: datetime) -> None:
+    """A live `successor_chains` row (#821): `predecessor` -> `successor` known at
+    `known_at`."""
+    _fact(
+        settings,
+        "successor_chains",
+        predecessor_id=predecessor,
+        successor_id=successor,
+        evidence_accession="SEC-24-000001",
+        evidence_form="8-K12B",
+        retracted=False,
+        withdrawn_known_at=None,
+        known_at=known_at,
+        ingested_at=known_at,
+        source="edgar",
+        provenance="filing",
+    )
+
+
+def test_a_spinoff_of_a_chained_parent_resolves_to_the_held_successor(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """#2127: the ledger holds the chained successor `SUCC`, the id the chain's
+    re-keyed read carries the predecessor `SPY`'s history under. A `spinoff` row
+    whose parent is the predecessor `SPY` re-keys its parent to `SUCC`, so the
+    child is offered as `(SUCC, ratio)`; without the re-key the held parent is
+    missed and the child would halt."""
+    _hold(journal_settings, fake, open_window, {(SUCC, "SPY"): 10.0})
+    _spinoff(journal_settings, MTUM, SPY, 0.4, STAMP, ex_date=EX)
+    _chain(journal_settings, SPY, SUCC, CUT)
+
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            S2,
+            as_of=STAMP,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+
+    assert found.spinoffs == {MTUM: (SUCC, 0.4)}
+
+
+def test_a_spinoff_of_a_chain_not_yet_known_keeps_the_stored_parent(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """No look-ahead (#2127): with the `SPY` -> `SUCC` chain known only after the
+    cutoff (`close(S2)`), the read sees two securities and the spin-off's parent
+    stays `SPY`; the ledger holds `SUCC`, so the child explains nothing and is
+    left a mismatch, never re-keyed ahead of the chain."""
+    _hold(journal_settings, fake, open_window, {(SUCC, "SPY"): 10.0})
+    _spinoff(journal_settings, MTUM, SPY, 0.4, STAMP, ex_date=EX)
+    _chain(journal_settings, SPY, SUCC, session_close(S2))
+
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            S2,
+            as_of=STAMP,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+
+    assert found.spinoffs == {}
+
+
 def test_a_broker_symbol_the_journal_never_held_maps_through_its_listing(
     journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
 ) -> None:
