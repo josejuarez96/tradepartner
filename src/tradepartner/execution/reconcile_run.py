@@ -86,6 +86,29 @@ as_of`:
   `broker_only_position` mismatch (never a guess).
 - `reference_prices`: the raw close of the latest bar at or before S-1 per
   name, which bounds an ended name's proceeds and a pending order's reach.
+- `mergers` (paper spec amendment #1762 item 1, T249): the open mergers, from
+  `mergers_as_of(close(S-1))` for the journal's names. A merger is identified by
+  its Alpaca id, which every `corporate_action_cash` row journaled for it names
+  in `explanation_json` (`merger_id`). It is open at S when `effective_date <=
+  S` and either (a) the ledger stated through S still holds its acquiree, long
+  or short, or (b) the removal is journaled (its own row, or the ended-listing
+  band's `corporate_action_cash` removal row for the acquiree, linked by
+  `security_id`) and the merger is not closed. It closes when the journaled cash
+  is within the cash bound of the due, or once an `ok` reconciliation after its
+  window (`payable_date`, else `effective_date`, plus the frozen
+  `risk.reconcile_merger_lag_sessions` sessions) has run with the row known and
+  the removal journaled; a row first known after its window's close opens
+  nothing under (b). `final` marks the first completed (`ok` or `mismatch`)
+  reconciliation after the window with the row known, unless an earlier one
+  already ran with the removal journaled or named the merger's due: that one
+  checks the due once. A reconciliation row's session is `command_session` of
+  its `at`. When one acquiree has several open ids, the latest
+  `effective_date` (then id) is passed. The acquirers join the names mapped to
+  broker symbols. Two ids for one acquiree and one `effective_date`
+  (`merger_conflict`) are never passed: the first reconciliation that knows
+  both, while either is open or has rows journaled, raises the pair in
+  `merger_conflicts`; any reconciliation row that already raised it (any
+  status) closes the pair for good.
 
 **`reconcile_command`** is `paper reconcile --book <book>` (`book_id`, default
 `paper.book_id`; ADR 0017 B.3 to B.5, plan T155). It takes the book's run lock
@@ -108,11 +131,13 @@ collections.
 from __future__ import annotations
 
 import json
+import math
 from collections import defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -129,17 +154,26 @@ from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.plan import current_listings
 from tradepartner.execution.reconcile import (
+    MERGER_CONFLICT,
     MISMATCH,
     OK,
     Explanations,
     JournalOpenOrder,
+    OpenMerger,
     Reconciliation,
+    _cash_bound,
     compare,
+    merger_due_detail,
 )
 from tradepartner.execution.risk import order_shape_violation
 from tradepartner.execution.symbols import broker_symbol
 from tradepartner.store import registry
-from tradepartner.store.asof import live_actions_as_of, prices_as_of, symbol_changes_as_of
+from tradepartner.store.asof import (
+    live_actions_as_of,
+    mergers_as_of,
+    prices_as_of,
+    symbol_changes_as_of,
+)
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.dividend_reviews import (
     ReviewedGroup,
@@ -173,6 +207,11 @@ _DIVIDEND_CASH = "dividend_cash"
 _SPLIT = "split"
 _SPINOFF = "spinoff"
 _RISK_PREFIX = "risk."
+_CORPORATE_ACTION_CASH = "corporate_action_cash"
+#: The reconciliation statuses that ran to the end: a merger's last check counts
+#: only these, never a `fills_lagging` or `pending_unresolved` one (T249).
+_COMPLETED = frozenset({OK, MISMATCH})
+_DEFAULT_RISK = RiskConfig()
 _FAULT_TYPE = ReconciliationError.__name__
 
 
@@ -189,6 +228,9 @@ class _JournalState:
     orders: list[OrderRow]
     adjustments: list[AdjustmentRow]
     ok_rows: list[ReconciliationRow]
+    #: Every reconciliation row known at the cut, any status (T249: a merger's
+    #: last check and a conflicting pair's one halt are read from them).
+    rows: list[ReconciliationRow] = field(default_factory=list)
 
     def base(self, through: date) -> ReconciliationRow | None:
         """The latest `ok` reconciliation stated on or before `through`: the
@@ -240,8 +282,12 @@ def frozen_risk(window: PaperWindowRow) -> RiskConfig:
     risk = {k[len(_RISK_PREFIX) :]: v for k, v in parsed.items() if k.startswith(_RISK_PREFIX)}
     # A window frozen before T202 has no `risk.max_skip_share`: read it as 0, so the
     # skip cap stays max(max_skips_per_run, 0) (paper spec amendment 2026-10-18 item 3).
-    # The one key back-filled; every other missing key still refuses.
+    # It and the merger lag below are the two keys back-filled; every other missing
+    # key still refuses.
     risk.setdefault("max_skip_share", 0.0)
+    # A window frozen before T249 has no `risk.reconcile_merger_lag_sessions`: read
+    # it at its default (paper spec amendment #1762 item 10).
+    risk.setdefault("reconcile_merger_lag_sessions", _DEFAULT_RISK.reconcile_merger_lag_sessions)
     missing = sorted(set(RiskConfig.model_fields) - set(risk))
     if missing:
         raise ValueError(f"window {window.window_id} frozen_json lacks risk keys {missing}")
@@ -292,15 +338,13 @@ def _journal_state(
 ) -> _JournalState:
     """The window's journal rows known at `as_of` (`known_at <= as_of`): the one
     place the ledger's and the explanations' journal input is cut (#488)."""
+    rows = [r for r in reconciliations_for(conn, window_id) if r.known_at <= as_of]
     return _JournalState(
         fills=[f for f in fills_for(conn, window_id=window_id) if f.fill.known_at <= as_of],
         orders=[o for o in orders_for(conn, window_id=window_id) if o.known_at <= as_of],
         adjustments=[a for a in adjustments_for(conn, window_id) if a.known_at <= as_of],
-        ok_rows=[
-            r
-            for r in reconciliations_for(conn, window_id)
-            if r.status == OK and r.known_at <= as_of
-        ],
+        ok_rows=[r for r in rows if r.status == OK],
+        rows=rows,
     )
 
 
@@ -602,6 +646,9 @@ def _explanations(
     broker_symbols: Collection[str],
     tolerance: float,
     through: date,
+    *,
+    merger_lag_sessions: int,
+    cash_tolerance: float,
 ) -> Explanations:
     cut = _cut(session)
     names = (
@@ -611,13 +658,27 @@ def _explanations(
     )
     order_symbols = {o.security_id: o.symbol for o in state.orders}
     current = current_listings(listing_ends_as_of(conn, cut, settings), session)
-    symbols, symbol_changes = _symbols(
+    mergers, merger_conflicts, acquirers = _mergers(
+        conn,
+        state,
         names,
+        session,
+        _ledger(state, actions, window, through, tolerance),
+        tolerance,
+        merger_lag_sessions,
+        cash_tolerance,
+    )
+    # The acquirers join the mapped names before the map is built (#1762 item
+    # 1), so a symbol an acquirer shares with its acquiree is resolved by
+    # `_symbols`' one-name-per-symbol rule, never a crash.
+    mapped = names | acquirers
+    symbols, symbol_changes = _symbols(
+        mapped,
         order_symbols,
         current,
         broker_symbols,
         settings.alpaca.class_symbols,
-        _symbol_change_candidates(conn, cut, names),
+        _symbol_change_candidates(conn, cut, mapped),
     )
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))
@@ -643,6 +704,8 @@ def _explanations(
         seen_activity_ids=seen_ids,
         activity_seen_before=seen_before,
         symbol_changes=symbol_changes,
+        mergers=mergers,
+        merger_conflicts=merger_conflicts,
     )
 
 
@@ -714,6 +777,214 @@ def _seen_activities(
     return booked, window.started_at.astimezone(_NEW_YORK).date()
 
 
+def _merger_id_of(adjustment: AdjustmentRow) -> str | None:
+    """The merger id an adjustment's `explanation_json` names, else None."""
+    if adjustment.explanation_json is None:
+        return None
+    try:
+        payload = json.loads(adjustment.explanation_json)
+    except (ValueError, TypeError):
+        return None
+    value = payload.get("merger_id") if isinstance(payload, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def _row_mismatches(row: ReconciliationRow) -> list[dict[str, Any]]:
+    """The mismatches a reconciliation row recorded (empty when none or unreadable)."""
+    if row.mismatches_json is None:
+        return []
+    try:
+        payload = json.loads(row.mismatches_json)
+    except (ValueError, TypeError):
+        return []
+    found = payload.get("mismatches") if isinstance(payload, dict) else None
+    return [m for m in found if isinstance(m, dict)] if isinstance(found, list) else []
+
+
+def _conflict_detail(name: str, effective_date: date, ids: Sequence[str]) -> str:
+    """The `merger_conflict` detail: every id quoted, so a read-back matches whole ids."""
+    quoted = ", ".join(repr(i) for i in ids)
+    return f"merger ids [{quoted}] for {name} effective {effective_date.isoformat()}"
+
+
+def _raised_conflict(row: ReconciliationRow, name: str, ids: Sequence[str]) -> bool:
+    """Whether `row` already raised the conflicting pair `ids` on `name`."""
+    return any(
+        m.get("kind") == MERGER_CONFLICT
+        and m.get("security_id") == name
+        and all(repr(i) in str(m.get("detail", "")) for i in ids)
+        for m in _row_mismatches(row)
+    )
+
+
+def _named_due(row: ReconciliationRow, name: str, merger_id: str) -> bool:
+    """Whether `row` recorded the `cash` mismatch of `merger_id`'s unmet due."""
+    return any(
+        m.get("kind") == "cash"
+        and m.get("security_id") == name
+        and str(m.get("detail", "")).startswith(merger_due_detail(merger_id))
+        for m in _row_mismatches(row)
+    )
+
+
+def _merger_first_known(
+    conn: duckdb.DuckDBPyConnection, cut: datetime, names: Sequence[str]
+) -> dict[tuple[str, str], datetime]:
+    """When each merger identity `(acquiree, id)` was first known, at or before
+    `cut`: its earliest stored revision's `known_at` (a later revision does not
+    move when the merger became known)."""
+    rows = conn.execute(
+        """
+        SELECT security_id, source_action_id, min(known_at) FROM mergers
+        WHERE known_at <= ? AND list_contains(?, security_id)
+        GROUP BY security_id, source_action_id
+        """,
+        [cut, list(names)],
+    ).fetchall()
+    return {(str(r[0]), str(r[1])): ensure_tz_aware_utc(r[2], field_name="known_at") for r in rows}
+
+
+def _window_end(row: Mapping[str, Any], lag_sessions: int) -> date:
+    """A merger's window end: `payable_date` (else `effective_date`) plus
+    `lag_sessions` XNYS sessions (#1762 item 4)."""
+    end: date = row["payable_date"] if row["payable_date"] is not None else row["effective_date"]
+    for _ in range(lag_sessions):
+        end = next_session(end)
+    return end
+
+
+def _mergers(
+    conn: duckdb.DuckDBPyConnection,
+    state: _JournalState,
+    names: Collection[str],
+    session: date,
+    ledger: Ledger,
+    tolerance: float,
+    lag_sessions: int,
+    cash_tolerance: float,
+) -> tuple[dict[str, OpenMerger], dict[str, str], set[str]]:
+    """The open mergers by acquiree, the conflicting pairs raised at this
+    reconciliation, and the acquirers to map (module docstring, `mergers`).
+
+    Every row is read from `mergers_as_of(close(S-1))`, so a row known later
+    explains nothing at S. `ledger` is the ledger stated through S."""
+    cut = _cut(session)
+    frame = mergers_as_of(conn, cut, sorted(names))
+    rows = [r for r in frame.iter_rows(named=True) if r["security_id"] in names]
+    acquirers = {
+        str(r["acquirer_security_id"]) for r in rows if r["acquirer_security_id"] is not None
+    }
+    if not rows:
+        return {}, {}, acquirers
+    first_known = _merger_first_known(conn, cut, sorted({r["security_id"] for r in rows}))
+    own: dict[str, list[AdjustmentRow]] = defaultdict(list)
+    band: dict[str, list[AdjustmentRow]] = defaultdict(list)
+    for adjustment in state.adjustments:
+        merger_id = _merger_id_of(adjustment)
+        if merger_id is not None:
+            own[merger_id].append(adjustment)
+        elif (
+            adjustment.kind == _CORPORATE_ACTION_CASH
+            and adjustment.security_id is not None
+            and adjustment.quantity is not None
+            and adjustment.quantity < 0
+        ):
+            band[adjustment.security_id].append(adjustment)
+    completed = [(row, command_session(row.at)) for row in state.rows if row.status in _COMPLETED]
+    bound = _cash_bound(cash_tolerance, ledger.fills_since_base)
+
+    # Per (acquiree, id): the merger, whether it is open, and whether it is
+    # active for a conflict (open, or with rows journaled).
+    found: dict[tuple[str, str], tuple[OpenMerger, bool, bool]] = {}
+    for row in rows:
+        name, merger_id = str(row["security_id"]), str(row["source_action_id"])
+        end = _window_end(row, lag_sessions)
+        known = first_known.get((name, merger_id), row["known_at"])
+        own_rows = sorted(own.get(merger_id, []), key=lambda a: a.known_at)
+        removal = next((a for a in own_rows if a.quantity is not None), None)
+        from_band = removal is None and bool(band.get(name))
+        if from_band:
+            removal = max(band[name], key=lambda a: a.known_at)
+        journaled = math.fsum(a.cash for a in own_rows if a.cash is not None)
+        if from_band and removal is not None and removal.cash is not None:
+            journaled += removal.cash
+        held = (
+            ledger.positions.get(name, 0.0) > tolerance
+            or ledger.short_holdings.get(name, 0.0) > tolerance
+        )
+        effective = row["effective_date"] <= session
+
+        def after_end(stated: date, end: date = end, known: datetime = known) -> bool:
+            # A reconciliation stated after the window, with the row known at its cut.
+            return stated > end and known <= _cut(stated)
+
+        open_held = effective and held
+        open_removed = False
+        removed_quantity: float | None = None
+        if removal is not None and removal.quantity is not None and effective and not held:
+            removed_quantity = -removal.quantity
+            rate = row["cash_per_share"] if row["cash_per_share"] is not None else 0.0
+            upper = Decimal(str(removed_quantity * float(rate)))
+            paid = Decimal(str(journaled)) >= upper - bound
+            closed = any(
+                r.status == OK and after_end(stated) and removal.known_at <= r.known_at
+                for r, stated in completed
+            )
+            ended_when_known = known > session_close(end)
+            open_removed = not (paid or closed or ended_when_known)
+        is_open = open_held or open_removed
+        checked = any(
+            after_end(stated)
+            and (
+                (removal is not None and removal.known_at <= r.known_at)
+                or _named_due(r, name, merger_id)
+            )
+            for r, stated in completed
+        )
+        merger = OpenMerger(
+            merger_id=merger_id,
+            kind=str(row["kind"]),
+            acquirer=row["acquirer_security_id"],
+            share_ratio=row["share_ratio"],
+            cash_per_share=row["cash_per_share"],
+            effective_date=row["effective_date"],
+            payable_date=row["payable_date"],
+            window_end=end,
+            removed_quantity=None if open_held else removed_quantity,
+            journaled_cash=journaled,
+            final=is_open and session > end and not checked,
+        )
+        found[(name, merger_id)] = (merger, is_open, is_open or bool(own_rows))
+
+    by_deal: dict[tuple[str, date], list[str]] = defaultdict(list)
+    for (name, merger_id), (merger, _open, _active) in found.items():
+        by_deal[(name, merger.effective_date)].append(merger_id)
+    conflicts: dict[str, str] = {}
+    excluded: set[tuple[str, str]] = set()
+    for (name, effective_date), ids in sorted(by_deal.items()):
+        if len(ids) < 2:
+            continue
+        ids = sorted(ids)
+        excluded |= {(name, i) for i in ids}
+        if any(_raised_conflict(r, name, ids) for r in state.rows):
+            continue
+        if any(found[(name, i)][2] for i in ids):
+            detail = _conflict_detail(name, effective_date, ids)
+            conflicts[name] = f"{conflicts[name]}; {detail}" if name in conflicts else detail
+
+    open_by_name: dict[str, OpenMerger] = {}
+    for (name, merger_id), (merger, is_open, _active) in sorted(found.items()):
+        if (name, merger_id) in excluded or not is_open:
+            continue
+        current = open_by_name.get(name)
+        if current is None or (merger.effective_date, merger.merger_id) > (
+            current.effective_date,
+            current.merger_id,
+        ):
+            open_by_name[name] = merger
+    return open_by_name, conflicts, acquirers
+
+
 def explanations_as_of(
     conn: duckdb.DuckDBPyConnection,
     window: PaperWindowRow,
@@ -723,6 +994,8 @@ def explanations_as_of(
     settings: Settings,
     broker_symbols: Collection[str] = (),
     quantity_tolerance: float,
+    merger_lag_sessions: int = _DEFAULT_RISK.reconcile_merger_lag_sessions,
+    cash_tolerance: float = _DEFAULT_RISK.reconcile_cash_tolerance,
 ) -> Explanations:
     """What the store knew at close(S-1), and the journal at `as_of`, to explain
     the broker on S (module docstring). Read-only. `as_of` is the journal cut
@@ -730,14 +1003,28 @@ def explanations_as_of(
     the journal never held can still be matched, and a held name whose ticker
     changed at close(S-1) maps to the broker's new symbol (#1761). `settings`
     gives `master.transfer_window_sessions` for the listing ends, and
-    `quantity_tolerance` is the frozen `risk.reconcile_quantity_tolerance`.
+    `quantity_tolerance` is the frozen `risk.reconcile_quantity_tolerance`;
+    `merger_lag_sessions` and `cash_tolerance` are the frozen
+    `risk.reconcile_merger_lag_sessions` and `risk.reconcile_cash_tolerance`
+    (their defaults when not given), which an open merger's window and its
+    paid-in-full test read (T249).
     Raises `ValueError` for a non-session `session` or a naive `as_of`."""
     cut = _cut(session)
     as_of = ensure_tz_aware_utc(as_of, field_name="as_of")
     state = _journal_state(conn, _window_id(window), as_of)
     actions = live_actions_as_of(conn, cut)
     return _explanations(
-        conn, state, actions, window, session, settings, broker_symbols, quantity_tolerance, session
+        conn,
+        state,
+        actions,
+        window,
+        session,
+        settings,
+        broker_symbols,
+        quantity_tolerance,
+        session,
+        merger_lag_sessions=merger_lag_sessions,
+        cash_tolerance=cash_tolerance,
     )
 
 
@@ -760,12 +1047,15 @@ def _open_orders(
     return orders, pending, sums
 
 
-def _explanation_json(text: str, reconciliation_id: int | None) -> str:
-    return json.dumps(
-        {"explanation": text, "reconciliation_id": reconciliation_id},
-        sort_keys=True,
-        allow_nan=False,
-    )
+def _explanation_json(
+    text: str, reconciliation_id: int | None, merger_id: str | None = None
+) -> str:
+    """An adjustment's `explanation_json`: its text, the reconciliation that
+    journaled it and, for a merger's row, the merger id (#1762, T249)."""
+    payload: dict[str, object] = {"explanation": text, "reconciliation_id": reconciliation_id}
+    if merger_id is not None:
+        payload["merger_id"] = merger_id
+    return json.dumps(payload, sort_keys=True, allow_nan=False)
 
 
 def reconcile_now(
@@ -839,7 +1129,17 @@ def reconcile_now(
         state = _journal_state(conn, window_id, as_of)
         actions = live_actions_as_of(conn, cut)
         explanations = _explanations(
-            conn, state, actions, window, session, settings, positions.keys(), tolerance, through
+            conn,
+            state,
+            actions,
+            window,
+            session,
+            settings,
+            positions.keys(),
+            tolerance,
+            through,
+            merger_lag_sessions=frozen.reconcile_merger_lag_sessions,
+            cash_tolerance=frozen.reconcile_cash_tolerance,
         )
     # The read-only `_explanations` names the seen-sets and fallback; the broker's
     # cash activities are attached here (they are a broker input, never a journal
@@ -896,7 +1196,9 @@ def reconcile_now(
                     security_id=adjustment.security_id,
                     quantity=adjustment.quantity,
                     cash=adjustment.cash,
-                    explanation_json=_explanation_json(adjustment.explanation, reconciliation_id),
+                    explanation_json=_explanation_json(
+                        adjustment.explanation, reconciliation_id, adjustment.merger_id
+                    ),
                     book_id=window.book_id,
                     broker_activity_id=adjustment.broker_activity_id,
                     known_at=stamp,

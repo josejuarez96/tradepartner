@@ -1221,12 +1221,26 @@ def test_frozen_risk_reads_a_frozen_max_skip_share_as_frozen() -> None:
     assert frozen_risk(_window_with(json.dumps(values))).max_skip_share == pytest.approx(0.2)
 
 
+def test_frozen_risk_reads_a_window_frozen_before_the_merger_lag_at_its_default() -> None:
+    """Paper spec amendment #1762 item 10 (T249): a window frozen before T249 has
+    no `risk.reconcile_merger_lag_sessions` and reads it at 5; a frozen value is
+    read as frozen."""
+    values = _todays_risk_keys_without("reconcile_merger_lag_sessions")
+    assert frozen_risk(_window_with(json.dumps(values))).reconcile_merger_lag_sessions == 5
+    frozen = _todays_risk_keys_without() | {"risk.reconcile_merger_lag_sessions": 2}
+    assert frozen_risk(_window_with(json.dumps(frozen))).reconcile_merger_lag_sessions == 2
+
+
+_BACK_FILLED = ("max_skip_share", "reconcile_merger_lag_sessions")
+
+
 @pytest.mark.parametrize(
-    "missing", sorted(k for k in RiskConfig.model_fields if k != "max_skip_share")
+    "missing", sorted(k for k in RiskConfig.model_fields if k not in _BACK_FILLED)
 )
 def test_frozen_risk_still_refuses_a_window_lacking_any_other_risk_key(missing: str) -> None:
-    """The back-fill is for `risk.max_skip_share` alone: a `frozen_json` lacking
-    any other `RiskConfig` key still refuses, naming it."""
+    """The back-fill is for `risk.max_skip_share` and
+    `risk.reconcile_merger_lag_sessions` alone: a `frozen_json` lacking any other
+    `RiskConfig` key still refuses, naming it."""
     values = _todays_risk_keys_without(missing)
     with pytest.raises(ValueError, match=f"window 7 frozen_json lacks risk keys.*{missing}"):
         frozen_risk(_window_with(json.dumps(values)))
