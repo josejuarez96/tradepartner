@@ -413,7 +413,7 @@ from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
 from tradepartner.corpus import departure_fetch
 from tradepartner.execution import check as paper_check
-from tradepartner.execution import lots_reconcile, ops, reconcile_run, window
+from tradepartner.execution import lots_reconcile, ops, reconcile_run, waiting, window
 from tradepartner.execution import report as paper_report
 from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
@@ -1652,6 +1652,20 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
     return lines
 
 
+def _waiting_lines(items: Sequence[waiting.WaitingItem]) -> list[str]:
+    """Format the owner queue after all `paper status --all` book lines."""
+    if not items:
+        return ["waiting on you: nothing"]
+    lines = [f"waiting on you ({len(items)}):"]
+    for item in items:
+        since = _fmt(item.since)
+        lines.append(
+            f"  book {item.book_id}; {item.kind}: {item.detail}; "
+            f"since {since}; command {item.command or '-'}"
+        )
+    return lines
+
+
 def _for_book(book: str | None) -> str:
     """` for book 'b'` when `--book` named one, else nothing (H1's output keeps
     its bytes)."""
@@ -1687,7 +1701,7 @@ def _status_lines(
         *paper_slippage.slippage_report_lines(fill_slippage),
         f"alerts ({len(data.alerts)}{', capped' if data.alerts_capped else ''}):",
     ]
-    lines += [f"  {a.at} {a.kind} {a.session}: {a.message}" for a in data.alerts]
+    lines += [f"  #{a.alert_id} {a.at} {a.kind} {a.session}: {a.message}" for a in data.alerts]
     return lines
 
 
@@ -4406,18 +4420,27 @@ def make_app(
         s = paper_settings()
         if every_book:
 
-            def read_all() -> tuple[ops.BookSummary, ...] | str:
+            def read_all() -> (
+                tuple[tuple[ops.BookSummary, ...], tuple[waiting.WaitingItem, ...]] | str
+            ):
                 with open_read_only(s) as conn:
                     try:
-                        return ops.book_summaries(conn, s)
+                        summaries = ops.book_summaries(conn, s)
+                        items = ops.waiting_on_owner(
+                            conn, s, ensure_tz_aware_utc(clock(), field_name="clock()")
+                        )
+                        return summaries, items
                     except schema.SchemaVersionError as exc:
                         return str(exc)
 
-            summaries = _paper_call(s, read_all)
-            if isinstance(summaries, str):  # the journal predates version 17
-                _echo_scrubbed(f"paper status: {summaries}", s)
+            result = _paper_call(s, read_all)
+            if isinstance(result, str):  # the journal predates version 17
+                _echo_scrubbed(f"paper status: {result}", s)
                 raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
+            summaries, items = result
             for line in _summary_lines(summaries):
+                _echo_scrubbed(line, s)
+            for line in _waiting_lines(items):
                 _echo_scrubbed(line, s)
             return
 

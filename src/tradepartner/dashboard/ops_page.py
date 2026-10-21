@@ -33,11 +33,12 @@ import streamlit as st
 
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
-from tradepartner.execution import ops
+from tradepartner.execution import headroom, ops, waiting
 from tradepartner.execution.ops import OpsData, OrderChain, RankedSignal
 from tradepartner.execution.switch import SwitchState
 from tradepartner.store import journal
 from tradepartner.store.asof import listings_as_of
+from tradepartner.store.db import utc_now
 from tradepartner.store.journal import AlertRow, ReconciliationRow
 from tradepartner.store.schema import SchemaVersionError
 
@@ -183,6 +184,27 @@ def _summary_card(summaries: tuple[ops.BookSummary, ...]) -> None:
     with st.container(border=True):
         st.subheader("Books")
         st.dataframe(_summary_table(summaries), hide_index=True)
+
+
+def _waiting_card(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    """Show every open book's owner queue, independent of the selected book."""
+    try:
+        items: tuple[waiting.WaitingItem, ...] = ops.waiting_on_owner(conn, settings, utc_now())
+    except SchemaVersionError:
+        return  # The outdated-journal panel below explains this store.
+    with st.container(border=True):
+        st.subheader("Waiting on you")
+        if not items:
+            theme.status_badge("Nothing is waiting on you", "good")
+            return
+        for item in items:
+            status: theme.Status = "critical" if item.kind == "kill_switch_engaged" else "warning"
+            theme.status_badge(f"{item.book_id}: {item.kind}", status)
+            st.caption(f"{item.detail} · since {item.since or '-'}")
+            if item.command is not None:
+                st.code(item.command, language="bash")
+            else:
+                st.caption("No command; follow the detail above.")
 
 
 def _kpis(data: OpsData) -> None:
@@ -362,6 +384,108 @@ def _reconciliation_card(reconciliation: ReconciliationRow | None) -> None:
             st.caption(reconciliation.mismatches_json)
 
 
+_RISK_STATUS_TEXT = {"within": "within", "over": "at or over", "engaged": "engaged"}
+_RISK_SCHEMA: dict[str, pl.DataType] = {
+    "limit": pl.Utf8(),
+    "value": pl.Utf8(),
+    "frozen limit": pl.Utf8(),
+    "headroom": pl.Utf8(),
+    "status": pl.Utf8(),
+    "what the limit does": pl.Utf8(),
+}
+
+
+def _risk_chip_status(row: headroom.LimitRow) -> theme.Status:
+    """Within is good; at or over is a warning, except the drawdown, whose
+    crossing engages the kill switch (critical, as is an engaged trigger)."""
+    if row.status == "within":
+        return "good"
+    return "critical" if row.key == "drawdown" else "warning"
+
+
+def _risk_number(row: headroom.LimitRow, number: float) -> str:
+    """Cash and drawdown read as a percentage; gross and a position as a weight."""
+    return f"{number:.2%}" if row.key in ("cash", "drawdown") else f"{number:.2f}"
+
+
+def _risk_value(card: headroom.Headroom, row: headroom.LimitRow) -> str:
+    if row.key != "position":
+        return _risk_number(row, row.value)
+    if card.largest_security_id is None:
+        return "none"
+    name = card.largest_ticker or f"Ticker unavailable ({card.largest_security_id})"
+    return f"{name} {row.value:.2f}"
+
+
+def _risk_headroom(row: headroom.LimitRow) -> str:
+    if row.headroom_pp > 0 and row.status == "within":
+        return f"{row.headroom_pp:.2f} pp left"
+    return f"over by {-row.headroom_pp:.2f} pp" if row.headroom_pp < 0 else "at the limit"
+
+
+def _risk_table(card: headroom.Headroom) -> pl.DataFrame:
+    return pl.DataFrame(
+        [
+            {
+                "limit": row.label,
+                "value": _risk_value(card, row),
+                "frozen limit": _risk_number(row, row.limit),
+                "headroom": _risk_headroom(row),
+                "status": _RISK_STATUS_TEXT[row.status],
+                "what the limit does": row.does,
+            }
+            for row in card.rows
+        ],
+        schema=_RISK_SCHEMA,
+    )
+
+
+def _risk_card(conn: duckdb.DuckDBPyConnection, window: journal.PaperWindowRow) -> None:
+    """The Risk card (plan T260): each limit the run enforces, the window's
+    frozen value, the headroom left and what crossing it does
+    (`execution.headroom`). An unreadable mark or `frozen_json` shows its
+    message here, not a crash."""
+    with st.container(border=True):
+        st.subheader("Risk")
+        try:
+            card = headroom.read(conn, window)
+        except ValueError as exc:  # UnreadableMarkError is a ValueError
+            theme.status_badge("Risk limits unreadable", "critical")
+            st.caption(str(exc))
+            return
+        if card.session is None:
+            st.caption(
+                f"Before the first mark: the window's starting cash {card.cash:,.2f} and "
+                f"equity {card.equity:,.2f}, no positions."
+            )
+        else:
+            st.caption(f"Ledger equity {card.equity:,.2f}, as of the close of {card.session}.")
+        if card.long_short:
+            theme.status_badge("short limits not shown yet", "warning")
+        for row in card.rows:
+            theme.status_badge(
+                f"{row.label}: {_RISK_STATUS_TEXT[row.status]}", _risk_chip_status(row)
+            )
+        st.dataframe(_risk_table(card), hide_index=True)
+        if card.drawdown_engaged:
+            st.caption("The drawdown trigger has engaged the kill switch; it rearms at a release.")
+        elif card.dollars_before_switch > 0:
+            st.caption(
+                f"Equity can fall ${card.dollars_before_switch:,.2f} before the kill switch "
+                "engages."
+            )
+        else:
+            st.caption(
+                f"Equity is ${-card.dollars_before_switch:,.2f} at or past the kill switch's "
+                "trigger level, peak x (1 - limit)."
+            )
+        st.caption(
+            f"Drawdown is measured from the rule's peak, ${card.peak:,.2f}: the last "
+            "release's peak equity, else the starting equity. Cash is the ledger's cash "
+            "less held shorts; the unspent_cash alert reads the broker's."
+        )
+
+
 def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) -> None:
     """Draw the operations page from the shell's read-only connection."""
     if settings is None:
@@ -369,6 +493,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
 
     st.header("Operations")
     summaries = _book_summaries(conn, settings)
+    _waiting_card(conn, settings)
     if summaries:
         _summary_card(summaries)
     book = _selected_book(summaries, settings.paper.book_id)
@@ -389,6 +514,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
         theme.status_badge("stale: no run yet for the required session", "warning")
 
     _kpis(data)
+    _risk_card(conn, data.window)
     if data.open_orders_count and data.last_run_kind == "rebalance":
         st.info("Fills are recorded at the next scheduled run")
     symbols = _symbols(conn, data)

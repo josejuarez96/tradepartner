@@ -85,6 +85,7 @@ from tradepartner.dashboard import (
     override_page,
     performance_page,
     research_page,
+    trades_page,
     trials_page,
 )
 from tradepartner.store.db import StoreLockedError, open_read_only
@@ -196,6 +197,7 @@ _PAGES: dict[str, Callable[[duckdb.DuckDBPyConnection], None]] = {
     "Trial registry": trials_page.render,
     "Research": research_page.render,
     "Operations": ops_page.render,
+    "Trades": trades_page.render,
     "Performance": performance_page.render,
     _OVERRIDE_PAGE: override_page.render,
 }
