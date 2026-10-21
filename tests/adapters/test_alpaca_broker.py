@@ -976,6 +976,95 @@ def test_a_fill_whose_order_cannot_be_resolved_raises_system_fault() -> None:
         broker.fills()
 
 
+#: The three Alpaca paper rows of order 30e87f04 (book daily, 2026-10-20, #2149):
+#: a `fill` of 1 corrected 2 ms later by a `partial_fill` of -0.64777629.
+_RAL_ORDER = "30e87f04-7701-4498-92cc-5a191a2e6c12"
+_RAL_ROWS: list[dict[str, Any]] = [
+    {
+        "id": "20261020093049795::a",
+        "activity_type": "FILL",
+        "transaction_time": "2026-10-20T13:30:49.795092Z",
+        "type": "partial_fill",
+        "price": "67.23",
+        "qty": "7",
+        "side": "buy",
+        "symbol": "RAL",
+        "leaves_qty": "0.352223709",
+        "order_id": _RAL_ORDER,
+        "cum_qty": "7",
+        "order_status": "partially_filled",
+    },
+    {
+        "id": "20261020093112899::06fa04cb-5704-494f-b5ac-aadcd8ffa6b0",
+        "activity_type": "FILL",
+        "transaction_time": "2026-10-20T13:31:12.899373Z",
+        "type": "fill",
+        "price": "67.23",
+        "qty": "1",
+        "side": "buy",
+        "symbol": "RAL",
+        "leaves_qty": "0",
+        "order_id": _RAL_ORDER,
+        "cum_qty": "7.35222371",
+        "order_status": "filled",
+    },
+    {
+        "id": "20261020093112901::df3177eb-37b1-42bb-b404-ea6e94174a75",
+        "activity_type": "FILL",
+        "transaction_time": "2026-10-20T13:31:12.901007Z",
+        "type": "partial_fill",
+        "price": "67.23",
+        "qty": "-0.64777629",
+        "side": "buy",
+        "symbol": "RAL",
+        "leaves_qty": "1",
+        "order_id": _RAL_ORDER,
+        "cum_qty": "6.35222371",
+        "order_status": "partially_filled",
+    },
+]
+
+
+def _ral_broker(rows: list[dict[str, Any]]) -> AlpacaBroker:
+    broker, http = _broker()
+    http.route("GET", "/v2/account/activities/FILL", (200, rows))
+    order = {"id": _RAL_ORDER, "client_order_id": "daily-20261020-ral"}
+    http.route("GET", "/v2/orders/[^/]+", _by_id({_RAL_ORDER: order}))
+    return broker
+
+
+def test_a_negative_fill_row_corrects_its_orders_earlier_fill() -> None:
+    fills = _ral_broker(copy.deepcopy(_RAL_ROWS)).fills()
+
+    assert [(f.broker_fill_id, f.quantity) for f in fills] == [
+        ("20261020093049795::a", 7.0),
+        ("20261020093112899::06fa04cb-5704-494f-b5ac-aadcd8ffa6b0", 0.35222371),
+    ]
+    assert sum(f.quantity for f in fills) == 7.35222371  # the broker's position
+    assert fills[1].filled_at == datetime(2026, 10, 20, 13, 31, 12, 899373, tzinfo=UTC)
+    assert fills[1].price == 67.23 and fills[1].client_order_id == "daily-20261020-ral"
+
+
+def test_a_negative_fill_row_with_no_earlier_fill_in_the_read_raises_system_fault() -> None:
+    since = datetime(2026, 10, 20, 13, 31, 12, 900000, tzinfo=UTC)  # between the two rows
+    with pytest.raises(SystemFaultError, match="has no earlier fill"):
+        _ral_broker(copy.deepcopy(_RAL_ROWS)).fills(since)
+    with pytest.raises(SystemFaultError, match="has no earlier fill"):
+        _ral_broker(copy.deepcopy(_RAL_ROWS[2:])).fills()
+
+
+def test_a_negative_fill_row_at_another_price_or_past_zero_raises_system_fault() -> None:
+    repriced = copy.deepcopy(_RAL_ROWS)
+    repriced[2]["price"] = "67.24"
+    with pytest.raises(SystemFaultError, match=r"corrects a fill at 67\.23"):
+        _ral_broker(repriced).fills()
+
+    too_big = copy.deepcopy(_RAL_ROWS)
+    too_big[2]["qty"] = "-1"
+    with pytest.raises(SystemFaultError, match="positive, finite"):
+        _ral_broker(too_big).fills()
+
+
 # --- account, positions, assets --------------------------------------------------
 
 

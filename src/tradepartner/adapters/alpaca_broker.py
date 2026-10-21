@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -486,12 +487,21 @@ class AlpacaBroker(Broker):
         return [_mapped("order", _order, p) for p in payloads]
 
     def fills(self, since: datetime | None = None) -> list[Fill]:
-        """Every fill activity with `filled_at >= since`, oldest first."""
+        """Every fill activity with `filled_at >= since`, oldest first.
+
+        Alpaca paper can follow a fractional order's fill with a negative-quantity
+        `partial_fill` row 2 ms later that corrects it (#2149: a `fill` of 1 then
+        -0.64777629, the position 7 + 1 - 0.64777629). Such a row is folded into
+        the same order's latest earlier row in this read, at the same price, keeping
+        that row's id and time; a correction with no such row, another price or a
+        result that is not positive is a `SystemFaultError`, as before.
+        """
         self._now()
         start = _EPOCH if since is None else ensure_tz_aware_utc(since, field_name="since")
         activities = self._raw.list_fill_activities(max(_EPOCH, start - _AFTER_MARGIN))
         owners: dict[str, str] = {}
         fills: list[Fill] = []
+        order_ids: list[Any] = []
         for activity in activities:
             # Filter first, so no order is resolved for a fill the caller did not ask for.
             if (
@@ -499,7 +509,11 @@ class AlpacaBroker(Broker):
                 < start
             ):
                 continue
+            if _mapped("fill activity", lambda a: _number(a["qty"]), activity) < 0:
+                _mapped("fill activity", lambda a: _fold_correction(a, fills, order_ids), activity)
+                continue
             fills.append(_mapped("fill activity", lambda a: self._fill(a, owners), activity))
+            order_ids.append(activity.get("order_id"))
         return fills
 
     def positions(self) -> dict[str, Position]:
@@ -604,6 +618,30 @@ class AlpacaBroker(Broker):
                 f"fill of broker order {broker_order_id!r}: no client_order_id resolved"
             )
         return coid
+
+
+def _fold_correction(activity: Mapping[str, Any], fills: list[Fill], order_ids: list[Any]) -> None:
+    """Fold a negative-quantity fill row into its order's latest earlier row in
+    `fills`, in place (#2149). Raise `ValueError` (mapped to `SystemFaultError`)
+    unless that row exists, has the same price and stays positive."""
+    order_id = activity["order_id"]
+    at = _instant(activity["transaction_time"])
+    price = _number(activity["price"])
+    for index in range(len(fills) - 1, -1, -1):
+        if order_ids[index] == order_id and fills[index].filled_at <= at:
+            break
+    else:
+        raise ValueError(
+            f"fill correction {activity['id']!r} of order {order_id!r} has no earlier fill"
+        )
+    corrected = fills[index]
+    if price != corrected.price:
+        raise ValueError(
+            f"fill correction {activity['id']!r} at {price} corrects a fill at {corrected.price}"
+        )
+    # Summed as decimals, so 1 - 0.64777629 is 0.35222371 with no float residue.
+    quantity = float(Decimal(repr(corrected.quantity)) + Decimal(str(activity["qty"])))
+    fills[index] = replace(corrected, quantity=quantity)
 
 
 def _position(payload: Mapping[str, Any]) -> Position:
