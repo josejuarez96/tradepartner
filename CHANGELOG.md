@@ -379,6 +379,103 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - OpenFIGI V3 mapping client with keyed/keyless limits, request pacing, a pure type parser, and scrubbed synthetic fixture coverage.
 - Tests: tests/lookahead/test_filename_listings_c2.py pins the C2 acceptance line (#1682) -- reads before the static row's fetch see no listing, NYSE from the 2019 10-K's acceptance, NASDAQ only from the 2021 10-K's, the static rows byte-identical with the switch off; a truncated-source invariance check and a pre-rename-prefix case fail if any writer path (confirmation included) uses a static row's exchange or valid_from before its known_at. Test-only; no source change.
 - Backtest: three frozen metrics.risk_free_* keys and DataProvider.rates(t, series), the store's as-of rates read (#1498, T170b).
+- Lot ledger: journaled adjustments and splits now adjust long lots (spin-off child at zero basis, carried residue, cash removal, stock merger); a corporate action on a short lot still halts (#516).
+- Backtest spec amendment (#657): the momentum buy/hold buffer, strategy.hold_top_fraction, with plan tasks T238 and T239 and the conditional paper task T240
+- scripts/repair_stamps.py shift-unrepaired: shifts an earlier release's unrepaired list later by the New York offset, no SGML request (#1382)
+- Backtest spec amendment #1598 and plan lines T250 to T254: the known-answer index check, outside the trial count.
+- edgar.stamp_sgml_fallback_runs: a CIK whose three newest SGML anchors stay unreadable for N runs gets its API stamps (late by the NY offset, never early); counted on the EDGAR run message shown by health (#1686)
+- OpenFIGI V3 mapping client with keyed/keyless limits, request pacing, a pure type parser, and scrubbed synthetic fixture coverage.
+- Additive `openfigi_types` table and opt-in `ingest --source openfigi`, with revisions only when mapped fields change and trial vintage unaffected.
+- `edgar.class_member_link` (default off): shares facts link to their class at ingest by the member's words, a nominal-class rule for lone lettered members, and a dead-class rule for totals (#1723, T190d).
+- paper report and paper status: per-order (VWAP) slippage vs the session open in bp (adverse positive), notional-weighted mean first, with no-bar, off-session and pending counts
+- tests/backtest/test_engine_scale.py: the synthetic 1,000-name, 10-year daily scale fixture and the BACKTEST_SCALE_BUDGET_SECONDS test (slow) (T207).
+- universe.rank_by (cap, dollar_volume) for forward books: ranks by median dollar volume over the history window from bars alone, intersected with Alpaca tradable assets as of t (skipped and recorded before the first snapshot); cap stays the default and no fingerprint moves.
+- Re-measured pytest shard weights and a test that the 8 shards partition the real collection
+- Runbooks: verification-pass-diff, protect-main-ruleset, orchestrator-handover, planning-team (#1752)
+- paper.min_free_disk_gb (default 5, 0 = off): a paper run below it refuses before any broker call with a run_failed alert and no kill switch (#1758).
+- Spec amendments and plan lines for storing Alpaca merger records point-in-time and explaining them in paper reconciliation (#1762, #1930)
+- Desk note recording the B9 kill and the B3 retirement, with numbers, sources and criteria (#1765)
+- backtest: with metrics.risk_free_source = store the engine reads rates once at the data cutoff and metric_rows compounds the T-bill accrual per period; a session with no rate known fails the trial risk_free_missing before any result row
+- End-to-end paper-run drills for bad symbol, 5xx, connection error, partial fill, accept-then-reject, delisted and split holdings and sleeping-Mac catch-up; skip-cap, mid-run not-fractionable and ack-timeout drills are strict xfails for T202/T202b.
+- FakeBroker returns unresolved asset reads, mirrors recorded 403 sell refusals, and reserves shares for open sells; fixtures declare broker assets explicitly. The exact submit-time untradable body remains an open question.
+- Backtest: `hold_membership` and `apply_rebalance_band` pure functions in `backtest/portfolio.py`, shared with the paper planner (T205) (#1786).
+- Backtest metrics `beta_spy` and `alpha_spy_annual` (beta-adjusted alpha against SPY), reported only, in no selection path (#1791, T211 metrics half)
+- Add spread_bps, impact_coeff and adv_sessions cost terms (T210)
+- risk.small_account (default off, frozen with the risk section, a missing key in an older window reads off) and the paper start feasibility refusal refused_small_account
+- Halt policy (T202): the broker's asset-not-found, not-fractionable and not-tradable refusals on a buy are skips (a rejected order plus a skipped decision, a skipped alert), and the skip cap is max(risk.max_skips_per_run, floor(risk.max_skip_share x decisions)); a window frozen before the key reads the share as 0.
+- Added `master.chains`, `master.chains_dismissed`, `master.chain_window_sessions` and `master.chain_max_price_ratio` (#821).
+- Added the `successor_chains` table (schema version 31) and the EDGAR master pass that derives, writes, retracts and rewrites a chain row at the evidence's `known_at` (#821).
+- Kill ladder rung-4 and rung-5 keys (`strategy.signal_delay_sessions`, `strategy.placebo`, `strategy.placebo_seed`), guarded until T217c, and the pure `backtest/placebo.py` (T217, #1824)
+- Backtest regression proves the oracle re-entry anchor; the 1,000-name scale fixture re-enters one selected name after six years.
+- The paper planner's decisions_from takes band= (the frozen strategy.rebalance_band, applied through backtest.portfolio.apply_rebalance_band) and hold= (the HoldBook resolved through backtest.portfolio.hold_membership); a band of 0 and equal weighting are byte-identical to today's plan rows. planning.py reads the band from the family's own frozen construction section and refuses a weighting = hold window before engine.plan, with no row, until #1832 is decided (#1831).
+- Research report: daily-strategy data readiness reconciliation (traceability and readiness matrices, contradictions, owner-run probes Q1/Q2) (#1833)
+- Backtest engine: strategy.weighting = hold, strategy.rebalance_band and backtest.cash_rate = store are wired (exits on session N, band on targets, per-session cash accrual); the T209a guard is removed.
+- An unacknowledged order past paper.accept_wait_max_seconds (default 300 s) is left pending_unresolved with a pending_unresolved alert and the run goes on; a second timeout in the run still halts; the next run's start, paper resume and paper reconcile settle it by a read-back (store schema version 32).
+- Backtest: strategy.signal_delay_sessions reads every plan input at the latest rebalance session d sessions back, and strategy.placebo shuffles or randomises the scores before construction; defaults unchanged
+- docs(research): strategy discovery framework reconciled with the Research Lab (#1854)
+- Backtest engine: charge spread and ADV impact at strategy, forced-exit and benchmark fills; bound impact sizing by float convergence (#1855)
+- backtest --measured-cost-bps <x> runs one more in-sample cost level, stored as trial_metrics.cost_level_kind = 'measured' (never the base, never in N, V or DSR); it needs --note naming the source book(s) and window, and a holdout or tracking run, or an x equal to the base or a ladder level, is refused (refused_measured_level) before any trial row (#1792).
+- Health: the `figi_types` block names a class the store calls `common` that OpenFIGI calls a note and the converse, reports the unmapped count, and gates on `openfigi.max_disagreements` when set (#1713).
+- Tests: the check-only source scan now covers `openfigi_types`, and universe, backtest and paper runs are byte-identical with the table populated and empty (#1713).
+- Research: ladder ledger (L1-L5, rung 2-O rows, rung-2 reads end 2019-12), owed claims TP-5, TP-6, LS-1 to LS-20, IRRX backlog row, and the Q1 repurchasers rung 1-2 note
+- Trial rows carry the shock tag (placebo=<mode> seed=<n>, signal_delay=<d>) in trials.note from run and sweep runs; at the defaults the note is unchanged. A holdout or tracking run of a placebo file, sweep promote and --operations-book-of refuse it as refused_placebo before any write; delayed files are not refused.
+- Spec amendments and plan tasks T218 to T237 for the short-side build under ADR 0024: signed backtest book, declared borrow fee with 0/30/300 bp lines, the $5 shortability proxy, paper short books on the paper broker only, and ADR 0010's short-side limits (#1872).
+- The T218 experiment file `docs/experiments/long-short-spike.md` (H1's ranking as a 50/50 book with a flat borrow fee, in-sample only), ready for the owner to register and run.
+- Store schema version 34: the short skip and cover reasons and decision kinds in the decisions, decision_events and order_events CHECKs, and the short and cover id tokens with attempts keyed by (security, token).
+- Broker shape for shorts: every order carries a position_intent (sent to Alpaca), Broker.paper, and the fake broker refuses shorts as the paper sandbox does (T226, #1885)
+- Data: successor chains (#821, T187b) — the six as-of reads re-key a live chain's predecessor rows to its successor (filters and id-keyed `accepted_*` entries mapped the same way) and hide a chained successor's own bars before its first listing row until its chain is known, `ListingResolver` rule 9 starts the successor's first span at the predecessor's span end, `--fill-holes` lists those sessions as the successor's, the repair dry run lists each live chain with its ratio, and the engine renames a held predecessor to its successor at the first step that sees the chain, counting `n_chained_positions` on the rebalance row.
+- Added the `successor_chains` health block (each live chain's hand-over day, close ratio, predecessor facts after the hand-over, and the latest EDGAR run's `chain_candidates`) and the five `--check` rules `chain_ids_distinct_ciks`, `chain_known_at_le_ingested_at`, `chain_known_at_ge_successor_rows`, `chain_successor_listed_under_predecessor_ticker` and `chain_predecessor_no_bar_after_handover`, with the `chain_price_break` warning above `master.chain_max_price_ratio` or below its inverse (#821).
+- Added `chain_candidates` to the EDGAR run row: every 8-K12B or 8-K12G3 filer whose first listing row takes a ticker and exchange another company's security last listed within `master.chain_window_sessions` sessions before it, on no `master.chains` entry and not dismissed (#821).
+- `master-retract` now proposes and retracts a live `successor_chains` row no `master.chains` entry derives, `[traded]` through its predecessor and successor (#821).
+- execution.risk: check_phase takes window_side, broker_paper, net_exposure; rules max_short_weight, net_exposure_band, min_short_equity, cover_within_holding, one_side_per_name; gross is sum of abs value; the cash rule deducts held shorts
+- config: risk.max_short_weight, net_exposure_band, min_short_equity (defaults 0.05, 0.10, 2000), read from windows frozen before T231 at their defaults
+- docs/research/2026-10-19-alpaca-sandbox-probe.md: what Alpaca paper answered to the sandbox probes, by build affected (#1892)
+- .env.example: a commented ALPACA_SANDBOX_API_KEY/_SECRET block for the broker-behaviour sandbox account (#1897)
+- `decisions_from(side=, short_min_price=)`, `Decision.position_side`, short skips and whole covers in `execution/plan.py`
+- Short lots and disposals in the lot ledger, and short holdings with signed equity and free cash in the paper ledger (T232, #1903).
+- docs/research/2026-10-19-alpaca-sandbox-after-hours.md: addendum filling the first sandbox report's pending closed-market section (#1909)
+- store: include_spin_offs on the total-return adjusted read, unvalued_spin_offs_as_of, and the parent named by the marking-change probe (#1911)
+- docs(research): MVP usability readiness report, owner workflow walkthrough, UI reconciliation and milestone forecasts (#1914)
+- Config: `adjust.apply_spin_offs` (default false) as a new frozen key: not required of a file, frozen at its default when absent, outside the promotion identity, and a `NOT_YET_APPLIED_KEYS` member so a `true` registration is refused until T211e.
+- `tradepartner health` and `health --check` now print the successor chains (hand-over day, close ratio, predecessor facts after it), the latest EDGAR run's chain candidates, and a `warning: chain_price_break` line per break.
+- Research report: the owner's day-to-day routines as a user, with real outputs, gaps against his prototype, and a ranked friction list (#1924).
+- Execution: reconcile.compare reads a ledger short as a negative quantity, halts an unexplained change as short_external_change and passes a debited or undebited short dividend (T233, #1926)
+- Data: `data_vintage(..., spin_offs=)` counts the stored `spinoff` rows a spin-off-reading trial sees, passed from the trial's frozen `adjust.apply_spin_offs`; at the default no stored vintage moves. (#1931)
+- docs/runbooks/owner-guide.md: the owner's one-page guide to running TradePartner as a user (#1932)
+- Backtest: under the frozen `adjust.apply_spin_offs`, the engine reads the two spin-off counts and writes `n_spin_offs_unvalued` and `n_late_spin_offs`; `false` writes nothing (#1894, #1936).
+- docs/runbooks/update-the-system.md: the owner's update routine, and backup and restore for a store damaged outside a release (#1938).
+- tradepartner store backup: verified, named copy of the store and its log with a manifest; no schedule (#1939)
+- Research report on daily candlestick-pattern signals on US equities net of costs, long and short (#1944): claims CS-1 to CS-7, a proposed parked row, and ladder-ledger row L-1.
+- broker_refusals types Alpaca's wash-trade 403 as ReconciliationError; the run halts with a reconciliation alert (#1949)
+- execution/phases.py: sell_orders orders covers (buy_to_close, whole shares, capped at the held short less open covers); buy_orders orders short opens (sell_to_open, whole shares, borrow re-check) before long buys sized within cash less held shorts; requests_for sets position_intent and the T228 id token (T230, #1950)
+- Momentum sweep file `docs/sweeps/momentum-hold-top-fraction.md`: the one-value grid `strategy.hold_top_fraction = [0.20]` at `top_fraction = 0.10` (backtest spec amendment #657, open question 31; owner, #1957).
+- execution/phases: buy_orders short_min_price keyword re-checks skip_short_price (#1969)
+- backtest/index_check.py: pure weights, name returns, month/year gaps, TE, worst-month ranking, protected edge and masked report rows (#1598, T244)
+- Alpaca merger records parse into Merger records (cash, stock, stock-and-cash) stamped at the close after process_date, with named refusals; PriceSource.mergers and the fixture adapter read them (#1762, T248b).
+- backtest: the momentum buy/hold buffer key strategy.hold_top_fraction (default 0.0 reproduces today), its validation and tables, and the pure retention rule buffered_targets; load_frozen refuses a non-default value until T239 (#657).
+- index_check config section, store.benchmarks.CHECK_ONLY_IDS and check_only reads, backfill-benchmark accepts check-only symbols, data_vintage excludes them (#1598, T243)
+- Paper run: a universe candidate with no T_0 bar (partial ingest) is recorded as signals reason excluded_no_t0_bar and raises the missing_candidate_bar alert; the run continues (#1997)
+- Docs: the paper-trading spec's #2006 amendment and the plan's T250 to T252 plan the read-only per-book performance card (equity curve, daily P&L, versus SPY, versus the book's backtest), off the order path and writing nothing (#2006).
+- Published the 2026-10-20 owner re-walk after the first daily-book fills, with routine findings, re-ranked frictions, limits, and a Part 1 link.
+- Research report `2026-10-20-long-short-spike.md` and claim TP-7: T218's run 1 kills the long/short `momentum` idea on H1's ranking by its pre-declared rule (net spread -6.82 pp/yr); the signed-engine build is not gated.
+- Paper spec amendment 2026-10-20 (#2023) and plan task T253: a held no-bar candidate is kept at its current quantity for that rebalance, the other targets share the rest of the budget by the band's rule; the backtest's drop-and-sell is a named difference (#2023)
+- T219: `PortfolioConfig` (`portfolio.side`, `gross_exposure`, `net_exposure`, `short_min_price`, `short_cover_weight`; the #1788 guard refusing any non-default until T223), its five frozen table entries and `POST_REGISTRATION_PORTFOLIO_KEYS`, `_FINGERPRINT_KEYS` membership, `FROZEN_SECTIONS`/`required_keys`/`frozen_params` wiring, and the pure `backtest.portfolio.signed_target_weights` (spec amendment #1872, items 1 and 2).
+- Pure per-book performance arithmetic in `execution/performance.py` (#2006 item 1, T250).
+- Schema version 35: the `mergers` table (acquiree, acquirer, share ratio, cash per share, three dates; stamped at the close after process_date), `mergers_as_of`, and the fixture's cash and stock mergers; `data_vintage` leaves the table out (#1762)
+- T221: `costs.borrow_bps_per_year` and `costs.borrow_sensitivity_bps` (frozen, post-registration cost keys, the headline may only rise), `hypothesis.register`'s `refused_portfolio` and `refused_borrow_rate` for a `long_short` file, and `sweep promote`'s `refused_benchmark_pending` behind the pinned `promotion.LONG_SHORT_BENCHMARK_LANDED` (spec amendment #1872, items 1, 6 and 8).
+- `tradepartner index-check [--start] [--end] [--store] [--out]` and `backtest/index_check_store.py` (#1598, T245): the whole universe, equal and cap weight, against RSP and SPY by year and month on read-only connections, with per-name flags; months after the protected edge show gaps only. Never a trial; writes nothing.
+- execution.ops.performance_data: per-book performance read over the journal (spec amendment 2026-10-20, #2006)
+- dashboard: a Performance page drawing ops.performance_data read-only (T252)
+- ingest: mergers are written by the daily run and the actions backfill at announcement_date_known_at(process_date), revisions at ingested_at, counted not-yet-known, refused, unresolved, merger_self and merger_conflict; repair-resolution's dry run lists mergers rows as unjudged
+- Reconciliation explains a cash merger on a held long from the stored `mergers` row: the removal and any later cash journal `corporate_action_cash` rows naming the merger id, a due unmet by the window's end halts once, and two conflicting rows halt `merger_conflict` once; new `risk.reconcile_merger_lag_sessions` (default 5) (T249, #2077).
+- Runbook `docs/runbooks/shakedown.md`: the owner's daily checks for the T162 shakedown span (10-22..11-04), from the opening row to the `paper shakedown` evidence (#2095).
+- Paper plan tasks T256 to T260 and the dashboard page map's Trades page and Operations cards for the owner's daily use (#2096).
+- docs/sweeps/b10-short-term-momentum.md: B10's two-variant momentum sweep (turnover screen 0.20 and its no-screen control), drafted for the owner to register (T165e, #2106).
+- Add a read-only session blotter with capped order rows and full-session slippage summary (#2113).
+- Risk card on the Operations page: cash, gross exposure, largest position and drawdown, each against the window's frozen risk limit with the headroom in percentage points and the dollars left before the kill switch (`execution/headroom.py`, T260).
+- The "waiting on me" read: `execution.waiting` (pure) and `ops.waiting_on_owner`, every open book's items in a fixed order with the command that clears each (T256, #2116).
+- Run sheet for the ordered data releases, restamp, DTB3 backfill, T214 merge, checks, evidence, and restore.
+- Read-only Trades page with book/session filters, slippage chart, KPIs and order table.
 
 ### Changed
 - `insert_row` now binds the UTC-normalized value for `TIMESTAMPTZ` columns (one canonical stored form) instead of the caller's original tzinfo, and `ensure_tz_aware_utc` re-raises the `OverflowError` from `.astimezone(UTC)` near `datetime.min`/`datetime.max` as `ValueError` naming the field (#43).
@@ -558,6 +655,58 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Plan: T192b added before T198; spec: a later rename contests only a span still live then (#1707).
 - Universe rule 2 no longer excludes a name whose newest listing row is on a real venue off the list while an older row on NYSE/NASDAQ/NYSE_AMERICAN is live (#1682 lever A, 74 of 75 key months).
 - ADR 0023 and the 2026-10-18 alignment (#1731): the owner's decisions D1 to D9 (the #969 accept rule, the halt policy with per-name skips under a share cap and pending_unresolved on an ack timeout, open fills for daily and week_end registrations, universe.rank_by = dollar_volume for forward books, the pause list, the live book deferred to the Phase 6 ADR after the shakedown and the first kill-ladder verdicts (D6), with a start feasibility rule and every buy a fractional notional order, no vendor action, the data-release id at rederive-1682, #878 Q1 b / Q2 a / Q3 a as ADR 0005's Live amendment and the charter's Compliance line ticked not applicable), the break-first working rule, the kill ladder (B10 -> B9 -> IRRX) and the forward-exam minimum fills per cadence; spec amendments in paper-trading, backtest and data-foundation; plan tasks T200 to T214 with T202b (A1 to A16), dated pause and supersede notes, T22 folded into T162, T165e as B10's rung 4.
+- backtest: value_positions and carry_to_fill are vectorised over polars frames; equity, rebalance rows and metrics are byte-identical to the per-name loop (T207).
+- Plan: T241 and T242 record n_assets_intersected / assets_intersection_skipped on trial_rebalances and paper_plans (#1747)
+- Always-loaded instructions (CLAUDE.md, .claude/agents, ready-pr skill, STATUS layout) shortened with every rule kept or linked to its one home; `scripts/doc_check.py cite` checks that task, ADR, claim and requirement citations resolve, and `doc_check.py size` warns on per-file size budgets (#1751)
+- ways-of-working docs rewritten for length, wording not meaning: git-workflow.md is the one home for the merge classes and the merge train; history in Changes tables; review-pass rule written once as practised; the team is the writer on its branch (#1752)
+- CI: pytest shards no longer wait for checks-fast; only the ci:full label starts a labeled run (other labels start a skip-only run that cannot cancel a real run), and unlabeled starts none
+- Plans: dependency edits from the 2026-10-18 roadmap analysis (T202, T206, T210, T211 to n/a; T208 to T207; T209 split into T209a and T209b; T205 on T206 and T209a; T161 drops T159; T165e drops T114), the one data sitting on T198 with T195 struck and T166c cut to the a3 store step, T114, T160 and T172d ticked, new lines T215 to T217 (test infra, the ladder's shocks), and the wording fixes of #1602, #1605 and #1547 (#1754).
+- A tradable held name missing its S-1 bar no longer fails the paper run at once: marked at its last close with a stale_mark alert for up to 3 consecutive sessions (frozen key paper.max_stale_mark_sessions; windows frozen earlier keep the old failure) (#1763).
+- ready_pr default --timeout-min 45 and a per-checkout .pytest-tmp basetemp for its local pytest; team.py start sets up the env and prints the shell lines; four-box PR template (#1764, PR #1766)
+- tests: the four slow `test_lab` cases run on a shrunk store (benchmark + shares-fact names, a ~2-month window, a one-level cost grid); one full-size sweep smoke test kept (#1776)
+- Tests: tests/lookahead/test_backtest_invariance.py builds its fixture store once from a session-scoped DuckDB template (tests/lookahead/harness.py) and copies it per case, each case's revisions applied as a delta (T215, #1785).
+- Backtest config: `strategy.weighting` gains `hold`, and `strategy.hold_sessions`, `strategy.hold_target_names` and `strategy.rebalance_band` are added; `backtest.cash_rate` accepts `store` (#1786).
+- Backtest config: until T209b wires the engine, `weighting = hold` and a non-zero `rebalance_band` are refused by a config validator, naming T209b (#1786).
+- Cache adjusted marking frames by step, invalidate on newly known bars and actions, and preserve point-in-time results
+- Backtest plan: T208 may re-pin test_engine.py's read-shape tests; results stay byte-identical to the unbounded engine
+- Split the four truncation-heavy as-of tests (health, gap, universe, adjusted prices) into 9 parametrised probe chunks; probe set pinned by count and hash.
+- Plan T202 (#1808): a new size-S T202a takes `schema.py` at version 29 (`decision_events.reason` and `order_events.reason` widened for the allowlist's skip reasons; T202b takes 30); T202 gains `risk.py` (the share cap), `collect.py` (a skip-reason `rejected` is not a rejection) and `reconcile_run.py` (`frozen_risk` reads a missing `risk.max_skip_share` as 0); the paper spec's item 2, item 11 and two Tables entries say the same.
+- Backtest plan and spec (#1792): T210 split by file into T210, T210b and T210c; `POST_REGISTRATION_COST_KEYS` extends the 2026-10-09 carve-out to post-registration `costs.*` keys; `trial_metrics.cost_level_kind` at the next free schema version; ADV from raw close times raw volume ending at the plan session; the benchmark's one buy pays the full cost model (spec Series line, ADR 0005).
+- Store schema version 29: the decision and order event reason CHECKs gain the allowlist's skip reasons, both tables rebuilt with every row kept (#1813, T202a).
+- Plans: T200, T213 and T174c ticked and collapsed
+- Backtest plan and spec (#1820): T209b's Files gain `config.py` (the hold/band guard's removal) and `tests/test_config.py`, its tests start from `spike/lock-T209b`; T217 split by file into T217 (keys, guard, pure `placebo.py`), T217c (engine `_plan`/`_plan_all`) and T217b (trial-row tag in `run.py` and `lab.py`, refusals); deterministic stdlib placebos over id-sorted names seeded by placebo_seed and session, `random_entry` a random ranking, `placebo=<mode> seed=<n>` / `signal_delay=<d>` in the trial note, `refused_placebo` from `sweep promote`, `--operations-book-of` and holdout or tracking runs, and universe, signal and gap all read at the delayed t'.
+- Chains code parses each security id's CIK at its ':' or '@' separator instead of assuming the first ten characters; the data-foundation spec and T187d runbook say so (docs).
+- Schema version 33: trial_metrics gains the NOT NULL cost_level_kind column (base, ladder or measured), rebuilt by _migrate_cost_level_kind with every row kept and backfilled base at the trial's stored base level and ladder elsewhere; the backtest page's per-level column headers carry the kind (#1792).
+- docs(decisions): ADR 0024 lifts the long-only, top-1,000 and daily-or-slower limits (charter Scope and Universe lines; ADR 0006, 0010, 0012, 0014, 0015, 0017 and 0021 notes) (#1863)
+- The paper short order-path tasks (T226, T228, T229, T231 to T234) start now, beside the backtest tasks; the first paper short book (T237) still waits for T225. T171d (borrow-status record) is un-paused so forward history accumulates.
+- The T218 long/short spike now only kills the long/short momentum idea (net spread at 30 bp below 0, or its upper bound below +2 pp/yr) and gates no build task; it reads T-bill rates from the store only. Backtest spec item 5 and the T218, T220 and T222 lines state the short's dividend difference from the prior close.
+- Backtest and data-foundation specs: the spin-off adjustment is specified from stored inputs (a dividend in kind, opt-in per file), and T211 is split into T211 (beta alpha) and T211b (spin-offs) (#1894)
+- Paper spec item 14 and the T229/T235 plan lines: how the planner writes a short book's decisions, T229 now after T232, the backtest parity test in T235 (#1904)
+- Paper plan: T234 buildable on T232 alone; T236 no longer needs a merger-ratio source
+- Scheduling runbook: schema-migration section points to the update routine; sleep section says keep the Mac on power with sleep off, since one wake cannot cover both jobs (#1759).
+- execution/phases: a flip's close sells the residue too (#1959)
+- Paper spec req 13: a carried-residue lot is dated at the previous window's closed stop row's session, not the new window's start (#1978, #516)
+- #1990: include extreme no-cap members in cap-book name listings and reject infinite name marks.
+- Paper-trading spec: two dated owner amendments (#1959, #1969)
+- Operations and paper status show readable tickers, fill timing and the rebalance traded on a fill session; paper check and health clarify pending orders and duplicate dividends (#2005).
+- docs/research/2026-10-20-long-short-spike.md: add the run-1 artifact's secondary values (b=0/300 book lines, book and SPY-hedged-control excess over T-bills, book minus hedged, short leg vs the equal-weighted universe, worst short month, max_short_weight, cover count, n_delisted_short) and read the three red flags (max_short_weight, n_delisted_short, control vs B11).
+- Signed backtest fills and valuation accept short positions; a pure fee charges short value by calendar day.
+- Paper check and owner views now show missed sessions, no-order runs, and plan-time tickers accurately (#2028).
+- docs(spec): record 360 in the AST-literal rule beside the `costs.py` lists, the borrow fee's 360-day count (#1872 item 6, #2030).
+- Count late and unvalued spin-offs on held predecessor parents after the live chain rename, with step-bound tests (#2032).
+- Paper spec amendment #2033: records the spin-off child rule #1896/PR #2029 built — a child is offered from the first reconciliation whose cutoff is at or after its row's stamp, only for a parent held unchanged since the ex-date, and the halt holds the base back; a residue child booked after the start, its ex-date eve before the previous stop date, still halts (#2107); open questions 32 and 33 put the lag-key alternative and a moved parent to the owner (#2033).
+- tests/conftest.py shard weight table re-measured from CI duration tables (#2036)
+- CI runs the pytest suite in 10 shards instead of 8 (#2044).
+- A held name with no read-session bar is kept at its quantity for the rebalance instead of sold left_universe; the other names share the remaining budget (#2023, T253)
+- CI pytest shards use worksteal, order units by measured weight, and skip the redundant collection pass.
+- The backtest engine applies `strategy.hold_top_fraction`: with it non-default, the plan's targets keep a held name while it ranks inside the hold share and `n_retained` is reported; every pinned run is byte-identical at the default.
+- Backtest: `_step` marks, trades and exits a signed book under `portfolio.side = long_short`, paying the borrow fee every session held and accruing `rf(s)` on free cash only (spec amendment #1872, items 4 to 7); `long_only` runs unchanged (#2060)
+- Explain paper run and resume refusals, cash and missing-bar alerts, spin-off receipts, bad closes, and check/status wording.
+- Pass run notes through wrapper sell and buy collections and record unjudged fills (#2066).
+- Backtest walks cover every rebalance in three strided chunks; dollar-volume probes are pinned and split nine ways.
+- health: mergers block and four merger integrity rules on health --check and the data-health page (T248e, #1762)
+- Plans amended (#2086, owner 2026-10-20): T162's span opens 2026-10-22, the drill moves to book daily, the data sitting moves after the span.
+- Scheduling runbook (#2088): the kill-switch drill commands use --book daily, run on the 2026-10-27 daily-book session.
 
 ### Fixed
 - `adjusted_prices_as_of(include_dividends=True)` no longer sizes a dividend against a prior close more than `adjust.max_prior_close_gap_sessions` XNYS sessions before its ex-date (default 5); such a dividend is left unapplied instead of mis-sized or failing the query, and the new `dropped_dividends_as_of` lists it (`stale_prior_bar`, `no_prior_bar` or `outside_calendar_range`) for health; `calendar.all_sessions` added (#72).
@@ -777,6 +926,47 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Universe rule 7: every shares fact dated before the security's first stored bar session known at T is no baseline when the first fact on or after that session is more than `universe.max_shares_ratio` (100x) times it; all such pre-bar seeds are skipped and that first post-bar fact anchors. So AMCR, CTVA, SW, LIN, PSKY and VTRS read their true stored counts (LIN, PSKY and VTRS have several seeds each), and the read-only store comparison moved 29 securities and 373 security-month-ends, 0 true counts lost, every census name except FOXA (its 1-share fact is dated after its first stored bar, 2019-01-07; #1682's text there still says "first listing", dropped in this line) (#1682, T190b).
 - The OTC pair rule (`non_overlapping_listings`) treats a same-start off-exchange pair where one ticker is the other plus FINRA's fifth-letter `D` temporary symbol (`JFIL`/`JFILD`) as one line, with a failing-first test (#1720)
 - The reviewed dividend list covers the two equal-amount groups the 2026-10-15 ingest added (PNNT 2026-10-15 `0.04` distinct; PFLT 2026-10-15 `0.0033` duplicate), so `duplicate_dividends` passes (#1720)
+- restamp pre-check: a pre-window row within 5 h after close(S-1) or a non-session started_at now fails the check (#1524)
+- A network error on the daily run's name-change request no longer fails the day's price chunk; it is counted in the run message and the window asks again next run (#1676)
+- health.last_ingests shows the latest daily alpaca run, not an actions-backfill month (#1676)
+- `--fill-holes` now lists mid-month and first-day gaps between a security's traded bars (#1721), not only rename-lead gaps; halts stay listed as holes the source cannot fill
+- The resolver no longer follows a stored name change that takes its own security's sessions of the new ticker from it (Alight WPF to ALIT, ContextLogic WISH to LOGC), so repair-resolution no longer proposes dropping their bars (#1728)
+- Paper order path: class-share tickers go to Alpaca in its form (GEF.B, BRK.B) for assets, orders, risk and reconciliation; an unknown asset (404 40410000) or a ticker with no broker form is skipped as untradable, not a halt (#1729).
+- The paper trading client retries 500/502/503 and transport connection errors like 429/504 and timeouts, instead of halting the book on the first one; submit keeps its duplicate client_order_id read-back (#1732)
+- paper report no longer skips its paper_reports row when the slippage line cannot be computed (bad bar, non-session date); it prints 'slippage n/a (<reason>)'. paper status reads the slippage line over only the newest paper.status_slippage_sessions order sessions (new config key), not the whole window (#1741).
+- paper run: read-only store opens retry for store.lock_retry_seconds; a store still locked before any order ends the run stale-style (stale_data alert, no kill switch), after submits began it still fails closed (#1757)
+- Execution: a held name whose stored `symbol_changes` ticker change is known at close(S-1) reconciles -- the broker position under the new symbol matches the ledger's under the old one, quantity equal -- and the `reconciliations` row records the mapping; a change not known at close(S-1), a quantity difference under the new symbol, or two candidate symbols still halts (#1761).
+- ready_pr fills reviewer checklist boxes from recorded PASS verdicts while preserving other checklist gates (#1823)
+- The fake broker refuses with the same typed errors as the Alpaca adapter (#1828).
+- write_master's chain path now applies the held and unjudged gates and retracts-then-rewrites a moved chain, sharing ingest's writer (#1838).
+- Tests: the T202b drill now scripts a vanished buy so it exercises pending_unresolved, not a submit-time transport fault (#1842)
+- ready_pr no longer reports CI failure for a cancelled draft-run check whose name differs from the full run's when a later run on the same head succeeded (#1844)
+- ready_pr review staleness compares the PR's own patch at the reviewed sha and head; main merges and docs/changelog.d changes no longer stale a review (#1851)
+- ready_pr now waits for a newer full CI run after a cancelled run's failed aggregator, rejects unclosed fences, and detects non-ASCII paths in review staleness checks.
+- FRED backfill splits the vintage range into windows (rates.fred_vintage_window_days), sets a request timeout, retries timeouts and 5xx, and reports FRED's error message (#1883)
+- Preserve other 40010001 refusals as AlpacaTradingError with code and message
+- The `successor_chains` block and its rules read raw `prices_daily` and `facts` rows rather than `prices_as_of`/`facts_as_of`, which T187b re-keys by chain: otherwise a predecessor's last close and its post-hand-over facts vanish and `chain_price_break` and `chain_predecessor_no_bar_after_handover` go blind (#821).
+- `master-retract` treats a chain as derived only when `build_chains` honours its entry at the run, so a refused entry (a `spac` predecessor, lost evidence, a successor listing that no longer matches) leaves its live row underived and proposed (#821).
+- `chain_known_at_ge_successor_rows` compares the successor's earliest-*known* listing row naming the predecessor's ticker and exchange, the row `build_chains` stamps from, so a backdated row of another ticker neither fails the rule forever nor hides a real lag (#821).
+- `master-retract` does not propose a chain whose predecessor CIK is unjudged this run (its listings are missing and `build_chains` would refuse `NO_LISTING`) (#821).
+- `reconcile_run` passed `spinoffs={}` to `reconcile.compare`, so a broker-booked spin-off child inside an open window failed closed; it now offers the stored `spinoff` actions whose ex-date is in `(base session, S]` and whose parent the ledger held on the session before the ex-date, while a row known only after the cutoff, a wrong ratio, or a child for a parent the ledger never held still halts (#1896).
+- A retried submit refused 422 40010001 for a bad intent, zero qty or two trail fields is raised, not returned as the landed order (#1901)
+- The T202 sell-refused drill test expects the reconciliation alert (one alert per halt, #644) and drives the sell refusal with an allowlisted per-name refusal; its xfail is gone.
+- paper report no longer records a refused in_sample or failed tracking trial for a book with fewer than two rebalances; it prints a plain message and exits 0 (#1923)
+- paper reconcile: a debited short's dividend is offered as a negative due and journals a negative dividend_cash instead of halting as a cash mismatch (#1928)
+- decision shakedown-span --reason help no longer says to name a live strategy; stale 'abandon not yet built' banner removed (#1934).
+- scheduling runbook opening status paragraph no longer says the paper commands are unbuilt (#1947)
+- risk.check_phase reads a held short from Ledger.short_holdings, so covers, cash, one-side, short weight and gross exposure see the replayed short book (#1960)
+- plan.decision_state no longer raises on a whole cover: a buy + short with no target_notional follows the long full exit's quantity branch (#1961)
+- Wash-sale matching: a loss sold before a 2:1 split or a stock merger at 0.5 was matched and prorated in mixed share units, so matched_quantity and disallowed_amount were off by the ratio; the disposal, the shares its sale closed and every lot are now scaled to today's units at match time, so matched_quantity is reported in those units (#1980).
+- A fill at 100x or 0.01x the reference close no longer passes silently: the run halts, named fill_price_outside_band, band from run-time paper.max_fill_price_deviation (default 0.25) (#1981).
+- The unspent_cash alert reads the broker's cash after the run's collection, not the buys phase's cash at sizing, so a broker-cancelled or expired buy no longer hides idle cash (#1982).
+- A held name's close of 0, negative or NaN is never written to positions_daily; the mark step halts (no kill switch) with a stale_data alert naming the security and session (#1983)
+- A paper run halts before any broker read when the window's frozen_json no longer hashes to its frozen_sha256 (limits edited in place); the halt re-fires every run until the row is restored (#1984)
+- `paper resume` refuses (LimitBreachError) when the window's frozen_json no longer hashes to its frozen_sha256, as a run does, before any broker call or row (#2017)
+- Count late and unvalued spin-offs on a held predecessor through the live chain terminal, with cycle and store-provider tests (#2083).
+- Trading retries now wait 1, 2 and 4 seconds by default before reattempting, while duplicate order read-back remains intact (#2094).
+- Paper status alert lines now show IDs for shakedown-note (#2097).
 
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.
