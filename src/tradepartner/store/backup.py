@@ -70,7 +70,7 @@ def backup_store(
     stamp = now.astimezone(UTC).strftime(STAMP_FORMAT)
     wal = store.with_name(store.name + ".wal")
     target = store.with_name(f"{store.name}.bak-{stamp}")
-    wal_target = store.with_name(f"{store.name}.wal.bak-{stamp}")
+    wal_target = Path(f"{target}.wal")
     manifest = store.with_name(f"{target.name}.manifest.json")
     for path in (target, wal_target, manifest):
         if path.exists():
