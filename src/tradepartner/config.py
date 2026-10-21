@@ -883,6 +883,10 @@ class AlpacaConfig(BaseModel):
     trading_requests_per_minute: float = Field(default=150.0, gt=0)
     trading_request_timeout_seconds: float = Field(default=30.0, gt=0)
     trading_max_retries: int = Field(default=3, ge=0)
+    #: Initial delay before retrying a failed trading request; doubles per retry.
+    trading_retry_backoff_seconds: float = Field(default=1.0, gt=0)
+    #: Maximum delay for each trading retry (default total: 1 + 2 + 4 = 7 seconds).
+    trading_retry_backoff_max_seconds: float = Field(default=8.0, gt=0)
     # Broker facts set by the recording task (T48b, docs/research/
     # 2026-10-08-alpaca-paper-facts.md). Precision: paper accepted and filled
     # 9-decimal quantities (tests/fixtures/alpaca/paper/buy_fractional.json filled
