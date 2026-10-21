@@ -60,7 +60,7 @@ df -h .
 uv run tradepartner store backup
 ```
 
-The command refuses if anything has the store open (go back to step 3), refuses if a copy with the same minute already exists, and never deletes or overwrites anything. It copies the store and its `.wal` file (if there is one) to `$STORE_PATH.bak-YYYYMMDD-HHMM` (the time is UTC, not your local time), checks the copy byte for byte, and writes `$STORE_PATH.bak-YYYYMMDD-HHMM.manifest.json` beside it with the code commit, the schema version and the file sizes. `copy matches the store byte for byte` must print. Write down the copy's name. The manifest records the code you were on, which a restore needs. This copy is a plain safety copy. A copy made for a data release keeps its own name and rules ([data-releases](data-releases.md)). Never overwrite or delete a release copy. The command runs only when you start it; there is no schedule.
+The command refuses if anything has the store open (go back to step 3), refuses if a copy with the same minute already exists, and never deletes or overwrites anything. It copies the store to `$STORE_PATH.bak-YYYYMMDD-HHMM` (the time is UTC, not your local time), and its `.wal` file (if there is one) to `$STORE_PATH.bak-YYYYMMDD-HHMM.wal`. It checks each copy byte for byte and writes `$STORE_PATH.bak-YYYYMMDD-HHMM.manifest.json` beside them with the code commit, the schema version and the file sizes. `copy matches the store byte for byte` must print. Write down the printed paths. The manifest records the code you were on, which a restore needs. This copy is a plain safety copy. A copy made for a data release follows the additional [data-releases](data-releases.md) rules. Never overwrite or delete a release copy. The command runs only when you start it; there is no schedule.
 
 **5. Pull and sync.**
 
@@ -102,7 +102,7 @@ launchctl print gui/$(id -u)/com.tradepartner.paper | grep "last exit code"
 
 ```bash
 rm "$STORE_PATH.bak-YYYYMMDD-HHMM" "$STORE_PATH.bak-YYYYMMDD-HHMM.manifest.json"
-[ -f "$STORE_PATH.wal.bak-YYYYMMDD-HHMM" ] && rm "$STORE_PATH.wal.bak-YYYYMMDD-HHMM"
+[ -f "$STORE_PATH.bak-YYYYMMDD-HHMM.wal" ] && rm "$STORE_PATH.bak-YYYYMMDD-HHMM.wal"
 ```
 
 (Run step 1's `STORE_PATH=` line first in a new Terminal window.)
@@ -136,7 +136,7 @@ Never reuse a `damaged-` folder: it may hold the only record of what was lost.
 ls -lt "$(dirname "$STORE_PATH")"
 ```
 
-Candidates, newest first: a `.bak-YYYYMMDD-HHMM` copy from Part 1, a `tradepartner.<release>.duckdb` from a data release ([data-releases](data-releases.md)), or a Time Machine copy. A `.bak-YYYYMMDD-HHMM` copy has a `.manifest.json` file naming the code it belongs to. If there is no copy at all, stop. Ask Claude before doing anything else. The damaged files you moved aside are the only data left.
+Candidates, newest first: a `.bak-YYYYMMDD-HHMM` copy from Part 1, a copy retained for a data release ([data-releases](data-releases.md)), or a Time Machine copy. A `.bak-YYYYMMDD-HHMM` copy has a `.manifest.json` file naming the code it belongs to. If there is no copy at all, stop. Ask Claude before doing anything else. The damaged files you moved aside are the only data left.
 
 **4. Restore from your own copy.** The log file is the one trap. If a `.wal` from the damaged store stays next to the restored file, DuckDB replays it onto the copy. This block refuses to run until step 2 has moved both files away. Replace `YYYYMMDD-HHMM` with the copy's date and time, and run it in the same Terminal window as step 2:
 
@@ -145,7 +145,7 @@ STORE_PATH=$(uv run python -c "from tradepartner.config import get_settings; pri
 BAK="$STORE_PATH.bak-YYYYMMDD-HHMM"
 if [ -e "$STORE_PATH" ] || [ -e "$STORE_PATH.wal" ]; then echo "stop: do step 2 first"; else
   cp "$BAK" "$STORE_PATH"
-  [ -f "$STORE_PATH.wal.bak-YYYYMMDD-HHMM" ] && cp "$STORE_PATH.wal.bak-YYYYMMDD-HHMM" "$STORE_PATH.wal"
+  [ -f "$BAK.wal" ] && cp "$BAK.wal" "$STORE_PATH.wal"
   cat "$BAK.manifest.json"
 fi
 ```

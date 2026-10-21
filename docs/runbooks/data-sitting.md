@@ -158,7 +158,7 @@ Purpose: attach `data.release_id` to new registrations at the release boundary.
 
 ## Restore and gaps
 
-With every job still stopped and no DuckDB process holding the store, save the **failed live store and WAL first** using `uv run tradepartner store backup`; label its printed paths as failed-state evidence on the release PR/issue. Then restore the chosen checkpoint. `store backup` names a copy `<store>.bak-YYYYMMDD-HHMM` and a WAL copy `<store>.wal.bak-YYYYMMDD-HHMM` when one exists. Use their **printed paths**, not a guessed release filename:
+With every job still stopped and no DuckDB process holding the store, save the **failed live store and WAL first** using `uv run tradepartner store backup`; label its printed paths as failed-state evidence on the release PR/issue. Then restore the chosen checkpoint. `store backup` names a copy `<store>.bak-YYYYMMDD-HHMM` and a WAL copy `<copy>.wal` when one exists. Use their **printed paths**, not a guessed release filename:
 
 ```bash
 CHECKPOINT_COPY="<printed-copy-path>"

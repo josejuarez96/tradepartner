@@ -16,7 +16,7 @@ A repair that changes stored rows changes what a backtest reads. The trials alre
 ## The rule
 
 1. **Every row-changing repair on the owner's store is one named release.** This covers `repair-resolution` (a real run), `master-retract`, `repair-bars` (T140c) and any hand fix that inserts, updates or deletes rows. The nightly `ingest` is not a release.
-2. **Before it:** take a file backup named `tradepartner.<release>.duckdb`, beside the store, then write a `before` record.
+2. **Before it:** run `uv run tradepartner store backup`, then write a `before` record naming its printed copy path.
 3. **After it:** write an `after` record, with the sessions the repair touched.
 4. **One batch per release.** Do every fix the release is for, in one sitting, then close it. Do not open a second release while one is open.
 5. **Paper windows are off limits.** Once T71 starts, no release touches a session inside an open paper window. The daily ingest is the only writer there (#1303 accepted policy; [ADR 0016](../decisions/0016-development-boundary-and-forward-exams.md), point 7). A forward exam compares the paper book with a backtest recomputed from the store, so a repair there would move the exam with no change in the book.
@@ -48,7 +48,7 @@ The fields:
 
 | Field | On | Meaning |
 |---|---|---|
-| `name` | all | The release name. Lowercase, digits and hyphens. The backup file carries it: `tradepartner.<name>.duckdb`. A `before` and its `after` share one name. |
+| `name` | all | The release name. Lowercase, digits and hyphens. A `before` and its `after` share one name; record the stamped backup path separately. |
 | `stage` | all | `before` (written before the repair), `after` (written after it) or `record` (a closed note about a state that already exists, such as the back-fill below). |
 | `made_at` | all | When you wrote the entry. UTC, with the `Z`. |
 | `backup_path` | `before`, `record` | The backup file, as a path from the project root. Leave it out on `after` (the `before` names it). |
@@ -85,18 +85,12 @@ Write the printed times into the entry with a `Z` in place of `+00:00`.
 
 1. **Pick a name and the sessions.** The name says what the batch is (`repair-13-tickers`). List the securities and sessions the repair will touch.
 2. **Check the gates.** No paper window covers those sessions (once T71 starts). No ingest or `paper run` is running and none is due. No sweep is running. Stop the scheduled jobs as in [scheduling.md](scheduling.md), "Before pulling a schema migration".
-3. **Back up the store.** With nothing running:
+3. **Back up the store.** With nothing running, check free disk first (`df -h`): the store is over 1 GB. Then:
    ```bash
-   NAME=<name>
-   if [ -e data/tradepartner.$NAME.duckdb ]; then
-     echo "backup exists: pick another name"
-   else
-     cp -n data/tradepartner.duckdb data/tradepartner.$NAME.duckdb
-     [ -f data/tradepartner.duckdb.wal ] && cp -n data/tradepartner.duckdb.wal data/tradepartner.$NAME.duckdb.wal
-   fi
+   uv run tradepartner store backup
    ```
-   Never overwrite an existing backup: it may be the only copy of a state a trial read. Check free disk first (`df -h`): the store is over 1 GB.
-4. **Write the `before` entry.** Run the command above on the live store, at the close of `sessions_to`, and append the entry.
+   Record the printed copy, log copy (if present) and manifest paths. The command refuses an existing target or a busy store and verifies each copy byte for byte. If the UTC minute's name already exists, wait for the next minute and rerun. Never overwrite an existing backup: it may be the only copy of a state a trial read.
+4. **Write the `before` entry.** Use the printed copy path as `backup_path` (and as `--backup` for `decision data-release open`). Run the "Read the two numbers" command on the live store, at the close of `sessions_to`, and append the entry.
 5. **Run the repair.** Every command in the batch, back to back. Dry runs first where the command has one.
 6. **Check it.** `uv run tradepartner health --check` exits 0, and the checks the release's issue names pass.
 7. **Write the `after` entry.** Same `name`, `stage = "after"`, the numbers read again on the live store, and the sessions actually touched.
@@ -105,10 +99,11 @@ Write the printed times into the entry with a `Z` in place of `+00:00`.
 If the repair fails partway, keep the jobs stopped and nothing holding the store. First save the failed live state as evidence with `uv run tradepartner store backup` and record its printed copy, WAL and manifest paths on the release PR/issue. Then restore the pre-release backup:
 
 ```bash
-NAME=<name>
+BACKUP_COPY="<printed-copy-path>"
+BACKUP_WAL_COPY="<printed-log-copy-path-or-empty-string>"
 rm -f data/tradepartner.duckdb.wal   # else DuckDB replays the failed repair onto the restored file
-cp data/tradepartner.$NAME.duckdb data/tradepartner.duckdb
-[ -f data/tradepartner.$NAME.duckdb.wal ] && cp data/tradepartner.$NAME.duckdb.wal data/tradepartner.duckdb.wal
+cp "$BACKUP_COPY" data/tradepartner.duckdb
+if [ -n "$BACKUP_WAL_COPY" ]; then cp "$BACKUP_WAL_COPY" data/tradepartner.duckdb.wal; fi
 ```
 
 Keep the backup itself and the failed-state copy. **A restore from a copy taken before `decision data-release open` removes that release's `before` row**, as well as all later rows; `decision data-release close` then refuses because no release is open. Record the rollback and the removed release ids on the release PR/issue. A retry is a new release with a new name. If the owner instead chooses to open and close a new release solely to record the rollback in the store, its `after` row enters `data_vintage` and stales affected trials; decide that explicitly before writing it. A full unwind also restores the paper-window state captured by the chosen backup, so verify that state before restarting any paper job.
