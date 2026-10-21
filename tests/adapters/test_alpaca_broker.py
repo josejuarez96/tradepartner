@@ -1065,6 +1065,17 @@ def test_a_negative_fill_row_at_another_price_or_past_zero_raises_system_fault()
         _ral_broker(too_big).fills()
 
 
+@pytest.mark.parametrize("field, value", [("symbol", "OTHER"), ("side", "sell")])
+def test_a_negative_fill_row_with_another_symbol_or_side_raises_system_fault(
+    field: str, value: str
+) -> None:
+    changed = copy.deepcopy(_RAL_ROWS)
+    changed[2][field] = value
+
+    with pytest.raises(SystemFaultError, match=field):
+        _ral_broker(changed).fills()
+
+
 # --- account, positions, assets --------------------------------------------------
 
 

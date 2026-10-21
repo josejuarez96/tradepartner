@@ -260,6 +260,7 @@ from tradepartner.config import (
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import plan as plan_rules
 from tradepartner.execution import switch
+from tradepartner.execution.collect import _check_unchanged
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.outcomes import NOT_EXECUTED, POSITION_RETURN, REALISED_PNL
@@ -287,7 +288,7 @@ from tradepartner.store.journal import (
     PaperWindowRow,
     PaperWindowStopRow,
     adjustments_for,
-    all_fill_ids,
+    all_fill_terms,
     append,
     decisions_for,
     fills_for,
@@ -1868,7 +1869,10 @@ def settle_order(
     on the name the broker still knows). Neither of the last two applies under
     the reset exception: `get_order` raised `UnknownOrderError` and
     `positions()` holds nothing. Any broker error but that one
-    `UnknownOrderError` propagates, nothing written.
+    `UnknownOrderError` propagates, nothing written. A fill in the stream whose
+    `broker_fill_id` the journal holds at another quantity or price (a broker
+    correction after collection, #2153) raises collect's `SystemFaultError`,
+    nothing written.
 
     Then one clock reading, which must be later than the gate's reading and
     than every journal row of the order (else `ClockError`), stamps both rows
@@ -1907,10 +1911,13 @@ def settle_order(
                 others.append((other.client_order_id, None))
 
         with connect() as conn:
-            journaled = all_fill_ids(conn)
+            journaled = all_fill_terms(conn)
             ledger_quantity, symbol = _ledger_view(
                 conn, settings, target, now, sorted(positions), tolerance
             )
+        for fill in stream:
+            if fill.broker_fill_id in journaled:
+                _check_unchanged(fill, journaled[fill.broker_fill_id])
         held = positions.get(symbol) if symbol is not None else None
         broker_quantity = 0.0 if held is None else held.quantity
         reset = reading is None and not any(p.quantity != 0 for p in positions.values())
