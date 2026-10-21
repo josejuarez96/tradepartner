@@ -143,6 +143,7 @@ from tradepartner.store.journal import (
     OrderRow,
     ReconciliationRow,
     all_fill_ids,
+    all_fill_terms,
     append,
     decisions_for,
     fill_cursors,
@@ -499,7 +500,7 @@ def _journal_fills(
     journaled: list[str] = []
     superseded: list[str] = []
     foreign: list[str] = []
-    journaled_as = _journaled_quantities(conn)
+    journaled_as = all_fill_terms(conn)
     for fill in seen:
         if fill.broker_fill_id in known:
             _check_unchanged(fill, journaled_as.get(fill.broker_fill_id))
@@ -532,12 +533,6 @@ def _journal_fills(
         if synthetic:
             superseded.append(fill.broker_fill_id)
     return tuple(journaled), tuple(superseded), tuple(foreign)
-
-
-def _journaled_quantities(conn: duckdb.DuckDBPyConnection) -> dict[str, tuple[float, float]]:
-    """Each journaled `broker_fill_id`'s (quantity, price), superseded rows included."""
-    rows = conn.execute("SELECT broker_fill_id, quantity, price FROM fills").fetchall()
-    return {row[0]: (float(row[1]), float(row[2])) for row in rows if row[0] is not None}
 
 
 def _check_unchanged(fill: Fill, journaled: tuple[float, float] | None) -> None:
