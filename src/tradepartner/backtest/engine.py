@@ -685,6 +685,18 @@ def _held_before(book: _Book, sid: str, ex_date: date) -> bool:
     return previous_session(ex_date) in book.held_on.get(sid, set())
 
 
+def _spin_off_parent(sid: str, mapping: Mapping[str, str]) -> str:
+    """Find the live terminal successor; leave a cyclic parent unresolved."""
+    seen: set[str] = set()
+    current = sid
+    while current in mapping:
+        if current in seen:
+            return sid
+        seen.add(current)
+        current = mapping[current]
+    return current
+
+
 def _spin_off_counts(
     book: _Book,
     start: date,
@@ -697,11 +709,11 @@ def _spin_off_counts(
     unvalued, late = spin_offs
     return {
         "n_spin_offs_unvalued": sum(
-            start < ex <= end and _held_before(book, mapping.get(sid, sid), ex)
+            start < ex <= end and _held_before(book, _spin_off_parent(sid, mapping), ex)
             for sid, ex in unvalued.select("security_id", "ex_date").iter_rows()
         ),
         "n_late_spin_offs": sum(
-            _held_before(book, mapping.get(sid, sid), ex)
+            _held_before(book, _spin_off_parent(sid, mapping), ex)
             for sid, ex in late.select("security_id", "ex_date").iter_rows()
         ),
     }
@@ -711,8 +723,10 @@ def _spin_off_held_ids(
     ever_held: Sequence[str], chains: Sequence[tuple[str, str]]
 ) -> tuple[str, ...]:
     """Include raw predecessor IDs for the late spin-off provider read."""
+    mapping = dict(chains)
+    held = set(ever_held)
     return tuple(
-        sorted({*ever_held, *(pred for pred, successor in chains if successor in ever_held)})
+        sorted({*held, *(pred for pred in mapping if _spin_off_parent(pred, mapping) in held)})
     )
 
 
