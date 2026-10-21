@@ -2985,6 +2985,11 @@ def _max_version(conn: duckdb.DuckDBPyConnection) -> int | None:
     return result[0] if result is not None else None
 
 
+def stored_version(conn: duckdb.DuckDBPyConnection) -> int | None:
+    """Return the store's highest recorded schema version, if any."""
+    return _max_version(conn)
+
+
 def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
     """The read-only path of `init_schema`: no DDL, only a version check."""
     max_version = _max_version(conn)

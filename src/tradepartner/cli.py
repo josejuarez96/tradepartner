@@ -4120,6 +4120,50 @@ def make_app(
             raise absent
         return s
 
+    def paper_schema_gate(
+        s: Settings, *, read_only: bool = False, lots_reconcile: bool = False
+    ) -> None:
+        """Migrate or refuse after option validation, before journal or broker work."""
+        if not read_only:
+
+            def migrate() -> None:
+                with open_for_write(s) as conn:
+                    schema.init_schema(conn)
+
+            _paper_call(s, migrate)
+            return
+
+        def read_version() -> int | None:
+            with open_read_only(s) as conn:
+                return schema.stored_version(conn)
+
+        if lots_reconcile:
+            try:
+                version = read_version()
+            except StoreLockedError as exc:
+                raise _fail(
+                    _scrubbed(f"refused: locked: store busy: {exc}", s),
+                    LOTS_RECONCILE_REFUSAL_EXIT["locked"],
+                ) from None
+            refusal_exit = LOTS_RECONCILE_REFUSAL_EXIT["schema_version"]
+        else:
+            version = _paper_call(s, read_version)
+            refusal_exit = PAPER_REFUSAL_EXIT["refused"]
+        if version == schema.CURRENT_SCHEMA_VERSION:
+            return
+        if version is not None and version > schema.CURRENT_SCHEMA_VERSION:
+            message = (
+                f"store at schema {version} is newer than this code "
+                f"({schema.CURRENT_SCHEMA_VERSION}): update the code"
+            )
+        else:
+            found = "no schema" if version is None else f"schema {version}"
+            message = (
+                f"store at {found}, code at {schema.CURRENT_SCHEMA_VERSION}: "
+                "run `tradepartner ingest` or any paper write command to migrate"
+            )
+        raise _fail(_scrubbed(message, s), refusal_exit)
+
     def write_chunk(s: Settings) -> window.Connect:
         return lambda: open_for_write(s)
 
@@ -4131,6 +4175,7 @@ def make_app(
         """Open a paper window for a signed-off hypothesis in the book (spec req 14)."""
         chosen = _checked_book(book)
         s = paper_settings()
+        paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         result = _paper_call(
             s,
@@ -4156,6 +4201,7 @@ def make_app(
         (req 14)."""
         chosen = _checked_book(book)
         s = paper_settings(reason)
+        paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         result = _paper_call(
             s,
@@ -4173,6 +4219,7 @@ def make_app(
         for every book with an open window (spec req 7; the scheduler's job)."""
         chosen = _checked_book(book)
         s = paper_settings()
+        paper_schema_gate(s)
         if chosen is None:
             try:
                 runs = paper_run.every_book_run(
@@ -4221,6 +4268,7 @@ def make_app(
         """Reconcile the book's journal with its broker now (spec req 6)."""
         chosen = _checked_book(book)
         s = paper_settings()
+        paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         result = _paper_call(
             s,
@@ -4296,6 +4344,7 @@ def make_app(
         """Settle, collect, reconcile and release the book's kill switch (spec req 5)."""
         chosen = _checked_book(book)
         s = paper_settings(reason)
+        paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         outcome = _paper_call(
             s,
@@ -4331,6 +4380,7 @@ def make_app(
         """Open the book's tracking trial and compare paper with it (spec req 10)."""
         chosen = _checked_book(book)
         s = paper_settings()
+        paper_schema_gate(s, read_only=True)
 
         def run_report() -> paper_report.Report | str:
             try:
@@ -4370,6 +4420,7 @@ def make_app(
         """The book's four exit-criteria checks; exit 0 only when all pass (req 15)."""
         chosen = _checked_book(book)
         s = paper_settings()
+        paper_schema_gate(s, read_only=True)
 
         def run_check() -> list[paper_check.CheckLine]:
             with open_read_only(s) as conn:
@@ -4387,6 +4438,7 @@ def make_app(
         """The machine-readiness gate's seven lines over every book; exit 0 only when
         all pass (ADR 0017 part E; spec req 15 as amended 2026-10-09). Read-only."""
         s = paper_settings()
+        paper_schema_gate(s, read_only=True)
         now = ensure_tz_aware_utc(clock(), field_name="clock()")
 
         def run_shakedown() -> paper_shakedown.Shakedown:
@@ -4418,6 +4470,7 @@ def make_app(
         if every_book and chosen is not None:
             raise _fail("--all and --book cannot be combined", USAGE_ERROR)
         s = paper_settings()
+        paper_schema_gate(s, read_only=True)
         if every_book:
 
             def read_all() -> (
@@ -4471,6 +4524,7 @@ def make_app(
         """End the book's window without flattening, owner-only (#247 Q13)."""
         chosen = _checked_book(book)
         s = paper_settings(reason)
+        paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         result = _paper_call(
             s,
@@ -4499,6 +4553,8 @@ def make_app(
         day = _parse_day("--session", session)
         chosen = _checked_book(book)
         s = paper_settings(reason)
+        if kind != "engage_kill_switch":
+            paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         override_id = _paper_call(
             s, lambda: window.override(s, clock, kind, day, name, reason, book_id=bk)
@@ -4525,6 +4581,7 @@ def make_app(
         (client_order_id,) = order
         chosen = _checked_book(book)
         s = paper_settings(reason)
+        paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         result = _paper_call(
             s,
@@ -4559,6 +4616,7 @@ def make_app(
 
         if not Path(s.store.path).exists():
             raise refuse("no_store", f"no store at {s.store.path}")
+        paper_schema_gate(s, read_only=True, lots_reconcile=True)
         try:
             rows = parse_export(export)
         except UnknownExportFormat as exc:
