@@ -298,6 +298,60 @@ def test_from_the_known_at_the_successor_reads_both_histories(
     ]
 
 
+def test_a_row_written_after_t_does_not_hide_the_chain_known_before_it(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#2103: the row that supersedes a chain must itself be known at `t`. A
+    `successor_chains` row written after `t` (a retraction here, as
+    `master-retract` writes with no replacement) must not drop a chain that was
+    knowable at `t`: the chain reads live from its own stamp until the
+    retraction's, and absent from it on, and the chained reads hold the same
+    boundary (the predecessor's rows are the successor's at `_AFTER`, before
+    the retraction, and the predecessor's own again from it)."""
+    retracted_at = datetime.fromisoformat("2020-05-01T20:30:00+00:00")
+    insert_row(
+        chain_fixture_store,
+        "successor_chains",
+        _chain_row(retracted_at, retracted_at, retracted=True, withdrawn_known_at=_CHAIN_KNOWN_AT),
+    )
+    assert live_chains(chain_fixture_store, _CHAIN_KNOWN_AT - PROBE_EPSILON) == ()
+    for t in (_CHAIN_KNOWN_AT, _AFTER):
+        assert live_chains(chain_fixture_store, t) == ((_PREDECESSOR, _SUCCESSOR),), t
+    assert (_PREDECESSOR, _SUCCESSOR) in live_chains(
+        chain_fixture_store, retracted_at - PROBE_EPSILON
+    )
+    for t in (retracted_at, retracted_at + PROBE_EPSILON):
+        assert (_PREDECESSOR, _SUCCESSOR) not in live_chains(chain_fixture_store, t), t
+    # The chained reads hold the same boundary: the predecessor's bars are the
+    # successor's at `_AFTER` (before the retraction) and its own again from it.
+    assert prices_as_of(chain_fixture_store, _AFTER, [_PREDECESSOR]).is_empty()
+    assert not prices_as_of(chain_fixture_store, retracted_at, [_PREDECESSOR]).is_empty()
+
+
+def test_live_chains_takes_the_greatest_ingested_at_among_rows_known_at_t() -> None:
+    """#2103 unit: `live_chains` picks the successor's unretracted row with the
+    greatest `ingested_at` **among the rows known at `t`**. A revision written
+    after `t` (its own `known_at` later) never enters that comparison, so it
+    cannot drop the row that was live at `t`; from its own `known_at` it
+    supersedes it."""
+    from tradepartner.store.schema import init_schema
+
+    conn = duckdb.connect(":memory:")
+    try:
+        init_schema(conn)
+        first = datetime.fromisoformat("2020-02-07T20:30:00+00:00")
+        later = datetime.fromisoformat("2020-03-30T20:30:00+00:00")
+        insert_row(conn, "successor_chains", _chain_row(first, first))
+        assert live_chains(conn, first) == ((_PREDECESSOR, _SUCCESSOR),)
+        insert_row(conn, "successor_chains", _chain_row(later, later, predecessor_id="0001000009"))
+        # The revision is not known at `first`, so it does not supersede there.
+        assert live_chains(conn, first) == ((_PREDECESSOR, _SUCCESSOR),)
+        # Known from its own stamp, it is the live chain.
+        assert live_chains(conn, later) == (("0001000009", _SUCCESSOR),)
+    finally:
+        conn.close()
+
+
 def test_the_chained_dividend_adjusts_the_successors_early_bars(
     chain_fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:

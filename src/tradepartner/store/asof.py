@@ -44,8 +44,10 @@ one function decides a security's existence is.
 out of a 1:1 successor-CIK reorganisation. `live_chains(conn, t)` returns
 the `(predecessor_id, successor_id)` pairs whose live, unretracted chain row
 is known at `t` (`schema.successor_chains`'s rule: the successor's
-unretracted row with the greatest `ingested_at`, unless a retraction was
-written after it). The six as-of reads keyed by security
+unretracted row known at `t` with the greatest `ingested_at`, unless a row
+known at `t` -- a revision or a retraction -- was written after it, so a row
+written after `t` never hides a chain that was known at `t`, #2103). The six
+as-of reads keyed by security
 (`prices_as_of`, `adjusted_prices_as_of`, `live_actions_as_of`,
 `price_jumps_as_of`, `dropped_dividends_as_of`, `facts_as_of`) apply the
 chains **known at `t`** with one shared helper: the predecessor's rows are
@@ -428,11 +430,14 @@ def _has_table(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
 def live_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[tuple[str, str], ...]:
     """The `(predecessor_id, successor_id)` pairs whose live chain is known
     at `t` (#821, T187b): sorted by successor. The live chain is the
-    successor's unretracted `successor_chains` row with the greatest
-    `ingested_at`, unless a later row (a retraction) was written after it
-    (`schema.successor_chains`); only rows with `known_at <= t` are read, so
-    a chain reads absent at every `t` before its evidence stamp. A store
-    below schema 31 has no `successor_chains` table and no chain.
+    successor's unretracted `successor_chains` row *known at `t`* with the
+    greatest `ingested_at`, unless a row known at `t` (a revision, or a
+    retraction) was written after it (`schema.successor_chains`); only rows
+    with `known_at <= t` are read -- the live row **and** any row that would
+    supersede it -- so a chain reads absent at every `t` before its evidence
+    stamp, and a row written after `t` never hides a chain that was known at
+    `t` (#2103). A store below schema 31 has no `successor_chains` table and
+    no chain.
 
     `t` must be tz-aware (a bare date raises `TypeError`)."""
     t = _validate_t(t)
@@ -445,10 +450,11 @@ def live_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[tuple[str
           AND NOT EXISTS (
               SELECT 1 FROM {_CHAINS_TABLE} n
               WHERE n.successor_id = c.successor_id AND n.ingested_at > c.ingested_at
+                AND n.known_at <= ?
           )
         ORDER BY successor_id
         """,
-        [t],
+        [t, t],
     ).fetchall()
     return tuple((str(predecessor), str(successor)) for predecessor, successor in rows)
 
