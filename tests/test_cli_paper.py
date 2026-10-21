@@ -305,7 +305,7 @@ def test_a_version_16_store_is_refused_as_schema_version(export_file: Path, live
 
     out = _reconcile(export_file, rows=AGREEING)
 
-    assert out.exit_code == REFUSED, out.output
+    assert out.exit_code == EXIT["schema_version"], out.output
     assert f"store at schema 16, code at {schema.CURRENT_SCHEMA_VERSION}" in out.output
 
 
@@ -872,6 +872,81 @@ def test_read_only_paper_command_refuses_old_store_without_writing(
     assert "tradepartner ingest" in out.output
     assert _sha256(live) == before
     assert factory.fake.calls == calls_before
+
+
+@pytest.mark.usefixtures("started")
+def test_kill_engages_even_when_migration_raises(
+    live: Path, clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _downgrade_to_34(live)
+
+    def fail_migration(_conn: duckdb.DuckDBPyConnection) -> None:
+        raise schema.SchemaVersionError("migration failed")
+
+    monkeypatch.setattr(schema, "init_schema", fail_migration)
+    out = _paper(clock, factory, "kill", "--reason", LONG_REASON)
+
+    assert out.exit_code == 0, out.output
+    assert _count("kill_switch") == 1
+
+
+@pytest.mark.usefixtures("started")
+def test_kill_switch_override_survives_migration_failure(
+    live: Path, clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _downgrade_to_34(live)
+
+    def fail_migration(_conn: duckdb.DuckDBPyConnection) -> None:
+        raise schema.SchemaVersionError("migration failed")
+
+    monkeypatch.setattr(schema, "init_schema", fail_migration)
+    out = _paper(
+        clock, factory, "override", "--kind", "engage_kill_switch", "--reason", LONG_REASON
+    )
+
+    assert out.exit_code == 0, out.output
+    assert _count("overrides") == 1
+
+
+@pytest.mark.usefixtures("started")
+def test_kill_engages_on_store_newer_than_code(
+    live: Path, clock: _Clock, factory: _Factory
+) -> None:
+    with duckdb.connect(str(live)) as conn:
+        conn.execute("UPDATE schema_version SET version = ?", [schema.CURRENT_SCHEMA_VERSION + 1])
+
+    out = _paper(clock, factory, "kill", "--reason", LONG_REASON)
+
+    assert out.exit_code == 0, out.output
+    assert _count("kill_switch") == 1
+
+
+@pytest.mark.usefixtures("started")
+def test_paper_run_help_does_not_migrate_old_store(
+    live: Path, clock: _Clock, factory: _Factory
+) -> None:
+    _downgrade_to_34(live)
+    out = _paper(clock, factory, "run", "--help")
+
+    assert out.exit_code == 0, out.output
+    with duckdb.connect(str(live), read_only=True) as conn:
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (34,)
+
+
+@pytest.mark.usefixtures("started")
+def test_read_only_paper_command_names_newer_store(
+    live: Path, clock: _Clock, factory: _Factory
+) -> None:
+    with duckdb.connect(str(live)) as conn:
+        conn.execute("UPDATE schema_version SET version = ?", [schema.CURRENT_SCHEMA_VERSION + 1])
+
+    out = _paper(clock, factory, "status")
+
+    assert out.exit_code == REFUSED
+    assert (
+        f"store at schema {schema.CURRENT_SCHEMA_VERSION + 1} is newer than this code "
+        f"({schema.CURRENT_SCHEMA_VERSION}): update the code"
+    ) in out.output
 
 
 def test_a_broker_that_cannot_be_built_fails_scrubbed(clock: _Clock) -> None:

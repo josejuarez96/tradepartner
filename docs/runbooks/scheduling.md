@@ -34,13 +34,13 @@ Sources run in order, `edgar` then `alpaca`, and **the run stops at the first so
 
 ## Before pulling a schema migration
 
-`tradepartner ingest` and every `tradepartner paper` write command migrate an older store before journaling or calling the broker. Paper write commands are `start`, `stop`, `run`, `reconcile`, `kill`, `resume`, `abandon`, `override` and `settle`. Paper read-only commands (`report`, `check`, `shakedown`, `status` and `lots-reconcile`) refuse an older store with the stored and code schema versions and tell you to run ingest or a paper write command. There is no separate `migrate` command or prompt. The first scheduled `ingest` or `paper run` after a schema bump migrates the store; older code cannot read it afterwards. The code's version is `CURRENT_SCHEMA_VERSION` in `src/tradepartner/store/schema.py`. Check before you pull:
+`tradepartner ingest` and paper write commands `start`, `stop`, `run`, `reconcile`, `resume`, `abandon`, `settle` and non-kill-switch `override` migrate an older store before journaling or calling the broker. **`paper kill` and `paper override --kind engage_kill_switch` skip migration so a migration failure cannot block engagement.** Paper read-only commands (`report`, `check`, `shakedown`, `status` and `lots-reconcile`) refuse an older store with the stored and code schema versions and tell you to run ingest or a paper write command that migrates. There is no separate `migrate` command or prompt. The first scheduled `ingest` or `paper run` after a schema bump migrates the store; older code cannot read it afterwards. The code's version is `CURRENT_SCHEMA_VERSION` in `src/tradepartner/store/schema.py`. Check before you pull:
 
 ```bash
 git fetch origin && git diff HEAD origin/main -- src/tradepartner/store/schema.py | grep '^[-+]CURRENT_SCHEMA_VERSION ='
 ```
 
-Any output means the pull migrates the store on its next write. If you have already pulled a bump and are not sure a write has run since, take the copy anyway: an extra one costs nothing.
+Any output means the pull migrates the store on its next ingest or migrating paper write command. If you have already pulled a bump and are not sure one has run since, take the copy anyway: an extra one costs nothing.
 
 **The full routine is its own page: [update-the-system](update-the-system.md).** It has the exact commands to unload every job and confirm it is idle, copy the store (the file, its `.wal`, and the commit you were on), pull, `uv sync`, load the jobs again, and check with `paper status --all` and `health --check`. Its Part 2 is the restore, for a bad update and for a store damaged by a disk fault or power loss.
 
