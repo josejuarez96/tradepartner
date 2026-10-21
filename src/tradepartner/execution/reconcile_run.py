@@ -88,7 +88,7 @@ as_of`:
   name, which bounds an ended name's proceeds and a pending order's reach.
 - `mergers` (paper spec amendment #1762 item 1, T249): the open mergers, from
   `mergers_as_of(close(S-1))` for the journal's names. A merger is identified by
-  its Alpaca id, which every `corporate_action_cash` row journaled for it names
+  its Alpaca id, which every `corporate_action_cash` or `merger_receipt` row names
   in `explanation_json` (`merger_id`). It is open at S when `effective_date <=
   S` and either (a) the ledger stated through S still holds its acquiree, long
   or short, or (b) the removal is journaled (its own row, or the ended-listing
@@ -651,6 +651,7 @@ def _explanations(
     *,
     merger_lag_sessions: int,
     cash_tolerance: float,
+    whole_share_price_buffer: float,
 ) -> Explanations:
     cut = _cut(session)
     names = (
@@ -669,6 +670,7 @@ def _explanations(
         tolerance,
         merger_lag_sessions,
         cash_tolerance,
+        whole_share_price_buffer,
     )
     # The acquirers join the mapped names before the map is built (#1762 item
     # 1), so a symbol an acquirer shares with its acquiree is resolved by
@@ -878,6 +880,7 @@ def _mergers(
     tolerance: float,
     lag_sessions: int,
     cash_tolerance: float,
+    whole_share_price_buffer: float,
 ) -> tuple[dict[str, OpenMerger], dict[str, str], set[str]]:
     """The open mergers by acquiree, the conflicting pairs raised at this
     reconciliation, and the acquirers to map (module docstring, `mergers`).
@@ -895,11 +898,14 @@ def _mergers(
     first_known = _merger_first_known(conn, cut, sorted({r["security_id"] for r in rows}))
     # A merger's own rows by (acquiree, id), the table's identity.
     own: dict[tuple[str, str], list[AdjustmentRow]] = defaultdict(list)
+    receipts: dict[tuple[str, str], list[AdjustmentRow]] = defaultdict(list)
     band: dict[str, list[AdjustmentRow]] = defaultdict(list)
     for adjustment in state.adjustments:
         merger_id = _merger_id_of(adjustment)
         if merger_id is not None:
             own[(adjustment.security_id or "", merger_id)].append(adjustment)
+            if adjustment.kind == "merger_receipt" and adjustment.security_id is not None:
+                receipts[(adjustment.security_id, merger_id)].append(adjustment)
         elif (
             adjustment.kind == _CORPORATE_ACTION_CASH
             and adjustment.security_id is not None
@@ -946,7 +952,28 @@ def _mergers(
         if removal is not None and removal.quantity is not None and effective and not held:
             removed_quantity = -removal.quantity
             rate = row["cash_per_share"] if row["cash_per_share"] is not None else 0.0
-            upper = Decimal(str(removed_quantity * float(rate)))
+            upper_value = removed_quantity * float(rate)
+            if row["kind"] != "cash" and row["acquirer_security_id"] is not None:
+                acquirer = str(row["acquirer_security_id"])
+                receipt_rows = receipts.get((acquirer, merger_id), [])
+                receipt = next((a for a in receipt_rows if a.session == removal.session), None)
+                if receipt is not None and receipt.quantity is not None:
+                    shares_due = removed_quantity * float(row["share_ratio"])
+                    fractional = max(shares_due - receipt.quantity, 0.0)
+                    if fractional > tolerance:
+                        prices = _reference_prices(
+                            conn,
+                            _cut(receipt.session),
+                            [acquirer],
+                            previous_session(receipt.session),
+                        )
+                        price = prices.get(acquirer)
+                        if price is None:
+                            raise ValueError(
+                                f"merger {merger_id} receipt lacks acquirer reference price"
+                            )
+                        upper_value += fractional * price * (1 + whole_share_price_buffer)
+            upper = Decimal(str(upper_value))
             paid = Decimal(str(journaled)) >= upper - bound
             closed = any(
                 r.status == OK and after_end(stated) and removal.known_at <= r.known_at
@@ -975,6 +1002,7 @@ def _mergers(
             removed_quantity=None if open_held else removed_quantity,
             journaled_cash=journaled,
             final=is_open and session > end and not checked,
+            cash_upper=upper_value if removed_quantity is not None else None,
         )
         found[(name, merger_id)] = (merger, is_open, is_open or bool(own_rows))
 
@@ -1018,6 +1046,7 @@ def explanations_as_of(
     quantity_tolerance: float,
     merger_lag_sessions: int = _DEFAULT_RISK.reconcile_merger_lag_sessions,
     cash_tolerance: float = _DEFAULT_RISK.reconcile_cash_tolerance,
+    whole_share_price_buffer: float = _DEFAULT_RISK.whole_share_price_buffer,
 ) -> Explanations:
     """What the store knew at close(S-1), and the journal at `as_of`, to explain
     the broker on S (module docstring). Read-only. `as_of` is the journal cut
@@ -1047,6 +1076,7 @@ def explanations_as_of(
         session,
         merger_lag_sessions=merger_lag_sessions,
         cash_tolerance=cash_tolerance,
+        whole_share_price_buffer=whole_share_price_buffer,
     )
 
 
@@ -1162,6 +1192,7 @@ def reconcile_now(
             through,
             merger_lag_sessions=frozen.reconcile_merger_lag_sessions,
             cash_tolerance=frozen.reconcile_cash_tolerance,
+            whole_share_price_buffer=frozen.whole_share_price_buffer,
         )
     # The read-only `_explanations` names the seen-sets and fallback; the broker's
     # cash activities are attached here (they are a broker input, never a journal

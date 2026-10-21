@@ -142,6 +142,7 @@ def _merger(
     payable: date | None = S,
     kind: str = "cash",
     acquirer: str | None = None,
+    share_ratio: float = 0.5,
 ) -> None:
     """A stored `mergers` row: a cash merger at `RATE` unless `kind` says stock."""
     stock = kind != "cash"
@@ -157,7 +158,7 @@ def _merger(
                 "acquiree_cusip": "SYNTH-MTUM",
                 "acquirer_symbol": "SPY" if acquirer else "",
                 "acquirer_cusip": "SYNTH-SPY" if acquirer else "",
-                "share_ratio": 0.5 if stock else None,
+                "share_ratio": share_ratio if stock else None,
                 "cash_per_share": None if kind == "stock" else RATE,
                 "effective_date": effective,
                 "process_date": effective,
@@ -715,19 +716,158 @@ def test_the_acquirer_joins_the_names_mapped_to_broker_symbols(
     assert found.mergers[MTUM].kind == "stock"
 
 
-def test_a_stock_merger_is_not_explained_here(
+def test_a_stock_merger_without_a_receipt_halts_on_quantity(
     journal_settings: Settings,
     fake: BookedFake,
     open_window: PaperWindowRow,
     fixed_clock: FixedClock,
 ) -> None:
-    """T249b's case: until then a removal on a stock row halts as today."""
+    """A stored stock merger cannot explain a missing acquirer receipt."""
     _hold(journal_settings, fake, open_window)
     _merger(journal_settings, kind="stock", acquirer=SPY)
     _removed(fake, 0.0)
 
     kinds = [m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S)]
-    assert kinds == ["ledger_only_position"]
+    assert kinds == ["quantity"]
+
+
+def test_stock_merger_whole_receipt_then_later_cil(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """10 x .25 = 2.5 due: 2 shares arrive, then 50 cash for the half
+    at the 100 reference. The upper cash bound is 51 with the 2% buffer."""
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings, kind="stock", acquirer=SPY, share_ratio=0.25)
+    _removed(fake)
+    fake.extra_quantity["SPY"] = 2.0
+
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S).status == OK
+    removal, receipt = _adjustments(journal_settings, open_window)
+    assert (removal.kind, removal.security_id, removal.quantity, removal.cash) == (
+        "corporate_action_cash",
+        MTUM,
+        -10.0,
+        0.0,
+    )
+    assert (receipt.kind, receipt.security_id, receipt.quantity, receipt.cash) == (
+        "merger_receipt",
+        SPY,
+        2.0,
+        None,
+    )
+    assert _merger_id(removal) == _merger_id(receipt) == M1
+    assert _open(journal_settings, open_window, S2).mergers[MTUM].removed_quantity == 10.0
+
+    fake.extra_cash = 50.0
+    fake.activities.append(CashActivity("cil-stock-1", "CIL", S2, "executed", 50.0, "SPY"))
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S2).status == OK
+    cash_row = _adjustments(journal_settings, open_window)[-1]
+    assert (cash_row.kind, cash_row.quantity, cash_row.cash, _merger_id(cash_row)) == (
+        "corporate_action_cash",
+        None,
+        50.0,
+        M1,
+    )
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S3).status == OK
+    assert len(_adjustments(journal_settings, open_window)) == 3
+
+
+def test_stock_merger_receipt_below_band_halts_on_quantity(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings, kind="stock", acquirer=SPY, share_ratio=0.25)
+    _removed(fake)
+    fake.extra_quantity["SPY"] = 0.5  # one share below the band's 1.5 lower edge
+    assert "quantity" in [
+        m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S)
+    ]
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_stock_merger_counts_a_preexisting_acquirer_holding(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings, kind="stock", acquirer=SPY, share_ratio=0.5)
+    # A preexisting 3-share holding plus 5 receipt shares.
+    _append(
+        journal_settings,
+        AdjustmentRow(
+            window_id=open_window.window_id,
+            session=BOUGHT_AT.date(),
+            kind="carried_residue",
+            security_id=SPY,
+            quantity=3.0,
+            known_at=BOUGHT_AT,
+            ingested_at=BOUGHT_AT,
+        ),
+    )
+    fake.extra_quantity["SPY"] = 8.0
+    _removed(fake)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S).status == OK
+    assert _adjustments(journal_settings, open_window)[-1].quantity == 5.0
+
+
+def test_short_stock_merger_still_halts_short_external_change() -> None:
+    ledger = Ledger(positions={}, cash=LEDGER_CASH, through=S, short_holdings={MTUM: HELD})
+    result = _compare(
+        ledger,
+        {"SPY": 5.0},
+        LEDGER_CASH,
+        {MTUM: _merger_open(kind="stock", acquirer=SPY, share_ratio=0.5, cash_per_share=None)},
+    )
+    assert "short_external_change" in [m.kind for m in result.mismatches]
+    assert result.adjustments == ()
+
+
+def test_stock_and_cash_receipt_and_base_cash_due() -> None:
+    """10 acquiree shares yield 2 acquirer shares and 625 base cash;
+    another 51 is the buffered CIL upper bound for the missing half share."""
+    ledger = Ledger(positions={MTUM: 10.0}, cash=LEDGER_CASH, through=S)
+    result = _compare(
+        ledger,
+        {"SPY": 2.0},
+        LEDGER_CASH + 625.0,
+        {
+            MTUM: _merger_open(
+                kind="stock_and_cash",
+                acquirer=SPY,
+                share_ratio=0.25,
+                cash_per_share=62.5,
+            )
+        },
+    )
+    assert result.status == OK
+    assert [(a.kind, a.quantity, a.cash) for a in result.adjustments] == [
+        ("corporate_action_cash", -10.0, 625.0),
+        ("merger_receipt", 2.0, None),
+    ]
+
+
+def test_unpaid_stock_cil_closes_quietly_after_window(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings, kind="stock", acquirer=SPY, share_ratio=0.25)
+    _removed(fake)
+    fake.extra_quantity["SPY"] = 2.0
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S).status == OK
+    assert _open(journal_settings, open_window, AFTER).mergers[MTUM].final
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, AFTER).status == OK
+    assert _open(journal_settings, open_window, LATER).mergers == {}
 
 
 # --- pure compare cases --------------------------------------------------------

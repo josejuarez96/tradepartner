@@ -542,7 +542,11 @@ registry; #83 took version 2 first, so the registry is version 3):
   backfill stales no trial. A read-only connection accepts a version-34 store:
   every read works but a `mergers` read, which fails on the missing table, and
   the next writable `init_schema` call migrates the store.
-- **A later DDL change goes to version 36**, with its own migration and a
+- **Version 36** (#2143, T249b): `adjustments.kind` gains
+  `merger_receipt`. The migration rebuilds `adjustments` with the widened
+  `CHECK`, keeping every v35 row in insertion order and byte-identical.
+  A read-only v35 store remains readable; the next writable open migrates it.
+- **A later DDL change goes to version 37**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -834,9 +838,11 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 35 (#1762, plan T248c): the `mergers` table and its identity index,
 #:   created by the DDL pass (`_MERGERS_TABLE_DDL`); no existing table changes
 #:   (module docstring, "Schema versions").
-#: - A later DDL change goes to version 36, with its own migration and a
+#: - 36 (#2143, T249b): `adjustments.kind` gains `merger_receipt`; the table
+#:   is rebuilt with its widened CHECK, preserving every existing row.
+#: - A later DDL change goes to version 37, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 35
+CURRENT_SCHEMA_VERSION = 36
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -996,6 +1002,7 @@ _PRE_SHORT_REASONS_VERSION = 33
 #: connections serve every other read; a `mergers` read there fails on the
 #: missing table, as a `symbol_changes` read did at 27.
 _PRE_MERGERS_VERSION = 34
+_PRE_MERGER_RECEIPT_VERSION = 35
 
 
 class SchemaVersionError(RuntimeError):
@@ -2044,6 +2051,7 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
         "carried_residue",
         "fee_cash",
         "cash_in_lieu",
+        "merger_receipt",
     ),
     ("adjustments", "origin"): ("dust", "untradable"),
     ("reconciliations", "status"): ("ok", "mismatch", "pending_unresolved", "fills_lagging"),
@@ -3012,6 +3020,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_COST_LEVEL_KIND_VERSION,
         _PRE_SHORT_REASONS_VERSION,
         _PRE_MERGERS_VERSION,
+        _PRE_MERGER_RECEIPT_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3382,6 +3391,26 @@ def _migrate_cash_in_lieu_kind(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("INSERT INTO adjustments_v27 BY NAME SELECT * FROM adjustments ORDER BY rowid")
     conn.execute("DROP TABLE adjustments")
     conn.execute("ALTER TABLE adjustments_v27 RENAME TO adjustments")
+
+
+def _migrate_merger_receipt_kind(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 36: widen `adjustments.kind`, preserving rows in insertion order."""
+    check = conn.execute(
+        "SELECT constraint_text FROM duckdb_constraints() WHERE database_name = "
+        "current_database() AND schema_name = current_schema() AND table_name = 'adjustments' "
+        "AND constraint_type = 'CHECK' AND constraint_column_names[1] = 'kind'",
+        [],
+    ).fetchone()
+    if check is not None and "'merger_receipt'" in (check[0] or ""):
+        return
+    conn.execute(
+        _CREATE_ADJUSTMENTS.replace(
+            "CREATE TABLE IF NOT EXISTS adjustments (", "CREATE TABLE adjustments_v36 (", 1
+        )
+    )
+    conn.execute("INSERT INTO adjustments_v36 BY NAME SELECT * FROM adjustments ORDER BY rowid")
+    conn.execute("DROP TABLE adjustments")
+    conn.execute("ALTER TABLE adjustments_v36 RENAME TO adjustments")
 
 
 def _add_nullable_int_columns(
@@ -3901,7 +3930,7 @@ def _migrate_short_reasons(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 34 store to version 35.
+    version-2 to 35 store to version 36.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -3914,6 +3943,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
     `CURRENT_SCHEMA_VERSION` and no lab table; every store gets
+    `adjustments` rebuilt with the version-36 `merger_receipt` kind `CHECK`
+    where needed, every row kept in insertion order; a version-35 store gets
+    a version-36 row (#2143, T249b); every store gets
     `openfigi_types` and `successor_chains` created where it lacks them (purely
     additive; a version-29 store gets version-30 and version-31 rows, a
     version-30 store a version-31 row; #1713, T189c; #821, T187); every store gets
@@ -4066,6 +4098,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_COST_LEVEL_KIND_VERSION,
         _PRE_SHORT_REASONS_VERSION,
         _PRE_MERGERS_VERSION,
+        _PRE_MERGER_RECEIPT_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4139,6 +4172,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_fee_activities(conn)
         if max_version is None or max_version <= _PRE_CASH_IN_LIEU_VERSION:
             _migrate_cash_in_lieu_kind(conn)
+        if max_version is None or max_version <= _PRE_MERGER_RECEIPT_VERSION:
+            _migrate_merger_receipt_kind(conn)
         if max_version is not None and max_version <= _PRE_SHORT_REASONS_VERSION:
             _refuse_stray_short_reasons(conn)
         if max_version is None or max_version <= _PRE_SKIP_REASONS_VERSION:
