@@ -349,10 +349,50 @@ def test_a_timeout_is_retried_max_retries_times_then_raised() -> None:
     with pytest.raises(AlpacaTradingError) as err:
         raw.get_account()
     assert len(client.calls) == 3
+    assert clock.sleeps == [1.0, 2.0]
     assert err.value.status_code is None and err.value.retried
     # No SDK exception (whose request headers carry the keys) kept on the error.
     assert err.value.__context__ is None and err.value.__cause__ is None
     assert PAPER_KEY not in repr(vars(err.value)) and PAPER_KEY not in str(err.value)
+
+
+@pytest.mark.parametrize("failures", [1, 2, 3])
+def test_retryable_failures_back_off_before_success(failures: int) -> None:
+    clock = FakeClock()
+    client = FakeClient(fail_with=[requests.Timeout("slow")] * failures)
+    raw = AlpacaTradingRaw(_settings(), client=client, clock=clock)
+
+    assert raw.get_account() == {"cash": "100"}
+    assert clock.sleeps == [float(2**attempt) for attempt in range(failures)]
+    assert len(client.calls) == failures + 1
+
+
+def test_retry_backoff_is_capped_and_never_sleeps_after_final_attempt() -> None:
+    clock = FakeClock()
+    client = FakeClient(fail_with=[requests.ConnectionError("offline")] * 4)
+    raw = AlpacaTradingRaw(
+        _settings(trading_retry_backoff_seconds=3, trading_retry_backoff_max_seconds=4),
+        client=client,
+        clock=clock,
+    )
+
+    with pytest.raises(AlpacaTradingError):
+        raw.get_account()
+    assert clock.sleeps == [3.0, 4.0, 4.0]
+    assert len(client.calls) == 4
+
+
+def test_success_and_non_retryable_error_do_not_back_off() -> None:
+    clock = FakeClock()
+    raw = AlpacaTradingRaw(_settings(), client=FakeClient(), clock=clock)
+    assert raw.get_account() == {"cash": "100"}
+    assert clock.sleeps == []
+
+    clock = FakeClock()
+    raw = AlpacaTradingRaw(_settings(), client=FakeClient(fail_with=[_api_error(403)]), clock=clock)
+    with pytest.raises(AlpacaTradingError):
+        raw.get_account()
+    assert clock.sleeps == []
 
 
 def _api_error(status: int, body: str = '{"code": 1, "message": "refused"}') -> APIError:
@@ -428,8 +468,11 @@ def _request() -> Any:
 
 
 def test_a_submit_refused_as_duplicate_on_retry_returns_the_landed_order() -> None:
+    clock = FakeClock()
     client = FakeClient(fail_with=[requests.ReadTimeout("slow"), _recorded_duplicate()])
-    assert _raw(client=client).submit_order(_request()) == {"client_order_id": "rec-1"}
+    raw = AlpacaTradingRaw(_settings(), client=client, clock=clock)
+    assert raw.submit_order(_request()) == {"client_order_id": "rec-1"}
+    assert clock.sleeps == [1.0, pytest.approx(0.4)]
     assert [name for name, _ in client.calls] == [
         "submit_order",
         "submit_order",
@@ -599,7 +642,7 @@ def test_get_order_by_id_is_paced_and_retried_like_every_call() -> None:
 
     assert raw.get_order_by_id("o9") == {"id": "o9"}
     assert client.calls == [("get_order_by_id", ("o9",))] * 2
-    assert clock.sleeps == [pytest.approx(2.0)]
+    assert clock.sleeps == [pytest.approx(1.0), pytest.approx(1.0)]
 
 
 @pytest.mark.parametrize(
