@@ -268,6 +268,7 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
     # slow shard whose wall clock crosses a session boundary between import and
     # render cannot advance the required session past the fixture's run (#1263).
     monkeypatch.setattr(ops, "utc_now", lambda: _NOW)
+    monkeypatch.setattr(ops_page, "utc_now", lambda: _NOW)
     at = AppTest.from_file(_APP_PATH)
     at.run()
     at.sidebar.radio[0].set_value(_PAGE).run()
@@ -785,6 +786,50 @@ def test_two_books_list_two_summary_rows_and_the_selector_switches_the_sections(
     assert {m.label: str(m.value) for m in at.metric}["Positions"] == "2"
     assert "No alerts in this window." in _text(at)
     assert "No fills yet in this window." in _text(at)
+
+
+def test_waiting_card_empty_before_books(monkeypatch: pytest.MonkeyPatch, risk_store: Path) -> None:
+    at = _app(monkeypatch, risk_store)
+    assert not at.exception
+    labels = [h.value for h in at.subheader]
+    assert labels.index("Waiting on you") < labels.index("Books")
+    assert re.search(r":green-badge\[[^\]]*Nothing is waiting on you", _text(at))
+
+
+def test_waiting_card_covers_every_book_after_selection_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _add_book_b(seeded_store)
+    settings = Settings(_env_file=None, store={"path": str(seeded_store)})
+    with open_for_write(settings) as conn:
+        window = journal.open_window(conn, "main")
+        assert window is not None and window.window_id is not None
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=window.window_id,
+                at=_at(-20),
+                state="engaged",
+                source="owner",
+                reason="test",
+                **_stamp(-20),
+            ),
+        )
+    before = seeded_store.read_bytes()
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    labels = [h.value for h in at.subheader]
+    assert labels.index("Waiting on you") < labels.index("Books")
+    text = _text(at)
+    assert re.search(r":red-badge\[[^\]]*main: kill_switch_engaged", text)
+    assert re.search(r":orange-badge\[[^\]]*b: unreadable", text)
+    assert any("tradepartner paper resume --book main" in code.value for code in at.code)
+    [selector] = [sb for sb in at.selectbox if sb.key == ops_page.BOOK_KEY]
+    selector.set_value("b").run(timeout=30)
+    assert not at.exception
+    assert "main: kill_switch_engaged" in _text(at)
+    assert "b: unreadable" in _text(at)
+    assert seeded_store.read_bytes() == before
 
 
 # --- the Risk card (plan T260, amendment 2026-10-20 #2096 item 3) -----------------

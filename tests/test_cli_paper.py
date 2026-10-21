@@ -1623,7 +1623,46 @@ def test_status_all_prints_one_summary_line_per_book(
         "last run n/a; next rebalance 2026-10-30\n"
         "book main: window 1 open; positions 0; open orders 0; kill switch released; "
         "last run n/a; next rebalance 2026-10-30\n"
+        "waiting on you: nothing\n"
     )
+
+
+@pytest.mark.usefixtures("started")
+def test_status_all_lists_two_waiting_items_byte_for_byte(
+    clock: _Clock, factory: _Factory, live: Path
+) -> None:
+    b_window = _open_book_b()
+    with open_for_write(_settings()) as conn:
+        for window_id in (1, b_window):
+            journal.append(
+                conn,
+                journal.KillSwitchRow(
+                    window_id=window_id,
+                    at=SESSION_CLOCK,
+                    state="engaged",
+                    source="owner",
+                    reason="test",
+                    known_at=SESSION_CLOCK,
+                    ingested_at=SESSION_CLOCK,
+                ),
+            )
+    before = _sha256(live)
+    out = _paper(clock, factory, "status", "--all")
+    assert (out.exit_code, out.output) == (
+        0,
+        f"book b: window {b_window} open; positions 0; open orders 0; kill switch engaged; "
+        "last run n/a; next rebalance 2026-10-30\n"
+        "book main: window 1 open; positions 0; open orders 0; kill switch engaged; "
+        "last run n/a; next rebalance 2026-10-30\n"
+        "waiting on you (2):\n"
+        f"  book b; kill_switch_engaged: kill switch engaged: kill_switch event 2 engaged "
+        f"(owner); since {SESSION_CLOCK}; command tradepartner paper resume --book b "
+        '--reason "<why>"\n'
+        f"  book main; kill_switch_engaged: kill switch engaged: kill_switch event 1 engaged "
+        f"(owner); since {SESSION_CLOCK}; command tradepartner paper resume --book main "
+        '--reason "<why>"\n',
+    )
+    assert _sha256(live) == before
 
 
 @pytest.mark.usefixtures("started")
@@ -1739,7 +1778,10 @@ def test_status_summary_labels_completed_rebalance_and_fill_lag(
 
 def test_status_all_with_no_window(clock: _Clock, factory: _Factory) -> None:
     out = _paper(clock, factory, "status", "--all")
-    assert (out.exit_code, out.output) == (0, "paper status: no paper window yet\n")
+    assert (out.exit_code, out.output) == (
+        0,
+        "paper status: no paper window yet\nwaiting on you: nothing\n",
+    )
 
 
 @pytest.mark.parametrize(
