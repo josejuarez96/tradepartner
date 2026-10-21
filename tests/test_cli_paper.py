@@ -1584,6 +1584,33 @@ def test_status_and_check_for_another_book_read_that_books_window(
 
 
 @pytest.mark.usefixtures("started")
+def test_status_prints_alert_ids_for_each_book(clock: _Clock, factory: _Factory) -> None:
+    _open_book_b()
+    at = datetime(2026, 10, 30, 14, tzinfo=UTC)
+    with open_for_write(_settings()) as conn:
+        ids = {}
+        for book in ("main", "b"):
+            alert_id = journal.append(
+                conn,
+                journal.AlertRow(
+                    book_id=book,
+                    session=at.date(),
+                    kind="locked",
+                    message=f"{book} lock held",
+                    at=at,
+                    known_at=at,
+                    ingested_at=at,
+                ),
+            )
+            assert alert_id is not None
+            ids[book] = alert_id
+    for book in ("main", "b"):
+        out = _paper(clock, factory, "status", "--book", book)
+        assert out.exit_code == 0, out.output
+        assert f"  #{ids[book]} {at} locked {at.date()}: {book} lock held\n" in out.output
+
+
+@pytest.mark.usefixtures("started")
 def test_status_all_prints_one_summary_line_per_book(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:
