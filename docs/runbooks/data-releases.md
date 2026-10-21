@@ -1,5 +1,7 @@
 # Runbook: named data releases
 
+For the post-T162 sequence of releases and paper-window handoff, use the [one data sitting run sheet](data-sitting.md).
+
 Owner-run, on the real store. Agents never change the owner's store. Plan task T140 ([#1325](https://github.com/josejuarez96/tradepartner/issues/1325), plan amendment [#1319](https://github.com/josejuarez96/tradepartner/issues/1319)). The owner accepted the policy on [#1303](https://github.com/josejuarez96/tradepartner/issues/1303).
 
 Until T140b adds a store kind for it, the record is a hand-written TOML file. Start recording now. Nothing here waits for T140b.
@@ -100,7 +102,7 @@ Write the printed times into the entry with a `Z` in place of `+00:00`.
 7. **Write the `after` entry.** Same `name`, `stage = "after"`, the numbers read again on the live store, and the sessions actually touched.
 8. **Restart the jobs** (scheduling.md). The next plain `sweep run` reruns any stale variants; each rerun counts in N. If the release deleted rows, also rerun the sweeps that read those sessions as "The record" above says.
 
-If the repair fails partway, restore the backup with the jobs still stopped and nothing holding the store:
+If the repair fails partway, keep the jobs stopped and nothing holding the store. First save the failed live state as evidence with `uv run tradepartner store backup` and record its printed copy, WAL and manifest paths on the release PR/issue. Then restore the pre-release backup:
 
 ```bash
 NAME=<name>
@@ -109,7 +111,7 @@ cp data/tradepartner.$NAME.duckdb data/tradepartner.duckdb
 [ -f data/tradepartner.$NAME.duckdb.wal ] && cp data/tradepartner.$NAME.duckdb.wal data/tradepartner.duckdb.wal
 ```
 
-Keep the backup itself. Then write an `after` entry whose `reason` says it was rolled back. The release is closed; a retry is a new release with a new name.
+Keep the backup itself and the failed-state copy. **A restore from a copy taken before `decision data-release open` removes that release's `before` row**, as well as all later rows; `decision data-release close` then refuses because no release is open. Record the rollback and the removed release ids on the release PR/issue. A retry is a new release with a new name. If the owner instead chooses to open and close a new release solely to record the rollback in the store, its `after` row enters `data_vintage` and stales affected trials; decide that explicitly before writing it. A full unwind also restores the paper-window state captured by the chosen backup, so verify that state before restarting any paper job.
 
 ## The back-fill: the state H1's holdout trial read
 
