@@ -155,7 +155,7 @@ def test_older_session_changes_rows_and_missing_slippage_is_text(
     ]
     assert list(table["ticker"]) == ["PENDING", "NOBAR", "NOFILL"]
     assert list(table["slippage (bp)"]) == ["pending", "no bar", "no fill"]
-    assert list(table["signal rank"]) == [2, 2, 2]
+    assert list(table["signal rank"]) == ["2", "2", "2"]
     assert list(table["shares"]) == [0.0, 0.0, 0.0]
     assert not at.get("vega_lite_chart")
 
@@ -176,6 +176,7 @@ def test_each_order_has_a_distinct_bar_and_largest_absolute_slippage_is_accented
     assert not at.exception
     frame = trades_page._chart_frame(_data(first, second))
     assert frame["order label"].is_unique
+    assert list(frame["order label"]) == ["AAPL · buy · …r-AAPL", "AAPL · sell · …L-sell"]
     assert list(frame["highlight"]) == [False, True]
     chart = str(at.get("vega_lite_chart")[0].proto.spec)
     assert "order label" in chart
@@ -238,3 +239,8 @@ def test_page_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     with duckdb.connect(str(path), read_only=True) as conn:
         after = conn.execute("SELECT count(*) FROM paper_windows").fetchone()
     assert before == after
+
+
+def test_exit_row_shows_a_dash_for_rank() -> None:
+    exit_row = replace(_row("EXIT", 1.0), side="sell", signal_rank=None)
+    assert list(trades_page._table(_data(exit_row))["signal rank"]) == ["—"]

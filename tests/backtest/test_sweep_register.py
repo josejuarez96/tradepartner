@@ -1234,3 +1234,41 @@ def test_the_three_rule_differences_agree_on_the_cost_terms(
                 assert "costs.adv_sessions (not fixed by the family rules)" in found[name], case
             if refused == {"costs.spread_bps"}:
                 assert "costs.spread_bps (lower than the family's 5.0)" in found[name], case
+
+
+# ── the long/short refusals on the sweep path (#2051 item 1) ───────────────────
+
+
+def _long_short_params(monkeypatch: pytest.MonkeyPatch, **changed: Any) -> None:
+    """`frozen_params` returns each variant's values with a long/short book on top (the
+    #1788 guard is stepped round, as `test_hypothesis.py` does)."""
+    real = hypothesis.frozen_params
+
+    def patched(parsed: hypothesis.HypothesisFile, settings: Settings) -> dict[str, Any]:
+        return {**real(parsed, settings), "portfolio.side": "long_short", **changed}
+
+    monkeypatch.setattr(hypothesis, "frozen_params", patched)
+
+
+def test_a_long_short_sweep_at_zero_borrow_is_refused_with_no_rows(
+    ready: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _long_short_params(monkeypatch, **{"costs.borrow_bps_per_year": 0.0})
+    _refused(
+        ready,
+        _copy(tmp_path, SWEEP_SOURCE),
+        settings,
+        hypothesis.HypothesisFileError,
+        "refused_borrow_rate",
+    )
+
+
+def test_a_long_only_sweep_still_registers(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    result = register(ready, _copy(tmp_path, SWEEP_SOURCE), settings, registered_by="test")
+    assert result.created
+    assert len(result.variants) == 4

@@ -975,6 +975,10 @@ def register(
     settings = settings if settings is not None else get_settings()
     parsed = parse_sweep_file(file, settings)
     variants = expand_grid(parsed, settings)
+    for variant in variants:
+        refusal = hypothesis.long_short_refusal(variant.frozen_set)
+        if refusal is not None:
+            raise hypothesis.HypothesisFileError(f"{file}: variant {variant.values}: {refusal}")
     if parsed.family == registry.ORACLE_FAMILY and registry._is_real_store(conn, settings):
         raise registry.RealStoreRefused(
             f"{file}: family {registry.ORACLE_FAMILY!r} is refused on the real store"

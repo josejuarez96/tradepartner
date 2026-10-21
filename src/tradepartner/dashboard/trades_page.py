@@ -54,7 +54,7 @@ def _table(data: blotter.SessionBlotter) -> pd.DataFrame:
                 "status": row.status,
                 "slippage (bp)": _slippage_text(row),
                 "reason": row.reason or row.decision,
-                "signal rank": row.signal_rank,
+                "signal rank": "—" if row.signal_rank is None else str(row.signal_rank),
             }
             for row in data.rows
         ]
@@ -83,7 +83,7 @@ def _chart_frame(data: blotter.SessionBlotter) -> pd.DataFrame:
         [
             {
                 "order": row.client_order_id,
-                "order label": f"{row.symbol} · {row.side} · {row.client_order_id}",
+                "order label": f"{row.symbol} · {row.side} · …{row.client_order_id[-6:]}",
                 "ticker": row.symbol,
                 "side": row.side,
                 "slippage": row.slippage_bp,
@@ -172,7 +172,6 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
             column_config={
                 "shares": st.column_config.NumberColumn("shares", format="%.4f"),
                 "fill price": st.column_config.NumberColumn("fill price", format="%.2f"),
-                "signal rank": st.column_config.NumberColumn("signal rank", format="%d"),
             },
         )
         if data.capped:
