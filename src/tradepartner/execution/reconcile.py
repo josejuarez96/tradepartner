@@ -998,12 +998,19 @@ def _merger_cash(
     buffer: float,
 ) -> tuple[bool, list[ProposedAdjustment]]:
     """Whether the cash difference is explained with open mergers present, and
-    the rows it journals (#1762 items 2 and 4). The dividends are offered as
-    `compare` offers them (none paid first, then all, the longs', the shorts');
-    the mergers take what is left, up to their caps, unless it is within the
-    cash bound; an ended name's proceeds take the rest, in [0, its cap], and
-    with no ended name the rest must be within the cash bound. A removal is
-    journaled whatever it takes; a cash-only row only when it takes cash."""
+    the rows it journals (#1762 items 2 and 4). The mergers read the cash left
+    after the reconciliation's other explanations, so the exact readings come
+    first: the mergers paid in full, then the mergers paid nothing, and only
+    then a part paid (the difference left, up to their caps, unless it is within
+    the cash bound). In each reading the dividends are offered as `compare`
+    offers them (none paid first, then all, the longs', the shorts'); an ended
+    name's proceeds take the rest, in [0, its cap], and with no ended name the
+    rest must be within the cash bound. So a credited dividend or an ended
+    name's proceeds are never booked as a merger's part payment when they
+    explain the cash alone. A removal is journaled whatever it takes; a
+    cash-only row only when it takes cash. Two mergers taking cash at once share
+    it in acquiree order, each up to its cap: their sum is right, the split
+    between the ids may not be."""
     subsets = (
         dividends,
         {n: a for n, a in dividends.items() if n not in shorts},
@@ -1013,9 +1020,15 @@ def _merger_cash(
     value = [expected[name] * reference_prices.get(name, 0.0) for name in removed]
     band_cap = Decimal(str(math.fsum(value) * (1 + buffer)))
     cap = Decimal(str(merger_cap))
-    for chosen in options:
+    readings = [(mode, chosen) for mode in ("full", "none", "part") for chosen in options]
+    for mode, chosen in readings:
         rest = difference - Decimal(str(math.fsum(chosen.values())))
-        take = min(max(rest, Decimal(0)), cap) if rest > bound else Decimal(0)
+        if mode == "full":
+            take = cap
+        elif mode == "none":
+            take = Decimal(0)
+        else:
+            take = min(max(rest, Decimal(0)), cap) if rest > bound else Decimal(0)
         left = rest - take
         top = band_cap if removed else Decimal(0)
         if not -bound <= left <= top + bound:

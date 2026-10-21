@@ -14,6 +14,7 @@ dated before the window (inside the base).
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Protocol
 
@@ -755,20 +756,7 @@ def _compare(
     activities: tuple[CashActivity, ...] = (),
     dividends: dict[str, float] | None = None,
 ) -> Reconciliation:
-    window = PaperWindowRow(
-        window_id=1,
-        hypothesis_id=1,
-        first_rebalance_session=S,
-        account_id="PA1",
-        starting_cash=100_000.0,
-        starting_equity=100_000.0,
-        code_version="test",
-        started_at=BOUGHT_AT,
-        frozen_json="{}",
-        frozen_sha256="0" * 64,
-        known_at=BOUGHT_AT,
-        ingested_at=BOUGHT_AT,
-    )
+    window = _window()
     at = datetime(2026, 10, 1, 14, tzinfo=UTC)
     return compare(
         ledger,
@@ -787,6 +775,23 @@ def _compare(
         window,
         FROZEN,
         order_id_prefix="tp",
+    )
+
+
+def _window() -> PaperWindowRow:
+    return PaperWindowRow(
+        window_id=1,
+        hypothesis_id=1,
+        first_rebalance_session=S,
+        account_id="PA1",
+        starting_cash=100_000.0,
+        starting_equity=100_000.0,
+        code_version="test",
+        started_at=BOUGHT_AT,
+        frozen_json="{}",
+        frozen_sha256="0" * 64,
+        known_at=BOUGHT_AT,
+        ingested_at=BOUGHT_AT,
     )
 
 
@@ -859,3 +864,125 @@ def test_a_merger_row_is_left_out_of_every_other_rows_json() -> None:
     assert entry["merger_id"] == M1
     plain = _compare(Ledger(positions={}, cash=LEDGER_CASH, through=S), {}, LEDGER_CASH, {})
     assert "merger_id" not in plain.mismatches_json
+
+
+# --- pass-1 review cases ------------------------------------------------------
+
+
+def test_a_dividend_beside_an_unpaid_due_is_booked_as_the_dividend_not_merger_cash() -> None:
+    """The removal is journaled with nothing paid; a 5.00 dividend on `SPY` is the
+    only credit. It is the dividend's, and the full due later is the merger's."""
+    ledger = Ledger(positions={SPY: 1.0}, cash=LEDGER_CASH, through=S)
+    removed = {MTUM: _merger_open(removed_quantity=HELD, journaled_cash=0.0)}
+
+    result = _compare(ledger, {"SPY": 1.0}, LEDGER_CASH + 5.0, removed, dividends={SPY: 5.0})
+
+    assert result.status == OK
+    assert [(a.kind, a.cash, a.merger_id) for a in result.adjustments] == [
+        ("dividend_cash", 5.0, None)
+    ]
+    paid = _compare(ledger, {"SPY": 1.0}, LEDGER_CASH + DUE, removed)
+    assert [(a.cash, a.merger_id) for a in paid.adjustments] == [(DUE, M1)]
+
+
+def test_an_ended_names_proceeds_beside_an_unpaid_removal_stay_the_ended_names() -> None:
+    """`MTUM` removed by its merger with nothing paid, `SPY` (1 share at 100)
+    ended in the same session crediting 90: the 90 is `SPY`'s proceeds."""
+    ledger = Ledger(positions={MTUM: HELD, SPY: 1.0}, cash=LEDGER_CASH, through=S)
+    explanations = Explanations(
+        symbols={MTUM: "MTUM", SPY: "SPY"},
+        ended=frozenset({SPY}),
+        reference_prices={MTUM: 100.0, SPY: 100.0},
+        mergers={MTUM: _merger_open()},
+        activity_seen_before=date(2026, 9, 29),
+    )
+    at = datetime(2026, 10, 1, 14, tzinfo=UTC)
+    result = compare(
+        ledger,
+        {},
+        (),
+        (),
+        Account(account_id="PA1", cash=LEDGER_CASH + 90.0, buying_power=0.0, equity=0.0, as_of=at),
+        explanations,
+        replace(_window(), account_id="PA1"),
+        FROZEN,
+        order_id_prefix="tp",
+    )
+
+    assert result.status == OK
+    rows = {(a.security_id, a.merger_id): a.cash for a in result.adjustments}
+    assert rows == {(MTUM, M1): 0.0, (SPY, None): 90.0}
+
+
+@pytest.mark.parametrize(("deferred", "final"), [(True, True), (False, False)])
+def test_a_row_after_the_window_beside_a_lagging_order_is_not_the_due_check(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    deferred: bool,
+    final: bool,
+) -> None:
+    """`compare` runs no due check beside a lagging or pending order, so a
+    mismatch row after the window that had one does not count as the check;
+    one without does (the removal was journaled before it)."""
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings)
+    _removed(fake, 0.0)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S).status == OK
+    stamp = datetime.combine(AFTER, time(13), tzinfo=UTC)
+    payload = {
+        "mismatches": [{"kind": "unknown_symbol", "detail": "x", "security_id": None}],
+        "lagging": ["tp-lag-1"] if deferred else [],
+        "pending": [],
+    }
+    _append(
+        journal_settings,
+        ReconciliationRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            at=stamp,
+            status="mismatch",
+            mismatches_json=json.dumps(payload),
+            book_id=open_window.book_id,
+            known_at=stamp,
+            ingested_at=stamp,
+        ),
+    )
+
+    assert _open(journal_settings, open_window, AFTER).mergers[MTUM].final is final
+
+
+def test_a_later_revision_does_not_move_when_the_row_was_first_known(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """First known at close(S), inside the window; a revision stamped after the
+    window does not make it "known only after its window": the band's removal
+    still opens it under (b)."""
+    _hold(journal_settings, fake, open_window)
+    _delisting(journal_settings, MTUM, KNOWN)
+    _removed(fake, 0.0)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S).status == OK
+    _merger(journal_settings, known_at=session_close(S))
+    _merger(journal_settings, known_at=session_close(AFTER), payable=S2)
+
+    opened = _open(journal_settings, open_window, LATER).mergers[MTUM]
+    assert opened.payable_date == S2 and opened.removed_quantity == pytest.approx(HELD)
+
+
+def test_a_band_removal_before_the_effective_date_is_not_the_mergers(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A band removal on S links no merger effective on S3 (two sessions on)."""
+    _hold(journal_settings, fake, open_window)
+    _delisting(journal_settings, MTUM, KNOWN)
+    _removed(fake, 0.0)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S).status == OK
+    _merger(journal_settings, known_at=session_close(S), effective=S3, payable=S3)
+
+    assert _open(journal_settings, open_window, S4).mergers == {}

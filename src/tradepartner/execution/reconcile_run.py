@@ -93,15 +93,17 @@ as_of`:
   S` and either (a) the ledger stated through S still holds its acquiree, long
   or short, or (b) the removal is journaled (its own row, or the ended-listing
   band's `corporate_action_cash` removal row for the acquiree, linked by
-  `security_id`) and the merger is not closed. It closes when the journaled cash
+  `security_id` and stated no earlier than the session before
+  `effective_date`) and the merger is not closed. It closes when the journaled cash
   is within the cash bound of the due, or once an `ok` reconciliation after its
   window (`payable_date`, else `effective_date`, plus the frozen
   `risk.reconcile_merger_lag_sessions` sessions) has run with the row known and
   the removal journaled; a row first known after its window's close opens
   nothing under (b). `final` marks the first completed (`ok` or `mismatch`)
   reconciliation after the window with the row known, unless an earlier one
-  already ran with the removal journaled or named the merger's due: that one
-  checks the due once. A reconciliation row's session is `command_session` of
+  already ran with the removal journaled and no lagging or pending order (the
+  check never runs beside one), or named the merger's due: that one checks the
+  due once. A reconciliation row's session is `command_session` of
   its `at`. When one acquiree has several open ids, the latest
   `effective_date` (then id) is passed. The acquirers join the names mapped to
   broker symbols. Two ids for one acquiree and one `effective_date`
@@ -817,6 +819,20 @@ def _raised_conflict(row: ReconciliationRow, name: str, ids: Sequence[str]) -> b
     )
 
 
+def _deferred(row: ReconciliationRow) -> bool:
+    """Whether `row` had a lagging or pending order: `compare` runs no merger due
+    check beside one, so such a row never counts as the check (T249)."""
+    if row.mismatches_json is None:
+        return False
+    try:
+        payload = json.loads(row.mismatches_json)
+    except (ValueError, TypeError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+    return bool(payload.get("lagging")) or bool(payload.get("pending"))
+
+
 def _named_due(row: ReconciliationRow, name: str, merger_id: str) -> bool:
     """Whether `row` recorded the `cash` mismatch of `merger_id`'s unmet due."""
     return any(
@@ -877,12 +893,13 @@ def _mergers(
     if not rows:
         return {}, {}, acquirers
     first_known = _merger_first_known(conn, cut, sorted({r["security_id"] for r in rows}))
-    own: dict[str, list[AdjustmentRow]] = defaultdict(list)
+    # A merger's own rows by (acquiree, id), the table's identity.
+    own: dict[tuple[str, str], list[AdjustmentRow]] = defaultdict(list)
     band: dict[str, list[AdjustmentRow]] = defaultdict(list)
     for adjustment in state.adjustments:
         merger_id = _merger_id_of(adjustment)
         if merger_id is not None:
-            own[merger_id].append(adjustment)
+            own[(adjustment.security_id or "", merger_id)].append(adjustment)
         elif (
             adjustment.kind == _CORPORATE_ACTION_CASH
             and adjustment.security_id is not None
@@ -900,11 +917,16 @@ def _mergers(
         name, merger_id = str(row["security_id"]), str(row["source_action_id"])
         end = _window_end(row, lag_sessions)
         known = first_known.get((name, merger_id), row["known_at"])
-        own_rows = sorted(own.get(merger_id, []), key=lambda a: a.known_at)
+        own_rows = sorted(own.get((name, merger_id), []), key=lambda a: a.known_at)
         removal = next((a for a in own_rows if a.quantity is not None), None)
-        from_band = removal is None and bool(band.get(name))
+        # A band removal links only from the session before the effective date
+        # on, so an older removal of the name is never read as this merger's.
+        linked = [
+            a for a in band.get(name, []) if a.session >= previous_session(row["effective_date"])
+        ]
+        from_band = removal is None and bool(linked)
         if from_band:
-            removal = max(band[name], key=lambda a: a.known_at)
+            removal = max(linked, key=lambda a: a.known_at)
         journaled = math.fsum(a.cash for a in own_rows if a.cash is not None)
         if from_band and removal is not None and removal.cash is not None:
             journaled += removal.cash
@@ -936,7 +958,7 @@ def _mergers(
         checked = any(
             after_end(stated)
             and (
-                (removal is not None and removal.known_at <= r.known_at)
+                (removal is not None and removal.known_at <= r.known_at and not _deferred(r))
                 or _named_due(r, name, merger_id)
             )
             for r, stated in completed
