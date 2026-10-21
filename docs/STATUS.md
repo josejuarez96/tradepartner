@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-10-21 · **Phase:** 1 closed; 2 Data foundation (105/133), 3 Strategy lab (29/29) and 4 Paper trading (85/101) in build (counts as of 10-18) · **Last tag:** v0.1.0 · **Next tag:** v0.2.0
+**Updated:** 2026-10-21 · **Phase:** 1 closed; 2 Data foundation (123/139), 3 Strategy lab (29/29) and 4 Paper trading (109/129) in build (counts as of 10-21) · **Last tag:** v0.1.0 · **Next tag:** v0.2.0
 
 ## Recently done
 - Trading raw requests use capped exponential backoff for retryable failures (#2094).
