@@ -209,7 +209,12 @@ class Plan:
     registry (ADR 0014 point 3; #1153, T127); `excluded_no_history` and
     `n_excluded_no_history` are `exclusions.get("no_history", ())` and its length, kept as
     fields so a `Plan` is built as before. Both mappings default to empty, so a plan
-    built without them records no counts."""
+    built without them records no counts.
+
+    `n_assets_intersected` and `assets_intersection_skipped` are the read universe's
+    liquidity-intersection record (backtest spec amendment 2026-10-18, `universe.rank_by`;
+    plan T241), copied through to the rebalance row so a `dollar_volume` run shows the
+    skip on its early rows; both are 0 and false under `cap` (`Universe`'s own defaults)."""
 
     session: date
     fill_session: date
@@ -223,6 +228,8 @@ class Plan:
     excluded_no_history: tuple[str, ...]
     counts: Mapping[str, int] = field(default_factory=dict)
     exclusions: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    n_assets_intersected: int = 0
+    assets_intersection_skipped: bool = False
 
 
 @dataclass
@@ -384,6 +391,8 @@ def _plan(
         excluded_no_history=no_history,
         counts=dict(signal.counts),
         exclusions=exclusions,
+        n_assets_intersected=universe.n_assets_intersected,
+        assets_intersection_skipped=universe.assets_intersection_skipped,
     )
 
 
@@ -1033,6 +1042,8 @@ def _step(
             n_dropped_dividends=n_dropped,
             n_late_dividends=n_late,
             counts=counts,
+            n_assets_intersected=plan.n_assets_intersected,
+            assets_intersection_skipped=plan.assets_intersection_skipped,
         )
     )
 

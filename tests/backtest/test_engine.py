@@ -359,6 +359,53 @@ class TestTargetsAndFills:
         assert a[gap_day] == a[previous]
 
 
+class TestIntersectionRecord:
+    """The rebalance row carries the read `Universe`'s liquidity-intersection record
+    (backtest spec amendment 2026-10-18, `universe.rank_by`; plan T241): the kept
+    classes checked against the assets snapshot, and whether the intersection was
+    skipped for want of a snapshot at `t`."""
+
+    def _provider(self, ids: Sequence[str], **fields: Any) -> FakeProvider:
+        members = {session: sorted(ids) for session in rebalance_sessions(T0, HISTORY_END)}
+        return FakeProvider(prices=_price_rows(), members=members, benchmarks={}, **fields)
+
+    def test_the_checked_count_and_skip_ride_on_every_rebalance_row(self) -> None:
+        """A `dollar_volume` read whose ranked top-N kept 4 classes and whose assets
+        snapshot made 3 of them tradable: the row reads the checked count (4,
+        `Universe`'s own definition, not the 5 ranked) and not-skipped, over the 3
+        members the intersection left."""
+        provider = self._provider(("A", "B", "C"), n_assets_intersected=4)
+        result = _run(provider)[15.0]
+        assert [row.session for row in result.rebalances] == [T0, T1, T2]
+        assert [
+            (row.n_assets_intersected, row.assets_intersection_skipped) for row in result.rebalances
+        ] == [(4, False)] * 3
+        assert [row.n_universe for row in result.rebalances] == [3, 3, 3]
+
+    def test_a_rebalance_before_the_first_snapshot_reads_zero_and_skipped(self) -> None:
+        """Before the first assets snapshot the intersection is skipped (never today's
+        list read backwards): the row reads 0 and skipped, with the members the ranked
+        set alone."""
+        provider = self._provider(
+            ("A", "B", "C", "D"), n_assets_intersected=0, assets_intersection_skipped=True
+        )
+        result = _run(provider)[15.0]
+        assert [
+            (row.n_assets_intersected, row.assets_intersection_skipped) for row in result.rebalances
+        ] == [(0, True)] * 3
+        assert [row.n_universe for row in result.rebalances] == [4, 4, 4]
+
+    def test_a_cap_read_reads_zero_and_false(self) -> None:
+        """Under `cap` the intersection does not apply: `Universe`'s own defaults are
+        copied through, so every row reads 0 and false."""
+        provider = self._provider(("A", "B", "C", "D"))
+        result = _run(provider)[15.0]
+        assert all(
+            (row.n_assets_intersected, row.assets_intersection_skipped) == (0, False)
+            for row in result.rebalances
+        )
+
+
 class TestCash:
     @pytest.mark.parametrize("fill_price", ["close", "open"])
     def test_cash_identity_and_non_negative_cash_at_every_level(self, fill_price: str) -> None:
@@ -1647,6 +1694,12 @@ def _rounded(value: Any) -> Any:
     return value
 
 
+#: `RebalanceRow`'s two version-36 fields (plan T241). The twin's pinned digest was taken
+#: before they existed, so it still covers every other column and not these; the run
+#: itself is byte-identical (the fixture is at `cap`, where both read 0 and false).
+_T241_REBALANCE_FIELDS = ("n_assets_intersected", "assets_intersection_skipped")
+
+
 def _run_digest(result: BacktestResult) -> str:
     import hashlib
     import json
@@ -1654,7 +1707,15 @@ def _run_digest(result: BacktestResult) -> str:
     payload = {
         "equity": [_rounded(dataclasses.astuple(row)) for row in result.equity],
         "rebalances": [
-            _rounded({**row.columns(), "counts": row.counts}) for row in result.rebalances
+            _rounded(
+                {
+                    key: value
+                    for key, value in row.columns().items()
+                    if key not in _T241_REBALANCE_FIELDS
+                }
+                | {"counts": row.counts}
+            )
+            for row in result.rebalances
         ],
         "weights": [_rounded(dataclasses.astuple(row)) for row in result.weights],
         "targets": _rounded({d.isoformat(): t for d, t in result.targets.items()}),

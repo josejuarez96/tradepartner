@@ -149,6 +149,9 @@ class FakeProvider:
     `gaps` maps a read time to its gap reading (zero when absent). `static_listings`
     names the securities whose listing rests on `snapshot_static` rows.
     `statement_rows` and `classification_rows` back `statement_facts` and `sics`.
+    `n_assets_intersected` and `assets_intersection_skipped` are the read
+    `Universe`'s liquidity-intersection record (plan T241); both default to 0 and
+    false, the `cap` universe's values.
     """
 
     prices: pl.DataFrame
@@ -179,6 +182,8 @@ class FakeProvider:
     split_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_SPLIT_SCHEMA))
     rate_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_RATE_SCHEMA))
     chain_pairs: tuple[tuple[str, str], ...] = ()
+    n_assets_intersected: int = 0
+    assets_intersection_skipped: bool = False
     calls: list[Call] = field(default_factory=list)
 
     def _record(self, method: str, t: datetime, **kwargs: Any) -> datetime:
@@ -218,6 +223,8 @@ class FakeProvider:
             exclusions=pl.DataFrame(schema=_EXCLUSION_SCHEMA),
             rules_enabled={},
             settings={},
+            n_assets_intersected=self.n_assets_intersected,
+            assets_intersection_skipped=self.assets_intersection_skipped,
         )
 
     def adjusted_prices(

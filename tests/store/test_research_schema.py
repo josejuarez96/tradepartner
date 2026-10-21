@@ -308,7 +308,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGERS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 1
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -690,13 +690,16 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         schema.require_research(c)
     # No pre-existing table's DDL text changed but `trial_results` (gained
     # `n_research`, version 12) and `trial_rebalances` (gained
-    # `PROFITABILITY_REBALANCE_COLUMNS`, version 13) and `trials` (gained its
+    # `PROFITABILITY_REBALANCE_COLUMNS`, version 13, and the two version-36
+    # intersection columns) and `trials` (gained its
     # vintage and detail columns, version 15) and `owner_decisions` and
     # `trial_results` (their `CHECK` widened by the lab migration, version 16,
     # `tests/store/test_lab_migration.py`); no row of any table changed.
     # Version 25 (#1597, T184d) rebuilds `listings` and `classifications` for
-    # `filing_name` too, and version 33 (#1792, T210b) rebuilds `trial_metrics`
-    # for `cost_level_kind`, so they move with the same rows kept.
+    # `filing_name` too, version 33 (#1792, T210b) rebuilds `trial_metrics`
+    # for `cost_level_kind`, and version 36 (plan T241) adds the two
+    # intersection columns to `paper_plans`, so they move with the same rows
+    # kept.
     _moved = {
         "trial_results",
         "trial_rebalances",
@@ -705,6 +708,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         "trial_metrics",
         "listings",
         "classifications",
+        "paper_plans",
     }
     assert {t: s for t, s in ddl_after.items() if t in ddl_before and t not in _moved} == {
         t: s for t, s in ddl_before.items() if t not in _moved
