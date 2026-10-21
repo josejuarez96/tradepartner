@@ -271,18 +271,33 @@ The paper vehicle is the registered H1 (long-only 12-1 momentum, top decile equa
 
 
 
-*Amendment 2026-10-20 (#2112; built by the plan's T261).* A spin-off on a held name (MSGS spinning off `MSGR.WI` at 0.5, ex-date 2026-10-27, held by the daily book) still halts the run in four places that the #2033 rule above does not reach. This amendment fixes three of them in code. The fourth, cash in lieu, is left to the owner (questions 34 to 36). Every store fact is read at close(S−1), as before.
+*Amendment 2026-10-20 (#2112; built by the plan's T261).* A spin-off on a held name (MSGS spinning off `MSGR.WI` at 0.5, ex-date 2026-10-27, held by the daily book) still halts the run in four places that the #2033 rule above does not reach. This amendment fixes three of them in code. The fourth, cash in lieu, is left to the owner (questions 35 and 36). Question 34 is about the `.WI` mapping. Every store fact is read at close(S−1), as before.
 
-1. **The child's symbol in the actions parser** (the [data-foundation spec](data-foundation.md)'s amendment of this date). Alpaca names a new child by its when-issued symbol (`MSGR.WI`), and the master lists it as `MSGR`, so the row was unresolved and never stored. The parser now resolves the child under `regular_way_symbol(new_symbol)` on its ex-date. A child the master does not list that session stays unresolved, as before.
+**Timing.** The MSGS ex-date (2026-10-27) falls inside the T162 span (2026-10-22 to 11-04), and this change is on the order path, so its PR carries `hold`. The owner chooses one of two paths. He can land it before 10-27 as an order-path change inside the span. Or he can keep the span's mitigation, an `exclude_name` override on MSGS before 10-27, so the book holds no parent on `previous_session(ex_date)`, and merge after the span. Under the second path, the 10-27 spin-off never reaches this rule. Even when it lands first, cash in lieu (item 3) can still halt.
+
+1. **The child's symbol in the actions parser** (the [data-foundation spec](data-foundation.md)'s amendment of this date). Alpaca names a new child by its when-issued symbol (`MSGR.WI`), and the master lists it as `MSGR`, so the row was unresolved and never stored. The parser now resolves the child under `regular_way_symbol(new_symbol)` on its ex-date. A child the master does not list that session stays unresolved, as before. The resolution is pinned to the ex-date, so a retry succeeds only if the master's listing for the child starts on or before the ex-date. A child listed only from a later session never resolves, and its broker position is a permanent `unknown_symbol` halt. The ways out are #2033 item 4's: an `exclude_name` on the parent before the ex-date, or afterwards `paper abandon --reason` and the owner's reset of the paper account.
 
 2. **The child held under its when-issued symbol (req 6; `execution/reconcile_run.py:_explanations`, `_symbols`; `execution/reconcile.py:compare`).**
    - *Mapping.* Each child `_spinoffs` offers (#2033 item 2) joins the names the symbol map is built for. Such a child maps to `X.WI` when the broker does not hold its ticker `X` but does hold `X.WI`. No other name maps to a `.WI` symbol.
    - *Inside the due band.* For a child mapped to `X.WI`, inside #2033 item 2's due band, `compare` records an `Allowed` ("when-issued spin-off child", the quantity, the child) and journals nothing. The status stays `ok` if nothing else differs, and the cash base moves on (the child carries no cash).
+   - *Equity while `.WI`.* The ledger does not hold the child, but the parent's close has already dropped by the child's value, so the ledger's equity (`marks.py`) is understated by about parent quantity × ratio × the child's price.
+     - That equity is read by the drawdown switch (`switch.drawdown_peak` and its rule), by the rebalance's sizing, by `positions_daily` and by req 10's tracking report.
+     - A large enough spin-off can therefore engage the drawdown switch. That fails closed.
+     - This rule does not re-derive the marks of those sessions after the receipt. The dip stays in the record, and the alert row's `Allowed` entry names its cause.
+     - Before this amendment, the book halted in this state instead.
    - *Why it is not journaled.* A journaled receipt is a ledger position under `X`. `exits.forced_exits` would then sell it whole as `untargeted_receipt` by sending an order for `X`, a symbol the broker does not hold. That order is rejected, or on a margin account it opens a short. The rule fails closed instead: once the broker holds the child regular-way as `X`, the next reconciliation journals the receipt by #2033 item 2, once.
    - *Outside the band.* A wrong quantity is still `broker_only_position`.
-   - *Not offered.* A `.WI` position whose row is unknown at close(S−1), whose parent was never held, or whose parent moved (#2033 item 4) maps to no name. It halts as `unknown_symbol`. The case where the parent is traded while the child is still `.WI` is included: the offer stops, and so does the book.
+   - *Not offered.* A `.WI` position maps to no name, and halts as `unknown_symbol`, when any of these holds:
+     - its row is unknown at close(S−1);
+     - its parent was never held;
+     - its parent moved (#2033 item 4);
+     - the broker holds both `X` and `X.WI`.
+
+     The parent moving includes being traded while the child is still `.WI`: the offer stops, and so does the book. A daily book trims often, so a `.WI` period of several sessions can end in that halt rather than in the regular-way receipt. That is question 33's case.
 
 3. **Cash in lieu of a fractional child share: not built (issue #2122).** A `CIL` activity for a spin-off still finds no stock dividend in `_place_cash_in_lieu` and halts as `unexplained_activity`, as #2033 item 4 says. Building it needs three answers the code cannot settle, questions 34 to 36: which symbol and date the activity carries, what bounds its cash, and what row books it. One fact about the lot ledger matters: `lots.cash_in_lieu` needs a quantity, and the spin-off receipt books whole shares only.
+   - *When it fires.* It fires only if Alpaca pays cash for the fraction instead of crediting fractional child shares. Which one it does is req 2's recording question. At 0.5, any parent holding that is not an even number of shares can produce a fraction, and that includes every fractional holding.
+   - *The way out.* It is #2033 item 4's: an `exclude_name` on the parent before the ex-date, or afterwards `paper abandon --reason` and the owner's reset of the paper account. The spec has no by-hand booking command. Question 35 (c) would need one.
 
 4. **The fill-price band across a spin-off ex-date (#1981; `execution/collect.py:fill_band_violations`).**
    - *The problem.* The reference is close(R), with R = `previous_session(S)`. It is split-adjusted, but it does not move for a spin-off, so a fill on the ex-date of a large spin-off fell below the band's low side and halted.
@@ -291,6 +306,8 @@ The paper vehicle is the registered H1 (long-only 12-1 momentum, top decile equa
      - E in (O, R], a late fill collected after the ex-date: only the low side applies.
      - E anywhere else: the band stays two-sided.
    - *Floor and note.* A fill price must still be finite and positive. The run notes each one-sided fill: `fill-price band: one side only (a spin-off ex-date) for <client_order_ids>`.
+     - The note is text in the run's notes, not an alert.
+     - This is an accepted weakening. On the ex-date, a fill of the parent far below its true price (a bad sell) is caught only by that floor and by reconciliation's cash, never by the band.
    - *Why no child price.* None is known at close(S−1) for a new child, whose first bar is the ex-date's own close, so any adjustment would be a guess (question 36).
    - *What is not fixed.* A row stamped after close(S−1), because its `process_date` came after the ex-date (data-foundation open question 18), leaves the band two-sided. The ex-date fill can then still halt, and the owner's `exclude_name` override on the parent stays the way to avoid it. That is the stamp at work, not a rule here.
 
@@ -571,7 +588,7 @@ Added 2026-10-20 by the #2112 amendment. Three questions, each with a recommenda
     - (b) Journal the receipt at once and teach the order path to sell `X.WI`. This puts a when-issued symbol into `exits`, `phases` and `symbols`.
     - (c) Also read other when-issued forms: Nasdaq's fifth-letter `V` (`MSGRV`) and a space form (`MSGR WI`).
 
-    **Recommendation: (a).** Add (c) only if req 2's recording shows Alpaca using another form. Two facts are still unknown: when the master first lists a new child, and whether Alpaca paper books the child as `X.WI`, as `X`, or on the ex-date at all. If the master lists the child only after the ex-date, the row is unresolved until then. The broker's child is then `unknown_symbol`, and the mitigation stays the owner's `exclude_name` on the parent before the ex-date.
+    **Recommendation: (a).** Add (c) only if req 2's recording shows Alpaca using another form. Two facts are still unknown: when the master first lists a new child, and whether Alpaca paper books the child as `X.WI`, as `X`, or on the ex-date at all. If the master lists the child only from a session after the ex-date, the row never resolves (item 1), and the broker's child is a permanent `unknown_symbol` halt. The mitigation stays the owner's `exclude_name` on the parent before the ex-date.
 
 35. **What bounds a spin-off's cash in lieu, and which symbol and date the `CIL` carries?**
     - (a) Accept a `CIL` when all of these hold:
@@ -580,14 +597,14 @@ Added 2026-10-20 by the #2112 amendment. Three questions, each with a recommenda
       - the broker's child quantity is below the due by more than the tolerance and by less than one share;
       - its cash is in (0, fraction × the parent's raw close on `previous_session(ex_date)` / ratio × (1 + `risk.cash_in_lieu_tolerance`)].
 
-      A child share cannot be worth more than the parent's whole pre-ex price per child share, so the bound needs no child price, and it is known at close(S−1) for any S on or after the ex-date.
+      A child share cannot be worth more than the parent's whole pre-ex price per child share, so the bound needs no child price, and it is known at close(S−1) for any S on or after the ex-date. It is a sanity cap, not a valuation: it is loose by about 1 / (the child's share of the parent's value).
     - (b) Value the fraction at the child's raw close on its ex-date. That bar is known only from the session after, so a `CIL` reconciled on the ex-date itself halts, and the kill switch engages.
     - (c) Keep halting and let the owner book it by hand.
 
     **Recommendation: (a)**, built once req 2's recording shows one real spin-off `CIL` (its symbol, date and amount).
 
 36. **What row books a spin-off's cash in lieu, and which child price feeds the band?**
-    - (a) Book a `cash_in_lieu` row on the child with a null `quantity` (the receipt holds whole shares only, so nothing is removed), the broker's cash and its `broker_activity_id`. `ledger.from_journal` already books a quantity-less row as cash alone. `lots.cash_in_lieu` needs one change: a quantity-less row is a disposal of the fraction at zero basis on the receipt's session. With PR #2080's basis allocation, it is the fraction's allocated basis. The band keeps item 4's one-sided rule, with no child price.
+    - (a) Book a `cash_in_lieu` row on the child with a null `quantity` (the receipt holds whole shares only, so nothing is removed), the broker's cash and its `broker_activity_id`. `ledger.from_journal` already books a quantity-less row as cash alone. `lots.cash_in_lieu` needs one change: a quantity-less row is a disposal of the fraction at zero basis on the receipt's session. With PR #2080's basis allocation, it is the fraction's allocated basis. The follow-up builds against whatever `lots.spinoff` does when it is claimed: zero basis if #2080 has not landed, the allocated basis if it has. The band keeps item 4's one-sided rule, with no child price.
     - (b) Book it as `dividend_cash` on the parent. This is wrong: `_dividends` treats any `dividend_cash` dated on or after an ex-date as paid, so a later dividend could be hidden.
     - (c) For the band, adjust the reference by ratio × the child's when-issued close on `previous_session(ex_date)`. That needs a `.WI` bar feed, which the store does not have.
 
