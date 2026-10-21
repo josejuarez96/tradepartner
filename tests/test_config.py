@@ -1918,6 +1918,24 @@ def test_risk_defaults_match_adr_0010() -> None:
     # against (fractional remainder x the reference price); the ex-date valuation
     # sits below the pre-ex close, so ~10% passes and more halts.
     assert r.cash_in_lieu_tolerance == pytest.approx(0.10)
+    # #1762 (T249): the sessions after a merger's payable date its cash may post.
+    assert r.reconcile_merger_lag_sessions == 5
+
+
+@pytest.mark.parametrize("value", [-1, 1.5])
+def test_risk_reconcile_merger_lag_sessions_is_a_whole_count_of_at_least_zero(
+    value: float,
+) -> None:
+    """Paper spec amendment #1762 item 10: 0 is allowed (any payment after the
+    payable date halts, open question 23 (b)); a negative or fractional count is not."""
+    assert (
+        Settings(
+            _env_file=None, risk={"reconcile_merger_lag_sessions": 0}
+        ).risk.reconcile_merger_lag_sessions
+        == 0
+    )
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={"reconcile_merger_lag_sessions": value})
 
 
 def test_risk_max_skip_share_defaults_to_a_tenth() -> None:

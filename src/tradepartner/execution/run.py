@@ -250,6 +250,7 @@ from tradepartner.execution.collect import (
     WriteOffContext,
     collect,
     lag_verdict,
+    note_unjudged,
 )
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.lock import LockHeld, resolve_book, run_lock
@@ -595,7 +596,7 @@ def _execute(
 ) -> BatchOutcome:
     """The wrapper's two phases; every exception it raises takes the halt path."""
     try:
-        return context.gate.execute(context.run, decisions, forced)
+        return context.gate.execute(context.run, decisions, forced, notes=context.notes)
     except Exception as exc:
         raise _Halt(exc) from exc
 
@@ -1878,11 +1879,7 @@ class _Run:
 
     def _note_unjudged(self, collected: Collected) -> None:
         """A note for the fills the price band had no reference price for (#1981)."""
-        if collected.unjudged:
-            self.notes.append(
-                "fill-price band: no reference price for "
-                + ", ".join(sorted(set(collected.unjudged)))
-            )
+        note_unjudged(collected, self.notes)
 
     def _collect_orders(self, orders: Sequence[OrderRow]) -> Collected:
         return collect(

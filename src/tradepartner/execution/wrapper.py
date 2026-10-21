@@ -253,7 +253,13 @@ from tradepartner.errors import (
 )
 from tradepartner.execution import phases, switch
 from tradepartner.execution.alerts import Alerter
-from tradepartner.execution.collect import Connect, PriceBand, WriteOffContext, collect
+from tradepartner.execution.collect import (
+    Connect,
+    PriceBand,
+    WriteOffContext,
+    collect,
+    note_unjudged,
+)
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.plan import BuyCosts, DecisionState, decision_state, residue
 from tradepartner.execution.planning import current_listings, reference_prices
@@ -731,6 +737,8 @@ class RiskGatedBroker:
         run: PaperRunRow,
         decisions: Sequence[DecisionRow],
         forced_exits: Sequence[DecisionRow],
+        *,
+        notes: list[str] | None = None,
     ) -> BatchOutcome:
         """Trade one batch in two phases on the run's session (module docstring).
 
@@ -740,7 +748,7 @@ class RiskGatedBroker:
         is a fault for the caller's halt path. A batch that skipped a name for one
         of the three per-name reasons writes one `skipped` alert naming each name
         and its reason (T202)."""
-        outcome = self._trade(run, decisions, forced_exits)
+        outcome = self._trade(run, decisions, forced_exits, notes if notes is not None else [])
         self._alert_skips(run, outcome.skips)
         return outcome
 
@@ -768,6 +776,7 @@ class RiskGatedBroker:
         run: PaperRunRow,
         decisions: Sequence[DecisionRow],
         forced_exits: Sequence[DecisionRow],
+        notes: list[str],
     ) -> BatchOutcome:
         """`execute`'s two phases."""
         if run.run_id is None or run.session is None:
@@ -851,10 +860,12 @@ class RiskGatedBroker:
             )
             skips, counted = (*skips, *refused), counted + len(refused)
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
-                self._await_sells(run, [row for row, _ in gated.to_submit], book)
+                self._await_sells(run, [row for row, _ in gated.to_submit], book, notes)
         if not any(d.side == _BUY for d in decisions):
             return BatchOutcome(_OK, tuple(submitted), skips)
-        bought = self._buys(run, rows, rebalance, sold, len(submitted), counted, len(decisions))
+        bought = self._buys(
+            run, rows, rebalance, sold, len(submitted), counted, len(decisions), notes
+        )
         return BatchOutcome(
             bought.status,
             (*submitted, *bought.submitted),
@@ -874,6 +885,7 @@ class RiskGatedBroker:
         prior_orders: int,
         prior_skips: int,
         plan_decisions: int,
+        notes: list[str],
     ) -> BatchOutcome:
         """The buys phase, read after the sells' collection (module docstring)."""
         assert run.session is not None
@@ -952,6 +964,7 @@ class RiskGatedBroker:
                 session=run.session,
             ),
             price_band=self._price_band(run, book),
+            notes=notes,
         )
         after = self._read_book(run, rows)
         written = tuple(
@@ -1609,7 +1622,9 @@ class RiskGatedBroker:
             book_id=self._run_book(run),
         )
 
-    def _await_sells(self, run: PaperRunRow, sells: Sequence[OrderRow], book: _Book) -> None:
+    def _await_sells(
+        self, run: PaperRunRow, sells: Sequence[OrderRow], book: _Book, notes: list[str]
+    ) -> None:
         """Poll this run's sells until each is terminal or
         `paper.sell_wait_seconds` has passed since the open, then collect them."""
         assert run.session is not None
@@ -1628,7 +1643,7 @@ class RiskGatedBroker:
             if not waiting or now >= deadline:
                 break
             self._sleep(min(paper.poll_interval_seconds, (deadline - now).total_seconds()))
-        self._collect(run, sells, price_band=self._price_band(run, book))
+        self._collect(run, sells, price_band=self._price_band(run, book), notes=notes)
 
     def _price_band(self, run: PaperRunRow, book: _Book) -> PriceBand:
         """The fill-price band (#1981) over the book's reference prices."""
@@ -1645,6 +1660,7 @@ class RiskGatedBroker:
         run: PaperRunRow,
         orders: Sequence[OrderRow],
         *,
+        notes: list[str],
         write_offs: WriteOffContext | None = None,
         price_band: PriceBand | None = None,
     ) -> tuple[int, ...]:
@@ -1671,6 +1687,7 @@ class RiskGatedBroker:
             write_offs=write_offs,
             price_band=price_band,
         )
+        note_unjudged(collected, notes)
         if collected.rejections:
             raise RejectionCapError("; ".join(b.message for b in collected.rejections))
         return collected.written_off

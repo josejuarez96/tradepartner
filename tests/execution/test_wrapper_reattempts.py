@@ -193,7 +193,7 @@ def test_open_sell_shortfall_keeps_buy_open_then_retries_its_remainder(
         for row in gate._read_book(env.run, [sell, buy, other]).orders
         if row.client_order_id == sell_coid
     ]
-    gate._collect(env.run, sell_rows)
+    gate._collect(env.run, sell_rows, notes=[])
     env.fake.script(FillAt())
     env.fake.script(FillAt())
     second = _execute(gate, env, [sell, buy, other])
@@ -222,7 +222,7 @@ def test_partly_filled_trim_expires_and_sells_only_the_notional_remainder(
     _execute(gate, env, [trim])
     first = _orders(env, trim.decision_id)[0][0]  # type: ignore[arg-type]
     env.fake.apply(first, Expire())
-    gate._collect(env.run, [gate._read_book(env.run, [trim]).orders[-1]])
+    gate._collect(env.run, [gate._read_book(env.run, [trim]).orders[-1]], notes=[])
     env.fake.script(FillAt())
     _execute(gate, env, [trim])
     assert [quantity for _, _, quantity in _orders(env, trim.decision_id)] == [

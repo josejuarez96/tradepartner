@@ -2268,6 +2268,11 @@ class RiskConfig(BaseModel):
     # so a ~10% relative gap passes; a larger one halts the book, as any mismatch
     # does. A fraction of the expected cash, in [0, 1].
     cash_in_lieu_tolerance: float = Field(default=0.10, ge=0, le=1)
+    # #1762 (paper spec amendment 2026-10-19 items 4 and 10; T249): the trading
+    # sessions after a merger's `payable_date` (else its `effective_date`) that its
+    # cash may still post; the first reconciliation after them checks the due once.
+    # A window frozen before T249 lacks the key and `frozen_risk` reads it at 5.
+    reconcile_merger_lag_sessions: int = Field(default=5, ge=0)
 
 
 # `paper.min_rebalances` per cadence (ADR 0017 part C and open question 2, the paper

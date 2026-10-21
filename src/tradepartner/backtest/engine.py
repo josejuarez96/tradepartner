@@ -685,6 +685,37 @@ def _held_before(book: _Book, sid: str, ex_date: date) -> bool:
     return previous_session(ex_date) in book.held_on.get(sid, set())
 
 
+def _spin_off_counts(
+    book: _Book,
+    start: date,
+    end: date,
+    spin_offs: tuple[pl.DataFrame, pl.DataFrame],
+    chains: Sequence[tuple[str, str]],
+) -> dict[str, int]:
+    """Count held parents using only the successor chains live at this step."""
+    mapping = dict(chains)
+    unvalued, late = spin_offs
+    return {
+        "n_spin_offs_unvalued": sum(
+            start < ex <= end and _held_before(book, mapping.get(sid, sid), ex)
+            for sid, ex in unvalued.select("security_id", "ex_date").iter_rows()
+        ),
+        "n_late_spin_offs": sum(
+            _held_before(book, mapping.get(sid, sid), ex)
+            for sid, ex in late.select("security_id", "ex_date").iter_rows()
+        ),
+    }
+
+
+def _spin_off_held_ids(
+    ever_held: Sequence[str], chains: Sequence[tuple[str, str]]
+) -> tuple[str, ...]:
+    """Include raw predecessor IDs for the late spin-off provider read."""
+    return tuple(
+        sorted({*ever_held, *(pred for pred, successor in chains if successor in ever_held)})
+    )
+
+
 def _book_targets(
     book: _Book,
     plan: Plan,
@@ -813,6 +844,7 @@ def _step(
     construction: _Construction,
     accruals: Mapping[date, float] | None,
     spin_offs: tuple[pl.DataFrame, pl.DataFrame] | None = None,
+    chains: Sequence[tuple[str, str]] = (),
 ) -> None:
     """Carry, fill, value and exit one cost level through the period (T_i, T_{i+1}].
 
@@ -936,16 +968,8 @@ def _step(
     # frame (a dividend in kind, item 2), so it is neither read nor counted.
     counts = _rebalance_counts(plan, book)
     if spin_offs is not None:
-        unvalued, late_spin = spin_offs
         counts = dict(counts)
-        counts["n_spin_offs_unvalued"] = sum(
-            plan.session < ex <= end and _held_before(book, sid, ex)
-            for sid, ex in unvalued.select("security_id", "ex_date").iter_rows()
-        )
-        counts["n_late_spin_offs"] = sum(
-            _held_before(book, sid, ex)
-            for sid, ex in late_spin.select("security_id", "ex_date").iter_rows()
-        )
+        counts.update(_spin_off_counts(book, plan.session, end, spin_offs, chains))
 
     book.cash = cash
     previous_positions = set(book.positions)
@@ -1709,7 +1733,10 @@ def _run_group(
         # with no `adjust.apply_spin_offs = true` variant makes none and stays byte-identical.
         if any(variant.settings.adjust.apply_spin_offs for variant in group):
             view.share(("unvalued_spin_offs", t), [(ids, None) for ids, _, _ in own])
-            view.share(("late_spin_offs", t_prev, t), [(held, None) for _, _, held in own])
+            view.share(
+                ("late_spin_offs", t_prev, t),
+                [(_spin_off_held_ids(held, chains), None) for _, _, held in own],
+            )
         last = index == len(sessions) - 1
         next_plans = {} if last else _plan_all(view, group, step_end, family, failed)
         for variant in list(group):
@@ -1722,6 +1749,7 @@ def _run_group(
                     benchmarks,
                     next_plans.get(variant.trial_id),
                     family,
+                    chains,
                 )
             except _ReadError:
                 raise
@@ -1861,6 +1889,7 @@ def _variant_step(
     benchmarks: Mapping[str, str],
     next_plan: Plan | None,
     family: HypothesisFamily,
+    chains: Sequence[tuple[str, str]],
 ) -> None:
     """One variant's step through `step_end` from the shared reads, restricted to its
     own ids: carry, fill, value and exit every level, then take `next_plan`. `index` is
@@ -1877,9 +1906,12 @@ def _variant_step(
     late = view.late_dividends(t_prev, t, ever_held)
     spin_offs: tuple[pl.DataFrame, pl.DataFrame] | None = None
     if params.adjust.apply_spin_offs:
+        # The late reader selects raw `source_action_id` parents. Keep the
+        # predecessor in this spin-off-only read after the book is renamed.
+        spin_held = _spin_off_held_ids(ever_held, chains)
         spin_offs = (
             view.unvalued_spin_offs(t, ids),
-            view.late_spin_offs(t_prev, t, ever_held),
+            view.late_spin_offs(t_prev, t, spin_held),
         )
     if next_plan is not None:
         next_plan = _no_benchmark_members(next_plan, benchmarks)
@@ -1908,6 +1940,7 @@ def _variant_step(
             construction,
             variant.accruals,
             spin_offs,
+            chains,
         )
         _benchmark_step(book, plan, step_end, frame, raw, params)
     if next_plan is not None:
