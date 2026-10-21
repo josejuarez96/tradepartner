@@ -158,7 +158,7 @@ Purpose: attach `data.release_id` to new registrations at the release boundary.
 
 ## Restore and gaps
 
-With every job still stopped and no DuckDB process holding the store, save the **failed live store and WAL first** using `uv run tradepartner store backup`; label its printed paths as failed-state evidence on the release PR/issue. Then restore the chosen checkpoint. `store backup` names a copy `<store>.bak-YYYYMMDD-HHMM` and a WAL copy `<store>.wal.bak-YYYYMMDD-HHMM` when one exists. Use their **printed paths**, not a guessed release filename:
+With every job still stopped and no DuckDB process holding the store, save the **failed live store and WAL first** using `uv run tradepartner store backup`; label its printed paths as failed-state evidence on the release PR/issue. Then restore the chosen checkpoint. Current `store backup` names a copy `<store>.bak-YYYYMMDD-HHMM` and a WAL copy `<copy>.wal` when one exists; older backups use `<store>.wal.bak-YYYYMMDD-HHMM`. Use their **printed paths**, not a guessed release filename:
 
 ```bash
 CHECKPOINT_COPY="<printed-copy-path>"
@@ -166,6 +166,11 @@ CHECKPOINT_WAL_COPY="<printed-wal-copy-path-or-empty-string>"  # use "" when non
 rm -f data/tradepartner.duckdb.wal
 cp "$CHECKPOINT_COPY" data/tradepartner.duckdb
 if [ -n "$CHECKPOINT_WAL_COPY" ]; then cp "$CHECKPOINT_WAL_COPY" data/tradepartner.duckdb.wal; fi
+```
+
+Before opening the restored store, compare the checkpoint manifest's `wal_bytes` with the restored WAL's size (`stat -f %z data/tradepartner.duckdb.wal` on macOS). A numeric `wal_bytes` requires a WAL of that size; `null` requires no restored WAL. Stop on a mismatch. Then check health:
+
+```bash
 uv run tradepartner health --check
 ```
 

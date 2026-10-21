@@ -123,6 +123,7 @@ from tradepartner.backtest.portfolio import (
     buffered_targets,
     drifted_weights,
     hold_membership,
+    signed_target_weights,
     target_weights,
 )
 from tradepartner.backtest.provider import (
@@ -190,10 +191,23 @@ class BacktestResult:
     marking_frames: tuple[StepFrame, ...]
     targets: Mapping[date, Mapping[str, float]]
     rates: pl.DataFrame | None = None
+    exposure_summary: ExposureSummary | None = None
 
     def stitched_returns(self) -> pl.DataFrame:
         """`valuation.stitched_returns` over this run's marking frames."""
         return stitched_returns(self.marking_frames)
+
+
+@dataclass(frozen=True)
+class ExposureSummary:
+    """Session-close exposure of the signed strategy book and its total borrow fee."""
+
+    gross_mean: float
+    gross_max: float
+    net_mean: float
+    net_min: float
+    net_max: float
+    borrow_paid: float
 
 
 @dataclass(frozen=True)
@@ -265,6 +279,11 @@ class _Book:
     values: list[pl.DataFrame] = field(default_factory=list)
     keep_detail: bool = True
     chained_positions: int = 0  # #821: positions renamed by a successor chain this step
+    series: str = STRATEGY_SERIES
+    borrow_bps: float | None = None
+    pending_covers: set[str] = field(default_factory=set)
+    exposures: list[tuple[float, float]] = field(default_factory=list)
+    borrow_paid: float = 0.0
 
 
 def _check_levels(cost_levels: Sequence[float]) -> list[float]:
@@ -367,7 +386,30 @@ def _plan(
         seed = f"{params.strategy.placebo_seed}:{session.toordinal()}"
         scores = (placebo.shuffle if mode == "shuffle" else placebo.random_entry)(scores, seed)
     construction = getattr(params, strategy.section)
-    if construction.weighting == "hold":
+    counts = dict(signal.counts)
+    if params.portfolio.side == "long_short":
+        raw = provider.raw_prices(t, sorted(scores))
+        closes = {
+            sid: close
+            for sid, day, close in raw.select("security_id", "session", "close").iter_rows()
+            if day == read
+        }
+        eligible = {
+            sid for sid in scores if closes.get(sid, 0.0) >= params.portfolio.short_min_price
+        }
+        # An unpriced name is ineligible, but it has no observed close below the
+        # floor and therefore is not part of the below-price count.
+        counts["n_short_below_price"] = sum(
+            sid in closes and closes[sid] < params.portfolio.short_min_price for sid in scores
+        )
+        targets = signed_target_weights(
+            scores,
+            construction.top_fraction,
+            params.portfolio.gross_exposure,
+            params.portfolio.net_exposure,
+            eligible,
+        )
+    elif construction.weighting == "hold":
         targets = _hold_candidates(scores, _construction(params, family))
     else:
         targets = target_weights(scores, construction.top_fraction, construction.weighting)
@@ -382,7 +424,7 @@ def _plan(
         members=tuple(members),
         scores=scores,
         excluded_no_history=no_history,
-        counts=dict(signal.counts),
+        counts=counts,
         exclusions=exclusions,
     )
 
@@ -861,6 +903,7 @@ def _step(
     accruals: Mapping[date, float] | None,
     spin_offs: tuple[pl.DataFrame, pl.DataFrame] | None = None,
     chains: Sequence[tuple[str, str]] = (),
+    decision_frames: Mapping[date, pl.DataFrame] | None = None,
 ) -> None:
     """Carry, fill, value and exit one cost level through the period (T_i, T_{i+1}].
 
@@ -875,7 +918,8 @@ def _step(
     value kept in the position set and in `held_on`, every session after the plan's read
     pays the borrow fee (the carry window to the fill included) and accrues `rf(s)` on
     free cash only, and an equity that is not positive ends the run with a `ValueError`
-    naming the session."""
+    naming the session. A drift cover remains pending through missing bars until its
+    next fill bar or the ordinary stale exit."""
     signed = params.portfolio.side == "long_short"
     fill_price = params.execution.fill_price
     carried = carry_to_fill(
@@ -896,7 +940,7 @@ def _step(
         else:
             for session in _sessions(plan.session, plan.fill_session)[1:]:
                 held_cash *= 1 + accruals[session]
-    borrow_bps = params.costs.borrow_bps_per_year
+    borrow_bps = params.costs.borrow_bps_per_year if book.borrow_bps is None else book.borrow_bps
     if signed and borrow_bps > 0:
         # The carry window (T_i, F_i] is charged too, on the positions held at
         # close(T_i) (`book.positions`): the short pays for every session it is held, so
@@ -905,15 +949,47 @@ def _step(
         # rebalance. The post-fill loop then charges from the fill on (item 6).
         carried_shorts = _shorts(book.positions)
         for session in _sessions(plan.session, plan.fill_session)[1:]:
-            held_cash -= borrow_fee(
-                carried_shorts, borrow_bps, (session - previous_session(session)).days
-            )
-    targets, aside = _book_targets(book, plan, index, carried, held_cash, construction)
+            fee = borrow_fee(carried_shorts, borrow_bps, (session - previous_session(session)).days)
+            held_cash -= fee
+            book.borrow_paid += fee
     adv = (
         adv_by_security(raw, plan.session, params.costs.adv_sessions)
         if params.costs.impact_coeff != 0.0
         else {}
     )
+    n_drift = 0
+    prefill_drift_cost = 0.0
+    prefill_drift_value = 0.0
+    if signed and book.pending_covers:
+        waiting: set[str] = set()
+        for sid in sorted(book.pending_covers):
+            value = carried.get(sid, 0.0)
+            if value >= 0:
+                continue
+            if _price_on(frame, sid, plan.fill_session, fill_price) is None:
+                # A held name without a fill bar keeps its last mark, as in
+                # apply_trades. Its pending cover travels into the session loop.
+                waiting.add(sid)
+                continue
+            raw_fill = _price_on(raw, sid, plan.fill_session, fill_price)
+            if raw_fill is None:
+                raise ValueError(f"{sid} has a bar on {plan.fill_session} but no raw bar")
+            cost = trade_cost(
+                -value,
+                -value / raw_fill,
+                book.level,
+                Commissions.from_config(params.costs),
+                spread_bps=params.costs.spread_bps,
+                impact_coeff=params.costs.impact_coeff,
+                adv=adv.get(sid),
+            )
+            held_cash += value - cost
+            prefill_drift_value += -value
+            prefill_drift_cost += cost
+            del carried[sid]
+            n_drift += 1
+        book.pending_covers = waiting
+    targets, aside = _book_targets(book, plan, index, carried, held_cash, construction)
     fill = _fill_to_targets(
         carried, held_cash, targets, aside, frame, raw, plan, book, params, adv, signed=signed
     )
@@ -940,6 +1016,10 @@ def _step(
     totals = dict(values.group_by("session").agg(pl.col("value").sum()).iter_rows())
     shorts = _shorts_by_session(values) if signed else {}
     cash = fill.cash
+    drift_exits: list[_Exit] = []
+    pending: set[str] = set(book.pending_covers)
+    book.pending_covers.clear()
+    covered: set[str] = set()
     for session in _sessions(plan.fill_session, end):
         if session > plan.fill_session:
             previous = previous_session(session)
@@ -951,7 +1031,65 @@ def _step(
                 else:
                     cash *= 1 + accruals[session]
             if signed and borrow_bps > 0:
-                cash -= borrow_fee(held_shorts, borrow_bps, (session - previous).days)
+                fee = borrow_fee(held_shorts, borrow_bps, (session - previous).days)
+                cash -= fee
+                book.borrow_paid += fee
+        if signed and pending:
+            previous = previous_session(session)
+            completed: set[str] = set()
+            for sid in sorted(pending):
+                if sid not in shorts.get(previous, {}) and sid not in fill.positions:
+                    completed.add(sid)
+                    continue
+                source = shorts.get(previous, {})
+                held_value = source.get(sid, book.positions.get(sid, 0.0))
+                if held_value >= 0:
+                    completed.add(sid)
+                    continue
+                if _price_on(frame, sid, session, fill_price) is None:
+                    # The order cannot fill during a halt. Keep it pending until
+                    # the next bar or until the ordinary stale exit removes it.
+                    continue
+                marked = book.marked_at.get(sid, previous)
+                if session > plan.fill_session:
+                    prior = values.filter(
+                        (pl.col("security_id") == sid) & (pl.col("session") == previous)
+                    )
+                    if not prior.is_empty():
+                        marked = prior["marked_at"].item()
+                at_fill = carry_to_fill(
+                    {sid: held_value},
+                    frame,
+                    previous,
+                    session,
+                    fill_price=fill_price,
+                    marked_at={sid: marked},
+                    signed=True,
+                )[sid]
+                raw_fill = _price_on(raw, sid, session, fill_price)
+                if raw_fill is None:
+                    raise ValueError(f"{sid} has a bar on {session} but no raw bar")
+                cost = trade_cost(
+                    -at_fill,
+                    -at_fill / raw_fill,
+                    book.level,
+                    Commissions.from_config(params.costs),
+                    spread_bps=params.costs.spread_bps,
+                    impact_coeff=params.costs.impact_coeff,
+                    adv=adv.get(sid),
+                )
+                cash += at_fill - cost
+                drift_exits.append(_Exit(sid, session, at_fill, cost, False))
+                covered.add(sid)
+                completed.add(sid)
+                n_drift += 1
+                exits = [e for e in exits if e.security_id != sid or e.session < session]
+                for day in _sessions(session, end):
+                    row = values.filter((pl.col("security_id") == sid) & (pl.col("session") == day))
+                    if not row.is_empty():
+                        totals[day] = totals.get(day, 0.0) - float(row["value"].item())
+                    shorts.get(day, {}).pop(sid, None)
+            pending.difference_update(completed)
         proceeds = [e.value - e.cost for e in exits if e.session == session]
         cash = math.fsum([cash, *proceeds])
         equity = math.fsum([cash, totals.get(session, 0.0)])
@@ -960,7 +1098,48 @@ def _step(
                 f"the book's equity is gone on {session.isoformat()}: equity {equity} is not "
                 "positive"
             )
-        book.equity.append(EquityRow(STRATEGY_SERIES, book.level, session, equity, cash))
+        book.equity.append(EquityRow(book.series, book.level, session, equity, cash))
+        if signed:
+            active = shorts.get(session, {})
+            # The positive part is the total signed value less the short part.
+            net_value = totals.get(session, 0.0)
+            gross_value = net_value + 2 * _short_value(active)
+            book.exposures.append((gross_value / equity, net_value / equity))
+            if decision_frames is not None:
+                asof = decision_frames[session]
+                live = {
+                    sid
+                    for sid, value in values.filter(pl.col("session") == session)
+                    .select("security_id", "value")
+                    .iter_rows()
+                    if value != 0
+                }
+                source_positions = {
+                    sid: value
+                    for sid, value in fill.positions.items()
+                    if sid in live and sid not in covered
+                }
+                asof_values = value_positions(
+                    source_positions,
+                    asof,
+                    plan.fill_session,
+                    fill_price=fill_price,
+                    through=session,
+                    signed=True,
+                ).filter(pl.col("session") == session)
+                asof_net = math.fsum(asof_values["value"].to_list())
+                asof_equity = cash + asof_net
+                if asof_equity <= 0:
+                    raise ValueError(f"the book's equity is gone on {session}")
+                pending.update(
+                    sid
+                    for sid, value in asof_values.select("security_id", "value").iter_rows()
+                    if value < 0 and -value / asof_equity > params.portfolio.short_cover_weight
+                )
+    if signed:
+        book.pending_covers = {sid for sid in pending if sid in shorts.get(end, {})}
+        if drift_exits:
+            values = _book_exits(values, drift_exits)
     before = math.fsum([held_cash, *carried.values()])
     # A short's exit value is negative; its turnover contribution is the magnitude.
     exited = math.fsum(abs(e.value) for e in exits)
@@ -983,6 +1162,9 @@ def _step(
     # ex-date, written only under the opt-in key. A valued spin-off is already in the
     # frame (a dividend in kind, item 2), so it is neither read nor counted.
     counts = _rebalance_counts(plan, book)
+    if signed and book.series == STRATEGY_SERIES and book.level == params.costs.per_side_bps:
+        counts = dict(counts)
+        counts["n_drift_covers"] = n_drift
     if spin_offs is not None:
         counts = dict(counts)
         counts.update(_spin_off_counts(book, plan.session, end, spin_offs, chains))
@@ -1023,8 +1205,21 @@ def _step(
             n_universe=plan.n_universe,
             n_static_listings=plan.n_static_listings,
             n_targets=len(targets),
-            turnover=fill.turnover + (exited / (2 * before) if before > 0 else 0.0),
-            cost_paid=math.fsum([fill.cost_paid, *(e.cost for e in exits)]),
+            turnover=fill.turnover
+            + (
+                (exited + prefill_drift_value + math.fsum(-e.value for e in drift_exits))
+                / (2 * before)
+                if before > 0
+                else 0.0
+            ),
+            cost_paid=math.fsum(
+                [
+                    fill.cost_paid,
+                    prefill_drift_cost,
+                    *(e.cost for e in exits),
+                    *(e.cost for e in drift_exits),
+                ]
+            ),
             gap_count_share=plan.gap.count_share,
             gap_size_share=plan.gap.size_share,
             n_missing_fill=len(fill.missing),
@@ -1647,18 +1842,38 @@ def run_many(
         raise SharedReadFailed([v.trial_id for v in group], cause) from cause
 
     for variant in group:
+        sensitivity = tuple(book for book in variant.books if book.series != STRATEGY_SERIES)
         out[variant.trial_id] = {
             book.level: BacktestResult(
                 cost_per_side_bps=book.level,
-                equity=tuple(book.equity),
+                equity=tuple(book.equity)
+                + (
+                    tuple(row for extra in sensitivity for row in extra.equity)
+                    if book.level == variant.settings.costs.per_side_bps
+                    else ()
+                ),
                 rebalances=tuple(book.rebalances),
                 weights=tuple(book.weights),
                 position_values=pl.concat([pl.DataFrame(schema=_POSITION_SCHEMA), *book.values]),
                 marking_frames=tuple(variant.frames),
                 targets=dict(variant.targets),
                 rates=variant.rates,
+                exposure_summary=(
+                    ExposureSummary(
+                        gross_mean=math.fsum(gross for gross, _ in book.exposures)
+                        / len(book.exposures),
+                        gross_max=max(gross for gross, _ in book.exposures),
+                        net_mean=math.fsum(net for _, net in book.exposures) / len(book.exposures),
+                        net_min=min(net for _, net in book.exposures),
+                        net_max=max(net for _, net in book.exposures),
+                        borrow_paid=book.borrow_paid,
+                    )
+                    if variant.settings.portfolio.side == "long_short"
+                    else None
+                ),
             )
             for book in variant.books
+            if book.series == STRATEGY_SERIES
         }
     return out
 
@@ -1707,11 +1922,26 @@ def _run_group(
             )
             for level in levels
         ]
+        if variant.settings.portfolio.side == "long_short":
+            seen_rates: set[float] = set()
+            for rate in variant.settings.costs.borrow_sensitivity_bps:
+                if rate in seen_rates:
+                    continue
+                seen_rates.add(rate)
+                variant.books.append(
+                    _Book(
+                        level=variant.settings.costs.per_side_bps,
+                        cash=capital,
+                        keep_detail=False,
+                        series=f"strategy_borrow_{rate:g}bp",
+                        borrow_bps=rate,
+                    )
+                )
         for book in variant.books:
-            book.equity.append(
-                EquityRow(STRATEGY_SERIES, book.level, sessions[0], capital, capital)
-            )
-            for name in benchmarks:
+            book.equity.append(EquityRow(book.series, book.level, sessions[0], capital, capital))
+            if variant.settings.portfolio.side == "long_short":
+                book.exposures.append((0.0, 0.0))
+            for name in benchmarks if book.series == STRATEGY_SERIES else ():
                 book.equity.append(EquityRow(name, book.level, sessions[0], capital, None))
         if variant.settings.backtest.cash_rate == "store":
             try:
@@ -1915,7 +2145,8 @@ def _variant_step(
     cadence = params.schedule.rebalance_cadence
     t, t_prev = read_time(step_end, cadence), read_time(plan.session, cadence)
     ids, marked, ever_held = (list(part) for part in _marking_ids(variant, benchmarks))
-    frame = view.marking_prices(t, marked, _marking_bound(variant, step_end, family, marked))
+    marking_bound = _marking_bound(variant, step_end, family, marked)
+    frame = view.marking_prices(t, marked, marking_bound)
     raw = view.raw_prices(t, marked)
     ended = _ended(view.listing_ends(t, ids), step_end)
     dropped = view.dropped_dividends(t, ids)
@@ -1942,6 +2173,14 @@ def _variant_step(
         variant.last_stitched[sid] = session
     variant.targets[plan.fill_session] = dict(plan.targets)
     construction = _construction(params, family)
+    decisions: dict[date, pl.DataFrame] | None = None
+    if params.portfolio.side == "long_short":
+        decisions = {
+            session: view.adjusted_prices(
+                session_close(session), marked, True, sessions_from=marking_bound
+            )
+            for session in _sessions(plan.fill_session, step_end)
+        }
     for book in variant.books:
         _step(
             book,
@@ -1957,7 +2196,9 @@ def _variant_step(
             variant.accruals,
             spin_offs,
             chains,
+            decisions,
         )
-        _benchmark_step(book, plan, step_end, frame, raw, params)
+        if book.series == STRATEGY_SERIES:
+            _benchmark_step(book, plan, step_end, frame, raw, params)
     if next_plan is not None:
         variant.plan = next_plan

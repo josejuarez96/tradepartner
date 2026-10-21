@@ -446,6 +446,7 @@ def _run(
     *,
     cursor: str | None = None,
     message: str | None = None,
+    mode: str = "session",
 ) -> None:
     insert_row(
         conn,
@@ -456,7 +457,7 @@ def _run(
             "finished_at": started + timedelta(minutes=5),
             "status": status,
             "source": source,
-            "mode": "daily",
+            "mode": mode,
             "rows_added": 0,
             "chunk_cursor": cursor,
             "message": message,
@@ -528,6 +529,106 @@ def test_last_ingests_shows_the_daily_alpaca_run_not_an_actions_backfill_month(
     assert alpaca.latest_status == "ok"
     assert alpaca.latest_started_at == day1
     assert alpaca.last_ok_cursor == "2020-06-29"
+
+
+def test_last_ingests_shows_a_failed_ingest_not_a_later_repair_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #2125: a `repair` row (mode `repair`, status `repaired`) after a failed
+    # nightly ingest must not become the latest Alpaca run and hide the
+    # failure.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    _run(fixture_store, "a2", "alpaca", "failed", day2, message="boom")
+    _run(
+        fixture_store,
+        "a3",
+        "alpaca",
+        "repaired",
+        day2 + timedelta(minutes=10),
+        message="deleted 1 duplicate dividend row",
+        mode="repair",
+    )
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "failed"
+    assert alpaca.latest_started_at == day2
+    assert alpaca.latest_message == "boom"
+    assert alpaca.last_ok_cursor == "2020-06-29"
+
+
+def test_last_ingests_leaves_out_an_action_retract_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #2125: an `action-retract` row (mode `action_retract`, status
+    # `repaired`; held PR #2121) is not an ingest either.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    _run(
+        fixture_store,
+        "a2",
+        "alpaca",
+        "repaired",
+        day2,
+        message="withdrew a split",
+        mode="action_retract",
+    )
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day1
+
+
+def test_last_ingests_leaves_out_a_hole_fill_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # A `--fill-holes` month (mode `holes`, status `filled`, never `ok`) is a
+    # maintenance run, not a fresh ingest, so it is left out like an actions
+    # month (#833, #1676, #2125).
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    _run(
+        fixture_store,
+        "a2",
+        "alpaca",
+        "filled",
+        day2,
+        cursor="holes;since=2020-06-01;through=2020-06-30",
+        mode="holes",
+    )
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day1
+
+
+def test_last_ingests_counts_a_backfill_chunk(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # A `--backfill` chunk (mode `backfill`) is a real ingest: its `ok` run
+    # and cursor are the source's last ok.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "failed", day1, message="boom")
+    _run(fixture_store, "a2", "alpaca", "ok", day2, cursor="2020-06-29", mode="backfill")
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day2
+    assert alpaca.last_ok_cursor == "2020-06-29"
+
+
+def test_last_ingests_leaves_out_an_unknown_mode(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # The mode set is an allow-list, so a mode added later (here a made-up
+    # one) is left out without a code change.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    _run(fixture_store, "a2", "alpaca", "failed", day2, mode="future_maintenance")
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day1
 
 
 def test_last_ingests_ignores_a_run_not_finished_at_t(
@@ -2087,7 +2188,7 @@ def test_statement_facts_report_reads_the_latest_edgar_run_message(
             "finished_at": T_END - timedelta(minutes=1),
             "status": "ok",
             "source": "edgar",
-            "mode": "daily",
+            "mode": "session",
             "rows_added": 0,
             "chunk_cursor": None,
             "message": "0 securities; statement_vintage_late: 2, statement_derived: 1",
