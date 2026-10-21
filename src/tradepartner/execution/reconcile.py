@@ -103,8 +103,9 @@ difference an allowance absorbs is listed under `allowed`.
   (`OpenMerger.final`), a journaled total below the due less the cash bound is a
   `cash` mismatch naming the merger, once. A `CIL` on an open merger's acquiree
   or acquirer symbol is left in the cash difference for the merger, never
-  booked against the stock-dividend rule. A stock kind (T249b) or a held short
-  (T249s) is not explained here.
+  booked against the stock-dividend rule. For a stock kind on a held long
+  (T249b), a `merger_receipt` adds the acquirer shares; its fractional-share
+  cash band stays open for a later `CIL`. A held short (T249s) is not explained.
 - A conflicting merger pair (`explanations.merger_conflicts`, acquiree to
   detail: two ids for one acquiree and one `effective_date`) is a
   `merger_conflict` mismatch; the caller raises it once per pair and never
@@ -241,6 +242,7 @@ class OpenMerger:
     removed_quantity: float | None = None
     journaled_cash: float = 0.0
     final: bool = False
+    cash_upper: float | None = None
 
 
 @dataclass(frozen=True)
@@ -254,6 +256,9 @@ class _MergerDue:
     held: float | None
     upper: float
     cap: float
+    lower: float
+    receipt: float | None = None
+    reference_price: float | None = None
 
 
 @dataclass(frozen=True)
@@ -347,6 +352,8 @@ class ProposedAdjustment:
     #: The merger id a merger's `corporate_action_cash` row names (#1762, T249);
     #: None for every other row, and then left out of `mismatches_json`.
     merger_id: str | None = None
+    #: Point-in-time merger terms carried into the lot journal (#2151).
+    merger_terms: Mapping[str, object] | None = None
 
 
 def _adjustment_json(adjustment: ProposedAdjustment) -> dict[str, object]:
@@ -354,6 +361,8 @@ def _adjustment_json(adjustment: ProposedAdjustment) -> dict[str, object]:
     entry = dict(vars(adjustment))
     if entry.get("merger_id") is None:
         entry.pop("merger_id", None)
+    if entry.get("merger_terms") is None:
+        entry.pop("merger_terms", None)
     return entry
 
 
@@ -733,7 +742,20 @@ def compare(
         difference_decimal -= Decimal(str(cil.cash))
     explained.extend(cil_proposals)
 
-    dues = _merger_dues(explanations.mergers, expected, broker, shorts, q_tol)
+    dues, invalid_receipts = _merger_dues(
+        explanations.mergers,
+        expected,
+        broker,
+        shorts,
+        q_tol,
+        explanations.reference_prices,
+        buffer,
+    )
+    for name, acquirer, detail in invalid_receipts:
+        mismatches.append(Mismatch("quantity", detail, name, explanations.symbols.get(name)))
+        expected.pop(name, None)
+        if acquirer is not None:
+            expected[acquirer] = broker.get(acquirer, 0.0)
     merger_removed = {due.name for due in dues if due.held is not None}
     # The merger rule applies to its acquiree instead of the ended-listing band.
     removed = [
@@ -786,6 +808,28 @@ def compare(
             Allowed("deferred dividend", amount, name) for name, amount in dividends.items()
         ]
     merger_cap = math.fsum(due.cap for due in dues)
+    cil_symbols: dict[str, set[str]] = {}
+    for merger_due in dues:
+        if merger_due.held is None or merger_due.merger.kind != "stock_and_cash":
+            continue
+        for candidate_name in (merger_due.name, merger_due.merger.acquirer):
+            if candidate_name is not None and candidate_name in explanations.symbols:
+                cil_symbols.setdefault(explanations.symbols[candidate_name], set()).add(
+                    merger_due.merger.merger_id
+                )
+    merger_cil: dict[str, float] = {}
+    for activity in activities:
+        ids = cil_symbols.get(activity.symbol or "", set())
+        if (
+            activity.activity_type == _CASH_IN_LIEU
+            and activity.status == _EXECUTED
+            and activity.net_amount is not None
+            and activity.net_amount > 0
+            and not _inside_base(activity, explanations)
+            and len(ids) == 1
+        ):
+            merger_id = next(iter(ids))
+            merger_cil[merger_id] = merger_cil.get(merger_id, 0.0) + activity.net_amount
     if deferring and dues:
         # A merger's removal and credit while an allowance is open are allowed,
         # never journaled; the next reconciliation without one journals them.
@@ -795,6 +839,16 @@ def compare(
             for due in dues
             if due.held is not None
         ]
+        for merger_due in dues:
+            if merger_due.receipt is not None and merger_due.merger.acquirer is not None:
+                bands[merger_due.merger.acquirer].widen(merger_due.receipt)
+                allowed.append(
+                    Allowed(
+                        "deferred merger receipt",
+                        merger_due.receipt,
+                        merger_due.merger.acquirer,
+                    )
+                )
     cash_ok = _cash_allows(cash_band, difference_decimal, cash_bound)
     if dues and not deferring:
         cash_ok, journaled = _merger_cash(
@@ -808,9 +862,15 @@ def compare(
             expected,
             explanations.reference_prices,
             buffer,
+            merger_cil,
         )
         explained += journaled
         mismatches += _merger_final_checks(dues, journaled, cash_bound, explanations.symbols)
+        for receipt in (a for a in journaled if a.kind == "merger_receipt"):
+            if receipt.security_id is not None and receipt.quantity is not None:
+                expected[receipt.security_id] = (
+                    expected.get(receipt.security_id, 0.0) + receipt.quantity
+                )
         for name in removed:
             expected.pop(name)
     elif removed:
@@ -961,28 +1021,75 @@ def _merger_dues(
     broker: Mapping[str, float],
     shorts: frozenset[str],
     q_tol: float,
-) -> list[_MergerDue]:
-    """The open cash mergers that may take cash at this reconciliation (#1762
-    items 2 and 4): a held long acquiree the broker no longer holds is removed
-    now, its cap the whole due (held x `cash_per_share`); a removed one may take
-    the rest of its due. A stock kind (T249b), a short (T249s) and an acquiree
-    the broker still holds take nothing."""
+    reference_prices: Mapping[str, float],
+    buffer: float,
+) -> tuple[list[_MergerDue], list[tuple[str, str | None, str]]]:
+    """Cash bounds and receipts for open long mergers (#1762 items 2, 4, 5)."""
     dues: list[_MergerDue] = []
+    invalid: list[tuple[str, str | None, str]] = []
     for name, merger in sorted(mergers.items()):
-        if merger.kind != MERGER_CASH or merger.cash_per_share is None or name in shorts:
+        if name in shorts:
             continue
-        rate = _finite(merger.cash_per_share, f"cash_per_share of merger {merger.merger_id}")
+        rate = _finite(merger.cash_per_share or 0.0, f"cash_per_share of merger {merger.merger_id}")
+        stock = merger.kind != MERGER_CASH
         if merger.removed_quantity is None:
             held = expected.get(name, 0.0)
             if held <= q_tol or name in broker:
                 continue
-            dues.append(_MergerDue(name, merger, held, held * rate, held * rate))
+            receipt: float | None = None
+            upper = held * rate
+            if stock:
+                acquirer = merger.acquirer
+                ratio = merger.share_ratio
+                if acquirer is None or ratio is None:
+                    invalid.append(
+                        (name, acquirer, f"merger {merger.merger_id} has no acquirer or ratio")
+                    )
+                    continue
+                receipt = broker.get(acquirer, 0.0) - expected.get(acquirer, 0.0)
+                due_shares = held * _finite(ratio, f"share ratio of merger {merger.merger_id}")
+                if abs(receipt) <= q_tol:
+                    receipt = 0.0
+                if not (
+                    0 <= receipt <= due_shares + q_tol
+                    and receipt > due_shares - 1 - q_tol
+                    and (receipt > 0 or due_shares < 1)
+                ):
+                    invalid.append(
+                        (
+                            name,
+                            acquirer,
+                            f"merger {merger.merger_id} receipt {receipt} outside "
+                            f"({due_shares - 1}, {due_shares}]",
+                        )
+                    )
+                    continue
+                fractional = max(due_shares - receipt, 0.0)
+                price = reference_prices.get(acquirer)
+                if (fractional > q_tol or merger.kind == "stock_and_cash") and (
+                    price is None or not math.isfinite(price) or price <= 0
+                ):
+                    invalid.append(
+                        (
+                            name,
+                            acquirer,
+                            f"merger {merger.merger_id} has no acquirer reference price",
+                        )
+                    )
+                    continue
+                upper += fractional * (price or 0.0) * (1 + buffer)
+            dues.append(
+                _MergerDue(
+                    name, merger, held, upper, upper, held * rate, receipt, price if stock else None
+                )
+            )
         else:
             removed = _finite(merger.removed_quantity, f"removed quantity of {merger.merger_id}")
             journaled = _finite(merger.journaled_cash, f"journaled cash of {merger.merger_id}")
-            upper = removed * rate
-            dues.append(_MergerDue(name, merger, None, upper, max(upper - journaled, 0.0)))
-    return dues
+            lower = removed * rate
+            upper = merger.cash_upper if merger.cash_upper is not None else lower
+            dues.append(_MergerDue(name, merger, None, upper, max(upper - journaled, 0.0), lower))
+    return dues, invalid
 
 
 def _merger_cash(
@@ -996,6 +1103,7 @@ def _merger_cash(
     expected: Mapping[str, float],
     reference_prices: Mapping[str, float],
     buffer: float,
+    merger_cil: Mapping[str, float],
 ) -> tuple[bool, list[ProposedAdjustment]]:
     """Whether the cash difference is explained with open mergers present, and
     the rows it journals (#1762 items 2 and 4). The mergers read the cash left
@@ -1040,7 +1148,7 @@ def _merger_cash(
             left = rest - take
             if not -bound <= left <= top + bound:
                 continue
-            rows = _merger_adjustments(dues, float(take))
+            rows = _merger_adjustments(dues, float(take), merger_cil)
             if removed:
                 proceeds = float(min(max(left, Decimal(0)), band_cap))
                 rows += _ended_adjustments(removed, expected, value, proceeds)
@@ -1064,7 +1172,9 @@ def _merger_cash(
     return False, []
 
 
-def _merger_adjustments(dues: Sequence[_MergerDue], take: float) -> list[ProposedAdjustment]:
+def _merger_adjustments(
+    dues: Sequence[_MergerDue], take: float, merger_cil: Mapping[str, float]
+) -> list[ProposedAdjustment]:
     """The rows the mergers journal: `take` shared in order, each up to its cap;
     a removal always (its quantity, whatever cash it took), a payment only when
     it took cash."""
@@ -1075,17 +1185,41 @@ def _merger_adjustments(dues: Sequence[_MergerDue], take: float) -> list[Propose
         left -= cash
         merger = due.merger
         if due.held is not None:
+            terms: dict[str, object] = {"merger_kind": merger.kind}
+            if due.receipt is not None and merger.share_ratio is not None:
+                terms.update(
+                    acquirer_security_id=merger.acquirer,
+                    share_ratio=merger.share_ratio,
+                    acquirer_price=due.reference_price,
+                    fractional_shares=max(due.held * merger.share_ratio - due.receipt, 0.0),
+                )
+                if merger.kind == "stock_and_cash":
+                    terms["same_session_cil_cash"] = min(
+                        cash,
+                        max(merger_cil.get(merger.merger_id, 0.0), cash - due.lower),
+                    )
             rows.append(
                 ProposedAdjustment(
                     "corporate_action_cash",
                     due.name,
                     -due.held,
                     cash,
-                    f"cash merger {merger.merger_id}: {due.held} shares at "
-                    f"{merger.cash_per_share} removed",
+                    f"merger {merger.merger_id}: {due.held} acquiree shares removed",
                     merger_id=merger.merger_id,
+                    merger_terms=terms,
                 )
             )
+            if due.receipt is not None and due.receipt > 0 and merger.acquirer is not None:
+                rows.append(
+                    ProposedAdjustment(
+                        "merger_receipt",
+                        merger.acquirer,
+                        due.receipt,
+                        None,
+                        f"merger {merger.merger_id}: acquirer shares received",
+                        merger_id=merger.merger_id,
+                    )
+                )
         elif cash > 0:
             rows.append(
                 ProposedAdjustment(
@@ -1093,7 +1227,7 @@ def _merger_adjustments(dues: Sequence[_MergerDue], take: float) -> list[Propose
                     due.name,
                     None,
                     cash,
-                    f"cash merger {merger.merger_id}: cash paid after the removal",
+                    f"merger {merger.merger_id}: cash paid after the removal",
                     merger_id=merger.merger_id,
                 )
             )
@@ -1126,11 +1260,11 @@ def _merger_final_checks(
         if not merger.final:
             continue
         total = merger.journaled_cash + taken.get(merger.merger_id, 0.0)
-        if Decimal(str(total)) < Decimal(str(due.upper)) - bound:
+        if Decimal(str(total)) < Decimal(str(due.lower)) - bound:
             found.append(
                 Mismatch(
                     "cash",
-                    f"{merger_due_detail(merger.merger_id)}: {total} of {due.upper} "
+                    f"{merger_due_detail(merger.merger_id)}: {total} of {due.lower} "
                     f"journaled by the end of its window on {merger.window_end}",
                     due.name,
                     symbols.get(due.name),

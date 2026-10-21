@@ -352,6 +352,16 @@ def test_each_adjustment_kind() -> None:
     assert ledger.cash == pytest.approx(671.2)
 
 
+def test_merger_receipt_adds_acquirer_shares_without_cash() -> None:
+    rows = (
+        _adjustment("corporate_action_cash", D9, security_id=A, quantity=-10.0, cash=0.0),
+        _adjustment("merger_receipt", D9, security_id=C, quantity=2.0),
+    )
+    result = _ledger([_fill(BUY_A, 10.0, 50.0)], [BUY_A], adjustments=rows)
+    assert result.positions == {C: 2.0}
+    assert result.cash == 500.0
+
+
 def test_an_unknown_adjustment_kind_is_refused() -> None:
     with pytest.raises(ValueError, match="kind"):
         _ledger([], [], adjustments=(_adjustment("gift", D1, security_id=A, quantity=1.0),))
