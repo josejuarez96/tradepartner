@@ -1,5 +1,7 @@
 # Runbook: named data releases
 
+For the post-T162 sequence of releases and paper-window handoff, use the [one data sitting run sheet](data-sitting.md).
+
 Owner-run, on the real store. Agents never change the owner's store. Plan task T140 ([#1325](https://github.com/josejuarez96/tradepartner/issues/1325), plan amendment [#1319](https://github.com/josejuarez96/tradepartner/issues/1319)). The owner accepted the policy on [#1303](https://github.com/josejuarez96/tradepartner/issues/1303).
 
 Until T140b adds a store kind for it, the record is a hand-written TOML file. Start recording now. Nothing here waits for T140b.
