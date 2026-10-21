@@ -179,7 +179,14 @@ class PaperRunResultRow:
 
 @dataclass(frozen=True, kw_only=True)
 class PaperPlanRow:
-    """One `paper_plans` row."""
+    """One `paper_plans` row.
+
+    `n_assets_intersected` and `assets_intersection_skipped` are the liquidity
+    intersection's record (version 36, plan T241): the kept classes checked
+    against the assets snapshot and whether the intersection was skipped for
+    want of one known at `t`. Both are nullable and default to `None` because
+    every row written before version 36 predates the record; T242 writes them.
+    """
 
     TABLE: ClassVar[str] = "paper_plans"
     ID_COLUMN: ClassVar[str | None] = None
@@ -193,6 +200,8 @@ class PaperPlanRow:
     n_orders_below_min_at_live_capital: int
     known_at: datetime
     ingested_at: datetime
+    n_assets_intersected: int | None = None
+    assets_intersection_skipped: bool | None = None
 
 
 @dataclass(frozen=True, kw_only=True)

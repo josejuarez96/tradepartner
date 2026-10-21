@@ -730,6 +730,55 @@ def test_a_rebalance_without_counts_reads_null_columns_and_no_rows(
     ]
 
 
+#: The two version-36 columns (plan T241), read back in cost-level order.
+_INTERSECTION_READER = (
+    "SELECT n_assets_intersected, assets_intersection_skipped FROM trial_rebalances "
+    "WHERE trial_id = ? ORDER BY cost_per_side_bps"
+)
+
+
+def test_the_two_intersection_fields_write_as_columns_or_null(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """`n_assets_intersected` and `assets_intersection_skipped` are `trial_rebalances`
+    columns, not `trial_rebalance_counts` rows: a row that sets them writes them, and
+    one built without them (their `None` default) writes NULL (plan T241)."""
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    registry.write_rebalances(
+        conn,
+        handle,
+        [
+            _rebalance_row(
+                cost_per_side_bps=0.0,
+                counts={},
+                n_assets_intersected=4,
+                assets_intersection_skipped=False,
+            )
+        ],
+    )
+    registry.write_rebalances(
+        conn,
+        handle,
+        [
+            _rebalance_row(
+                cost_per_side_bps=15.0,
+                counts={},
+                n_assets_intersected=0,
+                assets_intersection_skipped=True,
+            )
+        ],
+    )
+    registry.write_rebalances(conn, handle, [_rebalance_row(cost_per_side_bps=30.0, counts={})])
+    assert conn.execute(_INTERSECTION_READER, [handle.trial_id]).fetchall() == [
+        (4, False),
+        (0, True),
+        (None, None),
+    ]
+    # Never a `trial_rebalance_counts` row: neither name is a count.
+    assert registry.rebalance_counts(conn, handle.trial_id) == {}
+
+
 def test_a_count_that_is_not_an_int_is_refused_before_any_write(
     conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:

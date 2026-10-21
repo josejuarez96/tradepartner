@@ -354,7 +354,16 @@ class RebalanceRow:
     level, and fills each fixed count column (`schema.REBALANCE_COUNT_COLUMNS`:
     `n_excluded_no_history` and T85d's six `profitability` columns) from it by
     name on every level's row, NULL when absent, so both reads agree
-    (`columns`)."""
+    (`columns`).
+
+    `n_assets_intersected` and `assets_intersection_skipped` record the
+    `rank_by = dollar_volume` liquidity intersection (backtest spec amendment
+    2026-10-18; plan T241): the kept classes checked against the assets
+    snapshot and whether the intersection was skipped for want of a snapshot
+    known at `t`. They are `trial_rebalances` columns, written each by name,
+    not `trial_rebalance_counts` rows — the spec names the columns and one is a
+    flag — and default to `None` so a row built without them predates the
+    record (NULL), as every pre-version-36 row does."""
 
     cost_per_side_bps: float
     session: date
@@ -372,6 +381,8 @@ class RebalanceRow:
     n_dropped_dividends: int
     n_late_dividends: int
     counts: Mapping[str, int] = field(default_factory=dict)
+    n_assets_intersected: int | None = None
+    assets_intersection_skipped: bool | None = None
 
     def columns(self) -> dict[str, Any]:
         """The `trial_rebalances` row this writes: every field but `counts`, then
@@ -1116,7 +1127,9 @@ def write_rebalances(
     `costs.per_side_bps`), one `trial_rebalance_counts` row per count name: a
     plan's counts are the same at every level, so they are stored once per
     rebalance, as `trial_weights` is (#1153, T127). Refuses a count that is
-    not an integer."""
+    not an integer. The liquidity intersection's `n_assets_intersected` and
+    `assets_intersection_skipped` are `RebalanceRow` fields, so they ride along
+    on each row by name (plan T241), never as `trial_rebalance_counts` rows."""
     rows = list(rows)
     for row in rows:
         for name, value in row.counts.items():

@@ -1226,7 +1226,8 @@ def test_the_fixture_store_holds_the_six_borrow_cases(
 def _version_25_store(conn: duckdb.DuckDBPyConnection) -> None:
     """A store as version 25 (#1583, T183) left it: every DDL tuple, the
     unconditional post-DDL steps (`retracted`, the booked `FEE` activity
-    columns, the nullable registry columns, the period columns) and one row
+    columns, the nullable registry columns, the period columns, the version-36
+    intersection columns) and one row
     in each of `listings`, `classifications` and `prices_daily`, with both
     master tables still refusing `filing_name` in their provenance `CHECK`,
     and a single version-25 row."""
@@ -1248,6 +1249,7 @@ def _version_25_store(conn: duckdb.DuckDBPyConnection) -> None:
     schema._migrate_fee_activities(conn)
     schema._migrate_n_research(conn)
     schema._migrate_profitability_rebalance_counts(conn)
+    schema._migrate_assets_intersection(conn)
     schema._relax_no_history_count(conn)
     schema._migrate_period_columns(conn)
     conn.execute(
@@ -1833,10 +1835,20 @@ def test_migrating_a_version_13_store_copies_the_counts_once_per_rebalance() -> 
     conn = duckdb.connect(":memory:")
     try:
         _version_13_store(conn)
-        before = conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall()
+        kept = list(_columns(conn, "trial_rebalances"))
+        before = conn.execute(
+            f"SELECT {', '.join(kept)} FROM trial_rebalances ORDER BY ALL"
+        ).fetchall()
         schema.init_schema(conn)
         assert _versions(conn) == list(range(12, schema.CURRENT_SCHEMA_VERSION + 1))
-        assert conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall() == before
+        assert (
+            conn.execute(f"SELECT {', '.join(kept)} FROM trial_rebalances ORDER BY ALL").fetchall()
+            == before
+        )
+        # The two version-36 columns are new here and NULL on every existing row.
+        assert conn.execute(
+            "SELECT n_assets_intersected, assets_intersection_skipped FROM trial_rebalances"
+        ).fetchall() == [(None, None)] * len(before)
         assert not _columns(conn, "trial_rebalances")["n_excluded_no_history"][1]
         rows = conn.execute(
             "SELECT trial_id, session, name, value FROM trial_rebalance_counts ORDER BY ALL"
@@ -2338,7 +2350,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGERS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 1
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
@@ -2735,7 +2747,7 @@ def test_the_version_35_migration_adds_mergers_and_nothing_else() -> None:
         assert {i: indexes_after[i] for i in indexes_before} == indexes_before
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM mergers").fetchone() == (0,)
-        assert _versions(conn) == [34, 35] == [34, schema.CURRENT_SCHEMA_VERSION]
+        assert _versions(conn) == list(range(34, schema.CURRENT_SCHEMA_VERSION + 1))
         before_second = _versions(conn)
         schema.init_schema(conn)
         assert _versions(conn) == before_second
@@ -2766,3 +2778,143 @@ def test_read_only_open_of_a_version_34_store_passes(tmp_path: Path) -> None:
         assert ro.execute("SELECT count(*) FROM symbol_changes").fetchone() == (0,)
         with pytest.raises(duckdb.CatalogException):
             ro.execute("SELECT count(*) FROM mergers").fetchone()
+
+
+# --- version 36 (plan T241): the liquidity intersection's record -----------------------
+#
+# `trial_rebalances` and `paper_plans` each gain `n_assets_intersected INTEGER` and
+# `assets_intersection_skipped BOOLEAN` (backtest spec amendment 2026-10-18,
+# `universe.rank_by`), NULL on every existing row because those rows predate the
+# record. The two columns are version 36's; T241 was written when 35 was next, and
+# T248c's `mergers` took 35 first, so this migration is the next free number on `main`.
+# Every pin reads `schema._PRE_ASSETS_INTERSECTION_VERSION`, the last version without
+# them, at run time.
+
+#: The two columns, in both tables, name to the type their `ALTER TABLE` adds.
+_ASSETS_INTERSECTION_ADDED = (
+    ("n_assets_intersected", "INTEGER"),
+    ("assets_intersection_skipped", "BOOLEAN"),
+)
+
+
+def _as_pre_assets_intersection(conn: duckdb.DuckDBPyConnection) -> None:
+    """Leave `conn` as a version-35 store's: the four version-36 columns dropped
+    from `trial_rebalances` and `paper_plans`, one version-35 row. The rest of the
+    store is the current shape (as `_as_version_34` builds it)."""
+    for table in ("trial_rebalances", "paper_plans"):
+        for column, _ in _ASSETS_INTERSECTION_ADDED:
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    conn.execute("DELETE FROM schema_version")
+    conn.execute(
+        "INSERT INTO schema_version (version, applied_at) VALUES (35, TIMESTAMPTZ "
+        "'2026-10-20 20:00:00+00')"
+    )
+
+
+def _table_columns(conn: duckdb.DuckDBPyConnection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+
+
+#: A `trial_rebalances` row's NOT NULL columns (the two version-36 columns excluded).
+_TRIAL_REBALANCE_ROW: dict[str, object] = {
+    "trial_id": 1,
+    "cost_per_side_bps": 15.0,
+    "session": date(2018, 1, 31),
+    "fill_session": date(2018, 2, 1),
+    "n_universe": 10,
+    "n_static_listings": 1,
+    "n_targets": 2,
+    "turnover": 0.5,
+    "cost_paid": 0.001,
+    "n_missing_fill": 0,
+    "n_delisting_exits": 0,
+    "n_stale_exits": 0,
+    "n_excluded_no_history": 0,
+    "n_dropped_dividends": 0,
+    "n_late_dividends": 0,
+}
+
+#: A `paper_plans` row, its NOT NULL columns (the two version-36 columns excluded).
+_PAPER_PLAN_ROW: dict[str, object] = {
+    "run_id": 1,
+    "plan_trial_id": 1,
+    "rebalance_session": date(2018, 1, 31),
+    "n_universe": 10,
+    "n_targets": 2,
+    "n_orders_below_min_at_live_capital": 0,
+    "known_at": datetime(2018, 2, 1, tzinfo=UTC),
+    "ingested_at": datetime(2018, 2, 1, tzinfo=UTC),
+}
+
+
+def test_the_version_36_migration_adds_the_intersection_columns_and_nothing_else() -> None:
+    """From 35: `trial_rebalances` and `paper_plans` each gain `n_assets_intersected`
+    and `assets_intersection_skipped`, NULL on every existing row, and a version-36
+    row; no other table's shape, no index and no row changes; a second open adds
+    nothing; the two migrated tables are the fresh store's (plan T241)."""
+    conn = duckdb.connect(":memory:")
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        insert_row(conn, "trial_rebalances", _TRIAL_REBALANCE_ROW)
+        insert_row(conn, "paper_plans", _PAPER_PLAN_ROW)
+        _as_pre_assets_intersection(conn)
+        shape_before, indexes_before = _shape(conn), _indexes(conn)
+        for table in ("trial_rebalances", "paper_plans"):
+            assert not {name for name, _ in _ASSETS_INTERSECTION_ADDED} <= _table_columns(
+                conn, table
+            )
+        assert max(_versions(conn)) == 35
+
+        schema.init_schema(conn)
+
+        shape_after, indexes_after = _shape(conn), _indexes(conn)
+        assert set(shape_after) == set(shape_before)
+        for table in sorted(shape_before):
+            changed = table in ("trial_rebalances", "paper_plans")
+            assert (shape_after[table] != shape_before[table]) is changed, table
+        for table in ("trial_rebalances", "paper_plans"):
+            assert {name for name, _ in _ASSETS_INTERSECTION_ADDED} <= _table_columns(conn, table)
+        assert {i: indexes_after[i] for i in indexes_before} == indexes_before
+        assert _versions(conn) == [35, schema.CURRENT_SCHEMA_VERSION]
+        # Every existing row is kept; the two columns are NULL there.
+        for table in ("trial_rebalances", "paper_plans"):
+            assert conn.execute(
+                f"SELECT n_assets_intersected, assets_intersection_skipped FROM {table}"
+            ).fetchall() == [(None, None)]
+        before_second = _versions(conn)
+        schema.init_schema(conn)
+        assert _versions(conn) == before_second
+        fresh = duckdb.connect(":memory:")
+        try:
+            schema.init_schema(fresh)
+            for table in ("trial_rebalances", "paper_plans"):
+                assert shape_after[table] == _shape(fresh)[table]
+        finally:
+            fresh.close()
+    finally:
+        conn.close()
+
+
+def test_read_only_open_of_a_version_35_store_still_serves_every_other_read(
+    tmp_path: Path,
+) -> None:
+    """A read-only connection never migrates: a version-35 store passes, its
+    `schema_version` stays 35, its `trial_rebalances` and `paper_plans` lack the two
+    version-36 columns, and every read not naming them works (plan T241)."""
+    path = tmp_path / "v35.duckdb"
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        insert_row(conn, "trial_rebalances", _TRIAL_REBALANCE_ROW)
+        _as_pre_assets_intersection(conn)
+    finally:
+        conn.close()
+    with duckdb.connect(str(path), read_only=True) as ro:
+        schema.init_schema(ro)
+        assert max(_versions(ro)) == 35
+        assert ro.execute("SELECT count(*) FROM trial_rebalances").fetchone() == (1,)
+        assert ro.execute("SELECT count(*) FROM paper_plans").fetchone() == (0,)
+        for table in ("trial_rebalances", "paper_plans"):
+            assert not {name for name, _ in _ASSETS_INTERSECTION_ADDED} <= _table_columns(ro, table)
