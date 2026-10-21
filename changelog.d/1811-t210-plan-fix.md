@@ -1,3 +1,0 @@
-- T210 made buildable (#1792): split into T210 (pure terms, keys, the post-registration costs.* rule), T210b (the measured level's column) and T210c (engine wiring after T209b); spec amendment #1792.
-### Changed
-- Backtest plan and spec (#1792): T210 split by file into T210, T210b and T210c; `POST_REGISTRATION_COST_KEYS` extends the 2026-10-09 carve-out to post-registration `costs.*` keys; `trial_metrics.cost_level_kind` at the next free schema version; ADV from raw close times raw volume ending at the plan session; the benchmark's one buy pays the full cost model (spec Series line, ADR 0005).
