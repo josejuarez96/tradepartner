@@ -33,11 +33,12 @@ import streamlit as st
 
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
-from tradepartner.execution import headroom, ops
+from tradepartner.execution import headroom, ops, waiting
 from tradepartner.execution.ops import OpsData, OrderChain, RankedSignal
 from tradepartner.execution.switch import SwitchState
 from tradepartner.store import journal
 from tradepartner.store.asof import listings_as_of
+from tradepartner.store.db import utc_now
 from tradepartner.store.journal import AlertRow, ReconciliationRow
 from tradepartner.store.schema import SchemaVersionError
 
@@ -183,6 +184,27 @@ def _summary_card(summaries: tuple[ops.BookSummary, ...]) -> None:
     with st.container(border=True):
         st.subheader("Books")
         st.dataframe(_summary_table(summaries), hide_index=True)
+
+
+def _waiting_card(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    """Show every open book's owner queue, independent of the selected book."""
+    try:
+        items: tuple[waiting.WaitingItem, ...] = ops.waiting_on_owner(conn, settings, utc_now())
+    except SchemaVersionError:
+        return  # The outdated-journal panel below explains this store.
+    with st.container(border=True):
+        st.subheader("Waiting on you")
+        if not items:
+            theme.status_badge("Nothing is waiting on you", "good")
+            return
+        for item in items:
+            status: theme.Status = "critical" if item.kind == "kill_switch_engaged" else "warning"
+            theme.status_badge(f"{item.book_id}: {item.kind}", status)
+            st.caption(f"{item.detail} · since {item.since or '-'}")
+            if item.command is not None:
+                st.code(item.command, language="bash")
+            else:
+                st.caption("No command; follow the detail above.")
 
 
 def _kpis(data: OpsData) -> None:
@@ -471,6 +493,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
 
     st.header("Operations")
     summaries = _book_summaries(conn, settings)
+    _waiting_card(conn, settings)
     if summaries:
         _summary_card(summaries)
     book = _selected_book(summaries, settings.paper.book_id)
