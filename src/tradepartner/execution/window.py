@@ -1869,7 +1869,10 @@ def settle_order(
     on the name the broker still knows). Neither of the last two applies under
     the reset exception: `get_order` raised `UnknownOrderError` and
     `positions()` holds nothing. Any broker error but that one
-    `UnknownOrderError` propagates, nothing written.
+    `UnknownOrderError` propagates, nothing written. A fill in the stream whose
+    `broker_fill_id` the journal holds at another quantity or price (a broker
+    correction after collection, #2153) raises collect's `SystemFaultError`,
+    nothing written.
 
     Then one clock reading, which must be later than the gate's reading and
     than every journal row of the order (else `ClockError`), stamps both rows

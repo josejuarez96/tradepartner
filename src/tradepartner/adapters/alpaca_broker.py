@@ -493,8 +493,8 @@ class AlpacaBroker(Broker):
         `partial_fill` row 2 ms later that corrects it (#2149: a `fill` of 1 then
         -0.64777629, the position 7 + 1 - 0.64777629). Such a row is folded into
         the same order's latest earlier row in this read, at the same price, keeping
-        that row's id and time; a correction with no such row, another price or a
-        result that is not positive is a `SystemFaultError`, as before.
+        that row's id and time; a correction with no such row, another symbol, side
+        or price, or a result that is not positive is a `SystemFaultError`.
         """
         self._now()
         start = _EPOCH if since is None else ensure_tz_aware_utc(since, field_name="since")
@@ -623,7 +623,8 @@ class AlpacaBroker(Broker):
 def _fold_correction(activity: Mapping[str, Any], fills: list[Fill], order_ids: list[Any]) -> None:
     """Fold a negative-quantity fill row into its order's latest earlier row in
     `fills`, in place (#2149). Raise `ValueError` (mapped to `SystemFaultError`)
-    unless that row exists, has the same price and stays positive."""
+    unless that row exists, has the same symbol, side and price, and stays
+    positive (#2153)."""
     order_id = activity["order_id"]
     at = _instant(activity["transaction_time"])
     price = _number(activity["price"])
