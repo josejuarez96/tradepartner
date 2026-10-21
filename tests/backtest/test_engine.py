@@ -1876,6 +1876,13 @@ class TestSuccessorChains:
             "n_spin_offs_unvalued": 1,
             "n_late_spin_offs": 1,
         }
+        # When both hops arrive together, the engine's one-hop rename leaves B held.
+        book.held_on = {"B": {date(2020, 2, 5), date(2020, 2, 6)}}
+        assert engine._spin_off_held_ids(("B",), two_hops) == ("A", "B")
+        assert engine._spin_off_counts(book, start, end, (unvalued, late), two_hops) == {
+            "n_spin_offs_unvalued": 1,
+            "n_late_spin_offs": 1,
+        }
 
     def test_spin_off_parent_cycle_does_not_follow_forever(self) -> None:
         book = self._variant().books[0]
@@ -1954,8 +1961,9 @@ class TestSuccessorChains:
         finally:
             conn.close()
 
-    def test_a_two_hop_parent_counts_both_spin_off_rows_in_the_run(self) -> None:
-        """The second hop arrives at T2, after the held parent's ex-dates."""
+    @pytest.mark.parametrize("same_step", [False, True], ids=["separate-steps", "same-step"])
+    def test_a_two_hop_parent_counts_both_spin_off_rows_in_the_run(self, same_step: bool) -> None:
+        """Both rows count whether the two hops arrive together or separately."""
         predecessor, middle, successor = "PRE", "MID", "POST"
         prices = pl.concat(
             [
@@ -1989,17 +1997,23 @@ class TestSuccessorChains:
             def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
                 self._record("chains", t)
                 first = ((predecessor, middle),)
-                return (*first, (middle, successor)) if t >= read_time(T2) else first
+                if t >= read_time(T2):
+                    return (*first, (middle, successor))
+                return () if same_step else first
 
             def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
                 # The store re-keys this parent to the successor; this fake keeps
                 # the raw predecessor to exercise the count's mapping too.
-                wanted = [*ids, predecessor] if successor in ids else ids
+                wanted = [*ids, predecessor] if successor in ids or middle in ids else ids
                 return super().unvalued_spin_offs(t, wanted)
 
         provider = _StepChainProvider(
             prices=prices,
-            members={T0: [predecessor], T1: [middle], T2: [successor]},
+            members={
+                T0: [predecessor],
+                T1: [predecessor if same_step else middle],
+                T2: [successor],
+            },
             benchmarks={},
             unvalued_spin_offs_rows=unvalued,
             late_spin_offs_rows=late,

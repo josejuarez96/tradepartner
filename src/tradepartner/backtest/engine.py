@@ -685,16 +685,18 @@ def _held_before(book: _Book, sid: str, ex_date: date) -> bool:
     return previous_session(ex_date) in book.held_on.get(sid, set())
 
 
-def _spin_off_parent(sid: str, mapping: Mapping[str, str]) -> str:
-    """Find the live terminal successor; leave a cyclic parent unresolved."""
+def _spin_off_path(sid: str, mapping: Mapping[str, str]) -> tuple[str, ...]:
+    """IDs from a parent through its live successors, stopping before a cycle."""
+    path: list[str] = []
     seen: set[str] = set()
     current = sid
-    while current in mapping:
-        if current in seen:
-            return sid
+    while current not in seen:
         seen.add(current)
+        path.append(current)
+        if current not in mapping:
+            break
         current = mapping[current]
-    return current
+    return tuple(path)
 
 
 def _spin_off_counts(
@@ -709,11 +711,12 @@ def _spin_off_counts(
     unvalued, late = spin_offs
     return {
         "n_spin_offs_unvalued": sum(
-            start < ex <= end and _held_before(book, _spin_off_parent(sid, mapping), ex)
+            start < ex <= end
+            and any(_held_before(book, parent, ex) for parent in _spin_off_path(sid, mapping))
             for sid, ex in unvalued.select("security_id", "ex_date").iter_rows()
         ),
         "n_late_spin_offs": sum(
-            _held_before(book, _spin_off_parent(sid, mapping), ex)
+            any(_held_before(book, parent, ex) for parent in _spin_off_path(sid, mapping))
             for sid, ex in late.select("security_id", "ex_date").iter_rows()
         ),
     }
@@ -725,9 +728,8 @@ def _spin_off_held_ids(
     """Include raw predecessor IDs for the late spin-off provider read."""
     mapping = dict(chains)
     held = set(ever_held)
-    return tuple(
-        sorted({*held, *(pred for pred in mapping if _spin_off_parent(pred, mapping) in held)})
-    )
+    predecessors = {pred for pred in mapping if held.intersection(_spin_off_path(pred, mapping))}
+    return tuple(sorted(held | predecessors))
 
 
 def _book_targets(
