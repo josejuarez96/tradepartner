@@ -35,7 +35,7 @@ Each entry is one `[[release]]` table. An example (the numbers are illustrative)
 name = "repair-13-tickers"
 stage = "before"
 made_at = 2026-10-10T14:05:00Z
-backup_path = "data/tradepartner.repair-13-tickers.duckdb"
+backup_path = "data/tradepartner.duckdb.bak-20261010-1405"
 store_max_ingested_at = 2026-10-09T05:48:12.523886Z
 data_vintage = 2026-10-09T05:48:12.523886Z
 cutoff = 2026-04-29T20:00:00Z
@@ -107,6 +107,8 @@ if [ -n "$BACKUP_WAL_COPY" ]; then cp "$BACKUP_WAL_COPY" data/tradepartner.duckd
 ```
 
 Use the printed WAL path even for an older backup named `<store>.wal.bak-YYYYMMDD-HHMM`. Before opening the restored store, compare the backup manifest's `wal_bytes` with the restored WAL's size (`stat -f %z data/tradepartner.duckdb.wal` on macOS). A numeric `wal_bytes` requires a WAL of that size; `null` requires no restored WAL. Stop on a mismatch.
+
+A legacy release copy with no manifest — the hand-made `data/tradepartner.<name>.duckdb` files, such as the back-fill's `tradepartner.pre-sweep-20261008.duckdb` below — has no `wal_bytes` to compare, so skip that check: confirm no `<copy>.wal` sits beside it, open the copy once read-only to confirm it opens, then restore the copy alone with the block above, with no WAL restored.
 
 Keep the backup itself and the failed-state copy. **A restore from a copy taken before `decision data-release open` removes that release's `before` row**, as well as all later rows; `decision data-release close` then refuses because no release is open. Record the rollback and the removed release ids on the release PR/issue. A retry is a new release with a new name. If the owner instead chooses to open and close a new release solely to record the rollback in the store, its `after` row enters `data_vintage` and stales affected trials; decide that explicitly before writing it. A full unwind also restores the paper-window state captured by the chosen backup, so verify that state before restarting any paper job.
 
