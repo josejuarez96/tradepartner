@@ -4,6 +4,8 @@ or deletes. Temp files only; no real store is touched."""
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -13,7 +15,7 @@ from typer.testing import CliRunner
 
 from tradepartner import cli
 from tradepartner.config import Settings
-from tradepartner.store import backup
+from tradepartner.store import backup, registry, schema
 from tradepartner.store.backup import BackupError, backup_store
 
 NOW = datetime(2026, 10, 20, 14, 5, 59, tzinfo=UTC)
@@ -49,9 +51,48 @@ def test_the_wal_is_copied_too(store: Path) -> None:
     wal = Path(f"{store}.wal")
     wal.write_bytes(b"log bytes")
     result = backup_store(Settings(), now=NOW, git_commit="c")
-    assert result.wal_copy_path == Path(f"{store}.wal.bak-20261020-1405")
+    assert result.wal_copy_path == Path(f"{result.copy_path}.wal")
     assert result.wal_copy_path.read_bytes() == b"log bytes"
     assert wal.read_bytes() == b"log bytes"
+
+
+def test_release_open_reads_rows_from_the_backups_wal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash leaves a real WAL; the release check must see its latest row."""
+    path = tmp_path / "release.duckdb"
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
+    monkeypatch.setenv("STORE__PATH", str(path))
+    conn = duckdb.connect(str(path))
+    schema.init_schema(conn)
+    conn.close()
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import duckdb, os, sys; "
+            "c = duckdb.connect(sys.argv[1]); "
+            "c.execute(\"INSERT INTO rates VALUES ('x', DATE '2026-10-20', 1.0, "
+            "DATE '2026-10-20', TIMESTAMPTZ '2026-10-20 12:00:00+00', "
+            "TIMESTAMPTZ '2026-10-20 13:00:00+00', 'test', 'release')\"); "
+            "os._exit(0)",
+            str(path),
+        ],
+        check=True,
+    )
+    assert Path(f"{path}.wal").is_file()
+    result = backup_store(Settings(), now=NOW, git_commit="c")
+    assert result.wal_copy_path == Path(f"{result.copy_path}.wal")
+    assert result.wal_copy_path.is_file()
+    live = duckdb.connect(str(path))
+    copied = registry.open_backup(result.copy_path, path)
+    try:
+        registry.open_data_release(
+            live, copied, name="wal-release", backup_path=str(result.copy_path), reason="test"
+        )
+    finally:
+        copied.close()
+        live.close()
 
 
 def test_refuses_when_another_connection_holds_the_store(store: Path) -> None:
