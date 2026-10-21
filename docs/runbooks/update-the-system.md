@@ -98,11 +98,12 @@ launchctl print gui/$(id -u)/com.tradepartner.ingest | grep "last exit code"
 launchctl print gui/$(id -u)/com.tradepartner.paper | grep "last exit code"
 ```
 
-(For a per-book job, use its own label from `$STORE_PATH.jobs`.) Both should say 0 (what other codes mean: [scheduling](scheduling.md), "What a `paper run` exit code means"). When you have finished, also delete `$STORE_PATH.jobs`. Delete the step 4 copy only after both runs finished `ok`, with its exact name (no wildcard, and never a release copy):
+(For a per-book job, use its own label from `$STORE_PATH.jobs`.) Both should say 0 (what other codes mean: [scheduling](scheduling.md), "What a `paper run` exit code means"). When you have finished, also delete `$STORE_PATH.jobs`. Delete the step 4 copy and either WAL name only after both runs finished `ok`, with the exact stamp (no wildcard, and never a release copy):
 
 ```bash
 rm "$STORE_PATH.bak-YYYYMMDD-HHMM" "$STORE_PATH.bak-YYYYMMDD-HHMM.manifest.json"
 [ -f "$STORE_PATH.bak-YYYYMMDD-HHMM.wal" ] && rm "$STORE_PATH.bak-YYYYMMDD-HHMM.wal"
+[ -f "$STORE_PATH.wal.bak-YYYYMMDD-HHMM" ] && rm "$STORE_PATH.wal.bak-YYYYMMDD-HHMM"
 ```
 
 (Run step 1's `STORE_PATH=` line first in a new Terminal window.)
@@ -138,19 +139,23 @@ ls -lt "$(dirname "$STORE_PATH")"
 
 Candidates, newest first: a `.bak-YYYYMMDD-HHMM` copy from Part 1, a copy retained for a data release ([data-releases](data-releases.md)), or a Time Machine copy. A `.bak-YYYYMMDD-HHMM` copy has a `.manifest.json` file naming the code it belongs to. If there is no copy at all, stop. Ask Claude before doing anything else. The damaged files you moved aside are the only data left.
 
-**4. Restore from your own copy.** The log file is the one trap. If a `.wal` from the damaged store stays next to the restored file, DuckDB replays it onto the copy. This block refuses to run until step 2 has moved both files away. Replace `YYYYMMDD-HHMM` with the copy's date and time, and run it in the same Terminal window as step 2:
+**4. Restore from your own copy.** The log file is the one trap. If a `.wal` from the damaged store stays next to the restored file, DuckDB replays it onto the copy. Copies made before the release-backup change keep their WAL at `$STORE_PATH.wal.bak-YYYYMMDD-HHMM`; newer ones use `$BAK.wal`. This block refuses to run until step 2 has moved both damaged files away. Replace `YYYYMMDD-HHMM` with the copy's date and time, and run it in the same Terminal window as step 2:
 
 ```bash
 STORE_PATH=$(uv run python -c "from tradepartner.config import get_settings; print(get_settings().store.path)")
 BAK="$STORE_PATH.bak-YYYYMMDD-HHMM"
 if [ -e "$STORE_PATH" ] || [ -e "$STORE_PATH.wal" ]; then echo "stop: do step 2 first"; else
   cp "$BAK" "$STORE_PATH"
-  [ -f "$BAK.wal" ] && cp "$BAK.wal" "$STORE_PATH.wal"
+  if [ -f "$BAK.wal" ]; then
+    cp "$BAK.wal" "$STORE_PATH.wal"
+  elif [ -f "$STORE_PATH.wal.bak-YYYYMMDD-HHMM" ]; then
+    cp "$STORE_PATH.wal.bak-YYYYMMDD-HHMM" "$STORE_PATH.wal"
+  fi
   cat "$BAK.manifest.json"
 fi
 ```
 
-The last line prints the manifest, which holds the commit (`git_commit`) the copy was taken under. If it differs from the commit you are on now (`git rev-parse HEAD`), and your update crossed a store-version change, check out that commit before any job loads, because newer code upgrades the store on its next write and the upgrade cannot be undone:
+Before opening the restored store, compare the manifest's `wal_bytes` with the restored `$STORE_PATH.wal` file size (`stat -f %z "$STORE_PATH.wal"` on macOS). If `wal_bytes` is a number, the WAL must exist and match that size; if it is `null`, no WAL should have been restored. Stop if either check fails. The manifest also holds the commit (`git_commit`) the copy was taken under. If it differs from the commit you are on now (`git rev-parse HEAD`), and your update crossed a store-version change, check out that commit before any job loads, because newer code upgrades the store on its next write and the upgrade cannot be undone:
 
 ```bash
 git checkout "$(uv run python -c 'import json,sys; print(json.load(open(sys.argv[1]))["git_commit"])' "$BAK.manifest.json")"

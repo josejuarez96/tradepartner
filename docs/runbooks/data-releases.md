@@ -89,7 +89,7 @@ Write the printed times into the entry with a `Z` in place of `+00:00`.
    ```bash
    uv run tradepartner store backup
    ```
-   Record the printed copy, log copy (if present) and manifest paths. The command refuses an existing target or a busy store and verifies each copy byte for byte. If the UTC minute's name already exists, wait for the next minute and rerun. Never overwrite an existing backup: it may be the only copy of a state a trial read.
+   Record the printed copy, log copy (if present) and manifest paths. Open any backup only read-only: opening it for writing may checkpoint its WAL and change the backup. The command refuses an existing target or a busy store and verifies each copy byte for byte. If the UTC minute's name already exists, wait for the next minute and rerun. Never overwrite an existing backup: it may be the only copy of a state a trial read.
 4. **Write the `before` entry.** Use the printed copy path as `backup_path` (and as `--backup` for `decision data-release open`). Run the "Read the two numbers" command on the live store, at the close of `sessions_to`, and append the entry.
 5. **Run the repair.** Every command in the batch, back to back. Dry runs first where the command has one.
 6. **Check it.** `uv run tradepartner health --check` exits 0, and the checks the release's issue names pass.
@@ -105,6 +105,8 @@ rm -f data/tradepartner.duckdb.wal   # else DuckDB replays the failed repair ont
 cp "$BACKUP_COPY" data/tradepartner.duckdb
 if [ -n "$BACKUP_WAL_COPY" ]; then cp "$BACKUP_WAL_COPY" data/tradepartner.duckdb.wal; fi
 ```
+
+Use the printed WAL path even for an older backup named `<store>.wal.bak-YYYYMMDD-HHMM`. Before opening the restored store, compare the backup manifest's `wal_bytes` with the restored WAL's size (`stat -f %z data/tradepartner.duckdb.wal` on macOS). A numeric `wal_bytes` requires a WAL of that size; `null` requires no restored WAL. Stop on a mismatch.
 
 Keep the backup itself and the failed-state copy. **A restore from a copy taken before `decision data-release open` removes that release's `before` row**, as well as all later rows; `decision data-release close` then refuses because no release is open. Record the rollback and the removed release ids on the release PR/issue. A retry is a new release with a new name. If the owner instead chooses to open and close a new release solely to record the rollback in the store, its `after` row enters `data_vintage` and stales affected trials; decide that explicitly before writing it. A full unwind also restores the paper-window state captured by the chosen backup, so verify that state before restarting any paper job.
 
