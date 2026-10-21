@@ -80,7 +80,9 @@ as_of`:
   `execution.window` convention). There is no lower ex-date bound: a spin-off's
   row is stamped on the close after Alpaca's date-only `process_date`, so it can
   arrive weeks after the ex-date and a later `ok` reconciliation must not hide
-  it. A child the broker books is journaled a `spinoff_receipt`; a row known
+  it. An offered child is mapped like a journal name, and to `X.WI` when the
+  broker holds only that when-issued form of its ticker `X` (#2112). A child the
+  broker books is journaled a `spinoff_receipt`; a row known
   only after close(S-1), a wrong ratio, a child for a parent the ledger never
   held, or a parent moved since the ex-date stays an `unknown_symbol` or
   `broker_only_position` mismatch (never a guess).
@@ -147,6 +149,7 @@ import duckdb
 import polars as pl
 from pydantic import ValidationError
 
+from tradepartner.adapters.alpaca_prices import WHEN_ISSUED_SUFFIX
 from tradepartner.adapters.broker import Account, Broker, Order, Position, UnknownOrderError
 from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings, render_validation_errors
@@ -408,6 +411,8 @@ def _symbols(
     broker_symbols: Collection[str],
     class_symbols: Mapping[str, str] | None,
     changes: Mapping[str, Sequence[tuple[str, str]]],
+    *,
+    when_issued: Collection[str] = frozenset(),
 ) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
     """`security_id` to broker symbol, one name per symbol, and the ticker
     changes applied to it (module docstring). A listing's ticker is read in its
@@ -415,7 +420,10 @@ def _symbols(
     `GEF-B` listing. A held name whose stored change (at close(S-1)) puts it
     under a new symbol the broker holds maps to that symbol (#1761), so the
     ledger's old-symbol position matches, and the applied changes come back for
-    the row's record."""
+    the row's record. A name in `when_issued` (an offered spin-off child, #2112)
+    whose symbol `X` the broker does not hold, while it holds `X.WI`, maps to
+    `X.WI`: the broker can book a new child under its when-issued symbol before
+    it trades regular-way. Any other `.WI` symbol stays unmapped."""
     claims: dict[str, list[str]] = defaultdict(list)
     applied: dict[str, tuple[str, str]] = {}
     for name in sorted(set(names)):
@@ -431,6 +439,13 @@ def _symbols(
         if change is not None:
             applied[name] = change
             symbol = change[1]
+        if (
+            symbol is not None
+            and name in when_issued
+            and symbol not in broker_symbols
+            and symbol + WHEN_ISSUED_SUFFIX in broker_symbols
+        ):
+            symbol += WHEN_ISSUED_SUFFIX
         if symbol is not None:
             claims[symbol].append(name)
     symbols: dict[str, str] = {}
@@ -670,10 +685,13 @@ def _explanations(
         merger_lag_sessions,
         cash_tolerance,
     )
+    spinoffs = _spinoffs(state, actions, window, session, tolerance, through)
     # The acquirers join the mapped names before the map is built (#1762 item
     # 1), so a symbol an acquirer shares with its acquiree is resolved by
-    # `_symbols`' one-name-per-symbol rule, never a crash.
-    mapped = names | acquirers
+    # `_symbols`' one-name-per-symbol rule, never a crash. So do the offered
+    # spin-off children (#2112), each of which may map to its when-issued
+    # broker symbol.
+    mapped = names | acquirers | set(spinoffs)
     symbols, symbol_changes = _symbols(
         mapped,
         order_symbols,
@@ -681,6 +699,7 @@ def _explanations(
         broker_symbols,
         settings.alpaca.class_symbols,
         _symbol_change_candidates(conn, cut, mapped),
+        when_issued=frozenset(spinoffs),
     )
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))
@@ -697,7 +716,7 @@ def _explanations(
     return Explanations(
         symbols=symbols,
         ended=ended,
-        spinoffs=_spinoffs(state, actions, window, session, tolerance, through),
+        spinoffs=spinoffs,
         dividends=dividends,
         dividend_findings=findings,
         reference_prices=_reference_prices(conn, cut, priced, previous_session(session)),

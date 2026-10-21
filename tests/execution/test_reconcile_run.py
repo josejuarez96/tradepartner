@@ -619,6 +619,147 @@ def test_a_spinoff_known_only_after_the_cutoff_still_halts(
     assert _adjustments(journal_settings, open_window) == []
 
 
+# --- a when-issued spin-off child at the broker (#2112) ------------------------
+
+#: The broker form of a when-issued child (Alpaca's `spin_offs.new_symbol`).
+MTUM_WI = "MTUM.WI"
+S3 = next_session(S2)  # a Monday: S2 is Friday 2026-10-02
+
+
+def test_explanations_map_an_offered_child_to_its_when_issued_broker_symbol(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2112: the offered child `MTUM` maps to `MTUM.WI` only while the broker
+    holds the when-issued symbol and not the regular-way one."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _spinoff(journal_settings, MTUM, SPY, 0.4, STAMP, ex_date=EX)
+
+    def symbols(broker: tuple[str, ...]) -> dict[str, str]:
+        with open_read_only(journal_settings) as conn:
+            return dict(
+                explanations_as_of(
+                    conn,
+                    open_window,
+                    S2,
+                    as_of=fixed_clock.advance(),
+                    settings=journal_settings,
+                    broker_symbols=broker,
+                    quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+                ).symbols
+            )
+
+    assert symbols(("SPY", MTUM_WI)) == {SPY: "SPY", MTUM: MTUM_WI}
+    assert symbols(("SPY", "MTUM", MTUM_WI)) == {SPY: "SPY", MTUM: "MTUM"}
+    assert symbols(("SPY",)) == {SPY: "SPY", MTUM: "MTUM"}
+
+
+def test_a_when_issued_spinoff_child_is_allowed_then_journaled_once_regular_way(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2112: 10 `SPY` held and a 0.4 `MTUM`/`SPY` row known at close(S2-1), so
+    10 x 0.4 = 4.0 children are due. While the broker holds them as `MTUM.WI`
+    the reconciliation is `ok`, journals nothing and lists the 4.0 as allowed
+    (no ledger position on a symbol no order can trade). Once the broker holds
+    4.0 `MTUM` regular-way, one `spinoff_receipt` of 4.0 is journaled, no cash."""
+    fake.activities = [FUNDING]
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _spinoff(journal_settings, MTUM, SPY, 0.4, STAMP, ex_date=EX)
+    fake.extra_quantity = {MTUM_WI: 4.0}
+    fixed_clock.advance(days=1)
+
+    first = _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+
+    assert first.status == OK
+    assert _adjustments(journal_settings, open_window) == []
+    listed = json.loads(_rows(journal_settings, open_window)[-1].mismatches_json or "")
+    assert listed["allowed"] == [
+        {"reason": "when-issued spin-off child", "difference": 4.0, "security_id": MTUM}
+    ]
+    assert listed["explained"] == []
+
+    fake.extra_quantity = {"MTUM": 4.0}
+    fixed_clock.advance(days=3)  # Monday
+
+    second = _reconcile(journal_settings, fake, open_window, fixed_clock, session=S3)
+
+    assert second.status == OK
+    assert second.broker_cash == pytest.approx(100_000.0 - 10.0 * PRICE)
+    (adjustment,) = _adjustments(journal_settings, open_window)
+    assert (adjustment.kind, adjustment.security_id, adjustment.quantity, adjustment.cash) == (
+        "spinoff_receipt",
+        MTUM,
+        4.0,
+        None,
+    )
+
+
+def test_a_when_issued_child_known_only_after_the_cutoff_still_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2112 (no look-ahead): a `spinoff` row known only at close(S2) is not
+    read at S2's cutoff, close(S2-1), so nothing offers `MTUM` and the broker's
+    `MTUM.WI` maps to no name: `unknown_symbol`, nothing journaled."""
+    fake.activities = [FUNDING]
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _spinoff(journal_settings, MTUM, SPY, 0.4, session_close(S2), ex_date=EX)
+    fake.extra_quantity = {MTUM_WI: 4.0}
+    fixed_clock.advance(days=1)
+
+    with pytest.raises(ReconciliationError, match="unknown_symbol"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_a_when_issued_child_of_a_parent_not_held_still_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2112: a row whose parent the ledger never held is not offered, so the
+    broker's `MTUM.WI` maps to no name and halts as `unknown_symbol`."""
+    fake.activities = [FUNDING]
+    _spinoff(journal_settings, MTUM, SPY, 0.4, STAMP, ex_date=EX)
+    fake.extra_quantity = {MTUM_WI: 4.0}
+    fixed_clock.advance(days=1)
+
+    with pytest.raises(ReconciliationError, match="unknown_symbol"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_a_when_issued_child_at_a_wrong_ratio_still_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2112: 10 `SPY` at a stored 0.25 is 2.5 children due, the broker's
+    `MTUM.WI` is 4.0: the symbol maps, the quantity is outside the due band, so
+    it halts as `broker_only_position`, never allowed."""
+    fake.activities = [FUNDING]
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _spinoff(journal_settings, MTUM, SPY, 0.25, STAMP, ex_date=EX)
+    fake.extra_quantity = {MTUM_WI: 4.0}
+    fixed_clock.advance(days=1)
+
+    with pytest.raises(ReconciliationError, match="broker_only_position"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+
+    assert _adjustments(journal_settings, open_window) == []
+
+
 def test_a_broker_symbol_the_journal_never_held_maps_through_its_listing(
     journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
 ) -> None:

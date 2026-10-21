@@ -13,7 +13,7 @@ import polars as pl
 import pytest
 
 from execution.test_run_stop import MAY_3, buy_id, request_stop, sell_id
-from execution.test_run_trade import F_0, T_0, Env, at, bought
+from execution.test_run_trade import F_0, F_0_PLUS_1, T_0, Env, at, bought
 from execution.test_run_trade import _no_env_file as _no_env_file  # autouse
 from execution.test_run_trade import env as env
 from execution.test_run_trade import window as window
@@ -239,3 +239,90 @@ def test_a_fill_without_a_reference_is_reported_as_unjudged() -> None:
     band = _band({"SEC_A": 100.0})
     assert not _unpriced(_ordered(100.0), band)
     assert _unpriced(_ordered(100.0, "SEC_B"), band)
+
+
+# --- a spin-off of the filled name (#2112) -------------------------------------
+
+
+def _spun(ex: date, parent: str = "SEC_A") -> pl.DataFrame:
+    """A 0.5 `spinoff` row of child `SEC_C` from `parent`, ex-date `ex`, in the
+    store's convention (child in `security_id`, parent in `source_action_id`),
+    as the caller's `live_actions_as_of(close(S-1))` frame holds it."""
+    return pl.DataFrame(
+        {
+            "security_id": ["SEC_C"],
+            "action_type": ["spinoff"],
+            "ex_date": [ex],
+            "ratio_or_amount": [0.5],
+            "source_action_id": [parent],
+        }
+    )
+
+
+def test_a_fill_on_its_parents_spinoff_ex_date_is_judged_on_the_high_side_only() -> None:
+    """#2112: the reference is close(S-1) = 100, before the distribution; a fill
+    on the ex-date S is after it, lower by the child's value the band does not
+    know. 0.5 children at 80 each take 40 off: a fill at 60 is below the 75 low
+    bound but passes; the 125 high bound still holds (125.01 halts)."""
+    band = _band({"SEC_A": 100.0}, _spun(F_0), session=F_0)
+    assert fill_band_violations([_ordered(60.0), _ordered(125.0)], band) == ()
+    assert fill_band_violations([_ordered(60.0, order_session=F_0)], band) == ()
+    assert len(fill_band_violations([_ordered(125.01)], band)) == 1
+    assert len(fill_band_violations([_ordered(0.0)], band)) == 1  # never non-positive
+    assert len(fill_band_violations([_ordered(float("nan"))], band)) == 1
+
+
+def test_a_late_fill_from_before_the_ex_date_is_judged_on_the_low_side_only() -> None:
+    """#2112: an order of T_0 filled before the F_0 ex-date at 100 is collected
+    on F_0 + 1, whose reference is close(F_0) = 60, after the distribution: 100
+    is above its 75 high bound but passes; the 45 low bound still holds."""
+    band = _band({"SEC_A": 60.0}, _spun(F_0), session=F_0_PLUS_1)
+    assert fill_band_violations([_ordered(100.0, order_session=T_0)], band) == ()
+    assert len(fill_band_violations([_ordered(44.99, order_session=T_0)], band)) == 1
+    # An order of the ex-date itself is ex-distribution, like its reference.
+    assert len(fill_band_violations([_ordered(100.0, order_session=F_0)], band)) == 1
+
+
+def test_a_spinoff_moves_only_its_parents_band_and_only_across_its_ex_date() -> None:
+    """#2112: the child's own fill, another parent's spin-off, and a spin-off
+    whose ex-date is not between the reference and the fill leave the band
+    two-sided (a 60 fill against 100 still halts)."""
+    for actions, session, security in (
+        (_spun(F_0, parent="SEC_B"), F_0, "SEC_A"),  # another name's spin-off
+        (_spun(T_0), F_0, "SEC_A"),  # ex-date already inside close(S-1)
+        (_spun(F_0_PLUS_1), F_0, "SEC_A"),  # ex-date after the fill
+        (_spun(F_0), F_0, "SEC_C"),  # the child
+    ):
+        band = _band({"SEC_A": 100.0, "SEC_C": 100.0}, actions, session=session)
+        assert len(fill_band_violations([_ordered(60.0, security)], band)) == 1
+
+
+def test_a_spinoff_not_yet_known_leaves_the_band_two_sided() -> None:
+    """#2112 (no look-ahead): the band reads only the caller's frame of actions
+    known at close(S-1). A spin-off stored later is not in it, so the ex-date
+    fill at 60 against 100 still halts, as before this change."""
+    assert len(fill_band_violations([_ordered(60.0)], _band({"SEC_A": 100.0}))) == 1
+
+
+def test_a_one_sided_judgement_is_noted_for_the_owner() -> None:
+    from tradepartner.execution.collect import Collected, _one_sided, note_unjudged
+
+    band = _band({"SEC_A": 100.0}, _spun(F_0), session=F_0)
+    assert _one_sided(_ordered(60.0), band)
+    assert not _one_sided(_ordered(60.0), _band({"SEC_A": 100.0}))
+    notes: list[str] = []
+    note_unjudged(
+        Collected(
+            since=None,
+            collected_through=datetime(2019, 5, 1, 14, tzinfo=UTC),
+            fills_journaled=(),
+            superseded=(),
+            foreign_fill_ids=(),
+            readings=(),
+            rejections=(),
+            written_off=(),
+            one_sided=("tp-a", "tp-a"),
+        ),
+        notes,
+    )
+    assert notes == ["fill-price band: one side only (a spin-off ex-date) for tp-a"]

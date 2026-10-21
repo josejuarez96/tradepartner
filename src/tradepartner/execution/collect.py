@@ -74,7 +74,8 @@ path's read, `paper resume`'s settlement). In order:
 5. **The fill-price band** (#1981; with `price_band` given, a run's collectors), after
    the collection has committed: every fill this call journaled must sit within
    `paper.max_fill_price_deviation` of its order's reference price (the split-adjusted
-   close of S-1, moved back to the order's session for a late fill). A fill outside it,
+   close of S-1, moved back to the order's session for a late fill; judged on one side
+   only across a spin-off ex-date of the filled name, #2112). A fill outside it,
    raises `SystemFaultError` naming
    `fill_price_outside_band` (a rejection verdict of the call is named in the message),
    so the caller halts. The journal and the broker agree on a bad fill, so no
@@ -129,7 +130,7 @@ import duckdb
 import polars as pl
 
 from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Fill, Order
-from tradepartner.calendar import all_sessions, is_session
+from tradepartner.calendar import all_sessions, is_session, previous_session
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, RejectionCapError, SystemFaultError
 from tradepartner.execution.plan import decision_state
@@ -170,6 +171,7 @@ _BUY = "buy"
 _WRITTEN_OFF = "written_off"
 _UNFUNDED = "unfunded"
 _SPLIT = "split"
+_SPINOFF = "spinoff"
 _FILL_BAND_FAULT = "fill_price_outside_band"
 _BROKER_FEED = "broker_feed"
 _BROKER_STATUS = "broker_status"
@@ -254,6 +256,9 @@ class Collected:
     written_off: tuple[int, ...]
     #: `client_order_id`s of fills the price band could not judge (no reference price).
     unjudged: tuple[str, ...] = ()
+    #: `client_order_id`s of fills the band judged on one side only, across a
+    #: spin-off ex-date of the filled name (#2112).
+    one_sided: tuple[str, ...] = ()
 
     @property
     def lagging(self) -> tuple[OrderReading, ...]:
@@ -262,10 +267,16 @@ class Collected:
 
 
 def note_unjudged(collected: Collected, notes: list[str]) -> None:
-    """Record fills whose reference price was unavailable to the band."""
+    """Record fills whose reference price was unavailable to the band, and those
+    it judged on one side only (#2112)."""
     if collected.unjudged:
         notes.append(
             "fill-price band: no reference price for " + ", ".join(sorted(set(collected.unjudged)))
+        )
+    if collected.one_sided:
+        notes.append(
+            "fill-price band: one side only (a spin-off ex-date) for "
+            + ", ".join(sorted(set(collected.one_sided)))
         )
 
 
@@ -376,8 +387,9 @@ def collect(
             raise RejectionCapError("; ".join(b.message for b in rejections)) from exc
 
     unjudged: tuple[str, ...] = ()
+    one_sided: tuple[str, ...] = ()
     if price_band is not None:
-        unjudged = _judge_fill_band(connect, orders, journaled, price_band, rejections)
+        unjudged, one_sided = _judge_fill_band(connect, orders, journaled, price_band, rejections)
 
     return Collected(
         since=since,
@@ -389,6 +401,7 @@ def collect(
         rejections=rejections,
         written_off=written_off,
         unjudged=unjudged,
+        one_sided=one_sided,
     )
 
 
@@ -398,14 +411,15 @@ def _judge_fill_band(
     journaled: Sequence[str],
     band: PriceBand,
     rejections: Sequence[RejectionBreach],
-) -> tuple[str, ...]:
-    """Return the ids of the fills the band could not price (a note for the caller);
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return the ids of the fills the band could not price and of those it judged
+    on one side only (#2112; notes for the caller);
     raise `SystemFaultError` naming `fill_price_outside_band` for a fill this
     collection journaled outside the band (#1981). It runs after the collection has
     committed, so the fill is journaled as the broker holds it; a rejection verdict
     of the same collection is named in the message, never dropped."""
     if not journaled:
-        return ()
+        return (), ()
     new = set(journaled)
     with connect() as conn:
         fills = [
@@ -417,7 +431,10 @@ def _judge_fill_band(
     if found:
         verdicts = [b.message for b in rejections]
         raise SystemFaultError("; ".join([_FILL_BAND_FAULT + ": " + "; ".join(found), *verdicts]))
-    return tuple(f.fill.client_order_id for f in fills if _unpriced(f, band))
+    return (
+        tuple(f.fill.client_order_id for f in fills if _unpriced(f, band)),
+        tuple(f.fill.client_order_id for f in fills if _one_sided(f, band)),
+    )
 
 
 def _refuse_shapes(readings: Iterable[Order]) -> None:
@@ -636,7 +653,9 @@ def fill_band_violations(fills: Iterable[OrderedFill], band: PriceBand) -> tuple
     inclusive. A non-finite fill price is a violation. A fill of a name with no
     usable reference (`price_of` raises, as for an exit of an unpriced name, #569, or
     a held name outside the pending rebalance) is not judged: there is nothing to
-    compare it with, and halting every such exit would stop the book. Each message names the
+    compare it with, and halting every such exit would stop the book. A fill across a
+    spin-off ex-date of its own name is judged on one side only (`_spinoff_sides`,
+    #2112), and its price must still be positive. Each message names the
     order, the security, the fill price, the reference and the deviation."""
     out = []
     for item in fills:
@@ -646,10 +665,10 @@ def fill_band_violations(fills: Iterable[OrderedFill], band: PriceBand) -> tuple
         if ref is None:
             continue  # a name with no reference (an exit of an unpriced name) is not judged
         price = fill.price
-        if not (
-            math.isfinite(price)
-            and ref * (1 - band.deviation) <= price <= ref * (1 + band.deviation)
-        ):
+        low_side, high_side = _spinoff_sides(item, band)
+        low = ref * (1 - band.deviation) if low_side else 0.0
+        high = ref * (1 + band.deviation) if high_side else math.inf
+        if not (math.isfinite(price) and price > 0 and low <= price <= high):
             out.append(
                 f"{who}: fill price {price} is outside {band.deviation:.0%} of the "
                 f"reference price {ref}"
@@ -670,6 +689,39 @@ def _reference(item: OrderedFill, band: PriceBand) -> float | None:
 
 def _unpriced(item: OrderedFill, band: PriceBand) -> bool:
     return _reference(item, band) is None
+
+
+def _one_sided(item: OrderedFill, band: PriceBand) -> bool:
+    """Whether the band judged a priced fill on one side only (#2112)."""
+    return _reference(item, band) is not None and _spinoff_sides(item, band) != (True, True)
+
+
+def _spinoff_sides(item: OrderedFill, band: PriceBand) -> tuple[bool, bool]:
+    """(low side applies, high side applies) for a fill (#2112).
+
+    A spin-off of the filled name (a `spinoff` row in `band.actions_as_of`, the
+    actions known at close(S-1), whose `source_action_id` is the name) takes the
+    child's value off its price from the ex-date E on, and the band has no child
+    price. The reference is the close of R = `previous_session(band.session)`; the
+    fill is priced in the order's session O (`band.session` when it has none).
+    For E in (R, O] the fill is ex-distribution and the reference is not, so only
+    the high side applies; for E in (O, R] the reverse, so only the low side
+    applies. A spin-off with E outside both leaves the band two-sided."""
+    actions = band.actions_as_of
+    if "source_action_id" not in actions.columns:
+        return True, True
+    reference = previous_session(band.session)
+    filled = item.order_session if item.order_session is not None else band.session
+    low_side = high_side = True
+    for row in actions.iter_rows(named=True):
+        if row["action_type"] != _SPINOFF or row["source_action_id"] != item.security_id:
+            continue
+        ex_date = row["ex_date"]
+        if reference < ex_date <= filled:
+            low_side = False
+        if filled < ex_date <= reference:
+            high_side = False
+    return low_side, high_side
 
 
 def _split_factor(
