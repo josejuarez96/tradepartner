@@ -78,7 +78,9 @@ only if it changes what an as-of read returns:
   event, found across ex-dates. An id-less re-date (one stored key of a
   security and type gone from the window, one new key in it) and an id-less
   key gaining an id are each written as a cancel of the old key plus the new
-  row, both at `ingested_at`. A key merely absent is never cancelled.
+  row, both at `ingested_at`. A key merely absent is never cancelled; the
+  owner withdraws one with `action-retract` (#2092), and a later run never
+  revives it with the same values (`_add_actions`).
 - *Filed* rows (master, delistings, classifications, facts: `known_at` is a
   filing acceptance or fetch time) keep their `known_at` only when it is
   later than every stored row of their key and changes the view. Stored
@@ -318,6 +320,9 @@ from tradepartner.universe import SHARES_FACT, member_links_title
 OK, STALE, FAILED, LOCKED = "ok", "stale", "failed", "locked"
 ACTIONS_FILLED = "filled"
 ACTIONS_MODE = "actions"  # the actions backfill's run rows (#1676)
+#: The run rows of `tradepartner action-retract` (#2092): a cancel stamped at
+#: such a run's `started_at` is the owner's, and `_add_actions` keeps it.
+ACTION_RETRACT_MODE = "action_retract"
 MODE = "session"
 #: The price side's `ingestion_runs.source`. Its `MODE` runs alone count as
 #: the paper run's fresh prices (staleness and the clock floor, #1440 Q3).
@@ -3542,6 +3547,25 @@ def _stored_actions(
     return history
 
 
+def _owner_withdrawals(conn: duckdb.DuckDBPyConnection) -> set[datetime]:
+    """The `started_at` of every `action-retract` run (#2092): the
+    `ingested_at` of each cancel or reinstatement the owner wrote."""
+    rows = conn.execute(
+        "SELECT started_at FROM ingestion_runs WHERE mode = ?", [ACTION_RETRACT_MODE]
+    ).fetchall()
+    return {started for (started,) in rows}
+
+
+def _kept_withdrawal(row: Row, latest: Row, withdrawn: set[datetime]) -> bool:
+    """Whether live `row` only repeats `latest`, an owner's cancel (#2092)."""
+    return (
+        bool(latest["cancelled"])
+        and not row["cancelled"]
+        and latest["ingested_at"] in withdrawn
+        and _same_action({**row, "cancelled": True}, latest)
+    )
+
+
 def _cancel(latest: Row, ingested_at: datetime) -> Row:
     if ingested_at <= latest["known_at"]:
         raise ValueError(f"cancel at {ingested_at.isoformat()} would be back-dated")
@@ -3640,6 +3664,10 @@ def _add_actions(
     contract requires. A stored key that is only absent stays live: absence
     is not a withdrawal. An id-less key re-dated out of `window` is not
     seen, so both keys stay live; sources with ids (Alpaca) avoid that.
+    A live record of an identity whose latest stored revision is a cancel
+    an `action-retract` run wrote, with that cancel's type, ex-date and
+    ratio, is not written and is counted `actions_retracted_kept` (#2092):
+    the owner's withdrawal stands until the source changes the event.
     """
     groups: dict[_Identity, list[tuple[datetime, Row]]] = defaultdict(list)
     for action in actions:
@@ -3698,8 +3726,13 @@ def _add_actions(
     cancelled: set[tuple[str, str]] = set()
     retired: set[_Identity] = set()
     first_seen: list[Row] = []
+    withdrawn = _owner_withdrawals(conn)
     for identity, row in incoming.items():
         past = history.get(identity)
+        if past and _kept_withdrawal(row, past[-1], withdrawn):
+            if stats is not None:
+                stats["actions_retracted_kept"] = stats.get("actions_retracted_kept", 0) + 1
+            continue
         if past:
             revision = _current(row, past, ingested_at, _same_action)
             new_rows += revision
