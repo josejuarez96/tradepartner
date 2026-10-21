@@ -48,7 +48,8 @@ No other value is a counted trial. Variants (i) (`week_end` with the `offset` an
 later sweep on the owner's word. `strategy.turnover_top_fraction` has no
 `lab.axis_lattice` entry, so no continuous axis is implied.
 
-1 × 2 = **2 variants** in **1 read group** (one cadence), far under
+1 × 2 = **2 variants** in **2 read groups** (`strategy.turnover_top_fraction` is not a
+read-group-free key), far under
 `lab.max_variants_per_sweep` (100).
 
 ## Parameters
@@ -130,7 +131,8 @@ Where each value comes from:
 - `[grid] "strategy.turnover_top_fraction" = [0.20, 1.0]`: B10 and the control (ii), the
   owner's B10-5. Both values validate (`gt=0, le=1`) and are distinct. At 1.0 the key is
   left out of the canonical set (`POST_REGISTRATION_OWN_KEYS`), so the control's
-  fingerprint is the plain one-month sort's; no registration holds it.
+  fingerprint is the plain one-month sort's; if any registration already holds it,
+  `sweep register` refuses the file (refusal 1(b)).
 - `[lab] expected_excess_cagr_spy_pp = -1.0` and `expected_range_pp = [-6.0, 3.0]`: the
   hypothesis file's "Expected magnitudes": the net prior over SPY is "centred at about
   −1 pp/yr, plausible range −6 to +3 pp/yr". One prior covers both variants: the
@@ -143,9 +145,11 @@ Where each value comes from:
   lowest the parser accepts, and the `dsr_excess` half of the file's retirement rule.
 
 Owner answers that set these values, one line each:
-- B10-1 (a): `momentum` by amendment, one key (#1358; backtest spec amendment #1358).
+- B10-1 (a): `momentum` by amendment, one key (backtest spec amendment #1358).
 - B10-2 (a): formation-month share volume over shares outstanding known at `t`,
   split-adjusted (built in T165b and T165c).
+- B10-3: `turnover_top_fraction = 0.20` and `top_fraction = 0.20`, about 40 names.
+- B10-4: `month_end` first; `week_end` is variant (i), not in this grid.
 - B10-5: the file plus the three pre-declared variants; the control (ii) runs in this
   sweep beside B10.
 - 2026-10-20: "Yes draft the b10 sweep".
@@ -160,9 +164,10 @@ Owner answers that set these values, one line each:
   prior sits at or below B10's, inside the same range. Both variants inside the range is
   the expected outcome; over 40 monthly returns at about 10 %/yr tracking error, one
   outside it would not be surprising.
-- **The sign reading** (pre-declared, a diagnostic, never a selection): same sign, the
-  screen adds nothing; B10 above zero and the control below, SH-9's turnover mechanism is
-  visible in our data; both negative, SH-1's null covers both.
+- **The sign reading** (pre-declared): same sign, the screen adds nothing; B10 above zero
+  and the control below, SH-9's turnover mechanism is visible in our data; both negative,
+  SH-1's null covers both. It selects nothing for promotion; it is one of rung 4's kill
+  criteria (see "Retirement condition").
 - **Turnover and cost.** One-sided `turnover_monthly` about 85 to 95 % for B10; cost drag
   at 15 bp about 3 to 3.5 pp/yr, at the 100 bp rung about 20 to 23 pp/yr. The control's
   book (about 200 names) should turn over somewhat less. A `cost_drag` far from
@@ -191,7 +196,8 @@ Owner answers that set these values, one line each:
 The `momentum` family's N before this sweep is **11** as the buy/hold sweep counted it
 ([momentum-hold-top-fraction](momentum-hold-top-fraction.md), "Power arithmetic"), **12**
 once that sweep's one variant has run `ok`. After this sweep, with both variants `ok`,
-**N = 13 or 14**. V is the family's, read at registration, floored at
+**N = 13 or 14**. B10's later rung-4 runs (a delayed sibling file, if any) and rung-5
+placebos are `trials` rows in `momentum`'s N too (ADR 0023), so N rises further. V is the family's, read at registration, floored at
 `lab.min_sharpe_variance_annual` (0.04). At N = 14 the expected maximum Sharpe of a null
 grid is about `√V · ((1 − γ)·Φ⁻¹(1 − 1/N) + γ·Φ⁻¹(1 − 1/(N·e)))` ≈ **1.74 · √V** (1.70 at
 N = 13): about **0.35** annual at the V floor, more if the family's spread is wider.
@@ -227,7 +233,16 @@ Results already seen before registration:
 8. **Kill-ladder rung 1 for B10** (ADR 0023): the daily book's per-fill slippage
    (`paper report`, T203), read before this sweep runs; the sweep runs only if rung 1
    passes. It is a cost measurement, not a return.
-9. **General knowledge**: the hypothesis file's paragraph applies unchanged.
+9. **Kill-ladder rungs 2 and 3 for B10** (the long leg's sign and size in open data;
+   capacity): read-only arithmetic that the plan runs during the wait for rung 1. None had
+   been read when this file was drafted; any note written before registration is listed
+   here by issue before the owner registers.
+10. **Ladder ledger disclosure (rule L3).** The
+   [ladder ledger](../research/hypothesis-backlog.md#ladder-ledger) has no row for B10's
+   mechanism (its rows are B9, IRRX, Q1 and L-1). IRRX's row records a related look: the
+   plain one-month reversal proxy (two looks, rung 2 INSUFFICIENT, parked), which is the
+   control's signal read the other way. No batch denominator applies to B10.
+11. **General knowledge**: the hypothesis file's paragraph applies unchanged.
 
 **Not seen:** no TradePartner trial with a turnover screen, and no one-month momentum
 trial of any kind, exists on any store. Every grid and `[lab]` value was fixed before any
@@ -239,11 +254,40 @@ The reading is the hypothesis file's, applied per variant: the first `ok`, non-s
 in-sample trial of each variant over the full default window [2020-08-31, 2023-12-29]
 that passed `quant-auditor`, read at its base level.
 
-The sweep retires (`tradepartner sweep retire b10-short-term-momentum --reason ...`) and
-promotes nothing when its argmax, the variant with the higher base-level
-`excess_cagr_spy`, is below **−1 pp/yr** (`retire_below = -0.01`), the hypothesis file's
-line. A variant promotes only through `sweep promote` and its rules (spec req 4): it must
-be the argmax and reach `promote_at_least` against the family's mark, which the power
-arithmetic above says no plausible result does. The sweep also promotes nothing while a
-variant is `red_flag`ged, until the audit that flag opens has cleared it. The control is
-never promoted to the hypothesis file: it is not B10.
+**The sweep** retires (`tradepartner sweep retire b10-short-term-momentum --reason ...`)
+and promotes nothing when its argmax, the variant with the higher base-level
+`excess_cagr_spy`, is below **−1 pp/yr** (`retire_below = -0.01`). **B10 itself** (the
+0.20 variant) retires on its own reading, whatever the control does: base-level
+`excess_cagr_spy` below −1 pp/yr **and** `dsr_excess` below 0.5, the hypothesis file's
+rule. The control retires nothing but the sweep: it is not B10, and it is never promoted
+to the hypothesis file.
+
+**Kill-ladder rung 4** (ADR 0023; backtest plan T165e). This sweep is B10's rung 4, run
+only if rung 1 passed. The plan line's kill criteria, stated before any run: B10 is
+**killed** if, at the harsh settings, its net excess CAGR over SPY is below 0 **or** its
+`dsr_excess` is below 0.5, **or** if the 0.20 variant does not beat its control by the
+pre-declared sign test. What this file supplies and what it does not:
+- **Cost doubled to 30 bp per side**: supplied. It is the first level of
+  `sensitivity_per_side_bps`, printed in each variant's own trial rows; rung 4 reads the
+  0.20 variant's net excess at that level.
+- **A one-session delay** (`strategy.signal_delay_sessions = 1`): not supplied. The key
+  is not in `momentum`'s `sweepable_keys`, and a fixed value here would make B10's frozen
+  set differ from the hypothesis file's. It needs a separate counted registration (a
+  sibling sweep file whose fixed block sets it), drafted only on the owner's word.
+- **Open fills** (`execution.fill_price = open`): not available in `momentum`.
+  `execution.` is a forbidden prefix whose value must equal the family rules (`close`),
+  so no `momentum` file can register it.
+- **"Beats its control"**: the definition of the sign test is the owner's, settled before
+  registration and written here then (PR #2108, open question 5). Until it is, this file
+  is not ready to register.
+
+By this file's power arithmetic, `dsr_excess` ≥ 0.5 is reachable only above about
++3.5 pp/yr, a red-flagged result: **rung 4 as written kills every outcome that is not
+red-flagged first.** The owner sees that before registering.
+
+**Promotion and the paper book.** A variant promotes only through `sweep promote` and its
+rules (spec req 4): it must be the argmax and reach `promote_at_least` against the
+family's mark, which the power arithmetic says no plausible result does. The sweep also
+promotes nothing while a variant is `red_flag`ged, until the audit that flag opens has
+cleared it. A paper book for a B10 that survives rung 4 without promotion would need
+another route (PR #2108, open question 2); this file does not choose it.
