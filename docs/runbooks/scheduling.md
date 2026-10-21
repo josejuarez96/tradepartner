@@ -34,7 +34,7 @@ Sources run in order, `edgar` then `alpaca`, and **the run stops at the first so
 
 ## Before pulling a schema migration
 
-**Any write connection migrates the store** (T49's docstring): there is no separate `migrate` command and no prompt. The first scheduled `ingest` or `paper run` whose code is past a schema bump migrates the store as a side effect of its normal write, and older code cannot read the store afterwards. The code's version is `CURRENT_SCHEMA_VERSION` in `src/tradepartner/store/schema.py` (34 on 2026-10-19). Check before you pull:
+`tradepartner ingest` and every `tradepartner paper` write command migrate an older store before journaling or calling the broker. Paper write commands are `start`, `stop`, `run`, `reconcile`, `kill`, `resume`, `abandon`, `override` and `settle`. Paper read-only commands (`report`, `check`, `shakedown`, `status` and `lots-reconcile`) refuse an older store with the stored and code schema versions and tell you to run ingest or a paper write command. There is no separate `migrate` command or prompt. The first scheduled `ingest` or `paper run` after a schema bump migrates the store; older code cannot read it afterwards. The code's version is `CURRENT_SCHEMA_VERSION` in `src/tradepartner/store/schema.py`. Check before you pull:
 
 ```bash
 git fetch origin && git diff HEAD origin/main -- src/tradepartner/store/schema.py | grep '^[-+]CURRENT_SCHEMA_VERSION ='

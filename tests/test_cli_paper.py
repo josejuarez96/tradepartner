@@ -298,17 +298,15 @@ def test_a_store_without_the_journal_is_refused_as_no_window(export_file: Path, 
 
 
 def test_a_version_16_store_is_refused_as_schema_version(export_file: Path, live: Path) -> None:
-    """#1261: `require_journal` raises `SchemaVersionError` on a version-16 store;
-    `_read_ledger_set` gives it its own `schema_version` refusal, carrying the
-    "open it for writing once" message."""
+    """A read-only paper command refuses an older journal before reading it."""
     with duckdb.connect(str(live)) as conn:
         conn.execute("UPDATE schema_version SET version = 16")
         conn.execute("ALTER TABLE orders DROP COLUMN book_id")
 
     out = _reconcile(export_file, rows=AGREEING)
 
-    assert out.exit_code == EXIT["schema_version"], out.output
-    assert "open it for writing once" in out.output
+    assert out.exit_code == REFUSED, out.output
+    assert f"store at schema 16, code at {schema.CURRENT_SCHEMA_VERSION}" in out.output
 
 
 def test_a_locked_store_is_refused(export_file: Path, live: Path) -> None:
@@ -482,7 +480,7 @@ def test_the_command_opens_the_store_read_only_and_writes_nothing(
     codes = [_reconcile(export_file, rows=rows).exit_code for rows in (AGREEING, [], [])]
 
     assert codes == [0, 3, 3]
-    assert opened == ["read_only"] * 3
+    assert opened == ["read_only"] * 6  # schema check, then ledger, for each invocation
     assert _sha256(live) == store_before
     assert _sha256(export_file) == export_before
 
@@ -806,6 +804,74 @@ def test_stop_reconcile_resume_abandon_and_check_on_an_open_window(
     assert abandon.exit_code == 0, abandon.output
     assert "paper abandon: abandoned" in abandon.output
     assert _paper(clock, factory, "run").exit_code == 1  # no window: `no_window`
+
+
+def _downgrade_to_34(path: Path) -> None:
+    """Recreate the additive version-34 boundary after the fixture is seeded."""
+    with duckdb.connect(str(path)) as conn:
+        conn.execute("DROP TABLE mergers")
+        conn.execute("DELETE FROM schema_version")
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) "
+            "VALUES (34, TIMESTAMPTZ '2026-10-19 20:00:00+00')"
+        )
+
+
+@pytest.mark.usefixtures("started")
+def test_resume_migrates_old_store_before_journaling(
+    live: Path, clock: _Clock, factory: _Factory
+) -> None:
+    assert _paper(clock, factory, "kill", "--reason", LONG_REASON).exit_code == 0
+    _downgrade_to_34(live)
+
+    out = _paper(clock, factory, "resume", "--reason", LONG_REASON)
+
+    assert out.exit_code == 0, out.output
+    with duckdb.connect(str(live), read_only=True) as conn:
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (
+            schema.CURRENT_SCHEMA_VERSION,
+        )
+        assert conn.execute("SELECT COUNT(*) FROM mergers").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM resume_invocations").fetchone() == (1,)
+
+
+@pytest.mark.usefixtures("started")
+def test_resume_migration_failure_precedes_journal_and_broker(
+    live: Path, clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _paper(clock, factory, "kill", "--reason", LONG_REASON).exit_code == 0
+    _downgrade_to_34(live)
+    calls_before = factory.fake.calls
+
+    def fail_migration(_conn: duckdb.DuckDBPyConnection) -> None:
+        raise schema.SchemaVersionError("migration failed")
+
+    monkeypatch.setattr(schema, "init_schema", fail_migration)
+    out = _paper(clock, factory, "resume", "--reason", LONG_REASON)
+
+    assert out.exit_code != 0
+    assert "migration failed" in out.output
+    assert factory.fake.calls == calls_before
+    with duckdb.connect(str(live), read_only=True) as conn:
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (34,)
+        assert conn.execute("SELECT COUNT(*) FROM resume_invocations").fetchone() == (0,)
+
+
+@pytest.mark.usefixtures("started")
+def test_read_only_paper_command_refuses_old_store_without_writing(
+    live: Path, clock: _Clock, factory: _Factory
+) -> None:
+    _downgrade_to_34(live)
+    before = _sha256(live)
+    calls_before = factory.fake.calls
+
+    out = _paper(clock, factory, "status")
+
+    assert out.exit_code == REFUSED
+    assert f"store at schema 34, code at {schema.CURRENT_SCHEMA_VERSION}" in out.output
+    assert "tradepartner ingest" in out.output
+    assert _sha256(live) == before
+    assert factory.fake.calls == calls_before
 
 
 def test_a_broker_that_cannot_be_built_fails_scrubbed(clock: _Clock) -> None:

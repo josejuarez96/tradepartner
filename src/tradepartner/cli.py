@@ -4120,6 +4120,52 @@ def make_app(
             raise absent
         return s
 
+    @paper_app.callback()
+    def paper_schema_gate(ctx: typer.Context) -> None:
+        """Check the paper store before a command can journal or call its broker."""
+        command = ctx.invoked_subcommand
+        if command is None:
+            return
+        if command == "lots-reconcile":
+            s = settings()
+            if not Path(s.store.path).exists():
+                raise _fail(
+                    _scrubbed(f"refused: no store at {s.store.path}", s),
+                    LOTS_RECONCILE_REFUSAL_EXIT["no_store"],
+                )
+        else:
+            s = paper_settings()
+        read_only = {"report", "check", "shakedown", "status", "lots-reconcile"}
+        if command in read_only:
+            if command == "lots-reconcile":
+                try:
+                    version = _paper_read_version(s)
+                except StoreLockedError as exc:
+                    raise _fail(
+                        _scrubbed(f"refused: locked: store busy: {exc}", s),
+                        LOTS_RECONCILE_REFUSAL_EXIT["locked"],
+                    ) from None
+            else:
+                version = _paper_call(s, lambda: _paper_read_version(s))
+            if version != schema.CURRENT_SCHEMA_VERSION:
+                found = "no schema" if version is None else f"schema {version}"
+                raise _fail(
+                    f"store at {found}, code at {schema.CURRENT_SCHEMA_VERSION}: "
+                    "run `tradepartner ingest` or any paper write command to migrate",
+                    PAPER_REFUSAL_EXIT["refused"],
+                )
+            return
+
+        def migrate() -> None:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+
+        _paper_call(s, migrate)
+
+    def _paper_read_version(s: Settings) -> int | None:
+        with open_read_only(s) as conn:
+            return schema._max_version(conn)
+
     def write_chunk(s: Settings) -> window.Connect:
         return lambda: open_for_write(s)
 
