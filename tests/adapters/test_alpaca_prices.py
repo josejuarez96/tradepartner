@@ -2085,8 +2085,8 @@ class TestNewActions:
 
     def test_a_when_issued_child_with_no_regular_way_listing_stays_unresolved(self) -> None:
         """#2112: no listing under the root on the ex-date (the child is not in
-        the master yet, or listed only from a later session: no look-ahead) is
-        unresolved under the symbol Alpaca gave, never stored."""
+        the master yet, or listed only from a later session, with no first-span
+        `lead`, #974) is unresolved under the symbol Alpaca gave, never stored."""
         for listings in (
             [_listing("P", "PARENT", START)],
             [_listing("P", "PARENT", START), _listing("C", "CHILD", date(2020, 9, 30))],

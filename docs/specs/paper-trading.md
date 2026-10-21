@@ -314,7 +314,7 @@ The paper vehicle is the registered H1 (long-only 12-1 momentum, top decile equa
 5. **Acceptance (testable).**
    - `tests/adapters/test_alpaca_prices.py`:
      - `test_a_when_issued_child_resolves_under_its_regular_way_symbol`;
-     - `test_a_when_issued_child_with_no_regular_way_listing_stays_unresolved` (also a listing from the session after the ex-date: no look-ahead);
+     - `test_a_when_issued_child_with_no_regular_way_listing_stays_unresolved` (also a listing from the session after the ex-date, resolved without the first-span `lead` of #974, which the ingest passes and which can still reach a first span starting shortly after);
      - `test_only_a_trailing_when_issued_suffix_is_stripped`.
    - `tests/execution/test_reconcile_run.py` (the fake broker, with the account's funding `JNLC` dated before the window in each reconcile fixture):
      - `test_explanations_map_an_offered_child_to_its_when_issued_broker_symbol`;
