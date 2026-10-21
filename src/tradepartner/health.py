@@ -14,11 +14,14 @@ here is this module's and is stated once:
 
 - **Last ingest per source** (`last_ingests`): from `ingestion_runs` rows
   known at `t`, i.e. finished at or before `t` (ingest writes a run's row when
-  the run ends), other than `master-retract`'s (#859), per source
+  the run ends), whose mode is a real ingest's (`_INGEST_MODES`: `session`,
+  `backfill`, `import`), per source
   (`ingest.SOURCES` first, then any other source in the table,
   alphabetically): the finish time and cursor of the last `ok` run,
   and the status, start and message of the latest run of any status. A source
-  that never ran shows `None`s.
+  that never ran shows `None`s. A maintenance or repair mode (`retract`,
+  `actions`, `holes`, `repair`, `action_retract`, or any mode added later) is
+  not an ingest and is left out, so it never hides the latest ingest's status.
 - **Coverage** (`coverage`): the population of ingest's staleness check
   (spec req 10): securities whose current listing (latest `valid_from` on or
   before `session`) is live at `session`, i.e. listed, or transferred with its
@@ -401,6 +404,7 @@ from tradepartner.adapters.alpaca_prices import (
 )
 from tradepartner.adapters.prices import announcement_date_known_at, spinoff_known_at_floor
 from tradepartner.adapters.rates import rate_known_at
+from tradepartner.backfill import BACKFILL
 from tradepartner.calendar import (
     all_sessions,
     is_session,
@@ -417,7 +421,7 @@ from tradepartner.config import (
     parse_accepted_same_day_pair,
 )
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
-from tradepartner.ingest import ACTIONS_MODE, DERIVED_FACTS, MODE, OK, SOURCES
+from tradepartner.ingest import ASSETS_IMPORT_MODE, DERIVED_FACTS, MODE, OK, SOURCES
 from tradepartner.store.asof import (
     _FACT_KEY,
     _PRICE_KEY,
@@ -456,7 +460,7 @@ from tradepartner.store.index_members import (
     resolve,
 )
 from tradepartner.store.master import first_session, securities_as_of, security_cik, session_of
-from tradepartner.store.retraction import EDGAR, RETRACT, live_chains_as_of, underived_as_of
+from tradepartner.store.retraction import EDGAR, live_chains_as_of, underived_as_of
 from tradepartner.store.schema import (
     STATEMENT_FACT_BASIS_VALUES,
     TABLE_PROVENANCE_VALUES,
@@ -2616,21 +2620,33 @@ def _coverage_reference(
     )
 
 
+#: The `ingestion_runs.mode` values a real ingest writes: `ingest`'s daily
+#: and `--backfill` chunks (`session`, `backfill`, any source, `ok`/`stale`/
+#: `failed`) and the borrow snapshot's `--import-dir` files (`import`, `ok`/
+#: `failed`). Every other mode is not an ingest and is left out of
+#: `last_ingests`: `retract` (#859), `actions` (a corporate-actions backfill
+#: month, #1676), `holes` (a `--fill-holes` month, #833) and `repair` /
+#: `action_retract` (#2125). The set is an allow-list, so a mode added later
+#: is left out without a code change.
+_INGEST_MODES: tuple[str, ...] = (MODE, BACKFILL, ASSETS_IMPORT_MODE)
+
+
 def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestStatus, ...]:
     """Per source, the last `ok` run and the latest run whose row is known at
     `t` (finished at or before `t`); `ingest.SOURCES` first, then any other
-    source. A `master-retract` run row (mode `retract`, #859) is not an
-    ingest and is left out, so it never hides the latest EDGAR run's status
-    or quarantine count; so is an actions-backfill month (mode `actions`,
-    status `filled`, #1676), so it never shows as the latest Alpaca run."""
+    source. Only a real ingest's run row counts (`_INGEST_MODES`), so a
+    maintenance or repair row — `master-retract`'s `retract` (#859), an
+    actions-backfill month's `actions` (#1676), a `--fill-holes` month's
+    `holes` (#833), a `repair` row, or an `action-retract` row (#2125) —
+    never shows as the latest run or hides the latest ingest's status."""
     t = _validate_t(t)
     runs = conn.execute(
         """
         SELECT source, status, started_at, finished_at, chunk_cursor, message
-        FROM ingestion_runs WHERE coalesce(finished_at, started_at) <= ? AND mode NOT IN (?, ?)
+        FROM ingestion_runs WHERE coalesce(finished_at, started_at) <= ? AND mode IN ?
         ORDER BY started_at, run_id
         """,
-        [t, RETRACT, ACTIONS_MODE],
+        [t, list(_INGEST_MODES)],
     ).fetchall()
     by_source: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
     for run in runs:

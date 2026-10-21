@@ -143,6 +143,7 @@ from tradepartner.store.journal import (
     OrderRow,
     ReconciliationRow,
     all_fill_ids,
+    all_fill_terms,
     append,
     decisions_for,
     fill_cursors,
@@ -499,8 +500,10 @@ def _journal_fills(
     journaled: list[str] = []
     superseded: list[str] = []
     foreign: list[str] = []
+    journaled_as = all_fill_terms(conn)
     for fill in seen:
         if fill.broker_fill_id in known:
+            _check_unchanged(fill, journaled_as.get(fill.broker_fill_id))
             continue
         if fill.client_order_id not in own:
             foreign.append(fill.broker_fill_id)
@@ -530,6 +533,19 @@ def _journal_fills(
         if synthetic:
             superseded.append(fill.broker_fill_id)
     return tuple(journaled), tuple(superseded), tuple(foreign)
+
+
+def _check_unchanged(fill: Fill, journaled: tuple[float, float] | None) -> None:
+    """Raise `SystemFaultError` when a known fill reads back with another quantity or
+    price: a broker correction (#2149) that arrived after its fill was journaled."""
+    if journaled is None:
+        return
+    quantity, price = journaled
+    if not (math.isclose(fill.quantity, quantity) and math.isclose(fill.price, price)):
+        raise SystemFaultError(
+            f"broker fill {fill.broker_fill_id} reads {fill.quantity} at {fill.price}, "
+            f"journaled as {quantity} at {price}: a correction after collection"
+        )
 
 
 def _journal_terminals(
