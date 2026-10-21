@@ -1,3 +1,0 @@
-- T202 plan amended (#1808): skip-reason enums at schema version 29 as T202a (T202b at 30); an allowlisted submit-time refusal closes rejected with its skip reason and counts as a skip; frozen_risk reads a missing max_skip_share as 0.
-### Changed
-- Plan T202 (#1808): a new size-S T202a takes `schema.py` at version 29 (`decision_events.reason` and `order_events.reason` widened for the allowlist's skip reasons; T202b takes 30); T202 gains `risk.py` (the share cap), `collect.py` (a skip-reason `rejected` is not a rejection) and `reconcile_run.py` (`frozen_risk` reads a missing `risk.max_skip_share` as 0); the paper spec's item 2, item 11 and two Tables entries say the same.
