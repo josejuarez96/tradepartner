@@ -530,6 +530,22 @@ def _chain_mapped_key(key_columns: Sequence[str], alias: str = "t") -> str:
     )
 
 
+def _chain_parent(alias: str = "t") -> str:
+    """SQL: a `spinoff` row's parent re-keyed through the live chain view along
+    the same chain as the row's `security_id` (#821, #2127): the successor's id
+    when `source_action_id` (a spin-off's parent, a security id) is a chained
+    predecessor, else the stored value. A split's or dividend's
+    `source_action_id` is the source's opaque id, not a security id, so it is
+    left as stored. A correlated subquery, not a second join, so the read's
+    result columns are unchanged."""
+    return (
+        f"CASE WHEN {alias}.action_type = 'spinoff' "
+        f"THEN COALESCE((SELECT successor_id FROM {_CHAINS_VIEW} "
+        f"WHERE predecessor_id = {alias}.source_action_id), {alias}.source_action_id) "
+        f"ELSE {alias}.source_action_id END"
+    )
+
+
 @contextmanager
 def _chains_registered(conn: duckdb.DuckDBPyConnection, t: datetime) -> Iterator[LiveChains]:
     """Expose the live chains known at `t` to SQL as `_CHAINS_VIEW` (its
@@ -759,7 +775,10 @@ def live_actions_as_of(
     `t` must be tz-aware (a bare date raises `TypeError`); `security_ids`
     as in `_latest_as_of`. A live chain known at `t` (#821) re-keys the
     predecessor's actions to the successor; the successor's own action wins
-    a shared identity.
+    a shared identity. A `spinoff` row's parent reference
+    (`source_action_id`, a security id) is re-keyed along the same chain
+    (#2127), so a reader that keys the parent by it finds the successor's
+    held id, not the predecessor's.
     """
     t = _validate_t(t)
     with _chains_registered(conn, t) as chains:
@@ -772,7 +791,8 @@ def live_actions_as_of(
                         PARTITION BY {_ACTION_IDENTITY_PARTITION} ORDER BY _own, known_at DESC
                     ) AS _rn
                     FROM (
-                        SELECT * REPLACE ({_chain_id()} AS security_id), {_chain_own()} AS _own
+                        SELECT * REPLACE ({_chain_id()} AS security_id,
+                            {_chain_parent()} AS source_action_id), {_chain_own()} AS _own
                         FROM corporate_actions t {_chain_join()}
                         WHERE t.known_at <= ?
                         {security_filter}
