@@ -237,7 +237,7 @@ def test_registry_table_names_disjoint_from_fact_table_names() -> None:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGERS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGER_RECEIPT_VERSION + 1
 
 
 def test_fresh_init_creates_every_table_at_version_26() -> None:

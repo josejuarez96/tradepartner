@@ -160,7 +160,7 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
 
 
 def test_current_schema_version_is_31() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGERS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGER_RECEIPT_VERSION + 1
     assert schema._PRE_FEE_ACTIVITIES_VERSION == 24
     assert schema._PRE_FILING_NAME_VERSION == 25
     assert schema._PRE_CASH_IN_LIEU_VERSION == 26
@@ -1000,7 +1000,7 @@ def test_the_short_reasons_are_appended_last_and_the_version_is_the_next() -> No
         )
         assert (table, "reason") in schema.NULLABLE_JOURNAL_ENUMS
     assert schema._PRE_SHORT_REASONS_VERSION >= schema._PRE_PENDING_UNRESOLVED_VERSION + 1
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGERS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGER_RECEIPT_VERSION + 1
 
 
 def test_the_schema_docstring_names_the_short_reasons_version() -> None:
@@ -2175,3 +2175,43 @@ def test_insert_row_writes_a_column_named_at(journal: duckdb.DuckDBPyConnection)
         },
     )
     assert journal.execute('SELECT "at" FROM alerts').fetchall() == [(_NOW,)]
+
+
+def test_v35_adjustments_migrate_to_merger_receipt() -> None:
+    """A v35 row survives in insertion order, while the widened CHECK accepts
+    merger_receipt and still refuses an unknown kind."""
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        ddl = schema._CREATE_ADJUSTMENTS.replace(
+            "CREATE TABLE IF NOT EXISTS adjustments (", "CREATE TABLE adjustments_v35 (", 1
+        ).replace(", 'merger_receipt'", "")
+        conn.execute(ddl)
+        conn.execute("INSERT INTO adjustments_v35 BY NAME SELECT * FROM adjustments ORDER BY rowid")
+        conn.execute("DROP TABLE adjustments")
+        conn.execute("ALTER TABLE adjustments_v35 RENAME TO adjustments")
+        conn.execute("DELETE FROM schema_version WHERE version = 36")
+        conn.execute("INSERT INTO schema_version VALUES (35, now())")
+        conn.execute(
+            "INSERT INTO adjustments (adjustment_id, window_id, session, kind, "
+            "security_id, quantity, known_at, ingested_at) VALUES "
+            "(1, 1, DATE '2026-10-01', 'spinoff_receipt', 'SEC_X', 2, now(), now())"
+        )
+        with pytest.raises(duckdb.ConstraintException):
+            conn.execute(
+                "INSERT INTO adjustments (adjustment_id, window_id, session, kind, "
+                "security_id, quantity, known_at, ingested_at) VALUES "
+                "(2, 1, DATE '2026-10-01', 'merger_receipt', 'SEC_Y', 1, now(), now())"
+            )
+        before = conn.execute("SELECT * FROM adjustments ORDER BY rowid").fetchall()
+        schema.init_schema(conn)
+        assert conn.execute("SELECT * FROM adjustments ORDER BY rowid").fetchall() == before
+        assert _versions(conn)[-2:] == [35, 36]
+        assert "'merger_receipt'" in _ddl(conn, "adjustments")
+        conn.execute(
+            "INSERT INTO adjustments (adjustment_id, window_id, session, kind, "
+            "security_id, quantity, known_at, ingested_at) VALUES "
+            "(2, 1, DATE '2026-10-01', 'merger_receipt', 'SEC_Y', 1, now(), now())"
+        )
+    finally:
+        conn.close()

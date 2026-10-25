@@ -88,7 +88,7 @@ as_of`:
   name, which bounds an ended name's proceeds and a pending order's reach.
 - `mergers` (paper spec amendment #1762 item 1, T249): the open mergers, from
   `mergers_as_of(close(S-1))` for the journal's names. A merger is identified by
-  its Alpaca id, which every `corporate_action_cash` row journaled for it names
+  its Alpaca id, which every `corporate_action_cash` or `merger_receipt` row names
   in `explanation_json` (`merger_id`). It is open at S when `effective_date <=
   S` and either (a) the ledger stated through S still holds its acquiree, long
   or short, or (b) the removal is journaled (its own row, or the ended-listing
@@ -651,6 +651,7 @@ def _explanations(
     *,
     merger_lag_sessions: int,
     cash_tolerance: float,
+    whole_share_price_buffer: float,
 ) -> Explanations:
     cut = _cut(session)
     names = (
@@ -669,6 +670,7 @@ def _explanations(
         tolerance,
         merger_lag_sessions,
         cash_tolerance,
+        whole_share_price_buffer,
     )
     # The acquirers join the mapped names before the map is built (#1762 item
     # 1), so a symbol an acquirer shares with its acquiree is resolved by
@@ -878,6 +880,7 @@ def _mergers(
     tolerance: float,
     lag_sessions: int,
     cash_tolerance: float,
+    whole_share_price_buffer: float,
 ) -> tuple[dict[str, OpenMerger], dict[str, str], set[str]]:
     """The open mergers by acquiree, the conflicting pairs raised at this
     reconciliation, and the acquirers to map (module docstring, `mergers`).
@@ -946,7 +949,27 @@ def _mergers(
         if removal is not None and removal.quantity is not None and effective and not held:
             removed_quantity = -removal.quantity
             rate = row["cash_per_share"] if row["cash_per_share"] is not None else 0.0
-            upper = Decimal(str(removed_quantity * float(rate)))
+            upper_value = removed_quantity * float(rate)
+            if not from_band and row["kind"] != "cash":
+                try:
+                    terms = json.loads(removal.explanation_json or "{}")
+                except (ValueError, TypeError):
+                    terms = {}
+                if isinstance(terms, dict):
+                    fractional = terms.get("fractional_shares")
+                    price = terms.get("acquirer_price")
+                    if (
+                        isinstance(fractional, int | float)
+                        and not isinstance(fractional, bool)
+                        and math.isfinite(fractional)
+                        and fractional > tolerance
+                        and isinstance(price, int | float)
+                        and not isinstance(price, bool)
+                        and math.isfinite(price)
+                        and price > 0
+                    ):
+                        upper_value += fractional * price * (1 + whole_share_price_buffer)
+            upper = Decimal(str(upper_value))
             paid = Decimal(str(journaled)) >= upper - bound
             closed = any(
                 r.status == OK and after_end(stated) and removal.known_at <= r.known_at
@@ -975,6 +998,7 @@ def _mergers(
             removed_quantity=None if open_held else removed_quantity,
             journaled_cash=journaled,
             final=is_open and session > end and not checked,
+            cash_upper=upper_value if removed_quantity is not None else None,
         )
         found[(name, merger_id)] = (merger, is_open, is_open or bool(own_rows))
 
@@ -1018,6 +1042,7 @@ def explanations_as_of(
     quantity_tolerance: float,
     merger_lag_sessions: int = _DEFAULT_RISK.reconcile_merger_lag_sessions,
     cash_tolerance: float = _DEFAULT_RISK.reconcile_cash_tolerance,
+    whole_share_price_buffer: float = _DEFAULT_RISK.whole_share_price_buffer,
 ) -> Explanations:
     """What the store knew at close(S-1), and the journal at `as_of`, to explain
     the broker on S (module docstring). Read-only. `as_of` is the journal cut
@@ -1047,6 +1072,7 @@ def explanations_as_of(
         session,
         merger_lag_sessions=merger_lag_sessions,
         cash_tolerance=cash_tolerance,
+        whole_share_price_buffer=whole_share_price_buffer,
     )
 
 
@@ -1070,13 +1096,18 @@ def _open_orders(
 
 
 def _explanation_json(
-    text: str, reconciliation_id: int | None, merger_id: str | None = None
+    text: str,
+    reconciliation_id: int | None,
+    merger_id: str | None = None,
+    merger_terms: Mapping[str, object] | None = None,
 ) -> str:
     """An adjustment's `explanation_json`: its text, the reconciliation that
     journaled it and, for a merger's row, the merger id (#1762, T249)."""
     payload: dict[str, object] = {"explanation": text, "reconciliation_id": reconciliation_id}
     if merger_id is not None:
         payload["merger_id"] = merger_id
+    if merger_terms is not None:
+        payload.update(merger_terms)
     return json.dumps(payload, sort_keys=True, allow_nan=False)
 
 
@@ -1162,6 +1193,7 @@ def reconcile_now(
             through,
             merger_lag_sessions=frozen.reconcile_merger_lag_sessions,
             cash_tolerance=frozen.reconcile_cash_tolerance,
+            whole_share_price_buffer=frozen.whole_share_price_buffer,
         )
     # The read-only `_explanations` names the seen-sets and fallback; the broker's
     # cash activities are attached here (they are a broker input, never a journal
@@ -1219,7 +1251,10 @@ def reconcile_now(
                     quantity=adjustment.quantity,
                     cash=adjustment.cash,
                     explanation_json=_explanation_json(
-                        adjustment.explanation, reconciliation_id, adjustment.merger_id
+                        adjustment.explanation,
+                        reconciliation_id,
+                        adjustment.merger_id,
+                        adjustment.merger_terms,
                     ),
                     book_id=window.book_id,
                     broker_activity_id=adjustment.broker_activity_id,

@@ -2338,7 +2338,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGERS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGER_RECEIPT_VERSION + 1
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
@@ -2735,7 +2735,7 @@ def test_the_version_35_migration_adds_mergers_and_nothing_else() -> None:
         assert {i: indexes_after[i] for i in indexes_before} == indexes_before
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM mergers").fetchone() == (0,)
-        assert _versions(conn) == [34, 35] == [34, schema.CURRENT_SCHEMA_VERSION]
+        assert _versions(conn) == [34, 35, 36] == list(range(34, schema.CURRENT_SCHEMA_VERSION + 1))
         before_second = _versions(conn)
         schema.init_schema(conn)
         assert _versions(conn) == before_second
