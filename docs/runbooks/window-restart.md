@@ -33,7 +33,7 @@ These do **not** reset:
    # a paper run inside the submit window sells the holdings (step 2); then:
    uv run tradepartner paper stop --reason "why" --book <token>   # closes the window
    ```
-   If `stop` cannot finish, use `paper abandon` and follow "`abandon`: the last resort" in scheduling.md. What you lose: `abandon` places and cancels no order, so the positions stay at the broker, no residue is carried to the next window, and the window has no clean closing sell. You must reset the Alpaca paper account to flat before the next `paper start`, which also ends that account's history.
+   If `stop` cannot finish, use `paper abandon` and follow "`abandon`: the last resort" in scheduling.md. What you lose: `abandon` places and cancels no order, so the positions stay at the broker, no residue is carried to the next window, and the window has no clean closing sell. If any position remains, the account must be flat before the next `paper start`; the approved way is to reset the Alpaca paper account (scheduling.md, "`abandon`: the last resort"), which may also end that account's history (not verified in this repo).
 5. **Check the account is ready.** After `closed`: no open orders, and the positions are exactly the listed residues. After `abandoned`: zero positions, zero open orders. If you reset the account at Alpaca, check whether the account id or the keys changed; if the keys changed, follow [key-rotation](key-rotation.md) (`paper start` records whatever account id the broker reports for the new window; only another book's account is refused).
 6. **Open the new window.**
    ```bash

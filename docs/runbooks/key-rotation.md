@@ -34,7 +34,7 @@ Rotate one book at a time, so a mistake stops one book.
    ```bash
    uv run tradepartner paper reconcile --book <token>
    ```
-   It reads the broker with that book's keys and reconciles. `ok` means the keys and the account id match. Warning: a mismatch is a real finding, and it engages the kill switch for the book (resume procedure in scheduling.md), so run it when you can handle that. A `no_credentials` refusal means a half-set or mistyped pair; an auth error from Alpaca means the old key is still in use or the new one was copied wrong. `paper status` never contacts the broker, so it proves nothing about keys. With no open window, the first call that reads the broker is `paper start` (it calls `account()`), or the next scheduled `paper run`: check it per "Checking a run".
+   It reads the broker with that book's keys and reconciles. `ok` means the keys and the account id match. Warning: a mismatch is a real finding, and it engages the kill switch for the book (resume procedure in scheduling.md), so run it when you can handle that. A `no_credentials` refusal means a half-set or mistyped pair; an auth error from Alpaca means the old key is still in use or the new one was copied wrong. `paper status` never contacts the broker, so it proves nothing about keys. With no open window, the first call that reads the broker is `paper start` (it calls `account()` before any write); a scheduled `paper run` with no open window makes no broker call, so it proves nothing about keys.
 7. **Revoke the old key** at Alpaca only after step 6 passes.
 8. **Note it.** Record the date, the book and the reason in one line on the issue or in your notes. Never the key.
 
