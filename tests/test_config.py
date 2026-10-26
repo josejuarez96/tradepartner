@@ -97,6 +97,19 @@ def test_store_defaults() -> None:
     s = _settings()
     assert s.store.path == "data/tradepartner.duckdb"
     assert s.store.lock_retry_seconds == 60
+    assert s.store.pre_migration_backups_to_keep == 2
+    assert s.store.backup_disk_margin_bytes == 1_000_000_000
+
+
+def test_pre_migration_backup_config_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STORE__PRE_MIGRATION_BACKUPS_TO_KEEP", "1")
+    monkeypatch.setenv("STORE__BACKUP_DISK_MARGIN_BYTES", "0")
+    assert _settings().store.pre_migration_backups_to_keep == 1
+    assert _settings().store.backup_disk_margin_bytes == 0
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, store={"pre_migration_backups_to_keep": 0})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, store={"backup_disk_margin_bytes": -1})
 
 
 def test_calendar_defaults() -> None:
@@ -111,6 +124,13 @@ def test_ingest_defaults() -> None:
     assert s.ingest.reference_symbol == "SPY"
     assert s.ingest.max_missing_share == pytest.approx(0.05)
     assert s.ingest.max_dark_share == pytest.approx(1.0)  # #796: off until measured
+    assert s.ingest.edgar_gap_lookback_sessions == 5
+
+
+@pytest.mark.parametrize("value", [-1, 21])
+def test_edgar_gap_lookback_is_bounded(value: int) -> None:
+    with pytest.raises(ValidationError, match="edgar_gap_lookback_sessions"):
+        Settings(_env_file=None, ingest={"edgar_gap_lookback_sessions": value})
 
 
 def test_fred_rate_defaults_and_environment(monkeypatch: pytest.MonkeyPatch) -> None:
