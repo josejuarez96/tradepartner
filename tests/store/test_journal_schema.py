@@ -1042,6 +1042,7 @@ def test_the_short_skip_kinds_are_decision_kinds_last() -> None:
     assert schema.JOURNAL_ENUMS["decisions", "decision"] == (
         *_PRE_T228_DECISION_KINDS,
         *_T228_NEW_DECISION_KINDS,
+        "skip_restricted",  # T280a, version 37 (#2266 amendment item 7)
     )
 
 
@@ -2265,6 +2266,7 @@ _BREAK_COLUMNS = (
 #: Each widened `CHECK`: (table, column, the values version 37 appends).
 _V37_WIDENED = (
     ("reconciliations", "status", ("breaks",)),
+    ("decisions", "decision", ("skip_restricted",)),
     ("adjustments", "kind", ("auto_true_up", "owner_true_up")),
     ("decision_events", "reason", ("skip_restricted",)),
     ("order_events", "reason", ("skip_restricted",)),
@@ -2330,6 +2332,8 @@ def _insert_widened(conn: duckdb.DuckDBPyConnection, table: str, value: str) -> 
             "+ 1 FROM adjustments), 1, ?, ?, 'SEC_X', 1, ?, ?)",
             [_BREAK_SESSION, value, _LATER, _LATER],
         )
+    elif table == "decisions":
+        _insert_decision_kind(conn, value)
     else:
         _insert_reason(conn, table, value)
 
@@ -2484,6 +2488,12 @@ def _v36_store(conn: duckdb.DuckDBPyConnection) -> None:
             "INSERT INTO adjustments (adjustment_id, window_id, session, kind, security_id, "
             "cash, known_at, ingested_at) VALUES (?, 1, ?, ?, 'SEC_B', 1.25, ?, ?)",
             [adjustment_id, _BREAK_SESSION, kind, _NOW, _NOW],
+        )
+    for decision_id, kind in ((8, "skip_short_price"), (1, "trade"), (4, "skip_zero")):
+        conn.execute(
+            "INSERT INTO decisions (decision_id, run_id, security_id, whole_share, decision, "
+            "known_at, ingested_at) VALUES (?, 2, 'SEC_C', TRUE, ?, ?, ?)",
+            [decision_id, kind, _NOW, _NOW],
         )
     for decision_id, reason in ((8, "skip_short_price"), (1, None), (4, "unfunded")):
         conn.execute(
