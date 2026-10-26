@@ -20,6 +20,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from dashboard_nav import NavCall, nav_calls_fixture, nav_titles  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.backtest.metrics import LONG_SHORT_KEYS, METRIC_KEYS, deflated_sharpe
@@ -257,7 +258,8 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     at = AppTest.from_file(_APP_PATH)
     at.run()
-    at.sidebar.radio[0].set_value("Backtest").run()
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Backtest")
+    at.run()
     return at
 
 
@@ -398,21 +400,12 @@ def test_drawdowns_from_equity() -> None:
 
 
 def test_page_is_in_the_shell_navigation(
-    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded], nav_calls: list[NavCall]
 ) -> None:
     store_path, _ = seeded_store
     at = _app(monkeypatch, store_path)
     assert not at.exception
-    assert at.sidebar.radio[0].options == [
-        "Data health",
-        "Backtest",
-        "Trial registry",
-        "Research",
-        "Operations",
-        "Trades",
-        "Performance",
-        "Override",
-    ]
+    assert "Backtest" in nav_titles(nav_calls)
 
 
 def test_render_detailed_trial_shows_every_element(

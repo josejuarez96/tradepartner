@@ -9,6 +9,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from dashboard_nav import nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import Settings
@@ -78,7 +79,8 @@ def _app(monkeypatch: pytest.MonkeyPatch, path: Path) -> AppTest:
     monkeypatch.setenv("STORE__PATH", str(path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(path.parent / "missing.env"))
     at = AppTest.from_file(_APP).run()
-    at.sidebar.radio[0].set_value("Trades").run(timeout=30)
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Trades")
+    at.run(timeout=30)
     return at
 
 

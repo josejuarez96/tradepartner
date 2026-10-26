@@ -1,6 +1,6 @@
 # Dashboard design standard
 
-**Status:** Accepted v1.1 (#165, 2026-09-25; open decision closed by [ADR 0011](../decisions/0011-dashboard-technology.md), #268, 2026-09-26) · **Applies to:** every dashboard page from T21 (data health) and T44 (trial registry) onward; T43's backtest page, merged before this standard, is retrofitted by T44 · **Owner:** Jose
+**Status:** Accepted v1.2 (#165, 2026-09-25; top navigation, Home and Book looks and three chart roles added by T274, #2170, 2026-10-26; open decision closed by [ADR 0011](../decisions/0011-dashboard-technology.md), #268, 2026-09-26) · **Applies to:** every dashboard page from T21 (data health) and T44 (trial registry) onward; T43's backtest page, merged before this standard, is retrofitted by T44 · **Owner:** Jose
 
 ## Why this exists
 
@@ -31,11 +31,16 @@ Defined once in `src/tradepartner/dashboard/theme.py` and mirrored in `.streamli
 | Series 3 (aqua) | `#1baf7a` | `#199e70` |
 | Series 4 (yellow) | `#eda100` | `#c98500` |
 | Benchmark / muted line | text secondary at 60 % | text secondary at 60 % |
+| Role `book` (the book's own line) | accent blue `#2a78d6`, solid | `#3987e5`, solid |
+| Role `benchmark` (SPY) | text secondary `#5a6470`, dashed 4-4 | `#9aa5b1`, dashed 4-4 |
+| Role `needs_you` | series 2 orange `#eb6834` | `#d95926` |
 | Good | `#2c7a4b` on `#ddf0e3` | `#6cc08f` on `#17301f` |
 | Warning | `#b0741c` on `#f8ebd2` | `#d9a650` on `#3a2e15` |
 | Critical | `#b23f36` on `#f7dedb` | `#e07b73` on `#3b1f1d` |
 | Sequential ramp (magnitude) | blue steps 100 to 700 | blue steps 100 to 700 |
 | Diverging pair (polarity) | blue to red, grey midpoint `#f0efec` | blue to red, grey midpoint `#383835` |
+
+**Colour rules for the roles (T274).** Pages name `book`, `benchmark` or `needs_you` (`theme.Palette`), never a hex. `book` is the accent: the one line or number the page is about. `benchmark` is SPY, always dashed grey (the `dash` field on the role is what the chart helper reads), never any other colour. `needs_you` is the orange series and is **reserved for items that need the owner** (a halted book, an overdue delisting, a failed run): it appears nowhere else, so a page with no orange is a page where nothing needs him. It is a series colour, not a status colour, and is always paired with its one action as text.
 
 Categorical slots are used **in fixed order** and never cycled; a fifth series folds into "Other" or becomes small multiples. Type: the system sans (Streamlit default) for text, a monospace face for every number column so digits align. Radius 8 px on cards, 999 px on chips. Spacing on an 8 px grid; 16 px gutters at phone width.
 
@@ -63,6 +68,16 @@ Every page is the same skeleton, top to bottom:
 
 Interaction defaults: every chart with a plot has a hover layer; hit targets are larger than the mark; filters live in one row above the charts, never inside a card. A table view exists for every chart (the "…" menu).
 
+## Navigation (T274, #2170)
+
+The shell is a **top navigation**: `Home`, `Research`, `Books`, then a `Details` drop-down holding today's pages (Data health, Backtest, Trial registry, Operations, Trades, Performance, Override). Home is the default page. It replaces the sidebar radio; each page keeps drawing from the shell's one read-only connection (`render(conn)`; Home and Books take `render(conn, settings)`). Research is the existing developer view of registrations and runs, unchanged; a real Research workspace is a later amendment. Home and Books are placeholders ("Coming next") until T275 and T276.
+
+## Home and Book looks (approved by the owner, 2026-10-26)
+
+**Home**, top to bottom: a one-line status; **Needs you** (quiet when fine: "Nothing needs you" in one line and no orange anywhere; loud when not, each item in orange with its one action as copyable text); one **card per book** (status pill, equity as of its last marked session, return since start and SPY's over the same days in dollars and percent first, a small book-against-SPY line chart with `book` solid and `benchmark` dashed on one y-axis, the trades sentence, holdings count, cash, top tickers, a link to the book page); **Data status**; a **Research strip**. Every time is ET; the words "ops", "reconciliation", "known_at", ids and raw statuses never appear.
+
+**Book page**: a header (name, status pill, a plain strategy sentence, value, return since start, SPY over the same days); the book-against-SPY chart with range buttons (since start, 1M, 3M) beside best day, worst day, maximum drawdown ("the biggest fall from a high") and "too early to judge: N of M rebalances"; **Today** as grouped sentences (sells then buys, time range, count, dollars, notable names, failures in plain words) or a plain empty state; **Holdings** (count, cash, up and down today, two tables of biggest gains and losses by ticker with value, dollars and percent since bought). Light theme first; the dark tokens stay valid.
+
 ## Page map
 
 | Phase | Page | KPI row | Hero | Supporting |
@@ -70,6 +85,7 @@ Interaction defaults: every chart with a plot has a hover layer; hit targets are
 | 2 (T21) | Data health | coverage, gaps, delisted names present, last update | bars per session: rows ingested and missing share against `max_missing_share` | integrity checks as status chips; per-source staleness; gap report table |
 | 3 (T43, T44) | Backtest, trial registry | CAGR, max drawdown, Sharpe and deflated Sharpe, cost drag | equity curve of the hypothesis (accent) against SPY and MTUM (muted), log scale toggle | drawdown chart; monthly returns bars; cost breakdown; trial registry table with holdout flag |
 | 4 | Operations, override | positions, open orders, today's signals, kill-switch state | today's signal ranking with in/out reasons | above the Books table, "Waiting on you" (T257): every book's items, each a status chip with the command that clears it, or one good chip when nothing waits; the Risk card (T260): cash, gross exposure, largest position and drawdown, each against the window's frozen limit with the headroom left; fills table; journal chain per order; alerts list; the override form (the only write) |
+| 5 (T274 to T276) | Home, Books | see "Home and Book looks" | the book against SPY | Needs you, book cards, Today, holdings |
 | 4 (T259) | Trades | orders, filled, notional traded, the session's notional-weighted slippage (bp) | per-order slippage bars against the session's open, adverse positive, the largest in the accent | the order table (ticker, side, shares, fill price, status, slippage, reason; signal rank in the tooltip); a book and a session selector in the filter row |
 | 4 (T252) | Performance | equity, cumulative return, daily P&L, versus SPY | equity curve rebased to 100 at the base session: the book (accent), SPY (muted, dashed), the tracking trial's line over its own span once `paper report` has run | daily P&L bars (latest day in the accent); the tracking state: `not yet`, `report due` or the trial line; a `benchmark unavailable` chip when SPY has no bar; a book selector when more than one book has a window |
 | 6 | Review | calibration, loss attribution, override count | paper versus backtest drift | override log with outcomes; attribution table |

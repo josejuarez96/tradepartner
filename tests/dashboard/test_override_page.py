@@ -21,6 +21,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from dashboard_nav import NavCall, nav_calls_fixture, nav_titles  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.backtest.hypothesis import frozen_params_of
@@ -98,7 +99,8 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     at = AppTest.from_file(_APP_PATH, default_timeout=30)
     at.run()
-    at.sidebar.radio[0].set_value(_PAGE).run()
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", _PAGE)
+    at.run()
     return at
 
 
@@ -139,10 +141,12 @@ def _text(at: AppTest) -> str:
 # --- navigation and render -----------------------------------------------------
 
 
-def test_page_is_in_the_shell_navigation(monkeypatch: pytest.MonkeyPatch, store: Path) -> None:
+def test_page_is_in_the_shell_navigation(
+    monkeypatch: pytest.MonkeyPatch, store: Path, nav_calls: list[NavCall]
+) -> None:
     at = _app(monkeypatch, store)
     assert not at.exception
-    assert _PAGE in at.sidebar.radio[0].options
+    assert _PAGE in nav_titles(nav_calls)
 
 
 def test_the_form_offers_exactly_the_schemas_kinds(
@@ -260,7 +264,8 @@ def test_a_submit_after_a_render_writes_one_row_and_a_further_rerun_none(
     assert len(_rows(store)) == 1
 
     at.run()
-    at.sidebar.radio[0].set_value(_PAGE).run()
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", _PAGE)
+    at.run()
 
     assert not at.exception
     assert len(_rows(store)) == 1
@@ -491,7 +496,8 @@ def test_the_page_writes_to_the_shells_settings_not_the_environments(
 
     at = AppTest.from_function(_script, args=(str(store),), default_timeout=30)
     at.run()
-    at.sidebar.radio[0].set_value(_PAGE).run()
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", _PAGE)
+    at.run()
     _fill(at)
     _submit(at)
 
