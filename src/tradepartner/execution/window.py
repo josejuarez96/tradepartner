@@ -225,6 +225,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
@@ -1518,10 +1519,18 @@ def kill(
     token grammar, and `KillWriteFailed` when the row cannot be written."""
     note = _note(reason, "paper kill")
     book = resolve_book(settings, book_id)
+    started = time.monotonic()
     with connect() as conn:
         _, window_id = _window_of(conn, book)
+    # One lock wait per book, not one per connection: `engage` gets what is left (#2178).
+    left = max(1, int(settings.store.lock_retry_seconds - (time.monotonic() - started)))
+    engage_settings = settings.model_copy(
+        update={"store": settings.store.model_copy(update={"lock_retry_seconds": left})}
+    )
     try:
-        engaged = switch.engage(settings, clock, window_id=window_id, source=_OWNER, reason=note)
+        engaged = switch.engage(
+            engage_settings, clock, window_id=window_id, source=_OWNER, reason=note
+        )
     except Exception as exc:  # a bad clock reading, say: still not engaged
         engaged = switch.WriteFailed(f"{type(exc).__name__}: {exc}")
     if isinstance(engaged, switch.WriteFailed):
