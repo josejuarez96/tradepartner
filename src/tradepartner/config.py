@@ -225,6 +225,8 @@ class StoreConfig(_ClosedConfig):
     lock_retry_max_delay_seconds: float = Field(default=1.0, gt=0)
     memory_limit: str | None = None
     threads: int | None = Field(default=None, ge=1)
+    pre_migration_backups_to_keep: int = Field(default=2, ge=1)
+    backup_disk_margin_bytes: int = Field(default=1_000_000_000, ge=0)
 
     @field_validator("memory_limit")
     @classmethod
