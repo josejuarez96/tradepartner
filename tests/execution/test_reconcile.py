@@ -652,6 +652,21 @@ def test_nine_open_dues_do_not_try_an_unlisted_combination() -> None:
     assert _kinds(combination_only) == ["cash"]
 
 
+def test_above_cap_subset_proof_stops_at_its_state_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tradepartner.execution.reconcile._MAX_DIVIDEND_SUBSET_STATES", 32)
+    dues = tuple(float(2**i) for i in range(25))
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0 + float(2**24),
+        explanations=_explanations(
+            dividends={"SEC_A": float(2**25 - 1)}, dividend_dues={"SEC_A": dues}
+        ),
+    )
+    assert _kinds(result) == ["cash"]
+    assert result.adjustments == ()
+
+
 @pytest.mark.parametrize("dust", [0.004, 0.01])
 def test_dust_due_does_not_make_a_real_credit_ambiguous_or_get_journaled(dust: float) -> None:
     result = _run(
@@ -666,28 +681,26 @@ def test_dust_due_does_not_make_a_real_credit_ambiguous_or_get_journaled(dust: f
     assert [a.cash for a in result.adjustments] == [5.0]
 
 
-def test_a_positive_name_cannot_match_a_negative_individual_due() -> None:
-    with pytest.raises(ValueError, match="negative"):
-        _run(
-            _ledger(1_000.0, SEC_A=10.0),
-            _positions(AAA=10.0),
-            1_006.0,
-            explanations=_explanations(
-                dividends={"SEC_A": 5.0}, dividend_dues={"SEC_A": (6.0, -1.0)}
-            ),
-        )
+def test_a_long_name_can_match_its_positive_due_after_a_position_flip() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_006.0,
+        explanations=_explanations(dividends={"SEC_A": 5.0}, dividend_dues={"SEC_A": (6.0, -1.0)}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [6.0]
 
 
-def test_a_short_cannot_match_a_positive_individual_due() -> None:
-    with pytest.raises(ValueError, match="positive"):
-        _run(
-            Ledger(positions={}, cash=1_000.0, through=S, short_holdings={"SEC_A": 10.0}),
-            _positions(AAA=-10.0),
-            995.0,
-            explanations=_explanations(
-                dividends={"SEC_A": -5.0}, dividend_dues={"SEC_A": (-6.0, 1.0)}
-            ),
-        )
+def test_a_short_name_can_match_its_positive_due_after_a_position_flip() -> None:
+    result = _run(
+        Ledger(positions={}, cash=1_000.0, through=S, short_holdings={"SEC_A": 10.0}),
+        _positions(AAA=-10.0),
+        1_001.0,
+        explanations=_explanations(dividends={"SEC_A": -5.0}, dividend_dues={"SEC_A": (-6.0, 1.0)}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [1.0]
 
 
 def test_eight_open_dues_try_a_partial_combination() -> None:

@@ -142,7 +142,6 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
-from functools import cache
 from itertools import combinations
 
 from tradepartner.adapters.broker import (
@@ -173,6 +172,9 @@ MERGER_CASH = "cash"
 _BUY = "buy"
 _SELL = "sell"
 _ID_SEPARATOR = "-"
+# The above-eight-due uniqueness proof must stay bounded even for a contrived
+# book with many dues. Exhausting this many cent-sum states fails closed.
+_MAX_DIVIDEND_SUBSET_STATES = 10_000
 
 
 #: The non-trade activity types the ledger knows (spec 2026-10-12, item 2). A
@@ -895,14 +897,15 @@ def compare(
         if not math.isclose(math.fsum(finite), total, rel_tol=0.0, abs_tol=rounding):
             raise ValueError(f"dividend dues on {name} do not sum to its total {total}")
         dividend_dues.extend((name, amount) for amount in finite if amount != 0)
-    # A short's due is negative (-quantity x amount; item 10) and its cash band is
-    # [due, 0]; a long's is [0, due]. A negative due on any other name, or a
-    # positive one on a short, is the caller's fault.
-    negative = sorted({name for name, amount in dividend_dues if amount < 0 and name not in shorts})
+    # Individual dues can have opposite signs when a name flips between ex-dates.
+    # #1928 checks the per-name total against the current side of the holding.
+    negative = sorted(
+        name for name, amount in dividends.items() if amount < 0 and name not in shorts
+    )
     if negative:
         raise ValueError(f"dividend due is negative for {negative}")
     positive_short = sorted(
-        {name for name, amount in dividend_dues if amount > 0 and name in shorts}
+        name for name, amount in dividends.items() if amount > 0 and name in shorts
     )
     if positive_short:
         raise ValueError(f"dividend due is positive for the short {positive_short}")
@@ -1567,18 +1570,30 @@ def _fitting_dividend_subset_count(
         minimum[index] = minimum[index + 1] + min(0, cents[index])
         maximum[index] = maximum[index + 1] + max(0, cents[index])
 
-    @cache
-    def count(index: int, subtotal: int, used: bool) -> int:
-        if subtotal + minimum[index] > high or subtotal + maximum[index] < low:
-            return 0
-        if index == len(cents):
-            return int(used and low <= subtotal <= high)
-        without = count(index + 1, subtotal, used)
-        if without == 2:
-            return 2
-        return min(2, without + count(index + 1, subtotal + cents[index], True))
-
-    return count(0, 0, False)
+    # Each layer memoizes the number of ways (capped at two) to reach a cent
+    # sum, with a flag to exclude the empty subset. Count states across layers,
+    # and return two on exhaustion: `compare` will then report a cash mismatch.
+    ways: dict[tuple[int, bool], int] = {(0, False): 1}
+    states = 0
+    for index, amount in enumerate(cents):
+        next_ways: dict[tuple[int, bool], int] = {}
+        for (subtotal, used), count in ways.items():
+            for next_total, next_used in ((subtotal, used), (subtotal + amount, True)):
+                if next_total + minimum[index + 1] > high or next_total + maximum[index + 1] < low:
+                    continue
+                key = (next_total, next_used)
+                if key not in next_ways:
+                    states += 1
+                    if states > _MAX_DIVIDEND_SUBSET_STATES:
+                        return 2
+                next_ways[key] = min(2, next_ways.get(key, 0) + count)
+                if next_used and next_ways[key] == 2 and low <= next_total <= high:
+                    return 2
+        ways = next_ways
+    return min(
+        2,
+        sum(count for (subtotal, used), count in ways.items() if used and low <= subtotal <= high),
+    )
 
 
 def _dividend_adjustments(dividends: Sequence[tuple[str, float]]) -> list[ProposedAdjustment]:

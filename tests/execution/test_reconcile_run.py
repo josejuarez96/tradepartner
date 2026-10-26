@@ -16,7 +16,15 @@ from typing import Any, Protocol
 import polars as pl
 import pytest
 
-from tradepartner.adapters.broker import Account, CashActivity, OrderRequest, Position, Side
+from tradepartner.adapters.broker import (
+    Account,
+    Asset,
+    CashActivity,
+    OrderRequest,
+    Position,
+    PositionIntent,
+    Side,
+)
 from tradepartner.adapters.fake_broker import FakeBroker, PartialFill
 from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings
@@ -128,6 +136,30 @@ def fake(fixed_clock: FixedClock) -> BookedFake:
         price_of=lambda _s: PRICE,
         auto_fill=False,
         account_id="PA1",
+    )
+
+
+@pytest.fixture
+def flip_fake(fixed_clock: FixedClock) -> BookedFake:
+    """A paper broker whose SPY can be sold short between dividend ex-dates."""
+    return BookedFake(
+        assets={
+            "SPY": Asset(
+                tradable=True,
+                fractionable=True,
+                status="active",
+                cusip=None,
+                shortable=True,
+                easy_to_borrow=True,
+                marginable=True,
+            )
+        },
+        clock=fixed_clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        account_id="PA1",
+        paper=True,
+        activities=[FUNDING],
     )
 
 
@@ -404,6 +436,73 @@ def _sell_spy(settings: Settings, run_id: int, at: datetime) -> None:
             ingested_at=at,
         ),
     )
+
+
+def _filled_flip_trade(
+    settings: Settings,
+    fake: BookedFake,
+    run_id: int,
+    at: datetime,
+    side: Side,
+    intent: PositionIntent,
+) -> None:
+    """Journal and fill ten SPY shares on one side of a position flip."""
+    position_side = (
+        "short" if intent in (PositionIntent.SELL_TO_OPEN, PositionIntent.BUY_TO_CLOSE) else "long"
+    )
+    coid = f"tp-flip-{intent.value}-{at.date()}"
+    (decision_id,) = _append(
+        settings,
+        DecisionRow(
+            run_id=run_id,
+            rebalance_session=at.date(),
+            security_id=SPY,
+            side=side.value,
+            planned_quantity=10.0,
+            whole_share=False,
+            decision="trade",
+            position_side=position_side,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    assert decision_id is not None
+    _append(
+        settings,
+        OrderRow(
+            client_order_id=coid,
+            decision_id=decision_id,
+            run_id=run_id,
+            session=at.date(),
+            attempt=1,
+            phase="buy" if side is Side.BUY else "sell",
+            security_id=SPY,
+            symbol="SPY",
+            side=side.value,
+            quantity=10.0,
+            position_side=position_side,
+            sells_in_flight_at_submit=False,
+            known_at=at,
+            ingested_at=at,
+        ),
+        *(
+            OrderEventRow(client_order_id=coid, status=status, known_at=at, ingested_at=at)
+            for status in ("pending", "accepted", "filled")
+        ),
+        FillRow(
+            client_order_id=coid,
+            filled_at=at,
+            quantity=10.0,
+            price=PRICE,
+            price_implied=False,
+            broker_fill_id=f"fill-{coid}",
+            source="broker_feed",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    fake.submit(OrderRequest(coid, "SPY", side, quantity=10.0, position_intent=intent))
+    fake.simulate_fill(coid)
 
 
 def _reconcile(
@@ -1474,6 +1573,89 @@ def test_older_of_two_same_name_dividends_books_one_cash_row(
     assert [(a.kind, a.cash) for a in _adjustments(journal_settings, open_window)] == [
         ("dividend_cash", 5.0)
     ]
+
+
+def test_long_to_short_flip_still_books_the_older_long_dividend(
+    journal_settings: Settings,
+    flip_fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _hold(journal_settings, flip_fake, open_window, {(SPY, "SPY"): 10.0})
+    flipped = next_session(S)
+    ex2 = next_session(flipped)
+    traded_at = datetime.combine(flipped, datetime.min.time(), tzinfo=UTC) + timedelta(hours=18)
+    fixed_clock.now = traded_at
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, traded_at, Side.SELL, PositionIntent.SELL_TO_CLOSE
+    )
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, traded_at, Side.SELL, PositionIntent.SELL_TO_OPEN
+    )
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=S, source_action_id="long")
+    _dividend(journal_settings, SPY, 0.7, CUT, ex_date=ex2, source_action_id="short")
+    fixed_clock.now = datetime.combine(ex2, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            ex2,
+            as_of=fixed_clock.now,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividend_dues == {SPY: (5.0, -7.0)}
+    assert found.dividends == {SPY: -2.0}
+    flip_fake.activities = [CashActivity("long-credit", "DIV", ex2, "executed", 5.0, "SPY")]
+    flip_fake.extra_cash = 5.0
+    assert (
+        _reconcile(journal_settings, flip_fake, open_window, fixed_clock, session=ex2).status == OK
+    )
+    assert [(row.kind, row.cash) for row in _adjustments(journal_settings, open_window)] == [
+        ("dividend_cash", 5.0)
+    ]
+
+
+def test_short_to_long_flip_never_raises_for_mixed_sign_dividend_dues(
+    journal_settings: Settings,
+    flip_fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _run(journal_settings, open_window)
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, BOUGHT_AT, Side.SELL, PositionIntent.SELL_TO_OPEN
+    )
+    flipped = next_session(S)
+    ex2 = next_session(flipped)
+    traded_at = datetime.combine(flipped, datetime.min.time(), tzinfo=UTC) + timedelta(hours=18)
+    fixed_clock.now = traded_at
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, traded_at, Side.BUY, PositionIntent.BUY_TO_CLOSE
+    )
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, traded_at, Side.BUY, PositionIntent.BUY_TO_OPEN
+    )
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=S, source_action_id="short")
+    _dividend(journal_settings, SPY, 0.7, CUT, ex_date=ex2, source_action_id="long")
+    fixed_clock.now = datetime.combine(ex2, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            ex2,
+            as_of=fixed_clock.now,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividend_dues == {SPY: (-5.0, 7.0)}
+    assert found.dividends == {SPY: 2.0}
+    flip_fake.activities = [CashActivity("long-credit", "DIV", ex2, "executed", 7.0, "SPY")]
+    flip_fake.extra_cash = 7.0
+    result = _reconcile(journal_settings, flip_fake, open_window, fixed_clock, session=ex2)
+    assert result.status in (OK, MISMATCH)
+    if result.status == MISMATCH:
+        assert [m.kind for m in result.mismatches] == ["cash"]
 
 
 def test_expired_dividend_does_not_widen_deferred_cash_band(
