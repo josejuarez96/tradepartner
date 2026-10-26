@@ -416,7 +416,37 @@ Every alert is a row in the `alerts` table first (the source of truth), delivere
 | `drawdown` | Ledger equity fell more than `risk.max_drawdown` below the window's peak. | This engages the kill switch automatically (a risk rule, not a judgment call). `paper stop` is refused while the switch is engaged, so you cannot go straight to stopping: `paper resume --reason "..."` first (which also resets the drawdown peak to the ledger equity at the last mark — a further drop from the *new*, lower peak can trip it again), and only then decide whether to let trading continue or `paper stop --reason "..."` right away. |
 | `unspent_cash` | After buys executed, leftover cash exceeded `risk.max_unspent_cash_fraction` of equity. | Informational; check the plan's sizing on `paper status`. Does not engage the switch. |
 | `locked` | A second instance found the run lock (`<store.path>.paper.<book>.lock`, per book; book `main` also takes the pre-book `<store.path>.paper.lock`) held — by another `paper run`, or by a `resume`, `reconcile` or `stop` in progress. Ingest uses a separate store lock and is not a cause of this one. | No `paper_runs` row was written for this attempt; the lock holder's own run proceeds normally. If this was the day's only scheduled attempt, expect `missed_run` for S−1 on the next run, and on a fill session the rebalance falls to catch-up. If it recurs, check for a stuck process holding the paper lock, and avoid running `resume`/`reconcile`/`stop` right at the scheduled start time. |
-| `no_window` | `paper run` ran with no open window; `kill`, `resume`, `reconcile`, `abandon` and `override` are refused the same way but write no alert of their own. | Normal before the first `paper start` or after `paper stop`. If you expected a window to be open, check `paper status`. Once the final window has closed for good, `launchctl bootout` the paper job so it stops alerting daily. |
+| `no_window` | `paper run` ran with no open window; `kill`, `resume`, `reconcile`, `abandon` and `override` are refused the same way but write no alert of their own. | Normal before the first `paper start` or after `paper stop`. If you expected a window to be open, check `paper status`. Once the final window has closed for good, `launchctl bootout` the paper job so it stops alerting daily, and pause the paper heartbeat check (a no-window run pings `/fail`; a booted-out job mails as missed). A failure before the run starts (bad settings) sends no ping; the check then fires at its grace. |
+
+### A halt, off the Mac: the heartbeat and the halt card (#2155)
+
+The Mac cannot tell you it is off the network: on 2026-10-21..25 both books sat halted for three days with no one told. So each job also pings an outside **dead-man's-switch** check when it ends (`heartbeat.py`): the plain URL on success, `<url>/fail` on a non-zero outcome (a halt, a crash, `no_window`, stale ingest). The service mails you when a ping fails **or does not arrive** by its schedule plus grace, which also covers a Mac that is off, asleep or offline. The ping has a short timeout (`alerts.heartbeat_timeout_seconds`, default 5), never changes the job's exit code, and logs only the job name and error type, never the URL. No URL in `.env`, no ping.
+
+**One-time setup (yours; agents never touch `.env`).**
+1. On healthchecks.io (or a similar service) create two checks. `paper run`: schedule `5 8 * * *` (daily, like the plist) in the Mac's timezone, grace 60 minutes. `ingest`: `30 18 * * *`, grace 60 minutes. Point each check's email integration at an address your phone alerts on.
+2. Put each check's ping URL in `.env`: `ALERT_HEARTBEAT_URL_PAPER=...` and `ALERT_HEARTBEAT_URL_INGEST=...`. Each URL is a secret, scrubbed from output like the keys; never paste it into a plist, chat or issue. Every day pings, weekends and holidays included (`no_session` exits 0), so a Friday-night outage is caught on Saturday morning.
+3. Add `email` to `alerts.channels` and set the four `ALERT_SMTP_*` / `ALERT_EMAIL_TO` variables (`.env.example`), so the Mac's own alert mail also reaches your phone while the network is up. The heartbeat covers the case where it is not.
+4. Check once: `curl -fsS "$URL"` for each URL from the Mac turns the check green; `"$URL/fail"` should mail you.
+
+**The halt card.** A `halted` alert names a fault kind. For each: what it means, what to do, and the line to run once the cause is fixed. The `paper resume` line is per book and always reconciles first; run `paper status --all` before and after.
+
+| Fault in the alert | What it means | Fix path |
+|---|---|---|
+| `ClockError` | The clock returned an implausible or non-monotonic time. | Check the Mac's date and time sync, then resume. |
+| `ReconciliationError` | The ledger and the broker disagree and nothing explains it. | Read the mismatch in `paper status`; look at the broker's own account page. Resolve it (an order the broker filled or cancelled), then resume; resume refuses while it still fails. |
+| `RejectionCapError` | Too many of the run's orders were rejected by the broker. | Find the cause (symbol halted, account restriction), fix it, then resume, adding `--accept-rejections` only per the rule below. |
+| `SkipCapError` | Too many per-name skips in one rebalance. | Read the skip reasons in the alert; fix the data or universe cause, then resume. |
+| `LimitBreachError` | A planned or resulting position breaks a `risk.*` limit. | Read which limit; do not raise it to get past the halt. Resume once the plan is back inside. |
+| `AcknowledgementTimeoutError` | A submitted order was not acknowledged within `paper.accept_wait_seconds`. | Check the broker's status page and the order on its site; resume settles the pending order from the broker. |
+| `UniverseCollapseError` | The plan's universe fell under `paper.min_universe_names` or dropped too far. | Check the universe data and ingest (`health --check`); resume after the data is right. |
+| Anything else (a malformed broker row, a bad `.env` value, no network) | `run_failed`/`halted` with the exception named in `paper.err.log`. | Fix the cause from the log (network back, credentials, a data row), then resume. |
+
+```bash
+uv run tradepartner paper status --all
+uv run tradepartner paper resume --book <book> --reason "root cause and what you checked"
+```
+
+A halt does not close positions: while a book stays halted its positions are held as they were. If you would rather flatten, that is `paper abandon`, below; it is the last resort.
 
 ### Kill switch: engage, and the resume procedure
 
