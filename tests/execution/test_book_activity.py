@@ -41,6 +41,7 @@ def row(
     last: datetime | None = OPEN + timedelta(minutes=3),
     full_exit: bool = False,
     oid: str | None = None,
+    security_id: str | None = None,
 ) -> blotter.BlotterRow:
     filled = status in ("filled", "partial")
     return blotter.BlotterRow(
@@ -60,7 +61,7 @@ def row(
         first_fill_at=first if filled else None,
         last_fill_at=last if filled else None,
         full_exit=full_exit,
-        security_id=symbol,
+        security_id=symbol if security_id is None else security_id,
     )
 
 
@@ -94,6 +95,21 @@ def test_hand_values_ranges_exits_new_names_and_digest() -> None:
 def test_unknown_held_set_names_nothing_new() -> None:
     result = book_activity.summarise([row("DDD", "buy")], ET)
     assert result.buys.new_names == ()
+
+
+def test_empty_security_id_is_not_called_a_new_name() -> None:
+    result = book_activity.summarise([row("DDD", "buy", security_id="")], ET, held_before=set())
+    assert result.buys.new_names == ()
+
+
+def test_cross_day_range_includes_both_eastern_dates() -> None:
+    first = datetime(2026, 10, 26, 20, 1, tzinfo=UTC)  # Oct 26 4:01 PM EDT
+    last = datetime(2026, 10, 27, 13, 31, tzinfo=UTC)  # Oct 27 9:31 AM EDT
+    assert book_activity.time_range(first, last) == "Oct 26 4:01 PM to Oct 27 9:31 AM ET"
+
+
+def test_same_day_range_keeps_compact_format() -> None:
+    assert book_activity.time_range(OPEN, OPEN + timedelta(minutes=3)) == "9:31 to 9:34 AM ET"
 
 
 def test_range_is_eastern_not_utc_and_crosses_noon() -> None:

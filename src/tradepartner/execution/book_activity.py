@@ -83,11 +83,17 @@ def _clock(moment: datetime, tz: ZoneInfo) -> tuple[str, str]:
 
 
 def time_range(first: datetime, last: datetime, tz: ZoneInfo = EASTERN) -> str:
-    """`"9:31 to 9:34 AM ET"` (or `"11:58 AM to 12:03 PM ET"`), in `tz`, never UTC."""
+    """Show local fill times, adding dates when they span different local days."""
     if first.tzinfo is None or last.tzinfo is None:
         raise ValueError("fill times must be timezone-aware")
     (start, start_half), (end, end_half) = _clock(first, tz), _clock(last, tz)
     label = tz.key.rsplit("/", 1)[-1] if tz is not EASTERN else "ET"
+    first_local, last_local = first.astimezone(tz), last.astimezone(tz)
+    if first_local.date() != last_local.date():
+        return (
+            f"{first_local:%b} {first_local.day} {start} {start_half} to "
+            f"{last_local:%b} {last_local.day} {end} {end_half} {label}"
+        )
     if (start, start_half) == (end, end_half):
         return f"{start} {start_half} {label}"
     if start_half == end_half:
@@ -124,7 +130,10 @@ def _side(
             {
                 r.symbol
                 for r in filled
-                if r.side == "buy" and not r.full_exit and (r.security_id or r.symbol) not in held
+                if r.side == "buy"
+                and not r.full_exit
+                and r.security_id
+                and r.security_id not in held
             }
         )
         if held_before is not None
