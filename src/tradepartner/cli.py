@@ -414,7 +414,7 @@ from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
 from tradepartner.corpus import departure_fetch
 from tradepartner.execution import check as paper_check
-from tradepartner.execution import lots_reconcile, ops, reconcile_run, waiting, window
+from tradepartner.execution import lots_reconcile, ops, plain, reconcile_run, waiting, window
 from tradepartner.execution import report as paper_report
 from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
@@ -1186,6 +1186,11 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def _describe_failure(exc: BaseException) -> str:
+    """`_describe` plus the plain next step (#2203); display only."""
+    return f"{_describe(exc)}\n{plain.failure_hint(exc)}"
+
+
 def _echo_scrubbed(text: str, settings: Settings) -> None:
     """Print `text` through the `cli_record` fixture scrub (every lab command's output)."""
     typer.echo(_scrubbed(text, settings))
@@ -1619,7 +1624,7 @@ def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
     except window.KillWriteFailed as exc:
         message, code = f"failed: {exc}", WRITE_FAILED_EXIT_CODE
     except Exception as exc:
-        message, code = f"failed: {_describe(exc)}", CRASH_EXIT_CODE
+        message, code = f"failed: {_describe_failure(exc)}", CRASH_EXIT_CODE
     raise _fail(_scrubbed(message, settings), code)
 
 
@@ -1683,7 +1688,7 @@ def _status_lines(
         return ["paper status: no paper window yet" + _for_book(book)]
     state = data.switch_state
     switch_text = "n/a" if state is None else ("engaged" if state.engaged else "released")
-    causes = "; ".join(state.causes) if state is not None and state.causes else "-"
+    causes = plain.plain_causes(state.causes) if state is not None and state.causes else "-"
     recon = data.reconciliation
     lines = [
         f"window {data.window.window_id} (first rebalance {data.window.first_rebalance_session})",
@@ -4262,7 +4267,7 @@ def make_app(
             except Exception as exc:
                 heartbeat.ping(s, "paper", ok=False)
                 raise _fail(
-                    _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
+                    _scrubbed(f"paper run: failed: {_describe_failure(exc)}", s), CRASH_EXIT_CODE
                 ) from exc
             for entry in runs:
                 # The line before books for `paper.book_id` alone; any other book is named.
@@ -4276,7 +4281,7 @@ def make_app(
                             f": {said}" if isinstance(said, str) else ""
                         )
                     else:
-                        detail = f"failed: {_describe(entry.error)}"
+                        detail = f"failed: {_describe_failure(entry.error)}"
                     typer.echo(_scrubbed(f"{prefix}: {detail}", s), err=True)
                     continue
                 _run_lines(prefix, entry.outcome, s)
@@ -4299,7 +4304,7 @@ def make_app(
         except Exception as exc:
             heartbeat.ping(s, "paper", ok=False)
             raise _fail(
-                _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
+                _scrubbed(f"paper run: failed: {_describe_failure(exc)}", s), CRASH_EXIT_CODE
             ) from exc
         _run_lines("paper run", outcome, s)
         if not outcome.healthy:

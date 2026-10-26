@@ -33,7 +33,7 @@ import streamlit as st
 
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
-from tradepartner.execution import headroom, ops, waiting
+from tradepartner.execution import headroom, ops, plain, waiting
 from tradepartner.execution.ops import OpsData, OrderChain, RankedSignal
 from tradepartner.execution.switch import SwitchState
 from tradepartner.store import journal
@@ -114,7 +114,7 @@ def _render_no_window() -> None:
 
 def _switch_badge(state: SwitchState) -> None:
     if state.engaged:
-        theme.status_badge(f"kill switch: engaged ({'; '.join(state.causes)})", "critical")
+        theme.status_badge(f"kill switch: engaged ({plain.plain_causes(state.causes)})", "critical")
     elif state.run_in_progress:
         theme.status_badge("kill switch: run in progress", "warning")
     else:

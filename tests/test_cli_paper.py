@@ -1302,6 +1302,7 @@ def test_a_crash_in_one_book_does_not_stop_the_next_and_exits_non_zero_scrubbed(
     result = CliRunner().invoke(cli.make_app(clock=clock, broker=broken_main), ["paper", "run"])
     assert result.exit_code == 1, result.output
     assert "paper run: book main: failed: RuntimeError" in result.output
+    assert "Next: read ~/Library/Logs/tradepartner/paper.err.log" in result.output
     assert "paper run: book zeta: no_session" in result.output
     assert scrub_text(result.output, secrets=[ALPACA_KEY, ALPACA_SECRET])[1] == 0
     assert books.books == ["zeta"]
@@ -1868,11 +1869,13 @@ def test_status_all_lists_two_waiting_items_byte_for_byte(
         "book main: window 1 open; positions 0; open orders 0; kill switch engaged; "
         "last run n/a; next rebalance 2026-10-30\n"
         "waiting on you (2):\n"
-        f"  book b; kill_switch_engaged: kill switch engaged: kill_switch event 2 engaged "
-        f"(owner); since {SESSION_CLOCK}; command tradepartner paper resume --book b "
+        f"  book b; kill_switch_engaged: kill switch engaged: you switched it on "
+        f"(paper kill) (event 2); reason given: test; since {SESSION_CLOCK}; "
+        f"command tradepartner paper resume --book b "
         '--reason "<why>"\n'
-        f"  book main; kill_switch_engaged: kill switch engaged: kill_switch event 1 engaged "
-        f"(owner); since {SESSION_CLOCK}; command tradepartner paper resume --book main "
+        f"  book main; kill_switch_engaged: kill switch engaged: you switched it on "
+        f"(paper kill) (event 1); reason given: test; since {SESSION_CLOCK}; "
+        f"command tradepartner paper resume --book main "
         '--reason "<why>"\n',
     )
     assert _sha256(live) == before

@@ -165,7 +165,9 @@ def test_a_switch_engaged_by_a_halt_is_an_item_since_the_engaged_row() -> None:
         book_id="main",
         kind="kill_switch_engaged",
         since=_at(THU, 15),
-        detail="kill switch engaged: kill_switch event 1 engaged (fault); run 1 halted",
+        detail="kill switch engaged: a fault switched it on "
+        "(a failed check or broker problem) (event 1); "
+        "run 1 halted itself on a failed safety check",
         command='tradepartner paper resume --book main --reason "<why>"',
     )
 
@@ -179,7 +181,7 @@ def test_a_switch_with_only_a_run_in_progress_is_no_item() -> None:
     unfinished = _switch([], [running], lock_free=True)
     (item,) = build([BookFacts(book_id="main", switch=unfinished)], None)
     assert item.kind == "kill_switch_engaged" and item.since == _at(THU)
-    assert item.detail == "kill switch engaged: run 1 unfinished"
+    assert item.detail == "kill switch engaged: run 1 never finished (the process stopped part way)"
 
 
 def test_a_crashed_run_with_no_kill_switch_row_is_since_the_earliest_engaging_run() -> None:
@@ -192,7 +194,9 @@ def test_a_crashed_run_with_no_kill_switch_row_is_since_the_earliest_engaging_ru
     assert facts.state.engaged_row is None
     (item,) = build([BookFacts(book_id="main", switch=facts)], None)
     assert item.since == _at(FRI)
-    assert item.detail == "kill switch engaged: run 2 crashed; run 3 failed"
+    assert item.detail == (
+        "kill switch engaged: run 2 crashed with an error; run 3 failed with an error"
+    )
 
 
 def test_a_released_switch_is_no_item() -> None:
