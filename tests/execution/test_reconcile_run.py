@@ -1040,6 +1040,41 @@ def test_a_symbol_claimed_by_a_renamed_name_and_another_leaves_both_out(
     assert "claim SPY" in found.ambiguous[MTUM]
 
 
+@pytest.mark.parametrize(
+    ("at", "new"), [(CUT - timedelta(hours=1), "SPYX"), (None, "SPYZ")], ids=["s_minus_1", "other"]
+)
+def test_only_the_same_change_recorded_on_s_applies_in_the_order_map(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    at: datetime | None,
+    new: str,
+) -> None:
+    """#2185: a reconciliation that recorded the change on S-1 only, or one on S
+    that recorded another new symbol, is no evidence for S: the name stays out."""
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1))
+    stamp = fixed_clock() if at is None else at
+    change = {"security_id": SPY, "old_symbol": "SPY", "new_symbol": new}
+    _append(
+        journal_settings,
+        ReconciliationRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            at=stamp,
+            status="ok",
+            broker_cash=PRICE,
+            mismatches_json=json.dumps({"symbol_changes": [change]}),
+            known_at=stamp,
+            ingested_at=stamp,
+        ),
+    )
+
+    found = _order_symbols(journal_settings, open_window, SPY)
+
+    assert found.symbols == {}
+    assert SPY in found.ambiguous
+
+
 def test_the_order_map_reads_no_ticker_change_known_after_close_s_minus_1(
     journal_settings: Settings,
     fake: BookedFake,

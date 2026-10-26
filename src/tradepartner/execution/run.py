@@ -528,7 +528,7 @@ def stop_step(context: StepContext) -> BatchOutcome | None:
     # Read again: this run's forced exits block a `window_stop` exit of their name.
     book = _exit_book(context)
     stops = exits.stop_exits(
-        book.ledger.positions,
+        book.exitable(context),
         _residues(context, book),
         book.assets,
         book.decisions,
@@ -626,9 +626,23 @@ class _ExitBook:
     actions: pl.DataFrame
     open_sells: list[OpenSell]
     delisted: dict[str, date | None]
-    assets: dict[str, exits.ExitAsset]
+    assets: dict[str, Asset]
     marks: list[PositionDailyRow]
     runs: list[PaperRunRow]
+    #: Held names the one symbol map leaves ambiguous, with their notes (#2185).
+    ambiguous: dict[str, str] = field(default_factory=dict)
+
+    def exitable(self, context: StepContext) -> dict[str, float]:
+        """The ledger's holdings the exits may decide: an ambiguous name gets no
+        new forced or `window_stop` exit this run (its flags are never read
+        under the old symbol, and a guessed whole-share flag would be frozen on
+        the exit), noted on the run and in its `skipped` alert; the name stays
+        held, so `paper stop` refuses `not_flat` until it resolves."""
+        for name in sorted(set(self.ambiguous) & set(self.ledger.positions)):
+            line = f"{self.ambiguous[name]}; no new exit made while it is ambiguous"
+            context.notes.append(line)
+            context.gate.note_unsent(line)
+        return {k: v for k, v in self.ledger.positions.items() if k not in self.ambiguous}
 
 
 def _exit_book(context: StepContext) -> _ExitBook:
@@ -720,18 +734,13 @@ def _exit_book(context: StepContext) -> _ExitBook:
             sid: row["end_session"] for sid, row in ends.items() if row["status"] == DELISTED
         },
         assets={
-            **{
-                sid: context.assets[canonical_symbol(ticker)]
-                for sid, ticker in tickers.items()
-                if canonical_symbol(ticker) in context.assets
-            },
-            # A name the symbol map leaves ambiguous (#2185) is never read under
-            # its old symbol; its exit is journaled open, whole-share, and the
-            # wrapper keeps it open and notes it, never closing it `untradable`.
-            **dict.fromkeys(ambiguous, _KEPT_OPEN),
+            sid: context.assets[canonical_symbol(ticker)]
+            for sid, ticker in tickers.items()
+            if canonical_symbol(ticker) in context.assets
         },
         marks=marks_rows,
         runs=run_rows,
+        ambiguous=ambiguous,
     )
 
 
@@ -751,7 +760,7 @@ def _journal_forced_exits(
     exits journaled: (the decisions to hand to the sells phase, the names whose
     new exit was journaled closed `untradable`)."""
     new = exits.forced_exits(
-        book.ledger.positions,
+        book.exitable(context),
         book.delisted,
         book.assets,
         book.decisions,
@@ -1449,6 +1458,8 @@ class _Run:
         return self._finish(SKIPPED_KILL_SWITCH)
 
     def _finish(self, status: str) -> RunOutcome:
+        # A ticker-change note no batch alerted yet (#2185): the run's `skipped` alert.
+        self.gate.alert_unsent(self.run)
         finished = self.gate.read_clock()
         notes = tuple(dict.fromkeys(self.notes))
         with self.connect() as conn:
@@ -2327,19 +2338,6 @@ def _rebalance_kind(
         planning.frozen_max_catch_up_sessions(window),
         cadence=cadence,
     )
-
-
-@dataclass(frozen=True)
-class _KeptOpen:
-    """The exits' flags for a name the symbol map leaves ambiguous (#2185):
-    no `assets` read is made under its old symbol, so its exit is not closed
-    `untradable` but journaled open and whole-share; the wrapper never sends it."""
-
-    tradable: bool = True
-    fractionable: bool = False
-
-
-_KEPT_OPEN = _KeptOpen()
 
 
 def _current_symbols(

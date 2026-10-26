@@ -787,6 +787,8 @@ def test_a_forced_exit_of_an_ambiguous_held_name_stays_open_and_is_noted(
     assert _submits(env.fake) == []
     assert _decision_events(env.settings) == []
     assert any(f"DUALA -> {RENAMED}" in n and "kept open" in n for n in notes)
+    ((_, message),) = _skipped_alerts(env)
+    assert f"DUALA -> {RENAMED}" in message and "kept open" in message
 
 
 def test_a_buy_of_an_ambiguous_name_is_skipped_not_halted(

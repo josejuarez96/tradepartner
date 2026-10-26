@@ -646,6 +646,8 @@ class RiskGatedBroker:
         self._journal = journal
         self._calendar = calendar
         self._alerter = alerter
+        #: Ticker-change lines (#2185) the run's `skipped` alert still owes.
+        self._unsent: list[str] = []
         self._sleep = sleep
         self._last: datetime | None = None
         #: The batch's orders `_collect` and `_await_sells` never poll: the
@@ -765,16 +767,29 @@ class RiskGatedBroker:
         self._alert_skips(run, outcome.skips)
         return outcome
 
+    def note_unsent(self, line: str) -> None:
+        """Owe the run's `skipped` alert `line`: a held name a ticker change
+        leaves ambiguous whose exit is not sent (#2185)."""
+        self._unsent.append(line)
+
+    def alert_unsent(self, run: PaperRunRow) -> None:
+        """Write the run's `skipped` alert for the owed ticker-change lines, if
+        no batch has (the run's last step calls it)."""
+        self._alert_skips(run, ())
+
     def _alert_skips(self, run: PaperRunRow, skips: Sequence[Skip]) -> None:
         """One `skipped` alert for the run naming every per-name skip (the three
-        allowlist reasons) by security id and reason. The alerter dedupes on
-        (kind, run), so a second call in one run is a no-op."""
+        allowlist reasons) by security id and reason, and every owed
+        ticker-change line (#2185). The alerter dedupes on (kind, run), so a
+        second call in one run is a no-op."""
         named = [s for s in skips if s.reason in _ALERTED_SKIPS]
-        if not named or run.run_id is None:
+        unsent = list(dict.fromkeys(self._unsent))
+        if (not named and not unsent) or run.run_id is None:
             return
-        message = self._scrub(
-            f"{len(named)} skipped: " + "; ".join(f"{s.security_id} {s.reason}" for s in named)
-        )
+        self._unsent = []
+        listed = "; ".join(f"{s.security_id} {s.reason}" for s in named)
+        parts = [f"{len(named)} skipped: {listed}"] if named else []
+        message = self._scrub("; ".join([*parts, *unsent]))
         # No guard, as the run's other alerts (`run._alert`): an error takes the fault path.
         self._alerter.write(
             "skipped",
@@ -827,7 +842,7 @@ class RiskGatedBroker:
                 return BatchOutcome(_SKIPPED_KILL_SWITCH)
             assets = self._phase_assets(run, book, rows, _SELL)
             _refuse_unknown_held(assets, book)
-            kept, unsent = _drop_ambiguous(book, rows, _SELL, notes)
+            kept, unsent = _drop_ambiguous(book, rows, _SELL, notes, self._unsent)
             # Read once so the trim `sell_orders` caps and the `check_phase`
             # that verifies it see the same open sells (#605): both are the
             # same session's read of this same `book`.
@@ -920,7 +935,7 @@ class RiskGatedBroker:
         account = self._broker.account()
         cash = self._buys_cash(account, book, run.session)
         costs = book.costs
-        kept, unsent = _drop_ambiguous(book, rows, _BUY, notes)
+        kept, unsent = _drop_ambiguous(book, rows, _BUY, notes, self._unsent)
         built = phases.buy_orders(
             [r for r in rows if r.side != _BUY or r.security_id in kept],
             book.states,
@@ -1981,7 +1996,7 @@ class RiskGatedBroker:
 
 
 def _drop_ambiguous(
-    book: _Book, rows: Sequence[DecisionRow], phase: str, notes: list[str]
+    book: _Book, rows: Sequence[DecisionRow], phase: str, notes: list[str], alerted: list[str]
 ) -> tuple[frozenset[str], tuple[Skip, ...]]:
     """The batch's names the phase may build orders for, and the skips of the
     ones the one symbol map leaves ambiguous after a ticker change (#2185),
@@ -1991,7 +2006,7 @@ def _drop_ambiguous(
     `untargeted_receipt` or `window_stop`) is neither ordered nor skipped: it
     stays open, so the name is still held and `paper stop` refuses `not_flat`
     while it is; closing it skipped would leave the position held with its exit
-    closed."""
+    closed. Its line also goes on `alerted`, the run's `skipped` alert."""
     attempts = [
         a.decision
         for a in attempt_scope(rows, book.states, phase=phase).attempts
@@ -2001,7 +2016,9 @@ def _drop_ambiguous(
     for decision in attempts:
         note = book.ambiguous[decision.security_id]
         if decision.decision == _FORCED_EXIT:
-            notes.append(f"{note}; forced exit {decision.decision_id} kept open, not sent")
+            line = f"{note}; forced exit {decision.decision_id} kept open, not sent"
+            notes.append(line)
+            alerted.append(line)
             continue
         assert decision.decision_id is not None
         skips.append(Skip(decision.decision_id, decision.security_id, _SKIP_ASSET_UNKNOWN))

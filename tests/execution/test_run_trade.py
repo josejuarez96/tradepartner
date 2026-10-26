@@ -1103,13 +1103,15 @@ def test_a_renamed_held_names_forced_exit_is_sent_under_the_symbol_reconcile_map
     assert [r.symbol for r in env.submits()[sent_before:]] == ["DUALBX"]
 
 
-def test_an_ambiguous_held_names_forced_exit_stays_open_and_the_run_notes_the_change(
+def test_an_ambiguous_held_name_gets_no_exit_until_the_broker_renames_it(
     env: Env, window: PaperWindowRow
 ) -> None:
     """The broker has not renamed DUALB yet, so the change in force is ambiguous:
-    the forced exit is journaled open and kept open (not closed `untradable`, which
-    would leave the name held with its exit closed), nothing is sent under the old
-    symbol, and the `paper_run_results` row's notes name the change."""
+    no forced exit is made (its flags are never read under the old symbol, and a
+    guessed whole-share flag would be frozen on it), nothing is sent, the name
+    stays held, and the result row's notes and the run's `skipped` alert name the
+    change. Once the broker holds `DUALBX`, the next run's exit sells the
+    fractional holding under it."""
     bought(env)
     delist(env, "SEC_DUAL_B", at(F_0, 19, 0))
     rename(env, "SEC_DUAL_B", "DUALBX", at(F_0, 19, 0), broker=False)
@@ -1121,12 +1123,25 @@ def test_an_ambiguous_held_names_forced_exit_stays_open_and_the_run_notes_the_ch
     assert status == "ok"
     assert env.submits()[sent_before:] == []
     assert "DUALB" in env.held()
-    assert message is not None and "DUALB -> DUALBX" in message and "kept open" in message
-    (exit_id,) = [
-        d
-        for (d,) in env.query(
-            "SELECT decision_id FROM decisions WHERE security_id = 'SEC_DUAL_B' "
-            "AND decision = 'forced_exit'"
+    assert message is not None and "DUALB -> DUALBX" in message
+    assert "no new exit made" in message
+    assert (
+        env.query(
+            "SELECT 1 FROM decisions WHERE security_id = 'SEC_DUAL_B' AND decision = 'forced_exit'"
         )
-    ]
-    assert env.query("SELECT 1 FROM decision_events WHERE decision_id = ?", [exit_id]) == []
+        == []
+    )
+    ((run_id, _session, alert),) = env.alerts("skipped")
+    assert run_id == outcome.run_id and "DUALB -> DUALBX" in alert
+
+    held = env.held()["DUALB"]
+    assert held != int(held)  # a fractional holding
+    close = env.prices["DUALB"]
+    env.fake.set_asset("DUALBX", Asset(True, True, "active", None))
+    env.fake._net_quantity["DUALBX"] = env.fake._net_quantity.pop("DUALB")
+    later = env.run(at(next_session(F_0_PLUS_1)), prices={"DUALBX": close})
+
+    assert later.status == "ok", env.result(env.latest_run())
+    (sell,) = env.submits()[sent_before:]
+    assert sell.symbol == "DUALBX"
+    assert sell.quantity == pytest.approx(held)
