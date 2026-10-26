@@ -36,7 +36,13 @@ from tradepartner.execution.alerts import Alerter
 from tradepartner.execution.collect import WriteOffContext, collect
 from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.store.db import insert_row, open_for_write
-from tradepartner.store.journal import DecisionRow, OrderEventRow, OrderRow, append
+from tradepartner.store.journal import (
+    DecisionRow,
+    OrderEventRow,
+    OrderRow,
+    ReconciliationRow,
+    append,
+)
 
 from .test_wrapper_phases import (
     CUT,
@@ -658,3 +664,159 @@ def test_an_unknown_4xx_on_a_buy_still_halts(
     assert _events_of(env, first.client_order_id) == [("pending", None)]
     assert _decision_events(env.settings) == []
     assert _skipped_alerts(env) == []
+
+
+# --- one symbol map after a ticker change (#2185) ------------------------------------
+
+#: A's ticker change: `DUALA` -> `DUALX`, known at close(S-1); the listings still say `DUALA`.
+RENAMED = "DUALX"
+
+
+def _rename(env: Env, security_id: str, *, applied: bool, new: str = RENAMED) -> None:
+    """A stored `symbol_changes` row for `security_id` known a minute before
+    close(S-1) and, when `applied`, the window's reconciliation on S that applied
+    it (the broker held `new`, so the fake renamed the asset too)."""
+    known = CUT - timedelta(minutes=1)
+    with open_for_write(env.settings) as conn:
+        insert_row(
+            conn,
+            "symbol_changes",
+            {
+                "security_id": security_id,
+                "old_symbol": SYMBOLS[security_id],
+                "new_symbol": new,
+                "old_cusip": f"OLD-{security_id}",
+                "new_cusip": f"NEW-{security_id}",
+                "process_date": PREV,
+                "source_action_id": f"rename-{new}",
+                "known_at": known,
+                "ingested_at": known,
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+    if not applied:
+        return
+    env.fake.set_asset(new, Asset(tradable=True, fractionable=True, status="active", cusip=None))
+    env.prices[new] = PRICE
+    # The broker's rename of the position (the fake has no corporate actions).
+    held = env.fake._net_quantity.pop(SYMBOLS[security_id], None)
+    if held is not None:
+        env.fake._net_quantity[new] = held
+    change = {"security_id": security_id, "old_symbol": SYMBOLS[security_id], "new_symbol": new}
+    at = env.clock.now - timedelta(minutes=1)
+    with open_for_write(env.settings) as conn:
+        append(
+            conn,
+            ReconciliationRow(
+                window_id=env.window.window_id,  # type: ignore[arg-type]
+                run_id=env.run.run_id,
+                at=at,
+                status="ok",
+                broker_cash=100_000.0,
+                mismatches_json=json.dumps({"symbol_changes": [change]}),
+                known_at=at,
+                ingested_at=at,
+            ),
+        )
+
+
+def _assets_asked(env: Env) -> set[str]:
+    return {s for c in env.fake.calls if c.method == "assets" for s in c.args[0]}  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("decision", ["trade", "forced_exit"])
+def test_the_order_path_sends_a_renamed_held_name_under_the_symbol_reconcile_mapped(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, decision: str
+) -> None:
+    """The #2185 probe: hold A; a change to `DUALX` known at close(S-1); the listings
+    still show `DUALA`; the run's reconciliation on S applied the change. The sell
+    (a trim or a forced exit) goes out under `DUALX`, never `DUALA`."""
+    _hold(env, A, 10.0)
+    _rename(env, A, applied=True)
+    if decision == "forced_exit":
+        sell = _decision(env, A, "sell", quantity=10.0, decision="forced_exit", reason="delisted")
+        outcome = _execute(_gate(env, alerter_conn), env, [], (sell,))
+    else:
+        trim = _decision(env, A, "sell", notional=300.0)
+        outcome = _execute(_gate(env, alerter_conn), env, [trim])
+
+    assert outcome.status == "ok"
+    assert [r.symbol for r in _submits(env.fake)] == [RENAMED]
+    assert SYMBOLS[A] not in _assets_asked(env)
+
+
+def test_an_ordinary_sell_of_an_ambiguous_held_name_is_skipped_with_a_note(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """A change in force the reconciliation did not apply leaves A ambiguous: its
+    trim is `skip_asset_unknown`, never sent under `DUALA`, the run's note names
+    the change, and B's trim still goes out (per name, never run-wide)."""
+    _hold(env, A, 10.0)
+    _hold(env, B, 10.0)
+    _rename(env, A, applied=False)
+    trim_a = _decision(env, A, "sell", notional=300.0)
+    trim_b = _decision(env, B, "sell", notional=300.0)
+    notes: list[str] = []
+
+    outcome = _gate(env, alerter_conn).execute(env.run, [trim_a, trim_b], (), notes=notes)
+
+    assert outcome.status == "ok"
+    assert [r.symbol for r in _submits(env.fake)] == [SYMBOLS[B]]
+    assert SYMBOLS[A] not in _assets_asked(env)
+    assert (trim_a.decision_id, "skipped", "skip_asset_unknown") in _decision_events(env.settings)
+    assert any(f"DUALA -> {RENAMED}" in n and "skip_asset_unknown" in n for n in notes)
+
+
+@pytest.mark.parametrize("reason", ["delisted", "window_stop"])
+def test_a_forced_exit_of_an_ambiguous_held_name_stays_open_and_is_noted(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, reason: str
+) -> None:
+    """A forced exit (or a `window_stop` full exit) of an ambiguous name is neither
+    sent nor closed skipped: closing it would leave the name held with its exit
+    closed. It stays open (no event), so `paper stop` still sees the holding,
+    and the run notes it with the change."""
+    _hold(env, A, 10.0)
+    _rename(env, A, applied=False)
+    exit_a = _decision(env, A, "sell", quantity=10.0, decision="forced_exit", reason=reason)
+    notes: list[str] = []
+
+    outcome = _gate(env, alerter_conn).execute(env.run, [], (exit_a,), notes=notes)
+
+    assert outcome.status == "ok"
+    assert _submits(env.fake) == []
+    assert _decision_events(env.settings) == []
+    assert any(f"DUALA -> {RENAMED}" in n and "kept open" in n for n in notes)
+
+
+def test_a_buy_of_an_ambiguous_name_is_skipped_not_halted(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """A buy of a name whose change is in force but not applied is
+    `skip_asset_unknown` with the change noted; the other buy is sent."""
+    _rename(env, B, applied=False, new="DUALBX")
+    buy_a = _decision(env, A, "buy", notional=3000.0)
+    buy_b = _decision(env, B, "buy", notional=3000.0)
+    notes: list[str] = []
+
+    outcome = _gate(env, alerter_conn).execute(env.run, [buy_a, buy_b], (), notes=notes)
+
+    assert outcome.status == "ok"
+    assert [r.symbol for r in _submits(env.fake)] == [SYMBOLS[A]]
+    assert (buy_b.decision_id, "skipped", "skip_asset_unknown") in _decision_events(env.settings)
+    assert any("DUALB -> DUALBX" in n for n in notes)
+
+
+def test_a_held_name_the_broker_does_not_know_still_halts_when_it_is_not_ambiguous(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """Today's `_refuse_unknown_held` halt is unchanged for a name with no ticker
+    change: B's change does not touch A, so A's 404 is still a disagreement."""
+    _hold(env, A, 10.0)
+    _rename(env, B, applied=False, new="DUALBX")
+    env.fake.remove_asset(SYMBOLS[A])
+
+    with pytest.raises(ReconciliationError):
+        _execute(_gate(env, alerter_conn), env, [_decision(env, A, "sell", notional=300.0)])
+
+    assert _submits(env.fake) == []

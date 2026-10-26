@@ -1052,3 +1052,81 @@ def test_step_8_reconciles_against_the_fills_step_7b_journaled(
     step_4, step_8 = rows[0][1], rows[1][1]
     assert step_4 < min(known)  # step 4 ran before any fill: an empty book
     assert step_8 >= max(known)
+
+
+# --- one symbol map after a ticker change (#2185) ------------------------------------
+
+
+def rename(env: Env, security_id: str, new: str, known_at: datetime, *, broker: bool) -> None:
+    """A stored `symbol_changes` row (the listings keep the old ticker) and, when
+    `broker`, the broker's rename of the position and the asset."""
+    old = SYMBOLS[security_id]
+    env.insert(
+        "symbol_changes",
+        {
+            "security_id": security_id,
+            "old_symbol": old,
+            "new_symbol": new,
+            "old_cusip": f"OLD-{security_id}",
+            "new_cusip": f"NEW-{security_id}",
+            "process_date": known_at.date(),
+            "source_action_id": f"rename-{new}",
+            "known_at": known_at,
+            "ingested_at": known_at,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
+    if not broker:
+        return
+    env.fake.set_asset(new, Asset(True, True, "active", None))
+    # The broker's rename of the position (the fake has no corporate actions).
+    env.fake._net_quantity[new] = env.fake._net_quantity.pop(old)
+
+
+def test_a_renamed_held_names_forced_exit_is_sent_under_the_symbol_reconcile_mapped(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The #2185 probe end to end: DUALB is held, its listing ends and a change to
+    `DUALBX` is known at close(F_0), the listings still say `DUALB`, and the broker
+    holds `DUALBX`. The run's reconciliation maps `DUALBX` and the forced exit is
+    sent under it, never under `DUALB`."""
+    bought(env)
+    delist(env, "SEC_DUAL_B", at(F_0, 19, 0))
+    rename(env, "SEC_DUAL_B", "DUALBX", at(F_0, 19, 0), broker=True)
+    close = env.prices["DUALB"]
+    sent_before = len(env.submits())
+
+    outcome = env.run(at(F_0_PLUS_1), prices={"DUALBX": close})
+
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert [r.symbol for r in env.submits()[sent_before:]] == ["DUALBX"]
+
+
+def test_an_ambiguous_held_names_forced_exit_stays_open_and_the_run_notes_the_change(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The broker has not renamed DUALB yet, so the change in force is ambiguous:
+    the forced exit is journaled open and kept open (not closed `untradable`, which
+    would leave the name held with its exit closed), nothing is sent under the old
+    symbol, and the `paper_run_results` row's notes name the change."""
+    bought(env)
+    delist(env, "SEC_DUAL_B", at(F_0, 19, 0))
+    rename(env, "SEC_DUAL_B", "DUALBX", at(F_0, 19, 0), broker=False)
+    sent_before = len(env.submits())
+
+    outcome = env.run(at(F_0_PLUS_1))
+
+    status, _fault, message = env.result(outcome.run_id)
+    assert status == "ok"
+    assert env.submits()[sent_before:] == []
+    assert "DUALB" in env.held()
+    assert message is not None and "DUALB -> DUALBX" in message and "kept open" in message
+    (exit_id,) = [
+        d
+        for (d,) in env.query(
+            "SELECT decision_id FROM decisions WHERE security_id = 'SEC_DUAL_B' "
+            "AND decision = 'forced_exit'"
+        )
+    ]
+    assert env.query("SELECT 1 FROM decision_events WHERE decision_id = ?", [exit_id]) == []
