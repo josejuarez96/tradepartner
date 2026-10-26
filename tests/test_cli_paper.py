@@ -1304,6 +1304,7 @@ def test_a_crash_in_one_book_does_not_stop_the_next_and_exits_non_zero_scrubbed(
     result = CliRunner().invoke(cli.make_app(clock=clock, broker=broken_main), ["paper", "run"])
     assert result.exit_code == 1, result.output
     assert "paper run: book main: failed: RuntimeError" in result.output
+    assert "Next: read ~/Library/Logs/tradepartner/paper.err.log" in result.output
     assert "paper run: book zeta: no_session" in result.output
     assert scrub_text(result.output, secrets=[ALPACA_KEY, ALPACA_SECRET])[1] == 0
     assert books.books == ["zeta"]
@@ -1924,6 +1925,30 @@ def test_status_drops_the_overdue_line_once_the_cash_is_booked(
 
 
 @pytest.mark.usefixtures("started")
+def test_status_all_shows_a_secret_in_the_kill_reason_scrubbed(
+    clock: _Clock, factory: _Factory
+) -> None:
+    secret = "PKREALSECRETVALUE1234567890"  # gitleaks:allow
+    with open_for_write(_settings()) as conn:
+        journal.append(
+            conn,
+            journal.KillSwitchRow(
+                window_id=1,
+                at=SESSION_CLOCK,
+                state="engaged",
+                source="owner",
+                reason=f"stop\n  key {secret}",
+                known_at=SESSION_CLOCK,
+                ingested_at=SESSION_CLOCK,
+            ),
+        )
+    out = _paper(clock, factory, "status", "--all")
+    assert out.exit_code == 0, out.output
+    assert "reason given: stop key" in out.output
+    assert secret not in out.output
+
+
+@pytest.mark.usefixtures("started")
 def test_status_all_lists_two_waiting_items_byte_for_byte(
     clock: _Clock, factory: _Factory, live: Path
 ) -> None:
@@ -1956,11 +1981,15 @@ def test_status_all_lists_two_waiting_items_byte_for_byte(
         "main: halted today; run: tradepartner paper resume --book main "
         '--reason "<why>"\n'
         "waiting on you (2):\n"
-        f"  book b; kill_switch_engaged: kill switch engaged: kill_switch event 2 engaged "
-        f"(owner); since {since_et}; command tradepartner paper resume --book b "
+        f"  book b; kill_switch_engaged: kill switch engaged: you switched it on "
+        f"(paper kill, or an override you set) (event 2); reason given: test; "
+        f"since {since_et}; "
+        f"command tradepartner paper resume --book b "
         '--reason "<why>"\n'
-        f"  book main; kill_switch_engaged: kill switch engaged: kill_switch event 1 engaged "
-        f"(owner); since {since_et}; command tradepartner paper resume --book main "
+        f"  book main; kill_switch_engaged: kill switch engaged: you switched it on "
+        f"(paper kill, or an override you set) (event 1); reason given: test; "
+        f"since {since_et}; "
+        f"command tradepartner paper resume --book main "
         '--reason "<why>"\n'
         f"book b: window {b_window} open; positions 0; open orders 0; kill switch engaged; "
         f"last run n/a; {nxt}"
