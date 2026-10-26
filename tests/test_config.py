@@ -133,6 +133,19 @@ def test_edgar_gap_lookback_is_bounded(value: int) -> None:
         Settings(_env_file=None, ingest={"edgar_gap_lookback_sessions": value})
 
 
+def test_edgar_max_age_sessions_default_and_bounds() -> None:
+    assert _settings().ingest.edgar_max_age_sessions == 3
+    assert (
+        Settings(
+            _env_file=None, ingest={"edgar_max_age_sessions": 20}
+        ).ingest.edgar_max_age_sessions
+        == 20
+    )
+    for value in (0, 21, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ingest={"edgar_max_age_sessions": value})
+
+
 def test_fred_rate_defaults_and_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings()
     assert settings.fred_api_key is None
