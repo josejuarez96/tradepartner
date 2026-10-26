@@ -40,8 +40,8 @@ def _engaged_rows() -> int:
 
 
 def _busy_timer_probes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The first probe is free; another process owns the store while a timer probes."""
-    real = cli.open_for_write
+    """An external writer owns the store when the timer's read-only check runs."""
+    real = cli.open_read_only
 
     @contextmanager
     def probe(settings: object) -> Iterator[object]:
@@ -50,7 +50,7 @@ def _busy_timer_probes(monkeypatch: pytest.MonkeyPatch) -> None:
         with real(settings) as conn:  # type: ignore[arg-type]
             yield conn
 
-    monkeypatch.setattr(cli, "open_for_write", probe)
+    monkeypatch.setattr(cli, "open_read_only", probe)
 
 
 @contextmanager
@@ -70,6 +70,57 @@ def _reader_holds(path: str, *, seconds: float) -> Iterator[None]:
     finally:
         proc.kill()
         proc.wait()
+
+
+@contextmanager
+def _writer_holds(path: str, *, seconds: float) -> Iterator[None]:
+    """A separate process keeps DuckDB's write lock after the kill starts."""
+    code = (
+        "import duckdb, time\n"
+        f"c = duckdb.connect({path!r}, read_only=False)\n"
+        "print('held', flush=True)\n"
+        f"time.sleep({seconds})\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout is not None
+    assert proc.stdout.readline().strip() == "held"
+    try:
+        yield
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.usefixtures("started")
+def test_paper_kill_waits_for_another_process_writer_and_engages(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _Clock,  # noqa: F811
+    factory: _Factory,  # noqa: F811
+) -> None:
+    monkeypatch.setenv("STORE__LOCK_RETRY_SECONDS", "1")
+    monkeypatch.setenv("STORE__WRITER_LOCK_RETRY_SECONDS", "5")
+    before = _engaged_rows()
+    with _writer_holds(_settings().store.path, seconds=2):
+        out = _paper(clock, factory, "kill", "--reason", LONG_REASON)
+    assert out.exit_code == 0, out.output
+    assert _engaged_rows() == before + 1
+
+
+@pytest.mark.usefixtures("started")
+def test_paper_kill_writer_outlasts_wait_and_reports_not_engaged(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _Clock,  # noqa: F811
+    factory: _Factory,  # noqa: F811
+) -> None:
+    monkeypatch.setenv("STORE__LOCK_RETRY_SECONDS", "1")
+    monkeypatch.setenv("STORE__WRITER_LOCK_RETRY_SECONDS", "2")
+    before = _engaged_rows()
+    with _writer_holds(_settings().store.path, seconds=10):
+        out = _paper(clock, factory, "kill", "--reason", LONG_REASON)
+    assert out.exit_code == cli.WRITE_FAILED_EXIT_CODE
+    assert "kill switch NOT engaged yet: store busy" in out.output
+    assert "kill switch NOT engaged: store busy" in out.output
+    assert _engaged_rows() == before
 
 
 def test_writer_wait_defaults_above_the_reader_wait() -> None:

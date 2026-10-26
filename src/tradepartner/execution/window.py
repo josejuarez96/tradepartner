@@ -188,7 +188,7 @@ a false `no_window` (#1261, T132).
   [...], "pending": [...]}` from that reconciliation's `mismatches_json`.
   `start` never parses it (after an abandoned window the account must be
   strictly flat). It releases nothing.
-- **`kill(settings, connect, clock, reason)`** is `paper kill`. It takes no
+- **`kill(settings, clock, reason)`** is `paper kill`. It takes no
   run lock, so the owner can engage while a run holds it, refuses
   `no_window` and `multiple_open_windows` (spec req 14: only one window per
   book may ever be open; nothing is written for either refusal) and appends an
@@ -225,11 +225,13 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, cast, get_args
 from zoneinfo import ZoneInfo
 
@@ -1503,7 +1505,6 @@ def _abandon_row(
 
 def kill(
     settings: Settings,
-    connect: Connect,
     clock: Callable[[], datetime],
     reason: str,
     *,
@@ -1515,13 +1516,32 @@ def kill(
     Raises `WindowCommandRefused` for a blank reason, no open window for the book,
     or more than one (only one window per book may ever be open, spec req 14;
     nothing is written for any of these), `ValueError` for a book outside the
-    token grammar, and `KillWriteFailed` when the row cannot be written."""
+    token grammar, and `KillWriteFailed` when the row cannot be written. The
+    read-only lookup retries within the writer wait while reserving the
+    ordinary lock wait for the engagement write."""
     note = _note(reason, "paper kill")
     book = resolve_book(settings, book_id)
-    with open_read_only(settings) as conn:
+    if not Path(settings.store.path).is_file():
+        raise WindowCommandRefused(NO_WINDOW, "no_window: no paper window is open")
+    total = settings.store.writer_lock_retry_seconds
+    # When the configured writer wait is shorter than the ordinary wait, both
+    # phases still get a chance within that shorter total.
+    minimum = min(settings.store.lock_retry_seconds, total // 2 if total > 1 else total)
+    read_wait = max(0, total - minimum)
+    read_settings = settings.model_copy(
+        update={"store": settings.store.model_copy(update={"lock_retry_seconds": read_wait})}
+    )
+    started = time.monotonic()
+    with open_read_only(read_settings, retry=True) as conn:
         _, window_id = _window_of(conn, book)
+    engage_wait = max(minimum, int(total - (time.monotonic() - started)))
+    engage_settings = settings.model_copy(
+        update={"store": settings.store.model_copy(update={"lock_retry_seconds": engage_wait})}
+    )
     try:
-        engaged = switch.engage(settings, clock, window_id=window_id, source=_OWNER, reason=note)
+        engaged = switch.engage(
+            engage_settings, clock, window_id=window_id, source=_OWNER, reason=note
+        )
     except Exception as exc:  # a bad clock reading, say: still not engaged
         engaged = switch.WriteFailed(f"{type(exc).__name__}: {exc}")
     if isinstance(engaged, switch.WriteFailed):

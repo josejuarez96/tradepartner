@@ -4370,13 +4370,14 @@ def make_app(
         chosen = _checked_book(book)
         if every_book and chosen is not None:
             raise _fail("--all and --book cannot be combined", USAGE_ERROR)
-        s = _writer_settings(paper_settings(reason))
+        s = paper_settings(reason)
+        writer_s = _writer_settings(s)
 
         def waiting_line(holder: str) -> None:
             typer.echo(
                 "paper kill: kill switch NOT engaged yet: store busy "
                 f"(held by {holder}), waiting up to "
-                f"{s.store.lock_retry_seconds} s",
+                f"{writer_s.store.lock_retry_seconds} s",
                 err=True,
             )
 
@@ -4385,14 +4386,14 @@ def make_app(
 
             def probe() -> None:
                 try:
-                    with open_for_write(replace_wait(s, 0)):
+                    with open_read_only(replace_wait(writer_s, 0)):
                         pass
                 except StoreLockedError as busy:
                     holder = _lock_holder(busy)
                     if holder != "another connection in this process":
                         notice(holder)
 
-            timer = threading.Timer(s.store.lock_retry_initial_delay_seconds * 2, probe)
+            timer = threading.Timer(writer_s.store.lock_retry_initial_delay_seconds * 2, probe)
             timer.start()
             return timer
 
@@ -4406,13 +4407,13 @@ def make_app(
                     announced[0] = True
 
             try:
-                with open_for_write(replace_wait(s, 0)):
+                with open_for_write(replace_wait(writer_s, 0)):
                     pass  # a probe: is the store free right now?
             except StoreLockedError as busy:
                 announce(_lock_holder(busy))
             timer = wait_timer(announce) if not announced[0] else None
             try:
-                return window.kill(s, write_chunk(s), clock, reason, book_id=target)
+                return window.kill(s, clock, reason, book_id=target)
             except StoreLockedError as exc:
                 raise window.KillWriteFailed(
                     "kill switch NOT engaged: store busy "
@@ -4443,7 +4444,7 @@ def make_app(
 
         listing_timer = wait_timer(listing_notice)
         try:
-            books = _paper_call(s, lambda: paper_run.open_books(s))
+            books = _paper_call(s, lambda: paper_run.open_books(writer_s))
         finally:
             listing_timer.cancel()
             listing_timer.join()
