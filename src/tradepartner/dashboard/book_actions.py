@@ -3,7 +3,9 @@ section 2 and its 2026-10-26 amendment, PR #2228).
 
 `kill(settings, book, reason)` runs the desk's own command, `tradepartner paper
 kill --book=<book> --reason=<text>`, as a child of the same interpreter
-(`sys.executable -m tradepartner.cli`), in list form with no shell, once, and
+(`sys.executable` running the `tradepartner` console script installed beside it;
+the CLI module is never named or imported here, since only `cli.py` may),
+in list form with no shell, once, and
 never retries it. Nothing here opens the store, imports the switch or the
 override writer, or touches a broker: the child is the only writer, so the
 page's read-only connection can never break its write, and the kill path is
@@ -174,6 +176,11 @@ def reason_refusal(reason: str | None, settings: Settings) -> str | None:
     return None
 
 
+def _entry_point() -> Path:
+    """The `tradepartner` console script (`[project.scripts]`) beside `sys.executable`."""
+    return Path(sys.executable).parent / "tradepartner"
+
+
 def _start(argv: list[str], *, env: dict[str, str], cwd: Path) -> _Child:
     """Start the child (a seam for tests): list form, no shell, text pipes."""
     return subprocess.Popen(
@@ -217,13 +224,18 @@ def kill(settings: Settings, book: str, reason: str) -> KillResult:
     refusal = store_refusal(settings, live)
     if refusal is not None:
         raise KillRefused(refusal)
+    entry = _entry_point()
+    if not entry.is_file():
+        raise KillRefused(
+            f"The tradepartner command is not installed beside this interpreter ({entry}), "
+            f"so this page cannot stop a book. At the desk, run `{desk_command(book)}`."
+        )
     dropped = (_STORE_PATH_VAR, _ENV_FILE_VAR, "STORE")
     env = {k: v for k, v in os.environ.items() if k.upper() not in dropped}
     env[_STORE_PATH_VAR] = str(Path(settings.store.path).resolve())
     argv = [
         sys.executable,
-        "-m",
-        "tradepartner.cli",
+        str(entry),
         "paper",
         "kill",
         f"--book={book}",
