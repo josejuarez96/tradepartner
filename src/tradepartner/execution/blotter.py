@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
@@ -42,6 +42,11 @@ class BlotterRow:
     signal_rank: int | None
     slippage_bp: float | None
     slippage_note: str | None
+    # Earliest and latest live fill instants (UTC), None while unfilled (T271).
+    first_fill_at: datetime | None = None
+    last_fill_at: datetime | None = None
+    # The order's decision sells the whole remaining holding (`_full_exit`).
+    full_exit: bool = False
 
 
 @dataclass(frozen=True)
@@ -116,6 +121,8 @@ def _row(
         signal_rank=rank,
         slippage_bp=slip,
         slippage_note=note,
+        first_fill_at=min((i.fill.filled_at for i in fills), default=None),
+        last_fill_at=max((i.fill.filled_at for i in fills), default=None),
     )
 
 
@@ -125,24 +132,35 @@ def session_blotter(
     session: date,
     now: datetime,
     limit: int,
+    known_by: datetime | None = None,
 ) -> SessionBlotter:
     """Read one window's order session, capped to `limit` displayed rows.
 
     The summary covers every live fill of that session even when rows are capped.
     Open prices are read at the session's close, excluding later revisions.
+    `known_by` (T271, a tz-aware UTC as-of) leaves out every order, order event
+    and fill the journal learned of after it; None reads everything, as before.
     """
     if now.tzinfo is None or now.utcoffset() != UTC.utcoffset(now):
         raise ValueError("now must be timezone-aware UTC")
     if limit <= 0:
         raise ValueError("limit must be positive")
+    if known_by is not None and (
+        known_by.tzinfo is None or known_by.utcoffset() != UTC.utcoffset(known_by)
+    ):
+        raise ValueError("known_by must be timezone-aware UTC")
     session_close(session)  # Require a trading session even for an empty read.
     journal._require_orders_have_runs(conn)
     where = "t.session = ? AND t.run_id IN (SELECT run_id FROM paper_runs WHERE window_id = ?)"
+    params: list[object] = [session, window_id]
+    if known_by is not None:
+        where += " AND t.known_at <= ?"
+        params.append(known_by)
     orders = journal._select(
         conn,
         OrderRow,
         where,
-        [session, window_id],
+        params,
         order="t.known_at DESC, t.client_order_id DESC",
         limit=limit + 1,
     )
@@ -154,8 +172,9 @@ def session_blotter(
         row[0]
         for row in conn.execute(
             "SELECT o.client_order_id FROM orders o JOIN paper_runs r ON r.run_id = o.run_id "
-            "WHERE r.window_id = ? AND o.session = ? ORDER BY o.client_order_id",
-            [window_id, session],
+            "WHERE r.window_id = ? AND o.session = ? AND (?::TIMESTAMPTZ IS NULL "
+            "OR o.known_at <= ?) ORDER BY o.client_order_id",
+            [window_id, session, known_by, known_by],
         ).fetchall()
     ]
     fills = (
@@ -163,11 +182,14 @@ def session_blotter(
         if session_ids
         else []
     )
+    if known_by is not None:
+        fills = [item for item in fills if item.fill.known_at <= known_by]
     opens = slippage.read_opens(conn, fills) if fills else {}
     summary = slippage.summarise(fills, opens, now)
     events_by_id: dict[str, list[OrderEventRow]] = {}
     for event in journal.order_events_for(conn, window_id=window_id, client_order_ids=ids):
-        events_by_id.setdefault(event.client_order_id, []).append(event)
+        if known_by is None or event.known_at <= known_by:
+            events_by_id.setdefault(event.client_order_id, []).append(event)
     fills_by_id: dict[str, list[OrderedFill]] = {}
     for item in fills:
         fills_by_id.setdefault(item.fill.client_order_id, []).append(item)
@@ -198,14 +220,17 @@ def session_blotter(
     ).fetchall()
     ranks = {decision_id: rank for decision_id, rank in rank_rows}
     rows = tuple(
-        _row(
-            order,
-            fills_by_id.get(order.client_order_id, []),
-            events_by_id.get(order.client_order_id, []),
-            (decisions[order.decision_id].decision, decisions[order.decision_id].reason),
-            None if _full_exit(decisions[order.decision_id]) else ranks.get(order.decision_id),
-            opens,
-            now,
+        replace(
+            _row(
+                order,
+                fills_by_id.get(order.client_order_id, []),
+                events_by_id.get(order.client_order_id, []),
+                (decisions[order.decision_id].decision, decisions[order.decision_id].reason),
+                None if _full_exit(decisions[order.decision_id]) else ranks.get(order.decision_id),
+                opens,
+                now,
+            ),
+            full_exit=_full_exit(decisions[order.decision_id]),
         )
         for order in shown
     )
