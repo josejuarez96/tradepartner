@@ -22,6 +22,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -37,10 +38,12 @@ from tradepartner.errors import LimitBreachError
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.run import RunOutcome, submit_window, tracking_run
+from tradepartner.execution.window import stop
 from tradepartner.execution.wrapper import BatchOutcome
 from tradepartner.store import registry
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
 from tradepartner.store.journal import (
+    AdjustmentRow,
     OverrideRow,
     PaperWindowRow,
     append,
@@ -1145,3 +1148,41 @@ def test_an_ambiguous_held_name_gets_no_exit_until_the_broker_renames_it(
     (sell,) = env.submits()[sent_before:]
     assert sell.symbol == "DUALBX"
     assert sell.quantity == pytest.approx(held)
+
+
+def test_a_stop_run_with_an_ambiguous_held_residue_still_exits_the_other_names(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Review of #2285: DUALB carries a residue from a previous window and its
+    ticker change is in force but not on the broker. The stop run makes no
+    `window_stop` exit for it (and does not trip on its residue) but exits the
+    other held names, and notes the change."""
+    assert window.window_id is not None
+    env.append(
+        AdjustmentRow(
+            window_id=window.window_id,
+            session=T_0,
+            kind="carried_residue",
+            origin="dust",
+            security_id="SEC_DUAL_B",
+            quantity=2.0,
+            known_at=window.started_at,
+            ingested_at=window.started_at,
+        )
+    )
+    env.fake._net_quantity["DUALB"] = Decimal("2.0")
+    bought(env)
+    rename(env, "SEC_DUAL_B", "DUALBX", at(F_0, 19, 0), broker=False)
+    env.clock.now = at(F_0, 22, 0)
+    assert stop(env.settings, env.connect, env.fake, env.clock, "test").state == "requested"
+
+    outcome = env.run(at(F_0_PLUS_1))
+
+    status, _fault, message = env.result(outcome.run_id)
+    assert (outcome.kind, status) == ("stop", "ok")
+    exited = dict(
+        env.query("SELECT security_id, reason FROM decisions WHERE decision = 'forced_exit'")
+    )
+    assert exited == {"SEC_SPLIT_FUTURE": "window_stop", "SEC_TRANSFER": "window_stop"}
+    assert message is not None and "DUALB -> DUALBX" in message
+    assert "DUALB" in env.held()

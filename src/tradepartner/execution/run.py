@@ -527,9 +527,11 @@ def stop_step(context: StepContext) -> BatchOutcome | None:
     handed, untradable = _journal_forced_exits(context, _exit_book(context), pending_rebalance=None)
     # Read again: this run's forced exits block a `window_stop` exit of their name.
     book = _exit_book(context)
+    held = book.exitable(context)
     stops = exits.stop_exits(
-        book.exitable(context),
-        _residues(context, book),
+        held,
+        # Over the same holdings: an ambiguous name's residue is not its exit's (#2185).
+        {name: part for name, part in _residues(context, book).items() if name in held},
         book.assets,
         book.decisions,
         book.states,
