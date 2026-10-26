@@ -245,15 +245,18 @@ def test_render_ok_state_builds_the_top_nav(
     assert [p.title for p in pages[""] if p.url_path == ""] == ["Home"]
 
 
-def test_home_and_books_route_to_placeholders_with_the_final_signature(
+def test_home_and_books_route_with_the_final_signature(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store_path = _init_store(tmp_path)
     for page, module in (("Home", home_page), ("Books", book_page)):
         at = _run_app(monkeypatch, store_path, page)
         assert not at.exception
-        assert [h.value for h in at.header] == [page]
-        assert any("coming next" in m.value.lower() for m in at.markdown)
+        if page == "Home":
+            assert [h.value for h in at.header] == [page]
+            assert any("coming next" in m.value.lower() for m in at.markdown)
+        else:  # T276 filled the Book page: an empty store says no book has started
+            assert any("no book has started" in i.value.lower() for i in at.info)
         assert list(inspect.signature(module.render).parameters) == ["conn", "settings"]
 
 
