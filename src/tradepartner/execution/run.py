@@ -1107,12 +1107,14 @@ class BookRun:
         return self.outcome is not None and self.outcome.healthy and self.exit_code == 0
 
 
-def open_books(settings: Settings) -> tuple[str, ...]:
+def open_books(
+    settings: Settings, *, on_wait: Callable[[str], None] | None = None
+) -> tuple[str, ...]:
     """Every book with an open window (no `closed` or `abandoned` stop row), in
     token order, over a short read-only connection; empty on a store with no
     journal. A book with two open windows is listed once: its own run then fails
-    closed on them (`journal.open_window`)."""
-    with open_read_only(settings, retry=True) as conn:
+    closed on them (`journal.open_window`). `on_wait` is `open_read_only`'s."""
+    with open_read_only(settings, retry=True, on_wait=on_wait) as conn:
         try:
             require_journal(conn)
         except JournalNotInitialised:
