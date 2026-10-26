@@ -2394,16 +2394,44 @@ def test_book_reads_that_books_set_while_the_default_reads_main(
     assert nobook.exit_code == EXIT["no_window"]
 
 
-def _first_line(since: datetime | None, now: datetime, *, others: int = 0) -> str:
-    """`_book_first_lines` for one engaged book with `others` more waiting items."""
+def _first_line(
+    since: datetime | None,
+    now: datetime,
+    *,
+    others: int = 0,
+    halt_item: bool = True,
+    overdue: int = 0,
+    engaged: bool = True,
+) -> str:
+    """`_book_first_lines` for one book: `others` more waiting items, `overdue`
+    delisting-cash items, and a kill-switch item only when `halt_item`."""
     item = SimpleNamespace(book_id="main", kind="kill_switch_engaged", since=since, command="CMD")
     more = [SimpleNamespace(book_id="main", kind="order_lagging")] * others
+    late = [SimpleNamespace(book_id="main")] * overdue
     row = SimpleNamespace(
         book_id="main",
         is_open=True,
-        switch_state=SimpleNamespace(engaged=True, run_in_progress=False),
+        switch_state=SimpleNamespace(engaged=engaged, run_in_progress=False),
     )
-    return cli._book_first_lines([row], [item, *more], now)[0]  # type: ignore[list-item,arg-type]
+    return cli._book_first_lines(  # type: ignore[arg-type]
+        [row], [*([item] if halt_item else []), *more], now, late
+    )[0]
+
+
+def test_first_line_counts_an_overdue_delisting_as_an_issue() -> None:
+    now = datetime(2026, 11, 2, 13, tzinfo=UTC)
+    assert _first_line(None, now, halt_item=False, overdue=1, engaged=False) == (
+        "main: trading, 1 issue"
+    )
+    assert _first_line(None, now, halt_item=False, overdue=2, engaged=False) == (
+        "main: trading, 2 issues"
+    )
+
+
+def test_first_line_engaged_switch_without_a_waiting_item_says_halted_no_command() -> None:
+    now = datetime(2026, 11, 2, 13, tzinfo=UTC)
+    assert _first_line(None, now, halt_item=False) == "main: halted"
+    assert _first_line(None, now, halt_item=False, overdue=1) == "main: halted, 1 other issue"
 
 
 def test_first_line_counts_halt_days_across_the_fall_back() -> None:

@@ -1673,16 +1673,21 @@ def _plural(count: int, noun: str) -> str:
 
 
 def _book_first_lines(
-    summaries: Sequence[ops.BookSummary], items: Sequence[waiting.WaitingItem], now: datetime
+    summaries: Sequence[ops.BookSummary],
+    items: Sequence[waiting.WaitingItem],
+    now: datetime,
+    overdue: Sequence[ops.OverdueDelisting] = (),
 ) -> list[str]:
     """One plain sentence per book, before any counts (#2201): `daily: trading, 0
-    issues`, or `main: halted 2 days, run: <resume command>`."""
+    issues`, or `main: halted 2 days, run: <resume command>`. Each overdue delisting
+    cash item counts as an issue, so this line is never calmer than the ones below."""
     lines = []
     for row in summaries:
         mine = [item for item in items if item.book_id == row.book_id]
+        late = sum(1 for item in overdue if item.book_id == row.book_id)
         halt = next((i for i in mine if i.kind == "kill_switch_engaged"), None)
         if halt is not None or row.switch_state.engaged:
-            others = len(mine) - (1 if halt is not None else 0)
+            others = len(mine) + late - (1 if halt is not None else 0)
             if halt is None or not isinstance(halt.since, datetime):
                 age = "halted"
             else:
@@ -1700,7 +1705,7 @@ def _book_first_lines(
             state = "run in progress"
         else:
             state = "trading"
-        lines.append(f"{row.book_id}: {state}, {_plural(len(mine), 'issue')}")
+        lines.append(f"{row.book_id}: {state}, {_plural(len(mine) + late, 'issue')}")
     return lines
 
 
@@ -4655,7 +4660,7 @@ def make_app(
                     _echo_scrubbed(line, s)
                 return
             for line in (
-                *_book_first_lines(summaries, items, now),
+                *_book_first_lines(summaries, items, now, overdue),
                 *_waiting_lines(items),
                 *overdue_lines,
                 *_summary_lines(summaries),
