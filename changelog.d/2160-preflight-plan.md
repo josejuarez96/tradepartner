@@ -1,3 +1,3 @@
-- Plan tasks T266a and T266b (#2160): one preflight step (schema with verified backup, then broker-fill check) before every paper write command; plan only, no code; lands in the shakedown span, pulled after 2026-11-06
+- Plan task T266a (#2160): a store-level migrate with a verified, marked backup and retention before any schema migration; T266b (fill-step consolidation) parked by the owner; plan only, no code; pulled into the owner's checkout after 2026-11-06
 ### Added
-- Plan tasks T266a and T266b: one preflight step at the start of every paper write command (#2160).
+- Plan task T266a: a verified pre-migration backup with retention, and init_schema refusing to migrate unless asked (#2160).
