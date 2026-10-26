@@ -124,7 +124,9 @@ def test_the_timeout_must_be_positive(tmp_path: Path) -> None:
 # CLI wiring: ingest ----------------------------------------------------------------
 
 
-def _ingest(monkeypatch: pytest.MonkeyPatch, s: Settings, result: IngestResult | Exception) -> Any:
+def _ingest(
+    monkeypatch: pytest.MonkeyPatch, s: Settings, result: IngestResult | Exception, *args: str
+) -> Any:
     def fake(_s: Settings, **_kw: Any) -> IngestResult:
         if isinstance(result, Exception):
             raise result
@@ -132,7 +134,7 @@ def _ingest(monkeypatch: pytest.MonkeyPatch, s: Settings, result: IngestResult |
 
     monkeypatch.setattr(cli, "ingest_session", fake)
     app = cli.make_app(settings=lambda: s, clock=lambda: NOW)
-    return CliRunner().invoke(app, ["ingest"])
+    return CliRunner().invoke(app, ["ingest", *args])
 
 
 def test_ingest_ok_pings_the_plain_url(
@@ -202,3 +204,25 @@ def test_a_hung_request_is_abandoned_at_the_overall_deadline(
     assert heartbeat.ping(s, "paper", ok=True) is False
     assert time.monotonic() - started < 2
     release.set()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--source", "edgar"),
+        ("--source", "alpaca"),
+        ("--dry-run",),
+        ("--rebuild-statement-facts",),
+        ("--rebuild-filing-events",),
+        ("--rebuild-classifications",),
+    ],
+)
+def test_only_the_scheduled_ingest_shape_pings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, net: _Net, args: tuple[str, ...]
+) -> None:
+    s = _settings(tmp_path, alert_heartbeat_url_ingest=URL)
+    s.edgar.statement_facts_enabled = True
+    s.edgar.filing_events_enabled = True
+    result = _ingest(monkeypatch, s, IngestResult((SourceRun("edgar", OK, 1, "x", "f"),)), *args)
+    assert result.exit_code == 0, result.output
+    assert net.calls == []

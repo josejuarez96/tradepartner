@@ -2245,6 +2245,16 @@ def make_app(
                 fred = ingest_rates(s, all_rates, since=start, clock=clock)
                 result = IngestResult(result.runs + fred.runs)
         else:
+            # Only the scheduled job's shape pings its check: a one-source, dry, restamp
+            # or rebuild run must not report the 18:30 job as done (#2155).
+            scheduled_shape = (
+                source == "all"
+                and not dry_run
+                and restamp is None
+                and not (
+                    rebuild_statement_facts or rebuild_filing_events or rebuild_classifications
+                )
+            )
             try:
                 result = ingest_session(
                     s,
@@ -2263,10 +2273,10 @@ def make_app(
                     assets=lambda: assets_source(s, clock),
                 )
             except Exception:
-                if not dry_run:
+                if scheduled_shape:
                     heartbeat.ping(s, "ingest", ok=False)  # off-Mac dead-man's switch (#2155)
                 raise
-            if not dry_run:
+            if scheduled_shape:
                 heartbeat.ping(s, "ingest", ok=result.exit_code == 0)
         _print_result(result)
         for done in restamped:
