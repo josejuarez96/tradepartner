@@ -22,11 +22,12 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import httpx
 import pytest
 import typer
 from typer.testing import CliRunner
 
-from tradepartner import cli
+from tradepartner import cli, heartbeat
 from tradepartner.adapters.broker import OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker, PartialFill, SetPosition, Vanish
 from tradepartner.cli_record import scrub_text
@@ -734,6 +735,77 @@ def test_paper_run_reads_invoked_by_on_a_non_session_day(
     assert "paper run: no_session" in out.output
     with duckdb.connect(_settings().store.path, read_only=True) as conn:
         assert conn.execute("SELECT invoked_by FROM paper_runs").fetchall() == [("scheduler",)]
+
+
+HEARTBEAT_URL = "https://hc-ping.example.com/paper-secret-uuid"
+
+
+def _heartbeat_calls(monkeypatch: pytest.MonkeyPatch, *, raises: bool = False) -> list[str]:
+    """Set the paper check URL and record every ping (no network); optionally time out."""
+    monkeypatch.setenv("ALERT_HEARTBEAT_URL_PAPER", HEARTBEAT_URL)
+    calls: list[str] = []
+
+    def fake(url: str, timeout: float) -> Any:
+        calls.append(url)
+        if raises:
+            raise TimeoutError(url)
+        return httpx.Response(200, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(heartbeat, "_get", fake)
+    return calls
+
+
+@pytest.mark.usefixtures("started")
+def test_paper_run_ok_pings_the_plain_heartbeat_url(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    calls = _heartbeat_calls(monkeypatch)
+    clock.now = SATURDAY
+    out = _paper(clock, factory, "run")
+    assert out.exit_code == 0
+    assert calls == [HEARTBEAT_URL]
+
+
+def test_paper_run_non_zero_pings_fail_and_keeps_its_exit_code(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    calls = _heartbeat_calls(monkeypatch)
+    out = _paper(clock, factory, "run")  # no window: exits 1
+    assert out.exit_code == 1
+    assert calls == [HEARTBEAT_URL + "/fail"]
+
+
+def test_paper_run_exit_code_and_output_survive_a_ping_that_times_out(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    calls = _heartbeat_calls(monkeypatch, raises=True)
+    out = _paper(clock, factory, "run")
+    assert out.exit_code == 1
+    assert calls and "paper-secret-uuid" not in out.output
+
+
+@pytest.mark.usefixtures("started")
+def test_paper_run_write_failure_exit_3_still_reaches_the_caller_with_a_fail_ping(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    calls = _heartbeat_calls(monkeypatch)
+
+    def halt(*_a: Any, **_k: Any) -> Any:
+        raise SystemExit(WRITE_FAILED_EXIT_CODE)
+
+    monkeypatch.setattr(paper_run, "tracking_run", halt)
+    out = _paper(clock, factory, "run", "--book", "main")
+    assert out.exit_code == WRITE_FAILED_EXIT_CODE == 3
+    assert calls == [HEARTBEAT_URL + "/fail"]
+
+
+def test_paper_run_without_a_heartbeat_url_makes_no_call(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    calls = _heartbeat_calls(monkeypatch)
+    monkeypatch.delenv("ALERT_HEARTBEAT_URL_PAPER")
+    _paper(clock, factory, "run")
+    assert calls == []
 
 
 @pytest.mark.usefixtures("started")
