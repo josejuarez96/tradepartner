@@ -233,12 +233,12 @@ def _sha256(path: Path) -> str:
 # --- flags ------------------------------------------------------------------------
 
 
-def test_the_parser_has_exactly_export_and_tax_year() -> None:
+def test_the_parser_has_exactly_export_tax_year_and_book() -> None:
     group: Any = typer.main.get_command(cli.make_app())
     command = group.commands["paper"].commands["lots-reconcile"]
     options = {opt for param in command.params for opt in param.opts}
 
-    assert options == {"--export", "--tax-year"}
+    assert options == {"--export", "--tax-year", "--book"}
     for flag in ("--fix", "--adjust", "--write", "--store-path", "--force"):
         assert flag not in options
 
@@ -513,7 +513,7 @@ PAPER_OPTIONS = {
     "abandon": {"--reason", "--book"},
     "settle": {"--order", "--reason", "--book"},
     "override": {"--kind", "--session", "--name", "--reason", "--book"},
-    "lots-reconcile": {"--export", "--tax-year"},
+    "lots-reconcile": {"--export", "--tax-year", "--book"},
     "shakedown": set(),
 }
 
@@ -1840,6 +1840,76 @@ def test_status_all_prints_one_summary_line_per_book(
     )
 
 
+def _overdue_delisting_rows(*, paid: bool = False) -> None:
+    """Window 1: ACA removed on 2026-10-01 with no cash; a reconciliation after the
+    window recorded `overdue delisting cash` for it (#411); `paid` adds the late cash."""
+    at = datetime(2026, 10, 9, 14, tzinfo=UTC)
+    allowed = [{"reason": "overdue delisting cash", "difference": 3.356, "security_id": "ACA"}]
+    with open_for_write(_settings()) as conn:
+        journal.append(
+            conn,
+            journal.AdjustmentRow(
+                window_id=1,
+                session=date(2026, 10, 1),
+                kind="corporate_action_cash",
+                security_id="ACA",
+                quantity=-3.356,
+                cash=0.0,
+                explanation_json=json.dumps({"explanation": "listing ended"}),
+                known_at=at,
+                ingested_at=at,
+            ),
+        )
+        if paid:
+            journal.append(
+                conn,
+                journal.AdjustmentRow(
+                    window_id=1,
+                    session=date(2026, 10, 10),
+                    kind="corporate_action_cash",
+                    security_id="ACA",
+                    cash=100.0,
+                    explanation_json=json.dumps({"delisting_cash": True}),
+                    known_at=at,
+                    ingested_at=at,
+                ),
+            )
+        journal.append(
+            conn,
+            journal.ReconciliationRow(
+                window_id=1,
+                at=at,
+                status="ok",
+                broker_cash=1.0,
+                mismatches_json=json.dumps({"mismatches": [], "allowed": allowed}),
+                known_at=at,
+                ingested_at=at,
+            ),
+        )
+
+
+_OVERDUE_LINE = "ACA: delisting cash overdue since 2026-10-01 \u2014 check Alpaca's activity"
+
+
+@pytest.mark.usefixtures("started")
+def test_status_shows_a_delisting_whose_cash_is_overdue(clock: _Clock, factory: _Factory) -> None:
+    _overdue_delisting_rows()
+    out = _paper(clock, factory, "status")
+    assert out.exit_code == 0, out.output
+    assert f"\n{_OVERDUE_LINE}\n" in out.output
+    all_books = _paper(clock, factory, "status", "--all")
+    assert all_books.exit_code == 0, all_books.output
+    assert f"book main; {_OVERDUE_LINE}\n" in all_books.output
+
+
+@pytest.mark.usefixtures("started")
+def test_status_drops_the_overdue_line_once_the_cash_is_booked(
+    clock: _Clock, factory: _Factory
+) -> None:
+    _overdue_delisting_rows(paid=True)
+    assert "delisting cash overdue" not in _paper(clock, factory, "status").output
+
+
 @pytest.mark.usefixtures("started")
 def test_status_all_lists_two_waiting_items_byte_for_byte(
     clock: _Clock, factory: _Factory, live: Path
@@ -2263,3 +2333,49 @@ def test_status_all_on_an_outdated_journal_is_refused_not_a_crash(
     out = _paper(clock, factory, "status", "--all")
     assert out.exit_code == REFUSED
     assert out.output == "paper status: the journal predates schema version 17\n"
+
+
+def test_book_reads_that_books_set_while_the_default_reads_main(
+    export_file: Path, live: Path
+) -> None:
+    from dataclasses import replace
+
+    _seed(live)
+    later = SET_STAMP + timedelta(days=1)
+    with open_for_write(_settings()) as conn:
+        journal.append(
+            conn, replace(_window(None, WINDOW_START + timedelta(days=1)), book_id="daily")
+        )
+        journal.append(
+            conn,
+            replace(
+                _lot(3, date(2026, 3, 3), 5.0, 500.0),
+                book_id="daily",
+                known_at=later,
+                ingested_at=later,
+            ),
+        )
+        journal.append(
+            conn,
+            replace(
+                _disposal(3, 3, date(2026, 4, 4), 600.0, 100.0),
+                book_id="daily",
+                known_at=later,
+                ingested_at=later,
+            ),
+        )
+
+    main = _reconcile(export_file, rows=AGREEING)
+    assert "ledger of window 1 " in main.output
+    assert main.exit_code == 0, main.output
+    daily = _cli(
+        "paper", "lots-reconcile", "--export", str(export_file), "--tax-year", "2026",
+        "--book", "daily", rows=AGREEING,
+    )  # fmt: skip
+    assert "ledger of window 2 " in daily.output
+    assert daily.exit_code == cli.LOTS_RECONCILE_DIFFERENCE_EXIT, daily.output
+    nobook = _cli(
+        "paper", "lots-reconcile", "--export", str(export_file), "--tax-year", "2026",
+        "--book", "ghost", rows=AGREEING,
+    )  # fmt: skip
+    assert nobook.exit_code == EXIT["no_window"]

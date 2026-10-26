@@ -190,7 +190,12 @@ _CASH_IN_LIEU = "CIL"
 _DIVIDEND_TYPES = frozenset(
     {"DIV", "DIVCGL", "DIVCGS", "DIVNRA", "DIVROC", "DIVTW", "DIVFEE", "DIVTXEX"}
 )
-_CORPORATE_ACTION_TYPES = frozenset({"SSP", "SSO", "MA", "NC", "SC", "REORG"})
+_CORPORATE_ACTION_TYPES = frozenset({"SSP", "SSO", "MA", "NC", "SC", "REORG", "VOF"})
+#: The activity types a delisted holding's late cash is accepted as (#411): a
+#: merger or reorganisation payment, or a tender offer's fulfilment (`VOF`). `NC`
+#: and `SC` (name and symbol change) never carry cash and no adapter or fixture
+#: shows one that does, so they are not taken.
+_DELISTING_CASH_TYPES = frozenset({"MA", "REORG", "VOF"})
 
 
 def _cash_bound(cash_tolerance: float, fills_since_base: int) -> Decimal:
@@ -243,6 +248,23 @@ class OpenMerger:
     journaled_cash: float = 0.0
     final: bool = False
     cash_upper: float | None = None
+
+
+@dataclass(frozen=True)
+class DelistedCash:
+    """One removed delisted holding whose cash may still arrive (#411): the
+    ended-listing band removed `removed_quantity` shares on `since` (booking
+    whatever cash came with it, `journaled_cash` so far, late credits included).
+    `open` is True while the reconciliation's session is within
+    `risk.reconcile_merger_lag_sessions` sessions of `since`; `overdue` is True
+    at the first completed reconciliation after that window with none of the
+    cash arrived and no earlier one already raised it."""
+
+    removed_quantity: float
+    since: date
+    journaled_cash: float = 0.0
+    open: bool = True
+    overdue: bool = False
 
 
 @dataclass(frozen=True)
@@ -316,6 +338,9 @@ class Explanations:
     #: The conflicting merger pairs raised at this reconciliation: acquiree
     #: `security_id` to the detail naming both ids (#1762 item 1, T249).
     merger_conflicts: Mapping[str, str] = field(default_factory=dict)
+    #: The removed delisted holdings whose cash may still arrive (#411):
+    #: `security_id` to its `DelistedCash`. Never a name with an open merger.
+    delisted_cash: Mapping[str, DelistedCash] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -575,6 +600,69 @@ def _place_cash_in_lieu(
     return None, proposal
 
 
+#: The `Allowed.reason` of a delisted holding whose cash did not arrive within
+#: its window (#411). It is recorded once, on the first completed reconciliation
+#: after the window, and never halts.
+OVERDUE_DELISTING_CASH = "overdue delisting cash"
+
+
+def _delisting_credits(
+    explanations: Explanations,
+    activities: Sequence[CashActivity],
+    bound: Decimal,
+    premium: float,
+    security_of: Mapping[str, str],
+) -> tuple[list[ProposedAdjustment], list[tuple[str, DelistedCash]]]:
+    """The cash-only `corporate_action_cash` rows for the broker credits tagged to
+    a removed delisted holding's symbol while its window is open (#411), and the
+    holdings whose window has ended unpaid (`overdue`).
+
+    A credit is an `executed` `MA`, `REORG` or `VOF` activity (`_DELISTING_CASH_TYPES`)
+    with a positive `net_amount`, the holding's symbol, a date on or after the
+    removal and an id not yet inside the base. It is booked as the position's
+    proceeds, keyed by its activity id. The holding's credits together (with the
+    cash booked so far) may not exceed the removed quantity x reference price x
+    (1 + `risk.delisting_cash_max_premium`) plus the cash bound: a larger one is
+    left in the cash difference and halts, as any unexplained cash does."""
+    rows: list[ProposedAdjustment] = []
+    overdue: list[tuple[str, DelistedCash]] = []
+    for name, item in sorted(explanations.delisted_cash.items()):
+        if item.overdue and item.journaled_cash <= 0:
+            overdue.append((name, item))
+        symbol = explanations.symbols.get(name)
+        if not item.open or symbol is None or security_of.get(symbol) != name:
+            continue
+        credits = [
+            a
+            for a in activities
+            if a.symbol == symbol
+            and a.activity_type in _DELISTING_CASH_TYPES
+            and a.status == _EXECUTED
+            and a.net_amount is not None
+            and a.net_amount > 0
+            and a.date >= item.since
+            and not _inside_base(a, explanations)
+        ]
+        total = Decimal(str(math.fsum(a.net_amount or 0.0 for a in credits)))
+        price = explanations.reference_prices.get(name, 0.0)
+        cap = Decimal(str(item.removed_quantity * price * (1 + premium) - item.journaled_cash))
+        if not credits or total > max(cap, Decimal(0)) + bound:
+            continue
+        rows += [
+            ProposedAdjustment(
+                "corporate_action_cash",
+                name,
+                None,
+                a.net_amount,
+                f"delisting cash: {a.activity_type} {a.activity_id}",
+                broker_activity_id=a.activity_id,
+                merger_terms={"delisting_cash": True},
+            )
+            for a in credits
+        ]
+    return rows, overdue
+
+
 def _cash_allows(band: _Band, difference: Decimal, bound: Decimal) -> bool:
     """Whether `difference` (in `Decimal`) is within `band` widened by the cash
     bound `bound` (inclusive; #1583, T183). Kept in `Decimal` so a cent at a
@@ -741,6 +829,14 @@ def compare(
     for cil in cil_proposals:
         difference_decimal -= Decimal(str(cil.cash))
     explained.extend(cil_proposals)
+
+    # --- a removed delisted holding's late cash, tagged to its symbol (#411) ---
+    delisting_proposals, overdue = _delisting_credits(
+        explanations, activities, cash_bound, frozen.delisting_cash_max_premium, security_of
+    )
+    for credit in delisting_proposals:
+        difference_decimal -= Decimal(str(credit.cash))
+    explained.extend(delisting_proposals)
 
     dues, invalid_receipts = _merger_dues(
         explanations.mergers,
@@ -947,6 +1043,11 @@ def compare(
             for cil in cil_proposals
             if cil.cash is not None
         ]
+        allowed += [
+            Allowed("deferred delisting cash", credit.cash, credit.security_id)
+            for credit in delisting_proposals
+            if credit.cash is not None
+        ]
         explained = []
 
     for security_id in sorted(set(expected) | set(broker)):
@@ -986,6 +1087,11 @@ def compare(
                 symbol=explanations.symbols.get(security_id),
             )
         )
+
+    if not deferring:
+        allowed += [
+            Allowed(OVERDUE_DELISTING_CASH, item.removed_quantity, name) for name, item in overdue
+        ]
 
     if mismatches:
         status = MISMATCH

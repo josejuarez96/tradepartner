@@ -335,7 +335,7 @@ def open_for_write(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
             if remaining <= 0:
                 raise StoreLockedError(
                     f"could not acquire write lock on {settings.store.path!r} "
-                    f"within {settings.store.lock_retry_seconds}s"
+                    f"within {settings.store.lock_retry_seconds}s: {exc}"
                 ) from exc
             time.sleep(min(delay, remaining))
             delay = min(delay * 2, max_delay)
