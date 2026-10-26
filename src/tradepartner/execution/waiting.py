@@ -53,6 +53,7 @@ from zoneinfo import ZoneInfo
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig
 from tradepartner.execution.collect import lag_verdict
+from tradepartner.execution.plain import plain_causes
 from tradepartner.execution.switch import SwitchState, faulted_runs
 from tradepartner.store.journal import (
     KillSwitchRow,
@@ -193,6 +194,11 @@ class SpanFacts:
     now: datetime
 
 
+def _one_line(text: str) -> str:
+    """A stored free-text reason on one line; the renderers scrub it (cli, ops page)."""
+    return " ".join(text.split())
+
+
 def _kill_switch_item(book_id: str, facts: SwitchFacts) -> WaitingItem | None:
     state = facts.state
     if not state.engaged:
@@ -213,11 +219,14 @@ def _kill_switch_item(book_id: str, facts: SwitchFacts) -> WaitingItem | None:
             if rw.run.run_id != in_progress and (rw.result is None or rw.run.run_id in faulted)
         ]
         since = min(engaging, default=None)
+    why = state.engaged_row.reason if state.engaged_row is not None else None
     return WaitingItem(
         book_id=book_id,
         kind="kill_switch_engaged",
         since=since,
-        detail="kill switch engaged: " + "; ".join(state.causes),
+        detail="kill switch engaged: "
+        + plain_causes(state.causes)
+        + (f"; reason given: {_one_line(why)}" if why else ""),
         command=f'tradepartner paper resume --book {book_id} --reason "<why>"',
     )
 
