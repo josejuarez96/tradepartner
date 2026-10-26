@@ -470,6 +470,8 @@ uv run tradepartner paper kill --reason "why you are stopping trading"   # (buil
 uv run tradepartner paper resume --reason "root cause and what you checked"   # (built by T61b/T67)
 ```
 
+**`account_mismatch`: the broker's account is not the window's.** `paper resume` and `paper abandon` first read the broker's `account_id` and compare it with the one the window recorded at `paper start`; `paper reconcile` does the same and engages the switch with an `account_id:` reason. On a mismatch they refuse before writing anything broker-derived: another account's broker never saw this window's orders, so settling them against it would journal live orders as `not_received` and, for `abandon`, record that account's positions as the window's. The usual cause is the wrong key pair in this book's variables (another book's pair pasted in). The way back is to put the right keys back for that book, then run `paper resume --reason "..."` again; the journal is untouched, so nothing needs repairing.
+
 **When `--accept-broker-fills` is the right call.** Normally omit it. Add it only when:
 - An order has been `fills_lagging` for `risk.max_fill_lag_sessions` or more sessions (the spec's bound) — the journal's fill total is behind what the broker's `get_order` reports, and the fill-stream has never caught up on its own, **and**
 - You have checked `paper status`/the reconciliation view and confirmed the broker reports that specific order as **finished** (not still open) — an order the broker still holds open is refused even with the flag, since it may yet fill through the normal path.

@@ -1398,7 +1398,7 @@ def reconcile_command(
             account = broker.account()
             if account.account_id != window.account_id:
                 raise ReconciliationError(
-                    f"the broker's account {account.account_id!r} is not window "
+                    f"account_id: the broker's account {account.account_id!r} is not window "
                     f"{_window_id(window)}'s {window.account_id!r}"
                 )
             settle_pending_unresolved(

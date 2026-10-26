@@ -25,7 +25,10 @@ from tradepartner.store.journal import (
     PaperRunRow,
     PaperWindowRow,
     append,
+    fills_for,
+    kill_switch_events_for,
     order_events_for,
+    reconciliations_for,
 )
 
 
@@ -151,14 +154,13 @@ def _resume(settings: Settings, broker: FakeBroker, clock: FixedClock) -> Any:
     )
 
 
-def test_resume_on_another_accounts_broker_writes_nothing_before_the_account_check(
+def test_resume_refuses_another_accounts_broker_before_settling_any_order(
     journal_settings: Settings, fixed_clock: FixedClock
 ) -> None:
-    """F1: `paper resume` with the wrong account's keys (the owner pastes the
-    `daily` pair into `ALPACA_PAPER_*`, say) settles the book's `pending` order
-    against an account that never saw it: it journals `cancelled`
-    `not_received` before the reconciliation's `account_id` check refuses.
-    The real order lives on at the book's own account and may fill there."""
+    """`paper resume` with another account's keys (the `daily` pair pasted into
+    the main book's variables, say) is refused `account_mismatch` before it
+    settles the book's `pending` order: the order stays `pending`, for a resume
+    on the right account to settle."""
     window = _window(journal_settings, "PA_MAIN")
     own = _fake(fixed_clock, "PA_MAIN")
     other = _fake(fixed_clock, "PA_DAILY")
@@ -186,14 +188,11 @@ def test_resume_on_another_accounts_broker_writes_nothing_before_the_account_che
     assert statuses == [("pending", None)], statuses
 
 
-def test_after_a_wrong_account_resume_the_right_one_is_refused_while_the_order_is_open(
+def test_a_resume_on_the_right_account_still_settles_after_a_refused_wrong_account_resume(
     journal_settings: Settings, fixed_clock: FixedClock
 ) -> None:
-    """F1, the aftermath: the order the wrong-account resume wrote `cancelled`
-    is still open at the book's own account. A resume on the right keys is
-    refused `unexplained_open_order` (the journal holds it terminal) until the
-    DAY order ends at the broker; if it fills, the fill is journaled under a
-    `cancelled`/`not_received` order (see the report)."""
+    """After the refused wrong-account resume the order is still `pending`, so a
+    resume on the book's own account settles it and is not refused."""
     window = _window(journal_settings, "PA_MAIN")
     own = _fake(fixed_clock, "PA_MAIN")
     other = _fake(fixed_clock, "PA_DAILY")
@@ -214,12 +213,11 @@ def test_after_a_wrong_account_resume_the_right_one_is_refused_while_the_order_i
     assert second.status != REFUSED, second.reasons
 
 
-def test_abandon_on_another_accounts_broker_is_refused(
+def test_abandon_refuses_another_accounts_broker_with_account_mismatch(
     journal_settings: Settings, fixed_clock: FixedClock
 ) -> None:
-    """F3: `paper abandon` goes on over a reconciliation mismatch by design, and
-    an `account_id` mismatch is one: with the wrong keys it closes the window and
-    records the OTHER account's positions as this window's residues."""
+    """`paper abandon` with another account's keys is refused `account_mismatch`
+    before it closes the window or records that account's positions as residues."""
     from tradepartner.adapters.fake_broker import SetPosition
     from tradepartner.execution import window as window_module
 
@@ -233,7 +231,7 @@ def test_abandon_on_another_accounts_broker_is_refused(
             lambda: open_for_write(journal_settings),
             other,
             fixed_clock,
-            "owner abandons the window for the break test, long enough",
+            "owner abandons the window with the wrong account, long enough",
         )
     except window_module.WindowCommandRefused as exc:
         assert exc.reason == window_module.ACCOUNT_MISMATCH
@@ -241,11 +239,12 @@ def test_abandon_on_another_accounts_broker_is_refused(
     raise AssertionError(f"abandoned over another account: {result}")
 
 
-def test_reconcile_on_another_accounts_broker_writes_nothing_before_the_account_check(
+def test_reconcile_refuses_another_accounts_broker_before_settling_any_order(
     journal_settings: Settings, fixed_clock: FixedClock
 ) -> None:
-    """`paper reconcile` with the wrong account's keys must not settle the
-    book's `pending` order against an account that never saw it."""
+    """`paper reconcile` with another account's keys engages the kill switch and
+    writes no broker-derived row: the book's `pending` order is not settled
+    against an account that never saw it."""
     window = _window(journal_settings, "PA_MAIN")
     own = _fake(fixed_clock, "PA_MAIN")
     other = _fake(fixed_clock, "PA_DAILY")
@@ -264,3 +263,10 @@ def test_reconcile_on_another_accounts_broker_writes_nothing_before_the_account_
             if e.client_order_id == "tp-main-1"
         ]
     assert statuses == [("pending", None)], statuses
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+        assert [(e.state, e.source) for e in events] == [("engaged", "fault")]
+        assert events[0].reason is not None
+        assert events[0].reason.startswith("account_id:")
+        assert reconciliations_for(conn, window.window_id) == []  # type: ignore[arg-type]
+        assert fills_for(conn, window_id=window.window_id) == []
