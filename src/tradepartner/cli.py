@@ -292,7 +292,8 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
   (`no_window` with no open book; it is a usage error with `--book`).
 - `tradepartner paper shakedown` (ADR 0017 part E; plan T157b) prints
   `execution.shakedown.shakedown`'s seven lines, E.1 to E.7, over every book,
-  each with the rows, query and thresholds it read, through
+  each with its finding (the rows, query and thresholds it read only with
+  `--verbose`), through
   `store.db.open_read_only` (it writes nothing). The thresholds come from the
   newest `shakedown_span` decision, never `Settings`. It exits 0 only when every
   line passes and 1 otherwise, or when no `shakedown_span` row exists.
@@ -436,6 +437,7 @@ from tradepartner.health import (
     HealthReport,
     IndexMembersCheck,
     health_report,
+    health_verdict,
 )
 from tradepartner.ingest import (
     SOURCES,
@@ -1654,6 +1656,66 @@ def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
     raise _fail(_scrubbed(message, settings), code)
 
 
+#: The scheduled paper run's time, as the scheduling runbook sets it (08:05 ET), said
+#: to the owner where fills wait for it (#2201). Display text only; nothing reads it.
+PAPER_RUN_TIME_TEXT = "08:05 ET"
+_FILLS_NOTE = (
+    "Orders were sent; fills or rejections are recorded at the next scheduled run "
+    f"({PAPER_RUN_TIME_TEXT})"
+)
+
+
+def _et(value: Any) -> str:
+    """An owner-facing time: Eastern first, UTC beside it for the audit trail (#2201).
+    A date or a non-time value goes through `_fmt` unchanged."""
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        eastern = value.astimezone(_NEW_YORK)
+        utc = value.astimezone(UTC)
+        return f"{eastern:%Y-%m-%d %H:%M} ET ({utc:%H:%M} UTC)"
+    return _fmt(value)
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def _book_first_lines(
+    summaries: Sequence[ops.BookSummary],
+    items: Sequence[waiting.WaitingItem],
+    now: datetime,
+    overdue: Sequence[ops.OverdueDelisting] = (),
+) -> list[str]:
+    """One plain sentence per book, before any counts (#2201): `daily: trading, 0
+    issues`, or `main: halted 2 days, run: <resume command>`. Each overdue delisting
+    cash item counts as an issue, so this line is never calmer than the ones below."""
+    lines = []
+    for row in summaries:
+        mine = [item for item in items if item.book_id == row.book_id]
+        late = sum(1 for item in overdue if item.book_id == row.book_id)
+        halt = next((i for i in mine if i.kind == "kill_switch_engaged"), None)
+        if halt is not None or row.switch_state.engaged:
+            others = len(mine) + late - (1 if halt is not None else 0)
+            if halt is None or not isinstance(halt.since, datetime):
+                age = "halted"
+            else:
+                days = (
+                    now.astimezone(_NEW_YORK).date() - halt.since.astimezone(_NEW_YORK).date()
+                ).days
+                age = "halted today" if days <= 0 else f"halted {_plural(days, 'day')}"
+            more = f", {_plural(others, 'other issue')}" if others else ""
+            fix = f"; run: {halt.command}" if halt is not None and halt.command else ""
+            lines.append(f"{row.book_id}: {age}{more}{fix}")
+            continue
+        if not row.is_open:
+            state = "window closed"
+        elif row.switch_state.run_in_progress:
+            state = "run in progress"
+        else:
+            state = "trading"
+        lines.append(f"{row.book_id}: {state}, {_plural(len(mine) + late, 'issue')}")
+    return lines
+
+
 def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
     """`paper status --all`: the operations page's one-row-per-book summary (spec
     req 12 as amended 2026-10-09), one line per book in token order."""
@@ -1674,12 +1736,13 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
             f"open orders {row.open_orders_count}; kill switch {switch_text}; "
             f"last run {_fmt(row.last_run_status)}; "
             f"next rebalance {_fmt(row.next_rebalance_session)}"
+            + ("" if row.next_rebalance_session is None else " (data day; trades the next session)")
         )
         if traded is not None:
             result = "traded today" if row.last_run_has_orders else "ran today with no orders"
             line += f"; rebalance {traded} {result}"
         if row.open_orders_count and row.last_run_kind == "rebalance":
-            line += "; Fills are recorded at the next scheduled run"
+            line += f"; {_FILLS_NOTE}"
         lines.append(line)
     return lines
 
@@ -1695,7 +1758,7 @@ def _waiting_lines(items: Sequence[waiting.WaitingItem]) -> list[str]:
         return ["waiting on you: nothing"]
     lines = [f"waiting on you ({len(items)}):"]
     for item in items:
-        since = _fmt(item.since)
+        since = _et(item.since)
         lines.append(
             f"  book {item.book_id}; {item.kind}: {item.detail}; "
             f"since {since}; command {item.command or '-'}"
@@ -1723,15 +1786,11 @@ def _status_lines(
     recon = data.reconciliation
     lines = [
         f"window {data.window.window_id} (first rebalance {data.window.first_rebalance_session})",
-        f"as of {_fmt(data.as_of)}; last updated {_fmt(data.last_updated)}"
+        f"as of {_et(data.as_of)}; last updated {_et(data.last_updated)}"
         + ("; STALE: no run for S-1" if data.stale else ""),
         f"positions {data.positions_count} (value {data.positions_value:.2f}); open orders "
         f"{data.open_orders_count}; targets {data.targets_count}",
-        *(
-            ["Fills are recorded at the next scheduled run"]
-            if data.open_orders_count and data.last_run_kind == "rebalance"
-            else []
-        ),
+        *([_FILLS_NOTE] if data.open_orders_count and data.last_run_kind == "rebalance" else []),
         f"kill switch {switch_text} (causes: {causes})",
         "reconciliation "
         + ("n/a" if recon is None else f"{recon.reconciliation_id} {recon.status} at {recon.at}"),
@@ -2686,6 +2745,13 @@ def make_app(
             raise _fail(
                 f"the store has no usable schema; run `tradepartner ingest`: {exc}", 1
             ) from None
+        chain_breaks = report.successor_chains.frame.filter(pl.col("price_break")).height
+        expected_warnings = (
+            (1 if _quarantined(report) > 0 else 0)
+            + (1 if report.duplicate_dividends.pending else 0)
+            + chain_breaks
+        )
+        typer.echo(health_verdict(report, expected_warnings))
         _print_report(report)
         warnings = 0
         if (count := _quarantined(report)) > 0:
@@ -4523,7 +4589,17 @@ def make_app(
             _echo_scrubbed(line, s)
 
     @paper_app.command("check")
-    def paper_check_(book: Annotated[str | None, _BOOK_OPTION] = None) -> None:
+    def paper_check_(
+        book: Annotated[str | None, _BOOK_OPTION] = None,
+        verbose: Annotated[
+            bool,
+            typer.Option(
+                "--verbose",
+                help="also print each check's query and every session date",
+                allow_from_autoenv=False,
+            ),
+        ] = False,
+    ) -> None:
         """The book's four exit-criteria checks; exit 0 only when all pass (req 15)."""
         chosen = _checked_book(book)
         s = paper_settings()
@@ -4536,30 +4612,60 @@ def make_app(
         lines = _paper_call(s, run_check)
         for line in lines:
             verdict = "PASS" if line.passed else "FAIL"
-            _echo_scrubbed(f"{verdict} {line.name}: {line.detail} (query: {line.query})", s)
+            if verbose:
+                _echo_scrubbed(f"{verdict} {line.name}: {line.detail} (query: {line.query})", s)
+            else:
+                _echo_scrubbed(f"{verdict} {line.name}: {line.short or line.detail}", s)
         if not all(line.passed for line in lines):
             raise typer.Exit(CRASH_EXIT_CODE)
 
     @paper_app.command("shakedown")
-    def paper_shakedown_() -> None:
+    def paper_shakedown_(
+        verbose: Annotated[
+            bool,
+            typer.Option(
+                "--verbose",
+                help="also print each line's rows, query and thresholds",
+                allow_from_autoenv=False,
+            ),
+        ] = False,
+    ) -> None:
         """The machine-readiness gate's seven lines over every book; exit 0 only when
         all pass (ADR 0017 part E; spec req 15 as amended 2026-10-09). Read-only."""
         s = paper_settings()
         paper_schema_gate(s, read_only=True)
         now = ensure_tz_aware_utc(clock(), field_name="clock()")
 
-        def run_shakedown() -> paper_shakedown.Shakedown:
+        def run_shakedown() -> paper_shakedown.Shakedown | None:
             with open_read_only(s) as conn:
-                return paper_shakedown.shakedown(conn, s, now=now)
+                try:
+                    return paper_shakedown.shakedown(conn, s, now=now)
+                except ValueError:
+                    if registry.shakedown_span(conn) is None:
+                        return None
+                    raise
 
         result = _paper_call(s, run_shakedown)
-        for line in result.lines:
-            verdict = "PASS" if line.passed else "FAIL"
+        if result is None:
+            # not a crash: the span just has not been opened (exit code unchanged)
             _echo_scrubbed(
-                f"{verdict} {line.name}: {line.detail} (rows: {line.rows}; query: "
-                f"{line.query}; thresholds: {line.thresholds})",
+                "failed: ValueError: no shakedown_span decision: open the span with "
+                "`tradepartner decision shakedown-span --sessions N --order-sessions M --reason`"
+                if verbose
+                else "paper shakedown: no shakedown span is open yet. Open one with "
+                "`tradepartner decision shakedown-span --sessions N --order-sessions M "
+                "--reason ...` (see the shakedown runbook).",
                 s,
             )
+            raise typer.Exit(CRASH_EXIT_CODE)
+        for line in result.lines:
+            verdict = "PASS" if line.passed else "FAIL"
+            extra = (
+                f" (rows: {line.rows}; query: {line.query}; thresholds: {line.thresholds})"
+                if verbose
+                else ""
+            )
+            _echo_scrubbed(f"{verdict} {line.name}: {line.detail}{extra}", s)
         if not result.passed:
             raise typer.Exit(CRASH_EXIT_CODE)
 
@@ -4603,11 +4709,18 @@ def make_app(
                 _echo_scrubbed(f"paper status: {result}", s)
                 raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
             summaries, items, overdue = result
-            for line in _summary_lines(summaries):
-                _echo_scrubbed(line, s)
-            for line in _overdue_delisting_lines(overdue):
-                _echo_scrubbed(line, s)
-            for line in _waiting_lines(items):
+            now = ensure_tz_aware_utc(clock(), field_name="clock()")
+            overdue_lines = _overdue_delisting_lines(overdue)
+            if not summaries:  # no window yet: nothing to lead with
+                for line in (*_summary_lines(summaries), *overdue_lines, *_waiting_lines(items)):
+                    _echo_scrubbed(line, s)
+                return
+            for line in (
+                *_book_first_lines(summaries, items, now, overdue),
+                *_waiting_lines(items),
+                *overdue_lines,
+                *_summary_lines(summaries),
+            ):
                 _echo_scrubbed(line, s)
             return
 
