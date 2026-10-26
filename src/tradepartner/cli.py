@@ -1621,11 +1621,13 @@ def _writer_settings(s: Settings) -> Settings:
 
 
 _HOLDER_RE = re.compile(r"held in (.+?)\s*\(PID (\d+)\)")
+# `switch.engage` folds its error into `WriteFailed` as `"<class name>: <message>"`.
+_STORE_LOCKED_RE = re.compile(r"\bStore(?:SameProcess)?LockedError: ")
 
 
-def _lock_holder(exc: BaseException) -> str:
-    """Who holds the store, as far as the lock error says: DuckDB's process and PID,
-    else a plain "an unidentified process"."""
+def _lock_holder(exc: BaseException | str) -> str:
+    """Who holds the store, as far as the lock error (or its message) says:
+    DuckDB's process and PID, else a plain "an unidentified process"."""
     found = _HOLDER_RE.search(str(exc))
     if found is not None:
         return f"{Path(found.group(1)).name}, pid {found.group(2)}"
@@ -4448,23 +4450,46 @@ def make_app(
         chosen = _checked_book(book)
         if every_book and chosen is not None:
             raise _fail("--all and --book cannot be combined", USAGE_ERROR)
-        s = _writer_settings(paper_settings(reason))
+        if _blank_text(reason):
+            raise _fail("--reason must be non-blank", USAGE_ERROR)
+        s = settings()
+        if not Path(s.store.path).is_file():
+            raise _fail(
+                f"refused: no_window: no store at {s.store.path}, so no paper window is open; "
+                "kill switch NOT engaged (check the working directory or STORE__PATH)",
+                PAPER_REFUSAL_EXIT["no_window"],
+            )
+        writer_s = _writer_settings(s)
 
-        def kill_one(target: str) -> int:
-            """`window.kill`, a busy store made plain: nothing is engaged, say so (#2178)."""
+        def waiting_line(holder: str) -> None:
+            typer.echo(
+                "paper kill: kill switch NOT engaged yet: store busy "
+                f"(held by {holder}), waiting up to "
+                f"{writer_s.store.lock_retry_seconds} s",
+                err=True,
+            )
+
+        def kill_one(target: str, *, already_announced: bool = False) -> int:
+            """`window.kill`, a busy store made plain: nothing is engaged, say so (#2178).
+            The waiting line comes from the store's own first lock retry
+            (`on_wait`), once per book; no other connection is ever opened."""
+            announced = [already_announced]
+
+            def announce(message: str) -> None:
+                if not announced[0]:
+                    waiting_line(_lock_holder(message))
+                    announced[0] = True
+
             try:
-                with open_for_write(replace_wait(s, 0)):
-                    pass  # a probe: is the store free right now?
-            except StoreLockedError as busy:
-                typer.echo(
-                    "paper kill: kill switch NOT engaged yet: store busy "
-                    f"(held by {_lock_holder(busy)}), waiting up to "
-                    f"{s.store.lock_retry_seconds} s",
-                    err=True,
-                )
-            try:
-                return window.kill(s, write_chunk(s), clock, reason, book_id=target)
+                return window.kill(s, clock, reason, book_id=target, on_wait=announce)
             except StoreLockedError as exc:
+                raise window.KillWriteFailed(
+                    "kill switch NOT engaged: store busy "
+                    f"(held by {_lock_holder(exc)}); retry, or stop the reader"
+                ) from exc
+            except window.KillWriteFailed as exc:
+                if not _STORE_LOCKED_RE.search(str(exc)):
+                    raise
                 raise window.KillWriteFailed(
                     "kill switch NOT engaged: store busy "
                     f"(held by {_lock_holder(exc)}); retry, or stop the reader"
@@ -4475,7 +4500,13 @@ def make_app(
             event_id = _paper_call(s, lambda: kill_one(bk))
             _echo_scrubbed(f"paper kill: engaged (kill_switch event {event_id})", s)
             return
-        books = _paper_call(s, lambda: paper_run.open_books(s))
+        listing_waited = [False]
+
+        def listing_notice(message: str) -> None:
+            waiting_line(_lock_holder(message))
+            listing_waited[0] = True
+
+        books = _paper_call(s, lambda: paper_run.open_books(writer_s, on_wait=listing_notice))
         if not books:
             raise _fail(
                 "refused: no_window: no book has an open window", PAPER_REFUSAL_EXIT["no_window"]
@@ -4483,7 +4514,8 @@ def make_app(
         codes: list[int] = []
 
         def kill_book(target: str) -> Callable[[], int]:
-            return lambda: kill_one(target)
+            announced = listing_waited[0] and target == books[0]
+            return lambda: kill_one(target, already_announced=announced)
 
         for each in books:
             try:
