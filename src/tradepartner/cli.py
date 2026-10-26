@@ -1572,7 +1572,7 @@ PAPER_REFUSAL_EXIT: Mapping[str, int] = MappingProxyType(
 
 #: `--reason`, required by `stop`, `kill`, `resume`, `abandon`, `override` and `settle`.
 _REASON_OPTION = typer.Option("--reason", help="why, in words (journaled)")
-#: `--book`, on every `paper` command but `shakedown` and `lots-reconcile` (ADR
+#: `--book`, on every `paper` command but `shakedown` (ADR
 #: 0017 B.2 and B.7; plans T155b and T156).
 _BOOK_OPTION = typer.Option(
     "--book", help="the book token (default paper.book_id)", allow_from_autoenv=False
@@ -4648,8 +4648,10 @@ def make_app(
             ),
         ],
         tax_year: Annotated[int, typer.Option(help="the tax year the export covers")],
+        book: Annotated[str | None, _BOOK_OPTION] = None,
     ) -> None:
         """Compare a broker 1099-B export with the lot ledger; writes nothing."""
+        chosen = _checked_book(book)
         s = settings()
 
         def refuse(code: str, message: str) -> typer.Exit:
@@ -4664,7 +4666,7 @@ def make_app(
             raise refuse("unknown_export_format", str(exc)) from None
         try:
             with open_read_only(s) as conn:
-                ledger = _read_ledger_set(conn, tax_year, s.paper.book_id)
+                ledger = _read_ledger_set(conn, tax_year, chosen or s.paper.book_id)
         except StoreLockedError as exc:
             raise refuse("locked", f"locked: store busy: {exc}") from None
         except _LotsRefused as exc:

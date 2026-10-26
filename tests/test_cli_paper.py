@@ -233,12 +233,12 @@ def _sha256(path: Path) -> str:
 # --- flags ------------------------------------------------------------------------
 
 
-def test_the_parser_has_exactly_export_and_tax_year() -> None:
+def test_the_parser_has_exactly_export_tax_year_and_book() -> None:
     group: Any = typer.main.get_command(cli.make_app())
     command = group.commands["paper"].commands["lots-reconcile"]
     options = {opt for param in command.params for opt in param.opts}
 
-    assert options == {"--export", "--tax-year"}
+    assert options == {"--export", "--tax-year", "--book"}
     for flag in ("--fix", "--adjust", "--write", "--store-path", "--force"):
         assert flag not in options
 
@@ -513,7 +513,7 @@ PAPER_OPTIONS = {
     "abandon": {"--reason", "--book"},
     "settle": {"--order", "--reason", "--book"},
     "override": {"--kind", "--session", "--name", "--reason", "--book"},
-    "lots-reconcile": {"--export", "--tax-year"},
+    "lots-reconcile": {"--export", "--tax-year", "--book"},
     "shakedown": set(),
 }
 
@@ -2263,3 +2263,49 @@ def test_status_all_on_an_outdated_journal_is_refused_not_a_crash(
     out = _paper(clock, factory, "status", "--all")
     assert out.exit_code == REFUSED
     assert out.output == "paper status: the journal predates schema version 17\n"
+
+
+def test_book_reads_that_books_set_while_the_default_reads_main(
+    export_file: Path, live: Path
+) -> None:
+    from dataclasses import replace
+
+    _seed(live)
+    later = SET_STAMP + timedelta(days=1)
+    with open_for_write(_settings()) as conn:
+        journal.append(
+            conn, replace(_window(None, WINDOW_START + timedelta(days=1)), book_id="daily")
+        )
+        journal.append(
+            conn,
+            replace(
+                _lot(3, date(2026, 3, 3), 5.0, 500.0),
+                book_id="daily",
+                known_at=later,
+                ingested_at=later,
+            ),
+        )
+        journal.append(
+            conn,
+            replace(
+                _disposal(3, 3, date(2026, 4, 4), 600.0, 100.0),
+                book_id="daily",
+                known_at=later,
+                ingested_at=later,
+            ),
+        )
+
+    main = _reconcile(export_file, rows=AGREEING)
+    assert "ledger of window 1 " in main.output
+    assert main.exit_code == 0, main.output
+    daily = _cli(
+        "paper", "lots-reconcile", "--export", str(export_file), "--tax-year", "2026",
+        "--book", "daily", rows=AGREEING,
+    )  # fmt: skip
+    assert "ledger of window 2 " in daily.output
+    assert daily.exit_code == cli.LOTS_RECONCILE_DIFFERENCE_EXIT, daily.output
+    nobook = _cli(
+        "paper", "lots-reconcile", "--export", str(export_file), "--tax-year", "2026",
+        "--book", "ghost", rows=AGREEING,
+    )  # fmt: skip
+    assert nobook.exit_code == EXIT["no_window"]
