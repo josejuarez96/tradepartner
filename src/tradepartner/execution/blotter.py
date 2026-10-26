@@ -47,6 +47,8 @@ class BlotterRow:
     last_fill_at: datetime | None = None
     # The order's decision sells the whole remaining holding (`_full_exit`).
     full_exit: bool = False
+    # The order's security id, so held names compare by id, not by ticker text.
+    security_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -123,6 +125,7 @@ def _row(
         slippage_note=note,
         first_fill_at=min((i.fill.filled_at for i in fills), default=None),
         last_fill_at=max((i.fill.filled_at for i in fills), default=None),
+        security_id=order.security_id,
     )
 
 

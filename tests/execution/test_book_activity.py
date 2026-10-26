@@ -60,6 +60,7 @@ def row(
         first_fill_at=first if filled else None,
         last_fill_at=last if filled else None,
         full_exit=full_exit,
+        security_id=symbol,
     )
 
 
@@ -331,6 +332,9 @@ def test_no_look_ahead_fills_orders_and_events_after_as_of_are_left_out(
     assert later.buys.count == 2
     assert later.buys.dollars == pytest.approx(3000.0)
     assert later.problems[0].detail == "cancelled"
+    assert later.problems[0].part_filled
+    assert later.problems[0].sentence == "The buy of AAA part filled, then it was cancelled."
+    assert later.digest == "Bought 2 names for $3,000"  # a part fill is not "did not fill"
 
 
 def test_today_refuses_a_naive_as_of_and_a_capped_read(conn: duckdb.DuckDBPyConnection) -> None:
@@ -361,3 +365,46 @@ def test_empty_session_reads_the_plan_row(conn: duckdb.DuckDBPyConnection) -> No
         book_activity.today(conn, 1, SESSION, EVENING, limit=5).digest
         == "No trades today: the plan holds no names."
     )
+
+
+def test_marks_and_plan_known_after_as_of_are_ignored(conn: duckdb.DuckDBPyConnection) -> None:
+    run_id = start_run(conn)
+    place(conn, run_id, "o2", "BBB", "buy")
+    fill(conn, "o2", 100.0, OPEN)
+    journal.append(
+        conn,
+        PositionDailyRow(
+            run_id=run_id,
+            session=PRIOR,
+            security_id="BBB",
+            quantity=5.0,
+            **stamp(EVENING + timedelta(hours=1)),
+        ),
+    )
+    assert book_activity.today(conn, 1, SESSION, EVENING, limit=5).buys.new_names == ("BBB",)
+    empty = duckdb.connect(":memory:")
+    configure_connection(empty)
+    init_schema(empty)
+    r = start_run(empty)
+    journal.append(
+        empty,
+        PaperPlanRow(
+            run_id=r,
+            plan_trial_id=1,
+            rebalance_session=SESSION,
+            n_universe=10,
+            n_targets=0,
+            n_orders_below_min_at_live_capital=0,
+            **stamp(EVENING + timedelta(hours=1)),
+        ),
+    )
+    assert book_activity.today(empty, 1, SESSION, EVENING, limit=5).digest == "No trades today"
+    empty.close()
+
+
+def test_new_name_compares_security_ids_not_ticker_text() -> None:
+    renamed = row("NEW", "buy")
+    renamed = blotter.BlotterRow(**{**renamed.__dict__, "security_id": "sec-1"})
+    held_under_other_ticker = book_activity.summarise([renamed], ET, held_before={"sec-1"})
+    assert held_under_other_ticker.buys.new_names == ()
+    assert book_activity.summarise([renamed], ET, held_before={"NEW"}).buys.new_names == ("NEW",)

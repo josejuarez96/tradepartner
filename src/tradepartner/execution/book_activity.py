@@ -29,7 +29,7 @@ NEEDS_A_LOOK = "needs a look"
 # status the journal can hold (`order_events.status`, plus the blotter's "open").
 STATUS_SENTENCES: Mapping[str, str] = {
     "rejected": "the broker turned it down",
-    "cancelled": "it was cancelled before it filled",
+    "cancelled": "it was cancelled",
     "expired": "it expired without filling",
     "open": "it is still open",
     "pending": "it has not reached the broker yet",
@@ -40,7 +40,6 @@ STATUS_SENTENCES: Mapping[str, str] = {
     "cancel_failed": "a cancel was asked for and failed",
     "pending_unresolved": "the broker has not said what happened to it",
 }
-_DONE = frozenset({"filled"})
 _SIDE_WORDS = {"sell": ("Sold", "sell"), "buy": ("Bought", "buy")}
 
 
@@ -65,6 +64,7 @@ class OrderProblem:
     side: str
     sentence: str
     detail: str
+    part_filled: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,17 +109,23 @@ def _side(
     held_before: Collection[str] | None,
     tz: ZoneInfo,
 ) -> SideActivity:
-    filled = [r for r in rows if r.side == side and r.filled_quantity > 0 and r.fill_price]
+    filled = [
+        r for r in rows if r.side == side and r.filled_quantity > 0 and r.fill_price is not None
+    ]
     symbols = sorted({r.symbol for r in filled})
     dollars = sum(r.filled_quantity * (r.fill_price or 0.0) for r in filled)
     firsts = [r.first_fill_at for r in filled if r.first_fill_at is not None]
     lasts = [r.last_fill_at for r in filled if r.last_fill_at is not None]
     span = time_range(min(firsts), max(lasts), tz) if firsts and lasts else None
+    held = set(held_before or ())
     exits = sorted({r.symbol for r in filled if r.full_exit})
     new = (
         sorted(
-            {r.symbol for r in filled if r.side == "buy" and not r.full_exit}
-            - set(held_before or ())
+            {
+                r.symbol
+                for r in filled
+                if r.side == "buy" and not r.full_exit and (r.security_id or r.symbol) not in held
+            }
         )
         if held_before is not None
         else []
@@ -147,22 +153,25 @@ def _side(
 
 
 def _problem(row: blotter.BlotterRow) -> OrderProblem | None:
-    if row.status in _DONE and row.filled_quantity > 0:
+    if row.status == "filled" and row.filled_quantity > 0:
         return None
     if row.filled_quantity > 0 and row.status == "open":
         return None  # part filled and still working: its fills are counted
-    if row.status == "filled":  # filled with nothing journaled
-        reason, detail = NEEDS_A_LOOK, row.status
-    elif row.status in STATUS_SENTENCES:
-        reason, detail = STATUS_SENTENCES[row.status], row.status
-    else:
-        reason, detail = NEEDS_A_LOOK, row.status
+    reason = STATUS_SENTENCES.get(row.status, NEEDS_A_LOOK)
     word = _SIDE_WORDS.get(row.side, (row.side, row.side))[1]
+    if row.filled_quantity > 0:
+        return OrderProblem(
+            symbol=row.symbol,
+            side=row.side,
+            sentence=f"The {word} of {row.symbol} part filled, then {reason}.",
+            detail=row.status,
+            part_filled=True,
+        )
     return OrderProblem(
         symbol=row.symbol,
         side=row.side,
         sentence=f"The {word} of {row.symbol} did not fill: {reason}.",
-        detail=detail,
+        detail=row.status,
     )
 
 
@@ -199,7 +208,7 @@ def summarise(
 ) -> TodayActivity:
     """Plain-sentence activity of one session's blotter rows.
 
-    `held_before` is the tickers held before the session (None: unknown, so no
+    `held_before` is the security ids held before the session (None: unknown, so no
     name is called new). `plan` is the session's plan row, used only to say why
     a session with no orders had none.
     """
@@ -207,7 +216,11 @@ def summarise(
     sells = _side("sell", ordered, held_before, tz)
     buys = _side("buy", ordered, held_before, tz)
     problems = tuple(p for p in map(_problem, ordered) if p is not None)
-    digest = _digest(sells, buys, len(problems)) if ordered else _no_trades(plan)
+    digest = (
+        _digest(sells, buys, sum(not p.part_filled for p in problems))
+        if ordered
+        else _no_trades(plan)
+    )
     return TodayActivity(digest=digest, sells=sells, buys=buys, problems=problems)
 
 
@@ -249,12 +262,6 @@ def today(
     if book.capped:
         raise ValueError(f"session {session} has more than {limit} orders; raise limit")
     held_ids = _held_before(conn, window_id, session, as_of)
-    symbols = {
-        o.security_id: o.symbol
-        for o in journal.orders_for(conn, window_id=window_id)
-        if o.known_at <= as_of
-    }
-    held = {symbols.get(sid, sid) for sid in held_ids}
     plans = [
         p
         for p in journal._select(
@@ -266,4 +273,4 @@ def today(
             order="t.known_at DESC",
         )
     ]
-    return summarise(book.rows, tz, held_before=held, plan=plans[0] if plans else None)
+    return summarise(book.rows, tz, held_before=held_ids, plan=plans[0] if plans else None)
