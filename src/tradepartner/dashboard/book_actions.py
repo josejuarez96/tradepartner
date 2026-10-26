@@ -142,9 +142,12 @@ def live_store_path(live: Settings | None = None) -> Path:
     return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
 
 
-def store_refusal(settings: Settings, live: Settings | None = None) -> str | None:
+def store_refusal(
+    settings: Settings, live: Settings | None = None, book: str = "<book>"
+) -> str | None:
     """None when the page reads the live store and no backup manifest sits
-    beside it; otherwise one plain sentence saying why, with the desk command."""
+    beside it; otherwise one plain sentence saying why, with the desk command
+    for `book`."""
     page = Path(settings.store.path).resolve()
     try:
         same = os.path.samefile(page, live_store_path(live))
@@ -153,7 +156,7 @@ def store_refusal(settings: Settings, live: Settings | None = None) -> str | Non
     except ValueError:  # the live config itself does not load
         return (
             "The live store's config could not be read, so this page cannot stop a book. "
-            f"At the desk, run `{desk_command('<book>')}`."
+            f"At the desk, run `{desk_command(book)}`."
         )
     if not same:
         why = "This page is reading a store that is not the live store"
@@ -161,7 +164,7 @@ def store_refusal(settings: Settings, live: Settings | None = None) -> str | Non
         why = "This page is reading a store with a backup manifest beside it"
     else:
         return None
-    return f"{why}, so it cannot stop a book. At the desk, run `{desk_command('<book>')}`."
+    return f"{why}, so it cannot stop a book. At the desk, run `{desk_command(book)}`."
 
 
 def reason_refusal(reason: str | None, settings: Settings) -> str | None:
