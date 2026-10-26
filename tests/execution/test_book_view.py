@@ -32,6 +32,7 @@ from tradepartner.store.journal import (
     PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
+    PaperWindowStopRow,
     PositionDailyRow,
     ReconciliationRow,
     append,
@@ -279,7 +280,8 @@ def test_an_ok_row_with_nothing_off_matches_to_the_cent(journal_settings: Settin
     safety = _view(journal_settings).safety
     assert safety is not None
     assert safety.reconciliation.matches
-    assert "Matches Alpaca to the cent" in safety.reconciliation.text
+    assert "Matches Alpaca" in safety.reconciliation.text
+    assert "to the cent" not in safety.reconciliation.text
     assert "risk.reconcile_cash_tolerance" in safety.reconciliation.fields_read
 
 
@@ -514,3 +516,94 @@ def test_a_naive_now_is_refused(journal_settings: Settings) -> None:
     _seed(journal_settings)
     with open_read_only(journal_settings) as conn, pytest.raises(ValueError):
         book_view.build(conn, journal_settings, "main", NOW.replace(tzinfo=None))
+
+
+def test_a_closed_window_is_not_called_running(journal_settings: Settings) -> None:
+    _seed(journal_settings)
+    _append(
+        journal_settings,
+        PaperWindowStopRow(window_id=1, at=KNOWN, state="closed", **_stamp()),
+    )
+    view = _view(journal_settings)
+    assert view.header is not None and view.header.status == "closed"
+    assert view.safety is not None and "closed" in view.safety.kill_switch.text
+    assert "Running" not in view.safety.kill_switch.text
+
+
+def test_an_engaged_drawdown_row_never_reads_negative_over(journal_settings: Settings) -> None:
+    _seed(journal_settings)
+    engaged_at = KNOWN + timedelta(hours=1)
+    _append(
+        journal_settings,
+        KillSwitchRow(
+            window_id=1, at=engaged_at, state="engaged", source="drawdown", **_stamp(engaged_at)
+        ),
+    )
+    limits = _view(journal_settings).safety.limits  # type: ignore[union-attr]
+    drawdown = next(line for line in limits if line.key == "drawdown")
+    assert drawdown.status == "engaged"
+    assert "kill switch is engaged" in drawdown.sentence and "-" not in drawdown.sentence
+
+
+def test_a_window_known_after_now_is_not_shown(journal_settings: Settings) -> None:
+    _seed(journal_settings)
+    assert _view(journal_settings, STARTED - timedelta(hours=1)).window_id is None
+
+
+def test_a_fill_known_after_now_moves_nothing(journal_settings: Settings) -> None:
+    _seed(journal_settings, names_per_mark=1)
+    fill_at = datetime(2026, 9, 28, 15, 0, tzinfo=UTC)
+    with open_for_write(journal_settings) as conn:
+        decision = append(
+            conn,
+            DecisionRow(
+                run_id=1, security_id="SEC0", whole_share=True, decision="trade", **_stamp()
+            ),
+        )
+        assert decision is not None
+        append(
+            conn,
+            OrderRow(
+                client_order_id="o-1",
+                decision_id=decision,
+                run_id=1,
+                session=B,
+                attempt=1,
+                phase="buy",
+                security_id="SEC0",
+                symbol="AAA",
+                side="buy",
+                quantity=15.0,
+                sells_in_flight_at_submit=False,
+                **_stamp(),
+            ),
+        )
+        append(
+            conn,
+            FillRow(
+                client_order_id="o-1",
+                filled_at=fill_at,
+                quantity=10.0,
+                price=100.0,
+                price_implied=False,
+                broker_fill_id="f-1",
+                source="broker_feed",
+                **_stamp(),
+            ),
+        )
+    before = _view(journal_settings)
+    _append(
+        journal_settings,
+        FillRow(
+            client_order_id="o-1",
+            filled_at=fill_at,
+            quantity=5.0,
+            price=100.0,
+            price_implied=False,
+            broker_fill_id="f-2",
+            source="broker_feed",
+            **_stamp(LATER),
+        ),
+    )
+    assert _view(journal_settings) == before
+    assert _view(journal_settings, LATER + timedelta(hours=1)) != before

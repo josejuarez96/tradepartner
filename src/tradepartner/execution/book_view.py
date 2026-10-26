@@ -15,7 +15,7 @@ the latest tracking report). No Streamlit import: the page only draws it.
 learned of (or dated) after `now` moves nothing. The as-of session is the latest
 such marked session.
 
-**"Matches Alpaca to the cent"** is said only when the latest reconciliation row
+**"Matches Alpaca"** (not "to the cent") is said only when the latest reconciliation row
 (by `at`, known by `now`) is `ok`, records no mismatch, lagging or pending order,
 and none of the differences it allowed exceeds the window's frozen tolerance:
 `risk.reconcile_cash_tolerance` for cash, `risk.reconcile_quantity_tolerance` for a
@@ -59,6 +59,7 @@ from tradepartner.store import journal, registry
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.benchmarks import BenchmarkIdentityError
 from tradepartner.store.journal import (
+    CLOSING_STOP_STATES,
     JournalNotInitialised,
     KillSwitchRow,
     PaperReportRow,
@@ -91,11 +92,12 @@ _STATUS_WORDS = {
 
 @dataclass(frozen=True)
 class Header:
-    """The page header. `status` is `running` or `stopped` (`switch.derive`);
+    """The page header. `status` is `closed` for a closed or abandoned window, else
+    `running` or `stopped` (`switch.derive`);
     `value` is the book's equity at `as_of_session`; the returns are percents over
     the since-start range (None until the book has a mark, or SPY is missing)."""
 
-    status: Literal["running", "stopped"]
+    status: Literal["running", "stopped", "closed"]
     as_of_session: date | None
     value: float | None
     since_start_return_pct: float | None
@@ -260,7 +262,12 @@ def _switch(
     return state, ks_rows, runs
 
 
-def _kill_switch(state: SwitchState, runs: list[PaperRunRow]) -> KillSwitchView:
+def _kill_switch(state: SwitchState, runs: list[PaperRunRow], closed: bool) -> KillSwitchView:
+    if closed:
+        note = "This book's window is closed; it no longer trades."
+        if state.engaged:
+            return KillSwitchView(False, None, plain.plain_causes(state.causes), note)
+        return KillSwitchView(True, None, "", f"{note} The kill switch is off.")
     if not state.engaged:
         return KillSwitchView(True, None, "", "Running: the kill switch is off.")
     since: datetime | None = state.engaged_row.at if state.engaged_row is not None else None
@@ -284,6 +291,13 @@ def _percent(value: float) -> str:
 
 def _limit_sentence(row: headroom.LimitRow) -> str:
     left = row.headroom_pp
+    if row.status == "engaged":
+        side = f"{left:.1f} points under" if left >= 0 else f"{-left:.1f} points over"
+        return (
+            f"{row.label}: the kill switch is engaged on drawdown; the book is now "
+            f"{_percent(row.value)} down against a limit of {_percent(row.limit)}, "
+            f"{side} it."
+        )
     state = (
         f"{left:.1f} points to spare"
         if row.status == "within"
@@ -384,7 +398,13 @@ def _reconciliation(
             row.at,
             cash_tol,
         )
-    return ReconciliationView(True, f"Matches Alpaca to the cent as of {stamp}.", row.at, cash_tol)
+    return ReconciliationView(
+        True,
+        f"Matches Alpaca as of {stamp}: cash and holdings agree within the "
+        "reconciliation's tolerance.",
+        row.at,
+        cash_tol,
+    )
 
 
 def _progress(conn: duckdb.DuckDBPyConnection, now: datetime) -> ShakedownProgress | None:
@@ -515,10 +535,14 @@ def build(
         window = journal.latest_window(conn, book)
     except JournalNotInitialised:
         return empty
-    if window is None or window.window_id is None:
+    if window is None or window.window_id is None or window.known_at > now:
         return empty
     window_id = window.window_id
 
+    closed = any(
+        stop.known_at <= now and stop.state in CLOSING_STOP_STATES
+        for stop in journal.window_stops_for(conn, window_id)
+    )
     marks = _marks(conn, window_id, now)
     as_of = max((m.session for m in marks), default=None)
     state, ks_rows, runs = _switch(conn, settings, book, window, now)
@@ -557,14 +581,14 @@ def build(
 
     safety = Safety(
         _reconciliation(window, _known(journal.reconciliations_for(conn, window_id), now), now),
-        _kill_switch(state, runs),
+        _kill_switch(state, runs, closed),
         _limits(conn, window, marks, ks_rows),
     )
     return replace(
         empty,
         window_id=window_id,
         header=Header(
-            "stopped" if state.engaged else "running",
+            "closed" if closed else ("stopped" if state.engaged else "running"),
             as_of,
             value,
             since_book,
