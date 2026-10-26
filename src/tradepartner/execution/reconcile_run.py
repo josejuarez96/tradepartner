@@ -159,6 +159,8 @@ from tradepartner.execution.reconcile import (
     MERGER_CONFLICT,
     MISMATCH,
     OK,
+    OVERDUE_DELISTING_CASH,
+    DelistedCash,
     Explanations,
     JournalOpenOrder,
     OpenMerger,
@@ -710,7 +712,104 @@ def _explanations(
         symbol_changes=symbol_changes,
         mergers=mergers,
         merger_conflicts=merger_conflicts,
+        delisted_cash=_delisted_cash(
+            state,
+            mergers,
+            session,
+            merger_lag_sessions,
+            _ledger(state, actions, window, through, tolerance),
+            tolerance,
+        ),
     )
+
+
+def _delisted_cash(
+    state: _JournalState,
+    mergers: Mapping[str, OpenMerger],
+    session: date,
+    lag_sessions: int,
+    ledger: Ledger,
+    tolerance: float,
+) -> dict[str, DelistedCash]:
+    """The removed delisted holdings whose cash may still arrive (#411): each name
+    the ended-listing band removed (its latest `corporate_action_cash` removal row
+    with no merger id) that has no merger journaled and no open merger, is not
+    held again, and whose removal session plus the frozen
+    `risk.reconcile_merger_lag_sessions` sessions has not passed (`open`), or has
+    passed with no cash journaled and no completed reconciliation after it yet
+    recording `overdue delisting cash` for the name (`overdue`)."""
+    removals: dict[str, AdjustmentRow] = {}
+    merger_names: set[str] = set()
+    for adjustment in state.adjustments:
+        name = adjustment.security_id
+        if name is None or adjustment.kind != _CORPORATE_ACTION_CASH:
+            continue
+        if _merger_id_of(adjustment) is not None:
+            merger_names.add(name)
+        elif adjustment.quantity is not None and adjustment.quantity < 0:
+            current = removals.get(name)
+            if current is None or (adjustment.session, adjustment.known_at) > (
+                current.session,
+                current.known_at,
+            ):
+                removals[name] = adjustment
+    found: dict[str, DelistedCash] = {}
+    for name, removal in sorted(removals.items()):
+        if (
+            name in merger_names
+            or name in mergers
+            or ledger.positions.get(name, 0.0) > tolerance
+            or "listing ended" not in (removal.explanation_json or "")
+        ):
+            continue
+        late = [
+            a
+            for a in state.adjustments
+            if a.security_id == name
+            and a.kind == _CORPORATE_ACTION_CASH
+            and a.quantity is None
+            and a.session >= removal.session
+            and _delisting_cash(a)
+        ]
+        journaled = math.fsum([removal.cash or 0.0, *(a.cash or 0.0 for a in late)])
+        end = removal.session
+        for _ in range(lag_sessions):
+            end = next_session(end)
+        is_open = session <= end
+        noted = any(
+            m.get("security_id") == name and m.get("reason") == OVERDUE_DELISTING_CASH
+            for row in state.rows
+            for m in _row_allowed(row)
+        )
+        found[name] = DelistedCash(
+            removed_quantity=-(removal.quantity or 0.0),
+            since=removal.session,
+            journaled_cash=journaled,
+            open=is_open,
+            overdue=not is_open and journaled <= 0 and not noted,
+        )
+    return found
+
+
+def _delisting_cash(adjustment: AdjustmentRow) -> bool:
+    """Whether an adjustment's `explanation_json` marks it a delisting's late cash."""
+    try:
+        payload = json.loads(adjustment.explanation_json or "{}")
+    except (ValueError, TypeError):
+        return False
+    return isinstance(payload, dict) and payload.get("delisting_cash") is True
+
+
+def _row_allowed(row: ReconciliationRow) -> list[dict[str, Any]]:
+    """The `allowed` entries a reconciliation row recorded (empty when none or unreadable)."""
+    if row.mismatches_json is None:
+        return []
+    try:
+        payload = json.loads(row.mismatches_json)
+    except (ValueError, TypeError):
+        return []
+    found = payload.get("allowed") if isinstance(payload, dict) else None
+    return [m for m in found if isinstance(m, dict)] if isinstance(found, list) else []
 
 
 def _stock_dividend_references(
