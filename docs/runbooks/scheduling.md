@@ -259,6 +259,8 @@ The job must start **after the previous session's `ingest` has completed** (the 
 
 **Wake coverage for two jobs.** One wake cannot cover both the 18:30 ingest and the 08:05 paper run, because macOS keeps a single repeating wake (see "Sleep versus power-off" above, which has the commands). Keep the Mac on power with sleep off (`sudo pmset -c sleep 0`) and remove any old wake (`sudo pmset repeat cancel`). `caffeinate -i` in each plist is then enough to survive the run itself.
 
+`paper status` names the scheduled run as 08:05 ET (`PAPER_RUN_TIME_TEXT` in `cli.py`): it is this launchd schedule, so change both together.
+
 ### The paper plist
 
 Save as `~/Library/LaunchAgents/com.tradepartner.paper.plist`, beside the ingest one. Same `REPO`, `HOME_DIR` and `uv` substitutions as above. `StartCalendarInterval` is the Mac's **local clock**, same as the ingest plist: 08:05 ET is the literal Hour/Minute below only if the Mac's time zone is US Eastern; otherwise convert (see "When to run it" above) and follow daylight saving time with the local clock as the ingest section does.

@@ -19,6 +19,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -1872,9 +1873,9 @@ def test_status_all_lists_two_waiting_items_byte_for_byte(
     out = _paper(clock, factory, "status", "--all")
     assert (out.exit_code, out.output) == (
         0,
-        "b: halted today, run: tradepartner paper resume --book b "
+        "b: halted today; run: tradepartner paper resume --book b "
         '--reason "<why>"\n'
-        "main: halted today, run: tradepartner paper resume --book main "
+        "main: halted today; run: tradepartner paper resume --book main "
         '--reason "<why>"\n'
         "waiting on you (2):\n"
         f"  book b; kill_switch_engaged: kill switch engaged: kill_switch event 2 engaged "
@@ -1995,10 +1996,7 @@ def test_status_summary_labels_completed_rebalance_and_fill_lag(
     expected = "traded today" if has_orders else "ran today with no orders"
     assert f"rebalance {rebalance_day} {expected}" in out.output
     assert f"next rebalance {next_day} (today (done))" not in out.output
-    note = (
-        "The broker already holds these names; "
-        "fills are recorded at the next scheduled run (08:05 ET)"
-    )
+    note = "Orders were sent; fills or rejections are recorded at the next scheduled run (08:05 ET)"
     assert (note in out.output) == has_orders
     detail = _paper(clock, factory, "status")
     assert (note in detail.output) == has_orders
@@ -2324,3 +2322,26 @@ def test_book_reads_that_books_set_while_the_default_reads_main(
         "--book", "ghost", rows=AGREEING,
     )  # fmt: skip
     assert nobook.exit_code == EXIT["no_window"]
+
+
+def _first_line(since: datetime | None, now: datetime, *, others: int = 0) -> str:
+    """`_book_first_lines` for one engaged book with `others` more waiting items."""
+    item = SimpleNamespace(book_id="main", kind="kill_switch_engaged", since=since, command="CMD")
+    more = [SimpleNamespace(book_id="main", kind="order_lagging")] * others
+    row = SimpleNamespace(
+        book_id="main",
+        is_open=True,
+        switch_state=SimpleNamespace(engaged=True, run_in_progress=False),
+    )
+    return cli._book_first_lines([row], [item, *more], now)[0]  # type: ignore[list-item,arg-type]
+
+
+def test_first_line_counts_halt_days_across_the_fall_back() -> None:
+    engaged = datetime(2026, 10, 30, 20, tzinfo=UTC)  # 16:00 ET; clocks fall back 11-01
+    now = datetime(2026, 11, 2, 13, tzinfo=UTC)  # 08:00 ET
+    assert _first_line(engaged, now) == "main: halted 3 days; run: CMD"
+    assert _first_line(engaged, now, others=1) == "main: halted 3 days, 1 other issue; run: CMD"
+
+
+def test_first_line_with_unknown_halt_time_says_only_halted() -> None:
+    assert _first_line(None, datetime(2026, 11, 2, 13, tzinfo=UTC)) == "main: halted; run: CMD"

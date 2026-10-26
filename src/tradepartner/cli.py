@@ -1627,7 +1627,7 @@ def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
 #: to the owner where fills wait for it (#2201). Display text only; nothing reads it.
 PAPER_RUN_TIME_TEXT = "08:05 ET"
 _FILLS_NOTE = (
-    "The broker already holds these names; fills are recorded at the next scheduled run "
+    "Orders were sent; fills or rejections are recorded at the next scheduled run "
     f"({PAPER_RUN_TIME_TEXT})"
 )
 
@@ -1655,15 +1655,18 @@ def _book_first_lines(
     for row in summaries:
         mine = [item for item in items if item.book_id == row.book_id]
         halt = next((i for i in mine if i.kind == "kill_switch_engaged"), None)
-        if halt is not None:
-            days = (
-                (now.astimezone(_NEW_YORK).date() - halt.since.astimezone(_NEW_YORK).date()).days
-                if isinstance(halt.since, datetime)
-                else 0
-            )
-            age = "halted today" if days <= 0 else f"halted {_plural(days, 'day')}"
-            fix = f", run: {halt.command}" if halt.command else ""
-            lines.append(f"{row.book_id}: {age}{fix}")
+        if halt is not None or row.switch_state.engaged:
+            others = len(mine) - (1 if halt is not None else 0)
+            if halt is None or not isinstance(halt.since, datetime):
+                age = "halted"
+            else:
+                days = (
+                    now.astimezone(_NEW_YORK).date() - halt.since.astimezone(_NEW_YORK).date()
+                ).days
+                age = "halted today" if days <= 0 else f"halted {_plural(days, 'day')}"
+            more = f", {_plural(others, 'other issue')}" if others else ""
+            fix = f"; run: {halt.command}" if halt is not None and halt.command else ""
+            lines.append(f"{row.book_id}: {age}{more}{fix}")
             continue
         if not row.is_open:
             state = "window closed"
