@@ -1401,8 +1401,9 @@ def abandon(
     book_id: str | None = None,
 ) -> AbandonResult:
     """`paper abandon --reason`, owner-only (module docstring; #247 Q13).
-    Raises `WindowCommandRefused` for a blank reason, no open window or an
-    open order of the window (before any broker call or write),
+    Raises `WindowCommandRefused` for a blank reason, no open window, an
+    open order of the window or a broker on another account (`ACCOUNT_MISMATCH`,
+    #2187; all before any write),
     `LockHeld` while another process holds the run lock, `ClockError` for a
     bad clock reading, and whatever the broker or the store raises (nothing
     but the reconciliation row is then written, plus a `fault` engagement
@@ -1419,6 +1420,13 @@ def abandon(
                 OPEN_ORDERS,
                 "cancel or wait for the window's own open orders, run paper resume so "
                 "the journal collects them, then abandon: " + "; ".join(still_open),
+            )
+        account = broker.account()
+        if account.account_id != window.account_id:
+            raise WindowCommandRefused(
+                ACCOUNT_MISMATCH,
+                f"the broker's account {account.account_id!r} is not window "
+                f"{window_id}'s {window.account_id!r}",
             )
         frozen = frozen_risk(window)
         now = _command_clock(clock)
