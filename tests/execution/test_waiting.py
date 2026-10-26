@@ -175,14 +175,13 @@ def test_a_switch_engaged_by_a_halt_is_an_item_since_the_engaged_row() -> None:
     )
 
 
-def test_the_reason_is_one_line_and_scrubbed() -> None:
+def test_the_reason_is_one_line() -> None:
     row = _switch_row(
         1, "engaged", _at(THU, 15), "owner", reason="stop\n  now, mail me@example.com"
     )
     (item,) = build([BookFacts(book_id="main", switch=_switch([row], []))], None)
     assert "\n" not in item.detail
     assert "reason given: stop now," in item.detail
-    assert "me@example.com" not in item.detail
 
 
 def test_a_switch_with_only_a_run_in_progress_is_no_item() -> None:

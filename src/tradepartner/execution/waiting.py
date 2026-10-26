@@ -51,7 +51,6 @@ from typing import Final, Literal
 from zoneinfo import ZoneInfo
 
 from tradepartner.calendar import session_close
-from tradepartner.cli_record import scrub_text
 from tradepartner.config import RiskConfig
 from tradepartner.execution.collect import lag_verdict
 from tradepartner.execution.plain import plain_causes
@@ -196,8 +195,8 @@ class SpanFacts:
 
 
 def _one_line(text: str) -> str:
-    """A stored free-text reason on one line, through the CLI's output scrub."""
-    return scrub_text(" ".join(text.split()), secrets=())[0]
+    """A stored free-text reason on one line; the renderers scrub it (cli, ops page)."""
+    return " ".join(text.split())
 
 
 def _kill_switch_item(book_id: str, facts: SwitchFacts) -> WaitingItem | None:

@@ -10,8 +10,6 @@ from __future__ import annotations
 import re
 from typing import Final
 
-from tradepartner.adapters.alpaca_trading_raw import AlpacaTradingError
-
 #: Where the scheduled paper run's errors land (docs/runbooks/shakedown.md).
 PAPER_ERR_LOG: Final = "~/Library/Logs/tradepartner/paper.err.log"
 
@@ -50,8 +48,10 @@ def plain_causes(causes: tuple[str, ...] | list[str]) -> str:
 def failure_hint(exc: BaseException, *, scheduled: bool = False) -> str:
     """The plain next step for an unclassified failure. `scheduled` is True for the
     scheduled paper run, whose errors land in the log file."""
-    if isinstance(exc, AlpacaTradingError):
-        code = exc.status_code
+    if (
+        type(exc).__name__ == "AlpacaTradingError"
+    ):  # by name: execution never imports the raw client
+        code = getattr(exc, "status_code", None)
         if code == 401:
             what = "Alpaca refused the credentials; check the paper keys in .env"
         elif code == 403:
