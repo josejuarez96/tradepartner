@@ -4269,7 +4269,9 @@ def make_app(
                     continue
                 _run_lines(prefix, entry.outcome, s)
             codes = [entry.exit_code for entry in runs]
-            heartbeat.ping(s, "paper", ok=not any(codes))  # off-Mac dead-man's switch (#2155)
+            # Off-Mac dead-man's switch (#2155): green only when every open-window book is
+            # healthy; a halted book keeps it red until resumed (#2179).
+            heartbeat.ping(s, "paper", ok=all(entry.healthy for entry in runs))
             if WRITE_FAILED_EXIT_CODE in codes:
                 raise typer.Exit(WRITE_FAILED_EXIT_CODE)
             if any(codes):
@@ -4288,7 +4290,7 @@ def make_app(
                 _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
             ) from exc
         _run_lines("paper run", outcome, s)
-        heartbeat.ping(s, "paper", ok=not outcome.exit_code)
+        heartbeat.ping(s, "paper", ok=outcome.healthy)  # a halted book stays red (#2179)
         if outcome.exit_code:
             raise typer.Exit(outcome.exit_code)
 
