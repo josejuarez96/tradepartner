@@ -22,7 +22,7 @@ import duckdb
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from tradepartner.backtest.metrics import METRIC_KEYS, deflated_sharpe
+from tradepartner.backtest.metrics import LONG_SHORT_KEYS, METRIC_KEYS, deflated_sharpe
 from tradepartner.config import Settings
 from tradepartner.dashboard import backtest_page, theme
 from tradepartner.research.experiment import hash_file, parse_experiment_file
@@ -112,6 +112,7 @@ def _ok_trial(
     details: bool = False,
     measured: float | None = None,
     counts: dict[str, int] | None = None,
+    long_short: bool = False,
     **kwargs: Any,
 ) -> registry.TrialHandle:
     handle = _open(conn, seed_settings, hypothesis_id, **kwargs)
@@ -126,7 +127,27 @@ def _ok_trial(
             registry.MetricRow("strategy", measured, key, value, "measured")
             for key, value in _metrics(sharpe, excess).items()
         )
+    if long_short:
+        rows.extend(
+            registry.MetricRow("strategy", cost, key, 0.5 + i / 10, "base")
+            for cost in LADDER
+            for i, key in enumerate(LONG_SHORT_KEYS)
+        )
+        rows.extend(
+            registry.MetricRow("strategy_borrow_300bp", BASE, key, value, "base")
+            for key, value in _metrics(sharpe, excess).items()
+        )
     registry.write_metrics(conn, handle, rows)
+    if long_short:
+        registry.write_equity(
+            conn,
+            handle,
+            [
+                registry.EquityRow(series, BASE, day, 100.0 * (1 + i / 10) * scale, None)
+                for series, scale in (("strategy_borrow_300bp", 0.99),)
+                for i, day in enumerate(SESSIONS)
+            ],
+        )
     if details:
         registry.write_equity(
             conn,
@@ -933,3 +954,57 @@ def test_a_measured_level_column_header_carries_its_kind(tmp_path: Path) -> None
     assert "strategy @ 22.0 bps (measured)" in columns
     assert "strategy @ 15.0 bps (base)" in columns
     assert "strategy @ 30.0 bps (ladder)" in columns
+
+
+def _long_short_view(tmp_path: Path, *, long_short: bool) -> tuple[Path, int]:
+    store_path = tmp_path / ("ls.duckdb" if long_short else "lo.duckdb")
+    seed_settings = Settings(_env_file=None, store={"path": str(tmp_path / "real.duckdb")})
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        schema.init_schema(conn)
+        h1 = _hypothesis(conn, seed_settings, "h1-momentum-12-1", 0.5)
+        handle = _ok_trial(conn, seed_settings, h1, 0.2, 0.05, details=True, long_short=long_short)
+    return store_path, handle.trial_id
+
+
+def test_a_long_short_trial_shows_exposure_the_proxy_limits_and_reported_only_lines(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path, trial_id = _long_short_view(tmp_path, long_short=True)
+    at = _pick(_app(monkeypatch, store_path), trial_id)
+    assert not at.exception
+    text = _text(at)
+    assert "Long/short exposure" in text
+    for limit in backtest_page.PROXY_LIMITS:
+        assert limit in text
+    assert len(backtest_page.PROXY_LIMITS) == 3
+    exposure = next(
+        df.value for df in at.dataframe if list(df.value.columns) == ["metric", "value"]
+    )
+    assert list(exposure["metric"]) == list(LONG_SHORT_KEYS)
+    assert list(exposure["value"]) == pytest.approx([0.5 + i / 10 for i in range(7)])
+    metrics = next(
+        df.value
+        for df in at.dataframe
+        if "metric" in df.value.columns and "strategy @ 15.0 bps (base)" in df.value.columns
+    )
+    assert "strategy_borrow_300bp (reported only) @ 15.0 bps (base)" in metrics.columns
+    assert set(LONG_SHORT_KEYS) <= set(metrics["metric"])
+    equity_spec = json.loads(at.get("vega_lite_chart")[0].proto.spec)
+    series = set(equity_spec["encoding"]["color"]["scale"]["domain"])
+    assert "strategy_borrow_300bp (reported only)" in series
+    assert "strategy_borrow_300bp" not in series
+
+
+def test_a_long_only_trial_shows_no_long_short_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path, trial_id = _long_short_view(tmp_path, long_short=False)
+    at = _pick(_app(monkeypatch, store_path), trial_id)
+    assert not at.exception
+    text = _text(at)
+    assert "Long/short exposure" not in text
+    assert not any(limit in text for limit in backtest_page.PROXY_LIMITS)
+    metrics = next(
+        df.value for df in at.dataframe if "strategy @ 15.0 bps (base)" in df.value.columns
+    )
+    assert not set(LONG_SHORT_KEYS) & set(metrics["metric"])

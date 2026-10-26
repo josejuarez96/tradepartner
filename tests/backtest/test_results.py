@@ -28,6 +28,7 @@ from tradepartner.backtest.engine import BacktestResult, run
 from tradepartner.backtest.hypothesis import frozen_params_of, load_frozen
 from tradepartner.backtest.metrics import (
     EXCESS_SPY_KEYS,
+    LONG_SHORT_KEYS,
     METRIC_KEYS,
     deflated_sharpe,
     red_flag,
@@ -1652,3 +1653,132 @@ def test_a_measured_level_writes_a_plain_rungs_values_under_a_measured_label(
         assert _kinded_rows(conn, with_measured.trial_id, level) == _kinded_rows(
             conn, plain.trial_id, level
         )
+
+
+# --- T224: long/short reporting (spec amendment #1872, items 6 and 8) --------------------
+
+
+def _long_short_settings(tmp_path: Path) -> Settings:
+    return _settings(
+        tmp_path,
+        portfolio={"side": "long_short", "gross_exposure": 1.0, "net_exposure": 0.0},
+        costs={
+            "per_side_bps": BASE,
+            "sensitivity_per_side_bps": [0.0, 30.0],
+            "borrow_bps_per_year": 30.0,
+            "borrow_sensitivity_bps": [0.0, 300.0],
+        },
+    )
+
+
+def _long_short_rows(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> tuple[registry.TrialHandle, dict[float, BacktestResult], Settings]:
+    settings = _long_short_settings(tmp_path)
+    _register(conn, settings)
+    handle, results, status = _trial(conn, settings, tmp_path)
+    assert status == "ok"
+    return handle, results, settings
+
+
+def test_a_long_short_trial_writes_the_seven_keys_on_the_strategy_series_only(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    handle, results, _ = _long_short_rows(conn, tmp_path)
+    for level in LEVELS:
+        strategy = _metrics(conn, handle.trial_id, "strategy", level)
+        assert set(strategy) == set(METRIC_KEYS) | set(LONG_SHORT_KEYS), level
+        summary = results[level].exposure_summary
+        assert summary is not None
+        assert strategy["gross_exposure_mean"] == summary.gross_mean
+        assert strategy["net_exposure_min"] == summary.net_min
+        assert strategy["net_exposure_max"] == summary.net_max
+        assert strategy["borrow_paid_annual"] == pytest.approx(
+            summary.borrow_paid
+            / (
+                sum(r.equity for r in results[level].equity if r.series == "strategy")
+                / sum(1 for r in results[level].equity if r.series == "strategy")
+            )
+            / (len(rebalance_sessions(START, END)) - 1)
+            * 12,
+            rel=1e-12,
+        )
+        for series in ("SPY", "MTUM"):
+            assert set(_metrics(conn, handle.trial_id, series, level)) == set(METRIC_KEYS)
+
+
+def test_borrow_series_have_equity_and_metric_rows_at_the_base_level_only(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    handle, results, _ = _long_short_rows(conn, tmp_path)
+    for rate in ("0", "300"):
+        name = f"strategy_borrow_{rate}bp"
+        levels = {
+            level
+            for (level,) in conn.execute(
+                "SELECT DISTINCT cost_per_side_bps FROM trial_metrics "
+                "WHERE trial_id = ? AND series = ?",
+                [handle.trial_id, name],
+            ).fetchall()
+        }
+        assert levels == {BASE}, name
+        assert set(_metrics(conn, handle.trial_id, name, BASE)) == set(METRIC_KEYS)
+        (n_equity,) = conn.execute(  # type: ignore[misc]
+            "SELECT COUNT(*) FROM trial_equity WHERE trial_id = ? AND series = ?",
+            [handle.trial_id, name],
+        ).fetchone()
+        assert n_equity == sum(1 for r in results[BASE].equity if r.series == name) > 0
+    # A higher fee never gains: the 300 bp book ends no higher than the 0 bp book.
+    assert (
+        _metrics(conn, handle.trial_id, "strategy_borrow_300bp", BASE)["cagr"]
+        < _metrics(conn, handle.trial_id, "strategy_borrow_0bp", BASE)["cagr"]
+    )
+
+
+def test_borrow_series_never_move_n_v_dsr_or_the_red_flag(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """The same trial written with the borrow books' equity stripped has the same result row
+    (N, V, SR*, DSR, red flag), and the family's N and pair Sharpes count one trial."""
+    handle, results, settings = _long_short_rows(conn, tmp_path)
+    stored = _result_row(conn, handle.trial_id)
+    assert family_n(conn, "momentum") == 1
+    stripped = {
+        level: replace(
+            r, equity=tuple(row for row in r.equity if not row.series.startswith("strategy_borrow"))
+        )
+        for level, r in results.items()
+    }
+    base_rows = [r for r in metric_rows(stripped, settings, cadence="month_end", family="momentum")]
+    full_rows = metric_rows(results, settings, cadence="month_end", family="momentum")
+    assert {r for r in full_rows if r.series.startswith("strategy_borrow")}
+    assert [r for r in full_rows if not r.series.startswith("strategy_borrow")] == base_rows
+    # The stored statistics are the strategy base level's alone.
+    base = _metrics(conn, handle.trial_id, "strategy", BASE)
+    ppy = base["periods_per_year"]
+    assert ppy == 12 and stored["n_trials"] == 1
+    assert stored["red_flag"] == red_flag(base, settings)
+
+
+def test_a_long_only_trial_writes_no_long_short_row(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    settings = _settings(tmp_path)
+    _register(conn, settings)
+    handle, results, _ = _trial(conn, settings, tmp_path)
+    names = {
+        m
+        for (m,) in conn.execute(
+            "SELECT DISTINCT metric FROM trial_metrics WHERE trial_id = ?", [handle.trial_id]
+        ).fetchall()
+    }
+    assert names == set(METRIC_KEYS)
+    assert not names & set(LONG_SHORT_KEYS)
+    assert all(r.exposure_summary is None for r in results.values())
+    series = {
+        s
+        for (s,) in conn.execute(
+            "SELECT DISTINCT series FROM trial_metrics WHERE trial_id = ?", [handle.trial_id]
+        ).fetchall()
+    }
+    assert series == {"strategy", "SPY", "MTUM"}

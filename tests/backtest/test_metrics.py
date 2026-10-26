@@ -15,9 +15,11 @@ import pytest
 
 from tradepartner.backtest.metrics import (
     EXCESS_SPY_KEYS,
+    LONG_SHORT_KEYS,
     METRIC_KEYS,
     MONTHS_PER_YEAR,
     DeflatedSharpe,
+    LongShortBook,
     deflated_sharpe,
     expected_max_sharpe,
     metric_keys,
@@ -921,6 +923,89 @@ def test_beta_and_alpha_reach_no_selection_path() -> None:
         assert not {"METRIC_KEYS", "metric_keys"} & found, name
     base = _metrics()
     moved = {**base, "beta_spy": -50.0, "alpha_spy_annual": 99.0}
+    s = Settings(_env_file=None)
+    assert red_flag(moved, s) is red_flag(base, s)
+    pairs = [0.4, 0.9, 0.6]
+    for basis in ("raw", "excess_spy"):
+        assert deflated_sharpe(
+            moved, basis, n_trials=5, pair_sharpes=pairs, periods_per_year=12
+        ) == deflated_sharpe(base, basis, n_trials=5, pair_sharpes=pairs, periods_per_year=12)
+
+
+# --- T224: the seven long/short keys (spec amendment #1872, item 8) --------------------
+
+LS_BOOK = LongShortBook(
+    gross_mean=1.05, gross_max=1.2, net_mean=-0.1, net_min=-0.25, net_max=0.05, borrow_paid=40.0
+)
+
+
+def _long_short_metrics(book: LongShortBook | None = LS_BOOK, *, rf: float = 0.0) -> dict:  # type: ignore[type-arg]
+    return series_metrics(
+        "strategy",
+        period_returns=NET,
+        gross_period_returns=GROSS,
+        daily_equity=DAILY_EQUITY,
+        turnover=TURNOVER,
+        spy_period_returns=SPY,
+        mtum_period_returns=MTUM,
+        periods_per_year=12,
+        risk_free_period_returns=constant_period_returns(rf, 12, len(NET)),
+        long_short=book,
+    )
+
+
+def test_long_short_keys_equal_hand_values() -> None:
+    """Exposures are copied; borrow_paid_annual is 40 / mean(DAILY_EQUITY) / (4 / 12) years;
+    excess_cagr_rf is cagr - the annualised risk-free return (rf = 0.02 a year here)."""
+    m = _long_short_metrics(rf=0.02)
+    mean_equity = sum(DAILY_EQUITY) / len(DAILY_EQUITY)
+    cagr = math.prod(1 + r for r in NET) ** (12 / 4) - 1
+    rf_annual = m["risk_free_annual"]
+    assert rf_annual is not None and rf_annual > 0
+    assert m["gross_exposure_mean"] == 1.05
+    assert m["gross_exposure_max"] == 1.2
+    assert m["net_exposure_mean"] == -0.1
+    assert m["net_exposure_min"] == -0.25
+    assert m["net_exposure_max"] == 0.05
+    assert m["borrow_paid_annual"] == pytest.approx(40.0 / mean_equity / (4 / 12), rel=1e-12)
+    assert m["excess_cagr_rf"] == pytest.approx(cagr - rf_annual, rel=1e-12)
+
+
+def test_long_short_keys_leave_every_other_key_alone_and_none_adds_nothing() -> None:
+    base = _long_short_metrics(None)
+    with_ls = _long_short_metrics()
+    assert list(base) == list(METRIC_KEYS)
+    assert list(with_ls) == list(METRIC_KEYS) + list(LONG_SHORT_KEYS)
+    assert {k: with_ls[k] for k in METRIC_KEYS} == base
+    assert len(LONG_SHORT_KEYS) == 7 and not set(LONG_SHORT_KEYS) & set(METRIC_KEYS)
+
+
+def test_metric_keys_adds_the_long_short_keys_only_when_asked() -> None:
+    assert metric_keys(None) == METRIC_KEYS
+    assert metric_keys("QUAL", long_short=False) == metric_keys("QUAL")
+    assert metric_keys(None, long_short=True) == METRIC_KEYS + LONG_SHORT_KEYS
+    assert set(metric_keys("QUAL", long_short=True)) == set(METRIC_KEYS) | set(LONG_SHORT_KEYS) | {
+        "excess_cagr_qual",
+        "tracking_error_qual",
+    }
+
+
+def test_long_short_keys_and_borrow_series_reach_no_selection_path() -> None:
+    """Reported only (spec amendment #1872, items 6 and 8): `holdout.py`, `promotion.py` and
+    `sweep_report.py` name no long/short key, no `strategy_borrow` string, neither
+    `LONG_SHORT_KEYS` nor the borrow prefix, and never iterate `metric_keys`."""
+    for name in _SELECTION_MODULES:
+        found = _identifiers_and_strings(BACKTEST_SRC / name)
+        leaks = {
+            s
+            for s in found
+            for key in (*LONG_SHORT_KEYS, "strategy_borrow", "BORROW_SERIES_PREFIX")
+            if key in s
+        }
+        assert not leaks, (name, leaks)
+        assert not {"LONG_SHORT_KEYS", "LongShortBook", "metric_keys"} & found, name
+    base = _long_short_metrics(None)
+    moved = _long_short_metrics()
     s = Settings(_env_file=None)
     assert red_flag(moved, s) is red_flag(base, s)
     pairs = [0.4, 0.9, 0.6]
