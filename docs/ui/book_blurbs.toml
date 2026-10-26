@@ -1,0 +1,11 @@
+# One plain sentence per registered hypothesis, keyed by its slug (plan T273, #2170,
+# open question 3). The Home and Book pages show it under a book's name; a book whose
+# slug is missing here shows the registry title instead. Written by an agent, approved
+# by the owner in the T273 PR. Describe what the book does, not how it was tested.
+
+[blurbs]
+"h1-momentum-12-1" = "Holds the stocks that rose the most over the past year (leaving out the latest month), spread evenly, and re-sorts once a month."
+"b3-gross-profitability" = "Holds the companies that earn the most gross profit for the assets they own, spread evenly, and re-sorts once a month."
+"b9-earnings-reaction-drift" = "Holds the stocks that reacted best to their latest earnings report, each for about four weeks, and checks every day."
+"b10-short-term-momentum" = "Holds last month's winners among the most heavily traded stocks, spread evenly, and re-sorts once a month."
+"momentum-daily-shakedown" = "A machine test: the one-year momentum idea re-sorted every trading day, to prove the daily routine works, not to make money."
