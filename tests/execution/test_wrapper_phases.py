@@ -677,6 +677,7 @@ def test_a_held_trim_sells_the_rest_once_the_open_sell_expires(
     """#719 item 6 acceptance, end to end: a trim beside an earlier session's
     open own sell is held (no order, no `decision_events` row, no skip count,
     decision open); once that sell expires, the next run trims the rest."""
+    env.clock.now = session_open(S) + timedelta(minutes=10)  # room before the window closes
     _hold(env, A, 10.0)
     _open_sell(env, A, 9.5)
     trim = _decision(env, A, "sell", notional=500.0, whole_share=True)
@@ -1169,6 +1170,29 @@ def test_sells_closed_by_the_window_send_no_buy(
         "WHERE o.run_id = ? AND o.security_id = ? ORDER BY e.known_at, e.rowid",
         [env.run.run_id, C],
     ) == [("pending", None), ("cancelled", "not_received")]
+
+
+def test_a_buy_is_not_sent_when_a_lock_wait_ran_the_clock_past_the_window(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#2178: a longer store lock wait (`store.writer_lock_retry_seconds`) before the
+    buys can end after the window closes (open + 30 min). The window is re-checked
+    before every submit, not only after an ack timeout, so no buy is sent and each
+    order is closed `not_received`."""
+    env.clock.now = session_open(S) + timedelta(minutes=31)
+    buys = [_decision(env, A, "buy", notional=3000.0), _decision(env, B, "buy", notional=3000.0)]
+    outcome = _execute(_gate(env, alerter_conn), env, buys)
+    assert outcome.status == "ok"
+    assert _submits(env.fake) == []
+    events = _query(
+        env.settings,
+        "SELECT e.status, e.reason FROM order_events e JOIN orders o USING (client_order_id) "
+        "WHERE o.run_id = ?",
+        [env.run.run_id],
+    )
+    assert sorted(events, key=str) == sorted(
+        [("pending", None)] * 2 + [("cancelled", "not_received")] * 2, key=str
+    )
 
 
 def test_a_second_ack_timeout_in_the_batch_halts_and_leaves_it_pending(

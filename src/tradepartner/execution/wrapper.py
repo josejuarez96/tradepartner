@@ -1448,14 +1448,17 @@ class RiskGatedBroker:
         submitted: list[str] = []
         refused: list[Skip] = []
         for index, (row, request) in enumerate(pairs):
+            assert run.session is not None
             if self._recheck:
-                # After the longer poll: the clock pre-check and the submit
-                # window run again before the next submit (item 4 (a)).
-                assert run.session is not None
+                # After the longer poll: the clock pre-check runs again before
+                # the next submit (item 4 (a)).
                 self.clock_precheck(run.session, last_ok_ingest)
-                if not self._in_submit_window(run.session):
-                    self._close_unsent(run, [r for r, _ in pairs[index:]])
-                    break
+            # Before EVERY submit, not only after a longer poll: a store lock wait
+            # (`store.writer_lock_retry_seconds`) may have run the clock past the
+            # window, and nothing is sent outside it (#2178).
+            if not self._in_submit_window(run.session):
+                self._close_unsent(run, [r for r, _ in pairs[index:]])
+                break
             try:
                 placed = self._broker.submit(request)
             except DuplicateClientOrderIdError as duplicate:

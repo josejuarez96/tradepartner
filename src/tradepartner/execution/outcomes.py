@@ -491,7 +491,7 @@ def write_outcomes_and_lots(
             ledger, lot_error = None, str(exc)
         lot_rows = 0
         if ledger is not None:
-            appended = _append_ledger(conn, ledger, now)
+            appended = _append_ledger(conn, ledger, now, _window_book(conn, window_id))
             if appended is None:
                 lot_error = f"lot ledger changed but the clock ({now.isoformat()}) did not advance"
                 ledger = None  # unsaved: realised P&L waits for a run that saves it
@@ -531,6 +531,16 @@ def write_outcomes_and_lots(
     return WriteResult(outcomes=len(outcomes), lot_rows=lot_rows, lot_error=lot_error)
 
 
+def _window_book(conn: duckdb.DuckDBPyConnection, window_id: int) -> str:
+    """The book the window's rows are written in (`paper_windows.book_id`)."""
+    row = conn.execute(
+        "SELECT book_id FROM paper_windows WHERE window_id = ?", [window_id]
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no paper window {window_id}")
+    return str(row[0])
+
+
 _LOT_COLUMNS = (
     "account_id, account_type, account_owner, security_id, symbol, cusip, trade_at, "
     "trade_date_local, quantity, cost_basis, fill_id"
@@ -540,22 +550,37 @@ _DISPOSAL_COLUMNS = (
 )
 
 
-def _latest_set(conn: duckdb.DuckDBPyConnection) -> tuple[list[tuple[object, ...]], ...]:
-    """The content of the latest journaled lot-ledger set, ids replaced by
+def _book_stamp(conn: duckdb.DuckDBPyConnection, book_id: str) -> datetime | None:
+    """The stamp of `book_id`'s current lot-ledger set (its latest `lots.known_at`),
+    None when the book has none. Each book's set is its own (#2190)."""
+    row = conn.execute("SELECT max(known_at) FROM lots WHERE book_id = ?", [book_id]).fetchone()
+    return None if row is None else row[0]
+
+
+def _latest_set(
+    conn: duckdb.DuckDBPyConnection, book_id: str
+) -> tuple[list[tuple[object, ...]], ...]:
+    """The content of `book_id`'s latest journaled lot-ledger set, ids replaced by
     positions within the set, for comparison."""
+    stamp = _book_stamp(conn, book_id)
     lot_rows = conn.execute(
         f"SELECT lot_id, {_LOT_COLUMNS} FROM lots "
-        "WHERE known_at = (SELECT max(known_at) FROM lots) ORDER BY lot_id"
+        "WHERE book_id = ? AND known_at = ? ORDER BY lot_id",
+        [book_id, stamp],
     ).fetchall()
     lot_pos = {row[0]: n for n, row in enumerate(lot_rows)}
     disposal_rows = conn.execute(
         f"SELECT disposal_id, lot_id, {_DISPOSAL_COLUMNS} FROM disposals "
-        "WHERE known_at = (SELECT max(known_at) FROM lots) ORDER BY disposal_id"
+        "WHERE book_id = ? AND known_at = ? ORDER BY disposal_id",
+        [book_id, stamp],
     ).fetchall()
     disposal_pos = {row[0]: n for n, row in enumerate(disposal_rows)}
     flag_rows = conn.execute(
         "SELECT disposal_id, replacement_lot_id, matched_quantity, disallowed_amount "
-        "FROM wash_sale_flags WHERE known_at = (SELECT max(known_at) FROM lots) ORDER BY flag_id"
+        "FROM wash_sale_flags WHERE known_at = ? AND disposal_id IN "
+        "(SELECT disposal_id FROM disposals WHERE book_id = ? AND known_at = ?) "
+        "ORDER BY flag_id",
+        [stamp, book_id, stamp],
     ).fetchall()
     return (
         [_normal(row[1:]) for row in lot_rows],
@@ -622,15 +647,18 @@ def _rebuilt_set(ledger: LotLedger) -> tuple[list[tuple[object, ...]], ...]:
     )
 
 
-def _append_ledger(conn: duckdb.DuckDBPyConnection, ledger: LotLedger, now: datetime) -> int | None:
-    """Append the rebuilt set when it differs from the latest one; return the
-    number of rows appended, or None when it differs but `now` is not after
-    the latest set's stamp (appending would merge the two sets)."""
+def _append_ledger(
+    conn: duckdb.DuckDBPyConnection, ledger: LotLedger, now: datetime, book_id: str
+) -> int | None:
+    """Append the rebuilt set when it differs from `book_id`'s latest one (the
+    other books' sets are not compared, #2190); return the number of rows
+    appended, or None when it differs but `now` is not after the book's latest
+    stamp (appending would merge the two sets)."""
     lots, disposals, flags = ledger
-    if not lots or _rebuilt_set(ledger) == _latest_set(conn):
+    if not lots or _rebuilt_set(ledger) == _latest_set(conn, book_id):
         return 0
-    latest = conn.execute("SELECT max(known_at) FROM lots").fetchone()
-    if latest is not None and latest[0] is not None and now <= latest[0]:
+    latest = _book_stamp(conn, book_id)
+    if latest is not None and now <= latest:
         return None
     lot_ids: dict[int, int] = {}
     for lot in lots:
