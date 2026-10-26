@@ -904,6 +904,8 @@ def test_a_merged_fragment_naming_the_task_counts_as_done_before_the_fold(root: 
     (root / "changelog.d").mkdir()
     (root / "changelog.d" / "README.md").write_text("task: T8b (PR #1)\n")  # docs, not a fragment
     (root / "changelog.d" / "22-universe.md").write_text("task: T5 (PR #23)\n- s\n")
+    (root / "changelog.d" / "old").mkdir()  # not a fragment: fragments live at the top level
+    (root / "changelog.d" / "old" / "9-x.md").write_text("task: T8b (PR #9)\n")
     subprocess.run([*git, "add", "docs", "changelog.d"], check=True)
     subprocess.run([*git, "commit", "-q", "-m", "docs: plan and a merged fragment"], check=True)
     done = {t.id: t.done for t in team.load_tasks(root, "HEAD")}

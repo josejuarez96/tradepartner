@@ -1361,7 +1361,7 @@ def test_a_plan_task_pr_names_its_task_and_pr_in_its_fragment() -> None:
         issue_labels=("task:T2",),
         conflicted={frag: "task: T2 (PR #70)\n### Added\n- x (#69)\n"},
     )
-    with pytest.raises(ready_pr.ReadyError, match=r"task: T2 \(PR #69\)"):
+    with pytest.raises(ready_pr.ReadyError, match=r"may not add.*task: T2 \(PR #70\)"):
         ready_pr.ready(wrong_pr, 69, dry_run=True)
     named = FakeRunner(
         touched=touched,
@@ -1371,6 +1371,32 @@ def test_a_plan_task_pr_names_its_task_and_pr_in_its_fragment() -> None:
     assert ready_pr.ready(named, 69, dry_run=True) == 0
     # An issue that is not a plan task (size S) needs no task line.
     assert ready_pr.ready(FakeRunner(touched=touched), 69, dry_run=True) == 0
+
+
+def test_stray_task_lines_only_this_issue_this_pr_and_its_labels() -> None:
+    texts = {
+        "changelog.d/69-x.md": "task: T2 (PR #69)\ntask: T3 (PR #69)\ntask: T2 (PR #70)\n",
+        "changelog.d/12-other.md": "task: T2 (PR #69)\n- s\n",
+        "changelog.d/69-y.md": "- no task line\n",
+    }
+    assert ready_pr.stray_task_lines(69, 69, ["T2"], texts) == [
+        "changelog.d/12-other.md: task: T2 (PR #69)",
+        "changelog.d/69-x.md: task: T3 (PR #69)",
+        "changelog.d/69-x.md: task: T2 (PR #70)",
+    ]
+    # No task label (a size-S issue) or no issue: every task line is stray.
+    assert len(ready_pr.stray_task_lines(69, 69, [], texts)) == 4
+    assert len(ready_pr.stray_task_lines(None, 69, ["T2"], texts)) == 4
+
+
+def test_a_task_line_for_an_unlabelled_issue_stops_even_with_allow_shared_files() -> None:
+    frag = "changelog.d/69-x.md"
+    r = FakeRunner(
+        touched=["src/tradepartner/store/asof.py", frag],
+        conflicted={frag: "task: T2 (PR #69)\n### Added\n- x (#69)\n"},
+    )
+    with pytest.raises(ready_pr.ReadyError, match="may not add"):
+        ready_pr.ready(r, 69, dry_run=True, allow_shared_files=True)
 
 
 # ── targeted local tests (#456) ─────────────────────────────────────────────────

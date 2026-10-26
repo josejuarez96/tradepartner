@@ -786,7 +786,7 @@ def _ref_fragment_lines(root: Path, ref: str) -> list[str]:
     out = subprocess.run(
         [
             *("git", "-C", str(root), "grep", "-h", "-E", "^task: ", ref, "--"),
-            *("changelog.d/*.md", ":(exclude)changelog.d/README.md"),
+            *(":(glob)changelog.d/*.md", ":(exclude)changelog.d/README.md"),
         ],
         capture_output=True,
         text=True,

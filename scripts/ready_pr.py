@@ -628,6 +628,23 @@ def fragment_tasks(fragment_texts: Sequence[str]) -> dict[str, int]:
     }
 
 
+def stray_task_lines(
+    issue: int | None, number: int, tasks: Sequence[str], fragment_texts: Mapping[str, str]
+) -> list[str]:
+    """``task:`` lines in ``fragment_texts`` (path -> text) that are not this PR's to add
+    (#2280): outside ``changelog.d/<issue>-*``, naming another PR, or naming a task the
+    issue does not carry as a ``task:`` label."""
+    bad: list[str] = []
+    for path, text in sorted(fragment_texts.items()):
+        own = issue is not None and path.startswith(f"changelog.d/{issue}-")
+        for ln in text.splitlines():
+            if not (m := FRAGMENT_TASK_RE.match(ln.strip())):
+                continue
+            if not own or int(m.group("pr")) != number or m.group("id") not in tasks:
+                bad.append(f"{path}: {ln.strip()}")
+    return bad
+
+
 def lacks_changelog_bullets(branch: str, fragment_texts: Sequence[str]) -> bool:
     """On a ``feat/`` or ``fix/`` branch, whether none of the issue's added
     ``changelog.d`` fragments holds a CHANGELOG heading with a bullet (a STATUS-only
@@ -814,21 +831,38 @@ def ready(
                 "(or the line `task: Tn (PR #n)` first in it); the fold ticks and collapses "
                 "the plan line after merge (#2280)"
             )
-        if issue is not None:
-            tasks = [
-                lb.removeprefix(TASK_LABEL_PREFIX)
-                for lb in r.issue_labels(issue)
-                if lb.startswith(TASK_LABEL_PREFIX)
-            ]
-            named = fragment_tasks([r.read(p) for p in own])
-            want = [f"`task: {t} (PR #{number})`" for t in tasks if named.get(t) != number]
-            if want:
-                raise ReadyError(
-                    f"issue #{issue} is a plan task: put "
-                    + " and ".join(want)
-                    + f" first in changelog.d/{issue}-<slug>.md (`fragments.py add ... --task "
-                    "Tn --pr n`); the PR never edits docs/plans, the fold ticks the line (#2280)"
-                )
+    # #2280: every `task:` line the diff adds names this PR, sits in this issue's fragment
+    # and is one of the issue's `task:` labels; a labelled issue's fragment has its line.
+    # Outside the --allow-shared-files block: a merged task line marks a task done for claims.
+    issue = issue_of_branch(pr.branch)
+    labels = r.issue_labels(issue) if issue is not None else ()
+    tasks = [
+        lb.removeprefix(TASK_LABEL_PREFIX) for lb in labels if lb.startswith(TASK_LABEL_PREFIX)
+    ]
+    frag_texts = {
+        p: r.read(p)
+        for p in touched
+        if p.startswith("changelog.d/") and p.endswith(".md") and p not in deleted
+        if p != "changelog.d/README.md"
+    }
+    if stray := stray_task_lines(issue, number, tasks, frag_texts):
+        raise ReadyError(
+            "task lines this PR may not add: "
+            + "; ".join(stray)
+            + ". A `task: Tn (PR #n)` line goes only in this issue's fragment, names this PR, "
+            "and names a task the issue carries as a `task:Tn` label (#2280)"
+        )
+    if issue is not None:
+        own_texts = [t for p, t in frag_texts.items() if p.startswith(f"changelog.d/{issue}-")]
+        named = fragment_tasks(own_texts)
+        want = [f"`task: {t} (PR #{number})`" for t in tasks if named.get(t) != number]
+        if want:
+            raise ReadyError(
+                f"issue #{issue} is a plan task: put "
+                + " and ".join(want)
+                + f" first in changelog.d/{issue}-<slug>.md (`fragments.py add ... --task "
+                "Tn --pr n`); the PR never ticks docs/plans, the fold does (#2280)"
+            )
 
     # 4. local checks; pytest only when the diff can fail it (None = decide from the paths),
     # and then only the tests it maps to unless --full-tests (CI runs the full suite)
