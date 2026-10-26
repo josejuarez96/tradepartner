@@ -33,9 +33,10 @@ import duckdb
 import polars as pl
 import streamlit as st
 
+from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
-from tradepartner.execution import headroom, ops, waiting
+from tradepartner.execution import headroom, ops, plain, waiting
 from tradepartner.execution.ops import OpsData, OrderChain, RankedSignal
 from tradepartner.execution.switch import SwitchState
 from tradepartner.store import journal
@@ -116,7 +117,7 @@ def _render_no_window() -> None:
 
 def _switch_badge(state: SwitchState) -> None:
     if state.engaged:
-        theme.status_badge(f"kill switch: engaged ({'; '.join(state.causes)})", "critical")
+        theme.status_badge(f"kill switch: engaged ({plain.plain_causes(state.causes)})", "critical")
     elif state.run_in_progress:
         theme.status_badge("kill switch: run in progress", "warning")
     else:
@@ -202,7 +203,8 @@ def _waiting_card(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
         for item in items:
             status: theme.Status = "critical" if item.kind == "kill_switch_engaged" else "warning"
             theme.status_badge(f"{item.book_id}: {item.kind}", status)
-            st.caption(f"{item.detail} · since {item.since or '-'}")
+            detail = scrub_text(item.detail, secrets=_configured_secrets(settings))[0]
+            st.caption(f"{detail} · since {item.since or '-'}")
             if item.command is not None:
                 st.code(item.command, language="bash")
             else:

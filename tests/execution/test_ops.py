@@ -2506,7 +2506,10 @@ def test_waiting_on_owner_on_the_full_fixture_within_the_timing_bound(
             book_id="main",
             kind="kill_switch_engaged",
             since=_W_ENGAGED,
-            detail="kill switch engaged: kill_switch event 1 engaged (owner)",
+            detail=(
+                "kill switch engaged: you switched it on (paper kill, or an override you set) "
+                "(event 1); reason given: test"
+            ),
             command='tradepartner paper resume --book main --reason "<why>"',
         ),
         WaitingItem(
@@ -2699,7 +2702,7 @@ def test_a_crashed_run_with_no_kill_switch_row_is_since_its_started_at(
         "kill_switch_engaged",
         datetime(2026, 10, 6, 14, 0, tzinfo=UTC),
     )
-    assert item.detail == f"kill switch engaged: run {run} crashed"
+    assert item.detail == f"kill switch engaged: run {run} crashed with an error"
 
 
 def test_an_unreadable_frozen_json_is_one_item_and_the_other_books_still_come_out(
