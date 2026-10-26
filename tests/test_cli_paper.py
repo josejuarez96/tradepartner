@@ -20,6 +20,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import duckdb
 import httpx
@@ -1732,7 +1733,7 @@ def test_settle_order_is_never_read_from_an_auto_envvar() -> None:
 #: `month_end`, H1's output must not change by a byte.
 STATUS_MAIN = (
     "window 1 (first rebalance 2026-10-30)\n"
-    "as of 2026-10-01 14:00:00+00:00; last updated n/a; STALE: no run for S-1\n"
+    "as of 2026-10-01 10:00 ET (14:00 UTC); last updated n/a; STALE: no run for S-1\n"
     "positions 0 (value 0.00); open orders 0; targets 0\n"
     "kill switch released (causes: -)\n"
     "reconciliation n/a\n"
@@ -1831,12 +1832,15 @@ def test_status_all_prints_one_summary_line_per_book(
     b_window = _open_book_b()
     out = _paper(clock, factory, "status", "--all")
     assert out.exit_code == 0, out.output
+    nxt = "next rebalance 2026-10-30 (data day; trades the next session)\n"
     assert out.output == (
-        f"book b: window {b_window} open; positions 0; open orders 0; kill switch released; "
-        "last run n/a; next rebalance 2026-10-30\n"
-        "book main: window 1 open; positions 0; open orders 0; kill switch released; "
-        "last run n/a; next rebalance 2026-10-30\n"
+        "b: trading, 0 issues\n"
+        "main: trading, 0 issues\n"
         "waiting on you: nothing\n"
+        f"book b: window {b_window} open; positions 0; open orders 0; kill switch released; "
+        f"last run n/a; {nxt}"
+        f"book main: window 1 open; positions 0; open orders 0; kill switch released; "
+        f"last run n/a; {nxt}"
     )
 
 
@@ -1860,20 +1864,29 @@ def test_status_all_lists_two_waiting_items_byte_for_byte(
                 ),
             )
     before = _sha256(live)
+    nxt = "next rebalance 2026-10-30 (data day; trades the next session)\n"
+    since_et = (
+        f"{SESSION_CLOCK.astimezone(ZoneInfo('America/New_York')):%Y-%m-%d %H:%M} ET "
+        f"({SESSION_CLOCK:%H:%M} UTC)"
+    )
     out = _paper(clock, factory, "status", "--all")
     assert (out.exit_code, out.output) == (
         0,
-        f"book b: window {b_window} open; positions 0; open orders 0; kill switch engaged; "
-        "last run n/a; next rebalance 2026-10-30\n"
-        "book main: window 1 open; positions 0; open orders 0; kill switch engaged; "
-        "last run n/a; next rebalance 2026-10-30\n"
+        "b: halted today, run: tradepartner paper resume --book b "
+        '--reason "<why>"\n'
+        "main: halted today, run: tradepartner paper resume --book main "
+        '--reason "<why>"\n'
         "waiting on you (2):\n"
         f"  book b; kill_switch_engaged: kill switch engaged: kill_switch event 2 engaged "
-        f"(owner); since {SESSION_CLOCK}; command tradepartner paper resume --book b "
+        f"(owner); since {since_et}; command tradepartner paper resume --book b "
         '--reason "<why>"\n'
         f"  book main; kill_switch_engaged: kill switch engaged: kill_switch event 1 engaged "
-        f"(owner); since {SESSION_CLOCK}; command tradepartner paper resume --book main "
-        '--reason "<why>"\n',
+        f"(owner); since {since_et}; command tradepartner paper resume --book main "
+        '--reason "<why>"\n'
+        f"book b: window {b_window} open; positions 0; open orders 0; kill switch engaged; "
+        f"last run n/a; {nxt}"
+        f"book main: window 1 open; positions 0; open orders 0; kill switch engaged; "
+        f"last run n/a; {nxt}",
     )
     assert _sha256(live) == before
 
@@ -1978,15 +1991,17 @@ def test_status_summary_labels_completed_rebalance_and_fill_lag(
                 ),
             )
     out = _paper(clock, factory, "status", "--all")
-    assert f"next rebalance {next_day}" in out.output
+    assert f"next rebalance {next_day} (data day; trades the next session)" in out.output
     expected = "traded today" if has_orders else "ran today with no orders"
     assert f"rebalance {rebalance_day} {expected}" in out.output
     assert f"next rebalance {next_day} (today (done))" not in out.output
-    assert ("Fills are recorded at the next scheduled run" in out.output) == has_orders
-    assert "08:05 ET" not in out.output
+    note = (
+        "The broker already holds these names; "
+        "fills are recorded at the next scheduled run (08:05 ET)"
+    )
+    assert (note in out.output) == has_orders
     detail = _paper(clock, factory, "status")
-    assert ("Fills are recorded at the next scheduled run" in detail.output) == has_orders
-    assert "08:05 ET" not in detail.output
+    assert (note in detail.output) == has_orders
 
 
 def test_status_all_with_no_window(clock: _Clock, factory: _Factory) -> None:
