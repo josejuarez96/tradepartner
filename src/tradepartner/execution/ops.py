@@ -129,7 +129,8 @@ from tradepartner.config import Cadence, Settings
 from tradepartner.execution import lock, performance, shakedown, waiting
 from tradepartner.execution.marks import equity_at
 from tradepartner.execution.plan import stop_session as stop_session_of_request
-from tradepartner.execution.reconcile_run import frozen_risk
+from tradepartner.execution.reconcile import OVERDUE_DELISTING_CASH
+from tradepartner.execution.reconcile_run import allowed_of, frozen_risk, is_delisting_cash
 from tradepartner.execution.switch import FAULTED_RUN_STATUSES, SwitchState, derive
 from tradepartner.execution.window import window_cadence
 from tradepartner.store import journal, registry
@@ -163,6 +164,7 @@ __all__ = [
     "ChainStep",
     "OpsData",
     "OrderChain",
+    "OverdueDelisting",
     "PerformanceData",
     "RankedSignal",
     "book_ids",
@@ -234,6 +236,26 @@ class OrderChain:
 
 
 @dataclass(frozen=True)
+class OverdueDelisting:
+    """A delisted holding the broker removed whose cash never arrived (#411): shown
+    by `paper status` and the operations page from the rows already stored (the
+    reconciliation's `overdue delisting cash` entry, no `delisting_cash` row)."""
+
+    book_id: str
+    security_id: str
+    symbol: str
+    since: date
+
+    @property
+    def line(self) -> str:
+        """The one line both surfaces show."""
+        return (
+            f"{self.symbol}: delisting cash overdue since {self.since.isoformat()}"
+            " \u2014 check Alpaca's activity"
+        )
+
+
+@dataclass(frozen=True)
 class OpsData:
     """Everything the operations page and `paper status` (T67) show, computed
     once over a read-only connection."""
@@ -266,6 +288,7 @@ class OpsData:
     alerts: tuple[AlertRow, ...] = field(default_factory=tuple)
     alerts_capped: bool = False
     reconciliation: ReconciliationRow | None = None
+    overdue_delisting: tuple[OverdueDelisting, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -919,7 +942,75 @@ def page_data(
         alerts=alerts,
         alerts_capped=alerts_capped,
         reconciliation=reconciliation,
+        overdue_delisting=_overdue_delisting(conn, book, window_id),
     )
+
+
+def _overdue_delisting(
+    conn: duckdb.DuckDBPyConnection, book_id: str, window_id: int
+) -> tuple[OverdueDelisting, ...]:
+    """The window's delisted holdings flagged overdue and still unpaid: a
+    reconciliation recorded `overdue delisting cash` for the name, and no
+    `delisting_cash` or merger row has journaled cash for it since. Reads only
+    what is stored (#411)."""
+    journal.require_journal(conn)
+    texts = conn.execute(
+        "SELECT mismatches_json FROM reconciliations WHERE window_id = ? "
+        "AND mismatches_json LIKE ?",
+        [window_id, f"%{OVERDUE_DELISTING_CASH}%"],
+    ).fetchall()
+    flagged = {
+        str(m["security_id"])
+        for (text,) in texts
+        for m in allowed_of(text)
+        if m.get("reason") == OVERDUE_DELISTING_CASH and m.get("security_id") is not None
+    }
+    if not flagged:
+        return ()
+    adjustments = journal.adjustments_for(conn, window_id)
+    resolved = {
+        a.security_id
+        for a in adjustments
+        if a.kind == "corporate_action_cash"
+        and a.security_id is not None
+        and (
+            (a.explanation_json is not None and "merger_id" in a.explanation_json)
+            or is_delisting_cash(a)
+        )
+    }
+    symbols = {o.security_id: o.symbol for o in journal.orders_for(conn, window_id=window_id)}
+    found: list[OverdueDelisting] = []
+    for name in sorted(flagged - resolved):
+        removals = [
+            a
+            for a in adjustments
+            if a.kind == "corporate_action_cash"
+            and a.security_id == name
+            and a.quantity is not None
+            and a.quantity < 0
+        ]
+        if removals:
+            since = max(a.session for a in removals)
+            found.append(OverdueDelisting(book_id, name, symbols.get(name, name), since))
+    return tuple(found)
+
+
+def overdue_delisting_cash(
+    conn: duckdb.DuckDBPyConnection,
+) -> tuple[OverdueDelisting, ...]:
+    """Every open book's overdue delisting cash (#411), in book order; empty on a
+    store with no journal. Reads only."""
+    try:
+        books = book_ids(conn)
+    except JournalNotInitialised:
+        return ()
+    found: list[OverdueDelisting] = []
+    for book in books:
+        window = journal.latest_window(conn, book)
+        if window is None or window.window_id is None or not _is_open(conn, window.window_id):
+            continue
+        found.extend(_overdue_delisting(conn, book, window.window_id))
+    return tuple(found)
 
 
 def book_ids(conn: duckdb.DuckDBPyConnection) -> tuple[str, ...]:
