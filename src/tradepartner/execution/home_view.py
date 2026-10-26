@@ -241,14 +241,23 @@ def _status(
     settings: Settings,
     summaries: tuple[ops.BookSummary, ...],
     needs: tuple[NeedsYou, ...],
+    unreadable: tuple[str, ...] = (),
 ) -> StatusLine:
     clock = f"Next run at {settings.ui.next_run_time_et} ET"
     upcoming = [s.next_rebalance_session for s in summaries if s.next_rebalance_session]
     nxt = min(upcoming, default=None)
     halted = [s.book_id for s in summaries if s.is_open and s.switch_state.engaged]
     if halted or any(n.kind in _RED_KINDS for n in needs):
-        text = f"{', '.join(halted)} is halted" if halted else "A daily run was missed"
+        if halted:
+            text = f"{', '.join(halted)} is halted"
+        elif any(n.kind == "kill_switch_engaged" for n in needs):
+            text = "A book is halted"
+        else:
+            text = "A daily run was missed"
         return StatusLine("red", text, clock, nxt)
+    if unreadable:
+        text = f"Some records could not be read ({', '.join(unreadable)}); trading is not affected"
+        return StatusLine("amber", text, clock, nxt)
     if needs:
         word = "item needs" if len(needs) == 1 else "items need"
         text = f"{len(needs)} {word} a look; trading is not affected"
@@ -329,7 +338,7 @@ def _data_status(
     return DataStatus(f"Data is up to date through {through.isoformat()}", 0, False)
 
 
-def _research_strip(conn: duckdb.DuckDBPyConnection) -> ResearchStrip:
+def _research_strip(conn: duckdb.DuckDBPyConnection, now: datetime) -> ResearchStrip:
     try:
         view = research_page.load_research_view(conn)
     except schema.ResearchNotInitialised:
@@ -341,6 +350,7 @@ def _research_strip(conn: duckdb.DuckDBPyConnection) -> ResearchStrip:
     ] + [
         (r.known_at, titles.get(r.slug, r.slug), "A research run was registered") for r in view.runs
     ]
+    found = [f for f in found if f[0] <= now]
     if not found:
         return ResearchStrip("Nothing new yet", None, None, RESEARCH_PAGE)
     at, title, text = max(found, key=lambda f: f[0])
@@ -352,10 +362,11 @@ def build(conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime) ->
     now = ensure_tz_aware_utc(now, field_name="now")
     summaries = ops.book_summaries(conn, settings)
     needs = _needs_you(ops.waiting_on_owner(conn, settings, now), ops.overdue_delisting_cash(conn))
+    cards = tuple(_card(conn, settings, s, now) for s in summaries)
     return HomeView(
-        status=_status(settings, summaries, needs),
+        status=_status(settings, summaries, needs, tuple(c.book_id for c in cards if c.unreadable)),
         needs_you=needs,
-        books=tuple(_card(conn, settings, s, now) for s in summaries),
+        books=cards,
         data=_data_status(conn, summaries, now),
-        research=_research_strip(conn),
+        research=_research_strip(conn, now),
     )

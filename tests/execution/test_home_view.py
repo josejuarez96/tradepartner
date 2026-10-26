@@ -335,7 +335,7 @@ def test_a_fact_known_after_now_moves_nothing(store: Settings) -> None:
         (run_id,) = conn.execute(
             "SELECT run_id FROM paper_runs WHERE session = ?", [date(2026, 10, 1)]
         ).fetchone()  # type: ignore[misc]
-        # `h`'s run is also on 10-01; mark under the lowest id, `main`'s window is checked.
+        # The lowest run id is `h`'s (its window gets the later mark).
         later = datetime(2026, 10, 5, 21, 30, tzinfo=UTC)
         append(
             conn,
@@ -426,7 +426,7 @@ def _view(**kind: Any) -> Any:
 
 def _strip(monkeypatch: pytest.MonkeyPatch, view: Any) -> home_view.ResearchStrip:
     monkeypatch.setattr(research_page, "load_research_view", lambda _c: view)
-    return home_view._research_strip(None)  # type: ignore[arg-type]
+    return home_view._research_strip(None, NOW)  # type: ignore[arg-type]
 
 
 def test_the_strip_shows_the_latest_decision_or_run_with_its_title(
@@ -444,6 +444,16 @@ def test_the_strip_shows_the_latest_decision_or_run_with_its_title(
     assert out.title == "Decision: amended budget"
 
 
+def test_the_strip_ignores_facts_known_after_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    later = SimpleNamespace(known_at=NOW + timedelta(days=1), reason="future")
+    assert _strip(monkeypatch, _view(decisions=(later,))).text == "Nothing new yet"
+
+
+def test_an_unreadable_card_keeps_the_status_line_off_green() -> None:
+    line = home_view._status(Settings(_env_file=None), (_summary(),), (), ("main",))
+    assert line.level == "amber" and "main" in line.text
+
+
 def test_the_strip_says_nothing_new_without_research(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _strip(monkeypatch, _view()).text == "Nothing new yet"
 
@@ -451,4 +461,4 @@ def test_the_strip_says_nothing_new_without_research(monkeypatch: pytest.MonkeyP
         raise schema.ResearchNotInitialised("no tables")
 
     monkeypatch.setattr(research_page, "load_research_view", missing)
-    assert home_view._research_strip(None).text == "Nothing new yet"  # type: ignore[arg-type]
+    assert home_view._research_strip(None, NOW).text == "Nothing new yet"  # type: ignore[arg-type]
