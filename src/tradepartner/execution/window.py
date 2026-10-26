@@ -1856,8 +1856,10 @@ def settle_order(
     `paper.min_override_reason_chars`) and `not_engaged` (the derived switch),
     each before any broker call or write; one clock reading; then `account`
     (`account_mismatch` when its id is not the window's), `get_order`,
-    `open_orders`, `fills(since)` (`since` = the order's `pending` event's
-    `known_at` minus `paper.fill_read_overlap_seconds`) and `positions`, and a
+    `open_orders`, `fills(since)` (`since` reaches back from the order's
+    `pending` event's `known_at` to the broker's `submitted_at`, with
+    `paper.fill_read_overlap_seconds`, floored at the window start minus the
+    overlap) and `positions`, and a
     `get_order` per other non-terminal order of the window on the same
     `security_id`. It refuses `broker_open` (a non-terminal reading, or the id
     listed open), `unjournaled_fill` (a fill of the order in the stream whose
@@ -1900,7 +1902,13 @@ def settle_order(
         except UnknownOrderError:
             reading = None
         open_ids = sorted(o.client_order_id for o in broker.open_orders())
-        since = target.pending_at - timedelta(seconds=settings.paper.fill_read_overlap_seconds)
+        overlap = timedelta(seconds=settings.paper.fill_read_overlap_seconds)
+        since = target.pending_at - overlap
+        if reading is not None:
+            # The broker filters fills on its own clock. Our pending stamp may
+            # run ahead of its submitted_at and otherwise hide a real fill.
+            broker_since = max(reading.submitted_at - overlap, window.started_at - overlap)
+            since = min(since, broker_since)
         stream = broker.fills(since)
         positions = broker.positions()
         others: list[tuple[str, Order | None]] = []
