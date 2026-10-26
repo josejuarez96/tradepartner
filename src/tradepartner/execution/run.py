@@ -417,6 +417,15 @@ class RunOutcome:
     session: date | None = None
     kind: str | None = None
     notes: tuple[str, ...] = ()
+    engaged: bool = False
+
+    @property
+    def healthy(self) -> bool:
+        """True when the book ended able to trade: exits 0, did not skip on an
+        engaged switch, and (a `no_session` run) has no engaged switch. The off-Mac
+        heartbeat pings `/fail` for any unhealthy book, so a halt keeps the check
+        red until `paper resume` (#2179); exit codes are unchanged."""
+        return self.exit_code == 0 and self.status != SKIPPED_KILL_SWITCH and not self.engaged
 
     @property
     def exit_code(self) -> int:
@@ -1092,6 +1101,11 @@ class BookRun:
     error: BaseException | None = None
     exit_code: int = 0
 
+    @property
+    def healthy(self) -> bool:
+        """Whether the book ended able to trade (`RunOutcome.healthy`); a crash is not."""
+        return self.outcome is not None and self.outcome.healthy and self.exit_code == 0
+
 
 def open_books(settings: Settings) -> tuple[str, ...]:
     """Every book with an open window (no `closed` or `abandoned` stop row), in
@@ -1171,6 +1185,18 @@ def _locked_run(
     version, dirty = registry.code_version()
     if not is_session(day):
         with connect() as conn:
+            prior = runs_for(conn, window_id)
+            state = switch.derive(
+                window,
+                kill_switch_events_for(conn, window_id),
+                [r.run for r in prior],
+                [r.result for r in prior if r.result is not None],
+                reading_run=None,
+                lock_free=True,
+            )
+            switch_engaged = bool(state.causes) or bool(
+                store_journal.unconsumed_kill_switch_overrides(conn, window_id)
+            )
             run_id = append(
                 conn,
                 PaperRunRow(
@@ -1196,7 +1222,7 @@ def _locked_run(
                     ingested_at=now,
                 ),
             )
-        return RunOutcome(NO_SESSION, run_id=run_id)
+        return RunOutcome(NO_SESSION, run_id=run_id, engaged=switch_engaged)
 
     frozen = frozen_risk(window)
     alerter = _ChunkAlerter(settings, connect, clock)
