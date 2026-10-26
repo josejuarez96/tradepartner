@@ -13,6 +13,8 @@ Once a day, `tradepartner ingest` brings the store up to the **expected session*
 - A run the next morning (after a missed evening, see "Sleep versus power-off") still targets the previous session.
 
 Sources run in order, `edgar` then `alpaca`, and **every source runs even when an earlier one failed** (#2180): an EDGAR outage does not stop that evening's prices, and the run exits `1` if any source was not `ok`. Only a locked store ends the run early. Each source that runs writes one `ingestion_runs` row, with `mode = 'session'`, except when the store is locked: a locked source writes no row, and neither does a failed source whose row write is itself locked. So a failed evening can leave both rows, only an `edgar` row, or none. The command prints one line per source and exits with:
+
+Because prices keep flowing after an EDGAR failure, paper can trade on an EDGAR master that has stopped refreshing. Once `ingest.edgar_max_age_sessions` (default 3, 1 to 20) sessions have closed since the last `ok` `edgar` `session` run, `paper status`, `paper status --all` and the operations page show `EDGAR data N sessions old` (#2197). It is a display line only: no alert, no waiting item, and paper keeps trading. Fix the EDGAR failure and let the next ingest finish `ok`; the line clears itself.
 - `0`: every source is `ok`.
 - `1`: a source was stale or failed, or the store was locked.
 - `2`: a configuration error before any work, such as a missing `SEC_EDGAR_USER_AGENT` or Alpaca key. The error names the variable and never prints its value.

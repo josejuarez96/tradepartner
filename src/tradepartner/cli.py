@@ -1684,6 +1684,11 @@ def _overdue_delisting_lines(items: Sequence[ops.OverdueDelisting]) -> list[str]
     return [f"book {item.book_id}; {item.line}" for item in items]
 
 
+def _edgar_age_lines(age: ops.EdgarAge | None) -> list[str]:
+    """`paper status --all`'s EDGAR data age line, when it is over its limit (#2197)."""
+    return [] if age is None else [age.line]
+
+
 def _waiting_lines(items: Sequence[waiting.WaitingItem]) -> list[str]:
     """Format the owner queue after all `paper status --all` book lines."""
     if not items:
@@ -1732,6 +1737,7 @@ def _status_lines(
         + ("n/a" if recon is None else f"{recon.reconciliation_id} {recon.status} at {recon.at}"),
         *paper_slippage.slippage_report_lines(fill_slippage),
         *(item.line for item in data.overdue_delisting),
+        *_edgar_age_lines(data.edgar_age),
         f"alerts ({len(data.alerts)}{', capped' if data.alerts_capped else ''}):",
     ]
     lines += [f"  #{a.alert_id} {a.at} {a.kind} {a.session}: {a.message}" for a in data.alerts]
@@ -4578,6 +4584,7 @@ def make_app(
                     tuple[ops.BookSummary, ...],
                     tuple[waiting.WaitingItem, ...],
                     tuple[ops.OverdueDelisting, ...],
+                    ops.EdgarAge | None,
                 ]
                 | str
             ):
@@ -4587,7 +4594,13 @@ def make_app(
                         items = ops.waiting_on_owner(
                             conn, s, ensure_tz_aware_utc(clock(), field_name="clock()")
                         )
-                        return summaries, items, ops.overdue_delisting_cash(conn)
+                        now = ensure_tz_aware_utc(clock(), field_name="clock()")
+                        return (
+                            summaries,
+                            items,
+                            ops.overdue_delisting_cash(conn),
+                            ops.edgar_age(conn, s, now),
+                        )
                     except schema.SchemaVersionError as exc:
                         return str(exc)
 
@@ -4595,10 +4608,12 @@ def make_app(
             if isinstance(result, str):  # the journal predates version 17
                 _echo_scrubbed(f"paper status: {result}", s)
                 raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
-            summaries, items, overdue = result
+            summaries, items, overdue, edgar = result
             for line in _summary_lines(summaries):
                 _echo_scrubbed(line, s)
             for line in _overdue_delisting_lines(overdue):
+                _echo_scrubbed(line, s)
+            for line in _edgar_age_lines(edgar):
                 _echo_scrubbed(line, s)
             for line in _waiting_lines(items):
                 _echo_scrubbed(line, s)

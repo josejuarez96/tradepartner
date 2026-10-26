@@ -26,7 +26,7 @@ from conftest import version_4_store
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.backtest.hypothesis import frozen_params_of
-from tradepartner.calendar import next_session
+from tradepartner.calendar import last_completed_session, next_session, previous_session
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.dashboard import ops_page, theme
 from tradepartner.execution import headroom, ops
@@ -355,6 +355,40 @@ def test_page_drops_the_overdue_line_once_the_cash_is_booked(
     at = _app(monkeypatch, seeded_store)
     assert not at.exception
     assert "delisting cash overdue" not in _text(at)
+
+
+def _edgar_run(store_path: Path, finished: datetime, *, status: str = "ok") -> None:
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "INSERT INTO ingestion_runs (run_id, started_at, finished_at, status, source, mode) "
+            "VALUES (?, ?, ?, ?, 'edgar', 'session')",
+            [f"r-{finished.isoformat()}-{status}", finished, finished, status],
+        )
+
+
+def _sessions_back(count: int) -> datetime:
+    """After the close of the session `count` sessions before the page's last closed one."""
+    session = last_completed_session(_NOW)
+    for _ in range(count):
+        session = previous_session(session)
+    return datetime.combine(session, datetime.min.time(), tzinfo=UTC) + timedelta(hours=23)
+
+
+def test_page_shows_edgar_data_three_sessions_old(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _edgar_run(seeded_store, _sessions_back(3))
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    assert "EDGAR data 3 sessions old" in _text(at)
+
+
+def test_page_is_quiet_two_sessions_in_and_after_an_ok_run(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _edgar_run(seeded_store, _sessions_back(2))
+    assert "EDGAR data" not in _text(_app(monkeypatch, seeded_store))
 
 
 # --- headless render --------------------------------------------------------

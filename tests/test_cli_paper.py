@@ -1910,6 +1910,76 @@ def test_status_drops_the_overdue_line_once_the_cash_is_booked(
     assert "delisting cash overdue" not in _paper(clock, factory, "status").output
 
 
+def _edgar_run(finished: datetime, *, status: str = "ok", source: str = "edgar") -> None:
+    """One daily ingest run row (#2197), written the way `ingest` records it."""
+    with open_for_write(_settings()) as conn:
+        conn.execute(
+            "INSERT INTO ingestion_runs (run_id, started_at, finished_at, status, source, mode) "
+            "VALUES (?, ?, ?, ?, ?, 'session')",
+            [f"r-{source}-{status}-{finished.isoformat()}", finished, finished, status, source],
+        )
+
+
+_EDGAR_LINE_3 = "EDGAR data 3 sessions old (last ok ingest covered 2026-09-25)"
+
+
+@pytest.mark.usefixtures("started")
+def test_status_stays_quiet_below_the_edgar_age_limit(
+    clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
+    _edgar_run(datetime(2026, 9, 28, 22, tzinfo=UTC))  # covers 09-28: 2 sessions by 10-01
+    for args in (("status",), ("status", "--all")):
+        out = _paper(clock, factory, *args)
+        assert out.exit_code == 0, out.output
+        assert "EDGAR data" not in out.output
+
+
+@pytest.mark.usefixtures("started")
+def test_status_shows_edgar_data_three_sessions_old(
+    clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
+    _edgar_run(datetime(2026, 9, 25, 22, tzinfo=UTC))  # covers 09-25: 3 sessions by 10-01
+    out = _paper(clock, factory, "status")
+    assert out.exit_code == 0, out.output
+    assert f"\n{_EDGAR_LINE_3}" in out.output
+    all_books = _paper(clock, factory, "status", "--all")
+    assert all_books.exit_code == 0, all_books.output
+    assert f"\n{_EDGAR_LINE_3}" in all_books.output
+    assert "waiting on you: nothing" in all_books.output  # no new waiting kind
+
+
+@pytest.mark.usefixtures("started")
+def test_edgar_age_ignores_failed_and_other_source_runs_and_resets_on_an_ok_run(
+    clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
+    _edgar_run(datetime(2026, 9, 25, 22, tzinfo=UTC))
+    _edgar_run(datetime(2026, 9, 30, 22, tzinfo=UTC), status="failed")
+    _edgar_run(datetime(2026, 9, 30, 22, tzinfo=UTC), source="alpaca")
+    assert _EDGAR_LINE_3 in _paper(clock, factory, "status").output
+    _edgar_run(datetime(2026, 9, 30, 22, tzinfo=UTC))  # an ok run resets it
+    assert "EDGAR data" not in _paper(clock, factory, "status").output
+
+
+@pytest.mark.usefixtures("started")
+def test_status_names_no_edgar_age_without_an_ok_run(clock: _Clock, factory: _Factory) -> None:
+    assert "EDGAR data" not in _paper(clock, factory, "status").output
+
+
+@pytest.mark.usefixtures("started")
+def test_edgar_age_reads_without_writing(clock: _Clock, factory: _Factory) -> None:
+    _edgar_run(datetime(2026, 9, 25, 22, tzinfo=UTC))
+    before = _count("ingestion_runs")
+    with duckdb.connect(_settings().store.path, read_only=True) as conn:
+        age = ops.edgar_age(conn, _settings(), SESSION_CLOCK)
+    assert age is not None
+    assert age.sessions == 3
+    assert age.last_ok_session == date(2026, 9, 25)
+    assert _count("ingestion_runs") == before
+
+
 @pytest.mark.usefixtures("started")
 def test_status_all_lists_two_waiting_items_byte_for_byte(
     clock: _Clock, factory: _Factory, live: Path

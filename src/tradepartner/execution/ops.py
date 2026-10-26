@@ -114,6 +114,7 @@ of the bounded reads above.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -124,7 +125,13 @@ import duckdb
 
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.schedule import rebalance_sessions
-from tradepartner.calendar import is_session, previous_session, session_close
+from tradepartner.calendar import (
+    all_sessions,
+    is_session,
+    last_completed_session,
+    previous_session,
+    session_close,
+)
 from tradepartner.config import Cadence, Settings
 from tradepartner.execution import lock, performance, shakedown, waiting
 from tradepartner.execution.marks import equity_at
@@ -133,6 +140,8 @@ from tradepartner.execution.reconcile import OVERDUE_DELISTING_CASH
 from tradepartner.execution.reconcile_run import allowed_of, frozen_risk, is_delisting_cash
 from tradepartner.execution.switch import FAULTED_RUN_STATUSES, SwitchState, derive
 from tradepartner.execution.window import window_cadence
+from tradepartner.ingest import MODE as INGEST_MODE
+from tradepartner.ingest import OK as INGEST_OK
 from tradepartner.store import journal, registry
 from tradepartner.store.asof import adjusted_prices_as_of
 from tradepartner.store.benchmarks import BenchmarkIdentityError, benchmark_security_ids
@@ -162,6 +171,7 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 __all__ = [
     "BookSummary",
     "ChainStep",
+    "EdgarAge",
     "OpsData",
     "OrderChain",
     "OverdueDelisting",
@@ -179,6 +189,9 @@ _NEW_YORK = ZoneInfo("America/New_York")
 #: How far ahead `_next_rebalance_session` looks: the slowest cadence, `month_end`,
 #: has a rebalance session within two calendar months of any day.
 _REBALANCE_SEARCH = timedelta(days=62)
+
+#: The `ingestion_runs.source` of the EDGAR master's daily run (`ingest.SOURCES`).
+_EDGAR_SOURCE = "edgar"
 
 #: Deterministic tie-break for steps sharing a `known_at` in one order's chain.
 _STEP_ORDER: dict[str, int] = {"order": 0, "order_event": 1, "fill": 2, "outcome": 3}
@@ -256,6 +269,24 @@ class OverdueDelisting:
 
 
 @dataclass(frozen=True)
+class EdgarAge:
+    """The EDGAR master has not refreshed for `sessions` sessions (#2197): shown by
+    `paper status` and the operations page from the stored `ingestion_runs` rows,
+    display only (no alert, no waiting item, no refusal; paper keeps trading)."""
+
+    sessions: int
+    last_ok_session: date
+
+    @property
+    def line(self) -> str:
+        """The one line every surface shows."""
+        return (
+            f"EDGAR data {self.sessions} sessions old (last ok ingest covered "
+            f"{self.last_ok_session.isoformat()}) \u2014 check the ingest run"
+        )
+
+
+@dataclass(frozen=True)
 class OpsData:
     """Everything the operations page and `paper status` (T67) show, computed
     once over a read-only connection."""
@@ -289,6 +320,7 @@ class OpsData:
     alerts_capped: bool = False
     reconciliation: ReconciliationRow | None = None
     overdue_delisting: tuple[OverdueDelisting, ...] = field(default_factory=tuple)
+    edgar_age: EdgarAge | None = None
 
 
 @dataclass(frozen=True)
@@ -943,7 +975,31 @@ def page_data(
         alerts_capped=alerts_capped,
         reconciliation=reconciliation,
         overdue_delisting=_overdue_delisting(conn, book, window_id),
+        edgar_age=edgar_age(conn, settings, utc_now()),
     )
+
+
+def edgar_age(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime
+) -> EdgarAge | None:
+    """The EDGAR data age (#2197) when it reaches `ingest.edgar_max_age_sessions`:
+    the XNYS sessions after the session the latest `ok` daily EDGAR ingest run
+    covered (the last session closed when it finished), up to the last session
+    closed at `now`. None below the limit, and when no `ok` run is stored (nothing
+    to count from). Reads only the stored rows (the trading calendar, never
+    weekdays)."""
+    row = conn.execute(
+        "SELECT max(finished_at) FROM ingestion_runs WHERE status = ? AND source = ? AND mode = ?",
+        [INGEST_OK, _EDGAR_SOURCE, INGEST_MODE],
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    covered = last_completed_session(ensure_tz_aware_utc(row[0], field_name="finished_at"))
+    current = last_completed_session(ensure_tz_aware_utc(now, field_name="now"))
+    sessions = bisect_right(all_sessions(), current) - bisect_right(all_sessions(), covered)
+    if sessions < settings.ingest.edgar_max_age_sessions:
+        return None
+    return EdgarAge(sessions, covered)
 
 
 def _overdue_delisting(

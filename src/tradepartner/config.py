@@ -283,6 +283,10 @@ class IngestConfig(_ClosedConfig):
     # trail is itself truncated rather than crowding out the error text.
     max_where_frames: int = Field(default=8, gt=0)
     max_where_chars: int = Field(default=1500, gt=0)
+    # #2197 (owner, warn don't refuse): `paper status` and the operations page show an
+    # owner-visible line once this many sessions have closed since the last `ok` daily
+    # EDGAR ingest run. Display only: paper keeps trading on the stale master.
+    edgar_max_age_sessions: int = Field(default=3, ge=1, le=20)
 
 
 class RatesConfig(_ClosedConfig):

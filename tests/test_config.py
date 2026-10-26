@@ -113,6 +113,19 @@ def test_ingest_defaults() -> None:
     assert s.ingest.max_dark_share == pytest.approx(1.0)  # #796: off until measured
 
 
+def test_edgar_max_age_sessions_default_and_bounds() -> None:
+    assert _settings().ingest.edgar_max_age_sessions == 3
+    assert (
+        Settings(
+            _env_file=None, ingest={"edgar_max_age_sessions": 20}
+        ).ingest.edgar_max_age_sessions
+        == 20
+    )
+    for value in (0, 21, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ingest={"edgar_max_age_sessions": value})
+
+
 def test_fred_rate_defaults_and_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings()
     assert settings.fred_api_key is None

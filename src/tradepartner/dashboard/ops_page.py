@@ -217,6 +217,16 @@ def _overdue_delisting_card(conn: duckdb.DuckDBPyConnection) -> None:
         theme.status_badge(f"{item.book_id}: {item.line}", "warning")
 
 
+def _edgar_age_card(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    """The EDGAR master's age once over its limit, from stored run rows only."""
+    try:
+        age = ops.edgar_age(conn, settings, utc_now())
+    except (SchemaVersionError, duckdb.CatalogException):
+        return  # The outdated-journal panel below explains this store.
+    if age is not None:
+        theme.status_badge(age.line, "warning")
+
+
 def _kpis(data: OpsData) -> None:
     assert data.switch_state is not None
     tiles = st.columns(4)
@@ -505,6 +515,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
     summaries = _book_summaries(conn, settings)
     _waiting_card(conn, settings)
     _overdue_delisting_card(conn)
+    _edgar_age_card(conn, settings)
     if summaries:
         _summary_card(summaries)
     book = _selected_book(summaries, settings.paper.book_id)
