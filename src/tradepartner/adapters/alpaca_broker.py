@@ -623,8 +623,12 @@ class AlpacaBroker(Broker):
 #: Alpaca's account-activity `side` strings (#2163). A short sale reports
 #: `sell_short`; it is a sell to `Side`, which carries no position side (the
 #: short book's intent lives in the plan, and the position's sign in `positions`).
-#: A cover reports a plain `buy`; the docs list only `buy` and `sell`, so any other
-#: string, `buy_to_cover` included, is unclassified and faults (fail closed).
+#: A cover reports a plain `buy`. The docs list only `buy` and `sell`, but the
+#: sandbox probes (2026-10-19 and 2026-10-20, AAPL, 1 share and 0.5 + 0.5 covers)
+#: recorded `sell_short` opens and plain `buy` covers, never `buy_to_cover`
+#: (docs/research/2026-10-19-alpaca-sandbox-probe.md and the scrubbed rows in
+#: tests/fixtures/alpaca/paper/short_fills.json). Any other string,
+#: `buy_to_cover` included, is unclassified and faults (fail closed).
 _ACTIVITY_SIDES = {"buy": Side.BUY, "sell": Side.SELL, "sell_short": Side.SELL}
 
 

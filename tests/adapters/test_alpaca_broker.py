@@ -1085,14 +1085,30 @@ def _short_rows(side: str, correction_side: str | None = None) -> list[dict[str,
     return rows
 
 
-def test_a_sell_short_fill_parses_as_a_sell() -> None:
-    fills = _ral_broker(_short_rows("sell_short")[:1]).fills()
+def _short_fills_broker() -> AlpacaBroker:
+    """The recorded sandbox AAPL short open (`sell_short`) and its cover (`buy`),
+    ids scrubbed (`short_fills.json`, from the 2026-10-19 probe, batch 1)."""
+    rows = _load("short_fills")
+    broker, http = _broker()
+    http.route("GET", "/v2/account/activities/FILL", (200, rows))
+    orders = {
+        row["order_id"]: {"id": row["order_id"], "client_order_id": f"short-{n}"}
+        for n, row in enumerate(rows)
+    }
+    http.route("GET", "/v2/orders/[^/]+", _by_id(orders))
+    return broker
 
-    assert [(f.side, f.quantity, f.price) for f in fills] == [(Side.SELL, 7.0, 67.23)]
+
+def test_a_sell_short_fill_parses_as_a_sell() -> None:
+    fill = _short_fills_broker().fills()[0]
+
+    assert (fill.side, fill.symbol, fill.quantity, fill.price) == (Side.SELL, "AAPL", 1.0, 342.02)
 
 
 def test_a_cover_fill_parses_as_a_buy() -> None:
-    assert _ral_broker(_short_rows("buy")[:1]).fills()[0].side is Side.BUY
+    fill = _short_fills_broker().fills()[1]
+
+    assert (fill.side, fill.symbol, fill.quantity, fill.price) == (Side.BUY, "AAPL", 1.0, 342.06)
 
 
 def test_a_sell_short_correction_folds_into_its_sell_short_fill() -> None:
