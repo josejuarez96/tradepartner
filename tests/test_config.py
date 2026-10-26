@@ -1926,6 +1926,8 @@ def test_risk_defaults_match_adr_0010() -> None:
     assert r.cash_in_lieu_tolerance == pytest.approx(0.10)
     # #1762 (T249): the sessions after a merger's payable date its cash may post.
     assert r.reconcile_merger_lag_sessions == 5
+    # #411: the premium a delisted holding's late cash may carry over its last close.
+    assert r.delisting_cash_max_premium == pytest.approx(0.10)
 
 
 @pytest.mark.parametrize("value", [-1, 1.5])
@@ -1982,6 +1984,7 @@ def test_alpaca_cash_in_lieu_max_lag_sessions_default() -> None:
         "whole_share_price_buffer",
         "max_unspent_cash_fraction",
         "cash_in_lieu_tolerance",
+        "delisting_cash_max_premium",
     ],
 )
 @pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])

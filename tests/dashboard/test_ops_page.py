@@ -293,6 +293,70 @@ def _dataframe_with_columns(at: AppTest, *columns: str) -> Any:
     raise AssertionError(f"no dataframe has columns {columns}; got {available}")
 
 
+def _overdue_delisting(store_path: Path, *, paid: bool = False) -> None:
+    """BBB removed on S-1 with no cash and flagged overdue by a reconciliation (#411)."""
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        append(
+            conn,
+            journal.AdjustmentRow(
+                window_id=1,
+                session=_S_MINUS_1,
+                kind="corporate_action_cash",
+                security_id="BBB",
+                quantity=-5.0,
+                cash=0.0,
+                explanation_json=json.dumps({"explanation": "listing ended"}),
+                **_stamp(9),
+            ),
+        )
+        if paid:
+            append(
+                conn,
+                journal.AdjustmentRow(
+                    window_id=1,
+                    session=_S_MINUS_1,
+                    kind="corporate_action_cash",
+                    security_id="BBB",
+                    cash=100.0,
+                    explanation_json=json.dumps({"delisting_cash": True}),
+                    **_stamp(9),
+                ),
+            )
+        allowed = [{"reason": "overdue delisting cash", "difference": 5.0, "security_id": "BBB"}]
+        append(
+            conn,
+            ReconciliationRow(
+                window_id=1,
+                at=_at(10),
+                status="ok",
+                broker_cash=1000.0,
+                mismatches_json=json.dumps({"mismatches": [], "allowed": allowed}),
+                **_stamp(10),
+            ),
+        )
+
+
+def test_page_shows_a_delisting_whose_cash_is_overdue(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _overdue_delisting(seeded_store)
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    assert f"BBB: delisting cash overdue since {_S_MINUS_1} \u2014 check Alpaca's activity" in (
+        _text(at)
+    )
+
+
+def test_page_drops_the_overdue_line_once_the_cash_is_booked(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _overdue_delisting(seeded_store, paid=True)
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    assert "delisting cash overdue" not in _text(at)
+
+
 # --- headless render --------------------------------------------------------
 
 
