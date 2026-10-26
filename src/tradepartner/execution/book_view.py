@@ -15,7 +15,8 @@ the latest tracking report). No Streamlit import: the page only draws it.
 learned of (or dated) after `now` moves nothing. The as-of session is the latest
 such marked session.
 
-**"Matches Alpaca"** (not "to the cent") is said only when the latest reconciliation row
+**"Matches Alpaca"** (never "to the cent" without an observed cash difference) is said
+only when the latest reconciliation row
 (by `at`, known by `now`) is `ok`, records no mismatch, lagging or pending order,
 and none of the differences it allowed exceeds the window's frozen tolerance:
 `risk.reconcile_cash_tolerance` for cash, `risk.reconcile_quantity_tolerance` for a
@@ -75,7 +76,7 @@ EASTERN = ZoneInfo("America/New_York")
 
 #: The frozen `paper.*` key holding the "M" of "N of M" (`config.FROZEN_PAPER_KEYS`).
 MIN_REBALANCES_KEY = "paper.min_rebalances"
-#: The reconciliation fields the "matches to the cent" claim reads, named for the page.
+#: The reconciliation fields the match claim reads, named for the page.
 RECONCILIATION_FIELDS_READ = (
     "reconciliations.status",
     "reconciliations.mismatches_json (mismatches, lagging, pending, allowed)",
@@ -120,7 +121,8 @@ class Performance:
 class ReconciliationView:
     """Whether the book matches Alpaca. `matches` is True only for a checked
     match (module docstring); `text` is the sentence to show; `fields_read` names
-    what was read; `at` is the row's time (None with no row)."""
+    what was read; `at` is the row's time (None with no row). The journal stores
+    broker cash but no observed cash difference for an `ok` row."""
 
     matches: bool
     text: str

@@ -456,7 +456,8 @@ def test_the_safety_card_draws_the_view_and_computes_nothing(
 ) -> None:
     at = _app(monkeypatch, _store(tmp_path / "s.duckdb"))
     text = _text(at)
-    assert "Matches Alpaca to the cent." in text
+    assert "Matches Alpaca (within the reconciliation's tolerance)." in text
+    assert "to the cent" not in text
     assert "Checked Friday, October 2, 5:00 PM ET." in text
     assert "Trading: the kill switch is off." in text
     assert "Largest position: 4.8% against a limit of 5.0%" in text
@@ -468,7 +469,18 @@ def test_a_match_within_a_wider_tolerance_is_not_to_the_cent(
     at = _app(monkeypatch, _store(tmp_path / "s.duckdb"), _view(safety=_safety(tolerance=1.26)))
     text = _text(at)
     assert "to the cent" not in text
-    assert "Matches Alpaca within the reconciliation's tolerance (cash to $1.26)." in text
+    assert "Matches Alpaca (within the reconciliation's tolerance)." in text
+
+
+def test_a_one_cent_configured_tolerance_does_not_certify_a_cent_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Reconciliation can widen a one-cent configured tolerance after fills.
+    view = _view(safety=_safety(tolerance=0.01))
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"), view)
+    text = _text(at)
+    assert "Matches Alpaca (within the reconciliation's tolerance)." in text
+    assert "to the cent" not in text
 
 
 def test_a_reconciliation_that_did_not_match_says_what_differs(
