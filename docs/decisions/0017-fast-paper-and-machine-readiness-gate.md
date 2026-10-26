@@ -140,21 +140,21 @@ P0 to P3 can land before any book work; H1's window (book `main`) stays open thr
 
 The decision stands; part E's E.2 line and E.4's real-halt clause are superseded as below, and the text above is left as written. Under ADR 0025 a difference on one name is a **break** that restricts the name, not a book halt, and every break carries a `cause` (paper spec amendment of 2026-10-26, item 14). The owner, 2026-10-26: every whole-book stop costs the daily book days of testing.
 
-- **(a) What no longer restarts the span.** A name-level break whose `cause` is `corporate_action`, `broker_activity` or `data` does not restart the span. This holds whether the owner trues it up or an explainer clears it. These causes cover a corporate action, a broker activity or correction, a late store row and a data delay. A restriction writes no `kill_switch` row and leaves the run `ok`, so E.1 is unaffected.
+- **(a) What no longer restarts the span.** A name-level break whose `cause` is `corporate_action`, `broker_activity` or `data` does not restart the span. This holds whether the owner trues it up or an explainer clears it. These causes cover a corporate action in the store and a broker corporate-action or dividend activity on that name, each of a type that can produce the break's kind (the paper spec's table, item 14). A late store row or a data delay counts as external only when the broker's activity on the name already shows the event at detection (paper spec open question 47). A restriction writes no `kill_switch` row and leaves the run `ok`, so E.1 is unaffected.
 - **(b) What still counts against the span, unchanged.**
   - A `mismatch` reconciliation: under ADR 0025 these are only the book-level kinds (account, unattributed cash, the order-path kinds, `break_cap`).
   - A book-wide halt, with the restart after its `released` row as today.
   - Our own order errors (E.3's duplicate, mis-sized and breach checks).
   - Journal gaps (E.5).
   - A missed run or a `stale_data` alert without a note (E.1, E.7).
-  - A break whose `cause` is `unattributed`, which restarts the span like a mismatch. The span starts again at the session after the event that closes the break (`trued_up`, `auto_explained` or `resolved_by_broker`). Until then the span is pending, as after an unreleased mismatch.
+  - A break whose `cause` is `unattributed`, material or not (paper spec open question 46), which restarts the span like a mismatch. This includes any break on a name with an own fill or own open order since the last `ok` or `breaks` reconciliation. The span starts again at the session after the event that closes the break (`trued_up`, `auto_explained` or `resolved_by_broker`). Until then the span is pending, as after an unreleased mismatch.
 - **(c) Who decides the group.** The kind and the cause decide it. Deterministic code records both on the `opened` event at detection, from rows known at close(S−1) and the broker's reads. The cause is never rewritten afterwards, and no command, note or true-up changes it. A case the rules cannot place is `unattributed`, so it restarts.
 
 **E.2, as amended.** **Reconciliation.**
 - Zero `mismatch` rows in the span, in any book.
-- Zero breaks of cause `unattributed` opened in the span (open question 46 asks whether an immaterial one counts).
+- Zero breaks of cause `unattributed` opened in the span, immaterial ones included unless the owner picks open question 46 (b).
 - No break open past the frozen `risk.break_max_age_sessions` at the command's session (open question 48).
-- `pending_unresolved` and `fills_lagging` rows as before, with `breaks` rows counted with them.
+- A `pending_unresolved` or `fills_lagging` row passes when the next reconciliation of that book is `ok` or `breaks`; a `breaks` row passes on its own. Their counts are printed.
 - The line prints the external breaks opened in the span by cause, and how each closed (trued up, auto-explained, resolved by the broker, auto-accepted, still open).
 
 **E.4's real-halt clause, as amended.** A real halt-path engagement in the span (a `halted` run) still restarts the span once the owner has resumed. A restriction is not a halt.

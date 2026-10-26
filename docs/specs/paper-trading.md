@@ -298,73 +298,125 @@ The paper vehicle is the registered H1 (long-only 12-1 momentum, top decile equa
 
 *Amendment 2026-10-26 (#2266, [ADR 0025](../decisions/0025-reconcile-by-breaks.md); the owner's direction agreed on #2266 the same day; accepted by the owner's merge; built by the plan amendment that follows the merge, each sentence holding once its task is ticked; until then req 6's halt stands).* Req 6's rule "Any residual is `ReconciliationError`: halt, kill switch, alert" is replaced, for the name-level kinds of item 2, by a **break**: a recorded difference that restricts one name and waits for the owner, while the rest of the book trades. Every explanation rule of req 6 and of the amendments above is unchanged and runs first; only its residual is classified here. Paper books only; the live book inherits this only through the Phase 6 live ADR.
 
-1. **Where a break comes from (req 6; `execution/reconcile.py:compare`).** `compare` runs as today: the explanations, the allowances for pending and lagging orders, and the cash bound. Each remaining `Mismatch` is then classified by its kind, by a pure function. It is either **book-level** (item 3; status `mismatch`, `ReconciliationError`, the halt path as today) or a **name-level break** (item 2). One reconciliation can hold both; any book-level item makes the status `mismatch`. A reconciliation whose only residuals are name-level breaks has the new status **`breaks`**. The order of statuses is `mismatch` > `pending_unresolved` > `fills_lagging` > `breaks` > `ok`.
-2. **Name-level kinds.** These kinds become breaks:
-   - `quantity`, `ledger_only_position`, `broker_only_position`, `unknown_security` and `short_external_change`, on the name's `security_id`;
+1. **Where a break comes from (req 6; `execution/reconcile.py:compare`; `execution/reconcile_run.py:reconcile_now`).** `compare` runs its explanations and allowances as today, with three changes.
+   - **Name cash is attributed before the cash test.** This covers every non-trade activity outside the base (not in `seen_activity_ids`, dated on or after `activity_seen_before`) that has a non-null, non-zero `net_amount`, a `symbol` mapping to a name the window has journaled or the broker holds, and no explanation that books it (a booked `FEE`, `CIL`, dividend or merger credit). All types qualify: a `DIV` that is not due, `MA`, `REORG`, `VOF`, `SSP`, an unknown type, and the unsupported dividend types `reconcile_now` forces to `cash` today (`_UNSUPPORTED_DIVIDEND_CASH`). Each such activity is subtracted from the cash difference and becomes a **name cash break** on its name. The `Mismatch` carries `security_id`, `symbol`, `cash_amount` and the activity id. Activities with no symbol, or one that maps to no name, stay in the cash difference.
+   - **The cash test** then applies the cash bound (the 2026-10-12 rule) to what is left. Beyond the bound it is the book-level `cash` (item 3).
+   - **Every remaining `Mismatch` is classified by its kind,** by a pure function: either **book-level** (item 3; status `mismatch`, `ReconciliationError`, the halt path as today) or a **name-level break** (item 2).
+
+   One reconciliation can hold both kinds; any book-level item makes the status `mismatch`. A reconciliation whose only residuals are name-level breaks has the new status **`breaks`**. The order of statuses is `mismatch` > `pending_unresolved` > `fills_lagging` > `breaks` > `ok`.
+2. **Name-level kinds.** These become breaks:
+   - `quantity`, `ledger_only_position`, `broker_only_position`, `unknown_security` and `short_external_change`, on the `security_id`;
    - `unknown_symbol`, on the broker symbol, because no `security_id` exists for it;
-   - `merger_conflict` and `unexplained_dividend_group`, on the acquiree or the dividend's name;
-   - a **name cash break**: an `unexplained_activity` row whose `CashActivity.symbol` maps to a name the window has journaled, or that the broker holds. Its amount moves out of the book's cash difference (item 3) and onto that name.
+   - `merger_conflict`, on the acquiree, and `unexplained_dividend_group`, on the dividend's name;
+   - the name cash break of item 1, on its name.
 3. **Book-level kinds (unchanged halts).**
    - `account_id`.
-   - `cash`: the cash difference left after name cash breaks, beyond the cash bound (the 2026-10-12 rule).
+   - `cash`: the difference left after item 1's attribution, beyond the cash bound.
    - `unexplained_activity` with no symbol, or with a symbol that maps to no name.
    - Every order-path kind: `foreign_order`, `unexplained_open_order`, `open_order_differs`, `missing_open_order`, `order_differs` and `bad_reading`.
    - `break_cap` (item 5).
    - Unchanged, and outside reconciliation: `ClockError`, `StaleDataError`, broker connectivity after its retries, `LimitBreachError`, `KillSwitchEngagedError`, `UniverseCollapseError`, and the rejection and skip caps.
-4. **The break record (data / interfaces).** A new append-only journal table, `reconcile_breaks`, with one row per event. The columns: `event_id`, `break_id`, `window_id`, `book_id`, `event`, `kind`, `cause`, `security_id`, `symbol`, `ledger_quantity`, `broker_quantity`, `cash_amount`, `reference_price`, `dollar_size`, `material`, `first_seen_session`, `reconciliation_id`, `adjustment_id`, `reason`, `known_at` and `ingested_at`.
+4. **The break record (data / interfaces).** A new append-only journal table, `reconcile_breaks`, with one row per event. The columns: `event_id`, `break_id`, `window_id`, `book_id`, `event`, `kind`, `cause`, `security_id`, `symbol`, `ledger_quantity`, `broker_quantity`, `cash_amount`, `reference_price`, `dollar_size`, `material`, `first_seen_session`, `finding_key`, `reconciliation_id`, `adjustment_id`, `reason`, `known_at` and `ingested_at`.
    - **`event`** is one of: `opened`, `observed`, `auto_accepted`, `auto_explained`, `resolved_by_broker`, `trued_up`, `reopened`.
-   - **Break identity.** There is at most one open break per (window, name). The name is the `security_id`, the broker symbol for `unknown_symbol`, or the literal `cash` only through item 2's name cash. A later reconciliation that sees the same name's difference appends `observed` with the new size; it opens no second break.
+   - **Break identity.** There is at most one open break per (window, name). The name is the `security_id`, or the broker symbol for `unknown_symbol`. `break_id` is derived as `<window_id>:<name>:<first_seen_session>`, so the same inputs give the same id. `event_id` is the journal's insertion order. A later reconciliation that sees the same name's difference appends `observed` with the new figures; it opens no second break.
+   - **`finding_key`** names what `compare` re-raises from the broker or the store, for the three kinds item 9 acknowledges rather than adopts:
+     - `unknown_symbol`: the symbol and the broker quantity;
+     - `merger_conflict`: the sorted merger ids;
+     - `unexplained_dividend_group`: the name and the group's ex-dates.
    - **State** is derived like the kill switch's: from the latest event per `break_id`, in write order. A break is **open** after `opened`, `observed` or `reopened`. It is **closed** after `auto_accepted`, `auto_explained`, `resolved_by_broker` or `trued_up`.
    - **Age** is the number of XNYS sessions from `first_seen_session` through the reconciliation's S.
    - **Dollar size** is |`broker_quantity` − `ledger_quantity`| × the name's reference price (Definitions > Reference price, at close(S−1)), plus |`cash_amount`|. A name with no reference price has a null size and is material.
-   - The events are written in the reconciliation's own write chunk, stamped with its clock reading. `reconciliations.status` gains `breaks`, and `adjustments.kind` gains `auto_true_up` and `owner_true_up`: one schema version.
-5. **Materiality, aging and the cap (Config keys).** Every key is a frozen `risk.*` key, frozen into `paper_windows.frozen_json` at start. A window frozen before the build reads the default (the #2183 back-fill precedent; open question 42). The defaults are open questions 39 to 41.
-   - `risk.break_materiality_usd = 25.0` and `risk.break_materiality_bps = 5.0`. A break is **immaterial** when its dollar size is at or below **both** the dollar figure and that many basis points of the ledger equity at the last mark. A $100,000 book thus accepts up to $25, and a $100 book up to $0.05.
-   - `short_external_change` is always material (open question 43).
-   - `risk.break_max_age_sessions = 5`. An open break older than this is **aged**: its alert repeats every run and the Home item turns red. It does not halt the book (open question 41).
-   - `risk.max_open_breaks = 3` and `risk.max_open_break_share = 0.02`. A reconciliation that would leave more open material breaks than the count, or a total open dollar size above that share of ledger equity, is the book-level `break_cap` (item 3). An unpriced break counts toward the count only.
-   - `risk.break_cause_lookback_sessions = 10` (item 14; open question 49).
-6. **Auto-acceptance (open question 44).** An immaterial break is never opened as restricting. The reconciliation journals, in its own chunk, one `auto_true_up` adjustment and one `auto_accepted` event naming it. The adjustment adopts the broker's quantity and cash for the name; its `explanation_json` names the thresholds and the size. Ledger, lots and report read this adjustment exactly as an `owner_true_up` (item 9).
-7. **Restriction (req 3; req 7 step 6).** A name is **restricted** while its window has an open material break on it. Restriction is derived and never stored. What it blocks:
-   - **Blocked:** every order that opens or adds exposure in the name, in any phase: a buy-to-open, a sell-to-open, and the buy half of a re-weight. The plan writes the decision as **`skip_restricted`**, a new skip reason. It does not count toward the skip cap, because it is not a broker refusal.
-   - **Allowed, proposed:** orders that reduce exposure (a sell of a long, a cover of a short, a forced exit, `paper stop`'s close). Each is sized to at most min(|ledger quantity|, |broker quantity|), so it can never cross zero on either book. Recommended; open question 38.
+   - **When events are written.** They are written on a reconciliation of any status, in its own write chunk, stamped with its clock reading, so the record exists even beside a halt. Adjustments follow today's rule: only on `ok` or `breaks`, and only when no order is pending or lagging, so a deferred explanation still defers.
+   - **Schema.** One schema version adds the `reconcile_breaks` table. It also widens three closed `CHECK` sets: `reconciliations.status` gains `breaks`; `adjustments.kind` gains `auto_true_up` and `owner_true_up`; `decision_events.reason` and `order_events.reason` gain `skip_restricted`. `ALERT_KINDS` gains `reconcile_break` (`alerts.kind` is unconstrained).
+5. **Materiality, aging and the cap (Config keys).** Every key is a frozen `risk.*` key, frozen into `paper_windows.frozen_json` at start, validated ≥ 0 (0 allowed). A window frozen before the build reads the default (the #2183 back-fill precedent; open question 42). The defaults are open questions 39 to 41 and 49.
+   - **Materiality.** `risk.break_materiality_usd = 25.0` and `risk.break_materiality_bps = 5.0`. A break is **immaterial** when its dollar size is at or below **both** the dollar figure and that many basis points of the ledger equity at the last mark. A $100,000 book thus accepts up to $25, and a $100 book up to $0.05. A threshold of 0 makes every break material.
+   - **Always material:**
+     - a `short_external_change` (open question 43);
+     - an unpriced break;
+     - the three `finding_key` kinds;
+     - any break on a name whose auto-accepted sizes in the window already sum above the materiality threshold. This is the cumulative bound: a leak of a few dollars a session cannot be accepted forever.
+   - **Aging.** `risk.break_max_age_sessions = 5`. An open break older than this is **aged**: its alert repeats every run and its "waiting on me" item carries `aged`. It does not halt the book (open question 41).
+   - **The cap.** `risk.max_open_breaks = 3` and `risk.max_open_break_share = 0.02`. A reconciliation that leaves more open material breaks than the count, or a total open dollar size above that share of ledger equity, is the book-level `break_cap` (item 3). An unpriced break counts toward the count only. A cap of 0 makes every material break a halt.
+   - **The cause lookback.** `risk.break_cause_lookback_sessions = 10` (item 14).
+6. **Auto-acceptance (open question 44).** An immaterial break is written `opened`, with its `cause`, and then `auto_accepted`, in the same chunk. With them goes one `auto_true_up` adjustment that adopts the broker's quantity and cash for the name. Its `explanation_json` names the thresholds, the size and the cumulative auto-accepted total. The ledger, lots and report read it exactly as an `owner_true_up` (item 9). No restriction follows.
+7. **Restriction (req 3; req 7 step 6).** A name is **restricted** while its window has an open material break on it. Restriction is derived and never stored.
+   - **Blocked:** every order that opens or adds exposure in the name, in any phase: a buy-to-open, a sell-to-open, and the buy half of a re-weight. The plan writes the decision as **`skip_restricted`**. It does not count toward the skip cap, because it is not a broker refusal.
+   - **Allowed, proposed (open question 38):** orders that reduce exposure, each sized to at most min(|ledger quantity|, |broker quantity|) so it can never cross zero on either book:
+     - a sell of a long or a cover of a short;
+     - a forced exit;
+     - `paper stop`'s close.
    - **Weights:** a restricted held name keeps its weight as the #2023 kept-name rule does (W_K in that formula), so the rest of the book is not scaled over it.
    - **Never touched:** the kill switch. A restriction writes no `kill_switch` row, and the run ends `ok` when nothing else fails.
 8. **Auto-explainers feed the queue.** The explanations run before classification on every reconciliation, open breaks included. The ledger keeps its own figures for a broken name, so the original difference is still there to explain. When a store row known at close(S−1) lets an explainer clear an open break, the reconciliation journals the explainer's usual adjustment and an `auto_explained` event naming it. A break whose difference disappears with no adjustment (the broker corrected itself) closes `resolved_by_broker`. The explainers no longer gate trading: a missing explainer leaves a break, never a halt.
 9. **The owner true-up: `tradepartner paper true-up --book <b> --break <id> --reason "<text>"`** (req 16; modelled on `paper settle`, req 17).
-   - **Gate.** It takes the run lock and refuses, writing nothing, when: no window is open; the break is not open in that window; `--reason` is missing or blank (there is no default); or a fresh broker read shows the name's quantity or cash has moved from the break's latest event beyond the frozen tolerances (`moved`: run `paper reconcile` first, so the size accepted is the size written). The read is `positions()`, `account()` and `cash_activities`, taken after the lock.
-   - **What it writes.** One write chunk, stamped by one clock reading taken after the broker read, so `known_at` = `ingested_at` is later than every reading. It holds one `owner_true_up` adjustment and one `trued_up` event naming it and the reason. The adjustment's quantity is broker minus ledger for the name, and its cash is the name's cash break. Its `session` is the command's session, never back-dated. Its `explanation_json` holds the break id, the reason, and the broker and ledger figures read.
+   - **When it runs.** It runs whether or not the derived switch is engaged, so a `break_cap` halt can be cleared before `paper resume`.
+   - **Gate.** It takes the run lock. A fresh broker read follows: `account()`, `positions()` and `cash_activities`. It refuses, writing nothing, when:
+     - no window is open;
+     - the break is not open in that window;
+     - `--reason` is missing or blank (there is no default);
+     - `account().account_id` is not the window's (`account_mismatch`);
+     - a non-terminal order of the window trades the name (`open_order`), so an in-flight fill is never adopted;
+     - the name's broker quantity or cash has moved from the break's latest event beyond the frozen tolerances (`moved`: run `paper reconcile` first, so the size accepted is the size written).
+   - **What it writes.** One write chunk, stamped by one clock reading taken after the broker read, so `known_at` = `ingested_at` is later than every reading. It holds one `owner_true_up` adjustment and one `trued_up` event that names the adjustment and the reason. The adjustment's `session` is the command's session, never back-dated. Its `explanation_json` holds the break id, the reason, and the broker and ledger figures read.
+   - **A true-up sets the figure; it does not add to it.** The adjustment's `quantity` is the delta, broker minus ledger, and its `cash` is the name cash break. Its `explanation_json` also carries the broker's absolute quantity. The ledger states the name at that absolute quantity from the true-up on. It applies to that quantity only splits with `ex_date` after the true-up's session. A split row that lands later with an earlier `ex_date` is already in the broker's figure, so it is never applied on top. `auto_true_up` follows the same rule.
+   - **The three `finding_key` kinds are acknowledged, not adopted.** No `security_id` (or no ledger figure) exists to set, so their adjustment carries no quantity and no cash; it records the `finding_key`. The classifier does not reopen a trued-up break while `compare` raises the same `finding_key`. A changed key (another quantity, another merger id, another ex-date) opens a new break. For `unknown_symbol` the broker's shares stay outside the ledger's equity, and the owner's reason says so.
    - **Lots.** A positive quantity opens a lot at zero basis, flagged `owner_true_up` (`execution.lots`). A negative one closes lots first-in first-out at zero proceeds, any cash being booked separately. Phase 6's tax treatment is out of scope (open question 50).
    - **Reversal.** `paper true-up --reverse <adjustment_id> --reason "<text>"` appends the opposite `owner_true_up` row, naming the one it reverses, and a `reopened` event. Nothing is deleted or edited.
    - **Refused flags.** There is no `--all`, pattern, `--force` or `--size`. The CLI and the app expose no flag that skips the broker read.
-   - The next reconciliation sees no difference for the name.
-10. **Cash base.** A `breaks` reconciliation records `broker_cash` and journals every adjustment its explanations and auto-acceptances imply, as an `ok` one does. Its cash base is `broker_cash` less the sum of the open name cash breaks. So the ledger's cash includes a broken amount only once it is trued up.
+10. **Cash base, and every reader of `ok`.** A `breaks` row stores in `broker_cash` the **base cash**: the broker's cash less the sum of the open name cash breaks. The broker's raw cash goes in `mismatches_json`. So the ledger's cash includes a broken amount only once it is trued up. Buy sizing (req 3) subtracts the same open positive name cash breaks from `account().cash`, so it never spends them.
+    - **Readers that treat `breaks` exactly as `ok`,** with that base: every reader that takes the latest `ok` row as the cash base or as "reconciled". These are `execution/ledger.py` (the cash base), `store/journal.py`'s latest-ok read, `execution/wrapper.py`, `execution/planning.py`, `execution/reconcile_run.py` (`_COMPLETED`, and the merger final check) and `execution/resume.py`.
+    - **`execution/shakedown.py`** follows the amended E.2 (ADR 0017's 2026-10-26 amendment).
+    - **`paper start`'s flatness check (`execution/window.py`)** treats `breaks` as `ok`.
+    - **`paper stop`'s closing reconciliation** refuses (`open_breaks`) while a material break is open: the owner trues it up first, or uses `paper abandon --reason`, which closes as today.
 11. **Resume and the kill switch (req 5).** `paper resume` releases on an `ok` **or** `breaks` reconciliation. Open breaks do not block a release; book-level kinds still do. A window halted under req 6 before the build resumes into breaks for its name-level residuals.
 12. **How breaks surface (req 11; req 12; `paper status`; ADR 0018 Home).**
-    - **Alert.** A new run-scoped alert kind, `reconcile_break`, written once when a material break is opened, naming the break id, the kind, the name, the size and the `paper true-up` command line. While a break is aged, the same kind is written once per run, with the age. `paper reconcile` writes no alert, as for its mismatches (#366 Q22 (i)), and prints the breaks.
-    - **`paper status --book`** prints an "Open breaks" block. Each line carries the id, kind, name, dollar size, first-seen session, age, cause and state, plus "restricted". Closed breaks of the last N sessions are counted.
-    - **"Waiting on me" and Home.** `execution/waiting.py` gains the kind `reconcile_break`, ordered after `kill_switch_engaged`. Its `since` is the `opened` event's `known_at`, and its command is the true-up line with the reason left for the owner. Home's "Needs you" shows it through `ops.waiting_on_owner`: amber, and red once aged. A book with only breaks is not "halted".
+    - **Alert.** A new run-scoped kind, `reconcile_break`: one alert per run, naming every break opened or aged in that run, with id, kind, name, size, age and the `paper true-up` command line. A break first seen by `paper reconcile` (which writes no alert, #366 Q22 (i), and prints its breaks) is alerted by the next run.
+    - **`paper status --book`** prints an "Open breaks" block. Each line carries the id, kind, name, dollar size, first-seen session, age, cause and state, plus "restricted". Closed breaks of the window are counted.
+    - **"Waiting on me" and Home.** `execution/waiting.py` gains the kind `reconcile_break`, ordered after `kill_switch_engaged`. `WaitingItem` gains a boolean `aged`. Its `since` is the `opened` event's `known_at`, and its command is the true-up line with the reason left for the owner. Home's "Needs you" shows it through `ops.waiting_on_owner`: amber, red when `aged`. A book with only breaks is not "halted".
 13. **No look-ahead, and determinism.**
     - Classification, size, materiality, cause, restriction and state are pure functions of the reconciliation's inputs. These are the broker reads, the journal cut at `as_of`, and the store rows known at close(S−1), as for the explanations (#488).
-    - The same inputs give the same break events.
     - No LLM output reaches any of it (ADR 0008). The only text a person adds is the owner's `--reason`, which is journaled and never parsed.
     - The no-look-ahead suite (T63g) gains a case: a row stamped after close(S−1) neither explains a break nor sets its cause at S.
-14. **The cause, for the shakedown (ADR 0017 E, amended 2026-10-26).** Each `opened` event carries `cause`, computed once at detection and never rewritten:
-    - **`corporate_action`**: a `corporate_actions`, `mergers`, delisting or `symbol_changes` row for the name, known at close(S−1), dated within `risk.break_cause_lookback_sessions` XNYS sessions of S;
-    - **`broker_activity`**: a non-trade activity of a corporate-action or dividend type (`_CORPORATE_ACTION_TYPES`, `_DIVIDEND_TYPES`, `CIL`), symbol-tagged to the name and dated within the same lookback; or a broker correction of an earlier fill;
-    - **`data`**: the kind is `merger_conflict` or `unexplained_dividend_group`;
-    - **`unattributed`**: anything else, and any case that matches none of these, or matches only by guesswork.
-15. **Migration of today's halt causes.** On the first reconciliation after the build, every residual of item 2's kinds becomes a break instead of a halt, including those that the "what still halts" lists of the amendments of 2026-10-13 (item 4), 2026-10-19 (#1762 item 7; #1872 item 9 for shorts), 2026-10-20 (#2033 item 4) and 2026-10-26 (#2183 to #2185) name. Those lists' book-level cases stay halts. No adjustment is back-dated, and no past `reconciliations` row is rewritten. #2185 (one symbol map) and #2174 stay fixes.
+14. **The cause, for the shakedown (ADR 0017 E, amended 2026-10-26).** Each `opened` event carries `cause`, computed once at detection and never rewritten.
+    - **The window.** "In the window" means a date within the `risk.break_cause_lookback_sessions` XNYS sessions up to S. Store rows must be known at close(S−1); broker activities are dated by `CashActivity.date`.
+    - **The evidence must fit the kind.** A cause is set only by evidence that can produce the observed kind:
+
+      | Kind | `corporate_action` (a store row in the window) | `broker_activity` (an activity tagged to the name's symbol, in the window) |
+      |---|---|---|
+      | `quantity` | a `split` row's `ex_date` | `SSP`, `SSO` or `REORG` |
+      | `ledger_only_position` | the listing's end, or a `mergers` row's `effective_date` | `MA`, `REORG`, `VOF`, `NC` or `SC` |
+      | `broker_only_position`, `unknown_symbol` | a `spinoff` row of a held parent (`ex_date`), or a `symbol_changes` row of a held name | `SSO`, `SSP`, `NC`, `SC` or `REORG` |
+      | `unknown_security` | the listing's end, or a `symbol_changes` row | `NC` or `SC` |
+      | `short_external_change` | a `mergers` row's `effective_date`, or the listing's end | none |
+      | A name cash break of a dividend type | a cash dividend row's `ex_date` | none: the activity is the break itself |
+      | A name cash break of `MA`, `REORG` or `VOF` | a `mergers` row or the listing's end | none |
+      | A name cash break of `CIL` | a `split` or `spinoff` row | none |
+
+    - **`data`**: the kind is `merger_conflict` or `unexplained_dividend_group`.
+    - **`unattributed`**: anything else. Also, whatever the evidence, any own fill or own non-terminal order on the name since the window's latest `ok` or `breaks` reconciliation forces `unattributed`, because our own trading may have caused it. A late store row or a data delay is external only when broker activity on the name shows it at detection; a later `auto_explained` close does not change the cause (open question 47).
+15. **Migration of today's halt causes.** On the first reconciliation after the build, every residual of item 2's kinds becomes a break instead of a halt. This includes those named by the "what still halts" lists of the amendments of 2026-10-13 (item 4), 2026-10-19 (#1762 item 7; #1872 item 9 for shorts), 2026-10-20 (#2033 item 4) and 2026-10-26 (#2183 to #2185). Those lists' book-level cases stay halts. No adjustment is back-dated, and no past `reconciliations` row is rewritten. #2185 (one symbol map) and #2174 stay fixes.
 16. **Acceptance (testable; on the fake broker and the fixture store).** Each test fails if its guard is removed.
-    - A held name the broker removes, with no explanation, gives a `breaks` status, one `opened` event, no `kill_switch` row and a run ending `ok`. Its buy decision is `skip_restricted`, and the other names trade.
-    - The same difference at $10 on a $100,000 book is `auto_accepted`, with one `auto_true_up` row and no restriction.
-    - Four material breaks, or one above 2 % of equity, halts with `break_cap`.
-    - An `account_id`, a `foreign_order` and an unattributed cash difference each still halt.
-    - A `DIV` tagged to a held name and not due is a name cash break, and the cash base excludes it.
-    - `paper true-up` without `--reason`, on a closed break, or after the broker moved writes nothing and exits non-zero. With them, it writes one adjustment and one event with a single `known_at`, and the next reconciliation is `ok`. `--reverse` reopens it.
-    - A merger row stored the session after a break closes it `auto_explained`, with the merger's usual rows.
-    - A break past `risk.break_max_age_sessions` writes the aged alert on every run, and `waiting.build` lists it red.
-    - The same inputs reconciled twice give byte-identical events.
+    - **Restriction and halts.**
+      - A held name the broker removes, with no explanation, gives a `breaks` status, one `opened` event, no `kill_switch` row and a run ending `ok`. Its buy decision is `skip_restricted`, the other names trade, and a planned sell of it is sized to min(|ledger|, |broker|).
+      - Four material breaks, or one above 2 % of equity, halts with `break_cap`.
+      - An `account_id`, a `foreign_order` and an untagged cash difference each still halt.
+    - **Auto-acceptance.**
+      - The same difference at $10 on a $100,000 book writes `opened` and `auto_accepted`, with one `auto_true_up` row and no restriction.
+      - A third $10 break on that name (cumulative above $25) is material.
+    - **Name cash.**
+      - A not-due `DIV`, an `MA` and a `DIVNRA`, each tagged to a held name, are name cash breaks, not `cash`.
+      - Across two `breaks` sessions, the base cash excludes them and the buy cash does not spend them.
+    - **True-up.**
+      - `paper true-up` refuses and writes nothing, exiting non-zero, in each of these cases: no `--reason`; a closed break; the broker moved; an open order on the name; another account.
+      - With them in order, it writes one adjustment and one event with a single `known_at`, and the next reconciliation is `ok`. `--reverse` reopens the break.
+      - A split row stored after a true-up, with an earlier `ex_date`, does not change the trued-up quantity.
+      - An `unknown_symbol` trued up stays closed while its key is unchanged, and opens a new break when the broker quantity changes.
+    - **Auto-explanation.** A merger row stored the session after a break closes it `auto_explained`, with the merger's usual rows.
+    - **Cause.** One test per `cause` value, each kind in item 14's table included. An own fill on the name forces `unattributed`.
+    - **Resume and surfaces.**
+      - `paper resume` releases on a `breaks` reconciliation.
+      - A break past `risk.break_max_age_sessions` is in that run's alert, and `waiting.build` returns it with `aged` true.
+    - **Determinism.** Two copies of the fixture store, reconciled with the same clock, give equal events, ids included.
 17. **Out of scope.** Changing any explainer's rule; a live-account rule; adopting a book-level difference; an LLM-written reason or suggestion; a per-event explainer for the frozen list (#2266) unless it is shown to be frequent; the Phase 6 tax treatment of a true-up lot.
 
 ## Requirements
@@ -639,9 +691,9 @@ Added 2026-10-26 by the #2266 amendment ([ADR 0025](../decisions/0025-reconcile-
 
 45. **A trued-up external break and the shakedown.** Does it also need a `shakedown_note`? (a) No: the true-up's typed reason is the record (recommended); (b) yes, as a `stale_data` alert does.
 
-46. **An immaterial break whose cause is `unattributed`.** (a) Counted on the E.2 line, no restart (recommended: below materiality is a tolerance); (b) it restarts the span like a material one.
+46. **An immaterial break whose cause is `unattributed`.** (a) It restarts the span like a material one (recommended: the owner's 2026-10-26 rule that an ambiguous cause restarts; it is auto-accepted for trading either way); (b) it is counted on the E.2 line without a restart, as a tolerance.
 
-47. **An `unattributed` break that an explainer later clears.** (a) It still restarts the span, because the cause is fixed at detection (recommended, ADR 0017's 2026-10-26 amendment item (c)); (b) a later `auto_explained` close excuses it.
+47. **An `unattributed` break that an explainer later clears** (a late store row, a data delay). (a) It still restarts the span, because the cause is fixed at detection and only broker activity seen at detection makes a late row external (recommended, ADR 0017's 2026-10-26 amendment item (c)); (b) a later `auto_explained` close excuses it, which changes its group after detection.
 
 48. **An external break still open when `paper shakedown` runs.** (a) E.2 passes while it is younger than `risk.break_max_age_sessions` and fails once it is aged (recommended); (b) every break must be closed before E.2 passes.
 
