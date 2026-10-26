@@ -4,7 +4,11 @@
 the **expected session**: the calendar's last completed session at run time
 minus `ingest.settle_delay_minutes` (`expected_session`). Sources run in
 order, `edgar` then `alpaca` (the price side fetches the names the master
-lists), and the run **halts** at the first source that is not `ok`.
+lists, read from the store as last committed), and every source runs whatever
+an earlier one did (#2180, bar a locked store): a failed EDGAR chunk leaves the master as the last
+good run wrote it, so the price side still ingests, and the run exits non-zero
+if any source was not `ok`. Rates and the assets snapshot still wait for all
+`ok`.
 
 **One atomic chunk per source.** Each source is fetched before its write
 transaction: EDGAR with no store connection open (a recording pass), the
@@ -851,7 +855,7 @@ def ingest_session(
             after_commit=after_commit[name],
         )
         runs.append(run)
-        if run.status != OK:
+        if run.status == LOCKED:  # the store, not the source: the next would wait out the same lock
             break
     if (
         source == "all"

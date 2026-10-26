@@ -928,7 +928,7 @@ def test_a_mid_chunk_failure_commits_nothing_from_that_chunk(
     assert read("SELECT status FROM ingestion_runs WHERE source = 'alpaca'") == [(FAILED,)]
 
 
-def test_a_failed_source_halts_the_run(
+def test_a_failed_source_still_runs_the_next_and_fails_the_run(
     settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:
     class Broken(FixtureFilingSource):
@@ -937,10 +937,34 @@ def test_a_failed_source_halts_the_run(
 
     prices = _Prices()
     result = _run(settings, prices, filings=_filings(cls=Broken))
-    assert [(r.source, r.status) for r in result.runs] == [("edgar", FAILED)]
+    # Empty store: no master to read, so the price side fails on its own account.
+    assert [(r.source, r.status) for r in result.runs] == [("edgar", FAILED), ("alpaca", FAILED)]
+    assert result.exit_code == 1
     assert prices.calls == []
     assert _counts(read)["securities"] == 0
-    assert read("SELECT source, status FROM ingestion_runs") == [("edgar", FAILED)]
+    assert read("SELECT source, status FROM ingestion_runs ORDER BY source") == [
+        ("alpaca", FAILED),
+        ("edgar", FAILED),
+    ]
+
+
+def test_an_edgar_only_failure_still_ingests_prices(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#2180: EDGAR down on a later evening; the price side reads the last good
+    master, lands the session, and the run still exits non-zero."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    assert _run(settings).ok
+    broken = _filings(cls=Broken)
+    prices = _Prices()
+    result = _run(settings, prices, filings=broken)
+    assert [(r.source, r.status) for r in result.runs] == [("edgar", FAILED), ("alpaca", OK)]
+    assert prices.calls
+    assert result.exit_code == 1
 
 
 def test_one_source_only(settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]) -> None:
@@ -2211,7 +2235,7 @@ def test_a_filing_accepted_after_the_run_clock_fails_the_chunk(
     # No look-ahead: a record not yet knowable at the run's instant is never stored.
     early = NOW - timedelta(days=200)
     result = _run(settings, now=early)
-    assert [(r.source, r.status) for r in result.runs] == [("edgar", FAILED)]
+    assert [(r.source, r.status) for r in result.runs] == [("edgar", FAILED), ("alpaca", FAILED)]
     assert "after" in result.runs[0].message
     assert _counts(read)["securities"] == 0
 
