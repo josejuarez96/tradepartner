@@ -305,6 +305,20 @@ def test_change_today_up_down_counts_and_top_n() -> None:
     assert [r.ticker for r in out.rows] == ["XYZ", "YYY", "ZZZ"]  # by value, 1100 > 450 > 200
 
 
+def test_a_split_on_the_ex_date_is_not_a_crash_in_change_today() -> None:
+    """10 @ 100, 2:1 split ex 03-07. Prior mark 03-06: 110 a share (10 shares);
+    03-07: 55.5 (20 shares). The prior price in today's units is 55, so the
+    change is 20 x 0.5 = +10 (+0.909%), not -1,090."""
+    book = Book()
+    book.trade("buy", 10, 100.0, D0303)
+    marks = [_mark(D0306, "SEC_X", 10, 110.0), _mark(D0307, "SEC_X", 20, 55.5)]
+    out = book.holdings(marks, D0307, actions=_splits(("SEC_X", D0307, 2.0)))
+    row = _one(out, "XYZ")
+    assert row.change_today == pytest.approx(10.0)
+    assert row.change_today_percent == pytest.approx(0.5 / 55 * 100)
+    assert (out.summary.up_today, out.summary.down_today) == (1, 0)
+
+
 def test_a_name_bought_today_has_no_change_today() -> None:
     book = Book()
     book.trade("buy", 10, 100.0, D0305)

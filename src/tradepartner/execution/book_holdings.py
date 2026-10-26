@@ -19,7 +19,9 @@ for the whole window, never one per name.
   and its gain is basis minus value.
 - **Change today** is the mark against the prior marked session's mark of the
   same name and side (price change times today's quantity; None for a name with
-  no prior mark, such as one bought today).
+  no prior mark, such as one bought today). It applies the move to today's
+  whole quantity, shares bought today included, and divides the prior price by
+  a split between the two sessions.
 - A mark with no price (`mark_price` None) is shown as "no price yet" with no
   value, gain or change, and is left out of the up and down counts and the
   rankings, never counted as zero.
@@ -40,10 +42,11 @@ from typing import Any
 import duckdb
 import polars as pl
 
-from tradepartner.calendar import session_close
+from tradepartner.calendar import previous_session, session_close
 from tradepartner.execution.lots import SHORT, LedgerAccount, rebuild
 from tradepartner.execution.symbols import broker_symbol
 from tradepartner.store import journal
+from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.journal import AdjustmentRow, OrderedFill, OrderRow, PositionDailyRow
 from tradepartner.store.schema import LONG
 
@@ -160,7 +163,9 @@ def build_holdings(
         )
 
     prior_price: dict[tuple[str, str], float | None] = {
-        (m.security_id, m.position_side): m.mark_price
+        (m.security_id, m.position_side): _in_todays_units(
+            m.mark_price, m.security_id, prior_session, session, actions
+        )
         for m in marks
         if m.session == prior_session and m.security_id is not None
     }
@@ -169,6 +174,29 @@ def build_holdings(
     rows.sort(key=lambda r: (r.value is None, -(r.value or 0.0), r.ticker))
     cash = next((m.cash for m in marks if m.session == session and m.cash is not None), None)
     return Holdings(session, tuple(rows), _summary(rows, cash, top_n))
+
+
+def _in_todays_units(
+    price: float | None,
+    security_id: str,
+    prior_session: date | None,
+    session: date,
+    actions: pl.DataFrame | None,
+) -> float | None:
+    """The prior session's `price` per share in `session`'s units: divided by
+    every split ratio of the name with `prior_session < ex_date <= session`, so
+    an ex-date never shows as a crash."""
+    if price is None or prior_session is None or actions is None or actions.is_empty():
+        return price
+    splits = actions.filter(
+        (pl.col("security_id") == security_id)
+        & (pl.col("action_type") == "split")
+        & (pl.col("ex_date") > prior_session)
+        & (pl.col("ex_date") <= session)
+    )
+    for ratio in splits["ratio_or_amount"].to_list():
+        price /= float(ratio)
+    return price
 
 
 def read_holdings(
@@ -182,11 +210,19 @@ def read_holdings(
     top_n: int = 5,
 ) -> Holdings:
     """`build_holdings` over the window's journal: the fills, orders,
-    adjustments and marks, each read once (no per-name query), nothing written."""
+    adjustments and marks, each read once (no per-name query), nothing written.
+    `actions` defaults to the splits known at close(S-1) of the marked session S
+    (`live_actions_as_of`), the cut the mark was written under. Fills and marks
+    are the live rows now, not cut by `known_at`, so a past `as_of` shows a
+    later correction in its corrected form."""
     fills = journal.fills_for(conn, window_id=window_id)
     orders = journal.orders_for(conn, window_id=window_id)
     adjustments = journal.adjustments_for(conn, window_id, through_session=as_of)
     marks = journal.positions_daily_for(conn, window_id)
+    marked = sorted({m.session for m in marks if m.session <= as_of})
+    if actions is None and marked:
+        # The splits known at close(S-1), the cut the mark itself was written under.
+        actions = live_actions_as_of(conn, session_close(previous_session(marked[-1])))
     return build_holdings(
         fills,
         orders,
