@@ -2275,6 +2275,12 @@ class RiskConfig(BaseModel):
     reconcile_merger_lag_sessions: int = Field(default=5, ge=0)
     # #2183: cash may arrive after an ok reconciliation on the ex-date.
     reconcile_dividend_credit_sessions: int = Field(default=25, ge=1, le=55)
+    # #2183: up to this many unmatched dividend dues are searched exhaustively (2^n
+    # subsets); more need a proven-unique cent-sum fit or the book halts.
+    reconcile_dividend_exhaustive_dues: int = Field(default=8, ge=1, le=12)
+    # #2183: the cent-sum states that uniqueness proof may visit; exhausting them
+    # fails closed (a cash mismatch), keeping a contrived book bounded.
+    reconcile_dividend_subset_states: int = Field(default=10_000, ge=1)
     # #411: the most a delisted holding's late cash may exceed its last stored close x
     # quantity (a share of it, in [0, 1]): a cash deal trades below its price, so the
     # real credit can sit above the stale close; more is not this position's proceeds.
