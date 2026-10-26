@@ -762,24 +762,18 @@ def _explanations(
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))
     seen_ids, seen_before = _seen_activities(state.adjustments, state.base(through), window)
-    fresh_dividend_symbols = (
-        {
-            activity.symbol
-            for activity in broker_activities
-            if activity.activity_type == "DIV"
-            and activity.status == "executed"
-            and activity.symbol is not None
-            and activity.activity_id not in seen_ids
-            and (seen_before is None or activity.date >= seen_before)
-        }
-        if broker_activities is not None
-        else None
-    )
-    fresh_dividend_names = (
-        {name for name, symbol in symbols.items() if symbol in fresh_dividend_symbols}
-        if fresh_dividend_symbols is not None
-        else None
-    )
+    fresh_dividend_symbols = {
+        activity.symbol
+        for activity in broker_activities or ()
+        if activity.activity_type == "DIV"
+        and activity.status == "executed"
+        and activity.symbol is not None
+        and activity.activity_id not in seen_ids
+        and (seen_before is None or activity.date >= seen_before)
+    }
+    fresh_dividend_names = {
+        name for name, symbol in symbols.items() if symbol in fresh_dividend_symbols
+    }
     dividends, findings = _dividends(
         state,
         actions,
@@ -1254,7 +1248,9 @@ def explanations_as_of(
     `quantity_tolerance` is the frozen `risk.reconcile_quantity_tolerance`;
     `merger_lag_sessions`, `dividend_credit_sessions` and `cash_tolerance`
     are the corresponding frozen `risk.*` values (their defaults when not
-    given); they bound open merger and dividend dues and cash matches.
+    given); they bound open merger and dividend dues and cash matches. With no
+    broker activity feed, a dividend on or before the last `ok` cash base has
+    no fresh `DIV` tag and is not offered.
     Raises `ValueError` for a non-session `session` or a naive `as_of`."""
     cut = _cut(session)
     as_of = ensure_tz_aware_utc(as_of, field_name="as_of")

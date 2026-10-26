@@ -1241,6 +1241,32 @@ def test_untagged_cash_after_ok_base_is_not_a_late_dividend(
         _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay)
 
 
+def test_read_only_and_live_explanations_agree_on_pre_base_untagged_dividend(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Read-only has no broker DIV feed, so an older due is not offered."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == OK
+    later = next_session(S)
+    fixed_clock.now = datetime.combine(later, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    with open_read_only(journal_settings) as conn:
+        read_only = explanations_as_of(
+            conn,
+            open_window,
+            later,
+            as_of=fixed_clock.now,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert read_only.dividends == {}
+    live = _reconcile(journal_settings, fake, open_window, fixed_clock, session=later)
+    assert live.status == OK and live.adjustments == ()
+
+
 def test_untagged_pre_base_dividend_does_not_widen_deferred_cash_band(
     journal_settings: Settings,
     fake: BookedFake,
