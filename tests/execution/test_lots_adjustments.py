@@ -995,3 +995,51 @@ def test_later_cil_date_is_independent_of_adjustment_input_order() -> None:
     reversed_order = book.run(D0312, adjustments=list(reversed(book.adjustments)))
     assert first == reversed_order
     assert first[1][0].trade_date_local == D0312
+
+
+def test_open_lots_report_the_ledgers_own_open_basis_once_after_a_merger_boot() -> None:
+    """The stock-and-cash merger above: open basis 64 + 96 = 160 in 1.6 + 2.4
+    acquirer shares. The boot's basis (40) came off the lots once, though the
+    disposals also record it (#2247). `rebuild`'s own result is unchanged."""
+    book = Book()
+    book.trade("buy", 4, 20.0, D0303, security_id="SEC_T")
+    book.trade("buy", 6, 20.0, D0304, security_id="SEC_T")
+    terms = {
+        **_MERGER,
+        "merger_kind": "stock_and_cash",
+        "acquirer_security_id": "SEC_A",
+        "share_ratio": 0.4,
+        "acquirer_price": 60.0,
+        "fractional_shares": 0.0,
+    }
+    book.adjust("corporate_action_cash", D0307, "SEC_T", quantity=-10, cash=60, explanation=terms)
+    book.adjust("merger_receipt", D0307, "SEC_A", quantity=4, explanation=_MERGER)
+    held = lots.open_lots(
+        book.fills,
+        book.orders,
+        {},
+        ACCOUNT,
+        adjustments=book.adjustments,
+        actions=_splits(),
+        through=D0310,
+        symbols=SYMBOLS,
+    )
+    assert [(h.security_id, h.quantity, h.basis) for h in held] == [
+        ("SEC_A", 1.6, 64.0),
+        ("SEC_A", 2.4, 96.0),
+    ]
+
+
+def test_open_lots_drop_a_sold_lot_and_keep_the_rest_of_a_partial_one() -> None:
+    """Buy 10 @ 100, buy 10 @ 110, sell 15: lot 1 is gone, lot 2 holds 5 with
+    basis 550; a split 2:1 after scales the quantity (10) and keeps the basis."""
+    book = Book()
+    book.trade("buy", 10, 100.0, D0303)
+    book.trade("buy", 10, 110.0, D0304)
+    book.trade("sell", 15, 120.0, D0305)
+    held = lots.open_lots(
+        book.fills, book.orders, {}, ACCOUNT, actions=_splits(("SEC_X", D0307, 2.0)), through=D0310
+    )
+    assert [(h.lot_id, h.quantity, h.basis, h.position_side) for h in held] == [
+        (2, 10.0, 550.0, "long")
+    ]

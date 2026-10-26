@@ -366,3 +366,45 @@ def test_malformed_sell_decision_raises_journal_integrity_error(
     order(conn, run(conn), "bad-sell", "sell", reason="exclude_name")
     with pytest.raises(journal.JournalIntegrityError, match="neither a full exit nor a trim"):
         blotter.session_blotter(conn, 1, SESSION, AFTER, 10)
+
+
+def test_first_and_last_fill_times_and_full_exit_flag(conn: duckdb.DuckDBPyConnection) -> None:
+    rid = run(conn)
+    order(conn, rid, "two", "buy")
+    order(conn, rid, "none", "buy", symbol="BBB")
+    order(conn, rid, "out", "sell", symbol="CCC", reason="left_targets")
+    order(conn, rid, "trim", "sell", symbol="DDD")
+    fill(conn, "two", 101.0, at=AT + timedelta(minutes=5))
+    fill(conn, "two", 100.0, at=AT)
+    rows = {r.client_order_id: r for r in blotter.session_blotter(conn, 1, SESSION, AFTER, 10).rows}
+    assert rows["two"].first_fill_at == AT
+    assert rows["two"].last_fill_at == AT + timedelta(minutes=5)
+    assert (rows["none"].first_fill_at, rows["none"].last_fill_at) == (None, None)
+    assert (rows["out"].full_exit, rows["trim"].full_exit) == (True, False)
+
+
+def test_known_by_leaves_out_later_orders_events_and_fills(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    rid = run(conn)
+    order(conn, rid, "buy", "buy")
+    fill(conn, "buy", 100.0, at=AT)  # known AT + 1s
+    fill(conn, "buy", 110.0, at=AT + timedelta(hours=1))  # known later
+    journal.append(
+        conn,
+        OrderEventRow(client_order_id="buy", status="filled", **stamp(AT + timedelta(hours=2))),
+    )
+    bar(conn, "AAA", 100.0, session_close(SESSION))
+    cut = AT + timedelta(minutes=1)
+    seen = blotter.session_blotter(conn, 1, SESSION, AFTER, 10, known_by=cut)
+    assert seen.rows[0].filled_quantity == 1.0
+    assert seen.rows[0].status == "open"
+    assert seen.summary.overall.count == 1
+    full = blotter.session_blotter(conn, 1, SESSION, AFTER, 10)
+    assert (full.rows[0].filled_quantity, full.rows[0].status) == (2.0, "filled")
+    assert (
+        blotter.session_blotter(conn, 1, SESSION, AFTER, 10, known_by=AT - timedelta(days=1)).rows
+        == ()
+    )
+    with pytest.raises(ValueError, match="known_by"):
+        blotter.session_blotter(conn, 1, SESSION, AFTER, 10, known_by=cut.replace(tzinfo=None))

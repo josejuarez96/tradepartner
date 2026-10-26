@@ -282,7 +282,7 @@ class EdgarAge:
         """The one line every surface shows."""
         return (
             f"EDGAR data {self.sessions} sessions old (last ok ingest covered "
-            f"{self.last_ok_session.isoformat()}) \u2014 check the ingest run"
+            f"{self.last_ok_session.isoformat()}); check the ingest run (`tradepartner ingest`)"
         )
 
 
@@ -986,17 +986,20 @@ def edgar_age(
     the XNYS sessions after the session the latest `ok` daily EDGAR ingest run
     covered (the last session closed when it finished), up to the last session
     closed at `now`. None below the limit, and when no `ok` run is stored (nothing
-    to count from). Reads only the stored rows (the trading calendar, never
+    to count from). Runs finished after `now` are not yet known and are ignored.
+    Reads only the stored rows (the trading calendar, never
     weekdays)."""
     row = conn.execute(
-        "SELECT max(finished_at) FROM ingestion_runs WHERE status = ? AND source = ? AND mode = ?",
-        [INGEST_OK, _EDGAR_SOURCE, INGEST_MODE],
+        "SELECT max(finished_at) FROM ingestion_runs "
+        "WHERE status = ? AND source = ? AND mode = ? AND finished_at <= ?",
+        [INGEST_OK, _EDGAR_SOURCE, INGEST_MODE, now],
     ).fetchone()
     if row is None or row[0] is None:
         return None
     covered = last_completed_session(ensure_tz_aware_utc(row[0], field_name="finished_at"))
     current = last_completed_session(ensure_tz_aware_utc(now, field_name="now"))
-    sessions = bisect_right(all_sessions(), current) - bisect_right(all_sessions(), covered)
+    calendar = all_sessions()
+    sessions = bisect_right(calendar, current) - bisect_right(calendar, covered)
     if sessions < settings.ingest.edgar_max_age_sessions:
         return None
     return EdgarAge(sessions, covered)

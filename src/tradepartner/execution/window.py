@@ -188,7 +188,7 @@ a false `no_window` (#1261, T132).
   [...], "pending": [...]}` from that reconciliation's `mismatches_json`.
   `start` never parses it (after an abandoned window the account must be
   strictly flat). It releases nothing.
-- **`kill(settings, connect, clock, reason)`** is `paper kill`. It takes no
+- **`kill(settings, clock, reason)`** is `paper kill`. It takes no
   run lock, so the owner can engage while a run holds it, refuses
   `no_window` and `multiple_open_windows` (spec req 14: only one window per
   book may ever be open; nothing is written for either refusal) and appends an
@@ -231,6 +231,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, cast, get_args
 from zoneinfo import ZoneInfo
 
@@ -275,7 +276,7 @@ from tradepartner.execution.reconcile_run import (
 )
 from tradepartner.store import registry
 from tradepartner.store.asof import live_actions_as_of
-from tradepartner.store.db import open_for_write
+from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
     CLOSING_STOP_STATES,
@@ -1512,11 +1513,11 @@ def _abandon_row(
 
 def kill(
     settings: Settings,
-    connect: Connect,
     clock: Callable[[], datetime],
     reason: str,
     *,
     book_id: str | None = None,
+    on_wait: Callable[[str], None] | None = None,
 ) -> int:
     """`paper kill --book <book> --reason` (module docstring; `book_id` defaults
     to `paper.book_id`): the `engaged` row's `event_id`, on the book's open window
@@ -1524,20 +1525,37 @@ def kill(
     Raises `WindowCommandRefused` for a blank reason, no open window for the book,
     or more than one (only one window per book may ever be open, spec req 14;
     nothing is written for any of these), `ValueError` for a book outside the
-    token grammar, and `KillWriteFailed` when the row cannot be written."""
+    token grammar, and `KillWriteFailed` when the row cannot be written. The
+    read-only lookup retries within the writer wait while reserving the
+    ordinary lock wait for the engagement write. `on_wait` goes to both store
+    opens (`open_read_only`, `open_for_write`), so the caller can say it waits."""
     note = _note(reason, "paper kill")
     book = resolve_book(settings, book_id)
+    if not Path(settings.store.path).is_file():
+        raise WindowCommandRefused(NO_WINDOW, "no_window: no paper window is open")
+    total = settings.store.writer_lock_retry_seconds
+    # When the configured writer wait is shorter than the ordinary wait, both
+    # phases still get a chance within that shorter total.
+    minimum = min(settings.store.lock_retry_seconds, total // 2 if total > 1 else total)
+    read_wait = max(0, total - minimum)
+    read_settings = settings.model_copy(
+        update={"store": settings.store.model_copy(update={"lock_retry_seconds": read_wait})}
+    )
     started = time.monotonic()
-    with connect() as conn:
+    with open_read_only(read_settings, retry=True, on_wait=on_wait) as conn:
         _, window_id = _window_of(conn, book)
-    # One lock wait per book, not one per connection: `engage` gets what is left (#2178).
-    left = max(1, int(settings.store.lock_retry_seconds - (time.monotonic() - started)))
+    engage_wait = max(minimum, int(total - (time.monotonic() - started)))
     engage_settings = settings.model_copy(
-        update={"store": settings.store.model_copy(update={"lock_retry_seconds": left})}
+        update={"store": settings.store.model_copy(update={"lock_retry_seconds": engage_wait})}
     )
     try:
         engaged = switch.engage(
-            engage_settings, clock, window_id=window_id, source=_OWNER, reason=note
+            engage_settings,
+            clock,
+            window_id=window_id,
+            source=_OWNER,
+            reason=note,
+            on_wait=on_wait,
         )
     except Exception as exc:  # a bad clock reading, say: still not engaged
         engaged = switch.WriteFailed(f"{type(exc).__name__}: {exc}")
@@ -1873,8 +1891,10 @@ def settle_order(
     `paper.min_override_reason_chars`) and `not_engaged` (the derived switch),
     each before any broker call or write; one clock reading; then `account`
     (`account_mismatch` when its id is not the window's), `get_order`,
-    `open_orders`, `fills(since)` (`since` = the order's `pending` event's
-    `known_at` minus `paper.fill_read_overlap_seconds`) and `positions`, and a
+    `open_orders`, `fills(since)` (`since` reaches back from the order's
+    `pending` event's `known_at` to the broker's `submitted_at`, with
+    `paper.fill_read_overlap_seconds`, floored at the window start minus the
+    overlap) and `positions`, and a
     `get_order` per other non-terminal order of the window on the same
     `security_id`. It refuses `broker_open` (a non-terminal reading, or the id
     listed open), `unjournaled_fill` (a fill of the order in the stream whose
@@ -1917,7 +1937,13 @@ def settle_order(
         except UnknownOrderError:
             reading = None
         open_ids = sorted(o.client_order_id for o in broker.open_orders())
-        since = target.pending_at - timedelta(seconds=settings.paper.fill_read_overlap_seconds)
+        overlap = timedelta(seconds=settings.paper.fill_read_overlap_seconds)
+        since = target.pending_at - overlap
+        if reading is not None:
+            # The broker filters fills on its own clock. Our pending stamp may
+            # run ahead of its submitted_at and otherwise hide a real fill.
+            broker_since = max(reading.submitted_at - overlap, window.started_at - overlap)
+            since = min(since, broker_since)
         stream = broker.fills(since)
         positions = broker.positions()
         others: list[tuple[str, Order | None]] = []

@@ -476,6 +476,16 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - The "waiting on me" read: `execution.waiting` (pure) and `ops.waiting_on_owner`, every open book's items in a fixed order with the command that clears each (T256, #2116).
 - Run sheet for the ordered data releases, restamp, DTB3 backfill, T214 merge, checks, evidence, and restore.
 - Read-only Trades page with book/session filters, slippage chart, KPIs and order table.
+- Show each paper book’s owner action, severity, since time and command in Operations and paper status --all.
+- Long/short backtests now screen raw close for short eligibility, cover drifted shorts on the next fill, report borrow sensitivity books and summarize exposure.
+- Stock mergers on held longs now journal acquirer shares as merger receipts and reconcile later cash in lieu against the stored merger due.
+- Optional dead-man's-switch heartbeat: `paper run` and `ingest` ping `ALERT_HEARTBEAT_URL_PAPER` / `ALERT_HEARTBEAT_URL_INGEST` on completion (`/fail` on a non-zero outcome), best effort, URL scrubbed; halt card and setup steps in the scheduling runbook (#2155)
+- Research report on failure-loss layers: sizing from worst gaps, broker-held stops, reduce-only after the kill switch, an off-Mac watchdog (#2157).
+- Verified pre-migration store copies record their reason and code vintage; a configurable sweep retains only marked copies and protects owner backups.
+- Plan tasks T266a1 and T266a2: a verified pre-migration backup with retention, and init_schema refusing to migrate unless asked (#2160).
+- Research report on paper fill costs: decomposition of the 10-20 daily-book fills, verdict on the 15 bp cost model and open-fill cost tiers (#2165).
+- Test: hand-computed long/short parity cases for the backtest engine (#2166).
+- A long_short trial writes seven reported-only metric rows (gross and net exposure, borrow_paid_annual, excess_cagr_rf), its borrow-sensitivity books get metric rows kept out of V, N and DSR, the backtest page shows exposure, the proxy's limits and labels the borrow lines, and the bt oracle gains a long/short case (#2198)
 
 ### Changed
 - `insert_row` now binds the UTC-normalized value for `TIMESTAMPTZ` columns (one canonical stored form) instead of the caller's original tzinfo, and `ensure_tz_aware_utc` re-raises the `OverflowError` from `.astimezone(UTC)` near `datetime.min`/`datetime.max` as `ValueError` naming the field (#43).
@@ -707,6 +717,15 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - health: mergers block and four merger integrity rules on health --check and the data-health page (T248e, #1762)
 - Plans amended (#2086, owner 2026-10-20): T162's span opens 2026-10-22, the drill moves to book daily, the data sitting moves after the span.
 - Scheduling runbook (#2088): the kill-switch drill commands use --book daily, run on the 2026-10-27 daily-book session.
+- Paper spec req 13 amendment (#1976): a spin-off child carries the parent's acquisition dates and the stored Form 8937 basis allocation; data-foundation plan T254 and paper plan T255 add the point-in-time store, the receipt's `explanation_json` terms and one child lot per parent lot.
+- health.last_ingests selects the latest run among an allow-list of the ingest's modes (`session`, `backfill`, `import`) instead of a deny-list, so a `repair`, `action_retract`, `holes`, `actions` or `retract` row is left out and never hides a failed nightly ingest's status.
+- Runbook: corporate-event halts before the automatic rules land (dividend on its pay date, split cash in lieu, ticker change): how to recognise, verify at Alpaca, and the only existing way out (#2183 #2184 #2185)
+- paper status: plain first line per book, ET times with UTC beside, 08:05 ET fills note, data-day label on next rebalance (#2201).
+- `health` and the Data health page lead with a one-line verdict computed from the report; the stale badge says when the gap is expected (#2202)
+- paper check/shakedown: plain lines by default, --verbose restores the auditor detail; no-span shakedown says how to open one (#2204)
+- Docs: scheduling.md alert table complete (all ALERT_KINDS); data-releases.md rewritten for the store-backed release commands; new window-restart.md and key-rotation.md runbooks (#2205).
+- Operations page: stale badge explained; Reconciliation card lists dividends, ticker changes and unexplained items instead of raw JSON (#2206).
+- ADR 0018 gains a dated amendment: a kill on a locked store waits up to store.writer_lock_retry_seconds, then exits 3 with NOT engaged, not 5/409 (#2226).
 
 ### Fixed
 - `adjusted_prices_as_of(include_dividends=True)` no longer sizes a dividend against a prior close more than `adjust.max_prior_close_gap_sessions` XNYS sessions before its ex-date (default 5); such a dividend is left unapplied instead of mis-sized or failing the query, and the new `dropped_dividends_as_of` lists it (`stale_prior_bar`, `no_prior_bar` or `outside_calendar_range`) for health; `calendar.all_sessions` added (#72).
@@ -967,6 +986,23 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Count late and unvalued spin-offs on a held predecessor through the live chain terminal, with cycle and store-provider tests (#2083).
 - Trading retries now wait 1, 2 and 4 seconds by default before reattempting, while duplicate order read-back remains intact (#2094).
 - Paper status alert lines now show IDs for shakedown-note (#2097).
+- A delisted holding the broker removes before paying no longer halts the book on cash: a tagged credit within risk.reconcile_merger_lag_sessions sessions (capped by risk.delisting_cash_max_premium) books as proceeds; overdue shows in paper status (#411).
+- sweep register now applies hypothesis.long_short_refusal to every variant's frozen set before any write, so a long/short sweep at 0 bp borrow is refused by name (#2051 item 1).
+- Store backup writes the WAL beside its copy; release runbooks use verified backups and printed restore paths.
+- A malformed sell decision now shows the Trades page's unreadable panel (JournalIntegrityError, not a bare ValueError); exit rows show a dash for signal rank; hero bar labels are shorter (ticker, side, order-id suffix).
+- docs(runbooks): data-releases.md says how to restore a legacy release copy with no manifest (skip the wal_bytes check; confirm no <copy>.wal, open it read-only once, restore without a WAL), and the example entry's backup_path now uses the printed .bak-<stamp> form (#2144)
+- adapters: a negative-quantity partial_fill row from Alpaca paper (a correction 2 ms after a fractional fill) is folded into the same order's earlier fill at the same price; it halted book daily on 2026-10-21 (#2149)
+- execution: settle halts on a changed known fill before writing; Alpaca corrections must match symbol and side (#2153)
+- Paper commands now migrate or refuse older stores before any journal write or broker call (#2158).
+- The Alpaca adapter's `fills()` accepts the `sell_short` activity side (#2163); a cover is a plain `buy`, and any other side string still faults.
+- A stale short in a long/short backtest now pays borrow through the deciding rebalance, not only its last bar (#2169).
+- Scheduled writers out-wait a long store reader, and a locked paper kill says plainly it is NOT engaged (#2178).
+- The paper heartbeat stays red while a book's kill switch is engaged until resume, instead of recovering the day after a halt (#2179).
+- tradepartner ingest no longer skips the Alpaca price source after an EDGAR failure; the exit code and heartbeat still report the failure (#2180)
+- paper collect: the fill read's lower bound now also reaches back to the broker's own `submitted_at` of the orders it collects, so a Mac clock running ahead of Alpaca's no longer hides a run's fills (#2186).
+- paper resume, reconcile and abandon refuse a broker on another account before writing any broker-derived row (#2187)
+- The lot ledger's current set is scoped by book, so two books no longer overwrite each other's set; paper lots-reconcile reads the configured paper.book_id's set (#2190).
+- Paper settle includes fills timestamped by the broker before our pending stamp, bounded by the window start (#2216).
 
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.
