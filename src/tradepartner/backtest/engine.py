@@ -36,8 +36,9 @@ starts at the earliest held formation anchor or stale-exit window.
   not marked.
 - *Stale*: otherwise, no bar in the marking frame on the last
   `backtest.stale_exit_sessions` sessions through T_{i+1}; sold at its last bar's close.
-  A stale short keeps paying borrow on its last mark through T_{i+1}, the rebalance that
-  decides the cover (spec amendment 2026-10-25, #2169).
+  A stale short leaves the book, equity, exposure and drift test at its last bar, but
+  item 6's borrow sum keeps |last value| from there through T_{i+1}, the rebalance that
+  decides the cover, in every book at its own rate (spec amendment 2026-10-25, #2169).
 
 The sale is booked at that session, or at F_i when the session is earlier (the step
 that read the exit is the first that can book it; the name's value was frozen at that

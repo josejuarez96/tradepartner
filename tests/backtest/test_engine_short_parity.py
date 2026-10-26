@@ -295,6 +295,36 @@ def test_stale_forced_cover_at_last_mark_with_borrow(monkeypatch: pytest.MonkeyP
     assert summary.gross_max == pytest.approx(110_000 / 89_980)
 
 
+def test_stale_tail_borrow_on_sensitivity_series(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stale tail (spec amendment #2169) is charged in every book at its own rate.
+
+    The same fixture as above, headline 360 bp with sensitivity 0 and 720 bp. Cover cash,
+    price and exposure are rate-independent: the cover is 60,000 at Feb 6.
+    0 bp: no fee, equity 100,000 - 10,000 (A and B marks net) -> 90,000 from Feb 6 on.
+    720 bp ($12 a day per 60,000): through Feb 6 fees 10 + 30 + 12 = 52, equity
+      90,000 - 52 = 89,948; tail 23 days (Feb 6 -> Feb 29) * 12 = 276; T1 89,672.
+    Headline: tail 138 as above.
+    """
+    bars = test_engine_short._bars({"A": [(H, 100.0)], "B": [(H, 100.0), (FEB5, 120.0)]}).filter(
+        ~((pl.col("security_id") == "B") & (pl.col("session") > FEB6))
+    )
+    result = _go(
+        monkeypatch,
+        {T0: {"A": 0.5, "B": -0.5}},
+        bars,
+        _params(borrow=360.0, sensitivity=(0.0, 720.0)),
+        T1,
+    )
+    zero = _series(result, "strategy_borrow_0bp")
+    double = _series(result, "strategy_borrow_720bp")
+    assert zero[FEB6] == pytest.approx(90_000.0)
+    assert zero[T1] == pytest.approx(90_000.0, abs=1e-9)
+    assert double[FEB6] == pytest.approx(89_948.0, abs=1e-9)
+    assert double[T1] == pytest.approx(89_948.0 - 276.0, abs=1e-9)
+    assert test_engine_short._equity(result)[T1] == pytest.approx(89_836.0, abs=1e-9)
+    assert test_engine_short._cash(result)[FEB6] == pytest.approx(39_974.0, abs=1e-9)
+
+
 # --- #2152 quant-auditor follow-up: a halt that resumes after the step ends -----------------
 
 
