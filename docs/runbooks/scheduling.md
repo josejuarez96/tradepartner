@@ -12,7 +12,7 @@ Once a day, `tradepartner ingest` brings the store up to the **expected session*
 - On a weekend or holiday it re-reads the last session and usually writes little beyond its run rows. EDGAR accepts filings on some market holidays, and late price revisions can land on any day.
 - A run the next morning (after a missed evening, see "Sleep versus power-off") still targets the previous session.
 
-Sources run in order, `edgar` then `alpaca`, and **the run stops at the first source that is not `ok`**. Each source that runs writes one `ingestion_runs` row, with `mode = 'session'`, except when the store is locked: a locked source writes no row, and neither does a failed source whose row write is itself locked. So a failed evening can leave both rows, only an `edgar` row, or none. The command prints one line per source and exits with:
+Sources run in order, `edgar` then `alpaca`, and **every source runs even when an earlier one failed** (#2180): an EDGAR outage does not stop that evening's prices, and the run exits `1` if any source was not `ok`. Only a locked store ends the run early. Each source that runs writes one `ingestion_runs` row, with `mode = 'session'`, except when the store is locked: a locked source writes no row, and neither does a failed source whose row write is itself locked. So a failed evening can leave both rows, only an `edgar` row, or none. The command prints one line per source and exits with:
 - `0`: every source is `ok`.
 - `1`: a source was stale or failed, or the store was locked.
 - `2`: a configuration error before any work, such as a missing `SEC_EDGAR_USER_AGENT` or Alpaca key. The error names the variable and never prints its value.
