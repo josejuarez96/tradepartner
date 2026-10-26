@@ -983,6 +983,286 @@ def test_an_edgar_only_failure_still_ingests_prices(
     ]
 
 
+@pytest.mark.parametrize(
+    ("listing_day", "edgar_fails", "backfill"),
+    [
+        (date(2019, 7, 1), True, True),
+        (date(2019, 7, 2), True, False),
+        (date(2019, 7, 1), False, False),
+    ],
+)
+def test_edgar_gap_backfills_only_names_listed_on_the_missed_session(
+    settings: Settings,
+    read: Callable[[str], list[tuple[Any, ...]]],
+    listing_day: date,
+    edgar_fails: bool,
+    backfill: bool,
+) -> None:
+    """A recovered master fills only the failed evening's eligible new names."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    x = "0000000003"
+    accession = f"{x}-19-000001"
+    accepted = _at(listing_day.year, listing_day.month, listing_day.day)
+    new_filing = _new_gap_filing(x, accession, accepted)
+    first_day = date(2019, 7, 1)
+    second_day = date(2019, 7, 2)
+    first_at = datetime(2019, 7, 2, 2, tzinfo=UTC)
+    second_at = datetime(2019, 7, 3, 2, tzinfo=UTC)
+    assert _run(settings).ok
+    first_prices = _Prices()
+    first = _run(
+        settings,
+        first_prices,
+        now=first_at,
+        filings=_filings(cls=Broken) if edgar_fails else _filings(**new_filing),
+    )
+    assert first.runs[-1].status == OK
+    assert (("bars", tuple(sorted((*IDS, x))), first_day, first_day) in first_prices.calls) == (
+        not edgar_fails
+    )
+
+    second_prices = _Prices()
+    assert _run(settings, second_prices, now=second_at, filings=_filings(**new_filing)).ok
+    assert (("bars", (x,), first_day, first_day) in second_prices.calls) == backfill
+    assert ("bars", tuple(sorted((*IDS, x))), second_day, second_day) in second_prices.calls
+    rows = read(
+        f"SELECT session, known_at FROM prices_daily WHERE security_id='{x}' ORDER BY session"
+    )
+    expected = [first_day, second_day] if backfill or not edgar_fails else [second_day]
+    assert [day for day, _ in rows] == expected
+    if backfill:
+        assert rows[0][1] == second_at
+
+
+def _new_gap_filing(x: str, accession: str, accepted: datetime) -> dict[str, Any]:
+    """A new listed common name first discoverable on `accepted`'s session."""
+    return {
+        "extra_index": [FilingIndexEntry(x, "New Corp", "10-K", accession, accepted)],
+        "extra_covers": [
+            CoverPage(x, accession, accepted, (CoverListing("Common Stock", "NEW", "NYSE"),))
+        ],
+        "extra_headers": [FilingHeader(x, accession, "10-K", 3571, accepted)],
+    }
+
+
+def test_edgar_gap_fetch_failure_does_not_fail_todays_prices(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """The extra gap request may fail without rolling back today's bars."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    class GapError(_Prices):
+        def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+            if start == date(2019, 7, 1) and end == start:
+                raise RuntimeError("gap endpoint down")
+            return super().bars(security_ids, start, end)
+
+    x = "0000000003"
+    first = date(2019, 7, 1)
+    second = date(2019, 7, 2)
+    assert _run(settings).ok
+    assert (
+        _run(settings, now=datetime(2019, 7, 2, 2, tzinfo=UTC), filings=_filings(cls=Broken))
+        .runs[-1]
+        .status
+        == OK
+    )
+    filings = _filings(**_new_gap_filing(x, f"{x}-19-000001", _at(2019, 7, 1)))
+    recovered = _run(settings, GapError(), now=datetime(2019, 7, 3, 2, tzinfo=UTC), filings=filings)
+    assert recovered.ok
+    assert "edgar-gap backfill skipped 2019-07-01: RuntimeError" in recovered.runs[-1].message
+    assert read(f"SELECT session FROM prices_daily WHERE security_id='{x}'") == [(second,)]
+    retry = _Prices()
+    assert _run(settings, retry, now=datetime(2019, 7, 4, 2, tzinfo=UTC), filings=filings).ok
+    assert ("bars", (x,), first, first) in retry.calls
+
+
+def test_edgar_gap_missing_bar_is_attempted_once_and_expires(
+    settings: Settings,
+) -> None:
+    """A name Alpaca never traded cannot pin subsequent daily requests."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    x = "0000000003"
+    first = date(2019, 7, 1)
+    settings = settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"max_missing_share": 1.0})}
+    )
+    assert _run(settings).ok
+    assert (
+        _run(settings, now=datetime(2019, 7, 2, 2, tzinfo=UTC), filings=_filings(cls=Broken))
+        .runs[-1]
+        .status
+        == OK
+    )
+    filings = _filings(**_new_gap_filing(x, f"{x}-19-000001", _at(2019, 7, 1)))
+    for day in (2, 3, 5, 8, 9, 10):
+        prices = _Prices(missing={x})
+        result = _run(
+            settings, prices, now=datetime(2019, 7, day + 1, 2, tzinfo=UTC), filings=filings
+        )
+        assert result.ok
+        assert (("bars", (x,), first, first) in prices.calls) == (day == 2)
+        assert (
+            "actions",
+            tuple(sorted((*IDS, x))),
+            date(2019, 7, 1),
+            date(2019, 7, day),
+        ) in prices.calls
+        if day == 10:
+            assert "edgar-gap expired 2019-07-01" in result.runs[-1].message
+
+
+def test_edgar_gap_fetches_actions_for_name_delisted_before_recovery(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """A gap day's split is retained for a name no longer in today's fetch set."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    x = "0000000003"
+    gap = date(2019, 7, 1)
+    assert _run(settings).ok
+    assert (
+        _run(settings, now=datetime(2019, 7, 2, 2, tzinfo=UTC), filings=_filings(cls=Broken))
+        .runs[-1]
+        .status
+        == OK
+    )
+    records = _new_gap_filing(x, f"{x}-19-000001", _at(2019, 7, 1))
+    records["delistings"] = [
+        DelistingFiling(x, "25", "Common Stock", "NYSE", f"{x}-19-000025", _at(2019, 7, 2), gap)
+    ]
+    action = CorporateAction(
+        x, ActionType.SPLIT, gap, 2.0, action_first_seen_known_at(gap), "alpaca"
+    )
+    prices = _Prices(actions=[action])
+    result = _run(
+        settings, prices, now=datetime(2019, 7, 3, 2, tzinfo=UTC), filings=_filings(**records)
+    )
+    assert result.ok
+    assert ("bars", (x,), gap, gap) in prices.calls
+    assert (
+        "actions",
+        tuple(sorted((*IDS, x))),
+        gap,
+        date(2019, 7, 2),
+    ) in prices.calls
+    assert ("bars", tuple(sorted(IDS)), date(2019, 7, 2), date(2019, 7, 2)) in prices.calls
+    assert read(f"SELECT session FROM prices_daily WHERE security_id='{x}'") == [(gap,)]
+    assert read(f"SELECT action_type FROM corporate_actions WHERE security_id='{x}'") == [
+        ("split",)
+    ]
+
+
+def test_edgar_gap_process_date_action_is_written_once_with_todays_bars(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """An action processed on the gap day may have a later ex-date."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    class ProcessDatePrices(_Prices):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            self.calls.append(("actions", tuple(security_ids), start, end))
+            lag = timedelta(days=settings.alpaca.actions_process_lag_days)
+            return [action] if x in security_ids and start - lag <= gap <= end + lag else []
+
+    x = "0000000003"
+    gap = date(2019, 7, 1)
+    today = date(2019, 7, 2)
+    action = CorporateAction(
+        x,
+        ActionType.DIVIDEND,
+        today,
+        0.10,
+        action_first_seen_known_at(today),
+        "alpaca",
+        source_action_id="gap-dividend",
+    )
+    assert _run(settings).ok
+    assert (
+        _run(settings, now=datetime(2019, 7, 2, 2, tzinfo=UTC), filings=_filings(cls=Broken))
+        .runs[-1]
+        .status
+        == OK
+    )
+    filings = _filings(**_new_gap_filing(x, f"{x}-19-000001", _at(2019, 7, 1)))
+    prices = ProcessDatePrices()
+    assert _run(settings, prices, now=datetime(2019, 7, 3, 2, tzinfo=UTC), filings=filings).ok
+    assert (
+        "actions",
+        tuple(sorted((*IDS, x))),
+        gap,
+        today,
+    ) in prices.calls
+    assert ("bars", (x,), gap, gap) in prices.calls
+    assert read("SELECT count(*) FROM prices_daily WHERE session='2019-07-02'") == [(5,)]
+    assert read(f"SELECT count(*) FROM corporate_actions WHERE security_id='{x}'") == [(1,)]
+    assert _run(
+        settings, ProcessDatePrices(), now=datetime(2019, 7, 4, 2, tzinfo=UTC), filings=filings
+    ).ok
+    assert read(f"SELECT count(*) FROM corporate_actions WHERE security_id='{x}'") == [(1,)]
+
+
+def test_edgar_gap_write_error_falls_back_to_daily_prices(
+    settings: Settings,
+    read: Callable[[str], list[tuple[Any, ...]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recovered action write error rolls back and retries today's chunk."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    x = "0000000003"
+    gap = date(2019, 7, 1)
+    assert _run(settings).ok
+    assert (
+        _run(settings, now=datetime(2019, 7, 2, 2, tzinfo=UTC), filings=_filings(cls=Broken))
+        .runs[-1]
+        .status
+        == OK
+    )
+    filings = _filings(**_new_gap_filing(x, f"{x}-19-000001", _at(2019, 7, 1)))
+    original = ingest_module._add_actions
+    calls = [0]
+
+    def fail_once(*args: Any, **kwargs: Any) -> int:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise ValueError("gap action write")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ingest_module, "_add_actions", fail_once)
+    result = _run(settings, now=datetime(2019, 7, 3, 2, tzinfo=UTC), filings=filings)
+    assert result.ok
+    assert "edgar-gap backfill skipped 2019-07-01: ValueError" in result.runs[-1].message
+    assert read("SELECT count(*) FROM prices_daily WHERE session='2019-07-02'") == [(5,)]
+    assert read(f"SELECT session FROM prices_daily WHERE security_id='{x}'") == [
+        (date(2019, 7, 2),)
+    ]
+    assert _run(settings, now=datetime(2019, 7, 4, 2, tzinfo=UTC), filings=filings).ok
+    assert (gap,) in read(f"SELECT session FROM prices_daily WHERE security_id='{x}'")
+
+
 def test_one_source_only(settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]) -> None:
     result = _run(settings, source="edgar")
     assert [r.source for r in result.runs] == ["edgar"]

@@ -266,6 +266,8 @@ class IngestConfig(_ClosedConfig):
 
     settle_delay_minutes: int = 60
     reference_symbol: str = "SPY"
+    # #2196: search only this many prior XNYS sessions for EDGAR-gap bars.
+    edgar_gap_lookback_sessions: int = Field(default=5, ge=0, le=20)
     # Spec default, unmeasured. On SIP history a listed name should lack a bar only on a
     # halt or suspension; measure over ~20 real sessions and tighten (T3, #86).
     max_missing_share: float = 0.05

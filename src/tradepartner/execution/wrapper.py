@@ -143,7 +143,9 @@ falling back to `settings.costs`. Each phase, in order:
 
 1. its open decisions (`reattempts.attempt_scope`); a phase with none stops here;
 2. the derived switch, after `switch.engage_from_overrides`: engaged ends the
-   batch `skipped_kill_switch`, nothing written, nothing submitted;
+   batch `skipped_kill_switch`, nothing written, nothing submitted (read again
+   before every submit, step 8: a mid-phase kill keeps what was already sent and
+   closes the phase's unsent orders `not_received`; #2182);
 3. the clock pre-check; a name with no listing at close(S-1) refused
    (`ValueError`) before any broker call; the phase's `assets` read;
 4. the orders: `phases.sell_orders`, or, for buys, `phases.buy_orders` over the
@@ -164,7 +166,10 @@ falling back to `settings.costs`. Each phase, in order:
 7. one write chunk: the phase-time `skipped` rows, then the `orders` rows
    (`sells_in_flight_at_submit` true on a sell, `not last` on a buy) and their
    `pending` events, committed before the first submit;
-8. each submit, then `get_order` every `paper.poll_interval_seconds` until the
+8. before each submit, the derived switch read again (engaged: the unsent
+   orders closed `not_received`, the batch `skipped_kill_switch`, #2182) and
+   then, last, the submit-window test (closed: the same close, #2178); then each
+   submit, then `get_order` every `paper.poll_interval_seconds` until the
    broker knows the order (`UnknownOrderError` meanwhile is "not yet") or
    `paper.accept_wait_max_seconds` passes; the `accepted` event carries the
    broker's order id. The first order of a run past that bound is journaled
@@ -644,6 +649,7 @@ class RiskGatedBroker:
         #: window closed: every later submit, in either phase, re-runs the clock
         #: pre-check and the window test first (reset by `_trade`).
         self._recheck: bool = False
+        self._killed: bool = False
 
     def __repr__(self) -> str:
         return f"RiskGatedBroker(broker={type(self._broker).__name__})"
@@ -784,6 +790,7 @@ class RiskGatedBroker:
         rows = [*decisions, *forced_exits]
         self._set_aside = set()
         self._recheck = False
+        self._killed = False
         # The batch holds these rebalances: a halt in either phase marks them
         # `missed` (ADR 0010 point 2), whichever decisions that phase held.
         rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
@@ -857,8 +864,11 @@ class RiskGatedBroker:
                 len(decisions),
                 frozenset(book.ledger.positions),
                 book.last_ok_ingest,
+                window=book.window,
             )
             skips, counted = (*skips, *refused), counted + len(refused)
+            if self._killed:
+                return BatchOutcome(_SKIPPED_KILL_SWITCH, tuple(submitted), skips)
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
                 self._await_sells(run, [row for row, _ in gated.to_submit], book, notes)
         if not any(d.side == _BUY for d in decisions):
@@ -952,6 +962,7 @@ class RiskGatedBroker:
             plan_decisions,
             frozenset(book.ledger.positions),
             book.last_ok_ingest,
+            window=book.window,
         )
         refused_ids = {s.decision_id for s in refused}
         collected_written_off = self._collect(
@@ -971,23 +982,42 @@ class RiskGatedBroker:
             sorted(
                 {
                     *collected_written_off,
+                    # A mid-phase kill leaves the phase incomplete: deferred buys
+                    # stay open for the next run, never written off `unfunded`.
                     *self._write_offs(
-                        run, rows, after, scope.last, completed=True, deferred=built.deferred
+                        run,
+                        rows,
+                        after,
+                        scope.last,
+                        completed=not self._killed,
+                        deferred=built.deferred,
                     ),
                 }
             )
         )
+        # Only orders actually sent count as spent: a refusal, or an order closed
+        # `not_received` unsent (a mid-phase kill or a closed window), spent nothing.
+        sent = set(submitted)
+        sent_decisions = {
+            row.decision_id for row, request in gated.to_submit if request.client_order_id in sent
+        }
         spent = sum(
             (
                 _buy_cash(o.notional, o.quantity, o.price, o.whole_share, self._frozen, costs)
                 for o in gated.left
-                if o.decision_id not in refused_ids
+                if o.decision_id in sent_decisions
             ),
             Decimal(0),
         )
         left = float(max(Decimal(repr(cash)) - spent, Decimal(0)))
         return BatchOutcome(
-            _OK, tuple(submitted), (*gated.skips, *refused), built.deferred, written, cash, left
+            _SKIPPED_KILL_SWITCH if self._killed else _OK,
+            tuple(submitted),
+            (*gated.skips, *refused),
+            built.deferred,
+            written,
+            cash,
+            left,
         )
 
     def _buys_cash(self, account: Account, book: _Book, session: date) -> float:
@@ -1432,6 +1462,8 @@ class RiskGatedBroker:
         plan_decisions: int,
         held: Collection[str] = (),
         last_ok_ingest: datetime | None = None,
+        *,
+        window: PaperWindowRow,
     ) -> tuple[list[str], list[Skip]]:
         """Submit each journaled request in order and await its acknowledgement;
         `submit`'s `Order` passes the shape check after the acknowledgement's
@@ -1453,9 +1485,18 @@ class RiskGatedBroker:
                 # After the longer poll: the clock pre-check runs again before
                 # the next submit (item 4 (a)).
                 self.clock_precheck(run.session, last_ok_ingest)
-            # Before EVERY submit, not only after a longer poll: a store lock wait
-            # (`store.writer_lock_retry_seconds`) may have run the clock past the
-            # window, and nothing is sent outside it (#2178).
+            # The switch is re-read before EVERY submit (#2182, owner decision
+            # 2026-10-26): an owner kill mid-phase stops the phase's remaining
+            # orders (closed `not_received`) and the batch ends
+            # `skipped_kill_switch`, never `ok`.
+            if self._engaged(run, window):
+                self._killed = True
+                self._close_unsent(run, [r for r, _ in pairs[index:]])
+                break
+            # The window test comes last, right before `submit`: a store lock wait
+            # (`store.writer_lock_retry_seconds`), the switch read's included, may
+            # have run the clock past the window, and nothing is sent outside it
+            # (#2178).
             if not self._in_submit_window(run.session):
                 self._close_unsent(run, [r for r, _ in pairs[index:]])
                 break
