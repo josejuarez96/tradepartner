@@ -8,8 +8,8 @@ for the whole window, never one per name.
 - **Value** and **quantity** are the latest marked session's `positions_daily`
   row (the ledger's split-adjusted holding at that session's close).
 - **Cost basis** is the sum over the name's open lots of what `lots.rebuild`
-  holds, first in, first out: each lot's basis less the basis its disposals
-  closed (`proceeds - realised_pnl`). The rebuild is stated `through` the marked
+  holds, first in, first out: `lots.open_lots` reports each lot's open basis as
+  the ledger holds it (#2247). The rebuild is stated `through` the marked
   session and over the fills filled by that session's close only, so a lot
   opened after the session is never counted, and it reads splits and the other
   adjustments, so a name that split between the buy and the mark is read in
@@ -22,6 +22,9 @@ for the whole window, never one per name.
   no prior mark, such as one bought today). It applies the move to today's
   whole quantity, shares bought today included, and divides the prior price by
   a split between the two sessions.
+- A name whose open lots hold a different quantity than the mark (beyond
+  `risk.reconcile_quantity_tolerance`) shows `QUANTITY_NOTE` with its value and
+  no gain or change, and is left out of the rankings.
 - A mark with no price (`mark_price` None) is shown as "no price yet" with no
   value, gain or change, and is left out of the up and down counts and the
   rankings, never counted as zero.
@@ -32,7 +35,6 @@ Tickers are the order's broker symbol, else a listing's through
 
 from __future__ import annotations
 
-import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -43,7 +45,8 @@ import duckdb
 import polars as pl
 
 from tradepartner.calendar import previous_session, session_close
-from tradepartner.execution.lots import SHORT, LedgerAccount, rebuild
+from tradepartner.config import RiskConfig
+from tradepartner.execution.lots import SHORT, LedgerAccount, open_lots
 from tradepartner.execution.symbols import broker_symbol
 from tradepartner.store import journal
 from tradepartner.store.asof import live_actions_as_of
@@ -52,6 +55,8 @@ from tradepartner.store.schema import LONG
 
 #: What a priced-less holding shows in place of a number.
 NO_PRICE_NOTE = "no price yet"
+#: Shown when the open lots and the mark disagree on the quantity held.
+QUANTITY_NOTE = "lots do not match the holding"
 #: Shown for a name whose ticker is unknown; the security id is never shown.
 UNKNOWN_TICKER = "unknown"
 _ACCOUNT = LedgerAccount(account_id="book", account_type="paper", owner="self")
@@ -127,6 +132,7 @@ def build_holdings(
     actions: pl.DataFrame | None = None,
     tickers: Mapping[str, str] | None = None,
     top_n: int = 5,
+    quantity_tolerance: float | None = None,
 ) -> Holdings:
     """The holdings at the latest marked session on or before `as_of` (module
     docstring). `actions` is the `live_actions_as_of(close(S-1))` frame, the
@@ -143,7 +149,7 @@ def build_holdings(
 
     cutoff = session_close(session)
     seen = [f for f in fills if f.fill.filled_at <= cutoff]
-    lots, disposals, _ = rebuild(
+    held = open_lots(
         seen,
         orders,
         {},
@@ -153,14 +159,16 @@ def build_holdings(
         through=session,
         symbols=names,
     )
-    closed: dict[int, list[float]] = defaultdict(list)
-    for d in disposals:
-        closed[d.lot_id].append(d.proceeds - d.realised_pnl)
-    open_basis: dict[tuple[str, str], list[float]] = defaultdict(list)
-    for lot in lots:
-        open_basis[(lot.security_id, lot.position_side)].extend(
-            [lot.cost_basis, *(-c for c in closed.get(lot.lot_id, []))]
-        )
+    open_basis: dict[tuple[str, str], float] = defaultdict(float)
+    open_quantity: dict[tuple[str, str], float] = defaultdict(float)
+    for lot in held:
+        open_basis[(lot.security_id, lot.position_side)] += lot.basis
+        open_quantity[(lot.security_id, lot.position_side)] += lot.quantity
+    tolerance = (
+        RiskConfig().reconcile_quantity_tolerance
+        if quantity_tolerance is None
+        else quantity_tolerance
+    )
 
     prior_price: dict[tuple[str, str], float | None] = {
         (m.security_id, m.position_side): _in_todays_units(
@@ -170,7 +178,11 @@ def build_holdings(
         if m.session == prior_session and m.security_id is not None
     }
     today = [m for m in marks if m.session == session and m.security_id is not None]
-    rows = [_row(m, names, open_basis, prior_price) for m in today if m.quantity != 0]
+    rows = [
+        _row(m, names, open_basis, open_quantity, tolerance, prior_price)
+        for m in today
+        if m.quantity != 0
+    ]
     rows.sort(key=lambda r: (r.value is None, -(r.value or 0.0), r.ticker))
     cash = next((m.cash for m in marks if m.session == session and m.cash is not None), None)
     return Holdings(session, tuple(rows), _summary(rows, cash, top_n))
@@ -238,13 +250,16 @@ def read_holdings(
 def _row(
     mark: PositionDailyRow,
     names: Mapping[str, str],
-    open_basis: Mapping[tuple[str, str], list[float]],
+    open_basis: Mapping[tuple[str, str], float],
+    open_quantity: Mapping[tuple[str, str], float],
+    tolerance: float,
     prior_price: Mapping[tuple[str, str], float | None],
 ) -> HoldingRow:
     assert mark.security_id is not None
     short = mark.position_side == SHORT
     side = SHORT if short else LONG
-    raw = math.fsum(open_basis.get((mark.security_id, side), []))
+    key = (mark.security_id, side)
+    raw = open_basis.get(key, 0.0)
     basis = -raw if short else raw  # a short lot's basis is minus its sale's value
     quantity = abs(mark.quantity)
     ticker = names.get(mark.security_id, UNKNOWN_TICKER)
@@ -254,6 +269,11 @@ def _row(
             ticker, side, quantity, basis, None, None, None, None, None, NO_PRICE_NOTE
         )
     value = abs(mark.value)
+    if abs(open_quantity.get(key, 0.0) - quantity) > tolerance:
+        # The lots and the mark disagree on the shares held: no gain is stated.
+        return HoldingRow(
+            ticker, side, quantity, basis, value, None, None, None, None, QUANTITY_NOTE
+        )
     gain = basis - value if short else value - basis
     gain_percent = gain / basis * 100.0 if basis != 0 else None
     before = prior_price.get((mark.security_id, mark.position_side))

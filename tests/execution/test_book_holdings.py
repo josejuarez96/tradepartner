@@ -7,6 +7,7 @@ cases go through `read_holdings` on the fixture store.
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import UTC, date, datetime, timedelta
 from itertools import count
@@ -20,6 +21,7 @@ from tradepartner.config import Settings
 from tradepartner.execution import book_holdings
 from tradepartner.execution.book_holdings import (
     NO_PRICE_NOTE,
+    QUANTITY_NOTE,
     UNKNOWN_TICKER,
     HoldingRow,
     Holdings,
@@ -30,6 +32,7 @@ from tradepartner.execution.book_holdings import (
 from tradepartner.execution.lots import SHORT
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
+    AdjustmentRow,
     DecisionRow,
     FillRow,
     OrderedFill,
@@ -52,7 +55,7 @@ D0310 = date(2025, 3, 10)
 D0311 = date(2025, 3, 11)
 D0312 = date(2025, 3, 12)
 
-SYMBOLS = {"SEC_X": "XYZ", "SEC_Y": "YYY", "SEC_Z": "ZZZ"}
+SYMBOLS = {"SEC_X": "XYZ", "SEC_Y": "YYY", "SEC_Z": "ZZZ", "SEC_T": "TGT", "SEC_A": "ACQ"}
 
 
 def _at(day: date) -> datetime:
@@ -492,3 +495,74 @@ def test_read_holdings_on_the_full_window_fixture_is_within_the_timing_bound(
         elapsed = time.monotonic() - started
     assert out.summary.count == 150
     assert elapsed < fast.store.lock_retry_seconds / 2
+
+
+def test_a_merger_boot_is_not_taken_off_the_basis_twice() -> None:
+    """quant-auditor's case: target lots 4 and 6 at 20; cash 60 and four
+    acquirer shares at 60. The ledger holds basis 64 + 96 = 160 in 4 shares;
+    marked at 50, value 200, gain 40 (25%). Subtracting the disposals again
+    gave a basis of 120."""
+    book = Book()
+    book.trade("buy", 4, 20.0, D0303, security_id="SEC_T")
+    book.trade("buy", 6, 20.0, D0304, security_id="SEC_T")
+    terms = {
+        "merger_id": "m1",
+        "merger_kind": "stock_and_cash",
+        "acquirer_security_id": "SEC_A",
+        "share_ratio": 0.4,
+        "acquirer_price": 60.0,
+        "fractional_shares": 0.0,
+    }
+    adjustments = [
+        _adjustment(1, "corporate_action_cash", "SEC_T", -10.0, 60.0, terms),
+        _adjustment(2, "merger_receipt", "SEC_A", 4.0, None, {"merger_id": "m1"}),
+    ]
+    out = build_holdings(
+        book.fills,
+        book.orders,
+        adjustments,
+        [_mark(D0310, "SEC_A", 4, 50.0)],
+        D0310,
+        tickers={"SEC_A": "ACQ"},
+    )
+    row = _one(out, "ACQ")
+    assert row.cost_basis == pytest.approx(160.0)
+    assert row.gain == pytest.approx(40.0)
+    assert row.gain_percent == pytest.approx(25.0)
+
+
+def _adjustment(
+    n: int,
+    kind: str,
+    security_id: str,
+    quantity: float,
+    cash: float | None,
+    terms: dict[str, object],
+) -> AdjustmentRow:
+    known = session_close(D0307) + timedelta(minutes=30)
+    return AdjustmentRow(
+        adjustment_id=n,
+        window_id=1,
+        run_id=1,
+        session=D0307,
+        kind=kind,
+        security_id=security_id,
+        quantity=quantity,
+        cash=cash,
+        explanation_json=json.dumps(terms, sort_keys=True),
+        known_at=known,
+        ingested_at=known,
+    )
+
+
+def test_a_name_whose_lots_and_mark_disagree_on_quantity_is_flagged() -> None:
+    """The lots hold 10; the mark says 12. The row shows its value and the
+    note, no gain, and is in no ranking."""
+    book = Book()
+    book.trade("buy", 10, 100.0, D0303)
+    out = book.holdings([_mark(D0304, "SEC_X", 12, 100.0)], D0304)
+    row = _one(out, "XYZ")
+    assert row.note == QUANTITY_NOTE
+    assert (row.gain, row.gain_percent, row.change_today) == (None, None, None)
+    assert row.value == 1200.0
+    assert out.summary.best == out.summary.worst == out.summary.largest == ()

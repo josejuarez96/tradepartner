@@ -739,6 +739,28 @@ def _adjustment_key(row: AdjustmentRow) -> tuple[object, ...]:
     )
 
 
+def _run(
+    fills: Sequence[OrderedFill],
+    orders: Sequence[OrderRow],
+    assets: Mapping[str, Asset],
+    account: LedgerAccount,
+    adjustments: Sequence[AdjustmentRow],
+    actions: pl.DataFrame | None,
+    through: date | None,
+    symbols: Mapping[str, str] | None,
+) -> _Ledger:
+    for order in orders:
+        if order.position_side not in (LONG, SHORT):
+            raise LotLedgerError(
+                f"order {order.client_order_id!r} has position_side "
+                f"{order.position_side!r}: only 'long' and 'short' lots exist"
+            )
+    state = _Ledger(account, assets, symbols or {})
+    for _, event in sorted(_events(fills, orders, adjustments, actions, through), key=_by_key):
+        event(state)
+    return state
+
+
 def rebuild(
     fills: Sequence[OrderedFill],
     orders: Sequence[OrderRow],
@@ -771,15 +793,7 @@ def rebuild(
     must catch it and alert rather than fail its run. Also raises it on any
     order whose `position_side` is neither `schema.LONG` nor `SHORT`, and on
     a name that would be long and short at once (module docstring)."""
-    for order in orders:
-        if order.position_side not in (LONG, SHORT):
-            raise LotLedgerError(
-                f"order {order.client_order_id!r} has position_side "
-                f"{order.position_side!r}: only 'long' and 'short' lots exist"
-            )
-    state = _Ledger(account, assets, symbols or {})
-    for _, event in sorted(_events(fills, orders, adjustments, actions, through), key=_by_key):
-        event(state)
+    state = _run(fills, orders, assets, account, adjustments, actions, through, symbols)
     lot_list = [lot.to_lot(account) for lot in state.lots]
     return (
         lot_list,
@@ -1125,3 +1139,45 @@ def _fill_key(item: OrderedFill) -> int:
 def _dec(value: float) -> Fraction:
     """`value` as the exact `Fraction` of its shortest decimal form."""
     return Fraction(repr(float(value)))
+
+
+@dataclass(frozen=True)
+class OpenLot:
+    """What one lot still holds, as the ledger holds it (#2247): `quantity` in
+    today's share units, `basis` the open cost basis (negative for a short lot,
+    as `Lot.cost_basis` is), under the lot's current `security_id`."""
+
+    lot_id: int
+    security_id: str
+    position_side: str
+    quantity: float
+    basis: float
+
+
+def open_lots(
+    fills: Sequence[OrderedFill],
+    orders: Sequence[OrderRow],
+    assets: Mapping[str, Asset],
+    account: LedgerAccount,
+    *,
+    adjustments: Sequence[AdjustmentRow] = (),
+    actions: pl.DataFrame | None = None,
+    through: date | None = None,
+    symbols: Mapping[str, str] | None = None,
+) -> list[OpenLot]:
+    """The lots with shares still open after the same rebuild `rebuild` runs
+    (same arguments, same errors), read-only: the ledger's own running quantity
+    and basis, so a stock merger's boot or cash in lieu, which lowers a lot's
+    basis and records a disposal for it, is counted once."""
+    state = _run(fills, orders, assets, account, adjustments, actions, through, symbols)
+    return [
+        OpenLot(
+            lot_id=lot.lot_id,
+            security_id=lot.security_id,
+            position_side=lot.position_side,
+            quantity=float(lot.quantity),
+            basis=float(lot.basis),
+        )
+        for lot in state.lots
+        if lot.quantity > _ZERO
+    ]
