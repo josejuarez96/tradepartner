@@ -509,7 +509,7 @@ class SourceRun:
 
 @dataclass(frozen=True)
 class IngestResult:
-    """Every source attempted, in order; the run halted after a non-`ok` one."""
+    """Every source attempted, in order; every source runs, and the run is `ok` only if all were."""
 
     runs: tuple[SourceRun, ...]
 

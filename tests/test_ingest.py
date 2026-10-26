@@ -961,10 +961,26 @@ def test_an_edgar_only_failure_still_ingests_prices(
     assert _run(settings).ok
     broken = _filings(cls=Broken)
     prices = _Prices()
-    result = _run(settings, prices, filings=broken)
+    fetched: list[str] = []
+
+    def assets_fetch() -> Any:
+        fetched.append("assets")
+        raise AssertionError("assets snapshot must wait for every source ok")
+
+    rates = FixtureRateSource([])
+    result = _run(settings, prices, filings=broken, rates=rates, assets=assets_fetch)
     assert [(r.source, r.status) for r in result.runs] == [("edgar", FAILED), ("alpaca", OK)]
     assert prices.calls
     assert result.exit_code == 1
+    assert fetched == []  # rates and the assets snapshot were skipped
+    rows = read("SELECT source, status, mode FROM ingestion_runs ORDER BY source, status")
+    # the first (ok) run's two rows, then this evening's failed edgar and ok alpaca
+    assert rows == [
+        ("alpaca", OK, "session"),
+        ("alpaca", OK, "session"),
+        ("edgar", FAILED, "session"),
+        ("edgar", OK, "session"),
+    ]
 
 
 def test_one_source_only(settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]) -> None:
