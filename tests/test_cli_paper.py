@@ -1840,6 +1840,76 @@ def test_status_all_prints_one_summary_line_per_book(
     )
 
 
+def _overdue_delisting_rows(*, paid: bool = False) -> None:
+    """Window 1: ACA removed on 2026-10-01 with no cash; a reconciliation after the
+    window recorded `overdue delisting cash` for it (#411); `paid` adds the late cash."""
+    at = datetime(2026, 10, 9, 14, tzinfo=UTC)
+    allowed = [{"reason": "overdue delisting cash", "difference": 3.356, "security_id": "ACA"}]
+    with open_for_write(_settings()) as conn:
+        journal.append(
+            conn,
+            journal.AdjustmentRow(
+                window_id=1,
+                session=date(2026, 10, 1),
+                kind="corporate_action_cash",
+                security_id="ACA",
+                quantity=-3.356,
+                cash=0.0,
+                explanation_json=json.dumps({"explanation": "listing ended"}),
+                known_at=at,
+                ingested_at=at,
+            ),
+        )
+        if paid:
+            journal.append(
+                conn,
+                journal.AdjustmentRow(
+                    window_id=1,
+                    session=date(2026, 10, 10),
+                    kind="corporate_action_cash",
+                    security_id="ACA",
+                    cash=100.0,
+                    explanation_json=json.dumps({"delisting_cash": True}),
+                    known_at=at,
+                    ingested_at=at,
+                ),
+            )
+        journal.append(
+            conn,
+            journal.ReconciliationRow(
+                window_id=1,
+                at=at,
+                status="ok",
+                broker_cash=1.0,
+                mismatches_json=json.dumps({"mismatches": [], "allowed": allowed}),
+                known_at=at,
+                ingested_at=at,
+            ),
+        )
+
+
+_OVERDUE_LINE = "ACA: delisting cash overdue since 2026-10-01 \u2014 check Alpaca's activity"
+
+
+@pytest.mark.usefixtures("started")
+def test_status_shows_a_delisting_whose_cash_is_overdue(clock: _Clock, factory: _Factory) -> None:
+    _overdue_delisting_rows()
+    out = _paper(clock, factory, "status")
+    assert out.exit_code == 0, out.output
+    assert f"\n{_OVERDUE_LINE}\n" in out.output
+    all_books = _paper(clock, factory, "status", "--all")
+    assert all_books.exit_code == 0, all_books.output
+    assert f"book main; {_OVERDUE_LINE}\n" in all_books.output
+
+
+@pytest.mark.usefixtures("started")
+def test_status_drops_the_overdue_line_once_the_cash_is_booked(
+    clock: _Clock, factory: _Factory
+) -> None:
+    _overdue_delisting_rows(paid=True)
+    assert "delisting cash overdue" not in _paper(clock, factory, "status").output
+
+
 @pytest.mark.usefixtures("started")
 def test_status_all_lists_two_waiting_items_byte_for_byte(
     clock: _Clock, factory: _Factory, live: Path

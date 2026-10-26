@@ -1231,7 +1231,17 @@ def test_frozen_risk_reads_a_window_frozen_before_the_merger_lag_at_its_default(
     assert frozen_risk(_window_with(json.dumps(frozen))).reconcile_merger_lag_sessions == 2
 
 
-_BACK_FILLED = ("max_skip_share", "reconcile_merger_lag_sessions")
+def test_frozen_risk_reads_a_window_frozen_before_the_delisting_premium_at_its_default() -> None:
+    """#411: a window frozen before `risk.delisting_cash_max_premium` reads it at 0.10."""
+    values = _todays_risk_keys_without("delisting_cash_max_premium")
+    assert frozen_risk(_window_with(json.dumps(values))).delisting_cash_max_premium == 0.10
+
+
+_BACK_FILLED = (
+    "max_skip_share",
+    "reconcile_merger_lag_sessions",
+    "delisting_cash_max_premium",
+)
 
 
 @pytest.mark.parametrize(

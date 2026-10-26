@@ -1679,6 +1679,11 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
     return lines
 
 
+def _overdue_delisting_lines(items: Sequence[ops.OverdueDelisting]) -> list[str]:
+    """One line per book's overdue delisting cash after `paper status --all`'s rows (#411)."""
+    return [f"book {item.book_id}; {item.line}" for item in items]
+
+
 def _waiting_lines(items: Sequence[waiting.WaitingItem]) -> list[str]:
     """Format the owner queue after all `paper status --all` book lines."""
     if not items:
@@ -1726,6 +1731,7 @@ def _status_lines(
         "reconciliation "
         + ("n/a" if recon is None else f"{recon.reconciliation_id} {recon.status} at {recon.at}"),
         *paper_slippage.slippage_report_lines(fill_slippage),
+        *(item.line for item in data.overdue_delisting),
         f"alerts ({len(data.alerts)}{', capped' if data.alerts_capped else ''}):",
     ]
     lines += [f"  #{a.alert_id} {a.at} {a.kind} {a.session}: {a.message}" for a in data.alerts]
@@ -4568,7 +4574,12 @@ def make_app(
         if every_book:
 
             def read_all() -> (
-                tuple[tuple[ops.BookSummary, ...], tuple[waiting.WaitingItem, ...]] | str
+                tuple[
+                    tuple[ops.BookSummary, ...],
+                    tuple[waiting.WaitingItem, ...],
+                    tuple[ops.OverdueDelisting, ...],
+                ]
+                | str
             ):
                 with open_read_only(s) as conn:
                     try:
@@ -4576,7 +4587,7 @@ def make_app(
                         items = ops.waiting_on_owner(
                             conn, s, ensure_tz_aware_utc(clock(), field_name="clock()")
                         )
-                        return summaries, items
+                        return summaries, items, ops.overdue_delisting_cash(conn)
                     except schema.SchemaVersionError as exc:
                         return str(exc)
 
@@ -4584,8 +4595,10 @@ def make_app(
             if isinstance(result, str):  # the journal predates version 17
                 _echo_scrubbed(f"paper status: {result}", s)
                 raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
-            summaries, items = result
+            summaries, items, overdue = result
             for line in _summary_lines(summaries):
+                _echo_scrubbed(line, s)
+            for line in _overdue_delisting_lines(overdue):
                 _echo_scrubbed(line, s)
             for line in _waiting_lines(items):
                 _echo_scrubbed(line, s)
