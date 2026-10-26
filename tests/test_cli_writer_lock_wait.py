@@ -6,9 +6,9 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Any
 
 import duckdb
 import pytest
@@ -27,9 +27,6 @@ from test_cli_paper import (  # noqa: F401  (fixtures)
 
 from tradepartner import cli
 from tradepartner.config import StoreConfig
-from tradepartner.execution import run as paper_run
-from tradepartner.execution import window
-from tradepartner.store.db import StoreLockedError
 
 
 def _engaged_rows() -> int:
@@ -39,18 +36,19 @@ def _engaged_rows() -> int:
     return int(found[0])
 
 
-def _busy_timer_probes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An external writer owns the store when the timer's read-only check runs."""
-    real = cli.open_read_only
+def _connects_off_the_main_thread(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every store connection opened from any thread but the main one (#2200: a
+    second-thread probe made engage's write fail at once in the same process)."""
+    real = duckdb.connect
+    strays: list[str] = []
 
-    @contextmanager
-    def probe(settings: object) -> Iterator[object]:
+    def connect(*args: Any, **kwargs: Any) -> duckdb.DuckDBPyConnection:
         if threading.current_thread() is not threading.main_thread():
-            raise StoreLockedError("held in /tmp/other (PID 12345)")
-        with real(settings) as conn:  # type: ignore[arg-type]
-            yield conn
+            strays.append(threading.current_thread().name)
+        return real(*args, **kwargs)
 
-    monkeypatch.setattr(cli, "open_read_only", probe)
+    monkeypatch.setattr(duckdb, "connect", connect)
+    return strays
 
 
 @contextmanager
@@ -171,44 +169,54 @@ def test_paper_kill_that_cannot_get_the_store_says_not_engaged(
 
 
 @pytest.mark.usefixtures("books")
-def test_paper_kill_all_reports_a_wait_in_open_books_once_per_book(
+def test_paper_kill_all_reports_a_wait_in_open_books_once(
     monkeypatch: pytest.MonkeyPatch,
     clock: _Clock,  # noqa: F811
     books: object,  # noqa: F811
 ) -> None:
-    _busy_timer_probes(monkeypatch)
-    real_open_books = paper_run.open_books
-    real_kill = window.kill
-
-    def slow_open_books(*args: object) -> tuple[str, ...]:
-        time.sleep(0.2)
-        return real_open_books(*args)  # type: ignore[arg-type]
-
-    def slow_kill(*args: object, **kwargs: object) -> int:
-        time.sleep(0.2)
-        return real_kill(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(paper_run, "open_books", slow_open_books)
-    monkeypatch.setattr(window, "kill", slow_kill)
-    out = _paper(clock, books, "kill", "--all", "--reason", LONG_REASON)
+    """The listing's own first lock retry prints the waiting line; no other thread
+    opens the store."""
+    monkeypatch.setenv("STORE__LOCK_RETRY_SECONDS", "1")
+    monkeypatch.setenv("STORE__WRITER_LOCK_RETRY_SECONDS", "10")
+    strays = _connects_off_the_main_thread(monkeypatch)
+    with _writer_holds(_settings().store.path, seconds=1.5):
+        out = _paper(clock, books, "kill", "--all", "--reason", LONG_REASON)
     assert out.exit_code == 0, out.output
-    assert out.output.count("kill switch NOT engaged yet: store busy") == 2
+    assert out.output.count("kill switch NOT engaged yet: store busy (held by ") == 1
+    assert "waiting up to 10 s" in out.output
+    assert strays == []
 
 
 @pytest.mark.usefixtures("started")
-def test_paper_kill_reports_wait_when_engage_write_waits_after_probe(
+def test_paper_kill_reports_the_wait_from_the_stores_first_retry(
     monkeypatch: pytest.MonkeyPatch,
     clock: _Clock,  # noqa: F811
     factory: _Factory,  # noqa: F811
 ) -> None:
-    _busy_timer_probes(monkeypatch)
-    real_kill = window.kill
-
-    def slow_kill(*args: object, **kwargs: object) -> int:
-        time.sleep(0.2)
-        return real_kill(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(window, "kill", slow_kill)
-    out = _paper(clock, factory, "kill", "--reason", LONG_REASON)
+    """Another process's writer: one waiting line naming it, then engaged, and every
+    store connection on the main thread."""
+    monkeypatch.setenv("STORE__LOCK_RETRY_SECONDS", "1")
+    monkeypatch.setenv("STORE__WRITER_LOCK_RETRY_SECONDS", "10")
+    strays = _connects_off_the_main_thread(monkeypatch)
+    before = _engaged_rows()
+    with _writer_holds(_settings().store.path, seconds=1.5):
+        out = _paper(clock, factory, "kill", "--reason", LONG_REASON)
     assert out.exit_code == 0, out.output
-    assert out.output.count("kill switch NOT engaged yet: store busy") == 1
+    assert out.output.count("kill switch NOT engaged yet: store busy (held by ") == 1
+    assert ", pid " in out.output
+    assert strays == []
+    assert _engaged_rows() == before + 1
+
+
+def test_a_same_process_lock_reads_as_store_busy() -> None:
+    """`StoreSameProcessLockedError` folded into `WriteFailed` gets the plain wording."""
+    assert cli._STORE_LOCKED_RE.search(
+        "the kill switch row could not be written, so it is NOT engaged: "
+        "StoreSameProcessLockedError: 'x' is already open in this process"
+    )
+    assert cli._STORE_LOCKED_RE.search("NOT engaged: StoreLockedError: held in /x (PID 1)")
+    assert not cli._STORE_LOCKED_RE.search("NOT engaged: IOException: disk full")
+    assert (
+        cli._lock_holder("'x' is already open in this process in a different mode")
+        == "another connection in this process"
+    )

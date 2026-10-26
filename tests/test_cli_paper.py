@@ -1375,10 +1375,10 @@ def test_paper_kill_all_tries_every_book_after_one_fails(
 ) -> None:
     real = window.kill
 
-    def failing(*args: Any, book_id: str | None = None) -> int:
+    def failing(*args: Any, book_id: str | None = None, **kwargs: Any) -> int:
         if book_id == "main":
             raise window.KillWriteFailed("store gone")
-        return real(*args, book_id=book_id)
+        return real(*args, book_id=book_id, **kwargs)
 
     monkeypatch.setattr(window, "kill", failing)
     out = _paper(clock, books, "kill", "--all", "--reason", LONG_REASON)

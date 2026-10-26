@@ -982,8 +982,8 @@ def test_kill_reserves_the_configured_engage_wait_after_a_slow_lookup(
         return original(settings, *args, **kwargs)
 
     @contextmanager
-    def slow_read(settings: Settings, *, retry: bool = False) -> Any:
-        with real_open(settings, retry=retry) as conn:
+    def slow_read(settings: Settings, *, retry: bool = False, on_wait: Any = None) -> Any:
+        with real_open(settings, retry=retry, on_wait=on_wait) as conn:
             time.sleep(2.1)
             yield conn
 

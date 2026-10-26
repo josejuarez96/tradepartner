@@ -1509,6 +1509,7 @@ def kill(
     reason: str,
     *,
     book_id: str | None = None,
+    on_wait: Callable[[str], None] | None = None,
 ) -> int:
     """`paper kill --book <book> --reason` (module docstring; `book_id` defaults
     to `paper.book_id`): the `engaged` row's `event_id`, on the book's open window
@@ -1518,7 +1519,8 @@ def kill(
     nothing is written for any of these), `ValueError` for a book outside the
     token grammar, and `KillWriteFailed` when the row cannot be written. The
     read-only lookup retries within the writer wait while reserving the
-    ordinary lock wait for the engagement write."""
+    ordinary lock wait for the engagement write. `on_wait` goes to both store
+    opens (`open_read_only`, `open_for_write`), so the caller can say it waits."""
     note = _note(reason, "paper kill")
     book = resolve_book(settings, book_id)
     if not Path(settings.store.path).is_file():
@@ -1532,7 +1534,7 @@ def kill(
         update={"store": settings.store.model_copy(update={"lock_retry_seconds": read_wait})}
     )
     started = time.monotonic()
-    with open_read_only(read_settings, retry=True) as conn:
+    with open_read_only(read_settings, retry=True, on_wait=on_wait) as conn:
         _, window_id = _window_of(conn, book)
     engage_wait = max(minimum, int(total - (time.monotonic() - started)))
     engage_settings = settings.model_copy(
@@ -1540,7 +1542,12 @@ def kill(
     )
     try:
         engaged = switch.engage(
-            engage_settings, clock, window_id=window_id, source=_OWNER, reason=note
+            engage_settings,
+            clock,
+            window_id=window_id,
+            source=_OWNER,
+            reason=note,
+            on_wait=on_wait,
         )
     except Exception as exc:  # a bad clock reading, say: still not engaged
         engaged = switch.WriteFailed(f"{type(exc).__name__}: {exc}")

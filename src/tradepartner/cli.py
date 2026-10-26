@@ -365,7 +365,6 @@ import json
 import re
 import subprocess
 import sys
-import threading
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
@@ -1615,11 +1614,13 @@ def _writer_settings(s: Settings) -> Settings:
 
 
 _HOLDER_RE = re.compile(r"held in (.+?)\s*\(PID (\d+)\)")
+# `switch.engage` folds its error into `WriteFailed` as `"<class name>: <message>"`.
+_STORE_LOCKED_RE = re.compile(r"\bStore(?:SameProcess)?LockedError: ")
 
 
-def _lock_holder(exc: BaseException) -> str:
-    """Who holds the store, as far as the lock error says: DuckDB's process and PID,
-    else a plain "an unidentified process"."""
+def _lock_holder(exc: BaseException | str) -> str:
+    """Who holds the store, as far as the lock error (or its message) says:
+    DuckDB's process and PID, else a plain "an unidentified process"."""
     found = _HOLDER_RE.search(str(exc))
     if found is not None:
         return f"{Path(found.group(1)).name}, pid {found.group(2)}"
@@ -4381,55 +4382,31 @@ def make_app(
                 err=True,
             )
 
-        def wait_timer(notice: Callable[[str], None]) -> threading.Timer:
-            """Report a wait that begins after the point-in-time lock probe."""
-
-            def probe() -> None:
-                try:
-                    with open_read_only(replace_wait(writer_s, 0)):
-                        pass
-                except StoreLockedError as busy:
-                    holder = _lock_holder(busy)
-                    if holder != "another connection in this process":
-                        notice(holder)
-
-            timer = threading.Timer(writer_s.store.lock_retry_initial_delay_seconds * 2, probe)
-            timer.start()
-            return timer
-
         def kill_one(target: str, *, already_announced: bool = False) -> int:
-            """`window.kill`, a busy store made plain: nothing is engaged, say so (#2178)."""
+            """`window.kill`, a busy store made plain: nothing is engaged, say so (#2178).
+            The waiting line comes from the store's own first lock retry
+            (`on_wait`), once per book; no other connection is ever opened."""
             announced = [already_announced]
 
-            def announce(holder: str = "an unidentified process") -> None:
+            def announce(message: str) -> None:
                 if not announced[0]:
-                    waiting_line(holder)
+                    waiting_line(_lock_holder(message))
                     announced[0] = True
 
             try:
-                with open_for_write(replace_wait(writer_s, 0)):
-                    pass  # a probe: is the store free right now?
-            except StoreLockedError as busy:
-                announce(_lock_holder(busy))
-            timer = wait_timer(announce) if not announced[0] else None
-            try:
-                return window.kill(s, clock, reason, book_id=target)
+                return window.kill(s, clock, reason, book_id=target, on_wait=announce)
             except StoreLockedError as exc:
                 raise window.KillWriteFailed(
                     "kill switch NOT engaged: store busy "
                     f"(held by {_lock_holder(exc)}); retry, or stop the reader"
                 ) from exc
             except window.KillWriteFailed as exc:
-                if "StoreLockedError:" not in str(exc):
+                if not _STORE_LOCKED_RE.search(str(exc)):
                     raise
                 raise window.KillWriteFailed(
                     "kill switch NOT engaged: store busy "
                     f"(held by {_lock_holder(exc)}); retry, or stop the reader"
                 ) from exc
-            finally:
-                if timer is not None:
-                    timer.cancel()
-                    timer.join()
 
         if not every_book:
             bk = resolve_book(s, chosen)
@@ -4438,16 +4415,11 @@ def make_app(
             return
         listing_waited = [False]
 
-        def listing_notice(holder: str) -> None:
-            waiting_line(holder)
+        def listing_notice(message: str) -> None:
+            waiting_line(_lock_holder(message))
             listing_waited[0] = True
 
-        listing_timer = wait_timer(listing_notice)
-        try:
-            books = _paper_call(s, lambda: paper_run.open_books(writer_s))
-        finally:
-            listing_timer.cancel()
-            listing_timer.join()
+        books = _paper_call(s, lambda: paper_run.open_books(writer_s, on_wait=listing_notice))
         if not books:
             raise _fail(
                 "refused: no_window: no book has an open window", PAPER_REFUSAL_EXIT["no_window"]
