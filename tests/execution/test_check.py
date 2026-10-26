@@ -346,6 +346,10 @@ def test_week_end_window_counts_and_compares_per_iso_week(settings: Settings) ->
     assert lines["rebalance_count"].detail.startswith(
         "2 scheduler-executed rebalance session(s) [2026-11-27, 2026-12-04], need >= 2"
     )
+    assert lines["rebalance_count"].short == (
+        "2 of 2 rebalance sessions done; first 2026-11-27, latest 2026-12-04; "
+        "other runs are listed but not counted (--verbose shows them)"
+    )
     assert lines["tracking"].detail.startswith("2 compared non-excluded week(s), need >= 2")
 
 
@@ -958,3 +962,23 @@ def test_check_for_a_book_with_no_window_fails_and_a_bad_token_is_refused(
             check(conn, settings, "b")
         with pytest.raises(ValueError, match="book_id must match"):
             check(conn, settings, "b-1")
+
+
+def test_time_to_go_is_plain_per_cadence() -> None:
+    from tradepartner.execution.check import _time_to_go
+
+    assert _time_to_go(5, "daily") == "5 more session(s) to go"
+    assert _time_to_go(5, "week_end") == "about 5 weeks to go"
+    assert _time_to_go(3, "week_end") == "about 3 weeks to go"
+    assert _time_to_go(5, "month_end") == "about 5 months to go"
+
+
+def test_unpassed_week_end_count_line_says_progress(settings: Settings) -> None:
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(
+            conn, sessions=(W0, W1, W2), cadence="week_end", t1_executed_by="tty"
+        )
+    with open_read_only(settings) as conn:
+        line = {x.name: x for x in check(conn, settings)}["rebalance_count"]
+    assert not line.passed
+    assert line.short.startswith("1 of 2 rebalance sessions done so far, about 7 more day")
