@@ -19,6 +19,8 @@ Sources run in order, `edgar` then `alpaca`, and **the run stops at the first so
 
 **When to run it.** The regular close is 16:00 ET, so the expected session is that day's from 17:00 ET on (13:00 closes are handled by the calendar). The plist below runs at **18:30 local time**, which leaves margin for late bars. If the Mac's time zone is not US Eastern, convert: for example, 18:30 ET is 15:30 PT. launchd uses the Mac's local clock and follows daylight saving time with it.
 
+**Do not open the dashboard or any store reader during a job.** `ingest`, `paper run` and `paper kill` wait up to `store.writer_lock_retry_seconds` (300 s) for the store, longer than other commands (`store.lock_retry_seconds`, 60 s), so a render under five minutes is out-waited; a longer reader still locks them out (#2178). A Data health render with coverage holds the store for about 86 s. `paper kill` that cannot get the store says `kill switch NOT engaged: store busy (held by ...)` and exits 3: retry, or stop the reader.
+
 ## Before you install
 
 1. **The main checkout is on `main` and clean.** The job runs whatever code is checked out there, and `uv run` syncs the environment to `uv.lock` on each run. After `git pull`, the next scheduled run uses the new code.
