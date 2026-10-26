@@ -379,6 +379,7 @@ import httpx
 import polars as pl
 import typer
 
+from tradepartner import heartbeat
 from tradepartner.adapters import alpaca_raw, edgar_raw
 from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
 from tradepartner.adapters.broker import Broker
@@ -2244,22 +2245,29 @@ def make_app(
                 fred = ingest_rates(s, all_rates, since=start, clock=clock)
                 result = IngestResult(result.runs + fred.runs)
         else:
-            result = ingest_session(
-                s,
-                prices=prices,
-                filings=filings,
-                rates=all_rates,
-                source=source,
-                clock=clock,
-                dry_run=dry_run,
-                rebuild_statement_facts=rebuild_statement_facts,
-                rebuild_filing_events=rebuild_filing_events,
-                rebuild_classifications=rebuild_classifications,
-                restamp=restamp,
-                on_restamp=restamped.append,
-                restamp_window_ok=window_ok,
-                assets=lambda: assets_source(s, clock),
-            )
+            try:
+                result = ingest_session(
+                    s,
+                    prices=prices,
+                    filings=filings,
+                    rates=all_rates,
+                    source=source,
+                    clock=clock,
+                    dry_run=dry_run,
+                    rebuild_statement_facts=rebuild_statement_facts,
+                    rebuild_filing_events=rebuild_filing_events,
+                    rebuild_classifications=rebuild_classifications,
+                    restamp=restamp,
+                    on_restamp=restamped.append,
+                    restamp_window_ok=window_ok,
+                    assets=lambda: assets_source(s, clock),
+                )
+            except Exception:
+                if not dry_run:
+                    heartbeat.ping(s, "ingest", ok=False)  # off-Mac dead-man's switch (#2155)
+                raise
+            if not dry_run:
+                heartbeat.ping(s, "ingest", ok=result.exit_code == 0)
         _print_result(result)
         for done in restamped:
             _print_restamp(done, committed=result.ok and not dry_run)
@@ -4226,6 +4234,7 @@ def make_app(
                     s, write_chunk(s), lambda b: broker(s, clock, b), clock
                 )
             except Exception as exc:
+                heartbeat.ping(s, "paper", ok=False)
                 raise _fail(
                     _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
                 ) from exc
@@ -4246,6 +4255,7 @@ def make_app(
                     continue
                 _run_lines(prefix, entry.outcome, s)
             codes = [entry.exit_code for entry in runs]
+            heartbeat.ping(s, "paper", ok=not any(codes))  # off-Mac dead-man's switch (#2155)
             if WRITE_FAILED_EXIT_CODE in codes:
                 raise typer.Exit(WRITE_FAILED_EXIT_CODE)
             if any(codes):
@@ -4256,10 +4266,12 @@ def make_app(
                 s, write_chunk(s), broker(s, clock, chosen), clock, book_id=chosen
             )
         except Exception as exc:
+            heartbeat.ping(s, "paper", ok=False)
             raise _fail(
                 _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
             ) from exc
         _run_lines("paper run", outcome, s)
+        heartbeat.ping(s, "paper", ok=not outcome.exit_code)
         if outcome.exit_code:
             raise typer.Exit(outcome.exit_code)
 
