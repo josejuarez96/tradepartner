@@ -118,6 +118,10 @@ _CARRIED_RESIDUE = "carried_residue"
 #: The `explanation_json` key both rows of a stock merger name (paper spec
 #: amendment #1762 item 5).
 _MERGER_KEY = "merger_id"
+#: The `explanation_json` key of a delisting's late cash (#411): a cash-only
+#: `corporate_action_cash` row that is part of the proceeds of the ended-listing
+#: removal row before it.
+_DELISTING_KEY = "delisting_cash"
 
 
 class LotLedgerError(ValueError):
@@ -853,12 +857,53 @@ def _events(
             if row.quantity is None and merger_id not in quantity_removals:
                 raise LotLedgerError(f"merger cash {_describe(row)} has no merger removal row")
             cash_rows.setdefault(merger_id, []).append(row)
+    late = _late_delisting_cash(window)
     for row in window:
-        action = _adjustment_event(row, removals, receipts, cash_rows)
+        if _is_late_delisting_cash(row):
+            continue  # included with its removal's proceeds
+        action = _adjustment_event(row, removals, receipts, cash_rows, late.get(id(row), ()))
         if action is not None:
             rank = _RANK_CASH_IN_LIEU if row.kind == _CASH_IN_LIEU else _RANK_ADJUSTMENT
             events.append(((row.session, rank, *_adjustment_key(row)), action))
     return events
+
+
+def _is_late_delisting_cash(row: AdjustmentRow) -> bool:
+    """Whether `row` is a delisting's late cash: a cash-only `corporate_action_cash`
+    row marked `delisting_cash` and naming no merger (#411)."""
+    return (
+        row.kind == _CORPORATE_ACTION_CASH
+        and row.quantity is None
+        and _merger_id(row) is None
+        and _explanation(row).get(_DELISTING_KEY) is True
+    )
+
+
+def _late_delisting_cash(window: Sequence[AdjustmentRow]) -> dict[int, list[AdjustmentRow]]:
+    """Each ended-listing removal row (by `id`) to the late cash rows of its name
+    that follow it, so the removal disposes the lots at the whole proceeds (#411).
+    A late row goes to the latest removal of its name stated on or before its
+    session; one with none raises."""
+    removals: dict[str, list[AdjustmentRow]] = {}
+    for row in window:
+        if (
+            row.kind == _CORPORATE_ACTION_CASH
+            and row.quantity is not None
+            and row.quantity < 0
+            and _merger_id(row) is None
+            and row.security_id is not None
+        ):
+            removals.setdefault(row.security_id, []).append(row)
+    found: dict[int, list[AdjustmentRow]] = {}
+    for row in window:
+        if not _is_late_delisting_cash(row):
+            continue
+        earlier = [r for r in removals.get(row.security_id or "", []) if r.session <= row.session]
+        if not earlier:
+            raise LotLedgerError(f"delisting cash {_describe(row)} has no removal row")
+        target = max(earlier, key=lambda r: (r.session, r.adjustment_id or 0))
+        found.setdefault(id(target), []).append(row)
+    return found
 
 
 def _by_merger(
@@ -886,6 +931,7 @@ def _adjustment_event(
     removals: Mapping[str | None, AdjustmentRow],
     receipts: Mapping[str | None, AdjustmentRow],
     cash_rows: Mapping[str, Sequence[AdjustmentRow]],
+    late: Sequence[AdjustmentRow] = (),
 ) -> _Event | None:
     """The ledger action an adjustment makes, or None when it has no lot effect
     (a dividend, a fee) or is half of a merger the removal row carries out."""
@@ -904,6 +950,9 @@ def _adjustment_event(
             )
         if merger is not None:
             cash_total = sum((_cash(cash_row) for cash_row in cash_rows[merger]), _ZERO)
+            return partial(_Ledger.removal, row=row, cash_total=cash_total)
+        if late:
+            cash_total = _cash(row) + sum((_cash(r) for r in late), _ZERO)
             return partial(_Ledger.removal, row=row, cash_total=cash_total)
         return partial(_Ledger.removal, row=row)
     if row.kind == _MERGER_RECEIPT:
