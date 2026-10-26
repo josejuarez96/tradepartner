@@ -129,6 +129,7 @@ _CHECKED = datetime(2026, 10, 2, 21, 0, tzinfo=UTC)  # 5:00 PM ET
 def _safety(
     *,
     matches: bool = True,
+    tolerance: float = 0.01,
     running: bool = True,
     since: datetime | None = None,
     text: str | None = None,
@@ -149,7 +150,7 @@ def _safety(
         "within",
     )
     return book_view.Safety(
-        book_view.ReconciliationView(matches, recon_text, _CHECKED, 1.0), switch, (limit,)
+        book_view.ReconciliationView(matches, recon_text, _CHECKED, tolerance), switch, (limit,)
     )
 
 
@@ -461,6 +462,15 @@ def test_the_safety_card_draws_the_view_and_computes_nothing(
     assert "Largest position: 4.8% against a limit of 5.0%" in text
 
 
+def test_a_match_within_a_wider_tolerance_is_not_to_the_cent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"), _view(safety=_safety(tolerance=1.26)))
+    text = _text(at)
+    assert "to the cent" not in text
+    assert "Matches Alpaca within the reconciliation's tolerance (cash to $1.26)." in text
+
+
 def test_a_reconciliation_that_did_not_match_says_what_differs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -567,7 +577,7 @@ def test_past_the_bound_it_says_not_confirmed_and_neither_kills_nor_retries(
     at = _app(monkeypatch, _store(tmp_path / "s.duckdb"))
     _open_dialog(at)
     _confirm(at)
-    assert "NOT confirmed" in _text(at)
+    assert "NOT confirmed" in _text(at) and "within 330 seconds" in _text(at)
     assert len(starter.argvs) == 1 and not starter.children[0].terminated
     at.run(timeout=30)
     assert len(starter.argvs) == 1
@@ -662,7 +672,8 @@ def test_a_closed_book_offers_no_stop(monkeypatch: pytest.MonkeyPatch, tmp_path:
 def test_the_backtest_card(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     at = _app(monkeypatch, _store(tmp_path / "s.duckdb"))
     text = _text(at)
-    assert "5 of 10 sessions with no problem" in text
+    assert "5 of 10 sessions since the span started or last restarted" in text
+    assert "tradepartner paper shakedown" in text
     assert "The latest tracking report runs through Thursday, October 1: it finished." in text
     assert "tradepartner paper report --book main" in text
     assert "Running a new report counts as one test." in text
@@ -731,6 +742,9 @@ _BANNED_MODULES = (
     "tradepartner.execution.phases",
     "tradepartner.execution.brokers",
     "tradepartner.adapters",
+    "tradepartner.execution.resume",
+    "tradepartner.execution.report",
+    "tradepartner.backtest",
 )
 _BANNED_NAMES = {"submit", "engage", "open_for_write", "override_page", "switch", "window"}
 

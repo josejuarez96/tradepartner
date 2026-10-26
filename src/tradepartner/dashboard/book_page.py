@@ -46,7 +46,7 @@ import duckdb
 import pandas as pd
 import streamlit as st
 
-from tradepartner.config import Settings, kill_wait_seconds
+from tradepartner.config import Settings
 from tradepartner.dashboard import book_actions, theme
 from tradepartner.execution import book_holdings, book_stats, book_view, home_view, ops
 from tradepartner.execution.marks import UnreadableMarkError
@@ -63,6 +63,8 @@ STOP_OUTCOME_KEY = "book_page_stop_outcome"
 #: `(book, trimmed reason)` of the last kill that engaged or is unconfirmed.
 STOP_LAST_KEY = "book_page_stop_last"
 _EASTERN = ZoneInfo("America/New_York")
+#: "To the cent" is said only when the window's frozen cash tolerance is a cent or less.
+_CENT = 0.01
 RANGE_KEY = "book_page_range"
 _LINK_SEEN_KEY = "book_page_link_seen"
 #: The Trades page's own book picker key; the "see all" link sets it, then opens that page.
@@ -361,7 +363,7 @@ def _show_result(result: book_actions.KillResult, settings: Settings, book: str)
     elif result.status is book_actions.KillStatus.NOT_CONFIRMED:
         st.warning(
             f"The stop is NOT confirmed: the command did not finish within "
-            f"{kill_wait_seconds(book_actions.live_settings())} seconds. It was "
+            f"{result.wait_seconds} seconds. It was "
             "neither cancelled nor sent again; the card shows the switch as the journal "
             "has it on the next read."
         )
@@ -408,8 +410,15 @@ def _safety(view: book_view.BookView, settings: Settings, book: str) -> None:
     if safety is None or head is None:
         return
     recon = safety.reconciliation
-    if recon.matches:
+    if recon.matches and recon.cash_tolerance is not None and recon.cash_tolerance <= _CENT:
         st.write("Matches Alpaca to the cent.")
+        if recon.at is not None:
+            st.caption(f"Checked {_when(recon.at)}.")
+    elif recon.matches:
+        st.write(
+            "Matches Alpaca within the reconciliation's tolerance "
+            f"(cash to {_money(recon.cash_tolerance or 0.0)})."
+        )
         if recon.at is not None:
             st.caption(f"Checked {_when(recon.at)}.")
     else:
@@ -456,7 +465,8 @@ def _backtest(view: book_view.BookView) -> None:
     else:
         st.write(
             f"Shakedown: {progress.sessions_done} of {progress.sessions_needed} sessions "
-            "with no problem."
+            "since the span started or last restarted; `tradepartner paper shakedown` "
+            "says whether they pass."
         )
         if progress.text != f"{progress.sessions_done} of {progress.sessions_needed} sessions":
             st.caption(progress.text)
@@ -471,7 +481,7 @@ def _backtest(view: book_view.BookView) -> None:
         flag = " A red flag was raised." if trial.red_flag else ""
         st.write(
             f"The latest tracking report runs through {_day(report.through_session)}: "
-            f"{words}.{flag}"
+            f"{words}.{flag} The command below prints how it compares."
         )
     st.write(f"To run a new one, at the desk: `{card.command}`")
     st.caption("Running a new report counts as one test.")

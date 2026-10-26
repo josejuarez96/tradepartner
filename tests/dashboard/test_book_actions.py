@@ -275,6 +275,7 @@ def test_past_the_bound_it_is_not_confirmed_never_terminated_never_retried(
     fake = _fake(monkeypatch, _Fake(None))
     result = book_actions.kill(live, "main", _REASON)
     assert result.status is KillStatus.NOT_CONFIRMED and result.exit_code is None
+    assert result.wait_seconds == 330
     assert len(fake.calls) == 1 and not fake.terminated
 
 

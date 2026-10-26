@@ -75,11 +75,13 @@ class KillStatus(StrEnum):
 @dataclass(frozen=True)
 class KillResult:
     """`status` from the exit code alone (None when the wait ran out); `output`
-    is the command's scrubbed text, to show beneath, never read for the outcome."""
+    is the command's scrubbed text, to show beneath, never read for the outcome;
+    `wait_seconds` is the bound the call waited for."""
 
     status: KillStatus
     exit_code: int | None
     output: str
+    wait_seconds: int
 
 
 class KillRefused(ValueError):
@@ -235,7 +237,8 @@ def kill(settings: Settings, book: str, reason: str) -> KillResult:
     child = _start(argv, env=env, cwd=PROJECT_ROOT)
     try:
         # The child's own wait is the live config's, so the bound is too.
-        stdout, stderr = child.communicate(timeout=kill_wait_seconds(live))
+        wait = kill_wait_seconds(live)
+        stdout, stderr = child.communicate(timeout=wait)
     except subprocess.TimeoutExpired as exc:
         _drain(child)
         partial = "\n".join(
@@ -243,8 +246,8 @@ def kill(settings: Settings, book: str, reason: str) -> KillResult:
             for p in (exc.stdout, exc.stderr)
             if p
         )
-        return KillResult(KillStatus.NOT_CONFIRMED, None, _scrub(partial, settings, live))
+        return KillResult(KillStatus.NOT_CONFIRMED, None, _scrub(partial, settings, live), wait)
     code = child.returncode
     status = KillStatus.ENGAGED if code == ENGAGED_EXIT else KillStatus.NOT_ENGAGED
     output = "\n".join(p for p in (stdout, stderr) if p)
-    return KillResult(status, code, _scrub(output, settings, live))
+    return KillResult(status, code, _scrub(output, settings, live), wait)
