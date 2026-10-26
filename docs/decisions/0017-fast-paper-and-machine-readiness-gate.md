@@ -152,7 +152,7 @@ The decision stands; part E's E.2 line and E.4's real-halt clause are superseded
 
 **E.2, as amended.** **Reconciliation.**
 - Zero `mismatch` rows in the span, in any book.
-- Zero breaks of cause `unattributed` opened in the span, immaterial ones included unless the owner picks open question 46 (b).
+- Zero breaks opened, or observed, with an `unattributed` part in the span. This includes immaterial ones, unless the owner picks open question 46 (b).
 - No break open past the frozen `risk.break_max_age_sessions` at the command's session (open question 48).
 - A `pending_unresolved` or `fills_lagging` row passes when the next reconciliation of that book is `ok` or `breaks`; a `breaks` row passes on its own. Their counts are printed.
 - The line prints the external breaks opened in the span by cause, and how each closed (trued up, auto-explained, resolved by the broker, auto-accepted, still open).
