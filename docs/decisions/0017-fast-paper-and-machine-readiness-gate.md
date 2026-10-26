@@ -148,7 +148,7 @@ The decision stands; part E's E.2 line and E.4's real-halt clause are superseded
   - Journal gaps (E.5).
   - A missed run or a `stale_data` alert without a note (E.1, E.7).
   - A break whose `cause` is `unattributed`, material or not (paper spec open question 46), which restarts the span like a mismatch. This includes any break on a name with an own fill or own open order since the last `ok` or `breaks` reconciliation. The span starts again at the session after the event that closes the break (`trued_up`, `auto_explained`, `resolved_by_broker` or `auto_accepted`). Until then the span is pending, as after an unreleased mismatch.
-- **(c) Who decides the group.** The kind and the cause decide it. Deterministic code records both on the `opened` event at detection, from rows known at close(S−1) and the broker's reads. The cause is never rewritten afterwards, and no command, note or true-up changes it. A case the rules cannot place is `unattributed`, so it restarts.
+- **(c) Who decides the group.** The kind and the cause decide it. Deterministic code records both on the `opened` event at detection, from rows known at close(S−1) and the broker's reads. The cause is never rewritten afterwards, and no command, note or true-up changes it. A part added to an open break later carries its own cause, and the break restarts the span if any of its parts is `unattributed`. A case the rules cannot place is `unattributed`, so it restarts.
 
 **E.2, as amended.** **Reconciliation.**
 - Zero `mismatch` rows in the span, in any book.
