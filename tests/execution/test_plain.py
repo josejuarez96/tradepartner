@@ -23,10 +23,28 @@ def test_causes_join() -> None:
 
 
 def test_failure_hint_for_404_names_next_step() -> None:
-    hint = plain.failure_hint(AlpacaTradingError(404, "not found", retried=False))
+    hint = plain.failure_hint(AlpacaTradingError(404, "not found", retried=False), scheduled=True)
     assert "does not know" in hint
     assert "paper.err.log" in hint and "paper status" in hint
 
 
 def test_failure_hint_generic() -> None:
     assert "unexpected error" in plain.failure_hint(RuntimeError("x"))
+
+
+def test_403_is_not_blamed_on_credentials() -> None:
+    hint = plain.failure_hint(AlpacaTradingError(403, "insufficient buying power", retried=False))
+    assert "credentials" not in hint and "account rule" in hint
+    assert "credentials" in plain.failure_hint(AlpacaTradingError(401, "x", retried=False))
+
+
+def test_hint_points_to_resume_and_never_says_rerun_or_unchanged() -> None:
+    hint = plain.failure_hint(RuntimeError("x"))
+    assert 'paper resume --book <book> --reason "..."' in hint
+    assert "check `tradepartner paper status` before running anything again" in hint
+    assert "run it again" not in hint and "nothing was changed" not in hint
+
+
+def test_log_path_only_for_scheduled_runs() -> None:
+    assert "paper.err.log" not in plain.failure_hint(RuntimeError("x"))
+    assert "paper.err.log" in plain.failure_hint(RuntimeError("x"), scheduled=True)

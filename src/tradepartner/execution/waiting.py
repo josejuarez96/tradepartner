@@ -51,6 +51,7 @@ from typing import Final, Literal
 from zoneinfo import ZoneInfo
 
 from tradepartner.calendar import session_close
+from tradepartner.cli_record import scrub_text
 from tradepartner.config import RiskConfig
 from tradepartner.execution.collect import lag_verdict
 from tradepartner.execution.plain import plain_causes
@@ -194,6 +195,11 @@ class SpanFacts:
     now: datetime
 
 
+def _one_line(text: str) -> str:
+    """A stored free-text reason on one line, through the CLI's output scrub."""
+    return scrub_text(" ".join(text.split()), secrets=())[0]
+
+
 def _kill_switch_item(book_id: str, facts: SwitchFacts) -> WaitingItem | None:
     state = facts.state
     if not state.engaged:
@@ -221,7 +227,7 @@ def _kill_switch_item(book_id: str, facts: SwitchFacts) -> WaitingItem | None:
         since=since,
         detail="kill switch engaged: "
         + plain_causes(state.causes)
-        + (f"; reason given: {why}" if why else ""),
+        + (f"; reason given: {_one_line(why)}" if why else ""),
         command=f'tradepartner paper resume --book {book_id} --reason "<why>"',
     )
 

@@ -1186,9 +1186,9 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def _describe_failure(exc: BaseException) -> str:
+def _describe_failure(exc: BaseException, *, scheduled: bool = False) -> str:
     """`_describe` plus the plain next step (#2203); display only."""
-    return f"{_describe(exc)}\n{plain.failure_hint(exc)}"
+    return f"{_describe(exc)}\n{plain.failure_hint(exc, scheduled=scheduled)}"
 
 
 def _echo_scrubbed(text: str, settings: Settings) -> None:
@@ -4267,7 +4267,8 @@ def make_app(
             except Exception as exc:
                 heartbeat.ping(s, "paper", ok=False)
                 raise _fail(
-                    _scrubbed(f"paper run: failed: {_describe_failure(exc)}", s), CRASH_EXIT_CODE
+                    _scrubbed(f"paper run: failed: {_describe_failure(exc, scheduled=True)}", s),
+                    CRASH_EXIT_CODE,
                 ) from exc
             for entry in runs:
                 # The line before books for `paper.book_id` alone; any other book is named.
@@ -4281,7 +4282,7 @@ def make_app(
                             f": {said}" if isinstance(said, str) else ""
                         )
                     else:
-                        detail = f"failed: {_describe_failure(entry.error)}"
+                        detail = f"failed: {_describe_failure(entry.error, scheduled=True)}"
                     typer.echo(_scrubbed(f"{prefix}: {detail}", s), err=True)
                     continue
                 _run_lines(prefix, entry.outcome, s)
@@ -4304,7 +4305,8 @@ def make_app(
         except Exception as exc:
             heartbeat.ping(s, "paper", ok=False)
             raise _fail(
-                _scrubbed(f"paper run: failed: {_describe_failure(exc)}", s), CRASH_EXIT_CODE
+                _scrubbed(f"paper run: failed: {_describe_failure(exc, scheduled=True)}", s),
+                CRASH_EXIT_CODE,
             ) from exc
         _run_lines("paper run", outcome, s)
         if not outcome.healthy:

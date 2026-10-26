@@ -16,7 +16,7 @@ from tradepartner.adapters.alpaca_trading_raw import AlpacaTradingError
 PAPER_ERR_LOG: Final = "~/Library/Logs/tradepartner/paper.err.log"
 
 _SOURCE_WORDS: Final = {
-    "owner": "you switched it on (paper kill)",
+    "owner": "you switched it on (paper kill, or an override you set)",
     "fault": "a fault switched it on (a failed check or broker problem)",
     "drawdown": "the drawdown limit switched it on",
 }
@@ -47,26 +47,32 @@ def plain_causes(causes: tuple[str, ...] | list[str]) -> str:
     return "; ".join(plain_cause(c) for c in causes)
 
 
-def failure_hint(exc: BaseException) -> str:
-    """The plain next step for an unclassified failure."""
+def failure_hint(exc: BaseException, *, scheduled: bool = False) -> str:
+    """The plain next step for an unclassified failure. `scheduled` is True for the
+    scheduled paper run, whose errors land in the log file."""
     if isinstance(exc, AlpacaTradingError):
         code = exc.status_code
-        if code in (401, 403):
+        if code == 401:
             what = "Alpaca refused the credentials; check the paper keys in .env"
+        elif code == 403:
+            what = "Alpaca refused the request (an account rule or permission); read its message"
         elif code == 404:
             what = "Alpaca does not know what was asked for (an order or symbol); check it exists"
         elif code == 429:
-            what = "Alpaca is rate-limiting; wait a few minutes and run it again"
+            what = "Alpaca is rate-limiting; wait a few minutes before trying again"
         elif code is None or code >= 500:
-            what = "Alpaca or the network failed; check your connection and run it again"
+            what = "Alpaca or the network failed; check your connection"
         else:
             what = f"Alpaca rejected the request ({code})"
     elif isinstance(exc, (ConnectionError, TimeoutError, OSError)):
-        what = "a network or file problem; check your connection and disk, then run it again"
+        what = "a network or file problem; check your connection and disk"
     else:
-        what = "an unexpected error; nothing was changed by this message"
+        what = "an unexpected error; the run may have stopped part way"
+    where = f"read {PAPER_ERR_LOG}" if scheduled else "read the output above"
     return (
         f"  What happened: {what}.\n"
-        f"  Next: read {PAPER_ERR_LOG}, run `tradepartner paper status`, "
-        "and tell your agent if it repeats."
+        f"  Next: {where}, then check `tradepartner paper status` before running anything "
+        "again. If the kill switch is engaged, fix the cause, then "
+        '`tradepartner paper resume --book <book> --reason "..."`. '
+        "Tell your agent if it repeats."
     )

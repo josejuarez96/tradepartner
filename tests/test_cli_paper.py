@@ -1870,11 +1870,13 @@ def test_status_all_lists_two_waiting_items_byte_for_byte(
         "last run n/a; next rebalance 2026-10-30\n"
         "waiting on you (2):\n"
         f"  book b; kill_switch_engaged: kill switch engaged: you switched it on "
-        f"(paper kill) (event 2); reason given: test; since {SESSION_CLOCK}; "
+        f"(paper kill, or an override you set) (event 2); reason given: test; "
+        f"since {SESSION_CLOCK}; "
         f"command tradepartner paper resume --book b "
         '--reason "<why>"\n'
         f"  book main; kill_switch_engaged: kill switch engaged: you switched it on "
-        f"(paper kill) (event 1); reason given: test; since {SESSION_CLOCK}; "
+        f"(paper kill, or an override you set) (event 1); reason given: test; "
+        f"since {SESSION_CLOCK}; "
         f"command tradepartner paper resume --book main "
         '--reason "<why>"\n',
     )
