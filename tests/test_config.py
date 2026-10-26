@@ -124,6 +124,13 @@ def test_ingest_defaults() -> None:
     assert s.ingest.reference_symbol == "SPY"
     assert s.ingest.max_missing_share == pytest.approx(0.05)
     assert s.ingest.max_dark_share == pytest.approx(1.0)  # #796: off until measured
+    assert s.ingest.edgar_gap_lookback_sessions == 5
+
+
+@pytest.mark.parametrize("value", [-1, 21])
+def test_edgar_gap_lookback_is_bounded(value: int) -> None:
+    with pytest.raises(ValidationError, match="edgar_gap_lookback_sessions"):
+        Settings(_env_file=None, ingest={"edgar_gap_lookback_sessions": value})
 
 
 def test_fred_rate_defaults_and_environment(monkeypatch: pytest.MonkeyPatch) -> None:
