@@ -1649,6 +1649,66 @@ def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
     raise _fail(_scrubbed(message, settings), code)
 
 
+#: The scheduled paper run's time, as the scheduling runbook sets it (08:05 ET), said
+#: to the owner where fills wait for it (#2201). Display text only; nothing reads it.
+PAPER_RUN_TIME_TEXT = "08:05 ET"
+_FILLS_NOTE = (
+    "Orders were sent; fills or rejections are recorded at the next scheduled run "
+    f"({PAPER_RUN_TIME_TEXT})"
+)
+
+
+def _et(value: Any) -> str:
+    """An owner-facing time: Eastern first, UTC beside it for the audit trail (#2201).
+    A date or a non-time value goes through `_fmt` unchanged."""
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        eastern = value.astimezone(_NEW_YORK)
+        utc = value.astimezone(UTC)
+        return f"{eastern:%Y-%m-%d %H:%M} ET ({utc:%H:%M} UTC)"
+    return _fmt(value)
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def _book_first_lines(
+    summaries: Sequence[ops.BookSummary],
+    items: Sequence[waiting.WaitingItem],
+    now: datetime,
+    overdue: Sequence[ops.OverdueDelisting] = (),
+) -> list[str]:
+    """One plain sentence per book, before any counts (#2201): `daily: trading, 0
+    issues`, or `main: halted 2 days, run: <resume command>`. Each overdue delisting
+    cash item counts as an issue, so this line is never calmer than the ones below."""
+    lines = []
+    for row in summaries:
+        mine = [item for item in items if item.book_id == row.book_id]
+        late = sum(1 for item in overdue if item.book_id == row.book_id)
+        halt = next((i for i in mine if i.kind == "kill_switch_engaged"), None)
+        if halt is not None or row.switch_state.engaged:
+            others = len(mine) + late - (1 if halt is not None else 0)
+            if halt is None or not isinstance(halt.since, datetime):
+                age = "halted"
+            else:
+                days = (
+                    now.astimezone(_NEW_YORK).date() - halt.since.astimezone(_NEW_YORK).date()
+                ).days
+                age = "halted today" if days <= 0 else f"halted {_plural(days, 'day')}"
+            more = f", {_plural(others, 'other issue')}" if others else ""
+            fix = f"; run: {halt.command}" if halt is not None and halt.command else ""
+            lines.append(f"{row.book_id}: {age}{more}{fix}")
+            continue
+        if not row.is_open:
+            state = "window closed"
+        elif row.switch_state.run_in_progress:
+            state = "run in progress"
+        else:
+            state = "trading"
+        lines.append(f"{row.book_id}: {state}, {_plural(len(mine) + late, 'issue')}")
+    return lines
+
+
 def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
     """`paper status --all`: the operations page's one-row-per-book summary (spec
     req 12 as amended 2026-10-09), one line per book in token order."""
@@ -1669,12 +1729,13 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
             f"open orders {row.open_orders_count}; kill switch {switch_text}; "
             f"last run {_fmt(row.last_run_status)}; "
             f"next rebalance {_fmt(row.next_rebalance_session)}"
+            + ("" if row.next_rebalance_session is None else " (data day; trades the next session)")
         )
         if traded is not None:
             result = "traded today" if row.last_run_has_orders else "ran today with no orders"
             line += f"; rebalance {traded} {result}"
         if row.open_orders_count and row.last_run_kind == "rebalance":
-            line += "; Fills are recorded at the next scheduled run"
+            line += f"; {_FILLS_NOTE}"
         lines.append(line)
     return lines
 
@@ -1690,7 +1751,7 @@ def _waiting_lines(items: Sequence[waiting.WaitingItem]) -> list[str]:
         return ["waiting on you: nothing"]
     lines = [f"waiting on you ({len(items)}):"]
     for item in items:
-        since = _fmt(item.since)
+        since = _et(item.since)
         lines.append(
             f"  book {item.book_id}; {item.kind}: {item.detail}; "
             f"since {since}; command {item.command or '-'}"
@@ -1718,15 +1779,11 @@ def _status_lines(
     recon = data.reconciliation
     lines = [
         f"window {data.window.window_id} (first rebalance {data.window.first_rebalance_session})",
-        f"as of {_fmt(data.as_of)}; last updated {_fmt(data.last_updated)}"
+        f"as of {_et(data.as_of)}; last updated {_et(data.last_updated)}"
         + ("; STALE: no run for S-1" if data.stale else ""),
         f"positions {data.positions_count} (value {data.positions_value:.2f}); open orders "
         f"{data.open_orders_count}; targets {data.targets_count}",
-        *(
-            ["Fills are recorded at the next scheduled run"]
-            if data.open_orders_count and data.last_run_kind == "rebalance"
-            else []
-        ),
+        *([_FILLS_NOTE] if data.open_orders_count and data.last_run_kind == "rebalance" else []),
         f"kill switch {switch_text} (causes: {causes})",
         "reconciliation "
         + ("n/a" if recon is None else f"{recon.reconciliation_id} {recon.status} at {recon.at}"),
@@ -4596,11 +4653,18 @@ def make_app(
                 _echo_scrubbed(f"paper status: {result}", s)
                 raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
             summaries, items, overdue = result
-            for line in _summary_lines(summaries):
-                _echo_scrubbed(line, s)
-            for line in _overdue_delisting_lines(overdue):
-                _echo_scrubbed(line, s)
-            for line in _waiting_lines(items):
+            now = ensure_tz_aware_utc(clock(), field_name="clock()")
+            overdue_lines = _overdue_delisting_lines(overdue)
+            if not summaries:  # no window yet: nothing to lead with
+                for line in (*_summary_lines(summaries), *overdue_lines, *_waiting_lines(items)):
+                    _echo_scrubbed(line, s)
+                return
+            for line in (
+                *_book_first_lines(summaries, items, now, overdue),
+                *_waiting_lines(items),
+                *overdue_lines,
+                *_summary_lines(summaries),
+            ):
                 _echo_scrubbed(line, s)
             return
 
