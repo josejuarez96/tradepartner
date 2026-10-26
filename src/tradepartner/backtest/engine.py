@@ -36,6 +36,8 @@ starts at the earliest held formation anchor or stale-exit window.
   not marked.
 - *Stale*: otherwise, no bar in the marking frame on the last
   `backtest.stale_exit_sessions` sessions through T_{i+1}; sold at its last bar's close.
+  A stale short keeps paying borrow on its last mark through T_{i+1}, the rebalance that
+  decides the cover (spec amendment 2026-10-25, #2169).
 
 The sale is booked at that session, or at F_i when the session is earlier (the step
 that read the exit is the first that can book it; the name's value was frozen at that
@@ -1031,7 +1033,17 @@ def _step(
                 else:
                     cash *= 1 + accruals[session]
             if signed and borrow_bps > 0:
-                fee = borrow_fee(held_shorts, borrow_bps, (session - previous).days)
+                # A stale short is covered at its last bar's price and cash, but stays
+                # open (and pays borrow on its last mark) to the step's end, the
+                # rebalance session that decides the cover (spec amendment #2169).
+                stale_tail = {
+                    e.security_id: e.value
+                    for e in exits
+                    if e.stale and e.value < 0 and e.session <= previous
+                }
+                fee = borrow_fee(
+                    {**held_shorts, **stale_tail}, borrow_bps, (session - previous).days
+                )
                 cash -= fee
                 book.borrow_paid += fee
         if signed and pending:
