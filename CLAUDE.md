@@ -34,7 +34,7 @@ Before every push: lint, format, mypy and the test files you touched. CI runs th
 ## Before readying a PR
 1. Fill in the PR template completely.
 2. Run, in pass 1, `quant-auditor` if the PR touches data, backtests or signals and `safety-reviewer` if it touches the broker, orders, secrets or LLM inputs, plus the plan line's `Review:`. `QUANT_PREFIXES` / `SAFETY_PREFIXES` in `scripts/ready_pr.py` are the minimum it enforces by path. [Review passes](docs/ways-of-working/agents.md#review-passes).
-3. Put your STATUS line and CHANGELOG bullet in one fragment (`fragments.py add`, [command card](docs/ways-of-working/teams.md#command-card)); never edit `STATUS.md` or `CHANGELOG.md`.
+3. Put your STATUS line, CHANGELOG bullet and plan task (`--task Tn --pr n`) in one fragment (`fragments.py add`, [command card](docs/ways-of-working/teams.md#command-card)); never edit `STATUS.md`, `CHANGELOG.md` or `docs/plans/` (the fold ticks the line).
 4. Run `/ready-pr` (`uv run python scripts/ready_pr.py <pr> --timeout-min 45`). It merges main in, runs the checks, waits for CI, marks ready. Never mark ready by hand.
 
 ## Where things are

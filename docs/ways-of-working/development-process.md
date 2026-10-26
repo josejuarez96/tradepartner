@@ -13,7 +13,7 @@
 4. **Plan**, how: ordered tasks, one task = one PR → `docs/plans/<feature>.md`.
 5. **Build**: branch, tests first, PR → code + tests.
 6. **Review**: CI + specialist agents (each agent's full report a PR comment, its return a ten-line summary) → merged PR ([git-workflow rule 7](git-workflow.md#merge-classes-rule-7)).
-7. **Record**: STATUS, CHANGELOG, plan ticks → `docs/STATUS.md`.
+7. **Record**: STATUS, CHANGELOG, plan ticks → one fragment per PR, folded after merge (#2280).
 8. **Retro**, per phase: what to change in how we work → `docs/retros/phase-N.md`.
 
 Steps 1 to 7 run per feature or phase.
@@ -66,7 +66,7 @@ A plan or plan amendment is approved only when it passes this list. `spec-critic
 
 - The acceptance criteria are met and **demonstrated**: a command, its output or a screenshot is in the PR.
 - New behaviour has tests; a bug fix starts with a failing test. CI is green: lint, format, types, tests, hygiene. No TODOs without a linked issue.
-- Docs are updated **inside this PR, written as if it has already merged**: plan checkbox ticked; one fragment (the [command card](teams.md#command-card)'s `fragments.py add`; never an edit to `STATUS.md` or `CHANGELOG.md`) with the STATUS line (at most 240 characters) and the CHANGELOG bullets; ADR status `Accepted`; `.env.example` if config changed. No follow-up PR exists just to record a merge.
+- Docs are updated **inside this PR, written as if it has already merged**: one fragment (the [command card](teams.md#command-card)'s `fragments.py add`; never an edit to `STATUS.md` or `CHANGELOG.md`) with the STATUS line (at most 240 characters), the CHANGELOG bullets and, for a plan task, the line `task: Tn (PR #n)` (the PR never ticks `docs/plans/`; the fold does, #2280); ADR status `Accepted`; `.env.example` if config changed. No follow-up PR exists just to record a merge.
 - The PR was marked ready by `/ready-pr` (`scripts/ready_pr.py`), which ran the checks, verified the template and the specialist reviews, and waited for CI on the merged commit.
 - Data code: every stored fact has `known_at`, and `quant-auditor` has passed. Execution, LLM or secrets code: `safety-reviewer` has passed.
 
@@ -106,3 +106,4 @@ At the end of each phase, write `docs/retros/phase-N.md`: what worked, what did 
 | 2026-10-03, 10-04 | Build → Merge gate named the train, then the two merge classes | [merge-train spec](../specs/merge-train.md), #781 |
 | 2026-10-07 | Plan-shape rule 6 files only real defects and owner decisions | #1123 |
 | 2026-10-18 | Rewritten for length; lifecycle as a list; merge gate points at rule 7; blockers go on the issue or PR, not into STATUS | #1752 |
+| 2026-10-26 | Plan ticks move to the fold: the fragment's `task:` line | #2280 |
