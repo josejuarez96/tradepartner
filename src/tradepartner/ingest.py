@@ -3094,8 +3094,16 @@ def _check_caught_up(
         raise _Stale(
             f"the missed sessions {', '.join(day.isoformat() for day in thin)} came back "
             f"without the reference bar or over the {limit:.1%} missing share; run "
-            f"tradepartner ingest --source alpaca --backfill --since {thin[0].isoformat()}"
+            f"tradepartner ingest --source alpaca --backfill --since {thin[0].isoformat()}, "
+            f"then {_PLAIN_INGEST_STEP}"
         )
+
+
+_PLAIN_INGEST_STEP = (
+    "one plain `tradepartner ingest --source alpaca`: the backfill's bars do not "
+    "count for paper's staleness check, so paper halts stale_data until a "
+    "daily ingest run is ok (#2181)"
+)
 
 
 def _stored_sessions(conn: duckdb.DuckDBPyConnection, session: date) -> set[date]:
@@ -3136,7 +3144,7 @@ def _missed_sessions(
             f"{', '.join(day.isoformat() for day in missed[:10])}"
             f"{f' and {len(missed) - 10} more' if len(missed) > 10 else ''}; "
             f"run tradepartner ingest --source alpaca --backfill --since "
-            f"{missed[0].isoformat()}"
+            f"{missed[0].isoformat()}, then {_PLAIN_INGEST_STEP}"
         )
     return missed
 
