@@ -1154,12 +1154,113 @@ def test_edgar_gap_fetches_actions_for_name_delisted_before_recovery(
     )
     assert result.ok
     assert ("bars", (x,), gap, gap) in prices.calls
-    assert ("actions", (x,), gap, gap) in prices.calls
+    assert (
+        "actions",
+        tuple(sorted((*IDS, x))),
+        gap,
+        date(2019, 7, 2),
+    ) in prices.calls
     assert ("bars", tuple(sorted(IDS)), date(2019, 7, 2), date(2019, 7, 2)) in prices.calls
     assert read(f"SELECT session FROM prices_daily WHERE security_id='{x}'") == [(gap,)]
     assert read(f"SELECT action_type FROM corporate_actions WHERE security_id='{x}'") == [
         ("split",)
     ]
+
+
+def test_edgar_gap_process_date_action_is_written_once_with_todays_bars(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """An action processed on the gap day may have a later ex-date."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    class ProcessDatePrices(_Prices):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            self.calls.append(("actions", tuple(security_ids), start, end))
+            lag = timedelta(days=settings.alpaca.actions_process_lag_days)
+            return [action] if x in security_ids and start - lag <= gap <= end + lag else []
+
+    x = "0000000003"
+    gap = date(2019, 7, 1)
+    today = date(2019, 7, 2)
+    action = CorporateAction(
+        x,
+        ActionType.DIVIDEND,
+        today,
+        0.10,
+        action_first_seen_known_at(today),
+        "alpaca",
+        source_action_id="gap-dividend",
+    )
+    assert _run(settings).ok
+    assert (
+        _run(settings, now=datetime(2019, 7, 2, 2, tzinfo=UTC), filings=_filings(cls=Broken))
+        .runs[-1]
+        .status
+        == OK
+    )
+    filings = _filings(**_new_gap_filing(x, f"{x}-19-000001", _at(2019, 7, 1)))
+    prices = ProcessDatePrices()
+    assert _run(settings, prices, now=datetime(2019, 7, 3, 2, tzinfo=UTC), filings=filings).ok
+    assert (
+        "actions",
+        tuple(sorted((*IDS, x))),
+        gap,
+        today,
+    ) in prices.calls
+    assert ("bars", (x,), gap, gap) in prices.calls
+    assert read("SELECT count(*) FROM prices_daily WHERE session='2019-07-02'") == [(5,)]
+    assert read(f"SELECT count(*) FROM corporate_actions WHERE security_id='{x}'") == [(1,)]
+    assert _run(
+        settings, ProcessDatePrices(), now=datetime(2019, 7, 4, 2, tzinfo=UTC), filings=filings
+    ).ok
+    assert read(f"SELECT count(*) FROM corporate_actions WHERE security_id='{x}'") == [(1,)]
+
+
+def test_edgar_gap_write_error_falls_back_to_daily_prices(
+    settings: Settings,
+    read: Callable[[str], list[tuple[Any, ...]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recovered action write error rolls back and retries today's chunk."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    x = "0000000003"
+    gap = date(2019, 7, 1)
+    assert _run(settings).ok
+    assert (
+        _run(settings, now=datetime(2019, 7, 2, 2, tzinfo=UTC), filings=_filings(cls=Broken))
+        .runs[-1]
+        .status
+        == OK
+    )
+    filings = _filings(**_new_gap_filing(x, f"{x}-19-000001", _at(2019, 7, 1)))
+    original = ingest_module._add_actions
+    calls = [0]
+
+    def fail_once(*args: Any, **kwargs: Any) -> int:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise ValueError("gap action write")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ingest_module, "_add_actions", fail_once)
+    result = _run(settings, now=datetime(2019, 7, 3, 2, tzinfo=UTC), filings=filings)
+    assert result.ok
+    assert "edgar-gap backfill skipped 2019-07-01: ValueError" in result.runs[-1].message
+    assert read("SELECT count(*) FROM prices_daily WHERE session='2019-07-02'") == [(5,)]
+    assert read(f"SELECT session FROM prices_daily WHERE security_id='{x}'") == [
+        (date(2019, 7, 2),)
+    ]
+    assert _run(settings, now=datetime(2019, 7, 4, 2, tzinfo=UTC), filings=filings).ok
+    assert (gap,) in read(f"SELECT session FROM prices_daily WHERE security_id='{x}'")
 
 
 def test_one_source_only(settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]) -> None:

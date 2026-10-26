@@ -841,6 +841,32 @@ def ingest_session(
         "edgar": getattr(_unwrap(filings), "record_failures", None),
         "alpaca": None,
     }
+
+    def recover_alpaca(exc: Exception) -> SourceRun | None:
+        """Retry the ordinary daily chunk if optional gap data broke its write."""
+        gap = fetched.get("alpaca")
+        if dry_run or gap is None or not gap.gap_days:
+            return None
+
+        def prepare_daily() -> None:
+            daily = _fetch_prices(settings, prices, now, clock, recover_gaps=False)
+            notes = "; ".join(
+                f"edgar-gap backfill skipped {day.isoformat()}: {type(exc).__name__}"
+                for day in gap.gap_days
+            )
+            fetched["alpaca"] = replace(daily, message=f"{notes}; {daily.message}")
+
+        return _run_source(
+            "alpaca",
+            work["alpaca"],
+            settings,
+            now,
+            clock,
+            cursor,
+            dry_run,
+            prepare=prepare_daily,
+        )
+
     runs: list[SourceRun] = []
     for name in ("edgar", "alpaca") if source == "all" else (source,):
         run = _run_source(
@@ -853,6 +879,7 @@ def ingest_session(
             dry_run,
             prepare=prepare[name],
             after_commit=after_commit[name],
+            recover=recover_alpaca if name == "alpaca" else None,
         )
         runs.append(run)
         if run.status == LOCKED:  # the store, not the source: the next would wait out the same lock
@@ -988,6 +1015,7 @@ def _run_source(
     prepare: Callable[[], object] | None = None,
     after_commit: Callable[[], None] | None = None,
     success_status: str = OK,
+    recover: Callable[[Exception], SourceRun | None] | None = None,
 ) -> SourceRun:
     """One chunk: `prepare` (fetching, no store connection open), then
     `work` (given the run row's id) inside one write transaction with the
@@ -1020,6 +1048,12 @@ def _run_source(
         run = outcome(STALE, 0, str(exc))
         return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
     except Exception as exc:  # any source or parse failure halts with a run row
+        if recover is not None:
+            try:
+                if recovered := recover(exc):
+                    return recovered
+            except Exception as recovery_exc:
+                exc = recovery_exc
         message = _with_frames(f"{type(exc).__name__}: {exc}", exc, settings)
         run = outcome(FAILED, 0, message)
         # A dry run writes no run row, failed or not.
@@ -2952,8 +2986,8 @@ class _PriceFetch:
 
     bars: tuple[Bar, ...]
     runs: tuple[tuple[date, date], ...]
+    gap_days: tuple[date, ...]
     actions: tuple[CorporateAction, ...]
-    gap_actions: tuple[tuple[date, tuple[CorporateAction, ...]], ...]
     symbol_changes: tuple[SymbolChange, ...]
     mergers: tuple[Merger, ...]
     merger_report: Any
@@ -2968,6 +3002,8 @@ def _fetch_prices(
     prices: PriceSource,
     now: datetime,
     clock: Callable[[], datetime],
+    *,
+    recover_gaps: bool = True,
 ) -> _PriceFetch:
     """The price side's fetch pass (#173): names and the action replay plan
     from short read-only connections, bars and actions fetched with no store
@@ -2996,12 +3032,24 @@ def _fetch_prices(
                 # #1572: a name delisted inside the gap is fetched for the missed
                 # sessions it still traded on (its last bars), never for `session`.
                 gap_only = _price_names(conn, read_at, missed[0], settings)[0] - fetch
-        with _price_read(settings) as conn:
-            edgar_gaps, expired_gaps = _edgar_gap_names(
-                conn, settings, read_at, session, set(missed)
-            )
+        if recover_gaps:
+            # Keep the bounded gap scan off the master read: one more lock
+            # wait is possible, but neither read holds the other open.
+            try:
+                with _price_read(settings) as conn:
+                    edgar_gaps, expired_gaps = _edgar_gap_names(
+                        conn, settings, read_at, session, set(missed)
+                    )
+                scan_note = ""
+            except Exception as exc:
+                edgar_gaps, expired_gaps = {}, []
+                scan_note = f"edgar-gap scan skipped: {type(exc).__name__}"
+        else:
+            edgar_gaps, expired_gaps = {}, []
+            scan_note = ""
     else:
         edgar_gaps, expired_gaps = {}, []
+        scan_note = ""
     if reference is None:
         raise LookupError(f"reference symbol {symbol} has no live listing at {session}")
     ids = sorted(fetch)
@@ -3017,26 +3065,51 @@ def _fetch_prices(
             and not (bar.session == session and bar.security_id in gap_only)
         ]
     gap_bars: list[Bar] = []
-    gap_actions: list[tuple[date, tuple[CorporateAction, ...]]] = []
+    gap_names: set[str] = set()
+    gap_days: list[date] = []
     gap_notes = [f"edgar-gap expired {day.isoformat()}" for day in expired_gaps]
+    if scan_note:
+        gap_notes.insert(0, scan_note)
     for day, names in edgar_gaps.items():
         try:
             day_bars = prices.bars(sorted(names), day, day)
-            day_actions = prices.corporate_actions(sorted(names), day, day)
         except Exception as exc:
             gap_notes.append(f"edgar-gap backfill skipped {day.isoformat()}: {type(exc).__name__}")
             continue
         gap_bars.extend(bar for bar in day_bars if bar.session == day and bar.security_id in names)
-        gap_actions.append((day, tuple(day_actions)))
-    action_window = (request_runs[0][0].replace(day=1), session)
-    actions = prices.corporate_actions(every, *action_window)
+        gap_names.update(names)
+        gap_days.append(day)
+    normal_window = (request_runs[0][0].replace(day=1), session)
+    action_window = (
+        (
+            min(normal_window[0], *(day.replace(day=1) for day in gap_days)),
+            session,
+        )
+        if gap_days
+        else normal_window
+    )
+    action_ids = sorted(set(every) | gap_names)
+    try:
+        actions = prices.corporate_actions(action_ids, *action_window)
+    except Exception as exc:
+        if not gap_names:
+            raise
+        gap_notes.extend(
+            f"edgar-gap backfill skipped {day.isoformat()}: {type(exc).__name__}"
+            for day in gap_days
+        )
+        gap_bars.clear()
+        gap_names.clear()
+        gap_days.clear()
+        action_window = normal_window
+        actions = prices.corporate_actions(every, *action_window)
     action_summary = prices.resolution_summary()
     # A name change is asked for by `process_date` from one lag before the
     # month (#1665 review): one processed on a month's last session is
     # stamped the next session's close, so the next month's first run must
     # still ask for it. Identity makes the overlap add nothing.
     lag = timedelta(days=settings.alpaca.actions_process_lag_days)
-    changes = prices.symbol_changes(every, action_window[0] - lag, action_window[1])
+    changes = prices.symbol_changes(every, normal_window[0] - lag, normal_window[1])
     change_summary = prices.resolution_summary()
     # Mergers (#1762): one symbol-less request over `process_date` from one lag
     # before the session, because an acquiree is usually delisted before Alpaca
@@ -3046,10 +3119,26 @@ def _fetch_prices(
     merger_report = getattr(prices, "last_actions_report", None)
     merger_summary = prices.resolution_summary()
     have = {bar.security_id for bar in bars if bar.session == session}
-    with _price_read(settings) as conn:
-        plan = _replay_plan(conn, actions, action_window)
-        stale_ids = _stale_listed(conn, read_at, session, listed - have, reference, settings)
-    actions, covered = _replay_actions(prices, actions, action_window, plan)
+    try:
+        with _price_read(settings) as conn:
+            plan = _replay_plan(conn, actions, action_window)
+            stale_ids = _stale_listed(conn, read_at, session, listed - have, reference, settings)
+        actions, covered = _replay_actions(prices, actions, action_window, plan)
+    except Exception as exc:
+        if not gap_names:
+            raise
+        gap_notes.extend(
+            f"edgar-gap backfill skipped {day.isoformat()}: {type(exc).__name__}"
+            for day in gap_days
+        )
+        gap_bars.clear()
+        gap_days.clear()
+        action_window = normal_window
+        actions = prices.corporate_actions(every, *action_window)
+        with _price_read(settings) as conn:
+            plan = _replay_plan(conn, actions, action_window)
+            stale_ids = _stale_listed(conn, read_at, session, listed - have, reference, settings)
+        actions, covered = _replay_actions(prices, actions, action_window, plan)
     ingested_at = ensure_tz_aware_utc(clock(), field_name="clock()")  # revisions: when fetched
     bars.extend(replace(bar, known_at=ingested_at) for bar in gap_bars)
     if reference not in have:
@@ -3084,8 +3173,8 @@ def _fetch_prices(
     return _PriceFetch(
         tuple(bars),
         tuple(write_runs),
+        tuple(gap_days),
         tuple(actions),
-        tuple(gap_actions),
         tuple(changes),
         tuple(mergers),
         merger_report,
@@ -3203,6 +3292,7 @@ def _edgar_gap_names(
     ).fetchone()
     last_fetch = latest[0] if latest else None
     last_message = (latest[1] or "") if latest else ""
+    retry_scan = "edgar-gap scan skipped:" in last_message
     days: dict[date, datetime] = {}
     for day, fetched_at in evenings:
         if day is not None and fetched_at is not None:
@@ -3221,7 +3311,7 @@ def _edgar_gap_names(
         if day in missed or fetched_at is None:
             continue
         retry = f"edgar-gap backfill skipped {day.isoformat()}:" in last_message
-        threshold = fetched_at if retry or day == expiring else last_fetch
+        threshold = fetched_at if retry or retry_scan or day == expiring else last_fetch
         if threshold is None:
             continue
         new = {
@@ -3303,10 +3393,6 @@ def _write_prices(conn: duckdb.DuckDBPyConnection, fetched: _PriceFetch) -> tupl
         covered=fetched.covered,
         stats=stats,
     )
-    for day, actions in fetched.gap_actions:
-        added += _add_actions(
-            conn, actions, (day, day), ingested_at=at, covered=(day, day), stats=stats
-        )
     added += _add_symbol_changes(conn, fetched.symbol_changes, ingested_at=at, stats=stats)
     added += _add_mergers(conn, fetched.mergers, ingested_at=at, stats=stats)
     _count_merger_report(stats, fetched.merger_report)
