@@ -699,28 +699,28 @@ Added 2026-10-20 by the #1976 amendment. Each with a recommendation, **for the o
 
 Added 2026-10-26 by the #2266 amendment ([ADR 0025](../decisions/0025-reconcile-by-breaks.md)). All thirteen decided by the owner on 2026-10-26: every recommendation taken.
 
-38. **What a restriction blocks.** (a) Orders that add exposure are blocked; sells of a long, covers of a short, forced exits and `paper stop` are allowed, sized to at most min(|ledger|, |broker|) (recommended: a halted name must still be exitable, #2156); (b) every order in the name is blocked until the true-up.
+38. **What a restriction blocks.** *Decided (owner, 2026-10-26): as recommended.* (a) Orders that add exposure are blocked; sells of a long, covers of a short, forced exits and `paper stop` are allowed, sized to at most min(|ledger|, |broker|) (recommended: a halted name must still be exitable, #2156); (b) every order in the name is blocked until the true-up.
 
-39. **Materiality.** Immaterial when at or below both `risk.break_materiality_usd = 25.0` and `risk.break_materiality_bps = 5.0` of ledger equity (recommended; $25 on a $100,000 book, $0.05 on a $100 one). Other numbers are a one-line change before the build.
+39. **Materiality.** *Decided (owner, 2026-10-26): as recommended.* Immaterial when at or below both `risk.break_materiality_usd = 25.0` and `risk.break_materiality_bps = 5.0` of ledger equity (recommended; $25 on a $100,000 book, $0.05 on a $100 one). Other numbers are a one-line change before the build.
 
-40. **The break cap.** `risk.max_open_breaks = 3` and `risk.max_open_break_share = 0.02` of equity, above either a book-level `break_cap` halt (recommended). Higher numbers halt less often and hide a systemic fault for longer.
+40. **The break cap.** *Decided (owner, 2026-10-26): as recommended.* `risk.max_open_breaks = 3` and `risk.max_open_break_share = 0.02` of equity, above either a book-level `break_cap` halt (recommended). Higher numbers halt less often and hide a systemic fault for longer.
 
-41. **An aged break.** After `risk.break_max_age_sessions = 5` sessions, (a) a repeated alert and a red Home item, no halt (recommended), or (b) a book-level halt.
+41. **An aged break.** *Decided (owner, 2026-10-26): as recommended.* After `risk.break_max_age_sessions = 5` sessions, (a) a repeated alert and a red Home item, no halt (recommended), or (b) a book-level halt.
 
-42. **Windows open before the build.** (a) They read the new `risk.*` keys at their defaults (recommended, the #2183 precedent), or (b) they keep today's halt until they are restarted.
+42. **Windows open before the build.** *Decided (owner, 2026-10-26): as recommended.* (a) They read the new `risk.*` keys at their defaults (recommended, the #2183 precedent), or (b) they keep today's halt until they are restarted.
 
-43. **An unexplained change on a short** (`short_external_change`: a buy-in, a recall). (a) A name-level break, always material, with covers allowed under question 38 (recommended); (b) it stays a book-level halt because a short's loss is unbounded.
+43. **An unexplained change on a short** *Decided (owner, 2026-10-26): as recommended.* (`short_external_change`: a buy-in, a recall). (a) A name-level break, always material, with covers allowed under question 38 (recommended); (b) it stays a book-level halt because a short's loss is unbounded.
 
-44. **Automatic acceptance below materiality.** (a) Adopted automatically with an `auto_true_up` row and logged (recommended, #2266 item 3); (b) every break waits for the owner, however small.
+44. **Automatic acceptance below materiality.** *Decided (owner, 2026-10-26): as recommended.* (a) Adopted automatically with an `auto_true_up` row and logged (recommended, #2266 item 3); (b) every break waits for the owner, however small.
 
-45. **A trued-up external break and the shakedown.** Does it also need a `shakedown_note`? (a) No: the true-up's typed reason is the record (recommended); (b) yes, as a `stale_data` alert does.
+45. **A trued-up external break and the shakedown.** *Decided (owner, 2026-10-26): as recommended.* Does it also need a `shakedown_note`? (a) No: the true-up's typed reason is the record (recommended); (b) yes, as a `stale_data` alert does.
 
-46. **An immaterial break whose cause is `unattributed`.** (a) It restarts the span like a material one (recommended: the owner's 2026-10-26 rule that an ambiguous cause restarts; it is auto-accepted for trading either way); (b) it is counted on the E.2 line without a restart, as a tolerance.
+46. **An immaterial break whose cause is `unattributed`.** *Decided (owner, 2026-10-26): as recommended.* (a) It restarts the span like a material one (recommended: the owner's 2026-10-26 rule that an ambiguous cause restarts; it is auto-accepted for trading either way); (b) it is counted on the E.2 line without a restart, as a tolerance.
 
-47. **An `unattributed` break that an explainer later clears** (a late store row, a data delay). (a) It still restarts the span, because the cause is fixed at detection and only broker activity seen at detection makes a late row external (recommended, ADR 0017's 2026-10-26 amendment item (c)); (b) a later `auto_explained` close excuses it, which changes its group after detection.
+47. **An `unattributed` break that an explainer later clears** *Decided (owner, 2026-10-26): as recommended.* (a late store row, a data delay). (a) It still restarts the span, because the cause is fixed at detection and only broker activity seen at detection makes a late row external (recommended, ADR 0017's 2026-10-26 amendment item (c)); (b) a later `auto_explained` close excuses it, which changes its group after detection.
 
-48. **An external break still open when `paper shakedown` runs.** (a) E.2 passes while it is younger than `risk.break_max_age_sessions` and fails once it is aged (recommended); (b) every break must be closed before E.2 passes.
+48. **An external break still open when `paper shakedown` runs.** *Decided (owner, 2026-10-26): as recommended.* (a) E.2 passes while it is younger than `risk.break_max_age_sessions` and fails once it is aged (recommended); (b) every break must be closed before E.2 passes.
 
-49. **The cause lookback.** `risk.break_cause_lookback_sessions = 10` XNYS sessions (recommended: covers a payable date two weeks after an ex-date); shorter calls more breaks `unattributed`.
+49. **The cause lookback.** *Decided (owner, 2026-10-26): as recommended.* `risk.break_cause_lookback_sessions = 10` XNYS sessions (recommended: covers a payable date two weeks after an ex-date); shorter calls more breaks `unattributed`.
 
-50. **A true-up's lot.** (a) A positive true-up opens a zero-basis lot flagged `owner_true_up`, a negative one closes lots at zero proceeds, and Phase 6 settles the tax treatment (recommended); (b) the owner types a basis on the command.
+50. **A true-up's lot.** *Decided (owner, 2026-10-26): as recommended.* (a) A positive true-up opens a zero-basis lot flagged `owner_true_up`, a negative one closes lots at zero proceeds, and Phase 6 settles the tax treatment (recommended); (b) the owner types a basis on the command.
