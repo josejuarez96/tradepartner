@@ -947,16 +947,73 @@ def test_zero_share_merger_disposes_all_lots_for_removal_and_later_cil_cash() ->
     ]
 
 
-def test_band_removal_followed_by_merger_cash_holds_back_lots() -> None:
-    """A band removal has no merger id. Later merger cash cannot be dropped:
-    its 150 proceeds would otherwise leave a false 200 loss."""
+def test_band_removal_followed_by_merger_cash_is_one_disposal_of_both() -> None:
+    """A band removal (no merger id) of ten shares at basis 200 took 40; the
+    merger then pays 150 more. The sale is one disposal of 190 proceeds."""
     book = Book()
     book.trade("buy", 10, 20.0, D0303, security_id="SEC_T")
-    book.adjust("corporate_action_cash", D0307, "SEC_T", quantity=-10, cash=0)
+    book.adjust("corporate_action_cash", D0307, "SEC_T", quantity=-10, cash=40)
+    book.adjust("corporate_action_cash", D0310, "SEC_T", cash=150, explanation=_MERGER)
+
+    _, disposals, _ = book.run(D0310)
+    assert [(d.quantity, d.proceeds, d.realised_pnl) for d in disposals] == [(10.0, 190.0, -10.0)]
+
+
+def test_merger_cash_with_no_removal_at_all_holds_back_lots() -> None:
+    """Merger cash that no removal row of the name precedes is never dropped."""
+    book = Book()
+    book.trade("buy", 10, 20.0, D0303, security_id="SEC_T")
     book.adjust("corporate_action_cash", D0310, "SEC_T", cash=150, explanation=_MERGER)
 
     with pytest.raises(LotLedgerError, match="no merger removal"):
         book.run(D0310)
+
+
+def test_later_stock_and_cash_boot_is_sold_not_cil() -> None:
+    """Ten shares (basis 200) get four acquirer shares at 60 and 30 cash
+    now, 30 cash later: the cash due is 60 and no fraction is due. All 60 is
+    boot, f = 60/(60+240) = .2, so 2 shares sell 40 basis for 60 and four
+    acquirer shares keep 160."""
+    book = Book()
+    book.trade("buy", 10, 20.0, D0303, security_id="SEC_T")
+    terms = {
+        **_MERGER,
+        "merger_kind": "stock_and_cash",
+        "acquirer_price": 60.0,
+        "fractional_shares": 0.0,
+        "same_session_cil_cash": 0.0,
+        "merger_cash_due": 60.0,
+    }
+    book.adjust("corporate_action_cash", D0307, "SEC_T", quantity=-10, cash=30, explanation=terms)
+    book.adjust("merger_receipt", D0307, "SEC_A", quantity=4, explanation=_MERGER)
+    book.adjust("corporate_action_cash", D0310, "SEC_T", cash=30, explanation=_MERGER)
+
+    lot_list, disposals, _ = book.run(D0310)
+    assert [(r.quantity, r.cost_basis) for r in _of("SEC_A", lot_list)] == [(4.0, 160.0)]
+    assert [(d.quantity, d.proceeds, d.realised_pnl) for d in disposals] == [(2.0, 60.0, 20.0)]
+
+
+def test_later_cash_beyond_the_boot_due_is_cil() -> None:
+    """As above with 40 later: 30 completes the 60 boot (sells 40 basis for
+    60) and the last 10 sells one of the five fractional shares, f = 1/5 of
+    the carried 160 basis = 32: realised 10 - 32."""
+    book = Book()
+    book.trade("buy", 10, 20.0, D0303, security_id="SEC_T")
+    terms = {
+        **_MERGER,
+        "merger_kind": "stock_and_cash",
+        "acquirer_price": 60.0,
+        "fractional_shares": 1.0,
+        "same_session_cil_cash": 0.0,
+        "merger_cash_due": 60.0,
+    }
+    book.adjust("corporate_action_cash", D0307, "SEC_T", quantity=-10, cash=30, explanation=terms)
+    book.adjust("merger_receipt", D0307, "SEC_A", quantity=4, explanation=_MERGER)
+    book.adjust("corporate_action_cash", D0310, "SEC_T", cash=40, explanation=_MERGER)
+
+    lot_list, disposals, _ = book.run(D0310)
+    assert [(r.quantity, r.cost_basis) for r in _of("SEC_A", lot_list)] == [(4.0, 128.0)]
+    assert [(d.proceeds, d.realised_pnl) for d in disposals] == [(60.0, 20.0), (10.0, -22.0)]
 
 
 def test_same_session_stock_and_cash_cil_sells_fraction_separately() -> None:

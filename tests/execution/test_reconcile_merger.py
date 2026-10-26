@@ -945,6 +945,27 @@ def test_same_session_stock_and_cash_cil_is_journaled_separately_from_boot() -> 
     assert result.adjustments[0].merger_terms["same_session_cil_cash"] == 50.0
 
 
+def test_whole_share_stock_and_cash_receipt_with_unrelated_cil_journals_none() -> None:
+    """Ten target shares give five whole acquirer shares and 625.00 base
+    cash with no fraction due; an unrelated one-cent CIL on the acquirer,
+    inside the cash bound, is not merger CIL, so the removal journals none
+    for the lot rebuild to reject."""
+    cil = CashActivity("unrelated-cil", "CIL", S, "executed", 0.01, "SPY")
+    result = _compare(
+        Ledger(positions={MTUM: HELD}, cash=LEDGER_CASH, through=S),
+        {"SPY": 5.0},
+        LEDGER_CASH + DUE + 0.01,
+        {MTUM: _merger_open(kind="stock_and_cash", acquirer=SPY, share_ratio=0.5)},
+        activities=(cil,),
+    )
+    assert result.status == OK
+    terms = result.adjustments[0].merger_terms
+    assert terms is not None
+    assert terms["fractional_shares"] == 0.0
+    assert terms["same_session_cil_cash"] == 0.0
+    assert terms["merger_cash_due"] == DUE
+
+
 def test_unpaid_stock_cil_closes_quietly_after_window(
     journal_settings: Settings,
     fake: BookedFake,
