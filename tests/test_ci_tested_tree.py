@@ -286,7 +286,9 @@ def _refresh(api: FakeApi) -> bool:
     [
         ("docs/specs/a.md", True),
         ("docs/plans/paper-trading.md", True),
-        ("docs/runbooks/x.toml", True),
+        ("docs/runbooks/x.toml", False),
+        ("docs/ui/book_blurbs.toml", False),
+        ("docs/data.csv", False),
         ("changelog.d/12-x.md", True),
         ("CHANGELOG.md", True),
         ("README.md", True),

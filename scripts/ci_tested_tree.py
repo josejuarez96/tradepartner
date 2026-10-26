@@ -141,15 +141,16 @@ COMPARE_FILES_CAP = 300  # GitHub's compare lists at most 300 files
 def docs_only(paths: Sequence[str]) -> bool:
     """Whether every path is documentation, by a fixed allowlist (#2279).
 
-    Docs are anything under ``docs/`` or ``changelog.d/`` that is markdown, toml, json or
-    txt (never a ``.py``), and a root-level ``*.md``. Code, tests, scripts, ``.github/``,
-    config and dependency files are never docs, so anything else runs the full suite.
+    Docs are markdown (``*.md``) under ``docs/`` or ``changelog.d/``, and a root-level
+    ``*.md``. Any other docs file (``docs/ui/book_blurbs.toml`` is read by code) is not
+    docs. Code, tests, scripts, ``.github/``, config and dependency files are never docs,
+    so anything else runs the full suite.
     """
     for p in paths:
         if not p or ".." in p.split("/") or p.startswith("/"):
             return False
         if p.startswith(DOCS_PREFIXES):
-            if not p.endswith((".md", ".toml", ".json", ".txt", ".csv")):
+            if not p.endswith(".md"):
                 return False
         elif "/" in p or not p.endswith(".md"):
             return False
