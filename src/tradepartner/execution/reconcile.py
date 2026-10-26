@@ -172,9 +172,7 @@ MERGER_CASH = "cash"
 _BUY = "buy"
 _SELL = "sell"
 _ID_SEPARATOR = "-"
-# The above-eight-due uniqueness proof must stay bounded even for a contrived
-# book with many dues. Exhausting this many cent-sum states fails closed.
-_MAX_DIVIDEND_SUBSET_STATES = 10_000
+_CENTS_PER_DOLLAR = Decimal("100")
 
 
 #: The non-trade activity types the ledger knows (spec 2026-10-12, item 2). A
@@ -701,6 +699,8 @@ def compare(
     cash_in_lieu_tolerance = frozen.cash_in_lieu_tolerance
     buffer = frozen.whole_share_price_buffer
     cash_bound = _cash_bound(cash_tol, ledger.fills_since_base)
+    exhaustive_dues = frozen.reconcile_dividend_exhaustive_dues
+    max_states = frozen.reconcile_dividend_subset_states
     _validate(ledger, positions, account, explanations)
     security_of = _reverse(explanations.symbols)
     mismatches: list[Mismatch] = []
@@ -1023,7 +1023,7 @@ def compare(
         matches: list[tuple[int, ...]] = []
         count = len(search_dues)
         candidates: Iterable[tuple[int, ...]]
-        if count <= 8:
+        if count <= exhaustive_dues:
             candidates = (
                 indices
                 for size in range(1, count + 1)
@@ -1047,8 +1047,11 @@ def compare(
                 if len(matches) > 1:
                     break
         if len(matches) == 1 and (
-            count <= 8
-            or _fitting_dividend_subset_count(search_dues, difference_decimal, cash_bound) == 1
+            count <= exhaustive_dues
+            or _fitting_dividend_subset_count(
+                search_dues, difference_decimal, cash_bound, max_states
+            )
+            == 1
         ):
             cash_ok = True
             explained += _dividend_adjustments([search_dues[i] for i in matches[0]])
@@ -1549,21 +1552,31 @@ def _order_mismatches(
 
 
 def _fitting_dividend_subset_count(
-    dividends: Sequence[tuple[str, float]], difference: Decimal, bound: Decimal
+    dividends: Sequence[tuple[str, float]], difference: Decimal, bound: Decimal, max_states: int
 ) -> int:
     """Count all fitting non-empty cent subsets, stopping at two for ambiguity.
 
     The expanded bounds cover any loss from rounding sub-cent dues to integer
     cents. They can conservatively refuse a close fit, never certify an
-    ambiguous fit as unique.
+    ambiguous fit as unique. Exhausting `max_states` cent-sum states
+    (`risk.reconcile_dividend_subset_states`) fails closed, keeping the proof
+    bounded for a contrived book with many dues.
     """
-    raw_cents = [Decimal(str(amount)) * 100 for _, amount in dividends]
+    raw_cents = [Decimal(str(amount)) * _CENTS_PER_DOLLAR for _, amount in dividends]
     cents = [int(value.to_integral_value(rounding=ROUND_HALF_EVEN)) for value in raw_cents]
     rounding = sum(
         (abs(value - rounded) for value, rounded in zip(raw_cents, cents, strict=True)), Decimal(0)
     )
-    low = int(((difference - bound) * 100 - rounding).to_integral_value(rounding=ROUND_CEILING))
-    high = int(((difference + bound) * 100 + rounding).to_integral_value(rounding=ROUND_FLOOR))
+    low = int(
+        ((difference - bound) * _CENTS_PER_DOLLAR - rounding).to_integral_value(
+            rounding=ROUND_CEILING
+        )
+    )
+    high = int(
+        ((difference + bound) * _CENTS_PER_DOLLAR + rounding).to_integral_value(
+            rounding=ROUND_FLOOR
+        )
+    )
     minimum = [0] * (len(cents) + 1)
     maximum = [0] * (len(cents) + 1)
     for index in range(len(cents) - 1, -1, -1):
@@ -1584,7 +1597,7 @@ def _fitting_dividend_subset_count(
                 key = (next_total, next_used)
                 if key not in next_ways:
                     states += 1
-                    if states > _MAX_DIVIDEND_SUBSET_STATES:
+                    if states > max_states:
                         return 2
                 next_ways[key] = min(2, next_ways.get(key, 0) + count)
                 if next_used and next_ways[key] == 2 and low <= next_total <= high:

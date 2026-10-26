@@ -126,6 +126,7 @@ def _run(
     journal_open: Sequence[JournalOpenOrder] = (),
     explanations: Explanations | None = None,
     account_id: str = "acct-1",
+    frozen: RiskConfig = FROZEN,
 ) -> Reconciliation:
     return compare(
         ledger,
@@ -135,7 +136,7 @@ def _run(
         _account(cash, account_id),
         explanations or _explanations(),
         WINDOW,
-        FROZEN,
+        frozen,
         order_id_prefix=PREFIX,
     )
 
@@ -652,13 +653,13 @@ def test_nine_open_dues_do_not_try_an_unlisted_combination() -> None:
     assert _kinds(combination_only) == ["cash"]
 
 
-def test_above_cap_subset_proof_stops_at_its_state_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("tradepartner.execution.reconcile._MAX_DIVIDEND_SUBSET_STATES", 32)
+def test_above_cap_subset_proof_stops_at_its_state_limit() -> None:
     dues = tuple(float(2**i) for i in range(25))
     result = _run(
         _ledger(1_000.0, SEC_A=10.0),
         _positions(AAA=10.0),
         1_000.0 + float(2**24),
+        frozen=FROZEN.model_copy(update={"reconcile_dividend_subset_states": 32}),
         explanations=_explanations(
             dividends={"SEC_A": float(2**25 - 1)}, dividend_dues={"SEC_A": dues}
         ),

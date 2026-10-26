@@ -2029,6 +2029,8 @@ _BACK_FILLED = (
     "max_skip_share",
     "reconcile_merger_lag_sessions",
     "reconcile_dividend_credit_sessions",
+    "reconcile_dividend_exhaustive_dues",
+    "reconcile_dividend_subset_states",
     "delisting_cash_max_premium",
 )
 
@@ -2037,7 +2039,7 @@ _BACK_FILLED = (
     "missing", sorted(k for k in RiskConfig.model_fields if k not in _BACK_FILLED)
 )
 def test_frozen_risk_still_refuses_a_window_lacking_any_other_risk_key(missing: str) -> None:
-    """Only the four legacy back-fills allow a missing frozen risk key."""
+    """Only the legacy back-fills allow a missing frozen risk key."""
     values = _todays_risk_keys_without(missing)
     with pytest.raises(ValueError, match=f"window 7 frozen_json lacks risk keys.*{missing}"):
         frozen_risk(_window_with(json.dumps(values)))

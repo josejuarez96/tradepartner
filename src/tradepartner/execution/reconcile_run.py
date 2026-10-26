@@ -307,6 +307,8 @@ def frozen_risk(window: PaperWindowRow) -> RiskConfig:
     risk.setdefault(
         "reconcile_dividend_credit_sessions", _DEFAULT_RISK.reconcile_dividend_credit_sessions
     )
+    for key in ("reconcile_dividend_exhaustive_dues", "reconcile_dividend_subset_states"):
+        risk.setdefault(key, getattr(_DEFAULT_RISK, key))
     # A window frozen before #411 has no `risk.delisting_cash_max_premium`: same.
     risk.setdefault("delisting_cash_max_premium", _DEFAULT_RISK.delisting_cash_max_premium)
     missing = sorted(set(RiskConfig.model_fields) - set(risk))
