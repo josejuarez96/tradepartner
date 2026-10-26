@@ -1403,6 +1403,24 @@ def test_paper_kill_all_with_no_open_book_exits_no_window(clock: _Clock, factory
     assert "no_window" in out.output
 
 
+def test_paper_kill_all_with_missing_store_refuses_without_writing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: _Clock, factory: _Factory
+) -> None:
+    missing_dir = tmp_path / "missing-store"
+    monkeypatch.setenv("STORE__PATH", str(missing_dir / "paper.duckdb"))
+
+    single = _paper(clock, factory, "kill", "--reason", LONG_REASON)
+    all_books = _paper(clock, factory, "kill", "--all", "--reason", LONG_REASON)
+
+    assert single.exit_code == NO_WINDOW, single.output
+    assert all_books.exit_code == single.exit_code
+    assert all_books.output == single.output
+    assert str(missing_dir / "paper.duckdb") in single.output
+    assert "kill switch NOT engaged" in single.output
+    assert not missing_dir.exists()
+    assert factory.books == []
+
+
 # --- `paper settle` (plan T84c; spec req 17, #571) ---------------------------------------
 #
 # The orders are journaled on window 1 (opened by `paper start`) the way a run
