@@ -17,7 +17,7 @@ Sources run in order, `edgar` then `alpaca`, and **every source runs even when a
 - `1`: a source was stale or failed, or the store was locked.
 - `2`: a configuration error before any work, such as a missing `SEC_EDGAR_USER_AGENT` or Alpaca key. The error names the variable and never prints its value.
 
-After EDGAR recovers, the next ingest also fetches missing bars for newly added names on sessions whose EDGAR step failed but Alpaca succeeded (#2196).
+After EDGAR recovers, ingest tries missing bars for eligible new names on recent EDGAR-failed sessions; a failed gap request retries, while an unavailable bar expires without blocking daily prices (#2196).
 
 **When to run it.** The regular close is 16:00 ET, so the expected session is that day's from 17:00 ET on (13:00 closes are handled by the calendar). The plist below runs at **18:30 local time**, which leaves margin for late bars. If the Mac's time zone is not US Eastern, convert: for example, 18:30 ET is 15:30 PT. launchd uses the Mac's local clock and follows daylight saving time with it.
 

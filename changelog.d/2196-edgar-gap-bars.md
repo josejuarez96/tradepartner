@@ -1,3 +1,3 @@
-- Ingest fills new-name bars missed after an EDGAR failure while Alpaca succeeded ([#2196](https://github.com/josejuarez96/tradepartner/issues/2196)).
+- EDGAR-gap bar recovery reviewed ([#2196](https://github.com/josejuarez96/tradepartner/issues/2196)).
 ### Fixed
-- Backfill eligible new listings on EDGAR-failed sessions at fetch-time known_at (#2196).
+- Backfill eligible new listings after an EDGAR failure without delaying daily prices; failed gap requests retry, missing bars expire, and delisted names' actions are fetched (#2196).

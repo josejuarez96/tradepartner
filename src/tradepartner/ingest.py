@@ -2953,6 +2953,7 @@ class _PriceFetch:
     bars: tuple[Bar, ...]
     runs: tuple[tuple[date, date], ...]
     actions: tuple[CorporateAction, ...]
+    gap_actions: tuple[tuple[date, tuple[CorporateAction, ...]], ...]
     symbol_changes: tuple[SymbolChange, ...]
     mergers: tuple[Merger, ...]
     merger_report: Any
@@ -2982,7 +2983,6 @@ def _fetch_prices(
     read_at = now
     missed: list[date] = []
     gap_only: set[str] = set()
-    edgar_gaps: dict[date, set[str]] = {}
     if Path(settings.store.path).exists():
         with _price_read(settings) as conn:
             # Read the store as of now, after the EDGAR chunk committed (its snapshot
@@ -2992,33 +2992,43 @@ def _fetch_prices(
                 conn, read_at, session, settings
             )
             missed = _missed_sessions(conn, settings, session)
-            edgar_gaps = _edgar_gap_names(conn, settings, read_at, session, set(missed))
             if missed:
                 # #1572: a name delisted inside the gap is fetched for the missed
                 # sessions it still traded on (its last bars), never for `session`.
                 gap_only = _price_names(conn, read_at, missed[0], settings)[0] - fetch
+        with _price_read(settings) as conn:
+            edgar_gaps, expired_gaps = _edgar_gap_names(
+                conn, settings, read_at, session, set(missed)
+            )
+    else:
+        edgar_gaps, expired_gaps = {}, []
     if reference is None:
         raise LookupError(f"reference symbol {symbol} has no live listing at {session}")
     ids = sorted(fetch)
     every = sorted(fetch | gap_only)
-    # Write windows include the targeted EDGAR gaps; regular missed sessions
-    # retain their existing contiguous-request behavior (#1572).
-    runs = _fetch_runs(sorted([*missed, *edgar_gaps, session]))
+    request_runs = _fetch_runs([*missed, session])
+    write_runs = _fetch_runs(sorted([*missed, *edgar_gaps, session]))
     bars: list[Bar] = []
-    for first, last in _fetch_runs([*missed, session]):
+    for first, last in request_runs:
         bars += [
             bar
             for bar in prices.bars(every if first < session else ids, first, last)
             if first <= bar.session <= last
             and not (bar.session == session and bar.security_id in gap_only)
         ]
-    gap_bars = [
-        bar
-        for day, names in edgar_gaps.items()
-        for bar in prices.bars(sorted(names), day, day)
-        if bar.session == day and bar.security_id in names
-    ]
-    action_window = (runs[0][0].replace(day=1), session)
+    gap_bars: list[Bar] = []
+    gap_actions: list[tuple[date, tuple[CorporateAction, ...]]] = []
+    gap_notes = [f"edgar-gap expired {day.isoformat()}" for day in expired_gaps]
+    for day, names in edgar_gaps.items():
+        try:
+            day_bars = prices.bars(sorted(names), day, day)
+            day_actions = prices.corporate_actions(sorted(names), day, day)
+        except Exception as exc:
+            gap_notes.append(f"edgar-gap backfill skipped {day.isoformat()}: {type(exc).__name__}")
+            continue
+        gap_bars.extend(bar for bar in day_bars if bar.session == day and bar.security_id in names)
+        gap_actions.append((day, tuple(day_actions)))
+    action_window = (request_runs[0][0].replace(day=1), session)
     actions = prices.corporate_actions(every, *action_window)
     action_summary = prices.resolution_summary()
     # A name change is asked for by `process_date` from one lag before the
@@ -3060,6 +3070,8 @@ def _fetch_prices(
         f"{len(missing)} of {len(counted)} listed names missing{_reported_note(reported)}; "
         f"{_catchup_note(missed)}"
     )
+    if gap_notes:
+        message = "; ".join(gap_notes) + "; " + message
     if action_summary:
         message += f"; {action_summary}"
     # The name-change call repeats the resolver's line; keep only its own parts.
@@ -3071,8 +3083,9 @@ def _fetch_prices(
         message += f"; {'; '.join(extra)}"
     return _PriceFetch(
         tuple(bars),
-        tuple(runs),
+        tuple(write_runs),
         tuple(actions),
+        tuple(gap_actions),
         tuple(changes),
         tuple(mergers),
         merger_report,
@@ -3156,55 +3169,78 @@ def _edgar_gap_names(
     now: datetime,
     session: date,
     missed: set[date],
-) -> dict[date, set[str]]:
-    """Names added after a failed EDGAR evening's successful price fetch.
+) -> tuple[dict[date, set[str]], list[date]]:
+    """Bounded EDGAR-gap names and sessions expiring from the lookback.
 
-    Run rows identify that evening; listing ingestion time distinguishes names
-    absent from its master. The current master must still fetch each name on
-    that session, and an existing bar needs no repeat fetch.
+    A listing is attempted once, after the last OK price fetch, unless that
+    fetch reported an exception for its gap day. Empty provider answers are
+    not retried. Existing bars and the current master enforce eligibility.
     """
+    sessions = all_sessions()
+    index = bisect_left(sessions, session)
+    limit = settings.ingest.edgar_gap_lookback_sessions
+    prior = sessions[max(0, index - limit) : index]
+    expiring = sessions[index - limit - 1] if index > limit else None
+    if not prior and expiring is None:
+        return {}, []
+    earliest = expiring or prior[0]
     evenings = conn.execute(
         "SELECT TRY_CAST(a.chunk_cursor AS DATE), a.finished_at "
         "FROM ingestion_runs a JOIN ingestion_runs e ON e.started_at = a.started_at "
         "AND e.chunk_cursor = a.chunk_cursor "
         "WHERE a.source = ? AND a.mode = ? AND a.status = ? "
         "AND e.source = 'edgar' AND e.mode = ? AND e.status = ? "
+        "AND TRY_CAST(a.chunk_cursor AS DATE) >= ? "
         "AND TRY_CAST(a.chunk_cursor AS DATE) < ? "
-        "ORDER BY TRY_CAST(a.chunk_cursor AS DATE)",
-        [PRICE_SOURCE, MODE, OK, MODE, FAILED, session],
+        "ORDER BY TRY_CAST(a.chunk_cursor AS DATE) DESC, a.finished_at DESC",
+        [PRICE_SOURCE, MODE, OK, MODE, FAILED, earliest, session],
     ).fetchall()
-    gaps: dict[date, set[str]] = {}
+    latest = conn.execute(
+        "SELECT finished_at, message FROM ingestion_runs "
+        "WHERE source = ? AND mode = ? AND status = ? "
+        "ORDER BY finished_at DESC LIMIT 1",
+        [PRICE_SOURCE, MODE, OK],
+    ).fetchone()
+    last_fetch = latest[0] if latest else None
+    last_message = (latest[1] or "") if latest else ""
+    days: dict[date, datetime] = {}
     for day, fetched_at in evenings:
-        if day is None or day in missed or fetched_at is None:
+        if day is not None and fetched_at is not None:
+            days.setdefault(day, fetched_at)
+    stored = {
+        (day, sid)
+        for day, sid in conn.execute(
+            "SELECT DISTINCT session, security_id FROM prices_daily WHERE session IN "
+            "(SELECT UNNEST(?::DATE[]))",
+            [[*days]],
+        ).fetchall()
+    }
+    gaps: dict[date, set[str]] = {}
+    expired: list[date] = []
+    for day, fetched_at in days.items():
+        if day in missed or fetched_at is None:
+            continue
+        retry = f"edgar-gap backfill skipped {day.isoformat()}:" in last_message
+        threshold = fetched_at if retry or day == expiring else last_fetch
+        if threshold is None:
             continue
         new = {
             sid
             for (sid,) in conn.execute(
                 "SELECT DISTINCT security_id FROM listings "
                 "WHERE ingested_at > ? AND ingested_at <= ? AND valid_from <= ?",
-                [fetched_at, now, day],
+                [threshold, now, day],
             ).fetchall()
         }
         if not new:
             continue
         eligible = _price_names(conn, now, day, settings)[0] & new
-        stored = {
-            sid
-            for (sid,) in conn.execute(
-                "SELECT DISTINCT security_id FROM prices_daily WHERE session = ?", [day]
-            ).fetchall()
-        }
-        if names := eligible - stored:
+        if names := {sid for sid in eligible if (day, sid) not in stored}:
+            if day == expiring:
+                expired.append(day)
+                continue
             gaps[day] = names
-    bound = settings.alpaca.max_catchup_sessions
-    if len(gaps) + len(missed) > bound:
-        first = min(gaps)
-        raise _Stale(
-            f"{len(gaps)} EDGAR-gap sessions have unfilled new-name bars, over the "
-            f"{bound}-session catch-up bound (alpaca.max_catchup_sessions); run "
-            f"tradepartner ingest --source alpaca --backfill --since {first.isoformat()}"
-        )
-    return gaps
+    return gaps, expired
 
 
 def _fetch_runs(targets: Sequence[date]) -> list[tuple[date, date]]:
@@ -3267,6 +3303,10 @@ def _write_prices(conn: duckdb.DuckDBPyConnection, fetched: _PriceFetch) -> tupl
         covered=fetched.covered,
         stats=stats,
     )
+    for day, actions in fetched.gap_actions:
+        added += _add_actions(
+            conn, actions, (day, day), ingested_at=at, covered=(day, day), stats=stats
+        )
     added += _add_symbol_changes(conn, fetched.symbol_changes, ingested_at=at, stats=stats)
     added += _add_mergers(conn, fetched.mergers, ingested_at=at, stats=stats)
     _count_merger_report(stats, fetched.merger_report)
