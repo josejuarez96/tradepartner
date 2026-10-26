@@ -4290,7 +4290,10 @@ def make_app(
                 _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
             ) from exc
         _run_lines("paper run", outcome, s)
-        heartbeat.ping(s, "paper", ok=outcome.healthy)  # a halted book stays red (#2179)
+        if not outcome.healthy:
+            # A `--book` run only ever turns the check red: it cannot see the other
+            # books, so only the scheduled every-book run may ping OK (#2179).
+            heartbeat.ping(s, "paper", ok=False)
         if outcome.exit_code:
             raise typer.Exit(outcome.exit_code)
 

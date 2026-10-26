@@ -99,3 +99,23 @@ def test_multi_book_run_with_one_engaged_and_one_ok_pings_fail(
     assert "book zeta: skipped_kill_switch" in out.output, out.output
     assert out.exit_code == 0
     assert calls == [HEARTBEAT_URL + "/fail"], calls
+
+
+def test_a_book_run_never_pings_ok_while_another_book_is_engaged(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, books: object
+) -> None:
+    calls = _heartbeat_calls(monkeypatch)
+    _fresh_data(monkeypatch)
+    kill = _paper(
+        clock,
+        books,  # type: ignore[arg-type]
+        "kill",
+        "--book",
+        "zeta",
+        "--reason",
+        LONG_REASON,
+    )
+    assert kill.exit_code == 0
+    out = _paper(clock, books, "run", "--book", "main")  # type: ignore[arg-type]
+    assert out.exit_code == 0, out.output
+    assert calls == [], calls
