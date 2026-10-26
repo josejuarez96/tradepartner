@@ -11,6 +11,7 @@ future schema, could have.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -75,6 +76,7 @@ from tradepartner.health import (
     CoverageReference,
     HealthReport,
     IndexMembersCheck,
+    IntegrityCheck,
     _bars_after_delisting,
     _overlapping_listings,
     bar_gaps,
@@ -86,10 +88,12 @@ from tradepartner.health import (
     figi_types,
     filing_event_counts,
     health_report,
+    health_verdict,
     integrity_checks,
     last_ingests,
     listed_without_bars,
     sample_sessions,
+    stale_gap_expected,
     statement_counts,
     statement_coverage,
     static_reliance,
@@ -4449,3 +4453,59 @@ def test_a_store_without_the_mergers_table_reports_an_empty_block(
     assert report.mergers.latest_known_at is None
     assert report.mergers.conflicts.is_empty()
     assert report.mergers.after_effective.is_empty()
+
+
+# --- Verdict line (#2202) ---------------------------------------------------
+
+
+def test_verdict_fine_when_bars_are_current(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    verdict = health_verdict(health_report(fixture_store, T_END, settings))
+    assert verdict.startswith("Fine for the next paper run")
+    assert "2020-06-30" in verdict
+
+
+def test_verdict_expects_the_gap_before_the_evening_ingest(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    t = session_close(date(2020, 7, 1)) + timedelta(hours=1)  # 17:00 ET, before 18:30
+    report = health_report(fixture_store, t, settings)
+    assert stale_gap_expected(report)
+    verdict = health_verdict(report)
+    assert verdict.startswith("Fine for the next paper run once tonight's 18:30 ET ingest")
+    assert "expected" in verdict
+
+
+def test_verdict_flags_a_gap_after_the_ingest_time(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    t = session_close(date(2020, 7, 1)) + timedelta(hours=3)  # 19:00 ET, ingest overdue
+    report = health_report(fixture_store, t, settings)
+    assert not stale_gap_expected(report)
+    verdict = health_verdict(report)
+    assert verdict.startswith("Not fine")
+    assert "1 session behind" in verdict
+
+
+def test_verdict_names_integrity_failures(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    report = health_report(fixture_store, T_END, settings)
+    failing = dataclasses.replace(
+        report,
+        integrity=(IntegrityCheck("some_rule", pl.DataFrame({"x": [1]})),),
+    )
+    verdict = health_verdict(failing)
+    assert verdict.startswith("Not fine")
+    assert "some_rule" in verdict
+
+
+def test_verdict_for_an_empty_store(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    report = health_report(fixture_store, T_END, settings)
+    empty = dataclasses.replace(
+        report, coverage=dataclasses.replace(report.coverage, last_bar=None)
+    )
+    assert "no price bars" in health_verdict(empty)

@@ -436,6 +436,7 @@ from tradepartner.health import (
     HealthReport,
     IndexMembersCheck,
     health_report,
+    health_verdict,
 )
 from tradepartner.ingest import (
     SOURCES,
@@ -2646,6 +2647,7 @@ def make_app(
             raise _fail(
                 f"the store has no usable schema; run `tradepartner ingest`: {exc}", 1
             ) from None
+        typer.echo(health_verdict(report))
         _print_report(report)
         warnings = 0
         if (count := _quarantined(report)) > 0:

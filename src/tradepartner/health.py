@@ -1826,6 +1826,63 @@ class HealthReport:
         return not self.failures
 
 
+#: When the scheduled ingest runs (America/New_York, docs/runbooks/scheduling.md).
+INGEST_TIME_ET = time(18, 30)
+_ET = ZoneInfo("America/New_York")
+
+
+def stale_sessions(report: HealthReport) -> int | None:
+    """Sessions between the store's last bar and the last completed session at the
+    report time; `None` when the store has no bars."""
+    last_bar = report.coverage.last_bar
+    if last_bar is None:
+        return None
+    sessions = all_sessions()
+    return bisect_right(sessions, report.session) - bisect_right(sessions, last_bar)
+
+
+def stale_gap_expected(report: HealthReport) -> bool:
+    """True when the store is one session behind only because today's scheduled
+    ingest has not run yet (after the close, before `INGEST_TIME_ET`)."""
+    local = report.t.astimezone(_ET)
+    return (
+        stale_sessions(report) == 1
+        and local.date() == report.session
+        and local.time() < INGEST_TIME_ET
+    )
+
+
+def health_verdict(report: HealthReport) -> str:
+    """One plain line: is the data fine for the next paper run, and is a stale
+    session expected before tonight's ingest. Pure: it only reads `report`."""
+    if failures := report.failures:
+        return (
+            f"Not fine for the next paper run: {len(failures)} integrity "
+            f"check(s) fail ({', '.join(failures)}). Fix them before it runs."
+        )
+    stale = stale_sessions(report)
+    if stale is None:
+        return (
+            "Not fine for the next paper run: the store has no price bars. "
+            "Run `tradepartner ingest`."
+        )
+    if stale == 0:
+        return (
+            "Fine for the next paper run: no integrity failures, "
+            f"bars current to {report.coverage.last_bar}."
+        )
+    if stale_gap_expected(report):
+        return (
+            f"Fine for the next paper run once tonight's {INGEST_TIME_ET:%H:%M} ET ingest "
+            f"runs: today's bars are not in yet ({report.session}), which is expected until then."
+        )
+    plural = "" if stale == 1 else "s"
+    return (
+        f"Not fine for the next paper run: the store is {stale} session{plural} behind "
+        f"(last bar {report.coverage.last_bar}) and no ingest is due. Run `tradepartner ingest`."
+    )
+
+
 def health_report(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
