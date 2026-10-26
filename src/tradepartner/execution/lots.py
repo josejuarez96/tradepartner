@@ -525,7 +525,14 @@ class _Ledger:
             # Later cash first completes the boot the merger owed; only the
             # rest is cash in lieu of the fractional share.
             due = _merger_number(terms["merger_cash_due"], removal, "merger_cash_due")
-            later_boot = min(later_cash, max(due - boot, _ZERO))
+            fraction_due = _merger_number(
+                terms.get("fractional_shares", 0), removal, "fractional_shares"
+            )
+            # With no fraction due, all later cash is boot (float rounding in
+            # the journaled amounts must not leave a stray CIL).
+            later_boot = (
+                later_cash if fraction_due <= _ZERO else min(later_cash, max(due - boot, _ZERO))
+            )
             boot += later_boot
         if boot > _ZERO:
             price = _merger_number(terms.get("acquirer_price"), removal, "acquirer_price")

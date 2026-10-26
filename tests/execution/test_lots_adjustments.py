@@ -993,6 +993,31 @@ def test_later_stock_and_cash_boot_is_sold_not_cil() -> None:
     assert [(d.quantity, d.proceeds, d.realised_pnl) for d in disposals] == [(2.0, 60.0, 20.0)]
 
 
+def test_later_boot_with_float_rounding_and_no_fraction_is_all_boot() -> None:
+    """14 shares x 52.14 = 729.96 due; 6.06 paid at removal and the float
+    remainder 723.9000000000001 later. No fraction is due, so the 1e-13 over
+    the exact remainder is boot, not CIL, and the rebuild does not raise."""
+    book = Book()
+    book.trade("buy", 14, 20.0, D0303, security_id="SEC_T")
+    terms = {
+        **_MERGER,
+        "merger_kind": "stock_and_cash",
+        "acquirer_price": 60.0,
+        "fractional_shares": 0.0,
+        "same_session_cil_cash": 0.0,
+        "merger_cash_due": 729.96,
+    }
+    book.adjust("corporate_action_cash", D0307, "SEC_T", quantity=-14, cash=6.06, explanation=terms)
+    book.adjust("merger_receipt", D0307, "SEC_A", quantity=7, explanation=_MERGER)
+    book.adjust(
+        "corporate_action_cash", D0310, "SEC_T", cash=723.9000000000001, explanation=_MERGER
+    )
+
+    _, disposals, _ = book.run(D0310)
+    assert len(disposals) == 1
+    assert round(disposals[0].proceeds, 6) == 729.96
+
+
 def test_later_cash_beyond_the_boot_due_is_cil() -> None:
     """As above with 40 later: 30 completes the 60 boot (sells 40 basis for
     60) and the last 10 sells one of the five fractional shares, f = 1/5 of
