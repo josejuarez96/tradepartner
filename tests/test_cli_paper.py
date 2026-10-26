@@ -1759,6 +1759,7 @@ STATUS_MAIN = (
     "reconciliation n/a\n"
     "slippage vs open (bp, adverse positive, per order): buy n=0; sell n=0; all n=0; "
     "no bar 0; off session 0; pending 0\n"
+    "no successful EDGAR ingest yet; run `tradepartner ingest`\n"
     "alerts (0):\n"
 )
 CHECK_MAIN = (
@@ -1865,6 +1866,7 @@ def test_status_all_prints_one_summary_line_per_book(
         "b: trading, 0 issues\n"
         "main: trading, 0 issues\n"
         "waiting on you: nothing\n"
+        "no successful EDGAR ingest yet; run `tradepartner ingest`\n"
         f"book b: window {b_window} open; positions 0; open orders 0; kill switch released; "
         f"last run n/a; {nxt}"
         f"book main: window 1 open; positions 0; open orders 0; kill switch released; "
@@ -2023,8 +2025,20 @@ def test_edgar_age_counts_sessions_not_weekdays_across_thanksgiving(
 
 
 @pytest.mark.usefixtures("started")
-def test_status_names_no_edgar_age_without_an_ok_run(clock: _Clock, factory: _Factory) -> None:
-    assert "EDGAR data" not in _paper(clock, factory, "status").output
+def test_status_names_no_edgar_ingest_without_an_ok_run(
+    clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
+    _edgar_run(datetime(2026, 9, 30, 22, tzinfo=UTC), status="failed")
+    _edgar_run(datetime(2026, 9, 30, 22, tzinfo=UTC), source="alpaca")
+    for args in (("status",), ("status", "--all")):
+        out = _paper(clock, factory, *args)
+        assert out.exit_code == 0, out.output
+        assert "no successful EDGAR ingest yet" in out.output
+    with duckdb.connect(_settings().store.path, read_only=True) as conn:
+        age = ops.edgar_age(conn, _settings(), SESSION_CLOCK)
+    assert age is not None
+    assert age.last_ok_session is None
 
 
 @pytest.mark.usefixtures("started")
@@ -2106,6 +2120,7 @@ def test_status_all_lists_two_waiting_items_byte_for_byte(
         f"since {since_et}; "
         f"command tradepartner paper resume --book main "
         '--reason "<why>"\n'
+        "no successful EDGAR ingest yet; run `tradepartner ingest`\n"
         f"book b: window {b_window} open; positions 0; open orders 0; kill switch engaged; "
         f"last run n/a; {nxt}"
         f"book main: window 1 open; positions 0; open orders 0; kill switch engaged; "
@@ -2228,7 +2243,9 @@ def test_status_all_with_no_window(clock: _Clock, factory: _Factory) -> None:
     out = _paper(clock, factory, "status", "--all")
     assert (out.exit_code, out.output) == (
         0,
-        "paper status: no paper window yet\nwaiting on you: nothing\n",
+        "paper status: no paper window yet\n"
+        "no successful EDGAR ingest yet; run `tradepartner ingest`\n"
+        "waiting on you: nothing\n",
     )
 
 
