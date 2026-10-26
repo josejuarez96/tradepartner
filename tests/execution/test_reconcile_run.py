@@ -48,6 +48,7 @@ from tradepartner.execution.reconcile_run import (
     command_session,
     explanations_as_of,
     frozen_risk,
+    order_symbols,
     reconcile_command,
     reconcile_now,
 )
@@ -969,6 +970,90 @@ def test_two_candidate_ticker_changes_for_a_name_are_a_mismatch(
         "unknown_symbol",
     ]
     assert listed["symbol_changes"] == []
+
+
+def _order_symbols(settings: Settings, window: PaperWindowRow, *names: str) -> Any:
+    assert window.window_id is not None
+    with open_read_only(settings) as conn:
+        return order_symbols(conn, S, names, settings, window.window_id)
+
+
+def test_the_order_path_reads_the_symbol_reconcile_mapped_after_a_ticker_change(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2185: the listings still show `SPY`, a change to `SPYX` is known at
+    close(S-1) and the broker holds `SPYX`: once the reconciliation on S applied
+    it, the order path's map sends `SPY` under `SPYX`, the one reconcile mapped."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1))
+    fake.extra_quantity = {"SPY": -10.0, "SPYX": 10.0}
+
+    before = _order_symbols(journal_settings, open_window, SPY, MTUM)
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+    after = _order_symbols(journal_settings, open_window, SPY, MTUM)
+
+    assert result.symbol_changes == (SymbolChangeRecord(SPY, "SPY", "SPYX"),)
+    assert after.symbols == {SPY: "SPYX", MTUM: "MTUM"}
+    assert after.ambiguous == {}
+    # Before any reconciliation on S applied it, the name is never sent under SPY.
+    assert before.symbols == {MTUM: "MTUM"}
+    assert "SPY -> SPYX" in before.ambiguous[SPY]
+
+
+def test_two_ticker_changes_in_force_leave_the_name_out_of_the_order_map(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2185: two candidate new symbols are ambiguous: dropped, with a note naming
+    both, never sent under the old symbol."""
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1), "r1")
+    _symbol_change(journal_settings, SPY, "SPY", "SPYZ", CUT - timedelta(minutes=1), "r2")
+
+    found = _order_symbols(journal_settings, open_window, SPY)
+
+    assert found.symbols == {}
+    assert "SPY -> SPYX/SPYZ" in found.ambiguous[SPY]
+
+
+def test_a_symbol_claimed_by_a_renamed_name_and_another_leaves_both_out(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2185: the old ticker reused by another issuer (MTUM's listing re-tickered
+    to `SPY`) while SPY's change is not applied: both names claim `SPY`, so the
+    order map drops both, each with a note, instead of halting the run."""
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1))
+    with open_for_write(journal_settings) as conn:
+        conn.execute("UPDATE listings SET ticker = 'SPY' WHERE security_id = ?", [MTUM])
+
+    found = _order_symbols(journal_settings, open_window, SPY, MTUM)
+
+    assert found.symbols == {}
+    assert sorted(found.ambiguous) == [MTUM, SPY]
+    assert "claim SPY" in found.ambiguous[MTUM]
+
+
+def test_the_order_map_reads_no_ticker_change_known_after_close_s_minus_1(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2185 (no look-ahead): a change stamped a minute after close(S-1) is not
+    read, so the name keeps its listing's symbol and is not ambiguous."""
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT + timedelta(minutes=1))
+
+    found = _order_symbols(journal_settings, open_window, SPY)
+
+    assert found.symbols == {SPY: "SPY"}
+    assert found.ambiguous == {}
 
 
 def test_a_split_known_at_close_of_the_previous_session_explains_the_new_quantity(

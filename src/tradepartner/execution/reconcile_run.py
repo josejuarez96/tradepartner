@@ -429,16 +429,25 @@ def _symbols(
     broker_symbols: Collection[str],
     class_symbols: Mapping[str, str] | None,
     changes: Mapping[str, Sequence[tuple[str, str]]],
-) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
-    """`security_id` to broker symbol, one name per symbol, and the ticker
-    changes applied to it (module docstring). A listing's ticker is read in its
-    broker form (`broker_symbol`, #1729), so a `GEF.B` position matches the
-    `GEF-B` listing. A held name whose stored change (at close(S-1)) puts it
-    under a new symbol the broker holds maps to that symbol (#1761), so the
-    ledger's old-symbol position matches, and the applied changes come back for
-    the row's record."""
+) -> tuple[dict[str, str], dict[str, tuple[str, str]], dict[str, str]]:
+    """`security_id` to broker symbol, one name per symbol, the ticker changes
+    applied to it (module docstring), and the names a ticker change leaves
+    ambiguous: the one symbol map reconcile and the order path share (#2185).
+    A listing's ticker is read in its broker form (`broker_symbol`, #1729), so a
+    `GEF.B` position matches the `GEF-B` listing. A held name whose stored
+    change (at close(S-1)) puts it under a new symbol the broker holds maps to
+    that symbol (#1761), so the ledger's old-symbol position matches, and the
+    applied changes come back for the row's record.
+
+    A name is ambiguous, with a note naming the change, when a change from its
+    symbol is in force but not applied (two candidate new symbols, or one the
+    broker does not hold), or when it loses a symbol claim one of whose
+    claimants a change touches. Reconcile reads the map as before; the order
+    path (`order_symbols`) drops an ambiguous name, so it is never sent under
+    the old symbol."""
     claims: dict[str, list[str]] = defaultdict(list)
     applied: dict[str, tuple[str, str]] = {}
+    ambiguous: dict[str, str] = {}
     for name in sorted(set(names)):
         listing = current.get(name)
         symbol = (
@@ -446,20 +455,33 @@ def _symbols(
             if listing is not None
             else order_symbols.get(name)
         )
-        change = (
-            _applied_change(name, symbol, changes, broker_symbols) if symbol is not None else None
-        )
+        if symbol is None:
+            continue
+        change = _applied_change(name, symbol, changes, broker_symbols)
+        candidates = sorted({new for old, new in changes.get(name, ()) if old == symbol})
         if change is not None:
             applied[name] = change
             symbol = change[1]
-        if symbol is not None:
-            claims[symbol].append(name)
+        elif candidates:
+            ambiguous[name] = (
+                f"{name}: ticker change {symbol} -> {'/'.join(candidates)} known at "
+                "close(S-1) is not on the broker's positions"
+            )
+        claims[symbol].append(name)
     symbols: dict[str, str] = {}
     for symbol, claimants in claims.items():
         live = [n for n in claimants if current.get(n, {}).get("status") != DELISTED]
         chosen = claimants if len(claimants) == 1 else live
         if len(chosen) == 1:
             symbols[chosen[0]] = symbol
+        if len(claimants) > 1 and any(n in applied or n in ambiguous for n in claimants):
+            for name in claimants:
+                if symbols.get(name) != symbol:
+                    ambiguous.setdefault(
+                        name,
+                        f"{name}: {', '.join(sorted(claimants))} claim {symbol} "
+                        "after a ticker change",
+                    )
     claimed = set(claims)
     for symbol in sorted(set(broker_symbols) - claimed):
         matches = [
@@ -472,9 +494,95 @@ def _symbols(
     # Only a change the final map kept is recorded: a later pass (the
     # unclaimed-symbol rule) can put the name back on its listing's symbol
     # when the broker holds both, and the row must not claim it was applied.
-    return symbols, {
-        name: change for name, change in applied.items() if symbols.get(name) == change[1]
+    kept = {name: change for name, change in applied.items() if symbols.get(name) == change[1]}
+    for name, (old, new) in applied.items():
+        if name not in kept:
+            ambiguous.setdefault(
+                name, f"{name}: ticker change {old} -> {new} known at close(S-1) was not kept"
+            )
+    return symbols, kept, ambiguous
+
+
+@dataclass(frozen=True)
+class OrderSymbols:
+    """The order path's view of the one symbol map (#2185): `symbols` is each
+    name's broker symbol (None for a listing with no broker form, #1729), with
+    a ticker change applied as reconcile applied it; `ambiguous` holds each
+    name the map dropped, with a note naming the ticker change, which the
+    order path handles per name and never sends under the old symbol. A name
+    with no listing known at close(S-1) is in neither."""
+
+    symbols: dict[str, str | None]
+    ambiguous: dict[str, str]
+
+
+def _recorded_changes(
+    conn: duckdb.DuckDBPyConnection, window_id: int, session: date
+) -> dict[str, tuple[str, str]]:
+    """The ticker changes the window's latest reconciliation on `session`
+    applied (#1761), read from its `mismatches_json`: reconcile applies one
+    only when that reading's `positions()` held the new symbol, and the run
+    reconciles (step 4) before it plans or trades. Empty when no row on
+    `session` exists or it records none."""
+    rows = [
+        r
+        for r in reconciliations_for(conn, window_id)
+        if r.at.astimezone(_NEW_YORK).date() == session
+    ]
+    if not rows or rows[-1].mismatches_json is None:
+        return {}
+    try:
+        payload = json.loads(rows[-1].mismatches_json)
+    except (ValueError, TypeError):
+        return {}
+    found = payload.get("symbol_changes") if isinstance(payload, dict) else None
+    return {
+        str(entry["security_id"]): (str(entry["old_symbol"]), str(entry["new_symbol"]))
+        for entry in (found if isinstance(found, list) else [])
+        if isinstance(entry, dict) and {"security_id", "old_symbol", "new_symbol"} <= entry.keys()
     }
+
+
+def order_symbols(
+    conn: duckdb.DuckDBPyConnection,
+    session: date,
+    names: Iterable[str],
+    settings: Settings,
+    window_id: int,
+) -> OrderSymbols:
+    """The broker symbols the order path sends `names` under on S = `session`
+    (#2185): `_symbols` over each name's listing current at S and the stored
+    `symbol_changes`, both known at close(S-1), with a change applied to a name
+    only when the window's reconciliation on S applied that same change, so
+    reconcile and the order path agree on one map. Read-only."""
+    wanted = sorted(set(names))
+    if not wanted:
+        return OrderSymbols({}, {})
+    cut = _cut(session)
+    current = current_listings(listing_ends_as_of(conn, cut, settings, wanted), session)
+    class_symbols = settings.alpaca.class_symbols
+    recorded = _recorded_changes(conn, window_id, session)
+    mapped, applied, ambiguous = _symbols(
+        wanted,
+        {},
+        current,
+        {new for _, new in recorded.values()},
+        class_symbols,
+        _symbol_change_candidates(conn, cut, wanted),
+    )
+    for name, change in applied.items():
+        if recorded.get(name) != change:
+            ambiguous.setdefault(
+                name,
+                f"{name}: ticker change {change[0]} -> {change[1]} was not applied by "
+                "the reconciliation on this session",
+            )
+    symbols: dict[str, str | None] = {}
+    for name in wanted:
+        if name in ambiguous or name not in current:
+            continue
+        symbols[name] = mapped.get(name, broker_symbol(current[name], class_symbols))
+    return OrderSymbols(symbols, {n: ambiguous[n] for n in wanted if n in ambiguous})
 
 
 def _reference_prices(
@@ -758,7 +866,7 @@ def _explanations(
     # 1), so a symbol an acquirer shares with its acquiree is resolved by
     # `_symbols`' one-name-per-symbol rule, never a crash.
     mapped = names | acquirers
-    symbols, symbol_changes = _symbols(
+    symbols, symbol_changes, _ambiguous = _symbols(
         mapped,
         order_symbols,
         current,

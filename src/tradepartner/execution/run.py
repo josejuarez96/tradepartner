@@ -268,13 +268,13 @@ from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, Mismatch, 
 from tradepartner.execution.reconcile import OK as RECONCILED
 from tradepartner.execution.reconcile_run import (
     frozen_risk,
+    order_symbols,
     reconcile_now,
     settle_pending_unresolved,
     unresolved_orders,
     verify_frozen_sha256,
 )
 from tradepartner.execution.risk import OpenSell, unfilled_sells
-from tradepartner.execution.symbols import broker_symbol
 from tradepartner.execution.window import window_cadence
 from tradepartner.execution.wrapper import (
     CRASH_EXIT_CODE,
@@ -626,7 +626,7 @@ class _ExitBook:
     actions: pl.DataFrame
     open_sells: list[OpenSell]
     delisted: dict[str, date | None]
-    assets: dict[str, Asset]
+    assets: dict[str, exits.ExitAsset]
     marks: list[PositionDailyRow]
     runs: list[PaperRunRow]
 
@@ -680,13 +680,7 @@ def _exit_book(context: StepContext) -> _ExitBook:
             if held
             else {}
         )
-        tickers = (
-            _current_symbols(
-                listings_as_of(conn, cut, held), session, context.settings.alpaca.class_symbols
-            )
-            if held
-            else {}
-        )
+        tickers, ambiguous = _current_symbols(conn, session, held, context.settings, window_id)
         marks_rows = positions_daily_for(conn, window_id)
         run_rows = [r.run for r in runs_for(conn, window_id)]
     price_of = _lookup(prices, unpriced)
@@ -726,9 +720,15 @@ def _exit_book(context: StepContext) -> _ExitBook:
             sid: row["end_session"] for sid, row in ends.items() if row["status"] == DELISTED
         },
         assets={
-            sid: context.assets[canonical_symbol(ticker)]
-            for sid, ticker in tickers.items()
-            if canonical_symbol(ticker) in context.assets
+            **{
+                sid: context.assets[canonical_symbol(ticker)]
+                for sid, ticker in tickers.items()
+                if canonical_symbol(ticker) in context.assets
+            },
+            # A name the symbol map leaves ambiguous (#2185) is never read under
+            # its old symbol; its exit is journaled open, whole-share, and the
+            # wrapper keeps it open and notes it, never closing it `untradable`.
+            **dict.fromkeys(ambiguous, _KEPT_OPEN),
         },
         marks=marks_rows,
         runs=run_rows,
@@ -2013,12 +2013,11 @@ class _Run:
         return self._ledger_for(actions)(through)
 
     def _symbols(self, names: Sequence[str]) -> dict[str, str]:
-        """Each name's broker symbol on its listing current at S, known at close(S-1)."""
+        """Each name's broker symbol from the one symbol map (`_current_symbols`)."""
         if not names:
             return {}
         with open_read_only(self.settings, retry=True) as conn:
-            listings = listings_as_of(conn, self._cut(), list(names))
-        return _current_symbols(listings, self.session, self.settings.alpaca.class_symbols)
+            return _current_symbols(conn, self.session, names, self.settings, self.window_id)[0]
 
     def _start_day(self) -> date:
         return self.window.started_at.astimezone(_NEW_YORK).date()
@@ -2039,14 +2038,8 @@ class _Run:
         with open_read_only(self.settings, retry=True) as conn:
             sessions = self._mark_sessions(last_marked_session(conn, self.window_id))
             held = {name for day in sessions for name in ledger(day).positions}
-            symbols = (
-                _current_symbols(
-                    listings_as_of(conn, self._cut(), sorted(held)),
-                    self.session,
-                    self.settings.alpaca.class_symbols,
-                )
-                if held
-                else {}
+            symbols, _ambiguous = _current_symbols(
+                conn, self.session, sorted(held), self.settings, self.window_id
             )
         # Every name held on any marked session, not only those held at S
         # (#892 item 1, #1116): a name sold before S but held on a back-filled
@@ -2336,14 +2329,35 @@ def _rebalance_kind(
     )
 
 
+@dataclass(frozen=True)
+class _KeptOpen:
+    """The exits' flags for a name the symbol map leaves ambiguous (#2185):
+    no `assets` read is made under its old symbol, so its exit is not closed
+    `untradable` but journaled open and whole-share; the wrapper never sends it."""
+
+    tradable: bool = True
+    fractionable: bool = False
+
+
+_KEPT_OPEN = _KeptOpen()
+
+
 def _current_symbols(
-    listings: pl.DataFrame, day: date, class_symbols: Mapping[str, str] | None
-) -> dict[str, str]:
-    """Each name's broker symbol on its listing current on `day` (#1729); a
-    name whose ticker has no broker form is left out (never sent)."""
-    current = planning.current_listings(listings, day)
-    symbols = {sid: broker_symbol(row, class_symbols) for sid, row in current.items()}
-    return {sid: symbol for sid, symbol in symbols.items() if symbol is not None}
+    conn: duckdb.DuckDBPyConnection,
+    session: date,
+    names: Sequence[str],
+    settings: Settings,
+    window_id: int,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Each name's broker symbol from the one symbol map
+    (`reconcile_run.order_symbols`, #2185), with the names it leaves ambiguous
+    and their notes. A name whose ticker has no broker form (#1729) or that is
+    ambiguous is left out of the first (never read or sent)."""
+    if not names:
+        return {}, {}
+    mapped = order_symbols(conn, session, names, settings, window_id)
+    symbols = {sid: symbol for sid, symbol in mapped.symbols.items() if symbol is not None}
+    return symbols, mapped.ambiguous
 
 
 def _current_ids(listings: pl.DataFrame, day: date, ticker: str) -> list[str]:
