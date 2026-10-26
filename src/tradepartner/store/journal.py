@@ -74,6 +74,7 @@ import duckdb
 
 from tradepartner.store.db import ensure_tz_aware, insert_row
 from tradepartner.store.schema import (
+    _PRE_BREAKS_VERSION,
     CLOSING_BREAK_EVENTS,
     DEFAULT_BOOK_ID,
     ENGAGE_KILL_SWITCH_KIND,
@@ -844,8 +845,10 @@ def _require_break_order(conn: duckdb.DuckDBPyConnection, row: ReconcileBreakRow
     item 4): an `event_id` at or below one already written; an `opened` event on
     an existing break, with an id not derived from its window, name and
     reconciliation, or while the window holds an open break on the name; any other
-    event on a break never opened, on another window, book or name than its
-    `opened` event, or stamped before the break's latest event; an `observed` or
+    event on a break never opened, on another window, book, name or
+    `first_seen_session` than its `opened` event, with another `cause` than it (a
+    later event leaves `cause` NULL or repeats it; amendment item 14: computed once,
+    never rewritten), or stamped before the break's latest event; an `observed` or
     closing event on a closed break; and a `reopened` event on a break whose latest
     event is not `trued_up`, or while another break is open on the name."""
     (max_id,) = conn.execute(  # type: ignore[misc]
@@ -879,6 +882,15 @@ def _require_break_order(conn: duckdb.DuckDBPyConnection, row: ReconcileBreakRow
         raise BreakOrderError(
             f"break {row.break_id} belongs to window {opened.window_id}, book "
             f"{opened.book_id!r}, name {opened.name!r}"
+        )
+    if row.first_seen_session != opened.first_seen_session:
+        raise BreakOrderError(
+            f"break {row.break_id}: first_seen_session {row.first_seen_session} is not its "
+            f"opened event's {opened.first_seen_session}"
+        )
+    if row.cause is not None and row.cause != opened.cause:
+        raise BreakOrderError(
+            f"break {row.break_id}: cause {row.cause!r} rewrites its opened cause {opened.cause!r}"
         )
     if row.known_at < latest.known_at:
         raise BreakOrderError(
@@ -1452,12 +1464,21 @@ def last_ok_reconciliation(
 
 def _has_breaks_table(conn: duckdb.DuckDBPyConnection) -> bool:
     """Whether the store has `reconcile_breaks` (schema version 37 on). A read-only
-    connection to an older store lacks it, and no break can exist there."""
+    connection to an older store lacks it, and no break can exist there; a store
+    at version 37 or later without it raises `JournalNotInitialised` (fail closed,
+    never "no breaks")."""
     (present,) = conn.execute(  # type: ignore[misc]
         "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() "
         "AND schema_name = current_schema() AND table_name = 'reconcile_breaks'"
     ).fetchone()
-    return bool(present)
+    if present:
+        return True
+    (version,) = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()  # type: ignore[misc]
+    if version is not None and version > _PRE_BREAKS_VERSION:
+        raise JournalNotInitialised(
+            f"the store is at schema version {version} but has no reconcile_breaks table"
+        )
+    return False
 
 
 def break_events_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[ReconcileBreakRow]:

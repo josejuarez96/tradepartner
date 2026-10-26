@@ -33,6 +33,7 @@ from tradepartner.store.journal import (
     AlertDeliveryRow,
     AlertRow,
     BreakOrderError,
+    JournalNotInitialised,
     PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
@@ -2410,6 +2411,7 @@ def test_each_widened_check_still_refuses_a_misspelling(
         {"event": "trued_up", "cause": None, "reason": None},
         {"event": "trued_up", "cause": None, "reason": "   "},
         {"event": "reopened", "cause": None, "reason": ""},
+        {"event": "trued_up", "cause": None, "reason": "\t\n "},
     ],
     ids=[
         "event",
@@ -2423,6 +2425,7 @@ def test_each_widened_check_still_refuses_a_misspelling(
         "true-up-without-reason",
         "true-up-blank-reason",
         "reopen-blank-reason",
+        "true-up-whitespace-reason",
     ],
 )
 def test_the_break_table_refuses_a_malformed_row(
@@ -2673,6 +2676,8 @@ def test_a_closed_break_takes_no_observation_and_no_second_close(
         ({"book_id": "other"}, "belongs to window 1"),
         ({"security_id": "SEC_B"}, "belongs to window 1"),
         ({"known_at": _NOW - timedelta(seconds=1)}, "before its latest"),
+        ({"first_seen_session": date(2026, 10, 27)}, "is not its opened event's"),
+        ({"cause": "corporate_action"}, "rewrites its opened cause"),
     ],
 )
 def test_a_later_event_keeps_the_break_window_book_name_and_clock(
@@ -2699,6 +2704,20 @@ def test_only_a_trued_up_break_reopens_and_never_beside_another_open_one(
     assert [e.event for e in open_breaks(fresh, 1)] == ["reopened"]
     with pytest.raises(BreakOrderError, match="only a trued_up break reopens"):
         append(fresh, _break("reopened"))
+
+
+def test_a_later_event_may_repeat_the_opened_cause(fresh: duckdb.DuckDBPyConnection) -> None:
+    append(fresh, _break())
+    append(fresh, _break("observed", cause="unattributed"))
+    assert [e.cause for e in break_events_for(fresh, 1)] == ["unattributed", "unattributed"]
+
+
+def test_a_version_37_store_missing_the_break_table_fails_closed(
+    fresh: duckdb.DuckDBPyConnection,
+) -> None:
+    fresh.execute("DROP TABLE reconcile_breaks")
+    with pytest.raises(JournalNotInitialised, match="no reconcile_breaks table"):
+        open_breaks(fresh, 1)
 
 
 def test_an_auto_accepted_break_does_not_reopen(fresh: duckdb.DuckDBPyConnection) -> None:

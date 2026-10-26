@@ -2681,7 +2681,7 @@ CREATE TABLE IF NOT EXISTS reconcile_breaks (
     CHECK (dollar_size IS NULL OR (isfinite(dollar_size) AND dollar_size >= 0)),
     CHECK (dollar_size IS NOT NULL OR material),
     CHECK (event <> 'opened' OR (cause IS NOT NULL AND reconciliation_id IS NOT NULL)),
-    CHECK (event NOT IN ({_OWNER_BREAK_EVENTS}) OR length(trim(coalesce(reason, ''))) >= 1)
+    CHECK (event NOT IN ({_OWNER_BREAK_EVENTS}) OR regexp_matches(coalesce(reason, ''), '\\S'))
 )
 """
 
