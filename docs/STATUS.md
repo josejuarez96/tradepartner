@@ -21,7 +21,7 @@ Direction: [ADR 0023](decisions/0023-break-first-fast-books-paper-exam.md) (#174
 - Paper: the T162 shakedown span opened 2026-10-22 (day by day in docs/runbooks/shakedown.md). The drill on the `daily` book is 2026-10-27. Book `main`: first rebalance 2026-10-30. The owner's checkout pull is planned for 2026-10-28 (store backup, pull, v35→v36 migration).
 - Data: one sitting after the span (about 11-05): T197, T186c, #1382 a3, T198, with their execution gates (runbook in #2126).
 - Kill ladder: B10 is next (sweep file drafted, T165e); the owner registers and runs it after rung 1 passes.
-- Awaiting the owner's word: #2221 (corporate-event cash rules, T267-T269) and #2230 (Home and Book screens, T270-T278).
+- Building: T267 (dividend on its pay date, fast-tracked before the November pay dates; Codex) and the Home/Book screens T270-T279 (plans #2221 and #2230 merged 2026-10-26).
 - In review: #2224, #2229, #2227 (drafts). On hold: #2124 (live Phase 6 ADR draft). Other open PRs: `gh pr list --state open`.
 
 ## Ready frontier snapshot
@@ -32,7 +32,6 @@ T23 (paused), T204 (paused until its trigger), T146-T149b (after T144's verdict 
 
 ## Decisions needed from owner
 - Merge when ready (class B): this fold (#2236).
-- Plan amendments to accept or refuse: #2221 (T267-T269) and #2230 (T270-T278).
 - Hold: #2124 (live Phase 6 ADR draft) stays on hold until you lift it.
 - Open: #1686 (use API stamps for SGML anchors that 404), #1676 items 3-5 (spin-off and name-change), #1524 (restamp gate before the window's first session).
 - #1382: the `restamp-1382a3` store step (owner hold), part of the post-span data sitting.
