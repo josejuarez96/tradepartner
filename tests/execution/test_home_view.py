@@ -16,6 +16,7 @@ import duckdb
 import pytest
 
 from tradepartner import health
+from tradepartner.calendar import all_sessions
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.dashboard import research_page
 from tradepartner.execution import home_view, ops
@@ -354,6 +355,9 @@ def test_a_fact_known_after_now_moves_nothing(store: Settings) -> None:
 
 def test_the_read_stays_within_half_the_lock_retry_seconds(store: Settings) -> None:
     fast = Settings(_env_file=None, store={"path": store.store.path, "lock_retry_seconds": 2})
+    # The XNYS calendar is built once per process (~0.3 s cold, 0.25 s of the read on a
+    # laptop and more on a CI runner); warm it so the timing measures the store reads.
+    all_sessions()
     started = time.monotonic()
     _build(fast)
     assert time.monotonic() - started < fast.store.lock_retry_seconds / 2
