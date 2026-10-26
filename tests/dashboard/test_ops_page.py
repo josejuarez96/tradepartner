@@ -897,6 +897,32 @@ def test_waiting_card_covers_every_book_after_selection_and_writes_nothing(
     assert seeded_store.read_bytes() == before
 
 
+def test_waiting_card_shows_a_secret_in_the_kill_reason_scrubbed(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    secret = "PKREALSECRETVALUE1234567890"  # gitleaks:allow
+    settings = Settings(_env_file=None, store={"path": str(seeded_store)})
+    with open_for_write(settings) as conn:
+        window = journal.open_window(conn, "main")
+        assert window is not None and window.window_id is not None
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=window.window_id,
+                at=_at(-20),
+                state="engaged",
+                source="owner",
+                reason=f"stop key {secret}",
+                **_stamp(-20),
+            ),
+        )
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    text = _text(at)
+    assert "reason given: stop key" in text
+    assert secret not in text
+
+
 # --- the Risk card (plan T260, amendment 2026-10-20 #2096 item 3) -----------------
 
 #: Frozen limits 0.05 cash, 1.0 gross, 0.50 position, 0.30 drawdown.

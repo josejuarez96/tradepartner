@@ -1912,6 +1912,30 @@ def test_status_drops_the_overdue_line_once_the_cash_is_booked(
 
 
 @pytest.mark.usefixtures("started")
+def test_status_all_shows_a_secret_in_the_kill_reason_scrubbed(
+    clock: _Clock, factory: _Factory
+) -> None:
+    secret = "PKREALSECRETVALUE1234567890"  # gitleaks:allow
+    with open_for_write(_settings()) as conn:
+        journal.append(
+            conn,
+            journal.KillSwitchRow(
+                window_id=1,
+                at=SESSION_CLOCK,
+                state="engaged",
+                source="owner",
+                reason=f"stop\n  key {secret}",
+                known_at=SESSION_CLOCK,
+                ingested_at=SESSION_CLOCK,
+            ),
+        )
+    out = _paper(clock, factory, "status", "--all")
+    assert out.exit_code == 0, out.output
+    assert "reason given: stop key" in out.output
+    assert secret not in out.output
+
+
+@pytest.mark.usefixtures("started")
 def test_status_all_lists_two_waiting_items_byte_for_byte(
     clock: _Clock, factory: _Factory, live: Path
 ) -> None:
