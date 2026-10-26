@@ -4227,7 +4227,11 @@ def make_app(
         for every book with an open window (spec req 7; the scheduler's job)."""
         chosen = _checked_book(book)
         s = paper_settings()
-        paper_schema_gate(s)
+        try:
+            paper_schema_gate(s)
+        except (Exception, typer.Exit):
+            heartbeat.ping(s, "paper", ok=False)
+            raise
         if chosen is None:
             try:
                 runs = paper_run.every_book_run(
@@ -4265,6 +4269,9 @@ def make_app(
             outcome = paper_run.tracking_run(
                 s, write_chunk(s), broker(s, clock, chosen), clock, book_id=chosen
             )
+        except SystemExit:  # the write-failure exit (3) passes through, with a /fail ping
+            heartbeat.ping(s, "paper", ok=False)
+            raise
         except Exception as exc:
             heartbeat.ping(s, "paper", ok=False)
             raise _fail(

@@ -784,6 +784,21 @@ def test_paper_run_exit_code_and_output_survive_a_ping_that_times_out(
     assert calls and "paper-secret-uuid" not in out.output
 
 
+@pytest.mark.usefixtures("started")
+def test_paper_run_write_failure_exit_3_still_reaches_the_caller_with_a_fail_ping(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    calls = _heartbeat_calls(monkeypatch)
+
+    def halt(*_a: Any, **_k: Any) -> Any:
+        raise SystemExit(WRITE_FAILED_EXIT_CODE)
+
+    monkeypatch.setattr(paper_run, "tracking_run", halt)
+    out = _paper(clock, factory, "run", "--book", "main")
+    assert out.exit_code == WRITE_FAILED_EXIT_CODE == 3
+    assert calls == [HEARTBEAT_URL + "/fail"]
+
+
 def test_paper_run_without_a_heartbeat_url_makes_no_call(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:

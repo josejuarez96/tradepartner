@@ -103,8 +103,9 @@ def test_a_non_2xx_answer_is_a_warning_not_an_error(
     assert "status 404" in caplog.text and "secret-uuid" not in caplog.text
 
 
-def test_a_non_http_url_is_refused_without_a_call(tmp_path: Path, net: _Net) -> None:
-    s = _settings(tmp_path, alert_heartbeat_url_paper="file:///etc/passwd")
+@pytest.mark.parametrize("bad", ["file:///etc/passwd", "http://hc-ping.example.com/secret-uuid"])
+def test_only_https_is_pinged(tmp_path: Path, net: _Net, bad: str) -> None:
+    s = _settings(tmp_path, alert_heartbeat_url_paper=bad)
     assert heartbeat.ping(s, "paper", ok=True) is False
     assert net.calls == []
 
@@ -179,3 +180,25 @@ def test_ingest_exit_code_survives_a_ping_that_times_out(
     result = _ingest(monkeypatch, s, IngestResult((SourceRun("e", OK, 1, "x", "f"),)))
     assert result.exit_code == 0 and net.calls
     assert URL not in result.output
+
+
+def test_a_hung_request_is_abandoned_at_the_overall_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import threading
+    import time
+
+    release = threading.Event()
+
+    def hang(url: str, timeout: float) -> httpx.Response:
+        release.wait(10)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(heartbeat, "_get", hang)
+    s = _settings(
+        tmp_path, alert_heartbeat_url_paper=URL, alerts={"heartbeat_timeout_seconds": 0.2}
+    )
+    started = time.monotonic()
+    assert heartbeat.ping(s, "paper", ok=True) is False
+    assert time.monotonic() - started < 2
+    release.set()
