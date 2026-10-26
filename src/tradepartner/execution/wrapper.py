@@ -644,6 +644,7 @@ class RiskGatedBroker:
         #: window closed: every later submit, in either phase, re-runs the clock
         #: pre-check and the window test first (reset by `_trade`).
         self._recheck: bool = False
+        self._killed: bool = False
 
     def __repr__(self) -> str:
         return f"RiskGatedBroker(broker={type(self._broker).__name__})"
@@ -784,6 +785,7 @@ class RiskGatedBroker:
         rows = [*decisions, *forced_exits]
         self._set_aside = set()
         self._recheck = False
+        self._killed = False
         # The batch holds these rebalances: a halt in either phase marks them
         # `missed` (ADR 0010 point 2), whichever decisions that phase held.
         rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
@@ -857,8 +859,11 @@ class RiskGatedBroker:
                 len(decisions),
                 frozenset(book.ledger.positions),
                 book.last_ok_ingest,
+                window=book.window,
             )
             skips, counted = (*skips, *refused), counted + len(refused)
+            if self._killed:
+                return BatchOutcome(_SKIPPED_KILL_SWITCH, tuple(submitted), skips)
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
                 self._await_sells(run, [row for row, _ in gated.to_submit], book, notes)
         if not any(d.side == _BUY for d in decisions):
@@ -952,6 +957,7 @@ class RiskGatedBroker:
             plan_decisions,
             frozenset(book.ledger.positions),
             book.last_ok_ingest,
+            window=book.window,
         )
         refused_ids = {s.decision_id for s in refused}
         collected_written_off = self._collect(
@@ -987,7 +993,13 @@ class RiskGatedBroker:
         )
         left = float(max(Decimal(repr(cash)) - spent, Decimal(0)))
         return BatchOutcome(
-            _OK, tuple(submitted), (*gated.skips, *refused), built.deferred, written, cash, left
+            _SKIPPED_KILL_SWITCH if self._killed else _OK,
+            tuple(submitted),
+            (*gated.skips, *refused),
+            built.deferred,
+            written,
+            cash,
+            left,
         )
 
     def _buys_cash(self, account: Account, book: _Book, session: date) -> float:
@@ -1432,6 +1444,8 @@ class RiskGatedBroker:
         plan_decisions: int,
         held: Collection[str] = (),
         last_ok_ingest: datetime | None = None,
+        *,
+        window: PaperWindowRow,
     ) -> tuple[list[str], list[Skip]]:
         """Submit each journaled request in order and await its acknowledgement;
         `submit`'s `Order` passes the shape check after the acknowledgement's
@@ -1457,6 +1471,14 @@ class RiskGatedBroker:
             # (`store.writer_lock_retry_seconds`) may have run the clock past the
             # window, and nothing is sent outside it (#2178).
             if not self._in_submit_window(run.session):
+                self._close_unsent(run, [r for r, _ in pairs[index:]])
+                break
+            # The switch is re-read before EVERY submit too (#2182, owner decision
+            # 2026-10-26): an owner kill mid-phase stops the phase's remaining
+            # orders (closed `not_received`, as above) and the batch ends
+            # `skipped_kill_switch`, never `ok`.
+            if self._engaged(run, window):
+                self._killed = True
                 self._close_unsent(run, [r for r, _ in pairs[index:]])
                 break
             try:
