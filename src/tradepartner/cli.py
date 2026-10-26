@@ -1572,7 +1572,7 @@ PAPER_REFUSAL_EXIT: Mapping[str, int] = MappingProxyType(
 
 #: `--reason`, required by `stop`, `kill`, `resume`, `abandon`, `override` and `settle`.
 _REASON_OPTION = typer.Option("--reason", help="why, in words (journaled)")
-#: `--book`, on every `paper` command but `shakedown` and `lots-reconcile` (ADR
+#: `--book`, on every `paper` command but `shakedown` (ADR
 #: 0017 B.2 and B.7; plans T155b and T156).
 _BOOK_OPTION = typer.Option(
     "--book", help="the book token (default paper.book_id)", allow_from_autoenv=False
@@ -1722,8 +1722,9 @@ LOTS_RECONCILE_REFUSAL_EXIT: Mapping[str, int] = MappingProxyType(
     }
 )
 _NEW_YORK = ZoneInfo("America/New_York")
-#: Every table of one lot-ledger set shares the set's stamp, the latest `lots.known_at`.
-_LATEST_SET = "known_at = (SELECT max(known_at) FROM lots)"
+#: Every table of one lot-ledger set shares the set's stamp, the latest `lots.known_at`
+#: of the set's book (`?` is the book; each book's set is its own, #2190).
+_LATEST_SET = "known_at = (SELECT max(known_at) FROM lots WHERE book_id = ?)"
 
 
 class _LotsRefused(Exception):
@@ -1746,12 +1747,20 @@ class _LedgerSet:
     flags: list[journal.WashSaleFlagRow]
 
 
-def _set_rows(conn: duckdb.DuckDBPyConnection, row_type: Any, order: str) -> list[Any]:
-    """`row_type`'s rows of the latest lot-ledger set, exactly as written."""
+def _set_rows(
+    conn: duckdb.DuckDBPyConnection, row_type: Any, order: str, book_id: str
+) -> list[Any]:
+    """`row_type`'s rows of `book_id`'s latest lot-ledger set, exactly as written."""
     names = [f.name for f in fields(row_type)]
     columns = ", ".join(f'"{name}"' for name in names)
+    if row_type is journal.WashSaleFlagRow:  # no book column: the book's disposals
+        book = "disposal_id IN (SELECT disposal_id FROM disposals WHERE book_id = ?) AND "
+    else:
+        book = "book_id = ? AND "
+    params = [book_id, book_id]
     rows = conn.execute(
-        f"SELECT {columns} FROM {row_type.TABLE} WHERE {_LATEST_SET} ORDER BY {order}"
+        f"SELECT {columns} FROM {row_type.TABLE} WHERE {book}{_LATEST_SET} ORDER BY {order}",
+        params,
     ).fetchall()
     return [row_type(**dict(zip(names, row, strict=True))) for row in rows]
 
@@ -1760,10 +1769,10 @@ def _local(at: datetime) -> date:
     return at.astimezone(_NEW_YORK).date()
 
 
-def _read_ledger_set(conn: duckdb.DuckDBPyConnection, tax_year: int) -> _LedgerSet:
-    """The latest lot-ledger set, the window it belongs to (the last window
-    started by the set's stamp) and every other window that reaches the tax
-    year, or a `no_window` refusal. Read-only."""
+def _read_ledger_set(conn: duckdb.DuckDBPyConnection, tax_year: int, book_id: str) -> _LedgerSet:
+    """`book_id`'s latest lot-ledger set, the window it belongs to (the book's
+    last window started by the set's stamp) and every other window of the book
+    that reaches the tax year, or a `no_window` refusal. Read-only."""
     try:
         journal.require_journal(conn)
     except journal.JournalNotInitialised:
@@ -1773,12 +1782,15 @@ def _read_ledger_set(conn: duckdb.DuckDBPyConnection, tax_year: int) -> _LedgerS
     windows = [
         (int(w), s)
         for w, s in conn.execute(
-            "SELECT window_id, started_at FROM paper_windows ORDER BY window_id"
+            "SELECT window_id, started_at FROM paper_windows WHERE book_id = ? ORDER BY window_id",
+            [book_id],
         ).fetchall()
     ]
     if not windows:
-        raise _LotsRefused("no_window", "no_window: no paper window was ever started")
-    stamp_row = conn.execute("SELECT max(known_at) FROM lots").fetchone()
+        raise _LotsRefused("no_window", f"no_window: no paper window was ever started in {book_id}")
+    stamp_row = conn.execute(
+        "SELECT max(known_at) FROM lots WHERE book_id = ?", [book_id]
+    ).fetchone()
     stamp = None if stamp_row is None else stamp_row[0]
     started = [(w, s) for w, s in windows if stamp is None or s <= stamp]
     window_id, window_started = (started or windows)[-1]
@@ -1801,9 +1813,9 @@ def _read_ledger_set(conn: duckdb.DuckDBPyConnection, tax_year: int) -> _LedgerS
         window_id=window_id,
         window_started=_local(window_started),
         other_windows=others,
-        lots=_set_rows(conn, journal.LotRow, "lot_id"),
-        disposals=_set_rows(conn, journal.DisposalRow, "disposal_id"),
-        flags=_set_rows(conn, journal.WashSaleFlagRow, "flag_id"),
+        lots=_set_rows(conn, journal.LotRow, "lot_id", book_id),
+        disposals=_set_rows(conn, journal.DisposalRow, "disposal_id", book_id),
+        flags=_set_rows(conn, journal.WashSaleFlagRow, "flag_id", book_id),
     )
 
 
@@ -4641,8 +4653,10 @@ def make_app(
             ),
         ],
         tax_year: Annotated[int, typer.Option(help="the tax year the export covers")],
+        book: Annotated[str | None, _BOOK_OPTION] = None,
     ) -> None:
         """Compare a broker 1099-B export with the lot ledger; writes nothing."""
+        chosen = _checked_book(book)
         s = settings()
 
         def refuse(code: str, message: str) -> typer.Exit:
@@ -4657,7 +4671,7 @@ def make_app(
             raise refuse("unknown_export_format", str(exc)) from None
         try:
             with open_read_only(s) as conn:
-                ledger = _read_ledger_set(conn, tax_year)
+                ledger = _read_ledger_set(conn, tax_year, chosen or s.paper.book_id)
         except StoreLockedError as exc:
             raise refuse("locked", f"locked: store busy: {exc}") from None
         except _LotsRefused as exc:
