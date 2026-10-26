@@ -437,6 +437,7 @@ from tradepartner.health import (
     HealthReport,
     IndexMembersCheck,
     health_report,
+    health_verdict,
 )
 from tradepartner.ingest import (
     SOURCES,
@@ -2739,6 +2740,13 @@ def make_app(
             raise _fail(
                 f"the store has no usable schema; run `tradepartner ingest`: {exc}", 1
             ) from None
+        chain_breaks = report.successor_chains.frame.filter(pl.col("price_break")).height
+        expected_warnings = (
+            (1 if _quarantined(report) > 0 else 0)
+            + (1 if report.duplicate_dividends.pending else 0)
+            + chain_breaks
+        )
+        typer.echo(health_verdict(report, expected_warnings))
         _print_report(report)
         warnings = 0
         if (count := _quarantined(report)) > 0:
