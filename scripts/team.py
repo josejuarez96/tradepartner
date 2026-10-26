@@ -7,7 +7,9 @@ end over the ``gh`` CLI. Pure logic (plan parsing, readiness, claim resolution) 
 I/O so it can be unit-tested; every GitHub call goes through the ``GitHub`` protocol.
 
 Plans are read from ``origin/main`` (after a fetch), never from the working tree, so a
-checkbox ticked inside an unmerged PR does not make the next task look ready.
+task finished inside an unmerged PR does not make the next task look ready. On that ref a
+task counts as done when its line is ticked, its code PR is squash-merged (#1130), or a
+merged ``changelog.d/`` fragment names it (``task: Tn (PR #n)``, #2280).
 
 Usage. A new session runs ``start`` once from the main checkout, then works only inside the
 directory it prints (a git worktree outside the repo, so other teams' files stay out of view)::
@@ -770,16 +772,42 @@ def merged_task_ids(subjects: Iterable[str]) -> frozenset[str]:
     return frozenset(m.group(1) for s in subjects if (m := MERGED_TASK_RE.match(s)))
 
 
+# A fragment's plan-task line (#2280), the shape `scripts/fragments.py` writes and parses.
+FRAGMENT_TASK_RE = re.compile(r"^task: (T\d+[a-z]?) \(PR #\d+\)$")
+
+
+def fragment_task_ids(lines: Iterable[str]) -> frozenset[str]:
+    """Task ids named by fragment ``task: Tn (PR #n)`` lines (#2280)."""
+    return frozenset(m.group(1) for ln in lines if (m := FRAGMENT_TASK_RE.match(ln.strip())))
+
+
+def _ref_fragment_lines(root: Path, ref: str) -> list[str]:
+    """The ``task:`` lines of the fragments under ``changelog.d/`` on ``ref``."""
+    out = subprocess.run(
+        [
+            *("git", "-C", str(root), "grep", "-h", "-E", "^task: ", ref, "--"),
+            *("changelog.d/*.md", ":(exclude)changelog.d/README.md"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode not in (0, 1):  # 1: no match
+        raise SystemExit(f"cannot read changelog.d from {ref}: {out.stderr.strip()}")
+    return out.stdout.splitlines()
+
+
 def load_tasks(root: Path, ref: str | None) -> list[Task]:
     """Plan tasks from `ref` (or the working tree). On a ref, a task whose code PR is merged
-    there counts as done even before a fold ticks its box (#1130), so its dependants are
-    ready and the task itself is not offered again."""
+    there counts as done even before a fold ticks its box (#1130), as does a task a merged
+    fragment names (#2280: build PRs no longer tick the plan), so its dependants are ready
+    and the task itself is not offered again."""
     tasks: list[Task] = []
     for name, text in read_plans(root, ref).items():
         tasks.extend(parse_plan(text, name))
     if ref is None:
         return tasks
     merged = merged_task_ids(_git(root, "log", "--format=%s", ref).splitlines())
+    merged |= fragment_task_ids(_ref_fragment_lines(root, ref))
     return [replace(t, done=True) if t.id in merged and not t.done else t for t in tasks]
 
 

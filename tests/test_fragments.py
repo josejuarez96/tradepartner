@@ -254,3 +254,130 @@ def test_check_fails_on_a_bad_fragment(tmp_path: Path) -> None:
     (tmp_path / "changelog.d").mkdir()
     (tmp_path / "changelog.d" / "70-x.md").write_text("no bullet\n")
     assert fragments.main(["--root", str(tmp_path), "check"]) == 1
+
+
+# plan ticks after merge (#2280): the fragment names its task, the fold ticks the line
+# doc-check: ignore-file (the task ids below are made-up test data)
+
+OPEN_LINE = (
+    "- [ ] **T285: One symbol map (amendment #2266).** (#2273; size M, class A) · Files: "
+    "`src/tradepartner/execution/symbols.py` (new: the map, `risk.*` keys), "
+    "`tests/execution/test_symbols.py` · Tests: the map holds after a ticker change · "
+    "Depends on: T280a, T283 · Review: safety-reviewer, quant-auditor."
+)
+COLLAPSED = (
+    "- [x] **T285: One symbol map (amendment #2266).** (#2290, PR #2301) · Files: "
+    "`src/tradepartner/execution/symbols.py`, `tests/execution/test_symbols.py` · "
+    "Depends on: T280a, T283"
+)
+PLAN = (
+    "# Plan: X\n\n## Tasks\n\n"
+    "- [x] **T284: Done.** (#1, PR #2) · Files: `a.py` · Depends on: n/a\n"
+    f"{OPEN_LINE}\n"
+    "- [ ] **T286: Later.** · Files: `b.py` · Depends on: T285\n"
+)
+
+
+def test_a_fragment_names_its_plan_task_and_pr() -> None:
+    f = _frag("2290-symbols.md", "task: T285 (PR #2301)\n- #2290 map (PR #2301)\n### Added\n- m\n")
+    assert f.tasks == [("T285", 2301)]
+    assert f.status == ["- #2290 map (PR #2301)"]
+    assert _frag("2290-only.md", "task: T285b (PR #2301)\n").tasks == [("T285b", 2301)]
+    assert _frag("70-b.md", "### Fixed\n- f\n").tasks == []
+
+
+def test_a_task_line_has_one_shape_and_comes_before_any_heading() -> None:
+    with pytest.raises(fragments.FragmentError, match="task: Tn"):
+        _frag("70-x.md", "task: 285 (PR #1)\n")
+    with pytest.raises(fragments.FragmentError, match="task: Tn"):
+        _frag("70-x.md", "task: T285\n")
+    with pytest.raises(fragments.FragmentError, match="before any heading"):
+        _frag("70-x.md", "### Added\n- a\ntask: T285 (PR #1)\n")
+
+
+def test_collapse_plan_line_keeps_title_paths_and_dependencies() -> None:
+    assert fragments.collapse_plan_line(OPEN_LINE, issue=2290, pr=2301) == COLLAPSED
+    bare = "- [ ] **T9: Owner thing.** Files: none in the repo · Depends on: n/a."
+    assert fragments.collapse_plan_line(bare, issue=5, pr=6) == (
+        "- [x] **T9: Owner thing.** (#5, PR #6) · Files: none · Depends on: n/a"
+    )
+    no_deps = "- [ ] **T10: Solo.** · Files: `x.py`"
+    assert fragments.collapse_plan_line(no_deps, issue=5, pr=6).endswith("· Depends on: n/a")
+
+
+def test_collapse_shortens_paths_in_one_directory_then_refuses_past_the_cap() -> None:
+    many = ", ".join(f"`src/tradepartner/execution/module_{i:02d}.py`" for i in range(9))
+    line = f"- [ ] **T11: Many.** · Files: {many} · Depends on: n/a"
+    out = fragments.collapse_plan_line(line, issue=5, pr=6)
+    assert len(out) <= fragments.PLAN_LINE_MAX
+    assert "`src/tradepartner/execution/module_00.py`, `module_01.py`" in out
+    # Then the dependencies to their ids, then every later path to its file name.
+    prose = "T7 (T7 because the recording shows the code paper returns, #1904), T8" + " x" * 60
+    spread = ", ".join(f"`src/tradepartner/dir{i}/module_{i:02d}.py`" for i in range(9))
+    out = fragments.collapse_plan_line(
+        f"- [ ] **T13: Spread.** · Files: {spread} · Depends on: {prose}", issue=5, pr=6
+    )
+    assert out.endswith("· Depends on: T7, T8")
+    assert "`src/tradepartner/dir0/module_00.py`, `module_01.py`" in out
+    huge = ", ".join(f"`src/d{i}/a_rather_long_module_name_{i:02d}.py`" for i in range(16))
+    with pytest.raises(fragments.FragmentError, match=r"T12.*by hand"):
+        fragments.collapse_plan_line(
+            f"- [ ] **T12: Huge.** · Files: {huge} · Depends on: n/a", issue=5, pr=6
+        )
+
+
+def test_fold_plans_ticks_each_named_task_once() -> None:
+    plans = {"docs/plans/x.md": PLAN}
+    frags = [
+        _frag("2290-a.md", "task: T285 (PR #2301)\n"),
+        _frag("1-old.md", "task: T284 (PR #2)\n"),  # ticked the old way: left as it is
+    ]
+    out = fragments.fold_plans(plans, frags)
+    assert out["docs/plans/x.md"] == PLAN.replace(OPEN_LINE, COLLAPSED)
+    assert fragments.fold_plans(out, frags) == out
+    with pytest.raises(fragments.FragmentError, match="T999 is not a task"):
+        fragments.fold_plans(plans, [_frag("3-x.md", "task: T999 (PR #4)\n")])
+
+
+def _plan_repo(tmp_path: Path) -> list[str]:
+    root = _repo(tmp_path)
+    (tmp_path / "docs" / "plans").mkdir()
+    (tmp_path / "docs" / "plans" / "x.md").write_text(PLAN)
+    return root
+
+
+def test_add_with_a_task_then_show_and_fold_tick_the_plan(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _plan_repo(tmp_path)
+    args = ["add", "2290", "--slug", "map", "--task", "T285", "--pr", "2301", "--added", "m"]
+    assert fragments.main([*root, *args]) == 0
+    assert (tmp_path / "changelog.d" / "2290-map.md").read_text() == (
+        "task: T285 (PR #2301)\n### Added\n- m\n"
+    )
+    capsys.readouterr()
+    assert fragments.main([*root, "check"]) == 0
+    assert fragments.main([*root, "show"]) == 0
+    assert "Plan ticks (pending" in capsys.readouterr().out
+    assert fragments.main([*root, "fold"]) == 0
+    assert COLLAPSED in (tmp_path / "docs" / "plans" / "x.md").read_text()
+    assert not (tmp_path / "changelog.d" / "2290-map.md").exists()
+
+
+def test_add_needs_task_and_pr_together(tmp_path: Path) -> None:
+    root = _plan_repo(tmp_path)
+    with pytest.raises(SystemExit, match="--task and --pr"):
+        fragments.main([*root, "add", "2290", "--slug", "m", "--task", "T285", "--added", "m"])
+    with pytest.raises(SystemExit, match="--task and --pr"):
+        fragments.main([*root, "add", "2290", "--slug", "m", "--pr", "1", "--added", "m"])
+
+
+def test_check_and_fold_refuse_a_task_no_plan_names(tmp_path: Path) -> None:
+    root = _plan_repo(tmp_path)
+    (tmp_path / "changelog.d" / "2290-x.md").write_text("task: T999 (PR #1)\n- s\n")
+    assert fragments.main([*root, "check"]) == 1
+    with pytest.raises(SystemExit, match="T999"):
+        fragments.main([*root, "fold"])
+    # Nothing was written: STATUS, CHANGELOG and the fragment are as they were.
+    assert (tmp_path / "docs" / "STATUS.md").read_text() == STATUS
+    assert (tmp_path / "changelog.d" / "2290-x.md").exists()
