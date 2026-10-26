@@ -30,7 +30,8 @@ anything else) is NOT engaged for this book. The command's own text comes back
 scrubbed, to show, and is never read for the outcome: its "NOT engaged yet:
 store busy ... waiting" line can precede a success.
 
-**The wait** is `config.kill_wait_seconds`, which exceeds `paper kill`'s
+**The wait** is `config.kill_wait_seconds` of the live config (the one the child
+reads, so its bound matches the child's own store wait), which exceeds `paper kill`'s
 worst-case store wait by a margin (config refuses less). Past it the kill is NOT
 confirmed: the child is neither terminated nor retried; a daemon thread drains
 and reaps it, and the next render's read of the journal shows the truth.
@@ -127,24 +128,33 @@ class _LiveSettings(Settings):
         )
 
 
-def live_store_path() -> Path:
-    """The live store: what the project-root `.env` plus the defaults name, read
-    with `STORE__PATH` and `TRADEPARTNER_ENV_FILE` ignored (the `.env` path is
-    passed explicitly; nothing in `os.environ` changes), resolved under
-    `PROJECT_ROOT`."""
+def live_settings() -> Settings:
+    """The settings the child reads: the project-root `.env` plus the defaults and
+    the environment, with `STORE__PATH` and `TRADEPARTNER_ENV_FILE` ignored (the
+    `.env` path is passed explicitly; nothing in `os.environ` changes)."""
     source: dict[str, Any] = {"_env_file": PROJECT_ROOT / ".env"}
-    path = Path(_LiveSettings(**source).store.path)
+    return _LiveSettings(**source)
+
+
+def live_store_path(live: Settings | None = None) -> Path:
+    """The live store (`live_settings`' `store.path`), resolved under `PROJECT_ROOT`."""
+    path = Path((live or live_settings()).store.path)
     return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
 
 
-def store_refusal(settings: Settings) -> str | None:
+def store_refusal(settings: Settings, live: Settings | None = None) -> str | None:
     """None when the page reads the live store and no backup manifest sits
     beside it; otherwise one plain sentence saying why, with the desk command."""
     page = Path(settings.store.path).resolve()
     try:
-        same = os.path.samefile(page, live_store_path())
+        same = os.path.samefile(page, live_store_path(live))
     except OSError:
         same = False
+    except ValueError:  # the live config itself does not load
+        return (
+            "The live store's config could not be read, so this page cannot stop a book. "
+            f"At the desk, run `{desk_command('<book>')}`."
+        )
     if not same:
         why = "This page is reading a store that is not the live store"
     elif page.with_name(f"{page.name}.manifest.json").exists():
@@ -178,8 +188,9 @@ def _start(argv: list[str], *, env: dict[str, str], cwd: Path) -> _Child:
     )
 
 
-def _scrub(text: str, settings: Settings) -> str:
-    for value in secret_values(settings):
+def _scrub(text: str, *settings: Settings) -> str:
+    values = {v for s in settings for v in secret_values(s)}
+    for value in sorted(values, key=len, reverse=True):
         text = text.replace(value, "[redacted]")
     return _CONTROL.sub(" ", text).strip()
 
@@ -196,10 +207,18 @@ def kill(settings: Settings, book: str, reason: str) -> KillResult:
         check_book_id(book)
     except ValueError as exc:
         raise KillRefused(f"{book!r} is not a book name") from exc
-    for refusal in (reason_refusal(reason, settings), store_refusal(settings)):
-        if refusal is not None:
-            raise KillRefused(refusal)
-    env = {k: v for k, v in os.environ.items() if k.upper() not in (_STORE_PATH_VAR, _ENV_FILE_VAR)}
+    refusal = reason_refusal(reason, settings)
+    if refusal is not None:
+        raise KillRefused(refusal)
+    try:
+        live = live_settings()
+    except ValueError as exc:
+        raise KillRefused(store_refusal(settings, None) or "live config unreadable") from exc
+    refusal = store_refusal(settings, live)
+    if refusal is not None:
+        raise KillRefused(refusal)
+    dropped = (_STORE_PATH_VAR, _ENV_FILE_VAR, "STORE")
+    env = {k: v for k, v in os.environ.items() if k.upper() not in dropped}
     env[_STORE_PATH_VAR] = str(Path(settings.store.path).resolve())
     argv = [
         sys.executable,
@@ -212,13 +231,17 @@ def kill(settings: Settings, book: str, reason: str) -> KillResult:
     ]
     child = _start(argv, env=env, cwd=PROJECT_ROOT)
     try:
-        stdout, stderr = child.communicate(timeout=kill_wait_seconds(settings))
+        # The child's own wait is the live config's, so the bound is too.
+        stdout, stderr = child.communicate(timeout=kill_wait_seconds(live))
     except subprocess.TimeoutExpired as exc:
         _drain(child)
         partial = "\n".join(
-            p.decode() if isinstance(p, bytes) else p for p in (exc.stdout, exc.stderr) if p
+            p.decode(errors="replace") if isinstance(p, bytes) else p
+            for p in (exc.stdout, exc.stderr)
+            if p
         )
-        return KillResult(KillStatus.NOT_CONFIRMED, None, _scrub(partial, settings))
+        return KillResult(KillStatus.NOT_CONFIRMED, None, _scrub(partial, settings, live))
     code = child.returncode
     status = KillStatus.ENGAGED if code == ENGAGED_EXIT else KillStatus.NOT_ENGAGED
-    return KillResult(status, code, _scrub("\n".join(p for p in (stdout, stderr) if p), settings))
+    output = "\n".join(p for p in (stdout, stderr) if p)
+    return KillResult(status, code, _scrub(output, settings, live))

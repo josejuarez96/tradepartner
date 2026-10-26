@@ -193,7 +193,6 @@ def test_the_call_is_the_desk_command_in_list_form_on_the_same_store(
     monkeypatch: pytest.MonkeyPatch, live: Settings
 ) -> None:
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", "/elsewhere/.env")
-    monkeypatch.setattr(book_actions, "live_store_path", lambda: Path(live.store.path).resolve())
     fake = _fake(monkeypatch, _Fake(0))
     book_actions.kill(live, "main", _REASON)
     [call] = fake.calls
@@ -279,11 +278,50 @@ def test_past_the_bound_it_is_not_confirmed_never_terminated_never_retried(
     assert len(fake.calls) == 1 and not fake.terminated
 
 
-def test_the_wait_comes_from_config(monkeypatch: pytest.MonkeyPatch, live: Settings) -> None:
+def test_the_wait_comes_from_the_live_config_the_child_reads(
+    monkeypatch: pytest.MonkeyPatch, live: Settings
+) -> None:
+    (book_actions.PROJECT_ROOT / ".env").write_text(
+        "STORE__PATH=data/live.duckdb\nUI__KILL_WAIT_SECONDS=999\n"
+    )
     fake = _fake(monkeypatch, _Fake(0))
-    settings = live.model_copy(update={"ui": live.ui.model_copy(update={"kill_wait_seconds": 999})})
-    book_actions.kill(settings, "main", _REASON)
+    book_actions.kill(live, "main", _REASON)
     assert fake.timeouts == [999]
+
+
+def test_a_page_with_a_shorter_writer_wait_still_waits_the_child_s_bound(
+    monkeypatch: pytest.MonkeyPatch, live: Settings
+) -> None:
+    """The page launched with its own `.env` (same live store, smaller writer wait):
+    the bound follows the child's config, not the page's."""
+    page = Settings(
+        _env_file=None,
+        store={"path": live.store.path, "writer_lock_retry_seconds": 5},
+    )
+    fake = _fake(monkeypatch, _Fake(0))
+    book_actions.kill(page, "main", _REASON)
+    assert fake.timeouts == [330]
+
+
+def test_an_unloadable_live_config_refuses_in_words(
+    monkeypatch: pytest.MonkeyPatch, live: Settings
+) -> None:
+    (book_actions.PROJECT_ROOT / ".env").write_text("UI__KILL_WAIT_SECONDS=1\n")
+    fake = _fake(monkeypatch, _Fake(0))
+    refusal = book_actions.store_refusal(live)
+    assert refusal is not None and "could not be read" in refusal
+    with pytest.raises(KillRefused, match="could not be read"):
+        book_actions.kill(live, "main", _REASON)
+    assert fake.calls == []
+
+
+def test_a_store_section_variable_does_not_reach_the_child(
+    monkeypatch: pytest.MonkeyPatch, live: Settings
+) -> None:
+    monkeypatch.setenv("STORE", '{"path": "/elsewhere.duckdb"}')
+    fake = _fake(monkeypatch, _Fake(0))
+    book_actions.kill(live, "main", _REASON)
+    assert "STORE" not in fake.calls[0]["env"]
 
 
 def test_paper_kill_runs_for_real_against_a_temp_store(
