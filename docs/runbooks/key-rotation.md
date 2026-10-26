@@ -23,7 +23,7 @@ Rotate one book at a time, so a mistake stops one book.
 
 1. **Pick a quiet time**: not within the scheduled run window (the paper plist's time, scheduling.md) and not while `paper stop`, `resume` or `reconcile` is running.
 2. **Check the book is calm.** `uv run tradepartner paper status --book <token>`. If the kill switch is engaged or a run is in progress, deal with that first.
-3. **Make the new key at Alpaca.** In the Alpaca paper dashboard, open that book's own paper account and regenerate its API key. Regenerating keeps the account and its `account_id`. Do not make a new account: the open window is tied to the account id, and a run on a different account halts with `account_id: the broker's account ... is not window ...'s` (`execution/run.py`).
+3. **Make the new key at Alpaca.** In the Alpaca paper dashboard, open that book's own paper account and regenerate its API key. Regenerating a key should keep the account and its `account_id` (not verified in this repo; the reconcile step below proves it). Do not make a new account: the open window is tied to the account id, and a run on a different account halts with `account_id: the broker's account ... is not window ...'s` (`execution/run.py`).
 4. **Edit `.env` by hand** in an editor: replace both the key and the secret for that book only. Keep the names exactly as in the table above. Save. Never use `echo` or `export` for it, so the value stays out of shell history.
 5. **Check no stale override exists.** Process environment beats `.env` ([scheduling.md](scheduling.md), "PATH, working directory and `.env`"). For the book's two variable names, this prints nothing when none is set:
    ```bash
