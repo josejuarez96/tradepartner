@@ -147,7 +147,14 @@ import duckdb
 import polars as pl
 from pydantic import ValidationError
 
-from tradepartner.adapters.broker import Account, Broker, Order, Position, UnknownOrderError
+from tradepartner.adapters.broker import (
+    Account,
+    Broker,
+    CashActivity,
+    Order,
+    Position,
+    UnknownOrderError,
+)
 from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, LimitBreachError, ReconciliationError
@@ -209,6 +216,9 @@ Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 _NEW_YORK = ZoneInfo("America/New_York")
 _DIVIDEND = "dividend"
 _DIVIDEND_CASH = "dividend_cash"
+_UNSUPPORTED_DIVIDEND_CASH = frozenset(
+    {"DIVNRA", "DIVFEE", "DIVTW", "DIVROC", "DIVCGL", "DIVCGS", "DIVTXEX"}
+)
 _SPLIT = "split"
 _SPINOFF = "spinoff"
 _RISK_PREFIX = "risk."
@@ -485,6 +495,8 @@ def _dividends(
     through: date,
     reviewed: Sequence[ReviewedGroup],
     credit_sessions: int,
+    cash_tolerance: float,
+    fresh_names: Collection[str] | None,
 ) -> tuple[dict[str, float], dict[str, str]]:
     """Cash due per name in the credit window, net of journaled cash oldest first.
 
@@ -507,6 +519,9 @@ def _dividends(
     lookback_start = window_start
     for _ in range(credit_sessions):
         lookback_start = previous_session(lookback_start)
+    started_on = window.started_at.astimezone(_NEW_YORK).date()
+    base = state.base(through)
+    base_day = base.at.astimezone(_NEW_YORK).date() if base is not None else None
     journaled: dict[str, list[AdjustmentRow]] = defaultdict(list)
     for adjustment in state.adjustments:
         if adjustment.kind == _DIVIDEND_CASH and adjustment.security_id is not None:
@@ -542,7 +557,7 @@ def _dividends(
         short = holdings[before].short_holdings.get(row["security_id"], 0.0)
         if held > tolerance or short > tolerance:
             key = (row["security_id"], row["ex_date"], float(row["ratio_or_amount"]))
-            if key in unexplained and row["ex_date"] > window_start:
+            if key in unexplained and row["ex_date"] > max(window_start, started_on):
                 if unexplained[key] not in findings[row["security_id"]]:
                     findings[row["security_id"]].append(unexplained[key])
                 continue
@@ -557,24 +572,44 @@ def _dividends(
             dues[row["security_id"]].append((row["ex_date"], amount))
     due: dict[str, float] = defaultdict(float)
     for name, dated in dues.items():
-        # `dividend_cash` has no action id. A credit must consume the oldest
-        # eligible ex-date first, including one just outside the active window.
+        # `dividend_cash` has no action id. At the credit's own session, consume
+        # only dues still inside its N-session window, oldest ex-date first.
+        # The 2N look-back above (T267's netting rule) retains a due that was
+        # live when credited even after it expires at this reconciliation.
         credits = sorted(journaled.get(name, ()), key=lambda a: (a.session, a.adjustment_id or 0))
         remaining = sorted(dated)
         for credit in credits:
             cash = credit.cash
             if cash is None:
                 continue
+            credit_window_start = credit.session
+            for _ in range(credit_sessions):
+                credit_window_start = previous_session(credit_window_start)
             for index, (ex_date, amount) in enumerate(remaining):
-                if credit.session < ex_date or amount == 0 or cash * amount <= 0:
+                if (
+                    not credit_window_start < ex_date <= credit.session
+                    or amount == 0
+                    or cash * amount <= 0
+                ):
                     continue
                 paid = min(abs(cash), abs(amount))
                 signed_paid = math.copysign(paid, cash)
-                remaining[index] = (ex_date, amount - signed_paid)
+                remainder = amount - signed_paid
+                remaining[index] = (
+                    ex_date,
+                    0.0 if abs(remainder) <= cash_tolerance else remainder,
+                )
                 cash -= signed_paid
                 if cash == 0.0:
                     break
-        due[name] = math.fsum(amount for ex_date, amount in remaining if ex_date > window_start)
+        due[name] = math.fsum(
+            amount
+            for ex_date, amount in remaining
+            if ex_date > max(window_start, started_on)
+            and (
+                fresh_names is None or base_day is None or ex_date > base_day or name in fresh_names
+            )
+        )
     # `compare` signs a due against the book at S: a short's due is negative only
     # while the name is still held short, a long's positive only while it is not.
     # A short covered (or a long flipped short) after the ex-date has a due of
@@ -690,6 +725,7 @@ def _explanations(
     dividend_credit_sessions: int,
     cash_tolerance: float,
     whole_share_price_buffer: float,
+    broker_activities: Sequence[CashActivity] | None,
 ) -> Explanations:
     cut = _cut(session)
     names = (
@@ -726,6 +762,24 @@ def _explanations(
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))
     seen_ids, seen_before = _seen_activities(state.adjustments, state.base(through), window)
+    fresh_dividend_symbols = (
+        {
+            activity.symbol
+            for activity in broker_activities
+            if activity.activity_type == "DIV"
+            and activity.status == "executed"
+            and activity.symbol is not None
+            and activity.activity_id not in seen_ids
+            and (seen_before is None or activity.date >= seen_before)
+        }
+        if broker_activities is not None
+        else None
+    )
+    fresh_dividend_names = (
+        {name for name, symbol in symbols.items() if symbol in fresh_dividend_symbols}
+        if fresh_dividend_symbols is not None
+        else None
+    )
     dividends, findings = _dividends(
         state,
         actions,
@@ -735,6 +789,8 @@ def _explanations(
         through,
         reviewed_groups(),
         dividend_credit_sessions,
+        cash_tolerance,
+        fresh_dividend_names,
     )
     stock_dividends = _stock_dividends(
         actions,
@@ -1218,6 +1274,7 @@ def explanations_as_of(
         dividend_credit_sessions=dividend_credit_sessions,
         cash_tolerance=cash_tolerance,
         whole_share_price_buffer=whole_share_price_buffer,
+        broker_activities=None,
     )
 
 
@@ -1340,6 +1397,7 @@ def reconcile_now(
             dividend_credit_sessions=frozen.reconcile_dividend_credit_sessions,
             cash_tolerance=frozen.reconcile_cash_tolerance,
             whole_share_price_buffer=frozen.whole_share_price_buffer,
+            broker_activities=activities,
         )
     # The read-only `_explanations` names the seen-sets and fallback; the broker's
     # cash activities are attached here (they are a broker input, never a journal
@@ -1350,7 +1408,14 @@ def reconcile_now(
     tagged_dividends = {
         activity.symbol
         for activity in activities
-        if activity.activity_type == "DIV" and activity.symbol is not None
+        if activity.activity_type == "DIV"
+        and activity.status == "executed"
+        and activity.symbol is not None
+        and activity.activity_id not in explanations.seen_activity_ids
+        and (
+            explanations.activity_seen_before is None
+            or activity.date >= explanations.activity_seen_before
+        )
     }
     if tagged_dividends:
         explanations = replace(
@@ -1377,7 +1442,7 @@ def reconcile_now(
     unsupported_dividend_cash = [
         activity
         for activity in activities
-        if activity.activity_type in {"DIVNRA", "DIVFEE"}
+        if activity.activity_type in _UNSUPPORTED_DIVIDEND_CASH
         and activity.status == "executed"
         and activity.net_amount is not None
         and activity.net_amount != 0

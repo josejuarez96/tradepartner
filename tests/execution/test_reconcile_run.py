@@ -1030,7 +1030,9 @@ def test_a_dividend_credited_on_its_pay_date_after_an_ok_reconcile_is_explained(
     assert len(_adjustments(journal_settings, open_window)) == 1
 
 
-@pytest.mark.parametrize("activity_type", ["DIVNRA", "DIVFEE"])
+@pytest.mark.parametrize(
+    "activity_type", ["DIVNRA", "DIVFEE", "DIVTW", "DIVROC", "DIVCGL", "DIVCGS", "DIVTXEX"]
+)
 def test_dividend_fee_and_withholding_still_halt(
     journal_settings: Settings,
     fake: BookedFake,
@@ -1122,6 +1124,260 @@ def test_monthly_payer_nets_old_credit_before_new_due(
         _reconcile(journal_settings, fake, open_window, fixed_clock, session=check26).status == OK
     )
     assert [a.cash for a in _adjustments(journal_settings, open_window)] == [5.0, 5.0]
+
+
+def test_expired_unpaid_dividend_cannot_take_newer_dividends_credit(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+) -> None:
+    """A credit for ex 21 at session 26 must stay paid at session 27."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    ex21 = S
+    credit26 = S
+    for index in range(26):
+        credit26 = next_session(credit26)
+        if index == 20:
+            ex21 = credit26
+    check27 = next_session(credit26)
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=S, source_action_id="unpaid")
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=ex21, source_action_id="paid")
+    credited_at = datetime.combine(credit26, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    _append(
+        journal_settings,
+        AdjustmentRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            session=credit26,
+            kind="dividend_cash",
+            security_id=SPY,
+            cash=5.0,
+            known_at=credited_at,
+            ingested_at=credited_at,
+        ),
+    )
+    checked_at = datetime.combine(check27, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            check27,
+            as_of=checked_at,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividends == {}
+
+
+def test_newer_credit_is_not_reopened_by_an_expired_unpaid_due(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """E1 remains unpaid; booking E2 at 27 must not reopen E2 at 28."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    ex26 = S
+    for _ in range(26):
+        ex26 = next_session(ex26)
+    pay27 = next_session(ex26)
+    check28 = next_session(pay27)
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=S, source_action_id="unpaid")
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=ex26, source_action_id="paid")
+    fixed_clock.now = datetime.combine(pay27, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    fake.activities = [CashActivity("e2", "DIV", pay27, "executed", 5.0, "SPY")]
+    fake.extra_cash = 5.0
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay27).status == OK
+    fixed_clock.now = datetime.combine(check28, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            check28,
+            as_of=fixed_clock.now,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividends == {}
+
+
+def test_an_old_div_tag_cannot_admit_another_symbols_new_credit(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    old = CashActivity("old-spy", "DIV", S, "executed", 0.0, "SPY")
+    fake.activities = [old]
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == OK
+    pay = S
+    for _ in range(10):
+        pay = next_session(pay)
+    fixed_clock.now = datetime.combine(pay, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    fake.activities = [old, CashActivity("new-mtum", "DIV", pay, "executed", 5.0, "MTUM")]
+    fake.extra_cash = 5.0
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay)
+
+
+def test_untagged_cash_after_ok_base_is_not_a_late_dividend(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == OK
+    pay = S
+    for _ in range(10):
+        pay = next_session(pay)
+    fixed_clock.now = datetime.combine(pay, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    fake.extra_cash = 5.0
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay)
+
+
+def test_untagged_pre_base_dividend_does_not_widen_deferred_cash_band(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == OK
+    _order(
+        journal_settings,
+        run_id,
+        "tp-pending-tag",
+        MTUM,
+        "MTUM",
+        1.0,
+        events=("pending",),
+        fill=False,
+    )
+    fake.submit(OrderRequest("tp-pending-tag", "MTUM", Side.BUY, quantity=1.0))
+    pay = next_session(S)
+    fixed_clock.now = datetime.combine(pay, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    fake.extra_cash = 5.0
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay)
+
+
+def test_dividend_before_window_start_is_not_an_active_due(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+) -> None:
+    """A held name carried into a later window cannot reopen its earlier dividend."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1), ex_date=S)
+    later_start = next_session(S)
+    later_window = replace(
+        open_window,
+        started_at=datetime.combine(later_start, datetime.min.time(), tzinfo=UTC)
+        + timedelta(hours=14),
+    )
+    checked_at = datetime.combine(later_start, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            later_window,
+            later_start,
+            as_of=checked_at,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividends == {}
+
+
+def test_dividend_absorbed_as_ended_proceeds_cannot_explain_later_untagged_cash(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(MTUM, "MTUM"): 10.0})
+    _dividend(journal_settings, MTUM, 0.5, CUT - timedelta(days=1))
+    _delisting(journal_settings, MTUM, CUT - timedelta(days=1))
+    proceeds = 0.5 * 10 * _reference(journal_settings, MTUM)
+    fake.extra_quantity["MTUM"] = -10.0
+    fake.extra_cash = proceeds
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == OK
+    assert all(a.kind != "dividend_cash" for a in _adjustments(journal_settings, open_window))
+    later = next_session(S)
+    fixed_clock.now = datetime.combine(later, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    fake.extra_cash += 5.0
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=later)
+
+
+def test_dividend_credit_window_excludes_its_exact_far_edge(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    inside = S
+    for _ in range(FROZEN.reconcile_dividend_credit_sessions - 1):
+        inside = next_session(inside)
+    outside = next_session(inside)
+    with open_read_only(journal_settings) as conn:
+        due_inside = explanations_as_of(
+            conn,
+            open_window,
+            inside,
+            as_of=datetime.combine(inside, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20),
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert due_inside.dividends == pytest.approx({SPY: 5.0})
+    fixed_clock.now = datetime.combine(outside, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    fake.activities = [CashActivity("edge", "DIV", outside, "executed", 5.0, "SPY")]
+    fake.extra_cash = 5.0
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=outside)
+
+
+def test_netting_discards_a_cash_rounding_residue(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.03, CUT - timedelta(days=1))
+    _append(
+        journal_settings,
+        AdjustmentRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            session=S,
+            kind="dividend_cash",
+            security_id=SPY,
+            cash=0.3 - 1e-16,
+            known_at=datetime(2026, 10, 1, 20, 0, tzinfo=UTC),
+            ingested_at=datetime(2026, 10, 1, 20, 0, tzinfo=UTC),
+        ),
+    )
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            S,
+            as_of=datetime(2026, 10, 1, 20, 0, tzinfo=UTC),
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividends == {}
 
 
 def test_two_dividends_on_one_name_remain_due_after_the_first_is_paid(
