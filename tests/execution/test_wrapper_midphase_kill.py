@@ -132,6 +132,42 @@ def test_a_mid_buys_kill_writes_off_no_deferred_buy(
     assert [e for e in _decision_events(env.settings) if e[0] == tiny.decision_id] == []
 
 
+def test_a_mid_buys_window_close_writes_off_no_deferred_buy(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    a, b = (_decision(env, s, "buy", notional=3000.0) for s in (A, B))
+    tiny = _decision(env, C, "buy", notional=50.0, whole_share=True)
+    for _ in range(2):
+        env.fake.script(FillAt())
+    env.fake.on_submit = lambda _request: setattr(
+        env.clock, "now", session_open(S) + timedelta(minutes=31)
+    )
+
+    outcome = _execute(_gate(env, alerter_conn), env, [a, b, tiny])
+
+    assert outcome.status == "ok"
+    assert outcome.deferred == (tiny.decision_id,)
+    assert len(_submits(env.fake)) == 1
+    assert outcome.written_off == ()
+    assert [e for e in _decision_events(env.settings) if e[0] == tiny.decision_id] == []
+
+
+def test_a_completed_buys_phase_writes_off_the_deferred_buy(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    a = _decision(env, A, "buy", notional=3000.0)
+    tiny = _decision(env, C, "buy", notional=50.0, whole_share=True)
+    env.fake.script(FillAt())
+
+    outcome = _execute(_gate(env, alerter_conn), env, [a, tiny])
+
+    assert outcome.status == "ok"
+    assert outcome.deferred == (tiny.decision_id,)
+    assert len(_submits(env.fake)) == 1
+    assert outcome.written_off == (tiny.decision_id,)
+    assert [e for e in _decision_events(env.settings) if e[0] == tiny.decision_id] != []
+
+
 def test_a_switch_read_that_runs_past_the_window_sends_nothing_more(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
