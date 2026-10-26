@@ -31,7 +31,7 @@ import duckdb
 import polars as pl
 import streamlit as st
 
-from tradepartner.cli_record import scrub_text
+from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
 from tradepartner.execution import headroom, ops, plain, waiting
@@ -201,7 +201,8 @@ def _waiting_card(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
         for item in items:
             status: theme.Status = "critical" if item.kind == "kill_switch_engaged" else "warning"
             theme.status_badge(f"{item.book_id}: {item.kind}", status)
-            st.caption(f"{scrub_text(item.detail, secrets=())[0]} · since {item.since or '-'}")
+            detail = scrub_text(item.detail, secrets=_configured_secrets(settings))[0]
+            st.caption(f"{detail} · since {item.since or '-'}")
             if item.command is not None:
                 st.code(item.command, language="bash")
             else:

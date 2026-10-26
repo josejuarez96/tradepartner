@@ -901,6 +901,8 @@ def test_waiting_card_shows_a_secret_in_the_kill_reason_scrubbed(
     monkeypatch: pytest.MonkeyPatch, seeded_store: Path
 ) -> None:
     secret = "PKREALSECRETVALUE1234567890"  # gitleaks:allow
+    configured = "correct horse battery staple 99"  # no pattern catches this one
+    monkeypatch.setenv("ALERT_SMTP_PASSWORD", configured)
     settings = Settings(_env_file=None, store={"path": str(seeded_store)})
     with open_for_write(settings) as conn:
         window = journal.open_window(conn, "main")
@@ -912,7 +914,7 @@ def test_waiting_card_shows_a_secret_in_the_kill_reason_scrubbed(
                 at=_at(-20),
                 state="engaged",
                 source="owner",
-                reason=f"stop key {secret}",
+                reason=f"stop key {secret} pw {configured}",
                 **_stamp(-20),
             ),
         )
@@ -920,7 +922,7 @@ def test_waiting_card_shows_a_secret_in_the_kill_reason_scrubbed(
     assert not at.exception
     text = _text(at)
     assert "reason given: stop key" in text
-    assert secret not in text
+    assert secret not in text and configured not in text
 
 
 # --- the Risk card (plan T260, amendment 2026-10-20 #2096 item 3) -----------------
