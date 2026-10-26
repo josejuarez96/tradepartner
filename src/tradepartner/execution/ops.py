@@ -268,6 +268,9 @@ class OverdueDelisting:
         )
 
 
+NO_EDGAR_INGEST_LINE = "no successful EDGAR ingest yet; run `tradepartner ingest`"
+
+
 @dataclass(frozen=True)
 class EdgarAge:
     """The EDGAR master has not refreshed for `sessions` sessions (#2197): shown by
@@ -275,11 +278,14 @@ class EdgarAge:
     display only (no alert, no waiting item, no refusal; paper keeps trading)."""
 
     sessions: int
-    last_ok_session: date
+    #: None when no `ok` daily EDGAR ingest run is stored (#2254).
+    last_ok_session: date | None
 
     @property
     def line(self) -> str:
         """The one line every surface shows."""
+        if self.last_ok_session is None:
+            return NO_EDGAR_INGEST_LINE
         return (
             f"EDGAR data {self.sessions} sessions old (last ok ingest covered "
             f"{self.last_ok_session.isoformat()}); check the ingest run (`tradepartner ingest`)"
@@ -985,8 +991,9 @@ def edgar_age(
     """The EDGAR data age (#2197) when it reaches `ingest.edgar_max_age_sessions`:
     the XNYS sessions after the session the latest `ok` daily EDGAR ingest run
     covered (the last session closed when it finished), up to the last session
-    closed at `now`. None below the limit, and when no `ok` run is stored (nothing
-    to count from). Runs finished after `now` are not yet known and are ignored.
+    closed at `now`. None below the limit. With no `ok` run stored it is an
+    `EdgarAge` with no covered session (#2254), so a never-ingested store is not silent.
+    Runs finished after `now` are not yet known and are ignored.
     Reads only the stored rows (the trading calendar, never
     weekdays)."""
     row = conn.execute(
@@ -995,7 +1002,7 @@ def edgar_age(
         [INGEST_OK, _EDGAR_SOURCE, INGEST_MODE, now],
     ).fetchone()
     if row is None or row[0] is None:
-        return None
+        return EdgarAge(0, None)
     covered = last_completed_session(ensure_tz_aware_utc(row[0], field_name="finished_at"))
     current = last_completed_session(ensure_tz_aware_utc(now, field_name="now"))
     calendar = all_sessions()
