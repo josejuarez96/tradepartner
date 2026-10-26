@@ -4,7 +4,12 @@ and routing are checked."""
 
 from __future__ import annotations
 
+import ast
+import json
 import re
+import shutil
+import subprocess
+from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -13,8 +18,8 @@ import streamlit as st
 from dashboard_nav import nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
-from tradepartner.config import Settings
-from tradepartner.dashboard import book_page
+from tradepartner.config import RiskConfig, Settings
+from tradepartner.dashboard import book_actions, book_page
 from tradepartner.execution import book_activity, book_holdings, book_stats, book_view
 from tradepartner.store import schema
 from tradepartner.store.db import open_for_write
@@ -85,6 +90,8 @@ def _view(
     notes: dict[str, str] | None = None,
     tracking: book_stats.TrackingProgress | None = None,
     spy: float | None = 1.0,
+    safety: book_view.Safety | None = None,
+    backtest: book_view.Backtest | None = None,
 ) -> book_view.BookView:
     notes = notes or {}
     ranges = tuple(_slice(k, notes.get(k)) for k in ("since_start", "1M", "3M"))
@@ -111,9 +118,58 @@ def _view(
         book_activity.TodayActivity(digest, _side("sell", sells), _side("buy", buys), problems),
         _D2,
         held,
-        None,
-        None,
+        safety or _safety(),
+        backtest or _backtest(),
     )
+
+
+_CHECKED = datetime(2026, 10, 2, 21, 0, tzinfo=UTC)  # 5:00 PM ET
+
+
+def _safety(
+    *,
+    matches: bool = True,
+    tolerance: float = 0.01,
+    running: bool = True,
+    since: datetime | None = None,
+    text: str | None = None,
+) -> book_view.Safety:
+    recon_text = text or (
+        f"Matches Alpaca as of {_CHECKED.isoformat()}: cash and holdings agree within the "
+        "reconciliation's tolerance."
+    )
+    switch = (
+        book_view.KillSwitchView(True, None, "", "Running: the kill switch is off.")
+        if running
+        else book_view.KillSwitchView(False, since, "stopped by the owner: checking", "x")
+    )
+    limit = book_view.LimitLine(
+        "position",
+        "Largest position: 4.8% against a limit of 5.0%, 0.2 points to spare. "
+        "Past it, the order is cut.",
+        "within",
+    )
+    return book_view.Safety(
+        book_view.ReconciliationView(matches, recon_text, _CHECKED, tolerance), switch, (limit,)
+    )
+
+
+def _backtest(report: bool = True) -> book_view.Backtest:
+    trial = book_view.TrialResult(12, "ok", None, False, "trial 12: ok")
+    line = book_view.ReportLine(_D1, trial, "Latest report runs through 2026-10-01; trial 12: ok.")
+    return book_view.Backtest(
+        book_view.ShakedownProgress(5, 10, "5 of 10 sessions"),
+        line if report else None,
+        "tradepartner paper report --book main",
+    )
+
+
+def _live(monkeypatch: pytest.MonkeyPatch, store: Path) -> None:
+    """Make `store` the live store: a project root whose `.env` names it."""
+    root = store.parent / "root"
+    root.mkdir(exist_ok=True)
+    (root / ".env").write_text(f"STORE__PATH={store}\n")
+    monkeypatch.setattr(book_actions, "PROJECT_ROOT", root)
 
 
 def _app(
@@ -121,6 +177,8 @@ def _app(
     path: Path,
     view: book_view.BookView | None = None,
     seen: list[str] | None = None,
+    *,
+    live: bool = True,
 ) -> AppTest:
     def build(
         conn: object, settings: Settings, book: str, now: datetime, *, top_n: int = 5
@@ -132,6 +190,8 @@ def _app(
 
     monkeypatch.setattr(book_view, "build", build)
     monkeypatch.setattr(book_page, "_now", lambda: _NOW)
+    if live:
+        _live(monkeypatch, path)
     monkeypatch.setenv("STORE__PATH", str(path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(path.parent / "missing.env"))
     at = AppTest.from_file(_APP).run()
@@ -142,7 +202,8 @@ def _app(
 
 def _text(at: AppTest) -> str:
     parts: list[str] = []
-    for group in (at.markdown, at.caption, at.header, at.subheader, at.warning, at.info):
+    groups = (at.markdown, at.caption, at.header, at.subheader, at.warning, at.info, at.error)
+    for group in (*groups, at.success, at.code):
         parts += [str(e.value) for e in group]
     for m in at.metric:
         parts += [str(m.label), str(m.value), str(m.help or "")]
@@ -173,7 +234,8 @@ def test_status_pill_words(
 ) -> None:
     at = _app(monkeypatch, _store(tmp_path / "s.duckdb"), _view(status=status))
     assert word in _text(at)
-    assert status not in _text(at).lower().replace("trading", "") or status == "closed"
+    text = _text(at).lower().replace("running a new report", "")  # T277's quoted note
+    assert status not in text.replace("trading", "") or status == "closed"
 
 
 def test_range_buttons_default_since_start_and_switch(
@@ -323,3 +385,381 @@ def test_choosing_a_range_draws_that_range(monkeypatch: pytest.MonkeyPatch, tmp_
     at.get("button_group")[0].set_value("3M").run(timeout=30)
     assert not at.exception
     assert "longer than the book's history" in _text(at)
+
+
+# --- T277 (#2270): the safety card, "Stop this book now" and the backtest card ---
+
+_REASON = "the drawdown looks wrong, stopping to check"
+_ENGAGED_LINE = "paper kill: engaged (kill_switch event 4)"
+
+
+class _Child:
+    """A fake `paper kill` child: exits `code`, or is still running at the bound."""
+
+    def __init__(self, code: int | None, stdout: str, stderr: str) -> None:
+        self.returncode, self.out, self.err = code, stdout, stderr
+        self.terminated = False
+
+    def communicate(
+        self, input: str | None = None, timeout: float | None = None
+    ) -> tuple[str, str]:
+        if self.returncode is None and timeout is not None:
+            raise subprocess.TimeoutExpired("paper kill", timeout)
+        return self.out, self.err
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    kill = terminate
+
+
+class _Starter:
+    """Replaces `book_actions._start`; `check` runs when the child would start."""
+
+    def __init__(
+        self,
+        code: int | None = 0,
+        stdout: str = _ENGAGED_LINE,
+        stderr: str = "",
+        check: Callable[[], None] | None = None,
+    ) -> None:
+        self.code, self.stdout, self.stderr, self.check = code, stdout, stderr, check
+        self.argvs: list[list[str]] = []
+        self.children: list[_Child] = []
+
+    def __call__(self, argv: list[str], *, env: dict[str, str], cwd: Path) -> _Child:
+        if self.check is not None:
+            self.check()
+        self.argvs.append(argv)
+        self.children.append(_Child(self.code, self.stdout, self.stderr))
+        return self.children[-1]
+
+
+def _starter(monkeypatch: pytest.MonkeyPatch, starter: _Starter | None = None) -> _Starter:
+    starter = starter or _Starter()
+    monkeypatch.setattr(book_actions, "_start", starter)
+    return starter
+
+
+def _open_dialog(at: AppTest) -> None:
+    at.button(key=f"{book_page.STOP_BUTTON_KEY}_main").click().run(timeout=30)
+
+
+def _confirm(at: AppTest, reason: str | None = _REASON) -> None:
+    if reason is not None:
+        at.text_area(key=book_page.STOP_REASON_KEY).input(reason).run(timeout=30)
+    at.button(key=book_page.STOP_CONFIRM_KEY).click().run(timeout=30)
+
+
+def test_the_safety_card_draws_the_view_and_computes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"))
+    text = _text(at)
+    assert "Matches Alpaca to the cent." in text
+    assert "Checked Friday, October 2, 5:00 PM ET." in text
+    assert "Trading: the kill switch is off." in text
+    assert "Largest position: 4.8% against a limit of 5.0%" in text
+
+
+def test_a_match_within_a_wider_tolerance_is_not_to_the_cent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"), _view(safety=_safety(tolerance=1.26)))
+    text = _text(at)
+    assert "to the cent" not in text
+    assert "Matches Alpaca within the reconciliation's tolerance (cash to $1.26)." in text
+
+
+def test_a_reconciliation_that_did_not_match_says_what_differs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    words = (
+        f"Does not match Alpaca as of {_CHECKED.isoformat()}: the books do not match "
+        "Alpaca: cash differs."
+    )
+    view = _view(safety=_safety(matches=False, text=words))
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"), view)
+    text = _text(at)
+    assert "to the cent" not in text
+    assert "Does not match Alpaca as of Friday, October 2, 5:00 PM ET" in text
+    assert "cash differs" in text and "+00:00" not in text
+
+
+def test_a_stopped_book_says_since_when_and_why_and_the_desk_resume(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    view = _view(status="stopped", safety=_safety(running=False, since=_CHECKED))
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"), view)
+    text = _text(at)
+    assert "Halted since Friday, October 2, 5:00 PM ET: stopped by the owner: checking." in text
+    assert "tradepartner paper resume --book=main" in text
+    labels = [b.label for b in at.button]
+    assert not [b for b in labels if "esume" in b or "stop all" in b.lower() or "every" in b]
+
+
+def test_the_stop_dialog_names_the_book_says_what_happens_and_starts_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    starter = _starter(monkeypatch)
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"))
+    _open_dialog(at)
+    text = _text(at)
+    assert "Stop main now?" in text
+    assert "no run places an order for main" in text
+    box = at.text_area(key=book_page.STOP_REASON_KEY)
+    assert box.value in (None, "")
+    assert starter.argvs == []
+
+
+@pytest.mark.parametrize("reason", [None, "", "   \n "])
+def test_an_empty_or_blank_reason_runs_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reason: str | None
+) -> None:
+    starter = _starter(monkeypatch)
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"))
+    _open_dialog(at)
+    _confirm(at, reason)
+    assert not at.exception
+    assert starter.argvs == []
+    assert "empty or blank reason stops nothing" in _text(at)
+
+
+def test_the_reason_box_is_capped_by_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The box caps at `ui.max_reason_chars`; `book_actions.kill` refuses longer
+    text before anything runs (its own test)."""
+    monkeypatch.setenv("UI__MAX_REASON_CHARS", "40")
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"))
+    _open_dialog(at)
+    assert at.text_area(key=book_page.STOP_REASON_KEY).proto.max_chars == 40
+
+
+@pytest.mark.parametrize(
+    ("code", "engaged"),
+    [(0, True), (2, False), (3, False), (4, False), (5, False), (6, False), (77, False)],
+)
+def test_the_outcome_is_the_exit_code_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int, engaged: bool
+) -> None:
+    starter = _starter(monkeypatch, _Starter(code))
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"))
+    _open_dialog(at)
+    _confirm(at)
+    assert not at.exception
+    assert len(starter.argvs) == 1
+    assert starter.argvs[0][-2:] == ["--book=main", f"--reason={_REASON}"]
+    text = _text(at)
+    if engaged:
+        assert [s.value for s in at.success] == ["The kill switch is engaged for main."]
+        assert "NOT engaged" not in text
+    else:
+        assert "The kill switch is NOT engaged for main" in text and not at.success
+    assert _ENGAGED_LINE in text  # the command's own text, shown, never read
+
+
+def test_exit_0_after_the_store_busy_line_is_engaged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    waiting = "paper kill: kill switch NOT engaged yet: store busy (held by x), waiting up to 300 s"
+    _starter(monkeypatch, _Starter(0, stderr=waiting))
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"))
+    _open_dialog(at)
+    _confirm(at)
+    assert [s.value for s in at.success] == ["The kill switch is engaged for main."]
+
+
+def test_past_the_bound_it_says_not_confirmed_and_neither_kills_nor_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    starter = _starter(monkeypatch, _Starter(None))
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"))
+    _open_dialog(at)
+    _confirm(at)
+    assert "NOT confirmed" in _text(at) and "within 330 seconds" in _text(at)
+    assert len(starter.argvs) == 1 and not starter.children[0].terminated
+    at.run(timeout=30)
+    assert len(starter.argvs) == 1
+
+
+def test_a_stale_second_click_with_the_same_reason_runs_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The Override page's guard: a second click whose message still carries the
+    pre-clear reason is refused by content, not timing."""
+    starter = _starter(monkeypatch)
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"))
+    _open_dialog(at)
+    _confirm(at)
+    assert len(starter.argvs) == 1
+    assert at.session_state[book_page.STOP_REASON_KEY] == ""
+    del at.session_state[book_page.STOP_OUTCOME_KEY]  # the form shows again
+    at.run(timeout=30)
+    at.session_state[book_page.STOP_REASON_KEY] = f"  {_REASON} "
+    at.button(key=book_page.STOP_CONFIRM_KEY).click().run(timeout=30)
+    assert len(starter.argvs) == 1
+    assert "already" in _text(at)
+
+
+def test_no_store_connection_is_open_when_the_child_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = _store(tmp_path / "s.duckdb")
+    opened: list[bool] = []
+
+    def no_connection_open() -> None:
+        # A write open in this process fails at once while any read-only one is open.
+        probe = Settings(_env_file=None, store={"path": str(store), "lock_retry_seconds": 0})
+        with open_for_write(probe):
+            opened.append(True)
+
+    _starter(monkeypatch, _Starter(0, check=no_connection_open))
+    at = _app(monkeypatch, store)
+    _open_dialog(at)
+    _confirm(at)
+    assert not at.exception and opened == [True]
+
+
+def test_a_copy_named_by_the_page_s_own_env_refuses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    live = _store(tmp_path / "live.duckdb")
+    _live(monkeypatch, live)
+    copy = tmp_path / "copy" / "s.duckdb"
+    copy.parent.mkdir()
+    shutil.copy(live, copy)
+    env = tmp_path / "copy" / ".env"
+    env.write_text(f"STORE__PATH={copy}\n")
+    starter = _starter(monkeypatch)
+    at = _app(monkeypatch, copy, live=False)
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(env))
+    at.run(timeout=30)
+    assert "not the live store" in _text(at)
+    assert f"{book_page.STOP_BUTTON_KEY}_main" not in [b.key for b in at.button]
+    assert starter.argvs == []
+
+
+def test_a_store_with_a_backup_manifest_beside_it_refuses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = _store(tmp_path / "s.duckdb")
+    store.with_name(f"{store.name}.manifest.json").write_text("{}")
+    starter = _starter(monkeypatch)
+    at = _app(monkeypatch, store)
+    assert "backup manifest" in _text(at)
+    assert f"{book_page.STOP_BUTTON_KEY}_main" not in [b.key for b in at.button]
+    assert starter.argvs == []
+
+
+def test_a_store_outside_the_configured_one_refuses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    live = _store(tmp_path / "live.duckdb")
+    _live(monkeypatch, live)
+    starter = _starter(monkeypatch)
+    at = _app(monkeypatch, _store(tmp_path / "elsewhere.duckdb"), live=False)
+    assert "not the live store" in _text(at)
+    assert "tradepartner paper kill --book=main" in _text(at)
+    assert starter.argvs == []
+
+
+def test_a_closed_book_offers_no_stop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"), _view(status="closed"))
+    assert f"{book_page.STOP_BUTTON_KEY}_main" not in [b.key for b in at.button]
+
+
+def test_the_backtest_card(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"))
+    text = _text(at)
+    assert "5 of 10 sessions since the span started or last restarted" in text
+    assert "tradepartner paper shakedown" in text
+    assert "The latest tracking report runs through Thursday, October 1: it finished." in text
+    assert "tradepartner paper report --book main" in text
+    assert "Running a new report counts as one test." in text
+
+
+def test_no_report_yet_is_plain(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    at = _app(monkeypatch, _store(tmp_path / "s.duckdb"), _view(backtest=_backtest(False)))
+    assert "No tracking report yet." in _text(at)
+
+
+def test_a_real_render_adds_no_trial(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The real view model over a window with frozen risk keys: the page never runs
+    `paper report`, so the `trials` row count is the same before and after."""
+    path = tmp_path / "s.duckdb"
+    frozen = json.dumps({f"risk.{k}": v for k, v in RiskConfig().model_dump(mode="json").items()})
+    settings = Settings(_env_file=None, store={"path": str(path)})
+    with open_for_write(settings) as conn:
+        schema.init_schema(conn)
+        conn.execute(
+            "INSERT INTO hypotheses (hypothesis_id, slug, family, title, doc_path, doc_sha256, "
+            "params_json, params_sha256, in_sample_start, holdout_start, holdout_end, "
+            "registered_at, registered_by) VALUES (1, 'h-view', 'momentum', 'view', "
+            "'docs/hypotheses/h-view.md', repeat('0', 64), '{}', repeat('0', 64), ?, ?, ?, ?, "
+            "'test')",
+            [_D0, _D0, _D0, _NOW],
+        )
+        append(
+            conn,
+            PaperWindowRow(
+                hypothesis_id=1,
+                first_rebalance_session=_D0,
+                account_id="PA0",
+                starting_cash=100_000.0,
+                starting_equity=100_000.0,
+                code_version="test",
+                started_at=_NOW,
+                frozen_json=frozen,
+                frozen_sha256="0" * 64,
+                book_id="main",
+                known_at=_NOW,
+                ingested_at=_NOW,
+            ),
+        )
+    count = "SELECT count(*) FROM trials"
+    with open_for_write(settings) as conn:
+        before = conn.execute(count).fetchone()
+    _live(monkeypatch, path)
+    monkeypatch.setattr(book_page, "_now", lambda: _NOW)
+    monkeypatch.setenv("STORE__PATH", str(path))
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "missing.env"))
+    at = AppTest.from_file(_APP).run()
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Books")
+    at.run(timeout=30)
+    assert not at.exception, at.exception
+    assert "Running a new report counts as one test." in _text(at)
+    with open_for_write(settings) as conn:
+        assert conn.execute(count).fetchone() == before
+
+
+_BANNED_MODULES = (
+    "tradepartner.dashboard.override_page",
+    "tradepartner.execution.switch",
+    "tradepartner.execution.window",
+    "tradepartner.execution.wrapper",
+    "tradepartner.execution.run",
+    "tradepartner.execution.phases",
+    "tradepartner.execution.brokers",
+    "tradepartner.adapters",
+    "tradepartner.execution.resume",
+    "tradepartner.execution.report",
+    "tradepartner.backtest",
+)
+_BANNED_NAMES = {"submit", "engage", "open_for_write", "override_page", "switch", "window"}
+
+
+@pytest.mark.parametrize("module", [book_page, book_actions])
+def test_no_second_kill_path_is_imported(module: object) -> None:
+    tree = ast.parse(Path(str(getattr(module, "__file__", ""))).read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            names = [base, *(f"{base}.{a.name}" for a in node.names)]
+            assert not {a.name for a in node.names} & _BANNED_NAMES, ast.dump(node)
+        else:
+            continue
+        for name in names:
+            assert not name.startswith(_BANNED_MODULES), name

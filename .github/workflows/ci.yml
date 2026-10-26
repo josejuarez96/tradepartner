@@ -80,12 +80,22 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
           GH_TOKEN: ${{ github.token }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           needed=yes
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             files=$(git -c core.quotePath=false diff --no-renames --name-only "origin/$BASE_REF...HEAD")
             if [ -n "$files" ]; then
               needed=$(printf '%s\n' "$files" | python3 scripts/ready_pr.py --tests-needed)
+            fi
+            # A refresh that only merged docs from main into an already fully tested head
+            # keeps that head's result (#2279); any doubt prints `run`.
+            if [ "$needed" = "yes" ]; then
+              decision=$(python3 scripts/ci_tested_tree.py --refresh "$PR_HEAD") || decision=run
+              if [ "$decision" = "skip" ]; then
+                echo "PR: main brought in only docs over a head that passed the full suite; skipping the pytest shards (#2279)."
+                needed=no
+              fi
             fi
           elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
             decision=$(python3 scripts/ci_tested_tree.py "$GITHUB_SHA") || decision=run
