@@ -346,6 +346,10 @@ def test_week_end_window_counts_and_compares_per_iso_week(settings: Settings) ->
     assert lines["rebalance_count"].detail.startswith(
         "2 scheduler-executed rebalance session(s) [2026-11-27, 2026-12-04], need >= 2"
     )
+    assert lines["rebalance_count"].short == (
+        "2 of 2 rebalance sessions done; first 2026-11-27, latest 2026-12-04; "
+        "other runs are listed but not counted (--verbose shows them)"
+    )
     assert lines["tracking"].detail.startswith("2 compared non-excluded week(s), need >= 2")
 
 

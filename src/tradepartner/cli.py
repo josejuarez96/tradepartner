@@ -4462,7 +4462,17 @@ def make_app(
             _echo_scrubbed(line, s)
 
     @paper_app.command("check")
-    def paper_check_(book: Annotated[str | None, _BOOK_OPTION] = None) -> None:
+    def paper_check_(
+        book: Annotated[str | None, _BOOK_OPTION] = None,
+        verbose: Annotated[
+            bool,
+            typer.Option(
+                "--verbose",
+                help="also print each check's query and every session date",
+                allow_from_autoenv=False,
+            ),
+        ] = False,
+    ) -> None:
         """The book's four exit-criteria checks; exit 0 only when all pass (req 15)."""
         chosen = _checked_book(book)
         s = paper_settings()
@@ -4475,30 +4485,57 @@ def make_app(
         lines = _paper_call(s, run_check)
         for line in lines:
             verdict = "PASS" if line.passed else "FAIL"
-            _echo_scrubbed(f"{verdict} {line.name}: {line.detail} (query: {line.query})", s)
+            if verbose:
+                _echo_scrubbed(f"{verdict} {line.name}: {line.detail} (query: {line.query})", s)
+            else:
+                _echo_scrubbed(f"{verdict} {line.name}: {line.short or line.detail}", s)
         if not all(line.passed for line in lines):
             raise typer.Exit(CRASH_EXIT_CODE)
 
     @paper_app.command("shakedown")
-    def paper_shakedown_() -> None:
+    def paper_shakedown_(
+        verbose: Annotated[
+            bool,
+            typer.Option(
+                "--verbose",
+                help="also print each line's rows, query and thresholds",
+                allow_from_autoenv=False,
+            ),
+        ] = False,
+    ) -> None:
         """The machine-readiness gate's seven lines over every book; exit 0 only when
         all pass (ADR 0017 part E; spec req 15 as amended 2026-10-09). Read-only."""
         s = paper_settings()
         paper_schema_gate(s, read_only=True)
         now = ensure_tz_aware_utc(clock(), field_name="clock()")
 
-        def run_shakedown() -> paper_shakedown.Shakedown:
+        def run_shakedown() -> paper_shakedown.Shakedown | None:
             with open_read_only(s) as conn:
-                return paper_shakedown.shakedown(conn, s, now=now)
+                try:
+                    return paper_shakedown.shakedown(conn, s, now=now)
+                except ValueError:
+                    if registry.shakedown_span(conn) is None:
+                        return None
+                    raise
 
         result = _paper_call(s, run_shakedown)
-        for line in result.lines:
-            verdict = "PASS" if line.passed else "FAIL"
+        if result is None:
+            # not a crash: the span just has not been opened (exit code unchanged)
             _echo_scrubbed(
-                f"{verdict} {line.name}: {line.detail} (rows: {line.rows}; query: "
-                f"{line.query}; thresholds: {line.thresholds})",
+                "paper shakedown: no shakedown span is open yet. Open one with "
+                "`tradepartner decision shakedown-span --sessions N --order-sessions M "
+                "--reason ...` (see the shakedown runbook).",
                 s,
             )
+            raise typer.Exit(CRASH_EXIT_CODE)
+        for line in result.lines:
+            verdict = "PASS" if line.passed else "FAIL"
+            extra = (
+                f" (rows: {line.rows}; query: {line.query}; thresholds: {line.thresholds})"
+                if verbose
+                else ""
+            )
+            _echo_scrubbed(f"{verdict} {line.name}: {line.detail}{extra}", s)
         if not result.passed:
             raise typer.Exit(CRASH_EXIT_CODE)
 
