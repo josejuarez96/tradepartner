@@ -697,7 +697,7 @@ Added 2026-10-20 by the #1976 amendment. Each with a recommendation, **for the o
 
 37. **Where the child lot's carried dates live.** Options: (a) the parent lot's acquisition date on the child lot's own `trade_at` and `trade_date_local` (recommended: that is the tax acquisition date the long-term/short-term classification reads — not the §1091 scan, item 4, which a receipt lot enters only as a sale, never as a replacement — and the receipt's `session` records when the lot was received, so a per-window rebuild writes the whole window at once and no lot exists before its receipt session; T255's test names every reader of `lots.trade_at`); (b) a separate `holding_period_start` column, with `trade_at` at the receipt's session (keeps `trade_at` as the receipt instant, but adds a `lots` column and makes every later date reader choose which field it means, though the scan, item 4, would not read it).
 
-Added 2026-10-26 by the #2266 amendment ([ADR 0025](../decisions/0025-reconcile-by-breaks.md)). One decision each, a recommendation beside it, **for the owner**. His merge accepts the recommended option unless his review comment picks another.
+Added 2026-10-26 by the #2266 amendment ([ADR 0025](../decisions/0025-reconcile-by-breaks.md)). All thirteen decided by the owner on 2026-10-26: every recommendation taken.
 
 38. **What a restriction blocks.** (a) Orders that add exposure are blocked; sells of a long, covers of a short, forced exits and `paper stop` are allowed, sized to at most min(|ledger|, |broker|) (recommended: a halted name must still be exitable, #2156); (b) every order in the name is blocked until the true-up.
 
