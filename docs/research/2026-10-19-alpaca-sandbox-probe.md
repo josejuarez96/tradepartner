@@ -83,6 +83,9 @@ Files are in `~/tradepartner-probes/sandbox/results/` (outside the repo): `batch
 - **T220:** paper shows no borrow fee on an ETB short within a session; the overnight check (`--leave-short`, then `--only followup`) has not been run.
 - **Later intraday and options work:** the extended-hours, TIF, bracket, options and edge rows above.
 
+## Addendum (2026-10-25, #2163): fill-activity sides
+`FILL` account activities from `batch1-20261019T172717Z.jsonl` and `batch1-20261020T190409Z.jsonl` (labels `activities.since_run_start`, `activities.recent_all_types`) report a short open as side `sell_short` and every cover (1 share, and 0.5 + 0.5 fractional) as plain `buy`; `buy_to_cover` never appeared. The docs list only `buy` and `sell`. The adapter maps `sell_short` to a sell; a scrubbed pair is `tests/fixtures/alpaca/paper/short_fills.json`.
+
 ## Disconfirmation
 - Searches run: read all three result files in full (every labelled note) and `alpaca-github-notes.md` (the same-day survey of the alpacahq repos and docs) against each claim.
 - What was found against: three docs claims did not hold on the day. The OTO PATCH was accepted (docs: unsupported). `daytrade_count` is absent (explained by the 2026-07-06 removal, not a paper quirk). No HTB name was available to probe, so the HTB refusal text is unknown.
