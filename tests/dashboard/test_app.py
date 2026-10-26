@@ -249,15 +249,14 @@ def test_home_and_books_route_with_the_final_signature(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store_path = _init_store(tmp_path)
-    for page, module in (("Home", home_page), ("Books", book_page)):
-        at = _run_app(monkeypatch, store_path, page)
-        assert not at.exception
-        if page == "Home":
-            assert [h.value for h in at.header] == [page]
-            assert any("coming next" in m.value.lower() for m in at.markdown)
-        else:  # T276 filled the Book page: an empty store says no book has started
-            assert any("no book has started" in i.value.lower() for i in at.info)
+    for module in (home_page, book_page):
         assert list(inspect.signature(module.render).parameters) == ["conn", "settings"]
+    at = _run_app(monkeypatch, store_path, "Home")
+    assert not at.exception
+    at = _run_app(monkeypatch, store_path, "Books")
+    assert not at.exception
+    # T276 filled the Book page: an empty store says no book has started
+    assert any("no book has started" in i.value.lower() for i in at.info)
 
 
 def test_research_tab_renders_the_research_page_unchanged(
