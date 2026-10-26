@@ -251,10 +251,12 @@ def test_home_and_books_route_with_the_final_signature(
     store_path = _init_store(tmp_path)
     for module in (home_page, book_page):
         assert list(inspect.signature(module.render).parameters) == ["conn", "settings"]
+    at = _run_app(monkeypatch, store_path, "Home")
+    assert not at.exception
     at = _run_app(monkeypatch, store_path, "Books")
     assert not at.exception
-    assert [h.value for h in at.header] == ["Books"]
-    assert any("coming next" in m.value.lower() for m in at.markdown)  # T276 fills this in
+    # T276 filled the Book page: an empty store says no book has started
+    assert any("no book has started" in i.value.lower() for i in at.info)
 
 
 def test_research_tab_renders_the_research_page_unchanged(

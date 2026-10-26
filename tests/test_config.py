@@ -1960,6 +1960,8 @@ def test_risk_defaults_match_adr_0010() -> None:
     # #1762 (T249): the sessions after a merger's payable date its cash may post.
     assert r.reconcile_merger_lag_sessions == 5
     assert r.reconcile_dividend_credit_sessions == 25
+    assert r.reconcile_dividend_exhaustive_dues == 8
+    assert r.reconcile_dividend_subset_states == 10_000
     # #411: the premium a delisted holding's late cash may carry over its last close.
     assert r.delisting_cash_max_premium == pytest.approx(0.10)
 
@@ -3251,6 +3253,19 @@ def test_a_negative_borrow_rate_is_refused(override: dict[str, object]) -> None:
     """A negative fee would pay the short book to hold its positions."""
     with pytest.raises(ValueError, match="borrow"):
         CostsConfig(**override)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("reconcile_dividend_exhaustive_dues", 0),
+        ("reconcile_dividend_exhaustive_dues", 13),
+        ("reconcile_dividend_subset_states", 0),
+    ],
+)
+def test_risk_reconcile_dividend_search_bounds(key: str, value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={key: value})
 
 
 def test_ui_keys_default_and_validate() -> None:
