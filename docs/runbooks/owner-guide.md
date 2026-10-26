@@ -209,6 +209,7 @@ You can do this yourself: [update-the-system](update-the-system.md), Part 1. It 
 | The script for a non-backtest experiment | No `experiment run` command exists. |
 | Diagnosing a halt | Every real halt so far (10-12, 10-13, 10-16) needed an agent PR to fix the cause. Resuming you can do alone. |
 | Diagnosing a damaged store | [update-the-system](update-the-system.md) Part 2 has the restore steps, but a damaged store is risky. Keep the damaged files and ask Claude before you restore. |
+| Restarting a paper window, rotating Alpaca keys | Owner-run ([window-restart](window-restart.md), [key-rotation](key-rotation.md)). |
 | Data releases and repairs | Owner-run on your store, with Claude's checklist ([data-releases](data-releases.md); [benchmark-backfill](benchmark-backfill.md) once). |
 | Reading a result in plain words | The pages show numbers, not a verdict sentence. |
 
