@@ -2205,6 +2205,9 @@ def test_paper_shakedown_with_no_span_row_fails(clock: _Clock, factory: _Factory
     assert "no shakedown span is open yet" in out.output
     assert "decision shakedown-span" in out.output
     assert "failed" not in out.output and "ValueError" not in out.output
+    old = _paper(clock, factory, "shakedown", "--verbose")
+    assert old.exit_code == 1
+    assert "failed: ValueError: no shakedown_span decision" in old.output
     assert factory.fake.calls == ()
 
 

@@ -292,7 +292,8 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
   (`no_window` with no open book; it is a usage error with `--book`).
 - `tradepartner paper shakedown` (ADR 0017 part E; plan T157b) prints
   `execution.shakedown.shakedown`'s seven lines, E.1 to E.7, over every book,
-  each with the rows, query and thresholds it read, through
+  each with its finding (the rows, query and thresholds it read only with
+  `--verbose`), through
   `store.db.open_read_only` (it writes nothing). The thresholds come from the
   newest `shakedown_span` decision, never `Settings`. It exits 0 only when every
   line passes and 1 otherwise, or when no `shakedown_span` row exists.
@@ -4522,7 +4523,10 @@ def make_app(
         if result is None:
             # not a crash: the span just has not been opened (exit code unchanged)
             _echo_scrubbed(
-                "paper shakedown: no shakedown span is open yet. Open one with "
+                "failed: ValueError: no shakedown_span decision: open the span with "
+                "`tradepartner decision shakedown-span --sessions N --order-sessions M --reason`"
+                if verbose
+                else "paper shakedown: no shakedown span is open yet. Open one with "
                 "`tradepartner decision shakedown-span --sessions N --order-sessions M "
                 "--reason ...` (see the shakedown runbook).",
                 s,

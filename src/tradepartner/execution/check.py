@@ -127,6 +127,8 @@ _PERIOD_DAYS: Mapping[Cadence, int] = MappingProxyType({"month_end": 30, "week_e
 
 def _time_to_go(remaining: int, cadence: Cadence) -> str:
     """A rough, plain-words wait for `remaining` more rebalance periods."""
+    if cadence == "daily":
+        return f"{remaining} more session(s) to go"
     days = remaining * _PERIOD_DAYS[cadence]
     if days < 14:
         return f"about {days} more day(s)"
