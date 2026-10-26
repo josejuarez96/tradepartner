@@ -23,6 +23,7 @@ from typing import Any
 import duckdb
 import pytest
 from conftest import version_4_store
+from dashboard_nav import NavCall, nav_calls_fixture, nav_titles  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.backtest.hypothesis import frozen_params_of
@@ -290,7 +291,8 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path, now: datetime = _NOW
     monkeypatch.setattr(ops_page, "utc_now", lambda: now)
     at = AppTest.from_file(_APP_PATH)
     at.run()
-    at.sidebar.radio[0].set_value(_PAGE).run()
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", _PAGE)
+    at.run()
     return at
 
 
@@ -414,20 +416,11 @@ def test_page_is_quiet_two_sessions_in_and_after_an_ok_run(
 
 
 def test_page_is_in_the_shell_navigation(
-    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path, nav_calls: list[NavCall]
 ) -> None:
     at = _app(monkeypatch, seeded_store)
     assert not at.exception
-    assert at.sidebar.radio[0].options == [
-        "Data health",
-        "Backtest",
-        "Trial registry",
-        "Research",
-        _PAGE,
-        "Trades",
-        "Performance",
-        "Override",
-    ]
+    assert _PAGE in nav_titles(nav_calls)
 
 
 def test_render_journal_not_initialised(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
