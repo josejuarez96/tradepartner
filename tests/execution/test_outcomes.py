@@ -239,6 +239,23 @@ def test_a_filled_buy_has_its_position_return_and_contribution() -> None:
     assert outcome.mark_price == 110.0
 
 
+@pytest.mark.parametrize(
+    ("mark", "expected_return", "expected_contribution"),
+    [(110.0, -0.10, -0.01), (90.0, 0.10, 0.01)],
+)
+def test_a_short_open_has_short_signed_return_and_contribution(
+    mark: float, expected_return: float, expected_contribution: float
+) -> None:
+    book = Book()
+    coid = book.order("SEC_A", "sell", "filled", [(10.0, 100.0)], position_side="short")
+    book.mark("SEC_A", T_NEXT, mark, -10.0)
+
+    outcome = _by_kind(book.due(DUE))[(coid, "position_return")]
+
+    assert outcome.value == pytest.approx(expected_return)
+    assert outcome.contribution == pytest.approx(expected_contribution)
+
+
 def test_nothing_is_due_until_the_run_after_close_of_the_next_rebalance() -> None:
     book = Book()
     book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
@@ -279,6 +296,18 @@ def test_an_unexecuted_order_has_the_names_return_over_the_horizon(status: str) 
     assert (outcome.client_order_id, outcome.kind) == (coid, "not_executed")
     assert outcome.value == pytest.approx(0.10)
     assert outcome.mark_price == 22.0
+    assert outcome.contribution is None
+
+
+def test_a_missed_short_has_the_short_signed_not_executed_return() -> None:
+    book = Book()
+    coid = book.order("SEC_C", "sell", "expired", position_side="short")
+    book.closes[("SEC_C", T_I)] = 100.0
+    book.closes[("SEC_C", T_NEXT)] = 110.0
+
+    outcome = _by_kind(book.due(DUE))[(coid, "not_executed")]
+
+    assert outcome.value == pytest.approx(-0.10)
     assert outcome.contribution is None
 
 
@@ -514,6 +543,31 @@ def test_stopped_window_horizon_is_the_flattening_fill_when_earlier() -> None:
     buy = outcomes[(coid, "position_return")]
     assert buy.through_session == flatten
     assert (buy.value, buy.mark_price) == (pytest.approx(0.05), 105.0)
+
+
+def test_stopped_short_window_ends_at_the_forced_covers_fill() -> None:
+    flatten = date(2026, 10, 20)
+    book = Book()
+    coid = book.order("SEC_A", "sell", "filled", [(10.0, 100.0)], position_side="short")
+    book.order(
+        "SEC_A",
+        "buy",
+        "filled",
+        [(10.0, 95.0)],
+        session=flatten,
+        phase="exit",
+        position_side="short",
+    )
+    book.closes[("SEC_A", flatten)] = 96.0
+    window = OutcomeWindow(
+        window_id=1, stop_requested=date(2026, 10, 19), stop_flat={"SEC_A": date(2026, 10, 22)}
+    )
+
+    outcome = _by_kind(book.due(date(2026, 10, 21), window))[(coid, "position_return")]
+
+    assert outcome.through_session == flatten
+    assert outcome.mark_price == 95.0
+    assert outcome.value == pytest.approx(0.05)
 
 
 def test_stopped_window_horizon_is_close_of_the_next_rebalance_when_earlier() -> None:

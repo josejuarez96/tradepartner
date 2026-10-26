@@ -234,7 +234,7 @@ def _flattening(
     stop_requested: date | None,
 ) -> dict[str, tuple[date, float]]:
     """Per name, (session of the last fill, average fill price) of its first
-    filled `exit` sell on or after the stop request."""
+    filled closing `exit` order on or after the stop request."""
     if stop_requested is None:
         return {}
     by_order: dict[str, list[OrderedFill]] = {}
@@ -246,7 +246,7 @@ def _flattening(
         quantity = sum(i.fill.quantity for i in own)
         if (
             order.phase == _EXIT
-            and order.side == _SELL
+            and filled_outcome_kind(order.side, order.position_side) == REALISED_PNL
             and order.session >= stop_requested
             and terminal.get(order.client_order_id) == _FILLED
             and quantity > 0
@@ -406,8 +406,9 @@ def due_outcomes(
             )
             average = _price(cost / shares, f"average fill price of {order.client_order_id}")
             assert average is not None
-            value = None if mark is None else mark / average - 1
-            gain = None if mark is None else mark * shares - cost
+            sign = -1 if order.position_side == "short" else 1
+            value = None if mark is None else sign * (mark / average - 1)
+            gain = None if mark is None else sign * (mark * shares - cost)
             candidates.append(
                 Outcome(
                     order.client_order_id,
@@ -432,7 +433,8 @@ def due_outcomes(
             start = _price(prices(security, before), f"start price of {security} on {before}")
             if start is not None:
                 start /= _split_factor(actions, security, before, through)
-            value = None if mark is None or start is None else mark / start - 1
+            sign = -1 if order.position_side == "short" else 1
+            value = None if mark is None or start is None else sign * (mark / start - 1)
             candidates.append(
                 Outcome(order.client_order_id, through, NOT_EXECUTED, value, None, mark)
             )
