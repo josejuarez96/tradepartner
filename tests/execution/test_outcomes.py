@@ -19,6 +19,7 @@ import pytest
 
 from tradepartner.calendar import previous_session
 from tradepartner.config import Cadence
+from tradepartner.execution.check import _chain_line
 from tradepartner.execution.lots import LedgerAccount, rebuild
 from tradepartner.execution.marks import UnreadableMarkError
 from tradepartner.execution.outcomes import (
@@ -28,6 +29,7 @@ from tradepartner.execution.outcomes import (
     outcome_horizon,
     write_outcomes_and_lots,
 )
+from tradepartner.execution.window import _not_ready
 from tradepartner.store import journal, schema
 from tradepartner.store.journal import (
     AdjustmentRow,
@@ -90,6 +92,7 @@ class Book:
         phase: str | None = None,
         implied_last: bool = False,
         book_id: str = "main",
+        position_side: str = "long",
     ) -> str:
         coid = f"tp-{session:%Y%m%d}-{security_id}-{side}-{len(self.orders) + 1}"
         self.orders.append(
@@ -103,6 +106,7 @@ class Book:
                 security_id=security_id,
                 symbol=security_id.removeprefix("SEC_"),
                 side=side,
+                position_side=position_side,
                 quantity=10.0,
                 book_id=book_id,
                 sells_in_flight_at_submit=False,
@@ -696,6 +700,58 @@ def _count(conn: duckdb.DuckDBPyConnection, table: str) -> int:
     row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()
     assert row is not None
     return int(row[0])
+
+
+@pytest.mark.parametrize(
+    ("side", "position_side", "expected"),
+    [
+        ("buy", "long", "position_return"),
+        ("sell", "long", "realised_pnl"),
+        ("sell", "short", "position_return"),
+        ("buy", "short", "realised_pnl"),
+    ],
+)
+def test_written_intent_outcome_completes_check_and_stop_chain(
+    conn: duckdb.DuckDBPyConnection, side: str, position_side: str, expected: str
+) -> None:
+    book = Book()
+    if side == "sell" and position_side == "long":
+        book.order("SEC_A", "buy", "filled", [(10.0, 100.0)], session=F_I)
+    if side == "buy" and position_side == "short":
+        book.order("SEC_A", "sell", "filled", [(10.0, 100.0)], position_side="short", session=F_I)
+    coid = book.order("SEC_A", side, "filled", [(10.0, 100.0)], position_side=position_side)
+    book.mark("SEC_A", T_NEXT, 110.0)
+    _journal(conn, book)
+    append(
+        conn,
+        PaperRunRow(
+            run_id=2,
+            window_id=1,
+            session=DUE,
+            kind="mark",
+            started_at=_utc(DUE),
+            invoked_by="tty",
+            code_version="t",
+            known_at=_utc(DUE),
+            ingested_at=_utc(DUE),
+        ),
+    )
+    errors: list[str] = []
+    write_outcomes_and_lots(
+        conn,
+        1,
+        ACCOUNT,
+        {},
+        book.price_of,
+        DUE,
+        _clock,
+        on_lot_error=errors.append,
+        cadence=CADENCE,
+    )
+    assert errors == []
+    assert {row.kind for row in outcomes_for(conn, 1) if row.client_order_id == coid} == {expected}
+    assert _chain_line(conn, 1, CADENCE).passed
+    assert _not_ready(conn, 1) == []
 
 
 def test_the_writer_appends_outcomes_and_lots_once(conn: duckdb.DuckDBPyConnection) -> None:
