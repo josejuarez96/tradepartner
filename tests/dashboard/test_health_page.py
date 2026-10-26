@@ -19,6 +19,7 @@ from typing import Any
 import duckdb
 import pytest
 from conftest import load_universe_fixtures
+from dashboard_nav import nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner import health
@@ -86,6 +87,7 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path, now: datetime = T) -
     monkeypatch.setenv("STORE__PATH", str(store_path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     monkeypatch.setattr(health_page, "_now", lambda: now)
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Data health")
     at = AppTest.from_file(_APP_PATH, default_timeout=60)
     at.run()
     return at
@@ -248,8 +250,12 @@ def test_empty_store_view(tmp_path: Path) -> None:
 # --- render (headless) -------------------------------------------------------
 
 
-def test_page_is_the_shells_data_health_entry() -> None:
-    assert app._PAGES["Data health"] is health_page.render
+def test_page_is_the_shells_data_health_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[object] = []
+    monkeypatch.setattr(health_page, "render", lambda conn: seen.append(conn))
+    sentinel, settings = object(), Settings(_env_file=None)
+    app._DETAIL_PAGES["Data health"](sentinel, settings)  # type: ignore[arg-type]
+    assert seen == [sentinel]
 
 
 def test_render_shows_every_metric(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> None:

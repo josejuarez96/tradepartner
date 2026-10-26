@@ -133,6 +133,19 @@ def test_edgar_gap_lookback_is_bounded(value: int) -> None:
         Settings(_env_file=None, ingest={"edgar_gap_lookback_sessions": value})
 
 
+def test_edgar_max_age_sessions_default_and_bounds() -> None:
+    assert _settings().ingest.edgar_max_age_sessions == 3
+    assert (
+        Settings(
+            _env_file=None, ingest={"edgar_max_age_sessions": 20}
+        ).ingest.edgar_max_age_sessions
+        == 20
+    )
+    for value in (0, 21, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ingest={"edgar_max_age_sessions": value})
+
+
 def test_fred_rate_defaults_and_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings()
     assert settings.fred_api_key is None
@@ -3253,3 +3266,18 @@ def test_a_negative_borrow_rate_is_refused(override: dict[str, object]) -> None:
 def test_risk_reconcile_dividend_search_bounds(key: str, value: int) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, risk={key: value})
+
+
+def test_ui_keys_default_and_validate() -> None:
+    """T273 (#2170): display-only keys for the Home page."""
+    ui = _settings().ui
+    assert (ui.next_run_time_et, ui.holdings_rows) == ("08:05", 5)
+    for bad in ("8:05", "24:00", "08:60", "0805", "", "08:05 ET"):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"next_run_time_et": bad})
+    for rows in (0, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"holdings_rows": rows})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, ui={"unknown": 1})
+    assert Settings(_env_file=None, ui={"next_run_time_et": "23:59"}).ui.next_run_time_et == "23:59"
