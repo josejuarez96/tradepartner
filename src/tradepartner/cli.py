@@ -1601,6 +1601,32 @@ def _run_lines(prefix: str, outcome: paper_run.RunOutcome, settings: Settings) -
         _echo_scrubbed(f"  {note}", settings)
 
 
+def replace_wait(s: Settings, seconds: int) -> Settings:
+    """`s` with `store.lock_retry_seconds` set to `seconds`."""
+    store = s.store.model_copy(update={"lock_retry_seconds": seconds})
+    return s.model_copy(update={"store": store})
+
+
+def _writer_settings(s: Settings) -> Settings:
+    """`s` with the longer `store.writer_lock_retry_seconds` as the lock wait: the
+    scheduled writers (`paper run`, `paper kill`, `ingest`) out-wait a long reader (#2178)."""
+    return replace_wait(s, s.store.writer_lock_retry_seconds)
+
+
+_HOLDER_RE = re.compile(r"held in (.+?)\s*\(PID (\d+)\)")
+
+
+def _lock_holder(exc: BaseException) -> str:
+    """Who holds the store, as far as the lock error says: DuckDB's process and PID,
+    else a plain "an unidentified process"."""
+    found = _HOLDER_RE.search(str(exc))
+    if found is not None:
+        return f"{Path(found.group(1)).name}, pid {found.group(2)}"
+    if "already open in this process" in str(exc):
+        return "another connection in this process"
+    return "an unidentified process"
+
+
 def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
     """`call()`, every refusal and failure turned into its scrubbed message and exit."""
     try:
@@ -2157,7 +2183,8 @@ def make_app(
                 through_date = date.fromisoformat(through)
             except ValueError:
                 raise _fail(f"--through must be YYYY-MM-DD, got {through!r}", USAGE_ERROR) from None
-        s = settings()
+        base = settings()  # the edges get the caller's own Settings; only the store wait differs
+        s = _writer_settings(base)
         if source == "openfigi" and not s.openfigi.enabled:
             raise _fail("--source openfigi needs openfigi.enabled=true", USAGE_ERROR)
         if actions_backfill:
@@ -2226,7 +2253,9 @@ def make_app(
             _print_result(result)
             raise typer.Exit(result.exit_code)
         if source == ASSETS_SOURCE:
-            result = ingest_assets(s, lambda: assets_source(s, clock), clock=clock, dry_run=dry_run)
+            result = ingest_assets(
+                s, lambda: assets_source(base, clock), clock=clock, dry_run=dry_run
+            )
             _print_result(result)
             raise typer.Exit(result.exit_code)
         if source == "openfigi":
@@ -2282,7 +2311,7 @@ def make_app(
                     restamp=restamp,
                     on_restamp=restamped.append,
                     restamp_window_ok=window_ok,
-                    assets=lambda: assets_source(s, clock),
+                    assets=lambda: assets_source(base, clock),
                 )
             except Exception:
                 if scheduled_shape:
@@ -4248,7 +4277,7 @@ def make_app(
         """The tracking run on the clock's session for the book, or with no `--book`
         for every book with an open window (spec req 7; the scheduler's job)."""
         chosen = _checked_book(book)
-        s = paper_settings()
+        s = _writer_settings(paper_settings())
         try:
             paper_schema_gate(s)
         except (Exception, typer.Exit):
@@ -4340,12 +4369,31 @@ def make_app(
         chosen = _checked_book(book)
         if every_book and chosen is not None:
             raise _fail("--all and --book cannot be combined", USAGE_ERROR)
-        s = paper_settings(reason)
+        s = _writer_settings(paper_settings(reason))
+
+        def kill_one(target: str) -> int:
+            """`window.kill`, a busy store made plain: nothing is engaged, say so (#2178)."""
+            try:
+                with open_for_write(replace_wait(s, 0)):
+                    pass  # a probe: is the store free right now?
+            except StoreLockedError as busy:
+                typer.echo(
+                    "paper kill: kill switch NOT engaged yet: store busy "
+                    f"(held by {_lock_holder(busy)}), waiting up to "
+                    f"{s.store.lock_retry_seconds} s",
+                    err=True,
+                )
+            try:
+                return window.kill(s, write_chunk(s), clock, reason, book_id=target)
+            except StoreLockedError as exc:
+                raise window.KillWriteFailed(
+                    "kill switch NOT engaged: store busy "
+                    f"(held by {_lock_holder(exc)}); retry, or stop the reader"
+                ) from exc
+
         if not every_book:
             bk = resolve_book(s, chosen)
-            event_id = _paper_call(
-                s, lambda: window.kill(s, write_chunk(s), clock, reason, book_id=bk)
-            )
+            event_id = _paper_call(s, lambda: kill_one(bk))
             _echo_scrubbed(f"paper kill: engaged (kill_switch event {event_id})", s)
             return
         books = _paper_call(s, lambda: paper_run.open_books(s))
@@ -4356,7 +4404,7 @@ def make_app(
         codes: list[int] = []
 
         def kill_book(target: str) -> Callable[[], int]:
-            return lambda: window.kill(s, write_chunk(s), clock, reason, book_id=target)
+            return lambda: kill_one(target)
 
         for each in books:
             try:

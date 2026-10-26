@@ -209,6 +209,14 @@ class StoreConfig(_ClosedConfig):
     `lock_retry_seconds` may be zero (a caller that wants "fail
     immediately, no retry" is a legitimate choice) but not negative.
 
+    `writer_lock_retry_seconds` (#2178) is the longer wait the scheduled writers
+    (`paper run`, `paper kill`, `ingest`) use in place of `lock_retry_seconds`, so a
+    reader that holds the store for a minute or two (a dashboard Data health render
+    is ~86 s) is out-waited. The sells have ~85 min of window, but the buys start
+    after `paper.sell_wait_seconds` (about 15 min before the window closes), so
+    the wrapper re-checks the submit window before every submit and sends nothing
+    once it has closed, however long a lock wait took.
+
     `memory_limit` and `threads` (#1418) cap DuckDB's memory and worker
     threads on every store connection (`store.db.configure_connection`).
     Both default to `None`, which sets nothing and keeps DuckDB's own
@@ -221,6 +229,7 @@ class StoreConfig(_ClosedConfig):
 
     path: str = "data/tradepartner.duckdb"
     lock_retry_seconds: int = Field(default=60, ge=0)
+    writer_lock_retry_seconds: int = Field(default=300, ge=0)
     lock_retry_initial_delay_seconds: float = Field(default=0.05, gt=0)
     lock_retry_max_delay_seconds: float = Field(default=1.0, gt=0)
     memory_limit: str | None = None
