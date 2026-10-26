@@ -70,8 +70,7 @@ from tradepartner.config import Cadence, Settings
 from tradepartner.execution.lock import resolve_book
 from tradepartner.execution.outcomes import (
     NOT_EXECUTED,
-    POSITION_RETURN,
-    REALISED_PNL,
+    filled_outcome_kind,
     outcome_horizon,
 )
 from tradepartner.execution.plan import stop_session as stop_session_of_request
@@ -97,8 +96,6 @@ _EXECUTED = "executed"
 _REQUESTED = "requested"
 _SCHEDULER = "scheduler"
 _FILLED = "filled"
-_BUY = "buy"
-_SELL = "sell"
 _REBALANCE = "rebalance"
 _CATCH_UP = "catch_up"
 _PAPER_MIN_REBALANCES = "paper.min_rebalances"
@@ -478,10 +475,8 @@ def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int, cadence: Cadenc
             incomplete.append(f"order {coid} ({order.symbol}) is not terminal")
             continue
         earned: list[str] = []
-        if filled.get(coid, 0.0) > 0 and order.side == _BUY:
-            earned.append(POSITION_RETURN)
-        if filled.get(coid, 0.0) > 0 and order.side == _SELL:
-            earned.append(REALISED_PNL)
+        if filled.get(coid, 0.0) > 0:
+            earned.append(filled_outcome_kind(order.side, order.position_side))
         if terminal[coid] != _FILLED:
             earned.append(NOT_EXECUTED)
         incomplete += [
