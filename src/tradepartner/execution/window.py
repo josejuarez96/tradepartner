@@ -225,7 +225,6 @@ from __future__ import annotations
 
 import json
 import math
-import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
@@ -275,7 +274,7 @@ from tradepartner.execution.reconcile_run import (
 )
 from tradepartner.store import registry
 from tradepartner.store.asof import live_actions_as_of
-from tradepartner.store.db import open_for_write
+from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
     CLOSING_STOP_STATES,
@@ -1519,18 +1518,10 @@ def kill(
     token grammar, and `KillWriteFailed` when the row cannot be written."""
     note = _note(reason, "paper kill")
     book = resolve_book(settings, book_id)
-    started = time.monotonic()
-    with connect() as conn:
+    with open_read_only(settings) as conn:
         _, window_id = _window_of(conn, book)
-    # One lock wait per book, not one per connection: `engage` gets what is left (#2178).
-    left = max(1, int(settings.store.lock_retry_seconds - (time.monotonic() - started)))
-    engage_settings = settings.model_copy(
-        update={"store": settings.store.model_copy(update={"lock_retry_seconds": left})}
-    )
     try:
-        engaged = switch.engage(
-            engage_settings, clock, window_id=window_id, source=_OWNER, reason=note
-        )
+        engaged = switch.engage(settings, clock, window_id=window_id, source=_OWNER, reason=note)
     except Exception as exc:  # a bad clock reading, say: still not engaged
         engaged = switch.WriteFailed(f"{type(exc).__name__}: {exc}")
     if isinstance(engaged, switch.WriteFailed):

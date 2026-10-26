@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -959,6 +960,36 @@ def test_kill_appends_an_owner_engagement_even_while_a_run_holds_the_lock(
         (event,) = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
     assert event.event_id == event_id
     assert (event.state, event.source, event.reason) == ("engaged", "owner", NOTE)
+    assert _engaged(journal_settings, window)
+
+
+def test_kill_gives_engage_the_full_wait_after_a_queued_writer(
+    journal_settings: Settings,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queued writer ahead of kill must not spend the engage write's budget."""
+    seen: list[int] = []
+    original = switch.engage
+
+    def engage(settings: Settings, *args: Any, **kwargs: Any) -> int | switch.WriteFailed:
+        seen.append(settings.store.lock_retry_seconds)
+        if settings.store.lock_retry_seconds < 4:
+            return switch.WriteFailed("StoreLockedError: queued writer still owns store")
+        return original(settings, *args, **kwargs)
+
+    monkeypatch.setattr(switch, "engage", engage)
+    limited = journal_settings.model_copy(
+        update={"store": journal_settings.store.model_copy(update={"lock_retry_seconds": 5})}
+    )
+
+    def queued_writer() -> Any:
+        time.sleep(4.1)  # the old lookup's write connection queues behind a writer
+        return open_for_write(limited)
+
+    kill(limited, queued_writer, fixed_clock, NOTE)
+    assert seen == [5]
     assert _engaged(journal_settings, window)
 
 

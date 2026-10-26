@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -25,6 +27,9 @@ from test_cli_paper import (  # noqa: F401  (fixtures)
 
 from tradepartner import cli
 from tradepartner.config import StoreConfig
+from tradepartner.execution import run as paper_run
+from tradepartner.execution import window
+from tradepartner.store.db import StoreLockedError
 
 
 def _engaged_rows() -> int:
@@ -32,6 +37,20 @@ def _engaged_rows() -> int:
         found = conn.execute("SELECT count(*) FROM kill_switch WHERE state = 'engaged'").fetchone()
     assert found is not None
     return int(found[0])
+
+
+def _busy_timer_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The first probe is free; another process owns the store while a timer probes."""
+    real = cli.open_for_write
+
+    @contextmanager
+    def probe(settings: object) -> Iterator[object]:
+        if threading.current_thread() is not threading.main_thread():
+            raise StoreLockedError("held in /tmp/other (PID 12345)")
+        with real(settings) as conn:  # type: ignore[arg-type]
+            yield conn
+
+    monkeypatch.setattr(cli, "open_for_write", probe)
 
 
 @contextmanager
@@ -98,3 +117,47 @@ def test_paper_kill_that_cannot_get_the_store_says_not_engaged(
     assert "kill switch NOT engaged: store busy (held by " in out.output, out.output
     assert "retry, or stop the reader" in out.output
     assert _engaged_rows() == before
+
+
+@pytest.mark.usefixtures("books")
+def test_paper_kill_all_reports_a_wait_in_open_books_once_per_book(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _Clock,  # noqa: F811
+    books: object,  # noqa: F811
+) -> None:
+    _busy_timer_probes(monkeypatch)
+    real_open_books = paper_run.open_books
+    real_kill = window.kill
+
+    def slow_open_books(*args: object) -> tuple[str, ...]:
+        time.sleep(0.2)
+        return real_open_books(*args)  # type: ignore[arg-type]
+
+    def slow_kill(*args: object, **kwargs: object) -> int:
+        time.sleep(0.2)
+        return real_kill(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(paper_run, "open_books", slow_open_books)
+    monkeypatch.setattr(window, "kill", slow_kill)
+    out = _paper(clock, books, "kill", "--all", "--reason", LONG_REASON)
+    assert out.exit_code == 0, out.output
+    assert out.output.count("kill switch NOT engaged yet: store busy") == 2
+
+
+@pytest.mark.usefixtures("started")
+def test_paper_kill_reports_wait_when_engage_write_waits_after_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _Clock,  # noqa: F811
+    factory: _Factory,  # noqa: F811
+) -> None:
+    _busy_timer_probes(monkeypatch)
+    real_kill = window.kill
+
+    def slow_kill(*args: object, **kwargs: object) -> int:
+        time.sleep(0.2)
+        return real_kill(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(window, "kill", slow_kill)
+    out = _paper(clock, factory, "kill", "--reason", LONG_REASON)
+    assert out.exit_code == 0, out.output
+    assert out.output.count("kill switch NOT engaged yet: store busy") == 1

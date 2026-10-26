@@ -365,6 +365,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
@@ -4371,18 +4372,45 @@ def make_app(
             raise _fail("--all and --book cannot be combined", USAGE_ERROR)
         s = _writer_settings(paper_settings(reason))
 
-        def kill_one(target: str) -> int:
+        def waiting_line(holder: str) -> None:
+            typer.echo(
+                "paper kill: kill switch NOT engaged yet: store busy "
+                f"(held by {holder}), waiting up to "
+                f"{s.store.lock_retry_seconds} s",
+                err=True,
+            )
+
+        def wait_timer(notice: Callable[[str], None]) -> threading.Timer:
+            """Report a wait that begins after the point-in-time lock probe."""
+
+            def probe() -> None:
+                try:
+                    with open_for_write(replace_wait(s, 0)):
+                        pass
+                except StoreLockedError as busy:
+                    holder = _lock_holder(busy)
+                    if holder != "another connection in this process":
+                        notice(holder)
+
+            timer = threading.Timer(s.store.lock_retry_initial_delay_seconds * 2, probe)
+            timer.start()
+            return timer
+
+        def kill_one(target: str, *, already_announced: bool = False) -> int:
             """`window.kill`, a busy store made plain: nothing is engaged, say so (#2178)."""
+            announced = [already_announced]
+
+            def announce(holder: str = "an unidentified process") -> None:
+                if not announced[0]:
+                    waiting_line(holder)
+                    announced[0] = True
+
             try:
                 with open_for_write(replace_wait(s, 0)):
                     pass  # a probe: is the store free right now?
             except StoreLockedError as busy:
-                typer.echo(
-                    "paper kill: kill switch NOT engaged yet: store busy "
-                    f"(held by {_lock_holder(busy)}), waiting up to "
-                    f"{s.store.lock_retry_seconds} s",
-                    err=True,
-                )
+                announce(_lock_holder(busy))
+            timer = wait_timer(announce) if not announced[0] else None
             try:
                 return window.kill(s, write_chunk(s), clock, reason, book_id=target)
             except StoreLockedError as exc:
@@ -4390,13 +4418,35 @@ def make_app(
                     "kill switch NOT engaged: store busy "
                     f"(held by {_lock_holder(exc)}); retry, or stop the reader"
                 ) from exc
+            except window.KillWriteFailed as exc:
+                if "StoreLockedError:" not in str(exc):
+                    raise
+                raise window.KillWriteFailed(
+                    "kill switch NOT engaged: store busy "
+                    f"(held by {_lock_holder(exc)}); retry, or stop the reader"
+                ) from exc
+            finally:
+                if timer is not None:
+                    timer.cancel()
+                    timer.join()
 
         if not every_book:
             bk = resolve_book(s, chosen)
             event_id = _paper_call(s, lambda: kill_one(bk))
             _echo_scrubbed(f"paper kill: engaged (kill_switch event {event_id})", s)
             return
-        books = _paper_call(s, lambda: paper_run.open_books(s))
+        listing_waited = [False]
+
+        def listing_notice(holder: str) -> None:
+            waiting_line(holder)
+            listing_waited[0] = True
+
+        listing_timer = wait_timer(listing_notice)
+        try:
+            books = _paper_call(s, lambda: paper_run.open_books(s))
+        finally:
+            listing_timer.cancel()
+            listing_timer.join()
         if not books:
             raise _fail(
                 "refused: no_window: no book has an open window", PAPER_REFUSAL_EXIT["no_window"]
@@ -4404,7 +4454,8 @@ def make_app(
         codes: list[int] = []
 
         def kill_book(target: str) -> Callable[[], int]:
-            return lambda: kill_one(target)
+            announced = listing_waited[0] and target == books[0]
+            return lambda: kill_one(target, already_announced=announced)
 
         for each in books:
             try:
