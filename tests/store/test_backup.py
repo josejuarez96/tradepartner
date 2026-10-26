@@ -187,14 +187,14 @@ def test_migration_copy_records_reason_and_code_version(
     store: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(backup.registry, "code_version", lambda: ("migration-head", True))
-    result = backup_store(Settings(), reason="pre_migration", now=NOW)
+    result = backup_store(Settings(), reason=backup.PRE_MIGRATION, now=NOW)
     manifest = json.loads(result.manifest_path.read_text())
     assert manifest["reason"] == "pre_migration"
     assert manifest["git_commit"] == "migration-head"
     assert manifest["code_dirty"] is True
     assert result.git_commit == "migration-head"
     with pytest.raises(BackupError, match="already exists"):
-        backup_store(Settings(), reason="pre_migration", now=NOW)
+        backup_store(Settings(), reason=backup.PRE_MIGRATION, now=NOW)
 
 
 def test_retention_removes_only_old_marked_copies_and_their_wals(
@@ -205,10 +205,12 @@ def test_retention_removes_only_old_marked_copies_and_their_wals(
         copy = Path(f"{store}.bak-20261020-{minute}")
         copy.write_bytes(b"copy")
         Path(f"{copy}.wal").write_bytes(b"wal")
-        Path(f"{copy}.manifest.json").write_text(json.dumps({"reason": reason}))
+        Path(f"{copy}.manifest.json").write_text(
+            json.dumps({"reason": reason, "store_file": store.name})
+        )
     partial = Path(f"{store}.bak-20261020-1400.partial")
     partial.write_bytes(b"unfinished")
-    backup.sweep_pre_migration_backups(settings)
+    backup.sweep_pre_migration_backups(settings, keep=Path(f"{store}.bak-20261020-1403"))
     assert not Path(f"{store}.bak-20261020-1402").exists()
     assert not Path(f"{store}.bak-20261020-1402.wal").exists()
     assert not Path(f"{store}.bak-20261020-1402.manifest.json").exists()
@@ -224,9 +226,12 @@ def test_owner_backup_survives_migration_sweep(store: Path) -> None:
     owner = backup_store(settings, now=NOW, git_commit="owner")
     for minute in (6, 7):
         backup_store(
-            settings, now=NOW.replace(minute=minute), git_commit="migration", reason="pre_migration"
+            settings,
+            now=NOW.replace(minute=minute),
+            git_commit="migration",
+            reason=backup.PRE_MIGRATION,
         )
-    backup.sweep_pre_migration_backups(settings)
+    backup.sweep_pre_migration_backups(settings, keep=Path(f"{store}.bak-20261020-1407"))
     assert owner.copy_path.is_file()
     assert owner.manifest_path.is_file()
 
@@ -239,7 +244,60 @@ def test_disk_check_counts_store_wal_and_margin_before_copy(
     needed = store.stat().st_size + 3 + 7
     monkeypatch.setattr(backup.shutil, "disk_usage", lambda _: SimpleNamespace(free=needed - 1))
     with pytest.raises(BackupError, match="free disk"):
-        backup_store(settings, now=NOW, git_commit="c", reason="pre_migration")
+        backup_store(settings, now=NOW, git_commit="c", reason=backup.PRE_MIGRATION)
     assert not list(store.parent.glob("*.bak-*"))
     monkeypatch.setattr(backup.shutil, "disk_usage", lambda _: SimpleNamespace(free=needed))
     backup.check_backup_disk_space(settings)
+
+
+def test_orphan_manifest_does_not_displace_a_real_copy(store: Path) -> None:
+    settings = Settings(store={"path": str(store), "pre_migration_backups_to_keep": 2})
+    copies = [
+        backup_store(settings, now=NOW.replace(minute=minute), reason=backup.PRE_MIGRATION)
+        for minute in (5, 6, 7)
+    ]
+    copies[1].copy_path.unlink()
+    backup.sweep_pre_migration_backups(settings, keep=copies[2].copy_path)
+    assert copies[0].copy_path.is_file()
+    assert copies[1].manifest_path.is_file()
+    assert copies[2].copy_path.is_file()
+
+
+def test_keep_survives_future_stamped_copy(store: Path) -> None:
+    settings = Settings(store={"path": str(store), "pre_migration_backups_to_keep": 1})
+    future = backup_store(settings, now=NOW.replace(year=2027), reason=backup.PRE_MIGRATION)
+    current = backup_store(settings, now=NOW, reason=backup.PRE_MIGRATION)
+    backup.sweep_pre_migration_backups(settings, keep=current.copy_path)
+    assert current.copy_path.is_file()
+    assert current.manifest_path.is_file()
+    assert not future.copy_path.exists()
+    assert not future.manifest_path.exists()
+
+
+def test_sweep_skips_partial_wrong_name_bad_json_wrong_store_and_symlink(
+    store: Path, tmp_path: Path
+) -> None:
+    settings = Settings(store={"path": str(store), "pre_migration_backups_to_keep": 1})
+    keep = backup_store(settings, now=NOW, reason=backup.PRE_MIGRATION)
+    record = {"reason": backup.PRE_MIGRATION, "store_file": store.name}
+    partial = Path(f"{store}.bak-20261020-1406.manifest.json.partial")
+    wrong_name = Path(f"{store}.bak-not-a-stamp.manifest.json")
+    bad_json = Path(f"{store}.bak-20261020-1407.manifest.json")
+    wrong_store = Path(f"{store}.bak-20261020-1408.manifest.json")
+    symlink_copy = Path(f"{store}.bak-20261020-1409")
+    symlink_manifest = Path(f"{symlink_copy}.manifest.json")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-copy"
+    outside.write_bytes(b"outside")
+    partial.write_text(json.dumps(record))
+    wrong_name.write_text(json.dumps(record))
+    bad_json.write_text("{bad")
+    Path(str(bad_json).removesuffix(".manifest.json")).write_bytes(b"bad-json-copy")
+    wrong_store.write_text(json.dumps({**record, "store_file": "other.duckdb"}))
+    Path(str(wrong_store).removesuffix(".manifest.json")).write_bytes(b"other-store-copy")
+    symlink_copy.symlink_to(outside)
+    symlink_manifest.write_text(json.dumps(record))
+    backup.sweep_pre_migration_backups(settings, keep=keep.copy_path)
+    for path in (partial, wrong_name, bad_json, wrong_store, symlink_copy, symlink_manifest):
+        assert path.exists()
+    assert outside.read_bytes() == b"outside"
+    outside.unlink()

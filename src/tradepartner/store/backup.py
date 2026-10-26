@@ -21,6 +21,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import duckdb
 
@@ -29,6 +30,7 @@ from tradepartner.store import registry
 from tradepartner.store.db import StoreLockedError, open_read_only
 
 STAMP_FORMAT = "%Y%m%d-%H%M"
+PRE_MIGRATION: Literal["pre_migration"] = "pre_migration"
 
 
 class BackupError(RuntimeError):
@@ -65,12 +67,17 @@ def _copy_checked(source: Path, temp: Path) -> None:
 def backup_store(
     settings: Settings,
     *,
-    reason: str | None = None,
+    reason: Literal["pre_migration"] | None = None,
     now: datetime | None = None,
     git_commit: str | None = None,
     code_dirty: bool | None = None,
 ) -> BackupResult:
-    """Copy the store (and its `.wal`) to `<store>.bak-<UTC stamp>` and verify it."""
+    """Copy and verify the store and WAL beside it.
+
+    Callers wanting the dirty flag from `registry.code_version()` pass neither
+    `git_commit` nor `code_dirty`. Supplying only `git_commit` records a null
+    dirty flag, as before.
+    """
     if now is None:
         now = datetime.now(UTC)
     if now.tzinfo is None:
@@ -92,7 +99,7 @@ def backup_store(
     for temp in temps:
         if temp.exists():
             raise BackupError(f"{temp} is left over from an earlier run; read it, then remove it")
-    if reason == "pre_migration":
+    if reason == PRE_MIGRATION:
         check_backup_disk_space(settings)
 
     try:
@@ -152,24 +159,31 @@ def check_backup_disk_space(settings: Settings) -> None:
         raise BackupError(f"not enough free disk for backup: need {needed} bytes, have {free}")
 
 
-def sweep_pre_migration_backups(settings: Settings) -> None:
-    """Keep the newest configured number of marked pre-migration copies."""
+def sweep_pre_migration_backups(settings: Settings, *, keep: Path) -> None:
+    """Keep `keep` and the newest other marked copies, up to the configured N."""
     store = Path(settings.store.path)
     pattern = re.compile(rf"{re.escape(store.name)}\.bak-\d{{8}}-\d{{4}}\.manifest\.json")
     marked: list[tuple[str, Path, Path]] = []
     for manifest in store.parent.glob(f"{store.name}.bak-*.manifest.json"):
-        if pattern.fullmatch(manifest.name) is None:
+        if pattern.fullmatch(manifest.name) is None or manifest.is_symlink():
             continue
         try:
             record = json.loads(manifest.read_text())
         except (OSError, ValueError):
             continue
-        if not isinstance(record, dict) or record.get("reason") != "pre_migration":
+        if (
+            not isinstance(record, dict)
+            or record.get("reason") != PRE_MIGRATION
+            or record.get("store_file") != store.name
+        ):
             continue
         copy = manifest.with_name(manifest.name.removesuffix(".manifest.json"))
+        wal = Path(f"{copy}.wal")
+        if copy == keep or copy.is_symlink() or not copy.is_file() or wal.is_symlink():
+            continue
         marked.append((copy.name, copy, manifest))
     marked.sort(reverse=True)
-    for _, copy, manifest in marked[settings.store.pre_migration_backups_to_keep :]:
+    for _, copy, manifest in marked[settings.store.pre_migration_backups_to_keep - 1 :]:
         copy.unlink(missing_ok=True)
         Path(f"{copy}.wal").unlink(missing_ok=True)
         manifest.unlink(missing_ok=True)
