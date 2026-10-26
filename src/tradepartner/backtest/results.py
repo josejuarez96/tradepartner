@@ -364,6 +364,7 @@ def metric_rows(
                 risk_free_period_returns=risk_free,
                 family_benchmark=None if third is None else (third, returns[third]),
                 long_short=_long_short_book(result) if series == STRATEGY_SERIES else None,
+                risk_free_from_store=params.metrics.risk_free_source == "store",
             )
             rows.extend(MetricRow(series, level, key, value, kind) for key, value in values.items())
         if level == base:
@@ -403,7 +404,8 @@ def _borrow_metric_rows(
     engine writes them. Reported only (spec amendment #1872, item 6): `write_results`
     reads V, N, DSR and the red flag from the `strategy` series alone, and no selection
     module reads these rows. The book has no 0 bp run of its own, so its gross is its net
-    (`cost_drag` 0) and its turnover is the strategy's, the same trades."""
+    (`cost_drag` is stored None, it has no gross run) and its turnover is the strategy's,
+    the same trades."""
     rows: list[MetricRow] = []
     for series in borrow_series(result):
         own = _period_returns(_series_equity(result, series), ends)
@@ -418,6 +420,7 @@ def _borrow_metric_rows(
             periods_per_year=ppy,
             risk_free_period_returns=risk_free,
         )
+        values["cost_drag"] = None
         rows.extend(MetricRow(series, level, key, value, kind) for key, value in values.items())
     return rows
 

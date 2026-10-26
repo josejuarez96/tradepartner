@@ -939,7 +939,9 @@ LS_BOOK = LongShortBook(
 )
 
 
-def _long_short_metrics(book: LongShortBook | None = LS_BOOK, *, rf: float = 0.0) -> dict:  # type: ignore[type-arg]
+def _long_short_metrics(
+    book: LongShortBook | None = LS_BOOK, *, rf: float = 0.0, store: bool = True
+) -> dict:  # type: ignore[type-arg]
     return series_metrics(
         "strategy",
         period_returns=NET,
@@ -951,6 +953,7 @@ def _long_short_metrics(book: LongShortBook | None = LS_BOOK, *, rf: float = 0.0
         periods_per_year=12,
         risk_free_period_returns=constant_period_returns(rf, 12, len(NET)),
         long_short=book,
+        risk_free_from_store=store,
     )
 
 
@@ -1013,3 +1016,8 @@ def test_long_short_keys_and_borrow_series_reach_no_selection_path() -> None:
         assert deflated_sharpe(
             moved, basis, n_trials=5, pair_sharpes=pairs, periods_per_year=12
         ) == deflated_sharpe(base, basis, n_trials=5, pair_sharpes=pairs, periods_per_year=12)
+
+
+def test_excess_cagr_rf_is_none_unless_the_risk_free_source_is_the_store() -> None:
+    assert _long_short_metrics(rf=0.02, store=False)["excess_cagr_rf"] is None
+    assert _long_short_metrics(rf=0.02, store=True)["excess_cagr_rf"] is not None

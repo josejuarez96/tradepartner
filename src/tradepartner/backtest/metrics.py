@@ -230,6 +230,7 @@ def series_metrics(
     risk_free_period_returns: Sequence[float],
     family_benchmark: tuple[str, Sequence[float]] | None = None,
     long_short: LongShortBook | None = None,
+    risk_free_from_store: bool = False,
 ) -> dict[str, float | None]:
     """Every req 8 key for one series at one cost level.
 
@@ -246,6 +247,10 @@ def series_metrics(
     every other key (the three exposure means and extremes as given, `borrow_paid_annual`
     = the fees over the mean of `daily_equity`, per year of the run's `n / periods_per_year`,
     and `excess_cagr_rf` = `cagr - risk_free_annual`), and `None` adds nothing.
+    `excess_cagr_rf` is measured over the store's T-bill series, so it is None unless
+    `risk_free_from_store` (with the constant source it would just equal `cagr`).
+    `borrow_paid_annual` divides the whole run's fees by `n / periods_per_year` years; the
+    run's tail after its last rebalance adds fees but no years, a small upward bias.
     `daily_equity` is the equity on every session, for `max_drawdown`. `turnover` is the
     one-sided turnover per rebalance; an empty sequence gives 0. `risk_free_period_returns` is
     one return per period (`riskfree.constant_period_returns` or `riskfree.period_risk_free`).
@@ -359,7 +364,9 @@ def series_metrics(
         out["net_exposure_min"] = long_short.net_min
         out["net_exposure_max"] = long_short.net_max
         out["borrow_paid_annual"] = long_short.borrow_paid / float(np.mean(equity)) / years
-        out["excess_cagr_rf"] = cagr - annualised(risk_free_period_returns, ppy)
+        out["excess_cagr_rf"] = (
+            cagr - annualised(risk_free_period_returns, ppy) if risk_free_from_store else None
+        )
     return out
 
 

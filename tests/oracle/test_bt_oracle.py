@@ -234,8 +234,9 @@ class _Fill(bt.Algo):  # type: ignore[misc]
             for sid in names:
                 delta = weights.get(sid, 0.0) * equity - held.get(sid, 0.0)
                 if sid in weights and delta > 0:
-                    # A signed book's buy is a long buy or a short cover; only a long buy is
-                    # capped by free cash (`bt` holds short proceeds in its capital).
+                    # A signed book's buy is a long buy or a short cover. The long-only
+                    # book caps it at `bt`'s cash; the signed book caps nothing, since
+                    # `bt` holds short proceeds in its capital.
                     target.allocate(delta if self._signed else min(delta, target.capital), sid)
         for sid in self._exits.get(now, ()):
             target.close(sid)

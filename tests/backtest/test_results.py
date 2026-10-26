@@ -1690,6 +1690,8 @@ def test_a_long_short_trial_writes_the_seven_keys_on_the_strategy_series_only(
         assert set(strategy) == set(METRIC_KEYS) | set(LONG_SHORT_KEYS), level
         summary = results[level].exposure_summary
         assert summary is not None
+        assert summary.borrow_paid > 0
+        assert strategy["excess_cagr_rf"] is None  # constant risk-free source
         assert strategy["gross_exposure_mean"] == summary.gross_mean
         assert strategy["net_exposure_min"] == summary.net_min
         assert strategy["net_exposure_max"] == summary.net_max
@@ -1723,6 +1725,7 @@ def test_borrow_series_have_equity_and_metric_rows_at_the_base_level_only(
         }
         assert levels == {BASE}, name
         assert set(_metrics(conn, handle.trial_id, name, BASE)) == set(METRIC_KEYS)
+        assert _metrics(conn, handle.trial_id, name, BASE)["cost_drag"] is None
         (n_equity,) = conn.execute(  # type: ignore[misc]
             "SELECT COUNT(*) FROM trial_equity WHERE trial_id = ? AND series = ?",
             [handle.trial_id, name],
