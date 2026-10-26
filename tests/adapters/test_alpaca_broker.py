@@ -1076,6 +1076,42 @@ def test_a_negative_fill_row_with_another_symbol_or_side_raises_system_fault(
         _ral_broker(changed).fills()
 
 
+def _short_rows(side: str, correction_side: str | None = None) -> list[dict[str, Any]]:
+    """The RAL rows as a short sale (`side`), the correction on `correction_side`."""
+    rows = copy.deepcopy(_RAL_ROWS)
+    for row in rows:
+        row["side"] = side
+    rows[2]["side"] = correction_side or side
+    return rows
+
+
+def test_a_sell_short_fill_parses_as_a_sell() -> None:
+    fills = _ral_broker(_short_rows("sell_short")[:1]).fills()
+
+    assert [(f.side, f.quantity, f.price) for f in fills] == [(Side.SELL, 7.0, 67.23)]
+
+
+def test_a_cover_fill_parses_as_a_buy() -> None:
+    assert _ral_broker(_short_rows("buy")[:1]).fills()[0].side is Side.BUY
+
+
+def test_a_sell_short_correction_folds_into_its_sell_short_fill() -> None:
+    fills = _ral_broker(_short_rows("sell_short")).fills()
+
+    assert [(f.side, f.quantity) for f in fills] == [(Side.SELL, 7.0), (Side.SELL, 0.35222371)]
+
+
+def test_a_correction_on_the_opposite_side_of_a_sell_short_fill_raises_system_fault() -> None:
+    with pytest.raises(SystemFaultError, match="side"):
+        _ral_broker(_short_rows("sell_short", "buy")).fills()
+
+
+@pytest.mark.parametrize("side", ["buy_to_cover", "short", ""])
+def test_an_unclassified_fill_side_raises_system_fault(side: str) -> None:
+    with pytest.raises(SystemFaultError, match="not classified"):
+        _ral_broker(_short_rows(side)[:1]).fills()
+
+
 # --- account, positions, assets --------------------------------------------------
 
 
