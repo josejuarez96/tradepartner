@@ -650,6 +650,7 @@ class RiskGatedBroker:
         #: pre-check and the window test first (reset by `_trade`).
         self._recheck: bool = False
         self._killed: bool = False
+        self._phase_incomplete: bool = False
 
     def __repr__(self) -> str:
         return f"RiskGatedBroker(broker={type(self._broker).__name__})"
@@ -791,6 +792,7 @@ class RiskGatedBroker:
         self._set_aside = set()
         self._recheck = False
         self._killed = False
+        self._phase_incomplete = False
         # The batch holds these rebalances: a halt in either phase marks them
         # `missed` (ADR 0010 point 2), whichever decisions that phase held.
         rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
@@ -982,14 +984,13 @@ class RiskGatedBroker:
             sorted(
                 {
                     *collected_written_off,
-                    # A mid-phase kill leaves the phase incomplete: deferred buys
-                    # stay open for the next run, never written off `unfunded`.
+                    # A mid-phase break leaves deferred buys open for the next run.
                     *self._write_offs(
                         run,
                         rows,
                         after,
                         scope.last,
-                        completed=not self._killed,
+                        completed=not self._phase_incomplete,
                         deferred=built.deferred,
                     ),
                 }
@@ -1491,6 +1492,7 @@ class RiskGatedBroker:
             # `skipped_kill_switch`, never `ok`.
             if self._engaged(run, window):
                 self._killed = True
+                self._phase_incomplete = True
                 self._close_unsent(run, [r for r, _ in pairs[index:]])
                 break
             # The window test comes last, right before `submit`: a store lock wait
@@ -1498,6 +1500,7 @@ class RiskGatedBroker:
             # have run the clock past the window, and nothing is sent outside it
             # (#2178).
             if not self._in_submit_window(run.session):
+                self._phase_incomplete = True
                 self._close_unsent(run, [r for r, _ in pairs[index:]])
                 break
             try:
