@@ -2183,7 +2183,8 @@ def make_app(
                 through_date = date.fromisoformat(through)
             except ValueError:
                 raise _fail(f"--through must be YYYY-MM-DD, got {through!r}", USAGE_ERROR) from None
-        s = _writer_settings(settings())
+        base = settings()  # the edges get the caller's own Settings; only the store wait differs
+        s = _writer_settings(base)
         if source == "openfigi" and not s.openfigi.enabled:
             raise _fail("--source openfigi needs openfigi.enabled=true", USAGE_ERROR)
         if actions_backfill:
@@ -2252,7 +2253,9 @@ def make_app(
             _print_result(result)
             raise typer.Exit(result.exit_code)
         if source == ASSETS_SOURCE:
-            result = ingest_assets(s, lambda: assets_source(s, clock), clock=clock, dry_run=dry_run)
+            result = ingest_assets(
+                s, lambda: assets_source(base, clock), clock=clock, dry_run=dry_run
+            )
             _print_result(result)
             raise typer.Exit(result.exit_code)
         if source == "openfigi":
@@ -2308,7 +2311,7 @@ def make_app(
                     restamp=restamp,
                     on_restamp=restamped.append,
                     restamp_window_ok=window_ok,
-                    assets=lambda: assets_source(s, clock),
+                    assets=lambda: assets_source(base, clock),
                 )
             except Exception:
                 if scheduled_shape:
