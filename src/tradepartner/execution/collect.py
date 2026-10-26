@@ -329,10 +329,16 @@ def collect(
     bounds = [t for t in (cursor, open_since) if t is not None]
     overlap = timedelta(seconds=settings.paper.fill_read_overlap_seconds)
     since = min(bounds) - overlap if bounds else None
+    # The broker filters fills on its own clock, so a bound taken only from our
+    # stamps hides fills when our clock runs ahead (#2186): also reach back to
+    # the broker's own `submitted_at` of the orders being collected.
+    readings = {o.client_order_id: broker.get_order(o.client_order_id) for o in to_read}
+    if readings:
+        broker_bound = min(r.submitted_at for r in readings.values()) - overlap
+        since = broker_bound if since is None else min(since, broker_bound)
     seen = broker.fills(since)
     now = _read_clock(clock)
     _check_skew(seen, now, frozen.max_broker_clock_skew_seconds)
-    readings = {o.client_order_id: broker.get_order(o.client_order_id) for o in to_read}
     _refuse_shapes(readings.values())
 
     with connect() as conn:
