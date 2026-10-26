@@ -209,6 +209,16 @@ def _waiting_card(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
                 st.caption("No command; follow the detail above.")
 
 
+def _overdue_delisting_card(conn: duckdb.DuckDBPyConnection) -> None:
+    """Every open book's delisting cash that never arrived, from stored rows only."""
+    try:
+        items = ops.overdue_delisting_cash(conn)
+    except SchemaVersionError:
+        return  # The outdated-journal panel below explains this store.
+    for item in items:
+        theme.status_badge(f"{item.book_id}: {item.line}", "warning")
+
+
 def _kpis(data: OpsData) -> None:
     assert data.switch_state is not None
     tiles = st.columns(4)
@@ -547,6 +557,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
     st.header("Operations")
     summaries = _book_summaries(conn, settings)
     _waiting_card(conn, settings)
+    _overdue_delisting_card(conn)
     if summaries:
         _summary_card(summaries)
     book = _selected_book(summaries, settings.paper.book_id)
