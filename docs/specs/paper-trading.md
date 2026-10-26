@@ -423,7 +423,7 @@ The paper vehicle is the registered H1 (long-only 12-1 momentum, top decile equa
       - Across two `breaks` sessions, the base cash excludes them and the buy cash does not spend them.
     - **True-up.**
       - `paper true-up` refuses and writes nothing, exiting non-zero, in each of these cases: no `--reason`; a closed break; the broker moved; an open order on the name; another account.
-      - With them in order, it writes one adjustment and one event with a single `known_at`, and the next reconciliation is `ok`. `--reverse` reopens the break.
+      - With them in order, it writes its adjustments (one for the quantity part, one per cash activity) and one event, all with a single `known_at`, and the next reconciliation is `ok`. `--reverse` reopens the break.
       - A split row stored after a true-up, with an earlier `ex_date`, does not change the trued-up quantity.
       - An `unknown_symbol` trued up stays closed while its key is unchanged, and opens a new break when the broker quantity changes.
     - **Auto-explanation.** A merger row stored the session after a break closes it `auto_explained`, with the merger's usual rows.
