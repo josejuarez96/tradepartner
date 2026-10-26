@@ -141,7 +141,8 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
+from functools import cache
 from itertools import combinations
 
 from tradepartner.adapters.broker import (
@@ -897,13 +898,11 @@ def compare(
     # A short's due is negative (-quantity x amount; item 10) and its cash band is
     # [due, 0]; a long's is [0, due]. A negative due on any other name, or a
     # positive one on a short, is the caller's fault.
-    negative = sorted(
-        name for name, amount in dividends.items() if amount < 0 and name not in shorts
-    )
+    negative = sorted({name for name, amount in dividend_dues if amount < 0 and name not in shorts})
     if negative:
         raise ValueError(f"dividend due is negative for {negative}")
     positive_short = sorted(
-        name for name, amount in dividends.items() if amount > 0 and name in shorts
+        {name for name, amount in dividend_dues if amount > 0 and name in shorts}
     )
     if positive_short:
         raise ValueError(f"dividend due is positive for the short {positive_short}")
@@ -1011,9 +1010,15 @@ def compare(
         # None paid was tested first. On the plain path, try each open due and
         # every subset up to eight; above that cap use only singles and today's
         # all/longs/shorts readings. Two distinct paid subsets fitting the cash
-        # bound are ambiguous and must fail closed.
+        # bound are ambiguous and must fail closed. Dues inside the cash bound
+        # are absorbed by tolerance and are neither searched nor journaled.
+        search_dues = [
+            (name, amount)
+            for name, amount in dividend_dues
+            if abs(Decimal(str(amount))) > cash_bound
+        ]
         matches: list[tuple[int, ...]] = []
-        count = len(dividend_dues)
+        count = len(search_dues)
         candidates: Iterable[tuple[int, ...]]
         if count <= 8:
             candidates = (
@@ -1024,7 +1029,7 @@ def compare(
         else:
             fallback = [tuple(range(count))]
             fallback += [
-                tuple(i for i, (name, _) in enumerate(dividend_dues) if (name in shorts) == short)
+                tuple(i for i, (name, _) in enumerate(search_dues) if (name in shorts) == short)
                 for short in (False, True)
             ]
             candidates = iter(
@@ -1033,14 +1038,17 @@ def compare(
                 )
             )
         for indices in candidates:
-            amount = math.fsum(dividend_dues[i][1] for i in indices)
+            amount = math.fsum(search_dues[i][1] for i in indices)
             if abs(difference_decimal - Decimal(str(amount))) <= cash_bound:
                 matches.append(indices)
                 if len(matches) > 1:
                     break
-        if len(matches) == 1:
+        if len(matches) == 1 and (
+            count <= 8
+            or _fitting_dividend_subset_count(search_dues, difference_decimal, cash_bound) == 1
+        ):
             cash_ok = True
-            explained += _dividend_adjustments([dividend_dues[i] for i in matches[0]])
+            explained += _dividend_adjustments([search_dues[i] for i in matches[0]])
     for name in sorted(merger_removed):
         expected.pop(name)
     if not cash_ok:
@@ -1535,6 +1543,42 @@ def _order_mismatches(
                 )
             )
     return found
+
+
+def _fitting_dividend_subset_count(
+    dividends: Sequence[tuple[str, float]], difference: Decimal, bound: Decimal
+) -> int:
+    """Count all fitting non-empty cent subsets, stopping at two for ambiguity.
+
+    The expanded bounds cover any loss from rounding sub-cent dues to integer
+    cents. They can conservatively refuse a close fit, never certify an
+    ambiguous fit as unique.
+    """
+    raw_cents = [Decimal(str(amount)) * 100 for _, amount in dividends]
+    cents = [int(value.to_integral_value(rounding=ROUND_HALF_EVEN)) for value in raw_cents]
+    rounding = sum(
+        (abs(value - rounded) for value, rounded in zip(raw_cents, cents, strict=True)), Decimal(0)
+    )
+    low = int(((difference - bound) * 100 - rounding).to_integral_value(rounding=ROUND_CEILING))
+    high = int(((difference + bound) * 100 + rounding).to_integral_value(rounding=ROUND_FLOOR))
+    minimum = [0] * (len(cents) + 1)
+    maximum = [0] * (len(cents) + 1)
+    for index in range(len(cents) - 1, -1, -1):
+        minimum[index] = minimum[index + 1] + min(0, cents[index])
+        maximum[index] = maximum[index + 1] + max(0, cents[index])
+
+    @cache
+    def count(index: int, subtotal: int, used: bool) -> int:
+        if subtotal + minimum[index] > high or subtotal + maximum[index] < low:
+            return 0
+        if index == len(cents):
+            return int(used and low <= subtotal <= high)
+        without = count(index + 1, subtotal, used)
+        if without == 2:
+            return 2
+        return min(2, without + count(index + 1, subtotal + cents[index], True))
+
+    return count(0, 0, False)
 
 
 def _dividend_adjustments(dividends: Sequence[tuple[str, float]]) -> list[ProposedAdjustment]:

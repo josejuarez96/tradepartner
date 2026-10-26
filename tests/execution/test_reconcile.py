@@ -621,13 +621,28 @@ def test_two_paid_dues_on_one_name_journal_two_rows() -> None:
     assert [a.cash for a in result.adjustments] == [4.5, 7.0]
 
 
-def test_nine_open_dues_try_singles_but_not_all_combinations() -> None:
+def test_nine_open_dues_accept_a_unique_single_due() -> None:
+    dues = tuple(float(2**i) for i in range(9))
+    explanations = _explanations(dividends={"SEC_A": 511.0}, dividend_dues={"SEC_A": dues})
+    single = _run(
+        _ledger(1_000.0, SEC_A=10.0), _positions(AAA=10.0), 1_256.0, explanations=explanations
+    )
+    assert single.status == "ok" and [a.cash for a in single.adjustments] == [256.0]
+
+
+def test_nine_open_dues_fail_when_an_untried_subset_also_fits() -> None:
     dues = tuple(float(i) for i in range(1, 10))
     explanations = _explanations(dividends={"SEC_A": 45.0}, dividend_dues={"SEC_A": dues})
-    single = _run(
+    result = _run(
         _ledger(1_000.0, SEC_A=10.0), _positions(AAA=10.0), 1_009.0, explanations=explanations
     )
-    assert single.status == "ok" and [a.cash for a in single.adjustments] == [9.0]
+    assert _kinds(result) == ["cash"]
+    assert result.adjustments == ()
+
+
+def test_nine_open_dues_do_not_try_an_unlisted_combination() -> None:
+    dues = tuple(float(i) for i in range(1, 10))
+    explanations = _explanations(dividends={"SEC_A": 45.0}, dividend_dues={"SEC_A": dues})
     combination_only = _run(
         _ledger(1_000.0, SEC_A=10.0),
         _positions(AAA=10.0),
@@ -635,6 +650,44 @@ def test_nine_open_dues_try_singles_but_not_all_combinations() -> None:
         explanations=explanations,
     )
     assert _kinds(combination_only) == ["cash"]
+
+
+@pytest.mark.parametrize("dust", [0.004, 0.01])
+def test_dust_due_does_not_make_a_real_credit_ambiguous_or_get_journaled(dust: float) -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_005.0,
+        explanations=_explanations(
+            dividends={"SEC_A": 5.0 + dust}, dividend_dues={"SEC_A": (5.0, dust)}
+        ),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [5.0]
+
+
+def test_a_positive_name_cannot_match_a_negative_individual_due() -> None:
+    with pytest.raises(ValueError, match="negative"):
+        _run(
+            _ledger(1_000.0, SEC_A=10.0),
+            _positions(AAA=10.0),
+            1_006.0,
+            explanations=_explanations(
+                dividends={"SEC_A": 5.0}, dividend_dues={"SEC_A": (6.0, -1.0)}
+            ),
+        )
+
+
+def test_a_short_cannot_match_a_positive_individual_due() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        _run(
+            Ledger(positions={}, cash=1_000.0, through=S, short_holdings={"SEC_A": 10.0}),
+            _positions(AAA=-10.0),
+            995.0,
+            explanations=_explanations(
+                dividends={"SEC_A": -5.0}, dividend_dues={"SEC_A": (-6.0, 1.0)}
+            ),
+        )
 
 
 def test_eight_open_dues_try_a_partial_combination() -> None:
@@ -2028,18 +2081,29 @@ def test_exactly_one_cent_at_six_figures_passes_in_decimal() -> None:
 
 
 def test_a_dividend_beside_ten_fills_of_rounding_passes_at_the_scaled_bound() -> None:
-    """The bound in the dividend comparison (#1583, Q7): a 0.09 cash gap whose
-    0.05 is a credited dividend leaves 0.04 of per-fill rounding, inside
+    """The bound in the dividend comparison (#1583, Q7): a 0.11 cash gap whose
+    0.07 is a credited dividend leaves 0.04 of per-fill rounding, inside
     0.01 x (1 + 10/2) = 0.06; the #1290 bare 0.01 would have mismatched it."""
+    result = _run(
+        _ledger(1_000.0, fills_since_base=10, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.11,
+        explanations=_explanations(dividends={"SEC_A": 0.07}),
+    )
+
+    assert result.status == "ok"
+    assert [a.kind for a in result.adjustments] == ["dividend_cash"]
+
+
+def test_a_due_inside_the_scaled_bound_is_not_booked_for_a_larger_cash_gap() -> None:
     result = _run(
         _ledger(1_000.0, fills_since_base=10, SEC_A=10.0),
         _positions(AAA=10.0),
         1_000.09,
         explanations=_explanations(dividends={"SEC_A": 0.05}),
     )
-
-    assert result.status == "ok"
-    assert [a.kind for a in result.adjustments] == ["dividend_cash"]
+    assert _kinds(result) == ["cash"]
+    assert result.adjustments == ()
 
 
 def test_an_ended_listing_beside_ten_fills_of_rounding_passes_at_the_scaled_bound() -> None:

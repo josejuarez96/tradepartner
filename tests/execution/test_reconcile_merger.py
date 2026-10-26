@@ -986,6 +986,7 @@ def _compare(
     mergers: dict[str, OpenMerger],
     activities: tuple[CashActivity, ...] = (),
     dividends: dict[str, float] | None = None,
+    dividend_dues: dict[str, tuple[float, ...]] | None = None,
     lagging: tuple[JournalOpenOrder, ...] = (),
     reference_prices: dict[str, float] | None = None,
 ) -> Reconciliation:
@@ -1005,6 +1006,7 @@ def _compare(
             mergers=mergers,
             activities=activities,
             dividends=dividends or {},
+            dividend_dues=dividend_dues or {},
             activity_seen_before=date(2026, 9, 29),
         ),
         window,
@@ -1079,6 +1081,22 @@ def test_a_dividend_credited_beside_the_due_is_journaled_as_a_dividend() -> None
     assert result.status == OK
     kinds = sorted((a.kind, a.cash) for a in result.adjustments)
     assert kinds == [("corporate_action_cash", DUE), ("dividend_cash", 5.0)]
+
+
+def test_open_merger_does_not_match_only_part_of_a_names_dividend_dues() -> None:
+    ledger = Ledger(positions={SPY: 1.0}, cash=LEDGER_CASH, through=S)
+    removed = {MTUM: _merger_open(removed_quantity=HELD, journaled_cash=DUE)}
+    result = _compare(
+        ledger,
+        {"SPY": 1.0},
+        LEDGER_CASH + 4.5,
+        removed,
+        dividends={SPY: 11.5},
+        dividend_dues={SPY: (4.5, 7.0)},
+    )
+    assert result.status == "mismatch"
+    assert [m.kind for m in result.mismatches] == ["cash"]
+    assert not any(row.kind == "dividend_cash" for row in result.adjustments)
 
 
 def test_an_acquiree_the_broker_still_holds_takes_nothing() -> None:
