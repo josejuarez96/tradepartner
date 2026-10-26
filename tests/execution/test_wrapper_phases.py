@@ -1636,7 +1636,8 @@ def test_the_reserve_pre_check_runs_after_the_switch_read_and_before_any_sell(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#692: on a sell-and-buy batch the order is switch read, then the
-    reserve pre-check, then the sells phase's own switch read and submits."""
+    reserve pre-check, then the sells phase's own switch read and, since #2182,
+    one more switch read before each submit."""
     env.new_fake(cash=10_000.0)
     _hold(env, A, 10.0)
     trim = _decision(env, A, "sell", notional=300.0)
@@ -1657,7 +1658,7 @@ def test_the_reserve_pre_check_runs_after_the_switch_read_and_before_any_sell(
     monkeypatch.setattr(wrapper, "open_buy_reserve", spy_reserve)
     env.fake.on_submit = lambda _request: seen.append("submit")
     _execute(gate, env, [trim, buy])
-    assert seen[:4] == ["switch", "reserve", "switch", "submit"]
+    assert seen[:5] == ["switch", "reserve", "switch", "switch", "submit"]
 
 
 def test_a_sells_only_batch_never_reads_the_reserve(

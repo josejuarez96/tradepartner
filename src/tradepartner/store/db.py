@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import time
 import weakref
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -260,7 +260,10 @@ def _same_process_locked_error(settings: Settings, *, mode: str) -> StoreLockedE
 
 @contextmanager
 def open_read_only(
-    settings: Settings, *, retry: bool = False
+    settings: Settings,
+    *,
+    retry: bool = False,
+    on_wait: Callable[[str], None] | None = None,
 ) -> Iterator[duckdb.DuckDBPyConnection]:
     """A single short-lived, read-only connection to the store.
 
@@ -272,7 +275,9 @@ def open_read_only(
     `retry=True` (the paper run, #1757) retries a genuine cross-process lock
     conflict for up to `store.lock_retry_seconds` with the write path's
     backoff, then raises `StoreLockedError`; a same-process mode conflict is
-    never retried.
+    never retried. `on_wait`, when given, is called once, just before the
+    first retry, with DuckDB's lock-conflict message (it names the holder's
+    process and PID), so a caller can say it is waiting.
     """
     deadline = time.monotonic() + settings.store.lock_retry_seconds
     delay = settings.store.lock_retry_initial_delay_seconds
@@ -292,6 +297,9 @@ def open_read_only(
                     "the file is locked for writing by another process"
                     + (f" within {settings.store.lock_retry_seconds}s" if retry else "")
                 ) from exc
+            if on_wait is not None:
+                on_wait(str(exc))
+                on_wait = None
             time.sleep(min(delay, remaining))
             delay = min(delay * 2, settings.store.lock_retry_max_delay_seconds)
     try:
@@ -302,7 +310,9 @@ def open_read_only(
 
 
 @contextmanager
-def open_for_write(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+def open_for_write(
+    settings: Settings, *, on_wait: Callable[[str], None] | None = None
+) -> Iterator[duckdb.DuckDBPyConnection]:
     """A write connection to the store, scoped to one committed chunk.
 
     Creates the store file's parent directory if it does not exist, then
@@ -313,6 +323,8 @@ def open_for_write(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
     raises `StoreLockedError`. On normal exit the transaction commits; on
     any exception it rolls back; the connection is always closed
     afterwards so the lock is released between chunks (spec req 1, req 9).
+    `on_wait`, when given, is called once, just before the first retry, with
+    DuckDB's lock-conflict message (it names the holder's process and PID).
     """
     store_path = Path(settings.store.path)
     if store_path.parent != Path() and not store_path.parent.exists():
@@ -337,6 +349,9 @@ def open_for_write(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
                     f"could not acquire write lock on {settings.store.path!r} "
                     f"within {settings.store.lock_retry_seconds}s: {exc}"
                 ) from exc
+            if on_wait is not None:
+                on_wait(str(exc))
+                on_wait = None
             time.sleep(min(delay, remaining))
             delay = min(delay * 2, max_delay)
 

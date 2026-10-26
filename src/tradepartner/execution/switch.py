@@ -246,11 +246,12 @@ def engage(
     reason: str | None = None,
     run_id: int | None = None,
     override_id: int | None = None,
+    on_wait: Callable[[str], None] | None = None,
 ) -> int | WriteFailed:
     """Append one `engaged` row and return its `event_id`, or `WriteFailed` when
     the store stays locked past `store.lock_retry_seconds` or cannot be written.
     Raises `ValueError`, before any write, for a source outside `SOURCES` or a
-    `fault` without its `fault_type`."""
+    `fault` without its `fault_type`. `on_wait` is `open_for_write`'s."""
     if source not in SOURCES:
         raise ValueError(f"source must be one of {SOURCES}, got {source!r}")
     if source == _FAULT and not fault_type:
@@ -269,7 +270,7 @@ def engage(
         ingested_at=now,
     )
     try:
-        with open_for_write(settings) as conn:
+        with open_for_write(settings, on_wait=on_wait) as conn:
             return _append(conn, row)
     except _WRITE_ERRORS as exc:
         return WriteFailed(f"{type(exc).__name__}: {exc}")
