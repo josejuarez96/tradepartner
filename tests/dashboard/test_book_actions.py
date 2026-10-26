@@ -198,8 +198,7 @@ def test_the_call_is_the_desk_command_in_list_form_on_the_same_store(
     [call] = fake.calls
     assert call["argv"] == [
         sys.executable,
-        "-m",
-        "tradepartner.cli",
+        str(Path(sys.executable).parent / "tradepartner"),
         "paper",
         "kill",
         "--book=main",
@@ -209,6 +208,16 @@ def test_the_call_is_the_desk_command_in_list_form_on_the_same_store(
     assert "TRADEPARTNER_ENV_FILE" not in call["env"]
     assert call["cwd"] == book_actions.PROJECT_ROOT
     assert fake.timeouts == [330]
+
+
+def test_no_console_script_beside_the_interpreter_runs_nothing(
+    monkeypatch: pytest.MonkeyPatch, live: Settings, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(book_actions, "_entry_point", lambda: tmp_path / "missing")
+    fake = _fake(monkeypatch, _Fake(0))
+    with pytest.raises(KillRefused, match="not installed"):
+        book_actions.kill(live, "main", _REASON)
+    assert fake.calls == []
 
 
 def test_start_uses_no_shell() -> None:
