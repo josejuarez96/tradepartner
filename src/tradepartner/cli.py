@@ -4455,7 +4455,9 @@ def make_app(
         s = settings()
         if not Path(s.store.path).is_file():
             raise _fail(
-                "refused: no_window: no paper window is open", PAPER_REFUSAL_EXIT["no_window"]
+                f"refused: no_window: no store at {s.store.path}, so no paper window is open; "
+                "kill switch NOT engaged (check the working directory or STORE__PATH)",
+                PAPER_REFUSAL_EXIT["no_window"],
             )
         writer_s = _writer_settings(s)
 

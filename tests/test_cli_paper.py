@@ -1415,6 +1415,8 @@ def test_paper_kill_all_with_missing_store_refuses_without_writing(
     assert single.exit_code == NO_WINDOW, single.output
     assert all_books.exit_code == single.exit_code
     assert all_books.output == single.output
+    assert str(missing_dir / "paper.duckdb") in single.output
+    assert "kill switch NOT engaged" in single.output
     assert not missing_dir.exists()
     assert factory.books == []
 
