@@ -74,11 +74,12 @@ difference an allowance absorbs is listed under `allowed`.
   `symbol_changes` key. No identity rule is invented, so a change not known at
   close(S-1), a quantity difference under the new symbol, or two candidate new
   symbols stay a mismatch.
-- A credited dividend (`explanations.dividends`: cash due per name) explains a
-  cash difference equal to the total due: one `dividend_cash` adjustment per
-  name. It is not journaled when the cash does not show it. Beside an ended
-  listing the proceeds take the cash first, and the dividends are journaled
-  beside them only when the cash exceeds the proceeds' cap (#400). A
+- A credited dividend (`explanations.dividend_dues`: open dues oldest first;
+  `dividends`: their per-name sum) explains the cash difference on the plain
+  path by a unique combination of open dues, with one `dividend_cash` adjustment
+  per paid due. None paid is preferred when the cash is already inside its
+  bound. Beside a merger or ended listing, the per-name sums retain their
+  none-or-all reading; ended-listing proceeds take the cash first (#400). A
   negative amount due raises `ValueError` unless the name is a short in
   `Ledger.short_holdings`, where the due is negative (-quantity x amount) and
   the cash band is [due, 0]: no debit passes and journals nothing, the whole
@@ -115,8 +116,8 @@ difference an allowance absorbs is listed under `allowed`.
   `unexplained_dividend_group` mismatch whatever the cash shows: the caller
   never sums such a group, and neither one payment nor two is assumed.
 
-The caller passes only spin-offs and dividends not yet journaled (ex or pay date
-after the window's last `ok` reconciliation). While any order is lagging or
+The caller passes only open spin-offs and dividend dues in the credit window,
+net of journaled credits. While any order is lagging or
 pending, no explanation is journaled: an ended or spun-off name is allowed and
 listed under `deferred`, its cash allowed up to the same bound, a dividend's
 credit allowed up to the amount due (#399), and the next
@@ -137,10 +138,11 @@ from __future__ import annotations
 import json
 import math
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
+from itertools import combinations
 
 from tradepartner.adapters.broker import (
     TERMINAL_STATUSES,
@@ -290,8 +292,8 @@ class Explanations:
     `symbols`: `security_id` to broker symbol, for every name the ledger or the
     broker may hold. `ended`: names whose listing ended by S. `spinoffs`: child
     `security_id` to (parent `security_id`, shares per parent share),
-    `ex_date <= S`, not yet journaled. `dividends`: cash due per name for the
-    dividends paid by S, not yet journaled. `reference_prices`: close(S-1) per
+    `ex_date <= S`, not yet journaled. `dividends`: open cash due per name in
+    the credit window, net of journaled credits. `reference_prices`: close(S-1) per
     `security_id`. `activities`: the broker's non-trade cash activities this
     reconciliation read (the caller reads them after `account()`; empty in the
     read-only `explanations_as_of` path, #1583 T183). `seen_activity_ids` and
@@ -302,6 +304,9 @@ class Explanations:
     ended: frozenset[str] = frozenset()
     spinoffs: Mapping[str, tuple[str, float]] = field(default_factory=dict)
     dividends: Mapping[str, float] = field(default_factory=dict)
+    #: Open dividend amounts per held name, oldest ex-date first. A name absent
+    #: here is one due equal to its `dividends` total (legacy callers).
+    dividend_dues: Mapping[str, tuple[float, ...]] = field(default_factory=dict)
     #: The ticker changes the symbol map applied this reconciliation (#1761):
     #: `security_id` to `(old symbol, new symbol)`, from stored `symbol_changes`
     #: rows known at close(S-1). `compare` records them on the row's
@@ -881,6 +886,14 @@ def compare(
         name: _finite(amount, f"dividend due on {name}")
         for name, amount in sorted(explanations.dividends.items())
     }
+    dividend_dues: list[tuple[str, float]] = []
+    for name, total in dividends.items():
+        amounts = explanations.dividend_dues.get(name, (total,))
+        finite = tuple(_finite(amount, f"dividend due on {name}") for amount in amounts)
+        rounding = math.fsum(math.ulp(amount) for amount in (*finite, total))
+        if not math.isclose(math.fsum(finite), total, rel_tol=0.0, abs_tol=rounding):
+            raise ValueError(f"dividend dues on {name} do not sum to its total {total}")
+        dividend_dues.extend((name, amount) for amount in finite if amount != 0)
     # A short's due is negative (-quantity x amount; item 10) and its cash band is
     # [due, 0]; a long's is [0, due]. A negative due on any other name, or a
     # positive one on a short, is the caller's fault.
@@ -990,25 +1003,44 @@ def compare(
                     proceeds_f = float(min(max(proceeds, Decimal(0)), cap_decimal))
                     explained += _ended_adjustments(removed, expected, value, proceeds_f)
                     if with_dividends:
-                        explained += _dividend_adjustments(dividends)
+                        explained += _dividend_adjustments(list(dividends.items()))
                     break
         for name in removed:
             expected.pop(name)
     elif not cash_ok and dividends and not deferring:
-        # Everything paid, then the longs' credits alone, then the shorts' debits
-        # alone; the first that the difference matches is journaled.
-        subsets = (
-            dividends,
-            {n: a for n, a in dividends.items() if n not in shorts},
-            {n: a for n, a in dividends.items() if n in shorts},
-        )
-        for subset in subsets:
-            if subset and abs(difference_decimal - Decimal(str(math.fsum(subset.values())))) <= (
-                cash_bound
-            ):
-                cash_ok = True
-                explained += _dividend_adjustments(subset)
-                break
+        # None paid was tested first. On the plain path, try each open due and
+        # every subset up to eight; above that cap use only singles and today's
+        # all/longs/shorts readings. Two distinct paid subsets fitting the cash
+        # bound are ambiguous and must fail closed.
+        matches: list[tuple[int, ...]] = []
+        count = len(dividend_dues)
+        candidates: Iterable[tuple[int, ...]]
+        if count <= 8:
+            candidates = (
+                indices
+                for size in range(1, count + 1)
+                for indices in combinations(range(count), size)
+            )
+        else:
+            fallback = [tuple(range(count))]
+            fallback += [
+                tuple(i for i, (name, _) in enumerate(dividend_dues) if (name in shorts) == short)
+                for short in (False, True)
+            ]
+            candidates = iter(
+                dict.fromkeys(
+                    [(i,) for i in range(count)] + [indices for indices in fallback if indices]
+                )
+            )
+        for indices in candidates:
+            amount = math.fsum(dividend_dues[i][1] for i in indices)
+            if abs(difference_decimal - Decimal(str(amount))) <= cash_bound:
+                matches.append(indices)
+                if len(matches) > 1:
+                    break
+        if len(matches) == 1:
+            cash_ok = True
+            explained += _dividend_adjustments([dividend_dues[i] for i in matches[0]])
     for name in sorted(merger_removed):
         expected.pop(name)
     if not cash_ok:
@@ -1259,7 +1291,7 @@ def _merger_cash(
                 proceeds = float(min(max(left, Decimal(0)), band_cap))
                 rows += _ended_adjustments(removed, expected, value, proceeds)
             if chosen:
-                rows += _dividend_adjustments(chosen)
+                rows += _dividend_adjustments(list(chosen.items()))
             return rows
         return None
 
@@ -1505,11 +1537,11 @@ def _order_mismatches(
     return found
 
 
-def _dividend_adjustments(dividends: Mapping[str, float]) -> list[ProposedAdjustment]:
-    """One `dividend_cash` row per name with the dividend credited."""
+def _dividend_adjustments(dividends: Sequence[tuple[str, float]]) -> list[ProposedAdjustment]:
+    """One `dividend_cash` row per paid due, including two on one name."""
     return [
         ProposedAdjustment("dividend_cash", name, None, amount, "credited dividend")
-        for name, amount in dividends.items()
+        for name, amount in dividends
     ]
 
 

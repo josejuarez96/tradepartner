@@ -1429,6 +1429,7 @@ def test_two_dividends_on_one_name_remain_due_after_the_first_is_paid(
             quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
         )
     assert found.dividends == pytest.approx({SPY: 12.0})
+    assert found.dividend_dues == {SPY: (5.0, 7.0)}
     _append(
         journal_settings,
         AdjustmentRow(
@@ -1451,6 +1452,28 @@ def test_two_dividends_on_one_name_remain_due_after_the_first_is_paid(
             quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
         )
     assert found.dividends == pytest.approx({SPY: 7.0})
+    assert found.dividend_dues == {SPY: (7.0,)}
+
+
+def test_older_of_two_same_name_dividends_books_one_cash_row(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    second = next_session(S)
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=S, source_action_id="first")
+    _dividend(journal_settings, SPY, 0.7, CUT, ex_date=second, source_action_id="second")
+    fixed_clock.now = datetime.combine(second, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    fake.activities = [CashActivity("older", "DIV", second, "executed", 5.0, "SPY")]
+    fake.extra_cash = 5.0
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, session=second).status == OK
+    assert [(a.kind, a.cash) for a in _adjustments(journal_settings, open_window)] == [
+        ("dividend_cash", 5.0)
+    ]
 
 
 def test_expired_dividend_does_not_widen_deferred_cash_band(

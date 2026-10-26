@@ -525,6 +525,144 @@ def test_a_cash_difference_other_than_the_dividend_is_a_mismatch() -> None:
     assert result.adjustments == ()
 
 
+def test_two_names_open_and_only_one_dividend_paid() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0, SEC_B=4.0),
+        _positions(AAA=10.0, BBB=4.0),
+        1_004.5,
+        explanations=_explanations(
+            dividends={"SEC_A": 4.5, "SEC_B": 7.0},
+            dividend_dues={"SEC_A": (4.5,), "SEC_B": (7.0,)},
+        ),
+    )
+    assert result.status == "ok"
+    assert [(a.security_id, a.cash) for a in result.adjustments] == [("SEC_A", 4.5)]
+
+
+def test_two_dividends_on_one_name_book_only_the_older_paid_due() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_004.5,
+        explanations=_explanations(dividends={"SEC_A": 11.5}, dividend_dues={"SEC_A": (4.5, 7.0)}),
+    )
+    assert result.status == "ok"
+    assert [(a.security_id, a.cash) for a in result.adjustments] == [("SEC_A", 4.5)]
+
+
+def test_two_equal_open_dues_with_one_paid_fail_closed() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_005.0,
+        explanations=_explanations(dividends={"SEC_A": 10.0}, dividend_dues={"SEC_A": (5.0, 5.0)}),
+    )
+    assert _kinds(result) == ["cash"]
+    assert result.adjustments == ()
+
+
+def test_small_unpaid_due_prefers_none_paid_inside_cash_bound() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=0.01),
+        _positions(AAA=0.01),
+        1_000.0,
+        explanations=_explanations(dividends={"SEC_A": 0.005}, dividend_dues={"SEC_A": (0.005,)}),
+    )
+    assert result.status == "ok" and result.adjustments == ()
+
+
+def test_name_missing_from_dividend_dues_uses_its_per_name_total() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_004.5,
+        explanations=_explanations(dividends={"SEC_A": 4.5}, dividend_dues={}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [4.5]
+
+
+def test_present_dividend_dues_must_sum_to_the_per_name_total() -> None:
+    with pytest.raises(ValueError, match="dividend dues"):
+        _run(
+            _ledger(1_000.0, SEC_A=10.0),
+            _positions(AAA=10.0),
+            1_000.0,
+            explanations=_explanations(
+                dividends={"SEC_A": 4.5}, dividend_dues={"SEC_A": (2.0, 2.0)}
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("total", "dues"),
+    [(0.3, (0.1, 0.2)), (1.0, (0.3, 0.7000000000000001))],
+)
+def test_dividend_dues_allow_only_float_representation_rounding(
+    total: float, dues: tuple[float, ...]
+) -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0,
+        explanations=_explanations(dividends={"SEC_A": total}, dividend_dues={"SEC_A": dues}),
+    )
+    assert result.status == "ok"
+
+
+def test_two_paid_dues_on_one_name_journal_two_rows() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_011.5,
+        explanations=_explanations(dividends={"SEC_A": 11.5}, dividend_dues={"SEC_A": (4.5, 7.0)}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [4.5, 7.0]
+
+
+def test_nine_open_dues_try_singles_but_not_all_combinations() -> None:
+    dues = tuple(float(i) for i in range(1, 10))
+    explanations = _explanations(dividends={"SEC_A": 45.0}, dividend_dues={"SEC_A": dues})
+    single = _run(
+        _ledger(1_000.0, SEC_A=10.0), _positions(AAA=10.0), 1_009.0, explanations=explanations
+    )
+    assert single.status == "ok" and [a.cash for a in single.adjustments] == [9.0]
+    combination_only = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_012.0,
+        explanations=explanations,
+    )
+    assert _kinds(combination_only) == ["cash"]
+
+
+def test_eight_open_dues_try_a_partial_combination() -> None:
+    dues = tuple(float(2**i) for i in range(8))
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_130.0,
+        explanations=_explanations(dividends={"SEC_A": 255.0}, dividend_dues={"SEC_A": dues}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [2.0, 128.0]
+
+
+def test_ended_listing_does_not_try_partial_dividend_combinations() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0, SEC_C=0.1),
+        _positions(AAA=10.0),
+        1_005.5,
+        explanations=_explanations(
+            ended=frozenset({"SEC_C"}),
+            dividends={"SEC_A": 11.5},
+            dividend_dues={"SEC_A": (4.5, 7.0)},
+        ),
+    )
+    assert _kinds(result) == ["cash"]
+
+
 # --- pending and lagging allowances --------------------------------------------
 
 

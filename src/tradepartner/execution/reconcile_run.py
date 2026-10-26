@@ -497,7 +497,7 @@ def _dividends(
     credit_sessions: int,
     cash_tolerance: float,
     fresh_names: Collection[str] | None,
-) -> tuple[dict[str, float], dict[str, str]]:
+) -> tuple[dict[str, float], dict[str, tuple[float, ...]], dict[str, str]]:
     """Cash due per name in the credit window, net of journaled cash oldest first.
 
     The extra window of old ex-dates catches a late payment whose dividend has
@@ -571,6 +571,7 @@ def _dividends(
             )
             dues[row["security_id"]].append((row["ex_date"], amount))
     due: dict[str, float] = defaultdict(float)
+    open_dues: dict[str, tuple[float, ...]] = {}
     for name, dated in dues.items():
         # `dividend_cash` has no action id. At the credit's own session, consume
         # only dues still inside its N-session window, oldest ex-date first.
@@ -602,27 +603,31 @@ def _dividends(
                 cash -= signed_paid
                 if cash == 0.0:
                     break
-        due[name] = math.fsum(
+        open_dues[name] = tuple(
             amount
             for ex_date, amount in remaining
             if ex_date > max(window_start, started_on)
             and (
                 fresh_names is None or base_day is None or ex_date > base_day or name in fresh_names
             )
+            and amount != 0
         )
+        due[name] = math.fsum(open_dues[name])
     # `compare` signs a due against the book at S: a short's due is negative only
     # while the name is still held short, a long's positive only while it is not.
     # A short covered (or a long flipped short) after the ex-date has a due of
     # the wrong sign there, which would raise; leave it unexplained instead, so
     # the cash it moved halts as a `cash` mismatch as before (#1928).
     short_now = _ledger(state, actions, window, through, tolerance).short_holdings
+    active = {
+        name: amount
+        for name, amount in sorted(due.items())
+        if (amount < 0 and short_now.get(name, 0.0) > tolerance)
+        or (amount > 0 and short_now.get(name, 0.0) <= tolerance)
+    }
     return (
-        {
-            name: amount
-            for name, amount in sorted(due.items())
-            if (amount < 0 and short_now.get(name, 0.0) > tolerance)
-            or (amount > 0 and short_now.get(name, 0.0) <= tolerance)
-        },
+        active,
+        {name: open_dues[name] for name in active},
         {name: "; ".join(details) for name, details in sorted(findings.items())},
     )
 
@@ -774,7 +779,7 @@ def _explanations(
     fresh_dividend_names = {
         name for name, symbol in symbols.items() if symbol in fresh_dividend_symbols
     }
-    dividends, findings = _dividends(
+    dividends, dividend_dues, findings = _dividends(
         state,
         actions,
         window,
@@ -797,6 +802,7 @@ def _explanations(
         ended=ended,
         spinoffs=_spinoffs(state, actions, window, session, tolerance, through),
         dividends=dividends,
+        dividend_dues=dividend_dues,
         dividend_findings=findings,
         reference_prices=_reference_prices(conn, cut, priced, previous_session(session)),
         stock_dividends=stock_dividends,
