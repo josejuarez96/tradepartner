@@ -606,14 +606,16 @@ def _insert_order(
     decision_id: int = 1,
     run_id: int = 1,
     session: date = T0,
+    side: str = "buy",
+    position_side: str = "long",
 ) -> None:
     """An order of decision 1 at T0 with one terminal event stamped `at`."""
     conn.execute(
         "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
-        "security_id, symbol, side, notional, sells_in_flight_at_submit, known_at, "
-        "ingested_at) VALUES (?, ?, ?, ?, 1, 'buy', 'SEC_A', 'SEC_A', 'buy', 1000.0, FALSE, "
-        "?, ?)",
-        [coid, decision_id, run_id, session, _utc(session), _utc(session)],
+        "security_id, symbol, side, position_side, notional, "
+        "sells_in_flight_at_submit, known_at, ingested_at) "
+        "VALUES (?, ?, ?, ?, 1, 'buy', 'SEC_A', 'SEC_A', ?, ?, 1000.0, FALSE, ?, ?)",
+        [coid, decision_id, run_id, session, side, position_side, _utc(session), _utc(session)],
     )
     conn.execute(
         "INSERT INTO order_events (client_order_id, status, reason, known_at, ingested_at) "
@@ -663,6 +665,40 @@ def _chain(settings: Settings) -> check_module.CheckLine:
     tracking line to price."""
     with open_read_only(settings) as conn:
         return check_module._chain_line(conn, WINDOW_ID, "month_end")
+
+
+@pytest.mark.parametrize(
+    ("side", "position_side", "expected"),
+    [
+        ("buy", "long", "position_return"),
+        ("sell", "long", "realised_pnl"),
+        ("sell", "short", "position_return"),
+        ("buy", "short", "realised_pnl"),
+    ],
+)
+def test_chain_filled_outcome_follows_position_intent(
+    settings: Settings, side: str, position_side: str, expected: str
+) -> None:
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn)
+        _insert_order(conn, "intent", status="filled", side=side, position_side=position_side)
+        _insert_fill(conn, "intent", "intent-fill", _T0_UTC)
+    line = _chain(settings)
+    assert not line.passed
+    assert f"no {expected} outcome" in line.detail
+    with open_for_write(settings) as conn:
+        _insert_outcome(conn, "intent", expected)
+    assert _chain(settings).passed
+
+
+def test_chain_unfilled_order_still_needs_not_executed(settings: Settings) -> None:
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn)
+        _insert_order(conn, "missed-short", status="cancelled", side="sell", position_side="short")
+    assert "no not_executed outcome" in _chain(settings).detail
+    with open_for_write(settings) as conn:
+        _insert_outcome(conn, "missed-short", "not_executed")
+    assert _chain(settings).passed
 
 
 def test_chain_counts_an_owner_settled_order_complete_once_not_executed_is_written(

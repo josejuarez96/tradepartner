@@ -265,7 +265,7 @@ from tradepartner.execution import switch
 from tradepartner.execution.collect import _check_unchanged
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import resolve_book, run_lock
-from tradepartner.execution.outcomes import NOT_EXECUTED, POSITION_RETURN, REALISED_PNL
+from tradepartner.execution.outcomes import NOT_EXECUTED, filled_outcome_kind
 from tradepartner.execution.plan import current_listings
 from tradepartner.execution.reconcile import OK
 from tradepartner.execution.reconcile_run import (
@@ -1137,10 +1137,8 @@ def _not_ready(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[str]:
             missing.append(f"order {coid} ({order.symbol}) is not terminal")
             continue
         earned: list[str] = []
-        if filled.get(coid, 0.0) > 0 and order.side == _BUY:
-            earned.append(POSITION_RETURN)
-        if filled.get(coid, 0.0) > 0 and order.side == _SELL:
-            earned.append(REALISED_PNL)
+        if filled.get(coid, 0.0) > 0:
+            earned.append(filled_outcome_kind(order.side, order.position_side))
         if terminal[coid] != _FILLED:
             earned.append(NOT_EXECUTED)
         missing += [

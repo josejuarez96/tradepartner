@@ -20,11 +20,13 @@ run on a session after its horizon's last session:
   (`OutcomeWindow.stop_flat`, per name, computed by the caller; a name never
   held is flat). That run on S writes the row, from marks known at close(S-1):
   a run never reads close(S), which is not known before the open.
-- **Kinds.** A buy with fills: `position_return`, the horizon mark over the
+- **Kinds.** A fill opening a position (long buy or short sell):
+  `position_return`, the horizon mark over the
   order's split-adjusted average fill price (over the accessor's live fills, so
   an implied residual enters at the order's average and a superseded fill never)
   less 1, with its contribution (the dollar gain over the equity of the last mark
-  before the order's session). A sell with fills: `realised_pnl`, the dollars
+  before the order's session). A fill closing a position (long sell or short
+  buy): `realised_pnl`, the dollars
   realised on the FIFO lots it closed (`execution.lots`), with its contribution.
   An order that did not fill in full (expired, rejected or cancelled): also
   `not_executed`, the name's return from close of the session before the order
@@ -105,6 +107,17 @@ LotLedger = tuple[Sequence[Lot], Sequence[Disposal], Sequence[WashSaleFlag]]
 POSITION_RETURN = "position_return"
 REALISED_PNL = "realised_pnl"
 NOT_EXECUTED = "not_executed"
+
+
+def filled_outcome_kind(side: str, position_side: str) -> str:
+    """Outcome kind earned by a filled order's position intent."""
+    if (side, position_side) in {("buy", "long"), ("sell", "short")}:
+        return POSITION_RETURN
+    if (side, position_side) in {("sell", "long"), ("buy", "short")}:
+        return REALISED_PNL
+    raise ValueError(f"unknown position intent: {side}/{position_side}")
+
+
 _TERMINAL = frozenset({"filled", "expired", "rejected", "cancelled"})
 _FILLED = "filled"
 _EXIT = "exit"
@@ -221,7 +234,7 @@ def _flattening(
     stop_requested: date | None,
 ) -> dict[str, tuple[date, float]]:
     """Per name, (session of the last fill, average fill price) of its first
-    filled `exit` sell on or after the stop request."""
+    filled closing `exit` order on or after the stop request."""
     if stop_requested is None:
         return {}
     by_order: dict[str, list[OrderedFill]] = {}
@@ -233,7 +246,7 @@ def _flattening(
         quantity = sum(i.fill.quantity for i in own)
         if (
             order.phase == _EXIT
-            and order.side == _SELL
+            and filled_outcome_kind(order.side, order.position_side) == REALISED_PNL
             and order.session >= stop_requested
             and terminal.get(order.client_order_id) == _FILLED
             and quantity > 0
@@ -361,10 +374,10 @@ def due_outcomes(
         own = by_order.get(order.client_order_id, [])
         quantity = sum(item.fill.quantity for item in own)
         earned = []
-        if quantity > 0 and order.side == _BUY:
-            earned.append(POSITION_RETURN)
-        if quantity > 0 and order.side == _SELL and lots is not None:
-            earned.append(REALISED_PNL)
+        if quantity > 0:
+            kind = filled_outcome_kind(order.side, order.position_side)
+            if kind != REALISED_PNL or lots is not None:
+                earned.append(kind)
         if status != _FILLED:
             earned.append(NOT_EXECUTED)
         pending = {k for k in earned if (order.client_order_id, k) not in window.written}
@@ -393,8 +406,9 @@ def due_outcomes(
             )
             average = _price(cost / shares, f"average fill price of {order.client_order_id}")
             assert average is not None
-            value = None if mark is None else mark / average - 1
-            gain = None if mark is None else mark * shares - cost
+            sign = -1 if order.position_side == "short" else 1
+            value = None if mark is None else sign * (mark / average - 1)
+            gain = None if mark is None else sign * (mark * shares - cost)
             candidates.append(
                 Outcome(
                     order.client_order_id,
@@ -419,7 +433,8 @@ def due_outcomes(
             start = _price(prices(security, before), f"start price of {security} on {before}")
             if start is not None:
                 start /= _split_factor(actions, security, before, through)
-            value = None if mark is None or start is None else mark / start - 1
+            sign = -1 if order.position_side == "short" else 1
+            value = None if mark is None or start is None else sign * (mark / start - 1)
             candidates.append(
                 Outcome(order.client_order_id, through, NOT_EXECUTED, value, None, mark)
             )
