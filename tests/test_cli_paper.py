@@ -510,13 +510,13 @@ PAPER_OPTIONS = {
     "kill": {"--reason", "--book", "--all"},
     "resume": {"--reason", "--accept-broker-fills", "--accept-rejections", "--book"},
     "report": {"--book"},
-    "check": {"--book"},
+    "check": {"--book", "--verbose"},
     "status": {"--book", "--all"},
     "abandon": {"--reason", "--book"},
     "settle": {"--order", "--reason", "--book"},
     "override": {"--kind", "--session", "--name", "--reason", "--book"},
     "lots-reconcile": {"--export", "--tax-year", "--book"},
-    "shakedown": set(),
+    "shakedown": {"--verbose"},
 }
 
 
@@ -1743,6 +1743,12 @@ STATUS_MAIN = (
     "alerts (0):\n"
 )
 CHECK_MAIN = (
+    "FAIL rebalance_count: 0 of 6 rebalance sessions done so far, about 6 months to go\n"
+    "FAIL tracking: no paper_reports row yet\n"
+    "PASS chain: no incomplete chain once due\n"
+    "PASS override_reason: every override reason meets the frozen minimum\n"
+)
+CHECK_MAIN_VERBOSE = (
     "FAIL rebalance_count: 0 scheduler-executed rebalance session(s) [], need >= 6 "
     "(query: distinct rebalance_events.rebalance_session with status='executed' whose "
     "writing paper_runs row has invoked_by='scheduler')\n"
@@ -1778,6 +1784,8 @@ def test_status_and_check_for_main_are_byte_identical(
     check = _paper(clock, factory, "check", *flags)
     assert (status.exit_code, status.output) == (0, STATUS_MAIN)
     assert (check.exit_code, check.output) == (1, CHECK_MAIN)
+    verbose = _paper(clock, factory, "check", *flags, "--verbose")
+    assert (verbose.exit_code, verbose.output) == (1, CHECK_MAIN_VERBOSE)
 
 
 @pytest.mark.usefixtures("started")
@@ -2277,7 +2285,12 @@ def _shakedown_line(name: str, passed: bool) -> paper_shakedown.ShakedownLine:
 def test_paper_shakedown_with_no_span_row_fails(clock: _Clock, factory: _Factory) -> None:
     out = _paper(clock, factory, "shakedown")
     assert out.exit_code == 1
-    assert "no shakedown_span decision" in out.output
+    assert "no shakedown span is open yet" in out.output
+    assert "decision shakedown-span" in out.output
+    assert "failed" not in out.output and "ValueError" not in out.output
+    old = _paper(clock, factory, "shakedown", "--verbose")
+    assert old.exit_code == 1
+    assert "failed: ValueError: no shakedown_span decision" in old.output
     assert factory.fake.calls == ()
 
 
@@ -2302,7 +2315,11 @@ def test_paper_shakedown_prints_seven_lines_and_fails_on_an_empty_journal(
     lines = out.output.strip().splitlines()
     assert len(lines) == 7
     assert lines[0].startswith("FAIL E.1 sessions:")
-    assert "sessions >= 10, order sessions >= 5" in lines[0]
+    assert "sessions >= 10, order sessions >= 5" not in lines[0]  # thresholds: --verbose
+    assert "query:" not in lines[0]
+    verbose = _paper(clock, factory, "shakedown", "--verbose")
+    assert "sessions >= 10, order sessions >= 5" in verbose.output.splitlines()[0]
+    assert "query:" in verbose.output.splitlines()[0]
     assert [line.split(":")[0].split(" ", 1)[1] for line in lines] == [
         "E.1 sessions",
         "E.2 reconciliation",
