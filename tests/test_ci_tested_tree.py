@@ -243,3 +243,132 @@ def test_main_fails_closed_to_run(
     out = capsys.readouterr()
     assert out.out == "run\n"
     assert "run" in out.err
+
+
+# --- a docs-only refresh of a PR (#2279) -------------------------------------------------
+
+MERGE = "g" * 40  # the PR head: a merge of main into the previous head
+MAIN_TIP = "n" * 40
+
+
+def _checks_path(sha: str) -> str:
+    return f"repos/{REPO}/commits/{sha}/check-runs?filter=latest&per_page=100"
+
+
+def _delta(*names: str, **extra: Any) -> dict[str, Any]:
+    files = [{"filename": n} for n in names]
+    return {"status": "ahead", "files": files, **extra}
+
+
+class RefreshApi(FakeApi):
+    def __init__(self, delta: dict[str, Any] | None = None, **over: Any) -> None:
+        super().__init__()
+        runs = over.pop("runs", _full_suite())
+        self.answers = {
+            f"repos/{REPO}/git/commits/{MERGE}": {
+                "tree": {"sha": TREE},
+                "parents": [{"sha": HEAD}, {"sha": MAIN_TIP}],
+            },
+            f"repos/{REPO}/compare/{HEAD}...{MERGE}": delta or _delta("docs/a.md"),
+            _checks_path(HEAD): {"total_count": len(runs), "check_runs": runs},
+        }
+        self.answers.update(over)
+
+
+def _refresh(api: FakeApi) -> bool:
+    skip, reason = ci_tested_tree.decide_refresh(api, REPO, MERGE, SHARDS)
+    assert reason
+    return bool(skip)
+
+
+@pytest.mark.parametrize(
+    ("path", "docs"),
+    [
+        ("docs/specs/a.md", True),
+        ("docs/plans/paper-trading.md", True),
+        ("docs/runbooks/x.toml", False),
+        ("docs/ui/book_blurbs.toml", False),
+        ("docs/data.csv", False),
+        ("changelog.d/12-x.md", True),
+        ("CHANGELOG.md", True),
+        ("README.md", True),
+        ("src/tradepartner/a.py", False),
+        ("src/tradepartner/README.md", False),
+        ("tests/data.md", False),
+        ("scripts/x.md", False),
+        (".github/workflows/ci.yml", False),
+        (".github/PULL_REQUEST_TEMPLATE.md", False),
+        ("pyproject.toml", False),
+        ("uv.lock", False),
+        ("config/default.toml", False),
+        ("docsx/a.py", False),
+        ("docs/../src/a.py", False),
+        ("docs/a.py", False),
+        ("", False),
+    ],
+)
+def test_docs_only_is_a_fixed_allowlist(path: str, docs: bool) -> None:
+    assert ci_tested_tree.docs_only([path]) is docs
+
+
+def test_docs_only_needs_every_path() -> None:
+    assert ci_tested_tree.docs_only(["docs/a.md", "changelog.d/1-a.md"])
+    assert not ci_tested_tree.docs_only(["docs/a.md", "src/a.py"])
+
+
+def test_a_docs_only_merge_in_over_a_fully_tested_head_skips() -> None:
+    assert _refresh(RefreshApi())
+    assert _refresh(RefreshApi(_delta()))  # main added nothing: the tested tree stands
+
+
+def test_any_code_in_the_merge_in_runs() -> None:
+    assert not _refresh(RefreshApi(_delta("docs/a.md", "scripts/x.py")))
+
+
+def test_a_rename_out_of_code_runs() -> None:
+    renamed = {
+        "status": "ahead",
+        "files": [{"filename": "docs/a.md", "previous_filename": "src/a.py"}],
+    }
+    assert not _refresh(RefreshApi(renamed))
+
+
+@pytest.mark.parametrize(
+    "delta",
+    [
+        _delta("docs/a.md", total_commits=1) | {"status": "diverged"},
+        {"status": "ahead"},
+        {"status": "ahead", "files": None},
+        _delta(*(f"docs/{i}.md" for i in range(300))),
+    ],
+    ids=["diverged", "no-files", "null-files", "truncated-at-300"],
+)
+def test_a_doubtful_delta_runs(delta: dict[str, Any]) -> None:
+    assert not _refresh(RefreshApi(delta))
+
+
+def test_a_head_that_is_not_a_two_parent_merge_runs() -> None:
+    for parents in ([{"sha": HEAD}], [], [{"sha": HEAD}, {"sha": MAIN_TIP}, {"sha": PARENT}]):
+        commit = {"tree": {"sha": TREE}, "parents": parents}
+        assert not _refresh(RefreshApi(**{f"repos/{REPO}/git/commits/{MERGE}": commit}))
+
+
+def test_a_previous_head_without_a_full_green_suite_runs() -> None:
+    for runs in ([], _runs_without("checks"), _runs_without("pytest-shard (3)")):
+        assert not _refresh(RefreshApi(runs=runs))
+    skipped = [
+        r | {"conclusion": "skipped"} if r["name"] == "pytest-shard (0)" else r
+        for r in _full_suite()
+    ]
+    assert not _refresh(RefreshApi(runs=skipped))
+
+
+def test_refresh_mode_prints_skip_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setenv("PYTEST_SHARD_COUNT", str(SHARDS))
+    assert ci_tested_tree.main(["--refresh", MERGE], api=RefreshApi()) == 0
+    assert capsys.readouterr().out.strip() == "skip"
+    assert ci_tested_tree.main(["--refresh", MERGE], api=FakeApi()) == 0  # KeyError: closed
+    assert capsys.readouterr().out.strip() == "run"
