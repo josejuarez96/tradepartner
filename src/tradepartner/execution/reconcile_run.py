@@ -1393,6 +1393,14 @@ def reconcile_command(
             raise NoWindowError("no_window: no paper window is open")
         frozen = frozen_risk(window)
         try:
+            # Before `settle_pending_unresolved` writes anything broker-derived
+            # (#2187): another account's broker cannot answer for this window's orders.
+            account = broker.account()
+            if account.account_id != window.account_id:
+                raise ReconciliationError(
+                    f"the broker's account {account.account_id!r} is not window "
+                    f"{_window_id(window)}'s {window.account_id!r}"
+                )
             settle_pending_unresolved(
                 broker, connect, clock, unresolved_orders(connect, _window_id(window))
             )
