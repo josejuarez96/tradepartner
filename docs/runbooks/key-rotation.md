@@ -29,18 +29,18 @@ Rotate one book at a time, so a mistake stops one book.
    ```bash
    [ -n "$(launchctl getenv ALPACA_PAPER_API_KEY)" ] && echo "override set: remove it"
    ```
-   Run it for each variable you changed (it prints only a warning, never the value). Also check your shell has none exported (`env | grep -c ALPACA_PAPER` prints a count, not values).
+   Run it for each variable you changed (it prints only a warning, never the value). Also check the job plist's `EnvironmentVariables` for the same names (`grep -c ALPACA ~/Library/LaunchAgents/com.tradepartner.*.plist` prints a count per file, never a value; it should be 0, since no secret belongs in a plist). Also check your shell has none exported (`env | grep -c ALPACA_PAPER` prints a count, not values).
 6. **Prove the new keys work.** With a window open for the book:
    ```bash
    uv run tradepartner paper reconcile --book <token>
    ```
-   It reads the broker with that book's keys and reconciles. `ok` means the keys and the account id match. A `no_credentials` refusal means a half-set or mistyped pair; an auth error from Alpaca means the old key is still in use or the new one was copied wrong. With no open window, run `uv run tradepartner paper status --book <token>`, then confirm at the next `paper run` ("Checking a run").
+   It reads the broker with that book's keys and reconciles. `ok` means the keys and the account id match. Warning: a mismatch is a real finding, and it engages the kill switch for the book (resume procedure in scheduling.md), so run it when you can handle that. A `no_credentials` refusal means a half-set or mistyped pair; an auth error from Alpaca means the old key is still in use or the new one was copied wrong. `paper status` never contacts the broker, so it proves nothing about keys. With no open window, the first call that reads the broker is `paper start` (it calls `account()`), or the next scheduled `paper run`: check it per "Checking a run".
 7. **Revoke the old key** at Alpaca only after step 6 passes.
 8. **Note it.** Record the date, the book and the reason in one line on the issue or in your notes. Never the key.
 
 ## If a key leaked
 
-Revoke it at Alpaca first, then rotate as above. Then check the broker's activity for orders you did not place, and `paper status --book <token>` for unexpected orders. Check that the key was not printed in a log: the code scrubs keys from its output, but a pasted command line or a plist is not scrubbed. The paper endpoint is paper-only by a guarded setting no variable can change (paper-trading spec req 2), so a leaked paper key cannot touch real money.
+Revoke it at Alpaca first, then rotate as above. The market-data key (`ALPACA_API_KEY` / `ALPACA_API_SECRET`) can belong to a live Alpaca account, because it is a data key, not a paper key. If it leaked, rotate it at Alpaca the same way (edit `.env`, check for overrides, then run `uv run tradepartner ingest` or wait for the next ingest), and if the key is from a live account, revoke it at once, before anything else: it may reach real money. Then check the broker's activity for orders you did not place, and `paper status --book <token>` for unexpected orders. Check that the key was not printed in a log: the code scrubs keys from its output, but a pasted command line or a plist is not scrubbed. The paper endpoint is paper-only by a guarded setting no variable can change (paper-trading spec req 2), so a leaked paper key cannot touch real money (the data key above is the one that might).
 
 ## After resetting a paper account
 

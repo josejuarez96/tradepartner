@@ -1,6 +1,6 @@
 # Runbook: restarting a paper window
 
-Owner-run, on the real store, with the scheduled jobs stopped as in [scheduling.md](scheduling.md). A restart means closing a book's paper window and opening a new one for it. It is not a pause. The paper record starts again. Four restarts so far (10-13 and 10-18) each did this, and nothing told the owner what went with it ([owner walkthrough](../research/2026-10-19-owner-day-in-the-life.md), item 37).
+Owner-run, on the real store, with the scheduled jobs stopped as in [scheduling.md](scheduling.md). A restart means closing a book's paper window and opening a new one for it. It is not a pause. The paper record starts again. Restarts on 10-13 and 10-18 each did this, and nothing told the owner what went with it ([owner walkthrough](../research/2026-10-19-owner-day-in-the-life.md), item 37).
 
 Code references: `execution/window.py` (`start`, `stop`, `abandon`), `cli.py` (`paper start | stop | abandon`).
 
@@ -25,15 +25,15 @@ These do **not** reset:
 ## Checklist
 
 1. **Say why** in one line, and note which book. Every command takes `--book <token>` (default `main`).
-2. **Stop the jobs** that could run during the restart (scheduling.md, "Before pulling a schema migration"). A paper run in the middle of a stop or start would hit the run lock (`locked`).
+2. **Keep the scheduled paper job loaded until the stop run is done** (step 4). The sells happen in a `paper run` that starts inside the submit window (90 minutes before to 30 minutes after the open, scheduling.md "The submit window"), so the next scheduled run does it, or you run `paper run --book <token>` yourself inside that window. Only after the window is `closed` (or `abandoned`), stop the jobs (scheduling.md, "Before pulling a schema migration") and leave them stopped through step 6, so no run hits the lock (`locked`) during the start.
 3. **Read the state.** `uv run tradepartner paper status --book <token>`. If the kill switch is engaged, `paper stop` is refused: `paper resume --reason "..."` first (it reconciles first).
 4. **Close the old window.** Normal path, in two steps:
    ```bash
    uv run tradepartner paper stop --reason "why" --book <token>   # requests the stop
-   # the next paper run (or a manual one) sells the holdings; then:
+   # a paper run inside the submit window sells the holdings (step 2); then:
    uv run tradepartner paper stop --reason "why" --book <token>   # closes the window
    ```
-   If `stop` cannot finish, use `paper abandon` and follow "`abandon`: the last resort" in scheduling.md, including the Alpaca paper-account reset.
+   If `stop` cannot finish, use `paper abandon` and follow "`abandon`: the last resort" in scheduling.md. What you lose: `abandon` places and cancels no order, so the positions stay at the broker, no residue is carried to the next window, and the window has no clean closing sell. You must reset the Alpaca paper account to flat before the next `paper start`, which also ends that account's history.
 5. **Check the account is ready.** After `closed`: no open orders, and the positions are exactly the listed residues. After `abandoned`: zero positions, zero open orders. If you reset the account at Alpaca, check whether the account id or the keys changed; if the keys changed, follow [key-rotation](key-rotation.md) (`paper start` records whatever account id the broker reports for the new window; only another book's account is refused).
 6. **Open the new window.**
    ```bash
