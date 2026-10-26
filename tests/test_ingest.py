@@ -983,6 +983,67 @@ def test_an_edgar_only_failure_still_ingests_prices(
     ]
 
 
+@pytest.mark.parametrize(
+    ("listing_day", "edgar_fails", "backfill"),
+    [
+        (date(2019, 7, 1), True, True),
+        (date(2019, 7, 2), True, False),
+        (date(2019, 7, 1), False, False),
+    ],
+)
+def test_edgar_gap_backfills_only_names_listed_on_the_missed_session(
+    settings: Settings,
+    read: Callable[[str], list[tuple[Any, ...]]],
+    listing_day: date,
+    edgar_fails: bool,
+    backfill: bool,
+) -> None:
+    """A recovered master fills only the failed evening's eligible new names."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    x = "0000000003"
+    accession = f"{x}-19-000001"
+    accepted = _at(listing_day.year, listing_day.month, listing_day.day)
+    new_filing = {
+        "extra_index": [FilingIndexEntry(x, "New Corp", "10-K", accession, accepted)],
+        "extra_covers": [
+            CoverPage(x, accession, accepted, (CoverListing("Common Stock", "NEW", "NYSE"),))
+        ],
+        "extra_headers": [FilingHeader(x, accession, "10-K", 3571, accepted)],
+    }
+    first_day = date(2019, 7, 1)
+    second_day = date(2019, 7, 2)
+    first_at = datetime(2019, 7, 2, 2, tzinfo=UTC)
+    second_at = datetime(2019, 7, 3, 2, tzinfo=UTC)
+    assert _run(settings).ok
+    first_prices = _Prices()
+    first = _run(
+        settings,
+        first_prices,
+        now=first_at,
+        filings=_filings(cls=Broken) if edgar_fails else _filings(**new_filing),
+    )
+    assert first.runs[-1].status == OK
+    assert (("bars", tuple(sorted((*IDS, x))), first_day, first_day) in first_prices.calls) == (
+        not edgar_fails
+    )
+
+    second_prices = _Prices()
+    assert _run(settings, second_prices, now=second_at, filings=_filings(**new_filing)).ok
+    assert (("bars", (x,), first_day, first_day) in second_prices.calls) == backfill
+    assert ("bars", tuple(sorted((*IDS, x))), second_day, second_day) in second_prices.calls
+    rows = read(
+        f"SELECT session, known_at FROM prices_daily WHERE security_id='{x}' ORDER BY session"
+    )
+    expected = [first_day, second_day] if backfill or not edgar_fails else [second_day]
+    assert [day for day, _ in rows] == expected
+    if backfill:
+        assert rows[0][1] == second_at
+
+
 def test_one_source_only(settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]) -> None:
     result = _run(settings, source="edgar")
     assert [r.source for r in result.runs] == ["edgar"]
