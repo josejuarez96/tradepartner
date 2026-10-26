@@ -146,6 +146,13 @@ def live_store_path(live: Settings | None = None) -> Path:
     return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
 
 
+def _live_config_refusal(book: str) -> str:
+    return (
+        "The live store's config could not be read, so this page cannot stop a book. "
+        f"At the desk, run `{desk_command(book)}`."
+    )
+
+
 def store_refusal(
     settings: Settings, live: Settings | None = None, book: str = "<book>"
 ) -> str | None:
@@ -154,14 +161,13 @@ def store_refusal(
     for `book`."""
     page = Path(settings.store.path).resolve()
     try:
-        same = os.path.samefile(page, live_store_path(live))
+        live_path = live_store_path(live)
+    except (ValueError, OSError):  # the live config itself does not load
+        return _live_config_refusal(book)
+    try:
+        same = os.path.samefile(page, live_path)
     except OSError:
         same = False
-    except ValueError:  # the live config itself does not load
-        return (
-            "The live store's config could not be read, so this page cannot stop a book. "
-            f"At the desk, run `{desk_command(book)}`."
-        )
     if not same:
         why = "This page is reading a store that is not the live store"
     elif page.with_name(f"{page.name}.manifest.json").exists():
@@ -224,8 +230,8 @@ def kill(settings: Settings, book: str, reason: str) -> KillResult:
         raise KillRefused(refusal)
     try:
         live = live_settings()
-    except ValueError as exc:
-        raise KillRefused(store_refusal(settings, None) or "live config unreadable") from exc
+    except (ValueError, OSError) as exc:
+        raise KillRefused(_live_config_refusal(book)) from exc
     refusal = store_refusal(settings, live)
     if refusal is not None:
         raise KillRefused(refusal)
