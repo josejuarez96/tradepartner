@@ -15,10 +15,17 @@ path's read, `paper resume`'s settlement). In order:
    earliest `known_at` of the `pending` event of any non-terminal own order)
    - `paper.fill_read_overlap_seconds`, inclusive at equal timestamps
    (`Broker.fills` returns `filled_at >= since`); `None` (everything) when
-   there is neither. A `broker_feed` fill whose `filled_at` is ahead of the
+   there is neither. The orders to collect are read first (`get_order`), and
+   `since` also reaches back to the earliest broker `submitted_at` among them
+   minus the overlap, never earlier than the first window's `started_at`
+   minus the overlap: the broker filters fills on its own clock, so our
+   stamps alone hide fills when the Mac clock runs ahead (#2186). A `pending`
+   `known_at` later than its order's `submitted_at` by more than
+   `risk.max_broker_clock_skew_seconds` is a note on `Collected.clock_notes`
+   (no halt). A `broker_feed` fill whose `filled_at` is ahead of the
    clock (read after the call) by more than the frozen
    `risk.max_broker_clock_skew_seconds` is a `ClockError`, raised before
-   anything is written. Then `get_order` once per order to collect. Broker
+   anything is written. `get_order` is once per order to collect, before `fills`. Broker
    errors propagate: every method's allowlist but `cancel`'s is empty
    (req 4), so the caller halts. A reading that is not the default order
    shape (`risk.order_shape_violation`: anything but a market day order of a
@@ -255,6 +262,8 @@ class Collected:
     written_off: tuple[int, ...]
     #: `client_order_id`s of fills the price band could not judge (no reference price).
     unjudged: tuple[str, ...] = ()
+    #: Warnings that our clock runs ahead of the broker's (#2186); they never halt.
+    clock_notes: tuple[str, ...] = ()
 
     @property
     def lagging(self) -> tuple[OrderReading, ...]:
@@ -263,7 +272,9 @@ class Collected:
 
 
 def note_unjudged(collected: Collected, notes: list[str]) -> None:
-    """Record fills whose reference price was unavailable to the band."""
+    """Record the collection's warnings: fills whose reference price was unavailable
+    to the band, and a Mac clock running ahead of the broker's (#2186)."""
+    notes.extend(collected.clock_notes)
     if collected.unjudged:
         notes.append(
             "fill-price band: no reference price for " + ", ".join(sorted(set(collected.unjudged)))
@@ -317,6 +328,13 @@ def collect(
     with connect() as conn:
         cursors = fill_cursors(conn)
         open_since = _earliest_open_pending(conn)
+        pending_at = _open_pending_stamps(conn)
+        floor_row = conn.execute("SELECT min(started_at) FROM paper_windows").fetchone()
+        window_floor = (
+            ensure_tz_aware_utc(floor_row[0], field_name="started_at")
+            if floor_row is not None and floor_row[0] is not None
+            else None
+        )
         pending = {o.client_order_id for o in pending_orders(conn, window_id=None)}
         open_ids = {o.client_order_id for o in non_terminal_orders(conn, window_id=None)}
     cursor = max((c.collected_through for c in cursors), default=None)
@@ -331,11 +349,27 @@ def collect(
     since = min(bounds) - overlap if bounds else None
     # The broker filters fills on its own clock, so a bound taken only from our
     # stamps hides fills when our clock runs ahead (#2186): also reach back to
-    # the broker's own `submitted_at` of the orders being collected.
+    # the broker's own `submitted_at` of the orders being collected, never
+    # earlier than the first window's start minus the overlap (a bogus past
+    # `submitted_at` cannot widen the read without limit).
     readings = {o.client_order_id: broker.get_order(o.client_order_id) for o in to_read}
+    clock_notes: list[str] = []
     if readings:
         broker_bound = min(r.submitted_at for r in readings.values()) - overlap
+        if window_floor is not None:
+            broker_bound = max(broker_bound, window_floor - overlap)
         since = broker_bound if since is None else min(since, broker_bound)
+        limit = frozen.max_broker_clock_skew_seconds
+        for cid, reading in sorted(readings.items()):
+            stamped = pending_at.get(cid)
+            if stamped is None:
+                continue
+            ahead = (stamped - reading.submitted_at).total_seconds()
+            if ahead > limit:
+                clock_notes.append(
+                    f"clock skew: order {cid} was stamped {ahead:.0f}s later by our clock than "
+                    f"the broker's submitted_at (limit {limit}s); the Mac clock looks fast"
+                )
     seen = broker.fills(since)
     now = _read_clock(clock)
     _check_skew(seen, now, frozen.max_broker_clock_skew_seconds)
@@ -396,6 +430,7 @@ def collect(
         rejections=rejections,
         written_off=written_off,
         unjudged=unjudged,
+        clock_notes=tuple(clock_notes),
     )
 
 
@@ -484,6 +519,16 @@ def _earliest_open_pending(conn: duckdb.DuckDBPyConnection) -> datetime | None:
         ),
         default=None,
     )
+
+
+def _open_pending_stamps(conn: duckdb.DuckDBPyConnection) -> dict[str, datetime]:
+    """The `known_at` of the `pending` event of each non-terminal order."""
+    open_ids = {o.client_order_id for o in non_terminal_orders(conn, window_id=None)}
+    return {
+        e.client_order_id: e.known_at
+        for e in order_events_for(conn, window_id=None)
+        if e.status == _PENDING and e.client_order_id in open_ids
+    }
 
 
 def _check_skew(fills: Iterable[Fill], now: datetime, skew_seconds: float) -> None:

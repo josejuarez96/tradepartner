@@ -37,7 +37,7 @@ def test_the_broker_clock_behind_ours(
     assert env.count("fills") == 3
 
 
-def test_a_fast_mac_clock_misses_the_buy_fills_and_the_next_session_halts_on_fill_lag(
+def test_a_fast_mac_clock_still_journals_the_fills_and_the_next_session_runs_clean(
     env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Our clock 90 s ahead: the run journals the broker's real fills, and the next
@@ -52,3 +52,39 @@ def test_a_fast_mac_clock_misses_the_buy_fills_and_the_next_session_halts_on_fil
     second = env.run(at(MAY_2))
     assert second.status == "ok"
     assert env.query("SELECT count(*) FROM fills WHERE source = 'broker_feed'") == [(3,)]
+
+
+def test_a_fast_mac_clock_is_noted_and_the_fills_are_stamped_with_our_collection_time(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Our clock 90 s ahead (limit 60 s): a warning note names the skew, the run does not
+    halt, and each fill's `known_at` is our collection time, not back-dated."""
+    _behind(env, monkeypatch, 90)
+    env.run(at(F_0))
+    assert env.count("fills") == 3
+    result = env.result(env.latest_run())
+    assert "clock skew" in str(result), result
+    rows = env.query("SELECT known_at, ingested_at, filled_at FROM fills")
+    assert len(rows) == 3
+    for known_at, ingested_at, filled_at in rows:
+        assert known_at == ingested_at
+        assert known_at - filled_at >= timedelta(seconds=80)  # ours, not the broker's time
+
+
+def test_a_bogus_past_submitted_at_cannot_reach_back_beyond_the_window_start(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read's `since` is never earlier than the window's start minus the overlap."""
+    seen: list[object] = []
+    fake = env.fake
+    real_fills = fake.fills
+
+    def spy(since: object) -> object:
+        seen.append(since)
+        return real_fills(since)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fake, "fills", spy)
+    _behind(env, monkeypatch, 10 * 86400)  # submitted_at ten days before our stamps
+    env.run(at(F_0))
+    floor = window.started_at - timedelta(seconds=env.settings.paper.fill_read_overlap_seconds)
+    assert seen and all(s is None or s >= floor for s in seen), seen
