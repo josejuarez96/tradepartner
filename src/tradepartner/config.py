@@ -2396,6 +2396,9 @@ class AlertsConfig(BaseModel):
 
     channels: list[AlertChannel] = Field(default_factory=lambda: list(_DEFAULT_ALERT_CHANNELS))
     delivery_timeout_seconds: float = Field(default=10.0, gt=0)
+    # The off-Mac heartbeat ping (#2155, `heartbeat.py`): bounds the one HTTP request
+    # `paper run` and `ingest` make on completion, so a dead network cannot hold a run.
+    heartbeat_timeout_seconds: float = Field(default=5.0, gt=0)
 
     @field_validator("channels")
     @classmethod
@@ -2616,6 +2619,12 @@ class Settings(BaseSettings):
     alert_email_to: SecretStr | None = Field(default=None)
     # Optional sender for the email channel; the SMTP login when unset (#404).
     alert_email_from: SecretStr | None = Field(default=None)
+    # Optional dead-man's-switch URLs (#2155; healthchecks.io style), one check per job
+    # because the schedules differ: `paper run` and `ingest` ping theirs on completion.
+    # Secrets (the URL is the credential), so the type-driven `secret_values` scrub
+    # covers them. Env `ALERT_HEARTBEAT_URL_PAPER` / `ALERT_HEARTBEAT_URL_INGEST`.
+    alert_heartbeat_url_paper: SecretStr | None = Field(default=None)
+    alert_heartbeat_url_ingest: SecretStr | None = Field(default=None)
     # Research labeling (docs/specs/research-labeling.md req 17): the vendor key, read
     # only by `research/models.py`, redacted by `secret_values`; with it absent the
     # real model client cannot be built (ADR 0013 point 3 (e)).

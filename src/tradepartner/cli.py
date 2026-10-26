@@ -379,6 +379,7 @@ import httpx
 import polars as pl
 import typer
 
+from tradepartner import heartbeat
 from tradepartner.adapters import alpaca_raw, edgar_raw
 from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
 from tradepartner.adapters.broker import Broker
@@ -2244,22 +2245,39 @@ def make_app(
                 fred = ingest_rates(s, all_rates, since=start, clock=clock)
                 result = IngestResult(result.runs + fred.runs)
         else:
-            result = ingest_session(
-                s,
-                prices=prices,
-                filings=filings,
-                rates=all_rates,
-                source=source,
-                clock=clock,
-                dry_run=dry_run,
-                rebuild_statement_facts=rebuild_statement_facts,
-                rebuild_filing_events=rebuild_filing_events,
-                rebuild_classifications=rebuild_classifications,
-                restamp=restamp,
-                on_restamp=restamped.append,
-                restamp_window_ok=window_ok,
-                assets=lambda: assets_source(s, clock),
+            # Only the scheduled job's shape pings its check: a one-source, dry, restamp
+            # or rebuild run must not report the 18:30 job as done (#2155).
+            scheduled_shape = (
+                source == "all"
+                and not dry_run
+                and restamp is None
+                and not (
+                    rebuild_statement_facts or rebuild_filing_events or rebuild_classifications
+                )
             )
+            try:
+                result = ingest_session(
+                    s,
+                    prices=prices,
+                    filings=filings,
+                    rates=all_rates,
+                    source=source,
+                    clock=clock,
+                    dry_run=dry_run,
+                    rebuild_statement_facts=rebuild_statement_facts,
+                    rebuild_filing_events=rebuild_filing_events,
+                    rebuild_classifications=rebuild_classifications,
+                    restamp=restamp,
+                    on_restamp=restamped.append,
+                    restamp_window_ok=window_ok,
+                    assets=lambda: assets_source(s, clock),
+                )
+            except Exception:
+                if scheduled_shape:
+                    heartbeat.ping(s, "ingest", ok=False)  # off-Mac dead-man's switch (#2155)
+                raise
+            if scheduled_shape:
+                heartbeat.ping(s, "ingest", ok=result.exit_code == 0)
         _print_result(result)
         for done in restamped:
             _print_restamp(done, committed=result.ok and not dry_run)
@@ -4219,13 +4237,18 @@ def make_app(
         for every book with an open window (spec req 7; the scheduler's job)."""
         chosen = _checked_book(book)
         s = paper_settings()
-        paper_schema_gate(s)
+        try:
+            paper_schema_gate(s)
+        except (Exception, typer.Exit):
+            heartbeat.ping(s, "paper", ok=False)
+            raise
         if chosen is None:
             try:
                 runs = paper_run.every_book_run(
                     s, write_chunk(s), lambda b: broker(s, clock, b), clock
                 )
             except Exception as exc:
+                heartbeat.ping(s, "paper", ok=False)
                 raise _fail(
                     _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
                 ) from exc
@@ -4246,6 +4269,7 @@ def make_app(
                     continue
                 _run_lines(prefix, entry.outcome, s)
             codes = [entry.exit_code for entry in runs]
+            heartbeat.ping(s, "paper", ok=not any(codes))  # off-Mac dead-man's switch (#2155)
             if WRITE_FAILED_EXIT_CODE in codes:
                 raise typer.Exit(WRITE_FAILED_EXIT_CODE)
             if any(codes):
@@ -4255,11 +4279,16 @@ def make_app(
             outcome = paper_run.tracking_run(
                 s, write_chunk(s), broker(s, clock, chosen), clock, book_id=chosen
             )
+        except SystemExit:  # the write-failure exit (3) passes through, with a /fail ping
+            heartbeat.ping(s, "paper", ok=False)
+            raise
         except Exception as exc:
+            heartbeat.ping(s, "paper", ok=False)
             raise _fail(
                 _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
             ) from exc
         _run_lines("paper run", outcome, s)
+        heartbeat.ping(s, "paper", ok=not outcome.exit_code)
         if outcome.exit_code:
             raise typer.Exit(outcome.exit_code)
 
