@@ -299,6 +299,7 @@ _DECISION_EVENT_REASONS = (
     "skip_asset_unknown",
     "skip_not_fractionable",
     *_SHORT_SKIP_REASONS,
+    "skip_restricted",
 )
 
 
@@ -363,7 +364,7 @@ def test_a_misspelt_decision_event_reason_is_refused(
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGER_RECEIPT_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_BREAKS_VERSION + 1
 
 
 def test_fresh_init_records_version_17(journal: duckdb.DuckDBPyConnection) -> None:
