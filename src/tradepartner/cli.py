@@ -1601,11 +1601,16 @@ def _run_lines(prefix: str, outcome: paper_run.RunOutcome, settings: Settings) -
         _echo_scrubbed(f"  {note}", settings)
 
 
+def replace_wait(s: Settings, seconds: int) -> Settings:
+    """`s` with `store.lock_retry_seconds` set to `seconds`."""
+    store = s.store.model_copy(update={"lock_retry_seconds": seconds})
+    return s.model_copy(update={"store": store})
+
+
 def _writer_settings(s: Settings) -> Settings:
     """`s` with the longer `store.writer_lock_retry_seconds` as the lock wait: the
     scheduled writers (`paper run`, `paper kill`, `ingest`) out-wait a long reader (#2178)."""
-    store = s.store.model_copy(update={"lock_retry_seconds": s.store.writer_lock_retry_seconds})
-    return s.model_copy(update={"store": store})
+    return replace_wait(s, s.store.writer_lock_retry_seconds)
 
 
 _HOLDER_RE = re.compile(r"held in (.+?)\s*\(PID (\d+)\)")
@@ -1614,10 +1619,9 @@ _HOLDER_RE = re.compile(r"held in (.+?)\s*\(PID (\d+)\)")
 def _lock_holder(exc: BaseException) -> str:
     """Who holds the store, as far as the lock error says: DuckDB's process and PID,
     else a plain "an unidentified process"."""
-    cause = exc.__cause__ or exc
-    found = _HOLDER_RE.search(str(cause))
+    found = _HOLDER_RE.search(str(exc))
     if found is not None:
-        return f"{found.group(1)}, pid {found.group(2)}"
+        return f"{Path(found.group(1)).name}, pid {found.group(2)}"
     if "already open in this process" in str(exc):
         return "another connection in this process"
     return "an unidentified process"
@@ -4350,8 +4354,18 @@ def make_app(
         def kill_one(target: str) -> int:
             """`window.kill`, a busy store made plain: nothing is engaged, say so (#2178)."""
             try:
+                with open_for_write(replace_wait(s, 0)):
+                    pass  # a probe: is the store free right now?
+            except StoreLockedError as busy:
+                typer.echo(
+                    "paper kill: kill switch NOT engaged yet: store busy "
+                    f"(held by {_lock_holder(busy)}), waiting up to "
+                    f"{s.store.lock_retry_seconds} s",
+                    err=True,
+                )
+            try:
                 return window.kill(s, write_chunk(s), clock, reason, book_id=target)
-            except (LockHeld, StoreLockedError) as exc:
+            except StoreLockedError as exc:
                 raise window.KillWriteFailed(
                     "kill switch NOT engaged: store busy "
                     f"(held by {_lock_holder(exc)}); retry, or stop the reader"

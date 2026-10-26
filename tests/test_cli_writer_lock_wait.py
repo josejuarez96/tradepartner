@@ -92,7 +92,9 @@ def test_paper_kill_that_cannot_get_the_store_says_not_engaged(
     before = _engaged_rows()
     with _reader_holds(_settings().store.path, seconds=30):
         out = _paper(clock, factory, "kill", "--reason", LONG_REASON)
-    assert out.exit_code != 0
+    assert out.exit_code == cli.WRITE_FAILED_EXIT_CODE
+    assert "kill switch NOT engaged yet: store busy" in out.output
+    assert "waiting up to 1 s" in out.output
     assert "kill switch NOT engaged: store busy (held by " in out.output, out.output
     assert "retry, or stop the reader" in out.output
     assert _engaged_rows() == before
