@@ -235,6 +235,115 @@ def test_a_tagged_credit_far_above_the_position_value_halts(
     _halts_on_cash(journal_settings, fake, open_window, fixed_clock, later)
 
 
+def _paid_later(
+    settings: Settings,
+    broker: BookedFake,
+    window: PaperWindowRow,
+    clock: FixedClock,
+    amount: float,
+    *,
+    already: float = 0.0,
+    activity_type: str = "MA",
+) -> date:
+    """The reconcile two sessions after the removal, `amount` credited with a tagged
+    activity beside the `already` credited on the removal session."""
+    later = _later(S, 2)
+    _at(clock, later)
+    broker.extra_cash = already + amount
+    broker.activities.append(_credit("MTUM", amount, later, activity_type))
+    return later
+
+
+def test_a_credit_at_the_premium_cap_is_booked(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The cap is quantity x last close x (1 + `risk.delisting_cash_max_premium`, 0.10):
+    10 x 132.75 x 1.10 = 1,460.25 passes (the next test: 50 cents more halts)."""
+    _removed_on_s(journal_settings, fake, open_window, fixed_clock)
+    cap = 10 * _reference(journal_settings, MTUM) * 1.10  # 1,460.25
+    later = _paid_later(journal_settings, fake, open_window, fixed_clock, cap)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, session=later).status == OK
+
+
+def test_a_credit_just_over_the_premium_cap_halts(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _removed_on_s(journal_settings, fake, open_window, fixed_clock)
+    cap = 10 * _reference(journal_settings, MTUM) * 1.10
+    later = _paid_later(journal_settings, fake, open_window, fixed_clock, cap + 0.5)
+    _halts_on_cash(journal_settings, fake, open_window, fixed_clock, later)
+
+
+def _partly_paid_on_s(
+    settings: Settings, broker: BookedFake, window: PaperWindowRow, clock: FixedClock
+) -> None:
+    """Hold 10 MTUM, remove it on S and credit 400 the same session."""
+    broker.activities.append(FUNDING)
+    run_id = _hold(settings, broker, window, {(MTUM, "MTUM"): 10.0})
+    _delisting(settings, MTUM, CUT - timedelta(days=1))
+    broker.extra_quantity["MTUM"] = -10.0
+    broker.extra_cash = 400.0
+    broker.activities.append(_credit("MTUM", 400.0, S))
+    assert _reconcile(settings, broker, window, clock, run_id=run_id).status == OK
+
+
+def test_a_late_credit_is_capped_by_the_cash_already_booked(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """400 came with the removal, so the late credit may take 1,460.25 - 400 = 1,060.25."""
+    _partly_paid_on_s(journal_settings, fake, open_window, fixed_clock)
+    later = _paid_later(journal_settings, fake, open_window, fixed_clock, 1_060.25, already=400.0)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, session=later).status == OK
+    assert _kinds(journal_settings, open_window)[-1] == ("corporate_action_cash", None, 1_060.25)
+
+
+def test_a_late_credit_past_the_cash_already_booked_halts(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _partly_paid_on_s(journal_settings, fake, open_window, fixed_clock)
+    later = _paid_later(journal_settings, fake, open_window, fixed_clock, 1_061.25, already=400.0)
+    _halts_on_cash(journal_settings, fake, open_window, fixed_clock, later)
+
+
+def test_a_tender_offer_credit_is_booked(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """`VOF` (a tender offer's cash) is accepted."""
+    _removed_on_s(journal_settings, fake, open_window, fixed_clock)
+    later = _paid_later(
+        journal_settings, fake, open_window, fixed_clock, 1_000.0, activity_type="VOF"
+    )
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, session=later).status == OK
+
+
+def test_a_name_change_credit_halts(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _removed_on_s(journal_settings, fake, open_window, fixed_clock)
+    later = _paid_later(
+        journal_settings, fake, open_window, fixed_clock, 1_000.0, activity_type="NC"
+    )
+    _halts_on_cash(journal_settings, fake, open_window, fixed_clock, later)
+
+
 def test_no_cash_within_the_window_is_recorded_once_and_never_halts(
     journal_settings: Settings,
     fake: BookedFake,  # noqa: F811

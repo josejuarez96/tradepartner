@@ -190,7 +190,12 @@ _CASH_IN_LIEU = "CIL"
 _DIVIDEND_TYPES = frozenset(
     {"DIV", "DIVCGL", "DIVCGS", "DIVNRA", "DIVROC", "DIVTW", "DIVFEE", "DIVTXEX"}
 )
-_CORPORATE_ACTION_TYPES = frozenset({"SSP", "SSO", "MA", "NC", "SC", "REORG"})
+_CORPORATE_ACTION_TYPES = frozenset({"SSP", "SSO", "MA", "NC", "SC", "REORG", "VOF"})
+#: The activity types a delisted holding's late cash is accepted as (#411): a
+#: merger or reorganisation payment, or a tender offer's fulfilment (`VOF`). `NC`
+#: and `SC` (name and symbol change) never carry cash and no adapter or fixture
+#: shows one that does, so they are not taken.
+_DELISTING_CASH_TYPES = frozenset({"MA", "REORG", "VOF"})
 
 
 def _cash_bound(cash_tolerance: float, fills_since_base: int) -> Decimal:
@@ -605,19 +610,19 @@ def _delisting_credits(
     explanations: Explanations,
     activities: Sequence[CashActivity],
     bound: Decimal,
-    buffer: float,
+    premium: float,
     security_of: Mapping[str, str],
 ) -> tuple[list[ProposedAdjustment], list[tuple[str, DelistedCash]]]:
     """The cash-only `corporate_action_cash` rows for the broker credits tagged to
     a removed delisted holding's symbol while its window is open (#411), and the
     holdings whose window has ended unpaid (`overdue`).
 
-    A credit is an `executed` corporate-action activity (`_CORPORATE_ACTION_TYPES`)
+    A credit is an `executed` `MA`, `REORG` or `VOF` activity (`_DELISTING_CASH_TYPES`)
     with a positive `net_amount`, the holding's symbol, a date on or after the
     removal and an id not yet inside the base. It is booked as the position's
     proceeds, keyed by its activity id. The holding's credits together (with the
     cash booked so far) may not exceed the removed quantity x reference price x
-    (1 + `risk.whole_share_price_buffer`) plus the cash bound: a larger one is
+    (1 + `risk.delisting_cash_max_premium`) plus the cash bound: a larger one is
     left in the cash difference and halts, as any unexplained cash does."""
     rows: list[ProposedAdjustment] = []
     overdue: list[tuple[str, DelistedCash]] = []
@@ -631,7 +636,7 @@ def _delisting_credits(
             a
             for a in activities
             if a.symbol == symbol
-            and a.activity_type in _CORPORATE_ACTION_TYPES
+            and a.activity_type in _DELISTING_CASH_TYPES
             and a.status == _EXECUTED
             and a.net_amount is not None
             and a.net_amount > 0
@@ -640,7 +645,7 @@ def _delisting_credits(
         ]
         total = Decimal(str(math.fsum(a.net_amount or 0.0 for a in credits)))
         price = explanations.reference_prices.get(name, 0.0)
-        cap = Decimal(str(item.removed_quantity * price * (1 + buffer) - item.journaled_cash))
+        cap = Decimal(str(item.removed_quantity * price * (1 + premium) - item.journaled_cash))
         if not credits or total > max(cap, Decimal(0)) + bound:
             continue
         rows += [
@@ -827,7 +832,7 @@ def compare(
 
     # --- a removed delisted holding's late cash, tagged to its symbol (#411) ---
     delisting_proposals, overdue = _delisting_credits(
-        explanations, activities, cash_bound, buffer, security_of
+        explanations, activities, cash_bound, frozen.delisting_cash_max_premium, security_of
     )
     for credit in delisting_proposals:
         difference_decimal -= Decimal(str(credit.cash))

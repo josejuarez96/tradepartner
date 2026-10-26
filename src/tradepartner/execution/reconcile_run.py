@@ -286,12 +286,14 @@ def frozen_risk(window: PaperWindowRow) -> RiskConfig:
     risk = {k[len(_RISK_PREFIX) :]: v for k, v in parsed.items() if k.startswith(_RISK_PREFIX)}
     # A window frozen before T202 has no `risk.max_skip_share`: read it as 0, so the
     # skip cap stays max(max_skips_per_run, 0) (paper spec amendment 2026-10-18 item 3).
-    # It and the merger lag below are the two keys back-filled; every other missing
-    # key still refuses.
+    # It, the merger lag and the delisting-cash premium are the keys back-filled;
+    # every other missing key still refuses.
     risk.setdefault("max_skip_share", 0.0)
     # A window frozen before T249 has no `risk.reconcile_merger_lag_sessions`: read
     # it at its default (paper spec amendment #1762 item 10).
     risk.setdefault("reconcile_merger_lag_sessions", _DEFAULT_RISK.reconcile_merger_lag_sessions)
+    # A window frozen before #411 has no `risk.delisting_cash_max_premium`: same.
+    risk.setdefault("delisting_cash_max_premium", _DEFAULT_RISK.delisting_cash_max_premium)
     missing = sorted(set(RiskConfig.model_fields) - set(risk))
     if missing:
         raise ValueError(f"window {window.window_id} frozen_json lacks risk keys {missing}")
@@ -663,12 +665,13 @@ def _explanations(
     )
     order_symbols = {o.security_id: o.symbol for o in state.orders}
     current = current_listings(listing_ends_as_of(conn, cut, settings), session)
+    stated = _ledger(state, actions, window, through, tolerance)
     mergers, merger_conflicts, acquirers = _mergers(
         conn,
         state,
         names,
         session,
-        _ledger(state, actions, window, through, tolerance),
+        stated,
         tolerance,
         merger_lag_sessions,
         cash_tolerance,
@@ -717,7 +720,7 @@ def _explanations(
             mergers,
             session,
             merger_lag_sessions,
-            _ledger(state, actions, window, through, tolerance),
+            stated,
             tolerance,
         ),
     )
@@ -748,9 +751,9 @@ def _delisted_cash(
             merger_names.add(name)
         elif adjustment.quantity is not None and adjustment.quantity < 0:
             current = removals.get(name)
-            if current is None or (adjustment.session, adjustment.known_at) > (
+            if current is None or (adjustment.session, adjustment.adjustment_id or 0) > (
                 current.session,
-                current.known_at,
+                current.adjustment_id or 0,
             ):
                 removals[name] = adjustment
     found: dict[str, DelistedCash] = {}
@@ -769,7 +772,7 @@ def _delisted_cash(
             and a.kind == _CORPORATE_ACTION_CASH
             and a.quantity is None
             and a.session >= removal.session
-            and _delisting_cash(a)
+            and is_delisting_cash(a)
         ]
         journaled = math.fsum([removal.cash or 0.0, *(a.cash or 0.0 for a in late)])
         end = removal.session
@@ -779,7 +782,7 @@ def _delisted_cash(
         noted = any(
             m.get("security_id") == name and m.get("reason") == OVERDUE_DELISTING_CASH
             for row in state.rows
-            for m in _row_allowed(row)
+            for m in allowed_of(row.mismatches_json)
         )
         found[name] = DelistedCash(
             removed_quantity=-(removal.quantity or 0.0),
@@ -791,7 +794,7 @@ def _delisted_cash(
     return found
 
 
-def _delisting_cash(adjustment: AdjustmentRow) -> bool:
+def is_delisting_cash(adjustment: AdjustmentRow) -> bool:
     """Whether an adjustment's `explanation_json` marks it a delisting's late cash."""
     try:
         payload = json.loads(adjustment.explanation_json or "{}")
@@ -800,12 +803,13 @@ def _delisting_cash(adjustment: AdjustmentRow) -> bool:
     return isinstance(payload, dict) and payload.get("delisting_cash") is True
 
 
-def _row_allowed(row: ReconciliationRow) -> list[dict[str, Any]]:
-    """The `allowed` entries a reconciliation row recorded (empty when none or unreadable)."""
-    if row.mismatches_json is None:
+def allowed_of(mismatches_json: str | None) -> list[dict[str, Any]]:
+    """The `allowed` entries a reconciliation row's `mismatches_json` recorded (empty
+    when none or unreadable)."""
+    if mismatches_json is None:
         return []
     try:
-        payload = json.loads(row.mismatches_json)
+        payload = json.loads(mismatches_json)
     except (ValueError, TypeError):
         return []
     found = payload.get("allowed") if isinstance(payload, dict) else None
@@ -1331,9 +1335,10 @@ def reconcile_now(
         )
         activity_sessions = {a.activity_id: a.date for a in activities}
         for adjustment in result.adjustments:
-            # A booked `fee_cash` is stated on its own activity date (the broker
-            # fee's trade date), not the reconciliation session, so the ledger
-            # applies it from the session it belongs to (#1583, T183).
+            # A row keyed by a broker activity (a booked `fee_cash`, a `cash_in_lieu`,
+            # a delisting's late cash) is stated on the activity's own date, not the
+            # reconciliation session, so the ledger applies it from the session it
+            # belongs to (#1583, T183; #411).
             fee_date = (
                 activity_sessions.get(adjustment.broker_activity_id)
                 if adjustment.broker_activity_id is not None
