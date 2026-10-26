@@ -299,7 +299,7 @@ def test_render_marks_a_stale_store(monkeypatch: pytest.MonkeyPatch, store_path:
     at = _app(monkeypatch, store_path, now=later)
     assert not at.exception
     assert "stale: 4 sessions" in _text(at)
-    assert "Not fine for the next paper run" in _text(at)
+    assert "4 sessions behind" in _text(at)
     assert "expected until" not in _text(at)
     assert ":orange-badge[" in _text(at)
     assert "stale:" not in _text(_app(monkeypatch, store_path))
@@ -691,11 +691,11 @@ def test_render_says_the_one_session_gap_is_expected_before_the_ingest(
 ) -> None:
     before_ingest = session_close(date(2020, 7, 1)) + timedelta(hours=1)
     text = _text(_app(monkeypatch, store_path, now=before_ingest))
-    assert "Fine for the next paper run once tonight's 18:30 ET ingest" in text
+    assert "expected until tonight's 18:30 ET ingest" in text
     assert "stale: 1 session (expected until the 18:30 ET ingest)" in text
 
 
 def test_render_leads_with_a_fine_verdict_on_a_current_store(
     monkeypatch: pytest.MonkeyPatch, store_path: Path
 ) -> None:
-    assert "Fine for the next paper run" in _text(_app(monkeypatch, store_path))
+    assert "Data: checks pass" in _text(_app(monkeypatch, store_path))
