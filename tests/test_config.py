@@ -3219,3 +3219,18 @@ def test_a_negative_borrow_rate_is_refused(override: dict[str, object]) -> None:
     """A negative fee would pay the short book to hold its positions."""
     with pytest.raises(ValueError, match="borrow"):
         CostsConfig(**override)  # type: ignore[arg-type]
+
+
+def test_ui_keys_default_and_validate() -> None:
+    """T273 (#2170): display-only keys for the Home page."""
+    ui = _settings().ui
+    assert (ui.next_run_time_et, ui.holdings_rows) == ("08:05", 5)
+    for bad in ("8:05", "24:00", "08:60", "0805", "", "08:05 ET"):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"next_run_time_et": bad})
+    for rows in (0, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"holdings_rows": rows})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, ui={"unknown": 1})
+    assert Settings(_env_file=None, ui={"next_run_time_et": "23:59"}).ui.next_run_time_et == "23:59"

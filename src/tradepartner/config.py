@@ -2451,6 +2451,27 @@ class DashboardConfig(BaseModel):
     page_row_limit: int = Field(default=500, gt=0)
 
 
+class UiConfig(_ClosedConfig):
+    """What the Home and Book pages show (plan T273, #2170); display only, nothing
+    here reaches a run.
+
+    `next_run_time_et` is the clock time (HH:MM, America/New_York) the status line
+    says the next run happens: the schedule itself lives in launchd
+    (docs/runbooks/scheduling.md), so this is text to keep beside it. `holdings_rows`
+    is how many names a book card lists.
+    """
+
+    next_run_time_et: str = "08:05"
+    holdings_rows: int = Field(default=5, gt=0)
+
+    @field_validator("next_run_time_et")
+    @classmethod
+    def _hh_mm(cls, value: str) -> str:
+        if re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", value) is None:
+            raise ValueError("ui.next_run_time_et must be HH:MM on a 24-hour clock")
+        return value
+
+
 # The 8-K items a packet keeps, in priority order (research-labeling amendment
 # 2026-10-06 C2 and E14; owner decision 2026-10-06 question 5).
 _DEFAULT_EIGHTK_ITEMS = ("3.01", "2.01", "1.03", "5.01", "3.03", "1.01", "8.01")
@@ -2614,6 +2635,8 @@ class Settings(BaseSettings):
     # T219 (backtest spec amendment #1872): the signed-book section, after the other
     # appended sections for the same reason.
     portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
+    # T273 (#2170): the Home page's display keys, last so no other section shifts.
+    ui: UiConfig = Field(default_factory=UiConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
