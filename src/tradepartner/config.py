@@ -2471,10 +2471,21 @@ class UiConfig(_ClosedConfig):
     says the next run happens: the schedule itself lives in launchd
     (docs/runbooks/scheduling.md), so this is text to keep beside it. `holdings_rows`
     is how many names a book card lists.
+
+    The Book page's "Stop this book now" (plan T277, #2268; ADR 0018 section 2 and
+    its 2026-10-26 amendment): `max_reason_chars` caps the typed reason (as the
+    web app's `webapp.max_reason_chars`); the page waits on the `paper kill`
+    subprocess for `kill_wait_seconds`, which `None` makes
+    `store.writer_lock_retry_seconds` plus `kill_wait_margin_seconds` (interpreter
+    start plus one retry delay). A set value must exceed that sum, or a kill still
+    waiting on the store would be reported as not confirmed (`Settings`, at load).
     """
 
     next_run_time_et: str = "08:05"
     holdings_rows: int = Field(default=5, gt=0)
+    max_reason_chars: int = Field(default=500, gt=0)
+    kill_wait_seconds: int | None = Field(default=None, gt=0)
+    kill_wait_margin_seconds: int = Field(default=30, gt=0)
 
     @field_validator("next_run_time_et")
     @classmethod
@@ -2709,6 +2720,20 @@ class Settings(BaseSettings):
         self._validate_lab_sweepable_keys()
         # Also a plain attribute read and raise, for the same reason (T243).
         self._validate_check_only_symbols()
+        # And again (T277): the kill wait needs `store` and `ui` together.
+        self._validate_kill_wait()
+
+    def _validate_kill_wait(self) -> None:
+        """A set `ui.kill_wait_seconds` must exceed `paper kill`'s worst-case store
+        wait (`store.writer_lock_retry_seconds`) plus `ui.kill_wait_margin_seconds`
+        (ADR 0018, amendment 2026-10-26)."""
+        floor = self.store.writer_lock_retry_seconds + self.ui.kill_wait_margin_seconds
+        if self.ui.kill_wait_seconds is not None and self.ui.kill_wait_seconds <= floor:
+            raise ValueError(
+                f"ui.kill_wait_seconds ({self.ui.kill_wait_seconds}) must be above "
+                f"store.writer_lock_retry_seconds plus ui.kill_wait_margin_seconds ({floor}): "
+                "a shorter bound reports a kill still waiting on the store as not confirmed"
+            )
 
     def _validate_check_only_symbols(self) -> None:
         """`index_check.check_only_symbols` may not overlap `benchmarks` (backtest
@@ -2768,6 +2793,15 @@ class Settings(BaseSettings):
                     "store) would reach nobody (#366 Q22 (iii), #544). Set the "
                     "missing variable(s), add 'macos', or remove 'email'."
                 )
+
+
+def kill_wait_seconds(settings: Settings) -> int:
+    """How long the Book page waits on a `paper kill` subprocess (`UiConfig`):
+    `ui.kill_wait_seconds`, or by default `store.writer_lock_retry_seconds` plus
+    `ui.kill_wait_margin_seconds`."""
+    if settings.ui.kill_wait_seconds is not None:
+        return settings.ui.kill_wait_seconds
+    return settings.store.writer_lock_retry_seconds + settings.ui.kill_wait_margin_seconds
 
 
 def get_settings() -> Settings:

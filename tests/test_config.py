@@ -46,6 +46,7 @@ from tradepartner.config import (
     _default_env_file,
     _settings_has_key,
     clean_message,
+    kill_wait_seconds,
     paper_key_variable_names,
     parse_reference_name,
     render_validation_errors,
@@ -3281,3 +3282,42 @@ def test_ui_keys_default_and_validate() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, ui={"unknown": 1})
     assert Settings(_env_file=None, ui={"next_run_time_et": "23:59"}).ui.next_run_time_et == "23:59"
+
+
+def test_ui_kill_keys_default_and_validate() -> None:
+    """T277 (#2268): the Stop button's reason cap and its wait on `paper kill`."""
+    s = _settings()
+    assert (s.ui.max_reason_chars, s.ui.kill_wait_seconds, s.ui.kill_wait_margin_seconds) == (
+        500,
+        None,
+        30,
+    )
+    assert kill_wait_seconds(s) == s.store.writer_lock_retry_seconds + 30 == 330
+    for key in ("max_reason_chars", "kill_wait_margin_seconds", "kill_wait_seconds"):
+        for bad in (0, -1):
+            with pytest.raises(ValidationError):
+                Settings(_env_file=None, ui={key: bad})
+
+
+def test_ui_kill_wait_seconds_must_exceed_the_kill_store_wait_by_the_margin() -> None:
+    """ADR 0018's 2026-10-26 amendment: a caller's bound on `paper kill` must exceed
+    its worst-case store wait (`store.writer_lock_retry_seconds`) by a margin, or a
+    kill still waiting is reported as not confirmed; a set value not above the two
+    together is refused at load."""
+    valid = Settings(
+        _env_file=None, store={"writer_lock_retry_seconds": 100}, ui={"kill_wait_seconds": 131}
+    )
+    assert kill_wait_seconds(valid) == 131
+    for refused in (130, 100, 1):
+        with pytest.raises(ValueError, match=r"ui\.kill_wait_seconds"):
+            Settings(
+                _env_file=None,
+                store={"writer_lock_retry_seconds": 100},
+                ui={"kill_wait_seconds": refused},
+            )
+    margin = Settings(
+        _env_file=None,
+        store={"writer_lock_retry_seconds": 100},
+        ui={"kill_wait_margin_seconds": 50},
+    )
+    assert kill_wait_seconds(margin) == 150
