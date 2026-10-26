@@ -1402,8 +1402,9 @@ def abandon(
     book_id: str | None = None,
 ) -> AbandonResult:
     """`paper abandon --reason`, owner-only (module docstring; #247 Q13).
-    Raises `WindowCommandRefused` for a blank reason, no open window or an
-    open order of the window (before any broker call or write),
+    Raises `WindowCommandRefused` for a blank reason, no open window, an
+    open order of the window or a broker on another account (`ACCOUNT_MISMATCH`,
+    #2187; all before any write),
     `LockHeld` while another process holds the run lock, `ClockError` for a
     bad clock reading, and whatever the broker or the store raises (nothing
     but the reconciliation row is then written, plus a `fault` engagement
@@ -1420,6 +1421,13 @@ def abandon(
                 OPEN_ORDERS,
                 "cancel or wait for the window's own open orders, run paper resume so "
                 "the journal collects them, then abandon: " + "; ".join(still_open),
+            )
+        account = broker.account()
+        if account.account_id != window.account_id:
+            raise WindowCommandRefused(
+                ACCOUNT_MISMATCH,
+                f"the broker's account {account.account_id!r} is not window "
+                f"{window_id}'s {window.account_id!r}",
             )
         frozen = frozen_risk(window)
         now = _command_clock(clock)
@@ -1883,8 +1891,10 @@ def settle_order(
     `paper.min_override_reason_chars`) and `not_engaged` (the derived switch),
     each before any broker call or write; one clock reading; then `account`
     (`account_mismatch` when its id is not the window's), `get_order`,
-    `open_orders`, `fills(since)` (`since` = the order's `pending` event's
-    `known_at` minus `paper.fill_read_overlap_seconds`) and `positions`, and a
+    `open_orders`, `fills(since)` (`since` reaches back from the order's
+    `pending` event's `known_at` to the broker's `submitted_at`, with
+    `paper.fill_read_overlap_seconds`, floored at the window start minus the
+    overlap) and `positions`, and a
     `get_order` per other non-terminal order of the window on the same
     `security_id`. It refuses `broker_open` (a non-terminal reading, or the id
     listed open), `unjournaled_fill` (a fill of the order in the stream whose
@@ -1927,7 +1937,13 @@ def settle_order(
         except UnknownOrderError:
             reading = None
         open_ids = sorted(o.client_order_id for o in broker.open_orders())
-        since = target.pending_at - timedelta(seconds=settings.paper.fill_read_overlap_seconds)
+        overlap = timedelta(seconds=settings.paper.fill_read_overlap_seconds)
+        since = target.pending_at - overlap
+        if reading is not None:
+            # The broker filters fills on its own clock. Our pending stamp may
+            # run ahead of its submitted_at and otherwise hide a real fill.
+            broker_since = max(reading.submitted_at - overlap, window.started_at - overlap)
+            since = min(since, broker_since)
         stream = broker.fills(since)
         positions = broker.positions()
         others: list[tuple[str, Order | None]] = []

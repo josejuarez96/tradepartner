@@ -19,7 +19,9 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import duckdb
 import httpx
@@ -508,13 +510,13 @@ PAPER_OPTIONS = {
     "kill": {"--reason", "--book", "--all"},
     "resume": {"--reason", "--accept-broker-fills", "--accept-rejections", "--book"},
     "report": {"--book"},
-    "check": {"--book"},
+    "check": {"--book", "--verbose"},
     "status": {"--book", "--all"},
     "abandon": {"--reason", "--book"},
     "settle": {"--order", "--reason", "--book"},
     "override": {"--kind", "--session", "--name", "--reason", "--book"},
     "lots-reconcile": {"--export", "--tax-year", "--book"},
-    "shakedown": set(),
+    "shakedown": {"--verbose"},
 }
 
 
@@ -1732,7 +1734,7 @@ def test_settle_order_is_never_read_from_an_auto_envvar() -> None:
 #: `month_end`, H1's output must not change by a byte.
 STATUS_MAIN = (
     "window 1 (first rebalance 2026-10-30)\n"
-    "as of 2026-10-01 14:00:00+00:00; last updated n/a; STALE: no run for S-1\n"
+    "as of 2026-10-01 10:00 ET (14:00 UTC); last updated n/a; STALE: no run for S-1\n"
     "positions 0 (value 0.00); open orders 0; targets 0\n"
     "kill switch released (causes: -)\n"
     "reconciliation n/a\n"
@@ -1741,6 +1743,12 @@ STATUS_MAIN = (
     "alerts (0):\n"
 )
 CHECK_MAIN = (
+    "FAIL rebalance_count: 0 of 6 rebalance sessions done so far, about 6 months to go\n"
+    "FAIL tracking: no paper_reports row yet\n"
+    "PASS chain: no incomplete chain once due\n"
+    "PASS override_reason: every override reason meets the frozen minimum\n"
+)
+CHECK_MAIN_VERBOSE = (
     "FAIL rebalance_count: 0 scheduler-executed rebalance session(s) [], need >= 6 "
     "(query: distinct rebalance_events.rebalance_session with status='executed' whose "
     "writing paper_runs row has invoked_by='scheduler')\n"
@@ -1776,6 +1784,8 @@ def test_status_and_check_for_main_are_byte_identical(
     check = _paper(clock, factory, "check", *flags)
     assert (status.exit_code, status.output) == (0, STATUS_MAIN)
     assert (check.exit_code, check.output) == (1, CHECK_MAIN)
+    verbose = _paper(clock, factory, "check", *flags, "--verbose")
+    assert (verbose.exit_code, verbose.output) == (1, CHECK_MAIN_VERBOSE)
 
 
 @pytest.mark.usefixtures("started")
@@ -1831,13 +1841,86 @@ def test_status_all_prints_one_summary_line_per_book(
     b_window = _open_book_b()
     out = _paper(clock, factory, "status", "--all")
     assert out.exit_code == 0, out.output
+    nxt = "next rebalance 2026-10-30 (data day; trades the next session)\n"
     assert out.output == (
-        f"book b: window {b_window} open; positions 0; open orders 0; kill switch released; "
-        "last run n/a; next rebalance 2026-10-30\n"
-        "book main: window 1 open; positions 0; open orders 0; kill switch released; "
-        "last run n/a; next rebalance 2026-10-30\n"
+        "b: trading, 0 issues\n"
+        "main: trading, 0 issues\n"
         "waiting on you: nothing\n"
+        f"book b: window {b_window} open; positions 0; open orders 0; kill switch released; "
+        f"last run n/a; {nxt}"
+        f"book main: window 1 open; positions 0; open orders 0; kill switch released; "
+        f"last run n/a; {nxt}"
     )
+
+
+def _overdue_delisting_rows(*, paid: bool = False) -> None:
+    """Window 1: ACA removed on 2026-10-01 with no cash; a reconciliation after the
+    window recorded `overdue delisting cash` for it (#411); `paid` adds the late cash."""
+    at = datetime(2026, 10, 9, 14, tzinfo=UTC)
+    allowed = [{"reason": "overdue delisting cash", "difference": 3.356, "security_id": "ACA"}]
+    with open_for_write(_settings()) as conn:
+        journal.append(
+            conn,
+            journal.AdjustmentRow(
+                window_id=1,
+                session=date(2026, 10, 1),
+                kind="corporate_action_cash",
+                security_id="ACA",
+                quantity=-3.356,
+                cash=0.0,
+                explanation_json=json.dumps({"explanation": "listing ended"}),
+                known_at=at,
+                ingested_at=at,
+            ),
+        )
+        if paid:
+            journal.append(
+                conn,
+                journal.AdjustmentRow(
+                    window_id=1,
+                    session=date(2026, 10, 10),
+                    kind="corporate_action_cash",
+                    security_id="ACA",
+                    cash=100.0,
+                    explanation_json=json.dumps({"delisting_cash": True}),
+                    known_at=at,
+                    ingested_at=at,
+                ),
+            )
+        journal.append(
+            conn,
+            journal.ReconciliationRow(
+                window_id=1,
+                at=at,
+                status="ok",
+                broker_cash=1.0,
+                mismatches_json=json.dumps({"mismatches": [], "allowed": allowed}),
+                known_at=at,
+                ingested_at=at,
+            ),
+        )
+
+
+_OVERDUE_LINE = "ACA: delisting cash overdue since 2026-10-01 \u2014 check Alpaca's activity"
+
+
+@pytest.mark.usefixtures("started")
+def test_status_shows_a_delisting_whose_cash_is_overdue(clock: _Clock, factory: _Factory) -> None:
+    _overdue_delisting_rows()
+    out = _paper(clock, factory, "status")
+    assert out.exit_code == 0, out.output
+    assert f"\n{_OVERDUE_LINE}\n" in out.output
+    all_books = _paper(clock, factory, "status", "--all")
+    assert all_books.exit_code == 0, all_books.output
+    assert f"book main; {_OVERDUE_LINE}\n" in all_books.output
+
+
+@pytest.mark.usefixtures("started")
+def test_status_drops_the_overdue_line_once_the_cash_is_booked(
+    clock: _Clock, factory: _Factory
+) -> None:
+    _overdue_delisting_rows(paid=True)
+    assert "delisting cash overdue" not in _paper(clock, factory, "status").output
 
 
 @pytest.mark.usefixtures("started")
@@ -1860,20 +1943,29 @@ def test_status_all_lists_two_waiting_items_byte_for_byte(
                 ),
             )
     before = _sha256(live)
+    nxt = "next rebalance 2026-10-30 (data day; trades the next session)\n"
+    since_et = (
+        f"{SESSION_CLOCK.astimezone(ZoneInfo('America/New_York')):%Y-%m-%d %H:%M} ET "
+        f"({SESSION_CLOCK:%H:%M} UTC)"
+    )
     out = _paper(clock, factory, "status", "--all")
     assert (out.exit_code, out.output) == (
         0,
-        f"book b: window {b_window} open; positions 0; open orders 0; kill switch engaged; "
-        "last run n/a; next rebalance 2026-10-30\n"
-        "book main: window 1 open; positions 0; open orders 0; kill switch engaged; "
-        "last run n/a; next rebalance 2026-10-30\n"
+        "b: halted today; run: tradepartner paper resume --book b "
+        '--reason "<why>"\n'
+        "main: halted today; run: tradepartner paper resume --book main "
+        '--reason "<why>"\n'
         "waiting on you (2):\n"
         f"  book b; kill_switch_engaged: kill switch engaged: kill_switch event 2 engaged "
-        f"(owner); since {SESSION_CLOCK}; command tradepartner paper resume --book b "
+        f"(owner); since {since_et}; command tradepartner paper resume --book b "
         '--reason "<why>"\n'
         f"  book main; kill_switch_engaged: kill switch engaged: kill_switch event 1 engaged "
-        f"(owner); since {SESSION_CLOCK}; command tradepartner paper resume --book main "
-        '--reason "<why>"\n',
+        f"(owner); since {since_et}; command tradepartner paper resume --book main "
+        '--reason "<why>"\n'
+        f"book b: window {b_window} open; positions 0; open orders 0; kill switch engaged; "
+        f"last run n/a; {nxt}"
+        f"book main: window 1 open; positions 0; open orders 0; kill switch engaged; "
+        f"last run n/a; {nxt}",
     )
     assert _sha256(live) == before
 
@@ -1978,15 +2070,14 @@ def test_status_summary_labels_completed_rebalance_and_fill_lag(
                 ),
             )
     out = _paper(clock, factory, "status", "--all")
-    assert f"next rebalance {next_day}" in out.output
+    assert f"next rebalance {next_day} (data day; trades the next session)" in out.output
     expected = "traded today" if has_orders else "ran today with no orders"
     assert f"rebalance {rebalance_day} {expected}" in out.output
     assert f"next rebalance {next_day} (today (done))" not in out.output
-    assert ("Fills are recorded at the next scheduled run" in out.output) == has_orders
-    assert "08:05 ET" not in out.output
+    note = "Orders were sent; fills or rejections are recorded at the next scheduled run (08:05 ET)"
+    assert (note in out.output) == has_orders
     detail = _paper(clock, factory, "status")
-    assert ("Fills are recorded at the next scheduled run" in detail.output) == has_orders
-    assert "08:05 ET" not in detail.output
+    assert (note in detail.output) == has_orders
 
 
 def test_status_all_with_no_window(clock: _Clock, factory: _Factory) -> None:
@@ -2194,7 +2285,12 @@ def _shakedown_line(name: str, passed: bool) -> paper_shakedown.ShakedownLine:
 def test_paper_shakedown_with_no_span_row_fails(clock: _Clock, factory: _Factory) -> None:
     out = _paper(clock, factory, "shakedown")
     assert out.exit_code == 1
-    assert "no shakedown_span decision" in out.output
+    assert "no shakedown span is open yet" in out.output
+    assert "decision shakedown-span" in out.output
+    assert "failed" not in out.output and "ValueError" not in out.output
+    old = _paper(clock, factory, "shakedown", "--verbose")
+    assert old.exit_code == 1
+    assert "failed: ValueError: no shakedown_span decision" in old.output
     assert factory.fake.calls == ()
 
 
@@ -2219,7 +2315,11 @@ def test_paper_shakedown_prints_seven_lines_and_fails_on_an_empty_journal(
     lines = out.output.strip().splitlines()
     assert len(lines) == 7
     assert lines[0].startswith("FAIL E.1 sessions:")
-    assert "sessions >= 10, order sessions >= 5" in lines[0]
+    assert "sessions >= 10, order sessions >= 5" not in lines[0]  # thresholds: --verbose
+    assert "query:" not in lines[0]
+    verbose = _paper(clock, factory, "shakedown", "--verbose")
+    assert "sessions >= 10, order sessions >= 5" in verbose.output.splitlines()[0]
+    assert "query:" in verbose.output.splitlines()[0]
     assert [line.split(":")[0].split(" ", 1)[1] for line in lines] == [
         "E.1 sessions",
         "E.2 reconciliation",
@@ -2309,3 +2409,54 @@ def test_book_reads_that_books_set_while_the_default_reads_main(
         "--book", "ghost", rows=AGREEING,
     )  # fmt: skip
     assert nobook.exit_code == EXIT["no_window"]
+
+
+def _first_line(
+    since: datetime | None,
+    now: datetime,
+    *,
+    others: int = 0,
+    halt_item: bool = True,
+    overdue: int = 0,
+    engaged: bool = True,
+) -> str:
+    """`_book_first_lines` for one book: `others` more waiting items, `overdue`
+    delisting-cash items, and a kill-switch item only when `halt_item`."""
+    item = SimpleNamespace(book_id="main", kind="kill_switch_engaged", since=since, command="CMD")
+    more = [SimpleNamespace(book_id="main", kind="order_lagging")] * others
+    late = [SimpleNamespace(book_id="main")] * overdue
+    row = SimpleNamespace(
+        book_id="main",
+        is_open=True,
+        switch_state=SimpleNamespace(engaged=engaged, run_in_progress=False),
+    )
+    return cli._book_first_lines(  # type: ignore[arg-type]
+        [row], [*([item] if halt_item else []), *more], now, late
+    )[0]
+
+
+def test_first_line_counts_an_overdue_delisting_as_an_issue() -> None:
+    now = datetime(2026, 11, 2, 13, tzinfo=UTC)
+    assert _first_line(None, now, halt_item=False, overdue=1, engaged=False) == (
+        "main: trading, 1 issue"
+    )
+    assert _first_line(None, now, halt_item=False, overdue=2, engaged=False) == (
+        "main: trading, 2 issues"
+    )
+
+
+def test_first_line_engaged_switch_without_a_waiting_item_says_halted_no_command() -> None:
+    now = datetime(2026, 11, 2, 13, tzinfo=UTC)
+    assert _first_line(None, now, halt_item=False) == "main: halted"
+    assert _first_line(None, now, halt_item=False, overdue=1) == "main: halted, 1 other issue"
+
+
+def test_first_line_counts_halt_days_across_the_fall_back() -> None:
+    engaged = datetime(2026, 10, 30, 20, tzinfo=UTC)  # 16:00 ET; clocks fall back 11-01
+    now = datetime(2026, 11, 2, 13, tzinfo=UTC)  # 08:00 ET
+    assert _first_line(engaged, now) == "main: halted 3 days; run: CMD"
+    assert _first_line(engaged, now, others=1) == "main: halted 3 days, 1 other issue; run: CMD"
+
+
+def test_first_line_with_unknown_halt_time_says_only_halted() -> None:
+    assert _first_line(None, datetime(2026, 11, 2, 13, tzinfo=UTC)) == "main: halted; run: CMD"

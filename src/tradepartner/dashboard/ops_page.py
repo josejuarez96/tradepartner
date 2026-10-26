@@ -26,6 +26,8 @@ initialised" pattern): a store with no paper-trading journal yet
 
 from __future__ import annotations
 
+import json
+
 import altair as alt
 import duckdb
 import polars as pl
@@ -207,6 +209,16 @@ def _waiting_card(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
                 st.caption("No command; follow the detail above.")
 
 
+def _overdue_delisting_card(conn: duckdb.DuckDBPyConnection) -> None:
+    """Every open book's delisting cash that never arrived, from stored rows only."""
+    try:
+        items = ops.overdue_delisting_cash(conn)
+    except SchemaVersionError:
+        return  # The outdated-journal panel below explains this store.
+    for item in items:
+        theme.status_badge(f"{item.book_id}: {item.line}", "warning")
+
+
 def _kpis(data: OpsData) -> None:
     assert data.switch_state is not None
     tiles = st.columns(4)
@@ -370,6 +382,49 @@ def _alerts_card(data: OpsData) -> None:
             st.caption("Showing the newest alerts only; the window has more.")
 
 
+_EVENT_LABEL = {
+    "dividend_cash": "Dividend",
+    "corporate_action_cash": "Corporate action cash",
+    "fee_cash": "Fee",
+    "cash_in_lieu": "Cash in lieu of a fractional share",
+    "split": "Split",
+    "stock_dividend": "Stock dividend",
+}
+
+
+def _reconciliation_events(mismatches_json: str) -> list[str]:
+    """Plain lines for the events a reconciliation recorded on holdings: what it
+    explained (dividends, splits, fees), ticker changes, and what it could not."""
+    try:
+        payload = json.loads(mismatches_json)
+    except ValueError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    lines: list[str] = []
+    for entry in payload.get("explained") or []:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind", "event"))
+        label = _EVENT_LABEL.get(kind, kind.replace("_", " ").capitalize())
+        name = entry.get("security_id") or "account"
+        cash = entry.get("cash")
+        amount = f", cash {cash:+,.2f}" if isinstance(cash, int | float) else ""
+        why = f": {entry['explanation']}" if entry.get("explanation") else ""
+        lines.append(f"{label} on {name}{amount}{why}")
+    for entry in payload.get("symbol_changes") or []:
+        if isinstance(entry, dict):
+            lines.append(
+                f"Ticker change on {entry.get('security_id')}: "
+                f"{entry.get('old_symbol')} is now {entry.get('new_symbol')}"
+            )
+    for entry in payload.get("mismatches") or []:
+        if isinstance(entry, dict):
+            name = entry.get("security_id") or entry.get("symbol") or "account"
+            lines.append(f"Needs a look, {entry.get('kind')} on {name}: {entry.get('detail')}")
+    return lines
+
+
 def _reconciliation_card(reconciliation: ReconciliationRow | None) -> None:
     with st.container(border=True):
         st.subheader("Reconciliation")
@@ -381,7 +436,15 @@ def _reconciliation_card(reconciliation: ReconciliationRow | None) -> None:
         if reconciliation.broker_cash is not None:
             st.caption(f"broker cash: {reconciliation.broker_cash:,.2f}")
         if reconciliation.mismatches_json:
-            st.caption(reconciliation.mismatches_json)
+            events = _reconciliation_events(reconciliation.mismatches_json)
+            if events:
+                st.caption("Events on your holdings (dividends, splits, fees, name changes):")
+                for event in events:
+                    st.markdown(f"- {event}")
+            else:
+                st.caption("No events on your holdings in this check.")
+            with st.expander("Raw reconciliation record"):
+                st.code(reconciliation.mismatches_json, language="json")
 
 
 _RISK_STATUS_TEXT = {"within": "within", "over": "at or over", "engaged": "engaged"}
@@ -494,6 +557,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
     st.header("Operations")
     summaries = _book_summaries(conn, settings)
     _waiting_card(conn, settings)
+    _overdue_delisting_card(conn)
     if summaries:
         _summary_card(summaries)
     book = _selected_book(summaries, settings.paper.book_id)
@@ -512,6 +576,11 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
     header.render_freshness(header.Freshness(data.as_of, data.last_updated))
     if data.stale:
         theme.status_badge("stale: no run yet for the required session", "warning")
+        st.caption(
+            "Trust this over any 'last run ok' above: that run is for an earlier session. "
+            "Normal before today's morning run; if it is still here after the run's usual "
+            "time, see 'Waiting for you' at the top."
+        )
 
     _kpis(data)
     _risk_card(conn, data.window)

@@ -71,6 +71,24 @@ _AFTER_BOUNDARY = datetime.combine(next_session(_S), datetime.min.time(), tzinfo
 _T0 = datetime.combine(_S_MINUS_1, datetime.min.time(), tzinfo=UTC) + timedelta(hours=14)
 
 
+_RECON_JSON = json.dumps(
+    {
+        "activities": [],
+        "explained": [
+            {
+                "kind": "dividend_cash",
+                "security_id": "BBB",
+                "quantity": None,
+                "cash": 12.5,
+                "explanation": "cash dividend",
+            }
+        ],
+        "mismatches": [],
+        "symbol_changes": [{"security_id": "BBB", "old_symbol": "BBB", "new_symbol": "BBX"}],
+    }
+)
+
+
 def _at(minutes: int = 0) -> datetime:
     return _T0 + timedelta(minutes=minutes)
 
@@ -238,6 +256,7 @@ def _seed(store_path: Path) -> None:
                 at=_at(7),
                 status="ok",
                 broker_cash=1000.0,
+                mismatches_json=_RECON_JSON,
                 **_stamp(7),
             ),
         )
@@ -261,14 +280,14 @@ def seeded_store(tmp_path: Path) -> Path:
     return store_path
 
 
-def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
+def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path, now: datetime = _NOW) -> AppTest:
     monkeypatch.setenv("STORE__PATH", str(store_path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     # Freeze the clock the page reads to the instant S-1 was derived from, so a
     # slow shard whose wall clock crosses a session boundary between import and
     # render cannot advance the required session past the fixture's run (#1263).
-    monkeypatch.setattr(ops, "utc_now", lambda: _NOW)
-    monkeypatch.setattr(ops_page, "utc_now", lambda: _NOW)
+    monkeypatch.setattr(ops, "utc_now", lambda: now)
+    monkeypatch.setattr(ops_page, "utc_now", lambda: now)
     at = AppTest.from_file(_APP_PATH)
     at.run()
     at.sidebar.radio[0].set_value(_PAGE).run()
@@ -291,6 +310,70 @@ def _dataframe_with_columns(at: AppTest, *columns: str) -> Any:
             return df.value
     available = [list(df.value.columns) for df in at.dataframe]
     raise AssertionError(f"no dataframe has columns {columns}; got {available}")
+
+
+def _overdue_delisting(store_path: Path, *, paid: bool = False) -> None:
+    """BBB removed on S-1 with no cash and flagged overdue by a reconciliation (#411)."""
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        append(
+            conn,
+            journal.AdjustmentRow(
+                window_id=1,
+                session=_S_MINUS_1,
+                kind="corporate_action_cash",
+                security_id="BBB",
+                quantity=-5.0,
+                cash=0.0,
+                explanation_json=json.dumps({"explanation": "listing ended"}),
+                **_stamp(9),
+            ),
+        )
+        if paid:
+            append(
+                conn,
+                journal.AdjustmentRow(
+                    window_id=1,
+                    session=_S_MINUS_1,
+                    kind="corporate_action_cash",
+                    security_id="BBB",
+                    cash=100.0,
+                    explanation_json=json.dumps({"delisting_cash": True}),
+                    **_stamp(9),
+                ),
+            )
+        allowed = [{"reason": "overdue delisting cash", "difference": 5.0, "security_id": "BBB"}]
+        append(
+            conn,
+            ReconciliationRow(
+                window_id=1,
+                at=_at(10),
+                status="ok",
+                broker_cash=1000.0,
+                mismatches_json=json.dumps({"mismatches": [], "allowed": allowed}),
+                **_stamp(10),
+            ),
+        )
+
+
+def test_page_shows_a_delisting_whose_cash_is_overdue(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _overdue_delisting(seeded_store)
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    assert f"BBB: delisting cash overdue since {_S_MINUS_1} \u2014 check Alpaca's activity" in (
+        _text(at)
+    )
+
+
+def test_page_drops_the_overdue_line_once_the_cash_is_booked(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _overdue_delisting(seeded_store, paid=True)
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    assert "delisting cash overdue" not in _text(at)
 
 
 # --- headless render --------------------------------------------------------
@@ -357,6 +440,40 @@ def test_header_shows_as_of_last_updated_and_stale_chip(
     assert "as of" in text and "last updated" in text
     # S-1 has a finished run in the fixture, so the page is not stale.
     assert "stale" not in text.lower()
+
+
+def test_stale_badge_says_which_to_believe(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    """P-opsstale (#2206): the stale badge explains itself and says it is expected
+    before the morning run."""
+    at = _app(monkeypatch, seeded_store, _AFTER_BOUNDARY + timedelta(days=10))
+    assert not at.exception
+    text = _text(at)
+    assert "stale: no run yet" in text
+    assert "Normal before today's morning run" in text
+
+
+def test_reconciliation_lists_events_not_raw_json(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    """O-recon (#2206): events on holdings read as a list; raw JSON is in an expander."""
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    text = _text(at)
+    assert "Dividend on BBB, cash +12.50: cash dividend" in text
+    assert "Ticker change on BBB: BBB is now BBX" in text
+    assert '{"activities"' not in text
+    assert any("Raw reconciliation record" in e.label for e in at.expander)
+
+
+def test_reconciliation_events_helper_survives_bad_json() -> None:
+    assert ops_page._reconciliation_events("not json") == []
+    assert ops_page._reconciliation_events("[]") == []
+    lines = ops_page._reconciliation_events(
+        '{"mismatches": [{"kind": "cash", "detail": "off by 3", "security_id": "AAA"}]}'
+    )
+    assert lines == ["Needs a look, cash on AAA: off by 3"]
 
 
 def test_stale_chip_survives_a_session_boundary(

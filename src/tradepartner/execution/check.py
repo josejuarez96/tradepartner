@@ -116,6 +116,25 @@ class CheckLine:
     passed: bool
     query: str
     detail: str
+    #: The owner-readable form of `detail` (progress, date range) shown by default;
+    #: empty when `detail` is already short. `--verbose` prints `detail` in full.
+    short: str = ""
+
+
+#: Calendar days one rebalance period spans, for "about N to go" estimates.
+_PERIOD_DAYS: Mapping[Cadence, int] = MappingProxyType({"month_end": 30, "week_end": 7, "daily": 1})
+
+
+def _time_to_go(remaining: int, cadence: Cadence) -> str:
+    """A rough, plain-words wait for `remaining` more rebalance periods."""
+    if cadence == "daily":
+        return f"{remaining} more session(s) to go"
+    days = remaining * _PERIOD_DAYS[cadence]
+    if days < 14:
+        return f"about {days} more day(s)"
+    if days < 60:
+        return f"about {round(days / 7)} weeks to go"
+    return f"about {round(days / 30)} months to go"
 
 
 def _frozen(window: PaperWindowRow) -> dict[str, Any]:
@@ -237,7 +256,11 @@ def _journal_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> Journal:
 
 
 def _rebalance_count_line(
-    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, window_id: int, frozen: dict[str, Any]
+    conn: duckdb.DuckDBPyConnection,
+    window: PaperWindowRow,
+    window_id: int,
+    frozen: dict[str, Any],
+    cadence: Cadence,
 ) -> CheckLine:
     query = (
         "distinct rebalance_events.rebalance_session with status='executed' "
@@ -309,6 +332,7 @@ def _rebalance_count_line(
         f"{count} scheduler-executed rebalance session(s) [{sessions_text}], "
         f"need >= {min_rebalances}"
     )
+    base_detail = detail
     if tty_only_sessions:
         tty_text = ", ".join(s.isoformat() for s in tty_only_sessions)
         detail += f"; tty-executed, listed not counted: [{tty_text}]"
@@ -326,7 +350,15 @@ def _rebalance_count_line(
         detail += (
             f"; submitted-order runs, fills recorded by a later run, not counted: [{recorded_text}]"
         )
-    return CheckLine(name="rebalance_count", passed=passed, query=query, detail=detail)
+    ordered = sorted(scheduler_sessions)
+    short = f"{count} of {min_rebalances} rebalance sessions done"
+    if not passed:
+        short += f" so far, {_time_to_go(min_rebalances - count, cadence)}"
+    if ordered:
+        short += f"; first {ordered[0].isoformat()}, latest {ordered[-1].isoformat()}"
+    if detail != base_detail:
+        short += "; other runs are listed but not counted (--verbose shows them)"
+    return CheckLine(name="rebalance_count", passed=passed, query=query, detail=detail, short=short)
 
 
 def _tracking_line(
@@ -504,7 +536,7 @@ def check(
     frozen = _frozen(window)
 
     return [
-        _rebalance_count_line(conn, window, window_id, frozen),
+        _rebalance_count_line(conn, window, window_id, frozen, cadence),
         _tracking_line(conn, window, window_id, frozen, last_t, stop_session, cadence),
         _chain_line(conn, window_id, cadence),
         _override_line(conn, window, window_id, frozen),

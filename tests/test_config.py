@@ -97,6 +97,19 @@ def test_store_defaults() -> None:
     s = _settings()
     assert s.store.path == "data/tradepartner.duckdb"
     assert s.store.lock_retry_seconds == 60
+    assert s.store.pre_migration_backups_to_keep == 2
+    assert s.store.backup_disk_margin_bytes == 1_000_000_000
+
+
+def test_pre_migration_backup_config_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STORE__PRE_MIGRATION_BACKUPS_TO_KEEP", "1")
+    monkeypatch.setenv("STORE__BACKUP_DISK_MARGIN_BYTES", "0")
+    assert _settings().store.pre_migration_backups_to_keep == 1
+    assert _settings().store.backup_disk_margin_bytes == 0
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, store={"pre_migration_backups_to_keep": 0})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, store={"backup_disk_margin_bytes": -1})
 
 
 def test_calendar_defaults() -> None:
@@ -1926,6 +1939,8 @@ def test_risk_defaults_match_adr_0010() -> None:
     assert r.cash_in_lieu_tolerance == pytest.approx(0.10)
     # #1762 (T249): the sessions after a merger's payable date its cash may post.
     assert r.reconcile_merger_lag_sessions == 5
+    # #411: the premium a delisted holding's late cash may carry over its last close.
+    assert r.delisting_cash_max_premium == pytest.approx(0.10)
 
 
 @pytest.mark.parametrize("value", [-1, 1.5])
@@ -1982,6 +1997,7 @@ def test_alpaca_cash_in_lieu_max_lag_sessions_default() -> None:
         "whole_share_price_buffer",
         "max_unspent_cash_fraction",
         "cash_in_lieu_tolerance",
+        "delisting_cash_max_premium",
     ],
 )
 @pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])
