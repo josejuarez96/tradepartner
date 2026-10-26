@@ -61,18 +61,18 @@ as_of`:
 - `ended`: journal names whose current listing is `delisted` at close(S-1)
   (`store.delistings.listing_ends_as_of`; a transfer is not an end).
 - `dividends`: per held name, the cash due from `dividend` actions with an
-  ex-date after the cash base's session and on or before S. An
+  ex-date in the frozen `risk.reconcile_dividend_credit_sessions` window ending
+  at S. Journaled dividend cash nets oldest ex-date first, reading one further
+  window back so a just-expired due cannot consume a newer credit. An
   equal-amount group (one security, ex-date and amount under several live
   ids, #1613) is read through the reviewed list
   (`store.dividend_reviews`): a listed `duplicate` not yet repaired counts
   once, a listed `distinct` or `unresolved` pair as stored, and any other
   group on a held name is never summed but named in `dividend_findings`,
   which `compare` reports as an `unexplained_dividend_group` mismatch
-  (#1625): a data finding, failing closed. The base is the
-  window's latest `ok` reconciliation stated on or before S, or the window's
-  start. The cash due is the amount per share times the ledger's holding at
-  the session before the ex-date. A dividend the journal already holds as a
-  `dividend_cash` row dated on or after its ex-date is never offered again.
+  (#1625): a data finding, failing closed. The cash due is the amount per share
+  times the ledger's holding at the session before the ex-date, less credits
+  already journaled for it. A pre-key frozen window reads the default.
 - `spinoffs`: each stored `spinoff` action known at close(S-1) with an ex-date
   on or before S and whose parent the ledger held on the session before the
   ex-date (still held, unchanged, at the stated session), keyed by child
@@ -163,6 +163,7 @@ from tradepartner.execution.reconcile import (
     DelistedCash,
     Explanations,
     JournalOpenOrder,
+    Mismatch,
     OpenMerger,
     Reconciliation,
     _cash_bound,
@@ -286,12 +287,16 @@ def frozen_risk(window: PaperWindowRow) -> RiskConfig:
     risk = {k[len(_RISK_PREFIX) :]: v for k, v in parsed.items() if k.startswith(_RISK_PREFIX)}
     # A window frozen before T202 has no `risk.max_skip_share`: read it as 0, so the
     # skip cap stays max(max_skips_per_run, 0) (paper spec amendment 2026-10-18 item 3).
-    # It, the merger lag and the delisting-cash premium are the keys back-filled;
+    # It, the merger lag, dividend window and delisting-cash premium are back-filled;
     # every other missing key still refuses.
     risk.setdefault("max_skip_share", 0.0)
     # A window frozen before T249 has no `risk.reconcile_merger_lag_sessions`: read
     # it at its default (paper spec amendment #1762 item 10).
     risk.setdefault("reconcile_merger_lag_sessions", _DEFAULT_RISK.reconcile_merger_lag_sessions)
+    # #2183: open windows predate the dividend credit window; use its default.
+    risk.setdefault(
+        "reconcile_dividend_credit_sessions", _DEFAULT_RISK.reconcile_dividend_credit_sessions
+    )
     # A window frozen before #411 has no `risk.delisting_cash_max_premium`: same.
     risk.setdefault("delisting_cash_max_premium", _DEFAULT_RISK.delisting_cash_max_premium)
     missing = sorted(set(RiskConfig.model_fields) - set(risk))
@@ -479,11 +484,15 @@ def _dividends(
     tolerance: float,
     through: date,
     reviewed: Sequence[ReviewedGroup],
+    credit_sessions: int,
 ) -> tuple[dict[str, float], dict[str, str]]:
-    """Cash due per name for dividends with ex-date in (base session, S] (negative
-    for a name held short before the ex-date), less
-    any the journal already holds as `dividend_cash` on or after the ex-date,
-    and the held names with an equal-amount dividend group the reviewed list
+    """Cash due per name in the credit window, net of journaled cash oldest first.
+
+    The extra window of old ex-dates catches a late payment whose dividend has
+    just expired, so it cannot be attributed to a newer dividend on that name.
+    A short's due and cash debit are negative. The result excludes expired dues.
+
+    Also return held names with an equal-amount dividend group the reviewed list
     does not explain (#1625, #1613), each with its detail.
 
     Each `(security_id, ex_date, amount)` held by more than one live identity
@@ -492,16 +501,19 @@ def _dividends(
     is skipped); a listed `distinct` or `unresolved` pair counts as stored; any
     other group (`violation`) is never summed and, on a held name, is a
     finding, so the caller fails closed rather than guess one payment or two."""
-    base = state.base(through)
-    stated = base.at if base is not None else window.started_at
-    after = stated.astimezone(_NEW_YORK).date()
-    journaled: dict[str, list[date]] = defaultdict(list)
+    window_start = session
+    for _ in range(credit_sessions):
+        window_start = previous_session(window_start)
+    lookback_start = window_start
+    for _ in range(credit_sessions):
+        lookback_start = previous_session(lookback_start)
+    journaled: dict[str, list[AdjustmentRow]] = defaultdict(list)
     for adjustment in state.adjustments:
         if adjustment.kind == _DIVIDEND_CASH and adjustment.security_id is not None:
-            journaled[adjustment.security_id].append(adjustment.session)
+            journaled[adjustment.security_id].append(adjustment)
     rows = actions.filter(
         (pl.col("action_type") == _DIVIDEND)
-        & (pl.col("ex_date") > after)
+        & (pl.col("ex_date") > lookback_start)
         & (pl.col("ex_date") <= session)
     )
     skipped: set[tuple[str, str]] = set()
@@ -517,13 +529,11 @@ def _dividends(
                 f"{len(group.identities)} live dividend records of {group.amount!r} with "
                 f"ex-date {group.ex_date} ({ids}) that the reviewed list does not explain"
             )
-    due: dict[str, float] = defaultdict(float)
+    dues: dict[str, list[tuple[date, float]]] = defaultdict(list)
     findings: dict[str, list[str]] = defaultdict(list)
     holdings: dict[date, Ledger] = {}
     for row in rows.iter_rows(named=True):
         if (row["security_id"], row["source_action_id"]) in skipped:
-            continue
-        if any(day >= row["ex_date"] for day in journaled.get(row["security_id"], ())):
             continue
         before = previous_session(row["ex_date"])
         if before not in holdings:
@@ -532,16 +542,39 @@ def _dividends(
         short = holdings[before].short_holdings.get(row["security_id"], 0.0)
         if held > tolerance or short > tolerance:
             key = (row["security_id"], row["ex_date"], float(row["ratio_or_amount"]))
-            if key in unexplained:
+            if key in unexplained and row["ex_date"] > window_start:
                 if unexplained[key] not in findings[row["security_id"]]:
                     findings[row["security_id"]].append(unexplained[key])
                 continue
+            if key in unexplained:
+                continue
             # A short owes the dividend: -quantity x amount (#1928, item 10).
-            due[row["security_id"]] += (
+            amount = (
                 held * float(row["ratio_or_amount"])
                 if held > tolerance
                 else -short * float(row["ratio_or_amount"])
             )
+            dues[row["security_id"]].append((row["ex_date"], amount))
+    due: dict[str, float] = defaultdict(float)
+    for name, dated in dues.items():
+        # `dividend_cash` has no action id. A credit must consume the oldest
+        # eligible ex-date first, including one just outside the active window.
+        credits = sorted(journaled.get(name, ()), key=lambda a: (a.session, a.adjustment_id or 0))
+        remaining = sorted(dated)
+        for credit in credits:
+            cash = credit.cash
+            if cash is None:
+                continue
+            for index, (ex_date, amount) in enumerate(remaining):
+                if credit.session < ex_date or amount == 0 or cash * amount <= 0:
+                    continue
+                paid = min(abs(cash), abs(amount))
+                signed_paid = math.copysign(paid, cash)
+                remaining[index] = (ex_date, amount - signed_paid)
+                cash -= signed_paid
+                if cash == 0.0:
+                    break
+        due[name] = math.fsum(amount for ex_date, amount in remaining if ex_date > window_start)
     # `compare` signs a due against the book at S: a short's due is negative only
     # while the name is still held short, a long's positive only while it is not.
     # A short covered (or a long flipped short) after the ex-date has a due of
@@ -654,6 +687,7 @@ def _explanations(
     through: date,
     *,
     merger_lag_sessions: int,
+    dividend_credit_sessions: int,
     cash_tolerance: float,
     whole_share_price_buffer: float,
 ) -> Explanations:
@@ -693,7 +727,14 @@ def _explanations(
     priced = sorted(names | set(symbols))
     seen_ids, seen_before = _seen_activities(state.adjustments, state.base(through), window)
     dividends, findings = _dividends(
-        state, actions, window, session, tolerance, through, reviewed_groups()
+        state,
+        actions,
+        window,
+        session,
+        tolerance,
+        through,
+        reviewed_groups(),
+        dividend_credit_sessions,
     )
     stock_dividends = _stock_dividends(
         actions,
@@ -1144,6 +1185,7 @@ def explanations_as_of(
     broker_symbols: Collection[str] = (),
     quantity_tolerance: float,
     merger_lag_sessions: int = _DEFAULT_RISK.reconcile_merger_lag_sessions,
+    dividend_credit_sessions: int = _DEFAULT_RISK.reconcile_dividend_credit_sessions,
     cash_tolerance: float = _DEFAULT_RISK.reconcile_cash_tolerance,
     whole_share_price_buffer: float = _DEFAULT_RISK.whole_share_price_buffer,
 ) -> Explanations:
@@ -1154,10 +1196,9 @@ def explanations_as_of(
     changed at close(S-1) maps to the broker's new symbol (#1761). `settings`
     gives `master.transfer_window_sessions` for the listing ends, and
     `quantity_tolerance` is the frozen `risk.reconcile_quantity_tolerance`;
-    `merger_lag_sessions` and `cash_tolerance` are the frozen
-    `risk.reconcile_merger_lag_sessions` and `risk.reconcile_cash_tolerance`
-    (their defaults when not given), which an open merger's window and its
-    paid-in-full test read (T249).
+    `merger_lag_sessions`, `dividend_credit_sessions` and `cash_tolerance`
+    are the corresponding frozen `risk.*` values (their defaults when not
+    given); they bound open merger and dividend dues and cash matches.
     Raises `ValueError` for a non-session `session` or a naive `as_of`."""
     cut = _cut(session)
     as_of = ensure_tz_aware_utc(as_of, field_name="as_of")
@@ -1174,6 +1215,7 @@ def explanations_as_of(
         quantity_tolerance,
         session,
         merger_lag_sessions=merger_lag_sessions,
+        dividend_credit_sessions=dividend_credit_sessions,
         cash_tolerance=cash_tolerance,
         whole_share_price_buffer=whole_share_price_buffer,
     )
@@ -1295,12 +1337,30 @@ def reconcile_now(
             tolerance,
             through,
             merger_lag_sessions=frozen.reconcile_merger_lag_sessions,
+            dividend_credit_sessions=frozen.reconcile_dividend_credit_sessions,
             cash_tolerance=frozen.reconcile_cash_tolerance,
             whole_share_price_buffer=frozen.whole_share_price_buffer,
         )
     # The read-only `_explanations` names the seen-sets and fallback; the broker's
     # cash activities are attached here (they are a broker input, never a journal
     # fact, so the look-ahead cut does not touch them).
+    # A symbol-tagged DIV cannot justify another name's due. The broker's
+    # activity is evidence for the credit, while an absent DIV still leaves the
+    # store-backed cash comparison available (older paper activity feeds).
+    tagged_dividends = {
+        activity.symbol
+        for activity in activities
+        if activity.activity_type == "DIV" and activity.symbol is not None
+    }
+    if tagged_dividends:
+        explanations = replace(
+            explanations,
+            dividends={
+                name: amount
+                for name, amount in explanations.dividends.items()
+                if explanations.symbols.get(name) in tagged_dividends
+            },
+        )
     explanations = replace(explanations, activities=tuple(activities))
     ledger = _ledger(state, actions, window, through, tolerance)
     result = compare(
@@ -1314,6 +1374,33 @@ def reconcile_now(
         frozen,
         order_id_prefix=settings.paper.order_id_prefix,
     )
+    unsupported_dividend_cash = [
+        activity
+        for activity in activities
+        if activity.activity_type in {"DIVNRA", "DIVFEE"}
+        and activity.status == "executed"
+        and activity.net_amount is not None
+        and activity.net_amount != 0
+        and activity.activity_id not in explanations.seen_activity_ids
+        and (
+            explanations.activity_seen_before is None
+            or activity.date >= explanations.activity_seen_before
+        )
+    ]
+    if unsupported_dividend_cash:
+        result = replace(
+            result,
+            status=MISMATCH,
+            broker_cash=None,
+            adjustments=(),
+            mismatches=result.mismatches
+            + tuple(
+                Mismatch(
+                    "cash", f"unsupported {activity.activity_type} activity {activity.activity_id}"
+                )
+                for activity in unsupported_dividend_cash
+            ),
+        )
 
     with journal() as conn:
         stamp = _read_clock(clock)

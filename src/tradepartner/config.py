@@ -2267,6 +2267,8 @@ class RiskConfig(BaseModel):
     # cash may still post; the first reconciliation after them checks the due once.
     # A window frozen before T249 lacks the key and `frozen_risk` reads it at 5.
     reconcile_merger_lag_sessions: int = Field(default=5, ge=0)
+    # #2183: cash may arrive after an ok reconciliation on the ex-date.
+    reconcile_dividend_credit_sessions: int = Field(default=25, ge=1, le=55)
     # #411: the most a delisted holding's late cash may exceed its last stored close x
     # quantity (a share of it, in [0, 1]): a cash deal trades below its price, so the
     # real credit can sit above the stale close; more is not this position's proceeds.

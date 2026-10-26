@@ -1939,6 +1939,7 @@ def test_risk_defaults_match_adr_0010() -> None:
     assert r.cash_in_lieu_tolerance == pytest.approx(0.10)
     # #1762 (T249): the sessions after a merger's payable date its cash may post.
     assert r.reconcile_merger_lag_sessions == 5
+    assert r.reconcile_dividend_credit_sessions == 25
     # #411: the premium a delisted holding's late cash may carry over its last close.
     assert r.delisting_cash_max_premium == pytest.approx(0.10)
 
@@ -1957,6 +1958,24 @@ def test_risk_reconcile_merger_lag_sessions_is_a_whole_count_of_at_least_zero(
     )
     with pytest.raises(ValidationError):
         Settings(_env_file=None, risk={"reconcile_merger_lag_sessions": value})
+
+
+@pytest.mark.parametrize("value", [0, 56, 1.5])
+def test_risk_reconcile_dividend_credit_sessions_bounds(value: float) -> None:
+    assert (
+        Settings(
+            _env_file=None, risk={"reconcile_dividend_credit_sessions": 1}
+        ).risk.reconcile_dividend_credit_sessions
+        == 1
+    )
+    assert (
+        Settings(
+            _env_file=None, risk={"reconcile_dividend_credit_sessions": 55}
+        ).risk.reconcile_dividend_credit_sessions
+        == 55
+    )
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={"reconcile_dividend_credit_sessions": value})
 
 
 def test_risk_max_skip_share_defaults_to_a_tenth() -> None:
