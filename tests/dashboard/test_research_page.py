@@ -19,6 +19,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from dashboard_nav import NavCall, nav_calls_fixture, nav_titles  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.backtest.results import family_n_split
@@ -416,7 +417,8 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     at = AppTest.from_file(_APP_PATH)
     at.run()
-    at.sidebar.radio[0].set_value("Research").run()
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Research")
+    at.run()
     return at
 
 
@@ -458,20 +460,11 @@ def test_reader_lists_runs_and_derives_chain_usage(
 
 
 def test_page_is_in_the_shell_navigation(
-    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded], nav_calls: list[NavCall]
 ) -> None:
     at = _app(monkeypatch, seeded_store[0])
     assert not at.exception
-    assert at.sidebar.radio[0].options == [
-        "Data health",
-        "Backtest",
-        "Trial registry",
-        "Research",
-        "Operations",
-        "Trades",
-        "Performance",
-        "Override",
-    ]
+    assert "Research" in nav_titles(nav_calls)
 
 
 def test_render_lists_registrations_budgets_and_amendments(

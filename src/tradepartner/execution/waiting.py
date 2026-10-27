@@ -31,11 +31,19 @@ clears it, the command the owner types (text only: nothing here runs it).
 4. `shakedown_note`: a `stale_data` or `missed_run` alert at or after the open
    span's `start_at` (and at or before `now`) that no `shakedown_note` names.
    `since` is the alert's `at`. Command: `decision shakedown-note`.
-5. `report_due`: at least `ReportFacts.minimum` tracked rebalances (`paper
+5. `shakedown_failing` (#2298): one per `paper shakedown` line whose `state` is
+   `failing` (`execution.shakedown.ShakedownLine.state`, never its printed
+   text), or one when the shakedown could not be read (`ShakedownFacts.error`).
+   A line `in_progress` (sessions or order sessions still short, the span
+   pending, the drill not done) is no item: `shakedown_progress` words it for
+   `paper status --all`. The book is `SHAKEDOWN_BOOK` (the shakedown judges
+   every book at once); `since` is None. Command: `paper shakedown`, which prints
+   the whole line; the detail names the next step.
+6. `report_due`: at least `ReportFacts.minimum` tracked rebalances (`paper
    report`'s count) and no `paper_reports` row yet: only the first report is
    prompted, because every `paper report` opens a counted tracking trial.
    `since` is the second rebalance session. Command: `paper report`.
-6. `unreadable`: one per book whose rows raised a `ValueError` (an
+7. `unreadable`: one per book whose rows raised a `ValueError` (an
    `UnreadableMarkError`, `frozen_risk` on an unreadable `frozen_json`,
    `lag_verdict` on an unreadable reconciliation row), carrying every message.
    No command. The book's kinds that read fine still come out, and so do every
@@ -53,6 +61,8 @@ from zoneinfo import ZoneInfo
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig
 from tradepartner.execution.collect import lag_verdict
+from tradepartner.execution.plain import plain_causes
+from tradepartner.execution.shakedown import ShakedownLine
 from tradepartner.execution.switch import SwitchState, faulted_runs
 from tradepartner.store.journal import (
     KillSwitchRow,
@@ -65,16 +75,20 @@ from tradepartner.store.journal import (
 __all__ = [
     "KIND_ORDER",
     "NOTED_ALERT_KINDS",
+    "SHAKEDOWN_BOOK",
     "BookFacts",
     "LagFacts",
     "ReportFacts",
     "RunFacts",
+    "ShakedownFacts",
     "SpanAlert",
     "SpanFacts",
     "SwitchFacts",
     "WaitingItem",
     "WaitingKind",
     "build",
+    "shakedown_next_step",
+    "shakedown_progress",
 ]
 
 _NEW_YORK = ZoneInfo("America/New_York")
@@ -84,6 +98,7 @@ WaitingKind = Literal[
     "order_lagging",
     "missed_run",
     "shakedown_note",
+    "shakedown_failing",
     "report_due",
     "unreadable",
 ]
@@ -94,6 +109,7 @@ KIND_ORDER: Final[tuple[WaitingKind, ...]] = (
     "order_lagging",
     "missed_run",
     "shakedown_note",
+    "shakedown_failing",
     "report_due",
     "unreadable",
 )
@@ -101,18 +117,51 @@ KIND_ORDER: Final[tuple[WaitingKind, ...]] = (
 #: The alert kinds the shakedown needs noted (ADR 0017 E.1 and E.7).
 NOTED_ALERT_KINDS: Final = ("stale_data", "missed_run")
 
+#: The book a `shakedown_failing` item names: the shakedown judges every book.
+SHAKEDOWN_BOOK: Final = "every book"
+
+#: A failing shakedown line's next step, by its criterion (`E.1` .. `E.7`).
+_SHAKEDOWN_NEXT: Final[dict[str, str]] = {
+    "E.1": (
+        "check each session it names: a missed or stale run needs a "
+        "`decision shakedown-note` on its alert, any other result is a run to look into"
+    ),
+    "E.2": (
+        "find the mismatch in `paper status --book <book>`, fix its cause and resume; "
+        "a mismatch restarts the span"
+    ),
+    "E.3": (
+        "an order filled beyond its plan or a limit was breached: look at the named "
+        "orders before the next run (a sizing defect, not a threshold to change)"
+    ),
+    "E.4": (
+        "a drilled run wrote an order: treat it as a kill-switch defect "
+        "(docs/runbooks/scheduling.md, the drill)"
+    ),
+    "E.5": "run `paper check --book <book>` for the named book and fix the chain it names",
+    "E.6": (
+        "an alert channel has no successful delivery in the span: check that "
+        "channel's settings (docs/runbooks/scheduling.md)"
+    ),
+    "E.7": "note each named stale_data alert, and run `tradepartner health --check`",
+}
+_SHAKEDOWN_COMMAND: Final = "tradepartner paper shakedown"
+
 
 @dataclass(frozen=True, kw_only=True)
 class WaitingItem:
     """One thing a book is waiting on the owner for. `since` is a timestamp or a
     session (by kind, module docstring), None for `unreadable`; `command` is the
-    text the owner types to clear it, None where no command does."""
+    text the owner types to clear it, None where no command does; `line` is the
+    shakedown line a `shakedown_failing` item is about (None otherwise, and for
+    an unreadable shakedown)."""
 
     book_id: str
     kind: WaitingKind
     since: datetime | date | None
     detail: str
     command: str | None
+    line: str | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -193,6 +242,20 @@ class SpanFacts:
     now: datetime
 
 
+@dataclass(frozen=True, kw_only=True)
+class ShakedownFacts:
+    """`paper shakedown`'s lines over the open span (E.7 without its health half,
+    `ops`), or the `ValueError` message that stopped the read (then no lines)."""
+
+    lines: tuple[ShakedownLine, ...] = ()
+    error: str | None = None
+
+
+def _one_line(text: str) -> str:
+    """A stored free-text reason on one line; the renderers scrub it (cli, ops page)."""
+    return " ".join(text.split())
+
+
 def _kill_switch_item(book_id: str, facts: SwitchFacts) -> WaitingItem | None:
     state = facts.state
     if not state.engaged:
@@ -213,11 +276,14 @@ def _kill_switch_item(book_id: str, facts: SwitchFacts) -> WaitingItem | None:
             if rw.run.run_id != in_progress and (rw.result is None or rw.run.run_id in faulted)
         ]
         since = min(engaging, default=None)
+    why = state.engaged_row.reason if state.engaged_row is not None else None
     return WaitingItem(
         book_id=book_id,
         kind="kill_switch_engaged",
         since=since,
-        detail="kill switch engaged: " + "; ".join(state.causes),
+        detail="kill switch engaged: "
+        + plain_causes(state.causes)
+        + (f"; reason given: {_one_line(why)}" if why else ""),
         command=f'tradepartner paper resume --book {book_id} --reason "<why>"',
     )
 
@@ -299,6 +365,68 @@ def _shakedown_items(span: SpanFacts) -> list[WaitingItem]:
     ]
 
 
+def shakedown_next_step(line: str | None) -> str:
+    """The next step for a failing shakedown line, by its criterion (`E.3 orders`
+    reads `E.3`); a line this module does not know, or None (the shakedown could
+    not be read), points at `paper shakedown`."""
+    key = line.split(" ", 1)[0] if line else ""
+    return _SHAKEDOWN_NEXT.get(key, f"run `{_SHAKEDOWN_COMMAND} --verbose` and read the line")
+
+
+def _shakedown_failing_items(facts: ShakedownFacts) -> list[WaitingItem]:
+    if facts.error is not None:
+        return [
+            WaitingItem(
+                book_id=SHAKEDOWN_BOOK,
+                kind="shakedown_failing",
+                since=None,
+                detail=(
+                    f"the shakedown could not be read: {_one_line(facts.error)}; next: "
+                    + shakedown_next_step(None)
+                ),
+                command=_SHAKEDOWN_COMMAND,
+            )
+        ]
+    return [
+        WaitingItem(
+            book_id=SHAKEDOWN_BOOK,
+            kind="shakedown_failing",
+            since=None,
+            detail=(
+                f"shakedown line {line.name} is failing: {_one_line(line.detail)}; next: "
+                + shakedown_next_step(line.name)
+            ),
+            command=_SHAKEDOWN_COMMAND,
+            line=line.name,
+        )
+        for line in facts.lines
+        if line.state == "failing"
+    ]
+
+
+def shakedown_progress(facts: ShakedownFacts | None) -> str | None:
+    """The open span's progress in words for `paper status --all`: the lines still
+    `in_progress` with what they wait on, or that every line passes. None with no
+    span, or when the shakedown could not be read (that is an item)."""
+    if facts is None or facts.error is not None:
+        return None
+    waiting_on = [
+        f"{line.name}: {', '.join(line.progress)}"
+        for line in facts.lines
+        if line.state == "in_progress"
+    ]
+    failing = sum(1 for line in facts.lines if line.state == "failing")
+    if not waiting_on and not failing:
+        return (
+            "shakedown: every line passes so far (E.7's health half is not checked "
+            "here; `paper shakedown` is the gate)"
+        )
+    text = "shakedown in progress: " + ("; ".join(waiting_on) if waiting_on else "nothing pending")
+    if failing:
+        text += f" ({failing} line(s) failing, listed under waiting on you)"
+    return text
+
+
 def _book_items(book: BookFacts) -> list[WaitingItem]:
     items: list[WaitingItem] = []
     errors = list(book.errors)
@@ -349,13 +477,20 @@ def _ordered(items: Iterable[WaitingItem]) -> tuple[WaitingItem, ...]:
     )
 
 
-def build(books: Sequence[BookFacts], span: SpanFacts | None) -> tuple[WaitingItem, ...]:
-    """Every item the books and the open shakedown span (None when no span row
-    exists) are waiting on, in the fixed order (module docstring): by kind, then
-    book token, then `since`. Empty when nothing is waiting."""
+def build(
+    books: Sequence[BookFacts],
+    span: SpanFacts | None,
+    shakedown: ShakedownFacts | None = None,
+) -> tuple[WaitingItem, ...]:
+    """Every item the books, the open shakedown span (None when no span row
+    exists) and its shakedown lines (None when not read) are waiting on, in the
+    fixed order (module docstring): by kind, then book token, then `since`. Empty
+    when nothing is waiting."""
     items: list[WaitingItem] = []
     for book in books:
         items.extend(_book_items(book))
     if span is not None:
         items.extend(_shakedown_items(span))
+    if shakedown is not None:
+        items.extend(_shakedown_failing_items(shakedown))
     return _ordered(items)

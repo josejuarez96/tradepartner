@@ -1240,8 +1240,7 @@ def test_the_three_rule_differences_agree_on_the_cost_terms(
 
 
 def _long_short_params(monkeypatch: pytest.MonkeyPatch, **changed: Any) -> None:
-    """`frozen_params` returns each variant's values with a long/short book on top (the
-    #1788 guard is stepped round, as `test_hypothesis.py` does)."""
+    """Supply a signed variant to test sweep refusals with the existing fixture."""
     real = hypothesis.frozen_params
 
     def patched(parsed: hypothesis.HypothesisFile, settings: Settings) -> dict[str, Any]:

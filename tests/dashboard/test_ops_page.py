@@ -23,10 +23,11 @@ from typing import Any
 import duckdb
 import pytest
 from conftest import version_4_store
+from dashboard_nav import NavCall, nav_calls_fixture, nav_titles  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.backtest.hypothesis import frozen_params_of
-from tradepartner.calendar import next_session
+from tradepartner.calendar import last_completed_session, next_session, previous_session
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.dashboard import ops_page, theme
 from tradepartner.execution import headroom, ops
@@ -69,6 +70,24 @@ _AFTER_BOUNDARY = datetime.combine(next_session(_S), datetime.min.time(), tzinfo
     hours=14
 )
 _T0 = datetime.combine(_S_MINUS_1, datetime.min.time(), tzinfo=UTC) + timedelta(hours=14)
+
+
+_RECON_JSON = json.dumps(
+    {
+        "activities": [],
+        "explained": [
+            {
+                "kind": "dividend_cash",
+                "security_id": "BBB",
+                "quantity": None,
+                "cash": 12.5,
+                "explanation": "cash dividend",
+            }
+        ],
+        "mismatches": [],
+        "symbol_changes": [{"security_id": "BBB", "old_symbol": "BBB", "new_symbol": "BBX"}],
+    }
+)
 
 
 def _at(minutes: int = 0) -> datetime:
@@ -238,6 +257,7 @@ def _seed(store_path: Path) -> None:
                 at=_at(7),
                 status="ok",
                 broker_cash=1000.0,
+                mismatches_json=_RECON_JSON,
                 **_stamp(7),
             ),
         )
@@ -261,17 +281,18 @@ def seeded_store(tmp_path: Path) -> Path:
     return store_path
 
 
-def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
+def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path, now: datetime = _NOW) -> AppTest:
     monkeypatch.setenv("STORE__PATH", str(store_path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     # Freeze the clock the page reads to the instant S-1 was derived from, so a
     # slow shard whose wall clock crosses a session boundary between import and
     # render cannot advance the required session past the fixture's run (#1263).
-    monkeypatch.setattr(ops, "utc_now", lambda: _NOW)
-    monkeypatch.setattr(ops_page, "utc_now", lambda: _NOW)
+    monkeypatch.setattr(ops, "utc_now", lambda: now)
+    monkeypatch.setattr(ops_page, "utc_now", lambda: now)
     at = AppTest.from_file(_APP_PATH)
     at.run()
-    at.sidebar.radio[0].set_value(_PAGE).run()
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", _PAGE)
+    at.run()
     return at
 
 
@@ -293,24 +314,113 @@ def _dataframe_with_columns(at: AppTest, *columns: str) -> Any:
     raise AssertionError(f"no dataframe has columns {columns}; got {available}")
 
 
+def _overdue_delisting(store_path: Path, *, paid: bool = False) -> None:
+    """BBB removed on S-1 with no cash and flagged overdue by a reconciliation (#411)."""
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        append(
+            conn,
+            journal.AdjustmentRow(
+                window_id=1,
+                session=_S_MINUS_1,
+                kind="corporate_action_cash",
+                security_id="BBB",
+                quantity=-5.0,
+                cash=0.0,
+                explanation_json=json.dumps({"explanation": "listing ended"}),
+                **_stamp(9),
+            ),
+        )
+        if paid:
+            append(
+                conn,
+                journal.AdjustmentRow(
+                    window_id=1,
+                    session=_S_MINUS_1,
+                    kind="corporate_action_cash",
+                    security_id="BBB",
+                    cash=100.0,
+                    explanation_json=json.dumps({"delisting_cash": True}),
+                    **_stamp(9),
+                ),
+            )
+        allowed = [{"reason": "overdue delisting cash", "difference": 5.0, "security_id": "BBB"}]
+        append(
+            conn,
+            ReconciliationRow(
+                window_id=1,
+                at=_at(10),
+                status="ok",
+                broker_cash=1000.0,
+                mismatches_json=json.dumps({"mismatches": [], "allowed": allowed}),
+                **_stamp(10),
+            ),
+        )
+
+
+def test_page_shows_a_delisting_whose_cash_is_overdue(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _overdue_delisting(seeded_store)
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    assert f"BBB: delisting cash overdue since {_S_MINUS_1} \u2014 check Alpaca's activity" in (
+        _text(at)
+    )
+
+
+def test_page_drops_the_overdue_line_once_the_cash_is_booked(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _overdue_delisting(seeded_store, paid=True)
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    assert "delisting cash overdue" not in _text(at)
+
+
+def _edgar_run(store_path: Path, finished: datetime, *, status: str = "ok") -> None:
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "INSERT INTO ingestion_runs (run_id, started_at, finished_at, status, source, mode) "
+            "VALUES (?, ?, ?, ?, 'edgar', 'session')",
+            [f"r-{finished.isoformat()}-{status}", finished, finished, status],
+        )
+
+
+def _sessions_back(count: int) -> datetime:
+    """After the close of the session `count` sessions before the page's last closed one."""
+    session = last_completed_session(_NOW)
+    for _ in range(count):
+        session = previous_session(session)
+    return datetime.combine(session, datetime.min.time(), tzinfo=UTC) + timedelta(hours=23)
+
+
+def test_page_shows_edgar_data_three_sessions_old(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _edgar_run(seeded_store, _sessions_back(3))
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    assert "EDGAR data 3 sessions old" in _text(at)
+
+
+def test_page_is_quiet_two_sessions_in_and_after_an_ok_run(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _edgar_run(seeded_store, _sessions_back(2))
+    assert "EDGAR data" not in _text(_app(monkeypatch, seeded_store))
+
+
 # --- headless render --------------------------------------------------------
 
 
 def test_page_is_in_the_shell_navigation(
-    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path, nav_calls: list[NavCall]
 ) -> None:
     at = _app(monkeypatch, seeded_store)
     assert not at.exception
-    assert at.sidebar.radio[0].options == [
-        "Data health",
-        "Backtest",
-        "Trial registry",
-        "Research",
-        _PAGE,
-        "Trades",
-        "Performance",
-        "Override",
-    ]
+    assert _PAGE in nav_titles(nav_calls)
 
 
 def test_render_journal_not_initialised(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -357,6 +467,40 @@ def test_header_shows_as_of_last_updated_and_stale_chip(
     assert "as of" in text and "last updated" in text
     # S-1 has a finished run in the fixture, so the page is not stale.
     assert "stale" not in text.lower()
+
+
+def test_stale_badge_says_which_to_believe(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    """P-opsstale (#2206): the stale badge explains itself and says it is expected
+    before the morning run."""
+    at = _app(monkeypatch, seeded_store, _AFTER_BOUNDARY + timedelta(days=10))
+    assert not at.exception
+    text = _text(at)
+    assert "stale: no run yet" in text
+    assert "Normal before today's morning run" in text
+
+
+def test_reconciliation_lists_events_not_raw_json(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    """O-recon (#2206): events on holdings read as a list; raw JSON is in an expander."""
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    text = _text(at)
+    assert "Dividend on BBB, cash +12.50: cash dividend" in text
+    assert "Ticker change on BBB: BBB is now BBX" in text
+    assert '{"activities"' not in text
+    assert any("Raw reconciliation record" in e.label for e in at.expander)
+
+
+def test_reconciliation_events_helper_survives_bad_json() -> None:
+    assert ops_page._reconciliation_events("not json") == []
+    assert ops_page._reconciliation_events("[]") == []
+    lines = ops_page._reconciliation_events(
+        '{"mismatches": [{"kind": "cash", "detail": "off by 3", "security_id": "AAA"}]}'
+    )
+    assert lines == ["Needs a look, cash on AAA: off by 3"]
 
 
 def test_stale_chip_survives_a_session_boundary(
@@ -831,6 +975,34 @@ def test_waiting_card_covers_every_book_after_selection_and_writes_nothing(
     assert "main: kill_switch_engaged" in _text(at)
     assert "b: unreadable" in _text(at)
     assert seeded_store.read_bytes() == before
+
+
+def test_waiting_card_shows_a_secret_in_the_kill_reason_scrubbed(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    secret = "PKREALSECRETVALUE1234567890"  # gitleaks:allow
+    configured = "correct horse battery staple 99"  # no pattern catches this one
+    monkeypatch.setenv("ALERT_SMTP_PASSWORD", configured)
+    settings = Settings(_env_file=None, store={"path": str(seeded_store)})
+    with open_for_write(settings) as conn:
+        window = journal.open_window(conn, "main")
+        assert window is not None and window.window_id is not None
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=window.window_id,
+                at=_at(-20),
+                state="engaged",
+                source="owner",
+                reason=f"stop key {secret} pw {configured}",
+                **_stamp(-20),
+            ),
+        )
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    text = _text(at)
+    assert "reason given: stop key" in text
+    assert secret not in text and configured not in text
 
 
 # --- the Risk card (plan T260, amendment 2026-10-20 #2096 item 3) -----------------

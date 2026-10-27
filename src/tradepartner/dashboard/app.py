@@ -21,10 +21,16 @@ This module is deliberately split into two layers:
   selected page *inside* that connection's `with` block, passing the
   connection to the page so a page never has to open its own.
 
-Navigation maps each entry to a page's `render(conn)`: "Data health"
-(`health_page`, T21), "Backtest" (T43), "Trial registry" (T44), "Research"
-(`research_page`, T83c), "Operations" (`ops_page`, T69),
-"Performance" (`performance_page`, T252) and "Override" (`override_page`, T69b).
+Navigation is `st.navigation(position="top")` (Streamlit 1.64; an empty-string
+section header puts its pages first, and each other section is a drop-down):
+Home (`home_page`), Research (`research_page`, T83c), Books (`book_page`) and a
+"Details" group holding "Data health" (`health_page`, T21), "Backtest" (T43),
+"Trial registry" (T44), "Operations" (`ops_page`, T69), "Trades", "Performance"
+(`performance_page`, T252) and "Override" (`override_page`, T69b). Each
+`st.Page` runs one closure that does the whole store flow below for its page, so
+the connection is still opened once per render and the selected page draws inside
+it. Home and Books take `(conn, settings)` (T274 routes them once; T275 and T276
+fill in the bodies without editing this module).
 
 **Submit before render (ADR 0011 Decision 2, #273; T69b).** The override page
 is the dashboard's only write, and a DuckDB write connection cannot open
@@ -80,7 +86,9 @@ import streamlit as st
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import (
     backtest_page,
+    book_page,
     health_page,
+    home_page,
     ops_page,
     override_page,
     performance_page,
@@ -191,14 +199,26 @@ def render_unreadable(settings: Settings, detail: str) -> None:
 
 _OVERRIDE_PAGE = "Override"
 
-_PAGES: dict[str, Callable[[duckdb.DuckDBPyConnection], None]] = {
-    "Data health": health_page.render,
-    "Backtest": backtest_page.render,
-    "Trial registry": trials_page.render,
-    "Research": research_page.render,
-    "Operations": ops_page.render,
-    "Trades": trades_page.render,
-    "Performance": performance_page.render,
+_PageRenderer = Callable[[duckdb.DuckDBPyConnection, Settings], None]
+
+#: Section header for the pages that sit in the top nav's "Details" drop-down.
+_DETAILS = "Details"
+
+#: Pages shown straight in the top bar, in order: title -> renderer.
+_TOP_PAGES: dict[str, _PageRenderer] = {
+    "Home": home_page.render,
+    "Research": lambda conn, _settings: research_page.render(conn),
+    "Books": book_page.render,
+}
+
+#: The Details drop-down, in order: title -> renderer.
+_DETAIL_PAGES: dict[str, _PageRenderer] = {
+    "Data health": lambda conn, _settings: health_page.render(conn),
+    "Backtest": lambda conn, _settings: backtest_page.render(conn),
+    "Trial registry": lambda conn, _settings: trials_page.render(conn),
+    "Operations": lambda conn, _settings: ops_page.render(conn),
+    "Trades": lambda conn, _settings: trades_page.render(conn),
+    "Performance": lambda conn, _settings: performance_page.render(conn),
     _OVERRIDE_PAGE: override_page.render,
 }
 
@@ -246,7 +266,25 @@ def render_app(settings: Settings | None = None) -> None:
         st.error(message)
         return
 
-    page_name = st.sidebar.radio("Navigate", list(_PAGES))
+    def _page(title: str, renderer: _PageRenderer, *, default: bool = False) -> st.Page:
+        def _run() -> None:
+            _render_page(settings, title, renderer)
+
+        return st.Page(
+            _run,
+            title=title,
+            url_path="" if default else title.lower().replace(" ", "-"),
+            default=default,
+        )
+
+    top = [_page(t, r, default=(i == 0)) for i, (t, r) in enumerate(_TOP_PAGES.items())]
+    details = [_page(t, r) for t, r in _DETAIL_PAGES.items()]
+    st.navigation({"": top, _DETAILS: details}, position="top").run()
+
+
+def _render_page(settings: Settings, page_name: str, renderer: _PageRenderer) -> None:
+    """Run the store flow for the selected page: one read-only connection, closed
+    when the page has drawn; the unavailable panels replace the page."""
     if page_name == _OVERRIDE_PAGE:
         override_page.show_outcome(settings)
 
@@ -260,10 +298,7 @@ def render_app(settings: Settings | None = None) -> None:
                 render_unreadable(settings, store.detail)
             return
 
-        if page_name == _OVERRIDE_PAGE:
-            override_page.render(store, settings)
-        else:
-            _PAGES[page_name](store)
+        renderer(store, settings)
 
 
 if __name__ == "__main__":

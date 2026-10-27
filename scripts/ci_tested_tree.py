@@ -103,6 +103,14 @@ def decide(api: Api, repo: str, sha: str, shard_count: int) -> tuple[bool, str]:
             f"(compare status {compare.get('status')!r})"
         )
 
+    passed, why = _head_passed_in_full(api, repo, head, shard_count)
+    if passed:
+        return True, f"tree {tree[:7]} is PR #{number}'s head {head[:7]}; {why}"
+    return False, f"PR #{number}: {why}"
+
+
+def _head_passed_in_full(api: Api, repo: str, head: str, shard_count: int) -> tuple[bool, str]:
+    """Whether one CI run (check suite) on ``head`` passed ``checks`` and every shard."""
     page = api.get(
         f"repos/{repo}/commits/{head}/check-runs?filter=latest&per_page={CHECK_RUNS_PAGE}"
     )
@@ -119,11 +127,63 @@ def decide(api: Api, repo: str, sha: str, shard_count: int) -> tuple[bool, str]:
         suites.setdefault(suite, []).append(r)
     for suite, suite_runs in suites.items():
         if _suite_passed_in_full(suite_runs, shard_count):
-            return True, (
-                f"tree {tree[:7]} is PR #{number}'s head {head[:7]}, which passed checks and "
-                f"all {shard_count} pytest shards in check suite {suite}"
+            return (
+                True,
+                f"{head[:7]} passed checks and all {shard_count} shards in check suite {suite}",
             )
-    return False, f"no CI run on PR #{number} head {head[:7]} passed checks and every shard"
+    return False, f"no CI run on {head[:7]} passed checks and every shard"
+
+
+DOCS_PREFIXES = ("docs/", "changelog.d/")
+COMPARE_FILES_CAP = 300  # GitHub's compare lists at most 300 files
+
+
+def docs_only(paths: Sequence[str]) -> bool:
+    """Whether every path is documentation, by a fixed allowlist (#2279).
+
+    Docs are markdown (``*.md``) under ``docs/`` or ``changelog.d/``, and a root-level
+    ``*.md``. Any other docs file (``docs/ui/book_blurbs.toml`` is read by code) is not
+    docs. Code, tests, scripts, ``.github/``, config and dependency files are never docs,
+    so anything else runs the full suite.
+    """
+    for p in paths:
+        if not p or ".." in p.split("/") or p.startswith("/"):
+            return False
+        if p.startswith(DOCS_PREFIXES):
+            if not p.endswith(".md"):
+                return False
+        elif "/" in p or not p.endswith(".md"):
+            return False
+    return True
+
+
+def decide_refresh(api: Api, repo: str, head: str, shard_count: int) -> tuple[bool, str]:
+    """``(skip, reason)`` for a PR head that merged main into an already tested head.
+
+    Skip the shards only when ``head`` is a two-parent merge whose first parent (the PR's
+    previous head) passed the full suite, and everything that merge brought in is docs.
+    """
+    if shard_count < 1:
+        return False, f"bad shard count {shard_count}"
+    commit = api.get(f"repos/{repo}/git/commits/{head}")
+    parents = [str(p.get("sha")) for p in commit.get("parents") or []]
+    if len(parents) != 2:
+        return False, f"{head[:7]} has {len(parents)} parents, not a merge of main"
+    previous = parents[0]
+    compare = api.get(f"repos/{repo}/compare/{previous}...{head}")
+    if compare.get("status") not in {"ahead", "identical"}:
+        return False, f"compare status {compare.get('status')!r}, not ahead of {previous[:7]}"
+    files = compare.get("files")
+    if not isinstance(files, list) or len(files) >= COMPARE_FILES_CAP:
+        return False, "the merge-in's file list is missing or may be truncated"
+    paths = [str(f.get("filename") or "") for f in files]
+    paths += [str(f["previous_filename"]) for f in files if f.get("previous_filename")]
+    if not docs_only(paths):
+        return False, "the merge-in touches more than docs"
+    passed, why = _head_passed_in_full(api, repo, previous, shard_count)
+    if not passed:
+        return False, why
+    return True, f"main brought in only docs ({len(files)} file(s)) over {why}"
 
 
 class GhApi:
@@ -144,11 +204,15 @@ def main(argv: Sequence[str] | None = None, api: Api | None = None) -> int:
     """Print ``skip`` or ``run``; always exit 0 so the workflow reads the word, not a code."""
     args = list(sys.argv[1:] if argv is None else argv)
     try:
+        refresh = args[:1] == ["--refresh"]
+        if refresh:
+            args = args[1:]
         if len(args) != 1 or not args[0]:
-            raise ValueError("usage: ci_tested_tree.py <sha>")
+            raise ValueError("usage: ci_tested_tree.py [--refresh] <sha>")
         repo = os.environ["GITHUB_REPOSITORY"]
         shard_count = int(os.environ["PYTEST_SHARD_COUNT"])
-        skip, reason = decide(api or GhApi(), repo, args[0], shard_count)
+        run = decide_refresh if refresh else decide
+        skip, reason = run(api or GhApi(), repo, args[0], shard_count)
     except Exception as exc:  # fail closed on anything at all
         skip, reason = False, f"lookup failed ({type(exc).__name__}: {exc})"
     print(f"main tested-tree check: {'skip' if skip else 'run'}: {reason}", file=sys.stderr)

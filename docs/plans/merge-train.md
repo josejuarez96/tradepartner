@@ -14,6 +14,8 @@ No LLM anywhere in the path, no new dependency (`git`, `gh`, the standard librar
 
 **Owner items, ordered by what they unblock:** none pending before the build: the spec's seven questions were answered on 2026-10-01 (PR #465) and folded in. The one owner task is T75b: the `gh api` POST of the ruleset, the `train/smoke` push (AC14), the first real batch (AC15, AC16).
 
+**Amendment 2026-10-26 (#2280): plan ticks after merge.** Every build PR ticked and collapsed its own line in `docs/plans/*.md`, so every PR overlapped every other and each landing forced a refresh and about 30 minutes of CI (#2253, #2263, #2265, #2255, #2272 on 10-26). The owner approved moving the tick out of the PR on 2026-10-26: the PR's existing `changelog.d/` fragment gains a first line `task: Tn (PR #n)`; `fragments.py fold` ticks and collapses that plan line after merge; `team.py` counts a merged, unfolded fragment's task as done, so claims and dependency readiness never wait on the fold; `ready_pr.py` requires the line when the issue carries `task:Tn` and refuses a plan-box tick outside a fold. One task, T286, process tooling like T74. Plan shape: T286 is depth 1, its chain is 1 PR, and its files are shared with no open task (`ready_pr.py` and its tests only with T74, ticked); a PR opened before it lands moves its tick into the fragment before `ready_pr` (#2280 Notes).
+
 ## Tasks
 
 Each task = one branch = one PR (~≤400 lines). Tasks with no shared files may run in parallel.
@@ -25,7 +27,8 @@ Shape (development-process.md, "Plan shape"): slice by file, not by step; no ope
 - [x] **T73: CI runs the full suite on train branches.** (#476, PR #478) · Files: `.github/workflows/ci.yml` · Depends on: n/a
 - [x] **T74: Review prefixes and the ask rule for the train.** (#527, PR #528) · Files: `scripts/ready_pr.py`, `tests/test_ready_pr.py`, `.claude/settings.json` · Depends on: T72
 - [x] **T75: The train in the ways of working, ADR 0002 and the ruleset file.** (#673, PR #676) · Files: `docs/ways-of-working/git-workflow.md`, `docs/decisions/0002-git-workflow.md`, `docs/ways-of-working/teams.md`, `docs/ways-of-working/development-process.md`, `CLAUDE.md`, `.github/rulesets/protect-main.json` · Depends on: T72c, T73
-- [ ] **T75b (owner): Activate the ruleset and run the first real train.** Files: none in the repo. The owner: `gh api -X POST repos/josejuarez96/tradepartner/rulesets --input .github/rulesets/protect-main.json`; pushes `train/smoke` and confirms one run with the `Tests` step run and no `claims` job (AC14), then deletes the branch; runs `build` on three or more real ready PRs and `merge` on the batch (AC15); runs every check in AC16: the direct push, a force-push and a deletion refused with his own token, plain `gh pr merge` refused on a throwaway red PR that he then closes, a green PR merged by hand. The outputs go in a comment on #460 and the spec's status moves to Shipped in a size-S docs PR that also ticks this line · Tests: AC14 to AC16 · Depends on: T73, T74, T75 · Review: n/a. Gates nothing.
+- [ ] **T75b (owner): Activate the ruleset and run the first real train.** Files: none in the repo. The owner: `gh api -X POST repos/josejuarez96/tradepartner/rulesets --input .github/rulesets/protect-main.json`; pushes `train/smoke` and confirms one run with the `Tests` step run and no `claims` job (AC14), then deletes the branch; runs `build` on three or more real ready PRs and `merge` on the batch (AC15); runs every check in AC16: the direct push, a force-push and a deletion refused with his own token, plain `gh pr merge` refused on a throwaway red PR that he then closes, a green PR merged by hand. The outputs go in a comment on #460 and the spec's status moves to Shipped in a size-S docs PR whose fragment names this task (`task: T75b (PR #n)`, #2280) · Tests: AC14 to AC16 · Depends on: T73, T74, T75 · Review: n/a. Gates nothing.
+- [ ] **T286: Plan ticks after merge: the fragment's `task:` line, the fold ticks (#2280).** (#2280; size M, about 450 lines with docs; class B) · Files: `scripts/fragments.py`, `scripts/team.py`, `scripts/ready_pr.py`, `tests/test_fragments.py`, `tests/test_team.py`, `tests/test_ready_pr.py`, `docs/ways-of-working/teams.md`, `development-process.md`, `git-workflow.md`, `docs/plans/merge-train.md`, `docs/templates/plan.md`, `changelog.d/README.md`, `.claude/agents/implementer.md`, `doc-keeper.md`, `.claude/skills/ready-pr/SKILL.md`, `CLAUDE.md` · Tests: `add --task/--pr` writes the line; fold ticks and collapses it within 400 characters (paths, then dependency ids, shortened) and refuses an unknown task or a line still too long before writing anything; `check` fails on an unknown task; a merged fragment marks its task done on the ref, an unmerged one does not; ready_pr refuses a plan-box tick unless a fold, requires `task: Tn (PR #<this>)` when the issue carries `task:Tn`, and refuses a `task:` line in another issue's fragment, for another PR or an unlabelled task · Depends on: n/a · Review: safety-reviewer, spec-critic.
 
 ## Chains (for team claims)
 
@@ -36,6 +39,7 @@ Shape (development-process.md, "Plan shape"): slice by file, not by step; no ope
 | wiring | T74 | T72 merged; beside T72b |
 | docs | T75 | T72c and T73 merged |
 | owner | T75b | T73, T74 and T75 merged |
+| plan ticks | T286 | built in the PR that adds it (#2280) |
 
 ## Verification
 

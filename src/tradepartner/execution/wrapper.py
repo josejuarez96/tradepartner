@@ -143,7 +143,9 @@ falling back to `settings.costs`. Each phase, in order:
 
 1. its open decisions (`reattempts.attempt_scope`); a phase with none stops here;
 2. the derived switch, after `switch.engage_from_overrides`: engaged ends the
-   batch `skipped_kill_switch`, nothing written, nothing submitted;
+   batch `skipped_kill_switch`, nothing written, nothing submitted (read again
+   before every submit, step 8: a mid-phase kill keeps what was already sent and
+   closes the phase's unsent orders `not_received`; #2182);
 3. the clock pre-check; a name with no listing at close(S-1) refused
    (`ValueError`) before any broker call; the phase's `assets` read;
 4. the orders: `phases.sell_orders`, or, for buys, `phases.buy_orders` over the
@@ -164,7 +166,10 @@ falling back to `settings.costs`. Each phase, in order:
 7. one write chunk: the phase-time `skipped` rows, then the `orders` rows
    (`sells_in_flight_at_submit` true on a sell, `not last` on a buy) and their
    `pending` events, committed before the first submit;
-8. each submit, then `get_order` every `paper.poll_interval_seconds` until the
+8. before each submit, the derived switch read again (engaged: the unsent
+   orders closed `not_received`, the batch `skipped_kill_switch`, #2182) and
+   then, last, the submit-window test (closed: the same close, #2178); then each
+   submit, then `get_order` every `paper.poll_interval_seconds` until the
    broker knows the order (`UnknownOrderError` meanwhile is "not yet") or
    `paper.accept_wait_max_seconds` passes; the `accepted` event carries the
    broker's order id. The first order of a run past that bound is journaled
@@ -203,7 +208,7 @@ import logging
 import re
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -264,6 +269,7 @@ from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.plan import BuyCosts, DecisionState, decision_state, residue
 from tradepartner.execution.planning import current_listings, reference_prices
 from tradepartner.execution.reattempts import attempt_scope, write_offs
+from tradepartner.execution.reconcile_run import order_symbols
 from tradepartner.execution.reserve import open_buy_reserve
 from tradepartner.execution.risk import (
     OpenSell,
@@ -432,6 +438,8 @@ _OK = "ok"
 _SKIPPED_KILL_SWITCH = "skipped_kill_switch"
 _SELL = "sell"
 _BUY = "buy"
+_FORCED_EXIT = "forced_exit"
+_SKIP_ASSET_UNKNOWN = "skip_asset_unknown"
 _EXIT = "exit"
 _PENDING = "pending"
 _ACCEPTED = "accepted"
@@ -558,6 +566,9 @@ class _Book:
     events: Sequence[OrderEventRow]
     fills: Sequence[OrderedFill]
     last_ok_ingest: datetime | None
+    #: The batch's names the one symbol map leaves ambiguous after a ticker
+    #: change, each with its note (#2185): never read or sent, handled per name.
+    ambiguous: Mapping[str, str] = field(default_factory=dict)
 
     def price_of(self, security_id: str) -> float:
         """The reference price on S, or `ValueError` for a name not read or
@@ -635,6 +646,8 @@ class RiskGatedBroker:
         self._journal = journal
         self._calendar = calendar
         self._alerter = alerter
+        #: Ticker-change lines (#2185) the run's `skipped` alert still owes.
+        self._unsent: list[str] = []
         self._sleep = sleep
         self._last: datetime | None = None
         #: The batch's orders `_collect` and `_await_sells` never poll: the
@@ -644,6 +657,8 @@ class RiskGatedBroker:
         #: window closed: every later submit, in either phase, re-runs the clock
         #: pre-check and the window test first (reset by `_trade`).
         self._recheck: bool = False
+        self._killed: bool = False
+        self._phase_incomplete: bool = False
 
     def __repr__(self) -> str:
         return f"RiskGatedBroker(broker={type(self._broker).__name__})"
@@ -752,16 +767,29 @@ class RiskGatedBroker:
         self._alert_skips(run, outcome.skips)
         return outcome
 
+    def note_unsent(self, line: str) -> None:
+        """Owe the run's `skipped` alert `line`: a held name a ticker change
+        leaves ambiguous whose exit is not sent (#2185)."""
+        self._unsent.append(line)
+
+    def alert_unsent(self, run: PaperRunRow) -> None:
+        """Write the run's `skipped` alert for the owed ticker-change lines, if
+        no batch has (the run's last step calls it)."""
+        self._alert_skips(run, ())
+
     def _alert_skips(self, run: PaperRunRow, skips: Sequence[Skip]) -> None:
         """One `skipped` alert for the run naming every per-name skip (the three
-        allowlist reasons) by security id and reason. The alerter dedupes on
-        (kind, run), so a second call in one run is a no-op."""
+        allowlist reasons) by security id and reason, and every owed
+        ticker-change line (#2185). The alerter dedupes on (kind, run), so a
+        second call in one run is a no-op."""
         named = [s for s in skips if s.reason in _ALERTED_SKIPS]
-        if not named or run.run_id is None:
+        unsent = list(dict.fromkeys(self._unsent))
+        if (not named and not unsent) or run.run_id is None:
             return
-        message = self._scrub(
-            f"{len(named)} skipped: " + "; ".join(f"{s.security_id} {s.reason}" for s in named)
-        )
+        self._unsent = []
+        listed = "; ".join(f"{s.security_id} {s.reason}" for s in named)
+        parts = [f"{len(named)} skipped: {listed}"] if named else []
+        message = self._scrub("; ".join([*parts, *unsent]))
         # No guard, as the run's other alerts (`run._alert`): an error takes the fault path.
         self._alerter.write(
             "skipped",
@@ -784,6 +812,8 @@ class RiskGatedBroker:
         rows = [*decisions, *forced_exits]
         self._set_aside = set()
         self._recheck = False
+        self._killed = False
+        self._phase_incomplete = False
         # The batch holds these rebalances: a halt in either phase marks them
         # `missed` (ADR 0010 point 2), whichever decisions that phase held.
         rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
@@ -812,16 +842,17 @@ class RiskGatedBroker:
                 return BatchOutcome(_SKIPPED_KILL_SWITCH)
             assets = self._phase_assets(run, book, rows, _SELL)
             _refuse_unknown_held(assets, book)
+            kept, unsent = _drop_ambiguous(book, rows, _SELL, notes, self._unsent)
             # Read once so the trim `sell_orders` caps and the `check_phase`
             # that verifies it see the same open sells (#605): both are the
             # same session's read of this same `book`.
             open_sells = _open_sells(book, {d.security_id for d in rows}, run.session)
             sold = phases.sell_orders(
-                decisions,
+                [d for d in decisions if d.security_id in kept],
                 book.states,
                 book.ledger,
                 book.residues,
-                forced_exits,
+                [d for d in forced_exits if d.security_id in kept],
                 book.actions,
                 book.price_of,
                 assets,
@@ -831,6 +862,7 @@ class RiskGatedBroker:
                 open_sells=open_sells,
             )
             _log_held(run, sold.held)
+            sold = replace(sold, skips=(*sold.skips, *unsent))
             nobody = Account(book.window.account_id, 0.0, 0.0, 0.0, self.read_clock())
             gated = self._gate(
                 run,
@@ -857,8 +889,11 @@ class RiskGatedBroker:
                 len(decisions),
                 frozenset(book.ledger.positions),
                 book.last_ok_ingest,
+                window=book.window,
             )
             skips, counted = (*skips, *refused), counted + len(refused)
+            if self._killed:
+                return BatchOutcome(_SKIPPED_KILL_SWITCH, tuple(submitted), skips)
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
                 self._await_sells(run, [row for row, _ in gated.to_submit], book, notes)
         if not any(d.side == _BUY for d in decisions):
@@ -900,8 +935,9 @@ class RiskGatedBroker:
         account = self._broker.account()
         cash = self._buys_cash(account, book, run.session)
         costs = book.costs
+        kept, unsent = _drop_ambiguous(book, rows, _BUY, notes, self._unsent)
         built = phases.buy_orders(
-            rows,
+            [r for r in rows if r.side != _BUY or r.security_id in kept],
             book.states,
             cash,
             sold,
@@ -912,6 +948,7 @@ class RiskGatedBroker:
             session=run.session,
             ended=book.ended,
         )
+        built = replace(built, skips=(*built.skips, *unsent))
         # A buy adding to a held name the broker lacks is a disagreement, not a skip.
         _refuse_unknown_held(assets, book, buys=True)
         # A name the broker does not know (the `assets` read's 404 answer) is
@@ -952,6 +989,7 @@ class RiskGatedBroker:
             plan_decisions,
             frozenset(book.ledger.positions),
             book.last_ok_ingest,
+            window=book.window,
         )
         refused_ids = {s.decision_id for s in refused}
         collected_written_off = self._collect(
@@ -971,23 +1009,41 @@ class RiskGatedBroker:
             sorted(
                 {
                     *collected_written_off,
+                    # A mid-phase break leaves deferred buys open for the next run.
                     *self._write_offs(
-                        run, rows, after, scope.last, completed=True, deferred=built.deferred
+                        run,
+                        rows,
+                        after,
+                        scope.last,
+                        completed=not self._phase_incomplete,
+                        deferred=built.deferred,
                     ),
                 }
             )
         )
+        # Only orders actually sent count as spent: a refusal, or an order closed
+        # `not_received` unsent (a mid-phase kill or a closed window), spent nothing.
+        sent = set(submitted)
+        sent_decisions = {
+            row.decision_id for row, request in gated.to_submit if request.client_order_id in sent
+        }
         spent = sum(
             (
                 _buy_cash(o.notional, o.quantity, o.price, o.whole_share, self._frozen, costs)
                 for o in gated.left
-                if o.decision_id not in refused_ids
+                if o.decision_id in sent_decisions
             ),
             Decimal(0),
         )
         left = float(max(Decimal(repr(cash)) - spent, Decimal(0)))
         return BatchOutcome(
-            _OK, tuple(submitted), (*gated.skips, *refused), built.deferred, written, cash, left
+            _SKIPPED_KILL_SWITCH if self._killed else _OK,
+            tuple(submitted),
+            (*gated.skips, *refused),
+            built.deferred,
+            written,
+            cash,
+            left,
         )
 
     def _buys_cash(self, account: Account, book: _Book, session: date) -> float:
@@ -1272,8 +1328,8 @@ class RiskGatedBroker:
             open_names = {o.security_id for o in orders if o.client_order_id not in terminal}
             optional, unpriced = _optional_prices(conn, session, open_names - names, actions)
             prices = {**prices, **optional}
-            symbols, unmappable, ended = _listings(
-                conn, session, sorted({d.security_id for d in rows}), self._settings
+            symbols, unmappable, ended, ambiguous = _listings(
+                conn, session, sorted({d.security_id for d in rows}), self._settings, window_id
             )
             residue_rows = (
                 adjustments_for(conn, window_id),
@@ -1332,6 +1388,7 @@ class RiskGatedBroker:
             events,
             fills,
             last_ok_ingest,
+            ambiguous,
         )
 
     def _engaged(self, run: PaperRunRow, window: PaperWindowRow) -> bool:
@@ -1378,8 +1435,11 @@ class RiskGatedBroker:
         would never reach the broker anyway."""
         assert run.session is not None
         self.clock_precheck(run.session, book.last_ok_ingest)
+        # A name the symbol map leaves ambiguous is never read (#2185): the
+        # phase skips it or keeps its exit open (`_drop_ambiguous`).
         names = sorted(
             {a.decision.security_id for a in attempt_scope(rows, book.states, phase=side).attempts}
+            - set(book.ambiguous)
         )
         unknown = [sid for sid in names if not book.symbols.get(sid) and sid not in book.unmappable]
         if unknown:
@@ -1432,6 +1492,8 @@ class RiskGatedBroker:
         plan_decisions: int,
         held: Collection[str] = (),
         last_ok_ingest: datetime | None = None,
+        *,
+        window: PaperWindowRow,
     ) -> tuple[list[str], list[Skip]]:
         """Submit each journaled request in order and await its acknowledgement;
         `submit`'s `Order` passes the shape check after the acknowledgement's
@@ -1448,14 +1510,28 @@ class RiskGatedBroker:
         submitted: list[str] = []
         refused: list[Skip] = []
         for index, (row, request) in enumerate(pairs):
+            assert run.session is not None
             if self._recheck:
-                # After the longer poll: the clock pre-check and the submit
-                # window run again before the next submit (item 4 (a)).
-                assert run.session is not None
+                # After the longer poll: the clock pre-check runs again before
+                # the next submit (item 4 (a)).
                 self.clock_precheck(run.session, last_ok_ingest)
-                if not self._in_submit_window(run.session):
-                    self._close_unsent(run, [r for r, _ in pairs[index:]])
-                    break
+            # The switch is re-read before EVERY submit (#2182, owner decision
+            # 2026-10-26): an owner kill mid-phase stops the phase's remaining
+            # orders (closed `not_received`) and the batch ends
+            # `skipped_kill_switch`, never `ok`.
+            if self._engaged(run, window):
+                self._killed = True
+                self._phase_incomplete = True
+                self._close_unsent(run, [r for r, _ in pairs[index:]])
+                break
+            # The window test comes last, right before `submit`: a store lock wait
+            # (`store.writer_lock_retry_seconds`), the switch read's included, may
+            # have run the clock past the window, and nothing is sent outside it
+            # (#2178).
+            if not self._in_submit_window(run.session):
+                self._phase_incomplete = True
+                self._close_unsent(run, [r for r, _ in pairs[index:]])
+                break
             try:
                 placed = self._broker.submit(request)
             except DuplicateClientOrderIdError as duplicate:
@@ -1919,6 +1995,38 @@ class RiskGatedBroker:
         return text
 
 
+def _drop_ambiguous(
+    book: _Book, rows: Sequence[DecisionRow], phase: str, notes: list[str], alerted: list[str]
+) -> tuple[frozenset[str], tuple[Skip, ...]]:
+    """The batch's names the phase may build orders for, and the skips of the
+    ones the one symbol map leaves ambiguous after a ticker change (#2185),
+    each noted on the run with the change: never sent, and never under the old
+    symbol. A buy or an ordinary sell of one is `skip_asset_unknown` (the
+    allowlist's reason, so no schema change). A forced exit of one (`delisted`,
+    `untargeted_receipt` or `window_stop`) is neither ordered nor skipped: it
+    stays open, so the name is still held and `paper stop` refuses `not_flat`
+    while it is; closing it skipped would leave the position held with its exit
+    closed. Its line also goes on `alerted`, the run's `skipped` alert."""
+    attempts = [
+        a.decision
+        for a in attempt_scope(rows, book.states, phase=phase).attempts
+        if a.decision.security_id in book.ambiguous
+    ]
+    skips: list[Skip] = []
+    for decision in attempts:
+        note = book.ambiguous[decision.security_id]
+        if decision.decision == _FORCED_EXIT:
+            line = f"{note}; forced exit {decision.decision_id} kept open, not sent"
+            notes.append(line)
+            alerted.append(line)
+            continue
+        assert decision.decision_id is not None
+        skips.append(Skip(decision.decision_id, decision.security_id, _SKIP_ASSET_UNKNOWN))
+        notes.append(f"{note}; {decision.side} {decision.decision_id} {_SKIP_ASSET_UNKNOWN}")
+    names = frozenset(r.security_id for r in rows) - set(book.ambiguous)
+    return names, tuple(skips)
+
+
 def _refuse_unknown_held(assets: Mapping[str, Asset], book: _Book, *, buys: bool = False) -> None:
     """A sells phase's name the broker's `assets` read does not know (its 404 answer,
     `UNRESOLVED_ASSET`) is a held name the broker lacks: the ledger and the broker
@@ -2030,13 +2138,19 @@ def _optional_prices(
 
 
 def _listings(
-    conn: duckdb.DuckDBPyConnection, session: date, names: Sequence[str], settings: Settings
-) -> tuple[dict[str, str | None], frozenset[str], frozenset[str]]:
-    """Each name's broker symbol (`execution.symbols.broker_symbol` of its
-    current listing at S among rows known at close(S-1); None without one or
-    without a broker form), the names whose listing has no broker form
-    (`unmappable`, #1729), and the names whose listing ended (`delisted`) at
-    close(S-1).
+    conn: duckdb.DuckDBPyConnection,
+    session: date,
+    names: Sequence[str],
+    settings: Settings,
+    window_id: int,
+) -> tuple[dict[str, str | None], frozenset[str], frozenset[str], dict[str, str]]:
+    """Each name's broker symbol from the one symbol map
+    (`reconcile_run.order_symbols`, #2185: its current listing at S among rows
+    known at close(S-1), under the new symbol of a ticker change the window's
+    reconciliation on S applied; None without one, without a broker form or
+    when ambiguous), the names whose listing has no broker form (`unmappable`,
+    #1729), the names whose listing ended (`delisted`) at close(S-1), and the
+    names a ticker change leaves ambiguous, with their notes.
 
     A delisted name's own ticker must not also be a *later* issuer's current
     ticker as of close(S-1): that reuse would otherwise let the `assets`
@@ -2050,20 +2164,16 @@ def _listings(
     names its own phase's attempt scope actually resolves, right before the
     broker `assets` call."""
     if not names:
-        return {}, frozenset(), frozenset()
+        return {}, frozenset(), frozenset(), {}
     cut = session_close(previous_session(session))
-    current = current_listings(listings_as_of(conn, cut, list(names)), session)
-    class_symbols = settings.alpaca.class_symbols
-    symbols = {
-        sid: (broker_symbol(current[sid], class_symbols) if sid in current else None)
-        for sid in names
-    }
-    unmappable = frozenset(sid for sid in current if sid in symbols and symbols[sid] is None)
+    mapped = order_symbols(conn, session, names, settings, window_id)
+    symbols = {sid: mapped.symbols.get(sid) for sid in names}
+    unmappable = frozenset(sid for sid, symbol in mapped.symbols.items() if symbol is None)
     ends = current_listings(
         listing_ends_as_of(conn, cut, settings, list(names)), previous_session(session)
     )
     delisted = frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
-    return symbols, unmappable, delisted
+    return symbols, unmappable, delisted, mapped.ambiguous
 
 
 def _refuse_reused_tickers(

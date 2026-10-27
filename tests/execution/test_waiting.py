@@ -10,17 +10,23 @@ from pathlib import Path
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig
 from tradepartner.execution import waiting
+from tradepartner.execution.shakedown import ShakedownLine
 from tradepartner.execution.switch import derive
 from tradepartner.execution.waiting import (
+    KIND_ORDER,
+    SHAKEDOWN_BOOK,
     BookFacts,
     LagFacts,
     ReportFacts,
     RunFacts,
+    ShakedownFacts,
     SpanAlert,
     SpanFacts,
     SwitchFacts,
     WaitingItem,
     build,
+    shakedown_next_step,
+    shakedown_progress,
 )
 from tradepartner.store.journal import (
     KillSwitchRow,
@@ -83,8 +89,11 @@ def _result(run_id: int, status: str, finished_at: datetime) -> PaperRunResultRo
     )
 
 
-def _switch_row(event_id: int, state: str, at: datetime, source: str = "fault") -> KillSwitchRow:
+def _switch_row(
+    event_id: int, state: str, at: datetime, source: str = "fault", reason: str | None = None
+) -> KillSwitchRow:
     return KillSwitchRow(
+        reason=reason,
         event_id=event_id,
         window_id=1,
         at=at,
@@ -165,9 +174,20 @@ def test_a_switch_engaged_by_a_halt_is_an_item_since_the_engaged_row() -> None:
         book_id="main",
         kind="kill_switch_engaged",
         since=_at(THU, 15),
-        detail="kill switch engaged: kill_switch event 1 engaged (fault); run 1 halted",
+        detail="kill switch engaged: a fault switched it on "
+        "(a failed check or broker problem) (event 1); "
+        "run 1 halted itself on a failed safety check",
         command='tradepartner paper resume --book main --reason "<why>"',
     )
+
+
+def test_the_reason_is_one_line() -> None:
+    row = _switch_row(
+        1, "engaged", _at(THU, 15), "owner", reason="stop\n  now, mail me@example.com"
+    )
+    (item,) = build([BookFacts(book_id="main", switch=_switch([row], []))], None)
+    assert "\n" not in item.detail
+    assert "reason given: stop now," in item.detail
 
 
 def test_a_switch_with_only_a_run_in_progress_is_no_item() -> None:
@@ -179,7 +199,7 @@ def test_a_switch_with_only_a_run_in_progress_is_no_item() -> None:
     unfinished = _switch([], [running], lock_free=True)
     (item,) = build([BookFacts(book_id="main", switch=unfinished)], None)
     assert item.kind == "kill_switch_engaged" and item.since == _at(THU)
-    assert item.detail == "kill switch engaged: run 1 unfinished"
+    assert item.detail == "kill switch engaged: run 1 never finished (the process stopped part way)"
 
 
 def test_a_crashed_run_with_no_kill_switch_row_is_since_the_earliest_engaging_run() -> None:
@@ -192,7 +212,9 @@ def test_a_crashed_run_with_no_kill_switch_row_is_since_the_earliest_engaging_ru
     assert facts.state.engaged_row is None
     (item,) = build([BookFacts(book_id="main", switch=facts)], None)
     assert item.since == _at(FRI)
-    assert item.detail == "kill switch engaged: run 2 crashed; run 3 failed"
+    assert item.detail == (
+        "kill switch engaged: run 2 crashed with an error; run 3 failed with an error"
+    )
 
 
 def test_a_released_switch_is_no_item() -> None:
@@ -387,3 +409,93 @@ def test_the_module_does_no_io() -> None:
     text = Path(waiting.__file__).read_text()
     for banned in ("duckdb", "open(", "utc_now", "datetime.now", "subprocess", "requests"):
         assert banned not in text
+
+
+# --- the shakedown's lines (#2298) ---------------------------------------------------
+
+
+def _line(
+    name: str,
+    *,
+    passed: bool = False,
+    progress: tuple[str, ...] = (),
+    problems: tuple[str, ...] = (),
+) -> ShakedownLine:
+    return ShakedownLine(
+        name=name,
+        passed=passed,
+        rows="r",
+        query="q",
+        thresholds="t",
+        detail=f"{name} found\nthis",
+        progress=progress,
+        problems=problems,
+    )
+
+
+def test_a_failing_line_is_one_item_with_the_line_and_its_next_step() -> None:
+    facts = ShakedownFacts(
+        lines=(
+            _line("E.1 sessions", progress=("3 of 10 sessions",)),
+            _line("E.2 reconciliation", passed=True),
+            _line("E.3 orders"),
+            _line("E.4 kill-switch drill", progress=("kill-switch drill not done yet",)),
+        )
+    )
+    (item,) = build([], None, facts)
+    assert item == WaitingItem(
+        book_id=SHAKEDOWN_BOOK,
+        kind="shakedown_failing",
+        since=None,
+        detail=(
+            "shakedown line E.3 orders is failing: E.3 orders found this; next: "
+            + shakedown_next_step("E.3 orders")
+        ),
+        command="tradepartner paper shakedown",
+        line="E.3 orders",
+    )
+
+
+def test_a_line_short_on_time_and_failing_on_a_problem_is_an_item() -> None:
+    facts = ShakedownFacts(
+        lines=(_line("E.1 sessions", progress=("3 of 10 sessions",), problems=("missed",)),)
+    )
+    assert [i.line for i in build([], None, facts)] == ["E.1 sessions"]
+
+
+def test_an_unreadable_shakedown_is_one_item() -> None:
+    (item,) = build([], None, ShakedownFacts(error="window 2 frozen_json has no usable x"))
+    assert item.kind == "shakedown_failing" and item.line is None
+    assert item.detail.startswith("the shakedown could not be read: window 2 frozen_json")
+    assert shakedown_progress(ShakedownFacts(error="x")) is None
+
+
+def test_a_failing_item_sorts_after_the_note_items_and_before_report_due() -> None:
+    assert KIND_ORDER.index("shakedown_note") < KIND_ORDER.index("shakedown_failing")
+    assert KIND_ORDER.index("shakedown_failing") < KIND_ORDER.index("report_due")
+
+
+def test_progress_words_name_the_lines_in_progress_and_count_the_failing() -> None:
+    assert shakedown_progress(None) is None
+    assert (
+        shakedown_progress(ShakedownFacts(lines=(_line("E.2 reconciliation", passed=True),)))
+        == "shakedown: every line passes so far (E.7's health half is not checked here; "
+        "`paper shakedown` is the gate)"
+    )
+    facts = ShakedownFacts(
+        lines=(
+            _line("E.1 sessions", progress=("3 of 10 sessions", "1 of 5 order sessions")),
+            _line("E.3 orders"),
+            _line("E.4 kill-switch drill", progress=("kill-switch drill not done yet",)),
+        )
+    )
+    assert shakedown_progress(facts) == (
+        "shakedown in progress: E.1 sessions: 3 of 10 sessions, 1 of 5 order sessions; "
+        "E.4 kill-switch drill: kill-switch drill not done yet "
+        "(1 line(s) failing, listed under waiting on you)"
+    )
+
+
+def test_an_unknown_line_points_at_paper_shakedown() -> None:
+    assert "tradepartner paper shakedown --verbose" in shakedown_next_step("E.9 new")
+    assert "tradepartner paper shakedown --verbose" in shakedown_next_step(None)

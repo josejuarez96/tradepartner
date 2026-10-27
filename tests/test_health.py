@@ -11,6 +11,7 @@ future schema, could have.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -75,6 +76,7 @@ from tradepartner.health import (
     CoverageReference,
     HealthReport,
     IndexMembersCheck,
+    IntegrityCheck,
     _bars_after_delisting,
     _overlapping_listings,
     bar_gaps,
@@ -86,10 +88,12 @@ from tradepartner.health import (
     figi_types,
     filing_event_counts,
     health_report,
+    health_verdict,
     integrity_checks,
     last_ingests,
     listed_without_bars,
     sample_sessions,
+    stale_gap_expected,
     statement_counts,
     statement_coverage,
     static_reliance,
@@ -446,6 +450,7 @@ def _run(
     *,
     cursor: str | None = None,
     message: str | None = None,
+    mode: str = "session",
 ) -> None:
     insert_row(
         conn,
@@ -456,7 +461,7 @@ def _run(
             "finished_at": started + timedelta(minutes=5),
             "status": status,
             "source": source,
-            "mode": "daily",
+            "mode": mode,
             "rows_added": 0,
             "chunk_cursor": cursor,
             "message": message,
@@ -528,6 +533,106 @@ def test_last_ingests_shows_the_daily_alpaca_run_not_an_actions_backfill_month(
     assert alpaca.latest_status == "ok"
     assert alpaca.latest_started_at == day1
     assert alpaca.last_ok_cursor == "2020-06-29"
+
+
+def test_last_ingests_shows_a_failed_ingest_not_a_later_repair_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #2125: a `repair` row (mode `repair`, status `repaired`) after a failed
+    # nightly ingest must not become the latest Alpaca run and hide the
+    # failure.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    _run(fixture_store, "a2", "alpaca", "failed", day2, message="boom")
+    _run(
+        fixture_store,
+        "a3",
+        "alpaca",
+        "repaired",
+        day2 + timedelta(minutes=10),
+        message="deleted 1 duplicate dividend row",
+        mode="repair",
+    )
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "failed"
+    assert alpaca.latest_started_at == day2
+    assert alpaca.latest_message == "boom"
+    assert alpaca.last_ok_cursor == "2020-06-29"
+
+
+def test_last_ingests_leaves_out_an_action_retract_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #2125: an `action-retract` row (mode `action_retract`, status
+    # `repaired`; held PR #2121) is not an ingest either.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    _run(
+        fixture_store,
+        "a2",
+        "alpaca",
+        "repaired",
+        day2,
+        message="withdrew a split",
+        mode="action_retract",
+    )
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day1
+
+
+def test_last_ingests_leaves_out_a_hole_fill_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # A `--fill-holes` month (mode `holes`, status `filled`, never `ok`) is a
+    # maintenance run, not a fresh ingest, so it is left out like an actions
+    # month (#833, #1676, #2125).
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    _run(
+        fixture_store,
+        "a2",
+        "alpaca",
+        "filled",
+        day2,
+        cursor="holes;since=2020-06-01;through=2020-06-30",
+        mode="holes",
+    )
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day1
+
+
+def test_last_ingests_counts_a_backfill_chunk(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # A `--backfill` chunk (mode `backfill`) is a real ingest: its `ok` run
+    # and cursor are the source's last ok.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "failed", day1, message="boom")
+    _run(fixture_store, "a2", "alpaca", "ok", day2, cursor="2020-06-29", mode="backfill")
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day2
+    assert alpaca.last_ok_cursor == "2020-06-29"
+
+
+def test_last_ingests_leaves_out_an_unknown_mode(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # The mode set is an allow-list, so a mode added later (here a made-up
+    # one) is left out without a code change.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    _run(fixture_store, "a2", "alpaca", "failed", day2, mode="future_maintenance")
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day1
 
 
 def test_last_ingests_ignores_a_run_not_finished_at_t(
@@ -2087,7 +2192,7 @@ def test_statement_facts_report_reads_the_latest_edgar_run_message(
             "finished_at": T_END - timedelta(minutes=1),
             "status": "ok",
             "source": "edgar",
-            "mode": "daily",
+            "mode": "session",
             "rows_added": 0,
             "chunk_cursor": None,
             "message": "0 securities; statement_vintage_late: 2, statement_derived: 1",
@@ -4348,3 +4453,99 @@ def test_a_store_without_the_mergers_table_reports_an_empty_block(
     assert report.mergers.latest_known_at is None
     assert report.mergers.conflicts.is_empty()
     assert report.mergers.after_effective.is_empty()
+
+
+# --- Verdict line (#2202) ---------------------------------------------------
+
+_PAPER = "Paper run readiness and halts: `tradepartner paper status`."
+
+
+def _at(report: HealthReport, t: datetime, session: date, last_bar: date) -> HealthReport:
+    return dataclasses.replace(
+        report,
+        t=t,
+        session=session,
+        coverage=dataclasses.replace(report.coverage, last_bar=last_bar),
+    )
+
+
+def test_verdict_describes_data_only_when_bars_are_current(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    report = health_report(fixture_store, T_END, settings)
+    verdict = health_verdict(report)
+    assert verdict.startswith("Data: checks pass, bars current to 2020-06-30.")
+    assert verdict.endswith(_PAPER)
+    assert "next paper run" not in verdict
+    assert "with 2 warning(s)" in health_verdict(report, 2)
+
+
+def test_verdict_expects_the_gap_before_the_evening_ingest(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    t = session_close(date(2020, 7, 1)) + timedelta(hours=1)  # 17:00 ET, before 18:30
+    report = health_report(fixture_store, t, settings)
+    assert stale_gap_expected(report)
+    assert "expected until tonight's 18:30 ET ingest" in health_verdict(report)
+
+
+def test_verdict_after_the_ingest_time_says_it_should_be_running(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    t = session_close(date(2020, 7, 1)) + timedelta(hours=3)  # 19:00 ET
+    report = health_report(fixture_store, t, settings)
+    assert not stale_gap_expected(report)
+    assert "tonight's ingest should be running or just finished" in health_verdict(report)
+
+
+def test_verdict_names_a_stale_store_with_no_ingest_due(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    t = session_close(date(2020, 7, 7)) + timedelta(hours=3)
+    verdict = health_verdict(health_report(fixture_store, t, settings))
+    assert "4 sessions behind" in verdict
+    assert "run `tradepartner ingest`" in verdict
+
+
+def test_verdict_gap_is_expected_on_a_half_day(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    half_day = date(2020, 11, 27)  # 13:00 close, after Thanksgiving
+    report = health_report(fixture_store, T_END, settings)
+    early = _at(report, session_close(half_day) + timedelta(hours=1), half_day, date(2020, 11, 25))
+    assert stale_gap_expected(early)  # 14:00 ET
+    late = _at(report, session_close(half_day) + timedelta(hours=6), half_day, date(2020, 11, 25))
+    assert not stale_gap_expected(late)  # 19:00 ET
+
+
+def test_verdict_ingest_time_follows_the_dst_change(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    session = date(2026, 11, 2)  # first session after the 2026-11-01 change to EST
+    report = health_report(fixture_store, T_END, settings)
+    before = _at(report, datetime(2026, 11, 2, 23, 20, tzinfo=UTC), session, date(2026, 10, 30))
+    after = _at(report, datetime(2026, 11, 2, 23, 40, tzinfo=UTC), session, date(2026, 10, 30))
+    assert stale_gap_expected(before)  # 18:20 EST
+    assert not stale_gap_expected(after)  # 18:40 EST
+
+
+def test_verdict_names_integrity_failures(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    report = health_report(fixture_store, T_END, settings)
+    failing = dataclasses.replace(
+        report,
+        integrity=(IntegrityCheck("some_rule", pl.DataFrame({"x": [1]})),),
+    )
+    verdict = health_verdict(failing)
+    assert verdict.startswith("Data: 1 integrity check(s) fail (some_rule)")
+
+
+def test_verdict_for_an_empty_store(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    report = health_report(fixture_store, T_END, settings)
+    empty = dataclasses.replace(
+        report, coverage=dataclasses.replace(report.coverage, last_bar=None)
+    )
+    assert "no price bars" in health_verdict(empty)
