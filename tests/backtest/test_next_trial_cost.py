@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import math
 import statistics
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from typing import Any
 
 import duckdb
 import pytest
 
-from tradepartner.backtest import metrics, results
+from tradepartner.backtest import lab, metrics, results
 from tradepartner.config import Settings
 from tradepartner.store import lab_registry, registry
 from tradepartner.store.db import insert_row, utc_now
@@ -134,8 +136,18 @@ def test_floor_lifts_a_small_v_as_the_sweep_close_does(
     assert low.sr_star_now == pytest.approx(metrics.expected_max_sharpe(3, v))
 
 
-def test_sr_star_now_with_family_floor_equals_last_closed_sweep_run_at_todays_n(
-    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+class _Clock:
+    """A fixed Saturday outside every quiet interval; `sleep` is never reached."""
+
+    def now(self) -> datetime:
+        return datetime(2026, 10, 10, 16, 0, tzinfo=UTC)
+
+    def sleep(self, seconds: float) -> None:
+        raise AssertionError("the close must not wait")
+
+
+def test_sr_star_now_equals_what_the_real_sweep_close_stores_at_todays_n(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _family(lab_store, settings, [0.5, 0.52, 0.51])
     first = lab_store.execute("SELECT MIN(hypothesis_id) FROM hypotheses").fetchone()[0]  # type: ignore[index]
@@ -151,8 +163,6 @@ def test_sr_star_now_with_family_floor_equals_last_closed_sweep_run_at_todays_n(
         sr_star_seed_annual=None,
         settings=settings,
     )
-    # What lab._close_run records at today's N (3) with V floored.
-    recorded = metrics.expected_max_sharpe(3, rules.min_sharpe_variance_annual)
     sweep = lab_registry.register_sweep(
         lab_store,
         slug="g",
@@ -182,22 +192,26 @@ def test_sr_star_now_with_family_floor_equals_last_closed_sweep_run_at_todays_n(
         code_tree_sha256="c" * 64,
         run_by="test",
     )
-    lab_registry.close_sweep_run(
-        lab_store,
-        run_id,
-        n_ok=1,
-        n_failed=0,
-        n_terminal_failed=0,
-        seconds=1.0,
-        n_trials_at_end=3,
-        sr_star_annual_at_end=recorded,
-        completed=True,
-    )
-    (stored,) = lab_store.execute("SELECT sr_star_annual_at_end FROM sweep_runs").fetchone()  # type: ignore[misc]
+
+    @contextmanager
+    def _same_store(_store: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+        yield lab_store
+
+    monkeypatch.setattr(lab, "open_for_write", _same_store)
+    timing = lab._Timing(clock=_Clock(), settings=settings, paper_window_open=False)
+    # The real close: it computes N, V and SR* itself and writes them to sweep_runs.
+    lab._close_run(settings, sweep, run_id, [], timing, _Clock().now(), False)
+
+    ((n_end, stored),) = lab_store.execute(
+        "SELECT n_trials_at_end, sr_star_annual_at_end FROM sweep_runs WHERE sweep_run_id = ?",
+        [run_id],
+    ).fetchall()
     cost = results.next_trial_cost(
         lab_store, "momentum", basis="excess_spy", floor=rules.min_sharpe_variance_annual
     )
-    assert cost.n_now == 3
+    assert n_end == cost.n_now == 3
+    assert cost.floored is True
+    assert stored > 0
     assert cost.sr_star_now == pytest.approx(stored)
 
 
