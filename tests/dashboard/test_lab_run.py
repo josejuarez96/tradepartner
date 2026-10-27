@@ -82,7 +82,7 @@ def test_empty_slot_inside_grace_is_busy_and_never_taken_over(slot: Path) -> Non
     # a second tab inside the grace
     res = _take(slot)
     assert isinstance(res, Busy)
-    assert slot.exists() and slot.stat().st_size == 0
+    assert slot.exists() and lab_run._read(slot) is None
     assert not list(slot.parent.glob("*.stale*"))
 
 
@@ -421,7 +421,7 @@ def test_record_refuses_when_another_tab_took_the_slot_over(slot: Path, tmp_path
             start_time_of=lambda _p: "S",
             taken=first,
         )
-    assert slot.stat().st_size == 0  # tab B's file is untouched
+    assert lab_run._read(slot) is None  # tab B's file is untouched
 
 
 def _ps_down(_pid: int) -> str | None:

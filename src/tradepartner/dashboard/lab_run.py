@@ -73,8 +73,7 @@ class Taken:
     """The slot is ours; the caller spawns, then calls `record` (or `abandon`)."""
 
     slot_path: Path
-    dev: int = 0
-    ino: int = 0
+    token: str = ""
 
 
 @dataclass(frozen=True)
@@ -200,13 +199,14 @@ def _create(slot_path: Path) -> Taken | None:
         fd = os.open(slot_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, _FILE_MODE)
     except FileExistsError:
         return None
+    token = uuid.uuid4().hex
     try:
-        made = os.fstat(fd)
+        os.write(fd, json.dumps({"token": token}).encode())
     finally:
         os.close(fd)
     with contextlib.suppress(OSError):
         last_path(slot_path).unlink()
-    return Taken(slot_path, made.st_dev, made.st_ino)
+    return Taken(slot_path, token)
 
 
 def _in_grace(path: Path, now: datetime, grace_seconds: float) -> bool:
@@ -233,7 +233,7 @@ def take(
     if (made := _create(slot_path)) is not None:
         return made
     try:
-        before = slot_path.stat()
+        judged = slot_path.read_text()
     except FileNotFoundError:
         made = _create(slot_path)
         return made if made is not None else Busy(("another tab took the slot",))
@@ -249,8 +249,11 @@ def take(
         os.rename(slot_path, aside)
     except FileNotFoundError:
         return Busy(("another tab took over the stale slot",))
-    moved = aside.stat()
-    if (moved.st_ino, moved.st_mtime_ns) != (before.st_ino, before.st_mtime_ns):
+    try:
+        moved = aside.read_text()
+    except OSError:
+        moved = None
+    if moved != judged:  # content, not inode: inode numbers are reused at once
         # We renamed a file another tab had just made: put it back.
         with contextlib.suppress(OSError):
             os.link(aside, slot_path)
@@ -289,10 +292,10 @@ def record(
         raise ValueError("started_at must be tz-aware")
     if taken is not None:
         try:
-            cur = slot_path.stat()
-        except OSError as exc:
+            current = json.loads(slot_path.read_text())
+        except (OSError, ValueError) as exc:
             raise SlotLost(str(slot_path)) from exc
-        if (cur.st_dev, cur.st_ino) != (taken.dev, taken.ino):
+        if not isinstance(current, dict) or current.get("token") != taken.token:
             raise SlotLost(str(slot_path))
     try:
         pid_start = start_time_of(child.pid)
