@@ -106,7 +106,21 @@ listing has the snapshot's ticker and exchange (a changed ticker leaves the
 earlier one unknown: reported, not written). Otherwise the row is
 `snapshot`, valid from the fetch session, and only for a class with no
 cover page. `known_at` is always the fetch time. Only the earliest fetch
-writes a class's static span. A name delisted before the snapshot and
+writes a class's static span.
+
+**Snapshot renames** (#2291). The SEC's ticker file is current-only and each
+nightly run fetches it once, so `build_master` also takes the fetches the
+store's live EDGAR snapshot rows record (`stored_snapshot_fetches`, read at
+the run clock) and judges every distinct fetch in time order. A fetch
+repeating a class's latest snapshot ticker adds nothing. Another ticker on
+a class with no cover page known at the fetch is a ticker change: a
+`snapshot` row valid from the fetch session, known at the fetch, which ends
+the old line there as the as-of reads treat any ticker change; never a
+second span with the old start. A class with a cover page known at the
+fetch, or a change on its latest span's own session, is reported in
+`unmatched_snapshot` instead (once per ticker and exchange). An exchange
+change alone writes nothing. A name absent from today's fetch (delisted)
+gets no row: its stored rows only re-derive themselves. A name delisted before the snapshot and
 before cover pages has no listing at all: it is returned in
 `unlisted_securities` so health and the survivorship gap can count it.
 
@@ -369,7 +383,8 @@ class _Class:
     pairs: _Pairs = frozenset()  # (ticker, exchange) on the latest cover page showing it
     history: list[tuple[datetime, _Pairs]] = field(default_factory=list)
     first_listing: tuple[str, str, date, datetime] | None = None  # + the row's known_at
-    static_ticker: str | None = None  # ticker of the static span, once written
+    #: The ticker and start of its latest companies-snapshot row (#2291).
+    snapshot_span: tuple[str, date] | None = None
     exchanges: set[str] = field(default_factory=set)  # exchanges of its cover-page rows
     pair_titles: dict[tuple[str, str], str] = field(default_factory=dict)  # latest title per pair
     delisted_on: set[str] = field(default_factory=set)  # exchanges a Form 25 named
@@ -913,13 +928,20 @@ class _Builder:
             if cls is None:
                 self.unmatched.append(entry)
                 continue
-            if self.static and cls.static_ticker is not None:
-                # The earliest fetch already covered the span before cover
-                # pages; a later fetch showing another ticker is reported.
-                if entry.ticker != cls.static_ticker:
+            first_listing = cls.first_listing_at(t)
+            if cls.snapshot_span is not None:
+                # A fetch repeating the class's latest snapshot ticker adds
+                # nothing. Another ticker on a class with no cover page known
+                # at the fetch is a rename from the fetch session (#2291);
+                # otherwise it is reported, never a second span.
+                ticker, since = cls.snapshot_span
+                if entry.ticker == ticker:
+                    continue
+                if first_listing is None and session_of(t) > since:
+                    self._snapshot_listing(cls, entry, session_of(t), "snapshot")
+                else:
                     self.unmatched.append(entry)
                 continue
-            first_listing = cls.first_listing_at(t)
             if first_listing is None:
                 if self.static:
                     start, provenance = session_of(cls.known_at), "snapshot_static"
@@ -936,8 +958,7 @@ class _Builder:
     def _snapshot_listing(
         self, cls: _Class, entry: CompanySnapshotEntry, start: date, provenance: str
     ) -> None:
-        if provenance == "snapshot_static" and cls.static_ticker is None:
-            cls.static_ticker = entry.ticker
+        cls.snapshot_span = (entry.ticker, start)
         self.listing(
             cls.security_id,
             entry.ticker,
@@ -1001,8 +1022,30 @@ def _match(classes: list[_Class], item: CoverListing, claimed: dict[str, str]) -
     return by_ticker[0] if by_ticker else None
 
 
-def build_master(source: FilingSource, settings: Settings, *, ingested_at: datetime) -> MasterBuild:
+def _first_per_line(entries: Iterable[CompanySnapshotEntry]) -> tuple[CompanySnapshotEntry, ...]:
+    """`entries` once per (cik, ticker, exchange), the first of each, in
+    order: every distinct fetch is judged since #2291, so one unmatched line
+    seen in several fetches is still reported once, as before."""
+    first: dict[tuple[str, str, str], CompanySnapshotEntry] = {}
+    for entry in entries:
+        first.setdefault((entry.cik, entry.ticker, entry.exchange), entry)
+    return tuple(first.values())
+
+
+def build_master(
+    source: FilingSource,
+    settings: Settings,
+    *,
+    ingested_at: datetime,
+    earlier_fetches: Sequence[CompanySnapshotEntry] = (),
+) -> MasterBuild:
     """`securities` and `listings` rows for every issuer CIK and benchmark.
+
+    `earlier_fetches` are companies-snapshot entries from earlier runs
+    (`stored_snapshot_fetches`, #2291): judged with `source`'s fetches in
+    time order, so a run that sees only today's SEC ticker file still knows
+    the ticker a class's snapshot span was written under. They never seed a
+    benchmark.
 
     Pure apart from calling `source`. Raises `ValueError` if any record's
     `known_at` is later than `ingested_at` (spec: `known_at <= ingested_at`).
@@ -1024,14 +1067,19 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
 
     snapshot: dict[tuple[str, str, str], CompanySnapshotEntry] = {}
     fetches: dict[str, list[CompanySnapshotEntry]] = defaultdict(list)  # every fetch, per CIK
-    for snap in source.companies_snapshot():  # earliest fetch wins per (cik, ticker, exchange)
-        fetches[snap.cik].append(snap)
+    current = source.companies_snapshot()
+    for snap in current:  # earliest fetch wins per (cik, ticker, exchange): benchmarks
         key = (snap.cik, snap.ticker, snap.exchange)
         if key not in snapshot or snap.fetched_at < snapshot[key].fetched_at:
             snapshot[key] = snap
+    # Every distinct fetch, this run's and earlier runs' (#2291), so a class
+    # can change ticker and change back; a repeat of its ticker adds nothing.
+    every = [*earlier_fetches, *current]
+    distinct = {(e.cik, e.ticker, e.exchange, e.fetched_at): e for e in every}
     benchmarks = set(settings.benchmarks)
     by_cik: dict[str, list[CompanySnapshotEntry]] = defaultdict(list)
-    for snap in sorted(snapshot.values(), key=lambda e: (e.cik, e.fetched_at, e.ticker)):
+    for snap in sorted(distinct.values(), key=lambda e: (e.cik, e.fetched_at, e.ticker)):
+        fetches[snap.cik].append(snap)
         if snap.ticker not in benchmarks:
             by_cik[snap.cik].append(snap)
 
@@ -1081,7 +1129,7 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
     return MasterBuild(
         securities=tuple(builder.securities),
         listings=tuple(builder.listings),
-        unmatched_snapshot=tuple(builder.unmatched),
+        unmatched_snapshot=_first_per_line(builder.unmatched),
         missing_benchmarks=tuple(missing),
         unlisted_securities=tuple(
             row["security_id"] for row in builder.securities if row["security_id"] not in listed
@@ -1633,3 +1681,41 @@ def securities_as_of(
     sorted by `security_id`. A bare date raises `TypeError`, a naive
     datetime `ValueError` (same rules as `store.asof`)."""
     return _latest_as_of(conn, "securities", ("security_id",), _validate_t(t), security_ids)
+
+
+#: The `listings` provenances a companies-snapshot fetch writes (#2291).
+_SNAPSHOT_PROVENANCES = ("snapshot", "snapshot_static")
+
+#: Per stored EDGAR snapshot row known by `?`: its key's earliest `known_at`
+#: (the fetch that wrote it) while its latest revision is not retracted.
+_STORED_FETCHES_SQL = f"""
+    SELECT security_id, ticker, exchange, min(known_at) AS fetched_at
+    FROM listings
+    WHERE source = '{_EDGAR}'
+      AND provenance IN {_SNAPSHOT_PROVENANCES}
+      AND known_at <= ?
+    GROUP BY security_id, ticker, exchange, valid_from
+    HAVING NOT arg_max(retracted, known_at)
+    ORDER BY fetched_at, security_id, ticker, exchange
+"""
+
+
+def stored_snapshot_fetches(
+    conn: duckdb.DuckDBPyConnection, at: datetime
+) -> tuple[CompanySnapshotEntry, ...]:
+    """The companies-snapshot fetches the store's live EDGAR `snapshot` and
+    `snapshot_static` listings record, known at `at` (#2291): one entry per
+    row key, its CIK the row's (`security_cik`), fetched at the key's
+    earliest `known_at`. Each nightly run fetches only the current SEC
+    ticker file; `build_master(earlier_fetches=...)` judges these with it,
+    so a renamed class is matched against the ticker its span was written
+    under. A retracted key is no fetch; a config benchmark row is not EDGAR's.
+    The entries carry no name: a benchmark is never seeded from them.
+    A bare date raises `TypeError`, a naive datetime `ValueError`."""
+    at = _validate_t(at)
+    return tuple(
+        CompanySnapshotEntry(security_cik(security_id), "", ticker, exchange, fetched_at)
+        for security_id, ticker, exchange, fetched_at in conn.execute(
+            _STORED_FETCHES_SQL, [at]
+        ).fetchall()
+    )

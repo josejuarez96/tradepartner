@@ -56,7 +56,12 @@ from tradepartner.adapters.prices import (
 from tradepartner.adapters.rates import RateObservation, rate_known_at
 from tradepartner.calendar import all_sessions
 from tradepartner.config import BorrowConfig, Settings, secret_values
-from tradepartner.health import filing_event_counts, statement_counts
+from tradepartner.health import (
+    NON_OVERLAPPING_LISTINGS,
+    filing_event_counts,
+    integrity_checks,
+    statement_counts,
+)
 from tradepartner.ingest import (
     DARK,
     FACT_NAMES,
@@ -2726,6 +2731,52 @@ def test_an_otc_common_name_is_not_in_the_staleness_denominator(
     assert result.ok is ok, result.runs[-1].message
     if ok:
         assert "0 of 3 listed names missing" in result.runs[-1].message
+
+
+def _with_renamed_stat(ticker: str, fetched_at: datetime) -> FixtureFilingSource:
+    """`_with_stat` whose STAT shows `ticker` in the SEC file fetched at `fetched_at`."""
+    accession = f"{STAT}-18-000001"
+    return _filings(
+        fetched_at,
+        extra_index=[FilingIndexEntry(STAT, "Stat Corp", "10-K", accession, _at(2018, 3, 5))],
+        extra_headers=[FilingHeader(STAT, accession, "10-K", 3571, _at(2018, 3, 5))],
+        extra_facts=[_fact(STAT, "", 3_000_000, accession, _at(2018, 3, 5))],
+        extra_snapshot=[CompanySnapshotEntry(STAT, "Stat Corp", ticker, "OTC", fetched_at)],
+    )
+
+
+def test_a_no_cover_page_rename_is_one_dated_row_across_nightly_runs(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    # #2291: each run sees only the current SEC file. The rename is one
+    # `snapshot` row from its fetch session, never a second same-start
+    # `snapshot_static` row, and the next runs add nothing.
+    nights = [
+        (NOW, FETCHED_AT, "STAT"),
+        (NOW + timedelta(days=3), FETCHED_AT + timedelta(days=3), "STAX"),  # Mon 07-01
+        (NOW + timedelta(days=4), FETCHED_AT + timedelta(days=4), "STAX"),
+        (NOW + timedelta(days=5), FETCHED_AT + timedelta(days=5), "STAX"),
+    ]
+    stored = []
+    for now, fetched_at, ticker in nights:
+        filings = _with_renamed_stat(ticker, fetched_at)
+        result = _run(settings, now=now, source="edgar", filings=filings)
+        assert result.ok, result.runs[-1].message
+        stored.append(_counts(read)["listings"])
+    rows = read(
+        "SELECT ticker, provenance, valid_from, known_at FROM listings "
+        f"WHERE security_id = '{STAT}' ORDER BY valid_from"
+    )
+    assert rows == [
+        ("STAT", "snapshot_static", date(2018, 3, 5), FETCHED_AT),
+        ("STAX", "snapshot", date(2019, 7, 1), FETCHED_AT + timedelta(days=3)),
+    ]
+    assert stored[1] == stored[0] + 1
+    assert stored[3] == stored[2] == stored[1]
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        checks = integrity_checks(conn, nights[-1][0], settings)
+    (overlap,) = [c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS]
+    assert overlap.passed, overlap.violations
 
 
 NOT_COMMON = (
