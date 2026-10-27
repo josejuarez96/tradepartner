@@ -249,7 +249,12 @@ def test_next_take_clears_last(slot: Path, tmp_path: Path) -> None:
 def test_status_idle_starting_running_ended(slot: Path, tmp_path: Path) -> None:
     def st() -> lab_run.SlotStatus:
         return lab_run.status(
-            slot, scrub=lambda s: s, now=NOW, grace_seconds=30, start_time_of=lambda _p: "S1"
+            slot,
+            scrub=lambda s: s,
+            now=NOW,
+            grace_seconds=30,
+            start_time_of=lambda _p: "S1",
+            tail_bytes=4000,
         )
 
     assert st().state == "idle"
@@ -272,7 +277,12 @@ def test_status_idle_starting_running_ended(slot: Path, tmp_path: Path) -> None:
     slot.write_text(json.dumps(d))
     assert (
         lab_run.status(
-            slot, scrub=lambda s: s, now=NOW, grace_seconds=30, start_time_of=lambda _p: None
+            slot,
+            scrub=lambda s: s,
+            now=NOW,
+            grace_seconds=30,
+            start_time_of=lambda _p: None,
+            tail_bytes=4000,
         ).state
         == "ended"
     )
@@ -303,7 +313,12 @@ def test_status_refuses_a_symlinked_log(slot: Path, tmp_path: Path) -> None:
     assert isinstance(_take(slot), Taken)
     _record(slot, os.getpid(), link)
     s = lab_run.status(
-        slot, scrub=lambda t: t, now=NOW, grace_seconds=30, start_time_of=lambda _p: "S1"
+        slot,
+        scrub=lambda t: t,
+        now=NOW,
+        grace_seconds=30,
+        start_time_of=lambda _p: "S1",
+        tail_bytes=4000,
     )
     assert "topsecret" not in s.log_tail
 
@@ -320,10 +335,107 @@ def test_status_takes_no_connection_and_module_imports_neither_child_nor_store()
     assert not [m for m in mods if "lab_child" in m or ".store" in m or m.startswith("duckdb")]
 
 
-def test_abandon_removes_the_slot(slot: Path) -> None:
-    assert isinstance(_take(slot), Taken)
-    lab_run.abandon(slot)
+def test_abandon_removes_only_its_own_reservation(slot: Path) -> None:
+    first = _take(slot)
+    assert isinstance(first, Taken)
+    assert lab_run.abandon(slot, first) is True
     assert not slot.exists()
+    # a slow spawn fails after another tab took the slot over: nothing of B's is deleted
+    a = _take(slot)
+    assert isinstance(a, Taken)
+    _age(slot, 31)
+    b = _take(slot)
+    assert isinstance(b, Taken)
+    assert lab_run.abandon(slot, a) is False
+    assert slot.exists()
+    assert lab_run.abandon(slot, b) is True
+
+
+def test_release_refuses_a_starting_reservation(slot: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    assert lab_run.release(slot, start_time_of=lambda _p: None) is False
+    assert slot.exists()
+
+
+def test_waiter_cannot_overwrite_a_newer_run_after_release(slot: Path, tmp_path: Path) -> None:
+    old = FakeChild(2**22 + 5, code=0)
+    assert isinstance(_take(slot), Taken)
+    lab_run.record(
+        slot,
+        old,
+        kind="sweep",
+        slug="old",
+        baseline=1,
+        started_at=NOW,
+        log_path=tmp_path / "l",
+        start_time_of=lambda _p: None,
+    )
+    assert lab_run.release(slot, start_time_of=lambda _p: None)
+    new = _take(slot)
+    assert isinstance(new, Taken)
+    lab_run._store_exit_code(slot, old.pid, 0)  # the old waiter, late
+    assert lab_run._read(slot) is None  # the new reservation is intact
+    assert json.loads(slot.read_text())["token"] == new.token
+
+
+def test_state_changes_hold_an_exclusive_lock(slot: Path) -> None:
+    import fcntl
+
+    lock = slot.with_name(slot.name + ".lock")
+    assert isinstance(_take(slot), Taken)
+    fd = os.open(lock, os.O_WRONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    done = threading.Event()
+
+    def other() -> None:
+        lab_run.release(slot, start_time_of=lambda _p: None)
+        done.set()
+
+    t = threading.Thread(target=other, daemon=True)
+    t.start()
+    assert not done.wait(0.3)  # blocked behind our lock
+    os.close(fd)
+    assert done.wait(5)
+    t.join(5)
+
+
+def test_ps_nonzero_exit_with_error_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake(cmd: object, **kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 2, stdout="", stderr="ps: boom")
+
+    monkeypatch.setattr(lab_run.subprocess, "run", fake)
+    with pytest.raises(lab_run.PsUnavailable):
+        lab_run.process_start_time(1)
+
+    def missing(cmd: object, **kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 1, stdout="", stderr="")
+
+    monkeypatch.setattr(lab_run.subprocess, "run", missing)
+    assert lab_run.process_start_time(1) is None
+
+
+def test_status_does_not_hang_on_a_named_pipe(slot: Path, tmp_path: Path) -> None:
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    assert isinstance(_take(slot), Taken)
+    _record(slot, os.getpid(), fifo)
+    result: list[str] = []
+    t = threading.Thread(
+        target=lambda: result.append(
+            lab_run.status(
+                slot,
+                scrub=lambda x: x,
+                now=NOW,
+                grace_seconds=30,
+                start_time_of=lambda _p: "S1",
+                tail_bytes=100,
+            ).log_tail
+        ),
+        daemon=True,
+    )
+    t.start()
+    t.join(5)
+    assert result == [""]
 
 
 def test_real_subprocess_roundtrip(slot: Path, tmp_path: Path) -> None:
@@ -399,7 +511,12 @@ def test_status_ignores_a_non_regular_log(slot: Path, tmp_path: Path) -> None:
     assert isinstance(_take(slot), Taken)
     _record(slot, os.getpid(), tmp_path)  # a directory
     s = lab_run.status(
-        slot, scrub=lambda t: t, now=NOW, grace_seconds=30, start_time_of=lambda _p: "S1"
+        slot,
+        scrub=lambda t: t,
+        now=NOW,
+        grace_seconds=30,
+        start_time_of=lambda _p: "S1",
+        tail_bytes=4000,
     )
     assert s.log_tail == ""
 
@@ -434,7 +551,9 @@ def test_ps_failure_is_unknown_not_gone(slot: Path, tmp_path: Path) -> None:
     res = lab_run.take(slot, in_flight=(), now=NOW, grace_seconds=30, start_time_of=_ps_down)
     assert isinstance(res, Busy)
     assert lab_run.release(slot, start_time_of=_ps_down) is False
-    st = lab_run.status(slot, scrub=lambda t: t, now=NOW, grace_seconds=30, start_time_of=_ps_down)
+    st = lab_run.status(
+        slot, scrub=lambda t: t, now=NOW, grace_seconds=30, start_time_of=_ps_down, tail_bytes=4000
+    )
     assert st.state == "running"
 
 

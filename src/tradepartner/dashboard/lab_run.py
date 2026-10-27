@@ -28,19 +28,19 @@ function as arguments; it imports neither the child module nor the store.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import stat
 import subprocess
 import threading
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-DEFAULT_TAIL_BYTES = 4000
 _FILE_MODE = 0o600
 
 
@@ -119,7 +119,25 @@ def process_start_time(pid: int) -> str | None:
     except (OSError, subprocess.SubprocessError) as exc:
         raise PsUnavailable(str(exc)) from exc
     text = out.stdout.strip()
-    return text or None
+    if out.returncode == 0 and text:
+        return text
+    if out.returncode == 1 and not text and not out.stderr.strip():
+        return None  # ps's answer for a PID that does not exist
+    raise PsUnavailable(f"ps exited {out.returncode}: {out.stderr.strip()[:200]}")
+
+
+@contextlib.contextmanager
+def _locked(slot_path: Path) -> Iterator[None]:
+    """Hold an exclusive `flock` on `<slot>.lock` around every ownership check and
+    change (create, takeover, record, exit code, release, abandon), across tabs and
+    processes. The lock file is never removed."""
+    lock = slot_path.with_name(f"{slot_path.name}.lock")
+    fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, _FILE_MODE)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing releases the lock
 
 
 def last_path(slot_path: Path) -> Path:
@@ -225,7 +243,25 @@ def take(
     grace_seconds: float,
     start_time_of: StartTimeOf = process_start_time,
 ) -> Taken | Busy:
-    """Take the one slot, or say why it is busy. Never blocks, never retries."""
+    """Take the one slot, or say why it is busy. Never retries."""
+    with _locked(slot_path):
+        return _take(
+            slot_path,
+            in_flight=in_flight,
+            now=now,
+            grace_seconds=grace_seconds,
+            start_time_of=start_time_of,
+        )
+
+
+def _take(
+    slot_path: Path,
+    *,
+    in_flight: Sequence[str],
+    now: datetime,
+    grace_seconds: float,
+    start_time_of: StartTimeOf,
+) -> Taken | Busy:
     if now.tzinfo is None:
         raise ValueError("now must be tz-aware")
     if in_flight:
@@ -264,10 +300,19 @@ def take(
     return made if made is not None else Busy(("another tab took over the stale slot",))
 
 
-def abandon(slot_path: Path) -> None:
-    """Remove a slot whose spawn failed before any child existed."""
-    with contextlib.suppress(OSError):
-        slot_path.unlink()
+def abandon(slot_path: Path, taken: Taken) -> bool:
+    """Remove the reservation `taken` made when its spawn failed before any child
+    existed. Removes nothing unless the file still carries `taken`'s token."""
+    with _locked(slot_path):
+        try:
+            current = json.loads(slot_path.read_text())
+        except (OSError, ValueError):
+            return False
+        if not isinstance(current, dict) or current.get("token") != taken.token:
+            return False
+        with contextlib.suppress(OSError):
+            slot_path.unlink()
+        return True
 
 
 def record(
@@ -290,13 +335,6 @@ def record(
     """
     if started_at.tzinfo is None:
         raise ValueError("started_at must be tz-aware")
-    if taken is not None:
-        try:
-            current = json.loads(slot_path.read_text())
-        except (OSError, ValueError) as exc:
-            raise SlotLost(str(slot_path)) from exc
-        if not isinstance(current, dict) or current.get("token") != taken.token:
-            raise SlotLost(str(slot_path))
     try:
         pid_start = start_time_of(child.pid)
     except PsUnavailable:
@@ -310,7 +348,15 @@ def record(
         started_at=started_at.astimezone(UTC).isoformat(),
         log_path=str(log_path),
     )
-    _write_atomic(slot_path, _payload(rec))
+    with _locked(slot_path):
+        if taken is not None:
+            try:
+                current = json.loads(slot_path.read_text())
+            except (OSError, ValueError) as exc:
+                raise SlotLost(str(slot_path)) from exc
+            if not isinstance(current, dict) or current.get("token") != taken.token:
+                raise SlotLost(str(slot_path))
+        _write_atomic(slot_path, _payload(rec))
     return rec
 
 
@@ -331,13 +377,14 @@ def _payload(rec: SlotRecord) -> dict[str, Any]:
 
 def _store_exit_code(slot_path: Path, pid: int, code: int) -> None:
     """Add the exit code to the record that still names `pid` (slot, else last)."""
-    for path in (slot_path, last_path(slot_path)):
-        rec = _read(path)
-        if rec is not None and rec.pid == pid:
-            done = SlotRecord(**{**rec.__dict__, "exit_code": code})
-            with contextlib.suppress(OSError):
-                _write_atomic(path, _payload(done))
-            return
+    with _locked(slot_path):
+        for path in (slot_path, last_path(slot_path)):
+            rec = _read(path)
+            if rec is not None and rec.pid == pid:
+                done = SlotRecord(**{**rec.__dict__, "exit_code": code})
+                with contextlib.suppress(OSError):
+                    _write_atomic(path, _payload(done))
+                return
 
 
 def watch(slot_path: Path, child: Child) -> threading.Thread:
@@ -357,7 +404,7 @@ def watch(slot_path: Path, child: Child) -> threading.Thread:
 
 def _tail(log_path: str, tail_bytes: int) -> str:
     try:
-        fd = os.open(log_path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(log_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return ""
     try:
@@ -384,7 +431,7 @@ def status(
     now: datetime,
     grace_seconds: float,
     start_time_of: StartTimeOf = process_start_time,
-    tail_bytes: int = DEFAULT_TAIL_BYTES,
+    tail_bytes: int,
 ) -> SlotStatus:
     """Read the slot file, the PID and the log only; no connection, tail scrubbed."""
     if not slot_path.exists():
@@ -401,14 +448,17 @@ def status(
 
 def release(slot_path: Path, *, start_time_of: StartTimeOf = process_start_time) -> bool:
     """Rename the slot to `.last.json` once its child has gone; False while it runs."""
-    rec = _read(slot_path)
-    if rec is not None and _running(rec, start_time_of):
-        return False
-    try:
-        os.replace(slot_path, last_path(slot_path))
-    except FileNotFoundError:
-        return False
-    return True
+    with _locked(slot_path):
+        rec = _read(slot_path)
+        if rec is None:  # absent, or a starting reservation: not a finished run
+            return False
+        if _running(rec, start_time_of):
+            return False
+        try:
+            os.replace(slot_path, last_path(slot_path))
+        except FileNotFoundError:
+            return False
+        return True
 
 
 def read_last(slot_path: Path) -> SlotRecord | None:
