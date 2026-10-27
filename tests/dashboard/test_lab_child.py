@@ -272,6 +272,14 @@ def test_secret_cut_by_the_window_start_is_not_shown(live: Settings) -> None:
     assert SENTINEL[-6:] not in tail
 
 
+def test_literal_nul_in_log_is_not_redacted(live: Settings) -> None:
+    path = lab_child.log_path(live)
+    path.write_bytes(b"before\x00after")
+    tail = lab_child.scrubbed_tail(path, live)
+    assert tail == "before after"
+    assert "[redacted]" not in tail
+
+
 def test_tail_hidden_when_live_config_unreadable(
     live: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:

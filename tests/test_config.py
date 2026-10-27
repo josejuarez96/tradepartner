@@ -1002,7 +1002,13 @@ def test_env_file_override_via_tradepartner_env_file(
 
 
 def test_hypotheses_families_default() -> None:
-    assert _settings().hypotheses.families == ["momentum", "oracle", "profitability", "combined"]
+    assert _settings().hypotheses.families == [
+        "momentum",
+        "oracle",
+        "profitability",
+        "combined",
+        "filing_delay",
+    ]
 
 
 def test_hypotheses_family_outside_the_list_rejected() -> None:
@@ -1481,7 +1487,12 @@ def test_hypothesis_family_literal_equals_the_registry_keys() -> None:
 
 
 def test_family_parents_derives_without_oracle_at_today_s_values() -> None:
-    assert FAMILY_PARENTS == {"momentum": None, "profitability": None, "combined": "momentum"}
+    assert FAMILY_PARENTS == {
+        "momentum": None,
+        "profitability": None,
+        "combined": "momentum",
+        "filing_delay": None,
+    }
 
 
 def test_family_signal_sections_derives_without_oracle_at_today_s_values() -> None:
@@ -3384,3 +3395,12 @@ def test_ui_kill_wait_seconds_must_exceed_the_kill_store_wait_by_the_margin() ->
         ui={"kill_wait_margin_seconds": 50},
     )
     assert kill_wait_seconds(margin) == 150
+
+
+def test_ui_lab_orphan_after_hours_defaults_to_24_and_must_be_positive() -> None:
+    """T291 (#2304): how long an open lab registry row stays live before it is an orphan."""
+    assert _settings().ui.lab_orphan_after_hours == 24
+    assert Settings(_env_file=None, ui={"lab_orphan_after_hours": 6}).ui.lab_orphan_after_hours == 6
+    for bad in (0, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"lab_orphan_after_hours": bad})

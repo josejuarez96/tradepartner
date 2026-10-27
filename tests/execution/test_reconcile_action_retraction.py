@@ -34,7 +34,7 @@ from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.calendar import next_session, session_close
 from tradepartner.config import Settings
 from tradepartner.errors import ReconciliationError
-from tradepartner.execution.reconcile import MISMATCH, OK
+from tradepartner.execution.reconcile import BREAKS, OK
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.journal import PaperWindowRow
 
@@ -106,9 +106,11 @@ def test_a_withdrawn_split_halts_until_its_cancel_is_known_then_reconciles(
 
     assert result.status == OK
     assert result.broker_cash == pytest.approx(100_000.0 - 10.0 * PRICE)
+    # Paper spec amendment #2266 item 2: `quantity` is a name-level kind, so the
+    # status is `breaks`, not `mismatch`. T281 still halts (the raises above).
     assert [row.status for row in _rows(journal_settings, open_window)] == [
-        MISMATCH,
-        MISMATCH,
+        BREAKS,
+        BREAKS,
         OK,
     ]
 

@@ -32,7 +32,7 @@ Owner only: `team.py release --force`, `team.py claim --owner-task`, `team.py pr
 |---|---|
 | **Team** | One session in **its own working directory** (a worktree of this repo or its own clone), registered once with `team.py start <name>` (or `register <name>` in a clone). A chat window Jose types in or a background subagent the orchestrator spawns: either claims, releases and readies its own items, and "window" here means either. Jose is not a team; his word lands class B, the orchestrator lands class A (rule 7). The session he types in is a team like any other. |
 | **Claim** | A comment `claim: team:<name>` on a GitHub issue, mirrored by a `team:<name>` label. The claim, not the label, is authoritative. |
-| **Plan task** | A checkbox line in `docs/plans/*.md` (`T5`, `T8b`). Its issue carries the label `task:Tn`. |
+| **Plan task** | A checkbox line in `docs/plans/*.md` (`T5`, `T8b`, `T241`, `T171d`, `T266a1`). Task ids are `T<n>` with an optional lowercase letter and an optional digit after the letter. Its issue carries the label `task:Tn`. |
 | **Canonical issue** | The lowest-numbered **open** issue carrying a given `task:Tn` label. |
 | **Ready frontier** | Unclaimed plan tasks whose dependencies are all done **as merged on `origin/main`**: ticked there, or named by a merged fragment's `task:` line (#2280) or a merged code PR's `(Tn)` subject (#1130). An unmerged PR opens nothing. |
 | **Chain** | Consecutive dependent tasks that one team should keep (listed per plan). |
