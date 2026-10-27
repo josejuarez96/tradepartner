@@ -63,6 +63,7 @@ writing command migrates first.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import date
@@ -214,8 +215,8 @@ def next_trial_cost(
     Read-only."""
     if added < 0:
         raise ValueError(f"added must be non-negative, got {added}")
-    if floor < 0:
-        raise ValueError(f"floor must be non-negative, got {floor}")
+    if not math.isfinite(floor) or floor < 0:
+        raise ValueError(f"floor must be finite and non-negative, got {floor}")
     n_now = family_n(conn, family)
     n_next = n_now + added
     variance = registry.family_sharpes(conn, family).variance(basis)

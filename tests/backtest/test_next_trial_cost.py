@@ -239,6 +239,8 @@ def test_negative_added_or_floor_refused(lab_store: duckdb.DuckDBPyConnection) -
         results.next_trial_cost(lab_store, "momentum", basis="raw", added=-1)
     with pytest.raises(ValueError, match="floor"):
         results.next_trial_cost(lab_store, "momentum", basis="raw", floor=-0.1)
+    with pytest.raises(ValueError, match="floor"):
+        results.next_trial_cost(lab_store, "momentum", basis="raw", floor=float("nan"))
 
 
 def test_read_only(lab_store: duckdb.DuckDBPyConnection, settings: Settings) -> None:
