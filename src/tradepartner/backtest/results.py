@@ -80,6 +80,7 @@ from tradepartner.backtest.metrics import (
     LongShortBook,
     Series,
     deflated_sharpe,
+    expected_max_sharpe,
     red_flag,
     series_metrics,
 )
@@ -89,6 +90,7 @@ from tradepartner.calendar import session_close
 from tradepartner.config import FAMILIES, Cadence, HypothesisFamily, Settings
 from tradepartner.store import registry, research, schema
 from tradepartner.store.registry import (
+    Basis,
     EquityRow,
     FamilySharpes,
     MetricRow,
@@ -175,6 +177,69 @@ def family_n(
     """N of `family`: `family_n_split(...).total`. The one place N is computed (module
     docstring, "One N function")."""
     return family_n_split(conn, family, pending=pending).total
+
+
+@dataclass(frozen=True)
+class NextTrialCost:
+    """What one more counted trial does to a family's SR\\* (ADR 0018 amendment B).
+    `sr_star_now` is `expected_max_sharpe(n_now, V)` and `sr_star_next` the same at
+    `n_next = n_now + added`, both at today's V on `basis`. `floored` is True when V is
+    the floor (`variance_used` is then the floor); `variance_used` is None only when V
+    is unknown with no floor, where both SR\\* are 0 and `note` says so."""
+
+    n_now: int
+    n_next: int
+    sr_star_now: float
+    sr_star_next: float
+    basis: Basis
+    floored: bool
+    variance_used: float | None
+    note: str | None = None
+
+
+def next_trial_cost(
+    conn: duckdb.DuckDBPyConnection,
+    family: str,
+    *,
+    basis: Basis,
+    added: int = 1,
+    floor: float = 0.0,
+) -> NextTrialCost:
+    """The SR\\* `family` has now and the SR\\* `added` more counted trials would give.
+    N is `family_n` (the one N function); V is `family_sharpes(conn, family).variance(basis)`
+    at today's trials, floored at `floor` when `floor` is above zero exactly as
+    `lab.run_sweep`'s close floors it (a None V is the floor). Unfloored, a None V (fewer
+    than two pairs) gives 0 for both and `note` says so. `expected_max_sharpe` is never
+    called with fewer than one trial (a family with no counted trial has SR\\* 0 now).
+    Read-only."""
+    if added < 0:
+        raise ValueError(f"added must be non-negative, got {added}")
+    if floor < 0:
+        raise ValueError(f"floor must be non-negative, got {floor}")
+    n_now = family_n(conn, family)
+    n_next = n_now + added
+    variance = registry.family_sharpes(conn, family).variance(basis)
+    note: str | None = None
+    if variance is None and floor <= 0:
+        note = "V is unknown (fewer than two pairs) and no floor applies: SR* is 0"
+        used: float | None = None
+    else:
+        used = max(variance if variance is not None else 0.0, floor)
+
+    def at(n: int) -> float:
+        return expected_max_sharpe(n, used) if used is not None and n >= 1 else 0.0
+
+    floored = floor > 0 and (variance is None or variance < floor)
+    return NextTrialCost(
+        n_now=n_now,
+        n_next=n_next,
+        sr_star_now=at(n_now),
+        sr_star_next=at(n_next),
+        basis=basis,
+        floored=floored,
+        variance_used=used,
+        note=note,
+    )
 
 
 def hypothesis_cadence(conn: duckdb.DuckDBPyConnection, handle: TrialHandle) -> Cadence:
