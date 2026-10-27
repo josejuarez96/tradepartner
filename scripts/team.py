@@ -53,7 +53,7 @@ TEAM_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,19}$")
 # A task id: `T<n>`, an optional letter and an optional digit after it (T241, T171d,
 # T266a1; #2282).
 TASK_ID_RE = re.compile(r"^T\d+[a-z]?\d?$")
-TASK_REF_RE = re.compile(r"T\d+[a-z]?\d?")
+TASK_REF_RE = re.compile(r"\bT\d+[a-z]?\d?\b")
 TASK_LINE_RE = re.compile(
     r"^- \[(?P<done>[ x])\] \*\*(?P<id>T\d+[a-z]?\d?)(?P<owner> \(owner\))?: (?P<title>.*?)\*\*"
 )
