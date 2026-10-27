@@ -210,10 +210,11 @@ def scrub(text: str, *settings: Settings) -> str:
 
 
 def scrubbed_tail(path: Path, settings: Settings, *, max_bytes: int = TAIL_BYTES) -> str:
-    """The last `max_bytes` of the run log, scrubbed over the page's settings and the
-    live ones. A secret cut by the window's start is removed too: the window reads
-    past `max_bytes` by the longest secret, scrubs, then trims. If the live config
-    cannot be read the tail is not shown at all."""
+    """Mask secrets in raw bytes, slice the last `max_bytes`, decode, then clean.
+
+    The extra read catches secrets cut by the window's start. If the live config
+    cannot be read, the tail is not shown at all.
+    """
     try:
         live = book_actions.live_settings()
     except (ValueError, OSError):
@@ -234,11 +235,29 @@ def scrubbed_tail(path: Path, settings: Settings, *, max_bytes: int = TAIL_BYTES
     finally:
         os.close(fd)
     masked = bytearray(raw)
+    ranges: list[tuple[int, int]] = []
     for value in sorted({v.encode() for v in secrets}, key=len, reverse=True):
-        masked = bytearray(masked.replace(value, _MASK * len(value)))
+        start = 0
+        while (start := masked.find(value, start)) != -1:
+            end = start + len(value)
+            masked[start:end] = _MASK * len(value)
+            ranges.append((start, end))
+            start = end
     window = bytes(masked[-max_bytes:])
-    text = window.decode(errors="replace")
-    text = re.sub(f"{_MASK.decode()}+", "[redacted]", text)
+    window_start = len(masked) - len(window)
+    parts: list[bytes] = []
+    cursor = window_start
+    for start, end in sorted(ranges):
+        if end <= window_start or end <= cursor:
+            continue
+        if start > cursor:
+            parts.append(bytes(masked[cursor:start]))
+            parts.append(b"[redacted]")
+        elif not parts:
+            parts.append(b"[redacted]")
+        cursor = end
+    parts.append(bytes(masked[cursor:]))
+    text = b"".join(parts).decode(errors="replace")
     text = _CONTROL.sub(" ", _ANSI.sub(" ", text)).strip()
     return text
 
