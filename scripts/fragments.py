@@ -63,13 +63,13 @@ PLANS_DIR = Path("docs/plans")
 #: A finished plan line's length cap; ``tests/test_docs_budget.py`` enforces it (#353).
 PLAN_LINE_MAX = 400
 #: A fragment's plan-task line (#2280); ``team.py`` and ``ready_pr.py`` read the same shape.
-TASK_LINE_RE = re.compile(r"^task: (?P<id>T\d+[a-z]?) \(PR #(?P<pr>\d+)\)$")
+TASK_LINE_RE = re.compile(r"^task: (?P<id>T\d+[a-z]?\d?) \(PR #(?P<pr>\d+)\)$")
 PLAN_TASK_RE = re.compile(
-    r"^- \[(?P<done>[ x])\] (?P<bold>\*\*(?P<id>T\d+[a-z]?)(?: \(owner\))?: .*?\*\*)"
+    r"^- \[(?P<done>[ x])\] (?P<bold>\*\*(?P<id>T\d+[a-z]?\d?)(?: \(owner\))?: .*?\*\*)"
 )
 PLAN_FILES_RE = re.compile(r"Files:\s*(?P<seg>[^·]*)")
 PLAN_DEPENDS_RE = re.compile(r"Depends on:\s*(?P<seg>[^·]*)")
-TASK_REF_RE = re.compile(r"\bT\d+[a-z]?\b")
+TASK_REF_RE = re.compile(r"\bT\d+[a-z]?\d?\b")
 PAREN_RE = re.compile(r"\([^()]*\)")
 PATH_TOKEN_RE = re.compile(r"`([^`]+)`")
 FILE_NAME_RE = re.compile(r"^[\w.-]+\.\w+$")

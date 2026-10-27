@@ -98,8 +98,8 @@ CHANGELOG_LIST = "## [Unreleased]"
 FRAGMENT_DIRS = ("docs/status.d/", "changelog.d/")
 PLANS_PREFIX = "docs/plans/"
 # A fragment's plan-task line (#2280), the shape scripts/fragments.py writes (TASK_LINE_RE).
-FRAGMENT_TASK_RE = re.compile(r"^task: (?P<id>T\d+[a-z]?) \(PR #(?P<pr>\d+)\)$")
-PLAN_BOX_RE = re.compile(r"^- \[(?P<done>[ x])\] \*\*(?P<id>T\d+[a-z]?)[ :]")
+FRAGMENT_TASK_RE = re.compile(r"^task: (?P<id>T\d+[a-z]?\d?) \(PR #(?P<pr>\d+)\)$")
+PLAN_BOX_RE = re.compile(r"^- \[(?P<done>[ x])\] \*\*(?P<id>T\d+[a-z]?\d?)[ :]")
 TASK_LABEL_PREFIX = "task:"
 
 # Paths that require a specialist review before the PR is ready. The plan's per-task
