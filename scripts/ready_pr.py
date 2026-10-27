@@ -129,6 +129,8 @@ QUANT_PREFIXES = (
     "src/tradepartner/health.py",
     "src/tradepartner/backtest/",
     "src/tradepartner/execution/",
+    # the Lab page's child-process modules register and run hypotheses (#2304)
+    "src/tradepartner/dashboard/lab_",
     "scripts/make_fixture_universe.py",
     "tests/lookahead/",
     "tests/fixtures/universe/",
@@ -152,6 +154,9 @@ SAFETY_PREFIXES = (
     # the kill-switch override page and its test (#773)
     "src/tradepartner/dashboard/override_page.py",
     "tests/dashboard/test_override_page.py",
+    # the dashboard's child-process modules: book actions and the Lab (#2304)
+    "src/tradepartner/dashboard/book_actions.py",
+    "src/tradepartner/dashboard/lab_",
     "scripts/ready_pr.py",
     "tests/test_ready_pr.py",
     "scripts/fragments.py",

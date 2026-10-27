@@ -163,6 +163,7 @@ REPO = Path(__file__).resolve().parents[1]
 # Listed on purpose before the module exists; drop an entry once its module lands.
 PLANNED_PREFIXES = {
     "src/tradepartner/llm/",  # Phase 5, ADR 0008
+    "src/tradepartner/dashboard/lab_",  # Lab builders T289-T299; drop once lab_run.py lands
 }
 
 
@@ -223,6 +224,16 @@ def test_kill_switch_page_requires_the_safety_review() -> None:
         "tests/dashboard/test_override_page.py",
     ):
         assert ready_pr.required_reviews([path]) == {"safety-reviewer"}, path
+
+
+def test_dashboard_child_process_modules_require_their_reviews() -> None:
+    # the Lab and book actions spawn child processes that write (#2304)
+    both = {"quant-auditor", "safety-reviewer"}
+    assert ready_pr.required_reviews(["src/tradepartner/dashboard/lab_run.py"]) == both
+    assert ready_pr.required_reviews(["src/tradepartner/dashboard/book_actions.py"]) == {
+        "safety-reviewer"
+    }
+    assert ready_pr.required_reviews(["src/tradepartner/dashboard/home_page.py"]) == set()
 
 
 def test_every_review_prefix_exists_on_the_tree_unless_planned() -> None:
