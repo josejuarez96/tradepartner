@@ -17,6 +17,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from dashboard_nav import NavCall, nav_calls_fixture, nav_titles  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import Settings
@@ -100,7 +101,8 @@ def _app(
         )
     at = AppTest.from_file(_APP_PATH)
     at.run()
-    at.sidebar.radio[0].set_value(_PAGE).run(timeout=30)
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", _PAGE)
+    at.run(timeout=30)
     return at
 
 
@@ -118,10 +120,12 @@ def _metrics(at: AppTest) -> dict[str, str]:
     return {m.label: str(m.value) for m in at.metric}
 
 
-def test_page_is_in_the_shell_navigation(monkeypatch: pytest.MonkeyPatch, store: Path) -> None:
+def test_page_is_in_the_shell_navigation(
+    monkeypatch: pytest.MonkeyPatch, store: Path, nav_calls: list[NavCall]
+) -> None:
     at = _app(monkeypatch, store, lambda book: _data(book))
     assert not at.exception
-    assert _PAGE in at.sidebar.radio[0].options
+    assert _PAGE in nav_titles(nav_calls)
 
 
 def test_renders_header_kpis_and_charts(monkeypatch: pytest.MonkeyPatch, store: Path) -> None:

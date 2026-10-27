@@ -77,6 +77,7 @@ from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.hypothesis import frozen_hash_matches
 from tradepartner.backtest.metrics import (
     DeflatedSharpe,
+    LongShortBook,
     Series,
     deflated_sharpe,
     red_flag,
@@ -216,6 +217,18 @@ def _check(results: Mapping[float, BacktestResult], params: Settings, family: st
             raise ValueError(f"no equity rows for {missing} at {level} bp")
 
 
+#: The name prefix of a `long_short` trial's borrow-sensitivity series (spec amendment
+#: #1872, item 6; the engine's `strategy_borrow_<n>bp`). They are reported only.
+BORROW_SERIES_PREFIX = f"{STRATEGY_SERIES}_borrow_"
+
+
+def borrow_series(result: BacktestResult) -> list[str]:
+    """The borrow-sensitivity series among `result`'s equity rows, in name order."""
+    return sorted(
+        {row.series for row in result.equity if row.series.startswith(BORROW_SERIES_PREFIX)}
+    )
+
+
 def _series_equity(result: BacktestResult, series: str) -> list[EquityRow]:
     return sorted((row for row in result.equity if row.series == series), key=lambda r: r.session)
 
@@ -329,6 +342,7 @@ def metric_rows(
     base = params.costs.per_side_bps
     ladder = set(params.costs.sensitivity_per_side_bps)
     rows: list[MetricRow] = []
+    base_result = results[base]
     for level in sorted(results):
         result = results[level]
         kind = _cost_level_kind(level, base, ladder)
@@ -349,8 +363,65 @@ def metric_rows(
                 periods_per_year=ppy,
                 risk_free_period_returns=risk_free,
                 family_benchmark=None if third is None else (third, returns[third]),
+                long_short=_long_short_book(result) if series == STRATEGY_SERIES else None,
+                risk_free_from_store=params.metrics.risk_free_source == "store",
             )
             rows.extend(MetricRow(series, level, key, value, kind) for key, value in values.items())
+        if level == base:
+            rows.extend(
+                _borrow_metric_rows(base_result, returns, params, ends, risk_free, ppy, level, kind)
+            )
+    return rows
+
+
+def _long_short_book(result: BacktestResult) -> LongShortBook | None:
+    """The result's signed-book summary as `series_metrics` takes it (None for a
+    `long_only` run, so it writes no new row)."""
+    summary = result.exposure_summary
+    if summary is None:
+        return None
+    return LongShortBook(
+        gross_mean=summary.gross_mean,
+        gross_max=summary.gross_max,
+        net_mean=summary.net_mean,
+        net_min=summary.net_min,
+        net_max=summary.net_max,
+        borrow_paid=summary.borrow_paid,
+    )
+
+
+def _borrow_metric_rows(
+    result: BacktestResult,
+    returns: Mapping[str, Sequence[float]],
+    params: Settings,
+    ends: Sequence[date],
+    risk_free: Sequence[float],
+    ppy: int,
+    level: float,
+    kind: str,
+) -> list[MetricRow]:
+    """The req 8 keys of each `strategy_borrow_<n>bp` series at the base level, where the
+    engine writes them. Reported only (spec amendment #1872, item 6): `write_results`
+    reads V, N, DSR and the red flag from the `strategy` series alone, and no selection
+    module reads these rows. The book has no 0 bp run of its own, so its gross is its net
+    (`cost_drag` is stored None, it has no gross run) and its turnover is the strategy's,
+    the same trades."""
+    rows: list[MetricRow] = []
+    for series in borrow_series(result):
+        own = _period_returns(_series_equity(result, series), ends)
+        values = series_metrics(
+            series,
+            period_returns=own,
+            gross_period_returns=own,
+            daily_equity=[row.equity for row in _series_equity(result, series)],
+            turnover=[r.turnover for r in result.rebalances],
+            spy_period_returns=returns[SPY_SERIES],
+            mtum_period_returns=returns[MTUM_SERIES],
+            periods_per_year=ppy,
+            risk_free_period_returns=risk_free,
+        )
+        values["cost_drag"] = None
+        rows.extend(MetricRow(series, level, key, value, kind) for key, value in values.items())
     return rows
 
 

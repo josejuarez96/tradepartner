@@ -156,7 +156,7 @@ Rare flags: `--override-gap --gap-reason "<why>"` runs past the survivorship-gap
 | `reconciliation` | The journal and Alpaca disagree. Do not resume blind. Ask Claude. |
 | `rejection_cap`, `skip_cap` | Too many orders refused or names skipped. Find out why before resuming. |
 | `drawdown` | The book fell more than `risk.max_drawdown` (30%) from its peak. The switch engaged itself. Resume (this resets the peak to the equity at the last mark), then decide whether to `paper stop`. If you mean to stop, run `paper stop` straight after the resume: the next run in the submit window can trade again. |
-| `stale_data` | Ingest was late. No action. The next run proceeds once data catches up. Inside a shakedown span, add a `decision shakedown-note` for it. |
+| `stale_data` | Ingest was late. If the last ingest was `ok`, no action: the next run proceeds once data catches up. If ingest keeps failing (its heartbeat fails, or `tradepartner ingest` exits non-zero), ask Claude to look, and meanwhile run `tradepartner ingest --source alpaca` to land prices. After a gap of more than 5 sessions, `ingest --source alpaca --backfill --since <first missed session>` fills the bars but does **not** clear paper's staleness: follow it with one plain `tradepartner ingest` (#2181). Inside a shakedown span, add a `decision shakedown-note` for it. |
 | `missed_run`, `missed_rebalance` | The Mac was off or asleep, or a stop rule held the rebalance. Check the reason. Keep the Mac awake on power: sleep off, no repeating wake ([scheduling](scheduling.md), "Sleep versus power-off"). |
 | `kill_switch` | The switch changed state. `paper status` shows why. |
 | `kill_switch_write_failed` | The store may be damaged. This one arrives only as a macOS notification, never in the store. Stop. Ask Claude before anything else. |
@@ -210,6 +210,7 @@ You can do this yourself: [update-the-system](update-the-system.md), Part 1. It 
 | The script for a non-backtest experiment | No `experiment run` command exists. |
 | Diagnosing a halt | Every real halt so far (10-12, 10-13, 10-16) needed an agent PR to fix the cause. Resuming you can do alone. |
 | Diagnosing a damaged store | [update-the-system](update-the-system.md) Part 2 has the restore steps, but a damaged store is risky. Keep the damaged files and ask Claude before you restore. |
+| Restarting a paper window, rotating Alpaca keys | Owner-run ([window-restart](window-restart.md), [key-rotation](key-rotation.md)). |
 | Data releases and repairs | Owner-run on your store, with Claude's checklist ([data-releases](data-releases.md); [benchmark-backfill](benchmark-backfill.md) once). |
 | Reading a result in plain words | The pages show numbers, not a verdict sentence. |
 

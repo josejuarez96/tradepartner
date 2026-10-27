@@ -160,7 +160,7 @@ def v14() -> Iterator[duckdb.DuckDBPyConnection]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGERS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGER_RECEIPT_VERSION + 1
 
 
 def test_the_rename_table_covers_every_phase3_period_key() -> None:

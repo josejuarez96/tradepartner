@@ -899,8 +899,8 @@ def test_a_long_short_file_is_refused_benchmark_pending_and_writes_nothing(
     lab: Lab, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Until the ADR 0005 amendment lands (`LONG_SHORT_BENCHMARK_LANDED`), by name, as the
-    first word after the path. The #1788 guard refuses a `long_short` file before
-    `promote` could see it, so `frozen_params` is stepped round."""
+    first word after the path. The fixture is a long-only winner, so this test
+    supplies a signed variant to exercise the pending benchmark refusal."""
     sweep, variants = _won(lab)
     path = lab.promoted_file(sweep, variants[0])
     real = hypothesis.frozen_params

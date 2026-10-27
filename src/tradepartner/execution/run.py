@@ -268,13 +268,13 @@ from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, Mismatch, 
 from tradepartner.execution.reconcile import OK as RECONCILED
 from tradepartner.execution.reconcile_run import (
     frozen_risk,
+    order_symbols,
     reconcile_now,
     settle_pending_unresolved,
     unresolved_orders,
     verify_frozen_sha256,
 )
 from tradepartner.execution.risk import OpenSell, unfilled_sells
-from tradepartner.execution.symbols import broker_symbol
 from tradepartner.execution.window import window_cadence
 from tradepartner.execution.wrapper import (
     CRASH_EXIT_CODE,
@@ -417,6 +417,15 @@ class RunOutcome:
     session: date | None = None
     kind: str | None = None
     notes: tuple[str, ...] = ()
+    engaged: bool = False
+
+    @property
+    def healthy(self) -> bool:
+        """True when the book ended able to trade: exits 0, did not skip on an
+        engaged switch, and (a `no_session` run) has no engaged switch. The off-Mac
+        heartbeat pings `/fail` for any unhealthy book, so a halt keeps the check
+        red until `paper resume` (#2179); exit codes are unchanged."""
+        return self.exit_code == 0 and self.status != SKIPPED_KILL_SWITCH and not self.engaged
 
     @property
     def exit_code(self) -> int:
@@ -518,9 +527,11 @@ def stop_step(context: StepContext) -> BatchOutcome | None:
     handed, untradable = _journal_forced_exits(context, _exit_book(context), pending_rebalance=None)
     # Read again: this run's forced exits block a `window_stop` exit of their name.
     book = _exit_book(context)
+    held = book.exitable(context)
     stops = exits.stop_exits(
-        book.ledger.positions,
-        _residues(context, book),
+        held,
+        # Over the same holdings: an ambiguous name's residue is not its exit's (#2185).
+        {name: part for name, part in _residues(context, book).items() if name in held},
         book.assets,
         book.decisions,
         book.states,
@@ -620,6 +631,20 @@ class _ExitBook:
     assets: dict[str, Asset]
     marks: list[PositionDailyRow]
     runs: list[PaperRunRow]
+    #: Held names the one symbol map leaves ambiguous, with their notes (#2185).
+    ambiguous: dict[str, str] = field(default_factory=dict)
+
+    def exitable(self, context: StepContext) -> dict[str, float]:
+        """The ledger's holdings the exits may decide: an ambiguous name gets no
+        new forced or `window_stop` exit this run (its flags are never read
+        under the old symbol, and a guessed whole-share flag would be frozen on
+        the exit), noted on the run and in its `skipped` alert; the name stays
+        held, so `paper stop` refuses `not_flat` until it resolves."""
+        for name in sorted(set(self.ambiguous) & set(self.ledger.positions)):
+            line = f"{self.ambiguous[name]}; no new exit made while it is ambiguous"
+            context.notes.append(line)
+            context.gate.note_unsent(line)
+        return {k: v for k, v in self.ledger.positions.items() if k not in self.ambiguous}
 
 
 def _exit_book(context: StepContext) -> _ExitBook:
@@ -671,13 +696,7 @@ def _exit_book(context: StepContext) -> _ExitBook:
             if held
             else {}
         )
-        tickers = (
-            _current_symbols(
-                listings_as_of(conn, cut, held), session, context.settings.alpaca.class_symbols
-            )
-            if held
-            else {}
-        )
+        tickers, ambiguous = _current_symbols(conn, session, held, context.settings, window_id)
         marks_rows = positions_daily_for(conn, window_id)
         run_rows = [r.run for r in runs_for(conn, window_id)]
     price_of = _lookup(prices, unpriced)
@@ -723,6 +742,7 @@ def _exit_book(context: StepContext) -> _ExitBook:
         },
         marks=marks_rows,
         runs=run_rows,
+        ambiguous=ambiguous,
     )
 
 
@@ -742,7 +762,7 @@ def _journal_forced_exits(
     exits journaled: (the decisions to hand to the sells phase, the names whose
     new exit was journaled closed `untradable`)."""
     new = exits.forced_exits(
-        book.ledger.positions,
+        book.exitable(context),
         book.delisted,
         book.assets,
         book.decisions,
@@ -1092,13 +1112,20 @@ class BookRun:
     error: BaseException | None = None
     exit_code: int = 0
 
+    @property
+    def healthy(self) -> bool:
+        """Whether the book ended able to trade (`RunOutcome.healthy`); a crash is not."""
+        return self.outcome is not None and self.outcome.healthy and self.exit_code == 0
 
-def open_books(settings: Settings) -> tuple[str, ...]:
+
+def open_books(
+    settings: Settings, *, on_wait: Callable[[str], None] | None = None
+) -> tuple[str, ...]:
     """Every book with an open window (no `closed` or `abandoned` stop row), in
     token order, over a short read-only connection; empty on a store with no
     journal. A book with two open windows is listed once: its own run then fails
-    closed on them (`journal.open_window`)."""
-    with open_read_only(settings, retry=True) as conn:
+    closed on them (`journal.open_window`). `on_wait` is `open_read_only`'s."""
+    with open_read_only(settings, retry=True, on_wait=on_wait) as conn:
         try:
             require_journal(conn)
         except JournalNotInitialised:
@@ -1171,6 +1198,18 @@ def _locked_run(
     version, dirty = registry.code_version()
     if not is_session(day):
         with connect() as conn:
+            prior = runs_for(conn, window_id)
+            state = switch.derive(
+                window,
+                kill_switch_events_for(conn, window_id),
+                [r.run for r in prior],
+                [r.result for r in prior if r.result is not None],
+                reading_run=None,
+                lock_free=True,
+            )
+            switch_engaged = bool(state.causes) or bool(
+                store_journal.unconsumed_kill_switch_overrides(conn, window_id)
+            )
             run_id = append(
                 conn,
                 PaperRunRow(
@@ -1196,7 +1235,7 @@ def _locked_run(
                     ingested_at=now,
                 ),
             )
-        return RunOutcome(NO_SESSION, run_id=run_id)
+        return RunOutcome(NO_SESSION, run_id=run_id, engaged=switch_engaged)
 
     frozen = frozen_risk(window)
     alerter = _ChunkAlerter(settings, connect, clock)
@@ -1421,6 +1460,8 @@ class _Run:
         return self._finish(SKIPPED_KILL_SWITCH)
 
     def _finish(self, status: str) -> RunOutcome:
+        # A ticker-change note no batch alerted yet (#2185): the run's `skipped` alert.
+        self.gate.alert_unsent(self.run)
         finished = self.gate.read_clock()
         notes = tuple(dict.fromkeys(self.notes))
         with self.connect() as conn:
@@ -1985,12 +2026,11 @@ class _Run:
         return self._ledger_for(actions)(through)
 
     def _symbols(self, names: Sequence[str]) -> dict[str, str]:
-        """Each name's broker symbol on its listing current at S, known at close(S-1)."""
+        """Each name's broker symbol from the one symbol map (`_current_symbols`)."""
         if not names:
             return {}
         with open_read_only(self.settings, retry=True) as conn:
-            listings = listings_as_of(conn, self._cut(), list(names))
-        return _current_symbols(listings, self.session, self.settings.alpaca.class_symbols)
+            return _current_symbols(conn, self.session, names, self.settings, self.window_id)[0]
 
     def _start_day(self) -> date:
         return self.window.started_at.astimezone(_NEW_YORK).date()
@@ -2011,14 +2051,8 @@ class _Run:
         with open_read_only(self.settings, retry=True) as conn:
             sessions = self._mark_sessions(last_marked_session(conn, self.window_id))
             held = {name for day in sessions for name in ledger(day).positions}
-            symbols = (
-                _current_symbols(
-                    listings_as_of(conn, self._cut(), sorted(held)),
-                    self.session,
-                    self.settings.alpaca.class_symbols,
-                )
-                if held
-                else {}
+            symbols, _ambiguous = _current_symbols(
+                conn, self.session, sorted(held), self.settings, self.window_id
             )
         # Every name held on any marked session, not only those held at S
         # (#892 item 1, #1116): a name sold before S but held on a back-filled
@@ -2309,13 +2343,21 @@ def _rebalance_kind(
 
 
 def _current_symbols(
-    listings: pl.DataFrame, day: date, class_symbols: Mapping[str, str] | None
-) -> dict[str, str]:
-    """Each name's broker symbol on its listing current on `day` (#1729); a
-    name whose ticker has no broker form is left out (never sent)."""
-    current = planning.current_listings(listings, day)
-    symbols = {sid: broker_symbol(row, class_symbols) for sid, row in current.items()}
-    return {sid: symbol for sid, symbol in symbols.items() if symbol is not None}
+    conn: duckdb.DuckDBPyConnection,
+    session: date,
+    names: Sequence[str],
+    settings: Settings,
+    window_id: int,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Each name's broker symbol from the one symbol map
+    (`reconcile_run.order_symbols`, #2185), with the names it leaves ambiguous
+    and their notes. A name whose ticker has no broker form (#1729) or that is
+    ambiguous is left out of the first (never read or sent)."""
+    if not names:
+        return {}, {}
+    mapped = order_symbols(conn, session, names, settings, window_id)
+    symbols = {sid: symbol for sid, symbol in mapped.symbols.items() if symbol is not None}
+    return symbols, mapped.ambiguous
 
 
 def _current_ids(listings: pl.DataFrame, day: date, ticker: str) -> list[str]:

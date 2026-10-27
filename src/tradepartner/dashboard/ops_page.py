@@ -26,18 +26,22 @@ initialised" pattern): a store with no paper-trading journal yet
 
 from __future__ import annotations
 
+import json
+
 import altair as alt
 import duckdb
 import polars as pl
 import streamlit as st
 
+from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
-from tradepartner.execution import ops
+from tradepartner.execution import headroom, ops, plain, waiting
 from tradepartner.execution.ops import OpsData, OrderChain, RankedSignal
 from tradepartner.execution.switch import SwitchState
 from tradepartner.store import journal
 from tradepartner.store.asof import listings_as_of
+from tradepartner.store.db import utc_now
 from tradepartner.store.journal import AlertRow, ReconciliationRow
 from tradepartner.store.schema import SchemaVersionError
 
@@ -113,7 +117,7 @@ def _render_no_window() -> None:
 
 def _switch_badge(state: SwitchState) -> None:
     if state.engaged:
-        theme.status_badge(f"kill switch: engaged ({'; '.join(state.causes)})", "critical")
+        theme.status_badge(f"kill switch: engaged ({plain.plain_causes(state.causes)})", "critical")
     elif state.run_in_progress:
         theme.status_badge("kill switch: run in progress", "warning")
     else:
@@ -183,6 +187,48 @@ def _summary_card(summaries: tuple[ops.BookSummary, ...]) -> None:
     with st.container(border=True):
         st.subheader("Books")
         st.dataframe(_summary_table(summaries), hide_index=True)
+
+
+def _waiting_card(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    """Show every open book's owner queue, independent of the selected book."""
+    try:
+        items: tuple[waiting.WaitingItem, ...] = ops.waiting_on_owner(conn, settings, utc_now())
+    except SchemaVersionError:
+        return  # The outdated-journal panel below explains this store.
+    with st.container(border=True):
+        st.subheader("Waiting on you")
+        if not items:
+            theme.status_badge("Nothing is waiting on you", "good")
+            return
+        for item in items:
+            status: theme.Status = "critical" if item.kind == "kill_switch_engaged" else "warning"
+            theme.status_badge(f"{item.book_id}: {item.kind}", status)
+            detail = scrub_text(item.detail, secrets=_configured_secrets(settings))[0]
+            st.caption(f"{detail} · since {item.since or '-'}")
+            if item.command is not None:
+                st.code(item.command, language="bash")
+            else:
+                st.caption("No command; follow the detail above.")
+
+
+def _overdue_delisting_card(conn: duckdb.DuckDBPyConnection) -> None:
+    """Every open book's delisting cash that never arrived, from stored rows only."""
+    try:
+        items = ops.overdue_delisting_cash(conn)
+    except SchemaVersionError:
+        return  # The outdated-journal panel below explains this store.
+    for item in items:
+        theme.status_badge(f"{item.book_id}: {item.line}", "warning")
+
+
+def _edgar_age_card(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    """The EDGAR master's age once over its limit, from stored run rows only."""
+    try:
+        age = ops.edgar_age(conn, settings, utc_now())
+    except (SchemaVersionError, duckdb.CatalogException):
+        return  # The outdated-journal panel below explains this store.
+    if age is not None:
+        theme.status_badge(age.line, "warning")
 
 
 def _kpis(data: OpsData) -> None:
@@ -348,6 +394,49 @@ def _alerts_card(data: OpsData) -> None:
             st.caption("Showing the newest alerts only; the window has more.")
 
 
+_EVENT_LABEL = {
+    "dividend_cash": "Dividend",
+    "corporate_action_cash": "Corporate action cash",
+    "fee_cash": "Fee",
+    "cash_in_lieu": "Cash in lieu of a fractional share",
+    "split": "Split",
+    "stock_dividend": "Stock dividend",
+}
+
+
+def _reconciliation_events(mismatches_json: str) -> list[str]:
+    """Plain lines for the events a reconciliation recorded on holdings: what it
+    explained (dividends, splits, fees), ticker changes, and what it could not."""
+    try:
+        payload = json.loads(mismatches_json)
+    except ValueError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    lines: list[str] = []
+    for entry in payload.get("explained") or []:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind", "event"))
+        label = _EVENT_LABEL.get(kind, kind.replace("_", " ").capitalize())
+        name = entry.get("security_id") or "account"
+        cash = entry.get("cash")
+        amount = f", cash {cash:+,.2f}" if isinstance(cash, int | float) else ""
+        why = f": {entry['explanation']}" if entry.get("explanation") else ""
+        lines.append(f"{label} on {name}{amount}{why}")
+    for entry in payload.get("symbol_changes") or []:
+        if isinstance(entry, dict):
+            lines.append(
+                f"Ticker change on {entry.get('security_id')}: "
+                f"{entry.get('old_symbol')} is now {entry.get('new_symbol')}"
+            )
+    for entry in payload.get("mismatches") or []:
+        if isinstance(entry, dict):
+            name = entry.get("security_id") or entry.get("symbol") or "account"
+            lines.append(f"Needs a look, {entry.get('kind')} on {name}: {entry.get('detail')}")
+    return lines
+
+
 def _reconciliation_card(reconciliation: ReconciliationRow | None) -> None:
     with st.container(border=True):
         st.subheader("Reconciliation")
@@ -359,7 +448,117 @@ def _reconciliation_card(reconciliation: ReconciliationRow | None) -> None:
         if reconciliation.broker_cash is not None:
             st.caption(f"broker cash: {reconciliation.broker_cash:,.2f}")
         if reconciliation.mismatches_json:
-            st.caption(reconciliation.mismatches_json)
+            events = _reconciliation_events(reconciliation.mismatches_json)
+            if events:
+                st.caption("Events on your holdings (dividends, splits, fees, name changes):")
+                for event in events:
+                    st.markdown(f"- {event}")
+            else:
+                st.caption("No events on your holdings in this check.")
+            with st.expander("Raw reconciliation record"):
+                st.code(reconciliation.mismatches_json, language="json")
+
+
+_RISK_STATUS_TEXT = {"within": "within", "over": "at or over", "engaged": "engaged"}
+_RISK_SCHEMA: dict[str, pl.DataType] = {
+    "limit": pl.Utf8(),
+    "value": pl.Utf8(),
+    "frozen limit": pl.Utf8(),
+    "headroom": pl.Utf8(),
+    "status": pl.Utf8(),
+    "what the limit does": pl.Utf8(),
+}
+
+
+def _risk_chip_status(row: headroom.LimitRow) -> theme.Status:
+    """Within is good; at or over is a warning, except the drawdown, whose
+    crossing engages the kill switch (critical, as is an engaged trigger)."""
+    if row.status == "within":
+        return "good"
+    return "critical" if row.key == "drawdown" else "warning"
+
+
+def _risk_number(row: headroom.LimitRow, number: float) -> str:
+    """Cash and drawdown read as a percentage; gross and a position as a weight."""
+    return f"{number:.2%}" if row.key in ("cash", "drawdown") else f"{number:.2f}"
+
+
+def _risk_value(card: headroom.Headroom, row: headroom.LimitRow) -> str:
+    if row.key != "position":
+        return _risk_number(row, row.value)
+    if card.largest_security_id is None:
+        return "none"
+    name = card.largest_ticker or f"Ticker unavailable ({card.largest_security_id})"
+    return f"{name} {row.value:.2f}"
+
+
+def _risk_headroom(row: headroom.LimitRow) -> str:
+    if row.headroom_pp > 0 and row.status == "within":
+        return f"{row.headroom_pp:.2f} pp left"
+    return f"over by {-row.headroom_pp:.2f} pp" if row.headroom_pp < 0 else "at the limit"
+
+
+def _risk_table(card: headroom.Headroom) -> pl.DataFrame:
+    return pl.DataFrame(
+        [
+            {
+                "limit": row.label,
+                "value": _risk_value(card, row),
+                "frozen limit": _risk_number(row, row.limit),
+                "headroom": _risk_headroom(row),
+                "status": _RISK_STATUS_TEXT[row.status],
+                "what the limit does": row.does,
+            }
+            for row in card.rows
+        ],
+        schema=_RISK_SCHEMA,
+    )
+
+
+def _risk_card(conn: duckdb.DuckDBPyConnection, window: journal.PaperWindowRow) -> None:
+    """The Risk card (plan T260): each limit the run enforces, the window's
+    frozen value, the headroom left and what crossing it does
+    (`execution.headroom`). An unreadable mark or `frozen_json` shows its
+    message here, not a crash."""
+    with st.container(border=True):
+        st.subheader("Risk")
+        try:
+            card = headroom.read(conn, window)
+        except ValueError as exc:  # UnreadableMarkError is a ValueError
+            theme.status_badge("Risk limits unreadable", "critical")
+            st.caption(str(exc))
+            return
+        if card.session is None:
+            st.caption(
+                f"Before the first mark: the window's starting cash {card.cash:,.2f} and "
+                f"equity {card.equity:,.2f}, no positions."
+            )
+        else:
+            st.caption(f"Ledger equity {card.equity:,.2f}, as of the close of {card.session}.")
+        if card.long_short:
+            theme.status_badge("short limits not shown yet", "warning")
+        for row in card.rows:
+            theme.status_badge(
+                f"{row.label}: {_RISK_STATUS_TEXT[row.status]}", _risk_chip_status(row)
+            )
+        st.dataframe(_risk_table(card), hide_index=True)
+        if card.drawdown_engaged:
+            st.caption("The drawdown trigger has engaged the kill switch; it rearms at a release.")
+        elif card.dollars_before_switch > 0:
+            st.caption(
+                f"Equity can fall ${card.dollars_before_switch:,.2f} before the kill switch "
+                "engages."
+            )
+        else:
+            st.caption(
+                f"Equity is ${-card.dollars_before_switch:,.2f} at or past the kill switch's "
+                "trigger level, peak x (1 - limit)."
+            )
+        st.caption(
+            f"Drawdown is measured from the rule's peak, ${card.peak:,.2f}: the last "
+            "release's peak equity, else the starting equity. Cash is the ledger's cash "
+            "less held shorts; the unspent_cash alert reads the broker's."
+        )
 
 
 def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) -> None:
@@ -369,6 +568,9 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
 
     st.header("Operations")
     summaries = _book_summaries(conn, settings)
+    _waiting_card(conn, settings)
+    _overdue_delisting_card(conn)
+    _edgar_age_card(conn, settings)
     if summaries:
         _summary_card(summaries)
     book = _selected_book(summaries, settings.paper.book_id)
@@ -387,8 +589,14 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
     header.render_freshness(header.Freshness(data.as_of, data.last_updated))
     if data.stale:
         theme.status_badge("stale: no run yet for the required session", "warning")
+        st.caption(
+            "Trust this over any 'last run ok' above: that run is for an earlier session. "
+            "Normal before today's morning run; if it is still here after the run's usual "
+            "time, see 'Waiting for you' at the top."
+        )
 
     _kpis(data)
+    _risk_card(conn, data.window)
     if data.open_orders_count and data.last_run_kind == "rebalance":
         st.info("Fills are recorded at the next scheduled run")
     symbols = _symbols(conn, data)

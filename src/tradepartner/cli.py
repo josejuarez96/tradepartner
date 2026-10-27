@@ -299,7 +299,8 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
   (`no_window` with no open book; it is a usage error with `--book`).
 - `tradepartner paper shakedown` (ADR 0017 part E; plan T157b) prints
   `execution.shakedown.shakedown`'s seven lines, E.1 to E.7, over every book,
-  each with the rows, query and thresholds it read, through
+  each with its finding (the rows, query and thresholds it read only with
+  `--verbose`), through
   `store.db.open_read_only` (it writes nothing). The thresholds come from the
   newest `shakedown_span` decision, never `Settings`. It exits 0 only when every
   line passes and 1 otherwise, or when no `shakedown_span` row exists.
@@ -386,6 +387,7 @@ import httpx
 import polars as pl
 import typer
 
+from tradepartner import heartbeat
 from tradepartner.action_retract import retract_action
 from tradepartner.adapters import alpaca_raw, edgar_raw
 from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
@@ -421,7 +423,7 @@ from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
 from tradepartner.corpus import departure_fetch
 from tradepartner.execution import check as paper_check
-from tradepartner.execution import lots_reconcile, ops, reconcile_run, window
+from tradepartner.execution import lots_reconcile, ops, plain, reconcile_run, waiting, window
 from tradepartner.execution import report as paper_report
 from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
@@ -443,6 +445,7 @@ from tradepartner.health import (
     HealthReport,
     IndexMembersCheck,
     health_report,
+    health_verdict,
 )
 from tradepartner.ingest import (
     SOURCES,
@@ -1193,6 +1196,11 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def _describe_failure(exc: BaseException, *, scheduled: bool = False) -> str:
+    """`_describe` plus the plain next step (#2203); display only."""
+    return f"{_describe(exc)}\n{plain.failure_hint(exc, scheduled=scheduled)}"
+
+
 def _echo_scrubbed(text: str, settings: Settings) -> None:
     """Print `text` through the `cli_record` fixture scrub (every lab command's output)."""
     typer.echo(_scrubbed(text, settings))
@@ -1579,7 +1587,7 @@ PAPER_REFUSAL_EXIT: Mapping[str, int] = MappingProxyType(
 
 #: `--reason`, required by `stop`, `kill`, `resume`, `abandon`, `override` and `settle`.
 _REASON_OPTION = typer.Option("--reason", help="why, in words (journaled)")
-#: `--book`, on every `paper` command but `shakedown` and `lots-reconcile` (ADR
+#: `--book`, on every `paper` command but `shakedown` (ADR
 #: 0017 B.2 and B.7; plans T155b and T156).
 _BOOK_OPTION = typer.Option(
     "--book", help="the book token (default paper.book_id)", allow_from_autoenv=False
@@ -1608,6 +1616,34 @@ def _run_lines(prefix: str, outcome: paper_run.RunOutcome, settings: Settings) -
         _echo_scrubbed(f"  {note}", settings)
 
 
+def replace_wait(s: Settings, seconds: int) -> Settings:
+    """`s` with `store.lock_retry_seconds` set to `seconds`."""
+    store = s.store.model_copy(update={"lock_retry_seconds": seconds})
+    return s.model_copy(update={"store": store})
+
+
+def _writer_settings(s: Settings) -> Settings:
+    """`s` with the longer `store.writer_lock_retry_seconds` as the lock wait: the
+    scheduled writers (`paper run`, `paper kill`, `ingest`) out-wait a long reader (#2178)."""
+    return replace_wait(s, s.store.writer_lock_retry_seconds)
+
+
+_HOLDER_RE = re.compile(r"held in (.+?)\s*\(PID (\d+)\)")
+# `switch.engage` folds its error into `WriteFailed` as `"<class name>: <message>"`.
+_STORE_LOCKED_RE = re.compile(r"\bStore(?:SameProcess)?LockedError: ")
+
+
+def _lock_holder(exc: BaseException | str) -> str:
+    """Who holds the store, as far as the lock error (or its message) says:
+    DuckDB's process and PID, else a plain "an unidentified process"."""
+    found = _HOLDER_RE.search(str(exc))
+    if found is not None:
+        return f"{Path(found.group(1)).name}, pid {found.group(2)}"
+    if "already open in this process" in str(exc):
+        return "another connection in this process"
+    return "an unidentified process"
+
+
 def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
     """`call()`, every refusal and failure turned into its scrubbed message and exit."""
     try:
@@ -1626,8 +1662,68 @@ def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
     except window.KillWriteFailed as exc:
         message, code = f"failed: {exc}", WRITE_FAILED_EXIT_CODE
     except Exception as exc:
-        message, code = f"failed: {_describe(exc)}", CRASH_EXIT_CODE
+        message, code = f"failed: {_describe_failure(exc)}", CRASH_EXIT_CODE
     raise _fail(_scrubbed(message, settings), code)
+
+
+#: The scheduled paper run's time, as the scheduling runbook sets it (08:05 ET), said
+#: to the owner where fills wait for it (#2201). Display text only; nothing reads it.
+PAPER_RUN_TIME_TEXT = "08:05 ET"
+_FILLS_NOTE = (
+    "Orders were sent; fills or rejections are recorded at the next scheduled run "
+    f"({PAPER_RUN_TIME_TEXT})"
+)
+
+
+def _et(value: Any) -> str:
+    """An owner-facing time: Eastern first, UTC beside it for the audit trail (#2201).
+    A date or a non-time value goes through `_fmt` unchanged."""
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        eastern = value.astimezone(_NEW_YORK)
+        utc = value.astimezone(UTC)
+        return f"{eastern:%Y-%m-%d %H:%M} ET ({utc:%H:%M} UTC)"
+    return _fmt(value)
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def _book_first_lines(
+    summaries: Sequence[ops.BookSummary],
+    items: Sequence[waiting.WaitingItem],
+    now: datetime,
+    overdue: Sequence[ops.OverdueDelisting] = (),
+) -> list[str]:
+    """One plain sentence per book, before any counts (#2201): `daily: trading, 0
+    issues`, or `main: halted 2 days, run: <resume command>`. Each overdue delisting
+    cash item counts as an issue, so this line is never calmer than the ones below."""
+    lines = []
+    for row in summaries:
+        mine = [item for item in items if item.book_id == row.book_id]
+        late = sum(1 for item in overdue if item.book_id == row.book_id)
+        halt = next((i for i in mine if i.kind == "kill_switch_engaged"), None)
+        if halt is not None or row.switch_state.engaged:
+            others = len(mine) + late - (1 if halt is not None else 0)
+            if halt is None or not isinstance(halt.since, datetime):
+                age = "halted"
+            else:
+                days = (
+                    now.astimezone(_NEW_YORK).date() - halt.since.astimezone(_NEW_YORK).date()
+                ).days
+                age = "halted today" if days <= 0 else f"halted {_plural(days, 'day')}"
+            more = f", {_plural(others, 'other issue')}" if others else ""
+            fix = f"; run: {halt.command}" if halt is not None and halt.command else ""
+            lines.append(f"{row.book_id}: {age}{more}{fix}")
+            continue
+        if not row.is_open:
+            state = "window closed"
+        elif row.switch_state.run_in_progress:
+            state = "run in progress"
+        else:
+            state = "trading"
+        lines.append(f"{row.book_id}: {state}, {_plural(len(mine) + late, 'issue')}")
+    return lines
 
 
 def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
@@ -1650,13 +1746,38 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
             f"open orders {row.open_orders_count}; kill switch {switch_text}; "
             f"last run {_fmt(row.last_run_status)}; "
             f"next rebalance {_fmt(row.next_rebalance_session)}"
+            + ("" if row.next_rebalance_session is None else " (data day; trades the next session)")
         )
         if traded is not None:
             result = "traded today" if row.last_run_has_orders else "ran today with no orders"
             line += f"; rebalance {traded} {result}"
         if row.open_orders_count and row.last_run_kind == "rebalance":
-            line += "; Fills are recorded at the next scheduled run"
+            line += f"; {_FILLS_NOTE}"
         lines.append(line)
+    return lines
+
+
+def _overdue_delisting_lines(items: Sequence[ops.OverdueDelisting]) -> list[str]:
+    """One line per book's overdue delisting cash after `paper status --all`'s rows (#411)."""
+    return [f"book {item.book_id}; {item.line}" for item in items]
+
+
+def _edgar_age_lines(age: ops.EdgarAge | None) -> list[str]:
+    """`paper status --all`'s EDGAR data age line, when it is over its limit (#2197)."""
+    return [] if age is None else [age.line]
+
+
+def _waiting_lines(items: Sequence[waiting.WaitingItem]) -> list[str]:
+    """Format the owner queue after all `paper status --all` book lines."""
+    if not items:
+        return ["waiting on you: nothing"]
+    lines = [f"waiting on you ({len(items)}):"]
+    for item in items:
+        since = _et(item.since)
+        lines.append(
+            f"  book {item.book_id}; {item.kind}: {item.detail}; "
+            f"since {since}; command {item.command or '-'}"
+        )
     return lines
 
 
@@ -1676,23 +1797,21 @@ def _status_lines(
         return ["paper status: no paper window yet" + _for_book(book)]
     state = data.switch_state
     switch_text = "n/a" if state is None else ("engaged" if state.engaged else "released")
-    causes = "; ".join(state.causes) if state is not None and state.causes else "-"
+    causes = plain.plain_causes(state.causes) if state is not None and state.causes else "-"
     recon = data.reconciliation
     lines = [
         f"window {data.window.window_id} (first rebalance {data.window.first_rebalance_session})",
-        f"as of {_fmt(data.as_of)}; last updated {_fmt(data.last_updated)}"
+        f"as of {_et(data.as_of)}; last updated {_et(data.last_updated)}"
         + ("; STALE: no run for S-1" if data.stale else ""),
         f"positions {data.positions_count} (value {data.positions_value:.2f}); open orders "
         f"{data.open_orders_count}; targets {data.targets_count}",
-        *(
-            ["Fills are recorded at the next scheduled run"]
-            if data.open_orders_count and data.last_run_kind == "rebalance"
-            else []
-        ),
+        *([_FILLS_NOTE] if data.open_orders_count and data.last_run_kind == "rebalance" else []),
         f"kill switch {switch_text} (causes: {causes})",
         "reconciliation "
         + ("n/a" if recon is None else f"{recon.reconciliation_id} {recon.status} at {recon.at}"),
         *paper_slippage.slippage_report_lines(fill_slippage),
+        *(item.line for item in data.overdue_delisting),
+        *_edgar_age_lines(data.edgar_age),
         f"alerts ({len(data.alerts)}{', capped' if data.alerts_capped else ''}):",
     ]
     lines += [f"  #{a.alert_id} {a.at} {a.kind} {a.session}: {a.message}" for a in data.alerts]
@@ -1715,8 +1834,9 @@ LOTS_RECONCILE_REFUSAL_EXIT: Mapping[str, int] = MappingProxyType(
     }
 )
 _NEW_YORK = ZoneInfo("America/New_York")
-#: Every table of one lot-ledger set shares the set's stamp, the latest `lots.known_at`.
-_LATEST_SET = "known_at = (SELECT max(known_at) FROM lots)"
+#: Every table of one lot-ledger set shares the set's stamp, the latest `lots.known_at`
+#: of the set's book (`?` is the book; each book's set is its own, #2190).
+_LATEST_SET = "known_at = (SELECT max(known_at) FROM lots WHERE book_id = ?)"
 
 
 class _LotsRefused(Exception):
@@ -1739,12 +1859,20 @@ class _LedgerSet:
     flags: list[journal.WashSaleFlagRow]
 
 
-def _set_rows(conn: duckdb.DuckDBPyConnection, row_type: Any, order: str) -> list[Any]:
-    """`row_type`'s rows of the latest lot-ledger set, exactly as written."""
+def _set_rows(
+    conn: duckdb.DuckDBPyConnection, row_type: Any, order: str, book_id: str
+) -> list[Any]:
+    """`row_type`'s rows of `book_id`'s latest lot-ledger set, exactly as written."""
     names = [f.name for f in fields(row_type)]
     columns = ", ".join(f'"{name}"' for name in names)
+    if row_type is journal.WashSaleFlagRow:  # no book column: the book's disposals
+        book = "disposal_id IN (SELECT disposal_id FROM disposals WHERE book_id = ?) AND "
+    else:
+        book = "book_id = ? AND "
+    params = [book_id, book_id]
     rows = conn.execute(
-        f"SELECT {columns} FROM {row_type.TABLE} WHERE {_LATEST_SET} ORDER BY {order}"
+        f"SELECT {columns} FROM {row_type.TABLE} WHERE {book}{_LATEST_SET} ORDER BY {order}",
+        params,
     ).fetchall()
     return [row_type(**dict(zip(names, row, strict=True))) for row in rows]
 
@@ -1753,10 +1881,10 @@ def _local(at: datetime) -> date:
     return at.astimezone(_NEW_YORK).date()
 
 
-def _read_ledger_set(conn: duckdb.DuckDBPyConnection, tax_year: int) -> _LedgerSet:
-    """The latest lot-ledger set, the window it belongs to (the last window
-    started by the set's stamp) and every other window that reaches the tax
-    year, or a `no_window` refusal. Read-only."""
+def _read_ledger_set(conn: duckdb.DuckDBPyConnection, tax_year: int, book_id: str) -> _LedgerSet:
+    """`book_id`'s latest lot-ledger set, the window it belongs to (the book's
+    last window started by the set's stamp) and every other window of the book
+    that reaches the tax year, or a `no_window` refusal. Read-only."""
     try:
         journal.require_journal(conn)
     except journal.JournalNotInitialised:
@@ -1766,12 +1894,15 @@ def _read_ledger_set(conn: duckdb.DuckDBPyConnection, tax_year: int) -> _LedgerS
     windows = [
         (int(w), s)
         for w, s in conn.execute(
-            "SELECT window_id, started_at FROM paper_windows ORDER BY window_id"
+            "SELECT window_id, started_at FROM paper_windows WHERE book_id = ? ORDER BY window_id",
+            [book_id],
         ).fetchall()
     ]
     if not windows:
-        raise _LotsRefused("no_window", "no_window: no paper window was ever started")
-    stamp_row = conn.execute("SELECT max(known_at) FROM lots").fetchone()
+        raise _LotsRefused("no_window", f"no_window: no paper window was ever started in {book_id}")
+    stamp_row = conn.execute(
+        "SELECT max(known_at) FROM lots WHERE book_id = ?", [book_id]
+    ).fetchone()
     stamp = None if stamp_row is None else stamp_row[0]
     started = [(w, s) for w, s in windows if stamp is None or s <= stamp]
     window_id, window_started = (started or windows)[-1]
@@ -1794,9 +1925,9 @@ def _read_ledger_set(conn: duckdb.DuckDBPyConnection, tax_year: int) -> _LedgerS
         window_id=window_id,
         window_started=_local(window_started),
         other_windows=others,
-        lots=_set_rows(conn, journal.LotRow, "lot_id"),
-        disposals=_set_rows(conn, journal.DisposalRow, "disposal_id"),
-        flags=_set_rows(conn, journal.WashSaleFlagRow, "flag_id"),
+        lots=_set_rows(conn, journal.LotRow, "lot_id", book_id),
+        disposals=_set_rows(conn, journal.DisposalRow, "disposal_id", book_id),
+        flags=_set_rows(conn, journal.WashSaleFlagRow, "flag_id", book_id),
     )
 
 
@@ -2138,7 +2269,8 @@ def make_app(
                 through_date = date.fromisoformat(through)
             except ValueError:
                 raise _fail(f"--through must be YYYY-MM-DD, got {through!r}", USAGE_ERROR) from None
-        s = settings()
+        base = settings()  # the edges get the caller's own Settings; only the store wait differs
+        s = _writer_settings(base)
         if source == "openfigi" and not s.openfigi.enabled:
             raise _fail("--source openfigi needs openfigi.enabled=true", USAGE_ERROR)
         if actions_backfill:
@@ -2207,7 +2339,9 @@ def make_app(
             _print_result(result)
             raise typer.Exit(result.exit_code)
         if source == ASSETS_SOURCE:
-            result = ingest_assets(s, lambda: assets_source(s, clock), clock=clock, dry_run=dry_run)
+            result = ingest_assets(
+                s, lambda: assets_source(base, clock), clock=clock, dry_run=dry_run
+            )
             _print_result(result)
             raise typer.Exit(result.exit_code)
         if source == "openfigi":
@@ -2238,22 +2372,39 @@ def make_app(
                 fred = ingest_rates(s, all_rates, since=start, clock=clock)
                 result = IngestResult(result.runs + fred.runs)
         else:
-            result = ingest_session(
-                s,
-                prices=prices,
-                filings=filings,
-                rates=all_rates,
-                source=source,
-                clock=clock,
-                dry_run=dry_run,
-                rebuild_statement_facts=rebuild_statement_facts,
-                rebuild_filing_events=rebuild_filing_events,
-                rebuild_classifications=rebuild_classifications,
-                restamp=restamp,
-                on_restamp=restamped.append,
-                restamp_window_ok=window_ok,
-                assets=lambda: assets_source(s, clock),
+            # Only the scheduled job's shape pings its check: a one-source, dry, restamp
+            # or rebuild run must not report the 18:30 job as done (#2155).
+            scheduled_shape = (
+                source == "all"
+                and not dry_run
+                and restamp is None
+                and not (
+                    rebuild_statement_facts or rebuild_filing_events or rebuild_classifications
+                )
             )
+            try:
+                result = ingest_session(
+                    s,
+                    prices=prices,
+                    filings=filings,
+                    rates=all_rates,
+                    source=source,
+                    clock=clock,
+                    dry_run=dry_run,
+                    rebuild_statement_facts=rebuild_statement_facts,
+                    rebuild_filing_events=rebuild_filing_events,
+                    rebuild_classifications=rebuild_classifications,
+                    restamp=restamp,
+                    on_restamp=restamped.append,
+                    restamp_window_ok=window_ok,
+                    assets=lambda: assets_source(base, clock),
+                )
+            except Exception:
+                if scheduled_shape:
+                    heartbeat.ping(s, "ingest", ok=False)  # off-Mac dead-man's switch (#2155)
+                raise
+            if scheduled_shape:
+                heartbeat.ping(s, "ingest", ok=result.exit_code == 0)
         _print_result(result)
         for done in restamped:
             _print_restamp(done, committed=result.ok and not dry_run)
@@ -2677,6 +2828,13 @@ def make_app(
             raise _fail(
                 f"the store has no usable schema; run `tradepartner ingest`: {exc}", 1
             ) from None
+        chain_breaks = report.successor_chains.frame.filter(pl.col("price_break")).height
+        expected_warnings = (
+            (1 if _quarantined(report) > 0 else 0)
+            + (1 if report.duplicate_dividends.pending else 0)
+            + chain_breaks
+        )
+        typer.echo(health_verdict(report, expected_warnings))
         _print_report(report)
         warnings = 0
         if (count := _quarantined(report)) > 0:
@@ -4181,6 +4339,50 @@ def make_app(
             raise absent
         return s
 
+    def paper_schema_gate(
+        s: Settings, *, read_only: bool = False, lots_reconcile: bool = False
+    ) -> None:
+        """Migrate or refuse after option validation, before journal or broker work."""
+        if not read_only:
+
+            def migrate() -> None:
+                with open_for_write(s) as conn:
+                    schema.init_schema(conn)
+
+            _paper_call(s, migrate)
+            return
+
+        def read_version() -> int | None:
+            with open_read_only(s) as conn:
+                return schema.stored_version(conn)
+
+        if lots_reconcile:
+            try:
+                version = read_version()
+            except StoreLockedError as exc:
+                raise _fail(
+                    _scrubbed(f"refused: locked: store busy: {exc}", s),
+                    LOTS_RECONCILE_REFUSAL_EXIT["locked"],
+                ) from None
+            refusal_exit = LOTS_RECONCILE_REFUSAL_EXIT["schema_version"]
+        else:
+            version = _paper_call(s, read_version)
+            refusal_exit = PAPER_REFUSAL_EXIT["refused"]
+        if version == schema.CURRENT_SCHEMA_VERSION:
+            return
+        if version is not None and version > schema.CURRENT_SCHEMA_VERSION:
+            message = (
+                f"store at schema {version} is newer than this code "
+                f"({schema.CURRENT_SCHEMA_VERSION}): update the code"
+            )
+        else:
+            found = "no schema" if version is None else f"schema {version}"
+            message = (
+                f"store at {found}, code at {schema.CURRENT_SCHEMA_VERSION}: "
+                "run `tradepartner ingest` or any paper write command to migrate"
+            )
+        raise _fail(_scrubbed(message, s), refusal_exit)
+
     def write_chunk(s: Settings) -> window.Connect:
         return lambda: open_for_write(s)
 
@@ -4192,6 +4394,7 @@ def make_app(
         """Open a paper window for a signed-off hypothesis in the book (spec req 14)."""
         chosen = _checked_book(book)
         s = paper_settings()
+        paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         result = _paper_call(
             s,
@@ -4217,6 +4420,7 @@ def make_app(
         (req 14)."""
         chosen = _checked_book(book)
         s = paper_settings(reason)
+        paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         result = _paper_call(
             s,
@@ -4233,15 +4437,22 @@ def make_app(
         """The tracking run on the clock's session for the book, or with no `--book`
         for every book with an open window (spec req 7; the scheduler's job)."""
         chosen = _checked_book(book)
-        s = paper_settings()
+        s = _writer_settings(paper_settings())
+        try:
+            paper_schema_gate(s)
+        except (Exception, typer.Exit):
+            heartbeat.ping(s, "paper", ok=False)
+            raise
         if chosen is None:
             try:
                 runs = paper_run.every_book_run(
                     s, write_chunk(s), lambda b: broker(s, clock, b), clock
                 )
             except Exception as exc:
+                heartbeat.ping(s, "paper", ok=False)
                 raise _fail(
-                    _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
+                    _scrubbed(f"paper run: failed: {_describe_failure(exc, scheduled=True)}", s),
+                    CRASH_EXIT_CODE,
                 ) from exc
             for entry in runs:
                 # The line before books for `paper.book_id` alone; any other book is named.
@@ -4255,11 +4466,14 @@ def make_app(
                             f": {said}" if isinstance(said, str) else ""
                         )
                     else:
-                        detail = f"failed: {_describe(entry.error)}"
+                        detail = f"failed: {_describe_failure(entry.error, scheduled=True)}"
                     typer.echo(_scrubbed(f"{prefix}: {detail}", s), err=True)
                     continue
                 _run_lines(prefix, entry.outcome, s)
             codes = [entry.exit_code for entry in runs]
+            # Off-Mac dead-man's switch (#2155): green only when every open-window book is
+            # healthy; a halted book keeps it red until resumed (#2179).
+            heartbeat.ping(s, "paper", ok=all(entry.healthy for entry in runs))
             if WRITE_FAILED_EXIT_CODE in codes:
                 raise typer.Exit(WRITE_FAILED_EXIT_CODE)
             if any(codes):
@@ -4269,11 +4483,20 @@ def make_app(
             outcome = paper_run.tracking_run(
                 s, write_chunk(s), broker(s, clock, chosen), clock, book_id=chosen
             )
+        except SystemExit:  # the write-failure exit (3) passes through, with a /fail ping
+            heartbeat.ping(s, "paper", ok=False)
+            raise
         except Exception as exc:
+            heartbeat.ping(s, "paper", ok=False)
             raise _fail(
-                _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
+                _scrubbed(f"paper run: failed: {_describe_failure(exc, scheduled=True)}", s),
+                CRASH_EXIT_CODE,
             ) from exc
         _run_lines("paper run", outcome, s)
+        if not outcome.healthy:
+            # A `--book` run only ever turns the check red: it cannot see the other
+            # books, so only the scheduled every-book run may ping OK (#2179).
+            heartbeat.ping(s, "paper", ok=False)
         if outcome.exit_code:
             raise typer.Exit(outcome.exit_code)
 
@@ -4282,6 +4505,7 @@ def make_app(
         """Reconcile the book's journal with its broker now (spec req 6)."""
         chosen = _checked_book(book)
         s = paper_settings()
+        paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         result = _paper_call(
             s,
@@ -4307,15 +4531,63 @@ def make_app(
         chosen = _checked_book(book)
         if every_book and chosen is not None:
             raise _fail("--all and --book cannot be combined", USAGE_ERROR)
-        s = paper_settings(reason)
+        if _blank_text(reason):
+            raise _fail("--reason must be non-blank", USAGE_ERROR)
+        s = settings()
+        if not Path(s.store.path).is_file():
+            raise _fail(
+                f"refused: no_window: no store at {s.store.path}, so no paper window is open; "
+                "kill switch NOT engaged (check the working directory or STORE__PATH)",
+                PAPER_REFUSAL_EXIT["no_window"],
+            )
+        writer_s = _writer_settings(s)
+
+        def waiting_line(holder: str) -> None:
+            typer.echo(
+                "paper kill: kill switch NOT engaged yet: store busy "
+                f"(held by {holder}), waiting up to "
+                f"{writer_s.store.lock_retry_seconds} s",
+                err=True,
+            )
+
+        def kill_one(target: str, *, already_announced: bool = False) -> int:
+            """`window.kill`, a busy store made plain: nothing is engaged, say so (#2178).
+            The waiting line comes from the store's own first lock retry
+            (`on_wait`), once per book; no other connection is ever opened."""
+            announced = [already_announced]
+
+            def announce(message: str) -> None:
+                if not announced[0]:
+                    waiting_line(_lock_holder(message))
+                    announced[0] = True
+
+            try:
+                return window.kill(s, clock, reason, book_id=target, on_wait=announce)
+            except StoreLockedError as exc:
+                raise window.KillWriteFailed(
+                    "kill switch NOT engaged: store busy "
+                    f"(held by {_lock_holder(exc)}); retry, or stop the reader"
+                ) from exc
+            except window.KillWriteFailed as exc:
+                if not _STORE_LOCKED_RE.search(str(exc)):
+                    raise
+                raise window.KillWriteFailed(
+                    "kill switch NOT engaged: store busy "
+                    f"(held by {_lock_holder(exc)}); retry, or stop the reader"
+                ) from exc
+
         if not every_book:
             bk = resolve_book(s, chosen)
-            event_id = _paper_call(
-                s, lambda: window.kill(s, write_chunk(s), clock, reason, book_id=bk)
-            )
+            event_id = _paper_call(s, lambda: kill_one(bk))
             _echo_scrubbed(f"paper kill: engaged (kill_switch event {event_id})", s)
             return
-        books = _paper_call(s, lambda: paper_run.open_books(s))
+        listing_waited = [False]
+
+        def listing_notice(message: str) -> None:
+            waiting_line(_lock_holder(message))
+            listing_waited[0] = True
+
+        books = _paper_call(s, lambda: paper_run.open_books(writer_s, on_wait=listing_notice))
         if not books:
             raise _fail(
                 "refused: no_window: no book has an open window", PAPER_REFUSAL_EXIT["no_window"]
@@ -4323,7 +4595,8 @@ def make_app(
         codes: list[int] = []
 
         def kill_book(target: str) -> Callable[[], int]:
-            return lambda: window.kill(s, write_chunk(s), clock, reason, book_id=target)
+            announced = listing_waited[0] and target == books[0]
+            return lambda: kill_one(target, already_announced=announced)
 
         for each in books:
             try:
@@ -4357,6 +4630,7 @@ def make_app(
         """Settle, collect, reconcile and release the book's kill switch (spec req 5)."""
         chosen = _checked_book(book)
         s = paper_settings(reason)
+        paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         outcome = _paper_call(
             s,
@@ -4392,6 +4666,7 @@ def make_app(
         """Open the book's tracking trial and compare paper with it (spec req 10)."""
         chosen = _checked_book(book)
         s = paper_settings()
+        paper_schema_gate(s, read_only=True)
 
         def run_report() -> paper_report.Report | str:
             try:
@@ -4427,10 +4702,21 @@ def make_app(
             _echo_scrubbed(line, s)
 
     @paper_app.command("check")
-    def paper_check_(book: Annotated[str | None, _BOOK_OPTION] = None) -> None:
+    def paper_check_(
+        book: Annotated[str | None, _BOOK_OPTION] = None,
+        verbose: Annotated[
+            bool,
+            typer.Option(
+                "--verbose",
+                help="also print each check's query and every session date",
+                allow_from_autoenv=False,
+            ),
+        ] = False,
+    ) -> None:
         """The book's four exit-criteria checks; exit 0 only when all pass (req 15)."""
         chosen = _checked_book(book)
         s = paper_settings()
+        paper_schema_gate(s, read_only=True)
 
         def run_check() -> list[paper_check.CheckLine]:
             with open_read_only(s) as conn:
@@ -4439,29 +4725,60 @@ def make_app(
         lines = _paper_call(s, run_check)
         for line in lines:
             verdict = "PASS" if line.passed else "FAIL"
-            _echo_scrubbed(f"{verdict} {line.name}: {line.detail} (query: {line.query})", s)
+            if verbose:
+                _echo_scrubbed(f"{verdict} {line.name}: {line.detail} (query: {line.query})", s)
+            else:
+                _echo_scrubbed(f"{verdict} {line.name}: {line.short or line.detail}", s)
         if not all(line.passed for line in lines):
             raise typer.Exit(CRASH_EXIT_CODE)
 
     @paper_app.command("shakedown")
-    def paper_shakedown_() -> None:
+    def paper_shakedown_(
+        verbose: Annotated[
+            bool,
+            typer.Option(
+                "--verbose",
+                help="also print each line's rows, query and thresholds",
+                allow_from_autoenv=False,
+            ),
+        ] = False,
+    ) -> None:
         """The machine-readiness gate's seven lines over every book; exit 0 only when
         all pass (ADR 0017 part E; spec req 15 as amended 2026-10-09). Read-only."""
         s = paper_settings()
+        paper_schema_gate(s, read_only=True)
         now = ensure_tz_aware_utc(clock(), field_name="clock()")
 
-        def run_shakedown() -> paper_shakedown.Shakedown:
+        def run_shakedown() -> paper_shakedown.Shakedown | None:
             with open_read_only(s) as conn:
-                return paper_shakedown.shakedown(conn, s, now=now)
+                try:
+                    return paper_shakedown.shakedown(conn, s, now=now)
+                except ValueError:
+                    if registry.shakedown_span(conn) is None:
+                        return None
+                    raise
 
         result = _paper_call(s, run_shakedown)
-        for line in result.lines:
-            verdict = "PASS" if line.passed else "FAIL"
+        if result is None:
+            # not a crash: the span just has not been opened (exit code unchanged)
             _echo_scrubbed(
-                f"{verdict} {line.name}: {line.detail} (rows: {line.rows}; query: "
-                f"{line.query}; thresholds: {line.thresholds})",
+                "failed: ValueError: no shakedown_span decision: open the span with "
+                "`tradepartner decision shakedown-span --sessions N --order-sessions M --reason`"
+                if verbose
+                else "paper shakedown: no shakedown span is open yet. Open one with "
+                "`tradepartner decision shakedown-span --sessions N --order-sessions M "
+                "--reason ...` (see the shakedown runbook).",
                 s,
             )
+            raise typer.Exit(CRASH_EXIT_CODE)
+        for line in result.lines:
+            verdict = "PASS" if line.passed else "FAIL"
+            extra = (
+                f" (rows: {line.rows}; query: {line.query}; thresholds: {line.thresholds})"
+                if verbose
+                else ""
+            )
+            _echo_scrubbed(f"{verdict} {line.name}: {line.detail}{extra}", s)
         if not result.passed:
             raise typer.Exit(CRASH_EXIT_CODE)
 
@@ -4479,20 +4796,63 @@ def make_app(
         if every_book and chosen is not None:
             raise _fail("--all and --book cannot be combined", USAGE_ERROR)
         s = paper_settings()
+        paper_schema_gate(s, read_only=True)
         if every_book:
 
-            def read_all() -> tuple[ops.BookSummary, ...] | str:
+            def read_all() -> (
+                tuple[
+                    tuple[ops.BookSummary, ...],
+                    ops.OwnerQueue,
+                    tuple[ops.OverdueDelisting, ...],
+                    ops.EdgarAge | None,
+                ]
+                | str
+            ):
                 with open_read_only(s) as conn:
                     try:
-                        return ops.book_summaries(conn, s)
+                        summaries = ops.book_summaries(conn, s)
+                        queue = ops.owner_queue(
+                            conn, s, ensure_tz_aware_utc(clock(), field_name="clock()")
+                        )
+                        now = ensure_tz_aware_utc(clock(), field_name="clock()")
+                        return (
+                            summaries,
+                            queue,
+                            ops.overdue_delisting_cash(conn),
+                            ops.edgar_age(conn, s, now),
+                        )
                     except schema.SchemaVersionError as exc:
                         return str(exc)
 
-            summaries = _paper_call(s, read_all)
-            if isinstance(summaries, str):  # the journal predates version 17
-                _echo_scrubbed(f"paper status: {summaries}", s)
+            result = _paper_call(s, read_all)
+            if isinstance(result, str):  # the journal predates version 17
+                _echo_scrubbed(f"paper status: {result}", s)
                 raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
-            for line in _summary_lines(summaries):
+            summaries, queue, overdue, edgar = result
+            items = queue.items
+            now = ensure_tz_aware_utc(clock(), field_name="clock()")
+            overdue_lines = _overdue_delisting_lines(overdue)
+            edgar_lines = _edgar_age_lines(edgar)
+            # the open span's progress (#2298): not a problem, so not an item
+            progress_lines = [queue.shakedown_progress] if queue.shakedown_progress else []
+            if not summaries:  # no window yet: nothing to lead with
+                for line in (
+                    *_summary_lines(summaries),
+                    *overdue_lines,
+                    *edgar_lines,
+                    *_waiting_lines(items),
+                    *progress_lines,
+                ):
+                    _echo_scrubbed(line, s)
+                return
+            for line in (
+                *_book_first_lines(summaries, items, now, overdue),
+                *_waiting_lines(items),
+                *progress_lines,
+                *overdue_lines,
+                *edgar_lines,
+                *_summary_lines(summaries),
+            ):
                 _echo_scrubbed(line, s)
             return
 
@@ -4523,6 +4883,7 @@ def make_app(
         """End the book's window without flattening, owner-only (#247 Q13)."""
         chosen = _checked_book(book)
         s = paper_settings(reason)
+        paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         result = _paper_call(
             s,
@@ -4551,6 +4912,8 @@ def make_app(
         day = _parse_day("--session", session)
         chosen = _checked_book(book)
         s = paper_settings(reason)
+        if kind != "engage_kill_switch":
+            paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         override_id = _paper_call(
             s, lambda: window.override(s, clock, kind, day, name, reason, book_id=bk)
@@ -4577,6 +4940,7 @@ def make_app(
         (client_order_id,) = order
         chosen = _checked_book(book)
         s = paper_settings(reason)
+        paper_schema_gate(s)
         bk = resolve_book(s, chosen)
         result = _paper_call(
             s,
@@ -4602,8 +4966,10 @@ def make_app(
             ),
         ],
         tax_year: Annotated[int, typer.Option(help="the tax year the export covers")],
+        book: Annotated[str | None, _BOOK_OPTION] = None,
     ) -> None:
         """Compare a broker 1099-B export with the lot ledger; writes nothing."""
+        chosen = _checked_book(book)
         s = settings()
 
         def refuse(code: str, message: str) -> typer.Exit:
@@ -4611,13 +4977,14 @@ def make_app(
 
         if not Path(s.store.path).exists():
             raise refuse("no_store", f"no store at {s.store.path}")
+        paper_schema_gate(s, read_only=True, lots_reconcile=True)
         try:
             rows = parse_export(export)
         except UnknownExportFormat as exc:
             raise refuse("unknown_export_format", str(exc)) from None
         try:
             with open_read_only(s) as conn:
-                ledger = _read_ledger_set(conn, tax_year)
+                ledger = _read_ledger_set(conn, tax_year, chosen or s.paper.book_id)
         except StoreLockedError as exc:
             raise refuse("locked", f"locked: store busy: {exc}") from None
         except _LotsRefused as exc:

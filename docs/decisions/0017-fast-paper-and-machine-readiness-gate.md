@@ -135,3 +135,45 @@ The command is pure over a read-only connection (the `check.py` pattern), prints
 | **Phase 6: the live book** | M + S | its own ADR first; then `config.py` (the guard, live keys), `adapters/alpaca_trading_raw.py`, `adapters/alpaca_broker.py`, `execution/brokers.py`, a settled-cash read in `adapters/broker.py` and `execution/wrapper.py`, the runbook | Not before E passes and F is done; `safety-reviewer` on every PR |
 
 P0 to P3 can land before any book work; H1's window (book `main`) stays open throughout, and P4 to P6 open the second book beside it. P4 and P5 are independent of each other; P6 waits for both. `config.py`, `check.py`, `window.py` and `cli.py` are each named by three or four tasks: the plan PR declares those chains and its chain, width and shared-file numbers (development-process "Plan shape"), and may fold P2 into P1.
+
+## Amendment 2026-10-26 (#2266, [ADR 0025](0025-reconcile-by-breaks.md)): a break from an external cause does not restart the span
+
+The decision stands; part E's E.2 line and E.4's real-halt clause are superseded as below, and the text above is left as written. Under ADR 0025 a difference on one name is a **break** that restricts the name, not a book halt, and every break carries a `cause` (paper spec amendment of 2026-10-26, item 14). The owner, 2026-10-26: every whole-book stop costs the daily book days of testing.
+
+- **(a) What no longer restarts the span.** A name-level break whose `cause` is `corporate_action`, `broker_activity` or `data` does not restart the span. This holds whether the owner trues it up or an explainer clears it. These causes cover a corporate action in the store and a broker corporate-action or dividend activity on that name, each of a type that can produce the break's kind (the paper spec's table, item 14). A late store row or a data delay counts as external only when the broker's activity on the name already shows the event at detection (paper spec open question 47). A restriction writes no `kill_switch` row and leaves the run `ok`, so E.1 is unaffected.
+- **(b) What still counts against the span, unchanged.**
+  - A `mismatch` reconciliation: under ADR 0025 these are only the book-level kinds (account, unattributed cash, the order-path kinds, `break_cap`).
+  - A book-wide halt, with the restart after its `released` row as today.
+  - Our own order errors (E.3's duplicate, mis-sized and breach checks).
+  - Journal gaps (E.5).
+  - A missed run or a `stale_data` alert without a note (E.1, E.7).
+  - A break whose `cause` is `unattributed`, material or not (paper spec open question 46), which restarts the span like a mismatch. This includes any break on a name with an own fill or own open order since the last `ok` or `breaks` reconciliation. The span starts again at the session after the event that closes the break (`trued_up`, `auto_explained`, `resolved_by_broker` or `auto_accepted`). Until then the span is pending, as after an unreleased mismatch.
+- **(c) Who decides the group.** The kind and the cause decide it. Deterministic code records both on the `opened` event at detection, from rows known at close(S−1) and the broker's reads. The cause is never rewritten afterwards, and no command, note or true-up changes it. A part added to an open break later carries its own cause, and the break restarts the span if any of its parts is `unattributed`. A case the rules cannot place is `unattributed`, so it restarts.
+
+**E.2, as amended.** **Reconciliation.**
+- Zero `mismatch` rows in the span, in any book.
+- Zero breaks opened, or observed, with an `unattributed` part in the span. This includes immaterial ones, unless the owner picks open question 46 (b).
+- No break open past the frozen `risk.break_max_age_sessions` at the command's session (open question 48).
+- A `pending_unresolved` or `fills_lagging` row passes when the next reconciliation of that book is `ok` or `breaks`; a `breaks` row passes on its own. Their counts are printed.
+- The line prints the external breaks opened in the span by cause, and how each closed (trued up, auto-explained, resolved by the broker, auto-accepted, still open).
+
+**E.4's real-halt clause, as amended.** A real halt-path engagement in the span (a `halted` run) still restarts the span once the owner has resumed. A restriction is not a halt.
+
+Whether a trued-up external break also needs a `shakedown_note` is the paper spec's open question 45 (recommended: no; the true-up's typed reason is the record). This is what stops a single rare event from costing the daily book days of testing.
+
+## Correction 2026-10-26 (#2290): E.3's duplicate test judges orders by share count in shares
+
+The decision stands; E.3's duplicate clause for a notional decision is corrected as below, and the text above is left as written. A `planned_notional` decision is not always filled by notional orders. A trim (every sell, ADR 0010 amendment 2026-09-30), a whole-share buy, a short open or add, and a partial cover go out **by share count**, converted at the reference price. Judging their fills in dollars at the fill price fails every one that fills above its reference price, although nothing was oversold: on 2026-10-26, 68 of the daily book's 101 trims, so no span in which a book trims could pass. The quantity test, the mis-sized test, the breach test and both frozen tolerances are unchanged. The share-count test is weaker than a dollar test against a known reference price in one case, stated below as a limit.
+
+**E.3's duplicate clause, as corrected.** For no `decisions` row in the span do the live fills of its `orders` (`fills.superseded_by IS NULL`) sum to more than:
+- `decisions.planned_quantity` plus the frozen `risk.reconcile_quantity_tolerance`, for a quantity decision (unchanged);
+- for a notional decision, keyed on each order's own field, not the decision's side:
+  - its orders with `orders.notional`: fill value (quantity times price) above `decisions.planned_notional` plus the frozen `risk.reconcile_cash_tolerance` (unchanged);
+  - its orders with `orders.quantity`: filled shares above the shares they were sized to, plus the frozen `risk.reconcile_quantity_tolerance`. The journal does not keep the reference price, so "sized to" is read from the orders: each allows its own `quantity` plus the shares the decision's quantity orders had filled by fills known before it (`fills.known_at` before `orders.known_at`), and the decision may fill the largest of those. Two orders sized before either filled allow one order's quantity; a remainder sized after a fill allows that fill plus its own quantity.
+  - when the decision has an order with `orders.quantity`, any of its orders is a duplicate when it was written while an earlier order of the decision had no terminal `order_events` row (a decision is resized only once every order is terminal), or, for an order with `orders.quantity`, when the fill value of all the decision's orders known before it (both kinds, at the fill price) already reached the remainder's base (`target_notional` for a buy, `planned_notional` otherwise) less the frozen cash tolerance.
+
+*Limit (open question).* A stale remainder sized after a **partial** fill (say 9.9 of 10 shares filled, then 10 more ordered) passes, because the journal keeps no reference price to convert the remainder with. Closing it needs either the reference price stored on `orders` (a schema change) or a frozen price-drift tolerance (a new threshold); both are the owner's call.
+
+## Correction 2026-10-26 (#2301): E.4 fails if any drilled run wrote orders
+
+The decision stands; E.4 is corrected to fail when any scheduler `rebalance` or `catch_up` run made during an owner kill-switch engagement in the span wrote an `orders` row, even if another drill sequence is clean. The failing line names the run ids; a clean skipped run and a release are still required to pass.

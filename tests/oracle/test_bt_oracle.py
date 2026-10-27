@@ -130,16 +130,13 @@ def _fixture_store(path: Path) -> Path:
     return path
 
 
-@pytest.fixture(scope="module", params=CADENCES)
-def run(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory) -> OracleRun:
-    """Register the oracle hypothesis at the cadence `request.param` on a fresh fixture
-    store and run it once, under live settings without a `.env` whose store is another
-    temp file, so the fixture store is never `settings.store.path` and the oracle family
-    is allowed. Once per cadence: the tests only read the result."""
-    cadence: Cadence = request.param
-    tmp = tmp_path_factory.mktemp(f"oracle-{cadence}")
+def _oracle_run(tmp_path_factory: pytest.TempPathFactory, name: str, frozen: Settings) -> OracleRun:
+    """Register the oracle hypothesis with `frozen` on a fresh fixture store and run it
+    once, under live settings without a `.env` whose store is another temp file, so the
+    fixture store is never `settings.store.path` and the oracle family is allowed."""
+    cadence = frozen.schedule.rebalance_cadence
+    tmp = tmp_path_factory.mktemp(f"oracle-{name}")
     path, live = _fixture_store(tmp / "fixture_store.duckdb"), tmp / "real_store.duckdb"
-    frozen = _frozen(cadence)
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp / "none.env"))
         monkeypatch.setenv("STORE__PATH", str(live))
@@ -178,6 +175,13 @@ def run(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
     return OracleRun(cadence, path, live, outcome.trial_id, result)
 
 
+@pytest.fixture(scope="module", params=CADENCES)
+def run(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory) -> OracleRun:
+    """The long-only oracle run at the cadence `request.param`; once per cadence, the
+    tests only read the result."""
+    return _oracle_run(tmp_path_factory, request.param, _frozen(request.param))
+
+
 def _our_equity(result: BacktestResult) -> dict[date, float]:
     return {row.session: row.equity for row in result.equity if row.series == STRATEGY_SERIES}
 
@@ -207,9 +211,12 @@ class _Fill(bt.Algo):  # type: ignore[misc]
         targets: Mapping[date, Mapping[str, float]],
         bars: frozenset[tuple[date, str]],
         exits: Mapping[date, tuple[str, ...]],
+        *,
+        signed: bool = False,
     ) -> None:
         super().__init__()
         self._targets, self._bars, self._exits = targets, bars, exits
+        self._signed = signed
 
     def __call__(self, target: bt.core.StrategyBase) -> bool:
         now = target.now.date()
@@ -223,11 +230,14 @@ class _Fill(bt.Algo):  # type: ignore[misc]
                     if sid in held:
                         target.close(sid)
                 elif held.get(sid, 0.0) > weights[sid] * equity:
-                    target.allocate(weights[sid] * equity - held[sid], sid)
+                    target.allocate(weights[sid] * equity - held.get(sid, 0.0), sid)
             for sid in names:
                 delta = weights.get(sid, 0.0) * equity - held.get(sid, 0.0)
                 if sid in weights and delta > 0:
-                    target.allocate(min(delta, target.capital), sid)
+                    # A signed book's buy is a long buy or a short cover. The long-only
+                    # book caps it at `bt`'s cash; the signed book caps nothing, since
+                    # `bt` holds short proceeds in its capital.
+                    target.allocate(delta if self._signed else min(delta, target.capital), sid)
         for sid in self._exits.get(now, ()):
             target.close(sid)
         return True
@@ -237,12 +247,14 @@ def _run_bt(
     result: BacktestResult,
     targets: Mapping[date, Mapping[str, float]],
     exits: Mapping[date, tuple[str, ...]],
+    *,
+    signed: bool = False,
 ) -> bt.Backtest:
     """`bt` over `result`'s stitched frame, filled to `targets` with the forced `exits`,
     fractional shares, no commissions, on every session our engine reports."""
     prices, bars = _stitched(result, sorted(_our_equity(result)))
     backtest = bt.Backtest(
-        bt.Strategy("oracle", [_Fill(targets, bars, exits)]),
+        bt.Strategy("oracle", [_Fill(targets, bars, exits, signed=signed)]),
         prices,
         initial_capital=_frozen(CADENCES[0]).backtest.initial_capital,  # any cadence
         commissions=lambda quantity, price: 0.0,
@@ -339,3 +351,55 @@ def test_the_oracle_trial_is_synthetic_in_the_oracle_family(run: OracleRun) -> N
         ).fetchone()
     assert row == (True, "in_sample", "oracle", "ok")
     assert not run.live.exists()
+
+
+# --- the long/short case (backtest spec amendment #1872, item 9; plan T224) --------------
+
+
+def _frozen_long_short() -> Settings:
+    """`_frozen("month_end")` as a signed book: gross 1.0, net 0.0, fractional, zero costs and
+    a zero borrow fee (`bt` charges none); the price floor is lowered below every fixture
+    close so the proxy keeps the ranked names, and the drift cover is off (a short can be
+    at most all of equity; `bt` has no cover, spec item 7); the same lagged signal and
+    adjusted frame feed both engines."""
+    return _frozen("month_end").model_copy(
+        update={
+            "portfolio": _frozen("month_end").portfolio.model_copy(
+                update={
+                    "side": "long_short",
+                    "gross_exposure": 1.0,
+                    "net_exposure": 0.0,
+                    "short_min_price": 0.01,
+                    "short_cover_weight": 1.0,
+                }
+            )
+        }
+    )
+
+
+@pytest.fixture(scope="module")
+def short_run(tmp_path_factory: pytest.TempPathFactory) -> OracleRun:
+    """The one long/short oracle run, at `month_end`."""
+    return _oracle_run(tmp_path_factory, "long-short", _frozen_long_short())
+
+
+def test_bt_and_engine_agree_on_a_long_short_book(short_run: OracleRun) -> None:
+    result = short_run.result
+    targets = result.targets
+    # Both legs are held at many rebalances (a truncated leg scales its own share).
+    two_sided = [t for t in targets.values() if any(w < 0 for w in t.values())]
+    assert len(two_sided) >= 5 and any(abs(sum(t.values())) < 1e-12 for t in two_sided)
+    assert result.exposure_summary is not None
+
+    backtest = _run_bt(result, targets, EXITS, signed=True)
+
+    assert _max_relative_difference(_our_equity(result), backtest.strategy.values) <= TOLERANCE
+
+
+def test_a_one_session_lag_in_bt_fails_the_long_short_comparison(short_run: OracleRun) -> None:
+    result = short_run.result
+    late = {next_session(fill): target for fill, target in result.targets.items()}
+
+    backtest = _run_bt(result, late, EXITS, signed=True)
+
+    assert _max_relative_difference(_our_equity(result), backtest.strategy.values) > TOLERANCE
