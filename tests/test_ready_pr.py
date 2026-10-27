@@ -225,6 +225,16 @@ def test_kill_switch_page_requires_the_safety_review() -> None:
         assert ready_pr.required_reviews([path]) == {"safety-reviewer"}, path
 
 
+def test_dashboard_child_process_modules_require_their_reviews() -> None:
+    # the Lab and book actions spawn child processes that write (#2304)
+    both = {"quant-auditor", "safety-reviewer"}
+    assert ready_pr.required_reviews(["src/tradepartner/dashboard/lab_run.py"]) == both
+    assert ready_pr.required_reviews(["src/tradepartner/dashboard/book_actions.py"]) == {
+        "safety-reviewer"
+    }
+    assert ready_pr.required_reviews(["src/tradepartner/dashboard/home_page.py"]) == set()
+
+
 def test_every_review_prefix_exists_on_the_tree_unless_planned() -> None:
     # a rename must not silently disable the gate (#357: exec/ vs execution/)
     for prefix in (*ready_pr.QUANT_PREFIXES, *ready_pr.SAFETY_PREFIXES):
