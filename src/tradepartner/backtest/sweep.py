@@ -775,9 +775,8 @@ def _rule_differences(
         return shown if len(shown) <= 80 else f"{shown[:77]}..."
 
     def this_value(key: str, value: Any) -> str:
-        origin = (
-            " (current default)" if key not in file.fixed_params and key not in file.grid else ""
-        )
+        # A family-rule key is never a grid axis (forbidden axes are refused at parse).
+        origin = " (current default)" if key not in file.fixed_params else ""
         return f"{short(value)}{origin}"
 
     def compared(key: str, rule: Any, value: Any) -> str:
