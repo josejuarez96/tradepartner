@@ -60,7 +60,10 @@ and the day it closes may hold a run or not, so neither is required (ADR 0017:
    fill at most `planned_notional` (quantity times price) plus the frozen
    `risk.reconcile_cash_tolerance`, and its orders by share count fill at most
    the shares they were sized to (`_sized_shares`) plus the quantity tolerance,
-   never judged in dollars at the fill price; (mis-sized) every span
+   never judged in dollars at the fill price, and none of its orders could not
+   have come from its remainder (`_resized_orders`: written while an earlier
+   order was in flight, or a share order written after the fills known before
+   it reached the plan); (mis-sized) every span
    order's live fills sum to at most its `quantity` plus the quantity tolerance,
    else its `notional` plus the cash tolerance; (breach) no span
    `paper_run_results` row with `fault_type = 'LimitBreachError'`.
@@ -630,9 +633,14 @@ def _frozen_tolerance(window: PaperWindowRow, key: str) -> float:
     return float(value)
 
 
-def _sized_shares(
-    orders: Sequence[OrderRow], known: dict[str, list[tuple[datetime, float]]]
-) -> float:
+@dataclass(frozen=True)
+class _KnownFill:
+    known_at: datetime
+    quantity: float
+    price: float
+
+
+def _sized_shares(orders: Sequence[OrderRow], known: dict[str, list[_KnownFill]]) -> float:
     """The most shares a notional decision's orders by share count may fill.
 
     Each such order was sized to the decision's remainder from the fills known
@@ -641,7 +649,11 @@ def _sized_shares(
     decision may fill the largest of those. Two orders sized before either
     filled (a duplicate) allow only one order's quantity; a remainder sized
     after an earlier fill allows that fill plus its own quantity, whatever the
-    reference price it was converted at.
+    reference price it was converted at. A stale remainder sized after a
+    partial fill is not bounded here (no reference price is journaled);
+    `_resized_orders` catches the cases the journal can tell. A fill journaled
+    between sizing's read and the order's write counts as "before" it, which
+    can only loosen this bound.
     """
     coids = [o.client_order_id for o in orders]
     budgets = [0.0]
@@ -649,10 +661,55 @@ def _sized_shares(
         if order.quantity is None:
             continue
         before = sum(
-            qty for coid in coids for at, qty in known.get(coid, ()) if at < order.known_at
+            f.quantity for coid in coids for f in known.get(coid, ()) if f.known_at < order.known_at
         )
         budgets.append(order.quantity + before)
     return max(budgets)
+
+
+def _resized_orders(
+    decision_id: int,
+    orders: Sequence[OrderRow],
+    known: dict[str, list[_KnownFill]],
+    terminal_at: dict[str, datetime],
+    limit: float,
+    cash_tol: float,
+) -> list[str]:
+    """A notional decision's orders that its remainder could not have sized
+    (`plan.remainder`, `plan.decision_state`), over both order kinds:
+
+    - an order written while an earlier order of the decision had no terminal
+      event yet (a decision is resized only once every order is terminal);
+    - an order by share count written when the fill value of all the decision's
+      orders known before it already reached `limit` less the cash tolerance
+      (no remainder was left to size it from).
+    """
+    failures: list[str] = []
+    coids = [o.client_order_id for o in orders]
+    for order in orders:
+        for earlier in orders:
+            if earlier.known_at >= order.known_at:
+                continue
+            ended = terminal_at.get(earlier.client_order_id)
+            if ended is None or ended > order.known_at:
+                failures.append(
+                    f"order {order.client_order_id} written while order "
+                    f"{earlier.client_order_id} was in flight"
+                )
+        if order.quantity is None:
+            continue
+        value = sum(
+            f.quantity * f.price
+            for coid in coids
+            for f in known.get(coid, ())
+            if f.known_at < order.known_at
+        )
+        if value >= limit - cash_tol:
+            failures.append(
+                f"order {order.client_order_id} of decision {decision_id} sized with no "
+                f"remainder ({value:.2f} of {limit:.2f} filled before it)"
+            )
+    return failures
 
 
 def _orders_line(
@@ -664,12 +721,20 @@ def _orders_line(
     }
     quantity: dict[str, float] = {}
     notional: dict[str, float] = {}
-    known: dict[str, list[tuple[datetime, float]]] = {}
+    known: dict[str, list[_KnownFill]] = {}
     for item in store_journal.fills_for(conn):
         coid = item.fill.client_order_id
         quantity[coid] = quantity.get(coid, 0.0) + item.fill.quantity
         notional[coid] = notional.get(coid, 0.0) + item.fill.quantity * item.fill.price
-        known.setdefault(coid, []).append((item.fill.known_at, item.fill.quantity))
+        known.setdefault(coid, []).append(
+            _KnownFill(item.fill.known_at, item.fill.quantity, item.fill.price)
+        )
+    terminal_at: dict[str, datetime] = {}
+    for event in store_journal.order_events_for(conn, window_id=None):
+        if event.status in store_journal.TERMINAL_ORDER_STATUSES:
+            first = terminal_at.get(event.client_order_id)
+            if first is None or event.known_at < first:
+                terminal_at[event.client_order_id] = event.known_at
     orders = store_journal.orders_for(conn, window_id=None)
     in_span = [o for o in orders if o.session >= span.first_day]
 
@@ -697,9 +762,10 @@ def _orders_line(
     for order in orders:
         by_decision.setdefault(order.decision_id, []).append(order)
     planned = {
-        int(d): (run, pq, pn)
-        for d, run, pq, pn in conn.execute(
-            "SELECT decision_id, run_id, planned_quantity, planned_notional FROM decisions "
+        int(d): (run, pq, pn, side, pos, target)
+        for d, run, pq, pn, side, pos, target in conn.execute(
+            "SELECT decision_id, run_id, planned_quantity, planned_notional, side, "
+            "position_side, target_notional FROM decisions "
             "WHERE list_contains(?, decision_id)",
             [decision_ids],
         ).fetchall()
@@ -708,7 +774,9 @@ def _orders_line(
         if decision_id not in planned:
             failures.append(f"decision {decision_id} has orders but no decisions row")
             continue
-        run_id, planned_quantity, planned_notional = planned[decision_id]
+        run_id, planned_quantity, planned_notional, side, position_side, target = planned[
+            decision_id
+        ]
         qty_tol, cash_tol = tolerances(run_id)
         mine = by_decision[decision_id]
         coids = [o.client_order_id for o in mine]
@@ -738,6 +806,15 @@ def _orders_line(
                     failures.append(
                         f"decision {decision_id} filled {shares:g} shares > sized {sized:g}"
                     )
+                # a buy's remainder is sized from its target, every other one from
+                # the plan (`plan.remainder`)
+                whole_cover = side == "buy" and position_side == "short" and target is None
+                limit = (
+                    float(target)
+                    if side == "buy" and not whole_cover and target is not None
+                    else float(planned_notional)
+                )
+                failures += _resized_orders(decision_id, mine, known, terminal_at, limit, cash_tol)
         else:
             got = sum(quantity.get(c, 0.0) for c in coids)
             if got > 0:

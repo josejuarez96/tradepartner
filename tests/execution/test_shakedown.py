@@ -226,8 +226,10 @@ class _Journal:
         side: str = "buy",
         position_side: str = "long",
         hour: int = 19,
+        terminal_hour: int | None = None,
     ) -> None:
         stamp = _at(session, hour)
+        ended = stamp if terminal_hour is None else _at(session, terminal_hour)
         self.conn.execute(
             "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
             "security_id, symbol, side, notional, quantity, position_side, "
@@ -250,7 +252,7 @@ class _Journal:
         self.conn.execute(
             "INSERT INTO order_events (client_order_id, event_at, status, known_at, ingested_at) "
             "VALUES (?, ?, 'filled', ?, ?)",
-            [coid, stamp, stamp, stamp],
+            [coid, ended, ended, ended],
         )
         fill_at = _at(session, 21) if fill_after_terminal else stamp
         for index, qty in enumerate(fills):
@@ -737,7 +739,9 @@ def test_e3_a_remainder_order_sized_after_an_earlier_fill_passes(
         side="sell",
         hour=15,
     )
-    # the remainder, re-converted at a lower reference price: more shares than 10 - 4
+    # the remainder, re-converted at a lower reference price: more shares than 10 - 4.
+    # Accepted by design: without a journaled reference price any re-conversion of a
+    # remainder after a partial fill passes (ADR 0017 correction 2026-10-26, limit).
     j.order(
         "o-r2",
         decision_id,
@@ -752,6 +756,72 @@ def test_e3_a_remainder_order_sized_after_an_earlier_fill_passes(
     conn.close()
     line = _line(_run(settings), "E.3 orders")
     assert line.passed, line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_fails_on_a_share_order_written_after_the_plan_was_filled(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1, side="sell")
+    for coid, hour in (("o-f1", 15), ("o-f2", 16)):
+        j.order(coid, decision_id, run_id, D1, notional=None, quantity=10.0, side="sell", hour=hour)
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert not line.passed
+    assert f"order o-f2 of decision {decision_id} sized with no remainder" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_fails_on_a_whole_share_order_after_a_filled_notional_order(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1)
+    j.order("o-m1", decision_id, run_id, D1, hour=15)  # notional 1000, filled 10 at 100
+    j.order("o-m2", decision_id, run_id, D1, notional=None, quantity=10.0, hour=16)
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert not line.passed
+    assert f"order o-m2 of decision {decision_id} sized with no remainder" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_fails_on_an_order_written_while_an_earlier_one_was_in_flight(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1, side="sell")
+    j.order(
+        "o-i1",
+        decision_id,
+        run_id,
+        D1,
+        notional=None,
+        quantity=10.0,
+        fills=(5.0,),
+        side="sell",
+        hour=15,
+        terminal_hour=17,
+    )
+    j.order(
+        "o-i2",
+        decision_id,
+        run_id,
+        D1,
+        notional=None,
+        quantity=10.0,
+        fills=(5.0,),
+        side="sell",
+        hour=16,
+    )
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert not line.passed
+    assert "order o-i2 written while order o-i1 was in flight" in line.detail
 
 
 @pytest.mark.usefixtures("health")
