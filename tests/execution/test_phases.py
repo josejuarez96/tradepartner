@@ -756,6 +756,18 @@ def test_small_account_skips_a_nonfractionable_buy_below_one_share_only_when_ena
     assert cash_short.skips == () and cash_short.deferred == (3,)
 
 
+def test_small_account_skips_whole_share_worth_less_than_minimum() -> None:
+    frozen = RiskConfig.model_validate(
+        {"small_account": {"enabled": True}, "min_order_notional": 50.0}
+    )
+    buy = _d(3, "buy", sid="SEC_2", target=45.0, whole_share=True)
+    result = _buys([buy], 100.0, costs=NO_COSTS, assets={"SEC_2": WHOLE}, frozen=frozen)
+    assert result.orders == ()
+    assert result.deferred == ()
+    assert _reasons(result) == {"SEC_2": "skip_below_minimum"}
+    assert result.skips[0].counts_toward_cap
+
+
 def test_an_untradable_buy_skips_and_a_lost_fractionable_one_goes_by_whole_shares() -> None:
     assets = {"SEC_1": HALTED, "SEC_2": WHOLE, "SEC_3": TRADABLE}
     result = _buys(THREE[:2], 10_000.0, costs=NO_COSTS, assets=assets)

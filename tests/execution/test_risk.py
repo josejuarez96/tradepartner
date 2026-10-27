@@ -917,6 +917,16 @@ def test_a_whole_share_buy_worth_less_than_the_minimum_is_deferred() -> None:
     assert [(s.decision_id, s.deferred) for s in sizings] == [(1, False), (2, True)]
 
 
+def test_small_account_marks_a_never_fit_whole_share_for_a_minimum_skip() -> None:
+    frozen = RiskConfig.model_validate({"small_account": {"enabled": True}})
+    prices = {**_PRICES, "E": frozen.min_order_notional / 2}
+    buy = _buy(2, "A", frozen.min_order_notional * 0.6)
+    cheap = replace(buy, decision=replace(buy.decision, security_id="E", whole_share=True))
+    sizing = size_buys([cheap], 100.0, prices.__getitem__, frozen, _NO_COSTS)[0]
+    assert sizing.deferred
+    assert sizing.skip_below_minimum
+
+
 @pytest.mark.parametrize("weight", [math.nan, math.inf, -0.01])
 def test_a_non_finite_or_negative_target_weight_fails_closed(weight: float) -> None:
     orders = [_order("C", "buy", 2, notional=50.0, target_weight=weight)]

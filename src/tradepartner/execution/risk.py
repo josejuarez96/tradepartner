@@ -320,6 +320,7 @@ class Sizing:
     security_id: str
     notional: float | None = None
     quantity: float | None = None
+    skip_below_minimum: bool = False
 
     @property
     def deferred(self) -> bool:
@@ -1056,12 +1057,32 @@ def size_buys(
             cash_left -= cost
             whole_sizings.append(_sizing(buy, quantity=quantity))
         else:
-            whole_sizings.append(_sizing(buy))
+            whole_sizings.append(
+                _sizing(
+                    buy,
+                    skip_below_minimum=(
+                        frozen.small_account.enabled
+                        and id(buy) in never_fit
+                        and whole_shares(buy, Decimal(1)) >= 1
+                        and prices[buy.decision.security_id] < minimum
+                    ),
+                )
+            )
     return notional_sizings + whole_sizings
 
 
 def _sizing(
-    buy: BuyToSize, *, notional: float | None = None, quantity: float | None = None
+    buy: BuyToSize,
+    *,
+    notional: float | None = None,
+    quantity: float | None = None,
+    skip_below_minimum: bool = False,
 ) -> Sizing:
     assert buy.decision.decision_id is not None
-    return Sizing(buy.decision.decision_id, buy.decision.security_id, notional, quantity)
+    return Sizing(
+        buy.decision.decision_id,
+        buy.decision.security_id,
+        notional,
+        quantity,
+        skip_below_minimum,
+    )
