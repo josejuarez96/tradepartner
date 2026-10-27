@@ -812,6 +812,45 @@ def test_e3_uses_frozen_trading_minimum_for_no_remainder(
 
 
 @pytest.mark.usefixtures("health")
+def test_e3_zero_minimum_rejects_order_after_full_fill(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    conn.execute(
+        "UPDATE paper_windows SET frozen_json = json_merge_patch(frozen_json, ?) "
+        "WHERE window_id = 1",
+        [json.dumps({"risk.min_order_notional": 0.0})],
+    )
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1)
+    j.order("o-zero1", decision_id, run_id, D1, fills=(10.0,), hour=15)
+    j.order("o-zero2", decision_id, run_id, D1, fills=(), hour=16)
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert not line.passed
+    assert f"order o-zero2 of decision {decision_id} sized with no remainder" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_zero_minimum_allows_order_with_positive_remainder(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    conn.execute(
+        "UPDATE paper_windows SET frozen_json = json_merge_patch(frozen_json, ?) "
+        "WHERE window_id = 1",
+        [json.dumps({"risk.min_order_notional": 0.0})],
+    )
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1)
+    j.order("o-part1", decision_id, run_id, D1, fills=(5.0,), hour=15)
+    j.order("o-part2", decision_id, run_id, D1, notional=500.0, fills=(), hour=16)
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert line.passed, line.detail
+
+
+@pytest.mark.usefixtures("health")
 def test_e3_first_minimum_order_and_exact_minimum_remainder_pass(
     conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:

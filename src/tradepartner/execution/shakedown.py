@@ -781,7 +781,7 @@ def _resized_orders(
     - an order written while an earlier order of the decision had no terminal
       event yet (a decision is resized only once every order is terminal);
     - any order written when the fill value of all the decision's orders
-      known before it left less than the frozen trading minimum
+      known before it exhausted the remainder or left less than the frozen trading minimum
       (no remainder was left to size it from).
     """
     failures: list[str] = []
@@ -806,7 +806,8 @@ def _resized_orders(
             for f in known.get(coid, ())
             if f.known_at < order.known_at
         )
-        if value > 0 and limit - value < minimum:
+        remainder = limit - value
+        if value > 0 and (remainder <= 0 or remainder < minimum):
             failures.append(
                 f"order {order.client_order_id} of decision {decision_id} sized with no "
                 f"remainder ({value:.2f} of {limit:.2f} filled before it)"
