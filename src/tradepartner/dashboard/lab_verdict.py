@@ -28,7 +28,11 @@ connection (the caller's short read-only one is passed in).
 `in_flight(conn, now, settings)` lists what is open in the registry: a
 `sweep_runs` row with no `finished_at` or an `unfinished` non-synthetic trial,
 started within `ui.lab_orphan_after_hours`, is `running` (it blocks a new Run);
-an older one is listed apart as an `orphan` with its remedy and does not block.
+an older one is listed apart as an `orphan` with its remedy and does not block (the
+store's writer lock, not this list, serialises writers). An unfinished trial of a
+sweep run is covered by that run while the run row is open, and is an orphan
+whatever its age once the row has closed (an interrupted run leaves its group's
+trials unfinished; this refines the plan line's literal rule).
 """
 
 from __future__ import annotations
@@ -106,6 +110,7 @@ class LabVerdict:
     n_failed: int | None = None
     variants: tuple[VariantOutcome, ...] = ()
     verdicts: SweepVerdicts | None = None
+    verdicts_error: str | None = None
     log_tail: str = ""
 
 
@@ -150,20 +155,28 @@ def _trial_verdict(
     )
 
 
-def _sweep_verdicts(conn: duckdb.DuckDBPyConnection, slug: str) -> SweepVerdicts | None:
+def _sweep_verdicts(
+    conn: duckdb.DuckDBPyConnection, slug: str
+) -> tuple[SweepVerdicts | None, str | None]:
+    """`(verdicts, error)`: the error text when `sweep_report` could not be built."""
     try:
         report = sweep_report.sweep_report(conn, slug)
-    except (ValueError, LabNotInitialised):
-        return None
+    except ValueError as exc:
+        return None, str(exc)
+    except LabNotInitialised:
+        return None, None
     if report.state != "complete" or report.verdicts is None:
-        return None
+        return None, None
     v = report.verdicts
-    return SweepVerdicts(
-        argmax_slug=v.argmax.slug,
-        promote_at_least=report.promote_at_least,
-        promote_at_least_met=v.promote_at_least_met,
-        retire_below=report.retire_below,
-        retire_below_met=v.retire_below_met,
+    return (
+        SweepVerdicts(
+            argmax_slug=v.argmax.slug,
+            promote_at_least=report.promote_at_least,
+            promote_at_least_met=v.promote_at_least_met,
+            retire_below=report.retire_below,
+            retire_below_met=v.retire_below_met,
+        ),
+        None,
     )
 
 
@@ -199,7 +212,7 @@ def _sweep_run_verdict(
         VariantOutcome(t.variant_index, t.slug, t.status, t.message)
         for t in lab_registry.sweep_run_trials(conn, row.sweep_run_id)
     )
-    verdicts = _sweep_verdicts(conn, slug) if outcome == COMPLETED else None
+    verdicts, verdicts_error = _sweep_verdicts(conn, slug) if outcome == COMPLETED else (None, None)
     counts = f"{row.n_ok or 0} ok, {row.n_failed or 0} failed of {row.n_planned} planned"
     text = ENDED_EARLY_TEXT if outcome == ENDED_EARLY else outcome
     return LabVerdict(
@@ -215,6 +228,7 @@ def _sweep_run_verdict(
         n_failed=row.n_failed,
         variants=variants,
         verdicts=verdicts,
+        verdicts_error=verdicts_error,
         log_tail=output,
     )
 
@@ -283,9 +297,26 @@ def in_flight(conn: duckdb.DuckDBPyConnection, now: datetime, settings: Settings
                 "sweep_run", run.sweep_run_id, slugs.get(run.sweep_id, "?"), run.started_at, cutoff
             )
         )
+    run_of = {
+        int(trial_id): int(run_id)
+        for trial_id, run_id in conn.execute(
+            "SELECT trial_id, sweep_run_id FROM sweep_trials"
+        ).fetchall()
+    }
+    open_runs = {run.sweep_run_id for run in lab_registry.open_sweep_runs(conn)}
     for trial in registry.list_trials(conn):
-        if trial.status == registry.UNFINISHED:
-            items.append(_item("trial", trial.trial_id, trial.slug, trial.started_at, cutoff))
+        if trial.status != registry.UNFINISHED:
+            continue
+        run_id = run_of.get(trial.trial_id)
+        if run_id in open_runs:
+            continue  # the open run row already covers it
+        if run_id is not None:
+            # a sweep run that ended (an interrupt) left it open: nothing runs it
+            items.append(
+                _item("trial", trial.trial_id, trial.slug, trial.started_at, cutoff, orphan=True)
+            )
+            continue
+        items.append(_item("trial", trial.trial_id, trial.slug, trial.started_at, cutoff))
     return InFlight(
         running=tuple(i for i in items if i.state == "running"),
         orphans=tuple(i for i in items if i.state == "orphan"),
@@ -298,8 +329,10 @@ def _item(
     slug: str,
     started_at: datetime,
     cutoff: datetime,
+    *,
+    orphan: bool = False,
 ) -> InFlightItem:
-    live = started_at >= cutoff
+    live = started_at >= cutoff and not orphan
     return InFlightItem(
         kind,
         row_id,

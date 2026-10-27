@@ -323,7 +323,7 @@ def _run_trial(
     tmp_path: Path,
     run_id: int,
     record: registry.HypothesisRecord,
-    status: str,
+    status: str | None,
     message: str | None = None,
 ) -> int:
     trial_id = _trial(conn, settings, tmp_path, record.hypothesis_id, status, message)
@@ -631,3 +631,21 @@ def test_closed_runs_finished_trials_and_synthetic_trials_are_not_in_flight(
     got = lab_verdict.in_flight(lab_store, NOW, settings)
 
     assert (got.running, got.orphans, got.busy) == ((), (), False)
+
+
+def test_an_unfinished_trial_of_a_closed_run_is_an_orphan_and_of_an_open_run_is_covered(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    sweep, records = _sweep(lab_store, settings, [0.1, 0.2])
+    run_id = _run(lab_store, sweep, tmp_path)
+    for record in records:
+        _run_trial(lab_store, settings, tmp_path, run_id, record, None)
+
+    _age(lab_store, "sweep_runs", "sweep_run_id", run_id, 1)
+    open_run = lab_verdict.in_flight(lab_store, NOW, settings)
+    assert [(i.kind, i.row_id) for i in open_run.running] == [("sweep_run", run_id)]
+
+    _close(lab_store, run_id, n_ok=0, n_failed=0, completed=False)  # an interrupt closed it
+    closed = lab_verdict.in_flight(lab_store, NOW, settings)
+    assert not closed.busy and closed.running == ()
+    assert {i.kind for i in closed.orphans} == {"trial"} and len(closed.orphans) == 2
