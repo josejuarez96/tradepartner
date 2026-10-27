@@ -262,7 +262,7 @@ def take(
 
 
 def abandon(slot_path: Path) -> None:
-    """Drop a slot whose spawn failed before any child existed."""
+    """Remove a slot whose spawn failed before any child existed."""
     with contextlib.suppress(OSError):
         slot_path.unlink()
 
