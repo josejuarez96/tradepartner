@@ -880,6 +880,107 @@ def test_the_tolerances_come_from_the_frozen_window_never_settings(
 
 
 @pytest.mark.usefixtures("health")
+def test_e4_clean_drill_alone_passes(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    _clean(conn)
+    conn.close()
+    line = _line(_run(settings), "E.4 kill-switch drill")
+    assert line.passed
+    assert line.state == "passed"
+
+
+@pytest.mark.usefixtures("health")
+def test_e4_clean_drill_and_ordering_catch_up_fails(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    bad_run = j.run(D3, "ok", kind="catch_up", hour=20)
+    decision_id = j.decision(bad_run, D3)
+    j.order("o-bad-drill", decision_id, bad_run, D3, fills=())
+    conn.close()
+    line = _line(_run(settings), "E.4 kill-switch drill")
+    assert not line.passed
+    assert line.state == "failing"
+    assert f"run {bad_run}" in line.detail
+    assert any(f"run {bad_run}" in problem for problem in line.problems)
+
+
+@pytest.mark.usefixtures("health")
+def test_e4_ordering_drill_alone_fails(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    _clean(conn, drill_orders=True)
+    conn.close()
+    line = _line(_run(settings), "E.4 kill-switch drill")
+    assert not line.passed
+    assert line.state == "failing"
+    assert "run 3" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e4_non_owner_engagement_does_not_hide_ordering_drill(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    j.switch(_at(D3, 19), "engaged", "drawdown")
+    bad_run = j.run(D3, "ok", kind="catch_up", hour=20)
+    decision_id = j.decision(bad_run, D3)
+    j.order("o-stacked-drill", decision_id, bad_run, D3, fills=())
+    conn.close()
+    line = _line(_run(settings), "E.4 kill-switch drill")
+    assert line.state == "failing"
+    assert f"run {bad_run}" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e4_unreleased_ordering_drill_names_run(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _clean(conn, drill_orders=True)
+    conn.execute("DELETE FROM kill_switch WHERE state = 'released'")
+    conn.close()
+    line = _line(_run(settings), "E.4 kill-switch drill")
+    assert line.state == "failing"
+    assert "run 3" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e4_ordering_drill_today_fails_before_session_close(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    bad_run = j.run(D4, "ok", kind="catch_up", hour=14)
+    j.switch(_at(D4, 13), "engaged")
+    decision_id = j.decision(bad_run, D4)
+    j.order("o-today-drill", decision_id, bad_run, D4, fills=(), hour=14)
+    conn.close()
+    line = _line(_run(settings), "E.4 kill-switch drill")
+    assert line.state == "failing"
+    assert f"run {bad_run}" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e4_owner_engagement_opened_before_span_still_spoils(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _clean(conn, drill_orders=True)
+    conn.execute("UPDATE kill_switch SET \"at\" = ? WHERE state = 'engaged'", [MADE_AT])
+    conn.close()
+    line = _line(_run(settings), "E.4 kill-switch drill")
+    assert line.state == "failing"
+    assert "run 3" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e4_ordering_run_outside_owner_engagement_does_not_spoil_drill(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D4, "ok", kind="catch_up", hour=14)
+    decision_id = j.decision(run_id, D4)
+    j.order("o-outside-drill", decision_id, run_id, D4, fills=(), hour=14)
+    conn.close()
+    assert _line(_run(settings), "E.4 kill-switch drill").state == "passed"
+
+
+@pytest.mark.usefixtures("health")
 def test_e4_fails_with_no_drill_sequence(
     conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:

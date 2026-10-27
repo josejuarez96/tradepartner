@@ -71,7 +71,8 @@ and the day it closes may hold a run or not, so neither is required (ADR 0017:
    `kill_switch` row in the span, then a scheduler-invoked run of kind
    `rebalance` or `catch_up` started before the next `released` row whose result
    is `skipped_kill_switch` and which wrote no `orders` row, then that `released`
-   row. A drilled run that wrote an `orders` row does not count and is named.
+   row. Any scheduler rebalance or catch_up run during an owner engagement
+   that wrote an `orders` row fails the line, even with another clean drill.
    Non-owner `engaged` rows in the span are printed as evidence, not required.
 5. **`E.5 journal`**: `paper check`'s `chain` and `override_reason` lines
    (`check._chain_line`, `check._override_line`, the same functions) pass for
@@ -94,6 +95,7 @@ an E.6 channel whose attempts all failed, and any other shortfall, is `failing`.
 from __future__ import annotations
 
 import json
+from bisect import bisect_left
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -474,6 +476,7 @@ def _brackets(switches: Iterable[_Switch]) -> list[_Bracket]:
         by_window.setdefault(s.window_id, []).append(s)
     out: list[_Bracket] = []
     for window_id, rows in by_window.items():
+        rows.sort(key=lambda s: (s.at, s.event_id))
         for index, engaged in enumerate(rows):
             if engaged.state != _ENGAGED or engaged.source != _OWNER:
                 continue
@@ -495,6 +498,40 @@ def _drill_bracket(run: _Run, brackets: Iterable[_Bracket]) -> _Bracket | None:
         ),
         None,
     )
+
+
+def _engagement_timeline(
+    switches: Iterable[_Switch],
+) -> dict[int, tuple[list[datetime], list[bool]]]:
+    """Per window, the switch times in order and whether the owner's switch
+    was engaged after each one (sorted once, so a run's lookup is a bisect)."""
+    by_window: dict[int, list[_Switch]] = {}
+    for s in switches:
+        by_window.setdefault(s.window_id, []).append(s)
+    out: dict[int, tuple[list[datetime], list[bool]]] = {}
+    for window_id, rows in by_window.items():
+        rows.sort(key=lambda s: (s.at, s.event_id))
+        times: list[datetime] = []
+        states: list[bool] = []
+        engaged = False
+        for switch in rows:
+            if switch.state == _RELEASED:
+                engaged = False
+            elif switch.state == _ENGAGED and switch.source == _OWNER:
+                engaged = True
+            times.append(switch.at)
+            states.append(engaged)
+        out[window_id] = (times, states)
+    return out
+
+
+def _owner_engaged(run: _Run, timeline: dict[int, tuple[list[datetime], list[bool]]]) -> bool:
+    """Whether the owner's switch was engaged when a scheduler run began."""
+    if run.invoked_by != _SCHEDULER or run.window_id not in timeline:
+        return False
+    times, states = timeline[run.window_id]
+    index = bisect_left(times, run.started_at)  # switches strictly before the start
+    return index > 0 and states[index - 1]
 
 
 def _sessions_line(
@@ -884,6 +921,7 @@ def _orders_line(
 
 def _drill_line(
     span: Span,
+    now: datetime,
     windows: Sequence[PaperWindowRow],
     runs: Sequence[_Run],
     switches: Sequence[_Switch],
@@ -894,11 +932,19 @@ def _drill_line(
     spoiled: list[str] = []
     in_span = [s for s in switches if s.at >= span.start_at]
     books = {w.window_id: w.book_id for w in windows}
+    timeline = _engagement_timeline(switches)
     for run in runs:
-        if run.kind not in _DRILL_KINDS or _drill_bracket(run, brackets) is None:
+        if (
+            not span.start_at <= run.started_at <= now
+            or run.kind not in _DRILL_KINDS
+            or not _owner_engaged(run, timeline)
+        ):
             continue
         text = f"book {books.get(run.window_id)} run {run.run_id} on {run.session}"
-        (spoiled if run.run_id in ordered else drills).append(text)
+        if run.run_id in ordered:
+            spoiled.append(text)
+        elif _drill_bracket(run, brackets) is not None:
+            drills.append(text)
     halts = [
         f"window {s.window_id} {s.source} at {s.at.isoformat()}"
         for s in in_span
@@ -911,17 +957,18 @@ def _drill_line(
         detail += f"; real engagements (evidence): {_named(halts)}"
     return ShakedownLine(
         name="E.4 kill-switch drill",
-        passed=bool(drills),
+        passed=bool(drills) and not spoiled,
         # no drill yet is progress; a drilled run that wrote orders is a problem
         progress=() if drills or spoiled else ("kill-switch drill not done yet",),
-        problems=() if drills else tuple(f"drilled run wrote orders: {s}" for s in spoiled),
+        problems=tuple(f"drilled run wrote orders: {s}" for s in spoiled),
         rows="kill_switch, paper_runs, paper_run_results, orders",
         query=(
             "in one window: an owner 'engaged' kill_switch row, then a scheduler "
             "rebalance/catch_up run with result skipped_kill_switch and no orders row, "
-            "then a 'released' row"
+            "then a 'released' row; no scheduler rebalance/catch_up run during "
+            "an owner engagement wrote orders"
         ),
-        thresholds="drill sequences >= 1",
+        thresholds="drill sequences >= 1; drilled runs with orders = 0",
         detail=detail,
     )
 
@@ -1074,7 +1121,7 @@ def shakedown(
             _sessions_line(conn, span, windows, closed, runs, brackets, ordered, alerts, noted),
             _reconciliation_line(conn, span),
             _orders_line(conn, span, by_id),
-            _drill_line(span, windows, runs, switches, brackets, ordered),
+            _drill_line(span, at, windows, runs, switches, brackets, ordered),
             _journal_line(conn, span, windows, closed),
             _alerts_line(conn, span, settings),
             _data_line(conn, span, settings, at, alerts, noted, check_health),

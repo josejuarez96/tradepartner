@@ -173,3 +173,7 @@ The decision stands; E.3's duplicate clause for a notional decision is corrected
   - when the decision has an order with `orders.quantity`, any of its orders is a duplicate when it was written while an earlier order of the decision had no terminal `order_events` row (a decision is resized only once every order is terminal), or, for an order with `orders.quantity`, when the fill value of all the decision's orders known before it (both kinds, at the fill price) already reached the remainder's base (`target_notional` for a buy, `planned_notional` otherwise) less the frozen cash tolerance.
 
 *Limit (open question).* A stale remainder sized after a **partial** fill (say 9.9 of 10 shares filled, then 10 more ordered) passes, because the journal keeps no reference price to convert the remainder with. Closing it needs either the reference price stored on `orders` (a schema change) or a frozen price-drift tolerance (a new threshold); both are the owner's call.
+
+## Correction 2026-10-26 (#2301): E.4 fails if any drilled run wrote orders
+
+The decision stands; E.4 is corrected to fail when any scheduler `rebalance` or `catch_up` run made during an owner kill-switch engagement in the span wrote an `orders` row, even if another drill sequence is clean. The failing line names the run ids; a clean skipped run and a release are still required to pass.
