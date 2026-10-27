@@ -290,7 +290,7 @@ def test_preview_of_a_registered_unchanged_file_writes_nothing(
     assert _counts(ready) == before
 
 
-def test_a_changed_file_previews_as_a_new_registration(
+def test_a_prose_edit_to_a_registered_sweep_previews_the_refusal_register_gives(
     ready: duckdb.DuckDBPyConnection, settings: Settings, docs: Path
 ) -> None:
     path = docs / "sweeps" / "fixture-sweep.md"
@@ -299,7 +299,17 @@ def test_a_changed_file_previews_as_a_new_registration(
 
     view = lab_files.preview(path, settings, ready)
 
-    assert "new registration" in view.registration_effect
+    assert view.registration_effect.startswith("refused: a variant has the fingerprint")
+    with pytest.raises(sweep.FingerprintRegisteredError):
+        sweep.register(ready, path, settings, registered_by="test")
+
+
+def test_an_unregistered_sweep_previews_a_new_registration(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, docs: Path
+) -> None:
+    view = lab_files.preview(docs / "sweeps" / "fixture-sweep.md", settings, ready)
+
+    assert view.registration_effect.startswith("a new registration of 4 variants")
 
 
 def test_a_holdout_after_the_registration_day_is_forward(

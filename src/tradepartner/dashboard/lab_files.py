@@ -368,11 +368,30 @@ def preview(
     else:
         declared = lab_registry.family_declared_count(conn, parsed.family)
         unchanged = sweep._existing_registration(conn, parsed, variants) is not None
-        effect = (
-            "unchanged, nothing written"
+        held = (
+            None
             if unchanged
-            else f"a new registration of {len(variants)} variants"
+            else next(
+                (
+                    h
+                    for v in variants
+                    if (h := lab_registry.fingerprint_registered(conn, v.fingerprint)) is not None
+                ),
+                None,
+            )
         )
+        if unchanged:
+            effect = "unchanged, nothing written"
+        elif held is not None:
+            effect = (
+                f"refused: a variant has the fingerprint of registered hypothesis "
+                f"{held.slug!r}; the existing registration is the record"
+            )
+        else:
+            effect = (
+                f"a new registration of {len(variants)} variants "
+                "(the engine's other checks run when it registers)"
+            )
     return SweepPreview(
         slug=parsed.slug,
         family=parsed.family,
