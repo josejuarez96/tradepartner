@@ -1536,20 +1536,29 @@ def _write_break_events(
         old_parts = json.loads(previous.parts_json) if previous is not None else []
         parts: list[break_rules.BreakPart] = []
         for mismatch in mismatches:
-            activity_type = (
-                activity_by_id[mismatch.activity_ids[0]].activity_type
-                if mismatch.activity_ids
-                else None
-            )
             related = [a for a in activities if symbols.get(a.symbol or "") == name]
-            cause = break_rules.part_cause(
-                mismatch.kind,
-                session=session,
-                lookback_sessions=frozen.break_cause_lookback_sessions,
-                store_rows=evidence.get(name, ()),
-                activities=related,
-                own_trading=name in own_trading,
-                activity_type=activity_type,
+            # A name cash part may hold several activity types; a cause is set
+            # only by evidence that can produce every one of them (item 14), so
+            # the part takes the least attributed cause over its types.
+            activity_types: list[str | None] = (
+                [*sorted({activity_by_id[i].activity_type for i in mismatch.activity_ids})]
+                if mismatch.activity_ids
+                else [None]
+            )
+            cause = min(
+                (
+                    break_rules.part_cause(
+                        mismatch.kind,
+                        session=session,
+                        lookback_sessions=frozen.break_cause_lookback_sessions,
+                        store_rows=evidence.get(name, ()),
+                        activities=related,
+                        own_trading=name in own_trading,
+                        activity_type=activity_type,
+                    )
+                    for activity_type in activity_types
+                ),
+                key=break_rules._CAUSE_ORDER.index,
             )
             old = next((p for p in old_parts if p["kind"] == mismatch.kind), None)
             if old is not None:

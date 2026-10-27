@@ -577,6 +577,52 @@ def test_named_cash_break_is_written_before_the_temporary_halt(
     assert events[0].break_id == events[1].break_id
 
 
+@pytest.mark.parametrize(
+    ("types", "cause"),
+    [(("DIVNRA",), "corporate_action"), (("DIVNRA", "MA"), "unattributed")],
+)
+def test_a_mixed_name_cash_part_takes_the_least_attributed_cause(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    types: tuple[str, ...],
+    cause: str,
+) -> None:
+    """Item 14: a cause is set only by evidence that can produce the observed
+    kind. A dividend row fits `DIVNRA` but not `MA`, so a part holding both is
+    not `corporate_action`."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _dividend(
+        journal_settings,
+        SPY,
+        0.5,
+        CUT - timedelta(days=5),
+        ex_date=S - timedelta(days=2),
+        source_action_id="div-old",
+    )
+    # A clean reconciliation first, so the held name has no own trading since the
+    # last completed one (an own fill forces `unattributed`, item 14).
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "ok"
+    later = next_session(S)
+    fixed_clock.now = session_close(S) + timedelta(hours=18)
+    fake.activities = [
+        *fake.activities,
+        *(
+            CashActivity(f"credit-{i}", kind, later, "executed", 30.0, "SPY")
+            for i, kind in enumerate(types)
+        ),
+    ]
+    fake.extra_cash = 30.0 * len(types)
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later)
+
+    with open_read_only(journal_settings) as conn:
+        opened = break_events_for(conn, frozen_window.window_id or 0)[0]
+    assert opened.cause == cause
+
+
 def test_failed_break_event_write_engages_switch_and_submits_no_order(
     journal_settings: Settings,
     fake: BookedFake,
