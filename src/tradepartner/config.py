@@ -2292,7 +2292,8 @@ class RiskConfig(BaseModel):
     # the name's earlier auto-acceptances; an open break older than the age is
     # `aged`; more open material breaks than the count, or above the share of equity,
     # is the book-level `break_cap`; the cause lookback is item 14's window. 0 is
-    # allowed for each (a materiality and a cap of 0 make every break a halt). A
+    # allowed for each (a materiality of 0 makes every non-zero break material, a cap of 0
+    # makes every material break a halt). A
     # window frozen before them reads the defaults through `frozen_risk` (question 42).
     break_materiality_usd: float = Field(default=25.0, ge=0)
     break_materiality_bps: float = Field(default=5.0, ge=0, le=10_000)

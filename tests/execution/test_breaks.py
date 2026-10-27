@@ -4,6 +4,7 @@ items 2, 4, 5 and 14; plan T280b)."""
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -322,3 +323,43 @@ def test_state_is_the_latest_event_in_write_order() -> None:
     assert breaks.is_open("observed") and not breaks.is_open("resolved_by_broker")
     with pytest.raises(ValueError, match="not a break event"):
         breaks.is_open("deleted")
+
+
+@pytest.mark.parametrize("kinds", [(), ("cash",), ("quantity", "account_id"), ("x",)])
+def test_materiality_refuses_book_level_or_no_kinds(kinds: tuple[str, ...]) -> None:
+    """Items 2 and 3 (fail closed): a book-level, unknown or empty kind set is
+    never judged immaterial, so it can never be auto-accepted."""
+    with pytest.raises(ValueError, match="name-level kinds only"):
+        _material(1.0, kinds=kinds)
+
+
+def test_negative_sizes_and_totals_are_refused() -> None:
+    """Item 5's cumulative bound and the cap cannot be lowered by a negative."""
+    with pytest.raises(ValueError, match=">= 0"):
+        _material(-1.0)
+    with pytest.raises(ValueError, match=">= 0"):
+        _material(10.0, prior=-30.0)
+    with pytest.raises(ValueError, match=">= 0"):
+        breaks.over_cap([2_000.0, -1.0], ledger_equity=100_000.0, risk=RISK)
+
+
+def test_unknown_symbol_key_is_stable_across_int_and_float() -> None:
+    assert breaks.unknown_symbol_key("ZZZ", 10) == breaks.unknown_symbol_key("ZZZ", 10.0)
+
+
+def test_cause_refuses_a_session_that_is_not_xnys() -> None:
+    with pytest.raises(ValueError, match="not an XNYS session"):
+        breaks.part_cause(
+            "quantity",
+            session=date(2026, 10, 3),
+            lookback_sessions=10,
+            store_rows=(),
+            activities=(),
+            own_trading=False,
+        )
+
+
+def test_open_breaks_refuses_an_unwritten_event() -> None:
+    row = _event(1, "7:A:1", "opened")
+    with pytest.raises(ValueError, match="event_id"):
+        breaks.open_breaks([replace(row, event_id=None)])

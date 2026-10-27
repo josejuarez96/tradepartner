@@ -36,7 +36,7 @@ from decimal import Decimal
 from typing import Literal
 
 from tradepartner.adapters.broker import CashActivity
-from tradepartner.calendar import previous_session, session_close
+from tradepartner.calendar import is_session, previous_session, session_close
 from tradepartner.config import RiskConfig
 from tradepartner.execution.reconcile import (
     _CASH_IN_LIEU,
@@ -148,7 +148,7 @@ def identity(
 
 def unknown_symbol_key(symbol: str, broker_quantity: float) -> str:
     """An `unknown_symbol` part's finding key: the symbol and broker quantity."""
-    return json.dumps([UNKNOWN_SYMBOL, symbol, broker_quantity])
+    return json.dumps([UNKNOWN_SYMBOL, symbol, float(broker_quantity)])
 
 
 def merger_conflict_key(merger_ids: Iterable[str]) -> str:
@@ -186,6 +186,8 @@ def _window(session: date, lookback_sessions: int) -> tuple[date, date] | None:
     including `session`, or None for a lookback of 0."""
     if lookback_sessions <= 0:
         return None
+    if not is_session(session):
+        raise ValueError(f"{session.isoformat()} is not an XNYS session")
     first = session
     for _ in range(lookback_sessions - 1):
         first = previous_session(first)
@@ -244,11 +246,13 @@ def break_cause(parts: Sequence[BreakPart]) -> str:
     return min((p.cause for p in parts), key=_CAUSE_ORDER.index)
 
 
-def _finite(value: float | None, what: str) -> Decimal:
+def _finite(value: float | None, what: str, *, nonneg: bool = False) -> Decimal:
+    """`value` as an exact Decimal (None is 0); `ValueError` when it is not
+    finite, or negative under `nonneg` (a size or a total is never negative)."""
     if value is None:
         return Decimal(0)
-    if not math.isfinite(value):
-        raise ValueError(f"{what} must be finite, got {value!r}")
+    if not math.isfinite(value) or (nonneg and value < 0):
+        raise ValueError(f"{what} must be finite{' and >= 0' if nonneg else ''}, got {value!r}")
     return Decimal(repr(value))
 
 
@@ -283,13 +287,18 @@ def is_material(
     `risk.break_materiality_usd` and `risk.break_materiality_bps` of the ledger
     equity. Always material: an unpriced break, a `short_external_change` or
     finding part, and a non-finite or non-positive equity (fail closed)."""
+    kinds = tuple(kinds)
+    if not kinds or not all(is_name_level(kind) for kind in kinds):
+        raise ValueError(f"materiality is judged for name-level kinds only, got {kinds!r}")
     if size is None or any(kind in _ALWAYS_MATERIAL for kind in kinds):
         return True
     if not math.isfinite(ledger_equity) or ledger_equity <= 0:
         return True
     by_share = Decimal(repr(risk.break_materiality_bps)) * Decimal(repr(ledger_equity)) / _BPS
     threshold = min(Decimal(repr(risk.break_materiality_usd)), by_share)
-    total = _finite(prior_auto_accepted, "prior_auto_accepted") + _finite(size, "size")
+    total = _finite(prior_auto_accepted, "prior_auto_accepted", nonneg=True) + _finite(
+        size, "size", nonneg=True
+    )
     return total > threshold
 
 
@@ -307,7 +316,7 @@ def over_cap(
         return True
     if not math.isfinite(ledger_equity) or ledger_equity <= 0:
         return True
-    total = sum((_finite(s, "size") for s in open_material_sizes), Decimal(0))
+    total = sum((_finite(s, "size", nonneg=True) for s in open_material_sizes), Decimal(0))
     return total > Decimal(repr(risk.max_open_break_share)) * Decimal(repr(ledger_equity))
 
 
@@ -321,8 +330,11 @@ def is_open(event: str) -> bool:
 def open_breaks(events: Iterable[ReconcileBreakRow]) -> dict[str, ReconcileBreakRow]:
     """Each open break's latest event, by `break_id`, read in write order
     (`event_id`) and listed in the write order of that latest event."""
+    rows = list(events)
+    if any(e.event_id is None for e in rows):
+        raise ValueError("a break event without an event_id has not been written")
     latest: dict[str, ReconcileBreakRow] = {}
-    for event in sorted(events, key=lambda e: e.event_id or 0):
+    for event in sorted(rows, key=lambda e: e.event_id or 0):
         latest.pop(event.break_id, None)
         latest[event.break_id] = event
     return {bid: e for bid, e in latest.items() if is_open(e.event)}
