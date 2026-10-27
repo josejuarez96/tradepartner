@@ -1,0 +1,340 @@
+"""The Lab's one Run slot (plan T298, #2318; amendment 2026-10-27 #2304): a slot file
+created with O_EXCL, a record of the child, a daemon waiter, status and release."""
+
+from __future__ import annotations
+
+import ast
+import json
+import os
+import subprocess
+import sys
+import threading
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from tradepartner.dashboard import lab_run
+from tradepartner.dashboard.lab_run import Busy, Taken
+
+NOW = datetime(2026, 10, 27, 15, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def slot(tmp_path: Path) -> Path:
+    return tmp_path / "t.duckdb.lab-run.json"
+
+
+def _take(slot: Path, **kw: object) -> Taken | Busy:
+    args: dict[str, object] = {"in_flight": (), "now": NOW, "grace_seconds": 30}
+    args.update(kw)
+    return lab_run.take(slot, **args)  # type: ignore[arg-type]
+
+
+def _age(path: Path, seconds: float) -> None:
+    t = NOW.timestamp() - seconds
+    os.utime(path, (t, t))
+
+
+class FakeChild:
+    def __init__(self, pid: int, code: int = 0) -> None:
+        self.pid = pid
+        self.code = code
+        self.gate = threading.Event()
+
+    def wait(self) -> int:
+        self.gate.wait(5)
+        return self.code
+
+
+def _record(slot: Path, pid: int, log: Path, start: str = "S1") -> None:
+    lab_run.record(
+        slot,
+        FakeChild(pid),
+        kind="sweep",
+        slug="b10",
+        baseline=7,
+        started_at=NOW,
+        log_path=log,
+        start_time_of=lambda _p: start,
+    )
+
+
+def test_take_creates_slot_with_o_excl_and_second_take_is_busy(slot: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    assert slot.exists()
+    again = _take(slot)
+    assert isinstance(again, Busy)  # a double click
+    assert not isinstance(again, Taken)
+
+
+def test_take_busy_names_each_in_flight_and_creates_nothing(slot: Path) -> None:
+    res = _take(slot, in_flight=("open sweep_runs row 12", "unfinished trial 40"))
+    assert isinstance(res, Busy)
+    assert any("open sweep_runs row 12" in r for r in res.reasons)
+    assert any("unfinished trial 40" in r for r in res.reasons)
+    assert not slot.exists()
+
+
+def test_empty_slot_inside_grace_is_busy_and_never_taken_over(slot: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    _age(slot, 10)
+    # a second tab inside the grace
+    res = _take(slot)
+    assert isinstance(res, Busy)
+    assert slot.exists() and slot.stat().st_size == 0
+    assert not list(slot.parent.glob("*.stale*"))
+
+
+def test_empty_slot_past_grace_is_stale_and_taken_over(slot: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    _age(slot, 31)
+    assert isinstance(_take(slot), Taken)
+
+
+def test_record_holds_pid_start_kind_slug_baseline_started_log(slot: Path, tmp_path: Path) -> None:
+    log = tmp_path / "run.log"
+    assert isinstance(_take(slot), Taken)
+    _record(slot, 4242, log)
+    data = json.loads(slot.read_text())
+    assert data["pid"] == 4242
+    assert data["pid_start"] == "S1"
+    assert data["kind"] == "sweep"
+    assert data["slug"] == "b10"
+    assert data["baseline"] == 7
+    assert data["started_at"] == NOW.isoformat()
+    assert data["log_path"] == str(log)
+    assert (slot.stat().st_mode & 0o777) == 0o600
+
+
+def test_default_start_time_uses_ps_list_form(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[object] = []
+
+    def fake_run(cmd: object, **kw: object) -> subprocess.CompletedProcess[str]:
+        seen.append((cmd, kw))
+        return subprocess.CompletedProcess([], 0, stdout="Mon Oct 27 15:00:00 2026\n")
+
+    monkeypatch.setattr(lab_run.subprocess, "run", fake_run)
+    assert lab_run.process_start_time(99) == "Mon Oct 27 15:00:00 2026"
+    cmd, kw = seen[0]  # type: ignore[misc]
+    assert cmd == ["ps", "-o", "lstart=", "-p", "99"]
+    assert not kw.get("shell")
+
+
+def test_live_pid_with_same_start_is_busy(slot: Path, tmp_path: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    _record(slot, os.getpid(), tmp_path / "l")
+    res = lab_run.take(slot, in_flight=(), now=NOW, grace_seconds=30, start_time_of=lambda _p: "S1")
+    assert isinstance(res, Busy)
+
+
+def test_pid_alive_with_other_start_time_is_gone_and_taken_over(slot: Path, tmp_path: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    _record(slot, os.getpid(), tmp_path / "l", start="OLD")
+    res = lab_run.take(
+        slot, in_flight=(), now=NOW, grace_seconds=30, start_time_of=lambda _p: "NEW"
+    )
+    assert isinstance(res, Taken)
+    assert not list(slot.parent.glob("*.stale*"))  # renamed aside, then dropped
+
+
+def test_dead_pid_is_stale(slot: Path, tmp_path: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    _record(slot, 2**22 + 5, tmp_path / "l")
+    res = lab_run.take(slot, in_flight=(), now=NOW, grace_seconds=30, start_time_of=lambda _p: None)
+    assert isinstance(res, Taken)
+
+
+def test_two_threads_racing_for_a_stale_slot_one_wins(slot: Path, tmp_path: Path) -> None:
+    for _ in range(20):
+        slot.unlink(missing_ok=True)
+        assert isinstance(_take(slot), Taken)
+        _record(slot, 2**22 + 5, tmp_path / "l")
+        out: list[object] = []
+        barrier = threading.Barrier(2)
+
+        def go(barrier: threading.Barrier = barrier, out: list[object] = out) -> None:
+            barrier.wait()
+            out.append(
+                lab_run.take(
+                    slot,
+                    in_flight=(),
+                    now=NOW,
+                    grace_seconds=30,
+                    start_time_of=lambda _p: None,
+                )
+            )
+
+        ts = [threading.Thread(target=go) for _ in range(2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        assert sorted(type(o).__name__ for o in out) == ["Busy", "Taken"]
+        assert slot.exists()
+
+
+def test_waiter_writes_exit_code_via_temp_and_replace(
+    slot: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert isinstance(_take(slot), Taken)
+    child = FakeChild(1234, code=2)
+    lab_run.record(
+        slot,
+        child,
+        kind="sweep",
+        slug="b10",
+        baseline=3,
+        started_at=NOW,
+        log_path=tmp_path / "l",
+        start_time_of=lambda _p: "S",
+    )
+    replaced: list[tuple[str, str]] = []
+    real = os.replace
+
+    def spy(a: object, b: object) -> None:
+        replaced.append((str(a), str(b)))
+        real(a, b)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(lab_run.os, "replace", spy)
+    t = lab_run.watch(slot, child)
+    assert t.daemon
+    child.gate.set()
+    t.join(5)
+    assert json.loads(slot.read_text())["exit_code"] == 2
+    assert replaced and replaced[-1][1] == str(slot) and replaced[-1][0] != str(slot)
+
+
+def test_release_renames_to_last_and_baseline_and_exit_read_back(
+    slot: Path, tmp_path: Path
+) -> None:
+    assert isinstance(_take(slot), Taken)
+    child = FakeChild(1234, code=1)
+    lab_run.record(
+        slot,
+        child,
+        kind="backtest",
+        slug="h",
+        baseline=9,
+        started_at=NOW,
+        log_path=tmp_path / "l",
+        start_time_of=lambda _p: "S",
+    )
+    child.gate.set()
+    lab_run.watch(slot, child).join(5)
+    assert lab_run.release(slot, start_time_of=lambda _p: None) is True
+    assert not slot.exists()
+    last = lab_run.read_last(slot)
+    assert last is not None
+    assert (last.baseline, last.exit_code, last.slug, last.kind) == (9, 1, "h", "backtest")
+    assert lab_run.last_path(slot).name.endswith(".lab-run.last.json")
+
+
+def test_release_refuses_a_live_child(slot: Path, tmp_path: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    _record(slot, os.getpid(), tmp_path / "l")
+    assert lab_run.release(slot, start_time_of=lambda _p: "S1") is False
+    assert slot.exists()
+
+
+def test_next_take_clears_last(slot: Path, tmp_path: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    _record(slot, 2**22 + 5, tmp_path / "l")
+    assert lab_run.release(slot, start_time_of=lambda _p: None)
+    assert lab_run.read_last(slot) is not None
+    assert isinstance(_take(slot), Taken)
+    assert lab_run.read_last(slot) is None
+
+
+def test_status_idle_starting_running_ended(slot: Path, tmp_path: Path) -> None:
+    def st() -> lab_run.SlotStatus:
+        return lab_run.status(
+            slot, scrub=lambda s: s, now=NOW, grace_seconds=30, start_time_of=lambda _p: "S1"
+        )
+
+    assert st().state == "idle"
+    assert isinstance(_take(slot), Taken)
+    assert st().state == "starting"
+    log = tmp_path / "l"
+    log.write_text("hello\nworld\n")
+    _record(slot, os.getpid(), log)
+    s = st()
+    assert s.state == "running" and s.record is not None and s.record.slug == "b10"
+    assert s.log_tail == "hello\nworld\n"
+    # exit code recorded: ended
+    d = json.loads(slot.read_text())
+    d["exit_code"] = 0
+    slot.write_text(json.dumps(d))
+    assert st().state == "ended"
+    # dead pid
+    d.pop("exit_code")
+    d["pid"] = 2**22 + 5
+    slot.write_text(json.dumps(d))
+    assert (
+        lab_run.status(
+            slot, scrub=lambda s: s, now=NOW, grace_seconds=30, start_time_of=lambda _p: None
+        ).state
+        == "ended"
+    )
+
+
+def test_status_tail_goes_through_scrub_and_is_bounded(slot: Path, tmp_path: Path) -> None:
+    log = tmp_path / "l"
+    log.write_text("x" * 100 + "SECRET" + "y" * 100)
+    assert isinstance(_take(slot), Taken)
+    _record(slot, os.getpid(), log)
+    s = lab_run.status(
+        slot,
+        scrub=lambda t: t.replace("SECRET", "***"),
+        now=NOW,
+        grace_seconds=30,
+        start_time_of=lambda _p: "S1",
+        tail_bytes=110,
+    )
+    assert "SECRET" not in s.log_tail and "***" in s.log_tail
+    assert len(s.log_tail) <= 110
+
+
+def test_status_refuses_a_symlinked_log(slot: Path, tmp_path: Path) -> None:
+    target = tmp_path / "secret.txt"
+    target.write_text("topsecret")
+    link = tmp_path / "l"
+    link.symlink_to(target)
+    assert isinstance(_take(slot), Taken)
+    _record(slot, os.getpid(), link)
+    s = lab_run.status(
+        slot, scrub=lambda t: t, now=NOW, grace_seconds=30, start_time_of=lambda _p: "S1"
+    )
+    assert "topsecret" not in s.log_tail
+
+
+def test_status_takes_no_connection_and_module_imports_neither_child_nor_store() -> None:
+    tree = ast.parse(Path(lab_run.__file__).read_text())
+    mods: list[str] = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            mods += [a.name for a in n.names]
+        elif isinstance(n, ast.ImportFrom):
+            mods.append(n.module or "")
+            mods += [f"{n.module}.{a.name}" for a in n.names]
+    assert not [m for m in mods if "lab_child" in m or ".store" in m or m.startswith("duckdb")]
+
+
+def test_abandon_removes_the_slot(slot: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    lab_run.abandon(slot)
+    assert not slot.exists()
+
+
+def test_real_subprocess_roundtrip(slot: Path, tmp_path: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    log = tmp_path / "l"
+    p = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.2); raise SystemExit(3)"]
+    )
+    lab_run.record(slot, p, kind="sweep", slug="s", baseline=None, started_at=NOW, log_path=log)
+    lab_run.watch(slot, p).join(10)
+    assert json.loads(slot.read_text())["exit_code"] == 3
+    assert lab_run.release(slot)
+    last = lab_run.read_last(slot)
+    assert last is not None and last.baseline is None and last.exit_code == 3
