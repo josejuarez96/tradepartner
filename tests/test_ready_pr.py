@@ -500,8 +500,10 @@ class FakeRunner:
         own_patch_at_head: str = "+a",
         numstat: str = "1\t1\tx",
         same_blob: bool = False,
+        issue_labels: Sequence[str] = (),
     ) -> None:
         self.branch = branch
+        self._issue_labels = tuple(issue_labels)
         self.contains_main = contains_main
         self.merge_ok = merge_ok
         self.files = dict(conflicted or {})
@@ -598,6 +600,9 @@ class FakeRunner:
 
     def edit_body(self, number: int, body: str) -> None:
         self.edited_bodies.append((number, body))
+
+    def issue_labels(self, number: int) -> tuple[str, ...]:
+        return self._issue_labels
 
     def head_checks(self, number: int) -> ready_pr.HeadChecks:
         self.events.append("wait")
@@ -1291,6 +1296,107 @@ def test_a_feat_pr_with_a_status_only_fragment_is_not_ready() -> None:
     legacy_only = FakeRunner(touched=["src/tradepartner/x.py", "docs/status.d/69-x.md"])
     with pytest.raises(ready_pr.ReadyError, match="records its change in CHANGELOG"):
         ready_pr.ready(legacy_only, 69, dry_run=True)
+
+
+# ── plan ticks after merge (#2280) ──────────────────────────────────────────────
+
+PLAN_MAIN = "## Tasks\n- [x] **T1: Old.** · Files: `a.py`\n- [ ] **T2: Mine.** · Files: `b.py`\n"
+PLAN_TICKED = PLAN_MAIN.replace(
+    "- [ ] **T2: Mine.** · Files: `b.py`", "- [x] **T2: Mine.** (#69, PR #69)"
+)
+
+
+def test_plan_ticks_lists_lines_open_on_main_and_ticked_on_the_branch() -> None:
+    assert ready_pr.plan_ticks(PLAN_MAIN, PLAN_TICKED) == ["T2"]
+    added = PLAN_MAIN + "- [ ] **T3: New.** · Files: `c.py`\n"
+    assert ready_pr.plan_ticks(PLAN_MAIN, added) == []  # an amendment adding a line ticks nothing
+    assert ready_pr.plan_ticks(PLAN_MAIN, PLAN_MAIN.replace("Old", "Older")) == []
+
+
+def test_fragment_tasks_reads_task_lines_with_the_fragments_shape() -> None:
+    texts = ["task: T2 (PR #69)\n- s\n### Added\n- a\n", "### Fixed\n- f\n", "task: T3\n"]
+    assert ready_pr.fragment_tasks(texts) == {"T2": 69}
+    spec = importlib.util.spec_from_file_location(
+        "fragments_for_ready", Path(__file__).resolve().parents[1] / "scripts" / "fragments.py"
+    )
+    assert spec is not None and spec.loader is not None
+    fragments = importlib.util.module_from_spec(spec)
+    sys.modules["fragments_for_ready"] = fragments
+    spec.loader.exec_module(fragments)
+    assert ready_pr.FRAGMENT_TASK_RE.pattern == fragments.TASK_LINE_RE.pattern
+
+
+def test_a_pr_that_ticks_a_plan_box_is_refused_unless_it_is_a_fold() -> None:
+    plan = "docs/plans/x.md"
+    ticks = FakeRunner(
+        touched=["src/tradepartner/store/asof.py", plan, "changelog.d/69-x.md"],
+        main_files={plan: PLAN_MAIN},
+        conflicted={plan: PLAN_TICKED},
+    )
+    with pytest.raises(ready_pr.ReadyError, match=r"ticks plan lines.*T2.*--task T2"):
+        ready_pr.ready(ticks, 69, dry_run=True)
+    fold = FakeRunner(
+        touched=["docs/STATUS.md", plan, "changelog.d/1-a.md", "changelog.d/69-x.md"],
+        deleted=["changelog.d/1-a.md"],
+        main_files={plan: PLAN_MAIN, "docs/STATUS.md": "## Recently done\n"},
+        conflicted={plan: PLAN_TICKED, "docs/STATUS.md": "## Recently done\n- f\n"},
+    )
+    assert ready_pr.ready(fold, 69, dry_run=True) == 0
+    amendment = FakeRunner(
+        touched=[plan, "changelog.d/69-x.md"],
+        main_files={plan: PLAN_MAIN},
+        conflicted={plan: PLAN_MAIN + "- [ ] **T3: New.** · Files: `c.py`\n"},
+    )
+    assert ready_pr.ready(amendment, 69, dry_run=True) == 0
+
+
+def test_a_plan_task_pr_names_its_task_and_pr_in_its_fragment() -> None:
+    frag = "changelog.d/69-x.md"
+    touched = ["src/tradepartner/store/asof.py", frag]
+    missing = FakeRunner(touched=touched, issue_labels=("task:T2", "team:atlas"))
+    with pytest.raises(ready_pr.ReadyError, match=r"`task: T2 \(PR #69\)`"):
+        ready_pr.ready(missing, 69, dry_run=True)
+    wrong_pr = FakeRunner(
+        touched=touched,
+        issue_labels=("task:T2",),
+        conflicted={frag: "task: T2 (PR #70)\n### Added\n- x (#69)\n"},
+    )
+    with pytest.raises(ready_pr.ReadyError, match=r"may not add.*task: T2 \(PR #70\)"):
+        ready_pr.ready(wrong_pr, 69, dry_run=True)
+    named = FakeRunner(
+        touched=touched,
+        issue_labels=("task:T2",),
+        conflicted={frag: "task: T2 (PR #69)\n### Added\n- x (#69)\n"},
+    )
+    assert ready_pr.ready(named, 69, dry_run=True) == 0
+    # An issue that is not a plan task (size S) needs no task line.
+    assert ready_pr.ready(FakeRunner(touched=touched), 69, dry_run=True) == 0
+
+
+def test_stray_task_lines_only_this_issue_this_pr_and_its_labels() -> None:
+    texts = {
+        "changelog.d/69-x.md": "task: T2 (PR #69)\ntask: T3 (PR #69)\ntask: T2 (PR #70)\n",
+        "changelog.d/12-other.md": "task: T2 (PR #69)\n- s\n",
+        "changelog.d/69-y.md": "- no task line\n",
+    }
+    assert ready_pr.stray_task_lines(69, 69, ["T2"], texts) == [
+        "changelog.d/12-other.md: task: T2 (PR #69)",
+        "changelog.d/69-x.md: task: T3 (PR #69)",
+        "changelog.d/69-x.md: task: T2 (PR #70)",
+    ]
+    # No task label (a size-S issue) or no issue: every task line is stray.
+    assert len(ready_pr.stray_task_lines(69, 69, [], texts)) == 4
+    assert len(ready_pr.stray_task_lines(None, 69, ["T2"], texts)) == 4
+
+
+def test_a_task_line_for_an_unlabelled_issue_stops_even_with_allow_shared_files() -> None:
+    frag = "changelog.d/69-x.md"
+    r = FakeRunner(
+        touched=["src/tradepartner/store/asof.py", frag],
+        conflicted={frag: "task: T2 (PR #69)\n### Added\n- x (#69)\n"},
+    )
+    with pytest.raises(ready_pr.ReadyError, match="may not add"):
+        ready_pr.ready(r, 69, dry_run=True, allow_shared_files=True)
 
 
 # ── targeted local tests (#456) ─────────────────────────────────────────────────

@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 from pydantic import SecretStr
+from pydantic_settings.sources.providers.dotenv import DotEnvSettingsSource
 
 from tradepartner.config import Settings
 from tradepartner.dashboard import book_actions
@@ -284,6 +285,7 @@ def test_past_the_bound_it_is_not_confirmed_never_terminated_never_retried(
     fake = _fake(monkeypatch, _Fake(None))
     result = book_actions.kill(live, "main", _REASON)
     assert result.status is KillStatus.NOT_CONFIRMED and result.exit_code is None
+    assert result.wait_seconds == 330
     assert len(fake.calls) == 1 and not fake.terminated
 
 
@@ -321,6 +323,29 @@ def test_an_unloadable_live_config_refuses_in_words(
     assert refusal is not None and "could not be read" in refusal
     with pytest.raises(KillRefused, match="could not be read"):
         book_actions.kill(live, "main", _REASON)
+    assert fake.calls == []
+
+
+def test_an_oserror_reading_the_live_env_refuses_without_starting_a_child(
+    monkeypatch: pytest.MonkeyPatch, live: Settings
+) -> None:
+    def unreadable_env(self: DotEnvSettingsSource, file_path: Path) -> dict[str, str]:
+        assert file_path == book_actions.PROJECT_ROOT / ".env"
+        raise OSError("private filesystem detail")
+
+    monkeypatch.setattr(DotEnvSettingsSource, "_read_env_file", unreadable_env)
+    fake = _fake(monkeypatch, _Fake(0))
+    refusal = book_actions.store_refusal(live, book="main")
+    with pytest.raises(KillRefused) as caught:
+        book_actions.kill(live, "main", _REASON)
+    assert (
+        refusal
+        == str(caught.value)
+        == (
+            "The live store's config could not be read, so this page cannot stop a book. "
+            'At the desk, run `tradepartner paper kill --book=main --reason="<why>"`.'
+        )
+    )
     assert fake.calls == []
 
 
