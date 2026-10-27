@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Iterator, Mapping
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -52,7 +53,7 @@ from tradepartner.config import RiskConfig, Settings
 from tradepartner.execution import plan as plan_module
 from tradepartner.execution import planning
 from tradepartner.execution.ledger import Ledger
-from tradepartner.execution.plan import BuyCosts, Decisions, decisions_from
+from tradepartner.execution.plan import BuyCosts, Decisions, decisions_from, is_full_exit
 from tradepartner.store import journal
 
 from .test_planning import Env, open_env
@@ -446,3 +447,90 @@ def test_paper_hold_plan_rows_by_hand() -> None:
     assert (d.decision, d.side) == ("trade", "buy")
     # Spendable is the $100 exit plus the $20 trim, above the $100 buy.
     assert d.target_notional == pytest.approx(100.0, rel=1e-12)
+
+
+# --- a held name with no read-session bar is kept (spec amendment 2026-10-20, #2023; T253) ---
+# Hand book (zero costs, $10): equity 100,000.00, cash 0. A (kept) 1,000 sh = 10,000 (0.10);
+# B and C 4,500 sh = 45,000 each (0.45). Targets B 0.5, D 0.5; C has left the targets.
+
+
+def _kept_book(*, kept: tuple[str, ...] = ("A",)) -> tuple[Plan, Ledger]:
+    plan = _plan({"B": 0.5, "D": 0.5}, {"B": 0.4, "C": 0.1, "D": 0.3})
+    plan = replace(plan, exclusions={"no_history": (), "no_t0_bar": kept})
+    ledger = Ledger(positions={"A": 1000.0, "B": 4500.0, "C": 4500.0}, cash=0.0, through=S)
+    return plan, ledger
+
+
+def test_kept_name_at_band_0_is_skip_zero_and_the_others_share_the_rest() -> None:
+    plan, ledger = _kept_book()
+    got = {d.security_id: d for d in _decide(plan, ledger).decisions}
+    a = got["A"]
+    assert (a.decision, a.target_weight, a.drifted_weight) == ("skip_zero", 0.0, 0.10)
+    assert a.side is None and a.reason is None and a.planned_quantity is None
+    assert not is_full_exit(a)
+    b = got["B"]
+    assert b.side is None and abs(b.target_weight - 0.5) < 1e-12
+    assert abs(0.5 * 0.9 - b.drifted_weight) < 0.01  # delta under 0.01
+    c = got["C"]
+    assert (c.decision, c.side, c.reason) == ("trade", "sell", "left_targets")
+    assert c.planned_quantity is not None and c.planned_quantity * PRICE == pytest.approx(45_000.0)
+    d = got["D"]
+    assert (d.decision, d.side) == ("trade", "buy")
+    assert d.planned_notional == pytest.approx(45_000.0)
+
+
+def test_the_same_book_without_the_candidate_flag_sells_a_today() -> None:
+    plan, ledger = _kept_book(kept=())
+    got = {d.security_id: d for d in _decide(plan, ledger).decisions}
+    assert (got["A"].decision, got["A"].side, got["A"].reason) == ("trade", "sell", "left_universe")
+    assert got["A"].planned_quantity == 1000.0
+    assert got["B"].planned_notional == pytest.approx(5_000.0)
+    assert got["D"].planned_notional == pytest.approx(50_000.0)
+
+
+def test_kept_name_at_band_0_2_counts_b_inside_the_band() -> None:
+    plan, ledger = _kept_book()
+    got = {d.security_id: d for d in _decide(plan, ledger, band=0.2).decisions}
+    assert got["A"].decision == "skip_zero" and got["A"].drifted_weight == 0.10
+    assert got["B"].side is None  # held within the band: H = 0.45
+    assert got["D"].planned_notional == pytest.approx(45_000.0)
+    assert got["C"].reason == "left_targets"
+
+
+def test_the_helper_returns_h_and_the_scaled_targets() -> None:
+    drifted = {"A": 0.10, "B": 0.45, "C": 0.45}
+    targets = {"B": 0.5, "D": 0.5}
+    at_0 = plan_module.kept_effective_weights(targets, drifted, 0.0, {"A"})
+    assert at_0 == {"B": pytest.approx(0.45), "D": pytest.approx(0.45)}
+    at_band = plan_module.kept_effective_weights(targets, drifted, 0.2, {"A"})
+    assert at_band == {"B": 0.45, "D": pytest.approx(0.45)}  # B at its current weight, D 0.5*0.9
+    # With nothing kept it is `apply_rebalance_band` exactly.
+    for band in (0.0, 0.2):
+        assert plan_module.kept_effective_weights(
+            targets, drifted, band, frozenset()
+        ) == apply_rebalance_band(targets, drifted, band)
+
+
+def test_a_kept_weight_of_one_or_more_zeroes_every_traded_target() -> None:
+    drifted = {"A": 1.0}
+    assert plan_module.kept_effective_weights({"B": 0.5, "D": 0.5}, drifted, 0.0, {"A"}) == {}
+    plan = replace(
+        _plan({"B": 0.5, "D": 0.5}, {"B": 0.4, "D": 0.3}),
+        exclusions={"no_t0_bar": ("A",)},
+    )
+    ledger = Ledger(positions={"A": 5000.0}, cash=0.0, through=S)
+    got = {d.security_id: d for d in _decide(plan, ledger).decisions}
+    assert got["A"].decision == "skip_zero"
+    assert all(d.side is None for d in got.values())  # nothing bought
+
+
+def test_a_kept_name_under_long_short_raises() -> None:
+    with pytest.raises(ValueError, match="long_only"):
+        plan_module.kept_effective_weights({"B": 0.5}, {"A": 0.1}, 0.0, {"A"}, side="long_short")
+
+
+def test_an_empty_kept_set_is_todays_decisions() -> None:
+    plan, ledger = _kept_book(kept=())
+    bare = replace(plan, exclusions={"no_history": ()})
+    assert _decide(plan, ledger).decisions == _decide(bare, ledger).decisions
+    assert _decide(plan, ledger, band=0.2).decisions == _decide(bare, ledger, band=0.2).decisions

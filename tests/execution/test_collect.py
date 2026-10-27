@@ -251,6 +251,27 @@ def test_an_overlapping_read_never_doubles_a_fill(
     assert _statuses(journal_settings, "tp-a") == ["pending", "accepted", "filled"]
 
 
+def test_a_known_fill_read_back_with_another_quantity_is_a_system_fault(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    """A broker correction folded into a fill already journaled (#2149) is not
+    skipped as known: the journal would keep the uncorrected quantity."""
+    run_id = _run(journal_settings, open_window, fixed_clock())
+    order = _order(journal_settings, scripted_fake, fixed_clock, run_id, "tp-a", quantity=10.0)
+    fixed_clock.advance(minutes=1)
+    scripted_fake.apply("tp-a", FillAt(50.0))
+    fixed_clock.advance(minutes=1)
+    _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+
+    scripted_fake._fills[0] = replace(scripted_fake._fills[0], quantity=9.5)
+    with pytest.raises(SystemFaultError, match=r"fake-fill-1 reads 9\.5 at 50\.0, journaled as 10"):
+        _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+    assert [f.fill.quantity for f in _fills(journal_settings)] == [10.0]
+
+
 def test_a_fill_carries_the_brokers_time_and_the_collection_time(
     journal_settings: Settings,
     open_window: PaperWindowRow,

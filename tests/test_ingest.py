@@ -56,7 +56,12 @@ from tradepartner.adapters.prices import (
 from tradepartner.adapters.rates import RateObservation, rate_known_at
 from tradepartner.calendar import all_sessions
 from tradepartner.config import BorrowConfig, Settings, secret_values
-from tradepartner.health import filing_event_counts, statement_counts
+from tradepartner.health import (
+    NON_OVERLAPPING_LISTINGS,
+    filing_event_counts,
+    integrity_checks,
+    statement_counts,
+)
 from tradepartner.ingest import (
     DARK,
     FACT_NAMES,
@@ -928,7 +933,7 @@ def test_a_mid_chunk_failure_commits_nothing_from_that_chunk(
     assert read("SELECT status FROM ingestion_runs WHERE source = 'alpaca'") == [(FAILED,)]
 
 
-def test_a_failed_source_halts_the_run(
+def test_a_failed_source_still_runs_the_next_and_fails_the_run(
     settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:
     class Broken(FixtureFilingSource):
@@ -937,10 +942,330 @@ def test_a_failed_source_halts_the_run(
 
     prices = _Prices()
     result = _run(settings, prices, filings=_filings(cls=Broken))
-    assert [(r.source, r.status) for r in result.runs] == [("edgar", FAILED)]
+    # Empty store: no master to read, so the price side fails on its own account.
+    assert [(r.source, r.status) for r in result.runs] == [("edgar", FAILED), ("alpaca", FAILED)]
+    assert result.exit_code == 1
     assert prices.calls == []
     assert _counts(read)["securities"] == 0
-    assert read("SELECT source, status FROM ingestion_runs") == [("edgar", FAILED)]
+    assert read("SELECT source, status FROM ingestion_runs ORDER BY source") == [
+        ("alpaca", FAILED),
+        ("edgar", FAILED),
+    ]
+
+
+def test_an_edgar_only_failure_still_ingests_prices(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#2180: EDGAR down on a later evening; the price side reads the last good
+    master, lands the session, and the run still exits non-zero."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    assert _run(settings).ok
+    broken = _filings(cls=Broken)
+    prices = _Prices()
+    fetched: list[str] = []
+
+    def assets_fetch() -> Any:
+        fetched.append("assets")
+        raise AssertionError("assets snapshot must wait for every source ok")
+
+    rates = FixtureRateSource([])
+    result = _run(settings, prices, filings=broken, rates=rates, assets=assets_fetch)
+    assert [(r.source, r.status) for r in result.runs] == [("edgar", FAILED), ("alpaca", OK)]
+    assert prices.calls
+    assert result.exit_code == 1
+    assert fetched == []  # rates and the assets snapshot were skipped
+    rows = read("SELECT source, status, mode FROM ingestion_runs ORDER BY source, status")
+    # the first (ok) run's two rows, then this evening's failed edgar and ok alpaca
+    assert rows == [
+        ("alpaca", OK, "session"),
+        ("alpaca", OK, "session"),
+        ("edgar", FAILED, "session"),
+        ("edgar", OK, "session"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("listing_day", "edgar_fails", "backfill"),
+    [
+        (date(2019, 7, 1), True, True),
+        (date(2019, 7, 2), True, False),
+        (date(2019, 7, 1), False, False),
+    ],
+)
+def test_edgar_gap_backfills_only_names_listed_on_the_missed_session(
+    settings: Settings,
+    read: Callable[[str], list[tuple[Any, ...]]],
+    listing_day: date,
+    edgar_fails: bool,
+    backfill: bool,
+) -> None:
+    """A recovered master fills only the failed evening's eligible new names."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    x = "0000000003"
+    accession = f"{x}-19-000001"
+    accepted = _at(listing_day.year, listing_day.month, listing_day.day)
+    new_filing = _new_gap_filing(x, accession, accepted)
+    first_day = date(2019, 7, 1)
+    second_day = date(2019, 7, 2)
+    first_at = datetime(2019, 7, 2, 2, tzinfo=UTC)
+    second_at = datetime(2019, 7, 3, 2, tzinfo=UTC)
+    assert _run(settings).ok
+    first_prices = _Prices()
+    first = _run(
+        settings,
+        first_prices,
+        now=first_at,
+        filings=_filings(cls=Broken) if edgar_fails else _filings(**new_filing),
+    )
+    assert first.runs[-1].status == OK
+    assert (("bars", tuple(sorted((*IDS, x))), first_day, first_day) in first_prices.calls) == (
+        not edgar_fails
+    )
+
+    second_prices = _Prices()
+    assert _run(settings, second_prices, now=second_at, filings=_filings(**new_filing)).ok
+    assert (("bars", (x,), first_day, first_day) in second_prices.calls) == backfill
+    assert ("bars", tuple(sorted((*IDS, x))), second_day, second_day) in second_prices.calls
+    rows = read(
+        f"SELECT session, known_at FROM prices_daily WHERE security_id='{x}' ORDER BY session"
+    )
+    expected = [first_day, second_day] if backfill or not edgar_fails else [second_day]
+    assert [day for day, _ in rows] == expected
+    if backfill:
+        assert rows[0][1] == second_at
+
+
+def _new_gap_filing(x: str, accession: str, accepted: datetime) -> dict[str, Any]:
+    """A new listed common name first discoverable on `accepted`'s session."""
+    return {
+        "extra_index": [FilingIndexEntry(x, "New Corp", "10-K", accession, accepted)],
+        "extra_covers": [
+            CoverPage(x, accession, accepted, (CoverListing("Common Stock", "NEW", "NYSE"),))
+        ],
+        "extra_headers": [FilingHeader(x, accession, "10-K", 3571, accepted)],
+    }
+
+
+def test_edgar_gap_fetch_failure_does_not_fail_todays_prices(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """The extra gap request may fail without rolling back today's bars."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    class GapError(_Prices):
+        def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+            if start == date(2019, 7, 1) and end == start:
+                raise RuntimeError("gap endpoint down")
+            return super().bars(security_ids, start, end)
+
+    x = "0000000003"
+    first = date(2019, 7, 1)
+    second = date(2019, 7, 2)
+    assert _run(settings).ok
+    assert (
+        _run(settings, now=datetime(2019, 7, 2, 2, tzinfo=UTC), filings=_filings(cls=Broken))
+        .runs[-1]
+        .status
+        == OK
+    )
+    filings = _filings(**_new_gap_filing(x, f"{x}-19-000001", _at(2019, 7, 1)))
+    recovered = _run(settings, GapError(), now=datetime(2019, 7, 3, 2, tzinfo=UTC), filings=filings)
+    assert recovered.ok
+    assert "edgar-gap backfill skipped 2019-07-01: RuntimeError" in recovered.runs[-1].message
+    assert read(f"SELECT session FROM prices_daily WHERE security_id='{x}'") == [(second,)]
+    retry = _Prices()
+    assert _run(settings, retry, now=datetime(2019, 7, 4, 2, tzinfo=UTC), filings=filings).ok
+    assert ("bars", (x,), first, first) in retry.calls
+
+
+def test_edgar_gap_missing_bar_is_attempted_once_and_expires(
+    settings: Settings,
+) -> None:
+    """A name Alpaca never traded cannot pin subsequent daily requests."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    x = "0000000003"
+    first = date(2019, 7, 1)
+    settings = settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"max_missing_share": 1.0})}
+    )
+    assert _run(settings).ok
+    assert (
+        _run(settings, now=datetime(2019, 7, 2, 2, tzinfo=UTC), filings=_filings(cls=Broken))
+        .runs[-1]
+        .status
+        == OK
+    )
+    filings = _filings(**_new_gap_filing(x, f"{x}-19-000001", _at(2019, 7, 1)))
+    for day in (2, 3, 5, 8, 9, 10):
+        prices = _Prices(missing={x})
+        result = _run(
+            settings, prices, now=datetime(2019, 7, day + 1, 2, tzinfo=UTC), filings=filings
+        )
+        assert result.ok
+        assert (("bars", (x,), first, first) in prices.calls) == (day == 2)
+        assert (
+            "actions",
+            tuple(sorted((*IDS, x))),
+            date(2019, 7, 1),
+            date(2019, 7, day),
+        ) in prices.calls
+        if day == 10:
+            assert "edgar-gap expired 2019-07-01" in result.runs[-1].message
+
+
+def test_edgar_gap_fetches_actions_for_name_delisted_before_recovery(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """A gap day's split is retained for a name no longer in today's fetch set."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    x = "0000000003"
+    gap = date(2019, 7, 1)
+    assert _run(settings).ok
+    assert (
+        _run(settings, now=datetime(2019, 7, 2, 2, tzinfo=UTC), filings=_filings(cls=Broken))
+        .runs[-1]
+        .status
+        == OK
+    )
+    records = _new_gap_filing(x, f"{x}-19-000001", _at(2019, 7, 1))
+    records["delistings"] = [
+        DelistingFiling(x, "25", "Common Stock", "NYSE", f"{x}-19-000025", _at(2019, 7, 2), gap)
+    ]
+    action = CorporateAction(
+        x, ActionType.SPLIT, gap, 2.0, action_first_seen_known_at(gap), "alpaca"
+    )
+    prices = _Prices(actions=[action])
+    result = _run(
+        settings, prices, now=datetime(2019, 7, 3, 2, tzinfo=UTC), filings=_filings(**records)
+    )
+    assert result.ok
+    assert ("bars", (x,), gap, gap) in prices.calls
+    assert (
+        "actions",
+        tuple(sorted((*IDS, x))),
+        gap,
+        date(2019, 7, 2),
+    ) in prices.calls
+    assert ("bars", tuple(sorted(IDS)), date(2019, 7, 2), date(2019, 7, 2)) in prices.calls
+    assert read(f"SELECT session FROM prices_daily WHERE security_id='{x}'") == [(gap,)]
+    assert read(f"SELECT action_type FROM corporate_actions WHERE security_id='{x}'") == [
+        ("split",)
+    ]
+
+
+def test_edgar_gap_process_date_action_is_written_once_with_todays_bars(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """An action processed on the gap day may have a later ex-date."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    class ProcessDatePrices(_Prices):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            self.calls.append(("actions", tuple(security_ids), start, end))
+            lag = timedelta(days=settings.alpaca.actions_process_lag_days)
+            return [action] if x in security_ids and start - lag <= gap <= end + lag else []
+
+    x = "0000000003"
+    gap = date(2019, 7, 1)
+    today = date(2019, 7, 2)
+    action = CorporateAction(
+        x,
+        ActionType.DIVIDEND,
+        today,
+        0.10,
+        action_first_seen_known_at(today),
+        "alpaca",
+        source_action_id="gap-dividend",
+    )
+    assert _run(settings).ok
+    assert (
+        _run(settings, now=datetime(2019, 7, 2, 2, tzinfo=UTC), filings=_filings(cls=Broken))
+        .runs[-1]
+        .status
+        == OK
+    )
+    filings = _filings(**_new_gap_filing(x, f"{x}-19-000001", _at(2019, 7, 1)))
+    prices = ProcessDatePrices()
+    assert _run(settings, prices, now=datetime(2019, 7, 3, 2, tzinfo=UTC), filings=filings).ok
+    assert (
+        "actions",
+        tuple(sorted((*IDS, x))),
+        gap,
+        today,
+    ) in prices.calls
+    assert ("bars", (x,), gap, gap) in prices.calls
+    assert read("SELECT count(*) FROM prices_daily WHERE session='2019-07-02'") == [(5,)]
+    assert read(f"SELECT count(*) FROM corporate_actions WHERE security_id='{x}'") == [(1,)]
+    assert _run(
+        settings, ProcessDatePrices(), now=datetime(2019, 7, 4, 2, tzinfo=UTC), filings=filings
+    ).ok
+    assert read(f"SELECT count(*) FROM corporate_actions WHERE security_id='{x}'") == [(1,)]
+
+
+def test_edgar_gap_write_error_falls_back_to_daily_prices(
+    settings: Settings,
+    read: Callable[[str], list[tuple[Any, ...]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recovered action write error rolls back and retries today's chunk."""
+
+    class Broken(FixtureFilingSource):
+        def companies_snapshot(self) -> Any:
+            raise RuntimeError("SEC 403")
+
+    x = "0000000003"
+    gap = date(2019, 7, 1)
+    assert _run(settings).ok
+    assert (
+        _run(settings, now=datetime(2019, 7, 2, 2, tzinfo=UTC), filings=_filings(cls=Broken))
+        .runs[-1]
+        .status
+        == OK
+    )
+    filings = _filings(**_new_gap_filing(x, f"{x}-19-000001", _at(2019, 7, 1)))
+    original = ingest_module._add_actions
+    calls = [0]
+
+    def fail_once(*args: Any, **kwargs: Any) -> int:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise ValueError("gap action write")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ingest_module, "_add_actions", fail_once)
+    result = _run(settings, now=datetime(2019, 7, 3, 2, tzinfo=UTC), filings=filings)
+    assert result.ok
+    assert "edgar-gap backfill skipped 2019-07-01: ValueError" in result.runs[-1].message
+    assert read("SELECT count(*) FROM prices_daily WHERE session='2019-07-02'") == [(5,)]
+    assert read(f"SELECT session FROM prices_daily WHERE security_id='{x}'") == [
+        (date(2019, 7, 2),)
+    ]
+    assert _run(settings, now=datetime(2019, 7, 4, 2, tzinfo=UTC), filings=filings).ok
+    assert (gap,) in read(f"SELECT session FROM prices_daily WHERE security_id='{x}'")
 
 
 def test_one_source_only(settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]) -> None:
@@ -975,7 +1300,10 @@ def test_edgar_run_message_carries_the_adapter_counts(
 
     Counted.skipped = skipped
     result = _run(settings, filings=_filings(cls=Counted), source="edgar")
-    counts = "; unstamped: 2 filings, 2 facts; skipped filers: 3; missing benchmarks:"
+    counts = (
+        "; unstamped: 2 filings, 2 facts; skipped filers: 3; chain_candidates: none; "
+        "missing benchmarks:"
+    )
     assert result.runs[0].status == OK
     assert counts in result.runs[0].message
     assert counts in read("SELECT message FROM ingestion_runs")[0][0]
@@ -987,7 +1315,7 @@ def test_edgar_run_message_names_only_the_counts_the_source_exposes(settings: Se
 
     off = _switched(settings, False)  # the statement counts are their own tests' job
     message = _run(off, filings=_filings(cls=OnlyFacts), source="edgar").runs[0].message
-    assert " facts; unstamped: 1 facts; missing benchmarks:" in message
+    assert " facts; unstamped: 1 facts; chain_candidates: none; missing benchmarks:" in message
 
 
 def test_edgar_run_message_carries_the_fsn_counts(settings: Settings) -> None:
@@ -1006,7 +1334,8 @@ def test_edgar_run_message_carries_the_fsn_counts(settings: Settings) -> None:
     message = _run(settings, filings=_filings(cls=Fsn), source="edgar").runs[0].message
     counts = (
         "; FSN re-issued: 2; FSN duplicates: 1; FSN re-issues unchecked: 3; "
-        "FSN incomplete listings: 4; cover incomplete listings: 6; FSN missing: 5; missing"
+        "FSN incomplete listings: 4; cover incomplete listings: 6; FSN missing: 5; "
+        "chain_candidates: none; missing"
     )
     assert counts in message
 
@@ -1024,7 +1353,7 @@ def test_edgar_run_message_carries_the_exchange_axis_mismatch_counts(settings: S
     message = _run(settings, filings=_filings(cls=Mismatched), source="edgar").runs[0].message
     counts = (
         "; cover incomplete listings: 6; FSN exchange-axis mismatches: 7; "
-        "cover exchange-axis mismatches: 8; missing"
+        "cover exchange-axis mismatches: 8; chain_candidates: none; missing"
     )
     assert counts in message
 
@@ -1037,7 +1366,10 @@ def test_edgar_run_message_carries_the_pre_xml_delistings_count(settings: Settin
         unstamped_delistings = 2
 
     message = _run(settings, filings=_filings(cls=Delistings), source="edgar").runs[0].message
-    assert "; pre-XML delistings: 7; unstamped delistings: 2; missing" in message
+    assert (
+        "; pre-XML delistings: 7; unstamped delistings: 2; chain_candidates: none; missing"
+        in message
+    )
 
 
 def test_edgar_run_message_carries_the_failure_policy_counts(settings: Settings) -> None:
@@ -1062,7 +1394,8 @@ def test_edgar_run_message_carries_the_failure_policy_counts(settings: Settings)
         "; failed filings: 2; quarantined: 1; facts missing: 4"
         "; empty bulk facts: 3; empty bulk submissions: 5"
         "; empty API facts: 6; empty API submissions: 7"
-        "; keyless bulk facts: 8; keyless API facts: 9; capped facts dropped: 1; missing"
+        "; keyless bulk facts: 8; keyless API facts: 9; capped facts dropped: 1; "
+        "chain_candidates: none; missing"
     )
     assert counts in message
 
@@ -2203,7 +2536,7 @@ def test_a_filing_accepted_after_the_run_clock_fails_the_chunk(
     # No look-ahead: a record not yet knowable at the run's instant is never stored.
     early = NOW - timedelta(days=200)
     result = _run(settings, now=early)
-    assert [(r.source, r.status) for r in result.runs] == [("edgar", FAILED)]
+    assert [(r.source, r.status) for r in result.runs] == [("edgar", FAILED), ("alpaca", FAILED)]
     assert "after" in result.runs[0].message
     assert _counts(read)["securities"] == 0
 
@@ -2398,6 +2731,104 @@ def test_an_otc_common_name_is_not_in_the_staleness_denominator(
     assert result.ok is ok, result.runs[-1].message
     if ok:
         assert "0 of 3 listed names missing" in result.runs[-1].message
+
+
+def _with_renamed_stat(ticker: str, fetched_at: datetime) -> FixtureFilingSource:
+    """`_with_stat` whose STAT shows `ticker` in the SEC file fetched at `fetched_at`."""
+    accession = f"{STAT}-18-000001"
+    return _filings(
+        fetched_at,
+        extra_index=[FilingIndexEntry(STAT, "Stat Corp", "10-K", accession, _at(2018, 3, 5))],
+        extra_headers=[FilingHeader(STAT, accession, "10-K", 3571, _at(2018, 3, 5))],
+        extra_facts=[_fact(STAT, "", 3_000_000, accession, _at(2018, 3, 5))],
+        extra_snapshot=[CompanySnapshotEntry(STAT, "Stat Corp", ticker, "OTC", fetched_at)],
+    )
+
+
+def test_a_no_cover_page_rename_is_one_dated_row_across_nightly_runs(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    # #2291: each run sees only the current SEC file. The rename is one
+    # `snapshot` row from its fetch session, never a second same-start
+    # `snapshot_static` row, and the next runs add nothing.
+    nights = [
+        (NOW, FETCHED_AT, "STAT"),
+        (NOW + timedelta(days=3), FETCHED_AT + timedelta(days=3), "STAX"),  # Mon 07-01
+        (NOW + timedelta(days=4), FETCHED_AT + timedelta(days=4), "STAX"),
+        (NOW + timedelta(days=5), FETCHED_AT + timedelta(days=5), "STAX"),
+    ]
+    stored = []
+    for now, fetched_at, ticker in nights:
+        filings = _with_renamed_stat(ticker, fetched_at)
+        result = _run(settings, now=now, source="edgar", filings=filings)
+        assert result.ok, result.runs[-1].message
+        stored.append(_counts(read)["listings"])
+    rows = read(
+        "SELECT ticker, provenance, valid_from, known_at FROM listings "
+        f"WHERE security_id = '{STAT}' ORDER BY valid_from"
+    )
+    assert rows == [
+        ("STAT", "snapshot_static", date(2018, 3, 5), FETCHED_AT),
+        ("STAX", "snapshot", date(2019, 7, 1), FETCHED_AT + timedelta(days=3)),
+    ]
+    assert stored[1] == stored[0] + 1
+    assert stored[3] == stored[2] == stored[1]
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        checks = integrity_checks(conn, nights[-1][0], settings)
+    (overlap,) = [c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS]
+    assert overlap.passed, overlap.violations
+
+
+def test_a_stored_pre_fix_same_start_pair_gets_one_rename_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    # #2291: the real store already holds the bug's shape: a second
+    # `snapshot_static` row with the old start, known at a later fetch. The
+    # first run after the fix adds one rename row known at that fetch, the
+    # next adds nothing, and the old rows stay untouched.
+    _run(settings, source="edgar", filings=_with_renamed_stat("STAT", FETCHED_AT))
+    bad_fetch = FETCHED_AT + timedelta(days=3)  # Mon 07-01, session 07-01
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "listings",
+            {
+                "security_id": STAT,
+                "ticker": "STAX",
+                "exchange": "OTC",
+                "class_title": None,
+                "valid_from": date(2018, 3, 5),
+                "known_at": bad_fetch,
+                "ingested_at": bad_fetch,
+                "source": "edgar",
+                "provenance": "snapshot_static",
+            },
+        )
+    rows_sql = (
+        "SELECT ticker, provenance, valid_from, known_at FROM listings "
+        f"WHERE security_id = '{STAT}' ORDER BY valid_from, known_at"
+    )
+    seeded = read(rows_sql)
+    stored = []
+    for days in (4, 5):
+        fetched_at = FETCHED_AT + timedelta(days=days)
+        filings = _with_renamed_stat("STAX", fetched_at)
+        result = _run(settings, now=NOW + timedelta(days=days), source="edgar", filings=filings)
+        assert result.ok, result.runs[-1].message
+        stored.append(read(rows_sql))
+    assert stored[0] == [*seeded, ("STAX", "snapshot", date(2019, 7, 1), bad_fetch)]
+    assert stored[1] == stored[0]
+    accepted = settings.model_copy(
+        update={
+            "universe": settings.universe.model_copy(
+                update={"accepted_same_day_pairs": [f"{STAT}@2018-03-05"]}
+            )
+        }
+    )
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        checks = integrity_checks(conn, NOW + timedelta(days=5), accepted)
+    (overlap,) = [c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS]
+    assert overlap.passed, overlap.violations
 
 
 NOT_COMMON = (
@@ -4833,7 +5264,13 @@ def test_actions_backfill_floor_dry_run_and_idempotent_month(
         calls
         == [
             (
-                (CorporateActionsType.SPIN_OFF, CorporateActionsType.NAME_CHANGE),
+                (
+                    CorporateActionsType.SPIN_OFF,
+                    CorporateActionsType.NAME_CHANGE,
+                    CorporateActionsType.CASH_MERGER,
+                    CorporateActionsType.STOCK_MERGER,
+                    CorporateActionsType.STOCK_AND_CASH_MERGER,
+                ),
                 date(2020, 6, 1),
                 date(2020, 6, 30),
             )
@@ -5640,11 +6077,8 @@ def test_import_dry_run_keeps_the_counts_before_a_failing_file(
 # --- successor chains (#821, plan T187) -------------------------------------
 
 _CHAIN_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "universe" / "chains"
-_CHAIN_CASE = next(
-    case
-    for case in json.loads((_CHAIN_FIXTURE_DIR / "chain_cases.json").read_text())
-    if case["case"] == "chain_1to1"
-)
+_CHAIN_CASES = json.loads((_CHAIN_FIXTURE_DIR / "chain_cases.json").read_text())
+_CHAIN_CASE = next(case for case in _CHAIN_CASES if case["case"] == "chain_1to1")
 
 
 def _chain_parse(value: str) -> datetime:
@@ -5737,6 +6171,109 @@ def _chain_settings_for(settings: Settings, *, accession: str | None) -> Setting
 
 def _chain_now() -> datetime:
     return datetime(2026, 1, 2, 3, 0, tzinfo=UTC)
+
+
+def _candidate_filings(*cases: dict[str, Any]) -> FixtureFilingSource:
+    """`_filings()` plus each case's pair, with the successor's 8-K12B only
+    where the case has evidence (#821 candidates)."""
+    index: list[FilingIndexEntry] = []
+    covers: list[CoverPage] = []
+    for case in cases:
+        predecessor = case["predecessor"]
+        successor = case["successor"]
+        ticker = case["ticker"]
+        index += [
+            FilingIndexEntry(
+                predecessor["cik"],
+                predecessor["name"],
+                "10-K",
+                f"{predecessor['cik']}-20-000001",
+                _chain_parse(predecessor["first_index"]),
+            ),
+            FilingIndexEntry(
+                predecessor["cik"],
+                predecessor["name"],
+                "10-K",
+                f"{predecessor['cik']}-20-000002",
+                _chain_parse(predecessor["cover"]),
+            ),
+            FilingIndexEntry(
+                successor["cik"],
+                successor["name"],
+                "10-K",
+                f"{successor['cik']}-20-000001",
+                _chain_parse(successor["first_index"]),
+            ),
+        ]
+        evidence = case["evidence"]
+        if evidence is not None:
+            index.append(
+                FilingIndexEntry(
+                    successor["cik"],
+                    successor["name"],
+                    evidence["form"],
+                    evidence["accession"],
+                    _chain_parse(evidence["accepted_at"]),
+                )
+            )
+        covers += [
+            CoverPage(
+                predecessor["cik"],
+                f"{predecessor['cik']}-20-000002",
+                _chain_parse(predecessor["cover"]),
+                (CoverListing("Common Stock", ticker, "NYSE"),),
+            ),
+            CoverPage(
+                successor["cik"],
+                f"{successor['cik']}-20-000002",
+                _chain_parse(successor["cover"]),
+                (CoverListing("Common Stock", ticker, "NYSE"),),
+            ),
+        ]
+    return _filings(extra_index=index, extra_covers=covers)
+
+
+def test_the_edgar_run_row_names_chain_candidates(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821, T187c: the run row counts and names `chain_candidates` -- the
+    8-K12B filer whose listing row takes the ticker, never the spin-off pair
+    with no successor filing. The gap is 63 sessions without a Form 25 in
+    the source, inside the default 65."""
+    spin_off = next(case for case in _CHAIN_CASES if case["case"] == "chain_spinoff")
+    _run(settings, filings=_candidate_filings(_CHAIN_CASE, spin_off), now=_chain_now())
+    message = read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")[0][0]
+    assert "chain_candidates: 1: 0001000011" in message
+    assert "0001000017" not in message
+
+
+def test_a_chain_entry_removes_its_candidate(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821, T187c: a successor on a `master.chains` entry is no candidate."""
+    _run(
+        _chained_settings(settings, _CHAIN_CASE),
+        filings=_candidate_filings(_CHAIN_CASE),
+        now=_chain_now(),
+    )
+    message = read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")[0][0]
+    assert "chain_candidates: none" in message
+
+
+def test_a_dismissed_successor_is_no_candidate(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821, T187c: a successor in `master.chains_dismissed` is no candidate."""
+    dismissed = settings.model_copy(
+        update={
+            "master": settings.master.model_copy(
+                update={"chains_dismissed": [_CHAIN_CASE["successor"]["cik"]]}
+            )
+        }
+    )
+    _run(dismissed, filings=_candidate_filings(_CHAIN_CASE), now=_chain_now())
+    message = read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")[0][0]
+    assert "chain_candidates: none" in message
 
 
 def test_a_chain_entry_writes_a_row_and_the_run_row_counts_it(
@@ -6146,3 +6683,297 @@ def test_an_unjudged_entry_is_refused_and_writes_nothing() -> None:
         assert conn.execute("SELECT count(*) FROM successor_chains").fetchone() == (0,)
     finally:
         conn.close()
+
+
+def _transport_failing_prices(
+    root: Path, change: Any, windows: list[tuple[date, date]], fail_on: date
+) -> Any:
+    """A fixture price source behaving as `AlpacaPriceSource.symbol_changes`
+    does on a transport error (#1676): `[]` and a report naming the category,
+    for the run whose window ends on `fail_on`; the change is found when asked
+    again over a window that covers its day."""
+    from tradepartner.adapters.alpaca_prices import ActionsParse
+    from tradepartner.adapters.fixture_prices import FixturePriceSource
+
+    class Flaky(FixturePriceSource):
+        def symbol_changes(self, security_ids: Sequence[str], start: date, end: date) -> Any:
+            windows.append((start, end))
+            if end == fail_on:
+                self.report = ActionsParse((), (), (), unanswered_categories=("name_changes",))
+                return []
+            self.report = None
+            return [change] if start <= change.process_date <= end else []
+
+        def resolution_summary(self) -> str:
+            base = super().resolution_summary()
+            if self.report is None:
+                return base
+            return base + "; name_changes request unanswered (transport error)"
+
+    prices = Flaky(root)
+    prices.report = None
+    return prices
+
+
+def test_a_missed_days_name_change_is_asked_again_and_applied_next_run(
+    fixture_store_path: Path,
+) -> None:
+    """#1676: a transport error on the name-change request leaves the day's
+    prices stored with a warning in the run's message; the next run's window
+    still covers the missed day, finds the change, and stores it, known no
+    earlier than its announcement close (no look-ahead)."""
+    from tradepartner.adapters.prices import SymbolChange, announcement_date_known_at
+    from tradepartner.calendar import next_session
+    from tradepartner.store.asof import symbol_changes_as_of
+
+    day = date(2018, 11, 8)
+    known_at = announcement_date_known_at(day)
+    change = SymbolChange(
+        "SEC_TICKCHANGE", "TCKB", "TCKC", "SYNTH-NEW", "SYNTH-NEWER", day, known_at, "alpaca", "r1"
+    )
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    windows: list[tuple[date, date]] = []
+    prices = _transport_failing_prices(
+        Path(__file__).parent / "fixtures" / "universe", change, windows, day
+    )
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute("DELETE FROM symbol_changes")
+    first = _run(
+        settings, prices=prices, now=datetime(2018, 11, 8, 22, tzinfo=UTC), source="alpaca"
+    )
+    assert first.ok, first.runs
+    assert "name_changes request unanswered" in first.runs[0].message
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert (
+            conn.execute("SELECT count(*) FROM prices_daily WHERE session = ?", [day]).fetchone()[0]
+            > 0
+        )
+        assert conn.execute("SELECT count(*) FROM symbol_changes").fetchone()[0] == 0
+    next_day = next_session(day)
+    second = _run(
+        settings, prices=prices, now=datetime(2018, 11, 9, 22, tzinfo=UTC), source="alpaca"
+    )
+    assert second.ok, second.runs
+    assert next_day == date(2018, 11, 9)
+    # The re-ask window starts before the missed day: no cursor moved past it.
+    assert windows[0][0] <= day and windows[1][0] <= day <= windows[1][1]
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute("SELECT security_id, known_at FROM symbol_changes").fetchall() == [
+            ("SEC_TICKCHANGE", known_at)
+        ]
+        # No look-ahead: invisible before its known_at, visible at it.
+        before = known_at - timedelta(seconds=1)
+        assert symbol_changes_as_of(conn, before).height == 0
+        assert symbol_changes_as_of(conn, known_at).height == 1
+
+
+def test_a_month_end_name_change_missed_by_a_transport_error_is_asked_again_next_month(
+    fixture_store_path: Path,
+) -> None:
+    """#1676 audit: the re-ask crosses a month boundary because the window
+    starts `alpaca.actions_process_lag_days` (default 90) before the month."""
+    from tradepartner.adapters.prices import SymbolChange, announcement_date_known_at
+
+    day = date(2018, 11, 30)
+    change = SymbolChange(
+        "SEC_TICKCHANGE", "TCKB", "TCKC", "S-NEW", "S-NEWER", day,
+        announcement_date_known_at(day), "alpaca", "month-end",
+    )  # fmt: skip
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    windows: list[tuple[date, date]] = []
+    prices = _transport_failing_prices(
+        Path(__file__).parent / "fixtures" / "universe", change, windows, day
+    )
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute("DELETE FROM symbol_changes")
+    assert _run(
+        settings, prices=prices, now=datetime(2018, 11, 30, 22, tzinfo=UTC), source="alpaca"
+    ).ok
+    assert _run(
+        settings, prices=prices, now=datetime(2018, 12, 3, 22, tzinfo=UTC), source="alpaca"
+    ).ok
+    assert windows[1][0] <= day <= windows[1][1]
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute("SELECT count(*) FROM symbol_changes").fetchone()[0] == 1
+
+
+def test_daily_fixture_stores_both_mergers_at_their_stamps_once(
+    fixture_store_path: Path,
+) -> None:
+    """The symbol-less daily request stores the fixture's cash merger (its
+    acquiree delisted) and stock merger at the close after their
+    `process_date`, a run before the stamp stores nothing (no look-ahead),
+    and a re-run adds zero rows."""
+    from tradepartner.adapters.fixture_prices import FixturePriceSource
+    from tradepartner.adapters.prices import announcement_date_known_at
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    prices = FixturePriceSource(Path(__file__).parent / "fixtures" / "universe")
+    cash_stamp = announcement_date_known_at(date(2018, 7, 25))
+    stock_stamp = announcement_date_known_at(date(2020, 2, 14))
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute("DELETE FROM mergers")
+    cash = _run(settings, prices=prices, now=cash_stamp + timedelta(hours=1), source="alpaca")
+    assert cash.ok, cash.runs
+    stock = _run(settings, prices=prices, now=stock_stamp + timedelta(hours=1), source="alpaca")
+    assert stock.ok, stock.runs
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute(
+            "SELECT security_id, source_action_id, known_at FROM mergers ORDER BY known_at"
+        ).fetchall() == [
+            ("SEC_CLEAN_MERGER", "fixture-merger-cash-1", cash_stamp),
+            ("SEC_DIV_CANCELLED", "fixture-merger-stock-1", stock_stamp),
+        ]
+    again = _run(settings, prices=prices, now=stock_stamp + timedelta(hours=1), source="alpaca")
+    assert again.ok
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute("SELECT count(*) FROM mergers").fetchone() == (2,)
+
+
+def test_daily_run_before_a_mergers_stamp_stores_nothing(fixture_store_path: Path) -> None:
+    from tradepartner.adapters.fixture_prices import FixturePriceSource
+    from tradepartner.adapters.prices import announcement_date_known_at
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    prices = FixturePriceSource(Path(__file__).parent / "fixtures" / "universe")
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute("DELETE FROM mergers")
+    stamp = announcement_date_known_at(date(2018, 7, 25))
+    run = _run(settings, prices=prices, now=stamp - timedelta(hours=1), source="alpaca")
+    assert run.ok, run.runs
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute("SELECT count(*) FROM mergers").fetchone() == (0,)
+
+
+def test_actions_backfill_writes_a_symbol_less_cash_merger_once(
+    fixture_store_path: Path,
+) -> None:
+    from alpaca.data.enums import CorporateActionsType
+
+    from tradepartner.adapters.prices import announcement_date_known_at
+    from tradepartner.ingest import ingest_actions_backfill
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    asked: list[tuple[CorporateActionsType, ...]] = []
+
+    def scan(types: Sequence[CorporateActionsType], start: date, end: date) -> dict[str, Any]:
+        asked.append(tuple(types))
+        return {
+            "cash_mergers": [
+                {
+                    "id": "cash-2020-1",
+                    "acquiree_symbol": "SPY",
+                    "acquiree_cusip": "ACQ",
+                    "rate": 12.5,
+                    "effective_date": "2020-06-16",
+                    "process_date": "2020-06-16",
+                    "payable_date": "2020-06-17",
+                }
+            ]
+        }
+
+    now = datetime(2020, 7, 2, 20, tzinfo=UTC)
+    kwargs: dict[str, Any] = {
+        "since": date(2020, 6, 1),
+        "through": date(2020, 6, 30),
+        "clock": lambda: now,
+        "scan": scan,
+    }
+    dry = ingest_actions_backfill(settings, dry_run=True, **kwargs)
+    assert dry.runs[0].rows_added == 1
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM mergers WHERE security_id='SEC_SPY'"
+        ).fetchone() == (0,)
+    first = ingest_actions_backfill(settings, **kwargs)
+    second = ingest_actions_backfill(settings, **kwargs)
+    assert first.runs[0].rows_added == 1 and second.runs[0].rows_added == 0
+    assert {"CASH_MERGER", "STOCK_MERGER", "STOCK_AND_CASH_MERGER"} <= {t.name for t in asked[0]}
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute(
+            "SELECT kind, cash_per_share, known_at FROM mergers WHERE security_id='SEC_SPY'"
+        ).fetchall() == [("cash", 12.5, announcement_date_known_at(date(2020, 6, 16)))]
+
+
+def test_store_price_source_delegates_mergers() -> None:
+    from tradepartner.cli import StorePriceSource
+
+    class Inner:
+        last_actions_report = "report"
+
+        def mergers(self, start: date, end: date) -> list[Any]:
+            return [(start, end)]
+
+    source = StorePriceSource(Settings(_env_file=None))
+    assert source.last_actions_report is None
+    source._inner = Inner()  # type: ignore[assignment]
+    assert source.mergers(date(2020, 1, 1), date(2020, 1, 2)) == [
+        (date(2020, 1, 1), date(2020, 1, 2))
+    ]
+    assert source.last_actions_report == "report"
+
+
+def test_daily_run_after_the_acquirees_delisting_still_stores_its_merger(
+    fixture_store_path: Path,
+) -> None:
+    """The request is symbol-less, so an acquiree delisted before the run's
+    session (and so absent from the names asked for) is still stored."""
+    from tradepartner.adapters.fixture_prices import FixturePriceSource
+    from tradepartner.adapters.prices import announcement_date_known_at
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    prices = FixturePriceSource(Path(__file__).parent / "fixtures" / "universe")
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute("DELETE FROM mergers")
+        delisted = conn.execute(
+            "SELECT effective_on FROM delistings WHERE security_id = 'SEC_CLEAN_MERGER'"
+        ).fetchone()
+    assert delisted is not None
+    now = datetime(2018, 8, 10, 22, tzinfo=UTC)
+    assert now.date() > delisted[0]
+    run = _run(settings, prices=prices, now=now, source="alpaca")
+    assert run.ok, run.runs
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute(
+            "SELECT security_id, known_at FROM mergers WHERE security_id = 'SEC_CLEAN_MERGER'"
+        ).fetchall() == [("SEC_CLEAN_MERGER", announcement_date_known_at(date(2018, 7, 25)))]
+        assert conn.execute(
+            "SELECT count(*) FROM prices_daily WHERE security_id = 'SEC_CLEAN_MERGER' "
+            "AND session = DATE '2018-08-10'"
+        ).fetchone() == (0,)
+
+
+def test_an_unresolved_merger_is_stored_by_a_later_run_with_the_same_stamp(
+    fixture_store_path: Path,
+) -> None:
+    """A record the resolver could not place is not stored; once a later run's
+    request returns it, it is stored at its own stamp, not at that run's clock."""
+    from tradepartner.adapters.fixture_prices import FixturePriceSource
+    from tradepartner.adapters.prices import announcement_date_known_at
+
+    class Late(FixturePriceSource):
+        answer = False
+
+        last_actions_report: Any = None
+
+        def mergers(self, start: date, end: date) -> list[Any]:
+            from tradepartner.adapters.alpaca_prices import ActionsParse
+
+            if self.answer:
+                return super().mergers(start, end)
+            self.last_actions_report = ActionsParse((), (("CLNM", date(2018, 7, 25)),), ())
+            return []
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    prices = Late(Path(__file__).parent / "fixtures" / "universe")
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute("DELETE FROM mergers")
+    stamp = announcement_date_known_at(date(2018, 7, 25))
+    first = _run(settings, prices=prices, now=stamp + timedelta(hours=1), source="alpaca")
+    assert first.ok and "actions_unresolved=1" in first.runs[-1].message, first.runs
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute("SELECT count(*) FROM mergers").fetchone() == (0,)
+    prices.answer = True
+    assert _run(settings, prices=prices, now=stamp + timedelta(days=3), source="alpaca").ok
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute("SELECT known_at FROM mergers").fetchall() == [(stamp,)]

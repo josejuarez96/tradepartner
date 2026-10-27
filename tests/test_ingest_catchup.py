@@ -111,6 +111,9 @@ def test_a_gap_over_the_bound_fails_and_names_the_sessions(
     for day in missed:
         assert day.isoformat() in run.message
     assert f"--backfill --since {missed[0].isoformat()}" in run.message
+    # #2181: the backfill alone does not unblock paper; the message names the next step.
+    assert "then one plain `tradepartner ingest --source alpaca`" in run.message
+    assert "stale_data" in run.message
     assert read(f"SELECT count(*) FROM prices_daily WHERE session = DATE '{D}'") == [(0,)]
 
 
@@ -194,6 +197,7 @@ def test_a_caught_up_session_that_comes_back_thin_fails_the_run(
     assert run.status == STALE, run.message
     assert D2.isoformat() in run.message
     assert f"--backfill --since {D2.isoformat()}" in run.message
+    assert "then one plain `tradepartner ingest --source alpaca`" in run.message
     assert _sessions_stored(read) == {D3, D1}
 
 

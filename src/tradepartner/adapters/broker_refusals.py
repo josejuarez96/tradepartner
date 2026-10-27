@@ -33,6 +33,9 @@ ASSET_NOT_FOUND_CODE = 40410000
 #: HTTP status of the broker's per-order 403 refusals, and Alpaca's code on them.
 FORBIDDEN = 403
 FORBIDDEN_CODE = 40310000
+#: A 403 40310000 the book's own open orders cause (#1949, sandbox batch 5): a
+#: reconciliation fault on either side, never a skip (owner decision 2026-10-19).
+_WASH_TRADE_MESSAGE = "potential wash trade detected"
 
 
 def error_code(error: Refusal) -> object:
@@ -58,7 +61,8 @@ def typed_refusal(error: Refusal, request: OrderRequest) -> Exception | None:
     """The typed error for the submit refusals the wrapper's allowlist knows, else
     `None` (the caller raises `error` as is). The map is exact: a 404 only with code
     40410000, a 403 only with code 40310000 and `asset "<the order's symbol>" is not
-    tradable|fractionable` or `insufficient qty available`, and never for a retried
+    tradable|fractionable`, `insufficient qty available` or `potential wash trade
+    detected` (the last two reconciliation faults), and never for a retried
     submit (an earlier attempt may have reached the broker, so the run halts and
     resume settles it). By refusal, not by side: the wrapper decides what a sell's
     refusal means."""
@@ -71,6 +75,11 @@ def typed_refusal(error: Refusal, request: OrderRequest) -> Exception | None:
     if error.status_code != FORBIDDEN or code != FORBIDDEN_CODE:
         return None
     message = error_message(error)
+    if _WASH_TRADE_MESSAGE in message:
+        return ReconciliationError(
+            f"the broker refused order {coid!r} as a potential wash trade: "
+            "the book's own open orders conflict (use complex orders)"
+        )
     if "insufficient qty available" in message:
         return ReconciliationError(f"the broker holds less than order {coid!r} sells")
     symbol = re.escape(request.symbol)

@@ -54,6 +54,22 @@ _DIVIDEND_SCHEMA: dict[str, Any] = {
     "ratio_or_amount": pl.Float64,
     "known_at": pl.Datetime("us", "UTC"),
 }
+#: `unvalued_spin_offs`'s rows (T211e): `security_id` is the parent, `child` the
+#: distributed security, `reason` the store's drop name.
+_UNVALUED_SPIN_OFF_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "child": pl.Utf8,
+    "ex_date": pl.Date,
+    "reason": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+#: `late_spin_offs`'s rows (T211e): `security_id` is the parent.
+_LATE_SPIN_OFF_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "ex_date": pl.Date,
+    "ratio_or_amount": pl.Float64,
+    "known_at": pl.Datetime("us", "UTC"),
+}
 
 _STATEMENT_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
@@ -145,6 +161,12 @@ class FakeProvider:
     )
     dividends: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_DIVIDEND_SCHEMA))
     dropped: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_DIVIDEND_SCHEMA))
+    unvalued_spin_offs_rows: pl.DataFrame = field(
+        default_factory=lambda: pl.DataFrame(schema=_UNVALUED_SPIN_OFF_SCHEMA)
+    )
+    late_spin_offs_rows: pl.DataFrame = field(
+        default_factory=lambda: pl.DataFrame(schema=_LATE_SPIN_OFF_SCHEMA)
+    )
     gaps: Mapping[datetime, GapReading] = field(default_factory=dict)
     static_listings: Collection[str] = ()
     statement_rows: pl.DataFrame = field(
@@ -156,6 +178,7 @@ class FakeProvider:
     shares_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_SHARES_SCHEMA))
     split_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_SPLIT_SCHEMA))
     rate_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_RATE_SCHEMA))
+    chain_pairs: tuple[tuple[str, str], ...] = ()
     calls: list[Call] = field(default_factory=list)
 
     def _record(self, method: str, t: datetime, **kwargs: Any) -> datetime:
@@ -171,6 +194,10 @@ class FakeProvider:
         """Every `t` and `t_prev` passed to the provider so far."""
         times = {call.t for call in self.calls}
         return times | {call.t_prev for call in self.calls if call.t_prev is not None}
+
+    def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        self._record("chains", t)
+        return self.chain_pairs
 
     def universe(self, t: datetime) -> Universe:
         t = self._record("universe", t)
@@ -252,6 +279,32 @@ class FakeProvider:
         prev_session = last_completed_session(t_prev)
         key = ["security_id", "ex_date"]
         known = _for_ids(_known(self.dividends, t), ids)
+        first_known = known.group_by(key).agg(pl.col("known_at").min().alias("first_known_at"))
+        late_keys = first_known.filter(
+            (pl.col("first_known_at") > t_prev) & (pl.col("ex_date") <= prev_session)
+        ).select(key)
+        return _latest(known.join(late_keys, on=key, how="semi"), key)
+
+    def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        """The declared unvalued spin-off rows (`unvalued_spin_offs_rows`) of the
+        parents in `ids` known at `t` with an ex-date at or before `t`'s session;
+        `security_id` is the parent. A declared row is unvalued whatever its reason."""
+        t = self._record("unvalued_spin_offs", t, ids=ids)
+        session = last_completed_session(t)
+        rows = _for_ids(_known(self.unvalued_spin_offs_rows, t), ids).filter(
+            pl.col("ex_date") <= session
+        )
+        return _latest(rows, ["security_id", "child", "ex_date"])
+
+    def late_spin_offs(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        """The declared spin-off rows (`late_spin_offs_rows`) of the parents in `ids` first
+        known in `(t_prev, t]` with an ex-date at or before `t_prev`'s session; the same
+        rule `late_dividends` applies to dividends."""
+        t = self._record("late_spin_offs", t, ids=ids, t_prev=t_prev)
+        t_prev = check_t(t_prev, name="t_prev")
+        prev_session = last_completed_session(t_prev)
+        key = ["security_id", "ex_date"]
+        known = _for_ids(_known(self.late_spin_offs_rows, t), ids)
         first_known = known.group_by(key).agg(pl.col("known_at").min().alias("first_known_at"))
         late_keys = first_known.filter(
             (pl.col("first_known_at") > t_prev) & (pl.col("ex_date") <= prev_session)

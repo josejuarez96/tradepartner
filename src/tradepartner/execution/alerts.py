@@ -27,6 +27,10 @@ Kinds (`ALERT_KINDS`, pinned to the spec's list) and who emits them:
   bar was marked at its last close (#1763, owner decision; bounded by the frozen
   `paper.max_stale_mark_sessions`). Run-scoped; one alert per run naming every such
   name, a distinct kind so it never shadows the run's own `stale_data`.
+- `missing_candidate_bar`: the tracking run's plan step, when a universe candidate had
+  no T_0 bar and was excluded as `excluded_no_t0_bar` (#1997, owner decision). The run
+  goes on; run-scoped, one alert per run naming every such name. Not `stale_data`: that
+  halts the run on a bad held-name or benchmark read.
 - `skipped`: the risk-gated wrapper's `execute` (T202), one per run naming each
   name skipped (an allowlisted per-name refusal or a phase-time skip) and its
   reason. Run-scoped.
@@ -123,6 +127,7 @@ ALERT_KINDS: tuple[str, ...] = (
     "no_window",
     "lot_ledger",
     "stale_mark",
+    "missing_candidate_bar",
     "skipped",
     "pending_unresolved",
 )

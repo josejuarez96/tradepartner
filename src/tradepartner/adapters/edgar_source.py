@@ -339,7 +339,7 @@ from tradepartner.adapters.filings import (
 )
 from tradepartner.calendar import is_session, next_session
 from tradepartner.config import Settings, clean_message
-from tradepartner.health import clock_suspect
+from tradepartner.health import EDGAR_FILING_DATE_CUTOFF, clock_suspect
 from tradepartner.store.master import _is_plain_common
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -453,6 +453,28 @@ class _Submissions:
     # #576: the API answered 200 `{}` for the payload or a page, so a missing
     # accession is not evidence the filing is unstampable.
     empty: bool = False
+
+
+def _fallback_stamp(record: SubmissionRecord) -> SubmissionRecord:
+    """#1686: `record` for the API fallback, its stamp never earlier than the
+    true acceptance where that can be shown. SEC's API serves stamps late by
+    New York's offset, or exact; a stamp that fits only a clock moved early (a
+    session day before `EDGAR_FILING_DATE_CUTOFF` New York, the filing dated a
+    later day) is moved late by the offset, which lands it on the true time.
+    An early stamp that still fits its filing date cannot be told apart from a
+    true one and is kept as served."""
+    at, filed = record.accepted_at, record.filing_date
+    if at is None or filed is None:
+        return record
+    local = at.astimezone(_EASTERN)
+    if (
+        is_session(local.date())
+        and local.time() < EDGAR_FILING_DATE_CUTOFF
+        and filed > local.date()
+        and (offset := local.utcoffset()) is not None
+    ):
+        return replace(record, accepted_at=at - offset)
+    return record
 
 
 def _filing_date_or_none(value: Any) -> date | None:
@@ -672,6 +694,11 @@ class EdgarFilingSource(FilingSource):
         self.stamps_from_sgml = 0
         self.stamps_sgml_unread = 0
         self.stamps_sgml_overlong = 0
+        # #1686: after `edgar.stamp_sgml_fallback_runs` consecutive runs with no
+        # readable anchor, a CIK's stamps are cached as the API served them.
+        self.stamps_api_fallback = 0
+        self.stamp_fallback_ciks = 0
+        self._unread_counted: set[str] = set()
         # #599: a payload with `facts` but no `cik` (SEC ships this shape for
         # a few CIKs, identically from the zip and the API): identified by
         # the CIK it was requested under, not treated as absent.
@@ -887,11 +914,20 @@ class EdgarFilingSource(FilingSource):
             if all(miss is _HeaderMiss.NO_ACCEPTANCE for miss in headers.values()):
                 self.stamp_check_unread_ciks += 1
                 return checked
+            if self._unread_run_reached(cik):
+                # #1686: the API stamp, which is late or exact (never earlier
+                # than true) unless it is provably early (`_fallback_stamp`).
+                for record in stamped:
+                    checked[record.accession] = _fallback_stamp(record)
+                self.stamps_api_fallback += len(stamped)
+                self.stamp_fallback_ciks += 1
+                return checked
             for record in stamped:
                 del checked[record.accession]
                 reason = headers.get(record.accession)
                 self._count_sgml_miss(reason if isinstance(reason, _HeaderMiss) else None)
             return checked
+        self._clear_unread_runs(cik)  # an anchor read: the run count restarts
         if agrees:
             return checked
         self.stamp_check_mismatched_ciks += 1
@@ -907,6 +943,32 @@ class EdgarFilingSource(FilingSource):
                 del checked[record.accession]
                 self._count_sgml_miss(truth)
         return checked
+
+    def _unread_path(self) -> Path:
+        return self._cache / "sgml_unread" / "v1.json"
+
+    def _unread_runs(self) -> dict[str, int]:
+        try:
+            data = json.loads(self._unread_path().read_bytes())
+            return {str(cik): int(n) for cik, n in data.items()}
+        except (OSError, ValueError, AttributeError, TypeError):
+            return {}  # absent or unreadable: the count starts again
+
+    def _unread_run_reached(self, cik: str) -> bool:
+        """#1686: count this run (once per CIK per source) as one with no
+        readable anchor and say whether the count reached
+        `edgar.stamp_sgml_fallback_runs`."""
+        runs = self._unread_runs()
+        if cik not in self._unread_counted:
+            self._unread_counted.add(cik)
+            runs[cik] = runs.get(cik, 0) + 1
+            edgar_raw.write_atomic(self._unread_path(), json.dumps(runs).encode("utf-8"))
+        return runs.get(cik, 0) >= self._settings.edgar.stamp_sgml_fallback_runs
+
+    def _clear_unread_runs(self, cik: str) -> None:
+        runs = self._unread_runs()
+        if runs.pop(cik, None) is not None:
+            edgar_raw.write_atomic(self._unread_path(), json.dumps(runs).encode("utf-8"))
 
     def _count_sgml_miss(self, reason: _HeaderMiss | None) -> None:
         """Count a skipped stamp by whether its own header exceeded the cap."""

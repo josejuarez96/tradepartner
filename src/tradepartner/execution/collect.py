@@ -15,10 +15,17 @@ path's read, `paper resume`'s settlement). In order:
    earliest `known_at` of the `pending` event of any non-terminal own order)
    - `paper.fill_read_overlap_seconds`, inclusive at equal timestamps
    (`Broker.fills` returns `filled_at >= since`); `None` (everything) when
-   there is neither. A `broker_feed` fill whose `filled_at` is ahead of the
+   there is neither. The orders to collect are read first (`get_order`), and
+   `since` also reaches back to the earliest broker `submitted_at` among them
+   minus the overlap, never earlier than the first window's `started_at`
+   minus the overlap: the broker filters fills on its own clock, so our
+   stamps alone hide fills when the Mac clock runs ahead (#2186). A `pending`
+   `known_at` later than its order's `submitted_at` by more than
+   `risk.max_broker_clock_skew_seconds` is a note on `Collected.clock_notes`
+   (no halt). A `broker_feed` fill whose `filled_at` is ahead of the
    clock (read after the call) by more than the frozen
    `risk.max_broker_clock_skew_seconds` is a `ClockError`, raised before
-   anything is written. Then `get_order` once per order to collect. Broker
+   anything is written. `get_order` is once per order to collect, before `fills`. Broker
    errors propagate: every method's allowlist but `cancel`'s is empty
    (req 4), so the caller halts. A reading that is not the default order
    shape (`risk.order_shape_violation`: anything but a market day order of a
@@ -70,6 +77,16 @@ path's read, `paper resume`'s settlement). In order:
    `RejectionCapError` with the verdict, chained from the back-fill's error,
    since the committed cursor means no later collection judges those
    rejections again; without a verdict the back-fill's error propagates as is.
+
+5. **The fill-price band** (#1981; with `price_band` given, a run's collectors), after
+   the collection has committed: every fill this call journaled must sit within
+   `paper.max_fill_price_deviation` of its order's reference price (the split-adjusted
+   close of S-1, moved back to the order's session for a late fill). A fill outside it,
+   raises `SystemFaultError` naming
+   `fill_price_outside_band` (a rejection verdict of the call is named in the message),
+   so the caller halts. The journal and the broker agree on a bad fill, so no
+   reconciliation can see it. `paper resume` and the halt path's read pass no band:
+   the owner looks at a resume, and the halt has already happened.
 
 Every clock reading is checked (ADR 0007 point 4): an exception, a
 non-`datetime` or a naive value becomes `ClockError`, and so does a write
@@ -128,10 +145,12 @@ from tradepartner.store.journal import (
     DecisionEventRow,
     FillCursorRow,
     FillRow,
+    OrderedFill,
     OrderEventRow,
     OrderRow,
     ReconciliationRow,
     all_fill_ids,
+    all_fill_terms,
     append,
     decisions_for,
     fill_cursors,
@@ -158,6 +177,8 @@ _SKIP_REFUSAL_REASONS = frozenset(
 _BUY = "buy"
 _WRITTEN_OFF = "written_off"
 _UNFUNDED = "unfunded"
+_SPLIT = "split"
+_FILL_BAND_FAULT = "fill_price_outside_band"
 _BROKER_FEED = "broker_feed"
 _BROKER_STATUS = "broker_status"
 #: The `mismatches_json` key under which a reconciliation lists its lagging
@@ -216,6 +237,18 @@ class WriteOffContext:
 
 
 @dataclass(frozen=True)
+class PriceBand:
+    """The fill-price sanity band (#1981): the reference price on `session` (a pure
+    lookup over data already loaded, as `WriteOffContext.price_of`), the splits known
+    at close(S-1), and the configured `paper.max_fill_price_deviation`."""
+
+    price_of: Callable[[str], float]
+    actions_as_of: pl.DataFrame
+    session: date
+    deviation: float
+
+
+@dataclass(frozen=True)
 class Collected:
     """What one collection saw and wrote."""
 
@@ -227,11 +260,25 @@ class Collected:
     readings: tuple[OrderReading, ...]
     rejections: tuple[RejectionBreach, ...]
     written_off: tuple[int, ...]
+    #: `client_order_id`s of fills the price band could not judge (no reference price).
+    unjudged: tuple[str, ...] = ()
+    #: Warnings that our clock runs ahead of the broker's (#2186); they never halt.
+    clock_notes: tuple[str, ...] = ()
 
     @property
     def lagging(self) -> tuple[OrderReading, ...]:
         """The collected orders that are `fills_lagging`."""
         return tuple(r for r in self.readings if r.lagging)
+
+
+def note_unjudged(collected: Collected, notes: list[str]) -> None:
+    """Record the collection's warnings: fills whose reference price was unavailable
+    to the band, and a Mac clock running ahead of the broker's (#2186)."""
+    notes.extend(collected.clock_notes)
+    if collected.unjudged:
+        notes.append(
+            "fill-price band: no reference price for " + ", ".join(sorted(set(collected.unjudged)))
+        )
 
 
 @dataclass(frozen=True)
@@ -255,6 +302,7 @@ def collect(
     settings: Settings,
     *,
     write_offs: WriteOffContext | None = None,
+    price_band: PriceBand | None = None,
 ) -> Collected:
     """Collect fills and the terminal events of `orders` (module docstring).
 
@@ -280,6 +328,13 @@ def collect(
     with connect() as conn:
         cursors = fill_cursors(conn)
         open_since = _earliest_open_pending(conn)
+        pending_at = _open_pending_stamps(conn)
+        floor_row = conn.execute("SELECT min(started_at) FROM paper_windows").fetchone()
+        window_floor = (
+            ensure_tz_aware_utc(floor_row[0], field_name="started_at")
+            if floor_row is not None and floor_row[0] is not None
+            else None
+        )
         pending = {o.client_order_id for o in pending_orders(conn, window_id=None)}
         open_ids = {o.client_order_id for o in non_terminal_orders(conn, window_id=None)}
     cursor = max((c.collected_through for c in cursors), default=None)
@@ -292,10 +347,32 @@ def collect(
     bounds = [t for t in (cursor, open_since) if t is not None]
     overlap = timedelta(seconds=settings.paper.fill_read_overlap_seconds)
     since = min(bounds) - overlap if bounds else None
+    # The broker filters fills on its own clock, so a bound taken only from our
+    # stamps hides fills when our clock runs ahead (#2186): also reach back to
+    # the broker's own `submitted_at` of the orders being collected, never
+    # earlier than the first window's start minus the overlap (a bogus past
+    # `submitted_at` cannot widen the read without limit).
+    readings = {o.client_order_id: broker.get_order(o.client_order_id) for o in to_read}
+    clock_notes: list[str] = []
+    if readings:
+        broker_bound = min(r.submitted_at for r in readings.values()) - overlap
+        if window_floor is not None:
+            broker_bound = max(broker_bound, window_floor - overlap)
+        since = broker_bound if since is None else min(since, broker_bound)
+        limit = frozen.max_broker_clock_skew_seconds
+        for cid, reading in sorted(readings.items()):
+            stamped = pending_at.get(cid)
+            if stamped is None:
+                continue
+            ahead = (stamped - reading.submitted_at).total_seconds()
+            if ahead > limit:
+                clock_notes.append(
+                    f"clock skew: order {cid} was stamped {ahead:.0f}s later by our clock than "
+                    f"the broker's submitted_at (limit {limit}s); the Mac clock looks fast"
+                )
     seen = broker.fills(since)
     now = _read_clock(clock)
     _check_skew(seen, now, frozen.max_broker_clock_skew_seconds)
-    readings = {o.client_order_id: broker.get_order(o.client_order_id) for o in to_read}
     _refuse_shapes(readings.values())
 
     with connect() as conn:
@@ -339,6 +416,10 @@ def collect(
             # rejections again: the verdict leaves with the failure (#396).
             raise RejectionCapError("; ".join(b.message for b in rejections)) from exc
 
+    unjudged: tuple[str, ...] = ()
+    if price_band is not None:
+        unjudged = _judge_fill_band(connect, orders, journaled, price_band, rejections)
+
     return Collected(
         since=since,
         collected_through=through,
@@ -348,7 +429,37 @@ def collect(
         readings=tuple(collected),
         rejections=rejections,
         written_off=written_off,
+        unjudged=unjudged,
+        clock_notes=tuple(clock_notes),
     )
+
+
+def _judge_fill_band(
+    connect: Connect,
+    orders: Sequence[OrderRow],
+    journaled: Sequence[str],
+    band: PriceBand,
+    rejections: Sequence[RejectionBreach],
+) -> tuple[str, ...]:
+    """Return the ids of the fills the band could not price (a note for the caller);
+    raise `SystemFaultError` naming `fill_price_outside_band` for a fill this
+    collection journaled outside the band (#1981). It runs after the collection has
+    committed, so the fill is journaled as the broker holds it; a rejection verdict
+    of the same collection is named in the message, never dropped."""
+    if not journaled:
+        return ()
+    new = set(journaled)
+    with connect() as conn:
+        fills = [
+            f
+            for f in fills_for(conn, client_order_ids=[o.client_order_id for o in orders])
+            if f.fill.broker_fill_id in new
+        ]
+    found = fill_band_violations(fills, band)
+    if found:
+        verdicts = [b.message for b in rejections]
+        raise SystemFaultError("; ".join([_FILL_BAND_FAULT + ": " + "; ".join(found), *verdicts]))
+    return tuple(f.fill.client_order_id for f in fills if _unpriced(f, band))
 
 
 def _refuse_shapes(readings: Iterable[Order]) -> None:
@@ -410,6 +521,16 @@ def _earliest_open_pending(conn: duckdb.DuckDBPyConnection) -> datetime | None:
     )
 
 
+def _open_pending_stamps(conn: duckdb.DuckDBPyConnection) -> dict[str, datetime]:
+    """The `known_at` of the `pending` event of each non-terminal order."""
+    open_ids = {o.client_order_id for o in non_terminal_orders(conn, window_id=None)}
+    return {
+        e.client_order_id: e.known_at
+        for e in order_events_for(conn, window_id=None)
+        if e.status == _PENDING and e.client_order_id in open_ids
+    }
+
+
 def _check_skew(fills: Iterable[Fill], now: datetime, skew_seconds: float) -> None:
     limit = now + timedelta(seconds=skew_seconds)
     ahead = [f for f in fills if f.filled_at > limit]
@@ -430,8 +551,10 @@ def _journal_fills(
     journaled: list[str] = []
     superseded: list[str] = []
     foreign: list[str] = []
+    journaled_as = all_fill_terms(conn)
     for fill in seen:
         if fill.broker_fill_id in known:
+            _check_unchanged(fill, journaled_as.get(fill.broker_fill_id))
             continue
         if fill.client_order_id not in own:
             foreign.append(fill.broker_fill_id)
@@ -461,6 +584,19 @@ def _journal_fills(
         if synthetic:
             superseded.append(fill.broker_fill_id)
     return tuple(journaled), tuple(superseded), tuple(foreign)
+
+
+def _check_unchanged(fill: Fill, journaled: tuple[float, float] | None) -> None:
+    """Raise `SystemFaultError` when a known fill reads back with another quantity or
+    price: a broker correction (#2149) that arrived after its fill was journaled."""
+    if journaled is None:
+        return
+    quantity, price = journaled
+    if not (math.isclose(fill.quantity, quantity) and math.isclose(fill.price, price)):
+        raise SystemFaultError(
+            f"broker fill {fill.broker_fill_id} reads {fill.quantity} at {fill.price}, "
+            f"journaled as {quantity} at {price}: a correction after collection"
+        )
 
 
 def _journal_terminals(
@@ -553,6 +689,72 @@ def _back_fill_write_offs(
         )
         written.append(decision.decision_id)
     return tuple(written)
+
+
+def fill_band_violations(fills: Iterable[OrderedFill], band: PriceBand) -> tuple[str, ...]:
+    """One message per fill whose price is outside `reference x (1 +- deviation)`
+    (#1981).
+
+    Pure over `band.price_of`. The reference of a fill is its security's reference
+    price on `band.session`, moved back to the order's own session when the order is
+    older (a fill collected a session late): `price_of` divides by the splits with
+    ex-date up to `band.session`, so the order's reference is that times the split
+    ratios with ex-date in (order session, `band.session`]. The bounds are
+    inclusive. A non-finite fill price is a violation. A fill of a name with no
+    usable reference (`price_of` raises, as for an exit of an unpriced name, #569, or
+    a held name outside the pending rebalance) is not judged: there is nothing to
+    compare it with, and halting every such exit would stop the book. Each message names the
+    order, the security, the fill price, the reference and the deviation."""
+    out = []
+    for item in fills:
+        fill = item.fill
+        who = f"{fill.client_order_id} ({item.security_id})"
+        ref = _reference(item, band)
+        if ref is None:
+            continue  # a name with no reference (an exit of an unpriced name) is not judged
+        price = fill.price
+        if not (
+            math.isfinite(price)
+            and ref * (1 - band.deviation) <= price <= ref * (1 + band.deviation)
+        ):
+            out.append(
+                f"{who}: fill price {price} is outside {band.deviation:.0%} of the "
+                f"reference price {ref}"
+            )
+    return tuple(out)
+
+
+def _reference(item: OrderedFill, band: PriceBand) -> float | None:
+    """The fill's reference price, or None when the band has none for its name."""
+    try:
+        ref = band.price_of(item.security_id) * _split_factor(
+            band.actions_as_of, item.security_id, item.order_session, band.session
+        )
+    except (KeyError, ValueError):
+        return None
+    return ref if math.isfinite(ref) and ref > 0 else None
+
+
+def _unpriced(item: OrderedFill, band: PriceBand) -> bool:
+    return _reference(item, band) is None
+
+
+def _split_factor(
+    actions_as_of: pl.DataFrame, security_id: str, after: date | None, upto: date
+) -> float:
+    """The product of the split ratios of `security_id` with ex-date in
+    (`after`, `upto`]; 1.0 when `after` is None or not before `upto`."""
+    if after is None or after >= upto:
+        return 1.0
+    factor = 1.0
+    for row in actions_as_of.iter_rows(named=True):
+        if (
+            row["security_id"] == security_id
+            and row["action_type"] == _SPLIT
+            and after < row["ex_date"] <= upto
+        ):
+            factor *= float(row["ratio_or_amount"])
+    return factor
 
 
 def rejection_breaches(

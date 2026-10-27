@@ -279,3 +279,18 @@ def test_advancing_bound_with_a_multi_session_gap_keeps_no_extra_rows(
     )
     assert got.equals(fresh)
     assert provider.bounds[-1][2] == bound
+
+
+def test_the_probe_names_a_spin_offs_parent_when_the_row_becomes_known(
+    price_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A `spinoff` row is keyed by its child in `security_id`; the parent's cached marking
+    history must be rebuilt when the row becomes known (#1894)."""
+    known = session_close(SESSIONS[4])
+    before = session_close(SESSIONS[3])
+    # Parent B has no action and no revised bar of its own; child A is the row's security_id.
+    assert marking_changed_ids_as_of(price_store, before, known, ["B"]) == ()
+    row = _action("spinoff", 0.5, known_at=known) | {"source_action_id": "B"}
+    insert_row(price_store, "corporate_actions", row)
+    assert marking_changed_ids_as_of(price_store, before, known, ["B"]) == ("B",)
+    assert marking_changed_ids_as_of(price_store, known, session_close(SESSIONS[5]), ["B"]) == ()

@@ -52,6 +52,7 @@ from pydantic import (
     SerializerFunctionWrapHandler,
     StrictBool,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_serializer,
     model_validator,
@@ -208,6 +209,14 @@ class StoreConfig(_ClosedConfig):
     `lock_retry_seconds` may be zero (a caller that wants "fail
     immediately, no retry" is a legitimate choice) but not negative.
 
+    `writer_lock_retry_seconds` (#2178) is the longer wait the scheduled writers
+    (`paper run`, `paper kill`, `ingest`) use in place of `lock_retry_seconds`, so a
+    reader that holds the store for a minute or two (a dashboard Data health render
+    is ~86 s) is out-waited. The sells have ~85 min of window, but the buys start
+    after `paper.sell_wait_seconds` (about 15 min before the window closes), so
+    the wrapper re-checks the submit window before every submit and sends nothing
+    once it has closed, however long a lock wait took.
+
     `memory_limit` and `threads` (#1418) cap DuckDB's memory and worker
     threads on every store connection (`store.db.configure_connection`).
     Both default to `None`, which sets nothing and keeps DuckDB's own
@@ -220,10 +229,13 @@ class StoreConfig(_ClosedConfig):
 
     path: str = "data/tradepartner.duckdb"
     lock_retry_seconds: int = Field(default=60, ge=0)
+    writer_lock_retry_seconds: int = Field(default=300, ge=0)
     lock_retry_initial_delay_seconds: float = Field(default=0.05, gt=0)
     lock_retry_max_delay_seconds: float = Field(default=1.0, gt=0)
     memory_limit: str | None = None
     threads: int | None = Field(default=None, ge=1)
+    pre_migration_backups_to_keep: int = Field(default=2, ge=1)
+    backup_disk_margin_bytes: int = Field(default=1_000_000_000, ge=0)
 
     @field_validator("memory_limit")
     @classmethod
@@ -254,6 +266,8 @@ class IngestConfig(_ClosedConfig):
 
     settle_delay_minutes: int = 60
     reference_symbol: str = "SPY"
+    # #2196: search only this many prior XNYS sessions for EDGAR-gap bars.
+    edgar_gap_lookback_sessions: int = Field(default=5, ge=0, le=20)
     # Spec default, unmeasured. On SIP history a listed name should lack a bar only on a
     # halt or suspension; measure over ~20 real sessions and tighten (T3, #86).
     max_missing_share: float = 0.05
@@ -273,6 +287,10 @@ class IngestConfig(_ClosedConfig):
     # trail is itself truncated rather than crowding out the error text.
     max_where_frames: int = Field(default=8, gt=0)
     max_where_chars: int = Field(default=1500, gt=0)
+    # #2197 (owner, warn don't refuse): `paper status` and the operations page show an
+    # owner-visible line once this many sessions have closed since the last `ok` daily
+    # EDGAR ingest run. Display only: paper keeps trading on the stale master.
+    edgar_max_age_sessions: int = Field(default=3, ge=1, le=20)
 
 
 class RatesConfig(_ClosedConfig):
@@ -373,6 +391,14 @@ class EdgarConfig(BaseModel):
     # its SGML header's ACCEPTANCE-DATETIME (the master acceptance); on a
     # mismatch each new stamp is taken from its own SGML header instead.
     stamp_sgml_check: bool = True
+    # #1686: after this many consecutive runs in which none of a CIK's three
+    # newest SGML anchors can be read (404/410 or unparseable), the CIK's new
+    # stamps are cached as the per-CIK API served them. That stamp is late by
+    # New York's UTC offset (4 h EDT, 5 h EST) or exact, never early, so the
+    # fallback delays a row and cannot look ahead. Counted per CIK on disk
+    # (`sgml_unread/v1.json`), reset by any run whose anchor reads, and
+    # reported on the run's message (`stamps from API fallback`).
+    stamp_sgml_fallback_runs: int = Field(default=3, ge=1)
     # The longer range asked once for a stamp check's header that the first
     # `header_bytes` cut before `</SEC-HEADER>` (a Form 4 with many owners).
     stamp_header_bytes: int = Field(default=65536, gt=0)
@@ -874,6 +900,10 @@ class AlpacaConfig(BaseModel):
     trading_requests_per_minute: float = Field(default=150.0, gt=0)
     trading_request_timeout_seconds: float = Field(default=30.0, gt=0)
     trading_max_retries: int = Field(default=3, ge=0)
+    #: Initial delay before retrying a failed trading request; doubles per retry.
+    trading_retry_backoff_seconds: float = Field(default=1.0, gt=0)
+    #: Maximum delay for each trading retry (default total: 1 + 2 + 4 = 7 seconds).
+    trading_retry_backoff_max_seconds: float = Field(default=8.0, gt=0)
     # Broker facts set by the recording task (T48b, docs/research/
     # 2026-10-08-alpaca-paper-facts.md). Precision: paper accepted and filled
     # 9-decimal quantities (tests/fixtures/alpaca/paper/buy_fractional.json filled
@@ -1068,6 +1098,43 @@ class BorrowConfig(_ClosedConfig):
     raw_dir: str = Field(default_factory=_default_alpaca_assets_dir)
 
 
+_MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+
+
+class IndexCheckConfig(_ClosedConfig):
+    """The known-answer index check (backtest spec amendment 2026-10-19, #1598).
+
+    **Not frozen** and part of no hypothesis: the check is never a trial and no
+    registered canonical set, fingerprint or hash includes these keys. `start_month`
+    and `end_month` are the default window (the owner, 2026-10-12);
+    `check_only_symbols` are benchmark series stored for the check alone, which no
+    trial can read (`store.benchmarks.CHECK_ONLY_IDS`), so a symbol here may not also
+    be in `benchmarks` (`Settings` refuses the overlap); `equal_benchmark` and
+    `cap_benchmark` are the series the equal- and cap-weight books are compared with.
+    `worst_months` months are listed per weighting, each with `names_per_month`
+    names plus every name whose return is at least `extreme_name_return` (the first
+    pass's 60 % screen).
+    """
+
+    start_month: str = Field(default="2019-08", pattern=_MONTH_PATTERN)
+    end_month: str = Field(default="2026-09", pattern=_MONTH_PATTERN)
+    check_only_symbols: list[str] = Field(default_factory=lambda: ["RSP"])
+    equal_benchmark: str = Field(default="RSP", min_length=1)
+    cap_benchmark: str = Field(default="SPY", min_length=1)
+    worst_months: int = Field(default=10, ge=1)
+    names_per_month: int = Field(default=5, ge=1)
+    extreme_name_return: float = Field(default=0.60, gt=0.0)
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> IndexCheckConfig:
+        if self.end_month < self.start_month:
+            raise ValueError(
+                f"index_check.end_month ({self.end_month}) must not be before "
+                f"start_month ({self.start_month})"
+            )
+        return self
+
+
 class OpenfigiConfig(_ClosedConfig):
     """Current types check; unset limits use documented keyed/keyless limits."""
 
@@ -1111,6 +1178,7 @@ class AdjustConfig(_ClosedConfig):
 
     max_prior_close_gap_sessions: int = Field(default=5, gt=0)
     max_dividend_to_prior_close: float = Field(default=1.0, gt=0, le=1.0)
+    apply_spin_offs: bool = False
 
 
 class GapConfig(_ClosedConfig):
@@ -1341,6 +1409,13 @@ class StrategyConfig(BaseModel):
     `signal_delay_sessions`, `placebo` and `placebo_seed` are the kill ladder's rung-4
     delay and rung-5 placebo (ADR 0023; backtest spec amendment #1820): post-registration
     own-section keys, inert at their defaults and read by the engine's plan step.
+
+    `hold_top_fraction` is the `momentum` buy/hold buffer (backtest spec amendment #657):
+    0.0 (the default) is no buffer; otherwise a name held at the last rebalance stays
+    while it ranks inside this share, and `top_fraction <= value <= 1` is required. A
+    value equal to `top_fraction` is normalised to 0.0, so the two spellings of "no
+    buffer" are one hypothesis. It is a rule of `equal` weighting and a
+    post-registration own-section key.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1357,6 +1432,27 @@ class StrategyConfig(BaseModel):
     signal_delay_sessions: int = Field(default=0, ge=0)
     placebo: Literal["none", "shuffle", "random_entry"] = "none"
     placebo_seed: int = Field(default=0, ge=0)
+    hold_top_fraction: float = Field(default=0.0, ge=0, le=1)
+
+    @field_validator("hold_top_fraction")
+    @classmethod
+    def _validate_hold_top_fraction(cls, value: float, info: ValidationInfo) -> float:
+        top = info.data.get("top_fraction")
+        if top is None or value == 0.0:
+            return value
+        if value == top:
+            return 0.0
+        if value < top:
+            raise ValueError(
+                f"strategy.hold_top_fraction ({value}) must be 0.0 or at least "
+                f"strategy.top_fraction ({top})"
+            )
+        if info.data.get("weighting") == "hold":
+            raise ValueError(
+                f"strategy.hold_top_fraction ({value}) is a rule of equal weighting; "
+                "strategy.weighting = 'hold' has its own exit rule"
+            )
+        return value
 
     @model_validator(mode="after")
     def _validate_formation_window(self) -> StrategyConfig:
@@ -1417,6 +1513,46 @@ class CombinedConfig(BaseModel):
     weighting: Literal["equal"] = "equal"
 
 
+class PortfolioConfig(_ClosedConfig):
+    """The signed-book keys, the frozen section `portfolio` (backtest spec amendment
+    #1872, item 1).
+
+    `side` selects a long-only or a long/short book. `gross_exposure` is the sum of the
+    absolute target weights, in `(0, 1.0]`: the upper bound is ADR 0024 item 4's
+    placeholder, "so a backtest never tests what paper cannot hold". `net_exposure` is
+    the sum of the signed target weights, in `[-gross, gross]` and equal to
+    `gross_exposure` under `long_only`. `short_min_price` is the shortability proxy's
+    price floor in dollars (item 3; Alpaca's own $5 maintenance line), and
+    `short_cover_weight` the drift cover's short-value share of equity (item 7).
+
+    The section is listed by no family and is a post-registration section under the
+    2026-10-09 and #1792 rules, so every key is left out of the canonical set and the
+    fingerprint at its default and no stored registration moves.
+    """
+
+    side: Literal["long_only", "long_short"] = "long_only"
+    gross_exposure: float = Field(default=1.0, gt=0, le=1.0)
+    net_exposure: float = Field(default=1.0, ge=-1.0, le=1.0)
+    short_min_price: float = Field(default=5.0, gt=0)
+    short_cover_weight: float = Field(default=0.10, gt=0, le=1.0)
+
+    @model_validator(mode="after")
+    def _validate_exposures(self) -> PortfolioConfig:
+        """`net_exposure` in `[-gross, gross]`, equal to `gross_exposure` under
+        `long_only` (spec item 1)."""
+        if not (-self.gross_exposure <= self.net_exposure <= self.gross_exposure):
+            raise ValueError(
+                f"portfolio.net_exposure ({self.net_exposure}) must be in "
+                f"[{-self.gross_exposure}, {self.gross_exposure}]"
+            )
+        if self.side == "long_only" and self.net_exposure != self.gross_exposure:
+            raise ValueError(
+                f"portfolio.net_exposure ({self.net_exposure}) must equal "
+                f"portfolio.gross_exposure ({self.gross_exposure}) under 'long_only'"
+            )
+        return self
+
+
 # --- The family registry (ADR 0014; T128) ------------------------------------
 #
 # One table from which every per-family table derives. Each entry pins:
@@ -1464,8 +1600,15 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         paper_ready=True,
         # `no_turnover` and its two counts are B10's screen, reported only when
         # `strategy.turnover_top_fraction` is below 1.0 (backtest spec amendment #1358).
-        exclusion_reasons=("no_history", "no_turnover"),
-        count_names=("n_excluded_no_history", "n_screened", "n_excluded_no_turnover"),
+        exclusion_reasons=("no_history", "no_turnover", "no_t0_bar"),
+        # `n_retained` is the buffer's count, reported only when `strategy.hold_top_fraction`
+        # is non-zero (backtest spec amendment #657).
+        count_names=(
+            "n_excluded_no_history",
+            "n_screened",
+            "n_excluded_no_turnover",
+            "n_retained",
+        ),
         benchmark="MTUM",
         sweepable_keys=(
             "strategy.formation_months",
@@ -1474,6 +1617,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
             "strategy.weighting",
             "strategy.signal_total_return",
             "strategy.turnover_top_fraction",
+            "strategy.hold_top_fraction",
         ),
     ),
     "oracle": FamilySpec(
@@ -1482,7 +1626,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         parent=None,
         engine_ready=True,
         paper_ready=True,
-        exclusion_reasons=("no_history",),
+        exclusion_reasons=("no_history", "no_t0_bar"),
         count_names=("n_excluded_no_history",),
         benchmark="MTUM",
         sweepable_keys=(),
@@ -1495,7 +1639,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         # Paper-ready by the owner's word in ADR 0017 part D (ADR 0014 point 5, T152).
         paper_ready=True,
         # The four reasons `gross_profitability` may report (`backtest/signals.py:225`).
-        exclusion_reasons=("sector", "no_facts", "stale_facts", "malformed"),
+        exclusion_reasons=("sector", "no_facts", "stale_facts", "malformed", "no_t0_bar"),
         # The six count names of spec amendment #720 (T85d).
         count_names=(
             "n_ranked",
@@ -1529,6 +1673,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
             "stale_facts",
             "malformed",
             "one_signal_only",
+            "no_t0_bar",
         ),
         # Both sub-signals' counts plus `n_combined` (T130).
         count_names=(
@@ -1593,6 +1738,14 @@ class CostsConfig(BaseModel):
     `per_side_bps`, `impact_coeff` scales `sqrt(notional / ADV)` market impact, and
     `adv_sessions` is the window (in XNYS sessions) over which ADV is measured. Both new
     rate keys are `ge=0`; `adv_sessions` must hold at least one session.
+
+    Amendment 2026-10-19 (#1872) item 6 (T221): `borrow_bps_per_year` is the declared
+    headline borrow fee on a short book's value, in basis points a year (default 0.0, so
+    a long-only book pays none), and `borrow_sensitivity_bps` lists further rates, each
+    run as one more reported-only book. Both are non-negative; a `long_short` file is
+    refused `refused_borrow_rate` at registration unless its headline is above 0 and
+    {0, 30, 300} is inside the headline and the sensitivities together. The engine reads
+    them at T222.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1606,6 +1759,8 @@ class CostsConfig(BaseModel):
     sensitivity_per_side_bps: list[Annotated[float, Field(ge=0)]] = Field(
         default_factory=lambda: [0.0, 30.0, 60.0, 100.0]
     )
+    borrow_bps_per_year: float = Field(default=0.0, ge=0)
+    borrow_sensitivity_bps: list[Annotated[float, Field(ge=0)]] = Field(default_factory=list)
 
 
 class HoldoutConfig(BaseModel):
@@ -1985,6 +2140,20 @@ class SmallAccountConfig(BaseModel):
         return value
 
 
+class ShortRiskConfig(BaseModel):
+    """The three short-side `risk.*` keys (ADR 0010's amendment of 2026-10-19; paper
+    spec amendment #1872 items 7 and 12; plan T231). `RiskConfig` carries them like
+    `small_account`, outside its `model_fields`, so a window frozen before T231 still
+    loads at these defaults. The fractions are shares of equity in [0, 1]; non-finite
+    values and unknown keys are refused."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
+
+    max_short_weight: float = Field(default=0.05, ge=0, le=1)
+    net_exposure_band: float = Field(default=0.10, ge=0, le=1)
+    min_short_equity: float = Field(default=2000.0, ge=0)
+
+
 class RiskConfig(BaseModel):
     """The Phase 4 risk rules, ADR 0010 point 1: every limit is a named key here, the
     whole section frozen into the paper window at `paper start` and read from the
@@ -2022,25 +2191,53 @@ class RiskConfig(BaseModel):
     model_config = _PHASE3_MODEL_CONFIG
 
     _small_account: SmallAccountConfig = PrivateAttr(default_factory=SmallAccountConfig)
+    _short: ShortRiskConfig = PrivateAttr(default_factory=ShortRiskConfig)
 
     @model_validator(mode="wrap")
     @classmethod
     def _read_small_account(cls, data: Any, handler: Any) -> Any:
-        """Split `small_account` off the input before the field validation sees it."""
-        if isinstance(data, dict) and "small_account" in data:
-            rest = {k: v for k, v in data.items() if k != "small_account"}
-            section = SmallAccountConfig.model_validate(data["small_account"])
-            built = handler(rest)
-            built._small_account = section
-            return built
-        return handler(data)
+        """Split `small_account` and the three short keys (T231) off the input
+        before the field validation sees them."""
+        if not isinstance(data, dict):
+            return handler(data)
+        short_keys = {k: data[k] for k in ShortRiskConfig.model_fields if k in data}
+        if "small_account" not in data and not short_keys:
+            return handler(data)
+        rest = {k: v for k, v in data.items() if k != "small_account" and k not in short_keys}
+        section = (
+            SmallAccountConfig.model_validate(data["small_account"])
+            if "small_account" in data
+            else SmallAccountConfig()
+        )
+        short = ShortRiskConfig.model_validate(short_keys)
+        built = handler(rest)
+        built._small_account = section
+        built._short = short
+        return built
 
     @model_serializer(mode="wrap")
     def _write_small_account(self, handler: SerializerFunctionWrapHandler) -> Any:
-        """The dump carries `small_account`, so `paper start` freezes it."""
+        """The dump carries `small_account` and the short keys, so `paper start`
+        freezes them."""
         dumped = handler(self)
         dumped["small_account"] = self._small_account.model_dump()
+        dumped.update(self._short.model_dump())
         return dumped
+
+    @property
+    def max_short_weight(self) -> float:
+        """A short name's most held value over equity (ADR 0010 amendment 2026-10-19)."""
+        return self._short.max_short_weight
+
+    @property
+    def net_exposure_band(self) -> float:
+        """How far the net after a rebalance may sit from the window's `net_exposure`."""
+        return self._short.net_exposure_band
+
+    @property
+    def min_short_equity(self) -> float:
+        """The account equity below which a short open halts."""
+        return self._short.min_short_equity
 
     @property
     def small_account(self) -> SmallAccountConfig:
@@ -2071,6 +2268,24 @@ class RiskConfig(BaseModel):
     # so a ~10% relative gap passes; a larger one halts the book, as any mismatch
     # does. A fraction of the expected cash, in [0, 1].
     cash_in_lieu_tolerance: float = Field(default=0.10, ge=0, le=1)
+    # #1762 (paper spec amendment 2026-10-19 items 4 and 10; T249): the trading
+    # sessions after a merger's `payable_date` (else its `effective_date`) that its
+    # cash may still post; the first reconciliation after them checks the due once.
+    # A window frozen before T249 lacks the key and `frozen_risk` reads it at 5.
+    reconcile_merger_lag_sessions: int = Field(default=5, ge=0)
+    # #2183: cash may arrive after an ok reconciliation on the ex-date.
+    reconcile_dividend_credit_sessions: int = Field(default=25, ge=1, le=55)
+    # #2183: up to this many unmatched dividend dues are searched exhaustively (2^n
+    # subsets); more need a proven-unique cent-sum fit or the book halts.
+    reconcile_dividend_exhaustive_dues: int = Field(default=8, ge=1, le=12)
+    # #2183: the cent-sum states that uniqueness proof may visit; exhausting them
+    # fails closed (a cash mismatch), keeping a contrived book bounded.
+    reconcile_dividend_subset_states: int = Field(default=10_000, ge=1)
+    # #411: the most a delisted holding's late cash may exceed its last stored close x
+    # quantity (a share of it, in [0, 1]): a cash deal trades below its price, so the
+    # real credit can sit above the stale close; more is not this position's proceeds.
+    # A window frozen before the key lacks it and `frozen_risk` reads it at 0.10.
+    delisting_cash_max_premium: float = Field(default=0.10, ge=0, le=1)
 
 
 # `paper.min_rebalances` per cadence (ADR 0017 part C and open question 2, the paper
@@ -2154,6 +2369,14 @@ class PaperConfig(BaseModel):
     #: with the window's length. Read at run time, never frozen; `paper report`
     #: keeps the full window (its `paper_reports` row is the record).
     status_slippage_sessions: int = Field(default=20, gt=0)
+    #: The fill-price sanity band (#1981): a fill journaled by a run whose price is
+    #: further than this fraction from the order's reference price (the close of S-1,
+    #: split-adjusted) halts the run with a `fill_price_outside_band` fault. 0.25 is
+    #: conservative: an overnight gap past a quarter of the prior close is rare for a
+    #: liquid US equity, so a normal opening gap never trips it, while a 100x or 0.01x
+    #: fill (a broker-side bad print, a unit error) is far outside. Read at run time,
+    #: never frozen, so the open windows see it.
+    max_fill_price_deviation: float = Field(default=0.25, gt=0, lt=1)
 
     @field_validator("min_rebalances")
     @classmethod
@@ -2203,6 +2426,9 @@ class AlertsConfig(BaseModel):
 
     channels: list[AlertChannel] = Field(default_factory=lambda: list(_DEFAULT_ALERT_CHANNELS))
     delivery_timeout_seconds: float = Field(default=10.0, gt=0)
+    # The off-Mac heartbeat ping (#2155, `heartbeat.py`): bounds the one HTTP request
+    # `paper run` and `ingest` make on completion, so a dead network cannot hold a run.
+    heartbeat_timeout_seconds: float = Field(default=5.0, gt=0)
 
     @field_validator("channels")
     @classmethod
@@ -2235,6 +2461,38 @@ class DashboardConfig(BaseModel):
     model_config = _PHASE3_MODEL_CONFIG
 
     page_row_limit: int = Field(default=500, gt=0)
+
+
+class UiConfig(_ClosedConfig):
+    """What the Home and Book pages show (plan T273, #2170); display only, nothing
+    here reaches a run.
+
+    `next_run_time_et` is the clock time (HH:MM, America/New_York) the status line
+    says the next run happens: the schedule itself lives in launchd
+    (docs/runbooks/scheduling.md), so this is text to keep beside it. `holdings_rows`
+    is how many names a book card lists.
+
+    The Book page's "Stop this book now" (plan T277, #2268; ADR 0018 section 2 and
+    its 2026-10-26 amendment): `max_reason_chars` caps the typed reason (as the
+    web app's `webapp.max_reason_chars`); the page waits on the `paper kill`
+    subprocess for `kill_wait_seconds`, which `None` makes
+    `store.writer_lock_retry_seconds` plus `kill_wait_margin_seconds` (interpreter
+    start plus one retry delay). A set value must exceed that sum, or a kill still
+    waiting on the store would be reported as not confirmed (`Settings`, at load).
+    """
+
+    next_run_time_et: str = "08:05"
+    holdings_rows: int = Field(default=5, gt=0)
+    max_reason_chars: int = Field(default=500, gt=0)
+    kill_wait_seconds: int | None = Field(default=None, gt=0)
+    kill_wait_margin_seconds: int = Field(default=30, gt=0)
+
+    @field_validator("next_run_time_et")
+    @classmethod
+    def _hh_mm(cls, value: str) -> str:
+        if re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", value) is None:
+            raise ValueError("ui.next_run_time_et must be HH:MM on a 24-hour clock")
+        return value
 
 
 # The 8-K items a packet keeps, in priority order (research-labeling amendment
@@ -2395,6 +2653,13 @@ class Settings(BaseSettings):
     # #1506 (T171c): the borrow-status snapshot, after `health` for the same reason.
     borrow: BorrowConfig = Field(default_factory=BorrowConfig)
     openfigi: OpenfigiConfig = Field(default_factory=OpenfigiConfig)
+    # #1598 (T243): the known-answer index check; not frozen, part of no hypothesis.
+    index_check: IndexCheckConfig = Field(default_factory=IndexCheckConfig)
+    # T219 (backtest spec amendment #1872): the signed-book section, after the other
+    # appended sections for the same reason.
+    portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
+    # T273 (#2170): the Home page's display keys, last so no other section shifts.
+    ui: UiConfig = Field(default_factory=UiConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
@@ -2418,6 +2683,12 @@ class Settings(BaseSettings):
     alert_email_to: SecretStr | None = Field(default=None)
     # Optional sender for the email channel; the SMTP login when unset (#404).
     alert_email_from: SecretStr | None = Field(default=None)
+    # Optional dead-man's-switch URLs (#2155; healthchecks.io style), one check per job
+    # because the schedules differ: `paper run` and `ingest` ping theirs on completion.
+    # Secrets (the URL is the credential), so the type-driven `secret_values` scrub
+    # covers them. Env `ALERT_HEARTBEAT_URL_PAPER` / `ALERT_HEARTBEAT_URL_INGEST`.
+    alert_heartbeat_url_paper: SecretStr | None = Field(default=None)
+    alert_heartbeat_url_ingest: SecretStr | None = Field(default=None)
     # Research labeling (docs/specs/research-labeling.md req 17): the vendor key, read
     # only by `research/models.py`, redacted by `secret_values`; with it absent the
     # real model client cannot be built (ADR 0013 point 3 (e)).
@@ -2447,6 +2718,33 @@ class Settings(BaseSettings):
         # raises a plain `ValueError` whose message names only the bad key, never a
         # secret (code-review finding on #952).
         self._validate_lab_sweepable_keys()
+        # Also a plain attribute read and raise, for the same reason (T243).
+        self._validate_check_only_symbols()
+        # And again (T277): the kill wait needs `store` and `ui` together.
+        self._validate_kill_wait()
+
+    def _validate_kill_wait(self) -> None:
+        """A set `ui.kill_wait_seconds` must exceed `paper kill`'s worst-case store
+        wait (`store.writer_lock_retry_seconds`) plus `ui.kill_wait_margin_seconds`
+        (ADR 0018, amendment 2026-10-26)."""
+        floor = self.store.writer_lock_retry_seconds + self.ui.kill_wait_margin_seconds
+        if self.ui.kill_wait_seconds is not None and self.ui.kill_wait_seconds <= floor:
+            raise ValueError(
+                f"ui.kill_wait_seconds ({self.ui.kill_wait_seconds}) must be above "
+                f"store.writer_lock_retry_seconds plus ui.kill_wait_margin_seconds ({floor}): "
+                "a shorter bound reports a kill still waiting on the store as not confirmed"
+            )
+
+    def _validate_check_only_symbols(self) -> None:
+        """`index_check.check_only_symbols` may not overlap `benchmarks` (backtest
+        spec amendment #1598, item 3): a check-only series must stay out of every
+        trial's reach, and `benchmarks` is the trial list."""
+        overlap = sorted(set(self.index_check.check_only_symbols) & set(self.benchmarks))
+        if overlap:
+            raise ValueError(
+                f"index_check.check_only_symbols {overlap} also in benchmarks: a check-only "
+                "series must not be a trial benchmark"
+            )
 
     def _validate_lab_sweepable_keys(self) -> None:
         """`lab.sweepable_keys` (strategy-lab spec req 1; Amendment 2026-10-05 (#952,
@@ -2495,6 +2793,15 @@ class Settings(BaseSettings):
                     "store) would reach nobody (#366 Q22 (iii), #544). Set the "
                     "missing variable(s), add 'macos', or remove 'email'."
                 )
+
+
+def kill_wait_seconds(settings: Settings) -> int:
+    """How long the Book page waits on a `paper kill` subprocess (`UiConfig`):
+    `ui.kill_wait_seconds`, or by default `store.writer_lock_retry_seconds` plus
+    `ui.kill_wait_margin_seconds`."""
+    if settings.ui.kill_wait_seconds is not None:
+        return settings.ui.kill_wait_seconds
+    return settings.store.writer_lock_retry_seconds + settings.ui.kill_wait_margin_seconds
 
 
 def get_settings() -> Settings:

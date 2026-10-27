@@ -296,6 +296,33 @@ def _insert_price_fact(
     )
 
 
+def _insert_action_fact(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    security_id: str,
+    action_type: str,
+    known_at: datetime,
+    ingested_at: datetime,
+) -> None:
+    insert_row(
+        conn,
+        "corporate_actions",
+        {
+            "security_id": security_id,
+            "action_type": action_type,
+            "ex_date": known_at.date(),
+            "ratio_or_amount": 2.0,
+            "announced_at": None,
+            "source_action_id": "",
+            "cancelled": False,
+            "known_at": known_at,
+            "ingested_at": ingested_at,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
+
+
 # --- counted_trial -------------------------------------------------------------
 
 
@@ -462,6 +489,41 @@ def test_vintage_is_measured_at_the_trials_own_cutoff(
     trial = lab_queries.counted_trial(lab_store, record.hypothesis_id, sweep.sweep_id)
     assert trial is not None and lab_queries.is_stale(lab_store, trial)
     assert lab_queries.sweep_state(lab_store, sweep.sweep_id).state == "incomplete (stale)"
+
+
+def test_a_spinoff_row_stales_only_a_trial_that_reads_spin_offs(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """T211d (spec amendment #1894, item 6): `_is_current` reads the trial's own
+    frozen `adjust.apply_spin_offs`, so a `spinoff` row known in-window stales a
+    `true` variant's counted trial while a `false` one stays current. The
+    planning read's shared `vintages` memo is keyed by `(cutoff, spin_offs)`, so
+    a `false` variant's cut does not stand in for a `true` one's."""
+    sweep = _sweep(lab_store, settings, n_variants=2)
+    plain = _variant(lab_store, settings, sweep, 1)
+    reading = _variant(
+        lab_store, settings, sweep, 2, params=_params(**{"adjust.apply_spin_offs": True})
+    )
+    vintage = registry.data_vintage(lab_store, _CUTOFF)
+    assert vintage is not None
+    _insert_trial(lab_store, plain.hypothesis_id, data_vintage_value=vintage)
+    _insert_trial(lab_store, reading.hypothesis_id, data_vintage_value=vintage)
+    plain_trial = lab_queries.counted_trial(lab_store, plain.hypothesis_id, sweep.sweep_id)
+    reading_trial = lab_queries.counted_trial(lab_store, reading.hypothesis_id, sweep.sweep_id)
+    assert plain_trial is not None and not lab_queries.is_stale(lab_store, plain_trial)
+    assert reading_trial is not None and not lab_queries.is_stale(lab_store, reading_trial)
+    _insert_action_fact(
+        lab_store,
+        security_id="SEC_SPINOFF_READ",
+        action_type="spinoff",
+        known_at=datetime(2020, 6, 30, 20, 0, tzinfo=UTC),
+        ingested_at=vintage + timedelta(days=3),
+    )
+    assert not lab_queries.is_stale(lab_store, plain_trial)
+    assert lab_queries.is_stale(lab_store, reading_trial)
+    shared: dict[tuple[datetime, bool], datetime | None] = {}
+    assert lab_queries._is_current(lab_store, plain_trial, _checkout(), shared)
+    assert not lab_queries._is_current(lab_store, reading_trial, _checkout(), shared)
 
 
 # --- the counting rule, branch by branch ---------------------------------------

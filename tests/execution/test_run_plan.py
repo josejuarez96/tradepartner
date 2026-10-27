@@ -179,7 +179,7 @@ class Env:
             code_version="test",
             started_at=started,
             frozen_json=json.dumps(values, sort_keys=True),
-            frozen_sha256="0" * 64,
+            frozen_sha256=registry.params_sha256(values),
             known_at=started,
             ingested_at=started,
         )

@@ -300,8 +300,13 @@ def candidate_rows(
     York midnight or a session close, where an earlier correction could move
     a date or session a stored column derives from), and how many have
     `known_at` in ``(t, t + CORRECTION_REACH]`` for some instant ``t``; those
-    last are also returned grouped by table and `known_at`. With no window,
-    every count is zero.
+    last are also returned grouped by table and `known_at`. The reach check
+    also covers rows before ``window_start`` (#1524): a run on the first
+    session reads at ``close(S-1)`` and a window started on a non-session day
+    has a ``started_at`` before its first session, so a pre-window row within
+    reach of the earliest instant fails too. Only the row and refusal counts
+    stay on the window's side of ``window_start``. With no window, every count
+    is zero.
     """
     counts: dict[str, TableCandidates] = {}
     failing: list[InReachRow] = []
@@ -310,17 +315,21 @@ def candidate_rows(
         if window_start is None:
             counts[table] = TableCandidates(0, 0, 0)
             continue
+        window_open = _ny_midnight(window_start)
+        # #1524: scan from the earliest read instant when it precedes the window
+        lower = min([window_open, *ordered])
         groups = conn.execute(
             f"SELECT known_at, count(*) FROM {table} WHERE known_at >= ? "
             "GROUP BY known_at ORDER BY known_at",
-            [_ny_midnight(window_start)],
+            [lower],
         ).fetchall()
         rows = refusals = reach = 0
         for raw, n in groups:
             stamp = _utc(raw, "known_at")
-            rows += n
-            if _near_boundary(stamp):
-                refusals += n
+            if stamp >= window_open:
+                rows += n
+                if _near_boundary(stamp):
+                    refusals += n
             hit = _in_reach(stamp, ordered)
             if hit is not None:
                 reach += n

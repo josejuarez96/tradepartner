@@ -129,6 +129,7 @@ def test_the_reasons_are_spelt_as_the_spec_names_them() -> None:
         "owner_settled_unknown",
         *_SKIP_REASONS,
         *_SHORT_SKIP_REASONS,
+        schema.SKIP_RESTRICTED_REASON,
     )
     assert expected == schema.ORDER_EVENT_REASONS
 

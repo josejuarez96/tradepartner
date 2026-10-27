@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import get_args
@@ -37,6 +37,7 @@ from tradepartner.config import (
     ExecutionConfig,
     HypothesisFamily,
     PaperConfig,
+    PortfolioConfig,
     ProfitabilityConfig,
     ReferenceName,
     RiskConfig,
@@ -45,11 +46,14 @@ from tradepartner.config import (
     _default_env_file,
     _settings_has_key,
     clean_message,
+    kill_wait_seconds,
     paper_key_variable_names,
     parse_reference_name,
     render_validation_errors,
     secret_values,
 )
+from tradepartner.execution.reconcile_run import frozen_risk
+from tradepartner.store.journal import PaperWindowRow
 from tradepartner.store.schema import DEFAULT_BOOK_ID
 
 
@@ -94,6 +98,19 @@ def test_store_defaults() -> None:
     s = _settings()
     assert s.store.path == "data/tradepartner.duckdb"
     assert s.store.lock_retry_seconds == 60
+    assert s.store.pre_migration_backups_to_keep == 2
+    assert s.store.backup_disk_margin_bytes == 1_000_000_000
+
+
+def test_pre_migration_backup_config_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STORE__PRE_MIGRATION_BACKUPS_TO_KEEP", "1")
+    monkeypatch.setenv("STORE__BACKUP_DISK_MARGIN_BYTES", "0")
+    assert _settings().store.pre_migration_backups_to_keep == 1
+    assert _settings().store.backup_disk_margin_bytes == 0
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, store={"pre_migration_backups_to_keep": 0})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, store={"backup_disk_margin_bytes": -1})
 
 
 def test_calendar_defaults() -> None:
@@ -108,6 +125,26 @@ def test_ingest_defaults() -> None:
     assert s.ingest.reference_symbol == "SPY"
     assert s.ingest.max_missing_share == pytest.approx(0.05)
     assert s.ingest.max_dark_share == pytest.approx(1.0)  # #796: off until measured
+    assert s.ingest.edgar_gap_lookback_sessions == 5
+
+
+@pytest.mark.parametrize("value", [-1, 21])
+def test_edgar_gap_lookback_is_bounded(value: int) -> None:
+    with pytest.raises(ValidationError, match="edgar_gap_lookback_sessions"):
+        Settings(_env_file=None, ingest={"edgar_gap_lookback_sessions": value})
+
+
+def test_edgar_max_age_sessions_default_and_bounds() -> None:
+    assert _settings().ingest.edgar_max_age_sessions == 3
+    assert (
+        Settings(
+            _env_file=None, ingest={"edgar_max_age_sessions": 20}
+        ).ingest.edgar_max_age_sessions
+        == 20
+    )
+    for value in (0, 21, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ingest={"edgar_max_age_sessions": value})
 
 
 def test_fred_rate_defaults_and_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1233,6 +1270,7 @@ def test_lab_defaults() -> None:
         "strategy.weighting",
         "strategy.signal_total_return",
         "strategy.turnover_top_fraction",
+        "strategy.hold_top_fraction",
         "schedule.rebalance_cadence",
         "schedule.signal_anchor",
     ]
@@ -1470,6 +1508,7 @@ def test_default_sweepable_keys_derives_at_today_s_value() -> None:
         "strategy.weighting",
         "strategy.signal_total_return",
         "strategy.turnover_top_fraction",
+        "strategy.hold_top_fraction",
         "schedule.rebalance_cadence",
         "schedule.signal_anchor",
     )
@@ -1487,8 +1526,13 @@ def test_momentum_family_spec() -> None:
     assert spec.engine_ready is True
     assert spec.paper_ready is True
     # B10's screen (#1358): its reason and counts, reported only below 1.0.
-    assert spec.exclusion_reasons == ("no_history", "no_turnover")
-    assert spec.count_names == ("n_excluded_no_history", "n_screened", "n_excluded_no_turnover")
+    assert spec.exclusion_reasons == ("no_history", "no_turnover", "no_t0_bar")
+    assert spec.count_names == (
+        "n_excluded_no_history",
+        "n_screened",
+        "n_excluded_no_turnover",
+        "n_retained",
+    )
     assert spec.benchmark == "MTUM"
     assert spec.sweepable_keys == (
         "strategy.formation_months",
@@ -1497,6 +1541,7 @@ def test_momentum_family_spec() -> None:
         "strategy.weighting",
         "strategy.signal_total_return",
         "strategy.turnover_top_fraction",
+        "strategy.hold_top_fraction",
     )
 
 
@@ -1526,7 +1571,13 @@ def test_profitability_family_spec() -> None:
     assert spec.parent is None
     assert spec.engine_ready is True
     assert spec.paper_ready is True
-    assert spec.exclusion_reasons == ("sector", "no_facts", "stale_facts", "malformed")
+    assert spec.exclusion_reasons == (
+        "sector",
+        "no_facts",
+        "stale_facts",
+        "malformed",
+        "no_t0_bar",
+    )
     assert spec.count_names == (
         "n_ranked",
         "n_excluded_no_facts",
@@ -1595,6 +1646,7 @@ def test_combined_family_spec() -> None:
         "stale_facts",
         "malformed",
         "one_signal_only",
+        "no_t0_bar",
     )
     assert spec.count_names == (
         "n_excluded_no_history",
@@ -1827,6 +1879,8 @@ def test_alpaca_trading_defaults() -> None:
     assert a.trading_requests_per_minute == pytest.approx(150.0)
     assert a.trading_request_timeout_seconds == pytest.approx(30.0)
     assert a.trading_max_retries == 3
+    assert a.trading_retry_backoff_seconds == pytest.approx(1.0)
+    assert a.trading_retry_backoff_max_seconds == pytest.approx(8.0)
     # Broker facts the recording task (T48b) set: 9 decimals, accepted and filled
     # on paper (tests/fixtures/alpaca/paper/buy_fractional.json, flatten.json);
     # 128 characters, Alpaca's documented `client_order_id` limit.
@@ -1865,6 +1919,10 @@ def test_alpaca_broker_facts_may_still_be_unset() -> None:
         {"trading_requests_per_minute": 0},
         {"trading_request_timeout_seconds": 0},
         {"trading_max_retries": -1},
+        {"trading_retry_backoff_seconds": 0},
+        {"trading_retry_backoff_max_seconds": 0},
+        {"trading_retry_backoff_seconds": float("inf")},
+        {"trading_retry_backoff_max_seconds": float("inf")},
         {"quantity_decimals": -1},
         {"client_order_id_max_length": 0},
         {"trading_request_timeout_seconds": float("inf")},
@@ -1900,6 +1958,47 @@ def test_risk_defaults_match_adr_0010() -> None:
     # against (fractional remainder x the reference price); the ex-date valuation
     # sits below the pre-ex close, so ~10% passes and more halts.
     assert r.cash_in_lieu_tolerance == pytest.approx(0.10)
+    # #1762 (T249): the sessions after a merger's payable date its cash may post.
+    assert r.reconcile_merger_lag_sessions == 5
+    assert r.reconcile_dividend_credit_sessions == 25
+    assert r.reconcile_dividend_exhaustive_dues == 8
+    assert r.reconcile_dividend_subset_states == 10_000
+    # #411: the premium a delisted holding's late cash may carry over its last close.
+    assert r.delisting_cash_max_premium == pytest.approx(0.10)
+
+
+@pytest.mark.parametrize("value", [-1, 1.5])
+def test_risk_reconcile_merger_lag_sessions_is_a_whole_count_of_at_least_zero(
+    value: float,
+) -> None:
+    """Paper spec amendment #1762 item 10: 0 is allowed (any payment after the
+    payable date halts, open question 23 (b)); a negative or fractional count is not."""
+    assert (
+        Settings(
+            _env_file=None, risk={"reconcile_merger_lag_sessions": 0}
+        ).risk.reconcile_merger_lag_sessions
+        == 0
+    )
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={"reconcile_merger_lag_sessions": value})
+
+
+@pytest.mark.parametrize("value", [0, 56, 1.5])
+def test_risk_reconcile_dividend_credit_sessions_bounds(value: float) -> None:
+    assert (
+        Settings(
+            _env_file=None, risk={"reconcile_dividend_credit_sessions": 1}
+        ).risk.reconcile_dividend_credit_sessions
+        == 1
+    )
+    assert (
+        Settings(
+            _env_file=None, risk={"reconcile_dividend_credit_sessions": 55}
+        ).risk.reconcile_dividend_credit_sessions
+        == 55
+    )
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={"reconcile_dividend_credit_sessions": value})
 
 
 def test_risk_max_skip_share_defaults_to_a_tenth() -> None:
@@ -1940,6 +2039,7 @@ def test_alpaca_cash_in_lieu_max_lag_sessions_default() -> None:
         "whole_share_price_buffer",
         "max_unspent_cash_fraction",
         "cash_in_lieu_tolerance",
+        "delisting_cash_max_premium",
     ],
 )
 @pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])
@@ -2838,3 +2938,386 @@ def test_risk_small_account_refuses_an_int_or_other_spelling_in_the_section(
 ) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, risk={"small_account": {"enabled": value}})
+
+
+# --- the short-side risk keys (ADR 0010 amendment 2026-10-19; paper spec #1872 items 7, 12;
+# T231) ---------------------------------------------------------------------------------------
+
+_SHORT_KEYS = {"max_short_weight": 0.05, "net_exposure_band": 0.10, "min_short_equity": 2000.0}
+
+
+def _short_values(risk: RiskConfig) -> dict[str, float]:
+    return {key: getattr(risk, key) for key in _SHORT_KEYS}
+
+
+def test_short_risk_keys_default_to_the_adrs_placeholders() -> None:
+    assert _short_values(RiskConfig()) == _SHORT_KEYS
+    assert _short_values(_settings().risk) == _SHORT_KEYS
+
+
+def test_short_risk_keys_are_set_through_the_risk_section() -> None:
+    values = {"max_short_weight": 0.03, "net_exposure_band": 0.2, "min_short_equity": 5000.0}
+    assert _short_values(Settings(_env_file=None, risk=values).risk) == values
+    assert _short_values(RiskConfig(**values)) == values
+
+
+def test_short_risk_keys_load_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RISK__MAX_SHORT_WEIGHT", "0.04")
+    monkeypatch.setenv("RISK__NET_EXPOSURE_BAND", "0.15")
+    monkeypatch.setenv("RISK__MIN_SHORT_EQUITY", "2500")
+    assert _short_values(Settings(_env_file=None).risk) == {
+        "max_short_weight": 0.04,
+        "net_exposure_band": 0.15,
+        "min_short_equity": 2500.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("max_short_weight", -0.01),
+        ("max_short_weight", 1.01),  # a fraction of equity, in [0, 1]
+        ("max_short_weight", float("nan")),
+        ("net_exposure_band", -0.01),
+        ("net_exposure_band", 1.01),
+        ("net_exposure_band", float("inf")),
+        ("min_short_equity", -1.0),
+        ("min_short_equity", float("nan")),
+        ("min_short_equity", float("inf")),
+    ],
+)
+def test_short_risk_keys_refuse_out_of_range_and_non_finite_values(key: str, value: float) -> None:
+    """The key loads in range (so the refusal is the bound, not an unknown key)."""
+    assert (
+        getattr(Settings(_env_file=None, risk={key: _SHORT_KEYS[key]}).risk, key)
+        == (_SHORT_KEYS[key])
+    )
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={key: value})
+
+
+def test_the_dump_carries_the_short_keys_so_paper_start_freezes_them() -> None:
+    dumped = RiskConfig().model_dump()
+    assert {key: dumped[key] for key in _SHORT_KEYS} == _SHORT_KEYS
+    assert RiskConfig.model_validate(dumped) == RiskConfig()
+
+
+def _window(frozen: dict[str, object]) -> PaperWindowRow:
+    stamp = datetime(2026, 10, 19, 13, 0, tzinfo=UTC)
+    return PaperWindowRow(
+        window_id=1,
+        hypothesis_id=1,
+        first_rebalance_session=date(2026, 10, 20),
+        account_id="PA1",
+        starting_cash=10_000.0,
+        starting_equity=10_000.0,
+        code_version="test",
+        started_at=stamp,
+        frozen_json=json.dumps(frozen, sort_keys=True),
+        frozen_sha256="0" * 64,
+        known_at=stamp,
+        ingested_at=stamp,
+    )
+
+
+def _frozen_today(**overrides: object) -> dict[str, object]:
+    """Today's default `risk.*` section as `paper start` freezes it."""
+    frozen: dict[str, object] = {f"risk.{k}": v for k, v in RiskConfig().model_dump().items()}
+    frozen.update({f"risk.{k}": v for k, v in overrides.items()})
+    return frozen
+
+
+def test_a_window_frozen_before_t231_reads_the_short_keys_at_their_defaults() -> None:
+    """A `frozen_json` without the three keys (every window open today) is read,
+    never refused, and is the default section (spec item 12): the running
+    long-only books keep running."""
+    frozen = {k: v for k, v in _frozen_today().items() if k[len("risk.") :] not in _SHORT_KEYS}
+    read = frozen_risk(_window(frozen))
+    assert _short_values(read) == _SHORT_KEYS
+    assert read == RiskConfig()
+
+
+def test_a_window_frozen_with_short_keys_reads_them_back() -> None:
+    values = {"max_short_weight": 0.03, "net_exposure_band": 0.2, "min_short_equity": 5000.0}
+    read = frozen_risk(_window(_frozen_today(**values)))
+    assert _short_values(read) == values
+    assert read != RiskConfig()
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("max_short_weight", 1.5), ("net_exposure_band", -0.1), ("min_short_equity", -1.0)],
+)
+def test_a_window_frozen_with_a_bad_short_key_is_refused(key: str, value: float) -> None:
+    """The same key in range reads back; out of range, `frozen_risk` refuses."""
+    assert getattr(frozen_risk(_window(_frozen_today())), key) == _SHORT_KEYS[key]
+    with pytest.raises(ValueError, match=key):
+        frozen_risk(_window(_frozen_today(**{key: value})))
+
+
+# --- the known-answer index check (#1598, T243) ---------------------------------
+
+
+def test_index_check_defaults_are_the_amendments_eight_keys() -> None:
+    cfg = Settings(_env_file=None).index_check
+    assert cfg.model_dump() == {
+        "start_month": "2019-08",
+        "end_month": "2026-09",
+        "check_only_symbols": ["RSP"],
+        "equal_benchmark": "RSP",
+        "cap_benchmark": "SPY",
+        "worst_months": 10,
+        "names_per_month": 5,
+        "extreme_name_return": 0.60,
+    }
+
+
+def test_index_check_refuses_a_symbol_in_both_lists() -> None:
+    with pytest.raises(ValueError, match=r"index_check\.check_only_symbols \['RSP'\]"):
+        Settings(_env_file=None, benchmarks=["SPY", "RSP"])
+    with pytest.raises(ValueError, match="also in benchmarks"):
+        Settings(_env_file=None, index_check={"check_only_symbols": ["SPY"]})
+    assert Settings(_env_file=None, benchmarks=["SPY"]).benchmarks == ["SPY"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"start_month": "2019-13"},
+        {"end_month": "2026-9"},
+        {"start_month": "2026-09", "end_month": "2019-08"},
+        {"worst_months": 0},
+        {"names_per_month": 0},
+        {"extreme_name_return": 0.0},
+        {"extreme_name_return": float("nan")},
+        {"unknown_key": 1},
+    ],
+)
+def test_invalid_index_check_config_is_rejected(bad: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, index_check=bad)
+
+
+def test_index_check_is_in_no_hypothesis_key_set() -> None:
+    from tradepartner.backtest.frozen import FROZEN_KEY_DEFAULTS
+
+    assert not [k for k, _, _ in FROZEN_KEY_DEFAULTS if k.startswith("index_check")]
+
+
+# --- the buy/hold buffer key (backtest spec amendment #657, T238) ----------------------
+
+
+def test_hold_top_fraction_defaults_to_no_buffer() -> None:
+    for s in (_settings().strategy, StrategyConfig()):
+        assert s.hold_top_fraction == 0.0
+        assert type(s.hold_top_fraction) is float
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({"hold_top_fraction": 0.0}, 0.0),
+        ({"hold_top_fraction": 0.20}, 0.20),
+        ({"hold_top_fraction": 1.0}, 1.0),
+        ({"top_fraction": 0.2, "hold_top_fraction": 0.2}, 0.0),  # normalised
+        ({"top_fraction": 0.10, "hold_top_fraction": 0.10}, 0.0),
+        ({"top_fraction": 1.0, "hold_top_fraction": 1.0}, 0.0),
+        ({"top_fraction": 0.3, "hold_top_fraction": 0.3000001}, 0.3000001),
+    ],
+)
+def test_hold_top_fraction_accepts_zero_or_top_to_one(
+    override: dict[str, float], expected: float
+) -> None:
+    assert StrategyConfig(**override).hold_top_fraction == expected  # type: ignore[arg-type]
+    validated = Settings.model_validate({"strategy": override}).strategy
+    assert validated.hold_top_fraction == expected
+
+
+def test_hold_top_fraction_below_top_is_refused_naming_both_keys() -> None:
+    with pytest.raises(ValidationError, match=r"hold_top_fraction.*top_fraction"):
+        StrategyConfig(top_fraction=0.10, hold_top_fraction=0.05)
+    with pytest.raises(ValidationError, match=r"hold_top_fraction.*top_fraction"):
+        StrategyConfig(hold_top_fraction=0.05)  # the default top_fraction is 0.10
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5, float("nan"), float("inf")])
+def test_hold_top_fraction_rejects_out_of_range_values(bad: float) -> None:
+    with pytest.raises(ValidationError):
+        StrategyConfig(hold_top_fraction=bad)
+
+
+def test_hold_top_fraction_with_hold_weighting_is_refused() -> None:
+    with pytest.raises(ValidationError, match=r"hold_top_fraction.*hold"):
+        StrategyConfig(weighting="hold", hold_top_fraction=0.20)
+    # Normalised to the default, it is not a non-default value.
+    assert StrategyConfig(weighting="hold", hold_top_fraction=0.10).hold_top_fraction == 0.0
+    assert StrategyConfig(weighting="hold").hold_top_fraction == 0.0
+
+
+def test_momentum_family_gains_the_buffer_key_and_count() -> None:
+    spec = FAMILIES["momentum"]
+    assert spec.sweepable_keys[-1] == "strategy.hold_top_fraction"
+    assert spec.count_names[-1] == "n_retained"
+    for other in ("oracle", "profitability", "combined"):
+        assert "strategy.hold_top_fraction" not in FAMILIES[other].sweepable_keys  # type: ignore[index]
+        assert "n_retained" not in FAMILIES[other].count_names  # type: ignore[index]
+
+
+# --- the `portfolio` section (T219; backtest spec amendment #1872, item 1) -------------
+
+
+def test_portfolio_defaults() -> None:
+    """The five keys load at the values the spec's Config keys list gives."""
+    for p in (_settings().portfolio, PortfolioConfig()):
+        assert p.side == "long_only"
+        assert p.gross_exposure == pytest.approx(1.0)
+        assert p.net_exposure == pytest.approx(1.0)
+        assert p.short_min_price == pytest.approx(5.0)
+        assert p.short_cover_weight == pytest.approx(0.10)
+    assert set(get_args(PortfolioConfig.model_fields["side"].annotation)) == {
+        "long_only",
+        "long_short",
+    }
+
+
+def test_portfolio_is_a_settings_section() -> None:
+    assert Settings.model_fields["portfolio"].annotation is PortfolioConfig
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"side": "long_short"},
+        {"gross_exposure": 0.5, "net_exposure": 0.5},
+        {"net_exposure": 0.5},
+        {"short_min_price": 3.0},
+        {"short_cover_weight": 0.2},
+    ],
+)
+def test_portfolio_accepts_each_valid_non_default_after_t223(override: dict[str, object]) -> None:
+    """The five keys now reach the engine through both validation paths."""
+    if override == {"net_exposure": 0.5}:
+        override = {"side": "long_short", **override}
+    direct = PortfolioConfig(**override)  # type: ignore[arg-type]
+    from_settings = Settings.model_validate({"portfolio": override}).portfolio
+    assert direct == from_settings
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"side": "bogus"},
+        {"gross_exposure": 0.0},
+        {"gross_exposure": 1.5},
+        {"net_exposure": 2.0},
+        {"short_min_price": 0.0},
+        {"short_min_price": -1.0},
+        {"short_cover_weight": 0.0},
+        {"short_cover_weight": 1.5},
+    ],
+)
+def test_portfolio_rejects_out_of_range_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        PortfolioConfig(**override)  # type: ignore[arg-type]
+
+
+def test_portfolio_exposure_relation_is_pinned_for_t223() -> None:
+    """The live validator enforces the gross/net relation."""
+    row = {"short_min_price": 5.0, "short_cover_weight": 0.10}
+    with pytest.raises(ValidationError, match="net_exposure"):
+        PortfolioConfig(side="long_short", gross_exposure=0.5, net_exposure=0.8, **row)
+    with pytest.raises(ValidationError, match="long_only"):
+        PortfolioConfig(side="long_only", gross_exposure=1.0, net_exposure=0.5, **row)
+
+
+# --- the borrow keys (T221; backtest spec amendment #1872, item 6) ----------------------
+
+
+def test_borrow_key_defaults() -> None:
+    """A long-only book pays no borrow and lists no sensitivity rate."""
+    for costs in (_settings().costs, CostsConfig()):
+        assert costs.borrow_bps_per_year == pytest.approx(0.0)
+        assert costs.borrow_sensitivity_bps == []
+
+
+def test_borrow_keys_accept_non_negative_rates() -> None:
+    costs = CostsConfig(borrow_bps_per_year=30.0, borrow_sensitivity_bps=[0.0, 30.0, 300.0])
+    assert costs.borrow_bps_per_year == pytest.approx(30.0)
+    assert costs.borrow_sensitivity_bps == [0.0, 30.0, 300.0]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"borrow_bps_per_year": -1.0}, {"borrow_sensitivity_bps": [30.0, -0.5]}],
+)
+def test_a_negative_borrow_rate_is_refused(override: dict[str, object]) -> None:
+    """A negative fee would pay the short book to hold its positions."""
+    with pytest.raises(ValueError, match="borrow"):
+        CostsConfig(**override)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("reconcile_dividend_exhaustive_dues", 0),
+        ("reconcile_dividend_exhaustive_dues", 13),
+        ("reconcile_dividend_subset_states", 0),
+    ],
+)
+def test_risk_reconcile_dividend_search_bounds(key: str, value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={key: value})
+
+
+def test_ui_keys_default_and_validate() -> None:
+    """T273 (#2170): display-only keys for the Home page."""
+    ui = _settings().ui
+    assert (ui.next_run_time_et, ui.holdings_rows) == ("08:05", 5)
+    for bad in ("8:05", "24:00", "08:60", "0805", "", "08:05 ET"):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"next_run_time_et": bad})
+    for rows in (0, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"holdings_rows": rows})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, ui={"unknown": 1})
+    assert Settings(_env_file=None, ui={"next_run_time_et": "23:59"}).ui.next_run_time_et == "23:59"
+
+
+def test_ui_kill_keys_default_and_validate() -> None:
+    """T277 (#2268): the Stop button's reason cap and its wait on `paper kill`."""
+    s = _settings()
+    assert (s.ui.max_reason_chars, s.ui.kill_wait_seconds, s.ui.kill_wait_margin_seconds) == (
+        500,
+        None,
+        30,
+    )
+    assert kill_wait_seconds(s) == s.store.writer_lock_retry_seconds + 30 == 330
+    for key in ("max_reason_chars", "kill_wait_margin_seconds", "kill_wait_seconds"):
+        for bad in (0, -1):
+            with pytest.raises(ValidationError):
+                Settings(_env_file=None, ui={key: bad})
+
+
+def test_ui_kill_wait_seconds_must_exceed_the_kill_store_wait_by_the_margin() -> None:
+    """ADR 0018's 2026-10-26 amendment: a caller's bound on `paper kill` must exceed
+    its worst-case store wait (`store.writer_lock_retry_seconds`) by a margin, or a
+    kill still waiting is reported as not confirmed; a set value not above the two
+    together is refused at load."""
+    valid = Settings(
+        _env_file=None, store={"writer_lock_retry_seconds": 100}, ui={"kill_wait_seconds": 131}
+    )
+    assert kill_wait_seconds(valid) == 131
+    for refused in (130, 100, 1):
+        with pytest.raises(ValueError, match=r"ui\.kill_wait_seconds"):
+            Settings(
+                _env_file=None,
+                store={"writer_lock_retry_seconds": 100},
+                ui={"kill_wait_seconds": refused},
+            )
+    margin = Settings(
+        _env_file=None,
+        store={"writer_lock_retry_seconds": 100},
+        ui={"kill_wait_margin_seconds": 50},
+    )
+    assert kill_wait_seconds(margin) == 150

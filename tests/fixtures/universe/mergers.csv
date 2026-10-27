@@ -1,0 +1,3 @@
+security_id,kind,acquirer_security_id,acquiree_symbol,acquiree_cusip,acquirer_symbol,acquirer_cusip,share_ratio,cash_per_share,effective_date,process_date,payable_date,source_action_id,known_at,ingested_at,source,provenance
+SEC_CLEAN_MERGER,cash,,CLNM,SYNTH-CLNM,,,,62.5,2018-07-25,2018-07-25,2018-07-26,fixture-merger-cash-1,2018-07-26T20:00:00+00:00,2018-07-26T20:10:00+00:00,alpaca,action
+SEC_DIV_CANCELLED,stock,SEC_SPLIT_PLAIN,DCAN,SYNTH-DCAN,SPLT,SYNTH-SPLT,0.75,,2020-02-14,2020-02-14,,fixture-merger-stock-1,2020-02-18T21:00:00+00:00,2020-02-18T21:10:00+00:00,alpaca,action

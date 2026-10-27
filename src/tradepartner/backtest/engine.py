@@ -36,6 +36,9 @@ starts at the earliest held formation anchor or stale-exit window.
   not marked.
 - *Stale*: otherwise, no bar in the marking frame on the last
   `backtest.stale_exit_sessions` sessions through T_{i+1}; sold at its last bar's close.
+  A stale short leaves the book, equity, exposure and drift test at its last bar, but
+  item 6's borrow sum keeps |last value| from there through T_{i+1}, the rebalance that
+  decides the cover, in every book at its own rate (spec amendment 2026-10-25, #2169).
 
 The sale is booked at that session, or at F_i when the session is earlier (the step
 that read the exit is the first that can book it; the name's value was frozen at that
@@ -61,6 +64,22 @@ book grows by the session's `rf(s)` accrual (`riskfree`, over the frame read onc
 data cutoff, before the first step) at every session after T_0: cash held to the fill
 accrues through F_i before the trade, exit proceeds from the session after theirs.
 
+**The signed book** (spec amendment #1872, items 4 to 6; `portfolio.side = "long_short"`,
+plan T222): the same loop carries signed dollar values. Under `long_short` `_step` marks
+the positions with `value_positions(signed=True)`, trades with `apply_trades(signed=True)`
+(the long buys capped by free cash, cash minus the short magnitudes), and keeps a
+zero-excluded position set, so a short is a negative value; a short holding is recorded
+in `held_on` too, so the dividend counts see it. At every session after the plan's read the
+book pays the borrow fee (`costs.borrow_bps_per_year`, calendar days over a 360-day year,
+on the previous close's short values, the carry window from the plan to the fill
+included) and, under `cash_rate = "store"`, accrues `rf(s)` on free cash only (the short
+proceeds earn nothing). A session whose equity is not positive raises `ValueError` naming
+the session (a `failed` trial), never a silent ruin. `_exits`
+covers a delisted short at its last close and a stale one at its last bar's close like a
+long, and its cost is a magnitude, so the sign only decides which way cash moves. Under
+`long_only` (`side` at its default) no new branch is taken and every pinned run is
+byte-identical.
+
 **Read groups** (strategy-lab spec req 2, plan T105): `run_many` runs several
 variants that differ only in keys that change the computation, not the reads, in
 lockstep from one read set per step: each step's marking reads are made once for the
@@ -83,7 +102,7 @@ from __future__ import annotations
 
 import bisect
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from typing import Final, TypeVar, cast
@@ -94,6 +113,7 @@ from tradepartner.backtest import placebo
 from tradepartner.backtest.costs import (
     Commissions,
     adv_by_security,
+    borrow_fee,
     buy_notional_after_costs,
     trade_cost,
 )
@@ -103,8 +123,10 @@ from tradepartner.backtest.portfolio import (
     _equal_weight,
     _selected_count,
     apply_rebalance_band,
+    buffered_targets,
     drifted_weights,
     hold_membership,
+    signed_target_weights,
     target_weights,
 )
 from tradepartner.backtest.provider import (
@@ -139,6 +161,7 @@ from tradepartner.calendar import (
     next_session,
     previous_session,
     session_close,
+    sessions_in_month_window,
 )
 from tradepartner.config import Cadence, HypothesisFamily, Settings
 from tradepartner.store.delistings import DELISTED
@@ -171,10 +194,23 @@ class BacktestResult:
     marking_frames: tuple[StepFrame, ...]
     targets: Mapping[date, Mapping[str, float]]
     rates: pl.DataFrame | None = None
+    exposure_summary: ExposureSummary | None = None
 
     def stitched_returns(self) -> pl.DataFrame:
         """`valuation.stitched_returns` over this run's marking frames."""
         return stitched_returns(self.marking_frames)
+
+
+@dataclass(frozen=True)
+class ExposureSummary:
+    """Session-close exposure of the signed strategy book and its total borrow fee."""
+
+    gross_mean: float
+    gross_max: float
+    net_mean: float
+    net_min: float
+    net_max: float
+    borrow_paid: float
 
 
 @dataclass(frozen=True)
@@ -245,6 +281,12 @@ class _Book:
     weights: list[WeightRow] = field(default_factory=list)
     values: list[pl.DataFrame] = field(default_factory=list)
     keep_detail: bool = True
+    chained_positions: int = 0  # #821: positions renamed by a successor chain this step
+    series: str = STRATEGY_SERIES
+    borrow_bps: float | None = None
+    pending_covers: set[str] = field(default_factory=set)
+    exposures: list[tuple[float, float]] = field(default_factory=list)
+    borrow_paid: float = 0.0
 
 
 def _check_levels(cost_levels: Sequence[float]) -> list[float]:
@@ -347,7 +389,30 @@ def _plan(
         seed = f"{params.strategy.placebo_seed}:{session.toordinal()}"
         scores = (placebo.shuffle if mode == "shuffle" else placebo.random_entry)(scores, seed)
     construction = getattr(params, strategy.section)
-    if construction.weighting == "hold":
+    counts = dict(signal.counts)
+    if params.portfolio.side == "long_short":
+        raw = provider.raw_prices(t, sorted(scores))
+        closes = {
+            sid: close
+            for sid, day, close in raw.select("security_id", "session", "close").iter_rows()
+            if day == read
+        }
+        eligible = {
+            sid for sid in scores if closes.get(sid, 0.0) >= params.portfolio.short_min_price
+        }
+        # An unpriced name is ineligible, but it has no observed close below the
+        # floor and therefore is not part of the below-price count.
+        counts["n_short_below_price"] = sum(
+            sid in closes and closes[sid] < params.portfolio.short_min_price for sid in scores
+        )
+        targets = signed_target_weights(
+            scores,
+            construction.top_fraction,
+            params.portfolio.gross_exposure,
+            params.portfolio.net_exposure,
+            eligible,
+        )
+    elif construction.weighting == "hold":
         targets = _hold_candidates(scores, _construction(params, family))
     else:
         targets = target_weights(scores, construction.top_fraction, construction.weighting)
@@ -362,8 +427,48 @@ def _plan(
         members=tuple(members),
         scores=scores,
         excluded_no_history=no_history,
-        counts=dict(signal.counts),
+        counts=counts,
         exclusions=exclusions,
+    )
+
+
+#: The `Plan.exclusions` key for a universe candidate with no bar at the read session
+#: (paper spec amendment 2026-10-20, #1997).
+NO_T0_BAR: Final = "no_t0_bar"
+
+
+def no_t0_bar_candidates(
+    provider: DataProvider, params: Settings, session: date
+) -> tuple[str, ...]:
+    """Securities the universe dropped only because the read session's (T_0) bar is
+    missing (#1997): rule 6 (`history`, `missing_bars`) with every other session of the
+    history window present. Sorted ids, read at the same `t` as `plan`'s universe.
+
+    A partial ingest (SPY present, one name's T_0 bar absent) drops such a name with no
+    trace; the paper planner records it as `excluded_no_t0_bar` and alerts. They are not
+    universe members, so `Plan.n_universe` and the targets are untouched. Pure over the
+    provider's as-of reads: bars known at `t` only."""
+    cadence = params.schedule.rebalance_cadence
+    read = _read_session(session, params.strategy.signal_delay_sessions, cadence)
+    t = read_time(read, cadence)
+    universe = provider.universe(t)
+    dropped = universe.exclusions.filter(
+        (pl.col("rule_name") == "history") & (pl.col("reason") == "missing_bars")
+    )["security_id"].to_list()
+    if not dropped:
+        return ()
+    history = set(sessions_in_month_window(universe.session, params.universe.min_history_months))
+    bars = provider.raw_prices(t, sorted(dropped)).filter(pl.col("session") <= universe.session)
+    have: dict[str, set[date]] = {}
+    for sid, day in bars.select("security_id", "session").iter_rows():
+        have.setdefault(sid, set()).add(day)
+    return tuple(
+        sorted(
+            sid
+            for sid in dropped
+            if universe.session not in have.get(sid, set())
+            and history - {universe.session} <= have.get(sid, set())
+        )
     )
 
 
@@ -377,12 +482,50 @@ def plan(
     params: Settings,
     session: date,
     family: HypothesisFamily,
+    *,
+    previous_targets: Collection[str] | None = None,
 ) -> Plan:
     """The plan at rebalance session `session` (a rebalance session at the frozen
     `schedule.rebalance_cadence`), read at close(`session`): universe, family signal,
     targets and the gap, from `params` (the frozen hypothesis parameters). The backtest
-    loop calls exactly this function (`_plan`) at every rebalance it plans."""
-    return _plan(provider, params, session, family)
+    loop calls exactly this function (`_plan`) at every rebalance it plans.
+
+    `previous_targets` is the previous plan's targets of the same run, the buffer's
+    carried state (spec amendment #657, item 4). At the default
+    `strategy.hold_top_fraction` it is ignored and the call is unchanged. For a
+    registration with the buffer on it is required: a call that omits it (leaves it
+    `None`) raises `ValueError` naming the key, and an explicit empty mapping means a
+    run's first plan (`P = ∅`). The paper planner calls this without the argument, so a
+    buffered window's plan trial fails closed rather than trading an unbuffered plan
+    under a buffered label."""
+    return _apply_buffer(_plan(provider, params, session, family), params, previous_targets)
+
+
+def _apply_buffer(built: Plan, params: Settings, previous_targets: Collection[str] | None) -> Plan:
+    """`built` with the `momentum` buy/hold buffer applied (spec amendment #657, item 2).
+
+    At the default `strategy.hold_top_fraction` (0.0) `built` is returned unchanged and
+    no new path runs. Otherwise the targets are rebuilt from `buffered_targets` over the
+    plan's own `scores` (already past B10's screen, rung 4's delay and rung 5's placebo)
+    under `equal` weighting, so a held name is reset to the common weight, and
+    `n_retained` joins the plan's counts, reported only here (item 2). `previous_targets`
+    is the previous plan's targets after the successor-chain renaming; `None` is the
+    omitted argument, refused so no run records results under a buffered label."""
+    hold = params.strategy.hold_top_fraction
+    if hold == 0.0:
+        return built
+    if previous_targets is None:
+        raise ValueError(
+            "engine.plan needs previous_targets for a registration with "
+            f"strategy.hold_top_fraction = {hold!r} (the buy/hold buffer); pass the "
+            "previous plan's targets, or an empty mapping for a run's first plan"
+        )
+    targets, n_retained = buffered_targets(
+        built.scores, previous_targets, params.strategy.top_fraction, hold
+    )
+    counts = dict(built.counts)
+    counts["n_retained"] = n_retained
+    return replace(built, targets=targets, counts=counts)
 
 
 def _no_benchmark_members(plan: Plan, benchmarks: Mapping[str, str]) -> Plan:
@@ -458,17 +601,44 @@ def _exits(
         raw_close = _last_close(raw, sid, session)
         if raw_close is None:
             raise ValueError(f"{sid} has no raw bar at or before {session.isoformat()} to exit at")
+        # A trade's cost is a magnitude: a short's value is negative, and its cover pays
+        # the same model as a long's sale (spec amendment #1872, item 7). `abs` is the
+        # identity on the positive value a `long_only` book carries.
+        notional = abs(value)
         cost = trade_cost(
-            value,
-            value / raw_close,
+            notional,
+            notional / raw_close,
             book.level,
             commissions,
             spread_bps=params.costs.spread_bps,
             impact_coeff=params.costs.impact_coeff,
             adv=adv.get(sid),
         )
-        exits.append(_Exit(sid, session, value, min(cost, value), stale))
+        exits.append(_Exit(sid, session, value, min(cost, notional), stale))
     return exits
+
+
+def _short_value(positions: Mapping[str, float]) -> float:
+    """The absolute dollar value of the short positions (Σ |v| over v < 0), 0 when none."""
+    return math.fsum(-value for value in positions.values() if value < 0)
+
+
+def _shorts(positions: Mapping[str, float]) -> dict[str, float]:
+    """The short positions (negative values) of a signed book, keyed by security."""
+    return {sid: value for sid, value in positions.items() if value < 0}
+
+
+def _shorts_by_session(values: pl.DataFrame) -> dict[date, dict[str, float]]:
+    """Each session's short positions (negative values), keyed by security.
+
+    A signed book's borrow fee and free-cash accrual read the short values at the
+    previous session's close (spec amendment #1872, item 6), so they are grouped once
+    over the step's post-exit marking frame."""
+    out: dict[date, dict[str, float]] = {}
+    for session, sid, value in values.select("session", "security_id", "value").iter_rows():
+        if value < 0:
+            out.setdefault(session, {})[sid] = value
+    return out
 
 
 def _last_close(raw: pl.DataFrame, sid: str, session: date) -> float | None:
@@ -560,6 +730,53 @@ def _held_before(book: _Book, sid: str, ex_date: date) -> bool:
     return previous_session(ex_date) in book.held_on.get(sid, set())
 
 
+def _spin_off_path(sid: str, mapping: Mapping[str, str]) -> tuple[str, ...]:
+    """IDs from a parent through its live successors, stopping before a cycle."""
+    path: list[str] = []
+    seen: set[str] = set()
+    current = sid
+    while current not in seen:
+        seen.add(current)
+        path.append(current)
+        if current not in mapping:
+            break
+        current = mapping[current]
+    return tuple(path)
+
+
+def _spin_off_counts(
+    book: _Book,
+    start: date,
+    end: date,
+    spin_offs: tuple[pl.DataFrame, pl.DataFrame],
+    chains: Sequence[tuple[str, str]],
+) -> dict[str, int]:
+    """Count held parents using only the successor chains live at this step."""
+    mapping = dict(chains)
+    unvalued, late = spin_offs
+    return {
+        "n_spin_offs_unvalued": sum(
+            start < ex <= end
+            and any(_held_before(book, parent, ex) for parent in _spin_off_path(sid, mapping))
+            for sid, ex in unvalued.select("security_id", "ex_date").iter_rows()
+        ),
+        "n_late_spin_offs": sum(
+            any(_held_before(book, parent, ex) for parent in _spin_off_path(sid, mapping))
+            for sid, ex in late.select("security_id", "ex_date").iter_rows()
+        ),
+    }
+
+
+def _spin_off_held_ids(
+    ever_held: Sequence[str], chains: Sequence[tuple[str, str]]
+) -> tuple[str, ...]:
+    """Include raw predecessor IDs for the late spin-off provider read."""
+    mapping = dict(chains)
+    held = set(ever_held)
+    predecessors = {pred for pred in mapping if held.intersection(_spin_off_path(pred, mapping))}
+    return tuple(sorted(held | predecessors))
+
+
 def _book_targets(
     book: _Book,
     plan: Plan,
@@ -619,13 +836,17 @@ def _fill_to_targets(
     book: _Book,
     params: Settings,
     adv: Mapping[str, float],
+    *,
+    signed: bool = False,
 ) -> FillResult:
     """`apply_trades` towards `targets`, leaving the `aside` names untouched.
 
     Without any, exactly the plain call. With some, only the other positions are traded
     and their targets are rescaled from the whole equity to the part `apply_trades` sees
     (`aside` excluded), so the orders are the same ones the whole book would place, the
-    turnover is over the whole equity, and the set-aside positions come back unchanged."""
+    turnover is over the whole equity, and the set-aside positions come back unchanged.
+    `signed` selects `apply_trades(signed=True)` for a `long_short` book (a signed book
+    is refused a band and `hold` weighting, so its `aside` is always empty)."""
     fill_price = params.execution.fill_price
     commissions = Commissions.from_config(params.costs)
     if not aside:
@@ -642,6 +863,7 @@ def _fill_to_targets(
             spread_bps=params.costs.spread_bps,
             impact_coeff=params.costs.impact_coeff,
             adv=adv,
+            signed=signed,
         )
     kept = {sid: value for sid, value in carried.items() if sid in aside}
     traded = {sid: value for sid, value in carried.items() if sid not in aside}
@@ -661,6 +883,7 @@ def _fill_to_targets(
         spread_bps=params.costs.spread_bps,
         impact_coeff=params.costs.impact_coeff,
         adv=adv,
+        signed=signed,
     )
     return replace(
         fill,
@@ -681,11 +904,26 @@ def _step(
     params: Settings,
     construction: _Construction,
     accruals: Mapping[date, float] | None,
+    spin_offs: tuple[pl.DataFrame, pl.DataFrame] | None = None,
+    chains: Sequence[tuple[str, str]] = (),
+    decision_frames: Mapping[date, pl.DataFrame] | None = None,
 ) -> None:
     """Carry, fill, value and exit one cost level through the period (T_i, T_{i+1}].
 
     `index` is the plan's place among the rebalance sessions (a hold-mode book's clock);
-    `accruals` is the cash accrual of each session after T_0, None for a cash rate of 0."""
+    `accruals` is the cash accrual of each session after T_0, None for a cash rate of 0.
+    `spin_offs` is the step's `(unvalued, late)` spin-off reads, present only under the
+    trial's `adjust.apply_spin_offs` (spec amendment #1894, item 5), so a trial without
+    the key writes neither count and its rows are byte-identical.
+
+    Under `portfolio.side = "long_short"` the book is signed (spec amendment #1872, items
+    4 to 6): the same carries, fills and marks take `signed=True`, a short is a negative
+    value kept in the position set and in `held_on`, every session after the plan's read
+    pays the borrow fee (the carry window to the fill included) and accrues `rf(s)` on
+    free cash only, and an equity that is not positive ends the run with a `ValueError`
+    naming the session. A drift cover remains pending through missing bars until its
+    next fill bar or the ordinary stale exit."""
+    signed = params.portfolio.side == "long_short"
     fill_price = params.execution.fill_price
     carried = carry_to_fill(
         book.positions,
@@ -694,61 +932,263 @@ def _step(
         plan.fill_session,
         fill_price=fill_price,
         marked_at=book.marked_at,
+        signed=signed,
     )
     held_cash = book.cash
     if accruals is not None:
+        if signed:
+            # Free cash is cash less the short proceeds, which earn nothing (item 6).
+            for session in _sessions(plan.session, plan.fill_session)[1:]:
+                held_cash += (held_cash - _short_value(book.positions)) * accruals[session]
+        else:
+            for session in _sessions(plan.session, plan.fill_session)[1:]:
+                held_cash *= 1 + accruals[session]
+    borrow_bps = params.costs.borrow_bps_per_year if book.borrow_bps is None else book.borrow_bps
+    if signed and borrow_bps > 0:
+        # The carry window (T_i, F_i] is charged too, on the positions held at
+        # close(T_i) (`book.positions`): the short pays for every session it is held, so
+        # a daily book (whose fill session is the step's end) is not charged nothing, and
+        # a monthly book is not charged from the fill only and missing one session each
+        # rebalance. The post-fill loop then charges from the fill on (item 6).
+        carried_shorts = _shorts(book.positions)
         for session in _sessions(plan.session, plan.fill_session)[1:]:
-            held_cash *= 1 + accruals[session]
-    targets, aside = _book_targets(book, plan, index, carried, held_cash, construction)
+            fee = borrow_fee(carried_shorts, borrow_bps, (session - previous_session(session)).days)
+            held_cash -= fee
+            book.borrow_paid += fee
     adv = (
         adv_by_security(raw, plan.session, params.costs.adv_sessions)
         if params.costs.impact_coeff != 0.0
         else {}
     )
-    fill = _fill_to_targets(carried, held_cash, targets, aside, frame, raw, plan, book, params, adv)
-    values = value_positions(
-        fill.positions, frame, plan.fill_session, fill_price=fill_price, through=end
+    n_drift = 0
+    prefill_drift_cost = 0.0
+    prefill_drift_value = 0.0
+    if signed and book.pending_covers:
+        waiting: set[str] = set()
+        for sid in sorted(book.pending_covers):
+            value = carried.get(sid, 0.0)
+            if value >= 0:
+                continue
+            if _price_on(frame, sid, plan.fill_session, fill_price) is None:
+                # A held name without a fill bar keeps its last mark, as in
+                # apply_trades. Its pending cover travels into the session loop.
+                waiting.add(sid)
+                continue
+            raw_fill = _price_on(raw, sid, plan.fill_session, fill_price)
+            if raw_fill is None:
+                raise ValueError(f"{sid} has a bar on {plan.fill_session} but no raw bar")
+            cost = trade_cost(
+                -value,
+                -value / raw_fill,
+                book.level,
+                Commissions.from_config(params.costs),
+                spread_bps=params.costs.spread_bps,
+                impact_coeff=params.costs.impact_coeff,
+                adv=adv.get(sid),
+            )
+            held_cash += value - cost
+            prefill_drift_value += -value
+            prefill_drift_cost += cost
+            del carried[sid]
+            n_drift += 1
+        book.pending_covers = waiting
+    targets, aside = _book_targets(book, plan, index, carried, held_cash, construction)
+    fill = _fill_to_targets(
+        carried, held_cash, targets, aside, frame, raw, plan, book, params, adv, signed=signed
     )
-    negative = values.filter(pl.col("value") < 0)
-    if negative.height:
-        sid, session, value = negative.select("security_id", "session", "value").row(0)
-        raise ValueError(
-            f"negative position value {value} for {sid} on {session}: the backtester is "
-            "long-only (ADR 0014, 0015), a negative value would be silently dropped"
-        )
+    values = value_positions(
+        fill.positions,
+        frame,
+        plan.fill_session,
+        fill_price=fill_price,
+        through=end,
+        signed=signed,
+    )
+    if not signed:
+        negative = values.filter(pl.col("value") < 0)
+        if negative.height:
+            sid, session, value = negative.select("security_id", "session", "value").row(0)
+            raise ValueError(
+                f"negative position value {value} for {sid} on {session}: the backtester is "
+                "long-only (ADR 0014, 0015), a negative value would be silently dropped"
+            )
     exits = _exits(
         book, fill.positions, values, (frame, raw, ended), plan.fill_session, end, params, adv
     )
     values = _book_exits(values, exits)
     totals = dict(values.group_by("session").agg(pl.col("value").sum()).iter_rows())
+    shorts = _shorts_by_session(values) if signed else {}
     cash = fill.cash
+    drift_exits: list[_Exit] = []
+    pending: set[str] = set(book.pending_covers)
+    book.pending_covers.clear()
+    covered: set[str] = set()
     for session in _sessions(plan.fill_session, end):
-        if accruals is not None and session > plan.fill_session:
-            cash *= 1 + accruals[session]
+        if session > plan.fill_session:
+            previous = previous_session(session)
+            held_shorts = shorts.get(previous, {})
+            if accruals is not None:
+                if signed:
+                    free = cash - _short_value(held_shorts)
+                    cash += free * accruals[session]
+                else:
+                    cash *= 1 + accruals[session]
+            if signed and borrow_bps > 0:
+                # A stale short is covered at its last bar's price and cash, but stays
+                # open (and pays borrow on its last mark) to the step's end, the
+                # rebalance session that decides the cover (spec amendment #2169).
+                stale_tail = {
+                    e.security_id: e.value
+                    for e in exits
+                    if e.stale and e.value < 0 and e.session <= previous
+                }
+                fee = borrow_fee(
+                    {**held_shorts, **stale_tail}, borrow_bps, (session - previous).days
+                )
+                cash -= fee
+                book.borrow_paid += fee
+        if signed and pending:
+            previous = previous_session(session)
+            completed: set[str] = set()
+            for sid in sorted(pending):
+                if sid not in shorts.get(previous, {}) and sid not in fill.positions:
+                    completed.add(sid)
+                    continue
+                source = shorts.get(previous, {})
+                held_value = source.get(sid, book.positions.get(sid, 0.0))
+                if held_value >= 0:
+                    completed.add(sid)
+                    continue
+                if _price_on(frame, sid, session, fill_price) is None:
+                    # The order cannot fill during a halt. Keep it pending until
+                    # the next bar or until the ordinary stale exit removes it.
+                    continue
+                marked = book.marked_at.get(sid, previous)
+                if session > plan.fill_session:
+                    prior = values.filter(
+                        (pl.col("security_id") == sid) & (pl.col("session") == previous)
+                    )
+                    if not prior.is_empty():
+                        marked = prior["marked_at"].item()
+                at_fill = carry_to_fill(
+                    {sid: held_value},
+                    frame,
+                    previous,
+                    session,
+                    fill_price=fill_price,
+                    marked_at={sid: marked},
+                    signed=True,
+                )[sid]
+                raw_fill = _price_on(raw, sid, session, fill_price)
+                if raw_fill is None:
+                    raise ValueError(f"{sid} has a bar on {session} but no raw bar")
+                cost = trade_cost(
+                    -at_fill,
+                    -at_fill / raw_fill,
+                    book.level,
+                    Commissions.from_config(params.costs),
+                    spread_bps=params.costs.spread_bps,
+                    impact_coeff=params.costs.impact_coeff,
+                    adv=adv.get(sid),
+                )
+                cash += at_fill - cost
+                drift_exits.append(_Exit(sid, session, at_fill, cost, False))
+                covered.add(sid)
+                completed.add(sid)
+                n_drift += 1
+                exits = [e for e in exits if e.security_id != sid or e.session < session]
+                for day in _sessions(session, end):
+                    row = values.filter((pl.col("security_id") == sid) & (pl.col("session") == day))
+                    if not row.is_empty():
+                        totals[day] = totals.get(day, 0.0) - float(row["value"].item())
+                    shorts.get(day, {}).pop(sid, None)
+            pending.difference_update(completed)
         proceeds = [e.value - e.cost for e in exits if e.session == session]
         cash = math.fsum([cash, *proceeds])
         equity = math.fsum([cash, totals.get(session, 0.0)])
-        book.equity.append(EquityRow(STRATEGY_SERIES, book.level, session, equity, cash))
+        if signed and equity <= 0:
+            raise ValueError(
+                f"the book's equity is gone on {session.isoformat()}: equity {equity} is not "
+                "positive"
+            )
+        book.equity.append(EquityRow(book.series, book.level, session, equity, cash))
+        if signed:
+            active = shorts.get(session, {})
+            # The positive part is the total signed value less the short part.
+            net_value = totals.get(session, 0.0)
+            gross_value = net_value + 2 * _short_value(active)
+            book.exposures.append((gross_value / equity, net_value / equity))
+            if decision_frames is not None:
+                asof = decision_frames[session]
+                live = {
+                    sid
+                    for sid, value in values.filter(pl.col("session") == session)
+                    .select("security_id", "value")
+                    .iter_rows()
+                    if value != 0
+                }
+                source_positions = {
+                    sid: value
+                    for sid, value in fill.positions.items()
+                    if sid in live and sid not in covered
+                }
+                asof_values = value_positions(
+                    source_positions,
+                    asof,
+                    plan.fill_session,
+                    fill_price=fill_price,
+                    through=session,
+                    signed=True,
+                ).filter(pl.col("session") == session)
+                asof_net = math.fsum(asof_values["value"].to_list())
+                asof_equity = cash + asof_net
+                if asof_equity <= 0:
+                    raise ValueError(f"the book's equity is gone on {session}")
+                pending.update(
+                    sid
+                    for sid, value in asof_values.select("security_id", "value").iter_rows()
+                    if value < 0 and -value / asof_equity > params.portfolio.short_cover_weight
+                )
+    if signed:
+        book.pending_covers = {sid for sid in pending if sid in shorts.get(end, {})}
+        if drift_exits:
+            values = _book_exits(values, drift_exits)
     before = math.fsum([held_cash, *carried.values()])
-    exited = math.fsum(e.value for e in exits)
+    # A short's exit value is negative; its turnover contribution is the magnitude.
+    exited = math.fsum(abs(e.value) for e in exits)
 
     dropped, late = dividends
     n_late = sum(
         _held_before(book, sid, ex) for sid, ex in late.select("security_id", "ex_date").iter_rows()
     )
+    # `!= 0` keeps a short's negative value, so a short holding counts for a dividend
+    # (item 5); under `long_only` the negative-value guard above leaves only zero and
+    # positive values there, so it selects exactly what `> 0` did.
     for sid, session, value in values.select("security_id", "session", "value").iter_rows():
-        if value > 0:
+        if value != 0:
             book.held_on.setdefault(sid, set()).add(session)
     n_dropped = sum(
         plan.session < ex <= end and _held_before(book, sid, ex)
         for sid, ex in dropped.select("security_id", "ex_date").iter_rows()
     )
+    # The two spin-off counts (spec amendment #1894, item 4 and 5): parents held on the
+    # ex-date, written only under the opt-in key. A valued spin-off is already in the
+    # frame (a dividend in kind, item 2), so it is neither read nor counted.
+    counts = _rebalance_counts(plan, book)
+    if signed and book.series == STRATEGY_SERIES and book.level == params.costs.per_side_bps:
+        counts = dict(counts)
+        counts["n_drift_covers"] = n_drift
+    if spin_offs is not None:
+        counts = dict(counts)
+        counts.update(_spin_off_counts(book, plan.session, end, spin_offs, chains))
 
     book.cash = cash
     previous_positions = set(book.positions)
     last = values.filter(pl.col("session") == end)
+    # `!= 0` keeps a short's negative value (item 4); under `long_only` the guard above
+    # already excluded negative values, so it selects exactly what `> 0` did.
     book.positions = {
-        sid: value for sid, value in last.select("security_id", "value").iter_rows() if value > 0
+        sid: value for sid, value in last.select("security_id", "value").iter_rows() if value != 0
     }
     book.held_since = {
         sid: book.held_since[sid] if sid in previous_positions else plan.session
@@ -778,8 +1218,21 @@ def _step(
             n_universe=plan.n_universe,
             n_static_listings=plan.n_static_listings,
             n_targets=len(targets),
-            turnover=fill.turnover + (exited / (2 * before) if before > 0 else 0.0),
-            cost_paid=math.fsum([fill.cost_paid, *(e.cost for e in exits)]),
+            turnover=fill.turnover
+            + (
+                (exited + prefill_drift_value + math.fsum(-e.value for e in drift_exits))
+                / (2 * before)
+                if before > 0
+                else 0.0
+            ),
+            cost_paid=math.fsum(
+                [
+                    fill.cost_paid,
+                    prefill_drift_cost,
+                    *(e.cost for e in exits),
+                    *(e.cost for e in drift_exits),
+                ]
+            ),
             gap_count_share=plan.gap.count_share,
             gap_size_share=plan.gap.size_share,
             n_missing_fill=len(fill.missing),
@@ -787,9 +1240,21 @@ def _step(
             n_stale_exits=sum(e.stale for e in exits),
             n_dropped_dividends=n_dropped,
             n_late_dividends=n_late,
-            counts=plan.counts,
+            counts=counts,
         )
     )
+
+
+def _rebalance_counts(plan: Plan, book: _Book) -> Mapping[str, int]:
+    """The rebalance row's counts: the plan's, plus `n_chained_positions` (#821,
+    T187b) on the one step whose read saw the chain and renamed `book`'s
+    positions (0 in every other step, so no extra count row is written)."""
+    if not book.chained_positions:
+        return plan.counts
+    counts = dict(plan.counts)
+    counts["n_chained_positions"] = book.chained_positions
+    book.chained_positions = 0
+    return counts
 
 
 def _price_on(frame: pl.DataFrame, sid: str, session: date, fill_price: str) -> float | None:
@@ -919,8 +1384,10 @@ def _keyed_call(provider: DataProvider, key: _Key, ids: list[str], bound: date |
         if bound is None:
             return provider.adjusted_prices(t, ids, include_dividends)
         return provider.adjusted_prices(t, ids, include_dividends, sessions_from=bound)
-    if method == "late_dividends":
-        return provider.late_dividends(t, cast(datetime, args[1]), ids)
+    if method == "late_dividends" or method == "late_spin_offs":
+        return cast(Callable[[datetime, datetime, list[str]], object], getattr(provider, method))(
+            t, cast(datetime, args[1]), ids
+        )
     read = cast(Callable[[datetime, list[str]], object], getattr(provider, cast(str, method)))
     return read(t, ids)
 
@@ -1039,6 +1506,9 @@ class _SharedReads:
     def universe(self, t: datetime) -> Universe:
         return self._once(("universe", t), lambda: self._provider.universe(t))
 
+    def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        return self._once(("chains", t), lambda: self._provider.chains(t))
+
     def adjusted_prices(
         self,
         t: datetime,
@@ -1072,6 +1542,12 @@ class _SharedReads:
 
     def late_dividends(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         return cast(pl.DataFrame, self._read(("late_dividends", t_prev, t), ids))
+
+    def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return cast(pl.DataFrame, self._read(("unvalued_spin_offs", t), ids))
+
+    def late_spin_offs(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return cast(pl.DataFrame, self._read(("late_spin_offs", t_prev, t), ids))
 
     def static_listing_count(self, t: datetime, ids: Sequence[str]) -> int:
         return self._once(
@@ -1127,6 +1603,11 @@ class _Requests:
     def universe(self, t: datetime) -> Universe:
         return self.view.universe(t)
 
+    def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        # Not a keyed read: the engine reads it once per step itself, never a
+        # signal reader (T187b).
+        return self.view.chains(t)
+
     def adjusted_prices(
         self,
         t: datetime,
@@ -1154,6 +1635,12 @@ class _Requests:
 
     def late_dividends(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         return self._ask(("late_dividends", t_prev, t), ids)
+
+    def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return self._ask(("unvalued_spin_offs", t), ids)
+
+    def late_spin_offs(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return self._ask(("late_spin_offs", t_prev, t), ids)
 
     def static_listing_count(self, t: datetime, ids: Sequence[str]) -> int:
         return self.view.static_listing_count(t, ids)
@@ -1202,7 +1689,7 @@ class _Variant:
 
 
 def _check_variants(
-    variants: Sequence[tuple[Settings, TrialHandle]], cost_levels: Sequence[float]
+    variants: Sequence[tuple[Settings, TrialHandle]], cost_levels: Sequence[float], provider: object
 ) -> list[float]:
     """Every refusal before any read; the checked cost levels."""
     if not variants:
@@ -1235,6 +1722,27 @@ def _check_variants(
     cadences = {params.schedule.rebalance_cadence for params, _ in variants}
     if len(cadences) != 1:
         raise ValueError(f"a read group runs at one cadence, got {sorted(cadences)}")
+    # One provider holds one frozen Settings, so its `adjust.apply_spin_offs` decides the
+    # group's frames while each variant's own decides its counts (#1894, item 3): a mixed
+    # group would count spin-offs it never read, so it is refused before any read.
+    spin_offs = {params.adjust.apply_spin_offs for params, _ in variants}
+    if len(spin_offs) != 1:
+        raise ValueError(
+            "a read group reads one provider: every variant needs the same "
+            f"adjust.apply_spin_offs, got {sorted(spin_offs)}"
+        )
+    # The provider's own frozen `Settings` decide its frames; a provider built from other
+    # settings would serve frames the variant's counts do not match (#1894, item 3). A
+    # provider with no `settings` (a fake) carries no flag to check.
+    provider_settings = getattr(provider, "settings", None)
+    if provider_settings is not None:
+        flag = variants[0][0].adjust.apply_spin_offs
+        if provider_settings.adjust.apply_spin_offs != flag:
+            raise ValueError(
+                "the provider's adjust.apply_spin_offs "
+                f"({provider_settings.adjust.apply_spin_offs}) differs from the variants' "
+                f"({flag}): its frames would not carry the spin-off factor the counts assume"
+            )
     return levels
 
 
@@ -1247,7 +1755,13 @@ def _plan_all(
 ) -> dict[int, Plan]:
     """Each open variant's plan at `session`, from one signal read for the group: with
     several variants, each one's reader first says what it reads (`_Requests`), and
-    each keyed read is made once for their union before any variant plans."""
+    each keyed read is made once for their union before any variant plans.
+
+    Each variant's plan carries the buffer (`_apply_buffer`): its `previous_targets` is
+    the plan the run loop carries for it, `variant.plan`, which is `None` at the run's
+    first plan and the previous step's plan -- already renamed through the live
+    successor chains by `_rename_chained` -- at every later one (spec amendment #657,
+    items 2 and 4)."""
     if len(group) > 1:
         strategy = signal_for(family)
         cadence = group[0].settings.schedule.rebalance_cadence
@@ -1268,8 +1782,11 @@ def _plan_all(
             view.share(key, asked)
     plans: dict[int, Plan] = {}
     for variant in list(group):
+        previous = () if variant.plan is None else variant.plan.targets
         try:
-            plans[variant.trial_id] = _plan(view, variant.settings, session, family)
+            plans[variant.trial_id] = _apply_buffer(
+                _plan(view, variant.settings, session, family), variant.settings, previous
+            )
         except _ReadError:
             raise
         except Exception as exc:
@@ -1313,7 +1830,7 @@ def run_many(
     `()` (#1448: a summary-level sweep writes neither). Nothing else changes.
     """
     signal_for(family)
-    levels = _check_variants(variants, cost_levels)
+    levels = _check_variants(variants, cost_levels, provider)
     cadence = variants[0][0].schedule.rebalance_cadence
     sessions = rebalance_sessions(start, end, cadence)
     if len(sessions) < 2:
@@ -1338,18 +1855,38 @@ def run_many(
         raise SharedReadFailed([v.trial_id for v in group], cause) from cause
 
     for variant in group:
+        sensitivity = tuple(book for book in variant.books if book.series != STRATEGY_SERIES)
         out[variant.trial_id] = {
             book.level: BacktestResult(
                 cost_per_side_bps=book.level,
-                equity=tuple(book.equity),
+                equity=tuple(book.equity)
+                + (
+                    tuple(row for extra in sensitivity for row in extra.equity)
+                    if book.level == variant.settings.costs.per_side_bps
+                    else ()
+                ),
                 rebalances=tuple(book.rebalances),
                 weights=tuple(book.weights),
                 position_values=pl.concat([pl.DataFrame(schema=_POSITION_SCHEMA), *book.values]),
                 marking_frames=tuple(variant.frames),
                 targets=dict(variant.targets),
                 rates=variant.rates,
+                exposure_summary=(
+                    ExposureSummary(
+                        gross_mean=math.fsum(gross for gross, _ in book.exposures)
+                        / len(book.exposures),
+                        gross_max=max(gross for gross, _ in book.exposures),
+                        net_mean=math.fsum(net for _, net in book.exposures) / len(book.exposures),
+                        net_min=min(net for _, net in book.exposures),
+                        net_max=max(net for _, net in book.exposures),
+                        borrow_paid=book.borrow_paid,
+                    )
+                    if variant.settings.portfolio.side == "long_short"
+                    else None
+                ),
             )
             for book in variant.books
+            if book.series == STRATEGY_SERIES
         }
     return out
 
@@ -1398,11 +1935,26 @@ def _run_group(
             )
             for level in levels
         ]
+        if variant.settings.portfolio.side == "long_short":
+            seen_rates: set[float] = set()
+            for rate in variant.settings.costs.borrow_sensitivity_bps:
+                if rate in seen_rates:
+                    continue
+                seen_rates.add(rate)
+                variant.books.append(
+                    _Book(
+                        level=variant.settings.costs.per_side_bps,
+                        cash=capital,
+                        keep_detail=False,
+                        series=f"strategy_borrow_{rate:g}bp",
+                        borrow_bps=rate,
+                    )
+                )
         for book in variant.books:
-            book.equity.append(
-                EquityRow(STRATEGY_SERIES, book.level, sessions[0], capital, capital)
-            )
-            for name in benchmarks:
+            book.equity.append(EquityRow(book.series, book.level, sessions[0], capital, capital))
+            if variant.settings.portfolio.side == "long_short":
+                book.exposures.append((0.0, 0.0))
+            for name in benchmarks if book.series == STRATEGY_SERIES else ():
                 book.equity.append(EquityRow(name, book.level, sessions[0], capital, None))
         if variant.settings.backtest.cash_rate == "store":
             try:
@@ -1415,6 +1967,14 @@ def _run_group(
             return
         view.new_step()
         t = read_time(step_end, cadence)
+        # #821 (T187b): the live successor chains known at this step's read, applied
+        # to every variant's books and plans before the marking ids are built, so a
+        # held predecessor becomes its successor at one point (one share for one
+        # share) and the step's reads name the successor.
+        chains = view.chains(t)
+        if chains:
+            for variant in group:
+                _rename_chained(variant, chains)
         own = [_marking_ids(variant, benchmarks) for variant in group]
         t_prev = read_time(cast(Plan, group[0].plan).session, cadence)
         view.share(
@@ -1428,6 +1988,14 @@ def _run_group(
         view.share(("listing_ends", t), [(ids, None) for ids, _, _ in own])
         view.share(("dropped_dividends", t), [(ids, None) for ids, _, _ in own])
         view.share(("late_dividends", t_prev, t), [(held, None) for _, _, held in own])
+        # A spin-off read happens only under the opt-in key (#1894, item 3), so a group
+        # with no `adjust.apply_spin_offs = true` variant makes none and stays byte-identical.
+        if any(variant.settings.adjust.apply_spin_offs for variant in group):
+            view.share(("unvalued_spin_offs", t), [(ids, None) for ids, _, _ in own])
+            view.share(
+                ("late_spin_offs", t_prev, t),
+                [(_spin_off_held_ids(held, chains), None) for _, _, held in own],
+            )
         last = index == len(sessions) - 1
         next_plans = {} if last else _plan_all(view, group, step_end, family, failed)
         for variant in list(group):
@@ -1440,6 +2008,7 @@ def _run_group(
                     benchmarks,
                     next_plans.get(variant.trial_id),
                     family,
+                    chains,
                 )
             except _ReadError:
                 raise
@@ -1472,6 +2041,56 @@ def _cash_accruals(
     )
     yields = {s: to_yield(rate, metrics.risk_free_basis) for s, rate in published.items()}
     return session_accruals(every, yields, series=series)
+
+
+def _rename_chained(variant: _Variant, chains: Sequence[tuple[str, str]]) -> None:
+    """Rename a variant's books and plans through the live successor chains
+    (#821, T187b): each book's positions (one share for one share, summing a
+    collision), `held_on`, `held_since`, `entries` and `marked_at` keys, its
+    plan's targets, the targets it recorded per fill session, its last-stitched
+    sessions, and its benchmarks' holdings. `chained_positions` counts the
+    positions renamed for the book's next rebalance row; the map is idempotent,
+    so a later step re-reads no renamed name. The engine's `_marking_ids` and
+    reads then name the successor."""
+    mapping = dict(chains)
+    plan = variant.plan
+    if plan is not None:
+        targets = {mapping.get(sid, sid): weight for sid, weight in plan.targets.items()}
+        if targets != plan.targets:
+            variant.plan = replace(plan, targets=targets)
+    variant.last_stitched = {
+        mapping.get(sid, sid): session for sid, session in variant.last_stitched.items()
+    }
+    variant.targets = {
+        session: {mapping.get(sid, sid): weight for sid, weight in targets.items()}
+        for session, targets in variant.targets.items()
+    }
+    for book in variant.books:
+        positions: dict[str, float] = {}
+        renamed = 0
+        for sid, value in book.positions.items():
+            successor = mapping.get(sid, sid)
+            renamed += successor != sid
+            positions[successor] = positions.get(successor, 0.0) + value
+        book.positions = positions
+        book.chained_positions += renamed
+        book.marked_at = {mapping.get(sid, sid): day for sid, day in book.marked_at.items()}
+        held_since: dict[str, date] = {}
+        for sid, day in book.held_since.items():
+            successor = mapping.get(sid, sid)
+            held_since[successor] = min(day, held_since.get(successor, day))
+        book.held_since = held_since
+        entries: dict[str, int] = {}
+        for sid, count in book.entries.items():
+            successor = mapping.get(sid, sid)
+            entries[successor] = count + entries.get(successor, 0)
+        book.entries = entries
+        held_on: dict[str, set[date]] = {}
+        for sid, days in book.held_on.items():
+            held_on.setdefault(mapping.get(sid, sid), set()).update(days)
+        book.held_on = held_on
+        for holding in book.benchmarks.values():
+            holding.security_id = mapping.get(holding.security_id, holding.security_id)
 
 
 def _marking_ids(
@@ -1529,6 +2148,7 @@ def _variant_step(
     benchmarks: Mapping[str, str],
     next_plan: Plan | None,
     family: HypothesisFamily,
+    chains: Sequence[tuple[str, str]],
 ) -> None:
     """One variant's step through `step_end` from the shared reads, restricted to its
     own ids: carry, fill, value and exit every level, then take `next_plan`. `index` is
@@ -1538,11 +2158,21 @@ def _variant_step(
     cadence = params.schedule.rebalance_cadence
     t, t_prev = read_time(step_end, cadence), read_time(plan.session, cadence)
     ids, marked, ever_held = (list(part) for part in _marking_ids(variant, benchmarks))
-    frame = view.marking_prices(t, marked, _marking_bound(variant, step_end, family, marked))
+    marking_bound = _marking_bound(variant, step_end, family, marked)
+    frame = view.marking_prices(t, marked, marking_bound)
     raw = view.raw_prices(t, marked)
     ended = _ended(view.listing_ends(t, ids), step_end)
     dropped = view.dropped_dividends(t, ids)
     late = view.late_dividends(t_prev, t, ever_held)
+    spin_offs: tuple[pl.DataFrame, pl.DataFrame] | None = None
+    if params.adjust.apply_spin_offs:
+        # The late reader selects raw `source_action_id` parents. Keep the
+        # predecessor in this spin-off-only read after the book is renamed.
+        spin_held = _spin_off_held_ids(ever_held, chains)
+        spin_offs = (
+            view.unvalued_spin_offs(t, ids),
+            view.late_spin_offs(t_prev, t, spin_held),
+        )
     if next_plan is not None:
         next_plan = _no_benchmark_members(next_plan, benchmarks)
     if variant.keep_frames:
@@ -1556,6 +2186,14 @@ def _variant_step(
         variant.last_stitched[sid] = session
     variant.targets[plan.fill_session] = dict(plan.targets)
     construction = _construction(params, family)
+    decisions: dict[date, pl.DataFrame] | None = None
+    if params.portfolio.side == "long_short":
+        decisions = {
+            session: view.adjusted_prices(
+                session_close(session), marked, True, sessions_from=marking_bound
+            )
+            for session in _sessions(plan.fill_session, step_end)
+        }
     for book in variant.books:
         _step(
             book,
@@ -1569,7 +2207,11 @@ def _variant_step(
             params,
             construction,
             variant.accruals,
+            spin_offs,
+            chains,
+            decisions,
         )
-        _benchmark_step(book, plan, step_end, frame, raw, params)
+        if book.series == STRATEGY_SERIES:
+            _benchmark_step(book, plan, step_end, frame, raw, params)
     if next_plan is not None:
         variant.plan = next_plan

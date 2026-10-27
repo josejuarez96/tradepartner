@@ -353,3 +353,63 @@ def test_the_file_names_the_release_and_the_window_start(
         }
     ]
     assert "store_max_ingested_at" in data
+
+
+# --- #1524: reads made before the window's first session -------------------------
+
+
+def _saturday_window(conn: duckdb.DuckDBPyConnection) -> datetime:
+    """A window started Saturday 2026-10-10 14:00 NY (first session Monday
+    10-12) with a run on that Monday: its close(S-1) is Friday 10-09's close."""
+    started = datetime(2026, 10, 10, 18, tzinfo=UTC)
+    _window(conn, 1, started)
+    _run(conn, 1, MARK, "mark")
+    return started
+
+
+def test_a_pre_window_row_within_reach_of_close_s_minus_1_fails(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    _saturday_window(conn)
+    assert window_first_session(conn) == MARK
+    friday_close = _close(date(2026, 10, 9))
+    _filing(conn, 1, friday_close + timedelta(hours=1))  # New York Friday: before the window
+    result = compute_precheck(conn, release="r1", made_at=STARTED)
+    assert not result.passed
+    (hit,) = result.in_reach
+    assert (hit.table, hit.instant, hit.rows) == ("filing_events", friday_close, 1)
+    assert result.candidates["filing_events"].in_reach == 1
+    # the in-window row and refusal counts still start at the window's first session
+    assert result.candidates["filing_events"].rows == 0
+
+
+def test_a_pre_window_row_within_reach_of_a_non_session_started_at_fails(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    started = _saturday_window(conn)
+    _filing(conn, 1, started + timedelta(hours=2))  # Saturday 16:00 NY
+    result = compute_precheck(conn, release="r1", made_at=STARTED)
+    assert not result.passed
+    assert result.in_reach[0].instant == started
+
+
+def test_pre_window_rows_outside_reach_of_every_instant_still_pass(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    started = _saturday_window(conn)
+    _filing(conn, 1, _close(date(2026, 10, 9)))  # at the instant itself: unmoved
+    _filing(conn, 2, _close(date(2026, 10, 9)) + timedelta(hours=5, seconds=1))
+    _filing(conn, 3, started - timedelta(hours=1))  # before every instant... after close(S-1)+5h
+    _filing(conn, 4, _close(date(2026, 10, 9)) - timedelta(hours=1))  # before the earliest read
+    result = compute_precheck(conn, release="r1", made_at=STARTED)
+    assert [h.rows for h in result.in_reach] == []
+    assert result.passed
+
+
+def test_candidate_rows_with_no_window_still_count_nothing(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    _filing(conn, 1, _close(MARK))
+    counts, failing = candidate_rows(conn, None, [_close(MARK)])
+    assert failing == []
+    assert all(c.in_reach == 0 for c in counts.values())

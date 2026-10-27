@@ -11,7 +11,10 @@ unclassifiable and `snapshot_static` reliance, settings, statement facts
 is on, the last EDGAR run's `statement_*` counts and a warning badge while
 `statement_vintage_late > 0`), the borrow-status block (issue 1506,
 T171e: the switch, rows, the latest observation, the shortable and ETB
-counts at it, the last run and the stale and switch warnings), the coverage
+counts at it, the last run and the stale and switch warnings), the mergers
+block (issue 1762, T248e: rows by kind, the latest `known_at`, the last
+run's counts, and the report-only conflict and bar-after-effective-date
+lists), the coverage
 check against the named
 reference (issue 1541, T180: "not computed" until the viewer presses its
 button, since it costs one universe read per sample session; never computed
@@ -41,10 +44,12 @@ bar session up to the last completed session, shown as a warning chip when
 positive.
 
 **Sources.** The "latest run" chip is green for `ok`, orange (a caution,
-not a failure) for a maintenance run's own status (`repair-resolution`'s
-`repaired`, `ingest --fill-holes`'s `filled`, issue 833: deliberately never
-`ok`, so neither counts as a fresh ingest for "last ok" or the staleness
-check above) or when the source has never run, and red for anything else.
+not a failure) when the source has never run, and red for anything else. A
+maintenance or repair run (`repair-resolution`'s `repaired`,
+`ingest --fill-holes`'s `filled`, a `master-retract` or an `action-retract`
+row) is not an ingest: `health.last_ingests` leaves it out, so it never shows
+as the source's latest run and never hides a real ingest's status (issue 833,
+issue 2125).
 """
 
 from __future__ import annotations
@@ -59,33 +64,27 @@ import duckdb
 import polars as pl
 import streamlit as st
 
-from tradepartner.backfill import FILLED
 from tradepartner.calendar import all_sessions, last_completed_session
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
 from tradepartner.health import (
     COVERAGE_REFERENCE_NAMES,
     INDEX_MEMBERS_MISSING,
+    INGEST_TIME_ET,
     CoverageReference,
     HealthReport,
     IndexMembersCheck,
     health_report,
+    health_verdict,
+    stale_gap_expected,
+    stale_sessions,
 )
-from tradepartner.repair import REPAIRED
 from tradepartner.store.classify import COMMON, classifications_as_of
 from tradepartner.store.delistings import LISTED, TRANSFERRED, listing_ends_as_of
 from tradepartner.store.master import securities_as_of
 
 #: Sessions the window control starts with (a view default, not a threshold).
 DEFAULT_WINDOW_SESSIONS: Final = 60
-
-#: Statuses a maintenance run (`repair-resolution`, `ingest --fill-holes`)
-#: writes on success (issue 833): never `ok` (that stays the only "fresh"
-#: status, ingest's own staleness check, module docstring), but not a
-#: failure either, so the "Sources" card shows them as a caution, not an
-#: alarm. Shared from `repair`/`backfill`, never copied, so a renamed
-#: status can't drift silently out of this set.
-_MAINTENANCE_STATUSES: Final[frozenset[str]] = frozenset({REPAIRED, FILLED})
 
 #: The coverage card's button: true only on the rerun its press triggers.
 COVERAGE_BUTTON_KEY: Final = "health_coverage_reference"
@@ -110,6 +109,8 @@ class HealthView:
     as_of: datetime | None
     last_updated: datetime | None
     stale_sessions: int | None
+    verdict: str
+    gap_expected: bool
 
 
 def _now() -> datetime:
@@ -171,14 +172,6 @@ def _series(
     return pl.DataFrame(out, schema=_SERIES_SCHEMA, orient="row")
 
 
-def _stale_sessions(report: HealthReport) -> int | None:
-    last_bar = report.coverage.last_bar
-    if last_bar is None:
-        return None
-    sessions = all_sessions()
-    return bisect.bisect_right(sessions, report.session) - bisect.bisect_right(sessions, last_bar)
-
-
 def load_health_view(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -202,7 +195,9 @@ def load_health_view(
         threshold=settings.ingest.max_missing_share,
         as_of=header.store_freshness(conn, t).as_of,
         last_updated=max(finished, default=None),
-        stale_sessions=_stale_sessions(report),
+        stale_sessions=stale_sessions(report),
+        verdict=health_verdict(report),
+        gap_expected=stale_gap_expected(report),
     )
 
 
@@ -213,12 +208,16 @@ def _default_window(session: date) -> tuple[date, date]:
 
 
 def _header(view: HealthView) -> None:
+    st.markdown(f"**{view.verdict}**")
     header.render_freshness(header.Freshness(view.as_of, view.last_updated))
     if view.stale_sessions is None:
         theme.status_badge("no bars yet", "warning")
     elif view.stale_sessions:
         plural = "" if view.stale_sessions == 1 else "s"
-        theme.status_badge(f"stale: {view.stale_sessions} session{plural}", "warning")
+        note = (
+            f" (expected until the {INGEST_TIME_ET:%H:%M} ET ingest)" if view.gap_expected else ""
+        )
+        theme.status_badge(f"stale: {view.stale_sessions} session{plural}{note}", "warning")
 
 
 def _kpis(view: HealthView) -> None:
@@ -301,7 +300,15 @@ def _integrity_card(report: HealthReport) -> None:
         st.subheader("Integrity checks")
         for check in report.integrity:
             if check.passed:
-                theme.status_badge(f"{check.rule}: pass", "good")
+                pending = len(report.duplicate_dividends.pending)
+                if check.rule == "duplicate_dividends" and pending:
+                    theme.status_badge(
+                        f"duplicate_dividends: pass ({pending} pending repair; "
+                        "each payment is still counted twice)",
+                        "warning",
+                    )
+                else:
+                    theme.status_badge(f"{check.rule}: pass", "good")
             else:
                 theme.status_badge(f"{check.rule}: fail ({check.violations.height})", "critical")
         label, tone = coverage_badge(report.coverage_reference)
@@ -406,10 +413,6 @@ def _sources_card(report: HealthReport) -> None:
                 theme.status_badge("never run", "warning")
             elif ingest.latest_status == "ok":
                 theme.status_badge("latest run: ok", "good")
-            elif ingest.latest_status in _MAINTENANCE_STATUSES:
-                # A successful repair or hole-fill (issue 833): not a fresh
-                # ingest, but not a failure either.
-                theme.status_badge(f"latest run: {ingest.latest_status}", "warning")
             else:
                 theme.status_badge(f"latest run: {ingest.latest_status}", "critical")
             if ingest.latest_message:
@@ -532,6 +535,26 @@ def _borrow_card(report: HealthReport) -> None:
             theme.status_badge(warning, "warning")
 
 
+def _mergers_card(report: HealthReport) -> None:
+    """The mergers block (issue 1762, T248e): rows by kind, the latest
+    `known_at`, the last Alpaca run's counts and the two report-only lists."""
+    mergers = report.mergers
+    with st.container(border=True):
+        st.subheader("Mergers")
+        st.markdown(" · ".join(f"{kind} {n}" for kind, n in mergers.rows_by_kind.items()))
+        st.caption(f"Latest known at {header.when(mergers.latest_known_at)}")
+        counts = ", ".join(f"{k} {v}" for k, v in sorted(mergers.run_counts.items()))
+        st.caption(f"Last run: {counts or 'never'}")
+        st.markdown(f"Merger conflicts ({mergers.conflicts.height})")
+        if mergers.conflicts.height:
+            st.dataframe(mergers.conflicts, hide_index=True)
+        st.markdown(
+            f"Acquirees with a bar after their effective date ({mergers.after_effective.height})"
+        )
+        if mergers.after_effective.height:
+            st.dataframe(mergers.after_effective, hide_index=True)
+
+
 def _tables(report: HealthReport) -> None:
     st.subheader("Gap report")
     st.dataframe(report.gaps.rows, hide_index=True)
@@ -578,6 +601,7 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
         _statement_card(view.report)
         _rates_card(view.report)
         _borrow_card(view.report)
+        _mergers_card(view.report)
         _coverage_card(
             view.report,
             settings.coverage.check_enabled,

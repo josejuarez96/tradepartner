@@ -139,7 +139,13 @@ from tradepartner.execution.collect import (
 )
 from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.reconcile import OK
-from tradepartner.execution.reconcile_run import command_session, frozen_risk, reconcile_now
+from tradepartner.execution.reconcile_run import (
+    command_session,
+    frozen_risk,
+    reconcile_now,
+    verify_frozen_sha256,
+)
+from tradepartner.execution.window import ACCOUNT_MISMATCH
 from tradepartner.store.journal import (
     FillRow,
     OrderEventRow,
@@ -530,8 +536,10 @@ def resume(
     `TypeError` before anything. `connect` opens a write chunk
     (`lambda: store.db.open_for_write(settings)`). Raises `ValueError` for a
     blank `reason` before anything, `LockHeld` while another process holds the
-    run lock, `ClockError` for a bad clock reading, and whatever the broker or
-    the store raises; a refusal is an outcome, never an exception. `book_id`
+    run lock, `LimitBreachError` when the window's `frozen_json` no longer hashes to
+    its `frozen_sha256` (#2017), `ClockError` for a bad clock reading, and whatever the broker or
+    the store raises; a refusal (an `account_mismatch` among them, before any
+    write) is an outcome, never an exception. `book_id`
     (default `paper.book_id`, `ValueError` outside the token grammar) names the
     book: its run lock and its open window only (ADR 0017 B.3 and B.5)."""
     if not reason.strip():
@@ -545,9 +553,26 @@ def resume(
         if window is None:
             return ResumeOutcome(NO_WINDOW, None, ("no_window: no paper window is open",))
         window_id = _window_id(window)
+        # Before the first read or write: limits edited after `paper start` refuse
+        # the resume with the run's `LimitBreachError` (#1984, #2017).
+        verify_frozen_sha256(window)
         frozen = frozen_risk(window)
         now = _read_clock(clock)
         stamps = _MonotonicStamps(now)
+
+        # Before any broker-derived write (#2187): another account's broker does
+        # not know this window's orders, so settling them against it would journal
+        # them `not_received` while they live on at the window's own account.
+        account = broker.account()
+        if account.account_id != window.account_id:
+            return ResumeOutcome(
+                REFUSED,
+                None,
+                (
+                    f"{ACCOUNT_MISMATCH}: the broker's account {account.account_id!r} "
+                    f"is not window {window_id}'s {window.account_id!r}",
+                ),
+            )
 
         resume_id, seen, crashed, pending = _start(
             connect,

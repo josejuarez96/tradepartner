@@ -574,7 +574,8 @@ def test_tracking_window_on_or_before_holdout_end_is_refused(
     assert (outcome.status, outcome.results) == ("refused_window", None)
     assert calls == []
     trial = _row(read(), "trials", outcome.trial_id)
-    assert trial["kind"] == "in_sample"
+    # #1923: a refused tracking run is still a tracking row, never an `in_sample` one.
+    assert trial["kind"] == "tracking"
 
 
 # --- the development boundary (ADR 0016 points 2 and 4; plan T142b) -----------------
@@ -757,6 +758,10 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
                 "master.chains_dismissed",
                 "master.chain_window_sessions",
                 "master.chain_max_price_ratio",
+                "adjust.apply_spin_offs",
+                "strategy.hold_top_fraction",
+                "portfolio.",
+                "costs.borrow",
             )
         )
     }
@@ -870,6 +875,10 @@ def _register_more(
             "master.chains_dismissed",
             "master.chain_window_sessions",
             "master.chain_max_price_ratio",
+            "adjust.apply_spin_offs",
+            "strategy.hold_top_fraction",
+            "portfolio.",
+            "costs.borrow",
         )
         params = {k: v for k, v in params.items() if not k.startswith(later)}
     with open_for_write(_store(path)) as conn:

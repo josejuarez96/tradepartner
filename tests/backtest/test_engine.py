@@ -10,11 +10,13 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 import polars as pl
 import pytest
+from conftest import load_chain_overlay, load_universe_fixtures
+from polars.testing import assert_frame_equal
 
 from backtest.fake_provider import FakeProvider
 from tradepartner.backtest import engine
@@ -26,7 +28,9 @@ from tradepartner.backtest.signals import momentum_12_1
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import all_sessions, last_completed_session, session_close
 from tradepartner.config import Cadence, HypothesisFamily, Settings, SignalAnchor
-from tradepartner.store import registry
+from tradepartner.store import registry, schema
+from tradepartner.store.asof import adjusted_prices_as_of, prices_as_of
+from tradepartner.store.db import configure_connection, insert_row
 
 SRC = Path(__file__).parents[2] / "src" / "tradepartner" / "backtest"
 
@@ -109,6 +113,12 @@ def _run(
 
 def _equity(result: BacktestResult) -> dict[date, float]:
     return {row.session: row.equity for row in result.equity}
+
+
+def _strategy_equity(result: BacktestResult) -> dict[date, float]:
+    """The strategy series' equity by session: a `StoreProvider` run also carries the store's
+    benchmark series, whose rows share every session and would overwrite it in `_equity`."""
+    return {row.session: row.equity for row in result.equity if row.series == STRATEGY_SERIES}
 
 
 def _rows(result: BacktestResult, session: date) -> Any:
@@ -500,6 +510,441 @@ class TestDividends:
         assert [row.n_dropped_dividends for row in result.rebalances] == [1, 0, 0]
 
 
+class TestSpinOffs:
+    """`adjust.apply_spin_offs` (backtest spec amendment #1894, T211e): the engine reads
+    the two spin-off counts from the provider only under the opt-in key, a valued
+    spin-off is a dividend in kind (item 2), and a late one matches a late dividend
+    (item 4).
+
+    The store's own frames are the hand fixture of `tests/lookahead/test_spin_off.py`: the
+    held parent A flat at 100, a child C whose ex-date close is 20, a ratio of 0.5, so
+    D = r x C = 10 and the factor is 0.9. `test_a_valued_spin_off_equals_the_dividend_in_kind`
+    reads them through `adjusted_prices_as_of`, so the engine's equity over the two is
+    the store's frame equality, not a stand-in's."""
+
+    EX = date(2024, 2, 15)
+    D, P, RATIO = 10.0, 100.0, 0.5
+
+    @staticmethod
+    def _params(*, on: bool) -> Settings:
+        return _params(
+            strategy={"top_fraction": 1.0},
+            costs={"per_side_bps": 0.0},
+            adjust={"apply_spin_offs": on},
+        )
+
+    @staticmethod
+    def _members() -> dict[date, list[str]]:
+        return {session: ["A"] for session in rebalance_sessions(T0, HISTORY_END)}
+
+    @staticmethod
+    def _bar(sid: str, session: date, close: float) -> dict[str, object]:
+        stamp = session_close(session)
+        return {
+            "security_id": sid,
+            "session": session,
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": 1000,
+            "known_at": stamp,
+            "ingested_at": stamp,
+            "source": "alpaca",
+            "provenance": "bar",
+        }
+
+    def _base(self, *, drop: bool) -> pl.DataFrame:
+        """Name A flat at P, dropping to P - D at the ex-date when `drop`."""
+        schema = {
+            "security_id": pl.Utf8,
+            "session": pl.Date,
+            "open": pl.Float64,
+            "close": pl.Float64,
+            "known_at": pl.Datetime("us", "UTC"),
+        }
+        rows = [
+            (
+                "A",
+                session,
+                self.P,
+                self.P - self.D if drop and session >= self.EX else self.P,
+                session_close(session),
+            )
+            for session in SESSIONS
+        ]
+        return pl.DataFrame(rows, schema=schema, orient="row")
+
+    def _store_frames(self) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+        """`(spin_off, unadjusted, dividend)`: the store's frames for the held name A over
+        the module sessions, once with the `spinoff` row (child C at 20, ratio 0.5, ex
+        2024-02-15), once without it, and once with the dividend of r x C = 10 in its
+        place. The parent is A, the member the engine actually holds."""
+        conn = duckdb.connect(":memory:")
+        configure_connection(conn)
+        schema.init_schema(conn)
+        for session in SESSIONS:
+            conn_bar = self.P - self.D if session >= self.EX else self.P
+            insert_row(conn, "prices_daily", self._bar("A", session, conn_bar))
+        for session in SESSIONS:
+            if session >= self.EX:
+                insert_row(conn, "prices_daily", self._bar("C", session, self.D / self.RATIO))
+        insert_row(
+            conn,
+            "corporate_actions",
+            {
+                "security_id": "C",
+                "action_type": "spinoff",
+                "ex_date": self.EX,
+                "ratio_or_amount": self.RATIO,
+                "announced_at": None,
+                "source_action_id": "A",
+                "cancelled": False,
+                "known_at": session_close(self.EX),
+                "ingested_at": session_close(self.EX),
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+        settings = Settings(_env_file=None)
+        t = session_close(T2)
+        spin = adjusted_prices_as_of(
+            conn, t, ["A"], include_dividends=True, include_spin_offs=True, settings=settings
+        )
+        unadjusted = adjusted_prices_as_of(
+            conn, t, ["A"], include_dividends=True, settings=settings
+        )
+        conn.execute("DELETE FROM corporate_actions")
+        insert_row(
+            conn,
+            "corporate_actions",
+            {
+                "security_id": "A",
+                "action_type": "dividend",
+                "ex_date": self.EX,
+                "ratio_or_amount": self.D,
+                "announced_at": None,
+                "source_action_id": "",
+                "cancelled": False,
+                "known_at": session_close(self.EX),
+                "ingested_at": session_close(self.EX),
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+        dividend = adjusted_prices_as_of(conn, t, ["A"], include_dividends=True, settings=settings)
+        conn.close()
+        return spin, unadjusted, dividend
+
+    def _provider(
+        self,
+        *,
+        unvalued: bool = False,
+        late: bool = False,
+        unadjusted: pl.DataFrame | None = None,
+        adjusted: pl.DataFrame | None = None,
+    ) -> FakeProvider:
+        """One always-held name A; the frames default to the flat dividend-in-kind frame,
+        the declared rows are the test's (a row `ex` 2024-02-15, in the T0 step's window)."""
+        base = unadjusted if unadjusted is not None else self._base(drop=True)
+        frame = adjusted if adjusted is not None else self._base(drop=True)
+        unvalued_rows = (
+            pl.DataFrame(
+                {
+                    "security_id": ["A"],
+                    "child": ["C"],
+                    "ex_date": [self.EX],
+                    "reason": ["no_child_close"],
+                    "known_at": [session_close(date(2024, 2, 20))],
+                },
+                schema_overrides={"known_at": pl.Datetime("us", "UTC")},
+            )
+            if unvalued
+            else pl.DataFrame(
+                schema={
+                    "security_id": pl.Utf8,
+                    "child": pl.Utf8,
+                    "ex_date": pl.Date,
+                    "reason": pl.Utf8,
+                    "known_at": pl.Datetime("us", "UTC"),
+                }
+            )
+        )
+        late_rows = (
+            pl.DataFrame(
+                {
+                    "security_id": ["A"],
+                    "ex_date": [self.EX],
+                    "ratio_or_amount": [self.RATIO],
+                    "known_at": [session_close(date(2024, 3, 5))],
+                },
+                schema_overrides={"known_at": pl.Datetime("us", "UTC")},
+            )
+            if late
+            else pl.DataFrame(
+                schema={
+                    "security_id": pl.Utf8,
+                    "ex_date": pl.Date,
+                    "ratio_or_amount": pl.Float64,
+                    "known_at": pl.Datetime("us", "UTC"),
+                }
+            )
+        )
+        dividends = pl.DataFrame(
+            schema={
+                "security_id": pl.Utf8,
+                "ex_date": pl.Date,
+                "ratio_or_amount": pl.Float64,
+                "known_at": pl.Datetime("us", "UTC"),
+            }
+        )
+        return FakeProvider(
+            prices=base,
+            dividend_prices=frame,
+            raw=base,
+            members=self._members(),
+            benchmarks={},
+            dividends=dividends,
+            unvalued_spin_offs_rows=unvalued_rows,
+            late_spin_offs_rows=late_rows,
+        )
+
+    def test_the_two_counts_are_written_only_under_the_opt_in(self) -> None:
+        provider = self._provider(unvalued=True, late=True)
+        on = _run(provider, self._params(on=True), levels=[0.0])[0.0]
+        assert [row.counts.get("n_spin_offs_unvalued") for row in on.rebalances] == [1, 0, 0]
+        assert [row.counts.get("n_late_spin_offs") for row in on.rebalances] == [0, 1, 0]
+        assert {"unvalued_spin_offs", "late_spin_offs"} <= {call.method for call in provider.calls}
+        # The same rows at the default: no count name, no read, byte-identical.
+        off_provider = self._provider(unvalued=True, late=True)
+        off = _run(off_provider, self._params(on=False), levels=[0.0])[0.0]
+        plain = _run(self._provider(), self._params(on=False), levels=[0.0])[0.0]
+        assert _run_digest(off) == _run_digest(plain)
+        assert [row.counts for row in off.rebalances] == [row.counts for row in plain.rebalances]
+        assert not {"unvalued_spin_offs", "late_spin_offs"} & {
+            call.method for call in off_provider.calls
+        }
+
+    def test_a_mixed_opt_in_read_group_is_refused(self) -> None:
+        """One provider holds one frozen `Settings`, so its `adjust.apply_spin_offs`
+        decides the group's frames while each variant's own decides its counts: a group
+        mixing the flag would count spin-offs no read served (item 3)."""
+        variants = [
+            (self._params(on=True), _handle()),
+            (self._params(on=False), _handle(2)),
+        ]
+        provider = self._provider()
+        with pytest.raises(ValueError, match="apply_spin_offs"):
+            engine.run_many(variants, provider, T0, T3, (0.0,), family="momentum")
+        assert provider.calls == []
+
+    def test_a_provider_flag_that_differs_from_the_variants_is_refused(self) -> None:
+        """The provider's own frozen `Settings` decide its frames (#1894, item 3), so a
+        provider built from other settings would serve frames the variant's counts do not
+        match: `run_many` refuses it before any read, like a mixed-flag group."""
+        from tradepartner.backtest.provider import DataProvider
+
+        class _Provider:
+            settings = _params(adjust={"apply_spin_offs": False})
+
+        variants = [(_params(adjust={"apply_spin_offs": True}), _handle())]
+        with pytest.raises(ValueError, match=r"provider's adjust\.apply_spin_offs"):
+            engine.run_many(
+                variants,
+                cast(DataProvider, _Provider()),
+                T0,
+                T3,
+                (0.0,),
+                family="momentum",
+            )
+
+    def test_a_valued_spin_off_equals_the_dividend_in_kind(self) -> None:
+        """The store's `spinoff` frame equals its dividend of r x C to 1e-12, and the
+        engine's equity over each is equal: a valued row (no unvalued or late listing)
+        earns exactly the dividend, and the true trial's counts are zero (items 2, 3, 5)."""
+        spin, unadjusted, dividend = self._store_frames()
+        assert_frame_equal(spin, dividend, check_exact=False, abs_tol=1e-12)
+        # Teeth: the factor is real, so a provider that dropped the opt-in read this frame.
+        assert not spin.equals(unadjusted)
+        on = _run(
+            self._provider(unadjusted=unadjusted, adjusted=spin),
+            self._params(on=True),
+            levels=[0.0],
+        )[0.0]
+        off = _run(
+            self._provider(unadjusted=unadjusted, adjusted=dividend),
+            self._params(on=False),
+            levels=[0.0],
+        )[0.0]
+        assert _equity(on) == pytest.approx(_equity(off), rel=1e-12)
+        assert all(row.n_targets == 1 for row in on.rebalances)  # A is held, not cash
+        assert all(row.counts.get("n_spin_offs_unvalued") == 0 for row in on.rebalances)
+        assert all(row.counts.get("n_late_spin_offs") == 0 for row in on.rebalances)
+        assert all("n_spin_offs_unvalued" not in row.counts for row in off.rebalances)
+
+    #: The fixture universe's spin-off material for the store-driven late case (T211e):
+    #: `SEC_SPLIT_FUTURE` is a member at every rebalance here and `SEC_SPLIT_PLAIN` has a
+    #: bar on every session, so the child's E close and the parent's prior close are real
+    #: stored bars, not a fake's frames.
+    LATE_PARENT, LATE_CHILD = "SEC_SPLIT_FUTURE", "SEC_SPLIT_PLAIN"
+    LATE_E = date(2018, 12, 13)
+    LATE_KNOWN = datetime(2018, 12, 14, 21, 0, tzinfo=UTC)
+    LATE_RATIO = 0.25
+    LATE_START, LATE_END = date(2018, 11, 30), date(2018, 12, 31)
+
+    @staticmethod
+    def _plant(
+        conn: duckdb.DuckDBPyConnection,
+        *,
+        security_id: str,
+        action_type: str,
+        amount: float,
+        source_action_id: str,
+        at: datetime,
+    ) -> None:
+        insert_row(
+            conn,
+            "corporate_actions",
+            {
+                "security_id": security_id,
+                "action_type": action_type,
+                "ex_date": TestSpinOffs.LATE_E,
+                "ratio_or_amount": amount,
+                "announced_at": None,
+                "source_action_id": source_action_id,
+                "cancelled": False,
+                "known_at": at,
+                "ingested_at": at,
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+
+    @staticmethod
+    def _late_trial(conn: duckdb.DuckDBPyConnection, settings: Settings, slug: str) -> Any:
+        hypothesis = registry.register_hypothesis(
+            conn,
+            slug=slug,
+            family="momentum",
+            title=slug,
+            doc_path=f"docs/hypotheses/{slug}.md",
+            doc_sha256="0" * 64,
+            params={"costs.per_side_bps": 0.0},
+            in_sample_start=TestSpinOffs.LATE_START,
+            holdout_start=date(2020, 1, 1),
+            holdout_end=date(2021, 12, 31),
+            registered_by="test",
+            settings=settings,
+        )
+        return registry.open_trial(
+            conn,
+            hypothesis_id=hypothesis.hypothesis_id,
+            kind="in_sample",
+            start_session=TestSpinOffs.LATE_START,
+            end_session=TestSpinOffs.LATE_END,
+            data_cutoff=session_close(TestSpinOffs.LATE_END),
+            synthetic=True,
+            run_by="test",
+            settings=settings,
+        )
+
+    def _late_run(self, conn: duckdb.DuckDBPyConnection, settings: Settings, slug: str) -> Any:
+        handle = self._late_trial(conn, settings, slug)
+        connect = _lend(conn)
+        with StoreProvider(connect, handle, settings, registry_connect=connect) as provider:
+            return run(
+                settings,
+                provider,
+                self.LATE_START,
+                self.LATE_END,
+                handle,
+                (0.0,),
+                family="momentum",
+            )[0.0]
+
+    @pytest.mark.usefixtures("_no_env_file")
+    def test_a_late_spin_off_matches_a_late_dividend(self) -> None:
+        """A `spinoff` row first known after the step that owned its ex-date is counted late
+        on a held parent and never restates the earlier steps (item 4, T211e). Run on a real
+        store through `StoreProvider`: the same row known in time scales the parent's pre-E
+        marks and moves equity away from the row-free store (the adjustment is real, so the
+        equivalence has teeth), while the late row's `true` book equals a late parent
+        dividend of r x C, to 1e-12, and the row-free store at every session (no
+        restatement). The step that first knows the late row counts it once."""
+        base = Settings(
+            _env_file=None,
+            strategy={"top_fraction": 1.0},
+            costs={"per_side_bps": 0.0},
+            schedule={"rebalance_cadence": "daily"},
+        )
+        on = Settings(
+            _env_file=None,
+            strategy={"top_fraction": 1.0},
+            costs={"per_side_bps": 0.0},
+            schedule={"rebalance_cadence": "daily"},
+            adjust={"apply_spin_offs": True},
+        )
+        plain = _fixture_conn()
+        (child_close,) = (
+            prices_as_of(plain, session_close(self.LATE_E), [self.LATE_CHILD])
+            .filter(pl.col("session") == self.LATE_E)["close"]
+            .to_list()
+        )
+        amount = self.LATE_RATIO * child_close
+        in_time = session_close(date(2018, 12, 12))  # the session before E, known by its step
+
+        def spin_row(at: datetime) -> duckdb.DuckDBPyConnection:
+            conn = _fixture_conn()
+            self._plant(
+                conn,
+                security_id=self.LATE_CHILD,
+                action_type="spinoff",
+                amount=self.LATE_RATIO,
+                source_action_id=self.LATE_PARENT,
+                at=at,
+            )
+            return conn
+
+        def div_row(at: datetime) -> duckdb.DuckDBPyConnection:
+            conn = _fixture_conn()
+            self._plant(
+                conn,
+                security_id=self.LATE_PARENT,
+                action_type="dividend",
+                amount=amount,
+                source_action_id="",
+                at=at,
+            )
+            return conn
+
+        none = self._late_run(plain, base, "h-spin-none")
+        spin = self._late_run(spin_row(self.LATE_KNOWN), on, "h-spin-late")
+        div = self._late_run(div_row(self.LATE_KNOWN), base, "h-div-late")
+        timed = self._late_run(spin_row(in_time), on, "h-spin-timed")
+        timed_div = self._late_run(div_row(in_time), base, "h-div-timed")
+        # The store seeds benchmarks (SPY, MTUM), whose equity rows share every session: keep
+        # the strategy series alone, as `_equity` would drop it for a benchmark's.
+        et, etd = _strategy_equity(timed), _strategy_equity(timed_div)
+        es, ed, en = _strategy_equity(spin), _strategy_equity(div), _strategy_equity(none)
+        assert all(row.n_targets > 0 for row in spin.rebalances)  # the parent is held, not cash
+        # In time, the factor is real: the spin-off's book equals the dividend's and moves away
+        # from the row-free store, so the late equality below is not a flat-cash tautology.
+        assert et == pytest.approx(etd, rel=1e-12)
+        assert et[self.LATE_E] != pytest.approx(en[self.LATE_E], rel=1e-9)
+        # Late: the `true` book equals the late dividend's and the row-free store everywhere
+        # (earlier steps' equity is never restated when the row arrives).
+        assert set(es) == set(ed) == set(en)
+        for session in es:
+            assert es[session] == pytest.approx(ed[session], rel=1e-12)
+            assert es[session] == pytest.approx(en[session], rel=1e-12)
+        late_spin = {row.session: row.counts.get("n_late_spin_offs") for row in spin.rebalances}
+        assert late_spin[self.LATE_E] == 1
+        assert sum(count or 0 for count in late_spin.values()) == 1
+        assert all(row.counts.get("n_spin_offs_unvalued") == 0 for row in spin.rebalances)
+        assert all(row.counts.get("n_late_spin_offs") == 0 for row in timed.rebalances)
+        assert [row.n_late_dividends for row in div.rebalances if row.session == self.LATE_E] == [1]
+
+
 class TestInvariance:
     def test_a_shorter_run_is_a_prefix_of_a_longer_one(self) -> None:
         short = _run(_provider(), end=T2, levels=[0.0, 15.0])
@@ -744,6 +1189,7 @@ class TestPublicPlan:
         assert public.exclusions == {
             "no_history": public.excluded_no_history,
             "no_turnover": (),
+            "no_t0_bar": (),
         }
         assert public.counts == {"n_excluded_no_history": public.n_excluded_no_history}
 
@@ -1096,6 +1542,19 @@ def _lend(conn: duckdb.DuckDBPyConnection) -> Callable[[], Any]:
     return _connect
 
 
+#: The fixture universe, for the store-driven spin-off test (T211e).
+FIXTURE_UNIVERSE = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
+
+
+def _fixture_conn() -> duckdb.DuckDBPyConnection:
+    """A fresh in-memory store with the fixture universe loaded, as `fixture_store` builds."""
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    schema.init_schema(conn)
+    load_universe_fixtures(conn, FIXTURE_UNIVERSE)
+    return conn
+
+
 @pytest.mark.usefixtures("_no_env_file")
 @pytest.mark.parametrize(
     ("cadence", "start", "end"),
@@ -1259,9 +1718,12 @@ def test_the_twin_pin_fails_if_the_screen_reads_or_runs_at_the_default(
     assert _run_digest(results[0.0]) != TWIN_RUN_DIGESTS[0.0]
 
 
-#: The provider methods the twin's run calls: no turnover read.
+#: The provider methods the twin's run calls: no turnover read. `chains` (#821,
+#: T187b) is the engine's once-per-step live successor-chain read; it is empty on
+#: the fake and changes no run digest, only the call log.
 TWIN_CALL_METHODS = {
     "universe",
+    "chains",
     "adjusted_prices",
     "raw_prices",
     "static_listing_count",
@@ -1271,8 +1733,8 @@ TWIN_CALL_METHODS = {
     "dropped_dividends",
     "late_dividends",
 }
-TWIN_N_CALLS = 37
-TWIN_CALL_LOG_SHA256 = "0ddf16574afb66249b0115c32bdd659dddb9259ed87abf2bf2c2500d6d003665"
+TWIN_N_CALLS = 41
+TWIN_CALL_LOG_SHA256 = "84941e2098cbff6122a610b8b2a0b2b63f13a7a8c6a23378fb25116ac867f25a"
 #: Per cost level: a SHA-256 over the equity, rebalance (counts included), weight and
 #: target rows, floats rounded to nine places.
 TWIN_RUN_DIGESTS = {
@@ -1287,3 +1749,281 @@ TWIN_FINAL_EQUITY = {
     60.0: 113295.2130230013,
     100.0: 111947.28992016679,
 }
+
+
+class TestSuccessorChains:
+    """The engine's rename of a chained predecessor (#821, plan T187b)."""
+
+    def _variant(self) -> engine._Variant:
+        from tradepartner.backtest.provider import GapReading
+
+        variant = engine._Variant(settings=_params(), handle=_handle())
+        variant.plan = engine.Plan(
+            session=T0,
+            fill_session=T1,
+            targets={"PRE": 1.0},
+            n_universe=1,
+            n_static_listings=0,
+            n_excluded_no_history=0,
+            gap=GapReading(count_share=0.0, size_share=0.0),
+            members=("PRE",),
+            scores={"PRE": 1.0},
+            excluded_no_history=(),
+        )
+        variant.books = [engine._Book(level=0.0, cash=0.0)]
+        book = variant.books[0]
+        book.positions = {"PRE": 1234.0}
+        book.marked_at = {"PRE": T0}
+        book.held_since = {"PRE": T0}
+        book.entries = {"PRE": 1}
+        book.held_on = {"PRE": {T0}}
+        variant.last_stitched = {"PRE": T0}
+        variant.targets = {T1: {"PRE": 1.0}}
+        return variant
+
+    def test_a_held_predecessor_is_renamed_to_its_successor(self) -> None:
+        variant = self._variant()
+        engine._rename_chained(variant, (("PRE", "POST"),))
+        book = variant.books[0]
+        assert book.positions == {"POST": 1234.0}  # one share for one share
+        assert book.marked_at == {"POST": T0}
+        assert book.held_since == {"POST": T0}
+        assert book.entries == {"POST": 1}
+        assert book.held_on == {"POST": {T0}}
+        assert variant.plan is not None and variant.plan.targets == {"POST": 1.0}
+        assert variant.targets == {T1: {"POST": 1.0}}
+        assert variant.last_stitched == {"POST": T0}
+        assert book.chained_positions == 1
+
+    def test_the_count_lands_on_the_rebalance_row_then_resets(self) -> None:
+        variant = self._variant()
+        book = variant.books[0]
+        engine._rename_chained(variant, (("PRE", "POST"),))
+        plan = cast(engine.Plan, variant.plan)
+        counts = engine._rebalance_counts(plan, book)
+        assert counts["n_chained_positions"] == 1
+        assert book.chained_positions == 0
+        # A step with no chain writes the plan's counts unchanged (no extra row).
+        assert engine._rebalance_counts(plan, book) is plan.counts
+
+    def test_the_map_is_idempotent(self) -> None:
+        variant = self._variant()
+        engine._rename_chained(variant, (("PRE", "POST"),))
+        engine._rename_chained(variant, (("PRE", "POST"),))
+        assert variant.books[0].positions == {"POST": 1234.0}
+        assert variant.books[0].chained_positions == 1  # not counted twice
+
+    def test_a_collision_sums_the_values(self) -> None:
+        variant = self._variant()
+        variant.books[0].positions = {"PRE": 100.0, "POST": 25.0}
+        engine._rename_chained(variant, (("PRE", "POST"),))
+        assert variant.books[0].positions == {"POST": 125.0}
+
+    def test_spin_off_counts_follow_only_the_chain_known_at_the_step(
+        self, chain_fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        """A held predecessor has one late and one unvalued spin-off after rename.
+
+        The fixture's live 1:1 chain supplies the IDs. The rows remain keyed to the
+        stored predecessor; the book is keyed to the successor. Without that live
+        chain, neither row is entitled to the successor's held sessions.
+        """
+        predecessor, successor = chain_fixture_store.execute(
+            "SELECT predecessor_id, successor_id FROM successor_chains "
+            "WHERE successor_id = '0001000011'"
+        ).fetchone()
+        variant = self._variant()
+        book = variant.books[0]
+        book.positions = {predecessor: 1234.0}
+        book.held_on = {predecessor: {date(2020, 2, 5), date(2020, 2, 6)}}
+        engine._rename_chained(variant, ((predecessor, successor),))
+        late_ex = date(2020, 2, 6)  # held on the prior session, February 5
+        unvalued_ex = date(2020, 2, 7)  # held on the prior session, February 6
+        assert engine._held_before(book, predecessor, late_ex) is False
+        assert engine._held_before(book, predecessor, unvalued_ex) is False
+        assert engine._held_before(book, successor, late_ex) is True
+        assert engine._held_before(book, successor, unvalued_ex) is True
+        unvalued = pl.DataFrame({"security_id": [predecessor], "ex_date": [unvalued_ex]})
+        late = pl.DataFrame({"security_id": [predecessor], "ex_date": [late_ex]})
+        expected_missing = {"n_spin_offs_unvalued": 0, "n_late_spin_offs": 0}
+        expected_live = {"n_spin_offs_unvalued": 1, "n_late_spin_offs": 1}
+        assert (
+            engine._spin_off_counts(book, date(2020, 2, 5), unvalued_ex, (unvalued, late), ())
+            == expected_missing
+        )
+        live = ((predecessor, successor),)
+        assert (
+            engine._spin_off_counts(book, date(2020, 2, 5), unvalued_ex, (unvalued, late), live)
+            == expected_live
+        )
+
+    def test_spin_off_counts_follow_two_live_hops_without_look_ahead(self) -> None:
+        """A's two rows count under C only once both chain hops are live."""
+        book = self._variant().books[0]
+        book.held_on = {"C": {date(2020, 2, 5), date(2020, 2, 6)}}
+        late = pl.DataFrame({"security_id": ["A"], "ex_date": [date(2020, 2, 6)]})
+        unvalued = pl.DataFrame({"security_id": ["A"], "ex_date": [date(2020, 2, 7)]})
+        start, end = date(2020, 2, 5), date(2020, 2, 7)
+        one_hop = (("A", "B"),)
+        two_hops = (*one_hop, ("B", "C"))
+        assert engine._spin_off_held_ids(("C",), one_hop) == ("C",)
+        assert engine._spin_off_counts(book, start, end, (unvalued, late), one_hop) == {
+            "n_spin_offs_unvalued": 0,
+            "n_late_spin_offs": 0,
+        }
+        assert engine._spin_off_held_ids(("C",), two_hops) == ("A", "B", "C")
+        assert engine._spin_off_counts(book, start, end, (unvalued, late), two_hops) == {
+            "n_spin_offs_unvalued": 1,
+            "n_late_spin_offs": 1,
+        }
+        # When both hops arrive together, the engine's one-hop rename leaves B held.
+        book.held_on = {"B": {date(2020, 2, 5), date(2020, 2, 6)}}
+        assert engine._spin_off_held_ids(("B",), two_hops) == ("A", "B")
+        assert engine._spin_off_counts(book, start, end, (unvalued, late), two_hops) == {
+            "n_spin_offs_unvalued": 1,
+            "n_late_spin_offs": 1,
+        }
+
+    def test_spin_off_parent_cycle_does_not_follow_forever(self) -> None:
+        book = self._variant().books[0]
+        book.held_on = {"C": {date(2020, 2, 5)}}
+        cycle = (("A", "B"), ("B", "A"))
+        late = pl.DataFrame({"security_id": ["A"], "ex_date": [date(2020, 2, 6)]})
+        empty = pl.DataFrame(schema={"security_id": pl.String, "ex_date": pl.Date})
+        assert engine._spin_off_held_ids(("C",), cycle) == ("C",)
+        assert (
+            engine._spin_off_counts(book, date(2020, 2, 5), date(2020, 2, 6), (empty, late), cycle)[
+                "n_late_spin_offs"
+            ]
+            == 0
+        )
+
+    @pytest.mark.usefixtures("_no_env_file")
+    def test_late_chained_spin_off_reads_from_temp_store(self, fixture_store_path: Path) -> None:
+        """The real provider selects the predecessor's late action after rename."""
+        conn = duckdb.connect(str(fixture_store_path))
+        try:
+            load_chain_overlay(conn)
+            predecessor, successor = "0001000010", "0001000011"
+            known = session_close(date(2020, 2, 7))
+            insert_row(
+                conn,
+                "corporate_actions",
+                {
+                    "security_id": "CHAIN_SPIN_CHILD",
+                    "action_type": "spinoff",
+                    "ex_date": date(2020, 2, 6),
+                    "ratio_or_amount": 0.5,
+                    "announced_at": None,
+                    "source_action_id": predecessor,
+                    "cancelled": False,
+                    "known_at": known,
+                    "ingested_at": known,
+                    "source": "alpaca",
+                    "provenance": "action",
+                },
+            )
+            settings = _params(adjust={"apply_spin_offs": True})
+            # StoreProvider validates a registered trial handle on construction.
+            hypothesis = registry.register_hypothesis(
+                conn,
+                slug="h-chain-late-spin",
+                family="momentum",
+                title="late chained spin off",
+                doc_path="docs/hypotheses/h-chain-late-spin.md",
+                doc_sha256="0" * 64,
+                params={"costs.per_side_bps": 15.0},
+                in_sample_start=date(2020, 1, 31),
+                holdout_start=date(2021, 1, 1),
+                holdout_end=date(2022, 1, 1),
+                registered_by="test",
+                settings=settings,
+            )
+            handle = registry.open_trial(
+                conn,
+                hypothesis_id=hypothesis.hypothesis_id,
+                kind="in_sample",
+                start_session=date(2020, 1, 31),
+                end_session=date(2020, 2, 28),
+                data_cutoff=session_close(date(2020, 2, 28)),
+                synthetic=True,
+                run_by="test",
+                settings=settings,
+            )
+            connect = _lend(conn)
+            with StoreProvider(connect, handle, settings, registry_connect=connect) as provider:
+                chains = provider.chains(known)
+                assert (predecessor, successor) in chains
+                ids = engine._spin_off_held_ids((successor,), chains)
+                assert predecessor in ids
+                late = provider.late_spin_offs(session_close(date(2020, 2, 6)), known, ids)
+            assert late.select("security_id", "ex_date").rows() == [(predecessor, date(2020, 2, 6))]
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize("same_step", [False, True], ids=["separate-steps", "same-step"])
+    def test_a_two_hop_parent_counts_both_spin_off_rows_in_the_run(self, same_step: bool) -> None:
+        """Both rows count whether the two hops arrive together or separately."""
+        predecessor, middle, successor = "PRE", "MID", "POST"
+        prices = pl.concat(
+            [
+                _price_rows()
+                .filter(pl.col("security_id") == "A")
+                .with_columns(pl.lit(sid).alias("security_id"))
+                for sid in (predecessor, middle, successor)
+            ]
+        )
+        unvalued = pl.DataFrame(
+            {
+                "security_id": [predecessor],
+                "child": ["CHILD"],
+                "ex_date": [date(2024, 3, 15)],
+                "reason": ["no_child_close"],
+                "known_at": [session_close(date(2024, 3, 20))],
+            },
+            schema_overrides={"known_at": pl.Datetime("us", "UTC")},
+        )
+        late = pl.DataFrame(
+            {
+                "security_id": [predecessor],
+                "ex_date": [date(2024, 2, 15)],
+                "ratio_or_amount": [0.5],
+                "known_at": [session_close(date(2024, 3, 5))],
+            },
+            schema_overrides={"known_at": pl.Datetime("us", "UTC")},
+        )
+
+        class _StepChainProvider(FakeProvider):
+            def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+                self._record("chains", t)
+                first = ((predecessor, middle),)
+                if t >= read_time(T2):
+                    return (*first, (middle, successor))
+                return () if same_step else first
+
+            def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+                # The store re-keys this parent to the successor; this fake keeps
+                # the raw predecessor to exercise the count's mapping too.
+                wanted = [*ids, predecessor] if successor in ids or middle in ids else ids
+                return super().unvalued_spin_offs(t, wanted)
+
+        provider = _StepChainProvider(
+            prices=prices,
+            members={
+                T0: [predecessor],
+                T1: [predecessor if same_step else middle],
+                T2: [successor],
+            },
+            benchmarks={},
+            unvalued_spin_offs_rows=unvalued,
+            late_spin_offs_rows=late,
+        )
+        settings = _params(
+            strategy={"top_fraction": 1.0},
+            costs={"per_side_bps": 0.0},
+            adjust={"apply_spin_offs": True},
+        )
+        result = _run(provider, settings, end=T2, levels=[0.0])[0.0]
+        assert [row.n_targets for row in result.rebalances] == [1, 1]
+        assert [row.counts["n_spin_offs_unvalued"] for row in result.rebalances] == [0, 1]
+        assert [row.counts["n_late_spin_offs"] for row in result.rebalances] == [0, 1]

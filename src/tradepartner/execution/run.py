@@ -161,15 +161,24 @@ test of step 3 runs again (its rows written the same either way); only its
 to cash and the broker's cash read here would be a false positive (T63f).
 Otherwise one `unspent_cash` alert at most, naming every rebalance reaching
 `executed` here whose cash exceeds the frozen `risk.max_unspent_cash_fraction`
-of the broker's equity read at that moment. The cash is the batch's
-`BatchOutcome.cash_left` for the batch's own rebalance when its buys phase
-read the cash, else the broker's cash read with that equity. A rebalance
+of the broker's equity read at that moment. The cash is the broker's, read with
+that equity after the run's own collection (#1982), less the market value of any
+shorts held (their proceeds are collateral, not idle): the batch's
+`BatchOutcome.cash_left` is the cash at sizing, before a buy the broker cancelled
+or expired went terminal, so it cannot show the cash that stayed idle. A rebalance
 gets one `executed` row, so this call site names it at most once; a run
 reaching `executed` for a rebalance at step 3 and another (or the same one)
 here calls `_unspent_cash` twice, and the alerter's (kind, run) dedupe keeps
 only the first of the two alerts (rare under current settings). The batch's
 status (`skipped_kill_switch` when the wrapper read the switch engaged) is
 the run's.
+
+**The fill-price band** (#1981). Every collection of the run (step 3, step 7b and the
+wrapper's sells and buys collections) passes `collect` a `PriceBand`: a fill it
+journals outside `paper.max_fill_price_deviation` (run-time, default 0.25) of its
+reference price raises `SystemFaultError` naming
+`fill_price_outside_band`, so the run takes the halt path (a `halted` alert, the kill
+switch) before the next phase sizes anything on the bad fill's cash.
 
 **Steps 8 and 9.** `reconcile_now` again, cut the same way, then the result row:
 `ok`, or the batch's `skipped_kill_switch` (after its `kill_switch` alert, as at step 6).
@@ -237,9 +246,11 @@ from tradepartner.execution.alerts import Alerter
 from tradepartner.execution.collect import (
     Collected,
     Connect,
+    PriceBand,
     WriteOffContext,
     collect,
     lag_verdict,
+    note_unjudged,
 )
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.lock import LockHeld, resolve_book, run_lock
@@ -257,12 +268,13 @@ from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, Mismatch, 
 from tradepartner.execution.reconcile import OK as RECONCILED
 from tradepartner.execution.reconcile_run import (
     frozen_risk,
+    order_symbols,
     reconcile_now,
     settle_pending_unresolved,
     unresolved_orders,
+    verify_frozen_sha256,
 )
 from tradepartner.execution.risk import OpenSell, unfilled_sells
-from tradepartner.execution.symbols import broker_symbol
 from tradepartner.execution.window import window_cadence
 from tradepartner.execution.wrapper import (
     CRASH_EXIT_CODE,
@@ -405,6 +417,15 @@ class RunOutcome:
     session: date | None = None
     kind: str | None = None
     notes: tuple[str, ...] = ()
+    engaged: bool = False
+
+    @property
+    def healthy(self) -> bool:
+        """True when the book ended able to trade: exits 0, did not skip on an
+        engaged switch, and (a `no_session` run) has no engaged switch. The off-Mac
+        heartbeat pings `/fail` for any unhealthy book, so a halt keeps the check
+        red until `paper resume` (#2179); exit codes are unchanged."""
+        return self.exit_code == 0 and self.status != SKIPPED_KILL_SWITCH and not self.engaged
 
     @property
     def exit_code(self) -> int:
@@ -506,9 +527,11 @@ def stop_step(context: StepContext) -> BatchOutcome | None:
     handed, untradable = _journal_forced_exits(context, _exit_book(context), pending_rebalance=None)
     # Read again: this run's forced exits block a `window_stop` exit of their name.
     book = _exit_book(context)
+    held = book.exitable(context)
     stops = exits.stop_exits(
-        book.ledger.positions,
-        _residues(context, book),
+        held,
+        # Over the same holdings: an ambiguous name's residue is not its exit's (#2185).
+        {name: part for name, part in _residues(context, book).items() if name in held},
         book.assets,
         book.decisions,
         book.states,
@@ -584,7 +607,7 @@ def _execute(
 ) -> BatchOutcome:
     """The wrapper's two phases; every exception it raises takes the halt path."""
     try:
-        return context.gate.execute(context.run, decisions, forced)
+        return context.gate.execute(context.run, decisions, forced, notes=context.notes)
     except Exception as exc:
         raise _Halt(exc) from exc
 
@@ -608,6 +631,20 @@ class _ExitBook:
     assets: dict[str, Asset]
     marks: list[PositionDailyRow]
     runs: list[PaperRunRow]
+    #: Held names the one symbol map leaves ambiguous, with their notes (#2185).
+    ambiguous: dict[str, str] = field(default_factory=dict)
+
+    def exitable(self, context: StepContext) -> dict[str, float]:
+        """The ledger's holdings the exits may decide: an ambiguous name gets no
+        new forced or `window_stop` exit this run (its flags are never read
+        under the old symbol, and a guessed whole-share flag would be frozen on
+        the exit), noted on the run and in its `skipped` alert; the name stays
+        held, so `paper stop` refuses `not_flat` until it resolves."""
+        for name in sorted(set(self.ambiguous) & set(self.ledger.positions)):
+            line = f"{self.ambiguous[name]}; no new exit made while it is ambiguous"
+            context.notes.append(line)
+            context.gate.note_unsent(line)
+        return {k: v for k, v in self.ledger.positions.items() if k not in self.ambiguous}
 
 
 def _exit_book(context: StepContext) -> _ExitBook:
@@ -659,13 +696,7 @@ def _exit_book(context: StepContext) -> _ExitBook:
             if held
             else {}
         )
-        tickers = (
-            _current_symbols(
-                listings_as_of(conn, cut, held), session, context.settings.alpaca.class_symbols
-            )
-            if held
-            else {}
-        )
+        tickers, ambiguous = _current_symbols(conn, session, held, context.settings, window_id)
         marks_rows = positions_daily_for(conn, window_id)
         run_rows = [r.run for r in runs_for(conn, window_id)]
     price_of = _lookup(prices, unpriced)
@@ -711,6 +742,7 @@ def _exit_book(context: StepContext) -> _ExitBook:
         },
         marks=marks_rows,
         runs=run_rows,
+        ambiguous=ambiguous,
     )
 
 
@@ -730,7 +762,7 @@ def _journal_forced_exits(
     exits journaled: (the decisions to hand to the sells phase, the names whose
     new exit was journaled closed `untradable`)."""
     new = exits.forced_exits(
-        book.ledger.positions,
+        book.exitable(context),
         book.delisted,
         book.assets,
         book.decisions,
@@ -1080,13 +1112,20 @@ class BookRun:
     error: BaseException | None = None
     exit_code: int = 0
 
+    @property
+    def healthy(self) -> bool:
+        """Whether the book ended able to trade (`RunOutcome.healthy`); a crash is not."""
+        return self.outcome is not None and self.outcome.healthy and self.exit_code == 0
 
-def open_books(settings: Settings) -> tuple[str, ...]:
+
+def open_books(
+    settings: Settings, *, on_wait: Callable[[str], None] | None = None
+) -> tuple[str, ...]:
     """Every book with an open window (no `closed` or `abandoned` stop row), in
     token order, over a short read-only connection; empty on a store with no
     journal. A book with two open windows is listed once: its own run then fails
-    closed on them (`journal.open_window`)."""
-    with open_read_only(settings, retry=True) as conn:
+    closed on them (`journal.open_window`). `on_wait` is `open_read_only`'s."""
+    with open_read_only(settings, retry=True, on_wait=on_wait) as conn:
         try:
             require_journal(conn)
         except JournalNotInitialised:
@@ -1159,6 +1198,18 @@ def _locked_run(
     version, dirty = registry.code_version()
     if not is_session(day):
         with connect() as conn:
+            prior = runs_for(conn, window_id)
+            state = switch.derive(
+                window,
+                kill_switch_events_for(conn, window_id),
+                [r.run for r in prior],
+                [r.result for r in prior if r.result is not None],
+                reading_run=None,
+                lock_free=True,
+            )
+            switch_engaged = bool(state.causes) or bool(
+                store_journal.unconsumed_kill_switch_overrides(conn, window_id)
+            )
             run_id = append(
                 conn,
                 PaperRunRow(
@@ -1184,7 +1235,7 @@ def _locked_run(
                     ingested_at=now,
                 ),
             )
-        return RunOutcome(NO_SESSION, run_id=run_id)
+        return RunOutcome(NO_SESSION, run_id=run_id, engaged=switch_engaged)
 
     frozen = frozen_risk(window)
     alerter = _ChunkAlerter(settings, connect, clock)
@@ -1409,6 +1460,8 @@ class _Run:
         return self._finish(SKIPPED_KILL_SWITCH)
 
     def _finish(self, status: str) -> RunOutcome:
+        # A ticker-change note no batch alerted yet (#2185): the run's `skipped` alert.
+        self.gate.alert_unsent(self.run)
         finished = self.gate.read_clock()
         notes = tuple(dict.fromkeys(self.notes))
         with self.connect() as conn:
@@ -1468,6 +1521,9 @@ class _Run:
     # --- the steps -----------------------------------------------------------------
 
     def _steps(self) -> RunOutcome:
+        # First, before any broker read: limits edited after `paper start` halt the
+        # run (a `LimitBreachError`, the halt path) and nothing is sent (#1984).
+        verify_frozen_sha256(self.window)
         account = self._broker_call(Broker.account.__name__, self.broker.account)
         if account.account_id != self.window.account_id:
             raise ReconciliationError(
@@ -1486,7 +1542,7 @@ class _Run:
             )
         )
         collected = self._collect()
-        self._unspent_cash(self._executed(actions, prices), {})
+        self._unspent_cash(self._executed(actions, prices))
         if self.kind == _STOP:
             self._stop_missed()
         reconciliation = self._reconcile()
@@ -1513,13 +1569,34 @@ class _Run:
             lagging=lagging,
             notes=self.notes,
         )
-        rebalance: date | None = None
         if self.kind == _STOP:
             self.submit_begun = True
             batch = stop_step(context)
         elif self._due() is not None:
             plan = self._plan(lagging)
-            rebalance = plan.rebalance_session
+            if plan.no_t0_bar:
+                # #1997: a candidate with no T_0 bar was excluded, visibly; the run goes on.
+                # #2023: a held one is kept at its quantity (a `skip_zero` decision), not sold.
+                kept = sorted(
+                    {
+                        d.security_id
+                        for d in plan.decisions
+                        if d.decision == "skip_zero" and d.security_id in plan.no_t0_bar
+                    }
+                )
+                others = [sid for sid in plan.no_t0_bar if sid not in kept]
+                message = (
+                    f"rebalance {plan.rebalance_session.isoformat()}: universe candidate(s) "
+                    "with no T_0 bar excluded as excluded_no_t0_bar: " + ", ".join(plan.no_t0_bar)
+                )
+                if kept:
+                    message += (
+                        "; held and kept at their current quantity until the next rebalance; "
+                        "re-ingest the bar or the next rebalance sells them: " + ", ".join(kept)
+                    )
+                    if others:
+                        message += "; not kept: " + ", ".join(others)
+                self._alert("missing_candidate_bar", message)
             # The halt path's write-off back-fill prices every name now decided.
             self.write_offs = WriteOffContext(
                 self.window_id, actions, self._pending_prices(actions).__getitem__, self.session
@@ -1537,8 +1614,7 @@ class _Run:
             )
             executed = self._executed(actions, prices)
             if self.kind != _STOP:
-                cash_left = {rebalance: batch.cash_left} if rebalance is not None else {}
-                self._unspent_cash(executed, cash_left)
+                self._unspent_cash(executed)
         self._reconcile()
         if batch is not None and batch.status == SKIPPED_KILL_SWITCH:
             return self._skipped()
@@ -1625,6 +1701,37 @@ class _Run:
             }
             return planning.reference_prices(conn, self.session, names, actions)
 
+    def _price_band(self, orders: Sequence[OrderRow]) -> PriceBand | None:
+        """The fill-price band of one of this run's collections (#1981), None until
+        the step-1 write-off context exists. Its reference prices cover the names
+        decided in a pending rebalance (the context's) and the names of `orders`
+        themselves, so a forced exit's or a stop run's sell is judged as well; a
+        name with no bar at all has no price and is not judged."""
+        context = self.write_offs
+        if context is None:
+            return None
+        prices: dict[str, float] = {}
+        names = sorted({o.security_id for o in orders})
+        with open_read_only(self.settings, retry=True) as conn:
+            try:
+                prices = planning.reference_prices(
+                    conn, context.session, names, context.actions_as_of
+                )
+            except ValueError:  # one name has no bar: price the others one by one
+                for name in names:
+                    with suppress(ValueError):
+                        prices.update(
+                            planning.reference_prices(
+                                conn, context.session, [name], context.actions_as_of
+                            )
+                        )
+        return PriceBand(
+            prices.__getitem__,
+            context.actions_as_of,
+            context.session,
+            self.settings.paper.max_fill_price_deviation,
+        )
+
     def _collect(self) -> Collected:
         """Step 3's collection, the rejection cap and the lag bound."""
         with open_read_only(self.settings, retry=True) as conn:
@@ -1645,10 +1752,12 @@ class _Run:
                 self.frozen,
                 self.settings,
                 write_offs=self.write_offs,
+                price_band=self._price_band(orders),
             )
         )
         if collected.rejections:
             raise RejectionCapError("; ".join(b.message for b in collected.rejections))
+        self._note_unjudged(collected)
         self._lag_bound(collected)
         return collected
 
@@ -1790,6 +1899,7 @@ class _Run:
             if not orders:
                 return
             collected = self._halting(partial(self._collect_orders, orders))
+            self._note_unjudged(collected)
             if collected.rejections:
                 raise RejectionCapError("; ".join(b.message for b in collected.rejections))
             now = self.gate.read_clock()
@@ -1808,6 +1918,10 @@ class _Run:
                 return
             self.sleep(min(paper.poll_interval_seconds, (deadline - now).total_seconds()))
 
+    def _note_unjudged(self, collected: Collected) -> None:
+        """A note for the fills the price band had no reference price for (#1981)."""
+        note_unjudged(collected, self.notes)
+
     def _collect_orders(self, orders: Sequence[OrderRow]) -> Collected:
         return collect(
             self.broker,
@@ -1819,17 +1933,17 @@ class _Run:
             self.frozen,
             self.settings,
             write_offs=self.write_offs,
+            price_band=self._price_band(orders),
         )
 
-    def _unspent_cash(
-        self, rebalances: Sequence[date], cash_left: Mapping[date, float | None]
-    ) -> None:
+    def _unspent_cash(self, rebalances: Sequence[date]) -> None:
         """One `unspent_cash` alert, at most, for every rebalance in
         `rebalances` reaching `executed` here whose cash exceeds the frozen
         `risk.max_unspent_cash_fraction` of the broker's equity (module
-        docstring): the cash for a rebalance is `cash_left[rebalance]`, this
-        run's buys phase's, when it is given and not None, else the broker's
-        cash, read once with the equity for every rebalance in this call.
+        docstring): the cash is the broker's, read once with the equity for every
+        rebalance in this call, so it is the cash after the run's collection
+        (#1982), less the market value of any shorts held (their proceeds are
+        collateral, not idle).
 
         The alerter dedupes on (kind, run), so a run reaching `executed` for
         more than one rebalance at one call site must not call `_alert` more
@@ -1845,16 +1959,14 @@ class _Run:
             return
         account = self._broker_call(Broker.account.__name__, self.broker.account)
         bound = self.frozen.max_unspent_cash_fraction * account.equity
-        over = [
-            (t_i, account.cash if cash_left.get(t_i) is None else cash_left[t_i])
-            for t_i in rebalances
-        ]
-        over = [(t_i, cash) for t_i, cash in over if cash is not None and cash > bound]
-        if not over:
+        # A short sale's proceeds sit in cash as collateral, not idle: leave the
+        # shorts' market value out (None, a long-only adapter, is zero).
+        cash = max(account.cash - abs(account.short_market_value or 0.0), 0.0)
+        if cash <= bound:
             return
         named = "; ".join(
             f"rebalance {t_i.isoformat()} executed with {cash:.2f} cash unspent"
-            for t_i, cash in over
+            for t_i in rebalances
         )
         self._alert(
             _UNSPENT_CASH,
@@ -1914,12 +2026,11 @@ class _Run:
         return self._ledger_for(actions)(through)
 
     def _symbols(self, names: Sequence[str]) -> dict[str, str]:
-        """Each name's broker symbol on its listing current at S, known at close(S-1)."""
+        """Each name's broker symbol from the one symbol map (`_current_symbols`)."""
         if not names:
             return {}
         with open_read_only(self.settings, retry=True) as conn:
-            listings = listings_as_of(conn, self._cut(), list(names))
-        return _current_symbols(listings, self.session, self.settings.alpaca.class_symbols)
+            return _current_symbols(conn, self.session, names, self.settings, self.window_id)[0]
 
     def _start_day(self) -> date:
         return self.window.started_at.astimezone(_NEW_YORK).date()
@@ -1940,14 +2051,8 @@ class _Run:
         with open_read_only(self.settings, retry=True) as conn:
             sessions = self._mark_sessions(last_marked_session(conn, self.window_id))
             held = {name for day in sessions for name in ledger(day).positions}
-            symbols = (
-                _current_symbols(
-                    listings_as_of(conn, self._cut(), sorted(held)),
-                    self.session,
-                    self.settings.alpaca.class_symbols,
-                )
-                if held
-                else {}
+            symbols, _ambiguous = _current_symbols(
+                conn, self.session, sorted(held), self.settings, self.window_id
             )
         # Every name held on any marked session, not only those held at S
         # (#892 item 1, #1116): a name sold before S but held on a back-filled
@@ -2238,13 +2343,21 @@ def _rebalance_kind(
 
 
 def _current_symbols(
-    listings: pl.DataFrame, day: date, class_symbols: Mapping[str, str] | None
-) -> dict[str, str]:
-    """Each name's broker symbol on its listing current on `day` (#1729); a
-    name whose ticker has no broker form is left out (never sent)."""
-    current = planning.current_listings(listings, day)
-    symbols = {sid: broker_symbol(row, class_symbols) for sid, row in current.items()}
-    return {sid: symbol for sid, symbol in symbols.items() if symbol is not None}
+    conn: duckdb.DuckDBPyConnection,
+    session: date,
+    names: Sequence[str],
+    settings: Settings,
+    window_id: int,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Each name's broker symbol from the one symbol map
+    (`reconcile_run.order_symbols`, #2185), with the names it leaves ambiguous
+    and their notes. A name whose ticker has no broker form (#1729) or that is
+    ambiguous is left out of the first (never read or sent)."""
+    if not names:
+        return {}, {}
+    mapped = order_symbols(conn, session, names, settings, window_id)
+    symbols = {sid: symbol for sid, symbol in mapped.symbols.items() if symbol is not None}
+    return symbols, mapped.ambiguous
 
 
 def _current_ids(listings: pl.DataFrame, day: date, ticker: str) -> list[str]:

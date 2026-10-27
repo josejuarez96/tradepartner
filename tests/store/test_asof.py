@@ -33,7 +33,7 @@ import polars as pl
 import pytest
 
 from tradepartner.adapters.alpaca_prices import parse_corporate_actions
-from tradepartner.calendar import next_session
+from tradepartner.calendar import next_session, session_close
 from tradepartner.config import AdjustConfig, Settings
 from tradepartner.store import schema
 from tradepartner.store.asof import (
@@ -45,6 +45,7 @@ from tradepartner.store.asof import (
     filing_events_as_of,
     listings_as_of,
     live_actions_as_of,
+    mergers_as_of,
     price_jumps_as_of,
     prices_as_of,
     rates_as_of,
@@ -2121,6 +2122,149 @@ def test_symbol_changes_as_of_revision_and_no_lookahead(
         symbol_changes_as_of(synthetic_store, date(2020, 12, 2))  # type: ignore[arg-type]
 
 
+def _merger(**changes: object) -> dict[str, object]:
+    """A `stock` merger row of acquiree S1 by acquirer S2 (T248c)."""
+    stamp = datetime(2020, 12, 2, 21, tzinfo=UTC)
+    row: dict[str, object] = {
+        "security_id": "S1",
+        "kind": "stock",
+        "acquirer_security_id": "S2",
+        "acquiree_symbol": "TGT",
+        "acquiree_cusip": "",
+        "acquirer_symbol": "ACQ",
+        "acquirer_cusip": "",
+        "share_ratio": 0.5,
+        "cash_per_share": None,
+        "effective_date": date(2020, 12, 15),
+        "process_date": date(2020, 12, 1),
+        "payable_date": None,
+        "source_action_id": "m-1",
+        "known_at": stamp,
+        "ingested_at": stamp,
+        "source": "alpaca",
+        "provenance": "action",
+    }
+    return row | changes
+
+
+def test_mergers_as_of_latest_revision_and_no_lookahead(
+    synthetic_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """T248c: a merger is invisible before its `known_at`, visible from it, and a
+    revision (a re-rated deal, stamped at its own ingest) replaces the row from
+    its own stamp on; every table column comes back."""
+    first = datetime(2020, 12, 2, 21, tzinfo=UTC)
+    revised = first + timedelta(days=1)
+    insert_row(synthetic_store, "mergers", _merger())
+    insert_row(
+        synthetic_store,
+        "mergers",
+        _merger(share_ratio=0.6, known_at=revised, ingested_at=revised),
+    )
+    assert mergers_as_of(synthetic_store, first - timedelta(microseconds=1)).is_empty()
+    at_first = mergers_as_of(synthetic_store, first)
+    assert at_first.columns == [
+        row[1] for row in synthetic_store.execute("PRAGMA table_info('mergers')").fetchall()
+    ]
+    assert _one(at_first, security_id="S1")["share_ratio"] == 0.5
+    assert (
+        _one(mergers_as_of(synthetic_store, revised - timedelta(microseconds=1)), security_id="S1")[
+            "share_ratio"
+        ]
+        == 0.5
+    )
+    after = mergers_as_of(synthetic_store, revised)
+    assert after.height == 1
+    assert _one(after, security_id="S1")["share_ratio"] == 0.6
+    with pytest.raises(TypeError, match="tz-aware datetime"):
+        mergers_as_of(synthetic_store, date(2020, 12, 2))  # type: ignore[arg-type]
+
+
+def test_mergers_as_of_filters_the_acquiree_or_the_acquirer_after_choosing_the_revision(
+    synthetic_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The security filter matches the acquiree or the acquirer of the latest
+    revision (`None` no filter, `[]` no rows), and a revision that moves the
+    acquirer moves the match with it. Rows sort by acquiree and effective date."""
+    first = datetime(2020, 12, 2, 21, tzinfo=UTC)
+    later = first + timedelta(days=1)
+    insert_row(synthetic_store, "mergers", _merger())
+    insert_row(
+        synthetic_store,
+        "mergers",
+        _merger(
+            security_id="S0",
+            kind="cash",
+            acquirer_security_id=None,
+            share_ratio=None,
+            cash_per_share=9.0,
+            effective_date=date(2020, 12, 20),
+            source_action_id="m-0",
+        ),
+    )
+    insert_row(
+        synthetic_store,
+        "mergers",
+        _merger(security_id="S1", effective_date=date(2020, 12, 10), source_action_id="m-2"),
+    )
+    assert mergers_as_of(synthetic_store, first)[["security_id", "source_action_id"]].rows() == [
+        ("S0", "m-0"),
+        ("S1", "m-2"),
+        ("S1", "m-1"),
+    ]
+    assert mergers_as_of(synthetic_store, first, ["S0"])["source_action_id"].to_list() == ["m-0"]
+    assert mergers_as_of(synthetic_store, first, ["S2"])["source_action_id"].to_list() == [
+        "m-2",
+        "m-1",
+    ]
+    assert mergers_as_of(synthetic_store, first, ["S1", "S0"]).height == 3
+    assert mergers_as_of(synthetic_store, first, ["S9"]).is_empty()
+    assert mergers_as_of(synthetic_store, first, []).is_empty()
+    # m-1 is revised onto another acquirer: S2 no longer matches it, S3 does.
+    insert_row(
+        synthetic_store,
+        "mergers",
+        _merger(acquirer_security_id="S3", known_at=later, ingested_at=later),
+    )
+    assert mergers_as_of(synthetic_store, later, ["S2"])["source_action_id"].to_list() == ["m-2"]
+    assert mergers_as_of(synthetic_store, later, ["S3"])["source_action_id"].to_list() == ["m-1"]
+    assert mergers_as_of(synthetic_store, first, ["S3"]).is_empty()
+
+
+def test_two_ids_for_one_acquiree_and_effective_date_are_both_returned(
+    synthetic_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The deal that came back as a stock-and-cash row and a stock row (the
+    probe's AKUMQ): the read never picks one."""
+    first = datetime(2020, 12, 2, 21, tzinfo=UTC)
+    insert_row(synthetic_store, "mergers", _merger(source_action_id="a"))
+    insert_row(
+        synthetic_store,
+        "mergers",
+        _merger(kind="stock_and_cash", cash_per_share=1.0, source_action_id="b"),
+    )
+    assert mergers_as_of(synthetic_store, first)["source_action_id"].to_list() == ["a", "b"]
+
+
+def test_fixture_mergers_appear_at_the_next_close(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The fixture's cash merger (acquiree `SEC_CLEAN_MERGER`) and stock merger
+    (`SEC_DIV_CANCELLED` by `SEC_SPLIT_PLAIN`) stamp at the close of the first
+    session after their `process_date`."""
+    rows = mergers_as_of(fixture_store, datetime(2021, 1, 1, tzinfo=UTC))
+    assert rows.select("security_id", "kind", "acquirer_security_id", "cash_per_share").rows() == [
+        ("SEC_CLEAN_MERGER", "cash", None, 62.5),
+        ("SEC_DIV_CANCELLED", "stock", "SEC_SPLIT_PLAIN", None),
+    ]
+    assert rows["share_ratio"].to_list() == [None, 0.75]
+    assert mergers_as_of(fixture_store, datetime(2021, 1, 1, tzinfo=UTC), ["SEC_SPLIT_PLAIN"])[
+        "security_id"
+    ].to_list() == ["SEC_DIV_CANCELLED"]
+    for row in rows.iter_rows(named=True):
+        assert row["known_at"] == session_close(next_session(row["process_date"]))
+
+
 def test_spinoff_row_does_not_change_existing_action_consumers(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -2141,9 +2285,55 @@ def test_spinoff_row_does_not_change_existing_action_consumers(
     assert (
         live_actions_as_of(fixture_store, t).filter(pl.col("action_type") == "spinoff").height == 1
     )
+    # T248c (#1762): the fixture's two merger rows change none of these readers.
+    assert fixture_store.execute("SELECT count(*) FROM mergers").fetchone() == (2,)
+    fixture_store.execute("DELETE FROM mergers")
+    without_mergers = frame()
+    assert all(a.equals(b) for a, b in zip(present, without_mergers, strict=True))
+    assert universe_present.members.equals(universe_as_of(fixture_store, t, settings).members)
     fixture_store.execute("DELETE FROM corporate_actions WHERE action_type = 'spinoff'")
     absent = frame()
     universe_absent = universe_as_of(fixture_store, t, settings)
     assert all(a.equals(b) for a, b in zip(present, absent, strict=True))
     assert universe_present.members.equals(universe_absent.members)
     assert universe_present.exclusions.equals(universe_absent.exclusions)
+
+
+def test_spinoff_row_moves_only_the_flagged_read_and_only_the_parents_pre_ex_sessions(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """With `include_spin_offs=True` (#1894) the frame differs from the row-deleted frame
+    only on the parent's sessions before the ex-date, by 1 - r * C / P (the pin above holds
+    at the defaults)."""
+    t = datetime(2020, 1, 2, 21, tzinfo=UTC)
+    settings = Settings(_env_file=None)
+    parent, child, ex_date = "SEC_TICKCHANGE", "SEC_SPLIT_PLAIN", date(2018, 12, 13)
+    # r = 0.25; the child's raw close on E is 51.23 and the parent's prior close 17.48.
+    factor = 1.0 - 0.25 * 51.23 / 17.48
+
+    def read() -> pl.DataFrame:
+        return adjusted_prices_as_of(
+            fixture_store, t, settings=settings, include_dividends=True, include_spin_offs=True
+        )
+
+    flagged = read()
+    default = adjusted_prices_as_of(fixture_store, t, settings=settings, include_dividends=True)
+    fixture_store.execute("DELETE FROM corporate_actions WHERE action_type = 'spinoff'")
+    deleted = read()
+    assert default.equals(deleted)
+    prices = ["open", "high", "low", "close"]
+    joined = flagged.join(deleted, on=["security_id", "session"], suffix="_d")
+    moved = joined.filter(pl.any_horizontal(pl.col(c).ne(pl.col(f"{c}_d")) for c in prices)).select(
+        "security_id", "session"
+    )
+    want = deleted.filter((pl.col("security_id") == parent) & (pl.col("session") < ex_date))
+    assert (
+        moved.sort("session").rows() == want.select("security_id", "session").sort("session").rows()
+    )
+    assert moved.height > 0
+    for col in prices:
+        ratios = joined.filter(
+            (pl.col("security_id") == parent) & (pl.col("session") < ex_date)
+        ).select((pl.col(col) / pl.col(f"{col}_d")).alias("r"))["r"]
+        assert all(abs(r - factor) < 1e-9 for r in ratios)
+    assert child != parent

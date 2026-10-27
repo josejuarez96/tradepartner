@@ -13,11 +13,13 @@ states exactly which filings exist.
 
 from __future__ import annotations
 
+import csv
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import polars as pl
@@ -37,7 +39,7 @@ from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.config import Settings
 from tradepartner.store import schema
 from tradepartner.store.asof import listings_as_of
-from tradepartner.store.db import configure_connection
+from tradepartner.store.db import configure_connection, insert_row
 from tradepartner.store.delistings import DELISTED, LISTED, build_delistings, derive_listing_ends
 from tradepartner.store.master import (
     BENCHMARK_PREFIX,
@@ -49,10 +51,12 @@ from tradepartner.store.master import (
     _refuse_separator,
     build_chains,
     build_master,
+    chain_candidates,
     first_session,
     primary_security_id,
     securities_as_of,
     security_cik,
+    stored_snapshot_fetches,
     write_master,
 )
 
@@ -2203,3 +2207,237 @@ def test_security_cik_is_parsed_before_its_separator(security_id: str, cik: str)
     """#1838: the CIK is the id before `:` or `@`, never the first ten
     characters."""
     assert security_cik(security_id) == cik
+
+
+# --- successor-chain candidates (#821, plan T187c) --------------------------
+
+
+def _chain_delistings() -> list[dict[str, object]]:
+    """The chain overlay's Form 25 rows, `effective_on` parsed to a date."""
+    path = _FIXTURE_DIR / "chains" / "delistings.csv"
+    with path.open() as handle:
+        return [
+            {**row, "effective_on": date.fromisoformat(row["effective_on"])}
+            for row in csv.DictReader(handle)
+        ]
+
+
+def _combined_chain_source(*names: str) -> FixtureFilingSource:
+    """One source holding each named case's index entries and cover pages."""
+    sources = [_chain_source(_CHAIN_BY_NAME[name]) for name in names]
+    covers = [
+        page
+        for source in sources
+        for cik in sorted({item.cik for item in source.filing_index()})
+        for page in source.cover_pages(cik)
+    ]
+    return FixtureFilingSource(
+        index=[item for source in sources for item in source.filing_index()],
+        cover_pages=covers,
+    )
+
+
+def test_chain_candidates_names_the_1to1_pair_and_never_the_spinoff() -> None:
+    """#821, T187c: the 8-K12B filer whose first listing row takes a ticker
+    another company listed 18 sessions before it is a candidate; the
+    spin-off pair, with no successor filing, never is. Hand-computed:
+    predecessor's 25-NSE effective 2020-01-13 to the successor's first
+    listing row 2020-02-07 is 18 XNYS sessions, under the 65 bound."""
+    source = _combined_chain_source("chain_1to1", "chain_spinoff")
+    settings = _settings()
+    master = build_master(source, settings, ingested_at=INGESTED_AT)
+    candidates = chain_candidates(source, settings, master, delistings=_chain_delistings())
+    assert [
+        (c.successor_id, c.predecessor_id, c.ticker, c.exchange, c.sessions) for c in candidates
+    ] == [("0001000011", "0001000010", "CHNA", "NYSE", 18)]
+
+
+def test_chain_candidates_skip_an_entry_and_a_dismissed_successor() -> None:
+    """#821, T187c: a successor on a `master.chains` entry or in
+    `master.chains_dismissed` is never a candidate."""
+    case = _CHAIN_BY_NAME["chain_1to1"]
+    source = _combined_chain_source("chain_1to1")
+    master = build_master(source, _settings(), ingested_at=INGESTED_AT)
+    delistings = _chain_delistings()
+    with_entry = _settings(master={"chains": [_chain_entry(case)]})
+    assert chain_candidates(source, with_entry, master, delistings=delistings) == ()
+    dismissed = _settings(master={"chains_dismissed": [case["successor"]["cik"]]})
+    assert chain_candidates(source, dismissed, master, delistings=delistings) == ()
+
+
+def test_chain_candidates_respect_the_window_bound() -> None:
+    """#821, T187c: `master.chain_window_sessions` bounds the gap: 18 sessions
+    is inside the default 65, and 5 sessions leaves the pair out."""
+    source = _combined_chain_source("chain_1to1")
+    master = build_master(source, _settings(), ingested_at=INGESTED_AT)
+    delistings = _chain_delistings()
+    narrow = _settings(master={"chain_window_sessions": 5})
+    assert chain_candidates(source, narrow, master, delistings=delistings) == ()
+
+
+def test_chain_candidates_need_an_end_within_the_window() -> None:
+    """#821, T187c: without a Form 25 the predecessor's own listing row is
+    its last listed day (2019-11-06); the gap to the successor's 2020-02-07
+    listing row is 63 sessions, still inside 65."""
+    source = _combined_chain_source("chain_1to1")
+    settings = _settings()
+    master = build_master(source, settings, ingested_at=INGESTED_AT)
+    candidates = chain_candidates(source, settings, master)
+    assert [c.sessions for c in candidates] == [63]
+
+
+# --- #2291 (T287): a no-cover-page rename in the SEC ticker file --------------
+
+RENAMED = "0000000098"  # 10-K from 2010, never a cover page: snapshot-only
+F1 = datetime(2026, 10, 3, 18, 0, tzinfo=UTC)  # a Saturday fetch: session 10-05
+F2 = datetime(2026, 10, 25, 18, 47, tzinfo=UTC)  # a Sunday fetch: session 10-26
+F3 = datetime(2026, 10, 27, 23, 0, tzinfo=UTC)
+RENAME_AT = datetime(2026, 10, 28, 2, 0, tzinfo=UTC)
+
+
+def _renamed_source(*snaps: CompanySnapshotEntry, covers: tuple[CoverPage, ...] = ()) -> Any:
+    return FixtureFilingSource(
+        index=[_filing(RENAMED, "Renamed Inc", "10-K", _at(2010, 3, 1))],
+        cover_pages=covers,
+        snapshot=snaps,
+    )
+
+
+def _rn(ticker: str, fetched_at: datetime, exchange: str = "OTC") -> CompanySnapshotEntry:
+    return _snap(RENAMED, "RENAMED INC", ticker, exchange, fetched_at)
+
+
+def _renamed_rows(
+    build: MasterBuild,
+) -> list[tuple[object, ...]]:
+    return [
+        (r["ticker"], r["exchange"], r["provenance"], r["valid_from"], r["known_at"])
+        for r in build.listings
+        if r["security_id"] == RENAMED
+    ]
+
+
+def _rename_build(
+    current: Sequence[CompanySnapshotEntry],
+    earlier: Sequence[CompanySnapshotEntry],
+    settings: Settings | None = None,
+    covers: tuple[CoverPage, ...] = (),
+) -> MasterBuild:
+    return build_master(
+        _renamed_source(*current, covers=covers),
+        settings or _settings(),
+        ingested_at=RENAME_AT,
+        earlier_fetches=earlier,
+    )
+
+
+STATIC_ROW = ("RNA", "OTC", "snapshot_static", date(2010, 3, 1), F1)
+
+
+class TestSnapshotRename:
+    """#2291: each nightly run sees only the current SEC ticker file, so the
+    build is handed the fetches the store's snapshot rows record."""
+
+    def test_a_later_ticker_is_a_dated_snapshot_row(self) -> None:
+        build = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)])
+        assert _renamed_rows(build) == [
+            STATIC_ROW,
+            ("RNB", "OTC", "snapshot", date(2026, 10, 26), F2),
+        ]
+        assert build.unmatched_snapshot == ()
+
+    def test_never_a_second_same_start_row(self) -> None:
+        # The bug: a run that forgot the earlier fetch wrote RNB from 2010.
+        build = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)])
+        starts = [row[3] for row in _renamed_rows(build)]
+        assert len(starts) == len(set(starts))
+
+    def test_the_same_history_derives_the_same_rows(self) -> None:
+        once = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)])
+        again = _rename_build([_rn("RNB", F3)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(again) == _renamed_rows(once)
+        assert again.unmatched_snapshot == ()
+
+    def test_a_rename_back_is_followed(self) -> None:
+        build = _rename_build([_rn("RNA", F3)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(build) == [
+            STATIC_ROW,
+            ("RNB", "OTC", "snapshot", date(2026, 10, 26), F2),
+            ("RNA", "OTC", "snapshot", date(2026, 10, 27), F3),
+        ]
+
+    def test_a_class_with_a_cover_page_is_still_reported(self) -> None:
+        cover = _cover(RENAMED, _at(2019, 3, 1), ("Common Stock", "RNA", "OTC"))
+        build = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)], covers=(cover,))
+        assert [e.ticker for e in build.unmatched_snapshot] == ["RNB"]
+        assert "RNB" not in {row[0] for row in _renamed_rows(build)}
+
+    def test_a_rename_on_the_spans_own_session_is_reported(self) -> None:
+        # F2 and a second fetch the same session: a row there would tie RNB's start.
+        same_session = F2 + timedelta(hours=2)
+        build = _rename_build([_rn("RNC", same_session)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert [e.ticker for e in build.unmatched_snapshot] == ["RNC"]
+        assert [row[0] for row in _renamed_rows(build)] == ["RNA", "RNB"]
+
+    def test_a_delisted_name_absent_from_the_fetch_gets_no_new_row(self) -> None:
+        build = _rename_build([_snap(ACME, "ACME", "ACME", "NYSE", F2)], [_rn("RNA", F1)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+        assert build.unmatched_snapshot == (_snap(ACME, "ACME", "ACME", "NYSE", F2),)
+
+    def test_an_exchange_alone_is_no_rename(self) -> None:
+        build = _rename_build([_rn("RNA", F2, "NYSE")], [_rn("RNA", F1)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+
+    def test_without_static_columns_a_rerun_adds_no_row(self) -> None:
+        settings = _settings(master={"static_columns": ["name"]})
+        build = _rename_build([_rn("RNA", F2)], [_rn("RNA", F1)], settings)
+        assert _renamed_rows(build) == [("RNA", "OTC", "snapshot", date(2026, 10, 5), F1)]
+
+    def test_without_static_columns_an_exchange_alone_is_no_rename(self) -> None:
+        settings = _settings(master={"static_columns": ["name"]})
+        build = _rename_build([_rn("RNA", F2, "NYSE")], [_rn("RNA", F1)], settings)
+        assert _renamed_rows(build) == [("RNA", "OTC", "snapshot", date(2026, 10, 5), F1)]
+
+    def test_earlier_fetches_never_seed_a_benchmark(self) -> None:
+        spy = _snap(SPY_TRUST, "SPDR", "SPY", "NYSE", F1)
+        build = _rename_build([_rn("RNA", F2)], [spy])
+        assert build.missing_benchmarks == ("SPY", "MTUM")
+
+
+def _stored_store(*builds: MasterBuild) -> duckdb.DuckDBPyConnection:
+    conn = _new_store()
+    for build in builds:
+        for row in build.listings:
+            insert_row(conn, "listings", row)
+    return conn
+
+
+class TestStoredSnapshotFetches:
+    def test_each_live_snapshot_row_is_its_fetch(self) -> None:
+        build = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)])
+        with _stored_store(build) as conn:
+            fetches = stored_snapshot_fetches(conn, RENAME_AT)
+        assert [(e.cik, e.ticker, e.exchange, e.fetched_at) for e in fetches] == [
+            (RENAMED, "RNA", "OTC", F1),
+            (RENAMED, "RNB", "OTC", F2),
+        ]
+
+    def test_filing_rows_retracted_rows_and_benchmarks_are_not_fetches(self) -> None:
+        build = build_master(_source(), _settings(), ingested_at=INGESTED_AT)
+        with _stored_store(build) as conn:
+            pre = conn.execute("SELECT * FROM listings WHERE security_id = ?", [PRE]).fetchone()
+            assert pre is not None
+            names = [d[0] for d in conn.description]
+            retraction = dict(zip(names, pre, strict=True)) | {
+                "retracted": True,
+                "known_at": INGESTED_AT,
+                "ingested_at": INGESTED_AT,
+            }
+            insert_row(conn, "listings", retraction)
+            fetches = stored_snapshot_fetches(conn, INGESTED_AT)
+            before = stored_snapshot_fetches(conn, INGESTED_AT - PROBE_EPSILON)
+        tickers = sorted(e.ticker for e in fetches)
+        assert "PRE" not in tickers  # retracted
+        assert "PRE" in {e.ticker for e in before}
+        assert not {"SPY", "MTUM", "TCKA", "TCKB"} & set(tickers)  # config, filing
+        assert {e.ticker for e in fetches} == {"ACME", "DUA", "STDY", "ERLA"}

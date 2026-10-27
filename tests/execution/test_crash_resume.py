@@ -94,6 +94,7 @@ from tradepartner.execution.reserve import open_buy_reserve
 from tradepartner.execution.resume import RELEASED
 from tradepartner.execution.window import stop as window_stop
 from tradepartner.execution.wrapper import WRITE_FAILED_EXIT_CODE
+from tradepartner.store import registry
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import open_read_only
 from tradepartner.store.journal import (
@@ -698,6 +699,11 @@ def test_the_fill_lag_bound_halts_and_accept_broker_fills_completes_it(
 # --- the chain criterion ----------------------------------------------------------------------
 
 
+def _sha_of(frozen_json_text: str) -> str:
+    """The `frozen_sha256` a run accepts for this text (#1984)."""
+    return registry.params_sha256(json.loads(frozen_json_text))
+
+
 def _check_frozen_json(window: PaperWindowRow) -> str:
     """The window's `frozen_json` with the two extra keys `check.check` needs
     for its other lines (not the chain line itself) so `check()` does not
@@ -739,8 +745,8 @@ def test_the_chain_query_is_zero_once_every_outcome_is_due_then_a_deleted_event_
     assert window.window_id is not None
     with env.connect() as conn:
         conn.execute(
-            "UPDATE paper_windows SET frozen_json = ? WHERE window_id = ?",
-            [_check_frozen_json(window), window.window_id],
+            "UPDATE paper_windows SET frozen_json = ?, frozen_sha256 = ? WHERE window_id = ?",
+            [_check_frozen_json(window), _sha_of(_check_frozen_json(window)), window.window_id],
         )
 
     trns_buy_1 = buy_id(env, F_0, "SEC_TRANSFER")
@@ -954,8 +960,8 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
     frozen_values["paper.min_rebalances"] = PaperConfig().min_rebalances["month_end"]
     with env.connect() as conn:
         conn.execute(
-            "UPDATE paper_windows SET frozen_json = ? WHERE window_id = ?",
-            [json.dumps(frozen_values), window.window_id],
+            "UPDATE paper_windows SET frozen_json = ?, frozen_sha256 = ? WHERE window_id = ?",
+            [json.dumps(frozen_values), _sha_of(json.dumps(frozen_values)), window.window_id],
         )
     min_rebalances = frozen_values["paper.min_rebalances"]
 

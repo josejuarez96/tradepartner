@@ -857,3 +857,64 @@ def test_a_cost_term_moves_the_fingerprint_but_not_the_promotion_identity(
     assert promotion.promotion_identity(
         "momentum", other, IN_SAMPLE_START
     ) != promotion.promotion_identity("momentum", base, IN_SAMPLE_START)
+
+
+# --- the opt-in spin-off key is outside the promotion identity (#1917, T211c) --------
+
+
+def _spin_offs_text(slug: str, value: str) -> str:
+    """The momentum fixture at the module's window with `adjust.apply_spin_offs`
+    named in its `[adjust]` table."""
+    text = _text(slug, 0.10, 15.0)
+    assert "\n[adjust]\n" not in text
+    return text.replace("\n```\n", f"\n[adjust]\napply_spin_offs = {value}\n```\n", 1)
+
+
+def test_the_spin_offs_key_moves_the_fingerprint_but_not_the_promotion_identity(
+    tmp_path: Path,
+) -> None:
+    """`adjust.apply_spin_offs` is a fingerprint key outside the promotion identity, as
+    the cost terms are (spec amendment #1894, item 3): a survivor re-tested under
+    spin-offs is a new fingerprint and the same strategy, promoted at most once."""
+    settings = Settings(_env_file=None)
+    base_path = tmp_path / "twin.md"
+    base_path.write_text(_text("twin", 0.10, 15.0))
+    spin_path = tmp_path / "spin.md"
+    spin_path.write_text(_spin_offs_text("spin", "true"))
+    base = hypothesis.frozen_params(hypothesis.parse_file(base_path), settings)
+    spin = hypothesis.frozen_params(hypothesis.parse_file(spin_path), settings)
+    assert spin["adjust.apply_spin_offs"] is True
+    assert frozen.fingerprint("momentum", spin, IN_SAMPLE_START) != frozen.fingerprint(
+        "momentum", base, IN_SAMPLE_START
+    )
+    assert promotion.promotion_identity(
+        "momentum", spin, IN_SAMPLE_START
+    ) == promotion.promotion_identity("momentum", base, IN_SAMPLE_START)
+
+
+# --- the long/short benchmark refusal (T221; backtest spec amendment #1872, item 8) -----
+
+
+def test_a_long_short_file_is_refused_benchmark_pending_and_writes_nothing(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Until the ADR 0005 amendment lands (`LONG_SHORT_BENCHMARK_LANDED`), by name, as the
+    first word after the path. The fixture is a long-only winner, so this test
+    supplies a signed variant to exercise the pending benchmark refusal."""
+    sweep, variants = _won(lab)
+    path = lab.promoted_file(sweep, variants[0])
+    real = hypothesis.frozen_params
+    monkeypatch.setattr(
+        hypothesis,
+        "frozen_params",
+        lambda parsed, settings: {**real(parsed, settings), "portfolio.side": "long_short"},
+    )
+    assert promotion.LONG_SHORT_BENCHMARK_LANDED is False
+    _refused(lab, path, rf"^{re.escape(str(path))}: refused_benchmark_pending")
+
+
+def test_a_long_only_file_promotes_as_before(lab: Lab) -> None:
+    """The constant is not consulted for a long-only file: the winner promotes."""
+    sweep, variants = _won(lab)
+    outcome = lab.promote(lab.promoted_file(sweep, variants[0]))
+    assert frozen.frozen_values(outcome.promoted)["portfolio.side"] == "long_only"

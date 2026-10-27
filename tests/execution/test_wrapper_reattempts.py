@@ -41,6 +41,7 @@ from .test_wrapper_phases import (
     _override,
     _query,
     _run,
+    _settings,
     _submits,
 )
 
@@ -193,7 +194,7 @@ def test_open_sell_shortfall_keeps_buy_open_then_retries_its_remainder(
         for row in gate._read_book(env.run, [sell, buy, other]).orders
         if row.client_order_id == sell_coid
     ]
-    gate._collect(env.run, sell_rows)
+    gate._collect(env.run, sell_rows, notes=[])
     env.fake.script(FillAt())
     env.fake.script(FillAt())
     second = _execute(gate, env, [sell, buy, other])
@@ -222,7 +223,7 @@ def test_partly_filled_trim_expires_and_sells_only_the_notional_remainder(
     _execute(gate, env, [trim])
     first = _orders(env, trim.decision_id)[0][0]  # type: ignore[arg-type]
     env.fake.apply(first, Expire())
-    gate._collect(env.run, [gate._read_book(env.run, [trim]).orders[-1]])
+    gate._collect(env.run, [gate._read_book(env.run, [trim]).orders[-1]], notes=[])
     env.fake.script(FillAt())
     _execute(gate, env, [trim])
     assert [quantity for _, _, quantity in _orders(env, trim.decision_id)] == [
@@ -348,6 +349,10 @@ def test_partly_filled_buy_cancelled_for_halt_retries_only_unfilled_target(
 def test_full_exit_cancelled_after_partial_fill_sells_reconciled_remainder(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
+    # The fixture clock is at the window's last second: widen the window.
+    env.settings = _settings(
+        env.settings.store.path, paper={"submit_window_after_open_minutes": 60}
+    )
     _hold(env, A, 10.0)
     exit_ = _decision(env, A, "sell", quantity=8.0, reason="left_targets")
     env.fake.script(PartialFill(4.0, PRICE))

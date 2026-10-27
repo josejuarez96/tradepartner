@@ -19,12 +19,16 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+import requests
+from alpaca.common.exceptions import APIError
 
 from tradepartner.adapters.alpaca_prices import (
     AlpacaPriceSource,
+    ChainWindow,
     ListingResolver,
     RegistrantEvidence,
     TickerSpan,
+    _default_fetch_mergers,
     _default_fetch_name_changes,
     alpaca_symbol,
     feed_source,
@@ -37,12 +41,13 @@ from tradepartner.adapters.alpaca_prices import (
 from tradepartner.adapters.prices import (
     ActionType,
     CorporateAction,
+    Merger,
     UnknownSecurityIdError,
     action_first_seen_known_at,
     announcement_date_known_at,
     bar_known_at,
 )
-from tradepartner.calendar import is_session, next_session
+from tradepartner.calendar import is_session, next_session, session_close
 from tradepartner.config import AlpacaConfig, Settings
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "alpaca"
@@ -3141,6 +3146,35 @@ class TestAlpacaPriceSource:
         assert source.last_actions_report is not None
         assert source.last_actions_report.malformed_categories == ("name_changes",)
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            requests.ConnectionError("down"),
+            requests.Timeout("slow"),
+            OSError("reset"),
+            APIError('{"message": "bad gateway"}'),
+        ],
+    )
+    def test_a_transport_error_on_the_name_change_request_is_counted_not_raised(
+        self, error: Exception
+    ) -> None:
+        # #1676: the daily run's own name-change request tolerates a network
+        # error: no raise, a warning in the summary, nothing returned.
+        def fetch_name_changes(_s: list[str], _a: date, _b: date) -> dict[str, object]:
+            raise error
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS),
+            fetch_actions=_Recorded().actions,
+            fetch_name_changes=fetch_name_changes,
+            settings=_settings(),
+        )
+        assert source.symbol_changes(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31)) == []
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.unanswered_categories == ("name_changes",)
+        assert source.last_actions_report.malformed_categories == ()
+        assert "name_changes request unanswered" in source.resolution_summary()
+
     def test_spinoff_is_kept_when_only_its_parent_is_requested(self) -> None:
         # #1673 (1): a partial request (backfill, replay subset) that asks
         # for the parent alone still returns the parent's spin-off.
@@ -4848,3 +4882,571 @@ class TestARenameNeverCostsItsOwnSessions:
         assert resolver.report.symbol_changes_followed == 1
         assert resolver.report.symbol_changes_refused == 0
         assert resolver.resolve("ALIT", date(2021, 12, 1)) == self.ALIGHT
+
+
+class TestSuccessorChains:
+    """Rule 9 (#821, plan T187b): a chained successor's first span under the
+    predecessor's ticker starts on the predecessor's span end."""
+
+    _PRE = "0000000001"
+    _POST = "0000000002"
+
+    def _listings(self) -> list[dict[str, object]]:
+        return [
+            _listing(self._PRE, "CHNA", date(2019, 1, 8)),
+            _listing(self._POST, "CHNA", date(2020, 2, 4)),
+        ]
+
+    @staticmethod
+    def _last_bar(security_id: str, start: date, before: date) -> date | None:
+        # The predecessor's last bar before the successor's listing row (2020-02-04);
+        # rule 8 cuts its span to the next session (2020-01-06).
+        return date(2020, 1, 3) if security_id == TestSuccessorChains._PRE else None
+
+    def test_with_the_chain_the_successor_gets_the_hole_sessions(self) -> None:
+        resolver = ListingResolver(
+            self._listings(),
+            last_bar=self._last_bar,
+            handover_sessions=5,
+            chains=((self._PRE, self._POST),),
+        )
+        # Rule 8 cut the predecessor at 2020-01-06; rule 9 starts the successor there.
+        assert resolver.resolve("CHNA", date(2020, 1, 3)) == self._PRE
+        assert resolver.resolve("CHNA", date(2020, 1, 6)) == self._POST
+        assert resolver.resolve("CHNA", date(2020, 2, 3)) == self._POST
+        assert resolver.chain_windows(self._POST) == (
+            ChainWindow(self._POST, "CHNA", date(2020, 1, 6), date(2020, 2, 4)),
+        )
+        assert resolver.report.chain_early_starts == 1
+        assert "1 chained spans started early" in resolver.report.summary()
+
+    def test_without_the_chain_the_hole_resolves_to_nobody(self) -> None:
+        resolver = ListingResolver(self._listings(), last_bar=self._last_bar, handover_sessions=5)
+        assert resolver.resolve("CHNA", date(2020, 1, 6)) is None
+        assert resolver.resolve("CHNA", date(2020, 2, 3)) is None
+        assert resolver.chain_windows(self._POST) == ()
+        assert resolver.report.chain_early_starts == 0
+
+    def test_a_predecessor_that_runs_to_the_successors_row_moves_nothing(self) -> None:
+        # The predecessor's span end (its last bar's next session, 2019-01-08) is not
+        # earlier than the successor's first listing row, so rule 9 has no hole to give.
+        resolver = ListingResolver(
+            [
+                _listing(self._PRE, "CHNA", date(2019, 1, 8)),
+                _listing(self._POST, "CHNA", date(2019, 1, 8)),
+            ],
+            last_bar=lambda sid, start, before: date(2019, 1, 7) if sid == self._PRE else None,
+            handover_sessions=5,
+            chains=((self._PRE, self._POST),),
+        )
+        assert resolver.report.chain_early_starts == 0
+
+    def test_accepted_relistings_names_a_predecessor_rekeyed_to_its_successor(self) -> None:
+        resolver = ListingResolver(
+            self._listings(),
+            accepted_relistings=[self._PRE],
+            chains=((self._PRE, self._POST),),
+        )
+        assert self._POST in resolver._accepted
+        assert self._PRE not in resolver._accepted
+
+
+# --- mergers (T248b, #1762): constructed in the shape T248's probe recorded ---
+
+_MERGER_LISTINGS = [
+    _listing("ACQE", "TARG", START),
+    _listing("ACQR", "BUYR", START),
+    _listing("OTHR", "OTHR", START),
+]
+
+
+def _cash_merger(**changes: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "id": "cash-1",
+        "acquiree_symbol": "TARG",
+        "acquiree_cusip": "111111111",
+        "acquirer_symbol": "BUYR",
+        "acquirer_cusip": "222222222",
+        "rate": 28,
+        "effective_date": "2020-10-16",
+        "process_date": "2020-10-16",
+        "payable_date": "2020-10-16",
+    }
+    row.update(changes)
+    return row
+
+
+def _stock_merger(**changes: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "id": "stock-1",
+        "acquiree_symbol": "TARG",
+        "acquiree_cusip": "111111111",
+        "acquiree_rate": 1,
+        "acquirer_symbol": "BUYR",
+        "acquirer_cusip": "222222222",
+        "acquirer_rate": 3.8859,
+        "effective_date": "2020-10-16",
+        "process_date": "2020-10-16",
+    }
+    row.update(changes)
+    return row
+
+
+def _stock_and_cash_merger(**changes: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "id": "both-1",
+        "acquiree_symbol": "TARG",
+        "acquiree_cusip": "111111111",
+        "acquiree_rate": 1,
+        "acquirer_symbol": "BUYR",
+        "acquirer_cusip": "222222222",
+        "acquirer_rate": 1.25,
+        "cash_rate": 3.5,
+        "effective_date": "2020-10-16",
+        "process_date": "2020-10-16",
+        "payable_date": "2020-10-16",
+    }
+    row.update(changes)
+    return row
+
+
+def _parse_mergers(payload: dict[str, object], **kwargs: Any) -> Any:
+    merger_resolver = ListingResolver(_MERGER_LISTINGS)
+    return parse_corporate_actions(
+        payload,
+        merger_resolver.resolve_action,
+        partial(merger_resolver.lead, actions=True),
+        **kwargs,
+    )
+
+
+class TestMergerParsing:
+    def test_a_cash_merger(self) -> None:
+        parsed = _parse_mergers({"cash_mergers": [_cash_merger()]})
+        [m] = parsed.mergers
+        assert (m.security_id, m.kind, m.acquirer_security_id) == ("ACQE", "cash", "ACQR")
+        assert (m.cash_per_share, m.share_ratio) == (28.0, None)
+        assert (m.acquiree_symbol, m.acquiree_cusip) == ("TARG", "111111111")
+        assert (m.acquirer_symbol, m.acquirer_cusip) == ("BUYR", "222222222")
+        assert (m.effective_date, m.process_date, m.payable_date) == (
+            date(2020, 10, 16),
+            date(2020, 10, 16),
+            date(2020, 10, 16),
+        )
+        assert m.source_action_id == "cash-1" and m.source == "alpaca"
+        assert parsed.actions == ()
+        assert parsed.unsupported == ()
+
+    def test_the_stamp_is_the_close_of_the_first_session_after_process_date(self) -> None:
+        # Fri 2020-10-16 -> Mon 2020-10-19 16:00 EDT = 20:00 UTC.
+        [m] = _parse_mergers({"cash_mergers": [_cash_merger()]}).mergers
+        assert m.known_at == datetime(2020, 10, 19, 20, tzinfo=UTC)
+        assert m.known_at == announcement_date_known_at(date(2020, 10, 16))
+
+    def test_no_look_ahead_a_merger_is_never_known_by_the_close_of_its_process_date(self) -> None:
+        # The effective date is in the past of the stamp, not the stamp:
+        # a deal effective 2020-09-30 and processed 2020-10-15 is unknown
+        # until the close of Fri 2020-10-16, and not by Thu's close.
+        row = _cash_merger(effective_date="2020-09-30", process_date="2020-10-15")
+        [m] = _parse_mergers({"cash_mergers": [row]}).mergers
+        assert m.known_at == session_close(date(2020, 10, 16))
+        assert m.known_at > session_close(date(2020, 10, 15))
+        assert m.known_at > session_close(m.effective_date)
+        # Process date on a weekend: the next session's close, not Friday's.
+        [m] = _parse_mergers({"cash_mergers": [_cash_merger(process_date="2020-10-17")]}).mergers
+        assert m.known_at == datetime(2020, 10, 19, 20, tzinfo=UTC)
+
+    def test_a_stock_merger_ratio_and_no_cash(self) -> None:
+        [m] = _parse_mergers({"stock_mergers": [_stock_merger()]}).mergers
+        assert (m.kind, m.share_ratio, m.cash_per_share) == ("stock", 3.8859, None)
+        assert m.payable_date is None
+
+    def test_a_stock_merger_with_acquiree_rate_four_divides(self) -> None:
+        row = _stock_merger(acquiree_rate=4, acquirer_rate=2)
+        [m] = _parse_mergers({"stock_mergers": [row]}).mergers
+        assert m.share_ratio == 0.5
+
+    def test_a_stock_and_cash_merger_has_both(self) -> None:
+        [m] = _parse_mergers({"stock_and_cash_mergers": [_stock_and_cash_merger()]}).mergers
+        assert (m.kind, m.share_ratio, m.cash_per_share) == ("stock_and_cash", 1.25, 3.5)
+
+    def test_a_cash_merger_with_no_acquirer_or_one_that_resolves_to_nothing(self) -> None:
+        bare = _cash_merger(id="a")
+        for field_name in ("acquirer_symbol", "acquirer_cusip"):
+            del bare[field_name]
+        unknown = _cash_merger(id="b", acquirer_symbol="NOBODY")
+        parsed = _parse_mergers({"cash_mergers": [bare, unknown]})
+        assert [(m.source_action_id, m.acquirer_security_id) for m in parsed.mergers] == [
+            ("a", None),
+            ("b", None),
+        ]
+        assert [(m.acquirer_symbol, m.acquirer_cusip) for m in parsed.mergers] == [
+            ("", ""),
+            ("NOBODY", "222222222"),
+        ]
+        assert parsed.unresolved == ()
+
+    def test_the_acquiree_resolves_on_the_last_session_before_the_effective_date(self) -> None:
+        # The ticker changed on the effective date: the acquiree is the
+        # holder of TARG the session before (spec "Resolution").
+        merger_resolver = ListingResolver(
+            [
+                _listing("ACQE", "TARG", START),
+                _listing("NEWCO", "TARG", date(2020, 10, 16)),
+                _listing("ACQR", "BUYR", START),
+            ]
+        )
+        parsed = parse_corporate_actions(
+            {"cash_mergers": [_cash_merger()]}, merger_resolver.resolve_action
+        )
+        assert [m.security_id for m in parsed.mergers] == ["ACQE"]
+
+    def test_the_acquirer_resolves_on_the_first_session_on_or_after_the_effective_date(
+        self,
+    ) -> None:
+        # BUYR belongs to NEWB from Mon 2020-10-19; the effective date is a
+        # Saturday, so the first session on or after it is that Monday.
+        merger_resolver = ListingResolver(
+            [
+                _listing("ACQE", "TARG", START),
+                _listing("OLDB", "BUYR", START),
+                _listing("NEWB", "BUYR", date(2020, 10, 19)),
+            ]
+        )
+        row = _stock_merger(effective_date="2020-10-17", process_date="2020-10-17")
+        parsed = parse_corporate_actions({"stock_mergers": [row]}, merger_resolver.resolve_action)
+        assert [m.acquirer_security_id for m in parsed.mergers] == ["NEWB"]
+
+    def test_rows_are_kept_by_process_date_whatever_the_effective_date(self) -> None:
+        late = _cash_merger(id="late", effective_date="2018-01-02", process_date="2020-10-15")
+        early = _cash_merger(id="early", effective_date="2020-10-30", process_date="2020-09-01")
+        out = _cash_merger(id="out", effective_date="2020-10-15", process_date="2020-11-02")
+        parsed = _parse_mergers(
+            {"cash_mergers": [late, early, out]},
+            process_start=date(2020, 10, 1),
+            process_end=date(2020, 10, 31),
+        )
+        assert [m.source_action_id for m in parsed.mergers] == ["late"]
+        assert parsed.merger_rows_refused == ()
+
+    @pytest.mark.parametrize(
+        ("category", "row", "why"),
+        [
+            ("cash_mergers", _cash_merger(id=None), "no id"),
+            ("cash_mergers", _cash_merger(id=""), "no id"),
+            ("cash_mergers", _cash_merger(effective_date=None), "effective_date"),
+            ("cash_mergers", _cash_merger(effective_date="soon"), "effective_date"),
+            ("cash_mergers", _cash_merger(process_date=None), "process_date"),
+            ("cash_mergers", _cash_merger(process_date="2020-13-01"), "process_date"),
+            ("cash_mergers", _cash_merger(rate=0), "positive finite"),
+            ("cash_mergers", _cash_merger(rate=-1), "positive finite"),
+            ("cash_mergers", _cash_merger(rate=float("inf")), "positive finite"),
+            ("cash_mergers", _cash_merger(rate=float("nan")), "positive finite"),
+            ("cash_mergers", _cash_merger(rate="28"), "positive finite"),
+            ("cash_mergers", _cash_merger(rate=True), "positive finite"),
+            ("cash_mergers", _cash_merger(rate=None), "do not match the kind"),
+            ("cash_mergers", _cash_merger(acquirer_rate=1), "do not match the kind"),
+            ("stock_mergers", _stock_merger(cash_rate=2), "do not match the kind"),
+            ("stock_mergers", _stock_merger(rate=2), "do not match the kind"),
+            ("stock_mergers", _stock_merger(acquiree_rate=None), "do not match the kind"),
+            ("stock_mergers", _stock_merger(acquirer_rate=0), "positive finite"),
+            ("stock_mergers", _stock_merger(acquirer_symbol=""), "empty acquirer_symbol"),
+            ("stock_mergers", _stock_merger(acquirer_symbol=None), "empty acquirer_symbol"),
+            ("stock_and_cash_mergers", _stock_and_cash_merger(cash_rate=None), "do not match"),
+            ("stock_and_cash_mergers", _stock_and_cash_merger(cash_rate=-3), "positive finite"),
+            ("stock_and_cash_mergers", _stock_and_cash_merger(acquiree_rate=2), "acquiree_rate"),
+            ("stock_and_cash_mergers", _stock_and_cash_merger(acquirer_symbol=""), "empty acq"),
+            ("cash_mergers", _cash_merger(acquiree_symbol=""), "no acquiree_symbol"),
+            ("cash_mergers", "not a row", "not an object"),
+        ],
+    )
+    def test_a_bad_row_is_refused_and_named_and_the_others_are_kept(
+        self, category: str, row: object, why: str
+    ) -> None:
+        good = _cash_merger(id="good", acquiree_symbol="OTHR", acquirer_symbol="BUYR")
+        rows = [row, good] if category == "cash_mergers" else [row]
+        payload = {category: rows}
+        if category != "cash_mergers":
+            payload["cash_mergers"] = [good]
+        parsed = _parse_mergers(payload)
+        assert [m.source_action_id for m in parsed.mergers] == ["good"]
+        [named] = parsed.merger_rows_refused
+        assert why in named
+
+    def test_a_cusip_only_stock_row_is_refused(self) -> None:
+        # The probe's 34 stock rows with an empty acquirer_symbol (CUSIP only).
+        row = _stock_merger(acquirer_symbol="", acquirer_cusip="00130H105")
+        parsed = _parse_mergers({"stock_mergers": [row]})
+        assert parsed.mergers == () and len(parsed.merger_rows_refused) == 1
+        assert parsed.unresolved == ()
+
+    def test_a_same_symbol_row_is_refused_before_resolution_naming_both_cusips(self) -> None:
+        # The probe's CVR and escrow lines: acquirer_symbol == acquiree_symbol.
+        cvr = _cash_merger(
+            id="cvr",
+            acquiree_symbol="032CVR011",
+            acquiree_cusip="032CVR011",
+            acquirer_symbol="032CVR011",
+            acquirer_cusip="032CVR011",
+        )
+        escrow = _stock_and_cash_merger(
+            id="escrow",
+            acquiree_symbol="TARG",
+            acquirer_symbol="TARG",
+            acquirer_cusip="010ESC036",
+        )
+        parsed = _parse_mergers({"cash_mergers": [cvr], "stock_and_cash_mergers": [escrow]})
+        assert parsed.mergers == ()
+        assert parsed.unresolved == ()  # refused before resolution
+        assert len(parsed.merger_rows_refused) == 2
+        named = next(r for r in parsed.merger_rows_refused if "escrow" in r)
+        assert "111111111" in named and "010ESC036" in named
+
+    def test_an_unresolved_acquiree_or_stock_acquirer_is_reported_not_returned(self) -> None:
+        rows = {
+            "cash_mergers": [_cash_merger(id="a", acquiree_symbol="GONE")],
+            "stock_mergers": [_stock_merger(id="b", acquirer_symbol="NOBODY")],
+        }
+        parsed = _parse_mergers(rows)
+        assert parsed.mergers == ()
+        assert sorted(parsed.unresolved) == [
+            ("GONE", date(2020, 10, 16)),
+            ("NOBODY", date(2020, 10, 16)),
+        ]
+        assert parsed.merger_rows_refused == ()
+
+    def test_an_acquirer_that_resolves_to_the_acquiree_is_counted_merger_self(self) -> None:
+        # A holding-company reorganisation: another symbol, the same security.
+        def same_company(symbol: str, _session: date) -> str | None:
+            return "ACQE" if symbol in ("TARG", "HOLD") else None
+
+        parsed = parse_corporate_actions(
+            {"stock_mergers": [_stock_merger(acquirer_symbol="HOLD")]}, same_company
+        )
+        assert parsed.mergers == () and parsed.merger_self == 1
+        assert parsed.merger_rows_refused == ()
+
+    def test_two_ids_for_one_acquiree_and_effective_date_are_both_returned_and_named(self) -> None:
+        # The probe's AKUMQ: a stock-and-cash row and a stock row of one deal.
+        parsed = _parse_mergers(
+            {
+                "stock_and_cash_mergers": [_stock_and_cash_merger(id="x")],
+                "stock_mergers": [_stock_merger(id="y")],
+            }
+        )
+        assert sorted(m.source_action_id for m in parsed.mergers) == ["x", "y"]
+        assert parsed.merger_conflict == ("TARG 2020-10-16",)
+        # Two ids for different effective dates are not a conflict.
+        parsed = _parse_mergers(
+            {
+                "cash_mergers": [
+                    _cash_merger(id="x"),
+                    _cash_merger(id="y", effective_date="2020-10-23"),
+                ]
+            }
+        )
+        assert len(parsed.mergers) == 2 and parsed.merger_conflict == ()
+
+    def test_an_identical_repeat_is_one_record(self) -> None:
+        parsed = _parse_mergers({"cash_mergers": [_cash_merger(), _cash_merger()]})
+        assert len(parsed.mergers) == 1
+
+    def test_differing_rows_of_one_id_are_revisions_in_stamp_order(self) -> None:
+        first = _cash_merger(rate=28)
+        second = _cash_merger(rate=29, process_date="2020-10-20")
+        parsed = _parse_mergers({"cash_mergers": [second, first]})
+        assert [(m.cash_per_share, m.known_at) for m in parsed.mergers] == [
+            (28.0, datetime(2020, 10, 19, 20, tzinfo=UTC)),
+            (29.0, datetime(2020, 10, 21, 20, tzinfo=UTC)),
+        ]
+
+    def test_two_differing_rows_with_one_stamp_are_left_out_and_named(self) -> None:
+        parsed = _parse_mergers(
+            {
+                "cash_mergers": [
+                    _cash_merger(rate=28),
+                    _cash_merger(rate=29),
+                    _cash_merger(id="other", acquiree_symbol="OTHR"),
+                ]
+            }
+        )
+        assert [m.source_action_id for m in parsed.mergers] == ["other"]
+        assert parsed.merger_unordered == ("TARG cash-1",)
+
+    def test_a_merger_never_changes_the_other_parsed_records(self) -> None:
+        base = _json("corporate_actions.json")
+        with_mergers = {
+            **base,
+            "cash_mergers": [_cash_merger(acquiree_symbol="KO", acquirer_symbol="")],
+            "stock_mergers": [_stock_merger(), "junk"],
+        }
+        listing_resolver = ListingResolver(LISTINGS + _MERGER_LISTINGS)
+        plain = parse_corporate_actions(base, listing_resolver.resolve)
+        mixed = parse_corporate_actions(with_mergers, listing_resolver.resolve)
+        assert mixed.actions == plain.actions
+        assert mixed.symbol_changes == plain.symbol_changes
+        assert mixed.unsupported == plain.unsupported == ()
+        assert len(mixed.mergers) == 2 and len(mixed.merger_rows_refused) == 1
+
+    def test_a_non_list_merger_category_fails_the_parse_like_any_other(self) -> None:
+        with pytest.raises(ValueError, match="cash_mergers"):
+            _parse_mergers({"cash_mergers": {"id": "x"}})
+
+    def test_the_record_validates_its_own_shape(self) -> None:
+        good = _parse_mergers({"cash_mergers": [_cash_merger()]}).mergers[0]
+        with pytest.raises(ValueError, match="share_ratio"):
+            dataclasses.replace(good, share_ratio=2.0)
+        with pytest.raises(ValueError, match="acquirer_security_id"):
+            dataclasses.replace(
+                good, kind="stock", share_ratio=1.0, cash_per_share=None, acquirer_security_id=None
+            )
+        with pytest.raises(ValueError, match="positive"):
+            dataclasses.replace(good, cash_per_share=0.0)
+        with pytest.raises(ValueError, match="source_action_id"):
+            dataclasses.replace(good, source_action_id="")
+        with pytest.raises(ValueError, match="tz-aware"):
+            dataclasses.replace(good, known_at=datetime(2020, 10, 19, 20))  # noqa: DTZ001
+
+
+class TestMergerSource:
+    def _source(self, payload: Any, *, listings: list[dict[str, object]] | None = None) -> Any:
+        calls: list[tuple[date, date]] = []
+
+        def fetch(start: date, end: date) -> Any:
+            calls.append((start, end))
+            if isinstance(payload, Exception):
+                raise payload
+            return payload
+
+        source = AlpacaPriceSource(
+            ListingResolver(listings or _MERGER_LISTINGS),
+            fetch_mergers=fetch,
+            settings=_settings(),
+        )
+        source.calls = calls
+        return source
+
+    def test_a_symbol_less_request_over_the_process_date_range(self) -> None:
+        source = self._source(
+            {
+                "cash_mergers": [
+                    _cash_merger(id="in"),
+                    _cash_merger(id="before", process_date="2020-09-30"),
+                    _cash_merger(id="after", process_date="2020-11-02"),
+                ],
+                "spin_offs": [_spinoff()],
+            }
+        )
+        result = source.mergers(date(2020, 10, 1), date(2020, 10, 31))
+        assert source.calls == [(date(2020, 10, 1), date(2020, 10, 31))]
+        assert [m.source_action_id for m in result] == ["in"]
+        assert isinstance(result[0], Merger)
+        assert source.last_actions_report.mergers == tuple(result)
+
+    def test_only_resolved_acquirees_are_returned_and_the_rest_reported(self) -> None:
+        source = self._source(
+            {"cash_mergers": [_cash_merger(id="a"), _cash_merger(id="b", acquiree_symbol="GONE")]}
+        )
+        result = source.mergers(date(2020, 10, 1), date(2020, 10, 31))
+        assert [m.source_action_id for m in result] == ["a"]
+        assert source.last_actions_report.unresolved == (("GONE", date(2020, 10, 16)),)
+
+    def test_the_acquiree_resolves_at_its_effective_date_not_the_run_day(self) -> None:
+        # The record is processed long after the deal closed (open question
+        # 41), and the ticker has since passed to another company: the
+        # acquiree is the holder the session before the effective date.
+        source = self._source(
+            {"cash_mergers": [_cash_merger(process_date="2020-12-01")]},
+            listings=[
+                *_MERGER_LISTINGS,
+                _listing("LATER", "TARG", date(2020, 11, 2)),
+            ],
+        )
+        [m] = source.mergers(date(2020, 12, 1), date(2020, 12, 1))
+        assert m.security_id == "ACQE"
+
+    def test_bad_arguments_are_refused(self) -> None:
+        source = self._source({})
+        with pytest.raises(ValueError, match="after end"):
+            source.mergers(date(2020, 11, 1), date(2020, 10, 1))
+        assert source.calls == []
+
+    def test_a_malformed_response_is_counted_not_raised(self) -> None:
+        for bad in ({"cash_mergers": {"id": "x"}}, ValueError("two pages disagree")):
+            source = self._source(bad)
+            assert source.mergers(date(2020, 10, 1), date(2020, 10, 31)) == []
+            assert source.last_actions_report.malformed_categories == (
+                "cash_mergers",
+                "stock_mergers",
+                "stock_and_cash_mergers",
+            )
+
+    @pytest.mark.parametrize(
+        "error", [requests.ConnectionError("down"), OSError("reset"), APIError('{"m": "x"}')]
+    )
+    def test_a_transport_error_is_counted_not_raised(self, error: Exception) -> None:
+        source = self._source(error)
+        assert source.mergers(date(2020, 10, 1), date(2020, 10, 31)) == []
+        assert source.last_actions_report.unanswered_categories == (
+            "cash_mergers",
+            "stock_mergers",
+            "stock_and_cash_mergers",
+        )
+
+    def test_the_default_request_is_symbol_less_and_asks_for_the_three_types(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from alpaca.data.enums import CorporateActionsType
+
+        from tradepartner.adapters import alpaca_raw
+
+        seen: list[Any] = []
+
+        def scan(types: Any, start: date, end: date, *, settings: Any = None) -> dict[str, Any]:
+            seen.append((list(types), start, end))
+            return {"cash_mergers": []}
+
+        monkeypatch.setattr(alpaca_raw, "corporate_actions_scan", scan)
+        payload = _default_fetch_mergers(
+            date(2020, 10, 1), date(2020, 10, 31), settings=_settings()
+        )
+        assert payload == {"cash_mergers": []}
+        assert seen == [
+            (
+                [
+                    CorporateActionsType.CASH_MERGER,
+                    CorporateActionsType.STOCK_MERGER,
+                    CorporateActionsType.STOCK_AND_CASH_MERGER,
+                ],
+                date(2020, 10, 1),
+                date(2020, 10, 31),
+            )
+        ]
+
+    def test_corporate_actions_is_the_same_with_and_without_merger_categories(self) -> None:
+        recorded = _Recorded()
+        merger_rows = {
+            "cash_mergers": [_cash_merger(acquiree_symbol="KO", acquirer_symbol="")],
+            "stock_mergers": [_stock_merger(acquiree_symbol="AAPL", acquirer_symbol="MSFT")],
+            "stock_and_cash_mergers": [_stock_and_cash_merger(acquiree_symbol="MSFT")],
+        }
+
+        def with_mergers(symbols: list[str], start: date, end: date) -> Any:
+            return {**recorded.actions(symbols, start, end), **merger_rows}
+
+        def build(fetch: Any) -> AlpacaPriceSource:
+            return AlpacaPriceSource(
+                ListingResolver(LISTINGS),
+                fetch_bars=recorded.bars,
+                fetch_actions=fetch,
+                settings=_settings(),
+            )
+
+        ids = ["SEC_AAPL", "SEC_MSFT", "SEC_KO"]
+        start, end = date(2020, 8, 1), date(2020, 10, 31)
+        plain = build(recorded.actions)
+        mixed = build(with_mergers)
+        assert mixed.corporate_actions(ids, start, end) == plain.corporate_actions(ids, start, end)
+        assert mixed.last_actions_report == plain.last_actions_report
+        assert mixed.last_actions_report is not None
+        assert mixed.last_actions_report.mergers == ()

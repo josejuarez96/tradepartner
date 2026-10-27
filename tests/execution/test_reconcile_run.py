@@ -16,9 +16,17 @@ from typing import Any, Protocol
 import polars as pl
 import pytest
 
-from tradepartner.adapters.broker import Account, CashActivity, OrderRequest, Position, Side
+from tradepartner.adapters.broker import (
+    Account,
+    Asset,
+    CashActivity,
+    OrderRequest,
+    Position,
+    PositionIntent,
+    Side,
+)
 from tradepartner.adapters.fake_broker import FakeBroker, PartialFill
-from tradepartner.calendar import previous_session, session_close
+from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import reconcile_run, switch
@@ -40,6 +48,7 @@ from tradepartner.execution.reconcile_run import (
     command_session,
     explanations_as_of,
     frozen_risk,
+    order_symbols,
     reconcile_command,
     reconcile_now,
 )
@@ -81,6 +90,16 @@ CUT = session_close(date(2026, 9, 30))  # close(S-1)
 BOUGHT_AT = datetime(2026, 9, 29, 15, 0, tzinfo=UTC)  # before every ex-date tested
 PRICE = 100.0  # the fake's fill price (conftest REFERENCE_PRICE)
 SPY, MTUM = "SEC_SPY", "SEC_MTUM"  # fixture names listed through 2026
+#: The account's own $100,000 funding `JNLC`, dated the day before `open_window`'s
+#: New York start date (2026-09-29): inside the base under the fallback (#1641),
+#: so a fake-broker reconcile fixture carries it and never mismatches on it.
+FUNDING = CashActivity(
+    activity_id="20260928000000000::fund0001",
+    activity_type="JNLC",
+    date=date(2026, 9, 28),
+    status="executed",
+    net_amount=100_000.0,
+)
 
 
 class BookedFake(FakeBroker):
@@ -118,6 +137,30 @@ def fake(fixed_clock: FixedClock) -> BookedFake:
         price_of=lambda _s: PRICE,
         auto_fill=False,
         account_id="PA1",
+    )
+
+
+@pytest.fixture
+def flip_fake(fixed_clock: FixedClock) -> BookedFake:
+    """A paper broker whose SPY can be sold short between dividend ex-dates."""
+    return BookedFake(
+        assets={
+            "SPY": Asset(
+                tradable=True,
+                fractionable=True,
+                status="active",
+                cusip=None,
+                shortable=True,
+                easy_to_borrow=True,
+                marginable=True,
+            )
+        },
+        clock=fixed_clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        account_id="PA1",
+        paper=True,
+        activities=[FUNDING],
     )
 
 
@@ -165,6 +208,32 @@ def _dividend(
         ex_date=ex_date,
         ratio_or_amount=amount,
         source_action_id=source_action_id,
+        known_at=known_at,
+        ingested_at=known_at,
+        source="alpaca",
+        provenance="action",
+    )
+
+
+def _spinoff(
+    settings: Settings,
+    child: str,
+    parent: str,
+    ratio: float,
+    known_at: datetime,
+    ex_date: date = S,
+) -> None:
+    """A stored `spinoff` corporate action (child in `security_id`, parent in
+    `source_action_id`, `ratio` shares received per parent share), the
+    `execution.window` convention (#1894, #1896)."""
+    _fact(
+        settings,
+        "corporate_actions",
+        security_id=child,
+        action_type="spinoff",
+        ex_date=ex_date,
+        ratio_or_amount=ratio,
+        source_action_id=parent,
         known_at=known_at,
         ingested_at=known_at,
         source="alpaca",
@@ -317,6 +386,126 @@ def _hold(
     return run_id
 
 
+def _sell_spy(settings: Settings, run_id: int, at: datetime) -> None:
+    """Journal a filled sale of the ten SPY shares held by `_hold`."""
+    (decision_id,) = _append(
+        settings,
+        DecisionRow(
+            run_id=run_id,
+            rebalance_session=at.date(),
+            security_id=SPY,
+            side="sell",
+            planned_quantity=10.0,
+            whole_share=False,
+            decision="trade",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    assert decision_id is not None
+    coid = f"tp-sell-{at.date().isoformat()}"
+    _append(
+        settings,
+        OrderRow(
+            client_order_id=coid,
+            decision_id=decision_id,
+            run_id=run_id,
+            session=at.date(),
+            attempt=1,
+            phase="sell",
+            security_id=SPY,
+            symbol="SPY",
+            side="sell",
+            quantity=10.0,
+            sells_in_flight_at_submit=False,
+            known_at=at,
+            ingested_at=at,
+        ),
+        *(
+            OrderEventRow(client_order_id=coid, status=s, known_at=at, ingested_at=at)
+            for s in ("pending", "accepted", "filled")
+        ),
+        FillRow(
+            client_order_id=coid,
+            filled_at=at,
+            quantity=10.0,
+            price=PRICE,
+            price_implied=False,
+            broker_fill_id=f"fill-{coid}",
+            source="broker_feed",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+
+def _filled_flip_trade(
+    settings: Settings,
+    fake: BookedFake,
+    run_id: int,
+    at: datetime,
+    side: Side,
+    intent: PositionIntent,
+) -> None:
+    """Journal and fill ten SPY shares on one side of a position flip."""
+    position_side = (
+        "short" if intent in (PositionIntent.SELL_TO_OPEN, PositionIntent.BUY_TO_CLOSE) else "long"
+    )
+    coid = f"tp-flip-{intent.value}-{at.date()}"
+    (decision_id,) = _append(
+        settings,
+        DecisionRow(
+            run_id=run_id,
+            rebalance_session=at.date(),
+            security_id=SPY,
+            side=side.value,
+            planned_quantity=10.0,
+            whole_share=False,
+            decision="trade",
+            position_side=position_side,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    assert decision_id is not None
+    _append(
+        settings,
+        OrderRow(
+            client_order_id=coid,
+            decision_id=decision_id,
+            run_id=run_id,
+            session=at.date(),
+            attempt=1,
+            phase="buy" if side is Side.BUY else "sell",
+            security_id=SPY,
+            symbol="SPY",
+            side=side.value,
+            quantity=10.0,
+            position_side=position_side,
+            sells_in_flight_at_submit=False,
+            known_at=at,
+            ingested_at=at,
+        ),
+        *(
+            OrderEventRow(client_order_id=coid, status=status, known_at=at, ingested_at=at)
+            for status in ("pending", "accepted", "filled")
+        ),
+        FillRow(
+            client_order_id=coid,
+            filled_at=at,
+            quantity=10.0,
+            price=PRICE,
+            price_implied=False,
+            broker_fill_id=f"fill-{coid}",
+            source="broker_feed",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    fake.submit(OrderRequest(coid, "SPY", side, quantity=10.0, position_intent=intent))
+    fake.simulate_fill(coid)
+
+
 def _reconcile(
     settings: Settings,
     fake: FakeBroker,
@@ -325,13 +514,14 @@ def _reconcile(
     *,
     run_id: int | None = None,
     as_of: datetime | None = None,
+    session: date = S,
 ) -> Any:
     return reconcile_now(
         settings,
         lambda: open_for_write(settings),
         fake,
         window,
-        S,
+        session,
         clock,
         lambda: open_for_write(settings),
         run_id,
@@ -388,6 +578,198 @@ def test_explanations_read_only_rows_known_at_close_of_the_previous_session(
         SPY: _reference(journal_settings, SPY),
         MTUM: _reference(journal_settings, MTUM),
     }
+
+
+# --- spin-off children in an open window (#1896) -----------------------------
+
+#: The ex-date: its session-before is the session the parent was bought on
+#: (`BOUGHT_AT`), so the ledger held it before the ex-date.
+EX = previous_session(S)
+#: The adapter's earliest stamp for `EX` (the date-only rule on a process date of
+#: `EX`): the close of the session after it, as the fixture's own spin-off row
+#: carries. It is `close(S)`, after `S`'s own cutoff, so a row for `EX` is first
+#: knowable for the next session's reconcile.
+STAMP = session_close(next_session(EX))
+S2 = next_session(S)
+
+
+def test_explanations_offer_a_spinoff_of_a_held_parent(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """#1896: a stored `spinoff` known at close(S2-1) whose parent the ledger held
+    on the session before the ex-date is offered, keyed by child to
+    `(parent, ratio)` (the `execution.window` convention)."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _spinoff(journal_settings, MTUM, SPY, 0.4, STAMP, ex_date=EX)
+
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            S2,
+            as_of=STAMP,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+
+    assert found.spinoffs == {MTUM: (SPY, 0.4)}
+
+
+def test_explanations_leave_a_spinoff_of_a_parent_not_held_out(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """#1896: the ledger holds no `SPY`, so its stored spin-off is not offered and
+    a broker-booked child stays a mismatch (never a guess)."""
+    _spinoff(journal_settings, MTUM, SPY, 0.4, STAMP, ex_date=EX)
+
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            S2,
+            as_of=STAMP,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+
+    assert found.spinoffs == {}
+
+
+def test_a_spinoff_whose_row_lands_after_its_ex_date_is_still_offered(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """#1896: a spin-off's row is stamped the close after Alpaca's date-only
+    `process_date`, so an `ok` reconciliation can sit on the ex-date before the
+    row lands. The read is bounded by the cutoff, not the base session, so the
+    spin-off is still offered and the child is not lost for good."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _ok_base(journal_settings, open_window, at=session_close(EX), broker_cash=99_000.0)
+    _spinoff(journal_settings, MTUM, SPY, 0.4, STAMP, ex_date=EX)
+
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            S2,
+            as_of=STAMP,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+
+    assert found.spinoffs == {MTUM: (SPY, 0.4)}
+
+
+def test_a_broker_booked_spinoff_child_journals_a_spinoff_receipt(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1896: 10 `SPY` held, a 0.4 `SPY` -> `MTUM` spin-off known at close(S2-1),
+    and the broker's 4.0 `MTUM` child journals the `spinoff_receipt` the ledger
+    then holds (cash unchanged: a receipt is shares, not cash)."""
+    fake.activities = [FUNDING]
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _spinoff(journal_settings, MTUM, SPY, 0.4, STAMP, ex_date=EX)
+    fake.extra_quantity = {"MTUM": 4.0}
+    fixed_clock.advance(days=1)  # the next session, when the row is known
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+
+    assert result.status == OK
+    assert result.broker_cash == pytest.approx(100_000.0 - 10.0 * PRICE)
+    (adjustment,) = _adjustments(journal_settings, open_window)
+    assert (adjustment.kind, adjustment.security_id, adjustment.quantity, adjustment.cash) == (
+        "spinoff_receipt",
+        MTUM,
+        4.0,
+        None,
+    )
+
+
+def test_a_wrong_spinoff_ratio_still_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1896: 10 `SPY` at a stored 0.25 ratio is 2.5 children, but the broker
+    books 4.0: the ratio is wrong, so the child is a mismatch, never accepted."""
+    fake.activities = [FUNDING]
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _spinoff(journal_settings, MTUM, SPY, 0.25, STAMP, ex_date=EX)
+    fake.extra_quantity = {"MTUM": 4.0}
+    fixed_clock.advance(days=1)
+
+    with pytest.raises(ReconciliationError, match="broker_only_position"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_a_spinoff_child_of_a_parent_not_held_still_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1896: the ledger never held `SPY`, so its spin-off explains nothing and
+    the broker's `MTUM` child halts as a `broker_only_position`."""
+    fake.activities = [FUNDING]
+    _spinoff(journal_settings, MTUM, SPY, 0.4, STAMP, ex_date=EX)
+    fake.extra_quantity = {"MTUM": 4.0}
+    fixed_clock.advance(days=1)
+
+    with pytest.raises(ReconciliationError, match="broker_only_position"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_a_spinoff_of_a_parent_moved_since_the_ex_date_still_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1896: the parent must be held, unchanged, on the session before the
+    ex-date and at the stated session, so `compare`'s `parent held x ratio` bound
+    uses the basis the distribution was earned in; a parent bought up since then
+    is not offered and the broker's child halts."""
+    fake.activities = [FUNDING]
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 5.0})
+    later = datetime(2026, 9, 30, 15, 0, tzinfo=UTC)  # after the ex-date's session-before
+    _order(journal_settings, run_id, "tp-more", SPY, "SPY", 5.0, at=later)
+    fake.submit(OrderRequest("tp-more", "SPY", Side.BUY, quantity=5.0))
+    fake.simulate_fill("tp-more")
+    _spinoff(journal_settings, MTUM, SPY, 0.4, STAMP, ex_date=EX)
+    fake.extra_quantity = {"MTUM": 4.0}
+    fixed_clock.advance(days=1)
+
+    with pytest.raises(ReconciliationError, match="broker_only_position"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_a_spinoff_known_only_after_the_cutoff_still_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1896 (no look-ahead): a `spinoff` known only at the next session's close
+    is invisible at S2's cutoff, so the broker's child stays a mismatch."""
+    fake.activities = [FUNDING]
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _spinoff(journal_settings, MTUM, SPY, 0.4, session_close(S2), ex_date=EX)
+    fake.extra_quantity = {"MTUM": 4.0}
+    fixed_clock.advance(days=1)
+
+    with pytest.raises(ReconciliationError, match="broker_only_position"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+
+    assert _adjustments(journal_settings, open_window) == []
 
 
 def test_a_broker_symbol_the_journal_never_held_maps_through_its_listing(
@@ -590,6 +972,125 @@ def test_two_candidate_ticker_changes_for_a_name_are_a_mismatch(
     assert listed["symbol_changes"] == []
 
 
+def _order_symbols(settings: Settings, window: PaperWindowRow, *names: str) -> Any:
+    assert window.window_id is not None
+    with open_read_only(settings) as conn:
+        return order_symbols(conn, S, names, settings, window.window_id)
+
+
+def test_the_order_path_reads_the_symbol_reconcile_mapped_after_a_ticker_change(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2185: the listings still show `SPY`, a change to `SPYX` is known at
+    close(S-1) and the broker holds `SPYX`: once the reconciliation on S applied
+    it, the order path's map sends `SPY` under `SPYX`, the one reconcile mapped."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1))
+    fake.extra_quantity = {"SPY": -10.0, "SPYX": 10.0}
+
+    before = _order_symbols(journal_settings, open_window, SPY, MTUM)
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+    after = _order_symbols(journal_settings, open_window, SPY, MTUM)
+
+    assert result.symbol_changes == (SymbolChangeRecord(SPY, "SPY", "SPYX"),)
+    assert after.symbols == {SPY: "SPYX", MTUM: "MTUM"}
+    assert after.ambiguous == {}
+    # Before any reconciliation on S applied it, the name is never sent under SPY.
+    assert before.symbols == {MTUM: "MTUM"}
+    assert "SPY -> SPYX" in before.ambiguous[SPY]
+
+
+def test_two_ticker_changes_in_force_leave_the_name_out_of_the_order_map(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2185: two candidate new symbols are ambiguous: dropped, with a note naming
+    both, never sent under the old symbol."""
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1), "r1")
+    _symbol_change(journal_settings, SPY, "SPY", "SPYZ", CUT - timedelta(minutes=1), "r2")
+
+    found = _order_symbols(journal_settings, open_window, SPY)
+
+    assert found.symbols == {}
+    assert "SPY -> SPYX/SPYZ" in found.ambiguous[SPY]
+
+
+def test_a_symbol_claimed_by_a_renamed_name_and_another_leaves_both_out(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2185: the old ticker reused by another issuer (MTUM's listing re-tickered
+    to `SPY`) while SPY's change is not applied: both names claim `SPY`, so the
+    order map drops both, each with a note, instead of halting the run."""
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1))
+    with open_for_write(journal_settings) as conn:
+        conn.execute("UPDATE listings SET ticker = 'SPY' WHERE security_id = ?", [MTUM])
+
+    found = _order_symbols(journal_settings, open_window, SPY, MTUM)
+
+    assert found.symbols == {}
+    assert sorted(found.ambiguous) == [MTUM, SPY]
+    assert "claim SPY" in found.ambiguous[MTUM]
+
+
+@pytest.mark.parametrize(
+    ("at", "new"), [(CUT - timedelta(hours=1), "SPYX"), (None, "SPYZ")], ids=["s_minus_1", "other"]
+)
+def test_only_the_same_change_recorded_on_s_applies_in_the_order_map(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    at: datetime | None,
+    new: str,
+) -> None:
+    """#2185: a reconciliation that recorded the change on S-1 only, or one on S
+    that recorded another new symbol, is no evidence for S: the name stays out."""
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1))
+    stamp = fixed_clock() if at is None else at
+    change = {"security_id": SPY, "old_symbol": "SPY", "new_symbol": new}
+    _append(
+        journal_settings,
+        ReconciliationRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            at=stamp,
+            status="ok",
+            broker_cash=PRICE,
+            mismatches_json=json.dumps({"symbol_changes": [change]}),
+            known_at=stamp,
+            ingested_at=stamp,
+        ),
+    )
+
+    found = _order_symbols(journal_settings, open_window, SPY)
+
+    assert found.symbols == {}
+    assert SPY in found.ambiguous
+
+
+def test_the_order_map_reads_no_ticker_change_known_after_close_s_minus_1(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2185 (no look-ahead): a change stamped a minute after close(S-1) is not
+    read, so the name keeps its listing's symbol and is not ambiguous."""
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT + timedelta(minutes=1))
+
+    found = _order_symbols(journal_settings, open_window, SPY)
+
+    assert found.symbols == {SPY: "SPY"}
+    assert found.ambiguous == {}
+
+
 def test_a_split_known_at_close_of_the_previous_session_explains_the_new_quantity(
     journal_settings: Settings,
     fake: BookedFake,
@@ -713,6 +1214,635 @@ def test_a_credited_dividend_writes_dividend_cash_once(
     again = _reconcile(journal_settings, fake, open_window, fixed_clock)
     assert again.status == OK and again.adjustments == ()
     assert len(_adjustments(journal_settings, open_window)) == 1
+
+
+def test_a_dividend_credited_on_its_pay_date_after_an_ok_reconcile_is_explained(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2183: an ok cash base after the ex-date must not hide the later credit."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == OK
+
+    pay_date = S
+    for _ in range(10):
+        pay_date = next_session(pay_date)
+    fixed_clock.now = datetime.combine(pay_date, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    fake.activities = [CashActivity("div-pay", "DIV", pay_date, "executed", 5.0, "SPY")]
+    fake.extra_cash = 5.0
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay_date)
+    assert result.status == OK
+    assert [(a.kind, a.cash) for a in _adjustments(journal_settings, open_window)] == [
+        ("dividend_cash", pytest.approx(5.0))
+    ]
+
+    fixed_clock.advance(minutes=5)
+    assert (
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay_date).status == OK
+    )
+    assert len(_adjustments(journal_settings, open_window)) == 1
+
+
+@pytest.mark.parametrize(
+    "activity_type", ["DIVNRA", "DIVFEE", "DIVTW", "DIVROC", "DIVCGL", "DIVCGS", "DIVTXEX"]
+)
+def test_dividend_fee_and_withholding_still_halt(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    activity_type: str,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    fake.activities = [CashActivity("other", activity_type, S, "executed", 5.0, "SPY")]
+    fake.extra_cash = 5.0
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+
+@pytest.mark.parametrize("case", ["expired", "other_symbol", "wrong_amount", "not_held"])
+def test_late_dividend_cash_without_an_eligible_due_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    case: str,
+) -> None:
+    if case != "not_held":
+        _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    pay_date = S
+    count = FROZEN.reconcile_dividend_credit_sessions + 1 if case == "expired" else 10
+    for _ in range(count):
+        pay_date = next_session(pay_date)
+    fixed_clock.now = datetime.combine(pay_date, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    symbol = "MTUM" if case == "other_symbol" else "SPY"
+    amount = 5.02 if case == "wrong_amount" else 5.0
+    fake.activities = [CashActivity("div-pay", "DIV", pay_date, "executed", amount, symbol)]
+    fake.extra_cash = amount
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay_date)
+
+
+def test_monthly_payer_nets_old_credit_before_new_due(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """At session 26, ex 0 is expired; its session-24 credit cannot pay ex 21."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    ex21 = S
+    credit24 = S
+    check26 = S
+    for index in range(26):
+        check26 = next_session(check26)
+        if index == 20:
+            ex21 = check26
+        if index == 23:
+            credit24 = check26
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=S, source_action_id="first")
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=ex21, source_action_id="second")
+    credited_at = datetime.combine(credit24, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    _append(
+        journal_settings,
+        AdjustmentRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            session=credit24,
+            kind="dividend_cash",
+            security_id=SPY,
+            cash=5.0,
+            known_at=credited_at,
+            ingested_at=credited_at,
+        ),
+    )
+    fixed_clock.now = datetime.combine(check26, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            check26,
+            as_of=fixed_clock.now,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividends == pytest.approx({SPY: 5.0})
+    fake.extra_cash = 10.0
+    assert (
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=check26).status == OK
+    )
+    assert [a.cash for a in _adjustments(journal_settings, open_window)] == [5.0, 5.0]
+
+
+def test_expired_unpaid_dividend_cannot_take_newer_dividends_credit(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+) -> None:
+    """A credit for ex 21 at session 26 must stay paid at session 27."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    ex21 = S
+    credit26 = S
+    for index in range(26):
+        credit26 = next_session(credit26)
+        if index == 20:
+            ex21 = credit26
+    check27 = next_session(credit26)
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=S, source_action_id="unpaid")
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=ex21, source_action_id="paid")
+    credited_at = datetime.combine(credit26, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    _append(
+        journal_settings,
+        AdjustmentRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            session=credit26,
+            kind="dividend_cash",
+            security_id=SPY,
+            cash=5.0,
+            known_at=credited_at,
+            ingested_at=credited_at,
+        ),
+    )
+    checked_at = datetime.combine(check27, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            check27,
+            as_of=checked_at,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividends == {}
+
+
+def test_newer_credit_is_not_reopened_by_an_expired_unpaid_due(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """E1 remains unpaid; booking E2 at 27 must not reopen E2 at 28."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    ex26 = S
+    for _ in range(26):
+        ex26 = next_session(ex26)
+    pay27 = next_session(ex26)
+    check28 = next_session(pay27)
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=S, source_action_id="unpaid")
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=ex26, source_action_id="paid")
+    fixed_clock.now = datetime.combine(pay27, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    fake.activities = [CashActivity("e2", "DIV", pay27, "executed", 5.0, "SPY")]
+    fake.extra_cash = 5.0
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay27).status == OK
+    fixed_clock.now = datetime.combine(check28, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            check28,
+            as_of=fixed_clock.now,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividends == {}
+
+
+def test_an_old_div_tag_cannot_admit_another_symbols_new_credit(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    old = CashActivity("old-spy", "DIV", S, "executed", 0.0, "SPY")
+    fake.activities = [old]
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == OK
+    pay = S
+    for _ in range(10):
+        pay = next_session(pay)
+    fixed_clock.now = datetime.combine(pay, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    fake.activities = [old, CashActivity("new-mtum", "DIV", pay, "executed", 5.0, "MTUM")]
+    fake.extra_cash = 5.0
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay)
+
+
+def test_untagged_cash_after_ok_base_is_not_a_late_dividend(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == OK
+    pay = S
+    for _ in range(10):
+        pay = next_session(pay)
+    fixed_clock.now = datetime.combine(pay, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    fake.extra_cash = 5.0
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay)
+
+
+def test_read_only_and_live_explanations_agree_on_pre_base_untagged_dividend(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Read-only has no broker DIV feed, so an older due is not offered."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == OK
+    later = next_session(S)
+    fixed_clock.now = datetime.combine(later, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    with open_read_only(journal_settings) as conn:
+        read_only = explanations_as_of(
+            conn,
+            open_window,
+            later,
+            as_of=fixed_clock.now,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert read_only.dividends == {}
+    live = _reconcile(journal_settings, fake, open_window, fixed_clock, session=later)
+    assert live.status == OK and live.adjustments == ()
+
+
+def test_untagged_pre_base_dividend_does_not_widen_deferred_cash_band(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == OK
+    _order(
+        journal_settings,
+        run_id,
+        "tp-pending-tag",
+        MTUM,
+        "MTUM",
+        1.0,
+        events=("pending",),
+        fill=False,
+    )
+    fake.submit(OrderRequest("tp-pending-tag", "MTUM", Side.BUY, quantity=1.0))
+    pay = next_session(S)
+    fixed_clock.now = datetime.combine(pay, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    fake.extra_cash = 5.0
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay)
+
+
+def test_dividend_before_window_start_is_not_an_active_due(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+) -> None:
+    """A held name carried into a later window cannot reopen its earlier dividend."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1), ex_date=S)
+    later_start = next_session(S)
+    later_window = replace(
+        open_window,
+        started_at=datetime.combine(later_start, datetime.min.time(), tzinfo=UTC)
+        + timedelta(hours=14),
+    )
+    checked_at = datetime.combine(later_start, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            later_window,
+            later_start,
+            as_of=checked_at,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividends == {}
+
+
+def test_dividend_absorbed_as_ended_proceeds_cannot_explain_later_untagged_cash(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(MTUM, "MTUM"): 10.0})
+    _dividend(journal_settings, MTUM, 0.5, CUT - timedelta(days=1))
+    _delisting(journal_settings, MTUM, CUT - timedelta(days=1))
+    proceeds = 0.5 * 10 * _reference(journal_settings, MTUM)
+    fake.extra_quantity["MTUM"] = -10.0
+    fake.extra_cash = proceeds
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == OK
+    assert all(a.kind != "dividend_cash" for a in _adjustments(journal_settings, open_window))
+    later = next_session(S)
+    fixed_clock.now = datetime.combine(later, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    fake.extra_cash += 5.0
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=later)
+
+
+def test_dividend_credit_window_excludes_its_exact_far_edge(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    inside = S
+    for _ in range(FROZEN.reconcile_dividend_credit_sessions - 1):
+        inside = next_session(inside)
+    outside = next_session(inside)
+    with open_read_only(journal_settings) as conn:
+        due_inside = explanations_as_of(
+            conn,
+            open_window,
+            inside,
+            as_of=datetime.combine(inside, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20),
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert due_inside.dividends == pytest.approx({SPY: 5.0})
+    fixed_clock.now = datetime.combine(outside, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    fake.activities = [CashActivity("edge", "DIV", outside, "executed", 5.0, "SPY")]
+    fake.extra_cash = 5.0
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=outside)
+
+
+def test_netting_discards_a_cash_rounding_residue(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.03, CUT - timedelta(days=1))
+    _append(
+        journal_settings,
+        AdjustmentRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            session=S,
+            kind="dividend_cash",
+            security_id=SPY,
+            cash=0.3 - 1e-16,
+            known_at=datetime(2026, 10, 1, 20, 0, tzinfo=UTC),
+            ingested_at=datetime(2026, 10, 1, 20, 0, tzinfo=UTC),
+        ),
+    )
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            S,
+            as_of=datetime(2026, 10, 1, 20, 0, tzinfo=UTC),
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividends == {}
+
+
+def test_two_dividends_on_one_name_remain_due_after_the_first_is_paid(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    second = next_session(S)
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=S, source_action_id="first")
+    _dividend(journal_settings, SPY, 0.7, CUT, ex_date=second, source_action_id="second")
+    fixed_clock.now = datetime.combine(second, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            second,
+            as_of=fixed_clock.now,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividends == pytest.approx({SPY: 12.0})
+    assert found.dividend_dues == {SPY: (5.0, 7.0)}
+    _append(
+        journal_settings,
+        AdjustmentRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            session=second,
+            kind="dividend_cash",
+            security_id=SPY,
+            cash=5.0,
+            known_at=fixed_clock.now,
+            ingested_at=fixed_clock.now,
+        ),
+    )
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            second,
+            as_of=fixed_clock.now,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividends == pytest.approx({SPY: 7.0})
+    assert found.dividend_dues == {SPY: (7.0,)}
+
+
+def test_older_of_two_same_name_dividends_books_one_cash_row(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    second = next_session(S)
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=S, source_action_id="first")
+    _dividend(journal_settings, SPY, 0.7, CUT, ex_date=second, source_action_id="second")
+    fixed_clock.now = datetime.combine(second, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    fake.activities = [CashActivity("older", "DIV", second, "executed", 5.0, "SPY")]
+    fake.extra_cash = 5.0
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, session=second).status == OK
+    assert [(a.kind, a.cash) for a in _adjustments(journal_settings, open_window)] == [
+        ("dividend_cash", 5.0)
+    ]
+
+
+def test_long_to_short_flip_still_books_the_older_long_dividend(
+    journal_settings: Settings,
+    flip_fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _hold(journal_settings, flip_fake, open_window, {(SPY, "SPY"): 10.0})
+    flipped = next_session(S)
+    ex2 = next_session(flipped)
+    traded_at = datetime.combine(flipped, datetime.min.time(), tzinfo=UTC) + timedelta(hours=18)
+    fixed_clock.now = traded_at
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, traded_at, Side.SELL, PositionIntent.SELL_TO_CLOSE
+    )
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, traded_at, Side.SELL, PositionIntent.SELL_TO_OPEN
+    )
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=S, source_action_id="long")
+    _dividend(journal_settings, SPY, 0.7, CUT, ex_date=ex2, source_action_id="short")
+    fixed_clock.now = datetime.combine(ex2, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            ex2,
+            as_of=fixed_clock.now,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividend_dues == {SPY: (5.0, -7.0)}
+    assert found.dividends == {SPY: -2.0}
+    flip_fake.activities = [CashActivity("long-credit", "DIV", ex2, "executed", 5.0, "SPY")]
+    flip_fake.extra_cash = 5.0
+    assert (
+        _reconcile(journal_settings, flip_fake, open_window, fixed_clock, session=ex2).status == OK
+    )
+    assert [(row.kind, row.cash) for row in _adjustments(journal_settings, open_window)] == [
+        ("dividend_cash", 5.0)
+    ]
+
+
+def test_short_to_long_flip_never_raises_for_mixed_sign_dividend_dues(
+    journal_settings: Settings,
+    flip_fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _run(journal_settings, open_window)
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, BOUGHT_AT, Side.SELL, PositionIntent.SELL_TO_OPEN
+    )
+    flipped = next_session(S)
+    ex2 = next_session(flipped)
+    traded_at = datetime.combine(flipped, datetime.min.time(), tzinfo=UTC) + timedelta(hours=18)
+    fixed_clock.now = traded_at
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, traded_at, Side.BUY, PositionIntent.BUY_TO_CLOSE
+    )
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, traded_at, Side.BUY, PositionIntent.BUY_TO_OPEN
+    )
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=S, source_action_id="short")
+    _dividend(journal_settings, SPY, 0.7, CUT, ex_date=ex2, source_action_id="long")
+    fixed_clock.now = datetime.combine(ex2, datetime.min.time(), tzinfo=UTC) + timedelta(hours=20)
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            ex2,
+            as_of=fixed_clock.now,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividend_dues == {SPY: (-5.0, 7.0)}
+    assert found.dividends == {SPY: 2.0}
+    flip_fake.activities = [CashActivity("long-credit", "DIV", ex2, "executed", 7.0, "SPY")]
+    flip_fake.extra_cash = 7.0
+    result = _reconcile(journal_settings, flip_fake, open_window, fixed_clock, session=ex2)
+    assert result.status in (OK, MISMATCH)
+    if result.status == MISMATCH:
+        assert [m.kind for m in result.mismatches] == ["cash"]
+
+
+def test_expired_dividend_does_not_widen_deferred_cash_band(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=S)
+    _order(
+        journal_settings, run_id, "tp-pend-div", MTUM, "MTUM", 1.0, events=("pending",), fill=False
+    )
+    fake.submit(OrderRequest("tp-pend-div", "MTUM", Side.BUY, quantity=1.0))
+    expired = S
+    for _ in range(FROZEN.reconcile_dividend_credit_sessions + 1):
+        expired = next_session(expired)
+    fixed_clock.now = datetime.combine(expired, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    fake.extra_cash = 5.0
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=expired)
+
+
+@pytest.mark.parametrize(
+    ("trade", "expected"),
+    [("buy_on_ex", {}), ("sell_on_ex", {SPY: 5.0}), ("sell_before_ex", {})],
+)
+def test_dividend_uses_holding_at_the_previous_trading_session(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    trade: str,
+    expected: dict[str, float],
+) -> None:
+    if trade == "buy_on_ex":
+        run_id = _run(journal_settings, open_window)
+        _order(
+            journal_settings,
+            run_id,
+            "tp-buy-on-ex",
+            SPY,
+            "SPY",
+            10.0,
+            at=datetime(2026, 10, 1, 15, 0, tzinfo=UTC),
+        )
+    else:
+        run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+        sold_at = (
+            datetime(2026, 9, 30, 15, 0, tzinfo=UTC)
+            if trade == "sell_before_ex"
+            else datetime(2026, 10, 1, 15, 0, tzinfo=UTC)
+        )
+        _sell_spy(journal_settings, run_id, sold_at)
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(minutes=1))
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            S,
+            as_of=fixed_clock.now,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividends == expected
 
 
 def test_a_dividend_known_only_after_close_of_the_previous_session_explains_nothing(
@@ -992,12 +2122,44 @@ def test_frozen_risk_reads_a_frozen_max_skip_share_as_frozen() -> None:
     assert frozen_risk(_window_with(json.dumps(values))).max_skip_share == pytest.approx(0.2)
 
 
+def test_frozen_risk_reads_a_window_frozen_before_the_merger_lag_at_its_default() -> None:
+    """Paper spec amendment #1762 item 10 (T249): a window frozen before T249 has
+    no `risk.reconcile_merger_lag_sessions` and reads it at 5; a frozen value is
+    read as frozen."""
+    values = _todays_risk_keys_without("reconcile_merger_lag_sessions")
+    assert frozen_risk(_window_with(json.dumps(values))).reconcile_merger_lag_sessions == 5
+    frozen = _todays_risk_keys_without() | {"risk.reconcile_merger_lag_sessions": 2}
+    assert frozen_risk(_window_with(json.dumps(frozen))).reconcile_merger_lag_sessions == 2
+
+
+def test_frozen_risk_backfills_dividend_credit_window() -> None:
+    values = _todays_risk_keys_without("reconcile_dividend_credit_sessions")
+    assert frozen_risk(_window_with(json.dumps(values))).reconcile_dividend_credit_sessions == 25
+    values["risk.reconcile_dividend_credit_sessions"] = 12
+    assert frozen_risk(_window_with(json.dumps(values))).reconcile_dividend_credit_sessions == 12
+
+
+def test_frozen_risk_reads_a_window_frozen_before_the_delisting_premium_at_its_default() -> None:
+    """#411: a window frozen before `risk.delisting_cash_max_premium` reads it at 0.10."""
+    values = _todays_risk_keys_without("delisting_cash_max_premium")
+    assert frozen_risk(_window_with(json.dumps(values))).delisting_cash_max_premium == 0.10
+
+
+_BACK_FILLED = (
+    "max_skip_share",
+    "reconcile_merger_lag_sessions",
+    "reconcile_dividend_credit_sessions",
+    "reconcile_dividend_exhaustive_dues",
+    "reconcile_dividend_subset_states",
+    "delisting_cash_max_premium",
+)
+
+
 @pytest.mark.parametrize(
-    "missing", sorted(k for k in RiskConfig.model_fields if k != "max_skip_share")
+    "missing", sorted(k for k in RiskConfig.model_fields if k not in _BACK_FILLED)
 )
 def test_frozen_risk_still_refuses_a_window_lacking_any_other_risk_key(missing: str) -> None:
-    """The back-fill is for `risk.max_skip_share` alone: a `frozen_json` lacking
-    any other `RiskConfig` key still refuses, naming it."""
+    """Only the legacy back-fills allow a missing frozen risk key."""
     values = _todays_risk_keys_without(missing)
     with pytest.raises(ValueError, match=f"window 7 frozen_json lacks risk keys.*{missing}"):
         frozen_risk(_window_with(json.dumps(values)))

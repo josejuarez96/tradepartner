@@ -1,13 +1,15 @@
 """Portfolio construction and trades (backtest spec reqs 3 and 4).
 
 Pure functions over plain mappings keyed by `security_id`. Long-only: every weight is
-non-negative, weights sum to at most 1, and the remainder is cash.
+non-negative, weights sum to at most 1, and the remainder is cash. A signed book
+(`portfolio.side = "long_short"`, spec amendment #1872) builds through
+`signed_target_weights`.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Literal
@@ -65,6 +67,113 @@ def target_weights(
     selected = ranked[: _selected_count(len(ranked), top_fraction)]
     weight = _equal_weight(len(selected))
     return {sid: weight for sid in sorted(selected)}
+
+
+def signed_target_weights(
+    scores: Mapping[str, float],
+    top_fraction: float,
+    gross: float,
+    net: float,
+    eligible: Collection[str],
+) -> dict[str, float]:
+    """Signed target weights for a long/short book (backtest spec amendment #1872,
+    item 2).
+
+    `ranked` is the scored names by score descending, ties by `security_id` ascending, as
+    `target_weights` ranks them. The **long leg** is the top `k_L` ranked names, `k_L`
+    the count `top_fraction` selects from them, each at `(gross + net) / 2 / k_L`. The
+    **short leg** is chosen after it: `k_S` is the count `top_fraction` selects from the
+    eligible names (`eligible`, the names that pass item 3's price proxy), and the leg is
+    the `k_S` lowest-scored eligible names not in the long leg, each at
+    `-(gross - net) / 2 / k_S`. An ineligible low scorer is skipped and the next-lowest
+    eligible name takes its place; a name is never in both legs; when fewer than `k_S`
+    eligible names remain outside the long leg, the short leg takes those that remain and
+    `k_S` is that count. The legs are disjoint, each name with a non-zero target has one
+    weight, and the result is ordered by `security_id`. When both legs are full the long
+    leg sums to `(gross + net) / 2` and the short leg to `-(gross - net) / 2`, so
+    Σ |w| = `gross` and Σ w = `net`; a truncated or empty leg scales its own share.
+
+    `gross == net == 1.0` is the `long_only` book (spec item 1 makes `net_exposure` equal
+    `gross_exposure` there at the default), and the result is `target_weights`' output
+    exactly. A `gross == net` below 1.0 is still a signed book with no short leg: its
+    long leg carries the `gross` share, not the whole book. Raises `ValueError` for a
+    `top_fraction` outside `(0, 1]`, a non-finite score, `gross` or `net`, a `gross` at
+    or below 0, or a `net` outside `[-gross, gross]` (outside that range a "short" leg's
+    weight would turn into a long buy).
+    """
+    if not (0 < top_fraction <= 1):
+        raise ValueError(f"top_fraction must be in (0, 1], got {top_fraction}")
+    for sid, score in scores.items():
+        if not math.isfinite(score):
+            raise ValueError(f"score for {sid} must be finite, got {score}")
+    for name, value in (("gross", gross), ("net", net)):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite, got {value}")
+    if gross <= 0:
+        raise ValueError(f"gross must be positive, got {gross}")
+    if not (-gross <= net <= gross):
+        raise ValueError(f"net must be in [{-gross}, {gross}], got {net}")
+    if gross == net == 1.0:
+        return target_weights(scores, top_fraction, "equal")
+    if not scores:
+        return {}
+    ranked = sorted(scores, key=lambda sid: (-scores[sid], sid))
+    long_leg = ranked[: _selected_count(len(ranked), top_fraction)]
+    in_long = set(long_leg)
+    eligible_set = set(eligible)
+    eligible_ranked = [sid for sid in ranked if sid in eligible_set]
+    k_short = _selected_count(len(eligible_ranked), top_fraction)
+    short_leg = [sid for sid in reversed(eligible_ranked) if sid not in in_long][:k_short]
+    targets: dict[str, float] = {}
+    long_weight = (gross + net) / 2 / len(long_leg)
+    if long_weight:
+        targets.update({sid: long_weight for sid in long_leg})
+    if short_leg:
+        short_weight = -(gross - net) / 2 / len(short_leg)
+        if short_weight:
+            targets.update({sid: short_weight for sid in short_leg})
+    return {sid: targets[sid] for sid in sorted(targets)}
+
+
+def buffered_targets(
+    scores: Mapping[str, float],
+    previous: Collection[str],
+    top_fraction: float,
+    hold_top_fraction: float,
+) -> tuple[dict[str, float], int]:
+    """Targets under the buy/hold buffer, and the number of retained names (backtest
+    spec amendment #657, item 2).
+
+    `ranked` is the scored names by score descending, ties by `security_id` ascending;
+    n = |ranked|, k = the `top_fraction` count and h = the `hold_top_fraction` count
+    (the same count rule, so h >= k). The targets are `ranked[:k]` plus every name of
+    `previous` (the previous plan's targets) that is in `ranked[:h]`, each at the
+    `equal` weight 1 / |targets|. A previous name that is not scored is never kept.
+    `n_retained` is the number of targets outside `ranked[:k]`.
+
+    `hold_top_fraction` 0.0 means no buffer: the result is `target_weights`' output with
+    zero retained, and `previous` is not read. Otherwise it must be in
+    [`top_fraction`, 1]. Raises `ValueError` for a bad fraction or a non-finite score.
+    """
+    if hold_top_fraction == 0.0:
+        return target_weights(scores, top_fraction, "equal"), 0
+    if not (0 < top_fraction <= 1):
+        raise ValueError(f"top_fraction must be in (0, 1], got {top_fraction}")
+    if not (top_fraction <= hold_top_fraction <= 1):
+        raise ValueError(
+            f"hold_top_fraction must be 0.0 or in [{top_fraction}, 1], got {hold_top_fraction}"
+        )
+    for sid, score in scores.items():
+        if not math.isfinite(score):
+            raise ValueError(f"score for {sid} must be finite, got {score}")
+    if not scores:
+        return {}, 0
+    ranked = sorted(scores, key=lambda sid: (-scores[sid], sid))
+    top = set(ranked[: _selected_count(len(ranked), top_fraction)])
+    kept = set(ranked[: _selected_count(len(ranked), hold_top_fraction)]) & set(previous)
+    targets = top | kept
+    weight = _equal_weight(len(targets))
+    return {sid: weight for sid in sorted(targets)}, len(targets - top)
 
 
 def drifted_weights(position_values: Mapping[str, float], cash: float) -> dict[str, float]:

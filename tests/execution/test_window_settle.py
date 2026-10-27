@@ -53,6 +53,7 @@ from tradepartner.execution.window import (
     abandon,
     settle_order,
 )
+from tradepartner.store import registry
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     DecisionRow,
@@ -294,6 +295,7 @@ class Settle:
 
 def new_window(settings: Settings, frozen: str | None = None) -> PaperWindowRow:
     started = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
+    frozen_text = frozen or settle_frozen_json()
     row = PaperWindowRow(
         hypothesis_id=1,
         first_rebalance_session=REBALANCE,
@@ -302,8 +304,8 @@ def new_window(settings: Settings, frozen: str | None = None) -> PaperWindowRow:
         starting_equity=100_000.0,
         code_version="test",
         started_at=started,
-        frozen_json=frozen or settle_frozen_json(),
-        frozen_sha256="0" * 64,
+        frozen_json=frozen_text,
+        frozen_sha256=registry.params_sha256(json.loads(frozen_text)),
         known_at=started,
         ingested_at=started,
     )
@@ -562,10 +564,14 @@ def settle_window(env: Env, tmp_path: Path) -> PaperWindowRow:
     frozen["paper.min_override_reason_chars"] = MIN_REASON
     with open_for_write(env.settings) as conn:
         conn.execute(
-            "UPDATE paper_windows SET frozen_json = ? WHERE window_id = ?",
-            [json.dumps(frozen, sort_keys=True), window.window_id],
+            "UPDATE paper_windows SET frozen_json = ?, frozen_sha256 = ? WHERE window_id = ?",
+            [json.dumps(frozen, sort_keys=True), registry.params_sha256(frozen), window.window_id],
         )
-    env.window = replace(window, frozen_json=json.dumps(frozen, sort_keys=True))
+    env.window = replace(
+        window,
+        frozen_json=json.dumps(frozen, sort_keys=True),
+        frozen_sha256=registry.params_sha256(frozen),
+    )
     return env.window
 
 

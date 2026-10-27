@@ -79,7 +79,7 @@ import json
 import math
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from functools import partial
 from typing import Literal, Protocol, cast
@@ -108,11 +108,10 @@ from tradepartner.execution.plan import (
     decisions_from,
 )
 from tradepartner.execution.plan import current_listings as current_listings
-from tradepartner.execution.reconcile_run import frozen_risk
-from tradepartner.execution.symbols import broker_symbol
+from tradepartner.execution.reconcile_run import frozen_risk, order_symbols
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
-from tradepartner.store.asof import listings_as_of, live_actions_as_of, prices_as_of
+from tradepartner.store.asof import live_actions_as_of, prices_as_of
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
     DecisionRow,
@@ -187,6 +186,9 @@ class PlanOutcome:
     status: Literal["planned", "reused", "lagging"]
     decisions: tuple[DecisionRow, ...] = ()
     plan_trial_id: int | None = None
+    #: Candidates with no T_0 bar, excluded as `excluded_no_t0_bar` (#1997); the run
+    #: raises `missing_candidate_bar` for them. Empty for `reused` and `lagging`.
+    no_t0_bar: tuple[str, ...] = ()
 
 
 # --- the kind ------------------------------------------------------------------------
@@ -425,26 +427,31 @@ def _symbols(
     conn: duckdb.DuckDBPyConnection,
     session: date,
     names: Sequence[str],
-    class_symbols: Mapping[str, str] | None,
+    settings: Settings,
+    window_id: int,
 ) -> dict[str, str | None]:
-    """Each name's broker symbol (`execution.symbols.broker_symbol` of its
-    current listing at S among rows known at close(S-1)); `None` for a listing
-    with no broker form (#1729). A name with no listing raises, since its
-    `assets` read cannot be made."""
+    """Each name's broker symbol from the one symbol map
+    (`reconcile_run.order_symbols`, #2185): its current listing at S among rows
+    known at close(S-1), under the new symbol of a ticker change the run's
+    reconciliation applied; `None` for a listing with no broker form (#1729)
+    and for a name a ticker change leaves ambiguous, so neither is ever read
+    under its old symbol. A name with no listing raises, since its `assets`
+    read cannot be made."""
     if not names:
         return {}
-    current = current_listings(listings_as_of(conn, _cut(session), list(names)), session)
-    missing = sorted(set(names) - set(current))
+    mapped = order_symbols(conn, session, names, settings, window_id)
+    missing = sorted(set(names) - set(mapped.symbols) - set(mapped.ambiguous))
     if missing:
         raise ValueError(f"no listing known at close(S-1) for {missing}")
-    symbols = {sid: broker_symbol(current[sid], class_symbols) for sid in names}
+    symbols = {sid: mapped.symbols.get(sid) for sid in names}
     _check_unique(symbols)
     return symbols
 
 
 def _check_unique(symbols: Mapping[str, str | None]) -> None:
     """Raise when two names map to one broker symbol (`GEF-B` and `GEF/B` are
-    both `GEF.B`): the `assets` read and any order would be ambiguous."""
+    both `GEF.B`): the `assets` read and any order would be ambiguous. A name
+    the symbol map dropped is `None` here and claims nothing (#2185)."""
     mapped = [symbol for symbol in symbols.values() if symbol is not None]
     if len(set(mapped)) != len(mapped):
         raise ValueError(f"two names share a broker symbol: {dict(symbols)}")
@@ -458,6 +465,8 @@ class _Unresolved:
     untradable."""
 
     fractionable: bool = False
+    shortable: bool = False
+    easy_to_borrow: bool = False
 
 
 _UNRESOLVED = _Unresolved()
@@ -663,7 +672,7 @@ def _read(
 
     forced = _open_forced_exits(conn, window_id, session, actions, frozen, exit_price)
     overrides = tuple(o.override for o in store_journal.overrides_for(conn, window_id))
-    held_symbols = _symbols(conn, session, held, settings.alpaca.class_symbols)
+    held_symbols = _symbols(conn, session, held, settings, window_id)
     held_assets = _assets(assets_read, held_symbols)
     return _Reads(
         hypothesis=hypothesis,
@@ -724,7 +733,11 @@ def _plan_at(
 ) -> engine.Plan:
     lend = partial(_lend, conn)
     with StoreProvider(lend, handle, params, registry_connect=lend) as provider:
-        return engine.plan(provider, params, t_i, family=family)
+        plan = engine.plan(provider, params, t_i, family=family)
+        lost = engine.no_t0_bar_candidates(provider, params, t_i)
+    if not lost:
+        return plan
+    return replace(plan, exclusions={**plan.exclusions, engine.NO_T0_BAR: lost})
 
 
 def _close_ok(conn: duckdb.DuckDBPyConnection, handle: registry.TrialHandle) -> None:
@@ -837,9 +850,12 @@ def plan_rebalance(
         _check_universe(conn, window, window.window_id, t_i, plan.n_universe, settings)
         held = set(reads.held_assets)
         new = sorted(set(plan.targets) - held)
-        new_symbols = _symbols(conn, session, new, settings.alpaca.class_symbols)
-        _check_unique({**reads.held_symbols, **new_symbols})
-        assets = {**reads.held_assets, **_assets(assets_read, new_symbols)}
+        # One map over the held and the new names (#2185), so a new name
+        # claiming a renamed held name's symbol leaves both unread, never sent.
+        both = _symbols(conn, session, [*reads.held_symbols, *new], settings, window.window_id)
+        new_symbols = {sid: both[sid] for sid in new}
+        dropped = {sid: _UNRESOLVED for sid in reads.held_symbols if both[sid] is None}
+        assets = {**reads.held_assets, **dropped, **_assets(assets_read, new_symbols)}
         prices = {**reads.prices, **reference_prices(conn, session, new, reads.actions)}
         listings_at = {**reads.ended, **_ended(conn, session, new, reads.params)}
         costs = reads.params.costs
@@ -865,4 +881,6 @@ def plan_rebalance(
         _rollback(conn)
         raise
     conn.commit()
-    return PlanOutcome(t_i, "planned", rows, handle.trial_id)
+    return PlanOutcome(
+        t_i, "planned", rows, handle.trial_id, tuple(plan.exclusions.get(engine.NO_T0_BAR, ()))
+    )

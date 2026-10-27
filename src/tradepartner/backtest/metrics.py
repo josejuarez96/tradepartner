@@ -85,11 +85,44 @@ def family_benchmark_keys(name: str) -> tuple[str, str]:
     return f"excess_cagr_{lower}", f"tracking_error_{lower}"
 
 
-def metric_keys(family_benchmark: str | None = None) -> tuple[str, ...]:
-    """`METRIC_KEYS`, plus a family benchmark's two keys when it declares one."""
-    if family_benchmark is None:
-        return METRIC_KEYS
-    return METRIC_KEYS + family_benchmark_keys(family_benchmark)
+#: The seven keys a `long_short` trial's strategy series adds at every level (backtest spec
+#: amendment #1872, item 8; plan T224). They are reported only, written through
+#: `metric_keys` like a family benchmark's two, so a `long_only` trial writes no new row.
+LONG_SHORT_KEYS: tuple[str, ...] = (
+    "gross_exposure_mean",
+    "gross_exposure_max",
+    "net_exposure_mean",
+    "net_exposure_min",
+    "net_exposure_max",
+    "borrow_paid_annual",
+    "excess_cagr_rf",
+)
+
+
+@dataclass(frozen=True)
+class LongShortBook:
+    """A signed book's session-close exposures (fractions of equity) and its total borrow
+    fee in dollars over the run: the inputs of `LONG_SHORT_KEYS`."""
+
+    gross_mean: float
+    gross_max: float
+    net_mean: float
+    net_min: float
+    net_max: float
+    borrow_paid: float
+
+
+def metric_keys(
+    family_benchmark: str | None = None, *, long_short: bool = False
+) -> tuple[str, ...]:
+    """`METRIC_KEYS`, plus a family benchmark's two keys when it declares one, plus
+    `LONG_SHORT_KEYS` for a `long_short` trial's strategy series."""
+    keys = (
+        METRIC_KEYS
+        if family_benchmark is None
+        else METRIC_KEYS + family_benchmark_keys(family_benchmark)
+    )
+    return keys + LONG_SHORT_KEYS if long_short else keys
 
 
 # Stored as null for the SPY series: its excess over itself is identically zero (req 7).
@@ -196,6 +229,8 @@ def series_metrics(
     periods_per_year: int,
     risk_free_period_returns: Sequence[float],
     family_benchmark: tuple[str, Sequence[float]] | None = None,
+    long_short: LongShortBook | None = None,
+    risk_free_from_store: bool = False,
 ) -> dict[str, float | None]:
     """Every req 8 key for one series at one cost level.
 
@@ -208,6 +243,14 @@ def series_metrics(
     benchmark other than SPY and MTUM (ADR 0014 point 4); it adds `excess_cagr_<name>`
     and `tracking_error_<name>` (name lower-cased, `family_benchmark_keys`), and `None`
     adds nothing, so the key set and values of a family without one are unchanged.
+    `long_short` is a signed book's `LongShortBook`; it appends `LONG_SHORT_KEYS` after
+    every other key (the three exposure means and extremes as given, `borrow_paid_annual`
+    = the fees over the mean of `daily_equity`, per year of the run's `n / periods_per_year`,
+    and `excess_cagr_rf` = `cagr - risk_free_annual`), and `None` adds nothing.
+    `excess_cagr_rf` is measured over the store's T-bill series, so it is None unless
+    `risk_free_from_store` (with the constant source it would just equal `cagr`).
+    `borrow_paid_annual` divides the whole run's fees by `n / periods_per_year` years; the
+    run's tail after its last rebalance adds fees but no years, a small upward bias.
     `daily_equity` is the equity on every session, for `max_drawdown`. `turnover` is the
     one-sided turnover per rebalance; an empty sequence gives 0. `risk_free_period_returns` is
     one return per period (`riskfree.constant_period_returns` or `riskfree.period_risk_free`).
@@ -313,6 +356,17 @@ def series_metrics(
         excess_key, tracking_key = family_benchmark_keys(family_benchmark[0])
         out[excess_key] = cagr - _cagr(extra, ppy)
         out[tracking_key] = _annualized_std(net - extra, ppy)
+    if long_short is not None:
+        years = n / ppy
+        out["gross_exposure_mean"] = long_short.gross_mean
+        out["gross_exposure_max"] = long_short.gross_max
+        out["net_exposure_mean"] = long_short.net_mean
+        out["net_exposure_min"] = long_short.net_min
+        out["net_exposure_max"] = long_short.net_max
+        out["borrow_paid_annual"] = long_short.borrow_paid / float(np.mean(equity)) / years
+        out["excess_cagr_rf"] = (
+            cagr - annualised(risk_free_period_returns, ppy) if risk_free_from_store else None
+        )
     return out
 
 

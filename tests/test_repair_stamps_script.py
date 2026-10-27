@@ -1291,3 +1291,159 @@ def test_unrepaired_sgml_change_in_the_window_aborts_before_writing(tmp_path: Pa
     assert run_unrepaired(c, sec, source, "--apply") == 1
     assert {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")} == before
     assert not (c.dir / "stamps" / "v1.restamp-1382a3.manifest.csv").exists()
+
+
+# --- shift-unrepaired (#1382): the 39-CIK New York-offset shift ---------------
+
+SH = "0000003101"  # a listed CIK of an earlier release's unrepaired list
+SH_EDT = utc(2024, 7, 2, 14, 0)  # EDT: +4 h
+SH_EST = utc(2024, 1, 3, 14, 0)  # EST: +5 h
+SH_PRE2003 = utc(1998, 3, 10, 15, 0)  # EST
+SH_UNLISTED = utc(2024, 7, 5, 9, 0)
+SH_MOVED = utc(2024, 7, 9, 9, 0)  # listed, but its file now holds another stamp
+
+
+class NoRequests:
+    """A fetch that fails the test if the shift mode asks SEC for anything."""
+
+    def __call__(self, cik: str, accession: str) -> datetime:
+        raise AssertionError("shift-unrepaired must make no SEC request")
+
+
+def shift_case(tmp_path: Path) -> tuple[Cache, Path]:
+    c = Cache(tmp_path)
+    records = [
+        (acc(SH, 1), SH_EDT, date(2024, 7, 2)),
+        (acc(SH, 2), SH_EST, date(2024, 1, 3)),
+        ("0000003101-98-000001", SH_PRE2003, date(1998, 3, 10)),
+        (acc(SH, 4), SH_UNLISTED, date(2024, 7, 5)),
+        (acc(SH, 5), SH_MOVED + timedelta(hours=1), date(2024, 7, 9)),
+    ]
+    c.add_cik(SH, [(a, s, d, False) for a, s, d in records])
+    c.finish()
+    listed = [
+        (acc(SH, 1), SH_EDT),
+        (acc(SH, 2), SH_EST),
+        ("0000003101-98-000001", SH_PRE2003),
+        (acc(SH, 5), SH_MOVED),  # the file holds another stamp now
+        (acc(SH, 9), utc(2024, 7, 10, 9, 0)),  # gone from its file
+    ]
+    rows = [
+        {
+            "cik": SH,
+            "accession": a,
+            "old_stamp": s.isoformat(),
+            "new_stamp": s.isoformat(),
+            "method": "unrepaired",
+            "evidence": "class mixed, not repaired",
+        }
+        for a, s in listed
+    ]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=MANIFEST_COLUMNS, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    path = tmp_path / "v1.restamp-1382a2.manifest.unrepaired.csv.gz"
+    path.write_bytes(gzip.compress(buffer.getvalue().encode()))
+    return c, path
+
+
+def shift_unrepaired(c: Cache, source: Path, *extra: str, release: str = "restamp-1382a3") -> int:
+    argv = [
+        "--cache-dir",
+        str(c.dir),
+        "shift-unrepaired",
+        "--from",
+        str(source),
+        "--window-start",
+        WINDOW.isoformat(),
+        "--release",
+        release,
+        *extra,
+    ]
+    return repair_stamps.main(argv, fetch=NoRequests())
+
+
+def test_shift_unrepaired_dry_run_writes_nothing_and_counts(tmp_path: Path, capsys: Any) -> None:
+    c, source = shift_case(tmp_path)
+    before = c.snapshot()
+    assert shift_unrepaired(c, source) == 0
+    assert c.snapshot() == before
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "shift-unrepaired" and report["apply"] is False
+    assert report["to_shift"] == 3
+    assert report["stamp_differs_from_list"] == 1
+    assert report["listed_without_stamp"] == 1
+    assert report["requests"] == 0
+
+
+def test_shift_unrepaired_moves_each_listed_stamp_later_by_the_new_york_offset(
+    tmp_path: Path,
+) -> None:
+    c, source = shift_case(tmp_path)
+    before = c.snapshot()
+    assert shift_unrepaired(c, source, "--apply") == 0
+    assert c.stamp(SH, acc(SH, 1)) == SH_EDT + timedelta(hours=4)
+    assert c.stamp(SH, acc(SH, 2)) == SH_EST + timedelta(hours=5)
+    assert c.stamp(SH, "0000003101-98-000001") == SH_PRE2003 + timedelta(hours=5)
+    # not listed, and listed-but-changed-since, stay as they were
+    assert c.stamp(SH, acc(SH, 4)) == SH_UNLISTED
+    assert c.stamp(SH, acc(SH, 5)) == SH_MOVED + timedelta(hours=1)
+    # the backup holds the pre-run directory
+    backup = c.dir / "stamps" / "v1.restamp-1382a3.bak"
+    assert {
+        str(p.relative_to(backup)): p.read_bytes() for p in backup.rglob("*") if p.is_file()
+    } == {k.removeprefix("stamps/v1/"): v for k, v in before.items() if k.startswith("stamps/v1/")}
+    # only the three stamps changed in the file
+    for acc_n in (4, 5):
+        assert json.loads((c.stamps / f"{SH}.json").read_bytes())["records"][acc(SH, acc_n)]
+
+
+def test_no_lookahead_shift_unrepaired_never_moves_a_stamp_earlier(tmp_path: Path) -> None:
+    c, source = shift_case(tmp_path)
+    assert shift_unrepaired(c, source, "--apply") == 0
+    rows = c.manifest("restamp-1382a3")
+    assert rows and {r["method"] for r in rows} == {"shift"}
+    for r in rows:
+        assert datetime.fromisoformat(r["new_stamp"]) > datetime.fromisoformat(r["old_stamp"])
+        assert datetime.fromisoformat(r["new_stamp"]) - datetime.fromisoformat(r["old_stamp"]) in (
+            timedelta(hours=4),
+            timedelta(hours=5),
+        )
+
+
+def test_shift_unrepaired_lists_what_it_did_not_shift(tmp_path: Path) -> None:
+    c, source = shift_case(tmp_path)
+    assert shift_unrepaired(c, source, "--apply") == 0
+    left = _side(c)
+    assert set(left) == {(SH, acc(SH, 5)), (SH, acc(SH, 9))}
+
+
+def test_shift_unrepaired_twice_does_not_shift_again(tmp_path: Path) -> None:
+    c, source = shift_case(tmp_path)
+    assert shift_unrepaired(c, source, "--apply") == 0
+    once = c.records(SH)
+    assert shift_unrepaired(c, source, "--apply", release="restamp-1382a4") == 0
+    assert c.records(SH) == once  # the file's stamps no longer equal the list's old stamps
+
+
+def test_shift_unrepaired_in_the_window_aborts_before_writing(tmp_path: Path) -> None:
+    c, source = shift_case(tmp_path)
+    in_window = utc(2026, 10, 10, 14, 0)
+    data = json.loads((c.stamps / f"{SH}.json").read_bytes())
+    data["records"][acc(SH, 1)][3] = in_window.isoformat()
+    (c.stamps / f"{SH}.json").write_bytes(json.dumps(data).encode())
+    with gzip.open(source, "rt", newline="") as f:
+        text = f.read().replace(SH_EDT.isoformat(), in_window.isoformat())
+    source.write_bytes(gzip.compress(text.encode()))
+    before = {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")}
+    assert shift_unrepaired(c, source, "--apply") == 1
+    assert {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")} == before
+
+
+def test_shift_unrepaired_refuses_a_manifest_given_by_mistake(tmp_path: Path) -> None:
+    c, source = shift_case(tmp_path)
+    with gzip.open(source, "rt", newline="") as f:
+        text = f.read().replace("unrepaired", "shift")
+    source.write_bytes(gzip.compress(text.encode()))
+    assert shift_unrepaired(c, source) == 1

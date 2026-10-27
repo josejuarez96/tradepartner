@@ -691,6 +691,35 @@ def test_a_recorded_submit_refusal_is_raised_typed_with_no_key_in_it(
         assert secret not in text
 
 
+@pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
+def test_a_wash_trade_403_is_a_reconciliation_fault_by_code_and_message(side: Side) -> None:
+    """#1949: 403 40310000 'potential wash trade detected' is typed on either side,
+    and the error names it; the same code with another message is not."""
+    body = {"code": 40310000, "message": "potential wash trade detected. use complex orders"}
+    broker, http = _broker()
+    http.route("GET", "/v2/orders:by_client_order_id", _by_client_id({}))
+    http.route("POST", "/v2/orders", (403, body))
+    with pytest.raises(ReconciliationError, match="wash trade"):
+        broker.submit(_request(side=side))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "insufficient buying power",
+        "opg orders must be submitted after 7:00pm and before 9:28am",
+        "bracket orders do not support extended hours trading",
+    ],
+)
+def test_other_40310000_messages_are_not_typed_as_a_wash_trade(message: str) -> None:
+    broker, http = _broker()
+    http.route("GET", "/v2/orders:by_client_order_id", _by_client_id({}))
+    http.route("POST", "/v2/orders", (403, {"code": 40310000, "message": message}))
+    with pytest.raises(AlpacaTradingError) as err:
+        broker.submit(_request())
+    assert not isinstance(err.value, ReconciliationError)
+
+
 #: The three per-name refusals of the allowlist (paper spec amendment 2026-10-18
 #: item 2, T202), each as Alpaca answers `POST /v2/orders`: the 404 / 40410000 of an
 #: asset it does not know, and the 403 / 40310000 refusals told apart by message
@@ -945,6 +974,158 @@ def test_a_fill_whose_order_cannot_be_resolved_raises_system_fault() -> None:
     http.route("GET", "/v2/orders/[^/]+", _by_id(unnamed))
     with pytest.raises(SystemFaultError, match="no client_order_id"):
         broker.fills()
+
+
+#: The three Alpaca paper rows of order 30e87f04 (book daily, 2026-10-20, #2149):
+#: a `fill` of 1 corrected 2 ms later by a `partial_fill` of -0.64777629.
+_RAL_ORDER = "30e87f04-7701-4498-92cc-5a191a2e6c12"
+_RAL_ROWS: list[dict[str, Any]] = [
+    {
+        "id": "20261020093049795::a",
+        "activity_type": "FILL",
+        "transaction_time": "2026-10-20T13:30:49.795092Z",
+        "type": "partial_fill",
+        "price": "67.23",
+        "qty": "7",
+        "side": "buy",
+        "symbol": "RAL",
+        "leaves_qty": "0.352223709",
+        "order_id": _RAL_ORDER,
+        "cum_qty": "7",
+        "order_status": "partially_filled",
+    },
+    {
+        "id": "20261020093112899::06fa04cb-5704-494f-b5ac-aadcd8ffa6b0",
+        "activity_type": "FILL",
+        "transaction_time": "2026-10-20T13:31:12.899373Z",
+        "type": "fill",
+        "price": "67.23",
+        "qty": "1",
+        "side": "buy",
+        "symbol": "RAL",
+        "leaves_qty": "0",
+        "order_id": _RAL_ORDER,
+        "cum_qty": "7.35222371",
+        "order_status": "filled",
+    },
+    {
+        "id": "20261020093112901::df3177eb-37b1-42bb-b404-ea6e94174a75",
+        "activity_type": "FILL",
+        "transaction_time": "2026-10-20T13:31:12.901007Z",
+        "type": "partial_fill",
+        "price": "67.23",
+        "qty": "-0.64777629",
+        "side": "buy",
+        "symbol": "RAL",
+        "leaves_qty": "1",
+        "order_id": _RAL_ORDER,
+        "cum_qty": "6.35222371",
+        "order_status": "partially_filled",
+    },
+]
+
+
+def _ral_broker(rows: list[dict[str, Any]]) -> AlpacaBroker:
+    broker, http = _broker()
+    http.route("GET", "/v2/account/activities/FILL", (200, rows))
+    order = {"id": _RAL_ORDER, "client_order_id": "daily-20261020-ral"}
+    http.route("GET", "/v2/orders/[^/]+", _by_id({_RAL_ORDER: order}))
+    return broker
+
+
+def test_a_negative_fill_row_corrects_its_orders_earlier_fill() -> None:
+    fills = _ral_broker(copy.deepcopy(_RAL_ROWS)).fills()
+
+    assert [(f.broker_fill_id, f.quantity) for f in fills] == [
+        ("20261020093049795::a", 7.0),
+        ("20261020093112899::06fa04cb-5704-494f-b5ac-aadcd8ffa6b0", 0.35222371),
+    ]
+    assert sum(f.quantity for f in fills) == 7.35222371  # the broker's position
+    assert fills[1].filled_at == datetime(2026, 10, 20, 13, 31, 12, 899373, tzinfo=UTC)
+    assert fills[1].price == 67.23 and fills[1].client_order_id == "daily-20261020-ral"
+
+
+def test_a_negative_fill_row_with_no_earlier_fill_in_the_read_raises_system_fault() -> None:
+    since = datetime(2026, 10, 20, 13, 31, 12, 900000, tzinfo=UTC)  # between the two rows
+    with pytest.raises(SystemFaultError, match="has no earlier fill"):
+        _ral_broker(copy.deepcopy(_RAL_ROWS)).fills(since)
+    with pytest.raises(SystemFaultError, match="has no earlier fill"):
+        _ral_broker(copy.deepcopy(_RAL_ROWS[2:])).fills()
+
+
+def test_a_negative_fill_row_at_another_price_or_past_zero_raises_system_fault() -> None:
+    repriced = copy.deepcopy(_RAL_ROWS)
+    repriced[2]["price"] = "67.24"
+    with pytest.raises(SystemFaultError, match=r"corrects a fill at 67\.23"):
+        _ral_broker(repriced).fills()
+
+    too_big = copy.deepcopy(_RAL_ROWS)
+    too_big[2]["qty"] = "-1"
+    with pytest.raises(SystemFaultError, match="positive, finite"):
+        _ral_broker(too_big).fills()
+
+
+@pytest.mark.parametrize("field, value", [("symbol", "OTHER"), ("side", "sell")])
+def test_a_negative_fill_row_with_another_symbol_or_side_raises_system_fault(
+    field: str, value: str
+) -> None:
+    changed = copy.deepcopy(_RAL_ROWS)
+    changed[2][field] = value
+
+    with pytest.raises(SystemFaultError, match=field):
+        _ral_broker(changed).fills()
+
+
+def _short_rows(side: str, correction_side: str | None = None) -> list[dict[str, Any]]:
+    """The RAL rows as a short sale (`side`), the correction on `correction_side`."""
+    rows = copy.deepcopy(_RAL_ROWS)
+    for row in rows:
+        row["side"] = side
+    rows[2]["side"] = correction_side or side
+    return rows
+
+
+def _short_fills_broker() -> AlpacaBroker:
+    """The recorded sandbox AAPL short open (`sell_short`) and its cover (`buy`),
+    ids scrubbed (`short_fills.json`, from the 2026-10-19 probe, batch 1)."""
+    rows = _load("short_fills")
+    broker, http = _broker()
+    http.route("GET", "/v2/account/activities/FILL", (200, rows))
+    orders = {
+        row["order_id"]: {"id": row["order_id"], "client_order_id": f"short-{n}"}
+        for n, row in enumerate(rows)
+    }
+    http.route("GET", "/v2/orders/[^/]+", _by_id(orders))
+    return broker
+
+
+def test_a_sell_short_fill_parses_as_a_sell() -> None:
+    fill = _short_fills_broker().fills()[0]
+
+    assert (fill.side, fill.symbol, fill.quantity, fill.price) == (Side.SELL, "AAPL", 1.0, 342.02)
+
+
+def test_a_cover_fill_parses_as_a_buy() -> None:
+    fill = _short_fills_broker().fills()[1]
+
+    assert (fill.side, fill.symbol, fill.quantity, fill.price) == (Side.BUY, "AAPL", 1.0, 342.06)
+
+
+def test_a_sell_short_correction_folds_into_its_sell_short_fill() -> None:
+    fills = _ral_broker(_short_rows("sell_short")).fills()
+
+    assert [(f.side, f.quantity) for f in fills] == [(Side.SELL, 7.0), (Side.SELL, 0.35222371)]
+
+
+def test_a_correction_on_the_opposite_side_of_a_sell_short_fill_raises_system_fault() -> None:
+    with pytest.raises(SystemFaultError, match="side"):
+        _ral_broker(_short_rows("sell_short", "buy")).fills()
+
+
+@pytest.mark.parametrize("side", ["buy_to_cover", "short", ""])
+def test_an_unclassified_fill_side_raises_system_fault(side: str) -> None:
+    with pytest.raises(SystemFaultError, match="not classified"):
+        _ral_broker(_short_rows(side)[:1]).fills()
 
 
 # --- account, positions, assets --------------------------------------------------

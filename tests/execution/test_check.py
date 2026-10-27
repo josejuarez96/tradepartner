@@ -346,6 +346,10 @@ def test_week_end_window_counts_and_compares_per_iso_week(settings: Settings) ->
     assert lines["rebalance_count"].detail.startswith(
         "2 scheduler-executed rebalance session(s) [2026-11-27, 2026-12-04], need >= 2"
     )
+    assert lines["rebalance_count"].short == (
+        "2 of 2 rebalance sessions done; first 2026-11-27, latest 2026-12-04; "
+        "other runs are listed but not counted (--verbose shows them)"
+    )
     assert lines["tracking"].detail.startswith("2 compared non-excluded week(s), need >= 2")
 
 
@@ -406,6 +410,83 @@ def test_rebalance_count_lists_tty_and_no_trade_runs_without_counting_them(
     assert line.passed
     assert str(T1) in line.detail.split("tty-executed")[-1].split("no-trade")[0]
     assert str(T1) in line.detail.split("no-trade fill-session runs")[-1]
+
+
+def test_rebalance_count_clears_awaiting_when_later_run_records_fills(settings: Settings) -> None:
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn, extra_no_trade_run=True, t1_executed_by=None)
+        fill_day = next_session(T1)
+        conn.execute(
+            "UPDATE paper_runs SET session = ?, kind = 'rebalance' WHERE run_id = 12", [fill_day]
+        )
+        _insert_decision(conn, 12, 12, T1)
+        conn.execute(
+            "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, "
+            "phase, security_id, symbol, side, notional, sells_in_flight_at_submit, "
+            "known_at, ingested_at) VALUES ('pending-12', 12, 12, ?, 1, 'buy', "
+            "'SEC_A', 'AAA', 'buy', 1000.0, FALSE, ?, ?)",
+            [fill_day, _utc(fill_day), _utc(fill_day)],
+        )
+        _insert_run(conn, 13, next_session(fill_day), kind="mark")
+        _insert_rebalance_event(conn, T1, 13)
+    with open_read_only(settings) as conn:
+        line = next(line for line in check(conn, settings) if line.name == "rebalance_count")
+    assert line.passed
+    assert line.detail.startswith(f"2 scheduler-executed rebalance session(s) [{T0}, {T1}]")
+    assert (
+        f"submitted-order runs, fills recorded by a later run, not counted: [{fill_day}]"
+        in line.detail
+    )
+    assert "awaiting recorded fills" not in line.detail
+    assert f"no-trade fill-session runs, listed not counted: [{fill_day}]" not in line.detail
+
+
+def test_rebalance_count_keeps_awaiting_until_fills_are_recorded(settings: Settings) -> None:
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn, extra_no_trade_run=True)
+        fill_day = next_session(T2)
+        conn.execute(
+            "UPDATE paper_runs SET session = ?, kind = 'rebalance' WHERE run_id = 12", [fill_day]
+        )
+        _insert_decision(conn, 12, 12, T2)
+        conn.execute(
+            "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, "
+            "phase, security_id, symbol, side, notional, sells_in_flight_at_submit, "
+            "known_at, ingested_at) VALUES ('pending-12', 12, 12, ?, 1, 'buy', "
+            "'SEC_A', 'AAA', 'buy', 1000.0, FALSE, ?, ?)",
+            [fill_day, _utc(fill_day), _utc(fill_day)],
+        )
+    with open_read_only(settings) as conn:
+        line = next(line for line in check(conn, settings) if line.name == "rebalance_count")
+    assert line.passed
+    assert f"submitted-order runs awaiting recorded fills, not counted: [{fill_day}]" in line.detail
+
+
+def test_rebalance_count_names_missed_session_after_orders(settings: Settings) -> None:
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn, extra_no_trade_run=True)
+        fill_day = next_session(T2)
+        conn.execute(
+            "UPDATE paper_runs SET session = ?, kind = 'rebalance' WHERE run_id = 12", [fill_day]
+        )
+        _insert_decision(conn, 12, 12, T2)
+        conn.execute(
+            "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, "
+            "phase, security_id, symbol, side, notional, sells_in_flight_at_submit, "
+            "known_at, ingested_at) VALUES ('missed-12', 12, 12, ?, 1, 'buy', "
+            "'SEC_A', 'AAA', 'buy', 1000.0, FALSE, ?, ?)",
+            [fill_day, _utc(fill_day), _utc(fill_day)],
+        )
+        conn.execute(
+            "INSERT INTO rebalance_events (rebalance_session, run_id, status, known_at, "
+            "ingested_at) VALUES (?, 3, 'missed', ?, ?)",
+            [T2, _utc(fill_day), _utc(fill_day)],
+        )
+    with open_read_only(settings) as conn:
+        line = next(line for line in check(conn, settings) if line.name == "rebalance_count")
+    assert line.passed
+    assert f"submitted-order runs, rebalance missed, not counted: [{fill_day}]" in line.detail
+    assert "awaiting recorded fills" not in line.detail
 
 
 def test_two_executed_rows_on_one_rebalance_session_count_once(settings: Settings) -> None:
@@ -525,14 +606,16 @@ def _insert_order(
     decision_id: int = 1,
     run_id: int = 1,
     session: date = T0,
+    side: str = "buy",
+    position_side: str = "long",
 ) -> None:
     """An order of decision 1 at T0 with one terminal event stamped `at`."""
     conn.execute(
         "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
-        "security_id, symbol, side, notional, sells_in_flight_at_submit, known_at, "
-        "ingested_at) VALUES (?, ?, ?, ?, 1, 'buy', 'SEC_A', 'SEC_A', 'buy', 1000.0, FALSE, "
-        "?, ?)",
-        [coid, decision_id, run_id, session, _utc(session), _utc(session)],
+        "security_id, symbol, side, position_side, notional, "
+        "sells_in_flight_at_submit, known_at, ingested_at) "
+        "VALUES (?, ?, ?, ?, 1, 'buy', 'SEC_A', 'SEC_A', ?, ?, 1000.0, FALSE, ?, ?)",
+        [coid, decision_id, run_id, session, side, position_side, _utc(session), _utc(session)],
     )
     conn.execute(
         "INSERT INTO order_events (client_order_id, status, reason, known_at, ingested_at) "
@@ -582,6 +665,40 @@ def _chain(settings: Settings) -> check_module.CheckLine:
     tracking line to price."""
     with open_read_only(settings) as conn:
         return check_module._chain_line(conn, WINDOW_ID, "month_end")
+
+
+@pytest.mark.parametrize(
+    ("side", "position_side", "expected"),
+    [
+        ("buy", "long", "position_return"),
+        ("sell", "long", "realised_pnl"),
+        ("sell", "short", "position_return"),
+        ("buy", "short", "realised_pnl"),
+    ],
+)
+def test_chain_filled_outcome_follows_position_intent(
+    settings: Settings, side: str, position_side: str, expected: str
+) -> None:
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn)
+        _insert_order(conn, "intent", status="filled", side=side, position_side=position_side)
+        _insert_fill(conn, "intent", "intent-fill", _T0_UTC)
+    line = _chain(settings)
+    assert not line.passed
+    assert f"no {expected} outcome" in line.detail
+    with open_for_write(settings) as conn:
+        _insert_outcome(conn, "intent", expected)
+    assert _chain(settings).passed
+
+
+def test_chain_unfilled_order_still_needs_not_executed(settings: Settings) -> None:
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn)
+        _insert_order(conn, "missed-short", status="cancelled", side="sell", position_side="short")
+    assert "no not_executed outcome" in _chain(settings).detail
+    with open_for_write(settings) as conn:
+        _insert_outcome(conn, "missed-short", "not_executed")
+    assert _chain(settings).passed
 
 
 def test_chain_counts_an_owner_settled_order_complete_once_not_executed_is_written(
@@ -881,3 +998,23 @@ def test_check_for_a_book_with_no_window_fails_and_a_bad_token_is_refused(
             check(conn, settings, "b")
         with pytest.raises(ValueError, match="book_id must match"):
             check(conn, settings, "b-1")
+
+
+def test_time_to_go_is_plain_per_cadence() -> None:
+    from tradepartner.execution.check import _time_to_go
+
+    assert _time_to_go(5, "daily") == "5 more session(s) to go"
+    assert _time_to_go(5, "week_end") == "about 5 weeks to go"
+    assert _time_to_go(3, "week_end") == "about 3 weeks to go"
+    assert _time_to_go(5, "month_end") == "about 5 months to go"
+
+
+def test_unpassed_week_end_count_line_says_progress(settings: Settings) -> None:
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(
+            conn, sessions=(W0, W1, W2), cadence="week_end", t1_executed_by="tty"
+        )
+    with open_read_only(settings) as conn:
+        line = {x.name: x for x in check(conn, settings)}["rebalance_count"]
+    assert not line.passed
+    assert line.short.startswith("1 of 2 rebalance sessions done so far, about 7 more day")

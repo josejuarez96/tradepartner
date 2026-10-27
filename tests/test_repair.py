@@ -942,8 +942,11 @@ def test_the_dividend_repair_deletes_the_retract_identity_only(dividends: Settin
     assert message.startswith("deleted 1 duplicate dividend rows")
     with duckdb.connect(dividends.store.path, read_only=True) as conn:
         [ingest] = [i for i in last_ingests(conn, RUN) if i.source == "alpaca"]
-    assert ingest.last_ok_finished_at is None  # a repair is never an ok ingest
-    assert ingest.latest_status == REPAIRED
+    # A repair row is never an ingest (#2125): it is not the latest run at all,
+    # so its `repaired` status cannot hide a failed nightly ingest.
+    assert ingest.last_ok_finished_at is None
+    assert ingest.latest_status is None
+    assert ingest.latest_started_at is None
 
 
 def test_every_entry_without_a_bound(dividends: Settings) -> None:
@@ -1166,10 +1169,35 @@ def test_repair_judges_spinoff_parent_and_child_separately_from_dividend(
                 "provenance": "action",
             },
         )
+        insert_row(
+            conn,
+            "mergers",
+            {
+                "security_id": DEAD,
+                "kind": "cash",
+                "acquirer_security_id": None,
+                "acquiree_symbol": "DEAD",
+                "acquiree_cusip": "",
+                "acquirer_symbol": "",
+                "acquirer_cusip": "",
+                "share_ratio": None,
+                "cash_per_share": 5.0,
+                "effective_date": ex,
+                "process_date": ex,
+                "payable_date": None,
+                "source_action_id": "merger-1",
+                "known_at": session_close(ex),
+                "ingested_at": session_close(ex),
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
     dry = repair_resolution(store, clock=lambda: RUN, dry_run=True)
     assert dry.found.spinoffs == {(DEAD, ex): 1}
     assert dry.unjudged_symbol_changes == 1
     assert "1 symbol_changes rows unjudged" in dry.summary()
+    assert dry.unjudged_mergers == 1
+    assert "1 mergers rows unjudged" in dry.summary()
     assert (child, ex) in dry.found.actions
     assert (child, ex) not in dry.found.spinoffs
     assert dry.action_rows == 3  # one existing bad dividend, one same-day, one spin-off
@@ -1179,6 +1207,7 @@ def test_repair_judges_spinoff_parent_and_child_separately_from_dividend(
         "SELECT action_type, security_id FROM corporate_actions "
         "WHERE ex_date='2021-06-15' ORDER BY 1,2",
     ) == [("spinoff", child)]
+    assert _rows(store, "SELECT count(*) FROM mergers") == [(1,)]  # never deleted
 
 
 def test_repair_deletes_only_the_bad_parents_spinoff_of_a_shared_child(
@@ -1572,3 +1601,36 @@ def test_the_manifest_reads_both_tables_and_refuses_a_malformed_file(tmp_path: P
     bad.write_text("table,security_id\n")
     with pytest.raises(ValueError, match="the header must be"):
         repair.read_master_manifest(bad)
+
+
+# --- live successor chains (#821, plan T187b) ------------------------------------
+
+_UNIVERSE_DIR = Path(__file__).resolve().parent / "fixtures" / "universe"
+
+
+def test_the_dry_run_lists_a_live_successor_chain(tmp_path: Path) -> None:
+    """A live chain's dry run lists the pair with its ratio and proposes no
+    deletion for it: with rule 9 the hole bars resolve to the successor."""
+    from conftest import load_chain_overlay, load_universe_fixtures
+
+    settings = Settings(_env_file=None, store={"path": str(tmp_path / "chains.duckdb")})
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        load_universe_fixtures(conn, _UNIVERSE_DIR)
+        load_chain_overlay(conn)
+    result = repair_resolution(settings, clock=lambda: RUN, dry_run=True)
+    assert [(chain.predecessor_id, chain.successor_id) for chain in result.chains] == [
+        ("0001000010", "0001000011"),
+        ("0001000012", "0001000013"),
+        ("0001000014", "0001000015"),
+    ]
+    assert all(chain.ratio is not None and chain.ratio > 0 for chain in result.chains)
+    assert any(line.startswith("  chain 0001000010->0001000011: ratio") for line in result.lines())
+    assert "0001000010" not in result.found.securities
+    assert "0001000011" not in result.found.securities
+
+
+def test_the_dry_run_lists_no_chain_without_the_overlay(store: Settings) -> None:
+    """The store fixture has no successor_chains rows: no chain line."""
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert result.chains == ()

@@ -16,13 +16,14 @@ from tradepartner.adapters.broker import Order, OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker, PartialFill, Reject
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
-from tradepartner.errors import ClockError
+from tradepartner.errors import ClockError, LimitBreachError
 from tradepartner.execution import resume as resume_module
 from tradepartner.execution import switch
 from tradepartner.execution.collect import collect
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.reconcile_run import reconcile_now
 from tradepartner.execution.resume import NO_WINDOW, REFUSED, RELEASED, resume
+from tradepartner.store import registry
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     DecisionRow,
@@ -106,7 +107,7 @@ def _open_window(settings: Settings, risk: RiskConfig) -> PaperWindowRow:
         code_version="test",
         started_at=started,
         frozen_json=json.dumps(frozen, sort_keys=True),
-        frozen_sha256="0" * 64,
+        frozen_sha256=registry.params_sha256(frozen),
         known_at=started,
         ingested_at=started,
     )
@@ -861,6 +862,47 @@ def test_resume_is_refused_while_another_process_holds_the_lock(
     with run_lock(journal_settings), pytest.raises(LockHeld):
         _resume(journal_settings, fake, fixed_clock)
     assert _count(journal_settings, "resume_invocations") == 0
+
+
+def test_an_edited_frozen_json_refuses_the_resume_before_anything_is_read_or_written(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The window froze its limits; frozen_json is then rewritten looser with
+    frozen_sha256 unchanged (#2017, as #1984 does for a run). The resume raises
+    the run's `LimitBreachError`, with no broker call, no order and no row."""
+    _engage(journal_settings, window, fixed_clock)
+    frozen = json.loads(window.frozen_json)
+    frozen["risk.max_order_notional_fraction"] = 0.99
+    with open_for_write(journal_settings) as conn:
+        conn.execute(
+            "UPDATE paper_windows SET frozen_json = ? WHERE window_id = ?",
+            [json.dumps(frozen, sort_keys=True), window.window_id],
+        )
+    with pytest.raises(LimitBreachError, match="frozen_sha256"):
+        _resume(journal_settings, fake, fixed_clock)
+    assert fake.calls == ()
+    assert _count(journal_settings, "resume_invocations") == 0
+    assert _count(journal_settings, "orders") == 0
+    assert _engaged(journal_settings, window)
+
+
+def test_a_reformatted_frozen_json_with_the_same_values_still_resumes(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Control: the hash is of the canonical form, so whitespace is no mismatch."""
+    _engage(journal_settings, window, fixed_clock)
+    with open_for_write(journal_settings) as conn:
+        conn.execute(
+            "UPDATE paper_windows SET frozen_json = ? WHERE window_id = ?",
+            [json.dumps(json.loads(window.frozen_json), indent=2), window.window_id],
+        )
+    assert _resume(journal_settings, fake, fixed_clock).status == RELEASED
 
 
 def test_a_blank_reason_is_refused_before_anything(

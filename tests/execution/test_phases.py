@@ -744,9 +744,12 @@ def test_small_account_skips_a_nonfractionable_buy_below_one_share_only_when_ena
     off = _buys([buy], 100.0, costs=NO_COSTS, assets=assets)
     assert off.skips == () and off.deferred == (3,)
 
+    # A short-side buy is a cover, which the sells phase orders (ADR 0024); the
+    # small-account skip never reaches it, so the buys phase reads it the same on or off.
     short_buy = replace(buy, position_side="short")
     short = _buys([short_buy], 100.0, costs=NO_COSTS, assets=assets, frozen=on)
-    assert short.skips == () and short.deferred == (3,)
+    short_off = _buys([short_buy], 100.0, costs=NO_COSTS, assets=assets)
+    assert short.skips == () and short == short_off
 
     funded_later = _d(3, "buy", target=300.0, whole_share=True)
     cash_short = _buys([funded_later], 40.0, costs=NO_COSTS, assets=assets, frozen=on)

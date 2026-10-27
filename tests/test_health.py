@@ -11,6 +11,7 @@ future schema, could have.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -41,6 +42,12 @@ from tradepartner.gap import survivorship_gap
 from tradepartner.health import (
     BARS_ON_SESSIONS,
     BORROW_STATUS_UNIQUE,
+    CHAIN_IDS_DISTINCT_CIKS,
+    CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS,
+    CHAIN_KNOWN_AT_LE_INGESTED_AT,
+    CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER,
+    CHAIN_PRICE_BREAK,
+    CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER,
     COVERAGE_REFERENCE_NAMES,
     DUPLICATE_DIVIDENDS,
     FIGI_TYPES_DISAGREEMENTS,
@@ -69,9 +76,11 @@ from tradepartner.health import (
     CoverageReference,
     HealthReport,
     IndexMembersCheck,
+    IntegrityCheck,
     _bars_after_delisting,
     _overlapping_listings,
     bar_gaps,
+    chain_candidates_from_message,
     clock_suspect,
     coverage,
     coverage_reference,
@@ -79,10 +88,12 @@ from tradepartner.health import (
     figi_types,
     filing_event_counts,
     health_report,
+    health_verdict,
     integrity_checks,
     last_ingests,
     listed_without_bars,
     sample_sessions,
+    stale_gap_expected,
     statement_counts,
     statement_coverage,
     static_reliance,
@@ -439,6 +450,7 @@ def _run(
     *,
     cursor: str | None = None,
     message: str | None = None,
+    mode: str = "session",
 ) -> None:
     insert_row(
         conn,
@@ -449,7 +461,7 @@ def _run(
             "finished_at": started + timedelta(minutes=5),
             "status": status,
             "source": source,
-            "mode": "daily",
+            "mode": mode,
             "rows_added": 0,
             "chunk_cursor": cursor,
             "message": message,
@@ -492,6 +504,135 @@ def test_last_ingests_reports_last_ok_and_latest_run_per_source(
     assert alpaca.last_ok_cursor == "2020-06-29"
     assert alpaca.latest_status == "stale"
     assert alpaca.latest_message == "SPY missing"
+
+
+def test_last_ingests_shows_the_daily_alpaca_run_not_an_actions_backfill_month(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #1676: an actions-backfill month (mode `actions`, status `filled`) run
+    # after the latest daily run must not be the latest Alpaca run.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    insert_row(
+        fixture_store,
+        "ingestion_runs",
+        {
+            "run_id": "a2",
+            "started_at": day2,
+            "finished_at": day2 + timedelta(minutes=5),
+            "status": "filled",
+            "source": "alpaca",
+            "mode": "actions",
+            "rows_added": 0,
+            "chunk_cursor": "actions;since=2020-06-01;through=2020-06-30",
+            "message": "month",
+        },
+    )
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day1
+    assert alpaca.last_ok_cursor == "2020-06-29"
+
+
+def test_last_ingests_shows_a_failed_ingest_not_a_later_repair_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #2125: a `repair` row (mode `repair`, status `repaired`) after a failed
+    # nightly ingest must not become the latest Alpaca run and hide the
+    # failure.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    _run(fixture_store, "a2", "alpaca", "failed", day2, message="boom")
+    _run(
+        fixture_store,
+        "a3",
+        "alpaca",
+        "repaired",
+        day2 + timedelta(minutes=10),
+        message="deleted 1 duplicate dividend row",
+        mode="repair",
+    )
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "failed"
+    assert alpaca.latest_started_at == day2
+    assert alpaca.latest_message == "boom"
+    assert alpaca.last_ok_cursor == "2020-06-29"
+
+
+def test_last_ingests_leaves_out_an_action_retract_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #2125: an `action-retract` row (mode `action_retract`, status
+    # `repaired`; held PR #2121) is not an ingest either.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    _run(
+        fixture_store,
+        "a2",
+        "alpaca",
+        "repaired",
+        day2,
+        message="withdrew a split",
+        mode="action_retract",
+    )
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day1
+
+
+def test_last_ingests_leaves_out_a_hole_fill_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # A `--fill-holes` month (mode `holes`, status `filled`, never `ok`) is a
+    # maintenance run, not a fresh ingest, so it is left out like an actions
+    # month (#833, #1676, #2125).
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    _run(
+        fixture_store,
+        "a2",
+        "alpaca",
+        "filled",
+        day2,
+        cursor="holes;since=2020-06-01;through=2020-06-30",
+        mode="holes",
+    )
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day1
+
+
+def test_last_ingests_counts_a_backfill_chunk(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # A `--backfill` chunk (mode `backfill`) is a real ingest: its `ok` run
+    # and cursor are the source's last ok.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "failed", day1, message="boom")
+    _run(fixture_store, "a2", "alpaca", "ok", day2, cursor="2020-06-29", mode="backfill")
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day2
+    assert alpaca.last_ok_cursor == "2020-06-29"
+
+
+def test_last_ingests_leaves_out_an_unknown_mode(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # The mode set is an allow-list, so a mode added later (here a made-up
+    # one) is left out without a code change.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    _run(fixture_store, "a2", "alpaca", "failed", day2, mode="future_maintenance")
+    alpaca = last_ingests(fixture_store, day2 + timedelta(hours=1))[1]
+    assert alpaca.latest_status == "ok"
+    assert alpaca.latest_started_at == day1
 
 
 def test_last_ingests_ignores_a_run_not_finished_at_t(
@@ -2051,7 +2192,7 @@ def test_statement_facts_report_reads_the_latest_edgar_run_message(
             "finished_at": T_END - timedelta(minutes=1),
             "status": "ok",
             "source": "edgar",
-            "mode": "daily",
+            "mode": "session",
             "rows_added": 0,
             "chunk_cursor": None,
             "message": "0 securities; statement_vintage_late: 2, statement_derived: 1",
@@ -3755,3 +3896,656 @@ def test_the_figi_block_reads_the_latest_observation_known_at_t(
     assert figi_types(fixture_store, T_END, settings).rows["figi_type"].to_list() == [
         "Medium Term Note"
     ]
+
+
+# --- successor chains (#821, plan T187c) ------------------------------------
+
+
+CHAIN_IDS = ("0001000010", "0001000011")
+
+
+def _live_chain(
+    predecessor: str,
+    successor: str,
+    *,
+    known_at: datetime = T_END,
+    ingested_at: datetime | None = None,
+) -> dict[str, Any]:
+    """A `successor_chains` row the way an ingest writes it: `edgar`/`filing`,
+    unretracted, known at `known_at` and ingested at `ingested_at` (default
+    `known_at`)."""
+    return {
+        "predecessor_id": predecessor,
+        "successor_id": successor,
+        "evidence_accession": f"{successor}-24-900001",
+        "evidence_form": "8-K12B",
+        "known_at": known_at,
+        "ingested_at": ingested_at if ingested_at is not None else known_at,
+        "source": "edgar",
+        "provenance": "filing",
+        "retracted": False,
+    }
+
+
+def _chain_rule(
+    conn: duckdb.DuckDBPyConnection, rule: str, t: datetime = T_END
+) -> list[dict[str, Any]]:
+    report = health_report(conn, t, _settings())
+    [check] = [c for c in report.integrity if c.rule == rule]
+    return check.violations.to_dicts()
+
+
+def test_the_fixture_chains_pass_the_five_rules(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: the three fixture chains pass every chain rule, and a
+    price break is a warning, never a failure."""
+    report = health_report(chain_fixture_store, T_END, _settings())
+    failed = _failed(report.integrity)
+    for rule in (
+        CHAIN_IDS_DISTINCT_CIKS,
+        CHAIN_KNOWN_AT_LE_INGESTED_AT,
+        CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS,
+        CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER,
+        CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER,
+    ):
+        assert rule not in failed
+    assert CHAIN_PRICE_BREAK not in failed
+
+
+def test_the_successor_chains_block_lists_each_chain_handover_and_ratio(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: each live chain carries its hand-over day (the successor's
+    first listing row's `valid_from`) and the close ratio across it from the
+    stored bars. Hand-computed from the fixture: 19.33/15.41 = 1.2544 for the
+    1:1 pair (the only break), 19.65/20.52 = 0.9576 and 19.27/19.87 = 0.9698
+    for the other two."""
+    block = health_report(chain_fixture_store, T_END, _settings()).successor_chains
+    rows = {r["successor_id"]: r for r in block.frame.iter_rows(named=True)}
+    assert block.count == 3
+    assert rows["0001000011"]["handover"] == date(2020, 2, 4)
+    assert rows["0001000011"]["ratio"] == pytest.approx(19.33 / 15.41)
+    assert rows["0001000013"]["ratio"] == pytest.approx(19.65 / 20.52)
+    assert rows["0001000015"]["ratio"] == pytest.approx(19.27 / 19.87)
+    assert block.breaks == ("0001000011",)
+
+
+def test_the_chain_price_break_ratio_follows_the_threshold(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: the warning fires above `master.chain_max_price_ratio` or
+    below its inverse. At 1.20 the 1:1 pair's 1.2544 breaks; at 1.30 none
+    does; neither is ever a failure."""
+    tight = health_report(
+        chain_fixture_store, T_END, _settings(master={"chain_max_price_ratio": 1.20})
+    )
+    assert tight.successor_chains.breaks == ("0001000011",)
+    assert CHAIN_PRICE_BREAK not in _failed(tight.integrity)
+    loose = health_report(
+        chain_fixture_store, T_END, _settings(master={"chain_max_price_ratio": 1.30})
+    )
+    assert loose.successor_chains.breaks == ()
+
+
+def test_the_successor_chains_block_lists_predecessor_facts_after_the_handover(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: the subsidiary case -- a predecessor share fact dated after
+    the successor's first listing row is listed under the chain."""
+    insert_row(
+        chain_fixture_store,
+        "facts",
+        {
+            "security_id": "0001000010",
+            "fact_name": "shares_outstanding",
+            "as_of_date": date(2020, 3, 2),
+            "value": 4.2e8,
+            "known_at": session_close(date(2020, 3, 2)),
+            "ingested_at": session_close(date(2020, 3, 2)),
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    block = health_report(chain_fixture_store, T_END, _settings()).successor_chains
+    assert block.predecessor_facts.to_dicts() == [
+        {
+            "predecessor_id": "0001000010",
+            "fact_name": "shares_outstanding",
+            "as_of_date": date(2020, 3, 2),
+            "value": 4.2e8,
+        }
+    ]
+
+
+def test_chain_ids_distinct_ciks_fails_on_a_self_chain(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: the two ids naming one CIK fails the rule with both ids."""
+    insert_row(chain_fixture_store, "successor_chains", _live_chain("0001000099", "0001000099"))
+    violations = _chain_rule(chain_fixture_store, CHAIN_IDS_DISTINCT_CIKS)
+    assert [(v["predecessor_id"], v["successor_id"]) for v in violations] == [
+        ("0001000099", "0001000099")
+    ]
+
+
+def test_chain_known_at_le_ingested_at_fails_on_a_future_stamp(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: `known_at` after `ingested_at` fails the rule with the
+    ids. The schema's own CHECK blocks it, so inject into an unconstrained
+    copy (the shape a store built by other code could have)."""
+    loose = _unconstrained(chain_fixture_store)
+    try:
+        insert_row(
+            loose,
+            "successor_chains",
+            _live_chain(
+                "0001000098", "0001000097", known_at=T_END, ingested_at=T_END - timedelta(days=1)
+            ),
+        )
+        violations = _chain_rule(loose, CHAIN_KNOWN_AT_LE_INGESTED_AT)
+    finally:
+        loose.close()
+    assert [(v["predecessor_id"], v["successor_id"]) for v in violations] == [
+        ("0001000098", "0001000097")
+    ]
+
+
+def test_chain_known_at_ge_successor_rows_fails_on_a_lagging_stamp(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: a chain stamp before the successor's `securities` row and
+    first listing row (both 2020-02-07) fails, naming the pair. The row is
+    ingested at `T_END`, so it supersedes the fixture's live row."""
+    insert_row(
+        chain_fixture_store,
+        "successor_chains",
+        _live_chain(
+            CHAIN_IDS[0],
+            CHAIN_IDS[1],
+            known_at=datetime(2020, 1, 1, 20, 30, tzinfo=UTC),
+            ingested_at=T_END,
+        ),
+    )
+    violations = _chain_rule(chain_fixture_store, CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS)
+    assert {(v["predecessor_id"], v["successor_id"]) for v in violations} == {CHAIN_IDS}
+    assert {v["detail"] for v in violations} == {
+        "known_at 2020-01-01T20:30:00+00:00 < successor securities 2020-02-07T20:30:00+00:00",
+        "known_at 2020-01-01T20:30:00+00:00 < successor listing 2020-02-07T20:30:00+00:00",
+    }
+
+
+def test_chain_successor_listed_under_predecessor_ticker_fails(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: a successor not listed under the predecessor's ticker and
+    exchange fails, naming the pair. 0001000013 is listed CHNE, not CHNA."""
+    insert_row(chain_fixture_store, "successor_chains", _live_chain(CHAIN_IDS[0], "0001000013"))
+    violations = _chain_rule(chain_fixture_store, CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER)
+    assert {(v["predecessor_id"], v["successor_id"]) for v in violations} == {
+        (CHAIN_IDS[0], "0001000013")
+    }
+
+
+def test_chain_predecessor_no_bar_after_handover_fails_on_a_later_bar(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: a predecessor bar on or after the successor's first bar
+    (2020-02-04) fails, naming the pair."""
+    insert_row(chain_fixture_store, "prices_daily", _bar("0001000010", date(2020, 2, 5)))
+    violations = _chain_rule(chain_fixture_store, CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER)
+    assert {(v["predecessor_id"], v["successor_id"]) for v in violations} == {CHAIN_IDS}
+
+
+def test_chain_candidates_from_message_parses_the_run_row() -> None:
+    """#821, T187c: the run-row clause `none` or `N: id, id` parses to the
+    successor ids, and an absent clause parses to none."""
+    assert chain_candidates_from_message("chains_written: 0; chain_candidates: none") == ()
+    assert chain_candidates_from_message("x; chain_candidates: 2: 0001000011, 0001000013; y") == (
+        "0001000011",
+        "0001000013",
+    )
+    assert chain_candidates_from_message(None) == ()
+    assert chain_candidates_from_message("chains_written: 0") == ()
+
+
+def test_the_chain_block_and_rules_read_raw_rows(
+    chain_fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#821, T187c, quant audit of PR #1913: T187b re-keys `prices_as_of` and
+    `facts_as_of` by chain, so the block and the rules must read the raw rows
+    directly (never through those reads), or a predecessor's last close and
+    its post-hand-over facts vanish. A predecessor bar and a fact dated after
+    the hand-over stay visible even with the chained reads removed."""
+
+    def chained(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the chain block must not read through the chained reads")
+
+    monkeypatch.setattr(health, "prices_as_of", chained)
+    monkeypatch.setattr(health, "facts_as_of", chained, raising=False)
+    insert_row(
+        chain_fixture_store,
+        "facts",
+        {
+            "security_id": "0001000010",
+            "fact_name": "shares_outstanding",
+            "as_of_date": date(2020, 3, 2),
+            "value": 4.2e8,
+            "known_at": session_close(date(2020, 3, 2)),
+            "ingested_at": session_close(date(2020, 3, 2)),
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    block = health.successor_chains(chain_fixture_store, T_END, _settings())
+    rows = {row["successor_id"]: row for row in block.frame.iter_rows(named=True)}
+    assert rows["0001000011"]["ratio"] == pytest.approx(19.33 / 15.41)
+    assert block.predecessor_facts["value"].to_list() == [4.2e8]
+    insert_row(chain_fixture_store, "prices_daily", _bar("0001000010", date(2020, 2, 5)))
+    rules = health._chain_rule_rows(chain_fixture_store, T_END)
+    [violation] = rules[CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER].to_dicts()
+    assert (violation["predecessor_id"], violation["successor_id"]) == ("0001000010", "0001000011")
+
+
+def test_chain_known_at_ge_successor_rows_uses_the_derived_listing_row(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c, quant audit of PR #1913: the rule compares the row
+    `build_chains` stamps from -- the successor's earliest-known listing row
+    naming the predecessor's ticker -- not the earliest-`valid_from` row of any
+    ticker. A CHNZ row dated earlier but known after the chain (2020-05-01)
+    must not fail the rule for the 1:1 pair."""
+    insert_row(
+        chain_fixture_store,
+        "listings",
+        {
+            "security_id": "0001000011",
+            "ticker": "CHNZ",
+            "exchange": "NYSE",
+            "class_title": None,
+            "valid_from": date(2020, 1, 2),
+            "known_at": datetime(2020, 5, 1, 20, 30, tzinfo=UTC),
+            "ingested_at": datetime(2020, 5, 1, 20, 30, tzinfo=UTC),
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    assert _chain_rule(chain_fixture_store, CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS) == []
+
+
+def test_chain_known_at_ge_successor_rows_fails_when_the_derived_row_is_later(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c, quant audit of PR #1913: a later revision of the matching
+    CHNA/NYSE row (known 2020-03-01, after the chain's 2020-02-07) fails the
+    rule, naming the pair."""
+    insert_row(
+        chain_fixture_store,
+        "listings",
+        {
+            "security_id": "0001000011",
+            "ticker": "CHNA",
+            "exchange": "NYSE",
+            "class_title": None,
+            "valid_from": date(2020, 2, 4),
+            "known_at": datetime(2020, 3, 1, 20, 30, tzinfo=UTC),
+            "ingested_at": datetime(2020, 3, 1, 20, 30, tzinfo=UTC),
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    violations = _chain_rule(chain_fixture_store, CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS)
+    assert {(v["predecessor_id"], v["successor_id"]) for v in violations} == {CHAIN_IDS}
+
+
+# --- Mergers (#1762, T248e) ------------------------------------------------
+
+_MERGER_RULES = (
+    "mergers_known_at_from_process_date",
+    "mergers_rates_match_kind",
+    "mergers_acquirer",
+    "mergers_unique",
+)
+CASH_MERGER = "fixture-merger-cash-1"
+STOCK_MERGER = "fixture-merger-stock-1"
+
+
+def _merger_copy(
+    conn: duckdb.DuckDBPyConnection, action_id: str, replace: str, params: list[Any] | None = None
+) -> None:
+    """Insert a copy of the merger `action_id` with `replace` (a DuckDB
+    `REPLACE` list) applied."""
+    conn.execute(
+        f"INSERT INTO mergers SELECT * REPLACE ({replace}) FROM mergers "
+        "WHERE source_action_id = ? ORDER BY known_at LIMIT 1",
+        [*(params or []), action_id],
+    )
+
+
+def _merger_failed(report: HealthReport) -> set[str]:
+    return _failed(report.integrity) & set(_MERGER_RULES)
+
+
+def test_merger_rules_are_integrity_rules_and_pass_on_the_fixture(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    assert set(_MERGER_RULES) <= set(INTEGRITY_RULES)
+    report = health_report(fixture_store, T_END, settings)
+    assert report.ok, report.failures
+    assert _merger_failed(report) == set()
+
+
+def test_a_merger_first_row_with_the_wrong_stamp_fails(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    loose_store.execute(
+        "UPDATE mergers SET known_at = TIMESTAMPTZ '2018-07-25 20:00:00+00', "
+        "ingested_at = TIMESTAMPTZ '2018-07-26 20:10:00+00' WHERE source_action_id = ?",
+        [CASH_MERGER],
+    )
+    report = health_report(loose_store, T_END, settings)
+    assert _merger_failed(report) == {"mergers_known_at_from_process_date"}
+    assert not report.ok
+
+
+def test_a_legitimate_merger_revision_passes_and_a_mis_stamped_one_fails(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    revised = datetime(2018, 8, 2, 21, 5, tzinfo=UTC)
+    _merger_copy(
+        fixture_store,
+        CASH_MERGER,
+        "? AS known_at, ? AS ingested_at, 63.0 AS cash_per_share",
+        [revised, revised],
+    )
+    report = health_report(fixture_store, T_END, settings)
+    assert report.ok, report.failures
+    # A revision stamped before its own ingest, and one not after the row before.
+    fixture_store.execute(
+        "UPDATE mergers SET ingested_at = ingested_at + INTERVAL 1 HOUR WHERE known_at = ?",
+        [revised],
+    )
+    report = health_report(fixture_store, T_END, settings)
+    assert _merger_failed(report) == {"mergers_known_at_from_process_date"}
+
+
+def test_a_merger_revision_stamped_before_the_first_row_fails(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    early = datetime(2018, 7, 26, 19, 0, tzinfo=UTC)
+    _merger_copy(
+        loose_store,
+        CASH_MERGER,
+        "? AS known_at, ? AS ingested_at, 63.0 AS cash_per_share",
+        [early, early],
+    )
+    report = health_report(loose_store, T_END, settings)
+    assert _merger_failed(report) == {"mergers_known_at_from_process_date"}
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "cash_per_share = NULL",  # cash kind without its rate
+        "share_ratio = 0.5",  # cash kind with a share ratio
+        "cash_per_share = -1",  # not positive
+        "cash_per_share = 'NaN'",  # not finite
+        "kind = 'stock'",  # stock kind with no ratio
+        "kind = 'merger'",  # a kind outside the set
+    ],
+)
+def test_merger_rates_that_do_not_match_the_kind_fail(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings, assignment: str
+) -> None:
+    loose_store.execute(
+        f"UPDATE mergers SET {assignment} WHERE source_action_id = ?",
+        [CASH_MERGER],
+    )
+    report = health_report(loose_store, T_END, settings)
+    assert "mergers_rates_match_kind" in _merger_failed(report)
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    ["acquirer_security_id = NULL", "acquirer_security_id = security_id"],
+)
+def test_a_stock_merger_without_an_acquirer_or_with_itself_fails(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings, assignment: str
+) -> None:
+    loose_store.execute(
+        f"UPDATE mergers SET {assignment} WHERE source_action_id = ?",
+        [STOCK_MERGER],
+    )
+    report = health_report(loose_store, T_END, settings)
+    assert _merger_failed(report) == {"mergers_acquirer"}
+
+
+def test_a_cash_merger_may_have_no_acquirer(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    [(acquirer,)] = fixture_store.execute(
+        "SELECT acquirer_security_id FROM mergers WHERE source_action_id = ?", [CASH_MERGER]
+    ).fetchall()
+    assert acquirer is None
+    assert health_report(fixture_store, T_END, settings).ok
+
+
+def test_two_merger_rows_with_one_identity_and_one_stamp_fail(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _merger_copy(loose_store, CASH_MERGER, "63.0 AS cash_per_share")
+    report = health_report(loose_store, T_END, settings)
+    assert "mergers_unique" in _merger_failed(report)
+
+
+def test_a_merger_with_a_provenance_other_than_action_fails_the_common_rule(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    loose_store.execute("UPDATE mergers SET provenance = 'bar'")
+    report = health_report(loose_store, T_END, settings)
+    assert PROVENANCE_ALLOWED in _failed(report.integrity)
+
+
+def test_the_mergers_block_on_the_fixture(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    block = health_report(fixture_store, T_END, settings).mergers
+    assert block.rows_by_kind == {"cash": 1, "stock": 1, "stock_and_cash": 0}
+    assert block.latest_known_at == datetime(2020, 2, 18, 21, 0, tzinfo=UTC)
+    assert block.run_counts == {}
+    assert block.conflicts.is_empty()
+    # The stock merger's acquiree keeps trading after its effective date; the
+    # cash merger's does not.
+    assert block.after_effective["security_id"].to_list() == ["SEC_DIV_CANCELLED"]
+    [row] = block.after_effective.to_dicts()
+    assert row["effective_date"] == date(2020, 2, 14)
+    assert row["bars"] > 0
+    assert row["last_bar"] > date(2020, 2, 14)
+
+
+def test_the_mergers_block_reads_only_rows_known_at_t(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    before_stock = session_close(date(2020, 2, 14))
+    block = health_report(fixture_store, before_stock, settings).mergers
+    assert block.rows_by_kind == {"cash": 1, "stock": 0, "stock_and_cash": 0}
+    assert block.latest_known_at == datetime(2018, 7, 26, 20, 0, tzinfo=UTC)
+    assert block.after_effective.is_empty()
+
+
+def test_the_mergers_block_counts_the_last_alpaca_run(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    start = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(
+        fixture_store, "old", "alpaca", "ok", start - timedelta(days=1), message="mergers_stored=9"
+    )
+    _run(
+        fixture_store,
+        "last",
+        "alpaca",
+        "ok",
+        start,
+        message=(
+            "x; actions_not_yet_known=4; actions_unresolved=3; merger_rows_refused=1; "
+            "merger_self=2; mergers_stored=5"
+        ),
+    )
+    block = health_report(fixture_store, T_END + timedelta(hours=3), settings).mergers
+    assert block.run_counts == {
+        "stored": 5,
+        "refused": 1,
+        "unresolved": 3,
+        "merger_self": 2,
+        "not_yet_known": 4,
+    }
+
+
+def test_a_run_message_without_merger_counts_reads_zeros(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    start = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "last", "alpaca", "ok", start, message="nothing to say")
+    block = health_report(fixture_store, T_END + timedelta(hours=3), settings).mergers
+    assert block.run_counts == dict.fromkeys(
+        ("stored", "refused", "unresolved", "merger_self", "not_yet_known"), 0
+    )
+
+
+def test_two_ids_for_one_deal_are_a_conflict_pair_and_do_not_fail_check(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _merger_copy(fixture_store, STOCK_MERGER, "'fixture-merger-stock-2' AS source_action_id")
+    report = health_report(fixture_store, T_END, settings)
+    assert report.ok, report.failures
+    [row] = report.mergers.conflicts.to_dicts()
+    assert row["security_id"] == "SEC_DIV_CANCELLED"
+    assert row["effective_date"] == date(2020, 2, 14)
+    assert row["ids"] == ["fixture-merger-stock-1", "fixture-merger-stock-2"]
+    assert report.mergers.rows_by_kind["stock"] == 2
+
+
+def test_a_revision_that_moves_the_effective_date_ends_a_conflict(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _merger_copy(fixture_store, STOCK_MERGER, "'fixture-merger-stock-2' AS source_action_id")
+    revised = datetime(2020, 3, 2, 21, 5, tzinfo=UTC)
+    _merger_copy(
+        fixture_store,
+        "fixture-merger-stock-2",
+        "? AS known_at, ? AS ingested_at, DATE '2020-03-20' AS effective_date",
+        [revised, revised],
+    )
+    report = health_report(fixture_store, T_END, settings)
+    assert report.ok, report.failures
+    assert report.mergers.conflicts.is_empty()
+
+
+def test_a_store_without_the_mergers_table_reports_an_empty_block(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    fixture_store.execute("DELETE FROM schema_version WHERE version = 35")
+    fixture_store.execute("DROP TABLE mergers")
+    report = health_report(fixture_store, T_END, settings)
+    assert report.ok, report.failures
+    assert report.mergers.rows_by_kind == {"cash": 0, "stock": 0, "stock_and_cash": 0}
+    assert report.mergers.latest_known_at is None
+    assert report.mergers.conflicts.is_empty()
+    assert report.mergers.after_effective.is_empty()
+
+
+# --- Verdict line (#2202) ---------------------------------------------------
+
+_PAPER = "Paper run readiness and halts: `tradepartner paper status`."
+
+
+def _at(report: HealthReport, t: datetime, session: date, last_bar: date) -> HealthReport:
+    return dataclasses.replace(
+        report,
+        t=t,
+        session=session,
+        coverage=dataclasses.replace(report.coverage, last_bar=last_bar),
+    )
+
+
+def test_verdict_describes_data_only_when_bars_are_current(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    report = health_report(fixture_store, T_END, settings)
+    verdict = health_verdict(report)
+    assert verdict.startswith("Data: checks pass, bars current to 2020-06-30.")
+    assert verdict.endswith(_PAPER)
+    assert "next paper run" not in verdict
+    assert "with 2 warning(s)" in health_verdict(report, 2)
+
+
+def test_verdict_expects_the_gap_before_the_evening_ingest(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    t = session_close(date(2020, 7, 1)) + timedelta(hours=1)  # 17:00 ET, before 18:30
+    report = health_report(fixture_store, t, settings)
+    assert stale_gap_expected(report)
+    assert "expected until tonight's 18:30 ET ingest" in health_verdict(report)
+
+
+def test_verdict_after_the_ingest_time_says_it_should_be_running(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    t = session_close(date(2020, 7, 1)) + timedelta(hours=3)  # 19:00 ET
+    report = health_report(fixture_store, t, settings)
+    assert not stale_gap_expected(report)
+    assert "tonight's ingest should be running or just finished" in health_verdict(report)
+
+
+def test_verdict_names_a_stale_store_with_no_ingest_due(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    t = session_close(date(2020, 7, 7)) + timedelta(hours=3)
+    verdict = health_verdict(health_report(fixture_store, t, settings))
+    assert "4 sessions behind" in verdict
+    assert "run `tradepartner ingest`" in verdict
+
+
+def test_verdict_gap_is_expected_on_a_half_day(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    half_day = date(2020, 11, 27)  # 13:00 close, after Thanksgiving
+    report = health_report(fixture_store, T_END, settings)
+    early = _at(report, session_close(half_day) + timedelta(hours=1), half_day, date(2020, 11, 25))
+    assert stale_gap_expected(early)  # 14:00 ET
+    late = _at(report, session_close(half_day) + timedelta(hours=6), half_day, date(2020, 11, 25))
+    assert not stale_gap_expected(late)  # 19:00 ET
+
+
+def test_verdict_ingest_time_follows_the_dst_change(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    session = date(2026, 11, 2)  # first session after the 2026-11-01 change to EST
+    report = health_report(fixture_store, T_END, settings)
+    before = _at(report, datetime(2026, 11, 2, 23, 20, tzinfo=UTC), session, date(2026, 10, 30))
+    after = _at(report, datetime(2026, 11, 2, 23, 40, tzinfo=UTC), session, date(2026, 10, 30))
+    assert stale_gap_expected(before)  # 18:20 EST
+    assert not stale_gap_expected(after)  # 18:40 EST
+
+
+def test_verdict_names_integrity_failures(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    report = health_report(fixture_store, T_END, settings)
+    failing = dataclasses.replace(
+        report,
+        integrity=(IntegrityCheck("some_rule", pl.DataFrame({"x": [1]})),),
+    )
+    verdict = health_verdict(failing)
+    assert verdict.startswith("Data: 1 integrity check(s) fail (some_rule)")
+
+
+def test_verdict_for_an_empty_store(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    report = health_report(fixture_store, T_END, settings)
+    empty = dataclasses.replace(
+        report, coverage=dataclasses.replace(report.coverage, last_bar=None)
+    )
+    assert "no price bars" in health_verdict(empty)

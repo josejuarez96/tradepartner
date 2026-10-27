@@ -4,7 +4,11 @@
 the **expected session**: the calendar's last completed session at run time
 minus `ingest.settle_delay_minutes` (`expected_session`). Sources run in
 order, `edgar` then `alpaca` (the price side fetches the names the master
-lists), and the run **halts** at the first source that is not `ok`.
+lists, read from the store as last committed), and every source runs whatever
+an earlier one did (#2180, bar a locked store): a failed EDGAR chunk leaves the master as the last
+good run wrote it, so the price side still ingests, and the run exits non-zero
+if any source was not `ok`. Rates and the assets snapshot still wait for all
+`ok`.
 
 **One atomic chunk per source.** Each source is fetched before its write
 transaction: EDGAR with no store connection open (a recording pass), the
@@ -245,6 +249,7 @@ from tradepartner.adapters.openfigi_raw import map_tickers
 from tradepartner.adapters.prices import (
     Bar,
     CorporateAction,
+    Merger,
     PriceSource,
     SymbolChange,
     spinoff_known_at_floor,
@@ -285,13 +290,16 @@ from tradepartner.store.delistings import (
     listing_ends_as_of,
 )
 from tradepartner.store.master import (
+    ChainCandidate,
     MasterBuild,
     build_chains,
     build_master,
+    chain_candidates,
     primary_security_id,
     securities_as_of,
     security_cik,
     session_of,
+    stored_snapshot_fetches,
 )
 from tradepartner.store.master import (
     _held_ids as _master_held_ids,
@@ -314,6 +322,7 @@ from tradepartner.universe import SHARES_FACT, member_links_title
 
 OK, STALE, FAILED, LOCKED = "ok", "stale", "failed", "locked"
 ACTIONS_FILLED = "filled"
+ACTIONS_MODE = "actions"  # the actions backfill's run rows (#1676)
 MODE = "session"
 #: The price side's `ingestion_runs.source`. Its `MODE` runs alone count as
 #: the paper run's fresh prices (staleness and the clock floor, #1440 Q3).
@@ -501,7 +510,7 @@ class SourceRun:
 
 @dataclass(frozen=True)
 class IngestResult:
-    """Every source attempted, in order; the run halted after a non-`ok` one."""
+    """Every source attempted, in order; every source runs, and the run is `ok` only if all were."""
 
     runs: tuple[SourceRun, ...]
 
@@ -833,6 +842,32 @@ def ingest_session(
         "edgar": getattr(_unwrap(filings), "record_failures", None),
         "alpaca": None,
     }
+
+    def recover_alpaca(exc: Exception) -> SourceRun | None:
+        """Retry the ordinary daily chunk if optional gap data broke its write."""
+        gap = fetched.get("alpaca")
+        if dry_run or gap is None or not gap.gap_days:
+            return None
+
+        def prepare_daily() -> None:
+            daily = _fetch_prices(settings, prices, now, clock, recover_gaps=False)
+            notes = "; ".join(
+                f"edgar-gap backfill skipped {day.isoformat()}: {type(exc).__name__}"
+                for day in gap.gap_days
+            )
+            fetched["alpaca"] = replace(daily, message=f"{notes}; {daily.message}")
+
+        return _run_source(
+            "alpaca",
+            work["alpaca"],
+            settings,
+            now,
+            clock,
+            cursor,
+            dry_run,
+            prepare=prepare_daily,
+        )
+
     runs: list[SourceRun] = []
     for name in ("edgar", "alpaca") if source == "all" else (source,):
         run = _run_source(
@@ -845,9 +880,10 @@ def ingest_session(
             dry_run,
             prepare=prepare[name],
             after_commit=after_commit[name],
+            recover=recover_alpaca if name == "alpaca" else None,
         )
         runs.append(run)
-        if run.status != OK:
+        if run.status == LOCKED:  # the store, not the source: the next would wait out the same lock
             break
     if (
         source == "all"
@@ -895,7 +931,13 @@ def ingest_actions_backfill(
     if isinstance(through, datetime) or not isinstance(through, date) or through < since:
         raise ValueError("through must be a date on or after since")
     fetch = scan or partial(alpaca_raw.corporate_actions_scan, settings=settings)
-    types = (CorporateActionsType.SPIN_OFF, CorporateActionsType.NAME_CHANGE)
+    types = (
+        CorporateActionsType.SPIN_OFF,
+        CorporateActionsType.NAME_CHANGE,
+        CorporateActionsType.CASH_MERGER,
+        CorporateActionsType.STOCK_MERGER,
+        CorporateActionsType.STOCK_AND_CASH_MERGER,
+    )
 
     def run_month(first: date, last: date) -> SourceRun:
         prepared: dict[str, Any] = {}
@@ -924,6 +966,8 @@ def ingest_actions_backfill(
             added += _add_symbol_changes(
                 conn, parsed.symbol_changes, ingested_at=stamp, stats=counts
             )
+            added += _add_mergers(conn, parsed.mergers, ingested_at=stamp, stats=counts)
+            _count_merger_report(counts, parsed)
             counts["actions_unresolved"] = len(parsed.unresolved)
             counts["actions_self_spinoff"] = parsed.self_spinoff
             counts["actions_spinoff_revisions"] = parsed.spinoff_revisions
@@ -934,7 +978,8 @@ def ingest_actions_backfill(
             return (
                 added,
                 f"{first}..{last}: {len(parsed.actions)} spin-off action(s), "
-                f"{len(parsed.symbol_changes)} name change(s); {message}",
+                f"{len(parsed.symbol_changes)} name change(s), "
+                f"{len(parsed.mergers)} merger(s); {message}",
             )
 
         return _run_source(
@@ -945,7 +990,7 @@ def ingest_actions_backfill(
             clock,
             f"actions;since={since};through={last}",
             dry_run,
-            mode="actions",
+            mode=ACTIONS_MODE,
             prepare=prepare,
             success_status=ACTIONS_FILLED,
         )
@@ -971,6 +1016,7 @@ def _run_source(
     prepare: Callable[[], object] | None = None,
     after_commit: Callable[[], None] | None = None,
     success_status: str = OK,
+    recover: Callable[[Exception], SourceRun | None] | None = None,
 ) -> SourceRun:
     """One chunk: `prepare` (fetching, no store connection open), then
     `work` (given the run row's id) inside one write transaction with the
@@ -1003,6 +1049,12 @@ def _run_source(
         run = outcome(STALE, 0, str(exc))
         return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
     except Exception as exc:  # any source or parse failure halts with a run row
+        if recover is not None:
+            try:
+                if recovered := recover(exc):
+                    return recovered
+            except Exception as recovery_exc:
+                exc = recovery_exc
         message = _with_frames(f"{type(exc).__name__}: {exc}", exc, settings)
         run = outcome(FAILED, 0, message)
         # A dry run writes no run row, failed or not.
@@ -1354,7 +1406,12 @@ def _ingest_filings(
     if not (isinstance(filings, _Recorded) and filings.frozen):
         _fetch_and_gate(recorded, settings)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
-    master, delistings, classes, facts, unmatched = _build_filings(recorded, settings, now)
+    # Each run fetches only today's SEC ticker file: the stored snapshot rows
+    # are the earlier fetches, so a rename is judged against them (#2291).
+    earlier = stored_snapshot_fetches(conn, now)
+    master, delistings, classes, facts, unmatched = _build_filings(
+        recorded, settings, now, earlier_fetches=earlier
+    )
     restamped = ""
     if restamp is not None:
         result = restamp_from_manifest(
@@ -1395,6 +1452,9 @@ def _ingest_filings(
         chain_tally = _write_chains(conn, master, now, unjudged=unjudged_ciks, skipped=skipped)
         added += chain_tally.inserted
         chains = chain_tally.message()
+    candidates = _chain_candidate_clause(
+        chain_candidates(_unwrap(filings), settings, master, delistings=delistings.delistings)
+    )
     statements = ""
     if settings.edgar.statement_facts_enabled:
         tally = _write_statement_facts(
@@ -1427,10 +1487,19 @@ def _ingest_filings(
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
         f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}"
-        f"{_filename_counts(master, delistings, filings)}{chains}; "
+        f"{_filename_counts(master, delistings, filings)}{chains}{candidates}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
+
+
+def _chain_candidate_clause(candidates: Sequence[ChainCandidate]) -> str:
+    """The #821 chain-candidate clause of the EDGAR run row: the count and the
+    successor ids, or `none`. Health reads it beside `chain_price_break`."""
+    if not candidates:
+        return "; chain_candidates: none"
+    named = ", ".join(candidate.successor_id for candidate in candidates)
+    return f"; chain_candidates: {len(candidates)}: {named}"
 
 
 def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource) -> str:
@@ -1574,6 +1643,8 @@ def _source_counts(filings: FilingSource) -> str:
         ("stamp_check_mismatched_ciks", "CIKs stamped from SGML"),  # #1494
         ("stamps_from_sgml", "stamps from SGML"),
         ("stamps_sgml_unread", "stamps unread in SGML"),
+        ("stamps_api_fallback", "stamps from API fallback"),  # #1686
+        ("stamp_fallback_ciks", "CIKs on API fallback"),
         ("stamps_sgml_overlong", "stamps with overlong SGML headers"),
         ("stamp_check_unread_ciks", "CIKs stamped unchecked"),
         ("facts_bulk_keyless", "keyless bulk facts"),  # #599: facts but no `cik`
@@ -1586,15 +1657,23 @@ def _source_counts(filings: FilingSource) -> str:
 
 
 def _build_filings(
-    filings: FilingSource, settings: Settings, ingested_at: datetime, *, fetch: bool = False
+    filings: FilingSource,
+    settings: Settings,
+    ingested_at: datetime,
+    *,
+    fetch: bool = False,
+    earlier_fetches: Sequence[CompanySnapshotEntry] = (),
 ) -> tuple[MasterBuild, Any, ClassificationBuild, tuple[Row, ...], tuple[FactRecord, ...]]:
-    """The builds over `filings`. The fetch pass (`fetch`) also asks
+    """The builds over `filings`, the master also over `earlier_fetches`
+    (the store's snapshot rows as fetches, #2291). The fetch pass (`fetch`) also asks
     `statement_facts` for every issuer CIK while the switch is on (#660),
     after `facts`, so one payload read fills both caches; the records are
     dropped here and read again per CIK under the lock. It asks
     `filing_events` for every issuer CIK while that switch is on (#1358),
     the same way."""
-    master = build_master(filings, settings, ingested_at=ingested_at)
+    master = build_master(
+        filings, settings, ingested_at=ingested_at, earlier_fetches=earlier_fetches
+    )
     delistings = build_delistings(filings.delistings(), master, ingested_at=ingested_at)
     classes = build_classifications(filings, master, settings, ingested_at=ingested_at)
     if settings.master.chains:  # #821: the chained rows, on the classification
@@ -2921,8 +3000,11 @@ class _PriceFetch:
 
     bars: tuple[Bar, ...]
     runs: tuple[tuple[date, date], ...]
+    gap_days: tuple[date, ...]
     actions: tuple[CorporateAction, ...]
     symbol_changes: tuple[SymbolChange, ...]
+    mergers: tuple[Merger, ...]
+    merger_report: Any
     action_window: tuple[date, date]
     covered: tuple[date, date]
     ingested_at: datetime
@@ -2934,6 +3016,8 @@ def _fetch_prices(
     prices: PriceSource,
     now: datetime,
     clock: Callable[[], datetime],
+    *,
+    recover_gaps: bool = True,
 ) -> _PriceFetch:
     """The price side's fetch pass (#173): names and the action replay plan
     from short read-only connections, bars and actions fetched with no store
@@ -2962,37 +3046,115 @@ def _fetch_prices(
                 # #1572: a name delisted inside the gap is fetched for the missed
                 # sessions it still traded on (its last bars), never for `session`.
                 gap_only = _price_names(conn, read_at, missed[0], settings)[0] - fetch
+        if recover_gaps:
+            # Keep the bounded gap scan off the master read: one more lock
+            # wait is possible, but neither read holds the other open.
+            try:
+                with _price_read(settings) as conn:
+                    edgar_gaps, expired_gaps = _edgar_gap_names(
+                        conn, settings, read_at, session, set(missed)
+                    )
+                scan_note = ""
+            except Exception as exc:
+                edgar_gaps, expired_gaps = {}, []
+                scan_note = f"edgar-gap scan skipped: {type(exc).__name__}"
+        else:
+            edgar_gaps, expired_gaps = {}, []
+            scan_note = ""
+    else:
+        edgar_gaps, expired_gaps = {}, []
+        scan_note = ""
     if reference is None:
         raise LookupError(f"reference symbol {symbol} has no live listing at {session}")
     ids = sorted(fetch)
     every = sorted(fetch | gap_only)
-    # #1572: every session the run must leave stored, in contiguous runs, so one
-    # request asks for exactly the sessions it fetches and never a span of them.
-    runs = _fetch_runs([*missed, session])
+    request_runs = _fetch_runs([*missed, session])
+    write_runs = _fetch_runs(sorted([*missed, *edgar_gaps, session]))
     bars: list[Bar] = []
-    for first, last in runs:
+    for first, last in request_runs:
         bars += [
             bar
             for bar in prices.bars(every if first < session else ids, first, last)
             if first <= bar.session <= last
             and not (bar.session == session and bar.security_id in gap_only)
         ]
-    action_window = (runs[0][0].replace(day=1), session)
-    actions = prices.corporate_actions(every, *action_window)
+    gap_bars: list[Bar] = []
+    gap_names: set[str] = set()
+    gap_days: list[date] = []
+    gap_notes = [f"edgar-gap expired {day.isoformat()}" for day in expired_gaps]
+    if scan_note:
+        gap_notes.insert(0, scan_note)
+    for day, names in edgar_gaps.items():
+        try:
+            day_bars = prices.bars(sorted(names), day, day)
+        except Exception as exc:
+            gap_notes.append(f"edgar-gap backfill skipped {day.isoformat()}: {type(exc).__name__}")
+            continue
+        gap_bars.extend(bar for bar in day_bars if bar.session == day and bar.security_id in names)
+        gap_names.update(names)
+        gap_days.append(day)
+    normal_window = (request_runs[0][0].replace(day=1), session)
+    action_window = (
+        (
+            min(normal_window[0], *(day.replace(day=1) for day in gap_days)),
+            session,
+        )
+        if gap_days
+        else normal_window
+    )
+    action_ids = sorted(set(every) | gap_names)
+    try:
+        actions = prices.corporate_actions(action_ids, *action_window)
+    except Exception as exc:
+        if not gap_names:
+            raise
+        gap_notes.extend(
+            f"edgar-gap backfill skipped {day.isoformat()}: {type(exc).__name__}"
+            for day in gap_days
+        )
+        gap_bars.clear()
+        gap_names.clear()
+        gap_days.clear()
+        action_window = normal_window
+        actions = prices.corporate_actions(every, *action_window)
     action_summary = prices.resolution_summary()
     # A name change is asked for by `process_date` from one lag before the
     # month (#1665 review): one processed on a month's last session is
     # stamped the next session's close, so the next month's first run must
     # still ask for it. Identity makes the overlap add nothing.
     lag = timedelta(days=settings.alpaca.actions_process_lag_days)
-    changes = prices.symbol_changes(every, action_window[0] - lag, action_window[1])
+    changes = prices.symbol_changes(every, normal_window[0] - lag, normal_window[1])
     change_summary = prices.resolution_summary()
+    # Mergers (#1762): one symbol-less request over `process_date` from one lag
+    # before the session, because an acquiree is usually delisted before Alpaca
+    # processes its record and so is absent from `every`. Identity makes the
+    # overlap with earlier runs add nothing.
+    mergers = prices.mergers(session - lag, session)
+    merger_report = getattr(prices, "last_actions_report", None)
+    merger_summary = prices.resolution_summary()
     have = {bar.security_id for bar in bars if bar.session == session}
-    with _price_read(settings) as conn:
-        plan = _replay_plan(conn, actions, action_window)
-        stale_ids = _stale_listed(conn, read_at, session, listed - have, reference, settings)
-    actions, covered = _replay_actions(prices, actions, action_window, plan)
+    try:
+        with _price_read(settings) as conn:
+            plan = _replay_plan(conn, actions, action_window)
+            stale_ids = _stale_listed(conn, read_at, session, listed - have, reference, settings)
+        actions, covered = _replay_actions(prices, actions, action_window, plan)
+    except Exception as exc:
+        if not gap_names:
+            raise
+        gap_notes.extend(
+            f"edgar-gap backfill skipped {day.isoformat()}: {type(exc).__name__}"
+            for day in gap_days
+        )
+        gap_bars.clear()
+        gap_days.clear()
+        action_window = normal_window
+        actions = prices.corporate_actions(every, *action_window)
+        with _price_read(settings) as conn:
+            plan = _replay_plan(conn, actions, action_window)
+            stale_ids = _stale_listed(conn, read_at, session, listed - have, reference, settings)
+        actions, covered = _replay_actions(prices, actions, action_window, plan)
     ingested_at = ensure_tz_aware_utc(clock(), field_name="clock()")  # revisions: when fetched
+    bars.extend(replace(bar, known_at=ingested_at) for bar in gap_bars)
     if reference not in have:
         raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {session}")
     counted, missing, reported = _staleness(listed, have, static_only, may_count, stale_ids)
@@ -3011,17 +3173,25 @@ def _fetch_prices(
         f"{len(missing)} of {len(counted)} listed names missing{_reported_note(reported)}; "
         f"{_catchup_note(missed)}"
     )
+    if gap_notes:
+        message = "; ".join(gap_notes) + "; " + message
     if action_summary:
         message += f"; {action_summary}"
     # The name-change call repeats the resolver's line; keep only its own parts.
     seen = set(action_summary.split("; "))
     if extra := [part for part in change_summary.split("; ") if part and part not in seen]:
         message += f"; {'; '.join(extra)}"
+    seen |= set(change_summary.split("; "))
+    if extra := [part for part in merger_summary.split("; ") if part and part not in seen]:
+        message += f"; {'; '.join(extra)}"
     return _PriceFetch(
         tuple(bars),
-        tuple(runs),
+        tuple(write_runs),
+        tuple(gap_days),
         tuple(actions),
         tuple(changes),
+        tuple(mergers),
+        merger_report,
         action_window,
         covered,
         ingested_at,
@@ -3049,8 +3219,16 @@ def _check_caught_up(
         raise _Stale(
             f"the missed sessions {', '.join(day.isoformat() for day in thin)} came back "
             f"without the reference bar or over the {limit:.1%} missing share; run "
-            f"tradepartner ingest --source alpaca --backfill --since {thin[0].isoformat()}"
+            f"tradepartner ingest --source alpaca --backfill --since {thin[0].isoformat()}, "
+            f"then {_PLAIN_INGEST_STEP}"
         )
+
+
+_PLAIN_INGEST_STEP = (
+    "one plain `tradepartner ingest --source alpaca`: the backfill's bars do not "
+    "count for paper's staleness check, so paper halts stale_data until a "
+    "daily ingest run is ok (#2181)"
+)
 
 
 def _stored_sessions(conn: duckdb.DuckDBPyConnection, session: date) -> set[date]:
@@ -3091,9 +3269,90 @@ def _missed_sessions(
             f"{', '.join(day.isoformat() for day in missed[:10])}"
             f"{f' and {len(missed) - 10} more' if len(missed) > 10 else ''}; "
             f"run tradepartner ingest --source alpaca --backfill --since "
-            f"{missed[0].isoformat()}"
+            f"{missed[0].isoformat()}, then {_PLAIN_INGEST_STEP}"
         )
     return missed
+
+
+def _edgar_gap_names(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    now: datetime,
+    session: date,
+    missed: set[date],
+) -> tuple[dict[date, set[str]], list[date]]:
+    """Bounded EDGAR-gap names and sessions expiring from the lookback.
+
+    A listing is attempted once, after the last OK price fetch, unless that
+    fetch reported an exception for its gap day. Empty provider answers are
+    not retried. Existing bars and the current master enforce eligibility.
+    """
+    sessions = all_sessions()
+    index = bisect_left(sessions, session)
+    limit = settings.ingest.edgar_gap_lookback_sessions
+    prior = sessions[max(0, index - limit) : index]
+    expiring = sessions[index - limit - 1] if index > limit else None
+    if not prior and expiring is None:
+        return {}, []
+    earliest = expiring or prior[0]
+    evenings = conn.execute(
+        "SELECT TRY_CAST(a.chunk_cursor AS DATE), a.finished_at "
+        "FROM ingestion_runs a JOIN ingestion_runs e ON e.started_at = a.started_at "
+        "AND e.chunk_cursor = a.chunk_cursor "
+        "WHERE a.source = ? AND a.mode = ? AND a.status = ? "
+        "AND e.source = 'edgar' AND e.mode = ? AND e.status = ? "
+        "AND TRY_CAST(a.chunk_cursor AS DATE) >= ? "
+        "AND TRY_CAST(a.chunk_cursor AS DATE) < ? "
+        "ORDER BY TRY_CAST(a.chunk_cursor AS DATE) DESC, a.finished_at DESC",
+        [PRICE_SOURCE, MODE, OK, MODE, FAILED, earliest, session],
+    ).fetchall()
+    latest = conn.execute(
+        "SELECT finished_at, message FROM ingestion_runs "
+        "WHERE source = ? AND mode = ? AND status = ? "
+        "ORDER BY finished_at DESC LIMIT 1",
+        [PRICE_SOURCE, MODE, OK],
+    ).fetchone()
+    last_fetch = latest[0] if latest else None
+    last_message = (latest[1] or "") if latest else ""
+    retry_scan = "edgar-gap scan skipped:" in last_message
+    days: dict[date, datetime] = {}
+    for day, fetched_at in evenings:
+        if day is not None and fetched_at is not None:
+            days.setdefault(day, fetched_at)
+    stored = {
+        (day, sid)
+        for day, sid in conn.execute(
+            "SELECT DISTINCT session, security_id FROM prices_daily WHERE session IN "
+            "(SELECT UNNEST(?::DATE[]))",
+            [[*days]],
+        ).fetchall()
+    }
+    gaps: dict[date, set[str]] = {}
+    expired: list[date] = []
+    for day, fetched_at in days.items():
+        if day in missed or fetched_at is None:
+            continue
+        retry = f"edgar-gap backfill skipped {day.isoformat()}:" in last_message
+        threshold = fetched_at if retry or retry_scan or day == expiring else last_fetch
+        if threshold is None:
+            continue
+        new = {
+            sid
+            for (sid,) in conn.execute(
+                "SELECT DISTINCT security_id FROM listings "
+                "WHERE ingested_at > ? AND ingested_at <= ? AND valid_from <= ?",
+                [threshold, now, day],
+            ).fetchall()
+        }
+        if not new:
+            continue
+        eligible = _price_names(conn, now, day, settings)[0] & new
+        if names := {sid for sid in eligible if (day, sid) not in stored}:
+            if day == expiring:
+                expired.append(day)
+                continue
+            gaps[day] = names
+    return gaps, expired
 
 
 def _fetch_runs(targets: Sequence[date]) -> list[tuple[date, date]]:
@@ -3157,6 +3416,8 @@ def _write_prices(conn: duckdb.DuckDBPyConnection, fetched: _PriceFetch) -> tupl
         stats=stats,
     )
     added += _add_symbol_changes(conn, fetched.symbol_changes, ingested_at=at, stats=stats)
+    added += _add_mergers(conn, fetched.mergers, ingested_at=at, stats=stats)
+    _count_merger_report(stats, fetched.merger_report)
     counts = "; ".join(f"{key}={value}" for key, value in sorted(stats.items()))
     return added, fetched.message + (f"; {counts}" if counts else "")
 
@@ -3776,6 +4037,135 @@ def _add_symbol_changes(
             insert_row(conn, "symbol_changes", revision)
             added += 1
     return added
+
+
+def _merger_row(merger: Merger, ingested_at: datetime) -> Row:
+    return {
+        "security_id": merger.security_id,
+        "kind": merger.kind,
+        "acquirer_security_id": merger.acquirer_security_id,
+        "acquiree_symbol": merger.acquiree_symbol,
+        "acquiree_cusip": merger.acquiree_cusip,
+        "acquirer_symbol": merger.acquirer_symbol,
+        "acquirer_cusip": merger.acquirer_cusip,
+        "share_ratio": merger.share_ratio,
+        "cash_per_share": merger.cash_per_share,
+        "effective_date": merger.effective_date,
+        "process_date": merger.process_date,
+        "payable_date": merger.payable_date,
+        "source_action_id": merger.source_action_id,
+        "known_at": merger.known_at,
+        "ingested_at": ingested_at,
+        "source": merger.source,
+        "provenance": "action",
+    }
+
+
+_MERGER_VALUES = (
+    "kind",
+    "acquirer_security_id",
+    "acquiree_symbol",
+    "acquiree_cusip",
+    "acquirer_symbol",
+    "acquirer_cusip",
+    "share_ratio",
+    "cash_per_share",
+    "effective_date",
+    "process_date",
+    "payable_date",
+)
+
+
+def _same_merger(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+    return all(a[field] == b[field] for field in _MERGER_VALUES)
+
+
+def _add_mergers(
+    conn: duckdb.DuckDBPyConnection,
+    mergers: Sequence[Merger],
+    *,
+    ingested_at: datetime,
+    stats: dict[str, int] | None = None,
+) -> int:
+    """Write the newly knowable mergers and the revisions of their identity
+    `(security_id, source_action_id)` (spec "Mergers", #1762); return the
+    rows added.
+
+    A first row keeps the stamp its record carries (the close after its
+    `process_date`); a record whose stamp is after `ingested_at` is skipped
+    and counted `actions_not_yet_known`, never clamped. A later row of a
+    stored identity that differs in a value is a revision stamped at
+    `ingested_at` (`_current`); a repeat adds nothing. Two ids of one deal
+    (one acquiree, one `effective_date`) are both stored; the pairs of the
+    securities written to are counted `merger_conflict` from the store, so a
+    pair split over two runs counts as one that arrives together.
+    """
+    ids = sorted({merger.security_id for merger in mergers})
+    if not ids:
+        return 0
+    cursor = conn.execute("SELECT * FROM mergers WHERE list_contains(?, security_id)", [ids])
+    names = [column[0] for column in cursor.description]
+    history: dict[_Identity, list[Row]] = defaultdict(list)
+    for values in cursor.fetchall():
+        row = dict(zip(names, values, strict=True))
+        history[(row["security_id"], row["source_action_id"])].append(row)
+    for rows in history.values():
+        rows.sort(key=lambda row: row["known_at"])
+    incoming: dict[_Identity, list[Row]] = defaultdict(list)
+    for merger in sorted(mergers, key=lambda m: m.known_at):
+        if merger.known_at > ingested_at:
+            if stats is not None:
+                stats["actions_not_yet_known"] = stats.get("actions_not_yet_known", 0) + 1
+            continue
+        incoming[(merger.security_id, merger.source_action_id)].append(
+            _merger_row(merger, ingested_at)
+        )
+    added = 0
+    for identity, rows in incoming.items():
+        past = list(history.get(identity, []))
+        if not past:
+            first = rows[0]
+            insert_row(conn, "mergers", first)
+            past.append(first)
+            added += 1
+        for revision in _current(rows[-1], past, ingested_at, _same_merger):
+            insert_row(conn, "mergers", revision)
+            added += 1
+    if stats is not None:
+        stats["mergers_stored"] = stats.get("mergers_stored", 0) + added
+        pairs = conn.execute(
+            """
+            SELECT count(*) FROM (
+                SELECT security_id, effective_date FROM (
+                    SELECT security_id, source_action_id, effective_date FROM mergers
+                    WHERE list_contains(?, security_id)
+                    QUALIFY row_number() OVER (
+                        PARTITION BY security_id, source_action_id ORDER BY known_at DESC
+                    ) = 1
+                )
+                GROUP BY security_id, effective_date
+                HAVING count(*) > 1
+            )
+            """,
+            [ids],
+        ).fetchone()
+        assert pairs is not None
+        stats["merger_conflict"] = stats.get("merger_conflict", 0) + int(pairs[0])
+    return added
+
+
+def _count_merger_report(stats: dict[str, int], report: Any) -> None:
+    """Add the merger parse's own counts (refused, unresolved, same-company,
+    ambiguous stamps) to the run's `stats`; `report` is the source's
+    `ActionsParse`, `None` when the source keeps none."""
+    if report is None:
+        return
+    stats["merger_rows_refused"] = stats.get("merger_rows_refused", 0) + len(
+        report.merger_rows_refused
+    )
+    stats["actions_unresolved"] = stats.get("actions_unresolved", 0) + len(report.unresolved)
+    stats["merger_self"] = stats.get("merger_self", 0) + report.merger_self
+    stats["merger_unordered"] = stats.get("merger_unordered", 0) + len(report.merger_unordered)
 
 
 # --- writing only what changes an as-of read --------------------------------

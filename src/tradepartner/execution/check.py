@@ -70,8 +70,7 @@ from tradepartner.config import Cadence, Settings
 from tradepartner.execution.lock import resolve_book
 from tradepartner.execution.outcomes import (
     NOT_EXECUTED,
-    POSITION_RETURN,
-    REALISED_PNL,
+    filled_outcome_kind,
     outcome_horizon,
 )
 from tradepartner.execution.plan import stop_session as stop_session_of_request
@@ -97,8 +96,6 @@ _EXECUTED = "executed"
 _REQUESTED = "requested"
 _SCHEDULER = "scheduler"
 _FILLED = "filled"
-_BUY = "buy"
-_SELL = "sell"
 _REBALANCE = "rebalance"
 _CATCH_UP = "catch_up"
 _PAPER_MIN_REBALANCES = "paper.min_rebalances"
@@ -116,6 +113,25 @@ class CheckLine:
     passed: bool
     query: str
     detail: str
+    #: The owner-readable form of `detail` (progress, date range) shown by default;
+    #: empty when `detail` is already short. `--verbose` prints `detail` in full.
+    short: str = ""
+
+
+#: Calendar days one rebalance period spans, for "about N to go" estimates.
+_PERIOD_DAYS: Mapping[Cadence, int] = MappingProxyType({"month_end": 30, "week_end": 7, "daily": 1})
+
+
+def _time_to_go(remaining: int, cadence: Cadence) -> str:
+    """A rough, plain-words wait for `remaining` more rebalance periods."""
+    if cadence == "daily":
+        return f"{remaining} more session(s) to go"
+    days = remaining * _PERIOD_DAYS[cadence]
+    if days < 14:
+        return f"about {days} more day(s)"
+    if days < 60:
+        return f"about {round(days / 7)} weeks to go"
+    return f"about {round(days / 30)} months to go"
 
 
 def _frozen(window: PaperWindowRow) -> dict[str, Any]:
@@ -237,7 +253,11 @@ def _journal_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> Journal:
 
 
 def _rebalance_count_line(
-    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, window_id: int, frozen: dict[str, Any]
+    conn: duckdb.DuckDBPyConnection,
+    window: PaperWindowRow,
+    window_id: int,
+    frozen: dict[str, Any],
+    cadence: Cadence,
 ) -> CheckLine:
     query = (
         "distinct rebalance_events.rebalance_session with status='executed' "
@@ -254,15 +274,52 @@ def _rebalance_count_line(
         if e.run_id in runs and runs[e.run_id].invoked_by == _SCHEDULER
     }
     all_executed_sessions = {e.rebalance_session for e in executed}
+    missed_sessions = {e.rebalance_session for e in events if e.status == "missed"}
     tty_only_sessions = sorted(all_executed_sessions - scheduler_sessions)
     executed_run_ids = {e.run_id for e in executed}
-    no_trade_runs = sorted(
-        run.session
+    decision_sessions = {
+        row.decision.decision_id: row.decision.rebalance_session
+        for row in store_journal.decisions_for(conn, window_id)
+    }
+    order_sessions: dict[int, set[date | None]] = {}
+    for order in store_journal.orders_for(conn, window_id=window_id):
+        order_sessions.setdefault(order.run_id, set()).add(decision_sessions.get(order.decision_id))
+    order_run_ids = set(order_sessions)
+    uncounted_runs = [
+        run
         for run in runs.values()
         if run.session is not None
         and run.invoked_by == _SCHEDULER
         and run.kind in (_REBALANCE, _CATCH_UP)
         and run.run_id not in executed_run_ids
+    ]
+    no_trade_runs = sorted(
+        run.session
+        for run in uncounted_runs
+        if run.session is not None and run.run_id not in order_run_ids
+    )
+    missed_runs = sorted(
+        run.session
+        for run in uncounted_runs
+        if run.session is not None
+        and run.run_id in order_run_ids
+        and order_sessions[run.run_id] & missed_sessions
+    )
+    awaiting_runs = sorted(
+        run.session
+        for run in uncounted_runs
+        if run.session is not None
+        and run.run_id in order_run_ids
+        and not order_sessions[run.run_id] & missed_sessions
+        and not all(session in all_executed_sessions for session in order_sessions[run.run_id])
+    )
+    recorded_runs = sorted(
+        run.session
+        for run in uncounted_runs
+        if run.session is not None
+        and run.run_id in order_run_ids
+        and not order_sessions[run.run_id] & missed_sessions
+        and all(session in all_executed_sessions for session in order_sessions[run.run_id])
     )
 
     count = len(scheduler_sessions)
@@ -272,13 +329,33 @@ def _rebalance_count_line(
         f"{count} scheduler-executed rebalance session(s) [{sessions_text}], "
         f"need >= {min_rebalances}"
     )
+    base_detail = detail
     if tty_only_sessions:
         tty_text = ", ".join(s.isoformat() for s in tty_only_sessions)
         detail += f"; tty-executed, listed not counted: [{tty_text}]"
     if no_trade_runs:
         no_trade_text = ", ".join(s.isoformat() for s in no_trade_runs)
         detail += f"; no-trade fill-session runs, listed not counted: [{no_trade_text}]"
-    return CheckLine(name="rebalance_count", passed=passed, query=query, detail=detail)
+    if awaiting_runs:
+        submitted_text = ", ".join(s.isoformat() for s in awaiting_runs)
+        detail += f"; submitted-order runs awaiting recorded fills, not counted: [{submitted_text}]"
+    if missed_runs:
+        missed_text = ", ".join(s.isoformat() for s in missed_runs)
+        detail += f"; submitted-order runs, rebalance missed, not counted: [{missed_text}]"
+    if recorded_runs:
+        recorded_text = ", ".join(s.isoformat() for s in recorded_runs)
+        detail += (
+            f"; submitted-order runs, fills recorded by a later run, not counted: [{recorded_text}]"
+        )
+    ordered = sorted(scheduler_sessions)
+    short = f"{count} of {min_rebalances} rebalance sessions done"
+    if not passed:
+        short += f" so far, {_time_to_go(min_rebalances - count, cadence)}"
+    if ordered:
+        short += f"; first {ordered[0].isoformat()}, latest {ordered[-1].isoformat()}"
+    if detail != base_detail:
+        short += "; other runs are listed but not counted (--verbose shows them)"
+    return CheckLine(name="rebalance_count", passed=passed, query=query, detail=detail, short=short)
 
 
 def _tracking_line(
@@ -398,10 +475,8 @@ def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int, cadence: Cadenc
             incomplete.append(f"order {coid} ({order.symbol}) is not terminal")
             continue
         earned: list[str] = []
-        if filled.get(coid, 0.0) > 0 and order.side == _BUY:
-            earned.append(POSITION_RETURN)
-        if filled.get(coid, 0.0) > 0 and order.side == _SELL:
-            earned.append(REALISED_PNL)
+        if filled.get(coid, 0.0) > 0:
+            earned.append(filled_outcome_kind(order.side, order.position_side))
         if terminal[coid] != _FILLED:
             earned.append(NOT_EXECUTED)
         incomplete += [
@@ -456,7 +531,7 @@ def check(
     frozen = _frozen(window)
 
     return [
-        _rebalance_count_line(conn, window, window_id, frozen),
+        _rebalance_count_line(conn, window, window_id, frozen, cadence),
         _tracking_line(conn, window, window_id, frozen, last_t, stop_session, cadence),
         _chain_line(conn, window_id, cadence),
         _override_line(conn, window, window_id, frozen),

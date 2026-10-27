@@ -290,6 +290,102 @@ class SymbolChange:
         )
 
 
+#: The three merger kinds, one per Alpaca category (spec "Mergers", #1762).
+MERGER_KINDS = ("cash", "stock", "stock_and_cash")
+
+
+def _require_positive_finite(value: object, *, field_name: str) -> float:
+    number = _require_finite(value, field_name=field_name)
+    if number <= 0:
+        raise ValueError(f"{field_name} must be positive, got {value!r}")
+    return number
+
+
+@dataclass(frozen=True)
+class Merger:
+    """An Alpaca merger record (spec "Mergers", #1762): the acquiree
+    (`security_id`, the security that ends), the acquirer when it is in the
+    master, acquirer shares per acquiree share and cash per acquiree share,
+    and three dates. Known at the close after its `process_date`; Alpaca's
+    id is required and is the identity beside the acquiree.
+
+    `kind` ties the rates: `cash` has `cash_per_share` only, `stock` has
+    `share_ratio` only, `stock_and_cash` both; each is positive and finite.
+    Both stock kinds name their acquirer. Symbols and CUSIPs are verbatim,
+    `""` when absent.
+    """
+
+    security_id: str
+    kind: str
+    acquirer_security_id: str | None
+    acquiree_symbol: str
+    acquiree_cusip: str
+    acquirer_symbol: str
+    acquirer_cusip: str
+    share_ratio: float | None
+    cash_per_share: float | None
+    effective_date: date
+    process_date: date
+    payable_date: date | None
+    known_at: datetime
+    source: str
+    source_action_id: str
+
+    def __post_init__(self) -> None:
+        for name in ("security_id", "source", "source_action_id"):
+            _require_identifier(getattr(self, name), field_name=name)
+        if self.kind not in MERGER_KINDS:
+            raise ValueError(f"kind must be one of {MERGER_KINDS}, got {self.kind!r}")
+        for name in ("acquiree_symbol", "acquiree_cusip", "acquirer_symbol", "acquirer_cusip"):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(f"{name} must be a string")
+        if self.acquirer_security_id is not None:
+            _require_identifier(self.acquirer_security_id, field_name="acquirer_security_id")
+        elif self.kind != "cash":
+            raise ValueError(f"a {self.kind} merger needs its acquirer_security_id")
+        wants_ratio = self.kind in ("stock", "stock_and_cash")
+        wants_cash = self.kind in ("cash", "stock_and_cash")
+        if (self.share_ratio is not None) != wants_ratio:
+            raise ValueError(f"share_ratio does not match kind {self.kind!r}")
+        if (self.cash_per_share is not None) != wants_cash:
+            raise ValueError(f"cash_per_share does not match kind {self.kind!r}")
+        if self.share_ratio is not None:
+            _require_positive_finite(self.share_ratio, field_name="share_ratio")
+        if self.cash_per_share is not None:
+            _require_positive_finite(self.cash_per_share, field_name="cash_per_share")
+        _require_date(self.effective_date, field_name="effective_date")
+        _require_date(self.process_date, field_name="process_date")
+        if self.payable_date is not None:
+            _require_date(self.payable_date, field_name="payable_date")
+        object.__setattr__(
+            self, "known_at", ensure_tz_aware_utc(self.known_at, field_name="known_at")
+        )
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """The identity: the acquiree and Alpaca's id."""
+        return (self.security_id, self.source_action_id)
+
+    def same_values(self, other: Merger) -> bool:
+        """Equal in every field the source gives (not the stamp)."""
+        return self._values() == other._values()
+
+    def _values(self) -> tuple[object, ...]:
+        return (
+            self.kind,
+            self.acquirer_security_id,
+            self.acquiree_symbol,
+            self.acquiree_cusip,
+            self.acquirer_symbol,
+            self.acquirer_cusip,
+            self.share_ratio,
+            self.cash_per_share,
+            self.effective_date,
+            self.process_date,
+            self.payable_date,
+        )
+
+
 def bar_known_at(session: date) -> datetime:
     """When a bar for `session` becomes knowable: the XNYS close of that
     session (the early close on a half day), tz-aware UTC.
@@ -459,6 +555,16 @@ class PriceSource(abc.ABC):
         Existing price sources without a name-change feed return none.
         """
         check_request(security_ids, start, end)
+        return []
+
+    def mergers(self, start: date, end: date) -> list[Merger]:
+        """Mergers with `start <= process_date <= end` (spec "Mergers",
+        #1762), whatever their effective date. Symbol-less on purpose: an
+        acquiree is usually delisted before Alpaca processes its record.
+
+        Existing price sources without a merger feed return none.
+        """
+        check_request([], start, end)
         return []
 
     def resolution_summary(self) -> str:

@@ -100,7 +100,7 @@ def test_at_the_default_fraction_the_momentum_plan_reads_and_reports_nothing_new
     plan = engine.plan(provider, _screen_params(1.0), T_SESSION, "momentum")
     assert "turnover_inputs" not in {call.method for call in provider.calls}
     assert plan.counts == {"n_excluded_no_history": 1}
-    assert plan.exclusions == {"no_history": ("C",), "no_turnover": ()}
+    assert plan.exclusions == {"no_history": ("C",), "no_turnover": (), "no_t0_bar": ()}
     assert sorted(plan.scores) == ["A", "B", "D", "E"]
 
 
@@ -120,7 +120,11 @@ def test_below_one_the_plan_screens_before_the_rank_and_reports_the_counts() -> 
         "n_screened": 2,
         "n_excluded_no_turnover": 1,
     }
-    assert plan.exclusions == {"no_history": ("C",), "no_turnover": ("B", "D", "E")}
+    assert plan.exclusions == {
+        "no_history": ("C",),
+        "no_turnover": ("B", "D", "E"),
+        "no_t0_bar": (),
+    }
     assert list(plan.scores) == ["A"]
     assert set(plan.targets) == {"A"}
 

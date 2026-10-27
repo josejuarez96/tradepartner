@@ -39,10 +39,17 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import date
+from typing import Final
 
 import duckdb
 
 from tradepartner.store.schema import has_retracted
+
+#: Securities stored for the known-answer index check alone (backtest spec amendment
+#: #1598, item 3). Pinned and append-only: no trial may read one, so
+#: `benchmark_security_ids` refuses to resolve one unless the index check passes
+#: `check_only=True`, and `registry.data_vintage` leaves their rows out.
+CHECK_ONLY_IDS: Final[frozenset[str]] = frozenset({"BENCH:RSP"})
 
 
 class BenchmarkIdentityError(ValueError):
@@ -139,10 +146,15 @@ def benchmark_security_ids(
     *,
     start: date,
     through: date | None = None,
+    check_only: bool = False,
 ) -> dict[str, str]:
     """Each of `symbols` to its one benchmark `security_id`, by symbol; raises
     `BenchmarkIdentityError` on a missing, ambiguous or reused symbol (module
-    docstring). Reads identity rows only, never a bar."""
+    docstring). Reads identity rows only, never a bar.
+
+    A check-only security (`CHECK_ONLY_IDS`) resolves only for `check_only=True`,
+    which only the index check passes; a trial naming one fails by symbol rather
+    than reading its series (#1598, item 3)."""
     out: dict[str, str] = {}
     for symbol in symbols:
         found = benchmark_candidates(conn, symbol)
@@ -156,6 +168,10 @@ def benchmark_security_ids(
                 f"benchmark {symbol} is ambiguous: securities {', '.join(found)} all list it"
             )
         (sid,) = found
+        if sid in CHECK_ONLY_IDS and not check_only:
+            raise BenchmarkIdentityError(
+                f"benchmark {symbol} ({sid}) is check-only: no trial may read it"
+            )
         others = ticker_holders(conn, symbol, start=start, through=through, exclude=sid)
         if others:
             window = f"{start.isoformat()}..{through.isoformat() if through else 'open'}"

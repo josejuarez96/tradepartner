@@ -13,9 +13,11 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
+from types import SimpleNamespace
 from typing import Any, Protocol
 
 import duckdb
+import polars as pl
 import pytest
 
 from tradepartner import calendar
@@ -30,8 +32,10 @@ from tradepartner.errors import (
     SkipCapError,
     SystemFaultError,
 )
+from tradepartner.execution import run as run_module
 from tradepartner.execution import switch, wrapper
 from tradepartner.execution.alerts import Alerter
+from tradepartner.execution.collect import PriceBand
 from tradepartner.execution.plan import State
 from tradepartner.execution.wrapper import BatchOutcome, RiskGatedBroker
 from tradepartner.store.db import insert_row, open_for_write
@@ -342,6 +346,91 @@ def _execute(
     return gate.execute(env.run, decisions, exits)
 
 
+def test_wrapper_collection_notes_a_fill_without_a_reference(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """A wrapper-journaled fill with no readable reference reaches the run notes."""
+    decision = _decision(env, A, "buy", notional=100.0)
+    coid = "fx-unjudged-buy"
+    placed = env.fake.submit(OrderRequest(coid, SYMBOLS[A], Side.BUY, quantity=1.0))
+    assert decision.decision_id is not None
+    assert env.run.run_id is not None
+    order = OrderRow(
+        client_order_id=coid,
+        decision_id=decision.decision_id,
+        run_id=env.run.run_id,
+        session=S,
+        attempt=1,
+        phase="buy",
+        security_id=A,
+        symbol=SYMBOLS[A],
+        side="buy",
+        quantity=1.0,
+        sells_in_flight_at_submit=False,
+        known_at=env.run.started_at,
+        ingested_at=env.run.started_at,
+    )
+    _append(
+        env.settings,
+        order,
+        OrderEventRow(
+            client_order_id=coid,
+            status="pending",
+            known_at=env.run.started_at,
+            ingested_at=env.run.started_at,
+        ),
+        OrderEventRow(
+            client_order_id=coid,
+            status="accepted",
+            broker_order_id=placed.broker_order_id,
+            known_at=env.run.started_at,
+            ingested_at=env.run.started_at,
+        ),
+    )
+    env.fake.simulate_fill(coid)
+    # collect catches the KeyError from an unread or unpriced reference.
+    band = PriceBand({}.__getitem__, pl.DataFrame(), S, 0.25)
+    notes: list[str] = []
+    _gate(env, alerter_conn)._collect(env.run, [order], price_band=band, notes=notes)
+    assert notes == [f"fill-price band: no reference price for {coid}"]
+
+
+@pytest.mark.parametrize("side", ["sell", "buy"])
+def test_run_notes_receive_unjudged_wrapper_phase_fills(
+    env: Env,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+    side: str,
+) -> None:
+    """The run's notes survive the public wrapper path for both collections."""
+    if side == "sell":
+        _hold(env, A, 10.0)
+        decisions = [
+            _decision(env, A, "sell", notional=500.0),
+            _decision(env, B, "buy", notional=3000.0),
+        ]
+        victim = A
+    else:
+        decisions = [_decision(env, A, "buy", notional=3000.0)]
+        victim = A
+    env.fake.script(FillAt())
+    gate = _gate(env, alerter_conn)
+    # Keep phase sizing priced, but make the collection's reference unreadable.
+    monkeypatch.setattr(
+        gate, "_price_band", lambda _run, _book: PriceBand({}.__getitem__, pl.DataFrame(), S, 0.25)
+    )
+    notes: list[str] = []
+    context = SimpleNamespace(gate=gate, run=env.run, notes=notes)
+    outcome = run_module._execute(context, decisions, ())  # type: ignore[arg-type]
+    assert outcome.status == "ok"
+    ((coid,),) = _query(
+        env.settings,
+        "SELECT client_order_id FROM orders WHERE run_id = ? AND security_id = ? AND side = ?",
+        [env.run.run_id, victim, side],
+    )
+    assert notes == [f"fill-price band: no reference price for {coid}"]
+
+
 # --- the reference price ---------------------------------------------------------------
 
 
@@ -588,6 +677,7 @@ def test_a_held_trim_sells_the_rest_once_the_open_sell_expires(
     """#719 item 6 acceptance, end to end: a trim beside an earlier session's
     open own sell is held (no order, no `decision_events` row, no skip count,
     decision open); once that sell expires, the next run trims the rest."""
+    env.clock.now = session_open(S) + timedelta(minutes=10)  # room before the window closes
     _hold(env, A, 10.0)
     _open_sell(env, A, 9.5)
     trim = _decision(env, A, "sell", notional=500.0, whole_share=True)
@@ -1082,6 +1172,29 @@ def test_sells_closed_by_the_window_send_no_buy(
     ) == [("pending", None), ("cancelled", "not_received")]
 
 
+def test_a_buy_is_not_sent_when_a_lock_wait_ran_the_clock_past_the_window(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#2178: a longer store lock wait (`store.writer_lock_retry_seconds`) before the
+    buys can end after the window closes (open + 30 min). The window is re-checked
+    before every submit, not only after an ack timeout, so no buy is sent and each
+    order is closed `not_received`."""
+    env.clock.now = session_open(S) + timedelta(minutes=31)
+    buys = [_decision(env, A, "buy", notional=3000.0), _decision(env, B, "buy", notional=3000.0)]
+    outcome = _execute(_gate(env, alerter_conn), env, buys)
+    assert outcome.status == "ok"
+    assert _submits(env.fake) == []
+    events = _query(
+        env.settings,
+        "SELECT e.status, e.reason FROM order_events e JOIN orders o USING (client_order_id) "
+        "WHERE o.run_id = ?",
+        [env.run.run_id],
+    )
+    assert sorted(events, key=str) == sorted(
+        [("pending", None)] * 2 + [("cancelled", "not_received")] * 2, key=str
+    )
+
+
 def test_a_second_ack_timeout_in_the_batch_halts_and_leaves_it_pending(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
@@ -1523,7 +1636,8 @@ def test_the_reserve_pre_check_runs_after_the_switch_read_and_before_any_sell(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#692: on a sell-and-buy batch the order is switch read, then the
-    reserve pre-check, then the sells phase's own switch read and submits."""
+    reserve pre-check, then the sells phase's own switch read and, since #2182,
+    one more switch read before each submit."""
     env.new_fake(cash=10_000.0)
     _hold(env, A, 10.0)
     trim = _decision(env, A, "sell", notional=300.0)
@@ -1544,7 +1658,7 @@ def test_the_reserve_pre_check_runs_after_the_switch_read_and_before_any_sell(
     monkeypatch.setattr(wrapper, "open_buy_reserve", spy_reserve)
     env.fake.on_submit = lambda _request: seen.append("submit")
     _execute(gate, env, [trim, buy])
-    assert seen[:4] == ["switch", "reserve", "switch", "submit"]
+    assert seen[:5] == ["switch", "reserve", "switch", "switch", "submit"]
 
 
 def test_a_sells_only_batch_never_reads_the_reserve(

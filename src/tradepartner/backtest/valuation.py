@@ -70,9 +70,11 @@ def _check_fill_price(fill_price: str) -> None:
         raise ValueError(f"fill_price must be one of {get_args(FillPrice)}, got {fill_price!r}")
 
 
-def _check_positions(positions: Mapping[str, float]) -> None:
+def _check_positions(positions: Mapping[str, float], *, signed: bool = False) -> None:
     for sid, value in positions.items():
-        if not (math.isfinite(value) and value >= 0):
+        if not (math.isfinite(value) and (signed or value >= 0)):
+            if signed:
+                raise ValueError(f"position {sid} must be finite, got {value}")
             raise ValueError(f"position {sid} must be non-negative and finite, got {value}")
 
 
@@ -189,6 +191,7 @@ def value_positions(
     *,
     fill_price: FillPrice,
     through: date,
+    signed: bool = False,
 ) -> pl.DataFrame:
     """Dollar value of each position at the close of every session in
     `[fill_session, through]`: `security_id`, `session`, `value`, and `marked_at`, the
@@ -205,7 +208,7 @@ def value_positions(
     `fill_session`, a `fill_session` that is not a session, or `through` before it.
     """
     _check_fill_price(fill_price)
-    _check_positions(positions)
+    _check_positions(positions, signed=signed)
     sessions = _sessions(fill_session, through)
     if not positions:
         return pl.DataFrame(schema=_VALUE_SCHEMA)
@@ -250,6 +253,7 @@ def carry_to_fill(
     *,
     fill_price: FillPrice,
     marked_at: Mapping[str, date],
+    signed: bool = False,
 ) -> dict[str, float]:
     """Dollar values at close(`rebalance_session`) priced forward to the fill price on
     `fill_session` by `marking_frame`, the next step's frame (req 2's carry).
@@ -265,7 +269,7 @@ def carry_to_fill(
     no bar on a name's `marked_at` session (a retracted bar the value was marked at).
     """
     _check_fill_price(fill_price)
-    _check_positions(positions)
+    _check_positions(positions, signed=signed)
     if fill_session != next_session(rebalance_session):
         raise ValueError(
             f"fill_session {fill_session.isoformat()} is not the next session after "

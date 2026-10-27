@@ -37,3 +37,17 @@ A month where any session has no bar is `stale`. Nothing is written for that mon
 
 - `uv run tradepartner health` should list MTUM among the benchmark names with a bar at the last session. The daily ingest now fetches it like SPY, because benchmarks are always fetched.
 - Rerun the H1 in-sample trial (#839). A trial still refuses a benchmark whose ticker another security holds inside the run window, or which two benchmark securities both list. The message names the symbol.
+
+## RSP: a check-only series (#1598, T243)
+
+RSP (Invesco S&P 500 Equal Weight ETF) is the equal-weight comparison of the known-answer index check. It is **not** a trial benchmark: it is in `index_check.check_only_symbols`, never in `benchmarks`, and the config refuses it in both. `store.benchmarks.CHECK_ONLY_IDS` (`BENCH:RSP`) makes `benchmark_security_ids` refuse it for any trial, and `data_vintage` leaves its bars and actions out, so the backfill stales no counted trial. Owner-run, once, on the real store, like MTUM above:
+
+```bash
+uv run tradepartner backfill-benchmark RSP --since 2016-01-01 \
+  --cik <Invesco Exchange-Traded Fund Trust CIK> --name "Invesco S&P 500 Equal Weight ETF" \
+  --exchange <NYSE Arca code as Alpaca spells it>
+```
+
+- **Seed values to check before you run.** The name above is the issuer's own display name. The CIK (the trust that files for the fund, found on EDGAR) and the exchange code are labels no read uses, but they were not checked on the issuer's page when this was written (an agent cannot reach the prospectus), so look both up and fill them in.
+- **Stop (spec open question 36).** If the command refuses because another security already lists `RSP`, or `BENCH:RSP` is taken, stop and report on #1598. The decided answer is to amend the master so it treats a check-only symbol as it treats `benchmarks` (seeded `BENCH:`, never attached to an issuer CIK); do not read that security by ticker without the `benchmark` flag. The same stop applies if a later companies snapshot carries RSP: `build_master` keeps only `benchmarks` out of the snapshot's issuers, so it would derive a second security under the ticker and every check would refuse RSP by name until the amendment lands.
+- The daily ingest fetches it afterwards, like every benchmark-flagged security.

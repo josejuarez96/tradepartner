@@ -1663,3 +1663,42 @@ def test_fill_holes_counts_future_spinoff_without_storing_it(settings: Settings)
     assert _read(
         settings, "SELECT count(*) FROM corporate_actions WHERE action_type='spinoff'"
     ) == [(0,)]
+
+
+# --- a chained successor's rule-9 hole (#821, plan T187b) -------------------------
+
+_UNIVERSE_DIR = Path(__file__).resolve().parent / "fixtures" / "universe"
+_CHAIN_KNOWN_AT = datetime(2020, 2, 7, 20, 30, tzinfo=UTC)
+_JAN_2020 = (date(2020, 1, 1), date(2020, 1, 31))
+
+
+def test_a_chained_successor_is_named_for_and_holes_its_rule_9_window(
+    tmp_path: Path,
+) -> None:
+    """`fill_holes` takes the successor for the month of its rule-9 window
+    (sessions between the predecessor's span end and its first listing row) and
+    lists them as its hole; without the chain they resolve to nobody."""
+    from conftest import load_chain_overlay, load_universe_fixtures
+
+    from tradepartner import backfill as backfill_module
+    from tradepartner.repair import store_resolver
+    from tradepartner.store.db import open_for_write
+    from tradepartner.store.schema import init_schema
+
+    settings = Settings(_env_file=None, store={"path": str(tmp_path / "chains.duckdb")})
+    at = datetime(2020, 6, 1, 21, 0, tzinfo=UTC)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        load_universe_fixtures(conn, _UNIVERSE_DIR)
+        load_chain_overlay(conn)
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, at, settings)
+        named, _listed, _static, _may, _ref = backfill_module._window_names(
+            conn, at, _JAN_2020, settings, resolver
+        )
+        assert "0001000011" in named  # the successor, whose listing starts 2020-02-04
+        assert "0001000010" in named  # the predecessor, live through its delisting
+        holes, _gaps, _stored, _dropped, _handed = backfill_module._month_holes(
+            conn, resolver, at, _JAN_2020, named, None, settings.alpaca.rename_lead_days
+        )
+        assert "0001000011" in holes

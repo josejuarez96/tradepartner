@@ -7,7 +7,13 @@ live (#826's WillScot successor `0001647088@2020-08-10`, which #835's rules
 no longer make). This command builds the master exactly as an EDGAR ingest
 would (the same fetch pass, `ingest._prefetch`, then `build_master`) and
 lists every stored live EDGAR `filing` row of `securities` or `listings`
-whose key that build does not derive (`store.retraction.underived`).
+whose key that build does not derive (`store.retraction.underived`), and
+every live `successor_chains` row no entry derives at this run
+(`store.retraction.underived_chains`, #821): `build_chains` runs on the same
+build, so an entry that is refused (`spac` predecessor, lost evidence, a
+successor listing that no longer matches) leaves its row underived, as the
+ingest's chain writer skips it. A chain row is `[traded]` when the journal
+names its predecessor or successor.
 
 - **Dry run by default.** It reads on a read-only connection and changes
   nothing. The terminal lists every row found, marks a row of a security
@@ -81,17 +87,20 @@ from tradepartner.ingest import (
     _write_run,
 )
 from tradepartner.repair import release_refusal
+from tradepartner.store.classify import build_classifications
 from tradepartner.store.db import open_for_write, utc_now
-from tradepartner.store.master import build_master
+from tradepartner.store.master import build_chains, build_master
 from tradepartner.store.retraction import (
     EDGAR,
     RETRACT,
     RETRACTED,
     Underived,
     cik_of,
+    live_chains_as_of,
     record_underived,
     split_kept,
     stored_underived,
+    underived_chains,
     write_retractions,
 )
 from tradepartner.store.schema import has_retracted, init_schema
@@ -144,13 +153,13 @@ class RetractResult:
         rows kept on `master.keep_successors`, and the CIKs not judged."""
         by_table = {
             table: sum(1 for u in self.found if u.table == table)
-            for table in ("securities", "listings")
+            for table in ("securities", "listings", "successor_chains")
         }
         verb = "would retract" if self.dry_run else "retracted"
         line = (
             f"{verb} {self.rows} rows ({by_table['securities']} securities, "
-            f"{by_table['listings']} listings), digest {self.digest}, "
-            f"at {self.at.isoformat()}"
+            f"{by_table['listings']} listings, {by_table['successor_chains']} chains), "
+            f"digest {self.digest}, at {self.at.isoformat()}"
         )
         if self.kept:
             held = sorted({u.row["security_id"] for u in self.kept})
@@ -176,9 +185,18 @@ class RetractResult:
         """One line per row found, `[traded]` on a security the journal has
         an order for, then one per kept row, `[kept: master.keep_successors]`."""
         return tuple(
-            item.describe() + (" [traded]" if item.row["security_id"] in self.traded else "")
+            item.describe()
+            + (" [traded]" if any(sid in self.traded for sid in _row_ids(item)) else "")
             for item in self.found
         ) + tuple(f"{item.describe()} [kept: {_KEEP_KEY}]" for item in self.kept)
+
+
+def _row_ids(item: Underived) -> tuple[str, ...]:
+    """The security ids an underived row names: a listing or securities row
+    its own id, a chain row its predecessor and successor (#821)."""
+    if item.table == "successor_chains":
+        return (item.row["predecessor_id"], item.row["successor_id"])
+    return (item.row["security_id"],)
 
 
 #: Every journal table that names a security a window traded or holds:
@@ -195,8 +213,8 @@ _TRADED_SQL = """
 def _traded(conn: duckdb.DuckDBPyConnection, found: tuple[Underived, ...]) -> frozenset[str]:
     """The securities among `found` that any journal order, adjustment, daily
     position or lot names, in any window, open or closed: a superset of the
-    ones a window holds."""
-    ids = sorted({u.row["security_id"] for u in found})
+    ones a window holds. A chain row's ids are its two sides (#821)."""
+    ids = sorted({sid for item in found for sid in _row_ids(item)})
     if not ids:
         return frozenset()
     rows = conn.execute(_TRADED_SQL, [ids, ids, ids, ids]).fetchall()
@@ -268,6 +286,23 @@ def master_retract(
         keep = frozenset(settings.master.keep_successors)
         derived = frozenset(row["security_id"] for row in build.securities)
         found, kept = split_kept(stored_underived(conn, build, at, unjudged.ciks), keep, derived)
+        # #821, T187c: a chain is derived only when `build_chains` honours its
+        # entry at this run, not merely when the entry names the successor. A
+        # refused entry (`spac` predecessor, lost evidence, a successor
+        # listing that no longer matches) leaves its live row underived, as
+        # `store/master.py`'s chain writer skips it.
+        derived_successors: frozenset[str] = frozenset()
+        if settings.master.chains:
+            types = {
+                row["security_id"]: row["security_type"]
+                for row in build_classifications(
+                    recorded, build, settings, ingested_at=at
+                ).classifications
+            }
+            chain_build = build_chains(recorded, settings, build, types, ingested_at=at)
+            derived_successors = frozenset(chain.successor_id for chain in chain_build.chains)
+        chains = underived_chains(live_chains_as_of(conn, at), derived_successors, unjudged.ciks)
+        found = found + chains
         rest = keep - derived - {u.row["security_id"] for u in kept}
         unjudged_ids = {sid for sid in rest if cik_of(sid) in unjudged.ciks}
         result = RetractResult(
@@ -295,7 +330,7 @@ def master_retract(
                 )
             write_retractions(conn, found, at)
             run_id = uuid.uuid4().hex
-            record_underived(conn, run_id, at, found)
+            record_underived(conn, run_id, at, [u for u in found if u.table != "successor_chains"])
             message = clean_message(f"{result.summary()}; release {release}", settings)
             run = SourceRun(EDGAR, RETRACTED, result.rows, "", message)
             _write_run(conn, run_id, started, clock(), run, RETRACT)

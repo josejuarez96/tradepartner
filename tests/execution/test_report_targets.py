@@ -484,3 +484,44 @@ def test_report_refuses_a_bad_book_token_before_any_trial(
     report_settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
     with pytest.raises(ValueError, match="book_id must match"):
         report(report_settings, partial(open_read_only, report_settings), "b-1")
+
+
+@pytest.mark.parametrize(
+    ("now", "case"),
+    [
+        (datetime(2019, 7, 15, 12, tzinfo=UTC), "no rebalance yet"),
+        (datetime(2019, 8, 1, 12, tzinfo=UTC), "one rebalance"),
+    ],
+)
+def test_report_with_fewer_than_two_rebalances_writes_no_trial_and_no_report_row(
+    fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime, case: str
+) -> None:
+    """#1923: a book with fewer than two rebalances has nothing to compare; `report`
+    raises `NothingToCompareYet` and writes no trial (so no refused `in_sample`
+    row, no failed tracking row) and no `paper_reports` row."""
+    report_settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    with open_for_write(report_settings) as conn:
+        _seed_tracking_window(conn)
+        before = conn.execute("SELECT count(*) FROM trials").fetchone()
+    assert before is not None
+
+    import tradepartner.execution.report as report_module
+
+    monkeypatch.setattr(report_module, "utc_now", lambda: now)
+
+    def no_run(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError(f"no trial may run ({case})")
+
+    monkeypatch.setattr(report_module, "run_hypothesis", no_run)
+
+    with pytest.raises(report_module.NothingToCompareYet, match="nothing to compare yet"):
+        report(report_settings, partial(open_read_only, report_settings))
+    with open_read_only(report_settings) as conn:
+        trials = conn.execute("SELECT count(*) FROM trials").fetchone()
+        in_sample = conn.execute(
+            "SELECT count(*) FROM trials WHERE run_by = 'paper_report'"
+        ).fetchone()
+        reports = conn.execute("SELECT count(*) FROM paper_reports").fetchone()
+    assert trials is not None and trials[0] == before[0]
+    assert in_sample is not None and in_sample[0] == 0
+    assert reports is not None and reports[0] == 0

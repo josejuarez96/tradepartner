@@ -21,6 +21,7 @@ import pytest
 
 from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.config import FROZEN_COSTS_KEYS, CostsConfig, Settings
+from tradepartner.store import registry
 from tradepartner.store.db import open_for_write
 from tradepartner.store.journal import PaperWindowRow, append
 
@@ -85,7 +86,7 @@ def open_window(journal_settings: Settings) -> PaperWindowRow:
         code_version="test",
         started_at=CLOCK_START - timedelta(days=2),
         frozen_json=FROZEN_COSTS_JSON,
-        frozen_sha256="0" * 64,
+        frozen_sha256=registry.params_sha256(json.loads(FROZEN_COSTS_JSON)),
         known_at=CLOCK_START - timedelta(days=2),
         ingested_at=CLOCK_START - timedelta(days=2),
     )

@@ -11,8 +11,9 @@
    market data, so it can precede the insert: the `trials` row is append-only,
    so its kind must be known when it is written. A refusal at this point
    (`refused_window`, `refused_holdout`, or `refused_gap` for `--override-gap`
-   without a reason, before any gap read) is opened as `in_sample` with no
-   holdout reason, so it never counts as a holdout spend. A holdout run also
+   without a reason, before any gap read) is opened as `in_sample` (as `tracking` for a
+   tracking run, #1923) with no holdout reason, so it never counts as a holdout
+   spend. A holdout run also
    appends a `holdout_spend` owner decision.
 2. **Refuse** those at once: `close_trial` in its own chunk, no `StoreProvider`
    built.
@@ -387,7 +388,15 @@ def run_hypothesis(
         # `decision.kind` says: `refused_gap` keeps the holdout `Decision` its gate
         # started from (`holdout.decide`'s `replace(spend, outcome="refused_gap", ...)`),
         # so `decision.kind == "holdout"` there even though the run never happened.
-        trial_kind = decision.kind if not refused and decision.kind is not None else "in_sample"
+        # A refused tracking run stays `tracking` (#1923: a tracking report never
+        # leaves an `in_sample` row); N counts neither, as only `ok` trials count.
+        trial_kind = (
+            "tracking"
+            if tracking
+            else decision.kind
+            if not refused and decision.kind is not None
+            else "in_sample"
+        )
         handle = registry.open_trial(
             conn,
             hypothesis_id=hypothesis.hypothesis_id,
