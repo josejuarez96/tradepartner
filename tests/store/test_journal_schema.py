@@ -167,7 +167,7 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
 
 
 def test_current_schema_version_is_31() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_BREAKS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 1
     assert schema._PRE_FEE_ACTIVITIES_VERSION == 24
     assert schema._PRE_FILING_NAME_VERSION == 25
     assert schema._PRE_CASH_IN_LIEU_VERSION == 26
@@ -1013,7 +1013,7 @@ def test_the_short_reasons_are_appended_last_and_the_version_is_the_next() -> No
         )
         assert (table, "reason") in schema.NULLABLE_JOURNAL_ENUMS
     assert schema._PRE_SHORT_REASONS_VERSION >= schema._PRE_PENDING_UNRESOLVED_VERSION + 1
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_BREAKS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 1
 
 
 def test_the_schema_docstring_names_the_short_reasons_version() -> None:
@@ -2220,7 +2220,7 @@ def test_v35_adjustments_migrate_to_merger_receipt() -> None:
         before = conn.execute("SELECT * FROM adjustments ORDER BY rowid").fetchall()
         schema.init_schema(conn)
         assert conn.execute("SELECT * FROM adjustments ORDER BY rowid").fetchall() == before
-        assert _versions(conn) == [35, 36, schema.CURRENT_SCHEMA_VERSION]
+        assert _versions(conn) == list(range(35, schema.CURRENT_SCHEMA_VERSION + 1))
         assert "'merger_receipt'" in _ddl(conn, "adjustments")
         conn.execute(
             "INSERT INTO adjustments (adjustment_id, window_id, session, kind, "
@@ -2342,14 +2342,14 @@ def test_one_schema_version_holds_every_break_change() -> None:
     """T280a takes one version, the next after T249b's, and the module docstring
     names what it adds."""
     assert schema._PRE_BREAKS_VERSION == schema._PRE_MERGER_RECEIPT_VERSION + 1
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_BREAKS_VERSION + 1
-    version = schema.CURRENT_SCHEMA_VERSION
+    assert schema._PRE_ASSETS_INTERSECTION_VERSION == schema._PRE_BREAKS_VERSION + 1
+    version = schema._PRE_BREAKS_VERSION + 1
     doc = schema.__doc__ or ""
     match = re.search(rf"\*\*Version {version}\*\*(.*?)(?:\n- \*\*|\Z)", doc, re.S)
     assert match is not None, f"no **Version {version}** paragraph"
     for name in ("reconcile_breaks", "breaks", "auto_true_up", "owner_true_up", "skip_restricted"):
         assert f"`{name}`" in match.group(1), name
-    assert f"version {version + 1}**" in doc
+    assert f"version {schema.CURRENT_SCHEMA_VERSION + 1}**" in doc
 
 
 def test_a_fresh_store_has_the_break_table_with_the_spec_columns(
@@ -2524,7 +2524,7 @@ def test_a_version_36_store_migrates_to_37_keeping_every_row() -> None:
         before = {t: _rows_in_insertion_order(conn, t) for t in widened}
         ddl_before = _all_ddl(conn)
         schema.init_schema(conn)
-        assert _versions(conn) == [36, schema.CURRENT_SCHEMA_VERSION]
+        assert _versions(conn) == list(range(36, schema.CURRENT_SCHEMA_VERSION + 1))
         assert {t: _rows_in_insertion_order(conn, t) for t in widened} == before
         ddl_after = _all_ddl(conn)
         assert set(ddl_after) == set(ddl_before) | {"reconcile_breaks"}
@@ -2537,7 +2537,7 @@ def test_a_version_36_store_migrates_to_37_keeping_every_row() -> None:
         again = _all_ddl(conn)
         schema.init_schema(conn)
         assert _all_ddl(conn) == again
-        assert _versions(conn) == [36, schema.CURRENT_SCHEMA_VERSION]
+        assert _versions(conn) == list(range(36, schema.CURRENT_SCHEMA_VERSION + 1))
     finally:
         conn.close()
 
