@@ -1279,8 +1279,8 @@ class RiskGatedBroker:
         kept: list[phases.PhaseOrder] = []
         skips: list[Skip] = []
         decimals = self._decimals()
-        # The name's own sells still open at the broker are shares already spoken for
-        # on both books, so they come off both sides of the limit.
+        # The name's own sells (a short's covers, below) still open at the broker are
+        # shares already spoken for on both books: they come off both sides of the limit.
         done = {e.client_order_id for e in book.events if e.status in TERMINAL_ORDER_STATUSES}
         open_covers: dict[str, float] = {}
         for o in book.orders:

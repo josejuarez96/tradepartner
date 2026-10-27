@@ -395,25 +395,56 @@ def test_planning_past_the_break_cap_plans_nothing(env_planning: planning_tests.
     assert env_planning.counts() == before
 
 
-def test_a_short_cover_is_cut_to_the_smaller_short_and_ignores_open_short_sells(
-    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Ledger short 10, broker short 6, an open short-opening sell of 4: the cover is
-    cut to 6 (the sell deepens the short and must not widen the limit)."""
+def _cover(
+    env: Env,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    broker: float,
+    open_cover: float = 0.0,
+) -> list[float | None]:
+    """Restrict a cover of 10 on a name the ledger is short 10 and the broker `broker`,
+    with an open short-opening sell of 4 and an open cover of `open_cover`."""
     from dataclasses import replace as _replace
+    from datetime import timedelta
 
     from tradepartner.execution.ledger import Ledger
     from tradepartner.execution.phases import PhaseOrder, PhaseOrders
+    from tradepartner.store.journal import OrderEventRow, OrderRow
 
     _append(env.settings, _break(env, A))
     gate = _gate(env, alerter_conn)
-    monkeypatch.setattr(env.fake, "positions", lambda: {SYMBOLS[A]: Position(SYMBOLS[A], -6.0)})
+    monkeypatch.setattr(env.fake, "positions", lambda: {SYMBOLS[A]: Position(SYMBOLS[A], broker)})
     _hold(env, A, 10.0)
     _open_sell(env, A, 4.0)  # a sell that, on a short, deepens it
+    if open_cover:
+        at = env.run.started_at - timedelta(hours=1)
+        decision = _decision(env, A, "buy", notional=1.0)
+        _append(
+            env.settings,
+            OrderRow(
+                client_order_id="fx-cover",
+                decision_id=decision.decision_id,  # type: ignore[arg-type]
+                run_id=env.earlier.run_id,
+                session=PREV,
+                attempt=1,
+                phase="buy",
+                security_id=A,
+                symbol=SYMBOLS[A],
+                side="buy",
+                quantity=open_cover,
+                position_side="short",
+                sells_in_flight_at_submit=False,
+                known_at=at,
+                ingested_at=at,
+            ),
+            OrderEventRow(
+                client_order_id="fx-cover", status="pending", known_at=at, ingested_at=at
+            ),
+        )
     book = gate._read_book(env.run, [_decision(env, A, "sell", quantity=1.0)])
     book = _replace(
-        book,
-        ledger=Ledger(positions={}, short_holdings={A: 10.0}, cash=0.0, through=S),
+        book, ledger=Ledger(positions={}, short_holdings={A: 10.0}, cash=0.0, through=S)
     )
     cover = PhaseOrder(
         decision_id=1,
@@ -426,4 +457,24 @@ def test_a_short_cover_is_cut_to_the_smaller_short_and_ignores_open_short_sells(
         position_side="short",
     )
     out = gate._restrict(env.run, book, PhaseOrders((cover,), (), session=S), S)
-    assert [o.quantity for o in out.orders] == [6.0]
+    return [o.quantity for o in out.orders]
+
+
+def test_a_short_cover_is_cut_to_the_smaller_short_and_ignores_open_short_sells(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ledger short 10, broker short 6, an open short-opening sell of 4: the cover is
+    cut to 6 (the sell deepens the short and must not widen the limit)."""
+    assert _cover(env, alerter_conn, monkeypatch, broker=-6.0) == [6.0]
+
+
+def test_an_open_cover_comes_off_both_sides_of_a_shorts_limit(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _cover(env, alerter_conn, monkeypatch, broker=-7.0, open_cover=4.0) == [3.0]
+
+
+def test_a_cover_the_open_cover_leaves_nothing_for_is_skipped(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _cover(env, alerter_conn, monkeypatch, broker=-3.0, open_cover=4.0) == []
