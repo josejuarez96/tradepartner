@@ -247,6 +247,14 @@ def test_oracle_family_refused_on_the_real_store_and_accepted_on_a_temp_file(
     assert _register(conn, settings, family="oracle").family == "oracle"
 
 
+def test_register_refuses_experiment_only_family(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """An experiment-only family (not engine-ready) is refused."""
+    with pytest.raises(registry.RegistryError, match="experiment-only"):
+        _register(conn, settings, family="filing_delay")
+
+
 # --- trials --------------------------------------------------------------
 
 
