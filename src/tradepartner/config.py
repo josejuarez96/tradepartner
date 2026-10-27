@@ -2494,6 +2494,10 @@ class UiConfig(_ClosedConfig):
     `store.writer_lock_retry_seconds` plus `kill_wait_margin_seconds` (interpreter
     start plus one retry delay). A set value must exceed that sum, or a kill still
     waiting on the store would be reported as not confirmed (`Settings`, at load).
+
+    The Lab's file listing (plan T289, #2319): `lab_message_chars` caps a parser
+    message the page shows; `lab_git_timeout_seconds` bounds each read-only git
+    call that decides a file's merged state.
     """
 
     next_run_time_et: str = "08:05"
@@ -2501,6 +2505,8 @@ class UiConfig(_ClosedConfig):
     max_reason_chars: int = Field(default=500, gt=0)
     kill_wait_seconds: int | None = Field(default=None, gt=0)
     kill_wait_margin_seconds: int = Field(default=30, gt=0)
+    lab_message_chars: int = Field(default=500, gt=0)
+    lab_git_timeout_seconds: int = Field(default=10, gt=0)
 
     @field_validator("next_run_time_et")
     @classmethod
