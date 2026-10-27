@@ -523,6 +523,21 @@ class _Ledger:
         if same_session_cil > removal_cash:
             raise LotLedgerError(f"merger {_describe(removal)} has CIL above its removal cash")
         boot = removal_cash - same_session_cil if kind == "stock_and_cash" else _ZERO
+        later_cash = sum((_cash(row) for row in cash_rows if row.quantity is None), _ZERO)
+        later_boot = _ZERO
+        if kind == "stock_and_cash" and "merger_cash_due" in terms:
+            # Later cash first completes the boot the merger owed; only the
+            # rest is cash in lieu of the fractional share.
+            due = _merger_number(terms["merger_cash_due"], removal, "merger_cash_due")
+            fraction_due = _merger_number(
+                terms.get("fractional_shares", 0), removal, "fractional_shares"
+            )
+            # With no fraction due, all later cash is boot (float rounding in
+            # the journaled amounts must not leave a stray CIL).
+            later_boot = (
+                later_cash if fraction_due <= _ZERO else min(later_cash, max(due - boot, _ZERO))
+            )
+            boot += later_boot
         if boot > _ZERO:
             price = _merger_number(terms.get("acquirer_price"), removal, "acquirer_price")
             if price <= _ZERO:
@@ -570,9 +585,8 @@ class _Ledger:
         merged.extend(held)
         merged.sort(key=lambda lot: (lot.trade_at, lot.lot_id))
         self.longs[target] = []
-        cil_cash = sum(
-            (_cash(row) for row in cash_rows if row.quantity is None),
-            removal_cash if kind == "stock" else same_session_cil,
+        cil_cash = (removal_cash if kind == "stock" else same_session_cil) + (
+            later_cash - later_boot
         )
         if cil_cash > _ZERO:
             fractional = _merger_number(
@@ -865,17 +879,39 @@ def _events(
         if row.kind == _CORPORATE_ACTION_CASH and row.quantity is not None
         if (merger_id := _merger_id(row)) is not None
     }
+    band_cash: dict[int, list[AdjustmentRow]] = {}
     for row in window:
         merger_id = _merger_id(row)
         if merger_id is not None and row.kind == _CORPORATE_ACTION_CASH:
             if row.quantity is None and merger_id not in quantity_removals:
-                raise LotLedgerError(f"merger cash {_describe(row)} has no merger removal row")
+                # A band removal (no merger id) is the merger's removal: its
+                # latest quantity row for the name on or before the cash.
+                band = max(
+                    (
+                        r
+                        for r in window
+                        if r.kind == _CORPORATE_ACTION_CASH
+                        and r.quantity is not None
+                        and r.quantity < 0
+                        and _merger_id(r) is None
+                        and r.security_id == row.security_id
+                        and r.session <= row.session
+                    ),
+                    key=lambda r: (r.session, _adjustment_key(r)),
+                    default=None,
+                )
+                if band is None:
+                    raise LotLedgerError(f"merger cash {_describe(row)} has no merger removal row")
+                band_cash.setdefault(id(band), []).append(row)
+                continue
             cash_rows.setdefault(merger_id, []).append(row)
     late = _late_delisting_cash(window)
     for row in window:
         if _is_late_delisting_cash(row):
             continue  # included with its removal's proceeds
-        action = _adjustment_event(row, removals, receipts, cash_rows, late.get(id(row), ()))
+        action = _adjustment_event(
+            row, removals, receipts, cash_rows, band_cash, late.get(id(row), ())
+        )
         if action is not None:
             rank = _RANK_CASH_IN_LIEU if row.kind == _CASH_IN_LIEU else _RANK_ADJUSTMENT
             events.append(((row.session, rank, *_adjustment_key(row)), action))
@@ -945,6 +981,7 @@ def _adjustment_event(
     removals: Mapping[str | None, AdjustmentRow],
     receipts: Mapping[str | None, AdjustmentRow],
     cash_rows: Mapping[str, Sequence[AdjustmentRow]],
+    band_cash: Mapping[int, Sequence[AdjustmentRow]],
     late: Sequence[AdjustmentRow] = (),
 ) -> _Event | None:
     """The ledger action an adjustment makes, or None when it has no lot effect
@@ -965,9 +1002,12 @@ def _adjustment_event(
         if merger is not None:
             cash_total = sum((_cash(cash_row) for cash_row in cash_rows[merger]), _ZERO)
             return partial(_Ledger.removal, row=row, cash_total=cash_total)
-        if late:
-            cash_total = _cash(row) + sum((_cash(r) for r in late), _ZERO)
-            return partial(_Ledger.removal, row=row, cash_total=cash_total)
+        # Later cash a removal takes into one disposal: a band removal's merger
+        # cash (#2164) and an ended listing's late cash (#411).
+        later_rows = [*(band_cash.get(id(row), ()) if row.quantity is not None else ()), *late]
+        if later_rows:
+            later = sum((_cash(cash_row) for cash_row in later_rows), _ZERO)
+            return partial(_Ledger.removal, row=row, cash_total=_cash(row) + later)
         return partial(_Ledger.removal, row=row)
     if row.kind == _MERGER_RECEIPT:
         if _merger_id(row) in removals:

@@ -45,10 +45,10 @@ def _with(settings: Settings, section: str, **updates: Any) -> Settings:
 #: SHA-256 over the twin's rebalance rows (each row's `columns()` plus its counts
 #: mapping, floats rounded to nine places), taken on `main` before the buffer landed.
 TWIN_REBALANCE_DIGESTS = {
-    0.0: "3d07ef6b4fda8ffc57e8810f4aa7828c42859dceea6c617e694f26af7533d502",
-    30.0: "669469ced894a1c17312c6c780b78aa963ac076e21d87b0ddedf65f199935b22",
-    60.0: "9f1933fcf739b90f34da472a14d4a28c0eb2ccd20eedd78e38ea206f4bdb3c84",
-    100.0: "54d4cb26ac2bc509a14092919460cc7740420e8477c6b5c7d86edf2573dacb88",
+    0.0: "370d2036996301482788e8fc7e828c0f3a8a9cc367142216a26f6863e68a2132",
+    30.0: "c56bd75a147a35b7433d6257b3c64eab6e6fcd2974fc527255f0c5a7ef506f60",
+    60.0: "a5e02f270f311f8238fd712f9309fa38b3032450d845732a2e71954269852163",
+    100.0: "f718f65ad10ce8c49e51891bdae66bf8d340496e1ffc254521b1b158fd05375e",
 }
 
 

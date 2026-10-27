@@ -424,39 +424,74 @@ def _order_due_threshold(
     return outcome_horizon(order, decision_rebalance, cadence)
 
 
-def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int, cadence: Cadence) -> CheckLine:
+def _chain_line(
+    conn: duckdb.DuckDBPyConnection,
+    window_id: int,
+    cadence: Cadence,
+    *,
+    now: datetime | None = None,
+    asof_fills: Mapping[str, Sequence[tuple[datetime, float]]] | None = None,
+) -> CheckLine:
     query = (
         "every order's chain (order -> terminal event -> outcome) once its "
         "outcome is due (spec req 8), and no live fill journaled after its "
         "order's terminal event (req 17)"
     )
-    orders = store_journal.orders_for(conn, window_id=window_id)
+    orders = [
+        o
+        for o in store_journal.orders_for(conn, window_id=window_id)
+        if now is None or o.known_at <= now
+    ]
+    order_ids = {o.client_order_id for o in orders}
     decisions = {
-        d.decision.decision_id: d.decision for d in store_journal.decisions_for(conn, window_id)
+        d.decision.decision_id: d.decision
+        for d in store_journal.decisions_for(conn, window_id)
+        if now is None or d.decision.known_at <= now
     }
     run_sessions = sorted(
-        r.run.session for r in store_journal.runs_for(conn, window_id) if r.run.session is not None
+        r.run.session
+        for r in store_journal.runs_for(conn, window_id)
+        if r.run.session is not None and (now is None or r.run.known_at <= now)
     )
-    open_ids = {
-        o.client_order_id for o in store_journal.non_terminal_orders(conn, window_id=window_id)
-    }
+    open_ids = (
+        {o.client_order_id for o in store_journal.non_terminal_orders(conn, window_id=window_id)}
+        if now is None
+        else set()
+    )
     terminal: dict[str, str] = {}
     terminal_at: dict[str, datetime] = {}
     for event in sorted(
         store_journal.order_events_for(conn, window_id=window_id),
         key=lambda e: (e.known_at, e.ingested_at),
     ):
+        if now is not None and event.known_at > now:
+            continue
         if event.status in store_journal.TERMINAL_ORDER_STATUSES:
             terminal.setdefault(event.client_order_id, event.status)
             terminal_at.setdefault(event.client_order_id, event.known_at)
     filled: dict[str, float] = {}
     late: set[str] = set()
-    for item in store_journal.fills_for(conn, window_id=window_id):
-        coid = item.fill.client_order_id
-        filled[coid] = filled.get(coid, 0.0) + item.fill.quantity
-        if coid in terminal_at and item.fill.known_at > terminal_at[coid]:
+    fill_rows = (
+        (
+            (item.fill.client_order_id, item.fill.known_at, item.fill.quantity)
+            for item in store_journal.fills_for(conn, window_id=window_id)
+        )
+        if asof_fills is None
+        else ((coid, at, quantity) for coid, rows in asof_fills.items() for at, quantity in rows)
+    )
+    for coid, at, quantity in fill_rows:
+        if asof_fills is not None and coid not in order_ids:
+            continue
+        if now is not None and at > now:
+            continue
+        filled[coid] = filled.get(coid, 0.0) + quantity
+        if coid in terminal_at and at > terminal_at[coid]:
             late.add(coid)
-    written = {(o.client_order_id, o.kind) for o in store_journal.outcomes_for(conn, window_id)}
+    written = {
+        (o.client_order_id, o.kind)
+        for o in store_journal.outcomes_for(conn, window_id)
+        if now is None or o.known_at <= now
+    }
 
     incomplete: list[str] = []
     for order in sorted(orders, key=lambda o: o.client_order_id):
@@ -490,7 +525,12 @@ def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int, cadence: Cadenc
 
 
 def _override_line(
-    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, window_id: int, frozen: dict[str, Any]
+    conn: duckdb.DuckDBPyConnection,
+    window: PaperWindowRow,
+    window_id: int,
+    frozen: dict[str, Any],
+    *,
+    now: datetime | None = None,
 ) -> CheckLine:
     query = "overrides.reason, trimmed, against the frozen paper.min_override_reason_chars"
     min_chars = _int_key(window, frozen, _PAPER_MIN_OVERRIDE_REASON_CHARS)
@@ -499,6 +539,7 @@ def _override_line(
         f"{len(o.override.reason.strip())} char(s), need >= {min_chars}"
         for o in store_journal.overrides_for(conn, window_id)
         if len(o.override.reason.strip()) < min_chars
+        and (now is None or o.override.known_at <= now)
     ]
     passed = not violations
     detail = "every override reason meets the frozen minimum" if passed else "; ".join(violations)

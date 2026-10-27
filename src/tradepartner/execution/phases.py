@@ -92,7 +92,9 @@ listing ended at close(S-1) (`ended`) is skipped as `skip_delisted` before
 sizing, so it takes no share of the other buys' scaling, instead of being
 sized in and only then dropped by `risk.check_phase` (#604). A buy whose
 attempt falls below the minimum is **deferred** (its id in `deferred`, no skip
-row, no cap count); a name not `tradable` is `skip_untradable`. A buy of a
+row, no cap count); with `risk.small_account` on, a long non-fractionable buy
+below one buffered share instead gets `skip_not_fractionable` before sizing and
+counts toward the skip cap. A name not `tradable` is `skip_untradable`. A buy of a
 name the sells phase ordered or skipped, or whose sell decision is in flight,
 raises `ValueError` (#518). The scale is
 capped at 1 against the buys' remainders, so cash beyond the targets (a forced
@@ -152,6 +154,7 @@ _WHOLE_HOLDING_REASONS = frozenset({DELISTED_REASON, UNTARGETED_RECEIPT_REASON})
 _DUST = "dust"
 _UNTRADABLE = "untradable"
 _SKIP_UNTRADABLE = "skip_untradable"
+_SKIP_NOT_FRACTIONABLE = "skip_not_fractionable"
 _SKIP_BELOW_ONE_SHARE = "skip_below_one_share"
 _SKIP_BELOW_MINIMUM = "skip_below_minimum"
 _SKIP_DELISTED = "skip_delisted"
@@ -690,7 +693,24 @@ def buy_orders(
         if not asset.tradable:
             skips.append(Skip(_id(decision), sid, _SKIP_UNTRADABLE))
             continue
-        lost = True if not asset.fractionable else None
+        if (
+            frozen.small_account.enabled
+            and decision.position_side == LONG
+            and not asset.fractionable
+            and attempt.remainder.notional > 0
+            and Decimal(repr(attempt.remainder.notional))
+            < Decimal(repr(_price(price_of, sid)))
+            * (1 + Decimal(repr(frozen.whole_share_price_buffer)))
+        ):
+            skips.append(Skip(_id(decision), sid, _SKIP_NOT_FRACTIONABLE))
+            continue
+        lost = (
+            True
+            if not asset.fractionable
+            else False
+            if frozen.small_account.enabled and decision.position_side == LONG
+            else None
+        )
         to_size.append(BuyToSize(decision, attempt.remainder, whole_share=lost))
 
     sizing_of = {_id(b.decision): b for b in to_size}
@@ -708,6 +728,9 @@ def buy_orders(
         cash = float(max(Decimal(repr(float(cash))) - short_value, Decimal(0)))
     for sizing in size_buys(to_size, cash, price_of, frozen, costs):
         decision = sizing_of[sizing.decision_id].decision
+        if sizing.skip_below_minimum:
+            skips.append(Skip(sizing.decision_id, sizing.security_id, _SKIP_BELOW_MINIMUM))
+            continue
         if sizing.deferred:
             deferred.append(sizing.decision_id)
             continue

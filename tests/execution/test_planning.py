@@ -1420,7 +1420,7 @@ def test_a_screened_momentum_plan_journals_no_turnover_signals_and_counts(
 H1_PAPER_ROWS = {
     "signals": (6, "31f4d58d4188196ec5fe48cde2df02d5f61ce21325a2b6cb641dbfc6dbd29f04"),
     "decisions": (5, "e2f38d001a59a863c63aedf09d7311c5e1796df3e451b6351b69b649554ae7d4"),
-    "paper_plans": (1, "c6d327ddf9ce1660fac83ba6addca3434d6a9399707bf9d51e3887f78364fc03"),
+    "paper_plans": (1, "cd35c19371b28913c9fe7a279b2cec54126710bde8aeb02e9dc3c8701d00372a"),
 }
 
 

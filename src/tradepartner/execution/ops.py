@@ -1562,14 +1562,15 @@ def _waiting_span(conn: duckdb.DuckDBPyConnection, now: datetime) -> waiting.Spa
     """The open shakedown span's candidate alerts, or None with no `shakedown_span`
     row. Every book's alerts count (the shakedown judges every book), each read at
     or before `now`; the noted ids are `shakedown._noted_alerts`'s, imported."""
-    if registry.shakedown_span(conn) is None:
+    if registry.shakedown_span(conn, now=now) is None:
         return None
     span = shakedown.read_span(conn, now)
     book_column = "book_id" if _alerts_have_book(conn) else f"'{DEFAULT_BOOK_ID}'"
     rows = conn.execute(
         f'SELECT alert_id, {book_column}, kind, session, "at" FROM alerts '
-        'WHERE list_contains(?, kind) AND "at" >= ? AND "at" <= ? ORDER BY alert_id',
-        [list(waiting.NOTED_ALERT_KINDS), span.start_at, now],
+        'WHERE list_contains(?, kind) AND "at" >= ? AND "at" <= ? '
+        "AND known_at <= ? ORDER BY alert_id",
+        [list(waiting.NOTED_ALERT_KINDS), span.start_at, now, now],
     ).fetchall()
     return waiting.SpanFacts(
         start_at=span.start_at,
@@ -1577,7 +1578,7 @@ def _waiting_span(conn: duckdb.DuckDBPyConnection, now: datetime) -> waiting.Spa
             waiting.SpanAlert(alert_id=r[0], book_id=r[1], kind=r[2], session=r[3], at=r[4])
             for r in rows
         ),
-        noted=frozenset(shakedown._noted_alerts(conn)),
+        noted=frozenset(shakedown._noted_alerts(conn, now)),
         now=now,
     )
 
@@ -1590,7 +1591,7 @@ def _waiting_shakedown(
     window's `frozen_json` without a tolerance E.3 needs, or a defect) becomes the
     facts' `error`, so it never hides the books' own items; the schema gates
     (`SchemaVersionError`, `JournalNotInitialised`) still raise as before."""
-    if registry.shakedown_span(conn) is None:
+    if registry.shakedown_span(conn, now=now) is None:
         return None
     try:
         result = shakedown.shakedown(conn, settings, now=now, check_health=False)

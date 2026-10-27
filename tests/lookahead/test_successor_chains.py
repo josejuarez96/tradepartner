@@ -647,3 +647,72 @@ def test_a_spin_off_of_a_chained_parent_adjusts_the_successors_early_bars() -> N
                 assert close == pytest.approx(100.0 * 0.9, abs=1e-12)
     finally:
         conn.close()
+
+
+# --- a spin-off row's parent reference across the chain (#2127) -----------------------
+
+#: The child of the stored spin-off: not itself chained, so only the row's parent
+#: reference (`source_action_id`) is re-keyed, never the child's own id.
+_SPIN_CHILD = "0001000017"
+#: The spin-off's stored stamp: before the 1:1 chain's `known_at`, so the row is
+#: known to both the chained and the unchained read.
+_SPIN_KNOWN = datetime.fromisoformat("2019-12-26T21:00:00+00:00")
+
+
+def _store_spinoff_of_a_chained_parent(conn: duckdb.DuckDBPyConnection) -> None:
+    """A stored `spinoff` row: child `_SPIN_CHILD`, parent `_PREDECESSOR` (the
+    chained predecessor of the fixture's 1:1 pair), ratio 0.4, ex-date
+    2019-12-27, known `_SPIN_KNOWN` (#2127)."""
+    insert_row(
+        conn,
+        "corporate_actions",
+        {
+            "security_id": _SPIN_CHILD,
+            "action_type": "spinoff",
+            "ex_date": date(2019, 12, 27),
+            "ratio_or_amount": 0.4,
+            "announced_at": None,
+            "source_action_id": _PREDECESSOR,
+            "cancelled": False,
+            "known_at": _SPIN_KNOWN,
+            "ingested_at": _SPIN_KNOWN,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
+
+
+def _spinoff_row(conn: duckdb.DuckDBPyConnection, t: datetime) -> dict[str, object]:
+    frame = live_actions_as_of(conn, t).filter(
+        (pl.col("security_id") == _SPIN_CHILD) & (pl.col("action_type") == "spinoff")
+    )
+    assert frame.height == 1
+    return frame.row(0, named=True)
+
+
+def test_a_spin_off_of_a_chained_parent_re_keys_the_parent_reference(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#2127: a spin-off stores its parent in `source_action_id`, a security id.
+    When that parent is a chained predecessor the chained read re-keys the
+    reference to the successor (#821), the id a chained reader holds the
+    position under; the child's own id and the ratio are unchanged."""
+    _store_spinoff_of_a_chained_parent(chain_fixture_store)
+    row = _spinoff_row(chain_fixture_store, _AFTER)
+    assert row["source_action_id"] == _SUCCESSOR
+    assert row["security_id"] == _SPIN_CHILD
+    assert row["ratio_or_amount"] == 0.4
+    assert row["ex_date"] == date(2019, 12, 27)
+
+
+def test_a_spin_off_before_the_chain_is_known_keeps_the_stored_parent(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """No look-ahead (#2127): before the chain's `known_at` the spin-off's parent
+    reference is the stored predecessor, never the successor; the read sees two
+    securities exactly as it did before the chain was known."""
+    _store_spinoff_of_a_chained_parent(chain_fixture_store)
+    assert live_chains(chain_fixture_store, _CHAIN_KNOWN_AT - PROBE_EPSILON) == ()
+    row = _spinoff_row(chain_fixture_store, _CHAIN_KNOWN_AT - PROBE_EPSILON)
+    assert row["source_action_id"] == _PREDECESSOR
+    assert row["security_id"] == _SPIN_CHILD

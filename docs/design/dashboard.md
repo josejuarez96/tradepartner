@@ -70,7 +70,7 @@ Interaction defaults: every chart with a plot has a hover layer; hit targets are
 
 ## Navigation (T274, #2170)
 
-The shell is a **top navigation**: `Home`, `Research`, `Books`, then a `Details` drop-down holding today's pages (Data health, Backtest, Trial registry, Operations, Trades, Performance, Override). Home is the default page. It replaces the sidebar radio; each page keeps drawing from the shell's one read-only connection (`render(conn)`; Home and Books take `render(conn, settings)`). Research is the existing developer view of registrations and runs, unchanged; a real Research workspace is a later amendment. Home and Books are placeholders ("Coming next") until T275 and T276.
+The shell is a **top navigation**: `Home`, `Research`, `Books`, then a `Details` drop-down holding today's pages (Data health, Backtest, Trial registry, Operations, Trades, Performance, Override). Home is the default page. It replaces the sidebar radio; each page keeps drawing from the shell's one read-only connection (`render(conn)`; Home and Books take `render(conn, settings)`). Research is the existing developer view of registrations and runs, unchanged; a real Research workspace is a later amendment. Home and Books are placeholders ("Coming next") until T275 and T276. **Lab** (planned, T294 to T296, #2304) is a top tab after Research: the checkout's sweep and hypothesis files with their registry and git state, Register and Run as confirms that state the consequence in the method's terms (the file freezes; N and SR\* rise), a status card, and the result read thresholds first, then the result against them, then the rule's verdict, each quant term with an ⓘ.
 
 ## Home and Book looks (approved by the owner, 2026-10-26)
 
@@ -88,6 +88,7 @@ The shell is a **top navigation**: `Home`, `Research`, `Books`, then a `Details`
 | 4 (T274 to T276) | Home, Books | see "Home and Book looks" | the book against SPY | Needs you, book cards, Today, holdings |
 | 4 (T259) | Trades | orders, filled, notional traded, the session's notional-weighted slippage (bp) | per-order slippage bars against the session's open, adverse positive, the largest in the accent | the order table (ticker, side, shares, fill price, status, slippage, reason; signal rank in the tooltip); a book and a session selector in the filter row |
 | 4 (T252) | Performance | equity, cumulative return, daily P&L, versus SPY | equity curve rebased to 100 at the base session: the book (accent), SPY (muted, dashed), the tracking trial's line over its own span once `paper report` has run | daily P&L bars (latest day in the accent); the tracking state: `not yet`, `report due` or the trial line; a `benchmark unavailable` chip when SPY has no bar; a book selector when more than one book has a window |
+| 4 (T294 to T296) | Lab | the family's N, SR\* today, the holdout's state, the run slot | the selected sweep's pre-registered thresholds, then its variants against them | the file listing with registry and git state; Register and Run confirms; the status card; the rule's verdict and "how it was computed" |
 | 6 | Review | calibration, loss attribution, override count | paper versus backtest drift | override log with outcomes; attribution table |
 
 ## Streamlit implementation notes
@@ -101,7 +102,7 @@ The shell is a **top navigation**: `Home`, `Research`, `Books`, then a `Details`
 
 ## What stays out
 
-Chat assistants, "AI insight" cards, upgrade or promotional banners, user avatars and notifications (single owner, local), live-streaming widgets, and any widget that writes to the store other than the override form. If a mock shows it and this list names it, it is out.
+Chat assistants, "AI insight" cards, upgrade or promotional banners, user avatars and notifications (single owner, local), live-streaming widgets, and any widget that writes to the store other than the override form and the three that run the desk's own command as a child process (ADR 0018 sections 2 and B to C): the Book page's "Stop this book now" (`paper kill`, T277) and the Lab's Register (`sweep register`) and Run (`sweep run`, `backtest`). If a mock shows it and this list names it, it is out.
 
 ## Open decision, closed (formerly "Open decision, deferred")
 

@@ -152,3 +152,19 @@ def test_before_the_first_snapshot_nothing_is_intersected_and_the_skip_is_record
     # The later (smaller) tradable list never shrinks the earlier universe.
     assert u.members.height > after.members.height
     assert set(after.members["security_id"]) <= set(u.members["security_id"])
+
+
+def test_an_assets_revision_known_after_t_changes_neither_intersection_value_at_t(
+    fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
+) -> None:
+    """The record is read at `t` from the rows known at `t`: the same read on the store
+    truncated to `t` (every assets row known after it dropped) gives the same two
+    values, and the case is not vacuous — the first snapshot, known between the two
+    probes, flips the skip and the checked count (plan T241)."""
+    before = universe_as_of(fixture_store, _T_BEFORE, _SETTINGS)
+    cut = universe_as_of(truncated.at(_T_BEFORE), _T_BEFORE, _SETTINGS)
+    after = universe_as_of(fixture_store, _T_AFTER, _SETTINGS)
+    assert (before.n_assets_intersected, before.assets_intersection_skipped) == (0, True)
+    assert (cut.n_assets_intersected, cut.assets_intersection_skipped) == (0, True)
+    # Three kept companies hold four classes between them before the snapshot.
+    assert (after.n_assets_intersected, after.assets_intersection_skipped) == (4, False)
