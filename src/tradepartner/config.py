@@ -1351,7 +1351,7 @@ class CoverageConfig(_ClosedConfig):
 # for the deflated Sharpe, so a family cannot be invented by config: adding one is a
 # reviewed code change here. `oracle` is refused on the real store (registry, T31b). A
 # test pins `get_args(HypothesisFamily) == tuple(FAMILIES)` (ADR 0014 point 2).
-HypothesisFamily = Literal["momentum", "oracle", "profitability", "combined"]
+HypothesisFamily = Literal["momentum", "oracle", "profitability", "combined", "filing_delay"]
 
 # Cadence and signal anchor (strategy-lab spec, "Config keys"; ADR 0012, superseding
 # ADR 0006's Cadence section): frozen per hypothesis like the universe, beside
@@ -1574,6 +1574,20 @@ class PortfolioConfig(_ClosedConfig):
 #
 # `oracle` is a test-only entry that reads momentum's `strategy` section (as today), so
 # it is left out of `FAMILY_PARENTS` and `FAMILY_SIGNAL_SECTIONS` as it is today.
+# `filing_delay` is experiment-only: `sections=()`, so it has no signal section and is left
+# out of `FAMILY_SIGNAL_SECTIONS`, but it keeps its `FAMILY_PARENTS` entry (a root).
+
+
+class FilingDelayConfig(BaseModel):
+    """The `filing_delay` family's parameter section: empty on purpose (#2353).
+
+    `filing_delay` is an experiment-only root family: the C1 filing-delay event study runs
+    as an external script under the research registry (`docs/experiments/`), never through
+    the backtest engine, so it has no `Settings` section and no frozen keys. The class
+    exists because every `FamilySpec` names a params model.
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
 
 
 @dataclass(frozen=True)
@@ -1689,6 +1703,23 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         benchmark="MTUM",
         sweepable_keys=(),
     ),
+    "filing_delay": FamilySpec(
+        # An experiment-only root family (#2353; owner decision 2026-10-27): it gives the C1
+        # filing-delay experiment (`docs/experiments/c1-filing-delay.md`) a family of its own
+        # so its configurations count in `filing_delay`'s N, not B4's (`combined`, a child of
+        # `momentum`). It has no signal (`backtest/strategies.py`), so the engine and paper
+        # refuse it (`engine_ready` / `paper_ready` False), and it has no sweepable keys.
+        # No parameter section and no frozen keys: nothing for the engine to freeze.
+        sections=(),
+        params_model=FilingDelayConfig,
+        parent=None,
+        engine_ready=False,
+        paper_ready=False,
+        exclusion_reasons=(),
+        count_names=(),
+        benchmark=None,
+        sweepable_keys=(),
+    ),
 }
 
 
@@ -1709,7 +1740,9 @@ FAMILY_PARENTS: dict[HypothesisFamily, HypothesisFamily | None] = {
 # Each family's own signal section (first of its listed sections). `oracle` reads
 # momentum's `strategy` section, so it is left out as today (`backtest/frozen.py`).
 FAMILY_SIGNAL_SECTIONS: dict[HypothesisFamily, str] = {
-    family: spec.sections[0] for family, spec in FAMILIES.items() if family != "oracle"
+    family: spec.sections[0]
+    for family, spec in FAMILIES.items()
+    if family != "oracle" and spec.sections
 }
 
 # The families the engine can run today (#1053, folded into T85 by owner decision

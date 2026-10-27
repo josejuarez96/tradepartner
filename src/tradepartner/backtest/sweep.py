@@ -440,6 +440,10 @@ def parse_sweep_file(path: Path, settings: Settings | None = None) -> SweepFile:
             f"{path}: family {family!r} is not one of hypotheses.families "
             f"({', '.join(settings.hypotheses.families)})"
         )
+    if not config.FAMILIES[family].sections:
+        raise SweepFileError(
+            f"{path}: family {family!r} is experiment-only (no signal); a sweep cannot run it"
+        )
     parent = flat.get("parent_family")
     if parent is not None and not (isinstance(parent, str) and parent.strip()):
         raise SweepFileError(f"{path}: parent_family must be a non-empty string")
