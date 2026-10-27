@@ -593,7 +593,7 @@ class AlpacaBroker(Broker):
         return Fill(
             client_order_id=owners[broker_order_id],
             symbol=activity["symbol"],
-            side=Side(activity["side"]),
+            side=_activity_side(activity["side"]),
             quantity=_number(activity["qty"]),
             price=_number(activity["price"]),
             filled_at=_instant(activity["transaction_time"]),
@@ -620,6 +620,25 @@ class AlpacaBroker(Broker):
         return coid
 
 
+#: Alpaca's account-activity `side` strings (#2163). A short sale reports
+#: `sell_short`; it is a sell to `Side`, which carries no position side (the
+#: short book's intent lives in the plan, and the position's sign in `positions`).
+#: A cover reports a plain `buy`. The docs list only `buy` and `sell`, but the
+#: sandbox probes (2026-10-19 and 2026-10-20, AAPL, 1 share and 0.5 + 0.5 covers)
+#: recorded `sell_short` opens and plain `buy` covers, never `buy_to_cover`
+#: (docs/research/2026-10-19-alpaca-sandbox-probe.md and the scrubbed rows in
+#: tests/fixtures/alpaca/paper/short_fills.json). Any other string,
+#: `buy_to_cover` included, is unclassified and faults (fail closed).
+_ACTIVITY_SIDES = {"buy": Side.BUY, "sell": Side.SELL, "sell_short": Side.SELL}
+
+
+def _activity_side(value: Any) -> Side:
+    """The `Side` of a fill activity's `side` string, or `ValueError`."""
+    if not isinstance(value, str) or value not in _ACTIVITY_SIDES:
+        raise ValueError(f"fill activity side {value!r} is not classified")
+    return _ACTIVITY_SIDES[value]
+
+
 def _fold_correction(activity: Mapping[str, Any], fills: list[Fill], order_ids: list[Any]) -> None:
     """Fold a negative-quantity fill row into its order's latest earlier row in
     `fills`, in place (#2149). Raise `ValueError` (mapped to `SystemFaultError`)
@@ -641,7 +660,7 @@ def _fold_correction(activity: Mapping[str, Any], fills: list[Fill], order_ids: 
             f"fill correction {activity['id']!r} symbol {activity['symbol']!r} "
             f"disagrees with {corrected.symbol!r}"
         )
-    if activity["side"] != corrected.side.value:
+    if _activity_side(activity["side"]) != corrected.side:
         raise ValueError(
             f"fill correction {activity['id']!r} side {activity['side']!r} "
             f"disagrees with {corrected.side.value!r}"

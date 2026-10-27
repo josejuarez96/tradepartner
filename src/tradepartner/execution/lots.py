@@ -118,6 +118,10 @@ _CARRIED_RESIDUE = "carried_residue"
 #: The `explanation_json` key both rows of a stock merger name (paper spec
 #: amendment #1762 item 5).
 _MERGER_KEY = "merger_id"
+#: The `explanation_json` key of a delisting's late cash (#411): a cash-only
+#: `corporate_action_cash` row that is part of the proceeds of the ended-listing
+#: removal row before it.
+_DELISTING_KEY = "delisting_cash"
 
 
 class LotLedgerError(ValueError):
@@ -749,6 +753,28 @@ def _adjustment_key(row: AdjustmentRow) -> tuple[object, ...]:
     )
 
 
+def _run(
+    fills: Sequence[OrderedFill],
+    orders: Sequence[OrderRow],
+    assets: Mapping[str, Asset],
+    account: LedgerAccount,
+    adjustments: Sequence[AdjustmentRow],
+    actions: pl.DataFrame | None,
+    through: date | None,
+    symbols: Mapping[str, str] | None,
+) -> _Ledger:
+    for order in orders:
+        if order.position_side not in (LONG, SHORT):
+            raise LotLedgerError(
+                f"order {order.client_order_id!r} has position_side "
+                f"{order.position_side!r}: only 'long' and 'short' lots exist"
+            )
+    state = _Ledger(account, assets, symbols or {})
+    for _, event in sorted(_events(fills, orders, adjustments, actions, through), key=_by_key):
+        event(state)
+    return state
+
+
 def rebuild(
     fills: Sequence[OrderedFill],
     orders: Sequence[OrderRow],
@@ -781,15 +807,7 @@ def rebuild(
     must catch it and alert rather than fail its run. Also raises it on any
     order whose `position_side` is neither `schema.LONG` nor `SHORT`, and on
     a name that would be long and short at once (module docstring)."""
-    for order in orders:
-        if order.position_side not in (LONG, SHORT):
-            raise LotLedgerError(
-                f"order {order.client_order_id!r} has position_side "
-                f"{order.position_side!r}: only 'long' and 'short' lots exist"
-            )
-    state = _Ledger(account, assets, symbols or {})
-    for _, event in sorted(_events(fills, orders, adjustments, actions, through), key=_by_key):
-        event(state)
+    state = _run(fills, orders, assets, account, adjustments, actions, through, symbols)
     lot_list = [lot.to_lot(account) for lot in state.lots]
     return (
         lot_list,
@@ -887,12 +905,55 @@ def _events(
                 band_cash.setdefault(id(band), []).append(row)
                 continue
             cash_rows.setdefault(merger_id, []).append(row)
+    late = _late_delisting_cash(window)
     for row in window:
-        action = _adjustment_event(row, removals, receipts, cash_rows, band_cash)
+        if _is_late_delisting_cash(row):
+            continue  # included with its removal's proceeds
+        action = _adjustment_event(
+            row, removals, receipts, cash_rows, band_cash, late.get(id(row), ())
+        )
         if action is not None:
             rank = _RANK_CASH_IN_LIEU if row.kind == _CASH_IN_LIEU else _RANK_ADJUSTMENT
             events.append(((row.session, rank, *_adjustment_key(row)), action))
     return events
+
+
+def _is_late_delisting_cash(row: AdjustmentRow) -> bool:
+    """Whether `row` is a delisting's late cash: a cash-only `corporate_action_cash`
+    row marked `delisting_cash` and naming no merger (#411)."""
+    return (
+        row.kind == _CORPORATE_ACTION_CASH
+        and row.quantity is None
+        and _merger_id(row) is None
+        and _explanation(row).get(_DELISTING_KEY) is True
+    )
+
+
+def _late_delisting_cash(window: Sequence[AdjustmentRow]) -> dict[int, list[AdjustmentRow]]:
+    """Each ended-listing removal row (by `id`) to the late cash rows of its name
+    that follow it, so the removal disposes the lots at the whole proceeds (#411).
+    A late row goes to the latest removal of its name stated on or before its
+    session; one with none raises."""
+    removals: dict[str, list[AdjustmentRow]] = {}
+    for row in window:
+        if (
+            row.kind == _CORPORATE_ACTION_CASH
+            and row.quantity is not None
+            and row.quantity < 0
+            and _merger_id(row) is None
+            and row.security_id is not None
+        ):
+            removals.setdefault(row.security_id, []).append(row)
+    found: dict[int, list[AdjustmentRow]] = {}
+    for row in window:
+        if not _is_late_delisting_cash(row):
+            continue
+        earlier = [r for r in removals.get(row.security_id or "", []) if r.session <= row.session]
+        if not earlier:
+            raise LotLedgerError(f"delisting cash {_describe(row)} has no removal row")
+        target = max(earlier, key=lambda r: (r.session, r.adjustment_id or 0))
+        found.setdefault(id(target), []).append(row)
+    return found
 
 
 def _by_merger(
@@ -921,6 +982,7 @@ def _adjustment_event(
     receipts: Mapping[str | None, AdjustmentRow],
     cash_rows: Mapping[str, Sequence[AdjustmentRow]],
     band_cash: Mapping[int, Sequence[AdjustmentRow]],
+    late: Sequence[AdjustmentRow] = (),
 ) -> _Event | None:
     """The ledger action an adjustment makes, or None when it has no lot effect
     (a dividend, a fee) or is half of a merger the removal row carries out."""
@@ -940,8 +1002,11 @@ def _adjustment_event(
         if merger is not None:
             cash_total = sum((_cash(cash_row) for cash_row in cash_rows[merger]), _ZERO)
             return partial(_Ledger.removal, row=row, cash_total=cash_total)
-        if row.quantity is not None and id(row) in band_cash:
-            later = sum((_cash(cash_row) for cash_row in band_cash[id(row)]), _ZERO)
+        # Later cash a removal takes into one disposal: a band removal's merger
+        # cash (#2164) and an ended listing's late cash (#411).
+        later_rows = [*(band_cash.get(id(row), ()) if row.quantity is not None else ()), *late]
+        if later_rows:
+            later = sum((_cash(cash_row) for cash_row in later_rows), _ZERO)
             return partial(_Ledger.removal, row=row, cash_total=_cash(row) + later)
         return partial(_Ledger.removal, row=row)
     if row.kind == _MERGER_RECEIPT:
@@ -1114,3 +1179,45 @@ def _fill_key(item: OrderedFill) -> int:
 def _dec(value: float) -> Fraction:
     """`value` as the exact `Fraction` of its shortest decimal form."""
     return Fraction(repr(float(value)))
+
+
+@dataclass(frozen=True)
+class OpenLot:
+    """What one lot still holds, as the ledger holds it (#2247): `quantity` in
+    today's share units, `basis` the open cost basis (negative for a short lot,
+    as `Lot.cost_basis` is), under the lot's current `security_id`."""
+
+    lot_id: int
+    security_id: str
+    position_side: str
+    quantity: float
+    basis: float
+
+
+def open_lots(
+    fills: Sequence[OrderedFill],
+    orders: Sequence[OrderRow],
+    assets: Mapping[str, Asset],
+    account: LedgerAccount,
+    *,
+    adjustments: Sequence[AdjustmentRow] = (),
+    actions: pl.DataFrame | None = None,
+    through: date | None = None,
+    symbols: Mapping[str, str] | None = None,
+) -> list[OpenLot]:
+    """The lots with shares still open after the same rebuild `rebuild` runs
+    (same arguments, same errors), read-only: the ledger's own running quantity
+    and basis, so a stock merger's boot or cash in lieu, which lowers a lot's
+    basis and records a disposal for it, is counted once."""
+    state = _run(fills, orders, assets, account, adjustments, actions, through, symbols)
+    return [
+        OpenLot(
+            lot_id=lot.lot_id,
+            security_id=lot.security_id,
+            position_side=lot.position_side,
+            quantity=float(lot.quantity),
+            basis=float(lot.basis),
+        )
+        for lot in state.lots
+        if lot.quantity > _ZERO
+    ]

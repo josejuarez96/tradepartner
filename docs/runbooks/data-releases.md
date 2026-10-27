@@ -4,7 +4,7 @@ For the post-T162 sequence of releases and paper-window handoff, use the [one da
 
 Owner-run, on the real store. Agents never change the owner's store. Plan task T140 ([#1325](https://github.com/josejuarez96/tradepartner/issues/1325), plan amendment [#1319](https://github.com/josejuarez96/tradepartner/issues/1319)). The owner accepted the policy on [#1303](https://github.com/josejuarez96/tradepartner/issues/1303).
 
-Until T140b adds a store kind for it, the record is a hand-written TOML file. Start recording now. Nothing here waits for T140b.
+The record of each release lives in the store, as `data_release` rows of the `owner_decisions` table. You write it with `uv run tradepartner decision data-release open | close | record` (plan task T140b, built; `store/registry.py`, `cli.py`). The hand-written `data/releases.toml` of the early releases is the legacy format: import it once with `decision data-release import-file` (see "The record").
 
 ## Why
 
@@ -16,19 +16,26 @@ A repair that changes stored rows changes what a backtest reads. The trials alre
 ## The rule
 
 1. **Every row-changing repair on the owner's store is one named release.** This covers `repair-resolution` (a real run), `master-retract`, `repair-bars` (T140c) and any hand fix that inserts, updates or deletes rows. The nightly `ingest` is not a release.
-2. **Before it:** run `uv run tradepartner store backup`, then write a `before` record naming its printed copy path.
-3. **After it:** write an `after` record, with the sessions the repair touched.
+2. **Before it:** run `uv run tradepartner store backup`, then `decision data-release open` with its printed copy path.
+3. **After it:** `decision data-release close`, with the sessions the repair touched.
 4. **One batch per release.** Do every fix the release is for, in one sitting, then close it. Do not open a second release while one is open.
 5. **Paper windows are off limits.** Once T71 starts, no release touches a session inside an open paper window. The daily ingest is the only writer there (#1303 accepted policy; [ADR 0016](../decisions/0016-development-boundary-and-forward-exams.md), point 7). A forward exam compares the paper book with a backtest recomputed from the store, so a repair there would move the exam with no change in the book.
    **One exception (2026-10-11, #1497, owner-approved; [ADR 0016](../decisions/0016-development-boundary-and-forward-exams.md) point 7 carries the note).** A filing stamp inside the window may be corrected **earlier**, to the time its SGML header gives, by at most New York's offset (a stamp the SEC's API served late), when a read-only pre-check shows that no paper decision read the row. The pre-check is `scripts/restamp_precheck.py` (data-foundation plan, amendment 2026-10-11, decision (d), which defines it): the open windows, every instant a paper run of any kind read the store at (each window's `started_at`, `close(S-1)` and `close(S)` of each run, the plans' `data_cutoff`, the reports' `close(through_session)`, a standalone reconciliation's `close(S-1)`), and the rows the release could move; it passes when there is no such instant, or when no candidate row has `known_at` within 5 h after one. The reach check also covers rows dated before the window's first session (#1524): a run on the first session reads at `close(S-1)`, and a window started on a non-session day has a `started_at` before it. Keep its output, `precheck.<release>.json`, in the release's folder and its hash in the `before` record. The repair tools (`scripts/repair_stamps.py --window-earlier-ok`, `ingest --restamp-window-earlier-ok`) take that file, refuse without a pass, and check every in-window change against its instants before writing. Run the pre-check, the cache repair and the store restamp in one sitting with the paper jobs stopped (step 2): every paper run adds a read instant, and the restamp refuses a file whose instants no longer match the store. The `after` record lists the in-window changes applied, and its `sessions_to` then reaches into the window. A change that moves a stamp later, a bulk shift, an earlier move larger than the offset, or anything that touches prices, bars or actions in the window is still refused. The exam cannot move, because no decision read the row before the correction and none reads it differently after.
 6. **Run it outside ingest windows and outside a running sweep.** A sweep running through a release fails its open variants with `store changed during run`.
 7. **Keep every backup listed.** Each `before` and `record` entry names its backup file. If a data licence ever needs its data deleted (the deletion clause T145 will set), the list of backups is the list of files to walk. Do not delete a backup without noting it in the record (a `reason` on a new `record` entry is enough).
 
-## The record: `data/releases.toml`
+## The record
 
-The file lives beside the store, in `data/`. `data/*` is gitignored, so it never reaches the public repo. Write it by hand. Append; never edit an earlier entry. T140b imports it once into the store; after that, its commands write the record.
+The store holds the record. The commands, all in the `decision data-release` group:
 
-Each entry is one `[[release]]` table. An example (the numbers are illustrative):
+- `open --name N --backup <path> --reason "..."` writes the `before` row. It opens the backup read-only and refuses unless the backup holds the store's latest `ingested_at`. Only one release can be open, and a name is used once.
+- `close --name N --from <session> --to <session> [--reason "..."]` writes the `after` row for the open release. Its time enters `data_vintage`, so trials that read the touched sessions go stale even when the repair only deleted rows.
+- `record --name N --backup <path> --trial <id> --reason "..."` writes a closed `record` row: which backup holds the state a trial read. It prints whether the backup's vintage at the trial's cutoff equals the trial's.
+- `import-file data/releases.toml` imports the legacy hand-written file once. Imported `after` rows move no vintage.
+
+The real runs of `repair-resolution`, `repair-bars`, `repair-dividends`, `delete-master-rows` and `master-retract --apply` take `--release <name>` and refuse unless that release is open. The commands compute the numbers in the field table below, so you no longer copy them by hand.
+
+The legacy file lives beside the store, in `data/` (gitignored, so it never reaches the public repo). Each entry was one `[[release]]` table, append-only. Its format, still what `import-file` reads (the numbers are illustrative):
 
 ```toml
 [[release]]
@@ -59,7 +66,7 @@ The fields:
 | `trial` | `record` | The trial id whose state the backup holds. |
 | `reason` | all | One line: why, and the issue number. On `after`, say anything that differs from the plan. |
 
-**A delete-only repair** (bars removed, nothing written) does not reliably stale the trials that read those sessions. The vintage reads only rows still in the store. If the deleted rows did not hold the latest `ingested_at` at or before a trial's cutoff, the vintage stays the same and the trial still reads as current, though its inputs changed. If they did hold it, the vintage moves backward and the trial goes stale. Either way, until T140b counts `after` records in the vintage, do this after every release that deletes rows: for each sweep whose trials read the touched sessions, run `sweep run <slug>` (it reruns any variant that went stale), then, once the sweep reads complete, `sweep run <slug> --rerun`, so no trial on the old rows can still select. Each rerun counts in N. Say in the `after` entry's `reason` that the release deleted rows and which sweeps you reran.
+**A delete-only repair** (bars removed, nothing written) changes no `ingested_at` the vintage can see, so on its own it would not stale the trials that read those sessions. The `after` row `decision data-release close` writes fixes that: its time enters `data_vintage` for every cutoff on or after its `sessions_from` (`store/registry.py`). Imported legacy `after` rows move no vintage, so for a release recorded only in the TOML file, and as a belt-and-braces step after any release that deletes rows, do this: for each sweep whose trials read the touched sessions, run `sweep run <slug>` (it reruns any variant that went stale), then, once the sweep reads complete, `sweep run <slug> --rerun`, so no trial on the old rows can still select. Each rerun counts in N. Say in the `after` entry's `reason` that the release deleted rows and which sweeps you reran.
 
 ## Read the two numbers
 
@@ -90,10 +97,10 @@ Write the printed times into the entry with a `Z` in place of `+00:00`.
    uv run tradepartner store backup
    ```
    Record the printed copy, log copy (if present) and manifest paths. Open any backup only read-only: opening it for writing may checkpoint its WAL and change the backup. The command refuses an existing target or a busy store and verifies each copy byte for byte. If the UTC minute's name already exists, wait for the next minute and rerun. Never overwrite an existing backup: it may be the only copy of a state a trial read.
-4. **Write the `before` entry.** Use the printed copy path as `backup_path` (and as `--backup` for `decision data-release open`). Run the "Read the two numbers" command on the live store, at the close of `sessions_to`, and append the entry.
+4. **Open the release.** `uv run tradepartner decision data-release open --name <name> --backup <printed copy path> --reason "<why, issue number>"`. The command computes and stores the two numbers itself; "Read the two numbers" below is only for checking them by hand.
 5. **Run the repair.** Every command in the batch, back to back. Dry runs first where the command has one.
 6. **Check it.** `uv run tradepartner health --check` exits 0, and the checks the release's issue names pass.
-7. **Write the `after` entry.** Same `name`, `stage = "after"`, the numbers read again on the live store, and the sessions actually touched.
+7. **Close the release.** `uv run tradepartner decision data-release close --name <name> --from <first session touched> --to <last session touched>`; add `--reason` for anything that differs from the plan.
 8. **Restart the jobs** (scheduling.md). The next plain `sweep run` reruns any stale variants; each rerun counts in N. If the release deleted rows, also rerun the sweeps that read those sessions as "The record" above says.
 
 If the repair fails partway, keep the jobs stopped and nothing holding the store. First save the failed live state as evidence with `uv run tradepartner store backup` and record its printed copy, WAL and manifest paths on the release PR/issue. Then restore the pre-release backup:

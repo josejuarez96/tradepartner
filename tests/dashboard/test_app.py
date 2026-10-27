@@ -12,17 +12,22 @@ fixture and `tests/test_config.py` for the same env-var pattern).
 
 from __future__ import annotations
 
+import ast
+import inspect
 import runpy
 import tomllib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
 import pytest
 import streamlit as st
+from dashboard_nav import NavCall, nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import Settings
-from tradepartner.dashboard import override_page
+from tradepartner.dashboard import book_page, home_page, override_page, research_page
 from tradepartner.dashboard.app import (
     StoreState,
     StoreUnavailable,
@@ -38,12 +43,36 @@ _APP_PATH = str(
 _CONFIG_TOML = Path(__file__).resolve().parents[2] / ".streamlit" / "config.toml"
 
 
-def _run_app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
+_DASHBOARD_DIR = Path(_APP_PATH).parent
+
+_TOP_TITLES = ["Home", "Research", "Books"]
+_DETAIL_TITLES = [
+    "Data health",
+    "Backtest",
+    "Trial registry",
+    "Operations",
+    "Trades",
+    "Performance",
+    "Override",
+]
+
+
+def _run_app(monkeypatch: pytest.MonkeyPatch, store_path: Path, page: str = "Home") -> AppTest:
+    """Run the shell headless with `page` selected (`conftest.py` wraps `st.navigation`)."""
     monkeypatch.setenv("STORE__PATH", str(store_path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", page)
     at = AppTest.from_file(_APP_PATH)
     at.run()
     return at
+
+
+def _init_store(tmp_path: Path, name: str = "ok.duckdb") -> Path:
+    store_path = tmp_path / name
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        schema.init_schema(conn)
+    return store_path
 
 
 # --- open_store_connection (pure, no Streamlit) ---------------------------
@@ -196,31 +225,114 @@ def test_render_unreadable_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     assert any("could not be read" in e.value.lower() for e in at.error)
 
 
-def test_render_ok_state_shows_navigation_and_placeholder_page(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_render_ok_state_builds_the_top_nav(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    nav_calls: list[NavCall],
 ) -> None:
-    store_path = tmp_path / "ok.duckdb"
-    settings = Settings(_env_file=None, store={"path": str(store_path)})
-    with open_for_write(settings) as conn:
-        schema.init_schema(conn)
-
-    at = _run_app(monkeypatch, store_path)
+    at = _run_app(monkeypatch, _init_store(tmp_path))
 
     assert not at.exception
     assert not at.warning
-    assert not at.info
     assert not at.error
-    [nav] = at.sidebar.radio
-    assert nav.options == [
-        "Data health",
-        "Backtest",
-        "Trial registry",
-        "Research",
-        "Operations",
-        "Trades",
-        "Performance",
-        "Override",
-    ]
+    assert not at.sidebar.radio
+    [(pages, kwargs)] = nav_calls
+    assert kwargs == {"position": "top"}
+    assert {name: [p.title for p in group] for name, group in pages.items()} == {
+        "": _TOP_TITLES,
+        "Details": _DETAIL_TITLES,
+    }
+    assert [p.title for p in pages[""] if p.url_path == ""] == ["Home"]
+
+
+def test_home_and_books_route_with_the_final_signature(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path = _init_store(tmp_path)
+    for module in (home_page, book_page):
+        assert list(inspect.signature(module.render).parameters) == ["conn", "settings"]
+    at = _run_app(monkeypatch, store_path, "Home")
+    assert not at.exception
+    at = _run_app(monkeypatch, store_path, "Books")
+    assert not at.exception
+    # T276 filled the Book page: an empty store says no book has started
+    assert any("no book has started" in i.value.lower() for i in at.info)
+
+
+def test_research_tab_renders_the_research_page_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path = _init_store(tmp_path)
+    seen: list[object] = []
+    monkeypatch.setattr(research_page, "render", lambda conn: seen.append(conn))
+
+    at = _run_app(monkeypatch, store_path, "Research")
+
+    assert not at.exception
+    assert len(seen) == 1
+    assert isinstance(seen[0], duckdb.DuckDBPyConnection)
+
+
+@pytest.mark.parametrize("page", ["Data health", "Operations", "Override"])
+def test_details_pages_render_with_the_one_connection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, page: str
+) -> None:
+    at = _run_app(monkeypatch, _init_store(tmp_path), page)
+    assert not at.exception
+
+
+def test_each_render_opens_one_read_only_connection_and_closes_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import tradepartner.store.db as db_module
+
+    store_path = _init_store(tmp_path)
+    real_open = db_module.open_read_only
+    opened: list[duckdb.DuckDBPyConnection] = []
+
+    @contextmanager
+    def _spy_open(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+        with real_open(settings) as conn:
+            opened.append(conn)
+            yield conn
+
+    monkeypatch.setattr(db_module, "open_read_only", _spy_open)
+    at = _run_app(monkeypatch, store_path, "Books")
+
+    assert not at.exception
+    [conn] = opened
+    with pytest.raises(duckdb.Error):
+        conn.execute("SELECT 1")  # closed once the page has drawn
+
+
+def test_dashboard_modules_never_open_a_store_connection_or_write() -> None:
+    """Module-wide guard: no module in `dashboard/` (the later pages included) opens a
+    connection itself, imports `open_for_write`, or runs a write statement. The
+    Override submit is the one write, and goes through T64b's writer, not SQL here."""
+    forbidden_names = {"open_for_write", "open_read_only", "connect"}
+    write_sql = ("INSERT ", "UPDATE ", "DELETE ", "CREATE ", "DROP ", "ALTER ")
+    offenders: list[str] = []
+    for path in sorted(_DASHBOARD_DIR.glob("*.py")):
+        if path.name == "app.py":
+            continue  # the shell opens the one read-only connection; tested above
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                names = {alias.name for alias in node.names}
+                if names & {"open_for_write"}:
+                    offenders.append(f"{path.name}:{node.lineno} imports open_for_write")
+            elif isinstance(node, ast.Call):
+                func = node.func
+                called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if called in forbidden_names and path.name != "override_page.py":
+                    offenders.append(f"{path.name}:{node.lineno} calls {called}")
+            elif (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value.lstrip().upper().startswith(write_sql)
+            ):
+                offenders.append(f"{path.name}:{node.lineno} write SQL")
+    assert offenders == []
 
 
 def test_a_stray_outcome_shows_only_once_the_override_page_is_selected(
@@ -228,35 +340,26 @@ def test_a_stray_outcome_shows_only_once_the_override_page_is_selected(
 ) -> None:
     """`show_outcome` is only called when the Override page is selected
     (module docstring): an `Outcome` left in `session_state` while another
-    page is showing (nothing in the current click flow produces this —
-    `on_click` cannot change the sidebar's own page selection — but nothing
-    should rely on that) does not bleed onto that other page, and is still
+    page is showing does not bleed onto that other page, and is still
     shown, once, the next time Override is selected, since `show_outcome`
-    pops rather than peeks."""
-    store_path = tmp_path / "outcome-scoped.duckdb"
-    settings = Settings(_env_file=None, store={"path": str(store_path)})
-    with open_for_write(settings) as conn:
-        schema.init_schema(conn)
-
-    at = _run_app(monkeypatch, store_path)
-    at.sidebar.radio[0].set_value("Data health").run()
-    assert not at.exception
-
-    at.session_state[override_page.OUTCOME_KEY] = override_page.Outcome(
+    pops rather than peeks. Each page runs in its own `AppTest`, which seeds the
+    outcome after the first run."""
+    store_path = _init_store(tmp_path, "outcome-scoped.duckdb")
+    outcome = override_page.Outcome(
         override_page.OutcomeStatus.WRITTEN, "Override 1 written: exclude_name."
     )
-    at.run()
 
+    at = _run_app(monkeypatch, store_path, "Data health")
+    at.session_state[override_page.OUTCOME_KEY] = outcome
+    at.run()
     assert not at.exception
     assert not any("written" in s.value.lower() for s in at.success)
 
-    at.sidebar.radio[0].set_value("Override").run()
+    at = _run_app(monkeypatch, store_path, "Override")
+    at.session_state[override_page.OUTCOME_KEY] = outcome
+    at.run()
     assert not at.exception
     assert any("written" in s.value.lower() for s in at.success)
-
-    at.sidebar.radio[0].set_value("Data health").run()
-    assert not at.exception
-    assert not any("written" in s.value.lower() for s in at.success)
 
 
 # --- server options (ADR 0011, #273) ---------------------------------------
@@ -288,7 +391,9 @@ def test_server_options_ok(
 
 
 def test_render_app_refuses_when_server_options_differ(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    nav_calls: list[NavCall],
 ) -> None:
     """A running override (`STREAMLIT_SERVER_ADDRESS`, a CLI flag) that opens
     `server.address` to another interface must stop the render, not just the
@@ -310,11 +415,13 @@ def test_render_app_refuses_when_server_options_differ(
 
     assert not at.exception
     assert any("refusing to render" in e.value.lower() for e in at.error)
-    assert not at.sidebar.radio
+    assert nav_calls == []
 
 
 def test_render_app_renders_when_server_options_match(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    nav_calls: list[NavCall],
 ) -> None:
     """The default (unpatched) options come from the real `.streamlit/config.toml`,
     which this test pins matches ADR 0011, so the shell renders as normal."""
@@ -327,4 +434,4 @@ def test_render_app_renders_when_server_options_match(
 
     assert not at.exception
     assert not at.error
-    assert at.sidebar.radio
+    assert len(nav_calls) == 1

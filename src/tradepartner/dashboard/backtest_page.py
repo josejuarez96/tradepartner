@@ -67,8 +67,19 @@ import streamlit as st
 
 from tradepartner.backtest.engine import STRATEGY_SERIES
 from tradepartner.backtest.frozen import frozen_values
-from tradepartner.backtest.metrics import METRIC_KEYS, Basis, DeflatedSharpe, deflated_sharpe
-from tradepartner.backtest.results import CADENCE_KEY, FamilyN, family_n_split
+from tradepartner.backtest.metrics import (
+    LONG_SHORT_KEYS,
+    METRIC_KEYS,
+    Basis,
+    DeflatedSharpe,
+    deflated_sharpe,
+)
+from tradepartner.backtest.results import (
+    BORROW_SERIES_PREFIX,
+    CADENCE_KEY,
+    FamilyN,
+    family_n_split,
+)
 from tradepartner.backtest.schedule import MONTHS_PER_YEAR, periods_per_year
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
@@ -115,6 +126,21 @@ _ANNUAL: Final = "annual"
 #: row without the column (before schema version 15) is `full`.
 _FULL: Final = "full"
 _SUMMARY: Final = "summary"
+
+#: A borrow-sensitivity series' label on the page (backtest spec amendment 1872, item 6).
+_REPORTED_ONLY: Final = " (reported only)"
+
+#: The shortability proxy's three limits, fixed text on every long/short trial (spec
+#: amendment 1872, item 3; the page may not drop or reword them).
+PROXY_LIMITS: Final[tuple[str, ...]] = (
+    "(a) The proxy never sees a hard-to-borrow name, a recall, a failed locate or a fee "
+    "spike, so it biases the short leg's return upward, most in small, heavily shorted "
+    "names. The 300 bp borrow line is the stress for it.",
+    "(b) A wider universe makes the proxy worse: below the large caps its easy-to-borrow "
+    "assumption fails more often.",
+    "(c) Alpaca's shortable flags are one broker's book (5,373 shortable of 33,636 assets "
+    "on 2026-10-11), not the market's.",
+)
 
 _WEIGHT_COLUMNS: Final = ("fill_session", "security_id", "target_weight", "fill_price", "shares")
 
@@ -413,17 +439,30 @@ def _level_kind(row: Row, base: float) -> str:
     return "base" if row["cost_per_side_bps"] == base else "ladder"
 
 
+def _series_label(series: str) -> str:
+    """`series` as shown: a borrow-sensitivity book is labelled "reported only"."""
+    return series + _REPORTED_ONLY if series.startswith(BORROW_SERIES_PREFIX) else series
+
+
+def _labelled(rows: list[Row]) -> list[Row]:
+    """`rows` with each borrow book's series name labelled for display."""
+    return [{**r, "series": _series_label(str(r["series"]))} for r in rows]
+
+
 def _metrics_table(view: TrialView) -> pl.DataFrame:
     columns = sorted({(r["series"], r["cost_per_side_bps"]) for r in view.metrics})
     values = {(r["series"], r["cost_per_side_bps"], r["metric"]): r["value"] for r in view.metrics}
     kinds = {
         (r["series"], r["cost_per_side_bps"]): _level_kind(r, view.base_cost) for r in view.metrics
     }
-    keys = [k for k in METRIC_KEYS if any(m == k for _, _, m in values)]
+    keys = [k for k in (*METRIC_KEYS, *LONG_SHORT_KEYS) if any(m == k for _, _, m in values)]
     return pl.DataFrame(
         [
             {"metric": key}
-            | {f"{s} @ {c} bps ({kinds[(s, c)]})": values.get((s, c, key)) for s, c in columns}
+            | {
+                f"{_series_label(s)} @ {c} bps ({kinds[(s, c)]})": values.get((s, c, key))
+                for s, c in columns
+            }
             for key in keys
         ]
     )
@@ -497,6 +536,33 @@ def _render_states(view: TrialView) -> None:
         st.error(f"{status}: {trial.message or '(no message)'}")
 
 
+def _render_long_short(view: TrialView) -> None:
+    """A long/short trial's exposure at the base level and the proxy's three limits (spec
+    amendment 1872, items 3 and 8); nothing for a `long_only` trial, which has no such rows."""
+    exposure = {
+        r["metric"]: r["value"]
+        for r in view.metrics
+        if r["series"] == STRATEGY_SERIES
+        and r["cost_per_side_bps"] == view.base_cost
+        and r["metric"] in LONG_SHORT_KEYS
+    }
+    if not exposure:
+        return
+    st.subheader("Long/short exposure")
+    st.caption(
+        "Session-close gross and net exposure as fractions of equity, at the base cost level. "
+        "The borrow-sensitivity lines are reported only: never in V, N, DSR, the red flag, "
+        "a promotion rule or any selection."
+    )
+    st.dataframe(
+        pl.DataFrame([{"metric": k, "value": exposure.get(k)} for k in LONG_SHORT_KEYS]),
+        hide_index=True,
+    )
+    st.markdown("**The shortability proxy's limits**")
+    for limit in PROXY_LIMITS:
+        st.markdown(f"- {limit}")
+
+
 def _render_results(view: TrialView) -> None:
     palette = theme.palette()
     st.subheader("Equity")
@@ -510,10 +576,11 @@ def _render_results(view: TrialView) -> None:
             else "."
         )
     )
-    _line_chart(view.equity, "equity", "equity (log)", palette, log=True)
+    _line_chart(_labelled(view.equity), "equity", "equity (log)", palette, log=True)
 
     st.subheader("Drawdowns")
-    _line_chart(view.drawdowns, "drawdown", "drawdown", palette, fmt="%")
+    _line_chart(_labelled(view.drawdowns), "drawdown", "drawdown", palette, fmt="%")
+    _render_long_short(view)
 
     st.subheader("Turnover and costs")
     st.caption("Per rebalance period at the base cost level.")

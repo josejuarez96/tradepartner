@@ -126,6 +126,7 @@ def _run(
     journal_open: Sequence[JournalOpenOrder] = (),
     explanations: Explanations | None = None,
     account_id: str = "acct-1",
+    frozen: RiskConfig = FROZEN,
 ) -> Reconciliation:
     return compare(
         ledger,
@@ -135,7 +136,7 @@ def _run(
         _account(cash, account_id),
         explanations or _explanations(),
         WINDOW,
-        FROZEN,
+        frozen,
         order_id_prefix=PREFIX,
     )
 
@@ -523,6 +524,210 @@ def test_a_cash_difference_other_than_the_dividend_is_a_mismatch() -> None:
     )
     assert _kinds(result) == ["cash"]
     assert result.adjustments == ()
+
+
+def test_two_names_open_and_only_one_dividend_paid() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0, SEC_B=4.0),
+        _positions(AAA=10.0, BBB=4.0),
+        1_004.5,
+        explanations=_explanations(
+            dividends={"SEC_A": 4.5, "SEC_B": 7.0},
+            dividend_dues={"SEC_A": (4.5,), "SEC_B": (7.0,)},
+        ),
+    )
+    assert result.status == "ok"
+    assert [(a.security_id, a.cash) for a in result.adjustments] == [("SEC_A", 4.5)]
+
+
+def test_two_dividends_on_one_name_book_only_the_older_paid_due() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_004.5,
+        explanations=_explanations(dividends={"SEC_A": 11.5}, dividend_dues={"SEC_A": (4.5, 7.0)}),
+    )
+    assert result.status == "ok"
+    assert [(a.security_id, a.cash) for a in result.adjustments] == [("SEC_A", 4.5)]
+
+
+def test_two_equal_open_dues_with_one_paid_fail_closed() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_005.0,
+        explanations=_explanations(dividends={"SEC_A": 10.0}, dividend_dues={"SEC_A": (5.0, 5.0)}),
+    )
+    assert _kinds(result) == ["cash"]
+    assert result.adjustments == ()
+
+
+def test_small_unpaid_due_prefers_none_paid_inside_cash_bound() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=0.01),
+        _positions(AAA=0.01),
+        1_000.0,
+        explanations=_explanations(dividends={"SEC_A": 0.005}, dividend_dues={"SEC_A": (0.005,)}),
+    )
+    assert result.status == "ok" and result.adjustments == ()
+
+
+def test_name_missing_from_dividend_dues_uses_its_per_name_total() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_004.5,
+        explanations=_explanations(dividends={"SEC_A": 4.5}, dividend_dues={}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [4.5]
+
+
+def test_present_dividend_dues_must_sum_to_the_per_name_total() -> None:
+    with pytest.raises(ValueError, match="dividend dues"):
+        _run(
+            _ledger(1_000.0, SEC_A=10.0),
+            _positions(AAA=10.0),
+            1_000.0,
+            explanations=_explanations(
+                dividends={"SEC_A": 4.5}, dividend_dues={"SEC_A": (2.0, 2.0)}
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("total", "dues"),
+    [(0.3, (0.1, 0.2)), (1.0, (0.3, 0.7000000000000001))],
+)
+def test_dividend_dues_allow_only_float_representation_rounding(
+    total: float, dues: tuple[float, ...]
+) -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0,
+        explanations=_explanations(dividends={"SEC_A": total}, dividend_dues={"SEC_A": dues}),
+    )
+    assert result.status == "ok"
+
+
+def test_two_paid_dues_on_one_name_journal_two_rows() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_011.5,
+        explanations=_explanations(dividends={"SEC_A": 11.5}, dividend_dues={"SEC_A": (4.5, 7.0)}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [4.5, 7.0]
+
+
+def test_nine_open_dues_accept_a_unique_single_due() -> None:
+    dues = tuple(float(2**i) for i in range(9))
+    explanations = _explanations(dividends={"SEC_A": 511.0}, dividend_dues={"SEC_A": dues})
+    single = _run(
+        _ledger(1_000.0, SEC_A=10.0), _positions(AAA=10.0), 1_256.0, explanations=explanations
+    )
+    assert single.status == "ok" and [a.cash for a in single.adjustments] == [256.0]
+
+
+def test_nine_open_dues_fail_when_an_untried_subset_also_fits() -> None:
+    dues = tuple(float(i) for i in range(1, 10))
+    explanations = _explanations(dividends={"SEC_A": 45.0}, dividend_dues={"SEC_A": dues})
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0), _positions(AAA=10.0), 1_009.0, explanations=explanations
+    )
+    assert _kinds(result) == ["cash"]
+    assert result.adjustments == ()
+
+
+def test_nine_open_dues_do_not_try_an_unlisted_combination() -> None:
+    dues = tuple(float(i) for i in range(1, 10))
+    explanations = _explanations(dividends={"SEC_A": 45.0}, dividend_dues={"SEC_A": dues})
+    combination_only = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_012.0,
+        explanations=explanations,
+    )
+    assert _kinds(combination_only) == ["cash"]
+
+
+def test_above_cap_subset_proof_stops_at_its_state_limit() -> None:
+    dues = tuple(float(2**i) for i in range(25))
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0 + float(2**24),
+        frozen=FROZEN.model_copy(update={"reconcile_dividend_subset_states": 32}),
+        explanations=_explanations(
+            dividends={"SEC_A": float(2**25 - 1)}, dividend_dues={"SEC_A": dues}
+        ),
+    )
+    assert _kinds(result) == ["cash"]
+    assert result.adjustments == ()
+
+
+@pytest.mark.parametrize("dust", [0.004, 0.01])
+def test_dust_due_does_not_make_a_real_credit_ambiguous_or_get_journaled(dust: float) -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_005.0,
+        explanations=_explanations(
+            dividends={"SEC_A": 5.0 + dust}, dividend_dues={"SEC_A": (5.0, dust)}
+        ),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [5.0]
+
+
+def test_a_long_name_can_match_its_positive_due_after_a_position_flip() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_006.0,
+        explanations=_explanations(dividends={"SEC_A": 5.0}, dividend_dues={"SEC_A": (6.0, -1.0)}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [6.0]
+
+
+def test_a_short_name_can_match_its_positive_due_after_a_position_flip() -> None:
+    result = _run(
+        Ledger(positions={}, cash=1_000.0, through=S, short_holdings={"SEC_A": 10.0}),
+        _positions(AAA=-10.0),
+        1_001.0,
+        explanations=_explanations(dividends={"SEC_A": -5.0}, dividend_dues={"SEC_A": (-6.0, 1.0)}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [1.0]
+
+
+def test_eight_open_dues_try_a_partial_combination() -> None:
+    dues = tuple(float(2**i) for i in range(8))
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_130.0,
+        explanations=_explanations(dividends={"SEC_A": 255.0}, dividend_dues={"SEC_A": dues}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [2.0, 128.0]
+
+
+def test_ended_listing_does_not_try_partial_dividend_combinations() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0, SEC_C=0.1),
+        _positions(AAA=10.0),
+        1_005.5,
+        explanations=_explanations(
+            ended=frozenset({"SEC_C"}),
+            dividends={"SEC_A": 11.5},
+            dividend_dues={"SEC_A": (4.5, 7.0)},
+        ),
+    )
+    assert _kinds(result) == ["cash"]
 
 
 # --- pending and lagging allowances --------------------------------------------
@@ -1890,18 +2095,29 @@ def test_exactly_one_cent_at_six_figures_passes_in_decimal() -> None:
 
 
 def test_a_dividend_beside_ten_fills_of_rounding_passes_at_the_scaled_bound() -> None:
-    """The bound in the dividend comparison (#1583, Q7): a 0.09 cash gap whose
-    0.05 is a credited dividend leaves 0.04 of per-fill rounding, inside
+    """The bound in the dividend comparison (#1583, Q7): a 0.11 cash gap whose
+    0.07 is a credited dividend leaves 0.04 of per-fill rounding, inside
     0.01 x (1 + 10/2) = 0.06; the #1290 bare 0.01 would have mismatched it."""
+    result = _run(
+        _ledger(1_000.0, fills_since_base=10, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.11,
+        explanations=_explanations(dividends={"SEC_A": 0.07}),
+    )
+
+    assert result.status == "ok"
+    assert [a.kind for a in result.adjustments] == ["dividend_cash"]
+
+
+def test_a_due_inside_the_scaled_bound_is_not_booked_for_a_larger_cash_gap() -> None:
     result = _run(
         _ledger(1_000.0, fills_since_base=10, SEC_A=10.0),
         _positions(AAA=10.0),
         1_000.09,
         explanations=_explanations(dividends={"SEC_A": 0.05}),
     )
-
-    assert result.status == "ok"
-    assert [a.kind for a in result.adjustments] == ["dividend_cash"]
+    assert _kinds(result) == ["cash"]
+    assert result.adjustments == ()
 
 
 def test_an_ended_listing_beside_ten_fills_of_rounding_passes_at_the_scaled_bound() -> None:

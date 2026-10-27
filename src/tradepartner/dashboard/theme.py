@@ -24,6 +24,14 @@ BadgeColor = Literal["green", "orange", "red"]
 
 
 @dataclass(frozen=True)
+class ChartRole:
+    """A named chart role: its ink and its stroke dash (empty means solid)."""
+
+    color: str
+    dash: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class Palette:
     """One theme's colour roles; `series` are the categorical slots in fixed order."""
 
@@ -39,12 +47,17 @@ class Palette:
     warning_bg: str
     critical: str
     critical_bg: str
+    book: ChartRole
+    benchmark: ChartRole
+    needs_you: ChartRole
 
     @property
     def accent(self) -> str:
         """Series 1: the thing being examined."""
         return self.series[0]
 
+
+_BENCHMARK_DASH: Final = (4, 4)
 
 PALETTES: Final[dict[Mode, Palette]] = {
     "light": Palette(
@@ -60,6 +73,9 @@ PALETTES: Final[dict[Mode, Palette]] = {
         warning_bg="#f8ebd2",
         critical="#b23f36",
         critical_bg="#f7dedb",
+        book=ChartRole("#2a78d6"),
+        benchmark=ChartRole("#5a6470", _BENCHMARK_DASH),
+        needs_you=ChartRole("#eb6834"),
     ),
     "dark": Palette(
         background="#12161a",
@@ -74,6 +90,9 @@ PALETTES: Final[dict[Mode, Palette]] = {
         warning_bg="#3a2e15",
         critical="#e07b73",
         critical_bg="#3b1f1d",
+        book=ChartRole("#3987e5"),
+        benchmark=ChartRole("#9aa5b1", _BENCHMARK_DASH),
+        needs_you=ChartRole("#d95926"),
     ),
 }
 
@@ -147,13 +166,16 @@ def series_encodings(
         "color": alt.Color(
             f"{field}:N",
             scale=alt.Scale(
-                domain=domain, range=[palette.accent, *[palette.text_secondary] * len(others)]
+                domain=domain,
+                range=[palette.book.color, *[palette.benchmark.color] * len(others)],
             ),
             legend=alt.Legend(title=None, orient="top"),
         ),
         "strokeDash": alt.StrokeDash(
             f"{field}:N",
-            scale=alt.Scale(domain=domain, range=[solid, *[[4, 4]] * len(others)]),
+            scale=alt.Scale(
+                domain=domain, range=[solid, *[list(palette.benchmark.dash)] * len(others)]
+            ),
             legend=None,
         ),
         "opacity": alt.Opacity(

@@ -1826,6 +1826,71 @@ class HealthReport:
         return not self.failures
 
 
+#: When the scheduled ingest runs (America/New_York). Source: the launchd plist in
+#: docs/runbooks/scheduling.md; change the two together.
+INGEST_TIME_ET = time(18, 30)
+_ET = ZoneInfo("America/New_York")
+
+
+def stale_sessions(report: HealthReport) -> int | None:
+    """Sessions between the store's last bar and the last completed session at the
+    report time; `None` when the store has no bars."""
+    last_bar = report.coverage.last_bar
+    if last_bar is None:
+        return None
+    sessions = all_sessions()
+    return bisect_right(sessions, report.session) - bisect_right(sessions, last_bar)
+
+
+def stale_gap_expected(report: HealthReport) -> bool:
+    """True when the store is one session behind only because today's scheduled
+    ingest has not run yet (after the close, before `INGEST_TIME_ET`)."""
+    local = report.t.astimezone(_ET)
+    return (
+        stale_sessions(report) == 1
+        and local.date() == report.session
+        and local.time() < INGEST_TIME_ET
+    )
+
+
+def _ingest_running(report: HealthReport) -> bool:
+    """True after `INGEST_TIME_ET` on the last session's own day (the ingest
+    should be running or just finished)."""
+    local = report.t.astimezone(_ET)
+    return local.date() == report.session and local.time() >= INGEST_TIME_ET
+
+
+def health_verdict(report: HealthReport, warnings: int = 0) -> str:
+    """One plain line about the data only (never the paper run, which also gates on
+    the newest ok ingest including SPY, halts and the kill switch): do the checks
+    pass, and is a stale session expected before tonight's ingest. `warnings` is the
+    count of warnings the caller tallies outside the report. Pure."""
+    note = f" with {warnings} warning(s)" if warnings else ""
+    if failures := report.failures:
+        body = f"{len(failures)} integrity check(s) fail ({', '.join(failures)})"
+    else:
+        stale = stale_sessions(report)
+        last = report.coverage.last_bar
+        plural = "" if stale == 1 else "s"
+        if stale is None:
+            body = "the store has no price bars; run `tradepartner ingest`"
+        elif stale == 0:
+            body = f"checks pass{note}, bars current to {last}"
+        elif stale_gap_expected(report):
+            body = (
+                f"checks pass{note}; {stale} session behind (last bar {last}), which is "
+                f"expected until tonight's {INGEST_TIME_ET:%H:%M} ET ingest"
+            )
+        elif stale == 1 and _ingest_running(report):
+            body = (
+                f"checks pass{note}; 1 session behind (last bar {last}); tonight's "
+                "ingest should be running or just finished"
+            )
+        else:
+            body = f"{stale} session{plural} behind (last bar {last}); run `tradepartner ingest`"
+    return f"Data: {body}. Paper run readiness and halts: `tradepartner paper status`."
+
+
 def health_report(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,

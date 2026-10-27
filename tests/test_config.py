@@ -46,6 +46,7 @@ from tradepartner.config import (
     _default_env_file,
     _settings_has_key,
     clean_message,
+    kill_wait_seconds,
     paper_key_variable_names,
     parse_reference_name,
     render_validation_errors,
@@ -97,6 +98,19 @@ def test_store_defaults() -> None:
     s = _settings()
     assert s.store.path == "data/tradepartner.duckdb"
     assert s.store.lock_retry_seconds == 60
+    assert s.store.pre_migration_backups_to_keep == 2
+    assert s.store.backup_disk_margin_bytes == 1_000_000_000
+
+
+def test_pre_migration_backup_config_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STORE__PRE_MIGRATION_BACKUPS_TO_KEEP", "1")
+    monkeypatch.setenv("STORE__BACKUP_DISK_MARGIN_BYTES", "0")
+    assert _settings().store.pre_migration_backups_to_keep == 1
+    assert _settings().store.backup_disk_margin_bytes == 0
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, store={"pre_migration_backups_to_keep": 0})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, store={"backup_disk_margin_bytes": -1})
 
 
 def test_calendar_defaults() -> None:
@@ -111,6 +125,26 @@ def test_ingest_defaults() -> None:
     assert s.ingest.reference_symbol == "SPY"
     assert s.ingest.max_missing_share == pytest.approx(0.05)
     assert s.ingest.max_dark_share == pytest.approx(1.0)  # #796: off until measured
+    assert s.ingest.edgar_gap_lookback_sessions == 5
+
+
+@pytest.mark.parametrize("value", [-1, 21])
+def test_edgar_gap_lookback_is_bounded(value: int) -> None:
+    with pytest.raises(ValidationError, match="edgar_gap_lookback_sessions"):
+        Settings(_env_file=None, ingest={"edgar_gap_lookback_sessions": value})
+
+
+def test_edgar_max_age_sessions_default_and_bounds() -> None:
+    assert _settings().ingest.edgar_max_age_sessions == 3
+    assert (
+        Settings(
+            _env_file=None, ingest={"edgar_max_age_sessions": 20}
+        ).ingest.edgar_max_age_sessions
+        == 20
+    )
+    for value in (0, 21, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ingest={"edgar_max_age_sessions": value})
 
 
 def test_fred_rate_defaults_and_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1926,6 +1960,11 @@ def test_risk_defaults_match_adr_0010() -> None:
     assert r.cash_in_lieu_tolerance == pytest.approx(0.10)
     # #1762 (T249): the sessions after a merger's payable date its cash may post.
     assert r.reconcile_merger_lag_sessions == 5
+    assert r.reconcile_dividend_credit_sessions == 25
+    assert r.reconcile_dividend_exhaustive_dues == 8
+    assert r.reconcile_dividend_subset_states == 10_000
+    # #411: the premium a delisted holding's late cash may carry over its last close.
+    assert r.delisting_cash_max_premium == pytest.approx(0.10)
 
 
 @pytest.mark.parametrize("value", [-1, 1.5])
@@ -1942,6 +1981,24 @@ def test_risk_reconcile_merger_lag_sessions_is_a_whole_count_of_at_least_zero(
     )
     with pytest.raises(ValidationError):
         Settings(_env_file=None, risk={"reconcile_merger_lag_sessions": value})
+
+
+@pytest.mark.parametrize("value", [0, 56, 1.5])
+def test_risk_reconcile_dividend_credit_sessions_bounds(value: float) -> None:
+    assert (
+        Settings(
+            _env_file=None, risk={"reconcile_dividend_credit_sessions": 1}
+        ).risk.reconcile_dividend_credit_sessions
+        == 1
+    )
+    assert (
+        Settings(
+            _env_file=None, risk={"reconcile_dividend_credit_sessions": 55}
+        ).risk.reconcile_dividend_credit_sessions
+        == 55
+    )
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={"reconcile_dividend_credit_sessions": value})
 
 
 def test_risk_max_skip_share_defaults_to_a_tenth() -> None:
@@ -1982,6 +2039,7 @@ def test_alpaca_cash_in_lieu_max_lag_sessions_default() -> None:
         "whole_share_price_buffer",
         "max_unspent_cash_fraction",
         "cash_in_lieu_tolerance",
+        "delisting_cash_max_premium",
     ],
 )
 @pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])
@@ -3196,3 +3254,70 @@ def test_a_negative_borrow_rate_is_refused(override: dict[str, object]) -> None:
     """A negative fee would pay the short book to hold its positions."""
     with pytest.raises(ValueError, match="borrow"):
         CostsConfig(**override)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("reconcile_dividend_exhaustive_dues", 0),
+        ("reconcile_dividend_exhaustive_dues", 13),
+        ("reconcile_dividend_subset_states", 0),
+    ],
+)
+def test_risk_reconcile_dividend_search_bounds(key: str, value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={key: value})
+
+
+def test_ui_keys_default_and_validate() -> None:
+    """T273 (#2170): display-only keys for the Home page."""
+    ui = _settings().ui
+    assert (ui.next_run_time_et, ui.holdings_rows) == ("08:05", 5)
+    for bad in ("8:05", "24:00", "08:60", "0805", "", "08:05 ET"):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"next_run_time_et": bad})
+    for rows in (0, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"holdings_rows": rows})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, ui={"unknown": 1})
+    assert Settings(_env_file=None, ui={"next_run_time_et": "23:59"}).ui.next_run_time_et == "23:59"
+
+
+def test_ui_kill_keys_default_and_validate() -> None:
+    """T277 (#2268): the Stop button's reason cap and its wait on `paper kill`."""
+    s = _settings()
+    assert (s.ui.max_reason_chars, s.ui.kill_wait_seconds, s.ui.kill_wait_margin_seconds) == (
+        500,
+        None,
+        30,
+    )
+    assert kill_wait_seconds(s) == s.store.writer_lock_retry_seconds + 30 == 330
+    for key in ("max_reason_chars", "kill_wait_margin_seconds", "kill_wait_seconds"):
+        for bad in (0, -1):
+            with pytest.raises(ValidationError):
+                Settings(_env_file=None, ui={key: bad})
+
+
+def test_ui_kill_wait_seconds_must_exceed_the_kill_store_wait_by_the_margin() -> None:
+    """ADR 0018's 2026-10-26 amendment: a caller's bound on `paper kill` must exceed
+    its worst-case store wait (`store.writer_lock_retry_seconds`) by a margin, or a
+    kill still waiting is reported as not confirmed; a set value not above the two
+    together is refused at load."""
+    valid = Settings(
+        _env_file=None, store={"writer_lock_retry_seconds": 100}, ui={"kill_wait_seconds": 131}
+    )
+    assert kill_wait_seconds(valid) == 131
+    for refused in (130, 100, 1):
+        with pytest.raises(ValueError, match=r"ui\.kill_wait_seconds"):
+            Settings(
+                _env_file=None,
+                store={"writer_lock_retry_seconds": 100},
+                ui={"kill_wait_seconds": refused},
+            )
+    margin = Settings(
+        _env_file=None,
+        store={"writer_lock_retry_seconds": 100},
+        ui={"kill_wait_margin_seconds": 50},
+    )
+    assert kill_wait_seconds(margin) == 150

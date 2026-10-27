@@ -19,6 +19,7 @@ from typing import Any
 import duckdb
 import pytest
 from conftest import load_universe_fixtures
+from dashboard_nav import nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner import health
@@ -86,6 +87,7 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path, now: datetime = T) -
     monkeypatch.setenv("STORE__PATH", str(store_path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     monkeypatch.setattr(health_page, "_now", lambda: now)
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Data health")
     at = AppTest.from_file(_APP_PATH, default_timeout=60)
     at.run()
     return at
@@ -248,8 +250,12 @@ def test_empty_store_view(tmp_path: Path) -> None:
 # --- render (headless) -------------------------------------------------------
 
 
-def test_page_is_the_shells_data_health_entry() -> None:
-    assert app._PAGES["Data health"] is health_page.render
+def test_page_is_the_shells_data_health_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[object] = []
+    monkeypatch.setattr(health_page, "render", lambda conn: seen.append(conn))
+    sentinel, settings = object(), Settings(_env_file=None)
+    app._DETAIL_PAGES["Data health"](sentinel, settings)  # type: ignore[arg-type]
+    assert seen == [sentinel]
 
 
 def test_render_shows_every_metric(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> None:
@@ -299,6 +305,8 @@ def test_render_marks_a_stale_store(monkeypatch: pytest.MonkeyPatch, store_path:
     at = _app(monkeypatch, store_path, now=later)
     assert not at.exception
     assert "stale: 4 sessions" in _text(at)
+    assert "4 sessions behind" in _text(at)
+    assert "expected until" not in _text(at)
     assert ":orange-badge[" in _text(at)
     assert "stale:" not in _text(_app(monkeypatch, store_path))
 
@@ -682,3 +690,18 @@ def test_mergers_card_with_no_run_says_never(
     at = _app(monkeypatch, store_path)
     assert not at.exception
     assert "Last run: never" in _text(at)
+
+
+def test_render_says_the_one_session_gap_is_expected_before_the_ingest(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    before_ingest = session_close(date(2020, 7, 1)) + timedelta(hours=1)
+    text = _text(_app(monkeypatch, store_path, now=before_ingest))
+    assert "expected until tonight's 18:30 ET ingest" in text
+    assert "stale: 1 session (expected until the 18:30 ET ingest)" in text
+
+
+def test_render_leads_with_a_fine_verdict_on_a_current_store(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    assert "Data: checks pass" in _text(_app(monkeypatch, store_path))

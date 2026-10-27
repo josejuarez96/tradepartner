@@ -2230,6 +2230,8 @@ _W_S_MINUS_1 = date(2026, 10, 6)
 _W_STARTED = datetime(2026, 9, 29, 14, 0, tzinfo=UTC)
 _W_FROZEN = json.dumps(
     {f"risk.{k}": v for k, v in RiskConfig(max_fill_lag_sessions=1).model_dump(mode="json").items()}
+    # the shakedown read (#2298) runs `paper check`'s override line over the window
+    | {"paper.min_override_reason_chars": 20}
 )
 
 
@@ -2506,7 +2508,10 @@ def test_waiting_on_owner_on_the_full_fixture_within_the_timing_bound(
             book_id="main",
             kind="kill_switch_engaged",
             since=_W_ENGAGED,
-            detail="kill switch engaged: kill_switch event 1 engaged (owner)",
+            detail=(
+                "kill switch engaged: you switched it on (paper kill, or an override you set) "
+                "(event 1); reason given: test"
+            ),
             command='tradepartner paper resume --book main --reason "<why>"',
         ),
         WaitingItem(
@@ -2540,6 +2545,15 @@ def test_waiting_on_owner_on_the_full_fixture_within_the_timing_bound(
             ),
             command=f'tradepartner decision shakedown-note --alert {alert} --reason "<why>"',
         ),
+        # #2298: the shakedown read stops on `b`'s unreadable frozen_json, as `paper
+        # shakedown` would, and says so as one item
+        WaitingItem(
+            book_id="every book",
+            kind="shakedown_failing",
+            since=None,
+            detail=items[4].detail,
+            command="tradepartner paper shakedown",
+        ),
         WaitingItem(
             book_id="main",
             kind="report_due",
@@ -2559,6 +2573,9 @@ def test_waiting_on_owner_on_the_full_fixture_within_the_timing_bound(
         ),
     )
     assert items[-1].detail.startswith(f"window {waiting_store['b']} frozen_json lacks risk keys")
+    assert items[4].detail.startswith(
+        f"the shakedown could not be read: window {waiting_store['b']} frozen_json has no usable"
+    )
     assert elapsed < fast.store.lock_retry_seconds / 2
 
 
@@ -2571,7 +2588,7 @@ def test_waiting_on_owner_honours_now_and_stays_narrow(
     for name in ("utc_now", "page_data", "_summary", "book_summaries", "performance_data"):
         monkeypatch.setattr(ops, name, refuse)
     items = _w_read(journal_settings)
-    assert len(items) == 6
+    assert len(items) == 7  # six book items and the shakedown's (#2298)
     # One session earlier (Tuesday 14:00 ET): S-1 is Monday, the lag is one
     # session past its anchor (still at the bound of 1), the stale_data alert of
     # Monday 17:00 ET is already in, and four rebalances are tracked.
@@ -2658,12 +2675,12 @@ def test_shakedown_note_needs_a_span_and_clears_with_its_note(journal_settings: 
             {"sessions": 10, "order_sessions": 5},
             datetime(2026, 10, 1, 15, 0, tzinfo=UTC),
         )
-    assert [(i.kind, i.since) for i in _w_read(journal_settings)] == [
-        ("shakedown_note", _W_STALE_ALERT)
-    ]
+    # the span's own lines are `shakedown_failing` items (#2298), not this test's subject
+    notes = [(i.kind, i.since) for i in _w_read(journal_settings) if i.kind == "shakedown_note"]
+    assert notes == [("shakedown_note", _W_STALE_ALERT)]
     with open_for_write(journal_settings) as conn:
         _w_owner_decision(conn, "shakedown_note", {"alert_id": alert}, _W_NOW - timedelta(hours=1))
-    assert _w_read(journal_settings) == ()
+    assert [i for i in _w_read(journal_settings) if i.kind == "shakedown_note"] == []
 
 
 def test_report_due_at_two_rebalances_and_gone_once_a_report_row_exists(
@@ -2699,7 +2716,7 @@ def test_a_crashed_run_with_no_kill_switch_row_is_since_its_started_at(
         "kill_switch_engaged",
         datetime(2026, 10, 6, 14, 0, tzinfo=UTC),
     )
-    assert item.detail == f"kill switch engaged: run {run} crashed"
+    assert item.detail == f"kill switch engaged: run {run} crashed with an error"
 
 
 def test_an_unreadable_frozen_json_is_one_item_and_the_other_books_still_come_out(
