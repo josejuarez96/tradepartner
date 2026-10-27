@@ -528,20 +528,22 @@ def test_a_tradable_gap_within_the_frozen_limit_is_marked_and_alerted(
     assert PHANTOM in message and F_0.isoformat() in message and T_0.isoformat() in message
 
 
-@pytest.mark.parametrize("later_ticker", ["TRNS", "TRNS*", "trns"])
-@pytest.mark.parametrize("new_tradable", [True, False])
-def test_reused_ticker_asset_cannot_decide_a_delisted_names_missing_bar(
+def reused_ticker_mark(
     env: Env,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     later_ticker: str,
     new_tradable: bool,
-) -> None:
-    """The new TRNS issuer's tradability cannot turn the old name's gap into a fault."""
+    delisting_known: timedelta = timedelta(hours=-1),
+    listing_known: timedelta = timedelta(hours=-1),
+) -> tuple[RunOutcome, float, bool | None]:
+    """Mark SEC_TRANSFER with a delisting and a later issuer's TRNS listing, each
+    known `*_known` from close(S-1) (negative: before the cutoff)."""
     bought(env, tmp_path)
     session = date(2019, 5, 3)
     cut = session_close(previous_session(session))
-    known = cut - timedelta(hours=1)
+    delisting_at = cut + delisting_known
+    listing_at = cut + listing_known
     (exchange, class_title) = env.query(
         "SELECT exchange, class_title FROM listings WHERE security_id = 'SEC_TRANSFER' "
         "ORDER BY valid_from DESC LIMIT 1"
@@ -555,10 +557,10 @@ def test_reused_ticker_asset_cannot_decide_a_delisted_names_missing_bar(
                 "form": "25",
                 "class_title": class_title,
                 "exchange": exchange,
-                "filed_at": known,
-                "effective_on": known.date() + timedelta(days=10),
-                "known_at": known,
-                "ingested_at": known,
+                "filed_at": delisting_at,
+                "effective_on": delisting_at.date() + timedelta(days=10),
+                "known_at": delisting_at,
+                "ingested_at": delisting_at,
                 "source": "edgar",
                 "provenance": "filing",
             },
@@ -572,8 +574,8 @@ def test_reused_ticker_asset_cannot_decide_a_delisted_names_missing_bar(
                 "exchange": "NASDAQ",
                 "class_title": "Common Stock",
                 "valid_from": previous_session(session),
-                "known_at": known,
-                "ingested_at": known,
+                "known_at": listing_at,
+                "ingested_at": listing_at,
                 "source": "edgar",
                 "provenance": "filing",
             },
@@ -593,8 +595,48 @@ def test_reused_ticker_asset_cannot_decide_a_delisted_names_missing_bar(
         "WHERE run_id = ? AND security_id = 'SEC_TRANSFER' AND session = ?",
         [outcome.run_id, previous_session(session)],
     )[0]
+    return outcome, price, tradable
+
+
+@pytest.mark.parametrize("later_ticker", ["TRNS", "TRNS*", "trns"])
+@pytest.mark.parametrize("new_tradable", [True, False])
+def test_reused_ticker_asset_cannot_decide_a_delisted_names_missing_bar(
+    env: Env,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    later_ticker: str,
+    new_tradable: bool,
+) -> None:
+    """The new TRNS issuer's tradability cannot turn the old name's gap into a fault."""
+    _, price, tradable = reused_ticker_mark(env, tmp_path, monkeypatch, later_ticker, new_tradable)
     assert price == pytest.approx(env.close("SEC_TRANSFER", F_0))
     assert tradable is None
+
+
+@pytest.mark.parametrize(
+    ("delisting_known", "listing_known"),
+    [
+        (timedelta(hours=-1), timedelta(hours=1)),
+        (timedelta(hours=1), timedelta(hours=-1)),
+        (timedelta(hours=1), timedelta(hours=1)),
+    ],
+    ids=["listing-late", "delisting-late", "both-late"],
+)
+def test_a_listing_or_delisting_known_after_the_cutoff_cannot_change_the_mark_flag(
+    env: Env,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    delisting_known: timedelta,
+    listing_known: timedelta,
+) -> None:
+    """No look-ahead: a record first known after close(S-1) neither drops the held
+    name's symbol nor changes its stored flag; the result equals a run without it."""
+    _, price, tradable = reused_ticker_mark(
+        env, tmp_path, monkeypatch, "TRNS", False, delisting_known, listing_known
+    )
+    assert price == pytest.approx(env.close("SEC_TRANSFER", F_0))
+    # The held name still reads its own asset (TRNS, not tradable) as of the cutoff.
+    assert tradable is False
 
 
 def hold_phantom_on_f_0(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
