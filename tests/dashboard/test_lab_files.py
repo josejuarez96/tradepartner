@@ -341,3 +341,20 @@ def test_listing_and_preview_fit_in_half_the_store_wait(
     lab_files.preview(docs / "sweeps" / "fixture-sweep.md", settings, ready)
 
     assert time.monotonic() - started < settings.store.lock_retry_seconds / 2
+
+
+def test_preview_refuses_a_path_outside_sweeps(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, docs: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside.md"
+    outside.write_text((docs / "sweeps" / "fixture-sweep.md").read_text())
+    link = docs / "sweeps" / "link.md"
+    link.symlink_to(outside)
+    for bad in (
+        outside,
+        link,
+        docs / "hypotheses" / "fixture-momentum.md",
+        docs / "sweeps" / "Nope.md",
+    ):
+        with pytest.raises(LabFileRefused):
+            lab_files.preview(bad, settings, ready)

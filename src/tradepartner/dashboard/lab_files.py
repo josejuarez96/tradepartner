@@ -162,6 +162,22 @@ def resolve_file(docs_root: Path, kind: FileKind, name: str) -> Path:
     return path
 
 
+def _check_sweep_path(path: Path) -> None:
+    """Refuse a `preview` path that is not a plain `sweeps/<name>.md` file."""
+    try:
+        resolved = path.resolve(strict=True)
+        parent = path.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise LabFileRefused(f"{path.name} is not a file") from exc
+    if (
+        not NAME_PATTERN.fullmatch(path.name)
+        or parent.name != _FOLDERS[FileKind.SWEEP]
+        or resolved.parent != parent
+        or not resolved.is_file()
+    ):
+        raise LabFileRefused(f"{path.name} is not a sweep file in {_FOLDERS[FileKind.SWEEP]}/")
+
+
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str] | None:
     try:
         return subprocess.run(
@@ -183,7 +199,7 @@ def git_state(path: Path, root: Path, *, on_main: bool | None = None) -> GitStat
         on_main = _head_on_main(root)
     if not on_main:
         return GitState.NOT_MERGED
-    status = _git(["status", "--porcelain", "--", str(path)], root)
+    status = _git(["--no-optional-locks", "status", "--porcelain", "--", str(path)], root)
     if status is None or status.returncode != 0 or status.stdout.strip():
         return GitState.NOT_MERGED
     tracked = _git(["ls-files", "--error-unmatch", "--", str(path)], root)
@@ -206,7 +222,7 @@ def _sweep_row(
 ) -> dict[str, object]:
     try:
         parsed = sweep.parse_sweep_file(path, settings)
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, KeyError, TypeError) as exc:
         return {
             "slug": path.stem,
             "state": RegistryState.UNREADABLE,
@@ -241,7 +257,7 @@ def _hypothesis_row(
 ) -> dict[str, object]:
     try:
         parsed = hypothesis.parse_file(path)
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, KeyError, TypeError) as exc:
         return {
             "slug": path.stem,
             "state": RegistryState.UNREADABLE,
@@ -323,10 +339,11 @@ def preview(
     day) is the registration day of a family with no hypothesis yet, which decides
     whether its holdout is forward (ADR 0016 point 4).
     """
+    _check_sweep_path(path)
     try:
         parsed = sweep.parse_sweep_file(path, settings)
         variants = sweep.expand_grid(parsed, settings)
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, KeyError, TypeError) as exc:
         raise LabFileRefused(scrub(str(exc), settings)) from exc
     lab = lab_schema.is_lab_initialised(conn)
     registered_on = registry.family_registered_on(conn, parsed.family)
