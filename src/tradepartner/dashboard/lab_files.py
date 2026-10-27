@@ -48,8 +48,6 @@ from tradepartner.store import lab_registry, lab_schema, registry
 #: A file name the Lab accepts; no separator, no dot-dot, lower-case.
 NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]*\.md")
 _CONTROL = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]")
-_MAX_MESSAGE_CHARS = 500
-_GIT_TIMEOUT_SECONDS = 10
 
 
 class FileKind(StrEnum):
@@ -138,7 +136,8 @@ def scrub(text: str, settings: Settings) -> str:
     for value in sorted(secret_values(settings), key=len, reverse=True):
         text = text.replace(value, "[redacted]")
     text = _CONTROL.sub(" ", text).strip()
-    return text if len(text) <= _MAX_MESSAGE_CHARS else text[:_MAX_MESSAGE_CHARS] + "..."
+    cap = settings.ui.lab_message_chars
+    return text if len(text) <= cap else text[:cap] + "..."
 
 
 def _folder(docs_root: Path, kind: FileKind) -> Path:
@@ -178,14 +177,14 @@ def _check_sweep_path(path: Path) -> None:
         raise LabFileRefused(f"{path.name} is not a sweep file in {_FOLDERS[FileKind.SWEEP]}/")
 
 
-def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str] | None:
+def _git(args: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess[str] | None:
     try:
         return subprocess.run(
             ["git", *args],
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
+            timeout=timeout,
             check=False,
             stdin=subprocess.DEVNULL,
         )
@@ -193,23 +192,29 @@ def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str] | None:
         return None
 
 
-def git_state(path: Path, root: Path, *, on_main: bool | None = None) -> GitState:
+def git_state(
+    path: Path, root: Path, settings: Settings, *, on_main: bool | None = None
+) -> GitState:
     """`merged` only when the file is tracked, unedited and HEAD is on `origin/main`."""
+    timeout = settings.ui.lab_git_timeout_seconds
+    # Git runs in `root`, so a path relative to the caller would be read from there.
+    root = root.resolve()
+    path = path.resolve() if path.is_absolute() else (Path.cwd() / path).resolve()
     if on_main is None:
-        on_main = _head_on_main(root)
+        on_main = _head_on_main(root, timeout)
     if not on_main:
         return GitState.NOT_MERGED
-    status = _git(["--no-optional-locks", "status", "--porcelain", "--", str(path)], root)
+    status = _git(["--no-optional-locks", "status", "--porcelain", "--", str(path)], root, timeout)
     if status is None or status.returncode != 0 or status.stdout.strip():
         return GitState.NOT_MERGED
-    tracked = _git(["ls-files", "--error-unmatch", "--", str(path)], root)
+    tracked = _git(["ls-files", "--error-unmatch", "--", str(path)], root, timeout)
     if tracked is None or tracked.returncode != 0:
         return GitState.NOT_MERGED
     return GitState.MERGED
 
 
-def _head_on_main(root: Path) -> bool:
-    done = _git(["merge-base", "--is-ancestor", "HEAD", "origin/main"], root)
+def _head_on_main(root: Path, timeout: int) -> bool:
+    done = _git(["merge-base", "--is-ancestor", "HEAD", "origin/main"], root, timeout)
     return done is not None and done.returncode == 0
 
 
@@ -288,9 +293,10 @@ def list_files(
     `<docs_root>/hypotheses/` (sweeps first, each folder by name). A name or symlink
     `resolve_file` would refuse is left out. Reads the store and runs read-only git;
     writes nothing."""
+    docs_root = docs_root.resolve()
     root = docs_root.parent
     lab = lab_schema.is_lab_initialised(conn)
-    on_main = _head_on_main(root)
+    on_main = _head_on_main(root, settings.ui.lab_git_timeout_seconds)
     files: list[LabFile] = []
     for kind in (FileKind.SWEEP, FileKind.HYPOTHESIS):
         folder = _folder(docs_root, kind)
@@ -314,7 +320,7 @@ def list_files(
                     slug=str(row["slug"]),
                     path=path,
                     registry_state=state,
-                    git_state=git_state(path, root, on_main=on_main),
+                    git_state=git_state(path, root, settings, on_main=on_main),
                     desk_only=kind is FileKind.HYPOTHESIS and lab,
                     file_sha256=row.get("sha"),  # type: ignore[arg-type]
                     registered_at=row.get("at"),  # type: ignore[arg-type]

@@ -6,6 +6,7 @@ writes to the store the page reads (counts and file bytes are compared).
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from datetime import date
@@ -368,3 +369,33 @@ def test_preview_refuses_a_path_outside_sweeps(
     ):
         with pytest.raises(LabFileRefused):
             lab_files.preview(bad, settings, ready)
+
+
+def test_a_relative_docs_root_from_outside_the_checkout_reports_merged(
+    ready: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    docs: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The path git is given is absolute, whatever directory the caller is in."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    relative = Path(os.path.relpath(docs, elsewhere))
+    assert not relative.is_absolute()
+
+    files = lab_files.list_files(ready, settings, relative)
+
+    assert {f.git_state for f in files} == {GitState.MERGED}
+    assert (
+        lab_files.git_state(relative / "sweeps" / "fixture-sweep.md", docs.parent, settings)
+        is GitState.MERGED
+    )
+
+
+def test_the_message_cap_and_git_timeout_come_from_config() -> None:
+    capped = Settings(_env_file=None, ui={"lab_message_chars": 10})
+
+    assert lab_files.scrub("x" * 50, capped) == "x" * 10 + "..."
+    assert capped.ui.lab_git_timeout_seconds == 10
