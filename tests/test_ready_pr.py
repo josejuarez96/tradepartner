@@ -225,12 +225,6 @@ def test_kill_switch_page_requires_the_safety_review() -> None:
         assert ready_pr.required_reviews([path]) == {"safety-reviewer"}, path
 
 
-def test_book_page_requires_the_safety_review() -> None:
-    assert "safety-reviewer" in ready_pr.required_reviews(
-        ["src/tradepartner/dashboard/book_page.py"]
-    )
-
-
 def test_every_review_prefix_exists_on_the_tree_unless_planned() -> None:
     # a rename must not silently disable the gate (#357: exec/ vs execution/)
     for prefix in (*ready_pr.QUANT_PREFIXES, *ready_pr.SAFETY_PREFIXES):
@@ -1587,3 +1581,9 @@ def test_the_new_template_has_no_box_ready_pr_cannot_tick() -> None:
     assert len(boxes) == 4
     assert not any("uv run pytest" in b for b in boxes)
     assert ready_pr.unchecked_boxes(body.replace("- [ ]", "- [x]")) == []
+
+
+def test_book_page_requires_the_safety_review() -> None:
+    assert "safety-reviewer" in ready_pr.required_reviews(
+        ["src/tradepartner/dashboard/book_page.py"]
+    )
