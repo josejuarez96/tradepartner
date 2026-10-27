@@ -99,6 +99,8 @@ def test_a_ready_pr_is_eligible_even_when_behind_main() -> None:
         (_pr(base="develop"), None, PATHS, (), "(b)"),
         (_pr(labels=("parked",)), None, PATHS, (), "(c)"),
         (_pr(labels=("hold",)), None, PATHS, (), "(c) on hold"),
+        (_pr(labels=("Hold",)), None, PATHS, (), "(c) on hold"),
+        (_pr(labels=("Parked",)), None, PATHS, (), "(c) parked"),
         (
             None,
             None,
