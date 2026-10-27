@@ -1340,8 +1340,13 @@ _THREADS_QUERY = (
     "query($owner: String!, $name: String!, $number: Int!, $cursor: String) {"
     " repository(owner: $owner, name: $name) { pullRequest(number: $number) {"
     " reviewThreads(first: 100, after: $cursor) {"
-    " nodes { isResolved } pageInfo { hasNextPage endCursor } } } } }"
+    " nodes { isResolved comments(first: 1) { nodes { author { login } } } }"
+    " pageInfo { hasNextPage endCursor } } } } }"
 )
+
+# #2358, req 1 (j): threads whose first comment is from one of these review apps are
+# advisory (a backlog item, not a gate). The owner's decision of 2026-10-27.
+ADVISORY_REVIEW_BOTS = ("greptile-apps", "greptile-apps[bot]")
 
 
 class ShellRunner:
@@ -1492,9 +1497,10 @@ class ShellRunner:
     def _unresolved_threads(self, number: int) -> int:
         """How many of PR `number`'s review threads are unresolved, every page (#731).
 
-        Counts every thread whoever opened it, as the ruleset's
-        `required_review_thread_resolution` does: a thread can only make the PR
-        ineligible, never eligible.
+        Counts every unresolved thread except those whose first comment is by an
+        `ADVISORY_REVIEW_BOTS` login (#2358). A thread whose first-comment author
+        cannot be read stops the run: a thread can only make the PR ineligible,
+        never eligible.
         """
         owner, name = self._repo_name().split("/", 1)
         unresolved = 0
@@ -1507,13 +1513,20 @@ class ShellRunner:
             try:
                 raw = json.loads(self._gh("api", "graphql", *args))
                 threads = raw["data"]["repository"]["pullRequest"]["reviewThreads"]
-                states = [t["isResolved"] for t in threads["nodes"]]
-                if not all(isinstance(state, bool) for state in states):
-                    raise TypeError("isResolved is not a boolean")
-                unresolved += states.count(False)
+                for thread in threads["nodes"]:
+                    resolved = thread["isResolved"]
+                    if not isinstance(resolved, bool):
+                        raise TypeError("isResolved is not a boolean")
+                    if resolved:
+                        continue  # a resolved thread never counts; its author is moot
+                    login = thread["comments"]["nodes"][0]["author"]["login"]
+                    if not isinstance(login, str) or not login:
+                        raise TypeError("thread author is not a login")
+                    if login not in ADVISORY_REVIEW_BOTS:
+                        unresolved += 1
                 more = bool(threads["pageInfo"]["hasNextPage"])
                 cursor = threads["pageInfo"]["endCursor"]
-            except (KeyError, TypeError, ValueError) as exc:
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
                 raise StoppedError(f"PR #{number}: unreadable review threads ({exc!r})") from None
             if not more:
                 return unresolved
