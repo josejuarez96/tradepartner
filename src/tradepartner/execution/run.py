@@ -283,6 +283,7 @@ from tradepartner.execution.wrapper import (
     BatchOutcome,
     RiskGatedBroker,
     Verdict,
+    _refuse_reused_tickers,
     classify,
     last_ok_price_ingest,
 )
@@ -698,6 +699,22 @@ def _exit_book(context: StepContext) -> _ExitBook:
             else {}
         )
         tickers, ambiguous = _current_symbols(conn, session, held, context.settings, window_id)
+        delisted = frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
+        if delisted:
+            current = planning.current_listings(
+                listings_as_of(conn, cut, sorted(delisted)), session
+            )
+            reused = _refuse_reused_tickers(
+                conn,
+                cut,
+                session,
+                current,
+                delisted,
+                tickers,
+                context.settings.alpaca.class_symbols,
+            )
+            for sid, note in reused.items():
+                ambiguous[sid] = f"{ambiguous[sid]}; {note}" if sid in ambiguous else note
         marks_rows = positions_daily_for(conn, window_id)
         run_rows = [r.run for r in runs_for(conn, window_id)]
     price_of = _lookup(prices, unpriced)
@@ -1618,6 +1635,10 @@ class _Run:
                 self._unspent_cash(executed)
         self._reconcile()
         if batch is not None and batch.status == SKIPPED_KILL_SWITCH:
+            return self._skipped()
+        # A per-name restriction can leave no batch for the wrapper's switch
+        # check; still observe a kill engaged after the run's earlier read.
+        if batch is None and self.gate._engaged(self.run, self.window):
             return self._skipped()
         return self._finish(OK if batch is None else batch.status)
 

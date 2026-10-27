@@ -410,7 +410,7 @@ def _reconciliation(
 
 
 def _progress(conn: duckdb.DuckDBPyConnection, now: datetime) -> ShakedownProgress | None:
-    if registry.shakedown_span(conn) is None:
+    if registry.shakedown_span(conn, now=now) is None:
         return None
     span = shakedown.read_span(conn, now)
     done = len(span.sessions)

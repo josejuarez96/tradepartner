@@ -1604,15 +1604,18 @@ def _check_note_values(conn: duckdb.DuckDBPyConnection, values: Mapping[str, Any
         raise ShakedownRefused(f"alert {alert_id} does not exist")
 
 
-def shakedown_span(conn: duckdb.DuckDBPyConnection) -> ShakedownSpan | None:
+def shakedown_span(
+    conn: duckdb.DuckDBPyConnection, *, now: datetime | None = None
+) -> ShakedownSpan | None:
     """The newest `shakedown_span` row by `made_at` (then by id), or None. The
     thresholds come from the row, never from settings (ADR 0017 part E)."""
     if not _has_table(conn, "owner_decisions"):
         return None
     row = conn.execute(
         "SELECT decision_id, made_at, values_json, reason FROM owner_decisions "
-        "WHERE kind = ? ORDER BY made_at DESC, decision_id DESC LIMIT 1",
-        [SHAKEDOWN_SPAN_KIND],
+        "WHERE kind = ? AND (? IS NULL OR made_at <= ?) "
+        "ORDER BY made_at DESC, decision_id DESC LIMIT 1",
+        [SHAKEDOWN_SPAN_KIND, now, now],
     ).fetchone()
     if row is None:
         return None

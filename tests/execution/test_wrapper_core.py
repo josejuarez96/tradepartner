@@ -570,6 +570,56 @@ def test_the_alert_row_exists_before_the_fault_propagates(
     assert results == [("halted",)]
 
 
+def test_halt_alerts_owed_ticker_change_lines(
+    journal_settings: Settings,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    run = _run(journal_settings, open_window, fixed_clock())
+    gate = _wrapper(journal_settings, scripted_fake, fixed_clock, alerter_conn)
+    gate.note_unsent("SEC_X ticker change X -> Y; no new exit made")
+
+    with pytest.raises(LimitBreachError):
+        gate.halt(LimitBreachError("test fault"), run)
+
+    alerts = _query(
+        journal_settings, "SELECT kind, message FROM alerts WHERE run_id = ?", [run.run_id]
+    )
+    assert [kind for kind, _ in alerts] == ["skipped", "halted"]
+    assert "SEC_X ticker change X -> Y" in alerts[0][1]
+
+
+def test_halt_keeps_owed_lines_if_skipped_alert_fails(
+    journal_settings: Settings,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _run(journal_settings, open_window, fixed_clock())
+    gate = _wrapper(journal_settings, scripted_fake, fixed_clock, alerter_conn)
+    gate.note_unsent("SEC_X ticker change X -> Y; no new exit made")
+    write = gate._alerter.write
+
+    def fail_skipped(kind: str, *args: Any, **kwargs: Any) -> Any:
+        if kind == "skipped":
+            raise OSError("skipped write failed")
+        return write(kind, *args, **kwargs)
+
+    monkeypatch.setattr(gate._alerter, "write", fail_skipped)
+    with pytest.raises(LimitBreachError):
+        gate.halt(LimitBreachError("test fault"), run)
+
+    alerts = _query(
+        journal_settings, "SELECT kind, message FROM alerts WHERE run_id = ?", [run.run_id]
+    )
+    assert [kind for kind, _ in alerts] == ["halted"]
+    assert "SEC_X ticker change X -> Y" in alerts[0][1]
+
+
 @pytest.mark.parametrize(
     "fault, kind",
     [
