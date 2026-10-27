@@ -1613,7 +1613,7 @@ def test_static_invariant_tests_run_on_every_run_with_two_workers() -> None:
     names = ready_pr.STATIC_INVARIANT_TESTS
     for needle in (
         "test_boundaries.py",
-        "test_accept_rejections_boundary.py::test_the_flag_is_only_ever_passed_on_by_its_own_name",
+        "test_accept_rejections_boundary.py",
         "test_no_literals.py",
         "test_no_forbidden_imports.py",
         "test_marks.py::test_module_has_no_write_statements",

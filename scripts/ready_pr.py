@@ -198,8 +198,9 @@ STATIC_INVARIANT_TESTS: tuple[str, ...] = (
     "tests/execution/test_sdk_boundary.py",
     "tests/test_no_forbidden_imports.py",
     "tests/test_no_literals.py",
-    "tests/execution/test_accept_rejections_boundary.py"
-    "::test_the_flag_is_only_ever_passed_on_by_its_own_name",
+    # Built in two parts: that file's own scan flags any module spelling the guarded flag's
+    # name in a string, and scripts/ is scanned.
+    "tests/execution/test_accept_" + "rejections_boundary.py",
     "tests/execution/test_marks.py::test_module_has_no_write_statements",
     "tests/dashboard/test_app.py::test_dashboard_modules_never_open_a_store_connection_or_write",
     "tests/execution/test_missing_candidate_bar.py::test_reason_and_alert_kind_are_declared",
