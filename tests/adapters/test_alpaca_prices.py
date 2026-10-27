@@ -2064,6 +2064,53 @@ class TestNewActions:
         assert parsed.actions == ()
         assert parsed.self_spinoff == 1
 
+    def test_a_when_issued_child_resolves_under_its_regular_way_symbol(self) -> None:
+        """#2112: Alpaca names a new spin-off child by its when-issued symbol
+        (`MSGR.WI`), while the master lists it as `MSGR`. The child is resolved
+        under the root on its ex-date, so the row is stored, not dropped."""
+        resolver = ListingResolver(
+            [_listing("P", "PARENT", START), _listing("C", "CHILD", date(2020, 9, 29))]
+        )
+        parsed = parse_corporate_actions(
+            {"spin_offs": [_spinoff(new_symbol="CHILD.WI")]}, resolver.resolve
+        )
+        [action] = parsed.actions
+        assert (action.security_id, action.source_action_id, action.ratio_or_amount) == (
+            "C",
+            "P",
+            0.5,
+        )
+        assert action.known_at == announcement_date_known_at(date(2020, 10, 16))
+        assert parsed.unresolved == ()
+
+    def test_a_when_issued_child_with_no_regular_way_listing_stays_unresolved(self) -> None:
+        """#2112: no listing under the root on the ex-date (the child is not in
+        the master yet, or listed only from a later session, with no first-span
+        `lead`, #974) is unresolved under the symbol Alpaca gave, never stored."""
+        for listings in (
+            [_listing("P", "PARENT", START)],
+            [_listing("P", "PARENT", START), _listing("C", "CHILD", date(2020, 9, 30))],
+        ):
+            parsed = parse_corporate_actions(
+                {"spin_offs": [_spinoff(new_symbol="CHILD.WI")]},
+                ListingResolver(listings).resolve,
+            )
+            assert parsed.actions == ()
+            assert ("CHILD.WI", date(2020, 9, 29)) in parsed.unresolved
+
+    def test_only_a_trailing_when_issued_suffix_is_stripped(self) -> None:
+        """#2112: `.WI` is read only as a suffix; a bare `.WI` or a `WI` inside
+        the symbol resolves as written (here, to nothing)."""
+        resolver = ListingResolver(
+            [_listing("P", "PARENT", START), _listing("C", "CHILD", date(2020, 9, 29))]
+        )
+        for symbol in (".WI", "CHILD.WIX", "CHILDWI"):
+            parsed = parse_corporate_actions(
+                {"spin_offs": [_spinoff(new_symbol=symbol)]}, resolver.resolve
+            )
+            assert parsed.actions == ()
+            assert (symbol, date(2020, 9, 29)) in parsed.unresolved
+
     @pytest.mark.parametrize(
         "field,value",
         [
