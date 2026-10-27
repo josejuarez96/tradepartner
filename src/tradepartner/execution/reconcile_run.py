@@ -1589,7 +1589,10 @@ def _write_break_events(
                 break_rules.BreakPart(
                     kind=mismatch.kind,
                     cause=cause,
-                    ledger_quantity=ledger.positions.get(name, 0.0),
+                    # A short lives in `short_holdings` (unsigned); the signed
+                    # figure is what the broker's negative quantity is compared to.
+                    ledger_quantity=ledger.positions.get(name, 0.0)
+                    - ledger.short_holdings.get(name, 0.0),
                     broker_quantity=positions[mismatch.symbol].quantity
                     if mismatch.symbol is not None and mismatch.symbol in positions
                     else 0.0,
@@ -1604,7 +1607,9 @@ def _write_break_events(
             break_rules.BreakPart(**(old | {"activity_ids": tuple(old["activity_ids"])}))
             for old in old_parts
             if old["kind"] in break_rules.FINDING_KINDS
-            and not any(p.kind == old["kind"] for p in parts)
+            and not any(
+                p.kind == old["kind"] and p.finding_key == old["finding_key"] for p in parts
+            )
         )
         if previous is not None and not parts:
             if result.status not in (OK, BREAKS) or any(
@@ -1692,7 +1697,11 @@ def _write_break_events(
                 book_id=window.book_id,
                 event="observed" if previous is not None else "opened",
                 parts_json=break_rules.parts_json(parts),
-                cause=break_rules.break_cause(parts),
+                # The journal keeps the opening cause on every later event;
+                # each part carries its own cause in `parts_json` (item 14).
+                cause=previous.cause
+                if previous is not None and previous.cause is not None
+                else break_rules.break_cause(parts),
                 security_id=security_id,
                 symbol=symbol,
                 ledger_quantity=first.ledger_quantity,
@@ -1870,9 +1879,10 @@ def reconcile_now(
     )
     with connect() as conn:
         evidence = _break_evidence(conn, cut, settings, names)
+        open_now = open_breaks(conn, window_id)
         retained_finding = any(
             any(part["kind"] in break_rules.FINDING_KINDS for part in json.loads(row.parts_json))
-            for row in open_breaks(conn, window_id)
+            for row in open_now
         )
     if retained_finding and result.status == OK:
         # A one-shot finding stays open until the owner true-up; a clean broker
@@ -1963,7 +1973,7 @@ def reconcile_now(
                 adjustment_ids=adjustment_ids,
             )
         except Exception as exc:
-            if result.status in (MISMATCH, BREAKS) or halt_for_break:
+            if result.status in (MISMATCH, BREAKS) or halt_for_break or open_now:
                 # The row rolls back with its events. The command catches this
                 # fault and engages the independent kill-switch write.
                 raise ReconciliationError(

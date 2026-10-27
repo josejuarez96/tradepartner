@@ -623,6 +623,129 @@ def test_a_mixed_name_cash_part_takes_the_least_attributed_cause(
     assert opened.cause == cause
 
 
+def _last_event(settings: Settings, window: PaperWindowRow) -> Any:
+    with open_read_only(settings) as conn:
+        return break_events_for(conn, window.window_id or 0)[-1]
+
+
+def test_a_short_quantity_break_records_the_signed_ledger_short(
+    journal_settings: Settings,
+    flip_fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Greptile P1: a ledger short of 10 against broker -11 is a 1-share break,
+    not a break of the whole -11 (the ledger keeps shorts in `short_holdings`)."""
+    run_id = _hold(journal_settings, flip_fake, open_window, {(SPY, "SPY"): 10.0})
+    flipped = next_session(S)
+    traded_at = datetime.combine(flipped, datetime.min.time(), tzinfo=UTC) + timedelta(hours=18)
+    fixed_clock.now = traded_at
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, traded_at, Side.SELL, PositionIntent.SELL_TO_CLOSE
+    )
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, traded_at, Side.SELL, PositionIntent.SELL_TO_OPEN
+    )
+    flip_fake.extra_quantity = {"SPY": -1.0}
+    fixed_clock.now = datetime.combine(flipped, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, flip_fake, open_window, fixed_clock, session=flipped)
+
+    event = _last_event(journal_settings, open_window)
+    assert (event.ledger_quantity, event.broker_quantity) == (-10.0, -11.0)
+
+
+def test_a_changed_unknown_symbol_quantity_keeps_the_earlier_finding(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Greptile P1: findings are matched by `finding_key`, so 4 shares then 5
+    shares of an unmapped symbol keeps both keys until a true-up."""
+    fake.activities = [FUNDING]
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    for quantity in (4.0, 5.0):
+        fake.extra_quantity = {MTUM_WI: quantity}
+        with pytest.raises(ReconciliationError, match="unknown_symbol"):
+            _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    parts = json.loads(_last_event(journal_settings, open_window).parts_json)
+    keys = [p["finding_key"] for p in parts if p["kind"] == "unknown_symbol"]
+    assert len(keys) == 2 and len(set(keys)) == 2
+
+
+def test_a_part_with_a_new_cause_is_observed_under_the_opening_cause(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Greptile P1: the journal refuses a cause that rewrites the opening one, so
+    a later unattributed part is recorded in `parts_json` and the event keeps the
+    opening `corporate_action`; the reconciliation is not rolled back."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _dividend(
+        journal_settings,
+        SPY,
+        0.5,
+        CUT - timedelta(days=5),
+        ex_date=S - timedelta(days=2),
+        source_action_id="div-old",
+    )
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "ok"
+    later = next_session(S)
+    fixed_clock.now = session_close(S) + timedelta(hours=18)
+    fake.activities = [
+        *fake.activities,
+        CashActivity("c0", "DIVNRA", later, "executed", 30.0, "SPY"),
+    ]
+    fake.extra_cash = 30.0
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later)
+
+    fake.extra_quantity = {"SPY": -1.0}
+    with pytest.raises(ReconciliationError) as caught:
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later)
+
+    assert "could not be written" not in str(caught.value)
+    event = _last_event(journal_settings, frozen_window)
+    assert event.event == "observed" and event.cause == "corporate_action"
+    assert "unattributed" in event.parts_json
+
+
+def test_a_failed_closing_event_write_engages_the_switch(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Greptile P1: a break that clears on an `ok` read still halts when its
+    closing event cannot be written: `ReconciliationError`, switch engaged."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity = {"SPY": -1.0}
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock)
+    fake.extra_quantity = {}
+
+    def fail_events(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("event writer failed")
+
+    monkeypatch.setattr(reconcile_run, "_write_break_events", fail_events)
+    with pytest.raises(ReconciliationError, match="break events could not be written"):
+        reconcile_command(
+            journal_settings, lambda: open_for_write(journal_settings), fake, fixed_clock
+        )
+
+    with open_read_only(journal_settings) as conn:
+        switch_events = kill_switch_events_for(conn, frozen_window.window_id or 0)
+    assert switch_events[-1].state == "engaged"
+
+
 def test_failed_break_event_write_engages_switch_and_submits_no_order(
     journal_settings: Settings,
     fake: BookedFake,
