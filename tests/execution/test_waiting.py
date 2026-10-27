@@ -479,7 +479,8 @@ def test_progress_words_name_the_lines_in_progress_and_count_the_failing() -> No
     assert shakedown_progress(None) is None
     assert (
         shakedown_progress(ShakedownFacts(lines=(_line("E.2 reconciliation", passed=True),)))
-        == "shakedown: every line passes so far"
+        == "shakedown: every line passes so far (E.7's health half is not checked here; "
+        "`paper shakedown` is the gate)"
     )
     facts = ShakedownFacts(
         lines=(

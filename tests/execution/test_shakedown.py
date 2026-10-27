@@ -16,6 +16,7 @@ per run; an `ok` delivery on the default non-store channel (`macos`); and
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -1218,3 +1219,68 @@ def test_no_span_row_is_no_item_and_no_progress(
         queue = ops.owner_queue(read, settings, NOW)
     assert [i for i in queue.items if i.kind == "shakedown_failing"] == []
     assert queue.shakedown_progress is None
+
+
+def test_any_error_in_the_shakedown_read_leaves_the_other_items(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a defect in the diagnostic read must not hide a safety item (safety-reviewer)
+    j = _clean(conn)
+    j.switch(_at(D4, 12), "engaged")
+    conn.close()
+
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise KeyError(42)
+
+    monkeypatch.setattr(shakedown_module, "shakedown", broken)
+    with open_read_only(settings) as read:
+        items = ops.owner_queue(read, settings, _at(D4, 13)).items
+    kinds = [i.kind for i in items]
+    assert "kill_switch_engaged" in kinds
+    (failing,) = [i for i in items if i.kind == "shakedown_failing"]
+    assert failing.detail.startswith("the shakedown could not be read: KeyError: 42")
+
+
+def test_the_queue_read_on_a_year_of_orders_stays_within_the_read_budget(
+    conn: duckdb.DuckDBPyConnection, fixture_store_path: Path
+) -> None:
+    # The shakedown reads every order, event and fill (not only the span's), so pin
+    # its cost on a journal of about a year of two books (5,000 orders) before the
+    # span: well under half the lock wait, as the other owner reads are.
+    j = _clean(conn)
+    old = date(2026, 10, 8)
+    run_id = j.run(old, hour=15)
+    decision_id = j.decision(run_id, old)
+    stamp = _at(old, 19)
+    conn.execute(
+        "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
+        "security_id, symbol, side, notional, quantity, position_side, "
+        "sells_in_flight_at_submit, known_at, ingested_at) "
+        "SELECT 'bulk-' || i, ?, ?, ?, 1, 'buy', 'SEC_A', 'SEC_A', 'buy', NULL, 1.0, 'long', "
+        "FALSE, ?, ? FROM range(5000) t(i)",
+        [decision_id, run_id, old, stamp, stamp],
+    )
+    conn.execute(
+        "INSERT INTO order_events (client_order_id, event_at, status, known_at, ingested_at) "
+        "SELECT 'bulk-' || i, ?, 'filled', ?, ? FROM range(5000) t(i)",
+        [stamp, stamp, stamp],
+    )
+    first = j.next_id("fills")
+    conn.execute(
+        "INSERT INTO fills (fill_id, client_order_id, filled_at, quantity, price, "
+        "price_implied, broker_fill_id, source, known_at, ingested_at) "
+        "SELECT ? + i, 'bulk-' || i, ?, 1.0, 100.0, FALSE, 'bulk-f' || i, 'broker_feed', ?, ? "
+        "FROM range(5000) t(i)",
+        [first, stamp, stamp, stamp],
+    )
+    conn.close()
+    fast = Settings(
+        _env_file=None, store={"path": str(fixture_store_path), "lock_retry_seconds": 4}
+    )
+    with open_read_only(fast) as read:
+        ops.owner_queue(read, fast, NOW)  # warm-up: the calendar and imports
+        started = time.monotonic()
+        queue = ops.owner_queue(read, fast, NOW)
+        elapsed = time.monotonic() - started
+    assert queue.shakedown_progress is not None  # the shakedown really ran
+    assert elapsed < fast.store.lock_retry_seconds / 2

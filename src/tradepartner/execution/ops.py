@@ -1586,14 +1586,20 @@ def _waiting_shakedown(
     conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime
 ) -> waiting.ShakedownFacts | None:
     """`paper shakedown`'s lines at `now` without E.7's health half (module
-    docstring), or None with no `shakedown_span` row; a `ValueError` (a window's
-    `frozen_json` without a tolerance E.3 needs) becomes the facts' `error`."""
+    docstring), or None with no `shakedown_span` row. Any error in that read (a
+    window's `frozen_json` without a tolerance E.3 needs, or a defect) becomes the
+    facts' `error`, so it never hides the books' own items; the schema gates
+    (`SchemaVersionError`, `JournalNotInitialised`) still raise as before."""
     if registry.shakedown_span(conn) is None:
         return None
     try:
         result = shakedown.shakedown(conn, settings, now=now, check_health=False)
+    except (SchemaVersionError, JournalNotInitialised):
+        raise
     except ValueError as exc:
         return waiting.ShakedownFacts(error=str(exc))
+    except Exception as exc:  # a diagnostic read must not hide a safety item
+        return waiting.ShakedownFacts(error=f"{type(exc).__name__}: {exc}")
     return waiting.ShakedownFacts(lines=result.lines)
 
 

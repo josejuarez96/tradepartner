@@ -417,7 +417,10 @@ def shakedown_progress(facts: ShakedownFacts | None) -> str | None:
     ]
     failing = sum(1 for line in facts.lines if line.state == "failing")
     if not waiting_on and not failing:
-        return "shakedown: every line passes so far"
+        return (
+            "shakedown: every line passes so far (E.7's health half is not checked "
+            "here; `paper shakedown` is the gate)"
+        )
     text = "shakedown in progress: " + ("; ".join(waiting_on) if waiting_on else "nothing pending")
     if failing:
         text += f" ({failing} line(s) failing, listed under waiting on you)"
