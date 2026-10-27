@@ -14,6 +14,8 @@ registered.
 
 **Pre-registration decisions:** Jose Juarez, 2026-10-27, #2109 (answers to PR #2108).
 
+**Universe (2026-10-27, before registration):** utilities (SIC 4900-4999) are excluded, as in every earlier momentum trial: the momentum family's rules were frozen on 2026-10-07 with that exclusion, before ADR 0006's 2026-10-11 amendment made "no exclusion" the default, and `sweep register` refuses a file that differs (Jose Juarez, 2026-10-27).
+
 This is the sweep file the hypothesis file
 [b10-short-term-momentum](../hypotheses/b10-short-term-momentum.md) names: B10 enters the
 lab as a sweep, because a standalone file registers only as a promoted one (strategy-lab
@@ -97,6 +99,7 @@ signal_anchor = "month_end"
 
 [universe]
 top_n_by_cap = 1000
+exclude_sic_ranges = [[4900, 4999]]
 accepted_price_jumps = []
 accepted_same_day_pairs = ["0001903392@2024-03-14"]
 accepted_shares_facts = []
