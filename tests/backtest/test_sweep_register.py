@@ -422,10 +422,16 @@ def test_a_family_with_hypotheses_but_no_rules_is_refused(
 @pytest.mark.parametrize(
     ("edit", "rule"),
     [
-        (("start = 2023-01-03", "start = 2023-02-01"), "holdout.start"),
+        (
+            ("start = 2023-01-03", "start = 2023-02-01"),
+            r"holdout\.start \(family: 2023-01-03, this file: 2023-02-01\)",
+        ),
         (("end = 2025-12-31", "end = 2025-11-28"), "holdout.end"),
         ((IN_SAMPLE_START, "in_sample_start = 2018-02-28"), "in_sample_start"),
-        (("[gap]", "[universe]\ntop_n_by_cap = 400\n\n[gap]"), "universe.top_n_by_cap"),
+        (
+            ("[gap]", "[universe]\ntop_n_by_cap = 400\n\n[gap]"),
+            r"universe\.top_n_by_cap \(family: 1000, this file: 400\)",
+        ),
         (("[gap]", '[execution]\nfill_price = "open"\n\n[gap]'), "execution.fill_price"),
         (("count_share_threshold = 0.05", "count_share_threshold = 0.04"), "gap.count_share"),
         (("[gap]", "[backtest]\ninitial_capital = 50000.0\n\n[gap]"), "backtest.initial_capital"),
@@ -433,7 +439,10 @@ def test_a_family_with_hypotheses_but_no_rules_is_refused(
             ("[0.0, 30.0, 60.0, 100.0]", "[0.0, 30.0, 60.0]"),
             "costs.sensitivity_per_side_bps",
         ),
-        (("per_side_bps = 15.0", "per_side_bps = 10.0"), r"costs.per_side_bps \(lower"),
+        (
+            ("per_side_bps = 15.0", "per_side_bps = 10.0"),
+            r"costs\.per_side_bps \(lower than the family's 15\.0; this file: 10\.0\)",
+        ),
     ],
 )
 def test_a_file_off_the_family_rules_is_refused_naming_the_rule(
@@ -463,7 +472,14 @@ def test_a_momentum_file_omitting_the_utility_key_is_refused_by_name_and_naming_
     _twin(lab_store, named, tmp_path)
     path = _copy(tmp_path, SWEEP_SOURCE)
 
-    _refused(lab_store, path, settings, FamilyRuleError, r"universe\.exclude_sic_ranges")
+    _refused(
+        lab_store,
+        path,
+        settings,
+        FamilyRuleError,
+        r"universe\.exclude_sic_ranges \(family: \[\[4900, 4999\]\], "
+        r"this file: \[\] \(current default\)\)",
+    )
 
     result = register(lab_store, path, named, registered_by="test")
     assert isinstance(result, SweepRegistration) and result.created
@@ -1149,11 +1165,15 @@ def test_a_fixed_block_without_the_terms_registers_under_rules_stored_before_the
     [
         ({}, "spread_bps = 5.0", None),
         ({}, "impact_coeff = 0.1", None),
-        ({}, "adv_sessions = 10", r"costs\.adv_sessions \(not fixed by the family rules\)"),
+        (
+            {},
+            "adv_sessions = 10",
+            r"costs\.adv_sessions \(not fixed by the family rules; this file: 10\)",
+        ),
         (
             {"costs.spread_bps": 5.0},
             "spread_bps = 2.0",
-            r"costs\.spread_bps \(lower than the family's 5\.0\)",
+            r"costs\.spread_bps \(lower than the family's 5\.0; this file: 2\.0\)",
         ),
         ({"costs.spread_bps": 5.0}, "spread_bps = 8.0", None),
     ],
@@ -1231,9 +1251,21 @@ def test_the_three_rule_differences_agree_on_the_cost_terms(
             assert {d.split(" ")[0] for d in differences} == refused, (name, case)
         for name in ("hypothesis", "sweep"):
             if "costs.adv_sessions" in refused and "costs.adv_sessions" not in rules.fixed_params:
-                assert "costs.adv_sessions (not fixed by the family rules)" in found[name], case
+                expected = (
+                    "costs.adv_sessions (not fixed by the family rules; "
+                    f"this file: {params['costs.adv_sessions']!r} (current default))"
+                    if name == "sweep"
+                    else "costs.adv_sessions (not fixed by the family rules)"
+                )
+                assert expected in found[name], case
             if refused == {"costs.spread_bps"}:
-                assert "costs.spread_bps (lower than the family's 5.0)" in found[name], case
+                expected = (
+                    "costs.spread_bps (lower than the family's 5.0; "
+                    f"this file: {params['costs.spread_bps']!r} (current default))"
+                    if name == "sweep"
+                    else "costs.spread_bps (lower than the family's 5.0)"
+                )
+                assert expected in found[name], case
 
 
 # ── the long/short refusals on the sweep path (#2051 item 1) ───────────────────
