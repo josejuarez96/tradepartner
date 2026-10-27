@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from tradepartner.config import Settings
-from tradepartner.store.db import StoreLockedError, open_read_only
+from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only
 
 _HOLDER = (
     "import duckdb, sys, time\n"
@@ -70,3 +70,39 @@ def test_a_retrying_open_gives_up_after_lock_retry_seconds(fixture_store_path: P
         ):
             pass
         assert 0.9 <= time.monotonic() - started < 2.5
+
+
+def test_on_wait_fires_once_on_the_first_retry_of_either_open(fixture_store_path: Path) -> None:
+    """#2200: the caller hears of a wait from the open itself, once, with the holder."""
+    settings = _settings(fixture_store_path, 20)
+    for opener in (
+        lambda heard: open_read_only(settings, retry=True, on_wait=heard.append),
+        lambda heard: open_for_write(settings, on_wait=heard.append),
+    ):
+        heard: list[str] = []
+        with writer_held(str(fixture_store_path), 1.0), opener(heard):
+            pass
+        assert len(heard) == 1, heard
+        assert "PID" in heard[0]
+
+
+def test_on_wait_never_fires_when_the_store_is_free(fixture_store_path: Path) -> None:
+    settings = _settings(fixture_store_path, 20)
+    heard: list[str] = []
+    with open_read_only(settings, retry=True, on_wait=heard.append):
+        pass
+    with open_for_write(settings, on_wait=heard.append):
+        pass
+    assert heard == []
+
+
+def test_on_wait_never_fires_without_retry(fixture_store_path: Path) -> None:
+    settings = _settings(fixture_store_path, 20)
+    heard: list[str] = []
+    with (
+        writer_held(str(fixture_store_path), 1.0),
+        pytest.raises(StoreLockedError),
+        open_read_only(settings, on_wait=heard.append),
+    ):
+        pass
+    assert heard == []

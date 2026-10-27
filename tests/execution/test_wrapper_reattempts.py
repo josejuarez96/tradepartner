@@ -41,6 +41,7 @@ from .test_wrapper_phases import (
     _override,
     _query,
     _run,
+    _settings,
     _submits,
 )
 
@@ -348,6 +349,10 @@ def test_partly_filled_buy_cancelled_for_halt_retries_only_unfilled_target(
 def test_full_exit_cancelled_after_partial_fill_sells_reconciled_remainder(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
+    # The fixture clock is at the window's last second: widen the window.
+    env.settings = _settings(
+        env.settings.store.path, paper={"submit_window_after_open_minutes": 60}
+    )
     _hold(env, A, 10.0)
     exit_ = _decision(env, A, "sell", quantity=8.0, reason="left_targets")
     env.fake.script(PartialFill(4.0, PRICE))

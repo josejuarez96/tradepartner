@@ -1,3 +1,0 @@
-- #1889 Successor chains: the as-of reads, resolver rule 9, `--fill-holes`, the repair dry run and the engine's held position (T187b)
-### Added
-- Data: successor chains (#821, T187b) — the six as-of reads re-key a live chain's predecessor rows to its successor (filters and id-keyed `accepted_*` entries mapped the same way) and hide a chained successor's own bars before its first listing row until its chain is known, `ListingResolver` rule 9 starts the successor's first span at the predecessor's span end, `--fill-holes` lists those sessions as the successor's, the repair dry run lists each live chain with its ratio, and the engine renames a held predecessor to its successor at the first step that sees the chain, counting `n_chained_positions` on the rebalance row.

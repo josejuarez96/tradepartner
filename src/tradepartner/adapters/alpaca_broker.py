@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -486,12 +487,21 @@ class AlpacaBroker(Broker):
         return [_mapped("order", _order, p) for p in payloads]
 
     def fills(self, since: datetime | None = None) -> list[Fill]:
-        """Every fill activity with `filled_at >= since`, oldest first."""
+        """Every fill activity with `filled_at >= since`, oldest first.
+
+        Alpaca paper can follow a fractional order's fill with a negative-quantity
+        `partial_fill` row 2 ms later that corrects it (#2149: a `fill` of 1 then
+        -0.64777629, the position 7 + 1 - 0.64777629). Such a row is folded into
+        the same order's latest earlier row in this read, at the same price, keeping
+        that row's id and time; a correction with no such row, another symbol, side
+        or price, or a result that is not positive is a `SystemFaultError`.
+        """
         self._now()
         start = _EPOCH if since is None else ensure_tz_aware_utc(since, field_name="since")
         activities = self._raw.list_fill_activities(max(_EPOCH, start - _AFTER_MARGIN))
         owners: dict[str, str] = {}
         fills: list[Fill] = []
+        order_ids: list[Any] = []
         for activity in activities:
             # Filter first, so no order is resolved for a fill the caller did not ask for.
             if (
@@ -499,7 +509,11 @@ class AlpacaBroker(Broker):
                 < start
             ):
                 continue
+            if _mapped("fill activity", lambda a: _number(a["qty"]), activity) < 0:
+                _mapped("fill activity", lambda a: _fold_correction(a, fills, order_ids), activity)
+                continue
             fills.append(_mapped("fill activity", lambda a: self._fill(a, owners), activity))
+            order_ids.append(activity.get("order_id"))
         return fills
 
     def positions(self) -> dict[str, Position]:
@@ -579,7 +593,7 @@ class AlpacaBroker(Broker):
         return Fill(
             client_order_id=owners[broker_order_id],
             symbol=activity["symbol"],
-            side=Side(activity["side"]),
+            side=_activity_side(activity["side"]),
             quantity=_number(activity["qty"]),
             price=_number(activity["price"]),
             filled_at=_instant(activity["transaction_time"]),
@@ -604,6 +618,60 @@ class AlpacaBroker(Broker):
                 f"fill of broker order {broker_order_id!r}: no client_order_id resolved"
             )
         return coid
+
+
+#: Alpaca's account-activity `side` strings (#2163). A short sale reports
+#: `sell_short`; it is a sell to `Side`, which carries no position side (the
+#: short book's intent lives in the plan, and the position's sign in `positions`).
+#: A cover reports a plain `buy`. The docs list only `buy` and `sell`, but the
+#: sandbox probes (2026-10-19 and 2026-10-20, AAPL, 1 share and 0.5 + 0.5 covers)
+#: recorded `sell_short` opens and plain `buy` covers, never `buy_to_cover`
+#: (docs/research/2026-10-19-alpaca-sandbox-probe.md and the scrubbed rows in
+#: tests/fixtures/alpaca/paper/short_fills.json). Any other string,
+#: `buy_to_cover` included, is unclassified and faults (fail closed).
+_ACTIVITY_SIDES = {"buy": Side.BUY, "sell": Side.SELL, "sell_short": Side.SELL}
+
+
+def _activity_side(value: Any) -> Side:
+    """The `Side` of a fill activity's `side` string, or `ValueError`."""
+    if not isinstance(value, str) or value not in _ACTIVITY_SIDES:
+        raise ValueError(f"fill activity side {value!r} is not classified")
+    return _ACTIVITY_SIDES[value]
+
+
+def _fold_correction(activity: Mapping[str, Any], fills: list[Fill], order_ids: list[Any]) -> None:
+    """Fold a negative-quantity fill row into its order's latest earlier row in
+    `fills`, in place (#2149). Raise `ValueError` (mapped to `SystemFaultError`)
+    unless that row exists, has the same symbol, side and price, and stays
+    positive (#2153)."""
+    order_id = activity["order_id"]
+    at = _instant(activity["transaction_time"])
+    price = _number(activity["price"])
+    for index in range(len(fills) - 1, -1, -1):
+        if order_ids[index] == order_id and fills[index].filled_at <= at:
+            break
+    else:
+        raise ValueError(
+            f"fill correction {activity['id']!r} of order {order_id!r} has no earlier fill"
+        )
+    corrected = fills[index]
+    if activity["symbol"] != corrected.symbol:
+        raise ValueError(
+            f"fill correction {activity['id']!r} symbol {activity['symbol']!r} "
+            f"disagrees with {corrected.symbol!r}"
+        )
+    if _activity_side(activity["side"]) != corrected.side:
+        raise ValueError(
+            f"fill correction {activity['id']!r} side {activity['side']!r} "
+            f"disagrees with {corrected.side.value!r}"
+        )
+    if price != corrected.price:
+        raise ValueError(
+            f"fill correction {activity['id']!r} at {price} corrects a fill at {corrected.price}"
+        )
+    # Summed as decimals, so 1 - 0.64777629 is 0.35222371 with no float residue.
+    quantity = float(Decimal(repr(corrected.quantity)) + Decimal(str(activity["qty"])))
+    fills[index] = replace(corrected, quantity=quantity)
 
 
 def _position(payload: Mapping[str, Any]) -> Position:
