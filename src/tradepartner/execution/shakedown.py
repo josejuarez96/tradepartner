@@ -95,6 +95,7 @@ an E.6 channel whose attempts all failed, and any other shortfall, is `failing`.
 from __future__ import annotations
 
 import json
+from bisect import bisect_left
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -499,19 +500,38 @@ def _drill_bracket(run: _Run, brackets: Iterable[_Bracket]) -> _Bracket | None:
     )
 
 
-def _owner_engaged(run: _Run, switches: Sequence[_Switch]) -> bool:
+def _engagement_timeline(
+    switches: Iterable[_Switch],
+) -> dict[int, tuple[list[datetime], list[bool]]]:
+    """Per window, the switch times in order and whether the owner's switch
+    was engaged after each one (sorted once, so a run's lookup is a bisect)."""
+    by_window: dict[int, list[_Switch]] = {}
+    for s in switches:
+        by_window.setdefault(s.window_id, []).append(s)
+    out: dict[int, tuple[list[datetime], list[bool]]] = {}
+    for window_id, rows in by_window.items():
+        rows.sort(key=lambda s: (s.at, s.event_id))
+        times: list[datetime] = []
+        states: list[bool] = []
+        engaged = False
+        for switch in rows:
+            if switch.state == _RELEASED:
+                engaged = False
+            elif switch.state == _ENGAGED and switch.source == _OWNER:
+                engaged = True
+            times.append(switch.at)
+            states.append(engaged)
+        out[window_id] = (times, states)
+    return out
+
+
+def _owner_engaged(run: _Run, timeline: dict[int, tuple[list[datetime], list[bool]]]) -> bool:
     """Whether the owner's switch was engaged when a scheduler run began."""
-    if run.invoked_by != _SCHEDULER:
+    if run.invoked_by != _SCHEDULER or run.window_id not in timeline:
         return False
-    engaged = False
-    for switch in sorted(switches, key=lambda s: (s.at, s.event_id)):
-        if switch.window_id != run.window_id or switch.at >= run.started_at:
-            continue
-        if switch.state == _RELEASED:
-            engaged = False
-        elif switch.state == _ENGAGED and switch.source == _OWNER:
-            engaged = True
-    return engaged
+    times, states = timeline[run.window_id]
+    index = bisect_left(times, run.started_at)  # switches strictly before the start
+    return index > 0 and states[index - 1]
 
 
 def _sessions_line(
@@ -912,11 +932,12 @@ def _drill_line(
     spoiled: list[str] = []
     in_span = [s for s in switches if s.at >= span.start_at]
     books = {w.window_id: w.book_id for w in windows}
+    timeline = _engagement_timeline(switches)
     for run in runs:
         if (
             not span.start_at <= run.started_at <= now
             or run.kind not in _DRILL_KINDS
-            or not _owner_engaged(run, switches)
+            or not _owner_engaged(run, timeline)
         ):
             continue
         text = f"book {books.get(run.window_id)} run {run.run_id} on {run.session}"
