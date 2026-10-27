@@ -320,7 +320,8 @@ def _still_halts_on_the_open_finding(
     Paper spec amendment #2266 item 8: a `finding_key` part (`merger_conflict`)
     never closes on its own; only `paper true-up` (T282) closes it. T281 keeps
     the halt (`open finding`, no order) until then, so the old "resume, then
-    `ok`" no longer holds: the row is `breaks` (the finding part) and books the band, and the run
+    `ok`" no longer holds: the row is `breaks` (the finding part) and the
+    delisting band is asserted on the row's `explained` entry, and the run
     raises.
     """
     with pytest.raises(ReconciliationError, match="open finding"):
