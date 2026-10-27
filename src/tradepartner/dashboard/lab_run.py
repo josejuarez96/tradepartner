@@ -103,7 +103,10 @@ class SlotLost(Exception):
     """The slot `take` created is no longer the file at the slot path."""
 
 
-def process_start_time(pid: int) -> str | None:
+PS_TIMEOUT_SECONDS = 10.0  # a bound on a local `ps`, not a trading threshold (#2357)
+
+
+def process_start_time(pid: int, *, timeout_seconds: float = PS_TIMEOUT_SECONDS) -> str | None:
     """`ps -o lstart= -p <pid>` (list form, no shell); None when the PID is gone.
 
     Raises `PsUnavailable` when `ps` itself fails or times out (unknown, not gone).
@@ -114,7 +117,7 @@ def process_start_time(pid: int) -> str | None:
             capture_output=True,
             text=True,
             check=False,
-            timeout=10,
+            timeout=timeout_seconds,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise PsUnavailable(str(exc)) from exc
