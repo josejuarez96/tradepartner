@@ -187,18 +187,24 @@ class _Journal:
         *,
         planned_notional: float | None = 1000.0,
         planned_quantity: float | None = None,
+        side: str = "buy",
+        position_side: str = "long",
+        whole_share: bool = False,
     ) -> int:
         decision_id = self.next_id("decisions")
         self.conn.execute(
             "INSERT INTO decisions (decision_id, run_id, rebalance_session, security_id, side, "
-            "planned_notional, planned_quantity, whole_share, decision, known_at, ingested_at) "
-            "VALUES (?, ?, ?, 'SEC_A', 'buy', ?, ?, FALSE, 'trade', ?, ?)",
+            "planned_notional, planned_quantity, whole_share, decision, position_side, "
+            "known_at, ingested_at) VALUES (?, ?, ?, 'SEC_A', ?, ?, ?, ?, 'trade', ?, ?, ?)",
             [
                 decision_id,
                 run_id,
                 session,
+                side,
                 planned_notional,
                 planned_quantity,
+                whole_share,
+                position_side,
                 _at(session, 19),
                 _at(session, 19),
             ],
@@ -217,14 +223,29 @@ class _Journal:
         fills: tuple[float, ...] = (10.0,),
         price: float = 100.0,
         fill_after_terminal: bool = False,
+        side: str = "buy",
+        position_side: str = "long",
+        hour: int = 19,
     ) -> None:
-        stamp = _at(session, 19)
+        stamp = _at(session, hour)
         self.conn.execute(
             "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
-            "security_id, symbol, side, notional, quantity, sells_in_flight_at_submit, known_at, "
-            "ingested_at) VALUES (?, ?, ?, ?, 1, 'buy', 'SEC_A', 'SEC_A', 'buy', ?, ?, FALSE, "
-            "?, ?)",
-            [coid, decision_id, run_id, session, notional, quantity, stamp, stamp],
+            "security_id, symbol, side, notional, quantity, position_side, "
+            "sells_in_flight_at_submit, known_at, ingested_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, 'SEC_A', 'SEC_A', ?, ?, ?, ?, FALSE, ?, ?)",
+            [
+                coid,
+                decision_id,
+                run_id,
+                session,
+                side,
+                side,
+                notional,
+                quantity,
+                position_side,
+                stamp,
+                stamp,
+            ],
         )
         self.conn.execute(
             "INSERT INTO order_events (client_order_id, event_at, status, known_at, ingested_at) "
@@ -643,6 +664,108 @@ def test_e3_allows_an_overfill_within_the_frozen_cash_tolerance(
     j.order("o-tol", decision_id, run_id, D1, fills=(10.0,), price=100.0005)
     conn.close()
     assert _line(_run(settings), "E.3 orders").passed
+
+
+# #2290: a notional decision whose orders go out by share count is judged in
+# shares. Reference price 100, planned notional 1000, every order filled at 115.
+_BY_SHARES = {
+    "trim": ("sell", "long", False, 10.0),
+    "whole-share buy": ("buy", "long", True, 9.0),  # floor(1000 / (100 * 1.02))
+    "short open": ("sell", "short", False, 10.0),  # floor(1000 / 100)
+    "partial cover": ("buy", "short", False, 10.0),
+}
+
+
+@pytest.mark.usefixtures("health")
+@pytest.mark.parametrize("kind", sorted(_BY_SHARES))
+def test_e3_a_quantity_order_of_a_notional_decision_filled_above_its_reference_passes(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, kind: str
+) -> None:
+    side, position_side, whole_share, shares = _BY_SHARES[kind]
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(
+        run_id, D1, side=side, position_side=position_side, whole_share=whole_share
+    )
+    j.order(
+        "o-shares",
+        decision_id,
+        run_id,
+        D1,
+        notional=None,
+        quantity=shares,
+        fills=(shares,),
+        price=115.0,
+        side=side,
+        position_side=position_side,
+    )
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert line.passed, line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_fails_on_two_quantity_orders_of_a_notional_decision_sized_at_once(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1, side="sell")
+    for coid in ("o-t1", "o-t2"):
+        j.order(coid, decision_id, run_id, D1, notional=None, quantity=10.0, side="sell")
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert not line.passed
+    assert f"decision {decision_id} filled 20 shares > sized 10" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_a_remainder_order_sized_after_an_earlier_fill_passes(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1, side="sell")
+    j.order(
+        "o-r1",
+        decision_id,
+        run_id,
+        D1,
+        notional=None,
+        quantity=10.0,
+        fills=(4.0,),
+        side="sell",
+        hour=15,
+    )
+    # the remainder, re-converted at a lower reference price: more shares than 10 - 4
+    j.order(
+        "o-r2",
+        decision_id,
+        run_id,
+        D1,
+        notional=None,
+        quantity=6.2,
+        fills=(6.2,),
+        side="sell",
+        hour=16,
+    )
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert line.passed, line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_a_notional_buy_is_still_judged_in_dollars(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1, planned_notional=1000.0)
+    j.order("o-n", decision_id, run_id, D1, notional=1100.0, fills=(10.5,), price=100.0)
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert not line.passed
+    assert f"decision {decision_id} filled 1050.00 > planned 1000.00" in line.detail
 
 
 @pytest.mark.usefixtures("health")

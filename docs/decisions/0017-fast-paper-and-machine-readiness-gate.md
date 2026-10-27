@@ -160,3 +160,13 @@ The decision stands; part E's E.2 line and E.4's real-halt clause are superseded
 **E.4's real-halt clause, as amended.** A real halt-path engagement in the span (a `halted` run) still restarts the span once the owner has resumed. A restriction is not a halt.
 
 Whether a trued-up external break also needs a `shakedown_note` is the paper spec's open question 45 (recommended: no; the true-up's typed reason is the record). This is what stops a single rare event from costing the daily book days of testing.
+
+## Correction 2026-10-26 (#2290): E.3's duplicate test judges orders by share count in shares
+
+The decision stands; E.3's duplicate clause for a notional decision is corrected as below, and the text above is left as written. A `planned_notional` decision is not always filled by notional orders. A trim (every sell, ADR 0010 amendment 2026-09-30), a whole-share buy, a short open or add, and a partial cover go out **by share count**, converted at the reference price. Judging their fills in dollars at the fill price fails every one that fills above its reference price, although nothing was oversold: on 2026-10-26, 68 of the daily book's 101 trims, so no span in which a book trims could pass. This is a defect in the check's wording, not a change of the bar: the quantity test, the mis-sized test, the breach test and both frozen tolerances are unchanged.
+
+**E.3's duplicate clause, as corrected.** For no `decisions` row in the span do the live fills of its `orders` (`fills.superseded_by IS NULL`) sum to more than:
+- `decisions.planned_quantity` plus the frozen `risk.reconcile_quantity_tolerance`, for a quantity decision (unchanged);
+- for a notional decision, keyed on each order's own field, not the decision's side:
+  - its orders with `orders.notional`: fill value (quantity times price) above `decisions.planned_notional` plus the frozen `risk.reconcile_cash_tolerance` (unchanged);
+  - its orders with `orders.quantity`: filled shares above the shares they were sized to, plus the frozen `risk.reconcile_quantity_tolerance`. The journal does not keep the reference price, so "sized to" is read from the orders: each allows its own `quantity` plus the shares the decision's quantity orders had filled by fills known before it (`fills.known_at` before `orders.known_at`), and the decision may fill the largest of those. Two orders sized before either filled allow one order's quantity; a remainder sized after a fill allows that fill plus its own quantity.

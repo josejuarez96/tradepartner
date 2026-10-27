@@ -55,8 +55,12 @@ and the day it closes may hold a run or not, so neither is required (ADR 0017:
 3. **`E.3 orders`**: (duplicate) for every decision with an order in the span,
    its orders' live fills sum to at most `planned_quantity` plus the decision
    window's frozen `risk.reconcile_quantity_tolerance` (a decision with a
-   `planned_quantity`), else to at most `planned_notional` (quantity times price)
-   plus the frozen `risk.reconcile_cash_tolerance`; (mis-sized) every span
+   `planned_quantity`); for a `planned_notional` decision, keyed on each order's
+   own field (#2290, ADR 0017 correction of 2026-10-26): its orders by notional
+   fill at most `planned_notional` (quantity times price) plus the frozen
+   `risk.reconcile_cash_tolerance`, and its orders by share count fill at most
+   the shares they were sized to (`_sized_shares`) plus the quantity tolerance,
+   never judged in dollars at the fill price; (mis-sized) every span
    order's live fills sum to at most its `quantity` plus the quantity tolerance,
    else its `notional` plus the cash tolerance; (breach) no span
    `paper_run_results` row with `fault_type = 'LimitBreachError'`.
@@ -96,7 +100,7 @@ from tradepartner.health import health_report
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
 from tradepartner.store.db import utc_now
-from tradepartner.store.journal import PaperWindowRow
+from tradepartner.store.journal import OrderRow, PaperWindowRow
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _SCHEDULER = "scheduler"
@@ -626,6 +630,31 @@ def _frozen_tolerance(window: PaperWindowRow, key: str) -> float:
     return float(value)
 
 
+def _sized_shares(
+    orders: Sequence[OrderRow], known: dict[str, list[tuple[datetime, float]]]
+) -> float:
+    """The most shares a notional decision's orders by share count may fill.
+
+    Each such order was sized to the decision's remainder from the fills known
+    when it was written, so it allows its own quantity plus the shares those
+    orders had filled by its `known_at` (a fill known strictly before it). The
+    decision may fill the largest of those. Two orders sized before either
+    filled (a duplicate) allow only one order's quantity; a remainder sized
+    after an earlier fill allows that fill plus its own quantity, whatever the
+    reference price it was converted at.
+    """
+    coids = [o.client_order_id for o in orders]
+    budgets = [0.0]
+    for order in orders:
+        if order.quantity is None:
+            continue
+        before = sum(
+            qty for coid in coids for at, qty in known.get(coid, ()) if at < order.known_at
+        )
+        budgets.append(order.quantity + before)
+    return max(budgets)
+
+
 def _orders_line(
     conn: duckdb.DuckDBPyConnection, span: Span, windows: dict[int, PaperWindowRow]
 ) -> ShakedownLine:
@@ -635,10 +664,12 @@ def _orders_line(
     }
     quantity: dict[str, float] = {}
     notional: dict[str, float] = {}
+    known: dict[str, list[tuple[datetime, float]]] = {}
     for item in store_journal.fills_for(conn):
         coid = item.fill.client_order_id
         quantity[coid] = quantity.get(coid, 0.0) + item.fill.quantity
         notional[coid] = notional.get(coid, 0.0) + item.fill.quantity * item.fill.price
+        known.setdefault(coid, []).append((item.fill.known_at, item.fill.quantity))
     orders = store_journal.orders_for(conn, window_id=None)
     in_span = [o for o in orders if o.session >= span.first_day]
 
@@ -662,9 +693,9 @@ def _orders_line(
                 f"order {coid} filled {notional[coid]:.2f} > notional {order.notional:.2f}"
             )
     decision_ids = sorted({o.decision_id for o in in_span})
-    by_decision: dict[int, list[str]] = {}
+    by_decision: dict[int, list[OrderRow]] = {}
     for order in orders:
-        by_decision.setdefault(order.decision_id, []).append(order.client_order_id)
+        by_decision.setdefault(order.decision_id, []).append(order)
     planned = {
         int(d): (run, pq, pn)
         for d, run, pq, pn in conn.execute(
@@ -679,7 +710,8 @@ def _orders_line(
             continue
         run_id, planned_quantity, planned_notional = planned[decision_id]
         qty_tol, cash_tol = tolerances(run_id)
-        coids = by_decision[decision_id]
+        mine = by_decision[decision_id]
+        coids = [o.client_order_id for o in mine]
         if planned_quantity is not None:
             got = sum(quantity.get(c, 0.0) for c in coids)
             if got > planned_quantity + qty_tol:
@@ -687,11 +719,25 @@ def _orders_line(
                     f"decision {decision_id} filled {got:g} shares > planned {planned_quantity:g}"
                 )
         elif planned_notional is not None:
-            got = sum(notional.get(c, 0.0) for c in coids)
+            # #2290: keyed on each order's own field. Orders by notional are judged
+            # in dollars against the plan; orders by share count (trims, whole-share
+            # buys, short opens, partial covers) were converted at a reference price
+            # the journal does not keep, so they are judged in shares against what
+            # they were sized to (`_sized_shares`), never in dollars at the fill price.
+            by_value = [o.client_order_id for o in mine if o.quantity is None]
+            got = sum(notional.get(c, 0.0) for c in by_value)
             if got > planned_notional + cash_tol:
                 failures.append(
                     f"decision {decision_id} filled {got:.2f} > planned {planned_notional:.2f}"
                 )
+            by_shares = [o for o in mine if o.quantity is not None]
+            if by_shares:
+                shares = sum(quantity.get(o.client_order_id, 0.0) for o in by_shares)
+                sized = _sized_shares(by_shares, known)
+                if shares > sized + qty_tol:
+                    failures.append(
+                        f"decision {decision_id} filled {shares:g} shares > sized {sized:g}"
+                    )
         else:
             got = sum(quantity.get(c, 0.0) for c in coids)
             if got > 0:
@@ -710,8 +756,10 @@ def _orders_line(
         passed=not failures,
         rows="decisions, orders, fills (live), paper_run_results",
         query=(
-            "per span decision: its orders' live fills against planned_quantity or "
-            "planned_notional; per span order: its live fills against quantity or notional; "
+            "per span decision: its orders' live fills against planned_quantity, or "
+            "for planned_notional its notional orders' fill value against it and its "
+            "quantity orders' shares against what they were sized to; "
+            "per span order: its live fills against quantity or notional; "
             "span run results with fault_type='LimitBreachError'"
         ),
         thresholds=f"each window's frozen {_QUANTITY_TOLERANCE} and {_CASH_TOLERANCE}",
