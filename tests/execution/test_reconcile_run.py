@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -67,6 +68,7 @@ from tradepartner.store.journal import (
     ReconciliationRow,
     adjustments_for,
     append,
+    break_events_for,
     fills_for,
     kill_switch_events_for,
     orders_for,
@@ -538,6 +540,579 @@ def _rows(settings: Settings, window: PaperWindowRow) -> list[ReconciliationRow]
 def _adjustments(settings: Settings, window: PaperWindowRow) -> list[AdjustmentRow]:
     with open_read_only(settings) as conn:
         return adjustments_for(conn, window.window_id)  # type: ignore[arg-type]
+
+
+def test_named_cash_break_is_written_before_the_temporary_halt(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.activities = [CashActivity("name-credit", "MA", S, "executed", 30.0, "SPY")]
+    fake.extra_cash = 30.0
+    submits_before = sum(call.method == "submit" for call in fake.calls)
+
+    with pytest.raises(ReconciliationError):
+        reconcile_command(
+            journal_settings, lambda: open_for_write(journal_settings), fake, fixed_clock
+        )
+
+    (row,) = _rows(journal_settings, frozen_window)
+    with open_read_only(journal_settings) as conn:
+        events = break_events_for(conn, frozen_window.window_id or 0)
+        switch_events = kill_switch_events_for(conn, frozen_window.window_id or 0)
+    assert row.status == "breaks"
+    assert [(event.event, event.security_id, event.cash_amount) for event in events] == [
+        ("opened", SPY, 30.0)
+    ]
+    assert switch_events[-1].state == "engaged"
+    assert sum(call.method == "submit" for call in fake.calls) == submits_before
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock)
+    with open_read_only(journal_settings) as conn:
+        events = break_events_for(conn, frozen_window.window_id or 0)
+    assert [event.event for event in events] == ["opened", "observed"]
+    assert events[0].break_id == events[1].break_id
+
+
+@pytest.mark.parametrize(
+    ("types", "cause"),
+    [(("DIVNRA",), "corporate_action"), (("DIVNRA", "MA"), "unattributed")],
+)
+def test_a_mixed_name_cash_part_takes_the_least_attributed_cause(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    types: tuple[str, ...],
+    cause: str,
+) -> None:
+    """Item 14: a cause is set only by evidence that can produce the observed
+    kind. A dividend row fits `DIVNRA` but not `MA`, so a part holding both is
+    not `corporate_action`."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _dividend(
+        journal_settings,
+        SPY,
+        0.5,
+        CUT - timedelta(days=5),
+        ex_date=S - timedelta(days=2),
+        source_action_id="div-old",
+    )
+    # A clean reconciliation first, so the held name has no own trading since the
+    # last completed one (an own fill forces `unattributed`, item 14).
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "ok"
+    later = next_session(S)
+    fixed_clock.now = session_close(S) + timedelta(hours=18)
+    fake.activities = [
+        *fake.activities,
+        *(
+            CashActivity(f"credit-{i}", kind, later, "executed", 30.0, "SPY")
+            for i, kind in enumerate(types)
+        ),
+    ]
+    fake.extra_cash = 30.0 * len(types)
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later)
+
+    with open_read_only(journal_settings) as conn:
+        opened = break_events_for(conn, frozen_window.window_id or 0)[0]
+    assert opened.cause == cause
+
+
+def _last_event(settings: Settings, window: PaperWindowRow) -> Any:
+    with open_read_only(settings) as conn:
+        return break_events_for(conn, window.window_id or 0)[-1]
+
+
+def test_a_short_quantity_break_records_the_signed_ledger_short(
+    journal_settings: Settings,
+    flip_fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Greptile P1: a ledger short of 10 against broker -11 is a 1-share break,
+    not a break of the whole -11 (the ledger keeps shorts in `short_holdings`)."""
+    run_id = _hold(journal_settings, flip_fake, open_window, {(SPY, "SPY"): 10.0})
+    flipped = next_session(S)
+    traded_at = datetime.combine(flipped, datetime.min.time(), tzinfo=UTC) + timedelta(hours=18)
+    fixed_clock.now = traded_at
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, traded_at, Side.SELL, PositionIntent.SELL_TO_CLOSE
+    )
+    _filled_flip_trade(
+        journal_settings, flip_fake, run_id, traded_at, Side.SELL, PositionIntent.SELL_TO_OPEN
+    )
+    flip_fake.extra_quantity = {"SPY": -1.0}
+    fixed_clock.now = datetime.combine(flipped, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, flip_fake, open_window, fixed_clock, session=flipped)
+
+    event = _last_event(journal_settings, open_window)
+    assert (event.ledger_quantity, event.broker_quantity) == (-10.0, -11.0)
+
+
+def test_a_changed_unknown_symbol_quantity_keeps_the_earlier_finding(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Greptile P1: findings are matched by `finding_key`, so 4 shares then 5
+    shares of an unmapped symbol keeps both keys until a true-up."""
+    fake.activities = [FUNDING]
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    for quantity in (4.0, 5.0):
+        fake.extra_quantity = {MTUM_WI: quantity}
+        with pytest.raises(ReconciliationError, match="unknown_symbol"):
+            _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    parts = json.loads(_last_event(journal_settings, open_window).parts_json)
+    keys = [p["finding_key"] for p in parts if p["kind"] == "unknown_symbol"]
+    assert len(keys) == 2 and len(set(keys)) == 2
+
+
+def test_a_part_with_a_new_cause_is_observed_under_the_opening_cause(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Greptile P1: the journal refuses a cause that rewrites the opening one, so
+    a later unattributed part is recorded in `parts_json` and the event keeps the
+    opening `corporate_action`; the reconciliation is not rolled back."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _dividend(
+        journal_settings,
+        SPY,
+        0.5,
+        CUT - timedelta(days=5),
+        ex_date=S - timedelta(days=2),
+        source_action_id="div-old",
+    )
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "ok"
+    later = next_session(S)
+    fixed_clock.now = session_close(S) + timedelta(hours=18)
+    fake.activities = [
+        *fake.activities,
+        CashActivity("c0", "DIVNRA", later, "executed", 30.0, "SPY"),
+    ]
+    fake.extra_cash = 30.0
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later)
+
+    fake.extra_quantity = {"SPY": -1.0}
+    with pytest.raises(ReconciliationError) as caught:
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later)
+
+    assert "could not be written" not in str(caught.value)
+    event = _last_event(journal_settings, frozen_window)
+    assert event.event == "observed" and event.cause == "corporate_action"
+    assert "unattributed" in event.parts_json
+
+
+def test_a_failed_closing_event_write_engages_the_switch(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Greptile P1: a break that clears on an `ok` read still halts when its
+    closing event cannot be written: `ReconciliationError`, switch engaged."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity = {"SPY": -1.0}
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock)
+    fake.extra_quantity = {}
+
+    def fail_events(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("event writer failed")
+
+    monkeypatch.setattr(reconcile_run, "_write_break_events", fail_events)
+    with pytest.raises(ReconciliationError, match="break events could not be written"):
+        reconcile_command(
+            journal_settings, lambda: open_for_write(journal_settings), fake, fixed_clock
+        )
+
+    with open_read_only(journal_settings) as conn:
+        switch_events = kill_switch_events_for(conn, frozen_window.window_id or 0)
+    assert switch_events[-1].state == "engaged"
+
+
+def test_failed_break_event_write_engages_switch_and_submits_no_order(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.activities = [CashActivity("name-credit", "MA", S, "executed", 30.0, "SPY")]
+    fake.extra_cash = 30.0
+    submits_before = sum(call.method == "submit" for call in fake.calls)
+
+    def fail_events(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("event writer failed")
+
+    monkeypatch.setattr(reconcile_run, "_write_break_events", fail_events)
+    with pytest.raises(ReconciliationError, match="break events could not be written"):
+        reconcile_command(
+            journal_settings, lambda: open_for_write(journal_settings), fake, fixed_clock
+        )
+
+    with open_read_only(journal_settings) as conn:
+        switch_events = kill_switch_events_for(conn, frozen_window.window_id or 0)
+        events = break_events_for(conn, frozen_window.window_id or 0)
+    assert switch_events[-1].state == "engaged"
+    assert events == []
+    assert sum(call.method == "submit" for call in fake.calls) == submits_before
+
+
+def test_pending_order_with_a_name_break_still_raises_after_journaling(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _order(
+        journal_settings,
+        run_id,
+        "tp-still-pending",
+        MTUM,
+        "MTUM",
+        1.0,
+        events=("pending",),
+        fill=False,
+    )
+    fake.extra_quantity["SPY"] = 1.0
+
+    with pytest.raises(ReconciliationError, match=r"broker_only_position|quantity"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert _rows(journal_settings, open_window)[-1].status == PENDING_UNRESOLVED
+    with open_read_only(journal_settings) as conn:
+        events = break_events_for(conn, open_window.window_id or 0)
+    assert [event.event for event in events] == ["opened"]
+
+
+@pytest.mark.parametrize("write_fails", [False, True])
+def test_due_rebalance_with_a_break_never_reaches_submit(
+    journal_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    write_fails: bool,
+) -> None:
+    from execution import test_run_core as run_fixture
+
+    clock = run_fixture.Clock(run_fixture._at(run_fixture.F_0))
+    broker = BookedFake(
+        assets=FakeBroker.active_assets("SPY"),
+        clock=clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        cash=100_000.0,
+        account_id="PA1",
+    )
+    env = run_fixture.Env(journal_settings, clock, broker)
+    window = env.window(first=run_fixture.T_0, started=run_fixture._at(run_fixture.T_0, 12))
+    env.ingest(run_fixture._at(run_fixture.T_0, 21))
+    env.append(
+        AdjustmentRow(
+            window_id=window.window_id or 0,
+            session=run_fixture.T_0,
+            kind="spinoff_receipt",
+            security_id=SPY,
+            quantity=1.0,
+            known_at=run_fixture._at(run_fixture.T_0, 13),
+            ingested_at=run_fixture._at(run_fixture.T_0, 13),
+        )
+    )
+    broker.extra_quantity["SPY"] = 2.0
+    if write_fails:
+
+        def fail_events(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("event writer failed")
+
+        monkeypatch.setattr(reconcile_run, "_write_break_events", fail_events)
+
+    with pytest.raises(ReconciliationError):
+        env.run(run_fixture._at(run_fixture.F_0))
+
+    assert env.engaged()
+    assert "submit" not in env.broker_methods()
+    assert env.query("SELECT kind FROM paper_runs") == [("rebalance",)]
+    assert env.query("SELECT status FROM paper_run_results") == [("halted",)]
+    rows = env.query("SELECT status FROM reconciliations")
+    assert rows == ([] if write_fails else [("breaks",)])
+
+
+def test_two_store_copies_write_identical_break_events(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+) -> None:
+    copy_path = tmp_path / "copy.duckdb"
+    shutil.copyfile(journal_settings.store.path, copy_path)
+    copy_settings = Settings(_env_file=None, store={"path": str(copy_path)})
+    fake.extra_quantity["SPY"] = 10.0
+
+    for settings in (journal_settings, copy_settings):
+        with pytest.raises(ReconciliationError):
+            _reconcile(settings, fake, open_window, fixed_clock)
+
+    events = []
+    for settings in (journal_settings, copy_settings):
+        with open_read_only(settings) as conn:
+            events.append(break_events_for(conn, open_window.window_id or 0))
+    assert events[0] == events[1]
+    assert events[0][0].break_id == f"{open_window.window_id}:{SPY}:1"
+
+
+def test_next_session_merger_explains_an_open_quantity_break(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(MTUM, "MTUM"): 10.0})
+    fake.extra_quantity["MTUM"] = -10.0
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert _rows(journal_settings, open_window)[-1].status == "breaks"
+
+    known = datetime(2026, 10, 1, 19, 0, tzinfo=UTC)
+    _fact(
+        journal_settings,
+        "mergers",
+        security_id=MTUM,
+        kind="cash",
+        acquirer_security_id=None,
+        acquiree_symbol="MTUM",
+        acquiree_cusip="SYNTH-MTUM",
+        acquirer_symbol="",
+        acquirer_cusip="",
+        share_ratio=None,
+        cash_per_share=20.0,
+        effective_date=S,
+        process_date=S,
+        payable_date=S,
+        source_action_id="merger-1",
+        known_at=known,
+        ingested_at=known,
+        source="alpaca",
+        provenance="action",
+    )
+    following = next_session(S)
+    fixed_clock.now = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)
+    fake.extra_cash = 200.0
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, session=following)
+
+    assert result.status == OK
+    with open_read_only(journal_settings) as conn:
+        events = break_events_for(conn, open_window.window_id or 0)
+    assert [event.event for event in events] == ["opened", "auto_explained"]
+    assert any(
+        a.kind == "corporate_action_cash" for a in _adjustments(journal_settings, open_window)
+    )
+
+
+def test_merger_closure_cites_only_its_own_adjustment(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(MTUM, "MTUM"): 10.0, (SPY, "SPY"): 10.0})
+    fake.extra_quantity["MTUM"] = -10.0
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    known = datetime(2026, 10, 1, 19, 0, tzinfo=UTC)
+    _fact(
+        journal_settings,
+        "mergers",
+        security_id=MTUM,
+        kind="cash",
+        acquirer_security_id=None,
+        acquiree_symbol="MTUM",
+        acquiree_cusip="SYNTH-MTUM",
+        acquirer_symbol="",
+        acquirer_cusip="",
+        share_ratio=None,
+        cash_per_share=20.0,
+        effective_date=S,
+        process_date=S,
+        payable_date=S,
+        source_action_id="merger-cited",
+        known_at=known,
+        ingested_at=known,
+        source="alpaca",
+        provenance="action",
+    )
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    fake.activities = [CashActivity("div-spy", "DIV", S, "executed", 5.0, "SPY")]
+    fake.extra_cash = 205.0
+    fixed_clock.now = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, session=next_session(S))
+    assert result.status == OK
+    with open_read_only(journal_settings) as conn:
+        event = break_events_for(conn, open_window.window_id or 0)[-1]
+    adjustments = _adjustments(journal_settings, open_window)
+    merger_id = next(a.adjustment_id for a in adjustments if a.kind == "corporate_action_cash")
+    assert event.event == "auto_explained"
+    assert json.loads(event.adjustment_ids_json or "[]") == [merger_id]
+
+
+def test_observed_break_retains_finding_parts_and_structured_keys(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 1.0
+    original = reconcile_run._explanations
+    finding = {"active": True}
+
+    def with_findings(*args: Any, **kwargs: Any) -> Explanations:
+        result = original(*args, **kwargs)
+        if not finding["active"]:
+            return result
+        return replace(
+            result,
+            merger_conflicts={
+                SPY: "merger ids ['deal-b', 'deal-a'] for SEC_SPY effective 2026-10-01"
+            },
+            dividend_findings={
+                SPY: "2 live dividend records of 0.5 with ex-date 2026-10-01 "
+                "(div-a known 2026-09-30) that the reviewed list does not explain"
+            },
+        )
+
+    monkeypatch.setattr(reconcile_run, "_explanations", with_findings)
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    with open_read_only(journal_settings) as conn:
+        opened = break_events_for(conn, open_window.window_id or 0)[-1]
+    keys = {part["kind"]: part["finding_key"] for part in json.loads(opened.parts_json)}
+    assert keys["merger_conflict"] == '["merger_conflict", ["deal-a", "deal-b"]]'
+    assert keys["unexplained_dividend_group"] == (
+        '["unexplained_dividend_group", "SEC_SPY", ["2026-10-01"]]'
+    )
+
+    finding["active"] = False
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    fake.extra_quantity["SPY"] = 0.0
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert _rows(journal_settings, open_window)[-1].status == "breaks"
+    with open_read_only(journal_settings) as conn:
+        events = break_events_for(conn, open_window.window_id or 0)
+    assert [event.event for event in events] == ["opened", "observed", "observed"]
+    assert {part["kind"] for part in json.loads(events[-1].parts_json)} == {
+        "merger_conflict",
+        "unexplained_dividend_group",
+    }
+
+    _order(
+        journal_settings,
+        run_id,
+        "tp-finding-pending",
+        MTUM,
+        "MTUM",
+        1.0,
+        events=("pending",),
+        fill=False,
+    )
+    with pytest.raises(ReconciliationError, match="open finding"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert _rows(journal_settings, open_window)[-1].status == PENDING_UNRESOLVED
+
+
+def test_dividend_due_beside_a_break_books_once_after_the_break_clears(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0, (MTUM, "MTUM"): 10.0})
+    _dividend(journal_settings, MTUM, 0.5, CUT - timedelta(days=1))
+    fake.activities = [CashActivity("div-mtum", "DIV", S, "executed", 5.0, "MTUM")]
+    fake.extra_cash = 5.0
+    fake.extra_quantity["SPY"] = 1.0
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert _rows(journal_settings, open_window)[-1].status == "breaks"
+
+    fake.extra_quantity["SPY"] = 0.0
+    fixed_clock.now = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, session=next_session(S))
+    assert result.status == OK
+    assert [(a.kind, a.cash) for a in _adjustments(journal_settings, open_window)] == [
+        ("dividend_cash", pytest.approx(5.0))
+    ]
+
+
+def test_book_fault_keeps_an_open_break_observed_until_safe_closure(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = -10.0
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    fake.extra_quantity["SPY"] = 0.0
+    fake.extra_cash = 10.0
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    with open_read_only(journal_settings) as conn:
+        events = break_events_for(conn, open_window.window_id or 0)
+    assert [event.event for event in events] == ["opened", "observed"]
+
+
+def test_old_name_residual_opens_a_break_without_rewriting_its_row(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    earlier = fixed_clock() - timedelta(minutes=1)
+    old = ReconciliationRow(
+        window_id=open_window.window_id or 0,
+        at=earlier,
+        status="mismatch",
+        broker_cash=None,
+        mismatches_json='{"mismatches": [{"kind": "quantity"}]}',
+        known_at=earlier,
+        ingested_at=earlier,
+    )
+    _append(journal_settings, old)
+    before = _rows(journal_settings, open_window)[0]
+    fake.extra_quantity["SPY"] = 1.0
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    rows = _rows(journal_settings, open_window)
+    assert rows[0] == before
+    assert rows[-1].status == "breaks"
+    with open_read_only(journal_settings) as conn:
+        events = break_events_for(conn, open_window.window_id or 0)
+    assert [event.event for event in events] == ["opened"]
 
 
 def _reference(settings: Settings, security_id: str) -> float:
@@ -1329,16 +1904,21 @@ def test_a_split_known_only_after_close_of_the_previous_session_is_a_mismatch(
     fixed_clock: FixedClock,
 ) -> None:
     _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == OK
     _split(journal_settings, SPY, 2.0, CUT + timedelta(minutes=1))
     fake.extra_quantity["SPY"] = 10.0
 
     with pytest.raises(ReconciliationError, match="quantity"):
         _reconcile(journal_settings, fake, open_window, fixed_clock)
 
-    (row,) = _rows(journal_settings, open_window)
-    assert row.status == MISMATCH
+    row = _rows(journal_settings, open_window)[-1]
+    assert _rows(journal_settings, open_window)[0].status == OK
+    assert row.status == "breaks"
     assert row.broker_cash is None
     assert [m["kind"] for m in json.loads(row.mismatches_json or "")["mismatches"]] == ["quantity"]
+    with open_read_only(journal_settings) as conn:
+        (event,) = break_events_for(conn, open_window.window_id or 0)
+    assert event.cause == "unattributed"
 
 
 # --- each explanation kind writes its adjustment -----------------------------
