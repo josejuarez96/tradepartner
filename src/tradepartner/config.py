@@ -2528,6 +2528,10 @@ class UiConfig(_ClosedConfig):
     start plus one retry delay). A set value must exceed that sum, or a kill still
     waiting on the store would be reported as not confirmed (`Settings`, at load).
 
+    The Lab's file listing (plan T289, #2319): `lab_message_chars` caps a parser
+    message the page shows; `lab_git_timeout_seconds` bounds each read-only git
+    call that decides a file's merged state.
+
     The Lab page (plan T291, #2304): `lab_orphan_after_hours` is how long an open
     `sweep_runs` row or an `unfinished` trial may stay open before the page lists it
     apart as an orphan (a run whose writer died) that no longer blocks a new run.
@@ -2538,6 +2542,8 @@ class UiConfig(_ClosedConfig):
     max_reason_chars: int = Field(default=500, gt=0)
     kill_wait_seconds: int | None = Field(default=None, gt=0)
     kill_wait_margin_seconds: int = Field(default=30, gt=0)
+    lab_message_chars: int = Field(default=500, gt=0)
+    lab_git_timeout_seconds: int = Field(default=10, gt=0)
     lab_orphan_after_hours: int = Field(default=24, gt=0)
 
     @field_validator("next_run_time_et")

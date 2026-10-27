@@ -768,9 +768,23 @@ def family_rule_params(params: Mapping[str, Any]) -> dict[str, Any]:
 def _rule_differences(
     file: SweepFile, params: Mapping[str, Any], rules: lab_registry.FamilyRules
 ) -> list[str]:
-    """The family rules `file` and one variant's frozen set `params` break, by name."""
+    """The family rules `file` and one variant's frozen set `params` break."""
+
+    def short(value: Any) -> str:
+        shown = value.isoformat() if isinstance(value, date) else repr(value)
+        return shown if len(shown) <= 80 else f"{shown[:77]}..."
+
+    def this_value(key: str, value: Any) -> str:
+        origin = (
+            " (current default)" if key not in file.fixed_params and key not in file.grid else ""
+        )
+        return f"{short(value)}{origin}"
+
+    def compared(key: str, rule: Any, value: Any) -> str:
+        return f"{key} (family: {short(rule)}, this file: {this_value(key, value)})"
+
     differences = [
-        name
+        f"{name} (family: {short(theirs)}, this file: {short(ours)})"
         for name, ours, theirs in (
             ("holdout.start", file.holdout_start, rules.holdout_start),
             ("holdout.end", file.holdout_end, rules.holdout_end),
@@ -779,31 +793,42 @@ def _rule_differences(
         if ours != theirs
     ]
     if file.parent_family is not None and file.parent_family != rules.parent_family:
-        differences.append(f"parent_family (the family's is {rules.parent_family!r})")
+        differences.append(
+            f"parent_family (family: {short(rules.parent_family)}, "
+            f"this file: {short(file.parent_family)})"
+        )
     defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
     for key, rule in sorted(rules.fixed_params.items()):
         value = params.get(key)
         if key in frozen.HIGHER_ALLOWED_COST_KEYS:
             if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
                 continue
-            differences.append(f"{key} (lower than the family's {rule})")
+            differences.append(
+                f"{key} (lower than the family's {short(rule)}; "
+                f"this file: {this_value(key, value)})"
+            )
         elif key == "costs.adv_sessions":
             if value is not None and frozen.is_default(value, rule):
                 continue
-            differences.append(key)
+            differences.append(compared(key, rule, value))
         elif key == registry.BASE_COST_KEY:
             if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
                 continue
-            differences.append(f"{key} (lower than the family's {rule})")
+            differences.append(
+                f"{key} (lower than the family's {short(rule)}; "
+                f"this file: {this_value(key, value)})"
+            )
         elif key not in params or not frozen.is_default(value, rule):
-            differences.append(key)
+            differences.append(compared(key, rule, value))
     for key, value in sorted(family_rule_params(params).items()):
         if key in rules.fixed_params:
             continue
         # A frozen key that landed after the rules were written, at its behaviour-
         # preserving default, is the rules' behaviour; any other value is not.
         if not (key in defaults and frozen._cost_key_allows(key, value, defaults[key])):
-            differences.append(f"{key} (not fixed by the family rules)")
+            differences.append(
+                f"{key} (not fixed by the family rules; this file: {this_value(key, value)})"
+            )
     return differences
 
 
