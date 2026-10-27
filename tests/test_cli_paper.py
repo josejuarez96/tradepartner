@@ -2249,6 +2249,21 @@ def test_status_all_with_no_window(clock: _Clock, factory: _Factory) -> None:
     )
 
 
+def test_status_all_prints_the_shakedown_progress_after_the_queue(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    # #2298: progress is a line of its own, never an item under "waiting on you"
+    progress = "shakedown in progress: E.1 sessions: 2 of 10 sessions"
+    monkeypatch.setattr(
+        ops,
+        "owner_queue",
+        lambda conn, s, now: ops.OwnerQueue(items=(), shakedown_progress=progress),
+    )
+    out = _paper(clock, factory, "status", "--all")
+    assert out.exit_code == 0
+    assert out.output.endswith(f"waiting on you: nothing\n{progress}\n")
+
+
 @pytest.mark.parametrize(
     "args",
     [

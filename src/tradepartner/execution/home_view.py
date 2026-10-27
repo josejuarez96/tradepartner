@@ -96,6 +96,11 @@ _WORDS: Final[dict[str, tuple[str, str, str | None]]] = {
         "Write a line saying what happened, so the shakedown can count the day.",
         None,
     ),
+    "shakedown_failing": (
+        "A shakedown check is failing",
+        "Run the shakedown to read the whole line, then fix what it names.",
+        None,
+    ),
     "report_due": (
         "A tracking report is due",
         "Run the report once; it counts as one test.",
@@ -114,6 +119,7 @@ _URGENCY: Final[tuple[str, ...]] = (
     "overdue_delisting",
     "missed_run",
     "shakedown_note",
+    "shakedown_failing",
     "report_due",
     "unreadable",
 )
@@ -222,6 +228,12 @@ def _needs_you(
     for item in items:
         title, sentence, fallback = _WORDS[item.kind]
         action = item.command or (fallback or "").format(book=item.book_id)
+        if item.kind == "shakedown_failing":
+            # the line's name and its next step (#2298); the item's detail stays
+            # on `paper status --all`
+            title = f"{title}: {item.line}" if item.line else title
+            step = waiting.shakedown_next_step(item.line)
+            sentence = f"{step[:1].upper()}{step[1:]}."
         out.append(NeedsYou(item.book_id, item.kind, f"{title} ({item.book_id})", sentence, action))
     for late in overdue:
         title, sentence, fallback = _WORDS["overdue_delisting"]

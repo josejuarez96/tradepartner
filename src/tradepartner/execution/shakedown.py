@@ -82,6 +82,12 @@ and the day it closes may hold a run or not, so neither is required (ADR 0017:
 7. **`E.7 data`**: every `stale_data` alert in the span has a `shakedown_note`,
    and `health.health_report` at `now` is `ok` (`tradepartner health --check`'s
    rule; it reads the live `Settings` exactly as that command does).
+
+**Progress or failing** (#2298). Each line also says, structurally, whether it
+fails only on what time or the drill clears (`ShakedownLine.state`): E.1's
+session and order-session counts and a pending span, and E.4 with no drill yet,
+are `in_progress`; any other shortfall is `failing`. The owner's queue
+(`execution.waiting`) reads that, never the printed detail.
 """
 
 from __future__ import annotations
@@ -90,7 +96,7 @@ import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -126,11 +132,21 @@ _CASH_TOLERANCE = "risk.reconcile_cash_tolerance"
 #: How many failing items a line names before it says "and n more".
 _NAMED = 10
 
+#: A line's verdict for the owner's queue (#2298): `passed`; `in_progress` when it
+#: fails only on what more sessions or the drill clear; `failing` otherwise.
+LineState = Literal["passed", "in_progress", "failing"]
+
 
 @dataclass(frozen=True, kw_only=True)
 class ShakedownLine:
     """One criterion's verdict: the rows it read, its query in words, the
-    thresholds it compared against and what it found, pass or fail."""
+    thresholds it compared against and what it found, pass or fail.
+
+    `progress` names the shortfalls that only more sessions or the kill-switch
+    drill clear (E.1's session and order-session counts and a pending span, E.4's
+    missing drill); `problems` names every other shortfall of a line that sets
+    `progress`. Only E.1 and E.4 set them (#2298); any other failing line is
+    `failing` by `state`."""
 
     name: str
     passed: bool
@@ -138,6 +154,16 @@ class ShakedownLine:
     query: str
     thresholds: str
     detail: str
+    progress: tuple[str, ...] = ()
+    problems: tuple[str, ...] = ()
+
+    @property
+    def state(self) -> LineState:
+        """`passed`, `in_progress` (it fails only on `progress`) or `failing`:
+        a failing line with no `progress`, or with any `problems`, is `failing`."""
+        if self.passed:
+            return "passed"
+        return "in_progress" if self.progress and not self.problems else "failing"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -493,11 +519,15 @@ def _sessions_line(
         f"(shakedown_span decision {span.decision_id})"
     )
     failures: list[str] = []
+    progress: list[str] = []
     by_note = 0
     if span.start is None:
         failures.append("span pending")
+        progress.append(f"span pending, {span.restart}")
     elif len(span.sessions) < span.sessions_needed:
         failures.append(f"{len(span.sessions)} span session(s), need >= {span.sessions_needed}")
+        progress.append(f"{len(span.sessions)} of {span.sessions_needed} sessions")
+    problems_from = len(failures)
     in_span = set(span.sessions)
     for window in windows:
         assert window.window_id is not None
@@ -545,6 +575,7 @@ def _sessions_line(
                 continue
             statuses = ", ".join(f"run {r.run_id} {r.status or 'unfinished'}" for r in mine)
             failures.append(f"book {window.book_id} window {wid} {session}: {statuses}")
+    problems = tuple(failures[problems_from:])
     filled = {item.fill.client_order_id for item in store_journal.fills_for(conn)}
     filled_runs = {
         int(run_id)
@@ -562,6 +593,7 @@ def _sessions_line(
         failures.append(
             f"{len(order_sessions)} order session(s), need >= {span.order_sessions_needed}"
         )
+        progress.append(f"{len(order_sessions)} of {span.order_sessions_needed} order sessions")
     detail = (
         f"{span.describe()}; {len(order_sessions)} order session(s); "
         f"{by_note} session(s) passed by note"
@@ -575,6 +607,8 @@ def _sessions_line(
         query=query,
         thresholds=thresholds,
         detail=detail,
+        progress=tuple(progress),
+        problems=problems,
     )
 
 
@@ -877,6 +911,9 @@ def _drill_line(
     return ShakedownLine(
         name="E.4 kill-switch drill",
         passed=bool(drills),
+        # no drill yet is progress; a drilled run that wrote orders is a problem
+        progress=() if drills or spoiled else ("kill-switch drill not done yet",),
+        problems=() if drills else tuple(f"drilled run wrote orders: {s}" for s in spoiled),
         rows="kill_switch, paper_runs, paper_run_results, orders",
         query=(
             "in one window: an owner 'engaged' kill_switch row, then a scheduler "
@@ -964,17 +1001,22 @@ def _data_line(
     now: datetime,
     alerts: Sequence[_Alert],
     noted: set[int],
+    check_health: bool = True,
 ) -> ShakedownLine:
     unnoted = [
         f"stale_data alert {a.alert_id} (book {a.book_id}, {a.session})"
         for a in alerts
         if a.kind == _STALE_DATA and a.at >= span.start_at and a.alert_id not in noted
     ]
-    health = health_report(conn, now, settings)
     failures = list(unnoted)
-    if not health.ok:
-        failures.append(f"tradepartner health fails: {', '.join(health.failures)}")
-    detail = "every stale_data alert noted; health passes" if not failures else _named(failures)
+    if check_health:
+        health = health_report(conn, now, settings)
+        if not health.ok:
+            failures.append(f"tradepartner health fails: {', '.join(health.failures)}")
+        checked = "health passes"
+    else:
+        checked = "health not checked in this read (`tradepartner health --check`)"
+    detail = f"every stale_data alert noted; {checked}" if not failures else _named(failures)
     return ShakedownLine(
         name="E.7 data",
         passed=not failures,
@@ -993,10 +1035,14 @@ def shakedown(
     settings: Settings,
     *,
     now: datetime | None = None,
+    check_health: bool = True,
 ) -> Shakedown:
     """`paper shakedown` (ADR 0017 part E): the span and the seven lines over every
     book, reading only. Raises `ValueError` when no `shakedown_span` row exists or
-    a window's `frozen_json` lacks a tolerance key E.3 needs."""
+    a window's `frozen_json` lacks a tolerance key E.3 needs. `check_health=False`
+    leaves E.7's `health_report` half out (the owner's queue, #2298: that report
+    reads every fact table, too slow for a page read); E.7 then judges the notes
+    only and says so."""
     at = utc_now() if now is None else now
     switches = _switches(conn)
     closed = _closed_at(conn)
@@ -1020,6 +1066,6 @@ def shakedown(
             _drill_line(span, windows, runs, switches, brackets, ordered),
             _journal_line(conn, span, windows, closed),
             _alerts_line(conn, span, settings),
-            _data_line(conn, span, settings, at, alerts, noted),
+            _data_line(conn, span, settings, at, alerts, noted, check_health),
         ),
     )
