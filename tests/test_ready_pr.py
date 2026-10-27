@@ -1602,11 +1602,6 @@ def test_the_new_template_has_no_box_ready_pr_cannot_tick() -> None:
     assert ready_pr.unchecked_boxes(body.replace("- [ ]", "- [x]")) == []
 
 
-def test_book_page_requires_the_safety_review() -> None:
-    path = "src/tradepartner/dashboard/book_page.py"
-    assert ready_pr.required_reviews([path]) == {"safety-reviewer"}
-
-
 def test_static_invariant_tests_run_on_every_run_with_two_workers() -> None:
     """The whole-tree static tests run locally even when local pytest is skipped (#2367)."""
     names = ready_pr.STATIC_INVARIANT_TESTS
@@ -1636,3 +1631,8 @@ def test_a_failing_static_test_stops_before_the_push() -> None:
     with pytest.raises(ready_pr.ReadyError, match="static invariant tests failed"):
         ready_pr.ready(r, 69)
     assert r.pushed == []
+
+
+def test_book_page_requires_the_safety_review() -> None:
+    path = "src/tradepartner/dashboard/book_page.py"
+    assert ready_pr.required_reviews([path]) == {"safety-reviewer"}
