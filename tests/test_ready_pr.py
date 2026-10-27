@@ -163,7 +163,6 @@ REPO = Path(__file__).resolve().parents[1]
 # Listed on purpose before the module exists; drop an entry once its module lands.
 PLANNED_PREFIXES = {
     "src/tradepartner/llm/",  # Phase 5, ADR 0008
-    "src/tradepartner/dashboard/lab_",  # Lab builders T289-T299; drop once lab_run.py lands
 }
 
 
