@@ -577,6 +577,113 @@ def test_named_cash_break_is_written_before_the_temporary_halt(
     assert events[0].break_id == events[1].break_id
 
 
+def test_failed_break_event_write_engages_switch_and_submits_no_order(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.activities = [CashActivity("name-credit", "MA", S, "executed", 30.0, "SPY")]
+    fake.extra_cash = 30.0
+    submits_before = sum(call.method == "submit" for call in fake.calls)
+
+    def fail_events(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("event writer failed")
+
+    monkeypatch.setattr(reconcile_run, "_write_break_events", fail_events)
+    with pytest.raises(ReconciliationError, match="break events could not be written"):
+        reconcile_command(
+            journal_settings, lambda: open_for_write(journal_settings), fake, fixed_clock
+        )
+
+    with open_read_only(journal_settings) as conn:
+        switch_events = kill_switch_events_for(conn, frozen_window.window_id or 0)
+        events = break_events_for(conn, frozen_window.window_id or 0)
+    assert switch_events[-1].state == "engaged"
+    assert events == []
+    assert sum(call.method == "submit" for call in fake.calls) == submits_before
+
+
+def test_pending_order_with_a_name_break_still_raises_after_journaling(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _order(
+        journal_settings,
+        run_id,
+        "tp-still-pending",
+        MTUM,
+        "MTUM",
+        1.0,
+        events=("pending",),
+        fill=False,
+    )
+    fake.extra_quantity["SPY"] = 1.0
+
+    with pytest.raises(ReconciliationError, match=r"broker_only_position|quantity"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert _rows(journal_settings, open_window)[-1].status == PENDING_UNRESOLVED
+    with open_read_only(journal_settings) as conn:
+        events = break_events_for(conn, open_window.window_id or 0)
+    assert [event.event for event in events] == ["opened"]
+
+
+@pytest.mark.parametrize("write_fails", [False, True])
+def test_due_rebalance_with_a_break_never_reaches_submit(
+    journal_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    write_fails: bool,
+) -> None:
+    from execution import test_run_core as run_fixture
+
+    clock = run_fixture.Clock(run_fixture._at(run_fixture.F_0))
+    broker = BookedFake(
+        assets=FakeBroker.active_assets("SPY"),
+        clock=clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        cash=100_000.0,
+        account_id="PA1",
+    )
+    env = run_fixture.Env(journal_settings, clock, broker)
+    window = env.window(first=run_fixture.T_0, started=run_fixture._at(run_fixture.T_0, 12))
+    env.ingest(run_fixture._at(run_fixture.T_0, 21))
+    env.append(
+        AdjustmentRow(
+            window_id=window.window_id or 0,
+            session=run_fixture.T_0,
+            kind="spinoff_receipt",
+            security_id=SPY,
+            quantity=1.0,
+            known_at=run_fixture._at(run_fixture.T_0, 13),
+            ingested_at=run_fixture._at(run_fixture.T_0, 13),
+        )
+    )
+    broker.extra_quantity["SPY"] = 2.0
+    if write_fails:
+
+        def fail_events(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("event writer failed")
+
+        monkeypatch.setattr(reconcile_run, "_write_break_events", fail_events)
+
+    with pytest.raises(ReconciliationError):
+        env.run(run_fixture._at(run_fixture.F_0))
+
+    assert env.engaged()
+    assert "submit" not in env.broker_methods()
+    assert env.query("SELECT kind FROM paper_runs") == [("rebalance",)]
+    assert env.query("SELECT status FROM paper_run_results") == [("halted",)]
+    rows = env.query("SELECT status FROM reconciliations")
+    assert rows == ([] if write_fails else [("breaks",)])
+
+
 def test_two_store_copies_write_identical_break_events(
     journal_settings: Settings,
     fake: BookedFake,
@@ -647,6 +754,145 @@ def test_next_session_merger_explains_an_open_quantity_break(
     assert any(
         a.kind == "corporate_action_cash" for a in _adjustments(journal_settings, open_window)
     )
+
+
+def test_merger_closure_cites_only_its_own_adjustment(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(MTUM, "MTUM"): 10.0, (SPY, "SPY"): 10.0})
+    fake.extra_quantity["MTUM"] = -10.0
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    known = datetime(2026, 10, 1, 19, 0, tzinfo=UTC)
+    _fact(
+        journal_settings,
+        "mergers",
+        security_id=MTUM,
+        kind="cash",
+        acquirer_security_id=None,
+        acquiree_symbol="MTUM",
+        acquiree_cusip="SYNTH-MTUM",
+        acquirer_symbol="",
+        acquirer_cusip="",
+        share_ratio=None,
+        cash_per_share=20.0,
+        effective_date=S,
+        process_date=S,
+        payable_date=S,
+        source_action_id="merger-cited",
+        known_at=known,
+        ingested_at=known,
+        source="alpaca",
+        provenance="action",
+    )
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    fake.activities = [CashActivity("div-spy", "DIV", S, "executed", 5.0, "SPY")]
+    fake.extra_cash = 205.0
+    fixed_clock.now = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, session=next_session(S))
+    assert result.status == OK
+    with open_read_only(journal_settings) as conn:
+        event = break_events_for(conn, open_window.window_id or 0)[-1]
+    adjustments = _adjustments(journal_settings, open_window)
+    merger_id = next(a.adjustment_id for a in adjustments if a.kind == "corporate_action_cash")
+    assert event.event == "auto_explained"
+    assert json.loads(event.adjustment_ids_json or "[]") == [merger_id]
+
+
+def test_observed_break_retains_finding_parts_and_structured_keys(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 1.0
+    original = reconcile_run._explanations
+    finding = {"active": True}
+
+    def with_findings(*args: Any, **kwargs: Any) -> Explanations:
+        result = original(*args, **kwargs)
+        if not finding["active"]:
+            return result
+        return replace(
+            result,
+            merger_conflicts={
+                SPY: "merger ids ['deal-b', 'deal-a'] for SEC_SPY effective 2026-10-01"
+            },
+            dividend_findings={
+                SPY: "2 live dividend records of 0.5 with ex-date 2026-10-01 "
+                "(div-a known 2026-09-30) that the reviewed list does not explain"
+            },
+        )
+
+    monkeypatch.setattr(reconcile_run, "_explanations", with_findings)
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    with open_read_only(journal_settings) as conn:
+        opened = break_events_for(conn, open_window.window_id or 0)[-1]
+    keys = {part["kind"]: part["finding_key"] for part in json.loads(opened.parts_json)}
+    assert keys["merger_conflict"] == '["merger_conflict", ["deal-a", "deal-b"]]'
+    assert keys["unexplained_dividend_group"] == (
+        '["unexplained_dividend_group", "SEC_SPY", ["2026-10-01"]]'
+    )
+
+    finding["active"] = False
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    fake.extra_quantity["SPY"] = 0.0
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert _rows(journal_settings, open_window)[-1].status == "breaks"
+    with open_read_only(journal_settings) as conn:
+        events = break_events_for(conn, open_window.window_id or 0)
+    assert [event.event for event in events] == ["opened", "observed", "observed"]
+    assert {part["kind"] for part in json.loads(events[-1].parts_json)} == {
+        "merger_conflict",
+        "unexplained_dividend_group",
+    }
+
+    _order(
+        journal_settings,
+        run_id,
+        "tp-finding-pending",
+        MTUM,
+        "MTUM",
+        1.0,
+        events=("pending",),
+        fill=False,
+    )
+    with pytest.raises(ReconciliationError, match="open finding"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert _rows(journal_settings, open_window)[-1].status == PENDING_UNRESOLVED
+
+
+def test_dividend_due_beside_a_break_books_once_after_the_break_clears(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0, (MTUM, "MTUM"): 10.0})
+    _dividend(journal_settings, MTUM, 0.5, CUT - timedelta(days=1))
+    fake.activities = [CashActivity("div-mtum", "DIV", S, "executed", 5.0, "MTUM")]
+    fake.extra_cash = 5.0
+    fake.extra_quantity["SPY"] = 1.0
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert _rows(journal_settings, open_window)[-1].status == "breaks"
+
+    fake.extra_quantity["SPY"] = 0.0
+    fixed_clock.now = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, session=next_session(S))
+    assert result.status == OK
+    assert [(a.kind, a.cash) for a in _adjustments(journal_settings, open_window)] == [
+        ("dividend_cash", pytest.approx(5.0))
+    ]
 
 
 def test_book_fault_keeps_an_open_break_observed_until_safe_closure(

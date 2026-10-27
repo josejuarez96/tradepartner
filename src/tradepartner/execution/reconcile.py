@@ -728,20 +728,20 @@ def compare(
     max_states = frozen.reconcile_dividend_subset_states
     _validate(ledger, positions, account, explanations)
     security_of = _reverse(explanations.symbols)
-    # The store offers an explainer by name. Activities without one are
-    # attributed before its cash test; candidates wait for the second pass.
+    # The symbol map covers every journaled name, including one no longer held.
+    # Activities without an explainer are attributed before the cash test;
+    # candidates wait for the second pass. CIL retains its dedicated guard.
     named_cash: list[tuple[str, CashActivity]] = []
     candidate_cash: list[tuple[str, CashActivity]] = []
     for activity in explanations.activities:
         name = security_of.get(activity.symbol or "")
         if (
             name is None
-            or (name not in ledger.positions and activity.symbol not in positions)
             or activity.status != _EXECUTED
             or activity.net_amount is None
             or activity.net_amount == 0
             or _inside_base(activity, explanations)
-            or activity.activity_type == _FEE
+            or activity.activity_type in (_FEE, _CASH_IN_LIEU)
         ):
             continue
         candidate = (
@@ -1282,7 +1282,10 @@ def compare(
         mismatches=tuple(mismatches),
         lagging_ids=tuple(sorted(lagging_ids)),
         pending_ids=tuple(sorted(pending_ids)),
-        adjustments=tuple(explained) if status in (OK, BREAKS) else (),
+        # A breaks row is not yet a cash base (T282b). Do not book an
+        # explanation against it: a dividend with no activity id would then
+        # be offered again on the next session and create a phantom cash fault.
+        adjustments=tuple(explained) if status == OK else (),
         explained=tuple(explained),
         allowed=tuple(allowed),
         activities=activity_records,

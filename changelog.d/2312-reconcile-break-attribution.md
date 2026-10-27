@@ -1,3 +1,4 @@
-- T281 first seam: reconcile attributes named cash and journals break events while retaining the ReconciliationError halt (#2312).
+task: T281 (PR #2316)
+- T281 (#2312): reconcile attributes name-level breaks, journals events, and retains the fail-closed temporary halt.
 ### Added
-- Paper reconcile attributes eligible named cash and records open, observed, and explained break events before the temporary halt (#2312).
+- Paper reconciliation attributes cash on journaled names, records deterministic break events, and engages the kill switch on break-event write failure (#2312).

@@ -176,6 +176,20 @@ def test_executed_named_cash_without_a_due_is_a_break(activity_type: str) -> Non
     ]
 
 
+def test_cash_on_a_journaled_but_now_unheld_name_is_a_break() -> None:
+    activity = CashActivity("late-credit", "DIV", S, "executed", 12.0, "AAA")
+    result = _run(
+        _ledger(1_000.0),
+        _positions(),
+        1_012.0,
+        explanations=_explanations(activities=(activity,), activity_seen_before=PRIOR),
+    )
+    assert result.status == "breaks"
+    assert [(m.kind, m.security_id, m.activity_ids) for m in result.mismatches] == [
+        ("name_cash", "SEC_A", ("late-credit",))
+    ]
+
+
 def test_named_cash_does_not_hide_book_faults() -> None:
     activity = CashActivity("named", "MA", S, "executed", 12.0, "AAA")
     result = _run(
@@ -216,7 +230,7 @@ def test_candidate_explainer_does_not_hide_unbooked_unknown_cash() -> None:
     assert _kinds(result) == ["unexplained_activity"]
 
 
-def test_due_dividend_is_booked_beside_unrelated_named_cash() -> None:
+def test_due_dividend_is_explained_beside_unrelated_named_cash() -> None:
     due = CashActivity("due", "DIV", S, "executed", 5.0, "AAA")
     unrelated = CashActivity("other", "MA", S, "executed", 12.0, "AAA")
     result = _run(
@@ -230,7 +244,8 @@ def test_due_dividend_is_booked_beside_unrelated_named_cash() -> None:
         ),
     )
     assert result.status == "breaks"
-    assert [(a.kind, a.cash) for a in result.adjustments] == [("dividend_cash", 5.0)]
+    assert [(a.kind, a.cash) for a in result.explained] == [("dividend_cash", 5.0)]
+    assert result.adjustments == ()  # deferred until a reconciliation can be the cash base
     assert result.mismatches[0].activity_ids == ("other",)
 
 
@@ -308,7 +323,24 @@ def test_a_foreign_prefix_order_is_a_mismatch() -> None:
         _order_row("owner-manual-1", "SEC_A", "buy", quantity=1.0), OrderStatus.ACCEPTED
     )
     result = _run(_ledger(SEC_A=1.0), _positions(AAA=1.0), 1_000.0, open_orders=[foreign])
+    assert result.status == "mismatch"
     assert _kinds(result) == ["foreign_order"]
+
+
+def test_a_foreign_order_keeps_a_named_cash_break_at_book_halt() -> None:
+    foreign = _reading(
+        _order_row("owner-manual-1", "SEC_A", "buy", quantity=1.0), OrderStatus.ACCEPTED
+    )
+    activity = CashActivity("named", "MA", S, "executed", 12.0, "AAA")
+    result = _run(
+        _ledger(1_000.0, SEC_A=1.0),
+        _positions(AAA=1.0),
+        1_012.0,
+        open_orders=[foreign],
+        explanations=_explanations(activities=(activity,), activity_seen_before=PRIOR),
+    )
+    assert result.status == "mismatch"
+    assert _kinds(result) == ["foreign_order", "name_cash"]
 
 
 def test_an_own_prefix_order_the_journal_does_not_hold_open_is_a_mismatch() -> None:
@@ -1667,6 +1699,7 @@ def test_an_unknown_type_dated_on_the_start_date_is_still_unexplained() -> None:
         explanations=_explanations(
             activities=(_activity("act-on", "JNLC", date(2026, 10, 10), 25.0),),
             activity_seen_before=date(2026, 10, 10),
+            symbols={},  # no name from this window's journal
         ),
     )
 
@@ -2076,7 +2109,7 @@ def test_a_cash_in_lieu_whose_name_has_no_stock_dividend_halts() -> None:
     )
 
     assert result.status == "mismatch"
-    assert _kinds(result) == ["unexplained_activity", "cash", "name_cash"]
+    assert _kinds(result) == ["unexplained_activity"]
     assert "no stock dividend" in result.mismatches[0].detail
 
 
