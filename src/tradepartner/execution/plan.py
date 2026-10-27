@@ -1398,6 +1398,8 @@ def decisions_from(
                 sid
                 for sid in restricted
                 if sid in held
+                and sid in universe
+                and sid in targets
                 and sid not in kept
                 and sid not in open_forced_exits
                 and not ended(sid)

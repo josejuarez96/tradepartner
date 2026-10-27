@@ -43,6 +43,7 @@ from .test_wrapper_phases import (
     _execute,
     _gate,
     _hold,
+    _open_sell,
     _query,
     _submits,
 )
@@ -114,6 +115,14 @@ def test_a_restricted_name_leaving_the_targets_is_still_sold_whole() -> None:
     got = _by_name(_decide(("C", "X")))
     assert (got["C"].decision, got["C"].side, got["C"].planned_quantity) == ("trade", "sell", 5.0)
     assert (got["X"].decision, got["X"].reason) == ("trade", "left_universe")
+
+
+def test_a_restricted_name_leaving_the_targets_does_not_hold_weight_from_the_others() -> None:
+    """Its exit proceeds are the others' budget: sizes equal the unrestricted plan's."""
+    free = _by_name(_decide(()))
+    got = _by_name(_decide(("C",)))
+    assert got["A"].planned_notional == free["A"].planned_notional
+    assert got["B"].planned_notional == free["B"].planned_notional
 
 
 def test_a_restricted_exclude_name_override_still_sells() -> None:
@@ -215,6 +224,22 @@ def test_a_forced_exit_of_a_restricted_name_never_crosses_zero_on_the_broker(
 ) -> None:
     _hold(env, A, 10.0)
     _broker_sells(env, A, 7.0)  # broker 3
+    _append(env.settings, _break(env, A))
+    exit_ = _decision(env, A, "sell", quantity=10.0, decision="forced_exit", reason="window_stop")
+
+    _execute(_gate(env, alerter_conn), env, [], (exit_,))
+
+    (request,) = _submits(env.fake)
+    assert request.quantity == 3.0
+
+
+def test_an_open_own_sell_comes_off_the_broker_side_of_the_limit(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """Ledger 10, broker 7, 4 already open: at most 3 more may go, never 6."""
+    _hold(env, A, 10.0)
+    _broker_sells(env, A, 3.0)
+    _open_sell(env, A, 4.0)
     _append(env.settings, _break(env, A))
     exit_ = _decision(env, A, "sell", quantity=10.0, decision="forced_exit", reason="window_stop")
 

@@ -278,6 +278,7 @@ from tradepartner.execution.risk import (
     Violations,
     _buy_cash,
     check_phase,
+    open_sold,
     order_shape_violation,
     skip_cap,
     unfilled_sells,
@@ -1135,7 +1136,7 @@ class RiskGatedBroker:
         phase's first submit (`refused_position_side`, ADR 0015 seam 2)."""
         assert run.session is not None and run.run_id is not None
         session = run.session
-        built = self._restrict(run, book, built)
+        built = self._restrict(run, book, built, session)
         self._requests(built, book, session)
         candidates = [
             o.to_risk(str(book.symbols[o.security_id]), listing_ended=o.security_id in book.ended)
@@ -1256,7 +1257,7 @@ class RiskGatedBroker:
         )
 
     def _restrict(
-        self, run: PaperRunRow, book: _Book, built: phases.PhaseOrders
+        self, run: PaperRunRow, book: _Book, built: phases.PhaseOrders, session: date
     ) -> phases.PhaseOrders:
         """Item 7's restriction on every order of a phase, whatever the plan said.
 
@@ -1278,6 +1279,11 @@ class RiskGatedBroker:
         kept: list[phases.PhaseOrder] = []
         skips: list[Skip] = []
         decimals = self._decimals()
+        # The name's own sells still open at the broker are shares already spoken for
+        # on both books, so they come off both sides of the limit.
+        open_now = open_sold(
+            _open_sells(book, {o.security_id for o in built.orders}, session), decimals
+        )
         for order in built.orders:
             if order.security_id not in restricted:
                 kept.append(order)
@@ -1296,7 +1302,8 @@ class RiskGatedBroker:
             symbol = book.symbols[sid]
             position = held.get(canonical_symbol(symbol)) if symbol is not None else None
             broker_quantity = position.quantity if position is not None else 0.0
-            limit = break_rules.reducing_limit(ledger_quantity, broker_quantity)
+            spoken = float(open_now.get(sid, Decimal(0)))
+            limit = break_rules.reducing_limit(ledger_quantity - spoken, broker_quantity - spoken)
             wanted = (
                 order.quantity
                 if order.quantity is not None
