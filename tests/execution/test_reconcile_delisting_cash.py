@@ -92,12 +92,21 @@ def _halts_on_cash(
     window: PaperWindowRow,
     clock: FixedClock,
     session: date,
+    *,
+    name_level: bool = False,
 ) -> None:
-    """The reconcile raises and its row's only mismatch is `cash`."""
+    """The reconcile raises and its row's only residual is the credit.
+
+    Untagged, mis-tagged or unmapped credit stays the book-level `cash`
+    (`mismatch`). A credit tagged to a held name is, by amendment #2266 item 1,
+    a `name_cash` break (`breaks`); T281 still halts the run on it (the raise).
+    """
     with pytest.raises(ReconciliationError):
         _reconcile(settings, broker, window, clock, session=session)
-    payload = json.loads(_rows(settings, window)[-1].mismatches_json or "{}")
-    assert [m["kind"] for m in payload["mismatches"]] == ["cash"]
+    row = _rows(settings, window)[-1]
+    payload = json.loads(row.mismatches_json or "{}")
+    assert row.status == ("breaks" if name_level else "mismatch")
+    assert [m["kind"] for m in payload["mismatches"]] == ["name_cash" if name_level else "cash"]
 
 
 def _last_allowed(settings: Settings, window: PaperWindowRow) -> list[str]:
@@ -216,7 +225,7 @@ def test_a_tagged_credit_after_the_window_halts(
     fake.extra_cash = proceeds
     fake.activities.append(_credit("MTUM", proceeds, AFTER))
 
-    _halts_on_cash(journal_settings, fake, open_window, fixed_clock, AFTER)
+    _halts_on_cash(journal_settings, fake, open_window, fixed_clock, AFTER, name_level=True)
 
 
 def test_a_tagged_credit_far_above_the_position_value_halts(
@@ -232,7 +241,7 @@ def test_a_tagged_credit_far_above_the_position_value_halts(
     fake.extra_cash = big
     fake.activities.append(_credit("MTUM", big, later))
 
-    _halts_on_cash(journal_settings, fake, open_window, fixed_clock, later)
+    _halts_on_cash(journal_settings, fake, open_window, fixed_clock, later, name_level=True)
 
 
 def _paid_later(
@@ -277,7 +286,7 @@ def test_a_credit_just_over_the_premium_cap_halts(
     _removed_on_s(journal_settings, fake, open_window, fixed_clock)
     cap = 10 * _reference(journal_settings, MTUM) * 1.10
     later = _paid_later(journal_settings, fake, open_window, fixed_clock, cap + 0.5)
-    _halts_on_cash(journal_settings, fake, open_window, fixed_clock, later)
+    _halts_on_cash(journal_settings, fake, open_window, fixed_clock, later, name_level=True)
 
 
 def _partly_paid_on_s(
@@ -314,7 +323,7 @@ def test_a_late_credit_past_the_cash_already_booked_halts(
 ) -> None:
     _partly_paid_on_s(journal_settings, fake, open_window, fixed_clock)
     later = _paid_later(journal_settings, fake, open_window, fixed_clock, 1_061.25, already=400.0)
-    _halts_on_cash(journal_settings, fake, open_window, fixed_clock, later)
+    _halts_on_cash(journal_settings, fake, open_window, fixed_clock, later, name_level=True)
 
 
 def test_a_tender_offer_credit_is_booked(
@@ -341,7 +350,7 @@ def test_a_name_change_credit_halts(
     later = _paid_later(
         journal_settings, fake, open_window, fixed_clock, 1_000.0, activity_type="NC"
     )
-    _halts_on_cash(journal_settings, fake, open_window, fixed_clock, later)
+    _halts_on_cash(journal_settings, fake, open_window, fixed_clock, later, name_level=True)
 
 
 def test_no_cash_within_the_window_is_recorded_once_and_never_halts(
