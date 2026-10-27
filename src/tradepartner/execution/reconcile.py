@@ -163,6 +163,7 @@ OK = "ok"
 MISMATCH = "mismatch"
 PENDING_UNRESOLVED = "pending_unresolved"
 FILLS_LAGGING = "fills_lagging"
+BREAKS = "breaks"
 #: The mismatch kind of an equal-amount dividend group the reviewed list does
 #: not explain on a held name (#1625, #1613).
 UNEXPLAINED_DIVIDEND_GROUP = "unexplained_dividend_group"
@@ -364,6 +365,24 @@ class Mismatch:
     security_id: str | None = None
     symbol: str | None = None
     client_order_id: str | None = None
+    cash_amount: float | None = None
+    activity_ids: tuple[str, ...] = ()
+
+
+def _mismatch_json(mismatch: Mismatch) -> dict[str, object]:
+    """Keep historical mismatch bytes stable; add cash fields only when present."""
+    entry: dict[str, object] = {
+        "kind": mismatch.kind,
+        "detail": mismatch.detail,
+        "security_id": mismatch.security_id,
+        "symbol": mismatch.symbol,
+        "client_order_id": mismatch.client_order_id,
+    }
+    if mismatch.cash_amount is not None:
+        entry["cash_amount"] = mismatch.cash_amount
+    if mismatch.activity_ids:
+        entry["activity_ids"] = list(mismatch.activity_ids)
+    return entry
 
 
 @dataclass(frozen=True)
@@ -454,7 +473,7 @@ class Reconciliation:
         """The `reconciliations.mismatches_json` value, stable for equal results."""
         return json.dumps(
             {
-                "mismatches": [vars(m) for m in self.mismatches],
+                "mismatches": [_mismatch_json(m) for m in self.mismatches],
                 "lagging": list(self.lagging_ids),
                 "pending": list(self.pending_ids),
                 "explained": [_adjustment_json(a) for a in self.explained],
@@ -709,6 +728,32 @@ def compare(
     max_states = frozen.reconcile_dividend_subset_states
     _validate(ledger, positions, account, explanations)
     security_of = _reverse(explanations.symbols)
+    # The store offers an explainer by name. Activities without one are
+    # attributed before its cash test; candidates wait for the second pass.
+    named_cash: list[tuple[str, CashActivity]] = []
+    candidate_cash: list[tuple[str, CashActivity]] = []
+    for activity in explanations.activities:
+        name = security_of.get(activity.symbol or "")
+        if (
+            name is None
+            or (name not in ledger.positions and activity.symbol not in positions)
+            or activity.status != _EXECUTED
+            or activity.net_amount is None
+            or activity.net_amount == 0
+            or _inside_base(activity, explanations)
+            or activity.activity_type == _FEE
+        ):
+            continue
+        candidate = (
+            name in explanations.dividends
+            or name in explanations.mergers
+            or name in explanations.ended
+            or name in explanations.spinoffs
+            or name in explanations.stock_dividends
+            or name in explanations.delisted_cash
+        )
+        (candidate_cash if candidate else named_cash).append((name, activity))
+    attributable_ids = {a.activity_id for _, a in named_cash + candidate_cash}
     mismatches: list[Mismatch] = []
     if account.account_id != window.account_id:
         mismatches.append(
@@ -777,7 +822,11 @@ def compare(
     # `cash` is reported in cents and a broker fee is sub-cent, so the broker and
     # ledger balances are six-figure: the difference is taken in `Decimal`, from
     # each balance's shortest form, so a whole-cent fee never leaves float residue.
-    difference_decimal = Decimal(str(account.cash)) - Decimal(str(ledger.cash))
+    difference_decimal = (
+        Decimal(str(account.cash))
+        - Decimal(str(ledger.cash))
+        - sum((Decimal(str(a.net_amount)) for _, a in named_cash), Decimal(0))
+    )
     read_ids: set[str] = set()
     for activity in activities:
         if activity.activity_id in read_ids:
@@ -795,7 +844,7 @@ def compare(
         # activity outside the base is booked.
         inside_base = _inside_base(activity, explanations)
         unexplained = _activity_mismatch(activity, inside_base)
-        if unexplained is not None:
+        if unexplained is not None and activity.activity_id not in attributable_ids:
             mismatches.append(unexplained)
             continue
         if activity.activity_type == _FEE and activity.net_amount is not None and not inside_base:
@@ -1071,6 +1120,48 @@ def compare(
             explained += _dividend_adjustments([search_dues[i] for i in matches[0]])
     for name in sorted(merger_removed):
         expected.pop(name)
+    if not cash_ok and candidate_cash:
+        booked_ids = {a.broker_activity_id for a in explained if a.broker_activity_id}
+        remaining = [(n, a) for n, a in candidate_cash if a.activity_id not in booked_ids]
+        non_dividend = [
+            (n, a)
+            for n, a in remaining
+            if a.activity_type not in _DIVIDEND_TYPES
+            and n not in explanations.mergers
+            and n not in explanations.ended
+        ]
+        dividend_rest = difference_decimal - sum(
+            (Decimal(str(a.net_amount)) for _, a in non_dividend), Decimal(0)
+        )
+        if non_dividend and not deferring and len(dividend_dues) <= exhaustive_dues:
+            due_matches = [
+                indices
+                for count in range(1, len(dividend_dues) + 1)
+                for indices in combinations(range(len(dividend_dues)), count)
+                if abs(
+                    dividend_rest - Decimal(str(math.fsum(dividend_dues[i][1] for i in indices)))
+                )
+                <= cash_bound
+            ]
+            if len(due_matches) == 1:
+                named_cash.extend(non_dividend)
+                difference_decimal = dividend_rest
+                cash_ok = True
+                explained += _dividend_adjustments([dividend_dues[i] for i in due_matches[0]])
+        if not cash_ok:
+            rest = difference_decimal - sum(
+                (Decimal(str(a.net_amount)) for _, a in remaining), Decimal(0)
+            )
+            if remaining and _cash_allows(cash_band, rest, cash_bound):
+                named_cash.extend(remaining)
+                difference_decimal = rest
+                cash_ok = True
+    moved_ids = {activity.activity_id for _, activity in named_cash}
+    for _, activity in candidate_cash:
+        if activity.activity_id not in moved_ids:
+            residual = _activity_mismatch(activity, False)
+            if residual is not None:
+                mismatches.append(residual)
     if not cash_ok:
         mismatches.append(Mismatch("cash", f"broker {account.cash}, ledger {ledger.cash}"))
     elif abs(difference_decimal) > cash_bound and deferring:
@@ -1148,17 +1239,34 @@ def compare(
             )
         )
 
+    for name in sorted({name for name, _ in named_cash}):
+        grouped = sorted((a for n, a in named_cash if n == name), key=lambda a: a.activity_id)
+        mismatches.append(
+            Mismatch(
+                "name_cash",
+                "executed broker cash activities",
+                name,
+                explanations.symbols.get(name),
+                cash_amount=math.fsum(a.net_amount or 0.0 for a in grouped),
+                activity_ids=tuple(a.activity_id for a in grouped),
+            )
+        )
+
     if not deferring:
         allowed += [
             Allowed(OVERDUE_DELISTING_CASH, item.removed_quantity, name) for name, item in overdue
         ]
 
-    if mismatches:
+    from tradepartner.execution.breaks import is_name_level
+
+    if any(not is_name_level(m.kind) for m in mismatches):
         status = MISMATCH
     elif pending_ids:
         status = PENDING_UNRESOLVED
     elif lagging_ids:
         status = FILLS_LAGGING
+    elif mismatches:
+        status = BREAKS
     else:
         status = OK
     # The ticker changes the symbol map applied (#1761): recorded on the row,
@@ -1173,7 +1281,7 @@ def compare(
         mismatches=tuple(mismatches),
         lagging_ids=tuple(sorted(lagging_ids)),
         pending_ids=tuple(sorted(pending_ids)),
-        adjustments=tuple(explained) if status == OK else (),
+        adjustments=tuple(explained) if status in (OK, BREAKS) else (),
         explained=tuple(explained),
         allowed=tuple(allowed),
         activities=activity_records,

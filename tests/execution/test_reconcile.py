@@ -161,6 +161,79 @@ def test_matching_books_are_ok_and_record_the_broker_cash() -> None:
     assert result.adjustments == ()
 
 
+@pytest.mark.parametrize("activity_type", ["DIV", "MA", "DIVNRA"])
+def test_executed_named_cash_without_a_due_is_a_break(activity_type: str) -> None:
+    activity = CashActivity("new-credit", activity_type, S, "executed", 12.0, "AAA")
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_012.0,
+        explanations=_explanations(activities=(activity,), activity_seen_before=PRIOR),
+    )
+    assert result.status == "breaks"
+    assert [(m.kind, m.security_id, m.cash_amount, m.activity_ids) for m in result.mismatches] == [
+        ("name_cash", "SEC_A", 12.0, ("new-credit",))
+    ]
+
+
+def test_named_cash_does_not_hide_book_faults() -> None:
+    activity = CashActivity("named", "MA", S, "executed", 12.0, "AAA")
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_012.0,
+        explanations=_explanations(activities=(activity,), activity_seen_before=PRIOR),
+        account_id="other",
+    )
+    assert result.status == "mismatch"
+    assert _kinds(result) == ["account_id", "name_cash"]
+
+
+@pytest.mark.parametrize("symbol", [None, "ZZZ"])
+def test_untagged_or_unmapped_cash_stays_a_book_halt(symbol: str | None) -> None:
+    activity = CashActivity("orphan", "MA", S, "executed", 12.0, symbol)
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_012.0,
+        explanations=_explanations(activities=(activity,), activity_seen_before=PRIOR),
+    )
+    assert result.status == "mismatch"
+    assert _kinds(result) == ["cash"]
+
+
+def test_candidate_explainer_does_not_hide_unbooked_unknown_cash() -> None:
+    activity = CashActivity("tiny-int", "INT", S, "executed", 0.001, "AAA")
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0,
+        explanations=_explanations(
+            activities=(activity,), activity_seen_before=PRIOR, dividends={"SEC_A": 5.0}
+        ),
+    )
+    assert result.status == "mismatch"
+    assert _kinds(result) == ["unexplained_activity"]
+
+
+def test_due_dividend_is_booked_beside_unrelated_named_cash() -> None:
+    due = CashActivity("due", "DIV", S, "executed", 5.0, "AAA")
+    unrelated = CashActivity("other", "MA", S, "executed", 12.0, "AAA")
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_017.0,
+        explanations=_explanations(
+            activities=(due, unrelated),
+            activity_seen_before=PRIOR,
+            dividends={"SEC_A": 5.0},
+        ),
+    )
+    assert result.status == "breaks"
+    assert [(a.kind, a.cash) for a in result.adjustments] == [("dividend_cash", 5.0)]
+    assert result.mismatches[0].activity_ids == ("other",)
+
+
 @pytest.mark.parametrize(
     ("ledger", "positions", "cash", "kind"),
     [
@@ -176,7 +249,7 @@ def test_each_position_and_cash_mismatch(
 ) -> None:
     result = _run(ledger, positions, cash)
 
-    assert result.status == "mismatch"
+    assert result.status == ("mismatch" if kind == "cash" else "breaks")
     assert _kinds(result) == [kind]
     assert result.broker_cash is None  # never a re-base
     assert kind in json.loads(result.mismatches_json)["mismatches"][0]["kind"]
@@ -853,7 +926,7 @@ def test_an_own_prefix_broker_order_with_a_pending_row_is_a_resume_matter() -> N
 # --- precedence ------------------------------------------------------------------
 
 
-def test_status_precedence_mismatch_over_pending_over_lagging_over_ok() -> None:
+def test_status_precedence_mismatch_over_pending_over_lagging_over_breaks_over_ok() -> None:
     pending = _pending("tp-20261007-SEC_B-buy-1", "SEC_B", "buy", notional=200.0)
     lagging = _lagging_buy(5.0, 2.0)
     both = _run(
@@ -874,6 +947,19 @@ def test_status_precedence_mismatch_over_pending_over_lagging_over_ok() -> None:
     )
     assert with_mismatch.status == "mismatch"
     assert json.loads(with_mismatch.mismatches_json)["lagging"] == [lagging.order.client_order_id]
+    for orders, expected in (
+        ([pending, lagging], "pending_unresolved"),
+        ([lagging], "fills_lagging"),
+        ([], "breaks"),
+    ):
+        result = _run(
+            _ledger(1_000.0, SEC_A=12.0),
+            _positions(AAA=15.0 if lagging in orders else 12.0, CCC=2.0),
+            700.0 if lagging in orders else 1_000.0,
+            journal_open=orders,
+        )
+        assert result.status == expected
+        assert "broker_only_position" in _kinds(result)
 
 
 def test_the_mismatches_json_is_stable() -> None:
@@ -1484,19 +1570,18 @@ def test_a_fee_dated_on_or_after_the_fallback_start_is_booked() -> None:
 
 
 @pytest.mark.parametrize("activity_type", ["INT", "JNLC", "ACATC"])
-def test_an_unknown_cash_type_is_unexplained_activity(activity_type: str) -> None:
-    """A cash activity of a type the rule does not know names its type, id, date,
-    amount and status, and halts the window (#1583)."""
+def test_an_unknown_cash_type_is_named_cash_when_executed(activity_type: str) -> None:
+    """Every executed, named cash type is eligible for a name break (#2266)."""
     result = _run(
         _ledger(1_000.0, SEC_A=10.0),
         _positions(AAA=10.0),
-        1_000.0,
+        998.5,
         explanations=_explanations(activities=(_activity("act-x", activity_type, S, -1.5),)),
     )
 
-    assert _kinds(result) == ["unexplained_activity"]
-    detail = result.mismatches[0].detail
-    assert activity_type in detail and "act-x" in detail and "executed" in detail
+    assert result.status == "breaks"
+    assert _kinds(result) == ["name_cash"]
+    assert result.mismatches[0].activity_ids == ("act-x",)
 
 
 def test_a_fee_whose_status_is_not_executed_is_unexplained_activity() -> None:
@@ -1653,8 +1738,9 @@ def test_a_dividend_activity_is_recorded_but_never_booked_by_id() -> None:
         explanations=_explanations(activities=(_activity("act-1", "DIV", S, 4.5),)),
     )
 
-    assert result.status == "ok"
+    assert result.status == "mismatch"
     assert result.adjustments == ()
+    assert _kinds(result) == ["cash", "name_cash"]
     assert [r.activity_type for r in result.activities] == ["DIV"]
 
 
@@ -1804,7 +1890,7 @@ def test_a_stock_dividend_with_no_cash_in_lieu_halts_as_quantity() -> None:
         ),
     )
 
-    assert result.status == "mismatch"
+    assert result.status == "breaks"
     assert _kinds(result) == ["quantity"]
 
 
@@ -1990,7 +2076,7 @@ def test_a_cash_in_lieu_whose_name_has_no_stock_dividend_halts() -> None:
     )
 
     assert result.status == "mismatch"
-    assert _kinds(result) == ["unexplained_activity"]
+    assert _kinds(result) == ["unexplained_activity", "cash", "name_cash"]
     assert "no stock dividend" in result.mismatches[0].detail
 
 

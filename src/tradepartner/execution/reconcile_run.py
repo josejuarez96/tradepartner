@@ -161,11 +161,13 @@ from tradepartner.adapters.broker import (
 from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, LimitBreachError, ReconciliationError
+from tradepartner.execution import breaks as break_rules
 from tradepartner.execution import switch
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.plan import current_listings
 from tradepartner.execution.reconcile import (
+    BREAKS,
     MERGER_CONFLICT,
     MISMATCH,
     OK,
@@ -201,11 +203,13 @@ from tradepartner.store.journal import (
     OrderEventRow,
     OrderRow,
     PaperWindowRow,
+    ReconcileBreakRow,
     ReconciliationRow,
     adjustments_for,
     append,
     fills_for,
     non_terminal_orders,
+    open_breaks,
     open_window,
     order_events_for,
     orders_for,
@@ -228,7 +232,7 @@ _RISK_PREFIX = "risk."
 _CORPORATE_ACTION_CASH = "corporate_action_cash"
 #: The reconciliation statuses that ran to the end: a merger's last check counts
 #: only these, never a `fills_lagging` or `pending_unresolved` one (T249).
-_COMPLETED = frozenset({OK, MISMATCH})
+_COMPLETED = frozenset({OK, BREAKS, MISMATCH})
 _DEFAULT_RISK = RiskConfig()
 #: The frozen `risk.*` break keys (#2266 item 5), back-filled by `frozen_risk`.
 _BREAK_RISK_KEYS = (
@@ -1459,6 +1463,193 @@ def _explanation_json(
     return json.dumps(payload, sort_keys=True, allow_nan=False)
 
 
+def _break_evidence(
+    conn: duckdb.DuckDBPyConnection,
+    cut: datetime,
+    settings: Settings,
+    names: set[str],
+) -> dict[str, list[break_rules.StoreEvidence]]:
+    """Store causes for names, cut to close(S-1), never to the command clock."""
+    evidence: dict[str, list[break_rules.StoreEvidence]] = defaultdict(list)
+    if not names:
+        return evidence
+    for row in live_actions_as_of(conn, cut, sorted(names)).iter_rows(named=True):
+        if row["action_type"] in ("split", "spinoff", "dividend"):
+            evidence[row["security_id"]].append(
+                break_rules.StoreEvidence(row["action_type"], row["ex_date"], row["known_at"])
+            )
+    for row in mergers_as_of(conn, cut, sorted(names)).iter_rows(named=True):
+        evidence[row["security_id"]].append(
+            break_rules.StoreEvidence("merger", row["effective_date"], row["known_at"])
+        )
+    for row in symbol_changes_as_of(conn, cut, sorted(names)).iter_rows(named=True):
+        evidence[row["security_id"]].append(
+            break_rules.StoreEvidence("symbol_change", row["process_date"], row["known_at"])
+        )
+    for row in listing_ends_as_of(conn, cut, settings, sorted(names)).iter_rows(named=True):
+        if row["end_session"] is not None:
+            evidence[row["security_id"]].append(
+                break_rules.StoreEvidence("listing_end", row["end_session"], row["known_at"])
+            )
+    return evidence
+
+
+def _write_break_events(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    window: PaperWindowRow,
+    reconciliation_id: int,
+    result: Reconciliation,
+    session: date,
+    stamp: datetime,
+    frozen: RiskConfig,
+    ledger: Ledger,
+    positions: Mapping[str, Position],
+    explanations: Explanations,
+    activities: Sequence[CashActivity],
+    evidence: Mapping[str, list[break_rules.StoreEvidence]],
+    own_trading: set[str],
+    adjustment_ids: Sequence[int],
+) -> None:
+    """Append one event per affected name after the reconciliation and adjustments."""
+    window_id = _window_id(window)
+    prior = {row.name: row for row in open_breaks(conn, window_id) if row.name is not None}
+    by_name: dict[str, list[Mismatch]] = defaultdict(list)
+    for mismatch in result.mismatches:
+        if break_rules.is_name_level(mismatch.kind):
+            name = mismatch.security_id or mismatch.symbol
+            if name is None:
+                raise ValueError(f"name-level {mismatch.kind} has no name")
+            by_name[name].append(mismatch)
+    activity_by_id = {a.activity_id: a for a in activities}
+    symbols = {v: k for k, v in explanations.symbols.items()}
+    try:
+        equity = ledger.equity(explanations.reference_prices)
+    except (KeyError, ValueError):
+        equity = 0.0  # materiality fails closed without a valid ledger mark
+    for name in sorted(set(prior) | set(by_name)):
+        previous = prior.get(name)
+        mismatches = by_name.get(name, [])
+        old_parts = json.loads(previous.parts_json) if previous is not None else []
+        if not mismatches and any(p["kind"] in break_rules.FINDING_KINDS for p in old_parts):
+            continue  # finding keys require a typed owner true-up
+        parts: list[break_rules.BreakPart] = []
+        for mismatch in mismatches:
+            activity_type = (
+                activity_by_id[mismatch.activity_ids[0]].activity_type
+                if mismatch.activity_ids
+                else None
+            )
+            related = [a for a in activities if symbols.get(a.symbol or "") == name]
+            cause = break_rules.part_cause(
+                mismatch.kind,
+                session=session,
+                lookback_sessions=frozen.break_cause_lookback_sessions,
+                store_rows=evidence.get(name, ()),
+                activities=related,
+                own_trading=name in own_trading,
+                activity_type=activity_type,
+            )
+            old = next((p for p in old_parts if p["kind"] == mismatch.kind), None)
+            if old is not None:
+                cause = old["cause"]
+            finding = None
+            if mismatch.kind == break_rules.UNKNOWN_SYMBOL and mismatch.symbol is not None:
+                finding = break_rules.unknown_symbol_key(
+                    mismatch.symbol, positions[mismatch.symbol].quantity
+                )
+            elif mismatch.kind in break_rules.FINDING_KINDS:
+                finding = json.dumps([mismatch.kind, mismatch.detail], sort_keys=True)
+            parts.append(
+                break_rules.BreakPart(
+                    kind=mismatch.kind,
+                    cause=cause,
+                    ledger_quantity=ledger.positions.get(name, 0.0),
+                    broker_quantity=positions[mismatch.symbol].quantity
+                    if mismatch.symbol is not None and mismatch.symbol in positions
+                    else 0.0,
+                    cash_amount=mismatch.cash_amount,
+                    activity_ids=mismatch.activity_ids,
+                    finding_key=finding,
+                )
+            )
+        if previous is not None and not parts:
+            if result.status not in (OK, BREAKS) or any(
+                a.security_id == name for a in result.explained if a not in result.adjustments
+            ):
+                append(
+                    conn,
+                    replace(
+                        previous,
+                        event_id=None,
+                        event="observed",
+                        reconciliation_id=reconciliation_id,
+                        known_at=stamp,
+                        ingested_at=stamp,
+                    ),
+                )
+                continue
+            closing = (
+                "auto_explained"
+                if any(a.security_id == name for a in result.adjustments)
+                else "resolved_by_broker"
+            )
+            append(
+                conn,
+                replace(
+                    previous,
+                    event_id=None,
+                    event=closing,
+                    reconciliation_id=reconciliation_id,
+                    adjustment_ids_json=(
+                        json.dumps(list(adjustment_ids)) if closing == "auto_explained" else None
+                    ),
+                    known_at=stamp,
+                    ingested_at=stamp,
+                ),
+            )
+            continue
+        if not parts:
+            continue
+        first = parts[0]
+        cash = math.fsum(p.cash_amount or 0.0 for p in parts)
+        price = explanations.reference_prices.get(name)
+        size = break_rules.dollar_size(first.ledger_quantity, first.broker_quantity, price, cash)
+        material = break_rules.is_material(
+            (p.kind for p in parts),
+            size,
+            prior_auto_accepted=0.0,
+            ledger_equity=equity,
+            risk=frozen,
+        )
+        security_id = mismatches[0].security_id
+        symbol = mismatches[0].symbol
+        _, break_id = break_rules.identity(window_id, security_id, symbol, reconciliation_id)
+        append(
+            conn,
+            ReconcileBreakRow(
+                break_id=previous.break_id if previous is not None else break_id,
+                window_id=window_id,
+                book_id=window.book_id,
+                event="observed" if previous is not None else "opened",
+                parts_json=break_rules.parts_json(parts),
+                cause=break_rules.break_cause(parts),
+                security_id=security_id,
+                symbol=symbol,
+                ledger_quantity=first.ledger_quantity,
+                broker_quantity=first.broker_quantity,
+                cash_amount=cash if any(p.cash_amount is not None for p in parts) else None,
+                reference_price=price,
+                dollar_size=size,
+                material=material,
+                first_seen_session=previous.first_seen_session if previous is not None else session,
+                reconciliation_id=reconciliation_id,
+                known_at=stamp,
+                ingested_at=stamp,
+            ),
+        )
+
+
 def reconcile_now(
     settings: Settings,
     connect: Connect,
@@ -1593,6 +1784,7 @@ def reconcile_now(
         and activity.net_amount is not None
         and activity.net_amount != 0
         and activity.activity_id not in explanations.seen_activity_ids
+        and not any(activity.activity_id in m.activity_ids for m in result.mismatches)
         and (
             explanations.activity_seen_before is None
             or activity.date >= explanations.activity_seen_before
@@ -1613,6 +1805,19 @@ def reconcile_now(
             ),
         )
 
+    names = {m.security_id for m in result.mismatches if m.security_id is not None} | set(
+        ledger.positions
+    )
+    with connect() as conn:
+        evidence = _break_evidence(conn, cut, settings, names)
+    last_completed = max(
+        (row.known_at for row in state.rows if row.status in (OK, BREAKS)),
+        default=window.started_at,
+    )
+    own_trading = {
+        fill.security_id for fill in state.fills if fill.fill.known_at > last_completed
+    } | {order.security_id for order in orders}
+
     with journal() as conn:
         stamp = _read_clock(clock)
         if stamp < now:
@@ -1631,7 +1836,10 @@ def reconcile_now(
                 ingested_at=stamp,
             ),
         )
+        if reconciliation_id is None:
+            raise RuntimeError("reconciliation append returned no id")
         activity_sessions = {a.activity_id: a.date for a in activities}
+        adjustment_ids: list[int] = []
         for adjustment in result.adjustments:
             # A row keyed by a broker activity (a booked `fee_cash`, a `cash_in_lieu`,
             # a delisting's late cash) is stated on the activity's own date, not the
@@ -1642,7 +1850,7 @@ def reconcile_now(
                 if adjustment.broker_activity_id is not None
                 else None
             )
-            append(
+            adjustment_id = append(
                 conn,
                 AdjustmentRow(
                     window_id=window_id,
@@ -1664,8 +1872,26 @@ def reconcile_now(
                     ingested_at=stamp,
                 ),
             )
+            if adjustment_id is not None:
+                adjustment_ids.append(adjustment_id)
+        _write_break_events(
+            conn,
+            window=window,
+            reconciliation_id=reconciliation_id,
+            result=result,
+            session=session,
+            stamp=stamp,
+            frozen=frozen,
+            ledger=ledger,
+            positions=positions,
+            explanations=explanations,
+            activities=activities,
+            evidence=evidence,
+            own_trading=own_trading,
+            adjustment_ids=adjustment_ids,
+        )
 
-    if result.status == MISMATCH:
+    if result.status in (MISMATCH, BREAKS):
         kinds = ", ".join(sorted({m.kind for m in result.mismatches}))
         raise ReconciliationError(
             f"reconciliation {reconciliation_id} of window {window_id} on "
