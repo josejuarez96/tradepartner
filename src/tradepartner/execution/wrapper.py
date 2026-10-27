@@ -1422,17 +1422,9 @@ class RiskGatedBroker:
     def _phase_assets(
         self, run: PaperRunRow, book: _Book, rows: Sequence[DecisionRow], side: str
     ) -> dict[str, Asset]:
-        """The clock pre-check, the refusal of a name with no listing at
-        close(S-1) (before any broker call), the reused-ticker check (#568
-        item 2), then the phase's `assets` read for its open decisions,
-        keyed by `security_id`.
-
-        The reused-ticker check runs here, not in `_listings`/`_read_book`:
-        it is scoped to this phase's own attempt scope (only names this
-        phase actually resolves against the broker), so a batch the kill
-        switch skips, or a second run whose exit sell is already accepted
-        and has no attempt left this phase, never halts over a reuse that
-        would never reach the broker anyway."""
+        """Check the clock and known listings, then read broker assets for
+        the phase's open decisions, keyed by security ID. Ambiguous names,
+        including a delisted name whose ticker was reused, stay out."""
         assert run.session is not None
         self.clock_precheck(run.session, book.last_ok_ingest)
         # A name the symbol map leaves ambiguous is never read (#2185): the
@@ -1444,14 +1436,6 @@ class RiskGatedBroker:
         unknown = [sid for sid in names if not book.symbols.get(sid) and sid not in book.unmappable]
         if unknown:
             raise ValueError(f"no listing known at close(S-1) for {unknown}")
-        delisted = frozenset(sid for sid in names if sid in book.ended)
-        if delisted:
-            cut = session_close(previous_session(run.session))
-            with self._journal() as conn:
-                current = current_listings(listings_as_of(conn, cut, sorted(delisted)), run.session)
-                _refuse_reused_tickers(
-                    conn, cut, run.session, current, delisted, self._settings.alpaca.class_symbols
-                )
         # A name with no broker form is never sent: untradable, so skipped (#1729).
         unresolved = {sid: UNRESOLVED_ASSET for sid in names if sid in book.unmappable}
         symbols = {
@@ -1860,6 +1844,13 @@ class RiskGatedBroker:
             self._read(order, run, stamp, notes, write_offs)
 
         stamp()  # one checked reading first, so a clock gone bad since sets clock_fault
+        # The run's normal finish is bypassed on a halt. Deliver owed per-name
+        # ticker-change lines before the halt alert while the store is writable.
+        owed = list(dict.fromkeys(self._unsent))
+        try:
+            self.alert_unsent(run)
+        except Exception as exc:
+            notes.extend([f"skipped alert not written ({type(exc).__name__})", *owed])
         message = self._scrub("; ".join([headline, *dict.fromkeys(notes)]))
         alert_kind = _STALE_DATA if stale else _alert_kind(fault)
         try:
@@ -2152,17 +2143,8 @@ def _listings(
     #1729), the names whose listing ended (`delisted`) at close(S-1), and the
     names a ticker change leaves ambiguous, with their notes.
 
-    A delisted name's own ticker must not also be a *later* issuer's current
-    ticker as of close(S-1): that reuse would otherwise let the `assets`
-    read resolve against the new issuer, not the delisted one this read
-    means (#568 item 2). That check does not run here: `_listings` backs
-    `_read_book`, which every batch reads before the kill-switch check and
-    before `attempt_scope` decides whether a phase sends anything, so
-    raising here would halt a batch the kill switch would otherwise skip,
-    or a second run whose exit sell was already accepted and needs no
-    further attempt. `_phase_assets` runs the check instead, scoped to the
-    names its own phase's attempt scope actually resolves, right before the
-    broker `assets` call."""
+    A delisted name whose ticker a later issuer reused is also ambiguous.
+    Its order stays on the existing per-name guard path (#2286)."""
     if not names:
         return {}, frozenset(), frozenset(), {}
     cut = session_close(previous_session(session))
@@ -2173,7 +2155,15 @@ def _listings(
         listing_ends_as_of(conn, cut, settings, list(names)), previous_session(session)
     )
     delisted = frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
-    return symbols, unmappable, delisted, mapped.ambiguous
+    ambiguous = dict(mapped.ambiguous)
+    if delisted:
+        current = current_listings(listings_as_of(conn, cut, sorted(delisted)), session)
+        reused = _refuse_reused_tickers(
+            conn, cut, session, current, delisted, symbols, settings.alpaca.class_symbols
+        )
+        for sid, note in reused.items():
+            ambiguous[sid] = f"{ambiguous[sid]}; {note}" if sid in ambiguous else note
+    return symbols, unmappable, delisted, ambiguous
 
 
 def _refuse_reused_tickers(
@@ -2182,11 +2172,13 @@ def _refuse_reused_tickers(
     session: date,
     current: Mapping[str, Mapping[str, Any]],
     delisted: frozenset[str],
+    symbols: Mapping[str, str | None],
     class_symbols: Mapping[str, str] | None,
-) -> None:
-    """For each `delisted` name, refuse when some other security's current
+) -> dict[str, str]:
+    """For each `delisted` name, mark ambiguous when another security's current
     listing (as of close(S-1), across the whole universe) names the same
     ticker with a strictly later `valid_from`: a later issuer who reused it.
+    Check both its listing ticker and the symbol the order map would send.
     Tickers compare in their broker form (`broker_symbol`, #1729), the form the
     `assets` read is made in, so a delisted `BF-B` collides with a later `BFB`.
     An earlier owner of the same ticker (this name itself took it over from
@@ -2194,30 +2186,35 @@ def _refuse_reused_tickers(
     match with a security that has never been this name's own listing's
     ticker since."""
     if not delisted:
-        return
+        return {}
     universe = current_listings(listings_as_of(conn, cut), session)
-    collisions: dict[str, tuple[str, list[str]]] = {}
+    collisions: dict[str, list[str]] = {}
     for sid in delisted:
         row = current.get(sid)
         if row is None:
             continue
-        ticker = broker_symbol(row, class_symbols) or str(row["ticker"])
+        listing_ticker = broker_symbol(row, class_symbols) or str(row["ticker"])
+        tickers = {listing_ticker}
+        if symbols.get(sid):
+            tickers.add(canonical_symbol(str(symbols[sid])))
         own_valid_from = row["valid_from"]
-        reused_by = sorted(
-            other
-            for other, other_row in universe.items()
-            if other != sid
-            and (broker_symbol(other_row, class_symbols) or str(other_row["ticker"])) == ticker
-            and other_row["valid_from"] is not None
-            and (own_valid_from is None or other_row["valid_from"] > own_valid_from)
-        )
-        if reused_by:
-            collisions[sid] = (ticker, reused_by)
-    if collisions:
-        raise ValueError(
-            "ticker reused by a later issuer since close(S-1), the assets read would be "
-            f"ambiguous: {collisions}"
-        )
+        for ticker in sorted(tickers):
+            reused_by = sorted(
+                other
+                for other, other_row in universe.items()
+                if other != sid
+                and (broker_symbol(other_row, class_symbols) or str(other_row["ticker"])) == ticker
+                and other_row["valid_from"] is not None
+                and (own_valid_from is None or other_row["valid_from"] > own_valid_from)
+            )
+            if reused_by:
+                collisions.setdefault(sid, []).append(
+                    f"ticker {ticker} reused by later issuer {', '.join(reused_by)}"
+                )
+    return {
+        sid: f"{sid} {'; '.join(reuses)}; broker asset ambiguous"
+        for sid, reuses in collisions.items()
+    }
 
 
 def last_ok_price_ingest(
