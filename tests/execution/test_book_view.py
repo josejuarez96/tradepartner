@@ -19,9 +19,13 @@ from pathlib import Path
 
 import pytest
 
+from tradepartner.adapters.broker import Account
 from tradepartner.calendar import is_session, next_session
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.execution import book_view
+from tradepartner.execution.ledger import Ledger
+from tradepartner.execution.reconcile import Explanations, compare
+from tradepartner.store import journal
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     DecisionRow,
@@ -274,7 +278,9 @@ def test_no_reconciliation_is_never_a_match(journal_settings: Settings) -> None:
     assert safety.reconciliation.text == book_view.NO_RECONCILIATION
 
 
-def test_an_ok_row_with_nothing_off_matches_to_the_cent(journal_settings: Settings) -> None:
+def test_an_ok_row_without_a_stored_cash_difference_uses_tolerance_wording(
+    journal_settings: Settings,
+) -> None:
     _seed(journal_settings)
     _append(journal_settings, _reconciliation())
     safety = _view(journal_settings).safety
@@ -282,7 +288,55 @@ def test_an_ok_row_with_nothing_off_matches_to_the_cent(journal_settings: Settin
     assert safety.reconciliation.matches
     assert "Matches Alpaca" in safety.reconciliation.text
     assert "to the cent" not in safety.reconciliation.text
+    assert "within the reconciliation's tolerance" in safety.reconciliation.text
     assert "risk.reconcile_cash_tolerance" in safety.reconciliation.fields_read
+
+
+def test_an_ok_row_with_a_six_cent_gap_after_ten_fills_does_not_claim_cents(
+    journal_settings: Settings,
+) -> None:
+    _seed(journal_settings)
+    with open_read_only(journal_settings) as conn:
+        window = journal.latest_window(conn, "main")
+    assert window is not None
+    ledger_cash = 99_990.0
+    broker_cash = ledger_cash + 0.06
+    result = compare(
+        Ledger(positions={}, cash=ledger_cash, through=T1, fills_since_base=10),
+        {},
+        [],
+        [],
+        Account(
+            account_id="PA1",
+            cash=broker_cash,
+            buying_power=broker_cash,
+            equity=broker_cash,
+            as_of=KNOWN,
+        ),
+        Explanations(symbols={}),
+        window,
+        RiskConfig(),
+        order_id_prefix="tp",
+    )
+    assert result.status == "ok"
+    assert result.broker_cash == pytest.approx(broker_cash)
+    assert result.allowed == ()
+    row = _reconciliation()
+    _append(
+        journal_settings,
+        row.__class__(
+            **{
+                **vars(row),
+                "status": result.status,
+                "broker_cash": result.broker_cash,
+                "mismatches_json": result.mismatches_json,
+            }
+        ),
+    )
+    recon = _view(journal_settings).safety.reconciliation  # type: ignore[union-attr]
+    assert recon.matches
+    assert "to the cent" not in recon.text
+    assert "within the reconciliation's tolerance" in recon.text
 
 
 def test_an_ok_row_whose_cash_differs_by_more_than_the_tolerance_is_no_match(
