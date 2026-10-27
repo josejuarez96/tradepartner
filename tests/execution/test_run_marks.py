@@ -26,6 +26,7 @@ from typing import Any
 
 import pytest
 
+from tradepartner.adapters.broker import Asset
 from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.calendar import previous_session, session_close
@@ -525,6 +526,75 @@ def test_a_tradable_gap_within_the_frozen_limit_is_marked_and_alerted(
     ((run_id, session, message),) = env.alerts("stale_mark")
     assert (run_id, session) == (outcome.run_id, date(2019, 5, 6))
     assert PHANTOM in message and F_0.isoformat() in message and T_0.isoformat() in message
+
+
+@pytest.mark.parametrize("later_ticker", ["TRNS", "TRNS*", "trns"])
+@pytest.mark.parametrize("new_tradable", [True, False])
+def test_reused_ticker_asset_cannot_decide_a_delisted_names_missing_bar(
+    env: Env,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    later_ticker: str,
+    new_tradable: bool,
+) -> None:
+    """The new TRNS issuer's tradability cannot turn the old name's gap into a fault."""
+    bought(env, tmp_path)
+    session = date(2019, 5, 3)
+    cut = session_close(previous_session(session))
+    known = cut - timedelta(hours=1)
+    (exchange, class_title) = env.query(
+        "SELECT exchange, class_title FROM listings WHERE security_id = 'SEC_TRANSFER' "
+        "ORDER BY valid_from DESC LIMIT 1"
+    )[0]
+    with open_for_write(env.settings) as conn:
+        insert_row(
+            conn,
+            "delistings",
+            {
+                "security_id": "SEC_TRANSFER",
+                "form": "25",
+                "class_title": class_title,
+                "exchange": exchange,
+                "filed_at": known,
+                "effective_on": known.date() + timedelta(days=10),
+                "known_at": known,
+                "ingested_at": known,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        insert_row(
+            conn,
+            "listings",
+            {
+                "security_id": "SEC_TRANSFER_NEW_ISSUER",
+                "ticker": later_ticker,
+                "exchange": "NASDAQ",
+                "class_title": "Common Stock",
+                "valid_from": previous_session(session),
+                "known_at": known,
+                "ingested_at": known,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        conn.execute(
+            "DELETE FROM prices_daily WHERE security_id = 'SEC_TRANSFER' AND session = ?",
+            [previous_session(session)],
+        )
+    env.fake.set_asset("TRNS", Asset(new_tradable, True, "active", None))
+    # Keep this mark regression independent of the separate forced-exit path.
+    monkeypatch.setattr(run_module, "exits_step", lambda _context: None)
+    outcome = env.run(at(session))
+
+    assert outcome.status == "ok", env.result(outcome.run_id)
+    (price, tradable) = env.query(
+        "SELECT mark_price, tradable FROM positions_daily "
+        "WHERE run_id = ? AND security_id = 'SEC_TRANSFER' AND session = ?",
+        [outcome.run_id, previous_session(session)],
+    )[0]
+    assert price == pytest.approx(env.close("SEC_TRANSFER", F_0))
+    assert tradable is None
 
 
 def hold_phantom_on_f_0(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:

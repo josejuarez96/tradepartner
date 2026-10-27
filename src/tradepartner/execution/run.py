@@ -275,6 +275,7 @@ from tradepartner.execution.reconcile_run import (
     verify_frozen_sha256,
 )
 from tradepartner.execution.risk import OpenSell, unfilled_sells
+from tradepartner.execution.symbols import broker_symbol
 from tradepartner.execution.window import window_cadence
 from tradepartner.execution.wrapper import (
     CRASH_EXIT_CODE,
@@ -2051,9 +2052,7 @@ class _Run:
         with open_read_only(self.settings, retry=True) as conn:
             sessions = self._mark_sessions(last_marked_session(conn, self.window_id))
             held = {name for day in sessions for name in ledger(day).positions}
-            symbols, _ambiguous = _current_symbols(
-                conn, self.session, sorted(held), self.settings, self.window_id
-            )
+            symbols = _mark_symbols(conn, self.session, sorted(held), self.settings, self.window_id)
         # Every name held on any marked session, not only those held at S
         # (#892 item 1, #1116): a name sold before S but held on a back-filled
         # session gets its own tradable flag, so a tradable name's missing bar
@@ -2358,6 +2357,54 @@ def _current_symbols(
     mapped = order_symbols(conn, session, names, settings, window_id)
     symbols = {sid: symbol for sid, symbol in mapped.symbols.items() if symbol is not None}
     return symbols, mapped.ambiguous
+
+
+def _mark_symbols(
+    conn: duckdb.DuckDBPyConnection,
+    session: date,
+    names: Sequence[str],
+    settings: Settings,
+    window_id: int,
+) -> dict[str, str]:
+    """The order symbol map, excluding a delisted name's reused broker symbol.
+
+    A later issuer's asset cannot supply the former issuer's mark flag. Both
+    the listing ticker and the mapped symbol matter after a ticker change.
+    Every listing and ending is read as known at close(S-1).
+    """
+    symbols, _ambiguous = _current_symbols(conn, session, names, settings, window_id)
+    if not symbols:
+        return symbols
+    cut = calendar.session_close(previous_session(session))
+    ends = planning.current_listings(
+        listing_ends_as_of(conn, cut, settings, list(symbols)), previous_session(session)
+    )
+    delisted = {sid for sid, row in ends.items() if row["status"] == DELISTED}
+    if not delisted:
+        return symbols
+    listings = planning.current_listings(listings_as_of(conn, cut), session)
+
+    for sid in delisted:
+        own = listings.get(sid)
+        if own is None:
+            # An ended name without its own listing has no safe asset identity.
+            symbols.pop(sid, None)
+            continue
+        own_tickers = {symbols[sid]}
+        own_listing_symbol = broker_symbol(own, settings.alpaca.class_symbols)
+        if own_listing_symbol is not None:
+            own_tickers.add(own_listing_symbol)
+        own_start = own["valid_from"]
+        if any(
+            other_sid != sid
+            and (other_symbol := broker_symbol(row, settings.alpaca.class_symbols)) is not None
+            and other_symbol in own_tickers
+            and row["valid_from"] is not None
+            and (own_start is None or row["valid_from"] > own_start)
+            for other_sid, row in listings.items()
+        ):
+            symbols.pop(sid, None)
+    return symbols
 
 
 def _current_ids(listings: pl.DataFrame, day: date, ticker: str) -> list[str]:
