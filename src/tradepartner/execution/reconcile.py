@@ -65,7 +65,9 @@ difference an allowance absorbs is listed under `allowed`.
 - A spin-off child (`explanations.spinoffs`: child to parent and ratio) explains
   a broker position the ledger lacks when it is at most parent held x ratio and
   less than one share below it (cash in lieu of a fraction): a `spinoff_receipt`
-  adjustment adds it.
+  adjustment adds it. A child the caller mapped to its when-issued broker
+  symbol (`X.WI`, #2112) inside that band is `Allowed` ("when-issued spin-off
+  child") and never journaled, until a reconciliation sees it regular-way.
 - A ticker change known at close(S-1) (`explanations.symbol_changes`,
   `security_id` to `(old symbol, new symbol)`) is the one identity explanation
   (#1761): the caller has mapped the name to the broker's new symbol from the
@@ -144,6 +146,7 @@ from datetime import date
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 from itertools import combinations
 
+from tradepartner.adapters.alpaca_prices import WHEN_ISSUED_SUFFIX
 from tradepartner.adapters.broker import (
     TERMINAL_STATUSES,
     Account,
@@ -199,6 +202,9 @@ _CORPORATE_ACTION_TYPES = frozenset({"SSP", "SSO", "MA", "NC", "SC", "REORG", "V
 #: and `SC` (name and symbol change) never carry cash and no adapter or fixture
 #: shows one that does, so they are not taken.
 _DELISTING_CASH_TYPES = frozenset({"MA", "REORG", "VOF"})
+#: The when-issued suffix (#2112): a spin-off child the caller mapped to `X.WI`
+#: is allowed, never journaled (`compare`'s spin-off rule).
+_WHEN_ISSUED = WHEN_ISSUED_SUFFIX
 
 
 def _cash_bound(cash_tolerance: float, fills_since_base: int) -> Decimal:
@@ -879,6 +885,14 @@ def compare(
             and received > due - 1
         ):
             expected[child] = received
+            if explanations.symbols.get(child, "").endswith(_WHEN_ISSUED):
+                # Held under its when-issued symbol (#2112): allowed, never
+                # journaled, so the ledger never holds a name its order path
+                # would trade under the regular-way ticker the broker does not
+                # hold yet. The first `ok` reconciliation that sees it
+                # regular-way journals the receipt.
+                allowed.append(Allowed("when-issued spin-off child", received, child))
+                continue
             explained.append(
                 ProposedAdjustment(
                     "spinoff_receipt", child, received, None, f"spin-off child of {parent}"
@@ -974,6 +988,7 @@ def compare(
             explanations.reference_prices,
             buffer,
             merger_cil,
+            q_tol,
         )
         explained += journaled
         mismatches += _merger_final_checks(dues, journaled, cash_bound, explanations.symbols)
@@ -1256,6 +1271,7 @@ def _merger_cash(
     reference_prices: Mapping[str, float],
     buffer: float,
     merger_cil: Mapping[str, float],
+    q_tol: float,
 ) -> tuple[bool, list[ProposedAdjustment]]:
     """Whether the cash difference is explained with open mergers present, and
     the rows it journals (#1762 items 2 and 4). The mergers read the cash left
@@ -1300,7 +1316,7 @@ def _merger_cash(
             left = rest - take
             if not -bound <= left <= top + bound:
                 continue
-            rows = _merger_adjustments(dues, float(take), merger_cil)
+            rows = _merger_adjustments(dues, float(take), merger_cil, q_tol)
             if removed:
                 proceeds = float(min(max(left, Decimal(0)), band_cap))
                 rows += _ended_adjustments(removed, expected, value, proceeds)
@@ -1325,7 +1341,7 @@ def _merger_cash(
 
 
 def _merger_adjustments(
-    dues: Sequence[_MergerDue], take: float, merger_cil: Mapping[str, float]
+    dues: Sequence[_MergerDue], take: float, merger_cil: Mapping[str, float], q_tol: float
 ) -> list[ProposedAdjustment]:
     """The rows the mergers journal: `take` shared in order, each up to its cap;
     a removal always (its quantity, whatever cash it took), a payment only when
@@ -1346,10 +1362,18 @@ def _merger_adjustments(
                     fractional_shares=max(due.held * merger.share_ratio - due.receipt, 0.0),
                 )
                 if merger.kind == "stock_and_cash":
-                    terms["same_session_cil_cash"] = min(
-                        cash,
-                        max(merger_cil.get(merger.merger_id, 0.0), cash - due.lower),
+                    # No fraction due, no CIL: rounding cash or an unrelated CIL
+                    # must not read as the sale of a fractional share.
+                    fractional_due = due.held * merger.share_ratio - due.receipt
+                    terms["same_session_cil_cash"] = (
+                        min(
+                            cash,
+                            max(merger_cil.get(merger.merger_id, 0.0), cash - due.lower),
+                        )
+                        if fractional_due > q_tol
+                        else 0.0
                     )
+                    terms["merger_cash_due"] = due.lower
             rows.append(
                 ProposedAdjustment(
                     "corporate_action_cash",

@@ -560,14 +560,19 @@ def _digest(result: Any) -> dict[str, Any]:
     }
 
 
-def _standard_cases() -> dict[str, dict[float, dict[str, Any]]]:
+def _standard_inputs() -> dict[str, tuple[Any, Any]]:
     """The test_engine fixture (A..D, T0..T3) under close and open fills and with the
-    fill bars of A and C missing on F1, each run through the engine and digested."""
-    cases: dict[str, tuple[Any, Any]] = {
+    fill bars of A and C missing on F1: case name to its provider and settings."""
+    return {
         "close": (_provider(), _params(execution={"fill_price": "close"})),
         "open": (_provider(), _params(execution={"fill_price": "open"})),
         "missed": (_provider(skip=[("A", F1), ("C", F1)]), _params()),
     }
+
+
+def _standard_cases() -> dict[str, dict[float, dict[str, Any]]]:
+    """Each `_standard_inputs` case run through the engine and digested."""
+    cases = _standard_inputs()
     return {
         name: {
             level: _digest(res)
@@ -588,7 +593,7 @@ STANDARD_PINS: dict[str, dict[float, dict[str, Any]]] = {
             "n_equity": 63,
             "n_rebalances": 3,
             "positions_sha": "30f815c8ffc807ed",
-            "rebalances_sha": "ceea09fda7475722",
+            "rebalances_sha": "26da3bd8d354d15f",
         },
         15.0: {
             "equity_sha": "2213b471eda2b663",
@@ -597,7 +602,7 @@ STANDARD_PINS: dict[str, dict[float, dict[str, Any]]] = {
             "n_equity": 63,
             "n_rebalances": 3,
             "positions_sha": "2e9fb107aba9f127",
-            "rebalances_sha": "574d658d89ad7fe2",
+            "rebalances_sha": "0b9ae42df51df41c",
         },
     },
     "missed": {
@@ -608,7 +613,7 @@ STANDARD_PINS: dict[str, dict[float, dict[str, Any]]] = {
             "n_equity": 63,
             "n_rebalances": 3,
             "positions_sha": "584da82b920751ff",
-            "rebalances_sha": "91d7130735c51c57",
+            "rebalances_sha": "110e7ee16976f89e",
         },
         15.0: {
             "equity_sha": "f2a1319309739751",
@@ -617,7 +622,7 @@ STANDARD_PINS: dict[str, dict[float, dict[str, Any]]] = {
             "n_equity": 63,
             "n_rebalances": 3,
             "positions_sha": "8ca51261b130ef3f",
-            "rebalances_sha": "1c00cdcaac4ab8fd",
+            "rebalances_sha": "d5c9911c126cff56",
         },
     },
     "open": {
@@ -628,7 +633,7 @@ STANDARD_PINS: dict[str, dict[float, dict[str, Any]]] = {
             "n_equity": 63,
             "n_rebalances": 3,
             "positions_sha": "87c382d6717a27ab",
-            "rebalances_sha": "ceea09fda7475722",
+            "rebalances_sha": "26da3bd8d354d15f",
         },
         15.0: {
             "equity_sha": "62dd0e81ce9b3baa",
@@ -637,7 +642,7 @@ STANDARD_PINS: dict[str, dict[float, dict[str, Any]]] = {
             "n_equity": 63,
             "n_rebalances": 3,
             "positions_sha": "d91647f5c08858f3",
-            "rebalances_sha": "05339d60644fba88",
+            "rebalances_sha": "bccefa48ca1dcfbc",
         },
     },
 }
@@ -648,6 +653,37 @@ def test_the_standard_fixture_matches_the_pinned_loop_results(case: str) -> None
     """Equity, rebalance rows, position values and metrics are byte-identical to the
     per-name loop's: the pins were taken before the vectorised path existed."""
     assert _standard_cases()[case] == STANDARD_PINS[case]
+
+
+#: The same runs' `rebalances_sha` before version 36, taken on `main` with the two
+#: intersection fields absent from `RebalanceRow`. T241 appends them (0 and false under
+#: `cap`), so the pin moves; dropping the two appended fields from each row's `repr`
+#: must reproduce these exactly (plan T241).
+_PRE_T241_REBALANCES_SHA: dict[str, dict[float, str]] = {
+    "close": {0.0: "ceea09fda7475722", 15.0: "574d658d89ad7fe2"},
+    "missed": {0.0: "91d7130735c51c57", 15.0: "1c00cdcaac4ab8fd"},
+    "open": {0.0: "ceea09fda7475722", 15.0: "05339d60644fba88"},
+}
+
+
+@pytest.mark.parametrize("case", sorted(STANDARD_PINS))
+def test_the_two_new_rebalance_fields_are_the_only_change_in_the_pin(case: str) -> None:
+    """T241 appends `n_assets_intersected` and `assets_intersection_skipped` to
+    `RebalanceRow`, both 0 and false under `cap`; the rest of every row's `repr` is
+    unchanged, so dropping the two appended fields reproduces the pre-T241 pin."""
+    provider, params = _standard_inputs()[case]
+    for level, result in _run(provider, params, end=T3, levels=(0.0, 15.0)).items():
+        stripped = []
+        for row in result.rebalances:
+            text = repr(row)
+            suffix = (
+                f", n_assets_intersected={row.n_assets_intersected}, "
+                f"assets_intersection_skipped={row.assets_intersection_skipped})"
+            )
+            assert text.endswith(suffix), text
+            stripped.append(text[: -len(suffix)] + ")")
+        sha = hashlib.sha256(repr(stripped).encode()).hexdigest()[:16]
+        assert sha == _PRE_T241_REBALANCES_SHA[case][level]
 
 
 # --- T207: the vectorised paths against main's per-name loops, kept here verbatim ----
