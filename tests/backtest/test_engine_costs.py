@@ -111,7 +111,12 @@ def _settings(**costs: Any) -> Settings:
         "sensitivity_per_side_bps": [0.0],
         **costs,
     }
-    return Settings(_env_file=None, strategy={"top_fraction": 0.5}, costs=values)
+    return Settings(
+        _env_file=None,
+        strategy={"top_fraction": 0.5},
+        costs=values,
+        metrics={"risk_free_source": "constant"},  # the pre-T170d default (#2011)
+    )
 
 
 def _termed(**overrides: Any) -> Settings:
@@ -219,6 +224,7 @@ def test_reference_metrics_at_the_defaults_unchanged() -> None:
         _env_file=None,
         strategy={"top_fraction": 0.5},
         costs={"per_side_bps": PER_SIDE, "sensitivity_per_side_bps": [0.0, 30.0, 100.0]},
+        metrics={"risk_free_source": "constant"},  # the digest's source, pre-T170d (#2011)
     )
     assert _metrics_digest(default) == REFERENCE_METRICS_SHA256
 
