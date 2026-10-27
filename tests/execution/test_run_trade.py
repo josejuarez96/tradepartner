@@ -22,6 +22,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -37,10 +38,12 @@ from tradepartner.errors import LimitBreachError
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.run import RunOutcome, submit_window, tracking_run
+from tradepartner.execution.window import stop
 from tradepartner.execution.wrapper import BatchOutcome
 from tradepartner.store import registry
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
 from tradepartner.store.journal import (
+    AdjustmentRow,
     OverrideRow,
     PaperWindowRow,
     append,
@@ -1052,3 +1055,134 @@ def test_step_8_reconciles_against_the_fills_step_7b_journaled(
     step_4, step_8 = rows[0][1], rows[1][1]
     assert step_4 < min(known)  # step 4 ran before any fill: an empty book
     assert step_8 >= max(known)
+
+
+# --- one symbol map after a ticker change (#2185) ------------------------------------
+
+
+def rename(env: Env, security_id: str, new: str, known_at: datetime, *, broker: bool) -> None:
+    """A stored `symbol_changes` row (the listings keep the old ticker) and, when
+    `broker`, the broker's rename of the position and the asset."""
+    old = SYMBOLS[security_id]
+    env.insert(
+        "symbol_changes",
+        {
+            "security_id": security_id,
+            "old_symbol": old,
+            "new_symbol": new,
+            "old_cusip": f"OLD-{security_id}",
+            "new_cusip": f"NEW-{security_id}",
+            "process_date": known_at.date(),
+            "source_action_id": f"rename-{new}",
+            "known_at": known_at,
+            "ingested_at": known_at,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
+    if not broker:
+        return
+    env.fake.set_asset(new, Asset(True, True, "active", None))
+    # The broker's rename of the position (the fake has no corporate actions).
+    env.fake._net_quantity[new] = env.fake._net_quantity.pop(old)
+
+
+def test_a_renamed_held_names_forced_exit_is_sent_under_the_symbol_reconcile_mapped(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The #2185 probe end to end: DUALB is held, its listing ends and a change to
+    `DUALBX` is known at close(F_0), the listings still say `DUALB`, and the broker
+    holds `DUALBX`. The run's reconciliation maps `DUALBX` and the forced exit is
+    sent under it, never under `DUALB`."""
+    bought(env)
+    delist(env, "SEC_DUAL_B", at(F_0, 19, 0))
+    rename(env, "SEC_DUAL_B", "DUALBX", at(F_0, 19, 0), broker=True)
+    close = env.prices["DUALB"]
+    sent_before = len(env.submits())
+
+    outcome = env.run(at(F_0_PLUS_1), prices={"DUALBX": close})
+
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert [r.symbol for r in env.submits()[sent_before:]] == ["DUALBX"]
+
+
+def test_an_ambiguous_held_name_gets_no_exit_until_the_broker_renames_it(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The broker has not renamed DUALB yet, so the change in force is ambiguous:
+    no forced exit is made (its flags are never read under the old symbol, and a
+    guessed whole-share flag would be frozen on it), nothing is sent, the name
+    stays held, and the result row's notes and the run's `skipped` alert name the
+    change. Once the broker holds `DUALBX`, the next run's exit sells the
+    fractional holding under it."""
+    bought(env)
+    delist(env, "SEC_DUAL_B", at(F_0, 19, 0))
+    rename(env, "SEC_DUAL_B", "DUALBX", at(F_0, 19, 0), broker=False)
+    sent_before = len(env.submits())
+
+    outcome = env.run(at(F_0_PLUS_1))
+
+    status, _fault, message = env.result(outcome.run_id)
+    assert status == "ok"
+    assert env.submits()[sent_before:] == []
+    assert "DUALB" in env.held()
+    assert message is not None and "DUALB -> DUALBX" in message
+    assert "no new exit made" in message
+    assert (
+        env.query(
+            "SELECT 1 FROM decisions WHERE security_id = 'SEC_DUAL_B' AND decision = 'forced_exit'"
+        )
+        == []
+    )
+    ((run_id, _session, alert),) = env.alerts("skipped")
+    assert run_id == outcome.run_id and "DUALB -> DUALBX" in alert
+
+    held = env.held()["DUALB"]
+    assert held != int(held)  # a fractional holding
+    close = env.prices["DUALB"]
+    env.fake.set_asset("DUALBX", Asset(True, True, "active", None))
+    env.fake._net_quantity["DUALBX"] = env.fake._net_quantity.pop("DUALB")
+    later = env.run(at(next_session(F_0_PLUS_1)), prices={"DUALBX": close})
+
+    assert later.status == "ok", env.result(env.latest_run())
+    (sell,) = env.submits()[sent_before:]
+    assert sell.symbol == "DUALBX"
+    assert sell.quantity == pytest.approx(held)
+
+
+def test_a_stop_run_with_an_ambiguous_held_residue_still_exits_the_other_names(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Review of #2285: DUALB carries a residue from a previous window and its
+    ticker change is in force but not on the broker. The stop run makes no
+    `window_stop` exit for it (and does not trip on its residue) but exits the
+    other held names, and notes the change."""
+    assert window.window_id is not None
+    env.append(
+        AdjustmentRow(
+            window_id=window.window_id,
+            session=T_0,
+            kind="carried_residue",
+            origin="dust",
+            security_id="SEC_DUAL_B",
+            quantity=2.0,
+            known_at=window.started_at,
+            ingested_at=window.started_at,
+        )
+    )
+    env.fake._net_quantity["DUALB"] = Decimal("2.0")
+    bought(env)
+    rename(env, "SEC_DUAL_B", "DUALBX", at(F_0, 19, 0), broker=False)
+    env.clock.now = at(F_0, 22, 0)
+    assert stop(env.settings, env.connect, env.fake, env.clock, "test").state == "requested"
+
+    outcome = env.run(at(F_0_PLUS_1))
+
+    status, _fault, message = env.result(outcome.run_id)
+    assert (outcome.kind, status) == ("stop", "ok")
+    exited = dict(
+        env.query("SELECT security_id, reason FROM decisions WHERE decision = 'forced_exit'")
+    )
+    assert exited == {"SEC_SPLIT_FUTURE": "window_stop", "SEC_TRANSFER": "window_stop"}
+    assert message is not None and "DUALB -> DUALBX" in message
+    assert "DUALB" in env.held()
