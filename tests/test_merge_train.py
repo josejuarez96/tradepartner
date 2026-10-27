@@ -2027,15 +2027,25 @@ def test_shell_runner_pr_data_reads_the_fragment_at_the_head_so_h_passes(
     assert mt.eligibility(data.pr, data.head_checks, data.diff_paths, data.comments) is None
 
 
-def _threads_page(resolved: Sequence[bool], cursor: str | None) -> str:
-    """One `gh api graphql` page of a PR's `reviewThreads`; `cursor` set means more pages."""
+def _threads_page(
+    resolved: Sequence[bool], cursor: str | None, authors: Sequence[str] | None = None
+) -> str:
+    """One `gh api graphql` page of a PR's `reviewThreads`; `cursor` set means more pages.
+    `authors` is each thread's first-comment login (default: the owner)."""
+    logins = list(authors) if authors is not None else [OWNER] * len(resolved)
     return json.dumps(
         {
             "data": {
                 "repository": {
                     "pullRequest": {
                         "reviewThreads": {
-                            "nodes": [{"isResolved": r} for r in resolved],
+                            "nodes": [
+                                {
+                                    "isResolved": r,
+                                    "comments": {"nodes": [{"author": {"login": a}}]},
+                                }
+                                for r, a in zip(resolved, logins, strict=True)
+                            ],
                             "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor},
                         }
                     }
@@ -2043,6 +2053,14 @@ def _threads_page(resolved: Sequence[bool], cursor: str | None) -> str:
             }
         }
     )
+
+
+def _threads_page_with_comments(resolved: Sequence[bool], comments: object) -> str:
+    """A thread page whose every thread carries the given `comments` payload."""
+    page = json.loads(_threads_page(resolved, None))
+    for node in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
+        node["comments"] = comments
+    return json.dumps(page)
 
 
 def _real_pr_data(
@@ -2121,6 +2139,19 @@ def _real_pr_data(
         ),
         ([_threads_page([True, True], None)], None),
         ([_threads_page([], None)], None),
+        # #2358: Greptile threads are advisory, in either login spelling
+        ([_threads_page([False, False], None, ["greptile-apps", "greptile-apps[bot]"])], None),
+        # an open thread from anyone else still blocks, mixed with advisory ones
+        (
+            [
+                _threads_page(
+                    [False, False, False], None, ["greptile-apps", OWNER, "other-bot[bot]"]
+                )
+            ],
+            "(j) 2 unresolved review threads",
+        ),
+        # a resolved non-advisory thread does not count
+        ([_threads_page([True, False], None, [OWNER, "greptile-apps"])], None),
     ],
 )
 def test_shell_runner_pr_data_reads_review_threads_so_j_refuses_an_unresolved_one(
@@ -2176,6 +2207,17 @@ def test_eligibility_fails_closed_when_review_threads_were_never_read() -> None:
             "unreadable review threads",
         ),
         (["not json"], "unreadable review threads"),
+        # #2358: the first comment's author is unreadable (null login, null author, no
+        # comments): fail closed, never treated as advisory or as eligible
+        (
+            [_threads_page_with_comments([False], {"nodes": [{"author": {"login": None}}]})],
+            "unreadable review threads",
+        ),
+        (
+            [_threads_page_with_comments([False], {"nodes": [{"author": None}]})],
+            "unreadable review threads",
+        ),
+        ([_threads_page_with_comments([False], {"nodes": []})], "unreadable review threads"),
         # says more pages follow but gives no cursor to read them with
         ([_threads_page([True], "")], "no end cursor"),
     ],
