@@ -138,7 +138,9 @@ def test_bad_slug_refused_with_nothing_started(
     assert not lab_child.log_path(live).exists()
 
 
-@pytest.mark.parametrize("note", ["", "   ", "x" * 501, "a\x00b", "a\nb", "a\x1bb", "a\tb"])
+@pytest.mark.parametrize(
+    "note", ["", "   ", "x" * 501, "a\x00b", "a\nb", "a\x1bb", "a\tb", "a\u202eb", "a\u200bb"]
+)
 def test_bad_note_refused_with_nothing_started(
     live: Settings, popen: _Popen, conn: duckdb.DuckDBPyConnection, note: str
 ) -> None:
@@ -292,3 +294,41 @@ def test_book_actions_imports_no_lab_module() -> None:
         elif isinstance(node, ast.ImportFrom):
             names += [node.module or ""] + [a.name for a in node.names]
     assert not [n for n in names if "lab" in n.lower()]
+
+
+def _no_fragment(secret: str, tail: str) -> None:
+    for i in range(len(secret) - 3):
+        assert secret[i : i + 4] not in tail
+
+
+def test_cut_secret_also_present_whole_in_the_window(live: Settings) -> None:
+    root = book_actions.PROJECT_ROOT
+    (root / ".env").write_text(f"STORE__PATH=data/live.duckdb\nALPACA_API_KEY={SENTINEL}\n")
+    path = lab_child.log_path(live)
+    # the window starts inside the first copy; a whole copy follows and shrinks on redaction
+    path.write_text("A" * 50 + SENTINEL + " mid " + SENTINEL + " end")
+    max_bytes = len(" mid ") + len(SENTINEL) + len(" end") + 8
+    tail = lab_child.scrubbed_tail(path, live, max_bytes=max_bytes)
+    _no_fragment(SENTINEL, tail)
+    assert "[redacted]" in tail
+
+
+def test_cut_secret_followed_by_a_multibyte_tail(live: Settings) -> None:
+    root = book_actions.PROJECT_ROOT
+    (root / ".env").write_text(f"STORE__PATH=data/live.duckdb\nALPACA_API_KEY={SENTINEL}\n")
+    path = lab_child.log_path(live)
+    path.write_bytes(("B" * 50 + SENTINEL + "\u2014" * 12).encode())
+    tail = lab_child.scrubbed_tail(path, live, max_bytes=36)
+    _no_fragment(SENTINEL, tail)
+
+
+def test_log_hard_link_refused_and_not_truncated(live: Settings, tmp_path: Path) -> None:
+    other = tmp_path / "other.txt"
+    other.write_text("keep me")
+    other.chmod(0o644)
+    path = lab_child.log_path(live)
+    os.link(other, path)
+    with pytest.raises(LabRefused):
+        lab_child.open_log(path)
+    assert other.read_text() == "keep me"
+    assert stat.S_IMODE(other.stat().st_mode) == 0o644

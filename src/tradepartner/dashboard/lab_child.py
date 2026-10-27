@@ -62,6 +62,7 @@ _STORE_VARS = ("STORE__PATH", "TRADEPARTNER_ENV_FILE", "STORE")
 #: The default size of the log tail the page shows.
 TAIL_BYTES = 4000
 LOG_SUFFIX = ".lab-run.log"
+_MASK = b"\x00"  # same-length stand-in while byte offsets matter
 
 
 class LabKind(StrEnum):
@@ -110,8 +111,8 @@ def note_refusal(note: str | None, settings: Settings) -> str | None:
     cap = settings.ui.max_reason_chars
     if len(note) > cap:
         return f"The note is {len(note)} characters; the limit is {cap}."
-    if any(unicodedata.category(c) == "Cc" for c in note):
-        return "The note holds a control character."
+    if any(unicodedata.category(c) in {"Cc", "Cf"} for c in note):
+        return "The note holds a control or invisible formatting character."
     return None
 
 
@@ -179,17 +180,20 @@ def log_path(settings: Settings) -> Path:
 
 
 def open_log(path: Path) -> int:
-    """Open `path` `O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW` and set it `0600`
-    (also when a wider file was there). A symlink or a non-regular file in its
-    place is refused."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK
+    """Open `path` `O_WRONLY | O_CREAT | O_NOFOLLOW`, check it is a regular file with
+    one link, then truncate it and set it `0600` (also when a wider file was there).
+    A symlink, a non-regular file or a hard-linked file in its place is refused,
+    before anything is truncated."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
         fd = os.open(path, flags, 0o600)
     except OSError as exc:
         raise LabRefused(f"The run log {path.name} cannot be opened ({exc.strerror}).") from exc
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise LabRefused(f"The run log {path.name} is not a regular file.")
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise LabRefused(f"The run log {path.name} is not a plain single-link file.")
+        os.ftruncate(fd, 0)
         os.fchmod(fd, 0o600)
     except BaseException:
         os.close(fd)
@@ -229,8 +233,14 @@ def scrubbed_tail(path: Path, settings: Settings, *, max_bytes: int = TAIL_BYTES
         raw = os.read(fd, want)
     finally:
         os.close(fd)
-    text = scrub(raw.decode(errors="replace"), settings, live)
-    return text[-max_bytes:].strip()
+    masked = bytearray(raw)
+    for value in sorted({v.encode() for v in secrets}, key=len, reverse=True):
+        masked = bytearray(masked.replace(value, _MASK * len(value)))
+    window = bytes(masked[-max_bytes:])
+    text = window.decode(errors="replace")
+    text = re.sub(f"{_MASK.decode()}+", "[redacted]", text)
+    text = _CONTROL.sub(" ", _ANSI.sub(" ", text)).strip()
+    return text
 
 
 def _child_env(settings: Settings) -> dict[str, str]:
