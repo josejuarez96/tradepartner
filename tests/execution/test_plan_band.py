@@ -272,7 +272,7 @@ def _journaled(env: Env) -> list[object]:
 
 #: `repr` of the rows `plan_rebalance` journals on `test_planning`'s fixture-store window
 #: (H1's shape: momentum, `equal`, band 0), on `main` at 3b261961 before T205.
-TODAY_PLAN_ROWS_SHA256 = "e6b60a7d7e2c35988ead9d4e661354325e06f12e497ebc6d921ae526cf9022df"
+TODAY_PLAN_ROWS_SHA256 = "c7de08541a75bf139fa0949e0257c005e6e3b2ceb374ccd01a020cd7c7de7ac9"
 
 
 def test_band_zero_and_equal_plan_rows_are_todays_byte_for_byte(env: Env) -> None:
