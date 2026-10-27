@@ -98,6 +98,7 @@ def test_a_ready_pr_is_eligible_even_when_behind_main() -> None:
         (_pr(state="CLOSED"), None, PATHS, (), "(a)"),
         (_pr(base="develop"), None, PATHS, (), "(b)"),
         (_pr(labels=("parked",)), None, PATHS, (), "(c)"),
+        (_pr(labels=("hold",)), None, PATHS, (), "(c) on hold"),
         (
             None,
             None,

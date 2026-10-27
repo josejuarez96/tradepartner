@@ -206,6 +206,8 @@ def eligibility(
         return f"(b) base is {pr.base}, not main"
     if "parked" in pr.labels:
         return "(c) parked"
+    if "hold" in pr.labels:
+        return "(c) on hold"
     bodies = owner_bodies(comments, pr.owner)
     train = [(line, b) for b in bodies if (line := _train_line(b)) and line[0] != "INELIGIBLE"]
     if train and train[-1][0][0] == "CULPRIT" and _head_line(train[-1][1]) == pr.head:
