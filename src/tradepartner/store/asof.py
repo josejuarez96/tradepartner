@@ -779,6 +779,12 @@ def live_actions_as_of(
     (`source_action_id`, a security id) is re-keyed along the same chain
     (#2127), so a reader that keys the parent by it finds the successor's
     held id, not the predecessor's.
+
+    A spin-off parented by a predecessor and one parented by its successor,
+    for the same child, share one identity after the #2127 re-key; `_own`
+    follows the child's chain, so both rank 0 and the later-known row wins,
+    not the successor's own (#821). Both describe the same event; no store
+    holds both today (#2147).
     """
     t = _validate_t(t)
     with _chains_registered(conn, t) as chains:
