@@ -76,7 +76,7 @@ Taken 2026-10-27 with a read-only DuckDB connection to the owner's store, before
 - **Window.** Filings accepted 2017-01-01 to 2019-12-31, before every in-sample start (rule L4 in the report). The window's data bound is 2020-03-31 so the last events' 60-session exits are readable; nothing after that close is read. The momentum family's in-sample start and holdout (2024-01-01 to 2026-09-30) are untouched, and this registration's family has no protected window.
 - **The COVID quarter.** Events accepted in late 2019 and early 2020 hold through the February and March 2020 crash. Returns are market-adjusted, so only beta differences between terciles matter; the ex-crash read is a secondary.
 - **Filer status.** SEC deadlines depend on filer status (accelerated filers file sooner), and status follows public float, which follows past price. A firm growing into accelerated status files earlier by rule, so the early tercile may lean to past winners and the late tercile to past losers, which market adjustment does not remove. No diagnostic is registered for it; if the early tercile passes, rung 4 must control for it (for example by comparing with the tercile's 12-1 return before entry).
-- **Family.** The registry only accepts a family listed in `hypotheses.families` (`momentum`, `oracle`, `profitability`, `combined`); a new family such as `filing_delay` is a reviewed code change in `config.py`, outside a docs-only file. This file uses `combined` as a stand-in. **That is an owner decision before registration:** `combined` is B4's momentum x profitability family and a child of `momentum` in `FAMILY_PARENTS`. It has no hypothesis, trial, protected window or research run yet, so its N is 0, but this run would add 2 to it (the early long and the late short), and that count would enter every later B4 backtest's deflated Sharpe. The clean alternative is a root `filing_delay` family added to `config.py` first (a reviewed code change, outside this docs-only PR); then the `family` line, the script's `FAMILY` and the file's hash change with it. The owner picks one before the `register` command.
+- **Family.** `filing_delay`, a root, experiment-only family (issue #2353, PR #2361), so this run's two configurations count in its own N and in no momentum, profitability or combined count. It has no hypothesis, backtest trial or protected window.
 
 ## The dataset
 
@@ -92,7 +92,7 @@ title = "C1 filing delay: early and late filers by lag change, entered at the ne
 confirmatory = false
 provenance = "deterministic"
 touches_returns = true
-family = "combined"
+family = "filing_delay"
 claims = ["QI-2", "LS-6"]
 seed = 20261027
 splits = ["full"]
