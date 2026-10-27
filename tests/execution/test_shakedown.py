@@ -138,6 +138,7 @@ class _Journal:
             "paper.min_rebalances": 6,
             "risk.reconcile_cash_tolerance": CASH_TOLERANCE,
             "risk.reconcile_quantity_tolerance": QUANTITY_TOLERANCE,
+            "risk.min_order_notional": 1.0,
         }
         self.conn.execute(
             "INSERT INTO paper_windows (window_id, hypothesis_id, first_rebalance_session, "
@@ -789,6 +790,119 @@ def test_e3_fails_on_a_whole_share_order_after_a_filled_notional_order(
     line = _line(_run(settings), "E.3 orders")
     assert not line.passed
     assert f"order o-m2 of decision {decision_id} sized with no remainder" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_uses_frozen_trading_minimum_for_no_remainder(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    conn.execute(
+        "UPDATE paper_windows SET frozen_json = json_merge_patch(frozen_json, ?) "
+        "WHERE window_id = 1",
+        [json.dumps({"risk.reconcile_cash_tolerance": 1.26})],
+    )
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1)
+    j.order("o-min1", decision_id, run_id, D1, fills=(9.989,), hour=15)
+    j.order("o-min2", decision_id, run_id, D1, notional=None, quantity=0.011, fills=(), hour=16)
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert line.passed, line.detail  # $1.10 remains: above the frozen $1 minimum.
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_first_minimum_order_and_exact_minimum_remainder_pass(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    small = j.decision(run_id, D1, planned_notional=1.0)
+    j.order("o-small", small, run_id, D1, notional=1.0, fills=(0.01,), hour=15)
+    exact = j.decision(run_id, D1)
+    j.order("o-exact1", exact, run_id, D1, fills=(9.99,), hour=16)
+    j.order("o-exact2", exact, run_id, D1, notional=1.0, fills=(), hour=17)
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert line.passed, line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_notional_order_after_full_fill_fails_once_per_order(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1)
+    for coid, hour in (("o-n1", 15), ("o-n2", 16), ("o-n3", 17)):
+        j.order(coid, decision_id, run_id, D1, hour=hour, fills=(10.0,) if hour == 15 else ())
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert not line.passed
+    assert line.detail.count("order o-n3 of decision") == 1
+    assert "order o-n2 of decision" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_a_past_now_ignores_later_journal_and_alert_rows(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn, deliveries=False)
+    j.run(D4, status="halted", hour=16, fault_type="LimitBreachError")
+    j.alert(D4, "stale_data")
+    j.alert(D4, "kill_switch", delivered=("macos",))
+    j.reconciliation(_at(D4, 16), status="mismatch")
+    j.order("o-future", 1, 1, D4, fills=(), hour=16)
+    conn.execute(
+        "INSERT INTO fills (fill_id, client_order_id, filled_at, quantity, price, "
+        "price_implied, broker_fill_id, source, known_at, ingested_at) "
+        "VALUES (?, ?, ?, 10, 100, FALSE, 'future-fill', 'broker_feed', ?, ?)",
+        [j.next_id("fills"), f"o-{D1}", _at(D4, 16), _at(D4, 16), _at(D4, 16)],
+    )
+    conn.execute(
+        "INSERT INTO overrides (override_id, window_id, made_at, rebalance_session, "
+        "security_id, kind, reason, known_at, ingested_at) "
+        "VALUES (1, 1, ?, ?, 'SEC_B', 'keep_name', 'short', ?, ?)",
+        [_at(D4, 16), D4, _at(D4, 16), _at(D4, 16)],
+    )
+    j.span(sessions=99, made_at=_at(D4, 16))
+    conn.close()
+    result = _run(settings, now=NOW)
+    assert result.span.decision_id == 1
+    assert _line(result, "E.2 reconciliation").passed
+    assert _line(result, "E.3 orders").passed
+    assert "2 order(s)" in _line(result, "E.3 orders").detail
+    assert _line(result, "E.5 journal").passed
+    assert not _line(result, "E.6 alerts").passed
+    assert _line(result, "E.7 data").passed
+
+
+@pytest.mark.usefixtures("health")
+def test_a_later_real_fill_superseding_a_synthetic_fill_counts_once(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _clean(conn)
+    coid = f"o-{D1}"
+    old_id = conn.execute("SELECT fill_id FROM fills WHERE client_order_id = ?", [coid]).fetchone()
+    assert old_id is not None
+    new_id = conn.execute("SELECT COALESCE(MAX(fill_id), 0) + 1 FROM fills").fetchone()
+    assert new_id is not None
+    conn.execute(
+        "UPDATE fills SET source = 'broker_status', price_implied = TRUE WHERE fill_id = ?",
+        [old_id[0]],
+    )
+    conn.execute(
+        "INSERT INTO fills (fill_id, client_order_id, filled_at, quantity, price, "
+        "price_implied, broker_fill_id, source, superseded_by, known_at, ingested_at) "
+        "VALUES (?, ?, ?, 10, 100, FALSE, 'future-replacement', 'broker_feed', ?, ?, ?)",
+        [new_id[0], coid, _at(D4, 16), old_id[0], _at(D4, 16), _at(D4, 16)],
+    )
+    conn.close()
+    result = _run(settings, now=NOW)
+    assert _line(result, "E.1 sessions").passed
+    assert _line(result, "E.3 orders").passed
+    after = _run(settings, now=_at(D4, 17))
+    assert _line(after, "E.3 orders").passed
 
 
 @pytest.mark.usefixtures("health")
