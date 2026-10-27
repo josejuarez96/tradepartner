@@ -16,7 +16,8 @@ so a registration is never re-registered when a key lands.
 **The canonical frozen set** leaves out every table key whose value is its default (in
 the same JSON form, so `True`, `1` and `1.0` differ), except the keys of the family's
 own signal section, which are always kept unless the key is a
-`POST_REGISTRATION_OWN_KEYS` member (backtest spec amendment #1358, item 3); **the
+`POST_REGISTRATION_OWN_KEYS` member (backtest spec amendment #1358, item 3), and every
+`CANONICAL_EXCLUDED_KEYS` member (the risk-free keys) whatever its value (#2011); **the
 fingerprint** hashes the keys that decide what a run computes through that set, so a
 table entry added later changes neither.
 """
@@ -58,8 +59,9 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # A post-registration own-section key, so it is in `POST_REGISTRATION_OWN_KEYS` below.
     ("strategy.turnover_top_fraction", 1.0, 19),
     # The risk-free series from the store (backtest spec amendment #1498, T170b). None
-    # enters the fingerprint (`_FINGERPRINT_KEYS`); the table entry for the source stays
-    # `constant` even after T170d flips the live default to `store`.
+    # enters the fingerprint (`_FINGERPRINT_KEYS`) or any canonical set, whatever the value
+    # (`CANONICAL_EXCLUDED_KEYS`, #2011); the table entry for the source stays `constant`
+    # after T170d flipped the live default to `store`.
     ("metrics.risk_free_source", "constant", 28),
     ("metrics.risk_free_series", "DTB3", 28),
     ("metrics.risk_free_basis", "discount", 28),
@@ -166,6 +168,22 @@ POST_REGISTRATION_PORTFOLIO_KEYS: Final[frozenset[str]] = frozenset(
         "portfolio.net_exposure",
         "portfolio.short_min_price",
         "portfolio.short_cover_weight",
+    }
+)
+
+#: Frozen keys left out of every canonical frozen set (and so of the fingerprint, the
+#: canonical-set hash and the V pair key) **whatever their value** (owner decision (a),
+#: #2011, T170d). Under `backtest.cash_rate = 0.0` the risk-free series changes only the
+#: excess-return metrics; under `backtest.cash_rate = store` the series and basis also
+#: set the cash accrual, so equity moves while the pair does not (owner question #2085).
+#: Keeping them out lets the live default flip to `store` without moving H1's, B3's or
+#: the TWIN's pins. The keys stay frozen: `params` and `params_sha256` still carry them,
+#: and `load_frozen` still runs a registration at its stored source.
+CANONICAL_EXCLUDED_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "metrics.risk_free_source",
+        "metrics.risk_free_series",
+        "metrics.risk_free_basis",
     }
 )
 
@@ -321,12 +339,15 @@ def canonical_frozen_set(params: Mapping[str, Any], family: str) -> dict[str, An
     """`params` read through the defaults, with every table key at its default left out,
     except the keys of `family`'s own listed sections, which are always kept (but a
     `POST_REGISTRATION_OWN_KEYS` member at its default is left out there too), and with
-    the sections `family` does not list left out whole."""
+    the sections `family` does not list left out whole. A `CANONICAL_EXCLUDED_KEYS`
+    member is left out whatever its value."""
     own = _own_sections(family)
     inert = _all_sections() - own
     defaults = _defaults()
 
     def dropped(key: str, value: Any) -> bool:
+        if key in CANONICAL_EXCLUDED_KEYS:
+            return True
         if key not in defaults or not is_default(value, defaults[key]):
             return False
         return _section(key) not in own or key in POST_REGISTRATION_OWN_KEYS
