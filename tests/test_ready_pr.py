@@ -225,6 +225,12 @@ def test_kill_switch_page_requires_the_safety_review() -> None:
         assert ready_pr.required_reviews([path]) == {"safety-reviewer"}, path
 
 
+def test_book_page_requires_the_safety_review() -> None:
+    assert "safety-reviewer" in ready_pr.required_reviews(
+        ["src/tradepartner/dashboard/book_page.py"]
+    )
+
+
 def test_every_review_prefix_exists_on_the_tree_unless_planned() -> None:
     # a rename must not silently disable the gate (#357: exec/ vs execution/)
     for prefix in (*ready_pr.QUANT_PREFIXES, *ready_pr.SAFETY_PREFIXES):
