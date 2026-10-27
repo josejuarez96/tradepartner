@@ -86,9 +86,28 @@ def test_items_come_out_most_urgent_first() -> None:
         "overdue_delisting",
         "missed_run",
         "shakedown_note",
+        "shakedown_failing",
         "report_due",
         "unreadable",
     ]
+
+
+def test_a_failing_shakedown_line_names_the_line_and_its_next_step() -> None:
+    # #2298: the line's name in the title, its next step as the sentence, and the
+    # item's detail (the line's raw findings) left to `paper status --all`
+    item = WaitingItem(
+        book_id="every book",
+        kind="shakedown_failing",
+        since=None,
+        detail="RAW DETAIL",
+        command="tradepartner paper shakedown",
+        line="E.3 orders",
+    )
+    (out,) = home_view._needs_you((item,), ())
+    assert out.title == "A shakedown check is failing: E.3 orders (every book)"
+    assert out.sentence.startswith("An order filled beyond its plan")
+    assert out.sentence.endswith(".") and "RAW DETAIL" not in out.sentence
+    assert out.action == "tradepartner paper shakedown"
 
 
 # --- the status line ---------------------------------------------------------------

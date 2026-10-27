@@ -4727,7 +4727,7 @@ def make_app(
             def read_all() -> (
                 tuple[
                     tuple[ops.BookSummary, ...],
-                    tuple[waiting.WaitingItem, ...],
+                    ops.OwnerQueue,
                     tuple[ops.OverdueDelisting, ...],
                     ops.EdgarAge | None,
                 ]
@@ -4736,13 +4736,13 @@ def make_app(
                 with open_read_only(s) as conn:
                     try:
                         summaries = ops.book_summaries(conn, s)
-                        items = ops.waiting_on_owner(
+                        queue = ops.owner_queue(
                             conn, s, ensure_tz_aware_utc(clock(), field_name="clock()")
                         )
                         now = ensure_tz_aware_utc(clock(), field_name="clock()")
                         return (
                             summaries,
-                            items,
+                            queue,
                             ops.overdue_delisting_cash(conn),
                             ops.edgar_age(conn, s, now),
                         )
@@ -4753,22 +4753,27 @@ def make_app(
             if isinstance(result, str):  # the journal predates version 17
                 _echo_scrubbed(f"paper status: {result}", s)
                 raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
-            summaries, items, overdue, edgar = result
+            summaries, queue, overdue, edgar = result
+            items = queue.items
             now = ensure_tz_aware_utc(clock(), field_name="clock()")
             overdue_lines = _overdue_delisting_lines(overdue)
             edgar_lines = _edgar_age_lines(edgar)
+            # the open span's progress (#2298): not a problem, so not an item
+            progress_lines = [queue.shakedown_progress] if queue.shakedown_progress else []
             if not summaries:  # no window yet: nothing to lead with
                 for line in (
                     *_summary_lines(summaries),
                     *overdue_lines,
                     *edgar_lines,
                     *_waiting_lines(items),
+                    *progress_lines,
                 ):
                     _echo_scrubbed(line, s)
                 return
             for line in (
                 *_book_first_lines(summaries, items, now, overdue),
                 *_waiting_lines(items),
+                *progress_lines,
                 *overdue_lines,
                 *edgar_lines,
                 *_summary_lines(summaries),

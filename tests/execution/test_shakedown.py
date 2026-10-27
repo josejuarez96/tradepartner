@@ -16,6 +16,7 @@ per run; an `ok` delivery on the default non-store channel (`macos`); and
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -25,8 +26,10 @@ import duckdb
 import pytest
 
 from tradepartner.config import Settings
+from tradepartner.execution import ops
 from tradepartner.execution import shakedown as shakedown_module
 from tradepartner.execution.shakedown import Shakedown, ShakedownLine, shakedown
+from tradepartner.execution.waiting import SHAKEDOWN_BOOK, WaitingItem
 from tradepartner.store.db import open_for_write, open_read_only
 
 MADE_AT = datetime(2026, 10, 9, 15, tzinfo=UTC)  # Friday
@@ -1062,3 +1065,252 @@ def test_e1_an_owner_engagement_from_before_the_span_excuses_no_skipped_session(
     assert "run 3 skipped_kill_switch" in _line(result, "E.1 sessions").detail
     assert not _line(result, "E.1 sessions").passed
     assert not _line(result, "E.4 kill-switch drill").passed
+
+
+# --- progress or failing, and the owner's queue (#2298) ------------------------------
+
+
+def _states(result: Shakedown) -> dict[str, str]:
+    return {line.name: line.state for line in result.lines}
+
+
+@pytest.mark.usefixtures("health")
+def test_a_clean_span_is_every_line_passed(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _clean(conn)
+    conn.close()
+    assert set(_states(_run(settings)).values()) == {"passed"}
+
+
+@pytest.mark.usefixtures("health")
+def test_a_short_span_and_too_few_order_sessions_are_in_progress(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn, second_fill=False)
+    j.span(made_at=_at(D1, 15), sessions=3, order_sessions=2)
+    conn.close()
+    line = _line(_run(settings), "E.1 sessions")
+    assert line.state == "in_progress"
+    assert line.progress == ("2 of 3 sessions", "0 of 2 order sessions")
+    assert line.problems == ()
+
+
+@pytest.mark.usefixtures("health")
+def test_a_pending_span_is_in_progress_on_e1(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _clean(conn)
+    conn.execute("UPDATE paper_run_results SET status = 'halted' WHERE run_id = 3")
+    conn.execute("DELETE FROM kill_switch WHERE state = 'released'")
+    conn.close()
+    line = _line(_run(settings), "E.1 sessions")
+    assert line.state == "in_progress"
+    assert line.progress[0].startswith("span pending, awaiting the released kill-switch row")
+
+
+@pytest.mark.usefixtures("health")
+def test_a_missing_run_in_a_short_span_is_failing(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    j.span(made_at=_at(D1, 15))
+    conn.execute("UPDATE paper_runs SET invoked_by = 'tty' WHERE session = ?", [D2])
+    conn.close()
+    line = _line(_run(settings), "E.1 sessions")
+    assert line.state == "failing"
+    assert "2 of 3 sessions" in line.progress
+    assert line.problems == (
+        f"book main window 1 {D2}: no scheduler run and no missed_run alert with a shakedown_note",
+    )
+
+
+@pytest.mark.usefixtures("health")
+def test_no_drill_yet_is_in_progress(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    _clean(conn, drill=False)
+    conn.close()
+    pending = _line(_run(settings), "E.4 kill-switch drill")
+    assert pending.state == "in_progress"
+    assert pending.progress == ("kill-switch drill not done yet",)
+
+
+@pytest.mark.usefixtures("health")
+def test_a_drill_that_wrote_orders_is_failing(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _clean(conn, drill_orders=True)
+    conn.close()
+    line = _line(_run(settings), "E.4 kill-switch drill")
+    assert line.state == "failing"
+    assert line.problems and line.progress == ()
+
+
+@pytest.mark.usefixtures("health")
+def test_every_other_failing_line_is_failing(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    j.override("short")
+    conn.close()
+    assert _states(_run(settings))["E.5 journal"] == "failing"
+
+
+def test_e6_with_no_delivery_attempted_yet_is_progress_and_no_item(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    # orchestrator decision on #2298: nothing sent on a channel yet waits for traffic
+    _clean(conn, deliveries=False)
+    conn.close()
+    line = _line(_run(settings), "E.6 alerts")
+    assert (line.passed, line.state) == (False, "in_progress")
+    assert line.progress == ("no alert sent on macos yet",) and line.problems == ()
+    assert _queue(settings) == []
+
+
+def test_e6_with_only_failed_deliveries_is_failing_and_an_item(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn, deliveries=False)
+    alert_id = j.alert(D2, "kill_switch")
+    conn.execute(
+        'INSERT INTO alert_deliveries (alert_id, channel, "at", ok, known_at, ingested_at) '
+        "VALUES (?, 'macos', ?, FALSE, ?, ?)",
+        [alert_id, _at(D2, 20), _at(D2, 20), _at(D2, 20)],
+    )
+    conn.close()
+    line = _line(_run(settings), "E.6 alerts")
+    assert line.state == "failing"
+    assert line.problems == ("every delivery on macos failed",)
+    assert [i.line for i in _queue(settings)] == ["E.6 alerts"]
+
+
+def test_the_queue_read_leaves_health_out(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clean(conn)
+    conn.close()
+
+    def refuse(*_args: object) -> None:
+        raise AssertionError("health_report is not part of the queue read")
+
+    monkeypatch.setattr(shakedown_module, "health_report", refuse)
+    with open_read_only(settings) as read:
+        result = shakedown(read, settings, now=NOW, check_health=False)
+    line = _line(result, "E.7 data")
+    assert line.passed and "health not checked in this read" in line.detail
+
+
+def _queue(settings: Settings) -> list[WaitingItem]:
+    with open_read_only(settings) as read:
+        items = ops.waiting_on_owner(read, settings, NOW)
+    return [i for i in items if i.kind == "shakedown_failing"]
+
+
+def test_a_span_with_a_structural_e3_failure_shows_the_item(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    # the issue's first test: an E.3 failure that no further session clears
+    # (#2290's shape: a decision filled beyond its plan) is an owner item, with
+    # health left out of the read (no stub: it is never called)
+    j = _clean(conn)
+    j.order("o-dup", 1, 1, D1)  # a second order of decision 1, also filled 1000
+    conn.close()
+    (item,) = _queue(settings)
+    assert item.book_id == SHAKEDOWN_BOOK and item.line == "E.3 orders"
+    assert item.command == "tradepartner paper shakedown"
+    assert item.detail.startswith("shakedown line E.3 orders is failing: ")
+    assert "decision 1 filled 2000.00 > planned 1000.00" in item.detail
+    assert "next: an order filled beyond its plan" in item.detail
+
+
+def test_a_span_that_is_merely_short_shows_no_item(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    # the issue's second test: a span with too few sessions and order sessions so
+    # far, and no drill yet, is progress, not a problem
+    j = _clean(conn, drill=False)
+    j.span(made_at=_at(D1, 15), sessions=10, order_sessions=5)
+    j.alert(D2, "kill_switch", delivered=("macos",))  # keep E.6 met: progress lists E.1, E.4
+    conn.close()
+    assert _queue(settings) == []
+    with open_read_only(settings) as read:
+        progress = ops.owner_queue(read, settings, NOW).shakedown_progress
+    assert progress == (
+        "shakedown in progress: E.1 sessions: 2 of 10 sessions, 1 of 5 order sessions; "
+        "E.4 kill-switch drill: kill-switch drill not done yet"
+    )
+
+
+def test_no_span_row_is_no_item_and_no_progress(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    conn.close()
+    with open_read_only(settings) as read:
+        queue = ops.owner_queue(read, settings, NOW)
+    assert [i for i in queue.items if i.kind == "shakedown_failing"] == []
+    assert queue.shakedown_progress is None
+
+
+def test_any_error_in_the_shakedown_read_leaves_the_other_items(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a defect in the diagnostic read must not hide a safety item (safety-reviewer)
+    j = _clean(conn)
+    j.switch(_at(D4, 12), "engaged")
+    conn.close()
+
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise KeyError(42)
+
+    monkeypatch.setattr(shakedown_module, "shakedown", broken)
+    with open_read_only(settings) as read:
+        items = ops.owner_queue(read, settings, _at(D4, 13)).items
+    kinds = [i.kind for i in items]
+    assert "kill_switch_engaged" in kinds
+    (failing,) = [i for i in items if i.kind == "shakedown_failing"]
+    assert failing.detail.startswith("the shakedown could not be read: KeyError: 42")
+
+
+def test_the_queue_read_on_a_year_of_orders_stays_within_the_read_budget(
+    conn: duckdb.DuckDBPyConnection, fixture_store_path: Path
+) -> None:
+    # The shakedown reads every order, event and fill (not only the span's), so pin
+    # its cost on a journal of about a year of two books (5,000 orders) before the
+    # span: well under half the lock wait, as the other owner reads are.
+    j = _clean(conn)
+    old = date(2026, 10, 8)
+    run_id = j.run(old, hour=15)
+    decision_id = j.decision(run_id, old)
+    stamp = _at(old, 19)
+    conn.execute(
+        "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
+        "security_id, symbol, side, notional, quantity, position_side, "
+        "sells_in_flight_at_submit, known_at, ingested_at) "
+        "SELECT 'bulk-' || i, ?, ?, ?, 1, 'buy', 'SEC_A', 'SEC_A', 'buy', NULL, 1.0, 'long', "
+        "FALSE, ?, ? FROM range(5000) t(i)",
+        [decision_id, run_id, old, stamp, stamp],
+    )
+    conn.execute(
+        "INSERT INTO order_events (client_order_id, event_at, status, known_at, ingested_at) "
+        "SELECT 'bulk-' || i, ?, 'filled', ?, ? FROM range(5000) t(i)",
+        [stamp, stamp, stamp],
+    )
+    first = j.next_id("fills")
+    conn.execute(
+        "INSERT INTO fills (fill_id, client_order_id, filled_at, quantity, price, "
+        "price_implied, broker_fill_id, source, known_at, ingested_at) "
+        "SELECT ? + i, 'bulk-' || i, ?, 1.0, 100.0, FALSE, 'bulk-f' || i, 'broker_feed', ?, ? "
+        "FROM range(5000) t(i)",
+        [first, stamp, stamp, stamp],
+    )
+    conn.close()
+    fast = Settings(
+        _env_file=None, store={"path": str(fixture_store_path), "lock_retry_seconds": 4}
+    )
+    with open_read_only(fast) as read:
+        ops.owner_queue(read, fast, NOW)  # warm-up: the calendar and imports
+        started = time.monotonic()
+        queue = ops.owner_queue(read, fast, NOW)
+        elapsed = time.monotonic() - started
+    assert queue.shakedown_progress is not None  # the shakedown really ran
+    assert elapsed < fast.store.lock_retry_seconds / 2
