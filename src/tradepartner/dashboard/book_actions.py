@@ -77,11 +77,13 @@ class KillStatus(StrEnum):
 @dataclass(frozen=True)
 class KillResult:
     """`status` from the exit code alone (None when the wait ran out); `output`
-    is the command's scrubbed text, to show beneath, never read for the outcome."""
+    is the command's scrubbed text, to show beneath, never read for the outcome;
+    `wait_seconds` is the bound the call waited for."""
 
     status: KillStatus
     exit_code: int | None
     output: str
+    wait_seconds: int
 
 
 class KillRefused(ValueError):
@@ -144,26 +146,35 @@ def live_store_path(live: Settings | None = None) -> Path:
     return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
 
 
-def store_refusal(settings: Settings, live: Settings | None = None) -> str | None:
+def _live_config_refusal(book: str) -> str:
+    return (
+        "The live store's config could not be read, so this page cannot stop a book. "
+        f"At the desk, run `{desk_command(book)}`."
+    )
+
+
+def store_refusal(
+    settings: Settings, live: Settings | None = None, book: str = "<book>"
+) -> str | None:
     """None when the page reads the live store and no backup manifest sits
-    beside it; otherwise one plain sentence saying why, with the desk command."""
+    beside it; otherwise one plain sentence saying why, with the desk command
+    for `book`."""
     page = Path(settings.store.path).resolve()
     try:
-        same = os.path.samefile(page, live_store_path(live))
+        live_path = live_store_path(live)
+    except (ValueError, OSError):  # the live config itself does not load
+        return _live_config_refusal(book)
+    try:
+        same = os.path.samefile(page, live_path)
     except OSError:
         same = False
-    except ValueError:  # the live config itself does not load
-        return (
-            "The live store's config could not be read, so this page cannot stop a book. "
-            f"At the desk, run `{desk_command('<book>')}`."
-        )
     if not same:
         why = "This page is reading a store that is not the live store"
     elif page.with_name(f"{page.name}.manifest.json").exists():
         why = "This page is reading a store with a backup manifest beside it"
     else:
         return None
-    return f"{why}, so it cannot stop a book. At the desk, run `{desk_command('<book>')}`."
+    return f"{why}, so it cannot stop a book. At the desk, run `{desk_command(book)}`."
 
 
 def reason_refusal(reason: str | None, settings: Settings) -> str | None:
@@ -219,8 +230,8 @@ def kill(settings: Settings, book: str, reason: str) -> KillResult:
         raise KillRefused(refusal)
     try:
         live = live_settings()
-    except ValueError as exc:
-        raise KillRefused(store_refusal(settings, None) or "live config unreadable") from exc
+    except (ValueError, OSError) as exc:
+        raise KillRefused(_live_config_refusal(book)) from exc
     refusal = store_refusal(settings, live)
     if refusal is not None:
         raise KillRefused(refusal)
@@ -244,7 +255,8 @@ def kill(settings: Settings, book: str, reason: str) -> KillResult:
     child = _start(argv, env=env, cwd=PROJECT_ROOT)
     try:
         # The child's own wait is the live config's, so the bound is too.
-        stdout, stderr = child.communicate(timeout=kill_wait_seconds(live))
+        wait = kill_wait_seconds(live)
+        stdout, stderr = child.communicate(timeout=wait)
     except subprocess.TimeoutExpired as exc:
         _drain(child)
         partial = "\n".join(
@@ -252,8 +264,8 @@ def kill(settings: Settings, book: str, reason: str) -> KillResult:
             for p in (exc.stdout, exc.stderr)
             if p
         )
-        return KillResult(KillStatus.NOT_CONFIRMED, None, _scrub(partial, settings, live))
+        return KillResult(KillStatus.NOT_CONFIRMED, None, _scrub(partial, settings, live), wait)
     code = child.returncode
     status = KillStatus.ENGAGED if code == ENGAGED_EXIT else KillStatus.NOT_ENGAGED
     output = "\n".join(p for p in (stdout, stderr) if p)
-    return KillResult(status, code, _scrub(output, settings, live))
+    return KillResult(status, code, _scrub(output, settings, live), wait)

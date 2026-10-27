@@ -69,6 +69,7 @@ import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -165,12 +166,14 @@ class WriteResult:
     lot_error: str | None
 
 
+@lru_cache(maxsize=4096)
 def _rebalance_before(session: date, cadence: Cadence) -> date:
     """The last rebalance session at `cadence` strictly before `session`."""
     last = session - timedelta(days=1)
     return rebalance_sessions(last - _REBALANCE_SEARCH, last, cadence)[-1]
 
 
+@lru_cache(maxsize=4096)
 def _rebalance_after(rebalance: date, cadence: Cadence) -> date:
     """T_{i+1}: the first rebalance session at `cadence` strictly after `rebalance`."""
     first = rebalance + timedelta(days=1)

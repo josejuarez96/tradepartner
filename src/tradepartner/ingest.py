@@ -299,6 +299,7 @@ from tradepartner.store.master import (
     securities_as_of,
     security_cik,
     session_of,
+    stored_snapshot_fetches,
 )
 from tradepartner.store.master import (
     _held_ids as _master_held_ids,
@@ -1405,7 +1406,12 @@ def _ingest_filings(
     if not (isinstance(filings, _Recorded) and filings.frozen):
         _fetch_and_gate(recorded, settings)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
-    master, delistings, classes, facts, unmatched = _build_filings(recorded, settings, now)
+    # Each run fetches only today's SEC ticker file: the stored snapshot rows
+    # are the earlier fetches, so a rename is judged against them (#2291).
+    earlier = stored_snapshot_fetches(conn, now)
+    master, delistings, classes, facts, unmatched = _build_filings(
+        recorded, settings, now, earlier_fetches=earlier
+    )
     restamped = ""
     if restamp is not None:
         result = restamp_from_manifest(
@@ -1651,15 +1657,23 @@ def _source_counts(filings: FilingSource) -> str:
 
 
 def _build_filings(
-    filings: FilingSource, settings: Settings, ingested_at: datetime, *, fetch: bool = False
+    filings: FilingSource,
+    settings: Settings,
+    ingested_at: datetime,
+    *,
+    fetch: bool = False,
+    earlier_fetches: Sequence[CompanySnapshotEntry] = (),
 ) -> tuple[MasterBuild, Any, ClassificationBuild, tuple[Row, ...], tuple[FactRecord, ...]]:
-    """The builds over `filings`. The fetch pass (`fetch`) also asks
+    """The builds over `filings`, the master also over `earlier_fetches`
+    (the store's snapshot rows as fetches, #2291). The fetch pass (`fetch`) also asks
     `statement_facts` for every issuer CIK while the switch is on (#660),
     after `facts`, so one payload read fills both caches; the records are
     dropped here and read again per CIK under the lock. It asks
     `filing_events` for every issuer CIK while that switch is on (#1358),
     the same way."""
-    master = build_master(filings, settings, ingested_at=ingested_at)
+    master = build_master(
+        filings, settings, ingested_at=ingested_at, earlier_fetches=earlier_fetches
+    )
     delistings = build_delistings(filings.delistings(), master, ingested_at=ingested_at)
     classes = build_classifications(filings, master, settings, ingested_at=ingested_at)
     if settings.master.chains:  # #821: the chained rows, on the classification

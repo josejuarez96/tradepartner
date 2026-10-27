@@ -37,7 +37,13 @@ with an open window (`book_ids`, then that book's latest window, skipped when
 open shakedown span's alerts. It honours `now` (never the wall clock) and stays
 narrow: it never calls `page_data`, `_summary`, `book_summaries` or
 `performance_data`, and reads only the aggregates `waiting.py`'s kinds name. It
-writes nothing, opens no trial and calls no broker method.
+writes nothing, opens no trial and calls no broker method. While a span is open it
+also runs `shakedown.shakedown` over the same connection at `now` (#2298), with
+E.7's `health_report` half left out (it reads every fact table; `paper
+shakedown` and `tradepartner health --check` still run it), so a failing line is
+a `shakedown_failing` item on the same read, with no write and no scheduler step.
+`owner_queue` returns the items and the span's progress words (`paper status
+--all`) from that one read.
 
 **Journal not initialised.** A version-4 store no write has migrated yet
 raises `store.journal.JournalNotInitialised` from the first read; this module
@@ -175,10 +181,12 @@ __all__ = [
     "OpsData",
     "OrderChain",
     "OverdueDelisting",
+    "OwnerQueue",
     "PerformanceData",
     "RankedSignal",
     "book_ids",
     "book_summaries",
+    "owner_queue",
     "page_data",
     "performance_data",
     "waiting_on_owner",
@@ -1574,6 +1582,57 @@ def _waiting_span(conn: duckdb.DuckDBPyConnection, now: datetime) -> waiting.Spa
     )
 
 
+def _waiting_shakedown(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime
+) -> waiting.ShakedownFacts | None:
+    """`paper shakedown`'s lines at `now` without E.7's health half (module
+    docstring), or None with no `shakedown_span` row. Any error in that read (a
+    window's `frozen_json` without a tolerance E.3 needs, or a defect) becomes the
+    facts' `error`, so it never hides the books' own items; the schema gates
+    (`SchemaVersionError`, `JournalNotInitialised`) still raise as before."""
+    if registry.shakedown_span(conn) is None:
+        return None
+    try:
+        result = shakedown.shakedown(conn, settings, now=now, check_health=False)
+    except (SchemaVersionError, JournalNotInitialised):
+        raise
+    except ValueError as exc:
+        return waiting.ShakedownFacts(error=str(exc))
+    except Exception as exc:  # a diagnostic read must not hide a safety item
+        return waiting.ShakedownFacts(error=f"{type(exc).__name__}: {exc}")
+    return waiting.ShakedownFacts(lines=result.lines)
+
+
+@dataclass(frozen=True, kw_only=True)
+class OwnerQueue:
+    """`owner_queue`'s result: the waiting items and the open span's progress
+    words (`waiting.shakedown_progress`; None with no span)."""
+
+    items: tuple[waiting.WaitingItem, ...]
+    shakedown_progress: str | None
+
+
+def owner_queue(conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime) -> OwnerQueue:
+    """`waiting_on_owner`'s items and the shakedown's progress words from one read
+    (module docstring, "Waiting on the owner"). Reads only."""
+    now = ensure_tz_aware_utc(now, field_name="now")
+    try:
+        books = book_ids(conn)
+    except JournalNotInitialised:
+        return OwnerQueue(items=(), shakedown_progress=None)
+    facts: list[waiting.BookFacts] = []
+    for book in books:
+        window = journal.latest_window(conn, book)
+        if window is None or window.window_id is None or not _is_open(conn, window.window_id):
+            continue
+        facts.append(_waiting_book(conn, settings, book, window, now))
+    checked = _waiting_shakedown(conn, settings, now)
+    return OwnerQueue(
+        items=waiting.build(facts, _waiting_span(conn, now), checked),
+        shakedown_progress=waiting.shakedown_progress(checked),
+    )
+
+
 def waiting_on_owner(
     conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime
 ) -> tuple[waiting.WaitingItem, ...]:
@@ -1581,15 +1640,4 @@ def waiting_on_owner(
     (module docstring, "Waiting on the owner"; the kinds and their order are
     `execution.waiting`'s). Empty when nothing is, and on a store with no journal;
     a journal too old to read raises `SchemaVersionError`. Reads only."""
-    now = ensure_tz_aware_utc(now, field_name="now")
-    try:
-        books = book_ids(conn)
-    except JournalNotInitialised:
-        return ()
-    facts: list[waiting.BookFacts] = []
-    for book in books:
-        window = journal.latest_window(conn, book)
-        if window is None or window.window_id is None or not _is_open(conn, window.window_id):
-            continue
-        facts.append(_waiting_book(conn, settings, book, window, now))
-    return waiting.build(facts, _waiting_span(conn, now))
+    return owner_queue(conn, settings, now).items
