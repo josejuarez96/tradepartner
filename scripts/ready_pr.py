@@ -23,7 +23,9 @@ Steps, in order (each one stops the run with a reason on failure):
    a ``task:Tn`` label its fragment holds ``task: Tn (PR #<this PR>)``: the fold ticks and
    collapses the line after merge (#2280).
 4. Local checks: ruff check, ruff format --check, mypy, the fragment check and
-   ``tests/test_docs_budget.py`` always. No local pytest by default: CI runs the full suite
+   ``tests/test_docs_budget.py`` always, plus the whole-tree static invariant tests
+   (``STATIC_INVARIANT_TESTS``, ``-n 2``, ~25 s, #2367). No other local pytest by default:
+   CI runs the full suite
    on every diff that touches code, tests, scripts, dependencies or CI (``src/``,
    ``tests/``, ``scripts/``, ``.github/``, ``pyproject.toml``, ``uv.lock``,
    ``.python-version``; ``--tests-needed``) and on every push to main, sharded (#1113,
@@ -188,6 +190,21 @@ LOCAL_CHECKS: tuple[tuple[str, ...], ...] = (
     ("uv", "run", "pytest", "-q", "tests/test_docs_budget.py"),
 )
 PYTEST_CHECK: tuple[str, ...] = ("uv", "run", "pytest", "-q")
+# Whole-tree static invariant tests (#2367): any diff can break them, a local run takes
+# ~25 s, and they were 12 of 38 CI shard failures in one week. They run on every
+# ready_pr run, before the push, whatever the diff touches or --tests says.
+STATIC_INVARIANT_TESTS: tuple[str, ...] = (
+    "tests/execution/test_boundaries.py",
+    "tests/execution/test_sdk_boundary.py",
+    "tests/test_no_forbidden_imports.py",
+    "tests/test_no_literals.py",
+    "tests/execution/test_accept_rejections_boundary.py"
+    "::test_the_flag_is_only_ever_passed_on_by_its_own_name",
+    "tests/execution/test_marks.py::test_module_has_no_write_statements",
+    "tests/dashboard/test_app.py::test_dashboard_modules_never_open_a_store_connection_or_write",
+    "tests/execution/test_missing_candidate_bar.py::test_reason_and_alert_kind_are_declared",
+)
+STATIC_INVARIANT_CHECK: tuple[str, ...] = (*PYTEST_CHECK, "-n", "2", *STATIC_INVARIANT_TESTS)
 # The full suite runs in parallel when pytest-xdist is installed (#581), as CI does. xdist
 # workers each get their own subdirectory of any --basetemp, so that flag still works.
 XDIST_ARGS: tuple[str, ...] = ("-n", "auto")
@@ -872,7 +889,7 @@ def ready(
 
     # 4. local checks; pytest only when the diff can fail it (None = decide from the paths),
     # and then only the tests it maps to unless --full-tests (CI runs the full suite)
-    checks = list(LOCAL_CHECKS)
+    checks = [*LOCAL_CHECKS, STATIC_INVARIANT_CHECK]
     if full_tests:
         say("local pytest: the full suite (--full-tests)")
         checks.append(PYTEST_CHECK)
@@ -906,6 +923,12 @@ def ready(
     for cmd in checks:
         say(f"$ {' '.join(cmd)}")
         if not r.run_check(cmd):
+            if cmd == STATIC_INVARIANT_CHECK:
+                raise ReadyError(
+                    "static invariant tests failed (whole-tree boundary/literal/import "
+                    "checks CI would fail on); fix them before the push: "
+                    + " ".join(STATIC_INVARIANT_TESTS)
+                )
             raise ReadyError(f"local check failed: {' '.join(cmd)}")
 
     # 5. template, linked issue, specialist reviews
