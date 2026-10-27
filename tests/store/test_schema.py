@@ -25,7 +25,7 @@ import pytest
 from pydantic import ValidationError
 
 from tradepartner.config import Settings
-from tradepartner.store import schema
+from tradepartner.store import journal, schema
 from tradepartner.store.db import (
     StoreLockedError,
     _is_lock_error,
@@ -2903,7 +2903,10 @@ def test_read_only_open_of_a_version_37_store_still_serves_every_other_read(
 ) -> None:
     """A read-only connection never migrates: a version-37 store passes, its
     `schema_version` stays 37, its `trial_rebalances` and `paper_plans` lack the two
-    version-38 columns, and every read not naming them works (plan T241)."""
+    version-38 columns, and every read not naming them works (plan T241).
+    `journal.plans_for` names every `PaperPlanRow` field, so it reads the two as
+    NULL there instead of failing on the missing columns: the dashboard's
+    Operations page calls it on a read-only store (safety review of PR #2105)."""
     path = tmp_path / "v37.duckdb"
     conn = duckdb.connect(str(path))
     try:
@@ -2920,3 +2923,4 @@ def test_read_only_open_of_a_version_37_store_still_serves_every_other_read(
         assert ro.execute("SELECT count(*) FROM paper_plans").fetchone() == (0,)
         for table in ("trial_rebalances", "paper_plans"):
             assert not {name for name, _ in _ASSETS_INTERSECTION_ADDED} <= _table_columns(ro, table)
+        assert journal.plans_for(ro, 1) == []

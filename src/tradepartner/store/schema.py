@@ -571,9 +571,9 @@ registry; #83 took version 2 first, so the registry is version 3):
   columns by `ALTER TABLE` (`_migrate_assets_intersection`), NULL on every
   existing row because those rows predate the record; the pinned DDL strings
   do not change. A read-only connection accepts a version-37 store: every read
-  works but a read of the two new columns — `journal.plans_for` names
-  `paper_plans`'s, so it fails there until T242 declares it in the version note
-  — and the next writable `init_schema` call migrates the store.
+  works (`journal.plans_for`, which names `paper_plans`'s two, reads them as
+  NULL there; no read names `trial_rebalances`'s before T242), and the next
+  writable `init_schema` call migrates the store.
 - **A later DDL change goes to version 39**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
@@ -1050,9 +1050,9 @@ _PRE_BREAKS_VERSION = 36
 
 #: The last version without the liquidity intersection's record on
 #: `trial_rebalances` and `paper_plans` (plan T241, version 38): read-only
-#: connections serve every read but the two new columns — `journal.plans_for`
-#: names `paper_plans`'s because `_select` names every `PaperPlanRow` field,
-#: and no read names `trial_rebalances`'s before T242.
+#: connections serve every read: `journal._select` reads `paper_plans`'s two as
+#: NULL where they are missing, and no read names `trial_rebalances`'s before
+#: T242.
 _PRE_ASSETS_INTERSECTION_VERSION = 37
 
 
@@ -3214,12 +3214,10 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # version 33 every read (no short reason can exist there); version 34
         # every read but `mergers`; versions 35 and 36 every read (the break
         # readers find no `reconcile_breaks` at 35 or 36 and return no event);
-        # version 37 every read but the two version-38 columns
-        # `trial_rebalances.n_assets_intersected` and
-        # `assets_intersection_skipped` (no read names them before T242) and
-        # `paper_plans`'s same two, which `journal.plans_for` names because
-        # `_select` names every `PaperPlanRow` field (T242 owns that read);
-        # those rows predate the record.
+        # version 37 every read (no read names the two version-38
+        # `trial_rebalances` columns before T242, and `journal._select` reads
+        # `paper_plans`'s same two as NULL where they are missing); those rows
+        # predate the record.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -4258,8 +4256,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-37 (every read but the two
-    version-38 columns `trial_rebalances` and `paper_plans` each gain), 36 and
+    On a read-only connection no DDL runs: a version-37 (every read; `paper_plans`'s
+    two version-38 columns read as NULL through `journal`), 36 and
     35 (every read; the break readers return no event), 34
     (every read but `mergers`, missing there), 33 (every read; the short reasons
     only widen a `CHECK`), 32 (every read; the

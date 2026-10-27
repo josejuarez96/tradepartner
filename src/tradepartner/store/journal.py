@@ -1144,6 +1144,26 @@ class OverrideWithConsumption:
         return bool(self.decision_ids)
 
 
+#: Columns a row type names that a store one version back may lack, by table:
+#: `paper_plans`'s two version-38 columns (plan T241). A read-only connection
+#: accepts a version-37 store (`schema._check_read_only`), so `_select` reads
+#: them as NULL there, which is what every pre-version-38 row holds after the
+#: migration, instead of failing on the missing column.
+_LATE_COLUMNS: dict[str, frozenset[str]] = {
+    "paper_plans": frozenset({"n_assets_intersected", "assets_intersection_skipped"}),
+}
+
+
+def _absent_late_columns(conn: duckdb.DuckDBPyConnection, table: str) -> frozenset[str]:
+    """The `_LATE_COLUMNS` of `table` that the store's table lacks (empty for
+    every other table, and on a current store)."""
+    late = _LATE_COLUMNS.get(table)
+    if not late:
+        return frozenset()
+    present = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+    return late - present
+
+
 def _select[R](
     conn: duckdb.DuckDBPyConnection,
     row_type: type[R],
@@ -1160,8 +1180,9 @@ def _select[R](
     require_journal(conn)
     _check_limit(limit)
     names = [f.name for f in fields(row_type)]  # type: ignore[arg-type]
-    columns = ", ".join(f't."{name}"' for name in names)
     table = row_type.TABLE  # type: ignore[attr-defined]
+    absent = _absent_late_columns(conn, table)
+    columns = ", ".join(f'NULL AS "{name}"' if name in absent else f't."{name}"' for name in names)
     sql = f"SELECT {columns} FROM {table} t WHERE {where} ORDER BY {order}"
     values = list(params)
     if limit is not None:
