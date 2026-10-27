@@ -3385,3 +3385,12 @@ def test_ui_kill_wait_seconds_must_exceed_the_kill_store_wait_by_the_margin() ->
         ui={"kill_wait_margin_seconds": 50},
     )
     assert kill_wait_seconds(margin) == 150
+
+
+def test_ui_lab_orphan_after_hours_defaults_to_24_and_must_be_positive() -> None:
+    """T291 (#2304): how long an open lab registry row stays live before it is an orphan."""
+    assert _settings().ui.lab_orphan_after_hours == 24
+    assert Settings(_env_file=None, ui={"lab_orphan_after_hours": 6}).ui.lab_orphan_after_hours == 6
+    for bad in (0, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"lab_orphan_after_hours": bad})

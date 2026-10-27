@@ -517,6 +517,77 @@ def close_sweep_run(
     )
 
 
+@dataclass(frozen=True)
+class SweepRunRow:
+    """One `sweep_runs` row as the Lab page reads it: the planned and end-of-run
+    counts (NULL while the run is open) and who started it."""
+
+    sweep_run_id: int
+    sweep_id: int
+    started_at: datetime
+    finished_at: datetime | None
+    time_budget_minutes: int
+    n_declared: int
+    n_planned: int
+    n_ok: int | None
+    n_failed: int | None
+    n_terminal_failed: int | None
+    seconds: float | None
+    completed: bool | None
+    run_by: str
+    note: str | None
+
+
+@dataclass(frozen=True)
+class SweepRunTrial:
+    """One trial a sweep run opened, with its variant and outcome as stored;
+    `status` is `unfinished` when the trial has no result row."""
+
+    variant_index: int
+    slug: str
+    trial_id: int
+    status: str
+    message: str | None
+
+
+def sweep_runs_after(
+    conn: duckdb.DuckDBPyConnection, sweep_id: int, after_id: int
+) -> list[SweepRunRow]:
+    """The runs of registration `sweep_id` with `sweep_run_id` above `after_id`
+    (a baseline the caller read before it started a run), oldest first. Read-only."""
+    require_lab(conn)
+    return _select(
+        conn,
+        SweepRunRow,
+        "sweep_runs",
+        "sweep_id = ? AND sweep_run_id > ? ORDER BY sweep_run_id",
+        [sweep_id, after_id],
+    )
+
+
+def open_sweep_runs(conn: duckdb.DuckDBPyConnection) -> list[SweepRunRow]:
+    """Every `sweep_runs` row still open (`finished_at IS NULL`), oldest first,
+    whatever its age: the caller decides which are live and which orphans."""
+    require_lab(conn)
+    return _select(conn, SweepRunRow, "sweep_runs", "finished_at IS NULL ORDER BY sweep_run_id", [])
+
+
+def sweep_run_trials(conn: duckdb.DuckDBPyConnection, sweep_run_id: int) -> list[SweepRunTrial]:
+    """The trials one sweep run opened, in variant order, each with its stored
+    status and message. Read-only."""
+    require_lab(conn)
+    rows = conn.execute(
+        "SELECT v.variant_index, h.slug, st.trial_id, COALESCE(r.status, 'unfinished'), "
+        "r.message FROM sweep_trials st "
+        "JOIN trials t USING (trial_id) JOIN hypotheses h USING (hypothesis_id) "
+        "JOIN sweep_variants v USING (hypothesis_id) "
+        "LEFT JOIN trial_results r USING (trial_id) "
+        "WHERE st.sweep_run_id = ? ORDER BY v.variant_index, st.trial_id",
+        [sweep_run_id],
+    ).fetchall()
+    return [SweepRunTrial(*row) for row in rows]
+
+
 def write_sweep_trial(
     conn: duckdb.DuckDBPyConnection,
     *,

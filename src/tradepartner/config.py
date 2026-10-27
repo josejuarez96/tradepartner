@@ -2527,6 +2527,10 @@ class UiConfig(_ClosedConfig):
     `store.writer_lock_retry_seconds` plus `kill_wait_margin_seconds` (interpreter
     start plus one retry delay). A set value must exceed that sum, or a kill still
     waiting on the store would be reported as not confirmed (`Settings`, at load).
+
+    The Lab page (plan T291, #2304): `lab_orphan_after_hours` is how long an open
+    `sweep_runs` row or an `unfinished` trial may stay open before the page lists it
+    apart as an orphan (a run whose writer died) that no longer blocks a new run.
     """
 
     next_run_time_et: str = "08:05"
@@ -2534,6 +2538,7 @@ class UiConfig(_ClosedConfig):
     max_reason_chars: int = Field(default=500, gt=0)
     kill_wait_seconds: int | None = Field(default=None, gt=0)
     kill_wait_margin_seconds: int = Field(default=30, gt=0)
+    lab_orphan_after_hours: int = Field(default=24, gt=0)
 
     @field_validator("next_run_time_et")
     @classmethod

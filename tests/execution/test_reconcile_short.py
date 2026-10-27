@@ -54,6 +54,7 @@ from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ReconciliationError
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.reconcile import (
+    BREAKS,
     FILLS_LAGGING,
     MISMATCH,
     OK,
@@ -285,14 +286,15 @@ def test_a_change_our_own_lagging_cover_explains_is_not_short_external_change() 
 # --- a broker long against a ledger short ------------------------------------
 
 
-def test_a_broker_long_against_a_ledger_short_is_a_mismatch() -> None:
+def test_a_broker_long_against_a_ledger_short_is_a_name_break() -> None:
     """Item 10's sign check: broker +10 has the short's |quantity| but the
-    wrong sign. It is a mismatch on the held name: `short_external_change`
+    wrong sign. It is a residual on the held name: `short_external_change`
     (item 9) or `quantity`; never `broker_only_position`, since the ledger
-    holds the name."""
+    holds the name. Paper spec amendment #2266 item 2 lists both kinds as
+    name-level, so the status is `breaks` (T281 still halts the run)."""
     result = _run(_ledger(), _positions(AAA=10.0), SHORT_CASH)
 
-    assert result.status == MISMATCH
+    assert result.status == BREAKS
     kinds = _on(result, "SEC_A")
     assert len(kinds) == 1
     assert kinds[0] in {"short_external_change", "quantity"}
