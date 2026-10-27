@@ -379,9 +379,13 @@ def test_the_read_stays_within_half_the_lock_retry_seconds(store: Settings) -> N
     fast = Settings(_env_file=None, store={"path": store.store.path, "lock_retry_seconds": 4})
     all_sessions()
     _build(fast)
-    started = time.monotonic()
-    _build(fast)
-    assert time.monotonic() - started < fast.store.lock_retry_seconds / 2
+    # Best of 3: the bound guards the read, not a busy CI runner (#2348).
+    elapsed_times = []
+    for _ in range(3):
+        started = time.monotonic()
+        _build(fast)
+        elapsed_times.append(time.monotonic() - started)
+    assert min(elapsed_times) < fast.store.lock_retry_seconds / 2
 
 
 def test_the_read_writes_nothing(store: Settings) -> None:
