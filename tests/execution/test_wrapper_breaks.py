@@ -8,7 +8,7 @@ from __future__ import annotations
 import duckdb
 import pytest
 
-from tradepartner.adapters.broker import OrderRequest, Side
+from tradepartner.adapters.broker import OrderRequest, Position, Side
 from tradepartner.config import RiskConfig
 from tradepartner.errors import ReconciliationError
 from tradepartner.execution.plan import decisions_from
@@ -37,6 +37,7 @@ from .test_wrapper_phases import (
     B,
     C,
     Env,
+    S,
     _append,
     _decision,
     _decision_events,
@@ -392,3 +393,37 @@ def test_planning_past_the_break_cap_plans_nothing(env_planning: planning_tests.
     with pytest.raises(ReconciliationError, match="break_cap"):
         env_planning.plan()
     assert env_planning.counts() == before
+
+
+def test_a_short_cover_is_cut_to_the_smaller_short_and_ignores_open_short_sells(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ledger short 10, broker short 6, an open short-opening sell of 4: the cover is
+    cut to 6 (the sell deepens the short and must not widen the limit)."""
+    from dataclasses import replace as _replace
+
+    from tradepartner.execution.ledger import Ledger
+    from tradepartner.execution.phases import PhaseOrder, PhaseOrders
+
+    _append(env.settings, _break(env, A))
+    gate = _gate(env, alerter_conn)
+    monkeypatch.setattr(env.fake, "positions", lambda: {SYMBOLS[A]: Position(SYMBOLS[A], -6.0)})
+    _hold(env, A, 10.0)
+    _open_sell(env, A, 4.0)  # a sell that, on a short, deepens it
+    book = gate._read_book(env.run, [_decision(env, A, "sell", quantity=1.0)])
+    book = _replace(
+        book,
+        ledger=Ledger(positions={}, short_holdings={A: 10.0}, cash=0.0, through=S),
+    )
+    cover = PhaseOrder(
+        decision_id=1,
+        security_id=A,
+        side="buy",
+        decision="trade",
+        price=100.0,
+        quantity=10.0,
+        whole_share=True,
+        position_side="short",
+    )
+    out = gate._restrict(env.run, book, PhaseOrders((cover,), (), session=S), S)
+    assert [o.quantity for o in out.orders] == [6.0]

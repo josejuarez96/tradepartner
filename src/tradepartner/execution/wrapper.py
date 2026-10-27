@@ -1281,6 +1281,16 @@ class RiskGatedBroker:
         decimals = self._decimals()
         # The name's own sells still open at the broker are shares already spoken for
         # on both books, so they come off both sides of the limit.
+        done = {e.client_order_id for e in book.events if e.status in TERMINAL_ORDER_STATUSES}
+        open_covers: dict[str, float] = {}
+        for o in book.orders:
+            if (
+                o.client_order_id not in done
+                and o.side == _BUY
+                and o.position_side == SHORT
+                and o.quantity is not None
+            ):
+                open_covers[o.security_id] = open_covers.get(o.security_id, 0.0) + o.quantity
         open_now = open_sold(
             _open_sells(book, {o.security_id for o in built.orders}, session), decimals
         )
@@ -1302,7 +1312,11 @@ class RiskGatedBroker:
             symbol = book.symbols[sid]
             position = held.get(canonical_symbol(symbol)) if symbol is not None else None
             broker_quantity = position.quantity if position is not None else 0.0
-            spoken = float(open_now.get(sid, Decimal(0)))
+            # A long's sell is netted by its open sells; a short's cover by its open
+            # covers (the whole quantity of each non-terminal one: fail closed). A
+            # short-opening sell is never netted: it deepens the short. Signed, the
+            # open sells come off a long and the open covers go onto a short.
+            spoken = -open_covers.get(sid, 0.0) if short else float(open_now.get(sid, Decimal(0)))
             limit = break_rules.reducing_limit(ledger_quantity - spoken, broker_quantity - spoken)
             wanted = (
                 order.quantity
