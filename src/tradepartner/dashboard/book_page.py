@@ -15,8 +15,8 @@ word and no UTC time: the status is a pill (Trading, Halted, Closed), times are
 the view model's Eastern sentences, and dates are weekday and day.
 
 **The safety and backtest cards** (T277, #2270) draw `book_view.build`'s safety
-and backtest parts: "Matches Alpaca to the cent" only when the view says it
-checked, otherwise its words for what differs; the kill switch line; the limits
+and backtest parts: an `ok` match is described as within the reconciliation's
+tolerance, otherwise the view's words say what differs; the kill switch line; the limits
 in its plain words; shakedown progress, the latest tracking report and the
 desk command to run another (the page never runs one, so a render adds no trial).
 Resume is the desk's alone: the card prints its command and offers no button,
@@ -63,8 +63,6 @@ STOP_OUTCOME_KEY = "book_page_stop_outcome"
 #: `(book, trimmed reason)` of the last kill that engaged or is unconfirmed.
 STOP_LAST_KEY = "book_page_stop_last"
 _EASTERN = ZoneInfo("America/New_York")
-#: "To the cent" is said only when the window's frozen cash tolerance is a cent or less.
-_CENT = 0.01
 RANGE_KEY = "book_page_range"
 _LINK_SEEN_KEY = "book_page_link_seen"
 #: The Trades page's own book picker key; the "see all" link sets it, then opens that page.
@@ -410,15 +408,8 @@ def _safety(view: book_view.BookView, settings: Settings, book: str) -> None:
     if safety is None or head is None:
         return
     recon = safety.reconciliation
-    if recon.matches and recon.cash_tolerance is not None and recon.cash_tolerance <= _CENT:
-        st.write("Matches Alpaca to the cent.")
-        if recon.at is not None:
-            st.caption(f"Checked {_when(recon.at)}.")
-    elif recon.matches:
-        st.write(
-            "Matches Alpaca within the reconciliation's tolerance "
-            f"(cash to {_money(recon.cash_tolerance or 0.0)})."
-        )
+    if recon.matches:
+        st.write("Matches Alpaca (within the reconciliation's tolerance).")
         if recon.at is not None:
             st.caption(f"Checked {_when(recon.at)}.")
     else:
