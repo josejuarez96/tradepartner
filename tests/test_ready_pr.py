@@ -647,7 +647,7 @@ def test_happy_path_pushes_waits_and_marks_ready() -> None:
     assert ready_pr.ready(r, 69, poll_s=0) == 0
     assert r.pushed == ["HEAD:feat/69-x"]
     assert r.readied == [69]
-    assert [c[-1] for c in r.checks_run] == [".", ".", "mypy", "check", BUDGET]
+    assert [c[-1] for c in r.checks_run] == [".", ".", "mypy", "check", BUDGET, STATIC_CHECK[-1]]
 
 
 def test_a_draft_gets_the_full_ci_label_before_its_push_and_ready_after_green() -> None:
@@ -1189,6 +1189,7 @@ def test_tests_needed_only_for_code_tests_scripts_and_deps() -> None:
 
 
 BUDGET = "tests/test_docs_budget.py"
+STATIC_CHECK = ready_pr.STATIC_INVARIANT_CHECK
 
 
 def _ran_pytest(r: FakeRunner) -> bool:
@@ -1197,7 +1198,7 @@ def _ran_pytest(r: FakeRunner) -> bool:
 
 def _ran_suite(r: FakeRunner) -> bool:
     """pytest beyond the always-run docs-budget check."""
-    return any("pytest" in c and c[-1] != BUDGET for c in r.checks_run)
+    return any("pytest" in c and c[-1] != BUDGET and c != STATIC_CHECK for c in r.checks_run)
 
 
 def test_pytest_runs_locally_only_when_needed_unless_forced_or_skipped() -> None:
@@ -1205,16 +1206,24 @@ def test_pytest_runs_locally_only_when_needed_unless_forced_or_skipped() -> None
     code = FakeRunner()
     assert ready_pr.ready(code, 69, dry_run=True) == 0
     assert not _ran_suite(code)  # CI runs the full suite on a code diff (#1130)
-    assert [c[-1] for c in code.checks_run] == [".", ".", "mypy", "check", BUDGET]
+    assert [c[-1] for c in code.checks_run] == [".", ".", "mypy", "check", BUDGET, STATIC_CHECK[-1]]
 
     code_forced = FakeRunner()
     assert ready_pr.ready(code_forced, 69, dry_run=True, run_tests=True) == 0
-    assert [c[-1] for c in code_forced.checks_run] == [".", ".", "mypy", "check", BUDGET, "-q"]
+    assert [c[-1] for c in code_forced.checks_run] == [
+        ".",
+        ".",
+        "mypy",
+        "check",
+        BUDGET,
+        STATIC_CHECK[-1],
+        "-q",
+    ]
 
     docs = FakeRunner(touched=docs_only, comments=())
     assert ready_pr.ready(docs, 69, dry_run=True) == 0
     assert not _ran_suite(docs)
-    assert [c[-1] for c in docs.checks_run] == [".", ".", "mypy", "check", BUDGET]
+    assert [c[-1] for c in docs.checks_run] == [".", ".", "mypy", "check", BUDGET, STATIC_CHECK[-1]]
 
     forced = FakeRunner(touched=docs_only, comments=())
     assert ready_pr.ready(forced, 69, dry_run=True, run_tests=True) == 0
@@ -1591,6 +1600,37 @@ def test_the_new_template_has_no_box_ready_pr_cannot_tick() -> None:
     assert len(boxes) == 4
     assert not any("uv run pytest" in b for b in boxes)
     assert ready_pr.unchecked_boxes(body.replace("- [ ]", "- [x]")) == []
+
+
+def test_static_invariant_tests_run_on_every_run_with_two_workers() -> None:
+    """The whole-tree static tests run locally even when local pytest is skipped (#2367)."""
+    names = ready_pr.STATIC_INVARIANT_TESTS
+    for needle in (
+        "test_boundaries.py",
+        "test_accept_rejections_boundary.py",
+        "test_no_literals.py",
+        "test_no_forbidden_imports.py",
+        "test_marks.py::test_module_has_no_write_statements",
+        "test_app.py::test_dashboard_modules_never_open_a_store_connection_or_write",
+        "test_missing_candidate_bar.py::test_reason_and_alert_kind_are_declared",
+    ):
+        assert any(n.endswith(needle) for n in names), needle
+    assert ("uv", "run", "pytest", "-q", "-n", "2", *names) == ready_pr.STATIC_INVARIANT_CHECK
+    for kwargs in ({}, {"run_tests": False}, {"run_tests": True}):
+        r = FakeRunner()
+        assert ready_pr.ready(r, 69, dry_run=True, **kwargs) == 0  # type: ignore[arg-type]
+        assert r.checks_run.count(ready_pr.STATIC_INVARIANT_CHECK) == 1
+    docs = FakeRunner(touched=["docs/a.md", "changelog.d/69-x.md"])
+    assert ready_pr.ready(docs, 69, dry_run=True) == 0
+    assert ready_pr.STATIC_INVARIANT_CHECK in docs.checks_run
+
+
+def test_a_failing_static_test_stops_before_the_push() -> None:
+    r = FakeRunner()
+    r.run_check = lambda cmd: tuple(cmd) != ready_pr.STATIC_INVARIANT_CHECK  # type: ignore[method-assign]
+    with pytest.raises(ready_pr.ReadyError, match="static invariant tests failed"):
+        ready_pr.ready(r, 69)
+    assert r.pushed == []
 
 
 def test_book_page_requires_the_safety_review() -> None:
