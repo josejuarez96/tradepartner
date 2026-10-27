@@ -1486,8 +1486,8 @@ why = "The owner sees what is registered, changed or unmerged before he register
 unblocks = ["task:T293"]
 
 [task.T290]
-what = "The Lab's one Run slot: `sweep run` or `backtest` started as a child process the page never waits on, tracked by a slot file beside the store."
-why = "A run takes minutes; the page must start it, survive a restart and never block a kill (#2304, ADR 0018 B)."
+what = "The Lab's child process: the exact argv, a spawn the page never waits on, a 0600 log and the scrub."
+why = "A run takes minutes; the page must start the desk's own command, survive a restart and never block a kill (#2304, ADR 0018 B)."
 unblocks = ["task:T294"]
 
 [task.T291]
@@ -1521,3 +1521,13 @@ why = "The rest of ADR 0018 B's Run on Streamlit, after the B10 path (#2304)."
 [task.T297]
 what = "`ready_pr`'s review gate requires safety and quant reviews on the dashboard's child-process modules."
 why = "The Lab and kill modules spawn registry and kill-switch writes; the gate should enforce their reviews by path (#2304)."
+
+[task.T298]
+what = "The Lab's one Run slot: a slot file beside the store that every tab and a restarted dashboard share, with PID-reuse and orphan handling."
+why = "One run at a time, whatever the number of tabs, and a verdict that outlives the run (#2304, ADR 0018 B)."
+unblocks = ["task:T294"]
+
+[task.T299]
+what = "The charter's Interface line names the dashboard's child-process writes: stop a book, register a strategy, run a counted trial."
+why = "The charter still says the override is the only write; ADR 0018's amendment asks for this line before the app runs trials (#2304)."
+unblocks = ["task:T294"]
