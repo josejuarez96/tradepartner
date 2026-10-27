@@ -366,6 +366,11 @@ def parse_file(path: Path) -> HypothesisFile:
         inert_set = frozen.inert_sections(family)
     except KeyError as exc:
         raise HypothesisFileError(f"{path}: family {family!r} is not listed in FAMILIES") from exc
+    if not FAMILIES[family].sections:  # type: ignore[index]
+        raise HypothesisFileError(
+            f"{path}: family {family!r} is experiment-only (no signal, no frozen keys); "
+            "register it as a research experiment, not a hypothesis"
+        )
     inert = sorted(k for k in flat if k.partition(".")[0] in inert_set)
     if inert:
         raise HypothesisFileError(

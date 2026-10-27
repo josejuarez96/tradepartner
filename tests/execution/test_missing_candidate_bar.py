@@ -44,7 +44,12 @@ def signal_reasons(env: Env) -> dict[str, str]:
 
 def test_reason_and_alert_kind_are_declared() -> None:
     assert "missing_candidate_bar" in ALERT_KINDS
-    assert all("no_t0_bar" in spec.exclusion_reasons for spec in FAMILIES.values())
+    # `filing_delay` is experiment-only (#2353): no signal, so no exclusion reasons.
+    assert all(
+        "no_t0_bar" in spec.exclusion_reasons
+        for family, spec in FAMILIES.items()
+        if family != "filing_delay"
+    )
 
 
 def test_candidate_with_no_t0_bar_is_excluded_with_the_reason_and_alerts(
