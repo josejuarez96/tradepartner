@@ -280,7 +280,7 @@ def test_status_idle_starting_running_ended(slot: Path, tmp_path: Path) -> None:
 
 def test_status_tail_goes_through_scrub_and_is_bounded(slot: Path, tmp_path: Path) -> None:
     log = tmp_path / "l"
-    log.write_text("x" * 100 + "SECRET" + "y" * 100)
+    log.write_text("x" * 100 + "\nab SECRET cd\n" + "y" * 20 + "\n")
     assert isinstance(_take(slot), Taken)
     _record(slot, os.getpid(), log)
     s = lab_run.status(
@@ -289,10 +289,10 @@ def test_status_tail_goes_through_scrub_and_is_bounded(slot: Path, tmp_path: Pat
         now=NOW,
         grace_seconds=30,
         start_time_of=lambda _p: "S1",
-        tail_bytes=110,
+        tail_bytes=60,
     )
     assert "SECRET" not in s.log_tail and "***" in s.log_tail
-    assert len(s.log_tail) <= 110
+    assert len(s.log_tail) <= 60
 
 
 def test_status_refuses_a_symlinked_log(slot: Path, tmp_path: Path) -> None:
@@ -338,3 +338,129 @@ def test_real_subprocess_roundtrip(slot: Path, tmp_path: Path) -> None:
     assert lab_run.release(slot)
     last = lab_run.read_last(slot)
     assert last is not None and last.baseline is None and last.exit_code == 3
+
+
+def test_record_refuses_naive_started_at(slot: Path, tmp_path: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    with pytest.raises(ValueError, match="tz-aware"):
+        lab_run.record(
+            slot,
+            FakeChild(1),
+            kind="s",
+            slug="s",
+            baseline=None,
+            started_at=datetime(2026, 10, 27, 15, 0),  # noqa: DTZ001
+            log_path=tmp_path / "l",
+            start_time_of=lambda _p: "S",
+        )
+
+
+def test_waiter_after_release_writes_exit_code_to_last(slot: Path, tmp_path: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    child = FakeChild(2**22 + 5, code=2)
+    lab_run.record(
+        slot,
+        child,
+        kind="sweep",
+        slug="b10",
+        baseline=7,
+        started_at=NOW,
+        log_path=tmp_path / "l",
+        start_time_of=lambda _p: None,
+    )
+    assert lab_run.release(slot, start_time_of=lambda _p: None)
+    t = lab_run.watch(slot, child)
+    child.gate.set()
+    t.join(5)
+    last = lab_run.read_last(slot)
+    assert last is not None and (last.baseline, last.exit_code) == (7, 2)
+    assert not slot.exists()
+
+
+def test_tail_cut_inside_a_secret_never_shows_part_of_it(slot: Path, tmp_path: Path) -> None:
+    log = tmp_path / "l"
+    log.write_text("first line\nkey=ABCDEFGHIJKL end\nlast line\n")
+    assert isinstance(_take(slot), Taken)
+    _record(slot, os.getpid(), log)
+    # cut lands inside "ABCDEFGHIJKL"
+    cut = len("last line\n") + len(" end\n") + 6
+    s = lab_run.status(
+        slot,
+        scrub=lambda t: t.replace("ABCDEFGHIJKL", "[x]"),
+        now=NOW,
+        grace_seconds=30,
+        start_time_of=lambda _p: "S1",
+        tail_bytes=cut,
+    )
+    assert "GHIJKL" not in s.log_tail and "last line" in s.log_tail
+
+
+def test_status_ignores_a_non_regular_log(slot: Path, tmp_path: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    _record(slot, os.getpid(), tmp_path)  # a directory
+    s = lab_run.status(
+        slot, scrub=lambda t: t, now=NOW, grace_seconds=30, start_time_of=lambda _p: "S1"
+    )
+    assert s.log_tail == ""
+
+
+def test_record_refuses_when_another_tab_took_the_slot_over(slot: Path, tmp_path: Path) -> None:
+    first = _take(slot)
+    assert isinstance(first, Taken)
+    _age(slot, 31)
+    assert isinstance(_take(slot), Taken)  # tab B, past the grace
+    with pytest.raises(lab_run.SlotLost):
+        lab_run.record(
+            slot,
+            FakeChild(5),
+            kind="s",
+            slug="s",
+            baseline=None,
+            started_at=NOW,
+            log_path=tmp_path / "l",
+            start_time_of=lambda _p: "S",
+            taken=first,
+        )
+    assert slot.stat().st_size == 0  # tab B's file is untouched
+
+
+def _ps_down(_pid: int) -> str | None:
+    raise lab_run.PsUnavailable("down")
+
+
+def test_ps_failure_is_unknown_not_gone(slot: Path, tmp_path: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    _record(slot, os.getpid(), tmp_path / "l")
+    res = lab_run.take(slot, in_flight=(), now=NOW, grace_seconds=30, start_time_of=_ps_down)
+    assert isinstance(res, Busy)
+    assert lab_run.release(slot, start_time_of=_ps_down) is False
+    st = lab_run.status(slot, scrub=lambda t: t, now=NOW, grace_seconds=30, start_time_of=_ps_down)
+    assert st.state == "running"
+
+
+def test_ps_failure_at_record_falls_back_to_signal_zero(slot: Path, tmp_path: Path) -> None:
+    assert isinstance(_take(slot), Taken)
+    rec = lab_run.record(
+        slot,
+        FakeChild(os.getpid()),
+        kind="s",
+        slug="s",
+        baseline=None,
+        started_at=NOW,
+        log_path=tmp_path / "l",
+        start_time_of=_ps_down,
+    )
+    assert rec.pid_start is None
+    res = lab_run.take(
+        slot, in_flight=(), now=NOW, grace_seconds=30, start_time_of=lambda _p: "whatever"
+    )
+    assert isinstance(res, Busy)
+
+
+def test_ps_error_raises_ps_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise subprocess.TimeoutExpired("ps", 10)
+
+    monkeypatch.setattr(lab_run.subprocess, "run", boom)
+    with pytest.raises(lab_run.PsUnavailable):
+        lab_run.process_start_time(1)

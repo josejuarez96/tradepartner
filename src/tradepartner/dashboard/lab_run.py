@@ -30,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import stat
 import subprocess
 import threading
 import uuid
@@ -72,6 +73,8 @@ class Taken:
     """The slot is ours; the caller spawns, then calls `record` (or `abandon`)."""
 
     slot_path: Path
+    dev: int = 0
+    ino: int = 0
 
 
 @dataclass(frozen=True)
@@ -93,8 +96,19 @@ class SlotStatus:
 StartTimeOf = Callable[[int], str | None]
 
 
+class PsUnavailable(Exception):
+    """`ps` failed or timed out: the PID's state is unknown, not gone."""
+
+
+class SlotLost(Exception):
+    """The slot `take` created is no longer the file at the slot path."""
+
+
 def process_start_time(pid: int) -> str | None:
-    """`ps -o lstart= -p <pid>` (list form, no shell); None when the PID is gone."""
+    """`ps -o lstart= -p <pid>` (list form, no shell); None when the PID is gone.
+
+    Raises `PsUnavailable` when `ps` itself fails or times out (unknown, not gone).
+    """
     try:
         out = subprocess.run(
             ["ps", "-o", "lstart=", "-p", str(pid)],
@@ -103,8 +117,8 @@ def process_start_time(pid: int) -> str | None:
             check=False,
             timeout=10,
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PsUnavailable(str(exc)) from exc
     text = out.stdout.strip()
     return text or None
 
@@ -159,23 +173,40 @@ def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 def _alive(rec: SlotRecord, start_time_of: StartTimeOf) -> bool:
     """Same PID with the start time recorded; another start time is PID reuse."""
+    if rec.pid_start is None:  # `ps` failed at record time: signal 0 is all we have
+        try:
+            os.kill(rec.pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
     now_start = start_time_of(rec.pid)
     return now_start is not None and now_start == rec.pid_start
 
 
 def _running(rec: SlotRecord, start_time_of: StartTimeOf) -> bool:
-    return rec.exit_code is None and _alive(rec, start_time_of)
+    """Live child; an unknown PID state (`ps` failed) counts as running (fail closed)."""
+    if rec.exit_code is not None:
+        return False
+    try:
+        return _alive(rec, start_time_of)
+    except PsUnavailable:
+        return True
 
 
-def _create(slot_path: Path) -> bool:
+def _create(slot_path: Path) -> Taken | None:
     try:
         fd = os.open(slot_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, _FILE_MODE)
     except FileExistsError:
-        return False
-    os.close(fd)
+        return None
+    try:
+        made = os.fstat(fd)
+    finally:
+        os.close(fd)
     with contextlib.suppress(OSError):
         last_path(slot_path).unlink()
-    return True
+    return Taken(slot_path, made.st_dev, made.st_ino)
 
 
 def _in_grace(path: Path, now: datetime, grace_seconds: float) -> bool:
@@ -199,12 +230,13 @@ def take(
         raise ValueError("now must be tz-aware")
     if in_flight:
         return Busy(tuple(f"a run is in flight: {item}" for item in in_flight))
-    if _create(slot_path):
-        return Taken(slot_path)
+    if (made := _create(slot_path)) is not None:
+        return made
     try:
         before = slot_path.stat()
     except FileNotFoundError:
-        return Taken(slot_path) if _create(slot_path) else Busy(("another tab took the slot",))
+        made = _create(slot_path)
+        return made if made is not None else Busy(("another tab took the slot",))
     rec = _read(slot_path)
     if rec is None:
         if _in_grace(slot_path, now, grace_seconds):
@@ -225,9 +257,8 @@ def take(
         aside.unlink(missing_ok=True)
         return Busy(("another tab took over the stale slot",))
     aside.unlink(missing_ok=True)
-    if _create(slot_path):
-        return Taken(slot_path)
-    return Busy(("another tab took over the stale slot",))
+    made = _create(slot_path)
+    return made if made is not None else Busy(("another tab took over the stale slot",))
 
 
 def abandon(slot_path: Path) -> None:
@@ -246,11 +277,30 @@ def record(
     started_at: datetime,
     log_path: Path,
     start_time_of: StartTimeOf = process_start_time,
+    taken: Taken | None = None,
 ) -> SlotRecord:
-    """Write the child's record into the slot (temp file, then `os.replace`)."""
+    """Write the child's record into the slot (temp file, then `os.replace`).
+
+    Given the `Taken` that `take` returned, raises `SlotLost` when the file at the
+    slot path is no longer the one it created (another tab took the slot over
+    after the grace); the caller must not treat the run as the slot's.
+    """
+    if started_at.tzinfo is None:
+        raise ValueError("started_at must be tz-aware")
+    if taken is not None:
+        try:
+            cur = slot_path.stat()
+        except OSError as exc:
+            raise SlotLost(str(slot_path)) from exc
+        if (cur.st_dev, cur.st_ino) != (taken.dev, taken.ino):
+            raise SlotLost(str(slot_path))
+    try:
+        pid_start = start_time_of(child.pid)
+    except PsUnavailable:
+        pid_start = None
     rec = SlotRecord(
         pid=child.pid,
-        pid_start=start_time_of(child.pid),
+        pid_start=pid_start,
         kind=kind,
         slug=slug,
         baseline=baseline,
@@ -309,11 +359,19 @@ def _tail(log_path: str, tail_bytes: int) -> str:
         return ""
     try:
         with os.fdopen(fd, "rb") as fh:
-            size = os.fstat(fh.fileno()).st_size
-            fh.seek(max(0, size - tail_bytes))
-            return fh.read(tail_bytes).decode("utf-8", errors="replace")
+            info = os.fstat(fh.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                return ""
+            size = info.st_size
+            offset = max(0, size - tail_bytes)
+            fh.seek(offset)
+            raw = fh.read(tail_bytes).decode("utf-8", errors="replace")
     except OSError:
         return ""
+    if offset > 0:  # the cut may sit inside a secret: scrub whole lines only
+        _, nl, rest = raw.partition("\n")
+        return rest if nl else ""
+    return raw
 
 
 def status(
