@@ -571,9 +571,10 @@ def _age(
 def test_in_flight_lists_a_recent_open_run_and_an_unfinished_trial_as_running(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
-    sweep, records = _sweep(lab_store, settings, [0.1])
+    sweep, _ = _sweep(lab_store, settings, [0.1])
+    desk = _hyp(lab_store, settings, "desk-h")  # not a sweep variant
     run_id = _run(lab_store, sweep, tmp_path, n=1)
-    trial_id = _trial(lab_store, settings, tmp_path, records[0].hypothesis_id, None)
+    trial_id = _trial(lab_store, settings, tmp_path, desk.hypothesis_id, None)
     _age(lab_store, "sweep_runs", "sweep_run_id", run_id, 1)
     _age(lab_store, "trials", "trial_id", trial_id, 2)
 
@@ -582,7 +583,7 @@ def test_in_flight_lists_a_recent_open_run_and_an_unfinished_trial_as_running(
     assert got.busy and got.orphans == ()
     assert {(i.kind, i.row_id, i.slug, i.state) for i in got.running} == {
         ("sweep_run", run_id, "mom-grid", "running"),
-        ("trial", trial_id, records[0].slug, "running"),
+        ("trial", trial_id, desk.slug, "running"),
     }
     assert all(i.remedy is None for i in got.running)
 
@@ -590,9 +591,10 @@ def test_in_flight_lists_a_recent_open_run_and_an_unfinished_trial_as_running(
 def test_a_historic_orphan_is_listed_apart_and_does_not_block(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
-    sweep, records = _sweep(lab_store, settings, [0.1])
+    sweep, _ = _sweep(lab_store, settings, [0.1])
+    desk = _hyp(lab_store, settings, "desk-h")  # not a sweep variant
     run_id = _run(lab_store, sweep, tmp_path, n=1)
-    trial_id = _trial(lab_store, settings, tmp_path, records[0].hypothesis_id, None)
+    trial_id = _trial(lab_store, settings, tmp_path, desk.hypothesis_id, None)
     hours = settings.ui.lab_orphan_after_hours + 1
     _age(lab_store, "sweep_runs", "sweep_run_id", run_id, hours)
     _age(lab_store, "trials", "trial_id", trial_id, hours)
@@ -633,19 +635,23 @@ def test_closed_runs_finished_trials_and_synthetic_trials_are_not_in_flight(
     assert (got.running, got.orphans, got.busy) == ((), (), False)
 
 
-def test_an_unfinished_trial_of_a_closed_run_is_an_orphan_and_of_an_open_run_is_covered(
+def test_an_unfinished_variant_trial_without_a_link_follows_its_sweeps_run(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
+    """The runner links a trial to its run only when it closes the variant
+    (`backtest/lab.py`, `_write_sweep_trial`), so an interrupt leaves an unfinished
+    trial with no `sweep_trials` row: the state built here."""
     sweep, records = _sweep(lab_store, settings, [0.1, 0.2])
     run_id = _run(lab_store, sweep, tmp_path)
     for record in records:
-        _run_trial(lab_store, settings, tmp_path, run_id, record, None)
-
+        _trial(lab_store, settings, tmp_path, record.hypothesis_id, None)  # unlinked
+    assert lab_store.execute("SELECT COUNT(*) FROM sweep_trials").fetchone() == (0,)
     _age(lab_store, "sweep_runs", "sweep_run_id", run_id, 1)
+
     open_run = lab_verdict.in_flight(lab_store, NOW, settings)
     assert [(i.kind, i.row_id) for i in open_run.running] == [("sweep_run", run_id)]
 
-    _close(lab_store, run_id, n_ok=0, n_failed=0, completed=False)  # an interrupt closed it
+    _close(lab_store, run_id, n_ok=0, n_failed=0, completed=False)  # the interrupt closed it
     closed = lab_verdict.in_flight(lab_store, NOW, settings)
     assert not closed.busy and closed.running == ()
     assert {i.kind for i in closed.orphans} == {"trial"} and len(closed.orphans) == 2

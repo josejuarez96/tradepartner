@@ -30,7 +30,7 @@ connection (the caller's short read-only one is passed in).
 started within `ui.lab_orphan_after_hours`, is `running` (it blocks a new Run);
 an older one is listed apart as an `orphan` with its remedy and does not block (the
 store's writer lock, not this list, serialises writers). An unfinished trial of a
-sweep run is covered by that run while the run row is open, and is an orphan
+sweep variant is covered by its sweep's open run row while one is open, and is an orphan
 whatever its age once the row has closed (an interrupted run leaves its group's
 trials unfinished; this refines the plan line's literal rule).
 """
@@ -297,21 +297,25 @@ def in_flight(conn: duckdb.DuckDBPyConnection, now: datetime, settings: Settings
                 "sweep_run", run.sweep_run_id, slugs.get(run.sweep_id, "?"), run.started_at, cutoff
             )
         )
-    run_of = {
-        int(trial_id): int(run_id)
-        for trial_id, run_id in conn.execute(
-            "SELECT trial_id, sweep_run_id FROM sweep_trials"
+    # The runner writes a trial's `sweep_trials` link only when it closes the variant,
+    # so a trial left unfinished by an interrupt has no link. A sweep variant's trial
+    # belongs to its sweep instead (a variant is only ever run by a sweep run).
+    sweep_of = {
+        int(trial_id): int(sweep_id)
+        for trial_id, sweep_id in conn.execute(
+            "SELECT t.trial_id, v.sweep_id FROM trials t "
+            "JOIN sweep_variants v USING (hypothesis_id)"
         ).fetchall()
     }
-    open_runs = {run.sweep_run_id for run in lab_registry.open_sweep_runs(conn)}
+    sweeps_running = {run.sweep_id for run in lab_registry.open_sweep_runs(conn)}
     for trial in registry.list_trials(conn):
         if trial.status != registry.UNFINISHED:
             continue
-        run_id = run_of.get(trial.trial_id)
-        if run_id in open_runs:
-            continue  # the open run row already covers it
-        if run_id is not None:
-            # a sweep run that ended (an interrupt) left it open: nothing runs it
+        sweep_id = sweep_of.get(trial.trial_id)
+        if sweep_id in sweeps_running:
+            continue  # the sweep's open run row already covers it
+        if sweep_id is not None:
+            # its sweep's run ended (an interrupt) and left it open: nothing runs it
             items.append(
                 _item("trial", trial.trial_id, trial.slug, trial.started_at, cutoff, orphan=True)
             )
