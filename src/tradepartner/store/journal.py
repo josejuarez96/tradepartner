@@ -968,6 +968,62 @@ def _orphan_fill_error(
     )
 
 
+def live_fills_at(
+    conn: duckdb.DuckDBPyConnection, now: datetime
+) -> dict[str, list[tuple[datetime, Any, Any]]]:
+    """Journal-valid fills known at or before `now`, by client order id, each as
+    `(known_at, quantity, price)` in `fill_id` order. A fill whose superseding row
+    is known by `now` is hidden; rows with `known_at > now` are never read. Fails
+    closed with `JournalIntegrityError` on a dangling or invalid superseding
+    pointer, or a fill whose order or run was not yet known at `now`."""
+    require_journal(conn)
+    rows = conn.execute(
+        "SELECT f.fill_id, f.client_order_id, f.known_at, f.quantity, f.price, "
+        "f.superseded_by, successor.source, successor.client_order_id, "
+        "successor.superseded_by, successor.known_at, o.known_at, r.known_at "
+        "FROM fills f "
+        "LEFT JOIN fills successor ON successor.fill_id = f.superseded_by "
+        "LEFT JOIN orders o ON o.client_order_id = f.client_order_id "
+        "LEFT JOIN paper_runs r ON r.run_id = o.run_id "
+        "WHERE f.known_at <= ? "
+        "ORDER BY f.fill_id",
+        [now],
+    ).fetchall()
+    known: dict[str, list[tuple[datetime, Any, Any]]] = {}
+    for (
+        fill_id,
+        coid,
+        at,
+        quantity,
+        price,
+        superseded_by,
+        successor_source,
+        successor_coid,
+        successor_superseded,
+        successor_at,
+        order_at,
+        run_at,
+    ) in rows:
+        if superseded_by is not None and successor_at is None:
+            raise JournalIntegrityError(f"fill {fill_id} has no superseding fill {superseded_by}")
+        if superseded_by is not None and successor_at is not None and successor_at <= now:
+            if (
+                successor_source != "broker_status"
+                or successor_coid != coid
+                or successor_superseded is not None
+            ):
+                raise JournalIntegrityError(
+                    f"fill {fill_id} has an invalid superseding fill {superseded_by}"
+                )
+            continue
+        if order_at is None or order_at > now or run_at is None or run_at > now:
+            raise JournalIntegrityError(
+                f"fill {fill_id} has no order and run known at {now.isoformat()}"
+            )
+        known.setdefault(str(coid), []).append((at, quantity, price))
+    return known
+
+
 def fills_for(
     conn: duckdb.DuckDBPyConnection,
     *,

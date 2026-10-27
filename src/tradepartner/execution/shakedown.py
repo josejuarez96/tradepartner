@@ -374,53 +374,10 @@ def _ordered_runs(conn: duckdb.DuckDBPyConnection, now: datetime) -> set[int]:
 
 def _live_fills(conn: duckdb.DuckDBPyConnection, now: datetime) -> dict[str, list[_KnownFill]]:
     """Journal-valid fills live at `now`; hide replacement rows once known."""
-    rows = conn.execute(
-        "SELECT f.fill_id, f.client_order_id, f.known_at, f.quantity, f.price, "
-        "f.superseded_by, successor.source, successor.client_order_id, "
-        "successor.superseded_by, successor.known_at, o.known_at, r.known_at "
-        "FROM fills f "
-        "LEFT JOIN fills successor ON successor.fill_id = f.superseded_by "
-        "LEFT JOIN orders o ON o.client_order_id = f.client_order_id "
-        "LEFT JOIN paper_runs r ON r.run_id = o.run_id "
-        "WHERE f.known_at <= ? "
-        "ORDER BY f.fill_id",
-        [now],
-    ).fetchall()
-    known: dict[str, list[_KnownFill]] = {}
-    for (
-        fill_id,
-        coid,
-        at,
-        quantity,
-        price,
-        superseded_by,
-        successor_source,
-        successor_coid,
-        successor_superseded,
-        successor_at,
-        order_at,
-        run_at,
-    ) in rows:
-        if superseded_by is not None and successor_at is None:
-            raise store_journal.JournalIntegrityError(
-                f"fill {fill_id} has no superseding fill {superseded_by}"
-            )
-        if superseded_by is not None and successor_at is not None and successor_at <= now:
-            if (
-                successor_source != "broker_status"
-                or successor_coid != coid
-                or successor_superseded is not None
-            ):
-                raise store_journal.JournalIntegrityError(
-                    f"fill {fill_id} has an invalid superseding fill {superseded_by}"
-                )
-            continue
-        if order_at is None or order_at > now or run_at is None or run_at > now:
-            raise store_journal.JournalIntegrityError(
-                f"fill {fill_id} has no order and run known at {now.isoformat()}"
-            )
-        known.setdefault(str(coid), []).append(_KnownFill(at, quantity, price))
-    return known
+    return {
+        coid: [_KnownFill(at, quantity, price) for at, quantity, price in fills]
+        for coid, fills in store_journal.live_fills_at(conn, now).items()
+    }
 
 
 # --- the span -------------------------------------------------------------------
