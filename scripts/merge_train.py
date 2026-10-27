@@ -1517,10 +1517,12 @@ class ShellRunner:
                     resolved = thread["isResolved"]
                     if not isinstance(resolved, bool):
                         raise TypeError("isResolved is not a boolean")
+                    if resolved:
+                        continue  # a resolved thread never counts; its author is moot
                     login = thread["comments"]["nodes"][0]["author"]["login"]
                     if not isinstance(login, str) or not login:
                         raise TypeError("thread author is not a login")
-                    if not resolved and login not in ADVISORY_REVIEW_BOTS:
+                    if login not in ADVISORY_REVIEW_BOTS:
                         unresolved += 1
                 more = bool(threads["pageInfo"]["hasNextPage"])
                 cursor = threads["pageInfo"]["endCursor"]
