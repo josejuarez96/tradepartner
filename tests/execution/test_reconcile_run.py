@@ -2286,6 +2286,43 @@ def test_frozen_risk_reads_a_window_frozen_before_the_delisting_premium_at_its_d
     assert frozen_risk(_window_with(json.dumps(values))).delisting_cash_max_premium == 0.10
 
 
+#: Paper spec amendment 2026-10-26 (#2266) item 5, open question 42: the six
+#: break keys a window frozen before T280b lacks, at their decided defaults.
+_BREAK_DEFAULTS: dict[str, float] = {
+    "break_materiality_usd": 25.0,
+    "break_materiality_bps": 5.0,
+    "break_max_age_sessions": 5,
+    "max_open_breaks": 3,
+    "max_open_break_share": 0.02,
+    "break_cause_lookback_sessions": 10,
+}
+
+
+def test_frozen_risk_reads_a_window_frozen_before_the_break_keys_at_their_defaults() -> None:
+    """#2266 item 5 (question 42, the #2183 precedent): a window frozen before
+    the six break keys reads all six at their defaults instead of raising
+    `lacks risk keys`, and every other value is the frozen one."""
+    values = _todays_risk_keys_without(*_BREAK_DEFAULTS) | {"risk.max_skips_per_run": 7}
+    frozen = frozen_risk(_window_with(json.dumps(values)))
+    assert {k: getattr(frozen, k) for k in _BREAK_DEFAULTS} == _BREAK_DEFAULTS
+    assert frozen == FROZEN.model_copy(update={"max_skips_per_run": 7})
+
+
+def test_frozen_risk_keeps_a_later_windows_stored_break_keys() -> None:
+    """A window frozen after T280b keeps its stored values, never the defaults."""
+    stored = {
+        "break_materiality_usd": 0.0,
+        "break_materiality_bps": 1.5,
+        "break_max_age_sessions": 2,
+        "max_open_breaks": 0,
+        "max_open_break_share": 0.5,
+        "break_cause_lookback_sessions": 3,
+    }
+    values = _todays_risk_keys_without() | {f"risk.{k}": v for k, v in stored.items()}
+    frozen = frozen_risk(_window_with(json.dumps(values)))
+    assert {k: getattr(frozen, k) for k in stored} == stored
+
+
 _BACK_FILLED = (
     "max_skip_share",
     "reconcile_merger_lag_sessions",
@@ -2293,6 +2330,7 @@ _BACK_FILLED = (
     "reconcile_dividend_exhaustive_dues",
     "reconcile_dividend_subset_states",
     "delisting_cash_max_premium",
+    *_BREAK_DEFAULTS,
 )
 
 

@@ -230,6 +230,15 @@ _CORPORATE_ACTION_CASH = "corporate_action_cash"
 #: only these, never a `fills_lagging` or `pending_unresolved` one (T249).
 _COMPLETED = frozenset({OK, MISMATCH})
 _DEFAULT_RISK = RiskConfig()
+#: The frozen `risk.*` break keys (#2266 item 5), back-filled by `frozen_risk`.
+_BREAK_RISK_KEYS = (
+    "break_materiality_usd",
+    "break_materiality_bps",
+    "break_max_age_sessions",
+    "max_open_breaks",
+    "max_open_break_share",
+    "break_cause_lookback_sessions",
+)
 _FAULT_TYPE = ReconciliationError.__name__
 
 
@@ -314,6 +323,10 @@ def frozen_risk(window: PaperWindowRow) -> RiskConfig:
         risk.setdefault(key, getattr(_DEFAULT_RISK, key))
     # A window frozen before #411 has no `risk.delisting_cash_max_premium`: same.
     risk.setdefault("delisting_cash_max_premium", _DEFAULT_RISK.delisting_cash_max_premium)
+    # #2266 item 5 (open question 42, the #2183 precedent): a window frozen before
+    # the six break keys reads each at its default.
+    for key in _BREAK_RISK_KEYS:
+        risk.setdefault(key, getattr(_DEFAULT_RISK, key))
     missing = sorted(set(RiskConfig.model_fields) - set(risk))
     if missing:
         raise ValueError(f"window {window.window_id} frozen_json lacks risk keys {missing}")

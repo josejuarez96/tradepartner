@@ -1967,6 +1967,59 @@ def test_risk_defaults_match_adr_0010() -> None:
     assert r.delisting_cash_max_premium == pytest.approx(0.10)
 
 
+def test_risk_break_keys_default_to_the_2266_amendment() -> None:
+    """Paper spec amendment 2026-10-26 (#2266) item 5, open questions 39 to 41:
+    the six frozen break keys and their decided defaults, all in the dump."""
+    r = _settings().risk
+    assert r.break_materiality_usd == pytest.approx(25.0)
+    assert r.break_materiality_bps == pytest.approx(5.0)
+    assert r.break_max_age_sessions == 5
+    assert r.max_open_breaks == 3
+    assert r.max_open_break_share == pytest.approx(0.02)
+    assert r.break_cause_lookback_sessions == 10
+    assert set(_BREAK_KEYS) <= set(r.model_dump())
+
+
+_BREAK_KEYS = (
+    "break_materiality_usd",
+    "break_materiality_bps",
+    "break_max_age_sessions",
+    "max_open_breaks",
+    "max_open_break_share",
+    "break_cause_lookback_sessions",
+)
+
+
+@pytest.mark.parametrize("field", _BREAK_KEYS)
+def test_risk_break_keys_accept_zero(field: str) -> None:
+    """Item 5: validated >= 0, 0 allowed (a materiality and a cap of 0 turn every
+    break back into a halt, ADR 0025 Reversibility)."""
+    assert getattr(Settings(_env_file=None, risk={field: 0}).risk, field) == 0
+
+
+@pytest.mark.parametrize("field", _BREAK_KEYS)
+@pytest.mark.parametrize("value", [-1, float("nan"), float("inf")])
+def test_risk_break_keys_refuse_negative_and_non_finite(field: str, value: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={field: value})
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"max_open_break_share": 1.01},
+        {"break_materiality_bps": 10_001},
+        {"max_open_breaks": 1.5},
+        {"break_max_age_sessions": 2.5},
+        {"break_cause_lookback_sessions": 0.5},
+    ],
+)
+def test_risk_break_keys_refuse_out_of_range(override: dict[str, object]) -> None:
+    """The share is a fraction of equity, bps at most 100 %, the counts whole."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk=override)
+
+
 @pytest.mark.parametrize("value", [-1, 1.5])
 def test_risk_reconcile_merger_lag_sessions_is_a_whole_count_of_at_least_zero(
     value: float,

@@ -562,7 +562,19 @@ registry; #83 took version 2 first, so the registry is version 3):
   read-only connection accepts a version-36 store: every read works, and the break
   readers (`store.journal.break_events_for`, `open_breaks`) return no event
   there; the next writable `init_schema` call migrates it.
-- **A later DDL change goes to version 38**, with its own migration and a
+- **Version 38** (plan T241; backtest spec amendment 2026-10-18, `universe
+  .rank_by`): `trial_rebalances` and `paper_plans` each gain the liquidity
+  intersection's record — `n_assets_intersected INTEGER` (the kept classes
+  checked against the assets snapshot) and `assets_intersection_skipped
+  BOOLEAN` (no snapshot was known at `t`, so the intersection was skipped).
+  Additive: the migration from any earlier migratable version adds the two
+  columns by `ALTER TABLE` (`_migrate_assets_intersection`), NULL on every
+  existing row because those rows predate the record; the pinned DDL strings
+  do not change. A read-only connection accepts a version-37 store: every read
+  works (`journal.plans_for`, which names `paper_plans`'s two, reads them as
+  NULL there; no read names `trial_rebalances`'s before T242), and the next
+  writable `init_schema` call migrates the store.
+- **A later DDL change goes to version 39**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -861,9 +873,14 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   `auto_true_up` and `owner_true_up`; `decisions.decision`,
 #:   `decision_events.reason` and `order_events.reason` `skip_restricted`), each
 #:   table rebuilt with every row.
-#: - A later DDL change goes to version 38, with its own migration and a
+#: - 38 (plan T241): `trial_rebalances` and `paper_plans` each gain
+#:   `n_assets_intersected INTEGER` and `assets_intersection_skipped BOOLEAN`
+#:   (NULL on every existing row) by `ALTER TABLE`
+#:   (`_migrate_assets_intersection`); the pinned DDL strings do not change
+#:   (module docstring, "Schema versions").
+#: - A later DDL change goes to version 39, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 37
+CURRENT_SCHEMA_VERSION = 38
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -1030,6 +1047,13 @@ _PRE_MERGER_RECEIPT_VERSION = 35
 #: the break readers in `store.journal` find no table and return no event, since
 #: no break can exist there.
 _PRE_BREAKS_VERSION = 36
+
+#: The last version without the liquidity intersection's record on
+#: `trial_rebalances` and `paper_plans` (plan T241, version 38): read-only
+#: connections serve every read: `journal._select` reads `paper_plans`'s two as
+#: NULL where they are missing, and no read names `trial_rebalances`'s before
+#: T242.
+_PRE_ASSETS_INTERSECTION_VERSION = 37
 
 
 class SchemaVersionError(RuntimeError):
@@ -3152,6 +3176,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_MERGERS_VERSION,
         _PRE_MERGER_RECEIPT_VERSION,
         _PRE_BREAKS_VERSION,
+        _PRE_ASSETS_INTERSECTION_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3188,7 +3213,11 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # falls back to `base`/`ladder` by each level);
         # version 33 every read (no short reason can exist there); version 34
         # every read but `mergers`; versions 35 and 36 every read (the break
-        # readers find no `reconcile_breaks` at 35 or 36 and return no event).
+        # readers find no `reconcile_breaks` at 35 or 36 and return no event);
+        # version 37 every read (no read names the two version-38
+        # `trial_rebalances` columns before T242, and `journal._select` reads
+        # `paper_plans`'s same two as NULL where they are missing); those rows
+        # predate the record.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3576,6 +3605,29 @@ def _migrate_profitability_rebalance_counts(conn: duckdb.DuckDBPyConnection) -> 
     version-4 pin, so a fresh store gets the columns here too. Runs inside
     `init_schema`'s transaction, after its DDL pass."""
     _add_nullable_int_columns(conn, "trial_rebalances", PROFITABILITY_REBALANCE_COLUMNS)
+
+
+#: `trial_rebalances` and `paper_plans` each gain these, name to type, in
+#: version 38 (plan T241): the kept classes checked against the assets snapshot,
+#: and whether the intersection was skipped for want of a snapshot at `t`.
+_ASSETS_INTERSECTION_COLUMNS: Final = (
+    ("n_assets_intersected", "INTEGER"),
+    ("assets_intersection_skipped", "BOOLEAN"),
+)
+
+
+def _migrate_assets_intersection(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add each of `_ASSETS_INTERSECTION_COLUMNS` to `trial_rebalances` and
+    `paper_plans` (NULL on every existing row) where missing (module docstring,
+    "Schema versions", version 38). Idempotent: a column already present is left
+    alone. `_REGISTRY_TABLE_DDL` and `_JOURNAL_TABLE_DDL` keep their pins, so a
+    fresh store gets the columns here too. Runs inside `init_schema`'s
+    transaction, after its DDL pass."""
+    for table in ("trial_rebalances", "paper_plans"):
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+        for column, column_type in _ASSETS_INTERSECTION_COLUMNS:
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
 #: Where `_migrate_signal_reasons` builds the version-14 table before it takes
@@ -4106,7 +4158,7 @@ def _migrate_breaks(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 36 store to version 37.
+    version-2 to 37 store to version 38.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -4119,6 +4171,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
     `CURRENT_SCHEMA_VERSION` and no lab table; every store gets
+    `trial_rebalances` and `paper_plans` each with `n_assets_intersected` and
+    `assets_intersection_skipped` added (NULL on every existing row; a
+    version-37 store gets a version-38 row; plan T241); every store gets
     `reconcile_breaks` created where it lacks it, and `reconciliations`,
     `decisions`, `adjustments`, `decision_events` and `order_events` rebuilt
     where their `CHECK` lacks a version-37 value, every row kept in insertion order; a
@@ -4201,7 +4256,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-32 (every read; the
+    On a read-only connection no DDL runs: a version-37 (every read; `paper_plans`'s
+    two version-38 columns read as NULL through `journal`), 36 and
+    35 (every read; the break readers return no event), 34
+    (every read but `mergers`, missing there), 33 (every read; the short reasons
+    only widen a `CHECK`), 32 (every read; the
     `cost_level_kind` column is missing and the backtest page falls back to
     `base`/`ladder`), 31 (every read; no `pending_unresolved` event can exist
     there), 30 (every read but
@@ -4280,6 +4339,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_MERGERS_VERSION,
         _PRE_MERGER_RECEIPT_VERSION,
         _PRE_BREAKS_VERSION,
+        _PRE_ASSETS_INTERSECTION_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4330,6 +4390,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _migrate_filing_name(conn)
         _migrate_n_research(conn)
         _migrate_profitability_rebalance_counts(conn)
+        _migrate_assets_intersection(conn)
         _relax_no_history_count(conn)
         if max_version is not None and max_version <= _PRE_REBALANCE_COUNTS_VERSION:
             _migrate_rebalance_counts(conn)
