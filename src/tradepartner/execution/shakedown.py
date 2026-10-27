@@ -85,8 +85,9 @@ and the day it closes may hold a run or not, so neither is required (ADR 0017:
 
 **Progress or failing** (#2298). Each line also says, structurally, whether it
 fails only on what time or the drill clears (`ShakedownLine.state`): E.1's
-session and order-session counts and a pending span, and E.4 with no drill yet,
-are `in_progress`; any other shortfall is `failing`. The owner's queue
+session and order-session counts and a pending span, E.4 with no drill yet, and
+E.6 on a channel with no delivery attempted in the span yet are `in_progress`;
+an E.6 channel whose attempts all failed, and any other shortfall, is `failing`. The owner's queue
 (`execution.waiting`) reads that, never the printed detail.
 """
 
@@ -144,9 +145,9 @@ class ShakedownLine:
 
     `progress` names the shortfalls that only more sessions or the kill-switch
     drill clear (E.1's session and order-session counts and a pending span, E.4's
-    missing drill); `problems` names every other shortfall of a line that sets
-    `progress`. Only E.1 and E.4 set them (#2298); any other failing line is
-    `failing` by `state`."""
+    missing drill, E.6's channels nothing was sent on yet); `problems` names every
+    other shortfall of a line that sets `progress`. Only E.1, E.4 and E.6 set them
+    (#2298); any other failing line is `failing` by `state`."""
 
     name: str
     passed: bool
@@ -977,6 +978,12 @@ def _alerts_line(conn: duckdb.DuckDBPyConnection, span: Span, settings: Settings
             [span.start_at],
         ).fetchall()
     }
+    attempted = {
+        str(r[0])
+        for r in conn.execute(
+            'SELECT DISTINCT channel FROM alert_deliveries WHERE "at" >= ?', [span.start_at]
+        ).fetchall()
+    }
     missing = [c for c in channels if c not in delivered]
     detail = f"ok deliveries on {', '.join(sorted(delivered & set(channels))) or 'no channel'}" + (
         f"; no ok delivery on {', '.join(missing)}" if missing else ""
@@ -988,6 +995,10 @@ def _alerts_line(conn: duckdb.DuckDBPyConnection, span: Span, settings: Settings
         query="distinct channels with an ok=TRUE alert_deliveries row at or after the span start",
         thresholds=f"every non-store channel of alerts.channels: {', '.join(channels)}",
         detail=detail,
+        # #2298 (orchestrator, 2026-10-26): a channel nothing was sent on yet waits
+        # for traffic (progress); one whose attempts all failed is a problem
+        progress=tuple(f"no alert sent on {c} yet" for c in missing if c not in attempted),
+        problems=tuple(f"every delivery on {c} failed" for c in missing if c in attempted),
     )
 
 

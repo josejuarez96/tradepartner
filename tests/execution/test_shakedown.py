@@ -1149,9 +1149,39 @@ def test_a_drill_that_wrote_orders_is_failing(
 def test_every_other_failing_line_is_failing(
     conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
+    j = _clean(conn)
+    j.override("short")
+    conn.close()
+    assert _states(_run(settings))["E.5 journal"] == "failing"
+
+
+def test_e6_with_no_delivery_attempted_yet_is_progress_and_no_item(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    # orchestrator decision on #2298: nothing sent on a channel yet waits for traffic
     _clean(conn, deliveries=False)
     conn.close()
-    assert _states(_run(settings))["E.6 alerts"] == "failing"
+    line = _line(_run(settings), "E.6 alerts")
+    assert (line.passed, line.state) == (False, "in_progress")
+    assert line.progress == ("no alert sent on macos yet",) and line.problems == ()
+    assert _queue(settings) == []
+
+
+def test_e6_with_only_failed_deliveries_is_failing_and_an_item(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn, deliveries=False)
+    alert_id = j.alert(D2, "kill_switch")
+    conn.execute(
+        'INSERT INTO alert_deliveries (alert_id, channel, "at", ok, known_at, ingested_at) '
+        "VALUES (?, 'macos', ?, FALSE, ?, ?)",
+        [alert_id, _at(D2, 20), _at(D2, 20), _at(D2, 20)],
+    )
+    conn.close()
+    line = _line(_run(settings), "E.6 alerts")
+    assert line.state == "failing"
+    assert line.problems == ("every delivery on macos failed",)
+    assert [i.line for i in _queue(settings)] == ["E.6 alerts"]
 
 
 def test_the_queue_read_leaves_health_out(
@@ -1200,7 +1230,7 @@ def test_a_span_that_is_merely_short_shows_no_item(
     # far, and no drill yet, is progress, not a problem
     j = _clean(conn, drill=False)
     j.span(made_at=_at(D1, 15), sessions=10, order_sessions=5)
-    j.alert(D2, "kill_switch", delivered=("macos",))  # E.6 is not about time: keep it met
+    j.alert(D2, "kill_switch", delivered=("macos",))  # keep E.6 met: progress lists E.1, E.4
     conn.close()
     assert _queue(settings) == []
     with open_read_only(settings) as read:
