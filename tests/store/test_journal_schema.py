@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,13 +32,19 @@ from tradepartner.store.journal import (
     _EXPANSION_SEAM_TABLES,
     AlertDeliveryRow,
     AlertRow,
+    BreakOrderError,
+    JournalNotInitialised,
     PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
+    ReconcileBreakRow,
     alerts_for,
     append,
+    break_events_for,
+    break_id_for,
     fills_for,
     latest_window,
+    open_breaks,
     open_window,
 )
 
@@ -70,6 +76,7 @@ _EXPECTED_JOURNAL_TABLES = {
     "lots",
     "disposals",
     "wash_sale_flags",
+    "reconcile_breaks",
 }
 
 #: SHA-256 of `"".join(schema._TABLE_DDL)` and `"".join(schema._REGISTRY_TABLE_DDL)`
@@ -160,7 +167,7 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
 
 
 def test_current_schema_version_is_31() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGER_RECEIPT_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_BREAKS_VERSION + 1
     assert schema._PRE_FEE_ACTIVITIES_VERSION == 24
     assert schema._PRE_FILING_NAME_VERSION == 25
     assert schema._PRE_CASH_IN_LIEU_VERSION == 26
@@ -985,22 +992,28 @@ def test_the_short_reasons_are_appended_last_and_the_version_is_the_next() -> No
         *_PRE_T228_REASONS["decisions"],
         *_T228_NEW_REASONS["decisions"],
     ) == schema.DECISION_REASONS
+    # T280a (version 37) appends `skip_restricted` after T228's two event reasons.
+    t280a = {"decisions": (), "decision_events": ("skip_restricted",)}
+    t280a["order_events"] = t280a["decision_events"]
     assert (
         *_PRE_T228_REASONS["decision_events"],
         *_T228_NEW_REASONS["decision_events"],
+        *t280a["decision_events"],
     ) == schema.DECISION_EVENT_REASONS
     assert (
         *_PRE_T228_REASONS["order_events"],
         *_T228_NEW_REASONS["order_events"],
+        *t280a["order_events"],
     ) == schema.ORDER_EVENT_REASONS
     for table in _T228_TABLES:
         assert schema.JOURNAL_ENUMS[table, "reason"] == (
             *_PRE_T228_REASONS[table],
             *_T228_NEW_REASONS[table],
+            *t280a[table],
         )
         assert (table, "reason") in schema.NULLABLE_JOURNAL_ENUMS
     assert schema._PRE_SHORT_REASONS_VERSION >= schema._PRE_PENDING_UNRESOLVED_VERSION + 1
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGER_RECEIPT_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_BREAKS_VERSION + 1
 
 
 def test_the_schema_docstring_names_the_short_reasons_version() -> None:
@@ -1029,6 +1042,7 @@ def test_the_short_skip_kinds_are_decision_kinds_last() -> None:
     assert schema.JOURNAL_ENUMS["decisions", "decision"] == (
         *_PRE_T228_DECISION_KINDS,
         *_T228_NEW_DECISION_KINDS,
+        "skip_restricted",  # T280a, version 37 (#2266 amendment item 7)
     )
 
 
@@ -2190,7 +2204,7 @@ def test_v35_adjustments_migrate_to_merger_receipt() -> None:
         conn.execute("INSERT INTO adjustments_v35 BY NAME SELECT * FROM adjustments ORDER BY rowid")
         conn.execute("DROP TABLE adjustments")
         conn.execute("ALTER TABLE adjustments_v35 RENAME TO adjustments")
-        conn.execute("DELETE FROM schema_version WHERE version = 36")
+        conn.execute("DELETE FROM schema_version")
         conn.execute("INSERT INTO schema_version VALUES (35, now())")
         conn.execute(
             "INSERT INTO adjustments (adjustment_id, window_id, session, kind, "
@@ -2206,7 +2220,7 @@ def test_v35_adjustments_migrate_to_merger_receipt() -> None:
         before = conn.execute("SELECT * FROM adjustments ORDER BY rowid").fetchall()
         schema.init_schema(conn)
         assert conn.execute("SELECT * FROM adjustments ORDER BY rowid").fetchall() == before
-        assert _versions(conn)[-2:] == [35, 36]
+        assert _versions(conn) == [35, 36, schema.CURRENT_SCHEMA_VERSION]
         assert "'merger_receipt'" in _ddl(conn, "adjustments")
         conn.execute(
             "INSERT INTO adjustments (adjustment_id, window_id, session, kind, "
@@ -2215,3 +2229,509 @@ def test_v35_adjustments_migrate_to_merger_receipt() -> None:
         )
     finally:
         conn.close()
+
+
+# --- version 37: reconciliation breaks (#2266 amendment item 4, plan T280a) -------------
+#
+# One schema version adds `reconcile_breaks` and widens four closed `CHECK` sets; a
+# version-36 store migrates with every row of the four rebuilt tables kept in insertion
+# order, and a read-only version-36 store still serves every read. `journal.append`
+# holds the break events in write order and allows one open break per (window, name).
+
+_BREAK_SESSION = date(2026, 10, 26)
+#: The spec's columns (amendment item 4), in order, with `book_id` beside `window_id`.
+_BREAK_COLUMNS = (
+    "event_id",
+    "break_id",
+    "window_id",
+    "book_id",
+    "event",
+    "parts_json",
+    "cause",
+    "security_id",
+    "symbol",
+    "ledger_quantity",
+    "broker_quantity",
+    "cash_amount",
+    "reference_price",
+    "dollar_size",
+    "material",
+    "first_seen_session",
+    "reconciliation_id",
+    "adjustment_ids_json",
+    "reason",
+    "known_at",
+    "ingested_at",
+)
+#: Each widened `CHECK`: (table, column, the values version 37 appends).
+_V37_WIDENED = (
+    ("reconciliations", "status", ("breaks",)),
+    ("decisions", "decision", ("skip_restricted",)),
+    ("adjustments", "kind", ("auto_true_up", "owner_true_up")),
+    ("decision_events", "reason", ("skip_restricted",)),
+    ("order_events", "reason", ("skip_restricted",)),
+)
+_V37_CASES = [(t, c, v) for t, c, values in _V37_WIDENED for v in values]
+_V37_MISSPELT = ("break", "Breaks", "auto-true-up", "owner_trueup", "skip_restrict", "restricted")
+
+
+@pytest.fixture
+def fresh() -> Iterator[duckdb.DuckDBPyConnection]:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    yield conn
+    conn.close()
+
+
+def _break(
+    event: str = "opened",
+    *,
+    window_id: int = 1,
+    name: str = "SEC_A",
+    reconciliation_id: int = 1,
+    known_at: datetime = _NOW,
+    **values: Any,
+) -> ReconcileBreakRow:
+    """A break event on `name` (a `security_id`), opened by `reconciliation_id`."""
+    row: dict[str, Any] = {
+        "break_id": break_id_for(window_id, name, reconciliation_id),
+        "window_id": window_id,
+        "book_id": "main",
+        "event": event,
+        "parts_json": '[{"kind": "quantity", "cause": "unattributed"}]',
+        "cause": "unattributed" if event == "opened" else None,
+        "security_id": name,
+        "ledger_quantity": 10.0,
+        "broker_quantity": 0.0,
+        "reference_price": 50.0,
+        "dollar_size": 500.0,
+        "material": True,
+        "first_seen_session": _BREAK_SESSION,
+        "reconciliation_id": reconciliation_id,
+        "reason": "broker statement checked" if event in ("trued_up", "reopened") else None,
+        "known_at": known_at,
+        "ingested_at": known_at,
+    }
+    row.update(values)
+    return ReconcileBreakRow(**row)
+
+
+def _insert_widened(conn: duckdb.DuckDBPyConnection, table: str, value: str) -> None:
+    """One row of `table` carrying `value` in its widened column."""
+    if table == "reconciliations":
+        conn.execute(
+            'INSERT INTO reconciliations (reconciliation_id, window_id, "at", status, '
+            "known_at, ingested_at) VALUES ((SELECT coalesce(max(reconciliation_id), 0) + 1 "
+            "FROM reconciliations), 1, ?, ?, ?, ?)",
+            [_LATER, value, _LATER, _LATER],
+        )
+    elif table == "adjustments":
+        conn.execute(
+            "INSERT INTO adjustments (adjustment_id, window_id, session, kind, security_id, "
+            "quantity, known_at, ingested_at) VALUES ((SELECT coalesce(max(adjustment_id), 0) "
+            "+ 1 FROM adjustments), 1, ?, ?, 'SEC_X', 1, ?, ?)",
+            [_BREAK_SESSION, value, _LATER, _LATER],
+        )
+    elif table == "decisions":
+        _insert_decision_kind(conn, value)
+    else:
+        _insert_reason(conn, table, value)
+
+
+def test_one_schema_version_holds_every_break_change() -> None:
+    """T280a takes one version, the next after T249b's, and the module docstring
+    names what it adds."""
+    assert schema._PRE_BREAKS_VERSION == schema._PRE_MERGER_RECEIPT_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_BREAKS_VERSION + 1
+    version = schema.CURRENT_SCHEMA_VERSION
+    doc = schema.__doc__ or ""
+    match = re.search(rf"\*\*Version {version}\*\*(.*?)(?:\n- \*\*|\Z)", doc, re.S)
+    assert match is not None, f"no **Version {version}** paragraph"
+    for name in ("reconcile_breaks", "breaks", "auto_true_up", "owner_true_up", "skip_restricted"):
+        assert f"`{name}`" in match.group(1), name
+    assert f"version {version + 1}**" in doc
+
+
+def test_a_fresh_store_has_the_break_table_with_the_spec_columns(
+    fresh: duckdb.DuckDBPyConnection,
+) -> None:
+    assert _versions(fresh) == [schema.CURRENT_SCHEMA_VERSION]
+    columns = [
+        row[0]
+        for row in fresh.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'reconcile_breaks' ORDER BY ordinal_position"
+        ).fetchall()
+    ]
+    assert tuple(columns) == _BREAK_COLUMNS
+    assert "reconcile_breaks" in schema.JOURNAL_TABLE_NAMES
+    assert "reconcile_breaks" in schema.LATER_JOURNAL_TABLE_NAMES
+    assert schema.JOURNAL_ENUMS["reconcile_breaks", "event"] == (
+        "opened",
+        "observed",
+        "auto_accepted",
+        "auto_explained",
+        "resolved_by_broker",
+        "trued_up",
+        "reopened",
+    )
+    assert set(schema.OPEN_BREAK_EVENTS) | set(schema.CLOSING_BREAK_EVENTS) == set(
+        schema.BREAK_EVENTS
+    )
+    assert not set(schema.OPEN_BREAK_EVENTS) & set(schema.CLOSING_BREAK_EVENTS)
+
+
+@pytest.mark.parametrize(("table", "column", "value"), _V37_CASES)
+def test_each_widened_check_appends_its_value_last_and_accepts_it(
+    fresh: duckdb.DuckDBPyConnection, table: str, column: str, value: str
+) -> None:
+    allowed = schema.JOURNAL_ENUMS[table, column]
+    widened = next(values for t, _, values in _V37_WIDENED if t == table)
+    assert allowed[-len(widened) :] == widened
+    _insert_widened(fresh, table, value)
+    assert fresh.execute(f"SELECT {column} FROM {table}").fetchall() == [(value,)]
+
+
+@pytest.mark.parametrize(("table", "column"), [(t, c) for t, c, _ in _V37_WIDENED])
+@pytest.mark.parametrize("value", _V37_MISSPELT)
+def test_each_widened_check_still_refuses_a_misspelling(
+    fresh: duckdb.DuckDBPyConnection, table: str, column: str, value: str
+) -> None:
+    with pytest.raises(duckdb.ConstraintException):
+        _insert_widened(fresh, table, value)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"event": "closed"},
+        {"cause": "external"},
+        {"security_id": None, "symbol": None},
+        {"dollar_size": -1.0},
+        {"dollar_size": float("inf")},
+        {"dollar_size": None, "material": False},
+        {"cause": None},
+        {"reconciliation_id": None},
+        {"event": "trued_up", "cause": None, "reason": None},
+        {"event": "trued_up", "cause": None, "reason": "   "},
+        {"event": "reopened", "cause": None, "reason": ""},
+        {"event": "trued_up", "cause": None, "reason": "\t\n "},
+    ],
+    ids=[
+        "event",
+        "cause",
+        "no-name",
+        "negative-size",
+        "infinite-size",
+        "unpriced-immaterial",
+        "opened-without-cause",
+        "opened-without-reconciliation",
+        "true-up-without-reason",
+        "true-up-blank-reason",
+        "reopen-blank-reason",
+        "true-up-whitespace-reason",
+    ],
+)
+def test_the_break_table_refuses_a_malformed_row(
+    fresh: duckdb.DuckDBPyConnection, values: dict[str, Any]
+) -> None:
+    row = {f: getattr(_break(), f) for f in _BREAK_COLUMNS} | {"event_id": 1} | values
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(fresh, "reconcile_breaks", row)
+    assert fresh.execute("SELECT COUNT(*) FROM reconcile_breaks").fetchone() == (0,)
+
+
+def test_an_unpriced_material_break_on_a_broker_symbol_is_stored(
+    fresh: duckdb.DuckDBPyConnection,
+) -> None:
+    """`unknown_symbol` has no `security_id`: the symbol names it, and a null size
+    is allowed when the break is material."""
+    row = _break(
+        name="ZZZQ",
+        security_id=None,
+        symbol="ZZZQ",
+        dollar_size=None,
+        reference_price=None,
+        material=True,
+    )
+    assert append(fresh, row) == 1
+    assert break_events_for(fresh, 1)[0].name == "ZZZQ"
+
+
+def _v36_store(conn: duckdb.DuckDBPyConnection) -> None:
+    """A store at version 36: the current shape with `reconcile_breaks` dropped and
+    the four `CHECK`s narrowed to their version-36 sets, each holding rows inserted
+    out of key order with tied `known_at` stamps (a copy sorted by anything but
+    rowid would reorder them)."""
+    schema.init_schema(conn)
+    conn.execute("DROP TABLE reconcile_breaks")
+    for table, _column, values in _V37_WIDENED:
+        ddl = _ddl(conn, table)
+        for value in values:
+            ddl = ddl.replace(f", '{value}'", "")
+        assert all(f"'{v}'" not in ddl for v in values), ddl
+        conn.execute(ddl.replace(f"CREATE TABLE {table}(", f"CREATE TABLE {table}_v36(", 1))
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {table}_v36 RENAME TO {table}")
+        with pytest.raises(duckdb.ConstraintException):
+            _insert_widened(conn, table, values[0])
+    conn.execute("DELETE FROM schema_version")
+    conn.execute("INSERT INTO schema_version VALUES (36, now())")
+    for reconciliation_id, status in ((7, "ok"), (2, "mismatch"), (5, "fills_lagging")):
+        conn.execute(
+            'INSERT INTO reconciliations (reconciliation_id, window_id, "at", status, '
+            "broker_cash, known_at, ingested_at) VALUES (?, 1, ?, ?, 100.5, ?, ?)",
+            [reconciliation_id, _NOW, status, _NOW, _NOW],
+        )
+    for adjustment_id, kind in ((9, "merger_receipt"), (3, "dividend_cash"), (6, "fee_cash")):
+        conn.execute(
+            "INSERT INTO adjustments (adjustment_id, window_id, session, kind, security_id, "
+            "cash, known_at, ingested_at) VALUES (?, 1, ?, ?, 'SEC_B', 1.25, ?, ?)",
+            [adjustment_id, _BREAK_SESSION, kind, _NOW, _NOW],
+        )
+    for decision_id, kind in ((8, "skip_short_price"), (1, "trade"), (4, "skip_zero")):
+        conn.execute(
+            "INSERT INTO decisions (decision_id, run_id, security_id, whole_share, decision, "
+            "known_at, ingested_at) VALUES (?, 2, 'SEC_C', TRUE, ?, ?, ?)",
+            [decision_id, kind, _NOW, _NOW],
+        )
+    for decision_id, reason in ((8, "skip_short_price"), (1, None), (4, "unfunded")):
+        conn.execute(
+            "INSERT INTO decision_events (decision_id, run_id, status, reason, known_at, "
+            "ingested_at) VALUES (?, 2, 'skipped', ?, ?, ?)",
+            [decision_id, reason, _NOW, _NOW],
+        )
+    for order_id, reason in (("tp-9", "halt"), ("tp-1", None), ("tp-5", "skip_untradable")):
+        conn.execute(
+            "INSERT INTO order_events (client_order_id, status, reason, known_at, ingested_at) "
+            "VALUES (?, 'cancelled', ?, ?, ?)",
+            [order_id, reason, _NOW, _NOW],
+        )
+
+
+def _all_ddl(conn: duckdb.DuckDBPyConnection) -> dict[str, str]:
+    rows = conn.execute(
+        "SELECT table_name, sql FROM duckdb_tables() WHERE database_name = current_database()"
+    ).fetchall()
+    return {name: sql for name, sql in rows}
+
+
+def test_a_version_36_store_migrates_to_37_keeping_every_row() -> None:
+    conn = duckdb.connect(":memory:")
+    try:
+        _v36_store(conn)
+        widened = tuple(t for t, _, _ in _V37_WIDENED)
+        before = {t: _rows_in_insertion_order(conn, t) for t in widened}
+        ddl_before = _all_ddl(conn)
+        schema.init_schema(conn)
+        assert _versions(conn) == [36, schema.CURRENT_SCHEMA_VERSION]
+        assert {t: _rows_in_insertion_order(conn, t) for t in widened} == before
+        ddl_after = _all_ddl(conn)
+        assert set(ddl_after) == set(ddl_before) | {"reconcile_breaks"}
+        unchanged = set(ddl_before) - set(widened)
+        assert {t: ddl_after[t] for t in unchanged} == {t: ddl_before[t] for t in unchanged}
+        for table, column, value in _V37_CASES:
+            assert f"'{value}'" in schema._check_text(conn, table, column)
+            _insert_widened(conn, table, value)
+        assert append(conn, _break()) == 1
+        again = _all_ddl(conn)
+        schema.init_schema(conn)
+        assert _all_ddl(conn) == again
+        assert _versions(conn) == [36, schema.CURRENT_SCHEMA_VERSION]
+    finally:
+        conn.close()
+
+
+def test_a_fresh_store_needs_no_break_rebuild(fresh: duckdb.DuckDBPyConnection) -> None:
+    """The fresh DDL already holds every widened value, so the migration step is a
+    no-op there and on a second call."""
+    before = _all_ddl(fresh)
+    schema._migrate_breaks(fresh)
+    assert _all_ddl(fresh) == before
+
+
+def test_a_read_only_version_36_store_serves_every_read_and_has_no_breaks(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v36.duckdb"
+    with duckdb.connect(str(path)) as conn:
+        _v36_store(conn)
+        append(conn, _sample_window())
+    with duckdb.connect(str(path), read_only=True) as conn:
+        schema.init_schema(conn)
+        assert _versions(conn) == [36]
+        assert open_window(conn) is not None
+        assert break_events_for(conn, 1) == []
+        assert open_breaks(conn, 1) == []
+
+
+def _sample_window() -> PaperWindowRow:
+    return PaperWindowRow(
+        window_id=1,
+        hypothesis_id=1,
+        first_rebalance_session=_BREAK_SESSION,
+        account_id="PA-1",
+        starting_cash=100_000.0,
+        starting_equity=100_000.0,
+        code_version="abc",
+        started_at=_NOW,
+        frozen_json="{}",
+        frozen_sha256="0" * 64,
+        known_at=_NOW,
+        ingested_at=_NOW,
+    )
+
+
+# --- break event order (`journal.append`) ------------------------------------------------
+
+
+def _events(conn: duckdb.DuckDBPyConnection) -> list[tuple[int, str, str]]:
+    return [(e.event_id or 0, e.break_id, e.event) for e in break_events_for(conn, 1)]
+
+
+def test_break_events_append_in_write_order_and_derive_open_state(
+    fresh: duckdb.DuckDBPyConnection,
+) -> None:
+    later = _NOW + timedelta(days=1)
+    assert append(fresh, _break()) == 1
+    assert append(fresh, _break("observed", known_at=later, reconciliation_id=1)) == 2
+    assert append(fresh, _break(name="SEC_B", reconciliation_id=2, known_at=later)) == 3
+    assert append(fresh, _break("auto_accepted", known_at=later)) == 4
+    assert _events(fresh) == [
+        (1, "1:SEC_A:1", "opened"),
+        (2, "1:SEC_A:1", "observed"),
+        (3, "1:SEC_B:2", "opened"),
+        (4, "1:SEC_A:1", "auto_accepted"),
+    ]
+    assert [e.break_id for e in open_breaks(fresh, 1)] == ["1:SEC_B:2"]
+    assert break_events_for(fresh, 2) == [] and open_breaks(fresh, 2) == []
+
+
+def test_an_explicit_event_id_must_follow_every_written_one(
+    fresh: duckdb.DuckDBPyConnection,
+) -> None:
+    append(fresh, _break(event_id=5))
+    with pytest.raises(BreakOrderError, match="not after 5"):
+        append(fresh, _break(name="SEC_B", reconciliation_id=2, event_id=5))
+    with pytest.raises(BreakOrderError, match="not after 5"):
+        append(fresh, _break(name="SEC_B", reconciliation_id=2, event_id=3))
+    assert append(fresh, _break(name="SEC_B", reconciliation_id=2)) == 6
+
+
+def test_one_open_break_per_window_and_name(fresh: duckdb.DuckDBPyConnection) -> None:
+    append(fresh, _break(reconciliation_id=1))
+    with pytest.raises(BreakOrderError, match="already has open break 1:SEC_A:1"):
+        append(fresh, _break(reconciliation_id=2))
+    # another window, or another name, is its own break
+    append(fresh, _break(window_id=2, reconciliation_id=2))
+    append(fresh, _break(name="SEC_B", reconciliation_id=2))
+    # once closed, a later reconciliation opens a new break with a new id
+    append(fresh, _break("resolved_by_broker", reconciliation_id=1))
+    append(fresh, _break(reconciliation_id=3))
+    assert [e.break_id for e in open_breaks(fresh, 1)] == ["1:SEC_B:2", "1:SEC_A:3"]
+
+
+def test_one_open_break_per_broker_symbol(fresh: duckdb.DuckDBPyConnection) -> None:
+    symbol = {"security_id": None, "symbol": "ZZZQ", "name": "ZZZQ"}
+    append(fresh, _break(**symbol))
+    with pytest.raises(BreakOrderError, match="already has open break"):
+        append(fresh, _break(reconciliation_id=2, **symbol))
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ({"break_id": "1:SEC_A:2"}, "is not '1:SEC_A:1'"),
+        ({"break_id": "SEC_A"}, "is not '1:SEC_A:1'"),
+    ],
+)
+def test_an_opened_id_is_derived_from_window_name_and_reconciliation(
+    fresh: duckdb.DuckDBPyConnection, values: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(BreakOrderError, match=message):
+        append(fresh, _break(**values))
+    assert _events(fresh) == []
+
+
+def test_a_break_is_opened_once(fresh: duckdb.DuckDBPyConnection) -> None:
+    append(fresh, _break())
+    append(fresh, _break("auto_explained"))
+    with pytest.raises(BreakOrderError, match="already opened"):
+        append(fresh, _break())
+
+
+@pytest.mark.parametrize("event", ["observed", *schema.CLOSING_BREAK_EVENTS, "reopened"])
+def test_no_event_on_a_break_never_opened(fresh: duckdb.DuckDBPyConnection, event: str) -> None:
+    with pytest.raises(BreakOrderError, match="never opened"):
+        append(fresh, _break(event))
+    assert _events(fresh) == []
+
+
+@pytest.mark.parametrize("event", ["observed", *schema.CLOSING_BREAK_EVENTS])
+@pytest.mark.parametrize("closed_by", schema.CLOSING_BREAK_EVENTS)
+def test_a_closed_break_takes_no_observation_and_no_second_close(
+    fresh: duckdb.DuckDBPyConnection, event: str, closed_by: str
+) -> None:
+    append(fresh, _break())
+    append(fresh, _break(closed_by))
+    with pytest.raises(BreakOrderError, match="is closed"):
+        append(fresh, _break(event))
+    assert len(_events(fresh)) == 2
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ({"window_id": 2, "break_id": "1:SEC_A:1"}, "belongs to window 1"),
+        ({"book_id": "other"}, "belongs to window 1"),
+        ({"security_id": "SEC_B"}, "belongs to window 1"),
+        ({"known_at": _NOW - timedelta(seconds=1)}, "before its latest"),
+        ({"first_seen_session": date(2026, 10, 27)}, "is not its opened event's"),
+        ({"cause": "corporate_action"}, "rewrites its opened cause"),
+    ],
+)
+def test_a_later_event_keeps_the_break_window_book_name_and_clock(
+    fresh: duckdb.DuckDBPyConnection, values: dict[str, Any], message: str
+) -> None:
+    append(fresh, _break())
+    with pytest.raises(BreakOrderError, match=message):
+        append(fresh, _break("observed", **values))
+    assert len(_events(fresh)) == 1
+
+
+def test_only_a_trued_up_break_reopens_and_never_beside_another_open_one(
+    fresh: duckdb.DuckDBPyConnection,
+) -> None:
+    append(fresh, _break())
+    with pytest.raises(BreakOrderError, match="only a trued_up break reopens"):
+        append(fresh, _break("reopened"))
+    append(fresh, _break("trued_up", adjustment_ids_json="[4]"))
+    append(fresh, _break(reconciliation_id=2))
+    with pytest.raises(BreakOrderError, match="already has open break 1:SEC_A:2"):
+        append(fresh, _break("reopened"))
+    append(fresh, _break("auto_accepted", reconciliation_id=2))
+    append(fresh, _break("reopened"))
+    assert [e.event for e in open_breaks(fresh, 1)] == ["reopened"]
+    with pytest.raises(BreakOrderError, match="only a trued_up break reopens"):
+        append(fresh, _break("reopened"))
+
+
+def test_a_later_event_may_repeat_the_opened_cause(fresh: duckdb.DuckDBPyConnection) -> None:
+    append(fresh, _break())
+    append(fresh, _break("observed", cause="unattributed"))
+    assert [e.cause for e in break_events_for(fresh, 1)] == ["unattributed", "unattributed"]
+
+
+def test_a_version_37_store_missing_the_break_table_fails_closed(
+    fresh: duckdb.DuckDBPyConnection,
+) -> None:
+    fresh.execute("DROP TABLE reconcile_breaks")
+    with pytest.raises(JournalNotInitialised, match="no reconcile_breaks table"):
+        open_breaks(fresh, 1)
+
+
+def test_an_auto_accepted_break_does_not_reopen(fresh: duckdb.DuckDBPyConnection) -> None:
+    append(fresh, _break())
+    append(fresh, _break("auto_accepted"))
+    with pytest.raises(BreakOrderError, match="only a trued_up break reopens"):
+        append(fresh, _break("reopened"))
