@@ -101,7 +101,7 @@ _FITS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     SHORT_EXTERNAL_CHANGE: (frozenset({"merger", "listing_end"}), frozenset()),
 }
 #: Item 14: `unattributed` first, so a break counts as unattributed if any part is.
-_CAUSE_ORDER = ("unattributed", "data", "broker_activity", "corporate_action")
+CAUSE_ORDER = ("unattributed", "data", "broker_activity", "corporate_action")
 _BPS = Decimal(10_000)
 
 
@@ -250,7 +250,7 @@ def break_cause(parts: Sequence[BreakPart]) -> str:
     then `data`, then `broker_activity`, then `corporate_action`."""
     if not parts:
         raise ValueError("a break with no parts has no cause")
-    return min((p.cause for p in parts), key=_CAUSE_ORDER.index)
+    return min((p.cause for p in parts), key=CAUSE_ORDER.index)
 
 
 def _finite(value: float | None, what: str, *, nonneg: bool = False) -> Decimal:

@@ -1564,7 +1564,7 @@ def _write_break_events(
                     )
                     for activity_type in activity_types
                 ),
-                key=break_rules._CAUSE_ORDER.index,
+                key=break_rules.CAUSE_ORDER.index,
             )
             old = next((p for p in old_parts if p["kind"] == mismatch.kind), None)
             if old is not None:
