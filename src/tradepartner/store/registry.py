@@ -132,7 +132,7 @@ from tradepartner.calendar import (
     last_session_of_week,
     session_close,
 )
-from tradepartner.config import Cadence, Settings, get_settings
+from tradepartner.config import ENGINE_FAMILIES, Cadence, Settings, get_settings
 from tradepartner.store.benchmarks import CHECK_ONLY_IDS
 from tradepartner.store.db import configure_connection, insert_row, utc_now
 from tradepartner.store.schema import (
@@ -784,17 +784,23 @@ def register_hypothesis(
     make a new hypothesis; its family and window must then match the stored
     row. A changed file or parameter set is a new one, in the slug's
     original family. Refuses a family outside `settings.hypotheses.families`,
-    parameters without a numeric `costs.per_side_bps`, `holdout.start`,
-    `holdout.end` or `in_sample_start` params that disagree with the window
-    arguments, and `family="oracle"` on the real store. With a development boundary
-    in force (ADR 0016 point 2), refuses (`BoundaryRefused`) an `in_sample_start` on
-    or after it, or one with no rebalance session at the frozen cadence on or before
-    it, so no registration's default window is ever empty.
+    an experiment-only family (not engine-ready), parameters without a numeric
+    `costs.per_side_bps`, `holdout.start`, `holdout.end` or `in_sample_start`
+    params that disagree with the window arguments, and `family="oracle"` on the
+    real store. With a development boundary in force (ADR 0016 point 2), refuses
+    (`BoundaryRefused`) an `in_sample_start` on or after it, or one with no
+    rebalance session at the frozen cadence on or before it, so no
+    registration's default window is ever empty.
     """
     settings = settings if settings is not None else get_settings()
     if family not in settings.hypotheses.families:
         raise RegistryError(
             f"family {family!r} is not in hypotheses.families {settings.hypotheses.families}"
+        )
+    if family not in ENGINE_FAMILIES:
+        raise RegistryError(
+            f"family {family!r} is experiment-only; register it with "
+            f"`experiment register`, not as a hypothesis"
         )
     if family == ORACLE_FAMILY and _is_real_store(conn, settings):
         raise RealStoreRefused(f"family {ORACLE_FAMILY!r} is refused on the real store")
