@@ -1002,7 +1002,13 @@ def test_env_file_override_via_tradepartner_env_file(
 
 
 def test_hypotheses_families_default() -> None:
-    assert _settings().hypotheses.families == ["momentum", "oracle", "profitability", "combined"]
+    assert _settings().hypotheses.families == [
+        "momentum",
+        "oracle",
+        "profitability",
+        "combined",
+        "filing_delay",
+    ]
 
 
 def test_hypotheses_family_outside_the_list_rejected() -> None:
@@ -1481,7 +1487,12 @@ def test_hypothesis_family_literal_equals_the_registry_keys() -> None:
 
 
 def test_family_parents_derives_without_oracle_at_today_s_values() -> None:
-    assert FAMILY_PARENTS == {"momentum": None, "profitability": None, "combined": "momentum"}
+    assert FAMILY_PARENTS == {
+        "momentum": None,
+        "profitability": None,
+        "combined": "momentum",
+        "filing_delay": None,
+    }
 
 
 def test_family_signal_sections_derives_without_oracle_at_today_s_values() -> None:
