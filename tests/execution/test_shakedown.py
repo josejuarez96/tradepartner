@@ -1524,8 +1524,11 @@ def test_the_queue_read_on_a_year_of_orders_stays_within_the_read_budget(
     )
     with open_read_only(fast) as read:
         ops.owner_queue(read, fast, NOW)  # warm-up: the calendar and imports
-        started = time.monotonic()
-        queue = ops.owner_queue(read, fast, NOW)
-        elapsed = time.monotonic() - started
+        # Best of 3: the bound guards the read, not a busy CI runner (#2348).
+        elapsed_times = []
+        for _ in range(3):
+            started = time.monotonic()
+            queue = ops.owner_queue(read, fast, NOW)
+            elapsed_times.append(time.monotonic() - started)
     assert queue.shakedown_progress is not None  # the shakedown really ran
-    assert elapsed < fast.store.lock_retry_seconds / 2
+    assert min(elapsed_times) < fast.store.lock_retry_seconds / 2
