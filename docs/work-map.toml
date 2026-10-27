@@ -1479,3 +1479,45 @@ why = "A data gap should not realize a sale in a paper book of 200 names, and on
 what = "Reconcile by breaks: a broker difference the explainers do not clear restricts that one name and waits for the owner's typed true-up, small ones are accepted and logged, and only account-level faults still halt the whole book."
 why = "Stops every rare corporate event from halting the whole book and becoming an issue and a PR, and stops one external event from restarting the daily book's shakedown span (#2266, subsumes #2156)."
 unblocks = ["issue:2156", "phase:6"]
+
+[task.T289]
+what = "The Lab's listing of the checkout's sweep and hypothesis files, with registry and git state, and a sweep's frozen preview."
+why = "The owner sees what is registered, changed or unmerged before he registers anything from the app (#2304)."
+unblocks = ["task:T293"]
+
+[task.T290]
+what = "The Lab's one Run slot: `sweep run` or `backtest` started as a child process the page never waits on, tracked by a slot file beside the store."
+why = "A run takes minutes; the page must start it, survive a restart and never block a kill (#2304, ADR 0018 B)."
+unblocks = ["task:T294"]
+
+[task.T291]
+what = "The verdict of a Lab run, read from the trial registry rows above a recorded baseline, never from the exit code."
+why = "Every refusal exits 2 like a usage error, so only the registry can say what the engine decided (#2304)."
+unblocks = ["task:T294"]
+
+[task.T292]
+what = "`results.next_trial_cost`: N and SR* now and after the run adds its trials, at today's variance."
+why = "The Run confirm states the cost of a trial in the method's own terms (ADR 0018 B, #2304)."
+unblocks = ["task:T294"]
+
+[task.T293]
+what = "Register a merged sweep file from the Lab by running `sweep register` as a child process."
+why = "Pre-registration is the method's key moment and happens where the owner reads the result (#2304, ADR 0018 C)."
+unblocks = ["task:T294"]
+
+[task.T294]
+what = "The Lab page: pick a file, register it, run it, watch it and see the verdict."
+why = "The owner registers and runs B10 himself from the app (#2304)."
+unblocks = ["issue:2304"]
+
+[task.T295]
+what = "The Lab's result reading: the pre-registered thresholds, the result against them, then the rule's verdict, terms taught inline."
+why = "Reading a result in the method's order keeps a lucky trial from looking like an edge (#2304, ADR 0018 A)."
+
+[task.T296]
+what = "Run a promoted hypothesis with a safe window picker, a sweep time budget, and auto-refresh in the Lab."
+why = "The rest of ADR 0018 B's Run on Streamlit, after the B10 path (#2304)."
+
+[task.T297]
+what = "`ready_pr`'s review gate requires safety and quant reviews on the dashboard's child-process modules."
+why = "The Lab and kill modules spawn registry and kill-switch writes; the gate should enforce their reviews by path (#2304)."
