@@ -29,6 +29,7 @@ from execution.test_run_trade import (
     bought,
     delist,
     env,
+    rename,
     split,
     window,
 )
@@ -509,11 +510,12 @@ def test_a_reused_ticker_never_resolves_to_the_new_issuers_asset(
     known at close(S-1): the forced exit for the delisted SEC_TRANSFER must
     never resolve its `assets` read against that reused symbol, since the
     broker would answer for the new issuer, not the one this run means. It
-    fails closed instead of submitting anything (#568 item 2)."""
+    fails closed for that name instead of submitting anything (#568 item 2)."""
     bought(env)
     held = env.held()["TRNS"]
     submitted_before = len(env.submits())
     ended_before(env, MAY_3)
+    ended_before(env, MAY_3, "SEC_DUAL_B")
     reused_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=1)
     env.insert(
         "listings",
@@ -530,14 +532,51 @@ def test_a_reused_ticker_never_resolves_to_the_new_issuers_asset(
         },
     )
 
-    with pytest.raises(ValueError, match="TRNS"):
-        env.run(at(MAY_3))
+    outcome = env.run(at(MAY_3))
 
-    assert len(env.submits()) == submitted_before
+    assert outcome.status == "ok", env.result(outcome.run_id)
+    assert [order.symbol for order in env.submits()[submitted_before:]] == ["DUALB"]
     assert exit_orders(env, "SEC_TRANSFER") == []
+    assert exits(env, "SEC_TRANSFER") == []
     assert env.held()["TRNS"] == pytest.approx(held)
-    status, fault_type, _message = env.result(env.latest_run())
-    assert (status, fault_type) == ("halted", "ValueError")
+    ((run_id, _session, alert),) = env.alerts("skipped")
+    assert run_id == outcome.run_id and "TRNS" in alert and "reused" in alert
+
+
+@pytest.mark.parametrize("reused_symbol", ["TRNS", "TRNSX"])
+def test_a_renamed_delisted_name_with_a_reused_ticker_is_kept_open(
+    env: Env, window: PaperWindowRow, reused_symbol: str
+) -> None:
+    """Reuse of either the old or mapped ticker restricts only its former owner."""
+    bought(env)
+    held = env.held()["TRNS"]
+    ended_before(env, MAY_3)
+    rename(env, "SEC_TRANSFER", "TRNSX", at(MAY_3, 19, 0) - timedelta(days=1), broker=True)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_TRANSFER_NEW_ISSUER",
+            "ticker": reused_symbol,
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": F_0_PLUS_1,
+            "known_at": session_close(previous_session(MAY_3)) - timedelta(hours=1),
+            "ingested_at": session_close(previous_session(MAY_3)) - timedelta(hours=1),
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    before = len(env.submits())
+
+    outcome = env.run(at(MAY_3), prices={"TRNSX": env.prices["TRNS"]})
+
+    assert outcome.status == "ok", env.result(outcome.run_id)
+    assert env.submits()[before:] == []
+    assert env.held()["TRNSX"] == pytest.approx(held)
+    assert exit_orders(env, "SEC_TRANSFER") == []
+    assert exits(env, "SEC_TRANSFER") == []
+    ((run_id, _session, alert),) = env.alerts("skipped")
+    assert run_id == outcome.run_id and f"ticker {reused_symbol} reused" in alert
 
 
 def test_a_reusing_listing_known_after_close_s_minus_1_is_ignored(
