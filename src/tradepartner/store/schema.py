@@ -542,7 +542,39 @@ registry; #83 took version 2 first, so the registry is version 3):
   backfill stales no trial. A read-only connection accepts a version-34 store:
   every read works but a `mergers` read, which fails on the missing table, and
   the next writable `init_schema` call migrates the store.
-- **A later DDL change goes to version 36**, with its own migration and a
+- **Version 36** (#2143, T249b): `adjustments.kind` gains
+  `merger_receipt`. The migration rebuilds `adjustments` with the widened
+  `CHECK`, keeping every v35 row in insertion order and byte-identical.
+  A read-only v35 store remains readable; the next writable open migrates it.
+- **Version 37** (#2266, plan T280a; the paper spec's 2026-10-26 amendment
+  item 4, ADR 0025): adds the append-only journal table `reconcile_breaks`
+  (one row per break event: `opened`, `observed`, `auto_accepted`,
+  `auto_explained`, `resolved_by_broker`, `trued_up` or `reopened`) and widens
+  five closed `CHECK` sets, each value appended last: `reconciliations.status`
+  gains `breaks`; `adjustments.kind` gains `auto_true_up` and `owner_true_up`;
+  `decision_events.reason` and `order_events.reason` gain `skip_restricted`,
+  and so does `decisions.decision` (amendment item 7: the plan writes the
+  decision as `skip_restricted`). The sets only grow, so no stored row falls
+  outside them; DuckDB cannot change a `CHECK` in place, so `_migrate_breaks`
+  rebuilds each of the five tables through a staging table where its `CHECK`
+  lacks the new value, every row kept in insertion order and byte-identical,
+  and the DDL pass creates the new table. One version holds all of it. A
+  read-only connection accepts a version-36 store: every read works, and the break
+  readers (`store.journal.break_events_for`, `open_breaks`) return no event
+  there; the next writable `init_schema` call migrates it.
+- **Version 38** (plan T241; backtest spec amendment 2026-10-18, `universe
+  .rank_by`): `trial_rebalances` and `paper_plans` each gain the liquidity
+  intersection's record — `n_assets_intersected INTEGER` (the kept classes
+  checked against the assets snapshot) and `assets_intersection_skipped
+  BOOLEAN` (no snapshot was known at `t`, so the intersection was skipped).
+  Additive: the migration from any earlier migratable version adds the two
+  columns by `ALTER TABLE` (`_migrate_assets_intersection`), NULL on every
+  existing row because those rows predate the record; the pinned DDL strings
+  do not change. A read-only connection accepts a version-37 store: every read
+  works (`journal.plans_for`, which names `paper_plans`'s two, reads them as
+  NULL there; no read names `trial_rebalances`'s before T242), and the next
+  writable `init_schema` call migrates the store.
+- **A later DDL change goes to version 39**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -834,9 +866,21 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 35 (#1762, plan T248c): the `mergers` table and its identity index,
 #:   created by the DDL pass (`_MERGERS_TABLE_DDL`); no existing table changes
 #:   (module docstring, "Schema versions").
-#: - A later DDL change goes to version 36, with its own migration and a
+#: - 36 (#2143, T249b): `adjustments.kind` gains `merger_receipt`; the table
+#:   is rebuilt with its widened CHECK, preserving every existing row.
+#: - 37 (#2266, plan T280a): the `reconcile_breaks` journal table, and five
+#:   widened `CHECK`s (`reconciliations.status` `breaks`; `adjustments.kind`
+#:   `auto_true_up` and `owner_true_up`; `decisions.decision`,
+#:   `decision_events.reason` and `order_events.reason` `skip_restricted`), each
+#:   table rebuilt with every row.
+#: - 38 (plan T241): `trial_rebalances` and `paper_plans` each gain
+#:   `n_assets_intersected INTEGER` and `assets_intersection_skipped BOOLEAN`
+#:   (NULL on every existing row) by `ALTER TABLE`
+#:   (`_migrate_assets_intersection`); the pinned DDL strings do not change
+#:   (module docstring, "Schema versions").
+#: - A later DDL change goes to version 39, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 35
+CURRENT_SCHEMA_VERSION = 38
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -996,6 +1040,20 @@ _PRE_SHORT_REASONS_VERSION = 33
 #: connections serve every other read; a `mergers` read there fails on the
 #: missing table, as a `symbol_changes` read did at 27.
 _PRE_MERGERS_VERSION = 34
+_PRE_MERGER_RECEIPT_VERSION = 35
+
+#: The last version without `reconcile_breaks` and the five widened break
+#: `CHECK`s (#2266, T280a, version 37): read-only connections serve every read;
+#: the break readers in `store.journal` find no table and return no event, since
+#: no break can exist there.
+_PRE_BREAKS_VERSION = 36
+
+#: The last version without the liquidity intersection's record on
+#: `trial_rebalances` and `paper_plans` (plan T241, version 38): read-only
+#: connections serve every read: `journal._select` reads `paper_plans`'s two as
+#: NULL where they are missing, and no read names `trial_rebalances`'s before
+#: T242.
+_PRE_ASSETS_INTERSECTION_VERSION = 37
 
 
 class SchemaVersionError(RuntimeError):
@@ -1908,7 +1966,12 @@ NOT_RECEIVED_REASON = "not_received"
 #: `order_events.reason` of the terminal `cancelled` event `paper settle` journals
 #: for an order the owner settles without a fill (spec req 17, #571).
 OWNER_SETTLED_UNKNOWN_REASON = "owner_settled_unknown"
-#: Every `order_events.reason` the spec names (#332, #571). `plan.decision_state`
+#: `order_events.reason` and `decision_events.reason` of an order the plan does
+#: not place because its name is restricted by an open material break (version
+#: 37; the paper spec's 2026-10-26 #2266 amendment, item 7).
+SKIP_RESTRICTED_REASON = "skip_restricted"
+#: Every `order_events.reason` the spec names (#332, #571; `skip_restricted`
+#: appended last at version 37). `plan.decision_state`
 #: keeps a buy open on these exact spellings, so the column is a closed set.
 ORDER_EVENT_REASONS: tuple[str, ...] = (
     HALT_REASON,
@@ -1919,9 +1982,10 @@ ORDER_EVENT_REASONS: tuple[str, ...] = (
     "skip_untradable",
     "skip_not_borrowable",
     "skip_short_price",
+    SKIP_RESTRICTED_REASON,
 )
 #: Every `decision_events.reason` the spec names (version 29, #1813): the two
-#: new skip reasons come last.
+#: new skip reasons come last, then version 37's `skip_restricted`.
 DECISION_EVENT_REASONS: tuple[str, ...] = (
     "skip_below_one_share",
     "skip_untradable",
@@ -1934,6 +1998,7 @@ DECISION_EVENT_REASONS: tuple[str, ...] = (
     "skip_not_fractionable",
     "skip_not_borrowable",
     "skip_short_price",
+    SKIP_RESTRICTED_REASON,
 )
 
 #: `decisions.reason` of a plan full exit: a held name that left the targets.
@@ -1974,6 +2039,37 @@ DECISION_REASONS: tuple[str, ...] = (
     "cover_not_borrowable",
 )
 
+#: `reconciliations.status` of a reconciliation whose only residuals are
+#: name-level breaks (version 37; #2266 amendment item 1). It ranks below
+#: `fills_lagging` and above `ok`.
+BREAKS_STATUS = "breaks"
+#: `adjustments.kind` of the entry that adopts the broker's figure for an
+#: immaterial break (#2266 amendment item 6) and of the owner's `paper true-up`
+#: (item 9); version 37.
+AUTO_TRUE_UP_KIND = "auto_true_up"
+OWNER_TRUE_UP_KIND = "owner_true_up"
+#: `reconcile_breaks.event` (#2266 amendment item 4), `opened` first. A break is
+#: open after one of `OPEN_BREAK_EVENTS` and closed after one of
+#: `CLOSING_BREAK_EVENTS`, read from its latest event in write order.
+OPEN_BREAK_EVENTS: tuple[str, ...] = ("opened", "observed", "reopened")
+CLOSING_BREAK_EVENTS: tuple[str, ...] = (
+    "auto_accepted",
+    "auto_explained",
+    "resolved_by_broker",
+    "trued_up",
+)
+BREAK_EVENTS: tuple[str, ...] = (
+    "opened",
+    "observed",
+    "auto_accepted",
+    "auto_explained",
+    "resolved_by_broker",
+    "trued_up",
+    "reopened",
+)
+#: `reconcile_breaks.cause` (#2266 amendment item 14), computed once at detection.
+BREAK_CAUSES: tuple[str, ...] = ("corporate_action", "broker_activity", "data", "unattributed")
+
 #: Every journal column the spec enumerates as a closed set, with its allowed
 #: values; the DDL turns each into a `CHECK`. Columns in `NULLABLE_JOURNAL_ENUMS`
 #: may also be NULL: the spec lists `null` among their values, or the row can
@@ -2013,6 +2109,7 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
         "forced_exit",
         "skip_not_borrowable",
         "skip_short_price",
+        SKIP_RESTRICTED_REASON,
     ),
     ("decisions", "reason"): DECISION_REASONS,
     ("decision_events", "status"): ("skipped", "written_off"),
@@ -2044,9 +2141,18 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
         "carried_residue",
         "fee_cash",
         "cash_in_lieu",
+        "merger_receipt",
+        AUTO_TRUE_UP_KIND,
+        OWNER_TRUE_UP_KIND,
     ),
     ("adjustments", "origin"): ("dust", "untradable"),
-    ("reconciliations", "status"): ("ok", "mismatch", "pending_unresolved", "fills_lagging"),
+    ("reconciliations", "status"): (
+        "ok",
+        "mismatch",
+        "pending_unresolved",
+        "fills_lagging",
+        BREAKS_STATUS,
+    ),
     ("kill_switch", "state"): ("engaged", "released"),
     ("kill_switch", "source"): ("owner", "fault", "drawdown"),
     ("overrides", "kind"): (
@@ -2058,6 +2164,8 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
     ("positions_daily", "position_side"): POSITION_SIDES,
     ("lots", "position_side"): POSITION_SIDES,
     ("disposals", "position_side"): POSITION_SIDES,
+    ("reconcile_breaks", "event"): BREAK_EVENTS,
+    ("reconcile_breaks", "cause"): BREAK_CAUSES,
 }
 
 NULLABLE_JOURNAL_ENUMS: frozenset[tuple[str, str]] = frozenset(
@@ -2069,6 +2177,7 @@ NULLABLE_JOURNAL_ENUMS: frozenset[tuple[str, str]] = frozenset(
         ("adjustments", "origin"),
         ("order_events", "reason"),
         ("decisions", "reason"),
+        ("reconcile_breaks", "cause"),
     }
 )
 
@@ -2562,6 +2671,47 @@ CREATE TABLE IF NOT EXISTS wash_sale_flags (
 )
 """
 
+# Version 37 (#2266 amendment item 4, plan T280a): one row per break event,
+# append-only. `event_id` is write order; a break's state is its latest event's
+# (`OPEN_BREAK_EVENTS` or `CLOSING_BREAK_EVENTS`). The name is `security_id`, or
+# the broker `symbol` for `unknown_symbol`, so one of them is set. `dollar_size`
+# is NULL for an unpriced break, which is always material. An `opened` event
+# comes from a reconciliation and carries its cause; `trued_up` and `reopened`
+# carry the owner's non-blank reason. `store.journal.append` holds the event
+# order and the one-open-break-per-(window, name) rule, which a `CHECK` cannot.
+_OWNER_BREAK_EVENTS = "'trued_up', 'reopened'"
+_CREATE_RECONCILE_BREAKS = f"""
+CREATE TABLE IF NOT EXISTS reconcile_breaks (
+    event_id BIGINT NOT NULL PRIMARY KEY,
+    break_id VARCHAR NOT NULL,
+    window_id BIGINT NOT NULL,
+    book_id VARCHAR NOT NULL,
+    event VARCHAR NOT NULL,
+    parts_json VARCHAR NOT NULL,
+    cause VARCHAR,
+    security_id VARCHAR,
+    symbol VARCHAR,
+    ledger_quantity DOUBLE,
+    broker_quantity DOUBLE,
+    cash_amount DOUBLE,
+    reference_price DOUBLE,
+    dollar_size DOUBLE,
+    material BOOLEAN NOT NULL,
+    first_seen_session DATE NOT NULL,
+    reconciliation_id BIGINT,
+    adjustment_ids_json VARCHAR,
+    reason VARCHAR,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("reconcile_breaks", "event")},
+    {_check("reconcile_breaks", "cause")},
+    CHECK (security_id IS NOT NULL OR symbol IS NOT NULL),
+    CHECK (dollar_size IS NULL OR (isfinite(dollar_size) AND dollar_size >= 0)),
+    CHECK (dollar_size IS NOT NULL OR material),
+    CHECK (event <> 'opened' OR (cause IS NOT NULL AND reconciliation_id IS NOT NULL)),
+    CHECK (event NOT IN ({_OWNER_BREAK_EVENTS}) OR regexp_matches(coalesce(reason, ''), '\\S'))
+)
+"""
+
 #: The paper-trading journal tables added at schema version 5, disjoint
 #: from `TABLE_NAMES` and `REGISTRY_TABLE_NAMES`, so the look-ahead harness
 #: never sees them.
@@ -2593,12 +2743,14 @@ JOURNAL_TABLE_NAMES: tuple[str, ...] = (
     "lots",
     "disposals",
     "wash_sale_flags",
+    "reconcile_breaks",
 )
 
-#: Journal tables added after version 5 (#472), which a read-only connection to
-#: an older journal store lacks: `store.journal.require_journal` does not ask for
-#: them, so every other journal read keeps working there.
-LATER_JOURNAL_TABLE_NAMES: tuple[str, ...] = ("resume_acceptances",)
+#: Journal tables added after version 5 (#472; `reconcile_breaks` at 37), which a
+#: read-only connection to an older journal store lacks:
+#: `store.journal.require_journal` does not ask for them, so every other journal
+#: read keeps working there.
+LATER_JOURNAL_TABLE_NAMES: tuple[str, ...] = ("resume_acceptances", "reconcile_breaks")
 
 _JOURNAL_TABLE_DDL: tuple[str, ...] = (
     _CREATE_PAPER_WINDOWS,
@@ -2629,6 +2781,11 @@ _JOURNAL_TABLE_DDL: tuple[str, ...] = (
     _CREATE_DISPOSALS,
     _CREATE_WASH_SALE_FLAGS,
 )
+
+#: Version 37's journal table (#2266, T280a), created by `init_schema`'s DDL pass
+#: on every writable store; kept out of `_JOURNAL_TABLE_DDL`, as `_MERGERS_TABLE_DDL`
+#: is out of `_TABLE_DDL`, so the pinned DDL of earlier versions does not move.
+_BREAKS_TABLE_DDL: tuple[str, ...] = (_CREATE_RECONCILE_BREAKS,)
 
 
 # Research-experiment registry (schema version 12; research-registry spec req 1
@@ -2977,6 +3134,11 @@ def _max_version(conn: duckdb.DuckDBPyConnection) -> int | None:
     return result[0] if result is not None else None
 
 
+def stored_version(conn: duckdb.DuckDBPyConnection) -> int | None:
+    """Return the store's highest recorded schema version, if any."""
+    return _max_version(conn)
+
+
 def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
     """The read-only path of `init_schema`: no DDL, only a version check."""
     max_version = _max_version(conn)
@@ -3012,6 +3174,9 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_COST_LEVEL_KIND_VERSION,
         _PRE_SHORT_REASONS_VERSION,
         _PRE_MERGERS_VERSION,
+        _PRE_MERGER_RECEIPT_VERSION,
+        _PRE_BREAKS_VERSION,
+        _PRE_ASSETS_INTERSECTION_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3047,7 +3212,12 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # version 32 every read (no `cost_level_kind` column: the backtest page
         # falls back to `base`/`ladder` by each level);
         # version 33 every read (no short reason can exist there); version 34
-        # every read but `mergers`.
+        # every read but `mergers`; versions 35 and 36 every read (the break
+        # readers find no `reconcile_breaks` at 35 or 36 and return no event);
+        # version 37 every read (no read names the two version-38
+        # `trial_rebalances` columns before T242, and `journal._select` reads
+        # `paper_plans`'s same two as NULL where they are missing); those rows
+        # predate the record.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3384,6 +3554,26 @@ def _migrate_cash_in_lieu_kind(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("ALTER TABLE adjustments_v27 RENAME TO adjustments")
 
 
+def _migrate_merger_receipt_kind(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 36: widen `adjustments.kind`, preserving rows in insertion order."""
+    check = conn.execute(
+        "SELECT constraint_text FROM duckdb_constraints() WHERE database_name = "
+        "current_database() AND schema_name = current_schema() AND table_name = 'adjustments' "
+        "AND constraint_type = 'CHECK' AND constraint_column_names[1] = 'kind'",
+        [],
+    ).fetchone()
+    if check is not None and "'merger_receipt'" in (check[0] or ""):
+        return
+    conn.execute(
+        _CREATE_ADJUSTMENTS.replace(
+            "CREATE TABLE IF NOT EXISTS adjustments (", "CREATE TABLE adjustments_v36 (", 1
+        )
+    )
+    conn.execute("INSERT INTO adjustments_v36 BY NAME SELECT * FROM adjustments ORDER BY rowid")
+    conn.execute("DROP TABLE adjustments")
+    conn.execute("ALTER TABLE adjustments_v36 RENAME TO adjustments")
+
+
 def _add_nullable_int_columns(
     conn: duckdb.DuckDBPyConnection, table: str, columns: tuple[str, ...]
 ) -> None:
@@ -3415,6 +3605,29 @@ def _migrate_profitability_rebalance_counts(conn: duckdb.DuckDBPyConnection) -> 
     version-4 pin, so a fresh store gets the columns here too. Runs inside
     `init_schema`'s transaction, after its DDL pass."""
     _add_nullable_int_columns(conn, "trial_rebalances", PROFITABILITY_REBALANCE_COLUMNS)
+
+
+#: `trial_rebalances` and `paper_plans` each gain these, name to type, in
+#: version 38 (plan T241): the kept classes checked against the assets snapshot,
+#: and whether the intersection was skipped for want of a snapshot at `t`.
+_ASSETS_INTERSECTION_COLUMNS: Final = (
+    ("n_assets_intersected", "INTEGER"),
+    ("assets_intersection_skipped", "BOOLEAN"),
+)
+
+
+def _migrate_assets_intersection(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add each of `_ASSETS_INTERSECTION_COLUMNS` to `trial_rebalances` and
+    `paper_plans` (NULL on every existing row) where missing (module docstring,
+    "Schema versions", version 38). Idempotent: a column already present is left
+    alone. `_REGISTRY_TABLE_DDL` and `_JOURNAL_TABLE_DDL` keep their pins, so a
+    fresh store gets the columns here too. Runs inside `init_schema`'s
+    transaction, after its DDL pass."""
+    for table in ("trial_rebalances", "paper_plans"):
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+        for column, column_type in _ASSETS_INTERSECTION_COLUMNS:
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
 #: Where `_migrate_signal_reasons` builds the version-14 table before it takes
@@ -3899,9 +4112,53 @@ def _migrate_short_reasons(conn: duckdb.DuckDBPyConnection) -> None:
     forget_column_types(conn)
 
 
+#: Each `CHECK` version 37 widens: (table, its DDL, column, a value it adds).
+_BREAK_CHECKS: tuple[tuple[str, str, str, str], ...] = (
+    ("reconciliations", _CREATE_RECONCILIATIONS, "status", BREAKS_STATUS),
+    ("decisions", _CREATE_DECISIONS, "decision", SKIP_RESTRICTED_REASON),
+    ("adjustments", _CREATE_ADJUSTMENTS, "kind", OWNER_TRUE_UP_KIND),
+    ("decision_events", _CREATE_DECISION_EVENTS, "reason", SKIP_RESTRICTED_REASON),
+    ("order_events", _CREATE_ORDER_EVENTS, "reason", SKIP_RESTRICTED_REASON),
+)
+
+
+def _check_text(conn: duckdb.DuckDBPyConnection, table: str, column: str) -> str:
+    """The text of `table`'s `CHECK` on `column` alone (empty when it has none)."""
+    row = conn.execute(
+        "SELECT constraint_text FROM duckdb_constraints() WHERE database_name = "
+        "current_database() AND schema_name = current_schema() AND table_name = ? "
+        "AND constraint_type = 'CHECK' AND list_unique(constraint_column_names) = 1 "
+        "AND constraint_column_names[1] = ?",
+        [table, column],
+    ).fetchone()
+    return "" if row is None else str(row[0] or "")
+
+
+def _migrate_breaks(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 37 (module docstring, "Schema versions"; #2266, T280a): rebuild
+    `reconciliations`, `decisions`, `adjustments`, `decision_events` and
+    `order_events` with their widened `CHECK`s, each only where its `CHECK` lacks the new value (an
+    earlier step may already have rebuilt it from the current DDL), every row kept
+    in insertion order (readers break `known_at` ties on rowid). The sets only
+    grow, so no stored value can fall outside them. Runs on a store at version 36
+    or below, inside `init_schema`'s transaction, after every earlier step; the
+    DDL pass has already created `reconcile_breaks`."""
+    for table, create, column, value in _BREAK_CHECKS:
+        if f"'{value}'" in _check_text(conn, table, column):
+            continue
+        staging = f"{table}_v37"
+        conn.execute(
+            create.replace(f"CREATE TABLE IF NOT EXISTS {table} (", f"CREATE TABLE {staging} (", 1)
+        )
+        conn.execute(f"INSERT INTO {staging} BY NAME SELECT * FROM {table} ORDER BY rowid")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+    forget_column_types(conn)
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 34 store to version 35.
+    version-2 to 37 store to version 38.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -3914,6 +4171,16 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
     `CURRENT_SCHEMA_VERSION` and no lab table; every store gets
+    `trial_rebalances` and `paper_plans` each with `n_assets_intersected` and
+    `assets_intersection_skipped` added (NULL on every existing row; a
+    version-37 store gets a version-38 row; plan T241); every store gets
+    `reconcile_breaks` created where it lacks it, and `reconciliations`,
+    `decisions`, `adjustments`, `decision_events` and `order_events` rebuilt
+    where their `CHECK` lacks a version-37 value, every row kept in insertion order; a
+    version-36 store gets a version-37 row (#2266, T280a); every store gets
+    `adjustments` rebuilt with the version-36 `merger_receipt` kind `CHECK`
+    where needed, every row kept in insertion order; a version-35 store gets
+    a version-36 row (#2143, T249b); every store gets
     `openfigi_types` and `successor_chains` created where it lacks them (purely
     additive; a version-29 store gets version-30 and version-31 rows, a
     version-30 store a version-31 row; #1713, T189c; #821, T187); every store gets
@@ -3989,7 +4256,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-32 (every read; the
+    On a read-only connection no DDL runs: a version-37 (every read; `paper_plans`'s
+    two version-38 columns read as NULL through `journal`), 36 and
+    35 (every read; the break readers return no event), 34
+    (every read but `mergers`, missing there), 33 (every read; the short reasons
+    only widen a `CHECK`), 32 (every read; the
     `cost_level_kind` column is missing and the backtest page falls back to
     `base`/`ladder`), 31 (every read; no `pending_unresolved` event can exist
     there), 30 (every read but
@@ -4066,6 +4337,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_COST_LEVEL_KIND_VERSION,
         _PRE_SHORT_REASONS_VERSION,
         _PRE_MERGERS_VERSION,
+        _PRE_MERGER_RECEIPT_VERSION,
+        _PRE_BREAKS_VERSION,
+        _PRE_ASSETS_INTERSECTION_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4109,12 +4383,14 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _OPENFIGI_TYPES_TABLE_DDL
             + _SUCCESSOR_CHAINS_TABLE_DDL
             + _MERGERS_TABLE_DDL
+            + _BREAKS_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)
         _migrate_filing_name(conn)
         _migrate_n_research(conn)
         _migrate_profitability_rebalance_counts(conn)
+        _migrate_assets_intersection(conn)
         _relax_no_history_count(conn)
         if max_version is not None and max_version <= _PRE_REBALANCE_COUNTS_VERSION:
             _migrate_rebalance_counts(conn)
@@ -4139,6 +4415,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_fee_activities(conn)
         if max_version is None or max_version <= _PRE_CASH_IN_LIEU_VERSION:
             _migrate_cash_in_lieu_kind(conn)
+        if max_version is None or max_version <= _PRE_MERGER_RECEIPT_VERSION:
+            _migrate_merger_receipt_kind(conn)
         if max_version is not None and max_version <= _PRE_SHORT_REASONS_VERSION:
             _refuse_stray_short_reasons(conn)
         if max_version is None or max_version <= _PRE_SKIP_REASONS_VERSION:
@@ -4149,6 +4427,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_pending_unresolved(conn)
         if max_version is not None and max_version <= _PRE_SHORT_REASONS_VERSION:
             _migrate_short_reasons(conn)
+        if max_version is not None and max_version <= _PRE_BREAKS_VERSION:
+            _migrate_breaks(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
             applied_at = utc_now()

@@ -8,7 +8,7 @@ description: Bring your draft PR up to date with main, run every check and requi
 Run this when the work on your claimed issue is done and the draft PR describes it.
 
 ## Before you run it
-1. **One fragment, not the shared files:** `uv run python scripts/fragments.py add <issue> --slug <slug> --status "<Recently done line, ≤240 chars, with the PR number>" --added "<CHANGELOG bullet>"` (or `--changed` / `--fixed`). Never edit `docs/STATUS.md` or `CHANGELOG.md`. Tick only your own plan box.
+1. **One fragment, not the shared files:** `uv run python scripts/fragments.py add <issue> --slug <slug> --status "<Recently done line, ≤240 chars, with the PR number>" --added "<CHANGELOG bullet>"` (or `--changed` / `--fixed`), plus `--task <Tn> --pr <n>` for a plan task (the line `task: Tn (PR #n)`). Never edit `docs/STATUS.md` or `CHANGELOG.md`, and never tick your plan line: the fold does after merge, and `team.py` counts the merged fragment as done (#2280).
 2. **Reviews:** the plan line's `Review:`, plus `quant-auditor` for data, store, signals, backtests and `safety-reviewer` for broker, orders, secrets, config, LLM inputs. `QUANT_PREFIXES` / `SAFETY_PREFIXES` in `ready_pr.py` are the minimum it enforces by path. Give each the PR number; it posts its full report as a PR comment whose first line is the verdict (`quant-auditor: PASS`) and returns a ten-line summary. If it could not post, post its file with `gh pr comment <n> --body-file <path>`. Only a comment's first line counts, the latest verdict per agent wins, and only `PASS` passes: `PASS WITH FIXES` and `FAIL` block until a re-review after the fixes posts `PASS` (#356). The PR body never counts (#352).
 3. **Template:** tick every box, or mark it `n/a` with why. The body says `Closes #<issue>`.
 

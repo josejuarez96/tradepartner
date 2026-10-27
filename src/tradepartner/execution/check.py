@@ -70,8 +70,7 @@ from tradepartner.config import Cadence, Settings
 from tradepartner.execution.lock import resolve_book
 from tradepartner.execution.outcomes import (
     NOT_EXECUTED,
-    POSITION_RETURN,
-    REALISED_PNL,
+    filled_outcome_kind,
     outcome_horizon,
 )
 from tradepartner.execution.plan import stop_session as stop_session_of_request
@@ -97,8 +96,6 @@ _EXECUTED = "executed"
 _REQUESTED = "requested"
 _SCHEDULER = "scheduler"
 _FILLED = "filled"
-_BUY = "buy"
-_SELL = "sell"
 _REBALANCE = "rebalance"
 _CATCH_UP = "catch_up"
 _PAPER_MIN_REBALANCES = "paper.min_rebalances"
@@ -116,6 +113,25 @@ class CheckLine:
     passed: bool
     query: str
     detail: str
+    #: The owner-readable form of `detail` (progress, date range) shown by default;
+    #: empty when `detail` is already short. `--verbose` prints `detail` in full.
+    short: str = ""
+
+
+#: Calendar days one rebalance period spans, for "about N to go" estimates.
+_PERIOD_DAYS: Mapping[Cadence, int] = MappingProxyType({"month_end": 30, "week_end": 7, "daily": 1})
+
+
+def _time_to_go(remaining: int, cadence: Cadence) -> str:
+    """A rough, plain-words wait for `remaining` more rebalance periods."""
+    if cadence == "daily":
+        return f"{remaining} more session(s) to go"
+    days = remaining * _PERIOD_DAYS[cadence]
+    if days < 14:
+        return f"about {days} more day(s)"
+    if days < 60:
+        return f"about {round(days / 7)} weeks to go"
+    return f"about {round(days / 30)} months to go"
 
 
 def _frozen(window: PaperWindowRow) -> dict[str, Any]:
@@ -237,7 +253,11 @@ def _journal_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> Journal:
 
 
 def _rebalance_count_line(
-    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, window_id: int, frozen: dict[str, Any]
+    conn: duckdb.DuckDBPyConnection,
+    window: PaperWindowRow,
+    window_id: int,
+    frozen: dict[str, Any],
+    cadence: Cadence,
 ) -> CheckLine:
     query = (
         "distinct rebalance_events.rebalance_session with status='executed' "
@@ -309,6 +329,7 @@ def _rebalance_count_line(
         f"{count} scheduler-executed rebalance session(s) [{sessions_text}], "
         f"need >= {min_rebalances}"
     )
+    base_detail = detail
     if tty_only_sessions:
         tty_text = ", ".join(s.isoformat() for s in tty_only_sessions)
         detail += f"; tty-executed, listed not counted: [{tty_text}]"
@@ -326,7 +347,15 @@ def _rebalance_count_line(
         detail += (
             f"; submitted-order runs, fills recorded by a later run, not counted: [{recorded_text}]"
         )
-    return CheckLine(name="rebalance_count", passed=passed, query=query, detail=detail)
+    ordered = sorted(scheduler_sessions)
+    short = f"{count} of {min_rebalances} rebalance sessions done"
+    if not passed:
+        short += f" so far, {_time_to_go(min_rebalances - count, cadence)}"
+    if ordered:
+        short += f"; first {ordered[0].isoformat()}, latest {ordered[-1].isoformat()}"
+    if detail != base_detail:
+        short += "; other runs are listed but not counted (--verbose shows them)"
+    return CheckLine(name="rebalance_count", passed=passed, query=query, detail=detail, short=short)
 
 
 def _tracking_line(
@@ -395,39 +424,74 @@ def _order_due_threshold(
     return outcome_horizon(order, decision_rebalance, cadence)
 
 
-def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int, cadence: Cadence) -> CheckLine:
+def _chain_line(
+    conn: duckdb.DuckDBPyConnection,
+    window_id: int,
+    cadence: Cadence,
+    *,
+    now: datetime | None = None,
+    asof_fills: Mapping[str, Sequence[tuple[datetime, float]]] | None = None,
+) -> CheckLine:
     query = (
         "every order's chain (order -> terminal event -> outcome) once its "
         "outcome is due (spec req 8), and no live fill journaled after its "
         "order's terminal event (req 17)"
     )
-    orders = store_journal.orders_for(conn, window_id=window_id)
+    orders = [
+        o
+        for o in store_journal.orders_for(conn, window_id=window_id)
+        if now is None or o.known_at <= now
+    ]
+    order_ids = {o.client_order_id for o in orders}
     decisions = {
-        d.decision.decision_id: d.decision for d in store_journal.decisions_for(conn, window_id)
+        d.decision.decision_id: d.decision
+        for d in store_journal.decisions_for(conn, window_id)
+        if now is None or d.decision.known_at <= now
     }
     run_sessions = sorted(
-        r.run.session for r in store_journal.runs_for(conn, window_id) if r.run.session is not None
+        r.run.session
+        for r in store_journal.runs_for(conn, window_id)
+        if r.run.session is not None and (now is None or r.run.known_at <= now)
     )
-    open_ids = {
-        o.client_order_id for o in store_journal.non_terminal_orders(conn, window_id=window_id)
-    }
+    open_ids = (
+        {o.client_order_id for o in store_journal.non_terminal_orders(conn, window_id=window_id)}
+        if now is None
+        else set()
+    )
     terminal: dict[str, str] = {}
     terminal_at: dict[str, datetime] = {}
     for event in sorted(
         store_journal.order_events_for(conn, window_id=window_id),
         key=lambda e: (e.known_at, e.ingested_at),
     ):
+        if now is not None and event.known_at > now:
+            continue
         if event.status in store_journal.TERMINAL_ORDER_STATUSES:
             terminal.setdefault(event.client_order_id, event.status)
             terminal_at.setdefault(event.client_order_id, event.known_at)
     filled: dict[str, float] = {}
     late: set[str] = set()
-    for item in store_journal.fills_for(conn, window_id=window_id):
-        coid = item.fill.client_order_id
-        filled[coid] = filled.get(coid, 0.0) + item.fill.quantity
-        if coid in terminal_at and item.fill.known_at > terminal_at[coid]:
+    fill_rows = (
+        (
+            (item.fill.client_order_id, item.fill.known_at, item.fill.quantity)
+            for item in store_journal.fills_for(conn, window_id=window_id)
+        )
+        if asof_fills is None
+        else ((coid, at, quantity) for coid, rows in asof_fills.items() for at, quantity in rows)
+    )
+    for coid, at, quantity in fill_rows:
+        if asof_fills is not None and coid not in order_ids:
+            continue
+        if now is not None and at > now:
+            continue
+        filled[coid] = filled.get(coid, 0.0) + quantity
+        if coid in terminal_at and at > terminal_at[coid]:
             late.add(coid)
-    written = {(o.client_order_id, o.kind) for o in store_journal.outcomes_for(conn, window_id)}
+    written = {
+        (o.client_order_id, o.kind)
+        for o in store_journal.outcomes_for(conn, window_id)
+        if now is None or o.known_at <= now
+    }
 
     incomplete: list[str] = []
     for order in sorted(orders, key=lambda o: o.client_order_id):
@@ -446,10 +510,8 @@ def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int, cadence: Cadenc
             incomplete.append(f"order {coid} ({order.symbol}) is not terminal")
             continue
         earned: list[str] = []
-        if filled.get(coid, 0.0) > 0 and order.side == _BUY:
-            earned.append(POSITION_RETURN)
-        if filled.get(coid, 0.0) > 0 and order.side == _SELL:
-            earned.append(REALISED_PNL)
+        if filled.get(coid, 0.0) > 0:
+            earned.append(filled_outcome_kind(order.side, order.position_side))
         if terminal[coid] != _FILLED:
             earned.append(NOT_EXECUTED)
         incomplete += [
@@ -463,7 +525,12 @@ def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int, cadence: Cadenc
 
 
 def _override_line(
-    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, window_id: int, frozen: dict[str, Any]
+    conn: duckdb.DuckDBPyConnection,
+    window: PaperWindowRow,
+    window_id: int,
+    frozen: dict[str, Any],
+    *,
+    now: datetime | None = None,
 ) -> CheckLine:
     query = "overrides.reason, trimmed, against the frozen paper.min_override_reason_chars"
     min_chars = _int_key(window, frozen, _PAPER_MIN_OVERRIDE_REASON_CHARS)
@@ -472,6 +539,7 @@ def _override_line(
         f"{len(o.override.reason.strip())} char(s), need >= {min_chars}"
         for o in store_journal.overrides_for(conn, window_id)
         if len(o.override.reason.strip()) < min_chars
+        and (now is None or o.override.known_at <= now)
     ]
     passed = not violations
     detail = "every override reason meets the frozen minimum" if passed else "; ".join(violations)
@@ -504,7 +572,7 @@ def check(
     frozen = _frozen(window)
 
     return [
-        _rebalance_count_line(conn, window, window_id, frozen),
+        _rebalance_count_line(conn, window, window_id, frozen, cadence),
         _tracking_line(conn, window, window_id, frozen, last_t, stop_session, cadence),
         _chain_line(conn, window_id, cadence),
         _override_line(conn, window, window_id, frozen),

@@ -126,6 +126,7 @@ def _run(
     journal_open: Sequence[JournalOpenOrder] = (),
     explanations: Explanations | None = None,
     account_id: str = "acct-1",
+    frozen: RiskConfig = FROZEN,
 ) -> Reconciliation:
     return compare(
         ledger,
@@ -135,7 +136,7 @@ def _run(
         _account(cash, account_id),
         explanations or _explanations(),
         WINDOW,
-        FROZEN,
+        frozen,
         order_id_prefix=PREFIX,
     )
 
@@ -160,6 +161,94 @@ def test_matching_books_are_ok_and_record_the_broker_cash() -> None:
     assert result.adjustments == ()
 
 
+@pytest.mark.parametrize("activity_type", ["DIV", "MA", "DIVNRA"])
+def test_executed_named_cash_without_a_due_is_a_break(activity_type: str) -> None:
+    activity = CashActivity("new-credit", activity_type, S, "executed", 12.0, "AAA")
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_012.0,
+        explanations=_explanations(activities=(activity,), activity_seen_before=PRIOR),
+    )
+    assert result.status == "breaks"
+    assert [(m.kind, m.security_id, m.cash_amount, m.activity_ids) for m in result.mismatches] == [
+        ("name_cash", "SEC_A", 12.0, ("new-credit",))
+    ]
+
+
+def test_cash_on_a_journaled_but_now_unheld_name_is_a_break() -> None:
+    activity = CashActivity("late-credit", "DIV", S, "executed", 12.0, "AAA")
+    result = _run(
+        _ledger(1_000.0),
+        _positions(),
+        1_012.0,
+        explanations=_explanations(activities=(activity,), activity_seen_before=PRIOR),
+    )
+    assert result.status == "breaks"
+    assert [(m.kind, m.security_id, m.activity_ids) for m in result.mismatches] == [
+        ("name_cash", "SEC_A", ("late-credit",))
+    ]
+
+
+def test_named_cash_does_not_hide_book_faults() -> None:
+    activity = CashActivity("named", "MA", S, "executed", 12.0, "AAA")
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_012.0,
+        explanations=_explanations(activities=(activity,), activity_seen_before=PRIOR),
+        account_id="other",
+    )
+    assert result.status == "mismatch"
+    assert _kinds(result) == ["account_id", "name_cash"]
+
+
+@pytest.mark.parametrize("symbol", [None, "ZZZ"])
+def test_untagged_or_unmapped_cash_stays_a_book_halt(symbol: str | None) -> None:
+    activity = CashActivity("orphan", "MA", S, "executed", 12.0, symbol)
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_012.0,
+        explanations=_explanations(activities=(activity,), activity_seen_before=PRIOR),
+    )
+    assert result.status == "mismatch"
+    assert _kinds(result) == ["cash"]
+
+
+def test_candidate_explainer_does_not_hide_unbooked_unknown_cash() -> None:
+    activity = CashActivity("tiny-int", "INT", S, "executed", 0.001, "AAA")
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0,
+        explanations=_explanations(
+            activities=(activity,), activity_seen_before=PRIOR, dividends={"SEC_A": 5.0}
+        ),
+    )
+    assert result.status == "mismatch"
+    assert _kinds(result) == ["unexplained_activity"]
+
+
+def test_due_dividend_is_explained_beside_unrelated_named_cash() -> None:
+    due = CashActivity("due", "DIV", S, "executed", 5.0, "AAA")
+    unrelated = CashActivity("other", "MA", S, "executed", 12.0, "AAA")
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_017.0,
+        explanations=_explanations(
+            activities=(due, unrelated),
+            activity_seen_before=PRIOR,
+            dividends={"SEC_A": 5.0},
+        ),
+    )
+    assert result.status == "breaks"
+    assert [(a.kind, a.cash) for a in result.explained] == [("dividend_cash", 5.0)]
+    assert result.adjustments == ()  # deferred until a reconciliation can be the cash base
+    assert result.mismatches[0].activity_ids == ("other",)
+
+
 @pytest.mark.parametrize(
     ("ledger", "positions", "cash", "kind"),
     [
@@ -175,7 +264,7 @@ def test_each_position_and_cash_mismatch(
 ) -> None:
     result = _run(ledger, positions, cash)
 
-    assert result.status == "mismatch"
+    assert result.status == ("mismatch" if kind == "cash" else "breaks")
     assert _kinds(result) == [kind]
     assert result.broker_cash is None  # never a re-base
     assert kind in json.loads(result.mismatches_json)["mismatches"][0]["kind"]
@@ -234,7 +323,24 @@ def test_a_foreign_prefix_order_is_a_mismatch() -> None:
         _order_row("owner-manual-1", "SEC_A", "buy", quantity=1.0), OrderStatus.ACCEPTED
     )
     result = _run(_ledger(SEC_A=1.0), _positions(AAA=1.0), 1_000.0, open_orders=[foreign])
+    assert result.status == "mismatch"
     assert _kinds(result) == ["foreign_order"]
+
+
+def test_a_foreign_order_keeps_a_named_cash_break_at_book_halt() -> None:
+    foreign = _reading(
+        _order_row("owner-manual-1", "SEC_A", "buy", quantity=1.0), OrderStatus.ACCEPTED
+    )
+    activity = CashActivity("named", "MA", S, "executed", 12.0, "AAA")
+    result = _run(
+        _ledger(1_000.0, SEC_A=1.0),
+        _positions(AAA=1.0),
+        1_012.0,
+        open_orders=[foreign],
+        explanations=_explanations(activities=(activity,), activity_seen_before=PRIOR),
+    )
+    assert result.status == "mismatch"
+    assert _kinds(result) == ["foreign_order", "name_cash"]
 
 
 def test_an_own_prefix_order_the_journal_does_not_hold_open_is_a_mismatch() -> None:
@@ -525,6 +631,210 @@ def test_a_cash_difference_other_than_the_dividend_is_a_mismatch() -> None:
     assert result.adjustments == ()
 
 
+def test_two_names_open_and_only_one_dividend_paid() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0, SEC_B=4.0),
+        _positions(AAA=10.0, BBB=4.0),
+        1_004.5,
+        explanations=_explanations(
+            dividends={"SEC_A": 4.5, "SEC_B": 7.0},
+            dividend_dues={"SEC_A": (4.5,), "SEC_B": (7.0,)},
+        ),
+    )
+    assert result.status == "ok"
+    assert [(a.security_id, a.cash) for a in result.adjustments] == [("SEC_A", 4.5)]
+
+
+def test_two_dividends_on_one_name_book_only_the_older_paid_due() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_004.5,
+        explanations=_explanations(dividends={"SEC_A": 11.5}, dividend_dues={"SEC_A": (4.5, 7.0)}),
+    )
+    assert result.status == "ok"
+    assert [(a.security_id, a.cash) for a in result.adjustments] == [("SEC_A", 4.5)]
+
+
+def test_two_equal_open_dues_with_one_paid_fail_closed() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_005.0,
+        explanations=_explanations(dividends={"SEC_A": 10.0}, dividend_dues={"SEC_A": (5.0, 5.0)}),
+    )
+    assert _kinds(result) == ["cash"]
+    assert result.adjustments == ()
+
+
+def test_small_unpaid_due_prefers_none_paid_inside_cash_bound() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=0.01),
+        _positions(AAA=0.01),
+        1_000.0,
+        explanations=_explanations(dividends={"SEC_A": 0.005}, dividend_dues={"SEC_A": (0.005,)}),
+    )
+    assert result.status == "ok" and result.adjustments == ()
+
+
+def test_name_missing_from_dividend_dues_uses_its_per_name_total() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_004.5,
+        explanations=_explanations(dividends={"SEC_A": 4.5}, dividend_dues={}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [4.5]
+
+
+def test_present_dividend_dues_must_sum_to_the_per_name_total() -> None:
+    with pytest.raises(ValueError, match="dividend dues"):
+        _run(
+            _ledger(1_000.0, SEC_A=10.0),
+            _positions(AAA=10.0),
+            1_000.0,
+            explanations=_explanations(
+                dividends={"SEC_A": 4.5}, dividend_dues={"SEC_A": (2.0, 2.0)}
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("total", "dues"),
+    [(0.3, (0.1, 0.2)), (1.0, (0.3, 0.7000000000000001))],
+)
+def test_dividend_dues_allow_only_float_representation_rounding(
+    total: float, dues: tuple[float, ...]
+) -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0,
+        explanations=_explanations(dividends={"SEC_A": total}, dividend_dues={"SEC_A": dues}),
+    )
+    assert result.status == "ok"
+
+
+def test_two_paid_dues_on_one_name_journal_two_rows() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_011.5,
+        explanations=_explanations(dividends={"SEC_A": 11.5}, dividend_dues={"SEC_A": (4.5, 7.0)}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [4.5, 7.0]
+
+
+def test_nine_open_dues_accept_a_unique_single_due() -> None:
+    dues = tuple(float(2**i) for i in range(9))
+    explanations = _explanations(dividends={"SEC_A": 511.0}, dividend_dues={"SEC_A": dues})
+    single = _run(
+        _ledger(1_000.0, SEC_A=10.0), _positions(AAA=10.0), 1_256.0, explanations=explanations
+    )
+    assert single.status == "ok" and [a.cash for a in single.adjustments] == [256.0]
+
+
+def test_nine_open_dues_fail_when_an_untried_subset_also_fits() -> None:
+    dues = tuple(float(i) for i in range(1, 10))
+    explanations = _explanations(dividends={"SEC_A": 45.0}, dividend_dues={"SEC_A": dues})
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0), _positions(AAA=10.0), 1_009.0, explanations=explanations
+    )
+    assert _kinds(result) == ["cash"]
+    assert result.adjustments == ()
+
+
+def test_nine_open_dues_do_not_try_an_unlisted_combination() -> None:
+    dues = tuple(float(i) for i in range(1, 10))
+    explanations = _explanations(dividends={"SEC_A": 45.0}, dividend_dues={"SEC_A": dues})
+    combination_only = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_012.0,
+        explanations=explanations,
+    )
+    assert _kinds(combination_only) == ["cash"]
+
+
+def test_above_cap_subset_proof_stops_at_its_state_limit() -> None:
+    dues = tuple(float(2**i) for i in range(25))
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0 + float(2**24),
+        frozen=FROZEN.model_copy(update={"reconcile_dividend_subset_states": 32}),
+        explanations=_explanations(
+            dividends={"SEC_A": float(2**25 - 1)}, dividend_dues={"SEC_A": dues}
+        ),
+    )
+    assert _kinds(result) == ["cash"]
+    assert result.adjustments == ()
+
+
+@pytest.mark.parametrize("dust", [0.004, 0.01])
+def test_dust_due_does_not_make_a_real_credit_ambiguous_or_get_journaled(dust: float) -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_005.0,
+        explanations=_explanations(
+            dividends={"SEC_A": 5.0 + dust}, dividend_dues={"SEC_A": (5.0, dust)}
+        ),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [5.0]
+
+
+def test_a_long_name_can_match_its_positive_due_after_a_position_flip() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_006.0,
+        explanations=_explanations(dividends={"SEC_A": 5.0}, dividend_dues={"SEC_A": (6.0, -1.0)}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [6.0]
+
+
+def test_a_short_name_can_match_its_positive_due_after_a_position_flip() -> None:
+    result = _run(
+        Ledger(positions={}, cash=1_000.0, through=S, short_holdings={"SEC_A": 10.0}),
+        _positions(AAA=-10.0),
+        1_001.0,
+        explanations=_explanations(dividends={"SEC_A": -5.0}, dividend_dues={"SEC_A": (-6.0, 1.0)}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [1.0]
+
+
+def test_eight_open_dues_try_a_partial_combination() -> None:
+    dues = tuple(float(2**i) for i in range(8))
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_130.0,
+        explanations=_explanations(dividends={"SEC_A": 255.0}, dividend_dues={"SEC_A": dues}),
+    )
+    assert result.status == "ok"
+    assert [a.cash for a in result.adjustments] == [2.0, 128.0]
+
+
+def test_ended_listing_does_not_try_partial_dividend_combinations() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0, SEC_C=0.1),
+        _positions(AAA=10.0),
+        1_005.5,
+        explanations=_explanations(
+            ended=frozenset({"SEC_C"}),
+            dividends={"SEC_A": 11.5},
+            dividend_dues={"SEC_A": (4.5, 7.0)},
+        ),
+    )
+    assert _kinds(result) == ["cash"]
+
+
 # --- pending and lagging allowances --------------------------------------------
 
 
@@ -648,7 +958,7 @@ def test_an_own_prefix_broker_order_with_a_pending_row_is_a_resume_matter() -> N
 # --- precedence ------------------------------------------------------------------
 
 
-def test_status_precedence_mismatch_over_pending_over_lagging_over_ok() -> None:
+def test_status_precedence_mismatch_over_pending_over_lagging_over_breaks_over_ok() -> None:
     pending = _pending("tp-20261007-SEC_B-buy-1", "SEC_B", "buy", notional=200.0)
     lagging = _lagging_buy(5.0, 2.0)
     both = _run(
@@ -669,6 +979,19 @@ def test_status_precedence_mismatch_over_pending_over_lagging_over_ok() -> None:
     )
     assert with_mismatch.status == "mismatch"
     assert json.loads(with_mismatch.mismatches_json)["lagging"] == [lagging.order.client_order_id]
+    for orders, expected in (
+        ([pending, lagging], "pending_unresolved"),
+        ([lagging], "fills_lagging"),
+        ([], "breaks"),
+    ):
+        result = _run(
+            _ledger(1_000.0, SEC_A=12.0),
+            _positions(AAA=15.0 if lagging in orders else 12.0, CCC=2.0),
+            700.0 if lagging in orders else 1_000.0,
+            journal_open=orders,
+        )
+        assert result.status == expected
+        assert "broker_only_position" in _kinds(result)
 
 
 def test_the_mismatches_json_is_stable() -> None:
@@ -1279,19 +1602,18 @@ def test_a_fee_dated_on_or_after_the_fallback_start_is_booked() -> None:
 
 
 @pytest.mark.parametrize("activity_type", ["INT", "JNLC", "ACATC"])
-def test_an_unknown_cash_type_is_unexplained_activity(activity_type: str) -> None:
-    """A cash activity of a type the rule does not know names its type, id, date,
-    amount and status, and halts the window (#1583)."""
+def test_an_unknown_cash_type_is_named_cash_when_executed(activity_type: str) -> None:
+    """Every executed, named cash type is eligible for a name break (#2266)."""
     result = _run(
         _ledger(1_000.0, SEC_A=10.0),
         _positions(AAA=10.0),
-        1_000.0,
+        998.5,
         explanations=_explanations(activities=(_activity("act-x", activity_type, S, -1.5),)),
     )
 
-    assert _kinds(result) == ["unexplained_activity"]
-    detail = result.mismatches[0].detail
-    assert activity_type in detail and "act-x" in detail and "executed" in detail
+    assert result.status == "breaks"
+    assert _kinds(result) == ["name_cash"]
+    assert result.mismatches[0].activity_ids == ("act-x",)
 
 
 def test_a_fee_whose_status_is_not_executed_is_unexplained_activity() -> None:
@@ -1377,6 +1699,7 @@ def test_an_unknown_type_dated_on_the_start_date_is_still_unexplained() -> None:
         explanations=_explanations(
             activities=(_activity("act-on", "JNLC", date(2026, 10, 10), 25.0),),
             activity_seen_before=date(2026, 10, 10),
+            symbols={},  # no name from this window's journal
         ),
     )
 
@@ -1448,8 +1771,9 @@ def test_a_dividend_activity_is_recorded_but_never_booked_by_id() -> None:
         explanations=_explanations(activities=(_activity("act-1", "DIV", S, 4.5),)),
     )
 
-    assert result.status == "ok"
+    assert result.status == "mismatch"
     assert result.adjustments == ()
+    assert _kinds(result) == ["cash", "name_cash"]
     assert [r.activity_type for r in result.activities] == ["DIV"]
 
 
@@ -1599,7 +1923,7 @@ def test_a_stock_dividend_with_no_cash_in_lieu_halts_as_quantity() -> None:
         ),
     )
 
-    assert result.status == "mismatch"
+    assert result.status == "breaks"
     assert _kinds(result) == ["quantity"]
 
 
@@ -1890,18 +2214,29 @@ def test_exactly_one_cent_at_six_figures_passes_in_decimal() -> None:
 
 
 def test_a_dividend_beside_ten_fills_of_rounding_passes_at_the_scaled_bound() -> None:
-    """The bound in the dividend comparison (#1583, Q7): a 0.09 cash gap whose
-    0.05 is a credited dividend leaves 0.04 of per-fill rounding, inside
+    """The bound in the dividend comparison (#1583, Q7): a 0.11 cash gap whose
+    0.07 is a credited dividend leaves 0.04 of per-fill rounding, inside
     0.01 x (1 + 10/2) = 0.06; the #1290 bare 0.01 would have mismatched it."""
+    result = _run(
+        _ledger(1_000.0, fills_since_base=10, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.11,
+        explanations=_explanations(dividends={"SEC_A": 0.07}),
+    )
+
+    assert result.status == "ok"
+    assert [a.kind for a in result.adjustments] == ["dividend_cash"]
+
+
+def test_a_due_inside_the_scaled_bound_is_not_booked_for_a_larger_cash_gap() -> None:
     result = _run(
         _ledger(1_000.0, fills_since_base=10, SEC_A=10.0),
         _positions(AAA=10.0),
         1_000.09,
         explanations=_explanations(dividends={"SEC_A": 0.05}),
     )
-
-    assert result.status == "ok"
-    assert [a.kind for a in result.adjustments] == ["dividend_cash"]
+    assert _kinds(result) == ["cash"]
+    assert result.adjustments == ()
 
 
 def test_an_ended_listing_beside_ten_fills_of_rounding_passes_at_the_scaled_bound() -> None:

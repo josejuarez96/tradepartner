@@ -1233,7 +1233,9 @@ def decisions_from(
     - a full exit worth less than `risk.min_order_notional`, or a whole-share one
       below one share, is plan-time `dust` (never by the buffered-share minimum,
       ADR 0010 amendment 2026-09-30); a trade below the minimum is
-      `skip_below_minimum`, and exactly zero `skip_zero`.
+      `skip_below_minimum`, except a small-account whole-share buy is planned
+      at the minimum for the buys phase's fractionability check; exactly zero
+      is `skip_zero`.
 
     `band` (the frozen `strategy.rebalance_band`, default 0.0) suppresses a
     trade whose absolute drift from target is within the band: the planned
@@ -1543,10 +1545,13 @@ def decisions_from(
                 override_id=override_id,
             )
             continue
+        small_whole_buy = (
+            frozen.small_account.enabled and intent.side == _BUY and whole and not shorting
+        )
         rounded_up = (
             frozen.small_account.enabled
             and intent.side == _BUY
-            and not whole
+            and (not whole or small_whole_buy)
             and 0 < intent.notional < minimum
         )
         if rounded_up:
@@ -1554,6 +1559,8 @@ def decisions_from(
             # (shakedown E.3 measures fills against `planned_notional`).
             intents[key] = replace(intent, notional=minimum)
             intent = intents[key]
+        # A small-account whole-share long buy is raised to the minimum before
+        # the buys phase checks fractionability (#1848, #2308).
         if intent.notional == 0:
             decided[key] = Decision(**fields, decision=_SKIP_ZERO)
             del intents[key]
@@ -1565,7 +1572,7 @@ def decisions_from(
                 if skip in (_SKIP_NOT_BORROWABLE, _SKIP_SHORT_PRICE):
                     del intents[key]  # no order was ever to be placed
                 continue
-        elif intent.notional < minimum:
+        elif intent.notional < minimum and not small_whole_buy:
             decided[key] = Decision(**fields, decision=_SKIP_BELOW_MINIMUM)
             continue
         decided[key] = Decision(

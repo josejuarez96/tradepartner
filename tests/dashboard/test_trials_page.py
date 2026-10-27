@@ -22,6 +22,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from dashboard_nav import NavCall, nav_calls_fixture, nav_titles  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.backtest import results
@@ -270,7 +271,8 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     at = AppTest.from_file(_APP_PATH)
     at.run()
-    at.sidebar.radio[0].set_value(_PAGE).run()
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", _PAGE)
+    at.run()
     return at
 
 
@@ -287,19 +289,11 @@ def _trial_ids(at: AppTest) -> list[int]:
 
 
 def test_page_is_in_the_shell_navigation(
-    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded], nav_calls: list[NavCall]
 ) -> None:
     at = _app(monkeypatch, seeded_store[0])
     assert not at.exception
-    assert at.sidebar.radio[0].options == [
-        "Data health",
-        "Backtest",
-        _PAGE,
-        "Research",
-        "Operations",
-        "Performance",
-        "Override",
-    ]
+    assert _PAGE in nav_titles(nav_calls)
 
 
 def test_render_lists_trials_and_decisions(

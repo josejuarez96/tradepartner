@@ -1,11 +1,9 @@
 """The engine's signed book on a hand fixture (backtest spec amendment #1872, items 4 to
 7; plan T222).
 
-The `portfolio` keys are refused at registration until T223 (`PortfolioConfig`'s #1788
-guard), so these settings are built round the guard with `model_construct`, the #1820
-lock pattern. A hand fixture drives the loop through `run` with each rebalance plan's
-targets supplied by hand (T223 wires the real `long_short` plan), and every number the
-engine produces is checked against a ledger computed here by hand. Zero costs (and a
+The portfolio settings are validated through `PortfolioConfig`. A hand fixture drives
+the loop through `run` with each rebalance plan's targets supplied by hand. Every number
+the engine produces is checked against a ledger computed here by hand. Zero costs (and a
 flat price path) make the ledger exact; the fee, accrual and ruin cases add one term at a
 time.
 """
@@ -70,15 +68,14 @@ _RATE_SCHEMA = {
 
 
 def _signed(**overrides: Any) -> Settings:
-    """A `long_short` book's frozen `Settings`, built round `PortfolioConfig`'s #1788
-    guard (T223 removes it) with `model_construct`, as T217's tests step round theirs."""
+    """Validated `Settings` for a 50/50 signed book with drift covers disabled."""
     base = Settings(_env_file=None, strategy={"top_fraction": 0.5}, **overrides)
-    portfolio = PortfolioConfig.model_construct(
+    portfolio = PortfolioConfig(
         side="long_short",
         gross_exposure=1.0,
         net_exposure=0.0,
         short_min_price=5.0,
-        short_cover_weight=0.10,
+        short_cover_weight=1.0,
     )
     return base.model_copy(update={"portfolio": portfolio})
 

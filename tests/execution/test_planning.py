@@ -53,7 +53,7 @@ from tradepartner.execution.planning import (
     universe_collapse,
 )
 from tradepartner.store import journal, registry
-from tradepartner.store.db import configure_connection
+from tradepartner.store.db import configure_connection, insert_row
 from tradepartner.store.journal import (
     AdjustmentRow,
     DecisionEventRow,
@@ -67,6 +67,7 @@ from tradepartner.store.journal import (
     PaperRunRow,
     PaperWindowRow,
     RebalanceEventRow,
+    ReconciliationRow,
 )
 
 PLANNING_PY = (
@@ -1419,5 +1420,75 @@ def test_a_screened_momentum_plan_journals_no_turnover_signals_and_counts(
 H1_PAPER_ROWS = {
     "signals": (6, "31f4d58d4188196ec5fe48cde2df02d5f61ce21325a2b6cb641dbfc6dbd29f04"),
     "decisions": (5, "e2f38d001a59a863c63aedf09d7311c5e1796df3e451b6351b69b649554ae7d4"),
-    "paper_plans": (1, "c6d327ddf9ce1660fac83ba6addca3434d6a9399707bf9d51e3887f78364fc03"),
+    "paper_plans": (1, "cd35c19371b28913c9fe7a279b2cec54126710bde8aeb02e9dc3c8701d00372a"),
 }
+
+
+# --- one symbol map after a ticker change (#2185) ------------------------------------
+
+
+def _rename_spy(env: Env, *, reconciled: bool) -> None:
+    """A stored `SPY` -> `SPYX` change known at close(S-1) (the listings still
+    show `SPY`) and, when `reconciled`, the window's reconciliation on S that
+    applied it (the broker held `SPYX`)."""
+    known = session_close(T_I) - timedelta(minutes=1)
+    insert_row(
+        env.conn,
+        "symbol_changes",
+        {
+            "security_id": "SEC_SPY",
+            "old_symbol": "SPY",
+            "new_symbol": "SPYX",
+            "old_cusip": "OLD-SPY",
+            "new_cusip": "NEW-SPY",
+            "process_date": T_I,
+            "source_action_id": "rename-1",
+            "known_at": known,
+            "ingested_at": known,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
+    if not reconciled:
+        return
+    change = {"security_id": "SEC_SPY", "old_symbol": "SPY", "new_symbol": "SPYX"}
+    at = _utc(F_I, 12)
+    journal.append(
+        env.conn,
+        ReconciliationRow(
+            window_id=env.window.window_id,  # type: ignore[arg-type]
+            at=at,
+            status="ok",
+            broker_cash=STARTING_CASH,
+            mismatches_json=json.dumps({"symbol_changes": [change]}),
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+
+def test_the_plan_reads_a_renamed_held_name_under_the_symbol_reconcile_mapped(env: Env) -> None:
+    """The #2185 probe at planning: the held name's `assets` read, the one its
+    decision's flags come from, is made under `SPYX`, never the old `SPY`."""
+    _rename_spy(env, reconciled=True)
+    reads = AssetsRead(whole_share=("SPYX",))
+
+    decided = _decisions(env.plan(assets_read=reads))
+
+    assert reads.calls[0] == ["DUALA", "SPYX"]
+    assert decided["SEC_SPY"].whole_share is True  # SPYX's flag
+
+
+def test_an_ambiguous_held_name_is_not_read_and_does_not_halt_the_plan(env: Env) -> None:
+    """A change in force the run's reconciliation did not apply leaves the name
+    ambiguous: no `assets` read under `SPY`, the plan goes on for the other names,
+    and the name is planned whole-share with no flags read (the wrapper skips it)."""
+    _rename_spy(env, reconciled=False)
+    reads = AssetsRead()
+
+    decided = _decisions(env.plan(assets_read=reads))
+
+    assert all("SPY" not in call and "SPYX" not in call for call in reads.calls)
+    assert reads.calls[0] == ["DUALA"]
+    assert decided["SEC_SPY"].whole_share is True
+    assert decided["SEC_DUAL_A"].whole_share is False

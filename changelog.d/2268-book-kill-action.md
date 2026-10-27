@@ -1,0 +1,3 @@
+- T277 part 1 (#2268): `dashboard/book_actions.kill` runs `paper kill` as a subprocess on the live store only, judged by exit code alone, waited on for `ui.kill_wait_seconds`; new `ui.max_reason_chars`, `ui.kill_wait_*` keys.
+### Added
+- The Book page's kill action (`dashboard/book_actions.py`, not yet wired to the page): runs `paper kill` as a child process on the live store only, exit 0 is engaged and any other code is NOT engaged, past `ui.kill_wait_seconds` it is NOT confirmed; config keys `ui.max_reason_chars` (500), `ui.kill_wait_seconds` (default writer wait plus margin, a shorter set value refused) and `ui.kill_wait_margin_seconds` (30).

@@ -55,8 +55,15 @@ and the day it closes may hold a run or not, so neither is required (ADR 0017:
 3. **`E.3 orders`**: (duplicate) for every decision with an order in the span,
    its orders' live fills sum to at most `planned_quantity` plus the decision
    window's frozen `risk.reconcile_quantity_tolerance` (a decision with a
-   `planned_quantity`), else to at most `planned_notional` (quantity times price)
-   plus the frozen `risk.reconcile_cash_tolerance`; (mis-sized) every span
+   `planned_quantity`); for a `planned_notional` decision, keyed on each order's
+   own field (#2290, ADR 0017 correction of 2026-10-26): its orders by notional
+   fill at most `planned_notional` (quantity times price) plus the frozen
+   `risk.reconcile_cash_tolerance`, and its orders by share count fill at most
+   the shares they were sized to (`_sized_shares`) plus the quantity tolerance,
+   never judged in dollars at the fill price, and none of its orders could not
+   have come from its remainder (`_resized_orders`: written while an earlier
+   order was in flight, or any order written when the fills known before it
+   left less than the frozen `risk.min_order_notional`); (mis-sized) every span
    order's live fills sum to at most its `quantity` plus the quantity tolerance,
    else its `notional` plus the cash tolerance; (breach) no span
    `paper_run_results` row with `fault_type = 'LimitBreachError'`.
@@ -64,7 +71,8 @@ and the day it closes may hold a run or not, so neither is required (ADR 0017:
    `kill_switch` row in the span, then a scheduler-invoked run of kind
    `rebalance` or `catch_up` started before the next `released` row whose result
    is `skipped_kill_switch` and which wrote no `orders` row, then that `released`
-   row. A drilled run that wrote an `orders` row does not count and is named.
+   row. Any scheduler rebalance or catch_up run during an owner engagement
+   that wrote an `orders` row fails the line, even with another clean drill.
    Non-owner `engaged` rows in the span are printed as evidence, not required.
 5. **`E.5 journal`**: `paper check`'s `chain` and `override_reason` lines
    (`check._chain_line`, `check._override_line`, the same functions) pass for
@@ -75,15 +83,23 @@ and the day it closes may hold a run or not, so neither is required (ADR 0017:
 7. **`E.7 data`**: every `stale_data` alert in the span has a `shakedown_note`,
    and `health.health_report` at `now` is `ok` (`tradepartner health --check`'s
    rule; it reads the live `Settings` exactly as that command does).
+
+**Progress or failing** (#2298). Each line also says, structurally, whether it
+fails only on what time or the drill clears (`ShakedownLine.state`): E.1's
+session and order-session counts and a pending span, E.4 with no drill yet, and
+E.6 on a channel with no delivery attempted in the span yet are `in_progress`;
+an E.6 channel whose attempts all failed, and any other shortfall, is `failing`. The owner's queue
+(`execution.waiting`) reads that, never the printed detail.
 """
 
 from __future__ import annotations
 
 import json
+from bisect import bisect_left
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -96,7 +112,7 @@ from tradepartner.health import health_report
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
 from tradepartner.store.db import utc_now
-from tradepartner.store.journal import PaperWindowRow
+from tradepartner.store.journal import OrderRow, PaperWindowRow
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _SCHEDULER = "scheduler"
@@ -116,14 +132,25 @@ _STORE_CHANNEL = "store"
 _LIMIT_BREACH = "LimitBreachError"
 _QUANTITY_TOLERANCE = "risk.reconcile_quantity_tolerance"
 _CASH_TOLERANCE = "risk.reconcile_cash_tolerance"
+_MIN_ORDER_NOTIONAL = "risk.min_order_notional"
 #: How many failing items a line names before it says "and n more".
 _NAMED = 10
+
+#: A line's verdict for the owner's queue (#2298): `passed`; `in_progress` when it
+#: fails only on what more sessions or the drill clear; `failing` otherwise.
+LineState = Literal["passed", "in_progress", "failing"]
 
 
 @dataclass(frozen=True, kw_only=True)
 class ShakedownLine:
     """One criterion's verdict: the rows it read, its query in words, the
-    thresholds it compared against and what it found, pass or fail."""
+    thresholds it compared against and what it found, pass or fail.
+
+    `progress` names the shortfalls that only more sessions or the kill-switch
+    drill clear (E.1's session and order-session counts and a pending span, E.4's
+    missing drill, E.6's channels nothing was sent on yet); `problems` names every
+    other shortfall of a line that sets `progress`. Only E.1, E.4 and E.6 set them
+    (#2298); any other failing line is `failing` by `state`."""
 
     name: str
     passed: bool
@@ -131,6 +158,16 @@ class ShakedownLine:
     query: str
     thresholds: str
     detail: str
+    progress: tuple[str, ...] = ()
+    problems: tuple[str, ...] = ()
+
+    @property
+    def state(self) -> LineState:
+        """`passed`, `in_progress` (it fails only on `progress`) or `failing`:
+        a failing line with no `progress`, or with any `problems`, is `failing`."""
+        if self.passed:
+            return "passed"
+        return "in_progress" if self.progress and not self.problems else "failing"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -233,11 +270,12 @@ def _sessions_between(first: date, last: date) -> tuple[date, ...]:
 # --- reads ----------------------------------------------------------------------
 
 
-def _windows(conn: duckdb.DuckDBPyConnection) -> list[PaperWindowRow]:
+def _windows(conn: duckdb.DuckDBPyConnection, now: datetime) -> list[PaperWindowRow]:
     rows = conn.execute(
         "SELECT window_id, hypothesis_id, first_rebalance_session, account_id, starting_cash, "
         "starting_equity, code_version, started_at, frozen_json, frozen_sha256, book_id, "
-        "known_at, ingested_at FROM paper_windows ORDER BY window_id"
+        "known_at, ingested_at FROM paper_windows WHERE known_at <= ? ORDER BY window_id",
+        [now],
     ).fetchall()
     return [
         PaperWindowRow(
@@ -259,23 +297,25 @@ def _windows(conn: duckdb.DuckDBPyConnection) -> list[PaperWindowRow]:
     ]
 
 
-def _closed_at(conn: duckdb.DuckDBPyConnection) -> dict[int, datetime]:
+def _closed_at(conn: duckdb.DuckDBPyConnection, now: datetime) -> dict[int, datetime]:
     """Each window's first closing stop (`closed` or `abandoned`)."""
     rows = conn.execute(
         'SELECT window_id, MIN("at") FROM paper_window_stops WHERE list_contains(?, state) '
+        'AND known_at <= ? AND "at" <= ? '
         "GROUP BY window_id",
-        [list(store_journal.CLOSING_STOP_STATES)],
+        [list(store_journal.CLOSING_STOP_STATES), now, now],
     ).fetchall()
     return {int(w): at for w, at in rows}
 
 
-def _runs(conn: duckdb.DuckDBPyConnection, first_day: date) -> list[_Run]:
+def _runs(conn: duckdb.DuckDBPyConnection, first_day: date, now: datetime) -> list[_Run]:
     rows = conn.execute(
         "SELECT r.run_id, r.window_id, r.session, r.kind, r.started_at, r.invoked_by, "
         "res.status, res.fault_type FROM paper_runs r "
         "LEFT JOIN paper_run_results res ON res.run_id = r.run_id "
-        "WHERE r.session >= ? ORDER BY r.run_id",
-        [first_day],
+        "AND res.known_at <= ? AND res.finished_at <= ? "
+        "WHERE r.session >= ? AND r.known_at <= ? AND r.started_at <= ? ORDER BY r.run_id",
+        [now, now, first_day, now, now],
     ).fetchall()
     return [
         _Run(
@@ -292,18 +332,20 @@ def _runs(conn: duckdb.DuckDBPyConnection, first_day: date) -> list[_Run]:
     ]
 
 
-def _switches(conn: duckdb.DuckDBPyConnection) -> list[_Switch]:
+def _switches(conn: duckdb.DuckDBPyConnection, now: datetime) -> list[_Switch]:
     rows = conn.execute(
-        'SELECT event_id, window_id, "at", state, source FROM kill_switch ORDER BY event_id'
+        'SELECT event_id, window_id, "at", state, source FROM kill_switch '
+        'WHERE known_at <= ? AND "at" <= ? ORDER BY event_id',
+        [now, now],
     ).fetchall()
     return [_Switch(event_id=r[0], window_id=r[1], at=r[2], state=r[3], source=r[4]) for r in rows]
 
 
-def _alerts(conn: duckdb.DuckDBPyConnection, first_day: date) -> list[_Alert]:
+def _alerts(conn: duckdb.DuckDBPyConnection, first_day: date, now: datetime) -> list[_Alert]:
     rows = conn.execute(
         'SELECT alert_id, run_id, session, kind, book_id, "at" FROM alerts '
-        "WHERE session >= ? ORDER BY alert_id",
-        [first_day],
+        'WHERE session >= ? AND known_at <= ? AND "at" <= ? ORDER BY alert_id',
+        [first_day, now, now],
     ).fetchall()
     return [
         _Alert(alert_id=r[0], run_id=r[1], session=r[2], kind=r[3], book_id=r[4], at=r[5])
@@ -311,17 +353,31 @@ def _alerts(conn: duckdb.DuckDBPyConnection, first_day: date) -> list[_Alert]:
     ]
 
 
-def _noted_alerts(conn: duckdb.DuckDBPyConnection) -> set[int]:
+def _noted_alerts(conn: duckdb.DuckDBPyConnection, now: datetime) -> set[int]:
     """The alert ids every `shakedown_note` row names."""
     rows = conn.execute(
-        "SELECT values_json FROM owner_decisions WHERE kind = ?", [registry.SHAKEDOWN_NOTE_KIND]
+        "SELECT values_json FROM owner_decisions WHERE kind = ? AND made_at <= ?",
+        [registry.SHAKEDOWN_NOTE_KIND, now],
     ).fetchall()
     return {int(json.loads(r[0])["alert_id"]) for r in rows}
 
 
-def _ordered_runs(conn: duckdb.DuckDBPyConnection) -> set[int]:
+def _ordered_runs(conn: duckdb.DuckDBPyConnection, now: datetime) -> set[int]:
     """Run ids that wrote at least one `orders` row."""
-    return {int(r[0]) for r in conn.execute("SELECT DISTINCT run_id FROM orders").fetchall()}
+    return {
+        int(r[0])
+        for r in conn.execute(
+            "SELECT DISTINCT run_id FROM orders WHERE known_at <= ?", [now]
+        ).fetchall()
+    }
+
+
+def _live_fills(conn: duckdb.DuckDBPyConnection, now: datetime) -> dict[str, list[_KnownFill]]:
+    """Journal-valid fills live at `now`; hide replacement rows once known."""
+    return {
+        coid: [_KnownFill(at, quantity, price) for at, quantity, price in fills]
+        for coid, fills in store_journal.live_fills_at(conn, now).items()
+    }
 
 
 # --- the span -------------------------------------------------------------------
@@ -334,14 +390,15 @@ def _restart_events(
     result written after `after` and at or before `now`."""
     mismatches = conn.execute(
         'SELECT window_id, "at", reconciliation_id FROM reconciliations '
-        'WHERE status = ? AND "at" > ? AND "at" <= ?',
-        [_MISMATCH, after, now],
+        'WHERE status = ? AND "at" > ? AND "at" <= ? AND known_at <= ?',
+        [_MISMATCH, after, now, now],
     ).fetchall()
     halts = conn.execute(
         "SELECT r.window_id, res.finished_at, r.run_id FROM paper_run_results res "
         "JOIN paper_runs r ON r.run_id = res.run_id "
-        "WHERE res.status = ? AND res.finished_at > ? AND res.finished_at <= ?",
-        [_HALTED, after, now],
+        "WHERE res.status = ? AND res.finished_at > ? AND res.finished_at <= ? "
+        "AND res.known_at <= ? AND r.known_at <= ?",
+        [_HALTED, after, now, now, now],
     ).fetchall()
     return [
         (int(w), at, f"mismatch reconciliation {rid} ({at.isoformat()})")
@@ -352,7 +409,7 @@ def _restart_events(
 def read_span(conn: duckdb.DuckDBPyConnection, now: datetime) -> Span:
     """The span (module docstring) at `now`. `ValueError` when no `shakedown_span`
     row exists."""
-    return _read_span(conn, now, _switches(conn), _closed_at(conn))
+    return _read_span(conn, now, _switches(conn, now), _closed_at(conn, now))
 
 
 def _read_span(
@@ -361,7 +418,7 @@ def _read_span(
     switch_rows: Sequence[_Switch],
     closed: dict[int, datetime],
 ) -> Span:
-    row = registry.shakedown_span(conn)
+    row = registry.shakedown_span(conn, now=now)
     if row is None:
         raise ValueError(
             "no shakedown_span decision: open the span with "
@@ -440,6 +497,7 @@ def _brackets(switches: Iterable[_Switch]) -> list[_Bracket]:
         by_window.setdefault(s.window_id, []).append(s)
     out: list[_Bracket] = []
     for window_id, rows in by_window.items():
+        rows.sort(key=lambda s: (s.at, s.event_id))
         for index, engaged in enumerate(rows):
             if engaged.state != _ENGAGED or engaged.source != _OWNER:
                 continue
@@ -463,9 +521,44 @@ def _drill_bracket(run: _Run, brackets: Iterable[_Bracket]) -> _Bracket | None:
     )
 
 
+def _engagement_timeline(
+    switches: Iterable[_Switch],
+) -> dict[int, tuple[list[datetime], list[bool]]]:
+    """Per window, the switch times in order and whether the owner's switch
+    was engaged after each one (sorted once, so a run's lookup is a bisect)."""
+    by_window: dict[int, list[_Switch]] = {}
+    for s in switches:
+        by_window.setdefault(s.window_id, []).append(s)
+    out: dict[int, tuple[list[datetime], list[bool]]] = {}
+    for window_id, rows in by_window.items():
+        rows.sort(key=lambda s: (s.at, s.event_id))
+        times: list[datetime] = []
+        states: list[bool] = []
+        engaged = False
+        for switch in rows:
+            if switch.state == _RELEASED:
+                engaged = False
+            elif switch.state == _ENGAGED and switch.source == _OWNER:
+                engaged = True
+            times.append(switch.at)
+            states.append(engaged)
+        out[window_id] = (times, states)
+    return out
+
+
+def _owner_engaged(run: _Run, timeline: dict[int, tuple[list[datetime], list[bool]]]) -> bool:
+    """Whether the owner's switch was engaged when a scheduler run began."""
+    if run.invoked_by != _SCHEDULER or run.window_id not in timeline:
+        return False
+    times, states = timeline[run.window_id]
+    index = bisect_left(times, run.started_at)  # switches strictly before the start
+    return index > 0 and states[index - 1]
+
+
 def _sessions_line(
     conn: duckdb.DuckDBPyConnection,
     span: Span,
+    now: datetime,
     windows: Sequence[PaperWindowRow],
     closed: dict[int, datetime],
     runs: Sequence[_Run],
@@ -473,6 +566,7 @@ def _sessions_line(
     ordered: set[int],
     alerts: Sequence[_Alert],
     noted: set[int],
+    known: dict[str, list[_KnownFill]],
 ) -> ShakedownLine:
     rows = "paper_runs, paper_run_results, kill_switch, alerts, owner_decisions, orders, fills"
     query = (
@@ -486,11 +580,15 @@ def _sessions_line(
         f"(shakedown_span decision {span.decision_id})"
     )
     failures: list[str] = []
+    progress: list[str] = []
     by_note = 0
     if span.start is None:
         failures.append("span pending")
+        progress.append(f"span pending, {span.restart}")
     elif len(span.sessions) < span.sessions_needed:
         failures.append(f"{len(span.sessions)} span session(s), need >= {span.sessions_needed}")
+        progress.append(f"{len(span.sessions)} of {span.sessions_needed} sessions")
+    problems_from = len(failures)
     in_span = set(span.sessions)
     for window in windows:
         assert window.window_id is not None
@@ -538,10 +636,13 @@ def _sessions_line(
                 continue
             statuses = ", ".join(f"run {r.run_id} {r.status or 'unfinished'}" for r in mine)
             failures.append(f"book {window.book_id} window {wid} {session}: {statuses}")
-    filled = {item.fill.client_order_id for item in store_journal.fills_for(conn)}
+    problems = tuple(failures[problems_from:])
+    filled = set(known)
     filled_runs = {
         int(run_id)
-        for run_id, coid in conn.execute("SELECT run_id, client_order_id FROM orders").fetchall()
+        for run_id, coid in conn.execute(
+            "SELECT run_id, client_order_id FROM orders WHERE known_at <= ?", [now]
+        ).fetchall()
         if coid in filled
     }
     order_sessions = sorted(
@@ -555,6 +656,7 @@ def _sessions_line(
         failures.append(
             f"{len(order_sessions)} order session(s), need >= {span.order_sessions_needed}"
         )
+        progress.append(f"{len(order_sessions)} of {span.order_sessions_needed} order sessions")
     detail = (
         f"{span.describe()}; {len(order_sessions)} order session(s); "
         f"{by_note} session(s) passed by note"
@@ -568,16 +670,21 @@ def _sessions_line(
         query=query,
         thresholds=thresholds,
         detail=detail,
+        progress=tuple(progress),
+        problems=problems,
     )
 
 
 # --- E.2 ------------------------------------------------------------------------
 
 
-def _reconciliation_line(conn: duckdb.DuckDBPyConnection, span: Span) -> ShakedownLine:
+def _reconciliation_line(
+    conn: duckdb.DuckDBPyConnection, span: Span, now: datetime
+) -> ShakedownLine:
     rows = conn.execute(
         'SELECT reconciliation_id, book_id, "at", status FROM reconciliations '
-        'ORDER BY book_id, "at", reconciliation_id'
+        'WHERE known_at <= ? AND "at" <= ? ORDER BY book_id, "at", reconciliation_id',
+        [now, now],
     ).fetchall()
     failures: list[str] = []
     lagging = 0
@@ -626,20 +733,114 @@ def _frozen_tolerance(window: PaperWindowRow, key: str) -> float:
     return float(value)
 
 
+@dataclass(frozen=True)
+class _KnownFill:
+    known_at: datetime
+    quantity: float
+    price: float
+
+
+def _sized_shares(orders: Sequence[OrderRow], known: dict[str, list[_KnownFill]]) -> float:
+    """The most shares a notional decision's orders by share count may fill.
+
+    Each such order was sized to the decision's remainder from the fills known
+    when it was written, so it allows its own quantity plus the shares those
+    orders had filled by its `known_at` (a fill known strictly before it). The
+    decision may fill the largest of those. Two orders sized before either
+    filled (a duplicate) allow only one order's quantity; a remainder sized
+    after an earlier fill allows that fill plus its own quantity, whatever the
+    reference price it was converted at. A stale remainder sized after a
+    partial fill is not bounded here (no reference price is journaled);
+    `_resized_orders` catches the cases the journal can tell. A fill journaled
+    between sizing's read and the order's write counts as "before" it, which
+    can only loosen this bound.
+    """
+    coids = [o.client_order_id for o in orders]
+    budgets = [0.0]
+    for order in orders:
+        if order.quantity is None:
+            continue
+        before = sum(
+            f.quantity for coid in coids for f in known.get(coid, ()) if f.known_at < order.known_at
+        )
+        budgets.append(order.quantity + before)
+    return max(budgets)
+
+
+def _resized_orders(
+    decision_id: int,
+    orders: Sequence[OrderRow],
+    known: dict[str, list[_KnownFill]],
+    terminal_at: dict[str, datetime],
+    limit: float,
+    minimum: float,
+) -> list[str]:
+    """A notional decision's orders that its remainder could not have sized
+    (`plan.remainder`, `plan.decision_state`), over both order kinds:
+
+    - an order written while an earlier order of the decision had no terminal
+      event yet (a decision is resized only once every order is terminal);
+    - any order written when the fill value of all the decision's orders
+      known before it left less than the frozen trading minimum
+      (no remainder was left to size it from).
+    """
+    failures: list[str] = []
+    coids = [o.client_order_id for o in orders]
+    for order in orders:
+        in_flight: list[str] = []
+        for earlier in orders:
+            if earlier.known_at >= order.known_at:
+                continue
+            ended = terminal_at.get(earlier.client_order_id)
+            if ended is None or ended > order.known_at:
+                in_flight.append(earlier.client_order_id)
+        if in_flight:
+            failures.append(
+                f"order {order.client_order_id} written while order "
+                f"{', '.join(in_flight)} was in flight"
+            )
+            continue
+        value = sum(
+            f.quantity * f.price
+            for coid in coids
+            for f in known.get(coid, ())
+            if f.known_at < order.known_at
+        )
+        if value > 0 and limit - value < minimum:
+            failures.append(
+                f"order {order.client_order_id} of decision {decision_id} sized with no "
+                f"remainder ({value:.2f} of {limit:.2f} filled before it)"
+            )
+    return failures
+
+
 def _orders_line(
-    conn: duckdb.DuckDBPyConnection, span: Span, windows: dict[int, PaperWindowRow]
+    conn: duckdb.DuckDBPyConnection,
+    span: Span,
+    now: datetime,
+    windows: dict[int, PaperWindowRow],
+    known: dict[str, list[_KnownFill]],
 ) -> ShakedownLine:
     run_window = {
         int(r): int(w)
-        for r, w in conn.execute("SELECT run_id, window_id FROM paper_runs").fetchall()
+        for r, w in conn.execute(
+            "SELECT run_id, window_id FROM paper_runs WHERE known_at <= ?", [now]
+        ).fetchall()
     }
     quantity: dict[str, float] = {}
     notional: dict[str, float] = {}
-    for item in store_journal.fills_for(conn):
-        coid = item.fill.client_order_id
-        quantity[coid] = quantity.get(coid, 0.0) + item.fill.quantity
-        notional[coid] = notional.get(coid, 0.0) + item.fill.quantity * item.fill.price
-    orders = store_journal.orders_for(conn, window_id=None)
+    for coid, fills in known.items():
+        quantity[coid] = sum(f.quantity for f in fills)
+        notional[coid] = sum(f.quantity * f.price for f in fills)
+    terminal_at: dict[str, datetime] = {}
+    for event in store_journal.order_events_for(conn, window_id=None):
+        if event.known_at > now:
+            continue
+        if event.status in store_journal.TERMINAL_ORDER_STATUSES:
+            first = terminal_at.get(event.client_order_id)
+            if first is None or event.known_at < first:
+                terminal_at[event.client_order_id] = event.known_at
+    orders = [o for o in store_journal.orders_for(conn, window_id=None) if o.known_at <= now]
     in_span = [o for o in orders if o.session >= span.first_day]
 
     def tolerances(run_id: int) -> tuple[float, float]:
@@ -662,24 +863,28 @@ def _orders_line(
                 f"order {coid} filled {notional[coid]:.2f} > notional {order.notional:.2f}"
             )
     decision_ids = sorted({o.decision_id for o in in_span})
-    by_decision: dict[int, list[str]] = {}
+    by_decision: dict[int, list[OrderRow]] = {}
     for order in orders:
-        by_decision.setdefault(order.decision_id, []).append(order.client_order_id)
+        by_decision.setdefault(order.decision_id, []).append(order)
     planned = {
-        int(d): (run, pq, pn)
-        for d, run, pq, pn in conn.execute(
-            "SELECT decision_id, run_id, planned_quantity, planned_notional FROM decisions "
-            "WHERE list_contains(?, decision_id)",
-            [decision_ids],
+        int(d): (run, pq, pn, side, pos, target)
+        for d, run, pq, pn, side, pos, target in conn.execute(
+            "SELECT decision_id, run_id, planned_quantity, planned_notional, side, "
+            "position_side, target_notional FROM decisions "
+            "WHERE list_contains(?, decision_id) AND known_at <= ?",
+            [decision_ids, now],
         ).fetchall()
     }
     for decision_id in decision_ids:
         if decision_id not in planned:
             failures.append(f"decision {decision_id} has orders but no decisions row")
             continue
-        run_id, planned_quantity, planned_notional = planned[decision_id]
+        run_id, planned_quantity, planned_notional, side, position_side, target = planned[
+            decision_id
+        ]
         qty_tol, cash_tol = tolerances(run_id)
-        coids = by_decision[decision_id]
+        mine = by_decision[decision_id]
+        coids = [o.client_order_id for o in mine]
         if planned_quantity is not None:
             got = sum(quantity.get(c, 0.0) for c in coids)
             if got > planned_quantity + qty_tol:
@@ -687,19 +892,44 @@ def _orders_line(
                     f"decision {decision_id} filled {got:g} shares > planned {planned_quantity:g}"
                 )
         elif planned_notional is not None:
-            got = sum(notional.get(c, 0.0) for c in coids)
+            # #2290: keyed on each order's own field. Orders by notional are judged
+            # in dollars against the plan; orders by share count (trims, whole-share
+            # buys, short opens, partial covers) were converted at a reference price
+            # the journal does not keep, so they are judged in shares against what
+            # they were sized to (`_sized_shares`), never in dollars at the fill price.
+            by_value = [o.client_order_id for o in mine if o.quantity is None]
+            got = sum(notional.get(c, 0.0) for c in by_value)
             if got > planned_notional + cash_tol:
                 failures.append(
                     f"decision {decision_id} filled {got:.2f} > planned {planned_notional:.2f}"
                 )
+            by_shares = [o for o in mine if o.quantity is not None]
+            if by_shares:
+                shares = sum(quantity.get(o.client_order_id, 0.0) for o in by_shares)
+                sized = _sized_shares(by_shares, known)
+                if shares > sized + qty_tol:
+                    failures.append(
+                        f"decision {decision_id} filled {shares:g} shares > sized {sized:g}"
+                    )
+            # A buy's remainder is sized from its target, every other one from
+            # the plan (`plan.remainder`). Check both order kinds.
+            whole_cover = side == "buy" and position_side == "short" and target is None
+            limit = (
+                float(target)
+                if side == "buy" and not whole_cover and target is not None
+                else float(planned_notional)
+            )
+            minimum = _frozen_tolerance(windows[run_window[run_id]], _MIN_ORDER_NOTIONAL)
+            failures += _resized_orders(decision_id, mine, known, terminal_at, limit, minimum)
         else:
             got = sum(quantity.get(c, 0.0) for c in coids)
             if got > 0:
                 failures.append(f"decision {decision_id} has live fills but no planned size")
     breaches = conn.execute(
         "SELECT run_id FROM paper_run_results WHERE fault_type = ? AND finished_at >= ? "
+        "AND finished_at <= ? AND known_at <= ? "
         "ORDER BY run_id",
-        [_LIMIT_BREACH, span.start_at],
+        [_LIMIT_BREACH, span.start_at, now, now],
     ).fetchall()
     failures += [f"run {r[0]} failed with {_LIMIT_BREACH}" for r in breaches]
     detail = f"{len(in_span)} order(s) and {len(decision_ids)} decision(s) in the span"
@@ -710,11 +940,17 @@ def _orders_line(
         passed=not failures,
         rows="decisions, orders, fills (live), paper_run_results",
         query=(
-            "per span decision: its orders' live fills against planned_quantity or "
-            "planned_notional; per span order: its live fills against quantity or notional; "
+            "per span decision: its orders' live fills against planned_quantity, or "
+            "for planned_notional its notional orders' fill value against it and its "
+            "quantity orders' shares against what they were sized to, with no order "
+            "written below the frozen trading remainder minimum; "
+            "per span order: its live fills against quantity or notional; "
             "span run results with fault_type='LimitBreachError'"
         ),
-        thresholds=f"each window's frozen {_QUANTITY_TOLERANCE} and {_CASH_TOLERANCE}",
+        thresholds=(
+            f"each window's frozen {_QUANTITY_TOLERANCE}, {_CASH_TOLERANCE} "
+            f"and {_MIN_ORDER_NOTIONAL}"
+        ),
         detail=detail,
     )
 
@@ -724,6 +960,7 @@ def _orders_line(
 
 def _drill_line(
     span: Span,
+    now: datetime,
     windows: Sequence[PaperWindowRow],
     runs: Sequence[_Run],
     switches: Sequence[_Switch],
@@ -734,11 +971,19 @@ def _drill_line(
     spoiled: list[str] = []
     in_span = [s for s in switches if s.at >= span.start_at]
     books = {w.window_id: w.book_id for w in windows}
+    timeline = _engagement_timeline(switches)
     for run in runs:
-        if run.kind not in _DRILL_KINDS or _drill_bracket(run, brackets) is None:
+        if (
+            not span.start_at <= run.started_at <= now
+            or run.kind not in _DRILL_KINDS
+            or not _owner_engaged(run, timeline)
+        ):
             continue
         text = f"book {books.get(run.window_id)} run {run.run_id} on {run.session}"
-        (spoiled if run.run_id in ordered else drills).append(text)
+        if run.run_id in ordered:
+            spoiled.append(text)
+        elif _drill_bracket(run, brackets) is not None:
+            drills.append(text)
     halts = [
         f"window {s.window_id} {s.source} at {s.at.isoformat()}"
         for s in in_span
@@ -751,14 +996,18 @@ def _drill_line(
         detail += f"; real engagements (evidence): {_named(halts)}"
     return ShakedownLine(
         name="E.4 kill-switch drill",
-        passed=bool(drills),
+        passed=bool(drills) and not spoiled,
+        # no drill yet is progress; a drilled run that wrote orders is a problem
+        progress=() if drills or spoiled else ("kill-switch drill not done yet",),
+        problems=tuple(f"drilled run wrote orders: {s}" for s in spoiled),
         rows="kill_switch, paper_runs, paper_run_results, orders",
         query=(
             "in one window: an owner 'engaged' kill_switch row, then a scheduler "
             "rebalance/catch_up run with result skipped_kill_switch and no orders row, "
-            "then a 'released' row"
+            "then a 'released' row; no scheduler rebalance/catch_up run during "
+            "an owner engagement wrote orders"
         ),
-        thresholds="drill sequences >= 1",
+        thresholds="drill sequences >= 1; drilled runs with orders = 0",
         detail=detail,
     )
 
@@ -769,11 +1018,16 @@ def _drill_line(
 def _journal_line(
     conn: duckdb.DuckDBPyConnection,
     span: Span,
+    now: datetime,
     windows: Sequence[PaperWindowRow],
     closed: dict[int, datetime],
+    known: dict[str, list[_KnownFill]],
 ) -> ShakedownLine:
     failures: list[str] = []
     checked = 0
+    asof_fills = {
+        coid: [(fill.known_at, fill.quantity) for fill in fills] for coid, fills in known.items()
+    }
     for window in windows:
         wid = window.window_id
         assert wid is not None
@@ -782,8 +1036,8 @@ def _journal_line(
         checked += 1
         frozen = _frozen(window)
         for line in (
-            _chain_line(conn, wid, window_cadence(conn, window)),
-            _override_line(conn, window, wid, frozen),
+            _chain_line(conn, wid, window_cadence(conn, window), now=now, asof_fills=asof_fills),
+            _override_line(conn, window, wid, frozen, now=now),
         ):
             if not line.passed:
                 failures.append(f"book {window.book_id} window {wid} {line.name}: {line.detail}")
@@ -806,13 +1060,24 @@ def _journal_line(
 # --- E.6 ------------------------------------------------------------------------
 
 
-def _alerts_line(conn: duckdb.DuckDBPyConnection, span: Span, settings: Settings) -> ShakedownLine:
+def _alerts_line(
+    conn: duckdb.DuckDBPyConnection, span: Span, settings: Settings, now: datetime
+) -> ShakedownLine:
     channels = [c for c in settings.alerts.channels if c != _STORE_CHANNEL]
     delivered = {
         str(r[0])
         for r in conn.execute(
-            'SELECT DISTINCT channel FROM alert_deliveries WHERE ok AND "at" >= ?',
-            [span.start_at],
+            'SELECT DISTINCT channel FROM alert_deliveries WHERE ok AND "at" >= ? '
+            'AND "at" <= ? AND known_at <= ?',
+            [span.start_at, now, now],
+        ).fetchall()
+    }
+    attempted = {
+        str(r[0])
+        for r in conn.execute(
+            'SELECT DISTINCT channel FROM alert_deliveries WHERE "at" >= ? '
+            'AND "at" <= ? AND known_at <= ?',
+            [span.start_at, now, now],
         ).fetchall()
     }
     missing = [c for c in channels if c not in delivered]
@@ -826,6 +1091,10 @@ def _alerts_line(conn: duckdb.DuckDBPyConnection, span: Span, settings: Settings
         query="distinct channels with an ok=TRUE alert_deliveries row at or after the span start",
         thresholds=f"every non-store channel of alerts.channels: {', '.join(channels)}",
         detail=detail,
+        # #2298 (orchestrator, 2026-10-26): a channel nothing was sent on yet waits
+        # for traffic (progress); one whose attempts all failed is a problem
+        progress=tuple(f"no alert sent on {c} yet" for c in missing if c not in attempted),
+        problems=tuple(f"every delivery on {c} failed" for c in missing if c in attempted),
     )
 
 
@@ -839,17 +1108,22 @@ def _data_line(
     now: datetime,
     alerts: Sequence[_Alert],
     noted: set[int],
+    check_health: bool = True,
 ) -> ShakedownLine:
     unnoted = [
         f"stale_data alert {a.alert_id} (book {a.book_id}, {a.session})"
         for a in alerts
         if a.kind == _STALE_DATA and a.at >= span.start_at and a.alert_id not in noted
     ]
-    health = health_report(conn, now, settings)
     failures = list(unnoted)
-    if not health.ok:
-        failures.append(f"tradepartner health fails: {', '.join(health.failures)}")
-    detail = "every stale_data alert noted; health passes" if not failures else _named(failures)
+    if check_health:
+        health = health_report(conn, now, settings)
+        if not health.ok:
+            failures.append(f"tradepartner health fails: {', '.join(health.failures)}")
+        checked = "health passes"
+    else:
+        checked = "health not checked in this read (`tradepartner health --check`)"
+    detail = f"every stale_data alert noted; {checked}" if not failures else _named(failures)
     return ShakedownLine(
         name="E.7 data",
         passed=not failures,
@@ -868,33 +1142,40 @@ def shakedown(
     settings: Settings,
     *,
     now: datetime | None = None,
+    check_health: bool = True,
 ) -> Shakedown:
     """`paper shakedown` (ADR 0017 part E): the span and the seven lines over every
     book, reading only. Raises `ValueError` when no `shakedown_span` row exists or
-    a window's `frozen_json` lacks a tolerance key E.3 needs."""
+    a window's `frozen_json` lacks a tolerance key E.3 needs. `check_health=False`
+    leaves E.7's `health_report` half out (the owner's queue, #2298: that report
+    reads every fact table, too slow for a page read); E.7 then judges the notes
+    only and says so."""
     at = utc_now() if now is None else now
-    switches = _switches(conn)
-    closed = _closed_at(conn)
+    switches = _switches(conn, at)
+    closed = _closed_at(conn, at)
     span = _read_span(conn, at, switches, closed)
     # only drills engaged and released inside the span count, in E.1 and E.4 alike
     brackets = [
         b for b in _brackets(switches) if b.engaged.at >= span.start_at and b.released.at <= at
     ]
-    windows = _windows(conn)
-    runs = _runs(conn, span.first_day)
-    alerts = _alerts(conn, span.first_day)
-    noted = _noted_alerts(conn)
-    ordered = _ordered_runs(conn)
+    windows = _windows(conn, at)
+    runs = _runs(conn, span.first_day, at)
+    alerts = _alerts(conn, span.first_day, at)
+    noted = _noted_alerts(conn, at)
+    ordered = _ordered_runs(conn, at)
+    known = _live_fills(conn, at)
     by_id = {w.window_id: w for w in windows if w.window_id is not None}
     return Shakedown(
         span=span,
         lines=(
-            _sessions_line(conn, span, windows, closed, runs, brackets, ordered, alerts, noted),
-            _reconciliation_line(conn, span),
-            _orders_line(conn, span, by_id),
-            _drill_line(span, windows, runs, switches, brackets, ordered),
-            _journal_line(conn, span, windows, closed),
-            _alerts_line(conn, span, settings),
-            _data_line(conn, span, settings, at, alerts, noted),
+            _sessions_line(
+                conn, span, at, windows, closed, runs, brackets, ordered, alerts, noted, known
+            ),
+            _reconciliation_line(conn, span, at),
+            _orders_line(conn, span, at, by_id, known),
+            _drill_line(span, at, windows, runs, switches, brackets, ordered),
+            _journal_line(conn, span, at, windows, closed, known),
+            _alerts_line(conn, span, settings, at),
+            _data_line(conn, span, settings, at, alerts, noted, check_health),
         ),
     )

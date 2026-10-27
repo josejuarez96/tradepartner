@@ -166,6 +166,20 @@ def test_parse_plan_reads_ids_titles_deps_owner_and_phase() -> None:
     assert tasks["T5"].phase == 2
 
 
+def test_task_ref_regex_requires_whole_task_id_boundaries() -> None:
+    assert team.TASK_REF_RE.findall("T266a12") == []
+    assert team.TASK_REF_RE.findall("xT241") == []
+    assert team.TASK_REF_RE.findall("T241 T171d T266a1 (T241) T281/T282 T241,") == [
+        "T241",
+        "T171d",
+        "T266a1",
+        "T241",
+        "T281",
+        "T282",
+        "T241",
+    ]
+
+
 def test_task_brief_prints_the_task_line_and_its_dependencies_with_locations() -> None:
     tasks = team.parse_plan(PLAN, "docs/plans/data-foundation.md")
     by_id = {t.id: t for t in tasks}
@@ -894,3 +908,100 @@ def test_prune_dry_run_by_default_and_removes_with_yes(
     assert not (base / "guilo").exists()
     assert (base / "busy").is_dir()
     assert "removed 1" in capsys.readouterr().out
+
+
+def test_a_merged_fragment_naming_the_task_counts_as_done_before_the_fold(root: Path) -> None:
+    """#2280: a build PR names its task in its fragment instead of ticking the plan; on the
+    ref that fragment is the tick, so dependants are ready before any fold."""
+    git = ["git", "-C", str(root), "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
+    (root / "changelog.d").mkdir()
+    (root / "changelog.d" / "README.md").write_text("task: T8b (PR #1)\n")  # docs, not a fragment
+    (root / "changelog.d" / "22-universe.md").write_text("task: T5 (PR #23)\n- s\n")
+    (root / "changelog.d" / "old").mkdir()  # not a fragment: fragments live at the top level
+    (root / "changelog.d" / "old" / "9-x.md").write_text("task: T8b (PR #9)\n")
+    subprocess.run([*git, "add", "docs", "changelog.d"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "docs: plan and a merged fragment"], check=True)
+    done = {t.id: t.done for t in team.load_tasks(root, "HEAD")}
+    assert done["T5"] is True
+    assert done["T8b"] is False
+    # The working tree is not the ref: an unmerged fragment opens nothing.
+    (root / "changelog.d" / "30-other.md").write_text("task: T8b (PR #31)\n")
+    assert {t.id: t.done for t in team.load_tasks(root, "HEAD")}["T8b"] is False
+
+
+def test_fragment_task_ids_reads_task_lines() -> None:
+    lines = ["task: T5 (PR #23)", "task: T8b (PR #9)", "- task: T7 (PR #1)", "task: T9"]
+    assert team.fragment_task_ids(lines) == frozenset({"T5", "T8b"})
+
+
+# ── letter-digit task ids (#2282): T266a1, T266a2 ───────────────────────────────
+
+# The shape docs/plans/paper-trading.md uses, beside the ids that already parsed: a
+# letter suffix and a digit after it (T266a1), a bare id (T241) and a letter (T171d).
+SUFFIX_PLAN = """# Plan: Paper trading (Phase 5)
+
+## Tasks
+- [x] **T241: Backtest half, done.** Files: `src/a.py` · Depends on: n/a · Review: qa.
+- [ ] **T171d: Letter suffix.** Files: `src/b.py` · Depends on: T241 · Review: qa.
+- [ ] **T266a1: Marked pre-migration backup.** Files: `src/c.py` · Depends on: T241 · Review: qa.
+- [ ] **T266a2: `migrate(settings)`.** Files: `src/d.py` · Depends on: T266a1 · Review: qa.
+"""
+
+
+def test_a_letter_digit_id_is_a_plan_task_and_its_dependants_resolve() -> None:
+    tasks = team.parse_plan(SUFFIX_PLAN, "docs/plans/paper-trading.md")
+    assert [t.id for t in tasks] == ["T241", "T171d", "T266a1", "T266a2"]
+    by_id = {t.id: t for t in tasks}
+    # T266a2's dependency is read as a task, not as free text (the #2282 symptom).
+    assert by_id["T266a2"].depends_on == ("T266a1",)
+    assert "not a plan task" not in team.task_brief(by_id["T266a2"], tasks)
+    # T266a1 is ready (T241 is done); its dependant is not.
+    assert [t.id for t in team.ready_tasks(tasks)] == ["T171d", "T266a1"]
+
+
+def test_the_id_shape_and_sort_cover_letter_digit_ids_and_the_older_ones() -> None:
+    assert all(team.TASK_ID_RE.match(i) for i in ("T241", "T171d", "T266a1", "T266a2"))
+    assert not team.TASK_ID_RE.match("T266a1b")
+    assert team.task_from_title("T266a1: marked backup") == "T266a1"
+    assert team.task_from_title("T171d: letter suffix") == "T171d"
+    # A letter-digit id sorts beside its siblings, not off the end of the list.
+    assert team.task_sort_key("T266a1") == (266, "a1")
+    assert sorted(["T266a2", "T241", "T266a1", "T171d"], key=team.task_sort_key) == [
+        "T171d",
+        "T241",
+        "T266a1",
+        "T266a2",
+    ]
+    assert team.merged_task_ids(
+        ["feat(store): marked backup (T266a1) (#2161)", "feat(data): x (T171d) (#1)"]
+    ) == frozenset({"T266a1", "T171d"})
+    assert team.fragment_task_ids(["task: T266a1 (PR #2161)", "task: T241 (PR #1)"]) == frozenset(
+        {"T266a1", "T241"}
+    )
+    assert team.suggest_branch(team.Issue(2160, "T266a1: Marked pre-migration backup", ())) == (
+        "feat/2160-marked-pre-migration-backup"
+    )
+
+
+def test_claim_a_letter_digit_task_and_a_merged_fragment_unblocks_its_dependant(
+    root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2282: `claim T266a1` resolves, and a merged fragment naming it opens T266a2."""
+    (root / "docs" / "plans" / "paper-trading.md").write_text(SUFFIX_PLAN)
+    gh = FakeGitHub()
+    assert team.cmd_claim(gh, root, "T266a1") == 0
+    assert gh.list_issues("task:T266a1")[0].title == "T266a1: Marked pre-migration backup"
+    capsys.readouterr()
+    with pytest.raises(SystemExit, match="not ready"):
+        team.cmd_claim(gh, root, "T266a2")
+
+    git = ["git", "-C", str(root), "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
+    (root / "changelog.d").mkdir()
+    (root / "changelog.d" / "2160-backup.md").write_text("task: T266a1 (PR #2161)\n- s\n")
+    subprocess.run([*git, "add", "docs", "changelog.d"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "feat(store): backup (T266a1) (#2161)"], check=True)
+    tasks = team.load_tasks(root, "HEAD")
+    assert {t.id: t.done for t in tasks}["T266a1"] is True
+    assert "T266a2" in [t.id for t in team.ready_tasks(tasks)]

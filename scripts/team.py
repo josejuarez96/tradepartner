@@ -7,7 +7,9 @@ end over the ``gh`` CLI. Pure logic (plan parsing, readiness, claim resolution) 
 I/O so it can be unit-tested; every GitHub call goes through the ``GitHub`` protocol.
 
 Plans are read from ``origin/main`` (after a fetch), never from the working tree, so a
-checkbox ticked inside an unmerged PR does not make the next task look ready.
+task finished inside an unmerged PR does not make the next task look ready. On that ref a
+task counts as done when its line is ticked, its code PR is squash-merged (#1130), or a
+merged ``changelog.d/`` fragment names it (``task: Tn (PR #n)``, #2280).
 
 Usage. A new session runs ``start`` once from the main checkout, then works only inside the
 directory it prints (a git worktree outside the repo, so other teams' files stay out of view)::
@@ -48,14 +50,16 @@ TEAMS_DIR_ENV = "TRADEPARTNER_TEAMS_DIR"
 PLAN_REF_ENV = "TRADEPARTNER_PLAN_REF"
 DEFAULT_PLAN_REF = "origin/main"
 TEAM_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,19}$")
-TASK_ID_RE = re.compile(r"^T\d+[a-z]?$")
-TASK_REF_RE = re.compile(r"T\d+[a-z]?")
+# A task id: `T<n>`, an optional letter and an optional digit after it (T241, T171d,
+# T266a1; #2282).
+TASK_ID_RE = re.compile(r"^T\d+[a-z]?\d?$")
+TASK_REF_RE = re.compile(r"\bT\d+[a-z]?\d?\b")
 TASK_LINE_RE = re.compile(
-    r"^- \[(?P<done>[ x])\] \*\*(?P<id>T\d+[a-z]?)(?P<owner> \(owner\))?: (?P<title>.*?)\*\*"
+    r"^- \[(?P<done>[ x])\] \*\*(?P<id>T\d+[a-z]?\d?)(?P<owner> \(owner\))?: (?P<title>.*?)\*\*"
 )
-TITLE_TASK_RE = re.compile(r"^(T\d+[a-z]?)\s*[:(]")
+TITLE_TASK_RE = re.compile(r"^(T\d+[a-z]?\d?)\s*[:(]")
 DEPENDS_RE = re.compile(r"Depends on:\s*([^·]+)")
-TASK_ID_SORT_RE = re.compile(r"^T(\d+)([a-z]*)$")
+TASK_ID_SORT_RE = re.compile(r"^T(\d+)([a-z]*\d?)$")
 FILES_SEGMENT_RE = re.compile(r"Files:\s*(?P<seg>[^·]*)")
 FILE_TOKEN_RE = re.compile(r"`([^`]+)`")
 FILE_EXTENSIONS = (
@@ -234,8 +238,9 @@ def build_plan_graph(tasks: Sequence[Task]) -> PlanGraph:
 
 def task_sort_key(task_id: str) -> tuple[int, str]:
     """Numeric-aware sort key for a task id (#389 code review): T10 sorts after T2, not
-    before it as a plain string sort would. Ids that don't match ``T<n><letter?>`` sort
-    last, by their own text, so the key stays total and deterministic.
+    before it as a plain string sort would. Ids that don't match
+    ``T<n><letter?><digit?>`` sort last, by their own text, so the key stays total and
+    deterministic.
     """
     m = TASK_ID_SORT_RE.match(task_id)
     if not m:
@@ -564,7 +569,7 @@ def slugify(title: str, max_words: int = 4) -> str:
 
 def suggest_branch(issue: Issue) -> str:
     prefix = next((p for lb, p in TYPE_TO_PREFIX.items() if lb in issue.labels), "feat")
-    title = re.sub(r"^T\d+[a-z]?(\s*\(owner\))?:\s*", "", issue.title)
+    title = re.sub(r"^T\d+[a-z]?\d?(\s*\(owner\))?:\s*", "", issue.title)
     return f"{prefix}/{issue.number}-{slugify(title)}"
 
 
@@ -761,7 +766,7 @@ def read_plans(root: Path, ref: str | None) -> dict[str, str]:
 # A squash-merged code PR's subject on main: `feat(scope): title (Tn) (#pr)`. Plan, spec and
 # process edits (`docs`, `chore(process)` ...) name task ids too, so only code types count.
 MERGED_TASK_RE = re.compile(
-    r"^(?:feat|fix|test|refactor|perf)(?:\([^)]*\))?!?: .* \((T\d+[a-z]?)\) \(#\d+\)$"
+    r"^(?:feat|fix|test|refactor|perf)(?:\([^)]*\))?!?: .* \((T\d+[a-z]?\d?)\) \(#\d+\)$"
 )
 
 
@@ -770,16 +775,42 @@ def merged_task_ids(subjects: Iterable[str]) -> frozenset[str]:
     return frozenset(m.group(1) for s in subjects if (m := MERGED_TASK_RE.match(s)))
 
 
+# A fragment's plan-task line (#2280), the shape `scripts/fragments.py` writes and parses.
+FRAGMENT_TASK_RE = re.compile(r"^task: (T\d+[a-z]?\d?) \(PR #\d+\)$")
+
+
+def fragment_task_ids(lines: Iterable[str]) -> frozenset[str]:
+    """Task ids named by fragment ``task: Tn (PR #n)`` lines (#2280)."""
+    return frozenset(m.group(1) for ln in lines if (m := FRAGMENT_TASK_RE.match(ln.strip())))
+
+
+def _ref_fragment_lines(root: Path, ref: str) -> list[str]:
+    """The ``task:`` lines of the fragments under ``changelog.d/`` on ``ref``."""
+    out = subprocess.run(
+        [
+            *("git", "-C", str(root), "grep", "-h", "-E", "^task: ", ref, "--"),
+            *(":(glob)changelog.d/*.md", ":(exclude)changelog.d/README.md"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode not in (0, 1):  # 1: no match
+        raise SystemExit(f"cannot read changelog.d from {ref}: {out.stderr.strip()}")
+    return out.stdout.splitlines()
+
+
 def load_tasks(root: Path, ref: str | None) -> list[Task]:
     """Plan tasks from `ref` (or the working tree). On a ref, a task whose code PR is merged
-    there counts as done even before a fold ticks its box (#1130), so its dependants are
-    ready and the task itself is not offered again."""
+    there counts as done even before a fold ticks its box (#1130), as does a task a merged
+    fragment names (#2280: build PRs no longer tick the plan), so its dependants are ready
+    and the task itself is not offered again."""
     tasks: list[Task] = []
     for name, text in read_plans(root, ref).items():
         tasks.extend(parse_plan(text, name))
     if ref is None:
         return tasks
     merged = merged_task_ids(_git(root, "log", "--format=%s", ref).splitlines())
+    merged |= fragment_task_ids(_ref_fragment_lines(root, ref))
     return [replace(t, done=True) if t.id in merged and not t.done else t for t in tasks]
 
 

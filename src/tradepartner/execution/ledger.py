@@ -7,7 +7,7 @@ session `through`:
 
 - **Positions** per `security_id` come from the live fills (`store.journal.fills_for`,
   so a superseded fill is never counted twice) and the journaled adjustments
-  (`carried_residue`, `spinoff_receipt`, `corporate_action_cash`,
+  (`carried_residue`, `spinoff_receipt`, `merger_receipt`, `corporate_action_cash`,
   `dividend_cash`) dated on or before `through`, each split-adjusted by the
   splits in `actions_as_of` whose ex-date falls after the row's own date and
   on or before `through`. The caller reads `actions_as_of` with

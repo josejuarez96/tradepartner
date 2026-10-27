@@ -68,8 +68,8 @@ SIZE_BUDGETS_KB: Mapping[str, float] = {
 }
 
 OPEN_TASK_RE = re.compile(r"^- \[ \] ")
-TASK_DEF_RE = re.compile(r"^- \[[ x]\] \*\*(T\d+[a-z]?)[ :(*]")
-TASK_REF_RE = re.compile(r"\bT[1-9]\d*[a-z]?\b")
+TASK_DEF_RE = re.compile(r"^- \[[ x]\] \*\*(T\d+[a-z]?\d?)[ :(*]")
+TASK_REF_RE = re.compile(r"\bT[1-9]\d*[a-z]?\d?\b")
 ADR_REF_RE = re.compile(r"\bADR[ -]?(\d{1,4})\b")
 ADR_FILE_RE = re.compile(r"^(\d{4})-")
 REQ_REF_RE = re.compile(r"\breq (\d+)\b")

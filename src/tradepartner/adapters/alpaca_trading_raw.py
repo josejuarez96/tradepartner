@@ -20,7 +20,8 @@ The EDGAR client pattern: requests are paced at `alpaca.trading_requests_per_min
 time out after `alpaca.trading_request_timeout_seconds`, and a timeout, a connection error or a
 429/500/502/503/504 (the SDK's own retry codes plus the 5xx an outage returns, whose
 internal retry is switched off) is retried
-`alpaca.trading_max_retries` times, then raised. `submit_order` requires a
+`alpaca.trading_max_retries` times with capped exponential backoff, then raised.
+`submit_order` requires a
 `client_order_id`, so the broker refuses a second order with it; when a retry of a
 submit is refused as a duplicate (422 with Alpaca code 40010001, recorded in
 `duplicate_client_order_id.json`), the first attempt landed, and the order is read
@@ -309,6 +310,8 @@ class AlpacaTradingRaw:
         self.clock: PacingClock = clock or SystemPacingClock()
         self._interval = 60.0 / alpaca.trading_requests_per_minute
         self._max_retries = alpaca.trading_max_retries
+        self._retry_backoff = alpaca.trading_retry_backoff_seconds
+        self._retry_backoff_max = alpaca.trading_retry_backoff_max_seconds
         self._last: float | None = None
         self._lock = threading.Lock()
 
@@ -322,6 +325,7 @@ class AlpacaTradingRaw:
 
     def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
         retried = False
+        backoff = min(self._retry_backoff, self._retry_backoff_max)
         for attempt in range(self._max_retries + 1):
             self._pace()
             try:
@@ -334,6 +338,8 @@ class AlpacaTradingRaw:
             if not again:
                 raise AlpacaTradingError(status_code, body, retried=retried)
             retried = True
+            self.clock.sleep(backoff)
+            backoff = min(backoff * 2, self._retry_backoff_max)
         raise AssertionError("unreachable")  # pragma: no cover
 
     def submit_order(self, request: OrderRequest) -> Any:

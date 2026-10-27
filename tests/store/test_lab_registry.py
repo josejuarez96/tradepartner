@@ -817,6 +817,9 @@ _CALLS: dict[str, Callable[[duckdb.DuckDBPyConnection], object]] = {
         sr_star_annual_at_end=0.0,
         completed=False,
     ),
+    "sweep_runs_after": lambda c: lab_registry.sweep_runs_after(c, 1, 0),
+    "open_sweep_runs": lab_registry.open_sweep_runs,
+    "sweep_run_trials": lambda c: lab_registry.sweep_run_trials(c, 1),
     "write_sweep_trial": lambda c: lab_registry.write_sweep_trial(
         c, sweep_run_id=1, trial_id=1, read_group_index=0, seconds=0.0
     ),

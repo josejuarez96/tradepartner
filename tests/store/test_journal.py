@@ -45,7 +45,18 @@ MODULE = Path(journal.__file__)
 _NOW = datetime(2026, 10, 1, 21, 0, tzinfo=UTC)
 _SESSION = date(2026, 10, 1)
 #: Nullable columns a valid sample row still needs (a position row names its security).
-_SAMPLE_EXTRAS: dict[str, dict[str, Any]] = {"positions_daily": {"security_id": "SEC_A"}}
+_SAMPLE_EXTRAS: dict[str, dict[str, Any]] = {
+    "positions_daily": {"security_id": "SEC_A"},
+    # An `opened` break names its name, its reconciliation and its cause, its id
+    # is derived from them, and an unpriced break is material (schema version 37).
+    "reconcile_breaks": {
+        "break_id": "1:SEC_A:1",
+        "security_id": "SEC_A",
+        "reconciliation_id": 1,
+        "cause": "unattributed",
+        "material": True,
+    },
+}
 #: The closed enums plus `signals.reason`'s closed part (its own prefix `CHECK`
 #: since version 14, #1153), so a sample row takes a value its `CHECK` accepts.
 _ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
@@ -136,7 +147,7 @@ def test_fills_is_selected_only_inside_the_accessor_and_all_fill_ids() -> None:
         if isinstance(node, ast.Expr | ast.Assign)
         and isinstance(getattr(node, "value", None), ast.Constant)
     ]
-    assert readers == {"fills_for", "all_fill_ids"}
+    assert readers == {"fills_for", "all_fill_ids", "all_fill_terms", "live_fills_at"}
     assert not any(
         re.search(r"\b(FROM|JOIN)\s+fills\b", str(getattr(c, "value", ""))) for c in top_level
     )

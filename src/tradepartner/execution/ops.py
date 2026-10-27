@@ -30,6 +30,21 @@ performance card: the window's equity from the base session B, SPY total return,
 report`'s tracking count and the latest report row's trial line. It writes nothing and
 opens no trial; `None` for a book with no window.
 
+**Waiting on the owner** (plan T256, amendment 2026-10-20 #2096, item 1).
+`waiting_on_owner(conn, settings, now)` is the "waiting on me" read: for every book
+with an open window (`book_ids`, then that book's latest window, skipped when
+`_is_open` says it is closed), the rows `execution.waiting.build` needs, then the
+open shakedown span's alerts. It honours `now` (never the wall clock) and stays
+narrow: it never calls `page_data`, `_summary`, `book_summaries` or
+`performance_data`, and reads only the aggregates `waiting.py`'s kinds name. It
+writes nothing, opens no trial and calls no broker method. While a span is open it
+also runs `shakedown.shakedown` over the same connection at `now` (#2298), with
+E.7's `health_report` half left out (it reads every fact table; `paper
+shakedown` and `tradepartner health --check` still run it), so a failing line is
+a `shakedown_failing` item on the same read, with no write and no scheduler step.
+`owner_queue` returns the items and the span's progress words (`paper status
+--all`) from that one read.
+
 **Journal not initialised.** A version-4 store no write has migrated yet
 raises `store.journal.JournalNotInitialised` from the first read; this module
 catches it and returns an `OpsData` with `journal_not_initialised=True` and
@@ -105,6 +120,7 @@ of the bounded reads above.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -115,13 +131,23 @@ import duckdb
 
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.schedule import rebalance_sessions
-from tradepartner.calendar import is_session, previous_session, session_close
+from tradepartner.calendar import (
+    all_sessions,
+    is_session,
+    last_completed_session,
+    previous_session,
+    session_close,
+)
 from tradepartner.config import Cadence, Settings
-from tradepartner.execution import lock, performance
+from tradepartner.execution import lock, performance, shakedown, waiting
 from tradepartner.execution.marks import equity_at
 from tradepartner.execution.plan import stop_session as stop_session_of_request
+from tradepartner.execution.reconcile import OVERDUE_DELISTING_CASH
+from tradepartner.execution.reconcile_run import allowed_of, frozen_risk, is_delisting_cash
 from tradepartner.execution.switch import FAULTED_RUN_STATUSES, SwitchState, derive
 from tradepartner.execution.window import window_cadence
+from tradepartner.ingest import MODE as INGEST_MODE
+from tradepartner.ingest import OK as INGEST_OK
 from tradepartner.store import journal, registry
 from tradepartner.store.asof import adjusted_prices_as_of
 from tradepartner.store.benchmarks import BenchmarkIdentityError, benchmark_security_ids
@@ -146,18 +172,24 @@ from tradepartner.store.journal import (
     SignalRow,
 )
 from tradepartner.store.schema import DEFAULT_BOOK_ID, SchemaVersionError
+from tradepartner.timeutil import ensure_tz_aware_utc
 
 __all__ = [
     "BookSummary",
     "ChainStep",
+    "EdgarAge",
     "OpsData",
     "OrderChain",
+    "OverdueDelisting",
+    "OwnerQueue",
     "PerformanceData",
     "RankedSignal",
     "book_ids",
     "book_summaries",
+    "owner_queue",
     "page_data",
     "performance_data",
+    "waiting_on_owner",
 ]
 
 _NEW_YORK = ZoneInfo("America/New_York")
@@ -165,6 +197,9 @@ _NEW_YORK = ZoneInfo("America/New_York")
 #: How far ahead `_next_rebalance_session` looks: the slowest cadence, `month_end`,
 #: has a rebalance session within two calendar months of any day.
 _REBALANCE_SEARCH = timedelta(days=62)
+
+#: The `ingestion_runs.source` of the EDGAR master's daily run (`ingest.SOURCES`).
+_EDGAR_SOURCE = "edgar"
 
 #: Deterministic tie-break for steps sharing a `known_at` in one order's chain.
 _STEP_ORDER: dict[str, int] = {"order": 0, "order_event": 1, "fill": 2, "outcome": 3}
@@ -222,6 +257,50 @@ class OrderChain:
 
 
 @dataclass(frozen=True)
+class OverdueDelisting:
+    """A delisted holding the broker removed whose cash never arrived (#411): shown
+    by `paper status` and the operations page from the rows already stored (the
+    reconciliation's `overdue delisting cash` entry, no `delisting_cash` row)."""
+
+    book_id: str
+    security_id: str
+    symbol: str
+    since: date
+
+    @property
+    def line(self) -> str:
+        """The one line both surfaces show."""
+        return (
+            f"{self.symbol}: delisting cash overdue since {self.since.isoformat()}"
+            " \u2014 check Alpaca's activity"
+        )
+
+
+NO_EDGAR_INGEST_LINE = "no successful EDGAR ingest yet; run `tradepartner ingest`"
+
+
+@dataclass(frozen=True)
+class EdgarAge:
+    """The EDGAR master has not refreshed for `sessions` sessions (#2197): shown by
+    `paper status` and the operations page from the stored `ingestion_runs` rows,
+    display only (no alert, no waiting item, no refusal; paper keeps trading)."""
+
+    sessions: int
+    #: None when no `ok` daily EDGAR ingest run is stored (#2254).
+    last_ok_session: date | None
+
+    @property
+    def line(self) -> str:
+        """The one line every surface shows."""
+        if self.last_ok_session is None:
+            return NO_EDGAR_INGEST_LINE
+        return (
+            f"EDGAR data {self.sessions} sessions old (last ok ingest covered "
+            f"{self.last_ok_session.isoformat()}); check the ingest run (`tradepartner ingest`)"
+        )
+
+
+@dataclass(frozen=True)
 class OpsData:
     """Everything the operations page and `paper status` (T67) show, computed
     once over a read-only connection."""
@@ -254,6 +333,8 @@ class OpsData:
     alerts: tuple[AlertRow, ...] = field(default_factory=tuple)
     alerts_capped: bool = False
     reconciliation: ReconciliationRow | None = None
+    overdue_delisting: tuple[OverdueDelisting, ...] = field(default_factory=tuple)
+    edgar_age: EdgarAge | None = None
 
 
 @dataclass(frozen=True)
@@ -907,7 +988,103 @@ def page_data(
         alerts=alerts,
         alerts_capped=alerts_capped,
         reconciliation=reconciliation,
+        overdue_delisting=_overdue_delisting(conn, book, window_id),
+        edgar_age=edgar_age(conn, settings, utc_now()),
     )
+
+
+def edgar_age(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime
+) -> EdgarAge | None:
+    """The EDGAR data age (#2197) when it reaches `ingest.edgar_max_age_sessions`:
+    the XNYS sessions after the session the latest `ok` daily EDGAR ingest run
+    covered (the last session closed when it finished), up to the last session
+    closed at `now`. None below the limit. With no `ok` run stored it is an
+    `EdgarAge` with no covered session (#2254), so a never-ingested store is not silent.
+    Runs finished after `now` are not yet known and are ignored.
+    Reads only the stored rows (the trading calendar, never
+    weekdays)."""
+    row = conn.execute(
+        "SELECT max(finished_at) FROM ingestion_runs "
+        "WHERE status = ? AND source = ? AND mode = ? AND finished_at <= ?",
+        [INGEST_OK, _EDGAR_SOURCE, INGEST_MODE, now],
+    ).fetchone()
+    if row is None or row[0] is None:
+        return EdgarAge(0, None)
+    covered = last_completed_session(ensure_tz_aware_utc(row[0], field_name="finished_at"))
+    current = last_completed_session(ensure_tz_aware_utc(now, field_name="now"))
+    calendar = all_sessions()
+    sessions = bisect_right(calendar, current) - bisect_right(calendar, covered)
+    if sessions < settings.ingest.edgar_max_age_sessions:
+        return None
+    return EdgarAge(sessions, covered)
+
+
+def _overdue_delisting(
+    conn: duckdb.DuckDBPyConnection, book_id: str, window_id: int
+) -> tuple[OverdueDelisting, ...]:
+    """The window's delisted holdings flagged overdue and still unpaid: a
+    reconciliation recorded `overdue delisting cash` for the name, and no
+    `delisting_cash` or merger row has journaled cash for it since. Reads only
+    what is stored (#411)."""
+    journal.require_journal(conn)
+    texts = conn.execute(
+        "SELECT mismatches_json FROM reconciliations WHERE window_id = ? "
+        "AND mismatches_json LIKE ?",
+        [window_id, f"%{OVERDUE_DELISTING_CASH}%"],
+    ).fetchall()
+    flagged = {
+        str(m["security_id"])
+        for (text,) in texts
+        for m in allowed_of(text)
+        if m.get("reason") == OVERDUE_DELISTING_CASH and m.get("security_id") is not None
+    }
+    if not flagged:
+        return ()
+    adjustments = journal.adjustments_for(conn, window_id)
+    resolved = {
+        a.security_id
+        for a in adjustments
+        if a.kind == "corporate_action_cash"
+        and a.security_id is not None
+        and (
+            (a.explanation_json is not None and "merger_id" in a.explanation_json)
+            or is_delisting_cash(a)
+        )
+    }
+    symbols = {o.security_id: o.symbol for o in journal.orders_for(conn, window_id=window_id)}
+    found: list[OverdueDelisting] = []
+    for name in sorted(flagged - resolved):
+        removals = [
+            a
+            for a in adjustments
+            if a.kind == "corporate_action_cash"
+            and a.security_id == name
+            and a.quantity is not None
+            and a.quantity < 0
+        ]
+        if removals:
+            since = max(a.session for a in removals)
+            found.append(OverdueDelisting(book_id, name, symbols.get(name, name), since))
+    return tuple(found)
+
+
+def overdue_delisting_cash(
+    conn: duckdb.DuckDBPyConnection,
+) -> tuple[OverdueDelisting, ...]:
+    """Every open book's overdue delisting cash (#411), in book order; empty on a
+    store with no journal. Reads only."""
+    try:
+        books = book_ids(conn)
+    except JournalNotInitialised:
+        return ()
+    found: list[OverdueDelisting] = []
+    for book in books:
+        window = journal.latest_window(conn, book)
+        if window is None or window.window_id is None or not _is_open(conn, window.window_id):
+            continue
+        found.extend(_overdue_delisting(conn, book, window.window_id))
+    return tuple(found)
 
 
 def book_ids(conn: duckdb.DuckDBPyConnection) -> tuple[str, ...]:
@@ -1282,3 +1459,186 @@ def performance_data(
         trial_index=tuple(performance.rebase(dict(trial_rows), base_value)) if trial_rows else (),
         trial_error=trial_error,
     )
+
+
+# --- waiting on the owner (plan T256) ---------------------------------------------
+
+
+def _waiting_switch(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, book: str, window: PaperWindowRow
+) -> waiting.SwitchFacts:
+    """`switch.derive` over the bounded rows, exactly as `_summary` calls it."""
+    assert window.window_id is not None
+    rows = _kill_switch_rows_for(conn, window.window_id)
+    released_at = max((r.at for r in rows if r.state == "released"), default=None)
+    runs = _runs_for_switch(conn, window.window_id, released_at=released_at)
+    state = derive(
+        window,
+        rows,
+        [rw.run for rw in runs],
+        [rw.result for rw in runs if rw.result is not None],
+        reading_run=None,
+        lock_free=_lock_free(settings, book),
+    )
+    return waiting.SwitchFacts(window=window, state=state, kill_switch_rows=rows, runs=tuple(runs))
+
+
+def _waiting_lag(
+    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, s_minus_1: date
+) -> waiting.LagFacts:
+    """The window's frozen risk (always read, so an unreadable `frozen_json` shows
+    as `unreadable` even with no order open), its non-terminal orders and, only
+    when one is open, its reconciliations for `collect.lag_verdict`."""
+    assert window.window_id is not None
+    frozen = frozen_risk(window)
+    orders = journal.non_terminal_orders(conn, window_id=window.window_id)
+    reconciliations = journal.reconciliations_for(conn, window.window_id) if orders else []
+    return waiting.LagFacts(
+        orders=tuple(orders),
+        reconciliations=tuple(reconciliations),
+        session=s_minus_1,
+        frozen=frozen,
+    )
+
+
+def _waiting_report(
+    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, now: datetime
+) -> waiting.ReportFacts:
+    """`performance_data`'s `report_due` inputs at `now`: the tracking count, whether
+    a `paper_reports` row exists, and (only when a report is due) the window's
+    second rebalance session."""
+    assert window.window_id is not None
+    count = _tracking_count(conn, window, now)
+    has_report = bool(journal.paper_reports_for(conn, window.window_id))
+    second: date | None = None
+    if not has_report and count is not None and count >= _REPORT_MIN_REBALANCES:
+        first = window.first_rebalance_session
+        sessions = rebalance_sessions(first, first + _REPORT_SEARCH, window_cadence(conn, window))
+        second = sessions[1]
+    return waiting.ReportFacts(
+        tracking_count=count,
+        has_report=has_report,
+        minimum=_REPORT_MIN_REBALANCES,
+        second_rebalance=second,
+    )
+
+
+def _waiting_book(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    book: str,
+    window: PaperWindowRow,
+    now: datetime,
+) -> waiting.BookFacts:
+    """One open window's facts. Each section is read on its own, so a `ValueError`
+    (an `UnreadableMarkError` included) in one leaves the others and becomes the
+    book's `unreadable` item."""
+    assert window.window_id is not None
+    s_minus_1 = _required_run_session(now)
+    errors: list[str] = []
+    switch: waiting.SwitchFacts | None = None
+    lag: waiting.LagFacts | None = None
+    report: waiting.ReportFacts | None = None
+    try:
+        switch = _waiting_switch(conn, settings, book, window)
+    except ValueError as exc:
+        errors.append(str(exc))
+    try:
+        lag = _waiting_lag(conn, window, s_minus_1)
+    except ValueError as exc:
+        errors.append(str(exc))
+    stale, _ = _stale_and_last_updated(conn, window.window_id, s_minus_1)
+    run = waiting.RunFacts(stale=stale, session=s_minus_1, window_started_at=window.started_at)
+    try:
+        report = _waiting_report(conn, window, now)
+    except ValueError as exc:
+        errors.append(str(exc))
+    return waiting.BookFacts(
+        book_id=book, switch=switch, lag=lag, run=run, report=report, errors=tuple(errors)
+    )
+
+
+def _waiting_span(conn: duckdb.DuckDBPyConnection, now: datetime) -> waiting.SpanFacts | None:
+    """The open shakedown span's candidate alerts, or None with no `shakedown_span`
+    row. Every book's alerts count (the shakedown judges every book), each read at
+    or before `now`; the noted ids are `shakedown._noted_alerts`'s, imported."""
+    if registry.shakedown_span(conn, now=now) is None:
+        return None
+    span = shakedown.read_span(conn, now)
+    book_column = "book_id" if _alerts_have_book(conn) else f"'{DEFAULT_BOOK_ID}'"
+    rows = conn.execute(
+        f'SELECT alert_id, {book_column}, kind, session, "at" FROM alerts '
+        'WHERE list_contains(?, kind) AND "at" >= ? AND "at" <= ? '
+        "AND known_at <= ? ORDER BY alert_id",
+        [list(waiting.NOTED_ALERT_KINDS), span.start_at, now, now],
+    ).fetchall()
+    return waiting.SpanFacts(
+        start_at=span.start_at,
+        alerts=tuple(
+            waiting.SpanAlert(alert_id=r[0], book_id=r[1], kind=r[2], session=r[3], at=r[4])
+            for r in rows
+        ),
+        noted=frozenset(shakedown._noted_alerts(conn, now)),
+        now=now,
+    )
+
+
+def _waiting_shakedown(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime
+) -> waiting.ShakedownFacts | None:
+    """`paper shakedown`'s lines at `now` without E.7's health half (module
+    docstring), or None with no `shakedown_span` row. Any error in that read (a
+    window's `frozen_json` without a tolerance E.3 needs, or a defect) becomes the
+    facts' `error`, so it never hides the books' own items; the schema gates
+    (`SchemaVersionError`, `JournalNotInitialised`) still raise as before."""
+    if registry.shakedown_span(conn, now=now) is None:
+        return None
+    try:
+        result = shakedown.shakedown(conn, settings, now=now, check_health=False)
+    except (SchemaVersionError, JournalNotInitialised):
+        raise
+    except ValueError as exc:
+        return waiting.ShakedownFacts(error=str(exc))
+    except Exception as exc:  # a diagnostic read must not hide a safety item
+        return waiting.ShakedownFacts(error=f"{type(exc).__name__}: {exc}")
+    return waiting.ShakedownFacts(lines=result.lines)
+
+
+@dataclass(frozen=True, kw_only=True)
+class OwnerQueue:
+    """`owner_queue`'s result: the waiting items and the open span's progress
+    words (`waiting.shakedown_progress`; None with no span)."""
+
+    items: tuple[waiting.WaitingItem, ...]
+    shakedown_progress: str | None
+
+
+def owner_queue(conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime) -> OwnerQueue:
+    """`waiting_on_owner`'s items and the shakedown's progress words from one read
+    (module docstring, "Waiting on the owner"). Reads only."""
+    now = ensure_tz_aware_utc(now, field_name="now")
+    try:
+        books = book_ids(conn)
+    except JournalNotInitialised:
+        return OwnerQueue(items=(), shakedown_progress=None)
+    facts: list[waiting.BookFacts] = []
+    for book in books:
+        window = journal.latest_window(conn, book)
+        if window is None or window.window_id is None or not _is_open(conn, window.window_id):
+            continue
+        facts.append(_waiting_book(conn, settings, book, window, now))
+    checked = _waiting_shakedown(conn, settings, now)
+    return OwnerQueue(
+        items=waiting.build(facts, _waiting_span(conn, now), checked),
+        shakedown_progress=waiting.shakedown_progress(checked),
+    )
+
+
+def waiting_on_owner(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime
+) -> tuple[waiting.WaitingItem, ...]:
+    """What every book with an open window is waiting on the owner for at `now`
+    (module docstring, "Waiting on the owner"; the kinds and their order are
+    `execution.waiting`'s). Empty when nothing is, and on a store with no journal;
+    a journal too old to read raises `SchemaVersionError`. Reads only."""
+    return owner_queue(conn, settings, now).items
