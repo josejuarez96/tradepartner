@@ -18,11 +18,11 @@ Everything a build window types, in order of use. The rules behind each line fol
 | `uv run python scripts/team.py release <Tn\|issue#> [--park]` | When you stop for good on an item: `--park` for a green PR, plain for a red or empty one. Write a handoff comment. |
 | `uv run python scripts/fragments.py add <issue> --slug <slug> [--task <Tn> --pr <n>] --status "…" --added "…"` | Once per PR, before ready: the STATUS line and CHANGELOG bullets as one new file (`--changed`, `--fixed`, `--removed` for the other headings). A plan task's PR adds `--task <Tn> --pr <n>` once the draft PR exists and never ticks its plan line: the fold does (#2280). |
 | `uv run python scripts/ready_pr.py <pr> --timeout-min 45` (`/ready-pr`) | When the task is done: merges `main` in, runs the checks, waits for CI, marks the PR ready. Never merges. |
-| `uv run python scripts/merge_train.py build [PR ...] [--order N [N ...]]` | Only when the owner asks for a train: tests the ready PRs together on `train/<batch id>`, posts a `merge-train:` comment on each, merges nothing. `--resume <batch id>` re-attaches to an unfinished batch. Flags and rules: [the merge train](git-workflow.md#the-merge-train). |
-| `uv run python scripts/merge_train.py merge <batch id>` | Only on the owner's "merge train `<batch id>`", by him or the one window he says it to, on the machine that holds the record. `--resume` continues a stopped merge. |
+| `uv run python scripts/merge_train.py build [PR ...] [--order N [N ...]]` | The orchestrator runs it (since 2026-10-27, unasked): tests the ready PRs together on `train/<batch id>`, posts a `merge-train:` comment on each, merges nothing. `--resume <batch id>` re-attaches to an unfinished batch. Flags and rules: [the merge train](git-workflow.md#the-merge-train). |
+| `uv run python scripts/merge_train.py merge <batch id>` | Orchestrator only, as soon as a batch is green and without asking (since 2026-10-27); a class-B PR rides only with the owner's word for that PR, a `hold` PR never. On the machine that holds the record. `--resume` continues a stopped merge. |
 | `uv run python scripts/merge_train.py status [<batch id>]`, `… prune` | A batch's record, or the list; `prune` deletes finished batches' `train/*` branches and worktrees, from the clone that built them. |
 
-Owner only: `team.py release --force`, `team.py claim --owner-task`, `team.py prune --yes`, and the word "merge train `<batch id>`".
+Owner only: `team.py release --force`, `team.py claim --owner-task`, and `team.py prune --yes`.
 
 ## Rules
 
@@ -114,7 +114,7 @@ The `claims` job runs `scripts/team.py check-claims --pr <n>` on every pull requ
 - `team.py status` from any clone shows every team's claims. Merging the head of a chain widens the frontier for everyone, so prefer chain heads first. Labels of retired teams are harmless.
 - **Directories of retired teams are pruned ad hoc, never automatically.** `team.py prune` lists directories with no open claim idle for six hours or more (`--hours`); `--yes` removes them with `git worktree remove`; directories with uncommitted changes are listed and skipped. Agents never run it.
 - Two windows on one task is a process failure, never a judgment call; when it happens, the lower issue number wins and the other PR is closed with a pointer.
-- You are not a role in the tool. You approve every class-B merge (your word on that PR, or your "merge train `<batch id>`", which lets the window you say it to run `merge_train.py merge`); the orchestrator, the single session above the teams and never a team's own lead session, lands class A under the same [rule 7](git-workflow.md#merge-classes-rule-7). You decide which window claims an owner task, and you `release --force` when a window dies. Whatever window you type in is a normal team.
+- You are not a role in the tool. You approve every class-B merge (your word on that PR; a class-B PR rides in a train only with that word); the orchestrator builds and merges trains on its own since 2026-10-27, without your word; the orchestrator, the single session above the teams and never a team's own lead session, lands class A under the same [rule 7](git-workflow.md#merge-classes-rule-7). You decide which window claims an owner task, and you `release --force` when a window dies. Whatever window you type in is a normal team.
 
 ### Never
 
@@ -123,7 +123,7 @@ The `claims` job runs `scripts/team.py check-claims --pr <n>` on every pull requ
 - Enter another team's directory or the main checkout for any reason.
 - Touch a branch, PR or issue another team currently **holds** (released or parked is fair game after you claim it). Closing another team's issue is the tool's job under the duplicate rule, never yours.
 - Claim an owner task, or claim past unmerged dependencies without a written stub agreement.
-- Merge. The one exception is the orchestrator (the single session above the teams, never a team's own lead session) landing a class-A PR under every condition of [rule 7](git-workflow.md#merge-classes-rule-7); a class-B PR lands only on the owner's word for that PR, a train only on his "merge train `<batch id>`" (building one is not merging and happens only when he asks); the ruleset bypass (`--admin`) is never a window's.
+- Merge. The one exception is the orchestrator (the single session above the teams, never a team's own lead session) landing a class-A PR under every condition of [rule 7](git-workflow.md#merge-classes-rule-7); a class-B PR lands only on the owner's word for that PR, a train is built and merged by the orchestrator alone, unasked, since 2026-10-27, with class-B PRs in it only on his word for that PR and `hold` PRs never; the ruleset bypass (`--admin`) is never a window's.
 
 ### Model tiers
 
