@@ -1694,7 +1694,7 @@ def _rounded(value: Any) -> Any:
     return value
 
 
-#: `RebalanceRow`'s two version-36 fields (plan T241). The twin's pinned digest was taken
+#: `RebalanceRow`'s two version-38 fields (plan T241). The twin's pinned digest was taken
 #: before they existed, so it still covers every other column and not these; the run
 #: itself is byte-identical (the fixture is at `cap`, where both read 0 and false).
 _T241_REBALANCE_FIELDS = ("n_assets_intersected", "assets_intersection_skipped")

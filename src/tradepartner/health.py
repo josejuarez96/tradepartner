@@ -14,11 +14,14 @@ here is this module's and is stated once:
 
 - **Last ingest per source** (`last_ingests`): from `ingestion_runs` rows
   known at `t`, i.e. finished at or before `t` (ingest writes a run's row when
-  the run ends), other than `master-retract`'s (#859), per source
+  the run ends), whose mode is a real ingest's (`_INGEST_MODES`: `session`,
+  `backfill`, `import`), per source
   (`ingest.SOURCES` first, then any other source in the table,
   alphabetically): the finish time and cursor of the last `ok` run,
   and the status, start and message of the latest run of any status. A source
-  that never ran shows `None`s.
+  that never ran shows `None`s. A maintenance or repair mode (`retract`,
+  `actions`, `holes`, `repair`, `action_retract`, or any mode added later) is
+  not an ingest and is left out, so it never hides the latest ingest's status.
 - **Coverage** (`coverage`): the population of ingest's staleness check
   (spec req 10): securities whose current listing (latest `valid_from` on or
   before `session`) is live at `session`, i.e. listed, or transferred with its
@@ -401,6 +404,7 @@ from tradepartner.adapters.alpaca_prices import (
 )
 from tradepartner.adapters.prices import announcement_date_known_at, spinoff_known_at_floor
 from tradepartner.adapters.rates import rate_known_at
+from tradepartner.backfill import BACKFILL
 from tradepartner.calendar import (
     all_sessions,
     is_session,
@@ -417,7 +421,7 @@ from tradepartner.config import (
     parse_accepted_same_day_pair,
 )
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
-from tradepartner.ingest import ACTIONS_MODE, DERIVED_FACTS, MODE, OK, SOURCES
+from tradepartner.ingest import ASSETS_IMPORT_MODE, DERIVED_FACTS, MODE, OK, SOURCES
 from tradepartner.store.asof import (
     _FACT_KEY,
     _PRICE_KEY,
@@ -456,7 +460,7 @@ from tradepartner.store.index_members import (
     resolve,
 )
 from tradepartner.store.master import first_session, securities_as_of, security_cik, session_of
-from tradepartner.store.retraction import EDGAR, RETRACT, live_chains_as_of, underived_as_of
+from tradepartner.store.retraction import EDGAR, live_chains_as_of, underived_as_of
 from tradepartner.store.schema import (
     STATEMENT_FACT_BASIS_VALUES,
     TABLE_PROVENANCE_VALUES,
@@ -1822,6 +1826,71 @@ class HealthReport:
         return not self.failures
 
 
+#: When the scheduled ingest runs (America/New_York). Source: the launchd plist in
+#: docs/runbooks/scheduling.md; change the two together.
+INGEST_TIME_ET = time(18, 30)
+_ET = ZoneInfo("America/New_York")
+
+
+def stale_sessions(report: HealthReport) -> int | None:
+    """Sessions between the store's last bar and the last completed session at the
+    report time; `None` when the store has no bars."""
+    last_bar = report.coverage.last_bar
+    if last_bar is None:
+        return None
+    sessions = all_sessions()
+    return bisect_right(sessions, report.session) - bisect_right(sessions, last_bar)
+
+
+def stale_gap_expected(report: HealthReport) -> bool:
+    """True when the store is one session behind only because today's scheduled
+    ingest has not run yet (after the close, before `INGEST_TIME_ET`)."""
+    local = report.t.astimezone(_ET)
+    return (
+        stale_sessions(report) == 1
+        and local.date() == report.session
+        and local.time() < INGEST_TIME_ET
+    )
+
+
+def _ingest_running(report: HealthReport) -> bool:
+    """True after `INGEST_TIME_ET` on the last session's own day (the ingest
+    should be running or just finished)."""
+    local = report.t.astimezone(_ET)
+    return local.date() == report.session and local.time() >= INGEST_TIME_ET
+
+
+def health_verdict(report: HealthReport, warnings: int = 0) -> str:
+    """One plain line about the data only (never the paper run, which also gates on
+    the newest ok ingest including SPY, halts and the kill switch): do the checks
+    pass, and is a stale session expected before tonight's ingest. `warnings` is the
+    count of warnings the caller tallies outside the report. Pure."""
+    note = f" with {warnings} warning(s)" if warnings else ""
+    if failures := report.failures:
+        body = f"{len(failures)} integrity check(s) fail ({', '.join(failures)})"
+    else:
+        stale = stale_sessions(report)
+        last = report.coverage.last_bar
+        plural = "" if stale == 1 else "s"
+        if stale is None:
+            body = "the store has no price bars; run `tradepartner ingest`"
+        elif stale == 0:
+            body = f"checks pass{note}, bars current to {last}"
+        elif stale_gap_expected(report):
+            body = (
+                f"checks pass{note}; {stale} session behind (last bar {last}), which is "
+                f"expected until tonight's {INGEST_TIME_ET:%H:%M} ET ingest"
+            )
+        elif stale == 1 and _ingest_running(report):
+            body = (
+                f"checks pass{note}; 1 session behind (last bar {last}); tonight's "
+                "ingest should be running or just finished"
+            )
+        else:
+            body = f"{stale} session{plural} behind (last bar {last}); run `tradepartner ingest`"
+    return f"Data: {body}. Paper run readiness and halts: `tradepartner paper status`."
+
+
 def health_report(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -2616,21 +2685,33 @@ def _coverage_reference(
     )
 
 
+#: The `ingestion_runs.mode` values a real ingest writes: `ingest`'s daily
+#: and `--backfill` chunks (`session`, `backfill`, any source, `ok`/`stale`/
+#: `failed`) and the borrow snapshot's `--import-dir` files (`import`, `ok`/
+#: `failed`). Every other mode is not an ingest and is left out of
+#: `last_ingests`: `retract` (#859), `actions` (a corporate-actions backfill
+#: month, #1676), `holes` (a `--fill-holes` month, #833) and `repair` /
+#: `action_retract` (#2125). The set is an allow-list, so a mode added later
+#: is left out without a code change.
+_INGEST_MODES: tuple[str, ...] = (MODE, BACKFILL, ASSETS_IMPORT_MODE)
+
+
 def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestStatus, ...]:
     """Per source, the last `ok` run and the latest run whose row is known at
     `t` (finished at or before `t`); `ingest.SOURCES` first, then any other
-    source. A `master-retract` run row (mode `retract`, #859) is not an
-    ingest and is left out, so it never hides the latest EDGAR run's status
-    or quarantine count; so is an actions-backfill month (mode `actions`,
-    status `filled`, #1676), so it never shows as the latest Alpaca run."""
+    source. Only a real ingest's run row counts (`_INGEST_MODES`), so a
+    maintenance or repair row — `master-retract`'s `retract` (#859), an
+    actions-backfill month's `actions` (#1676), a `--fill-holes` month's
+    `holes` (#833), a `repair` row, or an `action-retract` row (#2125) —
+    never shows as the latest run or hides the latest ingest's status."""
     t = _validate_t(t)
     runs = conn.execute(
         """
         SELECT source, status, started_at, finished_at, chunk_cursor, message
-        FROM ingestion_runs WHERE coalesce(finished_at, started_at) <= ? AND mode NOT IN (?, ?)
+        FROM ingestion_runs WHERE coalesce(finished_at, started_at) <= ? AND mode IN ?
         ORDER BY started_at, run_id
         """,
-        [t, RETRACT, ACTIONS_MODE],
+        [t, list(_INGEST_MODES)],
     ).fetchall()
     by_source: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
     for run in runs:

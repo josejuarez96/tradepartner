@@ -20,11 +20,13 @@ run on a session after its horizon's last session:
   (`OutcomeWindow.stop_flat`, per name, computed by the caller; a name never
   held is flat). That run on S writes the row, from marks known at close(S-1):
   a run never reads close(S), which is not known before the open.
-- **Kinds.** A buy with fills: `position_return`, the horizon mark over the
+- **Kinds.** A fill opening a position (long buy or short sell):
+  `position_return`, the horizon mark over the
   order's split-adjusted average fill price (over the accessor's live fills, so
   an implied residual enters at the order's average and a superseded fill never)
   less 1, with its contribution (the dollar gain over the equity of the last mark
-  before the order's session). A sell with fills: `realised_pnl`, the dollars
+  before the order's session). A fill closing a position (long sell or short
+  buy): `realised_pnl`, the dollars
   realised on the FIFO lots it closed (`execution.lots`), with its contribution.
   An order that did not fill in full (expired, rejected or cancelled): also
   `not_executed`, the name's return from close of the session before the order
@@ -67,6 +69,7 @@ import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -105,6 +108,17 @@ LotLedger = tuple[Sequence[Lot], Sequence[Disposal], Sequence[WashSaleFlag]]
 POSITION_RETURN = "position_return"
 REALISED_PNL = "realised_pnl"
 NOT_EXECUTED = "not_executed"
+
+
+def filled_outcome_kind(side: str, position_side: str) -> str:
+    """Outcome kind earned by a filled order's position intent."""
+    if (side, position_side) in {("buy", "long"), ("sell", "short")}:
+        return POSITION_RETURN
+    if (side, position_side) in {("sell", "long"), ("buy", "short")}:
+        return REALISED_PNL
+    raise ValueError(f"unknown position intent: {side}/{position_side}")
+
+
 _TERMINAL = frozenset({"filled", "expired", "rejected", "cancelled"})
 _FILLED = "filled"
 _EXIT = "exit"
@@ -152,12 +166,14 @@ class WriteResult:
     lot_error: str | None
 
 
+@lru_cache(maxsize=4096)
 def _rebalance_before(session: date, cadence: Cadence) -> date:
     """The last rebalance session at `cadence` strictly before `session`."""
     last = session - timedelta(days=1)
     return rebalance_sessions(last - _REBALANCE_SEARCH, last, cadence)[-1]
 
 
+@lru_cache(maxsize=4096)
 def _rebalance_after(rebalance: date, cadence: Cadence) -> date:
     """T_{i+1}: the first rebalance session at `cadence` strictly after `rebalance`."""
     first = rebalance + timedelta(days=1)
@@ -221,7 +237,7 @@ def _flattening(
     stop_requested: date | None,
 ) -> dict[str, tuple[date, float]]:
     """Per name, (session of the last fill, average fill price) of its first
-    filled `exit` sell on or after the stop request."""
+    filled closing `exit` order on or after the stop request."""
     if stop_requested is None:
         return {}
     by_order: dict[str, list[OrderedFill]] = {}
@@ -233,7 +249,7 @@ def _flattening(
         quantity = sum(i.fill.quantity for i in own)
         if (
             order.phase == _EXIT
-            and order.side == _SELL
+            and filled_outcome_kind(order.side, order.position_side) == REALISED_PNL
             and order.session >= stop_requested
             and terminal.get(order.client_order_id) == _FILLED
             and quantity > 0
@@ -361,10 +377,10 @@ def due_outcomes(
         own = by_order.get(order.client_order_id, [])
         quantity = sum(item.fill.quantity for item in own)
         earned = []
-        if quantity > 0 and order.side == _BUY:
-            earned.append(POSITION_RETURN)
-        if quantity > 0 and order.side == _SELL and lots is not None:
-            earned.append(REALISED_PNL)
+        if quantity > 0:
+            kind = filled_outcome_kind(order.side, order.position_side)
+            if kind != REALISED_PNL or lots is not None:
+                earned.append(kind)
         if status != _FILLED:
             earned.append(NOT_EXECUTED)
         pending = {k for k in earned if (order.client_order_id, k) not in window.written}
@@ -393,8 +409,9 @@ def due_outcomes(
             )
             average = _price(cost / shares, f"average fill price of {order.client_order_id}")
             assert average is not None
-            value = None if mark is None else mark / average - 1
-            gain = None if mark is None else mark * shares - cost
+            sign = -1 if order.position_side == "short" else 1
+            value = None if mark is None else sign * (mark / average - 1)
+            gain = None if mark is None else sign * (mark * shares - cost)
             candidates.append(
                 Outcome(
                     order.client_order_id,
@@ -419,7 +436,8 @@ def due_outcomes(
             start = _price(prices(security, before), f"start price of {security} on {before}")
             if start is not None:
                 start /= _split_factor(actions, security, before, through)
-            value = None if mark is None or start is None else mark / start - 1
+            sign = -1 if order.position_side == "short" else 1
+            value = None if mark is None or start is None else sign * (mark / start - 1)
             candidates.append(
                 Outcome(order.client_order_id, through, NOT_EXECUTED, value, None, mark)
             )
@@ -491,7 +509,7 @@ def write_outcomes_and_lots(
             ledger, lot_error = None, str(exc)
         lot_rows = 0
         if ledger is not None:
-            appended = _append_ledger(conn, ledger, now)
+            appended = _append_ledger(conn, ledger, now, _window_book(conn, window_id))
             if appended is None:
                 lot_error = f"lot ledger changed but the clock ({now.isoformat()}) did not advance"
                 ledger = None  # unsaved: realised P&L waits for a run that saves it
@@ -531,6 +549,16 @@ def write_outcomes_and_lots(
     return WriteResult(outcomes=len(outcomes), lot_rows=lot_rows, lot_error=lot_error)
 
 
+def _window_book(conn: duckdb.DuckDBPyConnection, window_id: int) -> str:
+    """The book the window's rows are written in (`paper_windows.book_id`)."""
+    row = conn.execute(
+        "SELECT book_id FROM paper_windows WHERE window_id = ?", [window_id]
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no paper window {window_id}")
+    return str(row[0])
+
+
 _LOT_COLUMNS = (
     "account_id, account_type, account_owner, security_id, symbol, cusip, trade_at, "
     "trade_date_local, quantity, cost_basis, fill_id"
@@ -540,22 +568,37 @@ _DISPOSAL_COLUMNS = (
 )
 
 
-def _latest_set(conn: duckdb.DuckDBPyConnection) -> tuple[list[tuple[object, ...]], ...]:
-    """The content of the latest journaled lot-ledger set, ids replaced by
+def _book_stamp(conn: duckdb.DuckDBPyConnection, book_id: str) -> datetime | None:
+    """The stamp of `book_id`'s current lot-ledger set (its latest `lots.known_at`),
+    None when the book has none. Each book's set is its own (#2190)."""
+    row = conn.execute("SELECT max(known_at) FROM lots WHERE book_id = ?", [book_id]).fetchone()
+    return None if row is None else row[0]
+
+
+def _latest_set(
+    conn: duckdb.DuckDBPyConnection, book_id: str
+) -> tuple[list[tuple[object, ...]], ...]:
+    """The content of `book_id`'s latest journaled lot-ledger set, ids replaced by
     positions within the set, for comparison."""
+    stamp = _book_stamp(conn, book_id)
     lot_rows = conn.execute(
         f"SELECT lot_id, {_LOT_COLUMNS} FROM lots "
-        "WHERE known_at = (SELECT max(known_at) FROM lots) ORDER BY lot_id"
+        "WHERE book_id = ? AND known_at = ? ORDER BY lot_id",
+        [book_id, stamp],
     ).fetchall()
     lot_pos = {row[0]: n for n, row in enumerate(lot_rows)}
     disposal_rows = conn.execute(
         f"SELECT disposal_id, lot_id, {_DISPOSAL_COLUMNS} FROM disposals "
-        "WHERE known_at = (SELECT max(known_at) FROM lots) ORDER BY disposal_id"
+        "WHERE book_id = ? AND known_at = ? ORDER BY disposal_id",
+        [book_id, stamp],
     ).fetchall()
     disposal_pos = {row[0]: n for n, row in enumerate(disposal_rows)}
     flag_rows = conn.execute(
         "SELECT disposal_id, replacement_lot_id, matched_quantity, disallowed_amount "
-        "FROM wash_sale_flags WHERE known_at = (SELECT max(known_at) FROM lots) ORDER BY flag_id"
+        "FROM wash_sale_flags WHERE known_at = ? AND disposal_id IN "
+        "(SELECT disposal_id FROM disposals WHERE book_id = ? AND known_at = ?) "
+        "ORDER BY flag_id",
+        [stamp, book_id, stamp],
     ).fetchall()
     return (
         [_normal(row[1:]) for row in lot_rows],
@@ -622,15 +665,18 @@ def _rebuilt_set(ledger: LotLedger) -> tuple[list[tuple[object, ...]], ...]:
     )
 
 
-def _append_ledger(conn: duckdb.DuckDBPyConnection, ledger: LotLedger, now: datetime) -> int | None:
-    """Append the rebuilt set when it differs from the latest one; return the
-    number of rows appended, or None when it differs but `now` is not after
-    the latest set's stamp (appending would merge the two sets)."""
+def _append_ledger(
+    conn: duckdb.DuckDBPyConnection, ledger: LotLedger, now: datetime, book_id: str
+) -> int | None:
+    """Append the rebuilt set when it differs from `book_id`'s latest one (the
+    other books' sets are not compared, #2190); return the number of rows
+    appended, or None when it differs but `now` is not after the book's latest
+    stamp (appending would merge the two sets)."""
     lots, disposals, flags = ledger
-    if not lots or _rebuilt_set(ledger) == _latest_set(conn):
+    if not lots or _rebuilt_set(ledger) == _latest_set(conn, book_id):
         return 0
-    latest = conn.execute("SELECT max(known_at) FROM lots").fetchone()
-    if latest is not None and latest[0] is not None and now <= latest[0]:
+    latest = _book_stamp(conn, book_id)
+    if latest is not None and now <= latest:
         return None
     lot_ids: dict[int, int] = {}
     for lot in lots:

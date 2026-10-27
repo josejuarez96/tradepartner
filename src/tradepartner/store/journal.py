@@ -51,6 +51,12 @@ pointer).
   each reads every book exactly as before version 19, `open_window` still failing
   closed on two open windows of any books.
 
+- **Breaks** (schema version 37; the paper spec's 2026-10-26 #2266 amendment,
+  item 4; plan T280a): `reconcile_breaks` holds one row per break event, in
+  write order (`event_id`). `append` refuses (`BreakOrderError`) an event out of
+  order and a second open break on one (window, name); `break_events_for` and
+  `open_breaks` read them, and return none on a store before version 37.
+
 Column `at` is a DuckDB keyword: SQL naming it must quote it (`"at"`);
 `insert_row` quotes every column.
 """
@@ -68,11 +74,14 @@ import duckdb
 
 from tradepartner.store.db import ensure_tz_aware, insert_row
 from tradepartner.store.schema import (
+    _PRE_BREAKS_VERSION,
+    CLOSING_BREAK_EVENTS,
     DEFAULT_BOOK_ID,
     ENGAGE_KILL_SWITCH_KIND,
     JOURNAL_TABLE_NAMES,
     LATER_JOURNAL_TABLE_NAMES,
     LONG,
+    OPEN_BREAK_EVENTS,
     ORDER_SHAPE_DEFAULTS,
     SchemaVersionError,
 )
@@ -182,10 +191,10 @@ class PaperPlanRow:
     """One `paper_plans` row.
 
     `n_assets_intersected` and `assets_intersection_skipped` are the liquidity
-    intersection's record (version 36, plan T241): the kept classes checked
+    intersection's record (version 38, plan T241): the kept classes checked
     against the assets snapshot and whether the intersection was skipped for
     want of one known at `t`. Both are nullable and default to `None` because
-    every row written before version 36 predates the record; T242 writes them.
+    every row written before version 38 predates the record; T242 writes them.
     """
 
     TABLE: ClassVar[str] = "paper_plans"
@@ -633,6 +642,44 @@ class WashSaleFlagRow:
     ingested_at: datetime
 
 
+@dataclass(frozen=True, kw_only=True)
+class ReconcileBreakRow:
+    """One `reconcile_breaks` row: one event of one break (schema version 37; the
+    paper spec's 2026-10-26 #2266 amendment, item 4). `event_id` is write order;
+    `break_id` is `<window_id>:<name>:<opening reconciliation_id>`, the name being
+    `security_id`, or the broker `symbol` when no `security_id` exists."""
+
+    TABLE: ClassVar[str] = "reconcile_breaks"
+    ID_COLUMN: ClassVar[str | None] = "event_id"
+
+    event_id: int | None = None
+    break_id: str
+    window_id: int
+    book_id: str
+    event: str
+    parts_json: str
+    cause: str | None = None
+    security_id: str | None = None
+    symbol: str | None = None
+    ledger_quantity: float | None = None
+    broker_quantity: float | None = None
+    cash_amount: float | None = None
+    reference_price: float | None = None
+    dollar_size: float | None = None
+    material: bool
+    first_seen_session: date
+    reconciliation_id: int | None = None
+    adjustment_ids_json: str | None = None
+    reason: str | None = None
+    known_at: datetime
+    ingested_at: datetime
+
+    @property
+    def name(self) -> str | None:
+        """The break's name: its `security_id`, else its broker `symbol`."""
+        return self.security_id if self.security_id is not None else self.symbol
+
+
 #: Every row type, by table, in `JOURNAL_TABLE_NAMES` order.
 ROW_TYPES: Mapping[str, type[Any]] = MappingProxyType(
     {
@@ -665,6 +712,7 @@ ROW_TYPES: Mapping[str, type[Any]] = MappingProxyType(
             LotRow,
             DisposalRow,
             WashSaleFlagRow,
+            ReconcileBreakRow,
         )
     }
 )
@@ -765,13 +813,121 @@ def _require_after_reconciliations(conn: duckdb.DuckDBPyConnection, known_at: da
         )
 
 
+class BreakOrderError(ValueError):
+    """A `reconcile_breaks` event that would break the journal's event order or
+    the one-open-break-per-(window, name) rule; nothing is written."""
+
+
+def break_id_for(window_id: int, name: str, reconciliation_id: int) -> str:
+    """A break's id: `<window_id>:<name>:<opening reconciliation_id>` (#2266
+    amendment item 4), so the same inputs always give the same id."""
+    return f"{window_id}:{name}:{reconciliation_id}"
+
+
+def _break_events(
+    conn: duckdb.DuckDBPyConnection, where: str, params: list[Any]
+) -> list[ReconcileBreakRow]:
+    """`reconcile_breaks` rows matching `where`, in write order (`event_id`)."""
+    return _select(conn, ReconcileBreakRow, where, params, order="t.event_id")
+
+
+def _latest_by_break(events: Iterable[ReconcileBreakRow]) -> dict[str, ReconcileBreakRow]:
+    """Each break's latest event, from `events` in write order."""
+    latest: dict[str, ReconcileBreakRow] = {}
+    for event in events:
+        latest[event.break_id] = event
+    return latest
+
+
+def _open_on_name(
+    conn: duckdb.DuckDBPyConnection, window_id: int, name: str
+) -> list[ReconcileBreakRow]:
+    """The latest event of each open break the window holds on `name`."""
+    events = _break_events(
+        conn, "t.window_id = ? AND coalesce(t.security_id, t.symbol) = ?", [window_id, name]
+    )
+    return [e for e in _latest_by_break(events).values() if e.event in OPEN_BREAK_EVENTS]
+
+
+def _require_break_order(conn: duckdb.DuckDBPyConnection, row: ReconcileBreakRow) -> None:
+    """Refuse (`BreakOrderError`) a break event out of order (#2266 amendment
+    item 4): an `event_id` at or below one already written; an `opened` event on
+    an existing break, with an id not derived from its window, name and
+    reconciliation, or while the window holds an open break on the name; any other
+    event on a break never opened, on another window, book, name or
+    `first_seen_session` than its `opened` event, with another `cause` than it (a
+    later event leaves `cause` NULL or repeats it; amendment item 14: computed once,
+    never rewritten), or stamped before the break's latest event; an `observed` or
+    closing event on a closed break; and a `reopened` event on a break whose latest
+    event is not `trued_up`, or while another break is open on the name."""
+    (max_id,) = conn.execute(  # type: ignore[misc]
+        "SELECT MAX(event_id) FROM reconcile_breaks"
+    ).fetchone()
+    if row.event_id is not None and max_id is not None and row.event_id <= max_id:
+        raise BreakOrderError(
+            f"reconcile_breaks: event_id {row.event_id} is not after {max_id}; events append"
+        )
+    name = row.name
+    if name is None:
+        raise BreakOrderError(f"break {row.break_id} names neither a security_id nor a symbol")
+    history = _break_events(conn, "t.break_id = ?", [row.break_id])
+    if row.event == "opened":
+        if history:
+            raise BreakOrderError(f"break {row.break_id} is already opened")
+        if row.reconciliation_id is None:
+            raise BreakOrderError(f"break {row.break_id} is opened by no reconciliation")
+        expected = break_id_for(row.window_id, name, row.reconciliation_id)
+        if row.break_id != expected:
+            raise BreakOrderError(f"break id {row.break_id!r} is not {expected!r}")
+        if open_now := _open_on_name(conn, row.window_id, name):
+            raise BreakOrderError(
+                f"window {row.window_id} already has open break {open_now[0].break_id} on {name}"
+            )
+        return
+    if not history:
+        raise BreakOrderError(f"break {row.break_id} was never opened")
+    opened, latest = history[0], history[-1]
+    if (row.window_id, row.book_id, name) != (opened.window_id, opened.book_id, opened.name):
+        raise BreakOrderError(
+            f"break {row.break_id} belongs to window {opened.window_id}, book "
+            f"{opened.book_id!r}, name {opened.name!r}"
+        )
+    if row.first_seen_session != opened.first_seen_session:
+        raise BreakOrderError(
+            f"break {row.break_id}: first_seen_session {row.first_seen_session} is not its "
+            f"opened event's {opened.first_seen_session}"
+        )
+    if row.cause is not None and row.cause != opened.cause:
+        raise BreakOrderError(
+            f"break {row.break_id}: cause {row.cause!r} rewrites its opened cause {opened.cause!r}"
+        )
+    if row.known_at < latest.known_at:
+        raise BreakOrderError(
+            f"break {row.break_id}: known_at {row.known_at.isoformat()} is before its latest "
+            f"event's {latest.known_at.isoformat()}"
+        )
+    if row.event == "reopened":
+        if latest.event != "trued_up":
+            raise BreakOrderError(
+                f"break {row.break_id} is {latest.event!r}; only a trued_up break reopens"
+            )
+        if open_now := _open_on_name(conn, row.window_id, name):
+            raise BreakOrderError(
+                f"window {row.window_id} already has open break {open_now[0].break_id} on {name}"
+            )
+        return
+    if latest.event in CLOSING_BREAK_EVENTS:
+        raise BreakOrderError(f"break {row.break_id} is closed ({latest.event!r})")
+
+
 def append(conn: duckdb.DuckDBPyConnection, row: JournalRow) -> int | None:
     """Insert `row` into its table and return its own id (assigned when None), or
     None for a table without one. Raises `ValueError` for a naive timestamp,
     `known_at` after `ingested_at`, or a fill not stamped after every
-    reconciliation; `JournalNotInitialised` on a store without the journal; and
-    DuckDB's constraint errors for anything the schema refuses. Runs in the
-    caller's transaction."""
+    reconciliation; `BreakOrderError` for a `reconcile_breaks` event out of order
+    (`_require_break_order`); `JournalNotInitialised` on a store without the
+    journal; and DuckDB's constraint errors for anything the schema refuses. Runs
+    in the caller's transaction."""
     if type(row) not in ROW_TYPES.values():
         raise TypeError(f"not a journal row type: {type(row).__name__}")
     table, id_column = type(row).TABLE, type(row).ID_COLUMN
@@ -785,6 +941,8 @@ def append(conn: duckdb.DuckDBPyConnection, row: JournalRow) -> int | None:
     require_journal(conn)
     if isinstance(row, FillRow):
         _require_after_reconciliations(conn, known_at)
+    if isinstance(row, ReconcileBreakRow):
+        _require_break_order(conn, row)
     values = {f.name: getattr(row, f.name) for f in fields(row)}  # type: ignore[arg-type]
     row_id = None
     if id_column is not None:
@@ -905,6 +1063,14 @@ def all_fill_ids(conn: duckdb.DuckDBPyConnection) -> frozenset[str]:
     insert-or-ignore check, so a fill is never journaled twice."""
     require_journal(conn)
     return frozenset(row[0] for row in conn.execute("SELECT broker_fill_id FROM fills").fetchall())
+
+
+def all_fill_terms(conn: duckdb.DuckDBPyConnection) -> dict[str, tuple[float, float]]:
+    """Every journaled `broker_fill_id`'s (quantity, price), superseded rows included:
+    the collectors' check that a known fill reads back unchanged (#2149)."""
+    require_journal(conn)
+    rows = conn.execute("SELECT broker_fill_id, quantity, price FROM fills").fetchall()
+    return {row[0]: (float(row[1]), float(row[2])) for row in rows if row[0] is not None}
 
 
 # --- Readers (plan T49c) -------------------------------------------------------------
@@ -1303,6 +1469,45 @@ def last_ok_reconciliation(
     """The window's latest `ok` reconciliation (the ledger's cash base), or None."""
     rows = _select(conn, ReconciliationRow, "t.window_id = ? AND t.status = 'ok'", [window_id])
     return rows[-1] if rows else None
+
+
+def _has_breaks_table(conn: duckdb.DuckDBPyConnection) -> bool:
+    """Whether the store has `reconcile_breaks` (schema version 37 on). A read-only
+    connection to an older store lacks it, and no break can exist there; a store
+    at version 37 or later without it raises `JournalNotInitialised` (fail closed,
+    never "no breaks")."""
+    (present,) = conn.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() "
+        "AND schema_name = current_schema() AND table_name = 'reconcile_breaks'"
+    ).fetchone()
+    if present:
+        return True
+    (version,) = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()  # type: ignore[misc]
+    if version is not None and version > _PRE_BREAKS_VERSION:
+        raise JournalNotInitialised(
+            f"the store is at schema version {version} but has no reconcile_breaks table"
+        )
+    return False
+
+
+def break_events_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[ReconcileBreakRow]:
+    """The window's `reconcile_breaks` events in write order (`event_id`); none on
+    a store before schema version 37 (a read-only connection never migrates)."""
+    require_journal(conn)
+    if not _has_breaks_table(conn):
+        return []
+    return _break_events(conn, "t.window_id = ?", [window_id])
+
+
+def open_breaks(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[ReconcileBreakRow]:
+    """The latest event of each of the window's open breaks (its latest event is in
+    `schema.OPEN_BREAK_EVENTS`), in write order of that event. The state is read
+    from the latest event alone, as the kill switch's is: a writer closing one part
+    of a break while another stays open writes an `observed` event, never a
+    closing one."""
+    latest = _latest_by_break(break_events_for(conn, window_id))
+    events = [e for e in latest.values() if e.event in OPEN_BREAK_EVENTS]
+    return sorted(events, key=lambda e: e.event_id or 0)
 
 
 def rebalance_events_for(

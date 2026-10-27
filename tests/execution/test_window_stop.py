@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import re
+import time
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -403,7 +405,7 @@ def test_a_blank_reason_is_refused_before_any_broker_call_or_write(
         elif command == "abandon":
             abandon(journal_settings, connect, fake, fixed_clock, "")
         else:
-            kill(journal_settings, connect, fixed_clock, " \t")
+            kill(journal_settings, fixed_clock, " \t")
 
     assert excinfo.value.reason == REASON
     assert fake.calls == ()
@@ -418,7 +420,7 @@ def test_every_command_is_refused_with_no_window_and_writes_nothing(
     calls = [
         lambda: stop(journal_settings, connect, fake, fixed_clock, NOTE),
         lambda: abandon(journal_settings, connect, fake, fixed_clock, NOTE),
-        lambda: kill(journal_settings, connect, fixed_clock, NOTE),
+        lambda: kill(journal_settings, fixed_clock, NOTE),
         lambda: override(
             journal_settings, fixed_clock, "engage_kill_switch", None, None, OVERRIDE_REASON
         ),
@@ -453,7 +455,7 @@ def test_stop_refuses_more_than_one_open_window(
 def test_stop_is_refused_while_the_switch_is_engaged(
     journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
 ) -> None:
-    kill(journal_settings, _connect(journal_settings), fixed_clock, "the owner engages it")
+    kill(journal_settings, fixed_clock, "the owner engages it")
 
     with pytest.raises(WindowCommandRefused) as excinfo:
         _stop(journal_settings, fake, fixed_clock)
@@ -736,7 +738,7 @@ def test_a_closed_windows_halted_run_does_not_engage_the_next_window(
 def test_abandon_under_an_engaged_switch_records_the_note_positions_and_mismatches(
     journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
 ) -> None:
-    kill(journal_settings, _connect(journal_settings), fixed_clock, "the owner engages it")
+    kill(journal_settings, fixed_clock, "the owner engages it")
     fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))
     fake.simulate_fill("owner-1")
     fixed_clock.advance(minutes=1)
@@ -953,13 +955,66 @@ def test_kill_appends_an_owner_engagement_even_while_a_run_holds_the_lock(
     journal_settings: Settings, window: PaperWindowRow, fixed_clock: FixedClock
 ) -> None:
     with run_lock(journal_settings):
-        event_id = kill(journal_settings, _connect(journal_settings), fixed_clock, f" {NOTE} ")
+        event_id = kill(journal_settings, fixed_clock, f" {NOTE} ")
 
     with open_read_only(journal_settings) as conn:
         (event,) = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
     assert event.event_id == event_id
     assert (event.state, event.source, event.reason) == ("engaged", "owner", NOTE)
     assert _engaged(journal_settings, window)
+
+
+def test_kill_reserves_the_configured_engage_wait_after_a_slow_lookup(
+    journal_settings: Settings,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow lookup cannot spend the minimum reserved for the engage write."""
+    seen: list[int] = []
+    original = switch.engage
+    real_open = window_module.open_read_only
+
+    def engage(settings: Settings, *args: Any, **kwargs: Any) -> int | switch.WriteFailed:
+        seen.append(settings.store.lock_retry_seconds)
+        if settings.store.lock_retry_seconds < 2:
+            return switch.WriteFailed("StoreLockedError: queued writer still owns store")
+        return original(settings, *args, **kwargs)
+
+    @contextmanager
+    def slow_read(settings: Settings, *, retry: bool = False, on_wait: Any = None) -> Any:
+        with real_open(settings, retry=retry, on_wait=on_wait) as conn:
+            time.sleep(2.1)
+            yield conn
+
+    monkeypatch.setattr(switch, "engage", engage)
+    monkeypatch.setattr(window_module, "open_read_only", slow_read)
+    limited = journal_settings.model_copy(
+        update={
+            "store": journal_settings.store.model_copy(
+                update={"lock_retry_seconds": 2, "writer_lock_retry_seconds": 5}
+            )
+        }
+    )
+    kill(limited, fixed_clock, NOTE)
+    assert seen == [2]
+    assert _engaged(journal_settings, window)
+
+
+def test_kill_without_a_store_refuses_no_window(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    missing = journal_settings.model_copy(
+        update={
+            "store": journal_settings.store.model_copy(
+                update={"path": str(tmp_path / "missing.duckdb")}
+            )
+        }
+    )
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        kill(missing, fixed_clock, NOTE)
+    assert excinfo.value.reason == NO_WINDOW
+    assert not (tmp_path / "missing.duckdb").exists()
 
 
 def test_kill_refuses_more_than_one_open_window(
@@ -971,7 +1026,7 @@ def test_kill_refuses_more_than_one_open_window(
     _new_window(journal_settings, datetime(2026, 9, 29, 12, 0, tzinfo=UTC))
 
     with pytest.raises(WindowCommandRefused) as excinfo:
-        kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE)
+        kill(journal_settings, fixed_clock, NOTE)
 
     reason, message = _refusal(excinfo)
     assert reason == MULTIPLE_OPEN_WINDOWS
@@ -1380,7 +1435,7 @@ def test_an_engagement_written_after_the_first_checks_refuses_the_request(
             return original(clock)
         fired.append(True)
         if engagement == "kill":
-            kill(journal_settings, _connect(journal_settings), clock, "the owner engages it")
+            kill(journal_settings, clock, "the owner engages it")
         else:
             override(journal_settings, clock, "engage_kill_switch", None, None, OVERRIDE_REASON)
         return original(clock)
@@ -1411,7 +1466,7 @@ def test_an_engagement_written_during_the_closing_stop_refuses_the_close(
     def residues_then_engage(*args: Any) -> Any:
         listed = original(*args)
         if engagement == "kill":
-            kill(journal_settings, _connect(journal_settings), fixed_clock, "the owner engages")
+            kill(journal_settings, fixed_clock, "the owner engages")
         else:
             override(
                 journal_settings, fixed_clock, "engage_kill_switch", None, None, OVERRIDE_REASON
@@ -1503,7 +1558,7 @@ def test_kill_raises_when_its_row_cannot_be_written(
 ) -> None:
     monkeypatch.setattr(switch, "engage", lambda *a, **k: switch.WriteFailed("store locked"))
     with pytest.raises(KillWriteFailed, match="NOT engaged: store locked"):
-        kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE)
+        kill(journal_settings, fixed_clock, NOTE)
 
 
 def test_kill_raises_kill_write_failed_for_a_bad_clock(
@@ -1513,7 +1568,7 @@ def test_kill_raises_kill_write_failed_for_a_bad_clock(
         raise OSError("no clock")
 
     with pytest.raises(KillWriteFailed, match="NOT engaged"):
-        kill(journal_settings, _connect(journal_settings), broken, NOTE)
+        kill(journal_settings, broken, NOTE)
     assert _count(journal_settings, "kill_switch") == 0
 
 
@@ -1604,7 +1659,7 @@ def test_kill_refuses_schema_version_on_a_version_16_store(
     _downgrade_to_version_16(journal_settings)
 
     with pytest.raises(WindowCommandRefused) as excinfo:
-        kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE)
+        kill(journal_settings, fixed_clock, NOTE)
 
     reason, message = _refusal(excinfo)
     assert reason == window_module.SCHEMA_VERSION
@@ -1658,7 +1713,7 @@ def test_paper_kill_on_b_leaves_main_running(
 ) -> None:
     """Spec acceptance (ADR 0017 B.5): `paper kill --book b` engages `b`'s switch
     only; `main`'s stays released, and the reverse."""
-    event_id = kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE, book_id="b")
+    event_id = kill(journal_settings, fixed_clock, NOTE, book_id="b")
 
     with open_read_only(journal_settings) as conn:
         (event,) = kill_switch_events_for(conn, b_window.window_id)  # type: ignore[arg-type]
@@ -1667,7 +1722,7 @@ def test_paper_kill_on_b_leaves_main_running(
     assert _engaged(journal_settings, b_window)
     assert not _engaged(journal_settings, window)
 
-    kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE)  # the default: main
+    kill(journal_settings, fixed_clock, NOTE)  # the default: main
     assert _engaged(journal_settings, window)
 
 
@@ -1701,9 +1756,9 @@ def test_another_book_s_open_window_is_not_a_second_open_window(
 
     _new_window(journal_settings, datetime(2026, 9, 29, 14, 0, tzinfo=UTC))
     with pytest.raises(WindowCommandRefused) as excinfo:
-        kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE)
+        kill(journal_settings, fixed_clock, NOTE)
     assert excinfo.value.reason == MULTIPLE_OPEN_WINDOWS
-    kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE, book_id="b")
+    kill(journal_settings, fixed_clock, NOTE, book_id="b")
 
 
 def test_every_command_on_a_book_with_no_window_is_no_window_beside_main(
@@ -1715,7 +1770,7 @@ def test_every_command_on_a_book_with_no_window_is_no_window_beside_main(
     calls = [
         lambda: stop(journal_settings, connect, fake, fixed_clock, NOTE, book_id="b"),
         lambda: abandon(journal_settings, connect, fake, fixed_clock, NOTE, book_id="b"),
-        lambda: kill(journal_settings, connect, fixed_clock, NOTE, book_id="b"),
+        lambda: kill(journal_settings, fixed_clock, NOTE, book_id="b"),
         lambda: override(
             journal_settings,
             fixed_clock,

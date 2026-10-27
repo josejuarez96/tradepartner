@@ -8,6 +8,7 @@ environment variable can move a registered hypothesis's holdout or threshold.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
@@ -2048,8 +2049,8 @@ def test_portfolio_keys_are_allowed_and_frozen_at_their_defaults(
 ) -> None:
     """A file may name the five keys (`frozen_keys` includes the section), and absent
     they freeze at their table defaults: a file naming `side` at its default is the same
-    registration as one that omits it (`frozen_params`' `fixed` map reads the table, not
-    live `Settings`, which the guard keeps at its defaults until T223)."""
+    registration as one that omits it (`frozen_params`' `fixed` map reads the table,
+    not live `Settings`)."""
     text = FIXTURE.read_text().replace("\n```\n", '\n[portfolio]\nside = "long_only"\n```\n', 1)
     parsed = hypothesis.parse_file(_copy(tmp_path, text))
     explicit = hypothesis.frozen_params(parsed, settings)
@@ -2062,40 +2063,47 @@ def test_portfolio_keys_are_allowed_and_frozen_at_their_defaults(
         assert explicit[key] == table[key], key
 
 
-def test_a_non_default_portfolio_value_is_refused_until_t223(
-    tmp_path: Path, settings: Settings
-) -> None:
-    """T219's #1788 guard: the engine reads none of the five until T223, so a
-    `long_short` file cannot register (`_overlay` fails validation naming T223)."""
-    text = FIXTURE.read_text().replace("\n```\n", '\n[portfolio]\nside = "long_short"\n```\n', 1)
-    parsed = hypothesis.parse_file(_copy(tmp_path, text))
-    with pytest.raises(HypothesisFileError, match="T223"):
-        hypothesis.frozen_params(parsed, settings)
+def test_a_long_short_file_freezes_its_portfolio_values(tmp_path: Path, settings: Settings) -> None:
+    """The file's signed settings survive the normal parse and freeze path."""
+    parsed = hypothesis.parse_file(_long_short_file(tmp_path))
+    params = hypothesis.frozen_params(parsed, settings)
+    assert params["portfolio.side"] == "long_short"
+    assert params["portfolio.net_exposure"] == 0.0
+    assert params["costs.borrow_bps_per_year"] == 30.0
+    assert params["costs.borrow_sensitivity_bps"] == [0.0, 300.0]
 
 
 # --- the long/short refusals (T221; backtest spec amendment #1872, items 1 and 6) -----
 
-#: A 50/50 book's frozen values on top of the fixture's: the headline 30 bp, the grid's
-#: other two lines in the sensitivity list.
-LONG_SHORT_5050: dict[str, Any] = {
-    "portfolio.side": "long_short",
-    "portfolio.net_exposure": 0.0,
-    "costs.borrow_bps_per_year": 30.0,
-    "costs.borrow_sensitivity_bps": [0.0, 300.0],
-}
 
-
-def _long_short(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
-    """`frozen_params` returns the fixture's values with a long/short book on top: the
-    #1788 guard (T223 removes it) refuses a `long_short` file before `register` could
-    see it, so the guard is stepped round, as T222's tests do with `PortfolioConfig`."""
-    real = hypothesis.frozen_params
-    changed = {**LONG_SHORT_5050, **{k.replace("__", "."): v for k, v in overrides.items()}}
-
-    def patched(parsed: hypothesis.HypothesisFile, settings: Settings) -> dict[str, Any]:
-        return {**real(parsed, settings), **changed}
-
-    monkeypatch.setattr(hypothesis, "frozen_params", patched)
+def _long_short_file(
+    tmp_path: Path,
+    *,
+    headline: float = 30.0,
+    sensitivity: list[float] | None = None,
+    weighting: str = "equal",
+    band: float = 0.0,
+    buffer: float = 0.0,
+) -> Path:
+    """Write a signed variant of the fixture through the normal file parser."""
+    rates = [0.0, 300.0] if sensitivity is None else sensitivity
+    text = FIXTURE.read_text()
+    text = text.replace('weighting = "equal"', f"weighting = {json.dumps(weighting)}", 1)
+    text = text.replace(
+        "signal_total_return = true",
+        f"signal_total_return = true\nrebalance_band = {band}\nhold_top_fraction = {buffer}",
+        1,
+    )
+    text = text.replace(
+        "per_side_bps = 15.0",
+        f"per_side_bps = 15.0\nborrow_bps_per_year = {headline}"
+        f"\nborrow_sensitivity_bps = {json.dumps(rates)}",
+        1,
+    )
+    text = text.replace(
+        "\n```\n", '\n[portfolio]\nside = "long_short"\nnet_exposure = 0.0\n```\n', 1
+    )
+    return _copy(tmp_path, text)
 
 
 def _hypotheses(conn: duckdb.DuckDBPyConnection) -> int:
@@ -2106,10 +2114,8 @@ def test_a_valid_5050_file_registers(
     tmp_path: Path,
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _long_short(monkeypatch)
-    record = _register(conn, _copy(tmp_path), settings)
+    record = _register(conn, _long_short_file(tmp_path), settings)
     assert record.params["portfolio.side"] == "long_short"
     assert record.params["costs.borrow_bps_per_year"] == 30.0
     assert record.params["costs.borrow_sensitivity_bps"] == [0.0, 300.0]
@@ -2124,16 +2130,12 @@ def test_every_headline_with_the_grid_covered_registers(
     tmp_path: Path,
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
     headline: float,
     sensitivity: list[float],
 ) -> None:
-    _long_short(
-        monkeypatch,
-        costs__borrow_bps_per_year=headline,
-        costs__borrow_sensitivity_bps=sensitivity,
+    _register(
+        conn, _long_short_file(tmp_path, headline=headline, sensitivity=sensitivity), settings
     )
-    _register(conn, _copy(tmp_path), settings)
     assert _hypotheses(conn) == 1
 
 
@@ -2152,16 +2154,10 @@ def test_a_missing_borrow_line_is_refused_by_name_before_any_write(
     tmp_path: Path,
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
     headline: float,
     sensitivity: list[float],
 ) -> None:
-    _long_short(
-        monkeypatch,
-        costs__borrow_bps_per_year=headline,
-        costs__borrow_sensitivity_bps=sensitivity,
-    )
-    path = _copy(tmp_path)
+    path = _long_short_file(tmp_path, headline=headline, sensitivity=sensitivity)
     with pytest.raises(HypothesisFileError, match=rf"^{re.escape(str(path))}: refused_borrow_rate"):
         _register(conn, path, settings)
     assert _hypotheses(conn) == 0
@@ -2179,11 +2175,15 @@ def test_a_hold_a_band_or_a_buffer_on_a_signed_book_is_refused_by_name_before_an
     tmp_path: Path,
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
     override: dict[str, Any],
 ) -> None:
-    _long_short(monkeypatch, **override)
-    path = _copy(tmp_path)
+    names = {
+        "strategy__weighting": "weighting",
+        "strategy__rebalance_band": "band",
+        "strategy__hold_top_fraction": "buffer",
+    }
+    changed = {names[key]: value for key, value in override.items()}
+    path = _long_short_file(tmp_path, **changed)
     with pytest.raises(HypothesisFileError, match=rf"^{re.escape(str(path))}: refused_portfolio"):
         _register(conn, path, settings)
     assert _hypotheses(conn) == 0
@@ -2193,11 +2193,10 @@ def test_refused_portfolio_comes_before_refused_borrow_rate(
     tmp_path: Path,
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _long_short(monkeypatch, strategy__rebalance_band=0.02, costs__borrow_bps_per_year=0.0)
+    path = _long_short_file(tmp_path, band=0.02, headline=0.0)
     with pytest.raises(HypothesisFileError, match="refused_portfolio"):
-        _register(conn, _copy(tmp_path), settings)
+        _register(conn, path, settings)
 
 
 def test_a_long_only_file_takes_no_new_branch(

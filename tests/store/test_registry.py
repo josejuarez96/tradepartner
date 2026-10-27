@@ -730,7 +730,7 @@ def test_a_rebalance_without_counts_reads_null_columns_and_no_rows(
     ]
 
 
-#: The two version-36 columns (plan T241), read back in cost-level order.
+#: The two version-38 columns (plan T241), read back in cost-level order.
 _INTERSECTION_READER = (
     "SELECT n_assets_intersected, assets_intersection_skipped FROM trial_rebalances "
     "WHERE trial_id = ? ORDER BY cost_per_side_bps"

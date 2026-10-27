@@ -363,7 +363,7 @@ class RebalanceRow:
     known at `t`. They are `trial_rebalances` columns, written each by name,
     not `trial_rebalance_counts` rows — the spec names the columns and one is a
     flag — and default to `None` so a row built without them predates the
-    record (NULL), as every pre-version-36 row does."""
+    record (NULL), as every pre-version-38 row does."""
 
     cost_per_side_bps: float
     session: date

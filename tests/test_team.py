@@ -894,3 +894,28 @@ def test_prune_dry_run_by_default_and_removes_with_yes(
     assert not (base / "guilo").exists()
     assert (base / "busy").is_dir()
     assert "removed 1" in capsys.readouterr().out
+
+
+def test_a_merged_fragment_naming_the_task_counts_as_done_before_the_fold(root: Path) -> None:
+    """#2280: a build PR names its task in its fragment instead of ticking the plan; on the
+    ref that fragment is the tick, so dependants are ready before any fold."""
+    git = ["git", "-C", str(root), "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
+    (root / "changelog.d").mkdir()
+    (root / "changelog.d" / "README.md").write_text("task: T8b (PR #1)\n")  # docs, not a fragment
+    (root / "changelog.d" / "22-universe.md").write_text("task: T5 (PR #23)\n- s\n")
+    (root / "changelog.d" / "old").mkdir()  # not a fragment: fragments live at the top level
+    (root / "changelog.d" / "old" / "9-x.md").write_text("task: T8b (PR #9)\n")
+    subprocess.run([*git, "add", "docs", "changelog.d"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "docs: plan and a merged fragment"], check=True)
+    done = {t.id: t.done for t in team.load_tasks(root, "HEAD")}
+    assert done["T5"] is True
+    assert done["T8b"] is False
+    # The working tree is not the ref: an unmerged fragment opens nothing.
+    (root / "changelog.d" / "30-other.md").write_text("task: T8b (PR #31)\n")
+    assert {t.id: t.done for t in team.load_tasks(root, "HEAD")}["T8b"] is False
+
+
+def test_fragment_task_ids_reads_task_lines() -> None:
+    lines = ["task: T5 (PR #23)", "task: T8b (PR #9)", "- task: T7 (PR #1)", "task: T9"]
+    assert team.fragment_task_ids(lines) == frozenset({"T5", "T8b"})

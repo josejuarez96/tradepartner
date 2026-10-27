@@ -98,6 +98,15 @@ def _v11_journal_ddl() -> str:
         "'exclude_name', 'keep_name', 'delisted', 'untargeted_receipt', 'window_stop'))",
         1,
     )
+    # version 37 appended `breaks` to the reconciliation status set (T280a)
+    old_reconciliation = ", ".join(
+        f"'{s}'" for s in schema.JOURNAL_ENUMS["reconciliations", "status"][:-1]
+    )
+    blob = blob.replace(
+        schema._check("reconciliations", "status"),
+        f"CHECK (status IN ({old_reconciliation}))",
+        1,
+    )
     # version 32 appended `pending_unresolved` to the order status set (T202b)
     old_statuses = ", ".join(f"'{s}'" for s in schema.JOURNAL_ENUMS["order_events", "status"][:-1])
     blob = blob.replace(
@@ -690,14 +699,14 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         schema.require_research(c)
     # No pre-existing table's DDL text changed but `trial_results` (gained
     # `n_research`, version 12) and `trial_rebalances` (gained
-    # `PROFITABILITY_REBALANCE_COLUMNS`, version 13, and the two version-36
+    # `PROFITABILITY_REBALANCE_COLUMNS`, version 13, and the two version-38
     # intersection columns) and `trials` (gained its
     # vintage and detail columns, version 15) and `owner_decisions` and
     # `trial_results` (their `CHECK` widened by the lab migration, version 16,
     # `tests/store/test_lab_migration.py`); no row of any table changed.
     # Version 25 (#1597, T184d) rebuilds `listings` and `classifications` for
     # `filing_name` too, version 33 (#1792, T210b) rebuilds `trial_metrics`
-    # for `cost_level_kind`, and version 36 (plan T241) adds the two
+    # for `cost_level_kind`, and version 38 (plan T241) adds the two
     # intersection columns to `paper_plans`, so they move with the same rows
     # kept.
     _moved = {
@@ -732,7 +741,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
     # version 24 (#1506) `borrow_status`, version 28 (#1506, T172b)
     # `symbol_changes`, version 30 (#1713, T189c) `openfigi_types` and
     # version 31 (#821, T187) `successor_chains` and version 35 (#1762, T248c)
-    # `mergers`, all empty; nothing else
+    # `mergers` and version 37 (#2266, T280a) `reconcile_breaks`, all empty; nothing else
     # gains a table.
     assert rows_after == {
         **rows_before,
@@ -743,6 +752,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         "openfigi_types": [],
         "successor_chains": [],
         "mergers": [],
+        "reconcile_breaks": [],
     }
     # And the migrated store is shaped exactly as a fresh one.
     # (A fresh store gets version 18's and version 20's two kinds before the lab's

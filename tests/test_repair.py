@@ -942,8 +942,11 @@ def test_the_dividend_repair_deletes_the_retract_identity_only(dividends: Settin
     assert message.startswith("deleted 1 duplicate dividend rows")
     with duckdb.connect(dividends.store.path, read_only=True) as conn:
         [ingest] = [i for i in last_ingests(conn, RUN) if i.source == "alpaca"]
-    assert ingest.last_ok_finished_at is None  # a repair is never an ok ingest
-    assert ingest.latest_status == REPAIRED
+    # A repair row is never an ingest (#2125): it is not the latest run at all,
+    # so its `repaired` status cannot hide a failed nightly ingest.
+    assert ingest.last_ok_finished_at is None
+    assert ingest.latest_status is None
+    assert ingest.latest_started_at is None
 
 
 def test_every_entry_without_a_bound(dividends: Settings) -> None:

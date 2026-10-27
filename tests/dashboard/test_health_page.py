@@ -19,6 +19,7 @@ from typing import Any
 import duckdb
 import pytest
 from conftest import load_universe_fixtures
+from dashboard_nav import nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner import health
@@ -71,7 +72,7 @@ def store_path(tmp_path: Path) -> Path:
                 "finished_at": FINISHED,
                 "status": "ok",
                 "source": SOURCES[0],
-                "mode": "daily",
+                "mode": "session",
                 "rows_added": 3,
                 "chunk_cursor": "2020-06-30",
                 "message": "fixture run",
@@ -86,6 +87,7 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path, now: datetime = T) -
     monkeypatch.setenv("STORE__PATH", str(store_path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     monkeypatch.setattr(health_page, "_now", lambda: now)
+    monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Data health")
     at = AppTest.from_file(_APP_PATH, default_timeout=60)
     at.run()
     return at
@@ -248,8 +250,12 @@ def test_empty_store_view(tmp_path: Path) -> None:
 # --- render (headless) -------------------------------------------------------
 
 
-def test_page_is_the_shells_data_health_entry() -> None:
-    assert app._PAGES["Data health"] is health_page.render
+def test_page_is_the_shells_data_health_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[object] = []
+    monkeypatch.setattr(health_page, "render", lambda conn: seen.append(conn))
+    sentinel, settings = object(), Settings(_env_file=None)
+    app._DETAIL_PAGES["Data health"](sentinel, settings)  # type: ignore[arg-type]
+    assert seen == [sentinel]
 
 
 def test_render_shows_every_metric(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> None:
@@ -299,35 +305,40 @@ def test_render_marks_a_stale_store(monkeypatch: pytest.MonkeyPatch, store_path:
     at = _app(monkeypatch, store_path, now=later)
     assert not at.exception
     assert "stale: 4 sessions" in _text(at)
+    assert "4 sessions behind" in _text(at)
+    assert "expected until" not in _text(at)
     assert ":orange-badge[" in _text(at)
     assert "stale:" not in _text(_app(monkeypatch, store_path))
 
 
-@pytest.mark.parametrize("status", ["repaired", "filled"])
-def test_a_maintenance_run_is_a_caution_not_a_failure(
-    monkeypatch: pytest.MonkeyPatch, store_path: Path, status: str
+@pytest.mark.parametrize(
+    ("mode", "status"),
+    [("repair", "repaired"), ("holes", "filled"), ("action_retract", "repaired")],
+)
+def test_a_maintenance_run_never_becomes_the_latest_run(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path, mode: str, status: str
 ) -> None:
-    # #833: a successful repair-resolution or fill-holes run is deliberately
-    # never `ok` (module docstring), but it is not a failure either; the
-    # "Sources" card must not show it as critical. Started after the
-    # fixture's `ok` run (so it is the latest) but finished no later than
-    # `T` (so `last_ingests` still counts it as known).
+    # #2125: a repair, hole-fill or action-retract row is deliberately never
+    # `ok`, and it is not an ingest at all, so `last_ingests` leaves it out
+    # (this reverses #833's read: the row is hidden, not shown as a caution).
+    # It must not become the source's latest run and hide the fixture's `ok`
+    # run, or a failed nightly ingest. Started after the fixture's `ok` run
+    # but finished no later than `T`.
     _write(
         store_path,
         """
         INSERT INTO ingestion_runs
         (run_id, started_at, finished_at, status, source, mode, rows_added,
          chunk_cursor, message)
-        VALUES (2, ?, ?, ?, ?, 'maintenance', 0, NULL, 'fixture run')
+        VALUES (2, ?, ?, ?, ?, ?, 0, NULL, 'fixture run')
         """,
-        [FINISHED - timedelta(minutes=2), FINISHED, status, SOURCES[0]],
+        [FINISHED - timedelta(minutes=2), FINISHED, status, SOURCES[0], mode],
     )
     at = _app(monkeypatch, store_path)
     assert not at.exception
     text = _text(at)
-    assert f"latest run: {status}" in text
-    assert ":red-badge[" not in text
-    assert ":orange-badge[" in text
+    assert "latest run: ok" in text
+    assert f"latest run: {status}" not in text
 
 
 def test_render_empty_store_has_no_warning(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -651,7 +662,7 @@ def test_mergers_card_shows_the_block(monkeypatch: pytest.MonkeyPatch, store_pat
     stock merger's acquiree as the one with a bar after its effective date."""
     _write(
         store_path,
-        "INSERT INTO ingestion_runs VALUES (?, ?, ?, 'ok', 'alpaca', 'daily', 1, ?, ?)",
+        "INSERT INTO ingestion_runs VALUES (?, ?, ?, 'ok', 'alpaca', 'session', 1, ?, ?)",
         [
             "merger-1",
             FINISHED - timedelta(hours=2),
@@ -679,3 +690,18 @@ def test_mergers_card_with_no_run_says_never(
     at = _app(monkeypatch, store_path)
     assert not at.exception
     assert "Last run: never" in _text(at)
+
+
+def test_render_says_the_one_session_gap_is_expected_before_the_ingest(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    before_ingest = session_close(date(2020, 7, 1)) + timedelta(hours=1)
+    text = _text(_app(monkeypatch, store_path, now=before_ingest))
+    assert "expected until tonight's 18:30 ET ingest" in text
+    assert "stale: 1 session (expected until the 18:30 ET ingest)" in text
+
+
+def test_render_leads_with_a_fine_verdict_on_a_current_store(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    assert "Data: checks pass" in _text(_app(monkeypatch, store_path))

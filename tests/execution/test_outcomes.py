@@ -19,6 +19,7 @@ import pytest
 
 from tradepartner.calendar import previous_session
 from tradepartner.config import Cadence
+from tradepartner.execution.check import _chain_line
 from tradepartner.execution.lots import LedgerAccount, rebuild
 from tradepartner.execution.marks import UnreadableMarkError
 from tradepartner.execution.outcomes import (
@@ -28,6 +29,7 @@ from tradepartner.execution.outcomes import (
     outcome_horizon,
     write_outcomes_and_lots,
 )
+from tradepartner.execution.window import _not_ready
 from tradepartner.store import journal, schema
 from tradepartner.store.journal import (
     AdjustmentRow,
@@ -90,6 +92,7 @@ class Book:
         phase: str | None = None,
         implied_last: bool = False,
         book_id: str = "main",
+        position_side: str = "long",
     ) -> str:
         coid = f"tp-{session:%Y%m%d}-{security_id}-{side}-{len(self.orders) + 1}"
         self.orders.append(
@@ -103,6 +106,7 @@ class Book:
                 security_id=security_id,
                 symbol=security_id.removeprefix("SEC_"),
                 side=side,
+                position_side=position_side,
                 quantity=10.0,
                 book_id=book_id,
                 sells_in_flight_at_submit=False,
@@ -235,6 +239,23 @@ def test_a_filled_buy_has_its_position_return_and_contribution() -> None:
     assert outcome.mark_price == 110.0
 
 
+@pytest.mark.parametrize(
+    ("mark", "expected_return", "expected_contribution"),
+    [(110.0, -0.10, -0.01), (90.0, 0.10, 0.01)],
+)
+def test_a_short_open_has_short_signed_return_and_contribution(
+    mark: float, expected_return: float, expected_contribution: float
+) -> None:
+    book = Book()
+    coid = book.order("SEC_A", "sell", "filled", [(10.0, 100.0)], position_side="short")
+    book.mark("SEC_A", T_NEXT, mark, -10.0)
+
+    outcome = _by_kind(book.due(DUE))[(coid, "position_return")]
+
+    assert outcome.value == pytest.approx(expected_return)
+    assert outcome.contribution == pytest.approx(expected_contribution)
+
+
 def test_nothing_is_due_until_the_run_after_close_of_the_next_rebalance() -> None:
     book = Book()
     book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
@@ -275,6 +296,18 @@ def test_an_unexecuted_order_has_the_names_return_over_the_horizon(status: str) 
     assert (outcome.client_order_id, outcome.kind) == (coid, "not_executed")
     assert outcome.value == pytest.approx(0.10)
     assert outcome.mark_price == 22.0
+    assert outcome.contribution is None
+
+
+def test_a_missed_short_has_the_short_signed_not_executed_return() -> None:
+    book = Book()
+    coid = book.order("SEC_C", "sell", "expired", position_side="short")
+    book.closes[("SEC_C", T_I)] = 100.0
+    book.closes[("SEC_C", T_NEXT)] = 110.0
+
+    outcome = _by_kind(book.due(DUE))[(coid, "not_executed")]
+
+    assert outcome.value == pytest.approx(-0.10)
     assert outcome.contribution is None
 
 
@@ -512,6 +545,31 @@ def test_stopped_window_horizon_is_the_flattening_fill_when_earlier() -> None:
     assert (buy.value, buy.mark_price) == (pytest.approx(0.05), 105.0)
 
 
+def test_stopped_short_window_ends_at_the_forced_covers_fill() -> None:
+    flatten = date(2026, 10, 20)
+    book = Book()
+    coid = book.order("SEC_A", "sell", "filled", [(10.0, 100.0)], position_side="short")
+    book.order(
+        "SEC_A",
+        "buy",
+        "filled",
+        [(10.0, 95.0)],
+        session=flatten,
+        phase="exit",
+        position_side="short",
+    )
+    book.closes[("SEC_A", flatten)] = 96.0
+    window = OutcomeWindow(
+        window_id=1, stop_requested=date(2026, 10, 19), stop_flat={"SEC_A": date(2026, 10, 22)}
+    )
+
+    outcome = _by_kind(book.due(date(2026, 10, 21), window))[(coid, "position_return")]
+
+    assert outcome.through_session == flatten
+    assert outcome.mark_price == 95.0
+    assert outcome.value == pytest.approx(0.05)
+
+
 def test_stopped_window_horizon_is_close_of_the_next_rebalance_when_earlier() -> None:
     book = Book()
     coid = book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
@@ -696,6 +754,58 @@ def _count(conn: duckdb.DuckDBPyConnection, table: str) -> int:
     row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()
     assert row is not None
     return int(row[0])
+
+
+@pytest.mark.parametrize(
+    ("side", "position_side", "expected"),
+    [
+        ("buy", "long", "position_return"),
+        ("sell", "long", "realised_pnl"),
+        ("sell", "short", "position_return"),
+        ("buy", "short", "realised_pnl"),
+    ],
+)
+def test_written_intent_outcome_completes_check_and_stop_chain(
+    conn: duckdb.DuckDBPyConnection, side: str, position_side: str, expected: str
+) -> None:
+    book = Book()
+    if side == "sell" and position_side == "long":
+        book.order("SEC_A", "buy", "filled", [(10.0, 100.0)], session=F_I)
+    if side == "buy" and position_side == "short":
+        book.order("SEC_A", "sell", "filled", [(10.0, 100.0)], position_side="short", session=F_I)
+    coid = book.order("SEC_A", side, "filled", [(10.0, 100.0)], position_side=position_side)
+    book.mark("SEC_A", T_NEXT, 110.0)
+    _journal(conn, book)
+    append(
+        conn,
+        PaperRunRow(
+            run_id=2,
+            window_id=1,
+            session=DUE,
+            kind="mark",
+            started_at=_utc(DUE),
+            invoked_by="tty",
+            code_version="t",
+            known_at=_utc(DUE),
+            ingested_at=_utc(DUE),
+        ),
+    )
+    errors: list[str] = []
+    write_outcomes_and_lots(
+        conn,
+        1,
+        ACCOUNT,
+        {},
+        book.price_of,
+        DUE,
+        _clock,
+        on_lot_error=errors.append,
+        cadence=CADENCE,
+    )
+    assert errors == []
+    assert {row.kind for row in outcomes_for(conn, 1) if row.client_order_id == coid} == {expected}
+    assert _chain_line(conn, 1, CADENCE).passed
+    assert _not_ready(conn, 1) == []
 
 
 def test_the_writer_appends_outcomes_and_lots_once(conn: duckdb.DuckDBPyConnection) -> None:

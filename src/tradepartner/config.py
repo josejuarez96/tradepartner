@@ -209,6 +209,14 @@ class StoreConfig(_ClosedConfig):
     `lock_retry_seconds` may be zero (a caller that wants "fail
     immediately, no retry" is a legitimate choice) but not negative.
 
+    `writer_lock_retry_seconds` (#2178) is the longer wait the scheduled writers
+    (`paper run`, `paper kill`, `ingest`) use in place of `lock_retry_seconds`, so a
+    reader that holds the store for a minute or two (a dashboard Data health render
+    is ~86 s) is out-waited. The sells have ~85 min of window, but the buys start
+    after `paper.sell_wait_seconds` (about 15 min before the window closes), so
+    the wrapper re-checks the submit window before every submit and sends nothing
+    once it has closed, however long a lock wait took.
+
     `memory_limit` and `threads` (#1418) cap DuckDB's memory and worker
     threads on every store connection (`store.db.configure_connection`).
     Both default to `None`, which sets nothing and keeps DuckDB's own
@@ -221,10 +229,13 @@ class StoreConfig(_ClosedConfig):
 
     path: str = "data/tradepartner.duckdb"
     lock_retry_seconds: int = Field(default=60, ge=0)
+    writer_lock_retry_seconds: int = Field(default=300, ge=0)
     lock_retry_initial_delay_seconds: float = Field(default=0.05, gt=0)
     lock_retry_max_delay_seconds: float = Field(default=1.0, gt=0)
     memory_limit: str | None = None
     threads: int | None = Field(default=None, ge=1)
+    pre_migration_backups_to_keep: int = Field(default=2, ge=1)
+    backup_disk_margin_bytes: int = Field(default=1_000_000_000, ge=0)
 
     @field_validator("memory_limit")
     @classmethod
@@ -255,6 +266,8 @@ class IngestConfig(_ClosedConfig):
 
     settle_delay_minutes: int = 60
     reference_symbol: str = "SPY"
+    # #2196: search only this many prior XNYS sessions for EDGAR-gap bars.
+    edgar_gap_lookback_sessions: int = Field(default=5, ge=0, le=20)
     # Spec default, unmeasured. On SIP history a listed name should lack a bar only on a
     # halt or suspension; measure over ~20 real sessions and tighten (T3, #86).
     max_missing_share: float = 0.05
@@ -274,6 +287,10 @@ class IngestConfig(_ClosedConfig):
     # trail is itself truncated rather than crowding out the error text.
     max_where_frames: int = Field(default=8, gt=0)
     max_where_chars: int = Field(default=1500, gt=0)
+    # #2197 (owner, warn don't refuse): `paper status` and the operations page show an
+    # owner-visible line once this many sessions have closed since the last `ok` daily
+    # EDGAR ingest run. Display only: paper keeps trading on the stale master.
+    edgar_max_age_sessions: int = Field(default=3, ge=1, le=20)
 
 
 class RatesConfig(_ClosedConfig):
@@ -1510,9 +1527,7 @@ class PortfolioConfig(_ClosedConfig):
 
     The section is listed by no family and is a post-registration section under the
     2026-10-09 and #1792 rules, so every key is left out of the canonical set and the
-    fingerprint at its default and no stored registration moves. Until the engine reads
-    all five (T223) `_refuse_until_wired` refuses any non-default value, the #1788
-    guard, so no `long_short` trial can run on a half-built engine.
+    fingerprint at its default and no stored registration moves.
     """
 
     side: Literal["long_only", "long_short"] = "long_only"
@@ -1522,28 +1537,9 @@ class PortfolioConfig(_ClosedConfig):
     short_cover_weight: float = Field(default=0.10, gt=0, le=1.0)
 
     @model_validator(mode="after")
-    def _refuse_until_wired(self) -> PortfolioConfig:
-        """The #1788 guard (T209a, T217): the engine reads none of the five until T223,
-        so a non-default value would name a book no run builds. T223 removes this."""
-        for name in (
-            "side",
-            "gross_exposure",
-            "net_exposure",
-            "short_min_price",
-            "short_cover_weight",
-        ):
-            value = getattr(self, name)
-            if value != PortfolioConfig.model_fields[name].default:
-                raise ValueError(
-                    f"portfolio.{name} = {value!r} is not wired until T223: the engine "
-                    "still builds a long-only book"
-                )
-        return self
-
-    @model_validator(mode="after")
     def _validate_exposures(self) -> PortfolioConfig:
         """`net_exposure` in `[-gross, gross]`, equal to `gross_exposure` under
-        `long_only` (spec item 1). Live once T223's guard goes."""
+        `long_only` (spec item 1)."""
         if not (-self.gross_exposure <= self.net_exposure <= self.gross_exposure):
             raise ValueError(
                 f"portfolio.net_exposure ({self.net_exposure}) must be in "
@@ -2277,6 +2273,19 @@ class RiskConfig(BaseModel):
     # cash may still post; the first reconciliation after them checks the due once.
     # A window frozen before T249 lacks the key and `frozen_risk` reads it at 5.
     reconcile_merger_lag_sessions: int = Field(default=5, ge=0)
+    # #2183: cash may arrive after an ok reconciliation on the ex-date.
+    reconcile_dividend_credit_sessions: int = Field(default=25, ge=1, le=55)
+    # #2183: up to this many unmatched dividend dues are searched exhaustively (2^n
+    # subsets); more need a proven-unique cent-sum fit or the book halts.
+    reconcile_dividend_exhaustive_dues: int = Field(default=8, ge=1, le=12)
+    # #2183: the cent-sum states that uniqueness proof may visit; exhausting them
+    # fails closed (a cash mismatch), keeping a contrived book bounded.
+    reconcile_dividend_subset_states: int = Field(default=10_000, ge=1)
+    # #411: the most a delisted holding's late cash may exceed its last stored close x
+    # quantity (a share of it, in [0, 1]): a cash deal trades below its price, so the
+    # real credit can sit above the stale close; more is not this position's proceeds.
+    # A window frozen before the key lacks it and `frozen_risk` reads it at 0.10.
+    delisting_cash_max_premium: float = Field(default=0.10, ge=0, le=1)
 
 
 # `paper.min_rebalances` per cadence (ADR 0017 part C and open question 2, the paper
@@ -2417,6 +2426,9 @@ class AlertsConfig(BaseModel):
 
     channels: list[AlertChannel] = Field(default_factory=lambda: list(_DEFAULT_ALERT_CHANNELS))
     delivery_timeout_seconds: float = Field(default=10.0, gt=0)
+    # The off-Mac heartbeat ping (#2155, `heartbeat.py`): bounds the one HTTP request
+    # `paper run` and `ingest` make on completion, so a dead network cannot hold a run.
+    heartbeat_timeout_seconds: float = Field(default=5.0, gt=0)
 
     @field_validator("channels")
     @classmethod
@@ -2449,6 +2461,38 @@ class DashboardConfig(BaseModel):
     model_config = _PHASE3_MODEL_CONFIG
 
     page_row_limit: int = Field(default=500, gt=0)
+
+
+class UiConfig(_ClosedConfig):
+    """What the Home and Book pages show (plan T273, #2170); display only, nothing
+    here reaches a run.
+
+    `next_run_time_et` is the clock time (HH:MM, America/New_York) the status line
+    says the next run happens: the schedule itself lives in launchd
+    (docs/runbooks/scheduling.md), so this is text to keep beside it. `holdings_rows`
+    is how many names a book card lists.
+
+    The Book page's "Stop this book now" (plan T277, #2268; ADR 0018 section 2 and
+    its 2026-10-26 amendment): `max_reason_chars` caps the typed reason (as the
+    web app's `webapp.max_reason_chars`); the page waits on the `paper kill`
+    subprocess for `kill_wait_seconds`, which `None` makes
+    `store.writer_lock_retry_seconds` plus `kill_wait_margin_seconds` (interpreter
+    start plus one retry delay). A set value must exceed that sum, or a kill still
+    waiting on the store would be reported as not confirmed (`Settings`, at load).
+    """
+
+    next_run_time_et: str = "08:05"
+    holdings_rows: int = Field(default=5, gt=0)
+    max_reason_chars: int = Field(default=500, gt=0)
+    kill_wait_seconds: int | None = Field(default=None, gt=0)
+    kill_wait_margin_seconds: int = Field(default=30, gt=0)
+
+    @field_validator("next_run_time_et")
+    @classmethod
+    def _hh_mm(cls, value: str) -> str:
+        if re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", value) is None:
+            raise ValueError("ui.next_run_time_et must be HH:MM on a 24-hour clock")
+        return value
 
 
 # The 8-K items a packet keeps, in priority order (research-labeling amendment
@@ -2614,6 +2658,8 @@ class Settings(BaseSettings):
     # T219 (backtest spec amendment #1872): the signed-book section, after the other
     # appended sections for the same reason.
     portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
+    # T273 (#2170): the Home page's display keys, last so no other section shifts.
+    ui: UiConfig = Field(default_factory=UiConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
@@ -2637,6 +2683,12 @@ class Settings(BaseSettings):
     alert_email_to: SecretStr | None = Field(default=None)
     # Optional sender for the email channel; the SMTP login when unset (#404).
     alert_email_from: SecretStr | None = Field(default=None)
+    # Optional dead-man's-switch URLs (#2155; healthchecks.io style), one check per job
+    # because the schedules differ: `paper run` and `ingest` ping theirs on completion.
+    # Secrets (the URL is the credential), so the type-driven `secret_values` scrub
+    # covers them. Env `ALERT_HEARTBEAT_URL_PAPER` / `ALERT_HEARTBEAT_URL_INGEST`.
+    alert_heartbeat_url_paper: SecretStr | None = Field(default=None)
+    alert_heartbeat_url_ingest: SecretStr | None = Field(default=None)
     # Research labeling (docs/specs/research-labeling.md req 17): the vendor key, read
     # only by `research/models.py`, redacted by `secret_values`; with it absent the
     # real model client cannot be built (ADR 0013 point 3 (e)).
@@ -2668,6 +2720,20 @@ class Settings(BaseSettings):
         self._validate_lab_sweepable_keys()
         # Also a plain attribute read and raise, for the same reason (T243).
         self._validate_check_only_symbols()
+        # And again (T277): the kill wait needs `store` and `ui` together.
+        self._validate_kill_wait()
+
+    def _validate_kill_wait(self) -> None:
+        """A set `ui.kill_wait_seconds` must exceed `paper kill`'s worst-case store
+        wait (`store.writer_lock_retry_seconds`) plus `ui.kill_wait_margin_seconds`
+        (ADR 0018, amendment 2026-10-26)."""
+        floor = self.store.writer_lock_retry_seconds + self.ui.kill_wait_margin_seconds
+        if self.ui.kill_wait_seconds is not None and self.ui.kill_wait_seconds <= floor:
+            raise ValueError(
+                f"ui.kill_wait_seconds ({self.ui.kill_wait_seconds}) must be above "
+                f"store.writer_lock_retry_seconds plus ui.kill_wait_margin_seconds ({floor}): "
+                "a shorter bound reports a kill still waiting on the store as not confirmed"
+            )
 
     def _validate_check_only_symbols(self) -> None:
         """`index_check.check_only_symbols` may not overlap `benchmarks` (backtest
@@ -2727,6 +2793,15 @@ class Settings(BaseSettings):
                     "store) would reach nobody (#366 Q22 (iii), #544). Set the "
                     "missing variable(s), add 'macos', or remove 'email'."
                 )
+
+
+def kill_wait_seconds(settings: Settings) -> int:
+    """How long the Book page waits on a `paper kill` subprocess (`UiConfig`):
+    `ui.kill_wait_seconds`, or by default `store.writer_lock_retry_seconds` plus
+    `ui.kill_wait_margin_seconds`."""
+    if settings.ui.kill_wait_seconds is not None:
+        return settings.ui.kill_wait_seconds
+    return settings.store.writer_lock_retry_seconds + settings.ui.kill_wait_margin_seconds
 
 
 def get_settings() -> Settings:
