@@ -119,7 +119,11 @@ the old line there as the as-of reads treat any ticker change; never a
 second span with the old start. A class with a cover page known at the
 fetch, or a change on its latest span's own session, is reported in
 `unmatched_snapshot` instead (once per ticker and exchange). An exchange
-change alone writes nothing. A name absent from today's fetch (delisted)
+change alone writes nothing, in either mode (with `static_columns` off it
+wrote a fresh `snapshot` row before #2291). `master-retract` builds without
+the stored fetches, so it never derives a rename row: harmless while
+`retraction.underived` judges only filing rows, and to revisit if it ever
+judges snapshot rows. A name absent from today's fetch (delisted)
 gets no row: its stored rows only re-derive themselves. A name delisted before the snapshot and
 before cover pages has no listing at all: it is returned in
 `unlisted_securities` so health and the survivorship gap can count it.

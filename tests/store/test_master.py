@@ -2393,6 +2393,11 @@ class TestSnapshotRename:
         build = _rename_build([_rn("RNA", F2)], [_rn("RNA", F1)], settings)
         assert _renamed_rows(build) == [("RNA", "OTC", "snapshot", date(2026, 10, 5), F1)]
 
+    def test_without_static_columns_an_exchange_alone_is_no_rename(self) -> None:
+        settings = _settings(master={"static_columns": ["name"]})
+        build = _rename_build([_rn("RNA", F2, "NYSE")], [_rn("RNA", F1)], settings)
+        assert _renamed_rows(build) == [("RNA", "OTC", "snapshot", date(2026, 10, 5), F1)]
+
     def test_earlier_fetches_never_seed_a_benchmark(self) -> None:
         spy = _snap(SPY_TRUST, "SPDR", "SPY", "NYSE", F1)
         build = _rename_build([_rn("RNA", F2)], [spy])

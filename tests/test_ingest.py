@@ -2779,6 +2779,58 @@ def test_a_no_cover_page_rename_is_one_dated_row_across_nightly_runs(
     assert overlap.passed, overlap.violations
 
 
+def test_a_stored_pre_fix_same_start_pair_gets_one_rename_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    # #2291: the real store already holds the bug's shape: a second
+    # `snapshot_static` row with the old start, known at a later fetch. The
+    # first run after the fix adds one rename row known at that fetch, the
+    # next adds nothing, and the old rows stay untouched.
+    _run(settings, source="edgar", filings=_with_renamed_stat("STAT", FETCHED_AT))
+    bad_fetch = FETCHED_AT + timedelta(days=3)  # Mon 07-01, session 07-01
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "listings",
+            {
+                "security_id": STAT,
+                "ticker": "STAX",
+                "exchange": "OTC",
+                "class_title": None,
+                "valid_from": date(2018, 3, 5),
+                "known_at": bad_fetch,
+                "ingested_at": bad_fetch,
+                "source": "edgar",
+                "provenance": "snapshot_static",
+            },
+        )
+    rows_sql = (
+        "SELECT ticker, provenance, valid_from, known_at FROM listings "
+        f"WHERE security_id = '{STAT}' ORDER BY valid_from, known_at"
+    )
+    seeded = read(rows_sql)
+    stored = []
+    for days in (4, 5):
+        fetched_at = FETCHED_AT + timedelta(days=days)
+        filings = _with_renamed_stat("STAX", fetched_at)
+        result = _run(settings, now=NOW + timedelta(days=days), source="edgar", filings=filings)
+        assert result.ok, result.runs[-1].message
+        stored.append(read(rows_sql))
+    assert stored[0] == [*seeded, ("STAX", "snapshot", date(2019, 7, 1), bad_fetch)]
+    assert stored[1] == stored[0]
+    accepted = settings.model_copy(
+        update={
+            "universe": settings.universe.model_copy(
+                update={"accepted_same_day_pairs": [f"{STAT}@2018-03-05"]}
+            )
+        }
+    )
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        checks = integrity_checks(conn, NOW + timedelta(days=5), accepted)
+    (overlap,) = [c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS]
+    assert overlap.passed, overlap.violations
+
+
 NOT_COMMON = (
     CoverListing("6.00% Series A Preferred Stock", "ACMEP", "NYSE"),
     CoverListing("5.25% Notes due 2030", "ACME30", "NYSE"),
