@@ -2286,6 +2286,21 @@ class RiskConfig(BaseModel):
     # real credit can sit above the stale close; more is not this position's proceeds.
     # A window frozen before the key lacks it and `frozen_risk` reads it at 0.10.
     delisting_cash_max_premium: float = Field(default=0.10, ge=0, le=1)
+    # #2266 (paper spec amendment 2026-10-26 item 5, ADR 0025; open questions 39 to
+    # 41 decided as recommended): reconciliation breaks. A break is immaterial at or
+    # below both the dollar figure and the basis points of ledger equity, summed with
+    # the name's earlier auto-acceptances; an open break older than the age is
+    # `aged`; more open material breaks than the count, or above the share of equity,
+    # is the book-level `break_cap`; the cause lookback is item 14's window. 0 is
+    # allowed for each (a materiality of 0 makes every non-zero break material, a cap of 0
+    # makes every material break a halt). A
+    # window frozen before them reads the defaults through `frozen_risk` (question 42).
+    break_materiality_usd: float = Field(default=25.0, ge=0)
+    break_materiality_bps: float = Field(default=5.0, ge=0, le=10_000)
+    break_max_age_sessions: int = Field(default=5, ge=0)
+    max_open_breaks: int = Field(default=3, ge=0)
+    max_open_break_share: float = Field(default=0.02, ge=0, le=1)
+    break_cause_lookback_sessions: int = Field(default=10, ge=0)
 
 
 # `paper.min_rebalances` per cadence (ADR 0017 part C and open question 2, the paper
