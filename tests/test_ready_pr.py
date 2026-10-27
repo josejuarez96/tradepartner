@@ -1591,3 +1591,9 @@ def test_the_new_template_has_no_box_ready_pr_cannot_tick() -> None:
     assert len(boxes) == 4
     assert not any("uv run pytest" in b for b in boxes)
     assert ready_pr.unchecked_boxes(body.replace("- [ ]", "- [x]")) == []
+
+
+def test_book_page_requires_the_safety_review() -> None:
+    assert "safety-reviewer" in ready_pr.required_reviews(
+        ["src/tradepartner/dashboard/book_page.py"]
+    )
