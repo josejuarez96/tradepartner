@@ -1481,8 +1481,8 @@ why = "Stops every rare corporate event from halting the whole book and becoming
 unblocks = ["issue:2156", "phase:6"]
 
 [adr.0026]
-what = "Phone access: Tailscale Serve (never Funnel) proxies HTTPS on the owner's tailnet to a second, read-only Streamlit process on its own loopback port, which requires the owner's tailnet login and its tailnet Host on every session before any store read and has no write of any kind; the desk instance gains a Host check."
-why = "The owner wants to read his books from his phone; this opens that path without opening the LAN or any write, answers ADR 0018 open question 5 and unparks T278's phone layout."
+what = "Phone access: Tailscale Serve (Funnel removed by policy) proxies HTTPS on the owner's tailnet to a second, read-only Streamlit process on its own loopback port, which requires the owner's tailnet login, its tailnet Host and its own Origin on every script run before any widget or store read and has no write of any kind; the desk instance gains Host, Origin and proxied-header refusals."
+why = "The owner wants to read his books from his phone; this opens that path without opening the LAN or any write, answers ADR 0018 open question 5 and records the phone path T278's plan line was parked on (T278 itself is in PR #2385)."
 unblocks = ["task:T278"]
 
 [task.T289]
