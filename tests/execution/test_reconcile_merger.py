@@ -28,6 +28,7 @@ from tradepartner.errors import ReconciliationError
 from tradepartner.execution import reconcile_run as reconcile_module
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.reconcile import (
+    BREAKS,
     MERGER_CONFLICT,
     OK,
     Explanations,
@@ -304,6 +305,27 @@ def _halts(
     row = _rows(settings, window)[-1]
     mismatches: list[dict[str, Any]] = json.loads(row.mismatches_json or "")["mismatches"]
     return mismatches
+
+
+def _still_halts_on_the_open_finding(
+    settings: Settings,
+    fake: FakeBroker,
+    window: PaperWindowRow,
+    clock: FixedClock,
+    session: date,
+    minute: int = 0,
+) -> None:
+    """The reconcile after a `merger_conflict` explains its removal but still halts.
+
+    Paper spec amendment #2266 item 8: a `finding_key` part (`merger_conflict`)
+    never closes on its own; only `paper true-up` (T282) closes it. T281 keeps
+    the halt (`open finding`, no order) until then, so the old "resume, then
+    `ok`" no longer holds: the row is `breaks` (the finding part) and books the band, and the run
+    raises.
+    """
+    with pytest.raises(ReconciliationError, match="open finding"):
+        _reconcile(settings, fake, window, clock, session, minute)
+    assert _rows(settings, window)[-1].status == BREAKS
 
 
 def _rows(settings: Settings, window: PaperWindowRow) -> list[ReconciliationRow]:
@@ -682,9 +704,17 @@ def test_two_rows_known_before_the_removal_halt_merger_conflict_once_then_fall_b
 
     assert conflict["kind"] == MERGER_CONFLICT and conflict["security_id"] == MTUM
     assert conflict["detail"] == (f"merger ids [{M1!r}, {M2!r}] for {MTUM} effective 2026-10-01")
-    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S, 30).status == OK
-    (band,) = _adjustments(journal_settings, open_window)
-    assert _merger_id(band) is None and band.quantity == pytest.approx(-HELD)
+    _still_halts_on_the_open_finding(journal_settings, fake, open_window, fixed_clock, S, 30)
+    # T281 books no adjustment on a `breaks` row (not yet a cash base, T282b), so
+    # the explanation is recorded on the row and the band is journaled once the
+    # finding is trued up. The fall-back itself is unchanged: the delisting band
+    # explains the removal and neither merger id is read again.
+    assert _adjustments(journal_settings, open_window) == []
+    (explained,) = json.loads(_rows(journal_settings, open_window)[-1].mismatches_json or "")[
+        "explained"
+    ]
+    assert explained["explanation"] == "listing ended"
+    assert explained["quantity"] == pytest.approx(-HELD)
     assert _open(journal_settings, open_window, S2).mergers == {}
 
 
@@ -707,7 +737,7 @@ def test_a_second_row_after_the_first_explained_the_removal_halts_once(
     assert conflict["kind"] == MERGER_CONFLICT
     assert repr(M1) in conflict["detail"] and repr(M2) in conflict["detail"]
 
-    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S2, 30).status == OK
+    _still_halts_on_the_open_finding(journal_settings, fake, open_window, fixed_clock, S2, 30)
     fake.extra_cash = DUE
     kinds = [m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S3)]
     assert kinds == ["cash"]

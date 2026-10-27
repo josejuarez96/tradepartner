@@ -987,6 +987,16 @@ def test_the_explanations_are_unchanged_on_the_cut(
     assert after.dividends == {}
 
 
+def test_break_cause_evidence_ignores_rows_after_close_s_minus_1(
+    fixture: Fixture, cut: duckdb.DuckDBPyConnection
+) -> None:
+    names = set(fixture.held)
+    at_cut = reconcile_run._break_evidence(fixture.full, CUT, fixture.settings, names)
+    assert at_cut == reconcile_run._break_evidence(cut, LATER, fixture.settings, names)
+    later = reconcile_run._break_evidence(fixture.full, LATER, fixture.settings, names)
+    assert later != at_cut  # the injected late split and dividend are live
+
+
 def test_the_marks_are_unchanged_on_the_cut(
     fixture: Fixture, cut: duckdb.DuckDBPyConnection
 ) -> None:
