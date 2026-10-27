@@ -151,7 +151,8 @@ SAFETY_PREFIXES = (
     "src/tradepartner/execution/",
     "src/tradepartner/errors.py",
     "src/tradepartner/llm/",
-    # the kill-switch override page and its test (#773)
+    # the dashboard kill-switch pages and override test (#773, #2337)
+    "src/tradepartner/dashboard/book_page.py",
     "src/tradepartner/dashboard/override_page.py",
     "tests/dashboard/test_override_page.py",
     # the dashboard's child-process modules: book actions and the Lab (#2304)

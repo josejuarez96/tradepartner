@@ -166,6 +166,20 @@ def test_parse_plan_reads_ids_titles_deps_owner_and_phase() -> None:
     assert tasks["T5"].phase == 2
 
 
+def test_task_ref_regex_requires_whole_task_id_boundaries() -> None:
+    assert team.TASK_REF_RE.findall("T266a12") == []
+    assert team.TASK_REF_RE.findall("xT241") == []
+    assert team.TASK_REF_RE.findall("T241 T171d T266a1 (T241) T281/T282 T241,") == [
+        "T241",
+        "T171d",
+        "T266a1",
+        "T241",
+        "T281",
+        "T282",
+        "T241",
+    ]
+
+
 def test_task_brief_prints_the_task_line_and_its_dependencies_with_locations() -> None:
     tasks = team.parse_plan(PLAN, "docs/plans/data-foundation.md")
     by_id = {t.id: t for t in tasks}
