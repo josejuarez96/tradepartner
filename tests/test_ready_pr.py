@@ -1633,6 +1633,13 @@ def test_a_failing_static_test_stops_before_the_push() -> None:
     assert r.pushed == []
 
 
+def test_every_static_invariant_test_file_exists() -> None:
+    """A renamed test file would silently drop out of the static check (#2387)."""
+    root = Path(__file__).resolve().parents[1]
+    for entry in ready_pr.STATIC_INVARIANT_TESTS:
+        assert (root / entry.split("::")[0]).is_file(), entry
+
+
 def test_book_page_requires_the_safety_review() -> None:
     path = "src/tradepartner/dashboard/book_page.py"
     assert ready_pr.required_reviews([path]) == {"safety-reviewer"}
