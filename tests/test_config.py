@@ -3363,6 +3363,16 @@ def test_ui_kill_keys_default_and_validate() -> None:
                 Settings(_env_file=None, ui={key: bad})
 
 
+def test_ui_lab_file_keys_default_and_validate() -> None:
+    """T289 (#2319): the Lab listing's message cap and git timeout."""
+    s = _settings()
+    assert (s.ui.lab_message_chars, s.ui.lab_git_timeout_seconds) == (500, 10)
+    for key in ("lab_message_chars", "lab_git_timeout_seconds"):
+        for bad in (0, -1):
+            with pytest.raises(ValidationError):
+                Settings(_env_file=None, ui={key: bad})
+
+
 def test_ui_kill_wait_seconds_must_exceed_the_kill_store_wait_by_the_margin() -> None:
     """ADR 0018's 2026-10-26 amendment: a caller's bound on `paper kill` must exceed
     its worst-case store wait (`store.writer_lock_retry_seconds`) by a margin, or a
