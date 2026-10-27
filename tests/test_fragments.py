@@ -381,3 +381,58 @@ def test_check_and_fold_refuse_a_task_no_plan_names(tmp_path: Path) -> None:
     # Nothing was written: STATUS, CHANGELOG and the fragment are as they were.
     assert (tmp_path / "docs" / "STATUS.md").read_text() == STATUS
     assert (tmp_path / "changelog.d" / "2290-x.md").exists()
+
+
+# letter-digit task ids (#2282): T266a1/T266a2 in docs/plans/paper-trading.md
+
+SUFFIX_PLAN = (
+    "# Plan: Paper trading (Phase 5)\n\n## Tasks\n\n"
+    "- [ ] **T266a1: Marked pre-migration backup.** · Files: `a.py` · Depends on: T241\n"
+    "- [ ] **T266a2: `migrate(settings)`.** · Files: `b.py` · Depends on: T266a1\n"
+)
+
+
+def test_a_fragment_names_a_letter_digit_task_and_the_older_ones() -> None:
+    f = _frag("2160-backup.md", "task: T266a1 (PR #2161)\n- #2160 backup (PR #2161)\n")
+    assert f.tasks == [("T266a1", 2161)]
+    assert _frag("2290-map.md", "task: T241 (PR #1)\n").tasks == [("T241", 1)]
+    assert _frag("2290-map.md", "task: T171d (PR #1)\n").tasks == [("T171d", 1)]
+
+
+def test_a_letter_digit_id_is_a_plan_task_and_the_fold_ticks_it() -> None:
+    plans = {"docs/plans/paper-trading.md": SUFFIX_PLAN}
+    assert fragments.plan_task_ids(plans) == {"T266a1", "T266a2"}
+    out = fragments.fold_plans(plans, [_frag("2160-backup.md", "task: T266a1 (PR #2161)\n")])
+    lines = out["docs/plans/paper-trading.md"].splitlines()
+    assert lines[4] == (
+        "- [x] **T266a1: Marked pre-migration backup.** (#2160, PR #2161) · Files: `a.py` "
+        "· Depends on: T241"
+    )
+    assert lines[5] == "- [ ] **T266a2: `migrate(settings)`.** · Files: `b.py` · Depends on: T266a1"
+
+
+def test_collapsed_dependencies_keep_a_letter_digit_id() -> None:
+    prose = "T241, T266a1 (the backup task, see #2160)" + " x" * 200
+    line = f"- [ ] **T9: Deps.** · Files: `a.py` · Depends on: {prose}"
+    assert fragments.collapse_plan_line(line, issue=5, pr=6).endswith("· Depends on: T241, T266a1")
+
+
+def test_add_check_show_and_fold_a_letter_digit_task(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _repo(tmp_path)
+    (tmp_path / "docs" / "plans").mkdir()
+    (tmp_path / "docs" / "plans" / "paper-trading.md").write_text(SUFFIX_PLAN)
+    args = ["add", "2160", "--slug", "backup", "--task", "T266a1", "--pr", "2161", "--added", "b"]
+    assert fragments.main([*root, *args]) == 0
+    assert (tmp_path / "changelog.d" / "2160-backup.md").read_text() == (
+        "task: T266a1 (PR #2161)\n### Added\n- b\n"
+    )
+    capsys.readouterr()
+    assert fragments.main([*root, "check"]) == 0  # T266a1 is a plan task, not an unknown id
+    assert fragments.main([*root, "show"]) == 0
+    assert "- T266a1 (#2160, PR #2161)" in capsys.readouterr().out
+    assert fragments.main([*root, "fold"]) == 0
+    ticked = (tmp_path / "docs" / "plans" / "paper-trading.md").read_text()
+    assert "**T266a1: Marked pre-migration backup.** (#2160, PR #2161)" in ticked
+    assert "- [ ] **T266a2: `migrate(settings)`.**" in ticked  # its dependant is untouched

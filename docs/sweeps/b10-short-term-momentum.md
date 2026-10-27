@@ -12,6 +12,10 @@ registered.
 
 **Family:** momentum  ·  **Author:** team b10sweep (agent draft); the two-variant grid and the control by Jose Juarez (B10-1 to B10-5 taken as recommended, #1358; "Yes draft the b10 sweep", 2026-10-20)  ·  **Date:** 2026-10-20  ·  **Issue:** #2106
 
+**Pre-registration decisions:** Jose Juarez, 2026-10-27, #2109 (answers to PR #2108).
+
+**Universe (2026-10-27, before registration):** utilities (SIC 4900-4999) are excluded, as in every earlier momentum trial: the momentum family's rules were frozen on 2026-10-07 with that exclusion, before ADR 0006's 2026-10-11 amendment made "no exclusion" the default, and `sweep register` refuses a file that differs (Jose Juarez, 2026-10-27).
+
 This is the sweep file the hypothesis file
 [b10-short-term-momentum](../hypotheses/b10-short-term-momentum.md) names: B10 enters the
 lab as a sweep, because a standalone file registers only as a promoted one (strategy-lab
@@ -63,6 +67,7 @@ owner-edited exception lists `universe.accepted_price_jumps`,
 `universe.accepted_same_day_pairs`, `universe.accepted_shares_facts` and
 `master.keep_successors` to the momentum family rules' values, so a later `.env` entry
 cannot move this file's frozen set.
+`universe.rank_by` remains unpinned by the owner's #2109 decision.
 
 ```toml sweep
 slug = "b10-short-term-momentum"
@@ -94,6 +99,7 @@ signal_anchor = "month_end"
 
 [universe]
 top_n_by_cap = 1000
+exclude_sic_ranges = [[4900, 4999]]
 accepted_price_jumps = []
 accepted_same_day_pairs = ["0001903392@2024-03-14"]
 accepted_shares_facts = []
@@ -153,6 +159,16 @@ Owner answers that set these values, one line each:
 - B10-5: the file plus the three pre-declared variants; the control (ii) runs in this
   sweep beside B10.
 - 2026-10-20: "Yes draft the b10 sweep".
+- 2026-10-27, #2109: keep the base settings; a rung-4 delay shock may use an optional
+  sibling file later, with no sibling drafted here.
+- 2026-10-27, #2109: a B10 paper book uses an operations file through
+  `hypothesis register --operations-book-of`, not promotion.
+- 2026-10-27, #2109: pin all four exception lists to the momentum family rules.
+- 2026-10-27, #2109: confirm N from the store on registration day.
+- 2026-10-27, #2109: B10 beats its control only when its base-level
+  `excess_cagr_spy` is strictly above the control's in this sweep.
+- 2026-10-27, #2109: leave `universe.rank_by` unpinned.
+- 2026-10-27, #2109 (PR #2108 NIT): rung 4 reads `dsr_excess` at the base level.
 
 ## Expected magnitudes and red flags for the sweep
 
@@ -164,10 +180,13 @@ Owner answers that set these values, one line each:
   prior sits at or below B10's, inside the same range. Both variants inside the range is
   the expected outcome; over 40 monthly returns at about 10 %/yr tracking error, one
   outside it would not be surprising.
-- **The sign reading** (pre-declared): same sign, the screen adds nothing; B10 above zero
-  and the control below, SH-9's turnover mechanism is visible in our data; both negative,
-  SH-1's null covers both. It selects nothing for promotion; it is one of rung 4's kill
-  criteria (see "Retirement condition").
+- **The sign reading** (pre-declared): both positive or both negative, the screen adds
+  nothing by sign alone; both negative fits SH-1's null. B10 above zero and the control
+  below makes SH-9's turnover mechanism visible in our data; B10 below zero and the
+  control above means the screen hurts,
+  against SH-9. It selects nothing for promotion; the T165e/ADR 0023 plan line overrides
+  the hypothesis file's "diagnostic only" wording for rung 4, where this comparison is a
+  kill criterion (see "Retirement condition").
 - **Turnover and cost.** One-sided `turnover_monthly` about 85 to 95 % for B10; cost drag
   at 15 bp about 3 to 3.5 pp/yr, at the 100 bp rung about 20 to 23 pp/yr. The control's
   book (about 200 names) should turn over somewhat less. A `cost_drag` far from
@@ -197,7 +216,8 @@ The `momentum` family's N before this sweep is **11** as the buy/hold sweep coun
 ([momentum-hold-top-fraction](momentum-hold-top-fraction.md), "Power arithmetic"), **12**
 once that sweep's one variant has run `ok`. After this sweep, with both variants `ok`,
 **N = 13 or 14**. B10's later rung-4 runs (a delayed sibling file, if any) and rung-5
-placebos are `trials` rows in `momentum`'s N too (ADR 0023), so N rises further. V is the family's, read at registration, floored at
+placebos are `trials` rows in `momentum`'s N too (ADR 0023), so N rises further. Confirm
+N from the store on registration day. V is the family's, read at registration, floored at
 `lab.min_sharpe_variance_annual` (0.04). At N = 14 the expected maximum Sharpe of a null
 grid is about `√V · ((1 − γ)·Φ⁻¹(1 − 1/N) + γ·Φ⁻¹(1 − 1/(N·e)))` ≈ **1.74 · √V** (1.70 at
 N = 13): about **0.35** annual at the V floor, more if the family's spread is wider.
@@ -234,9 +254,14 @@ Results already seen before registration:
    (`paper report`, T203), read before this sweep runs; the sweep runs only if rung 1
    passes. It is a cost measurement, not a return.
 9. **Kill-ladder rungs 2 and 3 for B10** (the long leg's sign and size in open data;
-   capacity): read-only arithmetic that the plan runs during the wait for rung 1. None had
-   been read when this file was drafted; any note written before registration is listed
-   here by issue before the owner registers.
+   capacity): read-only arithmetic that the plan runs during the wait for rung 1. At this
+   edit, no separate B10 rung-2 or rung-3 result note is recorded on issue #2109. The
+   prior material already read is SH-9's long-short, gross published spread, with no
+   reported long leg or independent post-2018 US test (item 1), and the hypothesis file's
+   capacity estimate of about 40 names and 72 orders per month at roughly 90% monthly
+   one-sided turnover. These are priors, not a rung verdict. Before registration and
+   before rung 4 runs, the owner must record passing rung-2 and rung-3 notes on #2109 and
+   cite them here. A failed rung stops the ladder under ADR 0023.
 10. **Ladder ledger disclosure (rule L3).** The
    [ladder ledger](../research/hypothesis-backlog.md#ladder-ledger) has no row for B10's
    mechanism (its rows are B9, IRRX, Q1 and L-1). IRRX's row records a related look: the
@@ -263,23 +288,26 @@ rule. The control retires nothing but the sweep: it is not B10, and it is never 
 to the hypothesis file.
 
 **Kill-ladder rung 4** (ADR 0023; backtest plan T165e). This sweep is B10's rung 4, run
-only if rung 1 passed. The plan line's kill criteria, stated before any run: B10 is
-**killed** if, at the harsh settings, its net excess CAGR over SPY is below 0 **or** its
-`dsr_excess` is below 0.5, **or** if the 0.20 variant does not beat its control by the
-pre-declared sign test. What this file supplies and what it does not:
-- **Cost doubled to 30 bp per side**: supplied. It is the first level of
+only after rungs 1, 2 and 3 pass. The T165e kill criteria, with the owner's #2109
+base-level `dsr_excess` reading, are stated before any run: B10 is **killed** if its net
+excess CAGR over SPY at the 30 bp per-side cost level is below 0,
+**or** its base-level `dsr_excess` is below 0.5, **or** the 0.20 variant does not beat
+its control. The T165e/ADR 0023 plan line makes the control comparison a rung-4 kill
+criterion despite the hypothesis file's "diagnostic only" wording. What this file supplies:
+- **Cost doubled to 30 bp per side**: supplied. It is the first non-zero level of
   `sensitivity_per_side_bps`, printed in each variant's own trial rows; rung 4 reads the
   0.20 variant's net excess at that level.
-- **A one-session delay** (`strategy.signal_delay_sessions = 1`): not supplied. The key
+- **A one-session delay** (`strategy.signal_delay_sessions = 1`): optional later sibling
+  sweep file, not supplied here. The key
   is not in `momentum`'s `sweepable_keys`, and a fixed value here would make B10's frozen
   set differ from the hypothesis file's. It needs a separate counted registration (a
   sibling sweep file whose fixed block sets it), drafted only on the owner's word.
 - **Open fills** (`execution.fill_price = open`): not available in `momentum`.
   `execution.` is a forbidden prefix whose value must equal the family rules (`close`),
   so no `momentum` file can register it.
-- **"Beats its control"**: the definition of the sign test is the owner's, settled before
-  registration and written here then (PR #2108, open question 5). Until it is, this file
-  is not ready to register.
+- **"Beats its control"**: the 0.20 variant's base-level `excess_cagr_spy` must be
+  strictly above the 1.0 control's base-level `excess_cagr_spy` in this same sweep. Equal
+  readings fail. This is one comparison of stored values, with no p-value.
 
 By this file's power arithmetic, `dsr_excess` ≥ 0.5 is reachable only above about
 +3.5 pp/yr, a red-flagged result: **rung 4 as written kills every outcome that is not
@@ -289,5 +317,10 @@ red-flagged first.** The owner sees that before registering.
 rules (spec req 4): it must be the argmax and reach `promote_at_least` against the
 family's mark, which the power arithmetic says no plausible result does. The sweep also
 promotes nothing while a variant is `red_flag`ged, until the audit that flag opens has
-cleared it. A paper book for a B10 that survives rung 4 without promotion would need
-another route (PR #2108, open question 2); this file does not choose it.
+cleared it. A paper book for a B10 that survives rung 4 without promotion uses an
+operations file registered through `hypothesis register --operations-book-of` for the
+0.20 variant, on the owner's word; it is not a promotion.
+
+The older T165e plan line still describes promotion, harsh-level `dsr_excess`, and an
+undefined sign test. The owner's #2109 decisions above settle this file; that plan line
+and T161's paper-book dependency need a separate amendment before execution.

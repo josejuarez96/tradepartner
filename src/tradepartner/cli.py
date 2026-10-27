@@ -4754,7 +4754,7 @@ def make_app(
                 try:
                     return paper_shakedown.shakedown(conn, s, now=now)
                 except ValueError:
-                    if registry.shakedown_span(conn) is None:
+                    if registry.shakedown_span(conn, now=now) is None:
                         return None
                     raise
 

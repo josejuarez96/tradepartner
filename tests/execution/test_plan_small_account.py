@@ -181,14 +181,19 @@ class Chain:
     requests: tuple[OrderRequest, ...]
 
 
-def _chain(frozen: RiskConfig, assets: Mapping[str, Asset] | None = None) -> Chain:
+def _chain(
+    frozen: RiskConfig,
+    assets: Mapping[str, Asset] | None = None,
+    *,
+    plan_assets: Mapping[str, Asset] | None = None,
+) -> Chain:
     assets = assets if assets is not None else _assets()
     held = dict.fromkeys(OLD, OLD_SHARES)
     decided = decisions_from(
         _plan(),
         Ledger(positions=held, cash=START_CASH, through=S),
         (),
-        assets,
+        plan_assets if plan_assets is not None else assets,
         {},
         frozenset(),
         frozen,
@@ -520,6 +525,20 @@ def test_a_rounded_up_buy_plans_what_it_submits_so_shakedown_e3_passes() -> None
         assert planned is not None and notional is not None
         # E.3's per-decision check, at a full fill of the order.
         assert notional <= planned + frozen.reconcile_cash_tolerance, sid
+
+
+def test_a_whole_share_plan_that_becomes_fractionable_plans_its_rounded_order() -> None:
+    """The journaled E.3 bound covers a sub-minimum buy that becomes fractionable."""
+    frozen = _profile()
+    sid = SMALL[-1]
+    chain = _chain(frozen, plan_assets=_assets(sid))
+    row = next(row for row in chain.rows if row.security_id == sid)
+    request = next(request for request in chain.requests if request.symbol == sid)
+    assert row.whole_share is True
+    assert row.planned_notional == frozen.min_order_notional
+    assert request.notional == row.planned_notional
+    assert request.notional is not None
+    assert request.notional <= row.planned_notional + frozen.reconcile_cash_tolerance
 
 
 #: Cash short of the plan: $50 for 21 x $4.00 + 4 x $1.00. The current priority (the
