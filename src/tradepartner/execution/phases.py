@@ -704,7 +704,13 @@ def buy_orders(
         ):
             skips.append(Skip(_id(decision), sid, _SKIP_NOT_FRACTIONABLE))
             continue
-        lost = True if not asset.fractionable else None
+        lost = (
+            True
+            if not asset.fractionable
+            else False
+            if frozen.small_account.enabled and decision.position_side == LONG
+            else None
+        )
         to_size.append(BuyToSize(decision, attempt.remainder, whole_share=lost))
 
     sizing_of = {_id(b.decision): b for b in to_size}
@@ -722,6 +728,9 @@ def buy_orders(
         cash = float(max(Decimal(repr(float(cash))) - short_value, Decimal(0)))
     for sizing in size_buys(to_size, cash, price_of, frozen, costs):
         decision = sizing_of[sizing.decision_id].decision
+        if sizing.skip_below_minimum:
+            skips.append(Skip(sizing.decision_id, sizing.security_id, _SKIP_BELOW_MINIMUM))
+            continue
         if sizing.deferred:
             deferred.append(sizing.decision_id)
             continue
