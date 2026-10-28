@@ -1536,3 +1536,13 @@ unblocks = ["task:T294"]
 what = "The charter's Interface line names the dashboard's child-process writes: stop a book, register a strategy, run a counted trial."
 why = "The charter still says the override is the only write; ADR 0018's amendment asks for this line before the app runs trials (#2304)."
 unblocks = ["task:T294"]
+
+[task.T305b]
+what = "A pure reader of the SEC's quarterly insider bulk data set into Form 4 rows, the zip fetch and the four bulk-route config keys."
+why = "It cuts the Form 4 backfill from about 64 hours of XML fetches to about 1 hour (#2498), and needs no store, so it can merge before the span ends."
+unblocks = ["task:T307d"]
+
+[task.T307d]
+what = "The Form 4 backfill driver: one route per accession (bulk, or XML for the current quarter and prices under $1), acceptance from submissions, the line-order check and the request budget."
+why = "It writes the insider rows that hypothesis B7 reads, dated by acceptance and never by the bulk filing date (#2498)."
+unblocks = ["task:T308"]
