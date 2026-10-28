@@ -285,7 +285,8 @@
     "stale_listing_sessions": 63
   },
   "health": {
-    "min_session_rows_share": 0.0
+    "min_session_rows_share": 0.0,
+    "warn_free_disk_gb": 15.0
   },
   "holdout": {
     "end": null,
@@ -321,6 +322,7 @@
     "max_missing_share": 0.05,
     "max_where_chars": 1500,
     "max_where_frames": 8,
+    "min_free_disk_gb": 5.0,
     "reference_symbol": "SPY",
     "settle_delay_minutes": 60
   },
