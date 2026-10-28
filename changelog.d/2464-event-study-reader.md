@@ -1,3 +1,4 @@
-- T302 event-study reader and synthetic fixture store built with bounded as-of reads (#2464).
+task: T302 (PR #2467)
+- T302 event-study store reader and synthetic fixture store (#2464).
 ### Added
-- Event-study store reader uses read-only as-of bar and shares cuts with a synthetic fixture store (#2464).
+- An event-study reader that pulls events and prices from the store at an explicit known_at cut, with a synthetic fixture store (#2464).
