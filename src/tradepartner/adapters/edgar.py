@@ -965,7 +965,10 @@ def _xml_date(text: str) -> date:
     match = _XML_DATE.match(text)
     if match is None:
         raise _BadField(f"not a date: {text!r}")
-    return date.fromisoformat(match.group(1))
+    try:
+        return date.fromisoformat(match.group(1))
+    except ValueError as e:
+        raise _BadField(f"invalid date: {text!r}") from e
 
 
 def _xml_decimal(text: str) -> Decimal:
@@ -1058,9 +1061,13 @@ def _form4_fields(element: ET.Element) -> dict[str, Any] | None:
         price_text = value("transactionAmounts/transactionPricePerShare")
         owned_text = value("postTransactionAmounts/sharesOwnedFollowingTransaction")
         deemed_text = value("deemedExecutionDate")
+        try:
+            deemed = _xml_date(deemed_text) if deemed_text else None
+        except _BadField:
+            deemed = None  # optional: an invalid date is absent, as dateOfOriginalSubmission
         return {
             "transaction_date": _xml_date(date_text),
-            "deemed_execution_date": _xml_date(deemed_text) if deemed_text else None,
+            "deemed_execution_date": deemed,
             "transaction_code": code,
             "acquired_disposed": acquired,
             "shares": _xml_decimal(shares_text),

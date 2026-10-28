@@ -39,6 +39,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Literal, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -58,6 +59,9 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from tradepartner.config_base import _PHASE3_MODEL_CONFIG as _PHASE3_MODEL_CONFIG
+from tradepartner.config_base import _ClosedConfig as _ClosedConfig
 
 # `edgar.statement_tags`' default (spec amendment 2026-10-03, #660, decision
 # (a)): canonical names, each an ordered list of fallbacks, every one the
@@ -164,12 +168,6 @@ def _default_research_data_dir() -> str:
     run launched from another working directory still finds it; gitignored by
     `data/*`."""
     return str(Path(__file__).resolve().parents[2] / "data" / "research")
-
-
-class _ClosedConfig(BaseModel):
-    """Shared validation for early configuration sections."""
-
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
 
 
 class CalendarConfig(_ClosedConfig):
@@ -291,6 +289,10 @@ class IngestConfig(_ClosedConfig):
     # owner-visible line once this many sessions have closed since the last `ok` daily
     # EDGAR ingest run. Display only: paper keeps trading on the stale master.
     edgar_max_age_sessions: int = Field(default=3, ge=1, le=20)
+    # #2454: free GB the store's disk must have for an ingest to start; below it the
+    # ingest refuses before any write (clear message, exit 1, a /fail heartbeat for the
+    # scheduled shape). 0 turns the check off. Run-time, same default as the paper floor.
+    min_free_disk_gb: float = Field(default=5.0, ge=0)
 
 
 class RatesConfig(_ClosedConfig):
@@ -1072,6 +1074,10 @@ class HealthConfig(_ClosedConfig):
     """
 
     min_session_rows_share: float = Field(default=0.0, ge=0.0, le=1.0)
+    # #2454: `health` warns once the store's disk has less free space than this many GB,
+    # well above `ingest.min_free_disk_gb` and `paper.min_free_disk_gb` so there is time
+    # to act. 0 turns the warning off.
+    warn_free_disk_gb: float = Field(default=15.0, ge=0)
 
 
 class BorrowConfig(_ClosedConfig):
@@ -1360,14 +1366,6 @@ HypothesisFamily = Literal[
 # `HypothesisFamily` since both are the enumerations a hypothesis file pins.
 Cadence = Literal["month_end", "week_end", "daily"]
 SignalAnchor = Literal["month_end", "offset"]
-
-# Every Phase 3 section rejects unknown keys and non-finite floats. A hypothesis file pins
-# `strategy.*` and `costs.*` (spec req 10), so a misspelt key must fail rather than fall back
-# silently to the default, and a NaN or infinite value must fail rather than turn a
-# result into NaN. Errors hide the input value by default (#1093), as `Settings` does:
-# a caller that knows its input holds no secret (`execution/`'s frozen costs and risk)
-# puts it back with `render_validation_errors`.
-_PHASE3_MODEL_CONFIG = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
 
 
 class HypothesesConfig(BaseModel):
@@ -2570,6 +2568,23 @@ class EventsConfig(_ClosedConfig):
     )
     sec_forms_enabled: bool = False
     sec_forms_read_enabled: bool = False
+    # The Form 4 bulk route (plan T305b, #2498 amendment). None of these is a frozen key.
+    # `sec_forms_backfill_start`: the first filing date the backfill takes.
+    # `form4_xml_price_below`: an accession with a bulk price under it goes to XML (the
+    # set rounds prices to 2 decimals). `form4_zero_price_xml_codes`: a 0.00 price counts
+    # as under it only for these transaction codes (an award or gift reports 0 truly).
+    # `form4_bulk_order_sample`: accessions per quarter fetched as XML to check
+    # `NONDERIV_TRANS_SK` order (at most 1,000). `sec_forms_max_requests`: SEC requests per
+    # backfill run (at most 200,000, five times the #2498 estimate). `form4_bulk_max_member_bytes`:
+    # the largest uncompressed table member the bulk reader takes (refused above it).
+    sec_forms_backfill_start: date = date(2016, 1, 1)
+    form4_xml_price_below: Decimal = Field(default=Decimal("1.00"), gt=0)
+    form4_zero_price_xml_codes: list[Annotated[str, Field(min_length=1, pattern=r"^\S+$")]] = Field(
+        default_factory=lambda: ["P", "S"]
+    )
+    form4_bulk_order_sample: int = Field(default=20, gt=0, le=1_000)
+    sec_forms_max_requests: int = Field(default=40_000, gt=0, le=200_000)
+    form4_bulk_max_member_bytes: int = Field(default=1024**3, gt=0, le=8 * 1024**3)
 
 
 class UiConfig(_ClosedConfig):
@@ -2597,6 +2612,9 @@ class UiConfig(_ClosedConfig):
     `sweep_runs` row or an `unfinished` trial may stay open before the page lists it
     apart as an orphan (a run whose writer died) that no longer blocks a new run.
     `lab_poll_seconds` is the positive interval for the Lab status fragment.
+    `lab_slot_grace_seconds` is the grace period for a stale Lab run slot.
+    `lab_tail_bytes` is how many bytes of the child's log to show.
+    `lab_ps_timeout_seconds` bounds the `ps` call that checks the child's start time.
     """
 
     next_run_time_et: str = "08:05"

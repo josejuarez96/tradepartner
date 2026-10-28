@@ -20,6 +20,8 @@ from tradepartner.dashboard.lab_run import Busy, SlotRecord, SlotStatus, Taken
 from tradepartner.dashboard.lab_verdict import InFlight, LabVerdict, SweepVerdicts
 from tradepartner.store import lab_registry, registry
 
+_POLL_ENDED = "lab_poll_ended"
+
 
 def _file(
     *, state: RegistryState = RegistryState.NOT_REGISTERED, git: GitState = GitState.MERGED
@@ -93,6 +95,7 @@ def test_non_default_lab_slot_grace_seconds_reaches_take(
     monkeypatch.setattr(lab_page.lab_run, "take", capture_take)
     spawn = Mock()
     monkeypatch.setattr(lab_page.lab_child, "spawn", spawn)
+    monkeypatch.setattr(lab_page.lab_run, "watch", Mock())
     monkeypatch.setattr(
         lab_page.lab_run,
         "record",
@@ -131,6 +134,7 @@ def test_failed_spawn_abandons_slot_and_scrubs_message(
     monkeypatch.setattr(lab_page.lab_run, "take", Mock(return_value=taken))
     abandon = Mock(return_value=True)
     monkeypatch.setattr(lab_page.lab_run, "abandon", abandon)
+    monkeypatch.setattr(lab_page.lab_run, "watch", Mock())
     monkeypatch.setattr(
         lab_page.lab_child,
         "spawn",
@@ -155,6 +159,7 @@ def test_record_failure_after_spawn_keeps_slot_reserved(
     monkeypatch.setattr(lab_page.lab_run, "take", Mock(return_value=taken))
     abandon = Mock()
     monkeypatch.setattr(lab_page.lab_run, "abandon", abandon)
+    monkeypatch.setattr(lab_page.lab_run, "watch", Mock())
     monkeypatch.setattr(
         lab_page.lab_child,
         "spawn",
@@ -324,6 +329,22 @@ def test_status_poll_reruns_once_after_child_ends(monkeypatch: pytest.MonkeyPatc
     ui.rerun.assert_called_once_with()
 
 
+def test_quick_run_after_a_finished_run_still_refreshes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run that ends before any poll saw it running still triggers the page refresh."""
+    ui = Mock(session_state={_POLL_ENDED: True})  # the previous run already refreshed
+    monkeypatch.setattr(lab_page, "st", ui)
+    monkeypatch.setattr(lab_page.lab_run, "take", Mock(return_value=Taken(Path("slot"), "t")))
+    monkeypatch.setattr(lab_page.lab_run, "watch", Mock())
+    monkeypatch.setattr(lab_page.lab_child, "spawn", Mock())
+    monkeypatch.setattr(lab_page.lab_run, "record", Mock())
+    lab_page._start_run(Settings(_env_file=None), "b10", None, datetime.now(UTC), (), 0, Mock())
+    monkeypatch.setattr(
+        lab_page.lab_run, "status", Mock(return_value=SlotStatus("ended", None, ""))
+    )
+    lab_page._poll_status(Settings(_env_file=None))
+    ui.rerun.assert_called_once_with()
+
+
 @pytest.mark.parametrize(
     ("file", "busy"),
     [
@@ -481,6 +502,45 @@ def test_result_reading_orders_thresholds_result_rule_and_detail(
         "Owner decision",
     ):
         assert f"{term} ⓘ" in text
+
+
+def _reading_words(monkeypatch: pytest.MonkeyPatch, sweep: object, report: object) -> str:
+    events: list[str] = []
+    ui = MagicMock()
+    ui.write.side_effect = lambda value: events.append(str(value))
+    ui.caption.side_effect = lambda value: events.append(str(value))
+    ui.expander.side_effect = lambda label: (events.append(f"expander:{label}"), nullcontext())[1]
+    ui.selectbox.return_value = None
+    monkeypatch.setattr(lab_page, "st", ui)
+    monkeypatch.setattr(lab_page, "_safe_scrub", lambda text, _settings: text)
+    monkeypatch.setattr(lab_page.sweep_report, "sweep_report", Mock(return_value=report))
+    monkeypatch.setattr(lab_page.registry, "family_holdout_spends", Mock(return_value=[]))
+    monkeypatch.setattr(lab_page.registry, "development_boundary", Mock(return_value=None))
+    lab_page._result_reading(Mock(), Settings(_env_file=None), sweep)
+    return " ".join(events)
+
+
+def test_result_reading_suggests_retire_when_promote_and_retire_both_met(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec req 4: a sweep whose argmax meets retire_below promotes nothing."""
+    sweep, report = _reading_fixture()
+    report.verdicts.retire_below_met = True
+    words = _reading_words(monkeypatch, sweep, report)
+    assert "sweep retire" in words
+    assert "sweep promote" not in words
+
+
+def test_result_reading_complete_sweep_with_no_counted_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All variants failed terminally: complete, no winner, not 'wait for a decision'."""
+    sweep, report = _reading_fixture()
+    report.verdicts = None
+    report.rows[0].status = "terminal_failed"
+    words = _reading_words(monkeypatch, sweep, report)
+    assert "no variant completed successfully" in words
+    assert "until it is complete" not in words
 
 
 def test_incomplete_sweep_has_no_argmax_or_desk_decision(
