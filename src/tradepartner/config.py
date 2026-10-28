@@ -1351,7 +1351,9 @@ class CoverageConfig(_ClosedConfig):
 # for the deflated Sharpe, so a family cannot be invented by config: adding one is a
 # reviewed code change here. `oracle` is refused on the real store (registry, T31b). A
 # test pins `get_args(HypothesisFamily) == tuple(FAMILIES)` (ADR 0014 point 2).
-HypothesisFamily = Literal["momentum", "oracle", "profitability", "combined", "filing_delay"]
+HypothesisFamily = Literal[
+    "momentum", "oracle", "profitability", "combined", "filing_delay", "spinoff"
+]
 
 # Cadence and signal anchor (strategy-lab spec, "Config keys"; ADR 0012, superseding
 # ADR 0006's Cadence section): frozen per hypothesis like the universe, beside
@@ -1574,8 +1576,9 @@ class PortfolioConfig(_ClosedConfig):
 #
 # `oracle` is a test-only entry that reads momentum's `strategy` section (as today), so
 # it is left out of `FAMILY_PARENTS` and `FAMILY_SIGNAL_SECTIONS` as it is today.
-# `filing_delay` is experiment-only: `sections=()`, so it has no signal section and is left
-# out of `FAMILY_SIGNAL_SECTIONS`, but it keeps its `FAMILY_PARENTS` entry (a root).
+# `filing_delay` and `spinoff` are experiment-only: `sections=()`, so they have no signal
+# section and are left out of `FAMILY_SIGNAL_SECTIONS`, but keep their `FAMILY_PARENTS`
+# entry (a root).
 
 
 class FilingDelayConfig(BaseModel):
@@ -1585,6 +1588,18 @@ class FilingDelayConfig(BaseModel):
     as an external script under the research registry (`docs/experiments/`), never through
     the backtest engine, so it has no `Settings` section and no frozen keys. The class
     exists because every `FamilySpec` names a params model.
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+
+class SpinoffConfig(BaseModel):
+    """The `spinoff` family's parameter section: empty on purpose (#2399).
+
+    `spinoff` is an experiment-only root family: the C2 spin-off-children event study runs as
+    an external script under the research registry (`docs/experiments/`), never through the
+    backtest engine, so it has no `Settings` section and no frozen keys. The class exists
+    because every `FamilySpec` names a params model.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1712,6 +1727,21 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         # No parameter section and no frozen keys: nothing for the engine to freeze.
         sections=(),
         params_model=FilingDelayConfig,
+        parent=None,
+        engine_ready=False,
+        paper_ready=False,
+        exclusion_reasons=(),
+        count_names=(),
+        benchmark=None,
+        sweepable_keys=(),
+    ),
+    "spinoff": FamilySpec(
+        # An experiment-only root family (#2399; owner 'start c2', 2026-10-27): it gives the
+        # C2 spin-off-children experiment a family of its own so its configurations count in
+        # `spinoff`'s N, not B4's. No signal, so the engine and paper refuse it, and no
+        # sweepable keys, parameter section or frozen keys (as `filing_delay`, #2353).
+        sections=(),
+        params_model=SpinoffConfig,
         parent=None,
         engine_ready=False,
         paper_ready=False,
