@@ -39,6 +39,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Literal, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -2570,6 +2571,20 @@ class EventsConfig(_ClosedConfig):
     )
     sec_forms_enabled: bool = False
     sec_forms_read_enabled: bool = False
+    # The Form 4 bulk route (plan T305b, #2498 amendment). None of these is a frozen key.
+    # `sec_forms_backfill_start`: the first filing date the backfill takes.
+    # `form4_xml_price_below`: an accession with a bulk price under it goes to XML (the
+    # set rounds prices to 2 decimals). `form4_zero_price_xml_codes`: a 0.00 price counts
+    # as under it only for these transaction codes (an award or gift reports 0 truly).
+    # `form4_bulk_order_sample`: accessions per quarter fetched as XML to check
+    # `NONDERIV_TRANS_SK` order. `sec_forms_max_requests`: SEC requests per backfill run.
+    sec_forms_backfill_start: date = date(2016, 1, 1)
+    form4_xml_price_below: Decimal = Field(default=Decimal("1.00"), gt=0)
+    form4_zero_price_xml_codes: list[Annotated[str, Field(min_length=1, pattern=r"^\S+$")]] = Field(
+        default_factory=lambda: ["P", "S"]
+    )
+    form4_bulk_order_sample: int = Field(default=20, gt=0)
+    sec_forms_max_requests: int = Field(default=40_000, gt=0)
 
 
 class UiConfig(_ClosedConfig):
