@@ -388,6 +388,10 @@ STORE_READERS: Mapping[str, frozenset[str]] = {
     "tradepartner.store.db": frozenset(
         {"open_read_only", "utc_now", "ensure_tz_aware", "StoreLockedError"}
     ),
+    #: Benchmark identity by symbol (#840, #2517); reads identity rows only, never a bar.
+    "tradepartner.store.benchmarks": frozenset(
+        {"BenchmarkIdentityError", "benchmark_security_ids"}
+    ),
     "tradepartner.store.delistings": frozenset({"listing_ends_as_of", "delistings_as_of"}),
     "tradepartner.store.master": frozenset({"securities_as_of", "primary_security_id"}),
 }
