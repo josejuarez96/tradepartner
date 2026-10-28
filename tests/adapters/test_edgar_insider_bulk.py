@@ -25,7 +25,22 @@ from tradepartner.adapters.edgar import Form4Transaction, parse_form4
 from tradepartner.config import Settings
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "edgar" / "sec_forms"
-RECORDED = FIXTURES / "insider_bulk_2026q1.zip"
+RECORDED_DIR = FIXTURES / "insider_bulk_2026q1"  # the three real tables, one file each
+
+
+def _recorded_zip() -> bytes:
+    """The recorded tables zipped the way the SEC ships them (a zip is not committed:
+    the LLM-boundary scan refuses compressed fixtures)."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+        for table in sorted(RECORDED_DIR.glob("*.tsv")):
+            z.writestr(
+                zipfile.ZipInfo(table.name, date_time=(2026, 4, 6, 0, 0, 0)), table.read_bytes()
+            )
+    return buffer.getvalue()
+
+
+RECORDED_BYTES = _recorded_zip()
 ACCESSIONS = (
     "0001213900-26-037435",  # joint filing, two owners, blank prices (J, C), indirect
     "0001577526-26-000036",  # P and S with prices; SK order is not file order
@@ -132,12 +147,12 @@ def _one(**kw: object) -> bulk.BulkAccession:
 
 
 def test_recorded_zip_reads_the_four_accessions() -> None:
-    result = bulk.read_insider_bulk(RECORDED)
+    result = bulk.read_insider_bulk(io.BytesIO(RECORDED_BYTES))
     assert set(result.accessions) == set(ACCESSIONS)
 
 
 def test_recorded_zip_every_source_field() -> None:
-    a = bulk.read_insider_bulk(RECORDED).accessions["0001577526-26-000036"]
+    a = bulk.read_insider_bulk(io.BytesIO(RECORDED_BYTES)).accessions["0001577526-26-000036"]
     assert (a.document_type, a.filing_date) == ("4", date(2026, 3, 31))
     assert a.issuer_cik == "0001577526"
     assert a.filer_ciks == ("0001849334",)
@@ -171,7 +186,7 @@ def test_recorded_zip_every_source_field() -> None:
 
 
 def test_recorded_zip_amendment_carries_the_original_submission_date() -> None:
-    a = bulk.read_insider_bulk(RECORDED).accessions["0001977272-26-000004"]
+    a = bulk.read_insider_bulk(io.BytesIO(RECORDED_BYTES)).accessions["0001977272-26-000004"]
     assert a.document_type == "4/A"
     (row,) = a.transactions
     assert row.date_of_original_submission == date(2026, 3, 16)
@@ -179,7 +194,7 @@ def test_recorded_zip_amendment_carries_the_original_submission_date() -> None:
 
 
 def test_recorded_zip_blank_price_is_null_never_zero() -> None:
-    a = bulk.read_insider_bulk(RECORDED).accessions["0001493152-26-014171"]
+    a = bulk.read_insider_bulk(io.BytesIO(RECORDED_BYTES)).accessions["0001493152-26-014171"]
     by_code = {t.transaction_code: t for t in a.transactions}
     assert by_code["M"].price is None
     assert by_code["F"].price == Decimal("37.54")
@@ -188,7 +203,7 @@ def test_recorded_zip_blank_price_is_null_never_zero() -> None:
 
 
 def test_recorded_zip_joint_filing_has_a_row_per_owner_and_transaction() -> None:
-    a = bulk.read_insider_bulk(RECORDED).accessions["0001213900-26-037435"]
+    a = bulk.read_insider_bulk(io.BytesIO(RECORDED_BYTES)).accessions["0001213900-26-037435"]
     assert a.filer_ciks == ("0001642434", "0002029854")
     assert [(t.line_no, t.filer_cik) for t in a.transactions] == [
         (0, "0001642434"),
@@ -220,7 +235,7 @@ def test_parity_with_parse_form4_on_the_same_accession(accession: str) -> None:
     rounds them)."""
     xml = (FIXTURES / f"bulk_parity_{accession}.xml").read_text(encoding="utf-8")
     expected = parse_form4(xml)
-    got = bulk.read_insider_bulk(RECORDED).accessions[accession]
+    got = bulk.read_insider_bulk(io.BytesIO(RECORDED_BYTES)).accessions[accession]
     assert got.skipped == expected.skipped
     # The data set does not keep the XML's owner order: compare by identity, not position.
     assert got.filer_ciks == tuple(sorted(expected.filer_ciks))
@@ -484,7 +499,7 @@ def test_insider_bulk_zip_streams_into_the_cache_and_a_404_reads_as_unpublished(
         if "2026q3" in request.url.path:
             return httpx.Response(404)
         return httpx.Response(
-            200, content=RECORDED.read_bytes(), headers={"Last-Modified": "Tue, 07 Apr 2026"}
+            200, content=RECORDED_BYTES, headers={"Last-Modified": "Tue, 07 Apr 2026"}
         )
 
     settings = _settings(tmp_path)
@@ -546,7 +561,7 @@ def test_the_zip_request_passes_the_shared_limiter(
 ) -> None:
     waits: list[float] = []
     monkeypatch.setattr(edgar_raw._LIMITER, "wait", lambda interval: waits.append(interval))
-    client = _client(lambda request: httpx.Response(200, content=RECORDED.read_bytes()))
+    client = _client(lambda request: httpx.Response(200, content=RECORDED_BYTES))
     settings = _settings(tmp_path)
     edgar_raw.insider_bulk_zip("2026q1", settings=settings, client=client)
     edgar_raw.insider_bulk_validators("2026q1", settings=settings, client=client)
@@ -561,7 +576,7 @@ def test_the_limiter_spaces_back_to_back_zip_requests(tmp_path: Path) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         stamps.append(time.monotonic())
-        return httpx.Response(200, content=RECORDED.read_bytes())
+        return httpx.Response(200, content=RECORDED_BYTES)
 
     settings = _settings(tmp_path)
     settings = settings.model_copy(
