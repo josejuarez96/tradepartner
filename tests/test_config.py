@@ -3508,6 +3508,7 @@ _BULK_KEYS = {
     "events.form4_zero_price_xml_codes",
     "events.form4_bulk_order_sample",
     "events.sec_forms_max_requests",
+    "events.form4_bulk_max_member_bytes",
 }
 
 
@@ -3531,6 +3532,10 @@ def test_events_form4_bulk_keys_refuse_nonsense() -> None:
         {"form4_xml_price_below": -1},
         {"form4_bulk_order_sample": 0},
         {"sec_forms_max_requests": 0},
+        {"form4_bulk_order_sample": 1_001},
+        {"sec_forms_max_requests": 200_001},
+        {"form4_bulk_max_member_bytes": 0},
+        {"form4_bulk_max_member_bytes": 8 * 1024**3 + 1},
         {"form4_zero_price_xml_codes": [" "]},
         {"sec_forms_backfill_start": "not-a-date"},
     ):

@@ -2577,14 +2577,17 @@ class EventsConfig(_ClosedConfig):
     # set rounds prices to 2 decimals). `form4_zero_price_xml_codes`: a 0.00 price counts
     # as under it only for these transaction codes (an award or gift reports 0 truly).
     # `form4_bulk_order_sample`: accessions per quarter fetched as XML to check
-    # `NONDERIV_TRANS_SK` order. `sec_forms_max_requests`: SEC requests per backfill run.
+    # `NONDERIV_TRANS_SK` order (at most 1,000). `sec_forms_max_requests`: SEC requests per
+    # backfill run (at most 200,000, five times the #2498 estimate). `form4_bulk_max_member_bytes`:
+    # the largest uncompressed table member the bulk reader takes (refused above it).
     sec_forms_backfill_start: date = date(2016, 1, 1)
     form4_xml_price_below: Decimal = Field(default=Decimal("1.00"), gt=0)
     form4_zero_price_xml_codes: list[Annotated[str, Field(min_length=1, pattern=r"^\S+$")]] = Field(
         default_factory=lambda: ["P", "S"]
     )
-    form4_bulk_order_sample: int = Field(default=20, gt=0)
-    sec_forms_max_requests: int = Field(default=40_000, gt=0)
+    form4_bulk_order_sample: int = Field(default=20, gt=0, le=1_000)
+    sec_forms_max_requests: int = Field(default=40_000, gt=0, le=200_000)
+    form4_bulk_max_member_bytes: int = Field(default=1024**3, gt=0, le=8 * 1024**3)
 
 
 class UiConfig(_ClosedConfig):
