@@ -53,6 +53,7 @@
 **Lanes.**
 - `src/tradepartner/config_data.py` is named by two tasks, in order: T312 creates it and T314 appends to it.
 - `src/tradepartner/config.py` is named by T311 to T315. They touch disjoint parts: each deletes a different block of classes and adds its own import line. Whichever lands later merges main first (plan-shape rule 3).
+- `docs/plans/data-foundation.md` is named by T313, T314 and T315. Each edits the `Files:` segments of different task lines (Move rule 6), so their parts are disjoint, and whichever lands later merges main first (plan-shape rule 3). If open question 1 takes the alternative, none of them touches the file.
 - T310 has its own files. T309 has its own files.
 - T313 and T315 can each run beside the data tasks, since their only dependency is T311.
 
@@ -61,6 +62,7 @@
 - Depth 1: T309, T310. Depth 2: T311. Depth 3: T312, T313, T315. Depth 4: T314.
 - Files named by more than one open task:
   - `src/tradepartner/config_data.py`: T312 and T314.
+  - `docs/plans/data-foundation.md`: T313, T314 and T315 (disjoint lines, above).
   - `src/tradepartner/config.py`: T311 to T315 (disjoint parts, above), and tasks of other plans, of which `team.py graph` lists T163b (alpaca, which stays), T171d, T184h, T198, T214 (a new `data` section, Move rule 7) and T305b. T164e and T170d also name it, but `graph` does not list them, because T164e is not on its ready frontier and T170d is paused.
   - Move rule 6 handles every overlap. No other file here is named by another open task.
 
