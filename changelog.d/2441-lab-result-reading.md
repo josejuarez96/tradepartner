@@ -1,3 +1,4 @@
-- Lab result reading shows registered thresholds, today's variant results, rule decisions and selected trial detail (T295, #2441).
+task: T295 (PR #2445)
+- T295 Lab result reading: registered thresholds first, then each variant's result, then the rule's verdict (#2441).
 ### Added
-- Lab reads sweep results against registered thresholds with a selected trial and computation detail (#2441).
+- The Lab shows a sweep's pre-registered thresholds, each variant's result and the rule's verdict (#2441).
