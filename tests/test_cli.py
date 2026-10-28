@@ -2501,3 +2501,31 @@ def test_census_sec_forms_stops_on_a_failed_request(
     assert result.exit_code == 1
     assert "walk stopped" in result.output
     assert not Path(secrets_set.store.path).exists()
+
+
+def test_census_sec_forms_treats_open_quarter_404_as_empty(
+    secrets_set: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 404 for the current (open) quarter should be treated as empty, not an error."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _s: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        parts = request.url.path.split("/")  # .../full-index/<year>/QTR<q>/form.idx
+        key = (int(parts[-3]), int(parts[-2][3:]))
+        # Open quarter is 2025 Q1 (clock is 2025-02-10)
+        if key == (2025, 1):
+            return httpx.Response(404, text="not found")
+        return httpx.Response(200, text=_CENSUS_INDEX.get(key, ""))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    result = _invoke(
+        secrets_set,
+        ["ingest", "--census-sec-forms"],
+        edgar_client=client,
+        clock=lambda: datetime(2025, 2, 10, tzinfo=UTC),
+    )
+    assert result.exit_code == 0, result.output
+    # Should not error on the open quarter 404; earlier quarters still processed
+    assert "1993" in result.output and "2024" in result.output
+    assert "walk stopped" not in result.output
+    assert not Path(secrets_set.store.path).exists()

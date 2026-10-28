@@ -965,7 +965,10 @@ def _xml_date(text: str) -> date:
     match = _XML_DATE.match(text)
     if match is None:
         raise _BadField(f"not a date: {text!r}")
-    return date.fromisoformat(match.group(1))
+    try:
+        return date.fromisoformat(match.group(1))
+    except ValueError as e:
+        raise _BadField(f"invalid date: {text!r}") from e
 
 
 def _xml_decimal(text: str) -> Decimal:

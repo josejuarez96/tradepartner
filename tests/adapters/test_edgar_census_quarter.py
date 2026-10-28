@@ -6,12 +6,15 @@ not bleed into each other: the form column is whatever sits left of `Company Nam
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from tradepartner.adapters.edgar_source import census_quarter
 
-_HEADER = (
-    "Form Type   Company Name                                                  "
-    "CIK         Date Filed  File Name\n" + "-" * 130 + "\n"
-)
+# The header and dashes lines, read byte-exact from a recorded form.idx.
+_FIXTURE = Path(__file__).parents[1] / "fixtures" / "edgar" / "filing_index_2024_qtr1.txt"
+_FIXTURE_LINES = _FIXTURE.read_text().splitlines()
+_AT = next(i for i, ln in enumerate(_FIXTURE_LINES) if ln.startswith("Form Type"))
+_HEADER = "\n".join(_FIXTURE_LINES[_AT : _AT + 2]) + "\n"
 
 
 def _row(form: str, name: str, cik: int, accession: str, filed: str = "2016-08-01") -> str:
@@ -47,11 +50,9 @@ def test_multi_word_forms_and_spaced_names_are_counted_per_form() -> None:
 
 
 def test_a_form_that_fills_its_column_does_not_absorb_the_name() -> None:
-    # `SCHEDULE 13D/A` is 14 wide: the name follows after one space, not two.
-    header = _HEADER.replace("Form Type   Company Name", "Form Type      Company Name")
-    tail = "2016-08-02  edgar/data/9/0000000009-16-000001.txt\n"
-    row = f"{'SCHEDULE 13D/A':<15}{'TARGET CORP':<62}{9:<12}{tail}"
-    assert _counts(header + row) == {"SCHEDULE 13D/A": 1}
+    # Real header, 17-wide form column: `SCHEDULE 13D/A` (14) is followed by 3 spaces.
+    row = _row("SCHEDULE 13D/A", "TARGET CORP", 9, "0000000009-16-000001")
+    assert _counts(_HEADER + row) == {"SCHEDULE 13D/A": 1}
 
 
 def test_a_wanted_form_row_with_a_broken_tail_is_counted_unparsed() -> None:
@@ -59,3 +60,24 @@ def test_a_wanted_form_row_with_a_broken_tail_is_counted_unparsed() -> None:
     accessions, _ciks, unparsed = census_quarter(_HEADER + bad)
     assert accessions == {}
     assert unparsed == 1
+
+
+def test_invalid_filing_date_is_counted_unparsed_not_counted() -> None:
+    """An invalid date like 2016-99-99 should be counted as unparsed, not counted as a valid row."""
+    bad = f"{'SC 13D':<17}{'X':<62}{1:<12}2016-99-99  edgar/data/1/0000000001-16-000001.txt\n"
+    accessions, _ciks, unparsed = census_quarter(_HEADER + bad)
+    assert accessions == {}
+    assert unparsed == 1
+
+
+def test_one_space_between_form_and_name_is_parsed_correctly() -> None:
+    """A row with only one space between form and name should be parsed correctly
+    (previously it was silently dropped)."""
+    # Form column is 17 chars, but only 1 space before name (not 2+)
+    row = (
+        "SC 13D ADAGE CAPITAL PARTNERS L.P.          "
+        "111          2016-08-01  edgar/data/111/0000000111-16-000001.txt\n"
+    )
+    accessions, _ciks, unparsed = census_quarter(_HEADER + row)
+    assert accessions == {2016: {"SC 13D": {"0000000111-16-000001"}}}
+    assert unparsed == 0
