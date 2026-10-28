@@ -782,9 +782,10 @@ def live_actions_as_of(
 
     A spin-off parented by a predecessor and one parented by its successor,
     for the same child, share one identity after the #2127 re-key; `_own`
-    follows the child's chain, so both rank 0 and the later-known row wins,
-    not the successor's own (#821). Both describe the same event; no store
-    holds both today (#2147).
+    follows the child's chain, so both rank alike (0 when the child itself
+    has no chain) and the later-known row wins (on equal `known_at` the
+    pick is unspecified), not the successor's own (#821). Both describe
+    the same event; no store holds both today (#2147).
     """
     t = _validate_t(t)
     with _chains_registered(conn, t) as chains:
