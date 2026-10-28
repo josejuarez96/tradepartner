@@ -73,6 +73,53 @@ def test_run_callback_refuses_when_slot_busy_without_spawning(
     spawn.assert_not_called()
 
 
+def test_non_default_lab_slot_grace_seconds_reaches_take(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#2357: a configured lab_slot_grace_seconds is passed through to lab_run.take."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(tmp_path / "store.duckdb")},
+        ui={"lab_slot_grace_seconds": 12.5},
+    )
+    now = datetime.now(UTC)
+    captured: dict[str, object] = {}
+
+    def capture_take(slot_path: Path, *, in_flight, now, grace_seconds, start_time_of):
+        captured["grace_seconds"] = grace_seconds
+        captured["start_time_of"] = start_time_of
+        return Taken(slot_path, "token")
+
+    monkeypatch.setattr(lab_page.lab_run, "take", capture_take)
+    spawn = Mock()
+    monkeypatch.setattr(lab_page.lab_child, "spawn", spawn)
+    monkeypatch.setattr(
+        lab_page.lab_run,
+        "record",
+        Mock(
+            return_value=SimpleNamespace(
+                pid=7,
+                pid_start="pid-start",
+                kind="sweep_run",
+                slug="b10",
+                baseline=0,
+                started_at=now.isoformat(),
+                log_path="log",
+                exit_code=None,
+            )
+        ),
+    )
+    lab_page._start_run(settings, "b10", None, now, (), 0, Mock())
+    assert captured["grace_seconds"] == 12.5
+    # Verify start_time_of is a partial with the configured timeout
+    import functools
+
+    assert isinstance(captured["start_time_of"], functools.partial)
+    assert (
+        captured["start_time_of"].keywords["timeout_seconds"] == settings.ui.lab_ps_timeout_seconds
+    )
+
+
 def test_failed_spawn_abandons_slot_and_scrubs_message(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
