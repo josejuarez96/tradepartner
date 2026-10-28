@@ -2565,6 +2565,7 @@ class UiConfig(_ClosedConfig):
     The Lab page (plan T291, #2304): `lab_orphan_after_hours` is how long an open
     `sweep_runs` row or an `unfinished` trial may stay open before the page lists it
     apart as an orphan (a run whose writer died) that no longer blocks a new run.
+    `lab_poll_seconds` is the positive interval for the Lab status fragment.
     """
 
     next_run_time_et: str = "08:05"
@@ -2575,6 +2576,7 @@ class UiConfig(_ClosedConfig):
     lab_message_chars: int = Field(default=500, gt=0)
     lab_git_timeout_seconds: int = Field(default=10, gt=0)
     lab_orphan_after_hours: int = Field(default=24, gt=0)
+    lab_poll_seconds: int = Field(default=5, gt=0)
 
     @field_validator("next_run_time_et")
     @classmethod
