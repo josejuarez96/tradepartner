@@ -212,7 +212,11 @@ def eligibility(
     train = [(line, b) for b in bodies if (line := _train_line(b)) and line[0] != "INELIGIBLE"]
     if train and train[-1][0][0] == "CULPRIT" and _head_line(train[-1][1]) == pr.head:
         return "(d) culprit at its current head"
-    green = {r.name for r in head_checks.runs if r.conclusion.upper() == "SUCCESS"}
+    green = {
+        r.name
+        for r in ready_pr.latest_named_runs(head_checks.runs)
+        if r.status.upper() == "COMPLETED" and r.conclusion.upper() == "SUCCESS"
+    }
     if (
         not set(_REQUIRED_CHECKS) <= green
         or ready_pr.checks_state(head_checks, pr.head) != "success"
@@ -1402,6 +1406,8 @@ class ShellRunner:
                 str(c.get("name") or c.get("context") or "?"),
                 str(c.get("status") or ("COMPLETED" if c.get("conclusion") else "")),
                 str(c.get("conclusion") or c.get("state") or ""),
+                ready_pr._run_id(str(c.get("detailsUrl") or "")),
+                str(c.get("startedAt") or ""),
             )
             for c in raw.get("statusCheckRollup") or []
         )
