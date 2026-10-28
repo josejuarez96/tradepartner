@@ -20,19 +20,22 @@ it decides and raises on a mismatch. A run's steps 4 and 8, `paper reconcile`,
    `live_actions_as_of(close(S-1))`, and the explanations
    (`explanations_as_of`, at the same `as_of`), then call `compare`.
 4. In one write chunk, append the `reconciliations` row, the `adjustments`
-   rows an `ok` result's explanations imply, and the break events of a
-   `breaks` result (or of an open finding still unresolved). Each row is
-   stamped with the same clock reading, so every adjustment is inside the
-   reconciliation that re-bases the ledger's cash (`execution.ledger`: a row
-   whose `known_at` equals the base's is counted in it, never twice). Only
-   an `ok` result books `adjustments` rows; a `breaks` row books none (that
-   comes in a later task, T282b).
+    rows an `ok` result's explanations imply, and the break events of a
+    `breaks` result (or of an open finding still unresolved). An `ok` row also
+    writes the closing events of breaks that closed. Each row is stamped with
+    the same clock reading, so every adjustment is inside the reconciliation
+    that re-bases the ledger's cash (`execution.ledger`: a row whose `known_at`
+    equals the base's is counted in it, never twice). Only an `ok` result books
+    `adjustments` rows; a `breaks` row books none (that comes in a later task,
+    T282b).
 5. On `mismatch` or `breaks` (or an open finding still unresolved), raise
-   `ReconciliationError` after the row and its events are committed, so the
-   caller engages the kill switch and no order is submitted. Halting on
-   `breaks` is T281's temporary safety rule, which T282d removes. If the
-   events cannot be written while a break is open, the row rolls back and
-   `ReconciliationError` is raised too.
+    `ReconciliationError` after the row and its events are committed, so the
+    caller engages the kill switch and no order is submitted: the run's halt
+    path (T60) for steps 4 and 8, `reconcile_command` for `paper reconcile`.
+    Halting on `breaks` is T281's temporary safety rule, which T282d removes.
+    If the write fails on a `mismatch` or `breaks` result, a halt for a break,
+    or while any break is open, the row rolls back with its events and
+    `ReconciliationError` is raised too.
 
 **The journal cut (#488).** Every fill, order, adjustment and `ok`
 reconciliation the ledger and the explanations read is cut at one explicit
