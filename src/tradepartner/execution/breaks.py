@@ -23,6 +23,11 @@ the events (`store.journal.ReconcileBreakRow`).
 - **Size and materiality** (items 4 and 5): `dollar_size`, `is_material`
   (both thresholds, cumulative per name) and `over_cap` (the open break cap).
 - **State** (item 4): derived from each break's latest event in write order.
+- **Restriction and the cap** (items 5 and 7; plan T282a): `restricted_names` (the
+  names with an open material break), `cap_exceeded` (the open material breaks
+  against the cap) and `reducing_limit` (the most a reducing order may take, so it
+  never crosses zero on the ledger or the broker), and `require_under_cap` (the
+  book-level `break_cap` as an error).
 """
 
 from __future__ import annotations
@@ -38,6 +43,8 @@ from typing import Literal
 from tradepartner.adapters.broker import CashActivity
 from tradepartner.calendar import is_session, previous_session, session_close
 from tradepartner.config import RiskConfig
+from tradepartner.errors import ReconciliationError
+from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.reconcile import (
     _CASH_IN_LIEU,
     _DELISTING_CASH_TYPES,
@@ -338,3 +345,62 @@ def open_breaks(events: Iterable[ReconcileBreakRow]) -> dict[str, ReconcileBreak
         latest.pop(event.break_id, None)
         latest[event.break_id] = event
     return {bid: e for bid, e in latest.items() if is_open(e.event)}
+
+
+def restricted_names(events: Iterable[ReconcileBreakRow]) -> frozenset[str]:
+    """Item 7: the `security_id`s with an open material break. Derived, never
+    stored. An open break known only by a broker symbol has no `security_id` and
+    names no order, so it restricts none (it still counts toward the cap)."""
+    return frozenset(
+        e.security_id
+        for e in open_breaks(events).values()
+        if e.material and e.security_id is not None
+    )
+
+
+def cap_exceeded(
+    events: Iterable[ReconcileBreakRow], *, ledger_equity: float, risk: RiskConfig
+) -> bool:
+    """Item 5's `break_cap` over the window's break events: whether the open
+    material breaks (immaterial and closed ones do not count) pass the cap."""
+    sizes = [e.dollar_size for e in open_breaks(events).values() if e.material]
+    return over_cap(sizes, ledger_equity=ledger_equity, risk=risk)
+
+
+def require_under_cap(
+    events: Iterable[ReconcileBreakRow],
+    ledger: Ledger,
+    marks: Mapping[str, float],
+    *,
+    risk: RiskConfig,
+    window_id: int,
+) -> None:
+    """Item 5 / item 3: the book-level `break_cap`. Raises `ReconciliationError` when
+    the window's open material breaks pass the cap, judged against the ledger equity
+    at `marks`. An equity that cannot be read (a held name with no mark, a bad mark)
+    is over the cap while any break is open: it fails closed."""
+    events = list(events)
+    if not any(e.material for e in open_breaks(events).values()):
+        return
+    try:
+        equity = ledger.equity(marks)
+    except (KeyError, ValueError):
+        equity = math.nan
+    if cap_exceeded(events, ledger_equity=equity, risk=risk):
+        count = sum(e.material for e in open_breaks(events).values())
+        raise ReconciliationError(
+            f"break_cap: window {window_id} has {count} open material break(s), past "
+            f"risk.max_open_breaks={risk.max_open_breaks} or "
+            f"risk.max_open_break_share={risk.max_open_break_share} of the ledger equity"
+        )
+
+
+def reducing_limit(ledger_quantity: float, broker_quantity: float) -> float:
+    """Item 7: the most a reducing order on a restricted name may take, so it can
+    never cross zero on either book: the smaller magnitude of the two signed
+    quantities, and 0 when either is flat or they lie on opposite sides."""
+    ledger = _finite(ledger_quantity, "ledger_quantity")
+    broker = _finite(broker_quantity, "broker_quantity")
+    if ledger == 0 or broker == 0 or (ledger > 0) != (broker > 0):
+        return 0.0
+    return float(min(abs(ledger), abs(broker)))

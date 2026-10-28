@@ -179,6 +179,7 @@ _SKIP_BELOW_MINIMUM = "skip_below_minimum"
 _SKIP_ZERO = "skip_zero"
 SHORT = "short"
 _SKIP_NOT_BORROWABLE = "skip_not_borrowable"
+_SKIP_RESTRICTED = "skip_restricted"
 _SKIP_SHORT_PRICE = "skip_short_price"
 _SKIP_BELOW_ONE_SHARE = "skip_below_one_share"
 #: `decisions_from`'s `side` keyword (the window's frozen `portfolio.side`).
@@ -1210,6 +1211,7 @@ def decisions_from(
     hold: HoldBook | None = None,
     side: str = _LONG_ONLY,
     short_min_price: float | None = None,
+    restricted: Collection[str] = frozenset(),
 ) -> Decisions:
     """The decisions of rebalance T_i = `plan.session` on the run's session
     S = `ledger.through` (spec Definitions > Decision, reqs 7 step 6 and 9).
@@ -1302,6 +1304,16 @@ def decisions_from(
     cover skips `skip_below_minimum` and `skip_below_one_share` only. The long
     buys' spendable is `ledger.free_cash` plus the plan's long sells.
 
+    A **restricted** name (paper spec amendment 2026-10-26, #2266, item 7; T282a: it
+    has an open material break) takes no added exposure: an order that would open or
+    add to it (a buy to open, a sell to open, the buy half of a re-weight, a flip's
+    open) is the decision `skip_restricted`, which is no broker refusal and no order.
+    Reducing orders stay: a full exit (`left_targets`, `left_universe`,
+    `exclude_name`), a flip's close, a hold-weighting exit. A restricted held name
+    that is still a target keeps its weight as a kept name does (W_K): it is not
+    re-weighted down or up, and the other names are not scaled over it. Under
+    `long_short` there is no kept-weight rule, so only the block applies.
+
     `whole_share` is the name's `fractionable` flag negated, from `assets`
     (keyed by `security_id`; the caller maps symbols); a name that would trade
     and is missing from it raises. The plan side (targets, signals) reads only
@@ -1369,6 +1381,7 @@ def decisions_from(
         return end is None or end <= previous
 
     kept: frozenset[str] = frozenset()
+    restricted_kept: frozenset[str] = frozenset()
     if hold is None:
         kept = frozenset(
             sid
@@ -1378,7 +1391,26 @@ def decisions_from(
             and not ended(sid)
             and sid not in named
         )
-        effective = kept_effective_weights(plan.targets, drifted, band, kept, side=side)
+        # A restricted held name that is still a candidate keeps its weight too
+        # (item 7). A forced exit, an ended listing or an override claims it first.
+        restricted_kept = (
+            frozenset(
+                sid
+                for sid in restricted
+                if sid in held
+                and sid in universe
+                and sid in targets
+                and sid not in kept
+                and sid not in open_forced_exits
+                and not ended(sid)
+                and sid not in named
+            )
+            if not signed
+            else frozenset()
+        )
+        effective = kept_effective_weights(
+            plan.targets, drifted, band, kept | restricted_kept, side=side
+        )
         entering: frozenset[str] = frozenset()
         exiting: frozenset[str] = frozenset()
         hold_weight = 0.0
@@ -1492,6 +1524,13 @@ def decisions_from(
                 intent = _Intent(_BUY, 0.0)  # a live held name is never re-weighted
         elif sid in kept:
             intent = _Intent(_BUY, 0.0)  # kept: no order, `skip_zero` at its current weight
+        elif sid in restricted_kept and sid in universe and sid in targets:
+            # Restricted and still a target: its weight is kept (no re-weight down), and
+            # a re-weight up is the added exposure the second loop blocks.
+            desired = plan.targets[sid]
+            delta = (desired - drifted.get(sid, 0.0)) * equity
+            inside = band > 0 and abs(desired - drifted.get(sid, 0.0)) <= band * desired
+            intent = _Intent(_BUY, delta if delta > 0 and not inside else 0.0)
         elif held_side(sid) is not None and sid not in universe:
             intent = close_of(sid, _LEFT_UNIVERSE)
         elif held_side(sid) is not None and sid not in targets:
@@ -1526,6 +1565,12 @@ def decisions_from(
             "whole_share": whole,
             "position_side": intent.position_side,
         }
+        adds = (intent.side == _SELL) if shorting else (intent.side == _BUY)
+        if sid in restricted and adds and intent.full_exit_reason is None and intent.notional > 0:
+            # Item 7: no order may open or add exposure in a restricted name.
+            decided[key] = Decision(**fields, decision=_SKIP_RESTRICTED)
+            del intents[key]
+            continue
         if intent.full_exit_reason is not None:
             if intent.notional < minimum or (whole and intent.held < 1):
                 decided[key] = Decision(

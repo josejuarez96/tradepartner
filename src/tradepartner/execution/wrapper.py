@@ -210,7 +210,7 @@ import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, NoReturn, Protocol
@@ -256,6 +256,7 @@ from tradepartner.errors import (
     StaleDataError,
     SystemFaultError,
 )
+from tradepartner.execution import breaks as break_rules
 from tradepartner.execution import phases, switch
 from tradepartner.execution.alerts import Alerter
 from tradepartner.execution.collect import (
@@ -266,7 +267,7 @@ from tradepartner.execution.collect import (
     note_unjudged,
 )
 from tradepartner.execution.ledger import Ledger, from_journal
-from tradepartner.execution.plan import BuyCosts, DecisionState, decision_state, residue
+from tradepartner.execution.plan import SHORT, BuyCosts, DecisionState, decision_state, residue
 from tradepartner.execution.planning import current_listings, reference_prices
 from tradepartner.execution.reattempts import attempt_scope, write_offs
 from tradepartner.execution.reconcile_run import order_symbols
@@ -277,6 +278,7 @@ from tradepartner.execution.risk import (
     Violations,
     _buy_cash,
     check_phase,
+    open_sold,
     order_shape_violation,
     skip_cap,
     unfilled_sells,
@@ -300,6 +302,7 @@ from tradepartner.store.journal import (
     PaperRunRow,
     PaperWindowRow,
     RebalanceEventRow,
+    ReconcileBreakRow,
     adjustments_for,
     append,
     check_book_id,
@@ -307,6 +310,7 @@ from tradepartner.store.journal import (
     fills_for,
     kill_switch_events_for,
     non_terminal_orders,
+    open_breaks,
     order_events_for,
     orders_for,
     pending_orders,
@@ -449,6 +453,7 @@ _UNFUNDED = "unfunded"
 _MISSED = "missed"
 _LIMIT_BREACH = "limit_breach"
 _SKIP_CAP = "skip_cap"
+_SKIP_RESTRICTED = "skip_restricted"
 _COSTS_PREFIX = "costs."
 
 
@@ -574,6 +579,17 @@ class _Book:
         """The reference price on S, or `ValueError` for a name not read or
         read without one (`unpriced`, #569)."""
         return _price_lookup(self.prices, self.unpriced)(security_id)
+
+
+@dataclass(frozen=True)
+class _RestrictedSkip(Skip):
+    """A phase-time `skip_restricted` (paper spec amendment 2026-10-26, #2266, item
+    7): a name with an open material break takes no added exposure. It is no broker
+    refusal, so it never counts toward `risk.max_skips_per_run` and its share."""
+
+    @property
+    def counts_toward_cap(self) -> bool:
+        return False
 
 
 @dataclass(frozen=True)
@@ -818,6 +834,7 @@ class RiskGatedBroker:
         # `missed` (ADR 0010 point 2), whichever decisions that phase held.
         rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
         book = self._read_book(run, rows)
+        self._check_break_cap(run, book)
         if any(d.side == _BUY for d in decisions) and not self._engaged(run, book.window):
             # The buys phase's reserve prices every open quantity buy: a name
             # of one with no price halts here, before any sell is submitted,
@@ -1119,6 +1136,7 @@ class RiskGatedBroker:
         phase's first submit (`refused_position_side`, ADR 0015 seam 2)."""
         assert run.session is not None and run.run_id is not None
         session = run.session
+        built = self._restrict(run, book, built, session)
         self._requests(built, book, session)
         candidates = [
             o.to_risk(str(book.symbols[o.security_id]), listing_ended=o.security_id in book.ended)
@@ -1220,6 +1238,105 @@ class RiskGatedBroker:
                 pairs.append((row, request))
         counted += sum(s.counts_toward_cap for s in verdict.skips)
         return _Gated(tuple(pairs), skips, counted, final.orders)
+
+    def _open_breaks(self, run: PaperRunRow) -> list[ReconcileBreakRow]:
+        """The latest event of each open break of the run's window."""
+        with self._journal() as conn:
+            return open_breaks(conn, run.window_id)
+
+    def _check_break_cap(self, run: PaperRunRow, book: _Book) -> None:
+        """Item 5's `break_cap`, a book-level halt: more open material breaks than
+        `risk.max_open_breaks`, or their sizes above `risk.max_open_break_share` of the
+        ledger equity, raises `ReconciliationError` before any order is built."""
+        break_rules.require_under_cap(
+            self._open_breaks(run),
+            book.ledger,
+            book.prices,
+            risk=self._frozen,
+            window_id=run.window_id,
+        )
+
+    def _restrict(
+        self, run: PaperRunRow, book: _Book, built: phases.PhaseOrders, session: date
+    ) -> phases.PhaseOrders:
+        """Item 7's restriction on every order of a phase, whatever the plan said.
+
+        A name with an open material break takes no order that opens or adds
+        exposure (a buy of a long, a short open): it is a `skip_restricted`, uncounted
+        by the skip cap. A reducing order (a long's sell, a short's cover, a forced
+        exit, `paper stop`'s close) is cut to `reducing_limit(ledger, broker)` and
+        rounded down to the order's basis, so it can never cross zero on either book;
+        an order the limit leaves empty is a `skip_restricted` too. The broker's
+        positions are read only when such an order exists."""
+        restricted = break_rules.restricted_names(self._open_breaks(run))
+        if not restricted & {o.security_id for o in built.orders}:
+            return built
+        held = (
+            self._broker.positions()
+            if any(o.security_id in restricted for o in built.orders)
+            else {}
+        )
+        kept: list[phases.PhaseOrder] = []
+        skips: list[Skip] = []
+        decimals = self._decimals()
+        # The name's own sells (a short's covers, below) still open at the broker are
+        # shares already spoken for on both books: they come off both sides of the limit.
+        done = {e.client_order_id for e in book.events if e.status in TERMINAL_ORDER_STATUSES}
+        open_covers: dict[str, float] = {}
+        for o in book.orders:
+            if (
+                o.client_order_id not in done
+                and o.side == _BUY
+                and o.position_side == SHORT
+                and o.quantity is not None
+            ):
+                open_covers[o.security_id] = open_covers.get(o.security_id, 0.0) + o.quantity
+        open_now = open_sold(
+            _open_sells(book, {o.security_id for o in built.orders}, session), decimals
+        )
+        for order in built.orders:
+            if order.security_id not in restricted:
+                kept.append(order)
+                continue
+            short = order.position_side == SHORT
+            reducing = (order.side == _BUY) if short else (order.side == _SELL)
+            if not reducing:
+                skips.append(
+                    _RestrictedSkip(order.decision_id, order.security_id, _SKIP_RESTRICTED)
+                )
+                continue
+            sid = order.security_id
+            ledger_quantity = book.ledger.positions.get(sid, 0.0) - book.ledger.short_holdings.get(
+                sid, 0.0
+            )
+            symbol = book.symbols[sid]
+            position = held.get(canonical_symbol(symbol)) if symbol is not None else None
+            broker_quantity = position.quantity if position is not None else 0.0
+            # A long's sell is netted by its open sells; a short's cover by its open
+            # covers (the whole quantity of each non-terminal one: fail closed). A
+            # short-opening sell is never netted: it deepens the short. Signed, the
+            # open sells come off a long and the open covers go onto a short.
+            spoken = -open_covers.get(sid, 0.0) if short else float(open_now.get(sid, Decimal(0)))
+            limit = break_rules.reducing_limit(ledger_quantity - spoken, broker_quantity - spoken)
+            wanted = (
+                order.quantity
+                if order.quantity is not None
+                else (order.notional or 0.0) / order.price
+            )
+            quantity = min(wanted, limit)
+            step = Decimal(1).scaleb(-decimals)
+            rounded = Decimal(repr(quantity)).quantize(
+                Decimal(1) if order.whole_share else step, rounding=ROUND_DOWN
+            )
+            if rounded <= 0:
+                skips.append(_RestrictedSkip(order.decision_id, sid, _SKIP_RESTRICTED))
+            elif float(rounded) >= wanted and order.quantity is not None:
+                kept.append(order)
+            else:
+                kept.append(replace(order, quantity=float(rounded), notional=None))
+        if not skips and len(kept) == len(built.orders) and kept == list(built.orders):
+            return built
+        return replace(built, orders=tuple(kept), skips=(*built.skips, *skips))
 
     def _refuse(self, run: PaperRunRow, verdict: Violations, missed: Sequence[date]) -> NoReturn:
         """Raise the batch's violation: `LimitBreachError` when any rule is a
