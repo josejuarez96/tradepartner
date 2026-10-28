@@ -154,7 +154,10 @@ def order_sample(transaction_counts: Mapping[str, int], size: int) -> tuple[str,
     """The accessions whose XML checks the quarter's `NONDERIV_TRANS_SK` order: those with
     two or more non-derivative transactions, the first `size` by ascending SHA-256 of the
     accession number. `transaction_counts` maps each subject-issuer accession of the
-    quarter to its count; fewer eligible than `size` gives all of them, none gives `()`."""
+    quarter to its count of `NONDERIV_TRANS` rows (`len(bulk.rows)`, not
+    `Form4Transaction` rows, which multiply by owners), leaving out identity-bad and order-bad
+    accessions (their rows go to XML anyway); fewer eligible than `size` gives all of them,
+    none gives `()`."""
     if size < 0:
         raise ValueError("the sample size cannot be negative")
     eligible = [a for a, count in transaction_counts.items() if count >= 2]
