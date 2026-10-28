@@ -60,6 +60,9 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from tradepartner.config_base import _PHASE3_MODEL_CONFIG as _PHASE3_MODEL_CONFIG
+from tradepartner.config_base import _ClosedConfig as _ClosedConfig
+
 # `edgar.statement_tags`' default (spec amendment 2026-10-03, #660, decision
 # (a)): canonical names, each an ordered list of fallbacks, every one the
 # concept itself, never a near relative.
@@ -165,12 +168,6 @@ def _default_research_data_dir() -> str:
     run launched from another working directory still finds it; gitignored by
     `data/*`."""
     return str(Path(__file__).resolve().parents[2] / "data" / "research")
-
-
-class _ClosedConfig(BaseModel):
-    """Shared validation for early configuration sections."""
-
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
 
 
 class CalendarConfig(_ClosedConfig):
@@ -1369,14 +1366,6 @@ HypothesisFamily = Literal[
 # `HypothesisFamily` since both are the enumerations a hypothesis file pins.
 Cadence = Literal["month_end", "week_end", "daily"]
 SignalAnchor = Literal["month_end", "offset"]
-
-# Every Phase 3 section rejects unknown keys and non-finite floats. A hypothesis file pins
-# `strategy.*` and `costs.*` (spec req 10), so a misspelt key must fail rather than fall back
-# silently to the default, and a NaN or infinite value must fail rather than turn a
-# result into NaN. Errors hide the input value by default (#1093), as `Settings` does:
-# a caller that knows its input holds no secret (`execution/`'s frozen costs and risk)
-# puts it back with `render_validation_errors`.
-_PHASE3_MODEL_CONFIG = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
 
 
 class HypothesesConfig(BaseModel):
