@@ -99,6 +99,8 @@ def test_a_ready_pr_is_eligible_even_when_behind_main() -> None:
         (_pr(base="develop"), None, PATHS, (), "(b)"),
         (_pr(labels=("parked",)), None, PATHS, (), "(c)"),
         (_pr(labels=("hold",)), None, PATHS, (), "(c) on hold"),
+        (_pr(labels=("Hold",)), None, PATHS, (), "(c) on hold"),
+        (_pr(labels=("Parked",)), None, PATHS, (), "(c) parked"),
         (
             None,
             None,
@@ -427,6 +429,57 @@ def test_a_skipped_claims_run_is_not_green() -> None:
         ready_pr.CheckRun("claims", "COMPLETED", "SKIPPED"),
     )
     assert _eligible(checks=ready_pr.HeadChecks(HEAD, runs)).startswith("(e)")
+
+
+@pytest.mark.parametrize(
+    ("earlier", "latest", "eligible"),
+    [
+        (("FAILURE", "COMPLETED"), ("SUCCESS", "COMPLETED"), True),
+        (("SUCCESS", "COMPLETED"), ("FAILURE", "COMPLETED"), False),
+        (("SUCCESS", "COMPLETED"), ("", "IN_PROGRESS"), False),
+    ],
+)
+def test_eligibility_uses_latest_named_run(
+    earlier: tuple[str, str], latest: tuple[str, str], eligible: bool
+) -> None:
+    cr = ready_pr.CheckRun
+    runs = (
+        cr("checks", earlier[1], earlier[0], 10, "2026-10-27T10:00:00Z"),
+        cr("checks", latest[1], latest[0], 11, "2026-10-27T10:05:00Z"),
+        cr("claims", "COMPLETED", "SUCCESS", 11, "2026-10-27T10:05:00Z"),
+    )
+    reason = _eligible(checks=ready_pr.HeadChecks(HEAD, runs))
+    assert (reason is None) is eligible
+    if not eligible:
+        assert reason is not None and reason.startswith("(e)")
+
+
+def test_head_checks_fetch_keeps_run_ordering_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = mt.ShellRunner(tmp_path)
+    rollup = [
+        {
+            "name": "checks",
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+            "detailsUrl": f"https://github.com/{REPO}/actions/runs/{run_id}",
+            "startedAt": started,
+        }
+        for conclusion, run_id, started in (
+            ("FAILURE", 10, "2026-10-27T10:00:00Z"),
+            ("SUCCESS", 11, "2026-10-27T10:05:00Z"),
+        )
+    ]
+    rollup.append({"name": "claims", "status": "COMPLETED", "conclusion": "SUCCESS"})
+    monkeypatch.setattr(
+        runner,
+        "_gh",
+        lambda *args: json.dumps({"headRefOid": HEAD, "statusCheckRollup": rollup}),
+    )
+    checks = runner._head_checks(30)
+    assert [run.run_id for run in checks.runs[:2]] == [10, 11]
+    assert _eligible(checks=checks) is None
 
 
 @pytest.mark.parametrize(("green", "red"), [(-1, 0), (4, 5), (2, 2), (3, 2)])

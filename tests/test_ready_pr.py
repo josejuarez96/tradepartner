@@ -376,6 +376,37 @@ def test_checks_state_needs_the_exact_commit_and_completed_runs() -> None:
     assert ready_pr.checks_state(hc("abc", non_matrix), "abc") == "failure"
 
 
+@pytest.mark.parametrize(
+    ("earlier", "latest", "expected"),
+    [
+        (("FAILURE", "COMPLETED"), ("SUCCESS", "COMPLETED"), "success"),
+        (("SUCCESS", "COMPLETED"), ("FAILURE", "COMPLETED"), "failure"),
+        (("SUCCESS", "COMPLETED"), ("", "IN_PROGRESS"), "pending"),
+    ],
+)
+def test_checks_state_uses_latest_named_run(
+    earlier: tuple[str, str], latest: tuple[str, str], expected: str
+) -> None:
+    cr = ready_pr.CheckRun
+    runs = (
+        cr("checks", earlier[1], earlier[0], 10, "2026-10-27T10:00:00Z"),
+        cr("checks", latest[1], latest[0], 11, "2026-10-27T10:05:00Z"),
+        cr("claims", "COMPLETED", "SUCCESS", 11, "2026-10-27T10:05:00Z"),
+    )
+    assert ready_pr.checks_state(ready_pr.HeadChecks("abc", runs), "abc") == expected
+    reversed_checks = ready_pr.HeadChecks("abc", tuple(reversed(runs)))
+    assert ready_pr.checks_state(reversed_checks, "abc") == expected
+
+
+def test_checks_state_uses_start_time_for_reruns_of_one_workflow() -> None:
+    cr = ready_pr.CheckRun
+    runs = (
+        cr("checks", "COMPLETED", "FAILURE", 10, "2026-10-27T10:00:00Z"),
+        cr("checks", "COMPLETED", "SUCCESS", 10, "2026-10-27T10:05:00Z"),
+    )
+    assert ready_pr.checks_state(ready_pr.HeadChecks("abc", runs), "abc") == "success"
+
+
 def test_a_cancelled_draft_shard_is_superseded_by_the_labelled_full_run() -> None:
     """#1254: a draft run cancelled by the labelled `ci:full` run leaves its matrix job as
     the bare ``pytest-shard`` (cancelled), while the full run reports its shards as
@@ -1631,6 +1662,13 @@ def test_a_failing_static_test_stops_before_the_push() -> None:
     with pytest.raises(ready_pr.ReadyError, match="static invariant tests failed"):
         ready_pr.ready(r, 69)
     assert r.pushed == []
+
+
+def test_every_static_invariant_test_file_exists() -> None:
+    """A renamed test file would silently drop out of the static check (#2387)."""
+    root = Path(__file__).resolve().parents[1]
+    for entry in ready_pr.STATIC_INVARIANT_TESTS:
+        assert (root / entry.split("::")[0]).is_file(), entry
 
 
 def test_book_page_requires_the_safety_review() -> None:

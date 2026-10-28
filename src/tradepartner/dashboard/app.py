@@ -73,6 +73,7 @@ unit-testable without a page render.
 
 from __future__ import annotations
 
+import html
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -93,6 +94,7 @@ from tradepartner.dashboard import (
     override_page,
     performance_page,
     research_page,
+    theme,
     trades_page,
     trials_page,
 )
@@ -240,6 +242,21 @@ def _server_options_ok(address: str | None, gather_usage_stats: bool | None) -> 
     )
 
 
+def _page_path(title: str, *, default: bool = False) -> str:
+    """The URL path of a page: `/` for the default page, else `/<title-slug>`."""
+    return "/" if default else "/" + title.lower().replace(" ", "-")
+
+
+def _phone_bar_html() -> str:
+    """The phone's fixed bottom bar: one link per top-nav page, in order, by page URL.
+    CSS (`theme.phone_css`) hides it above the phone breakpoint; the top nav stays."""
+    links = "".join(
+        f'<a href="{_page_path(title, default=(i == 0))}" target="_self">{html.escape(title)}</a>'
+        for i, title in enumerate(_TOP_PAGES)
+    )
+    return f'<nav class="{theme.PHONE_NAV_CLASS}" aria-label="Pages">{links}</nav>'
+
+
 def render_app(settings: Settings | None = None) -> None:
     """Render the full dashboard shell for one Streamlit script run.
 
@@ -266,6 +283,8 @@ def render_app(settings: Settings | None = None) -> None:
         st.error(message)
         return
 
+    st.html(theme.phone_css(theme.palette()) + _phone_bar_html())
+
     def _page(title: str, renderer: _PageRenderer, *, default: bool = False) -> st.Page:
         def _run() -> None:
             _render_page(settings, title, renderer)
@@ -273,7 +292,7 @@ def render_app(settings: Settings | None = None) -> None:
         return st.Page(
             _run,
             title=title,
-            url_path="" if default else title.lower().replace(" ", "-"),
+            url_path="" if default else _page_path(title)[1:],
             default=default,
         )
 

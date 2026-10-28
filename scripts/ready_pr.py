@@ -474,12 +474,22 @@ def is_cancelled(run: CheckRun) -> bool:
 
 def is_later_than(run: CheckRun, other: CheckRun) -> bool:
     """Whether ``run`` belongs to a later workflow run than ``other``: by run id when both
-    are known, else by start time. Unknown ordering is never "later"."""
-    if run.run_id and other.run_id:
+    are known, else by start time. A rerun can share a workflow id, so its later start
+    time breaks that tie. Unknown ordering is never "later"."""
+    if run.run_id and other.run_id and run.run_id != other.run_id:
         return run.run_id > other.run_id
     if run.started_at and other.started_at:
         return run.started_at > other.started_at
     return False
+
+
+def latest_named_runs(runs: Sequence[CheckRun]) -> tuple[CheckRun, ...]:
+    """Keep each check name's latest known run; retain ambiguous peers to fail closed."""
+    return tuple(
+        run
+        for run in runs
+        if not any(other.name == run.name and is_later_than(other, run) for other in runs)
+    )
 
 
 def checks_state(checks: HeadChecks, sha: str) -> str:
@@ -513,7 +523,7 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
         return "pending"
     live = [
         (run, matrix_base(run.name), is_cancelled(run))
-        for run in checks.runs
+        for run in latest_named_runs(checks.runs)
         if run.name != DRAFT_CHECKS
     ]
     # The exact names and bare matrix names a finished, non-cancelled run excuses.
@@ -543,11 +553,10 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
             and run.run_id != 0
             and any(
                 old.name == "checks-fast" and is_cancelled(old) and old.run_id == run.run_id
-                for old, _base, _cancelled in live
+                for old in checks.runs
             )
             and any(
-                newer.name == "checks-fast" and is_later_than(newer, run)
-                for newer, _base, _cancelled in live
+                newer.name == "checks-fast" and is_later_than(newer, run) for newer in checks.runs
             )
         )
 

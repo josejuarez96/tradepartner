@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 import runpy
 import tomllib
 from collections.abc import Iterator
@@ -27,7 +28,7 @@ from dashboard_nav import NavCall, nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import Settings
-from tradepartner.dashboard import book_page, home_page, override_page, research_page
+from tradepartner.dashboard import book_page, home_page, override_page, research_page, theme
 from tradepartner.dashboard.app import (
     StoreState,
     StoreUnavailable,
@@ -243,6 +244,55 @@ def test_render_ok_state_builds_the_top_nav(
         "Details": _DETAIL_TITLES,
     }
     assert [p.title for p in pages[""] if p.url_path == ""] == ["Home"]
+
+
+def _bottom_bar_markup(at: AppTest) -> str:
+    """The shell's one phone-bar `st.html` block (it carries `theme.PHONE_NAV_CLASS`)."""
+    blocks = [str(b.value) for b in at.get("html") if theme.PHONE_NAV_CLASS in str(b.value)]
+    assert len(blocks) == 1
+    return blocks[0]
+
+
+def test_bottom_bar_has_one_link_per_top_nav_page_and_the_top_nav_stays(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    nav_calls: list[NavCall],
+) -> None:
+    at = _run_app(monkeypatch, _init_store(tmp_path))
+    assert not at.exception
+    markup = _bottom_bar_markup(at)
+    labels = re.findall(r"<a [^>]*>([^<]+)</a>", markup)
+    assert labels == _TOP_TITLES
+    hrefs = re.findall(r'href="([^"]*)"', markup)
+    assert hrefs == ["/", "/research", "/books"]
+    assert 'target="_self"' in markup
+    # desktop keeps the top nav
+    [(_pages, kwargs)] = nav_calls
+    assert kwargs == {"position": "top"}
+
+
+def test_bottom_bar_is_drawn_once_whichever_page_is_selected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path = _init_store(tmp_path)
+    for page in ("Home", "Books", "Backtest"):
+        at = _run_app(monkeypatch, store_path, page)
+        assert not at.exception
+        _bottom_bar_markup(at)
+
+
+def test_bottom_bar_is_absent_when_the_server_options_are_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real_get_option = st.get_option
+    monkeypatch.setattr(
+        st,
+        "get_option",
+        lambda key: "0.0.0.0" if key == "server.address" else real_get_option(key),
+    )
+    at = _run_app(monkeypatch, _init_store(tmp_path))
+    assert at.error
+    assert not [b for b in at.get("html") if theme.PHONE_NAV_CLASS in str(b.value)]
 
 
 def test_home_and_books_route_with_the_final_signature(

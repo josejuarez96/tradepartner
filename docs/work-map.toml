@@ -1480,6 +1480,11 @@ what = "Reconcile by breaks: a broker difference the explainers do not clear res
 why = "Stops every rare corporate event from halting the whole book and becoming an issue and a PR, and stops one external event from restarting the daily book's shakedown span (#2266, subsumes #2156)."
 unblocks = ["issue:2156", "phase:6"]
 
+[adr.0026]
+what = "Phone access: Tailscale Serve (Funnel removed by policy) proxies HTTPS on the owner's tailnet to a second, read-only Streamlit process on its own loopback port, which requires the owner's tailnet login, its tailnet Host and its own Origin on every script run before any widget or store read and has no write of any kind; the desk instance gains Host, Origin and proxied-header refusals."
+why = "The owner wants to read his books from his phone; this opens that path without opening the LAN or any write, answers ADR 0018 open question 5 and records the phone path T278's plan line was parked on (T278 itself is in PR #2385)."
+unblocks = ["task:T278"]
+
 [task.T289]
 what = "The Lab's listing of the checkout's sweep and hypothesis files, with registry and git state, and a sweep's frozen preview."
 why = "The owner sees what is registered, changed or unmerged before he registers anything from the app (#2304)."
