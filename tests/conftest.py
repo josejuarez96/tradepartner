@@ -548,6 +548,9 @@ def _load_table_csvs(conn: duckdb.DuckDBPyConnection, fixtures_dir: Path) -> Non
                 f"fixture CSV {csv_path.name!r} does not match any store "
                 f"table name (known tables: {schema.TABLE_NAMES})"
             )
+        # Old-version fixtures omit tables introduced after their schema version.
+        if table == "spinoff_allocations" and not _table_column_types(conn, table):
+            continue
         column_types = _table_column_types(conn, table)
         _assert_header_matches_columns(csv_path, table, column_types)
         _assert_cell_formats(csv_path, column_types)

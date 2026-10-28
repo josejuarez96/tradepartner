@@ -317,7 +317,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 2
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -752,6 +752,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         "openfigi_types": [],
         "successor_chains": [],
         "mergers": [],
+        "spinoff_allocations": [],
         "reconcile_breaks": [],
     }
     # And the migrated store is shaped exactly as a fresh one.

@@ -533,6 +533,8 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
     # cutoff is at or after its `known_at` (the amendment's "A held position"
     # paragraph), so the chained reads a trial sees are reproducible.
     "successor_chains",
+    # Owner-entered Form 8937 fractions change paper lots, not trial inputs.
+    # spinoff_allocations deliberately remains outside this explicit list.
 )
 
 #: The rows of a check-only security (`store.benchmarks.CHECK_ONLY_IDS`: RSP, stored for
@@ -577,8 +579,9 @@ def data_vintage(
     with `corporate_actions` counted only for its `split` and `dividend` rows
     and a `successor_chains` retraction counted from its `withdrawn_known_at`
     (`_TRIAL_TABLE_ROWS`; #821). Writing a `borrow_status`, `symbol_changes` or
-    `mergers` row therefore moves no trial's vintage, while `store_max_ingested_at` below
-    stays whole over every fact table: it is the store's state, not a trial's.
+    `mergers` or `spinoff_allocations` row therefore moves no trial's vintage,
+    while `store_max_ingested_at` stays whole over every fact table: it is the
+    store's state, not a trial's.
 
     `spin_offs` (backtest spec amendment #1894, item 6; T211d) adds the
     `corporate_actions` `spinoff` rows a spin-off-reading trial reads; a caller
