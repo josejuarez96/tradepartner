@@ -943,7 +943,7 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
     if last_t < t0 or len(rebalance_sessions(t0, last_t, cadence)) < 2:
         raise NothingToCompareYet(
             f"paper report: nothing to compare yet for book {book!r}; a report needs at "
-            f"least two rebalances and the first is {t0} (last completed: {last_t})"
+            f"least two rebalances and the first is {t0} (last marked rebalance: {last_t})"
         )
 
     missing = [t for t in rebalance_sessions(t0, last_t, cadence) if t not in marked]
