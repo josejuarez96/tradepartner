@@ -8,9 +8,11 @@ from __future__ import annotations
 
 from tradepartner.adapters.edgar_source import census_quarter
 
+# Real header from a recorded form.idx (tests/fixtures/edgar/filing_index_2024_qtr1.txt).
+# The header line and the dashes line that follows it.
 _HEADER = (
     "Form Type   Company Name                                                  "
-    "CIK         Date Filed  File Name\n" + "-" * 130 + "\n"
+    "CIK         Date Filed  File Name\n" + "-" * 143 + "\n"
 )
 
 
@@ -59,3 +61,24 @@ def test_a_wanted_form_row_with_a_broken_tail_is_counted_unparsed() -> None:
     accessions, _ciks, unparsed = census_quarter(_HEADER + bad)
     assert accessions == {}
     assert unparsed == 1
+
+
+def test_invalid_filing_date_is_counted_unparsed_not_counted() -> None:
+    """An invalid date like 2016-99-99 should be counted as unparsed, not counted as a valid row."""
+    bad = f"{'SC 13D':<17}{'X':<62}{1:<12}2016-99-99  edgar/data/1/0000000001-16-000001.txt\n"
+    accessions, _ciks, unparsed = census_quarter(_HEADER + bad)
+    assert accessions == {}
+    assert unparsed == 1
+
+
+def test_one_space_between_form_and_name_is_parsed_correctly() -> None:
+    """A row with only one space between form and name should be parsed correctly
+    (previously it was silently dropped)."""
+    # Form column is 17 chars, but only 1 space before name (not 2+)
+    row = (
+        "SC 13D ADAGE CAPITAL PARTNERS L.P.          "
+        "111          2016-08-01  edgar/data/111/0000000111-16-000001.txt\n"
+    )
+    accessions, _ciks, unparsed = census_quarter(_HEADER + row)
+    assert accessions == {2016: {"SC 13D": {"0000000111-16-000001"}}}
+    assert unparsed == 0

@@ -3938,6 +3938,15 @@ def _fsn_filing_from_json(accession: str, cik: str, data: Mapping[str, Any]) -> 
 # ownership event forms were filed each year and what fetching them would cost at
 # the EDGAR rate limit. It writes nothing: no store, no cache, no file. T307 (the
 # fetch and ingest) shares only the module, not these functions.
+#
+# The form column in `form.idx` is nominally 12 characters (up to the header's
+# "Company Name"), but real rows pad it to 17 characters. `census_quarter`
+# extracts the form by trying, in order: (1) the text before the first run of
+# two or more spaces; (2) the header's "Company Name" offset; (3) the padded
+# 17-character form column; (4) a prefix match against the wanted forms list.
+# If a wanted form is identified but the tail (CIK, date, accession) does not
+# parse, or the filing date is invalid (e.g., 2016-99-99), the row is counted
+# in `unparsed_rows` and not silently dropped.
 
 #: The six forms of the #2435 amendment, as the filing index names them. The
 #: `events.sec_forms` key (T305) takes over once it exists; the census takes the
@@ -4018,16 +4027,35 @@ def census_quarter(
         # wider than the header (17 vs 12), so the offset alone cuts `SCHEDULE 13D/A`. Take
         # the text before the first run of two spaces when that is a wanted form, else the
         # offset slice (a name one space from a short form: `SC 13D` is not a split point).
+        # As a final fallback, use the padded form column width (17 chars) which real rows use.
         form = _CENSUS_FORM_COLUMN.split(line, maxsplit=1)[0].strip()
         if form not in wanted and name_at is not None:
             form = line[:name_at].strip()
+        form_padded = line[:17].strip()
+        if form not in wanted and form_padded in wanted:
+            form = form_padded
+        # Fallback: try to match a wanted form as a prefix of the line (handles one-space
+        # rows where the form is not padded to 17 chars and there's only one space before
+        # the name). Check wanted forms sorted by length descending to match longest first.
+        if form not in wanted:
+            for w in sorted(wanted, key=len, reverse=True):
+                if line.startswith(w) and (len(line) == len(w) or line[len(w)] == " "):
+                    form = w
+                    break
         if form not in wanted:
             continue
-        match = _CENSUS_TAIL.match(line[len(form) :])
+        tail_start = len(form)
+        match = _CENSUS_TAIL.match(line[tail_start:])
         if match is None:
             unparsed += 1
             continue
-        year = int(match["filed"][:4])
+        # Validate the filing date; reject invalid dates like 2016-99-99.
+        try:
+            filed_date = date.fromisoformat(match["filed"])
+        except ValueError:
+            unparsed += 1
+            continue
+        year = filed_date.year
         accessions.setdefault(year, {}).setdefault(form, set()).add(match["accession"])
         ciks.setdefault(year, set()).add(f"{int(match['cik']):010d}")
     return accessions, ciks, unparsed
