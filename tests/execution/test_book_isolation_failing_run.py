@@ -236,3 +236,33 @@ def test_the_reserve_reads_only_its_own_books_orders_and_all_of_them(
     assert {e.client_order_id for e in b_events} <= {o.client_order_id for o in b_orders}
     assert not a_fills
     assert b_fills, "B's own fills are read"
+
+
+def test_book_bs_buys_left_open_by_an_earlier_window_still_count_and_as_never_do(
+    fixture_store_path: Path, tmp_path: Path
+) -> None:
+    """#2475: with B on a second (later) window, its first window's journaled buys
+    are still in B's reserve reads; A's open buys are in neither."""
+    from tradepartner.execution.wrapper import _own_book_rows
+
+    a, b = _two_books(fixture_store_path, tmp_path)
+    _fail_a_submit(a)
+    with pytest.raises(SubmitDown):
+        a.run(NOW)
+    assert b.run(NOW).status == "ok"
+    first_window = b.window.window_id
+    (second_id,) = b.append(replace(b.window, window_id=None))
+    assert second_id != first_window
+    with b.connect() as conn:
+        orders, _, _ = _own_book_rows(conn, BOOK_B)
+        windows = {
+            r[0]
+            for r in conn.execute(
+                "SELECT r.window_id FROM orders o JOIN paper_runs r USING (run_id) "
+                "WHERE o.client_order_id IN (SELECT unnest(?))",
+                [[o.client_order_id for o in orders]],
+            ).fetchall()
+        }
+    assert len(orders) == 3
+    assert windows == {first_window}, "B's buys come from its earlier window, not the new one"
+    assert all(o.book_id == BOOK_B for o in orders)
