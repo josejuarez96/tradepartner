@@ -54,7 +54,10 @@ def low_disk_warning(settings: Settings) -> str | None:
     warn = settings.health.warn_free_disk_gb
     if warn <= 0:
         return None
-    free = store_free_gb(settings)
+    try:
+        free = store_free_gb(settings)
+    except OSError as exc:
+        return f"low disk: could not read free space ({type(exc).__name__})"
     if free < warn:
         return (
             f"low disk: {free:.1f} GB free is below health.warn_free_disk_gb ({warn:g} GB); "

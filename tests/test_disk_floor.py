@@ -5,7 +5,6 @@ The disk is faked through `diskfloor.free_bytes`; no test reads the real one.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +13,6 @@ import pytest
 from test_cli import T_END, _invoke, _settings
 
 from tradepartner import diskfloor, heartbeat
-from tradepartner.calendar import session_close
 from tradepartner.config import Settings
 from tradepartner.store.db import open_for_write
 from tradepartner.store.schema import init_schema
@@ -137,6 +135,3 @@ def test_health_warning_off_at_zero(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     _free(monkeypatch, 1.0)
     out = _invoke(settings, ["health"], clock=lambda: T_END)
     assert "low disk" not in out.output
-
-
-_ = (UTC, date, datetime, session_close)
