@@ -3269,3 +3269,80 @@ scope = "50 issuers across cap ranks, ARQ/ARY rows"
 source = "docs/research/2026-10-11-sharadar-overlap-test.md"
 section = "Causes"
 note = "A small share of rows is affected; figure in the owner's local record."
+
+# ===== 2026-10-28-strategy-frontier-verified.md =====
+
+[[claim]]
+id = "FV-1"
+statement = "Cooper, Gulen and Schill (JF 2008) report an asset-growth return spread of 19.5% a year equal-weighted and 8.4% a year value-weighted, 1968-2003."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "all NYSE/AMEX/Nasdaq stocks, long-short deciles, risk-adjusted per the summaries; Chen-Zimmermann catalogue lists 1.73 %/month, t 8.45, equal-weighted"
+source = "docs/research/2026-10-28-strategy-frontier-verified.md"
+section = "Evidence"
+bears_on = ["backlog:I1"]
+note = "Search summaries and the catalogue row, not the paper. A follow-up said to attribute the result to omitted delisting returns is unnamed and UNVERIFIED."
+
+[[claim]]
+id = "FV-2"
+statement = "Chen and Velikov (JFQA 2023) put the average anomaly's expected return at 4 bp a month net of trading costs and post-publication effects, with post-2005 decay of 72%."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "204 anomalies; abstract only (earlier drafts gave 8 and 13 bp)"
+source = "docs/research/2026-10-28-strategy-frontier-verified.md"
+section = "Evidence"
+bears_on = ["backlog:I1"]
+note = "Agrees in direction with G2-S10 (Chen and Welch 2026, 7 bp non-micro post-2005); both say a 58% cut (QI-2) is too generous for our universe."
+
+[[claim]]
+id = "FV-3"
+statement = "Piotroski's F-score gains are strongest in small and medium firms, low share turnover and no analyst coverage, within the highest book-to-market group."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "1976-1996; secondary quote of the paper"
+source = "docs/research/2026-10-28-strategy-frontier-verified.md"
+section = "Evidence"
+note = "Our universe (price >= $5, $5M volume, top 1,000) removes most of these names."
+
+[[claim]]
+id = "TP-FV-1"
+statement = "The store's statement facts hold 8 fact names and no net income, equity, debt, current assets or liabilities, EBITDA or R&D, so the Piotroski score is 4 of 9 computable and the Mohanram score, accruals, enterprise multiple and debt-issuance signals are data-blocked."
+kind = "fact"
+grade = "SUPPORTED"
+scope = "store copy of 2026-10-28; 2,373,740 rows, 15,164 CIKs"
+source = "docs/research/2026-10-28-strategy-frontier-verified.md"
+section = "Census re-derived"
+bears_on = ["spec:data-foundation"]
+note = "TP- result (own query). Gross profit is missing for 38% of annual revenue filers in FY2020 (banks included), not 23%."
+
+[[claim]]
+id = "TP-FV-2"
+statement = "The `delistings` table lists 36 delisters for 2016-07 to 2018 against 779 issuers in the earlier coverage probe, and bars end for only 10 securities in 2016-2018 against 58 to 669 a year in 2019-2023, so a '77% delisted coverage' ratio on that table does not measure coverage before 2019."
+kind = "fact"
+grade = "SUPPORTED"
+scope = "store copy of 2026-10-28; 1,772 delisters at or before 2023-12-29, 1,365 with bars"
+source = "docs/research/2026-10-28-strategy-frontier-verified.md"
+section = "Census re-derived"
+bears_on = ["adr:0009"]
+note = "TP- result (own query). Reads before 2019 are on survivors."
+
+[[claim]]
+id = "TP-FV-3"
+statement = "Over the three paper sessions of 2026-10-20 to 10-27, per order, buys filled +46.9 bp against the open (95% interval +37.7 to +57.2) and sells +9.5 bp (+1.6 to +19.9), and buy cost rose from +30 bp above $200M daily volume to +131 bp below $50M."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "593 orders, 918 fills, paper simulator, 3 sessions (10-20 buys only, $494 each; later sessions mostly $1-50); order-level bootstrap"
+source = "docs/research/2026-10-28-strategy-frontier-verified.md"
+section = "Fill audit re-derived"
+bears_on = ["adr:0023"]
+note = "TP- result (own query). Replaces the overnight audit's 22.2 bp 'matches the backtest', which weighted by fills, mixed buy and sell gap signs and rested on a broken time column. Paper fills do not measure live slippage. Agrees with 2026-10-25-paper-fill-costs on the 10-20 buys."
+
+[[claim]]
+id = "TP-FV-4"
+statement = "Of 9,523 initial Schedule 13Ds filed 2016-07 to 2023-12, 4,168 have a bar within 7 days and 1,430 (873 securities) also pass price >= $5 and 20-day median dollar volume >= $5M; the median target trades about $2M a day."
+kind = "fact"
+grade = "SUPPORTED"
+scope = "free-model EDGAR list `sc13d.csv` joined to the store copy on CIK; common stock; activist and passive filers not separable"
+source = "docs/research/2026-10-28-strategy-frontier-verified.md"
+section = "Lead-by-lead table"
+note = "TP- result (own query). The 13D forms are not in the store; the list came from EDGAR by the overnight job."
