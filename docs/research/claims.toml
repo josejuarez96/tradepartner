@@ -3236,3 +3236,36 @@ scope = "US 10-Q/10-K filers 2016-07 to 2023-09 with Alpaca bars (14,589 events 
 source = "docs/experiments/c1b-filing-delay-matched.md"
 bears_on = ["backlog:C1"]
 note = "Registry runs: C1 run 2 (vs SPY; superseded, size and beta not signal) and C1b run 3 (artifact data/research/c1b-filing-delay-matched/c1b-filing-delay-matched-run3.json, t_min long -1.46, short -2.78). Retired by the owner 2026-10-27, killed on survivor data (#2371, #2411)."
+
+# ===== 2026-10-11-sharadar-overlap-test.md =====
+
+[[claim]]
+id = "TP-SH-1"
+statement = "Sharadar's identity crosswalk by CIK was one-to-one for 96.87% of 2,010 universe member-dates, below T144's 97% bar."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "Universes 2019-12-31 and 2023-12-29; CIK only (no CUSIP in the store); Domestic Common Stock categories"
+source = "docs/research/2026-10-11-sharadar-overlap-test.md"
+section = "Answer"
+bears_on = ["adr:0009"]
+note = "TP- result (own test). Multi-class issuers and current-CIK-only vendor field cause most misses."
+
+[[claim]]
+id = "TP-SH-2"
+statement = "T144 found Sharadar failing four of five pre-registered bars (crosswalk, 2016-18 delisted completeness, actions, fundamentals datekey) and passing raw closes by one row."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "Bars and methods as written in T144, owner-confirmed 2026-10-11"
+source = "docs/research/2026-10-11-sharadar-overlap-test.md"
+section = "Answer"
+bears_on = ["adr:0009"]
+
+[[claim]]
+id = "TP-SH-3"
+statement = "Sharadar's as-reported datekey equals EDGAR's Date Filed in 99.2% of matched rows, which precedes the acceptance time for filings accepted after 17:30 ET."
+kind = "fact"
+grade = "SUPPORTED"
+scope = "50 issuers across cap ranks, 3,411 ARQ/ARY rows 2009-2026"
+source = "docs/research/2026-10-11-sharadar-overlap-test.md"
+section = "Causes (counts)"
+note = "Stamping vendor fundamentals at the close of datekey would look ahead on about 1% of rows."
