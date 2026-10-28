@@ -4698,6 +4698,7 @@ def make_app(
                 for t in result.targets.rows
             ),
             *paper_slippage.slippage_report_lines(result.slippage, result.slippage_note),
+            *([f"paper report: {result.window_note}"] if result.window_note else []),
         ]
         for line in lines:
             _echo_scrubbed(line, s)
