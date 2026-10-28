@@ -532,9 +532,14 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
         if not cancelled:
             finished.add(run.name)
             finished.add(base)
+
     # A cancelled check is also excused by a SUCCESS in a later workflow run on this head,
     # whatever the names (the draft run's cancelled `pytest-shard` vs the full run's
-    # `pytest-shard (N)`, #1844).
+    # `pytest-shard (N)`, #1844). Cross-name excusal requires a DIFFERENT, LATER run_id;
+    # same run_id with later start time does not count (the cancelled check never passed).
+    def _cross_run_later(ok: CheckRun, cancelled: CheckRun) -> bool:
+        return ok.run_id != 0 and cancelled.run_id != 0 and ok.run_id > cancelled.run_id
+
     succeeded = [
         run
         for run, _base, cancelled in live
@@ -569,7 +574,7 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
             and (
                 run.name in finished
                 # never a cancelled `checks`: only a later `checks` excuses it (#1201)
-                or (run.name != "checks" and any(is_later_than(ok, run) for ok in succeeded))
+                or (run.name != "checks" and any(_cross_run_later(ok, run) for ok in succeeded))
             )
         )
     ]
