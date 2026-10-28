@@ -8,6 +8,7 @@ from __future__ import annotations
 import inspect
 import re
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
 import duckdb
@@ -612,6 +613,47 @@ def test_equity_at_reads_a_held_sessions_cash_from_its_position_rows() -> None:
 
 def test_equity_at_reads_a_flat_sessions_cash_only_row() -> None:
     assert equity_at([_row(D1, None, cash=750.0)], D1) == 750.0
+
+
+def test_equity_at_subtracts_short_leg_at_mark() -> None:
+    long = _row(D1, A, cash=1000.0, value=200.0)
+    short = _row(D1, B, cash=1000.0, value=120.0)
+    assert equity_at([long, replace(short, position_side="short")], D1) == 1080.0
+
+
+def test_marks_for_short_uses_its_own_close_and_unsigned_quantity(tmp_path) -> None:
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, D1, 20.0)
+    marks = marks_for(
+        conn,
+        _window(),
+        lambda through: Ledger(positions={}, short_holdings={A: 3.0}, cash=1060.0, through=through),
+        [D1],
+        {A: True},
+        actions=NO_ACTIONS,
+    )
+    conn.close()
+    assert [(m.security_id, m.quantity, m.value, m.position_side) for m in marks] == [
+        (A, 3.0, 60.0, "short")
+    ]
+
+
+def test_marks_refuses_same_name_on_both_sides(tmp_path) -> None:
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    with pytest.raises(ValueError, match="both long and short"):
+        marks_for(
+            conn,
+            _window(),
+            lambda through: Ledger(
+                positions={A: 1.0}, short_holdings={A: 1.0}, cash=500.0, through=through
+            ),
+            [D1],
+            {},
+            actions=NO_ACTIONS,
+        )
+    conn.close()
 
 
 def test_equity_at_reads_the_marks_for_rows_it_is_given(tmp_path) -> None:

@@ -32,6 +32,7 @@ from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import FROZEN_COSTS_KEYS, CostsConfig, RiskConfig, Settings
 from tradepartner.errors import SystemFaultError
+from tradepartner.execution import marks as marks_module
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.ledger import Ledger
@@ -324,6 +325,73 @@ def test_a_mark_session_writes_marks_and_no_order(env: Env, tmp_path: Path) -> N
     assert env.count("decisions") == 0
     assert env.submits() == 0
     assert env.alerts("missed_run") == []
+
+
+def test_mark_writer_persists_short_side(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env.open_window(tmp_path, first=T_1, started=MARK_START)
+
+    def short_mark(*_args: Any, **_kwargs: Any) -> list[marks_module.Mark]:
+        return [
+            marks_module.Mark(
+                session=date(2019, 5, 10),
+                security_id="SEC_SPY",
+                quantity=2.0,
+                mark_price=10.0,
+                value=20.0,
+                cash=FAKE_CASH + 20.0,
+                tradable=True,
+                position_side="short",
+            )
+        ]
+
+    monkeypatch.setattr(marks_module, "marks_for", short_mark)
+    env.run(at(MON))
+    assert env.query(
+        "SELECT position_side, quantity, value FROM positions_daily WHERE security_id = 'SEC_SPY'"
+    ) == [("short", 2.0, 20.0)]
+
+
+def test_mark_step_reads_asset_flag_for_held_short(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = env.open_window(tmp_path, first=T_1, started=MARK_START)
+    runner = run_module._Run.__new__(run_module._Run)
+    runner.settings = env.settings
+    runner.window = window
+    assert window.window_id is not None
+    runner.window_id = window.window_id
+    runner.session = MON
+    runner.frozen = FROZEN
+    runner.run_id = 1
+    runner.assets_read = env.fake.assets
+    monkeypatch.setattr(
+        runner,
+        "_ledger_for",
+        lambda _actions: (
+            lambda through: Ledger(
+                positions={}, short_holdings={"SEC_SPY": 2.0}, cash=FAKE_CASH, through=through
+            )
+        ),
+    )
+    monkeypatch.setattr(runner, "_drawdown", lambda _sessions: None)
+    seen: list[dict[str, bool]] = []
+
+    def capture(
+        _conn: Any,
+        _window: Any,
+        _ledger: Any,
+        _sessions: Any,
+        flags: dict[str, bool],
+        **_kwargs: Any,
+    ) -> list[marks_module.Mark]:
+        seen.append(flags)
+        return []
+
+    monkeypatch.setattr(marks_module, "marks_for", capture)
+    runner._mark(run_module.pl.DataFrame())
+    assert seen == [{"SEC_SPY": True}]
 
 
 def test_two_sessions_without_a_run_are_back_filled_by_the_next_run(

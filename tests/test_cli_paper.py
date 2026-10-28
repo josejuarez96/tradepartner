@@ -2340,6 +2340,123 @@ def test_report_passes_the_book_and_prints_the_same_lines(
     assert books == [None, "b"]
 
 
+def test_short_report_prints_dividends_and_headline_fee(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    t0, t1 = date(2026, 10, 1), date(2026, 10, 2)
+    period = paper_report.PeriodRow(
+        rebalance_session=t0,
+        next_session=t1,
+        raw=0.0,
+        dividend_term=-0.005,
+        fill_timing_term=0.0,
+        residual=-0.005,
+        residue_term=0.0,
+        modelled_cost=0.0,
+        missed=False,
+        override=False,
+        skip_names=(),
+        excluded=False,
+        passed=True,
+        short_dividend_term=0.005,
+        short_borrow_fee_term=0.00001,
+        short_book=True,
+    )
+    canned = paper_report.Report(
+        comparison=paper_report.PeriodComparison(
+            tracking_rule="raw",
+            tracking_k=2.0,
+            periods=(period,),
+            passed=True,
+            failing_period=None,
+        ),
+        targets=paper_report.TargetComparison(rows=()),
+        paper_report=journal.PaperReportRow(
+            window_id=1,
+            trial_id=7,
+            through_session=t1,
+            run_at=SESSION_CLOCK,
+            known_at=SESSION_CLOCK,
+            ingested_at=SESSION_CLOCK,
+        ),
+    )
+    monkeypatch.setattr(paper_report, "report", lambda *_a, **_k: canned)
+    out = _paper(clock, factory, "report")
+    assert out.exit_code == 0
+    assert "short dividends 0.005000 headline borrow fee 0.000010\n" in out.output
+
+
+@pytest.mark.usefixtures("started")
+def test_short_status_prints_broker_and_ledger_values(
+    clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock.now = datetime(2026, 10, 2, 14, tzinfo=UTC)
+    at = datetime(2026, 10, 1, 20, tzinfo=UTC)
+    with open_for_write(_settings()) as conn:
+        conn.execute(
+            "UPDATE paper_windows SET frozen_json = ? WHERE window_id = 1",
+            [json.dumps({"portfolio.side": "long_short"})],
+        )
+        run_id = journal.append(
+            conn,
+            journal.PaperRunRow(
+                window_id=1,
+                session=date(2026, 10, 1),
+                kind="mark",
+                started_at=at,
+                invoked_by="tty",
+                code_version="test",
+                known_at=at,
+                ingested_at=at,
+            ),
+        )
+        assert run_id is not None
+        journal.append(
+            conn,
+            journal.PositionDailyRow(
+                run_id=run_id,
+                session=date(2026, 10, 1),
+                security_id="SEC_SPY",
+                quantity=2.0,
+                mark_price=50.0,
+                value=100.0,
+                cash=100_100.0,
+                position_side="short",
+                known_at=at,
+                ingested_at=at,
+            ),
+        )
+    original = factory.fake.account
+    monkeypatch.setattr(
+        factory.fake,
+        "account",
+        lambda: replace(original(), short_market_value=-103.0),
+    )
+    out = _paper(clock, factory, "status")
+    assert out.exit_code == 0, out.output
+    assert "short value: broker -103.00; ledger -100.00\n" in out.output
+
+
+@pytest.mark.usefixtures("started")
+def test_short_status_survives_broker_account_failure(
+    clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with open_for_write(_settings()) as conn:
+        conn.execute(
+            "UPDATE paper_windows SET frozen_json = ? WHERE window_id = 1",
+            [json.dumps({"portfolio.side": "long_short"})],
+        )
+
+    def unavailable() -> Any:
+        raise RuntimeError("account unavailable")
+
+    monkeypatch.setattr(factory.fake, "account", unavailable)
+    out = _paper(clock, factory, "status")
+    assert out.exit_code == 0, out.output
+    assert "short value: broker n/a; ledger 0.00\n" in out.output
+    assert "kill switch released" in out.output
+
+
 def test_report_with_nothing_to_compare_prints_a_plain_message_and_exits_zero(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:

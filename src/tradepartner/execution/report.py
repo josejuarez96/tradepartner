@@ -59,10 +59,12 @@ is read for `paper.tracking_k` and `paper.tracking_rule` only, never live
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from itertools import pairwise
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -74,6 +76,7 @@ from tradepartner.backtest.holdout import Flags
 from tradepartner.backtest.run import run_hypothesis
 from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.calendar import (
+    all_sessions,
     previous_session,
     session_close,
 )
@@ -200,6 +203,19 @@ class PeriodRow:
     skip_names: tuple[str, ...]
     excluded: bool
     passed: bool
+    short_dividend_term: float = 0.0
+    short_borrow_fee_term: float = 0.0
+    short_book: bool = False
+
+    @property
+    def short_report_line(self) -> str | None:
+        """The two short tracking terms, absent on a long-only book."""
+        if not self.short_book:
+            return None
+        return (
+            f"short dividends {self.short_dividend_term:.6f} "
+            f"headline borrow fee {self.short_borrow_fee_term:.6f}"
+        )
 
 
 @dataclass(frozen=True)
@@ -242,7 +258,7 @@ def _local(at: datetime) -> date:
 def _quantity_at(marks: Sequence[PositionDailyRow], security_id: str, session: date) -> float:
     for row in marks:
         if row.session == session and row.security_id == security_id:
-            return row.quantity
+            return -row.quantity if row.position_side == "short" else row.quantity
     return 0.0
 
 
@@ -348,6 +364,72 @@ def _dividend_term(
     return total
 
 
+def _short_terms(
+    window: PaperWindowRow,
+    journal: Journal,
+    actions_as_of_next: pl.DataFrame,
+    t_i: date,
+    t_next: date,
+) -> tuple[float, float]:
+    """Short dividends owed and headline fee in dollars over one period.
+
+    Each day uses the prior session's short mark, matching backtest accrual
+    over calendar days. A missing intermediate mark is refused.
+    """
+    frozen = json.loads(window.frozen_json)
+    if frozen.get("portfolio.side", "long_only") != "long_short":
+        return 0.0, 0.0
+    rate = float(frozen["costs.borrow_bps_per_year"])
+    if not math.isfinite(rate) or rate < 0:
+        raise ValueError(f"invalid headline borrow fee {rate!r}")
+    short_marks = {
+        (row.session, row.security_id): row
+        for row in journal.positions_daily
+        if row.position_side == "short" and row.security_id is not None
+    }
+    owed = 0.0
+    if not actions_as_of_next.is_empty():
+        for action in actions_as_of_next.filter(pl.col("action_type") == _DIVIDEND).iter_rows(
+            named=True
+        ):
+            ex_date = action["ex_date"]
+            if not t_i < ex_date <= t_next:
+                continue
+            name = action["security_id"]
+            prior = short_marks.get((previous_session(ex_date), name))
+            if prior is None:
+                continue
+            already_debited = any(
+                a.kind == _DIVIDEND_CASH
+                and a.security_id == name
+                and ex_date <= a.session <= t_next
+                and a.known_at <= session_close(t_next)
+                for a in journal.adjustments
+            )
+            if not already_debited:
+                owed += prior.quantity * float(action["ratio_or_amount"])
+    fee = 0.0
+    sessions = [s for s in all_sessions() if t_i <= s <= t_next]
+    for prior_session, current_session in pairwise(sessions):
+        if not any(row.session == prior_session for row in journal.positions_daily):
+            raise ValueError(f"no mark for short fee on {prior_session}")
+        prior_values = [
+            row.value
+            for (marked_session, _), row in short_marks.items()
+            if marked_session == prior_session
+        ]
+        if any(value is None or not math.isfinite(value) for value in prior_values):
+            raise ValueError(f"unreadable short mark for {prior_session}")
+        fee += (
+            math.fsum(value for value in prior_values if value is not None)
+            * rate
+            / 10_000
+            * (current_session - prior_session).days
+            / 360
+        )
+    return owed, fee
+
+
 def _fill_timing_term(
     fills: Sequence[OrderedFill], prices: PriceOf, t_i: date, t_next: date
 ) -> float:
@@ -380,7 +462,10 @@ def _residue_term(
     held = {
         row.security_id: row.quantity
         for row in journal.positions_daily
-        if row.session == t_i and row.security_id is not None and row.quantity != 0
+        if row.session == t_i
+        and row.security_id is not None
+        and row.quantity != 0
+        and row.position_side != "short"
     }
     if not held:
         return 0.0
@@ -464,6 +549,7 @@ def compare_periods(
 
         actions_as_of_i = _actions_as_of(actions, session_close(t_i))
         actions_as_of_next = _actions_as_of(actions, session_close(t_next))
+        short_dividends, short_fee = _short_terms(window, journal, actions_as_of_next, t_i, t_next)
 
         dividend_term = (
             _dividend_term(
@@ -520,6 +606,9 @@ def compare_periods(
                 skip_names=skip_names,
                 excluded=excluded,
                 passed=period_passed,
+                short_dividend_term=short_dividends / paper_equity_i,
+                short_borrow_fee_term=short_fee / paper_equity_i,
+                short_book=json.loads(window.frozen_json).get("portfolio.side") == "long_short",
             )
         )
 
