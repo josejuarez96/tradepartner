@@ -43,11 +43,11 @@ Before anyone drafts an experiment file (or a hypothesis file) for an idea, the 
 
 - **(a) A causal timestamp exists in held data:** the event's `known_at` is in the store, so the signal could be acted on when it was known.
 - **(b) Event counts per year**, from a read-only count over the window, nothing after the development boundary and no returns.
-- **(c) Power:** the events needed to reach t >= 1.0 at a plausible effect (the literature's effect cut by the publication haircut, QI-2), and whether the store has them.
-- **(d) Gross edge plausibly above round-trip cost** at the ADR 0023 per-fill figure.
-- **(e) A matched benchmark is available** (peers of the same size, form and date). Never SPY for small stocks: [C1](../experiments/c1-filing-delay.md) run 2 against SPY showed size and beta, not the signal, until [C1b](../experiments/c1b-filing-delay-matched.md) (run 3) matched peers.
+- **(c) Power:** the number of events n at which the *expected* t reaches 1.0 at a plausible effect (the literature's effect cut by the publication haircut, QI-2), that is n = (sd / effect)^2, and whether the store has that many readable events. Having fewer means the idea is `deferred`, because a kill would say nothing.
+- **(d) Gross edge plausibly above round-trip cost:** the plausible effect exceeds 60 bp (30 bp per side, the figure C1, C1b and C2 use) unless rung 1's measured slippage says otherwise.
+- **(e) The design uses a matched benchmark, and one is available** (peers of the same size, form and date). Never SPY for small stocks: [C1](../experiments/c1-filing-delay.md) run 2 against SPY showed size and beta, not the signal, until [C1b](../experiments/c1b-filing-delay-matched.md) (run 3) matched peers.
 
-An idea that fails any item is recorded as `deferred: <reason>` and nothing is built or registered for it; it re-enters when the reason is removed (more history, an ingest). C2 is the case: [#2403](../experiments/c2-spinoff-children.md) counted 8 to 12 readable events, too few to reach t >= 1.0 at a plausible effect. A deferred idea costs a ledger row, not an experiment file.
+Record `pass` or `deferred: <item and reason>` (an item met in part counts as failed). Ideas already open before this rule (`pre-gate` rows) pass the check before their experiment file is drafted. An idea that fails any item is recorded as `deferred: <reason>` and nothing is built or registered for it; it re-enters when the reason is removed (more history, an ingest). C2 is the case: [#2403](../experiments/c2-spinoff-children.md) counted 8 to 12 readable events, too few to reach t >= 1.0 at a plausible effect. C2's own count probes read past the boundary before this rule; a forward check does not. A deferred idea costs a ledger row, not an experiment file.
 
 ### 5. Test
 

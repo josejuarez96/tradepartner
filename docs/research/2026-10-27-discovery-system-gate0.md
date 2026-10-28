@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-27 · **Issue:** #2409 · **Source:** [the external report](2026-10-27-discovery-system-external.md) (citations unverified), section 7, Gate 0 · **Type:** reconciliation, no new evidence
 
-The owner adopted Gates 0 and 1 of that report (Gate 1 is [research-program stage 4a](../ways-of-working/research-program.md#4a-feasibility-check-before-an-experiment-file)). Gates 2 to 5 (automation, a four-arm benchmark, grammar or GP search, RL) are not adopted; the report's own section 6 says not to build them yet.
+The owner adopted Gates 0 and 1 of that report (Gate 1 is adopted in part as [research-program stage 4a](../ways-of-working/research-program.md#4a-feasibility-check-before-an-experiment-file), the feasibility scoring; not taken: separate candidate templates, a duplicate-check step beyond the ledger `link`, and an independent-operator reproduction pilot). Gates 2 to 5 (automation, a four-arm benchmark, grammar or GP search, RL) are not adopted; the report's own section 6 says not to build them yet.
 
 ## What maps where
 
@@ -16,7 +16,7 @@ The owner adopted Gates 0 and 1 of that report (Gate 1 is [research-program stag
 | Experimental families as controls | `config.FAMILIES`: `momentum`, `oracle` (test-only), `profitability`, `combined`, `filing_delay`, `spinoff`; the last two are `engine_ready=False`, research-run only | Exists; family N carries the search (C1b file: "family N is not reset by a better design") |
 | Mechanism-first, event-based generation with kill ladder | [ADR 0023](../decisions/0023-break-first-fast-books-paper-exam.md) ladder; [sharper candidates](2026-10-27-sharper-candidates.md); rung 2-O | Exists; this is the report's Baseline B |
 | Feasibility router before any backtest | Ladder rungs 1 to 3 (cost, published leg, capacity) | **Partial.** Rungs cover cost and capacity. Not covered before an experiment file: causal timestamp, event counts, power, matched benchmark. That is Gate 1, now research-program 4a |
-| Candidate-generation arms, blinded benchmark, allocator, GP, RL, agents | none | Not adopted (Gates 2 to 5); revisit only if the ledger shows idea volume above its own upgrade trigger (more than one item a month at rung 1, or a batch above 20 ideas) |
+| Candidate-generation arms, blinded benchmark, allocator, GP, RL, agents | none | Not adopted (Gates 2 to 5); revisit only on the owner's word |
 
 ## The idea ledger: the report's section 3A fields
 
