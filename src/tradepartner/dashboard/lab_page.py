@@ -7,16 +7,18 @@ to recheck the registry before taking the slot and spawning the desk command.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import cast
 from zoneinfo import ZoneInfo
 
 import duckdb
 import streamlit as st
 
 from tradepartner import calendar
-from tradepartner.backtest import quiet, results, sweep_report
-from tradepartner.config import Settings
+from tradepartner.backtest import holdout, quiet, results, sweep_report
+from tradepartner.backtest.frozen import frozen_values
+from tradepartner.config import ENGINE_FAMILIES, Cadence, Settings
 from tradepartner.dashboard import (
     backtest_page,
     book_actions,
@@ -34,6 +36,8 @@ _ET = ZoneInfo("America/New_York")
 _GRACE_SECONDS = 30.0
 _OUTCOME = "lab_action_outcome"
 _NOTE = "lab_run_note"
+_BUDGET = "lab_sweep_time_budget"
+_POLL_ENDED = "lab_poll_ended"
 
 
 def _safe_scrub(text: str, settings: Settings) -> str:
@@ -148,6 +152,7 @@ def _on_run(
             st.session_state[_OUTCOME] = f"The run check failed: {_safe_scrub(str(exc), settings)}"
             return
         note = st.session_state.get(_NOTE) or None
+        budget = st.session_state.get(_BUDGET)
         _start_run(
             settings,
             slug,
@@ -156,6 +161,7 @@ def _on_run(
             tuple(i.slug for i in flying.running),
             baseline,
             store,
+            time_budget_minutes=budget,
         )
 
 
@@ -167,6 +173,11 @@ def _start_run(
     in_flight: tuple[str, ...],
     baseline: int,
     conn: duckdb.DuckDBPyConnection | None = None,
+    *,
+    kind: lab_child.LabKind = lab_child.LabKind.SWEEP_RUN,
+    start: date | None = None,
+    end: date | None = None,
+    time_budget_minutes: float | None = None,
 ) -> None:
     """Take the slot and spawn; abandon the reservation on any pre-spawn refusal."""
     slot = _slot_path(settings)
@@ -179,7 +190,12 @@ def _start_run(
         st.session_state[_OUTCOME] = "The registry read is unavailable; nothing ran."
         return
     try:
-        spawned = lab_child.spawn(settings, conn, lab_child.LabKind.SWEEP_RUN, slug, note=note)
+        if kind is lab_child.LabKind.BACKTEST:
+            spawned = lab_child.spawn(settings, conn, kind, slug, note=note, start=start, end=end)
+        else:
+            spawned = lab_child.spawn(
+                settings, conn, kind, slug, note=note, time_budget_minutes=time_budget_minutes
+            )
     except (lab_child.LabRefused, OSError, duckdb.Error, ValueError) as exc:
         lab_run.abandon(slot, taken)
         st.session_state[_OUTCOME] = _safe_scrub(str(exc), settings)
@@ -188,7 +204,7 @@ def _start_run(
         lab_run.record(
             slot,
             spawned.child,
-            kind="sweep_run",
+            kind=kind.value,
             slug=slug,
             baseline=baseline,
             started_at=now,
@@ -269,12 +285,185 @@ def _run_dialog(
     st.write(_cost_line(raw))
     st.caption(f"Predicted duration: about {predicted_seconds / 60:.1f} minutes.")
     st.text_area("Optional note", key=_NOTE, max_chars=settings.ui.max_reason_chars)
+    if st.checkbox("Set a time budget for this sweep"):
+        st.number_input("Time budget (minutes)", min_value=0.01, value=60.0, key=_BUDGET)
+    else:
+        st.session_state[_BUDGET] = None
     st.button(
         "Confirm Run",
         on_click=_on_run,
         args=(settings, slug, sweep_id, k, excess, raw),
         type="primary",
     )
+
+
+def _hypothesis_window(conn: duckdb.DuckDBPyConnection, slug: str) -> holdout.Window:
+    hypothesis = registry.get_hypothesis(conn, slug)
+    if hypothesis.family not in ENGINE_FAMILIES or registry.is_sweep_variant(
+        conn, hypothesis.hypothesis_id
+    ):
+        raise ValueError("Only a promoted, non-variant engine hypothesis can run here.")
+    if lab_registry.promotion_for(conn, hypothesis.hypothesis_id) is None:
+        raise ValueError("Only a promoted hypothesis can run here.")
+    values = frozen_values(hypothesis)
+    cadence = cast(Cadence, values["schedule.rebalance_cadence"])
+    frozen = holdout.Frozen(
+        hypothesis.hypothesis_id,
+        hypothesis.in_sample_start,
+        hypothesis.holdout_start,
+        hypothesis.holdout_end,
+        float(values[holdout.GAP_THRESHOLD_KEY]),
+    )
+    return holdout.default_in_sample_window(frozen, cadence, registry.boundary_date(conn))
+
+
+def _hypothesis_start_decision(now: datetime, settings: Settings, cadence: Cadence) -> str:
+    intervals = quiet.quiet_intervals_around(
+        now,
+        settings,
+        paper_window_open=True,
+        session_open=lambda day: calendar.session_open(day) if calendar.is_session(day) else None,
+    )
+    return quiet.start_decision(now, settings.lab.seconds_per_variant_default[cadence], intervals)
+
+
+def _on_hypothesis_run(
+    settings: Settings,
+    slug: str,
+    window: holdout.Window,
+    expected_id: int,
+    expected_excess: results.NextTrialCost,
+    expected_raw: results.NextTrialCost,
+) -> None:
+    """Recheck the registered window, cost, quiet interval and slot on click."""
+    from tradepartner.dashboard.app import StoreUnavailable, open_store_connection
+
+    now = datetime.now(UTC)
+    with open_store_connection(settings) as store:
+        if isinstance(store, StoreUnavailable):
+            st.session_state[_OUTCOME] = f"Store {store.state.value}; nothing ran."
+            return
+        try:
+            hypothesis = registry.get_hypothesis(store, slug)
+            allowed = _hypothesis_window(store, slug)
+            if (
+                hypothesis.hypothesis_id != expected_id
+                or window.start < allowed.start
+                or window.end != allowed.end
+            ):
+                st.session_state[_OUTCOME] = "Registration or window changed; nothing ran."
+                return
+            cadence = cast(Cadence, frozen_values(hypothesis)["schedule.rebalance_cadence"])
+            if _hypothesis_start_decision(now, settings, cadence) != "start":
+                st.session_state[_OUTCOME] = (
+                    "The quiet schedule says wait; nothing ran. Check when it opens."
+                )
+                return
+            rules = lab_registry.family_rules(store, hypothesis.family)
+            floor = rules.min_sharpe_variance_annual if rules else 0.0
+            excess = results.next_trial_cost(
+                store, hypothesis.family, basis="excess_spy", added=1, floor=floor
+            )
+            raw = results.next_trial_cost(
+                store, hypothesis.family, basis="raw", added=1, floor=floor
+            )
+            if (excess, raw) != (expected_excess, expected_raw):
+                st.session_state[_OUTCOME] = (
+                    "Trial cost changed; nothing ran. Review the new quote."
+                )
+                return
+            flying = lab_verdict.in_flight(store, now, settings)
+            row = store.execute("SELECT COALESCE(MAX(trial_id), 0) FROM trials").fetchone()
+            baseline = int(row[0]) if row else 0
+        except (
+            duckdb.Error,
+            ValueError,
+            KeyError,
+            registry.RegistryError,
+            lab_schema.LabNotInitialised,
+        ) as exc:
+            st.session_state[_OUTCOME] = _safe_scrub(f"The run check failed: {exc}", settings)
+            return
+        _start_run(
+            settings,
+            slug,
+            st.session_state.get(_NOTE) or None,
+            now,
+            tuple(i.slug for i in flying.running),
+            baseline,
+            store,
+            kind=lab_child.LabKind.BACKTEST,
+            start=window.start,
+            end=window.end,
+        )
+
+
+@st.dialog("Run hypothesis")
+def _hypothesis_dialog(
+    settings: Settings,
+    hypothesis: registry.HypothesisRecord,
+    window: holdout.Window,
+    excess: results.NextTrialCost,
+    raw: results.NextTrialCost,
+) -> None:
+    start = st.date_input(
+        "First in-sample session", value=window.start, min_value=window.start, max_value=window.end
+    )
+    st.write(f"Last in-sample session: {window.end}. The holdout stays reserved.")
+    st.write(f"One counted trial ⓘ of {hypothesis.family}: N ⓘ {excess.n_now} to {excess.n_next}.")
+    st.write(_cost_line(excess))
+    st.write(_cost_line(raw))
+    st.text_area("Optional note", key=_NOTE, max_chars=settings.ui.max_reason_chars)
+    st.button(
+        "Confirm Run",
+        on_click=_on_hypothesis_run,
+        args=(
+            settings,
+            hypothesis.slug,
+            holdout.Window(start, window.end),
+            hypothesis.hypothesis_id,
+            excess,
+            raw,
+        ),
+        type="primary",
+    )
+
+
+def _poll_status(settings: Settings) -> None:
+    """Fragment-only slot poll; no store connection or registry read."""
+    now = datetime.now(UTC)
+    state = lab_run.status(
+        _slot_path(settings),
+        scrub=lambda value: _safe_scrub(value, settings),
+        now=now,
+        grace_seconds=_GRACE_SECONDS,
+        tail_bytes=lab_child.TAIL_BYTES,
+    )
+    st.subheader("Run status")
+    st.write(status_sentence(state))
+    if state.state == "running":
+        intervals = quiet.quiet_intervals_around(
+            now,
+            settings,
+            paper_window_open=True,
+            session_open=lambda day: (
+                calendar.session_open(day) if calendar.is_session(day) else None
+            ),
+        )
+        waiting = next((i for i in intervals if i.start <= now < i.end), None)
+        if waiting is not None:
+            st.info(
+                "Queued: run is waiting for the quiet interval to end at "
+                f"{waiting.end.astimezone(_ET):%I:%M %p} ET."
+            )
+    if state.log_tail:
+        st.code(state.log_tail, language=None)
+    st.button("Check again")
+    if state.state in {"running", "starting"}:
+        st.session_state[_POLL_ENDED] = False
+    elif state.state == "ended" and not st.session_state.get(_POLL_ENDED, False):
+        st.session_state[_POLL_ENDED] = True
+        st.rerun()
 
 
 def _status(conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime) -> bool:
@@ -288,33 +477,11 @@ def _status(conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime) 
     )
     if state.state == "ended":
         lab_run.release(slot)
-    st.subheader("Run status")
-    st.write(status_sentence(state))
-    if state.state == "running":
-        intervals = quiet.quiet_intervals_around(
-            now,
-            settings,
-            paper_window_open=True,
-            session_open=lambda day: (
-                calendar.session_open(day) if calendar.is_session(day) else None
-            ),
-        )
-        waiting = next(
-            (interval for interval in intervals if interval.start <= now < interval.end), None
-        )
-        if waiting is not None:
-            st.info(
-                "Queued: sweep run is waiting for the quiet interval to end at "
-                f"{waiting.end.astimezone(_ET):%I:%M %p} ET."
-            )
-    if state.log_tail:
-        st.code(state.log_tail, language=None)
-    st.button("Check again")
     last = state.record if state.state == "ended" else lab_run.read_last(slot)
     if last is not None and last.baseline is not None:
         verdict = lab_verdict.verdict(
             conn,
-            kind="sweep_run",
+            kind=cast(lab_verdict.RunKind, last.kind),
             slug=last.slug,
             baseline_id=last.baseline,
             exit_code=last.exit_code,
@@ -322,10 +489,11 @@ def _status(conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime) 
             now=now,
         )
         st.write(_safe_scrub(f"Verdict ⓘ: {verdict.outcome}. {verdict.text}", settings))
-        st.caption(
-            "The engine's pre-registered sweep rule compares the selected variant's "
-            "deflated Sharpe ratio with its promote and retire thresholds."
-        )
+        if last.kind == "sweep_run":
+            st.caption(
+                "The engine's pre-registered sweep rule compares the selected variant's "
+                "deflated Sharpe ratio with its promote and retire thresholds."
+            )
         if verdict.message:
             st.write(_safe_scrub(verdict.message, settings))
         for variant in verdict.variants:
@@ -464,6 +632,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
     st.header("Lab")
     _show_outcome()
     now = datetime.now(UTC)
+    st.fragment(run_every=settings.ui.lab_poll_seconds)(_poll_status)(settings)
     busy = _status(conn, settings, now)
     files = lab_files.list_files(conn, settings, DOCS_ROOT)
     if not files:
@@ -485,6 +654,48 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
                     continue
                 if st.button("Register", key=f"register_{file.name}"):
                     _register_dialog(settings, file, preview)
+            if file.kind is FileKind.HYPOTHESIS and file.registry_state is RegistryState.REGISTERED:
+                try:
+                    hypothesis = registry.get_hypothesis(conn, file.slug)
+                    window = _hypothesis_window(conn, file.slug)
+                    cadence = cast(Cadence, frozen_values(hypothesis)["schedule.rebalance_cadence"])
+                    decision = _hypothesis_start_decision(now, settings, cadence)
+                    if busy:
+                        st.caption("Run is unavailable while the Lab slot is busy.")
+                    elif decision != "start":
+                        interval = quiet.next_quiet_interval(
+                            now,
+                            settings,
+                            paper_window_open=True,
+                            session_open=lambda day: (
+                                calendar.session_open(day) if calendar.is_session(day) else None
+                            ),
+                        )
+                        opening = (
+                            interval.end.astimezone(_ET).strftime("%Y-%m-%d %I:%M %p ET")
+                            if interval
+                            else "after the next quiet interval"
+                        )
+                        st.caption(f"Run waits for the quiet schedule; opens {opening}.")
+                    else:
+                        rules = lab_registry.family_rules(conn, hypothesis.family)
+                        floor = rules.min_sharpe_variance_annual if rules else 0.0
+                        excess = results.next_trial_cost(
+                            conn, hypothesis.family, basis="excess_spy", added=1, floor=floor
+                        )
+                        raw = results.next_trial_cost(
+                            conn, hypothesis.family, basis="raw", added=1, floor=floor
+                        )
+                        if st.button("Run", key=f"run_{file.name}"):
+                            _hypothesis_dialog(settings, hypothesis, window, excess, raw)
+                except (
+                    registry.RegistryError,
+                    duckdb.Error,
+                    ValueError,
+                    KeyError,
+                    lab_schema.LabNotInitialised,
+                ) as exc:
+                    st.caption(_safe_scrub(f"Hypothesis Run unavailable: {exc}", settings))
             if (
                 file.kind is not FileKind.SWEEP
                 or file.registry_state is not RegistryState.REGISTERED
