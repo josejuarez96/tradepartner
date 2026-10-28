@@ -337,9 +337,14 @@ def collect(
         raise ValueError(f"orders passed more than once: {repeated}")
 
     with connect() as conn:
-        cursors = fill_cursors(conn)
-        open_since = _earliest_open_pending(conn)
-        pending_at = _open_pending_stamps(conn)
+        # The writer's own book only (#2475): another book's open buy and run
+        # cursor belong to its own account, so they must not move this read's
+        # `since`. A run names its book through its window; a resume through
+        # its orders; neither: read account-wide as before.
+        books = _writer_books(conn, writer_kind, writer_id, orders)
+        cursors = _book_cursors(conn, books)
+        open_since = _earliest_open_pending(conn, books)
+        pending_at = _open_pending_stamps(conn, books)
         floor_row = conn.execute("SELECT min(started_at) FROM paper_windows").fetchone()
         window_floor = (
             ensure_tz_aware_utc(floor_row[0], field_name="started_at")
@@ -347,7 +352,7 @@ def collect(
             else None
         )
         pending = {o.client_order_id for o in pending_orders(conn, window_id=None)}
-        open_ids = {o.client_order_id for o in non_terminal_orders(conn, window_id=None)}
+        open_ids = _open_ids(conn, books)
     cursor = max((c.collected_through for c in cursors), default=None)
     last_run = max((c.known_at for c in cursors if c.writer_kind == _RUN), default=None)
     refused = sorted(i for i in ids if i in pending)
@@ -392,8 +397,15 @@ def collect(
             raise ClockError(f"clock went back from {now.isoformat()} to {stamp.isoformat()}")
         journaled, superseded, foreign = _journal_fills(conn, seen, stamp)
         collected = _journal_terminals(conn, to_read, readings, frozen, stamp)
-        all_orders = orders_for(conn, window_id=None)
-        all_events = order_events_for(conn, window_id=None)
+        # The same book(s) as the cursors above: `last_run` is this book's, so
+        # judging another book's rejections against it would re-judge them (#2475).
+        all_orders = [
+            o for o in orders_for(conn, window_id=None) if books is None or o.book_id in books
+        ]
+        in_books = {o.client_order_id for o in all_orders}
+        all_events = [
+            e for e in order_events_for(conn, window_id=None) if e.client_order_id in in_books
+        ]
         rejections = rejection_breaches(
             _runs_to_judge(collected, all_orders, all_events, last_run),
             all_orders,
@@ -525,9 +537,55 @@ def _runs_to_judge(
     return sorted(runs)
 
 
-def _earliest_open_pending(conn: duckdb.DuckDBPyConnection) -> datetime | None:
-    """The earliest `known_at` of the `pending` event of any non-terminal order."""
-    open_ids = {o.client_order_id for o in non_terminal_orders(conn, window_id=None)}
+def _writer_books(
+    conn: duckdb.DuckDBPyConnection, writer_kind: str, writer_id: int, orders: Sequence[OrderRow]
+) -> set[str] | None:
+    """The books this collection reads: the run's own book, else the orders'
+    books, else None (every book)."""
+    if writer_kind == _RUN:
+        row = conn.execute(
+            "SELECT w.book_id FROM paper_runs r JOIN paper_windows w ON w.window_id = r.window_id "
+            "WHERE r.run_id = ?",
+            [writer_id],
+        ).fetchone()
+        if row is not None:
+            return {str(row[0])}
+    return {o.book_id for o in orders} or None
+
+
+def _book_cursors(conn: duckdb.DuckDBPyConnection, books: set[str] | None) -> list[FillCursorRow]:
+    """Every cursor except another book's run cursor (#2475). A run cursor is
+    the book of its run's window; a resume cursor names no book and stays. Only
+    ever drops cursors, so `since` and `last_run` only move earlier (reads more, never hides
+    a fill)."""
+    cursors = fill_cursors(conn)
+    if books is None:
+        return cursors
+    book_of_run = {
+        int(run_id): str(book_id)
+        for run_id, book_id in conn.execute(
+            "SELECT r.run_id, w.book_id FROM paper_runs r "
+            "JOIN paper_windows w ON w.window_id = r.window_id"
+        ).fetchall()
+    }
+    return [c for c in cursors if c.writer_kind != _RUN or book_of_run.get(c.writer_id) in books]
+
+
+def _open_ids(conn: duckdb.DuckDBPyConnection, books: set[str] | None) -> set[str]:
+    """The non-terminal orders' ids, of `books` only (every book when None)."""
+    return {
+        o.client_order_id
+        for o in non_terminal_orders(conn, window_id=None)
+        if books is None or o.book_id in books
+    }
+
+
+def _earliest_open_pending(
+    conn: duckdb.DuckDBPyConnection, books: set[str] | None
+) -> datetime | None:
+    """The earliest `known_at` of the `pending` event of any non-terminal order
+    of `books`."""
+    open_ids = _open_ids(conn, books)
     return min(
         (
             e.known_at
@@ -538,9 +596,11 @@ def _earliest_open_pending(conn: duckdb.DuckDBPyConnection) -> datetime | None:
     )
 
 
-def _open_pending_stamps(conn: duckdb.DuckDBPyConnection) -> dict[str, datetime]:
-    """The `known_at` of the `pending` event of each non-terminal order."""
-    open_ids = {o.client_order_id for o in non_terminal_orders(conn, window_id=None)}
+def _open_pending_stamps(
+    conn: duckdb.DuckDBPyConnection, books: set[str] | None
+) -> dict[str, datetime]:
+    """The `known_at` of the `pending` event of each non-terminal order of `books`."""
+    open_ids = _open_ids(conn, books)
     return {
         e.client_order_id: e.known_at
         for e in order_events_for(conn, window_id=None)
