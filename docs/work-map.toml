@@ -1538,7 +1538,7 @@ why = "The charter still says the override is the only write; ADR 0018's amendme
 unblocks = ["task:T294"]
 
 [task.T305b]
-what = "A pure reader of the SEC's quarterly insider bulk data set into Form 4 rows, the zip fetch and the four bulk-route config keys."
+what = "A pure reader of the SEC's quarterly insider bulk data set into Form 4 rows, the zip fetch and the five bulk-route config keys."
 why = "It cuts the Form 4 backfill from about 64 hours of XML fetches to about 1 hour (#2498), and needs no store, so it can merge before the span ends."
 unblocks = ["task:T305c"]
 
