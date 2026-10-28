@@ -706,16 +706,14 @@ def test_two_rows_known_before_the_removal_halt_merger_conflict_once_then_fall_b
     assert conflict["kind"] == MERGER_CONFLICT and conflict["security_id"] == MTUM
     assert conflict["detail"] == (f"merger ids [{M1!r}, {M2!r}] for {MTUM} effective 2026-10-01")
     _still_halts_on_the_open_finding(journal_settings, fake, open_window, fixed_clock, S, 30)
-    # T281 books no adjustment on a `breaks` row (not yet a cash base, T282b), so
-    # the explanation is recorded on the row and the band is journaled once the
-    # finding is trued up. The fall-back itself is unchanged: the delisting band
-    # explains the removal and neither merger id is read again.
-    assert _adjustments(journal_settings, open_window) == []
-    (explained,) = json.loads(_rows(journal_settings, open_window)[-1].mismatches_json or "")[
-        "explained"
-    ]
-    assert explained["explanation"] == "listing ended"
-    assert explained["quantity"] == pytest.approx(-HELD)
+    # Amendment item 10 books the explained delisting band on a `breaks` cash base.
+    (adjustment,) = _adjustments(journal_settings, open_window)
+    assert (adjustment.kind, adjustment.quantity, adjustment.cash) == (
+        "corporate_action_cash",
+        pytest.approx(-HELD),
+        pytest.approx(DUE),
+    )
+    assert json.loads(adjustment.explanation_json or "")["explanation"] == "listing ended"
     assert _open(journal_settings, open_window, S2).mergers == {}
 
 

@@ -553,8 +553,8 @@ class _Book:
     that has none, the reason, raised when read: #569), each decision's state and each sold name's
     residue, the broker symbols, unmappable names (#1729) and ended listings
     of the batch's names, every own
-    order, event and live fill of any window, and the last `ok` daily price
-    ingest's `finished_at` (`last_ok_price_ingest`)."""
+    order, event and live fill of any window, its open breaks, and the last
+    `ok` daily price ingest's `finished_at` (`last_ok_price_ingest`)."""
 
     window: PaperWindowRow
     costs: BuyCosts
@@ -574,6 +574,7 @@ class _Book:
     #: The batch's names the one symbol map leaves ambiguous after a ticker
     #: change, each with its note (#2185): never read or sent, handled per name.
     ambiguous: Mapping[str, str] = field(default_factory=dict)
+    open_breaks: Sequence[ReconcileBreakRow] = ()
 
     def price_of(self, security_id: str) -> float:
         """The reference price on S, or `ValueError` for a name not read or
@@ -1064,10 +1065,9 @@ class RiskGatedBroker:
         )
 
     def _buys_cash(self, account: Account, book: _Book, session: date) -> float:
-        """**The one cash read** spec req 2 may amend (the declared stub, module
-        docstring): max(0, `account().cash` - the open-buy reserve), never
-        `buying_power`. A `ValueError` from the reserve halts the buys phase;
-        there is no fallback to a zero reserve or the full cash."""
+        """Cash available to buys: broker cash less the open-buy reserve,
+        unresolved sell proceeds and positive open name cash breaks, floored at
+        zero. Invalid reserve or break data halts the phase."""
         reserve = open_buy_reserve(
             book.orders,
             book.events,
@@ -1078,7 +1078,25 @@ class RiskGatedBroker:
             session=session,
         )
         proceeds = self._unresolved_proceeds(book)
-        return float(max(Decimal(repr(float(account.cash))) - reserve - proceeds, Decimal(0)))
+        broken_cash = Decimal(0)
+        for row in book.open_breaks:
+            parts = json.loads(row.parts_json)
+            if not isinstance(parts, list):
+                raise ValueError(f"break {row.break_id} has invalid parts")
+            for part in parts:
+                if not isinstance(part, dict):
+                    raise ValueError(f"break {row.break_id} has invalid part")
+                if part.get("kind") == "name_cash":
+                    cash_amount = part.get("cash_amount")
+                    if not isinstance(cash_amount, (int, float)) or isinstance(cash_amount, bool):
+                        raise ValueError(f"break {row.break_id} has invalid cash")
+                    amount = Decimal(str(cash_amount))
+                    if not amount.is_finite():
+                        raise ValueError(f"break {row.break_id} has non-finite cash")
+                    broken_cash += max(amount, Decimal(0))
+        return float(
+            max(Decimal(repr(float(account.cash))) - reserve - proceeds - broken_cash, Decimal(0))
+        )
 
     def _unresolved_proceeds(self, book: _Book) -> Decimal:
         """The most the own `pending_unresolved` sells may have credited: quantity
@@ -1418,7 +1436,8 @@ class RiskGatedBroker:
             ok = [
                 r
                 for r in reconciliations_for(conn, window_id)
-                if r.status == _OK and r.at.astimezone(_NEW_YORK).date() <= session
+                if (r.status == _OK or (r.status == "breaks" and r.broker_cash is not None))
+                and r.at.astimezone(_NEW_YORK).date() <= session
             ]
             ledger = from_journal(
                 fills_for(conn, window_id=window_id),
@@ -1454,6 +1473,7 @@ class RiskGatedBroker:
                 [r.run for r in runs_for(conn, window_id)],
             )
             last_ok_ingest = _last_ok_ingest(conn)
+            active_breaks = open_breaks(conn, window_id)
         events_of = {d.decision.decision_id: d.events for d in journaled}
         price_of = _price_lookup(prices, unpriced)
         states: dict[int, DecisionState] = {}
@@ -1506,6 +1526,7 @@ class RiskGatedBroker:
             fills,
             last_ok_ingest,
             ambiguous,
+            active_breaks,
         )
 
     def _engaged(self, run: PaperRunRow, window: PaperWindowRow) -> bool:
