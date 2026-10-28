@@ -2541,6 +2541,33 @@ class DashboardConfig(BaseModel):
     page_row_limit: int = Field(default=500, gt=0)
 
 
+class EventsConfig(_ClosedConfig):
+    """SEC ownership event forms (plan T305, spec amendment 2026-10-28, #2435).
+
+    `sec_forms` is the list of 13D and Form 4 form names kept as events; it is NOT
+    `master.issuer_forms` (an identity rule, in the frozen canonical set) and nothing
+    here reaches master construction, the universe, prices, signals or any trial input.
+    All three keys sit outside the frozen set (`tests/test_config.py` pins it).
+    `sec_forms_enabled` gates collection (off: no event fetch, no row write);
+    `sec_forms_read_enabled` gates the as-of reads and stays off until the owner records
+    a clean week of `sec_forms_clock_suspect = 0` (#1382). Never empty.
+    """
+
+    sec_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
+        default_factory=lambda: [
+            "SC 13D",
+            "SC 13D/A",
+            "SCHEDULE 13D",
+            "SCHEDULE 13D/A",
+            "4",
+            "4/A",
+        ],
+        min_length=1,
+    )
+    sec_forms_enabled: bool = False
+    sec_forms_read_enabled: bool = False
+
+
 class UiConfig(_ClosedConfig):
     """What the Home and Book pages show (plan T273, #2170); display only, nothing
     here reaches a run.
@@ -2751,6 +2778,8 @@ class Settings(BaseSettings):
     portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
     # T273 (#2170): the Home page's display keys, last so no other section shifts.
     ui: UiConfig = Field(default_factory=UiConfig)
+    # T305 (#2435): SEC ownership event forms; not frozen, last so no section shifts.
+    events: EventsConfig = Field(default_factory=EventsConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
