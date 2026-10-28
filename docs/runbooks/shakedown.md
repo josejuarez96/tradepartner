@@ -4,7 +4,7 @@ What you do on each day of the span, 2026-10-22 to 2026-11-04. The rules behind 
 
 The ten sessions: 10-22, 10-23, 10-26, 10-27 (drill on `daily`), 10-28, 10-29, 10-30, 11-02 (the first fill session of `main`, which must trade), 11-03, 11-04. The Mac runs the 18:30 ingest each evening and the 08:05 `paper run` each morning, as in scheduling.md. Run every command from the job checkout.
 
-During the span, do **not**: pull a schema bump into the job checkout, run a data release, start a new book, or pull an order-path change (unless it fixes a span blocker).
+During the span, do **not**: pull a schema bump into the job checkout (*Amended 2026-10-28, #2535, owner: the SEC ownership forms migration on Saturday 2026-10-31 is the one exception*), run a data release, start a new book, or pull an order-path change (unless it fixes a span blocker).
 
 ## 1. Before the span (finish by 10-21)
 
