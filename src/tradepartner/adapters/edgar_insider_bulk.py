@@ -33,8 +33,9 @@ share count (a reinvested dividend, a split remainder) can differ from the XML b
 0.005 shares, and a true price of 0.995 to 0.999 reads as 1.00 (#2498 open questions 2
 and 5). Parity with the XML is therefore asserted at 2 decimals.
 
-**Fail closed.** A zip missing a table, or a table missing a column named below (the
-readme's names, pinned against a recorded zip), or one that does not parse, raises
+**Fail closed.** A zip missing a table, a table missing a column named below (the
+readme's names, pinned against a recorded zip), a row whose cell count differs from the
+header (a stray tab shifts every later cell), or a table that does not parse, raises
 `InsiderBulkUnreadableError`: nothing is returned from that quarter.
 
 Forms 3, 5, 3/A and 5/A and the `DERIV_*` and `NONDERIV_HOLDING` tables are not read.
@@ -166,8 +167,13 @@ def _table(
             for cells in reader:
                 if not any(cell.strip() for cell in cells):
                     continue
-                padded = cells[:width] + [""] * (width - len(cells))
-                yield dict(zip(header, padded, strict=True))
+                if len(cells) != width:
+                    # A stray tab shifts every later cell (a code read as a date, a
+                    # price as blank): no cell of the row can be trusted.
+                    raise InsiderBulkUnreadableError(
+                        f"{name}.tsv row has {len(cells)} cells, the header {width}"
+                    )
+                yield dict(zip(header, cells, strict=True))
     except (csv.Error, zipfile.BadZipFile, OSError, EOFError) as error:
         raise InsiderBulkUnreadableError(f"{name}.tsv does not parse: {error!r}") from error
 

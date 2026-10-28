@@ -397,16 +397,20 @@ def test_header_fields_for_the_submissions_cross_check() -> None:
     assert bad.filing_date is None  # the cross-check then reads it as a disagreement
 
 
-def test_a_short_row_and_extra_columns_read() -> None:
-    cols = [*SUBMISSION, "ISSUERNAME", "REMARKS"]
-    text = _tsv(cols, [_sub(ISSUERNAME="X")]).replace("\tX\t\n", "\tX\n")  # trailing blank dropped
+def test_a_ragged_row_fails_the_quarter_closed() -> None:
+    """A tab inside a cell shifts the later cells; reading it would hide a row from the
+    under-threshold hold-back, so the quarter is unreadable."""
+    for bad in (_tr("1", SECURITY_TITLE="Common\tStock"), _tr("1", TRANS_SHARES="1\t0")):
+        with pytest.raises(bulk.InsiderBulkUnreadableError):
+            _read(trans=[bad])
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as z:
-        z.writestr("SUBMISSION.tsv", text)
+        z.writestr("SUBMISSION.tsv", _tsv(SUBMISSION, [_sub()]).replace("\t0000111111", ""))
         z.writestr("REPORTINGOWNER.tsv", _tsv(OWNER, [_own()]))
         z.writestr("NONDERIV_TRANS.tsv", _tsv(TRANS, [_tr("1")]))
     buffer.seek(0)
-    assert ACC in bulk.read_insider_bulk(buffer).accessions
+    with pytest.raises(bulk.InsiderBulkUnreadableError):
+        bulk.read_insider_bulk(buffer)
 
 
 # --- fail closed ------------------------------------------------------------------
