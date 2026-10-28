@@ -5096,3 +5096,18 @@ def test_signed_book_fails_closed_and_reads_a_registered_long_only_hypothesis(
         assert _REAL_SIGNED_BOOK(conn, known) is False
         # No such hypothesis: unreadable reads as signed, so the book halts.
         assert _REAL_SIGNED_BOOK(conn, replace(frozen_window, hypothesis_id=9_999)) is True
+
+
+def test_signed_book_reads_a_long_short_hypothesis_as_signed(
+    journal_settings: Settings, frozen_window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unsafe direction: a hypothesis freezing `portfolio.side = long_short` reads
+    True (the key and value `headroom._side` reads), so its restricted names halt."""
+    from execution.test_run_core import registered_hypothesis
+
+    known = replace(frozen_window, hypothesis_id=registered_hypothesis(journal_settings))
+    monkeypatch.setattr(
+        reconcile_run, "frozen_values", lambda _hypothesis: {"portfolio.side": "long_short"}
+    )
+    with open_for_write(journal_settings) as conn:
+        assert _REAL_SIGNED_BOOK(conn, known) is True
