@@ -43,7 +43,7 @@ no durable run record, even if its handle remains in memory. `synthetic=True`
 is refused on `settings.store.path` (file identity, `store.registry`'s check).
 
 **The development boundary** (ADR 0016 point 2; data-foundation plan T142b). For a
-registration that names a backtest family (one with registered hypotheses), `open_run` reads
+registration that names a family, including an experiment-only family, `open_run` reads
 `store.registry.development_boundary` once and treats it as one more protected edge,
 checked right after the window gate: a registration window that reads a session after
 the boundary outside every one of the family's holdouts (a dead month, or a session
@@ -855,7 +855,7 @@ def open_run(
     )
 
     window_decision = check_window(dataset_span, window, as_of)
-    if window_decision.outcome == "ok" and family_holdouts:
+    if window_decision.outcome == "ok" and registration.family is not None:
         window_decision = _boundary_decision(window, family_holdouts, boundary_date(conn))
     split_decision = check_split(split, registration.splits)
     holdout = check_holdout(

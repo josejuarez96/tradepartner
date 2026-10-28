@@ -46,7 +46,7 @@ _CONFIG_TOML = Path(__file__).resolve().parents[2] / ".streamlit" / "config.toml
 
 _DASHBOARD_DIR = Path(_APP_PATH).parent
 
-_TOP_TITLES = ["Home", "Research", "Books"]
+_TOP_TITLES = ["Home", "Research", "Lab", "Books"]
 _DETAIL_TITLES = [
     "Data health",
     "Backtest",
@@ -264,7 +264,7 @@ def test_bottom_bar_has_one_link_per_top_nav_page_and_the_top_nav_stays(
     labels = re.findall(r"<a [^>]*>([^<]+)</a>", markup)
     assert labels == _TOP_TITLES
     hrefs = re.findall(r'href="([^"]*)"', markup)
-    assert hrefs == ["/", "/research", "/books"]
+    assert hrefs == ["/", "/research", "/lab", "/books"]
     assert 'target="_self"' in markup
     # desktop keeps the top nav
     [(_pages, kwargs)] = nav_calls

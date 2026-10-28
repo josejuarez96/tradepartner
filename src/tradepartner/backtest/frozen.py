@@ -378,6 +378,11 @@ def _cost_key_allows(key: str, value: Any, default: Any) -> bool:
     return is_default(value, default)
 
 
+def borrow_axis_allows(key: str, params: Mapping[str, Any]) -> bool:
+    """A signed book may vary its borrow sensitivity list within a family (#2140)."""
+    return key == "costs.borrow_sensitivity_bps" and params.get("portfolio.side") == "long_short"
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
