@@ -379,7 +379,7 @@ from dataclasses import dataclass, fields
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -393,7 +393,12 @@ from tradepartner.adapters import alpaca_raw, edgar_raw
 from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
 from tradepartner.adapters.broker import Broker
 from tradepartner.adapters.edgar import parse_sgml_header
-from tradepartner.adapters.edgar_source import EdgarFilingSource
+from tradepartner.adapters.edgar_source import (
+    CENSUS_XML_BYTES_ASSUMED,
+    EdgarFilingSource,
+    FormsCensus,
+    census_filing_index,
+)
 from tradepartner.adapters.filings import FilingHeader
 from tradepartner.adapters.fred_rates import FredRateSource
 from tradepartner.adapters.prices import (
@@ -420,7 +425,7 @@ from tradepartner.backtest.hypothesis import (
 from tradepartner.backtest.metrics import METRIC_KEYS
 from tradepartner.backtest.run import RunOutcome, run_hypothesis
 from tradepartner.cli_record import _configured_secrets, scrub_text
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import Settings, clean_message, get_settings
 from tradepartner.corpus import departure_fetch
 from tradepartner.execution import check as paper_check
 from tradepartner.execution import lots_reconcile, ops, plain, reconcile_run, waiting, window
@@ -2081,6 +2086,84 @@ def _index_check_lines(report: idx.IndexCheckReport, code_version: str) -> list[
     return lines
 
 
+def _census_sec_forms(
+    s: Settings,
+    *,
+    source: str,
+    xml_bytes: int,
+    clock: Clock,
+    client: httpx.Client | None,
+    others: Sequence[bool],
+) -> NoReturn:
+    """`ingest --census-sec-forms`: walk the full filing index, print the ownership-forms
+    census and exit. Opens and writes no store (no lock, no cache): the only I/O is the
+    index requests, behind the EDGAR throttle (#2435, T307b)."""
+    if any(others) or source not in ("all", "edgar") or xml_bytes <= 0:
+        raise _fail(
+            "--census-sec-forms stands alone: no other ingest flag, --source all or edgar, "
+            "and a positive --census-xml-bytes",
+            USAGE_ERROR,
+        )
+    if _missing_secrets(s, "edgar"):
+        raise _fail(
+            "missing required secret(s): SEC_EDGAR_USER_AGENT. Set it in .env (see .env.example).",
+            USAGE_ERROR,
+        )
+    now = clock()
+    through = (now.year, (now.month - 1) // 3 + 1)
+
+    def fetch(year: int, qtr: int) -> str:
+        return edgar_raw.filing_index_quarter(year, qtr, settings=s, client=client)
+
+    try:
+        census = census_filing_index(fetch, through=through)
+    except httpx.HTTPError as exc:
+        stopped = clean_message(str(exc), s)
+        raise _fail(f"--census-sec-forms: the walk stopped: {stopped}", 1) from None
+    for line in _census_lines(
+        census,
+        rps=s.edgar.requests_per_second,
+        xml_bytes=xml_bytes,
+        header_bytes=s.edgar.header_bytes,
+    ):
+        typer.echo(line)
+    raise typer.Exit(1 if census.unparsed_rows else 0)
+
+
+def _census_lines(
+    census: FormsCensus, *, rps: float, xml_bytes: int, header_bytes: int
+) -> list[str]:
+    """The census table: forms per year, requests, and the totals at `rps`."""
+    forms = sorted({f for y in census.years for f in y.accessions})
+    head = ["year", *forms, "xml_req", "hdr_req", "ciks"]
+    rows = [
+        [
+            str(y.year),
+            *(str(y.accessions.get(f, 0)) for f in forms),
+            str(y.xml_requests),
+            str(y.header_requests),
+            str(y.ciks),
+        ]
+        for y in census.years
+    ]
+    lines = _grid(head, rows)
+    xml = sum(y.xml_requests for y in census.years)
+    hdr = sum(y.header_requests for y in census.years)
+    est = xml * xml_bytes + hdr * header_bytes
+    hours = (census.index_requests + xml + hdr) / rps / 3600
+    lines += [
+        "",
+        f"index: {census.index_requests} requests, {census.index_bytes} bytes (measured)",
+        f"xml requests {xml}, header requests {hdr}, one per accession; "
+        "submissions fetches are extra",
+        f"estimated fetch bytes {est} (assumed {xml_bytes} per XML, "
+        f"{header_bytes} per header; not measured)",
+        f"hours at {rps:g} requests/second, index plus fetches: {hours:.1f}",
+        f"unparsed rows: {census.unparsed_rows}",
+    ]
+    return lines
+
+
 def make_app(
     *,
     settings: Callable[[], Settings] = get_settings,
@@ -2190,6 +2273,23 @@ def make_app(
                 ),
             ),
         ] = None,
+        census_sec_forms: Annotated[
+            bool,
+            typer.Option(
+                "--census-sec-forms",
+                help=(
+                    "read-only census of the full filing index: ownership forms per year, "
+                    "requests, bytes and hours at the EDGAR rate limit; opens no store (#2435)"
+                ),
+            ),
+        ] = False,
+        census_xml_bytes: Annotated[
+            int,
+            typer.Option(
+                "--census-xml-bytes",
+                help="with --census-sec-forms: the assumed size of one filing XML, in bytes",
+            ),
+        ] = CENSUS_XML_BYTES_ASSUMED,
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
         if source not in ("all", *SOURCES, ASSETS_SOURCE, "openfigi"):
@@ -2198,6 +2298,20 @@ def make_app(
                 f"{' or '.join((*SOURCES, ASSETS_SOURCE, 'openfigi'))}; got {source!r}",
                 USAGE_ERROR,
             )
+        if census_sec_forms:
+            _census_sec_forms(
+                settings(),
+                source=source,
+                xml_bytes=census_xml_bytes,
+                clock=clock,
+                client=edgar_client,
+                others=(
+                    backfill_, since is not None, actions_backfill, through is not None, dry_run,
+                    fill_holes_, security is not None, bulk_from_cache, rebuild_statement_facts,
+                    rebuild_filing_events, rebuild_classifications, restamp_from is not None,
+                    restamp_window_earlier_ok is not None, import_dir is not None,
+                ),
+            )  # fmt: skip
         if import_dir is not None and source != ASSETS_SOURCE:
             raise _fail(f"--import-dir needs --source {ASSETS_SOURCE}", USAGE_ERROR)
         if source == ASSETS_SOURCE and backfill_:
@@ -4698,6 +4812,7 @@ def make_app(
                 for t in result.targets.rows
             ),
             *paper_slippage.slippage_report_lines(result.slippage, result.slippage_note),
+            *([f"paper report: {result.window_note}"] if result.window_note else []),
         ]
         for line in lines:
             _echo_scrubbed(line, s)

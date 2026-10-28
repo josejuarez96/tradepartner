@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, Mock
 import duckdb
 import pytest
 
-from tradepartner.backtest import sweep_report
+from tradepartner.backtest import holdout, sweep_report
 from tradepartner.backtest.results import NextTrialCost
 from tradepartner.config import Settings
 from tradepartner.dashboard import lab_page
@@ -155,6 +155,128 @@ def test_changed_cost_quote_refuses_before_slot_or_spawn(
     start.assert_not_called()
 
 
+def test_hypothesis_window_uses_frozen_cadence_and_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hypothesis = SimpleNamespace(
+        hypothesis_id=8,
+        family="momentum",
+        in_sample_start=date(2018, 1, 1),
+        holdout_start=date(2020, 1, 1),
+        holdout_end=date(2020, 12, 31),
+    )
+    monkeypatch.setattr(lab_page.registry, "get_hypothesis", Mock(return_value=hypothesis))
+    monkeypatch.setattr(lab_page.registry, "is_sweep_variant", Mock(return_value=False))
+    monkeypatch.setattr(lab_page.lab_registry, "promotion_for", Mock(return_value=object()))
+    monkeypatch.setattr(lab_page.registry, "boundary_date", Mock(return_value=date(2019, 6, 30)))
+    monkeypatch.setattr(
+        lab_page,
+        "frozen_values",
+        Mock(
+            return_value={
+                "gap.count_share_threshold": 0.1,
+                "schedule.rebalance_cadence": "month_end",
+            }
+        ),
+    )
+    window = lab_page._hypothesis_window(Mock(), "h")
+    assert window == holdout.Window(date(2018, 1, 1), date(2019, 6, 28))
+
+
+def test_hypothesis_window_refuses_without_promotion(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        lab_page.registry,
+        "get_hypothesis",
+        Mock(return_value=SimpleNamespace(hypothesis_id=8, family="momentum")),
+    )
+    monkeypatch.setattr(lab_page.registry, "is_sweep_variant", Mock(return_value=False))
+    monkeypatch.setattr(lab_page.lab_registry, "promotion_for", Mock(return_value=None))
+    with pytest.raises(ValueError, match="promoted"):
+        lab_page._hypothesis_window(Mock(), "h")
+
+
+def test_hypothesis_click_rechecks_quiet_and_refuses_without_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tradepartner.dashboard.app as app
+
+    @contextmanager
+    def store(_settings: Settings):
+        yield Mock()
+
+    state: dict[str, object] = {}
+    monkeypatch.setattr(lab_page, "st", Mock(session_state=state))
+    monkeypatch.setattr(app, "open_store_connection", store)
+    window = holdout.Window(date(2018, 1, 1), date(2019, 6, 28))
+    monkeypatch.setattr(lab_page, "_hypothesis_window", Mock(return_value=window))
+    monkeypatch.setattr(lab_page, "_hypothesis_start_decision", Mock(return_value="wait"))
+    monkeypatch.setattr(
+        lab_page.registry, "get_hypothesis", Mock(return_value=SimpleNamespace(hypothesis_id=8))
+    )
+    monkeypatch.setattr(
+        lab_page, "frozen_values", Mock(return_value={"schedule.rebalance_cadence": "month_end"})
+    )
+    spawn = Mock()
+    monkeypatch.setattr(lab_page.lab_child, "spawn", spawn)
+    lab_page._on_hypothesis_run(Settings(_env_file=None), "h", window, 8, Mock(), Mock())
+    spawn.assert_not_called()
+    assert "wait" in str(state[lab_page._OUTCOME]).lower()
+
+
+@pytest.mark.parametrize("changed", ["registration", "window", "cost"])
+def test_hypothesis_click_refuses_changed_quote_before_spawn(
+    monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    import tradepartner.dashboard.app as app
+
+    @contextmanager
+    def store(_settings: Settings):
+        yield Mock()
+
+    state: dict[str, object] = {}
+    monkeypatch.setattr(lab_page, "st", Mock(session_state=state))
+    monkeypatch.setattr(app, "open_store_connection", store)
+    window = holdout.Window(date(2018, 1, 1), date(2019, 6, 28))
+    allowed = holdout.Window(date(2018, 1, 1), date(2019, 5, 31)) if changed == "window" else window
+    hypothesis = SimpleNamespace(
+        hypothesis_id=9 if changed == "registration" else 8, family="momentum"
+    )
+    monkeypatch.setattr(lab_page.registry, "get_hypothesis", Mock(return_value=hypothesis))
+    monkeypatch.setattr(lab_page, "_hypothesis_window", Mock(return_value=allowed))
+    monkeypatch.setattr(
+        lab_page, "frozen_values", Mock(return_value={"schedule.rebalance_cadence": "month_end"})
+    )
+    monkeypatch.setattr(lab_page, "_hypothesis_start_decision", Mock(return_value="start"))
+    monkeypatch.setattr(lab_page.lab_registry, "family_rules", Mock(return_value=None))
+    cost = NextTrialCost(1, 2, 0.1, 0.2, "excess_spy", False, 0.1)
+    raw = NextTrialCost(1, 2, 0.1, 0.2, "raw", False, 0.1)
+    next_cost = Mock(side_effect=(cost, raw))
+    monkeypatch.setattr(lab_page.results, "next_trial_cost", next_cost)
+    spawn = Mock()
+    monkeypatch.setattr(lab_page.lab_child, "spawn", spawn)
+    expected = (
+        NextTrialCost(2, 3, 0.2, 0.3, "excess_spy", False, 0.1) if changed == "cost" else cost
+    )
+    lab_page._on_hypothesis_run(Settings(_env_file=None), "h", window, 8, expected, raw)
+    assert "nothing ran" in str(state[lab_page._OUTCOME])
+    spawn.assert_not_called()
+    if changed == "cost":
+        assert next_cost.call_count == 2
+    else:
+        next_cost.assert_not_called()
+
+
+def test_status_poll_reruns_once_after_child_ends(monkeypatch: pytest.MonkeyPatch) -> None:
+    ui = Mock(session_state={})
+    monkeypatch.setattr(lab_page, "st", ui)
+    monkeypatch.setattr(
+        lab_page.lab_run, "status", Mock(return_value=SlotStatus("ended", None, ""))
+    )
+    lab_page._poll_status(Settings(_env_file=None))
+    lab_page._poll_status(Settings(_env_file=None))
+    ui.rerun.assert_called_once_with()
+
+
 @pytest.mark.parametrize(
     ("file", "busy"),
     [
@@ -166,7 +288,7 @@ def test_changed_cost_quote_refuses_before_slot_or_spawn(
                 "h.md",
                 "h",
                 Path("/tmp/h.md"),
-                RegistryState.REGISTERED,
+                RegistryState.NOT_REGISTERED,
                 GitState.MERGED,
                 True,
             ),
