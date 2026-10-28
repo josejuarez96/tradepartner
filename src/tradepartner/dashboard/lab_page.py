@@ -194,6 +194,9 @@ def _start_run(
     if isinstance(taken, lab_run.Busy):
         st.session_state[_OUTCOME] = busy_sentence(taken)
         return
+    # A new child owns the slot: the next time one ends the page must refresh again,
+    # even if it ends before a poll sees it running.
+    st.session_state[_POLL_ENDED] = False
     if conn is None:
         lab_run.abandon(slot, taken)
         st.session_state[_OUTCOME] = "The registry read is unavailable; nothing ran."
@@ -585,7 +588,10 @@ def _result_reading(
             f"{_number(report.sr_star_annual)}."
         )
     if report.verdicts is None:
-        st.write(f"Sweep {report.state}; the rule has no decision until it is complete.")
+        if report.state == "complete":
+            st.write("Sweep complete; no variant completed successfully, so there is no winner.")
+        else:
+            st.write(f"Sweep {report.state}; the rule has no decision until it is complete.")
     else:
         verdict = report.verdicts
         st.write(
@@ -600,10 +606,10 @@ def _result_reading(
             f"{'met' if verdict.retire_below_met else 'not met'}."
         )
         next_step = (
-            "sweep promote"
-            if verdict.promote_at_least_met
-            else "sweep retire"
+            "sweep retire"
             if verdict.retire_below_met
+            else "sweep promote"
+            if verdict.promote_at_least_met
             else "review without promotion"
         )
         st.write(

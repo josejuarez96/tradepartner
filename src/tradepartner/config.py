@@ -2597,6 +2597,9 @@ class UiConfig(_ClosedConfig):
     `sweep_runs` row or an `unfinished` trial may stay open before the page lists it
     apart as an orphan (a run whose writer died) that no longer blocks a new run.
     `lab_poll_seconds` is the positive interval for the Lab status fragment.
+    `lab_slot_grace_seconds` is the grace period for a stale Lab run slot.
+    `lab_tail_bytes` is how many bytes of the child's log to show.
+    `lab_ps_timeout_seconds` bounds the `ps` call that checks the child's start time.
     """
 
     next_run_time_et: str = "08:05"
