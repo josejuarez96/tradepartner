@@ -73,3 +73,21 @@ def test_study_refusals(tmp_path: Path, old: str, new: str, match: str) -> None:
     assert old in source
     with pytest.raises(ExperimentFileError, match=match):
         _parse(tmp_path, source.replace(old, new, 1))
+
+
+@pytest.mark.parametrize(
+    ("key", "bad_value", "match"),
+    [
+        ("min_volume_bars", "21", r"study\.min_volume_bars must not exceed study\.volume_lookback"),
+        ("beta_min_bars", "121", r"study\.beta_min_bars must not exceed study\.beta_lookback"),
+    ],
+)
+def test_study_min_bars_exceeds_lookback_refused(
+    tmp_path: Path, key: str, bad_value: str, match: str
+) -> None:
+    source = FIXTURE.read_text()
+    old_line = f"{key} = 10" if key == "min_volume_bars" else f"{key} = 60"
+    new_line = f"{key} = {bad_value}"
+    assert old_line in source
+    with pytest.raises(ExperimentFileError, match=match):
+        _parse(tmp_path, source.replace(old_line, new_line, 1))
