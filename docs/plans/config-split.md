@@ -52,11 +52,10 @@
 - T310 has its own files. T309 has its own files.
 - T315 can run beside T312 to T314, since its only dependency is T311.
 
-**Plan shape numbers** (development-process, "Plan shape"; `uv run python scripts/team.py graph --ref docs/2512-config-split-plan` on 2026-10-28, this plan's tasks only): the numbers are in the PR body, which is refreshed after every amendment.
-- Longest open chain: T310 → T311 → T312 → T313 → T314, 5 PRs.
-- T313 also waits on T184h and T198, the post-span data sitting. T314 also waits on T171d and T305b.
-- Depth 1: T309, T310.
-- Files shared with open tasks of other plans: `src/tradepartner/config.py`, also named by T163b (alpaca, stays), T171d (borrow), T184h and T198 (edgar), T214 (a new `data` section) and T305b (events). The overlap is resolved by rule 6 and the `Depends on` lines.
+**Plan shape numbers** (development-process, "Plan shape"; `uv run python scripts/team.py graph --ref docs/2512-config-split-plan` on 2026-10-28, against `main` 3ee5d844):
+- Longest open chain: 5 PRs, T309 (or T310) → T311 → T312 → T313 → T314, the repo's longest after this plan.
+- Depth 1: T309, T310. Depth 2: T311. Depth 3: T312, T315. Depth 4: T313, which also waits on T198 at depth 2 (behind the owner's T197) and on T184h. Depth 5: T314, which also waits on T171d and T305b.
+- Files named by more than one open task: `src/tradepartner/config_data.py` (T312, T313, T314, the declared chain). `src/tradepartner/config.py` is named by T311 to T315 (disjoint parts, above) and by six tasks of other plans: T163b (alpaca, which stays), T171d (borrow), T184h and T198 (edgar), T214 (a new `data` section) and T305b (events). Move rule 6 and the `Depends on` lines handle that overlap. No other file here is named by another open task.
 
 **Owner items, ordered by what they unblock:** the open questions below. Question 1 gates T313 and T314. No owner task gates anything else.
 
