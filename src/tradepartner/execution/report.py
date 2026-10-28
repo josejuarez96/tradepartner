@@ -714,6 +714,14 @@ class Report:
     #: Why `slippage` is None when the computation raised (#1741): `paper report`
     #: prints `slippage n/a (<reason>)` and the `paper_reports` row is still written.
     slippage_note: str | None = None
+    #: Set when the window was capped short of the last completed rebalance session
+    #: because the book has no marks there (a halted session, #2448).
+    window_note: str | None = None
+
+
+class MarksMissing(ValueError):
+    """A rebalance session inside the report window has no `positions_daily` mark
+    (#2448). `report` raises it before any trial opens, so nothing is written."""
 
 
 class NothingToCompareYet(Exception):
@@ -916,11 +924,33 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
         stop_session = _stop_session_of(store_journal.window_stops_for(conn, window_id))
         while stop_session is not None and last_t >= stop_session:
             last_t = _before(last_t, cadence)
+        marked = {m.session for m in store_journal.positions_daily_for(conn, window_id)}
+
+    #: The window ends at the last rebalance session the book has marks for (#2448):
+    #: a session the kill switch halted has none, and asking the comparison for its
+    #: equity would raise after the trial opened. Reported, never silent.
+    completed_t = last_t
+    last_marked = max(marked) if marked else None
+    while last_t >= t0 and (last_marked is None or last_t > last_marked):
+        last_t = _before(last_t, cadence)
+    window_note: str | None = None
+    if last_t != completed_t:
+        window_note = (
+            f"report ends at {last_t}, not the last completed rebalance {completed_t}: "
+            f"the book has no marks after {last_marked} (halted or not yet marked)"
+        )
 
     if last_t < t0 or len(rebalance_sessions(t0, last_t, cadence)) < 2:
         raise NothingToCompareYet(
             f"paper report: nothing to compare yet for book {book!r}; a report needs at "
-            f"least two rebalances and the first is {t0} (last completed: {last_t})"
+            f"least two rebalances and the first is {t0} (last marked rebalance: {last_t})"
+        )
+
+    missing = [t for t in rebalance_sessions(t0, last_t, cadence) if t not in marked]
+    if missing:
+        raise MarksMissing(
+            f"paper report: no marks for rebalance session(s) {', '.join(map(str, missing))} "
+            f"of book {book!r}; nothing was written"
         )
 
     outcome = run_hypothesis(
@@ -968,4 +998,5 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
         paper_report=paper_report_row,
         slippage=fill_slippage,
         slippage_note=slippage_note,
+        window_note=window_note,
     )
