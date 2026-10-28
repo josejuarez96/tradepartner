@@ -3233,7 +3233,7 @@ statement = "Filing delay (C1) showed no edge against same-size peers: early fil
 kind = "empirical"
 grade = "NOT SUPPORTED"
 scope = "US 10-Q/10-K filers 2016-07 to 2023-09 with Alpaca bars (14,589 events in the primary read), 60-session hold, size-matched normal-lag peers; survivor data (delisted filers almost absent)"
-source = "docs/experiments/c1b-filing-delay-matched.md"
+source = "docs/research/2026-10-28-c1-filing-delay-results.md; docs/experiments/c1b-filing-delay-matched.md"
 bears_on = ["backlog:C1"]
 note = "Registry runs: C1 run 2 (vs SPY; superseded, size and beta not signal) and C1b run 3 (artifact data/research/c1b-filing-delay-matched/c1b-filing-delay-matched-run3.json, t_min long -1.46, short -2.78). Retired by the owner 2026-10-27, killed on survivor data (#2371, #2411)."
 
