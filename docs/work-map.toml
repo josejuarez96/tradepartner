@@ -571,7 +571,7 @@ what = "Slims the always-loaded STATUS to a board with the last 10 done lines, o
 why = "Every session re-read a 10k-token STATUS on every turn; a smaller, bounded board keeps each session's context for the work itself."
 
 [issue.460]
-what = "Spec and plan for a merge train: batch the ready PRs, build one combined branch, run CI once, bisect on red, squash-merge only trees that ran green, on the owner's word per batch."
+what = "Spec and plan for a merge train: batch the ready PRs, build one combined branch, run CI once, bisect on red, squash-merge only trees that ran green, on the owner's word per batch (2026-10-27: the orchestrator, unasked)."
 why = "Green PRs merged one after another broke main twice on 2026-10-01 (#430 after #387, #444 with #429); refreshing each PR costs a 30-minute run per merge, which serialises every window behind the owner."
 unblocks = ["spec:merge-train", "plan:merge-train"]
 
