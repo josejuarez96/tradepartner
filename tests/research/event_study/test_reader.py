@@ -44,6 +44,38 @@ def test_truncation_invariance_and_benchmark(tmp_path: Path) -> None:
     )
 
 
+def test_benchmark_resolves_snapshot_static_identity_stamped_after_the_window(
+    tmp_path: Path,
+) -> None:
+    """#2517: SPY's identity rows are stamped at the snapshot fetch (after any
+    historical window); #840 reads identity by symbol, bars stay point-in-time."""
+    settings = build_event_study_store(
+        tmp_path / "store.duckdb", identity_known_at=datetime(2026, 10, 3, 12, tzinfo=UTC)
+    )
+    reader = EventStudyReader(settings, END)
+    assert reader.benchmark("SPY", start=date(2018, 6, 1)) == "SPY_ID"
+    assert reader.max_read_t == datetime(2018, 6, 8, 20, tzinfo=UTC)
+    adjusted, _ = reader.bars(["SPY_ID"], sessions_from=date(2018, 6, 1))
+    assert adjusted["session"].max() <= END  # bars stay cut at the window end
+
+
+def test_benchmark_identity_by_symbol_ignores_data_after_cutoff(tmp_path: Path) -> None:
+    """No look-ahead: the resolved id and bars do not change with later bars."""
+    late = datetime(2026, 10, 3, 12, tzinfo=UTC)
+    full = EventStudyReader(
+        build_event_study_store(tmp_path / "f.duckdb", identity_known_at=late), END
+    )
+    cut = EventStudyReader(
+        build_event_study_store(tmp_path / "c.duckdb", truncate_at=END, identity_known_at=late), END
+    )
+    assert full.benchmark("SPY", start=date(2018, 6, 1)) == cut.benchmark(
+        "SPY", start=date(2018, 6, 1)
+    )
+    assert full.bars(["SPY_ID"], sessions_from=date(2018, 6, 1))[0].equals(
+        cut.bars(["SPY_ID"], sessions_from=date(2018, 6, 1))[0]
+    )
+
+
 def test_non_session_window_end_uses_prior_close(tmp_path: Path) -> None:
     reader = EventStudyReader(build_event_study_store(tmp_path / "store.duckdb"), date(2018, 6, 9))
     assert reader.cutoff == datetime(2018, 6, 8, 20, tzinfo=UTC)
