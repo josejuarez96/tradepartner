@@ -987,8 +987,8 @@ def parse_form4(xml_text: str) -> Form4Parse:
     rows are not read. A transaction lacking a code, date, acquired/disposed flag,
     share count or direct/indirect flag, or carrying a present-but-unparseable number
     or date, is skipped and counted, and the filing's other rows stand. Raises
-    `ValueError` for no `issuerCik` or no reporting owner with an `rptOwnerCik`
-    (identity missing)."""
+    `ValueError` for no `issuerCik` no reporting owner with an `rptOwnerCik`, or one
+    owner CIK listed twice (identity missing or ambiguous)."""
     root = _xml_root(xml_text)
     issuer = _child_text(root, "issuer/issuerCik")
     if not issuer:
@@ -1000,6 +1000,10 @@ def parse_form4(xml_text: str) -> Form4Parse:
         if not raw:
             raise ValueError("Form 4 reporting owner has no rptOwnerCik")
         owners.append((_cik(raw), owner))
+    if len({cik for cik, _ in owners}) != len(owners):
+        # Two blocks for one owner would repeat (filer_cik, line_no) with possibly
+        # different relationship flags: the identity is ambiguous, so none is guessed.
+        raise ValueError("Form 4 lists a reporting owner CIK more than once")
     if not owners:
         raise ValueError("Form 4 has no reportingOwner")
     original_text = _child_text(root, "dateOfOriginalSubmission")

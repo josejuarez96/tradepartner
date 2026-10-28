@@ -135,6 +135,12 @@ def test_joint_filing_keeps_a_row_per_owner_and_transaction_with_own_flags() -> 
     assert {t.transaction_code for t in parse.transactions} == {"S"}
 
 
+def test_duplicate_reporting_owner_cik_is_identity_ambiguous() -> None:
+    xml = _text("form4_joint_with_holding.xml").replace("0000999990", JANE)
+    with pytest.raises(ValueError, match="more than once"):
+        parse_form4(xml)
+
+
 def test_holding_row_does_not_shift_line_no() -> None:
     """The holding sits before the one transaction in the document: its line_no is 0."""
     parse = parse_form4(_text("form4_joint_with_holding.xml"))
