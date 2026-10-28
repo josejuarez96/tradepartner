@@ -502,7 +502,8 @@ def _ledger(
     ok = [
         r
         for r in store_journal.reconciliations_for(conn, window_id)
-        if r.status == _OK and r.at.astimezone(_NEW_YORK).date() <= session
+        if (r.status == _OK or (r.status == "breaks" and r.broker_cash is not None))
+        and r.at.astimezone(_NEW_YORK).date() <= session
     ]
     return from_journal(
         store_journal.fills_for(conn, window_id=window_id),

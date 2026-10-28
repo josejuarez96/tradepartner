@@ -431,7 +431,8 @@ def test_a_cancelled_draft_shard_is_superseded_by_the_labelled_full_run() -> Non
 
 def test_a_cancelled_check_with_a_different_name_is_superseded_by_a_later_success() -> None:
     """#1844: the draft run's cancelled `pytest-shard` and `claims-x` share no name with the
-    full run's checks; a later workflow run's SUCCESS (by run id, else start time) excuses them."""
+    full run's checks; a later workflow run's SUCCESS (by run_id only) excuses them.
+    Unknown run_ids (0) cannot establish ordering, so no excusal occurs."""
     hc = ready_pr.HeadChecks
     cr = ready_pr.CheckRun
     draft = (
@@ -443,11 +444,12 @@ def test_a_cancelled_check_with_a_different_name_is_superseded_by_a_later_succes
         cr("checks", "COMPLETED", "SUCCESS", 11, "2026-10-18T10:05:00Z"),
     )
     assert ready_pr.checks_state(hc("abc", (*draft, *full)), "abc") == "success"
+    # Unknown run_ids (0): cannot determine ordering, so cross-name excusal does not apply.
     by_time = (
         cr("odd-job", "COMPLETED", "CANCELLED", 0, "2026-10-18T10:00:00Z"),
         cr("checks", "COMPLETED", "SUCCESS", 0, "2026-10-18T10:05:00Z"),
     )
-    assert ready_pr.checks_state(hc("abc", by_time), "abc") == "success"
+    assert ready_pr.checks_state(hc("abc", by_time), "abc") == "failure"
 
 
 def test_failed_aggregator_from_cancelled_1856_run_waits_for_newer_full_run() -> None:
@@ -509,6 +511,34 @@ def test_a_cancelled_check_with_no_later_success_still_fails() -> None:
         cr("checks", "COMPLETED", "SUCCESS"),
     )
     assert ready_pr.checks_state(hc("abc", unordered), "abc") == "failure"
+
+
+def test_cross_name_excusal_requires_different_later_run_id() -> None:
+    """Cross-name rule (#1844): a cancelled check is excused only by a SUCCESS in a
+    *different, later* workflow run (by run_id). Same run_id with later start time
+    does NOT excuse it — the cancelled check never passed in that run."""
+    hc = ready_pr.HeadChecks
+    cr = ready_pr.CheckRun
+    # Same workflow run (run_id=10): cancelled `claims` at 10:00, successful `checks` at 10:05.
+    # The cross-name rule must NOT excuse `claims` because it's the same run.
+    same_run = (
+        cr("claims", "COMPLETED", "CANCELLED", 10, "2026-10-18T10:00:00Z"),
+        cr("checks", "COMPLETED", "SUCCESS", 10, "2026-10-18T10:05:00Z"),
+    )
+    assert ready_pr.checks_state(hc("abc", same_run), "abc") == "failure"
+    # Different run_id (11 > 10): cancelled `claims` in run 10, successful `checks` in run 11.
+    # This SHOULD be excused by the cross-name rule.
+    later_run = (
+        cr("claims", "COMPLETED", "CANCELLED", 10, "2026-10-18T10:00:00Z"),
+        cr("checks", "COMPLETED", "SUCCESS", 11, "2026-10-18T10:05:00Z"),
+    )
+    assert ready_pr.checks_state(hc("abc", later_run), "abc") == "success"
+    # Unknown run_id (0): cannot determine ordering, so no excusal.
+    unknown_run_id = (
+        cr("claims", "COMPLETED", "CANCELLED", 0, "2026-10-18T10:00:00Z"),
+        cr("checks", "COMPLETED", "SUCCESS", 0, "2026-10-18T10:05:00Z"),
+    )
+    assert ready_pr.checks_state(hc("abc", unknown_run_id), "abc") == "failure"
 
 
 # ── the flow, on a fake runner ──────────────────────────────────────────────────
