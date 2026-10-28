@@ -145,8 +145,8 @@ def _bulk_date(text: str) -> date:
 def _table(
     archive: zipfile.ZipFile, name: str, required: tuple[str, ...]
 ) -> Iterator[dict[str, str]]:
-    """The rows of one tab-separated member as dicts (a short row's missing cells are
-    blank). Raises `InsiderBulkUnreadableError` for a missing member or column or a
+    """The rows of one tab-separated member as dicts (a row of the wrong width is
+    unreadable). Raises `InsiderBulkUnreadableError` for a missing member or column or a
     malformed table."""
     try:
         member = archive.open(f"{name}.tsv")
