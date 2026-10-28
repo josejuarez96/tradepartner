@@ -35,7 +35,8 @@ and 5). Parity with the XML is therefore asserted at 2 decimals.
 
 **Fail closed.** A zip missing a table, a table missing a column named below (the
 readme's names, pinned against a recorded zip), a row whose cell count differs from the
-header (a stray tab shifts every later cell), or a table that does not parse, raises
+header (a stray tab shifts every later cell), a byte that is not UTF-8, a table member
+over the size cap (declared or actually read), or a table that does not parse, raises
 `InsiderBulkUnreadableError`: nothing is returned from that quarter.
 
 Forms 3, 5, 3/A and 5/A and the `DERIV_*` and `NONDERIV_HOLDING` tables are not read.
@@ -56,6 +57,10 @@ from typing import IO, Any
 from tradepartner.adapters.edgar import Form4Transaction, _BadField, _cik, _xml_decimal
 
 _FORMS = frozenset({"4", "4/A"})
+
+#: The cap on one table member's uncompressed size (`events.form4_bulk_max_member_bytes`
+#: is the config key; a test pins that the two defaults agree).
+DEFAULT_MAX_MEMBER_BYTES = 1024**3
 
 #: The columns each table must carry (the data set readme's names).
 _SUBMISSION_COLUMNS = (
@@ -143,18 +148,34 @@ def _bulk_date(text: str) -> date:
 
 
 def _table(
-    archive: zipfile.ZipFile, name: str, required: tuple[str, ...]
+    archive: zipfile.ZipFile, name: str, required: tuple[str, ...], max_bytes: int
 ) -> Iterator[dict[str, str]]:
     """The rows of one tab-separated member as dicts (a row of the wrong width is
     unreadable). Raises `InsiderBulkUnreadableError` for a missing member or column or a
     malformed table."""
     try:
-        member = archive.open(f"{name}.tsv")
+        info = archive.getinfo(f"{name}.tsv")
     except KeyError as error:
         raise InsiderBulkUnreadableError(f"{name}.tsv is not in the zip") from error
+    if info.file_size > max_bytes:
+        raise InsiderBulkUnreadableError(
+            f"{name}.tsv is {info.file_size} bytes, over the {max_bytes}-byte cap"
+        )
     try:
-        with member:
-            lines = (line.decode("utf-8-sig", errors="replace") for line in member)
+        with archive.open(info) as member:
+            read = 0
+
+            def decoded() -> Iterator[str]:
+                nonlocal read
+                for line in member:
+                    read += len(line)
+                    if read > max_bytes:  # a header can understate the size
+                        raise InsiderBulkUnreadableError(
+                            f"{name}.tsv is over the {max_bytes}-byte cap"
+                        )
+                    yield line.decode("utf-8-sig")
+
+            lines = decoded()
             reader = csv.reader(lines, delimiter="\t", quoting=csv.QUOTE_NONE)
             header = next(reader, None)
             if header is None:
@@ -174,7 +195,7 @@ def _table(
                         f"{name}.tsv row has {len(cells)} cells, the header {width}"
                     )
                 yield dict(zip(header, cells, strict=True))
-    except (csv.Error, zipfile.BadZipFile, OSError, EOFError) as error:
+    except (csv.Error, zipfile.BadZipFile, OSError, EOFError, UnicodeDecodeError) as error:
         raise InsiderBulkUnreadableError(f"{name}.tsv does not parse: {error!r}") from error
 
 
@@ -329,12 +350,15 @@ def _lenient_price(row: dict[str, str]) -> Decimal | None:
         return None
 
 
-def read_insider_bulk(source: Path | IO[bytes]) -> InsiderBulk:
+def read_insider_bulk(
+    source: Path | IO[bytes], *, max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES
+) -> InsiderBulk:
     """Read one quarter's insider data-set zip: every Form 4 and 4/A accession of its
     `SUBMISSION` table with its owners and non-derivative transactions. Pure over the
     zip; raises `InsiderBulkUnreadableError` (fail closed) for a missing table or
     column or an unparseable table. A `NONDERIV_TRANS` or `REPORTINGOWNER` row of an
-    accession that is not a Form 4 or 4/A of `SUBMISSION` (a Form 3 or 5) is not read."""
+    accession that is not a Form 4 or 4/A of `SUBMISSION` (a Form 3 or 5) is not read.
+    A table member over `max_member_bytes` uncompressed, or not strict UTF-8, is unreadable."""
     try:
         archive = zipfile.ZipFile(source)
     except (zipfile.BadZipFile, OSError) as error:
@@ -342,7 +366,7 @@ def read_insider_bulk(source: Path | IO[bytes]) -> InsiderBulk:
     with archive:
         headers: dict[str, dict[str, str]] = {}
         duplicated: set[str] = set()
-        for row in _table(archive, "SUBMISSION", _SUBMISSION_COLUMNS):
+        for row in _table(archive, "SUBMISSION", _SUBMISSION_COLUMNS, max_member_bytes):
             accession = row["ACCESSION_NUMBER"].strip()
             if row["DOCUMENT_TYPE"].strip() not in _FORMS or not accession:
                 continue
@@ -350,12 +374,12 @@ def read_insider_bulk(source: Path | IO[bytes]) -> InsiderBulk:
                 duplicated.add(accession)
             headers[accession] = row
         owners: dict[str, list[dict[str, str]]] = defaultdict(list)
-        for row in _table(archive, "REPORTINGOWNER", _OWNER_COLUMNS):
+        for row in _table(archive, "REPORTINGOWNER", _OWNER_COLUMNS, max_member_bytes):
             accession = row["ACCESSION_NUMBER"].strip()
             if accession in headers:
                 owners[accession].append(row)
         trans: dict[str, list[dict[str, str]]] = defaultdict(list)
-        for row in _table(archive, "NONDERIV_TRANS", _TRANS_COLUMNS):
+        for row in _table(archive, "NONDERIV_TRANS", _TRANS_COLUMNS, max_member_bytes):
             accession = row["ACCESSION_NUMBER"].strip()
             if accession in headers:
                 trans[accession].append(row)
