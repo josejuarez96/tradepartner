@@ -586,3 +586,45 @@ def test_the_limiter_spaces_back_to_back_zip_requests(tmp_path: Path) -> None:
     edgar_raw.insider_bulk_zip("2026q1", settings=settings, client=client)
     edgar_raw.insider_bulk_zip("2026q2", settings=settings, client=client)
     assert stamps[1] - stamps[0] >= 0.19
+
+
+# --- hardening (#2528) ------------------------------------------------------------
+
+
+def test_a_decode_error_fails_the_quarter_closed() -> None:
+    """A byte that is not UTF-8 is not silently replaced: the quarter is unreadable."""
+    bad_title = (
+        _tsv(TRANS, [_tr("1", SECURITY_TITLE="Common XX")]).encode().replace(b"XX", b"\xff\xfe")
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as z:
+        z.writestr("SUBMISSION.tsv", _tsv(SUBMISSION, [_sub()]))
+        z.writestr("REPORTINGOWNER.tsv", _tsv(OWNER, [_own()]))
+        z.writestr("NONDERIV_TRANS.tsv", bad_title)
+    buffer.seek(0)
+    with pytest.raises(bulk.InsiderBulkUnreadableError):
+        bulk.read_insider_bulk(buffer)
+
+
+def test_a_utf8_bom_and_non_ascii_still_read() -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as z:
+        z.writestr("SUBMISSION.tsv", b"\xef\xbb\xbf" + _tsv(SUBMISSION, [_sub()]).encode())
+        z.writestr("REPORTINGOWNER.tsv", _tsv(OWNER, [_own()]))
+        z.writestr("NONDERIV_TRANS.tsv", _tsv(TRANS, [_tr("1", SECURITY_TITLE="Café Stock")]))
+    buffer.seek(0)
+    assert bulk.read_insider_bulk(buffer).accessions
+
+
+def test_a_member_over_the_size_cap_is_refused() -> None:
+    zipped = _zip()
+    with pytest.raises(bulk.InsiderBulkUnreadableError, match="cap"):
+        bulk.read_insider_bulk(zipped, max_member_bytes=50)
+    zipped.seek(0)
+    assert bulk.read_insider_bulk(zipped, max_member_bytes=1_000_000).accessions
+
+
+def test_the_default_cap_matches_the_config_default() -> None:
+    assert (
+        Settings(_env_file=None).events.form4_bulk_max_member_bytes == bulk.DEFAULT_MAX_MEMBER_BYTES
+    )
