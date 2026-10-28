@@ -290,6 +290,79 @@ def test_openfigi_selection_leaves_out_delisted_and_barless_names(settings: Sett
         ).fetchall() == [("S_LIVE",)]
 
 
+def test_openfigi_history_window_anchors_to_last_completed_session(settings: Settings) -> None:
+    """The history window's first_bar uses the last completed NY session, not UTC date.
+
+    At 2026-10-28 00:30 UTC (2026-10-27 20:30 ET), UTC date is 2026-10-28 but the
+    last completed NY session is 2026-10-27. With min_history_months=12, the window
+    should start at 2025-10-27 (session - 12 months), not 2025-10-28 (UTC date - 12
+    months). A security with a bar on 2025-10-27 must be included.
+    """
+    enabled = settings.model_copy(
+        update={"openfigi": settings.openfigi.model_copy(update={"enabled": True})}
+    )
+    # 2026-10-28 00:30 UTC = 2026-10-27 20:30 ET (after 20:00 ET close + settle)
+    now = datetime(2026, 10, 28, 0, 30, tzinfo=UTC)
+    # Last completed NY session at this time is 2026-10-27 (Tuesday)
+    # min_history_months=12 -> window starts at 2025-10-27 (session - 12 months)
+    # NOT 2025-10-28 (UTC date - 12 months)
+    t0 = datetime(2025, 10, 27, 20, tzinfo=UTC)
+    with open_for_write(enabled) as conn:
+        init_schema(conn)
+        conn.execute(
+            "CREATE TEMP TABLE figi_jobs AS SELECT * FROM (VALUES "
+            "('S_BOUNDARY', 'BOUND'), ('S_LATER', 'LATER')) AS v(sid, ticker)"
+        )
+        conn.execute(
+            "INSERT INTO securities (security_id, cik, name, benchmark, known_at, "
+            "ingested_at, source, provenance) "
+            "SELECT sid, sid, sid, FALSE, ?, ?, 'test', 'filing' FROM figi_jobs",
+            [t0, t0],
+        )
+        conn.execute(
+            "INSERT INTO listings (security_id, ticker, exchange, valid_from, known_at, "
+            "ingested_at, source, provenance) "
+            "SELECT sid, ticker, 'NYSE', DATE '2025-01-01', ?, ?, 'test', 'filing' FROM figi_jobs",
+            [t0, t0],
+        )
+        # S_BOUNDARY has a bar on 2025-10-27 (the boundary session that should be included
+        # with the fix but excluded with the bug using UTC date)
+        # S_LATER has a bar on 2025-10-28 (included by both calculations)
+        conn.execute(
+            "INSERT INTO prices_daily (security_id, session, open, high, low, close, "
+            "volume, known_at, ingested_at, source, provenance) VALUES "
+            "('S_BOUNDARY', DATE '2025-10-27', 10, 11, 9, 10, 1000, ?, ?, 'test', 'bar'), "
+            "('S_LATER', DATE '2025-10-28', 10, 11, 9, 10, 1000, ?, ?, 'test', 'bar')",
+            [t0, t0, t0, t0],
+        )
+
+    seen: list[list[str]] = []
+
+    def fake_mapping(
+        tickers: list[str], _config: object, **_kwargs: object
+    ) -> list[tuple[list[object], datetime, datetime]]:
+        seen.append(tickers)
+        sent = datetime(2026, 10, 28, 1, tzinfo=UTC)
+        return [
+            (
+                [{"figi": f"BBG{i}", "exchCode": "US", "securityType": "Common Stock"}],
+                sent,
+                sent + timedelta(seconds=1),
+            )
+            for i in range(len(tickers))
+        ]
+
+    result = ingest_module.ingest_openfigi(enabled, clock=lambda: now, mapping=fake_mapping)
+    # Both securities should be mapped because the history window correctly starts
+    # at 2025-10-27 (last completed session - 12 months), which includes S_BOUNDARY's bar.
+    assert seen == [["BOUND", "LATER"]]
+    assert result.runs[0].rows_added == 2
+    with open_for_write(enabled) as conn:
+        assert conn.execute(
+            "SELECT security_id FROM openfigi_types ORDER BY security_id"
+        ).fetchall() == [("S_BOUNDARY",), ("S_LATER",)]
+
+
 def test_rates_backfill_is_point_in_time_and_idempotent(
     settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:

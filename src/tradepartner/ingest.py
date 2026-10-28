@@ -363,7 +363,7 @@ def ingest_openfigi(
         raise ValueError("OpenFIGI ingest is disabled")
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     session = last_completed_session(now)
-    first_bar = now.date() - relativedelta(months=settings.universe.min_history_months)
+    first_bar = session - relativedelta(months=settings.universe.min_history_months)
     prepared: list[tuple[str, str, str]] = []
     responses: list[tuple[list[Any], datetime, datetime]] = []
     class_symbols = settings.alpaca.class_symbols
