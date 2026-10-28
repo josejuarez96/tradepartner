@@ -42,7 +42,7 @@ from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from tradepartner.config import MAIN_BOOK_ID, Settings
+from tradepartner.config import MAIN_BOOK_ID, SANDBOX_BOOK_ID, Settings
 from tradepartner.store.journal import check_book_id
 
 #: Owner read and write only: the file names a pid, nothing else.
@@ -53,11 +53,52 @@ class LockHeld(RuntimeError):
     """Another process holds the paper run lock."""
 
 
+def _temp_roots() -> set[Path]:
+    """The fixed directories a throwaway store copy may live under: `/tmp`, resolved
+    (`/private/tmp` on macOS). Not `tempfile.gettempdir()`: `TMPDIR` must not widen it."""
+    return {Path("/tmp").resolve()}
+
+
+def sandbox_marker(settings: Settings) -> Path:
+    """`<store.path>.sandbox`: the file that marks a store as a sandbox COPY. The runbook
+    creates it beside the copy; the live store never has one."""
+    return Path(f"{settings.store.path}.sandbox")
+
+
+def sandbox_store_refusal(settings: Settings, book_id: str) -> str | None:
+    """Why `book_id` may not run on `settings.store.path`, or `None` (owner decision
+    2026-10-28, docs/runbooks/sandbox.md). Both directions, so the copy (which holds the
+    owner's real books and, with the real keys in `.env`, could trade them) and the live
+    store never mix: book `sandbox` needs a store that resolves under a fixed temp root
+    AND carries the marker; every other book is refused on a marked store. Pure reads."""
+    store = Path(settings.store.path).resolve()
+    marked = sandbox_marker(settings).is_file()
+    if book_id != SANDBOX_BOOK_ID:
+        if marked:
+            return (
+                f"book {book_id!r} is refused on a sandbox copy of the store (marker "
+                f"{sandbox_marker(settings).name} present): only book {SANDBOX_BOOK_ID!r} "
+                "runs there (docs/runbooks/sandbox.md)"
+            )
+        return None
+    if marked and any(root in store.parents for root in _temp_roots()):
+        return None
+    return (
+        f"book {SANDBOX_BOOK_ID!r} runs only on a temp copy of the store, never the live "
+        f"one: store.path {settings.store.path!r} must be under /tmp and have the marker "
+        "file <store.path>.sandbox (docs/runbooks/sandbox.md)"
+    )
+
+
 def resolve_book(settings: Settings, book_id: str | None) -> str:
     """The command's book: `book_id`, or `paper.book_id` when none is given (the
-    spec's `--book` default); `ValueError` outside the book token grammar."""
+    spec's `--book` default); `ValueError` outside the book token grammar, or for book
+    `sandbox` on a store that is not a temp copy (`sandbox_store_refusal`)."""
     book = settings.paper.book_id if book_id is None else book_id
     check_book_id(book)
+    refusal = sandbox_store_refusal(settings, book)
+    if refusal is not None:
+        raise ValueError(refusal)
     return book
 
 

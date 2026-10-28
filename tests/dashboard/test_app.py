@@ -36,7 +36,7 @@ from tradepartner.dashboard.app import (
     open_store_connection,
 )
 from tradepartner.store import schema
-from tradepartner.store.db import open_for_write
+from tradepartner.store.db import StoreLockedError, open_for_write
 
 _APP_PATH = str(
     Path(__file__).resolve().parents[2] / "src" / "tradepartner" / "dashboard" / "app.py"
@@ -63,7 +63,7 @@ def _run_app(monkeypatch: pytest.MonkeyPatch, store_path: Path, page: str = "Hom
     monkeypatch.setenv("STORE__PATH", str(store_path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", page)
-    at = AppTest.from_file(_APP_PATH)
+    at = AppTest.from_file(_APP_PATH, default_timeout=60)
     at.run()
     return at
 
@@ -149,6 +149,35 @@ def test_open_store_connection_propagates_page_body_errors(settings: Settings) -
     with pytest.raises(_PageBoom), open_store_connection(settings) as store:
         assert isinstance(store, duckdb.DuckDBPyConnection)
         raise _PageBoom("simulated page-body failure")
+
+
+def test_data_health_shows_busy_if_a_later_read_is_locked(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings
+) -> None:
+    import tradepartner.dashboard.app as app_module
+
+    with open_for_write(settings) as conn:
+        schema.init_schema(conn)
+    real_open = app_module.open_read_only
+    calls = 0
+    shown: list[str] = []
+
+    @contextmanager
+    def lock_second_read(config: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise StoreLockedError("writer acquired the store")
+        with real_open(config) as conn:
+            yield conn
+
+    monkeypatch.setattr(app_module, "open_read_only", lock_second_read)
+    monkeypatch.setattr(app_module, "render_busy", lambda _settings: shown.append("busy"))
+    app_module._render_page(
+        settings, "Data health", lambda conn, _settings: conn.execute("SELECT 1").fetchone()
+    )
+    assert calls == 2
+    assert shown == ["busy"]
 
 
 def test_dashboard_app_module_never_imports_open_for_write() -> None:

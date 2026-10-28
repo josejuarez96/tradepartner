@@ -13,7 +13,8 @@ All in `.env` (names in `.env.example`):
 | `main` | `ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET` |
 | any other book, for example `daily` | `ALPACA_PAPER_BOOKS__DAILY__API_KEY`, `ALPACA_PAPER_BOOKS__DAILY__API_SECRET` (the token upper-cased) |
 | market data (ingest, not orders) | `ALPACA_API_KEY`, `ALPACA_API_SECRET` |
-| sandbox probes (never a book) | `ALPACA_SANDBOX_API_KEY`, `ALPACA_SANDBOX_API_SECRET` |
+| sandbox probes | `ALPACA_SANDBOX_API_KEY`, `ALPACA_SANDBOX_API_SECRET` |
+| book `sandbox` (same account; regression runs, [sandbox.md](sandbox.md)) | `ALPACA_PAPER_BOOKS__SANDBOX__API_KEY`, `ALPACA_PAPER_BOOKS__SANDBOX__API_SECRET` |
 
 Rules the code enforces: each book has its own pair, from its own Alpaca paper account. A pair that repeats the data keys, `main`'s pair or another book's is refused, and a book with no pair cannot start (`no_credentials`). A book never falls back to `main`'s pair. `ALPACA_PAPER_BOOKS__MAIN__*` is never read. The jobs read `.env` on every run, so no job needs reloading after an edit.
 

@@ -3446,3 +3446,57 @@ def test_ui_lab_ps_timeout_seconds_default_and_bounds() -> None:
     for bad in (0, -1, -0.5):
         with pytest.raises(ValidationError):
             Settings(_env_file=None, ui={"lab_ps_timeout_seconds": bad})
+
+
+def test_events_sec_forms_defaults() -> None:
+    """T305 (#2435): the six event forms, collection and reads both off."""
+    s = Settings(_env_file=None)
+    assert s.events.sec_forms == [
+        "SC 13D",
+        "SC 13D/A",
+        "SCHEDULE 13D",
+        "SCHEDULE 13D/A",
+        "4",
+        "4/A",
+    ]
+    assert s.events.sec_forms_enabled is False
+    assert s.events.sec_forms_read_enabled is False
+
+
+def test_events_sec_forms_refuses_empty_or_blank_and_unknown_keys() -> None:
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, events={"sec_forms": []})
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, events={"sec_forms": [" "]})
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, events={"nope": 1})
+
+
+def test_events_sec_forms_keys_sit_outside_every_frozen_canonical_set() -> None:
+    """T305 (#2435): none of the three keys is a frozen key of any family, so changing
+    one never changes a registered backtest input, its canonical set or its fingerprint;
+    and `master.issuer_forms` is untouched."""
+    from datetime import date
+
+    from tradepartner.backtest import frozen, hypothesis
+
+    keys = {"events.sec_forms", "events.sec_forms_enabled", "events.sec_forms_read_enabled"}
+    assert keys.isdisjoint(hypothesis.frozen_keys())
+    assert keys.isdisjoint(frozen.CANONICAL_EXCLUDED_KEYS)
+    assert keys.isdisjoint({key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS})
+    assert "events" not in {k.partition(".")[0] for k in hypothesis.frozen_keys()}
+    fixture = Path(__file__).parent / "fixtures" / "hypotheses" / "fixture-momentum.md"
+    parsed = hypothesis.parse_file(fixture)
+    base = Settings(_env_file=None)
+    flipped = Settings(
+        _env_file=None,
+        events={"sec_forms": ["4"], "sec_forms_enabled": True, "sec_forms_read_enabled": True},
+    )
+    # What a registration stores (and so its params hash and fingerprint) ignores them.
+    stored = hypothesis.frozen_params(parsed, base)
+    assert hypothesis.frozen_params(parsed, flipped) == stored
+    assert not any(k.startswith("events.") for k in stored)
+    assert frozen.fingerprint("momentum", stored, date(2019, 11, 29)) == frozen.fingerprint(
+        "momentum", hypothesis.frozen_params(parsed, flipped), date(2019, 11, 29)
+    )
+    assert Settings(_env_file=None).master.issuer_forms[-2:] == ["25", "25-NSE"]

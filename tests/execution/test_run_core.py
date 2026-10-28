@@ -259,6 +259,7 @@ class Env:
         *,
         quantity: float = 1.0,
         submit: bool = True,
+        book_id: str = "main",
     ) -> OrderRow:
         """A forced-exit buy's decision, `orders` row and `pending` event, and,
         unless `submit=False` (the broker never got it), the fake's submit and
@@ -290,6 +291,7 @@ class Env:
             side="buy",
             quantity=quantity,
             sells_in_flight_at_submit=False,
+            book_id=book_id,
             known_at=at,
             ingested_at=at,
         )
@@ -855,7 +857,7 @@ def test_the_lag_bound_mismatch_row_carries_a_non_default_book(env: Env) -> None
     env.ingest(_at(MON, 21))
     earlier = env.past_run(window, _at(MON))
     env.fake.lag_fills(None)
-    env.order(earlier, "tp-lag", _at(MON), quantity=2.0)
+    env.order(earlier, "tp-lag", _at(MON), quantity=2.0, book_id="fx")
     env.fake.apply("tp-lag", PartialFill(1.0, PRICE))
     seen = _at(MON, 14)
     env.append(
