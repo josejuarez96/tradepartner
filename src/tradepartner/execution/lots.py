@@ -910,7 +910,7 @@ def _events(
         and r.quantity is not None
         and (through is None or r.session <= through)
     ]
-    for trade in _trades(fills, orders):
+    for trade in _trades(fills, orders, true_ups):
         day = trade.trade_at.astimezone(_EXCHANGE_TZ).date()
         after_true_up = trade.known_at is not None and any(
             r.security_id == trade.security_id and r.session == day and r.known_at < trade.known_at
@@ -922,6 +922,9 @@ def _events(
                     day,
                     _RANK_TRUE_UP if after_true_up else _RANK_FILL,
                     trade.known_at if after_true_up else trade.trade_at,
+                    # A fill stamped at a true-up's own instant is inside its
+                    # figure: it replays first, whatever the ids (#2479).
+                    0,
                     trade.order_key,
                 ),
                 partial(_Ledger.trade, trade=trade),
@@ -977,6 +980,7 @@ def _events(
                     row.session,
                     _RANK_TRUE_UP,
                     row.known_at,
+                    1,
                     row.adjustment_id or 0,
                 )
             else:
@@ -1092,9 +1096,16 @@ def _adjustment_event(
     return None
 
 
-def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_Trade]:
+def _trades(
+    fills: Sequence[OrderedFill],
+    orders: Sequence[OrderRow],
+    true_ups: Sequence[AdjustmentRow] = (),
+) -> list[_Trade]:
     """One `_Trade` per fill, or per order when any of its fills is implied,
-    in trade order."""
+    in trade order. An implied order's fills merge only within the span between
+    two true-ups of its name and session: a true-up holds the fills stamped
+    before it, so a fill caught up by it and a residual added after it are
+    separate trades, each replayed on its own side of the true-up (#2479)."""
     known = {order.client_order_id: order for order in orders}
     by_order: dict[str, list[OrderedFill]] = {}
     for item in fills:
@@ -1116,7 +1127,28 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
             raise LotLedgerError(f"fill {row.fill_id} has a naive filled_at")
         by_order.setdefault(row.client_order_id, []).append(item)
     trades: list[_Trade] = []
-    for group in by_order.values():
+
+    def _span(item: OrderedFill) -> tuple[date, int]:
+        day = item.fill.filled_at.astimezone(_EXCHANGE_TZ).date()
+        earlier = sum(
+            1
+            for r in true_ups
+            if r.security_id == item.security_id
+            and r.session == day
+            and r.known_at < item.fill.known_at
+        )
+        return day, earlier
+
+    spans: list[list[OrderedFill]] = []
+    for whole in by_order.values():
+        if any(item.fill.price_implied for item in whole):
+            split: dict[tuple[date, int], list[OrderedFill]] = {}
+            for item in whole:
+                split.setdefault(_span(item), []).append(item)
+            spans.extend(split.values())
+        else:
+            spans.append(whole)
+    for group in spans:
         parts = [(item, _dec(item.fill.quantity), _dec(item.fill.price)) for item in group]
         if any(item.fill.price_implied for item in group):
             first = min(group, key=lambda item: (item.fill.filled_at, _fill_key(item)))

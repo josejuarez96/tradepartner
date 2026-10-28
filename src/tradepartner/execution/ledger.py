@@ -382,7 +382,9 @@ def from_journal(
 
     # A true-up, and any fill journaled after one on its session, replay
     # together in the order they were stamped: a true-up's absolute quantity
-    # holds every fill stamped before it and none stamped after.
+    # holds every fill stamped at or before it and none stamped after. A tie
+    # therefore replays the fill first (rank 0), then the true-up (rank 1), so
+    # a fill the figure already holds is never counted twice (#2479).
     ordered: list[tuple[datetime, int, int, date, str, str, Fraction]] = []
     seen_fills: set[int] = set()
     fills_since_base = 0
@@ -407,7 +409,7 @@ def from_journal(
             ordered.append(
                 (
                     row.known_at,
-                    1,
+                    0,
                     row.fill_id or 0,
                     stated_on,
                     kind,
@@ -449,7 +451,7 @@ def from_journal(
                 ordered.append(
                     (
                         adjustment.known_at,
-                        0,
+                        1,
                         adjustment.adjustment_id or 0,
                         adjustment.session,
                         _TRUE_UP,
