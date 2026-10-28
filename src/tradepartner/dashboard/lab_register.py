@@ -67,7 +67,7 @@ def register(settings: Settings, docs_root: Path, kind: FileKind, name: str) -> 
     argv = lab_child.register_argv(path)
     if not lab_child._entry_point().is_file():
         raise RegisterRefused("The tradepartner command is not installed beside this interpreter.")
-    wait_seconds = settings.store.lock_retry_seconds + settings.ui.kill_wait_margin_seconds
+    wait_seconds = live.store.lock_retry_seconds + live.ui.kill_wait_margin_seconds
     child = subprocess.Popen(
         argv,
         env=lab_child._child_env(settings),
