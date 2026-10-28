@@ -397,8 +397,15 @@ def collect(
             raise ClockError(f"clock went back from {now.isoformat()} to {stamp.isoformat()}")
         journaled, superseded, foreign = _journal_fills(conn, seen, stamp)
         collected = _journal_terminals(conn, to_read, readings, frozen, stamp)
-        all_orders = orders_for(conn, window_id=None)
-        all_events = order_events_for(conn, window_id=None)
+        # The same book(s) as the cursors above: `last_run` is this book's, so
+        # judging another book's rejections against it would re-judge them (#2475).
+        all_orders = [
+            o for o in orders_for(conn, window_id=None) if books is None or o.book_id in books
+        ]
+        in_books = {o.client_order_id for o in all_orders}
+        all_events = [
+            e for e in order_events_for(conn, window_id=None) if e.client_order_id in in_books
+        ]
         rejections = rejection_breaches(
             _runs_to_judge(collected, all_orders, all_events, last_run),
             all_orders,
@@ -549,7 +556,7 @@ def _writer_books(
 def _book_cursors(conn: duckdb.DuckDBPyConnection, books: set[str] | None) -> list[FillCursorRow]:
     """Every cursor except another book's run cursor (#2475). A run cursor is
     the book of its run's window; a resume cursor names no book and stays. Only
-    ever drops cursors, so `since` can only move earlier (reads more, never hides
+    ever drops cursors, so `since` and `last_run` only move earlier (reads more, never hides
     a fill)."""
     cursors = fill_cursors(conn)
     if books is None:
