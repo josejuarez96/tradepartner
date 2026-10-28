@@ -2608,6 +2608,9 @@ class UiConfig(_ClosedConfig):
     lab_git_timeout_seconds: int = Field(default=10, gt=0)
     lab_orphan_after_hours: int = Field(default=24, gt=0)
     lab_poll_seconds: int = Field(default=5, gt=0)
+    lab_slot_grace_seconds: float = Field(default=30.0, gt=0)
+    lab_tail_bytes: int = Field(default=4000, gt=0)
+    lab_ps_timeout_seconds: float = Field(default=10.0, gt=0)
 
     @field_validator("next_run_time_et")
     @classmethod

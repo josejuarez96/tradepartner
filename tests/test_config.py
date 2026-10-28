@@ -3415,6 +3415,39 @@ def test_ui_lab_poll_seconds_is_positive() -> None:
         Settings(_env_file=None, ui={"lab_poll_seconds": 0})
 
 
+def test_ui_lab_slot_grace_seconds_default_and_bounds() -> None:
+    """#2357: the grace window while a slot file with no PID yet is protected."""
+    assert _settings().ui.lab_slot_grace_seconds == 30.0
+    assert (
+        Settings(_env_file=None, ui={"lab_slot_grace_seconds": 15.0}).ui.lab_slot_grace_seconds
+        == 15.0
+    )
+    for bad in (0, -1, -0.5):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"lab_slot_grace_seconds": bad})
+
+
+def test_ui_lab_tail_bytes_default_and_bounds() -> None:
+    """#2357: the log tail size the Lab page shows."""
+    assert _settings().ui.lab_tail_bytes == 4000
+    assert Settings(_env_file=None, ui={"lab_tail_bytes": 2000}).ui.lab_tail_bytes == 2000
+    for bad in (0, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"lab_tail_bytes": bad})
+
+
+def test_ui_lab_ps_timeout_seconds_default_and_bounds() -> None:
+    """#2357: the `ps` timeout when checking a child's start time."""
+    assert _settings().ui.lab_ps_timeout_seconds == 10.0
+    assert (
+        Settings(_env_file=None, ui={"lab_ps_timeout_seconds": 5.0}).ui.lab_ps_timeout_seconds
+        == 5.0
+    )
+    for bad in (0, -1, -0.5):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"lab_ps_timeout_seconds": bad})
+
+
 def test_events_sec_forms_defaults() -> None:
     """T305 (#2435): the six event forms, collection and reads both off."""
     s = Settings(_env_file=None)

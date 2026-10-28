@@ -7,6 +7,7 @@ to recheck the registry before taking the slot and spawning the desk command.
 
 from __future__ import annotations
 
+import functools
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import cast
@@ -33,7 +34,6 @@ from tradepartner.store import lab_queries, lab_registry, lab_schema, registry
 
 DOCS_ROOT = Path(__file__).resolve().parents[3] / "docs"
 _ET = ZoneInfo("America/New_York")
-_GRACE_SECONDS = 30.0
 _OUTCOME = "lab_action_outcome"
 _NOTE = "lab_run_note"
 _BUDGET = "lab_sweep_time_budget"
@@ -181,7 +181,16 @@ def _start_run(
 ) -> None:
     """Take the slot and spawn; abandon the reservation on any pre-spawn refusal."""
     slot = _slot_path(settings)
-    taken = lab_run.take(slot, in_flight=in_flight, now=now, grace_seconds=_GRACE_SECONDS)
+    start_time_of = functools.partial(
+        lab_run.process_start_time, timeout_seconds=settings.ui.lab_ps_timeout_seconds
+    )
+    taken = lab_run.take(
+        slot,
+        in_flight=in_flight,
+        now=now,
+        grace_seconds=settings.ui.lab_slot_grace_seconds,
+        start_time_of=start_time_of,
+    )
     if isinstance(taken, lab_run.Busy):
         st.session_state[_OUTCOME] = busy_sentence(taken)
         return
@@ -210,6 +219,7 @@ def _start_run(
             started_at=now,
             log_path=spawned.log_path,
             taken=taken,
+            start_time_of=start_time_of,
         )
         lab_run.watch(slot, spawned.child)
     except (lab_run.SlotLost, OSError, ValueError) as exc:
@@ -432,12 +442,16 @@ def _hypothesis_dialog(
 def _poll_status(settings: Settings) -> None:
     """Fragment-only slot poll; no store connection or registry read."""
     now = datetime.now(UTC)
+    start_time_of = functools.partial(
+        lab_run.process_start_time, timeout_seconds=settings.ui.lab_ps_timeout_seconds
+    )
     state = lab_run.status(
         _slot_path(settings),
         scrub=lambda value: _safe_scrub(value, settings),
         now=now,
-        grace_seconds=_GRACE_SECONDS,
-        tail_bytes=lab_child.TAIL_BYTES,
+        grace_seconds=settings.ui.lab_slot_grace_seconds,
+        start_time_of=start_time_of,
+        tail_bytes=settings.ui.lab_tail_bytes,
     )
     st.subheader("Run status")
     st.write(status_sentence(state))
@@ -468,15 +482,19 @@ def _poll_status(settings: Settings) -> None:
 
 def _status(conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime) -> bool:
     slot = _slot_path(settings)
+    start_time_of = functools.partial(
+        lab_run.process_start_time, timeout_seconds=settings.ui.lab_ps_timeout_seconds
+    )
     state = lab_run.status(
         slot,
         scrub=lambda text: _safe_scrub(text, settings),
         now=now,
-        grace_seconds=_GRACE_SECONDS,
-        tail_bytes=lab_child.TAIL_BYTES,
+        grace_seconds=settings.ui.lab_slot_grace_seconds,
+        start_time_of=start_time_of,
+        tail_bytes=settings.ui.lab_tail_bytes,
     )
     if state.state == "ended":
-        lab_run.release(slot)
+        lab_run.release(slot, start_time_of=start_time_of)
     last = state.record if state.state == "ended" else lab_run.read_last(slot)
     if last is not None and last.baseline is not None:
         verdict = lab_verdict.verdict(
