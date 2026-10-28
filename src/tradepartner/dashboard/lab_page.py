@@ -15,9 +15,10 @@ import duckdb
 import streamlit as st
 
 from tradepartner import calendar
-from tradepartner.backtest import quiet, results
+from tradepartner.backtest import quiet, results, sweep_report
 from tradepartner.config import Settings
 from tradepartner.dashboard import (
+    backtest_page,
     book_actions,
     lab_child,
     lab_files,
@@ -26,7 +27,7 @@ from tradepartner.dashboard import (
     lab_verdict,
 )
 from tradepartner.dashboard.lab_files import FileKind, GitState, LabFile, RegistryState
-from tradepartner.store import lab_queries, lab_registry, lab_schema
+from tradepartner.store import lab_queries, lab_registry, lab_schema, registry
 
 DOCS_ROOT = Path(__file__).resolve().parents[3] / "docs"
 _ET = ZoneInfo("America/New_York")
@@ -354,6 +355,110 @@ def _status(conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime) 
     return state.state in {"starting", "running"} or flying.busy
 
 
+def _number(value: float | None) -> str:
+    return "unavailable" if value is None else f"{value:.3f}"
+
+
+def _result_reading(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, sweep: lab_registry.SweepRecord
+) -> None:
+    """Read a registered sweep in the owner's threshold, result, rule order."""
+    report = sweep_report.sweep_report(conn, sweep.slug)
+    spends = registry.family_holdout_spends(conn, sweep.family)
+    boundary = registry.development_boundary(conn)
+    st.subheader(f"Result: {sweep.slug}")
+    st.write(
+        "Pre-registration ⓘ fixes the test and thresholds before its trials run. "
+        f"selection_statistic {sweep.selection_statistic}; promote_at_least "
+        f"{sweep.promote_at_least}; retire_below {sweep.retire_below}."
+    )
+    st.write(
+        f"Holdout ⓘ is reserved data for the final check: {sweep.holdout_start} to "
+        f"{sweep.holdout_end}; {'spent' if spends else 'unspent'} "
+        f"({len(spends)} family spends). registered_at {sweep.registered_at}; "
+        f"grid hash {sweep.grid_sha256}."
+    )
+    st.caption(
+        "Development boundary ⓘ is the latest owner-set date that limits new "
+        f"in-sample work: {boundary.boundary if boundary else 'none recorded'}."
+    )
+    st.write(
+        f"N ⓘ counts the family's trials: {report.family_n}. "
+        "SR* ⓘ is the expected maximum Sharpe of N unskilled trials: "
+        f"{_number(report.sr_star_annual)} annual today."
+    )
+    st.caption(
+        "Deflated Sharpe ratio ⓘ adjusts a trial's Sharpe for repeated testing. "
+        "dsr_excess ⓘ is that ratio on the excess-over-SPY basis."
+    )
+    for row in report.rows:
+        st.write(
+            f"Trial ⓘ is one recorded test: variant {row.variant_index} ({row.slug}), "
+            f"{row.status}; today's dsr_excess {_number(row.dsr_excess)} at "
+            f"today's family N {report.family_n} and SR* "
+            f"{_number(report.sr_star_annual)}."
+        )
+    if report.verdicts is None:
+        st.write(f"Sweep {report.state}; the rule has no decision until it is complete.")
+    else:
+        verdict = report.verdicts
+        st.write(
+            f"Rule verdict: argmax {verdict.argmax.slug} (variant "
+            f"{verdict.argmax.variant_index}); dsr_excess recomputed at the family's "
+            f"SR* high-water mark is {_number(verdict.dsr_excess_at_high_water)} "
+            f"(high-water SR* {_number(verdict.sr_star_high_water_annual)}), "
+            "which can differ from today's value above. "
+            f"promote_at_least {sweep.promote_at_least}: "
+            f"{'met' if verdict.promote_at_least_met else 'not met'}; "
+            f"retire_below {sweep.retire_below}: "
+            f"{'met' if verdict.retire_below_met else 'not met'}."
+        )
+        next_step = (
+            "sweep promote"
+            if verdict.promote_at_least_met
+            else "sweep retire"
+            if verdict.retire_below_met
+            else "review without promotion"
+        )
+        st.write(
+            "Owner decision ⓘ is the owner's explicit next step, not an automatic "
+            f"action: {next_step} at the desk."
+        )
+    with st.expander("How it was computed"):
+        if report.distribution is not None:
+            d = report.distribution
+            st.write(
+                "Distribution of the selection statistic: "
+                f"min {_number(d.minimum)}, Q1 {_number(d.q1)}, "
+                f"median {_number(d.median)}, Q3 {_number(d.q3)}, "
+                f"max {_number(d.maximum)}."
+            )
+        st.write(f"Red flags: {report.red_flag_count} variants.")
+        for row in report.rows:
+            message = _safe_scrub(row.message, settings) if row.message else row.status
+            st.write(f"{row.slug}: red_flag {row.red_flag}; {message}.")
+        choices = [row.trial_id for row in report.rows if row.trial_id is not None]
+        picked = st.selectbox("Selected trial", choices, index=None, key=f"trial_{sweep.sweep_id}")
+        if picked is not None:
+            view = backtest_page.load_trial_view(conn, picked, settings)
+            for dsr in view.dsr_rows:
+                st.write(
+                    f"{dsr.basis}: stored DSR {_number(dsr.stored_dsr)} "
+                    f"(N at run time); today's DSR "
+                    f"{_number(dsr.today.dsr if dsr.today else None)}."
+                )
+                if dsr.today_error:
+                    st.caption(_safe_scrub(dsr.today_error, settings))
+            gaps = [
+                r["gap_count_share"] for r in view.rebalances if r["gap_count_share"] is not None
+            ]
+            st.write(
+                "Survivorship gap ⓘ is the share of names missing from the "
+                "point-in-time universe; maximum count share "
+                f"{_number(max(gaps) if gaps else None)}."
+            )
+
+
 def render(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
     """Draw the Lab from the shell's read-only connection."""
     st.header("Lab")
@@ -385,11 +490,15 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
                 or file.registry_state is not RegistryState.REGISTERED
             ):
                 continue
-            if busy:
-                st.caption("Run is unavailable while the Lab slot is busy.")
-                continue
             sweep = lab_registry.sweep_by_slug(conn, file.slug)
             if sweep is None:
+                continue
+            try:
+                _result_reading(conn, settings, sweep)
+            except (duckdb.Error, ValueError, lab_schema.LabNotInitialised) as exc:
+                st.warning(_safe_scrub(f"Result unavailable: {exc}", settings))
+            if busy:
+                st.caption("Run is unavailable while the Lab slot is busy.")
                 continue
             plan = lab_queries.plan_run(conn, sweep.sweep_id)
             k = len(plan.variants)
