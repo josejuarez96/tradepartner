@@ -15,8 +15,8 @@ _HEADER = (
 
 
 def _row(form: str, name: str, cik: int, accession: str, filed: str = "2016-08-01") -> str:
-    # The form column is 12 wide and the name column starts right after it.
-    return f"{form:<12}{name:<62}{cik:<12}{filed}  edgar/data/{cik}/{accession}.txt\n"
+    # The real files pad the form to 17 though the header puts Company Name at column 12.
+    return f"{form:<17}{name:<62}{cik:<12}{filed}  edgar/data/{cik}/{accession}.txt\n"
 
 
 def _counts(text: str) -> dict[str, int]:
@@ -31,11 +31,19 @@ def test_multi_word_forms_and_spaced_names_are_counted_per_form() -> None:
         + _row("SC 13D", "ADAGE CAPITAL PARTNERS L.P.", 111, "0000000111-16-000001")
         + _row("SC 13D/A", "AAL ENERGY HOLDINGS INC", 222, "0000000222-16-000002")
         + _row("SC 13D/A", "AAL ENERGY HOLDINGS INC", 222, "0000000222-16-000003")
+        + _row("SCHEDULE 13D", "BETA CORP", 666, "0000000666-16-000006")
+        + _row("SCHEDULE 13D/A", "BETA CORP", 666, "0000000666-16-000007")
         + _row("4", "ACM RESEARCH CORP", 333, "0000000333-16-000004")
         + _row("4", "SMITH JOHN Q", 444, "0000000333-16-000004")  # joint: one accession
         + _row("10-K", "NOT WANTED CO", 555, "0000000555-16-000005")
     )
-    assert _counts(text) == {"SC 13D": 1, "SC 13D/A": 2, "4": 1}
+    assert _counts(text) == {
+        "SC 13D": 1,
+        "SC 13D/A": 2,
+        "SCHEDULE 13D": 1,
+        "SCHEDULE 13D/A": 1,
+        "4": 1,
+    }
 
 
 def test_a_form_that_fills_its_column_does_not_absorb_the_name() -> None:
@@ -47,7 +55,7 @@ def test_a_form_that_fills_its_column_does_not_absorb_the_name() -> None:
 
 
 def test_a_wanted_form_row_with_a_broken_tail_is_counted_unparsed() -> None:
-    bad = f"{'SC 13D':<12}{'X':<62}no-cik-here edgar/data/1/0000000001-16-000001.txt\n"
+    bad = f"{'SC 13D':<17}{'X':<62}no-cik-here edgar/data/1/0000000001-16-000001.txt\n"
     accessions, _ciks, unparsed = census_quarter(_HEADER + bad)
     assert accessions == {}
     assert unparsed == 1

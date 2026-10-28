@@ -4014,15 +4014,16 @@ def census_quarter(
             continue
         if "edgar/data/" not in line:
             continue
-        # The form column is what sits left of the name column (`SC 13D` has a space,
-        # so a whitespace split cannot tell it from the name). No header: two spaces.
-        if name_at is None:
-            form = _CENSUS_FORM_COLUMN.split(line, maxsplit=1)[0].strip()
-        else:
+        # The form column ends at the header's `Company Name` offset, but real rows pad it
+        # wider than the header (17 vs 12), so the offset alone cuts `SCHEDULE 13D/A`. Take
+        # the text before the first run of two spaces when that is a wanted form, else the
+        # offset slice (a name one space from a short form: `SC 13D` is not a split point).
+        form = _CENSUS_FORM_COLUMN.split(line, maxsplit=1)[0].strip()
+        if form not in wanted and name_at is not None:
             form = line[:name_at].strip()
         if form not in wanted:
             continue
-        match = _CENSUS_TAIL.match(line[name_at or len(form) :])
+        match = _CENSUS_TAIL.match(line[len(form) :])
         if match is None:
             unparsed += 1
             continue
