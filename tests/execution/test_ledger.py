@@ -456,8 +456,8 @@ def test_a_fill_known_at_the_base_instant_is_not_since_the_base() -> None:
     assert ledger.fills_since_base == 1  # only the fill known strictly after the base
 
 
-def test_a_reconciliation_that_is_not_ok_is_refused() -> None:
-    with pytest.raises(ValueError, match="ok"):
+def test_a_reconciliation_that_is_neither_ok_nor_breaks_is_refused() -> None:
+    with pytest.raises(ValueError, match="must be reconciled"):
         _ledger(
             FILLS, ORDERS, reconciliation=_reconciliation(600.0, _utc(D5, 22), status="mismatch")
         )

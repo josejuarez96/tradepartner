@@ -155,6 +155,22 @@ def test_timeout_never_retries_or_confirms(
     assert result.status == "not_confirmed" and calls == 1
 
 
+def test_wait_bound_uses_live_settings_not_page_settings(
+    ready: tuple[Settings, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, docs, store = ready
+    live = Settings(
+        _env_file=None,
+        store={"path": str(store), "lock_retry_seconds": 120},
+        ui={"kill_wait_margin_seconds": 10},
+    )
+    monkeypatch.setattr(lab_child.book_actions, "live_settings", lambda: live)
+    child = FakeChild()
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: child)
+    lab_register.register(settings, docs, FileKind.SWEEP, "safe.md")
+    assert child.calls == [130], f"expected [130], got {child.calls}"
+
+
 def test_secret_from_child_never_returned(
     ready: tuple[Settings, Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
