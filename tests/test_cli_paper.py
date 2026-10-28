@@ -2651,3 +2651,43 @@ def test_paper_reconcile_accepts_a_breaks_row_as_a_cash_base_status(
     out = _paper(clock, factory, "reconcile")
     assert out.exit_code == code, out.output
     assert f"paper reconcile: {status}" in out.output
+
+
+def test_book_sandbox_on_a_store_outside_temp_is_refused_before_any_broker(
+    clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: Any
+) -> None:
+    """The sandbox book runs on a temp COPY of the store only (owner 2026-10-28):
+    with the temp root moved away from the store, every book command refuses it
+    (exit 2, nothing built, store untouched) and names the rule, no secret."""
+    store = Path(_settings().store.path)
+    before = _sha256(store)
+    elsewhere = Path(tmp_path_factory.mktemp("elsewhere")).resolve()
+    monkeypatch.setattr("tradepartner.execution.lock._temp_roots", lambda: {elsewhere})
+    out = _paper(clock, factory, "start", "--hypothesis", "h1", "--book", "sandbox")
+    assert out.exit_code == 2
+    assert "runs only on a temp copy of the store" in out.output
+    assert factory.clocks == []
+    assert _sha256(store) == before
+
+
+@pytest.mark.parametrize("args", [["--book", "sandbox"], ["--book", "main"], []])
+def test_paper_run_on_a_marked_sandbox_copy_is_refused_unless_book_sandbox_is_valid(
+    clock: _Clock,
+    factory: _Factory,
+    args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: Any,
+) -> None:
+    """A bare or other-book `paper run` on a marked copy would trade the real books with
+    their real keys: refused with exit 2 before any broker. Book `sandbox` is refused
+    when the store is not under the fixed temp root (here a patched-away root)."""
+    elsewhere = Path(tmp_path_factory.mktemp("elsewhere")).resolve()
+    monkeypatch.setattr("tradepartner.execution.lock._temp_roots", lambda: {elsewhere})
+    store = Path(_settings().store.path)
+    Path(f"{store}.sandbox").write_text("")
+    before = _sha256(store)
+    out = _paper(clock, factory, "run", *args)
+    assert out.exit_code == 2, out.output
+    assert "--book:" in out.output
+    assert factory.clocks == []
+    assert _sha256(store) == before

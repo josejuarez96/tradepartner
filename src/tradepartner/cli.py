@@ -428,6 +428,7 @@ from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, clean_message, get_settings
 from tradepartner.corpus import departure_fetch
 from tradepartner.execution import check as paper_check
+from tradepartner.execution import lock as paper_lock
 from tradepartner.execution import lots_reconcile, ops, plain, reconcile_run, waiting, window
 from tradepartner.execution import report as paper_report
 from tradepartner.execution import resume as paper_resume
@@ -435,7 +436,7 @@ from tradepartner.execution import run as paper_run
 from tradepartner.execution import shakedown as paper_shakedown
 from tradepartner.execution import slippage as paper_slippage
 from tradepartner.execution.brokers import build_broker
-from tradepartner.execution.lock import LockHeld, resolve_book
+from tradepartner.execution.lock import LockHeld
 from tradepartner.execution.lots_reconcile import BrokerLotRow
 from tradepartner.execution.lots_reconcile_export import UnknownExportFormat
 from tradepartner.execution.lots_reconcile_export import parse_export as parse_broker_export
@@ -638,6 +639,15 @@ def _missing_secrets(settings: Settings, source: str) -> list[str]:
 def _fail(message: str, code: int) -> typer.Exit:
     typer.echo(message, err=True)
     return typer.Exit(code)
+
+
+def _resolve_book(settings: Settings, book: str | None) -> str:
+    """`lock.resolve_book`, its refusal (book `sandbox` on a store that is not a temp
+    copy) a usage error (2) before any broker or lock is built."""
+    try:
+        return paper_lock.resolve_book(settings, book)
+    except ValueError as exc:
+        raise _fail(f"--book: {exc}", USAGE_ERROR) from exc
 
 
 def _print_result(result: IngestResult) -> None:
@@ -4510,7 +4520,7 @@ def make_app(
         chosen = _checked_book(book)
         s = paper_settings()
         paper_schema_gate(s)
-        bk = resolve_book(s, chosen)
+        bk = _resolve_book(s, chosen)
         result = _paper_call(
             s,
             lambda: window.start(
@@ -4536,7 +4546,7 @@ def make_app(
         chosen = _checked_book(book)
         s = paper_settings(reason)
         paper_schema_gate(s)
-        bk = resolve_book(s, chosen)
+        bk = _resolve_book(s, chosen)
         result = _paper_call(
             s,
             lambda: window.stop(s, write_chunk(s), broker(s, clock, bk), clock, reason, book_id=bk),
@@ -4556,6 +4566,11 @@ def make_app(
         try:
             paper_schema_gate(s)
         except (Exception, typer.Exit):
+            heartbeat.ping(s, "paper", ok=False)
+            raise
+        try:
+            _resolve_book(s, chosen)  # the sandbox/marker refusal, before any run or broker
+        except typer.Exit:
             heartbeat.ping(s, "paper", ok=False)
             raise
         if chosen is None:
@@ -4621,7 +4636,7 @@ def make_app(
         chosen = _checked_book(book)
         s = paper_settings()
         paper_schema_gate(s)
-        bk = resolve_book(s, chosen)
+        bk = _resolve_book(s, chosen)
         result = _paper_call(
             s,
             lambda: reconcile_run.reconcile_command(
@@ -4692,7 +4707,7 @@ def make_app(
                 ) from exc
 
         if not every_book:
-            bk = resolve_book(s, chosen)
+            bk = _resolve_book(s, chosen)
             event_id = _paper_call(s, lambda: kill_one(bk))
             _echo_scrubbed(f"paper kill: engaged (kill_switch event {event_id})", s)
             return
@@ -4746,7 +4761,7 @@ def make_app(
         chosen = _checked_book(book)
         s = paper_settings(reason)
         paper_schema_gate(s)
-        bk = resolve_book(s, chosen)
+        bk = _resolve_book(s, chosen)
         outcome = _paper_call(
             s,
             lambda: paper_resume.resume(
@@ -5000,7 +5015,7 @@ def make_app(
         chosen = _checked_book(book)
         s = paper_settings(reason)
         paper_schema_gate(s)
-        bk = resolve_book(s, chosen)
+        bk = _resolve_book(s, chosen)
         result = _paper_call(
             s,
             lambda: window.abandon(
@@ -5030,7 +5045,7 @@ def make_app(
         s = paper_settings(reason)
         if kind != "engage_kill_switch":
             paper_schema_gate(s)
-        bk = resolve_book(s, chosen)
+        bk = _resolve_book(s, chosen)
         override_id = _paper_call(
             s, lambda: window.override(s, clock, kind, day, name, reason, book_id=bk)
         )
@@ -5057,7 +5072,7 @@ def make_app(
         chosen = _checked_book(book)
         s = paper_settings(reason)
         paper_schema_gate(s)
-        bk = resolve_book(s, chosen)
+        bk = _resolve_book(s, chosen)
         result = _paper_call(
             s,
             lambda: window.settle_order(
