@@ -2387,3 +2387,117 @@ def test_delete_master_rows_usage_errors(
     missing = _invoke(no_agent, [*base, "--release", _MASTER_RELEASE, "--dry-run"])
     assert missing.exit_code == cli.USAGE_ERROR and "SEC_EDGAR_USER_AGENT" in missing.output
     assert _stored_tickers(settings) == ["VZ", "VZ22A"]
+
+
+# --- ingest --census-sec-forms (T307b, #2435) -------------------------------------
+
+
+def _idx_row(form: str, name: str, cik: int, filed: str, accession: str) -> str:
+    return f"{form:<14}{name:<30}{cik:<10}{filed}  edgar/data/{cik}/{accession}.txt\n"
+
+
+_CENSUS_INDEX = {
+    (1993, 1): (
+        "Description: Quarterly form index\n"
+        + "Form Type   Company Name   CIK   Date Filed   File Name\n"
+        + "---------------------------------------------------------\n"
+        + _idx_row("SC 13D", "OLD HOLDER INC", 1111, "1993-02-01", "0000001111-93-000001")
+        + _idx_row("10-K", "NOT WANTED CORP", 2222, "1993-02-02", "0000002222-93-000002")
+    ),
+    (2024, 4): (
+        "Form Type   Company Name   CIK   Date Filed   File Name\n"
+        + "---------------------------------------------------------\n"
+        + _idx_row("4", "ISSUER INC", 3333, "2024-10-01", "0000003333-24-000001")
+        + _idx_row("4", "OWNER PERSON", 4444, "2024-10-01", "0000003333-24-000001")
+        + _idx_row("4/A", "ISSUER INC", 3333, "2024-10-02", "0000003333-24-000002")
+        + _idx_row("SCHEDULE 13D", "TARGET INC", 5555, "2024-12-20", "0000005555-24-000003")
+        + _idx_row("8-K", "ISSUER INC", 3333, "2024-10-03", "0000003333-24-000004")
+    ),
+    (2025, 1): (
+        _idx_row("4", "ISSUER INC", 3333, "2025-01-05", "0000003333-25-000001")
+        + _idx_row("SC 13D/A", "ANOTHER", 6666, "2025-01-06", "0000006666-25-000002")
+    ),
+}
+
+
+def _census_run(
+    settings: Settings, args: Sequence[str] = ("ingest", "--census-sec-forms")
+) -> tuple[Any, list[httpx.Request]]:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        parts = request.url.path.split("/")  # .../full-index/<year>/QTR<q>/form.idx
+        key = (int(parts[-3]), int(parts[-2][3:]))
+        return httpx.Response(200, text=_CENSUS_INDEX.get(key, ""))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    result = _invoke(
+        settings,
+        args,
+        edgar_client=client,
+        clock=lambda: datetime(2025, 2, 10, tzinfo=UTC),
+    )
+    return result, seen
+
+
+def test_census_sec_forms_counts_a_recorded_index_and_opens_no_store(
+    secrets_set: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _s: None)
+    result, seen = _census_run(secrets_set)
+    assert result.exit_code == 0, result.output
+    # 1993 QTR1 through 2025 QTR1, one request per quarter, none after the clock's quarter.
+    assert len(seen) == (2025 - 1993) * 4 + 1
+    assert all(r.headers["User-Agent"] == USER_AGENT for r in seen)
+    rows = {
+        line.split("|")[0].strip(): [c.strip() for c in line.split("|")]
+        for line in result.output.splitlines()
+        if line[:4].isdigit()
+    }
+    assert set(rows) == {"1993", "2024", "2025"}
+    head = next(ln for ln in result.output.splitlines() if ln.startswith("year"))
+    cols = [c.strip() for c in head.split("|")]
+    # Form 4 appears under two filers in the index but is one accession: one request.
+    assert rows["2024"][cols.index("4")] == "1"
+    assert rows["2024"][cols.index("4/A")] == "1"
+    assert rows["2024"][cols.index("xml_req")] == "3"  # 4, 4/A, SCHEDULE 13D
+    assert rows["2024"][cols.index("ciks")] == "3"  # 3333, 4444, 5555: every filer counts
+    assert rows["1993"][cols.index("SC 13D")] == "1"
+    assert rows["1993"][cols.index("xml_req")] == "0"
+    assert rows["1993"][cols.index("hdr_req")] == "1"
+    assert rows["2025"][cols.index("SC 13D/A")] == "1"
+    assert "10-K" not in result.output and "8-K" not in result.output
+    assert "hours at" in result.output and "bytes" in result.output
+    assert not Path(secrets_set.store.path).exists()  # no store was opened or created
+    assert USER_AGENT not in result.output
+
+
+def test_census_sec_forms_stands_alone_and_needs_the_user_agent(
+    secrets_set: Settings, tmp_path: Path
+) -> None:
+    for extra in (["--backfill", "--since", "2016-01-01"], ["--dry-run"], ["--source", "alpaca"]):
+        result, seen = _census_run(secrets_set, ["ingest", "--census-sec-forms", *extra])
+        assert result.exit_code == 2, extra
+        assert seen == []
+    bare = _settings(tmp_path / "bare", sec_edgar_user_agent="")
+    result, seen = _census_run(bare)
+    assert result.exit_code == 2 and "SEC_EDGAR_USER_AGENT" in result.output
+    assert seen == []
+    assert not Path(bare.store.path).exists()
+
+
+def test_census_sec_forms_stops_on_a_failed_request(
+    secrets_set: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _s: None)
+    client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404, text="no")))
+    result = _invoke(
+        secrets_set,
+        ["ingest", "--census-sec-forms"],
+        edgar_client=client,
+        clock=lambda: datetime(2025, 2, 10, tzinfo=UTC),
+    )
+    assert result.exit_code == 1
+    assert "walk stopped" in result.output
+    assert not Path(secrets_set.store.path).exists()
