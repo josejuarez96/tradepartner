@@ -2292,6 +2292,7 @@ RENAMED = "0000000098"  # 10-K from 2010, never a cover page: snapshot-only
 F1 = datetime(2026, 10, 3, 18, 0, tzinfo=UTC)  # a Saturday fetch: session 10-05
 F2 = datetime(2026, 10, 25, 18, 47, tzinfo=UTC)  # a Sunday fetch: session 10-26
 F3 = datetime(2026, 10, 27, 23, 0, tzinfo=UTC)
+NEXT_FETCH = F2 + timedelta(days=1)  # Monday's consecutive nightly fetch
 RENAME_AT = datetime(2026, 10, 28, 2, 0, tzinfo=UTC)
 
 
@@ -2337,6 +2338,27 @@ STATIC_ROW = ("RNA", "OTC", "snapshot_static", date(2010, 3, 1), F1)
 class TestSnapshotRename:
     """#2291: each nightly run sees only the current SEC ticker file, so the
     build is handed the fetches the store's snapshot rows record."""
+
+    def test_one_new_ticker_fetch_writes_no_rename(self) -> None:
+        build = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+
+    def test_two_consecutive_new_ticker_fetches_date_the_second(self) -> None:
+        build = _rename_build([_rn("RNB", NEXT_FETCH)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(build) == [
+            STATIC_ROW,
+            ("RNB", "OTC", "snapshot", date(2026, 10, 26), NEXT_FETCH),
+        ]
+
+    def test_new_ticker_then_old_ticker_back_writes_no_rename(self) -> None:
+        build = _rename_build([_rn("RNA", NEXT_FETCH)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+
+    def test_confirmation_is_not_visible_before_second_fetch(self) -> None:
+        before = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)])
+        after = _rename_build([_rn("RNB", NEXT_FETCH)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(before) == [STATIC_ROW]
+        assert all(row[4] >= NEXT_FETCH for row in _renamed_rows(after)[1:])
 
     def test_a_later_ticker_is_a_dated_snapshot_row(self) -> None:
         build = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)])
