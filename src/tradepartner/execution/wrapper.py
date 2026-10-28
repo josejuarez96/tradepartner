@@ -545,6 +545,18 @@ class BatchOutcome:
     cash_left: float | None = None
 
 
+def _own_book_rows(
+    conn: duckdb.DuckDBPyConnection, book_id: str
+) -> tuple[list[OrderRow], list[OrderEventRow], list[OrderedFill]]:
+    """Every order, event and live fill of book `book_id`, across all its windows
+    and sessions (a buy left open by an earlier window still counts), and none of
+    another book (its own account, #2475): what the open-buy reserve reads."""
+    orders = [o for o in orders_for(conn, window_id=None) if o.book_id == book_id]
+    ids = {o.client_order_id for o in orders}
+    events = [e for e in order_events_for(conn, window_id=None) if e.client_order_id in ids]
+    return orders, events, fills_for(conn, client_order_ids=ids)
+
+
 @dataclass(frozen=True)
 class _Book:
     """One phase's read of the journal and the store, every store fact as of
@@ -1450,9 +1462,7 @@ class RiskGatedBroker:
                 window_id=window_id,
                 quantity_tolerance=self._frozen.reconcile_quantity_tolerance,
             )
-            orders = orders_for(conn, window_id=None)
-            events = order_events_for(conn, window_id=None)
-            fills = fills_for(conn)
+            orders, events, fills = _own_book_rows(conn, window.book_id)
             journaled = decisions_for(conn, window_id)
             terminal = {e.client_order_id for e in events if e.status in TERMINAL_ORDER_STATUSES}
             # The batch's and the ledger's names are priced here: a missing
