@@ -41,6 +41,11 @@ The block below is the only part the registry parses (`research/experiment.py`).
   it).
 - Keep other fenced blocks out of the parameter block; its first bare ` ``` ` line
   closes it.
+- For a reusable return event study, add `[study]` and one or more `[[study.kill]]`
+  tables inside this same block. Every study key is required, including cost,
+  borrow, `z`, and `cluster_by`; `study.configurations` must cover the kill lines
+  and fit within `budget.configurations`. Kill readings are `raw`,
+  `beta_adjusted`, `size_tight`, or `size_tight_beta_adjusted`.
 
 ```toml experiment
 slug = "<slug>"
@@ -84,6 +89,48 @@ runs = <maximum runs across the amendment chain, failures and refusals included>
 configurations = <maximum configurations evaluated across those runs>
 stop_rule = "<words: sensitivity set and tolerance, the revision rule>"
 expected_effect = "<words: the prior, at or below the brief's haircuts for return claims>"
+
+# Optional for kind = "return" only; uncomment and fill every key:
+# [study]
+# configurations = 2
+# horizons = [20, 60]
+# groups = ["treated", "peer"]
+# peer_group = "peer"
+# entry = "next_open_after_instant" # or "next_session_after_date"
+# facts_read = "event_known_at" # or "window_end" (disclose look-ahead)
+# bucket_by = ["quarter", "stratum"]
+# peer_by = ["stratum"]
+# n_buckets = 3
+# min_bucket_events = 30
+# price_floor = 5.0
+# volume_floor = 1000000.0
+# volume_lookback = 20
+# min_volume_bars = 10
+# shares_stale_days = 365
+# shares_fact = "shares_outstanding"
+# benchmark_security = "SPY"
+# peer_window = 5
+# min_peers = 3
+# near_k = 10
+# beta_lookback = 120
+# beta_min_bars = 60
+# cost_bps = [15.0, 30.0]
+# borrow_bps = [0.0, 30.0]
+# z = 1.645
+# cluster_by = ["month", "quarter"]
+# [[study.kill]]
+# name = "long"
+# side = "long" # or "short"; selects the net-return formula
+# group = "treated"
+# horizon = 60
+# readings = ["raw", "beta_adjusted", "size_tight", "size_tight_beta_adjusted"]
+# metric = "gross_spread_bp" # or "net_bp"
+# floor = 60.0
+# t_metric = "net_bp"
+# t_floor = 1.0
+# t = "min" # or a declared cluster_by value
+# cost_bps = 30.0
+# borrow_bps = 0.0
 
 # Only on an amendment:
 # amends_sha256 = "<params_sha256 of the registration this one supersedes>"
