@@ -1683,7 +1683,7 @@ def _auto_accepts(
         gross = math.fsum(abs(amount) for _, amount in cash_parts)
         judged = None if size is None else size + max(0.0, gross - abs(cash))
         prior = _prior_auto_accepted(events, name)
-        if size is None or _judge(
+        if judged is None or _judge(
             kinds,
             size=judged,
             prior=prior,
