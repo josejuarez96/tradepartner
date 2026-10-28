@@ -15,7 +15,7 @@ session `through`:
   after that cut is never applied (no look-ahead). Rows dated after `through`
   are left out, so an earlier session's ledger (a back-filled mark) can be
   rebuilt from the whole window's rows.
-- **Cash** is the `broker_cash` of the window's last `ok` reconciliation plus
+- **Cash** is the `broker_cash` of the window's last `ok` or `breaks` reconciliation plus
   every fill and adjustment delta known after it, or `starting_cash` plus every
   delta before the first one. A row whose `known_at` equals the
   reconciliation's is inside it. A base taken after `through` cannot state
@@ -261,10 +261,10 @@ def _cash_base(
         return starting_cash, None
     name = f"reconciliation {reconciliation.reconciliation_id}"
     _check_window("reconciliation", reconciliation.window_id, window_id)
-    if reconciliation.status != _OK:
-        raise ValueError(f"{name} is {reconciliation.status!r}, the cash base must be an ok one")
+    if reconciliation.status not in (_OK, "breaks"):
+        raise ValueError(f"{name} is {reconciliation.status!r}, the cash base must be reconciled")
     if reconciliation.broker_cash is None:
-        raise ValueError(f"ok {name} has no broker_cash")
+        raise ValueError(f"{name} has no broker_cash")
     if reconciliation.at.astimezone(_NEW_YORK).date() > through:
         raise ValueError(f"{name} at {reconciliation.at} is after {through}, the ledger's session")
     return _finite(reconciliation.broker_cash, f"{name} broker_cash"), reconciliation.known_at
@@ -288,12 +288,12 @@ def from_journal(
     holds at least every fill's order. `adjustments` are the window's rows
     (`store.journal.adjustments_for`). `actions_as_of` is a `live_actions_as_of`
     frame read at close(S-1); only its `split` rows count. `last_ok_reconciliation`
-    is the window's latest `ok` row stated on or before `through`, or None.
+    is the window's latest `ok` or `breaks` base stated on or before `through`, or None.
     `quantity_tolerance` is the frozen `risk.reconcile_quantity_tolerance`.
 
     Raises `ValueError` on: a row of another window; a fill without its order,
     disagreeing with it, or repeated; a repeated adjustment or an unknown kind;
-    a base that is not `ok`, lacks `broker_cash` or is after `through`; any
+    a base that is neither `ok` nor `breaks`, lacks `broker_cash` or is after `through`; any
     non-finite number or non-positive split ratio; a non-date `through`.
     """
     if isinstance(through, datetime) or not isinstance(through, date):

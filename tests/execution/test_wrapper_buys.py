@@ -12,7 +12,7 @@ from tradepartner.adapters.broker import OrderRequest, Side
 from tradepartner.adapters.fake_broker import Accept, FillAt
 from tradepartner.calendar import session_open
 from tradepartner.config import Settings
-from tradepartner.store.journal import PaperRunResultRow, PaperWindowRow
+from tradepartner.store.journal import PaperRunResultRow, PaperWindowRow, ReconcileBreakRow
 
 from .test_wrapper_phases import (
     CUT,
@@ -73,6 +73,35 @@ def _submission_times(env: Env) -> list[tuple[OrderRequest, datetime]]:
     times: list[tuple[OrderRequest, datetime]] = []
     env.fake.on_submit = lambda request: times.append((request, env.clock.now))
     return times
+
+
+def test_buy_cash_excludes_positive_open_name_cash_break(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    env.new_fake(cash=640.0)
+    at = env.run.started_at
+    _append(
+        env.settings,
+        ReconcileBreakRow(
+            break_id=f"{env.window.window_id}:{A}:1",
+            window_id=env.window.window_id,  # type: ignore[arg-type]
+            book_id=env.window.book_id,
+            event="opened",
+            parts_json='[{"kind":"name_cash","cash_amount":30.0,"activity_ids":["credit"]}]',
+            cause="corporate_action",
+            security_id=A,
+            cash_amount=30.0,
+            material=True,
+            dollar_size=30.0,
+            first_seen_session=PREV,
+            reconciliation_id=1,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    gate = _gate(env, alerter_conn)
+    book = gate._read_book(env.run, [])
+    assert gate._buys_cash(env.fake.account(), book, S) == pytest.approx(610.0)
 
 
 def test_buy_waits_until_sell_deadline_when_sell_stays_live(

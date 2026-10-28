@@ -276,8 +276,8 @@ class _JournalState:
     rows: list[ReconciliationRow] = field(default_factory=list)
 
     def base(self, through: date) -> ReconciliationRow | None:
-        """The latest `ok` reconciliation stated on or before `through`: the
-        ledger's cash base for that session. A later `ok` row (a weekend
+        """The latest `ok` or `breaks` reconciliation stated on or before `through`:
+        the ledger's cash base for that session. A later row (a weekend
         `paper reconcile` stated for Friday) cannot state `through`."""
         stated = [r for r in self.ok_rows if r.at.astimezone(_NEW_YORK).date() <= through]
         return stated[-1] if stated else None
@@ -398,7 +398,9 @@ def _journal_state(
         fills=[f for f in fills_for(conn, window_id=window_id) if f.fill.known_at <= as_of],
         orders=[o for o in orders_for(conn, window_id=window_id) if o.known_at <= as_of],
         adjustments=[a for a in adjustments_for(conn, window_id) if a.known_at <= as_of],
-        ok_rows=[r for r in rows if r.status == OK],
+        ok_rows=[
+            r for r in rows if r.status == OK or (r.status == BREAKS and r.broker_cash is not None)
+        ],
         rows=rows,
     )
 
@@ -1122,7 +1124,7 @@ def _seen_activities(
 
     The window's already-booked activity ids (`adjustments.broker_activity_id`)
     are always seen, so a fee is booked once by id. The base's recorded set (the
-    last `ok` reconciliation's `activities`) takes precedence; before the first
+    last `ok` or `breaks` reconciliation's `activities`) takes precedence; before the first
     `ok`, the window row's `activities_seen_json` (what `paper start` read); when
     both are null, the fallback cutoff is the window's New York start date, so a
     fee dated before the window opened is seen and a fee dated on it is bookable."""
@@ -1332,7 +1334,9 @@ def _mergers(
             upper = Decimal(str(upper_value))
             paid = Decimal(str(journaled)) >= upper - bound
             closed = any(
-                r.status == OK and after_end(stated) and removal.known_at <= r.known_at
+                (r.status == OK or (r.status == BREAKS and r.broker_cash is not None))
+                and after_end(stated)
+                and removal.known_at <= r.known_at
                 for r, stated in completed
             )
             ended_when_known = known > session_close(end)
@@ -1897,6 +1901,31 @@ def reconcile_now(
         # A one-shot finding stays open until the owner true-up; a clean broker
         # read cannot release the temporary T281 whole-book halt.
         result = replace(result, status=BREAKS, broker_cash=None, adjustments=())
+    if result.status == BREAKS:
+        # A name cash break remains outside the ledger until an adjustment
+        # books it. Preserve the raw account reading for the audit trail.
+        result = replace(result, adjustments=result.explained)
+        open_cash = math.fsum(
+            m.cash_amount or 0.0 for m in result.mismatches if m.kind == "name_cash"
+        )
+        payload = json.loads(result.mismatches_json)
+        raw_cash = float(account.cash)
+        payload["raw_broker_cash"] = raw_cash
+        open_ids = {
+            activity_id
+            for mismatch in result.mismatches
+            if mismatch.kind == "name_cash"
+            for activity_id in mismatch.activity_ids
+        }
+        payload["activities"] = [
+            item for item in payload["activities"] if item["activity_id"] not in open_ids
+        ]
+        result = replace(result, broker_cash=math.fsum((raw_cash, -open_cash)))
+        # Keep the filtered seen set on the row without altering the compare
+        # result's activity evidence used by break-event attribution.
+        result_payload = json.dumps(payload, sort_keys=True, allow_nan=False)
+    else:
+        result_payload = result.mismatches_json
     halt_for_break = retained_finding or any(
         break_rules.is_name_level(m.kind) for m in result.mismatches
     )
@@ -1920,7 +1949,7 @@ def reconcile_now(
                 at=stamp,
                 status=result.status,
                 broker_cash=result.broker_cash,
-                mismatches_json=result.mismatches_json,
+                mismatches_json=result_payload,
                 book_id=window.book_id,
                 known_at=stamp,
                 ingested_at=stamp,

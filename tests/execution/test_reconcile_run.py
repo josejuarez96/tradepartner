@@ -577,6 +577,62 @@ def test_named_cash_break_is_written_before_the_temporary_halt(
     assert events[0].break_id == events[1].break_id
 
 
+def test_name_cash_break_is_excluded_from_two_bases_and_remains_unseen(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.activities = [CashActivity("open-credit", "MA", S, "executed", 30.0, "SPY")]
+    fake.extra_cash = 30.0
+    for expected, session in (("opened", S), ("observed", next_session(S))):
+        if session != S:
+            fixed_clock.now = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)
+        with pytest.raises(ReconciliationError):
+            _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=session)
+        row = _rows(journal_settings, frozen_window)[-1]
+        payload = json.loads(row.mismatches_json or "")
+        assert row.status == "breaks"
+        assert row.broker_cash == pytest.approx(100_000.0 - 10 * PRICE)
+        assert payload["raw_broker_cash"] == pytest.approx(100_030.0 - 10 * PRICE)
+        assert "open-credit" not in {a["activity_id"] for a in payload["activities"]}
+        with open_read_only(journal_settings) as conn:
+            state = _journal_state(conn, frozen_window.window_id or 0, fixed_clock())
+            ledger = _ledger(
+                state,
+                live_actions_as_of(conn, session_close(previous_session(session))),
+                frozen_window,
+                session,
+                FROZEN.reconcile_quantity_tolerance,
+            )
+            events = break_events_for(conn, frozen_window.window_id or 0)
+        assert ledger.cash == pytest.approx(100_000.0 - 10 * PRICE)
+        assert events[-1].event == expected
+
+
+def test_pre_t282b_break_without_cash_is_not_a_ledger_base(
+    journal_settings: Settings, open_window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    earlier = fixed_clock() - timedelta(minutes=10)
+    _ok_base(journal_settings, open_window, at=earlier, broker_cash=90_000.0)
+    broken_at = fixed_clock() - timedelta(minutes=5)
+    _append(
+        journal_settings,
+        ReconciliationRow(
+            window_id=open_window.window_id or 0,
+            at=broken_at,
+            status="breaks",
+            broker_cash=None,
+            known_at=broken_at,
+            ingested_at=broken_at,
+        ),
+    )
+    with open_read_only(journal_settings) as conn:
+        state = _journal_state(conn, open_window.window_id or 0, fixed_clock())
+        assert state.base(S) is not None and state.base(S).broker_cash == 90_000.0
+
+
 @pytest.mark.parametrize(
     ("types", "cause"),
     [(("DIVNRA",), "corporate_action"), (("DIVNRA", "MA"), "unattributed")],
@@ -1061,6 +1117,96 @@ def test_dividend_due_beside_a_break_books_once_after_the_break_clears(
     assert result.status == OK
     assert [(a.kind, a.cash) for a in _adjustments(journal_settings, open_window)] == [
         ("dividend_cash", pytest.approx(5.0))
+    ]
+
+
+def test_retained_finding_keeps_a_cash_base_and_books_a_separate_dividend(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0, (MTUM, "MTUM"): 10.0})
+    original = reconcile_run._explanations
+    finding = {"active": True}
+
+    def with_finding(*args: Any, **kwargs: Any) -> Explanations:
+        offered = original(*args, **kwargs)
+        if finding["active"]:
+            return replace(
+                offered,
+                merger_conflicts={SPY: "merger ids ['deal-b', 'deal-a'] for SEC_SPY"},
+            )
+        return offered
+
+    monkeypatch.setattr(reconcile_run, "_explanations", with_finding)
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    finding["active"] = False
+    _dividend(journal_settings, MTUM, 0.5, CUT - timedelta(days=1))
+    fake.activities = [CashActivity("div-mtum", "DIV", S, "executed", 5.0, "MTUM")]
+    fake.extra_cash = 5.0
+    fixed_clock.advance(minutes=5)
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    row = _rows(journal_settings, open_window)[-1]
+    assert row.status == "breaks"
+    assert row.broker_cash == pytest.approx(100_000.0 - 20 * PRICE + 5.0)
+    assert [(a.kind, a.cash) for a in _adjustments(journal_settings, open_window)] == [
+        ("dividend_cash", pytest.approx(5.0))
+    ]
+    with open_read_only(journal_settings) as conn:
+        assert [event.event for event in break_events_for(conn, open_window.window_id or 0)] == [
+            "opened",
+            "observed",
+        ]
+
+
+def test_explained_name_closes_while_another_name_still_breaks(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(MTUM, "MTUM"): 10.0, (SPY, "SPY"): 10.0})
+    fake.extra_quantity.update({"MTUM": -10.0, "SPY": 1.0})
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    known = datetime(2026, 10, 1, 19, 0, tzinfo=UTC)
+    _fact(
+        journal_settings,
+        "mergers",
+        security_id=MTUM,
+        kind="cash",
+        acquirer_security_id=None,
+        acquiree_symbol="MTUM",
+        acquiree_cusip="SYNTH-MTUM",
+        acquirer_symbol="",
+        acquirer_cusip="",
+        share_ratio=None,
+        cash_per_share=20.0,
+        effective_date=S,
+        process_date=S,
+        payable_date=S,
+        source_action_id="merger-cited",
+        known_at=known,
+        ingested_at=known,
+        source="alpaca",
+        provenance="action",
+    )
+    fake.extra_cash = 200.0
+    fixed_clock.now = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, session=next_session(S))
+    with open_read_only(journal_settings) as conn:
+        events = break_events_for(conn, open_window.window_id or 0)
+    assert [(event.security_id, event.event) for event in events[-2:]] == [
+        (MTUM, "auto_explained"),
+        (SPY, "observed"),
+    ]
+    assert [(a.kind, a.cash) for a in _adjustments(journal_settings, open_window)] == [
+        ("corporate_action_cash", pytest.approx(200.0))
     ]
 
 
@@ -1914,7 +2060,7 @@ def test_a_split_known_only_after_close_of_the_previous_session_is_a_mismatch(
     row = _rows(journal_settings, open_window)[-1]
     assert _rows(journal_settings, open_window)[0].status == OK
     assert row.status == "breaks"
-    assert row.broker_cash is None
+    assert row.broker_cash == pytest.approx(100_000.0 - 10 * PRICE)
     assert [m["kind"] for m in json.loads(row.mismatches_json or "")["mismatches"]] == ["quantity"]
     with open_read_only(journal_settings) as conn:
         (event,) = break_events_for(conn, open_window.window_id or 0)

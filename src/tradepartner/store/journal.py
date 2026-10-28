@@ -1543,8 +1543,14 @@ def reconciliations_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list
 def last_ok_reconciliation(
     conn: duckdb.DuckDBPyConnection, window_id: int
 ) -> ReconciliationRow | None:
-    """The window's latest `ok` reconciliation (the ledger's cash base), or None."""
-    rows = _select(conn, ReconciliationRow, "t.window_id = ? AND t.status = 'ok'", [window_id])
+    """The window's latest `ok` or `breaks` reconciliation (cash base), or None."""
+    rows = _select(
+        conn,
+        ReconciliationRow,
+        "t.window_id = ? AND (t.status = 'ok' OR (t.status = 'breaks' "
+        "AND t.broker_cash IS NOT NULL))",
+        [window_id],
+    )
     return rows[-1] if rows else None
 
 
