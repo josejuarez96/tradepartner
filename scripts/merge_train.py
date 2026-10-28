@@ -204,9 +204,10 @@ def eligibility(
         return "(a) not open, or a draft"
     if pr.base != "main":
         return f"(b) base is {pr.base}, not main"
-    if "parked" in pr.labels:
+    labels = {label.lower() for label in pr.labels}
+    if "parked" in labels:
         return "(c) parked"
-    if "hold" in pr.labels:
+    if "hold" in labels:
         return "(c) on hold"
     bodies = owner_bodies(comments, pr.owner)
     train = [(line, b) for b in bodies if (line := _train_line(b)) and line[0] != "INELIGIBLE"]
