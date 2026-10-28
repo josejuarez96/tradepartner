@@ -434,6 +434,7 @@ from tradepartner.execution.lock import LockHeld, resolve_book
 from tradepartner.execution.lots_reconcile import BrokerLotRow
 from tradepartner.execution.lots_reconcile_export import UnknownExportFormat
 from tradepartner.execution.lots_reconcile_export import parse_export as parse_broker_export
+from tradepartner.execution.reconcile import BREAKS as RECONCILE_BREAKS
 from tradepartner.execution.reconcile import OK as RECONCILE_OK
 from tradepartner.execution.wrapper import CRASH_EXIT_CODE, WRITE_FAILED_EXIT_CODE
 from tradepartner.health import (
@@ -4514,7 +4515,7 @@ def make_app(
             ),
         )
         _echo_scrubbed(f"paper reconcile: {result.status}; {result.mismatches_json}", s)
-        if result.status != RECONCILE_OK:
+        if result.status not in (RECONCILE_OK, RECONCILE_BREAKS):
             raise typer.Exit(CRASH_EXIT_CODE)
 
     @paper_app.command("kill")

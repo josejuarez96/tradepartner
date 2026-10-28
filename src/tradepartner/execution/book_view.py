@@ -353,6 +353,28 @@ def _reconciliation(
     quantity_tol = float(risk.reconcile_quantity_tolerance)
     stamp = row.at.isoformat()
     payload = _json(row.mismatches_json)
+    if row.status == "breaks":
+        # Paper spec amendment 2026-10-26 (#2266) item 10: a `breaks` row is a
+        # reconciliation with named differences, not a full mismatch. Count the
+        # names; `matches` stays False, it is not a checked match.
+        mismatches = payload.get("mismatches") if payload is not None else None
+        names = {
+            m.get("security_id") or m.get("symbol") or m.get("kind")
+            for m in (mismatches if isinstance(mismatches, list) else [])
+            if isinstance(m, dict)
+        }
+        count = len(names)
+        what = (
+            "an open finding"
+            if count == 0
+            else f"{count} open {'break' if count == 1 else 'breaks'}"
+        )
+        return ReconciliationView(
+            False,
+            f"Matches Alpaca as of {stamp} except {what}.",
+            row.at,
+            cash_tol,
+        )
     if row.status != "ok":
         why = _STATUS_WORDS.get(row.status, f"its status is {row.status}")
         detail = ""

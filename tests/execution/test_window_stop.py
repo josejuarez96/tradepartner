@@ -10,6 +10,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -32,6 +33,7 @@ from tradepartner.execution.window import (
     NO_WINDOW,
     NOT_FLAT,
     NOT_READY,
+    OPEN_BREAKS,
     OPEN_ORDERS,
     OVERRIDE,
     REASON,
@@ -106,8 +108,8 @@ def fake(fixed_clock: FixedClock) -> FakeBroker:
     )
 
 
-def _frozen_json() -> str:
-    frozen: dict[str, Any] = {f"risk.{k}": v for k, v in FROZEN.model_dump(mode="json").items()}
+def _frozen_json(risk: RiskConfig = FROZEN) -> str:
+    frozen: dict[str, Any] = {f"risk.{k}": v for k, v in risk.model_dump(mode="json").items()}
     frozen["paper.min_override_reason_chars"] = MIN_REASON
     return json.dumps(frozen, sort_keys=True)
 
@@ -119,6 +121,7 @@ def _new_window(
     starting_cash: float = 100_000.0,
     book_id: str = "main",
     account_id: str = "PA1",
+    risk: RiskConfig = FROZEN,
 ) -> PaperWindowRow:
     row = PaperWindowRow(
         hypothesis_id=registered_hypothesis(settings),
@@ -129,7 +132,7 @@ def _new_window(
         starting_equity=100_000.0,
         code_version="test",
         started_at=started,
-        frozen_json=(text := _frozen_json()),
+        frozen_json=(text := _frozen_json(risk)),
         frozen_sha256=registry.params_sha256(json.loads(text)),
         known_at=started,
         ingested_at=started,
@@ -716,6 +719,54 @@ def test_a_reconciliation_mismatch_refuses_the_closing_stop_and_engages_the_swit
         (event,) = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
     assert (event.source, event.fault_type) == ("fault", "ReconciliationError")
     assert [s.state for s in _stops(journal_settings, window)] == ["requested"]
+
+
+def _break_without_cash_gap(settings: Settings, fake: FakeBroker, clock: FixedClock) -> None:
+    """A share the ledger lacks, its cost paid back so only the quantity differs: a
+    name-level residual (`broker_only_position`), not a book-level `cash`."""
+    fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))
+    fake.simulate_fill("owner-1")
+    fake._cash += Decimal(PRICE)
+
+
+def test_stop_refuses_open_breaks_while_a_material_break_remains(
+    journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """T282d, #2266 item 10: a `breaks` reconciliation no longer halts, but the close
+    refuses `open_breaks` while a material break is open; nothing is engaged."""
+    _requested(journal_settings, window, DAY1 - timedelta(minutes=50))
+    _break_without_cash_gap(journal_settings, fake, fixed_clock)
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        _stop(journal_settings, fake, fixed_clock)
+
+    reason, message = _refusal(excinfo)
+    assert reason == OPEN_BREAKS
+    assert "1 open material break" in message
+    assert [s.state for s in _stops(journal_settings, window)] == ["requested"]
+    assert _count(journal_settings, "kill_switch") == 0
+    assert _count(journal_settings, "reconcile_breaks") == 1
+
+
+def test_stop_closes_on_a_breaks_base_when_no_open_break_is_material(
+    journal_settings: Settings, fake: FakeBroker, fixed_clock: FixedClock
+) -> None:
+    """A `breaks` row of immaterial breaks only is a safe base: `_residues`
+    and the close read it as reconciled."""
+    roomy = FROZEN.model_copy(
+        update={"break_materiality_usd": 1_000.0, "break_materiality_bps": 1_000.0}
+    )
+    window = _new_window(journal_settings, datetime(2026, 9, 29, 12, 0, tzinfo=UTC), risk=roomy)
+    _requested(journal_settings, window, DAY1 - timedelta(minutes=50))
+    _break_without_cash_gap(journal_settings, fake, fixed_clock)
+
+    result = _stop(journal_settings, fake, fixed_clock)
+
+    assert result.state == "closed"
+    with open_read_only(journal_settings) as conn:
+        (row,) = reconciliations_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert row.status == "breaks" and row.reconciliation_id == result.reconciliation_id
+    assert [s.state for s in _stops(journal_settings, window)][-1] == "closed"
 
 
 def test_a_closed_windows_halted_run_does_not_engage_the_next_window(

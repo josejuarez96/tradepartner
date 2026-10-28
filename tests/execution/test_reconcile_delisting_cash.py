@@ -36,6 +36,7 @@ from tradepartner.adapters.broker import CashActivity
 from tradepartner.calendar import next_session
 from tradepartner.config import Settings
 from tradepartner.errors import ReconciliationError
+from tradepartner.execution import reconcile_run
 from tradepartner.execution.reconcile import OK, OVERDUE_DELISTING_CASH
 from tradepartner.store.journal import PaperWindowRow
 
@@ -86,6 +87,12 @@ def _kinds(
     return [(a.kind, a.quantity, a.cash) for a in _adjustments(settings, window)]
 
 
+@pytest.fixture(autouse=True)
+def _long_only_book(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These windows name no registered hypothesis; read each as `long_only`."""
+    monkeypatch.setattr(reconcile_run, "_signed_book", lambda conn, window: False)
+
+
 def _halts_on_cash(
     settings: Settings,
     broker: BookedFake,
@@ -98,11 +105,14 @@ def _halts_on_cash(
     """The reconcile raises and its row's only residual is the credit.
 
     Untagged, mis-tagged or unmapped credit stays the book-level `cash`
-    (`mismatch`). A credit tagged to a held name is, by amendment #2266 item 1,
-    a `name_cash` break (`breaks`); T281 still halts the run on it (the raise).
+    (`mismatch`, raised). A credit tagged to a held name is, by amendment #2266 item
+    1, a `name_cash` break (`breaks`), which halts nothing (T282d).
     """
-    with pytest.raises(ReconciliationError):
+    if name_level:
         _reconcile(settings, broker, window, clock, session=session)
+    else:
+        with pytest.raises(ReconciliationError):
+            _reconcile(settings, broker, window, clock, session=session)
     row = _rows(settings, window)[-1]
     payload = json.loads(row.mismatches_json or "{}")
     assert row.status == ("breaks" if name_level else "mismatch")
