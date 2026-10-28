@@ -2636,3 +2636,18 @@ def test_first_line_counts_halt_days_across_the_fall_back() -> None:
 
 def test_first_line_with_unknown_halt_time_says_only_halted() -> None:
     assert _first_line(None, datetime(2026, 11, 2, 13, tzinfo=UTC)) == "main: halted; run: CMD"
+
+
+@pytest.mark.usefixtures("started")
+@pytest.mark.parametrize(("status", "code"), [("ok", 0), ("breaks", 0), ("mismatch", 1)])
+def test_paper_reconcile_accepts_a_breaks_row_as_a_cash_base_status(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory, status: str, code: int
+) -> None:
+    from tradepartner.execution import reconcile_run
+    from tradepartner.execution.reconcile import Reconciliation
+
+    result = Reconciliation(status, 1.0, (), (), (), ())
+    monkeypatch.setattr(reconcile_run, "reconcile_command", lambda *_a, **_k: result)
+    out = _paper(clock, factory, "reconcile")
+    assert out.exit_code == code, out.output
+    assert f"paper reconcile: {status}" in out.output
