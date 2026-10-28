@@ -3961,6 +3961,13 @@ CENSUS_FIRST_YEAR = 1993
 CENSUS_XML_BYTES_ASSUMED = 20_000
 
 _CENSUS_FORM_COLUMN = re.compile(r"\s{2,}")
+_CENSUS_NAME_HEADER = re.compile(r"^Form Type\s+Company Name")
+# What follows the form column: the name (any text, may be blank), the CIK, the date
+# filed and the file name. The form is never read from this tail.
+_CENSUS_TAIL = re.compile(
+    r"^(?:.*\s)?(?P<cik>\d+)\s+(?P<filed>\d{4}-\d{2}-\d{2})\s+"
+    r"edgar/data/\d+/(?P<accession>\d{10}-\d{2}-\d{6})\.txt\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -4000,21 +4007,28 @@ def census_quarter(
     accessions: dict[int, dict[str, set[str]]] = {}
     ciks: dict[int, set[str]] = {}
     unparsed = 0
+    name_at: int | None = None  # the header's `Company Name` offset: the form column's end
     for line in text.splitlines():
+        if _CENSUS_NAME_HEADER.match(line):
+            name_at = line.index("Company Name")
+            continue
         if "edgar/data/" not in line:
             continue
-        form = _CENSUS_FORM_COLUMN.split(line, maxsplit=1)[0].strip()
+        # The form column is what sits left of the name column (`SC 13D` has a space,
+        # so a whitespace split cannot tell it from the name). No header: two spaces.
+        if name_at is None:
+            form = _CENSUS_FORM_COLUMN.split(line, maxsplit=1)[0].strip()
+        else:
+            form = line[:name_at].strip()
         if form not in wanted:
             continue
-        try:
-            rows = parse_filing_index(line, {}).unstamped
-        except ValueError:
+        match = _CENSUS_TAIL.match(line[name_at or len(form) :])
+        if match is None:
             unparsed += 1
             continue
-        for row in rows:
-            year = row.filed_on.year
-            accessions.setdefault(year, {}).setdefault(row.form, set()).add(row.accession)
-            ciks.setdefault(year, set()).add(row.cik)
+        year = int(match["filed"][:4])
+        accessions.setdefault(year, {}).setdefault(form, set()).add(match["accession"])
+        ciks.setdefault(year, set()).add(f"{int(match['cik']):010d}")
     return accessions, ciks, unparsed
 
 

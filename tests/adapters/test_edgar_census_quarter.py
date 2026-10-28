@@ -1,0 +1,53 @@
+"""`census_quarter` reads `form.idx` by the header's column offsets (#2491).
+
+A multi-word form type (`SC 13D`, `SC 13D/A`) and a company name with spaces must
+not bleed into each other: the form column is whatever sits left of `Company Name`.
+"""
+
+from __future__ import annotations
+
+from tradepartner.adapters.edgar_source import census_quarter
+
+_HEADER = (
+    "Form Type   Company Name                                                  "
+    "CIK         Date Filed  File Name\n" + "-" * 130 + "\n"
+)
+
+
+def _row(form: str, name: str, cik: int, accession: str, filed: str = "2016-08-01") -> str:
+    # The form column is 12 wide and the name column starts right after it.
+    return f"{form:<12}{name:<62}{cik:<12}{filed}  edgar/data/{cik}/{accession}.txt\n"
+
+
+def _counts(text: str) -> dict[str, int]:
+    accessions, _ciks, unparsed = census_quarter(text)
+    assert unparsed == 0
+    return {f: len(a) for f, a in accessions[2016].items()}
+
+
+def test_multi_word_forms_and_spaced_names_are_counted_per_form() -> None:
+    text = (
+        _HEADER
+        + _row("SC 13D", "ADAGE CAPITAL PARTNERS L.P.", 111, "0000000111-16-000001")
+        + _row("SC 13D/A", "AAL ENERGY HOLDINGS INC", 222, "0000000222-16-000002")
+        + _row("SC 13D/A", "AAL ENERGY HOLDINGS INC", 222, "0000000222-16-000003")
+        + _row("4", "ACM RESEARCH CORP", 333, "0000000333-16-000004")
+        + _row("4", "SMITH JOHN Q", 444, "0000000333-16-000004")  # joint: one accession
+        + _row("10-K", "NOT WANTED CO", 555, "0000000555-16-000005")
+    )
+    assert _counts(text) == {"SC 13D": 1, "SC 13D/A": 2, "4": 1}
+
+
+def test_a_form_that_fills_its_column_does_not_absorb_the_name() -> None:
+    # `SCHEDULE 13D/A` is 14 wide: the name follows after one space, not two.
+    header = _HEADER.replace("Form Type   Company Name", "Form Type      Company Name")
+    tail = "2016-08-02  edgar/data/9/0000000009-16-000001.txt\n"
+    row = f"{'SCHEDULE 13D/A':<15}{'TARGET CORP':<62}{9:<12}{tail}"
+    assert _counts(header + row) == {"SCHEDULE 13D/A": 1}
+
+
+def test_a_wanted_form_row_with_a_broken_tail_is_counted_unparsed() -> None:
+    bad = f"{'SC 13D':<12}{'X':<62}no-cik-here edgar/data/1/0000000001-16-000001.txt\n"
+    accessions, _ciks, unparsed = census_quarter(_HEADER + bad)
+    assert accessions == {}
+    assert unparsed == 1
