@@ -38,11 +38,12 @@ from __future__ import annotations
 
 import fcntl
 import os
+import tempfile
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from tradepartner.config import MAIN_BOOK_ID, Settings
+from tradepartner.config import MAIN_BOOK_ID, SANDBOX_BOOK_ID, Settings
 from tradepartner.store.journal import check_book_id
 
 #: Owner read and write only: the file names a pid, nothing else.
@@ -53,11 +54,39 @@ class LockHeld(RuntimeError):
     """Another process holds the paper run lock."""
 
 
+def _temp_roots() -> set[Path]:
+    """The directories a throwaway store copy may live under: the system temp directory
+    and `/tmp` (macOS keeps them apart), resolved."""
+    return {Path(tempfile.gettempdir()).resolve(), Path("/tmp").resolve()}
+
+
+def sandbox_store_refusal(settings: Settings, book_id: str) -> str | None:
+    """Why book `sandbox` may not run on `settings.store.path`, or `None` (owner decision
+    2026-10-28, docs/runbooks/sandbox.md): the sandbox book exists only in a throwaway
+    COPY of the store, so any other book is never refused and the sandbox is refused
+    unless the store file resolves to a path under the system temp directory. The live
+    store (`data/tradepartner.duckdb` of the main checkout) is not there. Pure."""
+    if book_id != SANDBOX_BOOK_ID:
+        return None
+    store = Path(settings.store.path).resolve()
+    if any(root in store.parents for root in _temp_roots()):
+        return None
+    return (
+        f"book {SANDBOX_BOOK_ID!r} runs only on a temp copy of the store, never the live "
+        f"one: store.path {settings.store.path!r} is not under the system temp directory "
+        "(copy the store, set STORE__PATH to the copy; docs/runbooks/sandbox.md)"
+    )
+
+
 def resolve_book(settings: Settings, book_id: str | None) -> str:
     """The command's book: `book_id`, or `paper.book_id` when none is given (the
-    spec's `--book` default); `ValueError` outside the book token grammar."""
+    spec's `--book` default); `ValueError` outside the book token grammar, or for book
+    `sandbox` on a store that is not a temp copy (`sandbox_store_refusal`)."""
     book = settings.paper.book_id if book_id is None else book_id
     check_book_id(book)
+    refusal = sandbox_store_refusal(settings, book)
+    if refusal is not None:
+        raise ValueError(refusal)
     return book
 
 

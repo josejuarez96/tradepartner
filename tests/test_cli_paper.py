@@ -2651,3 +2651,20 @@ def test_paper_reconcile_accepts_a_breaks_row_as_a_cash_base_status(
     out = _paper(clock, factory, "reconcile")
     assert out.exit_code == code, out.output
     assert f"paper reconcile: {status}" in out.output
+
+
+def test_book_sandbox_on_a_store_outside_temp_is_refused_before_any_broker(
+    clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: Any
+) -> None:
+    """The sandbox book runs on a temp COPY of the store only (owner 2026-10-28):
+    with the temp root moved away from the store, every book command refuses it
+    (exit 2, nothing built, store untouched) and names the rule, no secret."""
+    store = Path(_settings().store.path)
+    before = _sha256(store)
+    elsewhere = Path(tmp_path_factory.mktemp("elsewhere")).resolve()
+    monkeypatch.setattr("tradepartner.execution.lock._temp_roots", lambda: {elsewhere})
+    out = _paper(clock, factory, "start", "--hypothesis", "h1", "--book", "sandbox")
+    assert out.exit_code != 0
+    assert "runs only on a temp copy of the store" in out.output
+    assert factory.clocks == []
+    assert _sha256(store) == before
