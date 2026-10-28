@@ -1,3 +1,4 @@
-- T296: Lab runs promoted hypotheses within the frozen in-sample window, with quiet scheduling, sweep time budgets and auto-refresh (#2449).
+task: T296 (PR #2471)
+- T296 the Lab runs a promoted hypothesis, takes a sweep time budget and refreshes its status card (#2449).
 ### Added
-- The Lab can run a promoted hypothesis safely, set a sweep time budget, and refresh run status automatically (#2449).
+- The Lab runs a promoted hypothesis inside the allowed window, takes an optional sweep time budget and refreshes the run status on its own (#2449).
