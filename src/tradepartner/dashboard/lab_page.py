@@ -585,7 +585,10 @@ def _result_reading(
             f"{_number(report.sr_star_annual)}."
         )
     if report.verdicts is None:
-        st.write(f"Sweep {report.state}; the rule has no decision until it is complete.")
+        if report.state == "complete":
+            st.write(f"Sweep {report.state}; all variants failed terminally — sweep retire.")
+        else:
+            st.write(f"Sweep {report.state}; the rule has no decision until it is complete.")
     else:
         verdict = report.verdicts
         st.write(
@@ -600,10 +603,10 @@ def _result_reading(
             f"{'met' if verdict.retire_below_met else 'not met'}."
         )
         next_step = (
-            "sweep promote"
-            if verdict.promote_at_least_met
-            else "sweep retire"
+            "sweep retire"
             if verdict.retire_below_met
+            else "sweep promote"
+            if verdict.promote_at_least_met
             else "review without promotion"
         )
         st.write(
