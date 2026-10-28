@@ -3500,3 +3500,49 @@ def test_events_sec_forms_keys_sit_outside_every_frozen_canonical_set() -> None:
         "momentum", hypothesis.frozen_params(parsed, flipped), date(2019, 11, 29)
     )
     assert Settings(_env_file=None).master.issuer_forms[-2:] == ["25", "25-NSE"]
+
+
+_BULK_KEYS = {
+    "events.sec_forms_backfill_start",
+    "events.form4_xml_price_below",
+    "events.form4_zero_price_xml_codes",
+    "events.form4_bulk_order_sample",
+    "events.sec_forms_max_requests",
+}
+
+
+def test_events_form4_bulk_keys_default_as_the_amendment_says() -> None:
+    """T305b (#2498): backfill from 2016-01-01, under $1 goes to XML, a 0.00 price only
+    for P and S, 20 order-sample accessions, 40,000 requests per run."""
+    from datetime import date
+    from decimal import Decimal
+
+    e = Settings(_env_file=None).events
+    assert e.sec_forms_backfill_start == date(2016, 1, 1)
+    assert e.form4_xml_price_below == Decimal("1.00")
+    assert e.form4_zero_price_xml_codes == ["P", "S"]
+    assert e.form4_bulk_order_sample == 20
+    assert e.sec_forms_max_requests == 40_000
+
+
+def test_events_form4_bulk_keys_refuse_nonsense() -> None:
+    for bad in (
+        {"form4_xml_price_below": 0},
+        {"form4_xml_price_below": -1},
+        {"form4_bulk_order_sample": 0},
+        {"sec_forms_max_requests": 0},
+        {"form4_zero_price_xml_codes": [" "]},
+        {"sec_forms_backfill_start": "not-a-date"},
+    ):
+        with pytest.raises(ValueError):
+            Settings(_env_file=None, events=bad)
+    # An empty code list is allowed: no code sends a 0.00 price to XML.
+    assert Settings(_env_file=None, events={"form4_zero_price_xml_codes": []}).events
+
+
+def test_events_form4_bulk_keys_sit_outside_every_frozen_canonical_set() -> None:
+    from tradepartner.backtest import frozen, hypothesis
+
+    assert _BULK_KEYS.isdisjoint(hypothesis.frozen_keys())
+    assert _BULK_KEYS.isdisjoint(frozen.CANONICAL_EXCLUDED_KEYS)
+    assert _BULK_KEYS.isdisjoint({key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS})

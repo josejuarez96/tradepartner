@@ -892,6 +892,71 @@ def fsn_validators(
     return response.headers
 
 
+# --- SEC insider transactions data sets (T305b, #2498) -----------------------
+
+_INSIDER_BULK_URL = (
+    "https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/"
+    "{quarter}_form345.zip"
+)
+_INSIDER_QUARTER_RE = re.compile(r"\d{4}q[1-4]")
+
+
+def _validate_insider_quarter(quarter: str) -> None:
+    """`quarter` must be `YYYYqN` before it reaches a URL or a path under
+    `edgar.cache_dir` (as `_validate_fsn_period` guards FSN periods)."""
+    if not _INSIDER_QUARTER_RE.fullmatch(quarter):
+        raise InvalidFilingReferenceError(f"not an insider data-set quarter: {quarter!r}")
+
+
+def insider_bulk_zip(
+    quarter: str, *, settings: Settings | None = None, client: httpx.Client | None = None
+) -> tuple[Path, httpx.Headers] | None:
+    """Stream one filing quarter's Insider Transactions Data Set (`YYYYqN`, the DERA
+    `<quarter>_form345.zip`) into `edgar.cache_dir/insider/`; returns its path and
+    response headers (`Last-Modified`, `Content-Length`), through
+    `_stream_to_with_headers`: the shared limiter, the one retry policy and the zip
+    CRC check. A 404 returns `None`: the quarter is not published (the caller decides
+    whether that is the current quarter or a missing one). Any other failure raises."""
+    _validate_insider_quarter(quarter)
+    settings = settings or get_settings()
+    dest = Path(settings.edgar.cache_dir) / "insider" / f"{quarter}_form345.zip"
+    try:
+        return _stream_to_with_headers(
+            _INSIDER_BULK_URL.format(quarter=quarter), dest, settings=settings, client=client
+        )
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code == httpx.codes.NOT_FOUND:
+            return None
+        raise
+
+
+def insider_bulk_validators(
+    quarter: str, *, settings: Settings | None = None, client: httpx.Client | None = None
+) -> httpx.Headers | None:
+    """An unconditional `HEAD` of one quarter's insider zip behind the same limiter,
+    retry and `User-Agent`; returns the validators (`Last-Modified`, `ETag`,
+    `Content-Length`) the cached zip is compared with, or `None` on a 404."""
+    _validate_insider_quarter(quarter)
+    settings = settings or get_settings()
+    url = _INSIDER_BULK_URL.format(quarter=quarter)
+    headers = {"User-Agent": _user_agent(settings)}
+    http_client = (
+        client if client is not None else _default_client(settings.edgar.request_timeout_seconds)
+    )
+    timeout = settings.edgar.request_timeout_seconds
+    try:
+        response = _execute_with_retry(
+            lambda: http_client.request("HEAD", url, headers=headers, timeout=timeout),
+            settings=settings,
+            min_interval_seconds=1.0 / settings.edgar.requests_per_second,
+        )
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code == httpx.codes.NOT_FOUND:
+            return None
+        raise
+    return response.headers
+
+
 def bulk_submissions(
     *, settings: Settings | None = None, client: httpx.Client | None = None
 ) -> Path:
