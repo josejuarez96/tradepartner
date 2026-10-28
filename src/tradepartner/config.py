@@ -289,6 +289,10 @@ class IngestConfig(_ClosedConfig):
     # owner-visible line once this many sessions have closed since the last `ok` daily
     # EDGAR ingest run. Display only: paper keeps trading on the stale master.
     edgar_max_age_sessions: int = Field(default=3, ge=1, le=20)
+    # #2454: free GB the store's disk must have for an ingest to start; below it the
+    # ingest refuses before any write (clear message, exit 1, a /fail heartbeat for the
+    # scheduled shape). 0 turns the check off. Run-time, same default as the paper floor.
+    min_free_disk_gb: float = Field(default=5.0, ge=0)
 
 
 class RatesConfig(_ClosedConfig):
@@ -1070,6 +1074,10 @@ class HealthConfig(_ClosedConfig):
     """
 
     min_session_rows_share: float = Field(default=0.0, ge=0.0, le=1.0)
+    # #2454: `health` warns once the store's disk has less free space than this many GB,
+    # well above `ingest.min_free_disk_gb` and `paper.min_free_disk_gb` so there is time
+    # to act. 0 turns the warning off.
+    warn_free_disk_gb: float = Field(default=15.0, ge=0)
 
 
 class BorrowConfig(_ClosedConfig):
