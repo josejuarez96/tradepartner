@@ -90,6 +90,7 @@ from tradepartner.dashboard import (
     book_page,
     health_page,
     home_page,
+    lab_page,
     ops_page,
     override_page,
     performance_page,
@@ -210,6 +211,7 @@ _DETAILS = "Details"
 _TOP_PAGES: dict[str, _PageRenderer] = {
     "Home": home_page.render,
     "Research": lambda conn, _settings: research_page.render(conn),
+    "Lab": lab_page.render,
     "Books": book_page.render,
 }
 

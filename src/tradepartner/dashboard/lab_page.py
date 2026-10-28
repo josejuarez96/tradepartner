@@ -1,0 +1,418 @@
+"""Sweep registration and run controls for the Lab (T294, B10 path).
+
+Render uses the shell's read-only connection. Write actions are Streamlit button
+callbacks, after that connection closes; Run reopens one short read-only connection
+to recheck the registry before taking the slot and spawning the desk command.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import duckdb
+import streamlit as st
+
+from tradepartner import calendar
+from tradepartner.backtest import quiet, results
+from tradepartner.config import Settings
+from tradepartner.dashboard import (
+    book_actions,
+    lab_child,
+    lab_files,
+    lab_register,
+    lab_run,
+    lab_verdict,
+)
+from tradepartner.dashboard.lab_files import FileKind, GitState, LabFile, RegistryState
+from tradepartner.store import lab_queries, lab_registry, lab_schema
+
+DOCS_ROOT = Path(__file__).resolve().parents[3] / "docs"
+_ET = ZoneInfo("America/New_York")
+_GRACE_SECONDS = 30.0
+_OUTCOME = "lab_action_outcome"
+_NOTE = "lab_run_note"
+
+
+def _safe_scrub(text: str, settings: Settings) -> str:
+    """Show text only after both page and live secrets are removed."""
+    try:
+        live = book_actions.live_settings()
+    except (ValueError, OSError):
+        return "Text hidden because the live configuration could not be read."
+    return lab_child.scrub(text, settings, live)
+
+
+def _slot_path(settings: Settings) -> Path:
+    return Path(f"{settings.store.path}.lab-run.json")
+
+
+def register_refusal(file: LabFile) -> str | None:
+    """Why this file has no Register action."""
+    if file.kind is FileKind.HYPOTHESIS:
+        return "Hypothesis registration is desk only, through sweep promote."
+    if file.git_state is GitState.NOT_MERGED:
+        return "This file is not merged, so it cannot be registered here."
+    if file.registry_state is RegistryState.UNREADABLE:
+        return file.message or "The file cannot be read."
+    if file.message and "not initialised" in file.message:
+        return file.message
+    return None
+
+
+def busy_sentence(busy: lab_run.Busy) -> str:
+    """One card sentence naming all slot blockers."""
+    return "Run busy: " + "; ".join(busy.reasons)
+
+
+def status_sentence(status: lab_run.SlotStatus) -> str:
+    """The slot's state in owner-facing words."""
+    if status.state == "running" and status.record is not None:
+        return f"The {status.record.kind} {status.record.slug} is running."
+    return {
+        "idle": "No Lab run is active.",
+        "starting": "Another tab is starting a run; check again.",
+        "running": "The run is running.",
+        "ended": "The run ended.",
+        "stale": "A prior run slot is stale; check the registry before another run.",
+    }[status.state]
+
+
+def _on_register(settings: Settings, name: str) -> None:
+    """Register in a callback, after the render connection has closed."""
+    try:
+        st.session_state[_OUTCOME] = lab_register.register(
+            settings, DOCS_ROOT, FileKind.SWEEP, name
+        )
+    except (lab_register.RegisterRefused, OSError, duckdb.Error) as exc:
+        st.session_state[_OUTCOME] = _safe_scrub(str(exc), settings)
+
+
+def _on_run(
+    settings: Settings,
+    slug: str,
+    expected_sweep_id: int,
+    expected_k: int,
+    expected_excess: results.NextTrialCost,
+    expected_raw: results.NextTrialCost,
+) -> None:
+    """Recheck and start one sweep, with one short callback-only store read."""
+    from tradepartner.dashboard.app import StoreUnavailable, open_store_connection
+
+    now = datetime.now(UTC)
+    with open_store_connection(settings) as store:
+        if isinstance(store, StoreUnavailable):
+            st.session_state[_OUTCOME] = f"Store {store.state.value}; nothing ran."
+            return
+        try:
+            sweep = lab_registry.sweep_by_slug(store, slug)
+            if sweep is None:
+                st.session_state[_OUTCOME] = f"{slug} is not registered; nothing ran."
+                return
+            if sweep.sweep_id != expected_sweep_id:
+                st.session_state[_OUTCOME] = (
+                    "Registration changed since this dialog opened; nothing ran."
+                )
+                return
+            plan = lab_queries.plan_run(store, sweep.sweep_id)
+            if not plan.variants:
+                st.session_state[_OUTCOME] = "There are no variants to run; nothing ran."
+                return
+            k = len(plan.variants)
+            rules = lab_registry.family_rules(store, sweep.family)
+            floor = rules.min_sharpe_variance_annual if rules else 0.0
+            excess = results.next_trial_cost(
+                store, sweep.family, basis="excess_spy", added=k, floor=floor
+            )
+            raw = results.next_trial_cost(store, sweep.family, basis="raw", added=k, floor=floor)
+            if (k, excess, raw) != (expected_k, expected_excess, expected_raw):
+                st.session_state[_OUTCOME] = (
+                    "Trial cost changed since this dialog opened; nothing ran. "
+                    "Review the new quote."
+                )
+                return
+            flying = lab_verdict.in_flight(store, now, settings)
+            row = store.execute(
+                "SELECT COALESCE(MAX(sweep_run_id), 0) FROM sweep_runs WHERE sweep_id = ?",
+                [sweep.sweep_id],
+            ).fetchone()
+            baseline = int(row[0]) if row is not None else 0
+        except (
+            duckdb.Error,
+            ValueError,
+            lab_schema.LabNotInitialised,
+            lab_registry.LabRegistryError,
+        ) as exc:
+            st.session_state[_OUTCOME] = f"The run check failed: {_safe_scrub(str(exc), settings)}"
+            return
+        note = st.session_state.get(_NOTE) or None
+        _start_run(
+            settings,
+            slug,
+            note,
+            now,
+            tuple(i.slug for i in flying.running),
+            baseline,
+            store,
+        )
+
+
+def _start_run(
+    settings: Settings,
+    slug: str,
+    note: str | None,
+    now: datetime,
+    in_flight: tuple[str, ...],
+    baseline: int,
+    conn: duckdb.DuckDBPyConnection | None = None,
+) -> None:
+    """Take the slot and spawn; abandon the reservation on any pre-spawn refusal."""
+    slot = _slot_path(settings)
+    taken = lab_run.take(slot, in_flight=in_flight, now=now, grace_seconds=_GRACE_SECONDS)
+    if isinstance(taken, lab_run.Busy):
+        st.session_state[_OUTCOME] = busy_sentence(taken)
+        return
+    if conn is None:
+        lab_run.abandon(slot, taken)
+        st.session_state[_OUTCOME] = "The registry read is unavailable; nothing ran."
+        return
+    try:
+        spawned = lab_child.spawn(settings, conn, lab_child.LabKind.SWEEP_RUN, slug, note=note)
+    except (lab_child.LabRefused, OSError, duckdb.Error, ValueError) as exc:
+        lab_run.abandon(slot, taken)
+        st.session_state[_OUTCOME] = _safe_scrub(str(exc), settings)
+        return
+    try:
+        lab_run.record(
+            slot,
+            spawned.child,
+            kind="sweep_run",
+            slug=slug,
+            baseline=baseline,
+            started_at=now,
+            log_path=spawned.log_path,
+            taken=taken,
+        )
+        lab_run.watch(slot, spawned.child)
+    except (lab_run.SlotLost, OSError, ValueError) as exc:
+        st.session_state[_OUTCOME] = (
+            "The child may be running, but its slot could not be recorded. "
+            "Do not start another run; inspect the registry and desk log. "
+            + _safe_scrub(str(exc), settings)
+        )
+        return
+    st.session_state[_OUTCOME] = f"Started {slug}; check the status card for progress."
+
+
+def _show_outcome() -> None:
+    outcome = st.session_state.pop(_OUTCOME, None)
+    if isinstance(outcome, str):
+        st.warning(outcome)
+    elif isinstance(outcome, lab_register.RegisterResult):
+        (st.success if outcome.status in {"created", "unchanged"} else st.warning)(
+            f"Registration {outcome.status}: {outcome.output}"
+        )
+
+
+@st.dialog("Register sweep")
+def _register_dialog(settings: Settings, file: LabFile, preview: lab_files.SweepPreview) -> None:
+    st.write(f"{preview.title} · {preview.family} · {len(preview.variants)} variants")
+    st.write(
+        f"In sample from {preview.in_sample_start}; holdout {preview.holdout_start} to "
+        f"{preview.holdout_end} ({preview.holdout_kind})."
+    )
+    st.write(
+        f"Selection statistic ⓘ {preview.selection_statistic}; promote at least "
+        f"{preview.promote_at_least}; retire below {preview.retire_below}."
+    )
+    for variant in preview.variants:
+        st.write(f"Variant {variant.index}: {variant.variant_params}")
+    st.info(preview.registration_effect)
+    st.write(
+        f"From here these parameters cannot change (grid hash {preview.grid_sha256}). "
+        "A change is a new registration with new variants, each counted against "
+        "the family's budget."
+    )
+    st.button("Confirm Register", on_click=_on_register, args=(settings, file.name), type="primary")
+
+
+def _cost_line(cost: results.NextTrialCost) -> str:
+    basis = "excess" if cost.basis == "excess_spy" else "raw"
+    note = f" {cost.note}." if cost.note else ""
+    floor = " Variance is floored at the family's minimum." if cost.floored else ""
+    return f"{basis} basis ⓘ: SR* ⓘ {cost.sr_star_now:.3f} to {cost.sr_star_next:.3f}.{floor}{note}"
+
+
+@st.dialog("Run sweep")
+def _run_dialog(
+    settings: Settings,
+    slug: str,
+    sweep_id: int,
+    family: str,
+    k: int,
+    excess: results.NextTrialCost,
+    raw: results.NextTrialCost,
+    predicted_seconds: float,
+) -> None:
+    st.write(
+        f"This runs up to {k} variants, each a counted trial ⓘ of the `{family}` family: "
+        f"N ⓘ goes from {excess.n_now} to at most {excess.n_next}."
+    )
+    st.write(
+        "SR* ⓘ, the expected maximum Sharpe of N unskilled trials, rises at today's "
+        "variance; every later deflated Sharpe ratio ⓘ in this family is deflated "
+        "against it. A refused trial is logged and does not count."
+    )
+    st.write(_cost_line(excess))
+    st.write(_cost_line(raw))
+    st.caption(f"Predicted duration: about {predicted_seconds / 60:.1f} minutes.")
+    st.text_area("Optional note", key=_NOTE, max_chars=settings.ui.max_reason_chars)
+    st.button(
+        "Confirm Run",
+        on_click=_on_run,
+        args=(settings, slug, sweep_id, k, excess, raw),
+        type="primary",
+    )
+
+
+def _status(conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime) -> bool:
+    slot = _slot_path(settings)
+    state = lab_run.status(
+        slot,
+        scrub=lambda text: _safe_scrub(text, settings),
+        now=now,
+        grace_seconds=_GRACE_SECONDS,
+        tail_bytes=lab_child.TAIL_BYTES,
+    )
+    if state.state == "ended":
+        lab_run.release(slot)
+    st.subheader("Run status")
+    st.write(status_sentence(state))
+    if state.state == "running":
+        intervals = quiet.quiet_intervals_around(
+            now,
+            settings,
+            paper_window_open=True,
+            session_open=lambda day: (
+                calendar.session_open(day) if calendar.is_session(day) else None
+            ),
+        )
+        waiting = next(
+            (interval for interval in intervals if interval.start <= now < interval.end), None
+        )
+        if waiting is not None:
+            st.info(
+                "Queued: sweep run is waiting for the quiet interval to end at "
+                f"{waiting.end.astimezone(_ET):%I:%M %p} ET."
+            )
+    if state.log_tail:
+        st.code(state.log_tail, language=None)
+    st.button("Check again")
+    last = state.record if state.state == "ended" else lab_run.read_last(slot)
+    if last is not None and last.baseline is not None:
+        verdict = lab_verdict.verdict(
+            conn,
+            kind="sweep_run",
+            slug=last.slug,
+            baseline_id=last.baseline,
+            exit_code=last.exit_code,
+            output=state.log_tail,
+            now=now,
+        )
+        st.write(_safe_scrub(f"Verdict ⓘ: {verdict.outcome}. {verdict.text}", settings))
+        st.caption(
+            "The engine's pre-registered sweep rule compares the selected variant's "
+            "deflated Sharpe ratio with its promote and retire thresholds."
+        )
+        if verdict.message:
+            st.write(_safe_scrub(verdict.message, settings))
+        for variant in verdict.variants:
+            line = f"Variant {variant.variant_index} ({variant.slug}): {variant.status}"
+            if variant.message:
+                line += f" — {_safe_scrub(variant.message, settings)}"
+            st.write(line)
+        if verdict.verdicts is not None:
+            rules = verdict.verdicts
+            st.write(
+                f"promote at least {rules.promote_at_least}: "
+                f"{'met' if rules.promote_at_least_met else 'not met'}; "
+                f"retire below {rules.retire_below}: "
+                f"{'met' if rules.retire_below_met else 'not met'}"
+            )
+        if verdict.verdicts_error:
+            st.warning(_safe_scrub(verdict.verdicts_error, settings))
+    try:
+        flying = lab_verdict.in_flight(conn, now, settings)
+    except (duckdb.Error, ValueError, lab_schema.LabNotInitialised):
+        st.warning("The registry's in-flight state could not be read.")
+        return True
+    for item in flying.orphans:
+        st.warning(f"Orphan {item.slug}: {item.remedy}")
+    if flying.running:
+        st.info("Run busy: " + ", ".join(item.slug for item in flying.running))
+    return state.state in {"starting", "running"} or flying.busy
+
+
+def render(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    """Draw the Lab from the shell's read-only connection."""
+    st.header("Lab")
+    _show_outcome()
+    now = datetime.now(UTC)
+    busy = _status(conn, settings, now)
+    files = lab_files.list_files(conn, settings, DOCS_ROOT)
+    if not files:
+        st.info("No sweep or hypothesis files are available.")
+    for file in files:
+        with st.container(border=True):
+            st.write(
+                f"{file.name} · {file.kind.value} · {file.registry_state.value} · "
+                f"{file.git_state.value}"
+            )
+            refusal = register_refusal(file)
+            if refusal:
+                st.caption(refusal)
+            elif file.kind is FileKind.SWEEP:
+                try:
+                    preview = lab_files.preview(file.path, settings, conn)
+                except lab_files.LabFileRefused as exc:
+                    st.warning(_safe_scrub(str(exc), settings))
+                    continue
+                if st.button("Register", key=f"register_{file.name}"):
+                    _register_dialog(settings, file, preview)
+            if (
+                file.kind is not FileKind.SWEEP
+                or file.registry_state is not RegistryState.REGISTERED
+            ):
+                continue
+            if busy:
+                st.caption("Run is unavailable while the Lab slot is busy.")
+                continue
+            sweep = lab_registry.sweep_by_slug(conn, file.slug)
+            if sweep is None:
+                continue
+            plan = lab_queries.plan_run(conn, sweep.sweep_id)
+            k = len(plan.variants)
+            if not k:
+                st.caption("No variants are awaiting a plain run.")
+                continue
+            rules = lab_registry.family_rules(conn, sweep.family)
+            floor = rules.min_sharpe_variance_annual if rules else 0.0
+            excess = results.next_trial_cost(
+                conn, sweep.family, basis="excess_spy", added=k, floor=floor
+            )
+            raw = results.next_trial_cost(conn, sweep.family, basis="raw", added=k, floor=floor)
+            predicted = sum(
+                settings.lab.seconds_per_variant_default[p.cadence] for p in plan.variants
+            )
+            if st.button("Run", key=f"run_{file.name}"):
+                _run_dialog(
+                    settings,
+                    sweep.slug,
+                    sweep.sweep_id,
+                    sweep.family,
+                    k,
+                    excess,
+                    raw,
+                    predicted,
+                )
