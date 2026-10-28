@@ -154,7 +154,10 @@ a false `no_window` (#1261, T132).
   also `not_executed`); `reconciliation`, when its own `reconcile_now` for
   the clock's session (`reconcile_run.command_session`) with the frozen risk
   section raises a mismatch (the row is written and the switch engaged with
-  source `fault`, as `paper reconcile` does) or ends in any status but `ok`;
+  source `fault`, as `paper reconcile` does) or ends in any status but `ok` or
+  `breaks`; `open_breaks`, when it ends `breaks` while a material break is open
+  (a safe `breaks` row, one with only immaterial breaks, is the ledger's base
+  like `ok`, T282d, #2266 item 10);
   `not_flat`, naming each short holding (the system is long-only) and each
   name the ledger holds above its residue
   (`plan.residue`) by more than the frozen
@@ -267,7 +270,7 @@ from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.outcomes import NOT_EXECUTED, filled_outcome_kind
 from tradepartner.execution.plan import current_listings
-from tradepartner.execution.reconcile import OK
+from tradepartner.execution.reconcile import BREAKS, OK
 from tradepartner.execution.reconcile_run import (
     command_session,
     explanations_as_of,
@@ -297,6 +300,7 @@ from tradepartner.store.journal import (
     kill_switch_events_for,
     latest_window,
     non_terminal_orders,
+    open_breaks,
     open_window,
     order_events_for,
     orders_for,
@@ -969,6 +973,8 @@ NOT_FLAT = "not_flat"
 OVERRIDE = "override"
 MULTIPLE_OPEN_WINDOWS = "multiple_open_windows"
 OPEN_ORDERS = "open_orders"
+#: `stop` refuses while an open material break remains (T282d, #2266 item 10).
+OPEN_BREAKS = "open_breaks"
 
 REQUESTED = "requested"
 CLOSED = "closed"
@@ -1159,6 +1165,12 @@ def _origin(parts: dict[str, float], security_id: str) -> str:
     raise ValueError(f"the residue of {security_id} has no part with an origin")
 
 
+def _is_base(row: Any) -> bool:
+    """Whether a reconciliation row states the ledger's cash: an `ok` row, or a
+    `breaks` row that carries its base cash (T282b, T282c's `run._is_cash_base`)."""
+    return row.status == OK or (row.status == BREAKS and row.broker_cash is not None)
+
+
 def _residues(
     connect: Connect, window: PaperWindowRow, session: date, frozen: RiskConfig
 ) -> dict[str, dict[str, Any]]:
@@ -1171,7 +1183,7 @@ def _residues(
         fills = fills_for(conn, window_id=window_id)
         orders = orders_for(conn, window_id=window_id)
         adjustments = adjustments_for(conn, window_id)
-        ok_rows = [r for r in reconciliations_for(conn, window_id) if r.status == OK]
+        ok_rows = [r for r in reconciliations_for(conn, window_id) if _is_base(r)]
         decided = decisions_for(conn, window_id)
         marks = positions_daily_for(conn, window_id)
         runs = [r.run for r in runs_for(conn, window_id)]
@@ -1350,13 +1362,24 @@ def stop(
             raise WindowCommandRefused(RECONCILIATION, message) from exc
         with connect() as conn:
             reconciliation = _latest_reconciliation(conn, window_id)
-        if result.status != OK:
+        if result.status not in (OK, BREAKS):
             waiting = ", ".join((*result.lagging_ids, *result.pending_ids)) or "none listed"
             raise WindowCommandRefused(
                 RECONCILIATION,
                 f"reconciliation {reconciliation.reconciliation_id} is {result.status}, "
                 f"not ok (orders: {waiting})",
             )
+        if result.status == BREAKS:
+            with connect() as conn:
+                material = [b for b in open_breaks(conn, window_id) if b.material]
+            if material:
+                names = ", ".join(sorted(b.break_id for b in material))
+                raise WindowCommandRefused(
+                    OPEN_BREAKS,
+                    f"reconciliation {reconciliation.reconciliation_id} leaves "
+                    f"{len(material)} open material break(s), true them up or let the "
+                    f"broker clear them first: {names}",
+                )
 
         residues = _residues(connect, window, session, frozen)
         residues_json = json.dumps(residues, sort_keys=True, allow_nan=False)
@@ -1831,7 +1854,7 @@ def _ledger_view(
             f"the clock reading {as_of.isoformat()} is before journal row stamped "
             f"{max(stamps).isoformat()}"
         )
-    stated = [r for r in reconciliations if r.status == OK and _ny_date(r.at) <= session]
+    stated = [r for r in reconciliations if _is_base(r) and _ny_date(r.at) <= session]
     ledger = from_journal(
         fills,
         orders,

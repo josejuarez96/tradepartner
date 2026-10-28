@@ -1223,17 +1223,25 @@ def test_the_run_ledger_reads_a_breaks_row_as_its_cash_base(env: Env) -> None:
     assert ledger.cash == pytest.approx(90_000.0)
 
 
-def test_a_run_on_a_breaks_reconciliation_still_halts_and_submits_no_order(env: Env) -> None:
+def test_a_run_on_a_breaks_reconciliation_restricts_the_name_and_ends_ok(
+    env: Env, exits_done: list[object]
+) -> None:
+    """T282d (#2266 item 7) removes T282c's temporary halt: a `breaks` reconciliation
+    writes its row and event, engages no switch and the run ends `ok`."""
     window = _marked(env)
     _hold_spy(env, window)
     env.fake.activities.append(CashActivity("open-credit", "MA", MON, "executed", 30.0, "SPY"))
     env.fake._cash += Decimal(30)
-    with pytest.raises(ReconciliationError):
-        env.run(_at(TUE))
+
+    outcome = env.run(_at(TUE))
+
+    assert outcome.status == "ok"
     assert env.query("SELECT status FROM reconciliations ORDER BY reconciliation_id")[-1] == (
         "breaks",
     )
-    assert env.results()[env.latest_run()][0] == "halted"
+    assert env.results()[env.latest_run()][0] == "ok"
+    assert env.query("SELECT state FROM kill_switch") == []
+    assert env.query("SELECT event, security_id FROM reconcile_breaks")[0] == ("opened", SPY)
     # The one submit is `_hold_spy`'s seed order, placed before the run.
     assert env.broker_methods().count("submit") == 1
 

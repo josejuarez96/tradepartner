@@ -5,17 +5,24 @@ break cap stops the book. Pure `decisions_from` cases first, then the wrapper.""
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
+
 import duckdb
 import pytest
 
 from tradepartner.adapters.broker import OrderRequest, Position, Side
-from tradepartner.config import RiskConfig
+from tradepartner.backtest.hypothesis import frozen_params_of
+from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ReconciliationError
 from tradepartner.execution.plan import decisions_from
-from tradepartner.store import journal
-from tradepartner.store.journal import ReconcileBreakRow
+from tradepartner.store import journal, registry
+from tradepartner.store.db import open_for_write
+from tradepartner.store.journal import AdjustmentRow, PaperWindowRow, ReconcileBreakRow
 
 from . import test_planning as planning_tests
+from . import test_run_core as run_core
 from .test_decisions_from import (
     COSTS,
     FROZEN,
@@ -49,7 +56,7 @@ from .test_wrapper_phases import (
     _submits,
 )
 
-pytest_plugins = ("execution.test_wrapper_phases",)
+pytest_plugins = ("execution.test_wrapper_phases", "execution.test_run_core")
 
 env_planning = planning_tests.env
 
@@ -478,3 +485,99 @@ def test_a_cover_the_open_cover_leaves_nothing_for_is_skipped(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     assert _cover(env, alerter_conn, monkeypatch, broker=-3.0, open_cover=4.0) == []
+
+
+# --- reconciliation to order: the break no longer halts the book (T282d) ---------------
+
+
+class _Ticking(run_core.Clock):
+    """A clock that moves a second on every reading, as a real one does."""
+
+    def __call__(self) -> datetime:
+        now = self.now
+        self.now = now + timedelta(seconds=1)
+        return now
+
+
+@pytest.fixture
+def breaks_env(env: run_core.Env, tmp_path: Path) -> tuple[run_core.Env, PaperWindowRow]:
+    """The rebalance window of `run_core.rebalance_env`, with three names' worth of
+    room under the position limits (a third of the book each)."""
+    params = Settings(
+        _env_file=None,
+        strategy={"top_fraction": 0.5},
+        holdout={
+            "start": run_core.HOLDOUT_START.isoformat(),
+            "end": run_core.HOLDOUT_END.isoformat(),
+        },
+    )
+    elsewhere = Settings(_env_file=None, store={"path": str(tmp_path / "elsewhere.duckdb")})
+    with open_for_write(env.settings) as conn:
+        hypothesis = registry.register_hypothesis(
+            conn,
+            slug="h-wrapper-breaks",
+            family="momentum",
+            title="restricted name end to end",
+            doc_path="docs/hypotheses/h-wrapper-breaks.md",
+            doc_sha256="0" * 64,
+            params=frozen_params_of(params, family="momentum"),
+            in_sample_start=run_core.IN_SAMPLE_START,
+            holdout_start=run_core.HOLDOUT_START,
+            holdout_end=run_core.HOLDOUT_END,
+            registered_by="test",
+            settings=elsewhere,
+        )
+    window = env.window(
+        first=run_core.T_0,
+        started=run_core._at(run_core.T_0, 12),
+        hypothesis_id=hypothesis.hypothesis_id,
+        frozen=RiskConfig(max_position_weight=0.5, max_order_notional_fraction=0.5),
+    )
+    return env, window
+
+
+def test_a_held_name_break_restricts_it_and_the_run_trades_on(
+    breaks_env: tuple[run_core.Env, PaperWindowRow],
+) -> None:
+    """Spec item 16, "Restriction and halts": a held name the ledger and the broker
+    disagree on gives a `breaks` row, one `opened` event, no `kill_switch` row and a run
+    ending `ok`. The name's order is sized to min(|ledger|, |broker|), the others trade."""
+    env, window = breaks_env
+    env.ingest(run_core._at(run_core.T_0, 21))
+    env.clock.now = run_core._at(run_core.T_0, 13)
+    env.fake.submit(OrderRequest("seed-1", "SPY", Side.BUY, quantity=3.0))
+    env.fake.simulate_fill("seed-1")
+    env.fake._cash += Decimal(3 * run_core.PRICE)  # the seed's cost is outside the ledger
+    env.append(
+        AdjustmentRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            session=run_core.T_0,
+            kind="spinoff_receipt",
+            security_id=run_core.SPY,
+            quantity=2.0,
+            known_at=run_core._at(run_core.T_0, 13),
+            ingested_at=run_core._at(run_core.T_0, 13),
+        )
+    )
+
+    env.clock.__class__ = _Ticking
+    # The reference prices the fill band reads, by broker symbol.
+    prices = {"SPY": 238.5, "DUALB": 28.56, "SPFT": 23.9, "TRNS": 25.32}
+    env.fake._price_of = lambda symbol: prices.get(symbol, run_core.PRICE)
+    env.fake._auto_fill = True  # the run's own orders fill at once; the seed is booked
+
+    outcome = env.run(run_core._at(run_core.F_0))
+
+    assert outcome.status == "ok"
+    assert env.query("SELECT status FROM reconciliations ORDER BY reconciliation_id") == [
+        ("breaks",),
+        ("breaks",),
+    ]
+    events = env.query("SELECT event, security_id FROM reconcile_breaks ORDER BY event_id")
+    assert [e for e, _ in events] == ["opened", "observed"]  # one break, seen again after
+    assert {sid for _, sid in events} == {run_core.SPY}
+    assert env.query("SELECT state FROM kill_switch") == []
+    orders = env.query("SELECT symbol, side, quantity FROM orders ORDER BY symbol")
+    # SPY: the ledger holds 2, the broker 3: the sell is at most min(2, 3). The others buy.
+    assert ("SPY", "sell", 2.0) in orders
+    assert {symbol for symbol, side, _ in orders if side == "buy"} == {"DUALB", "SPFT", "TRNS"}

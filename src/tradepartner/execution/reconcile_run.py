@@ -28,11 +28,18 @@ it decides and raises on a mismatch. A run's steps 4 and 8, `paper reconcile`,
     equals the base's is counted in it, never twice). Only an `ok` result books
     `adjustments` rows; a `breaks` row books none (that comes in a later task,
     T282b).
-5. On `mismatch` or `breaks` (or an open finding still unresolved), raise
-    `ReconciliationError` after the row and its events are committed, so the
-    caller engages the kill switch and no order is submitted: the run's halt
-    path (T60) for steps 4 and 8, `reconcile_command` for `paper reconcile`.
-    Halting on `breaks` is T281's temporary safety rule, which T282d removes.
+5. On `mismatch` (or a name-level difference beside a lagging or unresolved
+    order, or a one-shot finding still unresolved), raise `ReconciliationError`
+    after the row and its events are committed, so the caller engages the kill
+    switch and no order is submitted: the run's halt path (T60) for steps 4 and
+    8, `reconcile_command` for `paper reconcile`. A `breaks` result no longer
+    halts (T282d, paper spec amendment 2026-10-26, #2266, item 7): it restricts
+    its names and the rest of the book trades. The one exception is the
+    book-level `break_cap` (item 3): when the events of this reconciliation leave
+    more open material breaks than `risk.max_open_breaks`, or their sizes above
+    `risk.max_open_break_share` of the ledger equity (an `unknown_symbol` break
+    counts, though it restricts no name), the chunk is redone as a `mismatch`
+    carrying a `break_cap` mismatch, and the book halts.
     If the write fails on a `mismatch` or `breaks` result, a halt for a break,
     or while any break is open, the row rolls back with its events and
     `ReconciliationError` is raised too.
@@ -169,6 +176,7 @@ from tradepartner.adapters.broker import (
     Position,
     UnknownOrderError,
 )
+from tradepartner.backtest.frozen import frozen_values
 from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, LimitBreachError, ReconciliationError
@@ -256,6 +264,22 @@ _BREAK_RISK_KEYS = (
     "break_cause_lookback_sessions",
 )
 _FAULT_TYPE = ReconciliationError.__name__
+
+
+class _BookHalt(Exception):
+    """Raised inside the write chunk when a reconciliation's events call for a
+    book-level halt (item 3's `break_cap`, or a restricted name in a `long_short`
+    book); the chunk rolls back and is redone as a `mismatch` of `kind`."""
+
+    def __init__(self, kind: str, detail: str) -> None:
+        super().__init__(detail)
+        self.kind = kind
+
+
+#: A restricted name in a `long_short` book (the owner's decision of 2026-10-28 on
+#: PR #2386, question 2, fallback): the plan cannot yet be built around a signed
+#: kept weight, so the book halts with this message instead.
+RESTRICTED_LONG_SHORT = "restricted_long_short"
 
 
 class NoWindowError(RuntimeError):
@@ -1479,6 +1503,16 @@ def _explanation_json(
     return json.dumps(payload, sort_keys=True, allow_nan=False)
 
 
+def _signed_book(conn: duckdb.DuckDBPyConnection, window: PaperWindowRow) -> bool:
+    """Whether the window's hypothesis freezes `portfolio.side = long_short`. A
+    hypothesis that cannot be read counts as signed (fail closed)."""
+    try:
+        hypothesis = registry.get_hypothesis_by_id(conn, window.hypothesis_id)
+    except registry.RegistryError:
+        return True
+    return str(frozen_values(hypothesis).get("portfolio.side", "long_only")) == "long_short"
+
+
 def _break_evidence(
     conn: duckdb.DuckDBPyConnection,
     cut: datetime,
@@ -1899,7 +1933,7 @@ def reconcile_now(
         )
     if retained_finding and result.status == OK:
         # A one-shot finding stays open until the owner true-up; a clean broker
-        # read cannot release the temporary T281 whole-book halt.
+        # read does not close it.
         result = replace(result, status=BREAKS, broker_cash=None, adjustments=())
     if result.status == BREAKS:
         # A name cash break remains outside the ledger until an adjustment
@@ -1926,9 +1960,16 @@ def reconcile_now(
         result_payload = json.dumps(payload, sort_keys=True, allow_nan=False)
     else:
         result_payload = result.mismatches_json
-    halt_for_break = retained_finding or any(
-        break_rules.is_name_level(m.kind) for m in result.mismatches
+    # A `breaks` result restricts names and halts nothing (T282d). A name-level
+    # difference beside a pending or lagging order keeps T281's halt: nothing has
+    # released it.
+    halt_for_break = result.status != BREAKS and (
+        retained_finding or any(break_rules.is_name_level(m.kind) for m in result.mismatches)
     )
+    try:
+        cap_equity = ledger.equity(explanations.reference_prices)
+    except (KeyError, ValueError):
+        cap_equity = 0.0  # the cap fails closed without a valid ledger mark
     last_completed = max(
         (row.known_at for row in state.rows if row.status in (OK, BREAKS)),
         default=window.started_at,
@@ -1937,94 +1978,138 @@ def reconcile_now(
         fill.security_id for fill in state.fills if fill.fill.known_at > last_completed
     } | {order.security_id for order in orders}
 
-    with journal() as conn:
-        stamp = _read_clock(clock)
-        if stamp < now:
-            raise ClockError(f"clock went back from {now.isoformat()} to {stamp.isoformat()}")
-        reconciliation_id = append(
-            conn,
-            ReconciliationRow(
-                window_id=window_id,
-                run_id=run_id,
-                at=stamp,
-                status=result.status,
-                broker_cash=result.broker_cash,
-                mismatches_json=result_payload,
-                book_id=window.book_id,
-                known_at=stamp,
-                ingested_at=stamp,
-            ),
-        )
-        if reconciliation_id is None:
-            raise RuntimeError("reconciliation append returned no id")
-        activity_sessions = {a.activity_id: a.date for a in activities}
-        adjustment_ids: list[int] = []
-        for adjustment in result.adjustments:
-            # A row keyed by a broker activity (a booked `fee_cash`, a `cash_in_lieu`,
-            # a delisting's late cash) is stated on the activity's own date, not the
-            # reconciliation session, so the ledger applies it from the session it
-            # belongs to (#1583, T183; #411).
-            fee_date = (
-                activity_sessions.get(adjustment.broker_activity_id)
-                if adjustment.broker_activity_id is not None
-                else None
-            )
-            adjustment_id = append(
+    def commit(res: Reconciliation, payload: str, *, judge_cap: bool) -> int:
+        """Write the row, adjustments and break events of `res` in one chunk and
+        return the reconciliation id. With `judge_cap`, raise `_BookHalt` inside
+        the chunk (so it rolls back) when the open material breaks pass the cap."""
+        with journal() as conn:
+            stamp = _read_clock(clock)
+            if stamp < now:
+                raise ClockError(f"clock went back from {now.isoformat()} to {stamp.isoformat()}")
+            reconciliation_id = append(
                 conn,
-                AdjustmentRow(
+                ReconciliationRow(
                     window_id=window_id,
                     run_id=run_id,
-                    session=fee_date if fee_date is not None else session,
-                    kind=adjustment.kind,
-                    security_id=adjustment.security_id,
-                    quantity=adjustment.quantity,
-                    cash=adjustment.cash,
-                    explanation_json=_explanation_json(
-                        adjustment.explanation,
-                        reconciliation_id,
-                        adjustment.merger_id,
-                        adjustment.merger_terms,
-                    ),
+                    at=stamp,
+                    status=res.status,
+                    broker_cash=res.broker_cash,
+                    mismatches_json=payload,
                     book_id=window.book_id,
-                    broker_activity_id=adjustment.broker_activity_id,
                     known_at=stamp,
                     ingested_at=stamp,
                 ),
             )
-            if adjustment_id is not None:
-                adjustment_ids.append(adjustment_id)
-        try:
-            _write_break_events(
-                conn,
-                window=window,
-                reconciliation_id=reconciliation_id,
-                result=result,
-                session=session,
-                stamp=stamp,
-                frozen=frozen,
-                ledger=ledger,
-                positions=positions,
-                explanations=explanations,
-                activities=activities,
-                evidence=evidence,
-                own_trading=own_trading,
-                adjustment_ids=adjustment_ids,
-            )
-        except Exception as exc:
-            if result.status in (MISMATCH, BREAKS) or halt_for_break or open_now:
-                # The row rolls back with its events. The command catches this
-                # fault and engages the independent kill-switch write.
-                raise ReconciliationError(
-                    f"reconciliation of window {window_id}: "
-                    f"break events could not be written: {exc}"
-                ) from exc
-            raise
+            if reconciliation_id is None:
+                raise RuntimeError("reconciliation append returned no id")
+            activity_sessions = {a.activity_id: a.date for a in activities}
+            adjustment_ids: list[int] = []
+            for adjustment in res.adjustments:
+                # A row keyed by a broker activity (a booked `fee_cash`, a `cash_in_lieu`,
+                # a delisting's late cash) is stated on the activity's own date, not the
+                # reconciliation session, so the ledger applies it from the session it
+                # belongs to (#1583, T183; #411).
+                fee_date = (
+                    activity_sessions.get(adjustment.broker_activity_id)
+                    if adjustment.broker_activity_id is not None
+                    else None
+                )
+                adjustment_id = append(
+                    conn,
+                    AdjustmentRow(
+                        window_id=window_id,
+                        run_id=run_id,
+                        session=fee_date if fee_date is not None else session,
+                        kind=adjustment.kind,
+                        security_id=adjustment.security_id,
+                        quantity=adjustment.quantity,
+                        cash=adjustment.cash,
+                        explanation_json=_explanation_json(
+                            adjustment.explanation,
+                            reconciliation_id,
+                            adjustment.merger_id,
+                            adjustment.merger_terms,
+                        ),
+                        book_id=window.book_id,
+                        broker_activity_id=adjustment.broker_activity_id,
+                        known_at=stamp,
+                        ingested_at=stamp,
+                    ),
+                )
+                if adjustment_id is not None:
+                    adjustment_ids.append(adjustment_id)
+            try:
+                _write_break_events(
+                    conn,
+                    window=window,
+                    reconciliation_id=reconciliation_id,
+                    result=res,
+                    session=session,
+                    stamp=stamp,
+                    frozen=frozen,
+                    ledger=ledger,
+                    positions=positions,
+                    explanations=explanations,
+                    activities=activities,
+                    evidence=evidence,
+                    own_trading=own_trading,
+                    adjustment_ids=adjustment_ids,
+                )
+            except Exception as exc:
+                if res.status in (MISMATCH, BREAKS) or halt_for_break or open_now:
+                    # The row rolls back with its events. The command catches this
+                    # fault and engages the independent kill-switch write.
+                    raise ReconciliationError(
+                        f"reconciliation of window {window_id}: "
+                        f"break events could not be written: {exc}"
+                    ) from exc
+                raise
+            if judge_cap:
+                still_open = open_breaks(conn, window_id)
+                if break_rules.cap_exceeded(still_open, ledger_equity=cap_equity, risk=frozen):
+                    counted = sum(e.material for e in still_open)
+                    raise _BookHalt(
+                        "break_cap",
+                        f"window {window_id} has {counted} open material break(s), past "
+                        f"risk.max_open_breaks={frozen.max_open_breaks} or "
+                        f"risk.max_open_break_share={frozen.max_open_break_share} of the "
+                        "ledger equity",
+                    )
+                held = sorted(break_rules.restricted_names(still_open))
+                if held and _signed_book(conn, window):
+                    raise _BookHalt(
+                        RESTRICTED_LONG_SHORT,
+                        f"window {window_id} is a long_short book with restricted name(s) "
+                        f"{', '.join(held)}: the plan cannot yet be built around a signed "
+                        "kept weight, so the book halts until the owner trues the break up",
+                    )
+            return reconciliation_id
 
-    if result.status in (MISMATCH, BREAKS) or halt_for_break:
+    try:
+        reconciliation_id = commit(result, result_payload, judge_cap=result.status != MISMATCH)
+    except _BookHalt as cap:
+        # Item 3: past the cap the book halts. The first chunk rolled back; redo it
+        # as the book-level `mismatch`, its events written as before.
+        result = replace(
+            result,
+            status=MISMATCH,
+            broker_cash=None,
+            adjustments=(),
+            mismatches=(*result.mismatches, Mismatch(cap.kind, str(cap))),
+        )
+        reconciliation_id = commit(result, result.mismatches_json, judge_cap=False)
+
+    if result.status == MISMATCH or halt_for_break:
         kinds = ", ".join(sorted({m.kind for m in result.mismatches})) or "open finding"
+        # The book-level halts of this module say why, in the message the owner reads.
+        why = "".join(
+            f"; {m.detail}"
+            for m in result.mismatches
+            if m.kind in ("break_cap", RESTRICTED_LONG_SHORT)
+        )
         raise ReconciliationError(
             f"reconciliation {reconciliation_id} of window {window_id} on "
-            f"{session.isoformat()}: {kinds}"
+            f"{session.isoformat()}: {kinds}{why}"
         )
     return result
 
