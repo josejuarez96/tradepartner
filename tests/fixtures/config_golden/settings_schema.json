@@ -802,6 +802,35 @@
       "additionalProperties": false,
       "description": "SEC ownership event forms (plan T305, spec amendment 2026-10-28, #2435).\n\n`sec_forms` is the list of 13D and Form 4 form names kept as events; it is NOT\n`master.issuer_forms` (an identity rule, in the frozen canonical set) and nothing\nhere reaches master construction, the universe, prices, signals or any trial input.\nAll three keys sit outside the frozen set (`tests/test_config.py` pins it).\n`sec_forms_enabled` gates collection (off: no event fetch, no row write);\n`sec_forms_read_enabled` gates the as-of reads and stays off until the owner records\na clean week of `sec_forms_clock_suspect = 0` (#1382). Never empty.",
       "properties": {
+        "form4_bulk_order_sample": {
+          "default": 20,
+          "exclusiveMinimum": 0,
+          "title": "Form4 Bulk Order Sample",
+          "type": "integer"
+        },
+        "form4_xml_price_below": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "default": "1.00",
+          "title": "Form4 Xml Price Below"
+        },
+        "form4_zero_price_xml_codes": {
+          "items": {
+            "minLength": 1,
+            "pattern": "^\\S+$",
+            "type": "string"
+          },
+          "title": "Form4 Zero Price Xml Codes",
+          "type": "array"
+        },
         "sec_forms": {
           "items": {
             "minLength": 1,
@@ -812,10 +841,22 @@
           "title": "Sec Forms",
           "type": "array"
         },
+        "sec_forms_backfill_start": {
+          "default": "2016-01-01",
+          "format": "date",
+          "title": "Sec Forms Backfill Start",
+          "type": "string"
+        },
         "sec_forms_enabled": {
           "default": false,
           "title": "Sec Forms Enabled",
           "type": "boolean"
+        },
+        "sec_forms_max_requests": {
+          "default": 40000,
+          "exclusiveMinimum": 0,
+          "title": "Sec Forms Max Requests",
+          "type": "integer"
         },
         "sec_forms_read_enabled": {
           "default": false,

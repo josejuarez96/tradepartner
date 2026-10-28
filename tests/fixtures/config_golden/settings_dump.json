@@ -255,6 +255,12 @@
     "title_fallback": true
   },
   "events": {
+    "form4_bulk_order_sample": 20,
+    "form4_xml_price_below": "1.00",
+    "form4_zero_price_xml_codes": [
+      "P",
+      "S"
+    ],
     "sec_forms": [
       "SC 13D",
       "SC 13D/A",
@@ -263,7 +269,9 @@
       "4",
       "4/A"
     ],
+    "sec_forms_backfill_start": "2016-01-01",
     "sec_forms_enabled": false,
+    "sec_forms_max_requests": 40000,
     "sec_forms_read_enabled": false
   },
   "execution": {
