@@ -987,7 +987,7 @@ def parse_form4(xml_text: str) -> Form4Parse:
     rows are not read. A transaction lacking a code, date, acquired/disposed flag,
     share count or direct/indirect flag, or carrying a present-but-unparseable number
     or date, is skipped and counted, and the filing's other rows stand. Raises
-    `ValueError` for no `issuerCik` no reporting owner with an `rptOwnerCik`, or one
+    `ValueError` for no `issuerCik`, no reporting owner with an `rptOwnerCik`, or one
     owner CIK listed twice (identity missing or ambiguous)."""
     root = _xml_root(xml_text)
     issuer = _child_text(root, "issuer/issuerCik")
