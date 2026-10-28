@@ -472,7 +472,7 @@
   "research": {
     "claude": {
       "anthropic_version": "2023-06-01",
-      "api_base_url": "https://api.anthropic.com",
+      "api_base_url": "https://api.<VENDOR-HOST>",
       "chars_per_token": 3.5,
       "effort": "low",
       "max_attempts": 3,
@@ -487,7 +487,7 @@
     "data_dir": "<ROOT>/data/research",
     "experiments_dir": "docs/experiments",
     "labeling": {
-      "api_base_url": "https://api.typesafe.ai/v1",
+      "api_base_url": "https://api.<VENDOR-HOST>/v1",
       "chars_per_token": 2.5,
       "context_after_days": 20,
       "context_before_days": 45,

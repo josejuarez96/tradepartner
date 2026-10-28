@@ -1718,7 +1718,7 @@
           "type": "string"
         },
         "api_base_url": {
-          "default": "https://api.anthropic.com",
+          "default": "https://api.<VENDOR-HOST>",
           "title": "Api Base Url",
           "type": "string"
         },
@@ -1834,7 +1834,7 @@
       "description": "Research labeling, pilot A (docs/specs/research-labeling.md req 7 and the\namendment 2026-10-06's config table, which drops `estimate_margin` and\n`batch_max_usd`).\n\n`api_base_url` is the vendor's API root, read only by `research/models.py`\n(ADR 0013 point 3 (c)); it must be `https`. `price_usd_per_million_input_tokens`\nis the price snapshot (vendor Models page, 2026-10-05). `chars_per_token` is the\npre-call token estimate's divisor (E9: 4 ran 1.5 to 1.7x low).\n`max_packet_tokens` is a refusal, never a truncation rule. The three `*_max_chars`\nare the per-document cuts of C2's packets; the three `*_days` windows are\ncalendar days around the Form 25's filing date; `eightk_items` is the 8-K item\npriority order. `max_attempts` counts the first send: only HTTP 429, 529 and a\nconnection error before any byte was sent are retried (req 7).",
       "properties": {
         "api_base_url": {
-          "default": "https://api.typesafe.ai/v1",
+          "default": "https://api.<VENDOR-HOST>/v1",
           "title": "Api Base Url",
           "type": "string"
         },

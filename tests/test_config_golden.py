@@ -53,8 +53,18 @@ def _golden_hint(name: str) -> str:
     )
 
 
+#: `tests/test_llm_boundary.py` allows the vendor hosts under `tests/` only in named files,
+#: so a golden holds a placeholder for them; the comparison masks `actual` the same way.
+_VENDOR_HOST = re.compile(r"typesafe\.ai|anthropic\.com", re.IGNORECASE)
+
+
+def _mask(actual: Any) -> Any:
+    return json.loads(_VENDOR_HOST.sub("<VENDOR-HOST>", json.dumps(actual)))
+
+
 def _check_golden(name: str, actual: Any) -> None:
     """Compare `actual` with `fixtures/config_golden/<name>.json`, or rewrite it."""
+    actual = _mask(actual)
     path = GOLDEN_DIR / f"{name}.json"
     if _UPDATING:
         GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
@@ -257,7 +267,7 @@ def test_synthetic_env_from_example_loads_to_the_default_dump(tmp_path: Path) ->
         settings = Settings(_env_file=env_file)
     except Exception as exc:  # the message must not carry a secret; it names the file
         pytest.fail(f"the synthetic .env from .env.example no longer loads: {type(exc).__name__}")
-    loaded = _scrub_root(settings.model_dump(mode="json"))
+    loaded = _mask(_scrub_root(settings.model_dump(mode="json")))
     assert _without_secrets(loaded) == _without_secrets(golden), _golden_hint("settings_dump")
     # The dummies landed on their own fields (secrets aside from the dump comparison).
     assert settings.alpaca_api_key is not None
