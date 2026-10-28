@@ -290,6 +290,14 @@ def _validate_study(study: object, path: Path, budget: int, ci_level: float) -> 
         "beta_min_bars",
     ):
         _study_positive_int(f"study.{key}", study[key], path)
+    if study["min_volume_bars"] > study["volume_lookback"]:
+        raise ExperimentFileError(
+            f"{path}: study.min_volume_bars must not exceed study.volume_lookback"
+        )
+    if study["beta_min_bars"] > study["beta_lookback"]:
+        raise ExperimentFileError(
+            f"{path}: study.beta_min_bars must not exceed study.beta_lookback"
+        )
     for key in ("price_floor", "volume_floor", "z"):
         _study_number(f"study.{key}", study[key], path, positive=key == "z")
     if abs(float(study["z"]) - NormalDist().inv_cdf(ci_level)) > 0.001:
