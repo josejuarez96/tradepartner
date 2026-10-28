@@ -1246,3 +1246,34 @@ def test_a_fill_journaled_after_a_true_up_on_its_session_is_not_overwritten() ->
 
     assert disposals == []
     assert sum(lot.quantity for lot in lot_list) == pytest.approx(15.01)
+
+
+def test_a_fill_between_two_true_ups_of_one_session_is_counted_once() -> None:
+    """Steps 4 and 8 both reconcile on one session: true-up to 10.01, a buy of 5,
+    then a second true-up to 15.01 (its broker read holds the buy). Ordered by
+    their stamps the lots total 15.01, not 20.01."""
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303)
+    book.adjust(
+        "auto_true_up", D0304, "SEC_X", quantity=0.01, explanation={"broker_quantity": 10.01}
+    )
+    book.trade("buy", 5, 40.0, D0304)
+    late = book.fills[-1]
+    book.fills[-1] = OrderedFill(
+        FillRow(**{**late.fill.__dict__, "known_at": session_close(D0304) + timedelta(hours=1)}),
+        late.side,
+        late.security_id,
+        late.symbol,
+        late.window_id,
+        late.run_id,
+    )
+    second = book.adjust(
+        "auto_true_up", D0304, "SEC_X", quantity=0.0, explanation={"broker_quantity": 15.01}
+    )
+    book.adjustments[-1] = AdjustmentRow(
+        **{**second.__dict__, "known_at": session_close(D0304) + timedelta(hours=2)}
+    )
+
+    lot_list, _, _ = book.run(D0304)
+
+    assert sum(lot.quantity for lot in lot_list) == pytest.approx(15.01)

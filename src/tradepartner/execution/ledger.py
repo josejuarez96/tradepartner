@@ -121,8 +121,7 @@ _REPLAY_FILL_RANK = "2_fill"
 _REPLAY_ADJUSTMENT_RANK = "3_adjustment"
 #: A true-up states its name after every other row of its session; a fill
 #: journaled after it (the broker's figure did not hold it) follows it.
-_REPLAY_TRUE_UP_RANK = "4_true_up"
-_REPLAY_LATE_FILL_RANK = "5_late_fill"
+_REPLAY_TRUE_UP_RANK = "4_true_up_and_late_fill"
 
 
 def _finite(value: float, what: str) -> float:
@@ -381,6 +380,10 @@ def from_journal(
         for ex_date, ratio in rows:
             _record(ex_date, _REPLAY_SPLIT_RANK, "split", name, _split_ratio(ratio))
 
+    # A true-up, and any fill journaled after one on its session, replay
+    # together in the order they were stamped: a true-up's absolute quantity
+    # holds every fill stamped before it and none stamped after.
+    ordered: list[tuple[datetime, int, int, date, str, str, Fraction]] = []
     seen_fills: set[int] = set()
     fills_since_base = 0
     for fill in fills:
@@ -400,28 +403,28 @@ def from_journal(
             and a.known_at < row.known_at
             for a in adjustments
         )
-        _record(
-            stated_on,
-            _REPLAY_LATE_FILL_RANK if late else _REPLAY_FILL_RANK,
-            kind,
-            fill.security_id,
-            sign * _exact(row.quantity),
-        )
+        if late:
+            ordered.append(
+                (
+                    row.known_at,
+                    1,
+                    row.fill_id or 0,
+                    stated_on,
+                    kind,
+                    fill.security_id,
+                    sign * _exact(row.quantity),
+                )
+            )
+        else:
+            _record(
+                stated_on, _REPLAY_FILL_RANK, kind, fill.security_id, sign * _exact(row.quantity)
+            )
         if after_base(row.known_at):
             cash -= sign * row.quantity * row.price
             fills_since_base += 1
 
     seen_adjustments: set[int] = set()
-    # True-ups replay in the order they were stamped, then written, whatever
-    # order the caller listed them in.
-    for adjustment in sorted(
-        adjustments,
-        key=lambda a: (
-            (a.kind in TRUE_UP_KINDS, a.known_at, a.adjustment_id or 0)
-            if a.kind in TRUE_UP_KINDS
-            else (False, _STAMP_FLOOR, 0)
-        ),
-    ):
+    for adjustment in adjustments:
         _check_window("adjustment", adjustment.window_id, window_id)
         _check_adjustment(adjustment, seen_adjustments)
         if adjustment.session > through:
@@ -443,12 +446,16 @@ def from_journal(
             # never applied on top.
             absolute = true_up_quantity(adjustment)
             if absolute is not None:
-                _record(
-                    adjustment.session,
-                    order,
-                    _TRUE_UP,
-                    adjustment.security_id,
-                    _exact(absolute),
+                ordered.append(
+                    (
+                        adjustment.known_at,
+                        0,
+                        adjustment.adjustment_id or 0,
+                        adjustment.session,
+                        _TRUE_UP,
+                        adjustment.security_id,
+                        _exact(absolute),
+                    )
                 )
         elif adjustment.quantity is not None and adjustment.security_id is not None:
             _record(
@@ -460,6 +467,9 @@ def from_journal(
             )
         if adjustment.cash is not None and after_base(adjustment.known_at):
             cash += adjustment.cash
+
+    for _known_at, _kind_rank, _id, day, kind, security_id, amount in sorted(ordered):
+        _record(day, _REPLAY_TRUE_UP_RANK, kind, security_id, amount)
 
     for _day, _order, _seq, kind, security_id, amount in sorted(replay):
         if kind == "split":

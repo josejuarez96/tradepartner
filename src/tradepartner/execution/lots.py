@@ -118,7 +118,6 @@ _RANK_ADJUSTMENT = _RANK_FILL + 1
 # A true-up states its name after every other row of its session, and a fill
 # journaled after it (the broker's figure did not hold it) comes after the true-up.
 _RANK_TRUE_UP = _RANK_ADJUSTMENT + 1
-_RANK_LATE_FILL = _RANK_TRUE_UP + 1
 
 _SPLIT = "split"
 _CASH_IN_LIEU = "cash_in_lieu"
@@ -921,8 +920,8 @@ def _events(
             (
                 (
                     day,
-                    _RANK_LATE_FILL if after_true_up else _RANK_FILL,
-                    trade.trade_at,
+                    _RANK_TRUE_UP if after_true_up else _RANK_FILL,
+                    trade.known_at if after_true_up else trade.trade_at,
                     trade.order_key,
                 ),
                 partial(_Ledger.trade, trade=trade),

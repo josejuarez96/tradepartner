@@ -1694,7 +1694,7 @@ def _auto_accepts(
         ):
             continue
         accepted[name] = _AutoAccept(
-            size=size,
+            size=judged,
             prior=prior,
             ledger_quantity=ledger_quantity,
             broker_quantity=broker_quantity,
@@ -2039,6 +2039,8 @@ def _write_break_events(
                     row,
                     event="auto_accepted",
                     material=False,
+                    # The gross size, so offsetting cash counts toward the bound.
+                    dollar_size=accept.size,
                     adjustment_ids_json=json.dumps(booked),
                 ),
             )
