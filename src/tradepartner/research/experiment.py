@@ -35,6 +35,7 @@ sealed set returns the existing row) are `store.research.register_dataset`'s job
 from __future__ import annotations
 
 import json
+import math
 import re
 import tomllib
 from collections.abc import Iterable, Mapping, Sequence
@@ -42,6 +43,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
+from statistics import NormalDist
 from typing import Any, Final
 
 import polars as pl
@@ -111,6 +113,53 @@ _OPTIONAL_KEYS: Final = (
     "amends_sha256",
 )
 _ALLOWED_KEYS: Final = frozenset(_REQUIRED_KEYS) | frozenset(_OPTIONAL_KEYS)
+_STUDY_KEYS: Final = frozenset(
+    {
+        "configurations",
+        "horizons",
+        "groups",
+        "peer_group",
+        "entry",
+        "facts_read",
+        "bucket_by",
+        "peer_by",
+        "n_buckets",
+        "min_bucket_events",
+        "price_floor",
+        "volume_floor",
+        "volume_lookback",
+        "min_volume_bars",
+        "shares_stale_days",
+        "shares_fact",
+        "benchmark_security",
+        "peer_window",
+        "min_peers",
+        "near_k",
+        "beta_lookback",
+        "beta_min_bars",
+        "cost_bps",
+        "borrow_bps",
+        "z",
+        "cluster_by",
+        "kill",
+    }
+)
+_KILL_KEYS: Final = frozenset(
+    {
+        "name",
+        "side",
+        "group",
+        "horizon",
+        "readings",
+        "metric",
+        "floor",
+        "t_metric",
+        "t_floor",
+        "t",
+        "cost_bps",
+        "borrow_bps",
+    }
+)
 _DEFAULT_CI_LEVEL: Final = 0.95
 
 _BLOCK_OPEN: Final = re.compile(r"^```toml experiment[ \t]*$", re.MULTILINE)
@@ -164,6 +213,139 @@ class ParsedExperiment:
     doc_sha256: str
     params_json: str
     params_sha256: str
+    study: dict[str, Any] | None = None
+
+
+def _study_number(key: str, value: object, path: Path, *, positive: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ExperimentFileError(f"{path}: {key} must be a finite number")
+    if value < 0 or (positive and value == 0):
+        raise ExperimentFileError(
+            f"{path}: {key} must be {'positive' if positive else 'nonnegative'}"
+        )
+    return float(value)
+
+
+def _study_positive_int(key: str, value: object, path: Path) -> int:
+    result = _require_int(key, value, path)
+    if result < 1:
+        raise ExperimentFileError(f"{path}: {key} must be >= 1")
+    return result
+
+
+def _validate_study(study: object, path: Path, budget: int, ci_level: float) -> dict[str, Any]:
+    if not isinstance(study, dict):
+        raise ExperimentFileError(f"{path}: study must be a table")
+    unknown = set(study) - _STUDY_KEYS
+    if unknown:
+        raise ExperimentFileError(
+            f"{path}: unknown keys: {', '.join(sorted('study.' + k for k in unknown))}"
+        )
+    missing = _STUDY_KEYS - set(study)
+    if missing:
+        raise ExperimentFileError(
+            f"{path}: required keys missing: {', '.join(sorted('study.' + k for k in missing))}"
+        )
+    configurations = _study_positive_int("study.configurations", study["configurations"], path)
+    if configurations > budget:
+        raise ExperimentFileError(f"{path}: study.configurations exceeds budget.configurations")
+    for key in ("groups", "bucket_by", "peer_by", "cluster_by"):
+        values = _require_str_list(f"study.{key}", study[key], path)
+        if len(values) != len(set(values)) or any(not item.strip() for item in values):
+            raise ExperimentFileError(f"{path}: study.{key} must contain unique non-empty values")
+    horizons = study["horizons"]
+    if (
+        not isinstance(horizons, list)
+        or not horizons
+        or any(type(h) is not int or h < 1 for h in horizons)
+        or len(horizons) != len(set(horizons))
+    ):
+        raise ExperimentFileError(f"{path}: study.horizons must be positive integers")
+    groups = study["groups"]
+    peer = _require_str("study.peer_group", study["peer_group"], path)
+    if peer not in groups or len(groups) < 2:
+        raise ExperimentFileError(f"{path}: study.peer_group must name one of at least two groups")
+    for key, choices in (
+        ("entry", ("next_open_after_instant", "next_session_after_date")),
+        ("facts_read", ("event_known_at", "window_end")),
+    ):
+        _require_enum(f"study.{key}", study[key], choices, path)
+    for key, allowed_values in (
+        ("bucket_by", {"quarter", "stratum"}),
+        ("peer_by", {"stratum"}),
+        ("cluster_by", {"event_date", "month", "quarter"}),
+    ):
+        if set(study[key]) - allowed_values:
+            raise ExperimentFileError(f"{path}: study.{key} has unsupported values")
+    for key in (
+        "n_buckets",
+        "min_bucket_events",
+        "volume_lookback",
+        "min_volume_bars",
+        "shares_stale_days",
+        "peer_window",
+        "min_peers",
+        "near_k",
+        "beta_lookback",
+        "beta_min_bars",
+    ):
+        _study_positive_int(f"study.{key}", study[key], path)
+    for key in ("price_floor", "volume_floor", "z"):
+        _study_number(f"study.{key}", study[key], path, positive=key == "z")
+    if abs(float(study["z"]) - NormalDist().inv_cdf(ci_level)) > 0.001:
+        raise ExperimentFileError(f"{path}: study.z must match primary.ci_level")
+    for key in ("shares_fact", "benchmark_security"):
+        _require_str(f"study.{key}", study[key], path)
+    for key in ("cost_bps", "borrow_bps"):
+        values = study[key]
+        if not isinstance(values, list) or not values:
+            raise ExperimentFileError(f"{path}: study.{key} must be a non-empty list")
+        for value in values:
+            _study_number(f"study.{key}", value, path)
+    kills = study["kill"]
+    if not isinstance(kills, list) or not kills:
+        raise ExperimentFileError(f"{path}: study.kill must be a non-empty list")
+    if len(kills) > configurations:
+        raise ExperimentFileError(
+            f"{path}: study.configurations below the number of study.kill lines"
+        )
+    names: set[str] = set()
+    for line in kills:
+        if not isinstance(line, dict):
+            raise ExperimentFileError(f"{path}: study.kill entries must be tables")
+        if set(line) != _KILL_KEYS:
+            raise ExperimentFileError(
+                f"{path}: study.kill keys must be exactly {sorted(_KILL_KEYS)}"
+            )
+        name = _require_str("study.kill.name", line["name"], path)
+        _require_enum("study.kill.side", line["side"], ("long", "short"), path)
+        if name in names:
+            raise ExperimentFileError(f"{path}: duplicate study.kill name {name}")
+        names.add(name)
+        if line["group"] not in groups or line["group"] == peer:
+            raise ExperimentFileError(f"{path}: study.kill.group must name a treated group")
+        if type(line["horizon"]) is not int or line["horizon"] not in horizons:
+            raise ExperimentFileError(f"{path}: study.kill.horizon must name a horizon")
+        readings = _require_str_list("study.kill.readings", line["readings"], path)
+        if set(readings) - {"raw", "beta_adjusted", "size_tight", "size_tight_beta_adjusted"}:
+            raise ExperimentFileError(f"{path}: study.kill.readings names an unavailable reading")
+        for key in ("metric", "t_metric"):
+            _require_enum(f"study.kill.{key}", line[key], ("gross_spread_bp", "net_bp"), path)
+        if line["t"] != "min" and line["t"] not in study["cluster_by"]:
+            raise ExperimentFileError(f"{path}: study.kill.t names an unavailable clustering")
+        for key in ("floor", "t_floor"):
+            value = line[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ExperimentFileError(f"{path}: study.kill.{key} must be finite")
+        for key in ("cost_bps", "borrow_bps"):
+            _study_number(f"study.kill.{key}", line[key], path)
+            if line[key] not in study[key]:
+                raise ExperimentFileError(f"{path}: study.kill.{key} must name a declared line")
+    return study
 
 
 def _flatten(table: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
@@ -332,6 +514,7 @@ def parse_experiment_file(
     except tomllib.TOMLDecodeError as exc:
         raise ExperimentFileError(f"{path}: parameter block is not valid TOML: {exc}") from exc
 
+    study_raw = block.pop("study", None)
     flat = _flatten(block)
     # The spec's two Data / interfaces worked examples used to write `splits = [...]`
     # directly after `[window]`'s `start`/`end` and before the next table header; TOML
@@ -502,6 +685,12 @@ def parse_experiment_file(
         raise ExperimentFileError(
             f"{path}: budget.configurations must be >= 1, got {budget_configurations}"
         )
+    study: dict[str, Any] | None = None
+    if study_raw is not None:
+        if kind != "return":
+            raise ExperimentFileError(f"{path}: study requires kind = 'return'")
+        study = _validate_study(study_raw, path, budget_configurations, primary_ci_level)
+        flat["study"] = study
     stop_rule = _require_str("budget.stop_rule", flat["budget.stop_rule"], path)
     expected_effect = _require_str("budget.expected_effect", flat["budget.expected_effect"], path)
 
@@ -562,6 +751,7 @@ def parse_experiment_file(
         doc_sha256=sha256(raw).hexdigest(),
         params_json=canonical_experiment_json(normalised),
         params_sha256=experiment_sha256(normalised),
+        study=study,
     )
 
 
