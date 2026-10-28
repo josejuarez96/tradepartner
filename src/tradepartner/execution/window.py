@@ -1367,7 +1367,7 @@ def stop(
             raise WindowCommandRefused(
                 RECONCILIATION,
                 f"reconciliation {reconciliation.reconciliation_id} is {result.status}, "
-                f"not ok (orders: {waiting})",
+                f"not ok or breaks (orders: {waiting})",
             )
         if result.status == BREAKS:
             with connect() as conn:

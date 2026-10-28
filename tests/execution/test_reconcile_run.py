@@ -537,6 +537,9 @@ def _reconcile(
     )
 
 
+_REAL_SIGNED_BOOK = reconcile_run._signed_book  # before the autouse patch below
+
+
 @pytest.fixture(autouse=True)
 def _long_only_book(monkeypatch: pytest.MonkeyPatch) -> None:
     """These windows name no registered hypothesis; read each as `long_only`. The
@@ -5081,3 +5084,15 @@ def test_an_unlisted_pair_on_a_name_not_held_is_no_finding(
     found = _explain_at_cut(journal_settings, open_window)
     assert found.dividends == {}
     assert found.dividend_findings == {}
+
+
+def test_signed_book_fails_closed_and_reads_a_registered_long_only_hypothesis(
+    journal_settings: Settings, frozen_window: PaperWindowRow
+) -> None:
+    from execution.test_run_core import registered_hypothesis
+
+    known = replace(frozen_window, hypothesis_id=registered_hypothesis(journal_settings))
+    with open_for_write(journal_settings) as conn:
+        assert _REAL_SIGNED_BOOK(conn, known) is False
+        # No such hypothesis: unreadable reads as signed, so the book halts.
+        assert _REAL_SIGNED_BOOK(conn, replace(frozen_window, hypothesis_id=9_999)) is True

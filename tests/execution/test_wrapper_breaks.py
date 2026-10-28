@@ -13,6 +13,7 @@ import duckdb
 import pytest
 
 from tradepartner.adapters.broker import OrderRequest, Position, Side
+from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ReconciliationError
@@ -56,7 +57,7 @@ from .test_wrapper_phases import (
     _submits,
 )
 
-pytest_plugins = ("execution.test_wrapper_phases", "execution.test_run_core")
+pytest_plugins = ("execution.test_wrapper_phases",)
 
 env_planning = planning_tests.env
 
@@ -500,9 +501,21 @@ class _Ticking(run_core.Clock):
 
 
 @pytest.fixture
-def breaks_env(env: run_core.Env, tmp_path: Path) -> tuple[run_core.Env, PaperWindowRow]:
+def breaks_env(journal_settings: Settings, tmp_path: Path) -> tuple[run_core.Env, PaperWindowRow]:
     """The rebalance window of `run_core.rebalance_env`, with three names' worth of
     room under the position limits (a third of the book each)."""
+    clock = run_core.Clock(run_core._at(run_core.TUE))
+    fake = FakeBroker(
+        assets=FakeBroker.active_assets(
+            "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+        ),
+        clock=clock,
+        price_of=lambda _s: run_core.PRICE,
+        auto_fill=False,
+        cash=run_core.FAKE_CASH,
+        account_id="PA1",
+    )
+    env = run_core.Env(journal_settings, clock, fake)
     params = Settings(
         _env_file=None,
         strategy={"top_fraction": 0.5},

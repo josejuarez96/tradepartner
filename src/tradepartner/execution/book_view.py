@@ -364,10 +364,14 @@ def _reconciliation(
             if isinstance(m, dict)
         }
         count = len(names)
-        noun = "break" if count == 1 else "breaks"
+        what = (
+            "an open finding"
+            if count == 0
+            else f"{count} open {'break' if count == 1 else 'breaks'}"
+        )
         return ReconciliationView(
             False,
-            f"Matches Alpaca as of {stamp} except {count} open {noun}.",
+            f"Matches Alpaca as of {stamp} except {what}.",
             row.at,
             cash_tol,
         )

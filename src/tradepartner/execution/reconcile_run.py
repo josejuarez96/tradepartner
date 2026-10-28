@@ -28,8 +28,8 @@ it decides and raises on a mismatch. A run's steps 4 and 8, `paper reconcile`,
     equals the base's is counted in it, never twice). Only an `ok` result books
     `adjustments` rows; a `breaks` row books none (that comes in a later task,
     T282b).
-5. On `mismatch` (or a name-level difference beside a lagging or unresolved
-    order, or a one-shot finding still unresolved), raise `ReconciliationError`
+5. On `mismatch` (or a name-level difference, or a retained finding, beside a
+    lagging or unresolved order), raise `ReconciliationError`
     after the row and its events are committed, so the caller engages the kill
     switch and no order is submitted: the run's halt path (T60) for steps 4 and
     8, `reconcile_command` for `paper reconcile`. A `breaks` result no longer
