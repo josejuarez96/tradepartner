@@ -106,6 +106,7 @@ SOURCES = ("owner", "fault", "drawdown")
 FAULTED_RUN_STATUSES = frozenset({"halted", "crashed", "failed"})
 _OWNER, _FAULT, _DRAWDOWN = SOURCES
 _RECONCILIATION_OK = "ok"
+_RECONCILIATION_BREAKS = "breaks"
 #: What the writers treat as "the store could not be written".
 _WRITE_ERRORS = (StoreLockedError, JournalNotInitialised, duckdb.Error, OSError)
 
@@ -340,9 +341,18 @@ def release(
         )
         if reconciliation is None:
             raise ReleaseRefused(f"reconciliation {reconciliation_id} is not in window {window_id}")
-        if reconciliation.status != _RECONCILIATION_OK:
+        # A `breaks` row releases (T282d, #2266 item 10) only with its base cash
+        # (T282b): a row without one is not a base, so it is not "reconciled".
+        if not (
+            reconciliation.status == _RECONCILIATION_OK
+            or (
+                reconciliation.status == _RECONCILIATION_BREAKS
+                and reconciliation.broker_cash is not None
+            )
+        ):
             raise ReleaseRefused(
-                f"reconciliation {reconciliation_id} is {reconciliation.status!r}, not ok"
+                f"reconciliation {reconciliation_id} is {reconciliation.status!r}, "
+                f"not ok or breaks with a base cash"
             )
         latest = max(r.reconciliation_id or 0 for r in reconciliations)
         if reconciliation_id != latest:
