@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import fcntl
 import os
-import tempfile
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -55,26 +54,39 @@ class LockHeld(RuntimeError):
 
 
 def _temp_roots() -> set[Path]:
-    """The directories a throwaway store copy may live under: the system temp directory
-    and `/tmp` (macOS keeps them apart), resolved."""
-    return {Path(tempfile.gettempdir()).resolve(), Path("/tmp").resolve()}
+    """The fixed directories a throwaway store copy may live under: `/tmp`, resolved
+    (`/private/tmp` on macOS). Not `tempfile.gettempdir()`: `TMPDIR` must not widen it."""
+    return {Path("/tmp").resolve()}
+
+
+def sandbox_marker(settings: Settings) -> Path:
+    """`<store.path>.sandbox`: the file that marks a store as a sandbox COPY. The runbook
+    creates it beside the copy; the live store never has one."""
+    return Path(f"{settings.store.path}.sandbox")
 
 
 def sandbox_store_refusal(settings: Settings, book_id: str) -> str | None:
-    """Why book `sandbox` may not run on `settings.store.path`, or `None` (owner decision
-    2026-10-28, docs/runbooks/sandbox.md): the sandbox book exists only in a throwaway
-    COPY of the store, so any other book is never refused and the sandbox is refused
-    unless the store file resolves to a path under the system temp directory. The live
-    store (`data/tradepartner.duckdb` of the main checkout) is not there. Pure."""
-    if book_id != SANDBOX_BOOK_ID:
-        return None
+    """Why `book_id` may not run on `settings.store.path`, or `None` (owner decision
+    2026-10-28, docs/runbooks/sandbox.md). Both directions, so the copy (which holds the
+    owner's real books and, with the real keys in `.env`, could trade them) and the live
+    store never mix: book `sandbox` needs a store that resolves under a fixed temp root
+    AND carries the marker; every other book is refused on a marked store. Pure reads."""
     store = Path(settings.store.path).resolve()
-    if any(root in store.parents for root in _temp_roots()):
+    marked = sandbox_marker(settings).is_file()
+    if book_id != SANDBOX_BOOK_ID:
+        if marked:
+            return (
+                f"book {book_id!r} is refused on a sandbox copy of the store (marker "
+                f"{sandbox_marker(settings).name} present): only book {SANDBOX_BOOK_ID!r} "
+                "runs there (docs/runbooks/sandbox.md)"
+            )
+        return None
+    if marked and any(root in store.parents for root in _temp_roots()):
         return None
     return (
         f"book {SANDBOX_BOOK_ID!r} runs only on a temp copy of the store, never the live "
-        f"one: store.path {settings.store.path!r} is not under the system temp directory "
-        "(copy the store, set STORE__PATH to the copy; docs/runbooks/sandbox.md)"
+        f"one: store.path {settings.store.path!r} must be under /tmp and have the marker "
+        "file <store.path>.sandbox (docs/runbooks/sandbox.md)"
     )
 
 

@@ -4568,6 +4568,11 @@ def make_app(
         except (Exception, typer.Exit):
             heartbeat.ping(s, "paper", ok=False)
             raise
+        try:
+            _resolve_book(s, chosen)  # the sandbox/marker refusal, before any run or broker
+        except typer.Exit:
+            heartbeat.ping(s, "paper", ok=False)
+            raise
         if chosen is None:
             try:
                 runs = paper_run.every_book_run(
