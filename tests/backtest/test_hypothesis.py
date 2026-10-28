@@ -2084,6 +2084,7 @@ def _long_short_file(
     weighting: str = "equal",
     band: float = 0.0,
     buffer: float = 0.0,
+    risk_free_source: str = "store",
 ) -> Path:
     """Write a signed variant of the fixture through the normal file parser."""
     rates = [0.0, 300.0] if sensitivity is None else sensitivity
@@ -2101,7 +2102,10 @@ def _long_short_file(
         1,
     )
     text = text.replace(
-        "\n```\n", '\n[portfolio]\nside = "long_short"\nnet_exposure = 0.0\n```\n', 1
+        "\n```\n",
+        f'\n[portfolio]\nside = "long_short"\nnet_exposure = 0.0\n'
+        f"\n[metrics]\nrisk_free_source = {json.dumps(risk_free_source)}\n```\n",
+        1,
     )
     return _copy(tmp_path, text)
 
@@ -2211,6 +2215,60 @@ def test_a_long_only_file_takes_no_new_branch(
         {"portfolio.side": "long_only", "costs.borrow_sensitivity_bps": []},
     ):
         assert hypothesis.long_short_refusal(params) is None
+    _register(conn, _copy(tmp_path), settings)
+    assert _hypotheses(conn) == 1
+
+
+def test_long_short_refused_when_risk_free_source_is_constant(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A long_short file with metrics.risk_free_source = "constant" is refused."""
+    params = {
+        "portfolio.side": "long_short",
+        "strategy.weighting": "equal",
+        "strategy.rebalance_band": 0.0,
+        "strategy.hold_top_fraction": 0.0,
+        "costs.borrow_bps_per_year": 30.0,
+        "costs.borrow_sensitivity_bps": [0.0, 300.0],
+        "metrics.risk_free_source": "constant",
+    }
+    refusal = hypothesis.long_short_refusal(params)
+    assert refusal is not None
+    assert refusal.startswith("refused_risk_free:")
+    path = _long_short_file(tmp_path, risk_free_source="constant")
+    with pytest.raises(HypothesisFileError, match=r"^.*: refused_risk_free:"):
+        _register(conn, path, settings)
+    assert _hypotheses(conn) == 0
+
+
+def test_long_short_with_store_risk_free_source_passes(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A long_short file with metrics.risk_free_source = "store" and otherwise valid
+    params passes (copy of existing passing case with the key added)."""
+    params = {
+        "portfolio.side": "long_short",
+        "strategy.weighting": "equal",
+        "strategy.rebalance_band": 0.0,
+        "strategy.hold_top_fraction": 0.0,
+        "costs.borrow_bps_per_year": 30.0,
+        "costs.borrow_sensitivity_bps": [0.0, 300.0],
+        "metrics.risk_free_source": "store",
+    }
+    assert hypothesis.long_short_refusal(params) is None
+    _register(conn, _long_short_file(tmp_path), settings)
+    assert _hypotheses(conn) == 1
+
+
+def test_long_only_with_constant_risk_free_source_passes(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A long_only file with metrics.risk_free_source = "constant" takes no branch."""
+    params = {
+        "portfolio.side": "long_only",
+        "metrics.risk_free_source": "constant",
+    }
+    assert hypothesis.long_short_refusal(params) is None
     _register(conn, _copy(tmp_path), settings)
     assert _hypotheses(conn) == 1
 

@@ -253,16 +253,22 @@ BORROW_GRID_BPS: Final = (0.0, 30.0, 300.0)
 def long_short_refusal(params: Mapping[str, Any]) -> str | None:
     """Why a `long_short` file's frozen values `params` may not be registered, or None
     (backtest spec amendment #1872, items 1 and 6; T221). The message starts with the
-    refusal's name, `refused_portfolio` or `refused_borrow_rate`. A `long_only` set (the
-    default, or a key absent) takes no branch here.
+    refusal's name: `refused_portfolio`, `refused_borrow_rate`, or `refused_risk_free`.
+    A `long_only` set (the default, or a key absent) takes no branch here.
 
     `refused_portfolio`: the family's weighting is `hold`, `strategy.rebalance_band` is
     non-zero, or `strategy.hold_top_fraction` is not its default (none is specified for
     a signed book). `refused_borrow_rate`: the headline `costs.borrow_bps_per_year` is
     not above 0, or {0, 30, 300} is not inside the headline and
-    `costs.borrow_sensitivity_bps` together."""
+    `costs.borrow_sensitivity_bps` together. `refused_risk_free`: `metrics.risk_free_source`
+    is not `store` (issue #2219)."""
     if params.get("portfolio.side", "long_only") != "long_short":
         return None
+    if params.get("metrics.risk_free_source", "constant") != "store":
+        return (
+            'refused_risk_free: a long_short file uses metrics.risk_free_source = "store" '
+            "(issue #2219)"
+        )
     defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
     if params.get("strategy.weighting", "equal") == "hold":
         return (
