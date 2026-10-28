@@ -9,7 +9,10 @@ import polars as pl
 from tradepartner.calendar import is_session, previous_session, session_close
 from tradepartner.config import Settings
 from tradepartner.store.asof import adjusted_prices_as_of, facts_as_of, prices_as_of
-from tradepartner.store.benchmarks import BenchmarkIdentityError, benchmark_security_ids
+from tradepartner.store.benchmarks import (
+    BenchmarkIdentityError,
+    research_benchmark_security_ids,
+)
 from tradepartner.store.db import open_read_only
 
 
@@ -44,7 +47,7 @@ class EventStudyReader:
             raise ValueError(f"benchmark {symbol!r} starts after the window end")
         with open_read_only(self.settings) as conn:
             try:
-                ids = benchmark_security_ids(
+                ids = research_benchmark_security_ids(
                     conn, [symbol], start=start, through=self.cutoff.date()
                 )
             except BenchmarkIdentityError as exc:

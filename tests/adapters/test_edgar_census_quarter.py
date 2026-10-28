@@ -81,3 +81,16 @@ def test_one_space_between_form_and_name_is_parsed_correctly() -> None:
     accessions, _ciks, unparsed = census_quarter(_HEADER + row)
     assert accessions == {2016: {"SC 13D": {"0000000111-16-000001"}}}
     assert unparsed == 0
+
+
+def test_custom_form_list_without_the_amendment_never_reads_it_as_the_original() -> None:
+    """#2497: with `SCHEDULE 13D/A` unwanted, the offset slice of the padded form column
+    must not truncate it to `SCHEDULE 13D`."""
+    text = (
+        _HEADER
+        + _row("SCHEDULE 13D", "BETA CORP", 666, "0000000666-16-000006")
+        + _row("SCHEDULE 13D/A", "BETA CORP", 666, "0000000666-16-000007")
+    )
+    accessions, _ciks, unparsed = census_quarter(text, ["SCHEDULE 13D"])
+    assert {f: len(a) for f, a in accessions[2016].items()} == {"SCHEDULE 13D": 1}
+    assert unparsed == 0

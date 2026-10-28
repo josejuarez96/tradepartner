@@ -248,3 +248,38 @@ def test_invalid_date_of_original_submission_is_treated_as_none() -> None:
     assert [t.line_no for t in parse.transactions] == [0, 5]
     for t in parse.transactions:
         assert t.date_of_original_submission is None
+
+
+def _one_row_form4(*, transaction_date: str, deemed: str) -> str:
+    return f"""<ownershipDocument>
+  <issuer><issuerCik>0000777777</issuerCik></issuer>
+  <reportingOwner><reportingOwnerId><rptOwnerCik>0000888888</rptOwnerCik></reportingOwnerId>
+  </reportingOwner>
+  <nonDerivativeTable><nonDerivativeTransaction>
+    <securityTitle><value>Common Stock</value></securityTitle>
+    <transactionDate><value>{transaction_date}</value></transactionDate>
+    <deemedExecutionDate><value>{deemed}</value></deemedExecutionDate>
+    <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+    <transactionAmounts>
+      <transactionShares><value>10</value></transactionShares>
+      <transactionAcquiredDisposedCode><value>A</value></transactionAcquiredDisposedCode>
+    </transactionAmounts>
+    <ownershipNature><directOrIndirectOwnership><value>D</value></directOrIndirectOwnership>
+    </ownershipNature>
+  </nonDerivativeTransaction></nonDerivativeTable>
+</ownershipDocument>"""
+
+
+def test_invalid_optional_deemed_execution_date_keeps_the_row_with_none() -> None:
+    """#2514: like dateOfOriginalSubmission, a bad optional date is absent, not a skip."""
+    parse = parse_form4(_one_row_form4(transaction_date="2025-03-03", deemed="2016-99-99"))
+    assert parse.skipped == 0
+    (row,) = parse.transactions
+    assert row.deemed_execution_date is None
+    assert row.transaction_date == date(2025, 3, 3)
+
+
+def test_invalid_required_transaction_date_still_skips_and_counts() -> None:
+    parse = parse_form4(_one_row_form4(transaction_date="2016-99-99", deemed="2025-03-03"))
+    assert parse.skipped == 1
+    assert parse.transactions == ()

@@ -181,3 +181,15 @@ def benchmark_security_ids(
             )
         out[symbol] = sid
     return dict(sorted(out.items()))
+
+
+def research_benchmark_security_ids(
+    conn: duckdb.DuckDBPyConnection,
+    symbols: Sequence[str],
+    *,
+    start: date,
+    through: date | None = None,
+) -> dict[str, str]:
+    """`benchmark_security_ids` for research callers: no `check_only` switch, so a
+    check-only security (RSP) never resolves on the research path (#2526)."""
+    return benchmark_security_ids(conn, symbols, start=start, through=through)
