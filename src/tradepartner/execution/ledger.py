@@ -83,7 +83,7 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from fractions import Fraction
 from zoneinfo import ZoneInfo
 
@@ -98,6 +98,7 @@ from tradepartner.store.schema import (
 )
 
 _NEW_YORK = ZoneInfo("America/New_York")
+_STAMP_FLOOR = datetime.min.replace(tzinfo=UTC)
 _SPLIT = "split"
 _OK = "ok"
 _BUY = "buy"
@@ -118,6 +119,10 @@ _REPLAY_SPLIT_RANK = "0_split"
 _REPLAY_CASH_IN_LIEU_RANK = "1_cash_in_lieu"
 _REPLAY_FILL_RANK = "2_fill"
 _REPLAY_ADJUSTMENT_RANK = "3_adjustment"
+#: A true-up states its name after every other row of its session; a fill
+#: journaled after it (the broker's figure did not hold it) follows it.
+_REPLAY_TRUE_UP_RANK = "4_true_up"
+_REPLAY_LATE_FILL_RANK = "5_late_fill"
 
 
 def _finite(value: float, what: str) -> float:
@@ -387,13 +392,36 @@ def from_journal(
             continue
         sign = 1 if fill.side == _BUY else -1
         kind = _SHORT_FILL if by_id[row.client_order_id].position_side != LONG else "fill"
-        _record(stated_on, _REPLAY_FILL_RANK, kind, fill.security_id, sign * _exact(row.quantity))
+        late = any(
+            a.kind in TRUE_UP_KINDS
+            and a.quantity is not None
+            and a.security_id == fill.security_id
+            and a.session == stated_on
+            and a.known_at < row.known_at
+            for a in adjustments
+        )
+        _record(
+            stated_on,
+            _REPLAY_LATE_FILL_RANK if late else _REPLAY_FILL_RANK,
+            kind,
+            fill.security_id,
+            sign * _exact(row.quantity),
+        )
         if after_base(row.known_at):
             cash -= sign * row.quantity * row.price
             fills_since_base += 1
 
     seen_adjustments: set[int] = set()
-    for adjustment in adjustments:
+    # True-ups replay in the order they were stamped, then written, whatever
+    # order the caller listed them in.
+    for adjustment in sorted(
+        adjustments,
+        key=lambda a: (
+            (a.kind in TRUE_UP_KINDS, a.known_at, a.adjustment_id or 0)
+            if a.kind in TRUE_UP_KINDS
+            else (False, _STAMP_FLOOR, 0)
+        ),
+    ):
         _check_window("adjustment", adjustment.window_id, window_id)
         _check_adjustment(adjustment, seen_adjustments)
         if adjustment.session > through:
@@ -403,6 +431,8 @@ def from_journal(
         order = (
             _REPLAY_CASH_IN_LIEU_RANK
             if adjustment.kind == _CASH_IN_LIEU
+            else _REPLAY_TRUE_UP_RANK
+            if adjustment.kind in TRUE_UP_KINDS
             else _REPLAY_ADJUSTMENT_RANK
         )
         if adjustment.kind in TRUE_UP_KINDS and adjustment.security_id is not None:

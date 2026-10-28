@@ -5428,3 +5428,58 @@ def test_a_deferred_small_break_that_grows_past_materiality_stays_open_and_mater
     assert [
         a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
     ] == []
+
+
+def test_opposite_cash_activities_do_not_net_into_an_immaterial_break(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Safety pass 1: +$30 and -$30 on one name net to $0 but are $60 of activity:
+    the break is judged on the gross and stays open, restricted, unadjusted."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _credit(fake, "plus", 30.0)
+    _credit(fake, "minus", -30.0)
+
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+
+    assert [(e.event, e.material) for e in _events(journal_settings, frozen_window)] == [
+        ("opened", True)
+    ]
+    assert [
+        a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
+    ] == []
+
+
+def test_a_fill_journaled_after_a_true_up_is_not_overwritten_by_it(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Quant/safety pass 1: the true-up is the broker's figure at its read; a fill
+    journaled later on the same session adds to it."""
+    run_id = _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 0.04
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+    fixed_clock.advance(minutes=5)
+    _order(
+        journal_settings,
+        run_id,
+        "tp-after",
+        SPY,
+        "SPY",
+        5.0,
+        at=fixed_clock(),
+    )
+    with open_read_only(journal_settings) as conn:
+        state = _journal_state(conn, frozen_window.window_id or 0, fixed_clock())
+        ledger = _ledger(
+            state,
+            live_actions_as_of(conn, CUT),
+            frozen_window,
+            S,
+            FROZEN.reconcile_quantity_tolerance,
+        )
+    assert ledger.positions[SPY] == pytest.approx(15.04)

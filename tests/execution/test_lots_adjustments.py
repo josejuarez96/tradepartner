@@ -1216,3 +1216,33 @@ def test_a_true_up_on_an_open_short_lot_raises() -> None:
     book.adjust("auto_true_up", D0305, "SEC_X", quantity=1.0, explanation={"broker_quantity": 1.0})
     with pytest.raises(LotLedgerError):
         book.run(D0305)
+
+
+def test_a_fill_journaled_after_a_true_up_on_its_session_is_not_overwritten() -> None:
+    """Safety/quant pass 1: the true-up states the name as of its broker read; a
+    fill stamped after it, on the same session, adds to it. Hand values:
+
+      03-03 buy 10 @ 50
+      03-04 true-up to 10.01 (stamped 03-04 close + 30 min)
+      03-04 buy 5 @ 40 journaled after the true-up -> 15.01 shares, nothing closed
+    """
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303)
+    book.adjust(
+        "auto_true_up", D0304, "SEC_X", quantity=0.01, explanation={"broker_quantity": 10.01}
+    )
+    book.trade("buy", 5, 40.0, D0304)
+    late = book.fills[-1]
+    book.fills[-1] = OrderedFill(
+        FillRow(**{**late.fill.__dict__, "known_at": session_close(D0304) + timedelta(hours=2)}),
+        late.side,
+        late.security_id,
+        late.symbol,
+        late.window_id,
+        late.run_id,
+    )
+
+    lot_list, disposals, _ = book.run(D0304)
+
+    assert disposals == []
+    assert sum(lot.quantity for lot in lot_list) == pytest.approx(15.01)

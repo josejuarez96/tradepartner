@@ -115,6 +115,10 @@ _RANK_SPLIT = 0
 _RANK_CASH_IN_LIEU = 1
 _RANK_FILL = 2
 _RANK_ADJUSTMENT = _RANK_FILL + 1
+# A true-up states its name after every other row of its session, and a fill
+# journaled after it (the broker's figure did not hold it) comes after the true-up.
+_RANK_TRUE_UP = _RANK_ADJUSTMENT + 1
+_RANK_LATE_FILL = _RANK_TRUE_UP + 1
 
 _SPLIT = "split"
 _CASH_IN_LIEU = "cash_in_lieu"
@@ -217,6 +221,7 @@ class _Trade:
     client_order_id: str
     book_id: str  # the order's book (ADR 0015 seam 1, plan T133)
     position_side: str = LONG  # the order's `position_side` (T232)
+    known_at: datetime | None = None  # when its latest fill was journaled
 
 
 @dataclass
@@ -899,12 +904,24 @@ def _events(
                     partial(_Ledger.split, security_id=security_id, ratio=_split_ratio(ratio)),
                 )
             )
+    true_ups = [
+        r
+        for r in adjustments
+        if r.kind in TRUE_UP_KINDS
+        and r.quantity is not None
+        and (through is None or r.session <= through)
+    ]
     for trade in _trades(fills, orders):
+        day = trade.trade_at.astimezone(_EXCHANGE_TZ).date()
+        after_true_up = trade.known_at is not None and any(
+            r.security_id == trade.security_id and r.session == day and r.known_at < trade.known_at
+            for r in true_ups
+        )
         events.append(
             (
                 (
-                    trade.trade_at.astimezone(_EXCHANGE_TZ).date(),
-                    _RANK_FILL,
+                    day,
+                    _RANK_LATE_FILL if after_true_up else _RANK_FILL,
                     trade.trade_at,
                     trade.order_key,
                 ),
@@ -955,8 +972,18 @@ def _events(
             row, removals, receipts, cash_rows, band_cash, late.get(id(row), ())
         )
         if action is not None:
-            rank = _RANK_CASH_IN_LIEU if row.kind == _CASH_IN_LIEU else _RANK_ADJUSTMENT
-            events.append(((row.session, rank, *_adjustment_key(row)), action))
+            if row.kind in TRUE_UP_KINDS:
+                # In the order the positions ledger replays them: by the stamp.
+                key: tuple[object, ...] = (
+                    row.session,
+                    _RANK_TRUE_UP,
+                    row.known_at,
+                    row.adjustment_id or 0,
+                )
+            else:
+                rank = _RANK_CASH_IN_LIEU if row.kind == _CASH_IN_LIEU else _RANK_ADJUSTMENT
+                key = (row.session, rank, *_adjustment_key(row))
+            events.append((key, action))
     return events
 
 
@@ -1107,6 +1134,7 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
                     client_order_id=first.fill.client_order_id,
                     book_id=known[first.fill.client_order_id].book_id,
                     position_side=known[first.fill.client_order_id].position_side,
+                    known_at=max(item.fill.known_at for item in group),
                 )
             )
             continue
@@ -1123,6 +1151,7 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
                 client_order_id=item.fill.client_order_id,
                 book_id=known[item.fill.client_order_id].book_id,
                 position_side=known[item.fill.client_order_id].position_side,
+                known_at=item.fill.known_at,
             )
             for item, quantity, price in parts
         )

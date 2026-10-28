@@ -1678,10 +1678,14 @@ def _auto_accepts(
         )
         cash = math.fsum(m.cash_amount or 0.0 for m in items)
         size = break_rules.dollar_size(ledger_quantity, broker_quantity, prices.get(name), cash)
+        # Opposite cash activities must not net away: materiality is judged on
+        # the gross of each activity.
+        gross = math.fsum(abs(amount) for _, amount in cash_parts)
+        judged = None if size is None else size + max(0.0, gross - abs(cash))
         prior = _prior_auto_accepted(events, name)
         if size is None or _judge(
             kinds,
-            size=size,
+            size=judged,
             prior=prior,
             equity=equity,
             frozen=frozen,
@@ -1956,9 +1960,15 @@ def _write_break_events(
         cash = math.fsum(p.cash_amount or 0.0 for p in parts)
         price = explanations.reference_prices.get(name)
         size = break_rules.dollar_size(first.ledger_quantity, first.broker_quantity, price, cash)
+        gross = math.fsum(
+            abs(activity_by_id[i].net_amount or 0.0) if i in activity_by_id else 0.0
+            for p in parts
+            for i in p.activity_ids
+        )
+        judged = None if size is None else size + max(0.0, gross - abs(cash))
         material = _judge(
             [p.kind for p in parts],
-            size=size,
+            size=judged,
             prior=_prior_auto_accepted(all_events, name),
             equity=equity,
             frozen=frozen,
@@ -2358,7 +2368,7 @@ def reconcile_now(
                     accepted=accept,
                 )
             except Exception as exc:
-                if res.status in (MISMATCH, BREAKS) or halt_for_break or open_now:
+                if res.status in (MISMATCH, BREAKS) or halt_for_break or open_now or accept:
                     # The row rolls back with its events. The command catches this
                     # fault and engages the independent kill-switch write.
                     raise ReconciliationError(
