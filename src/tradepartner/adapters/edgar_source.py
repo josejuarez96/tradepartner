@@ -3942,8 +3942,8 @@ def _fsn_filing_from_json(accession: str, cik: str, data: Mapping[str, Any]) -> 
 # The form column in `form.idx` is nominally 12 characters (up to the header's
 # "Company Name"), but real rows pad it to 17 characters. `census_quarter`
 # extracts the form by trying, in order: (1) the text before the first run of
-# two or more spaces; (2) the header's "Company Name" offset; (3) the padded
-# 17-character form column; (4) a prefix match against the wanted forms list.
+# two or more spaces; (2) the header's "Company Name" offset; (3) a prefix match
+# against the wanted forms list.
 # If a wanted form is identified but the tail (CIK, date, accession) does not
 # parse, or the filing date is invalid (e.g., 2016-99-99), the row is counted
 # in `unparsed_rows` and not silently dropped.
@@ -4027,13 +4027,9 @@ def census_quarter(
         # wider than the header (17 vs 12), so the offset alone cuts `SCHEDULE 13D/A`. Take
         # the text before the first run of two spaces when that is a wanted form, else the
         # offset slice (a name one space from a short form: `SC 13D` is not a split point).
-        # As a final fallback, use the padded form column width (17 chars) which real rows use.
         form = _CENSUS_FORM_COLUMN.split(line, maxsplit=1)[0].strip()
         if form not in wanted and name_at is not None:
             form = line[:name_at].strip()
-        form_padded = line[:17].strip()
-        if form not in wanted and form_padded in wanted:
-            form = form_padded
         # Fallback: try to match a wanted form as a prefix of the line (handles one-space
         # rows where the form is not padded to 17 chars and there's only one space before
         # the name). Check wanted forms sorted by length descending to match longest first.
