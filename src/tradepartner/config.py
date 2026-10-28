@@ -2152,6 +2152,10 @@ def _is_set(value: str | SecretStr | None) -> bool:
 #: The book whose paper key pair is `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET`
 #: (ADR 0017 B.1): H1's book, `store.schema.DEFAULT_BOOK_ID` and `paper.book_id`'s default.
 MAIN_BOOK_ID = "main"
+#: The regression-test book (owner decision 2026-10-28): its own Alpaca paper account,
+#: keys `ALPACA_PAPER_BOOKS__SANDBOX__API_KEY`/`..._SECRET`, run only on a temp COPY of
+#: the store, never graded, never in the shakedown (docs/runbooks/sandbox.md).
+SANDBOX_BOOK_ID = "sandbox"
 #: The settings field holding every other book's pair, and so the head of its variables.
 _BOOK_PAIRS_FIELD = "alpaca_paper_books"
 

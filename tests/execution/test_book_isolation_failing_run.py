@@ -176,10 +176,6 @@ def test_a_failing_run_of_book_a_leaves_book_bs_orders_and_call_shape_unchanged(
     assert sorted(together["held"]) == sorted(baseline["held"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#2475: book A's open buys reserve book B's cash (open_buy_reserve is store-wide)",
-)
 def test_a_failing_run_of_book_a_leaves_book_bs_fills_and_broker_calls_equal_to_a_solo_run(
     fixture_store_path: Path, tmp_path: Path
 ) -> None:
@@ -217,3 +213,56 @@ def test_no_row_of_book_a_carries_book_bs_account(fixture_store_path: Path, tmp_
     assert a_ids and not (a_ids & b_ids)
     assert all(f"-{BOOK_A}-" in cid for cid in a_ids)
     assert all(f"-{BOOK_B}-" in cid for cid in b_ids)
+
+
+def test_the_reserve_reads_only_its_own_books_orders_and_all_of_them(
+    fixture_store_path: Path, tmp_path: Path
+) -> None:
+    """#2475: book A's journaled open buys never reach book B's reserve; B's own
+    orders (any window or session) all do."""
+    from tradepartner.execution.wrapper import _own_book_rows
+
+    a, b = _two_books(fixture_store_path, tmp_path)
+    _fail_a_submit(a)
+    with pytest.raises(SubmitDown):
+        a.run(NOW)
+    assert b.run(NOW).status == "ok"
+    with b.connect() as conn:
+        a_orders, a_events, a_fills = _own_book_rows(conn, BOOK_A)
+        b_orders, b_events, b_fills = _own_book_rows(conn, BOOK_B)
+    assert len(a_orders) == 3 and len(b_orders) == 3
+    assert not {o.client_order_id for o in a_orders} & {o.client_order_id for o in b_orders}
+    assert {e.client_order_id for e in a_events} <= {o.client_order_id for o in a_orders}
+    assert {e.client_order_id for e in b_events} <= {o.client_order_id for o in b_orders}
+    assert not a_fills
+    assert b_fills, "B's own fills are read"
+
+
+def test_book_bs_buys_left_open_by_an_earlier_window_still_count_and_as_never_do(
+    fixture_store_path: Path, tmp_path: Path
+) -> None:
+    """#2475: with B on a second (later) window, its first window's journaled buys
+    are still in B's reserve reads; A's open buys are in neither."""
+    from tradepartner.execution.wrapper import _own_book_rows
+
+    a, b = _two_books(fixture_store_path, tmp_path)
+    _fail_a_submit(a)
+    with pytest.raises(SubmitDown):
+        a.run(NOW)
+    assert b.run(NOW).status == "ok"
+    first_window = b.window.window_id
+    (second_id,) = b.append(replace(b.window, window_id=None))
+    assert second_id != first_window
+    with b.connect() as conn:
+        orders, _, _ = _own_book_rows(conn, BOOK_B)
+        windows = {
+            r[0]
+            for r in conn.execute(
+                "SELECT r.window_id FROM orders o JOIN paper_runs r USING (run_id) "
+                "WHERE o.client_order_id IN (SELECT unnest(?))",
+                [[o.client_order_id for o in orders]],
+            ).fetchall()
+        }
+    assert len(orders) == 3
+    assert windows == {first_window}, "B's buys come from its earlier window, not the new one"
+    assert all(o.book_id == BOOK_B for o in orders)

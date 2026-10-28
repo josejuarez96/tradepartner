@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import re
 import tomllib
-from dataclasses import replace
+from dataclasses import fields, is_dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import duckdb
+import polars as pl
 import pytest
 from conftest import load_universe_fixtures
 from dashboard_nav import nav_calls_fixture  # noqa: F401
@@ -145,6 +146,51 @@ def test_view_carries_the_health_report(store_path: Path) -> None:
     assert view.report.coverage == report.coverage
     assert view.report.delisted.count == report.delisted.count
     assert view.threshold == settings.ingest.max_missing_share
+
+
+def test_short_reads_preserve_the_fixture_view(store_path: Path) -> None:
+    settings = _settings(store_path)
+    with _connect(store_path) as conn:
+        expected = health_page.load_health_view(conn, T, settings, WINDOW)
+    actual = health_page.load_health_view(
+        cast(duckdb.DuckDBPyConnection, app._ReadSteps(settings)), T, settings, WINDOW
+    )
+
+    def same(left: Any, right: Any) -> bool:
+        if isinstance(left, pl.DataFrame):
+            return left.equals(right)
+        if is_dataclass(left):
+            return all(same(getattr(left, f.name), getattr(right, f.name)) for f in fields(left))
+        if isinstance(left, tuple | list):
+            return len(left) == len(right) and all(
+                same(a, b) for a, b in zip(left, right, strict=True)
+            )
+        if isinstance(left, dict):
+            return left.keys() == right.keys() and all(same(left[k], right[k]) for k in left)
+        return bool(left == right)
+
+    assert same(actual, expected)
+
+
+def test_short_reads_release_store_before_python_aggregation(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    settings = _settings(store_path)
+    original = health._current_from
+    reached = False
+
+    def check_released(*args: Any, **kwargs: Any) -> Any:
+        nonlocal reached
+        reached = True
+        writer = duckdb.connect(str(store_path), read_only=False)
+        writer.close()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(health, "_current_from", check_released)
+    health_page.load_health_view(
+        cast(duckdb.DuckDBPyConnection, app._ReadSteps(settings)), T, settings, WINDOW
+    )
+    assert reached
 
 
 def test_series_has_every_session_in_the_window(store_path: Path) -> None:
@@ -365,7 +411,7 @@ def test_a_half_picked_window_keeps_the_rest_of_the_page(
     assert "Pick an end date" in text
 
 
-def test_page_reads_only_through_the_shells_connection(
+def test_page_opens_only_short_read_only_connections(
     monkeypatch: pytest.MonkeyPatch, store_path: Path
 ) -> None:
     opened: list[object] = []
@@ -379,7 +425,8 @@ def test_page_reads_only_through_the_shells_connection(
     monkeypatch.setattr(duckdb, "connect", _counting_connect)
     at.run()
     assert not at.exception
-    assert opened == [True]
+    assert len(opened) > 1
+    assert all(mode is True for mode in opened)
 
 
 # --- Statement facts (#660, T77c) -------------------------------------------
