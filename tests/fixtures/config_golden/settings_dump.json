@@ -255,6 +255,7 @@
     "title_fallback": true
   },
   "events": {
+    "form4_bulk_max_member_bytes": 1073741824,
     "form4_bulk_order_sample": 20,
     "form4_xml_price_below": "1.00",
     "form4_zero_price_xml_codes": [
