@@ -94,7 +94,7 @@ All monthly, percent per dollar of each leg (a 1-dollar long and 1-dollar short 
 | Asset growth, equal-weighted all stocks | 1.73 | 0.73 | 0.07 | 0.05 to 0.35 | +0.38 to +0.68 (not tradable: micro-caps) |
 | Asset growth, value-weighted | 0.70 | 0.29 | 0.07 | 0.05 to 0.35 | -0.06 to +0.24 |
 | Price delay | 1.21 | 0.51 | 0.07 | 0.05 to 0.35 | micro-cap only |
-| Piotroski | 1.96 (high B/M, long-short) | 0.82 | 0.07 | monthly turnover ~10%: 0.06 to 0.12 | data-blocked |
+| Piotroski | 1.96 (high B/M, long-short) | 0.82 | 0.07 | monthly turnover ~10%: 0.06 to 0.12 (borrow not included) | data-blocked |
 
 The overnight file's +0.68 for asset growth is therefore the first row with the cost of one leg: right as arithmetic, wrong for our universe by a factor of three to ten.
 
@@ -116,7 +116,7 @@ The overnight file's +0.68 for asset growth is therefore the first row with the 
 
 ## Disconfirmation
 - **Searches run:** (1) Chen-Zimmermann post-publication decay for asset growth, value-weighted and large stocks; (2) Hou-Xue-Zhang replication and microcap treatment; (3) Chen-Welch 2026 on non-micro post-2005 returns; (4) Chen-Velikov net-of-cost figure; (5) Piotroski sample and where the return sits; (6) Cooper-Gulen-Schill spreads; (7) Hou-Moskowitz delay premium and post-publication work. No search found an asset-growth post-publication figure for large stocks.
-- **What was found against my own conclusions:** (a) Chen and Zimmermann report that publication bias in 156 portfolios is only about 12% of in-sample return, much smaller than post-publication decay, which supports the view that these spreads were real mispricing, so a prior of zero may be too harsh. (b) A critique of Hou-Xue-Zhang finds a replication rate of 82% on alpha tests, far above their pessimistic number. (c) The repo's own Q1 note names Jensen, Kelly and Pedersen (JF 2023), who argue published factors replicate better than multiple-testing cuts imply. (d) Asset growth has a value-weighted spread that stays positive and significant (8.4% a year, t about 5): it is not a micro-cap-only effect. This is the reason asset growth is KEEP and not DROP. (e) Our store lacks most delisters before 2019, so a read on 2016-2018 data is on survivors, which flatters a long leg and denies a short leg the gains from stocks that failed. Any store test should start in 2019 or say so.
+- **What was found against my own conclusions:** (a) Chen and Zimmermann report that publication bias in 156 portfolios is only about 12% of in-sample return, much smaller than post-publication decay, which supports the view that these spreads were real mispricing, so a prior of zero may be too harsh. (b) A critique of Hou-Xue-Zhang finds a replication rate of 82% on alpha tests, far above their pessimistic number. (c) The repo's own Q1 note names Jensen, Kelly and Pedersen (JF 2023), who argue published factors replicate better than multiple-testing cuts imply. (d) Asset growth has a value-weighted spread that stays positive and significant (8.4% a year, t about 5): it is not a micro-cap-only effect. This is the reason asset growth is KEEP and not DROP. (e) Our store lacks most delisters through 2019, so a read on 2016-2018 data is on survivors, which flatters a long leg and denies a short leg the gains from stocks that failed. Any store test should start no earlier than 2020-08-31 (the practice window) or say so.
 - **What I did not do:** read any full text; query a source for the post-2010 asset-growth long leg; compute any return or turnover in the store.
 
 ## Caveats & gaps

@@ -3317,14 +3317,14 @@ note = "TP- result (own query). Gross profit is missing for 38% of annual revenu
 
 [[claim]]
 id = "TP-FV-2"
-statement = "The `delistings` table lists 36 delisters for 2016-07 to 2018 against 779 issuers in the earlier coverage probe, and bars end for only 10 securities in 2016-2018 against 58 to 669 a year in 2019-2023, so a '77% delisted coverage' ratio on that table does not measure coverage before 2019."
+statement = "The `delistings` table lists 36 delisters for 2016-07 to 2018 against 779 issuers in the earlier coverage probe, and bars end for only 10 securities in 2016-2018 against 58 to 669 a year in 2019-2023, so a '77% delisted coverage' ratio on that table does not measure coverage before 2020 (2019 has 72 delisters on file against about 310 a year in the coverage probe)."
 kind = "fact"
 grade = "SUPPORTED"
 scope = "store copy of 2026-10-28; 1,772 delisters at or before 2023-12-29, 1,365 with bars"
 source = "docs/research/2026-10-28-strategy-frontier-verified.md"
 section = "Census re-derived"
 bears_on = ["adr:0009"]
-note = "TP- result (own query). Reads before 2019 are on survivors."
+note = "TP- result (own query). Reads before 2020 are on survivors."
 
 [[claim]]
 id = "TP-FV-3"

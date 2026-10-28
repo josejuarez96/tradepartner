@@ -161,7 +161,7 @@ Parked ideas are listed at the end with the reason.
 - **Engine:** none for the desk read. A store run needs a new signal family (long-short, ADR 0024).
 - **Declared read (rung 2, before any number is opened):** Chen-Zimmermann `AssetGrowth`, value-weighted and size-screened files, long leg and short leg separately, 2010-01 to 2019-12 (L4). The file names are UNVERIFIED until opened; if absent, write the substitute first.
 - **Prior:** at or below the QI-2 cut of the value-weighted spread: 0.29 a month gross for the long-short, centred lower by Chen-Welch (0.07). Net of two legs and borrow about -0.3 to +0.2 a month.
-- **Kill:** a leg below 0.10 a month, or t below 1.0, or a long-short spread under 2 x the round-trip cost plus 30 bp a year of borrow (the cost ladder's low rung). Also kill Q1 on the same series family if both fail.
+- **Kill:** a leg below 0.10 a month, or t below 1.0, or a long-short spread under 0.15 a month (two legs at 15 bp a side with 100% annual turnover is 0.05; add 0.025 for 30 bp a year of borrow, then a 2x margin). Also kill Q1 on the same series family if both fail.
 - **Power (4a c):** about 40 months to the boundary; an expected t of 1 needs 0.32 a month at an assumed 2% monthly volatility (UNVERIFIED). At the haircut value expected t is about 0.9 over 40 months, a fail on 4a (c); at the non-micro prior it is about 0.2. A store run would be exploration at best, so the desk read comes first and decides.
 - **Information value:** moderate, at the lowest cost: retires a family of ideas with one read; no new data.
 - **Cost:** S.
