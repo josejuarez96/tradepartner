@@ -1540,6 +1540,11 @@ unblocks = ["task:T294"]
 [task.T305b]
 what = "A pure reader of the SEC's quarterly insider bulk data set into Form 4 rows, the zip fetch and the four bulk-route config keys."
 why = "It cuts the Form 4 backfill from about 64 hours of XML fetches to about 1 hour (#2498), and needs no store, so it can merge before the span ends."
+unblocks = ["task:T305c"]
+
+[task.T305c]
+what = "The pure Form 4 bulk-route rules: which source each accession takes, the line-order sample and row comparison, and the request plan against the budget."
+why = "Keeping the rules pure lets them be tested and merged before the span ends, so the held driver stays small (#2498)."
 unblocks = ["task:T307d"]
 
 [task.T307d]
