@@ -1008,6 +1008,7 @@ def test_hypotheses_families_default() -> None:
         "profitability",
         "combined",
         "filing_delay",
+        "spinoff",
     ]
 
 
@@ -1492,6 +1493,7 @@ def test_family_parents_derives_without_oracle_at_today_s_values() -> None:
         "profitability": None,
         "combined": "momentum",
         "filing_delay": None,
+        "spinoff": None,
     }
 
 
