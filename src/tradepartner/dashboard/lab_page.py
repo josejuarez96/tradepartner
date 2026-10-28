@@ -194,6 +194,9 @@ def _start_run(
     if isinstance(taken, lab_run.Busy):
         st.session_state[_OUTCOME] = busy_sentence(taken)
         return
+    # A new child owns the slot: the next time one ends the page must refresh again,
+    # even if it ends before a poll sees it running.
+    st.session_state[_POLL_ENDED] = False
     if conn is None:
         lab_run.abandon(slot, taken)
         st.session_state[_OUTCOME] = "The registry read is unavailable; nothing ran."
@@ -586,7 +589,7 @@ def _result_reading(
         )
     if report.verdicts is None:
         if report.state == "complete":
-            st.write(f"Sweep {report.state}; all variants failed terminally — sweep retire.")
+            st.write("Sweep complete; no variant completed successfully, so there is no winner.")
         else:
             st.write(f"Sweep {report.state}; the rule has no decision until it is complete.")
     else:

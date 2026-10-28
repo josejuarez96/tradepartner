@@ -329,40 +329,20 @@ def test_status_poll_reruns_once_after_child_ends(monkeypatch: pytest.MonkeyPatc
     ui.rerun.assert_called_once_with()
 
 
-def test_poll_ended_resets_when_new_run_starts(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_POLL_ENDED should reset to False when a new run starts (starting/running state)."""
-    ui = Mock(session_state={_POLL_ENDED: True})  # Previous run ended, flag is True
+def test_quick_run_after_a_finished_run_still_refreshes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run that ends before any poll saw it running still triggers the page refresh."""
+    ui = Mock(session_state={_POLL_ENDED: True})  # the previous run already refreshed
     monkeypatch.setattr(lab_page, "st", ui)
-    # New run has started
-    monkeypatch.setattr(
-        lab_page.lab_run, "status", Mock(return_value=SlotStatus("running", None, "log"))
-    )
-    lab_page._poll_status(Settings(_env_file=None))
-    # Flag should be reset
-    assert ui.session_state[_POLL_ENDED] is False
-    # Should not rerun (only reruns on ended -> ended transition)
-    ui.rerun.assert_not_called()
-
-
-def test_poll_ended_allows_rerun_for_new_ended_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    """After a new run starts and ends, _POLL_ENDED should allow another rerun."""
-    ui = Mock(session_state={_POLL_ENDED: True})
-    monkeypatch.setattr(lab_page, "st", ui)
-    # First, a new run starts (resets flag)
-    monkeypatch.setattr(
-        lab_page.lab_run, "status", Mock(return_value=SlotStatus("running", None, "log"))
-    )
-    lab_page._poll_status(Settings(_env_file=None))
-    assert ui.session_state[_POLL_ENDED] is False
-    ui.rerun.reset_mock()
-    # Then the new run ends
+    monkeypatch.setattr(lab_page.lab_run, "take", Mock(return_value=Taken(Path("slot"), "t")))
+    monkeypatch.setattr(lab_page.lab_run, "watch", Mock())
+    monkeypatch.setattr(lab_page.lab_child, "spawn", Mock())
+    monkeypatch.setattr(lab_page.lab_run, "record", Mock())
+    lab_page._start_run(Settings(_env_file=None), "b10", None, datetime.now(UTC), (), 0, Mock())
     monkeypatch.setattr(
         lab_page.lab_run, "status", Mock(return_value=SlotStatus("ended", None, ""))
     )
     lab_page._poll_status(Settings(_env_file=None))
-    # Should rerun for this new ended run
     ui.rerun.assert_called_once_with()
-    assert ui.session_state[_POLL_ENDED] is True
 
 
 @pytest.mark.parametrize(
@@ -524,39 +504,7 @@ def test_result_reading_orders_thresholds_result_rule_and_detail(
         assert f"{term} ⓘ" in text
 
 
-def test_result_reading_shows_retire_when_both_promote_and_retire_met(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When both promote_at_least_met and retire_below_met are True, show retire."""
-    sweep, report = _reading_fixture()
-    # Override verdicts to have both promote and retire met
-    row = SimpleNamespace(
-        variant_index=1,
-        slug="b10-v1",
-        status="counted",
-        trial_id=17,
-        dsr_excess=0.731,
-        red_flag=True,
-        message=None,
-    )
-    verdicts = SimpleNamespace(
-        argmax=row,
-        sr_star_high_water_annual=0.49,
-        dsr_excess_at_high_water=0.683,
-        promote_at_least_met=True,
-        retire_below_met=True,  # Both met
-    )
-    report = SimpleNamespace(
-        rows=(row,),
-        family_n=7,
-        sr_star_annual=0.43,
-        distribution=SimpleNamespace(
-            minimum=0.731, q1=0.731, median=0.731, q3=0.731, maximum=0.731
-        ),
-        red_flag_count=1,
-        verdicts=verdicts,
-        state="complete",
-    )
+def _reading_words(monkeypatch: pytest.MonkeyPatch, sweep: object, report: object) -> str:
     events: list[str] = []
     ui = MagicMock()
     ui.write.side_effect = lambda value: events.append(str(value))
@@ -569,63 +517,30 @@ def test_result_reading_shows_retire_when_both_promote_and_retire_met(
     monkeypatch.setattr(lab_page.registry, "family_holdout_spends", Mock(return_value=[]))
     monkeypatch.setattr(lab_page.registry, "development_boundary", Mock(return_value=None))
     lab_page._result_reading(Mock(), Settings(_env_file=None), sweep)
-    words = " ".join(events)
-    # Should show retire, not promote, when both are met
+    return " ".join(events)
+
+
+def test_result_reading_suggests_retire_when_promote_and_retire_both_met(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec req 4: a sweep whose argmax meets retire_below promotes nothing."""
+    sweep, report = _reading_fixture()
+    report.verdicts.retire_below_met = True
+    words = _reading_words(monkeypatch, sweep, report)
     assert "sweep retire" in words
     assert "sweep promote" not in words
 
 
-def test_result_reading_all_failed_shows_retire(
+def test_result_reading_complete_sweep_with_no_counted_variant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When all variants have terminal_failed, show retire (no counted variants for argmax)."""
-    sweep = SimpleNamespace(
-        sweep_id=3,
-        slug="b10",
-        family="momentum",
-        selection_statistic="dsr_excess",
-        promote_at_least=0.6,
-        retire_below=0.2,
-        holdout_start="2025-01-01",
-        holdout_end="2025-12-31",
-        registered_at=datetime(2024, 1, 1, tzinfo=UTC),
-        grid_sha256="grid123",
-    )
-    # All variants are terminal_failed, no counted variants
-    row = SimpleNamespace(
-        variant_index=1,
-        slug="b10-v1",
-        status="terminal_failed",
-        trial_id=None,
-        dsr_excess=None,
-        red_flag=False,
-        message="terminal failure",
-    )
-    report = SimpleNamespace(
-        rows=(row,),
-        family_n=7,
-        sr_star_annual=0.43,
-        distribution=None,
-        red_flag_count=0,
-        verdicts=None,  # No verdicts because no counted variants
-        state="complete",  # But sweep is complete (all variants are counted or terminal_failed)
-    )
-    events: list[str] = []
-    ui = MagicMock()
-    ui.write.side_effect = lambda value: events.append(str(value))
-    ui.caption.side_effect = lambda value: events.append(str(value))
-    ui.expander.side_effect = lambda label: (events.append(f"expander:{label}"), nullcontext())[1]
-    ui.selectbox.return_value = None
-    monkeypatch.setattr(lab_page, "st", ui)
-    monkeypatch.setattr(lab_page, "_safe_scrub", lambda text, _settings: text)
-    monkeypatch.setattr(lab_page.sweep_report, "sweep_report", Mock(return_value=report))
-    monkeypatch.setattr(lab_page.registry, "family_holdout_spends", Mock(return_value=[]))
-    monkeypatch.setattr(lab_page.registry, "development_boundary", Mock(return_value=None))
-    lab_page._result_reading(Mock(), Settings(_env_file=None), sweep)
-    words = " ".join(events)
-    # Should show retire for all-failed sweep
-    assert "sweep retire" in words
-    assert "no decision until it is complete" not in words
+    """All variants failed terminally: complete, no winner, not 'wait for a decision'."""
+    sweep, report = _reading_fixture()
+    report.verdicts = None
+    report.rows[0].status = "terminal_failed"
+    words = _reading_words(monkeypatch, sweep, report)
+    assert "no variant completed successfully" in words
+    assert "until it is complete" not in words
 
 
 def test_incomplete_sweep_has_no_argmax_or_desk_decision(
