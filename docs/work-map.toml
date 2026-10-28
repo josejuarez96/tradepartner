@@ -1553,33 +1553,28 @@ why = "It writes the insider rows that hypothesis B7 reads, dated by acceptance 
 unblocks = ["task:T308"]
 
 [plan.config-split]
-what = "How config.py is split into sibling modules without a behaviour change: the review prefixes widened to stems (T309), golden tests (T310), then five verbatim moves into config_base.py, config_data.py and config_backtest.py (T311 to T315), with Settings, paper, execution, research and Lab left in config.py."
+what = "How config.py is split into sibling modules without a behaviour change: the review prefixes widened to stems (T309), golden tests (T310), then five verbatim moves into config_base.py, config_data.py, config_edgar.py and config_backtest.py (T311 to T315), with Settings, paper, execution, research and Lab left in config.py."
 why = "config.py is the most-changed file (126 merges since 2026-09-28) and one file for every domain makes unrelated PRs collide; smaller files cut the conflicts and the review size."
 
 [task.T309]
 what = "ready_pr.py's quant and safety review prefixes widened from file names to stems (config, cli, health, ingest, adapters/edgar for quant), with a test that new sibling modules keep their reviewers."
 why = "Without it a new config_data.py or ingest_edgar.py would merge with no specialist review."
-unblocks = ["task:T311"]
 
 [task.T310]
 what = "Golden tests that pin the config's observable output: the Settings dump and JSON schema, the frozen keys, every family's parameter hash, the env-var names, the importable names, and a synthetic .env loading."
 why = "They are the proof that each later move changes nothing; without them a verbatim move is only trusted, not shown."
-unblocks = ["task:T311"]
 
 [task.T311]
 what = "config_base.py holds the two shared base definitions, _ClosedConfig and _PHASE3_MODEL_CONFIG, re-exported from config.py."
 why = "Every later module needs them and must not import config.py, so they move first."
-unblocks = ["task:T312", "task:T315"]
 
 [task.T312]
 what = "The calendar, store, ingest and rates sections move verbatim to config_data.py, re-exported from config.py."
 why = "The first data slice; nothing open edits these classes, so it can land early."
-unblocks = ["task:T313"]
 
 [task.T313]
-what = "The EDGAR and master sections and their parse helpers move verbatim to config_data.py, after the sitting tasks that flip their defaults."
+what = "The EDGAR and master sections and their parse helpers move verbatim to their own config_edgar.py, re-exported from config.py."
 why = "EDGAR config is the busiest data section; moving it ends most data-side collisions in config.py."
-unblocks = ["task:T314"]
 
 [task.T314]
 what = "The remaining data sections (universe, health, borrow, index check, OpenFIGI, adjust, gap, coverage, events) move verbatim to config_data.py."
