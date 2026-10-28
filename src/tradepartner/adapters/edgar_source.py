@@ -3929,3 +3929,137 @@ def _fsn_filing_from_json(accession: str, cik: str, data: Mapping[str, Any]) -> 
         # every reading this cache already served is unchanged by the field.
         symbol_only=_fsn_symbol_only(data),
     )
+
+
+# --- the ownership-forms census (T307b, #2435) ---------------------------------
+#
+# A read-only walk of the full-history quarterly `form.idx` that counts, with no
+# store and no `securities` filter (every filer), how many accessions of the
+# ownership event forms were filed each year and what fetching them would cost at
+# the EDGAR rate limit. It writes nothing: no store, no cache, no file. T307 (the
+# fetch and ingest) shares only the module, not these functions.
+
+#: The six forms of the #2435 amendment, as the filing index names them. The
+#: `events.sec_forms` key (T305) takes over once it exists; the census takes the
+#: list as a parameter.
+CENSUS_FORMS: tuple[str, ...] = (
+    "SC 13D",
+    "SC 13D/A",
+    "SCHEDULE 13D",
+    "SCHEDULE 13D/A",
+    "4",
+    "4/A",
+)
+#: Forms whose facts come from one XML document per accession (structured 13D since
+#: 2024-12, and Form 4). The unstructured `SC 13D` is read from the SGML header
+#: (`edgar.header_bytes`), a separate request kind the census counts apart.
+CENSUS_XML_FORMS: frozenset[str] = frozenset({"SCHEDULE 13D", "SCHEDULE 13D/A", "4", "4/A"})
+#: The first year of EDGAR's full-index.
+CENSUS_FIRST_YEAR = 1993
+#: An assumed size of one filing XML. The index cannot say; the census prints it as
+#: an assumption, and the `ingest` option overrides it.
+CENSUS_XML_BYTES_ASSUMED = 20_000
+
+_CENSUS_FORM_COLUMN = re.compile(r"\s{2,}")
+
+
+@dataclass(frozen=True)
+class FormsYear:
+    """One filing year of the census: distinct accessions per form (a joint filing
+    is listed once per filer in the index, counted once here), the requests the
+    ownership read would make and the distinct index CIKs (every filer)."""
+
+    year: int
+    accessions: Mapping[str, int]
+    xml_requests: int
+    header_requests: int
+    ciks: int
+
+
+@dataclass(frozen=True)
+class FormsCensus:
+    """The census of a full-index walk. `unparsed_rows` counts rows of the wanted
+    forms that did not parse (counted, never silently dropped)."""
+
+    years: tuple[FormsYear, ...]
+    index_requests: int
+    index_bytes: int
+    unparsed_rows: int
+
+
+def census_quarter(
+    text: str, forms: Sequence[str] = CENSUS_FORMS
+) -> tuple[dict[int, dict[str, set[str]]], dict[int, set[str]], int]:
+    """Per filing year, the accessions of each wanted form and the index CIKs in one
+    quarter's `form.idx` text, plus the count of wanted rows that did not parse.
+
+    Pure: every filer counts, none is filtered against any master. An accession is
+    one XML or header request however many filers the index lists it under.
+    """
+    wanted = frozenset(forms)
+    accessions: dict[int, dict[str, set[str]]] = {}
+    ciks: dict[int, set[str]] = {}
+    unparsed = 0
+    for line in text.splitlines():
+        if "edgar/data/" not in line:
+            continue
+        form = _CENSUS_FORM_COLUMN.split(line, maxsplit=1)[0].strip()
+        if form not in wanted:
+            continue
+        try:
+            rows = parse_filing_index(line, {}).unstamped
+        except ValueError:
+            unparsed += 1
+            continue
+        for row in rows:
+            year = row.filed_on.year
+            accessions.setdefault(year, {}).setdefault(row.form, set()).add(row.accession)
+            ciks.setdefault(year, set()).add(row.cik)
+    return accessions, ciks, unparsed
+
+
+def census_filing_index(
+    fetch: Callable[[int, int], str],
+    *,
+    through: tuple[int, int],
+    first_year: int = CENSUS_FIRST_YEAR,
+    forms: Sequence[str] = CENSUS_FORMS,
+    xml_forms: frozenset[str] = CENSUS_XML_FORMS,
+) -> FormsCensus:
+    """Walk every `(year, quarter)` from `first_year` QTR1 through `through` with
+    `fetch` (the raw `form.idx` text; it is the only I/O) and count the wanted forms.
+
+    Reads and writes nothing else. Index CIKs are distinct per year across quarters.
+    """
+    last_year, last_qtr = through
+    totals: dict[int, dict[str, int]] = {}
+    cik_sets: dict[int, set[str]] = {}
+    requests = 0
+    size = 0
+    unparsed = 0
+    for year in range(first_year, last_year + 1):
+        for qtr in range(1, 5):
+            if (year, qtr) > (last_year, last_qtr):
+                break
+            text = fetch(year, qtr)
+            requests += 1
+            size += len(text.encode("utf-8"))
+            per_year, per_cik, bad = census_quarter(text, forms)
+            unparsed += bad
+            for y, by_form in per_year.items():
+                counts = totals.setdefault(y, {})
+                for form, accs in by_form.items():
+                    counts[form] = counts.get(form, 0) + len(accs)
+            for y, found in per_cik.items():
+                cik_sets.setdefault(y, set()).update(found)
+    years = tuple(
+        FormsYear(
+            year=y,
+            accessions=dict(sorted(counts.items())),
+            xml_requests=sum(n for f, n in counts.items() if f in xml_forms),
+            header_requests=sum(n for f, n in counts.items() if f not in xml_forms),
+            ciks=len(cik_sets.get(y, ())),
+        )
+        for y, counts in sorted(totals.items())
+    )
+    return FormsCensus(years, requests, size, unparsed)
