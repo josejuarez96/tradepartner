@@ -4030,6 +4030,10 @@ def census_quarter(
         form = _CENSUS_FORM_COLUMN.split(line, maxsplit=1)[0].strip()
         if form not in wanted and name_at is not None:
             form = line[:name_at].strip()
+            # Never truncate a longer form name (`SCHEDULE 13D/A` cut to `SCHEDULE 13D`):
+            # a form ends at a space or the line's end.
+            if line[len(form) : len(form) + 1].strip():
+                form = ""
         # Fallback: try to match a wanted form as a prefix of the line (handles one-space
         # rows where the form is not padded to 17 chars and there's only one space before
         # the name). Check wanted forms sorted by length descending to match longest first.

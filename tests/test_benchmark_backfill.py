@@ -27,7 +27,11 @@ from tradepartner.adapters.prices import (
 from tradepartner.backfill import BenchmarkSeed, backfill_benchmark
 from tradepartner.config import Settings
 from tradepartner.ingest import OK, STALE
-from tradepartner.store.benchmarks import BenchmarkIdentityError, benchmark_security_ids
+from tradepartner.store.benchmarks import (
+    BenchmarkIdentityError,
+    benchmark_security_ids,
+    research_benchmark_security_ids,
+)
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.schema import init_schema
 
@@ -180,6 +184,20 @@ def test_a_check_only_symbol_resolves_only_for_the_index_check(settings: Setting
             conn, ["RSP"], start=SINCE, through=date(2019, 6, 28), check_only=True
         )
     assert ids == {"RSP": RSP}
+
+
+def test_research_benchmark_resolution_cannot_reach_a_check_only_symbol(
+    settings: Settings,
+) -> None:
+    """#2526: the research path has no check_only switch; RSP stays refused there."""
+    _run(settings, _History(), symbol="RSP", seed=RSP_SEED)
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        with pytest.raises(BenchmarkIdentityError, match="check-only"):
+            research_benchmark_security_ids(conn, ["RSP"], start=SINCE, through=date(2019, 6, 28))
+        with pytest.raises(TypeError):
+            research_benchmark_security_ids(  # type: ignore[call-arg]
+                conn, ["RSP"], start=SINCE, through=date(2019, 6, 28), check_only=True
+            )
 
 
 def test_a_symbol_in_neither_list_is_refused_with_rsp_configured(settings: Settings) -> None:
