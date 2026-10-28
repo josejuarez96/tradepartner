@@ -2123,7 +2123,12 @@ def _census_sec_forms(
     through = (now.year, (now.month - 1) // 3 + 1)
 
     def fetch(year: int, qtr: int) -> str:
-        return edgar_raw.filing_index_quarter(year, qtr, settings=s, client=client)
+        try:
+            return edgar_raw.filing_index_quarter(year, qtr, settings=s, client=client)
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code == 404 and (year, qtr) == through:
+                return ""  # the open quarter's index may not exist yet
+            raise
 
     try:
         census = census_filing_index(fetch, through=through)

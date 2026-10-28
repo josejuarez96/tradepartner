@@ -232,3 +232,19 @@ def test_parser_version_is_its_own_integer_constant() -> None:
     assert isinstance(SEC_FORMS_PARSER_VERSION, int)
     assert SEC_FORMS_PARSER_VERSION >= 1
     assert not hasattr(edgar, "SEC_FORMS_CACHE_VERSION")
+
+
+def test_invalid_date_of_original_submission_is_treated_as_none() -> None:
+    """An invalid dateOfOriginalSubmission (e.g., 2016-99-99) should not reject the filing;
+    the field should be None and the filing's transactions should still be parsed."""
+    original = _text("form4_amendment_with_bad_rows.xml")
+    xml = original.replace(
+        "<dateOfOriginalSubmission>2025-03-04</dateOfOriginalSubmission>",
+        "<dateOfOriginalSubmission>2016-99-99</dateOfOriginalSubmission>",
+    )
+    assert xml != original  # the fixture really carries the element
+    parse = parse_form4(xml)
+    assert parse.skipped == 4  # the fixture's own bad rows, nothing more
+    assert [t.line_no for t in parse.transactions] == [0, 5]
+    for t in parse.transactions:
+        assert t.date_of_original_submission is None
