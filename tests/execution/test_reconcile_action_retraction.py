@@ -33,7 +33,7 @@ from tradepartner.action_retract import retract_action
 from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.calendar import next_session, session_close
 from tradepartner.config import Settings
-from tradepartner.errors import ReconciliationError
+from tradepartner.execution import reconcile_run
 from tradepartner.execution.reconcile import BREAKS, OK
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.journal import PaperWindowRow
@@ -79,6 +79,12 @@ def _held_with_a_withdrawn_split(
         )
 
 
+@pytest.fixture(autouse=True)
+def _long_only_book(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These windows name no registered hypothesis; read each as `long_only`."""
+    monkeypatch.setattr(reconcile_run, "_signed_book", lambda conn, window: False)
+
+
 def test_a_withdrawn_split_halts_until_its_cancel_is_known_then_reconciles(
     journal_settings: Settings,
     fake: BookedFake,
@@ -86,8 +92,7 @@ def test_a_withdrawn_split_halts_until_its_cancel_is_known_then_reconciles(
     fixed_clock: FixedClock,
 ) -> None:
     _held_with_a_withdrawn_split(journal_settings, fake, open_window)
-    with pytest.raises(ReconciliationError, match="quantity"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
 
     retract_action(
         journal_settings,
@@ -98,8 +103,7 @@ def test_a_withdrawn_split_halts_until_its_cancel_is_known_then_reconciles(
         expect_known_at=CUT,
     )
     fixed_clock.now = RETRACTED_AT + timedelta(minutes=30)
-    with pytest.raises(ReconciliationError, match="quantity"):  # S is cut at close(S-1)
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)  # S is cut at close(S-1)
 
     fixed_clock.now = NEXT_MORNING
     result = _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
@@ -107,7 +111,7 @@ def test_a_withdrawn_split_halts_until_its_cancel_is_known_then_reconciles(
     assert result.status == OK
     assert result.broker_cash == pytest.approx(100_000.0 - 10.0 * PRICE)
     # Paper spec amendment #2266 item 2: `quantity` is a name-level kind, so the
-    # status is `breaks`, not `mismatch`. T281 still halts (the raises above).
+    # status is `breaks`, not `mismatch`, and halts nothing (T282d).
     assert [row.status for row in _rows(journal_settings, open_window)] == [
         BREAKS,
         BREAKS,
@@ -115,7 +119,7 @@ def test_a_withdrawn_split_halts_until_its_cancel_is_known_then_reconciles(
     ]
 
 
-def test_without_the_cancel_the_next_session_still_halts(
+def test_without_the_cancel_the_next_session_still_breaks(
     journal_settings: Settings,
     fake: BookedFake,
     open_window: PaperWindowRow,
@@ -124,8 +128,7 @@ def test_without_the_cancel_the_next_session_still_halts(
     _held_with_a_withdrawn_split(journal_settings, fake, open_window)
     fixed_clock.now = NEXT_MORNING
 
-    with pytest.raises(ReconciliationError, match="quantity"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2).status == BREAKS
 
 
 def test_a_cancel_written_after_close_s_also_costs_s_plus_1(
@@ -135,7 +138,7 @@ def test_a_cancel_written_after_close_s_also_costs_s_plus_1(
     fixed_clock: FixedClock,
 ) -> None:
     """The owner acts at 19:00 ET on S, after close(S): S+1's cut close(S) is
-    before the cancel, so S+1 halts too; S+2's cut close(S+1) is after it."""
+    before the cancel, so S+1 breaks too; S+2's cut close(S+1) is after it."""
     _held_with_a_withdrawn_split(journal_settings, fake, open_window)
     late = session_close(S) + timedelta(hours=3)
     retract_action(
@@ -147,8 +150,7 @@ def test_a_cancel_written_after_close_s_also_costs_s_plus_1(
         expect_known_at=CUT,
     )
     fixed_clock.now = NEXT_MORNING
-    with pytest.raises(ReconciliationError, match="quantity"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2).status == BREAKS
 
     s3 = next_session(S2)
     fixed_clock.now = datetime.combine(s3, NEXT_MORNING.timetz())
