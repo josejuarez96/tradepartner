@@ -3406,3 +3406,10 @@ def test_ui_lab_orphan_after_hours_defaults_to_24_and_must_be_positive() -> None
     for bad in (0, -1):
         with pytest.raises(ValidationError):
             Settings(_env_file=None, ui={"lab_orphan_after_hours": bad})
+
+
+def test_ui_lab_poll_seconds_is_positive() -> None:
+    assert Settings(_env_file=None).ui.lab_poll_seconds > 0
+    assert Settings(_env_file=None, ui={"lab_poll_seconds": 4}).ui.lab_poll_seconds == 4
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, ui={"lab_poll_seconds": 0})
