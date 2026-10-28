@@ -62,8 +62,15 @@ journal. Nothing here reads a clock or the store.
   basis to it); a **carried residue** opens a zero-basis lot on its session; a
   **stock merger** (a `corporate_action_cash` and a `merger_receipt` naming one
   `merger_id`) re-keys the target's lots to the acquirer at the ratio of the two
-  quantities, carrying basis and date, with no disposal. A residue or a
-  spin-off child is never a wash-sale replacement. Any corporate action on an
+  quantities, carrying basis and date, with no disposal. A **true-up** (an
+  `auto_true_up` or `owner_true_up` row with a quantity, paper spec amendment
+  2026-10-26 #2266, item 9) states the name at the broker's absolute quantity
+  its `explanation_json` carries: a shortfall of lots opens one zero-basis lot
+  on the row's session, an excess closes lots first in, first out at zero
+  proceeds (cash is booked by its own rows). The lots are compared with the
+  absolute figure, not the row's delta, so a split the true-up suppressed
+  never leaves the lots and the positions ledger apart. A residue, a true-up
+  lot or a spin-off child is never a wash-sale replacement. Any corporate action on an
   open short lot raises (short lots are Phase 6).
 
 Amounts are computed in `Fraction` from each float's `repr`, so FIFO residues
@@ -88,7 +95,7 @@ import polars as pl
 
 from tradepartner.adapters.broker import Asset
 from tradepartner.calendar import session_close
-from tradepartner.execution.ledger import _split_ratio
+from tradepartner.execution.ledger import TRUE_UP_KINDS, _split_ratio, true_up_quantity
 from tradepartner.store.journal import AdjustmentRow, OrderedFill, OrderRow
 from tradepartner.store.schema import LONG
 
@@ -644,6 +651,41 @@ class _Ledger:
         _require_long_delta(row, negative=False)
         self._receipt(row, security, _ZERO)
 
+    def true_up(self, row: AdjustmentRow) -> None:
+        """A true-up states the name at the broker's absolute quantity (item 9):
+        open a zero-basis lot for a shortfall, or close lots FIFO at zero
+        proceeds for an excess. A true-up on a name with an open short lot
+        raises (short lots are Phase 6)."""
+        security = _security(row)
+        self.refuse_short(security, row.kind)
+        absolute = true_up_quantity(row)
+        if absolute is None:
+            return
+        held = self.longs.get(security, [])
+        gap = _exact(absolute) - sum((lot.quantity for lot in held), _ZERO)
+        if gap > _ZERO:
+            lot = self.open_lot(
+                security,
+                self.symbol_of(security),
+                _session_at(row),
+                gap,
+                _ZERO,
+                fill_id=None,
+                client_order_id=_placeholder(row),
+                book_id=row.book_id,
+            )
+            self.no_replacement.add(lot.lot_id)
+        elif gap < _ZERO:
+            closed = _close_fifo(held, -gap, _describe(row))
+            self.dispose(
+                closed,
+                lambda sold: _ZERO,
+                trade_at=_session_at(row),
+                fill_id=None,
+                client_order_id=_placeholder(row),
+                book_id=None,
+            )
+
     def _receipt(self, row: AdjustmentRow, security: str, basis: Fraction) -> None:
         lot = self.open_lot(
             security,
@@ -1019,6 +1061,8 @@ def _adjustment_event(
         return partial(_Ledger.spinoff, row=row)
     if row.kind == _CARRIED_RESIDUE:
         return partial(_Ledger.residue, row=row)
+    if row.kind in TRUE_UP_KINDS:
+        return partial(_Ledger.true_up, row=row)
     return None
 
 

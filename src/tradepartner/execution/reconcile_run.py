@@ -25,9 +25,17 @@ it decides and raises on a mismatch. A run's steps 4 and 8, `paper reconcile`,
     writes the closing events of breaks that closed. Each row is stamped with
     the same clock reading, so every adjustment is inside the reconciliation
     that re-bases the ledger's cash (`execution.ledger`: a row whose `known_at`
-    equals the base's is counted in it, never twice). Only an `ok` result books
-    `adjustments` rows; a `breaks` row books none (that comes in a later task,
-    T282b).
+    equals the base's is counted in it, never twice). Only an `ok` or `breaks`
+    result books `adjustments` rows. **Auto-acceptance (T283a, item 6):** a name's
+    immaterial break (`_auto_accepts`: at or below both materiality bounds, the
+    sizes already auto-accepted on the name included, and never a finding, a
+    short, an `unknown_security` or a break once material or reopened) is written
+    `opened` (when new) and `auto_accepted` in this chunk, with `auto_true_up`
+    adjustments that adopt the broker's absolute quantity and cash. A
+    reconciliation every one of whose breaks is accepted, with no finding left
+    open, is `ok` and halts nothing. A deferred reconciliation (`mismatch`,
+    `pending_unresolved`, `fills_lagging`) books none: the immaterial break stays
+    `opened`, unrestricted, and the next `ok` or `breaks` reconciliation re-tests it.
 5. On `mismatch` (or a name-level difference, or a retained finding, beside a
     lagging or unresolved order), raise `ReconciliationError`
     after the row and its events are committed, so the caller engages the kill
@@ -227,6 +235,7 @@ from tradepartner.store.journal import (
     ReconciliationRow,
     adjustments_for,
     append,
+    break_events_for,
     fills_for,
     non_terminal_orders,
     open_breaks,
@@ -236,6 +245,7 @@ from tradepartner.store.journal import (
     pending_orders,
     reconciliations_for,
 )
+from tradepartner.store.schema import AUTO_TRUE_UP_KIND
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
@@ -1544,6 +1554,231 @@ def _break_evidence(
     return evidence
 
 
+#: Item 6: the kinds an immaterial break may be auto-accepted for: a quantity
+#: part and a cash part on a long name. Every other kind (a finding, a short, an
+#: `unknown_security`) is material whatever its size and waits for the owner.
+_AUTO_QUANTITY_KINDS = frozenset({"quantity", "ledger_only_position", "broker_only_position"})
+_AUTO_KINDS = _AUTO_QUANTITY_KINDS | {break_rules.NAME_CASH}
+
+
+@dataclass(frozen=True)
+class _AutoAccept:
+    """One name's auto-acceptance (item 6): the figures its `auto_true_up` rows
+    adopt, and the sizes the explanation names."""
+
+    size: float
+    prior: float
+    ledger_quantity: float
+    broker_quantity: float
+    quantity_part: bool
+    cash_parts: tuple[tuple[str, float], ...]
+    equity: float
+
+
+def _by_name(result: Reconciliation) -> dict[str, list[Mismatch]]:
+    """The name-level mismatches by break name (item 2)."""
+    by_name: dict[str, list[Mismatch]] = defaultdict(list)
+    for mismatch in result.mismatches:
+        if break_rules.is_name_level(mismatch.kind):
+            name = mismatch.security_id or mismatch.symbol
+            if name is None:
+                raise ValueError(f"name-level {mismatch.kind} has no name")
+            by_name[name].append(mismatch)
+    return by_name
+
+
+def _prior_auto_accepted(events: Iterable[ReconcileBreakRow], name: str) -> float:
+    """The sizes already booked by `auto_accepted` on `name` in the window
+    (item 5's cumulative bound). Only booked `auto_true_up` sizes count."""
+    return math.fsum(
+        e.dollar_size or 0.0 for e in events if e.event == "auto_accepted" and e.name == name
+    )
+
+
+def _judge(
+    kinds: Sequence[str],
+    *,
+    size: float | None,
+    prior: float,
+    equity: float,
+    frozen: RiskConfig,
+    previous: ReconcileBreakRow | None,
+    signed: bool,
+) -> bool:
+    """Whether a break is material (items 5 and 6). Material when `is_material`
+    says so, when a kind is outside `_AUTO_KINDS`, when the name is signed (a
+    short, or a broker quantity below zero), when the break was ever material
+    ("material from then on") and when the owner reopened it (item 9)."""
+    return (
+        (previous is not None and (previous.material or previous.event == "reopened"))
+        or signed
+        or any(kind not in _AUTO_KINDS for kind in kinds)
+        or break_rules.is_material(
+            kinds, size, prior_auto_accepted=prior, ledger_equity=equity, risk=frozen
+        )
+    )
+
+
+def _name_quantities(
+    name: str, items: Sequence[Mismatch], ledger: Ledger, positions: Mapping[str, Position]
+) -> tuple[float, float, bool]:
+    """(signed ledger quantity, broker quantity, whether the name is signed) of a
+    break on `name`, as the events record them. A short lives in
+    `short_holdings`, so the ledger figure is signed here."""
+    ledger_quantity = ledger.positions.get(name, 0.0) - ledger.short_holdings.get(name, 0.0)
+    symbol = items[0].symbol
+    broker_quantity = (
+        positions[symbol].quantity if symbol is not None and symbol in positions else 0.0
+    )
+    return (
+        ledger_quantity,
+        broker_quantity,
+        name in ledger.short_holdings or ledger_quantity < 0 or broker_quantity < 0,
+    )
+
+
+def _auto_accepts(
+    result: Reconciliation,
+    *,
+    ledger: Ledger,
+    positions: Mapping[str, Position],
+    prices: Mapping[str, float],
+    activities: Sequence[CashActivity],
+    frozen: RiskConfig,
+    previous: Mapping[str, ReconcileBreakRow],
+    events: Sequence[ReconcileBreakRow],
+) -> dict[str, _AutoAccept]:
+    """The names whose break item 6 accepts in this reconciliation's own chunk:
+    immaterial under `_judge` (the cumulative bound included, a deferred break
+    re-tested here), carrying only a quantity and cash part on a `security_id`.
+    Pure over its inputs; a ledger whose equity cannot be marked accepts none."""
+    try:
+        equity = ledger.equity(prices)
+    except (KeyError, ValueError):
+        return {}
+    by_id = {a.activity_id: a for a in activities}
+    accepted: dict[str, _AutoAccept] = {}
+    for name, items in _by_name(result).items():
+        if items[0].security_id is None:
+            continue
+        prior_row = previous.get(name)
+        kinds = [m.kind for m in items]
+        if prior_row is not None:
+            kinds += [
+                p["kind"]
+                for p in json.loads(prior_row.parts_json)
+                if p["kind"] in break_rules.FINDING_KINDS
+            ]
+        ledger_quantity, broker_quantity, signed = _name_quantities(name, items, ledger, positions)
+        ids = [activity_id for m in items for activity_id in m.activity_ids]
+        if any(activity_id not in by_id for activity_id in ids):
+            continue  # an activity the broker read no longer lists: wait for the owner
+        cash_parts = tuple(
+            (activity_id, by_id[activity_id].net_amount or 0.0) for activity_id in ids
+        )
+        cash = math.fsum(m.cash_amount or 0.0 for m in items)
+        size = break_rules.dollar_size(ledger_quantity, broker_quantity, prices.get(name), cash)
+        prior = _prior_auto_accepted(events, name)
+        if size is None or _judge(
+            kinds,
+            size=size,
+            prior=prior,
+            equity=equity,
+            frozen=frozen,
+            previous=prior_row,
+            signed=signed,
+        ):
+            continue
+        accepted[name] = _AutoAccept(
+            size=size,
+            prior=prior,
+            ledger_quantity=ledger_quantity,
+            broker_quantity=broker_quantity,
+            quantity_part=any(k in _AUTO_QUANTITY_KINDS for k in kinds),
+            cash_parts=cash_parts,
+            equity=equity,
+        )
+    return accepted
+
+
+def _auto_true_up_rows(
+    name: str,
+    accept: _AutoAccept,
+    *,
+    window: PaperWindowRow,
+    run_id: int | None,
+    session: date,
+    stamp: datetime,
+    break_id: str,
+    reconciliation_id: int,
+    frozen: RiskConfig,
+) -> list[AdjustmentRow]:
+    """Item 6's `auto_true_up` rows for `name`: one for the quantity part (its
+    `quantity` the delta, broker minus ledger, its `explanation_json` the broker's
+    absolute quantity) and one per cash activity (its `cash` and its id in
+    `broker_activity_id`). Each names the thresholds, the size and the cumulative
+    auto-accepted total. All carry the one chunk stamp and the command's session."""
+    terms: dict[str, object] = {
+        "break_id": break_id,
+        "reconciliation_id": reconciliation_id,
+        "size": accept.size,
+        "prior_auto_accepted": accept.prior,
+        "cumulative_auto_accepted": accept.prior + accept.size,
+        "break_materiality_usd": frozen.break_materiality_usd,
+        "break_materiality_bps": frozen.break_materiality_bps,
+        "ledger_equity": accept.equity,
+    }
+
+    def row(
+        text: str,
+        extra: Mapping[str, object],
+        *,
+        quantity: float | None = None,
+        cash: float | None = None,
+        activity_id: str | None = None,
+    ) -> AdjustmentRow:
+        return AdjustmentRow(
+            window_id=_window_id(window),
+            run_id=run_id,
+            session=session,
+            kind=AUTO_TRUE_UP_KIND,
+            security_id=name,
+            quantity=quantity,
+            cash=cash,
+            explanation_json=json.dumps(
+                {"explanation": text, **terms, **extra}, sort_keys=True, allow_nan=False
+            ),
+            book_id=window.book_id,
+            broker_activity_id=activity_id,
+            known_at=stamp,
+            ingested_at=stamp,
+        )
+
+    rows: list[AdjustmentRow] = []
+    if accept.quantity_part:
+        delta = float(Decimal(repr(accept.broker_quantity)) - Decimal(repr(accept.ledger_quantity)))
+        rows.append(
+            row(
+                "auto-accepted quantity break",
+                {
+                    "broker_quantity": accept.broker_quantity,
+                    "ledger_quantity": accept.ledger_quantity,
+                },
+                quantity=delta,
+            )
+        )
+    for activity_id, amount in accept.cash_parts:
+        rows.append(
+            row(
+                "auto-accepted name cash break",
+                {"activity_id": activity_id},
+                cash=amount,
+                activity_id=activity_id,
+            )
+        )
+    return rows
+
+
 def _write_break_events(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -1560,17 +1795,17 @@ def _write_break_events(
     evidence: Mapping[str, list[break_rules.StoreEvidence]],
     own_trading: set[str],
     adjustment_ids: Sequence[int],
+    run_id: int | None = None,
+    accepted: Mapping[str, _AutoAccept] | None = None,
 ) -> None:
-    """Append one event per affected name after the reconciliation and adjustments."""
+    """Append one event per affected name after the reconciliation and adjustments.
+    A name in `accepted` (`_auto_accepts`) is written `opened` (when new) and
+    `auto_accepted`, with its `auto_true_up` rows, in this chunk (item 6)."""
+    accepted = accepted or {}
     window_id = _window_id(window)
     prior = {row.name: row for row in open_breaks(conn, window_id) if row.name is not None}
-    by_name: dict[str, list[Mismatch]] = defaultdict(list)
-    for mismatch in result.mismatches:
-        if break_rules.is_name_level(mismatch.kind):
-            name = mismatch.security_id or mismatch.symbol
-            if name is None:
-                raise ValueError(f"name-level {mismatch.kind} has no name")
-            by_name[name].append(mismatch)
+    by_name = _by_name(result)
+    all_events = break_events_for(conn, window_id)
     activity_by_id = {a.activity_id: a for a in activities}
     symbols = {v: k for k, v in explanations.symbols.items()}
     try:
@@ -1721,13 +1956,17 @@ def _write_break_events(
         cash = math.fsum(p.cash_amount or 0.0 for p in parts)
         price = explanations.reference_prices.get(name)
         size = break_rules.dollar_size(first.ledger_quantity, first.broker_quantity, price, cash)
-        material = break_rules.is_material(
-            (p.kind for p in parts),
-            size,
-            prior_auto_accepted=0.0,
-            ledger_equity=equity,
-            risk=frozen,
+        material = _judge(
+            [p.kind for p in parts],
+            size=size,
+            prior=_prior_auto_accepted(all_events, name),
+            equity=equity,
+            frozen=frozen,
+            previous=previous,
+            signed=(first.ledger_quantity or 0.0) < 0 or (first.broker_quantity or 0.0) < 0,
         )
+        if name in accepted and material:
+            raise ValueError(f"auto-accepted break on {name} is material at the write")
         if mismatches:
             security_id = mismatches[0].security_id
             symbol = mismatches[0].symbol
@@ -1736,33 +1975,63 @@ def _write_break_events(
             security_id = previous.security_id
             symbol = previous.symbol
         _, break_id = break_rules.identity(window_id, security_id, symbol, reconciliation_id)
-        append(
-            conn,
-            ReconcileBreakRow(
-                break_id=previous.break_id if previous is not None else break_id,
-                window_id=window_id,
-                book_id=window.book_id,
-                event="observed" if previous is not None else "opened",
-                parts_json=break_rules.parts_json(parts),
-                # The journal keeps the opening cause on every later event;
-                # each part carries its own cause in `parts_json` (item 14).
-                cause=previous.cause
-                if previous is not None and previous.cause is not None
-                else break_rules.break_cause(parts),
-                security_id=security_id,
-                symbol=symbol,
-                ledger_quantity=first.ledger_quantity,
-                broker_quantity=first.broker_quantity,
-                cash_amount=cash if any(p.cash_amount is not None for p in parts) else None,
-                reference_price=price,
-                dollar_size=size,
-                material=material,
-                first_seen_session=previous.first_seen_session if previous is not None else session,
+        if previous is not None:
+            break_id = previous.break_id
+        accept = accepted.get(name)
+        booked: list[int] = []
+        if accept is not None:
+            for adjustment_row in _auto_true_up_rows(
+                name,
+                accept,
+                window=window,
+                run_id=run_id,
+                session=session,
+                stamp=stamp,
+                break_id=break_id,
                 reconciliation_id=reconciliation_id,
-                known_at=stamp,
-                ingested_at=stamp,
-            ),
+                frozen=frozen,
+            ):
+                booked_id = append(conn, adjustment_row)
+                if booked_id is None:
+                    raise RuntimeError("auto_true_up append returned no id")
+                booked.append(booked_id)
+        row = ReconcileBreakRow(
+            break_id=break_id,
+            window_id=window_id,
+            book_id=window.book_id,
+            event="observed" if previous is not None else "opened",
+            parts_json=break_rules.parts_json(parts),
+            # The journal keeps the opening cause on every later event;
+            # each part carries its own cause in `parts_json` (item 14).
+            cause=previous.cause
+            if previous is not None and previous.cause is not None
+            else break_rules.break_cause(parts),
+            security_id=security_id,
+            symbol=symbol,
+            ledger_quantity=first.ledger_quantity,
+            broker_quantity=first.broker_quantity,
+            cash_amount=cash if any(p.cash_amount is not None for p in parts) else None,
+            reference_price=price,
+            dollar_size=size,
+            material=material,
+            first_seen_session=previous.first_seen_session if previous is not None else session,
+            reconciliation_id=reconciliation_id,
+            known_at=stamp,
+            ingested_at=stamp,
         )
+        if accept is None or previous is None:
+            append(conn, row)
+        if accept is not None:
+            # Item 6: `opened` (only when new) and `auto_accepted` in one chunk.
+            append(
+                conn,
+                replace(
+                    row,
+                    event="auto_accepted",
+                    material=False,
+                    adjustment_ids_json=json.dumps(booked),
+                ),
+            )
 
 
 def reconcile_now(
@@ -1935,12 +2204,35 @@ def reconcile_now(
         # A one-shot finding stays open until the owner true-up; a clean broker
         # read does not close it.
         result = replace(result, status=BREAKS, broker_cash=None, adjustments=())
+    accepted: dict[str, _AutoAccept] = {}
+    if result.status == BREAKS:
+        # Item 6: an immaterial break is accepted in this reconciliation's own
+        # chunk. A reconciliation every one of whose breaks is accepted, with no
+        # finding left open, is `ok`: its base is the broker's raw cash, the
+        # accepted cash being inside it (the `auto_true_up` rows share its stamp).
+        with connect() as conn:
+            accepted = _auto_accepts(
+                result,
+                ledger=ledger,
+                positions=positions,
+                prices=explanations.reference_prices,
+                activities=activities,
+                frozen=frozen,
+                previous={row.name: row for row in open_now if row.name is not None},
+                events=break_events_for(conn, window_id),
+            )
+        if not retained_finding and set(_by_name(result)) <= set(accepted):
+            result = replace(
+                result, status=OK, broker_cash=float(account.cash), adjustments=result.explained
+            )
     if result.status == BREAKS:
         # A name cash break remains outside the ledger until an adjustment
         # books it. Preserve the raw account reading for the audit trail.
         result = replace(result, adjustments=result.explained)
         open_cash = math.fsum(
-            m.cash_amount or 0.0 for m in result.mismatches if m.kind == "name_cash"
+            m.cash_amount or 0.0
+            for m in result.mismatches
+            if m.kind == "name_cash" and (m.security_id or m.symbol) not in accepted
         )
         payload = json.loads(result.mismatches_json)
         raw_cash = float(account.cash)
@@ -1949,6 +2241,7 @@ def reconcile_now(
             activity_id
             for mismatch in result.mismatches
             if mismatch.kind == "name_cash"
+            and (mismatch.security_id or mismatch.symbol) not in accepted
             for activity_id in mismatch.activity_ids
         }
         payload["activities"] = [
@@ -1960,10 +2253,11 @@ def reconcile_now(
         result_payload = json.dumps(payload, sort_keys=True, allow_nan=False)
     else:
         result_payload = result.mismatches_json
-    # A `breaks` result restricts names and halts nothing (T282d). A name-level
+    # A `breaks` result restricts names and halts nothing (T282d), and neither
+    # does an `ok` one whose every break was auto-accepted. A name-level
     # difference beside a pending or lagging order keeps T281's halt: nothing has
     # released it.
-    halt_for_break = result.status != BREAKS and (
+    halt_for_break = result.status not in (OK, BREAKS) and (
         retained_finding or any(break_rules.is_name_level(m.kind) for m in result.mismatches)
     )
     try:
@@ -1978,7 +2272,13 @@ def reconcile_now(
         fill.security_id for fill in state.fills if fill.fill.known_at > last_completed
     } | {order.security_id for order in orders}
 
-    def commit(res: Reconciliation, payload: str, *, judge_cap: bool) -> int:
+    def commit(
+        res: Reconciliation,
+        payload: str,
+        *,
+        judge_cap: bool,
+        accept: Mapping[str, _AutoAccept],
+    ) -> int:
         """Write the row, adjustments and break events of `res` in one chunk and
         return the reconciliation id. With `judge_cap`, raise `_BookHalt` inside
         the chunk (so it rolls back) when the open material breaks pass the cap."""
@@ -2054,6 +2354,8 @@ def reconcile_now(
                     evidence=evidence,
                     own_trading=own_trading,
                     adjustment_ids=adjustment_ids,
+                    run_id=run_id,
+                    accepted=accept,
                 )
             except Exception as exc:
                 if res.status in (MISMATCH, BREAKS) or halt_for_break or open_now:
@@ -2086,7 +2388,9 @@ def reconcile_now(
             return reconciliation_id
 
     try:
-        reconciliation_id = commit(result, result_payload, judge_cap=result.status != MISMATCH)
+        reconciliation_id = commit(
+            result, result_payload, judge_cap=result.status != MISMATCH, accept=accepted
+        )
     except _BookHalt as cap:
         # Item 3: past the cap the book halts. The first chunk rolled back; redo it
         # as the book-level `mismatch`, its events written as before.
@@ -2097,7 +2401,8 @@ def reconcile_now(
             adjustments=(),
             mismatches=(*result.mismatches, Mismatch(cap.kind, str(cap))),
         )
-        reconciliation_id = commit(result, result.mismatches_json, judge_cap=False)
+        # A halted row books no adjustment (item 4), so no break is accepted in it.
+        reconciliation_id = commit(result, result.mismatches_json, judge_cap=False, accept={})
 
     if result.status == MISMATCH or halt_for_break:
         kinds = ", ".join(sorted({m.kind for m in result.mismatches})) or "open finding"
