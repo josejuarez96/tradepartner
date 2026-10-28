@@ -8,9 +8,12 @@ import polars as pl
 
 from tradepartner.calendar import is_session, previous_session, session_close
 from tradepartner.config import Settings
-from tradepartner.store.asof import adjusted_prices_as_of, facts_as_of, listings_as_of, prices_as_of
+from tradepartner.store.asof import adjusted_prices_as_of, facts_as_of, prices_as_of
+from tradepartner.store.benchmarks import (
+    BenchmarkIdentityError,
+    research_benchmark_security_ids,
+)
 from tradepartner.store.db import open_read_only
-from tradepartner.store.master import securities_as_of
 
 
 class EventStudyReader:
@@ -33,20 +36,23 @@ class EventStudyReader:
         return t
 
     def benchmark(self, symbol: str, *, start: date) -> str:
-        """Resolve a benchmark identity within the study window."""
+        """Resolve a benchmark identity by symbol (#840), refusing ticker reuse.
+
+        Identity rows are snapshot-static, stamped after any historical window, so
+        they are read by symbol and not gated on `known_at`; bars stay cut at the
+        window end in `bars`.
+        """
         self._record(self.cutoff)
+        if start > self.cutoff.date():
+            raise ValueError(f"benchmark {symbol!r} starts after the window end")
         with open_read_only(self.settings) as conn:
-            securities = securities_as_of(conn, self.cutoff).filter(pl.col("benchmark"))
-            listings = listings_as_of(conn, self.cutoff).filter(
-                (pl.col("ticker").str.to_uppercase() == symbol.strip().upper())
-                & (pl.col("valid_from") <= start)
-            )
-        ids: set[str] = {str(sid) for sid in securities["security_id"].to_list()} & {
-            str(sid) for sid in listings["security_id"].to_list()
-        }
-        if len(ids) != 1 or start > self.cutoff.date():
-            raise ValueError(f"benchmark {symbol!r} is missing or ambiguous at window end")
-        return next(iter(ids))
+            try:
+                ids = research_benchmark_security_ids(
+                    conn, [symbol], start=start, through=self.cutoff.date()
+                )
+            except BenchmarkIdentityError as exc:
+                raise ValueError(f"benchmark {symbol!r} is missing or ambiguous: {exc}") from exc
+        return next(iter(ids.values()))
 
     def bars(
         self, security_ids: list[str], *, sessions_from: date

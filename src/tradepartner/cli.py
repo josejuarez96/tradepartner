@@ -427,6 +427,7 @@ from tradepartner.backtest.run import RunOutcome, run_hypothesis
 from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, clean_message, get_settings
 from tradepartner.corpus import departure_fetch
+from tradepartner.diskfloor import ingest_floor_refusal, low_disk_warning
 from tradepartner.execution import check as paper_check
 from tradepartner.execution import lock as paper_lock
 from tradepartner.execution import lots_reconcile, ops, plain, reconcile_run, waiting, window
@@ -2123,7 +2124,12 @@ def _census_sec_forms(
     through = (now.year, (now.month - 1) // 3 + 1)
 
     def fetch(year: int, qtr: int) -> str:
-        return edgar_raw.filing_index_quarter(year, qtr, settings=s, client=client)
+        try:
+            return edgar_raw.filing_index_quarter(year, qtr, settings=s, client=client)
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code == 404 and (year, qtr) == through:
+                return ""  # the open quarter's index may not exist yet
+            raise
 
     try:
         census = census_filing_index(fetch, through=through)
@@ -2396,6 +2402,19 @@ def make_app(
                 raise _fail(f"--through must be YYYY-MM-DD, got {through!r}", USAGE_ERROR) from None
         base = settings()  # the edges get the caller's own Settings; only the store wait differs
         s = _writer_settings(base)
+        if (refusal := ingest_floor_refusal(s)) is not None:
+            # Before any store write, so it can never fire mid-write (#2454).
+            if (
+                source == "all"
+                and start is None
+                and not dry_run
+                and restamp is None
+                and not (
+                    rebuild_statement_facts or rebuild_filing_events or rebuild_classifications
+                )
+            ):
+                heartbeat.ping(s, "ingest", ok=False)  # same shape as the scheduled job (#2155)
+            raise _fail(refusal, 1)
         if source == "openfigi" and not s.openfigi.enabled:
             raise _fail("--source openfigi needs openfigi.enabled=true", USAGE_ERROR)
         if actions_backfill:
@@ -3011,6 +3030,7 @@ def make_app(
             (1 if _quarantined(report) > 0 else 0)
             + (1 if report.duplicate_dividends.pending else 0)
             + chain_breaks
+            + (1 if (disk_warning := low_disk_warning(s)) is not None else 0)
         )
         typer.echo(health_verdict(report, expected_warnings))
         _print_report(report)
@@ -3042,6 +3062,9 @@ def make_app(
                 "check the chain before relying on it",
                 err=True,
             )
+        if disk_warning is not None:
+            warnings += 1
+            typer.echo(f"warning: {disk_warning}", err=True)
         if check:
             failures = len(report.failures)
             if failures:
