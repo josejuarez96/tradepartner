@@ -53,7 +53,7 @@ Source: `statement_facts`, `prices_daily`, `delistings`, `securities`, `classifi
 | Of those, price at least $5 and 20-day median dollar volume at least $5M | not given | 2,046 / 2,420 / 2,108 | The real universe then takes the top 1,000 by market cap |
 | Common with an asset-growth signal (two consecutive 10-K assets, known by the date, last 15 months) | "about 7,000" | **3,607 / 3,733 / 4,111; liquid subset 1,879 / 2,061 / 2,003** | |
 | Delisters on file with effective date at or before 2023-12-29 | 1,769, of which 1,363 have bars (77%) | 1,772 (1,365 with bars, 77.0%); 1,098 common (1,065 with bars) | Ratio reproduces. The denominator does not measure coverage: see next row |
-| Delisters on file by year (2016-07 to 2023) / with bars | "86% for 2016-18 (43 of 50)" | 2016: 5 (4); 2017: 18 (15); 2018: 13 (8); 2019: 72 (61); 2020: 214 (151); 2021: 342 (190); 2022: 427 (221); 2023: 599 (344), common stock only | The list is thin before 2019: 36 delisters for 2016-07 to 2018, against the 779 issuers in the owner's earlier coverage probe. Securities whose last bar falls in 2016, 2017, 2018 are 4, 3, 3; in 2019 to 2023 they are 58, 192, 327, 482, 669. So any strategy read before 2019 is on survivors, and the "77%" is circular |
+| Delisters on file by year (2016-07 to 2023): all classes (of which common, common with bars) | "86% for 2016-18 (43 of 50)" | 2016: 5 (5, 4); 2017: 18 (15, 15); 2018: 13 (10, 8); 2019: 72 (63, 61); 2020: 214 (158, 151); 2021: 342 (196, 190); 2022: 427 (231, 221); 2023: 599 (346, 344) | The list is thin before 2019: 36 delisters for 2016-07 to 2018, against the 779 issuers in the owner's earlier coverage probe (about 310 a year). 2019 (72) is also far under that rate. Securities whose last bar falls in 2016, 2017, 2018 are 4, 3, 3; in 2019 to 2023 they are 58, 192, 327, 482, 669. So any strategy read before 2020 is on survivors, and the "77%" is circular |
 | Spin-off rows | 40 on 37 dates | 40 on 37 dates (2020: 1, 2021: 7, 2022: 11, 2023: 21) | Same |
 | Dividend rows | "10k+ a year" | 9,158 (2020), 9,792, 10,248, 10,499 (2023) | Same |
 | Universe note | "securities with prices in 2023 (6,489)" | not re-derived | The relevant universe is ADR 0006's top 1,000, not any proxy |
@@ -82,12 +82,12 @@ Not re-checked: rejected/cancelled orders ("none"). The summary's "1% partially 
 
 ## Economics, redone with consistent units
 
-All monthly, percent of a long-short book's gross value; one-sided annual turnover of 100% per leg for an annual sort (an assumption, UNVERIFIED; no turnover was measured).
+All monthly, percent per dollar of each leg (a 1-dollar long and 1-dollar short book); one-sided annual turnover of 100% per leg for an annual sort (an assumption, UNVERIFIED; no turnover was measured).
 
 - **Gross:** published spread x 0.42 (the 58% post-publication cut, QI-2). Alternative prior: Chen and Welch's 7 bp for non-micro, post-2005 (G2-S10, abstract only).
 - **Cost, two legs:** 2 legs x 100% x 2 sides x c / 12. At the backtest default c = 15 bp: 5 bp a month. At the 30 bp the ledger uses for small names: 10 bp. The overnight file charged one leg at 30 bp (5 bp a month).
 - **Borrow on the short leg:** the cost config's own ladder is 0, 30, 300 bp a year (`costs.borrow_sensitivity_bps`): 0, 2.5 and 25 bp a month on short value.
-- **Power (4a, item c):** a monthly long-short series has about 40 non-overlapping months in 2020-08-31 to 2023-12-29. Months are not overlapping returns even when membership persists, so n is about 40, not the 3.3 annual sorts. With an assumed monthly long-short volatility of 2% for large names (UNVERIFIED), the effect for expected t = 1 is 2 / sqrt(40) = 0.32 a month. Asset growth's value-weighted haircut value (0.29) just reaches it. The non-micro prior (0.07) needs about 800 months.
+- **Power (4a, item c):** a monthly long-short series has about 40 non-overlapping months in 2020-08-31 to 2023-12-29. Months are not overlapping returns even when membership persists, so n is about 40, not the 3.3 annual sorts. With an assumed monthly long-short volatility of 2% for large names (UNVERIFIED), the effect for expected t = 1 is 2 / sqrt(40) = 0.32 a month. Asset growth's value-weighted haircut value (0.29) falls just short of it (expected t about 0.9 over 40 months). The non-micro prior (0.07) needs about 800 months.
 
 | Lead | Published spread | After 58% cut | Non-micro prior | Cost + borrow | Net range |
 |---|---|---|---|---|---|
