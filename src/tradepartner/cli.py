@@ -4912,6 +4912,11 @@ def make_app(
                 f"{m.residue_term:.6f} cost {m.modelled_cost:.6f}"
                 f"{' excluded' if m.excluded else ''}{' missed' if m.missed else ''}"
                 f"{' override' if m.override else ''} {'pass' if m.passed else 'FAIL'}"
+                + (
+                    f" (residue at carried mark: {', '.join(m.residue_carried)})"
+                    if m.residue_carried
+                    else ""
+                )
                 for m in comparison.periods
             ),
             *(

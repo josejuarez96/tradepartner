@@ -750,6 +750,109 @@ def test_residue_term_uses_close_even_when_fill_price_is_open() -> None:
     assert result.periods[0].residue_term == pytest.approx(expected)
 
 
+def _delisted_residue_journal(
+    marks: list[PositionDailyRow],
+) -> Journal:
+    """A delisted name held at T0 whose forced exit closed `untradable`: a
+    residue at risk (#2570)."""
+    decision_id = next(_IDS)
+    return _journal(
+        positions_daily=marks,
+        decisions=[
+            DecisionRow(
+                decision_id=decision_id,
+                run_id=1,
+                rebalance_session=None,
+                security_id=A,
+                whole_share=False,
+                decision="forced_exit",
+                reason="delisted",
+                known_at=_utc(T0),
+                ingested_at=_utc(T0),
+            )
+        ],
+        decision_events=[
+            DecisionEventRow(
+                decision_id=decision_id,
+                run_id=1,
+                status="skipped",
+                reason="untradable",
+                known_at=_utc(T0),
+                ingested_at=_utc(T0),
+            )
+        ],
+        runs=(_run(1, T0),),
+    )
+
+
+def test_residue_of_delisted_untradable_name_uses_carried_mark_and_is_flagged() -> None:
+    # #2570: no bar on T0 or T1 (delisted); the marks carried the last close,
+    # 40.0, on both sessions. The residue is valued at those marks (zero move,
+    # no split) and the name is flagged, not hidden.
+    equity = {T0: 100_000.0, T1: 100_000.0}
+    trial = _trial(equity, {T0: 0.0})
+    cash = 100_000.0 - 10.0 * 40.0
+    marks = [
+        _position_mark(T0, A, 10.0, 40.0, tradable=False, cash=cash),
+        _position_mark(T1, A, 10.0, 40.0, tradable=False, cash=cash),
+    ]
+    result = compare_periods(
+        _window(),
+        trial,
+        _delisted_residue_journal(marks),
+        _no_actions(),
+        _no_price,
+        _no_price,
+        None,
+    )
+    assert result.periods[0].residue_term == pytest.approx(0.0)
+    assert result.periods[0].residue_carried == (A,)
+
+
+def test_residue_carried_mark_ignores_marks_of_later_sessions() -> None:
+    # No look-ahead: only the marks on T_i and T_{i+1} price the residue. A
+    # mark (or bar) of a later session, here 999.0 at T2, never reaches it.
+    equity = {T0: 100_000.0, T1: 100_000.0}
+    trial = _trial(equity, {T0: 0.0})
+    cash = 100_000.0 - 10.0 * 40.0
+    marks = [
+        _position_mark(T0, A, 10.0, 40.0, tradable=False, cash=cash),
+        _position_mark(T1, A, 10.0, 41.0, tradable=False, cash=cash),
+        _position_mark(T2, A, 10.0, 999.0, tradable=False, cash=cash),
+    ]
+    result = compare_periods(
+        _window(),
+        trial,
+        _delisted_residue_journal(marks),
+        _no_actions(),
+        _no_price,
+        _no_price,
+        None,
+    )
+    assert result.periods[0].residue_term == pytest.approx(10.0 * 1.0 / 100_000.0)
+
+
+def test_residue_without_close_or_mark_still_raises() -> None:
+    # No bar and no mark on T1 (the name is not held then): no allowed
+    # fallback, so the report refuses rather than guess a value.
+    equity = {T0: 100_000.0, T1: 100_000.0}
+    trial = _trial(equity, {T0: 0.0})
+    marks = [
+        _position_mark(T0, A, 10.0, 40.0, tradable=False, cash=100_000.0 - 400.0),
+        _cash_mark(T1, 100_000.0),
+    ]
+    with pytest.raises(ValueError, match="no close for"):
+        compare_periods(
+            _window(),
+            trial,
+            _delisted_residue_journal(marks),
+            _no_actions(),
+            _no_price,
+            _no_price,
+            None,
+        )
+
+
 def test_raw_rule_excludes_missed_lists_override() -> None:
     equity = {T0: 100_000.0, T1: 101_000.0}
     trial = _trial(equity, {T0: 100.0})

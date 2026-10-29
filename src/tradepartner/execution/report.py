@@ -59,6 +59,7 @@ is read for `paper.tracking_k` and `paper.tracking_rule` only, never live
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -200,6 +201,9 @@ class PeriodRow:
     skip_names: tuple[str, ...]
     excluded: bool
     passed: bool
+    #: Names whose residue was valued at the mark's carried last close because
+    #: the store has no bar on T_i or T_{i+1} (#2570): flagged, never hidden.
+    residue_carried: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -244,6 +248,22 @@ def _quantity_at(marks: Sequence[PositionDailyRow], security_id: str, session: d
         if row.session == session and row.security_id == security_id:
             return row.quantity
     return 0.0
+
+
+def _mark_price_at(
+    marks: Sequence[PositionDailyRow], security_id: str, session: date
+) -> float | None:
+    """The price `marks_for` wrote for `security_id` on `session`, if any."""
+    for row in marks:
+        if (
+            row.session == session
+            and row.security_id == security_id
+            and row.mark_price is not None
+            and math.isfinite(row.mark_price)
+            and row.mark_price > 0
+        ):
+            return row.mark_price
+    return None
 
 
 def _actions_as_of(actions: pl.DataFrame, t: datetime) -> pl.DataFrame:
@@ -376,14 +396,20 @@ def _residue_term(
     window_id: int,
     t_i: date,
     t_next: date,
-) -> float:
+) -> tuple[float, tuple[str, ...]]:
+    """(the residue sum, the names valued at a carried mark). A name with no
+    bar on T_i or T_{i+1} is valued at the mark `marks_for` already wrote for
+    that session (#2570): the last close known at that session, carried only
+    within the marks' own rules and the window's frozen
+    `paper.max_stale_mark_sessions` (spec req 7, #678), never a later bar.
+    No mark row, no value: it raises."""
     held = {
         row.security_id: row.quantity
         for row in journal.positions_daily
         if row.session == t_i and row.security_id is not None and row.quantity != 0
     }
     if not held:
-        return 0.0
+        return 0.0, ()
     #: `execution.plan.residue` requires its `decisions`, `decision_events`
     #: and `positions_daily` rows to be those known to the run on the ledger's
     #: session (its own docstring), and raises on a row whose run is not among
@@ -396,6 +422,7 @@ def _residue_term(
     known_decision_events = [e for e in journal.decision_events if e.run_id in known_run_ids]
     known_marks = [m for m in journal.positions_daily if m.run_id in known_run_ids]
     total = 0.0
+    carried: list[str] = []
     for security_id, quantity in held.items():
         ledger = Ledger(positions={security_id: quantity}, cash=0.0, through=t_i)
         quantity_at_risk = residue_of(
@@ -414,11 +441,17 @@ def _residue_term(
         close_i = closes(security_id, t_i)
         close_next = closes(security_id, t_next)
         if close_i is None or close_next is None:
-            raise ValueError(f"no close for {security_id} on {t_i} or {t_next}")
+            mark_i = _mark_price_at(journal.positions_daily, security_id, t_i)
+            mark_next = _mark_price_at(journal.positions_daily, security_id, t_next)
+            if mark_i is None or mark_next is None:
+                raise ValueError(f"no close for {security_id} on {t_i} or {t_next}")
+            close_i = close_i if close_i is not None else mark_i
+            close_next = close_next if close_next is not None else mark_next
+            carried.append(security_id)
         factor = _split_factor(actions_as_of_next, security_id, t_i, t_next)
         adjusted_next = close_next * factor
         total += quantity_at_risk * (adjusted_next - close_i)
-    return total
+    return total, tuple(carried)
 
 
 def compare_periods(
@@ -473,12 +506,10 @@ def compare_periods(
         )
         fill_timing_term = _fill_timing_term(live_fills, prices, t_i, t_next) / paper_equity_i
         residual = raw + dividend_term + fill_timing_term
-        residue_term = (
-            _residue_term(
-                journal, actions_as_of_i, actions_as_of_next, closes, window.window_id, t_i, t_next
-            )
-            / paper_equity_i
+        residue_sum, residue_carried = _residue_term(
+            journal, actions_as_of_i, actions_as_of_next, closes, window.window_id, t_i, t_next
         )
+        residue_term = residue_sum / paper_equity_i
         modelled_cost = trial.cost_paid[t_i] / trial.equity[t_i]
 
         missed = any(
@@ -520,6 +551,7 @@ def compare_periods(
                 skip_names=skip_names,
                 excluded=excluded,
                 passed=period_passed,
+                residue_carried=residue_carried,
             )
         )
 
