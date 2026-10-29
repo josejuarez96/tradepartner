@@ -752,6 +752,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         "openfigi_types": [],
         "successor_chains": [],
         "mergers": [],
+        "spinoff_allocations": [],
         "reconcile_breaks": [],
         "sec_filing_events": [],
         "sec_form4_transactions": [],

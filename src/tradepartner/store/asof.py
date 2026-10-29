@@ -1113,6 +1113,22 @@ def symbol_changes_as_of(
     ).pl()
 
 
+def spinoff_allocations_as_of(conn: duckdb.DuckDBPyConnection, t: datetime) -> pl.DataFrame:
+    """Latest owner-entered basis fraction per spin-off known at ``t``."""
+    t = _validate_t(t)
+    return conn.execute(
+        """SELECT * EXCLUDE (_rn) FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY parent_security_id, child_security_id, ex_date
+                ORDER BY known_at DESC
+            ) AS _rn
+            FROM spinoff_allocations WHERE known_at <= ?
+        ) WHERE _rn = 1
+        ORDER BY parent_security_id, child_security_id, ex_date""",
+        [t],
+    ).pl()
+
+
 def mergers_as_of(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,

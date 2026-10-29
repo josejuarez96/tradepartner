@@ -1296,6 +1296,7 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "successor_chains",
             "mergers",
             "reconcile_breaks",
+            "spinoff_allocations",
             "sec_filing_events",
             "sec_form4_transactions",
         }
@@ -2926,3 +2927,49 @@ def test_read_only_open_of_a_version_37_store_still_serves_every_other_read(
         for table in ("trial_rebalances", "paper_plans"):
             assert not {name for name, _ in _ASSETS_INTERSECTION_ADDED} <= _table_columns(ro, table)
         assert journal.plans_for(ro, 1) == []
+
+
+def test_version_39_adds_only_spinoff_allocations() -> None:
+    """A version-38 store gains the allocation table and one version row."""
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        for table in ("spinoff_allocations", "sec_filing_events", "sec_form4_transactions"):
+            conn.execute(f"DROP TABLE {table}")
+        conn.execute("DELETE FROM schema_version WHERE version IN (39, 40)")
+        conn.execute("INSERT INTO schema_version VALUES (38, TIMESTAMPTZ '2026-10-27 00:00:00+00')")
+        before = _shape(conn)
+        versions = _versions(conn)
+        assert versions == [38]
+        schema.init_schema(conn)
+        after = _shape(conn)
+        # The same open also takes T306's version 40 (#2539).
+        assert set(after) - set(before) == {
+            "spinoff_allocations",
+            "sec_filing_events",
+            "sec_form4_transactions",
+        }
+        assert {name: after[name] for name in before} == before
+        assert _versions(conn) == [38, 39, 40]
+        schema.init_schema(conn)
+        assert _versions(conn) == [38, 39, 40]
+    finally:
+        conn.close()
+
+
+def test_read_only_version_38_store_keeps_existing_reads(tmp_path: Path) -> None:
+    path = tmp_path / "v38.duckdb"
+    conn = duckdb.connect(str(path))
+    schema.init_schema(conn)
+    for table in ("spinoff_allocations", "sec_filing_events", "sec_form4_transactions"):
+        conn.execute(f"DROP TABLE {table}")
+    conn.execute("DELETE FROM schema_version WHERE version IN (39, 40)")
+    conn.execute("INSERT INTO schema_version VALUES (38, TIMESTAMPTZ '2026-10-27 00:00:00+00')")
+    conn.close()
+    ro = duckdb.connect(str(path), read_only=True)
+    try:
+        schema.init_schema(ro)
+        assert schema.stored_version(ro) == 38
+        assert ro.execute("SELECT count(*) FROM corporate_actions").fetchone() == (0,)
+    finally:
+        ro.close()

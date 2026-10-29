@@ -61,6 +61,7 @@ _UNTOUCHED_TABLES = tuple(
     not in (
         "corporate_actions",
         "schema_version",
+        "spinoff_allocations",
         "sec_filing_events",
         "sec_form4_transactions",
         *schema.RETRACTABLE_TABLES,

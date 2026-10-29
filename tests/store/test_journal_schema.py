@@ -1251,6 +1251,7 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
         if name
         not in (
             "schema_version",
+            "spinoff_allocations",
             "trial_results",
             "trial_rebalances",
             "trial_metrics",

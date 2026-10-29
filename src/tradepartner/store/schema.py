@@ -574,7 +574,10 @@ registry; #83 took version 2 first, so the registry is version 3):
   works (`journal.plans_for`, which names `paper_plans`'s two, reads them as
   NULL there; no read names `trial_rebalances`'s before T242), and the next
   writable `init_schema` call migrates the store.
-- **Version 39** belongs to T254 (spin-off basis allocation) and lands first.
+- **Version 39** (#1976, T254): adds `spinoff_allocations`, the owner-entered
+  Form 8937 basis fraction keyed by parent, child and ex-date, with revisions
+  stamped at the write clock. Additive; no existing rows or tables change.
+  `registry.data_vintage` excludes it, while the store maximum includes it.
 - **Version 40** (#2539, T306): `sec_filing_events` and
   `sec_form4_transactions` are additive main-store tables. Reads are gated by
   `events.sec_forms_read_enabled`; read-only version-38 and version-39 stores
@@ -703,6 +706,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "openfigi_types": ("openfigi",),
     "successor_chains": ("filing",),
     "mergers": ("action",),
+    "spinoff_allocations": ("owner",),
 }
 
 #: `statement_facts.basis` (#660): `reported` for an as-filed value,
@@ -885,9 +889,16 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   (NULL on every existing row) by `ALTER TABLE`
 #:   (`_migrate_assets_intersection`); the pinned DDL strings do not change
 #:   (module docstring, "Schema versions").
+#: - 39 (#1976, T254): additive owner-entered `spinoff_allocations` table.
+#: - 40 (#2539, T306): additive `sec_filing_events` and
+#:   `sec_form4_transactions` tables, read behind
+#:   `events.sec_forms_read_enabled`.
 #: - A later DDL change goes to version 41, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
 CURRENT_SCHEMA_VERSION = 40
+
+#: Last version without the owner-entered Form 8937 allocation table.
+_PRE_SPINOFF_ALLOCATIONS_VERSION = 38
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -1061,7 +1072,6 @@ _PRE_BREAKS_VERSION = 36
 #: NULL where they are missing, and no read names `trial_rebalances`'s before
 #: T242.
 _PRE_ASSETS_INTERSECTION_VERSION = 37
-_PRE_T254_VERSION = 38
 
 # Version 39 belongs to T254; T306's additive ownership tables are version 40.
 _PRE_SEC_FORMS_VERSION = 39
@@ -1546,6 +1556,20 @@ CREATE TABLE IF NOT EXISTS successor_chains (
 )
 """
 
+# Owner-entered Form 8937 fractions. Each revision is an append-only row at
+# the owner's actual write clock; the spin-off date is only the natural key.
+_CREATE_SPINOFF_ALLOCATIONS = f"""
+CREATE TABLE IF NOT EXISTS spinoff_allocations (
+    parent_security_id VARCHAR NOT NULL,
+    child_security_id VARCHAR NOT NULL,
+    ex_date DATE NOT NULL,
+    basis_allocation DOUBLE NOT NULL CHECK (basis_allocation BETWEEN 0 AND 1),
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["spinoff_allocations"])},
+    UNIQUE (parent_security_id, child_security_id, ex_date, known_at)
+)
+"""
+_SPINOFF_ALLOCATIONS_TABLE_DDL: tuple[str, ...] = (_CREATE_SPINOFF_ALLOCATIONS,)
+
 #: Every table this module owns, in dependency-free creation order (no
 #: foreign keys are declared, so order only needs schema_version last for
 #: readability). Used by `init_schema` and exposed for the test loader.
@@ -1567,6 +1591,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "openfigi_types",
     "successor_chains",
     "mergers",
+    "spinoff_allocations",
     "ingestion_runs",
     "schema_version",
 )
@@ -3239,7 +3264,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_MERGER_RECEIPT_VERSION,
         _PRE_BREAKS_VERSION,
         _PRE_ASSETS_INTERSECTION_VERSION,
-        _PRE_T254_VERSION,
+        _PRE_SPINOFF_ALLOCATIONS_VERSION,
         _PRE_SEC_FORMS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
@@ -4222,7 +4247,7 @@ def _migrate_breaks(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 37 store to version 38.
+    version-2 to 38 store to version 39.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -4404,7 +4429,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_MERGER_RECEIPT_VERSION,
         _PRE_BREAKS_VERSION,
         _PRE_ASSETS_INTERSECTION_VERSION,
-        _PRE_T254_VERSION,
+        _PRE_SPINOFF_ALLOCATIONS_VERSION,
         _PRE_SEC_FORMS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
@@ -4451,6 +4476,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _SUCCESSOR_CHAINS_TABLE_DDL
             + _MERGERS_TABLE_DDL
             + _BREAKS_TABLE_DDL
+            + _SPINOFF_ALLOCATIONS_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)

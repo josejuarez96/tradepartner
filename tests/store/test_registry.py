@@ -1188,6 +1188,7 @@ def test_every_fact_table_is_classified_for_trial_vintage(
             "symbol_changes",
             "openfigi_types",
             "mergers",
+            "spinoff_allocations",
             "sec_filing_events",
             "sec_form4_transactions",
         }
@@ -2479,6 +2480,19 @@ def test_a_check_only_dividend_alone_moves_nothing_but_a_universe_dividend_does(
     )
     for flag in (False, True):
         assert registry.data_vintage(fixture_store, cutoff, spin_offs=flag) == _LATE_INGEST
+
+
+def test_spinoff_allocation_does_not_move_trial_vintage(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    cutoff = datetime(2020, 1, 1, tzinfo=UTC)
+    before = registry.data_vintage(fixture_store, cutoff, spin_offs=True)
+    stamp = datetime(2019, 1, 1, tzinfo=UTC)
+    fixture_store.execute(
+        "INSERT INTO spinoff_allocations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ["P", "C", date(2018, 12, 13), 0.3, stamp, stamp, "owner", "owner"],
+    )
+    assert registry.data_vintage(fixture_store, cutoff, spin_offs=True) == before
 
 
 def test_sec_ownership_rows_do_not_move_trial_vintage() -> None:
