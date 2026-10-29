@@ -35,6 +35,7 @@ from tradepartner.store.journal import (
     DecisionRow,
     FillRow,
     OrderedFill,
+    OrderRow,
     PaperRunRow,
     PaperWindowRow,
     PaperWindowStopRow,
@@ -235,6 +236,7 @@ def _journal(
     decisions: Sequence[DecisionRow] = (),
     decision_events: Sequence[DecisionEventRow] = (),
     fills: Sequence[OrderedFill] = (),
+    orders: Sequence[OrderRow] = (),
     runs: Sequence[PaperRunRow] = (_run(1, T0), _run(2, T1)),
     rebalance_events: Sequence[RebalanceEventRow] = (),
 ) -> Journal:
@@ -244,6 +246,7 @@ def _journal(
         decisions=decisions,
         decision_events=decision_events,
         fills=fills,
+        orders=orders,
         runs=runs,
         rebalance_events=rebalance_events,
     )
@@ -702,10 +705,6 @@ def test_residue_untradable_null_flag() -> None:
 @pytest.mark.parametrize(
     ("kind", "message"),
     [
-        ("merger_receipt", "not built until T316b"),
-        ("spinoff_receipt", "not built until T316b"),
-        ("auto_true_up", "not built until T316b"),
-        ("owner_true_up", "not built until T316b"),
         ("carried_residue", "carried_residue inside period"),
         ("unknown_cash", "unclassified unknown_cash"),
     ],
@@ -748,32 +747,71 @@ def test_residue_refuses_unhandled_period_row(kind: str, message: str) -> None:
         )
 
 
-def test_residue_refuses_live_fill_until_t316b() -> None:
-    marks = [_position_mark(T0, A, 10, 20, cash=99_800), _position_mark(T1, A, 10, 20, cash=99_800)]
+def test_residue_live_fill_values_opening_holding() -> None:
+    marks = [
+        _position_mark(T0, A, 10.3, 20, cash=99_794),
+        _position_mark(T1, A, 15.3, 21, cash=99_694),
+    ]
     carried = AdjustmentRow(
+        adjustment_id=next(_IDS),
         window_id=WINDOW_ID,
         session=T0,
         kind="carried_residue",
         origin="dust",
         security_id=A,
-        quantity=10,
+        quantity=0.3,
         known_at=_utc(T0),
         ingested_at=_utc(T0),
     )
     journal = _journal(
         positions_daily=marks,
         adjustments=[carried],
-        fills=[_fill("fill", "buy", A, _utc(T1), 1, 20)],
+        fills=[
+            _fill("opening", "buy", A, _utc(T0), 10, 20),
+            _fill("fill", "buy", A, _utc(T1), 5, 20),
+        ],
+        orders=[
+            OrderRow(
+                client_order_id="fill",
+                decision_id=1,
+                run_id=1,
+                session=T1,
+                attempt=1,
+                phase="buy",
+                security_id=A,
+                symbol=A,
+                side="buy",
+                quantity=5,
+                sells_in_flight_at_submit=False,
+                known_at=_utc(T1),
+                ingested_at=_utc(T1),
+            ),
+            OrderRow(
+                client_order_id="opening",
+                decision_id=1,
+                run_id=1,
+                session=T0,
+                attempt=1,
+                phase="buy",
+                security_id=A,
+                symbol=A,
+                side="buy",
+                quantity=10,
+                sells_in_flight_at_submit=False,
+                known_at=_utc(T0),
+                ingested_at=_utc(T0),
+            ),
+        ],
     )
-    with pytest.raises(ValueError, match="not built until T316b"):
-        compare_periods(
-            _window(),
-            _trial({T0: 100_000, T1: 100_000}, {T0: 0}),
-            journal,
-            _no_actions(),
-            _prices({(A, T1): 20}),
-            None,
-        )
+    result = compare_periods(
+        _window(),
+        _trial({T0: 100_000, T1: 100_000}, {T0: 0}),
+        journal,
+        _no_actions(),
+        _prices({(A, T0): 20, (A, T1): 20}),
+        None,
+    )
+    assert result.periods[0].residue_term == pytest.approx(0.3 / 100_000)
 
 
 def test_late_credit_enters_first_mark_that_absorbs_it() -> None:
@@ -984,7 +1022,7 @@ def test_adjustment_known_after_first_close_cannot_create_first_residue() -> Non
 
 
 @pytest.mark.parametrize("kind", ["merger_receipt", "spinoff_receipt"])
-def test_receipt_on_receiving_name_refuses_before_source_is_valued(kind: str) -> None:
+def test_receipt_on_receiving_name_values_source(kind: str) -> None:
     marks = [_position_mark(T0, A, 5, 20, cash=99_900), _position_mark(T1, B, 2, 60, cash=99_900)]
     rows = [
         AdjustmentRow(
@@ -1020,18 +1058,26 @@ def test_receipt_on_receiving_name_refuses_before_source_is_valued(kind: str) ->
         ),
     ]
     journal = _journal(positions_daily=marks, adjustments=rows)
-    with pytest.raises(ValueError, match="not built until T316b"):
-        compare_periods(
-            _window(),
-            _trial({T0: 100_000, T1: 100_020}, {T0: 0}),
-            journal,
-            _no_actions(),
-            _no_price,
-            None,
+    actions = _no_actions()
+    if kind == "spinoff_receipt":
+        actions = pl.DataFrame(
+            {
+                "security_id": [B],
+                "source_action_id": [A],
+                "action_type": ["spinoff"],
+                "ex_date": [T1],
+                "ratio_or_amount": [0.4],
+                "known_at": [_utc(T1)],
+                "cancelled": [False],
+            }
         )
+    result = compare_periods(
+        _window(), _trial({T0: 100_000, T1: 100_020}, {T0: 0}), journal, actions, _no_price, None
+    )
+    assert result.periods[0].residue_term == pytest.approx(20 / 100_000)
 
 
-def test_receipt_with_no_residue_keeps_zero_term() -> None:
+def test_receipt_without_merger_source_refuses() -> None:
     marks = [_position_mark(T0, A, 5, 20, cash=99_900), _position_mark(T1, B, 2, 60, cash=99_900)]
     receipt = AdjustmentRow(
         window_id=WINDOW_ID,
@@ -1042,15 +1088,614 @@ def test_receipt_with_no_residue_keeps_zero_term() -> None:
         known_at=_utc(T1),
         ingested_at=_utc(T1),
     )
+    with pytest.raises(ValueError, match="no merger source"):
+        compare_periods(
+            _window(),
+            _trial({T0: 100_000, T1: 100_020}, {T0: 0}),
+            _journal(positions_daily=marks, adjustments=[receipt]),
+            _no_actions(),
+            _no_price,
+            None,
+        )
+
+
+@pytest.mark.parametrize("missing", ["action", "child_mark"])
+def test_spinoff_receipt_requires_live_action_and_child_mark(missing: str) -> None:
+    marks = [_position_mark(T0, A, 5, 20, cash=99_900), _position_mark(T1, A, 5, 19, cash=99_900)]
+    if missing != "child_mark":
+        marks.append(_position_mark(T1, B, 2, 10, cash=99_900))
+    rows = [
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T0,
+            kind="carried_residue",
+            origin="dust",
+            security_id=A,
+            quantity=5,
+            known_at=_utc(T0),
+            ingested_at=_utc(T0),
+        ),
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T1,
+            kind="spinoff_receipt",
+            security_id=B,
+            quantity=2,
+            known_at=_utc(T1),
+            ingested_at=_utc(T1),
+        ),
+    ]
+    actions = (
+        _no_actions()
+        if missing == "action"
+        else pl.DataFrame(
+            {
+                "security_id": [B],
+                "source_action_id": [A],
+                "action_type": ["spinoff"],
+                "ex_date": [T1],
+                "ratio_or_amount": [0.4],
+                "known_at": [_utc(T1)],
+                "cancelled": [False],
+            }
+        )
+    )
+    with pytest.raises(
+        ValueError, match=("spinoff action" if missing == "action" else "mark_price")
+    ):
+        compare_periods(
+            _window(),
+            _trial({T0: 100_000, T1: 100_015}, {T0: 0}),
+            _journal(positions_daily=marks, adjustments=rows),
+            actions,
+            _no_price,
+            None,
+        )
+
+
+def test_spinoff_parent_fill_with_receipt_refuses() -> None:
+    marks = [
+        _position_mark(T0, A, 5, 20, cash=99_900),
+        _position_mark(T1, A, 6, 19, cash=99_880),
+        _position_mark(T1, B, 2, 10, cash=99_880),
+    ]
+    rows = [
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T0,
+            kind="carried_residue",
+            origin="dust",
+            security_id=A,
+            quantity=5,
+            known_at=_utc(T0),
+            ingested_at=_utc(T0),
+        ),
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T1,
+            kind="spinoff_receipt",
+            security_id=B,
+            quantity=2,
+            known_at=_utc(T1),
+            ingested_at=_utc(T1),
+        ),
+    ]
+    action = pl.DataFrame(
+        {
+            "security_id": [B],
+            "source_action_id": [A],
+            "action_type": ["spinoff"],
+            "ex_date": [T1],
+            "ratio_or_amount": [0.4],
+            "known_at": [_utc(T1)],
+            "cancelled": [False],
+        }
+    )
+    with pytest.raises(ValueError, match="fill with quantity-bearing period row"):
+        compare_periods(
+            _window(),
+            _trial({T0: 100_000, T1: 100_014}, {T0: 0}),
+            _journal(
+                positions_daily=marks,
+                adjustments=rows,
+                fills=[_fill("buy", "buy", A, _utc(T1), 1, 20)],
+            ),
+            action,
+            _prices({(A, T1): 20}),
+            None,
+        )
+
+
+def test_merger_cash_and_later_payment_use_journal_value() -> None:
+    carried = AdjustmentRow(
+        window_id=WINDOW_ID,
+        session=T0,
+        kind="carried_residue",
+        origin="dust",
+        security_id=A,
+        quantity=5,
+        known_at=_utc(T0),
+        ingested_at=_utc(T0),
+    )
+    removal = AdjustmentRow(
+        window_id=WINDOW_ID,
+        session=T1,
+        kind="corporate_action_cash",
+        security_id=A,
+        quantity=-5,
+        cash=110,
+        explanation_json='{"merger_id":"m1"}',
+        known_at=_utc(T1),
+        ingested_at=_utc(T1),
+    )
+    later = AdjustmentRow(
+        window_id=WINDOW_ID,
+        session=T2,
+        kind="corporate_action_cash",
+        security_id=A,
+        cash=10,
+        explanation_json='{"merger_id":"m1"}',
+        known_at=_utc(T2),
+        ingested_at=_utc(T2),
+    )
+    journal = _journal(
+        positions_daily=[
+            _position_mark(T0, A, 5, 20, cash=99_900),
+            _cash_mark(T1, 100_010),
+            _cash_mark(T2, 100_020),
+        ],
+        adjustments=[carried, removal, later],
+    )
     result = compare_periods(
         _window(),
-        _trial({T0: 100_000, T1: 100_020}, {T0: 0}),
-        _journal(positions_daily=marks, adjustments=[receipt]),
+        _trial({T0: 100_000, T1: 100_000, T2: 100_000}, {T0: 0, T1: 0}, (T0, T1, T2)),
+        journal,
+        _no_actions(),
+        _no_price,
+        None,
+    )
+    assert [p.residue_term for p in result.periods] == pytest.approx([10 / 100_000, 10 / 100_010])
+
+
+def test_late_cash_uses_rebalance_exit_start_and_mark_cut() -> None:
+    before_exit = previous_session(T1)
+    marks = [
+        _position_mark(T0, A, 10.3, 20, cash=99_794),
+        _position_mark(before_exit, A, 5.3, 20, cash=99_894),
+        _cash_mark(T1, 99_894),
+        _cash_mark(T2, 99_994),
+    ]
+    rows = [
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T0,
+            kind="carried_residue",
+            origin="dust",
+            security_id=A,
+            quantity=0.3,
+            known_at=_utc(T0),
+            ingested_at=_utc(T0),
+        ),
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T1,
+            kind="corporate_action_cash",
+            security_id=A,
+            quantity=-5.3,
+            cash=0,
+            known_at=_utc(T1),
+            ingested_at=_utc(T1),
+        ),
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T2,
+            kind="corporate_action_cash",
+            security_id=A,
+            cash=100,
+            explanation_json='{"delisting_cash":true}',
+            known_at=_utc(T2),
+            ingested_at=_utc(T2),
+        ),
+    ]
+    trial = _trial({T0: 100_000, T1: 100_000, T2: 100_000}, {T0: 0, T1: 0}, (T0, T1, T2))
+    result = compare_periods(
+        _window(),
+        trial,
+        _journal(positions_daily=marks, adjustments=rows),
+        _no_actions(),
+        _no_price,
+        None,
+    )
+    assert result.periods[1].residue_term == pytest.approx((100 * 0.3 / 10.3) / 99_894)
+    late = replace(rows[-1], known_at=_utc(T2) + timedelta(days=2))
+    result_late = compare_periods(
+        _window(),
+        trial,
+        _journal(positions_daily=marks, adjustments=[*rows[:-1], late]),
+        _no_actions(),
+        _no_price,
+        None,
+    )
+    assert result_late.periods[1].residue_term == 0
+
+
+def test_unheld_dividend_credit_without_residue_is_ignored() -> None:
+    marks = [_cash_mark(T0, 100_000), _cash_mark(T1, 100_005)]
+    row = AdjustmentRow(
+        window_id=WINDOW_ID,
+        session=T1,
+        kind="dividend_cash",
+        security_id=A,
+        cash=5,
+        known_at=_utc(T1),
+        ingested_at=_utc(T1),
+    )
+    result = compare_periods(
+        _window(),
+        _trial({T0: 100_000, T1: 100_000}, {T0: 0}),
+        _journal(positions_daily=marks, adjustments=[row]),
         _no_actions(),
         _no_price,
         None,
     )
     assert result.periods[0].residue_term == 0
+
+
+def test_late_dividend_credit_after_residue_exit_uses_entitlement() -> None:
+    prior = previous_session(T1)
+    marks = [
+        _position_mark(T0, A, 10.3, 20, cash=99_794),
+        _position_mark(prior, A, 10.3, 20, cash=99_794),
+        _cash_mark(T1, 99_794),
+        _cash_mark(T2, 99_799.15),
+    ]
+    rows = [
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T0,
+            kind="carried_residue",
+            origin="dust",
+            security_id=A,
+            quantity=0.3,
+            known_at=_utc(T0),
+            ingested_at=_utc(T0),
+        ),
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T1,
+            kind="corporate_action_cash",
+            security_id=A,
+            quantity=-10.3,
+            cash=0,
+            known_at=_utc(T1),
+            ingested_at=_utc(T1),
+        ),
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T2,
+            kind="dividend_cash",
+            security_id=A,
+            cash=5.15,
+            known_at=_utc(T2),
+            ingested_at=_utc(T2),
+        ),
+    ]
+    window = _window()
+    frozen = json.loads(window.frozen_json)
+    frozen["risk.reconcile_dividend_credit_sessions"] = 30
+    window = replace(window, frozen_json=json.dumps(frozen))
+    result = compare_periods(
+        window,
+        _trial({T0: 100_000, T1: 100_000, T2: 100_000}, {T0: 0, T1: 0}, (T0, T1, T2)),
+        _journal(positions_daily=marks, adjustments=rows),
+        _action(A, "dividend", T1, 0.5, _utc(T1)),
+        _no_price,
+        None,
+    )
+    assert result.periods[1].residue_term == pytest.approx(0.15 / 99_794)
+
+
+def test_late_delisting_cash_without_exit_period_has_zero_residue() -> None:
+    marks = [_cash_mark(T0, 100_000), _cash_mark(T1, 100_100)]
+    row = AdjustmentRow(
+        window_id=WINDOW_ID,
+        session=T1,
+        kind="corporate_action_cash",
+        security_id=A,
+        cash=100,
+        explanation_json='{"delisting_cash":true}',
+        known_at=_utc(T1),
+        ingested_at=_utc(T1),
+    )
+    result = compare_periods(
+        _window(),
+        _trial({T0: 100_000, T1: 100_000}, {T0: 0}),
+        _journal(positions_daily=marks, adjustments=[row]),
+        _no_actions(),
+        _no_price,
+        None,
+    )
+    assert result.periods[0].residue_term == 0
+
+
+def test_merger_receipt_with_two_sources_refuses() -> None:
+    marks = [
+        _position_mark(T0, A, 5, 20, cash=99_900),
+        _position_mark(T0, "OTHER", 1, 10, cash=99_900),
+        _position_mark(T1, B, 2, 60, cash=99_900),
+    ]
+    rows = [
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T1,
+            kind="corporate_action_cash",
+            security_id=name,
+            quantity=-1,
+            explanation_json='{"merger_id":"m1"}',
+            known_at=_utc(T1),
+            ingested_at=_utc(T1),
+        )
+        for name in (A, "OTHER")
+    ]
+    rows.append(
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T1,
+            kind="merger_receipt",
+            security_id=B,
+            quantity=2,
+            explanation_json='{"merger_id":"m1"}',
+            known_at=_utc(T1),
+            ingested_at=_utc(T1),
+        )
+    )
+    with pytest.raises(ValueError, match="multiple merger source"):
+        compare_periods(
+            _window(),
+            _trial({T0: 100_000, T1: 100_020}, {T0: 0}),
+            _journal(positions_daily=marks, adjustments=rows),
+            _no_actions(),
+            _no_price,
+            None,
+        )
+
+
+def test_received_merger_shares_are_excluded_from_acquirer_residue() -> None:
+    marks = [
+        _position_mark(T0, A, 5, 20, cash=99_850),
+        _position_mark(T0, B, 1, 50, cash=99_850),
+        _position_mark(T1, B, 3, 60, cash=99_850),
+    ]
+    carried = [
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T0,
+            kind="carried_residue",
+            origin="dust",
+            security_id=name,
+            quantity=quantity,
+            known_at=_utc(T0),
+            ingested_at=_utc(T0),
+        )
+        for name, quantity in ((A, 5), (B, 1))
+    ]
+    rows = [
+        *carried,
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T1,
+            kind="corporate_action_cash",
+            security_id=A,
+            quantity=-5,
+            cash=0,
+            explanation_json='{"merger_id":"m1"}',
+            known_at=_utc(T1),
+            ingested_at=_utc(T1),
+        ),
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T1,
+            kind="merger_receipt",
+            security_id=B,
+            quantity=2,
+            explanation_json='{"merger_id":"m1"}',
+            known_at=_utc(T1),
+            ingested_at=_utc(T1),
+        ),
+    ]
+    result = compare_periods(
+        _window(),
+        _trial({T0: 100_000, T1: 100_030}, {T0: 0}),
+        _journal(positions_daily=marks, adjustments=rows),
+        _no_actions(),
+        _no_price,
+        None,
+    )
+    assert result.periods[0].residue_term == pytest.approx(30 / 100_000)
+
+
+def test_fill_with_quantity_cash_in_lieu_refuses() -> None:
+    marks = [
+        _position_mark(T0, A, 10.3, 20, cash=99_794),
+        _position_mark(T1, A, 15, 21, cash=99_685),
+    ]
+    rows = [
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T0,
+            kind="carried_residue",
+            origin="dust",
+            security_id=A,
+            quantity=0.3,
+            known_at=_utc(T0),
+            ingested_at=_utc(T0),
+        ),
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T1,
+            kind="cash_in_lieu",
+            security_id=A,
+            quantity=-0.3,
+            cash=6.3,
+            known_at=_utc(T1),
+            ingested_at=_utc(T1),
+        ),
+    ]
+    with pytest.raises(ValueError, match="fill with quantity-bearing period row"):
+        compare_periods(
+            _window(),
+            _trial({T0: 100_000, T1: 100_000}, {T0: 0}),
+            _journal(
+                positions_daily=marks,
+                adjustments=rows,
+                fills=[_fill("buy", "buy", A, _utc(T1), 5, 20)],
+            ),
+            _no_actions(),
+            _prices({(A, T1): 20}),
+            None,
+        )
+
+
+def test_dividend_cash_with_fill_uses_pre_ex_date_holding() -> None:
+    prior = previous_session(T1)
+    marks = [
+        _position_mark(T0, A, 10.3, 20, cash=99_794),
+        _position_mark(prior, A, 5.3, 20, cash=99_894, run_id=3),
+        _position_mark(T1, A, 10.3, 19.5, cash=99_799.15),
+    ]
+    rows = [
+        AdjustmentRow(
+            adjustment_id=next(_IDS),
+            window_id=WINDOW_ID,
+            session=date(2026, 6, 30),
+            kind="dividend_cash",
+            security_id=A,
+            cash=5,
+            known_at=_utc(date(2026, 6, 30)),
+            ingested_at=_utc(date(2026, 6, 30)),
+        ),
+        AdjustmentRow(
+            adjustment_id=next(_IDS),
+            window_id=WINDOW_ID,
+            session=T0,
+            kind="carried_residue",
+            origin="dust",
+            security_id=A,
+            quantity=0.3,
+            known_at=_utc(T0),
+            ingested_at=_utc(T0),
+        ),
+        AdjustmentRow(
+            adjustment_id=next(_IDS),
+            window_id=WINDOW_ID,
+            session=T1,
+            kind="dividend_cash",
+            security_id=A,
+            cash=2.65,
+            known_at=_utc(T1),
+            ingested_at=_utc(T1),
+        ),
+    ]
+    fills = [
+        _fill("opening", "buy", A, _utc(T0), 10, 20),
+        _fill("sale", "sell", A, _utc(prior), 5, 20),
+        _fill("later", "buy", A, _utc(T1), 5, 20),
+    ]
+    orders = [
+        OrderRow(
+            client_order_id=label,
+            decision_id=1,
+            run_id=1,
+            session=day,
+            attempt=1,
+            phase=side,
+            security_id=A,
+            symbol=A,
+            side=side,
+            quantity=quantity,
+            sells_in_flight_at_submit=False,
+            known_at=_utc(day),
+            ingested_at=_utc(day),
+        )
+        for label, day, quantity, side in (
+            ("opening", T0, 10, "buy"),
+            ("sale", prior, 5, "sell"),
+            ("later", T1, 5, "buy"),
+        )
+    ]
+    actions = _action(A, "dividend", T1, 0.5, _utc(T1))
+    decision_id = next(_IDS)
+    decision = DecisionRow(
+        decision_id=decision_id,
+        run_id=3,
+        security_id=A,
+        whole_share=False,
+        decision="forced_exit",
+        reason="window_stop",
+        known_at=_utc(prior),
+        ingested_at=_utc(prior),
+    )
+    event = DecisionEventRow(
+        decision_id=decision_id,
+        run_id=3,
+        status="skipped",
+        reason="dust",
+        known_at=_utc(prior),
+        ingested_at=_utc(prior),
+    )
+    result = compare_periods(
+        _window(),
+        _trial({T0: 100_000, T1: 100_000}, {T0: 0}),
+        _journal(
+            positions_daily=marks,
+            adjustments=rows,
+            fills=fills,
+            orders=orders,
+            decisions=[decision],
+            decision_events=[event],
+            runs=(_run(1, T0), _run(2, T1), _run(3, prior)),
+        ),
+        actions,
+        _prices({(A, T0): 20, (A, prior): 20, (A, T1): 20}),
+        None,
+    )
+    assert result.periods[0].residue_term == pytest.approx(0)
+
+
+@pytest.mark.parametrize("kind", ["owner_true_up", "auto_true_up"])
+def test_residue_true_up_is_listed(kind: str) -> None:
+    marks = [_position_mark(T0, A, 5, 20, cash=99_900), _position_mark(T1, A, 6, 20, cash=99_900)]
+    rows = [
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T0,
+            kind="carried_residue",
+            origin="dust",
+            security_id=A,
+            quantity=5,
+            known_at=_utc(T0),
+            ingested_at=_utc(T0),
+        ),
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T1,
+            kind=kind,
+            security_id=A,
+            quantity=1,
+            known_at=_utc(T1),
+            ingested_at=_utc(T1),
+        ),
+    ]
+    result = compare_periods(
+        _window(),
+        _trial({T0: 100_000, T1: 100_020}, {T0: 0}),
+        _journal(positions_daily=marks, adjustments=rows),
+        _no_actions(),
+        _no_price,
+        None,
+    )
+    assert result.periods[0].residue_term == pytest.approx(20 / 100_000)
+    assert result.periods[0].residue_trued_up == (A,)
 
 
 def test_residue_quantity_uses_close_cut_even_when_mark_is_written_later(
@@ -1199,38 +1844,53 @@ def test_unclassified_row_refuses_even_without_residue(kind: str, message: str) 
         )
 
 
-def test_late_cash_on_exited_residue_refuses_until_t316b() -> None:
-    marks = [_cash_mark(T0, 100_000), _cash_mark(T1, 100_000)]
+def test_late_cash_on_exited_residue_uses_exit_fraction() -> None:
+    marks = [
+        _position_mark(T0, A, 10, 20, cash=99_800),
+        _cash_mark(T1, 99_800),
+        _cash_mark(T2, 99_900),
+    ]
     rows = [
         AdjustmentRow(
             window_id=WINDOW_ID,
-            session=date(2026, 9, 1),
+            session=T0,
             kind="carried_residue",
             origin="dust",
             security_id=A,
             quantity=10,
-            known_at=_utc(date(2026, 9, 1)),
-            ingested_at=_utc(date(2026, 9, 1)),
+            known_at=_utc(T0),
+            ingested_at=_utc(T0),
         ),
         AdjustmentRow(
             window_id=WINDOW_ID,
             session=T1,
             kind="corporate_action_cash",
             security_id=A,
-            cash=5,
+            quantity=-10,
+            cash=0,
             known_at=_utc(T1),
             ingested_at=_utc(T1),
         ),
+        AdjustmentRow(
+            window_id=WINDOW_ID,
+            session=T2,
+            kind="corporate_action_cash",
+            security_id=A,
+            cash=100,
+            explanation_json='{"delisting_cash":true}',
+            known_at=_utc(T2),
+            ingested_at=_utc(T2),
+        ),
     ]
-    with pytest.raises(ValueError, match="not built until T316b"):
-        compare_periods(
-            _window(),
-            _trial({T0: 100_000, T1: 100_000}, {T0: 0}),
-            _journal(positions_daily=marks, adjustments=rows),
-            _no_actions(),
-            _no_price,
-            None,
-        )
+    result = compare_periods(
+        _window(),
+        _trial({T0: 100_000, T1: 100_000, T2: 100_000}, {T0: 0, T1: 0}, (T0, T1, T2)),
+        _journal(positions_daily=marks, adjustments=rows),
+        _no_actions(),
+        _no_price,
+        None,
+    )
+    assert [p.residue_term for p in result.periods] == pytest.approx([-200 / 100_000, 100 / 99_800])
 
 
 def test_raw_rule_excludes_missed_lists_override() -> None:
