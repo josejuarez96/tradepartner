@@ -1083,6 +1083,15 @@ class SchemaVersionError(RuntimeError):
     operate on it rather than guessing."""
 
 
+class SchemaMigrationRequiredError(SchemaVersionError):
+    """An older writable store requires the explicit backed-up migration."""
+
+
+# Only store.migrate enables this around its init_schema call. Tests replace it
+# for legacy migration fixtures; there is deliberately no settings/env route.
+_ALLOW_MIGRATION = False
+
+
 class RegistryNotInitialised(RuntimeError):
     """A read-only connection opened a store without the trial registry
     (a version-2 store, or one never initialised). Read-only
@@ -4435,6 +4444,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
             f"store schema_version is {max_version}, this code expects {CURRENT_SCHEMA_VERSION}"
+        )
+    if max_version is not None and max_version < CURRENT_SCHEMA_VERSION and not _ALLOW_MIGRATION:
+        raise SchemaMigrationRequiredError(
+            f"store schema_version is {max_version}, this code expects {CURRENT_SCHEMA_VERSION}; "
+            "run `tradepartner ingest` to back up and migrate the store"
         )
     with atomic(conn):
         if max_version in pre_identity:

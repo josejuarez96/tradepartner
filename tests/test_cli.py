@@ -30,7 +30,7 @@ from tradepartner.backfill import FILLED, NO_HOLE, UNASSIGNED, Hole, HoleFill, N
 from tradepartner.calendar import session_close
 from tradepartner.config import Settings
 from tradepartner.ingest import FAILED, OK, STALE, IngestResult, RestampResult, SourceRun
-from tradepartner.store import journal, registry
+from tradepartner.store import journal, registry, schema
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.dividend_reviews import ReviewedGroup
 from tradepartner.store.schema import init_schema
@@ -55,6 +55,96 @@ def _settings(tmp_path: Path, store: Path | None = None, **overrides: Any) -> Se
 def _invoke(settings: Settings, args: Sequence[str], **kwargs: Any) -> Any:  # click.testing.Result
     app = cli.make_app(settings=lambda: settings, clock=kwargs.pop("clock", lambda: NOW), **kwargs)
     return CliRunner().invoke(app, list(args))
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["ingest", "--source", "fred"],
+        ["ingest", "--source", "alpaca", "--backfill", "--since", "2020-01-01"],
+        ["ingest", "--source", "alpaca", "--backfill", "--since", "2020-01-01", "--fill-holes"],
+        ["ingest", "--source", "alpaca_assets", "--import-dir", "/tmp/nonexistent-assets"],
+        ["ingest", "--source", "openfigi"],
+    ],
+)
+def test_ingest_entry_points_migrate_before_source_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> None:
+    from tradepartner.store import migrate as store_migrate
+
+    settings = _settings(tmp_path)
+    if args[-1] == "openfigi":
+        settings = settings.model_copy(
+            update={"openfigi": settings.openfigi.model_copy(update={"enabled": True})}
+        )
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        conn.execute("UPDATE schema_version SET version = ?", [schema.CURRENT_SCHEMA_VERSION - 1])
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+    monkeypatch.setattr(cli, "_missing_secrets", lambda *_: [])
+
+    def refuse(_settings: Settings) -> None:
+        raise schema.SchemaMigrationRequiredError("migration refused")
+
+    monkeypatch.setattr(store_migrate, "migrate", refuse)
+    result = _invoke(settings, args)
+    assert result.exit_code != 0, result.output
+    assert "migration refused" in result.output
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM ingestion_runs").fetchone() == (0,)
+
+
+def test_ingest_dry_run_refuses_older_store_without_migrating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import migrate as store_migrate
+
+    settings = _settings(tmp_path)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        conn.execute("UPDATE schema_version SET version = ?", [schema.CURRENT_SCHEMA_VERSION - 1])
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+    monkeypatch.setattr(cli, "_missing_secrets", lambda *_: [])
+    monkeypatch.setattr(store_migrate, "migrate", lambda _: pytest.fail("dry-run migrated"))
+    result = _invoke(settings, ["ingest", "--source", "fred", "--dry-run"])
+    assert result.exit_code != 0
+    assert "tradepartner ingest" in result.output
+
+
+def test_scheduled_ingest_migration_refusal_pings_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import migrate as store_migrate
+
+    settings = _settings(tmp_path)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        conn.execute("UPDATE schema_version SET version = ?", [schema.CURRENT_SCHEMA_VERSION - 1])
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+    monkeypatch.setattr(cli, "_missing_secrets", lambda *_: [])
+    calls: list[tuple[str, bool]] = []
+    monkeypatch.setattr(cli.heartbeat, "ping", lambda _s, job, *, ok: calls.append((job, ok)))
+
+    def refuse(_settings: Settings) -> None:
+        raise schema.SchemaMigrationRequiredError("migration refused")
+
+    monkeypatch.setattr(store_migrate, "migrate", refuse)
+    result = _invoke(settings, ["ingest"])
+    assert result.exit_code == 1
+    assert calls == [("ingest", False)]
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM ingestion_runs").fetchone() == (0,)
+
+
+def test_fill_holes_on_missing_store_refuses_before_migration(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    result = _invoke(
+        settings,
+        ["ingest", "--backfill", "--since", "2020-01-01", "--source", "alpaca", "--fill-holes"],
+    )
+    assert result.exit_code != 0
+    assert "no store" in result.output
+    assert not Path(settings.store.path).exists()
 
 
 def _run_row(
@@ -600,7 +690,8 @@ class _FillRecorder:
 
 
 def _with_store(settings: Settings) -> Settings:
-    Path(settings.store.path).touch()
+    with open_for_write(settings) as conn:
+        init_schema(conn)
     return settings
 
 

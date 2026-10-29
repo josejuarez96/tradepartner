@@ -514,6 +514,7 @@ from tradepartner.store import (
     research,
     schema,
 )
+from tradepartner.store import migrate as store_migrate
 from tradepartner.store.asof import ASSETS_SOURCE
 from tradepartner.store.db import (
     StoreLockedError,
@@ -1676,6 +1677,8 @@ def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
         message, code = f"refused: {exc.reason}: {exc}", PAPER_REFUSAL_EXIT["refused"]
     except registry.UnknownHypothesis as exc:
         message, code = f"refused: unknown_hypothesis: {exc}", PAPER_REFUSAL_EXIT["refused"]
+    except (schema.SchemaVersionError, store_backup_module.BackupError) as exc:
+        message, code = f"refused: {exc}", PAPER_REFUSAL_EXIT["refused"]
     except window.KillWriteFailed as exc:
         message, code = f"failed: {exc}", WRITE_FAILED_EXIT_CODE
     except Exception as exc:
@@ -2402,17 +2405,16 @@ def make_app(
                 raise _fail(f"--through must be YYYY-MM-DD, got {through!r}", USAGE_ERROR) from None
         base = settings()  # the edges get the caller's own Settings; only the store wait differs
         s = _writer_settings(base)
+        scheduled_ingest = (
+            source == "all"
+            and start is None
+            and not dry_run
+            and restamp is None
+            and not (rebuild_statement_facts or rebuild_filing_events or rebuild_classifications)
+        )
         if (refusal := ingest_floor_refusal(s)) is not None:
             # Before any store write, so it can never fire mid-write (#2454).
-            if (
-                source == "all"
-                and start is None
-                and not dry_run
-                and restamp is None
-                and not (
-                    rebuild_statement_facts or rebuild_filing_events or rebuild_classifications
-                )
-            ):
+            if scheduled_ingest:
                 heartbeat.ping(s, "ingest", ok=False)  # same shape as the scheduled job (#2155)
             raise _fail(refusal, 1)
         if source == "openfigi" and not s.openfigi.enabled:
@@ -2433,20 +2435,47 @@ def make_app(
             )
         if rebuild_filing_events and not s.edgar.filing_events_enabled:
             raise _fail("--rebuild-filing-events needs edgar.filing_events_enabled", USAGE_ERROR)
-        if fill_holes_ and start is not None:
-            if (absent := _store_missing(s)) is not None:
-                raise absent
-            if dry_run:  # fetches nothing: no secret needed
-                listed = fill_holes(
-                    s,
-                    prices=_NoPrices(),
-                    since=start,
-                    clock=clock,
-                    dry_run=True,
-                    securities=named,
+        if fill_holes_ and (absent := _store_missing(s)) is not None:
+            raise absent
+        if import_dir is None and not (fill_holes_ and dry_run):
+            missing = _missing_secrets(s, source)
+            if missing:
+                raise _fail(
+                    f"missing required secret(s): {', '.join(missing)}. "
+                    "Set them in .env (see .env.example).",
+                    USAGE_ERROR,
                 )
-                _print_holes(listed)
-                raise typer.Exit(listed.exit_code)
+        try:
+            if dry_run:
+                if Path(s.store.path).is_file():
+                    with open_read_only(s) as conn:
+                        stored = schema.stored_version(conn)
+                    if stored != schema.CURRENT_SCHEMA_VERSION:
+                        raise schema.SchemaVersionError(
+                            f"store at schema {stored}, code at {schema.CURRENT_SCHEMA_VERSION}: "
+                            "run `tradepartner ingest` without --dry-run first"
+                        )
+            else:
+                store_migrate.migrate(s)
+        except (
+            schema.SchemaVersionError,
+            store_backup_module.BackupError,
+            StoreLockedError,
+        ) as exc:
+            if scheduled_ingest:
+                heartbeat.ping(s, "ingest", ok=False)
+            raise _fail(_scrubbed(f"refused: {exc}", s), 1) from None
+        if fill_holes_ and start is not None and dry_run:  # fetches nothing: no secret needed
+            listed = fill_holes(
+                s,
+                prices=_NoPrices(),
+                since=start,
+                clock=clock,
+                dry_run=True,
+                securities=named,
+            )
+            _print_holes(listed)
+            raise typer.Exit(listed.exit_code)
         if import_dir is not None:  # no request: no secret needed
             try:
                 imported = import_assets(s, import_dir, clock=clock, dry_run=dry_run)
@@ -2454,13 +2483,6 @@ def make_app(
                 raise _fail(f"--import-dir: {exc}", USAGE_ERROR) from None
             _print_import(imported)
             raise typer.Exit(imported.exit_code)
-        missing = _missing_secrets(s, source)
-        if missing:
-            raise _fail(
-                f"missing required secret(s): {', '.join(missing)}. "
-                "Set them in .env (see .env.example).",
-                USAGE_ERROR,
-            )
         if actions_backfill:
             assert start is not None
             result = ingest_actions_backfill(
@@ -4545,12 +4567,7 @@ def make_app(
     ) -> None:
         """Migrate or refuse after option validation, before journal or broker work."""
         if not read_only:
-
-            def migrate() -> None:
-                with open_for_write(s) as conn:
-                    schema.init_schema(conn)
-
-            _paper_call(s, migrate)
+            _paper_call(s, lambda: store_migrate.migrate(s))
             return
 
         def read_version() -> int | None:
@@ -4580,7 +4597,7 @@ def make_app(
             found = "no schema" if version is None else f"schema {version}"
             message = (
                 f"store at {found}, code at {schema.CURRENT_SCHEMA_VERSION}: "
-                "run `tradepartner ingest` or any paper write command to migrate"
+                "run `tradepartner ingest` or a paper write command to migrate"
             )
         raise _fail(_scrubbed(message, s), refusal_exit)
 
