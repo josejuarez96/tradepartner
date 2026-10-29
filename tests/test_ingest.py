@@ -27,7 +27,7 @@ import pytest
 
 from tradepartner import ingest as ingest_module
 from tradepartner.adapters.alpaca_raw import AssetsFetch
-from tradepartner.adapters.edgar import StatementConflict, parse_statement_facts
+from tradepartner.adapters.edgar import StatementConflict, parse_form4, parse_statement_facts
 from tradepartner.adapters.edgar_source import EdgarFilingSource, SubmissionRecord
 from tradepartner.adapters.edgar_validation import InputValidationError, ValidationFailures
 from tradepartner.adapters.filings import (
@@ -41,6 +41,7 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    SecFormFiling,
     StatementFactRecord,
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
@@ -6977,3 +6978,152 @@ def test_an_unresolved_merger_is_stored_by_a_later_run_with_the_same_stamp(
     assert _run(settings, prices=prices, now=stamp + timedelta(days=3), source="alpaca").ok
     with duckdb.connect(str(fixture_store_path)) as conn:
         assert conn.execute("SELECT known_at FROM mergers").fetchall() == [(stamp,)]
+
+
+def test_sec_form4_accession_write_is_atomic_idempotent_and_refuses_changes(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    xml = (
+        Path(__file__).parent / "fixtures/edgar/sec_forms/form4_purchase_gift_indirect.xml"
+    ).read_text()
+    parsed = parse_form4(xml)
+    accession = "0000320193-26-000123"
+    accepted = datetime(2026, 9, 24, 21, 0, tzinfo=UTC)
+    filing = SecFormFiling(
+        accession,
+        "4",
+        accepted,
+        date(2026, 9, 24),
+        (parsed.issuer_cik,),
+        parsed.filer_ciks,
+        parsed.transactions,
+    )
+    write = ingest_module.write_sec_form_accession
+    first = write(fixture_store, filing, ingested_at=accepted + timedelta(hours=1))
+    assert first.added == len(parsed.filer_ciks) + len(parsed.transactions)
+    identical = write(fixture_store, filing, ingested_at=accepted + timedelta(hours=2))
+    assert (identical.added, identical.changed) == (0, 0)
+    changed = replace(filing, accepted_at=accepted + timedelta(minutes=1))
+    assert write(fixture_store, changed, ingested_at=accepted + timedelta(hours=2)).changed == 1
+    assert fixture_store.execute(
+        "SELECT DISTINCT known_at FROM sec_form4_transactions WHERE accession = ?", [accession]
+    ).fetchall() == [(accepted,)]
+
+
+def test_sec_ownership_amendment_coexists_and_filer_only_index_creates_no_security(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    accepted = datetime(2026, 9, 24, 21, 0, tzinfo=UTC)
+    original = SecFormFiling(
+        "0000950123-26-000001",
+        "SC 13D",
+        accepted,
+        date(2026, 9, 24),
+        ("0000111111",),
+        ("0000222222",),
+    )
+    amendment = replace(
+        original,
+        accession="0000950123-26-000002",
+        form="SC 13D/A",
+        accepted_at=accepted + timedelta(hours=1),
+    )
+    assert (
+        ingest_module.write_sec_form_accession(
+            fixture_store, original, ingested_at=accepted + timedelta(hours=2)
+        ).added
+        == 1
+    )
+    assert (
+        ingest_module.write_sec_form_accession(
+            fixture_store, amendment, ingested_at=accepted + timedelta(hours=2)
+        ).added
+        == 1
+    )
+    assert fixture_store.execute(
+        "SELECT count(*) FROM sec_filing_events WHERE subject_cik = '0000111111'"
+    ).fetchone() == (2,)
+    source = FixtureFilingSource(
+        index=[FilingIndexEntry("0000222222", "Activist", "SC 13D", original.accession, accepted)]
+    )
+    built = build_master(source, settings, ingested_at=accepted + timedelta(hours=2))
+    assert not any(row["cik"] == "0000222222" for row in built.securities)
+
+
+def test_sec_13d_full_ingest_switch_and_run_message(settings: Settings) -> None:
+    accepted = NOW - timedelta(hours=1)
+    filing = SecFormFiling(
+        "0000950123-19-000001",
+        "SC 13D",
+        accepted,
+        SESSION,
+        (ACME,),
+        ("0000222222", "0000333333"),
+    )
+    source = _filings()
+    source._sec_forms_13d = [filing]
+    disabled = _run(settings, filings=source, source="edgar")
+    assert disabled.ok
+    with duckdb.connect(settings.store.path) as conn:
+        assert conn.execute("SELECT count(*) FROM sec_filing_events").fetchone() == (0,)
+    enabled = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    first = _run(enabled, filings=source, source="edgar")
+    assert first.ok and "sec_forms_added: 2" in first.runs[0].message
+    second = _run(enabled, filings=source, source="edgar")
+    assert second.ok and "sec_forms_added: 0" in second.runs[0].message
+    assert "sec_forms_changed: 0" in second.runs[0].message
+    with duckdb.connect(settings.store.path) as conn:
+        assert conn.execute(
+            "SELECT filer_cik FROM sec_filing_events ORDER BY filer_cik"
+        ).fetchall() == [("0000222222",), ("0000333333",)]
+
+
+def test_sec_form_write_refuses_future_acceptance(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    accepted = datetime(2026, 9, 24, 21, 0, tzinfo=UTC)
+    filing = SecFormFiling(
+        "0000950123-26-000009",
+        "SC 13D",
+        accepted,
+        date(2026, 9, 24),
+        ("0000111111",),
+        ("0000222222",),
+    )
+    result = ingest_module.write_sec_form_accession(
+        fixture_store, filing, ingested_at=accepted - timedelta(minutes=1)
+    )
+    assert result.not_yet_known == 1
+    assert fixture_store.execute(
+        "SELECT count(*) FROM sec_filing_events WHERE accession = ?", [filing.accession]
+    ).fetchone() == (0,)
+
+
+def test_sec_13d_later_qualifying_subject_is_added_without_changed_count(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    accepted = datetime(2026, 9, 24, 21, 0, tzinfo=UTC)
+    filing = SecFormFiling(
+        "0000950123-26-000010",
+        "SCHEDULE 13D",
+        accepted,
+        date(2026, 9, 24),
+        ("0000111111", "0000555555"),
+        ("0000222222",),
+    )
+    write = ingest_module.write_sec_form_accession
+    first = write(
+        fixture_store,
+        replace(filing, subject_ciks=(filing.subject_ciks[0],)),
+        ingested_at=accepted + timedelta(hours=1),
+    )
+    later = write(
+        fixture_store,
+        replace(filing, subject_ciks=(filing.subject_ciks[1],)),
+        ingested_at=accepted + timedelta(hours=2),
+    )
+    assert (first.added, first.changed, later.added, later.changed) == (1, 0, 1, 0)
+    assert fixture_store.execute(
+        "SELECT subject_cik FROM sec_filing_events WHERE accession = ? ORDER BY subject_cik",
+        [filing.accession],
+    ).fetchall() == [("0000111111",), ("0000555555",)]
