@@ -399,10 +399,12 @@ def _residue_term(
 ) -> tuple[float, tuple[str, ...]]:
     """(the residue sum, the names valued at a carried mark). A name with no
     bar on T_i or T_{i+1} is valued at the mark `marks_for` already wrote for
-    that session (#2570): the last close known at that session, carried only
-    within the marks' own rules and the window's frozen
-    `paper.max_stale_mark_sessions` (spec req 7, #678), never a later bar.
-    No mark row, no value: it raises."""
+    that session (#2570): the last close known at that session, carried by
+    the marks' own rules (spec req 7, #678), never a later bar. The frozen
+    `paper.max_stale_mark_sessions` bounds a tradable name's carry only; an
+    untradable (delisted) name, the #2570 case, is carried at its last close
+    with no session bound, as the marks carry it. No mark row, no value: it
+    raises."""
     held = {
         row.security_id: row.quantity
         for row in journal.positions_daily

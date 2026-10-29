@@ -809,6 +809,31 @@ def test_residue_of_delisted_untradable_name_uses_carried_mark_and_is_flagged() 
     assert result.periods[0].residue_carried == (A,)
 
 
+def test_residue_carried_mark_across_a_split_is_put_on_one_basis() -> None:
+    # A 2:1 split inside the period with no bars: the marks carry 40.0 on T0
+    # and 20.0 (post-split) on T1. The T1 mark is scaled back to T0's basis,
+    # so the split is not a loss: the residue term is 0 (quant-auditor, #2575).
+    equity = {T0: 100_000.0, T1: 100_000.0}
+    trial = _trial(equity, {T0: 0.0})
+    cash = 100_000.0 - 10.0 * 40.0
+    marks = [
+        _position_mark(T0, A, 10.0, 40.0, tradable=False, cash=cash),
+        _position_mark(T1, A, 20.0, 20.0, tradable=False, cash=cash),
+    ]
+    split_actions = _action(A, "split", date(2026, 10, 15), 2.0, _utc(T1))
+    result = compare_periods(
+        _window(),
+        trial,
+        _delisted_residue_journal(marks),
+        split_actions,
+        _no_price,
+        _no_price,
+        None,
+    )
+    assert result.periods[0].residue_term == pytest.approx(0.0)
+    assert result.periods[0].residue_carried == (A,)
+
+
 def test_residue_carried_mark_ignores_marks_of_later_sessions() -> None:
     # No look-ahead: only the marks on T_i and T_{i+1} price the residue. A
     # mark (or bar) of a later session, here 999.0 at T2, never reaches it.
