@@ -2738,6 +2738,59 @@ def make_app(
                 f"{len(result.stale)} stale list entries: re-review them before a real run", 1
             )
 
+    @app.command("spinoff-allocation")
+    def spinoff_allocation(
+        parent: Annotated[str, typer.Option(help="parent security_id")],
+        child: Annotated[str, typer.Option(help="child security_id")],
+        ex_date: Annotated[str, typer.Option(help="spin-off ex-date YYYY-MM-DD")],
+        fraction: Annotated[str, typer.Option(help="Form 8937 basis fraction [0, 1]")],
+    ) -> None:
+        """Record an owner-read Form 8937 fraction at the current UTC clock."""
+        try:
+            value = float(fraction)
+        except ValueError:
+            raise _fail("fraction must be numeric and in [0, 1]", USAGE_ERROR) from None
+        if not 0 <= value <= 1:
+            raise _fail("fraction must be numeric and in [0, 1]", USAGE_ERROR)
+        try:
+            ex_session = date.fromisoformat(ex_date)
+        except ValueError:
+            raise _fail("ex-date must be YYYY-MM-DD", USAGE_ERROR) from None
+        parent, child = parent.strip(), child.strip()
+        if not parent or not child or parent == child:
+            raise _fail("parent and child must be distinct security IDs", USAGE_ERROR)
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                stamp = ensure_tz_aware_utc(clock(), field_name="clock")
+                action = conn.execute(
+                    "SELECT ex_date, cancelled FROM corporate_actions "
+                    "WHERE security_id = ? AND source_action_id = ? AND action_type = 'spinoff' "
+                    "AND known_at <= ? ORDER BY known_at DESC LIMIT 1",
+                    [child, parent, stamp],
+                ).fetchone()
+                if action is None or action[0] != ex_session or action[1]:
+                    raise _fail("no live spin-off matches parent, child, and ex-date", USAGE_ERROR)
+                duplicate = conn.execute(
+                    "SELECT 1 FROM spinoff_allocations WHERE parent_security_id = ? "
+                    "AND child_security_id = ? AND ex_date = ? AND known_at = ?",
+                    [parent, child, ex_session, stamp],
+                ).fetchone()
+                if duplicate is not None:
+                    raise _fail("allocation already recorded at this UTC clock", USAGE_ERROR)
+                conn.execute(
+                    "INSERT INTO spinoff_allocations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [parent, child, ex_session, value, stamp, stamp, "owner", "owner"],
+                )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        typer.echo(
+            f"spinoff allocation {parent} -> {child} {ex_date}: {value:g} at {stamp.isoformat()}"
+        )
+
     @app.command("action-retract")
     def action_retract_(
         security: Annotated[str, typer.Option(help="the action's security_id")],

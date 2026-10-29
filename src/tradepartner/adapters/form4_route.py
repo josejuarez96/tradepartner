@@ -41,6 +41,12 @@ UNDER_THRESHOLD = "sec_forms_bulk_under_threshold"
 BUDGET_REFUSED = "sec_forms_budget_refused"
 
 _CENT = Decimal("0.01")
+# The one rounding mode for comparing bulk rows with XML rows at 2 decimals, shared with
+# T305b's parity test. DERA's own mode is undocumented and no recorded quarter holds an
+# exact half-cent (the one 4-decimal value, 176754.3281 -> 176754.33, is not a tie), so
+# this is the half-away-from-zero of SQL/SAS/Java ROUND, the likely producers of the data
+# set (#2542). Revisit if a real backfill quarter shows a tie rounding the other way.
+DERA_ROUNDING = ROUND_HALF_UP
 _ROUNDED_FIELDS = frozenset({"price", "shares", "shares_owned_after"})
 
 
@@ -166,7 +172,7 @@ def order_sample(transaction_counts: Mapping[str, int], size: int) -> tuple[str,
 
 
 def _q2(value: Decimal | None) -> Decimal | None:
-    return None if value is None else value.quantize(_CENT, rounding=ROUND_HALF_UP)
+    return None if value is None else value.quantize(_CENT, rounding=DERA_ROUNDING)
 
 
 def _comparable(row: Form4Transaction) -> tuple[object, ...]:
