@@ -375,3 +375,8 @@ def test_plan_rejects_nonsense() -> None:
 def test_the_run_stops_on_reaching_the_budget() -> None:
     assert not r.budget_reached(999, 1000)
     assert r.budget_reached(1000, 1000)
+
+
+def test_half_cent_rows_agree_under_the_shared_dera_rounding() -> None:
+    assert r.rows_agree([_row(price=Decimal("0.125"))], [_row(price=Decimal("0.13"))])
+    assert not r.rows_agree([_row(price=Decimal("0.125"))], [_row(price=Decimal("0.12"))])

@@ -22,6 +22,7 @@ import pytest
 from tradepartner.adapters import edgar_insider_bulk as bulk
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar import Form4Transaction, parse_form4
+from tradepartner.adapters.form4_route import DERA_ROUNDING
 from tradepartner.config import Settings
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "edgar" / "sec_forms"
@@ -226,7 +227,7 @@ def test_recorded_zip_joint_filing_has_a_row_per_owner_and_transaction() -> None
 
 
 def _q2(value: Decimal | None) -> Decimal | None:
-    return None if value is None else value.quantize(Decimal("0.01"))
+    return None if value is None else value.quantize(Decimal("0.01"), rounding=DERA_ROUNDING)
 
 
 @pytest.mark.parametrize("accession", ACCESSIONS)
@@ -628,3 +629,24 @@ def test_the_default_cap_matches_the_config_default() -> None:
     assert (
         Settings(_env_file=None).events.form4_bulk_max_member_bytes == bulk.DEFAULT_MAX_MEMBER_BYTES
     )
+
+
+def test_parity_rounding_is_the_routes_rounding_on_a_half_cent() -> None:
+    """The parity test and the route's `rows_agree` round with one shared mode."""
+    assert _q2(Decimal("0.125")) == Decimal("0.13")
+    assert _q2(Decimal("0.135")) == Decimal("0.14")
+
+
+def test_an_invalid_optional_deemed_date_is_none_and_the_row_is_kept() -> None:
+    """As the XML path (#2514): an unparseable optional date is absent, not a skip."""
+    for bad in ("2026-03-27", "garbage", "32-MAR-2026"):
+        a = _one(trans=[_tr("1", DEEMED_EXECUTION_DATE=bad), _tr("2")])
+        assert a.skipped == 0, bad
+        assert [t.line_no for t in a.transactions] == [0, 1], bad
+        assert a.transactions[0].deemed_execution_date is None, bad
+
+
+def test_an_invalid_required_transaction_date_still_skips_and_counts() -> None:
+    a = _one(trans=[_tr("1", TRANS_DATE="garbage"), _tr("2")])
+    assert a.skipped == 1
+    assert [t.line_no for t in a.transactions] == [1]
