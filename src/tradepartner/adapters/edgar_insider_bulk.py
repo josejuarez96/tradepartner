@@ -231,9 +231,13 @@ def _row_fields(row: dict[str, str]) -> dict[str, Any] | None:
         price_text = row["TRANS_PRICEPERSHARE"].strip()
         owned_text = row["SHRS_OWND_FOLWNG_TRANS"].strip()
         deemed_text = row["DEEMED_EXECUTION_DATE"].strip()
+        try:
+            deemed = _bulk_date(deemed_text) if deemed_text else None
+        except (_BadField, ValueError):
+            deemed = None  # optional: an invalid date is absent, as the XML path (#2514)
         return {
             "transaction_date": _bulk_date(date_text),
-            "deemed_execution_date": _bulk_date(deemed_text) if deemed_text else None,
+            "deemed_execution_date": deemed,
             "transaction_code": code,
             "acquired_disposed": acquired,
             "shares": _xml_decimal(shares_text),
