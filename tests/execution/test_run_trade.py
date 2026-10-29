@@ -35,8 +35,8 @@ from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.calendar import next_session, previous_session, session_close, session_open
 from tradepartner.config import FROZEN_COSTS_KEYS, CostsConfig, RiskConfig, Settings
 from tradepartner.errors import LimitBreachError
+from tradepartner.execution import lock, switch
 from tradepartner.execution import run as run_module
-from tradepartner.execution import switch
 from tradepartner.execution.run import RunOutcome, submit_window, tracking_run
 from tradepartner.execution.window import stop
 from tradepartner.execution.wrapper import BatchOutcome
@@ -407,6 +407,88 @@ def test_a_fill_session_run_outside_the_window_plans_but_submits_nothing(
     assert "submit" not in [c.method for c in env.fake.calls]
     assert env.rebalance_events() == []  # still pending
     assert any("outside the submit window" in note for note in outcome.notes)
+
+
+def test_sandbox_submits_at_1400_et_on_a_marked_copy(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(env.settings).write_text("")
+    env.settings = env.settings.model_copy(
+        update={"paper": env.settings.paper.model_copy(update={"book_id": "sandbox"})}
+    )
+    env.open_window(tmp_path=tmp_path)
+    outcome = env.run(at(F_0, 18))
+    assert outcome.status == "ok"
+    assert len(env.submits()) == 3
+    assert "sandbox: submit window skipped" in outcome.notes
+
+
+def test_daily_at_1400_et_still_submits_nothing(env: Env, window: PaperWindowRow) -> None:
+    outcome = env.run(at(F_0, 18))
+    assert outcome.status == "ok"
+    assert env.submits() == []
+    assert any("outside the submit window" in note for note in outcome.notes)
+
+
+def test_sandbox_after_close_submits_nothing(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(env.settings).write_text("")
+    env.settings = env.settings.model_copy(
+        update={"paper": env.settings.paper.model_copy(update={"book_id": "sandbox"})}
+    )
+    env.open_window(tmp_path=tmp_path)
+    outcome = env.run(at(F_0, 21))
+    assert outcome.status == "ok"
+    assert env.submits() == []
+    assert any("outside market hours" in note for note in outcome.notes)
+
+
+def test_sandbox_preopen_waits_until_market_open_to_submit(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(env.settings).write_text("")
+    env.settings = env.settings.model_copy(
+        update={"paper": env.settings.paper.model_copy(update={"book_id": "sandbox"})}
+    )
+    env.open_window(tmp_path=tmp_path)
+    submitted_at: list[datetime] = []
+    original = env.fake.submit
+
+    def record_submit(request: OrderRequest) -> Any:
+        submitted_at.append(env.clock.now)
+        return original(request)
+
+    monkeypatch.setattr(env.fake, "submit", record_submit)
+    outcome = env.run(at(F_0, 13))
+    assert outcome.status == "ok"
+    assert submitted_at
+    assert all(session_open(F_0) <= stamp <= session_close(F_0) for stamp in submitted_at)
+
+
+def test_sandbox_wrapper_stops_when_clock_passes_close_mid_batch(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(env.settings).write_text("")
+    env.settings = env.settings.model_copy(
+        update={"paper": env.settings.paper.model_copy(update={"book_id": "sandbox"})}
+    )
+    env.open_window(tmp_path=tmp_path)
+    original = env.fake.submit
+
+    def advance_after_first(request: OrderRequest) -> Any:
+        placed = original(request)
+        env.clock.now = session_close(F_0) + timedelta(seconds=1)
+        return placed
+
+    monkeypatch.setattr(env.fake, "submit", advance_after_first)
+    outcome = env.run(session_close(F_0) - timedelta(seconds=1))
+    assert outcome.status == "ok"
+    assert len(env.submits()) == 1
 
 
 def test_a_later_in_window_run_trades_the_pending_rebalance(

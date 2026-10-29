@@ -4608,16 +4608,27 @@ def make_app(
     def paper_start(
         hypothesis: Annotated[str, typer.Option(help="the registered hypothesis slug")],
         book: Annotated[str | None, _BOOK_OPTION] = None,
+        now: Annotated[
+            bool, typer.Option("--now", help="start the sandbox book from the latest close")
+        ] = False,
     ) -> None:
         """Open a paper window for a signed-off hypothesis in the book (spec req 14)."""
         chosen = _checked_book(book)
         s = paper_settings()
         paper_schema_gate(s)
         bk = _resolve_book(s, chosen)
+        if now and bk != "sandbox":
+            raise _fail("--now is only for book 'sandbox' on a marked temp copy", USAGE_ERROR)
         result = _paper_call(
             s,
             lambda: window.start(
-                s, lambda: open_read_only(s), broker(s, clock, bk), clock, hypothesis, book_id=bk
+                s,
+                lambda: open_read_only(s),
+                broker(s, clock, bk),
+                clock,
+                hypothesis,
+                book_id=bk,
+                now=now,
             ),
         )
         opened = result.window
