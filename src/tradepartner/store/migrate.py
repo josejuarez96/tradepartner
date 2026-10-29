@@ -19,7 +19,7 @@ def migrate(settings: Settings) -> None:
     if not store.is_file():
         version = None
     else:
-        with open_read_only(settings) as conn:
+        with open_read_only(settings, retry=True) as conn:
             version = schema.stored_version(conn)
 
     if version == schema.CURRENT_SCHEMA_VERSION:

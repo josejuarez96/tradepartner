@@ -1,6 +1,6 @@
 # Runbook: update the system, and back up or restore the store
 
-**For:** Jose, running this yourself  ·  **Date:** 2026-10-19  ·  **Issue:** [#1938](https://github.com/josejuarez96/tradepartner/issues/1938)  ·  **Checked against:** the CLI's `--help` and `src/tradepartner/store/schema.py` (schema version 34) on `origin/main`
+**For:** Jose, running this yourself  ·  **Date:** 2026-10-29  ·  **Issue:** [#1938](https://github.com/josejuarez96/tradepartner/issues/1938), [#2565](https://github.com/josejuarez96/tradepartner/issues/2565)  ·  **Checked against:** the CLI migration gate and `src/tradepartner/store/schema.py`
 
 Two jobs on this page. Part 1 is the routine for pulling new code. Part 2 is what to do when the store file itself is damaged (disk fault, power loss, a bad copy). Both run from the main checkout, in Terminal, as you:
 
@@ -8,7 +8,7 @@ Two jobs on this page. Part 1 is the routine for pulling new code. Part 2 is wha
 cd ~/Projects/tradepartner
 ```
 
-Why a copy matters: any command that writes to the store upgrades it on the spot, with no prompt and no "undo". Once the store is upgraded, older code cannot read it. A copy taken before the pull is the only way back. The detail is in [scheduling](scheduling.md), "Before pulling a schema migration".
+Why a copy matters: a schema upgrade cannot be undone in place. Keep the owner's copy from step 4 for rollback. After the pull, `ingest` or a paper write command automatically takes a verified `pre_migration` copy before upgrading an older store. The automatic retention sweep keeps the newest two marked copies by default (`STORE__PRE_MIGRATION_BACKUPS_TO_KEEP`, minimum one); it leaves owner-made and release copies alone. The detail is in [scheduling](scheduling.md), "Before pulling a schema migration".
 
 ## Part 1: update the system
 
@@ -34,7 +34,7 @@ git diff HEAD origin/main -- src/tradepartner/store/schema.py | grep '^[-+]CURRE
 ```
 
 - **The last command prints nothing:** the store layout is unchanged. You may skip steps 3 and 4 and go to step 5. A copy is still cheap if you want one.
-- **It prints two lines** (one starting `-`, one starting `+`): the pull upgrades the store on its next write. Do steps 3 and 4. For reference, the code on `main` today is at schema version 34.
+- **It prints two lines** (one starting `-`, one starting `+`): the new code requires a schema upgrade. Do steps 3 and 4, then run `ingest` in step 5.
 
 **3. Stop every job, and confirm they are idle.**
 
@@ -71,6 +71,8 @@ uv sync
 
 `--ff-only` refuses if the checkout is not a simple fast-forward. If it refuses, stop and ask Claude.
 
+**Run `ingest` first after pulling**, while the jobs are still unloaded. It checks the store version, makes the automatic pre-migration copy when needed, and upgrades the schema before the paper job can run. Use the normal `uv run tradepartner ingest` command; `--dry-run` refuses an older store and does not migrate it. If a manual copy was made in the same UTC minute, wait until the next minute before running it. If the copy or disk-space check refuses, leave the jobs unloaded and resolve the reason before retrying.
+
 **6. Load the jobs again.**
 
 ```bash
@@ -89,7 +91,11 @@ uv run tradepartner health --check
 
 Every book should say `last run ok` and `kill switch released`, and `health --check` should exit 0 (`echo $?` prints 0).
 
-If a command says "a read-only connection does not migrate", that is expected after a version bump. These two commands only read, and the store is upgraded by the first write. The next scheduled ingest (18:30) or paper run (08:05) does it. Look again after that run. Do not run `paper run` or `kickstart` to force it.
+These two commands only read. If they refuse an older store, keep the jobs unloaded and run `ingest` as in step 5. Do not run `paper run` or `kickstart` to force a migration.
+
+### Store newer than the code: what refuses, and the way back
+
+A store with a schema version newer than this checkout is refused by `ingest`, paper write commands, and read-only paper reports, checks, shakedown, status and lots reconciliation. `--dry-run` cannot change that version. Pull the matching newer code and run `uv sync` before using the store. If you must return to the older code, stop all jobs and restore the verified `pre_migration` copy made before the upgrade, following Part 2's WAL and manifest checks. Restoring that copy loses writes made since it was taken; review the resulting data and paper gap before loading jobs again.
 
 **8. Look at the first runs.** After the next 18:30 ingest and the next 08:05 paper run, check both exit codes:
 
@@ -155,7 +161,7 @@ if [ -e "$STORE_PATH" ] || [ -e "$STORE_PATH.wal" ]; then echo "stop: do step 2 
 fi
 ```
 
-Before opening the restored store, compare the manifest's `wal_bytes` with the restored `$STORE_PATH.wal` file size (`stat -f %z "$STORE_PATH.wal"` on macOS). If `wal_bytes` is a number, the WAL must exist and match that size; if it is `null`, no WAL should have been restored. Stop if either check fails. The manifest also holds the commit (`git_commit`) the copy was taken under. If it differs from the commit you are on now (`git rev-parse HEAD`), and your update crossed a store-version change, check out that commit before any job loads, because newer code upgrades the store on its next write and the upgrade cannot be undone:
+Before opening the restored store, compare the manifest's `wal_bytes` with the restored `$STORE_PATH.wal` file size (`stat -f %z "$STORE_PATH.wal"` on macOS). If `wal_bytes` is a number, the WAL must exist and match that size; if it is `null`, no WAL should have been restored. Stop if either check fails. The manifest also holds the commit (`git_commit`) the copy was taken under. If it differs from the commit you are on now (`git rev-parse HEAD`), and your update crossed a store-version change, check out that commit before any job loads, because an `ingest` or paper write can upgrade the store again:
 
 ```bash
 git checkout "$(uv run python -c 'import json,sys; print(json.load(open(sys.argv[1]))["git_commit"])' "$BAK.manifest.json")"

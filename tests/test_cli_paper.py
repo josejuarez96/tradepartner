@@ -45,6 +45,7 @@ from tradepartner.execution.lock import run_lock
 from tradepartner.execution.lots_reconcile import BrokerLotRow
 from tradepartner.execution.wrapper import WRITE_FAILED_EXIT_CODE
 from tradepartner.store import journal, registry, schema
+from tradepartner.store import migrate as store_migrate
 from tradepartner.store.db import open_for_write
 from tradepartner.store.journal import (
     DecisionRow,
@@ -893,10 +894,11 @@ def _downgrade_to_34(path: Path) -> None:
 
 @pytest.mark.usefixtures("started")
 def test_resume_migrates_old_store_before_journaling(
-    live: Path, clock: _Clock, factory: _Factory
+    live: Path, clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     assert _paper(clock, factory, "kill", "--reason", LONG_REASON).exit_code == 0
     _downgrade_to_34(live)
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
 
     out = _paper(clock, factory, "resume", "--reason", LONG_REASON)
 
@@ -917,18 +919,58 @@ def test_resume_migration_failure_precedes_journal_and_broker(
     _downgrade_to_34(live)
     calls_before = factory.fake.calls
 
-    def fail_migration(_conn: duckdb.DuckDBPyConnection) -> None:
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+
+    def fail_migration(_settings: Settings) -> None:
         raise schema.SchemaVersionError("migration failed")
 
-    monkeypatch.setattr(schema, "init_schema", fail_migration)
+    monkeypatch.setattr(store_migrate, "migrate", fail_migration)
     out = _paper(clock, factory, "resume", "--reason", LONG_REASON)
 
-    assert out.exit_code != 0
+    assert out.exit_code == REFUSED
     assert "migration failed" in out.output
     assert factory.fake.calls == calls_before
     with duckdb.connect(str(live), read_only=True) as conn:
         assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (34,)
         assert conn.execute("SELECT COUNT(*) FROM resume_invocations").fetchone() == (0,)
+
+
+@pytest.mark.usefixtures("started")
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("start", "--hypothesis", "h1"),
+        ("stop", "--reason", LONG_REASON),
+        ("run",),
+        ("reconcile",),
+        ("resume", "--reason", LONG_REASON),
+        ("abandon", "--reason", LONG_REASON),
+        ("settle", "--order", "order-1", "--reason", LONG_REASON),
+        ("override", "--kind", "exclude_name", "--reason", LONG_REASON),
+        ("override", "--kind", "keep_name", "--reason", LONG_REASON),
+    ],
+)
+def test_paper_write_commands_refuse_when_migration_refuses(
+    live: Path,
+    clock: _Clock,
+    factory: _Factory,
+    monkeypatch: pytest.MonkeyPatch,
+    args: tuple[str, ...],
+) -> None:
+    _downgrade_to_34(live)
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+
+    def refuse(_settings: Settings) -> None:
+        raise schema.SchemaMigrationRequiredError("migration refused")
+
+    monkeypatch.setattr(store_migrate, "migrate", refuse)
+    calls_before = factory.fake.calls
+    out = _paper(clock, factory, *args)
+    assert out.exit_code == REFUSED, (args, out.output)
+    assert "migration refused" in out.output
+    assert factory.fake.calls == calls_before
+    with duckdb.connect(str(live), read_only=True) as conn:
+        assert schema.stored_version(conn) == 34
 
 
 @pytest.mark.usefixtures("started")
@@ -946,6 +988,32 @@ def test_read_only_paper_command_refuses_old_store_without_writing(
     assert "tradepartner ingest" in out.output
     assert _sha256(live) == before
     assert factory.fake.calls == calls_before
+
+
+@pytest.mark.usefixtures("started")
+@pytest.mark.parametrize(
+    "args", [("report",), ("check",), ("shakedown",), ("status",), ("lots-reconcile",)]
+)
+def test_read_only_paper_commands_refuse_older_store(
+    live: Path,
+    export_file: Path,
+    clock: _Clock,
+    factory: _Factory,
+    monkeypatch: pytest.MonkeyPatch,
+    args: tuple[str, ...],
+) -> None:
+    _downgrade_to_34(live)
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+    before = _sha256(live)
+    command_args = (
+        (*args, "--export", str(export_file), "--tax-year", "2025")
+        if args[0] == "lots-reconcile"
+        else args
+    )
+    out = _paper(clock, factory, *command_args)
+    expected = EXIT["schema_version"] if args[0] == "lots-reconcile" else REFUSED
+    assert out.exit_code == expected, (args, out.output)
+    assert _sha256(live) == before
 
 
 @pytest.mark.usefixtures("started")
@@ -980,6 +1048,31 @@ def test_kill_switch_override_survives_migration_failure(
 
     assert out.exit_code == 0, out.output
     assert _count("overrides") == 1
+
+
+@pytest.mark.usefixtures("started")
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("kill", "--reason", LONG_REASON),
+        ("kill", "--all", "--reason", LONG_REASON),
+        ("override", "--kind", "engage_kill_switch", "--reason", LONG_REASON),
+    ],
+)
+def test_emergency_paper_commands_skip_migration(
+    live: Path,
+    clock: _Clock,
+    factory: _Factory,
+    monkeypatch: pytest.MonkeyPatch,
+    args: tuple[str, ...],
+) -> None:
+    _downgrade_to_34(live)
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+    monkeypatch.setattr(store_migrate, "migrate", lambda _: pytest.fail("migration called"))
+    out = _paper(clock, factory, *args)
+    assert out.exit_code == 0, (args, out.output)
+    with duckdb.connect(str(live), read_only=True) as conn:
+        assert schema.stored_version(conn) == 34
 
 
 @pytest.mark.usefixtures("started")

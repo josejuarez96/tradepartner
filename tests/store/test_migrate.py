@@ -9,7 +9,7 @@ import pytest
 
 from tradepartner.config import Settings
 from tradepartner.store import backup, migrate, schema
-from tradepartner.store.db import open_for_write
+from tradepartner.store.db import open_for_write, open_read_only
 
 # Total calls, read-only calls, and disposition of every writable call.
 # A new call must be classified here; PR 2 changes selected fail-closed
@@ -18,7 +18,7 @@ INIT_SCHEMA_CALLERS = {
     "backfill.py": (2, 0, "fail-closed"),
     "backtest/lab.py": (1, 0, "fail-closed"),
     "backtest/run.py": (1, 0, "fail-closed"),
-    "cli.py": (22, 6, "fail-closed"),
+    "cli.py": (21, 6, "fail-closed"),
     "dashboard/backtest_page.py": (1, 1, "read-only"),
     "dashboard/research_page.py": (1, 1, "read-only"),
     "dashboard/trials_page.py": (1, 1, "read-only"),
@@ -117,6 +117,23 @@ def test_equal_version_is_no_op(store_settings: Settings, monkeypatch: pytest.Mo
     _seed_version(store_settings.store.path, schema.CURRENT_SCHEMA_VERSION)
     monkeypatch.setattr(backup, "backup_store", lambda *_args, **_kwargs: pytest.fail("backup"))
     migrate.migrate(store_settings)
+
+
+def test_migration_probe_uses_writer_lock_wait(
+    store_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_version(store_settings.store.path, schema.CURRENT_SCHEMA_VERSION)
+    retries: list[bool] = []
+
+    def read(
+        settings: Settings, *, retry: bool = False
+    ) -> AbstractContextManager[duckdb.DuckDBPyConnection]:
+        retries.append(retry)
+        return open_read_only(settings, retry=retry)
+
+    monkeypatch.setattr(migrate, "open_read_only", read)
+    migrate.migrate(store_settings)
+    assert retries == [True]
 
 
 def test_newer_version_refuses(store_settings: Settings) -> None:
