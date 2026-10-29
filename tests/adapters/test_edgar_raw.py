@@ -58,3 +58,10 @@ def test_submissions_page_rejects_a_name_that_is_not_a_page() -> None:
     for bad in ["../secret.json", "CIK0000320193.json", "CIK0000320193-submissions-1.json", ""]:
         with pytest.raises(edgar_raw.InvalidFilingReferenceError):
             edgar_raw.submissions_page(bad)
+
+
+def test_insider_bulk_zip_reads_a_published_quarter_and_a_future_one_as_unpublished() -> None:
+    """T305b (#2498): a published DERA quarter streams; a quarter far ahead is a 404."""
+    published = edgar_raw.insider_bulk_zip("2025q4")
+    assert published is not None and published[0].is_file()
+    assert edgar_raw.insider_bulk_zip("2099q1") is None
