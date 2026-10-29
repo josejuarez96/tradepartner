@@ -53,6 +53,7 @@ from tradepartner.execution import (
     plain,
     shakedown,
 )
+from tradepartner.execution import breaks as breaks_rules
 from tradepartner.execution.marks import equity_at
 from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.execution.switch import SwitchState, derive
@@ -68,6 +69,7 @@ from tradepartner.store.journal import (
     PaperRunRow,
     PaperWindowRow,
     PositionDailyRow,
+    ReconcileBreakRow,
     ReconciliationRow,
 )
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -342,7 +344,10 @@ def _money(amount: float) -> str:
 
 
 def _reconciliation(
-    window: PaperWindowRow, rows: list[ReconciliationRow], now: datetime
+    window: PaperWindowRow,
+    rows: list[ReconciliationRow],
+    now: datetime,
+    break_events: list[ReconcileBreakRow] | None = None,
 ) -> ReconciliationView:
     known = [r for r in rows if r.known_at <= now and r.at <= now]
     if not known:
@@ -364,6 +369,13 @@ def _reconciliation(
             if isinstance(m, dict)
         }
         count = len(names)
+        if break_events:
+            # ADR 0025 item 2: every open break counts, not only the names this
+            # row's payload lists (a retained finding stays open without being
+            # re-listed). Read at the row's own cut, `known_at <= row.known_at`.
+            cut = min(now, row.known_at)
+            open_now = breaks_rules.open_breaks([e for e in break_events if e.known_at <= cut])
+            count = max(count, len(open_now))
         what = (
             "an open finding"
             if count == 0
@@ -604,7 +616,12 @@ def build(
     holdings = _holdings(conn, window_id, marks, as_of, now, top_n) if as_of is not None else None
 
     safety = Safety(
-        _reconciliation(window, _known(journal.reconciliations_for(conn, window_id), now), now),
+        _reconciliation(
+            window,
+            _known(journal.reconciliations_for(conn, window_id), now),
+            now,
+            journal.break_events_for(conn, window_id),
+        ),
         _kill_switch(state, runs, closed),
         _limits(conn, window, marks, ks_rows),
     )
