@@ -732,3 +732,13 @@ def version_4_store(path: Path) -> Path:
     finally:
         conn.close()
     return path
+
+
+@pytest.fixture(autouse=True)
+def _plenty_of_free_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ingest floor and health's low-disk warning (#2454) read the real disk
+    through `diskfloor.free_bytes`; no test's outcome may depend on the machine's
+    free space, so every test sees 1 TB free unless it replaces the seam."""
+    from tradepartner import diskfloor
+
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda path: 1_000_000_000_000)

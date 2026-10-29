@@ -13,7 +13,12 @@ from tradepartner.store import schema
 from tradepartner.store.db import configure_connection, insert_row
 
 
-def build_event_study_store(path: Path, *, truncate_at: date | None = None) -> Settings:
+def build_event_study_store(
+    path: Path,
+    *,
+    truncate_at: date | None = None,
+    identity_known_at: datetime | None = None,
+) -> Settings:
     """Build a store with two securities and facts on both sides of the study cut."""
     cutoff = None
     if truncate_at is not None:
@@ -30,7 +35,7 @@ def build_event_study_store(path: Path, *, truncate_at: date | None = None) -> S
     try:
         configure_connection(conn)
         schema.init_schema(conn)
-        early = datetime(2018, 6, 1, 15, tzinfo=UTC)
+        early = identity_known_at or datetime(2018, 6, 1, 15, tzinfo=UTC)
         for sid, benchmark in (("ISSUER", False), ("SPY_ID", True)):
             insert_row(
                 conn,
