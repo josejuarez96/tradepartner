@@ -75,7 +75,7 @@ direction = "<greater|less>"
 # threshold = <optional decision threshold>
 ci_level = 0.95
 min_clusters = <numeric floor below which the result is underpowered>
-inference = "<the CI or test method in words>"
+inference = "<the CI or test method in words; with a [study] table say one-sided or two-sided>"
 secondary = ["<metric name>", "..."]
 comparison_set = "<words: what is compared against what>"
 

@@ -458,3 +458,25 @@ def test_c1b_synthetic_stage_a_every_registered_key() -> None:
     assert got["inference"]["mde_80"] == pytest.approx(calibrated["mde_80"] * 10_000)
     assert got["kill"]["long"]["readings"]["raw"]["mde_80_bp"] > 0
     assert got["exploratory"]["h60"]["overlap"]["max_open"] > 1
+
+
+def test_summarise_omitted_cost_row_does_not_crash() -> None:
+    """The raw short reading is computed from the chosen settings, not looked up in the grid."""
+    rows = _lag_rows()
+    rows = rows + [{**r, "group": "late"} for r in rows]
+    req = {**REQUIRED, "primary_cost": 15.0, "short_borrow": 15.0}
+    in_grid = _run(rows, costs=(15.0,), borrows=(15.0,), **req)
+    omitted = _run(rows, costs=(30.0,), borrows=(30.0,), **req)
+    assert omitted["kill"] == in_grid["kill"]
+    raw = omitted["kill"]["short"]["readings"]["raw"]  # type: ignore[index]
+    assert math.isfinite(raw["net_bp"])
+
+
+def test_summarise_fractional_costs_keep_distinct_keys() -> None:
+    rows = _lag_rows()
+    got = _run(rows, costs=(30.0, 30.9), borrows=(30.0,))
+    sec = got["secondary"]
+    assert isinstance(sec, dict)
+    keys = [k for k in sec if k.startswith("short_") and "_c30" in k and k.endswith("_net_bp")]
+    assert any("_c30_b30_" in k for k in keys) and any("_c30p9_b30_" in k for k in keys)
+    assert sec["early_60_net30_bp"] != sec["early_60_net30p9_bp"]
