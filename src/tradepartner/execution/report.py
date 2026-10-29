@@ -56,6 +56,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from itertools import pairwise
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -70,8 +71,8 @@ from tradepartner.calendar import (
     previous_session,
     session_close,
 )
-from tradepartner.config import Cadence, Settings
-from tradepartner.execution.ledger import Ledger
+from tradepartner.config import Cadence, RiskConfig, Settings
+from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.lock import resolve_book
 from tradepartner.execution.marks import equity_at
 from tradepartner.execution.plan import residue as residue_of
@@ -195,6 +196,8 @@ class PeriodRow:
     passed: bool
     #: Residue names whose mark says tradable is false or unknown.
     residue_untradable: tuple[str, ...] = ()
+    #: Residue names with an absorbed quantity true-up.
+    residue_trued_up: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -347,13 +350,201 @@ def _fill_timing_term(
     return total
 
 
-def _residue_term(
+def _residues_at(
     journal: Journal,
-    actions_as_of_i: pl.DataFrame,
+    actions: pl.DataFrame,
+    window_id: int,
+    day: date,
+    period_end: date | None = None,
+) -> dict[str, float]:
+    """Residues visible at a session's own mark, including its opening cut."""
+    marks = {
+        m.security_id: m for m in journal.positions_daily if m.session == day and m.security_id
+    }
+    if not marks:
+        return {}
+    k = max(m.known_at for m in journal.positions_daily if m.session == day)
+    known_runs = tuple(
+        r for r in journal.runs if r.session is not None and r.session <= day and r.known_at <= k
+    )
+    run_ids = {r.run_id for r in known_runs}
+    decisions = [d for d in journal.decisions if d.run_id in run_ids and d.known_at <= k]
+    events = [e for e in journal.decision_events if e.run_id in run_ids and e.known_at <= k]
+    earlier_marks = [
+        m
+        for m in journal.positions_daily
+        if m.run_id in run_ids and m.known_at <= k and m.session <= day
+    ]
+    adjustments = [a for a in journal.adjustments if a.known_at <= session_close(day)]
+    historical = {
+        a.security_id
+        for a in adjustments
+        if a.window_id == window_id and a.session <= day and a.kind == "carried_residue"
+    }
+    skipped = {
+        e.decision_id
+        for e in events
+        if e.status == "skipped" and e.reason in {"dust", "untradable"}
+    }
+    historical.update(d.security_id for d in decisions if d.decision_id in skipped)
+    result: dict[str, float] = {}
+    for name, mark in marks.items():
+        if mark.quantity < 0 or mark.position_side == "short":
+            if name in historical:
+                raise ValueError(f"{name} {day} to {period_end or day}: short residue")
+            continue
+        quantity = residue_of(
+            name,
+            adjustments,
+            decisions,
+            events,
+            earlier_marks,
+            Ledger(positions={name: mark.quantity}, cash=0.0, through=day),
+            _actions_as_of(actions, session_close(day)),
+            window_id=window_id,
+            runs=known_runs,
+        )
+        if quantity:
+            result[name] = quantity
+    return result
+
+
+def _receipt_source(
+    row: AdjustmentRow,
+    source_rows: Sequence[AdjustmentRow],
+    actions: pl.DataFrame,
+    t_i: date,
+    t_next: date,
+) -> str:
+    name = row.security_id
+    if name is None:
+        raise ValueError(f"{t_i} to {t_next}: {row.kind} names no security")
+    prefix = f"{name} {t_i} to {t_next}: {row.kind}"
+    try:
+        details = json.loads(row.explanation_json or "{}")
+    except ValueError as exc:
+        raise ValueError(f"{prefix} unreadable explanation") from exc
+    if not isinstance(details, dict):
+        raise ValueError(f"{prefix} unreadable explanation")
+    if row.kind == "merger_receipt":
+        merger_id = details.get("merger_id")
+        sources = {
+            a.security_id
+            for a in source_rows
+            if a.kind == "corporate_action_cash"
+            and a.security_id
+            and a.explanation_json
+            and isinstance(merger_id, str)
+            and _merger_id(a) == merger_id
+        }
+        if len(sources) != 1:
+            raise ValueError(f"{prefix} has {'no' if not sources else 'multiple'} merger source")
+        return next(iter(sources))
+    candidates = [
+        a
+        for a in actions.iter_rows(named=True)
+        if a["action_type"] == "spinoff" and a["security_id"] == name and a["ex_date"] <= t_next
+    ]
+    parents = {a.get("source_action_id") for a in candidates if a.get("source_action_id")}
+    if len(parents) != 1 or (
+        details.get("parent_security_id") and details["parent_security_id"] not in parents
+    ):
+        raise ValueError(f"{prefix} has no matching spinoff action or parent disagreement")
+    return str(next(iter(parents)))
+
+
+def _merger_id(row: AdjustmentRow) -> str | None:
+    try:
+        payload = json.loads(row.explanation_json or "{}")
+    except ValueError:
+        return None
+    value = payload.get("merger_id") if isinstance(payload, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def _dividend_fraction(
+    row: AdjustmentRow,
+    journal: Journal,
+    actions: pl.DataFrame,
+    window: PaperWindowRow,
     window_id: int,
     t_i: date,
     t_next: date,
-) -> tuple[float, tuple[str, ...]]:
+    k_next: datetime,
+    residue_at_start: float | None,
+    rebalance_sessions: Sequence[date],
+) -> float:
+    """Residue share of the oldest unnetted dividend entitlement."""
+    name = row.security_id
+    if name is None:
+        raise ValueError(f"{t_i} to {t_next}: dividend_cash names no security")
+    try:
+        frozen = json.loads(window.frozen_json)
+        if not isinstance(frozen, dict):
+            raise ValueError("frozen settings are not an object")
+        credit_sessions = int(
+            frozen.get(
+                "risk.reconcile_dividend_credit_sessions",
+                RiskConfig().reconcile_dividend_credit_sessions,
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} {t_i} to {t_next}: unreadable dividend credit window") from exc
+    earliest = row.session
+    for _ in range(credit_sessions):
+        earliest = previous_session(earliest)
+    actions_at_credit = _actions_as_of(actions, session_close(row.session))
+    candidates = sorted(
+        a["ex_date"]
+        for a in actions_at_credit.iter_rows(named=True)
+        if a["action_type"] == "dividend"
+        and a["security_id"] == name
+        and earliest < a["ex_date"] <= row.session
+    )
+    prior_credits = sum(
+        1
+        for a in journal.adjustments
+        if a.window_id == window_id
+        and a.security_id == name
+        and a.kind == "dividend_cash"
+        and a.known_at <= k_next
+        and a.session > earliest
+        and (a.session, a.known_at) < (row.session, row.known_at)
+    )
+    if prior_credits >= len(candidates):
+        raise ValueError(f"{name} {t_i} to {t_next}: dividend_cash has no ex-date")
+    entitlement_day = previous_session(candidates[prior_credits])
+    mark = next(
+        (
+            m
+            for m in journal.positions_daily
+            if m.security_id == name and m.session == entitlement_day and m.known_at <= k_next
+        ),
+        None,
+    )
+    if mark is None or mark.quantity <= 0:
+        raise ValueError(f"{name} {t_i} to {t_next}: dividend_cash has no entitlement mark")
+    if residue_at_start is None:
+        basis_day = next(
+            (day for day in reversed(rebalance_sessions) if day <= entitlement_day), None
+        )
+        residue_at_start = (
+            _residues_at(journal, actions, window_id, basis_day).get(name, 0.0)
+            if basis_day is not None
+            else 0.0
+        )
+    return residue_at_start / mark.quantity
+
+
+def _residue_term(
+    journal: Journal,
+    actions: pl.DataFrame,
+    window: PaperWindowRow,
+    window_id: int,
+    t_i: date,
+    t_next: date,
+    rebalance_sessions: Sequence[date],
+) -> tuple[float, tuple[str, ...], tuple[str, ...]]:
     """Return marked journal P&L of T_i residues and their untradable names."""
     marks_i = {
         m.security_id: m
@@ -367,18 +558,6 @@ def _residue_term(
     }
     k_i = max(m.known_at for m in journal.positions_daily if m.session == t_i)
     k_next = max(m.known_at for m in journal.positions_daily if m.session == t_next)
-    known_runs = tuple(
-        r for r in journal.runs if r.session is not None and r.session <= t_i and r.known_at <= k_i
-    )
-    run_ids = {r.run_id for r in known_runs}
-    known_decisions = [d for d in journal.decisions if d.run_id in run_ids and d.known_at <= k_i]
-    known_events = [e for e in journal.decision_events if e.run_id in run_ids and e.known_at <= k_i]
-    known_marks = [
-        m
-        for m in journal.positions_daily
-        if m.run_id in run_ids and m.known_at <= k_i and m.session <= t_i
-    ]
-    opening_adjustments = [a for a in journal.adjustments if a.known_at <= session_close(t_i)]
     period_rows = [
         a
         for a in journal.adjustments
@@ -388,38 +567,13 @@ def _residue_term(
         and a.known_at <= k_next
         and not (a.session <= t_i and a.known_at <= k_i)
     ]
-    historical_residues = {
-        a.security_id
-        for a in opening_adjustments
-        if a.window_id == window_id and a.session <= t_i and a.kind == "carried_residue"
-    }
-    residue_decisions = {
-        e.decision_id
-        for e in known_events
-        if e.status == "skipped" and e.reason in {"dust", "untradable"}
-    }
-    historical_residues.update(
-        d.security_id for d in known_decisions if d.decision_id in residue_decisions
-    )
-    residues: dict[str, float] = {}
-    for name, mark_i in marks_i.items():
-        if mark_i.quantity < 0 or mark_i.position_side == "short":
-            if name in historical_residues:
-                raise ValueError(f"{name} {t_i} to {t_next}: short residue")
-            continue
-        residue = residue_of(
-            name,
-            opening_adjustments,
-            known_decisions,
-            known_events,
-            known_marks,
-            Ledger(positions={name: mark_i.quantity}, cash=0.0, through=t_i),
-            actions_as_of_i,
-            window_id=window_id,
-            runs=known_runs,
-        )
-        if residue:
-            residues[name] = residue
+    residues = _residues_at(journal, actions, window_id, t_i, t_next)
+    actions_next = _actions_as_of(actions, session_close(t_next))
+    source_rows = [
+        a
+        for a in journal.adjustments
+        if a.window_id == window_id and a.session <= t_next and a.known_at <= k_next
+    ]
     for a in period_rows:
         if a.kind == "carried_residue":
             raise ValueError(f"{a.security_id} {t_i} to {t_next}: carried_residue inside period")
@@ -433,47 +587,228 @@ def _residue_term(
             "owner_true_up",
         }:
             raise ValueError(f"{a.security_id} {t_i} to {t_next}: unclassified {a.kind}")
-        if a.kind in {"merger_receipt", "spinoff_receipt"} and (
-            residues or any(name not in marks_i for name in historical_residues)
-        ):
-            raise ValueError(f"{a.security_id} {t_i} to {t_next}: {a.kind} not built until T316b")
-        if a.security_id not in residues and not (
-            a.security_id not in marks_i and a.security_id in historical_residues
-        ):
+    receipts: dict[str, float] = {}
+    received: dict[str, float] = {}
+    quantity_names: set[str] = set()
+    for a in period_rows:
+        name = a.security_id
+        if name is None:
             continue
-        if a.security_id not in marks_i:
-            raise ValueError(
-                f"{a.security_id} {t_i} to {t_next}: period row on unheld name "
-                "not built until T316b"
+        had_residue = (
+            any(
+                name in _residues_at(journal, actions, window_id, day)
+                for day in rebalance_sessions
+                if day < t_i and any(m.session == day for m in journal.positions_daily)
             )
-        if a.kind in {"auto_true_up", "owner_true_up"}:
-            raise ValueError(f"{a.security_id} {t_i} to {t_next}: {a.kind} not built until T316b")
+            if name not in marks_i
+            else False
+        )
+        if (
+            name not in marks_i
+            and a.kind
+            not in {
+                "merger_receipt",
+                "spinoff_receipt",
+                "corporate_action_cash",
+                "dividend_cash",
+            }
+            and had_residue
+        ):
+            raise ValueError(f"{name} {t_i} to {t_next}: {a.kind} on unheld name")
+        if name not in marks_i and a.kind == "corporate_action_cash":
+            try:
+                details = json.loads(a.explanation_json or "{}")
+            except (TypeError, ValueError):
+                details = {}
+            late = (
+                not a.quantity
+                and isinstance(details, dict)
+                and (details.get("delisting_cash") is True or _merger_id(a))
+            )
+            if not late and had_residue:
+                raise ValueError(f"{name} {t_i} to {t_next}: corporate_action_cash on unheld name")
+        if a.quantity:
+            quantity_names.add(name)
+        if a.kind not in {"merger_receipt", "spinoff_receipt"}:
+            continue
+        source = _receipt_source(a, source_rows, actions_next, t_i, t_next)
+        if a.quantity:
+            quantity_names.add(source)
+        receiver = marks_next.get(name)
+        if receiver is None or receiver.mark_price is None:
+            raise ValueError(f"{name} {t_i} to {t_next}: {a.kind} receiver has no mark_price")
+        value = (a.quantity or 0.0) * receiver.mark_price
+        receipts[source] = receipts.get(source, 0.0) + value
+        received[name] = received.get(name, 0.0) + value
+    live_fills = [
+        f
+        for f in journal.fills
+        if f.fill.superseded_by is None
+        and f.fill.known_at <= k_next
+        and t_i < _local(f.fill.filled_at) <= t_next
+    ]
     total = 0.0
     untradable: list[str] = []
+    trued_up: list[str] = []
     for name, residue in residues.items():
         mark_i = marks_i[name]
         rows = [a for a in period_rows if a.security_id == name]
-        if any(
-            item.security_id == name and t_i < _local(item.fill.filled_at) <= t_next
-            for item in journal.fills
-            if item.fill.superseded_by is None
-        ):
-            raise ValueError(f"{name} {t_i} to {t_next}: fill not built until T316b")
+        has_fill = any(f.security_id == name for f in live_fills)
+        if has_fill and name in quantity_names:
+            raise ValueError(f"{name} {t_i} to {t_next}: fill with quantity-bearing period row")
         mark_next = marks_next.get(name)
         if mark_next is not None and mark_next.position_side == "short":
             raise ValueError(f"{name} {t_i} to {t_next}: short residue")
-        if mark_next is None and not any(a.quantity for a in rows):
+        if mark_next is None and not has_fill and not any(a.quantity for a in rows):
             raise ValueError(f"{name} {t_i} to {t_next}: unexplained missing mark")
         if mark_i.tradable is not True or (
             mark_next is not None and mark_next.tradable is not True
         ):
             untradable.append(name)
         value_next = mark_next.value if mark_next is not None else 0.0
+        if has_fill:
+            try:
+                frozen = json.loads(window.frozen_json)
+                if not isinstance(frozen, dict):
+                    raise ValueError("frozen settings are not an object")
+                tolerance = float(
+                    frozen.get(
+                        "risk.reconcile_quantity_tolerance",
+                        RiskConfig().reconcile_quantity_tolerance,
+                    )
+                )
+                held = from_journal(
+                    [
+                        f
+                        for f in journal.fills
+                        if f.fill.superseded_by is None
+                        and f.fill.known_at <= k_next
+                        and _local(f.fill.filled_at) <= t_i
+                    ],
+                    journal.orders,
+                    [
+                        a
+                        for a in journal.adjustments
+                        if a.window_id == window_id and a.session <= t_next and a.known_at <= k_next
+                    ],
+                    actions_next,
+                    None,
+                    window.starting_cash,
+                    t_next,
+                    window_id=window_id,
+                    quantity_tolerance=tolerance,
+                )
+                if mark_next is None or mark_next.mark_price is None:
+                    raise ValueError("no next mark_price")
+                value_next = held.positions.get(name, 0.0) * mark_next.mark_price
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} {t_i} to {t_next}: ledger replay: {exc}") from exc
         if mark_i.value is None or value_next is None:
             raise ValueError(f"{name} {t_i} to {t_next}: missing mark value")
-        cash = math.fsum(a.cash or 0.0 for a in rows)
-        total += residue / mark_i.quantity * (value_next - mark_i.value + cash)
-    return total, tuple(sorted(untradable))
+        if any(a.kind in {"auto_true_up", "owner_true_up"} for a in rows):
+            trued_up.append(name)
+        ordinary_cash = math.fsum((a.cash or 0.0) for a in rows if a.kind != "dividend_cash")
+        dividend_cash = 0.0
+        for row in rows:
+            if row.kind != "dividend_cash":
+                continue
+            fraction = (
+                _dividend_fraction(
+                    row,
+                    journal,
+                    actions,
+                    window,
+                    window_id,
+                    t_i,
+                    t_next,
+                    k_next,
+                    residue,
+                    rebalance_sessions,
+                )
+                if has_fill
+                else residue / mark_i.quantity
+            )
+            dividend_cash += fraction * (row.cash or 0.0)
+        total += (
+            residue
+            / mark_i.quantity
+            * (
+                value_next
+                - mark_i.value
+                + ordinary_cash
+                + receipts.get(name, 0.0)
+                - received.get(name, 0.0)
+            )
+        )
+        total += dividend_cash
+    # A late cash or stock receipt uses the fraction at the exit mark.
+    late_flows: dict[str, float] = dict(receipts)
+    for row in period_rows:
+        name = row.security_id
+        if name is not None and name not in marks_i and row.kind == "dividend_cash":
+            had_residue = any(
+                name in _residues_at(journal, actions, window_id, day)
+                for day in rebalance_sessions
+                if day < t_i and any(m.session == day for m in journal.positions_daily)
+            )
+            if had_residue:
+                fraction = _dividend_fraction(
+                    row,
+                    journal,
+                    actions,
+                    window,
+                    window_id,
+                    t_i,
+                    t_next,
+                    k_next,
+                    None,
+                    rebalance_sessions,
+                )
+                total += fraction * (row.cash or 0.0)
+            continue
+        if name is None or name in marks_i or row.kind != "corporate_action_cash" or row.quantity:
+            continue
+        try:
+            details = json.loads(row.explanation_json or "{}")
+        except ValueError:
+            details = {}
+        if isinstance(details, dict) and (details.get("delisting_cash") is True or _merger_id(row)):
+            late_flows[name] = late_flows.get(name, 0.0) + (row.cash or 0.0)
+    for name, flow in late_flows.items():
+        if name in marks_i or not flow:
+            continue
+        exit_start = next(
+            (
+                start
+                for start, end in reversed(list(pairwise(rebalance_sessions)))
+                if end <= t_i
+                and any(
+                    m.security_id == name and m.session == start and m.known_at <= k_next
+                    for m in journal.positions_daily
+                )
+                and not any(
+                    m.security_id == name and m.session == end and m.known_at <= k_next
+                    for m in journal.positions_daily
+                )
+            ),
+            None,
+        )
+        if exit_start is None:
+            # No held exit period means there was no residue to allocate.
+            continue
+        exit_mark = next(
+            m
+            for m in journal.positions_daily
+            if m.security_id == name and m.session == exit_start and m.known_at <= k_next
+        )
+        if exit_mark.quantity <= 0:
+            raise ValueError(f"{name} {t_i} to {t_next}: late cash has no positive exit quantity")
+        fraction = (
+            _residues_at(journal, actions, window_id, exit_start).get(name, 0.0)
+            / exit_mark.quantity
+        )
+        total += fraction * flow
+    return total, tuple(sorted(untradable)), tuple(sorted(trued_up))
 
 
 def compare_periods(
@@ -513,7 +848,6 @@ def compare_periods(
         trial_return = trial.equity[t_next] / trial.equity[t_i] - 1
         raw = paper_return - trial_return
 
-        actions_as_of_i = _actions_as_of(actions, session_close(t_i))
         actions_as_of_next = _actions_as_of(actions, session_close(t_next))
 
         dividend_term = (
@@ -524,8 +858,8 @@ def compare_periods(
         )
         fill_timing_term = _fill_timing_term(live_fills, prices, t_i, t_next) / paper_equity_i
         residual = raw + dividend_term + fill_timing_term
-        residue_sum, residue_untradable = _residue_term(
-            journal, actions_as_of_i, window.window_id, t_i, t_next
+        residue_sum, residue_untradable, residue_trued_up = _residue_term(
+            journal, actions, window, window.window_id, t_i, t_next, trial.sessions
         )
         residue_term = residue_sum / paper_equity_i
         modelled_cost = trial.cost_paid[t_i] / trial.equity[t_i]
@@ -570,6 +904,7 @@ def compare_periods(
                 excluded=excluded,
                 passed=period_passed,
                 residue_untradable=residue_untradable,
+                residue_trued_up=residue_trued_up,
             )
         )
 
