@@ -71,6 +71,12 @@ def evaluate_kill(
     return {"killed": killed, "readings": details}
 
 
+def _bps_key(value: float) -> str:
+    """Key part for a bps setting: integers keep ``30``, fractions stay distinct (``30p9``)."""
+    number = float(value)
+    return str(int(number)) if number.is_integer() else repr(number).replace(".", "p")
+
+
 def summarise(
     rows: Sequence[Mapping[str, Any]],
     counts: Mapping[str, Any],
@@ -139,12 +145,14 @@ def summarise(
     for h in horizons:
         longs, shorts = sel(long_group, h), sel(short_group, h)
         for cost in costs:
-            sec[f"{long_group}_{h}_net{int(cost)}_bp"] = _mean_bp(
+            sec[f"{long_group}_{h}_net{_bps_key(cost)}_bp"] = _mean_bp(
                 [net_long(float(row[f"spread_{h}"]), cost) for row in longs]
             )
             for borrow in borrows:
-                sec[f"short_{short_group}_{h}_c{int(cost)}_b{int(borrow)}_net_bp"] = _mean_bp(
-                    [net_short(float(row[f"spread_{h}"]), cost, borrow, h) for row in shorts]
+                sec[f"short_{short_group}_{h}_c{_bps_key(cost)}_b{_bps_key(borrow)}_net_bp"] = (
+                    _mean_bp(
+                        [net_short(float(row[f"spread_{h}"]), cost, borrow, h) for row in shorts]
+                    )
                 )
         for label, selected, values in (
             (
@@ -177,7 +185,8 @@ def summarise(
             cluster_by,
         )["min"]
         net_key = (
-            f"short_{short_group}_{main_h}_{name}_c{int(primary_cost)}_b{int(short_borrow)}_net_bp"
+            f"short_{short_group}_{main_h}_{name}_c{_bps_key(primary_cost)}"
+            f"_b{_bps_key(short_borrow)}_net_bp"
         )
         sec[net_key] = _mean_bp(
             [
@@ -206,16 +215,22 @@ def summarise(
         long_readings[name] = {
             "gross_spread_bp": float(sec[gross_key]),
         }
-        net_key = (
-            f"short_{short_group}_{main_h}_c{int(primary_cost)}_b{int(short_borrow)}_net_bp"
-            if name == "raw"
-            else (
-                f"short_{short_group}_{main_h}_{name}_c{int(primary_cost)}"
-                f"_b{int(short_borrow)}_net_bp"
+        if name == "raw":
+            short_net_bp = _mean_bp(
+                [
+                    net_short(float(row[f"spread_{main_h}"]), primary_cost, short_borrow, main_h)
+                    for row in short_rows
+                ]
             )
-        )
+        else:
+            short_net_bp = float(
+                sec[
+                    f"short_{short_group}_{main_h}_{name}_c{_bps_key(primary_cost)}"
+                    f"_b{_bps_key(short_borrow)}_net_bp"
+                ]
+            )
         short_readings[name] = {
-            "net_bp": float(sec[net_key]),
+            "net_bp": short_net_bp,
         }
     for name in reading_names:
         source = "spread" if name == "raw" else f"spread_{name}"
