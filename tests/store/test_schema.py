@@ -284,6 +284,25 @@ def test_init_schema_raises_on_schema_version_mismatch(
         schema.init_schema(fixture_store)
 
 
+def test_older_writable_store_requires_explicit_migration(
+    fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture_store.execute(
+        "DELETE FROM schema_version WHERE version = ?", [schema.CURRENT_SCHEMA_VERSION]
+    )
+    fixture_store.execute(
+        "INSERT INTO schema_version VALUES (?, current_timestamp)",
+        [schema.CURRENT_SCHEMA_VERSION - 1],
+    )
+    before = fixture_store.execute("SELECT * FROM schema_version").fetchall()
+    runs_before = fixture_store.execute("SELECT COUNT(*) FROM ingestion_runs").fetchone()
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+    with pytest.raises(schema.SchemaMigrationRequiredError, match=r"run `tradepartner ingest`"):
+        schema.init_schema(fixture_store)
+    assert fixture_store.execute("SELECT * FROM schema_version").fetchall() == before
+    assert fixture_store.execute("SELECT COUNT(*) FROM ingestion_runs").fetchone() == runs_before
+
+
 def test_configure_connection_disables_extension_autoinstall_and_autoload(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
