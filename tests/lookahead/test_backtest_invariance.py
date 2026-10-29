@@ -764,7 +764,8 @@ def test_a_shares_fact_accepted_after_close_t_i_reaches_only_plans_after_t_i(
 #: every other table's rows are main's (without that table it is main's fb9b651c...).
 #: T248c (#1762) moved it only by hashing the new `mergers` table's name and its two fixture
 #: rows; with that table left out the hash is the previous pin, ed654fea...0fdd9.
-TEMPLATE_FINGERPRINT = "fb39b57878d6ca9613c3ad334b98dffdf8451c08b2dd4f38e98796cd3d2dcef1"
+#: T254 (#1976) adds a late owner-stamped `spinoff_allocations` fixture row, moving this pin.
+TEMPLATE_FINGERPRINT = "6b6cfd33de7d908b9bacca91d817c2edb9608a58e1af2133dd7b437ac395fb35"
 
 
 def _bar_revisions(conn: duckdb.DuckDBPyConnection, sid: str, session: date) -> int:

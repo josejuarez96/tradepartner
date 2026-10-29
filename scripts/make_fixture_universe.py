@@ -219,6 +219,16 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "source",
         "provenance",
     ),
+    "spinoff_allocations": (
+        "parent_security_id",
+        "child_security_id",
+        "ex_date",
+        "basis_allocation",
+        "known_at",
+        "ingested_at",
+        "source",
+        "provenance",
+    ),
     "mergers": (
         "security_id",
         "kind",
@@ -428,6 +438,7 @@ class Rows:
     corporate_actions: list[dict[str, object]] = field(default_factory=list)
     symbol_changes: list[dict[str, object]] = field(default_factory=list)
     mergers: list[dict[str, object]] = field(default_factory=list)
+    spinoff_allocations: list[dict[str, object]] = field(default_factory=list)
     facts: list[dict[str, object]] = field(default_factory=list)
     statement_facts: list[dict[str, object]] = field(default_factory=list)
     filing_events: list[dict[str, object]] = field(default_factory=list)
@@ -1248,6 +1259,19 @@ def _spin_and_name_change(rows: Rows) -> None:
         0.25,
         known_at=spin_stamp,
         source_action_id="SEC_TICKCHANGE",
+    )
+    allocation_stamp = session_close(nth_session_after(spin_ex, 5))
+    rows.spinoff_allocations.append(
+        {
+            "parent_security_id": "SEC_TICKCHANGE",
+            "child_security_id": "SEC_SPLIT_PLAIN",
+            "ex_date": spin_ex,
+            "basis_allocation": 0.25,
+            "known_at": allocation_stamp,
+            "ingested_at": allocation_stamp,
+            "source": "owner",
+            "provenance": "owner",
+        }
     )
     rename_day = date(2018, 11, 7)
     rename_stamp = session_close(next_session(rename_day))
@@ -3221,6 +3245,13 @@ def write_fixtures(output_dir: Path) -> None:
         lineterminator="\n",
     )
     _write_csv(
+        output_dir / "spinoff_allocations.csv",
+        "spinoff_allocations",
+        rows.spinoff_allocations,
+        ("parent_security_id", "child_security_id", "ex_date", "known_at"),
+        lineterminator="\n",
+    )
+    _write_csv(
         output_dir / "mergers.csv",
         "mergers",
         rows.mergers,
@@ -3312,6 +3343,7 @@ def _write_chain_overlay(output_dir: Path) -> None:
             "borrow_status",
             "symbol_changes",
             "mergers",
+            "spinoff_allocations",
         )
     )
     lines = [
