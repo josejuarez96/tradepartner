@@ -2083,7 +2083,11 @@ class _Run:
         ledger = self._ledger_for(actions)
         with open_read_only(self.settings, retry=True) as conn:
             sessions = self._mark_sessions(last_marked_session(conn, self.window_id))
-            held = {name for day in sessions for name in ledger(day).positions}
+            held = {
+                name
+                for day in sessions
+                for name in (*ledger(day).positions, *ledger(day).short_holdings)
+            }
             symbols = _mark_symbols(conn, self.session, sorted(held), self.settings, self.window_id)
         # Every name held on any marked session, not only those held at S
         # (#892 item 1, #1116): a name sold before S but held on a back-filled
@@ -2131,6 +2135,7 @@ class _Run:
                             value=mark.value,
                             cash=mark.cash,
                             tradable=mark.tradable,
+                            position_side=mark.position_side,
                             book_id=self.window.book_id,
                             known_at=stamp,
                             ingested_at=stamp,
