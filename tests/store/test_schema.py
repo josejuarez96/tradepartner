@@ -1296,6 +1296,8 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "successor_chains",
             "mergers",
             "reconcile_breaks",
+            "sec_filing_events",
+            "sec_form4_transactions",
         }
         assert {table for table in shape_before if shape_after[table] != shape_before[table]} == {
             "listings",
@@ -2351,7 +2353,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_SEC_FORMS_VERSION + 1
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
@@ -2878,7 +2880,7 @@ def test_the_version_38_migration_adds_the_intersection_columns_and_nothing_else
         for table in ("trial_rebalances", "paper_plans"):
             assert {name for name, _ in _ASSETS_INTERSECTION_ADDED} <= _table_columns(conn, table)
         assert {i: indexes_after[i] for i in indexes_before} == indexes_before
-        assert _versions(conn) == [37, schema.CURRENT_SCHEMA_VERSION]
+        assert _versions(conn) == list(range(37, schema.CURRENT_SCHEMA_VERSION + 1))
         # Every existing row is kept; the two columns are NULL there.
         for table in ("trial_rebalances", "paper_plans"):
             assert conn.execute(

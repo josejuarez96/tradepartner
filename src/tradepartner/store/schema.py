@@ -574,7 +574,12 @@ registry; #83 took version 2 first, so the registry is version 3):
   works (`journal.plans_for`, which names `paper_plans`'s two, reads them as
   NULL there; no read names `trial_rebalances`'s before T242), and the next
   writable `init_schema` call migrates the store.
-- **A later DDL change goes to version 39**, with its own migration and a
+- **Version 39** belongs to T254 (spin-off basis allocation) and lands first.
+- **Version 40** (#2539, T306): `sec_filing_events` and
+  `sec_form4_transactions` are additive main-store tables. Reads are gated by
+  `events.sec_forms_read_enabled`; read-only version-38 and version-39 stores
+  serve earlier reads and fail ownership reads on the missing tables.
+- **A later DDL change goes to version 41**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -690,6 +695,8 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "facts": ("filing",),
     "statement_facts": ("filing",),
     "filing_events": ("filing",),
+    "sec_filing_events": ("filing",),
+    "sec_form4_transactions": ("filing",),
     "rates": ("release",),
     "borrow_status": ("snapshot",),
     "symbol_changes": ("action",),
@@ -878,9 +885,9 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   (NULL on every existing row) by `ALTER TABLE`
 #:   (`_migrate_assets_intersection`); the pinned DDL strings do not change
 #:   (module docstring, "Schema versions").
-#: - A later DDL change goes to version 39, with its own migration and a
+#: - A later DDL change goes to version 41, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 38
+CURRENT_SCHEMA_VERSION = 40
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -1054,6 +1061,10 @@ _PRE_BREAKS_VERSION = 36
 #: NULL where they are missing, and no read names `trial_rebalances`'s before
 #: T242.
 _PRE_ASSETS_INTERSECTION_VERSION = 37
+_PRE_T254_VERSION = 38
+
+# Version 39 belongs to T254; T306's additive ownership tables are version 40.
+_PRE_SEC_FORMS_VERSION = 39
 
 
 class SchemaVersionError(RuntimeError):
@@ -1287,6 +1298,51 @@ CREATE TABLE IF NOT EXISTS filing_events (
 )
 """
 
+# Ownership events keep the subject and every reporting owner separate from the
+# issuer-only 8-K table. The identity excludes known_at so a re-read cannot revise it.
+_CREATE_SEC_FILING_EVENTS = f"""
+CREATE TABLE IF NOT EXISTS sec_filing_events (
+    accession VARCHAR NOT NULL,
+    form VARCHAR NOT NULL,
+    accepted_at TIMESTAMPTZ NOT NULL,
+    filed_date DATE NOT NULL,
+    subject_cik VARCHAR NOT NULL,
+    filer_cik VARCHAR NOT NULL,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["sec_filing_events"])},
+    CHECK (known_at = accepted_at),
+    UNIQUE (accession, subject_cik, filer_cik)
+)
+"""
+
+_CREATE_SEC_FORM4_TRANSACTIONS = f"""
+CREATE TABLE IF NOT EXISTS sec_form4_transactions (
+    accession VARCHAR NOT NULL,
+    issuer_cik VARCHAR NOT NULL,
+    filer_cik VARCHAR NOT NULL,
+    line_no INTEGER NOT NULL,
+    is_director BOOLEAN NOT NULL,
+    is_officer BOOLEAN NOT NULL,
+    is_ten_percent_owner BOOLEAN NOT NULL,
+    is_other BOOLEAN NOT NULL,
+    transaction_date DATE NOT NULL,
+    deemed_execution_date DATE,
+    transaction_code VARCHAR NOT NULL,
+    acquired_disposed VARCHAR NOT NULL,
+    shares DECIMAL(38, 10) NOT NULL,
+    price DECIMAL(38, 10),
+    shares_owned_after DECIMAL(38, 10),
+    ownership_form VARCHAR NOT NULL,
+    security_title VARCHAR NOT NULL,
+    date_of_original_submission DATE,
+    accepted_at TIMESTAMPTZ NOT NULL,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["sec_form4_transactions"])},
+    CHECK (known_at = accepted_at),
+    CHECK (line_no >= 0),
+    CHECK (acquired_disposed IN ('A', 'D')),
+    UNIQUE (accession, filer_cik, line_no)
+)
+"""
+
 # Rates (amendment 2026-10-11, #1498, ADR 0020; spec "Data / interfaces" >
 # Amendment 2026-10-11 (#1498)). One row per (series, observation_date,
 # value) of a published interest-rate series. `series` is the source's id
@@ -1503,6 +1559,8 @@ TABLE_NAMES: tuple[str, ...] = (
     "facts",
     "statement_facts",
     "filing_events",
+    "sec_filing_events",
+    "sec_form4_transactions",
     "rates",
     "borrow_status",
     "symbol_changes",
@@ -1546,6 +1604,10 @@ _STATEMENT_FACTS_TABLE_DDL: tuple[str, ...] = (_CREATE_STATEMENT_FACTS,)
 #: `tests/store/test_schema.py`; a later edit of this DDL goes to the next
 #: schema version with its own migration.
 _FILING_EVENTS_TABLE_DDL: tuple[str, ...] = (_CREATE_FILING_EVENTS,)
+_SEC_FORMS_TABLE_DDL: tuple[str, ...] = (
+    _CREATE_SEC_FILING_EVENTS,
+    _CREATE_SEC_FORM4_TRANSACTIONS,
+)
 
 #: `rates` (#1498, T169), added at version 23: its own tuple, as
 #: `_FILING_EVENTS_TABLE_DDL` is, so no earlier pin moves. Pinned by hash in
@@ -3177,6 +3239,8 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_MERGER_RECEIPT_VERSION,
         _PRE_BREAKS_VERSION,
         _PRE_ASSETS_INTERSECTION_VERSION,
+        _PRE_T254_VERSION,
+        _PRE_SEC_FORMS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -4340,6 +4404,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_MERGER_RECEIPT_VERSION,
         _PRE_BREAKS_VERSION,
         _PRE_ASSETS_INTERSECTION_VERSION,
+        _PRE_T254_VERSION,
+        _PRE_SEC_FORMS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4377,6 +4443,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _RESEARCH_TABLE_DDL
             + _REBALANCE_COUNTS_TABLE_DDL
             + _FILING_EVENTS_TABLE_DDL
+            + _SEC_FORMS_TABLE_DDL
             + _RATES_TABLE_DDL
             + _BORROW_STATUS_TABLE_DDL
             + _SYMBOL_CHANGES_TABLE_DDL

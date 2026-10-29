@@ -1182,7 +1182,15 @@ def test_every_fact_table_is_classified_for_trial_vintage(
         # none is read by a reader a registered trial uses. `successor_chains`
         # (#821, T187) is inside the vintage: its rows move the chained reads a
         # trial sees.
-        excluded = {"rates", "borrow_status", "symbol_changes", "openfigi_types", "mergers"}
+        excluded = {
+            "rates",
+            "borrow_status",
+            "symbol_changes",
+            "openfigi_types",
+            "mergers",
+            "sec_filing_events",
+            "sec_form4_transactions",
+        }
         assert included.isdisjoint(excluded)
         # An included name must be a store table, and every store table must
         # be classified on one side. `symbol_changes` is the amendment's
@@ -2471,3 +2479,45 @@ def test_a_check_only_dividend_alone_moves_nothing_but_a_universe_dividend_does(
     )
     for flag in (False, True):
         assert registry.data_vintage(fixture_store, cutoff, spin_offs=flag) == _LATE_INGEST
+
+
+def test_sec_ownership_rows_do_not_move_trial_vintage() -> None:
+    """Collecting research-only ownership events cannot stale a trial."""
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    stamp = datetime(2026, 10, 28, 21, tzinfo=UTC)
+    before = registry.data_vintage(conn, stamp)
+    conn.execute(
+        "INSERT INTO sec_filing_events VALUES ('accession', '4', ?, '2026-10-28', "
+        "'issuer', 'owner', ?, ?, 'edgar', 'filing')",
+        [stamp, stamp, stamp],
+    )
+    conn.execute(
+        "INSERT INTO sec_form4_transactions VALUES (" + ", ".join(["?"] * 23) + ")",
+        [
+            "accession",
+            "issuer",
+            "owner",
+            0,
+            False,
+            True,
+            False,
+            False,
+            date(2026, 10, 28),
+            None,
+            "P",
+            "A",
+            10,
+            2,
+            10,
+            "D",
+            "Common",
+            None,
+            stamp,
+            stamp,
+            stamp,
+            "edgar",
+            "filing",
+        ],
+    )
+    assert registry.data_vintage(conn, stamp) == before

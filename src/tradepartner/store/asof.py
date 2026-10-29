@@ -1438,6 +1438,71 @@ def filing_events_as_of(
         conn.unregister(_FILING_EVENT_SECURITIES_VIEW)
 
 
+def _require_sec_forms_read(settings: Settings | None) -> None:
+    """Keep ownership events outside existing research reads until enabled."""
+    if not (settings if settings is not None else get_settings()).events.sec_forms_read_enabled:
+        raise PermissionError("events.sec_forms_read_enabled is false")
+
+
+def sec_filing_events_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    forms: Sequence[str],
+    subject_cik: str | None = None,
+    *,
+    settings: Settings | None = None,
+) -> pl.DataFrame:
+    """Read ownership filings by subject CIK at their UTC acceptance instant.
+
+    Forms match verbatim. No filer is resolved into a security, and a filing
+    accepted after the session close is invisible at that close.
+    """
+    _require_sec_forms_read(settings)
+    t = _validate_t(t)
+    form_list = _string_list(forms, name="forms")
+    if form_list is None:
+        raise TypeError("forms must be a sequence of strings")
+    params: list[Any] = [t, form_list]
+    subject_filter = ""
+    if subject_cik is not None:
+        subject_filter = " AND subject_cik = ?"
+        params.append(subject_cik)
+    return conn.execute(
+        "SELECT * FROM sec_filing_events WHERE known_at <= ? "
+        f"AND list_contains(?::VARCHAR[], form){subject_filter} "
+        "ORDER BY known_at, accession, subject_cik, filer_cik",
+        params,
+    ).pl()
+
+
+def sec_form4_transactions_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    subject_cik: str | None = None,
+    *,
+    settings: Settings | None = None,
+) -> pl.DataFrame:
+    """Read non-derivative Form 4 rows by issuer CIK at acceptance time.
+
+    Bulk share counts may be rounded to two decimal places. A 4/A has its own
+    accession and coexists with its original; a consumer must decide how to
+    treat amendments. Transaction and deemed execution dates are filer-entered
+    dates, not clocks.
+    """
+    _require_sec_forms_read(settings)
+    t = _validate_t(t)
+    params: list[Any] = [t]
+    subject_filter = ""
+    if subject_cik is not None:
+        subject_filter = " AND issuer_cik = ?"
+        params.append(subject_cik)
+    return conn.execute(
+        "SELECT * FROM sec_form4_transactions WHERE known_at <= ?"
+        f"{subject_filter} ORDER BY known_at, accession, filer_cik, line_no",
+        params,
+    ).pl()
+
+
 def _latest_assets_observation(conn: duckdb.DuckDBPyConnection, t: datetime) -> datetime | None:
     """The latest `ok` `ASSETS_SOURCE` run cursor at or before `t`, or None
     when there is none (spec Amendment 2026-10-11, #1506, ADR 0021 point 3:

@@ -529,6 +529,8 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
     "facts",
     "statement_facts",
     "filing_events",
+    # SEC ownership events are deliberately absent: no registered trial reads
+    # them until a separate strategy and input fingerprint rule are approved.
     # #821 (T187): a `successor_chains` row stales every registered trial whose
     # cutoff is at or after its `known_at` (the amendment's "A held position"
     # paragraph), so the chained reads a trial sees are reproducible.
