@@ -71,6 +71,7 @@ from zoneinfo import ZoneInfo
 import duckdb
 import polars as pl
 
+from tradepartner.backtest.costs import borrow_fee
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import Flags
 from tradepartner.backtest.run import run_hypothesis
@@ -420,12 +421,11 @@ def _short_terms(
         ]
         if any(value is None or not math.isfinite(value) for value in prior_values):
             raise ValueError(f"unreadable short mark for {prior_session}")
-        fee += (
-            math.fsum(value for value in prior_values if value is not None)
-            * rate
-            / 10_000
-            * (current_session - prior_session).days
-            / 360
+        # Short marks are unsigned (#1872 item 10); the backtest's fee takes signed values.
+        fee += borrow_fee(
+            {str(i): -value for i, value in enumerate(prior_values) if value is not None},
+            rate,
+            (current_session - prior_session).days,
         )
     return owed, fee
 
