@@ -60,8 +60,11 @@ def overlap_cluster_stats(
         sums[cohort] += value - mean
     ordered = sorted(sums)
     variance = sum(total * total for total in sums.values())
-    for i, a in enumerate(ordered):
-        for b in ordered[i + 1 :]:
+    n_ordered = len(ordered)
+    for i in range(n_ordered):
+        a = ordered[i]
+        for j in range(i + 1, n_ordered):
+            b = ordered[j]
             if b - a > max_lag_sessions:
                 break
             variance += 2 * sums[a] * sums[b]
