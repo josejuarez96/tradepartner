@@ -45,10 +45,11 @@ Work in your team folder, on the branch under test. Use the placeholders below; 
 4. **Flatten leftover sandbox positions.** The account is shared across runs. In the Alpaca paper dashboard (owner), close every position and cancel every open order for that account, or run `paper abandon --book sandbox --reason "reset"` if a previous copy's window is in this copy. `paper start` needs the account strictly flat of anything it does not own.
 5. **Start.** Use a registered, signed-off, small test strategy. The copy already holds `momentum-daily-shakedown` (the daily machine-test book, rebalanced every session):
    ```bash
-   uv run tradepartner paper start --hypothesis momentum-daily-shakedown --book sandbox
+   uv run tradepartner paper start --hypothesis momentum-daily-shakedown --book sandbox --now
    ```
    Note the printed window id and `account_id`: it must be the sandbox account's, not another book's.
-6. **Run the scenarios**, inside the submit window (scheduling.md, "The submit window"), each followed by `uv run tradepartner paper status --book sandbox`:
+   `--now` starts from the latest stored prior session close, so the first fill session is today. It requires a daily-cadence hypothesis, a marked temp store copy, and a prior-session bar already known to the store. It is refused on every real book.
+6. **Run the scenarios** during the XNYS session's market hours (normally 09:30–16:00 ET; the calendar handles early closes), each followed by `uv run tradepartner paper status --book sandbox`. Sandbox runs record `sandbox: submit window skipped` in their notes; all other order and risk checks still apply:
 
    | Scenario | How | Expected |
    |---|---|---|

@@ -28,8 +28,9 @@ from tradepartner.adapters.broker import (
 )
 from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.adapters.prices import announcement_date_known_at
+from tradepartner.backtest.schedule import fill_session
 from tradepartner.config import FROZEN_COSTS_KEYS, FROZEN_EXECUTION_KEYS, Settings
-from tradepartner.execution import report, window
+from tradepartner.execution import lock, report, window
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.reconcile_run import frozen_risk
@@ -519,6 +520,125 @@ def test_accepts_a_week_end_and_a_daily_registration(
     assert frozen["paper.min_rebalances"] == min_rebalances
     # One k at every cadence (ADR 0017 open question 6).
     assert frozen["paper.tracking_k"] == 2.0
+
+
+def test_sandbox_now_starts_from_the_previous_stored_close(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(journal_settings).write_text("")
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(
+            conn,
+            journal_settings,
+            "now",
+            date(2026, 8, 31),
+            params=_params(**{"schedule.rebalance_cadence": "daily"}),
+        )
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+        conn.execute(
+            "INSERT INTO prices_daily (security_id, session, open, high, low, close, "
+            "volume, known_at, ingested_at, source, provenance) "
+            "VALUES ('SEC_SPY', '2026-09-30', 100, 100, 100, 100, 1000, ?, ?, 'test', 'bar')",
+            [datetime(2026, 9, 30, 20, tzinfo=UTC)] * 2,
+        )
+    result = window.start(
+        journal_settings,
+        _connect(journal_settings),
+        _fake(fixed_clock),
+        fixed_clock,
+        "now",
+        book_id="sandbox",
+        now=True,
+    )
+    assert result.window.first_rebalance_session == date(2026, 9, 30)
+    assert fill_session(result.window.first_rebalance_session, "daily") == date(2026, 10, 1)
+
+
+@pytest.mark.parametrize("case", ["wrong_cadence", "missing_close", "late_close", "post_close"])
+def test_sandbox_now_refuses_without_a_known_daily_prior_close(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(journal_settings).write_text("")
+    cadence = "month_end" if case == "wrong_cadence" else "daily"
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(
+            conn,
+            journal_settings,
+            "now-refused",
+            date(2026, 8, 31),
+            params=_params(**{"schedule.rebalance_cadence": cadence}),
+        )
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+        if case in ("late_close", "post_close"):
+            stamp = (
+                fixed_clock() + timedelta(days=1)
+                if case == "late_close"
+                else datetime(2026, 9, 30, 21, tzinfo=UTC)
+            )
+            conn.execute(
+                "INSERT INTO prices_daily (security_id, session, open, high, low, close, "
+                "volume, known_at, ingested_at, source, provenance) "
+                "VALUES ('SEC_SPY', '2026-09-30', 100, 100, 100, 100, 1000, ?, ?, 'test', 'bar')",
+                [stamp, stamp],
+            )
+    reason = "now_cadence" if case == "wrong_cadence" else "now_data"
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings,
+            _connect(journal_settings),
+            _fake(fixed_clock),
+            fixed_clock,
+            "now-refused",
+            book_id="sandbox",
+            now=True,
+        )
+    assert exc.value.reason == reason
+    with open_for_write(journal_settings) as conn:
+        assert latest_window(conn, "sandbox") is None
+
+
+@pytest.mark.parametrize("book", ["main", "daily"])
+def test_now_refuses_real_books_before_a_write(
+    journal_settings: Settings, fixed_clock: FixedClock, book: str
+) -> None:
+    with pytest.raises(ValueError, match="sandbox"):
+        window.start(
+            journal_settings,
+            _connect(journal_settings),
+            _fake(fixed_clock),
+            fixed_clock,
+            "missing",
+            book_id=book,
+            now=True,
+        )
+    with open_for_write(journal_settings) as conn:
+        assert latest_window(conn, book) is None
+
+
+def test_now_refuses_unmarked_store_before_a_write(
+    journal_settings: Settings, fixed_clock: FixedClock
+) -> None:
+    with pytest.raises(ValueError, match="temp copy"):
+        window.start(
+            journal_settings,
+            _connect(journal_settings),
+            _fake(fixed_clock),
+            fixed_clock,
+            "missing",
+            book_id="sandbox",
+            now=True,
+        )
+    with open_for_write(journal_settings) as conn:
+        assert latest_window(conn, "sandbox") is None
 
 
 def test_accepts_an_operations_book_after_a_signoff_on_its_own_trial(

@@ -504,7 +504,7 @@ NO_WINDOW = cli.PAPER_REFUSAL_EXIT["no_window"]
 #: Every `paper` command's exact options (spec req 16: no endpoint, run-session,
 #: store-path or bypass flag; `override --session` is the override's rebalance session).
 PAPER_OPTIONS = {
-    "start": {"--hypothesis", "--book"},
+    "start": {"--hypothesis", "--book", "--now"},
     "stop": {"--reason", "--book"},
     "run": {"--book"},
     "reconcile": {"--book"},
@@ -2759,6 +2759,31 @@ def test_book_sandbox_on_a_store_outside_temp_is_refused_before_any_broker(
     out = _paper(clock, factory, "start", "--hypothesis", "h1", "--book", "sandbox")
     assert out.exit_code == 2
     assert "runs only on a temp copy of the store" in out.output
+    assert factory.clocks == []
+    assert _sha256(store) == before
+
+
+@pytest.mark.parametrize("book", ["main", "daily"])
+def test_paper_start_now_refuses_real_books_without_a_store_write(
+    clock: _Clock, factory: _Factory, book: str
+) -> None:
+    store = Path(_settings().store.path)
+    before = _sha256(store)
+    out = _paper(clock, factory, "start", "--hypothesis", "h1", "--book", book, "--now")
+    assert out.exit_code == 2, out.output
+    assert "--now is only for book 'sandbox'" in out.output
+    assert factory.clocks == []
+    assert _sha256(store) == before
+
+
+def test_paper_start_now_refuses_unmarked_sandbox_store_without_a_write(
+    clock: _Clock, factory: _Factory
+) -> None:
+    store = Path(_settings().store.path)
+    before = _sha256(store)
+    out = _paper(clock, factory, "start", "--hypothesis", "h1", "--book", "sandbox", "--now")
+    assert out.exit_code == 2, out.output
+    assert "temp copy" in out.output
     assert factory.clocks == []
     assert _sha256(store) == before
 

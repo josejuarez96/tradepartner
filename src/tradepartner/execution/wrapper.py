@@ -267,6 +267,7 @@ from tradepartner.execution.collect import (
     note_unjudged,
 )
 from tradepartner.execution.ledger import Ledger, from_journal
+from tradepartner.execution.lock import sandbox_store_refusal
 from tradepartner.execution.plan import SHORT, BuyCosts, DecisionState, decision_state, residue
 from tradepartner.execution.planning import current_listings, reference_prices
 from tradepartner.execution.reattempts import attempt_scope, write_offs
@@ -1660,7 +1661,7 @@ class RiskGatedBroker:
             # (`store.writer_lock_retry_seconds`), the switch read's included, may
             # have run the clock past the window, and nothing is sent outside it
             # (#2178).
-            if not self._in_submit_window(run.session):
+            if not self._in_submit_window(run.session, run):
                 self._phase_incomplete = True
                 self._close_unsent(run, [r for r, _ in pairs[index:]])
                 break
@@ -1693,13 +1694,18 @@ class RiskGatedBroker:
             submitted.append(request.client_order_id)
         return submitted, refused
 
-    def _in_submit_window(self, session: date) -> bool:
+    def _in_submit_window(self, session: date, run: PaperRunRow) -> bool:
         """Whether the clock reads inside [open(S) - `paper.submit_window_before_open_minutes`,
         open(S) + `paper.submit_window_after_open_minutes`] (the interval of
         `run.submit_window`)."""
         paper = self._settings.paper
         opening = self._calendar.session_open(session)
         now = self.read_clock()
+        if (
+            self._run_book(run) == "sandbox"
+            and sandbox_store_refusal(self._settings, "sandbox") is None
+        ):
+            return opening <= now <= self._calendar.session_close(session)
         return (
             opening - timedelta(minutes=paper.submit_window_before_open_minutes)
             <= now
