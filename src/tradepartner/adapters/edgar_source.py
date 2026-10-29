@@ -300,7 +300,9 @@ import httpx
 
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar import (
+    SEC_FORMS_PARSER_VERSION,
     CoverPageParse,
+    FilingParties,
     FsnFiling,
     FsnShare,
     SgmlNoAcceptanceError,
@@ -318,7 +320,10 @@ from tradepartner.adapters.edgar import (
     parse_cover_page,
     parse_delisting,
     parse_filing_index,
+    parse_form4,
     parse_fsn,
+    parse_schedule_13d_xml,
+    parse_sgml_13d_parties,
     parse_sgml_header,
     parse_statement_facts,
     sgml_acceptance,
@@ -335,6 +340,7 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    SecFormFiling,
     StatementFactRecord,
 )
 from tradepartner.calendar import is_session, next_session
@@ -585,6 +591,8 @@ class EdgarFilingSource(FilingSource):
         self.filing_events_items_missing = 0
         self.filing_events_clock_suspect = 0
         self.filing_events_clock_suspect_accessions: list[str] = []
+        self.sec_forms_counts: dict[str, int] = defaultdict(int)
+        self._sec_forms_counted: set[tuple[str, str]] = set()
         self._clock_suspect_seen: set[tuple[str, str]] = set()
         self._open_quarters: dict[Quarter, str] = {}
         # #578: quarters whose form.idx did not parse, recorded once per instance.
@@ -1129,6 +1137,238 @@ class EdgarFilingSource(FilingSource):
 
     def _stamps_path(self, cik: str) -> Path:
         return self._cache / "stamps" / f"v{PARSER_VERSION}" / f"{cik}.json"
+
+    def sec_form_stamp(
+        self, issuer_cik: str, accession: str, filed_date: date
+    ) -> SubmissionRecord | None:
+        """Look up an issuer accession in the checked stamp cache or its submissions.
+
+        An unlisted accession has no stamp. Older pages are fetched only while
+        it remains missing; the SGML anchor applies before a new stamp is cached.
+        This is the issuer-stamp seam used by T307d's bulk route.
+        """
+        if not self._settings.events.sec_forms_enabled:
+            return None
+        _validate_cik(issuer_cik)
+        edgar_raw.validate_accession(accession)
+        stamps = self._load_stamps(issuer_cik)
+        if accession not in stamps:
+            submissions = self._fetch_submissions(issuer_cik, {accession})
+            found = submissions.records.get(accession)
+            if found is None:
+                quarter = (filed_date.year, (filed_date.month - 1) // 3 + 1)
+                if not submissions.empty and self._settled(quarter, submissions.fetched_at):
+                    stamps[accession] = SubmissionRecord(accession, "", "", False, None)
+                    self._save_stamps(issuer_cik, stamps)
+                return None
+            checked = self._sgml_checked(issuer_cik, {accession: found})
+            if accession not in checked:
+                return None
+            stamps.update(checked)
+            self._save_stamps(issuer_cik, stamps)
+        record = stamps[accession]
+        return replace(record, filing_date=filed_date) if record.accepted_at is not None else None
+
+    def _sec_count(self, reason: str, accession: str) -> None:
+        key = (reason, accession)
+        if key not in self._sec_forms_counted:
+            self._sec_forms_counted.add(key)
+            self.sec_forms_counts[reason] += 1
+
+    def _sec_identity_missing(self, accession: str) -> bool:
+        path = self._cache / "sec_forms_identity" / f"v{SEC_FORMS_PARSER_VERSION}" / accession
+        return path.exists()
+
+    def _sec_mark_identity_missing(self, accession: str) -> None:
+        path = self._cache / "sec_forms_identity" / f"v{SEC_FORMS_PARSER_VERSION}" / accession
+        edgar_raw.write_atomic(path, b"missing")
+        self._sec_count("identity_missing", accession)
+
+    def _sec_xml(self, cik: str, record: SubmissionRecord) -> str:
+        filename = record.primary_document
+        if not filename.lower().endswith(".xml"):
+            names = edgar_raw.filing_index(
+                cik, record.accession, settings=self._settings, client=self._client
+            )
+            xml_names = [name for name in names if name.lower().endswith(".xml")]
+            if len(xml_names) != 1:
+                raise ValueError(f"{record.accession}: no unique XML document")
+            filename = xml_names[0]
+        # The submissions primaryDocument can name an XSL-rendered copy. The
+        # parser needs the root XML, as the other EDGAR document readers do.
+        filename = re.sub(r"^xsl[^/]*/", "", filename)
+        return edgar_raw.filing_xml(
+            cik, record.accession, filename, settings=self._settings, client=self._client
+        )
+
+    def _sec_13d_header(self, cik: str, accession: str) -> str:
+        """Read an unstructured 13D header, retrying the larger SGML stamp cap."""
+        sizes = dict.fromkeys(
+            (self._settings.edgar.header_bytes, self._settings.edgar.stamp_header_bytes)
+        )
+        for size in sizes:
+            document = edgar_raw.filing_sgml_header(
+                cik, accession, header_bytes=size, settings=self._settings, client=self._client
+            )
+            if "</SEC-HEADER>" in document:
+                return document
+        raise ValueError(f"{accession}: SGML header truncated at stamp_header_bytes")
+
+    def _sec_parties_path(self, accession: str) -> Path:
+        return (
+            self._cache / "sec_forms_parties" / f"v{SEC_FORMS_PARSER_VERSION}" / f"{accession}.json"
+        )
+
+    def _sec_cached_parties(self, accession: str, form: str) -> FilingParties | None:
+        try:
+            data = json.loads(self._sec_parties_path(accession).read_bytes())
+            if data["form"] != form:
+                return None
+            subjects, filers = data["subjects"], data["filers"]
+            if (
+                not subjects
+                or not filers
+                or not all(isinstance(c, str) for c in (*subjects, *filers))
+            ):
+                return None
+            return FilingParties(tuple(subjects), tuple(filers))
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _sec_save_parties(self, accession: str, form: str, parties: FilingParties) -> None:
+        data = {"form": form, "subjects": parties.subject_ciks, "filers": parties.filer_ciks}
+        edgar_raw.write_atomic(self._sec_parties_path(accession), json.dumps(data).encode("utf-8"))
+
+    def _sec_stamped(self, cik: str, accession: str, filed_date: date) -> SubmissionRecord | None:
+        record = self.sec_form_stamp(cik, accession, filed_date)
+        if record is None or record.accepted_at is None:
+            cached = self._load_stamps(cik).get(accession)
+            self._sec_count(
+                "unstampable" if cached is not None and cached.accepted_at is None else "unstamped",
+                accession,
+            )
+            return None
+        if clock_suspect(record.accepted_at, filed_date):
+            self._sec_count("clock_suspect", accession)
+            return None
+        if record.accepted_at > self._now():
+            self._sec_count("not_yet_known", accession)
+            return None
+        return record
+
+    def sec_form4_accession(
+        self, issuer_cik: str, accession: str, filed_date: date
+    ) -> SecFormFiling | None:
+        """Fetch, parse and stamp exactly one Form 4 XML accession for T307d.
+
+        This selects no accessions. The caller chooses the XML route first and
+        writes the returned filing with `ingest.write_sec_form_accession`.
+        """
+        edgar_raw.validate_accession(accession)
+        if not self._settings.events.sec_forms_enabled:
+            return None
+        if self._sec_identity_missing(accession):
+            self._sec_count("identity_missing", accession)
+            return None
+        record = self._sec_stamped(issuer_cik, accession, filed_date)
+        if (
+            record is None
+            or record.accepted_at is None
+            or record.form not in ("4", "4/A")
+            or record.form not in self._settings.events.sec_forms
+        ):
+            return None
+        xml = self._guarded(accession, "4", partial(self._sec_xml, issuer_cik, record))
+        if xml is None:
+            self._sec_count("fetch_failed", accession)
+            return None
+        try:
+            parsed = parse_form4(xml)
+        except ValueError:
+            self._sec_mark_identity_missing(accession)
+            return None
+        if parsed.issuer_cik != issuer_cik:
+            self._sec_count("issuer_mismatch", accession)
+            return None
+        key = ("form4_row_skipped", accession)
+        if key not in self._sec_forms_counted:
+            self._sec_forms_counted.add(key)
+            self.sec_forms_counts["form4_row_skipped"] += parsed.skipped
+        return SecFormFiling(
+            accession,
+            record.form,
+            record.accepted_at,
+            filed_date,
+            (parsed.issuer_cik,),
+            parsed.filer_ciks,
+            parsed.transactions,
+        )
+
+    def sec_forms_13d(self) -> list[SecFormFiling]:
+        """Discover all 13D spellings, including filings under filer-only CIKs.
+
+        The ingest filters parsed subjects against issuer securities. Index CIKs
+        never qualify a subject or create a security.
+        """
+        if not self._settings.events.sec_forms_enabled:
+            return []
+        start = (self._settings.edgar.index_first_year, 1)
+        last = quarter_of(self._now())
+        quarters = [
+            (y, q)
+            for y in range(start[0], last[0] + 1)
+            for q in range(1, 5)
+            if start <= (y, q) <= last
+        ]
+        wanted = frozenset(self._settings.events.sec_forms) & frozenset(
+            {"SC 13D", "SC 13D/A", "SCHEDULE 13D", "SCHEDULE 13D/A"}
+        )
+        accessions: dict[str, UnstampedFiling] = {}
+        for _, row in self._rows(quarters, last):
+            if row.form in wanted:
+                accessions.setdefault(row.accession, row)
+        result: list[SecFormFiling] = []
+        for accession, row in accessions.items():
+            if self._sec_identity_missing(accession):
+                self._sec_count("identity_missing", accession)
+                continue
+            record = self._sec_stamped(row.cik, accession, row.filed_on)
+            if record is None or record.accepted_at is None:
+                continue
+            if record.form != row.form:
+                self._sec_count("form_mismatch", accession)
+                continue
+            parties = self._sec_cached_parties(accession, row.form)
+            if parties is None:
+                if row.form.startswith("SC "):
+                    fetch = partial(self._sec_13d_header, row.cik, accession)
+                else:
+                    fetch = partial(self._sec_xml, row.cik, record)
+                document = self._guarded(accession, row.form.removesuffix("/A"), fetch)
+                if document is None:
+                    self._sec_count("fetch_failed", accession)
+                    continue
+                try:
+                    parties = (
+                        parse_sgml_13d_parties(document, accession)
+                        if row.form.startswith("SC ")
+                        else parse_schedule_13d_xml(document)
+                    )
+                except ValueError:
+                    self._sec_mark_identity_missing(accession)
+                    continue
+                self._sec_save_parties(accession, row.form, parties)
+            result.append(
+                SecFormFiling(
+                    accession,
+                    row.form,
+                    record.accepted_at,
+                    row.filed_on,
+                    parties.subject_ciks,
+                    parties.filer_ciks,
+                )
+            )
+        return sorted(result, key=lambda filing: (filing.accepted_at, filing.accession))
 
     def _load_stamps(self, cik: str) -> dict[str, SubmissionRecord]:
         """`cik`'s stamps in either layout (module docstring, "Stamps layout");
