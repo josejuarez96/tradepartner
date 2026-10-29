@@ -44,6 +44,20 @@ def test_c1b_study_parses_and_is_hashed(tmp_path: Path) -> None:
     assert changed.params_sha256 != result.params_sha256
     assert result.study is not None
     assert result.study["configurations"] == 2
+    assert result.study["matching"] == "ex_post"
+
+
+def test_matching_is_optional_causal_default_and_explicit_ex_post_is_hashed(
+    tmp_path: Path,
+) -> None:
+    source = FIXTURE.read_text()
+    causal = _parse(tmp_path / "causal", source.replace('matching = "ex_post"\n', ""))
+    assert causal.study is not None
+    assert "matching" not in causal.study
+    ex_post = _parse(tmp_path / "expost", source)
+    assert ex_post.params_sha256 != causal.params_sha256
+    with pytest.raises(ExperimentFileError, match=r"study\.matching"):
+        _parse(tmp_path / "invalid", source.replace('matching = "ex_post"', 'matching = "other"'))
 
 
 @pytest.mark.parametrize(
