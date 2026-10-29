@@ -1296,6 +1296,7 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "successor_chains",
             "mergers",
             "reconcile_breaks",
+            "spinoff_allocations",
         }
         assert {table for table in shape_before if shape_after[table] != shape_before[table]} == {
             "listings",
@@ -2351,7 +2352,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 2
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
@@ -2878,7 +2879,7 @@ def test_the_version_38_migration_adds_the_intersection_columns_and_nothing_else
         for table in ("trial_rebalances", "paper_plans"):
             assert {name for name, _ in _ASSETS_INTERSECTION_ADDED} <= _table_columns(conn, table)
         assert {i: indexes_after[i] for i in indexes_before} == indexes_before
-        assert _versions(conn) == [37, schema.CURRENT_SCHEMA_VERSION]
+        assert _versions(conn) == [37, 38, schema.CURRENT_SCHEMA_VERSION]
         # Every existing row is kept; the two columns are NULL there.
         for table in ("trial_rebalances", "paper_plans"):
             assert conn.execute(
@@ -2924,3 +2925,42 @@ def test_read_only_open_of_a_version_37_store_still_serves_every_other_read(
         for table in ("trial_rebalances", "paper_plans"):
             assert not {name for name, _ in _ASSETS_INTERSECTION_ADDED} <= _table_columns(ro, table)
         assert journal.plans_for(ro, 1) == []
+
+
+def test_version_39_adds_only_spinoff_allocations() -> None:
+    """A version-38 store gains the allocation table and one version row."""
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        conn.execute("DROP TABLE spinoff_allocations")
+        conn.execute("DELETE FROM schema_version WHERE version = 39")
+        conn.execute("INSERT INTO schema_version VALUES (38, TIMESTAMPTZ '2026-10-27 00:00:00+00')")
+        before = _shape(conn)
+        versions = _versions(conn)
+        assert versions == [38]
+        schema.init_schema(conn)
+        after = _shape(conn)
+        assert set(after) - set(before) == {"spinoff_allocations"}
+        assert {name: after[name] for name in before} == before
+        assert _versions(conn)[-1] == 39
+        schema.init_schema(conn)
+        assert _versions(conn)[-1] == 39
+    finally:
+        conn.close()
+
+
+def test_read_only_version_38_store_keeps_existing_reads(tmp_path: Path) -> None:
+    path = tmp_path / "v38.duckdb"
+    conn = duckdb.connect(str(path))
+    schema.init_schema(conn)
+    conn.execute("DROP TABLE spinoff_allocations")
+    conn.execute("DELETE FROM schema_version WHERE version = 39")
+    conn.execute("INSERT INTO schema_version VALUES (38, TIMESTAMPTZ '2026-10-27 00:00:00+00')")
+    conn.close()
+    ro = duckdb.connect(str(path), read_only=True)
+    try:
+        schema.init_schema(ro)
+        assert schema.stored_version(ro) == 38
+        assert ro.execute("SELECT count(*) FROM corporate_actions").fetchone() == (0,)
+    finally:
+        ro.close()
