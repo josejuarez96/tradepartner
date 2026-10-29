@@ -53,6 +53,253 @@ from tradepartner.adapters.filings import (
 from tradepartner.config import Settings
 from tradepartner.store.master import build_master
 
+
+def test_sec_form_stamp_uses_cache_and_refuses_unlisted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The issuer lookup must never date an accession absent from its submissions."""
+    accession = "0000320193-26-000123"
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    record = SubmissionRecord(
+        accession, "4", "form4.xml", False, CLOCK, filing_date=date(2026, 9, 24)
+    )
+    calls: list[str] = []
+
+    def fetched(cik: str, wanted: set[str]) -> edgar_source_module._Submissions:
+        calls.append(cik)
+        return edgar_source_module._Submissions({accession: record}, [], CLOCK)
+
+    monkeypatch.setattr(source, "_fetch_submissions", fetched)
+    monkeypatch.setattr(source, "_sgml_checked", lambda _cik, records: dict(records))
+    assert source.sec_form_stamp(APPLE, accession, date(2026, 9, 24)) == record
+    assert source.sec_form_stamp(APPLE, accession, date(2026, 9, 24)) == record
+    assert source.sec_form_stamp(APPLE, "0000320193-26-999999", date(2026, 9, 24)) is None
+    assert calls == [APPLE, APPLE]
+
+
+def test_sec_13d_discovery_reads_filer_index_and_document_subject(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000950123-09-012345"
+    row = UnstampedFiling("0000222222", "Activist", "SC 13D", accession, date(2009, 5, 11))
+    other = UnstampedFiling(
+        "0000222222", "Activist", "SC 13DX", "0000950123-09-012346", date(2009, 5, 11)
+    )
+    monkeypatch.setattr(
+        source, "_rows", lambda *_args: iter([((2009, 2), row), ((2009, 2), other)])
+    )
+    stamp = SubmissionRecord(accession, "SC 13D", "", False, CLOCK, filing_date=row.filed_on)
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: stamp)
+    monkeypatch.setattr(
+        edgar_raw,
+        "filing_sgml_header",
+        lambda *_args, **_kwargs: (
+            FIXTURES / "sec_forms/sgml_header_sc13d_unstructured.txt"
+        ).read_text(),
+    )
+    filings = source.sec_forms_13d()
+    assert len(filings) == 1
+    assert filings[0].subject_ciks == ("0000111111",)
+    assert filings[0].filer_ciks == ("0000222222", "0000333333")
+
+
+def test_sec_form4_accession_fetches_one_recorded_xml(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000320193-26-000123"
+    stamp = SubmissionRecord(
+        accession, "4", "form4.xml", False, CLOCK, filing_date=date(2026, 9, 24)
+    )
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: stamp)
+    fetched: list[str] = []
+
+    def xml(*_args: object, **_kwargs: object) -> str:
+        fetched.append(accession)
+        return (FIXTURES / "sec_forms/form4_purchase_gift_indirect.xml").read_text()
+
+    monkeypatch.setattr(edgar_raw, "filing_xml", xml)
+    filing = source.sec_form4_accession("0000777777", accession, date(2026, 9, 24))
+    assert filing is not None and filing.transactions
+    assert fetched == [accession]
+
+
+def test_sec_forms_disabled_never_discovers_or_fetches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    monkeypatch.setattr(
+        source, "_rows", lambda *_args: pytest.fail("disabled discovery fetched index")
+    )
+    monkeypatch.setattr(
+        source, "_sec_stamped", lambda *_args: pytest.fail("disabled XML fetched stamp")
+    )
+    assert source.sec_forms_13d() == []
+    assert source.sec_form4_accession(APPLE, "0000320193-26-000123", date(2026, 9, 24)) is None
+
+
+def test_sec_form_exclusions_count_each_accession_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000320193-26-000123"
+    filed = date(2026, 9, 24)
+    monkeypatch.setattr(source, "sec_form_stamp", lambda *_args: None)
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_forms_counts["unstamped"] == 1
+    future = SubmissionRecord(
+        accession, "4", "form4.xml", False, CLOCK + timedelta(hours=1), filing_date=filed
+    )
+    monkeypatch.setattr(source, "sec_form_stamp", lambda *_args: future)
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_forms_counts["not_yet_known"] == 1
+
+
+def test_sec_schedule13d_uses_root_xml_and_caches_parties(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000950123-24-000001"
+    row = UnstampedFiling(
+        "0000444444", "Reporting person", "SCHEDULE 13D", accession, date(2024, 12, 3)
+    )
+    stamp = SubmissionRecord(
+        accession, row.form, "xslS13D/primary.xml", False, CLOCK, filing_date=row.filed_on
+    )
+    monkeypatch.setattr(source, "_rows", lambda *_args: iter([((2024, 4), row)]))
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: stamp)
+    filenames: list[str] = []
+
+    def xml(_cik: str, _accession: str, filename: str, **_kwargs: object) -> str:
+        filenames.append(filename)
+        return (FIXTURES / "sec_forms/schedule13d_structured.xml").read_text()
+
+    monkeypatch.setattr(edgar_raw, "filing_xml", xml)
+    filings = source.sec_forms_13d()
+    assert filings[0].subject_ciks == ("0000555555",)
+    assert filings[0].filer_ciks == ("0000444444", "0000666666")
+    assert filenames == ["primary.xml"]
+    assert source.sec_forms_13d() == filings
+    assert filenames == ["primary.xml"]
+
+
+def test_sec_form4_missing_xml_retries_without_identity_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000320193-26-000123"
+    stamp = SubmissionRecord(accession, "4", "doc.htm", False, CLOCK, filing_date=date(2026, 9, 24))
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: stamp)
+    monkeypatch.setattr(edgar_raw, "filing_index", lambda *_args, **_kwargs: [])
+    assert source.sec_form4_accession(APPLE, accession, date(2026, 9, 24)) is None
+    assert source.sec_forms_counts["fetch_failed"] == 1
+    assert not source._sec_identity_missing(accession)
+
+
+def test_sec_form_clock_suspect_and_missing_identity_are_excluded_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000320193-26-000123"
+    filed = date(2026, 9, 23)
+    suspect = SubmissionRecord(accession, "4", "form4.xml", False, CLOCK, filing_date=filed)
+    monkeypatch.setattr(source, "sec_form_stamp", lambda *_args: suspect)
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_forms_counts["clock_suspect"] == 1
+
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: suspect)
+    monkeypatch.setattr(
+        edgar_raw,
+        "filing_xml",
+        lambda *_args, **_kwargs: (
+            FIXTURES / "sec_forms/form4_purchase_gift_indirect.xml"
+        ).read_text(),
+    )
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_forms_counts["issuer_mismatch"] == 1
+    assert not source._sec_identity_missing(accession)
+    monkeypatch.setattr(
+        edgar_raw,
+        "filing_xml",
+        lambda *_args, **_kwargs: (FIXTURES / "sec_forms/schedule13d_structured.xml").read_text(),
+    )
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_forms_counts["identity_missing"] == 1
+
+
+def test_sec_13d_truncated_header_retries_larger_cap_then_keeps_failure_retryable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000950123-09-012345"
+    row = UnstampedFiling("0000222222", "Activist", "SC 13D", accession, date(2009, 5, 11))
+    stamp = SubmissionRecord(accession, row.form, "", False, CLOCK, filing_date=row.filed_on)
+    monkeypatch.setattr(source, "_rows", lambda *_args: iter([((2009, 2), row)]))
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: stamp)
+    recorded = (FIXTURES / "sec_forms/sgml_header_sc13d_unstructured.txt").read_text()
+    sizes: list[int] = []
+
+    def header(_cik: str, _accession: str, *, header_bytes: int, **_kwargs: object) -> str:
+        sizes.append(header_bytes)
+        return recorded[:100] if len(sizes) == 1 else recorded
+
+    monkeypatch.setattr(edgar_raw, "filing_sgml_header", header)
+    assert source.sec_forms_13d()[0].subject_ciks == ("0000111111",)
+    assert sizes == [settings.edgar.header_bytes, settings.edgar.stamp_header_bytes]
+
+    source2 = EdgarFilingSource(
+        settings.model_copy(
+            update={
+                "edgar": settings.edgar.model_copy(update={"cache_dir": str(tmp_path / "second")})
+            }
+        ),
+        clock=lambda: CLOCK,
+    )
+    monkeypatch.setattr(source2, "_rows", lambda *_args: iter([((2009, 2), row)]))
+    monkeypatch.setattr(source2, "_sec_stamped", lambda *_args: stamp)
+    monkeypatch.setattr(edgar_raw, "filing_sgml_header", lambda *_args, **_kwargs: recorded[:100])
+    assert source2.sec_forms_13d() == []
+    assert source2.sec_forms_counts["fetch_failed"] == 1
+    assert not source2._sec_identity_missing(accession)
+
+
 CLOCK = datetime(2026, 9, 25, tzinfo=UTC)
 APPLE, ALPHABET, KLX = "0000320193", "0001652044", "0001738827"
 KLX_25NSE = "0001354457-26-000904"

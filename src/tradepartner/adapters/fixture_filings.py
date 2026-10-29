@@ -23,6 +23,7 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    SecFormFiling,
     StatementFactRecord,
 )
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -48,6 +49,7 @@ class FixtureFilingSource(FilingSource):
         delistings: Iterable[DelistingFiling] = (),
         statement_facts: Iterable[StatementFactRecord] = (),
         filing_events: Iterable[FilingEvent] = (),
+        sec_forms_13d: Iterable[SecFormFiling] = (),
         filename_listings: Iterable[FilenameListing] = (),
     ) -> None:
         self._index = sorted(index, key=lambda e: (e.accepted_at, e.accession, e.cik))
@@ -59,6 +61,7 @@ class FixtureFilingSource(FilingSource):
         self._filing_events = sorted(
             filing_events, key=lambda e: (e.accepted_at, e.accession, e.cik)
         )
+        self._sec_forms_13d = sorted(sec_forms_13d, key=lambda e: (e.accepted_at, e.accession))
         self._filename_listings = sorted(
             filename_listings, key=lambda e: (e.accepted_at, e.accession, e.ticker)
         )
@@ -108,6 +111,7 @@ class FixtureFilingSource(FilingSource):
             cover_pages=[e for e in self._cover_pages if e.accepted_at <= t],
             delistings=[e for e in self._delistings if e.accepted_at <= t],
             filing_events=[e for e in self._filing_events if e.accepted_at <= t],
+            sec_forms_13d=[e for e in self._sec_forms_13d if e.accepted_at <= t],
             filename_listings=[e for e in self._filename_listings if e.accepted_at <= t],
         )
 
@@ -120,6 +124,7 @@ class FixtureFilingSource(FilingSource):
         stamps |= {e.accepted_at for e in self._cover_pages}
         stamps |= {e.accepted_at for e in self._delistings}
         stamps |= {e.accepted_at for e in self._filing_events}
+        stamps |= {e.accepted_at for e in self._sec_forms_13d}
         stamps |= {e.accepted_at for e in self._filename_listings}
         return sorted(stamps)
 
@@ -146,6 +151,9 @@ class FixtureFilingSource(FilingSource):
 
     def filing_events(self, cik: str) -> list[FilingEvent]:
         return [e for e in self._filing_events if e.cik == cik]
+
+    def sec_forms_13d(self) -> list[SecFormFiling]:
+        return list(self._sec_forms_13d)
 
     def filename_listings(self, cik: str) -> list[FilenameListing]:
         return [e for e in self._filename_listings if e.cik == cik]

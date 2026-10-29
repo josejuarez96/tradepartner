@@ -539,6 +539,25 @@ def _filing_url(cik: str, accession: str, filename: str) -> str:
     )
 
 
+def filing_xml(
+    cik: str,
+    accession: str,
+    filename: str,
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> str:
+    """Fetch one accession's XML through the shared EDGAR limiter and retry policy."""
+    if not re.fullmatch(r"\d{1,10}", cik):
+        raise InvalidFilingReferenceError(f"filing CIK must be digits, got {cik!r}")
+    _validate_accession(accession)
+    _validate_relative_filename(filename)
+    if not filename.lower().endswith(".xml"):
+        raise InvalidFilingReferenceError(f"filing document is not XML: {filename!r}")
+    settings = settings or get_settings()
+    return _get(_filing_url(cik, accession, filename), settings=settings, client=client).text
+
+
 def filing_index(
     cik: str,
     accession: str,

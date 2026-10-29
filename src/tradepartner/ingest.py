@@ -244,6 +244,7 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    SecFormFiling,
     StatementFactRecord,
 )
 from tradepartner.adapters.openfigi import FigiType, parse_mapping
@@ -318,7 +319,7 @@ from tradepartner.store.restamp_precheck import (
     window_first_session,
 )
 from tradepartner.store.retraction import record_underived, split_kept, stored_underived
-from tradepartner.store.schema import init_schema
+from tradepartner.store.schema import atomic, init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT, member_links_title
 
@@ -1267,6 +1268,10 @@ class _Recorded(FilingSource):
             return records
         return self._source.filing_events(cik)
 
+    def sec_forms_13d(self) -> list[SecFormFiling]:
+        """Record the 13D discovery before the store write lock is acquired."""
+        return list(self._ask("sec_forms_13d"))
+
 
 def _unwrap(filings: FilingSource) -> FilingSource:
     """The adapter under any number of `_Recorded` wrappers (T17's fetch
@@ -1380,6 +1385,115 @@ _EMPTY_COUNTS: tuple[tuple[str, str], ...] = (
 )
 
 
+@dataclass(frozen=True)
+class SecFormWrite:
+    """Per-accession ownership write counts for the ingestion run message."""
+
+    added: int = 0
+    changed: int = 0
+    not_yet_known: int = 0
+
+
+def write_sec_form_accession(
+    conn: duckdb.DuckDBPyConnection,
+    filing: SecFormFiling,
+    *,
+    ingested_at: datetime,
+    source: str | None = None,
+) -> SecFormWrite:
+    """Write one ownership accession atomically, refusing any differing re-read.
+
+    The caller fetches and parses before opening the store. This one-accession
+    seam is also the writer for T307d's selected Form 4 route.
+    """
+    ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
+    if filing.accepted_at > ingested_at:
+        return SecFormWrite(not_yet_known=1)
+    if source is None:
+        source = (
+            "sec_form4_xml"
+            if filing.form in ("4", "4/A")
+            else "sec_13d_xml"
+            if filing.form.startswith("SCHEDULE")
+            else "sec_13d_sgml"
+        )
+    common: Row = {
+        "accepted_at": filing.accepted_at,
+        "known_at": filing.accepted_at,
+        "ingested_at": ingested_at,
+        "source": source,
+        "provenance": "filing",
+    }
+    event_rows: list[Row] = [
+        {
+            "accession": filing.accession,
+            "form": filing.form,
+            "filed_date": filing.filed_date,
+            "subject_cik": subject,
+            "filer_cik": filer,
+            **common,
+        }
+        for subject in filing.subject_ciks
+        for filer in filing.filer_ciks
+    ]
+    transaction_rows: list[Row] = [
+        {"accession": filing.accession, **asdict(transaction), **common}
+        for transaction in filing.transactions
+    ]
+    wanted = {
+        "sec_filing_events": event_rows,
+        "sec_form4_transactions": transaction_rows,
+    }
+    with atomic(conn):
+        existing: dict[str, list[Row]] = {}
+        for table in wanted:
+            if table == "sec_filing_events" and filing.form not in ("4", "4/A"):
+                if len(filing.subject_ciks) != 1:
+                    raise ValueError("write each 13D subject separately")
+                cursor = conn.execute(
+                    "SELECT * FROM sec_filing_events WHERE accession = ? AND subject_cik = ?",
+                    [filing.accession, filing.subject_ciks[0]],
+                )
+            else:
+                cursor = conn.execute(
+                    f"SELECT * FROM {table} WHERE accession = ?", [filing.accession]
+                )
+            columns = [column[0] for column in cursor.description]
+            existing[table] = [
+                dict(zip(columns, values, strict=True)) for values in cursor.fetchall()
+            ]
+        if any(existing.values()):
+
+            def comparable(rows: list[Row]) -> list[tuple[tuple[str, Any], ...]]:
+                return sorted(
+                    (
+                        tuple(
+                            sorted(
+                                (key, value) for key, value in row.items() if key != "ingested_at"
+                            )
+                        )
+                        for row in rows
+                    ),
+                    key=repr,
+                )
+
+            if all(
+                comparable(existing[table]) == comparable(rows) for table, rows in wanted.items()
+            ):
+                return SecFormWrite()
+            return SecFormWrite(changed=1)
+        for table, rows in wanted.items():
+            for row in rows:
+                columns = list(row)
+                names = ", ".join(columns)
+                placeholders = ", ".join("?" for _ in columns)
+                conn.execute(
+                    f"INSERT INTO {table} ({names}) VALUES ({placeholders})",
+                    [row[column] for column in columns],
+                )
+    return SecFormWrite(added=len(event_rows) + len(transaction_rows))
+
+
 def _ingest_filings(
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
@@ -1483,6 +1597,30 @@ def _ingest_filings(
         events = event_tally.message(_unwrap(filings))
     elif rebuild_filing_events:
         raise ValueError(_REBUILD_EVENTS_NEEDS_SWITCH)
+    sec_forms = ""
+    if settings.events.sec_forms_enabled:
+        subjects = frozenset(
+            cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+        )
+        sec_added = sec_changed = sec_future = 0
+        for filing in recorded.sec_forms_13d():
+            for subject in filing.subject_ciks:
+                if subject not in subjects:
+                    continue
+                sec_write = write_sec_form_accession(
+                    conn, replace(filing, subject_ciks=(subject,)), ingested_at=now
+                )
+                sec_added += sec_write.added
+                sec_changed += sec_write.changed
+                sec_future += sec_write.not_yet_known
+        source_counts = getattr(_unwrap(filings), "sec_forms_counts", {})
+        figures = {"added": sec_added, "changed": sec_changed, "not_yet_known": sec_future}
+        for name, count in source_counts.items():
+            figures[name] = figures.get(name, 0) + count
+        sec_forms = "; " + ", ".join(
+            f"sec_forms_{name}: {count}" for name, count in figures.items()
+        )
+        added += sec_added
     skip = _unjudged_ciks(recorded).ciks
     keep = frozenset(settings.master.keep_successors)  # owner-accepted (#922)
     derived = frozenset(row["security_id"] for row in master.securities)
@@ -1491,7 +1629,7 @@ def _ingest_filings(
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
-        f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}"
+        f"{statements}{events}{sec_forms}{rebuilt}{restamped}{_source_counts(filings)}"
         f"{_filename_counts(master, delistings, filings)}{chains}{candidates}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
@@ -1693,6 +1831,8 @@ def _build_filings(
     if fetch and settings.edgar.filing_events_enabled:  # #1358: full history, every run
         for cik in ciks:
             filings.filing_events(cik)
+    if fetch and settings.events.sec_forms_enabled:
+        filings.sec_forms_13d()
     link = settings.edgar.class_member_link
     facts, unmatched = fact_rows(
         records,

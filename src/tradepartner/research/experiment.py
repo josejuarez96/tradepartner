@@ -144,6 +144,9 @@ _STUDY_KEYS: Final = frozenset(
         "kill",
     }
 )
+# Optional amendment #2493 mode. Kept outside the frozen required-key set:
+# existing studies remain causal by default and must name an ex-post choice.
+_STUDY_OPTIONAL_KEYS = {"matching"}
 _KILL_KEYS: Final = frozenset(
     {
         "name",
@@ -238,7 +241,7 @@ def _validate_study(
 ) -> dict[str, Any]:
     if not isinstance(study, dict):
         raise ExperimentFileError(f"{path}: study must be a table")
-    unknown = set(study) - _STUDY_KEYS
+    unknown = set(study) - _STUDY_KEYS - _STUDY_OPTIONAL_KEYS
     if unknown:
         raise ExperimentFileError(
             f"{path}: unknown keys: {', '.join(sorted('study.' + k for k in unknown))}"
@@ -249,6 +252,8 @@ def _validate_study(
             f"{path}: required keys missing: {', '.join(sorted('study.' + k for k in missing))}"
         )
     configurations = _study_positive_int("study.configurations", study["configurations"], path)
+    if "matching" in study:
+        _require_enum("study.matching", study["matching"], ("entry_known", "ex_post"), path)
     if configurations > budget:
         raise ExperimentFileError(f"{path}: study.configurations exceeds budget.configurations")
     for key in ("groups", "bucket_by", "peer_by", "cluster_by"):
