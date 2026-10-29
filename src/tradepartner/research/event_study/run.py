@@ -26,6 +26,7 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Settings, get_settings
 from tradepartner.research import RunHandle, require_handle
+from tradepartner.research.datafiles import data_dir
 from tradepartner.research.event_study.peers import assign_buckets, attach_spreads
 from tradepartner.research.event_study.reader import EventStudyReader
 from tradepartner.research.event_study.stats import net_long, net_short, overlap_result_interval
@@ -539,7 +540,7 @@ def run_study(
     }
     payload = _json_bytes(artifact)
     digest = sha256(payload).hexdigest()
-    path = Path(cfg.research.data_dir) / run.slug / f"{run.slug}-run{run.run_id}-{digest}.json"
+    path = data_dir(cfg) / run.slug / f"{run.slug}-run{run.run_id}-{digest}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with path.open("xb") as stream:
