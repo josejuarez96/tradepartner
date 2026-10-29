@@ -504,6 +504,14 @@ FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT = "filing_events_known_at_is_accepted_at"
 FILING_EVENTS_FORM_ALLOWED = "filing_events_form_allowed"
 FILING_EVENTS_ITEMS_NOT_NULL = "filing_events_items_not_null"
 FILING_EVENTS_UNIQUE = "filing_events_unique"
+SEC_FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT = "sec_filing_events_known_at_is_accepted_at"
+SEC_FILING_EVENTS_TIMESTAMPS_AWARE = "sec_filing_events_timestamps_aware"
+SEC_FILING_EVENTS_UNIQUE = "sec_filing_events_unique"
+SEC_FILING_EVENTS_IDENTITY_NOT_NULL = "sec_filing_events_identity_not_null"
+SEC_FORM4_TRANSACTIONS_KNOWN_AT_IS_ACCEPTED_AT = "sec_form4_transactions_known_at_is_accepted_at"
+SEC_FORM4_TRANSACTIONS_TIMESTAMPS_AWARE = "sec_form4_transactions_timestamps_aware"
+SEC_FORM4_TRANSACTIONS_UNIQUE = "sec_form4_transactions_unique"
+SEC_FORM4_TRANSACTIONS_IDENTITY_NOT_NULL = "sec_form4_transactions_identity_not_null"
 #: The coverage check's rule (#1541): reported from the `coverage_reference`
 #: block, never from `INTEGRITY_RULES` (module docstring).
 COVERAGE_REFERENCE_NAMES = "coverage_reference_names"
@@ -567,6 +575,14 @@ INTEGRITY_RULES: tuple[str, ...] = (
     FILING_EVENTS_FORM_ALLOWED,
     FILING_EVENTS_ITEMS_NOT_NULL,
     FILING_EVENTS_UNIQUE,
+    SEC_FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
+    SEC_FILING_EVENTS_TIMESTAMPS_AWARE,
+    SEC_FILING_EVENTS_UNIQUE,
+    SEC_FILING_EVENTS_IDENTITY_NOT_NULL,
+    SEC_FORM4_TRANSACTIONS_KNOWN_AT_IS_ACCEPTED_AT,
+    SEC_FORM4_TRANSACTIONS_TIMESTAMPS_AWARE,
+    SEC_FORM4_TRANSACTIONS_UNIQUE,
+    SEC_FORM4_TRANSACTIONS_IDENTITY_NOT_NULL,
     SESSION_HOLES,
     RATE_KNOWN_AT,
     RATE_UNIQUE,
@@ -3047,6 +3063,7 @@ def _integrity_checks(
         STATEMENT_DERIVED_MATCHES_COMPONENTS: _statement_derived_matches_components(conn),
         STATEMENT_BASIS_ALLOWED: _statement_basis_allowed(conn),
         **_filing_event_rules(conn, settings),
+        **_sec_form_rules(conn),
         SESSION_HOLES: _session_holes(conn, t, settings),
         **_rate_rules(conn),
         **_new_action_stamp_rules(conn),
@@ -3802,3 +3819,79 @@ def _filing_event_rules(
         FILING_EVENTS_ITEMS_NOT_NULL: keys("WHERE items IS NULL"),
         FILING_EVENTS_UNIQUE: keys("", "HAVING count(*) > 1"),
     }
+
+
+_SEC_FORM_IDENTITIES: dict[str, tuple[str, ...]] = {
+    "sec_filing_events": ("accession", "subject_cik", "filer_cik"),
+    "sec_form4_transactions": ("accession", "filer_cik", "line_no"),
+}
+_SEC_FORM_KEY_SCHEMA: dict[str, Any] = {
+    "accession": pl.Utf8,
+    "rows": pl.Int64,
+}
+_SEC_FORM_COLUMN_SCHEMA: dict[str, Any] = {
+    "column": pl.Utf8,
+    "rows": pl.Int64,
+}
+
+
+def _sec_form_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
+    """Check SEC ownership identity and acceptance stamps in the store."""
+    present = _present_tables(conn)
+    rules: dict[str, pl.DataFrame] = {}
+    for table, identity in _SEC_FORM_IDENTITIES.items():
+        key_schema = _SEC_FORM_KEY_SCHEMA
+        column_schema = _SEC_FORM_COLUMN_SCHEMA
+        if table not in present:
+            rules[f"{table}_known_at_is_accepted_at"] = pl.DataFrame(schema=key_schema)
+            rules[f"{table}_timestamps_aware"] = pl.DataFrame(schema=column_schema)
+            rules[f"{table}_unique"] = pl.DataFrame(schema=key_schema)
+            rules[f"{table}_identity_not_null"] = pl.DataFrame(schema=column_schema)
+            continue
+
+        def keys(
+            where: str,
+            having: str = "",
+            table_name: str = table,
+            columns: tuple[str, ...] = identity,
+            schema: dict[str, Any] = key_schema,
+        ) -> pl.DataFrame:
+            found = conn.execute(
+                f"SELECT accession, count(*) FROM {table_name} {where} "
+                f"GROUP BY {', '.join(columns)} {having} ORDER BY accession"
+            ).fetchall()
+            return pl.DataFrame(
+                [{"accession": accession, "rows": int(count)} for accession, count in found],
+                schema=schema,
+            )
+
+        rules[f"{table}_known_at_is_accepted_at"] = keys(
+            "WHERE known_at IS DISTINCT FROM accepted_at"
+        )
+        rules[f"{table}_unique"] = keys("", "HAVING count(*) > 1")
+        null_counts = []
+        for column in identity:
+            count_row = conn.execute(
+                f"SELECT count(*) FROM {table} WHERE {column} IS NULL"
+            ).fetchone()
+            null_counts.append({"column": column, "rows": int(count_row[0]) if count_row else 0})
+        rules[f"{table}_identity_not_null"] = pl.DataFrame(
+            [row for row in null_counts if row["rows"]], schema=column_schema
+        )
+        types = conn.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name = ? AND table_catalog = current_database() "
+            "AND table_schema = current_schema() "
+            "AND column_name IN ('known_at', 'accepted_at')",
+            [table],
+        ).fetchall()
+        type_by_column = dict(types)
+        rules[f"{table}_timestamps_aware"] = pl.DataFrame(
+            [
+                {"column": column, "rows": 1}
+                for column in ("known_at", "accepted_at")
+                if type_by_column.get(column) != "TIMESTAMP WITH TIME ZONE"
+            ],
+            schema=column_schema,
+        )
+    return rules
