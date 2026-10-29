@@ -4913,8 +4913,8 @@ def make_app(
                 f"{' excluded' if m.excluded else ''}{' missed' if m.missed else ''}"
                 f"{' override' if m.override else ''} {'pass' if m.passed else 'FAIL'}"
                 + (
-                    f" (residue at carried mark: {', '.join(m.residue_carried)})"
-                    if m.residue_carried
+                    f" (residue untradable: {', '.join(m.residue_untradable)})"
+                    if m.residue_untradable
                     else ""
                 )
                 for m in comparison.periods
