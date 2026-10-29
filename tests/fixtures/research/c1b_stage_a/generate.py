@@ -5,12 +5,17 @@ Run from the repo: uv run python tests/fixtures/research/c1b_stage_a/generate.py
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from datetime import date
 from pathlib import Path
 
 PROBE = Path.home() / "tradepartner-probes/c1lag/c1b_filing_delay.py"
+PROBE_SHA256 = "e73a0598eb9692781e4bd1fe46926b8369dab4bb72d5f7c49fa720d31342e1d5"
+_actual = hashlib.sha256(PROBE.read_bytes()).hexdigest()
+if _actual != PROBE_SHA256:
+    raise SystemExit(f"probe SHA-256 mismatch: expected {PROBE_SHA256}, got {_actual}")
 OUT = Path(__file__).with_name("expected.json")
 spec = importlib.util.spec_from_file_location("c1b_probe", PROBE)
 assert spec and spec.loader

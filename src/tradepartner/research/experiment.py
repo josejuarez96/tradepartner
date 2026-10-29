@@ -236,7 +236,9 @@ def _study_positive_int(key: str, value: object, path: Path) -> int:
     return result
 
 
-def _validate_study(study: object, path: Path, budget: int, ci_level: float) -> dict[str, Any]:
+def _validate_study(
+    study: object, path: Path, budget: int, ci_level: float, inference: str
+) -> dict[str, Any]:
     if not isinstance(study, dict):
         raise ExperimentFileError(f"{path}: study must be a table")
     unknown = set(study) - _STUDY_KEYS - _STUDY_OPTIONAL_KEYS
@@ -295,10 +297,29 @@ def _validate_study(study: object, path: Path, budget: int, ci_level: float) -> 
         "beta_min_bars",
     ):
         _study_positive_int(f"study.{key}", study[key], path)
+    if study["min_volume_bars"] > study["volume_lookback"]:
+        raise ExperimentFileError(
+            f"{path}: study.min_volume_bars must not exceed study.volume_lookback"
+        )
+    if study["beta_min_bars"] > study["beta_lookback"]:
+        raise ExperimentFileError(
+            f"{path}: study.beta_min_bars must not exceed study.beta_lookback"
+        )
     for key in ("price_floor", "volume_floor", "z"):
         _study_number(f"study.{key}", study[key], path, positive=key == "z")
-    if abs(float(study["z"]) - NormalDist().inv_cdf(ci_level)) > 0.001:
-        raise ExperimentFileError(f"{path}: study.z must match primary.ci_level")
+    text = inference.lower().replace("-", " ")
+    one_sided, two_sided = "one sided" in text, "two sided" in text
+    if one_sided == two_sided:
+        raise ExperimentFileError(
+            f"{path}: primary.inference must say exactly one of one-sided or two-sided "
+            "when a [study] table is present"
+        )
+    quantile = ci_level if one_sided else 1 - (1 - ci_level) / 2
+    if abs(float(study["z"]) - NormalDist().inv_cdf(quantile)) > 0.001:
+        side = "one-sided" if one_sided else "two-sided"
+        raise ExperimentFileError(
+            f"{path}: study.z must match primary.ci_level for a {side} interval"
+        )
     for key in ("shares_fact", "benchmark_security"):
         _require_str(f"study.{key}", study[key], path)
     for key in ("cost_bps", "borrow_bps"):
@@ -694,7 +715,9 @@ def parse_experiment_file(
     if study_raw is not None:
         if kind != "return":
             raise ExperimentFileError(f"{path}: study requires kind = 'return'")
-        study = _validate_study(study_raw, path, budget_configurations, primary_ci_level)
+        study = _validate_study(
+            study_raw, path, budget_configurations, primary_ci_level, primary_inference
+        )
         flat["study"] = study
     stop_rule = _require_str("budget.stop_rule", flat["budget.stop_rule"], path)
     expected_effect = _require_str("budget.expected_effect", flat["budget.expected_effect"], path)
