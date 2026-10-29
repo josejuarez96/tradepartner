@@ -621,6 +621,12 @@ def test_equity_at_subtracts_short_leg_at_mark() -> None:
     assert equity_at([long, replace(short, position_side="short")], D1) == 1080.0
 
 
+def test_equity_at_refuses_signed_negative_short_mark() -> None:
+    short = replace(_row(D1, B, cash=1000.0, value=-120.0), position_side="short")
+    with pytest.raises(UnreadableMarkError, match=r"short mark .*negative"):
+        equity_at([short], D1)
+
+
 def test_marks_for_short_uses_its_own_close_and_unsigned_quantity(tmp_path) -> None:
     conn = duckdb.connect(str(tmp_path / "store.duckdb"))
     schema.init_schema(conn)

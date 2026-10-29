@@ -145,6 +145,11 @@ def equity_at(rows: Sequence[PositionDailyRow], session: date) -> float:
             raise UnreadableMarkError(
                 f"the mark of {row.security_id} for {session.isoformat()} has value {row.value!r}"
             )
+        if row.position_side == "short" and (row.quantity < 0 or row.value < 0):
+            raise UnreadableMarkError(
+                f"short mark of {row.security_id} for {session.isoformat()} has negative "
+                "quantity or value"
+            )
         values.append(-row.value if row.position_side == "short" else row.value)
     equity = cash_value + math.fsum(values)
     if not math.isfinite(equity):
