@@ -4928,6 +4928,11 @@ def make_app(
                     if m.residue_untradable
                     else ""
                 )
+                + (
+                    f" (residue trued up: {', '.join(m.residue_trued_up)})"
+                    if m.residue_trued_up
+                    else ""
+                )
                 for m in comparison.periods
             ),
             *(

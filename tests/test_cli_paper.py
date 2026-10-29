@@ -2436,6 +2436,11 @@ def test_report_passes_the_book_and_prints_the_same_lines(
     flagged_out = _paper(clock, factory, "report")
     assert flagged_out.exit_code == 0
     assert "(residue untradable: 0001739445)" in flagged_out.output
+    trued_up = replace(canned.comparison.periods[0], residue_trued_up=("0001739445",))
+    canned = replace(canned, comparison=replace(canned.comparison, periods=(trued_up,)))
+    trued_up_out = _paper(clock, factory, "report")
+    assert trued_up_out.exit_code == 0
+    assert "(residue trued up: 0001739445)" in trued_up_out.output
 
 
 def test_report_with_nothing_to_compare_prints_a_plain_message_and_exits_zero(
