@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import duckdb
@@ -165,3 +166,44 @@ def test_render_writes_one_caption() -> None:
 def test_a_store_without_the_tables_has_no_freshness() -> None:
     conn = duckdb.connect(":memory:")
     assert header.store_freshness(conn, T) == header.Freshness(None, None)
+
+
+def test_a_sec_forms_backfill_leaves_both_reads_on_the_bars(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#2624: a forms-only backfill writes ownership rows and its own run rows
+    after a failed nightly; neither may make the store look fresh."""
+    from tradepartner.adapters.edgar import Form4Transaction
+    from tradepartner.adapters.filings import SecFormFiling
+    from tradepartner.ingest import write_sec_form_accession
+
+    load_universe_fixtures(conn, UNIVERSE_DIR)
+    bars_run = datetime(2020, 6, 30, 21, tzinfo=UTC)
+    _run(conn, 1, "ok", bars_run)
+    _run(conn, 2, "failed", bars_run + timedelta(hours=1))  # the nightly failed
+    accepted = bars_run + timedelta(hours=1, minutes=30)
+    owner, issuer = "0000888888", "0000000001"
+    write_sec_form_accession(
+        conn,
+        SecFormFiling(
+            "0000000001-20-000123",
+            "4",
+            accepted,
+            date(2020, 6, 30),
+            (issuer,),
+            (owner,),
+            (
+                Form4Transaction(
+                    issuer, owner, 0, False, True, False, False, date(2020, 6, 29), None,
+                    "P", "A", Decimal("10"), Decimal("12.34"), Decimal("110"), "D", "Common", None,
+                ),
+            ),
+        ),
+        ingested_at=accepted,
+        source="sec_insider_bulk",
+    )  # fmt: skip
+    for run_id, source in ((3, "sec_forms"), (4, "sec_insider_bulk")):
+        _run_row(conn, run_id, "ok", accepted, source=source)
+    fresh = header.store_freshness(conn, T)
+    assert fresh.last_updated == bars_run
+    assert fresh.as_of == session_close(date(2020, 6, 30))

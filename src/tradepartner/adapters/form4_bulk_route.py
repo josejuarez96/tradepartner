@@ -197,9 +197,11 @@ def run_form4_bulk_route(
     """
     if budget <= 0:
         raise ValueError("budget must be positive")
+    # Issuer by issuer within each quarter, so the stamp seam reads each
+    # issuer's stamps file once per quarter, not once per accession (#2632).
     queue = sorted(
         (row for row in set(accessions) if row[0] not in skip_accessions),
-        key=lambda row: (row[3], row[0]),
+        key=lambda row: (row[1], row[3], row[0]),
     )
     grouped: dict[Quarter, list[Form4IndexRow]] = defaultdict(list)
     for row in queue:

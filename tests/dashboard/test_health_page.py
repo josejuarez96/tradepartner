@@ -752,3 +752,19 @@ def test_render_leads_with_a_fine_verdict_on_a_current_store(
     monkeypatch: pytest.MonkeyPatch, store_path: Path
 ) -> None:
     assert "Data: checks pass" in _text(_app(monkeypatch, store_path))
+
+
+def test_a_sec_forms_backfill_run_is_not_last_updated(store_path: Path) -> None:
+    """#2624: a forms-only backfill's run rows never make the page look updated."""
+    later = FINISHED + timedelta(minutes=30)
+    for run_id, source in (("2624a", "sec_forms"), ("2624b", "sec_insider_bulk")):
+        _write(
+            store_path,
+            "INSERT INTO ingestion_runs VALUES (?, ?, ?, 'ok', ?, 'backfill', 0, 'x', 'x')",
+            [run_id, later, later, source],
+        )
+    with _connect(store_path) as conn:
+        view = health_page.load_health_view(
+            conn, later + timedelta(minutes=1), _settings(store_path), WINDOW
+        )
+    assert view.last_updated == FINISHED

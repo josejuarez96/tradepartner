@@ -18,6 +18,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
@@ -7921,3 +7922,73 @@ def test_sec_form_writer_with_the_stored_set_writes_the_same_rows_and_still_refu
         if stored is not None:
             assert stored == {filing.accession}
     assert stores[0] == stores[1]
+
+
+def test_form4_route_reads_each_issuers_stamps_file_once_per_quarter(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2632: the route goes issuer by issuer, and the stamps file of the issuer
+    in hand is parsed once; a read returns its own dict and a write drops the memo."""
+    from tradepartner.adapters import edgar_source
+    from tradepartner.adapters.form4_bulk_route import run_form4_bulk_route
+    from tradepartner.adapters.form4_route import Quarter
+
+    now = datetime(2026, 4, 2, tzinfo=UTC)  # 2026Q1 not yet published: every row stamps
+    enabled = settings.model_copy(
+        update={
+            "edgar": settings.edgar.model_copy(update={"cache_dir": str(tmp_path / "cache")}),
+            "events": settings.events.model_copy(update={"sec_forms_enabled": True}),
+        }
+    )
+    source = EdgarFilingSource(enabled, client=httpx.Client(), clock=lambda: now)
+    other = "0000000009"
+    rows = []
+    for day in (2, 3, 4):  # interleaved by date: ACME, other, ACME, other, ...
+        for cik in (ACME, other):
+            accession = f"{cik}-26-{day:06d}"
+            rows.append((accession, cik, "4", date(2026, 1, day)))
+    for cik in (ACME, other):
+        source._save_stamps(
+            cik,
+            {
+                a: SubmissionRecord(a, "4", "f.xml", False, datetime(2026, 1, 5, tzinfo=UTC))
+                for a, c, _f, _d in rows
+                if c == cik
+            },
+        )
+    parses: list[str] = []
+    real_loads = edgar_source.json.loads
+
+    def counted(text: Any) -> Any:
+        parsed = real_loads(text)
+        if isinstance(parsed, dict) and "records" in parsed:
+            parses.append(parsed["cik"])
+        return parsed
+
+    monkeypatch.setattr(edgar_source.json, "loads", counted)
+    order: list[str] = []
+
+    def stamp(cik: str, accession: str, filed: date) -> None:
+        order.append(cik)
+        assert source.sec_form_stamp(cik, accession, filed) is not None
+        return None
+
+    run_form4_bulk_route(
+        rows,
+        quarters={Quarter(2026, 1): None},
+        stamp=stamp,
+        xml=lambda *_: None,
+        write=lambda _filing: None,
+        now=now,
+        price_below=Decimal("1"),
+        zero_price_codes=("P", "S"),
+        order_sample_size=0,
+        budget=100,
+    )
+    assert order == [ACME] * 3 + [other] * 3
+    assert parses == [ACME, other]
+    copy = source._load_stamps(other)
+    copy.clear()
+    assert len(source._load_stamps(other)) == 3 and parses == [ACME, other]
+    source._save_stamps(other, {})
+    assert source._load_stamps(other) == {} and parses == [ACME, other, other]

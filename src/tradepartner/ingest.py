@@ -1926,6 +1926,9 @@ def _write_sec_forms(
 #: The run-row source of `ingest_sec_forms` (#2624); its quarters keep their
 #: own `sec_insider_bulk` rows, as in the EDGAR chunk.
 SEC_FORMS_SOURCE = "sec_forms"
+#: The run-row sources of the SEC forms backfill: they say nothing about when
+#: the bars or the master arrived, so freshness reads skip them (#2624).
+SEC_FORMS_BACKFILL_SOURCES = frozenset({SEC_FORMS_SOURCE, "sec_insider_bulk"})
 _SEC_13D_FORMS = frozenset({"SC 13D", "SC 13D/A", "SCHEDULE 13D", "SCHEDULE 13D/A"})
 
 

@@ -587,6 +587,9 @@ class EdgarFilingSource(FilingSource):
         # last read or written; the forms `filing_events` answers (T164e
         # passes `edgar.event_forms`); the counts, each CIK counted once.
         self._items_refreshed: dict[str, bool] = {}
+        # #2632: the last parsed stamps file (CIK, records, items_refreshed),
+        # dropped when that CIK's file is written.
+        self._stamps_memo: tuple[str, dict[str, SubmissionRecord], bool] | None = None
         self._event_forms = frozenset(event_forms)
         self._events_counted: set[str] = set()
         self.filing_events_unstamped = 0
@@ -1512,7 +1515,13 @@ class EdgarFilingSource(FilingSource):
     def _load_stamps(self, cik: str) -> dict[str, SubmissionRecord]:
         """`cik`'s stamps in either layout (module docstring, "Stamps layout");
         `{}` for an absent, truncated or unknown file. Records the file's
-        `items_refreshed` flag for `_save_stamps` (`True` with no file)."""
+        `items_refreshed` flag for `_save_stamps` (`True` with no file).
+        The last file parsed is kept (#2632), so consecutive reads of one CIK
+        parse it once; each read returns its own dict, and a write drops it."""
+        memo = self._stamps_memo
+        if memo is not None and memo[0] == cik:
+            self._items_refreshed[cik] = memo[2]
+            return dict(memo[1])
         try:
             data = json.loads(self._stamps_path(cik).read_bytes())
             if data["version"] != PARSER_VERSION or data["cik"] != cik:
@@ -1546,6 +1555,7 @@ class EdgarFilingSource(FilingSource):
             self._items_refreshed.pop(cik, None)
             return {}  # absent, truncated or another layout: stamp again
         self._items_refreshed[cik] = refreshed
+        self._stamps_memo = (cik, dict(records), refreshed)
         return records
 
     def _save_stamps(
@@ -1558,6 +1568,8 @@ class EdgarFilingSource(FilingSource):
         """Write `cik`'s stamps in `STAMPS_LAYOUT`. `items_refreshed` defaults
         to the flag `_load_stamps` last read for the CIK (`True` if none), so
         a stamping pass never marks an old-layout file refreshed."""
+        if self._stamps_memo is not None and self._stamps_memo[0] == cik:
+            self._stamps_memo = None
         if items_refreshed is None:
             items_refreshed = self._items_refreshed.get(cik, True)
         data = {
