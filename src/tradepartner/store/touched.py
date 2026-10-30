@@ -19,13 +19,21 @@ class FailureState:
 
 
 @dataclass(frozen=True, slots=True)
+class PerNameEntry:
+    """One config entry's full value and every CIK the entry names."""
+
+    value: str
+    ciks: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
 class TouchedInputs:
     """Explicit facts and state changes used to select tonight's CIKs.
 
     ``accession_ciks`` includes every index row listing the accession, not
     only its filer. It expands failures as well as FSN periods. Per-name
-    values map each stored config entry to all CIKs
-    it names. An edited entry touches all CIKs it named before or after.
+    entries hold both the full config value and every CIK they name. An
+    edited key or value touches all CIKs it named before or after.
     Snapshot values omit fetch time: identical new fetches are not changes.
     Clock sets are calculated at the source boundary from the prior successful
     run and tonight's source state. ``newly_known_ciks`` covers an acceptance
@@ -43,10 +51,8 @@ class TouchedInputs:
     accession_ciks: Mapping[str, frozenset[str]] = field(default_factory=dict)
     previous_snapshot: Mapping[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
     current_snapshot: Mapping[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
-    previous_per_name_lists: Mapping[str, Mapping[str, frozenset[str]]] = field(
-        default_factory=dict
-    )
-    current_per_name_lists: Mapping[str, Mapping[str, frozenset[str]]] = field(default_factory=dict)
+    previous_per_name_lists: Mapping[str, Mapping[str, PerNameEntry]] = field(default_factory=dict)
+    current_per_name_lists: Mapping[str, Mapping[str, PerNameEntry]] = field(default_factory=dict)
     master_chains_ciks: frozenset[str] = frozenset()
     settled_ciks: frozenset[str] = frozenset()
     lag_window_start_ciks: frozenset[str] = frozenset()
@@ -90,11 +96,13 @@ def touched_ciks(inputs: TouchedInputs) -> set[str]:
         before_list = inputs.previous_per_name_lists.get(name, {})
         after_list = inputs.current_per_name_lists.get(name, {})
         for entry in before_list.keys() | after_list.keys():
-            before_ciks = before_list.get(entry, frozenset())
-            after_ciks = after_list.get(entry, frozenset())
-            if before_ciks != after_ciks:
-                touched.update(before_ciks)
-                touched.update(after_ciks)
+            before_value = before_list.get(entry)
+            after_value = after_list.get(entry)
+            if before_value != after_value:
+                if before_value is not None:
+                    touched.update(before_value.ciks)
+                if after_value is not None:
+                    touched.update(after_value.ciks)
 
     touched.update(inputs.master_chains_ciks)
     touched.update(inputs.settled_ciks)

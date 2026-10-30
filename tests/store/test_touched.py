@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 
-from tradepartner.store.touched import FailureState, TouchedInputs, touched_ciks
+from tradepartner.store.touched import FailureState, PerNameEntry, TouchedInputs, touched_ciks
 
 A = "0000000001"
 B = "0000000002"
@@ -63,6 +63,16 @@ def test_shared_accession_failure_touches_every_listing_cik() -> None:
     assert touched_ciks(inputs) == {A, B}
 
 
+def test_unchanged_non_quarantined_shared_accession_touches_every_listing_cik() -> None:
+    failures = {ACCESSION: FailureState(A)}
+    inputs = TouchedInputs(
+        previous_failures=failures,
+        current_failures=failures,
+        accession_ciks={ACCESSION: frozenset({A, B})},
+    )
+    assert touched_ciks(inputs) == {A, B}
+
+
 def test_filename_incomplete_ciks() -> None:
     assert touched_ciks(TouchedInputs(filename_incomplete_ciks=frozenset({A}))) == {A}
 
@@ -87,8 +97,8 @@ def test_companies_snapshot_entry_appeared_changed_or_disappeared() -> None:
 
 
 def test_per_name_list_edit_diffed_against_last_run_value() -> None:
-    before = {"master.keep_successors": {"old": frozenset({A})}}
-    after = {"master.keep_successors": {"new": frozenset({B})}}
+    before = {"master.keep_successors": {"old": PerNameEntry("old", frozenset({A}))}}
+    after = {"master.keep_successors": {"new": PerNameEntry("new", frozenset({B}))}}
     assert touched_ciks(
         TouchedInputs(previous_per_name_lists=before, current_per_name_lists=after)
     ) == {A, B}
@@ -96,6 +106,14 @@ def test_per_name_list_edit_diffed_against_last_run_value() -> None:
         touched_ciks(TouchedInputs(previous_per_name_lists=before, current_per_name_lists=before))
         == set()
     )
+
+
+def test_per_name_list_value_edit_touches_cik_with_unchanged_key() -> None:
+    before = {"edgar.class_member_overrides": {A: PerNameEntry("CommonClassA", frozenset({A}))}}
+    after = {"edgar.class_member_overrides": {A: PerNameEntry("CommonClassB", frozenset({A}))}}
+    assert touched_ciks(
+        TouchedInputs(previous_per_name_lists=before, current_per_name_lists=after)
+    ) == {A}
 
 
 def test_master_chains_entry_ciks_every_night() -> None:
