@@ -104,13 +104,20 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
-from tradepartner.calendar import last_completed_session, next_session, previous_session
+from tradepartner.calendar import (
+    last_completed_session,
+    next_session,
+    previous_session,
+    session_close,
+)
 from tradepartner.config import Settings
 from tradepartner.execution.check import _chain_line, _frozen, _override_line
+from tradepartner.execution.plan import _split_factor
 from tradepartner.execution.window import window_cadence
 from tradepartner.health import health_report
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
+from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import utc_now
 from tradepartner.store.journal import OrderRow, PaperWindowRow
 
@@ -768,6 +775,7 @@ def _sized_shares(orders: Sequence[OrderRow], known: dict[str, list[_KnownFill]]
 
 
 def _resized_orders(
+    conn: duckdb.DuckDBPyConnection,
     decision_id: int,
     orders: Sequence[OrderRow],
     known: dict[str, list[_KnownFill]],
@@ -805,19 +813,35 @@ def _resized_orders(
         if whole_cover:
             prior_orders = [o for o in orders if o.known_at < order.known_at]
             if prior_orders:
-                latest = max(prior_orders, key=lambda o: o.known_at)
-                filled = sum(
-                    f.quantity
-                    for f in known.get(latest.client_order_id, ())
-                    if f.known_at < order.known_at
+                latest = max(enumerate(prior_orders), key=lambda p: (p[1].known_at, p[0]))[1]
+                prior_fills = [
+                    f for f in known.get(latest.client_order_id, ()) if f.known_at < order.known_at
+                ]
+                prefix = (
+                    f"order {order.client_order_id} of decision {decision_id} "
+                    "sized with no remainder "
                 )
-                remaining = (latest.quantity or 0.0) - filled
-                if remaining < 1:
-                    failures.append(
-                        f"order {order.client_order_id} of decision {decision_id} sized with no "
-                        f"remainder ({filled:g} of {latest.quantity or 0.0:g} shares filled "
-                        "before it)"
+                if latest.quantity is not None:
+                    filled = sum(f.quantity for f in prior_fills)
+                    actions = live_actions_as_of(
+                        conn, session_close(previous_session(order.session)), [order.security_id]
                     )
+                    factor = _split_factor(
+                        actions, order.security_id, latest.session, order.session
+                    )
+                    remaining = (latest.quantity - filled) * factor
+                    if remaining < 1:
+                        failures.append(
+                            f"{prefix}({filled:g} of {latest.quantity:g} shares filled before it)"
+                        )
+                elif latest.notional is not None:
+                    filled_value = sum(f.quantity * f.price for f in prior_fills)
+                    remaining = latest.notional - filled_value
+                    if remaining <= 0 or remaining < minimum:
+                        failures.append(
+                            f"{prefix}({filled_value:.2f} of {latest.notional:.2f} "
+                            "filled before it)"
+                        )
             continue
         value = sum(
             f.quantity * f.price
@@ -941,7 +965,14 @@ def _orders_line(
             )
             minimum = _frozen_tolerance(windows[run_window[run_id]], _MIN_ORDER_NOTIONAL)
             failures += _resized_orders(
-                decision_id, mine, known, terminal_at, limit, minimum, whole_cover=whole_cover
+                conn,
+                decision_id,
+                mine,
+                known,
+                terminal_at,
+                limit,
+                minimum,
+                whole_cover=whole_cover,
             )
         else:
             got = sum(quantity.get(c, 0.0) for c in coids)
