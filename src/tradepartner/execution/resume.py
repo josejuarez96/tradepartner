@@ -706,22 +706,21 @@ def resume(
         # engagement write failed. Rejudge fills from earlier resume
         # invocations since the last release, using each invocation's own
         # close(S-1) view, before this invocation can release the switch.
+        # Resume IDs preserve that order even when the wall clock steps back.
         with connect() as conn:
-            released_at = max(
-                (event.known_at for event in events if event.state == "released"),
-                default=window.started_at,
+            released_resume_id = max(
+                (event.resume_id or 0 for event in events if event.state == "released"),
+                default=0,
             )
             earlier = {
                 row.resume_id: row
                 for row in resume_invocations(conn)
-                if row.resume_id != resume_id and released_at < row.at < now
+                if row.resume_id is not None and released_resume_id < row.resume_id < resume_id
             }
             prior_cursors = [
                 cursor
                 for cursor in fill_cursors(conn)
-                if cursor.writer_kind == _WRITER
-                and cursor.writer_id in earlier
-                and released_at < cursor.known_at < now
+                if cursor.writer_kind == _WRITER and cursor.writer_id in earlier
             ]
             fills_by_stamp: dict[datetime, list[OrderedFill]] = {}
             for item in fills_for(conn, window_id=window_id):

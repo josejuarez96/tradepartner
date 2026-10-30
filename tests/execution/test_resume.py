@@ -459,6 +459,42 @@ def test_bad_fill_stays_refused_if_fault_engagement_write_fails(
     assert _engaged(journal_settings, window) == initially_engaged
 
 
+def test_clock_step_back_rechecks_an_earlier_refused_invocation(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=True)
+    _order(journal_settings, fake, crashed, "tp-backward-bad", 2.0, DAY1 - timedelta(hours=1))
+    fake.apply("tp-backward-bad", FillAt(200.0))
+    _engage(journal_settings, window, fixed_clock)
+    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    real_engage = switch.engage
+    monkeypatch.setattr(
+        resume_module.switch,
+        "engage",
+        lambda *_args, **_kwargs: switch.WriteFailed("store unavailable"),
+    )
+    first = _resume(journal_settings, fake, fixed_clock)
+    assert first.status == REFUSED
+    assert "kill switch write failed" in first.reasons[0]
+    monkeypatch.setattr(resume_module.switch, "engage", real_engage)
+
+    fixed_clock.now = DAY1 - timedelta(minutes=1)
+    second = _resume(journal_settings, fake, fixed_clock)
+
+    assert second.status == REFUSED
+    assert any("fill_price_outside_band" in reason for reason in second.reasons)
+    assert window.window_id is not None
+    with open_read_only(journal_settings) as conn:
+        assert len(resume_invocations(conn)) == 2
+        assert not any(
+            event.state == "released" for event in kill_switch_events_for(conn, window.window_id)
+        )
+
+
 def test_resume_reports_a_new_fill_without_a_reference_price(
     journal_settings: Settings,
     fake: SkewedFake,

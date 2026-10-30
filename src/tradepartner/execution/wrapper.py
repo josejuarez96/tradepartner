@@ -40,8 +40,8 @@ interrupted one for that book's own `paper resume`. A wrapper with no
    distinct from a crash's (`SystemExit(WRITE_FAILED_EXIT_CODE)`, `!=
    CRASH_EXIT_CODE`, #515) with nothing else done. The
    `engaged` row is where the fault is journaled with its type; the result row
-   (step 5) repeats the type with the full message. `StaleDataError` writes no
-   `engaged` row: it is a data fault the next ingest cures;
+   (step 5) repeats the type with the full message. `StaleDataError` initially
+   writes no `engaged` row; a bad fill found by its halt read engages the switch;
 2. best-effort cancels of the run's **acknowledged** non-terminal orders,
    oldest first. A `pending` order (no broker-acknowledged event) gets neither
    a cancel nor a read: `paper resume` settles it. Before every cancel call a
@@ -60,7 +60,8 @@ interrupted one for that book's own `paper resume`. A wrapper with no
    which every read of the account-wide feed meets again) is not a new fault:
    the halt stands, the switch stays engaged, and the alert and the result row
    name it (#375). A rejection verdict a read returns is named in the alert
-   too (T58's handoff: a halt-path caller never drops one). With
+   too (T58's handoff: a halt-path caller never drops one). An out-of-band fill
+   engages the switch with its band violation as the reason. With
    `write_offs`, each read back-fills the `written_off` row of a terminal buy
    of a pending rebalance that lacks one (T58);
 4. the alert, run-scoped, after one checked clock reading (so a clock gone bad
@@ -2074,7 +2075,6 @@ class RiskGatedBroker:
             )
         except Exception as exc:
             # A halt still reads back fills when its reference-price read fails.
-            # A stale-data halt leaves the switch as it was.
             notes.append(f"halt read of {coid} has no price band ({type(exc).__name__})")
         try:
             collected = collect(
@@ -2098,11 +2098,25 @@ class RiskGatedBroker:
             return
         except SystemFaultError as exc:
             if "fill_price_outside_band:" in str(exc):
-                notes.append(
-                    f"halt read of {coid} failed ({type(exc).__name__}: {self._scrub(str(exc))})"
+                reason = self._scrub(str(exc))
+                engaged = switch.engage(
+                    self._settings,
+                    stamp,
+                    window_id=run.window_id,
+                    source=_FAULT,
+                    fault_type=type(exc).__name__,
+                    reason=reason,
+                    run_id=run.run_id,
                 )
-                return
-            self._event(coid, _CANCEL_FAILED, stamp, notes)
+                if isinstance(engaged, switch.WriteFailed):
+                    self._alerter.deliver_without_store(
+                        "kill_switch_write_failed",
+                        f"run {run.run_id} halt read found {reason}; the engaged row could not be "
+                        f"written ({engaged.error})",
+                    )
+                    raise SystemExit(WRITE_FAILED_EXIT_CODE) from exc
+            else:
+                self._event(coid, _CANCEL_FAILED, stamp, notes)
             notes.append(
                 f"halt read of {coid} failed ({type(exc).__name__}: {self._scrub(str(exc))})"
             )
