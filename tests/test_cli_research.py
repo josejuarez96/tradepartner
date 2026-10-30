@@ -1142,7 +1142,7 @@ def test_study_closes_the_run_failed_on_any_exception_scrubbed(
     study_ready: int, config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = get_settings()
-    paths = (str(Path.home()), settings.store.path, settings.research.data_dir)
+    paths = (str(Path.home()), settings.store.path)
 
     def boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError(f"bars unreadable {ALPACA_KEY}; {'; '.join(paths)}")
@@ -1157,8 +1157,8 @@ def test_study_closes_the_run_failed_on_any_exception_scrubbed(
     )
     assert outcome == "failed"
     assert message.startswith("RuntimeError: bars unreadable") and ALPACA_KEY not in message
-    assert message.count("<path>") == 3
-    assert out.stdout.count("<path>") == 3
+    assert message.count("<path>") == 2
+    assert out.stdout.count("<path>") == 2
     for path in paths:
         assert path not in message
         assert path not in out.stdout

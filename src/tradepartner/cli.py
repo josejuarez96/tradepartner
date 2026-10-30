@@ -1415,8 +1415,6 @@ def _study_scrubbed(text: str, settings: Settings) -> str:
         str(Path.home()),
         str(settings.store.path),
         str(Path(settings.store.path).resolve()),
-        str(settings.research.data_dir),
-        str(Path(settings.research.data_dir).resolve()),
     }
     for path in sorted(paths, key=len, reverse=True):
         if path not in {"", ".", "/"}:
