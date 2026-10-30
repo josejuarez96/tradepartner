@@ -200,6 +200,16 @@ derived at `t`, as the data is read.
   `provenance_allowed` (the table's own set, `schema.TABLE_PROVENANCE_VALUES`)
   on every fact table. The schema's constraints already block these; the rules
   make a store written by other code, or a changed schema, show it.
+- The SEC ownership form rules (#2571, T307c), four per table on
+  `sec_filing_events` and `sec_form4_transactions`, over every stored row
+  whatever its `known_at`, and whether or not `events.sec_forms_enabled`
+  collects: `*_known_at_is_accepted_at` (`known_at` equals `accepted_at`),
+  `*_timestamps_aware` (both timestamp columns are `TIMESTAMPTZ`),
+  `*_unique` (no duplicate identity) and `*_identity_not_null`. The identity
+  is (`accession`, `subject_cik`, `filer_cik`) for `sec_filing_events` and
+  (`accession`, `filer_cik`, `line_no`) for `sec_form4_transactions`; the
+  `*_known_at_is_accepted_at` and `*_unique` frames carry it in full. A store
+  without a table passes that table's four rules.
 - `bars_on_sessions`: every `prices_daily.session` is an XNYS session in the
   configured calendar range.
 - `no_duplicate_bars`: no two bars share `(security_id, session, known_at)`.
@@ -3825,8 +3835,25 @@ _SEC_FORM_IDENTITIES: dict[str, tuple[str, ...]] = {
     "sec_filing_events": ("accession", "subject_cik", "filer_cik"),
     "sec_form4_transactions": ("accession", "filer_cik", "line_no"),
 }
+_SEC_FORM_RULES: dict[str, tuple[str, str, str, str]] = {
+    "sec_filing_events": (
+        SEC_FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
+        SEC_FILING_EVENTS_TIMESTAMPS_AWARE,
+        SEC_FILING_EVENTS_UNIQUE,
+        SEC_FILING_EVENTS_IDENTITY_NOT_NULL,
+    ),
+    "sec_form4_transactions": (
+        SEC_FORM4_TRANSACTIONS_KNOWN_AT_IS_ACCEPTED_AT,
+        SEC_FORM4_TRANSACTIONS_TIMESTAMPS_AWARE,
+        SEC_FORM4_TRANSACTIONS_UNIQUE,
+        SEC_FORM4_TRANSACTIONS_IDENTITY_NOT_NULL,
+    ),
+}
 _SEC_FORM_KEY_SCHEMA: dict[str, Any] = {
     "accession": pl.Utf8,
+    "subject_cik": pl.Utf8,
+    "filer_cik": pl.Utf8,
+    "line_no": pl.Int64,
     "rows": pl.Int64,
 }
 _SEC_FORM_COLUMN_SCHEMA: dict[str, Any] = {
@@ -3842,11 +3869,17 @@ def _sec_form_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
     for table, identity in _SEC_FORM_IDENTITIES.items():
         key_schema = _SEC_FORM_KEY_SCHEMA
         column_schema = _SEC_FORM_COLUMN_SCHEMA
+        (
+            known_at_rule,
+            timestamps_rule,
+            unique_rule,
+            identity_not_null_rule,
+        ) = _SEC_FORM_RULES[table]
         if table not in present:
-            rules[f"{table}_known_at_is_accepted_at"] = pl.DataFrame(schema=key_schema)
-            rules[f"{table}_timestamps_aware"] = pl.DataFrame(schema=column_schema)
-            rules[f"{table}_unique"] = pl.DataFrame(schema=key_schema)
-            rules[f"{table}_identity_not_null"] = pl.DataFrame(schema=column_schema)
+            rules[known_at_rule] = pl.DataFrame(schema=key_schema)
+            rules[timestamps_rule] = pl.DataFrame(schema=column_schema)
+            rules[unique_rule] = pl.DataFrame(schema=key_schema)
+            rules[identity_not_null_rule] = pl.DataFrame(schema=column_schema)
             continue
 
         def keys(
@@ -3856,26 +3889,28 @@ def _sec_form_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
             columns: tuple[str, ...] = identity,
             schema: dict[str, Any] = key_schema,
         ) -> pl.DataFrame:
+            select_cols = ", ".join(columns)
             found = conn.execute(
-                f"SELECT accession, count(*) FROM {table_name} {where} "
-                f"GROUP BY {', '.join(columns)} {having} ORDER BY accession"
+                f"SELECT {select_cols}, count(*) FROM {table_name} {where} "
+                f"GROUP BY {select_cols} {having} ORDER BY accession"
             ).fetchall()
-            return pl.DataFrame(
-                [{"accession": accession, "rows": int(count)} for accession, count in found],
-                schema=schema,
-            )
+            rows: list[dict[str, Any]] = []
+            for row in found:
+                d = {"rows": int(row[-1])}
+                for i, col in enumerate(columns):
+                    d[col] = row[i]
+                rows.append(d)
+            return pl.DataFrame(rows, schema=schema)
 
-        rules[f"{table}_known_at_is_accepted_at"] = keys(
-            "WHERE known_at IS DISTINCT FROM accepted_at"
-        )
-        rules[f"{table}_unique"] = keys("", "HAVING count(*) > 1")
+        rules[known_at_rule] = keys("WHERE known_at IS DISTINCT FROM accepted_at")
+        rules[unique_rule] = keys("", "HAVING count(*) > 1")
         null_counts = []
         for column in identity:
             count_row = conn.execute(
                 f"SELECT count(*) FROM {table} WHERE {column} IS NULL"
             ).fetchone()
             null_counts.append({"column": column, "rows": int(count_row[0]) if count_row else 0})
-        rules[f"{table}_identity_not_null"] = pl.DataFrame(
+        rules[identity_not_null_rule] = pl.DataFrame(
             [row for row in null_counts if row["rows"]], schema=column_schema
         )
         types = conn.execute(
@@ -3886,7 +3921,7 @@ def _sec_form_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
             [table],
         ).fetchall()
         type_by_column = dict(types)
-        rules[f"{table}_timestamps_aware"] = pl.DataFrame(
+        rules[timestamps_rule] = pl.DataFrame(
             [
                 {"column": column, "rows": 1}
                 for column in ("known_at", "accepted_at")

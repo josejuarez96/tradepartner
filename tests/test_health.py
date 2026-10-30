@@ -4691,3 +4691,34 @@ def test_sec_form_null_identity_fails(
     )
     assert not check.passed
     assert check.violations["column"].to_list() == [column]
+
+
+@pytest.mark.parametrize("table", _SEC_TABLES)
+def test_sec_form_violation_frame_has_identity_columns(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings, table: str
+) -> None:
+    """Each SEC forms violation frame includes the full identity columns."""
+    row = _sec_row(table)
+    row["known_at"] -= timedelta(days=1)
+    insert_row(loose_store, table, row)
+    check = next(
+        c
+        for c in integrity_checks(loose_store, T_END, settings)
+        if c.rule == f"{table}_known_at_is_accepted_at"
+    )
+    assert not check.passed
+    expected_identity = set(_SEC_IDENTITY[table])
+    actual_columns = set(check.violations.columns)
+    assert expected_identity.issubset(actual_columns), (
+        f"Missing identity columns for {table}: {expected_identity - actual_columns}"
+    )
+    # Also check the unique rule violation frame has identity columns
+    insert_row(loose_store, table, row)
+    check = next(
+        c for c in integrity_checks(loose_store, T_END, settings) if c.rule == f"{table}_unique"
+    )
+    assert not check.passed
+    actual_columns = set(check.violations.columns)
+    assert expected_identity.issubset(actual_columns), (
+        f"Missing identity columns for {table} unique: {expected_identity - actual_columns}"
+    )
