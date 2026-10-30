@@ -139,6 +139,220 @@ def _json_bytes(value: object) -> bytes:
     ).encode()
 
 
+def match_events(
+    event_rows: Sequence[dict[str, Any]], design: Mapping[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Size buckets and matched peers over built event rows (pure).
+
+    Returns the rows with their buckets and peer spreads, and the counts this
+    stage derives (`n_dropped_small_size_group_*`, `n_dropped_no_peers_*`,
+    `n_traded_*`), which the caller adds to the earlier stages' counts.
+    """
+    derived: dict[str, int] = defaultdict(int)
+    # Default cuts and peer pools are re-evaluated at the treated event's entry.
+    # A declared ex-post option reproduces the historical C1b probe.
+    matching = design.get("matching", "entry_known")
+    if matching not in {"entry_known", "ex_post"}:
+        raise ValueError("unknown matching mode")
+    bucketed = (
+        assign_buckets(
+            event_rows,
+            bucket_by=design["bucket_by"],
+            n_buckets=int(design["n_buckets"]),
+            min_bucket_events=int(design["min_bucket_events"]),
+        )
+        if matching == "ex_post"
+        else []
+    )
+    by_bucket_cell: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for row in event_rows:
+        by_bucket_cell[tuple(row[key] for key in design["bucket_by"])].append(row)
+    bucket_cache: dict[tuple[int, tuple[Any, ...]], list[dict[str, Any]]] = {}
+    peer_index: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    peer_indices: dict[tuple[Any, ...], list[int]] = {}
+    if matching == "ex_post":
+        for row in bucketed:
+            if row["group"] == design["peer_group"] and row["bucket"] is not None:
+                peer_index[(*tuple(row[key] for key in design["peer_by"]), row["bucket"])].append(
+                    row
+                )
+        for key, candidates in peer_index.items():
+            candidates.sort(key=lambda row: row["entry_index"])
+            peer_indices[key] = [int(row["entry_index"]) for row in candidates]
+    processed: list[dict[str, Any]] = []
+    for event in bucketed if matching == "ex_post" else event_rows:
+        if matching == "entry_known":
+            cell = tuple(event[key] for key in design["bucket_by"])
+            cache_key = (int(event["entry_index"]), cell)
+            if cache_key not in bucket_cache:
+                entry_instant = session_open(date.fromisoformat(str(event["entry"])))
+                visible = [
+                    row
+                    for row in by_bucket_cell[cell]
+                    if row["entry_index"] <= event["entry_index"]
+                    and row["known_at"] <= entry_instant
+                ]
+                bucket_cache[cache_key] = assign_buckets(
+                    visible,
+                    bucket_by=design["bucket_by"],
+                    n_buckets=int(design["n_buckets"]),
+                    min_bucket_events=int(design["min_bucket_events"]),
+                )
+            pool = bucket_cache[cache_key]
+            event = next(row for row in pool if row["event_id"] == event["event_id"])
+        else:
+            pool = peer_index.get(
+                (*tuple(event[key] for key in design["peer_by"]), event["bucket"]), []
+            )
+        group = str(event["group"])
+        if event["bucket"] is None:
+            derived[f"n_dropped_small_size_group_{group}"] += 1
+            processed.append(event)
+            continue
+        if group == design["peer_group"]:
+            derived[f"n_traded_{group}"] += 1
+            processed.append(event)
+            continue
+        if matching == "ex_post":
+            indices = peer_indices.get(
+                (*tuple(event[key] for key in design["peer_by"]), event["bucket"]), []
+            )
+            low = bisect_left(indices, int(event["entry_index"]) - int(design["peer_window"]))
+            high = bisect_right(indices, int(event["entry_index"]) + int(design["peer_window"]))
+            candidates = pool[low:high]
+        else:
+            candidates = [
+                row
+                for row in pool
+                if row["group"] == design["peer_group"]
+                and row["bucket"] == event["bucket"]
+                and all(row[key] == event[key] for key in design["peer_by"])
+                and int(event["entry_index"]) - int(row["entry_index"])
+                <= int(design["peer_window"])
+            ]
+        spread = attach_spreads(
+            [event, *candidates],
+            horizons=design["horizons"],
+            treated_groups=[group],
+            peer_group=str(design["peer_group"]),
+            peer_by=design["peer_by"],
+            peer_window=int(design["peer_window"]),
+            min_peers=int(design["min_peers"]),
+            near_k=int(design["near_k"]),
+        )[0]
+        if spread["no_peers"]:
+            derived[f"n_dropped_no_peers_{group}"] += 1
+        else:
+            derived[f"n_traded_{group}"] += 1
+        processed.append(spread)
+    return processed, dict(derived)
+
+
+def summarise_study(
+    processed: Sequence[Mapping[str, Any]], counts: Mapping[str, Any], design: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The study summary and the declared kill lines over matched rows (pure).
+
+    Its `secondary` is what `experiment study` records as `secondary_json`;
+    the C1b golden calls it with run 3's event rows and recorded counts.
+    """
+    groups = list(design["groups"])
+    kills = {
+        str(line["name"]): {
+            "readings": [
+                dict(
+                    raw="raw", beta_adjusted="badj", size_tight="sz", size_tight_beta_adjusted="szb"
+                )[name]
+                for name in line["readings"]
+            ],
+            "metric": line["metric"],
+            "floor_bp": line["floor"],
+            "t_floor": line["t_floor"],
+            "which_t": line["t"],
+        }
+        for line in design["kill"]
+    }
+    by_side = {str(line["side"]): kills[str(line["name"])] for line in design["kill"]}
+    fallback = {
+        "readings": ["raw"],
+        "metric": "net_bp",
+        "floor_bp": 0.0,
+        "t_floor": 0.0,
+        "which_t": "min",
+    }
+    long_line = next((line for line in design["kill"] if line["side"] == "long"), None)
+    short_line = next((line for line in design["kill"] if line["side"] == "short"), None)
+    primary_cost = float(long_line["cost_bps"]) if long_line else float(design["cost_bps"][-1])
+    short_borrow = float(short_line["borrow_bps"]) if short_line else float(design["borrow_bps"][0])
+    summary = summarise(
+        processed,
+        counts,
+        groups=groups,
+        peer_group=str(design["peer_group"]),
+        horizons=design["horizons"],
+        costs=design["cost_bps"],
+        borrows=design["borrow_bps"],
+        cluster_by=design["cluster_by"],
+        kill_lines={"long": by_side.get("long", fallback), "short": by_side.get("short", fallback)},
+        primary_cost=primary_cost,
+        short_borrow=short_borrow,
+        z=float(design["z"]),
+        peer_window=int(design["peer_window"]),
+    )
+    reading_key = {
+        "raw": "spread",
+        "beta_adjusted": "spread_badj",
+        "size_tight": "spread_sz",
+        "size_tight_beta_adjusted": "spread_szb",
+    }
+    for line in design["kill"]:
+        group = str(line["group"])
+        horizon = int(line["horizon"])
+        side = str(line["side"])
+        cost = float(line["cost_bps"])
+        borrow = float(line["borrow_bps"])
+        selected = [
+            row for row in processed if row["group"] == group and f"spread_{horizon}" in row
+        ]
+        readings: dict[str, dict[str, float]] = {}
+        for reading in line["readings"]:
+            metric_key = f"{reading_key[reading]}_{horizon}"
+            gross = [float(row[metric_key]) * (-1 if side == "short" else 1) for row in selected]
+            net = [
+                net_short(float(row[metric_key]), cost, borrow, horizon)
+                if side == "short"
+                else net_long(float(row[metric_key]), cost)
+                for row in selected
+            ]
+            t_values = gross if line["t_metric"] == "gross_spread_bp" else net
+            interval = overlap_result_interval(
+                t_values,
+                [int(row["entry_index"]) for row in selected],
+                max_lag_sessions=horizon - 1 + 2 * int(design["peer_window"]),
+                z=float(design["z"]),
+            )
+            gross_bp = sum(gross) / len(gross) * 10_000 if gross else math.nan
+            net_bp = sum(net) / len(net) * 10_000 if net else math.nan
+            readings[str(reading)] = {
+                "gross_spread_bp": gross_bp,
+                "net_bp": net_bp,
+                **{f"t_{kind}": interval["t"] for kind in (*design["cluster_by"], "min")},
+            }
+        result = evaluate_kill(
+            {
+                "readings": line["readings"],
+                "metric": line["metric"],
+                "floor_bp": line["floor"],
+                "t_floor": line["t_floor"],
+                "which_t": line["t"],
+            },
+            readings,
+        )
+        summary["kill"][str(line["name"])] = result
+        summary["secondary"][f"kill_{line['name']}"] = float(result["killed"])
+    return summary
+
+
 def run_study(
     handle: object,
     study: Mapping[str, Any] | Any,
@@ -329,195 +543,11 @@ def run_study(
             counts["n_delisted_exits"] += 1
         event_rows.append(built)
 
-    # Default cuts and peer pools are re-evaluated at the treated event's entry.
-    # A declared ex-post option reproduces the historical C1b probe.
+    processed, derived = match_events(event_rows, design)
+    for key, value in derived.items():
+        counts[key] += value
+    summary = summarise_study(processed, counts, design)
     matching = design.get("matching", "entry_known")
-    if matching not in {"entry_known", "ex_post"}:
-        raise ValueError("unknown matching mode")
-    bucketed = (
-        assign_buckets(
-            event_rows,
-            bucket_by=design["bucket_by"],
-            n_buckets=int(design["n_buckets"]),
-            min_bucket_events=int(design["min_bucket_events"]),
-        )
-        if matching == "ex_post"
-        else []
-    )
-    by_bucket_cell: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
-    for row in event_rows:
-        by_bucket_cell[tuple(row[key] for key in design["bucket_by"])].append(row)
-    bucket_cache: dict[tuple[int, tuple[Any, ...]], list[dict[str, Any]]] = {}
-    peer_index: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
-    peer_indices: dict[tuple[Any, ...], list[int]] = {}
-    if matching == "ex_post":
-        for row in bucketed:
-            if row["group"] == design["peer_group"] and row["bucket"] is not None:
-                peer_index[(*tuple(row[key] for key in design["peer_by"]), row["bucket"])].append(
-                    row
-                )
-        for key, candidates in peer_index.items():
-            candidates.sort(key=lambda row: row["entry_index"])
-            peer_indices[key] = [int(row["entry_index"]) for row in candidates]
-    processed: list[dict[str, Any]] = []
-    for event in bucketed if matching == "ex_post" else event_rows:
-        if matching == "entry_known":
-            cell = tuple(event[key] for key in design["bucket_by"])
-            cache_key = (int(event["entry_index"]), cell)
-            if cache_key not in bucket_cache:
-                entry_instant = session_open(date.fromisoformat(str(event["entry"])))
-                visible = [
-                    row
-                    for row in by_bucket_cell[cell]
-                    if row["entry_index"] <= event["entry_index"]
-                    and row["known_at"] <= entry_instant
-                ]
-                bucket_cache[cache_key] = assign_buckets(
-                    visible,
-                    bucket_by=design["bucket_by"],
-                    n_buckets=int(design["n_buckets"]),
-                    min_bucket_events=int(design["min_bucket_events"]),
-                )
-            pool = bucket_cache[cache_key]
-            event = next(row for row in pool if row["event_id"] == event["event_id"])
-        else:
-            pool = peer_index.get(
-                (*tuple(event[key] for key in design["peer_by"]), event["bucket"]), []
-            )
-        group = str(event["group"])
-        if event["bucket"] is None:
-            drop(group, "small_size_group")
-            processed.append(event)
-            continue
-        if group == design["peer_group"]:
-            counts[f"n_traded_{group}"] += 1
-            processed.append(event)
-            continue
-        if matching == "ex_post":
-            indices = peer_indices.get(
-                (*tuple(event[key] for key in design["peer_by"]), event["bucket"]), []
-            )
-            low = bisect_left(indices, int(event["entry_index"]) - int(design["peer_window"]))
-            high = bisect_right(indices, int(event["entry_index"]) + int(design["peer_window"]))
-            candidates = pool[low:high]
-        else:
-            candidates = [
-                row
-                for row in pool
-                if row["group"] == design["peer_group"]
-                and row["bucket"] == event["bucket"]
-                and all(row[key] == event[key] for key in design["peer_by"])
-                and int(event["entry_index"]) - int(row["entry_index"])
-                <= int(design["peer_window"])
-            ]
-        spread = attach_spreads(
-            [event, *candidates],
-            horizons=design["horizons"],
-            treated_groups=[group],
-            peer_group=str(design["peer_group"]),
-            peer_by=design["peer_by"],
-            peer_window=int(design["peer_window"]),
-            min_peers=int(design["min_peers"]),
-            near_k=int(design["near_k"]),
-        )[0]
-        if spread["no_peers"]:
-            drop(group, "no_peers")
-        else:
-            counts[f"n_traded_{group}"] += 1
-        processed.append(spread)
-    kills = {
-        str(line["name"]): {
-            "readings": [
-                dict(
-                    raw="raw", beta_adjusted="badj", size_tight="sz", size_tight_beta_adjusted="szb"
-                )[name]
-                for name in line["readings"]
-            ],
-            "metric": line["metric"],
-            "floor_bp": line["floor"],
-            "t_floor": line["t_floor"],
-            "which_t": line["t"],
-        }
-        for line in design["kill"]
-    }
-    by_side = {str(line["side"]): kills[str(line["name"])] for line in design["kill"]}
-    fallback = {
-        "readings": ["raw"],
-        "metric": "net_bp",
-        "floor_bp": 0.0,
-        "t_floor": 0.0,
-        "which_t": "min",
-    }
-    long_line = next((line for line in design["kill"] if line["side"] == "long"), None)
-    short_line = next((line for line in design["kill"] if line["side"] == "short"), None)
-    primary_cost = float(long_line["cost_bps"]) if long_line else float(design["cost_bps"][-1])
-    short_borrow = float(short_line["borrow_bps"]) if short_line else float(design["borrow_bps"][0])
-    summary = summarise(
-        processed,
-        counts,
-        groups=groups,
-        peer_group=str(design["peer_group"]),
-        horizons=design["horizons"],
-        costs=design["cost_bps"],
-        borrows=design["borrow_bps"],
-        cluster_by=design["cluster_by"],
-        kill_lines={"long": by_side.get("long", fallback), "short": by_side.get("short", fallback)},
-        primary_cost=primary_cost,
-        short_borrow=short_borrow,
-        z=float(design["z"]),
-        peer_window=int(design["peer_window"]),
-    )
-    reading_key = {
-        "raw": "spread",
-        "beta_adjusted": "spread_badj",
-        "size_tight": "spread_sz",
-        "size_tight_beta_adjusted": "spread_szb",
-    }
-    for line in design["kill"]:
-        group = str(line["group"])
-        horizon = int(line["horizon"])
-        side = str(line["side"])
-        cost = float(line["cost_bps"])
-        borrow = float(line["borrow_bps"])
-        selected = [
-            row for row in processed if row["group"] == group and f"spread_{horizon}" in row
-        ]
-        readings: dict[str, dict[str, float]] = {}
-        for reading in line["readings"]:
-            metric_key = f"{reading_key[reading]}_{horizon}"
-            gross = [float(row[metric_key]) * (-1 if side == "short" else 1) for row in selected]
-            net = [
-                net_short(float(row[metric_key]), cost, borrow, horizon)
-                if side == "short"
-                else net_long(float(row[metric_key]), cost)
-                for row in selected
-            ]
-            t_values = gross if line["t_metric"] == "gross_spread_bp" else net
-            interval = overlap_result_interval(
-                t_values,
-                [int(row["entry_index"]) for row in selected],
-                max_lag_sessions=horizon - 1 + 2 * int(design["peer_window"]),
-                z=float(design["z"]),
-            )
-            gross_bp = sum(gross) / len(gross) * 10_000 if gross else math.nan
-            net_bp = sum(net) / len(net) * 10_000 if net else math.nan
-            readings[str(reading)] = {
-                "gross_spread_bp": gross_bp,
-                "net_bp": net_bp,
-                **{f"t_{kind}": interval["t"] for kind in (*design["cluster_by"], "min")},
-            }
-        result = evaluate_kill(
-            {
-                "readings": line["readings"],
-                "metric": line["metric"],
-                "floor_bp": line["floor"],
-                "t_floor": line["t_floor"],
-                "which_t": line["t"],
-            },
-            readings,
-        )
-        summary["kill"][str(line["name"])] = result
-        summary["secondary"][f"kill_{line['name']}"] = float(result["killed"])
     summary["exploratory"]["matching"] = matching
     summary["exploratory"]["delisted_exit_note"] = (
         "Last available close carried forward; no delisting return. "

@@ -1135,6 +1135,32 @@ def test_study_closes_the_run_failed_on_any_exception_scrubbed(
     assert message.startswith("RuntimeError: bars unreadable") and ALPACA_KEY not in message
 
 
+def test_study_closes_the_run_failed_on_ctrl_c_and_exits_130(
+    study_ready: int, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def interrupted(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "run_study", interrupted)
+    run = _first_int(_open_study(study_ready, config_file), "run")
+    out = _cli("experiment", "study", "--run", str(run))
+    assert out.exit_code == cli.INTERRUPTED_EXIT == 130
+    assert _rows("SELECT outcome, message FROM research_results WHERE run_id = ?", run) == [
+        ("failed", "KeyboardInterrupt: ")
+    ]
+
+
+def test_study_refuses_a_study_table_without_configurations(
+    study_ready: int, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = _first_int(_open_study(study_ready, config_file), "run")
+    monkeypatch.setattr(cli, "_study_table", lambda record: {"horizons": [5]})
+    out = _cli("experiment", "study", "--run", str(run))
+    assert out.exit_code == 2
+    assert "study.configurations is missing" in out.output
+    assert _count("research_results") == 0
+
+
 def test_study_of_a_synthetic_run_on_a_temp_store_copy_is_excluded_from_counts(
     study_ready: int, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

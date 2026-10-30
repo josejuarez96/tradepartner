@@ -1370,13 +1370,21 @@ def _study_table(record: research.RegistrationRecord) -> dict[str, Any] | None:
     return study if isinstance(study, dict) else None
 
 
+def _study_configurations(slug: str, study: Mapping[str, Any]) -> int:
+    """`study.configurations`, refused (ValueError) when absent or not a positive int."""
+    value = study.get("configurations")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{slug}: study.configurations is missing or not a positive integer")
+    return value
+
+
 def _declared_configurations(record: research.RegistrationRecord, given: int | None) -> int:
     """`experiment open`'s configurations: a `[study]` registration's
     `study.configurations`, refusing a different value (#2440); else `given` or 1."""
     study = _study_table(record)
     if study is None:
         return 1 if given is None else given
-    declared = int(study["configurations"])
+    declared = _study_configurations(record.slug, study)
     if given is not None and given != declared:
         raise ValueError(
             f"--configurations {given} differs from {record.slug}'s study.configurations "
@@ -1412,10 +1420,11 @@ def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None 
     """
     if (missing := _store_missing(settings)) is not None:
         raise missing
+    real_store = real if real is not None else settings
     try:
         with open_for_write(settings) as conn:
             schema.init_schema(conn)
-            handle = research.attach_run(conn, run_id, settings=real or settings)
+            handle = research.attach_run(conn, run_id, settings=real_store)
             record = research.get_registration(conn, handle.slug)
     except StoreLockedError as exc:
         raise _fail(f"store busy: {exc}", 1) from None
@@ -1434,6 +1443,10 @@ def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None 
     design = _study_table(record)
     if design is None:
         raise _refusal(ValueError(f"run {run_id}: {record.slug} has no [study] table"), settings)
+    try:
+        n_configurations = _study_configurations(record.slug, design)
+    except ValueError as exc:
+        raise _refusal(exc, settings) from None
     study = SimpleNamespace(
         slug=record.slug,
         study=design,
@@ -1452,7 +1465,7 @@ def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None 
                 primary_ci_high=float(primary["ci_high"]),
                 n_observations=int(primary["n"]),
                 n_clusters=int(primary["n_clusters"]),
-                n_configurations=int(design["configurations"]),
+                n_configurations=n_configurations,
                 artifact_sha256=result.artifact_sha256,
                 artifact_path=str(result.artifact_path),
                 secondary=result.secondary,
@@ -1470,8 +1483,7 @@ def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None 
     _echo_scrubbed(
         "\n".join(
             (
-                f"run {run_id}: {outcome} ({handle.slug}, {design['configurations']} "
-                "configurations)",
+                f"run {run_id}: {outcome} ({handle.slug}, {n_configurations} configurations)",
                 f"  primary {_fmt(primary['value'])} bp [{_fmt(primary['ci_low'])}, "
                 f"{_fmt(primary['ci_high'])}] over {primary['n']} events, "
                 f"{primary['n_clusters']} clusters",
