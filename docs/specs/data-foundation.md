@@ -17,7 +17,7 @@ Nothing in Phases 3–6 can be trusted unless the data underneath answers one qu
 
 - **T** is always a tz-aware UTC timestamp. A rebalance *date* maps to T = that session's close via the calendar. Never a bare date.
 - **`known_at`** is when a fact became knowable to a market participant. **`ingested_at`** is when we stored it. `known_at ≤ ingested_at` always.
-- **Revision**: a later value for the same key is a **new row** with its own `known_at`; rows are never updated in place. "Latest as of T" is the row with the greatest `known_at ≤ T`. One exception by design: `statement_facts` (amendment 2026-10-03, #660) holds the **first** vintage of each key only and never a later one, so it has no revisions to read; the amendment says why. `filing_events` (amendment 2026-10-09, #1358) is keyed by the filing's accession, which EDGAR never reuses, so it has no revisions either: an 8-K/A is another accession and another row. A **retraction** (amendment 2026-10-04, #859) is a revision of a `securities` or `listings` key with `retracted = TRUE`: from its `known_at` on, the key has no row; before it, the old row stands.
+- **Revision**: a later value for the same key is a **new row** with its own `known_at`; rows are never updated in place. "Latest as of T" is the row with the greatest `known_at ≤ T`. One exception by design: `statement_facts` (amendment 2026-10-03, #660) holds the **first** vintage of each key only and never a later one, so it has no revisions to read; the amendment says why. `filing_events` (amendment 2026-10-09, #1358) is keyed by the filing's accession, which EDGAR never reuses, so it has no revisions either: an 8-K/A is another accession and another row. `filing_index` (amendment 2026-10-30, #2629) has none by the same rule; its one in-place change is a stamps-repair release. A **retraction** (amendment 2026-10-04, #859) is a revision of a `securities` or `listings` key with `retracted = TRUE`: from its `known_at` on, the key has no row; before it, the old row stands.
 - **Provenance** on every row: `filing` (`known_at` = SEC acceptance timestamp), `filing_name` (amendment 2026-10-12, #1597: a `listings` ticker read from a filing's file names, its XBRL instance or a Form 25 exhibit, rather than a tagged fact; `known_at` = that filing's acceptance, as `filing`), `bar` (session close), `action` (rule below), `release` (amendment 2026-10-11, #1498: a published statistical release whose source gives a release date and no time; `known_at` = the close of the first XNYS session strictly after that date), `snapshot` (current-only endpoint; `known_at` = fetch time), or `snapshot_static` (a snapshot attribute the config explicitly allows to apply before its fetch time, e.g. a company name or a pre-2019 exchange; counted and shown on the health page). A `snapshot_static` value is stored only in a row whose `known_at` is that snapshot's fetch time; only the row's `valid_from` may predate it, and as-of reads still see the row only once `known_at <= T` (#35).
 - **Raw payload**: the bytes a source returns (JSON, SGML header text, or a downloaded filing file). Fetch functions return raw payloads; parsers turn raw payloads into records. Only parsers are unit-tested; fixtures are recorded raw payloads.
 
@@ -25,7 +25,7 @@ Nothing in Phases 3–6 can be trusted unless the data underneath answers one qu
 
 1. **Store.** A single DuckDB file, path from config. Every fact table has `known_at`, `ingested_at`, `source`, `provenance`. Prices raw OHLCV; corporate actions separate; adjusted series computed at read time as of T. Ingest holds the file read-write only while committing a chunk and releases it between chunks; every other process uses **short-lived `read_only=True`** connections and shows a "store busy" state when locked.
 2. **Calendar.** Wrapper over `exchange_calendars` XNYS: is-session, next/previous session, open and close timestamps, last session of month, last *completed* session as of a timestamp, sessions in a calendar-month window, half-day detection. No weekday logic. The calendar-month window is exact: for `end_session` and `months`, it is every session `s` with `end_session − relativedelta(months=months) < s ≤ end_session`.
-3. **Security master.** A `securities` row is created from the **earliest issuer filing per CIK** in EDGAR's filing index (`known_at` = that filing's acceptance; issuer form types from `master.issuer_forms`, so reporting owners filing Forms 3/4/5 and 13D/G never create rows). The index is scanned over **full history regardless of `--since`**, so `securities.known_at` is never too late. Companies therefore exist at historical T and delisted names exist at all. Ticker ranges, exchange, SIC, type and delisting come from filings where filings supply them and from `snapshot_static` attributes where they do not (pre-~2019 ticker and exchange); those count only from their fetch time, see open question 1. *Amended 2026-10-12 (#1597): a 10-K's XBRL instance file name and a Nasdaq Form 25's exhibit file name supply pre-2019 ticker and exchange rows known at those filings' acceptance (`provenance = filing_name`, behind `edgar.filename_listings`); the amendment under Data / interfaces has the rules.* Keyed by `security_id`; adapters never resolve by bare ticker. Benchmarks (SPY, MTUM) are **seeded from config**, not derived from EDGAR (MTUM shares its trust's CIK with other funds). A stored EDGAR master row that the current rules no longer derive is withdrawn by a retraction known at the correcting run, never deleted (amendment 2026-10-04, #859).
+3. **Security master.** A `securities` row is created from the **earliest issuer filing per CIK** in EDGAR's filing index (`known_at` = that filing's acceptance; issuer form types from `master.issuer_forms`, so reporting owners filing Forms 3/4/5 and 13D/G never create rows). The index is scanned over **full history regardless of `--since`**, so `securities.known_at` is never too late. *Amended 2026-10-30 (#2629): the full history is kept in the store's `filing_index` table, which a nightly run extends from unread SEC daily index files, a settled quarter's reconcile and a new issuer's walk of its earlier quarters, with a full walk only under `--rebuild-index` (rules under Data / interfaces).* Companies therefore exist at historical T and delisted names exist at all. Ticker ranges, exchange, SIC, type and delisting come from filings where filings supply them and from `snapshot_static` attributes where they do not (pre-~2019 ticker and exchange); those count only from their fetch time, see open question 1. *Amended 2026-10-12 (#1597): a 10-K's XBRL instance file name and a Nasdaq Form 25's exhibit file name supply pre-2019 ticker and exchange rows known at those filings' acceptance (`provenance = filing_name`, behind `edgar.filename_listings`); the amendment under Data / interfaces has the rules.* Keyed by `security_id`; adapters never resolve by bare ticker. Benchmarks (SPY, MTUM) are **seeded from config**, not derived from EDGAR (MTUM shares its trust's CIK with other funds). A stored EDGAR master row that the current rules no longer derive is withdrawn by a retraction known at the correcting run, never deleted (amendment 2026-10-04, #859).
 4. **Delistings.** Forms **25 and 25-NSE** are both ingested as filing rows (`known_at` = acceptance) that name a class title and exchange. **Transfer status and listing end are never stored; they are derived at read time** from rows with `known_at ≤ T`: a listing's end is its last bar session known at T after the filing; the filing is a **transfer** at T only if a new listing row for the same security exists with `known_at ≤ T` and `valid_from` within `master.transfer_window_sessions` of the filing date. Between the filing and the new listing becoming known, the security is treated as delisted at T (conservative), and becomes a transfer once the new listing is known. `effective_on` is stored for reference (filing date + 10 days per Rule 12d2-2 unless stated) and is the anchor of req 11's *no bars after a listing's end* rule (amendment #822); it never sets a listing's end.
 5. **Corporate actions.** `PriceSource.corporate_actions()` supplies splits and dividends. **First-seen** row: `known_at` = source announcement time if present, else the close of the session before ex-date. The announcement time is stored as `announced_at` (NULL when the source gives none), so the rule is checkable: `known_at == min(announced_at, proxy)` if set, else exactly the proxy; an earlier stamp without an announcement is look-ahead and refused (#83). A later announcement is capped at the proxy: raw bars from the ex-date on already reflect the action, and it is public before its ex-date. Revisions carry `announced_at` forward unchanged; it is never a filter for T. A source that gives only an announcement **date** is stamped at the close of the first session strictly after that date (the announcement may follow that day's close). **Any later row that differs** for the same action: `known_at = ingested_at`. Never back-dated on revision. An action's identity is (security, source action id) when the source gives a stable id, else (security, type, ex-date) (#108). So a **re-dated** action (same id, new ex-date) is a revision: the old ex-date applies until its `known_at`, the new one after, never both. A **cancelled** revision (`cancelled = TRUE`, stamped at `ingested_at`) withdraws the event from its `known_at` on. It also retires the old key of a re-date from a source with no id: ingest writes a cancel for the old key plus a **replacement** row for the new one, and the replacement is stamped `known_at = ingested_at` (it revises a known event, so it never takes a first-seen proxy stamp). The same applies when an event first stored without an id later arrives with one: cancel the id-less key, write the id row as a replacement. An id row may not share (security, type, ex-date) with a live id-less row. The store holds one row per identity per `known_at`. As-of reads take the latest revision per identity first, then apply the ex-date and cancel filters.
 6. **`PriceSource`** (`bars`, `corporate_actions`) with **fixture** and **Alpaca** adapters. **`FilingSource`** (filing index, company facts, filing headers, cover pages, Form 25/25-NSE, companies snapshot) with **fixture** and **EDGAR** adapters. Real adapters = thin raw-fetch client (`httpx` for EDGAR JSON/SGML/files, `alpaca-py` for Alpaca) + pure parsers; `edgartools` (pinned, cache dir from config) is used only to parse downloaded cover-page iXBRL.
@@ -865,6 +865,143 @@ Older pages are known only as they are fetched. The run prints this plan in its 
 *Open questions.* (1) **A blocked quarter.** *Answered 2026-10-28 (owner, "merge 2499 rec ok", on PR #2499), as recommended: a quarter failing the order check stops for the owner (not sent wholesale to XML).* When a quarter's order sample mismatches, what should that quarter do? Recommendation: stop it for the owner, with no automatic switch to XML for the whole quarter, which would cost about one request per accession. The owner then chooses XML for that quarter under a raised budget, or leaves it out. (2) **Rounded shares.** *Answered 2026-10-28 (owner, "merge 2499 rec ok", on PR #2499), as recommended: share counts rounded to 2 decimals are accepted.* The bulk set rounds shares to 2 decimals as well, so a fractional count (dividend reinvestment, a split remainder) can differ from the XML by under 0.005 shares. The #2498 sample found no share mismatch. Recommendation: accept this, and say it in the read's docstring. The alternative routes every accession with a fractional bulk share count to XML. (3) **An accession missing from the issuer's payload.** *Answered 2026-10-28 (owner, "merge 2499 rec ok", on PR #2499), as recommended: no fallback to the reporting owner's payload when an accession is missing from the issuer's submissions JSON (excluded and counted).* What if the issuer's submissions payload, with its older pages, does not list a bulk accession? Recommendation: no fallback to the reporting owner's payload in v1. The row stays under rule (a), and the owner revisits if `sec_forms_unstampable` for bulk rows is material after T308. (4) **Defaults.** *Answered 2026-10-28 (owner, "merge 2499 rec ok", on PR #2499), as recommended: defaults: `events.sec_forms_max_requests` = 40000, order sample = 20.* `events.sec_forms_max_requests` 40,000 and `events.form4_bulk_order_sample` 20 are recommendations. Both stand as answered; the owner can still change them in config at T308. (5) **Zero prices and rounding.** *Answered 2026-10-28 (owner, "merge 2499 rec ok", on PR #2499), as recommended: 0.00 prices go to XML only for transaction codes P and S; a true 0.995-0.999 reading 1.00 in bulk is accepted.* Accept the 0.995-0.999 rounding above? Does "under $1" include a 0.00 bulk price? Taken literally, it would send every award and gift accession to XML. That is likely a large share of all Form 4s, enough to blow the 30,000 to 35,000 estimate, which #2498 does not break down by price. Recommendation: the code-scoped rule above, so 0.00 goes to XML only for P and S. The literal alternative sets `events.form4_zero_price_xml_codes` to every code and raises the budget. (6) **An older quarter's 404.** When a quarter older than the run date's quarter and the one before it returns 404, the run writes nothing from bulk for it, counts `sec_forms_bulk_quarter_missing` and the quarter waits for the owner. Recommendation: that, rather than sending the whole quarter to XML at about one request per accession; the owner then chooses XML for it under a raised budget, or leaves it out, as in question 1. Unanswered.
 
 **Amendment 2026-10-29 (#2572, T307d): where a bulk row's zip is recorded.** The #2498 amendment put "the quarter and zip SHA-256 in `provenance`". Across the store, `provenance` is a closed vocabulary (`schema.PROVENANCE_VALUES`, `TABLE_PROVENANCE_VALUES`), never free text, and T306's version 40 tables allow only `'filing'` in `sec_filing_events` and `sec_form4_transactions`. The data comes from filings on both routes, so both write `provenance = 'filing'`, and the route stays in `source` (`sec_insider_bulk` or `sec_form4_xml`). The zip is recorded on the run: the backfill writes each quarter in its own `ingestion_runs` row with `source = 'sec_insider_bulk'`, whose `chunk_cursor` names the quarter (`<yyyy>q<n>`) and whose `message` carries the zip's SHA-256 and the row counts. A stored row reaches its zip through its accession's quarter and that run. No schema change. The order-check memory beside the cached zip, keyed by the zip SHA-256 and the parser versions, is unchanged. Owner decision 2026-10-29: option 1 of two; the other was a version 41 column, declined to avoid a second migration before the 2026-10-31 backfill.
+
+**Amendment 2026-10-30 (#2629): the nightly EDGAR ingest is incremental.** Owner decision 2026-10-30 on #2629. Under req 3, every run walks EDGAR's quarterly `form.idx` files from 1993: 135 files, about 16.9M stamped issuer rows. It loads every issuer's stamps and builds the master and everything derived from it out of that whole list before it looks at what is new. The nightly EDGAR source took 97, 103 and 115 min on 2026-10-26, 10-27 and 10-28 (#2593). Its peak memory was about 16 GB before #2622 and is about 4.1 GB after, and it still grows with history (#2616, #2623).
+
+This amendment keeps the full history and every `known_at` rule, but stores the parsed, stamped index. A nightly run then reads only the SEC daily index files it has not read before, stamps only new accessions, and rebuilds only the CIKs those filings touch. A full walk runs only behind a flag. Four behaviours are new:
+- a stamp that differs from the stored one is refused;
+- a closed quarter's file is checked against the table (the *reconcile*);
+- a row that only the quarterly file carries arrives when its quarter settles;
+- a rule-fingerprint gate.
+
+Everything else is unchanged.
+
+*Terms.* A quarter is **settled** `edgar.index_settle_days` after its Eastern-time end (today's cache rule, `_settled`). A **touched** CIK is one the nightly rebuilds (the list is below). The **reconcile** compares a quarterly `form.idx` with the stored rows of its quarter.
+
+*Where the index lives: a store table.* `filing_index(cik, accession, form, company_name, filed_on, accepted_at)` is a fact table in the main store, with the four common columns:
+- UNIQUE `(cik, accession)`;
+- `known_at = accepted_at`, the stamp today's `_stamp` path gives (stamps cache, #1494 SGML check, #1382), never `filed_on`;
+- `provenance = filing`, `source = edgar`.
+
+The table holds every row the three walks keep today:
+- every row of an issuer CIK;
+- the Form 25 and 25-NSE rows of every CIK, so the exchange's own 25-NSE copy that `delistings()` reads stays;
+- the `events.sec_forms` rows of every CIK, with the row `_sec_forms_13d_impl` stamps through.
+
+Each consumer filters these as it does today. The other option, a stamped extension of #2595's index cache files, was rejected for two reasons. A file has no `known_at`, `ingested_at` or provenance for `--check` (req 1). And its cursor can get ahead of a store commit that fails, which silently loses a day. A table row and its cursor commit in the EDGAR source's one atomic chunk (req 9), or neither does, and DuckDB reads one CIK's or one form's rows by query. That is #2623's columnar index, and it is store first.
+
+Definitions gains an exception: `filing_index` has no revisions (an accession is permanent, as in `filing_events`). Its one in-place change is a stamps-repair release: `RESTAMP_TABLES` gains it, matched on `(cik, accession)`.
+
+The state lives in three non-fact tables, each like `master_underived` and never read by a trial:
+- `filing_index_pending(cik, accession, form, company_name, filed_on)`: rows whose stamp is not yet known. They are retried each run as today and leave the table once stamped or settled unstampable (still reported on `.unstamped_filings`).
+- `edgar_filers(cik, first_quarter, last_quarter)`: every CIK any index file names.
+- `edgar_index_files(path, sha256, run_id)`: **the cursor**. It holds every daily file read, by name and hash, not a date high-water mark.
+
+Each run's counts, files read, rule fingerprint and peak RSS (`getrusage`) go on an `ingestion_runs` row with `source = 'edgar_index'`, as #2572 records a bulk quarter. `registry.data_vintage` leaves all four tables out; its explicit list is unchanged. This needs a schema bump: the next free version when the build merges.
+
+*The nightly read.* An EDGAR `session` run, with `edgar.incremental_index = true`, does these steps. The key defaults to `false`, which gives today's full walk and is the rollback.
+1. **Snapshot.** The fetch pass (req 1, before the lock) reads the four tables on one read-only connection and notes the last `edgar_index` run id. Under the lock, a different run id fails the source with nothing written. A `--rebuild-index` or another run committed in between.
+2. **Fingerprint gate.** The fingerprint is a hash of:
+   - the settings keys the builders read: the plan lists them, and they include the top-level `benchmarks`, `master.issuer_forms` and `events.sec_forms`;
+   - the cache version constants (`PARSER_VERSION`, `COVER_VERSION`, `HEADER_VERSION`, `DELISTING_VERSION`, `FSN_VERSION`, `STAMPS_LAYOUT`);
+   - the schema version;
+   - a new `BUILD_RULES_VERSION`. Any PR that changes what `build_master`, `build_chains`, `build_classifications`, `build_delistings` or `fact_rows` derive from the same inputs bumps it, and quant-auditor checks.
+
+   Some keys are left out:
+   - the limiter, timeouts and paths, and the new keys;
+   - the per-name lists (`master.chains`, `chains_dismissed`, `keep_successors`, `edgar.class_member_overrides`, `edgar.filename_listings_refused`). An edit to one touches the CIKs it adds or removes, diffed against the value stored on the last run row.
+
+   If the fingerprint differs from the last `ok` run's, the source fails before any fetch and names `--rebuild-index`. Prices still run (#2180).
+3. **New daily files.** The run lists each quarter directory (`https://www.sec.gov/Archives/edgar/daily-index/<yyyy>/QTR<n>/`, its JSON index) whose quarter is not settled. It reads every listed `form.<yyyymmdd>.idx` whose name and hash are not in `edgar_index_files`, through the edgar_raw limiter and with the existing parser. The listing decides which files exist, so no date is ever guessed: EDGAR's holidays are not XNYS's. A re-posted file has a new hash and is read again. The row key makes that idempotent.
+4. **Issuers, as today.** A CIK is an issuer when it has an issuer-form row, or is the subject of a 25 or 25-NSE. The 25-NSE pairing (the exchange copy dropped from the issuer rows) uses the accession's rows across the table and the new rows, not one file. `edgar_filers` is updated. A CIK that becomes an issuer tonight with earlier quarters in `edgar_filers` gets those rows from its span, one quarter at a time. They come from the cached settled files, plus each closed but unsettled quarter and the open quarter, which are fetched as `_index_text` fetches them today. One walk serves every such CIK of the night.
+5. **Stamps.** New and pending rows are stamped by today's `_stamp` path. The **table is the one stamp source** for every build, including `cover_pages`, `facts` and statement facts. If a stamps-cache record differs from a stored row, that CIK is not rebuilt and nothing is written for the accession. It is counted `index_stamp_changed`, and `health` warns. A changed stamp is an owner repair release (#2435's rule).
+6. **Touched CIKs.** These CIKs are touched. Only they are rebuilt, and the writers diff against the store as today.
+   - a CIK with a row inserted tonight (a daily file, the reconcile or a new-issuer walk);
+   - a CIK whose companyfacts or statement cache is incomplete (`complete = False`, #275). It stays touched every night until the cache is complete, as today.
+   - a CIK with a non-quarantined `failed_filings` entry (T11h retries);
+   - a CIK whose failure-store state changed: the owner cleared a quarantine or accepted a filing;
+   - a CIK in `filename_incomplete_ciks`;
+   - every CIK that lists an accession of an FSN period first published since the last run (co-registrants included);
+   - a CIK whose companies-snapshot entry appeared, changed or disappeared against its stored fetches (#2291);
+   - a CIK named by a per-name list edit (step 2);
+   - a CIK on a `master.chains` entry;
+   - a CIK whose result can move with the run clock alone. The known cases are a quarter settling tonight (`_settled`), the FSN lag window (`_lag_window_start`) and an SGML unread-run count reaching its limit (`_unread_run_reached`). Plan task (d1) lists any other case and adds it.
+
+   `_stale_fact_caches` and the bulk-zip decision count touched CIKs only, so no step loads every stamps file.
+
+*What is incremental and what still needs the full list.*
+
+| Product | Nightly |
+|---|---|
+| `securities`, `listings` (cover pages, snapshot, file names), `classifications`, `delistings`, `facts`, `statement_facts`, `filing_events` | **Per touched CIK**, from that CIK's full stored history by query (ordered by `accepted_at, accession, cik`, as `filing_index()` sorts today), its caches and config. |
+| `master_underived` (#859) | Recomputed for touched CIKs. Each untouched CIK's earlier rows are carried forward, so the run's set stays complete and health's `underived_master_rows` reads it as today. |
+| `successor_chains`, chain candidates, unmatched snapshot names, missing benchmarks, benchmark rows | **Every run, cross-CIK, by query** on the table and the store; never an in-memory full list. |
+| FSN data sets | Already per period. A new period is fetched once and touches its CIKs. |
+| `delistings()`, `sec_forms_13d` discovery | Read the table and the new rows instead of walking the quarterly files. |
+| `master-retract`, the restamp, `--rebuild-classifications`, `--rebuild-index` | **Always a full build**, read from the table, never a touched-only build. |
+
+*Late corrections.*
+- **A row SEC adds to a closed quarter.** At settle, the quarter's `form.idx` is fetched and cached as today and reconciled. Only the rows the table keeps are compared: issuer CIKs, CIKs that an issuer-form row in the file makes issuers (which then take the new-issuer walk), and the 25 and `events.sec_forms` rows. A missing row is inserted with its own acceptance as `known_at`, ingested by this run, and counted `index_reconcile_added`. A stored row absent from the file is counted `index_reconcile_absent` and kept. A differing form or name is refused and counted.
+- **A settled quarter that changes again.** Each run sends a conditional GET (#2607's validators) for every cached settled quarter. A changed file is reconciled the same way and replaces the cache atomically. If SEC sends no validator, open question 3 applies.
+- **Amended filings** (10-K/A, 8-K/A, 25/A) are new accessions, so they arrive as new daily rows.
+- **Re-stamped acceptance times:** step 5.
+- **A rule changed in code without a bump.** Two checks catch this. Each run rebuilds a rotating share of the untouched issuer CIKs read-only, so every CIK is checked within `edgar.verify_rotation_days` (default 28), and compares the result with the store. A difference is counted `incremental_drift` with up to 10 CIKs named, and `health` warns. Once a month the owner also runs `--rebuild-index --dry-run` on a store copy, outside the jobs, which reports every row it would write.
+
+*Full rebuild and seed.* `tradepartner ingest --source edgar --rebuild-index` is today's full-history path:
+- It walks every quarter, stamps, inserts missing `filing_index` rows (never deleting one), rebuilds every CIK and records the fingerprint.
+- It commits one quarter per chunk and resumes from the last committed quarter (req 9).
+- After it, the next nightly reads every listed daily file of the unsettled quarters once, which is idempotent.
+
+It seeds the table once (an owner step with a backup, outside the 08:05 and 18:30 jobs, runbook rule 5) and otherwise runs only after a fingerprint change or a repair. `--backfill` and `--dry-run` read the table as a session run does. A dry run writes nothing, `edgar_index_files` included. Req 3's guarantee holds: the master reads the full history whatever `--since` says, now from the table.
+
+*Point in time.* `known_at` is still the SEC acceptance, never `filed_on`, a file date or a run time. No as-of read, backtest, universe or signal reads the new tables, and a boundary test pins that. Every stored row keeps its source and provenance, and its run row names the files it came from by hash.
+
+*Targets.* Measured after the seed, on 5 consecutive scheduled runs, from the `edgar_index` run row:
+- The EDGAR source takes at most 20 min on a weekday (it took 97 to 115 min).
+- Peak RSS is at most 1.5 GB (about 4.1 GB after #2622) and does not grow with history.
+- No request goes to a settled quarter's `form.idx` other than the conditional GETs.
+
+*Plan tasks (total L, each task at most M).*
+- **(a) probe, S, read-only, before (b).** Record a quarter directory listing and two daily files as fixtures. On two settled quarters, check that the daily files together equal `form.idx` on `(cik, accession, form, company_name, filed_on)` and in each accession's row order (the 13D and 25 de-duplication take the first row, open question 4). Check whether every CIK of a 25-NSE is in one daily file and whether SEC sends ETag or Last-Modified. Log when each day's file is listed against the 18:30 ET run. Seed a temp store copy from `data/edgar_cache` to measure the table's size and the seed's time.
+- **(b) schema, M.** The tables, the migration, the `--check` rules (`known_at = accepted_at`, no duplicate `(cik, accession)`, tz-aware stamps), `RESTAMP_TABLES` on `(cik, accession)`, and the vintage exclusion.
+- **(c) adapter, M.** The daily read, the file cursor, issuers and the new-issuer walk, pending rows, the reconcile and the conditional recheck.
+- **(d1) touched set, M, pure.**
+- **(d2) underived carry-forward and the rotation check, M, pure.**
+- **(d3) fingerprint and gate, S, pure.**
+- **(d4) the ingest driver, M.** It adds `edgar.incremental_index` and `--rebuild-index`.
+- **(e) owner steps.** The seed on the real store. One comparison on a copy of incremental against `--rebuild-index`, which must show no difference before the key is turned on. Then the 5-run evidence for the targets.
+
+*Tests.*
+- **Equality, the main test.** On the fixture, simulate 100 days that cross a quarter end, an unsettled quarter and its settle. The run includes:
+  - new issuers, one with earlier rows;
+  - an exchange-only 25-NSE and a 13D whose first row is the filer's;
+  - a pending row stamped later;
+  - a reconcile insert;
+  - a companyfacts payload lagging longer than a week;
+  - a failure that passes on retry;
+  - an FSN period with a co-registrant;
+  - a snapshot entry that disappears;
+  - a `master.chains` edit.
+
+  One store runs incrementally each night and a second runs `--rebuild-index` each night under the same clocks. They must be equal table by table and row for row. Their run-row messages (chain candidates, unmatched names, missing benchmarks, unstamped counts) and their `health` output must be equal too.
+- **Cursor.** A failed EDGAR chunk leaves the tables as they were, and a re-run adds zero rows. A file whose hash changed is read again with no duplicate row. A file the listing does not name is never requested. Another writer between the snapshot and the lock fails the run with nothing written.
+- **Corrections.** A row only in the quarterly file arrives at settle with `known_at` = its acceptance. A stored row absent from the quarterly file is counted and kept. A changed stamp, form or name is refused and counted, and the CIK is not rebuilt.
+- **Gate.** A fingerprint change fails EDGAR while Alpaca runs, and `--rebuild-index` clears it. A per-name list edit touches its CIKs and does not trip the gate.
+- **Drift.** A seeded rule change without a bump is reported within the rotation.
+- **Full builds.** `master-retract` on an incremental store proposes the same rows as on a full-built store.
+- **No look-ahead.** Truncation invariance holds with `filing_index` in the truncated store. An after-close acceptance is invisible at the preceding close although its `filed_on` is that day.
+- **Memory.** The recorded max RSS of a synthetic 2-year and a 20-year history differ by at most 10%.
+- **Boundary.** `backtest/`, `universe.py` and signals do not read the new tables.
+
+*Open questions (owner).*
+1. **Table or files.** Recommended: the store table, for the reasons above. The cost is a schema bump and an estimated 0.5 to 1 GB of store (task (a) measures it).
+2. **ADR 0023 schema freeze and timing.** Recommended: allow it, since it is ingest-internal and additive and no trial reads it (like #2535). Migrate in its own owner step after the 2026-10-31 T306 sitting, never together with it.
+3. **No validator on the quarterly files.** Recommended: re-fetch and reconcile the last 8 settled quarters each Saturday. Older quarters wait for `--rebuild-index`.
+4. **If daily and quarterly files order an accession's rows differently** (probe (a)). Recommended: replace "first row" with an order-free rule (the filer's row, from the accession prefix, else the lowest CIK). Apply it by a `BUILD_RULES_VERSION` bump and one rebuild, and do it before the 13D backfill so no stored 13D row moves.
+5. **Fingerprint mismatch: fail or rebuild unasked.** Recommended: fail and name the flag. A rule change is a release with a backup, and an unplanned 2-hour rebuild in the 18:30 job could reach the 08:05 paper run.
+6. **The checks against drift: a 28-day rotation and a monthly full dry run on a copy.** Recommended: yes. Shorten the rotation if a night's share runs over 2 min.
+7. **The targets, 20 min and 1.5 GB.** Recommended: yes, as the pass mark for the 5-run evidence.
+8. **#2623 (columnar index).** Recommended: close it as superseded once (d4) merges.
 
 ## Risks & domain checks
 
