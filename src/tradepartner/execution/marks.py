@@ -113,10 +113,10 @@ class UnreadableMarkError(ValueError):
 def signed_value(row: PositionDailyRow) -> float | None:
     """A mark row's value with the equity sign rule (paper spec #1872 item 10:
     equity = cash + long value - short value): a short's unsigned value counts
-    negative. None when the row has no value."""
+    negative whichever sign the writer stored. None when the row has no value."""
     if row.value is None:
         return None
-    return -row.value if row.position_side == SHORT else row.value
+    return -abs(row.value) if row.position_side == SHORT else row.value
 
 
 def equity_at(rows: Sequence[PositionDailyRow], session: date) -> float:

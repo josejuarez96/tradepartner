@@ -23,7 +23,7 @@ from conftest import version_4_store
 from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.calendar import next_session, previous_session
 from tradepartner.config import RiskConfig, Settings
-from tradepartner.execution import ops
+from tradepartner.execution import headroom, ops
 from tradepartner.execution.marks import UnreadableMarkError
 from tradepartner.execution.plan import stop_session
 from tradepartner.execution.waiting import WaitingItem
@@ -1142,12 +1142,33 @@ def test_positions_value_is_long_minus_short(
     journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
 ) -> None:
     """A short's mark is unsigned (paper spec #1872 item 10), so the status
-    value is long minus short, as `equity_at` counts it (#2561, #2547)."""
+    value is long minus short, as `Ledger.equity` counts it (#2561, #2547)."""
     _mark_session_rows(journal_settings, seeded, [("LLL", 100.0, "long"), ("SSS", 40.0, "short")])
     with open_read_only(journal_settings) as conn:
         data = ops.page_data(conn, journal_settings)
     assert data.positions_count == 2
     assert data.positions_value == 60.0
+
+
+def test_net_positions_value_and_gross_exposure_stay_apart(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """One long (100) and one short (40): the positions value is net (60) and
+    the risk card's gross exposure is gross (140), each from its own reader."""
+    _mark_session_rows(journal_settings, seeded, [("LLL", 100.0, "long"), ("SSS", 40.0, "short")])
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings)
+        marks = [
+            m
+            for m in ops.journal.positions_daily_for(conn, open_window.window_id or 0)
+            if m.security_id in ("LLL", "SSS")
+        ]
+    for i, m in enumerate(marks):
+        marks[i] = replace(m, cash=1_000.0)
+    card = headroom.compute(open_window, marks, (), journal_settings.risk)
+    gross = next(r for r in card.rows if r.key == "gross")
+    assert data.positions_value == 60.0
+    assert gross.value * card.equity == pytest.approx(140.0)
 
 
 def test_long_only_positions_value_is_unchanged(
