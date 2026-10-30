@@ -102,17 +102,23 @@ def resolve_book(settings: Settings, book_id: str | None) -> str:
     return book
 
 
+def _resolved_store(settings: Settings) -> Path:
+    """The fully resolved store path (symlinks followed), so a symlink and its target
+    take the same lock (#2557). A path with no symlink in it keeps its lock names."""
+    return Path(settings.store.path).resolve()
+
+
 def lock_path(settings: Settings, book_id: str | None = None) -> Path:
     """`<store.path>.paper.<book>.lock`, beside the store it guards; `book_id`
     defaults to `paper.book_id`. `ValueError` outside the book token grammar."""
-    return Path(f"{settings.store.path}.paper.{resolve_book(settings, book_id)}.lock")
+    return Path(f"{_resolved_store(settings)}.paper.{resolve_book(settings, book_id)}.lock")
 
 
 def legacy_lock_path(settings: Settings) -> Path:
     """`<store.path>.paper.lock`, the one lock before books (T59). Book `main`
     takes it too (after its own), so a process still on the old code and one on
     the new exclude each other across the upgrade while H1's window is open."""
-    return Path(f"{settings.store.path}.paper.lock")
+    return Path(f"{_resolved_store(settings)}.paper.lock")
 
 
 def _holder(path: Path) -> str:

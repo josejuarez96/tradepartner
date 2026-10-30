@@ -140,7 +140,7 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Cadence, Settings
 from tradepartner.execution import lock, performance, shakedown, waiting
-from tradepartner.execution.marks import equity_at
+from tradepartner.execution.marks import equity_at, signed_value
 from tradepartner.execution.plan import stop_session as stop_session_of_request
 from tradepartner.execution.reconcile import OVERDUE_DELISTING_CASH
 from tradepartner.execution.reconcile_run import allowed_of, frozen_risk, is_delisting_cash
@@ -868,8 +868,10 @@ def _lock_free(settings: Settings, book: str) -> bool:
 
 
 def _positions(conn: duckdb.DuckDBPyConnection, window_id: int) -> tuple[int, float]:
-    """(count, value) of the non-zero marks at the window's latest marked
-    session (module docstring, item 1)."""
+    """(count, net value) of the non-zero marks at the window's latest marked
+    session (module docstring, item 1). A short's unsigned mark counts negative
+    (`marks.signed_value`, paper spec #1872 item 10), so the value is long
+    minus short (#2561, #2547)."""
     last_session = _last_marked_session(conn, window_id)
     if last_session is None:
         return 0, 0.0
@@ -884,7 +886,7 @@ def _positions(conn: duckdb.DuckDBPyConnection, window_id: int) -> tuple[int, fl
         )
         if m.security_id is not None and m.quantity != 0
     ]
-    return len(marks), sum(m.value or 0.0 for m in marks)
+    return len(marks), sum(signed_value(m) or 0.0 for m in marks)
 
 
 def page_data(
