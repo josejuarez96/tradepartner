@@ -576,6 +576,7 @@ class EdgarFilingSource(FilingSource):
         self._client = client or httpx.Client(timeout=settings.edgar.request_timeout_seconds)
         hooks = self._client.event_hooks
         hooks["request"] = [*hooks.get("request", []), self._count]
+        hooks["response"] = [*hooks.get("response", []), self._count_not_modified]
         self._client.event_hooks = hooks
         self._clock = clock or (lambda: datetime.now(UTC))
         self._cache = Path(settings.edgar.cache_dir)
@@ -703,6 +704,9 @@ class EdgarFilingSource(FilingSource):
         # of the per-CIK API instead; counted for the run's summary.
         self.facts_bulk_empty = 0
         self.submissions_bulk_empty = 0
+        # #2594: nightly bulk zips SEC answered `304 Not Modified`, so the
+        # cached copy was kept; a count that never drops to 0 is a frozen zip.
+        self.bulk_not_modified = 0
         # #576: per-CIK API answers of 200 `{}` (SEC's "nothing here").
         self.facts_api_empty = 0
         self.submissions_api_empty = 0
@@ -768,6 +772,14 @@ class EdgarFilingSource(FilingSource):
             self.sec_forms_requests["submissions_pages"] += 1
         else:
             self.sec_forms_requests["other"] += 1
+
+    def _count_not_modified(self, response: httpx.Response) -> None:
+        """Count a `304` to a conditional bulk-zip `GET` (#2594): the run kept
+        its cached `submissions.zip` / `companyfacts.zip`."""
+        if response.status_code == httpx.codes.NOT_MODIFIED and response.request.url.path.endswith(
+            ".zip"
+        ):
+            self.bulk_not_modified += 1
 
     def _sec_header(self, cik: str, accession: str, size: int) -> str:
         key = (cik, accession, size)

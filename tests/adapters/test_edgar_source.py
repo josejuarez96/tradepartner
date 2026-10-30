@@ -14,6 +14,7 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import shutil
 import zipfile
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -811,6 +812,40 @@ def test_an_empty_bulk_submissions_member_falls_back_to_the_api(tmp_path: Path) 
         _submission_urls(router)
     )
     assert [u.accession for u in source.unstamped_filings] == [MISSING]
+
+
+def test_a_kept_bulk_submissions_zip_is_counted(tmp_path: Path) -> None:
+    """#2594: a second run whose conditional `GET` of `submissions.zip` gets a
+    `304` keeps the cached zip, stamps the same, and counts the kept zip on
+    `.bulk_not_modified` (in the run message), so a zip that never changes shows."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as bulk:
+        bulk.write(FIXTURES / SUBMISSIONS[APPLE][0], f"CIK{APPLE}.json")
+    body = buffer.getvalue()
+    settings = edgar_settings(
+        tmp_path / "cache", bulk_stamp_threshold_ciks=1, bulk_stamps_enabled=True
+    )
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("If-None-Match") == '"v1"':
+            return httpx.Response(304)
+        return httpx.Response(200, content=body, headers={"ETag": '"v1"'})
+
+    first_router = _router()
+    first_router.add(BULK_URL, serve)
+    first = _source(settings, first_router)
+    entries = first.filing_index()
+    assert first.bulk_not_modified == 0
+    # Every per-CIK cache gone, the bulk zip and its sidecar kept: the next run
+    # asks for `submissions.zip` again, conditionally.
+    for path in (tmp_path / "cache").iterdir():
+        if path.name != "bulk":
+            shutil.rmtree(path) if path.is_dir() else path.unlink()
+    second_router = _router()
+    second_router.add(BULK_URL, serve)
+    second = _source(settings, second_router)
+    assert second.filing_index() == entries
+    assert second_router.urls.count(BULK_URL) == 1 and second.bulk_not_modified == 1
 
 
 # --- the companies snapshot and provenance ---------------------------------------
