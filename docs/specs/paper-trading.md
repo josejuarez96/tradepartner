@@ -325,6 +325,7 @@ The paper vehicle is the registered H1 (long-only 12-1 momentum, top decile equa
      - The note is text in the run's notes, not an alert.
      - This is an accepted weakening. On the ex-date, a fill of the parent far below its true price (a bad sell) is caught only by that floor and by reconciliation's cash, never by the band.
    - *Why no child price.* None is known at close(S−1) for a new child, whose first bar is the ex-date's own close, so any adjustment would be a guess (question 53).
+
    - *What is not fixed.* A row stamped after close(S−1), because its `process_date` came after the ex-date (data-foundation open question 18), leaves the band two-sided. The ex-date fill can then still halt, and the owner's `exclude_name` override on the parent stays the way to avoid it. That is the stamp at work, not a rule here.
 
 5. **Acceptance (testable).**
@@ -352,6 +353,8 @@ The paper vehicle is the registered H1 (long-only 12-1 momentum, top decile equa
    - the order path's sizing of the parent on its ex-date.
 
    The change is on the order path. It lands after the T162 shakedown span (2026-10-22 to 11-04) unless the owner says otherwise; the PR carries `hold`.
+
+*Amendment 2026-10-21 (#2007; owner decision).* A `paper resume` collection and a halt-path read pass the same configured fill-price band as a tracking run, using the command or run session S and only bars and actions known at close(S−1). A broker-feed fill first journaled by resume outside the band refuses release and records a fault engagement, even when the switch was already engaged; later resumes of that window refuse until the owner abandons it. The refusal and newly collected fill prices appear in resume's output. A bad fill first journaled by the halt read is named in the existing halt alert. Fills with no reference price are reported as unjudged. The synthetic residual of req 8 remains on its explicit `--accept-broker-fills` path, including its rule to store a negative implied price; resume shows its computed price.
 
 *Amendment 2026-10-26 (#2183, #2184, #2185; the owner's decisions of 2026-10-26 on each issue; built by the plan's T267, T268 and T269, T267 fast-tracked before the November pay dates and the others after the shakedown span, 2026-11-06).* Three rules extend req 6; until a task merges, the text it supersedes below still holds and the matching halt stays a halt.
 

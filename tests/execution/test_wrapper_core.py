@@ -547,6 +547,30 @@ def test_each_fault_halts_in_the_req_4_order(
     ]
 
 
+def test_halt_read_judges_the_fill_it_journals(
+    journal_settings: Settings,
+    ticking_fake: FakeBroker,
+    ticking: TickingClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _run(journal_settings, open_window, ticking())
+    _order(journal_settings, ticking_fake, ticking, run, "tp-bad")
+    ticking_fake.apply("tp-bad", FillAt(price=200.0))
+    monkeypatch.setattr(wrapper_module, "reference_prices", lambda *_: {"SEC-AAA": 100.0})
+    gate = _wrapper(journal_settings, ticking_fake, ticking, alerter_conn)
+
+    with pytest.raises(ValueError, match="original fault"):
+        _halt(gate, ValueError("original fault"), run)
+
+    [(message,)] = _query(
+        journal_settings, "SELECT message FROM paper_run_results WHERE run_id = ?", [run.run_id]
+    )
+    assert "fill_price_outside_band" in message
+    assert "tp-bad" in message
+
+
 def test_the_alert_row_exists_before_the_fault_propagates(
     journal_settings: Settings,
     scripted_fake: FakeBroker,

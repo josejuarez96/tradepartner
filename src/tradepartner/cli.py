@@ -4652,6 +4652,8 @@ def make_app(
             *(f"  crashed run {r}" for r in outcome.crashed_runs),
             *(f"  settled {o}: {how}" for o, how in outcome.settled),
             *(f"  synthetic fill for {o}" for o in outcome.synthetic_fills),
+            *(f"  fill {o}: {price}" for o, price in outcome.fill_prices),
+            *(f"  warning: {warning}" for warning in outcome.fill_warnings),
             *(f"  accepted {a}" for a in outcome.accepted_rejections),
         ]
         for line in lines:

@@ -13,7 +13,7 @@ from typing import Any, Protocol
 import pytest
 
 from tradepartner.adapters.broker import Order, OrderRequest, Side
-from tradepartner.adapters.fake_broker import Expire, FakeBroker, PartialFill, Reject
+from tradepartner.adapters.fake_broker import Expire, FakeBroker, FillAt, PartialFill, Reject
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, LimitBreachError
@@ -345,7 +345,9 @@ def test_a_pending_order_the_fake_filled_is_settled_with_its_fills_before_its_fi
     fake: SkewedFake,
     window: PaperWindowRow,
     fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
     crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
     _order(
         journal_settings,
@@ -369,6 +371,80 @@ def test_a_pending_order_the_fake_filled_is_settled_with_its_fills_before_its_fi
         assert fill.fill.known_at <= filled_event[0].known_at
     assert fill.fill.quantity == 2.0
     assert not _engaged(journal_settings, window)
+
+
+@pytest.mark.parametrize("price, expected", [(200.0, REFUSED), (100.0, RELEASED)])
+def test_resume_judges_a_new_fill_and_reports_its_price(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+    price: float,
+    expected: str,
+) -> None:
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _order(journal_settings, fake, crashed, "tp-bad", 2.0, DAY1 - timedelta(hours=1))
+    fake.apply("tp-bad", FillAt(price))
+    _engage(journal_settings, window, fixed_clock)
+    seen: list[date] = []
+    cuts: list[datetime] = []
+    real_actions = resume_module.live_actions_as_of
+
+    def actions(conn: object, cut: datetime) -> object:
+        cuts.append(cut)
+        return real_actions(conn, cut)
+
+    def prices(_conn: object, session: date, names: object, _actions: object) -> dict[str, float]:
+        seen.append(session)
+        assert names == [SPY]
+        return {SPY: PRICE}
+
+    monkeypatch.setattr(resume_module, "reference_prices", prices)
+    monkeypatch.setattr(resume_module, "live_actions_as_of", actions)
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert seen == [DAY1.date()]
+    assert cuts == [session_close(date(2026, 9, 30))]
+    assert outcome.status == expected, outcome.reasons
+    if expected == REFUSED:
+        assert any("fill_price_outside_band" in reason for reason in outcome.reasons)
+        assert _engaged(journal_settings, window)
+    assert _all_fills(journal_settings, "tp-bad")
+    assert outcome.fill_prices == (("tp-bad", price),)
+    if expected == REFUSED:
+        with open_read_only(journal_settings) as conn:
+            assert any(
+                event.reason and event.reason.startswith("fill_price_outside_band:")
+                for event in kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+            )
+        again = _resume(journal_settings, fake, fixed_clock)
+        assert again.status == REFUSED
+        assert any("prior fill_price_outside_band" in reason for reason in again.reasons)
+        assert _engaged(journal_settings, window)
+
+
+def test_resume_reports_a_new_fill_without_a_reference_price(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _order(journal_settings, fake, crashed, "tp-unpriced", 2.0, DAY1 - timedelta(hours=1))
+    fake.apply("tp-unpriced", FillAt(PRICE))
+    _engage(journal_settings, window, fixed_clock)
+
+    def no_reference(*_args: object) -> dict[str, float]:
+        raise ValueError("no bar known at close(S-1)")
+
+    monkeypatch.setattr(resume_module, "reference_prices", no_reference)
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.fill_prices == (("tp-unpriced", PRICE),)
+    assert outcome.fill_warnings == ("fill-price band: no reference price for tp-unpriced",)
+    assert not any("fill_price_outside_band" in reason for reason in outcome.reasons)
 
 
 def test_a_pending_order_the_broker_never_received_is_cancelled_not_received(
@@ -751,6 +827,7 @@ def test_with_the_flag_a_synthetic_third_fill_completes_two_journaled_ones(
 
     assert outcome.status == RELEASED, outcome.reasons
     assert outcome.synthetic_fills == ("tp-lag",)
+    assert ("tp-lag", 102.0) in outcome.fill_prices
     rows = _all_fills(journal_settings, "tp-lag")
     assert [(q, p, src) for _, q, p, src, *_ in rows[:2]] == [
         (1.0, 100.0, "broker_feed"),
@@ -807,6 +884,7 @@ def test_a_negative_implied_price_is_stored_with_price_implied(
     assert (source, implied) == ("broker_status", True)
     assert quantity == pytest.approx(1.0)
     assert price == pytest.approx(3 * 60.0 - 201.0)
+    assert ("tp-lag", price) in outcome.fill_prices
 
 
 def test_with_the_flag_an_order_the_broker_still_holds_open_is_refused(
@@ -2049,6 +2127,7 @@ def test_a_backward_step_before_the_cut_is_clamped_to_what_collect_wrote(
     window: PaperWindowRow,
     fixed_clock: FixedClock,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Settle stamps T1, collect journals a fill and its terminal event at T3,
     then the clock steps back to T2 (T1 < T2 < T3) before the journal cut.
@@ -2057,6 +2136,7 @@ def test_a_backward_step_before_the_cut_is_clamped_to_what_collect_wrote(
     reconciliation — a spurious mismatch. `collect`'s readings instead raise
     the floor (`_MonotonicStamps.observe`), so the cut is clamped to T3 and
     the reconciliation sees the fill it was stamped to see."""
+    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
     crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
     _order(
         journal_settings,

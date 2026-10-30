@@ -2059,6 +2059,23 @@ class RiskGatedBroker:
     ) -> None:
         coid = order.client_order_id
         assert run.run_id is not None
+        band: PriceBand | None = None
+        try:
+            assert run.session is not None
+            cut = session_close(previous_session(run.session))
+            with self._journal() as conn:
+                actions = live_actions_as_of(conn, cut)
+                prices, unpriced = _optional_prices(conn, run.session, [order.security_id], actions)
+            band = PriceBand(
+                _price_lookup(prices, unpriced),
+                actions,
+                run.session,
+                self._settings.paper.max_fill_price_deviation,
+            )
+        except Exception as exc:
+            # A halt still reads back fills when its reference-price read fails.
+            # The original fault already engaged the switch.
+            notes.append(f"halt read of {coid} has no price band ({type(exc).__name__})")
         try:
             collected = collect(
                 self._broker,
@@ -2070,6 +2087,7 @@ class RiskGatedBroker:
                 self._frozen,
                 self._settings,
                 write_offs=write_offs,
+                price_band=band,
             )
         except ClockError as exc:
             # Every later read of the account-wide feed meets the same skew:
@@ -2087,6 +2105,7 @@ class RiskGatedBroker:
             )
             return
         notes.extend(breach.message for breach in collected.rejections)
+        note_unjudged(collected, notes)
 
     def _event(
         self, coid: str, status: str, stamp: Callable[[], datetime], notes: list[str]
