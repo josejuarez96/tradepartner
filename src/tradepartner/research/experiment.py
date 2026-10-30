@@ -253,7 +253,7 @@ def _validate_study(
         )
     configurations = _study_positive_int("study.configurations", study["configurations"], path)
     if "matching" in study:
-        _require_enum("study.matching", study["matching"], ("entry_known", "ex_post"), path)
+        _require_enum("study.matching", study["matching"], ("causal", "ex_post"), path)
     if configurations > budget:
         raise ExperimentFileError(f"{path}: study.configurations exceeds budget.configurations")
     for key in ("groups", "bucket_by", "peer_by", "cluster_by"):
@@ -277,6 +277,11 @@ def _validate_study(
         ("facts_read", ("event_known_at", "window_end")),
     ):
         _require_enum(f"study.{key}", study[key], choices, path)
+    if study["facts_read"] == "window_end" and study.get("matching", "causal") == "causal":
+        # Causal matching's no-look-ahead guarantee needs per-event fact reads (#2493).
+        raise ExperimentFileError(
+            f'{path}: study.facts_read = "window_end" requires study.matching = "ex_post"'
+        )
     for key, allowed_values in (
         ("bucket_by", {"quarter", "stratum"}),
         ("peer_by", {"stratum"}),

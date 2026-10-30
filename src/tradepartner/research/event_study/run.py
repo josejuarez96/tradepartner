@@ -158,10 +158,11 @@ def match_events(
     `n_traded_*`), which the caller adds to the earlier stages' counts.
     """
     derived: dict[str, int] = defaultdict(int)
-    # Default cuts and peer pools are re-evaluated at the treated event's entry.
-    # A declared ex-post option reproduces the historical C1b probe.
-    matching = design.get("matching", "entry_known")
-    if matching not in {"entry_known", "ex_post"}:
+    # Causal (the default, #2493): cuts and peers for each event come only from
+    # events of its cell known strictly before its entry open, entering no later
+    # than it does. A declared `ex_post` option reproduces the C1b probe.
+    matching = design.get("matching", "causal")
+    if matching not in {"causal", "ex_post"}:
         raise ValueError("unknown matching mode")
     bucketed = (
         assign_buckets(
@@ -175,6 +176,10 @@ def match_events(
     )
     by_bucket_cell: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     for row in event_rows:
+        if matching == "causal" and not row["known_at"] < session_open(
+            date.fromisoformat(str(row["entry"]))
+        ):
+            raise ValueError(f"event {row['event_id']!r} is not known before its entry open")
         by_bucket_cell[tuple(row[key] for key in design["bucket_by"])].append(row)
     bucket_cache: dict[tuple[int, tuple[Any, ...]], list[dict[str, Any]]] = {}
     peer_index: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
@@ -190,7 +195,7 @@ def match_events(
             peer_indices[key] = [int(row["entry_index"]) for row in candidates]
     processed: list[dict[str, Any]] = []
     for event in bucketed if matching == "ex_post" else event_rows:
-        if matching == "entry_known":
+        if matching == "causal":
             cell = tuple(event[key] for key in design["bucket_by"])
             cache_key = (int(event["entry_index"]), cell)
             if cache_key not in bucket_cache:
@@ -199,7 +204,7 @@ def match_events(
                     row
                     for row in by_bucket_cell[cell]
                     if row["entry_index"] <= event["entry_index"]
-                    and row["known_at"] <= entry_instant
+                    and row["known_at"] < entry_instant
                 ]
                 bucket_cache[cache_key] = assign_buckets(
                     visible,
@@ -567,7 +572,7 @@ def run_study(
             counts[key] += value
     counts.update(count_study_events(event_rows, design, counts, derived))
     summary = summarise_study(processed, counts, design)
-    matching = design.get("matching", "entry_known")
+    matching = design.get("matching", "causal")
     summary["exploratory"]["matching"] = matching
     summary["exploratory"]["delisted_exit_note"] = (
         "Last available close carried forward; no delisting return. "
