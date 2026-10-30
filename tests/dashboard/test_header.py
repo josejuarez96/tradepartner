@@ -116,6 +116,25 @@ def test_as_of_is_the_latest_known_at_at_or_before_t(conn: duckdb.DuckDBPyConnec
     assert earlier <= session_close(date(2019, 1, 2)) < everything <= T
 
 
+def test_owner_spinoff_allocation_does_not_move_as_of_but_a_bar_does(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    load_universe_fixtures(conn, UNIVERSE_DIR)
+    bar_close = session_close(date(2020, 6, 30))
+    allocation_time = bar_close + timedelta(hours=1)
+    assert header.store_freshness(conn, T).as_of == bar_close
+    conn.execute(
+        "INSERT INTO spinoff_allocations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ["P", "C", date(2020, 6, 30), 0.3, allocation_time, allocation_time, "owner", "owner"],
+    )
+    assert header.store_freshness(conn, T).as_of == bar_close
+    conn.execute(
+        "UPDATE prices_daily SET known_at = ?, ingested_at = ? WHERE known_at = ?",
+        [allocation_time + timedelta(minutes=1), allocation_time + timedelta(minutes=1), bar_close],
+    )
+    assert header.store_freshness(conn, T).as_of == allocation_time + timedelta(minutes=1)
+
+
 def test_last_updated_is_the_latest_ok_run_finished_by_t(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
