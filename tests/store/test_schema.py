@@ -1296,6 +1296,7 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "successor_chains",
             "mergers",
             "reconcile_breaks",
+            "snapshot_sightings",
         }
         assert {table for table in shape_before if shape_after[table] != shape_before[table]} == {
             "listings",
@@ -2351,7 +2352,23 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 2
+
+
+def test_version_39_adds_snapshot_sightings_to_a_version_38_store() -> None:
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        conn.execute("DROP TABLE snapshot_sightings")
+        conn.execute("UPDATE schema_version SET version = 38 WHERE version = 39")
+        assert max(_versions(conn)) == 38
+        schema.init_schema(conn)
+        assert "snapshot_sightings" in _shape(conn)
+        assert max(_versions(conn)) == 39
+        schema.init_schema(conn)
+        assert _versions(conn).count(39) == 1
+    finally:
+        conn.close()
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
@@ -2878,7 +2895,7 @@ def test_the_version_38_migration_adds_the_intersection_columns_and_nothing_else
         for table in ("trial_rebalances", "paper_plans"):
             assert {name for name, _ in _ASSETS_INTERSECTION_ADDED} <= _table_columns(conn, table)
         assert {i: indexes_after[i] for i in indexes_before} == indexes_before
-        assert _versions(conn) == [37, schema.CURRENT_SCHEMA_VERSION]
+        assert _versions(conn) == [37, 38, schema.CURRENT_SCHEMA_VERSION]
         # Every existing row is kept; the two columns are NULL there.
         for table in ("trial_rebalances", "paper_plans"):
             assert conn.execute(

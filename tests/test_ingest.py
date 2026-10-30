@@ -2769,10 +2769,11 @@ def test_a_no_cover_page_rename_is_one_dated_row_across_nightly_runs(
     )
     assert rows == [
         ("STAT", "snapshot_static", date(2018, 3, 5), FETCHED_AT),
-        ("STAX", "snapshot", date(2019, 7, 1), FETCHED_AT + timedelta(days=3)),
+        ("STAX", "snapshot", date(2019, 7, 1), FETCHED_AT + timedelta(days=4)),
     ]
-    assert stored[1] == stored[0] + 1
-    assert stored[3] == stored[2] == stored[1]
+    assert stored[1] == stored[0]
+    assert stored[2] == stored[1] + 1
+    assert stored[3] == stored[2]
     with duckdb.connect(settings.store.path, read_only=True) as conn:
         checks = integrity_checks(conn, nights[-1][0], settings)
     (overlap,) = [c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS]
@@ -2816,7 +2817,10 @@ def test_a_stored_pre_fix_same_start_pair_gets_one_rename_row(
         result = _run(settings, now=NOW + timedelta(days=days), source="edgar", filings=filings)
         assert result.ok, result.runs[-1].message
         stored.append(read(rows_sql))
-    assert stored[0] == [*seeded, ("STAX", "snapshot", date(2019, 7, 1), bad_fetch)]
+    assert stored[0] == [
+        *seeded,
+        ("STAX", "snapshot", date(2019, 7, 1), FETCHED_AT + timedelta(days=4)),
+    ]
     assert stored[1] == stored[0]
     accepted = settings.model_copy(
         update={

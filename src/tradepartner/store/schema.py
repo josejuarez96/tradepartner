@@ -878,9 +878,9 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   (NULL on every existing row) by `ALTER TABLE`
 #:   (`_migrate_assets_intersection`); the pinned DDL strings do not change
 #:   (module docstring, "Schema versions").
-#: - A later DDL change goes to version 39, with its own migration and a
+#: - A later DDL change goes to version 40, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 38
+CURRENT_SCHEMA_VERSION = 39
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -1054,6 +1054,7 @@ _PRE_BREAKS_VERSION = 36
 #: NULL where they are missing, and no read names `trial_rebalances`'s before
 #: T242.
 _PRE_ASSETS_INTERSECTION_VERSION = 37
+_PRE_SNAPSHOT_SIGHTINGS_VERSION = 38
 
 
 class SchemaVersionError(RuntimeError):
@@ -1113,6 +1114,18 @@ CREATE TABLE IF NOT EXISTS listings (
     valid_from DATE NOT NULL,
     {_common_fact_columns(_V4_MASTER_PROVENANCE)},
     UNIQUE (security_id, ticker, exchange, valid_from, known_at)
+)
+"""
+
+_CREATE_SNAPSHOT_SIGHTINGS = """
+CREATE TABLE IF NOT EXISTS snapshot_sightings (
+    cik VARCHAR NOT NULL,
+    ticker VARCHAR NOT NULL,
+    exchange VARCHAR NOT NULL,
+    known_at TIMESTAMPTZ NOT NULL,
+    ingested_at TIMESTAMPTZ NOT NULL,
+    CHECK (known_at <= ingested_at),
+    UNIQUE (cik, ticker, exchange, known_at)
 )
 """
 
@@ -1496,6 +1509,7 @@ CREATE TABLE IF NOT EXISTS successor_chains (
 TABLE_NAMES: tuple[str, ...] = (
     "securities",
     "listings",
+    "snapshot_sightings",
     "classifications",
     "delistings",
     "prices_daily",
@@ -1532,6 +1546,8 @@ _TABLE_DDL: tuple[str, ...] = (
     _CREATE_INGESTION_RUNS,
     _CREATE_SCHEMA_VERSION,
 )
+
+_SNAPSHOT_SIGHTINGS_TABLE_DDL: tuple[str, ...] = (_CREATE_SNAPSHOT_SIGHTINGS,)
 
 #: `statement_facts` (#660, T76), added at version 10: its own tuple rather
 #: than folded into `_TABLE_DDL` above, so that tuple's version-4 pin never
@@ -3177,6 +3193,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_MERGER_RECEIPT_VERSION,
         _PRE_BREAKS_VERSION,
         _PRE_ASSETS_INTERSECTION_VERSION,
+        _PRE_SNAPSHOT_SIGHTINGS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -4340,6 +4357,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_MERGER_RECEIPT_VERSION,
         _PRE_BREAKS_VERSION,
         _PRE_ASSETS_INTERSECTION_VERSION,
+        _PRE_SNAPSHOT_SIGHTINGS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4384,6 +4402,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _SUCCESSOR_CHAINS_TABLE_DDL
             + _MERGERS_TABLE_DDL
             + _BREAKS_TABLE_DDL
+            + _SNAPSHOT_SIGHTINGS_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)
