@@ -23,7 +23,7 @@ from conftest import version_4_store
 from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.calendar import next_session, previous_session
 from tradepartner.config import RiskConfig, Settings
-from tradepartner.execution import ops
+from tradepartner.execution import headroom, ops
 from tradepartner.execution.marks import UnreadableMarkError
 from tradepartner.execution.plan import stop_session
 from tradepartner.execution.waiting import WaitingItem
@@ -1114,6 +1114,70 @@ def test_marks_filter_does_not_depend_on_the_trading_calendar(
 
     assert data.positions_count == 1
     assert data.positions_value == 30.0
+
+
+def _mark_session_rows(
+    journal_settings: Settings, seeded: dict[str, int], rows: list[tuple[str, float, str]]
+) -> None:
+    """Append (security_id, value, position_side) marks after the seeded session."""
+    last_session = next_session(_S_MINUS_1)
+    with open_for_write(journal_settings) as conn:
+        for i, (sid, value, side) in enumerate(rows):
+            append(
+                conn,
+                PositionDailyRow(
+                    run_id=seeded["run_id"],
+                    session=last_session,
+                    security_id=sid,
+                    quantity=value / 10.0,
+                    mark_price=10.0,
+                    value=value,
+                    position_side=side,
+                    **_stamp(80 + i),
+                ),
+            )
+
+
+def test_positions_value_is_long_minus_short(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """A short's mark is unsigned (paper spec #1872 item 10), so the status
+    value is long minus short, as `Ledger.equity` counts it (#2561, #2547)."""
+    _mark_session_rows(journal_settings, seeded, [("LLL", 100.0, "long"), ("SSS", 40.0, "short")])
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings)
+    assert data.positions_count == 2
+    assert data.positions_value == 60.0
+
+
+def test_net_positions_value_and_gross_exposure_stay_apart(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """One long (100) and one short (40): the positions value is net (60) and
+    the risk card's gross exposure is gross (140), each from its own reader."""
+    _mark_session_rows(journal_settings, seeded, [("LLL", 100.0, "long"), ("SSS", 40.0, "short")])
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings)
+        marks = [
+            m
+            for m in ops.journal.positions_daily_for(conn, open_window.window_id or 0)
+            if m.security_id in ("LLL", "SSS")
+        ]
+    for i, m in enumerate(marks):
+        marks[i] = replace(m, cash=1_000.0)
+    card = headroom.compute(open_window, marks, (), journal_settings.risk)
+    gross = next(r for r in card.rows if r.key == "gross")
+    assert data.positions_value == 60.0
+    assert gross.value * card.equity == pytest.approx(140.0)
+
+
+def test_long_only_positions_value_is_unchanged(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    _mark_session_rows(journal_settings, seeded, [("LLL", 100.0, "long"), ("MMM", 30.0, "long")])
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings)
+    assert data.positions_value == 130.0
 
 
 def test_kill_switch_read_is_at_most_two_rows_and_matches_derive(
