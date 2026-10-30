@@ -7521,6 +7521,12 @@ def test_sec_13d_full_ingest_switch_and_run_message(settings: Settings) -> None:
     )
     source = _filings()
     source._sec_forms_13d = [filing]
+    source.sec_forms_requests = {
+        "headers": 2,
+        "submissions": 1,
+        "submissions_pages": 3,
+        "retries_backoffs": 1,
+    }
     disabled = _run(settings, filings=source, source="edgar")
     assert disabled.ok
     with duckdb.connect(settings.store.path) as conn:
@@ -7530,6 +7536,9 @@ def test_sec_13d_full_ingest_switch_and_run_message(settings: Settings) -> None:
     )
     first = _run(enabled, filings=source, source="edgar")
     assert first.ok and "sec_forms_added: 2" in first.runs[0].message
+    assert "sec_forms_requests_headers: 2" in first.runs[0].message
+    assert "sec_forms_requests_submissions_pages: 3" in first.runs[0].message
+    assert "sec_forms_requests_retries_backoffs: 1" in first.runs[0].message
     second = _run(enabled, filings=source, source="edgar")
     assert second.ok and "sec_forms_added: 0" in second.runs[0].message
     assert "sec_forms_changed: 0" in second.runs[0].message
@@ -7537,6 +7546,61 @@ def test_sec_13d_full_ingest_switch_and_run_message(settings: Settings) -> None:
         assert conn.execute(
             "SELECT filer_cik FROM sec_filing_events ORDER BY filer_cik"
         ).fetchall() == [("0000222222",), ("0000333333",)]
+
+
+def test_sec_13d_prefetch_keeps_subject_already_in_securities(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _run(settings, filings=_filings(), source="edgar").ok
+    original_open = ingest_module.open_read_only
+    retries: list[bool] = []
+
+    def tracked_open(*args: Any, **kwargs: Any) -> Any:
+        retries.append(kwargs.get("retry", False))
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(ingest_module, "open_read_only", tracked_open)
+    filing = SecFormFiling(
+        "0000950123-19-000003",
+        "SC 13D",
+        NOW - timedelta(hours=1),
+        SESSION,
+        (ACME,),
+        ("0000222222",),
+    )
+    source = _filings()
+    source._index = [entry for entry in source._index if entry.cik != ACME]
+    source._sec_forms_13d = [filing]
+    enabled = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    result = _run(enabled, filings=source, source="edgar")
+    assert result.ok and "sec_forms_added: 1" in result.runs[0].message
+    assert True in retries
+
+
+def test_sec_13d_pending_subject_is_found_after_it_joins_securities(settings: Settings) -> None:
+    filing = SecFormFiling(
+        "0000950123-19-000004",
+        "SC 13D",
+        NOW - timedelta(hours=1),
+        SESSION,
+        (ACME,),
+        ("0000222222",),
+    )
+    enabled = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    first = _run(
+        enabled,
+        filings=FixtureFilingSource(sec_forms_13d=[filing]),
+        source="edgar",
+    )
+    assert first.ok and "sec_forms_added: 0" in first.runs[0].message
+    source = _filings()
+    source._sec_forms_13d = [filing]
+    second = _run(enabled, filings=source, source="edgar")
+    assert second.ok and "sec_forms_added: 1" in second.runs[0].message
 
 
 def test_sec_form_write_refuses_future_acceptance(fixture_store: duckdb.DuckDBPyConnection) -> None:

@@ -1229,6 +1229,8 @@ class _Recorded(FilingSource):
         self._statement_filled: set[str] = set()  # #660: which CIKs, never the records
         self._events_asked: set[str] = set()  # #1358: which CIKs, never the records
         self.frozen = False
+        self.sec_subjects: frozenset[str] = frozenset()
+        self.sec_forms_subjects: frozenset[str] = frozenset()
         #: CIKs whose filename answer is partial (#1597, T184b), read at the fetch pass.
         self.filename_incomplete_ciks: set[str] = set()
 
@@ -1298,9 +1300,9 @@ class _Recorded(FilingSource):
             return records
         return self._source.filing_events(cik)
 
-    def sec_forms_13d(self) -> list[SecFormFiling]:
+    def sec_forms_13d(self, subjects: frozenset[str] | None = None) -> list[SecFormFiling]:
         """Record the 13D discovery before the store write lock is acquired."""
-        return list(self._ask("sec_forms_13d"))
+        return list(self._ask("sec_forms_13d", subjects))
 
 
 def _unwrap(filings: FilingSource) -> FilingSource:
@@ -1342,7 +1344,8 @@ def _unjudged_ciks(filings: FilingSource) -> Unjudged:
 
 
 def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None:
-    """The fetch pass: every filing question, with no store connection open;
+    """The fetch pass: snapshot existing SEC subject CIKs, then ask every
+    filing question with no store connection open;
     then `check_failures()` (T11h), if the source under `recorded` has one,
     before the lock; then `recorded` answers only from what it holds.
 
@@ -1363,6 +1366,11 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None
     later step can fail because an input was treated as absent), the gate
     still fails the run with the full list and names that error, so the
     error never hides the list."""
+    if settings.events.sec_forms_enabled and Path(settings.store.path).exists():
+        with open_read_only(settings, retry=True) as conn:
+            recorded.sec_subjects = frozenset(
+                cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+            )
     _fetch_and_gate(recorded, settings)
     source = _unwrap(recorded)
     check_failures = getattr(source, "check_failures", None)
@@ -1822,6 +1830,10 @@ def _ingest_filings(
     # recompute it (#564). A caller that hands an unfrozen source still
     # meets the input-validation gate before any row is written (#578).
     if not (isinstance(filings, _Recorded) and filings.frozen):
+        if settings.events.sec_forms_enabled:
+            recorded.sec_subjects = frozenset(
+                cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+            )
         _fetch_and_gate(recorded, settings)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     # Each run fetches only today's SEC ticker file: the stored snapshot rows
@@ -1926,7 +1938,12 @@ def _ingest_filings(
                     f"Form 4 bulk: {raw_source.requests} requests; sec_forms_budget_stopped: 1"
                 )
             sec_added += form4_added
-        for filing in recorded.sec_forms_13d():
+        prefetch_subjects = (
+            filings.sec_forms_subjects
+            if isinstance(filings, _Recorded) and filings.frozen
+            else recorded.sec_forms_subjects
+        )
+        for filing in recorded.sec_forms_13d(prefetch_subjects):
             for subject in filing.subject_ciks:
                 if subject not in subjects:
                     continue
@@ -1940,6 +1957,8 @@ def _ingest_filings(
         figures = {"added": sec_added, "changed": sec_changed, "not_yet_known": sec_future}
         for name, count in source_counts.items():
             figures[name] = figures.get(name, 0) + count
+        for name, count in getattr(raw_source, "sec_forms_requests", {}).items():
+            figures[f"requests_{name}"] = count
         sec_forms = "; " + ", ".join(
             f"sec_forms_{name}: {count}" for name, count in figures.items()
         )
@@ -2157,7 +2176,12 @@ def _build_filings(
         for cik in ciks:
             filings.filing_events(cik)
     if fetch and settings.events.sec_forms_enabled:
-        filings.sec_forms_13d()
+        subjects = getattr(filings, "sec_subjects", frozenset()) | frozenset(
+            row["cik"] for row in master.securities
+        )
+        if isinstance(filings, _Recorded):
+            filings.sec_forms_subjects = subjects
+        filings.sec_forms_13d(subjects)
     link = settings.edgar.class_member_link
     facts, unmatched = fact_rows(
         records,

@@ -336,7 +336,7 @@ class FilingSource(abc.ABC):
     deterministic order.
     """
 
-    def sec_forms_13d(self) -> list[SecFormFiling]:
+    def sec_forms_13d(self, subjects: frozenset[str] | None = None) -> list[SecFormFiling]:
         """Ownership 13D accessions. Sources without this extension return none."""
         return []
 
