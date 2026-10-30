@@ -97,7 +97,7 @@ def _app(
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     if read is not None:
         monkeypatch.setattr(
-            ops, "performance_data", lambda conn, settings, book_id=None: read(str(book_id))
+            ops, "performance_data", lambda conn, settings, book_id=None, *, now: read(str(book_id))
         )
     at = AppTest.from_file(_APP_PATH)
     at.run()

@@ -1930,7 +1930,7 @@ def _book_first_lines(
     return lines
 
 
-def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
+def _summary_lines(summaries: Sequence[ops.BookSummary], now: datetime) -> list[str]:
     """`paper status --all`: the operations page's one-row-per-book summary (spec
     req 12 as amended 2026-10-09), one line per book in token order."""
     if not summaries:
@@ -1943,7 +1943,7 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
             if state.engaged
             else ("run in progress" if state.run_in_progress else "released")
         )
-        traded = ops.rebalance_traded_today(row)
+        traded = ops.rebalance_traded_today(row, now=now)
         line = (
             f"book {row.book_id}: window {row.window.window_id} "
             f"{'open' if row.is_open else 'closed'}; positions {row.positions_count}; "
@@ -5284,21 +5284,21 @@ def make_app(
                     ops.OwnerQueue,
                     tuple[ops.OverdueDelisting, ...],
                     ops.EdgarAge | None,
+                    datetime,
                 ]
                 | str
             ):
                 with open_read_only(s) as conn:
                     try:
-                        summaries = ops.book_summaries(conn, s)
-                        queue = ops.owner_queue(
-                            conn, s, ensure_tz_aware_utc(clock(), field_name="clock()")
-                        )
                         now = ensure_tz_aware_utc(clock(), field_name="clock()")
+                        summaries = ops.book_summaries(conn, s, now=now)
+                        queue = ops.owner_queue(conn, s, now)
                         return (
                             summaries,
                             queue,
                             ops.overdue_delisting_cash(conn),
                             ops.edgar_age(conn, s, now),
+                            now,
                         )
                     except schema.SchemaVersionError as exc:
                         return str(exc)
@@ -5307,16 +5307,15 @@ def make_app(
             if isinstance(result, str):  # the journal predates version 17
                 _echo_scrubbed(f"paper status: {result}", s)
                 raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
-            summaries, queue, overdue, edgar = result
+            summaries, queue, overdue, edgar, now = result
             items = queue.items
-            now = ensure_tz_aware_utc(clock(), field_name="clock()")
             overdue_lines = _overdue_delisting_lines(overdue)
             edgar_lines = _edgar_age_lines(edgar)
             # the open span's progress (#2298): not a problem, so not an item
             progress_lines = [queue.shakedown_progress] if queue.shakedown_progress else []
             if not summaries:  # no window yet: nothing to lead with
                 for line in (
-                    *_summary_lines(summaries),
+                    *_summary_lines(summaries, now),
                     *overdue_lines,
                     *edgar_lines,
                     *_waiting_lines(items),
@@ -5330,14 +5329,16 @@ def make_app(
                 *progress_lines,
                 *overdue_lines,
                 *edgar_lines,
-                *_summary_lines(summaries),
+                *_summary_lines(summaries, now),
             ):
                 _echo_scrubbed(line, s)
             return
 
         def read() -> tuple[ops.OpsData, paper_slippage.Slippage | None]:
             with open_read_only(s) as conn:
-                page = ops.page_data(conn, s, chosen)
+                page = ops.page_data(
+                    conn, s, chosen, now=ensure_tz_aware_utc(clock(), field_name="clock()")
+                )
                 window_id = page.window.window_id if page.window is not None else None
                 if window_id is None or page.journal_outdated is not None:
                     return page, None

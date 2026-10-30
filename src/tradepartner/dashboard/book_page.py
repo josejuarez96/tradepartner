@@ -481,7 +481,7 @@ def _backtest(view: book_view.BookView) -> None:
 def render(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
     """Draw the Book page from the shell's one read-only connection."""
     try:
-        summaries = ops.book_summaries(conn, settings)
+        summaries = ops.book_summaries(conn, settings, now=_now())
     except (JournalNotInitialised, SchemaVersionError):
         st.info("No book has started yet, so there is nothing to show.")
         return
