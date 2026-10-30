@@ -480,6 +480,53 @@ def _cached_quarters(settings: Settings) -> set[str]:
     }
 
 
+def test_filing_index_scans_once_per_source_and_returns_independent_lists(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(settings, _router())
+    original_rows = source._rows
+    walks = 0
+
+    def counted_rows(*args: Any, **kwargs: Any) -> Any:
+        nonlocal walks
+        walks += 1
+        return original_rows(*args, **kwargs)
+
+    monkeypatch.setattr(source, "_rows", counted_rows)
+    first = source.filing_index()
+    unstamped = list(source.unstamped_filings)
+    assert walks == 2
+
+    second = source.filing_index()
+    assert second == first and second is not first
+    assert walks == 2
+    assert source.unstamped_filings == unstamped
+    second.clear()
+    assert source.filing_index() == first
+
+    since = datetime(2024, 2, 1, tzinfo=UTC)
+    assert source.filing_index(since) == [e for e in first if e.accepted_at >= since]
+    assert walks == 2
+    assert source.unstamped_filings == unstamped
+
+    since_first = _source(edgar_settings(Path(settings.edgar.cache_dir) / "since"), _router())
+    assert since_first.filing_index(since) == [e for e in first if e.accepted_at >= since]
+    assert since_first.filing_index() == first
+
+    other = _source(settings, _router())
+    other_rows = other._rows
+    other_walks = 0
+
+    def counted_other(*args: Any, **kwargs: Any) -> Any:
+        nonlocal other_walks
+        other_walks += 1
+        return other_rows(*args, **kwargs)
+
+    monkeypatch.setattr(other, "_rows", counted_other)
+    assert other.filing_index() == first
+    assert other_walks == 2
+
+
 def test_a_quarter_is_cached_only_once_settled_and_the_open_quarter_may_404(
     settings: Settings,
 ) -> None:
@@ -497,7 +544,7 @@ def test_a_404_for_a_closed_quarter_raises(settings: Settings) -> None:
         _source(settings, _router(overrides={(2025, 2): 404})).filing_index()
 
 
-def test_a_second_call_fetches_only_the_unsettled_quarter_and_restamps_nothing(
+def test_a_new_instance_fetches_the_unsettled_quarter_but_a_second_call_does_not(
     settings: Settings,
 ) -> None:
     first = _source(settings, _router()).filing_index()
@@ -512,10 +559,10 @@ def test_a_second_call_fetches_only_the_unsettled_quarter_and_restamps_nothing(
         "CIK0000320193.json",
         "CIK0000320193-submissions-001.json",
     ]
-    # The same instance reuses its memoised submissions: only the open quarter.
+    # The same instance keeps the full index, including the open quarter.
     before = len(again_router.urls)
     assert source.filing_index() == first
-    assert again_router.urls[before:] == again_router.index_urls()[-1:]
+    assert again_router.urls[before:] == []
 
 
 def test_an_accession_missing_after_its_quarter_settled_is_cached_as_unstampable(
