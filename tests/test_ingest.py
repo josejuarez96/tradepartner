@@ -7651,3 +7651,273 @@ def test_sec_13d_later_qualifying_subject_is_added_without_changed_count(
         "SELECT subject_cik FROM sec_filing_events WHERE accession = ? ORDER BY subject_cik",
         [filing.accession],
     ).fetchall() == [("0000111111",), ("0000555555",)]
+
+
+# --- the SEC forms backfill alone (#2624) -------------------------------------------
+
+_F4_ACCESSION = f"{ACME}-18-000123"
+_F4_FILED = date(2018, 11, 15)
+_F4_ACCEPTED = datetime(2018, 11, 15, 21, 0, tzinfo=UTC)
+_LATER = NOW + timedelta(hours=1)
+
+
+def _acme_form4() -> SecFormFiling:
+    parsed = parse_form4(
+        (
+            Path(__file__).parent / "fixtures/edgar/sec_forms/form4_purchase_gift_indirect.xml"
+        ).read_text()
+    )
+    transactions = tuple(replace(t, issuer_cik=ACME) for t in parsed.transactions)
+    return SecFormFiling(
+        _F4_ACCESSION, "4", _F4_ACCEPTED, _F4_FILED, (ACME,), parsed.filer_ciks, transactions
+    )
+
+
+def _forms_source(filing: SecFormFiling) -> FixtureFilingSource:
+    """The fixture filings plus one 13D on ACME and the EDGAR seams the Form 4 step uses."""
+    from tradepartner.adapters.edgar_source import SubmissionRecord
+
+    source = _filings()
+    source._sec_forms_13d = [  # type: ignore[attr-defined]
+        SecFormFiling(
+            "0000950123-18-000001",
+            "SC 13D",
+            datetime(2018, 11, 20, 21, 0, tzinfo=UTC),
+            date(2018, 11, 20),
+            (ACME, "0000777000"),
+            ("0000999999",),
+        )
+    ]
+    row = UnstampedFiling(ACME, "Acme Corp", "4", filing.accession, filing.filed_date)
+    record = SubmissionRecord(
+        filing.accession, "4", "form4.xml", False, filing.accepted_at, filing_date=filing.filed_date
+    )
+    hooks: dict[str, Any] = {
+        "_client": httpx.Client(),
+        "requests": 0,
+        "_rows": lambda *_: iter([((2018, 4), row)]),
+        "_load_stamps": lambda *_: {},
+        "_fetch_submissions": lambda _cik, wanted: SimpleNamespace(
+            records={a: record for a in wanted if a == filing.accession}
+        ),
+        "_sec_stamped": lambda *_: record,
+        "sec_form4_accession": lambda *_: filing,
+    }
+    for name, value in hooks.items():
+        setattr(source, name, value)
+    return source
+
+
+def _fake_bulk(filing: SecFormFiling) -> Callable[..., Any]:
+    from tradepartner.adapters.edgar_insider_bulk import BulkRowFact
+    from tradepartner.adapters.form4_route import quarter_of
+
+    def load(quarters: Iterable[Any], **_kwargs: Any) -> Any:
+        rows = tuple(
+            BulkRowFact(t.line_no, t.transaction_code, t.price, False) for t in filing.transactions
+        )
+        record = BulkAccession(
+            filing.accession,
+            "4",
+            filing.filed_date,
+            ACME,
+            filing.filer_ciks,
+            filing.transactions,
+            0,
+            rows,
+            False,
+            False,
+        )
+        wanted = set(quarters)
+        bulk = {q: InsiderBulk({filing.accession: record}) for q in wanted}
+        mine = quarter_of(filing.filed_date)
+        bulk = {q: (b if q == mine else InsiderBulk({})) for q, b in bulk.items()}
+        return bulk, {q: "d" * 64 for q in wanted}, Counter(), frozenset()
+
+    return load
+
+
+def _table_rows(path: str) -> dict[str, list[str]]:
+    with duckdb.connect(path, read_only=True) as conn:
+        tables = [
+            name
+            for (name,) in conn.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'"
+            ).fetchall()
+        ]
+        return {t: sorted(map(repr, conn.execute(f"SELECT * FROM {t}").fetchall())) for t in tables}
+
+
+def test_sec_forms_only_writes_what_the_edgar_backfill_writes_and_nothing_else(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+
+    from tradepartner.adapters import edgar_source
+    from tradepartner.backfill import backfill
+
+    filing = _acme_form4()
+    monkeypatch.setattr(edgar_source, "EdgarFilingSource", FixtureFilingSource)
+    monkeypatch.setattr(ingest_module, "load_bulk_quarters", _fake_bulk(filing))
+    master = backfill(
+        settings,
+        prices=_Prices(),
+        filings=_filings(),
+        since=SESSION,
+        source="edgar",
+        clock=lambda: NOW,
+    )
+    assert master.ok, master.runs
+    store_b = tmp_path / "forms_only.duckdb"
+    shutil.copy(settings.store.path, store_b)
+
+    def enabled(store: Path, cache: str) -> Settings:
+        return settings.model_copy(
+            update={
+                "store": settings.store.model_copy(update={"path": str(store)}),
+                "edgar": settings.edgar.model_copy(update={"cache_dir": str(tmp_path / cache)}),
+                "events": settings.events.model_copy(update={"sec_forms_enabled": True}),
+            }
+        )
+
+    full = backfill(
+        enabled(Path(settings.store.path), "cache_a"),
+        prices=_Prices(),
+        filings=_forms_source(filing),
+        since=SESSION,
+        source="edgar",
+        clock=lambda: _LATER,
+    )
+    assert full.ok, full.runs
+    before = _table_rows(str(store_b))
+    alone = ingest_module.ingest_sec_forms(
+        enabled(store_b, "cache_b"), _forms_source(filing), clock=lambda: _LATER
+    )
+    assert alone.ok, alone.runs
+    assert [(r.source, r.status) for r in alone.runs] == [("sec_forms", "ok")]
+    assert "Form 4 bulk: 1 selected" in alone.runs[0].message
+    after = _table_rows(str(store_b))
+    full_rows = _table_rows(settings.store.path)
+    written = {"sec_filing_events", "sec_form4_transactions"}
+    for table in written:
+        assert after[table] and after[table] == full_rows[table], table
+    # Every other table is as it was, but for the new run rows.
+    assert {t for t in after if after[t] != before[t]} == written | {"ingestion_runs"}
+    with duckdb.connect(str(store_b), read_only=True) as conn:
+        new_runs = conn.execute(
+            "SELECT source, mode FROM ingestion_runs WHERE started_at = ? ORDER BY source", [_LATER]
+        ).fetchall()
+        quarters_b = conn.execute(
+            "SELECT status, mode, rows_added, chunk_cursor, message FROM ingestion_runs "
+            "WHERE source = 'sec_insider_bulk'"
+        ).fetchall()
+        sources = conn.execute(
+            "SELECT DISTINCT form, source FROM sec_filing_events ORDER BY form"
+        ).fetchall()
+        # No look-ahead: known_at is the submissions acceptance, never the filing date.
+        stamps = conn.execute(
+            "SELECT DISTINCT known_at, accepted_at FROM sec_form4_transactions"
+        ).fetchall()
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        quarters_a = conn.execute(
+            "SELECT status, mode, rows_added, chunk_cursor, message FROM ingestion_runs "
+            "WHERE source = 'sec_insider_bulk'"
+        ).fetchall()
+    assert new_runs == [("sec_forms", "backfill"), ("sec_insider_bulk", "backfill")]
+    assert quarters_b == quarters_a and quarters_b[0][3] == "2018q4"
+    assert ("4", "sec_insider_bulk") in sources and any(form == "SC 13D" for form, _ in sources)
+    assert stamps == [(_F4_ACCEPTED, _F4_ACCEPTED)]
+
+
+def test_form4_bulk_holds_one_quarter_in_memory_at_a_time(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gc
+    import weakref
+
+    from tradepartner.adapters.form4_route import Quarter, quarter_of
+
+    now = datetime(2026, 10, 29, tzinfo=UTC)
+    enabled = settings.model_copy(
+        update={
+            "edgar": settings.edgar.model_copy(update={"cache_dir": str(tmp_path / "cache")}),
+            "events": settings.events.model_copy(update={"sec_forms_enabled": True}),
+        }
+    )
+    source = EdgarFilingSource(enabled, client=httpx.Client(), clock=lambda: now)
+    quarters = [Quarter(2024 + (i // 4), i % 4 + 1) for i in range(6)]
+    rows = [
+        UnstampedFiling(
+            ACME, "ACME", "4", f"{ACME}-{q.year % 100}-{i:06d}", date(q.year, q.number * 3, 1)
+        )
+        for i, q in enumerate(quarters)
+    ]
+    monkeypatch.setattr(source, "_rows", lambda *_: iter(((0, 0), row) for row in rows))
+    monkeypatch.setattr(source, "_load_stamps", lambda *_: {})
+    monkeypatch.setattr(
+        source, "_fetch_submissions", lambda *_: SimpleNamespace(records={}, empty=True)
+    )
+    live: list[weakref.ref[InsiderBulk]] = []
+    calls: list[tuple[list[Quarter], bool, int]] = []
+
+    def load(wanted: Iterable[Quarter], *, revalidate: bool = True, **_kwargs: Any) -> Any:
+        gc.collect()
+        asked = sorted(wanted)
+        calls.append((asked, revalidate, sum(ref() is not None for ref in live)))
+        bulk: dict[Quarter, InsiderBulk | None] = {}
+        for q in asked:
+            row = next(r for r in rows if quarter_of(r.filed_on) == q)
+            record = BulkAccession(
+                row.accession, "4", row.filed_on, ACME, ("0000888888",), (), 0, (), False, False
+            )
+            bulk[q] = InsiderBulk({row.accession: record})
+            live.append(weakref.ref(bulk[q]))
+        return bulk, {q: "e" * 64 for q in asked}, Counter(), frozenset()
+
+    monkeypatch.setattr(ingest_module, "load_bulk_quarters", load)
+    added, message = ingest_module._write_form4_bulk(
+        fixture_store, enabled, source, frozenset({ACME}), now
+    )
+    assert added == 0 and "6 selected" in message and "6 remaining" in message
+    # Each quarter is read once to plan and once to route, never two at once.
+    assert [asked for asked, _, _ in calls] == [[q] for q in quarters] * 2
+    assert [revalidate for _, revalidate, _ in calls] == [True] * 6 + [False] * 6
+    assert {held for _, _, held in calls} == {0}
+
+
+def test_sec_form_writer_with_the_stored_set_writes_the_same_rows_and_still_refuses(
+    tmp_path: Path,
+) -> None:
+    filing = _acme_form4()
+    stores = []
+    for name, stored in (("plain", None), ("fast", set[str]())):
+        conn = duckdb.connect(str(tmp_path / f"{name}.duckdb"))
+        ingest_module.init_schema(conn)
+        first = ingest_module.write_sec_form_accession(
+            conn, filing, ingested_at=_LATER, source="sec_insider_bulk", stored=stored
+        )
+        again = ingest_module.write_sec_form_accession(
+            conn, filing, ingested_at=_LATER, source="sec_insider_bulk", stored=stored
+        )
+        moved = ingest_module.write_sec_form_accession(
+            conn,
+            replace(filing, accepted_at=_F4_ACCEPTED + timedelta(minutes=1)),
+            ingested_at=_LATER,
+            source="sec_insider_bulk",
+            stored=stored,
+        )
+        assert first.added > 0 and (again.added, again.changed) == (0, 0)
+        assert (moved.added, moved.changed) == (0, 1)
+        stores.append(
+            {
+                t: sorted(map(repr, conn.execute(f"SELECT * FROM {t}").fetchall()))
+                for t in ("sec_filing_events", "sec_form4_transactions")
+            }
+        )
+        conn.close()
+        if stored is not None:
+            assert stored == {filing.accession}
+    assert stores[0] == stores[1]

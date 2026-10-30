@@ -37,6 +37,10 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   when the file passes and still matches the store
   (`ingest.restamp_from_manifest`); any other in-window change still fails
   the run with nothing written.
+  `--source edgar --sec-forms-only` (#2624) runs `ingest.ingest_sec_forms`:
+  the EDGAR backfill's SEC ownership forms step alone, from
+  `events.sec_forms_backfill_start`, for the stored securities' CIKs, with no
+  full filing index or master build; it takes no other flag.
 - `tradepartner backfill-benchmark SYMBOL --since DATE [--cik --name
   --exchange]` runs `backfill.backfill_benchmark` (#840): the owner's one-off
   for a configured benchmark the store lacks (MTUM), seeded from the three
@@ -477,6 +481,7 @@ from tradepartner.ingest import (
     ingest_assets,
     ingest_openfigi,
     ingest_rates,
+    ingest_sec_forms,
     ingest_session,
     manifest_release,
     rates_seeded,
@@ -2459,6 +2464,16 @@ def make_app(
                 help="with --census-sec-forms: the assumed size of one filing XML, in bytes",
             ),
         ] = CENSUS_XML_BYTES_ASSUMED,
+        sec_forms_only: Annotated[
+            bool,
+            typer.Option(
+                "--sec-forms-only",
+                help=(
+                    "with --source edgar: only the SEC ownership forms backfill, from "
+                    "events.sec_forms_backfill_start, no full EDGAR pass (#2624)"
+                ),
+            ),
+        ] = False,
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
         if source not in ("all", *SOURCES, ASSETS_SOURCE, "openfigi"):
@@ -2481,6 +2496,22 @@ def make_app(
                     restamp_window_earlier_ok is not None, import_dir is not None,
                 ),
             )  # fmt: skip
+        if sec_forms_only and (
+            source != "edgar"
+            or any(
+                (
+                    backfill_, since is not None, actions_backfill, through is not None, dry_run,
+                    fill_holes_, security is not None, bulk_from_cache, rebuild_statement_facts,
+                    rebuild_filing_events, rebuild_classifications, restamp_from is not None,
+                    restamp_window_earlier_ok is not None, import_dir is not None,
+                )
+            )
+        ):  # fmt: skip
+            raise _fail(
+                "--sec-forms-only needs --source edgar and no other flag "
+                "(it starts at events.sec_forms_backfill_start)",
+                USAGE_ERROR,
+            )
         if import_dir is not None and source != ASSETS_SOURCE:
             raise _fail(f"--import-dir needs --source {ASSETS_SOURCE}", USAGE_ERROR)
         if source == ASSETS_SOURCE and backfill_:
@@ -2567,6 +2598,8 @@ def make_app(
             if scheduled_ingest:
                 heartbeat.ping(s, "ingest", ok=False)  # same shape as the scheduled job (#2155)
             raise _fail(refusal, 1)
+        if sec_forms_only and not s.events.sec_forms_enabled:
+            raise _fail("--sec-forms-only needs events.sec_forms_enabled", USAGE_ERROR)
         if source == "openfigi" and not s.openfigi.enabled:
             raise _fail("--source openfigi needs openfigi.enabled=true", USAGE_ERROR)
         if actions_backfill:
@@ -2671,6 +2704,10 @@ def make_app(
             reuse_cached=bulk_from_cache,
             event_forms=s.edgar.event_forms,
         )
+        if sec_forms_only:
+            result = ingest_sec_forms(s, filings, clock=clock)
+            _print_result(result)
+            raise typer.Exit(result.exit_code)
         prices = (
             price_source(s)
             if price_source
