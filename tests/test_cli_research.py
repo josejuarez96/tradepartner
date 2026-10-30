@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import signal
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -1058,6 +1059,27 @@ def test_open_refuses_configurations_other_than_the_study_table(
     assert _count("research_results") == 0
 
 
+def test_open_refuses_a_registered_study_without_configurations(
+    study_ready: int, config_file: Path
+) -> None:
+    # Model an older malformed registration; the current parser rejects this file at register time.
+    with open_for_write(get_settings()) as conn:
+        [(params,)] = conn.execute(
+            "SELECT params_json FROM research_registrations WHERE slug = ?", [STUDY]
+        ).fetchall()
+        registration = json.loads(params)
+        del registration["study"]["configurations"]
+        conn.execute(
+            "UPDATE research_registrations SET params_json = ? WHERE slug = ?",
+            [json.dumps(registration), STUDY],
+        )
+    out = _open_study(study_ready, config_file)
+    assert out.exit_code == 2, out.output
+    assert "study.configurations is missing" in out.output
+    assert _count("research_runs") == 0
+    assert _count("research_results") == 0
+
+
 def test_study_writes_an_ok_result_with_the_artifact(
     study_ready: int, config_file: Path, tmp_path: Path
 ) -> None:
@@ -1145,6 +1167,28 @@ def test_study_closes_the_run_failed_on_ctrl_c_and_exits_130(
     run = _first_int(_open_study(study_ready, config_file), "run")
     out = _cli("experiment", "study", "--run", str(run))
     assert out.exit_code == cli.INTERRUPTED_EXIT == 130
+    assert _rows("SELECT outcome, message FROM research_results WHERE run_id = ?", run) == [
+        ("failed", "KeyboardInterrupt: ")
+    ]
+
+
+def test_study_second_ctrl_c_during_failed_close_still_closes(
+    study_ready: int, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def interrupted(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    close_run = cli.research.close_run
+
+    def interrupted_close(*args: Any, **kwargs: Any) -> Any:
+        signal.raise_signal(signal.SIGINT)
+        return close_run(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "run_study", interrupted)
+    monkeypatch.setattr(cli.research, "close_run", interrupted_close)
+    run = _first_int(_open_study(study_ready, config_file), "run")
+    out = _cli("experiment", "study", "--run", str(run))
+    assert out.exit_code == 130
     assert _rows("SELECT outcome, message FROM research_results WHERE run_id = ?", run) == [
         ("failed", "KeyboardInterrupt: ")
     ]

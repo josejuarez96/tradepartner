@@ -381,6 +381,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+import signal
 import subprocess
 import sys
 from collections import defaultdict
@@ -1473,7 +1474,15 @@ def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None 
             )
     except BaseException as exc:  # any exception closes the run failed (#2440)
         message = _scrubbed(f"{type(exc).__name__}: {exc}", settings)
-        _echo_scrubbed(_close_study_failed(settings, handle, message), settings)
+        if isinstance(exc, KeyboardInterrupt):
+            previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                closed = _close_study_failed(settings, handle, message)
+            finally:
+                signal.signal(signal.SIGINT, previous_handler)
+        else:
+            closed = _close_study_failed(settings, handle, message)
+        _echo_scrubbed(closed, settings)
         _echo_scrubbed(f"  {message}", settings)
         raise typer.Exit(INTERRUPTED_EXIT if isinstance(exc, KeyboardInterrupt) else 1) from None
     kills = ", ".join(
