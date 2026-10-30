@@ -938,11 +938,12 @@ class RiskGatedBroker:
                 book.last_ok_ingest,
                 window=book.window,
             )
-            if submitted:
-                self._phase_time(notes, "sells_submitted")
             skips, counted = (*skips, *refused), counted + len(refused)
             if self._killed:
                 return BatchOutcome(_SKIPPED_KILL_SWITCH, tuple(submitted), skips)
+            # After the kill-switch return, so a clock read can't change the halt path.
+            if submitted:
+                self._phase_time(notes, "sells_submitted")
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
                 self._await_sells(run, [row for row, _ in gated.to_submit], book, notes)
         if not any(d.side == _BUY for d in decisions):
