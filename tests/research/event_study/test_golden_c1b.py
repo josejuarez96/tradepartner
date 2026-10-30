@@ -26,7 +26,7 @@ import pytest
 
 from tradepartner.calendar import all_sessions
 from tradepartner.config import Settings
-from tradepartner.research.event_study.run import match_events, summarise_study
+from tradepartner.research.event_study.run import count_study_events, match_events, summarise_study
 from tradepartner.research.experiment import hash_file, parse_experiment_file
 from tradepartner.store import research, schema
 from tradepartner.store.db import open_for_write
@@ -89,20 +89,17 @@ def _runner_rows(probe_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]
 
 
 def _reproduce(
-    rows: Sequence[Mapping[str, Any]], counts: Mapping[str, Any], design: Mapping[str, Any]
+    rows: Sequence[Mapping[str, Any]], secondary: Mapping[str, Any], design: Mapping[str, Any]
 ) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any]]:
     """The runner's own matching and summary stages (`run.match_events`,
     `run.summarise_study`, as `run_study` calls them) over traded event rows."""
     rows = [{k: v for k, v in row.items() if not k.startswith("peer_n_")} for row in rows]
     processed, derived = match_events(rows, design)
+    counts = _counts(rows, secondary, design, derived)
     return (
         processed,
         derived,
-        summarise_study(
-            processed,
-            {**counts, **{key: value for key, value in derived.items() if key in counts}},
-            design,
-        ),
+        summarise_study(processed, counts, design),
     )
 
 
@@ -137,7 +134,10 @@ def _assert_derived(
 
 
 def _counts(
-    rows: Sequence[Mapping[str, Any]], secondary: Mapping[str, Any], design: Mapping[str, Any]
+    rows: Sequence[Mapping[str, Any]],
+    secondary: Mapping[str, Any],
+    design: Mapping[str, Any],
+    derived: Mapping[str, int],
 ) -> dict[str, Any]:
     """Derive the counts the traded rows carry; pass through the recorded ones that
     need the unlabelled and dropped events (`n_events_total`, `n_no_label`,
@@ -154,25 +154,15 @@ def _counts(
             or key in {"n_events_total", "n_no_label", "n_securities"}
         )
     }
+    shared = count_study_events(rows, design, counts, derived)
+    counts.update({key: value for key, value in shared.items() if key in secondary})
     counts.update(
         {
-            key: 0
+            key: derived.get(key, 0)
             for key in secondary
-            if key.startswith(("n_traded_", "n_dropped_no_peers_", "n_dropped_small_size_group_"))
+            if key.startswith(("n_dropped_no_peers_", "n_dropped_small_size_group_"))
         }
     )
-    for group in {str(row["group"]) for row in rows}:
-        if f"n_events_{group}" in secondary:
-            counts[f"n_events_{group}"] = sum(row["group"] == group for row in rows) + sum(
-                value
-                for key, value in counts.items()
-                if key.startswith("n_dropped_") and key.endswith(f"_{group}")
-            )
-    if DELISTED_DEPARTURE in secondary:
-        # `run_study`'s rule: one per event row early at any registered horizon.
-        counts[DELISTED_DEPARTURE] = sum(
-            any(row[f"exited_early_{int(h)}"] for h in design["horizons"]) for row in rows
-        )
     return counts
 
 
@@ -251,8 +241,13 @@ def test_synthetic_stage_a_through_the_golden_path(tmp_path: Path) -> None:
         "min_peers": 1,
     }
     expected = case["expected"]
-    rows, derived, summary = _reproduce(
-        case["input"], _counts(case["input"], expected["secondary"], design), design
+    rows, derived, summary = _reproduce(case["input"], expected["secondary"], design)
+    # Frozen from the runner's secondary path before the shared-count refactor.
+    secondary_json = json.dumps(
+        summary["secondary"], sort_keys=True, separators=(",", ":"), allow_nan=True
+    )
+    assert sha256((secondary_json + "\n").encode()).hexdigest() == (
+        "5d13679f27a5ad7717c7d5ca1c663d0b7495355e60005017c6e354d5013b57f9"
     )
     for row, probe_row in zip(rows, case["expected_rows"], strict=True):
         assert row["bucket"] == probe_row["bucket"]
@@ -307,7 +302,7 @@ def test_c1b_run3_secondary_from_the_artifact_event_rows(tmp_path: Path) -> None
     expected = artifact["summary"]["secondary"]
     design = _design(tmp_path)
     input_rows = _runner_rows(artifact["events"])
-    rows, derived, summary = _reproduce(input_rows, _counts(input_rows, expected, design), design)
+    rows, derived, summary = _reproduce(input_rows, expected, design)
     for row, probe_row in zip(rows, artifact["events"], strict=True):
         assert row["bucket"] == probe_row["bucket"], row["event_id"]
     _assert_derived(derived, expected, rows, design)

@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from tradepartner.research import NoRunHandle, _issue_run_handle
-from tradepartner.research.event_study.run import entry_session, run_study
+from tradepartner.research.event_study.run import count_study_events, entry_session, run_study
 
 ET = ZoneInfo("America/New_York")
 
@@ -32,6 +32,25 @@ def instant(day: int, hour: int, minute: int = 0, *, month: int = 6) -> datetime
 def test_entry_rules(known_at: datetime, instant_entry: date, date_entry: date) -> None:
     assert entry_session(known_at, "next_open_after_instant") == instant_entry
     assert entry_session(known_at, "next_session_after_date") == date_entry
+
+
+def test_shared_counts_use_exact_groups_and_one_exit_per_event() -> None:
+    counts = count_study_events(
+        [
+            {"group": "normal", "exited_early_2": True, "exited_early_3": True},
+            {"group": "pre_normal", "exited_early_2": False, "exited_early_3": False},
+        ],
+        {"groups": ["normal", "pre_normal"], "horizons": [2, 3]},
+        {"n_dropped_horizon_pre_normal": 1},
+        {"n_traded_normal": 1, "n_traded_pre_normal": 0},
+    )
+    assert counts == {
+        "n_events_normal": 1,
+        "n_events_pre_normal": 2,
+        "n_traded_normal": 1,
+        "n_traded_pre_normal": 0,
+        "n_delisted_exits": 1,
+    }
 
 
 def test_no_handle_precedes_every_read(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -98,8 +117,9 @@ def test_configuration_overrun_precedes_read(
         run_study(handle(tmp_path), {"configurations": 3, "kill": [{}, {}, {}]}, [])
 
 
+@pytest.mark.parametrize("two_horizons", [False, True], ids=["single-horizon", "short-exit-only"])
 def test_event_stage_delisting_and_causal_matching(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, two_horizons: bool
 ) -> None:
     """Stage B on synthetic bars: entry, returns, held delisting, and causal pools."""
     import json
@@ -135,6 +155,24 @@ def test_event_stage_delisting_and_causal_matching(
         def bars(
             self, _ids: list[str], *, sessions_from: date
         ) -> tuple[pl.DataFrame, pl.DataFrame]:
+            if two_horizons:
+                short_only = pl.concat(
+                    [
+                        bars,
+                        pl.DataFrame(
+                            [
+                                {
+                                    "security_id": "ISSUER",
+                                    "session": date(2018, 6, 8),
+                                    "open": 25.0,
+                                    "close": 25.0,
+                                    "volume": 1000,
+                                }
+                            ]
+                        ),
+                    ]
+                )
+                return short_only, short_only
             if self.late:
                 changed = bars.with_columns(
                     pl.when(
@@ -223,6 +261,8 @@ def test_event_stage_delisting_and_causal_matching(
             for name in ("long", "short")
         ],
     }
+    if two_horizons:
+        design["horizons"] = [2, 3]
     events = [
         {
             "event_id": "e",
@@ -251,6 +291,9 @@ def test_event_stage_delisting_and_causal_matching(
     assert early["scheduled_exit_2"] == "2018-06-07"
     assert early["exited_early_2"] is True
     assert default.secondary["n_delisted_exits"] == 1
+    if two_horizons:
+        assert early["exited_early_3"] is False
+        return
     assert default.secondary["n_dropped_no_peers_early"] == 1
     assert artifact["meta"]["max_read_t"] == "2018-06-08T20:00:00+00:00"
     FakeReader.late = True

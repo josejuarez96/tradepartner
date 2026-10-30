@@ -33,6 +33,15 @@ from tradepartner.research.event_study.stats import net_long, net_short, overlap
 from tradepartner.research.event_study.summary import evaluate_kill, summarise
 
 ET = ZoneInfo("America/New_York")
+PRE_MATCH_DROP_REASONS = (
+    "no_entry_bar",
+    "horizon",
+    "price_floor",
+    "liquidity",
+    "no_mcap",
+    "no_beta",
+)
+MATCH_DROP_REASONS = ("small_size_group", "no_peers")
 
 
 @dataclass(frozen=True)
@@ -248,6 +257,30 @@ def match_events(
     return processed, dict(derived)
 
 
+def count_study_events(
+    event_rows: Sequence[Mapping[str, Any]],
+    design: Mapping[str, Any],
+    dropped: Mapping[str, int],
+    derived: Mapping[str, int],
+) -> dict[str, int]:
+    """Count built events, earlier drops, traded groups, and early exits (pure).
+
+    An event with several early horizons contributes one delisted exit. Earlier
+    drops count toward their exact group; matching drops are already built rows.
+    """
+    counts: dict[str, int] = {}
+    for group in design["groups"]:
+        counts[f"n_events_{group}"] = sum(row["group"] == group for row in event_rows) + sum(
+            dropped.get(f"n_dropped_{reason}_{group}", 0) for reason in PRE_MATCH_DROP_REASONS
+        )
+        counts[f"n_traded_{group}"] = derived.get(f"n_traded_{group}", 0)
+    counts["n_delisted_exits"] = sum(
+        any(row.get(f"exited_early_{int(h)}", False) for h in design["horizons"])
+        for row in event_rows
+    )
+    return counts
+
+
 def summarise_study(
     processed: Sequence[Mapping[str, Any]], counts: Mapping[str, Any], design: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -407,20 +440,10 @@ def run_study(
         "n_securities": len({row["security_id"] for row in rows}),
     }
     groups = list(design["groups"])
-    reasons = (
-        "no_entry_bar",
-        "horizon",
-        "price_floor",
-        "liquidity",
-        "no_mcap",
-        "no_beta",
-        "small_size_group",
-        "no_peers",
-    )
     for group in groups:
         counts[f"n_events_{group}"] = 0
         counts[f"n_traded_{group}"] = 0
-        for reason in reasons:
+        for reason in (*PRE_MATCH_DROP_REASONS, *MATCH_DROP_REASONS):
             counts[f"n_dropped_{reason}_{group}"] = 0
     event_rows: list[dict[str, Any]] = []
 
@@ -434,7 +457,6 @@ def run_study(
             continue
         if group not in groups:
             raise ValueError(f"unknown study group {group!r}")
-        counts[f"n_events_{group}"] += 1
         sid = str(event["security_id"])
         known_at = event["known_at"]
         entry = entry_session(known_at, str(design["entry"]))
@@ -514,7 +536,6 @@ def run_study(
             "mcap": mcap,
             "beta": beta,
         }
-        exited_early = False
         for h in design["horizons"]:
             horizon = int(h)
             exit_day = history[entry_i + horizon - 1]
@@ -526,7 +547,6 @@ def run_study(
             built[f"exited_early_{horizon}"] = early
             built[f"last_bar_{horizon}"] = last_day.isoformat()
             built[f"scheduled_exit_{horizon}"] = exit_day.isoformat()
-            exited_early |= early
             entry_open = float(adjusted[sid][entry]["open"])
             # Carry the last stock close through the scheduled horizon. The
             # benchmark continues over that same horizon, including a gap
@@ -539,13 +559,13 @@ def run_study(
             built[f"r_{horizon}"] = ret
             built[f"spy_{horizon}"] = benchmark_return
             built[f"rb_{horizon}"] = ret - beta * benchmark_return
-        if exited_early:
-            counts["n_delisted_exits"] += 1
         event_rows.append(built)
 
     processed, derived = match_events(event_rows, design)
     for key, value in derived.items():
-        counts[key] += value
+        if not key.startswith("n_traded_"):
+            counts[key] += value
+    counts.update(count_study_events(event_rows, design, counts, derived))
     summary = summarise_study(processed, counts, design)
     matching = design.get("matching", "entry_known")
     summary["exploratory"]["matching"] = matching
