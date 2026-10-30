@@ -63,6 +63,7 @@ returns rather than raises so the row survives the commit.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -1023,6 +1024,20 @@ def close_run(
     _insert_result(conn, handle.run_id, outcome, message)
 
 
+def _non_finite_as_null(value: Any) -> Any:
+    """`value` with every NaN or infinite float, at any depth of dicts, lists
+    and tuples, replaced by None: a statistic the analysis could not compute is
+    stored as JSON null, meaning "not computable" (#2610, owner 2026-10-29).
+    Only the result path uses it; parameter hashing still refuses NaN."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {key: _non_finite_as_null(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_non_finite_as_null(item) for item in value]
+    return value
+
+
 def write_result(
     conn: duckdb.DuckDBPyConnection,
     handle: RunHandle,
@@ -1089,8 +1104,8 @@ def write_result(
         n_observations=n_observations,
         n_clusters=n_clusters,
         n_configurations=n_configurations,
-        secondary_json=canonical_params_json(secondary or {}),
-        exploratory_json=canonical_params_json(exploratory or {}),
+        secondary_json=canonical_params_json(_non_finite_as_null(secondary or {})),
+        exploratory_json=canonical_params_json(_non_finite_as_null(exploratory or {})),
         verdict=verdict,
         artifact_sha256=artifact_sha256,
         artifact_path=artifact_path,
