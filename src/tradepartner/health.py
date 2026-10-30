@@ -112,18 +112,6 @@ here is this module's and is stated once:
   reported, not thresholded. `clock_suspect` is the clock detector's rule
   (a health finding, never a repair): a stamp that fits only a moved clock.
 
-- **SEC ownership forms** (`sec_filing_events`, `sec_form4_transactions`,
-  #2571, T307c): `edgar.sec_forms_enabled`'s state; four integrity rules per
-  table run over every stored row, whatever its `known_at`:
-  `*_known_at_is_accepted_at` (the row's `known_at` equals its `accepted_at`),
-  `*_timestamps_aware` (both timestamp columns are `TIMESTAMPTZ`, not naive
-  `TIMESTAMP`), `*_unique` (no duplicate identity keys), and
-  `*_identity_not_null` (every identity column is non-null). The identity
-  columns are (`accession`, `subject_cik`, `filer_cik`) for
-  `sec_filing_events` and (`accession`, `filer_cik`, `line_no`) for
-  `sec_form4_transactions`. Violation frames include the full identity.
-  A store without either table passes all four rules for that table.
-
 - **Rates** (`rates`, #1498, T169e): per configured or stored series, the
   stored row count, latest observation, vintage and stamp, revised-key count,
   the longest missing XNYS-session span between observations, and the last
@@ -212,6 +200,16 @@ derived at `t`, as the data is read.
   `provenance_allowed` (the table's own set, `schema.TABLE_PROVENANCE_VALUES`)
   on every fact table. The schema's constraints already block these; the rules
   make a store written by other code, or a changed schema, show it.
+- The SEC ownership form rules (#2571, T307c), four per table on
+  `sec_filing_events` and `sec_form4_transactions`, over every stored row
+  whatever its `known_at`, and whether or not `events.sec_forms_enabled`
+  collects: `*_known_at_is_accepted_at` (`known_at` equals `accepted_at`),
+  `*_timestamps_aware` (both timestamp columns are `TIMESTAMPTZ`),
+  `*_unique` (no duplicate identity) and `*_identity_not_null`. The identity
+  is (`accession`, `subject_cik`, `filer_cik`) for `sec_filing_events` and
+  (`accession`, `filer_cik`, `line_no`) for `sec_form4_transactions`; the
+  `*_known_at_is_accepted_at` and `*_unique` frames carry it in full. A store
+  without a table passes that table's four rules.
 - `bars_on_sessions`: every `prices_daily.session` is an XNYS session in the
   configured calendar range.
 - `no_duplicate_bars`: no two bars share `(security_id, session, known_at)`.
