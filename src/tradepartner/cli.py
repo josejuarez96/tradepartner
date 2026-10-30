@@ -5284,6 +5284,7 @@ def make_app(
                     ops.OwnerQueue,
                     tuple[ops.OverdueDelisting, ...],
                     ops.EdgarAge | None,
+                    datetime,
                 ]
                 | str
             ):
@@ -5297,6 +5298,7 @@ def make_app(
                             queue,
                             ops.overdue_delisting_cash(conn),
                             ops.edgar_age(conn, s, now),
+                            now,
                         )
                     except schema.SchemaVersionError as exc:
                         return str(exc)
@@ -5305,9 +5307,8 @@ def make_app(
             if isinstance(result, str):  # the journal predates version 17
                 _echo_scrubbed(f"paper status: {result}", s)
                 raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
-            summaries, queue, overdue, edgar = result
+            summaries, queue, overdue, edgar, now = result
             items = queue.items
-            now = ensure_tz_aware_utc(clock(), field_name="clock()")
             overdue_lines = _overdue_delisting_lines(overdue)
             edgar_lines = _edgar_age_lines(edgar)
             # the open span's progress (#2298): not a problem, so not an item

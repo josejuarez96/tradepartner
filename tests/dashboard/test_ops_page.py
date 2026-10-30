@@ -507,10 +507,9 @@ def test_stale_chip_survives_a_session_boundary(
 ) -> None:
     """Regression for #1263: a shard that imports before a session boundary and
     renders after it must not paint `stale` for the fixture's finished run.
-    Simulates the ambient clock one session past S-1; a page that reads that
-    clock (instead of the fixture's own frozen instant) then requires a later
-    session the fixture has no run for."""
-    monkeypatch.setattr("tradepartner.store.db.utc_now", lambda: _AFTER_BOUNDARY)
+    The page reads its one clock (`_app` pins it) and hands it to `ops`, which
+    has no wall clock of its own to read past S-1 (#2655)."""
+    assert not hasattr(ops, "utc_now")
     at = _app(monkeypatch, seeded_store)
     assert not at.exception
     assert "stale" not in _text(at).lower()
