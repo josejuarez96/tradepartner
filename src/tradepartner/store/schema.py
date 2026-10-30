@@ -585,13 +585,15 @@ registry; #83 took version 2 first, so the registry is version 3):
 - **Version 41** (#2617; research-registry spec req 8 as amended
   2026-10-30): `research_results.verdict` gains `not_computable`, appended
   last, the verdict of an `ok` result whose primary statistic or interval
-  bound is NaN or infinite (no evidence, never a `fail`). The set only grows,
-  so no stored row falls outside it; DuckDB cannot change a `CHECK` in place,
-  so `_migrate_not_computable` rebuilds `research_results` through a staging
-  table where its verdict `CHECK` lacks the value, every row kept in insertion
-  order and byte-identical but one value: a `fail` whose stored primary value
-  or bound is NaN or infinite is copied as `not_computable` (#2658, from the
-  stored values only, the count and run ids logged). A read-only connection
+  bound is NaN or infinite (no evidence, never a `fail`), and
+  `research_decisions.kind` gains `verdict_relabel`. The sets only grow, so no
+  stored row falls outside them; DuckDB cannot change a `CHECK` in place, so
+  `_migrate_not_computable` rebuilds both tables through staging tables where
+  a `CHECK` lacks its value, every row kept in insertion order and
+  byte-identical. Then every stored verdict whose result's primary value or
+  bound is NaN or infinite is set to `not_computable` (#2658, #2660: from the
+  stored values only), each relabel appended as a `verdict_relabel` decision
+  and the count and run ids logged. A read-only connection
   accepts a version-40 store: every read works (no `not_computable` row can
   exist there), and the next writable `init_schema` call migrates it.
 - **A later DDL change goes to version 42**, with its own migration and a
@@ -663,6 +665,7 @@ they shape this DDL):
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -908,9 +911,11 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 40 (#2539, T306): additive `sec_filing_events` and
 #:   `sec_form4_transactions` tables, read behind
 #:   `events.sec_forms_read_enabled`.
-#: - 41 (#2617): `research_results.verdict` gains `not_computable`; the table
-#:   is rebuilt (`_migrate_not_computable`), every row kept, a non-finite
-#:   `fail` relabelled `not_computable` (#2658).
+#: - 41 (#2617): `research_results.verdict` gains `not_computable` and
+#:   `research_decisions.kind` `verdict_relabel`; both tables are rebuilt
+#:   (`_migrate_not_computable`), every row kept, and every verdict on a
+#:   non-finite stored primary relabelled `not_computable`, each with a
+#:   `verdict_relabel` decision (#2658, #2660).
 #: - A later DDL change goes to version 42, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
 CURRENT_SCHEMA_VERSION = 41
@@ -1094,9 +1099,10 @@ _PRE_ASSETS_INTERSECTION_VERSION = 37
 # Version 39 belongs to T254; T306's additive ownership tables are version 40.
 _PRE_SEC_FORMS_VERSION = 39
 
-#: The last version without the `not_computable` research verdict (#2617,
-#: version 41): read-only connections serve every read, since no read depends
-#: on the verdict `CHECK` and no such row can exist there.
+#: The last version without the `not_computable` research verdict and the
+#: `verdict_relabel` decision kind (#2617, version 41): read-only connections
+#: serve every read, since no read depends on either `CHECK` and no such row
+#: can exist there.
 _PRE_NOT_COMPUTABLE_VERSION = 40
 
 
@@ -2970,7 +2976,8 @@ RESEARCH_VERDICTS: tuple[str, ...] = ("pass", "fail", "underpowered", "n/a", "no
 
 #: `research_decisions.kind` (req 2's `budget_amend`, req 5's `holdout_spend`;
 #: the earlier draft's `import` was dropped with req 12, #810).
-RESEARCH_DECISION_KINDS: tuple[str, ...] = ("holdout_spend", "budget_amend")
+#: `verdict_relabel` (version 41, #2660) is written only by `_migrate_not_computable`.
+RESEARCH_DECISION_KINDS: tuple[str, ...] = ("holdout_spend", "budget_amend", "verdict_relabel")
 
 #: Every enumerated research column and its allowed values, one `CHECK` each
 #: (`stage`, an integer, has its own `CHECK` over `RESEARCH_STAGES`).
@@ -4280,53 +4287,100 @@ def _migrate_breaks(conn: duckdb.DuckDBPyConnection) -> None:
     forget_column_types(conn)
 
 
+#: `made_by` on the `verdict_relabel` decisions the version-41 migration writes.
+NOT_COMPUTABLE_RELABEL_BY: Final = "schema-41 migration"
+
+
+def _rebuild_research_table(conn: duckdb.DuckDBPyConnection, table: str, create: str) -> None:
+    """Rebuild research `table` from its current DDL `create` through a staging
+    table, every row kept in insertion order and byte-identical."""
+    staging = f"{table}_v41"
+    conn.execute(
+        create.replace(f"CREATE TABLE IF NOT EXISTS {table} (", f"CREATE TABLE {staging} (", 1)
+    )
+    conn.execute(f"INSERT INTO {staging} BY NAME SELECT * FROM {table} ORDER BY rowid")
+    conn.execute(f"DROP TABLE {table}")
+    conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+
+
 def _migrate_not_computable(conn: duckdb.DuckDBPyConnection) -> None:
-    """Version 41 (module docstring, "Schema versions"; #2617): rebuild
-    `research_results` with `not_computable` in its verdict `CHECK`, only where
-    the `CHECK` lacks it (the DDL pass creates the table at its current shape on
-    a store that had none), every row kept in insertion order. The set only
-    grows, so no stored verdict can fall outside it. Runs inside
+    """Version 41 (module docstring, "Schema versions"; #2617): widen
+    `research_results.verdict` with `not_computable` and
+    `research_decisions.kind` with `verdict_relabel`, each table rebuilt only
+    where its `CHECK` lacks the value (the DDL pass creates both at their
+    current shape on a store that had none), every row kept in insertion order.
+    The sets only grow, so no stored value can fall outside them. Runs inside
     `init_schema`'s transaction, after the DDL pass.
 
-    The one value that moves (#2658, owner 2026-10-30): a `fail` whose stored
+    Then the one relabel (#2658, #2660, owner 2026-10-30), only when the verdict
+    `CHECK` was widened here: every result with a verdict whose stored
     `primary_value`, `primary_ci_low` or `primary_ci_high` is NaN or infinite
-    (how `write_result` stored them; NULL is not non-finite) is copied as
+    (how `write_result` stored them; NULL is not non-finite) gets
     `not_computable`, the verdict `compute_verdict` now gives it. Derived from
-    the stored values only, nothing is recomputed; every other verdict, a
-    finite `fail` included, is copied as it was. The count and the relabelled
-    run ids are logged."""
+    the stored values only, nothing is recomputed, and no other column moves.
+    Each relabel appends a `verdict_relabel` decision (the run, its
+    registration, the old and new verdicts and the schema version in
+    `values_json`, made by `NOT_COMPUTABLE_RELABEL_BY`, at the clock), and the
+    count and run ids are logged."""
+    if "'verdict_relabel'" not in _check_text(conn, "research_decisions", "kind"):
+        _rebuild_research_table(conn, "research_decisions", _CREATE_RESEARCH_DECISIONS)
     if "'not_computable'" in _check_text(conn, "research_results", "verdict"):
+        forget_column_types(conn)
         return
     non_finite = " OR ".join(
-        f"NOT isfinite({column})"
+        f"NOT isfinite(x.{column})"
         for column in ("primary_value", "primary_ci_low", "primary_ci_high")
     )
-    relabel = f"verdict = 'fail' AND ({non_finite})"
     relabelled = [
-        int(run_id)
-        for (run_id,) in conn.execute(
-            f"SELECT run_id FROM research_results WHERE {relabel} ORDER BY run_id"
+        (int(run_id), None if registration_id is None else int(registration_id), str(verdict))
+        for run_id, registration_id, verdict in conn.execute(
+            "SELECT x.run_id, r.registration_id, x.verdict FROM research_results x "
+            "LEFT JOIN research_runs r ON r.run_id = x.run_id "
+            f"WHERE x.verdict IS NOT NULL AND ({non_finite}) ORDER BY x.run_id"
         ).fetchall()
     ]
-    staging = "research_results_v41"
+    _rebuild_research_table(conn, "research_results", _CREATE_RESEARCH_RESULTS)
+    if not relabelled:
+        forget_column_types(conn)
+        return
     conn.execute(
-        _CREATE_RESEARCH_RESULTS.replace(
-            "CREATE TABLE IF NOT EXISTS research_results (", f"CREATE TABLE {staging} (", 1
+        "UPDATE research_results SET verdict = 'not_computable' WHERE run_id IN "
+        f"({', '.join('?' for _ in relabelled)})",
+        [run_id for run_id, _, _ in relabelled],
+    )
+    last = conn.execute("SELECT COALESCE(MAX(decision_id), 0) FROM research_decisions").fetchone()
+    next_id = 1 + (0 if last is None else int(last[0]))
+    at = utc_now()
+    for offset, (run_id, registration_id, verdict) in enumerate(relabelled):
+        values = json.dumps(
+            {
+                "new_verdict": "not_computable",
+                "old_verdict": verdict,
+                "schema_version": _PRE_NOT_COMPUTABLE_VERSION + 1,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
         )
-    )
-    conn.execute(
-        f"INSERT INTO {staging} BY NAME SELECT * REPLACE (CASE WHEN {relabel} "
-        "THEN 'not_computable' ELSE verdict END AS verdict) FROM research_results ORDER BY rowid"
-    )
-    conn.execute("DROP TABLE research_results")
-    conn.execute(f"ALTER TABLE {staging} RENAME TO research_results")
+        conn.execute(
+            "INSERT INTO research_decisions (decision_id, kind, registration_id, run_id, "
+            "values_json, reason, made_by, known_at) "
+            "VALUES (?, 'verdict_relabel', ?, ?, ?, ?, ?, ?)",
+            [
+                next_id + offset,
+                registration_id,
+                run_id,
+                values,
+                "non-finite primary statistic or interval bound (#2617, #2658, #2660)",
+                NOT_COMPUTABLE_RELABEL_BY,
+                at,
+            ],
+        )
     forget_column_types(conn)
-    if relabelled:
-        _log.warning(
-            "schema 41: relabelled %d research result(s) fail -> not_computable: %s",
-            len(relabelled),
-            relabelled,
-        )
+    _log.warning(
+        "schema 41: relabelled %d research result(s) to not_computable: %s",
+        len(relabelled),
+        [(run_id, verdict) for run_id, _, verdict in relabelled],
+    )
 
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
@@ -4345,9 +4399,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     fresh store gets every table and one `schema_version` row for
     `CURRENT_SCHEMA_VERSION` and no lab table; a version-40 or earlier store
     gets `research_results` rebuilt with `not_computable` in its verdict
-    `CHECK` where it lacks it, every row kept in insertion order (a `fail`
-    with a non-finite stored primary relabelled `not_computable`, #2658), and a
-    version-41 row (#2617); every store gets
+    `CHECK` and `research_decisions` with `verdict_relabel` in its kind
+    `CHECK` where they lack them, every row kept in insertion order, every
+    verdict on a non-finite stored primary relabelled `not_computable` with a
+    `verdict_relabel` decision (#2658, #2660), and a version-41 row (#2617);
+    every store gets
     `trial_rebalances` and `paper_plans` each with `n_assets_intersected` and
     `assets_intersection_skipped` added (NULL on every existing row; a
     version-37 store gets a version-38 row; plan T241); every store gets
