@@ -895,7 +895,7 @@ Definitions gains an exception: `filing_index` has no revisions (an accession is
 The state lives in three non-fact tables, each like `master_underived` and never read by a trial:
 - `filing_index_pending(cik, accession, form, company_name, filed_on)`: rows whose stamp is not yet known. They are retried each run as today and leave the table once stamped or settled unstampable (still reported on `.unstamped_filings`).
 - `edgar_filers(cik, first_quarter, last_quarter)`: every CIK any index file names.
-- `edgar_index_files(path, sha256, run_id)`: **the cursor**. It holds every daily file read, by name and hash, not a date high-water mark.
+- `edgar_index_files(path, last_modified, size, sha256, run_id)`: **the cursor**. It holds every daily file read, with the listing's last-modified and size and the hash of the bytes read, not a date high-water mark.
 
 Each run's counts, files read, rule fingerprint and peak RSS (`getrusage`) go on an `ingestion_runs` row with `source = 'edgar_index'`, as #2572 records a bulk quarter. `registry.data_vintage` leaves all four tables out; its explicit list is unchanged. This needs a schema bump: the next free version when the build merges.
 
@@ -911,8 +911,8 @@ Each run's counts, files read, rule fingerprint and peak RSS (`getrusage`) go on
    - the limiter, timeouts and paths, and the new keys;
    - the per-name lists (`master.chains`, `chains_dismissed`, `keep_successors`, `edgar.class_member_overrides`, `edgar.filename_listings_refused`). An edit to one touches the CIKs it adds or removes, diffed against the value stored on the last run row.
 
-   If the fingerprint differs from the last `ok` run's, the source fails before any fetch and names `--rebuild-index`. Prices still run (#2180).
-3. **New daily files.** The run lists each quarter directory (`https://www.sec.gov/Archives/edgar/daily-index/<yyyy>/QTR<n>/`, its JSON index) whose quarter is not settled. It reads every listed `form.<yyyymmdd>.idx` whose name and hash are not in `edgar_index_files`, through the edgar_raw limiter and with the existing parser. The listing decides which files exist, so no date is ever guessed: EDGAR's holidays are not XNYS's. A re-posted file has a new hash and is read again. The row key makes that idempotent.
+   If the fingerprint differs from the last `ok` run's, or no seed has finished, the source fails before any fetch and names `--rebuild-index`. Prices still run (#2180).
+3. **New daily files.** The run lists each quarter directory (`https://www.sec.gov/Archives/edgar/daily-index/<yyyy>/QTR<n>/`, its JSON index) whose quarter is not settled. It reads every listed `form.<yyyymmdd>.idx` that is not in `edgar_index_files`, or whose listed last-modified or size differs from the stored ones (a re-post), through the edgar_raw limiter and with the existing parser. The listing decides which files exist, so no date is ever guessed: EDGAR's holidays are not XNYS's. Only those files are downloaded and hashed, and the row key makes a re-read idempotent.
 4. **Issuers, as today.** A CIK is an issuer when it has an issuer-form row, or is the subject of a 25 or 25-NSE. The 25-NSE pairing (the exchange copy dropped from the issuer rows) uses the accession's rows across the table and the new rows, not one file. `edgar_filers` is updated. A CIK that becomes an issuer tonight with earlier quarters in `edgar_filers` gets those rows from its span, one quarter at a time. They come from the cached settled files, plus each closed but unsettled quarter and the open quarter, which are fetched as `_index_text` fetches them today. One walk serves every such CIK of the night.
 5. **Stamps.** New and pending rows are stamped by today's `_stamp` path. The **table is the one stamp source** for every build, including `cover_pages`, `facts` and statement facts. If a stamps-cache record differs from a stored row, that CIK is not rebuilt and nothing is written for the accession. It is counted `index_stamp_changed`, and `health` warns. A changed stamp is an owner repair release (#2435's rule).
 6. **Touched CIKs.** These CIKs are touched. Only they are rebuilt, and the writers diff against the store as today.
@@ -949,7 +949,7 @@ Each run's counts, files read, rule fingerprint and peak RSS (`getrusage`) go on
 
 *Full rebuild and seed.* `tradepartner ingest --source edgar --rebuild-index` is today's full-history path:
 - It walks every quarter, stamps, inserts missing `filing_index` rows (never deleting one), rebuilds every CIK and records the fingerprint.
-- It commits one quarter per chunk and resumes from the last committed quarter (req 9).
+- It commits one quarter per chunk and resumes from the last committed quarter (req 9). It writes the `ok` `edgar_index` row with the fingerprint only after its last chunk, so a seed that stops halfway leaves the nightly gate closed.
 - After it, the next nightly reads every listed daily file of the unsettled quarters once, which is idempotent.
 
 It seeds the table once (an owner step with a backup, outside the 08:05 and 18:30 jobs, runbook rule 5) and otherwise runs only after a fingerprint change or a repair. `--backfill` and `--dry-run` read the table as a session run does. A dry run writes nothing, `edgar_index_files` included. Req 3's guarantee holds: the master reads the full history whatever `--since` says, now from the table.
@@ -957,7 +957,8 @@ It seeds the table once (an owner step with a backup, outside the 08:05 and 18:3
 *Point in time.* `known_at` is still the SEC acceptance, never `filed_on`, a file date or a run time. No as-of read, backtest, universe or signal reads the new tables, and a boundary test pins that. Every stored row keeps its source and provenance, and its run row names the files it came from by hash.
 
 *Targets.* Measured after the seed, on 5 consecutive scheduled runs, from the `edgar_index` run row:
-- The EDGAR source takes at most 20 min on a weekday (it took 97 to 115 min).
+- The EDGAR source takes at most 20 min on an ordinary weekday (it took 97 to 115 min).
+- A night when a quarter settles (about four a year) or the FSN lag window moves (about monthly) touches many more CIKs. It is reported on its run row and bounded at 60 min (open question 7).
 - Peak RSS is at most 1.5 GB (about 4.1 GB after #2622) and does not grow with history.
 - No request goes to a settled quarter's `form.idx` other than the conditional GETs.
 
@@ -997,10 +998,10 @@ It seeds the table once (an owner step with a backup, outside the 08:05 and 18:3
 1. **Table or files.** Recommended: the store table, for the reasons above. The cost is a schema bump and an estimated 0.5 to 1 GB of store (task (a) measures it).
 2. **ADR 0023 schema freeze and timing.** Recommended: allow it, since it is ingest-internal and additive and no trial reads it (like #2535). Migrate in its own owner step after the 2026-10-31 T306 sitting, never together with it.
 3. **No validator on the quarterly files.** Recommended: re-fetch and reconcile the last 8 settled quarters each Saturday. Older quarters wait for `--rebuild-index`.
-4. **If daily and quarterly files order an accession's rows differently** (probe (a)). Recommended: replace "first row" with an order-free rule (the filer's row, from the accession prefix, else the lowest CIK). Apply it by a `BUILD_RULES_VERSION` bump and one rebuild, and do it before the 13D backfill so no stored 13D row moves.
+4. **If daily and quarterly files order an accession's rows differently** (probe (a)). Recommended: replace "first row" with an order-free rule (the filer's row, from the accession prefix, else the lowest CIK). Apply it by a `BUILD_RULES_VERSION` bump and one rebuild. This does not hold the 2026-10-31 13D backfill. Rows that backfill stores keep their acceptance, which is the same whichever CIK a row is stamped through, and #2435's differing-re-read rule counts any row the new rule would change rather than updating it.
 5. **Fingerprint mismatch: fail or rebuild unasked.** Recommended: fail and name the flag. A rule change is a release with a backup, and an unplanned 2-hour rebuild in the 18:30 job could reach the 08:05 paper run.
 6. **The checks against drift: a 28-day rotation and a monthly full dry run on a copy.** Recommended: yes. Shorten the rotation if a night's share runs over 2 min.
-7. **The targets, 20 min and 1.5 GB.** Recommended: yes, as the pass mark for the 5-run evidence.
+7. **The targets: 20 min and 1.5 GB, and 60 min on a settle or FSN night.** Recommended: yes. The 5-run evidence is the pass mark for the first two. The 60-minute bound is checked on the first settle night after the key is turned on.
 8. **#2623 (columnar index).** Recommended: close it as superseded once (d4) merges.
 
 ## Risks & domain checks
