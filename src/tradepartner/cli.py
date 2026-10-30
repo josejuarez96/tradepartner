@@ -175,7 +175,17 @@ Research registry (research-registry spec req 11 and req 14; plan T83):
   run's result. `--spend-holdout` without a non-blank reason, a reason without
   its flag, `--holdout-repeat` without `--spend-holdout`, `--configurations`
   under 1 and a config that is not a JSON object are refused before anything is
-  written, as are an unknown slug or dataset.
+  written, as are an unknown slug or dataset. A registration with a `[study]`
+  table takes `--configurations` from its `study.configurations` and refuses a
+  different value (amendment 2026-10-28 #2440); any other defaults to 1.
+- `tradepartner experiment study --run <id>` runs the event-study runner on an
+  unfinished run (`attach_run`, `research.load_dataset`, `run_study`,
+  `write_result`) and prints its primary, kill lines and artifact through the
+  `cli_record` scrub. A run with a result row, a registration without
+  `[study]`, a run under a superseded registration and a handle from another
+  store are refused (exit 2) with nothing written; any exception after that
+  closes the run `failed` with its scrubbed message (exit 1, as does a
+  `failed` result).
 - `tradepartner experiment abandon --run <id> --reason` appends the run's
   `abandoned` result.
 - `tradepartner experiments [--registration] [--family] [--kind]
@@ -378,7 +388,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import UTC, date, datetime
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Annotated, Any, NoReturn
 from zoneinfo import ZoneInfo
 
@@ -482,7 +492,14 @@ from tradepartner.repair import (
     retract_dividends,
     store_resolver,
 )
-from tradepartner.research import EVERY_ROW_SPLITS, DatasetChanged, datafiles
+from tradepartner.research import (
+    EVERY_ROW_SPLITS,
+    DatasetChanged,
+    RunHandle,
+    datafiles,
+    load_dataset,
+)
+from tradepartner.research.event_study.run import run_study
 from tradepartner.research.experiment import (
     SPLITS,
     ExperimentFileError,
@@ -1345,6 +1362,127 @@ def _sealed_periods(extra: Sequence[str]) -> list[tuple[date, date]]:
             raise _fail(f"--sealed-period end {end} is before its start {start}", USAGE_ERROR)
         periods.append((start, end))
     return periods
+
+
+def _study_table(record: research.RegistrationRecord) -> dict[str, Any] | None:
+    """The registration's frozen `[study]` table, from its hashed `params_json`."""
+    study = json.loads(record.params_json).get("study")
+    return study if isinstance(study, dict) else None
+
+
+def _declared_configurations(record: research.RegistrationRecord, given: int | None) -> int:
+    """`experiment open`'s configurations: a `[study]` registration's
+    `study.configurations`, refusing a different value (#2440); else `given` or 1."""
+    study = _study_table(record)
+    if study is None:
+        return 1 if given is None else given
+    declared = int(study["configurations"])
+    if given is not None and given != declared:
+        raise ValueError(
+            f"--configurations {given} differs from {record.slug}'s study.configurations "
+            f"{declared}; the file declares the run's configurations"
+        )
+    return declared
+
+
+def _close_study_failed(settings: Settings, handle: RunHandle, message: str) -> str:
+    """Close `handle`'s run `failed` with `message`; returns the line saying what happened."""
+    try:
+        with open_for_write(settings) as conn:
+            research.close_run(conn, handle, "failed", message)
+    except research.RunAlreadyClosed:
+        return f"run {handle.run_id}: already has its result row"
+    except Exception as exc:  # the run stays unfinished: say so, never hide it
+        return (
+            f"run {handle.run_id}: could not be closed ({type(exc).__name__}: {exc}); it is "
+            "unfinished, close it with `experiment abandon`"
+        )
+    return f"run {handle.run_id}: failed ({handle.slug})"
+
+
+def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None = None) -> None:
+    """`experiment study --run <id>` (amendment 2026-10-28 #2440, plan T304).
+
+    Refusals (exit 2) write nothing; after them any exception closes the run
+    `failed` with its scrubbed message (exit 1). `real` is the settings whose
+    store is the real one for `attach_run`'s synthetic rule. The command passes
+    none, so its configured store is the real store and only a non-synthetic
+    run attaches; a test passes the original's settings to study a synthetic
+    run on a temp-file copy, which every count excludes.
+    """
+    if (missing := _store_missing(settings)) is not None:
+        raise missing
+    try:
+        with open_for_write(settings) as conn:
+            schema.init_schema(conn)
+            handle = research.attach_run(conn, run_id, settings=real or settings)
+            record = research.get_registration(conn, handle.slug)
+    except StoreLockedError as exc:
+        raise _fail(f"store busy: {exc}", 1) from None
+    except _RESEARCH_REFUSALS as exc:
+        raise _refusal(exc, settings) from None
+    if handle.database != str(Path(settings.store.path).resolve()):
+        raise _refusal(ValueError(f"run {run_id} was opened on another store"), settings)
+    if record.registration_id != handle.registration_id:
+        raise _refusal(
+            ValueError(
+                f"run {run_id} is under registration {handle.registration_id}, superseded by "
+                f"{record.registration_id}; abandon it"
+            ),
+            settings,
+        )
+    design = _study_table(record)
+    if design is None:
+        raise _refusal(ValueError(f"run {run_id}: {record.slug} has no [study] table"), settings)
+    study = SimpleNamespace(
+        slug=record.slug,
+        study=design,
+        window_start=record.window_start,
+        window_end=record.window_end,
+    )
+    try:
+        result = run_study(handle, study, load_dataset(handle), settings=settings)
+        primary = result.primary
+        with open_for_write(settings) as conn:
+            outcome = research.write_result(
+                conn,
+                handle,
+                primary_value=float(primary["value"]),
+                primary_ci_low=float(primary["ci_low"]),
+                primary_ci_high=float(primary["ci_high"]),
+                n_observations=int(primary["n"]),
+                n_clusters=int(primary["n_clusters"]),
+                n_configurations=int(design["configurations"]),
+                artifact_sha256=result.artifact_sha256,
+                artifact_path=str(result.artifact_path),
+                secondary=result.secondary,
+                exploratory=result.exploratory,
+            )
+    except BaseException as exc:  # any exception closes the run failed (#2440)
+        message = _scrubbed(f"{type(exc).__name__}: {exc}", settings)
+        _echo_scrubbed(_close_study_failed(settings, handle, message), settings)
+        _echo_scrubbed(f"  {message}", settings)
+        raise typer.Exit(INTERRUPTED_EXIT if isinstance(exc, KeyboardInterrupt) else 1) from None
+    kills = ", ".join(
+        f"{name} {'killed' if line['killed'] else 'holds'}"
+        for name, line in result.summary["kill"].items()
+    )
+    _echo_scrubbed(
+        "\n".join(
+            (
+                f"run {run_id}: {outcome} ({handle.slug}, {design['configurations']} "
+                "configurations)",
+                f"  primary {_fmt(primary['value'])} bp [{_fmt(primary['ci_low'])}, "
+                f"{_fmt(primary['ci_high'])}] over {primary['n']} events, "
+                f"{primary['n_clusters']} clusters",
+                f"  kill lines: {kills or 'none'}",
+                f"  artifact {result.artifact_path} sha256 {result.artifact_sha256}",
+            )
+        ),
+        settings,
+    )
+    if outcome != "ok":
+        raise typer.Exit(1)
 
 
 def _flag_names(run: research.RunSummary) -> str:
@@ -3822,8 +3960,12 @@ def make_app(
         split: Annotated[str, typer.Option(help="the split to bind")],
         config: Annotated[Path, typer.Option(help="the run's config, a JSON object file")],
         configurations: Annotated[
-            int, typer.Option(help="configurations this run will evaluate")
-        ] = 1,
+            int | None,
+            typer.Option(
+                help="configurations this run will evaluate (default: the file's "
+                "study.configurations, else 1)"
+            ),
+        ] = None,
         spend_holdout: Annotated[
             bool, typer.Option(help="open a run touching a protected window (needs a reason)")
         ] = False,
@@ -3840,13 +3982,16 @@ def make_app(
             raise _fail("--holdout-reason goes with --spend-holdout", USAGE_ERROR)
         if holdout_repeat and not spend_holdout:
             raise _fail("--holdout-repeat goes with --spend-holdout", USAGE_ERROR)
-        if configurations < 1:
+        if configurations is not None and configurations < 1:
             raise _fail("--configurations must be at least 1", USAGE_ERROR)
         s = settings()
         run_config = _read_config(config, s)
         try:
             with open_for_write(s) as conn:
                 schema.init_schema(conn)
+                declared = _declared_configurations(
+                    research.get_registration(conn, slug), configurations
+                )
                 handle = research.open_run(
                     conn,
                     slug,
@@ -3857,7 +4002,7 @@ def make_app(
                     note,
                     flags=ResearchFlags(spend_holdout=spend_holdout, holdout_repeat=holdout_repeat),
                     reasons=ResearchReasons(holdout_reason=holdout_reason),
-                    configurations=configurations,
+                    configurations=declared,
                     settings=s,
                 )
                 listed = research.list_runs(conn, registration=handle.slug)
@@ -3900,6 +4045,13 @@ def make_app(
         except _RESEARCH_REFUSALS as exc:
             raise _refusal(exc, s) from None
         typer.echo(f"run {run}: abandoned ({handle.slug})")
+
+    @experiment_app.command("study")
+    def experiment_study(
+        run: Annotated[int, typer.Option(help="the unfinished run to study")],
+    ) -> None:
+        """Run the event-study runner on an open run and record its result."""
+        _experiment_study(settings(), run)
 
     @app.command()
     def experiments(
