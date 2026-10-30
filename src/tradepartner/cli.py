@@ -517,6 +517,7 @@ from tradepartner.research.experiment import (
 )
 from tradepartner.research.gates import Flags as ResearchFlags
 from tradepartner.research.gates import Reasons as ResearchReasons
+from tradepartner.research.interrupt_guard import run_with_sigint_ignored
 from tradepartner.research.labeling import frame as labeling_frame
 from tradepartner.research.labeling import gold, job, review, scoring
 from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET, REVERSED_OPTION_SET
@@ -1488,7 +1489,11 @@ def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None 
     except BaseException as exc:  # any exception closes the run failed (#2440)
         message = _study_scrubbed(f"{type(exc).__name__}: {exc}", settings)
         _echo_scrubbed(
-            _study_scrubbed(_close_study_failed(settings, handle, message), settings), settings
+            _study_scrubbed(
+                run_with_sigint_ignored(lambda: _close_study_failed(settings, handle, message)),
+                settings,
+            ),
+            settings,
         )
         _echo_scrubbed(f"  {message}", settings)
         raise typer.Exit(INTERRUPTED_EXIT if isinstance(exc, KeyboardInterrupt) else 1) from None

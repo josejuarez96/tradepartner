@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import signal
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -1185,6 +1186,28 @@ def test_study_closes_the_run_failed_on_ctrl_c_and_exits_130(
     run = _first_int(_open_study(study_ready, config_file), "run")
     out = _cli("experiment", "study", "--run", str(run))
     assert out.exit_code == cli.INTERRUPTED_EXIT == 130
+    assert _rows("SELECT outcome, message FROM research_results WHERE run_id = ?", run) == [
+        ("failed", "KeyboardInterrupt: ")
+    ]
+
+
+def test_study_second_ctrl_c_during_close_still_records_failed(
+    study_ready: int, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def interrupted(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    close_run = research.close_run
+
+    def close_after_second_interrupt(*args: Any, **kwargs: Any) -> None:
+        signal.raise_signal(signal.SIGINT)
+        close_run(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "run_study", interrupted)
+    monkeypatch.setattr(research, "close_run", close_after_second_interrupt)
+    run = _first_int(_open_study(study_ready, config_file), "run")
+    out = _cli("experiment", "study", "--run", str(run))
+    assert out.exit_code == 130
     assert _rows("SELECT outcome, message FROM research_results WHERE run_id = ?", run) == [
         ("failed", "KeyboardInterrupt: ")
     ]
