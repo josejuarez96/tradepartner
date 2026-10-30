@@ -83,12 +83,18 @@ def _validators(headers: httpx.Headers) -> dict[str, str]:
 
 
 def load_bulk_quarters(
-    quarters: Iterable[Quarter], *, settings: Settings, client: httpx.Client
+    quarters: Iterable[Quarter],
+    *,
+    settings: Settings,
+    client: httpx.Client,
+    revalidate: bool = True,
 ) -> tuple[dict[Quarter, InsiderBulk | None], dict[Quarter, str], Counter[str], frozenset[Quarter]]:
     """Download or validate each quarter's zip through edgar_raw's shared limiter.
 
     The validator sidecar controls cache reuse. A malformed zip fails closed for its
     quarter, and the order-check key changes when its bytes or a parser changes.
+    `revalidate=False` reads a cached zip with no request: the backfill's second read
+    of a quarter it validated earlier in the same run (#2624).
     """
     base = Path(settings.edgar.cache_dir) / "insider"
     result: dict[Quarter, InsiderBulk | None] = {}
@@ -108,8 +114,8 @@ def load_bulk_quarters(
                 saved = loaded
         except (OSError, ValueError):
             pass
-        use_cache = False
-        if path.exists() and saved:
+        use_cache = not revalidate and path.exists()
+        if not use_cache and path.exists() and saved:
             headers = edgar_raw.insider_bulk_validators(label, settings=settings, client=client)
             if headers is None:
                 result[quarter] = None
@@ -191,9 +197,11 @@ def run_form4_bulk_route(
     """
     if budget <= 0:
         raise ValueError("budget must be positive")
+    # Issuer by issuer within each quarter, so the stamp seam reads each
+    # issuer's stamps file once per quarter, not once per accession (#2632).
     queue = sorted(
         (row for row in set(accessions) if row[0] not in skip_accessions),
-        key=lambda row: (row[3], row[0]),
+        key=lambda row: (row[1], row[3], row[0]),
     )
     grouped: dict[Quarter, list[Form4IndexRow]] = defaultdict(list)
     for row in queue:

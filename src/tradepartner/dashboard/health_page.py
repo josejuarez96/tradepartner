@@ -80,6 +80,7 @@ from tradepartner.health import (
     stale_gap_expected,
     stale_sessions,
 )
+from tradepartner.ingest import SEC_FORMS_BACKFILL_SOURCES
 from tradepartner.store.classify import COMMON, classifications_as_of
 from tradepartner.store.delistings import LISTED, TRANSFERRED, listing_ends_as_of
 from tradepartner.store.master import securities_as_of
@@ -186,7 +187,11 @@ def load_health_view(
     coverage-reference block is computed only when `with_coverage_reference` is true
     (the card's button), never on a plain refresh."""
     report = health_report(conn, t, settings, with_coverage_reference=with_coverage_reference)
-    finished = [i.last_ok_finished_at for i in report.ingests if i.last_ok_finished_at]
+    finished = [
+        i.last_ok_finished_at
+        for i in report.ingests
+        if i.last_ok_finished_at and i.source not in SEC_FORMS_BACKFILL_SOURCES
+    ]
     return HealthView(
         report=report,
         series=_series(

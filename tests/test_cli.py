@@ -2620,3 +2620,51 @@ def test_census_sec_forms_treats_open_quarter_404_as_empty(
     assert "1993" in result.output and "2024" in result.output
     assert "walk stopped" not in result.output
     assert not Path(secrets_set.store.path).exists()
+
+
+# --- ingest --sec-forms-only (#2624) ------------------------------------------------
+
+
+def _forms_settings(settings: Settings, **events: Any) -> Settings:
+    update = {"sec_forms_enabled": True, "sec_forms": ["4", "4/A"], **events}
+    return settings.model_copy(update={"events": settings.events.model_copy(update=update)})
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("ingest", "--sec-forms-only"),
+        ("ingest", "--source", "alpaca", "--sec-forms-only"),
+        ("ingest", "--source", "edgar", "--sec-forms-only", "--backfill", "--since", "2016-01-01"),
+        ("ingest", "--source", "edgar", "--sec-forms-only", "--dry-run"),
+    ],
+)
+def test_sec_forms_only_needs_edgar_and_no_other_flag(
+    secrets_set: Settings, args: Sequence[str]
+) -> None:
+    result = _invoke(_forms_settings(secrets_set), args)
+    assert result.exit_code == cli.USAGE_ERROR
+    assert "--sec-forms-only needs --source edgar" in result.output
+
+
+def test_sec_forms_only_needs_the_collection_switch(secrets_set: Settings) -> None:
+    result = _invoke(secrets_set, ["ingest", "--source", "edgar", "--sec-forms-only"])
+    assert result.exit_code == cli.USAGE_ERROR
+    assert "needs events.sec_forms_enabled" in result.output
+
+
+def test_sec_forms_only_reads_no_index_quarter_before_the_backfill_start(
+    secrets_set: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _s: None)
+    settings = _forms_settings(secrets_set, sec_forms_backfill_start=date(2024, 10, 1))
+    result, seen = _census_run(settings, ("ingest", "--source", "edgar", "--sec-forms-only"))
+    assert result.exit_code == 0, result.output
+    assert "sec_forms" in result.output and "Form 4 bulk: 0 selected" in result.output
+    # Only the start's quarter and the clock's: no 1993 index, no master build's requests.
+    assert [r.url.path.split("/")[-3:-1] for r in seen] == [["2024", "QTR4"], ["2025", "QTR1"]]
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert conn.execute("SELECT source, mode FROM ingestion_runs").fetchall() == [
+            ("sec_forms", "backfill")
+        ]
+        assert conn.execute("SELECT count(*) FROM securities").fetchone() == (0,)
