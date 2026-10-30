@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -13,7 +13,6 @@ from typer.testing import CliRunner
 from tradepartner import cli
 from tradepartner.adapters.broker import Asset, OrderRequest, PositionIntent, Side
 from tradepartner.calendar import session_close
-from tradepartner.errors import ReconciliationError
 from tradepartner.execution import book_view, headroom, home_view, ops, report
 from tradepartner.execution.marks import equity_at, signed_value
 from tradepartner.store import journal, registry
@@ -113,13 +112,14 @@ def _carry_short(env: Env) -> None:
 def test_filled_rebalance_rerun_sends_no_duplicate_orders(
     env: Env, window: journal.PaperWindowRow
 ) -> None:
-    """A filled May 1 rebalance re-run on May 1 sends no duplicate order. Today the
-    re-run then fails closed on reconciliation (#2649 asks whether that is intended)."""
+    """A filled May 1 rebalance re-run later on May 1 sends no duplicate order and
+    reconciles clean: its journal cut is its own clock reading, after the first
+    run's journalled fills (#2649, owner 2026-10-30)."""
     bought(env)
     submitted = len(env.submits())
     assert submitted >= 3
-    with pytest.raises(ReconciliationError, match="broker_only_position, cash"):
-        env.run(at(F_0))
+    outcome = env.run(env.clock.now + timedelta(minutes=1))
+    assert outcome.status == "ok", env.result(env.latest_run())
     assert len(env.submits()) == submitted
 
 
