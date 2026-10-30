@@ -2527,6 +2527,7 @@ def make_app(
                     fill_holes_, security is not None, bulk_from_cache, rebuild_statement_facts,
                     rebuild_filing_events, rebuild_classifications, restamp_from is not None,
                     restamp_window_earlier_ok is not None, import_dir is not None,
+                    sec_forms_only,
                 ),
             )  # fmt: skip
         if sec_forms_only and (

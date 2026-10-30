@@ -1584,12 +1584,15 @@ def _write_form4_bulk(
         return 0, "Form 4 bulk: 0 selected, 0 requests, 0 remaining"
     # One quarter's bulk set in memory at a time (#2624): the plan reads each
     # quarter once and releases it; the route reads it again from the zip the
-    # plan validated, with no request. An accession's index rows share its
-    # filing date, so its quarter is that of its first row.
-    filing_quarters = {quarter_of(row[3]) for rows in candidates.values() for row in rows}
+    # plan validated, with no request. Keep all index rows of an accession in
+    # one quarter even when their filing dates disagree.
     by_quarter: dict[Quarter, dict[str, list[Form4IndexRow]]] = defaultdict(dict)
+    accession_quarters: dict[str, Quarter] = {}
     for accession, rows in candidates.items():
-        by_quarter[quarter_of(rows[0][3])][accession] = rows
+        quarter = quarter_of(rows[0][3])
+        accession_quarters[accession] = quarter
+        by_quarter[quarter][accession] = rows
+    filing_quarters = set(by_quarter)
     stored = {
         accession: stored_source
         for accession, stored_source in conn.execute(
@@ -1817,6 +1820,7 @@ def _write_form4_bulk(
             skip_accessions=frozenset(skip),
             blocked_quarters=frozenset(unreadable),
             source_counts_failures=True,
+            accession_quarters=accession_quarters,
         )
         del quarter_bulk  # released before the next quarter is read
         counts.update(result.counts)
