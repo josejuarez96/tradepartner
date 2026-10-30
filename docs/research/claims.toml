@@ -3349,11 +3349,11 @@ note = "TP- result (own query). The 13D forms are not in the store; the list cam
 
 [[claim]]
 id = "TP-FC-1"
-statement = "Over the paper sessions of 2026-10-20, 10-26 and 10-27, per order against the arrival price, buys cost +38.9 bp (95% +31.9 to +46.9) and sells +9.5 bp (+1.7 to +19.7), +24.2 bp per side (+18.8 to +30.5), above B10's 12 bp rung-1 line; in names over $200M daily dollar volume it is +10.6 bp (+6.2 to +15.3); buys fill 375 to 618 s after the open on rebalance days because the run submits them only after every sell is terminal."
+statement = "Over the paper sessions of 2026-10-20, 10-26 and 10-27, per order against the arrival price, buys cost +38.9 bp (95% +31.9 to +46.8) and sells +9.5 bp (+1.8 to +20.2), +24.2 bp per side (+18.9 to +30.6), above B10's 12 bp rung-1 line; in names over $200M daily dollar volume it is +10.6 bp (+6.0 to +15.4) against arrival, equal-weighted, and +17.9 bp (+11.3 to +24.4) against the open as currently executed; buys fill 375 to 618 s after the open on rebalance days because the run submits them only after every sell is terminal."
 kind = "empirical"
 grade = "SUPPORTED"
 scope = "593 orders, 918 fills, paper simulator, 3 sessions (10-20 buys only, $494 each; 10-26 and 10-27 mostly $1-50); arrival = SIP NBBO mid at submitted_at for post-open orders, SIP open for pre-open orders; order-level iid bootstrap, a lower bound on the uncertainty"
 source = "docs/research/2026-10-30-paper-fill-cost-arrival.md"
 section = "Rung-1 figures (one bootstrap run, seed 26082)"
 bears_on = ["backlog:B10", "adr:0023", "spec:paper-trading"]
-note = "TP- result (own query). Paper fills do not measure live slippage. Refines TP-FV-3 (vs the open): the buy drift between the open and the submit, +16.4 bp on two sessions, is a market move, not a known cost. The buy delay is the two-phase design (paper-trading spec req 3), not the broker."
+note = "TP- result (own query). Paper fills do not measure live slippage. Refines TP-FV-3 (vs the open): the buy drift between the open and the submit, +16.4 bp on two sessions, was positive on both sessions (+30.8 bp over $200M), sign in general untested. The buy delay is the two-phase design (paper-trading spec req 3), not the broker."
