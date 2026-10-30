@@ -37,6 +37,7 @@ STAGE_A = FIXTURES / "research" / "c1b_stage_a" / "expected.json"
 SLUG = "c1b-filing-delay-matched"
 #: Run 3's registered artifact and its SHA-256 (the probe's run 3 output).
 ARTIFACT = Path(Settings(_env_file=None).research.data_dir) / SLUG / f"{SLUG}-run3.json"
+# Run 3's registered artifact digest (docs/specs/research-registry.md, req. 8; C1b run 3).
 ARTIFACT_SHA256 = "a30adf20f70557482b13d6fbe807d678fb68697180a09b64a079dd10637d2793"
 #: Keys the probe derived per row; the runner recomputes them.
 DERIVED = ("bucket", "no_peers", "beta_gap", "logmcap_gap")
@@ -258,6 +259,38 @@ def test_synthetic_stage_a_through_the_golden_path(tmp_path: Path) -> None:
     _assert_derived(derived, expected["secondary"], rows, design)
     _assert_same(summary["secondary"], expected["secondary"])
     _assert_stored_secondary(tmp_path, summary, STAGE_A)
+
+
+def test_synthetic_kill_is_decided_by_t_not_bp_floor(tmp_path: Path) -> None:
+    design = _design(tmp_path)
+    design["kill"] = [{**design["kill"][0], "readings": ["raw"], "floor": 1.0}]
+    values = (0.02, -0.01, 0.03, -0.005)
+    processed = [
+        {
+            "group": "early",
+            "security_id": f"synthetic-{i}",
+            "bucket": 0,
+            "acc_date": f"2020-0{i + 1}-15",
+            "qidx": i // 3,
+            "entry_index": i * 100,
+            "beta_gap": 0.0,
+            "logmcap_gap": 0.0,
+            **{f"spread_{h}": value for h in design["horizons"]},
+            **{f"r_{h}": value for h in design["horizons"]},
+            **{f"spy_{h}": 0.0 for h in design["horizons"]},
+            **{
+                f"spread_{variant}_{h}": value
+                for variant in ("badj", "sz", "szb")
+                for h in design["horizons"]
+            },
+        }
+        for i, value in enumerate(values)
+    ]
+    summary = summarise_study(processed, {}, design)
+    reading = summary["kill"]["long"]["readings"]["raw"]
+    assert reading["gross_spread_bp"] > design["kill"][0]["floor"]
+    assert 0 < reading["t_min"] < design["kill"][0]["t_floor"]
+    assert summary["secondary"]["kill_long"] == 1.0
 
 
 def test_c1b_run3_secondary_from_the_artifact_event_rows(tmp_path: Path) -> None:

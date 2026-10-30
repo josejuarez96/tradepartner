@@ -1058,6 +1058,27 @@ def test_open_refuses_configurations_other_than_the_study_table(
     assert _count("research_results") == 0
 
 
+def test_open_refuses_a_registered_study_without_configurations(
+    study_ready: int, config_file: Path
+) -> None:
+    # Model an older malformed registration; the current parser rejects this file at register time.
+    with open_for_write(get_settings()) as conn:
+        [(params,)] = conn.execute(
+            "SELECT params_json FROM research_registrations WHERE slug = ?", [STUDY]
+        ).fetchall()
+        registration = json.loads(params)
+        del registration["study"]["configurations"]
+        conn.execute(
+            "UPDATE research_registrations SET params_json = ? WHERE slug = ?",
+            [json.dumps(registration), STUDY],
+        )
+    out = _open_study(study_ready, config_file)
+    assert out.exit_code == 2, out.output
+    assert "study.configurations is missing" in out.output
+    assert _count("research_runs") == 0
+    assert _count("research_results") == 0
+
+
 def test_study_writes_an_ok_result_with_the_artifact(
     study_ready: int, config_file: Path, tmp_path: Path
 ) -> None:
