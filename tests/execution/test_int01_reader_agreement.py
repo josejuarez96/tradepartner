@@ -224,7 +224,7 @@ def test_one_session_readers_agree_with_the_journal(
         equity = equity_at(marks, NEXT)
         assert equity == pytest.approx(cash + net)
 
-        operational = ops.page_data(conn, env.settings)
+        operational = ops.page_data(conn, env.settings, now=env.clock.now)
         assert operational.positions_count == len(marks)
         assert operational.positions_value == pytest.approx(net)
         monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "absent.env"))
