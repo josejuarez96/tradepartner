@@ -13,9 +13,11 @@ with nothing patched.
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import duckdb
 import pytest
+from execution.test_run_trade import BROKER_ASSETS, F_0, Env, at
 from test_cli_paper import (  # noqa: F401  (fixtures)
     HEARTBEAT_URL,
     _Clock,
@@ -31,6 +33,7 @@ from test_cli_paper import (  # noqa: F401  (fixtures)
     started,
 )
 
+from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.calendar import next_session, previous_session, session_close
 
 
@@ -52,6 +55,56 @@ def test_run_with_no_ok_ingest_pings_fail_exits_non_zero_and_submits_nothing(
     assert calls == [HEARTBEAT_URL + "/fail"], calls
     assert _submits(factory) == []
     assert _count("orders") == 0
+
+
+def test_recovered_rebalance_submits_each_pending_order_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    clock: _Clock,
+    factory: _Factory,
+) -> None:
+    """The refused F_0 run leaves its due plan for the next permitted run."""
+    calls = _heartbeat_calls(monkeypatch)
+    clock.now = at(F_0, 13, 45)
+    env = Env(_settings(), clock)
+    env.open_window(tmp_path=tmp_path)
+    env.price_at(F_0)
+    factory.fake = FakeBroker(
+        assets=FakeBroker.active_assets(*BROKER_ASSETS),
+        clock=clock,
+        price_of=lambda symbol: env.prices[symbol],
+        auto_fill=True,
+        account_id="PA1",
+    )
+
+    refused = _paper(clock, factory, "run")
+    assert refused.exit_code != 0 and "StaleDataError" in refused.output, refused.output
+    assert _results() == [(1, "stale", "StaleDataError")]
+    assert _submits(factory) == []
+
+    s_minus_1 = previous_session(F_0)
+    close = session_close(s_minus_1)
+    _ok_ingest("s1-recovered", close + timedelta(minutes=30))
+    clock.step = timedelta(milliseconds=1)
+    recovered = _paper(clock, factory, "run")
+    assert recovered.exit_code == 0, recovered.output
+    assert "paper run: ok (run 2" in recovered.output
+    with duckdb.connect(_settings().store.path, read_only=True) as conn:
+        ((planned,),) = conn.execute(
+            "SELECT n_targets FROM paper_plans WHERE run_id = 2"
+        ).fetchall()
+        rows = conn.execute("SELECT client_order_id FROM orders WHERE run_id = 2").fetchall()
+    submits = _submits(factory)
+    ids = [call.args[0].client_order_id for call in submits]
+    assert planned == len(submits) == len(rows) == 3
+    assert len(set(ids)) == len(ids)
+    assert set(ids) == {row[0] for row in rows}
+
+    again = _paper(clock, factory, "run")
+    assert again.exit_code == 0, again.output
+    assert len(_submits(factory)) == planned
+    assert _count("orders") == planned
+    assert calls == [HEARTBEAT_URL + "/fail", HEARTBEAT_URL, HEARTBEAT_URL]
 
 
 @pytest.mark.usefixtures("started")
