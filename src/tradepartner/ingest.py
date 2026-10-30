@@ -2125,6 +2125,7 @@ def _source_counts(filings: FilingSource) -> str:
         ("facts_missing", "facts missing"),  # T11h: T11e's company-facts-404 leftover
         ("facts_bulk_empty", "empty bulk facts"),  # #566: `{}` companyfacts.zip members
         ("submissions_bulk_empty", "empty bulk submissions"),
+        ("bulk_not_modified", "bulk zips kept (304)"),  # #2594: conditional GET hits
         ("facts_api_empty", "empty API facts"),  # #576: per-CIK API 200 `{}`
         ("submissions_api_empty", "empty API submissions"),
         ("stamp_check_mismatched_ciks", "CIKs stamped from SGML"),  # #1494

@@ -1426,11 +1426,12 @@ def test_edgar_run_message_carries_the_failure_policy_counts(settings: Settings)
         facts_bulk_keyless = 8  # #599
         facts_api_keyless = 9
         facts_capped_dropped = frozenset({("acc", "name", "day")})  # #610 X2: dropped keys
+        bulk_not_modified = 2  # #2594: kept bulk zips
 
     message = _run(settings, filings=_filings(cls=Failing), source="edgar").runs[0].message
     counts = (
         "; failed filings: 2; quarantined: 1; facts missing: 4"
-        "; empty bulk facts: 3; empty bulk submissions: 5"
+        "; empty bulk facts: 3; empty bulk submissions: 5; bulk zips kept (304): 2"
         "; empty API facts: 6; empty API submissions: 7"
         "; keyless bulk facts: 8; keyless API facts: 9; capped facts dropped: 1; "
         "chain_candidates: none; missing"
