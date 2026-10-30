@@ -1950,7 +1950,6 @@ def test_status_prints_alert_ids_for_each_book(clock: _Clock, factory: _Factory)
 def test_status_all_prints_one_summary_line_per_book(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:
-    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
     b_window = _open_book_b()
     out = _paper(clock, factory, "status", "--all")
     assert out.exit_code == 0, out.output
@@ -2057,7 +2056,6 @@ _EDGAR_LINE_3 = (
 def test_status_stays_quiet_below_the_edgar_age_limit(
     clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
     _edgar_run(datetime(2026, 9, 28, 22, tzinfo=UTC))  # covers 09-28: 2 sessions by 10-01
     for args in (("status",), ("status", "--all")):
         out = _paper(clock, factory, *args)
@@ -2069,7 +2067,6 @@ def test_status_stays_quiet_below_the_edgar_age_limit(
 def test_status_shows_edgar_data_three_sessions_old(
     clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
     _edgar_run(datetime(2026, 9, 25, 22, tzinfo=UTC))  # covers 09-25: 3 sessions by 10-01
     out = _paper(clock, factory, "status")
     assert out.exit_code == 0, out.output
@@ -2084,7 +2081,6 @@ def test_status_shows_edgar_data_three_sessions_old(
 def test_edgar_age_ignores_failed_and_other_source_runs_and_resets_on_an_ok_run(
     clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
     _edgar_run(datetime(2026, 9, 25, 22, tzinfo=UTC))
     _edgar_run(datetime(2026, 9, 30, 22, tzinfo=UTC), status="failed")
     _edgar_run(datetime(2026, 9, 30, 22, tzinfo=UTC), source="alpaca")
@@ -2121,7 +2117,6 @@ def test_edgar_age_counts_sessions_not_weekdays_across_thanksgiving(
 def test_status_names_no_edgar_ingest_without_an_ok_run(
     clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
     _edgar_run(datetime(2026, 9, 30, 22, tzinfo=UTC), status="failed")
     _edgar_run(datetime(2026, 9, 30, 22, tzinfo=UTC), source="alpaca")
     for args in (("status",), ("status", "--all")):
@@ -2168,6 +2163,19 @@ def test_status_all_shows_a_secret_in_the_kill_reason_scrubbed(
     assert out.exit_code == 0, out.output
     assert "reason given: stop key" in out.output
     assert secret not in out.output
+
+
+@pytest.mark.usefixtures("started")
+def test_status_all_reads_the_injected_clock_not_the_wall_clock(
+    clock: _Clock, factory: _Factory
+) -> None:
+    """#2655: `paper status --all` names the next rebalance after the command's
+    clock, here pinned in January 2027, whatever month the wall clock is in."""
+    clock.now = datetime(2027, 1, 5, 15, tzinfo=UTC)
+    out = _paper(clock, factory, "status", "--all")
+    assert out.exit_code == 0, out.output
+    assert "next rebalance 2027-01-29 (data day; trades the next session)" in out.output
+    assert "next rebalance 2026-" not in out.output
 
 
 @pytest.mark.usefixtures("started")
@@ -2244,7 +2252,7 @@ def test_status_summary_labels_completed_rebalance_and_fill_lag(
 ) -> None:
     """A fill-session run names its own rebalance and whether it placed orders."""
     run_at = datetime.combine(fill_day, datetime.min.time(), tzinfo=UTC) + timedelta(hours=14)
-    monkeypatch.setattr(ops, "utc_now", lambda: run_at)
+    clock.now = run_at
     with open_for_write(_settings()) as conn:
         window = journal.latest_window(conn, "main")
         assert window is not None and window.window_id is not None
@@ -2635,7 +2643,7 @@ def test_paper_shakedown_exits_zero_when_every_line_passes_on_a_read_only_store(
 def test_status_all_on_an_outdated_journal_is_refused_not_a_crash(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:
-    def outdated(*_args: Any) -> Any:
+    def outdated(*_args: Any, **_kwargs: Any) -> Any:
         raise schema.SchemaVersionError("the journal predates schema version 17")
 
     monkeypatch.setattr(ops, "book_summaries", outdated)
@@ -2866,7 +2874,7 @@ def test_status_all_hides_phase_notes_but_keeps_other_run_notes() -> None:
         next_rebalance_session=None,
         last_run_message="paper_phase started=1; check fill; paper_phase finished=2",
     )
-    assert cli._summary_lines((row,))[0].endswith("; check fill")
+    assert cli._summary_lines((row,), SESSION_CLOCK)[0].endswith("; check fill")
     row.last_run_message = "paper_phase started=1"
-    assert "check fill" not in cli._summary_lines((row,))[0]
-    assert "paper_phase" not in cli._summary_lines((row,))[0]
+    assert "check fill" not in cli._summary_lines((row,), SESSION_CLOCK)[0]
+    assert "paper_phase" not in cli._summary_lines((row,), SESSION_CLOCK)[0]

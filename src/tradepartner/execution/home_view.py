@@ -11,8 +11,8 @@ action is the text the owner types or a pointer to where to look.
 
 **As of.** A card is cut at the last session completed at `now`; a mark of a
 later session, or a blotter row known after `now`, moves nothing. The readers
-beneath (`ops.performance_data`, `ops.book_summaries`) take the real clock for
-their own header and next-rebalance reads; `now` is theirs only where they take it.
+beneath (`ops.performance_data`, `ops.book_summaries`) read their header and
+next-rebalance facts at the same `now` (#2655).
 
 **The status line** is red for a halted book or a missed run, amber for any other
 item waiting on the owner, and "Everything is running normally" otherwise.
@@ -308,7 +308,7 @@ def _card(
     window_id = summary.window.window_id
     cut = last_completed_session(now)
     try:
-        perf = ops.performance_data(conn, settings, summary.book_id)
+        perf = ops.performance_data(conn, settings, summary.book_id, now=now)
         if perf is not None and perf.base_session is not None:
             series = {d: v for d, v in perf.equity if d <= cut}
             # The base point alone (every mark is after the cut) is no mark at all.
@@ -381,7 +381,7 @@ def _research_strip(conn: duckdb.DuckDBPyConnection, now: datetime) -> ResearchS
 def build(conn: duckdb.DuckDBPyConnection, settings: Settings, now: datetime) -> HomeView:
     """The Home page at `now` (module docstring); read-only through `conn`."""
     now = ensure_tz_aware_utc(now, field_name="now")
-    summaries = ops.book_summaries(conn, settings)
+    summaries = ops.book_summaries(conn, settings, now=now)
     needs = _needs_you(ops.waiting_on_owner(conn, settings, now), ops.overdue_delisting_cash(conn))
     cards = tuple(_card(conn, settings, s, now) for s in summaries)
     return HomeView(

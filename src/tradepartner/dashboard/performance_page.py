@@ -55,7 +55,7 @@ def _selected_book(conn: duckdb.DuckDBPyConnection, settings: Settings) -> str:
     """The selector's pick, as `ops_page`'s: shown only when a book other than
     `paper.book_id` has a window."""
     try:
-        summaries = ops.book_summaries(conn, settings)
+        summaries = ops.book_summaries(conn, settings, now=header.now())
     except SchemaVersionError:
         return settings.paper.book_id
     default = settings.paper.book_id
@@ -214,7 +214,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
     st.header("Performance")
     book = _selected_book(conn, settings)
     try:
-        data = ops.performance_data(conn, settings, book)
+        data = ops.performance_data(conn, settings, book, now=header.now())
     except UnreadableMarkError as exc:
         st.error(f"A position mark could not be read: {exc}")
         return
