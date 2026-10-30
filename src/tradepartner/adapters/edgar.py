@@ -347,7 +347,7 @@ def parse_submissions(
     return sorted(entries, key=lambda e: (e.accepted_at, e.accession))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)  # #2616: millions per run, so no per-row __dict__
 class UnstampedFiling:
     """An index row whose acceptance time is unknown: reported, not stamped."""
 
