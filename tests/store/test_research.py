@@ -1143,9 +1143,12 @@ def test_a_non_finite_primary_is_not_computable_not_a_fail(
     # a quiet `fail` (a NaN compares false against any threshold).
     assert _ok(conn, opened, **{field: bad}) == "ok"
     row = conn.execute(
-        "SELECT outcome, verdict FROM research_results WHERE run_id = ?", [opened.run_id]
+        f"SELECT outcome, verdict, {field} FROM research_results WHERE run_id = ?",
+        [opened.run_id],
     ).fetchone()
-    assert row == ("ok", "not_computable")
+    assert row is not None
+    # The primary is stored as given, not nulled (spec Data / interfaces).
+    assert row[:2] == ("ok", "not_computable") and repr(row[2]) == repr(bad)
 
 
 def test_a_non_finite_primary_is_not_computable_even_below_the_cluster_floor(
