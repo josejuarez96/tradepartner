@@ -299,17 +299,20 @@ def _dividend_term(
     #: Sessions a `dividend_cash` adjustment was journaled for each name:
     #: reconcile stamps it at the reconciliation session, on or after the
     #: ex-date (`execution.reconcile_run._dividends`), never on the ex-date
-    #: itself, so the match is "on or after", not "equal to". Only a credit
-    #: known by close(T_{i+1}) counts (the same cutoff the dividend term
-    #: itself is computed under): a later credit was not knowable when this
-    #: period was last reported and must not retroactively zero its term.
-    cutoff = session_close(t_next)
+    #: itself, so the match is "on or after", not "equal to". A credit counts
+    #: when the T_{i+1} mark absorbed it (`session <= T_{i+1}` and `known_at`
+    #: no later than that mark's own `known_at`), the same cut the residue
+    #: term uses (spec amendment 2026-10-29, item 3). So a credit is either in
+    #: paper equity at T_{i+1} and not added back, or uncredited; a credit
+    #: journaled after that mark was written was not in the period's return.
+    absorbed_at = max(m.known_at for m in marks if m.session == t_next)
     credited: dict[str, list[date]] = {}
     for adjustment in adjustments:
         if (
             adjustment.kind == _DIVIDEND_CASH
             and adjustment.security_id is not None
-            and adjustment.known_at <= cutoff
+            and adjustment.session <= t_next
+            and adjustment.known_at <= absorbed_at
         ):
             credited.setdefault(adjustment.security_id, []).append(adjustment.session)
     total = 0.0

@@ -433,6 +433,63 @@ def test_dividend_credit_known_only_after_month_end_does_not_zero_term() -> None
     assert result.periods[0].dividend_term == pytest.approx(expected)
 
 
+def _credit_after_close_case(
+    *, credit_known_offset: timedelta, mark_known_offset: timedelta
+) -> float:
+    """Dividend term for a credit journaled `credit_known_offset` after close(T1)
+    when the T1 mark was written `mark_known_offset` after close(T1)."""
+    ex_date = date(2026, 10, 15)
+    record_date = previous_session(ex_date)
+    equity = {T0: 100_000.0, T1: 101_000.0}
+    trial = _trial(equity, {T0: 0.0})
+    mark_at = session_close(T1) + mark_known_offset
+    marks = [
+        _cash_mark(T0, equity[T0]),
+        replace(_cash_mark(T1, equity[T1]), known_at=mark_at, ingested_at=mark_at),
+        _position_mark(record_date, A, 100.0, 50.0),
+    ]
+    credit_at = session_close(T1) + credit_known_offset
+    journal = _journal(
+        positions_daily=marks,
+        adjustments=[
+            AdjustmentRow(
+                adjustment_id=next(_IDS),
+                window_id=WINDOW_ID,
+                run_id=1,
+                session=ex_date,
+                kind="dividend_cash",
+                security_id=A,
+                cash=50.0,
+                known_at=credit_at,
+                ingested_at=credit_at,
+            )
+        ],
+    )
+    dividends = _action(A, "dividend", ex_date, 0.5, _utc(T1))
+    result = compare_periods(
+        _window(tracking_rule="residual"), trial, journal, dividends, _no_price, None
+    )
+    return result.periods[0].dividend_term
+
+
+def test_dividend_credit_absorbed_by_next_mark_is_not_added_back() -> None:
+    # Journaled after close(T1) but before the run that wrote the T1 mark: the
+    # credit is inside paper equity at T1, so the term must not add it back (#2581).
+    term = _credit_after_close_case(
+        credit_known_offset=timedelta(hours=1), mark_known_offset=timedelta(hours=2)
+    )
+    assert term == pytest.approx(0.0)
+
+
+def test_dividend_credit_known_after_next_mark_is_still_uncredited() -> None:
+    # No look-ahead: a credit journaled after the T1 mark was written is not in
+    # that mark, so the period still adds it back.
+    term = _credit_after_close_case(
+        credit_known_offset=timedelta(hours=3), mark_known_offset=timedelta(hours=2)
+    )
+    assert term == pytest.approx((0.5 * 100.0) / 100_000.0)
+
+
 def test_raw_boundary_exact_passes_one_above_fails() -> None:
     # Every number below is a dyadic fraction (an exact power-of-two divisor)
     # so the arithmetic `compare_periods` does is bit-exact, and the "exactly
