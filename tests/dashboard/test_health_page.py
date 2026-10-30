@@ -276,6 +276,15 @@ def test_as_of_last_updated_and_staleness(store_path: Path) -> None:
     assert fresh.as_of is not None and fresh.as_of >= known[0]
     assert fresh.last_updated == FINISHED
     assert fresh.stale_sessions == 0
+    allocation_time = session_close(LAST) + timedelta(hours=1)
+    with duckdb.connect(str(store_path)) as conn:
+        conn.execute(
+            "INSERT INTO spinoff_allocations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ["P", "C", LAST, 0.3, allocation_time, allocation_time, "owner", "owner"],
+        )
+    with _connect(store_path) as conn:
+        after_allocation = health_page.load_health_view(conn, T, _settings(store_path), WINDOW)
+    assert after_allocation.as_of == fresh.as_of
     # 2020-07-01, 07-02, 07-06 and 07-07 have no bars (07-03 is a holiday).
     assert stale.stale_sessions == 4
 

@@ -429,6 +429,23 @@ def test_data_is_up_to_date_through_the_last_session(monkeypatch: pytest.MonkeyP
     assert out.text == "Data is up to date through 2026-10-02" and out.records == 0
 
 
+def test_owner_allocation_does_not_advance_home_data_date(
+    monkeypatch: pytest.MonkeyPatch, store: Settings
+) -> None:
+    monday = datetime(2026, 10, 5, 22, tzinfo=UTC)
+    allocation_time = monday - timedelta(minutes=30)
+    with open_for_write(store) as conn:
+        conn.execute(
+            "INSERT INTO spinoff_allocations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ["P", "C", date(2026, 10, 5), 0.3, allocation_time, allocation_time, "owner", "owner"],
+        )
+    monkeypatch.setattr(health, "last_ingests", lambda _c, _t: ())
+    monkeypatch.setattr(health, "bar_gaps", lambda _c, _t: SimpleNamespace(names_with_gaps=0))
+    with open_read_only(store) as conn:
+        out = home_view._data_status(conn, (), monday)
+    assert out.text == "Data is up to date through 2026-10-02"
+
+
 def test_open_quarantined_filings_and_bar_holes_need_tidying_not_affecting_trading(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
