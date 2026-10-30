@@ -763,6 +763,71 @@ def test_e3_a_remainder_order_sized_after_an_earlier_fill_passes(
 
 
 @pytest.mark.usefixtures("health")
+def test_e3_whole_short_cover_retry_uses_unfilled_shares_after_price_rise(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1, side="buy", position_side="short", whole_share=True)
+    j.order(
+        "o-cover-1",
+        decision_id,
+        run_id,
+        D1,
+        notional=None,
+        quantity=10.0,
+        fills=(6.0,),
+        price=175.0,
+        side="buy",
+        position_side="short",
+        hour=15,
+    )
+    j.order(
+        "o-cover-2",
+        decision_id,
+        run_id,
+        D1,
+        notional=None,
+        quantity=4.0,
+        fills=(4.0,),
+        price=175.0,
+        side="buy",
+        position_side="short",
+        hour=16,
+    )
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert line.passed, line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_whole_short_cover_retry_after_full_fill_has_no_remainder(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1, side="buy", position_side="short", whole_share=True)
+    for coid, shares, hour in (("o-cover-full", 10.0, 15), ("o-cover-extra", 1.0, 16)):
+        j.order(
+            coid,
+            decision_id,
+            run_id,
+            D1,
+            notional=None,
+            quantity=shares,
+            fills=(shares,),
+            side="buy",
+            position_side="short",
+            hour=hour,
+        )
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert not line.passed
+    assert f"order o-cover-extra of decision {decision_id} sized with no remainder" in line.detail
+    assert "10 of 10 shares filled before it" in line.detail
+
+
+@pytest.mark.usefixtures("health")
 def test_e3_fails_on_a_share_order_written_after_the_plan_was_filled(
     conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:

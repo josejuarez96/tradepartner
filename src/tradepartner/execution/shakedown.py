@@ -774,15 +774,17 @@ def _resized_orders(
     terminal_at: dict[str, datetime],
     limit: float,
     minimum: float,
+    whole_cover: bool = False,
 ) -> list[str]:
     """A notional decision's orders that its remainder could not have sized
     (`plan.remainder`, `plan.decision_state`), over both order kinds:
 
     - an order written while an earlier order of the decision had no terminal
       event yet (a decision is resized only once every order is terminal);
-    - any order written when the fill value of all the decision's orders
-      known before it exhausted the remainder or left less than the frozen trading minimum
-      (no remainder was left to size it from).
+    - any order written when fills known before it exhausted the remainder or
+      left less than the frozen trading minimum. A whole short cover uses the
+      latest order's unfilled shares, as `plan.remainder` does; the journal has
+      no reference price for a dollar minimum check on that share remainder.
     """
     failures: list[str] = []
     coids = [o.client_order_id for o in orders]
@@ -799,6 +801,23 @@ def _resized_orders(
                 f"order {order.client_order_id} written while order "
                 f"{', '.join(in_flight)} was in flight"
             )
+            continue
+        if whole_cover:
+            prior_orders = [o for o in orders if o.known_at < order.known_at]
+            if prior_orders:
+                latest = max(prior_orders, key=lambda o: o.known_at)
+                filled = sum(
+                    f.quantity
+                    for f in known.get(latest.client_order_id, ())
+                    if f.known_at < order.known_at
+                )
+                remaining = (latest.quantity or 0.0) - filled
+                if remaining < 1:
+                    failures.append(
+                        f"order {order.client_order_id} of decision {decision_id} sized with no "
+                        f"remainder ({filled:g} of {latest.quantity or 0.0:g} shares filled "
+                        "before it)"
+                    )
             continue
         value = sum(
             f.quantity * f.price
@@ -921,7 +940,9 @@ def _orders_line(
                 else float(planned_notional)
             )
             minimum = _frozen_tolerance(windows[run_window[run_id]], _MIN_ORDER_NOTIONAL)
-            failures += _resized_orders(decision_id, mine, known, terminal_at, limit, minimum)
+            failures += _resized_orders(
+                decision_id, mine, known, terminal_at, limit, minimum, whole_cover=whole_cover
+            )
         else:
             got = sum(quantity.get(c, 0.0) for c in coids)
             if got > 0:
