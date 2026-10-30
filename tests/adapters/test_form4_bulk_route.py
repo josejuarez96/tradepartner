@@ -15,12 +15,59 @@ from tradepartner.adapters.edgar_insider_bulk import read_insider_bulk
 from tradepartner.adapters.filings import SecFormFiling
 from tradepartner.adapters.form4_bulk_route import (
     RequestBudgetStopped,
+    load_bulk_quarters,
     order_check_path,
     request_budget,
     run_form4_bulk_route,
 )
 from tradepartner.adapters.form4_route import Quarter
 from tradepartner.config import Settings
+
+
+def test_second_bulk_read_missing_zip_fails_closed_without_download(
+    tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    quarter = Quarter(2026, 1)
+    local = settings.model_copy(
+        update={"edgar": settings.edgar.model_copy(update={"cache_dir": tmp_path})}
+    )
+    monkeypatch.setattr(
+        edgar_raw,
+        "insider_bulk_zip",
+        lambda *_args, **_kwargs: pytest.fail("second read requested a download"),
+    )
+    loaded, digests, counts, bad = load_bulk_quarters(
+        {quarter}, settings=local, client=httpx.Client(), revalidate=False
+    )
+    assert loaded == {quarter: None}
+    assert digests == {}
+    assert counts["sec_forms_bulk_unreadable"] == 1
+    assert bad == {quarter}
+
+
+def test_accession_rows_in_two_quarters_route_together(tmp_path: Path) -> None:
+    accession = "0001577526-26-000036"
+    first = Quarter(2026, 1)
+    rows = [
+        (accession, "0001577526", "4", date(2026, 3, 31)),
+        (accession, "0001577526", "4", date(2026, 4, 1)),
+    ]
+    seen: list[date] = []
+    result = run_form4_bulk_route(
+        rows,
+        quarters={first: _bulk(tmp_path)},
+        stamp=lambda _cik, _accession, filed: seen.append(filed) or None,
+        xml=lambda *_: pytest.fail("unstamped accession fetched XML"),
+        write=lambda *_: pytest.fail("unstamped accession written"),
+        now=datetime(2027, 1, 2, tzinfo=UTC),
+        price_below=1,
+        zero_price_codes=("P", "S"),
+        order_sample_size=0,
+        budget=100,
+        accession_quarters={accession: first},
+    )
+    assert seen == [date(2026, 3, 31), date(2026, 4, 1)]
+    assert result.remaining == 2
 
 
 def _bulk(tmp_path: Path):  # type: ignore[no-untyped-def]
