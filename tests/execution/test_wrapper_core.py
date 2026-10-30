@@ -571,6 +571,26 @@ def test_halt_read_judges_the_fill_it_journals(
     assert "tp-bad" in message
 
 
+def test_halt_read_bad_fill_does_not_record_cancel_failed(
+    journal_settings: Settings,
+    ticking_fake: FakeBroker,
+    ticking: TickingClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _run(journal_settings, open_window, ticking())
+    _order(journal_settings, ticking_fake, ticking, run, "tp-bad")
+    ticking_fake.apply("tp-bad", FillAt(price=200.0))
+    monkeypatch.setattr(wrapper_module, "reference_prices", lambda *_: {"SEC-AAA": 100.0})
+    gate = _wrapper(journal_settings, ticking_fake, ticking, alerter_conn)
+
+    with pytest.raises(ValueError, match="original fault"):
+        _halt(gate, ValueError("original fault"), run)
+
+    assert ("cancel_failed", HALT_REASON) not in _events(journal_settings, "tp-bad")
+
+
 def test_the_alert_row_exists_before_the_fault_propagates(
     journal_settings: Settings,
     scripted_fake: FakeBroker,

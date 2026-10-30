@@ -2074,7 +2074,7 @@ class RiskGatedBroker:
             )
         except Exception as exc:
             # A halt still reads back fills when its reference-price read fails.
-            # The original fault already engaged the switch.
+            # A stale-data halt leaves the switch as it was.
             notes.append(f"halt read of {coid} has no price band ({type(exc).__name__})")
         try:
             collected = collect(
@@ -2095,6 +2095,17 @@ class RiskGatedBroker:
             if not any(note.startswith(_READ_CLOCK_NOTE) for note in notes):
                 notes.append(f"{_READ_CLOCK_NOTE}: {exc}")
             stamp.trip()
+            return
+        except SystemFaultError as exc:
+            if "fill_price_outside_band:" in str(exc):
+                notes.append(
+                    f"halt read of {coid} failed ({type(exc).__name__}: {self._scrub(str(exc))})"
+                )
+                return
+            self._event(coid, _CANCEL_FAILED, stamp, notes)
+            notes.append(
+                f"halt read of {coid} failed ({type(exc).__name__}: {self._scrub(str(exc))})"
+            )
             return
         except Exception as exc:
             self._event(coid, _CANCEL_FAILED, stamp, notes)

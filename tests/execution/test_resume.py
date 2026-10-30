@@ -424,6 +424,41 @@ def test_resume_judges_a_new_fill_and_reports_its_price(
         assert _engaged(journal_settings, window)
 
 
+@pytest.mark.parametrize("initially_engaged", [False, True])
+def test_bad_fill_stays_refused_if_fault_engagement_write_fails(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+    initially_engaged: bool,
+) -> None:
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=True)
+    _order(journal_settings, fake, crashed, "tp-bad-write", 2.0, DAY1 - timedelta(hours=1))
+    fake.apply("tp-bad-write", FillAt(200.0))
+    if initially_engaged:
+        _engage(journal_settings, window, fixed_clock)
+    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    monkeypatch.setattr(
+        resume_module.switch,
+        "engage",
+        lambda *_args, **_kwargs: switch.WriteFailed("store unavailable"),
+    )
+
+    first = _resume(journal_settings, fake, fixed_clock)
+
+    assert first.status == REFUSED
+    assert "kill switch write failed" in first.reasons[0]
+    assert ("NOT engaged" in first.reasons[0]) == (not initially_engaged)
+    assert _engaged(journal_settings, window) == initially_engaged
+    assert _all_fills(journal_settings, "tp-bad-write")
+
+    second = _resume(journal_settings, fake, fixed_clock)
+    assert second.status == REFUSED
+    assert any("fill_price_outside_band" in reason for reason in second.reasons)
+    assert _engaged(journal_settings, window) == initially_engaged
+
+
 def test_resume_reports_a_new_fill_without_a_reference_price(
     journal_settings: Settings,
     fake: SkewedFake,

@@ -20,9 +20,10 @@ The only way the kill switch is released. In the req 5 order:
    That journals this invocation's `fill_cursors` row, whatever follows.
    The collection judges newly journaled broker-feed fills against the
    configured band around the close(S-1) reference, with only facts known by
-   that close. An out-of-band fill refuses this invocation and keeps the kill
-   switch engaged. Its fault engagement stays in the journal and blocks later
-   release. Broker-status residual fills keep req 8's explicit acceptance path.
+   that close. An out-of-band fill refuses this invocation. A successful fault
+   engagement blocks later release; if that write fails, later resumes rejudge
+   the fill using this invocation's reference view. Broker-status residual fills
+   keep req 8's explicit acceptance path.
    - A rejection-cap verdict refuses the release: one from the collection
      (an all-rejected or over-cap submitting run whose rejection this resume
      journaled; #374, T58's handoff), or one on a run the release would clear
@@ -141,6 +142,7 @@ from tradepartner.execution.collect import (
     PriceBand,
     RejectionBreach,
     collect,
+    fill_band_violations,
     lag_verdict,
     note_unjudged,
     rejection_breaches,
@@ -158,6 +160,7 @@ from tradepartner.execution.window import ACCOUNT_MISMATCH
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.journal import (
     FillRow,
+    OrderedFill,
     OrderEventRow,
     OrderRow,
     PaperRunResultRow,
@@ -165,6 +168,7 @@ from tradepartner.store.journal import (
     ResumeAcceptanceRow,
     ResumeInvocationRow,
     append,
+    fill_cursors,
     fills_for,
     kill_switch_events_for,
     non_terminal_orders,
@@ -174,6 +178,7 @@ from tradepartner.store.journal import (
     pending_orders,
     positions_daily_for,
     reconciliations_for,
+    resume_invocations,
     runs_for,
 )
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -676,7 +681,12 @@ def resume(
             except Exception as engage_error:
                 engaged = switch.WriteFailed(f"{type(engage_error).__name__}: {engage_error}")
             if isinstance(engaged, switch.WriteFailed):
-                return outcome(REFUSED, f"{message}; kill switch write failed: {engaged.error}")
+                state = _switch(connect, window)
+                state_note = "the kill switch is engaged" if state.engaged else "it is NOT engaged"
+                return outcome(
+                    REFUSED,
+                    f"{message}; kill switch write failed, {state_note}: {engaged.error}",
+                )
             return outcome(REFUSED, message)
 
         if band_error is not None:
@@ -684,13 +694,67 @@ def resume(
         assert collected is not None
         note_unjudged(collected, fill_warnings)
         with connect() as conn:
+            events = kill_switch_events_for(conn, window_id)
             prior_band_faults = [
                 event.reason
-                for event in kill_switch_events_for(conn, window_id)
+                for event in events
                 if event.reason and event.reason.startswith("fill_price_outside_band:")
             ]
         if prior_band_faults:
             return outcome(REFUSED, f"prior {prior_band_faults[-1]}; abandon this window")
+        # A prior refusal can have journaled its fill before the fault
+        # engagement write failed. Rejudge fills from earlier resume
+        # invocations since the last release, using each invocation's own
+        # close(S-1) view, before this invocation can release the switch.
+        with connect() as conn:
+            released_at = max(
+                (event.known_at for event in events if event.state == "released"),
+                default=window.started_at,
+            )
+            earlier = {
+                row.resume_id: row
+                for row in resume_invocations(conn)
+                if row.resume_id != resume_id and released_at < row.at < now
+            }
+            prior_cursors = [
+                cursor
+                for cursor in fill_cursors(conn)
+                if cursor.writer_kind == _WRITER
+                and cursor.writer_id in earlier
+                and released_at < cursor.known_at < now
+            ]
+            fills_by_stamp: dict[datetime, list[OrderedFill]] = {}
+            for item in fills_for(conn, window_id=window_id):
+                if item.fill.source == "broker_feed":
+                    fills_by_stamp.setdefault(item.fill.known_at, []).append(item)
+            prior_violations: list[str] = []
+            for cursor in prior_cursors:
+                group = fills_by_stamp.get(cursor.known_at, [])
+                if not group:
+                    continue
+                prior_session = command_session(earlier[cursor.writer_id].at)
+                prior_actions = live_actions_as_of(
+                    conn, session_close(previous_session(prior_session))
+                )
+                prior_prices: dict[str, float] = {}
+                for name in sorted({item.security_id for item in group}):
+                    with suppress(ValueError):
+                        prior_prices.update(
+                            reference_prices(conn, prior_session, [name], prior_actions)
+                        )
+
+                def prior_price_of(name: str, prices: dict[str, float] = prior_prices) -> float:
+                    return prices[name]
+
+                prior_band = PriceBand(
+                    prior_price_of,
+                    prior_actions,
+                    prior_session,
+                    settings.paper.max_fill_price_deviation,
+                )
+                prior_violations.extend(fill_band_violations(group, prior_band))
+        if prior_violations:
+            return refuse_bad_fill("fill_price_outside_band: " + "; ".join(prior_violations))
         faulted = _faulted_run_breaches(connect, window, frozen)
         if accept_rejections:
             # Only the verdicts on runs the release would clear (#451's refusal).
