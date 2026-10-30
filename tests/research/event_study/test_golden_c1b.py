@@ -1,7 +1,7 @@
 """C1b run 3 golden, summary stage (amendment 2026-10-28 #2440, plan T304).
 
-From the run 3 artifact's per-event rows, with the run's recorded counts passed
-through, the runner's matching and summary stages (the functions `run_study`
+From the run 3 artifact's per-event rows, with earlier-stage counts retained,
+the runner's matching and summary stages (the functions `run_study`
 itself calls, so the secondary is what `experiment study` records, kill lines
 included) must give the registered `secondary_json` key for key: counts and
 booleans exact, NaN equal to NaN, floats within a relative 1e-9. The artifact is
@@ -27,7 +27,9 @@ import pytest
 from tradepartner.calendar import all_sessions
 from tradepartner.config import Settings
 from tradepartner.research.event_study.run import match_events, summarise_study
-from tradepartner.research.experiment import parse_experiment_file
+from tradepartner.research.experiment import hash_file, parse_experiment_file
+from tradepartner.store import research, schema
+from tradepartner.store.db import open_for_write
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
 C1B_FILE = FIXTURES / "experiments" / "c1b-filing-delay-matched.md"
@@ -44,6 +46,14 @@ DERIVED = ("bucket", "no_peers", "beta_gap", "logmcap_gap")
 #: peer-group rows never have one, so it recorded 0 (run 3). The runner counts
 #: every bucketed peer-group row as traded; the golden asserts that count.
 ACCEPTED_DEPARTURE = "n_traded_normal"
+#: The second accepted departure (owner decision 2026-10-30 on #2618): the probe
+#: counted a delisted exit only when `exited_early_60` was set (`c1b_filing_delay.py`
+#: `evaluate`), and the runner (`run_study`) counts an event early at any horizon, as
+#: the spec's entry-and-exit rule reads ("delistings and halts alike"). Run 3 records
+#: 382; the runner gives 383, the extra
+#: event being accession 0001000694-22-000009 (10-Q, entry 2022-05-10, no bar at
+#: its 20-session exit 2022-06-07, a bar at its 60-session exit 2022-08-04).
+DELISTED_DEPARTURE = "n_delisted_exits"
 
 
 def _design(tmp_path: Path) -> dict[str, Any]:
@@ -85,7 +95,15 @@ def _reproduce(
     `run.summarise_study`, as `run_study` calls them) over traded event rows."""
     rows = [{k: v for k, v in row.items() if not k.startswith("peer_n_")} for row in rows]
     processed, derived = match_events(rows, design)
-    return processed, derived, summarise_study(processed, counts, design)
+    return (
+        processed,
+        derived,
+        summarise_study(
+            processed,
+            {**counts, **{key: value for key, value in derived.items() if key in counts}},
+            design,
+        ),
+    )
 
 
 def _assert_same(actual: Mapping[str, Any], expected: Mapping[str, Any]) -> None:
@@ -118,10 +136,108 @@ def _assert_derived(
             assert value == recorded[key], key
 
 
-def _counts(secondary: Mapping[str, Any]) -> dict[str, Any]:
-    """The recorded counts passed through (they need the dropped and unlabelled
-    events, which the traded rows do not carry)."""
-    return {key: value for key, value in secondary.items() if key.startswith("n_")}
+def _counts(
+    rows: Sequence[Mapping[str, Any]], secondary: Mapping[str, Any], design: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Derive the counts the traded rows carry; pass through the recorded ones that
+    need the unlabelled and dropped events (`n_events_total`, `n_no_label`,
+    `n_dropped_*` before matching, `n_securities`), as the spec's stage A says."""
+    counts = {
+        key: value
+        for key, value in secondary.items()
+        if key.startswith("n_")
+        and (
+            (
+                key.startswith("n_dropped_")
+                and not key.startswith(("n_dropped_no_peers_", "n_dropped_small_size_group_"))
+            )
+            or key in {"n_events_total", "n_no_label", "n_securities"}
+        )
+    }
+    counts.update(
+        {
+            key: 0
+            for key in secondary
+            if key.startswith(("n_traded_", "n_dropped_no_peers_", "n_dropped_small_size_group_"))
+        }
+    )
+    for group in {str(row["group"]) for row in rows}:
+        if f"n_events_{group}" in secondary:
+            counts[f"n_events_{group}"] = sum(row["group"] == group for row in rows) + sum(
+                value
+                for key, value in counts.items()
+                if key.startswith("n_dropped_") and key.endswith(f"_{group}")
+            )
+    if DELISTED_DEPARTURE in secondary:
+        # `run_study`'s rule: one per event row early at any registered horizon.
+        counts[DELISTED_DEPARTURE] = sum(
+            any(row[f"exited_early_{int(h)}"] for h in design["horizons"]) for row in rows
+        )
+    return counts
+
+
+def _assert_stored_secondary(
+    tmp_path: Path, summary: Mapping[str, Any], artifact_path: Path
+) -> None:
+    """The production result writer persists this summary on a temp store."""
+    settings = Settings(_env_file=None).model_copy(
+        update={
+            "store": Settings(_env_file=None).store.model_copy(
+                update={"path": str(tmp_path / "golden.duckdb")}
+            )
+        }
+    )
+    parsed = parse_experiment_file(
+        tmp_path / "experiments" / C1B_FILE.name,
+        tmp_path / "experiments",
+        settings=settings,
+    )
+    export = tmp_path / "synthetic-export.json"
+    export.write_bytes(STAGE_A.read_bytes())
+    with open_for_write(settings) as conn:
+        schema.init_schema(conn)
+        research.register_experiment(conn, parsed, "test")
+        dataset = research.register_dataset(
+            conn,
+            name=parsed.dataset_name,
+            version="synthetic",
+            path=str(export),
+            sha256=hash_file(export),
+            event_start=parsed.window_start,
+            event_end=parsed.window_end,
+        )
+        handle = research.open_run(
+            conn, SLUG, dataset.dataset_id, "full", {}, "test", configurations=2, settings=settings
+        )
+    assert handle.refusal is None
+    primary = summary["primary"]
+    with open_for_write(settings) as conn:
+        assert (
+            research.write_result(
+                conn,
+                handle,
+                primary_value=float(primary["value"]),
+                primary_ci_low=float(primary["ci_low"]),
+                primary_ci_high=float(primary["ci_high"]),
+                n_observations=int(primary["n"]),
+                n_clusters=int(primary["n_clusters"]),
+                n_configurations=2,
+                artifact_sha256=hash_file(artifact_path),
+                artifact_path=str(artifact_path),
+                secondary=summary["secondary"],
+            )
+            == "ok"
+        )
+        row = conn.execute(
+            "SELECT secondary_json FROM research_results WHERE run_id = ?", [handle.run_id]
+        ).fetchone()
+    assert row is not None
+    stored = json.loads(row[0])
+    expected = {
+        key: None if isinstance(value, float) and not math.isfinite(value) else value
+        for key, value in summary["secondary"].items()
+    }
+    _assert_same(stored, expected)
 
 
 def test_synthetic_stage_a_through_the_golden_path(tmp_path: Path) -> None:
@@ -135,11 +251,14 @@ def test_synthetic_stage_a_through_the_golden_path(tmp_path: Path) -> None:
         "min_peers": 1,
     }
     expected = case["expected"]
-    rows, derived, summary = _reproduce(case["input"], _counts(expected["secondary"]), design)
+    rows, derived, summary = _reproduce(
+        case["input"], _counts(case["input"], expected["secondary"], design), design
+    )
     for row, probe_row in zip(rows, case["expected_rows"], strict=True):
         assert row["bucket"] == probe_row["bucket"]
     _assert_derived(derived, expected["secondary"], rows, design)
     _assert_same(summary["secondary"], expected["secondary"])
+    _assert_stored_secondary(tmp_path, summary, STAGE_A)
 
 
 def test_synthetic_kill_is_decided_by_t_not_bp_floor(tmp_path: Path) -> None:
@@ -187,11 +306,22 @@ def test_c1b_run3_secondary_from_the_artifact_event_rows(tmp_path: Path) -> None
     artifact = json.loads(data)
     expected = artifact["summary"]["secondary"]
     design = _design(tmp_path)
-    rows, derived, summary = _reproduce(_runner_rows(artifact["events"]), _counts(expected), design)
+    input_rows = _runner_rows(artifact["events"])
+    rows, derived, summary = _reproduce(input_rows, _counts(input_rows, expected, design), design)
     for row, probe_row in zip(rows, artifact["events"], strict=True):
         assert row["bucket"] == probe_row["bucket"], row["event_id"]
     _assert_derived(derived, expected, rows, design)
-    _assert_same(summary["secondary"], expected)
+    # The accepted delisted-exit departure is exactly the one known event.
+    assert (expected[DELISTED_DEPARTURE], summary["secondary"][DELISTED_DEPARTURE]) == (382, 383)
+    _assert_same(
+        summary["secondary"],
+        {
+            **expected,
+            ACCEPTED_DEPARTURE: derived[ACCEPTED_DEPARTURE],
+            DELISTED_DEPARTURE: summary["secondary"][DELISTED_DEPARTURE],
+        },
+    )
+    _assert_stored_secondary(tmp_path, summary, ARTIFACT)
     primary = artifact["summary"]["primary"]
     assert summary["primary"]["value"] == pytest.approx(primary["value"], rel=1e-9)
     assert (summary["primary"]["n"], summary["primary"]["n_clusters"]) == (
