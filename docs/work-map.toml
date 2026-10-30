@@ -1583,3 +1583,66 @@ why = "Completes the data side of the split, so data PRs stop touching config.py
 [task.T315]
 what = "The backtest sections, the family registry and the hypothesis enumerations move verbatim to config_backtest.py; frozen.py and hypothesis.py keep importing from config.py."
 why = "Backtest PRs stop colliding with data and paper PRs in config.py, and frozen keys and hashes stay byte-identical."
+
+[task.T317]
+what = "A read-only probe of SEC's daily index files: recorded fixtures, and whether the daily files add up to the quarterly index, keep its row order, carry validators, and when each day's file appears."
+why = "Its answers decide two owner rules and the table size before any schema work on the incremental nightly EDGAR ingest (#2629)."
+unblocks = ["task:T318", "task:T319a", "task:T319b"]
+
+[task.T318]
+what = "The filing_index table (the stamped EDGAR index with known_at = acceptance), its three state tables, the --check rules and the restamp match."
+why = "Storing the stamped index is what lets the nightly stop re-walking 33 years of EDGAR every run (#2629)."
+unblocks = ["task:T319", "task:T321", "task:T323a"]
+
+[task.T319]
+what = "The EDGAR adapter's incremental read: the new daily rows, the issuer rule, a new issuer's earlier rows, and stamps for new rows only."
+why = "It replaces the full-history walk that took 97 to 115 min a night with a read of what is new (#2629)."
+unblocks = ["task:T323"]
+
+[task.T319a]
+what = "The new EDGAR requests (daily directory listing, daily file, conditional GET of a quarterly file) and the pure choice of which daily files are unread or re-posted."
+why = "It is the cursor: the nightly reads only what it has not read, with no date guessed (#2629)."
+unblocks = ["task:T319"]
+
+[task.T319b]
+what = "The pure settled-quarter reconcile: which quarters to check on a run and how a quarterly index's rows compare with the stored ones."
+why = "It catches rows SEC adds to a closed quarter after the daily files, so the stored history stays complete (#2629)."
+unblocks = ["task:T319"]
+
+[task.T320]
+what = "A pure rule for which CIKs a night must rebuild: new filings, incomplete caches, retries, FSN periods, snapshot changes, list edits and clock-driven cases."
+why = "Rebuilding only those CIKs is what makes the nightly fast without changing any row a full rebuild would write (#2629)."
+unblocks = ["task:T323"]
+
+[task.T321]
+what = "The underived-row check carried forward for untouched CIKs, and a rotating read-only rebuild that checks every CIK against the store within 28 days."
+why = "It keeps health's master check complete and catches a rule change that missed its version bump (#2629)."
+unblocks = ["task:T323"]
+
+[task.T322]
+what = "A pure rule fingerprint over the settings, cache versions and schema the master builds read, plus a BUILD_RULES_VERSION constant."
+why = "A rule change must fail the nightly and ask for a full rebuild, never leave old rules on untouched names (#2629)."
+unblocks = ["task:T323", "task:T325"]
+
+[task.T323]
+what = "The ingest driver that runs the incremental nightly EDGAR path behind edgar.incremental_index, and the resumable --rebuild-index full walk."
+why = "It puts the pieces together behind one switch, so the owner can roll back to today's full walk (#2629)."
+unblocks = ["task:T323b"]
+
+[task.T323a]
+what = "The master, classification, delisting and 13D readers move from the quarterly walk to the filing_index table, which becomes the one stamp source."
+why = "It removes the last full-history list from memory, the fix #2623 asked for (#2629)."
+unblocks = ["task:T323", "task:T325"]
+
+[task.T323b]
+what = "The 100-day proof that an incremental store equals a full rebuild, and that peak memory stays flat from 2 to 20 years of history."
+why = "It is the evidence that the speed-up changes no stored fact (#2629)."
+unblocks = ["task:T324"]
+
+[task.T324]
+what = "Owner step: seed the table on the real store, compare on a copy, turn the key on, and post 5 nightly runs' times and memory."
+why = "The nightly EDGAR run drops from about 2 hours and 4 GB to minutes and flat memory, after the 2026-10-31 sitting (#2629)."
+
+[task.T325]
+what = "Conditional: an order-free rule for which index row of an accession the 13D and delisting paths take, built only if the probe finds daily and quarterly files order rows differently."
+why = "The incremental and full builds must pick the same row whatever file they read it from (#2629, owner decision 4)."
