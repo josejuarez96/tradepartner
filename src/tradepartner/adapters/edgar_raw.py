@@ -63,7 +63,9 @@ import threading
 import time
 import zipfile
 import zlib
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -259,6 +261,21 @@ def _backoff_seconds(
     )
 
 
+_retry_observer: ContextVar[Callable[[], None] | None] = ContextVar(
+    "edgar_retry_observer", default=None
+)
+
+
+@contextmanager
+def observe_retries(observer: Callable[[], None]) -> Iterator[None]:
+    """Count actual retry waits for one caller without changing the shared limiter."""
+    token = _retry_observer.set(observer)
+    try:
+        yield
+    finally:
+        _retry_observer.reset(token)
+
+
 class _RetryPolicy:
     """One request's retry state and decisions (see the module docstring),
     shared by `_execute_with_retry` and the streamed `GET` in
@@ -282,6 +299,8 @@ class _RetryPolicy:
         if self._attempt + 1 >= self._settings.edgar.retry_max_attempts:
             return False
         time.sleep(_backoff_seconds(self._attempt, self._settings, None))
+        if observer := _retry_observer.get():
+            observer()
         self._attempt += 1
         return True
 
@@ -300,6 +319,8 @@ class _RetryPolicy:
         if status in _TRANSIENT_STATUS_CODES:
             if self._attempt + 1 < self._settings.edgar.retry_max_attempts:
                 time.sleep(_backoff_seconds(self._attempt, self._settings, response))
+                if observer := _retry_observer.get():
+                    observer()
                 self._attempt += 1
                 return True
             if status == _BLOCK_429_STATUS_CODE:
@@ -318,6 +339,8 @@ class _RetryPolicy:
         self._rate_limit_waited = True
         _RATE_LIMIT_BLOCK.set()
         time.sleep(self._settings.edgar.rate_limit_wait_seconds)
+        if observer := _retry_observer.get():
+            observer()
         return True
 
 

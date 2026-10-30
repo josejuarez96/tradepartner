@@ -152,8 +152,12 @@ class FixtureFilingSource(FilingSource):
     def filing_events(self, cik: str) -> list[FilingEvent]:
         return [e for e in self._filing_events if e.cik == cik]
 
-    def sec_forms_13d(self) -> list[SecFormFiling]:
-        return list(self._sec_forms_13d)
+    def sec_forms_13d(self, subjects: frozenset[str] | None = None) -> list[SecFormFiling]:
+        return [
+            filing
+            for filing in self._sec_forms_13d
+            if subjects is None or any(cik in subjects for cik in filing.subject_ciks)
+        ]
 
     def filename_listings(self, cik: str) -> list[FilenameListing]:
         return [e for e in self._filename_listings if e.cik == cik]

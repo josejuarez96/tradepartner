@@ -286,7 +286,7 @@ import re
 import shutil
 import zipfile
 import zlib
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
@@ -593,6 +593,17 @@ class EdgarFilingSource(FilingSource):
         self.filing_events_clock_suspect = 0
         self.filing_events_clock_suspect_accessions: list[str] = []
         self.sec_forms_counts: dict[str, int] = defaultdict(int)
+        self.sec_forms_requests: dict[str, int] = defaultdict(
+            int,
+            total=0,
+            headers=0,
+            submissions=0,
+            submissions_pages=0,
+            other=0,
+            retries_backoffs=0,
+        )
+        self._sec_header_text: OrderedDict[tuple[str, str, int], str] = OrderedDict()
+        self._sec_forms_request_active = False
         self._sec_forms_counted: set[tuple[str, str]] = set()
         self._clock_suspect_seen: set[tuple[str, str]] = set()
         self._open_quarters: dict[Quarter, str] = {}
@@ -745,6 +756,30 @@ class EdgarFilingSource(FilingSource):
 
     def _count(self, request: httpx.Request) -> None:
         self.requests += 1
+        if not self._sec_forms_request_active:
+            return
+        self.sec_forms_requests["total"] += 1
+        path = request.url.path
+        if path.endswith(".txt") and "/Archives/edgar/data/" in path:
+            self.sec_forms_requests["headers"] += 1
+        elif re.fullmatch(r"/submissions/CIK\d{10}\.json", path):
+            self.sec_forms_requests["submissions"] += 1
+        elif path.startswith("/submissions/"):
+            self.sec_forms_requests["submissions_pages"] += 1
+        else:
+            self.sec_forms_requests["other"] += 1
+
+    def _sec_header(self, cik: str, accession: str, size: int) -> str:
+        key = (cik, accession, size)
+        if key not in self._sec_header_text:
+            self._sec_header_text[key] = edgar_raw.filing_sgml_header(
+                cik, accession, header_bytes=size, settings=self._settings, client=self._client
+            )
+            if len(self._sec_header_text) > 8:
+                self._sec_header_text.popitem(last=False)
+        else:
+            self._sec_header_text.move_to_end(key)
+        return self._sec_header_text[key]
 
     def _now(self) -> datetime:
         return ensure_tz_aware_utc(self._clock(), field_name="clock()")
@@ -1002,9 +1037,7 @@ class EdgarFilingSource(FilingSource):
         sizes = (self._settings.edgar.header_bytes, self._settings.edgar.stamp_header_bytes)
         for attempt, size in enumerate(sizes):
             try:
-                text = edgar_raw.filing_sgml_header(
-                    cik, accession, header_bytes=size, settings=self._settings, client=self._client
-                )
+                text = self._sec_header(cik, accession, size)
                 return sgml_acceptance(text, accession)
             except httpx.HTTPStatusError as error:
                 if error.response.status_code not in (404, 410):
@@ -1214,9 +1247,7 @@ class EdgarFilingSource(FilingSource):
             (self._settings.edgar.header_bytes, self._settings.edgar.stamp_header_bytes)
         )
         for size in sizes:
-            document = edgar_raw.filing_sgml_header(
-                cik, accession, header_bytes=size, settings=self._settings, client=self._client
-            )
+            document = self._sec_header(cik, accession, size)
             if "</SEC-HEADER>" in document:
                 return document
         raise ValueError(f"{accession}: SGML header truncated at stamp_header_bytes")
@@ -1311,15 +1342,32 @@ class EdgarFilingSource(FilingSource):
             parsed.transactions,
         )
 
-    def sec_forms_13d(self) -> list[SecFormFiling]:
+    def sec_forms_13d(self, subjects: frozenset[str] | None = None) -> list[SecFormFiling]:
         """Discover all 13D spellings, including filings under filer-only CIKs.
 
-        The ingest filters parsed subjects against issuer securities. Index CIKs
-        never qualify a subject or create a security.
+        The caller's subject set skips cached non-subjects before any request.
+        Index CIKs never qualify a subject or create a security.
         """
         if not self._settings.events.sec_forms_enabled:
             return []
-        start = (self._settings.edgar.index_first_year, 1)
+        self._sec_forms_request_active = True
+        try:
+            with edgar_raw.observe_retries(self._sec_retry):
+                return self._sec_forms_13d_impl(subjects)
+        finally:
+            self._sec_forms_request_active = False
+
+    def _sec_retry(self) -> None:
+        self.sec_forms_requests["retries_backoffs"] += 1
+
+    def _sec_forms_13d_impl(self, subjects: frozenset[str] | None) -> list[SecFormFiling]:
+        start = (
+            max(
+                self._settings.edgar.index_first_year,
+                self._settings.events.sec_forms_backfill_start.year,
+            ),
+            1,
+        )
         last = quarter_of(self._now())
         quarters = [
             (y, q)
@@ -1332,13 +1380,40 @@ class EdgarFilingSource(FilingSource):
         )
         accessions: dict[str, UnstampedFiling] = {}
         for _, row in self._rows(quarters, last):
-            if row.form in wanted:
+            if (
+                row.form in wanted
+                and row.filed_on >= self._settings.events.sec_forms_backfill_start
+            ):
                 accessions.setdefault(row.accession, row)
         result: list[SecFormFiling] = []
         for accession, row in accessions.items():
             if self._sec_identity_missing(accession):
                 self._sec_count("identity_missing", accession)
                 continue
+            parties = self._sec_cached_parties(accession, row.form)
+            if (
+                parties is not None
+                and subjects is not None
+                and not subjects.intersection(parties.subject_ciks)
+            ):
+                continue
+            if parties is None and row.form.startswith("SC "):
+                document = self._guarded(
+                    accession,
+                    row.form.removesuffix("/A"),
+                    partial(self._sec_13d_header, row.cik, accession),
+                )
+                if document is None:
+                    self._sec_count("fetch_failed", accession)
+                    continue
+                try:
+                    parties = parse_sgml_13d_parties(document, accession)
+                except ValueError:
+                    self._sec_mark_identity_missing(accession)
+                    continue
+                self._sec_save_parties(accession, row.form, parties)
+                if subjects is not None and not subjects.intersection(parties.subject_ciks):
+                    continue
             record = self._sec_stamped(row.cik, accession, row.filed_on)
             if record is None or record.accepted_at is None:
                 continue
@@ -1365,6 +1440,8 @@ class EdgarFilingSource(FilingSource):
                     self._sec_mark_identity_missing(accession)
                     continue
                 self._sec_save_parties(accession, row.form, parties)
+            if subjects is not None and not subjects.intersection(parties.subject_ciks):
+                continue
             result.append(
                 SecFormFiling(
                     accession,
