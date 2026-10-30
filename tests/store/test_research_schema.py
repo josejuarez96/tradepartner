@@ -317,7 +317,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_SEC_FORMS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_NOT_COMPUTABLE_VERSION + 1
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -378,7 +378,7 @@ def test_the_enumerations_are_the_specs_sets() -> None:
         "refused_budget",
         "abandoned",
     )
-    assert schema.RESEARCH_VERDICTS == ("pass", "fail", "underpowered", "n/a")
+    assert schema.RESEARCH_VERDICTS == ("pass", "fail", "underpowered", "n/a", "not_computable")
     assert schema.RESEARCH_DECISION_KINDS == ("holdout_spend", "budget_amend")
 
 
@@ -824,3 +824,101 @@ def test_a_read_only_open_of_a_version_15_store_passes(tmp_path: Path) -> None:
     with duckdb.connect(str(path), read_only=True) as c:
         schema.init_schema(c)
         schema.require_research(c)
+
+
+# --- version 41: the `not_computable` verdict (#2617) -------------------------------
+
+#: `research_results.verdict`'s `CHECK` as version 40 left it.
+_V40_VERDICT_CHECK = "CHECK (verdict IS NULL OR verdict IN ('pass', 'fail', 'underpowered', 'n/a'))"
+
+
+def _version_40_store(path: Path) -> list[tuple[Any, ...]]:
+    """A store as version 40 left it: `research_results` with the four-verdict
+    `CHECK` and three rows, and no version-41 row. Returns the rows in order."""
+    with duckdb.connect(str(path)) as c:
+        schema.init_schema(c)
+        ddl = schema._CREATE_RESEARCH_RESULTS.replace(
+            schema._research_check("research_results", "verdict", nullable=True),
+            _V40_VERDICT_CHECK,
+            1,
+        )
+        assert ddl != schema._CREATE_RESEARCH_RESULTS
+        c.execute("DROP TABLE research_results")
+        c.execute(ddl)
+        for run_id, outcome, verdict in ((3, "ok", "fail"), (1, "failed", None), (2, "ok", "n/a")):
+            insert_row(
+                c,
+                "research_results",
+                _row(
+                    "research_results",
+                    run_id=run_id,
+                    outcome=outcome,
+                    verdict=verdict,
+                    primary_ci_low=float("nan") if run_id == 3 else 0.5,
+                ),
+            )
+        with pytest.raises(duckdb.ConstraintException):
+            insert_row(
+                c,
+                "research_results",
+                _row("research_results", run_id=9, verdict="not_computable"),
+            )
+        c.execute("DELETE FROM schema_version")
+        c.execute(
+            "INSERT INTO schema_version VALUES (?, ?)",
+            [schema._PRE_NOT_COMPUTABLE_VERSION, KNOWN],
+        )
+        assert max(_versions(c)) == 40
+        return c.execute("SELECT * FROM research_results ORDER BY rowid").fetchall()
+
+
+def _same_rows(a: list[tuple[Any, ...]], b: list[tuple[Any, ...]]) -> bool:
+    """Row equality with NaN equal to itself."""
+    return repr(a) == repr(b)
+
+
+def test_the_migration_from_version_40_widens_the_verdict_check(tmp_path: Path) -> None:
+    path = tmp_path / "v40.duckdb"
+    rows = _version_40_store(path)
+    with duckdb.connect(str(path)) as c:
+        before = {name: sql for name, sql in _ddl(c).items() if name != "research_results"}
+        schema.init_schema(c)
+        assert _versions(c) == [40, 41]
+        assert "'not_computable'" in schema._check_text(c, "research_results", "verdict")
+        # Every row kept, byte-identical, in insertion order; no other table moved.
+        assert _same_rows(
+            c.execute("SELECT * FROM research_results ORDER BY rowid").fetchall(), rows
+        )
+        assert {n: s for n, s in _ddl(c).items() if n != "research_results"} == before
+        assert _ddl(c)["research_results"] == conn_ddl()
+        insert_row(
+            c, "research_results", _row("research_results", run_id=9, verdict="not_computable")
+        )
+        with pytest.raises(duckdb.ConstraintException):
+            insert_row(c, "research_results", _row("research_results", run_id=10, verdict="x"))
+        with pytest.raises(duckdb.ConstraintException):
+            insert_row(c, "research_results", _row("research_results", run_id=3))
+        # Idempotent: a second open changes nothing.
+        after = _ddl(c)
+        schema.init_schema(c)
+        assert _ddl(c) == after
+        assert _versions(c) == [40, 41]
+
+
+def conn_ddl() -> str:
+    """`research_results`'s stored DDL on a fresh store."""
+    with duckdb.connect(":memory:") as c:
+        schema.init_schema(c)
+        return _ddl(c)["research_results"]
+
+
+def test_a_read_only_open_of_a_version_40_store_serves_research_reads(tmp_path: Path) -> None:
+    path = tmp_path / "v40.duckdb"
+    rows = _version_40_store(path)
+    with duckdb.connect(str(path), read_only=True) as c:
+        schema.init_schema(c)
+        schema.require_research(c)
+        assert schema.stored_version(c) == 40
+        assert _same_rows(
+            c.execute("SELECT * FROM research_results ORDER BY rowid").fetchall(), rows
+        )
