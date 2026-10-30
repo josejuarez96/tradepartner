@@ -121,7 +121,9 @@ def _app(
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Home")
     if view is not None:
         monkeypatch.setattr(home_view, "build", lambda conn, settings, now: view)
-    monkeypatch.setattr(ops, "performance_data", lambda conn, settings, book_id=None: _perf())
+    monkeypatch.setattr(
+        ops, "performance_data", lambda conn, settings, book_id=None, *, now: _perf()
+    )
     at = AppTest.from_file(_APP_PATH, default_timeout=30)
     at.run()
     assert not at.exception
