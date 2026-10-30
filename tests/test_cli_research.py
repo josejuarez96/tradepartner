@@ -1141,8 +1141,11 @@ def test_study_refuses_a_handle_from_another_store(
 def test_study_closes_the_run_failed_on_any_exception_scrubbed(
     study_ready: int, config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    settings = get_settings()
+    paths = (str(Path.home()), settings.store.path)
+
     def boom(*args: object, **kwargs: object) -> None:
-        raise RuntimeError(f"bars unreadable {ALPACA_KEY}")
+        raise RuntimeError(f"bars unreadable {ALPACA_KEY}; {'; '.join(paths)}")
 
     monkeypatch.setattr(cli, "run_study", boom)
     run = _first_int(_open_study(study_ready, config_file), "run")
@@ -1154,6 +1157,22 @@ def test_study_closes_the_run_failed_on_any_exception_scrubbed(
     )
     assert outcome == "failed"
     assert message.startswith("RuntimeError: bars unreadable") and ALPACA_KEY not in message
+    assert message.count("<path>") == 2
+    assert out.stdout.count("<path>") == 2
+    for path in paths:
+        assert path not in message
+        assert path not in out.stdout
+
+
+def test_study_scrub_keeps_secret_scrub_with_empty_configured_paths() -> None:
+    settings = get_settings()
+    empty = settings.model_copy(
+        update={
+            "store": settings.store.model_copy(update={"path": ""}),
+            "research": settings.research.model_copy(update={"data_dir": ""}),
+        }
+    )
+    assert cli._study_scrubbed(f"failed: {ALPACA_KEY}", empty) == "failed: <scrubbed>"
 
 
 def test_study_closes_the_run_failed_on_ctrl_c_and_exits_130(

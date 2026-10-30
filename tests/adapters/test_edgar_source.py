@@ -632,6 +632,99 @@ def test_filing_index_scans_once_per_source_and_returns_independent_lists(
     assert other_walks == 2
 
 
+# --- #2616: memory over a long history ---------------------------------------
+
+_MANY_CIKS = 30
+
+
+def _synthetic_history(settings: Settings) -> list[FilingIndexEntry]:
+    """Cache a 2024 Q1 to 2026 Q3 index of `_MANY_CIKS` issuers, three filings
+    each a quarter, and every one already stamped, so `filing_index` reads
+    the cache only. Returns the entries it must give, sorted as it sorts."""
+    cache = Path(settings.edgar.cache_dir)
+    quarters = [(y, q) for y in (2024, 2025, 2026) for q in (1, 2, 3, 4) if (y, q) <= (2026, 3)]
+    stamps: dict[str, dict[str, list[object]]] = {}
+    expected: list[FilingIndexEntry] = []
+    for year, qtr in quarters:
+        lines = []
+        for n in range(1, _MANY_CIKS + 1):
+            cik = f"{n:010d}"
+            for k, form in enumerate(("10-Q", "8-K", "4")):
+                accession = f"{n:010d}-{year % 100:02d}-{qtr * 10 + k:06d}"
+                filed = date(year, qtr * 3 - 2, 10 + k)
+                lines.append(index_line(form, f"Issuer {n} Inc", n, filed.isoformat(), accession))
+                at = datetime(filed.year, filed.month, filed.day, 15, tzinfo=UTC)
+                stamps.setdefault(cik, {})[accession] = [form, "d.htm", False, at.isoformat(), ""]
+                expected.append(FilingIndexEntry(cik, f"Issuer {n} Inc", form, accession, at))
+        path = cache / "index" / f"{year}-QTR{qtr}.idx.gz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(gzip.compress(_synthetic(*lines).encode("utf-8"), mtime=0))
+    for cik, records in stamps.items():
+        path = cache / "stamps" / "v1" / f"{cik}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "layout": STAMPS_LAYOUT,
+            "cik": cik,
+            "items_refreshed": True,
+            "records": records,
+        }
+        path.write_text(json.dumps(payload))
+    return sorted(expected, key=lambda e: (e.accepted_at, e.accession, e.cik))
+
+
+class _TrackedStamps(dict[str, SubmissionRecord]):
+    """A loaded stamps dict that `weakref.finalize` can watch."""
+
+
+def test_filing_index_holds_one_ciks_stamps_at_a_time_not_every_ciks(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2616: every issuer's full-history stamps were loaded at once, beside
+    every kept row, so the peak grew with the history (13 GB on the real
+    cache). With nothing to stamp, a CIK's stamps are read, used and dropped
+    before the next CIK's are read."""
+    import weakref
+
+    expected = _synthetic_history(settings)
+    router = EdgarRouter()
+    source = _source(settings, router)
+    original = source._load_stamps
+    alive = most = 0
+
+    def dropped() -> None:
+        nonlocal alive
+        alive -= 1
+
+    def tracked(cik: str) -> dict[str, SubmissionRecord]:
+        nonlocal alive, most
+        loaded = _TrackedStamps(original(cik))
+        weakref.finalize(loaded, dropped)
+        alive += 1
+        most = max(most, alive)
+        return loaded
+
+    monkeypatch.setattr(source, "_load_stamps", tracked)
+    assert source.filing_index() == expected
+    assert router.urls == []
+    assert most <= 2  # the CIK being read, and the one just used
+
+
+def test_filing_index_entries_share_one_string_per_cik_name_and_form(
+    settings: Settings,
+) -> None:
+    """#2616: each index row carried its own copy of its CIK, company name and
+    form; the kept entries now share one string object per distinct value,
+    so what the source keeps for its lifetime is one accession and one
+    stamp per filing."""
+    expected = _synthetic_history(settings)
+    entries = _source(settings, EdgarRouter()).filing_index()
+    assert entries == expected
+    for field in ("cik", "company_name", "form"):
+        values = {getattr(e, field) for e in entries}
+        assert len({id(getattr(e, field)) for e in entries}) == len(values), field
+
+
 def test_a_quarter_is_cached_only_once_settled_and_the_open_quarter_may_404(
     settings: Settings,
 ) -> None:
