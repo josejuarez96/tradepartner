@@ -86,7 +86,11 @@ def test_sec_13d_discovery_reads_filer_index_and_document_subject(
 ) -> None:
     settings = edgar_settings(tmp_path)
     settings = settings.model_copy(
-        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2009, 1, 1)}
+            )
+        }
     )
     source = EdgarFilingSource(settings, clock=lambda: CLOCK)
     accession = "0000950123-09-012345"
@@ -265,7 +269,11 @@ def test_sec_13d_truncated_header_retries_larger_cap_then_keeps_failure_retryabl
 ) -> None:
     settings = edgar_settings(tmp_path)
     settings = settings.model_copy(
-        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2009, 1, 1)}
+            )
+        }
     )
     source = EdgarFilingSource(settings, clock=lambda: CLOCK)
     accession = "0000950123-09-012345"
@@ -298,6 +306,102 @@ def test_sec_13d_truncated_header_retries_larger_cap_then_keeps_failure_retryabl
     assert source2.sec_forms_13d() == []
     assert source2.sec_forms_counts["fetch_failed"] == 1
     assert not source2._sec_identity_missing(accession)
+
+
+def test_sec_13d_filters_recorded_subject_before_stamp_and_reuses_header(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2009, 1, 1)}
+            )
+        }
+    )
+    accession = "0000950123-09-012345"
+    row = UnstampedFiling("0000222222", "Activist", "SC 13D", accession, date(2009, 5, 11))
+    header = (FIXTURES / "sec_forms/sgml_header_sc13d_unstructured.txt").read_text()
+    requests: list[httpx.Request] = []
+
+    def response(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(206, text=header)
+
+    source = EdgarFilingSource(
+        settings, client=httpx.Client(transport=httpx.MockTransport(response)), clock=lambda: CLOCK
+    )
+    monkeypatch.setattr(source, "_rows", lambda *_: iter([((2009, 2), row)]))
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_: pytest.fail("non-subject stamped"))
+    assert source.sec_forms_13d(frozenset({"0000999999"})) == []
+    assert len(requests) == 1
+    assert source.sec_forms_requests["headers"] == 1
+    assert source.sec_forms_requests["submissions"] == 0
+    assert source.sec_forms_13d(frozenset({"0000999999"})) == []
+    assert len(requests) == 1
+    stamp = SubmissionRecord(accession, row.form, "", False, CLOCK, filing_date=row.filed_on)
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_: stamp)
+    assert source.sec_forms_13d(frozenset({"0000111111"}))[0].subject_ciks == ("0000111111",)
+    assert len(requests) == 1
+
+
+def test_sec_13d_backfill_start_skips_old_index_row_before_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    row = UnstampedFiling(
+        "0000222222", "Activist", "SC 13D", "0000950123-09-012345", date(2009, 5, 11)
+    )
+    monkeypatch.setattr(source, "_rows", lambda *_: iter([((2009, 2), row)]))
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_: pytest.fail("old filing stamped"))
+    assert source.sec_forms_13d(frozenset({"0000111111"})) == []
+    assert source.sec_forms_requests["total"] == 0
+
+
+def test_sec_13d_request_counter_includes_retry_backoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path, retry_backoff_seconds=0.001)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2009, 1, 1)}
+            )
+        }
+    )
+    accession = "0000950123-09-012345"
+    row = UnstampedFiling("0000222222", "Activist", "SC 13D", accession, date(2009, 5, 11))
+    header = (FIXTURES / "sec_forms/sgml_header_sc13d_unstructured.txt").read_text()
+    attempts = 0
+
+    def response(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503) if attempts == 1 else httpx.Response(206, text=header)
+
+    source = EdgarFilingSource(
+        settings, client=httpx.Client(transport=httpx.MockTransport(response)), clock=lambda: CLOCK
+    )
+    monkeypatch.setattr(source, "_rows", lambda *_: iter([((2009, 2), row)]))
+    assert source.sec_forms_13d(frozenset({"0000999999"})) == []
+    assert source.sec_forms_requests["total"] == 2
+    assert source.sec_forms_requests["headers"] == 2
+    assert source.sec_forms_requests["retries_backoffs"] == 1
+    source._sec_forms_request_active = True
+    source._count(httpx.Request("GET", "https://data.sec.gov/submissions/CIK0000222222.json"))
+    source._count(
+        httpx.Request("GET", "https://data.sec.gov/submissions/CIK0000222222-submissions-001.json")
+    )
+    source._sec_forms_request_active = False
+    assert source.sec_forms_requests["submissions"] == 1
+    assert source.sec_forms_requests["submissions_pages"] == 1
+    for n in range(9):
+        source._sec_header("0000222222", f"0000950123-09-{n:06d}", settings.edgar.header_bytes)
+    assert len(source._sec_header_text) == 8
 
 
 CLOCK = datetime(2026, 9, 25, tzinfo=UTC)
