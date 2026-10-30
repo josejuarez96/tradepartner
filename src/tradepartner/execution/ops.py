@@ -322,6 +322,7 @@ class OpsData:
     open_orders_count: int = 0
     last_run_kind: str | None = None
     last_run_session: date | None = None
+    last_run_message: str | None = None
     targets_count: int = 0
     plan_known_at: datetime | None = None
     switch_state: SwitchState | None = None
@@ -360,6 +361,7 @@ class BookSummary:
     #: now, never before the window's first rebalance; None for a window that is
     #: no longer open or whose cadence cannot be read.
     next_rebalance_session: date | None
+    last_run_message: str | None = None
 
 
 def rebalance_traded_today(row: BookSummary) -> date | None:
@@ -928,7 +930,8 @@ def page_data(
     released_at = max((r.at for r in kill_switch_rows if r.state == "released"), default=None)
     runs_with_results = _runs_for_switch(conn, window_id, released_at=released_at)
     runs = [rw.run for rw in runs_with_results]
-    latest_run = max(runs, key=lambda r: r.run_id or 0, default=None)
+    latest_run_with_result = max(runs_with_results, key=lambda rw: rw.run.run_id or 0, default=None)
+    latest_run = latest_run_with_result.run if latest_run_with_result is not None else None
     results = [rw.result for rw in runs_with_results if rw.result is not None]
 
     s_minus_1 = _required_run_session(utc_now())
@@ -979,6 +982,11 @@ def page_data(
         open_orders_count=open_orders_count,
         last_run_kind=latest_run.kind if latest_run is not None else None,
         last_run_session=latest_run.session if latest_run is not None else None,
+        last_run_message=(
+            latest_run_with_result.result.message
+            if latest_run_with_result is not None and latest_run_with_result.result is not None
+            else None
+        ),
         targets_count=targets_count,
         plan_known_at=plan.known_at if plan is not None else None,
         switch_state=switch_state,
@@ -1165,6 +1173,7 @@ def _summary(conn: duckdb.DuckDBPyConnection, settings: Settings, book: str) -> 
         next_rebalance_session=(
             _next_rebalance_session(conn, window, utc_now()) if is_open else None
         ),
+        last_run_message=latest_run.result.message if latest_run and latest_run.result else None,
     )
 
 

@@ -171,6 +171,16 @@ def test_quiet_page_says_nothing_needs_you_and_uses_no_orange(
     assert "orange" not in _text(at)
 
 
+def test_home_page_shows_owner_note_and_omits_empty_run_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    card = replace(_QUIET.books[0], last_run_message="check fill")
+    at = _app(monkeypatch, tmp_path, replace(_QUIET, books=(card,)))
+    assert "Last run: check fill" in _text(at)
+    at = _app(monkeypatch, tmp_path, replace(_QUIET, books=(replace(card, last_run_message=None),)))
+    assert "Last run:" not in _text(at)
+
+
 def test_loud_page_shows_each_item_in_orange_with_its_command_as_copyable_text(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -40,7 +40,14 @@ from tradepartner import health
 from tradepartner.calendar import last_completed_session
 from tradepartner.config import Settings
 from tradepartner.dashboard import header, research_page
-from tradepartner.execution import book_activity, book_holdings, book_stats, ops, waiting
+from tradepartner.execution import (
+    book_activity,
+    book_holdings,
+    book_stats,
+    ops,
+    paper_message,
+    waiting,
+)
 from tradepartner.store import registry, schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -166,6 +173,7 @@ class BookCard:
     cash: float | None
     top_names: tuple[str, ...]
     unreadable: bool
+    last_run_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -326,6 +334,7 @@ def _card(
     return BookCard(
         summary.book_id, _pill(summary), strategy_sentence(conn, summary), session, equity,
         since, spy, digest, count, cash, top, unreadable,
+        paper_message.owner_message(summary.last_run_message),
     )  # fmt: skip
 
 
