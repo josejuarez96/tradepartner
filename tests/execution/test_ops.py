@@ -1116,6 +1116,49 @@ def test_marks_filter_does_not_depend_on_the_trading_calendar(
     assert data.positions_value == 30.0
 
 
+def _mark_session_rows(
+    journal_settings: Settings, seeded: dict[str, int], rows: list[tuple[str, float, str]]
+) -> None:
+    """Append (security_id, value, position_side) marks after the seeded session."""
+    last_session = next_session(_S_MINUS_1)
+    with open_for_write(journal_settings) as conn:
+        for i, (sid, value, side) in enumerate(rows):
+            append(
+                conn,
+                PositionDailyRow(
+                    run_id=seeded["run_id"],
+                    session=last_session,
+                    security_id=sid,
+                    quantity=value / 10.0,
+                    mark_price=10.0,
+                    value=value,
+                    position_side=side,
+                    **_stamp(80 + i),
+                ),
+            )
+
+
+def test_positions_value_is_long_minus_short(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """A short's mark is unsigned (paper spec #1872 item 10), so the status
+    value is long minus short, as `equity_at` counts it (#2561, #2547)."""
+    _mark_session_rows(journal_settings, seeded, [("LLL", 100.0, "long"), ("SSS", 40.0, "short")])
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings)
+    assert data.positions_count == 2
+    assert data.positions_value == 60.0
+
+
+def test_long_only_positions_value_is_unchanged(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    _mark_session_rows(journal_settings, seeded, [("LLL", 100.0, "long"), ("MMM", 30.0, "long")])
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings)
+    assert data.positions_value == 130.0
+
+
 def test_kill_switch_read_is_at_most_two_rows_and_matches_derive(
     journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
 ) -> None:
