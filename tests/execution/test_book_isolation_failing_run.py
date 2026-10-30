@@ -338,7 +338,10 @@ def test_book_bs_next_run_after_book_as_failure_is_valid(
     assert outcome.status == "ok", b.result(b.latest_run())
     assert outcome.kind == "rebalance"
     assert not outcome.engaged
-    assert b.result(outcome.run_id) == ("ok", None, None)
+    status, fault, message = b.result(outcome.run_id)
+    # Only timing notes (#2620) may ride on an ok rebalance's message.
+    assert (status, fault) == ("ok", None)
+    assert all(part.startswith("paper_phase ") for part in (message or "").split("; ") if part)
     ((planned,),) = b.query("SELECT n_targets FROM paper_plans WHERE run_id = ?", [outcome.run_id])
     b_submits = b.submits()
     b_ids = [request.client_order_id for request in b_submits]
