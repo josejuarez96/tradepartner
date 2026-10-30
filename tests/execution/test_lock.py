@@ -184,3 +184,37 @@ def test_main_also_holds_the_pre_book_lock_across_the_upgrade(settings: Settings
         pass
     assert legacy_lock_path(settings) == Path(f"{settings.store.path}.paper.lock")
     assert not is_held(settings)
+
+
+def _linked(tmp_path: Path) -> tuple[Settings, Settings]:
+    """Settings on a store and on a file symlink to it (#2557)."""
+    real = tmp_path / "real" / "tp.duckdb"
+    real.parent.mkdir()
+    real.touch()
+    link = tmp_path / "link.duckdb"
+    link.symlink_to(real)
+    return (
+        Settings(_env_file=None, store={"path": str(real)}),
+        Settings(_env_file=None, store={"path": str(link)}),
+    )
+
+
+def test_a_symlink_and_its_target_take_the_same_lock_path(tmp_path: Path) -> None:
+    real, link = _linked(tmp_path)
+    assert lock_path(link) == lock_path(real)
+    assert legacy_lock_path(link) == legacy_lock_path(real)
+
+
+def test_holding_through_the_symlink_refuses_the_target(tmp_path: Path) -> None:
+    real, link = _linked(tmp_path)
+    with run_lock(link), pytest.raises(LockHeld), run_lock(real):
+        pass
+    with run_lock(real), pytest.raises(LockHeld), run_lock(link):
+        pass
+
+
+def test_an_unsymlinked_store_keeps_todays_lock_names(tmp_path: Path) -> None:
+    store = tmp_path.resolve() / "data" / "tradepartner.duckdb"
+    s = Settings(_env_file=None, store={"path": str(store)})
+    assert lock_path(s, "daily") == Path(f"{store}.paper.daily.lock")
+    assert legacy_lock_path(s) == Path(f"{store}.paper.lock")
