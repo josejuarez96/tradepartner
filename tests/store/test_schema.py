@@ -2373,7 +2373,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_SEC_FORMS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_NOT_COMPUTABLE_VERSION + 1
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
@@ -2955,23 +2955,23 @@ def test_version_39_adds_only_spinoff_allocations() -> None:
         schema.init_schema(conn)
         for table in ("spinoff_allocations", "sec_filing_events", "sec_form4_transactions"):
             conn.execute(f"DROP TABLE {table}")
-        conn.execute("DELETE FROM schema_version WHERE version IN (39, 40)")
+        conn.execute("DELETE FROM schema_version WHERE version IN (39, 40, 41)")
         conn.execute("INSERT INTO schema_version VALUES (38, TIMESTAMPTZ '2026-10-27 00:00:00+00')")
         before = _shape(conn)
         versions = _versions(conn)
         assert versions == [38]
         schema.init_schema(conn)
         after = _shape(conn)
-        # The same open also takes T306's version 40 (#2539).
+        # The same open also takes T306's version 40 (#2539) and 41 (#2617).
         assert set(after) - set(before) == {
             "spinoff_allocations",
             "sec_filing_events",
             "sec_form4_transactions",
         }
         assert {name: after[name] for name in before} == before
-        assert _versions(conn) == [38, 39, 40]
+        assert _versions(conn) == [38, 39, 40, 41]
         schema.init_schema(conn)
-        assert _versions(conn) == [38, 39, 40]
+        assert _versions(conn) == [38, 39, 40, 41]
     finally:
         conn.close()
 
@@ -2982,7 +2982,7 @@ def test_read_only_version_38_store_keeps_existing_reads(tmp_path: Path) -> None
     schema.init_schema(conn)
     for table in ("spinoff_allocations", "sec_filing_events", "sec_form4_transactions"):
         conn.execute(f"DROP TABLE {table}")
-    conn.execute("DELETE FROM schema_version WHERE version IN (39, 40)")
+    conn.execute("DELETE FROM schema_version WHERE version IN (39, 40, 41)")
     conn.execute("INSERT INTO schema_version VALUES (38, TIMESTAMPTZ '2026-10-27 00:00:00+00')")
     conn.close()
     ro = duckdb.connect(str(path), read_only=True)
