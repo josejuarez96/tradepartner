@@ -114,6 +114,11 @@ def load_bulk_quarters(
                 saved = loaded
         except (OSError, ValueError):
             pass
+        if not revalidate and not path.exists():
+            unreadable.add(quarter)
+            counts["sec_forms_bulk_unreadable"] += 1
+            result[quarter] = None
+            continue
         use_cache = not revalidate and path.exists()
         if not use_cache and path.exists() and saved:
             headers = edgar_raw.insider_bulk_validators(label, settings=settings, client=client)
@@ -188,6 +193,7 @@ def run_form4_bulk_route(
     skip_accessions: frozenset[str] = frozenset(),
     blocked_quarters: frozenset[Quarter] = frozenset(),
     source_counts_failures: bool = False,
+    accession_quarters: Mapping[str, Quarter] | None = None,
 ) -> BulkRouteResult:
     """Route selected Form 4 accessions, never substituting a bulk row after XML fails.
 
@@ -205,7 +211,10 @@ def run_form4_bulk_route(
     )
     grouped: dict[Quarter, list[Form4IndexRow]] = defaultdict(list)
     for row in queue:
-        grouped[quarter_of(row[3])].append(row)
+        quarter = (
+            accession_quarters[row[0]] if accession_quarters is not None else quarter_of(row[3])
+        )
+        grouped[quarter].append(row)
     counts: Counter[str] = Counter()
     requests = 0
     remaining = 0

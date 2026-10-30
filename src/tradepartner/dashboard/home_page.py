@@ -113,7 +113,7 @@ def _chart_rows(
     if card.session is None:
         return None
     try:
-        perf = ops.performance_data(conn, settings, card.book_id)
+        perf = ops.performance_data(conn, settings, card.book_id, now=header.now())
     except ValueError:
         return None
     if perf is None or not perf.equity:
