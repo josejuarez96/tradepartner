@@ -2819,3 +2819,16 @@ def test_paper_run_on_a_marked_sandbox_copy_is_refused_unless_book_sandbox_is_va
     assert "--book:" in out.output
     assert factory.clocks == []
     assert _sha256(store) == before
+
+
+def test_status_line_shows_the_net_positions_value() -> None:
+    """The `positions` line prints long minus short (#2561); a long-only value
+    prints as before."""
+    from tradepartner.execution.ops import OpsData
+
+    data = OpsData(
+        window=_window(1, datetime(2026, 10, 1, 14, 0, tzinfo=UTC)),
+        positions_count=2,
+        positions_value=60.0,
+    )
+    assert "positions 2 (value 60.00); open orders 0; targets 0" in cli._status_lines(data)[2]

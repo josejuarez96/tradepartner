@@ -53,6 +53,7 @@ from tradepartner.calendar import all_sessions, next_session, previous_session, 
 from tradepartner.config import Cadence
 from tradepartner.errors import StaleDataError
 from tradepartner.execution.ledger import Ledger
+from tradepartner.execution.lots import SHORT
 from tradepartner.execution.switch import ENGAGED, FAULTED_RUN_STATUSES, RELEASED
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.journal import (
@@ -107,6 +108,15 @@ class UnreadableMarkError(ValueError):
     row's, a held name with no value, or a non-finite number. A check that
     cannot read its input does not pass (#713 (ii)(a)), so callers refuse or
     fault on it, never skip."""
+
+
+def signed_value(row: PositionDailyRow) -> float | None:
+    """A mark row's value with the equity sign rule (paper spec #1872 item 10:
+    equity = cash + long value - short value): a short's unsigned value counts
+    negative whichever sign the writer stored. None when the row has no value."""
+    if row.value is None:
+        return None
+    return -abs(row.value) if row.position_side == SHORT else row.value
 
 
 def equity_at(rows: Sequence[PositionDailyRow], session: date) -> float:
