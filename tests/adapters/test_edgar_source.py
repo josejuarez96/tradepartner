@@ -16,6 +16,7 @@ import io
 import json
 import shutil
 import zipfile
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1150,6 +1151,17 @@ def test_the_stamps_cache_round_trips_items_under_the_new_layout(settings: Setti
     loaded = _source(settings, _router())._load_stamps(APPLE)
     assert loaded[APPLE_202].items == "2.02,9.01"
     assert loaded[APPLE_202].accepted_at == _recorded_acceptance()[APPLE_202]
+
+
+def test_stamps_memo_sees_another_sources_rewrite(settings: Settings) -> None:
+    _source(settings, _router()).filing_index()
+    first = _source(settings, _router())
+    assert first._load_stamps(APPLE)[APPLE_202].items == "2.02,9.01"
+    second = _source(settings, _router())
+    changed = second._load_stamps(APPLE)
+    changed[APPLE_202] = replace(changed[APPLE_202], items="rewritten")
+    second._save_stamps(APPLE, changed)
+    assert first._load_stamps(APPLE)[APPLE_202].items == "rewritten"
 
 
 def test_an_old_layout_cache_is_read_as_it_is_with_no_request(settings: Settings) -> None:

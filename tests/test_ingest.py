@@ -7364,7 +7364,7 @@ def test_form4_bulk_ingest_chooses_issuer_index_row_even_if_owner_is_first(
     owner = "0000873860"
     rows = [
         UnstampedFiling(owner, "Owner", "4", accession, date(2026, 3, 31)),
-        UnstampedFiling(issuer, "Issuer", "4", accession, date(2026, 3, 31)),
+        UnstampedFiling(issuer, "Issuer", "4", accession, date(2026, 4, 1)),
     ]
     monkeypatch.setattr(source, "_rows", lambda *_: iter([((2026, 1), row) for row in rows]))
     monkeypatch.setattr(source, "_load_stamps", lambda *_: {accession: object()})
@@ -7386,17 +7386,101 @@ def test_form4_bulk_ingest_chooses_issuer_index_row_even_if_owner_is_first(
         ),
     )
     captured: list[tuple[str, str, str, date]] = []
+    routed_quarters: list[dict[str, Quarter]] = []
 
     def record(accessions: Iterable[tuple[str, str, str, date]], **_kwargs: Any) -> BulkRouteResult:
         captured.extend(accessions)
+        routed_quarters.append(dict(_kwargs["accession_quarters"]))
         return BulkRouteResult(Counter(), 0, 0)
 
     monkeypatch.setattr(ingest_module, "run_form4_bulk_route", record)
     ingest_module._write_form4_bulk(fixture_store, enabled, source, frozenset({issuer, owner}), now)
-    assert captured == [(accession, issuer, "4", date(2026, 3, 31))]
+    assert captured == [(accession, issuer, "4", date(2026, 4, 1))]
+    assert routed_quarters == [{accession: Quarter(2026, 1)}]
     captured.clear()
     ingest_module._write_form4_bulk(fixture_store, enabled, source, frozenset({owner}), now)
     assert captured == []
+
+
+def test_form4_bulk_changed_zip_fails_quarter_closed(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tradepartner.adapters.form4_route import Quarter
+
+    quarter = Quarter(2026, 1)
+    now = datetime(2026, 4, 2, tzinfo=UTC)
+    enabled = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(enabled, client=httpx.Client(), clock=lambda: now)
+    row = UnstampedFiling(ACME, "ACME", "4", "0001577526-26-000036", date(2026, 3, 31))
+    monkeypatch.setattr(source, "_rows", lambda *_: iter([((2026, 1), row)]))
+    monkeypatch.setattr(source, "_load_stamps", lambda *_: {})
+    reads: list[bool] = []
+
+    def load(_quarters: Iterable[Quarter], **kwargs: Any) -> Any:
+        second = kwargs.get("revalidate") is False
+        reads.append(second)
+        return (
+            {quarter: InsiderBulk({})},
+            {quarter: "b" * 64 if second else "a" * 64},
+            Counter(),
+            frozenset(),
+        )
+
+    monkeypatch.setattr(ingest_module, "load_bulk_quarters", load)
+    added, message = ingest_module._write_form4_bulk(
+        fixture_store, enabled, source, frozenset({ACME}), now
+    )
+    assert reads == [False, True]
+    assert added == 0 and "1 remaining" in message
+    assert "sec_forms_bulk_unreadable: 1" in message
+    assert fixture_store.execute("SELECT count(*) FROM sec_filing_events").fetchone() == (0,)
+
+
+def test_form4_bulk_budget_stop_counts_later_quarter_rows(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tradepartner.adapters.form4_route import Quarter
+
+    now = datetime(2026, 7, 2, tzinfo=UTC)
+    enabled = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(enabled, client=httpx.Client(), clock=lambda: now)
+    rows = [
+        UnstampedFiling(ACME, "ACME", "4", f"0001577526-26-0000{i:02d}", filed)
+        for i, filed in enumerate((date(2026, 3, 31), date(2026, 4, 1), date(2026, 4, 2)))
+    ]
+    monkeypatch.setattr(
+        source,
+        "_rows",
+        lambda *_: iter([((r.filed_on.year, 1 if r.filed_on.month == 3 else 2), r) for r in rows]),
+    )
+    monkeypatch.setattr(source, "_load_stamps", lambda *_: {})
+
+    def load(quarters: Iterable[Quarter], **_kwargs: Any) -> Any:
+        quarter = next(iter(quarters))
+        return {quarter: InsiderBulk({})}, {quarter: "a" * 64}, Counter(), frozenset()
+
+    monkeypatch.setattr(ingest_module, "load_bulk_quarters", load)
+    calls = 0
+
+    def route(_rows: Iterable[Any], **_kwargs: Any) -> BulkRouteResult:
+        nonlocal calls
+        calls += 1
+        return BulkRouteResult(Counter({"sec_forms_budget_stopped": 1}), 0, 1)
+
+    monkeypatch.setattr(ingest_module, "run_form4_bulk_route", route)
+    added, message = ingest_module._write_form4_bulk(
+        fixture_store, enabled, source, frozenset({ACME}), now
+    )
+    assert added == 0 and calls == 1
+    assert "3 remaining" in message
 
 
 def test_form4_bulk_cross_route_comparison_never_rewrites_xml(

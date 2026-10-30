@@ -589,7 +589,7 @@ class EdgarFilingSource(FilingSource):
         self._items_refreshed: dict[str, bool] = {}
         # #2632: the last parsed stamps file (CIK, records, items_refreshed),
         # dropped when that CIK's file is written.
-        self._stamps_memo: tuple[str, dict[str, SubmissionRecord], bool] | None = None
+        self._stamps_memo: tuple[str, dict[str, SubmissionRecord], bool, int, int] | None = None
         self._event_forms = frozenset(event_forms)
         self._events_counted: set[str] = set()
         self.filing_events_unstamped = 0
@@ -1519,11 +1519,18 @@ class EdgarFilingSource(FilingSource):
         The last file parsed is kept (#2632), so consecutive reads of one CIK
         parse it once; each read returns its own dict, and a write drops it."""
         memo = self._stamps_memo
-        if memo is not None and memo[0] == cik:
+        path = self._stamps_path(cik)
+        try:
+            stat = path.stat()
+        except OSError:
+            self._stamps_memo = None
+            self._items_refreshed.pop(cik, None)
+            return {}
+        if memo is not None and memo[0] == cik and memo[3:] == (stat.st_mtime_ns, stat.st_size):
             self._items_refreshed[cik] = memo[2]
             return dict(memo[1])
         try:
-            data = json.loads(self._stamps_path(cik).read_bytes())
+            data = json.loads(path.read_bytes())
             if data["version"] != PARSER_VERSION or data["cik"] != cik:
                 raise ValueError("another version or CIK")
             layout = data.get("layout", _OLD_STAMPS_LAYOUT)
@@ -1555,7 +1562,7 @@ class EdgarFilingSource(FilingSource):
             self._items_refreshed.pop(cik, None)
             return {}  # absent, truncated or another layout: stamp again
         self._items_refreshed[cik] = refreshed
-        self._stamps_memo = (cik, dict(records), refreshed)
+        self._stamps_memo = (cik, dict(records), refreshed, stat.st_mtime_ns, stat.st_size)
         return records
 
     def _save_stamps(
