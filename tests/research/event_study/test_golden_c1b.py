@@ -38,6 +38,11 @@ ARTIFACT = Path(Settings(_env_file=None).research.data_dir) / SLUG / f"{SLUG}-ru
 ARTIFACT_SHA256 = "a30adf20f70557482b13d6fbe807d678fb68697180a09b64a079dd10637d2793"
 #: Keys the probe derived per row; the runner recomputes them.
 DERIVED = ("bucket", "no_peers", "beta_gap", "logmcap_gap")
+#: The one accepted departure from the probe (owner decision 2026-10-29 on PR
+#: #2609): the probe counted a row as traded only when it had a spread, and
+#: peer-group rows never have one, so it recorded 0 (run 3). The runner counts
+#: every bucketed peer-group row as traded; the golden asserts that count.
+ACCEPTED_DEPARTURE = "n_traded_normal"
 
 
 def _design(tmp_path: Path) -> dict[str, Any]:
@@ -94,10 +99,21 @@ def _assert_same(actual: Mapping[str, Any], expected: Mapping[str, Any]) -> None
             assert got == value, key
 
 
-def _assert_derived(derived: Mapping[str, int], recorded: Mapping[str, Any]) -> None:
-    """The counts the matching stage derives equal the recorded ones it names."""
+def _assert_derived(
+    derived: Mapping[str, int],
+    recorded: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+    design: Mapping[str, Any],
+) -> None:
+    """The counts the matching stage derives equal the recorded ones it names,
+    except the accepted departure, which is the bucketed peer-group row count."""
+    peer_group = str(design["peer_group"])
+    assert f"n_traded_{peer_group}" == ACCEPTED_DEPARTURE
+    assert derived[ACCEPTED_DEPARTURE] == sum(
+        1 for row in rows if row["group"] == peer_group and row["bucket"] is not None
+    )
     for key, value in derived.items():
-        if key in recorded:
+        if key in recorded and key != ACCEPTED_DEPARTURE:
             assert value == recorded[key], key
 
 
@@ -121,7 +137,7 @@ def test_synthetic_stage_a_through_the_golden_path(tmp_path: Path) -> None:
     rows, derived, summary = _reproduce(case["input"], _counts(expected["secondary"]), design)
     for row, probe_row in zip(rows, case["expected_rows"], strict=True):
         assert row["bucket"] == probe_row["bucket"]
-    _assert_derived(derived, expected["secondary"])
+    _assert_derived(derived, expected["secondary"], rows, design)
     _assert_same(summary["secondary"], expected["secondary"])
 
 
@@ -137,12 +153,11 @@ def test_c1b_run3_secondary_from_the_artifact_event_rows(tmp_path: Path) -> None
     assert sha256(data).hexdigest() == ARTIFACT_SHA256, "not run 3's registered artifact"
     artifact = json.loads(data)
     expected = artifact["summary"]["secondary"]
-    rows, derived, summary = _reproduce(
-        _runner_rows(artifact["events"]), _counts(expected), _design(tmp_path)
-    )
+    design = _design(tmp_path)
+    rows, derived, summary = _reproduce(_runner_rows(artifact["events"]), _counts(expected), design)
     for row, probe_row in zip(rows, artifact["events"], strict=True):
         assert row["bucket"] == probe_row["bucket"], row["event_id"]
-    _assert_derived(derived, expected)
+    _assert_derived(derived, expected, rows, design)
     _assert_same(summary["secondary"], expected)
     primary = artifact["summary"]["primary"]
     assert summary["primary"]["value"] == pytest.approx(primary["value"], rel=1e-9)
