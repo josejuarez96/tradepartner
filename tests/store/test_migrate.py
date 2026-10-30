@@ -18,7 +18,7 @@ INIT_SCHEMA_CALLERS = {
     "backfill.py": (2, 0, "fail-closed"),
     "backtest/lab.py": (1, 0, "fail-closed"),
     "backtest/run.py": (1, 0, "fail-closed"),
-    "cli.py": (21, 6, "fail-closed"),
+    "cli.py": (22, 6, "fail-closed"),
     "dashboard/backtest_page.py": (1, 1, "read-only"),
     "dashboard/research_page.py": (1, 1, "read-only"),
     "dashboard/trials_page.py": (1, 1, "read-only"),
