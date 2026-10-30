@@ -942,7 +942,7 @@ Each run's counts, files read, rule fingerprint and peak RSS (`getrusage`) go on
 
 *Late corrections.*
 - **A row SEC adds to a closed quarter.** At settle, the quarter's `form.idx` is fetched and cached as today and reconciled. Only the rows the table keeps are compared: issuer CIKs, CIKs that an issuer-form row in the file makes issuers (which then take the new-issuer walk), and the 25 and `events.sec_forms` rows. A missing row is inserted with its own acceptance as `known_at`, ingested by this run, and counted `index_reconcile_added`. A stored row absent from the file is counted `index_reconcile_absent` and kept. A differing form or name is refused and counted.
-- **A settled quarter that changes again.** Each run sends a conditional GET (#2607's validators) for every cached settled quarter. A changed file is reconciled the same way and replaces the cache atomically. If SEC sends no validator, open question 3 applies.
+- **A settled quarter that changes again.** Each run sends a conditional GET (#2607's validators) for every cached settled quarter. A changed file is reconciled the same way and replaces the cache atomically. If SEC sends no validator, the last 8 settled quarters are re-fetched and reconciled each Saturday (owner decision 3).
 - **Amended filings** (10-K/A, 8-K/A, 25/A) are new accessions, so they arrive as new daily rows.
 - **Re-stamped acceptance times:** step 5.
 - **A rule changed in code without a bump.** Two checks catch this. Each run rebuilds a rotating share of the untouched issuer CIKs read-only, so every CIK is checked within `edgar.verify_rotation_days` (default 28), and compares the result with the store. A difference is counted `incremental_drift` with up to 10 CIKs named, and `health` warns. Once a month the owner also runs `--rebuild-index --dry-run` on a store copy, outside the jobs, which reports every row it would write.
@@ -958,12 +958,12 @@ It seeds the table once (an owner step with a backup, outside the 08:05 and 18:3
 
 *Targets.* Measured after the seed, on 5 consecutive scheduled runs, from the `edgar_index` run row:
 - The EDGAR source takes at most 20 min on an ordinary weekday (it took 97 to 115 min).
-- A night when a quarter settles (about four a year) or the FSN lag window moves (about monthly) touches many more CIKs. It is reported on its run row and bounded at 60 min (open question 7).
+- A night when a quarter settles (about four a year) or the FSN lag window moves (about monthly) touches many more CIKs. It is reported on its run row and bounded at 60 min (owner decision 7).
 - Peak RSS is at most 1.5 GB (about 4.1 GB after #2622) and does not grow with history.
 - No request goes to a settled quarter's `form.idx` other than the conditional GETs.
 
 *Plan tasks (total L, each task at most M).*
-- **(a) probe, S, read-only, before (b).** Record a quarter directory listing and two daily files as fixtures. On two settled quarters, check that the daily files together equal `form.idx` on `(cik, accession, form, company_name, filed_on)` and in each accession's row order (the 13D and 25 de-duplication take the first row, open question 4). Check whether every CIK of a 25-NSE is in one daily file and whether SEC sends ETag or Last-Modified. Log when each day's file is listed against the 18:30 ET run. Seed a temp store copy from `data/edgar_cache` to measure the table's size and the seed's time.
+- **(a) probe, S, read-only, before (b).** Record a quarter directory listing and two daily files as fixtures. On two settled quarters, check that the daily files together equal `form.idx` on `(cik, accession, form, company_name, filed_on)` and in each accession's row order (the 13D and 25 de-duplication take the first row; owner decision 4). Check whether every CIK of a 25-NSE is in one daily file and whether SEC sends ETag or Last-Modified. Log when each day's file is listed against the 18:30 ET run. Seed a temp store copy from `data/edgar_cache` to measure the table's size and the seed's time.
 - **(b) schema, M.** The tables, the migration, the `--check` rules (`known_at = accepted_at`, no duplicate `(cik, accession)`, tz-aware stamps), `RESTAMP_TABLES` on `(cik, accession)`, and the vintage exclusion.
 - **(c) adapter, M.** The daily read, the file cursor, issuers and the new-issuer walk, pending rows, the reconcile and the conditional recheck.
 - **(d1) touched set, M, pure.**
@@ -994,15 +994,15 @@ It seeds the table once (an owner step with a backup, outside the 08:05 and 18:3
 - **Memory.** The recorded max RSS of a synthetic 2-year and a 20-year history differ by at most 10%.
 - **Boundary.** `backtest/`, `universe.py` and signals do not read the new tables.
 
-*Open questions (owner).*
-1. **Table or files.** Recommended: the store table, for the reasons above. The cost is a schema bump and an estimated 0.5 to 1 GB of store (task (a) measures it).
-2. **ADR 0023 schema freeze and timing.** Recommended: allow it, since it is ingest-internal and additive and no trial reads it (like #2535). Migrate in its own owner step after the 2026-10-31 T306 sitting, never together with it.
-3. **No validator on the quarterly files.** Recommended: re-fetch and reconcile the last 8 settled quarters each Saturday. Older quarters wait for `--rebuild-index`.
-4. **If daily and quarterly files order an accession's rows differently** (probe (a)). Recommended: replace "first row" with an order-free rule (the filer's row, from the accession prefix, else the lowest CIK). Apply it by a `BUILD_RULES_VERSION` bump and one rebuild. This does not hold the 2026-10-31 13D backfill. Rows that backfill stores keep their acceptance, which is the same whichever CIK a row is stamped through, and #2435's differing-re-read rule counts any row the new rule would change rather than updating it.
-5. **Fingerprint mismatch: fail or rebuild unasked.** Recommended: fail and name the flag. A rule change is a release with a backup, and an unplanned 2-hour rebuild in the 18:30 job could reach the 08:05 paper run.
-6. **The checks against drift: a 28-day rotation and a monthly full dry run on a copy.** Recommended: yes. Shorten the rotation if a night's share runs over 2 min.
-7. **The targets: 20 min and 1.5 GB, and 60 min on a settle or FSN night.** Recommended: yes. The 5-run evidence is the pass mark for the first two. The 60-minute bound is checked on the first settle night after the key is turned on.
-8. **#2623 (columnar index).** Recommended: close it as superseded once (d4) merges.
+*Owner decisions 2026-10-30 (PR #2631, "Agree with recs").* Each open question was answered as recommended:
+1. **Table or files:** the store table.
+2. **Schema freeze and timing:** the ADR 0023 freeze is lifted for this table. It migrates in its own owner step after the 2026-10-31 T306 sitting, never with it.
+3. **No validator on the quarterly files:** re-fetch and reconcile the last 8 settled quarters each Saturday. Older quarters wait for `--rebuild-index`.
+4. **Row order differs between daily and quarterly files:** use the order-free rule (the filer's row, else the lowest CIK), applied by a `BUILD_RULES_VERSION` bump and one rebuild. It does not hold the 2026-10-31 13D backfill.
+5. **Fingerprint mismatch:** the source fails and names `--rebuild-index`. It never rebuilds unasked.
+6. **Drift checks:** a 28-day rotation, plus a monthly full dry run on a store copy.
+7. **Targets:** 20 min on an ordinary weekday, 60 min on a settle or FSN night, and 1.5 GB peak RSS.
+8. **#2623:** closed as superseded once (d4) merges.
 
 ## Risks & domain checks
 
