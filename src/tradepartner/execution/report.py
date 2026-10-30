@@ -17,8 +17,9 @@ computes:
   `known_at <= close(T_{i+1})` of amount x the ledger quantity held on the
   ex-date (`positions_daily`), excluding any dividend the broker already
   credited (an `adjustments` row of kind `dividend_cash` for the same name
-  and session, req 6: paper got the cash already, so counting it again would
-  double it);
+  that the T_{i+1} mark absorbed: `session <= T_{i+1}` and `known_at` no
+  later than that mark's, the residue term's cut; req 6: paper got the cash
+  already, so counting it again would double it);
 - the **fill-timing term**: over equity at close(T_i), [sum over buys of
   (the paper fill price - the frozen `execution.fill_price` bar price on the
   fill's session) x filled quantity, less the same sum over sells], so a buy

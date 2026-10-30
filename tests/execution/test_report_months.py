@@ -434,7 +434,11 @@ def test_dividend_credit_known_only_after_month_end_does_not_zero_term() -> None
 
 
 def _credit_after_close_case(
-    *, credit_known_offset: timedelta, mark_known_offset: timedelta
+    *,
+    credit_known_offset: timedelta,
+    mark_known_offset: timedelta,
+    credit_session: date | None = None,
+    later_mark_known_offset: timedelta | None = None,
 ) -> float:
     """Dividend term for a credit journaled `credit_known_offset` after close(T1)
     when the T1 mark was written `mark_known_offset` after close(T1)."""
@@ -448,6 +452,9 @@ def _credit_after_close_case(
         replace(_cash_mark(T1, equity[T1]), known_at=mark_at, ingested_at=mark_at),
         _position_mark(record_date, A, 100.0, 50.0),
     ]
+    if later_mark_known_offset is not None:
+        later = session_close(T1) + later_mark_known_offset
+        marks.append(replace(_cash_mark(T2, 1.0), known_at=later, ingested_at=later))
     credit_at = session_close(T1) + credit_known_offset
     journal = _journal(
         positions_daily=marks,
@@ -456,7 +463,7 @@ def _credit_after_close_case(
                 adjustment_id=next(_IDS),
                 window_id=WINDOW_ID,
                 run_id=1,
-                session=ex_date,
+                session=credit_session or ex_date,
                 kind="dividend_cash",
                 security_id=A,
                 cash=50.0,
@@ -479,6 +486,27 @@ def test_dividend_credit_absorbed_by_next_mark_is_not_added_back() -> None:
         credit_known_offset=timedelta(hours=1), mark_known_offset=timedelta(hours=2)
     )
     assert term == pytest.approx(0.0)
+
+
+def test_dividend_cut_ignores_later_sessions_marks() -> None:
+    term = _credit_after_close_case(
+        credit_known_offset=timedelta(hours=3),
+        mark_known_offset=timedelta(hours=2),
+        later_mark_known_offset=timedelta(days=40),
+    )
+    assert term == pytest.approx((0.5 * 100.0) / 100_000.0)
+
+
+def test_dividend_credit_stated_after_next_session_is_still_uncredited() -> None:
+    # A row stated for a later session is not absorbed by the T1 mark, even if
+    # journaled before it; a later mark's write time does not move the T1 cut.
+    term = _credit_after_close_case(
+        credit_known_offset=timedelta(hours=1),
+        mark_known_offset=timedelta(hours=2),
+        credit_session=T2,
+        later_mark_known_offset=timedelta(days=40),
+    )
+    assert term == pytest.approx((0.5 * 100.0) / 100_000.0)
 
 
 def test_dividend_credit_known_after_next_mark_is_still_uncredited() -> None:
