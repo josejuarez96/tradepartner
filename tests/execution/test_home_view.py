@@ -325,6 +325,29 @@ def test_build_cards_status_and_needs_on_a_seeded_store(store: Settings) -> None
     assert view.research == home_view.ResearchStrip("Nothing new yet", None, None, "research")
 
 
+def test_home_card_keeps_only_owner_notes_from_the_latest_run(store: Settings) -> None:
+    raw = "paper_phase started=1; check fill; paper_phase finished=2"
+    with open_for_write(store) as conn:
+        conn.execute(
+            "UPDATE paper_run_results SET message = ? WHERE run_id = "
+            "(SELECT max(r.run_id) FROM paper_runs r JOIN paper_windows w "
+            "ON w.window_id = r.window_id WHERE w.book_id = 'main')",
+            [raw],
+        )
+    main = next(card for card in _build(store).books if card.book_id == "main")
+    assert main.last_run_message == "check fill"
+    with open_read_only(store) as conn:
+        assert conn.execute(
+            "SELECT s.message FROM paper_run_results s JOIN paper_runs r USING (run_id) "
+            "JOIN paper_windows w USING (window_id) WHERE w.book_id = 'main' "
+            "ORDER BY r.run_id DESC LIMIT 1"
+        ).fetchone() == (raw,)
+    with open_for_write(store) as conn:
+        conn.execute("UPDATE paper_run_results SET message = 'paper_phase only=1'")
+    main = next(card for card in _build(store).books if card.book_id == "main")
+    assert main.last_run_message is None
+
+
 def test_a_book_with_only_a_normal_run_shows_everything_running_normally(
     journal_settings: Settings,
 ) -> None:
@@ -427,6 +450,23 @@ def _data(
 def test_data_is_up_to_date_through_the_last_session(monkeypatch: pytest.MonkeyPatch) -> None:
     out = _data(monkeypatch, message="ok", gaps=0, summaries=(_summary(),))
     assert out.text == "Data is up to date through 2026-10-02" and out.records == 0
+
+
+def test_owner_allocation_does_not_advance_home_data_date(
+    monkeypatch: pytest.MonkeyPatch, store: Settings
+) -> None:
+    monday = datetime(2026, 10, 5, 22, tzinfo=UTC)
+    allocation_time = monday - timedelta(minutes=30)
+    with open_for_write(store) as conn:
+        conn.execute(
+            "INSERT INTO spinoff_allocations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ["P", "C", date(2026, 10, 5), 0.3, allocation_time, allocation_time, "owner", "owner"],
+        )
+    monkeypatch.setattr(health, "last_ingests", lambda _c, _t: ())
+    monkeypatch.setattr(health, "bar_gaps", lambda _c, _t: SimpleNamespace(names_with_gaps=0))
+    with open_read_only(store) as conn:
+        out = home_view._data_status(conn, (), monday)
+    assert out.text == "Data is up to date through 2026-10-02"
 
 
 def test_open_quarantined_filings_and_bar_holes_need_tidying_not_affecting_trading(

@@ -877,6 +877,25 @@ def test_one_book_shows_its_summary_row_and_no_selector(
     assert all(sb.key != ops_page.BOOK_KEY for sb in at.selectbox)
 
 
+def test_ops_page_hides_phase_notes_without_changing_the_result_row(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    raw = "paper_phase started=1; check fill; paper_phase finished=2"
+    with duckdb.connect(str(seeded_store)) as conn:
+        conn.execute("UPDATE paper_run_results SET message = ?", [raw])
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    assert "check fill" in _text(at)
+    assert "paper_phase" not in _text(at)
+    with duckdb.connect(str(seeded_store), read_only=True) as conn:
+        assert conn.execute("SELECT message FROM paper_run_results").fetchone() == (raw,)
+    with duckdb.connect(str(seeded_store)) as conn:
+        conn.execute("UPDATE paper_run_results SET message = 'paper_phase only=1'")
+    at = _app(monkeypatch, seeded_store)
+    assert "Last run:" not in _text(at)
+    assert "last run:" not in _text(at)
+
+
 def test_summary_names_traded_rebalance_without_marking_next_daily_one_done(
     monkeypatch: pytest.MonkeyPatch, seeded_store: Path
 ) -> None:

@@ -2832,3 +2832,41 @@ def test_status_line_shows_the_net_positions_value() -> None:
         positions_value=60.0,
     )
     assert "positions 2 (value 60.00); open orders 0; targets 0" in cli._status_lines(data)[2]
+
+
+def test_status_hides_phase_notes_but_shows_other_run_notes() -> None:
+    from tradepartner.execution.ops import OpsData
+
+    raw = "paper_phase first=1; check fill; paper_phase last=2"
+    data = OpsData(
+        window=_window(1, datetime(2026, 10, 1, 14, 0, tzinfo=UTC)),
+        last_run_message=raw,
+    )
+    lines = cli._status_lines(data)
+    assert "last run: check fill" in lines
+    assert "paper_phase" not in "\n".join(lines)
+    assert "last run:" not in "\n".join(
+        cli._status_lines(replace(data, last_run_message="paper_phase first=1"))
+    )
+    assert data.last_run_message == raw
+
+
+def test_status_all_hides_phase_notes_but_keeps_other_run_notes() -> None:
+    row = SimpleNamespace(
+        book_id="main",
+        window=SimpleNamespace(window_id=1),
+        is_open=True,
+        positions_count=0,
+        open_orders_count=0,
+        switch_state=SimpleNamespace(engaged=False, run_in_progress=False),
+        last_run_status="ok",
+        last_run_kind="tracking",
+        last_run_session=None,
+        last_run_has_orders=False,
+        next_rebalance_session=None,
+        last_run_message="paper_phase started=1; check fill; paper_phase finished=2",
+    )
+    assert cli._summary_lines((row,))[0].endswith("; check fill")
+    row.last_run_message = "paper_phase started=1"
+    assert "check fill" not in cli._summary_lines((row,))[0]
+    assert "paper_phase" not in cli._summary_lines((row,))[0]

@@ -36,7 +36,7 @@ import streamlit as st
 from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
-from tradepartner.execution import headroom, ops, plain, waiting
+from tradepartner.execution import headroom, ops, paper_message, plain, waiting
 from tradepartner.execution.ops import OpsData, OrderChain, RankedSignal
 from tradepartner.execution.switch import SwitchState
 from tradepartner.store import journal
@@ -187,6 +187,9 @@ def _summary_card(summaries: tuple[ops.BookSummary, ...]) -> None:
     with st.container(border=True):
         st.subheader("Books")
         st.dataframe(_summary_table(summaries), hide_index=True)
+        for row in summaries:
+            if message := paper_message.owner_message(row.last_run_message):
+                st.caption(f"{row.book_id} last run: {message}")
 
 
 def _waiting_card(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
@@ -596,6 +599,8 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
         )
 
     _kpis(data)
+    if message := paper_message.owner_message(data.last_run_message):
+        st.caption(f"Last run: {message}")
     _risk_card(conn, data.window)
     if data.open_orders_count and data.last_run_kind == "rebalance":
         st.info("Fills are recorded at the next scheduled run")
