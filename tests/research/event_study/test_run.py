@@ -143,6 +143,18 @@ def test_causal_matching_every_event_sees_only_its_past() -> None:
             past = [row for row in rows if row["entry_index"] <= event["entry_index"]]
             alone = _matched(past, event["event_id"], "causal", **mode_design)
             assert full[event["event_id"]] == alone, event["event_id"]
+            # Adding later events and changing later market caps moves nothing.
+            later = [
+                {**row, "mcap": row["mcap"] * 7.0 + 1.0}
+                for row in rows
+                if row["entry_index"] > event["entry_index"]
+            ]
+            extra = [
+                _match_row(f"new{day}", "normal", day, cap, 0.09)
+                for day, cap in ((11, 1.0), (12, 99.0))  # sessions after every event
+            ]
+            changed = _matched(past + later + extra, event["event_id"], "causal", **mode_design)
+            assert full[event["event_id"]] == changed, event["event_id"]
 
 
 def test_causal_refuses_an_event_not_known_before_its_entry_open() -> None:
@@ -154,6 +166,61 @@ def test_causal_refuses_an_event_not_known_before_its_entry_open() -> None:
     at_open = {**before, "known_at": instant(5, 9, 30)}
     with pytest.raises(ValueError, match="not known before its entry open"):
         match_events([target, at_open], {**_MATCH_DESIGN, "matching": "causal"})
+
+
+def test_causal_peer_window_boundaries() -> None:
+    """Peers enter on the treated session or up to `peer_window` sessions before
+    it: -window is in, -(window + 1) and +1 are out, same session is in."""
+    target = _match_row("target", "early", 7, 20.0, 0.03)
+    window = int(_MATCH_DESIGN["peer_window"])
+
+    def peers(day: int, known_at: datetime | None = None) -> int:
+        peer = _match_row("peer", "normal", day, 10.0, 0.01, known_at=known_at)
+        filler = _match_row("filler", "early", 4, 30.0, 0.0)  # keeps the pool at two
+        row = _matched([filler, peer, target], "target", "causal")
+        return int(row["peer_n_1"]) if not row["no_peers"] else 0
+
+    assert peers(7) == 1  # same session, known before the shared open
+    assert peers(7 - window) == 1
+    assert peers(7 - window - 1) == 0
+    assert peers(8) == 0  # enters after the treated event
+    # Known exactly at the treated open: it enters the next session, so it is out.
+    assert peers(8, known_at=instant(7, 9, 30)) == 0
+
+
+def test_causal_small_pool_is_dropped_and_counted() -> None:
+    """A known-so-far pool of `min_bucket_events - 1` leaves the event
+    unbucketed and counted as small_size_group, though ex_post would bucket it."""
+    rows = [
+        _match_row("first", "normal", 4, 10.0, 0.01),
+        _match_row("second", "early", 5, 20.0, 0.03),
+        _match_row("third", "normal", 6, 30.0, 0.02),
+    ]
+    design = {**_MATCH_DESIGN, "min_bucket_events": 3}
+    matched, derived = match_events(rows, {**design, "matching": "causal"})
+    by_id = {row["event_id"]: row for row in matched}
+    assert by_id["first"]["bucket"] is None
+    assert by_id["second"]["bucket"] is None  # pool of 2 = min_bucket_events - 1
+    assert by_id["third"]["bucket"] == 0
+    assert derived["n_dropped_small_size_group_normal"] == 1
+    assert derived["n_dropped_small_size_group_early"] == 1
+    _, ex_post = match_events(rows, {**design, "matching": "ex_post"})
+    assert "n_dropped_small_size_group_early" not in ex_post
+
+
+def test_causal_pool_restarts_at_each_quarter() -> None:
+    """With `quarter` in the bucket cell, last quarter's events are not in this
+    quarter's pool, so the first event of a quarter cell is unbucketed."""
+    old = [
+        {**_match_row(f"q1_{day}", "normal", day, 10.0 * day, 0.01), "quarter": 1} for day in (4, 5)
+    ]
+    first = {**_match_row("q2_first", "early", 6, 20.0, 0.03), "quarter": 2}
+    second = {**_match_row("q2_second", "normal", 7, 25.0, 0.02), "quarter": 2}
+    rows = [*old, first, second]
+    assert _matched(rows, "q1_5", "causal")["bucket"] == 0
+    assert _matched(rows, "q2_first", "causal")["bucket"] is None
+    assert _matched(rows, "q2_second", "causal")["bucket"] == 0
+    assert _matched(rows, "q2_first", "ex_post")["bucket"] == 0
 
 
 def test_no_handle_precedes_every_read(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -385,8 +452,11 @@ def test_event_stage_delisting_and_causal_matching(
     parsed = SimpleNamespace(
         study=design, window_start=date(2018, 6, 1), window_end=date(2018, 6, 8), slug="test"
     )
+    assert "matching" not in design  # absent key means causal
     default = run_study(handle(tmp_path), parsed, events, settings=cfg)
     artifact = json.loads(default.artifact_path.read_text())
+    assert default.exploratory["matching"] == "causal"
+    assert artifact["meta"]["matching"] == "causal"
     early = next(row for row in artifact["events"] if row["event_id"] == "e")
     assert early["r_2"] == pytest.approx(0.0)  # last available close on entry day
     assert early["spy_2"] == pytest.approx(15 / 14 - 1)
@@ -412,6 +482,7 @@ def test_event_stage_delisting_and_causal_matching(
     design["matching"] = "ex_post"
     ex_post = run_study(handle(tmp_path), parsed, events, settings=cfg)
     assert ex_post.secondary["n_dropped_no_peers_early"] == 0
+    assert ex_post.exploratory["matching"] == "ex_post"
     # A peer disclosed after the treated event, but before its entry open,
     # belongs to the causal pool. The cutoff is entry, not event acceptance.
     design["matching"] = "causal"
