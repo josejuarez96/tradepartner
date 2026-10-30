@@ -763,6 +763,187 @@ def test_e3_a_remainder_order_sized_after_an_earlier_fill_passes(
 
 
 @pytest.mark.usefixtures("health")
+def test_e3_whole_short_cover_retry_uses_unfilled_shares_after_price_rise(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1, side="buy", position_side="short", whole_share=True)
+    j.order(
+        "o-cover-1",
+        decision_id,
+        run_id,
+        D1,
+        notional=None,
+        quantity=10.0,
+        fills=(6.0,),
+        price=175.0,
+        side="buy",
+        position_side="short",
+        hour=15,
+    )
+    j.order(
+        "o-cover-2",
+        decision_id,
+        run_id,
+        D1,
+        notional=None,
+        quantity=4.0,
+        fills=(4.0,),
+        price=175.0,
+        side="buy",
+        position_side="short",
+        hour=16,
+    )
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert line.passed, line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_whole_short_cover_retry_after_full_fill_has_no_remainder(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1, side="buy", position_side="short", whole_share=True)
+    for coid, shares, hour in (("o-cover-full", 10.0, 15), ("o-cover-extra", 1.0, 16)):
+        j.order(
+            coid,
+            decision_id,
+            run_id,
+            D1,
+            notional=None,
+            quantity=shares,
+            fills=(shares,),
+            side="buy",
+            position_side="short",
+            hour=hour,
+        )
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert not line.passed
+    assert f"order o-cover-extra of decision {decision_id} sized with no remainder" in line.detail
+    assert "10 of 10 shares filled before it" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_whole_short_cover_retry_uses_reverse_split_shares(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    first_run = j.run(D1, invoked_by="tty", hour=15)
+    retry_run = j.run(D2, invoked_by="tty", hour=15)
+    decision_id = j.decision(first_run, D1, side="buy", position_side="short")
+    j.order(
+        "o-before-split",
+        decision_id,
+        first_run,
+        D1,
+        notional=None,
+        quantity=10.0,
+        fills=(9.0,),
+        side="buy",
+        position_side="short",
+        hour=15,
+    )
+    conn.execute(
+        "INSERT INTO corporate_actions (security_id, action_type, ex_date, "
+        "ratio_or_amount, known_at, ingested_at, source, provenance) "
+        "VALUES ('SEC_A', 'split', ?, 0.1, ?, ?, 'test', 'action')",
+        [D2, _at(D1, 20), _at(D1, 20)],
+    )
+    j.order(
+        "o-after-split",
+        decision_id,
+        retry_run,
+        D2,
+        notional=None,
+        quantity=0.1,
+        fills=(),
+        side="buy",
+        position_side="short",
+        hour=15,
+    )
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert not line.passed
+    assert f"order o-after-split of decision {decision_id} sized with no remainder" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_whole_short_cover_retry_after_notional_order_uses_dollars(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1, side="buy", position_side="short")
+    j.order(
+        "o-notional-cover",
+        decision_id,
+        run_id,
+        D1,
+        notional=1000.0,
+        fills=(4.0,),
+        side="buy",
+        position_side="short",
+        hour=15,
+    )
+    j.order(
+        "o-share-retry",
+        decision_id,
+        run_id,
+        D1,
+        notional=None,
+        quantity=6.0,
+        fills=(),
+        side="buy",
+        position_side="short",
+        hour=16,
+    )
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert line.passed, line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_e3_whole_short_cover_retry_breaks_known_at_ties_by_journal_order(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    run_id = j.run(D1, invoked_by="tty", hour=15)
+    decision_id = j.decision(run_id, D1, side="buy", position_side="short")
+    for coid, fills in (("o-first", (10.0,)), ("o-second", ())):
+        j.order(
+            coid,
+            decision_id,
+            run_id,
+            D1,
+            notional=None,
+            quantity=10.0,
+            fills=fills,
+            side="buy",
+            position_side="short",
+            hour=15,
+        )
+    j.order(
+        "o-retry",
+        decision_id,
+        run_id,
+        D1,
+        notional=None,
+        quantity=10.0,
+        fills=(),
+        side="buy",
+        position_side="short",
+        hour=16,
+    )
+    conn.close()
+    line = _line(_run(settings), "E.3 orders")
+    assert line.passed, line.detail
+
+
+@pytest.mark.usefixtures("health")
 def test_e3_fails_on_a_share_order_written_after_the_plan_was_filled(
     conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
