@@ -19,7 +19,8 @@ quarter's full text is parsed at a time.
 
 **Caches.** A quarter's raw `form.idx` is cached, gzipped, only when fetched
 `edgar.index_settle_days` or more after its Eastern-time end; younger
-quarters are re-fetched every call. Acceptance times are cached per CIK,
+quarters are re-fetched by a new source instance. The full stamped index is
+kept once per source instance. Acceptance times are cached per CIK,
 one reduced record per accession, under a directory named by
 `PARSER_VERSION`, so a parser fix re-stamps. A cache file that does not
 decode (truncated, older version) is ignored and re-fetched. Every write
@@ -600,6 +601,7 @@ class EdgarFilingSource(FilingSource):
         self.requests = 0
         self.skipped_filers = 0
         self.unstamped_filings: list[UnstampedFiling] = []
+        self._filing_index_entries: tuple[FilingIndexEntry, ...] | None = None
         self.fsn_duplicates = 0
         self.fsn_reissued = 0
         self.fsn_reissue_undetected = 0
@@ -754,6 +756,10 @@ class EdgarFilingSource(FilingSource):
         times; unstamped rows go to `.unstamped_filings`, never the result."""
         if since is not None:
             since = ensure_tz_aware_utc(since, field_name="since")
+        if self._filing_index_entries is not None:
+            return [
+                e for e in self._filing_index_entries if since is None or e.accepted_at >= since
+            ]
         self.unstamped_filings, self._open_quarters = [], {}
         start = (self._settings.edgar.index_first_year, 1)
         last = quarter_of(self._now())
@@ -792,13 +798,14 @@ class EdgarFilingSource(FilingSource):
                 record = stamps[cik].get(accession)
                 if record is None or record.accepted_at is None:
                     self.unstamped_filings.append(row)
-                elif since is None or record.accepted_at >= since:
+                else:
                     at = record.accepted_at
                     entries.append(FilingIndexEntry(cik, row.company_name, row.form, accession, at))
         entries.sort(key=lambda e: (e.accepted_at, e.accession, e.cik))
         self.unstamped_filings.sort(key=lambda r: (r.filed_on, r.accession, r.cik))
         self._filing_index_ran = True
-        return entries
+        self._filing_index_entries = tuple(entries)
+        return [e for e in self._filing_index_entries if since is None or e.accepted_at >= since]
 
     def _rows(
         self, quarters: Sequence[Quarter], open_quarter: Quarter
