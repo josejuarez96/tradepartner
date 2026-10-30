@@ -326,19 +326,38 @@ def test_waiting_on_owner_names_book_a_and_nothing_for_book_b(
 def test_book_bs_next_run_after_book_as_failure_is_valid(
     fixture_store_path: Path, tmp_path: Path
 ) -> None:
-    """#2602: B's next scheduled run (the next session) ends ok with its
-    switch not engaged, submits nothing (no order is sent twice), and leaves B's orders and
-    holdings as its rebalance left them; A stays engaged."""
-    _, b = _a_failed_then_b_ran(fixture_store_path, tmp_path)
-    orders_before = b.query("SELECT client_order_id FROM orders ORDER BY 1")
-    held_before = b.held()
-    submits_before = len(b.submits())
+    """B's due rebalance after A fails submits its own plan once, then stays valid."""
+    a, b = _two_books(fixture_store_path, tmp_path)
+    a_attempts = _fail_a_submit(a)
+    with pytest.raises(SubmitDown):
+        a.run(NOW)
+    assert a_attempts
+    assert not b.submits()
 
-    outcome = b.run(at(next_session(F_0)))
+    outcome = b.run(NOW)
     assert outcome.status == "ok", b.result(b.latest_run())
+    assert outcome.kind == "rebalance"
     assert not outcome.engaged
     assert b.result(outcome.run_id) == ("ok", None, None)
-    assert len(b.submits()) == submits_before, "no order is sent twice"
+    ((planned,),) = b.query("SELECT n_targets FROM paper_plans WHERE run_id = ?", [outcome.run_id])
+    b_submits = b.submits()
+    b_ids = [request.client_order_id for request in b_submits]
+    a_ids = {request.client_order_id for request in a_attempts}
+    assert planned == len(b_submits) == 3
+    assert len(set(b_ids)) == len(b_ids)
+    assert all(f"-{BOOK_B}-" in cid for cid in b_ids)
+    assert not (set(b_ids) & a_ids)
+    journal_ids = {
+        row[0]
+        for row in b.query("SELECT client_order_id FROM orders WHERE run_id = ?", [outcome.run_id])
+    }
+    assert journal_ids == set(b_ids)
+
+    orders_before = b.query("SELECT client_order_id FROM orders ORDER BY 1")
+    held_before = b.held()
+    follow_up = b.run(at(next_session(F_0)))
+    assert follow_up.status == "ok", b.result(b.latest_run())
+    assert len(b.submits()) == planned, "the follow-up sends no duplicate orders"
     assert b.query("SELECT client_order_id FROM orders ORDER BY 1") == orders_before
     assert b.held() == held_before
 
