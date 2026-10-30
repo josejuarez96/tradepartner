@@ -253,7 +253,7 @@ def _validate_study(
         )
     configurations = _study_positive_int("study.configurations", study["configurations"], path)
     if "matching" in study:
-        _require_enum("study.matching", study["matching"], ("entry_known", "ex_post"), path)
+        _require_enum("study.matching", study["matching"], ("causal", "ex_post"), path)
     if configurations > budget:
         raise ExperimentFileError(f"{path}: study.configurations exceeds budget.configurations")
     for key in ("groups", "bucket_by", "peer_by", "cluster_by"):

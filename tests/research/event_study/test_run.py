@@ -5,12 +5,18 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from tradepartner.research import NoRunHandle, _issue_run_handle
-from tradepartner.research.event_study.run import count_study_events, entry_session, run_study
+from tradepartner.research.event_study.run import (
+    count_study_events,
+    entry_session,
+    match_events,
+    run_study,
+)
 
 ET = ZoneInfo("America/New_York")
 
@@ -51,6 +57,103 @@ def test_shared_counts_use_exact_groups_and_one_exit_per_event() -> None:
         "n_traded_pre_normal": 0,
         "n_delisted_exits": 1,
     }
+
+
+_MATCH_DESIGN: dict[str, Any] = {
+    "bucket_by": ["quarter"],
+    "peer_by": ["stratum"],
+    "n_buckets": 1,
+    "min_bucket_events": 2,
+    "peer_group": "normal",
+    "peer_window": 2,
+    "min_peers": 1,
+    "near_k": 1,
+    "horizons": [1],
+}
+
+
+def _match_row(
+    event_id: str, group: str, day: int, cap: float, ret: float, known_at: datetime | None = None
+) -> dict[str, Any]:
+    return {
+        "event_id": event_id,
+        "security_id": event_id,
+        "group": group,
+        "stratum": "A",
+        "quarter": 1,
+        "entry": f"2018-06-{day:02d}",
+        "entry_index": day,
+        "known_at": known_at or instant(day - 1, 16, 1),
+        "mcap": cap,
+        "r_1": ret,
+        "rb_1": ret,
+        "beta": 1.0,
+    }
+
+
+def _matched(rows: list[dict[str, Any]], event_id: str, mode: str, **design: Any) -> dict[str, Any]:
+    matched, _ = match_events(rows, {**_MATCH_DESIGN, **design, "matching": mode})
+    return next(row for row in matched if row["event_id"] == event_id)
+
+
+def test_causal_matching_is_invariant_to_future_events() -> None:
+    rows = [
+        _match_row("prior", "normal", 4, 10.0, 0.01),
+        _match_row("target", "early", 5, 20.0, 0.03),
+        _match_row("future", "normal", 6, 100.0, 0.02),
+    ]
+    causal_full = _matched(rows, "target", "causal")
+    assert causal_full == _matched(rows[:2], "target", "causal")
+    assert causal_full["bucket"] == 0
+    assert causal_full["peer_n_1"] == 1
+    ex_post_full = _matched(rows, "target", "ex_post")
+    assert ex_post_full["peer_n_1"] == 2
+    assert ex_post_full["spread_1"] != _matched(rows[:2], "target", "ex_post")["spread_1"]
+    assert (
+        _matched(rows, "target", "causal", n_buckets=2)["bucket"]
+        == _matched(rows[:2], "target", "causal", n_buckets=2)["bucket"]
+    )
+    assert (
+        _matched(rows, "target", "ex_post", n_buckets=2)["bucket"]
+        != _matched(rows[:2], "target", "ex_post", n_buckets=2)["bucket"]
+    )
+
+
+def test_causal_matching_every_event_sees_only_its_past() -> None:
+    """For every event, dropping every event not known before its entry open
+    leaves its bucket, peers and spread unchanged (#2493 no look-ahead)."""
+    rows = [
+        _match_row(f"x{day}{group}", group, day, cap, ret)
+        for day, group, cap, ret in (
+            (4, "normal", 30.0, 0.01),
+            (4, "early", 12.0, 0.02),
+            (5, "normal", 5.0, -0.01),
+            (6, "early", 40.0, 0.04),
+            (6, "normal", 22.0, 0.00),
+            (7, "normal", 8.0, 0.03),
+            (8, "early", 18.0, -0.02),
+            (8, "normal", 50.0, 0.05),
+        )
+    ]
+    for mode_design in ({"n_buckets": 1}, {"n_buckets": 2, "min_bucket_events": 3}):
+        full = {
+            row["event_id"]: row for row in match_events(rows, {**_MATCH_DESIGN, **mode_design})[0]
+        }
+        for event in rows:
+            past = [row for row in rows if row["entry_index"] <= event["entry_index"]]
+            alone = _matched(past, event["event_id"], "causal", **mode_design)
+            assert full[event["event_id"]] == alone, event["event_id"]
+
+
+def test_causal_refuses_an_event_not_known_before_its_entry_open() -> None:
+    """Both entry rules enter strictly after `known_at`; a row that does not is
+    refused under causal matching rather than matched on an unknown fact."""
+    target = _match_row("target", "early", 5, 20.0, 0.03)
+    before = _match_row("peer", "normal", 5, 10.0, 0.01, known_at=instant(5, 9, 29))
+    assert _matched([target, before], "target", "causal")["peer_n_1"] == 1
+    at_open = {**before, "known_at": instant(5, 9, 30)}
+    with pytest.raises(ValueError, match="not known before its entry open"):
+        match_events([target, at_open], {**_MATCH_DESIGN, "matching": "causal"})
 
 
 def test_no_handle_precedes_every_read(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -311,7 +414,7 @@ def test_event_stage_delisting_and_causal_matching(
     assert ex_post.secondary["n_dropped_no_peers_early"] == 0
     # A peer disclosed after the treated event, but before its entry open,
     # belongs to the causal pool. The cutoff is entry, not event acceptance.
-    design["matching"] = "entry_known"
+    design["matching"] = "causal"
     design["entry"] = "next_open_after_instant"
     events[1]["known_at"] = instant(6, 8)
     same_entry = run_study(handle(tmp_path), parsed, events, settings=cfg)

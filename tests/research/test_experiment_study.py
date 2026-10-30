@@ -58,6 +58,11 @@ def test_matching_is_optional_causal_default_and_explicit_ex_post_is_hashed(
     assert ex_post.params_sha256 != causal.params_sha256
     with pytest.raises(ExperimentFileError, match=r"study\.matching"):
         _parse(tmp_path / "invalid", source.replace('matching = "ex_post"', 'matching = "other"'))
+    with pytest.raises(ExperimentFileError, match=r"study\.matching"):
+        _parse(
+            tmp_path / "old_name",
+            source.replace('matching = "ex_post"', 'matching = "entry_known"'),
+        )
 
 
 @pytest.mark.parametrize(

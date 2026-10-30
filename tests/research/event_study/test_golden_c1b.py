@@ -68,6 +68,9 @@ def _design(tmp_path: Path) -> dict[str, Any]:
     shutil.copy(C1B_FILE, path)
     study = parse_experiment_file(path, experiments, settings=Settings(_env_file=None)).study
     assert study is not None
+    # Run 3 used whole-cell cuts and symmetric peers; the fixture names the
+    # disclosed ex-post option (amendment 2026-10-30, #2493).
+    assert study["matching"] == "ex_post"
     return study
 
 
