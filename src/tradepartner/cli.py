@@ -444,7 +444,15 @@ from tradepartner.corpus import departure_fetch
 from tradepartner.diskfloor import ingest_floor_refusal, low_disk_warning
 from tradepartner.execution import check as paper_check
 from tradepartner.execution import lock as paper_lock
-from tradepartner.execution import lots_reconcile, ops, plain, reconcile_run, waiting, window
+from tradepartner.execution import (
+    lots_reconcile,
+    ops,
+    paper_message,
+    plain,
+    reconcile_run,
+    waiting,
+    window,
+)
 from tradepartner.execution import report as paper_report
 from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
@@ -1949,6 +1957,8 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
             line += f"; rebalance {traded} {result}"
         if row.open_orders_count and row.last_run_kind == "rebalance":
             line += f"; {_FILLS_NOTE}"
+        if message := paper_message.owner_message(row.last_run_message):
+            line += f"; {message}"
         lines.append(line)
     return lines
 
@@ -2010,6 +2020,8 @@ def _status_lines(
         *_edgar_age_lines(data.edgar_age),
         f"alerts ({len(data.alerts)}{', capped' if data.alerts_capped else ''}):",
     ]
+    if message := paper_message.owner_message(data.last_run_message):
+        lines.insert(-1, f"last run: {message}")
     lines += [f"  #{a.alert_id} {a.at} {a.kind} {a.session}: {a.message}" for a in data.alerts]
     return lines
 
