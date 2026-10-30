@@ -12,6 +12,7 @@ safety-reviewer MUST FIX).
 from __future__ import annotations
 
 import io
+import json
 import random
 import zipfile
 import zlib
@@ -1182,6 +1183,238 @@ def test_without_reuse_cached_the_bulk_file_is_requested_over_a_cached_one(
         settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
     )
     assert len(served) == 1 and path.read_bytes() == fresh
+
+
+# --- conditional GET for the nightly bulk zips (#2594) -------------------------
+
+_BULK_FETCHES = [
+    pytest.param(edgar_raw.bulk_submissions, "submissions.zip", id="submissions"),
+    pytest.param(edgar_raw.bulk_company_facts, "companyfacts.zip", id="companyfacts"),
+]
+_LAST_MODIFIED = "Wed, 28 Oct 2026 07:12:00 GMT"
+_ETAG = '"abc123"'
+
+
+def _seed_cached_bulk(
+    tmp_path: Path, name: str, *, sidecar: dict[str, object] | None
+) -> tuple[Path, bytes]:
+    """A cached bulk zip and, unless `sidecar` is `None`, its validators sidecar."""
+    cached = tmp_path / "bulk" / name
+    cached.parent.mkdir()
+    body = _valid_zip_bytes("old.json")
+    cached.write_bytes(body)
+    if sidecar is not None:
+        payload = {"size": len(body), **sidecar}
+        edgar_raw._validators_path(cached).write_text(json.dumps(payload))
+    return cached, body
+
+
+@pytest.mark.parametrize(("fetch", "name"), _BULK_FETCHES)
+def test_a_304_keeps_the_cached_bulk_zip_with_no_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fetch: Callable[..., Path], name: str
+) -> None:
+    cached, body = _seed_cached_bulk(
+        tmp_path, name, sidecar={"last_modified": _LAST_MODIFIED, "etag": _ETAG}
+    )
+    sidecar_before = edgar_raw._validators_path(cached).read_bytes()
+    mtime = cached.stat().st_mtime_ns
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(304)
+
+    def no_replace(src: str, dst: Path) -> None:
+        pytest.fail(f"a 304 must not rewrite anything: {src} -> {dst}")
+
+    monkeypatch.setattr(edgar_raw.os, "replace", no_replace)
+    path = fetch(settings=_settings(cache_dir=tmp_path), client=_mock_client(handler))
+
+    [request] = seen
+    assert request.headers["If-Modified-Since"] == _LAST_MODIFIED
+    assert request.headers["If-None-Match"] == _ETAG
+    assert path == cached and cached.read_bytes() == body
+    assert cached.stat().st_mtime_ns == mtime
+    assert edgar_raw._validators_path(cached).read_bytes() == sidecar_before
+    assert sorted(p.name for p in cached.parent.iterdir()) == sorted(
+        [name, edgar_raw._validators_path(cached).name]
+    )
+
+
+@pytest.mark.parametrize(("fetch", "name"), _BULK_FETCHES)
+def test_a_200_replaces_the_bulk_zip_atomically_and_records_its_validators(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fetch: Callable[..., Path], name: str
+) -> None:
+    cached, _old = _seed_cached_bulk(tmp_path, name, sidecar={"last_modified": _LAST_MODIFIED})
+    fresh = _valid_zip_bytes("new.json")
+    replaced: list[tuple[Path, Path]] = []
+    real_replace = edgar_raw.os.replace
+
+    def spy(src: str, dst: Path) -> None:
+        replaced.append((Path(src), Path(dst)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(edgar_raw.os, "replace", spy)
+    new_modified = "Thu, 29 Oct 2026 07:12:00 GMT"
+    path = fetch(
+        settings=_settings(cache_dir=tmp_path),
+        client=_mock_client(
+            lambda request: httpx.Response(
+                200, content=fresh, headers={"Last-Modified": new_modified, "ETag": '"n2"'}
+            )
+        ),
+    )
+    assert path == cached and cached.read_bytes() == fresh
+    # The zip itself arrives through a temp file beside it, never written in place.
+    zip_moves = [(src, dst) for src, dst in replaced if dst == cached]
+    assert len(zip_moves) == 1 and zip_moves[0][0].parent == cached.parent
+    assert json.loads(edgar_raw._validators_path(cached).read_text()) == {
+        "size": len(fresh),
+        "last_modified": new_modified,
+        "etag": '"n2"',
+    }
+    assert sorted(p.name for p in cached.parent.iterdir()) == sorted(
+        [name, edgar_raw._validators_path(cached).name]
+    )
+
+
+@pytest.mark.parametrize(("fetch", "name"), _BULK_FETCHES)
+def test_a_conditional_200_failing_mid_stream_keeps_the_zip_and_its_validators(
+    tmp_path: Path, fetch: Callable[..., Path], name: str
+) -> None:
+    cached, body = _seed_cached_bulk(tmp_path, name, sidecar={"etag": _ETAG})
+    sidecar_before = edgar_raw._validators_path(cached).read_bytes()
+    with pytest.raises(httpx.ReadError):
+        fetch(
+            settings=_settings(cache_dir=tmp_path, retry_max_attempts=1),
+            client=_mock_client(lambda request: httpx.Response(200, stream=_BrokenStream())),
+        )
+    assert cached.read_bytes() == body
+    assert edgar_raw._validators_path(cached).read_bytes() == sidecar_before
+    assert sorted(p.name for p in cached.parent.iterdir()) == sorted(
+        [name, edgar_raw._validators_path(cached).name]
+    )
+
+
+def test_a_conditional_200_that_stays_corrupt_keeps_the_zip_and_its_validators(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    cached, body = _seed_cached_bulk(tmp_path, "companyfacts.zip", sidecar={"etag": _ETAG})
+    sidecar_before = edgar_raw._validators_path(cached).read_bytes()
+    with pytest.raises(zipfile.BadZipFile):
+        edgar_raw.bulk_company_facts(
+            settings=_settings(cache_dir=tmp_path),
+            client=_mock_client(lambda request: httpx.Response(200, content=b"not a zip")),
+        )
+    assert cached.read_bytes() == body
+    assert edgar_raw._validators_path(cached).read_bytes() == sidecar_before
+
+
+@pytest.mark.parametrize(
+    "sidecar",
+    [
+        pytest.param(None, id="no-sidecar"),
+        pytest.param("not json", id="unreadable"),
+        pytest.param({"size": 1, "etag": _ETAG}, id="size-mismatch"),
+        pytest.param({"etag": ""}, id="blank-validator"),
+        pytest.param({}, id="no-validator"),
+    ],
+)
+def test_without_a_usable_validator_the_bulk_zip_is_fetched_unconditionally(
+    tmp_path: Path, sidecar: dict[str, object] | str | None
+) -> None:
+    cached = tmp_path / "bulk" / "companyfacts.zip"
+    cached.parent.mkdir()
+    cached.write_bytes(_valid_zip_bytes("old.json"))
+    if isinstance(sidecar, str):
+        edgar_raw._validators_path(cached).write_text(sidecar)
+    elif sidecar is not None:
+        edgar_raw._validators_path(cached).write_text(
+            json.dumps({"size": cached.stat().st_size, **sidecar})
+        )
+    seen: list[httpx.Request] = []
+    fresh = _valid_zip_bytes("new.json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=fresh)
+
+    path = edgar_raw.bulk_company_facts(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+    [request] = seen
+    assert "If-Modified-Since" not in request.headers and "If-None-Match" not in request.headers
+    assert path.read_bytes() == fresh
+    # A 200 with no validators leaves no sidecar behind to send next time.
+    assert [p.name for p in cached.parent.iterdir()] == ["companyfacts.zip"]
+
+
+def test_a_sidecar_with_no_cached_zip_sends_no_conditional_request(tmp_path: Path) -> None:
+    (tmp_path / "bulk").mkdir()
+    sidecar = edgar_raw._validators_path(tmp_path / "bulk" / "submissions.zip")
+    sidecar.write_text(json.dumps({"size": 10, "etag": _ETAG}))
+    seen: list[httpx.Request] = []
+    fresh = _valid_zip_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=fresh)
+
+    path = edgar_raw.bulk_submissions(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+    [request] = seen
+    assert "If-None-Match" not in request.headers and path.read_bytes() == fresh
+
+
+def test_an_unasked_304_still_raises(tmp_path: Path) -> None:
+    """A 304 to a request that sent no validator is not a cache hit: there is no
+    cached copy it can refer to, so it fails as any other unexpected status."""
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.bulk_submissions(
+            settings=_settings(cache_dir=tmp_path),
+            client=_mock_client(lambda request: httpx.Response(304)),
+        )
+    assert list((tmp_path / "bulk").iterdir()) == []
+
+
+def test_the_conditional_request_goes_through_the_shared_limiter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_cached_bulk(tmp_path, "companyfacts.zip", sidecar={"etag": _ETAG})
+    waits: list[float] = []
+    monkeypatch.setattr(edgar_raw._LIMITER, "wait", waits.append)
+    edgar_raw.bulk_company_facts(
+        settings=_settings(cache_dir=tmp_path, requests_per_second=9),
+        client=_mock_client(lambda request: httpx.Response(304)),
+    )
+    assert waits == [pytest.approx(1 / 9)]
+
+
+def test_a_304_hands_the_caller_the_same_bytes_and_no_zip_date(tmp_path: Path) -> None:
+    """No look-ahead is unchanged (#2594): the bulk functions return only the
+    cached path, never the response's `Last-Modified`, so the zip's date cannot
+    reach a stamp (stamps come from each filing's `acceptanceDateTime`); and a
+    304 hands back byte-identical bytes to the 200 before it, so whatever the
+    caller parses, and every stamp it reads, is the same as today's."""
+    fresh = _valid_zip_bytes("CIK0000000001.json", b'{"acceptanceDateTime": "x"}')
+    responses = iter(
+        [
+            httpx.Response(200, content=fresh, headers={"Last-Modified": _LAST_MODIFIED}),
+            httpx.Response(304, headers={"Last-Modified": "Fri, 01 Jan 2100 00:00:00 GMT"}),
+        ]
+    )
+    settings = _settings(cache_dir=tmp_path)
+    first = edgar_raw.bulk_submissions(
+        settings=settings, client=_mock_client(lambda request: next(responses))
+    )
+    first_bytes = first.read_bytes()
+    second = edgar_raw.bulk_submissions(
+        settings=settings, client=_mock_client(lambda request: next(responses))
+    )
+    assert isinstance(second, Path) and second == first
+    assert second.read_bytes() == first_bytes == fresh
 
 
 # --- filing index and capped document read (T184b, #1597) -------------------

@@ -46,6 +46,14 @@ streamed `GET`, each attempt and retry still behind `_RateLimiter`:
   still corrupt after that raises `zipfile.BadZipFile`. Each download is
   checked in its temp file before it replaces the cached zip, so a corrupt
   one never overwrites the previous good copy (#761).
+- **The nightly bulk zips** (`submissions.zip`, `companyfacts.zip`; #2594)
+  are fetched with a conditional `GET`: the validators (`Last-Modified`,
+  `ETag`) of the copy already cached are kept in a sidecar beside it
+  (`_validators_path`), sent as `If-Modified-Since` / `If-None-Match`, and a
+  `304` keeps the cached zip untouched. A missing, unreadable or mismatched
+  sidecar sends an unconditional `GET`, as before. The FSN and insider zips
+  are not fetched this way: their callers `HEAD` first and compare against
+  their own manifests.
 
 Every public function takes an optional `client: httpx.Client` so tests
 can inject an `httpx.MockTransport`-backed client without any real
@@ -55,6 +63,7 @@ callers omit it and get the module's shared, lazily-built client.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -733,8 +742,9 @@ def download_filing_file(
 def _stream_to(url: str, dest: Path, *, settings: Settings, client: httpx.Client | None) -> Path:
     """Stream `url` to `dest` behind the throttle and `User-Agent`, the
     module's retry policy, and one re-download if it arrives corrupt, through
-    a temp file and `os.replace`."""
-    return _stream_to_with_headers(url, dest, settings=settings, client=client)[0]
+    a temp file and `os.replace`; a conditional `GET` against the cached copy,
+    kept as it is on a `304` (#2594)."""
+    return _stream_to_with_headers(url, dest, settings=settings, client=client, conditional=True)[0]
 
 
 def _write_stream_to_temp(dest: Path, chunks: Iterable[bytes]) -> Path:
@@ -753,14 +763,18 @@ def _write_stream_to_temp(dest: Path, chunks: Iterable[bytes]) -> Path:
     return Path(tmp)
 
 
-def _replace_if_valid_zip(tmp: Path, dest: Path) -> bool:
+def _replace_if_valid_zip(tmp: Path, dest: Path, *, stale: Path | None = None) -> bool:
     """Move `tmp` over `dest` if it is a sound zip and return `True`; else
     delete it and return `False`, leaving any previous `dest` in place
     (#761: the check runs before `os.replace`, never after). `tmp` is gone
-    either way, including on an error."""
+    either way, including on an error. `stale` (the old copy's validators
+    sidecar, #2594) is deleted just before the replace, so it never describes
+    a zip it was not written for."""
     try:
         if _zip_is_corrupt(tmp):
             return False
+        if stale is not None:
+            stale.unlink(missing_ok=True)
         os.replace(tmp, dest)
         return True
     finally:
@@ -781,8 +795,63 @@ def _zip_is_corrupt(path: Path) -> bool:
         return True
 
 
+#: The response validators a conditional bulk `GET` keeps (#2594), as
+#: `(sidecar key, response header, request header)`.
+_VALIDATORS = (
+    ("last_modified", "Last-Modified", "If-Modified-Since"),
+    ("etag", "ETag", "If-None-Match"),
+)
+
+
+def _validators_path(dest: Path) -> Path:
+    """The sidecar beside a cached bulk zip holding its response validators
+    and size (#2594); kept next to the file, never in the store."""
+    return dest.with_name(f"{dest.name}.validators.json")
+
+
+def _conditional_headers(dest: Path) -> dict[str, str]:
+    """`If-Modified-Since` / `If-None-Match` for the zip cached at `dest`, from
+    its sidecar; empty (an unconditional `GET`, the pre-#2594 behaviour) when
+    there is no cached zip, no readable sidecar, a sidecar whose recorded size
+    is not the cached file's, no non-blank validator, or a cached file that
+    does not open as a zip."""
+    try:
+        sidecar = json.loads(_validators_path(dest).read_text())
+        size = dest.stat().st_size
+        with zipfile.ZipFile(dest):
+            pass
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return {}
+    if not isinstance(sidecar, dict) or sidecar.get("size") != size:
+        return {}
+    return {
+        request_header: value
+        for key, _response_header, request_header in _VALIDATORS
+        if isinstance(value := sidecar.get(key), str) and value.strip()
+    }
+
+
+def _write_validators(dest: Path, headers: httpx.Headers) -> None:
+    """Record the validators of the zip just written to `dest` in its sidecar
+    (atomically), or leave none when the response sent no validator."""
+    validators = {
+        key: value
+        for key, response_header, _request_header in _VALIDATORS
+        if (value := headers.get(response_header, "").strip())
+    }
+    if validators:
+        write_atomic(
+            _validators_path(dest), json.dumps({"size": dest.stat().st_size, **validators}).encode()
+        )
+
+
 def _stream_to_with_headers(
-    url: str, dest: Path, *, settings: Settings, client: httpx.Client | None
+    url: str,
+    dest: Path,
+    *,
+    settings: Settings,
+    client: httpx.Client | None,
+    conditional: bool = False,
 ) -> tuple[Path, httpx.Headers]:
     """As `_stream_to`, but also returns the response headers (T11c: `Last-
     Modified`, `ETag` and `Content-Length` go into the FSN period manifest).
@@ -796,6 +865,12 @@ def _stream_to_with_headers(
     `dest` (if any) untouched (#761). The
     status and transport-error decisions are `_RetryPolicy`'s, the same as
     every other request here.
+
+    With `conditional` (#2594) the request carries the cached copy's
+    validators (`_conditional_headers`); a `304` returns `dest` as it stands,
+    with no write, and a `200` that replaces `dest` records its validators
+    for the next run. A `304` to a request that sent no validator raises, as
+    any other unexpected status.
     """
     headers = {"User-Agent": _user_agent(settings)}
     http_client = (
@@ -804,6 +879,9 @@ def _stream_to_with_headers(
     timeout = settings.edgar.request_timeout_seconds
     min_interval_seconds = 1.0 / settings.edgar.requests_per_second
     dest.parent.mkdir(parents=True, exist_ok=True)
+    validator_headers = _conditional_headers(dest) if conditional else {}
+    headers.update(validator_headers)
+    sent_validator = bool(validator_headers)
 
     policy = _RetryPolicy(settings)
     zip_redownloaded = False
@@ -811,6 +889,9 @@ def _stream_to_with_headers(
         _LIMITER.wait(min_interval_seconds)
         try:
             with http_client.stream("GET", url, headers=headers, timeout=timeout) as response:
+                if sent_validator and response.status_code == httpx.codes.NOT_MODIFIED:
+                    _RATE_LIMIT_BLOCK.clear()
+                    return dest, response.headers
                 if policy.retry_after_response(response):
                     continue
                 response_headers = response.headers
@@ -820,11 +901,14 @@ def _stream_to_with_headers(
                 continue
             raise
 
-        if not _replace_if_valid_zip(tmp, dest):
+        stale = _validators_path(dest) if conditional else None
+        if not _replace_if_valid_zip(tmp, dest, stale=stale):
             if zip_redownloaded:
                 raise zipfile.BadZipFile(f"{dest} still corrupt after one re-download")
             zip_redownloaded = True
             continue
+        if conditional:
+            _write_validators(dest, response_headers)
         return dest, response_headers
 
 
@@ -1003,7 +1087,8 @@ def bulk_submissions(
     *, settings: Settings | None = None, client: httpx.Client | None = None
 ) -> Path:
     """The nightly `submissions.zip` (every CIK's submissions and older pages,
-    rebuilt about 03:00 ET), streamed to `edgar.cache_dir/bulk/submissions.zip`."""
+    rebuilt about 03:00 ET), streamed to `edgar.cache_dir/bulk/submissions.zip`
+    with a conditional `GET`: a `304` keeps the cached copy (#2594)."""
     settings = settings or get_settings()
     return _stream_to(
         "https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip",
@@ -1019,7 +1104,8 @@ def bulk_company_facts(
     client: httpx.Client | None = None,
     reuse_cached: bool = False,
 ) -> Path:
-    """The nightly `companyfacts.zip`, streamed to `edgar.cache_dir/bulk/companyfacts.zip`.
+    """The nightly `companyfacts.zip`, streamed to `edgar.cache_dir/bulk/companyfacts.zip`
+    with a conditional `GET`: a `304` keeps the cached copy (#2594).
 
     With `reuse_cached` (`ingest --bulk-from-cache`, #660) the file already
     there is returned as it stands with no request, provided it opens as a
