@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import random
 import zipfile
 import zlib
@@ -1204,7 +1205,8 @@ def _seed_cached_bulk(
     body = _valid_zip_bytes("old.json")
     cached.write_bytes(body)
     if sidecar is not None:
-        payload = {"size": len(body), **sidecar}
+        stat = cached.stat()
+        payload = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, **sidecar}
         edgar_raw._validators_path(cached).write_text(json.dumps(payload))
     return cached, body
 
@@ -1270,6 +1272,7 @@ def test_a_200_replaces_the_bulk_zip_atomically_and_records_its_validators(
     assert len(zip_moves) == 1 and zip_moves[0][0].parent == cached.parent
     assert json.loads(edgar_raw._validators_path(cached).read_text()) == {
         "size": len(fresh),
+        "mtime_ns": cached.stat().st_mtime_ns,
         "last_modified": new_modified,
         "etag": '"n2"',
     }
@@ -1330,8 +1333,9 @@ def test_without_a_usable_validator_the_bulk_zip_is_fetched_unconditionally(
     if isinstance(sidecar, str):
         edgar_raw._validators_path(cached).write_text(sidecar)
     elif sidecar is not None:
+        stat = cached.stat()
         edgar_raw._validators_path(cached).write_text(
-            json.dumps({"size": cached.stat().st_size, **sidecar})
+            json.dumps({"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, **sidecar})
         )
     seen: list[httpx.Request] = []
     fresh = _valid_zip_bytes("new.json")
@@ -1415,6 +1419,151 @@ def test_a_304_hands_the_caller_the_same_bytes_and_no_zip_date(tmp_path: Path) -
     )
     assert isinstance(second, Path) and second == first
     assert second.read_bytes() == first_bytes == fresh
+
+
+@pytest.mark.parametrize(
+    "bad", [pytest.param('"a"\r\nX-Injected: 1', id="crlf"), pytest.param('"café"', id="non-ascii")]
+)
+def test_a_sidecar_validator_that_is_not_printable_ascii_sends_an_unconditional_get(
+    tmp_path: Path, bad: str
+) -> None:
+    _seed_cached_bulk(
+        tmp_path, "companyfacts.zip", sidecar={"etag": bad, "last_modified": _LAST_MODIFIED}
+    )
+    seen: list[httpx.Request] = []
+    fresh = _valid_zip_bytes("new.json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=fresh)
+
+    path = edgar_raw.bulk_company_facts(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+    [request] = seen
+    assert "If-None-Match" not in request.headers and "If-Modified-Since" not in request.headers
+    assert "X-Injected" not in request.headers and path.read_bytes() == fresh
+
+
+@pytest.mark.parametrize(
+    "bad", [pytest.param('"a"\nX-Injected: 1', id="lf"), pytest.param('"café"', id="non-ascii")]
+)
+def test_a_response_validator_that_is_not_printable_ascii_writes_no_sidecar(
+    tmp_path: Path, bad: str
+) -> None:
+    cached, _old = _seed_cached_bulk(tmp_path, "submissions.zip", sidecar={"etag": _ETAG})
+    fresh = _valid_zip_bytes("new.json")
+    headers = httpx.Headers({"Last-Modified": _LAST_MODIFIED})
+    # httpx refuses CR/LF and non-ASCII when building headers, so set the raw value.
+    headers._list.append((b"ETag", b"etag", bad.encode("utf-8")))
+    path = edgar_raw.bulk_submissions(
+        settings=_settings(cache_dir=tmp_path),
+        client=_mock_client(lambda request: httpx.Response(200, content=fresh, headers=headers)),
+    )
+    assert path.read_bytes() == fresh
+    assert not edgar_raw._validators_path(cached).exists()
+
+
+def test_an_oversized_sidecar_is_refused_before_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cached, _old = _seed_cached_bulk(tmp_path, "companyfacts.zip", sidecar=None)
+    edgar_raw._validators_path(cached).write_text(
+        json.dumps(
+            {
+                "size": cached.stat().st_size,
+                "mtime_ns": cached.stat().st_mtime_ns,
+                "etag": _ETAG,
+                "pad": "x" * 5000,
+            }
+        )
+    )
+    monkeypatch.setattr(
+        edgar_raw.json, "loads", lambda _text: pytest.fail("an oversized sidecar was parsed")
+    )
+    assert edgar_raw._conditional_headers(cached) == {}
+
+
+def test_a_deeply_nested_sidecar_sends_an_unconditional_get(tmp_path: Path) -> None:
+    cached, _old = _seed_cached_bulk(tmp_path, "companyfacts.zip", sidecar=None)
+    edgar_raw._validators_path(cached).write_text("[" * 2000 + "]" * 2000)
+    assert edgar_raw._conditional_headers(cached) == {}
+
+
+def test_a_failed_sidecar_write_does_not_fail_a_good_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cached, _old = _seed_cached_bulk(tmp_path, "companyfacts.zip", sidecar={"etag": _ETAG})
+    fresh = _valid_zip_bytes("new.json")
+
+    def no_space(path: Path, data: bytes) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(edgar_raw, "write_atomic", no_space)
+    path = edgar_raw.bulk_company_facts(
+        settings=_settings(cache_dir=tmp_path),
+        client=_mock_client(
+            lambda request: httpx.Response(200, content=fresh, headers={"ETag": '"n2"'})
+        ),
+    )
+    assert path == cached and cached.read_bytes() == fresh
+    assert not edgar_raw._validators_path(cached).exists()
+
+
+def test_a_503_then_304_keeps_the_cached_zip(tmp_path: Path) -> None:
+    cached, body = _seed_cached_bulk(tmp_path, "companyfacts.zip", sidecar={"etag": _ETAG})
+    statuses = iter([503, 304])
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(next(statuses))
+
+    path = edgar_raw.bulk_company_facts(
+        settings=_settings(cache_dir=tmp_path, retry_backoff_seconds=0.001),
+        client=_mock_client(handler),
+    )
+    assert len(seen) == 2 and all(r.headers["If-None-Match"] == _ETAG for r in seen)
+    assert path == cached and cached.read_bytes() == body
+
+
+def test_a_304_clears_the_rate_limit_block(tmp_path: Path) -> None:
+    _seed_cached_bulk(tmp_path, "companyfacts.zip", sidecar={"etag": _ETAG})
+    edgar_raw._RATE_LIMIT_BLOCK.set()
+    try:
+        edgar_raw.bulk_company_facts(
+            settings=_settings(cache_dir=tmp_path),
+            client=_mock_client(lambda request: httpx.Response(304)),
+        )
+        assert not edgar_raw._RATE_LIMIT_BLOCK.is_set()
+    finally:
+        edgar_raw._RATE_LIMIT_BLOCK.clear()
+
+
+def test_the_conditional_request_declares_the_user_agent(tmp_path: Path) -> None:
+    _seed_cached_bulk(tmp_path, "submissions.zip", sidecar={"etag": _ETAG})
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(304)
+
+    edgar_raw.bulk_submissions(settings=_settings(cache_dir=tmp_path), client=_mock_client(handler))
+    [request] = seen
+    assert request.headers["User-Agent"] == "TradePartner test-agent"
+    assert request.headers["If-None-Match"] == _ETAG
+
+
+def test_a_sidecar_for_a_same_size_zip_with_another_mtime_sends_an_unconditional_get(
+    tmp_path: Path,
+) -> None:
+    """A zip swapped in by hand at the same size is not the one the sidecar was
+    written for: its `st_mtime_ns` differs, so no validator is sent."""
+    cached, body = _seed_cached_bulk(tmp_path, "companyfacts.zip", sidecar={"etag": _ETAG})
+    stat = cached.stat()
+    os.utime(cached, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    assert cached.stat().st_size == len(body)
+    assert edgar_raw._conditional_headers(cached) == {}
 
 
 # --- filing index and capped document read (T184b, #1597) -------------------

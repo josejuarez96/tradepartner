@@ -49,9 +49,10 @@ streamed `GET`, each attempt and retry still behind `_RateLimiter`:
 - **The nightly bulk zips** (`submissions.zip`, `companyfacts.zip`; #2594)
   are fetched with a conditional `GET`: the validators (`Last-Modified`,
   `ETag`) of the copy already cached are kept in a sidecar beside it
-  (`_validators_path`), sent as `If-Modified-Since` / `If-None-Match`, and a
-  `304` keeps the cached zip untouched. A missing, unreadable or mismatched
-  sidecar sends an unconditional `GET`, as before. The FSN and insider zips
+  (`_validators_path`, bound to the zip by its size and `st_mtime_ns`),
+  sent as `If-Modified-Since` / `If-None-Match`, and a `304` keeps the
+  cached zip untouched. A missing, unreadable or mismatched sidecar sends
+  an unconditional `GET`, as before. The FSN and insider zips
   are not fetched this way: their callers `HEAD` first and compare against
   their own manifests.
 
@@ -73,7 +74,7 @@ import time
 import zipfile
 import zlib
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -803,6 +804,19 @@ _VALIDATORS = (
 )
 
 
+#: A validators sidecar holds a size and two short header values; anything
+#: larger is not one this module wrote, and is refused before it is parsed.
+_VALIDATORS_SIDECAR_MAX_BYTES = 4096
+
+
+def _usable_validator(value: object) -> bool:
+    """Whether `value` may go into a request header: a non-blank, printable
+    ASCII string (so never a CR/LF or other control character)."""
+    return (
+        isinstance(value, str) and bool(value.strip()) and value.isascii() and value.isprintable()
+    )
+
+
 def _validators_path(dest: Path) -> Path:
     """The sidecar beside a cached bulk zip holding its response validators
     and size (#2594); kept next to the file, never in the store."""
@@ -813,36 +827,49 @@ def _conditional_headers(dest: Path) -> dict[str, str]:
     """`If-Modified-Since` / `If-None-Match` for the zip cached at `dest`, from
     its sidecar; empty (an unconditional `GET`, the pre-#2594 behaviour) when
     there is no cached zip, no readable sidecar, a sidecar whose recorded size
-    is not the cached file's, no non-blank validator, or a cached file that
-    does not open as a zip."""
+    or `st_mtime_ns` is not the cached file's (so a zip replaced by hand is
+    never vouched for by the old copy's validators), a sidecar over `_VALIDATORS_SIDECAR_MAX_BYTES`,
+    any validator that is not printable ASCII (`_usable_validator`), none at
+    all, or a cached file that does not open as a zip."""
+    sidecar_path = _validators_path(dest)
     try:
-        sidecar = json.loads(_validators_path(dest).read_text())
-        size = dest.stat().st_size
+        if sidecar_path.stat().st_size > _VALIDATORS_SIDECAR_MAX_BYTES:
+            return {}
+        sidecar = json.loads(sidecar_path.read_text())
+        stat = dest.stat()
         with zipfile.ZipFile(dest):
             pass
-    except (OSError, ValueError, zipfile.BadZipFile):
+    except (OSError, ValueError, RecursionError, zipfile.BadZipFile):
         return {}
-    if not isinstance(sidecar, dict) or sidecar.get("size") != size:
+    if (
+        not isinstance(sidecar, dict)
+        or sidecar.get("size") != stat.st_size
+        or sidecar.get("mtime_ns") != stat.st_mtime_ns
+    ):
         return {}
-    return {
-        request_header: value
+    present = {
+        request_header: sidecar[key]
         for key, _response_header, request_header in _VALIDATORS
-        if isinstance(value := sidecar.get(key), str) and value.strip()
+        if sidecar.get(key) is not None
     }
+    if not all(_usable_validator(value) for value in present.values()):
+        return {}
+    return present
 
 
 def _write_validators(dest: Path, headers: httpx.Headers) -> None:
     """Record the validators of the zip just written to `dest` in its sidecar
-    (atomically), or leave none when the response sent no validator."""
+    (atomically), or leave none when the response sent no validator or any
+    validator that is not printable ASCII (`_usable_validator`)."""
     validators = {
         key: value
         for key, response_header, _request_header in _VALIDATORS
         if (value := headers.get(response_header, "").strip())
     }
-    if validators:
-        write_atomic(
-            _validators_path(dest), json.dumps({"size": dest.stat().st_size, **validators}).encode()
-        )
+    if validators and all(_usable_validator(value) for value in validators.values()):
+        stat = dest.stat()
+        payload = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, **validators}
+        write_atomic(_validators_path(dest), json.dumps(payload).encode())
 
 
 def _stream_to_with_headers(
@@ -908,7 +935,10 @@ def _stream_to_with_headers(
             zip_redownloaded = True
             continue
         if conditional:
-            _write_validators(dest, response_headers)
+            # The zip is already in place; a sidecar that cannot be written only
+            # costs the next run an unconditional `GET`, never this download.
+            with suppress(OSError):
+                _write_validators(dest, response_headers)
         return dest, response_headers
 
 
