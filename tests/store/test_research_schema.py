@@ -885,9 +885,11 @@ def test_the_migration_from_version_40_widens_the_verdict_check(tmp_path: Path) 
         schema.init_schema(c)
         assert _versions(c) == [40, 41]
         assert "'not_computable'" in schema._check_text(c, "research_results", "verdict")
-        # Every row kept, byte-identical, in insertion order; no other table moved.
+        # Every row kept, byte-identical, in insertion order, but run 3's verdict:
+        # its NaN interval bound relabels its `fail` (#2658); no other table moved.
+        relabelled = [(*r[:11], "not_computable", *r[12:]) if r[0] == 3 else r for r in rows]
         assert _same_rows(
-            c.execute("SELECT * FROM research_results ORDER BY rowid").fetchall(), rows
+            c.execute("SELECT * FROM research_results ORDER BY rowid").fetchall(), relabelled
         )
         assert {n: s for n, s in _ddl(c).items() if n != "research_results"} == before
         assert _ddl(c)["research_results"] == conn_ddl()
@@ -922,3 +924,66 @@ def test_a_read_only_open_of_a_version_40_store_serves_research_reads(tmp_path: 
         assert _same_rows(
             c.execute("SELECT * FROM research_results ORDER BY rowid").fetchall(), rows
         )
+
+
+def test_the_version_41_migration_relabels_a_non_finite_fail_only(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#2658 (owner, 2026-10-30): a pre-v41 `fail` whose stored primary value or
+    interval bound is NaN or infinite becomes `not_computable`, derived from the
+    stored values only; a finite `fail` and every other verdict are untouched,
+    and the count and ids are logged."""
+    path = tmp_path / "v40.duckdb"
+    rows = _version_40_store(path)
+    assert [(r[0], r[11]) for r in rows] == [(3, "fail"), (1, None), (2, "n/a")]
+    with duckdb.connect(str(path)) as c:
+        configure_connection(c)  # UTC session, so both reads render `known_at` alike
+        for run_id, verdict, column, value in (
+            (4, "fail", "primary_ci_low", 0.5),  # finite: a genuine fail
+            (5, "fail", "primary_value", float("inf")),
+            (6, "fail", "primary_ci_high", float("-inf")),
+            (7, "underpowered", "primary_ci_low", float("nan")),
+        ):
+            c.execute(
+                f"INSERT INTO research_results (run_id, outcome, n_configurations, verdict, "
+                f"{column}, known_at) VALUES (?, 'ok', 1, ?, ?, ?)",
+                [run_id, verdict, value, KNOWN],
+            )
+        before = c.execute("SELECT * EXCLUDE (verdict) FROM research_results ORDER BY rowid")
+        kept = before.fetchall()
+        with caplog.at_level("WARNING", logger="tradepartner.store.schema"):
+            schema.init_schema(c)
+        verdicts = dict(c.execute("SELECT run_id, verdict FROM research_results").fetchall())
+        assert verdicts == {
+            3: "not_computable",
+            1: None,
+            2: "n/a",
+            4: "fail",
+            5: "not_computable",
+            6: "not_computable",
+            7: "underpowered",
+        }
+        after = c.execute("SELECT * EXCLUDE (verdict) FROM research_results ORDER BY rowid")
+        assert _same_rows(after.fetchall(), kept)
+        assert "relabelled 3 research result(s) fail -> not_computable: [3, 5, 6]" in caplog.text
+        caplog.clear()
+        schema.init_schema(c)
+        assert "relabelled" not in caplog.text
+
+
+def test_the_version_41_migration_relabels_exactly_one_of_two_fails(tmp_path: Path) -> None:
+    """The coordinator's case (#2658): one non-finite `fail`, one finite `fail`."""
+    path = tmp_path / "v40.duckdb"
+    _version_40_store(path)
+    with duckdb.connect(str(path)) as c:
+        c.execute("DELETE FROM research_results WHERE run_id <> 3")
+        c.execute(
+            "INSERT INTO research_results (run_id, outcome, n_configurations, verdict, "
+            "primary_ci_low, known_at) VALUES (4, 'ok', 1, 'fail', 0.5, ?)",
+            [KNOWN],
+        )
+        schema.init_schema(c)
+        assert c.execute("SELECT run_id, verdict FROM research_results ORDER BY 1").fetchall() == [
+            (3, "not_computable"),
+            (4, "fail"),
+        ]

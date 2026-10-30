@@ -589,9 +589,11 @@ registry; #83 took version 2 first, so the registry is version 3):
   so no stored row falls outside it; DuckDB cannot change a `CHECK` in place,
   so `_migrate_not_computable` rebuilds `research_results` through a staging
   table where its verdict `CHECK` lacks the value, every row kept in insertion
-  order and byte-identical. A read-only connection accepts a version-40 store:
-  every read works (no `not_computable` row can exist there), and the next
-  writable `init_schema` call migrates it.
+  order and byte-identical but one value: a `fail` whose stored primary value
+  or bound is NaN or infinite is copied as `not_computable` (#2658, from the
+  stored values only, the count and run ids logged). A read-only connection
+  accepts a version-40 store: every read works (no `not_computable` row can
+  exist there), and the next writable `init_schema` call migrates it.
 - **A later DDL change goes to version 42**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
@@ -661,6 +663,7 @@ they shape this DDL):
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Final, TypedDict
@@ -668,6 +671,8 @@ from typing import Final, TypedDict
 import duckdb
 
 from tradepartner.store.db import configure_connection, forget_column_types, utc_now
+
+_log = logging.getLogger(__name__)
 
 #: Every provenance value used anywhere in the store (spec "Definitions").
 #: No single table allows all of these — see `TABLE_PROVENANCE_VALUES`.
@@ -904,7 +909,8 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   `sec_form4_transactions` tables, read behind
 #:   `events.sec_forms_read_enabled`.
 #: - 41 (#2617): `research_results.verdict` gains `not_computable`; the table
-#:   is rebuilt (`_migrate_not_computable`), every row kept.
+#:   is rebuilt (`_migrate_not_computable`), every row kept, a non-finite
+#:   `fail` relabelled `not_computable` (#2658).
 #: - A later DDL change goes to version 42, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
 CURRENT_SCHEMA_VERSION = 41
@@ -4280,19 +4286,47 @@ def _migrate_not_computable(conn: duckdb.DuckDBPyConnection) -> None:
     the `CHECK` lacks it (the DDL pass creates the table at its current shape on
     a store that had none), every row kept in insertion order. The set only
     grows, so no stored verdict can fall outside it. Runs inside
-    `init_schema`'s transaction, after the DDL pass."""
+    `init_schema`'s transaction, after the DDL pass.
+
+    The one value that moves (#2658, owner 2026-10-30): a `fail` whose stored
+    `primary_value`, `primary_ci_low` or `primary_ci_high` is NaN or infinite
+    (how `write_result` stored them; NULL is not non-finite) is copied as
+    `not_computable`, the verdict `compute_verdict` now gives it. Derived from
+    the stored values only, nothing is recomputed; every other verdict, a
+    finite `fail` included, is copied as it was. The count and the relabelled
+    run ids are logged."""
     if "'not_computable'" in _check_text(conn, "research_results", "verdict"):
         return
+    non_finite = " OR ".join(
+        f"NOT isfinite({column})"
+        for column in ("primary_value", "primary_ci_low", "primary_ci_high")
+    )
+    relabel = f"verdict = 'fail' AND ({non_finite})"
+    relabelled = [
+        int(run_id)
+        for (run_id,) in conn.execute(
+            f"SELECT run_id FROM research_results WHERE {relabel} ORDER BY run_id"
+        ).fetchall()
+    ]
     staging = "research_results_v41"
     conn.execute(
         _CREATE_RESEARCH_RESULTS.replace(
             "CREATE TABLE IF NOT EXISTS research_results (", f"CREATE TABLE {staging} (", 1
         )
     )
-    conn.execute(f"INSERT INTO {staging} BY NAME SELECT * FROM research_results ORDER BY rowid")
+    conn.execute(
+        f"INSERT INTO {staging} BY NAME SELECT * REPLACE (CASE WHEN {relabel} "
+        "THEN 'not_computable' ELSE verdict END AS verdict) FROM research_results ORDER BY rowid"
+    )
     conn.execute("DROP TABLE research_results")
     conn.execute(f"ALTER TABLE {staging} RENAME TO research_results")
     forget_column_types(conn)
+    if relabelled:
+        _log.warning(
+            "schema 41: relabelled %d research result(s) fail -> not_computable: %s",
+            len(relabelled),
+            relabelled,
+        )
 
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
@@ -4311,7 +4345,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     fresh store gets every table and one `schema_version` row for
     `CURRENT_SCHEMA_VERSION` and no lab table; a version-40 or earlier store
     gets `research_results` rebuilt with `not_computable` in its verdict
-    `CHECK` where it lacks it, every row kept in insertion order, and a
+    `CHECK` where it lacks it, every row kept in insertion order (a `fail`
+    with a non-finite stored primary relabelled `not_computable`, #2658), and a
     version-41 row (#2617); every store gets
     `trial_rebalances` and `paper_plans` each with `n_assets_intersected` and
     `assets_intersection_skipped` added (NULL on every existing row; a
