@@ -1408,6 +1408,20 @@ def _close_study_failed(settings: Settings, handle: RunHandle, message: str) -> 
     return f"run {handle.run_id}: failed ({handle.slug})"
 
 
+def _study_scrubbed(text: str, settings: Settings) -> str:
+    """Scrub secrets and local paths from study result and failure text."""
+    text = _scrubbed(text, settings)
+    paths = {
+        str(Path.home()),
+        str(settings.store.path),
+        str(Path(settings.store.path).resolve()),
+    }
+    for path in sorted(paths, key=len, reverse=True):
+        if path not in {"", ".", "/"}:
+            text = text.replace(path, "<path>")
+    return text
+
+
 def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None = None) -> None:
     """`experiment study --run <id>` (amendment 2026-10-28 #2440, plan T304).
 
@@ -1472,8 +1486,10 @@ def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None 
                 exploratory=result.exploratory,
             )
     except BaseException as exc:  # any exception closes the run failed (#2440)
-        message = _scrubbed(f"{type(exc).__name__}: {exc}", settings)
-        _echo_scrubbed(_close_study_failed(settings, handle, message), settings)
+        message = _study_scrubbed(f"{type(exc).__name__}: {exc}", settings)
+        _echo_scrubbed(
+            _study_scrubbed(_close_study_failed(settings, handle, message), settings), settings
+        )
         _echo_scrubbed(f"  {message}", settings)
         raise typer.Exit(INTERRUPTED_EXIT if isinstance(exc, KeyboardInterrupt) else 1) from None
     kills = ", ".join(
