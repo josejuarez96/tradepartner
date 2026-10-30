@@ -56,7 +56,7 @@ def _utc_optional(record: object, field_name: str) -> None:
     _utc(record, field_name)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)  # #2616: millions per run, so no per-row __dict__
 class FilingIndexEntry:
     """One row of EDGAR's full-history filing index."""
 

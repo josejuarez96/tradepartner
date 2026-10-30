@@ -826,6 +826,14 @@ class EdgarFilingSource(FilingSource):
                     issuers.add(row.cik)  # the subject of a delisting
         self.skipped_filers = len(filers - issuers)
 
+        # #2616: the full history is millions of rows, so each kept row shares
+        # one string per CIK, company name and form (and one date per day)
+        # instead of carrying the parser's own copies; each CIK's rows are
+        # dropped as its entries are made, and `_stamp_each` holds one CIK's
+        # stamps at a time, so the rows, the stamps and the entries are never
+        # all held at once.
+        strings: dict[str, str] = {}
+        days: dict[date, date] = {}
         kept: dict[str, dict[str, tuple[UnstampedFiling, Quarter]]] = {}
         for quarter, row in self._rows(quarters, last):
             if row.cik not in issuers:
@@ -836,22 +844,37 @@ class EdgarFilingSource(FilingSource):
                 and len(delisting_ciks[row.accession]) > 1
             ):
                 continue  # the exchange's copy of a 25-NSE; the subject company keeps it
-            kept.setdefault(row.cik, {}).setdefault(row.accession, (row, quarter))
+            rows = kept.get(row.cik)
+            if rows is None:
+                rows = kept[strings.setdefault(row.cik, row.cik)] = {}
+            if row.accession not in rows:
+                shared = UnstampedFiling(
+                    strings.setdefault(row.cik, row.cik),
+                    strings.setdefault(row.company_name, row.company_name),
+                    strings.setdefault(row.form, row.form),
+                    row.accession,
+                    days.setdefault(row.filed_on, row.filed_on),
+                )
+                rows[row.accession] = (shared, quarter)
+        del strings, days
 
-        stamps = self._stamp(kept)
         entries: list[FilingIndexEntry] = []
-        for cik, rows in kept.items():
-            for accession, (row, _) in rows.items():
-                record = stamps[cik].get(accession)
+        unstamped: list[UnstampedFiling] = []
+        for cik, stamps in self._stamp_each(kept):
+            for accession, (row, _) in kept.pop(cik).items():
+                record = stamps.get(accession)
                 if record is None or record.accepted_at is None:
-                    self.unstamped_filings.append(row)
+                    unstamped.append(row)
                 else:
                     at = record.accepted_at
-                    entries.append(FilingIndexEntry(cik, row.company_name, row.form, accession, at))
+                    entries.append(
+                        FilingIndexEntry(row.cik, row.company_name, row.form, accession, at)
+                    )
         entries.sort(key=lambda e: (e.accepted_at, e.accession, e.cik))
-        self.unstamped_filings.sort(key=lambda r: (r.filed_on, r.accession, r.cik))
+        self.unstamped_filings = sorted(unstamped, key=lambda r: (r.filed_on, r.accession, r.cik))
         self._filing_index_ran = True
         self._filing_index_entries = tuple(entries)
+        del entries
         return [e for e in self._filing_index_entries if since is None or e.accepted_at >= since]
 
     def _rows(
@@ -911,9 +934,29 @@ class EdgarFilingSource(FilingSource):
     def _stamp(
         self, kept: Mapping[str, Mapping[str, tuple[UnstampedFiling, Quarter]]]
     ) -> dict[str, dict[str, SubmissionRecord]]:
-        stamps = {cik: self._load_stamps(cik) for cik in kept}
-        pending = {cik: {a for a in rows if a not in stamps[cik]} for cik, rows in kept.items()}
-        pending = {cik: wanted for cik, wanted in pending.items() if wanted}
+        """Every kept CIK's stamps at once (`_stamp_each`, collected)."""
+        return dict(self._stamp_each(kept))
+
+    def _stamp_each(
+        self, kept: Mapping[str, Mapping[str, tuple[UnstampedFiling, Quarter]]]
+    ) -> Iterator[tuple[str, dict[str, SubmissionRecord]]]:
+        """Each kept CIK with its stamps, the new ones fetched and cached.
+
+        #2616: a CIK with nothing to stamp is yielded as soon as its stamps
+        are read, so only the CIKs with a filing still to stamp (a night's
+        new filings, in steady state) are held together while they are
+        stamped; those are yielded last. The caller may drop a yielded CIK
+        from `kept`; the CIKs are listed before the first is read."""
+        stamps: dict[str, dict[str, SubmissionRecord]] = {}
+        pending: dict[str, set[str]] = {}
+        for cik in list(kept):
+            loaded = self._load_stamps(cik)
+            wanted = {a for a in kept[cik] if a not in loaded}
+            if wanted:
+                stamps[cik], pending[cik] = loaded, wanted
+            else:
+                yield cik, loaded
+            del loaded
         unparsed: set[str] = set()
         edgar = self._settings.edgar
         if edgar.bulk_stamps_enabled and len(pending) > edgar.bulk_stamp_threshold_ciks:
@@ -936,7 +979,7 @@ class EdgarFilingSource(FilingSource):
                     self._check_event_clock(cik, record)
                 stamps[cik].update(new)
                 self._save_stamps(cik, stamps[cik])
-        return stamps
+        yield from stamps.items()
 
     def _sgml_checked(
         self, cik: str, new: Mapping[str, SubmissionRecord]
@@ -2297,7 +2340,11 @@ class EdgarFilingSource(FilingSource):
                 continue  # the exchange's copy of a 25-NSE; the subject company keeps it
             kept.setdefault(row.cik, {}).setdefault(row.accession, (row, quarter))
 
-        stamps = self._stamp(kept)
+        # #2616: of each CIK's full-history stamps, only its delisting rows'.
+        stamps = {
+            cik: {a: loaded[a] for a in kept[cik] if a in loaded}
+            for cik, loaded in self._stamp_each(kept)
+        }
         # One result per accession (plan T11f): a Form 25 kept under several
         # CIKs is served once, from the first CIK (index order) that stamps it.
         candidates: dict[str, list[tuple[str, SubmissionRecord | None]]] = {}
