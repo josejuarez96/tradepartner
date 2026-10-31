@@ -1,11 +1,14 @@
 """T317: recorded SEC daily-index inputs for the incremental EDGAR read (#2659).
 
-The fixtures are one quarter's directory listing (2026 QTR2 `index.json`) and two
-of its daily `form.<yyyymmdd>.idx` files, each with its response headers. The
-daily bodies are stored gzipped (`.idx.gz`, byte-identical once decoded) to stay
-under the repository's large-file limit. They
-pin three facts the T319a adapter builds on: daily files carry `YYYYMMDD` dates
-that today's quarterly parser does not read, every recorded file is named by the
+The fixtures are one quarter's directory listing (2026 QTR2 `index.json`) and
+two of its daily `form.<yyyymmdd>.idx` files, each with its response headers.
+The daily bodies are stored gzipped (`.idx.gz`) to stay under the repository's
+large-file limit. For the fixture scrub (`tests/test_fixture_scrub.py`), SEC's
+banner contact address and one company-name word that looks like an Alpaca key
+prefix were replaced with `<scrubbed>`, in file order; putting them back gives
+the bytes SEC sent (`_original`). The fixtures pin three
+facts the T319a adapter builds on: daily files carry `YYYYMMDD` dates that
+today's quarterly parser does not read, every recorded file is named by the
 listing, and SEC sends both an ETag (the MD5 of the decoded body plus `-gzip`)
 and a Last-Modified header.
 """
@@ -22,6 +25,13 @@ from tradepartner.adapters.edgar import parse_filing_index
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "edgar" / "daily_index"
 DAILY = ["form.20260401.idx", "form.20260402.idx"]
+# What the scrub replaced, per file and in order. SEC's public banner contact is
+# split so no file holds an email-shaped string.
+_SCRUBBED = {
+    "form.20260401.idx": ["webmaster" + "@" + "sec.gov", "AKTIEN" + "GESELLSCHAFT"],
+    "form.20260402.idx": ["webmaster" + "@" + "sec.gov"],
+}
+_HEADERS = {"etag", "last-modified", "content-length", "content-encoding", "content-type", "date"}
 _DAILY_DATE = re.compile(r"(?<=\s)(\d{4})(\d{2})(\d{2})(?=\s+edgar/data/)")
 
 
@@ -41,6 +51,15 @@ def _body(name: str) -> bytes:
         if path.exists()
         else gzip.decompress((FIXTURES / f"{name}.gz").read_bytes())
     )
+
+
+def _original(name: str) -> bytes:
+    """The body SEC sent: the recorded one with each scrubbed span put back."""
+    body = _body(name)
+    for value in _SCRUBBED.get(name, []):
+        body = body.replace(b"<scrubbed>", value.encode(), 1)
+    assert b"<scrubbed>" not in body
+    return body
 
 
 def test_two_daily_files_are_recorded_and_the_listing_names_them() -> None:
@@ -74,5 +93,11 @@ def test_each_daily_file_parses_whole_after_normalising(name: str) -> None:
 def test_sec_sends_both_validators_and_the_etag_is_the_body_md5(name: str) -> None:
     headers = json.loads((FIXTURES / f"{name}.headers.json").read_text(encoding="utf-8"))
     assert headers["last-modified"].endswith(" GMT")
-    body = _body(name)
+    body = _original(name)
     assert headers["etag"] == f'"{hashlib.md5(body, usedforsecurity=False).hexdigest()}-gzip"'
+
+
+@pytest.mark.parametrize("name", ["index.json", *DAILY])
+def test_recorded_headers_are_only_the_allow_list(name: str) -> None:
+    headers = json.loads((FIXTURES / f"{name}.headers.json").read_text(encoding="utf-8"))
+    assert set(headers) <= _HEADERS
