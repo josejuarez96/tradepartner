@@ -73,7 +73,10 @@ revision instead.
   touched CIKs, so `carry_forward_underived` adds each untouched CIK's rows
   from the previous check (`underived_as_of`'s frame) to the run's own
   finding. The set a touched-only run records then equals the set a full run
-  records, and `underived_master_rows` reads it unchanged.
+  records, and `underived_master_rows` reads it unchanged. `previous` should
+  be the last `ok` ingest's check: after a `master-retract --apply` the
+  applied rows are retracted and drop out of `underived_as_of`, which would
+  leave the CIKs it did not judge uncarried until touched.
 """
 
 from __future__ import annotations

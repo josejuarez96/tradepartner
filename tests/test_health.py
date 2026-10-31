@@ -4731,7 +4731,9 @@ def test_incremental_edgar_warnings_show_drift_with_its_ciks_and_changed_stamps(
 ) -> None:
     drift = drift_message(DriftReport(checked=40, drifted=("0000000007", "0000000009")))
     message = f"10 securities; {drift}, index_stamp_changed: 3; missing benchmarks: none"
-    _run(fixture_store, "r-inc", "edgar", "ok", T_END - timedelta(hours=1), message=message)
+    _run(fixture_store, "r-inc", "edgar_index", "ok", T_END - timedelta(hours=2), message=message)
+    # A later run without the figures neither clears nor repeats the warning.
+    _run(fixture_store, "r-later", "edgar", "failed", T_END - timedelta(hours=1), message="boom")
     block = health_report(fixture_store, T_END, _settings()).incremental_edgar
     assert block.counts == {"incremental_drift": 2, "index_stamp_changed": 3}
     assert block.drift_ciks == ("0000000007", "0000000009")

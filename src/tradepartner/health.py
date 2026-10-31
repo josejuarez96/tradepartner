@@ -113,7 +113,8 @@ here is this module's and is stated once:
   (a health finding, never a repair): a stamp that fits only a moved clock.
 
 - **Incremental EDGAR** (`incremental_edgar`, #2629, T321): `counts` is
-  `incremental_edgar_counts` of the latest EDGAR run's message
+  `incremental_edgar_counts` of the latest `edgar` or `edgar_index` run
+  message that carries them
   (`incremental_drift: N`, `index_stamp_changed: N`), with the CIKs the
   drift check named; a warning while either is positive. A drifted CIK means
   a rule changed in code without a `BUILD_RULES_VERSION` bump; a changed stamp
@@ -953,8 +954,20 @@ class IncrementalEdgar:
         return tuple(out)
 
 
-def _incremental_edgar_report(ingests: tuple[IngestStatus, ...]) -> IncrementalEdgar:
-    message = next((i.latest_message for i in ingests if i.source == "edgar"), None)
+def _incremental_edgar_report(conn: duckdb.DuckDBPyConnection, t: datetime) -> IncrementalEdgar:
+    """The latest run of `edgar` or `edgar_index` finished by `t` whose
+    message carries either figure (the driver writes both on the
+    `edgar_index` row); a later run without them neither clears nor shows."""
+    row = conn.execute(
+        """
+        SELECT message FROM ingestion_runs
+        WHERE source IN ('edgar', 'edgar_index') AND coalesce(finished_at, started_at) <= ?
+          AND (message LIKE '%incremental_drift:%' OR message LIKE '%index_stamp_changed:%')
+        ORDER BY started_at DESC, run_id DESC LIMIT 1
+        """,
+        [t],
+    ).fetchone()
+    message = None if row is None else row[0]
     named = _INCREMENTAL_CIKS.search(message or "")
     return IncrementalEdgar(
         counts=incremental_edgar_counts(message),
@@ -2034,7 +2047,7 @@ def health_report(
         },
         statement=_statement_facts_report(conn, t, settings, ingests),
         filing_events=_filing_events_report(conn, settings, ingests),
-        incremental_edgar=_incremental_edgar_report(ingests),
+        incremental_edgar=_incremental_edgar_report(conn, t),
         rates=_rates_report(conn, t, settings),
         borrow=_borrow_report(conn, t, session, settings),
         mergers=_mergers_report(conn, t, ingests),
