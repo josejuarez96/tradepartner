@@ -311,6 +311,12 @@ def test_every_contract_field_is_compared() -> None:
         assert not r.rows_agree([base], [dataclasses.replace(base, **{name: value})]), name
 
 
+@pytest.mark.parametrize("title", ["Common\nStock", " Common   Stock ", "Common\tStock"])
+def test_security_title_whitespace_is_equivalent(title: str) -> None:
+    base = _row(security_title="Common Stock")
+    assert r.rows_agree([base], [dataclasses.replace(base, security_title=title)])
+
+
 # --- the request plan -----------------------------------------------------------
 
 
