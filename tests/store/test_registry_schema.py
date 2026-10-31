@@ -64,6 +64,7 @@ _UNTOUCHED_TABLES = tuple(
         "spinoff_allocations",
         "sec_filing_events",
         "sec_form4_transactions",
+        "delisting_reasons",
         *schema.RETRACTABLE_TABLES,
     )
 )
@@ -245,7 +246,7 @@ def test_registry_table_names_disjoint_from_fact_table_names() -> None:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_SEC_FORMS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_DELISTING_REASONS_VERSION + 1
 
 
 def test_fresh_init_creates_every_table_at_version_26() -> None:

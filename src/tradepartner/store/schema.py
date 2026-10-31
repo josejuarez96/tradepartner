@@ -582,7 +582,10 @@ registry; #83 took version 2 first, so the registry is version 3):
   `sec_form4_transactions` are additive main-store tables. Reads are gated by
   `events.sec_forms_read_enabled`; read-only version-38 and version-39 stores
   serve earlier reads and fail ownership reads on the missing tables.
-- **A later DDL change goes to version 41**, with its own migration and a
+- **Version 43** (T326): adds `delisting_reasons` as a separate fact table.
+  Reason revisions are keyed to the Form 25 episode, with evidence acceptance
+  stored as `reason_known_at` and checked equal to `known_at`.
+- **A later DDL change goes to version 44**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -693,6 +696,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "listings": (*_V4_MASTER_PROVENANCE, "filing_name"),
     "classifications": (*_V4_MASTER_PROVENANCE, "filing_name"),
     "delistings": ("filing",),
+    "delisting_reasons": ("filing",),
     "prices_daily": ("bar",),
     "corporate_actions": ("action",),
     "facts": ("filing",),
@@ -893,9 +897,14 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 40 (#2539, T306): additive `sec_filing_events` and
 #:   `sec_form4_transactions` tables, read behind
 #:   `events.sec_forms_read_enabled`.
-#: - A later DDL change goes to version 41, with its own migration and a
+#: - 43 (T326): additive `delisting_reasons` fact table; versions 41 and 42
+#:   are reserved for #2657 and #2665.
+#: - A later DDL change goes to version 44, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 40
+CURRENT_SCHEMA_VERSION = 43
+
+# Versions 41 (#2657) and 42 (#2665) are reserved by upstream PRs.
+_PRE_DELISTING_REASONS_VERSION = 42
 
 #: Last version without the owner-entered Form 8937 allocation table.
 _PRE_SPINOFF_ALLOCATIONS_VERSION = 38
@@ -1175,6 +1184,33 @@ CREATE TABLE IF NOT EXISTS delistings (
     UNIQUE (security_id, form, class_title, exchange, filed_at, known_at)
 )
 """
+
+# Reason evidence is a revision of one Form 25 episode, never a revision of
+# its listing end. The episode key is the existing delistings natural key.
+_CREATE_DELISTING_REASONS = f"""
+CREATE TABLE IF NOT EXISTS delisting_reasons (
+    security_id VARCHAR NOT NULL,
+    delisting_form VARCHAR NOT NULL,
+    delisting_class_title VARCHAR NOT NULL,
+    delisting_exchange VARCHAR NOT NULL,
+    delisting_filed_at TIMESTAMPTZ NOT NULL,
+    reason VARCHAR NOT NULL,
+    reason_evidence_form VARCHAR NOT NULL,
+    reason_evidence_accession VARCHAR,
+    reason_source VARCHAR NOT NULL,
+    reason_known_at TIMESTAMPTZ NOT NULL,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["delisting_reasons"])},
+    CHECK (known_at = reason_known_at),
+    CHECK (reason IN ('performance_failure', 'bankruptcy', 'merger_acquisition',
+                     'voluntary_other', 'unknown')),
+    CHECK (reason_source IN ('form25_provision', 'form25_text', 'eightk_item', 'unknown')),
+    CHECK (reason_source = 'unknown' OR reason_evidence_accession IS NOT NULL),
+    UNIQUE (security_id, delisting_form, delisting_class_title,
+            delisting_exchange, delisting_filed_at, known_at)
+)
+"""
+
+_DELISTING_REASONS_TABLE_DDL: tuple[str, ...] = (_CREATE_DELISTING_REASONS,)
 
 _CREATE_PRICES_DAILY = f"""
 CREATE TABLE IF NOT EXISTS prices_daily (
@@ -1587,6 +1623,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "listings",
     "classifications",
     "delistings",
+    "delisting_reasons",
     "prices_daily",
     "corporate_actions",
     "facts",
@@ -3275,6 +3312,9 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_ASSETS_INTERSECTION_VERSION,
         _PRE_SPINOFF_ALLOCATIONS_VERSION,
         _PRE_SEC_FORMS_VERSION,
+        _PRE_DELISTING_REASONS_VERSION - 2,
+        _PRE_DELISTING_REASONS_VERSION - 1,
+        _PRE_DELISTING_REASONS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -4440,6 +4480,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_ASSETS_INTERSECTION_VERSION,
         _PRE_SPINOFF_ALLOCATIONS_VERSION,
         _PRE_SEC_FORMS_VERSION,
+        _PRE_DELISTING_REASONS_VERSION - 2,
+        _PRE_DELISTING_REASONS_VERSION - 1,
+        _PRE_DELISTING_REASONS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4491,6 +4534,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _MERGERS_TABLE_DDL
             + _BREAKS_TABLE_DDL
             + _SPINOFF_ALLOCATIONS_TABLE_DDL
+            + _DELISTING_REASONS_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)
