@@ -948,7 +948,10 @@ def page_data(
 
     open_orders_count = _open_orders_count(conn, window_id)
 
-    plan = _latest(journal.plans_for(conn, window_id))
+    try:
+        plan = _latest(journal.plans_for(conn, window_id))
+    except SchemaVersionError as exc:
+        return OpsData(journal_outdated=str(exc), book_id=book)
     targets_count = plan.n_targets if plan is not None else 0
     ranking = _build_ranking(conn, window_id, plan) if plan is not None else ()
 

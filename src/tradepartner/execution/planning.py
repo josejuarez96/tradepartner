@@ -778,6 +778,8 @@ def _write(
             n_orders_below_min_at_live_capital=decided.n_orders_below_min_at_live_capital,
             known_at=now,
             ingested_at=now,
+            n_assets_intersected=plan.n_assets_intersected,
+            assets_intersection_skipped=plan.assets_intersection_skipped,
         ),
     )
     return tuple(rows)

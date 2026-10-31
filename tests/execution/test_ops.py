@@ -421,6 +421,27 @@ def test_journal_outdated_on_a_read_only_version_16_store(tmp_path: Path) -> Non
     assert data.window is None
 
 
+def test_journal_outdated_on_a_read_only_version_37_store(
+    journal_settings: Settings, open_window: PaperWindowRow
+) -> None:
+    """Operations reports the plan-reader migration instead of raising it."""
+    assert open_window.window_id is not None
+    with duckdb.connect(str(journal_settings.store.path)) as conn:
+        for column in ("n_assets_intersected", "assets_intersection_skipped"):
+            conn.execute(f"ALTER TABLE paper_plans DROP COLUMN {column}")
+        conn.execute("DELETE FROM schema_version")
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, current_timestamp)",
+            [schema._PRE_ASSETS_INTERSECTION_VERSION],
+        )
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings, now=utc_now())
+    assert data.book_id == "main"
+    assert data.journal_outdated is not None
+    assert "paper plans require schema version" in data.journal_outdated
+    assert data.window is None
+
+
 def test_no_window_returns_empty_data(journal_settings: Settings) -> None:
     with open_read_only(journal_settings) as conn:
         data = ops.page_data(conn, journal_settings, now=utc_now())
