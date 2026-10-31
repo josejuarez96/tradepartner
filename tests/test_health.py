@@ -89,6 +89,7 @@ from tradepartner.health import (
     filing_event_counts,
     health_report,
     health_verdict,
+    incremental_edgar_counts,
     integrity_checks,
     last_ingests,
     listed_without_bars,
@@ -102,6 +103,7 @@ from tradepartner.health import (
 from tradepartner.store.db import configure_connection, insert_row
 from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.store.dividend_reviews import ReviewedGroup, reviewed_groups
+from tradepartner.store.drift_check import DriftReport, drift_message
 from tradepartner.store.index_members import IndexInterval, IndexMembers, IndexMembersError
 from tradepartner.store.master import first_session
 from tradepartner.store.schema import TABLE_NAMES, TABLE_PROVENANCE_VALUES
@@ -4722,3 +4724,31 @@ def test_sec_form_violation_frame_has_identity_columns(
     assert expected_identity.issubset(actual_columns), (
         f"Missing identity columns for {table} unique: {expected_identity - actual_columns}"
     )
+
+
+def test_incremental_edgar_warnings_show_drift_with_its_ciks_and_changed_stamps(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    drift = drift_message(DriftReport(checked=40, drifted=("0000000007", "0000000009")))
+    message = f"10 securities; {drift}, index_stamp_changed: 3; missing benchmarks: none"
+    _run(fixture_store, "r-inc", "edgar", "ok", T_END - timedelta(hours=1), message=message)
+    block = health_report(fixture_store, T_END, _settings()).incremental_edgar
+    assert block.counts == {"incremental_drift": 2, "index_stamp_changed": 3}
+    assert block.drift_ciks == ("0000000007", "0000000009")
+    assert block.warnings == (
+        "incremental_drift: 2 (0000000007 0000000009)",
+        "index_stamp_changed: 3",
+    )
+
+
+def test_incremental_edgar_is_quiet_without_counts_or_with_zero(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    assert health_report(fixture_store, T_END, _settings()).incremental_edgar.warnings == ()
+    message = "incremental_drift: 0, index_stamp_changed: 0"
+    _run(fixture_store, "r-inc0", "edgar", "ok", T_END - timedelta(hours=1), message=message)
+    block = health_report(fixture_store, T_END, _settings()).incremental_edgar
+    assert block.counts == {"incremental_drift": 0, "index_stamp_changed": 0}
+    assert block.warnings == ()
+    assert incremental_edgar_counts(None) == {}
+    assert incremental_edgar_counts("statement_added: 3") == {}

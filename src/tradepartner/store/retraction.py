@@ -69,6 +69,11 @@ revision instead.
   or `retracted`) and keeps the rows still live at T: health's
   `underived_master_rows`. `master_underived` is not a fact table and no
   as-of read of the master reads it.
+- **Carried forward (#2629).** A touched-only EDGAR run judges only the
+  touched CIKs, so `carry_forward_underived` adds each untouched CIK's rows
+  from the previous check (`underived_as_of`'s frame) to the run's own
+  finding. The set a touched-only run records then equals the set a full run
+  records, and `underived_master_rows` reads it unchanged.
 """
 
 from __future__ import annotations
@@ -183,6 +188,40 @@ def underived(
         ]
         found.extend(sorted(rows, key=lambda u: tuple(str(part) for part in u.key)))
     return tuple(found)
+
+
+def carry_forward_underived(
+    recomputed: Iterable[Underived],
+    previous: Iterable[Mapping[str, Any]],
+    touched: frozenset[str],
+    skip_ciks: frozenset[str] = frozenset(),
+) -> tuple[Underived, ...]:
+    """The underived set of a touched-only run (#2629): `recomputed` (the
+    run's finding over the touched CIKs) plus every row of `previous` (the
+    previous check's `underived_as_of` rows, shaped as `UNDERIVED_SCHEMA`)
+    whose CIK is neither touched nor in `skip_ciks`, which a full run would
+    not judge. A carried row keeps its stored `known_at`; a key in both takes
+    the recomputed row. Ordered as `underived` orders a full run: securities
+    first, each table by key. Pure."""
+    merged: dict[tuple[str, tuple[Any, ...]], Underived] = {}
+    for old in previous:
+        table = old["table"]
+        if table not in ("securities", "listings"):
+            continue
+        cik = cik_of(old["security_id"])
+        if cik in touched or cik in skip_ciks:
+            continue
+        row = {c: old[c] for c in KEYS[table]} | {"known_at": old["known_at"]}
+        item = Underived(table, row)
+        merged[(table, item.key)] = item
+    for item in recomputed:
+        merged[(item.table, item.key)] = item
+    return tuple(
+        sorted(
+            merged.values(),
+            key=lambda u: (u.table != "securities", tuple(str(part) for part in u.key)),
+        )
+    )
 
 
 def split_kept(

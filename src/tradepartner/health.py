@@ -112,6 +112,13 @@ here is this module's and is stated once:
   reported, not thresholded. `clock_suspect` is the clock detector's rule
   (a health finding, never a repair): a stamp that fits only a moved clock.
 
+- **Incremental EDGAR** (`incremental_edgar`, #2629, T321): `counts` is
+  `incremental_edgar_counts` of the latest EDGAR run's message
+  (`incremental_drift: N`, `index_stamp_changed: N`), with the CIKs the
+  drift check named; a warning while either is positive. A drifted CIK means
+  a rule changed in code without a `BUILD_RULES_VERSION` bump; a changed stamp
+  is an owner repair release (spec amendment 2026-10-30). Report-only.
+
 - **Rates** (`rates`, #1498, T169e): per configured or stored series, the
   stored row count, latest observation, vintage and stamp, revised-key count,
   the longest missing XNYS-session span between observations, and the last
@@ -397,7 +404,7 @@ import re
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from itertools import pairwise
 from typing import Any
@@ -904,6 +911,55 @@ class FilingEvents:
             for name in ("items_missing", "clock_suspect")
             if self.counts.get(name, 0) > 0
         )
+
+
+#: `incremental_drift: <N>` and `index_stamp_changed: <N>` (the incremental
+#: EDGAR ingest's run-message figures, #2629), and the drift check's named
+#: CIKs, `incremental_drift_ciks: a b c` (`store.drift_check.drift_message`).
+_INCREMENTAL_COUNT = re.compile(r"\b(incremental_drift|index_stamp_changed): (\d+)\b")
+_INCREMENTAL_CIKS = re.compile(r"\bincremental_drift_ciks: ([0-9 ]+)")
+
+
+def incremental_edgar_counts(message: str | None) -> dict[str, int]:
+    """The `incremental_drift` and `index_stamp_changed` figures of an EDGAR
+    run's message (#2629), keyed by name. Empty when `message` is `None` or
+    names neither (a nightly before the incremental ingest)."""
+    if not message:
+        return {}
+    return {name: int(n) for name, n in _INCREMENTAL_COUNT.findall(message)}
+
+
+@dataclass(frozen=True, eq=False)
+class IncrementalEdgar:
+    """The incremental EDGAR ingest's two report-only warnings (#2629, T321;
+    module docstring). `counts` is `incremental_edgar_counts` of the latest
+    EDGAR run's message and `drift_ciks` the CIKs it names (up to ten)."""
+
+    counts: dict[str, int]
+    drift_ciks: tuple[str, ...] = ()
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        """`incremental_drift` (naming its CIKs) and `index_stamp_changed`,
+        each while its count in the latest run is positive."""
+        out: list[str] = []
+        drift = self.counts.get("incremental_drift", 0)
+        if drift > 0:
+            named = f" ({' '.join(self.drift_ciks)})" if self.drift_ciks else ""
+            out.append(f"incremental_drift: {drift}{named}")
+        changed = self.counts.get("index_stamp_changed", 0)
+        if changed > 0:
+            out.append(f"index_stamp_changed: {changed}")
+        return tuple(out)
+
+
+def _incremental_edgar_report(ingests: tuple[IngestStatus, ...]) -> IncrementalEdgar:
+    message = next((i.latest_message for i in ingests if i.source == "edgar"), None)
+    named = _INCREMENTAL_CIKS.search(message or "")
+    return IncrementalEdgar(
+        counts=incremental_edgar_counts(message),
+        drift_ciks=tuple(named.group(1).split()) if named else (),
+    )
 
 
 _REFERENCE_MISSING_SCHEMA: dict[str, Any] = {
@@ -1825,6 +1881,8 @@ class HealthReport:
     integrity: tuple[IntegrityCheck, ...]
     #: `None` when the block was not computed ("not computed", never a pass).
     coverage_reference: CoverageReference | None = None
+    #: The incremental EDGAR ingest's warnings (#2629).
+    incremental_edgar: IncrementalEdgar = field(default_factory=lambda: IncrementalEdgar({}))
 
     @property
     def failures(self) -> tuple[str, ...]:
@@ -1976,6 +2034,7 @@ def health_report(
         },
         statement=_statement_facts_report(conn, t, settings, ingests),
         filing_events=_filing_events_report(conn, settings, ingests),
+        incremental_edgar=_incremental_edgar_report(ingests),
         rates=_rates_report(conn, t, settings),
         borrow=_borrow_report(conn, t, session, settings),
         mergers=_mergers_report(conn, t, ingests),
