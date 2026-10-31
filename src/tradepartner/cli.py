@@ -384,7 +384,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import logging
 import re
 import subprocess
 import sys
@@ -495,6 +494,7 @@ from tradepartner.ingest import (
     manifest_release,
     rates_seeded,
     read_manifest,
+    show_ingest_progress,
 )
 from tradepartner.repair import (
     HeaderLookup,
@@ -2740,12 +2740,7 @@ def make_app(
             event_forms=s.edgar.event_forms,
         )
         if sec_forms_only:
-            # The Form 4 bulk route logs per-quarter progress (#2681).
-            progress = logging.getLogger("tradepartner.ingest")
-            if not progress.handlers:
-                progress.addHandler(logging.StreamHandler())
-            progress.setLevel(logging.INFO)
-            progress.propagate = False
+            show_ingest_progress()
             result = ingest_sec_forms(s, filings, clock=clock)
             _print_result(result)
             raise typer.Exit(result.exit_code)

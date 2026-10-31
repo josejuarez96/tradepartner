@@ -349,6 +349,15 @@ from tradepartner.universe import SHARES_FACT, member_links_title
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def show_ingest_progress() -> None:
+    """Print this module's progress messages (the Form 4 bulk route's, #2681) to stderr."""
+    if not _LOGGER.handlers:
+        _LOGGER.addHandler(logging.StreamHandler())
+    _LOGGER.setLevel(logging.INFO)
+    _LOGGER.propagate = False
+
+
 OK, STALE, FAILED, LOCKED = "ok", "stale", "failed", "locked"
 ACTIONS_FILLED = "filled"
 ACTIONS_MODE = "actions"  # the actions backfill's run rows (#1676)
