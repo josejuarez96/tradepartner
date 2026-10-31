@@ -1635,15 +1635,22 @@ def _write_form4_bulk(
             "SELECT DISTINCT accession, source FROM sec_filing_events WHERE form IN ('4', '4/A')"
         ).fetchall()
     }
-    completed = {
-        cursor: message.split("zip_sha256=", 1)[1].split(";", 1)[0]
-        for cursor, message in conn.execute(
-            "SELECT chunk_cursor, message FROM ingestion_runs "
-            "WHERE source='sec_insider_bulk' AND status='ok' "
-            "ORDER BY finished_at"
-        ).fetchall()
-        if "zip_sha256=" in message
-    }
+    completed: dict[str, str] = {}
+    for cursor, message in conn.execute(
+        "SELECT chunk_cursor, message FROM ingestion_runs "
+        "WHERE source='sec_insider_bulk' AND status IN ('ok', 'partial') "
+        "ORDER BY finished_at NULLS FIRST, started_at, run_id"
+    ).fetchall():
+        parts = dict(
+            part.strip().split("=", 1) for part in (message or "").split(";") if "=" in part
+        )
+        # Older rows only recorded the loaded digest. New rows explicitly carry
+        # the last digest checked, including "none" when there was no prior check.
+        digest = parts.get("checked_sha256", parts.get("zip_sha256"))
+        if digest is None:
+            completed.pop(cursor, None)
+        else:
+            completed[cursor] = digest
     load_counts: Counter[str] = Counter()
     digests: dict[Quarter, str] = {}
     unreadable: set[Quarter] = set()
@@ -1831,6 +1838,7 @@ def _write_form4_bulk(
 
     counts: Counter[str] = Counter(load_counts)
     remaining = 0
+    checked_digests = completed.copy()
     route_quarters = sorted(queued_by_quarter)
     for position, quarter in enumerate(route_quarters):
         rows = queued_by_quarter[quarter]
@@ -1875,6 +1883,15 @@ def _write_form4_bulk(
         del quarter_bulk  # released before the next quarter is read
         counts.update(result.counts)
         remaining += result.remaining
+        # Only a quarter the route fully walked has been checked against this zip.
+        if (
+            not result.counts.get("sec_forms_budget_stopped")
+            and not result.counts.get("sec_forms_bulk_order_mismatch")
+            and quarter not in unreadable
+        ):
+            digest = digests.get(quarter)
+            if digest is not None:
+                checked_digests[f"{quarter.year}q{quarter.number}"] = digest
         _LOGGER.info(
             "Form 4 bulk routed %dq%d: %d queued, %d added, %d remaining, "
             "%d requests; %.1fs elapsed",
@@ -1903,7 +1920,8 @@ def _write_form4_bulk(
         selected_count = len(queued_by_quarter.get(quarter, ()))
         digest = digests.get(quarter, "none")
         run_message = (
-            f"zip_sha256={digest}; selected={selected_count}; "
+            f"zip_sha256={digest}; checked_sha256={checked_digests.get(label, 'none')}; "
+            f"selected={selected_count}; "
             f"rows_added={quarter_added[quarter]}; rows_changed={quarter_changed[quarter]}; "
             f"remaining={remaining}"
         )
