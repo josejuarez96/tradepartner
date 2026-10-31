@@ -1635,15 +1635,16 @@ def _write_form4_bulk(
             "SELECT DISTINCT accession, source FROM sec_filing_events WHERE form IN ('4', '4/A')"
         ).fetchall()
     }
-    completed = {
-        cursor: message.split("zip_sha256=", 1)[1].split(";", 1)[0]
-        for cursor, message in conn.execute(
-            "SELECT chunk_cursor, message FROM ingestion_runs "
-            "WHERE source='sec_insider_bulk' AND status='ok' "
-            "ORDER BY finished_at"
-        ).fetchall()
-        if "zip_sha256=" in message
-    }
+    completed: dict[str, str] = {}
+    for cursor, message in conn.execute(
+        "SELECT chunk_cursor, message FROM ingestion_runs "
+        "WHERE source='sec_insider_bulk' AND status IN ('ok', 'partial') "
+        "ORDER BY finished_at NULLS FIRST, started_at, run_id"
+    ).fetchall():
+        if message and "zip_sha256=" in message:
+            completed[cursor] = message.split("zip_sha256=", 1)[1].split(";", 1)[0]
+        else:
+            completed.pop(cursor, None)
     load_counts: Counter[str] = Counter()
     digests: dict[Quarter, str] = {}
     unreadable: set[Quarter] = set()

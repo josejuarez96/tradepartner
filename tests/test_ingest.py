@@ -7555,6 +7555,98 @@ def test_form4_bulk_cross_route_comparison_never_rewrites_xml(
     ).fetchall() == [("sec_form4_xml",)]
 
 
+@pytest.mark.parametrize("partial_digest, routed", [("a" * 64, False), ("b" * 64, True)])
+def test_form4_bulk_partial_run_skips_only_stored_matching_digest(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    partial_digest: str,
+    routed: bool,
+) -> None:
+    from tradepartner.adapters.form4_route import Quarter
+
+    parsed = parse_form4(
+        (
+            Path(__file__).parent / "fixtures/edgar/sec_forms/form4_purchase_gift_indirect.xml"
+        ).read_text()
+    )
+    accession = "0000320193-26-000123"
+    filed = date(2026, 9, 24)
+    accepted = datetime(2026, 9, 24, 21, tzinfo=UTC)
+    quarter = Quarter(2026, 3)
+    filing = SecFormFiling(
+        accession,
+        "4",
+        accepted,
+        filed,
+        (parsed.issuer_cik,),
+        parsed.filer_ciks,
+        parsed.transactions,
+    )
+    ingest_module.write_sec_form_accession(
+        fixture_store, filing, ingested_at=accepted, source="sec_insider_bulk"
+    )
+    # The latest run controls the digest, even when an older ok run exists.
+    for run_id, status, digest, finished in (
+        ("older", "ok", "b" * 64 if not routed else "a" * 64, accepted),
+        ("latest", "partial", partial_digest, accepted + timedelta(minutes=1)),
+    ):
+        fixture_store.execute(
+            "INSERT INTO ingestion_runs "
+            "(run_id, started_at, finished_at, status, source, mode, rows_added, "
+            "chunk_cursor, message) "
+            "VALUES (?, ?, ?, ?, 'sec_insider_bulk', 'backfill', 0, '2026q3', ?)",
+            [run_id, finished, finished, status, f"zip_sha256={digest}; remaining=1"],
+        )
+    enabled = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(enabled, client=httpx.Client(), clock=lambda: accepted)
+    row = UnstampedFiling(parsed.issuer_cik, "Issuer", "4", accession, filed)
+    monkeypatch.setattr(source, "_rows", lambda *_: iter([((2026, 3), row)]))
+    monkeypatch.setattr(source, "_load_stamps", lambda *_: {})
+    calls: list[str] = []
+
+    def submissions(_cik: str, accessions: set[str]) -> SimpleNamespace:
+        calls.extend(f"submissions:{item}" for item in accessions)
+        return SimpleNamespace(records={})
+
+    def stamped(_cik: str, item: str, _filed: date) -> None:
+        calls.append(f"stamp:{item}")
+
+    monkeypatch.setattr(source, "_fetch_submissions", submissions)
+    monkeypatch.setattr(source, "_sec_stamped", stamped)
+    facts = BulkAccession(
+        accession,
+        "4",
+        filed,
+        parsed.issuer_cik,
+        parsed.filer_ciks,
+        parsed.transactions,
+        0,
+        (),
+        False,
+        False,
+    )
+    monkeypatch.setattr(
+        ingest_module,
+        "load_bulk_quarters",
+        lambda *_args, **_kwargs: (
+            {quarter: InsiderBulk({accession: facts})},
+            {quarter: "a" * 64},
+            Counter(),
+            frozenset(),
+        ),
+    )
+
+    added, message = ingest_module._write_form4_bulk(
+        fixture_store, enabled, source, frozenset({parsed.issuer_cik}), accepted
+    )
+    assert added == 0
+    assert calls == ([f"submissions:{accession}", f"stamp:{accession}"] if routed else [])
+    assert ("1 remaining" in message) is routed
+
+
 def test_form4_bulk_planner_reads_stored_xml_rows_once_per_quarter(
     fixture_store: duckdb.DuckDBPyConnection,
     settings: Settings,
