@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import functools
 import json
+import shutil
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -1373,6 +1374,45 @@ def test_h1_paper_plan_rows_are_pinned(fixture_store_path: Path, tmp_path: Path)
         assert outcome.status == "planned"
         digests = {t: _rows_digest(env.conn, t) for t in ("signals", "decisions", "paper_plans")}
     assert digests == H1_PAPER_ROWS
+
+
+def test_reason_rows_do_not_change_execution_plan(fixture_store_path: Path, tmp_path: Path) -> None:
+    """Planning never reads a delisting's later classification."""
+    base_path = tmp_path / "base.duckdb"
+    reason_path = tmp_path / "reason.duckdb"
+    shutil.copyfile(fixture_store_path, base_path)
+    shutil.copyfile(fixture_store_path, reason_path)
+    with open_env(base_path, tmp_path) as env:
+        before = env.plan()
+        before_rows = {t: _rows_digest(env.conn, t) for t in ("signals", "decisions")}
+    with open_env(reason_path, tmp_path) as env:
+        episode = env.conn.execute(
+            "SELECT security_id, form, class_title, exchange, filed_at FROM delistings LIMIT 1"
+        ).fetchone()
+        assert episode is not None
+        insert_row(
+            env.conn,
+            "delisting_reasons",
+            {
+                "security_id": episode[0],
+                "delisting_form": episode[1],
+                "delisting_class_title": episode[2],
+                "delisting_exchange": episode[3],
+                "delisting_filed_at": episode[4],
+                "reason": "bankruptcy",
+                "reason_evidence_form": "8-K",
+                "reason_evidence_accession": "0001-19-000001",
+                "reason_source": "eightk_item",
+                "reason_known_at": read_time(T_I),
+                "known_at": read_time(T_I),
+                "ingested_at": datetime(2026, 10, 31, tzinfo=UTC),
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        after = env.plan()
+        assert after == before
+        assert {t: _rows_digest(env.conn, t) for t in ("signals", "decisions")} == before_rows
 
 
 def test_h1_paper_plan_reads_no_turnover(
