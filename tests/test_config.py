@@ -3507,6 +3507,7 @@ _BULK_KEYS = {
     "events.form4_xml_price_below",
     "events.form4_zero_price_xml_codes",
     "events.form4_bulk_order_sample",
+    "events.form4_multi_owner_xml",
     "events.sec_forms_max_requests",
     "events.form4_bulk_max_member_bytes",
 }
@@ -3523,6 +3524,7 @@ def test_events_form4_bulk_keys_default_as_the_amendment_says() -> None:
     assert e.form4_xml_price_below == Decimal("1.00")
     assert e.form4_zero_price_xml_codes == ["P", "S"]
     assert e.form4_bulk_order_sample == 20
+    assert e.form4_multi_owner_xml is True
     assert e.sec_forms_max_requests == 40_000
 
 

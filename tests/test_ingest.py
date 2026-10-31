@@ -7846,15 +7846,23 @@ def test_form4_bulk_cross_route_comparison_never_rewrites_xml(
 
 
 @pytest.mark.parametrize(
-    "partial_digest, routed",
-    [("a" * 64, False), ("b" * 64, True), ("none", True), ("", True), (None, True)],
+    "partial_digest, routed, multi_owner",
+    [
+        ("a" * 64, False, False),
+        ("b" * 64, True, False),
+        ("none", True, False),
+        ("", True, False),
+        (None, True, False),
+        ("b" * 64, False, True),
+    ],
 )
-def test_form4_bulk_partial_run_skips_only_stored_matching_digest(
+def test_form4_bulk_partial_run_skips_matching_digest_or_stored_multi_owner(
     fixture_store: duckdb.DuckDBPyConnection,
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
     partial_digest: str | None,
     routed: bool,
+    multi_owner: bool,
 ) -> None:
     from tradepartner.adapters.form4_route import Quarter
 
@@ -7920,7 +7928,7 @@ def test_form4_bulk_partial_run_skips_only_stored_matching_digest(
         "4",
         filed,
         parsed.issuer_cik,
-        parsed.filer_ciks,
+        (*parsed.filer_ciks, "0000000002") if multi_owner else parsed.filer_ciks,
         parsed.transactions,
         0,
         (),

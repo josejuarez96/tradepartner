@@ -79,6 +79,110 @@ def _bulk(tmp_path: Path):  # type: ignore[no-untyped-def]
     return read_insider_bulk(archive)
 
 
+@pytest.mark.parametrize("multi_owner_xml", [True, False])
+def test_multi_owner_route_and_order_sample_switch(tmp_path: Path, multi_owner_xml: bool) -> None:
+    bulk = _bulk(tmp_path)
+    multi = "0001213900-26-037435"
+    single = "0001577526-26-000036"
+    accepted = datetime(2026, 4, 1, tzinfo=UTC)
+    rows = [
+        (multi, "0002025396", "4", date(2026, 3, 31)),
+        (single, "0001577526", "4", date(2026, 3, 31)),
+    ]
+    xml_calls: list[str] = []
+    xml_writes: list[str] = []
+    bulk_writes: list[str] = []
+
+    def xml(_cik: str, accession: str, _day: date) -> SecFormFiling:
+        xml_calls.append(accession)
+        facts = bulk.accessions[accession]
+        return SecFormFiling(
+            accession,
+            "4",
+            accepted,
+            date(2026, 3, 31),
+            (facts.issuer_cik,),
+            facts.filer_ciks,
+            facts.transactions,
+        )
+
+    result = run_form4_bulk_route(
+        rows,
+        quarters={Quarter(2026, 1): bulk},
+        stamp=lambda *_: accepted,
+        xml=xml,
+        write=lambda filing: xml_writes.append(filing.accession),
+        write_bulk=lambda filing, _quarter: bulk_writes.append(filing.accession),
+        now=accepted,
+        price_below=1,
+        zero_price_codes=("P", "S"),
+        order_sample_size=1,
+        budget=10,
+        multi_owner_xml=multi_owner_xml,
+    )
+    if multi_owner_xml:
+        assert xml_writes == [multi]
+        assert bulk_writes == [single]
+        assert result.counts["sec_forms_bulk_multi_owner_xml"] == 1
+        assert xml_calls.count(multi) == 1  # route only, never order sample
+    else:
+        assert xml_writes == []
+        assert set(bulk_writes) == {multi, single}
+        assert result.counts["sec_forms_bulk_multi_owner_xml"] == 0
+
+
+def test_multi_owner_swap_does_not_fail_quarter_order_sample(tmp_path: Path) -> None:
+    bulk = _bulk(tmp_path)
+    multi = "0001213900-26-037435"
+    single = "0001577526-26-000036"
+    accepted = datetime(2026, 4, 1, tzinfo=UTC)
+    xml_writes: list[str] = []
+    bulk_writes: list[str] = []
+    checked: list[Quarter] = []
+
+    def xml(_cik: str, accession: str, _day: date) -> SecFormFiling:
+        facts = bulk.accessions[accession]
+        transactions = facts.transactions
+        if accession == multi:
+            transactions = (
+                replace(transactions[0], filer_cik=transactions[1].filer_cik),
+                *transactions[1:],
+            )
+        return SecFormFiling(
+            accession,
+            "4",
+            accepted,
+            date(2026, 3, 31),
+            (facts.issuer_cik,),
+            facts.filer_ciks,
+            transactions,
+        )
+
+    result = run_form4_bulk_route(
+        [
+            (multi, "0002025396", "4", date(2026, 3, 31)),
+            (single, "0001577526", "4", date(2026, 3, 31)),
+        ],
+        quarters={Quarter(2026, 1): bulk},
+        stamp=lambda *_: accepted,
+        xml=xml,
+        write=lambda filing: xml_writes.append(filing.accession),
+        write_bulk=lambda filing, _quarter: bulk_writes.append(filing.accession),
+        now=accepted,
+        price_below=1,
+        zero_price_codes=("P", "S"),
+        order_sample_size=2,
+        budget=10,
+        multi_owner_xml=True,
+        remember_check=checked.append,
+    )
+    assert result.counts["sec_forms_bulk_order_mismatch"] == 0
+    assert result.counts["sec_forms_bulk_multi_owner_xml"] == 1
+    assert xml_writes == [multi]
+    assert bulk_writes == [single]
+    assert checked == [Quarter(2026, 1)]
+
+
 def test_bulk_acceptance_is_the_stamp_and_missing_stamp_is_excluded(tmp_path: Path) -> None:
     bulk = _bulk(tmp_path)
     accessions = [
@@ -418,6 +522,10 @@ def test_order_check_repeats_when_zip_or_parser_version_changes(
     passed.write_text("passed")
     assert passed.exists()
     assert not order_check_path(settings, quarter, "zip-b").exists()
+    switched = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"form4_multi_owner_xml": False})}
+    )
+    assert not order_check_path(switched, quarter, "zip-a").exists()
     monkeypatch.setattr(
         form4_bulk_route,
         "BULK_READER_VERSION",

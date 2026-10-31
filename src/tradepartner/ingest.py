@@ -1715,10 +1715,17 @@ def _write_form4_bulk(
                     if not rows_agree(accession_bulk.transactions, xml_rows):
                         cross_route_disagree += 1
                 skip.add(accession)
-            elif (
-                stored_source == "sec_insider_bulk"
-                and digests.get(quarter) is not None
-                and completed.get(f"{quarter.year}q{quarter.number}") == digests[quarter]
+            elif stored_source == "sec_insider_bulk" and (
+                (
+                    settings.events.form4_multi_owner_xml
+                    and quarter_bulk is not None
+                    and (record := quarter_bulk.accessions.get(accession)) is not None
+                    and len(record.filer_ciks) > 1
+                )
+                or (
+                    digests.get(quarter) is not None
+                    and completed.get(f"{quarter.year}q{quarter.number}") == digests[quarter]
+                )
             ):
                 skip.add(accession)
         pending = [row for row in queued_by_quarter[quarter] if row[0] not in skip]
@@ -1736,6 +1743,10 @@ def _write_form4_bulk(
                 and quarter_bulk.accessions[accession].issuer_cik == cik
                 and not quarter_bulk.accessions[accession].identity_bad
                 and not quarter_bulk.accessions[accession].order_bad
+                and (
+                    not settings.events.form4_multi_owner_xml
+                    or len(quarter_bulk.accessions[accession].filer_ciks) == 1
+                )
                 and len(quarter_bulk.accessions[accession].rows) >= 2
             )
             samples += min(settings.events.form4_bulk_order_sample, eligible)
@@ -1745,16 +1756,17 @@ def _write_form4_bulk(
                     quarter_bulk.accessions.get(accession) if quarter_bulk is not None else None
                 )
                 if (
-                    route_accession(
-                        candidate,
-                        state=state,
-                        submissions_form=form,
-                        submissions_filing_date=filed,
-                        price_below=settings.events.form4_xml_price_below,
-                        zero_price_codes=settings.events.form4_zero_price_xml_codes,
-                    ).route
-                    is Route.XML
-                ):
+                    settings.events.form4_multi_owner_xml
+                    and candidate is not None
+                    and len(candidate.filer_ciks) > 1
+                ) or route_accession(
+                    candidate,
+                    state=state,
+                    submissions_form=form,
+                    submissions_filing_date=filed,
+                    price_below=settings.events.form4_xml_price_below,
+                    zero_price_codes=settings.events.form4_zero_price_xml_codes,
+                ).route is Route.XML:
                     xml_expected += 1
         del loaded, quarter_bulk, xml_saved  # released before the next quarter is read
         _LOGGER.info(
@@ -1878,6 +1890,7 @@ def _write_form4_bulk(
             price_below=settings.events.form4_xml_price_below,
             zero_price_codes=tuple(settings.events.form4_zero_price_xml_codes),
             order_sample_size=settings.events.form4_bulk_order_sample,
+            multi_owner_xml=settings.events.form4_multi_owner_xml,
             budget=settings.events.sec_forms_max_requests,
             request_count=lambda: source.requests,
             checked=checked,
