@@ -1715,9 +1715,11 @@ def _write_form4_bulk(
                     if not rows_agree(accession_bulk.transactions, xml_rows):
                         cross_route_disagree += 1
                 skip.add(accession)
-            elif stored_source == "sec_insider_bulk" and completed.get(
-                f"{quarter.year}q{quarter.number}"
-            ) == digests.get(quarter):
+            elif (
+                stored_source == "sec_insider_bulk"
+                and digests.get(quarter) is not None
+                and completed.get(f"{quarter.year}q{quarter.number}") == digests[quarter]
+            ):
                 skip.add(accession)
         pending = [row for row in queued_by_quarter[quarter] if row[0] not in skip]
         state = quarter_state(quarter, downloaded=quarter_bulk is not None, run_date=now.date())
@@ -1790,6 +1792,7 @@ def _write_form4_bulk(
     added = 0
     quarter_added: Counter[Quarter] = Counter()
     quarter_changed: Counter[Quarter] = Counter()
+    written_stored: set[str] = set()
 
     held = {
         accession
@@ -1802,6 +1805,8 @@ def _write_form4_bulk(
         tally = write_sec_form_accession(
             conn, filing, ingested_at=now, source="sec_form4_xml", stored=held
         )
+        if filing.accession in stored:
+            written_stored.add(filing.accession)
         added += tally.added
         quarter = quarter_of(filing.filed_date)
         quarter_added[quarter] += tally.added
@@ -1813,6 +1818,8 @@ def _write_form4_bulk(
         tally = write_sec_form_accession(
             conn, filing, ingested_at=now, source="sec_insider_bulk", stored=held
         )
+        if filing.accession in stored:
+            written_stored.add(filing.accession)
         added += tally.added
         quarter_added[quarter] += tally.added
         quarter_changed[quarter] += tally.changed
@@ -1883,11 +1890,14 @@ def _write_form4_bulk(
         del quarter_bulk  # released before the next quarter is read
         counts.update(result.counts)
         remaining += result.remaining
-        # Only a quarter the route fully walked has been checked against this zip.
+        # A failed stored accession must be compared again on the next run. New
+        # accession failures do not prevent the digest from advancing (#2688).
+        routed_stored = {row[0] for row in rows if row[0] not in skip and row[0] in stored}
         if (
             not result.counts.get("sec_forms_budget_stopped")
             and not result.counts.get("sec_forms_bulk_order_mismatch")
             and quarter not in unreadable
+            and routed_stored <= written_stored
         ):
             digest = digests.get(quarter)
             if digest is not None:
