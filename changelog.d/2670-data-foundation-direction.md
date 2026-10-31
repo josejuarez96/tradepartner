@@ -1,3 +1,2 @@
-- Data foundation: specified delisting reasons and failure-return sensitivity, candidate XBRL inputs, and ingest-stamped survivor listing backfill (#2670).
-### Changed
-- Specified delisting outcomes, frozen failure-return sensitivity, named-candidate XBRL facts, and point-in-time survivor listing backfill.
+- Data foundation: specified delisting reason evidence and a frozen failure-return sensitivity grid, with exit-session and data-cutoff limits (#2670).
+- Specified the gated XBRL inputs and coverage checks for cash-based operating profitability; deferred the historical membership decision to the owner (#2670).

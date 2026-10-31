@@ -1648,14 +1648,14 @@ what = "Conditional: an order-free rule for which index row of an accession the 
 why = "The incremental and full builds must pick the same row whatever file they read it from (#2629, owner decision 4)."
 
 [issue.2670]
-what = "Amend the data-foundation direction for delisting reasons and returns, named XBRL candidates, and survivor listing history."
-why = "Point-in-time inputs and a frozen exit policy make future candidate tests and historical comparisons reviewable."
-unblocks = ["task:T326", "task:T330", "task:T332"]
+what = "Amend the data-foundation direction for delisting reasons and returns and cash-based operating profitability inputs."
+why = "As-of reason evidence and a frozen exit policy make future candidate tests reviewable."
+unblocks = ["task:T326", "task:T330"]
 
 [task.T326]
 what = "Add delisting reason evidence fields and as-of reads after schema versions 41 and 42."
 why = "An exit can only use the reason known at its trial cutoff."
-unblocks = ["task:T327", "task:T328", "task:T332"]
+unblocks = ["task:T327", "task:T328"]
 
 [task.T327]
 what = "Classify delisting reasons from Form 25 and matched 8-K item evidence."
@@ -1672,19 +1672,10 @@ what = "Feed cutoff-visible delisting reasons to backtests and report coverage i
 why = "Late reason evidence must not change an earlier trial."
 
 [task.T330]
-what = "Parse only the named candidates' verified XBRL concepts as first-vintage statement inputs."
-why = "The candidate tests need as-filed accounting values without broad extraction."
+what = "Parse verified XBRL inputs for cash-based operating profitability as first-vintage statement facts."
+why = "The cash-based operating profitability test needs as-filed flows and working-capital balances."
 unblocks = ["task:T331"]
 
 [task.T331]
-what = "Compute aligned cash-based operating profitability and financing candidates with coverage checks."
+what = "Compute aligned cash-based operating profitability with coverage checks."
 why = "Missing or mismatched accounting components must be visible before any signal test."
-
-[task.T332]
-what = "Identify continuous pre-2019 survivor bars and store listing provenance with an ingest-time stamp."
-why = "Earlier bars can extend a listing only after their identity evidence is ingested."
-unblocks = ["task:T333"]
-
-[task.T333]
-what = "Apply eligible survivor listings in a named release and show rejects and the historical as-of limit."
-why = "A backdated valid span must be traceable without changing past as-of membership."
