@@ -22,7 +22,7 @@ import pytest
 from tradepartner.adapters import edgar_insider_bulk as bulk
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar import Form4Transaction, parse_form4
-from tradepartner.adapters.form4_route import DERA_ROUNDING
+from tradepartner.adapters.form4_route import DERA_ROUNDING, rows_agree
 from tradepartner.config import Settings
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "edgar" / "sec_forms"
@@ -307,6 +307,57 @@ def test_a_blank_is_null_never_zero() -> None:
 def test_a_zero_price_stays_zero() -> None:
     (row,) = _one(trans=[_tr("1", TRANS_CODE="A", TRANS_PRICEPERSHARE="0.0")]).transactions
     assert row.price == Decimal("0.0")
+
+
+@pytest.mark.parametrize(
+    ("raw", "title"),
+    [
+        (
+            '"Common Stock, par value $0.01 per share (""Common Stock"")"',
+            'Common Stock, par value $0.01 per share ("Common Stock")',
+        ),
+        ('"Common Stock (""Shares"")"', 'Common Stock ("Shares")'),
+        ('"""Class A"""', '"Class A"'),
+        (' "Units (""LP"")" ', 'Units ("LP")'),
+        ("Common Stock", "Common Stock"),
+        ("Common Stock, par value $0.01", "Common Stock, par value $0.01"),
+        # Not the data set's quoting (a lone or unpaired quote): kept as read.
+        ('Series "A', 'Series "A'),
+        ('"Series "A"', '"Series "A"'),
+        ('"', '"'),
+    ],
+)
+def test_a_quoted_security_title_is_unquoted(raw: str, title: str) -> None:
+    """The data set writes a title holding a `"` in CSV quoting: wrapped in quotes, each
+    inner quote doubled (#2706). The XML holds the plain text."""
+    (row,) = _one(trans=[_tr("1", SECURITY_TITLE=raw)]).transactions
+    assert row.security_title == title
+
+
+def _recorded_zip_of(directory: Path) -> io.BytesIO:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+        for table in sorted(directory.glob("*.tsv")):
+            z.writestr(table.name, table.read_bytes())
+    buffer.seek(0)
+    return buffer
+
+
+def test_recorded_quoted_title_agrees_with_the_xml() -> None:
+    """2017q4 sample `0000906318-17-000081` (#2706): the data set's title
+    `"Common Stock, par value $0.01 per share (""Common Stock"")"` failed the quarter's
+    order sample against the XML's `Common Stock, par value $0.01 per share ("Common
+    Stock")`."""
+    accession = "0000906318-17-000081"
+    got = bulk.read_insider_bulk(_recorded_zip_of(FIXTURES / "insider_bulk_2017q4_quoted"))
+    xml = (FIXTURES / f"bulk_parity_{accession}.xml").read_text(encoding="utf-8")
+    expected = parse_form4(xml).transactions
+    rows = got.accessions[accession].transactions
+    assert [t.security_title for t in rows] == [
+        'Common Stock, par value $0.01 per share ("Common Stock")',
+        "Common Stock",
+    ]
+    assert rows_agree(rows, expected)
 
 
 def test_line_no_ranks_every_row_by_key_a_skipped_row_keeping_its_position() -> None:
