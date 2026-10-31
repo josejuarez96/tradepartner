@@ -1583,6 +1583,7 @@ def rebalance_events_for(
 
 def plans_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[PaperPlanRow]:
     """The window's `paper_plans` rows once intersection fields exist."""
+    require_journal(conn)  # a store with no journal says so before its version
     (version,) = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()  # type: ignore[misc]
     if version is None or version <= _PRE_ASSETS_INTERSECTION_VERSION:
         raise SchemaVersionError(
