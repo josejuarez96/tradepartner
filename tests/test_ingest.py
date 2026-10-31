@@ -7555,6 +7555,46 @@ def test_form4_bulk_cross_route_comparison_never_rewrites_xml(
     ).fetchall() == [("sec_form4_xml",)]
 
 
+def test_stored_xml_form4_transactions_are_read_in_one_query(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    parsed = parse_form4(
+        (
+            Path(__file__).parent / "fixtures/edgar/sec_forms/form4_purchase_gift_indirect.xml"
+        ).read_text()
+    )
+    accepted = datetime(2026, 9, 24, 21, tzinfo=UTC)
+    accessions = {f"0000320193-26-{number:06d}" for number in range(30)}
+    for accession in accessions:
+        filing = SecFormFiling(
+            accession,
+            "4",
+            accepted,
+            accepted.date(),
+            (parsed.issuer_cik,),
+            parsed.filer_ciks,
+            parsed.transactions,
+        )
+        ingest_module.write_sec_form_accession(
+            fixture_store, filing, ingested_at=accepted, source="sec_form4_xml"
+        )
+
+    class CountingConnection:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def execute(self, query: str, params: object = ()) -> duckdb.DuckDBPyConnection:
+            if "sec_form4_transactions" in query:
+                self.reads += 1
+            return fixture_store.execute(query, params)
+
+    counting = CountingConnection()
+    saved = ingest_module._stored_xml_form4_transactions(counting, accessions)
+    assert counting.reads == 1
+    assert set(saved) == accessions
+    assert all(rows == parsed.transactions for rows in saved.values())
+
+
 def test_sec_ownership_amendment_coexists_and_filer_only_index_creates_no_security(
     fixture_store: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
