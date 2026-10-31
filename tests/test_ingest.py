@@ -7598,6 +7598,181 @@ def test_form4_bulk_order_mismatch_quarter_keeps_previous_checked_digest(
     assert f"checked_sha256={'a' * 64}" in message
 
 
+@pytest.mark.parametrize("failure", ["stamp", "xml"])
+def test_form4_bulk_failed_stored_accession_keeps_previous_checked_digest(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    from tradepartner.adapters.form4_route import Quarter
+
+    now = datetime(2026, 7, 2, tzinfo=UTC)
+    filed = date(2026, 4, 1)
+    accession = "0001577526-26-000038"
+    quarter = Quarter(2026, 2)
+    enabled = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(enabled, client=httpx.Client(), clock=lambda: now)
+    row = UnstampedFiling(ACME, "ACME", "4", accession, filed)
+    filing = SecFormFiling(accession, "4", now, filed, (ACME,), (ACME,), ())
+    ingest_module.write_sec_form_accession(
+        fixture_store, filing, ingested_at=now, source="sec_insider_bulk"
+    )
+    fixture_store.execute(
+        "INSERT INTO ingestion_runs "
+        "(run_id, started_at, finished_at, status, source, mode, rows_added, "
+        "chunk_cursor, message) "
+        "VALUES ('older', ?, ?, 'ok', 'sec_insider_bulk', 'backfill', 0, '2026q2', ?)",
+        [now - timedelta(days=1), now - timedelta(days=1), f"zip_sha256={'a' * 64}"],
+    )
+    monkeypatch.setattr(source, "_rows", lambda *_: iter([((2026, 2), row)]))
+    monkeypatch.setattr(source, "_load_stamps", lambda *_: {})
+    monkeypatch.setattr(
+        ingest_module,
+        "load_bulk_quarters",
+        lambda *_args, **_kwargs: (
+            {quarter: InsiderBulk({})},
+            {quarter: "b" * 64},
+            Counter(),
+            frozenset(),
+        ),
+    )
+    monkeypatch.setattr(
+        source,
+        "_fetch_submissions",
+        lambda *_args: SimpleNamespace(
+            records={
+                accession: SubmissionRecord(
+                    accession, "4", "form4.xml", False, now, filing_date=filed
+                )
+            }
+        ),
+    )
+    failed = True
+    attempts: list[str] = []
+
+    def stamped(*_args: Any) -> Any:
+        attempts.append("stamp")
+        return None if failed and failure == "stamp" else SimpleNamespace(accepted_at=now)
+
+    def xml(*_args: Any) -> SecFormFiling | None:
+        attempts.append("xml")
+        return None if failed and failure == "xml" else filing
+
+    monkeypatch.setattr(source, "_sec_stamped", stamped)
+    monkeypatch.setattr(source, "sec_form4_accession", xml)
+    ingest_module._write_form4_bulk(fixture_store, enabled, source, frozenset({ACME}), now)
+    message = fixture_store.execute(
+        "SELECT message FROM ingestion_runs WHERE source='sec_insider_bulk' "
+        "AND chunk_cursor='2026q2' ORDER BY finished_at DESC LIMIT 1"
+    ).fetchone()[0]
+    assert f"checked_sha256={'a' * 64}" in message
+
+    failed = False
+    attempts.clear()
+    ingest_module._write_form4_bulk(
+        fixture_store, enabled, source, frozenset({ACME}), now + timedelta(minutes=1)
+    )
+    assert attempts == ["stamp", "xml"]
+
+
+def test_form4_bulk_stored_accession_without_zip_is_not_skipped(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 7, 2, tzinfo=UTC)
+    filed = date(2026, 7, 1)
+    accession = "0001577526-26-000038"
+    enabled = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(enabled, client=httpx.Client(), clock=lambda: now)
+    row = UnstampedFiling(ACME, "ACME", "4", accession, filed)
+    ingest_module.write_sec_form_accession(
+        fixture_store,
+        SecFormFiling(accession, "4", now, filed, (ACME,), (ACME,), ()),
+        ingested_at=now,
+        source="sec_insider_bulk",
+    )
+    monkeypatch.setattr(source, "_rows", lambda *_: iter([((2026, 3), row)]))
+    monkeypatch.setattr(source, "_load_stamps", lambda *_: {})
+    monkeypatch.setattr(
+        ingest_module,
+        "load_bulk_quarters",
+        lambda *_args, **_kwargs: ({}, {}, Counter(), frozenset()),
+    )
+    routed: list[frozenset[str]] = []
+
+    def route(_rows: Iterable[Any], **kwargs: Any) -> BulkRouteResult:
+        routed.append(kwargs["skip_accessions"])
+        return BulkRouteResult(Counter(), 0, 0)
+
+    monkeypatch.setattr(ingest_module, "run_form4_bulk_route", route)
+    ingest_module._write_form4_bulk(fixture_store, enabled, source, frozenset({ACME}), now)
+    assert accession not in routed[0]
+
+
+def test_form4_bulk_new_failure_does_not_hold_checked_digest(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tradepartner.adapters.form4_route import Quarter
+
+    now = datetime(2026, 7, 2, tzinfo=UTC)
+    filed = date(2026, 4, 1)
+    stored_accession = "0001577526-26-000038"
+    new_accession = "0001577526-26-000039"
+    quarter = Quarter(2026, 2)
+    filing = SecFormFiling(stored_accession, "4", now, filed, (ACME,), (ACME,), ())
+    ingest_module.write_sec_form_accession(
+        fixture_store, filing, ingested_at=now, source="sec_insider_bulk"
+    )
+    enabled = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(enabled, client=httpx.Client(), clock=lambda: now)
+    rows = [
+        UnstampedFiling(ACME, "ACME", "4", accession, filed)
+        for accession in (stored_accession, new_accession)
+    ]
+    monkeypatch.setattr(source, "_rows", lambda *_: iter([((2026, 2), row) for row in rows]))
+    monkeypatch.setattr(source, "_load_stamps", lambda *_: {})
+    monkeypatch.setattr(
+        ingest_module,
+        "load_bulk_quarters",
+        lambda *_args, **_kwargs: (
+            {quarter: InsiderBulk({})},
+            {quarter: "b" * 64},
+            Counter(),
+            frozenset(),
+        ),
+    )
+    skipped: list[frozenset[str]] = []
+
+    def route(_rows: Iterable[Any], **kwargs: Any) -> BulkRouteResult:
+        skipped.append(kwargs["skip_accessions"])
+        if stored_accession not in kwargs["skip_accessions"]:
+            kwargs["write_bulk"](filing, quarter)
+        return BulkRouteResult(Counter(), 0, 1)
+
+    monkeypatch.setattr(ingest_module, "run_form4_bulk_route", route)
+    ingest_module._write_form4_bulk(fixture_store, enabled, source, frozenset({ACME}), now)
+    message = fixture_store.execute(
+        "SELECT message FROM ingestion_runs WHERE source='sec_insider_bulk' "
+        "AND chunk_cursor='2026q2' ORDER BY finished_at DESC LIMIT 1"
+    ).fetchone()[0]
+    assert f"checked_sha256={'b' * 64}" in message
+    ingest_module._write_form4_bulk(
+        fixture_store, enabled, source, frozenset({ACME}), now + timedelta(minutes=1)
+    )
+    assert stored_accession in skipped[1]
+    assert new_accession not in skipped[1]
+
+
 def test_form4_bulk_cross_route_comparison_never_rewrites_xml(
     fixture_store: duckdb.DuckDBPyConnection,
     settings: Settings,

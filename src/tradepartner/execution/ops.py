@@ -948,7 +948,10 @@ def page_data(
 
     open_orders_count = _open_orders_count(conn, window_id)
 
-    plan = _latest(journal.plans_for(conn, window_id))
+    try:
+        plan = _latest(journal.plans_for(conn, window_id))
+    except SchemaVersionError as exc:
+        return OpsData(journal_outdated=str(exc), book_id=book)
     targets_count = plan.n_targets if plan is not None else 0
     ranking = _build_ranking(conn, window_id, plan) if plan is not None else ()
 
@@ -1213,8 +1216,9 @@ def _capped_fills(
 
 _BENCHMARK_SYMBOL = "SPY"
 
-#: `paper report` needs two rebalance sessions to compare (`NothingToCompareYet`, #1923).
-_REPORT_MIN_REBALANCES = 2
+#: `paper report` needs three rebalance sessions (two period returns) to compare
+#: (`NothingToCompareYet`, #1923, #2468); a test pins this to `report`'s own floor.
+_REPORT_MIN_REBALANCES = 3
 
 #: `paper report`'s own search bound for "last completed T" (`report._REBALANCE_SEARCH`).
 _REPORT_SEARCH = timedelta(days=62)
@@ -1539,8 +1543,9 @@ def _waiting_report(
     second: date | None = None
     if not has_report and count is not None and count >= _REPORT_MIN_REBALANCES:
         first = window.first_rebalance_session
-        sessions = rebalance_sessions(first, first + _REPORT_SEARCH, window_cadence(conn, window))
-        second = sessions[1]
+        span = _REPORT_SEARCH * _REPORT_MIN_REBALANCES
+        sessions = rebalance_sessions(first, first + span, window_cadence(conn, window))
+        second = sessions[_REPORT_MIN_REBALANCES - 1]
     return waiting.ReportFacts(
         tracking_count=count,
         has_report=has_report,
