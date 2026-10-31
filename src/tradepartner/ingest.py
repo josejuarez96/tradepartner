@@ -1626,20 +1626,6 @@ def _write_form4_bulk(
             "SELECT DISTINCT accession, source FROM sec_filing_events WHERE form IN ('4', '4/A')"
         ).fetchall()
     }
-    xml_saved = _stored_xml_form4_transactions(
-        conn,
-        {
-            accession
-            for accession, origin in stored.items()
-            if origin == "sec_form4_xml" and accession in candidates
-        },
-    )
-    _LOGGER.info(
-        "Form 4 bulk planning: %d candidates, %d stored XML accessions; %.1fs elapsed",
-        len(candidates),
-        len(xml_saved),
-        time.monotonic() - started,
-    )
     completed = {
         cursor: message.split("zip_sha256=", 1)[1].split(";", 1)[0]
         for cursor, message in conn.execute(
@@ -1687,6 +1673,17 @@ def _write_form4_bulk(
                 selected[accession] = rows
             chosen.append(accession)
         queued_by_quarter[quarter] = [row for accession in chosen for row in selected[accession]]
+        # One read per quarter, freed with the quarter (#2681), not one per accession.
+        xml_saved = _stored_xml_form4_transactions(
+            conn,
+            {
+                accession
+                for accession in chosen
+                if stored.get(accession) == "sec_form4_xml"
+                and quarter_bulk is not None
+                and accession in quarter_bulk.accessions
+            },
+        )
         for accession in chosen:
             stored_source = stored.get(accession)
             if stored_source == "sec_form4_xml":
@@ -1741,13 +1738,13 @@ def _write_form4_bulk(
                     is Route.XML
                 ):
                     xml_expected += 1
-        del loaded, quarter_bulk  # released before the next quarter is read
+        del loaded, quarter_bulk, xml_saved  # released before the next quarter is read
         _LOGGER.info(
-            "Form 4 bulk planned %dq%d: %d queued, %d skipped; %.1fs elapsed",
+            "Form 4 bulk planned %dq%d: %d accessions queued, %d skipped; %.1fs elapsed",
             quarter.year,
             quarter.number,
-            len(queued_by_quarter[quarter]),
-            sum(row[0] in skip for row in queued_by_quarter[quarter]),
+            len(chosen),
+            sum(accession in skip for accession in chosen),
             time.monotonic() - started,
         )
     first_pages = {cik for _accession, cik, _form, _filed in stamp_work}

@@ -2745,6 +2745,7 @@ def make_app(
             if not progress.handlers:
                 progress.addHandler(logging.StreamHandler())
             progress.setLevel(logging.INFO)
+            progress.propagate = False
             result = ingest_sec_forms(s, filings, clock=clock)
             _print_result(result)
             raise typer.Exit(result.exit_code)
