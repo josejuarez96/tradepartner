@@ -1687,5 +1687,5 @@ unblocks = ["issue:2669"]
 
 [research.2026-10-31-form4-insider-purchases-desk-read]
 what = "Check opportunistic Form 4 purchases against a timestamped net-of-cost, acceptance-timed monthly kill line."
-why = "It records that published evidence and current Form 4 fields cannot settle the frozen design before a store event study (#2673)."
+why = "It records an INSUFFICIENT desk read and the owner-approved frozen registered event study, after counts-only feasibility (#2673)."
 unblocks = ["issue:2673"]
