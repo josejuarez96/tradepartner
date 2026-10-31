@@ -1647,6 +1647,39 @@ why = "The nightly EDGAR run drops from about 2 hours and 4 GB to minutes and fl
 what = "Conditional: an order-free rule for which index row of an accession the 13D and delisting paths take, built only if the probe finds daily and quarterly files order rows differently."
 why = "The incremental and full builds must pick the same row whatever file they read it from (#2629, owner decision 4)."
 
+[issue.2670]
+what = "Amend the data-foundation direction for delisting reasons and returns and cash-based operating profitability inputs."
+why = "As-of reason evidence and a frozen exit policy make future candidate tests reviewable."
+unblocks = ["task:T326", "task:T330"]
+
+[task.T326]
+what = "Add separate delisting reason fact rows and as-of reads after schema versions 41 and 42; universe and execution reads remain blind."
+why = "An exit can only use evidence visible at its deciding read and registered cutoff under the approved timing rule."
+unblocks = ["task:T327", "task:T328"]
+
+[task.T327]
+what = "Classify delisting reasons from Form 25 and matched 8-K item evidence."
+why = "Failure and merger exits need distinct, auditable evidence."
+unblocks = ["task:T329"]
+
+[task.T328]
+what = "Register a frozen failure-delisting return policy, severe unknown-exit variant, and conditional reason/merger trial vintage."
+why = "A last-close exit can overstate returns after a failed listing, and backfilled evidence must stale affected trials."
+unblocks = ["task:T329"]
+
+[task.T329]
+what = "Feed deciding-read-visible reasons and mergers only to backtest exit costs; report unknown coverage and withheld shocks."
+why = "Later evidence must not change an earlier exit under the approved timing rule."
+
+[task.T330]
+what = "Parse verified XBRL inputs for cash-based operating profitability as first-vintage statement facts."
+why = "The cash-based operating profitability test needs as-filed flows and working-capital balances."
+unblocks = ["task:T331"]
+
+[task.T331]
+what = "Compute aligned cash-based operating profitability with coverage checks."
+why = "Missing or mismatched accounting components must be visible before any signal test."
+
 [research.2026-10-30-equity-issuance-desk-read]
 what = "Read the composite and one-year share-issuance Chen-Zimmermann legs against a prewritten cost and strength line."
 why = "It retires the issuance line at the desk read: CompEquIss, ShareIss1Y and NetEquityFinance fail; Q1 is killed (#2669)."
