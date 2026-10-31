@@ -27,9 +27,10 @@ import polars as pl
 import streamlit as st
 
 from tradepartner.config import Settings
-from tradepartner.dashboard import header, theme
+from tradepartner.dashboard import header, ops_page, theme
 from tradepartner.execution import book_stats, home_view, ops
 from tradepartner.execution.home_view import BookCard, NeedsYou
+from tradepartner.store.schema import SchemaVersionError
 
 #: The Books tab's route (`app` derives it from the title) and the query key it reads.
 BOOKS_URL_PATH: Final = "books"
@@ -214,7 +215,11 @@ def _data_and_research(view: home_view.HomeView) -> None:
 
 def render(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
     """Draw the Home page from the shell's one read-only connection."""
-    view = home_view.build(conn, settings, header.now().astimezone(UTC))
+    try:
+        view = home_view.build(conn, settings, header.now().astimezone(UTC))
+    except SchemaVersionError as exc:
+        ops_page._render_journal_outdated(str(exc))
+        return
     if not view.books:
         st.write(_NO_WINDOW)
         _data_and_research(view)
