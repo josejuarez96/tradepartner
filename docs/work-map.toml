@@ -1622,7 +1622,7 @@ unblocks = ["task:T323"]
 [task.T322]
 what = "A pure rule fingerprint over the settings, cache versions and schema the master builds read, plus a BUILD_RULES_VERSION constant."
 why = "A rule change must fail the nightly and ask for a full rebuild, never leave old rules on untouched names (#2629)."
-unblocks = ["task:T323", "task:T325"]
+unblocks = ["task:T323"]
 
 [task.T323]
 what = "The ingest driver that runs the incremental nightly EDGAR path behind edgar.incremental_index, and the resumable --rebuild-index full walk."
@@ -1632,7 +1632,7 @@ unblocks = ["task:T323b"]
 [task.T323a]
 what = "The master, classification, delisting and 13D readers move from the quarterly walk to the filing_index table, which becomes the one stamp source."
 why = "It removes the last full-history list from memory, the fix #2623 asked for (#2629)."
-unblocks = ["task:T323", "task:T325"]
+unblocks = ["task:T323"]
 
 [task.T323b]
 what = "The 100-day proof that an incremental store equals a full rebuild, and that peak memory stays flat from 2 to 20 years of history."
@@ -1642,10 +1642,6 @@ unblocks = ["task:T324"]
 [task.T324]
 what = "Owner step: seed the table on the real store, compare on a copy, turn the key on, and post 5 nightly runs' times and memory."
 why = "The nightly EDGAR run drops from about 2 hours and 4 GB to minutes and flat memory, after the 2026-10-31 sitting (#2629)."
-
-[task.T325]
-what = "Conditional: an order-free rule for which index row of an accession the 13D and delisting paths take, built only if the probe finds daily and quarterly files order rows differently."
-why = "The incremental and full builds must pick the same row whatever file they read it from (#2629, owner decision 4)."
 
 [issue.2670]
 what = "Amend the data-foundation direction for delisting reasons and returns and cash-based operating profitability inputs."
