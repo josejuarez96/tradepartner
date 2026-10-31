@@ -62,7 +62,7 @@ Storage options for raw archives and backups:
 
 We will hold every source to five rules, adopting them one source at a time:
 
-1. **Raw first.** A fetched response is kept before it is parsed, named by its content hash, with its URL and fetch time in the run row. Identical content (same hash) is not stored twice. **Nightly full snapshots are the exception:** `submissions.zip`, `companyfacts.zip` and quarterly `form.idx` are rebuilt by SEC in place. Until the owner chooses storage for them (question 2), these keep today's single latest copy. Weekly copies (the latest plus four, about 14 GB for the bulk zips) start only on an SSD, object storage or a paid tier, never on the laptop or the free tier. At about 2.8 GB per snapshot copy, keeping every night would pass 100 GB in about five weeks.
+1. **Raw first.** A fetched response is kept before it is parsed, named by its content hash, with its URL and fetch time in the run row. Identical content (same hash) is not stored twice. **Nightly full snapshots are the exception:** `submissions.zip`, `companyfacts.zip` and quarterly `form.idx` are rebuilt by SEC in place. Until the owner chooses storage for them (question 2), these keep today's single latest copy. Weekly copies (the latest plus four, about 14 GB for the bulk zips) start only on an SSD, object storage or a paid tier, never on the laptop or the free tier. On iCloud, they start only once the write-check-evict step (Upload, below) is built. At about 2.8 GB per snapshot copy, keeping every night would pass 100 GB in about five weeks.
 2. **Parse only from kept raw, and record where each row came from.** Parsing is a pure function of the raw file. Each run row names the raw file hashes it parsed and the parser version, as `edgar_index_files` already does for index files. A stored row maps to its run by an `ingested_at` within the run's start and finish (some write paths stamp at commit, not at start). The re-derive's manifest names every row, and a row matching no run fails the dry run. Recording this per run, not per row, needs no new table column.
 3. **Two kinds of correction, never mixed:**
    - **(a) The source published a new value later**, as SEC does with `filed_on` (#2659). This is a new revision whose `known_at` is the run that first saw it. The old value stays visible as-of.
@@ -74,10 +74,10 @@ We will hold every source to five rules, adopting them one source at a time:
 **Look-ahead guard.** Only ingest and re-derive open the raw archive. No backtest, universe, signal or research read opens it, enforced by a source scan as for `index_members.csv`. A re-derive reads only the raw files its run rows name, by hash. A later fetch is a new run with its own run row; a row it produces keeps `known_at` no earlier than that fetch's time.
 
 **Storage.** The live store never lives on a synced or external disk, because an interrupted write by an unattended run could corrupt it. Sharadar data is never copied off the laptop. If the owner chooses (c), (d) or (e) for the archive:
-- **Integrity.** Raw files are content-addressed, so a sync conflict copy ("name (1)") is never matched. Every read re-checks the hash and refuses on a mismatch.
+- **Integrity.** Raw files are content-addressed, so a sync conflict copy (Drive's "name (1)", iCloud's "name 2") is never matched. Every read re-checks the hash and refuses on a mismatch.
 - **Offline.** The daily ingest never reads the archive. A re-derive whose raw file is unavailable fails loudly. It never falls back to a fresh SEC fetch, which would be later, different content.
 - **Disk.** Drive for desktop and iCloud both keep downloaded files on the boot disk and may offer no size cap. A re-derive checks the 10 GB floor before it starts and stops if it falls below. On iCloud, a re-derive first requests its files with `brctl download` and refuses to start until they are local.
-- **Upload.** Raw files are written locally, verified by hash once uploaded, and only then removed locally.
+- **Upload.** Every archive write first checks the 10 GB floor and refuses below it. On Drive or B2/S3, a file is verified by hash once uploaded and only then removed locally. On iCloud, a written file is confirmed uploaded by its iCloud status (there is no remote hash), then evicted with `brctl evict`, never deleted, because deleting it deletes the cloud copy. A file is re-hashed after any later download (Integrity).
 - **Backups.** A backup is written outside the synced folder as a consistent snapshot, then moved in, so a half-written file is never uploaded. Backups hold broker order and account rows. Off the laptop they are encrypted before upload; this is the owner's call (question 4).
 - **Paths.** The archive path lives in `.env` or local config, never in a committed default. The Drive path (`~/Library/CloudStorage/GoogleDrive-<account>`) contains the account email.
 
@@ -108,19 +108,20 @@ Volume:
   - Migration effort, paid one source at a time.
   - If the owner chooses weekly snapshot copies, they take about 14 GB, which is why they are not kept nightly or by default. Raw Form 4 adds about 1.6 GB a year before compression.
   - Storage choice (c) above 15 GB, or (d), is running-system spend. That **amends ADR 0009's $0/month budget** and needs the owner's word. The free tier, or (a)/(b), keeps $0.
+  - (e) uses the owner's existing 2 TB iCloud plan: no new spend; whether it counts under ADR 0009 is the owner's call (question 2).
   - A never-true row parsed from a snapshot copy that has since rotated out cannot be re-derived; the re-derive fails loudly, and such a row still needs a hand-written repair.
   - Recording raw hashes in run rows is additive. It touches no fact-table schema under the ADR 0023 freeze.
   - Bars and corporate actions come from Alpaca. Its data terms are checked before that source adopts rule 1. The archive is not a cache of public data for every source.
 - **Reversibility.** Cheap. The archive location is one config path, and sources not yet adopted are unaffected.
 - **Revisit if:**
-  - Drive streaming proves unreliable for reads.
+  - Drive or iCloud proves unreliable for reads.
   - Weekly snapshot copies outgrow the chosen storage.
   - A comparison threshold fires on a source we trusted.
 
 ## Open questions
 
 1. Accept option 3, with the first step above? Recommended: yes.
-2. Storage for the raw archive and backups: laptop now and decide later; external SSD; Drive; B2/S3; or iCloud Drive? Recommended: **iCloud Drive**. The owner already pays for 2 TB, so it adds no running-system spend under ADR 0009, and it has room for the weekly snapshot copies too. Whether existing personal storage counts as running-system spend is the owner's call.
+2. Storage for the raw archive and backups: laptop now and decide later; external SSD; Drive; B2/S3; or iCloud Drive? Recommended: **iCloud Drive**. The owner already pays for 2 TB: no new spend, and classification under ADR 0009 is the owner's call. It has room for the weekly snapshot copies once the write-check-evict step is built.
 3. Run the merged `repair-form4-roles` release (#2705) now, or wait for this standard? Recommended: now. It is built and audited, and the Form 4 study waits on it. The first step then uses that fix as its regression test.
-4. Store backups off the laptop: yes, encrypted, or keep them local only? Recommended: yes, encrypted.
+4. Store backups off the laptop: yes, encrypted, or keep them local only? Recommended: yes, encrypted before upload. Standard iCloud is not end-to-end encrypted unless Advanced Data Protection is on, and backups hold broker order and account rows.
 5. For #2700 (SEC's bulk file mispins owner roles in some multi-owner filings): should rule 5 trust the XML over the bulk file for multi-owner filings? Recommended: yes. This is a data call.
