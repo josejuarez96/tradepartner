@@ -1196,7 +1196,7 @@ CREATE TABLE IF NOT EXISTS delisting_reasons (
     delisting_filed_at TIMESTAMPTZ NOT NULL,
     reason VARCHAR NOT NULL,
     reason_evidence_form VARCHAR NOT NULL,
-    reason_evidence_accession VARCHAR NOT NULL,
+    reason_evidence_accession VARCHAR,
     reason_source VARCHAR NOT NULL,
     reason_known_at TIMESTAMPTZ NOT NULL,
     {_common_fact_columns(TABLE_PROVENANCE_VALUES["delisting_reasons"])},
@@ -1204,6 +1204,7 @@ CREATE TABLE IF NOT EXISTS delisting_reasons (
     CHECK (reason IN ('performance_failure', 'bankruptcy', 'merger_acquisition',
                      'voluntary_other', 'unknown')),
     CHECK (reason_source IN ('form25_provision', 'form25_text', 'eightk_item', 'unknown')),
+    CHECK (reason_source = 'unknown' OR reason_evidence_accession IS NOT NULL),
     UNIQUE (security_id, delisting_form, delisting_class_title,
             delisting_exchange, delisting_filed_at, known_at)
 )

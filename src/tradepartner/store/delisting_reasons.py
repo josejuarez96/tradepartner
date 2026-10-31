@@ -13,6 +13,7 @@ import duckdb
 import polars as pl
 
 from tradepartner.store.asof import _latest_as_of, _validate_t
+from tradepartner.store.delistings import delistings_as_of
 
 _EPISODE_KEY = (
     "security_id",
@@ -28,5 +29,15 @@ def delisting_reasons_as_of(
     t: datetime,
     security_ids: Sequence[str] | None = None,
 ) -> pl.DataFrame:
-    """Return the latest reason revision per episode known at UTC instant `t`."""
-    return _latest_as_of(conn, "delisting_reasons", _EPISODE_KEY, _validate_t(t), security_ids)
+    """Return reason revisions only for Form 25 episodes known at UTC instant `t`."""
+    t = _validate_t(t)
+    reasons = _latest_as_of(conn, "delisting_reasons", _EPISODE_KEY, t, security_ids)
+    episodes = delistings_as_of(conn, t, security_ids).rename(
+        {
+            "form": "delisting_form",
+            "class_title": "delisting_class_title",
+            "exchange": "delisting_exchange",
+            "filed_at": "delisting_filed_at",
+        }
+    )
+    return reasons.join(episodes.select(_EPISODE_KEY), on=_EPISODE_KEY, how="semi")

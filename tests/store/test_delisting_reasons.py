@@ -13,7 +13,7 @@ from tradepartner.config import Settings
 from tradepartner.store import schema
 from tradepartner.store.db import insert_row
 from tradepartner.store.delisting_reasons import delisting_reasons_as_of
-from tradepartner.store.delistings import listing_ends_as_of
+from tradepartner.store.delistings import delistings_with_reasons_as_of, listing_ends_as_of
 from tradepartner.universe import universe_as_of
 
 FILED = datetime(2020, 1, 2, 15, tzinfo=UTC)
@@ -25,6 +25,22 @@ INGESTED = datetime(2020, 3, 1, tzinfo=UTC)
 def synthetic() -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
+    insert_row(
+        conn,
+        "delistings",
+        {
+            "security_id": "S",
+            "form": "25",
+            "class_title": "Common Stock",
+            "exchange": "NASDAQ",
+            "filed_at": FILED,
+            "effective_on": FILED.date() + timedelta(days=10),
+            "known_at": FILED,
+            "ingested_at": INGESTED,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
     yield conn
     conn.close()
 
@@ -57,9 +73,18 @@ def test_late_evidence_and_revisions_are_as_of(synthetic: duckdb.DuckDBPyConnect
     assert delisting_reasons_as_of(synthetic, INGESTED)["reason"].to_list() == ["unknown"]
 
 
+def test_reason_cannot_reveal_future_form_25(synthetic: duckdb.DuckDBPyConnection) -> None:
+    early_evidence = FILED - timedelta(days=20)
+    insert_row(synthetic, "delisting_reasons", _reason(early_evidence))
+    assert delisting_reasons_as_of(synthetic, FILED - timedelta(microseconds=1)).is_empty()
+    assert delisting_reasons_as_of(synthetic, FILED)["reason"].to_list() == ["bankruptcy"]
+    assert delistings_with_reasons_as_of(synthetic, FILED - timedelta(microseconds=1)).is_empty()
+    assert delistings_with_reasons_as_of(synthetic, FILED)["reason"].to_list() == ["bankruptcy"]
+
+
 def test_truncation_invariance(synthetic: duckdb.DuckDBPyConnection) -> None:
     insert_row(synthetic, "delisting_reasons", _reason())
-    truncated = TruncatedStore(synthetic, tables=("delisting_reasons",))
+    truncated = TruncatedStore(synthetic, tables=("delistings", "delisting_reasons"))
     try:
         for t in (EVIDENCE - timedelta(microseconds=1), EVIDENCE, INGESTED):
             assert delisting_reasons_as_of(synthetic, t).equals(
@@ -75,6 +100,18 @@ def test_reason_constraints(synthetic: duckdb.DuckDBPyConnection) -> None:
             insert_row(synthetic, "delisting_reasons", {**_reason(), field: value})
     with pytest.raises(duckdb.ConstraintException):
         insert_row(synthetic, "delisting_reasons", {**_reason(), "reason_known_at": FILED})
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(synthetic, "delisting_reasons", {**_reason(), "reason_evidence_accession": None})
+    insert_row(
+        synthetic,
+        "delisting_reasons",
+        {
+            **_reason(),
+            "reason": "unknown",
+            "reason_source": "unknown",
+            "reason_evidence_accession": None,
+        },
+    )
 
 
 def test_universe_and_listing_ends_ignore_reasons(

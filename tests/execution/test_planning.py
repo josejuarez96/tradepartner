@@ -1385,6 +1385,10 @@ def test_reason_rows_do_not_change_execution_plan(fixture_store_path: Path, tmp_
     with open_env(base_path, tmp_path) as env:
         before = env.plan()
         before_rows = {t: _rows_digest(env.conn, t) for t in ("signals", "decisions")}
+        before_plan = env.conn.execute(
+            "SELECT * EXCLUDE (store_max_ingested_at) FROM paper_plans ORDER BY ALL"
+        ).fetchall()
+        before_stamp = env.conn.execute("SELECT store_max_ingested_at FROM paper_plans").fetchone()
     with open_env(reason_path, tmp_path) as env:
         episode = env.conn.execute(
             "SELECT security_id, form, class_title, exchange, filed_at FROM delistings LIMIT 1"
@@ -1413,6 +1417,16 @@ def test_reason_rows_do_not_change_execution_plan(fixture_store_path: Path, tmp_
         after = env.plan()
         assert after == before
         assert {t: _rows_digest(env.conn, t) for t in ("signals", "decisions")} == before_rows
+        assert (
+            env.conn.execute(
+                "SELECT * EXCLUDE (store_max_ingested_at) FROM paper_plans ORDER BY ALL"
+            ).fetchall()
+            == before_plan
+        )
+        assert (
+            env.conn.execute("SELECT store_max_ingested_at FROM paper_plans").fetchone()
+            != before_stamp
+        )
 
 
 def test_h1_paper_plan_reads_no_turnover(
