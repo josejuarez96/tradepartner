@@ -2780,6 +2780,25 @@ def test_a_no_cover_page_rename_is_one_dated_row_across_nightly_runs(
     assert overlap.passed, overlap.violations
 
 
+def test_snapshot_sightings_store_only_pending_changes(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    nights = [
+        (NOW, FETCHED_AT, "STAT"),
+        (NOW + timedelta(days=3), FETCHED_AT + timedelta(days=3), "STAX"),
+        (NOW + timedelta(days=4), FETCHED_AT + timedelta(days=4), "STAX"),
+        (NOW + timedelta(days=5), FETCHED_AT + timedelta(days=5), "STAX"),
+    ]
+    counts = []
+    for now, fetched_at, ticker in nights:
+        result = _run(
+            settings, now=now, source="edgar", filings=_with_renamed_stat(ticker, fetched_at)
+        )
+        assert result.ok, result.runs[-1].message
+        counts.append(read(f"SELECT count(*) FROM snapshot_sightings WHERE cik = '{STAT}'")[0][0])
+    assert counts == [0, 1, 1, 1]
+
+
 def test_a_stored_pre_fix_same_start_pair_gets_one_rename_row(
     settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:

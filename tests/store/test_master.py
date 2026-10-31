@@ -2290,10 +2290,10 @@ def test_chain_candidates_need_an_end_within_the_window() -> None:
 
 RENAMED = "0000000098"  # 10-K from 2010, never a cover page: snapshot-only
 F1 = datetime(2026, 10, 3, 18, 0, tzinfo=UTC)  # a Saturday fetch: session 10-05
-F2 = datetime(2026, 10, 25, 18, 47, tzinfo=UTC)  # a Sunday fetch: session 10-26
-F3 = datetime(2026, 10, 27, 23, 0, tzinfo=UTC)
-NEXT_FETCH = F2 + timedelta(days=1)  # Monday's consecutive nightly fetch
-RENAME_AT = datetime(2026, 10, 29, 2, 0, tzinfo=UTC)
+F2 = datetime(2026, 10, 26, 18, 47, tzinfo=UTC)  # a Monday fetch: session 10-26
+F3 = datetime(2026, 10, 28, 23, 0, tzinfo=UTC)
+NEXT_FETCH = F2 + timedelta(days=1)  # Tuesday's consecutive nightly fetch
+RENAME_AT = datetime(2026, 10, 31, 2, 0, tzinfo=UTC)
 
 
 def _renamed_source(*snaps: CompanySnapshotEntry, covers: tuple[CoverPage, ...] = ()) -> Any:
@@ -2350,6 +2350,15 @@ class TestSnapshotRename:
             ("RNB", "OTC", "snapshot", date(2026, 10, 26), NEXT_FETCH),
         ]
 
+    def test_two_fetches_in_one_session_do_not_confirm_a_rename(self) -> None:
+        later_same_session = F2 + timedelta(hours=2)
+        build = _rename_build([_rn("RNB", later_same_session)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+
+    def test_a_pending_ticker_must_keep_its_exchange(self) -> None:
+        build = _rename_build([_rn("RNB", NEXT_FETCH, "NYSE")], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+
     def test_new_ticker_then_old_ticker_back_writes_no_rename(self) -> None:
         build = _rename_build([_rn("RNA", NEXT_FETCH)], [_rn("RNA", F1), _rn("RNB", F2)])
         assert _renamed_rows(build) == [STATIC_ROW]
@@ -2393,7 +2402,7 @@ class TestSnapshotRename:
         assert _renamed_rows(build) == [
             STATIC_ROW,
             ("RNB", "OTC", "snapshot", date(2026, 10, 26), NEXT_FETCH),
-            ("RNA", "OTC", "snapshot", date(2026, 10, 27), back_confirmed),
+            ("RNA", "OTC", "snapshot", date(2026, 10, 28), back_confirmed),
         ]
 
     def test_a_class_with_a_cover_page_is_still_reported(self) -> None:
@@ -2403,13 +2412,15 @@ class TestSnapshotRename:
         assert "RNB" not in {row[0] for row in _renamed_rows(build)}
 
     def test_a_rename_on_the_spans_own_session_is_reported(self) -> None:
-        # F2 and a second fetch the same session: a row there would tie RNB's start.
-        same_session = NEXT_FETCH + timedelta(hours=2)
+        # A second ticker on the span's own session cannot start another row.
+        same_session = F1 + timedelta(hours=2)
         build = _rename_build(
             [_rn("RNC", same_session)],
-            [_rn("RNA", F1), _rn("RNB", F2), _rn("RNB", NEXT_FETCH)],
+            [_rn("RNA", F1)],
+            _settings(master={"static_columns": ["name"]}),
         )
-        assert [row[0] for row in _renamed_rows(build)] == ["RNA", "RNB"]
+        assert [row[0] for row in _renamed_rows(build)] == ["RNA"]
+        assert [entry.ticker for entry in build.unmatched_snapshot] == ["RNC"]
 
     def test_a_delisted_name_absent_from_the_fetch_gets_no_new_row(self) -> None:
         build = _rename_build([_snap(ACME, "ACME", "ACME", "NYSE", F2)], [_rn("RNA", F1)])

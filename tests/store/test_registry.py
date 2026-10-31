@@ -1181,7 +1181,14 @@ def test_every_fact_table_is_classified_for_trial_vintage(
         # none is read by a reader a registered trial uses. `successor_chains`
         # (#821, T187) is inside the vintage: its rows move the chained reads a
         # trial sees.
-        excluded = {"rates", "borrow_status", "symbol_changes", "openfigi_types", "mergers"}
+        excluded = {
+            "rates",
+            "borrow_status",
+            "symbol_changes",
+            "openfigi_types",
+            "mergers",
+            "snapshot_sightings",  # trials read listings, never raw SEC observations
+        }
         assert included.isdisjoint(excluded)
         # An included name must be a store table, and every store table must
         # be classified on one side. `symbol_changes` is the amendment's

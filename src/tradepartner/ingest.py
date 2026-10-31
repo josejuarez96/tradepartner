@@ -1418,7 +1418,7 @@ def _ingest_filings(
     master, delistings, classes, facts, unmatched = _build_filings(
         recorded, settings, now, earlier_fetches=earlier
     )
-    record_snapshot_sightings(conn, recorded.companies_snapshot(), now)
+    record_snapshot_sightings(conn, recorded.companies_snapshot(), now, master.listings)
     restamped = ""
     if restamp is not None:
         result = restamp_from_manifest(

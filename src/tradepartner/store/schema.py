@@ -574,7 +574,11 @@ registry; #83 took version 2 first, so the registry is version 3):
   works (`journal.plans_for`, which names `paper_plans`'s two, reads them as
   NULL there; no read names `trial_rebalances`'s before T242), and the next
   writable `init_schema` call migrates the store.
-- **A later DDL change goes to version 39**, with its own migration and a
+- **Version 39** (#2291, #2295): adds `snapshot_sightings` for SEC ticker
+  observations awaiting rename confirmation. The migration is additive;
+  existing fact rows remain untouched. `known_at` is the fetch instant, and
+  the look-ahead harness truncates this table with the other dated tables.
+- **A later DDL change goes to version 40**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -697,6 +701,9 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "successor_chains": ("filing",),
     "mergers": ("action",),
 }
+
+# `snapshot_sightings` belongs to TABLE_NAMES for as-of truncation, but has
+# no `source` or `provenance`: it records raw fetch observations, not facts.
 
 #: `statement_facts.basis` (#660): `reported` for an as-filed value,
 #: `derived` for a `gross_profit` row the ingest computed from the stored
@@ -878,6 +885,8 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   (NULL on every existing row) by `ALTER TABLE`
 #:   (`_migrate_assets_intersection`); the pinned DDL strings do not change
 #:   (module docstring, "Schema versions").
+#: - 39 (#2291, #2295): additive `snapshot_sightings` table for pending
+#:   SEC ticker observations; no existing table changes.
 #: - A later DDL change goes to version 40, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
 CURRENT_SCHEMA_VERSION = 39

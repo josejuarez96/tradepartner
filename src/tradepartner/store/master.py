@@ -920,7 +920,7 @@ class _Builder:
         """Attach snapshot entries (sorted by fetch time) using only what the
         cover pages showed by each entry's `fetched_at`, so a row's presence
         never depends on a filing accepted after its own `known_at`."""
-        pending: dict[str, tuple[str, date]] = {}
+        pending: dict[str, tuple[str, str, date]] = {}
         for entry in entries:
             t = entry.fetched_at
             listed = [c for c in classes if c.pairs_at(t)]
@@ -941,11 +941,15 @@ class _Builder:
                     continue
                 if first_listing is None and session_of(t) > since:
                     candidate = pending.get(cls.security_id)
-                    if candidate is not None and candidate[0] == entry.ticker:
-                        self._snapshot_listing(cls, entry, candidate[1], "snapshot")
+                    if (
+                        candidate is not None
+                        and candidate[:2] == (entry.ticker, entry.exchange)
+                        and session_of(t) > candidate[2]
+                    ):
+                        self._snapshot_listing(cls, entry, candidate[2], "snapshot")
                         pending.pop(cls.security_id, None)
                     else:
-                        pending[cls.security_id] = (entry.ticker, session_of(t))
+                        pending[cls.security_id] = (entry.ticker, entry.exchange, session_of(t))
                 else:
                     self.unmatched.append(entry)
                 continue
@@ -1750,12 +1754,21 @@ def record_snapshot_sightings(
     conn: duckdb.DuckDBPyConnection,
     entries: Sequence[CompanySnapshotEntry],
     ingested_at: datetime,
+    current_listings: Sequence[dict[str, Any]] = (),
 ) -> None:
-    """Persist each fetched SEC ticker, even when it derives no listing yet."""
+    """Persist changed tickers awaiting confirmation, not the full SEC file."""
     ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
+    current: dict[str, tuple[date, datetime, str]] = {}
+    for row in current_listings:
+        cik = security_cik(row["security_id"])
+        version = (row["valid_from"], row["known_at"], row["ticker"])
+        if cik not in current or version[:2] > current[cik][:2]:
+            current[cik] = version
     for entry in entries:
         if entry.fetched_at > ingested_at:
             raise ValueError("snapshot fetched_at is later than ingested_at")
+        if entry.cik in current and entry.ticker == current[entry.cik][2]:
+            continue
         conn.execute(
             "INSERT INTO snapshot_sightings VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
             [entry.cik, entry.ticker, entry.exchange, entry.fetched_at, ingested_at],
