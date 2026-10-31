@@ -1590,9 +1590,14 @@ why = "Its answers decide two owner rules and the table size before any schema w
 unblocks = ["task:T318", "task:T319a", "task:T319b"]
 
 [task.T318]
-what = "The filing_index table (the stamped EDGAR index with known_at = acceptance), its three state tables, the --check rules and the restamp match."
+what = "The filing_index table (the stamped EDGAR index with known_at = acceptance, and a dated revision row for a later SEC filed_on), its three state tables and the module that reads and writes them."
 why = "Storing the stamped index is what lets the nightly stop re-walking 33 years of EDGAR every run (#2629)."
-unblocks = ["task:T319", "task:T321", "task:T323a"]
+unblocks = ["task:T318b", "task:T319", "task:T323a"]
+
+[task.T318b]
+what = "The --check rules for filing_index, its filed_on revisions included, and the restamp's match on (cik, accession)."
+why = "They keep a stored index row's known_at honest and let a stamps repair move every revision of an accession (#2629, #2703)."
+unblocks = ["task:T323"]
 
 [task.T319]
 what = "The EDGAR adapter's incremental read: the new daily rows, the issuer rule, a new issuer's earlier rows, and stamps for new rows only."
