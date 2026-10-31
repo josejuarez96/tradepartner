@@ -7483,6 +7483,70 @@ def test_form4_bulk_budget_stop_counts_later_quarter_rows(
     assert "3 remaining" in message
 
 
+def test_form4_bulk_unreached_quarter_keeps_previous_checked_digest(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tradepartner.adapters.form4_route import Quarter
+
+    now = datetime(2026, 7, 2, tzinfo=UTC)
+    enabled = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(enabled, client=httpx.Client(), clock=lambda: now)
+    early = UnstampedFiling(ACME, "ACME", "4", "0001577526-26-000036", date(2026, 3, 31))
+    later = UnstampedFiling(ACME, "ACME", "4", "0001577526-26-000037", date(2026, 4, 1))
+    monkeypatch.setattr(source, "_rows", lambda *_: iter([((2026, 1), early), ((2026, 2), later)]))
+    monkeypatch.setattr(source, "_load_stamps", lambda *_: {})
+    ingest_module.write_sec_form_accession(
+        fixture_store,
+        SecFormFiling(later.accession, "4", now, later.filed_on, (ACME,), (ACME,), ()),
+        ingested_at=now,
+        source="sec_insider_bulk",
+    )
+    fixture_store.execute(
+        "INSERT INTO ingestion_runs "
+        "(run_id, started_at, finished_at, status, source, mode, rows_added, "
+        "chunk_cursor, message) "
+        "VALUES ('older', ?, ?, 'ok', 'sec_insider_bulk', 'backfill', 0, '2026q2', ?)",
+        [now - timedelta(days=1), now - timedelta(days=1), f"zip_sha256={'a' * 64}"],
+    )
+
+    def load(quarters: Iterable[Quarter], **_kwargs: Any) -> Any:
+        quarter = next(iter(quarters))
+        return {quarter: InsiderBulk({})}, {quarter: "b" * 64}, Counter(), frozenset()
+
+    monkeypatch.setattr(ingest_module, "load_bulk_quarters", load)
+    routed: list[tuple[Quarter, frozenset[str]]] = []
+    stop = True
+
+    def route(rows: Iterable[tuple[str, str, str, date]], **kwargs: Any) -> BulkRouteResult:
+        quarter = kwargs["accession_quarters"][next(iter(rows))[0]]
+        routed.append((quarter, kwargs["skip_accessions"]))
+        if stop:
+            return BulkRouteResult(Counter({"sec_forms_budget_stopped": 1}), 0, 1)
+        return BulkRouteResult(Counter(), 0, 0)
+
+    monkeypatch.setattr(ingest_module, "run_form4_bulk_route", route)
+    ingest_module._write_form4_bulk(fixture_store, enabled, source, frozenset({ACME}), now)
+    assert [quarter for quarter, _ in routed] == [Quarter(2026, 1)]
+    partial_message = fixture_store.execute(
+        "SELECT message FROM ingestion_runs WHERE source='sec_insider_bulk' "
+        "AND chunk_cursor='2026q2' ORDER BY finished_at DESC LIMIT 1"
+    ).fetchone()[0]
+    assert f"zip_sha256={'b' * 64}" in partial_message
+    assert f"checked_sha256={'a' * 64}" in partial_message
+
+    stop = False
+    routed.clear()
+    ingest_module._write_form4_bulk(
+        fixture_store, enabled, source, frozenset({ACME}), now + timedelta(minutes=1)
+    )
+    assert [quarter for quarter, _ in routed] == [Quarter(2026, 1), Quarter(2026, 2)]
+    assert later.accession not in routed[1][1]
+
+
 def test_form4_bulk_cross_route_comparison_never_rewrites_xml(
     fixture_store: duckdb.DuckDBPyConnection,
     settings: Settings,
@@ -7555,12 +7619,15 @@ def test_form4_bulk_cross_route_comparison_never_rewrites_xml(
     ).fetchall() == [("sec_form4_xml",)]
 
 
-@pytest.mark.parametrize("partial_digest, routed", [("a" * 64, False), ("b" * 64, True)])
+@pytest.mark.parametrize(
+    "partial_digest, routed",
+    [("a" * 64, False), ("b" * 64, True), ("none", True), ("", True), (None, True)],
+)
 def test_form4_bulk_partial_run_skips_only_stored_matching_digest(
     fixture_store: duckdb.DuckDBPyConnection,
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
-    partial_digest: str,
+    partial_digest: str | None,
     routed: bool,
 ) -> None:
     from tradepartner.adapters.form4_route import Quarter
@@ -7596,7 +7663,13 @@ def test_form4_bulk_partial_run_skips_only_stored_matching_digest(
             "(run_id, started_at, finished_at, status, source, mode, rows_added, "
             "chunk_cursor, message) "
             "VALUES (?, ?, ?, ?, 'sec_insider_bulk', 'backfill', 0, '2026q3', ?)",
-            [run_id, finished, finished, status, f"zip_sha256={digest}; remaining=1"],
+            [
+                run_id,
+                finished,
+                finished,
+                status,
+                f"zip_sha256={digest}; remaining=1" if digest else digest,
+            ],
         )
     enabled = settings.model_copy(
         update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
