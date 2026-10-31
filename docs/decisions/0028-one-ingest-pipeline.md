@@ -1,6 +1,6 @@
 # 0028. One ingest standard: keep raw downloads, parse from them, declare the plumbing
 
-**Status:** Proposed  ·  **Date:** 2026-10-31  ·  **Issue:** #2712  ·  **Related:** [#2681](https://github.com/josejuarez96/tradepartner/issues/2681), [#2685](https://github.com/josejuarez96/tradepartner/issues/2685), [#2691](https://github.com/josejuarez96/tradepartner/issues/2691), [#2697](https://github.com/josejuarez96/tradepartner/issues/2697), [#2700](https://github.com/josejuarez96/tradepartner/issues/2700), [#2706](https://github.com/josejuarez96/tradepartner/issues/2706), T317–T324 ([data-foundation plan](../plans/data-foundation.md)), [ADR 0009](0009-price-vendor.md) (the $0 budget), [ADR 0023](0023-break-first-fast-books-paper-exam.md) (the schema freeze)
+**Status:** Accepted ([owner's answer on PR #2713, 2026-10-31](https://github.com/josejuarez96/tradepartner/pull/2713))  ·  **Date:** 2026-10-31  ·  **Issue:** #2712  ·  **Related:** [#2681](https://github.com/josejuarez96/tradepartner/issues/2681), [#2685](https://github.com/josejuarez96/tradepartner/issues/2685), [#2691](https://github.com/josejuarez96/tradepartner/issues/2691), [#2697](https://github.com/josejuarez96/tradepartner/issues/2697), [#2700](https://github.com/josejuarez96/tradepartner/issues/2700), [#2706](https://github.com/josejuarez96/tradepartner/issues/2706), T317–T324 ([data-foundation plan](../plans/data-foundation.md)), [ADR 0009](0009-price-vendor.md) (the $0 budget), [ADR 0023](0023-break-first-fast-books-paper-exam.md) (the schema freeze)
 
 ## Context
 
@@ -125,3 +125,5 @@ Volume:
 3. Run the merged `repair-form4-roles` release (#2705) now, or wait for this standard? Recommended: now. It is built and audited, and the Form 4 study waits on it. The first step then uses that fix as its regression test.
 4. Store backups off the laptop: yes, encrypted, or keep them local only? Recommended: yes, encrypted before upload. Standard iCloud is not end-to-end encrypted unless Advanced Data Protection is on, and backups hold broker order and account rows.
 5. For #2700 (SEC's bulk file mispins owner roles in some multi-owner filings): should rule 5 trust the XML over the bulk file for multi-owner filings? Recommended: yes. This is a data call.
+
+**Correction (2026-10-31):** `edgar_index_files` is not yet built; T318 creates it.
