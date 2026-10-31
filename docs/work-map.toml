@@ -1689,3 +1689,8 @@ unblocks = ["issue:2669"]
 what = "Check opportunistic Form 4 purchases against a timestamped net-of-cost, acceptance-timed monthly kill line."
 why = "It records an INSUFFICIENT desk read and the owner-approved frozen registered event study, after counts-only feasibility (#2673)."
 unblocks = ["issue:2673"]
+
+[research.2026-10-31-cash-op-profitability-desk-read]
+what = "Read cash-based operating profitability in both Chen-Zimmermann portfolio files against a frozen cost and leg line."
+why = "The weak short leg retires this candidate; T330 and T331 must not be built for it, pending the owner's strike-or-park decision on #2677."
+unblocks = ["issue:2675"]
