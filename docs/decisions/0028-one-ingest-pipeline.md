@@ -56,6 +56,7 @@ Storage options for raw archives and backups:
 - **(b) External SSD:** about $60 once (whether a one-off hardware buy counts under ADR 0009's running-system budget is the owner's call), but a second device, and unusable for the live store.
 - **(c) Google Drive for desktop, streaming mode:** the free 15 GB tier fits the first step; above that, about $2/month. It brings sync caveats (below).
 - **(d) A scriptable object store (Backblaze B2, S3):** about $6 per TB per month and easy to script, but a new account and more setup.
+- **(e) iCloud Drive:** the owner already pays for 2 TB (2026-10-31), so there is no new spend and no new account. It syncs a normal macOS folder (`~/Library/Mobile Documents/com~apple~CloudDocs`). With "Optimize Mac Storage", macOS evicts files to the cloud and downloads them on first read. That is slow for a large re-derive, and there is no scripting API beyond the folder.
 
 ## Decision
 
@@ -72,13 +73,13 @@ We will hold every source to five rules, adopting them one source at a time:
 
 **Look-ahead guard.** Only ingest and re-derive open the raw archive. No backtest, universe, signal or research read opens it, enforced by a source scan as for `index_members.csv`. A re-derive reads only the raw files its run rows name, by hash. A later fetch is a new run with its own run row; a row it produces keeps `known_at` no earlier than that fetch's time.
 
-**Storage.** The live store never lives on a synced or external disk, because an interrupted write by an unattended run could corrupt it. Sharadar data is never copied off the laptop. If the owner chooses (c) or (d) for the archive:
+**Storage.** The live store never lives on a synced or external disk, because an interrupted write by an unattended run could corrupt it. Sharadar data is never copied off the laptop. If the owner chooses (c), (d) or (e) for the archive:
 - **Integrity.** Raw files are content-addressed, so a sync conflict copy ("name (1)") is never matched. Every read re-checks the hash and refuses on a mismatch.
 - **Offline.** The daily ingest never reads the archive. A re-derive whose raw file is unavailable fails loudly. It never falls back to a fresh SEC fetch, which would be later, different content.
-- **Disk.** Drive for desktop keeps a local cache on the boot disk and may offer no size cap, so a re-derive checks the 10 GB floor before it starts and stops if it falls below.
+- **Disk.** Drive for desktop and iCloud both keep downloaded files on the boot disk and may offer no size cap. A re-derive checks the 10 GB floor before it starts and stops if it falls below. On iCloud, a re-derive first requests its files with `brctl download` and refuses to start until they are local.
 - **Upload.** Raw files are written locally, verified by hash once uploaded, and only then removed locally.
 - **Backups.** A backup is written outside the synced folder as a consistent snapshot, then moved in, so a half-written file is never uploaded. Backups hold broker order and account rows. Off the laptop they are encrypted before upload; this is the owner's call (question 4).
-- **Paths.** The Drive path (`~/Library/CloudStorage/GoogleDrive-<account>`) contains the account email, so it lives in `.env` or local config, never in a committed default.
+- **Paths.** The archive path lives in `.env` or local config, never in a committed default. The Drive path (`~/Library/CloudStorage/GoogleDrive-<account>`) contains the account email.
 
 **First step, if accepted.** Option 2's scope, built to the standard:
 - keep Form 4 XML and the daily index files raw;
@@ -119,7 +120,7 @@ Volume:
 ## Open questions
 
 1. Accept option 3, with the first step above? Recommended: yes.
-2. Storage for the raw archive: laptop now and decide later; external SSD; Drive (free tier first); or B2/S3? Recommended: Drive free tier for raw Form 4 and daily index files. It keeps $0, and we revisit if it outgrows 15 GB.
+2. Storage for the raw archive and backups: laptop now and decide later; external SSD; Drive; B2/S3; or iCloud Drive? Recommended: **iCloud Drive**. The owner already pays for 2 TB, so it adds no running-system spend under ADR 0009, and it has room for the weekly snapshot copies too. Whether existing personal storage counts as running-system spend is the owner's call.
 3. Run the merged `repair-form4-roles` release (#2705) now, or wait for this standard? Recommended: now. It is built and audited, and the Form 4 study waits on it. The first step then uses that fix as its regression test.
 4. Store backups off the laptop: yes, encrypted, or keep them local only? Recommended: yes, encrypted.
 5. For #2700 (SEC's bulk file mispins owner roles in some multi-owner filings): should rule 5 trust the XML over the bulk file for multi-owner filings? Recommended: yes. This is a data call.
