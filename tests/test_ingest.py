@@ -2799,6 +2799,27 @@ def test_snapshot_sightings_store_only_pending_changes(
     assert counts == [0, 1, 1, 1]
 
 
+def test_four_nights_of_flapping_snapshot_tickers_write_no_rename(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    for days, ticker in ((0, "STAT"), (3, "STAX"), (4, "STAT"), (5, "STAX")):
+        result = _run(
+            settings,
+            now=NOW + timedelta(days=days),
+            source="edgar",
+            filings=_with_renamed_stat(ticker, FETCHED_AT + timedelta(days=days)),
+        )
+        assert result.ok, result.runs[-1].message
+
+    assert read(
+        "SELECT ticker, provenance, valid_from FROM listings "
+        f"WHERE security_id = '{STAT}' ORDER BY valid_from"
+    ) == [("STAT", "snapshot_static", date(2018, 3, 5))]
+    assert read(
+        f"SELECT ticker FROM snapshot_sightings WHERE cik = '{STAT}' ORDER BY known_at"
+    ) == [("STAX",), ("STAT",), ("STAX",)]
+
+
 def test_a_stored_pre_fix_same_start_pair_gets_one_rename_row(
     settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:

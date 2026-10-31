@@ -1758,16 +1758,25 @@ def record_snapshot_sightings(
 ) -> None:
     """Persist changed tickers awaiting confirmation, not the full SEC file."""
     ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
-    current: dict[str, tuple[date, datetime, str]] = {}
+    current: dict[str, dict[str, tuple[date, datetime, str]]] = defaultdict(dict)
     for row in current_listings:
         cik = security_cik(row["security_id"])
+        security_id = row["security_id"]
         version = (row["valid_from"], row["known_at"], row["ticker"])
-        if cik not in current or version[:2] > current[cik][:2]:
-            current[cik] = version
+        if security_id not in current[cik] or version[:2] > current[cik][security_id][:2]:
+            current[cik][security_id] = version
+    latest_sighting = dict(
+        conn.execute("SELECT cik, MAX(known_at) FROM snapshot_sightings GROUP BY cik").fetchall()
+    )
     for entry in entries:
         if entry.fetched_at > ingested_at:
             raise ValueError("snapshot fetched_at is later than ingested_at")
-        if entry.cik in current and entry.ticker == current[entry.cik][2]:
+        matching = [
+            version for version in current.get(entry.cik, {}).values() if version[2] == entry.ticker
+        ]
+        if matching and latest_sighting.get(entry.cik, matching[0][1]) <= max(
+            version[1] for version in matching
+        ):
             continue
         conn.execute(
             "INSERT INTO snapshot_sightings VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
