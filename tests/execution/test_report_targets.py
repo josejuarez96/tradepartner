@@ -491,12 +491,14 @@ def test_report_refuses_a_bad_book_token_before_any_trial(
     [
         (datetime(2019, 7, 15, 12, tzinfo=UTC), "no rebalance yet"),
         (datetime(2019, 8, 1, 12, tzinfo=UTC), "one rebalance"),
+        # #2468: two sessions give one period return; the engine needs two.
+        (datetime(2019, 9, 10, 12, tzinfo=UTC), "two rebalances"),
     ],
 )
-def test_report_with_fewer_than_two_rebalances_writes_no_trial_and_no_report_row(
+def test_report_with_fewer_than_three_rebalances_writes_no_trial_and_no_report_row(
     fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime, case: str
 ) -> None:
-    """#1923: a book with fewer than two rebalances has nothing to compare; `report`
+    """#1923: a book with fewer than three rebalances has nothing to compare; `report`
     raises `NothingToCompareYet` and writes no trial (so no refused `in_sample`
     row, no failed tracking row) and no `paper_reports` row."""
     report_settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})

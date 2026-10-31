@@ -2148,11 +2148,11 @@ def test_a_window_with_no_mark_has_a_base_and_no_series(journal_settings: Settin
 
 
 def test_tracking_states_without_a_report_row(journal_settings: Settings) -> None:
-    # two daily rebalances done by the as-of (09-30 and 10-01): the report is due
-    _p_seed(journal_settings, report=False)
+    # three daily rebalances done by the as-of (09-29, 09-30 and 10-01): the report is due
+    _p_seed(journal_settings, window=_p_window(first=date(2026, 9, 29)), report=False)
     done = _p_read(journal_settings)
     assert done is not None
-    assert (done.tracking_state, done.tracking_n) == ("report_due", 2)
+    assert (done.tracking_state, done.tracking_n) == ("report_due", 3)
     assert done.trial_line == () and done.trial_span is None and done.tracking_trial_id is None
 
 
@@ -2661,7 +2661,7 @@ def test_waiting_on_owner_on_the_full_fixture_within_the_timing_bound(
         WaitingItem(
             book_id="main",
             kind="report_due",
-            since=date(2026, 10, 1),
+            since=date(2026, 10, 2),
             detail=(
                 "5 rebalances tracked and no tracking report yet; `paper report` opens a "
                 "counted tracking trial"
@@ -2787,7 +2787,7 @@ def test_shakedown_note_needs_a_span_and_clears_with_its_note(journal_settings: 
     assert [i for i in _w_read(journal_settings) if i.kind == "shakedown_note"] == []
 
 
-def test_report_due_at_two_rebalances_and_gone_once_a_report_row_exists(
+def test_report_due_at_three_rebalances_and_gone_once_a_report_row_exists(
     journal_settings: Settings,
 ) -> None:
     with open_for_write(journal_settings) as conn:
@@ -2795,17 +2795,20 @@ def test_report_due_at_two_rebalances_and_gone_once_a_report_row_exists(
         main = _w_window(conn, "main")
         _w_run(conn, main, date(2026, 9, 30))
         _w_run(conn, main, date(2026, 10, 1))
+        _w_run(conn, main, date(2026, 10, 2))
 
     def due(now: datetime) -> list[object]:
         return [i.since for i in _w_read(journal_settings, now) if i.kind == "report_due"]
 
     # 10-01 14:00 ET: only 09-30 has closed (one rebalance).
     assert due(datetime(2026, 10, 1, 18, 0, tzinfo=UTC)) == []
-    # 10-02 14:00 ET: 09-30 and 10-01 (two): due since the second, 10-01.
-    assert due(datetime(2026, 10, 2, 18, 0, tzinfo=UTC)) == [date(2026, 10, 1)]
+    # 10-02 14:00 ET: 09-30 and 10-01 (two): a report still needs a third (#2468).
+    assert due(datetime(2026, 10, 2, 18, 0, tzinfo=UTC)) == []
+    # 10-02 17:00 ET: the third has closed: due since the third, 10-02.
+    assert due(datetime(2026, 10, 2, 21, 0, tzinfo=UTC)) == [date(2026, 10, 2)]
     with open_for_write(journal_settings) as conn:
         _w_report_row(conn, main)
-    assert due(datetime(2026, 10, 2, 18, 0, tzinfo=UTC)) == []
+    assert due(datetime(2026, 10, 2, 21, 0, tzinfo=UTC)) == []
 
 
 def test_a_crashed_run_with_no_kill_switch_row_is_since_its_started_at(
@@ -2834,3 +2837,11 @@ def test_an_unreadable_frozen_json_is_one_item_and_the_other_books_still_come_ou
     items = _w_read(journal_settings)
     assert _w_kinds(items) == [("main", "missed_run"), ("a", "unreadable")]
     assert items[1].detail == f"window {a} frozen_json is not JSON"
+
+
+def test_the_report_due_floor_is_the_report_guards_floor() -> None:
+    """#2468: the card and the waiting list must call a report due exactly when
+    `paper report` stops refusing with `NothingToCompareYet`."""
+    from tradepartner.execution import report as report_module
+
+    assert ops._REPORT_MIN_REBALANCES == report_module._MIN_REBALANCE_SESSIONS

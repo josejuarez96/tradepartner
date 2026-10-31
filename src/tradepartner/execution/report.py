@@ -1114,9 +1114,14 @@ class MarksMissing(ValueError):
     `report` raises it before any trial opens, so nothing is written."""
 
 
+#: The tracking trial's Sharpe needs two period returns, and N rebalance sessions give
+#: N - 1 of them, so a report needs three sessions (#2468).
+_MIN_REBALANCE_SESSIONS = 3
+
+
 class NothingToCompareYet(Exception):
-    """A book with fewer than two rebalance sessions through the last completed one
-    has no period to compare (#1923). `report` raises it before any trial opens, so
+    """A book with fewer than three rebalance sessions through the last completed one
+    has too few periods to compare (#1923, #2468). `report` raises it before any trial opens, so
     nothing is written: no refused `in_sample` row, no failed tracking row."""
 
 
@@ -1287,9 +1292,9 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
     than after paying for a trial run; quant-auditor finding on PR #525; `paper
     start` writes it since #526, so only a window started earlier lacks it), or
     when the tracking trial does not finish `ok`. Raises `NothingToCompareYet`, with
-    nothing written, when fewer than two rebalance sessions fall in `[T_0, last
-    completed T]` (#1923): the engine needs two, and a refused or failed trial row is
-    noise in the registry.
+    nothing written, when fewer than three rebalance sessions fall in `[T_0, last
+    completed T]` (#1923, #2468): the engine needs two period returns, so three, and a refused or
+    failed trial row is noise in the registry.
 
     "Last completed T" is capped strictly before the window's stop session
     (req 15), when it has one: a stopped window's `last completed T` is never
@@ -1331,10 +1336,11 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
             f"the book has no marks after {last_marked} (halted or not yet marked)"
         )
 
-    if last_t < t0 or len(rebalance_sessions(t0, last_t, cadence)) < 2:
+    if last_t < t0 or len(rebalance_sessions(t0, last_t, cadence)) < _MIN_REBALANCE_SESSIONS:
         raise NothingToCompareYet(
             f"paper report: nothing to compare yet for book {book!r}; a report needs at "
-            f"least two rebalances and the first is {t0} (last marked rebalance: {last_t})"
+            f"least three rebalances (two period returns) and the first is {t0} "
+            f"(last marked rebalance: {last_t})"
         )
 
     missing = [t for t in rebalance_sessions(t0, last_t, cadence) if t not in marked]
