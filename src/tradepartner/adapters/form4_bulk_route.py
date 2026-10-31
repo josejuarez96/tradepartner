@@ -42,7 +42,7 @@ from tradepartner.adapters.form4_route import (
 from tradepartner.config import Settings
 
 Form4IndexRow = tuple[str, str, str, date]  # accession, issuer CIK, form, filing date
-BULK_READER_VERSION = 1
+BULK_READER_VERSION = 2  # Joined owner roles and title whitespace parity (#2691).
 
 
 class RequestBudgetStopped(Exception):

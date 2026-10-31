@@ -254,23 +254,43 @@ def test_parity_with_parse_form4_on_the_same_accession(accession: str) -> None:
 # --- the rules --------------------------------------------------------------------
 
 
-def test_the_relationship_list_gives_the_four_booleans() -> None:
-    cases = {
-        "Director": (True, False, False, False),
-        "Officer": (False, True, False, False),
-        "TenPercentOwner": (False, False, True, False),
-        "Other": (False, False, False, True),
-        "Director,Officer,TenPercentOwner,Other": (True, True, True, True),
-        "": (False, False, False, False),
-    }
-    for rel, flags in cases.items():
-        (row,) = _one(owners=[_own(rel=rel)]).transactions
-        assert (
-            row.is_director,
-            row.is_officer,
-            row.is_ten_percent_owner,
-            row.is_other,
-        ) == flags, rel
+@pytest.mark.parametrize(
+    ("rel", "flags"),
+    [
+        ("Director", (True, False, False, False)),
+        ("Officer", (False, True, False, False)),
+        ("TenPercentOwner", (False, False, True, False)),
+        ("Other", (False, False, False, True)),
+        ("DirectorOther", (True, False, False, True)),
+        ("OfficerOther", (False, True, False, True)),
+        ("TenPercentOwnerOther", (False, False, True, True)),
+        ("OtherDirector", (True, False, False, True)),
+        ("OfficerDirectorOther", (True, True, False, True)),
+        ("TenPercentOwnerOfficerDirector", (True, True, True, False)),
+        ("Director,Officer,TenPercentOwner,Other", (True, True, True, True)),
+        (" Director , OfficerOther ", (True, True, False, True)),
+        (" Director  Officer Other ", (True, True, False, True)),
+        (" directorother ", (True, False, False, True)),
+        ("", (False, False, False, False)),
+    ],
+)
+def test_the_relationship_list_gives_the_four_booleans(
+    rel: str, flags: tuple[bool, bool, bool, bool]
+) -> None:
+    (row,) = _one(owners=[_own(rel=rel)]).transactions
+    assert (
+        row.is_director,
+        row.is_officer,
+        row.is_ten_percent_owner,
+        row.is_other,
+    ) == flags
+
+
+@pytest.mark.parametrize("rel", ["Mystery", "DirectorMystery", "Officer,Unknown"])
+def test_unknown_relationship_is_identity_bad(rel: str) -> None:
+    accession = _one(owners=[_own(rel=rel)])
+    assert accession.identity_bad
+    assert accession.transactions == ()
 
 
 def test_a_blank_is_null_never_zero() -> None:
