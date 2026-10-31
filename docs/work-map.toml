@@ -1672,6 +1672,44 @@ unblocks = ["task:T329"]
 what = "Feed deciding-read-visible reasons and mergers only to backtest exit costs; report unknown coverage and withheld shocks."
 why = "Later evidence must not change an earlier exit under the approved timing rule."
 
+[task.T345]
+what = "Configure the local raw archive path and refuse writes that breach the iCloud disk floor."
+why = "Raw-first ingest must fail safely without committing an account-specific path."
+unblocks = ["task:T346"]
+
+[task.T346]
+what = "Keep raw bodies by content hash and verify iCloud upload, eviction, download and integrity."
+why = "Form 4 XML and daily index inputs must survive parser fixes and sync eviction."
+unblocks = ["task:T347", "task:T348"]
+
+[task.T347]
+what = "Archive daily index files before parsing and record their hashes, URLs, fetch times and parser versions in runs."
+why = "A corrected daily file must remain available for a point-in-time rebuild."
+unblocks = ["task:T352"]
+
+[task.T348]
+what = "Archive fetched Form 4 XML before parsing and skip unchanged held accessions."
+why = "Reruns should fetch only new filings while retaining the exact source for repair."
+unblocks = ["task:T350", "task:T352"]
+
+[task.T349]
+what = "Declare per-field Form 4 source trust and tolerances and count disagreements."
+why = "A measured threshold replaces a single-mismatch quarter stop."
+unblocks = ["task:T351"]
+
+[task.T350]
+what = "Route multi-owner Form 4 accessions to XML and keep transaction-owner associations."
+why = "Bulk owner joins can assign a transaction to the wrong reporting owner."
+unblocks = ["task:T351"]
+
+[task.T351]
+what = "Apply per-source disagreement thresholds in Form 4 ingest and health."
+why = "A differing sampled filing should not discard an otherwise usable quarter."
+
+[task.T352]
+what = "Re-derive from named raw hashes and enforce the archive's no-look-ahead reader boundary."
+why = "Parser repairs need exact historical inputs without exposing later files to research reads."
+
 
 
 [research.2026-10-30-equity-issuance-desk-read]
