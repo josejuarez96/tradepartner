@@ -45,6 +45,7 @@ Forms 3, 5, 3/A and 5/A and the `DERIV_*` and `NONDERIV_HOLDING` tables are not 
 from __future__ import annotations
 
 import csv
+import re
 import zipfile
 from collections import defaultdict
 from collections.abc import Iterator
@@ -209,9 +210,20 @@ def _cik_or_none(raw: str) -> str | None:
         return None
 
 
-def _relationship(raw: str) -> tuple[bool, bool, bool, bool]:
-    """(director, officer, ten percent owner, other) from the comma-separated list."""
-    roles = {part.strip().lower() for part in raw.split(",")}
+_ROLE_TOKEN = re.compile(r"tenpercentowner|director|officer|other")
+
+
+def _relationship(raw: str) -> tuple[bool, bool, bool, bool] | None:
+    """Decode comma-separated or concatenated roles; unknown text marks identity bad."""
+    roles: set[str] = set()
+    for part in raw.lower().split(","):
+        text = part.strip()
+        while text:
+            match = _ROLE_TOKEN.match(text)
+            if match is None:
+                return None
+            roles.add(match.group())
+            text = text[match.end() :].lstrip()
     return "director" in roles, "officer" in roles, "tenpercentowner" in roles, "other" in roles
 
 
@@ -311,6 +323,7 @@ def _accession(
     skipped = sum(1 for fact in facts if fact.skipped)
 
     owner_roles = [_relationship(o["RPTOWNER_RELATIONSHIP"]) for o in owners]
+    identity_bad = identity_bad or any(roles is None for roles in owner_roles)
     transactions: tuple[Form4Transaction, ...] = ()
     if not identity_bad and not order_bad and issuer is not None:
         transactions = tuple(
@@ -328,7 +341,7 @@ def _accession(
             for rank, _row, fields in parsed
             if rank is not None and fields is not None
             for cik, roles in zip(owner_ciks, owner_roles, strict=True)
-            if cik is not None
+            if cik is not None and roles is not None
         )
         transactions = tuple(sorted(transactions, key=lambda t: (t.line_no, t.filer_cik)))
     return BulkAccession(
