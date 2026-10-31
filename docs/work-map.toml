@@ -1646,3 +1646,8 @@ why = "The nightly EDGAR run drops from about 2 hours and 4 GB to minutes and fl
 [task.T325]
 what = "Conditional: an order-free rule for which index row of an accession the 13D and delisting paths take, built only if the probe finds daily and quarterly files order rows differently."
 why = "The incremental and full builds must pick the same row whatever file they read it from (#2629, owner decision 4)."
+
+[research.2026-10-30-equity-issuance-desk-read]
+what = "Read the composite and one-year share-issuance Chen-Zimmermann legs against a prewritten cost and strength line."
+why = "It retires the issuance line at the desk read: CompEquIss, ShareIss1Y and NetEquityFinance fail; Q1 is killed (#2669)."
+unblocks = ["issue:2669"]
