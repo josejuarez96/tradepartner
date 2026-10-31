@@ -62,7 +62,7 @@ Storage options for raw archives and backups:
 We will hold every source to five rules, adopting them one source at a time:
 
 1. **Raw first.** A fetched response is kept before it is parsed, named by its content hash, with its URL and fetch time in the run row. Identical content (same hash) is not stored twice. **Nightly full snapshots are the exception:** `submissions.zip`, `companyfacts.zip` and quarterly `form.idx` are rebuilt by SEC in place. Until the owner chooses storage for them (question 2), these keep today's single latest copy. Weekly copies (the latest plus four, about 14 GB for the bulk zips) start only on an SSD, object storage or a paid tier, never on the laptop or the free tier. At about 2.8 GB per snapshot copy, keeping every night would pass 100 GB in about five weeks.
-2. **Parse only from kept raw, and record where each row came from.** Parsing is a pure function of the raw file. Each run row names the raw file hashes it parsed and the parser version, as `edgar_index_files` already does for index files. A stored row maps to its run through its `ingested_at`, which equals the run's start, so a re-derive can find the affected rows. Recording this per run, not per row, needs no new table column.
+2. **Parse only from kept raw, and record where each row came from.** Parsing is a pure function of the raw file. Each run row names the raw file hashes it parsed and the parser version, as `edgar_index_files` already does for index files. A stored row maps to its run by an `ingested_at` within the run's start and finish (some write paths stamp at commit, not at start). The re-derive's manifest names every row, and a row matching no run fails the dry run. Recording this per run, not per row, needs no new table column.
 3. **Two kinds of correction, never mixed:**
    - **(a) The source published a new value later**, as SEC does with `filed_on` (#2659). This is a new revision whose `known_at` is the run that first saw it. The old value stays visible as-of.
    - **(b) Our parser misread a payload that was already public.** The stored row was never true, so the re-derived row keeps its normal `known_at` (for example acceptance). It replaces the old row under a named release, with a reviewed manifest, stale trials and the open-window rule (spec #1682 item 7, the #1613 rule). A re-derive replaces only the hand-written repair command.
@@ -105,7 +105,7 @@ Volume:
   - Over time, a new source should need mainly a parser and a config entry.
 - **Bad / accepted risks.**
   - Migration effort, paid one source at a time.
-  - The snapshot copies (latest plus four weekly) take about 14 GB, which is why they are not kept nightly. Raw Form 4 adds about 1.6 GB a year before compression.
+  - If the owner chooses weekly snapshot copies, they take about 14 GB, which is why they are not kept nightly or by default. Raw Form 4 adds about 1.6 GB a year before compression.
   - Storage choice (c) above 15 GB, or (d), is running-system spend. That **amends ADR 0009's $0/month budget** and needs the owner's word. The free tier, or (a)/(b), keeps $0.
   - A never-true row parsed from a snapshot copy that has since rotated out cannot be re-derived; the re-derive fails loudly, and such a row still needs a hand-written repair.
   - Recording raw hashes in run rows is additive. It touches no fact-table schema under the ADR 0023 freeze.
