@@ -64,7 +64,7 @@ A claim that would change **the tool itself** (new data to ingest, a model's aut
 
 ### Registration defaults
 
-- **Liquidity floor (owner, 2026-10-30, [#836](https://github.com/josejuarez96/tradepartner/issues/836#issuecomment-6537997869), #2667):** every daily or weekly paper book's universe gets a median 20-day dollar-volume floor of **$200M**, frozen per registration. It is a default for new registrations, set in the registration's `[study]` keys (not in code); existing registrations are not changed retroactively.
+- **Liquidity floor (owner, 2026-10-30, [#836](https://github.com/josejuarez96/tradepartner/issues/836#issuecomment-6537997869), #2667):** every daily or weekly paper book's universe gets a floor of **$200M** on the median raw close x volume over the 20 sessions before `t` (as of `known_at` <= `t`), frozen per registration. "Daily or weekly" means cadence `daily` or `week_end`. It is a default for new registrations (it sets the default under [ADR 0023 D4](../decisions/0023-break-first-fast-books-paper-exam.md)'s universe rule), recorded in the registration, not in code; existing registrations are not changed retroactively. The universe config key that carries it does not exist yet and needs a plan task (open).
 
 ## Zones
 
