@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -21,7 +22,7 @@ from tradepartner.store.journal import (
     PaperRunRow,
     PositionDailyRow,
 )
-from tradepartner.store.schema import init_schema
+from tradepartner.store.schema import SchemaVersionError, init_schema
 
 SESSION = date(2026, 10, 14)
 PRIOR = date(2026, 10, 13)
@@ -312,6 +313,20 @@ def test_today_reads_ticker_sentences_from_the_journal(conn: duckdb.DuckDBPyConn
     assert result.buys.new_names == ()  # BBB was already held; CCC never filled
     assert result.digest == "Sold 1 name for $1,020, bought 1 for $1,000; 1 order did not fill"
     assert result.problems[0].symbol == "CCC"
+
+
+def test_today_on_read_only_version_37_store_raises_schema_error(tmp_path: Path) -> None:
+    path = tmp_path / "v37.duckdb"
+    with duckdb.connect(str(path)) as conn:
+        init_schema(conn)
+        for column in ("n_assets_intersected", "assets_intersection_skipped"):
+            conn.execute(f"ALTER TABLE paper_plans DROP COLUMN {column}")
+        conn.execute("UPDATE schema_version SET version = 37")
+    with (
+        duckdb.connect(str(path), read_only=True) as conn,
+        pytest.raises(SchemaVersionError, match="paper plans require schema version"),
+    ):
+        book_activity.today(conn, 1, SESSION, EVENING, limit=5)
 
 
 def test_new_name_is_one_with_no_position_before_the_session(
