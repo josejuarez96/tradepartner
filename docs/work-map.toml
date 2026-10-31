@@ -1653,8 +1653,8 @@ why = "As-of reason evidence and a frozen exit policy make future candidate test
 unblocks = ["task:T326", "task:T330"]
 
 [task.T326]
-what = "Add delisting reason evidence fields and as-of reads after schema versions 41 and 42."
-why = "An exit can only use the reason known at its trial cutoff."
+what = "Add separate delisting reason fact rows and as-of reads after schema versions 41 and 42; universe and execution reads remain blind."
+why = "An exit can only use evidence visible at its deciding read and registered cutoff under the approved timing rule."
 unblocks = ["task:T327", "task:T328"]
 
 [task.T327]
@@ -1663,13 +1663,13 @@ why = "Failure and merger exits need distinct, auditable evidence."
 unblocks = ["task:T329"]
 
 [task.T328]
-what = "Register a frozen failure-delisting return policy and sensitivity variants."
-why = "A last-close exit can overstate returns after a failed listing."
+what = "Register a frozen failure-delisting return policy, severe unknown-exit variant, and conditional reason/merger trial vintage."
+why = "A last-close exit can overstate returns after a failed listing, and backfilled evidence must stale affected trials."
 unblocks = ["task:T329"]
 
 [task.T329]
-what = "Feed cutoff-visible delisting reasons to backtests and report coverage in health."
-why = "Late reason evidence must not change an earlier trial."
+what = "Feed deciding-read-visible reasons and mergers only to backtest exit costs; report unknown coverage and withheld shocks."
+why = "Later evidence must not change an earlier exit under the approved timing rule."
 
 [task.T330]
 what = "Parse verified XBRL inputs for cash-based operating profitability as first-vintage statement facts."
