@@ -1650,7 +1650,7 @@ why = "The incremental and full builds must pick the same row whatever file they
 [issue.2670]
 what = "Amend the data-foundation direction for delisting reasons and returns and cash-based operating profitability inputs."
 why = "As-of reason evidence and a frozen exit policy make future candidate tests reviewable."
-unblocks = ["task:T326", "task:T330"]
+unblocks = ["task:T326"]
 
 [task.T326]
 what = "Add separate delisting reason fact rows and as-of reads after schema versions 41 and 42; universe and execution reads remain blind."
@@ -1671,14 +1671,7 @@ unblocks = ["task:T329"]
 what = "Feed deciding-read-visible reasons and mergers only to backtest exit costs; report unknown coverage and withheld shocks."
 why = "Later evidence must not change an earlier exit under the approved timing rule."
 
-[task.T330]
-what = "Parse verified XBRL inputs for cash-based operating profitability as first-vintage statement facts."
-why = "The cash-based operating profitability test needs as-filed flows and working-capital balances."
-unblocks = ["task:T331"]
 
-[task.T331]
-what = "Compute aligned cash-based operating profitability with coverage checks."
-why = "Missing or mismatched accounting components must be visible before any signal test."
 
 [research.2026-10-30-equity-issuance-desk-read]
 what = "Read the composite and one-year share-issuance Chen-Zimmermann legs against a prewritten cost and strength line."
@@ -1692,5 +1685,5 @@ unblocks = ["issue:2673"]
 
 [research.2026-10-31-cash-op-profitability-desk-read]
 what = "Read cash-based operating profitability in both Chen-Zimmermann portfolio files against a frozen cost and leg line."
-why = "The weak short leg retires this candidate; T330 and T331 must not be built for it, pending the owner's strike-or-park decision on #2677."
+why = "The weak short leg retires this candidate; T330 and T331 must not be built for it, struck by the owner on 2026-10-31 (#2677)."
 unblocks = ["issue:2675"]
