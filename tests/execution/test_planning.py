@@ -1359,6 +1359,11 @@ def _rows_digest(conn: duckdb.DuckDBPyConnection, table: str) -> tuple[int, str]
     cursor = conn.execute(f"SELECT * FROM {table} ORDER BY ALL")
     columns = [d[0] for d in cursor.description]
     rows = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+    if table == "paper_plans":
+        # This T165 pin predates T242; its two T241 columns were still NULL.
+        for row in rows:
+            row["n_assets_intersected"] = None
+            row["assets_intersection_skipped"] = None
     payload = json.dumps(rows, sort_keys=True, default=str)
     return len(rows), hashlib.sha256(payload.encode()).hexdigest()
 
@@ -1371,6 +1376,11 @@ def test_h1_paper_plan_rows_are_pinned(fixture_store_path: Path, tmp_path: Path)
         assert TURNOVER_KEY not in stored
         outcome = env.plan()
         assert outcome.status == "planned"
+        assert env.window.window_id is not None
+        assert [
+            (row.n_assets_intersected, row.assets_intersection_skipped)
+            for row in journal.plans_for(env.conn, env.window.window_id)
+        ] == [(0, False)]
         digests = {t: _rows_digest(env.conn, t) for t in ("signals", "decisions", "paper_plans")}
     assert digests == H1_PAPER_ROWS
 

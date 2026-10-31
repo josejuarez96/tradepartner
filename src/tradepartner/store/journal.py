@@ -74,6 +74,7 @@ import duckdb
 
 from tradepartner.store.db import ensure_tz_aware, insert_row
 from tradepartner.store.schema import (
+    _PRE_ASSETS_INTERSECTION_VERSION,
     _PRE_BREAKS_VERSION,
     CLOSING_BREAK_EVENTS,
     DEFAULT_BOOK_ID,
@@ -1601,7 +1602,13 @@ def rebalance_events_for(
 
 
 def plans_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[PaperPlanRow]:
-    """The window's `paper_plans` rows (through their run)."""
+    """The window's `paper_plans` rows (through their run), from version 38 on."""
+    (version,) = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()  # type: ignore[misc]
+    if version is None or version <= _PRE_ASSETS_INTERSECTION_VERSION:
+        raise SchemaVersionError(
+            "paper plans require schema version 38; open the store for writing "
+            "once with a command that migrates it (for example `ingest`)"
+        )
     return _select(conn, PaperPlanRow, _RUN_IN_WINDOW, [window_id])
 
 
