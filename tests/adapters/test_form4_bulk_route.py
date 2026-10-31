@@ -131,6 +131,39 @@ def test_multi_owner_route_and_order_sample_switch(tmp_path: Path, multi_owner_x
         assert result.counts["sec_forms_bulk_multi_owner_xml"] == 0
 
 
+def test_duplicate_owner_cik_is_one_distinct_owner(tmp_path: Path) -> None:
+    bulk = _bulk(tmp_path)
+    accession = "0001577526-26-000036"
+    facts = bulk.accessions[accession]
+    bulk.accessions[accession] = replace(facts, filer_ciks=(facts.filer_ciks[0],) * 2)
+    accepted = datetime(2026, 4, 1, tzinfo=UTC)
+    bulk_writes: list[str] = []
+    result = run_form4_bulk_route(
+        [(accession, facts.issuer_cik, "4", date(2026, 3, 31))],
+        quarters={Quarter(2026, 1): bulk},
+        stamp=lambda *_: accepted,
+        xml=lambda *_: SecFormFiling(
+            accession,
+            "4",
+            accepted,
+            date(2026, 3, 31),
+            (facts.issuer_cik,),
+            facts.filer_ciks,
+            facts.transactions,
+        ),
+        write=lambda *_: pytest.fail("duplicate owner CIK was routed to XML"),
+        write_bulk=lambda filing, _quarter: bulk_writes.append(filing.accession),
+        now=accepted,
+        price_below=1,
+        zero_price_codes=("P", "S"),
+        order_sample_size=1,
+        budget=10,
+        multi_owner_xml=True,
+    )
+    assert bulk_writes == [accession]
+    assert result.counts["sec_forms_bulk_multi_owner_xml"] == 0
+
+
 def test_multi_owner_swap_does_not_fail_quarter_order_sample(tmp_path: Path) -> None:
     bulk = _bulk(tmp_path)
     multi = "0001213900-26-037435"

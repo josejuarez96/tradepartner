@@ -252,7 +252,7 @@ def run_form4_bulk_route(
                 and bulk.accessions[accession].issuer_cik == cik
                 and not bulk.accessions[accession].identity_bad
                 and not bulk.accessions[accession].order_bad
-                and (not multi_owner_xml or len(bulk.accessions[accession].filer_ciks) == 1)
+                and (not multi_owner_xml or len(set(bulk.accessions[accession].filer_ciks)) == 1)
             }
             sample = order_sample(candidates, order_sample_size)
             if not sample:
@@ -304,7 +304,7 @@ def run_form4_bulk_route(
                 if (
                     multi_owner_xml
                     and accession_bulk is not None
-                    and len(accession_bulk.filer_ciks) > 1
+                    and len(set(accession_bulk.filer_ciks)) > 1
                 )
                 else AccessionRoute(Route.XML, IDENTITY_BAD)
                 if accession_bulk is not None and accession_bulk.issuer_cik != cik

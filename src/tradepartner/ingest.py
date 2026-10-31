@@ -1658,6 +1658,7 @@ def _write_form4_bulk(
     selected: dict[str, list[Form4IndexRow]] = {}
     queued_by_quarter: dict[Quarter, list[Form4IndexRow]] = {}
     skip: set[str] = set()
+    multi_owner_stored: Counter[Quarter] = Counter()
     stamp_work: list[Form4IndexRow] = []
     cross_route_disagree = samples = xml_expected = 0
     for quarter in sorted(filing_quarters):
@@ -1715,19 +1716,21 @@ def _write_form4_bulk(
                     if not rows_agree(accession_bulk.transactions, xml_rows):
                         cross_route_disagree += 1
                 skip.add(accession)
-            elif stored_source == "sec_insider_bulk" and (
-                (
+            elif stored_source == "sec_insider_bulk":
+                stored_multi_owner = (
                     settings.events.form4_multi_owner_xml
                     and quarter_bulk is not None
                     and (record := quarter_bulk.accessions.get(accession)) is not None
-                    and len(record.filer_ciks) > 1
+                    and len(set(record.filer_ciks)) > 1
                 )
-                or (
+                if stored_multi_owner:
+                    # #2720 releases stored bulk roles after the owner reviews them.
+                    multi_owner_stored[quarter] += 1
+                if stored_multi_owner or (
                     digests.get(quarter) is not None
                     and completed.get(f"{quarter.year}q{quarter.number}") == digests[quarter]
-                )
-            ):
-                skip.add(accession)
+                ):
+                    skip.add(accession)
         pending = [row for row in queued_by_quarter[quarter] if row[0] not in skip]
         state = quarter_state(quarter, downloaded=quarter_bulk is not None, run_date=now.date())
         if quarter not in unreadable and state is not QuarterState.MISSING:
@@ -1745,7 +1748,7 @@ def _write_form4_bulk(
                 and not quarter_bulk.accessions[accession].order_bad
                 and (
                     not settings.events.form4_multi_owner_xml
-                    or len(quarter_bulk.accessions[accession].filer_ciks) == 1
+                    or len(set(quarter_bulk.accessions[accession].filer_ciks)) == 1
                 )
                 and len(quarter_bulk.accessions[accession].rows) >= 2
             )
@@ -1758,7 +1761,7 @@ def _write_form4_bulk(
                 if (
                     settings.events.form4_multi_owner_xml
                     and candidate is not None
-                    and len(candidate.filer_ciks) > 1
+                    and len(set(candidate.filer_ciks)) > 1
                 ) or route_accession(
                     candidate,
                     state=state,
@@ -1798,7 +1801,9 @@ def _write_form4_bulk(
     if plan.refused:
         return (
             0,
-            f"Form 4 bulk: {len(selected)} selected; {plan.message()}; sec_forms_budget_refused: 1",
+            f"Form 4 bulk: {len(selected)} selected; {plan.message()}; "
+            f"sec_forms_budget_refused: 1; "
+            f"sec_forms_bulk_multi_owner_stored: {sum(multi_owner_stored.values())}",
         )
 
     added = 0
@@ -1856,6 +1861,7 @@ def _write_form4_bulk(
         edgar_raw.write_atomic(order_check_path(settings, quarter, digests[quarter]), b"passed")
 
     counts: Counter[str] = Counter(load_counts)
+    counts["sec_forms_bulk_multi_owner_stored"] = sum(multi_owner_stored.values())
     remaining = 0
     checked_digests = completed.copy()
     route_quarters = sorted(queued_by_quarter)
@@ -1946,7 +1952,8 @@ def _write_form4_bulk(
             f"zip_sha256={digest}; checked_sha256={checked_digests.get(label, 'none')}; "
             f"selected={selected_count}; "
             f"rows_added={quarter_added[quarter]}; rows_changed={quarter_changed[quarter]}; "
-            f"remaining={remaining}"
+            f"remaining={remaining}; "
+            f"sec_forms_bulk_multi_owner_stored={multi_owner_stored[quarter]}"
         )
         _write_run(
             conn,
