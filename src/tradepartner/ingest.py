@@ -1883,7 +1883,12 @@ def _write_form4_bulk(
         del quarter_bulk  # released before the next quarter is read
         counts.update(result.counts)
         remaining += result.remaining
-        if not result.counts.get("sec_forms_budget_stopped") and quarter not in unreadable:
+        # Only a quarter the route fully walked has been checked against this zip.
+        if (
+            not result.counts.get("sec_forms_budget_stopped")
+            and not result.counts.get("sec_forms_bulk_order_mismatch")
+            and quarter not in unreadable
+        ):
             digest = digests.get(quarter)
             if digest is not None:
                 checked_digests[f"{quarter.year}q{quarter.number}"] = digest

@@ -7547,6 +7547,57 @@ def test_form4_bulk_unreached_quarter_keeps_previous_checked_digest(
     assert later.accession not in routed[1][1]
 
 
+def test_form4_bulk_order_mismatch_quarter_keeps_previous_checked_digest(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2685: a quarter the route skipped on an order mismatch was not checked."""
+    from tradepartner.adapters.form4_route import Quarter
+
+    now = datetime(2026, 7, 2, tzinfo=UTC)
+    enabled = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(enabled, client=httpx.Client(), clock=lambda: now)
+    filing = UnstampedFiling(ACME, "ACME", "4", "0001577526-26-000038", date(2026, 4, 1))
+    monkeypatch.setattr(source, "_rows", lambda *_: iter([((2026, 2), filing)]))
+    monkeypatch.setattr(source, "_load_stamps", lambda *_: {})
+    ingest_module.write_sec_form_accession(
+        fixture_store,
+        SecFormFiling(filing.accession, "4", now, filing.filed_on, (ACME,), (ACME,), ()),
+        ingested_at=now,
+        source="sec_insider_bulk",
+    )
+    fixture_store.execute(
+        "INSERT INTO ingestion_runs "
+        "(run_id, started_at, finished_at, status, source, mode, rows_added, "
+        "chunk_cursor, message) "
+        "VALUES ('older', ?, ?, 'ok', 'sec_insider_bulk', 'backfill', 0, '2026q2', ?)",
+        [now - timedelta(days=1), now - timedelta(days=1), f"zip_sha256={'a' * 64}"],
+    )
+
+    def load(quarters: Iterable[Quarter], **_kwargs: Any) -> Any:
+        quarter = next(iter(quarters))
+        return {quarter: InsiderBulk({})}, {quarter: "b" * 64}, Counter(), frozenset()
+
+    monkeypatch.setattr(ingest_module, "load_bulk_quarters", load)
+    monkeypatch.setattr(
+        ingest_module,
+        "run_form4_bulk_route",
+        lambda rows, **_kwargs: BulkRouteResult(
+            Counter({"sec_forms_bulk_order_mismatch": 1}), 0, len(list(rows))
+        ),
+    )
+    ingest_module._write_form4_bulk(fixture_store, enabled, source, frozenset({ACME}), now)
+    message = fixture_store.execute(
+        "SELECT message FROM ingestion_runs WHERE source='sec_insider_bulk' "
+        "AND chunk_cursor='2026q2' ORDER BY finished_at DESC LIMIT 1"
+    ).fetchone()[0]
+    assert f"zip_sha256={'b' * 64}" in message
+    assert f"checked_sha256={'a' * 64}" in message
+
+
 def test_form4_bulk_cross_route_comparison_never_rewrites_xml(
     fixture_store: duckdb.DuckDBPyConnection,
     settings: Settings,
