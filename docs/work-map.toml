@@ -1649,5 +1649,5 @@ why = "The incremental and full builds must pick the same row whatever file they
 
 [research.2026-10-30-equity-issuance-desk-read]
 what = "Read the composite and one-year share-issuance Chen-Zimmermann legs against a prewritten cost and strength line."
-why = "It retires the weak composite line and identifies whether share issuance merits a registered test (#2669)."
+why = "It retires the issuance line at the desk read: CompEquIss, ShareIss1Y and NetEquityFinance fail; Q1 is killed (#2669)."
 unblocks = ["issue:2669"]
