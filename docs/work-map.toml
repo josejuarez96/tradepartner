@@ -1646,3 +1646,45 @@ why = "The nightly EDGAR run drops from about 2 hours and 4 GB to minutes and fl
 [task.T325]
 what = "Conditional: an order-free rule for which index row of an accession the 13D and delisting paths take, built only if the probe finds daily and quarterly files order rows differently."
 why = "The incremental and full builds must pick the same row whatever file they read it from (#2629, owner decision 4)."
+
+[issue.2670]
+what = "Amend the data-foundation direction for delisting reasons and returns, named XBRL candidates, and survivor listing history."
+why = "Point-in-time inputs and a frozen exit policy make future candidate tests and historical comparisons reviewable."
+unblocks = ["task:T326", "task:T330", "task:T332"]
+
+[task.T326]
+what = "Add delisting reason evidence fields and as-of reads after schema versions 41 and 42."
+why = "An exit can only use the reason known at its trial cutoff."
+unblocks = ["task:T327", "task:T328", "task:T332"]
+
+[task.T327]
+what = "Classify delisting reasons from Form 25 and matched 8-K item evidence."
+why = "Failure and merger exits need distinct, auditable evidence."
+unblocks = ["task:T329"]
+
+[task.T328]
+what = "Register a frozen failure-delisting return policy and sensitivity variants."
+why = "A last-close exit can overstate returns after a failed listing."
+unblocks = ["task:T329"]
+
+[task.T329]
+what = "Feed cutoff-visible delisting reasons to backtests and report coverage in health."
+why = "Late reason evidence must not change an earlier trial."
+
+[task.T330]
+what = "Parse only the named candidates' verified XBRL concepts as first-vintage statement inputs."
+why = "The candidate tests need as-filed accounting values without broad extraction."
+unblocks = ["task:T331"]
+
+[task.T331]
+what = "Compute aligned cash-based operating profitability and financing candidates with coverage checks."
+why = "Missing or mismatched accounting components must be visible before any signal test."
+
+[task.T332]
+what = "Identify continuous pre-2019 survivor bars and store listing provenance with an ingest-time stamp."
+why = "Earlier bars can extend a listing only after their identity evidence is ingested."
+unblocks = ["task:T333"]
+
+[task.T333]
+what = "Apply eligible survivor listings in a named release and show rejects and the historical as-of limit."
+why = "A backdated valid span must be traceable without changing past as-of membership."
