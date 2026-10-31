@@ -153,7 +153,7 @@ def test_update_count_mismatch_rolls_back(
             yield Connection(conn)
 
     monkeypatch.setattr(roles_module, "open_for_write", wrong_count_open)
-    with pytest.raises(RuntimeError, match="rolled back"):
+    with pytest.raises(RoleRepairRefused, match="rolled back"):
         repair_form4_roles(settings, manifest, "roles-2691", 1, clock=lambda: NOW)
     assert _row(settings) == (False, False, False, False, OLD, OLD, OLD)
     assert _runs(settings) == []

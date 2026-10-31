@@ -209,7 +209,7 @@ def repair_form4_roles(
                 [at],
             ).fetchone()
             if updated is None or int(updated[0]) != len(changes):
-                raise RuntimeError(
+                raise RoleRepairRefused(
                     f"form4 roles updated {updated} rows where it counted {len(changes)}; "
                     "rolled back"
                 )
@@ -217,5 +217,12 @@ def repair_form4_roles(
             run = SourceRun(
                 "edgar", REPAIRED, 0, "", f"form4 roles: {len(changes)} rows; release {release}"
             )
-            _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
+            _write_run(
+                conn,
+                uuid.uuid4().hex,
+                started,
+                ensure_tz_aware_utc(clock(), field_name="finished_at"),
+                run,
+                REPAIR,
+            )
         return len(changes)
