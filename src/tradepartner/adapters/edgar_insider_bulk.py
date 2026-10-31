@@ -210,6 +210,22 @@ def _cik_or_none(raw: str) -> str | None:
         return None
 
 
+def _unquoted(raw: str) -> str:
+    """A cell in the data set's CSV quoting as its plain text (#2706).
+
+    The SEC writes a value holding a `"` wrapped in quotes with each inner quote
+    doubled, `"Common Stock (""Shares"")"`, though the table is tab-separated; the XML
+    holds `Common Stock ("Shares")`. A value not in that form (no wrapping, or a lone
+    inner quote) is returned stripped and otherwise as read."""
+    text = raw.strip()
+    if len(text) < 2 or text[0] != '"' or text[-1] != '"':
+        return text
+    inner = text[1:-1]
+    if '"' in inner.replace('""', ""):
+        return text
+    return inner.replace('""', '"')
+
+
 _ROLE_TOKEN = re.compile(r"tenpercentowner|director|officer|other")
 
 
@@ -256,7 +272,7 @@ def _row_fields(row: dict[str, str]) -> dict[str, Any] | None:
             "price": _xml_decimal(price_text) if price_text else None,
             "shares_owned_after": _xml_decimal(owned_text) if owned_text else None,
             "ownership_form": ownership,
-            "security_title": row["SECURITY_TITLE"].strip(),
+            "security_title": _unquoted(row["SECURITY_TITLE"]),
         }
     except (_BadField, InvalidOperation, ValueError):
         return None
