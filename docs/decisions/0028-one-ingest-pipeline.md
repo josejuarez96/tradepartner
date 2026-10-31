@@ -53,7 +53,7 @@ Each format's parser is unavoidable. The question is what around it can be stand
 
 Storage options for raw archives and backups:
 - **(a) Laptop disk:** $0, but it is the scarce resource.
-- **(b) External SSD:** about $60 once, but a second device, and unusable for the live store.
+- **(b) External SSD:** about $60 once (whether a one-off hardware buy counts under ADR 0009's running-system budget is the owner's call), but a second device, and unusable for the live store.
 - **(c) Google Drive for desktop, streaming mode:** the free 15 GB tier fits the first step; above that, about $2/month. It brings sync caveats (below).
 - **(d) A scriptable object store (Backblaze B2, S3):** about $6 per TB per month and easy to script, but a new account and more setup.
 
@@ -61,8 +61,8 @@ Storage options for raw archives and backups:
 
 We will hold every source to five rules, adopting them one source at a time:
 
-1. **Raw first.** A fetched response is kept before it is parsed, named by its content hash, with its URL and fetch time in the run row. Identical content (same hash) is not stored twice. **Nightly full snapshots are the exception:** `submissions.zip`, `companyfacts.zip` and quarterly `form.idx` are rebuilt by SEC in place. We keep the latest copy plus the last four weekly copies, not every night: about 14 GB for the bulk zips. At about 2.8 GB per snapshot copy, keeping every night would pass 100 GB in about five weeks.
-2. **Parse only from kept raw, and record where each row came from.** Parsing is a pure function of the raw file. Each run row names the raw file hashes it parsed and the parser version, as `edgar_index_files` already does for index files. Recording this per run, not per row, needs no new table column.
+1. **Raw first.** A fetched response is kept before it is parsed, named by its content hash, with its URL and fetch time in the run row. Identical content (same hash) is not stored twice. **Nightly full snapshots are the exception:** `submissions.zip`, `companyfacts.zip` and quarterly `form.idx` are rebuilt by SEC in place. Until the owner chooses storage for them (question 2), these keep today's single latest copy. Weekly copies (the latest plus four, about 14 GB for the bulk zips) start only on an SSD, object storage or a paid tier, never on the laptop or the free tier. At about 2.8 GB per snapshot copy, keeping every night would pass 100 GB in about five weeks.
+2. **Parse only from kept raw, and record where each row came from.** Parsing is a pure function of the raw file. Each run row names the raw file hashes it parsed and the parser version, as `edgar_index_files` already does for index files. A stored row maps to its run through its `ingested_at`, which equals the run's start, so a re-derive can find the affected rows. Recording this per run, not per row, needs no new table column.
 3. **Two kinds of correction, never mixed:**
    - **(a) The source published a new value later**, as SEC does with `filed_on` (#2659). This is a new revision whose `known_at` is the run that first saw it. The old value stays visible as-of.
    - **(b) Our parser misread a payload that was already public.** The stored row was never true, so the re-derived row keeps its normal `known_at` (for example acceptance). It replaces the old row under a named release, with a reviewed manifest, stale trials and the open-window rule (spec #1682 item 7, the #1613 rule). A re-derive replaces only the hand-written repair command.
@@ -70,12 +70,12 @@ We will hold every source to five rules, adopting them one source at a time:
 4. **One change check per source.** A recorded fingerprint or cursor (ETag, zip hash, last accession, daily-file date) decides what is new. The aim is that a rerun costs only new work.
 5. **A declared source-comparison rule.** When two sources carry the same fact, a per-source config entry names, for each field, which source is trusted and which differences are tolerated. Disagreeing rows are recorded and counted. A per-source threshold share of disagreeing rows fails the run, and `health` names it. This replaces the current all-or-nothing order sample, which failed whole quarters.
 
-**Look-ahead guard.** Only ingest and re-derive open the raw archive. No backtest, universe, signal or research read opens it, enforced by a source scan as for `index_members.csv`. A re-derive reads only the raw files its run rows name, by hash. A snapshot-sourced row re-derived from a later fetch keeps `known_at` no earlier than that fetch's time.
+**Look-ahead guard.** Only ingest and re-derive open the raw archive. No backtest, universe, signal or research read opens it, enforced by a source scan as for `index_members.csv`. A re-derive reads only the raw files its run rows name, by hash. A later fetch is a new run with its own run row; a row it produces keeps `known_at` no earlier than that fetch's time.
 
 **Storage.** The live store never lives on a synced or external disk, because an interrupted write by an unattended run could corrupt it. Sharadar data is never copied off the laptop. If the owner chooses (c) or (d) for the archive:
 - **Integrity.** Raw files are content-addressed, so a sync conflict copy ("name (1)") is never matched. Every read re-checks the hash and refuses on a mismatch.
 - **Offline.** The daily ingest never reads the archive. A re-derive whose raw file is unavailable fails loudly. It never falls back to a fresh SEC fetch, which would be later, different content.
-- **Disk.** Drive for desktop keeps a local cache on the boot disk. A re-derive checks the 10 GB floor first, and the Drive cache is capped.
+- **Disk.** Drive for desktop keeps a local cache on the boot disk and may offer no size cap, so a re-derive checks the 10 GB floor before it starts and stops if it falls below.
 - **Upload.** Raw files are written locally, verified by hash once uploaded, and only then removed locally.
 - **Backups.** A backup is written outside the synced folder as a consistent snapshot, then moved in, so a half-written file is never uploaded. Backups hold broker order and account rows. Off the laptop they are encrypted before upload; this is the owner's call (question 4).
 - **Paths.** The Drive path (`~/Library/CloudStorage/GoogleDrive-<account>`) contains the account email, so it lives in `.env` or local config, never in a committed default.
@@ -90,7 +90,7 @@ Volume:
 - A back-fetch of all ~4.8 million historical Form 4 filings is about 29 GB raw and about a week at SEC's rate limit. It is **not** part of this step: we keep what we fetch from now on.
 - Daily index files are about 1 MB a day.
 
-**How this meets T317–T324.** T317–T324 ship as planned, with three edits:
+**How this meets T317–T324.** T317–T324 ship as planned, with these edits:
 - **T319a** keeps a differing quarterly `form.idx` under rule 1's snapshot exception instead of overwriting it.
 - **The daily index files are kept raw.** This gives #2709's rebuild its source for corrected `filed_on`.
 - **No parser-version column lands in T318.** It goes in the run row.
@@ -107,6 +107,7 @@ Volume:
   - Migration effort, paid one source at a time.
   - The snapshot copies (latest plus four weekly) take about 14 GB, which is why they are not kept nightly. Raw Form 4 adds about 1.6 GB a year before compression.
   - Storage choice (c) above 15 GB, or (d), is running-system spend. That **amends ADR 0009's $0/month budget** and needs the owner's word. The free tier, or (a)/(b), keeps $0.
+  - A never-true row parsed from a snapshot copy that has since rotated out cannot be re-derived; the re-derive fails loudly, and such a row still needs a hand-written repair.
   - Recording raw hashes in run rows is additive. It touches no fact-table schema under the ADR 0023 freeze.
   - Bars and corporate actions come from Alpaca. Its data terms are checked before that source adopts rule 1. The archive is not a cache of public data for every source.
 - **Reversibility.** Cheap. The archive location is one config path, and sources not yet adopted are unaffected.
