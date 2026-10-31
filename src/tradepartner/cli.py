@@ -494,6 +494,7 @@ from tradepartner.ingest import (
     manifest_release,
     rates_seeded,
     read_manifest,
+    show_ingest_progress,
 )
 from tradepartner.repair import (
     HeaderLookup,
@@ -2739,6 +2740,7 @@ def make_app(
             event_forms=s.edgar.event_forms,
         )
         if sec_forms_only:
+            show_ingest_progress()
             result = ingest_sec_forms(s, filings, clock=clock)
             _print_result(result)
             raise typer.Exit(result.exit_code)

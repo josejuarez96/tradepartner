@@ -207,6 +207,7 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import logging
 import re
 import time
 import traceback
@@ -345,6 +346,17 @@ from tradepartner.store.retraction import record_underived, split_kept, stored_u
 from tradepartner.store.schema import atomic, init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT, member_links_title
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def show_ingest_progress() -> None:
+    """Print this module's progress messages (the Form 4 bulk route's, #2681) to stderr."""
+    if not _LOGGER.handlers:
+        _LOGGER.addHandler(logging.StreamHandler())
+    _LOGGER.setLevel(logging.INFO)
+    _LOGGER.propagate = False
+
 
 OK, STALE, FAILED, LOCKED = "ok", "stale", "failed", "locked"
 ACTIONS_FILLED = "filled"
@@ -1545,6 +1557,24 @@ def write_sec_form_accession(
     return SecFormWrite(added=len(event_rows) + len(transaction_rows))
 
 
+def _stored_xml_form4_transactions(
+    conn: duckdb.DuckDBPyConnection, accessions: set[str]
+) -> dict[str, tuple[Form4Transaction, ...]]:
+    """Read the stored XML accessions' transaction rows in one table pass."""
+    if not accessions:
+        return {}
+    columns = ", ".join(item.name for item in fields(Form4Transaction))
+    rows = conn.execute(
+        f"SELECT accession, {columns} FROM sec_form4_transactions "
+        "WHERE accession IN (SELECT UNNEST(?))",
+        [sorted(accessions)],
+    ).fetchall()
+    grouped: dict[str, list[Form4Transaction]] = defaultdict(list)
+    for accession, *values in rows:
+        grouped[accession].append(Form4Transaction(*values))
+    return {accession: tuple(items) for accession, items in grouped.items()}
+
+
 def _write_form4_bulk(
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
@@ -1593,6 +1623,12 @@ def _write_form4_bulk(
         accession_quarters[accession] = quarter
         by_quarter[quarter][accession] = rows
     filing_quarters = set(by_quarter)
+    started = time.monotonic()
+    _LOGGER.info(
+        "Form 4 bulk planning: %d candidates across %d quarters",
+        len(candidates),
+        len(filing_quarters),
+    )
     stored = {
         accession: stored_source
         for accession, stored_source in conn.execute(
@@ -1617,7 +1653,6 @@ def _write_form4_bulk(
     skip: set[str] = set()
     stamp_work: list[Form4IndexRow] = []
     cross_route_disagree = samples = xml_expected = 0
-    columns = ", ".join(item.name for item in fields(Form4Transaction))
     for quarter in sorted(filing_quarters):
         loaded, quarter_digests, quarter_counts, bad = load_bulk_quarters(
             {quarter}, settings=settings, client=source._client
@@ -1647,6 +1682,17 @@ def _write_form4_bulk(
                 selected[accession] = rows
             chosen.append(accession)
         queued_by_quarter[quarter] = [row for accession in chosen for row in selected[accession]]
+        # One read per quarter, freed with the quarter (#2681), not one per accession.
+        xml_saved = _stored_xml_form4_transactions(
+            conn,
+            {
+                accession
+                for accession in chosen
+                if stored.get(accession) == "sec_form4_xml"
+                and quarter_bulk is not None
+                and accession in quarter_bulk.accessions
+            },
+        )
         for accession in chosen:
             stored_source = stored.get(accession)
             if stored_source == "sec_form4_xml":
@@ -1658,11 +1704,7 @@ def _write_form4_bulk(
                     and not accession_bulk.identity_bad
                     and not accession_bulk.order_bad
                 ):
-                    saved = conn.execute(
-                        f"SELECT {columns} FROM sec_form4_transactions WHERE accession = ?",
-                        [accession],
-                    ).fetchall()
-                    xml_rows = tuple(Form4Transaction(*values) for values in saved)
+                    xml_rows = xml_saved.get(accession, ())
                     if not rows_agree(accession_bulk.transactions, xml_rows):
                         cross_route_disagree += 1
                 skip.add(accession)
@@ -1705,7 +1747,15 @@ def _write_form4_bulk(
                     is Route.XML
                 ):
                     xml_expected += 1
-        del loaded, quarter_bulk  # released before the next quarter is read
+        del loaded, quarter_bulk, xml_saved  # released before the next quarter is read
+        _LOGGER.info(
+            "Form 4 bulk planned %dq%d: %d accessions queued, %d skipped; %.1fs elapsed",
+            quarter.year,
+            quarter.number,
+            len(chosen),
+            sum(accession in skip for accession in chosen),
+            time.monotonic() - started,
+        )
     first_pages = {cik for _accession, cik, _form, _filed in stamp_work}
     by_cik: dict[str, list[str]] = defaultdict(list)
     for accession, cik, _form, _filed in stamp_work:
@@ -1825,6 +1875,17 @@ def _write_form4_bulk(
         del quarter_bulk  # released before the next quarter is read
         counts.update(result.counts)
         remaining += result.remaining
+        _LOGGER.info(
+            "Form 4 bulk routed %dq%d: %d queued, %d added, %d remaining, "
+            "%d requests; %.1fs elapsed",
+            quarter.year,
+            quarter.number,
+            len(rows),
+            quarter_added[quarter],
+            result.remaining,
+            source.requests,
+            time.monotonic() - started,
+        )
         if result.counts.get("sec_forms_budget_stopped"):
             remaining += len(
                 {
