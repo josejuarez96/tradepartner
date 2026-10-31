@@ -1684,3 +1684,8 @@ why = "Missing or mismatched accounting components must be visible before any si
 what = "Read the composite and one-year share-issuance Chen-Zimmermann legs against a prewritten cost and strength line."
 why = "It retires the issuance line at the desk read: CompEquIss, ShareIss1Y and NetEquityFinance fail; Q1 is killed (#2669)."
 unblocks = ["issue:2669"]
+
+[research.2026-10-31-cash-op-profitability-desk-read]
+what = "Read cash-based operating profitability in both Chen-Zimmermann portfolio files against a frozen cost and leg line."
+why = "The weak short leg retires this candidate; T330 and T331 must not be built for it, pending the owner's strike-or-park decision on #2677."
+unblocks = ["issue:2675"]
