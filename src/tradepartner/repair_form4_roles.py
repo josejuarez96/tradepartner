@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 import zipfile
 from collections.abc import Callable, Iterable
 from datetime import datetime
@@ -17,7 +18,8 @@ from tradepartner.adapters.edgar_insider_bulk import (
     _table,
 )
 from tradepartner.config import Settings
-from tradepartner.repair import release_refusal
+from tradepartner.ingest import SourceRun, _write_run
+from tradepartner.repair import REPAIR, REPAIRED, release_refusal
 from tradepartner.store.db import open_for_write, open_read_only, utc_now
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -67,6 +69,7 @@ def build_manifest(settings: Settings, zips: Iterable[Path], output: Path) -> in
     if not found_zip:
         raise RoleRepairRefused("no cached insider zips found")
     rows: list[dict[str, Any]] = []
+    unmatched = 0
     with open_read_only(settings) as conn:
         cursor = conn.execute(
             "SELECT accession, filer_cik, line_no, is_director, is_officer, "
@@ -77,6 +80,7 @@ def build_manifest(settings: Settings, zips: Iterable[Path], output: Path) -> in
             for accession, filer, line, *stored in batch:
                 source = owners.get((accession, filer))
                 if source is None:
+                    unmatched += 1
                     continue
                 zip_name, sha, raw = source
                 new = _relationship(raw)
@@ -96,6 +100,10 @@ def build_manifest(settings: Settings, zips: Iterable[Path], output: Path) -> in
                     )
                 elif tuple(stored) != new and tuple(stored) != old:
                     raise RoleRepairRefused(f"stale stored flags for {(accession, filer, line)}")
+    if unmatched:
+        raise RoleRepairRefused(
+            f"{unmatched} bulk rows have no cached owner match; manifest not written"
+        )
     rows.sort(key=lambda row: row["key"])
     output.write_text(json.dumps({"version": 1, "rows": rows}, indent=2) + "\n")
     return len(rows)
@@ -150,6 +158,7 @@ def repair_form4_roles(
             if isinstance(exc, RoleRepairRefused):
                 raise
             raise RoleRepairRefused(f"invalid manifest entry: {exc}") from exc
+    started = ensure_tz_aware_utc(clock(), field_name="clock") if not dry_run else None
     context = open_read_only(settings) if dry_run else open_for_write(settings)
     with context as conn:
         refusal = release_refusal(conn, release)
@@ -189,7 +198,7 @@ def repair_form4_roles(
                 "INSERT INTO _form4_role_changes VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [[*key, *flags] for flags, key in changes],
             )
-            conn.execute(
+            updated = conn.execute(
                 "UPDATE sec_form4_transactions AS stored SET "
                 "is_director = changed.is_director, is_officer = changed.is_officer, "
                 "is_ten_percent_owner = changed.is_ten_percent_owner, "
@@ -198,5 +207,15 @@ def repair_form4_roles(
                 "WHERE stored.accession = changed.accession "
                 "AND stored.filer_cik = changed.filer_cik AND stored.line_no = changed.line_no",
                 [at],
+            ).fetchone()
+            if updated is None or int(updated[0]) != len(changes):
+                raise RuntimeError(
+                    f"form4 roles updated {updated} rows where it counted {len(changes)}; "
+                    "rolled back"
+                )
+            assert started is not None
+            run = SourceRun(
+                "edgar", REPAIRED, 0, "", f"form4 roles: {len(changes)} rows; release {release}"
             )
+            _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
         return len(changes)
