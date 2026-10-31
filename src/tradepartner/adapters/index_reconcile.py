@@ -147,17 +147,28 @@ def reconcile_quarter(
     `stored` is the latest revision of every `(cik, accession)` the table holds that the
     file lists or whose `filed_on` is in `quarter`. `listed_on` is `quarterly_listed_on`
     of the file's Last-Modified. `kept_forms` are the 25 and `events.sec_forms` forms.
+
+    The driver builds `stored` after it has applied the run's daily revisions. A stored
+    row whose latest `filed_on` is in this quarter but that the file no longer lists (a
+    correction that moved it out, not yet revised in the table) is counted absent and
+    kept, a count only.
     """
     by_key = {(row.cik, row.accession): row for row in stored}
     rows, conflicting = _dedupe(file_rows)
     issuers = frozenset(issuer_ciks)
+    issuer_form_set = frozenset(issuer_forms)
     new_issuers = {
-        row.cik for row in rows if row.cik not in issuers and row.form in set(issuer_forms)
+        row.cik for row in rows if row.cik not in issuers and row.form in issuer_form_set
     }
     kept = frozenset(kept_forms)
     to_add: list[FileRow] = []
     revisions: list[Revision] = []
-    refused: list[FileRow] = [row for row in conflicting if row.cik not in new_issuers]
+    refused: list[FileRow] = [
+        row
+        for row in conflicting
+        if row.cik not in new_issuers
+        and ((row.cik, row.accession) in by_key or row.cik in issuers or row.form in kept)
+    ]
     stale = 0
     listed: set[tuple[str, str]] = {(row.cik, row.accession) for row in rows}
     listed.update((row.cik, row.accession) for row in conflicting)

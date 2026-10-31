@@ -109,8 +109,8 @@ def test_row_whose_latest_revision_sits_in_another_quarter_is_matched() -> None:
     assert len(result.revisions) == 1
 
 
-def test_row_stored_in_this_quarter_but_moved_out_is_not_absent() -> None:
-    """A stored row whose latest revision is in Q2 is not 'held by' Q1, so never absent."""
+def test_row_whose_latest_revision_is_in_a_later_quarter_is_not_absent() -> None:
+    """A stored row whose latest revision is in Q2 is not held by Q1, so never absent."""
     stored = [_stored(d=(2026, 4, 2), listed=(2026, 4, 3))]
     result = _run([], stored)
     assert result.absent == 0
@@ -157,6 +157,21 @@ def test_exact_duplicate_lines_are_one_row_and_conflicting_ones_are_refused() ->
     result = _run([_file(), _file(form="10-K/A")])
     assert result.refused_count == 1
     assert not result.to_add
+
+
+def test_conflicting_lines_of_a_row_the_table_does_not_keep_are_not_counted() -> None:
+    rows = [
+        _file(cik="0000000009", acc="0000000009-26-000001", form="4"),
+        _file(cik="0000000009", acc="0000000009-26-000001", form="4/A"),
+    ]
+    result = _run(rows)
+    assert result.refused_count == 0 and not result.to_add
+
+
+def test_row_corrected_out_of_the_quarter_is_counted_absent_and_kept() -> None:
+    """Stored 03-31 (Q1); SEC moved it to 04-01, so Q1's file lacks it: a count only."""
+    result = _run([], [_stored(d=(2026, 3, 31))])
+    assert result.absent == 1 and not (result.to_add or result.revisions or result.refused)
 
 
 def test_same_accession_under_two_ciks_are_two_keys() -> None:
