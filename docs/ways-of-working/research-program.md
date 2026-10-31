@@ -62,6 +62,10 @@ When a hypothesis reaches a verdict (in-sample, holdout, or retirement): the res
 
 A claim that would change **the tool itself** (new data to ingest, a model's authority, the universe, a risk rule) goes to an ADR citing the claim ids, never straight into code. Waiting on the owner: research-only model benchmarking (ADR 0008, claims-pilot tension CP-X2); filing-text ingest; Form 4 ingest.
 
+### Registration defaults
+
+- **Liquidity floor (owner, 2026-10-30, [#836](https://github.com/josejuarez96/tradepartner/issues/836#issuecomment-6537997869), #2667):** every daily or weekly paper book's universe gets a median 20-day dollar-volume floor of **$200M**, frozen per registration. It is a default for new registrations, set in the registration's `[study]` keys (not in code); existing registrations are not changed retroactively.
+
 ## Zones
 
 Three data zones; the evidence a run gives gets stronger from one to the next. The rules are in the [strategy-lab spec](../specs/strategy-lab.md) and [ADR 0016](../decisions/0016-development-boundary-and-forward-exams.md); the owner's decisions of 2026-10-08 are on #1301 (decisions 1 to 5, his governance brief in comment 6065810154). This section states principles and adds no rule.
@@ -98,3 +102,4 @@ The owner's line: research freedom in development, evidence discipline in valida
 | 2026-10-09 | Zones, the development boundary and forward exams, from the owner's decisions of 2026-10-08 | #1331, #1301 |
 | 2026-10-18 | Rewritten for length, meaning unchanged; the loop as a numbered list; the 10-08 track snapshot points at STATUS | #1752 |
 | 2026-10-27 | Stage 4a: the feasibility check before an experiment file; ledger gains `feasibility` and `decision` | #2409 |
+| 2026-10-30 | Registration defaults: the $200M dollar-volume floor for daily and weekly books | #2667 |

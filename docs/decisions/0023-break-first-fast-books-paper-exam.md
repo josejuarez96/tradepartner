@@ -49,3 +49,14 @@ We take option 3. The owner's decisions of 2026-10-18 on #1731, D1 to D9, and th
 - Bad / accepted risks: history keeps the identity residue D1 names, cited on every report; a strategy that dies at a cheap rung is never built, and a false kill (a noisy rung-1 slippage number) is possible, which is why rung 1 reads two weeks of fills before it decides; the fill-convention split (H1 `close`, fast books `open`) means two conventions in one registry, each frozen per hypothesis; the per-name skip rule can hide a systematic broker fault behind many small skips, bounded by the share cap and the alert; the paused work loses context while it waits.
 - Reversibility: cheap for everything but D3 and D4, which are frozen per registration and therefore never retroactive: a later record can change the default for new registrations and nothing else moves. The pause list is a note per line; un-pausing is a claim.
 - Revisit if: the shakedown span restarts twice (the paper policy is wrong, not the machine); B10, B9 and IRRX all die at rung 1 or 2 (the ladder is too harsh, or the measured cost is); the per-fill slippage median on any book is above 20 bp per side (the live book's sizing, not its strategy, is the problem); a forward book under `dollar_volume` holds a name the historical universe never had for a reason other than the shares fact (the two universes have diverged beyond D4's intent); or the owner's circumstances change (D9's compliance statement is his and dated).
+
+## Amendment 2026-10-30 (#2667): one rung-1 cost rule
+
+Owner decision 4 of 2026-10-30 ([#836 comment](https://github.com/josejuarez96/tradepartner/issues/836#issuecomment-6537997869)). The "measured cost per side" in rung 1 is defined once, here:
+
+- **Per side, against arrival:** buy-adverse cost of the order's fill VWAP against the arrival price (the NBBO midpoint when the order could first trade; the session open for a pre-open order), as in the [arrival study](../research/2026-10-30-paper-fill-cost-arrival.md), not against the open.
+- **Equal-weighted** across orders (not notional-weighted), the mean of the buy mean and the sell mean.
+- **In the book's own liquidity band:** only orders in names inside the universe the book registers (for a daily book, over the $200M floor in the [research program](../ways-of-working/research-program.md#registration-defaults)).
+- **Rebalance days only:** build-day and other non-rebalance sessions are excluded.
+
+A rung-1 note on an item's issue states which of the four it used. The kill lines already written (B10 12 bp, B9 6 bp) are unchanged. Nothing before this date is re-opened.
