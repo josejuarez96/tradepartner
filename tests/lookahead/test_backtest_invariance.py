@@ -768,9 +768,10 @@ def test_a_shares_fact_accepted_after_close_t_i_reaches_only_plans_after_t_i(
 #: T306 (#2539) moved it only by hashing the two new, empty `sec_filing_events` and
 #: `sec_form4_transactions` tables' names; without them the hash is T254's 6b6cfd33...5fb35.
 #: #2295 (version 42) and T326 (#2682, version 43) moved it only by hashing the new, empty
-#: `snapshot_sightings` and `delisting_reasons` tables' names; without them the hash is
+#: `snapshot_sightings` and `delisting_reasons` tables' names, and T318 (#2740, version 45)
+#: by hashing the empty `filing_index` table's name; without them the hash is
 #: T306's f3c2dc45...42ff1ec.
-TEMPLATE_FINGERPRINT = "591c83e2e1a9f02a050ba410aa2fa87036e39d57e95e726b9d111e710cb56b0c"
+TEMPLATE_FINGERPRINT = "b1109eb77a1118dc11867dc4b00ffafb4c7fd54edb2217186bb94387b3c1eb42"
 
 
 def _bar_revisions(conn: duckdb.DuckDBPyConnection, sid: str, session: date) -> int:
