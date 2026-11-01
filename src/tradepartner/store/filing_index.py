@@ -6,6 +6,8 @@ listing's first acceptance stamp is permanent; only ``filed_on`` may revise.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -156,6 +158,20 @@ def snapshot_id(conn: duckdb.DuckDBPyConnection) -> str | None:
     return None if row is None else str(row[0])
 
 
+@contextmanager
+def listing_run(
+    conn: duckdb.DuckDBPyConnection, ingested_at: datetime
+) -> Iterator[Callable[[list[Listing]], None]]:
+    """Collect per-file listings and commit their winners once at run end."""
+    listings: list[Listing] = []
+
+    def add(file_listings: list[Listing]) -> None:
+        listings.extend(file_listings)
+
+    yield add
+    insert_listings(conn, listings, ingested_at)
+
+
 def insert_listings(
     conn: duckdb.DuckDBPyConnection, listings: list[Listing], ingested_at: datetime
 ) -> InsertCounts:
@@ -251,16 +267,11 @@ def _insert_accession(
         pass
     elif listing.listed_on == old.listed_on and not listing.is_daily:
         stale = 1
-    elif old.known_at == clock and old.known_at != old.accepted_at:
-        # Calls for separate files in one run share a clock and one provisional row.
-        conn.execute(
-            "UPDATE filing_index SET filed_on = ?, listed_on = ? "
-            "WHERE cik = ? AND accession = ? AND known_at = ?",
-            [listing.filed_on, listing.listed_on, cik, accession, clock],
-        )
     else:
         if clock <= old.known_at:
-            raise ValueError("revision clock must follow the previous known_at")
+            raise ValueError(
+                "revision clock must follow the previous known_at; collect one run first"
+            )
         conn.execute(
             "INSERT INTO filing_index VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'edgar', 'filing')",
             [

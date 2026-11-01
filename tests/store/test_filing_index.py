@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import ast
+import re
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import duckdb
 import pytest
@@ -47,11 +50,48 @@ def test_per_file_corrections_at_one_clock_are_order_independent() -> None:
         conn = duckdb.connect(":memory:")
         schema.init_schema(conn)
         filing_index.insert_listings(conn, [_entry()], RUN)
-        for listing in order:
-            filing_index.insert_listings(conn, [listing], RUN + timedelta(days=1))
-        filing_index.insert_listings(conn, [newer], RUN + timedelta(days=1))
+        with filing_index.listing_run(conn, RUN + timedelta(days=1)) as add:
+            for listing in order:
+                add([listing])
+            add([newer])
         assert filing_index.by_cik(conn, "1", RUN + timedelta(days=1))[0].filed_on == newer.filed_on
         assert conn.execute("SELECT count(*) FROM filing_index").fetchone()[0] == 2
+
+
+def test_per_file_x_y_x_at_one_clock_matches_batch() -> None:
+    x = _entry(listed_on=date(2026, 4, 1))
+    y = _entry(filed_on=date(2026, 4, 2), listed_on=date(2026, 4, 2))
+    x_again = _entry(listed_on=date(2026, 4, 2))
+    rows = []
+    for separate in (True, False):
+        conn = duckdb.connect(":memory:")
+        schema.init_schema(conn)
+        filing_index.insert_listings(conn, [x], RUN)
+        if separate:
+            with filing_index.listing_run(conn, RUN + timedelta(days=1)) as add:
+                for listing in (x, y, x_again):
+                    add([listing])
+                assert conn.execute("SELECT count(*) FROM filing_index").fetchone()[0] == 1
+        else:
+            filing_index.insert_listings(conn, [x, y, x_again], RUN + timedelta(days=1))
+        rows.append(
+            conn.execute("SELECT filed_on, known_at FROM filing_index ORDER BY known_at").fetchall()
+        )
+    assert rows[0] == rows[1] == [(x.filed_on, ACCEPTED)]
+
+
+def test_filing_index_module_never_updates_or_deletes() -> None:
+    module = Path(filing_index.__file__)
+    tree = ast.parse(module.read_text(encoding="utf-8"))
+    strings = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+    assert not any(
+        re.search(r"\b(?:UPDATE\s+|DELETE\s+FROM\s+)filing_index\b", value, re.I)
+        for value in strings
+    )
 
 
 def test_new_accession_form_conflict_is_counted() -> None:
