@@ -3639,3 +3639,40 @@ def test_raw_archive_waits_must_be_positive_and_finite(key: str, bad: float) -> 
 def test_raw_archive_per_mb_wait_is_finite_and_not_negative(bad: float) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, raw_archive={"transfer_wait_s_per_mb": bad})
+
+
+# --- T349 (#2714): rule 5 per-field source comparison keys ---
+
+_COMPARE_KEYS = {
+    "events.form4_compare_trusted",
+    "events.form4_compare_decimals",
+    "events.form4_compare_tolerance",
+    "events.form4_compare_threshold",
+}
+
+
+def test_events_form4_compare_keys_default_report_only_and_stay_unfrozen() -> None:
+    from tradepartner.backtest import frozen, hypothesis
+
+    e = Settings(_env_file=None).events
+    assert e.form4_compare_threshold is None
+    assert e.form4_compare_decimals == 2
+    assert e.form4_compare_trusted == {} and e.form4_compare_tolerance == {}
+    assert _COMPARE_KEYS.isdisjoint(hypothesis.frozen_keys())
+    assert _COMPARE_KEYS.isdisjoint(frozen.CANONICAL_EXCLUDED_KEYS)
+    assert _COMPARE_KEYS.isdisjoint({k for k, _d, _v in frozen.FROZEN_KEY_DEFAULTS})
+
+
+def test_events_form4_compare_keys_refuse_nonsense() -> None:
+    for bad in (
+        {"form4_compare_threshold": 0},
+        {"form4_compare_threshold": 2},
+        {"form4_compare_decimals": -1},
+        {"form4_compare_decimals": 9},
+        {"form4_compare_trusted": {"price": "both"}},
+        {"form4_compare_trusted": {"nope": "xml"}},
+        {"form4_compare_tolerance": {"filer_cik": 1}},
+        {"form4_compare_tolerance": {"price": -1}},
+    ):
+        with pytest.raises(ValueError):
+            Settings(_env_file=None, events=bad)
