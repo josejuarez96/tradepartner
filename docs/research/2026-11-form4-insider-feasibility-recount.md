@@ -11,15 +11,15 @@ The snapshot is complete under the T343 ratio rule: 0 of 32 quarters are below 0
 1. It has at most **47** opportunistic events against the 400 floor. Since `n_eff <= n`, it cannot reach 400.
 2. **No** Form 25 delisted security falls in its treated pool.
 
-All names passes every gate on these counts: 2,882 events, 0.6% missing entry bars, and treated and neutral delister coverage of 100% and 93.6%. But the frozen kill line is conjunctive across strata ("n_eff ≥ 400 in **each** stratum"), and the plan says the recount "may not ... drop a stratum". So all names alone cannot carry the study. The plan's outcome on FAIL therefore applies. The study is recorded INSUFFICIENT by this note and by the B7 rows of the [hypothesis backlog](hypothesis-backlog.md), and T332 to T341 and T344 are struck, not built.
+All names passes every gate on these counts: 2,882 events, 0.6% missing entry bars, and treated and neutral delister coverage of 100% and 93.6%. But the frozen kill line is conjunctive across strata ("n_eff ≥ 400 in **each** stratum"), and the plan says the recount "may not ... drop a stratum". So all names alone cannot carry the study. The plan's outcome on FAIL therefore applies. The study is recorded INSUFFICIENT by this note and by the B7 rows of the [hypothesis backlog](hypothesis-backlog.md), and T332 to T341 and T344 are struck, not built. B7 is `retired`, and family N is not charged (owner, 2026-10-31; see [Outcome applied](#outcome-applied-plan-amendment-if-t342-is-fail)).
 
-Confidence: **high** that the label is FAIL. The floor clause holds under every interpretation choice the script made and alone carries the FAIL. The treated-delister clause holds under choices 1 to 7 and 10; under choice 8 and #2720 only the floor decides (see [Robustness](#why-the-fail-is-robust)). The 47 is an upper bound.
+Confidence: **high** that the label is FAIL. The floor clause holds under every interpretation choice the script made and alone carries the FAIL. The treated-delister clause holds under choices 1 to 7 and 10; under choices 8 and 9 and #2720 only the floor decides (see [Robustness](#why-the-fail-is-robust)). The 47 is an upper bound.
 
 ## What ran
 
 | Item | Value |
 |---|---|
-| Script | `~/tradepartner-probes/t342/recount.py`, sha256 `9dcb98de00428c2e6c22c47214a1222238186d16ec4868abaee5c746fef13c15` (printed on its first output line; re-hashed for this note) |
+| Script | `~/tradepartner-probes/t342/recount.py`, sha256 `9dcb98de00428c2e6c22c47214a1222238186d16ec4868abaee5c746fef13c15` (printed on its first output line; re-hashed for this note); committed byte for byte in the [appendix file](2026-11-form4-insider-feasibility-recount-appendix.md) |
 | Its notes | `~/tradepartner-probes/t342/README.md`: run instructions, an output-to-T342 map, and ten numbered interpretation choices |
 | Output | `recount-diag.txt` sha256 `ae59ecdd2c0e659d0e26a117e1c0a244a3fd2d420b857ddfd4062e456d229347`; `recount-diag.json` sha256 `58337a26f3573d467ae8769f860ad147c2fc6c9f3bb5735778b677aa9eadf114` (same directory) |
 | Store | A byte copy of the owner's live store taken 2026-10-31 21:18 New York (file mtime 2026-11-01T01:18:03Z, 2,279,878,656 bytes), opened `read_only=True`. The copy was deleted after the run |
@@ -66,7 +66,7 @@ The effective-date reading is near 0 because `effective_on` is always the filing
 
 ## Why the FAIL is robust
 
-Each $200M clause is enough for FAIL by itself. The floor clause holds under every choice in the script's README and alone carries the FAIL; the treated-delister clause holds under choices 1 to 7 and 10, and under choice 8 only the floor decides. Where a cell is reasoning rather than a counted bound, it says so:
+Each $200M clause is enough for FAIL by itself. The floor clause holds under every choice in the script's README and alone carries the FAIL; the treated-delister clause holds under choices 1 to 7 and 10, and under choices 8 and 9 only the floor decides. Where a cell is reasoning rather than a counted bound, it says so:
 
 | # | Choice | Can it move the $200M floor (47 vs 400)? | The treated-delister clause? |
 |---|---|---|---|
@@ -77,13 +77,13 @@ Each $200M clause is enough for FAIL by itself. The floor clause holds under eve
 | 5 | Bar existence on raw traded bars, not adjusted | Not upward. The price and liquidity filters use raw close and volume as A3 pins. `no_entry_bar` is 0 of 47, so n already equals the eligible count and cannot exceed it | No |
 | 6 | Ratio counts use form `4` only; 2023Q4 cut at the boundary | No. Another ratio reading can only add an "incomplete snapshot" clause, which is another FAIL | No |
 | 7 | History from 2017-01-01; the window filter is on acceptance, before coalescing | No. History from 2017-01-01 and acceptances 2020-01-01 to 2023-11-30 are the frozen values applied as written, and A1 already rules out years before 2017 as observed | No |
-| 8 | `securities` CIK map as of the window-end cut; classification as of each entry cutoff | No. Classification half (counted): the script's diagnostic gives only 257 `no_common_security` events, of any kind and any liquidity, that would map under the window-end classification; 47 + 257 = 304 < 400 even if every one were opportunistic, at least $200M and had an entry bar. CIK-map half (reasoning): the window-end cut is the latest read the boundary allows, so an earlier map (as of each entry cutoff) would know the same or fewer securities | Not shown robust: a remapped event could sit on a delister. Only the floor decides here |
+| 8 | `securities` CIK map as of the window-end cut; classification as of each entry cutoff | No. Classification half (counted): the script's diagnostic gives only 257 `no_common_security` events, of any kind and any liquidity, that would map under the window-end classification; 47 + 257 = 304 < 400 even if every one were opportunistic, at least $200M and had an entry bar. CIK-map half (reasoning, not counted): the window-end cut is the latest read the boundary allows, so an earlier map (as of each entry cutoff) would know the same or fewer securities. This assumes no `securities` revision before the cutoff changed a security's CIK; remaps were not counted | Not shown robust: a remapped event could sit on a delister. Only the floor decides here |
 | 9 | A3's class choice uses the bar on E−1 | No for the class choice: the rule already picks the most liquid common class, so another class cannot raise the dollar volume. Reasoning, not a bound: a different "prior raw bar" (the last bar before E rather than E−1) could admit a security with no bar on E−1; at a $200M median dollar volume such gaps are implausible at the 353-event scale | Reasoning only, as for the floor |
 | 10 | The Form 4 tables are read by direct SQL, not the gated `sec_*_as_of` readers | No. The schema enforces `known_at = accepted_at`, and the script cuts on `accepted_at <= close(2023-12-29)`. The gated readers return the same rows | No |
 
 Choices 1 and 5 can only lower n, choice 8's classification half has a counted ceiling of 304, and choices 8 (CIK map) and 9 are bounded by reasoning. No choice can lift the $200M stratum to 400.
 
-**#2720, multi-owner roles (reasoning, not a measurement).** The correction re-pins officer and director flags among the reporting owners of stored multi-owner filings. The orchestrator gives about 46k such filings in the store, a figure not re-counted here. #2720 estimates 50 to 60 mispinned accessions among about 9,820 multi-owner accessions from 2022q4 to 2025q1, and fewer elsewhere. Two confirmed rows are wrong.
+**#2720, multi-owner roles (reasoning, not a measurement).** The correction re-pins officer and director flags among the reporting owners of stored multi-owner filings. The store holds 46,358 bulk multi-owner filings (counter `sec_forms_bulk_multi_owner_stored: 46358` in the `ingestion_runs` message of the 2026-10-31 20:11 `sec_forms` run, the last run before this copy was taken; not re-counted from the copy). #2720 estimates 50 to 60 mispinned accessions among about 9,820 multi-owner accessions from 2022q4 to 2025q1, and fewer elsewhere. Two confirmed rows are wrong.
 
 A role fix changes which owner's lines qualify and so which (filer, issuer) votes and histories exist. It cannot change an event's issuer, acceptance, price, dollar volume or bars. At $200M, 1,146 events of any kind are otherwise eligible and only 51 of them are classifiable (47 opportunistic, 4 routine). To reach 400, the fix would have to turn 353 of the 1,095 unclassifiable ones opportunistic (or create new eligible events) by giving their insiders three prior years of qualifying purchases, or a qualifying role, that they lack today. One corrected accession can serve as history for several later votes of the same (filer, issuer) pair, but even so this needs on the order of a hundred or more corrected accessions concentrated in $200M names, against the issue's estimate of tens. A new or relabelled event could sit on a security that later delists, so #2720 could in principle add a treated delister; for #2720, as for choice 8, only the floor decides.
 
@@ -92,29 +92,32 @@ The weakest link is that estimate. #2720's own step 1 counts the corrected acces
 ## Outcome applied (plan amendment, "If T342 is FAIL")
 
 - **The study is INSUFFICIENT under its own feasibility gate.** This note is the result. The B7 summary row, the B7 item and the B7 ladder-ledger row in the [hypothesis backlog](hypothesis-backlog.md) are updated in the same PR (class B).
-- **T332 to T341 and T344 are struck, not built** (plan amendment). This PR does not edit the plan file: the T342 line names only this note and the B7 row. Striking the lines is an owner item below.
-- **Family N under research-registry req 9.** The frozen table says "Count **N +2** ... even if a run fails or is refused". No run was opened, so N has not moved. The plan asks this note to state whether the owner charges the +2. **He has not said yet; it is open question 1, to be answered on this PR (class B, so it waits for his word anyway) and recorded here and in the B7 rows before merge.**
+- **T332 to T341 and T344 are struck, not built** (plan amendment). This PR does not edit the plan file, because the T342 line names only this note and the B7 row. A follow-up class-B plan PR strikes them; the fold does not.
+- **Family N under research-registry req 9.** The frozen table says "Count **N +2** ... even if a run fails or is refused". No run was opened, so N has not moved. The plan asks this note to state whether the owner charges the +2. **The +2 is not charged.** **Owner's word, 2026-10-31: "Go with recs"** (on PR #2734's five questions): no run was opened and no return was read, and family N counts looks at returns.
+- **Ledger decision: `retired`** (owner's word, as above). The 2016 to 2023 window is fully loaded, so no further data can rescue the $200M floor. The B7 summary row, item and ladder-ledger row say so.
+- **`TP-9`** is added to [claims.toml](claims.toml). Ladder rule L5 and [research-program](../ways-of-working/research-program.md) step 6 record a ladder verdict or retirement as a `TP-` claim.
 - The search-limit tally already counts B7 as candidate 3, with its registered event study counted with it. That does not change.
 
-## Open questions for the owner
+## Owner's answers
 
-1. **N +2:** is the +2 for the B7 registered test charged to family N now that the study is INSUFFICIENT at its feasibility gate before any run was opened? The frozen table counts it "even if a run fails or is refused". This note records neither choice.
-2. **Ledger decision value:** the plan directs "INSUFFICIENT" but not a ledger `decision` value. The B7 row now reads "registered study INSUFFICIENT at its feasibility gate". Should it read `retired`, `parked` or `deferred: <reason>` (for example, re-entry only with a new registration)?
-3. **Striking T332 to T341 and T344** in `docs/plans/research-registry.md`: in a follow-up PR (class B), or by the fold?
-4. **L5:** should the verdict also get a `TP-` claim in [claims.toml](claims.toml)? Ladder rule L5 records ladder verdicts that way, and this PR does not add one.
-5. **Committed queries:** the plan asks for the method's queries in this note's appendix; the appendix gives gate definitions in words. Commit `recount.py` (sha256 above) or its SQL into the repo, or waive it?
+**Owner's word, 2026-10-31: "Go with recs"** (on PR #2734's five questions). The five questions this note first left open are now answered:
+
+1. **N +2:** not charged. No run was opened and no return was read, and family N counts looks at returns.
+2. **Ledger decision:** `retired`. The 2016 to 2023 window is fully loaded, so no further data can rescue the floor.
+3. **T332 to T341 and T344:** a follow-up class-B plan PR strikes them. This PR does not, and neither does the fold.
+4. **`TP-` claim:** L5 requires one for a retirement. It is `TP-9`.
+5. **Queries:** the script is committed byte for byte in the [appendix file](2026-11-form4-insider-feasibility-recount-appendix.md). The original's sha256 is `9dcb98de00428c2e6c22c47214a1222238186d16ec4868abaee5c746fef13c15`, and the fenced block reproduces it.
 
 ## Caveats & gaps
 
 - The run preceded #2720. The script README's step 1 asked for #2720 first, and the robustness argument for it is reasoning, not a recount.
 - n is an upper bound: the `no_mcap` and `no_beta` drops were not applied.
 - The all-names treated delister set is two securities, so its 100% coverage is thin and reported only.
-- The method is committed below as gate definitions, not as queries. The plan's T342 line asks for the queries in an appendix; the script that ran lives outside the repo (`~/tradepartner-probes/t342/`), pinned by its sha256, so the FAIL cannot be re-run from the repo alone. Committing the script or its SQL, or waiving that, is open question 5.
+- The method is committed twice. Gate definitions in words are below, and the full script with its queries is in the [appendix file](2026-11-form4-insider-feasibility-recount-appendix.md), byte for byte (sha256 `9dcb98de00428c2e6c22c47214a1222238186d16ec4868abaee5c746fef13c15`). It imports `tradepartner` store readers, so re-running it needs a checkout whose readers behave as on 2026-10-31.
 - Voluntary delistings are absent: the store holds exchange-filed 25-NSE forms only (T343, known data limits).
 
 ## UNVERIFIED items
 
-- The "about 46k" stored multi-owner filings (orchestrator's figure).
 - #2720's estimate of 50 to 60 mispinned accessions.
 - That adjusted and raw traded session sets are equal (choice 5; not checked, because checking reads adjusted bars).
 
@@ -129,7 +132,7 @@ The weakest link is that estimate. #2720's own step 1 counts the corrected acces
 
 ## Appendix: method (gate definitions)
 
-These are the script's definitions in words, not its code. Every constant comes from the frozen table or T343.
+These are the script's definitions in words. The full code, with every query, is in the [appendix file](2026-11-form4-insider-feasibility-recount-appendix.md) (sha256 `9dcb98de00428c2e6c22c47214a1222238186d16ec4868abaee5c746fef13c15`). Every constant comes from the frozen table or T343.
 
 **Calendar and clocks.** XNYS sessions come from `tradepartner.calendar`. A filing accepted at instant *a* enters at the first session E with *a* ≤ open(E) − 15 min, equality included. It is *buffered* when it would have entered earlier without the buffer. The horizon is E to E + 19 (entry counted as 1). An event is in the window if E is on or after 2020-01-02 and E + 19 is on or before 2023-12-29.
 
