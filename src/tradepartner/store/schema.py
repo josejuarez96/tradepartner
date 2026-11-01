@@ -3354,14 +3354,13 @@ REBALANCE_COUNT_COLUMNS: tuple[str, ...] = (
 def require_research(conn: duckdb.DuckDBPyConnection) -> None:
     """Require the registry tables used by existing research readers.
 
-    A read-only store from before the exposure migration still serves those
-    readers; exposure-specific readers check their table separately.
+    `research_exposures` is excluded, and no version is read: a read-only store
+    from before the exposure migration still serves those readers (the
+    review module's no-runtime-table test pins that `require_research` reads
+    nothing but table metadata); exposure-specific readers check their own
+    table.
     """
-    names = (
-        RESEARCH_TABLE_NAMES
-        if (_max_version(conn) or 0) >= CURRENT_SCHEMA_VERSION
-        else tuple(n for n in RESEARCH_TABLE_NAMES if n != "research_exposures")
-    )
+    names = tuple(n for n in RESEARCH_TABLE_NAMES if n != "research_exposures")
     (present,) = conn.execute(  # type: ignore[misc]
         "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() "
         "AND schema_name = current_schema() AND table_name IN "
