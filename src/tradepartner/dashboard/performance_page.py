@@ -55,7 +55,7 @@ def _selected_book(conn: duckdb.DuckDBPyConnection, settings: Settings) -> str:
     """The selector's pick, as `ops_page`'s: shown only when a book other than
     `paper.book_id` has a window."""
     try:
-        summaries = ops.book_summaries(conn, settings)
+        summaries = ops.book_summaries(conn, settings, now=header.now())
     except SchemaVersionError:
         return settings.paper.book_id
     default = settings.paper.book_id
@@ -197,11 +197,11 @@ def _tracking_line(data: PerformanceData) -> None:
             st.caption(f"Tracking trial {data.tracking_trial_id} drawn from the latest report.")
     elif data.tracking_state == "not_yet":
         st.caption(
-            "not yet — a report needs two rebalances "
+            "not yet — a report needs three rebalances "
             f"({data.tracking_n} of {ops._REPORT_MIN_REBALANCES})"
         )
     elif data.tracking_state == "report_due":
-        st.caption(f"two rebalances done — run paper report --book {data.book_id}")
+        st.caption(f"three rebalances done — run paper report --book {data.book_id}")
     else:
         st.caption("tracking unavailable: the rebalance cadence could not be read.")
 
@@ -214,7 +214,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
     st.header("Performance")
     book = _selected_book(conn, settings)
     try:
-        data = ops.performance_data(conn, settings, book)
+        data = ops.performance_data(conn, settings, book, now=header.now())
     except UnreadableMarkError as exc:
         st.error(f"A position mark could not be read: {exc}")
         return

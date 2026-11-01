@@ -97,7 +97,7 @@ def _app(
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     if read is not None:
         monkeypatch.setattr(
-            ops, "performance_data", lambda conn, settings, book_id=None: read(str(book_id))
+            ops, "performance_data", lambda conn, settings, book_id=None, *, now: read(str(book_id))
         )
     at = AppTest.from_file(_APP_PATH)
     at.run()
@@ -152,17 +152,17 @@ def test_stale_chip(monkeypatch: pytest.MonkeyPatch, store: Path) -> None:
 def test_tracking_state_not_yet(monkeypatch: pytest.MonkeyPatch, store: Path) -> None:
     at = _app(monkeypatch, store, lambda book: _data(book, tracking_n=1))
     assert not at.exception
-    assert "not yet — a report needs two rebalances (1 of 2)" in _text(at)
+    assert "not yet — a report needs three rebalances (1 of 3)" in _text(at)
 
 
 def test_tracking_state_report_due(monkeypatch: pytest.MonkeyPatch, store: Path) -> None:
     at = _app(
         monkeypatch,
         store,
-        lambda book: _data(book, tracking_state="report_due", tracking_n=2),
+        lambda book: _data(book, tracking_state="report_due", tracking_n=3),
     )
     assert not at.exception
-    assert "two rebalances done — run paper report --book main" in _text(at)
+    assert "three rebalances done — run paper report --book main" in _text(at)
 
 
 def test_tracking_state_drawn_adds_the_trial_line(

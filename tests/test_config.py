@@ -243,6 +243,7 @@ def test_edgar_filing_source_defaults() -> None:
     s = _settings()
     assert s.edgar.index_first_year == 1993
     assert s.edgar.index_settle_days == 3
+    assert s.edgar.reconcile_recent_quarters == 8
     assert s.edgar.bulk_stamp_threshold_ciks == 500
     assert s.edgar.bulk_stamps_enabled is False
     assert s.edgar.cover_page_forms == ["10-K", "10-Q", "20-F", "40-F"]
@@ -656,6 +657,7 @@ def test_edgar_failure_policy_defaults() -> None:
     [
         ("index_first_year", 1992),
         ("index_settle_days", -1),
+        ("reconcile_recent_quarters", 0),
         ("bulk_stamp_threshold_ciks", 0),
         ("fsn_first_year", 2008),
         ("header_first_year", 1992),
@@ -3507,6 +3509,7 @@ _BULK_KEYS = {
     "events.form4_xml_price_below",
     "events.form4_zero_price_xml_codes",
     "events.form4_bulk_order_sample",
+    "events.form4_multi_owner_xml",
     "events.sec_forms_max_requests",
     "events.form4_bulk_max_member_bytes",
 }
@@ -3523,6 +3526,7 @@ def test_events_form4_bulk_keys_default_as_the_amendment_says() -> None:
     assert e.form4_xml_price_below == Decimal("1.00")
     assert e.form4_zero_price_xml_codes == ["P", "S"]
     assert e.form4_bulk_order_sample == 20
+    assert e.form4_multi_owner_xml is True
     assert e.sec_forms_max_requests == 40_000
 
 

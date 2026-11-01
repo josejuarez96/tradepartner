@@ -2645,12 +2645,21 @@ def test_sec_forms_only_needs_edgar_and_no_other_flag(
     result = _invoke(_forms_settings(secrets_set), args)
     assert result.exit_code == cli.USAGE_ERROR
     assert "--sec-forms-only needs --source edgar" in result.output
+    assert not Path(secrets_set.store.path).exists()
 
 
 def test_sec_forms_only_needs_the_collection_switch(secrets_set: Settings) -> None:
     result = _invoke(secrets_set, ["ingest", "--source", "edgar", "--sec-forms-only"])
     assert result.exit_code == cli.USAGE_ERROR
     assert "needs events.sec_forms_enabled" in result.output
+    assert not Path(secrets_set.store.path).exists()
+
+
+def test_census_refuses_sec_forms_only_without_a_store(secrets_set: Settings) -> None:
+    result = _invoke(secrets_set, ["ingest", "--census-sec-forms", "--sec-forms-only"])
+    assert result.exit_code == cli.USAGE_ERROR
+    assert "--census-sec-forms stands alone" in result.output
+    assert not Path(secrets_set.store.path).exists()
 
 
 def test_sec_forms_only_reads_no_index_quarter_before_the_backfill_start(

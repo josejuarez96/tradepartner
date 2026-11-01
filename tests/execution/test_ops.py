@@ -377,7 +377,7 @@ def test_journal_not_initialised_on_a_version_4_store(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, store={"path": str(path)})
     conn = duckdb.connect(str(path), read_only=True)
     try:
-        data = ops.page_data(conn, settings)
+        data = ops.page_data(conn, settings, now=utc_now())
     finally:
         conn.close()
     assert data.journal_not_initialised is True
@@ -414,16 +414,37 @@ def test_journal_outdated_on_a_read_only_version_16_store(tmp_path: Path) -> Non
         conn.close()
     settings = Settings(_env_file=None, store={"path": str(path)})
     with duckdb.connect(str(path), read_only=True) as conn:
-        data = ops.page_data(conn, settings)
+        data = ops.page_data(conn, settings, now=utc_now())
     assert data.journal_not_initialised is False
     assert data.journal_outdated is not None
     assert "open it for writing once" in data.journal_outdated
     assert data.window is None
 
 
+def test_journal_outdated_on_a_read_only_version_37_store(
+    journal_settings: Settings, open_window: PaperWindowRow
+) -> None:
+    """Operations reports the plan-reader migration instead of raising it."""
+    assert open_window.window_id is not None
+    with duckdb.connect(str(journal_settings.store.path)) as conn:
+        for column in ("n_assets_intersected", "assets_intersection_skipped"):
+            conn.execute(f"ALTER TABLE paper_plans DROP COLUMN {column}")
+        conn.execute("DELETE FROM schema_version")
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, current_timestamp)",
+            [schema._PRE_ASSETS_INTERSECTION_VERSION],
+        )
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings, now=utc_now())
+    assert data.book_id == "main"
+    assert data.journal_outdated is not None
+    assert "paper plans require schema version" in data.journal_outdated
+    assert data.window is None
+
+
 def test_no_window_returns_empty_data(journal_settings: Settings) -> None:
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
     assert data.journal_not_initialised is False
     assert data.window is None
     assert data.switch_state is None
@@ -436,7 +457,7 @@ def test_every_field_on_a_seeded_journal(
     journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
 ) -> None:
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
 
     assert data.journal_not_initialised is False
     assert data.window is not None and data.window.window_id == open_window.window_id
@@ -515,7 +536,7 @@ def test_stale_when_s_minus_1_has_no_run(
         assert run_id is not None
         append(conn, _result(run_id, "ok"))
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
     assert data.stale is True
 
 
@@ -541,7 +562,7 @@ def test_locked_alerts_with_no_run_still_show_in_the_window(
         )
         assert alert_id is not None
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
     kinds = {a.kind for a in data.alerts}
     assert "locked" in kinds
     assert len(data.alerts) == 2  # the seeded stale_data alert plus this one
@@ -591,7 +612,7 @@ def test_run_in_progress_while_another_process_holds_the_lock(
     with open_for_write(journal_settings) as conn:
         append(conn, _run(window_id, _S, minutes=100))
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
     assert data.switch_state is not None
     assert data.switch_state.engaged is False
     assert data.switch_state.run_in_progress is True
@@ -603,7 +624,7 @@ def test_page_data_takes_no_write_connection(
     """A real read-only DuckDB connection: any write attempted inside
     `page_data` would raise, not merely go unnoticed."""
     with open_read_only(journal_settings) as conn:
-        ops.page_data(conn, journal_settings)
+        ops.page_data(conn, journal_settings, now=utc_now())
     # the store is still free for a write connection right after
     with open_for_write(journal_settings):
         pass
@@ -683,7 +704,7 @@ def test_per_row_reads_are_capped_and_keep_the_newest_rows(
             extra_fill_ids.append(fill_id)
 
     with open_read_only(limited) as conn:
-        data = ops.page_data(conn, limited)
+        data = ops.page_data(conn, limited, now=utc_now())
 
     assert len(data.alerts) == 1
     assert data.alerts_capped is True
@@ -780,7 +801,7 @@ def test_page_data_runs_within_half_the_lock_retry_seconds(
         elapsed_times = []
         for i in range(3):
             started = time.monotonic()
-            data = ops.page_data(conn, fast)
+            data = ops.page_data(conn, fast, now=utc_now())
             elapsed = time.monotonic() - started
             elapsed_times.append(elapsed)
             if i == 0:
@@ -897,7 +918,7 @@ def _chain_reads(settings: Settings) -> tuple[ops.OpsData, list[tuple[str, int]]
     order-chain tables handed back."""
     with open_read_only(settings) as conn:
         counting = _CountingConnection(conn)
-        data = ops.page_data(counting, settings)  # type: ignore[arg-type]
+        data = ops.page_data(counting, settings, now=utc_now())  # type: ignore[arg-type]
     reads = [
         (sql, rows)
         for sql, rows in counting.reads
@@ -950,7 +971,7 @@ def test_the_chain_views_fills_come_only_from_the_kept_orders(
 
     monkeypatch.setattr(ops.journal, "fills_for", spy)
     with open_read_only(limited) as conn:
-        data = ops.page_data(conn, limited)
+        data = ops.page_data(conn, limited, now=utc_now())
 
     assert all(c.get("limit") is not None or c.get("client_order_ids") is not None for c in calls)
     (chain_call,) = [c for c in calls if c.get("client_order_ids") is not None]
@@ -973,7 +994,7 @@ def test_as_of_covers_a_late_event_on_an_order_past_the_cap(
         append(conn, OrderEventRow(client_order_id="tp-sell-1", status="cancel_noop", **_stamp(90)))
     limited = _limited(journal_settings, 1)
     with open_read_only(limited) as conn:
-        data = ops.page_data(conn, limited)
+        data = ops.page_data(conn, limited, now=utc_now())
     assert [c.client_order_id for c in data.chains] == ["tp-bulk-002"]
     assert data.as_of == _at(90)
 
@@ -987,7 +1008,7 @@ def test_under_the_limit_the_bounded_reads_show_every_row(
     window_id = open_window.window_id
     assert window_id is not None
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
         orders = ops.journal.orders_for(conn, window_id=window_id)
         events = ops.journal.order_events_for(conn, window_id=window_id)
         fills = ops.journal.fills_for(conn, window_id=window_id)
@@ -1014,7 +1035,7 @@ def _rows(settings: Settings, pattern: str) -> list[tuple[str, int]]:
     """`page_data`'s row counts for every query whose SQL matches `pattern`."""
     with open_read_only(settings) as conn:
         counting = _CountingConnection(conn)
-        ops.page_data(counting, settings)  # type: ignore[arg-type]
+        ops.page_data(counting, settings, now=utc_now())  # type: ignore[arg-type]
     return [(sql, rows) for sql, rows in counting.reads if re.search(pattern, sql)]
 
 
@@ -1053,7 +1074,7 @@ def test_marks_read_only_the_latest_marked_session(
     expected_value = sum(m.value or 0.0 for m in full_marks if m.quantity != 0)
 
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
     assert data.positions_count == expected_count
     assert data.positions_value == expected_value
 
@@ -1110,7 +1131,7 @@ def test_marks_filter_does_not_depend_on_the_trading_calendar(
         )
 
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
 
     assert data.positions_count == 1
     assert data.positions_value == 30.0
@@ -1145,7 +1166,7 @@ def test_positions_value_is_long_minus_short(
     value is long minus short, as `Ledger.equity` counts it (#2561, #2547)."""
     _mark_session_rows(journal_settings, seeded, [("LLL", 100.0, "long"), ("SSS", 40.0, "short")])
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
     assert data.positions_count == 2
     assert data.positions_value == 60.0
 
@@ -1157,7 +1178,7 @@ def test_net_positions_value_and_gross_exposure_stay_apart(
     the risk card's gross exposure is gross (140), each from its own reader."""
     _mark_session_rows(journal_settings, seeded, [("LLL", 100.0, "long"), ("SSS", 40.0, "short")])
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
         marks = [
             m
             for m in ops.journal.positions_daily_for(conn, open_window.window_id or 0)
@@ -1176,7 +1197,7 @@ def test_long_only_positions_value_is_unchanged(
 ) -> None:
     _mark_session_rows(journal_settings, seeded, [("LLL", 100.0, "long"), ("MMM", 30.0, "long")])
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
     assert data.positions_value == 130.0
 
 
@@ -1354,7 +1375,7 @@ def test_reconciliation_tie_on_at_picks_the_same_row_as_max(
     assert actual.reconciliation_id != later_id
 
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
     assert data.reconciliation is not None
     assert data.reconciliation.reconciliation_id == earlier_id
 
@@ -1378,7 +1399,7 @@ def test_open_orders_count_matches_non_terminal_orders_with_many_terminal_orders
     assert all(rows == 1 for _, rows in reads)
 
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
     assert data.open_orders_count == expected
 
 
@@ -1457,7 +1478,7 @@ def test_as_of_covers_rows_the_bounded_reads_no_longer_fetch(
             ),
         )
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
     assert data.as_of == late
 
 
@@ -1542,7 +1563,7 @@ def test_a_long_window_reads_at_most_the_bound_of_every_remaining_section(
 
         settings = journal_settings
         counting = _CountingConnection(conn)
-        data = ops.page_data(counting, settings)  # type: ignore[arg-type]
+        data = ops.page_data(counting, settings, now=utc_now())  # type: ignore[arg-type]
 
     assert data.positions_count == expected_positions_count
     assert data.positions_value == expected_positions_value
@@ -1737,7 +1758,7 @@ def test_switch_engages_from_an_unfinished_run_alone(
     with open_read_only(journal_settings) as conn:
         bounded_rows = ops._kill_switch_rows_for(conn, window_id)
         assert bounded_rows == ()
-        data = ops.page_data(conn, journal_settings)
+        data = ops.page_data(conn, journal_settings, now=utc_now())
     assert data.switch_state is not None
     assert data.switch_state.engaged is True
     assert data.switch_state.causes == (f"run {run_id} unfinished",)
@@ -1812,9 +1833,9 @@ def test_page_data_reads_only_the_named_books_window(
     """With no book `page_data` reads `paper.book_id`'s (`main`'s) window, though
     `b`'s is newer; with `b` it reads `b`'s; each sees its own `locked` alert only."""
     with open_read_only(journal_settings) as conn:
-        default = ops.page_data(conn, journal_settings)
-        main = ops.page_data(conn, journal_settings, "main")
-        other = ops.page_data(conn, journal_settings, "b")
+        default = ops.page_data(conn, journal_settings, now=utc_now())
+        main = ops.page_data(conn, journal_settings, "main", now=utc_now())
+        other = ops.page_data(conn, journal_settings, "b", now=utc_now())
     assert default == main
     assert main.book_id == "main" and other.book_id == "b"
     assert main.window is not None and main.window.window_id == two_books["main"]
@@ -1828,9 +1849,9 @@ def test_page_data_for_a_book_with_no_window_is_the_no_window_state(
     journal_settings: Settings, two_books: dict[str, int]
 ) -> None:
     with open_read_only(journal_settings) as conn:
-        data = ops.page_data(conn, journal_settings, "c")
+        data = ops.page_data(conn, journal_settings, "c", now=utc_now())
         with pytest.raises(ValueError, match="book_id must match"):
-            ops.page_data(conn, journal_settings, "b-1")
+            ops.page_data(conn, journal_settings, "b-1", now=utc_now())
     assert data == ops.OpsData(book_id="c")
 
 
@@ -1838,7 +1859,7 @@ def test_book_summaries_lists_one_row_per_book_in_token_order(
     journal_settings: Settings, two_books: dict[str, int]
 ) -> None:
     with open_read_only(journal_settings) as conn:
-        rows = ops.book_summaries(conn, journal_settings)
+        rows = ops.book_summaries(conn, journal_settings, now=utc_now())
     assert [(r.book_id, r.window.window_id) for r in rows] == [
         ("b", two_books["b"]),
         ("main", two_books["main"]),
@@ -1857,21 +1878,22 @@ def test_book_summaries_closed_window_has_no_next_rebalance(
     """A closed book's row says so and names no next rebalance; an open one names
     the first rebalance session at its window's cadence whose close is after now."""
     monkeypatch.setattr(ops, "window_cadence", lambda _conn, _window: "month_end")
-    monkeypatch.setattr(ops, "utc_now", lambda: datetime(2026, 10, 9, 18, tzinfo=UTC))
     with open_for_write(journal_settings) as conn:
         append(
             conn,
             PaperWindowStopRow(window_id=two_books["b"], at=_at(30), state="closed", **_stamp(30)),
         )
     with open_read_only(journal_settings) as conn:
-        b, main = ops.book_summaries(conn, journal_settings)
+        b, main = ops.book_summaries(
+            conn, journal_settings, now=datetime(2026, 10, 9, 18, tzinfo=UTC)
+        )
     assert not b.is_open and b.next_rebalance_session is None
     assert main.is_open and main.next_rebalance_session == date(2026, 10, 30)
 
 
 def test_book_summaries_is_empty_before_the_first_window(journal_settings: Settings) -> None:
     with open_read_only(journal_settings) as conn:
-        assert ops.book_summaries(conn, journal_settings) == ()
+        assert ops.book_summaries(conn, journal_settings, now=utc_now()) == ()
 
 
 def test_the_switch_reads_the_books_own_run_lock(
@@ -1882,9 +1904,11 @@ def test_the_switch_reads_the_books_own_run_lock(
     from tradepartner.execution.lock import run_lock
 
     with run_lock(journal_settings, "b"), open_read_only(journal_settings) as conn:
-        other = ops.page_data(conn, journal_settings, "b")
-        main = ops.page_data(conn, journal_settings, "main")
-        summaries = {r.book_id: r for r in ops.book_summaries(conn, journal_settings)}
+        other = ops.page_data(conn, journal_settings, "b", now=utc_now())
+        main = ops.page_data(conn, journal_settings, "main", now=utc_now())
+        summaries = {
+            r.book_id: r for r in ops.book_summaries(conn, journal_settings, now=utc_now())
+        }
     assert other.switch_state is not None and other.switch_state.run_in_progress
     assert main.switch_state is not None and not main.switch_state.run_in_progress
     assert summaries["b"].switch_state.run_in_progress
@@ -2028,7 +2052,7 @@ def _p_seed(
 
 def _p_read(settings: Settings) -> ops.PerformanceData | None:
     with open_read_only(settings) as conn:
-        return ops.performance_data(conn, settings)
+        return ops.performance_data(conn, settings, now=utc_now())
 
 
 def _approx_rows(rows: tuple[tuple[date, float], ...], expected: list[tuple[date, float]]) -> None:
@@ -2124,11 +2148,11 @@ def test_a_window_with_no_mark_has_a_base_and_no_series(journal_settings: Settin
 
 
 def test_tracking_states_without_a_report_row(journal_settings: Settings) -> None:
-    # two daily rebalances done by the as-of (09-30 and 10-01): the report is due
-    _p_seed(journal_settings, report=False)
+    # three daily rebalances done by the as-of (09-29, 09-30 and 10-01): the report is due
+    _p_seed(journal_settings, window=_p_window(first=date(2026, 9, 29)), report=False)
     done = _p_read(journal_settings)
     assert done is not None
-    assert (done.tracking_state, done.tracking_n) == ("report_due", 2)
+    assert (done.tracking_state, done.tracking_n) == ("report_due", 3)
     assert done.trial_line == () and done.trial_span is None and done.tracking_trial_id is None
 
 
@@ -2177,7 +2201,7 @@ def test_tracking_count_stops_before_the_stop_session(journal_settings: Settings
 def test_a_book_with_no_window_returns_none(journal_settings: Settings) -> None:
     assert _p_read(journal_settings) is None
     with open_read_only(journal_settings) as conn:
-        assert ops.performance_data(conn, journal_settings, "other") is None
+        assert ops.performance_data(conn, journal_settings, "other", now=utc_now()) is None
 
 
 def test_an_unresolvable_spy_identity_is_the_benchmark_error(journal_settings: Settings) -> None:
@@ -2246,7 +2270,7 @@ def test_an_unreadable_mark_propagates(journal_settings: Settings) -> None:
     with open_for_write(journal_settings) as conn:
         conn.execute("UPDATE positions_daily SET cash = NULL WHERE session = ?", [_PT0])
     with open_read_only(journal_settings) as conn, pytest.raises(UnreadableMarkError):
-        ops.performance_data(conn, journal_settings)
+        ops.performance_data(conn, journal_settings, now=utc_now())
 
 
 def _row_counts(settings: Settings) -> dict[str, int]:
@@ -2637,7 +2661,7 @@ def test_waiting_on_owner_on_the_full_fixture_within_the_timing_bound(
         WaitingItem(
             book_id="main",
             kind="report_due",
-            since=date(2026, 10, 1),
+            since=date(2026, 10, 2),
             detail=(
                 "5 rebalances tracked and no tracking report yet; `paper report` opens a "
                 "counted tracking trial"
@@ -2665,7 +2689,7 @@ def test_waiting_on_owner_honours_now_and_stays_narrow(
     def refuse(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("not part of the waiting read")
 
-    for name in ("utc_now", "page_data", "_summary", "book_summaries", "performance_data"):
+    for name in ("page_data", "_summary", "book_summaries", "performance_data"):
         monkeypatch.setattr(ops, name, refuse)
     items = _w_read(journal_settings)
     assert len(items) == 7  # six book items and the shakedown's (#2298)
@@ -2763,7 +2787,7 @@ def test_shakedown_note_needs_a_span_and_clears_with_its_note(journal_settings: 
     assert [i for i in _w_read(journal_settings) if i.kind == "shakedown_note"] == []
 
 
-def test_report_due_at_two_rebalances_and_gone_once_a_report_row_exists(
+def test_report_due_at_three_rebalances_and_gone_once_a_report_row_exists(
     journal_settings: Settings,
 ) -> None:
     with open_for_write(journal_settings) as conn:
@@ -2771,17 +2795,20 @@ def test_report_due_at_two_rebalances_and_gone_once_a_report_row_exists(
         main = _w_window(conn, "main")
         _w_run(conn, main, date(2026, 9, 30))
         _w_run(conn, main, date(2026, 10, 1))
+        _w_run(conn, main, date(2026, 10, 2))
 
     def due(now: datetime) -> list[object]:
         return [i.since for i in _w_read(journal_settings, now) if i.kind == "report_due"]
 
     # 10-01 14:00 ET: only 09-30 has closed (one rebalance).
     assert due(datetime(2026, 10, 1, 18, 0, tzinfo=UTC)) == []
-    # 10-02 14:00 ET: 09-30 and 10-01 (two): due since the second, 10-01.
-    assert due(datetime(2026, 10, 2, 18, 0, tzinfo=UTC)) == [date(2026, 10, 1)]
+    # 10-02 14:00 ET: 09-30 and 10-01 (two): a report still needs a third (#2468).
+    assert due(datetime(2026, 10, 2, 18, 0, tzinfo=UTC)) == []
+    # 10-02 17:00 ET: the third has closed: due since the third, 10-02.
+    assert due(datetime(2026, 10, 2, 21, 0, tzinfo=UTC)) == [date(2026, 10, 2)]
     with open_for_write(journal_settings) as conn:
         _w_report_row(conn, main)
-    assert due(datetime(2026, 10, 2, 18, 0, tzinfo=UTC)) == []
+    assert due(datetime(2026, 10, 2, 21, 0, tzinfo=UTC)) == []
 
 
 def test_a_crashed_run_with_no_kill_switch_row_is_since_its_started_at(
@@ -2810,3 +2837,11 @@ def test_an_unreadable_frozen_json_is_one_item_and_the_other_books_still_come_ou
     items = _w_read(journal_settings)
     assert _w_kinds(items) == [("main", "missed_run"), ("a", "unreadable")]
     assert items[1].detail == f"window {a} frozen_json is not JSON"
+
+
+def test_the_report_due_floor_is_the_report_guards_floor() -> None:
+    """#2468: the card and the waiting list must call a report due exactly when
+    `paper report` stops refusing with `NothingToCompareYet`."""
+    from tradepartner.execution import report as report_module
+
+    assert ops._REPORT_MIN_REBALANCES == report_module._MIN_REBALANCE_SESSIONS

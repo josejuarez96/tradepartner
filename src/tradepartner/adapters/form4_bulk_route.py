@@ -42,7 +42,7 @@ from tradepartner.adapters.form4_route import (
 from tradepartner.config import Settings
 
 Form4IndexRow = tuple[str, str, str, date]  # accession, issuer CIK, form, filing date
-BULK_READER_VERSION = 1
+BULK_READER_VERSION = 4  # Recheck order samples after multi-owner exclusion (#2711).
 
 
 class RequestBudgetStopped(Exception):
@@ -114,6 +114,11 @@ def load_bulk_quarters(
                 saved = loaded
         except (OSError, ValueError):
             pass
+        if not revalidate and not path.exists():
+            unreadable.add(quarter)
+            counts["sec_forms_bulk_unreadable"] += 1
+            result[quarter] = None
+            continue
         use_cache = not revalidate and path.exists()
         if not use_cache and path.exists() and saved:
             headers = edgar_raw.insider_bulk_validators(label, settings=settings, client=client)
@@ -146,7 +151,10 @@ def order_check_path(settings: Settings, quarter: Quarter, digest: str) -> Path:
     from tradepartner.adapters.edgar_source import PARSER_VERSION
 
     label = f"{quarter.year}q{quarter.number}"
-    version = f"b{BULK_READER_VERSION}-x{SEC_FORMS_PARSER_VERSION}-s{PARSER_VERSION}"
+    version = (
+        f"b{BULK_READER_VERSION}-x{SEC_FORMS_PARSER_VERSION}-s{PARSER_VERSION}"
+        f"-m{int(settings.events.form4_multi_owner_xml)}"
+    )
     return (
         Path(settings.edgar.cache_dir)
         / "insider"
@@ -182,12 +190,14 @@ def run_form4_bulk_route(
     zero_price_codes: tuple[str, ...],
     order_sample_size: int,
     budget: int,
+    multi_owner_xml: bool = True,
     request_count: Callable[[], int] | None = None,
     checked: Callable[[Quarter], bool] | None = None,
     remember_check: Callable[[Quarter], None] | None = None,
     skip_accessions: frozenset[str] = frozenset(),
     blocked_quarters: frozenset[Quarter] = frozenset(),
     source_counts_failures: bool = False,
+    accession_quarters: Mapping[str, Quarter] | None = None,
 ) -> BulkRouteResult:
     """Route selected Form 4 accessions, never substituting a bulk row after XML fails.
 
@@ -205,7 +215,10 @@ def run_form4_bulk_route(
     )
     grouped: dict[Quarter, list[Form4IndexRow]] = defaultdict(list)
     for row in queue:
-        grouped[quarter_of(row[3])].append(row)
+        quarter = (
+            accession_quarters[row[0]] if accession_quarters is not None else quarter_of(row[3])
+        )
+        grouped[quarter].append(row)
     counts: Counter[str] = Counter()
     requests = 0
     remaining = 0
@@ -239,6 +252,7 @@ def run_form4_bulk_route(
                 and bulk.accessions[accession].issuer_cik == cik
                 and not bulk.accessions[accession].identity_bad
                 and not bulk.accessions[accession].order_bad
+                and (not multi_owner_xml or len(set(bulk.accessions[accession].filer_ciks)) == 1)
             }
             sample = order_sample(candidates, order_sample_size)
             if not sample:
@@ -286,7 +300,13 @@ def run_form4_bulk_route(
                 continue
             accession_bulk = bulk.accessions.get(accession) if bulk is not None else None
             decision = (
-                AccessionRoute(Route.XML, IDENTITY_BAD)
+                AccessionRoute(Route.XML, "sec_forms_bulk_multi_owner_xml")
+                if (
+                    multi_owner_xml
+                    and accession_bulk is not None
+                    and len(set(accession_bulk.filer_ciks)) > 1
+                )
+                else AccessionRoute(Route.XML, IDENTITY_BAD)
                 if accession_bulk is not None and accession_bulk.issuer_cik != cik
                 else route_accession(
                     accession_bulk,

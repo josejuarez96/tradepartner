@@ -93,6 +93,11 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   (`store/dividend_reviews.csv`) with an ex-date on or before `--to`, counts
   the later ones deferred, and lists every stale entry (a dry run exits 1 on
   any; a real run refuses).
+- `tradepartner build-form4-roles-manifest --zip-dir DIR --output FILE`
+  reads the store and cached insider zips to list rows with the old bulk role
+  parse. `repair-form4-roles --manifest FILE --release NAME --expect-rows N
+  [--dry-run]` checks every stored key, source row, zip hash and raw role before
+  updating the four flags and `ingested_at` inside the open release (#2697).
 - `tradepartner action-retract --security <id> --action-id <source id>
   --reason <text> [--reinstate] (--dry-run | --expect-known-at <iso>)` runs
   `action_retract.retract_action` (#2092, data-foundation plan T262): it
@@ -494,6 +499,7 @@ from tradepartner.ingest import (
     manifest_release,
     rates_seeded,
     read_manifest,
+    show_ingest_progress,
 )
 from tradepartner.repair import (
     HeaderLookup,
@@ -504,6 +510,15 @@ from tradepartner.repair import (
     repair_resolution,
     retract_dividends,
     store_resolver,
+)
+from tradepartner.repair_form4_roles import (
+    RoleRepairRefused,
+)
+from tradepartner.repair_form4_roles import (
+    build_manifest as build_form4_roles_manifest,
+)
+from tradepartner.repair_form4_roles import (
+    repair_form4_roles as apply_form4_roles_repair,
 )
 from tradepartner.research import (
     EVERY_ROW_SPLITS,
@@ -1930,7 +1945,7 @@ def _book_first_lines(
     return lines
 
 
-def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
+def _summary_lines(summaries: Sequence[ops.BookSummary], now: datetime) -> list[str]:
     """`paper status --all`: the operations page's one-row-per-book summary (spec
     req 12 as amended 2026-10-09), one line per book in token order."""
     if not summaries:
@@ -1943,7 +1958,7 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
             if state.engaged
             else ("run in progress" if state.run_in_progress else "released")
         )
-        traded = ops.rebalance_traded_today(row)
+        traded = ops.rebalance_traded_today(row, now=now)
         line = (
             f"book {row.book_id}: window {row.window.window_id} "
             f"{'open' if row.is_open else 'closed'}; positions {row.positions_count}; "
@@ -2527,6 +2542,7 @@ def make_app(
                     fill_holes_, security is not None, bulk_from_cache, rebuild_statement_facts,
                     rebuild_filing_events, rebuild_classifications, restamp_from is not None,
                     restamp_window_earlier_ok is not None, import_dir is not None,
+                    sec_forms_only,
                 ),
             )  # fmt: skip
         if sec_forms_only and (
@@ -2738,6 +2754,7 @@ def make_app(
             event_forms=s.edgar.event_forms,
         )
         if sec_forms_only:
+            show_ingest_progress()
             result = ingest_sec_forms(s, filings, clock=clock)
             _print_result(result)
             raise typer.Exit(result.exit_code)
@@ -2917,6 +2934,42 @@ def make_app(
         except ValueError as exc:
             raise _fail(f"refused: {exc}", USAGE_ERROR) from None
         typer.echo(result.summary())
+
+    @app.command("repair-form4-roles")
+    def repair_form4_roles_command(
+        manifest: Annotated[Path, typer.Option(help="reviewed JSON manifest")],
+        release: Annotated[str, typer.Option(help="the open data release")],
+        expect_rows: Annotated[int, typer.Option(help="the dry run's changed-row count")],
+        dry_run: Annotated[bool, typer.Option(help="count changes without writing")] = False,
+    ) -> None:
+        """Repair bulk Form 4 roles against the cached zip and a reviewed manifest."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            count = apply_form4_roles_repair(
+                s, manifest, release, expect_rows, dry_run=dry_run, clock=clock
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RoleRepairRefused as exc:
+            raise _fail(f"repair refused: {exc}", 1) from None
+        typer.echo(f"form4 roles: {count} rows {'would change' if dry_run else 'changed'}")
+
+    @app.command("build-form4-roles-manifest")
+    def build_form4_roles_manifest_command(
+        zip_dir: Annotated[Path, typer.Option(help="directory of cached *_form345.zip files")],
+        output: Annotated[Path, typer.Option(help="reviewable JSON manifest path")],
+    ) -> None:
+        """Build a role repair manifest from the store and cached SEC zips."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            count = build_form4_roles_manifest(s, sorted(zip_dir.glob("*_form345.zip")), output)
+        except (StoreLockedError, ValueError, OSError) as exc:
+            raise _fail(f"manifest refused: {exc}", 1) from None
+        typer.echo(f"form4 roles manifest: {count} rows")
 
     @app.command("repair-dividends")
     def repair_dividends(
@@ -5284,21 +5337,21 @@ def make_app(
                     ops.OwnerQueue,
                     tuple[ops.OverdueDelisting, ...],
                     ops.EdgarAge | None,
+                    datetime,
                 ]
                 | str
             ):
                 with open_read_only(s) as conn:
                     try:
-                        summaries = ops.book_summaries(conn, s)
-                        queue = ops.owner_queue(
-                            conn, s, ensure_tz_aware_utc(clock(), field_name="clock()")
-                        )
                         now = ensure_tz_aware_utc(clock(), field_name="clock()")
+                        summaries = ops.book_summaries(conn, s, now=now)
+                        queue = ops.owner_queue(conn, s, now)
                         return (
                             summaries,
                             queue,
                             ops.overdue_delisting_cash(conn),
                             ops.edgar_age(conn, s, now),
+                            now,
                         )
                     except schema.SchemaVersionError as exc:
                         return str(exc)
@@ -5307,16 +5360,15 @@ def make_app(
             if isinstance(result, str):  # the journal predates version 17
                 _echo_scrubbed(f"paper status: {result}", s)
                 raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
-            summaries, queue, overdue, edgar = result
+            summaries, queue, overdue, edgar, now = result
             items = queue.items
-            now = ensure_tz_aware_utc(clock(), field_name="clock()")
             overdue_lines = _overdue_delisting_lines(overdue)
             edgar_lines = _edgar_age_lines(edgar)
             # the open span's progress (#2298): not a problem, so not an item
             progress_lines = [queue.shakedown_progress] if queue.shakedown_progress else []
             if not summaries:  # no window yet: nothing to lead with
                 for line in (
-                    *_summary_lines(summaries),
+                    *_summary_lines(summaries, now),
                     *overdue_lines,
                     *edgar_lines,
                     *_waiting_lines(items),
@@ -5330,14 +5382,16 @@ def make_app(
                 *progress_lines,
                 *overdue_lines,
                 *edgar_lines,
-                *_summary_lines(summaries),
+                *_summary_lines(summaries, now),
             ):
                 _echo_scrubbed(line, s)
             return
 
         def read() -> tuple[ops.OpsData, paper_slippage.Slippage | None]:
             with open_read_only(s) as conn:
-                page = ops.page_data(conn, s, chosen)
+                page = ops.page_data(
+                    conn, s, chosen, now=ensure_tz_aware_utc(clock(), field_name="clock()")
+                )
                 window_id = page.window.window_id if page.window is not None else None
                 if window_id is None or page.journal_outdated is not None:
                     return page, None
