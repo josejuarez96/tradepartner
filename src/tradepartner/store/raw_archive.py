@@ -674,7 +674,7 @@ def same_filesystem(settings: Settings, directory: Path) -> bool:
 
 
 def adopt_file(settings: Settings, source: Path, sha256: str, *, size: int) -> Archived:
-    """Move a local file into the archive under its hash by rename (plan T361,
+    """Move a local file into the archive under its hash by rename (plan T361a,
     #2743 item 2): no bytes are written, so the floor does not apply. The caller
     hashed `source`; it must still be a regular file of `size` bytes on the
     archive's filesystem. The final name is made with `os.link` (which never

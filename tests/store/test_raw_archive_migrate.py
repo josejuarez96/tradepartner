@@ -1,4 +1,4 @@
-"""The existing-cache migration runner, move class (plan T361, #2765; spec
+"""The existing-cache migration runner, move class (plan T361a, #2765; spec
 amendment #2743 items 2, 4 and 7). Everything runs under `tmp_path`, with the disk
 and iCloud faked (`FakeICloud`), so no real archive, cache or store is touched."""
 

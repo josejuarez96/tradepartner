@@ -1,4 +1,4 @@
-"""The existing-cache migration runner, move class (plan T361, #2765; data-foundation
+"""The existing-cache migration runner, move class (plan T361a, #2765; data-foundation
 spec amendment 2026-10-31, #2743, items 2, 4 and 7). The backup class and
 restore are later slices of the same plan line (split proposed in #2766).
 
