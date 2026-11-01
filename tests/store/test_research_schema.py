@@ -325,7 +325,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION > schema._PRE_NOT_COMPUTABLE_VERSION
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESEARCH_EXPOSURES_VERSION + 1
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -872,8 +872,8 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
     # version 24 (#1506) `borrow_status`, version 28 (#1506, T172b)
     # `symbol_changes`, version 30 (#1713, T189c) `openfigi_types` and
     # version 31 (#821, T187) `successor_chains` and version 35 (#1762, T248c)
-    # `mergers` and version 37 (#2266, T280a) `reconcile_breaks`, all empty; nothing else
-    # gains a table.
+    # `mergers` and version 37 (#2266, T280a) `reconcile_breaks` and version 42
+    # (#2295) `snapshot_sightings`, all empty; nothing else gains a table.
     assert rows_after == {
         **rows_before,
         "filing_events": [],
@@ -887,6 +887,8 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         "reconcile_breaks": [],
         "sec_filing_events": [],
         "sec_form4_transactions": [],
+        "snapshot_sightings": [],
+        "delisting_reasons": [],
     }
     # And the migrated store is shaped exactly as a fresh one.
     # (A fresh store gets version 18's and version 20's two kinds before the lab's

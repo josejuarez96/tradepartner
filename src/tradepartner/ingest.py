@@ -350,10 +350,11 @@ from tradepartner.store.master import (
     build_master,
     chain_candidates,
     primary_security_id,
+    record_snapshot_sightings,
     securities_as_of,
     security_cik,
     session_of,
-    stored_snapshot_fetches,
+    stored_snapshot_history,
 )
 from tradepartner.store.master import (
     _held_ids as _master_held_ids,
@@ -2175,8 +2176,15 @@ def _form4_bulk(
     def checked(quarter: Quarter) -> bool:
         return order_check_path(settings, quarter, digests[quarter]).exists()
 
+    #: A dry run's passing order checks: the marker names it would write (#2757).
+    would_remember: list[str] = []
+
     def remember(quarter: Quarter) -> None:
-        edgar_raw.write_atomic(order_check_path(settings, quarter, digests[quarter]), b"passed")
+        marker = order_check_path(settings, quarter, digests[quarter])
+        if _DRY_RUN.get():  # a dry run changes nothing on disk; it names the marker
+            would_remember.append(marker.name)
+            return
+        edgar_raw.write_atomic(marker, b"passed")
 
     counts: Counter[str] = Counter(load_counts)
     counts["sec_forms_bulk_multi_owner_stored"] = sum(multi_owner_stored.values())
@@ -2346,9 +2354,11 @@ def _form4_bulk(
             mode="backfill",
         )
     figures = ", ".join(f"{name}: {count}" for name, count in sorted(counts.items()))
+    would_write = "".join(f"; order_check_would_write: {name}" for name in would_remember)
     return added, (
         f"Form 4 bulk: {len(selected)} selected, {added} rows added, "
         f"{source.requests} requests, {remaining} remaining; {plan.message()}; {figures}"
+        f"{would_write}"
     )
 
 
@@ -2526,12 +2536,13 @@ def _ingest_filings(
             )
         _fetch_and_gate(recorded, settings)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
-    # Each run fetches only today's SEC ticker file: the stored snapshot rows
-    # are the earlier fetches, so a rename is judged against them (#2291).
-    earlier = stored_snapshot_fetches(conn, now)
+    # Each run fetches only today's SEC ticker file. Stored sightings include
+    # pending first observations, so a rename needs confirmation (#2295).
+    earlier = stored_snapshot_history(conn, now)
     master, delistings, classes, facts, unmatched = _build_filings(
         recorded, settings, now, earlier_fetches=earlier
     )
+    record_snapshot_sightings(conn, recorded.companies_snapshot(), now, master.listings)
     restamped = ""
     if restamp is not None:
         result = restamp_from_manifest(

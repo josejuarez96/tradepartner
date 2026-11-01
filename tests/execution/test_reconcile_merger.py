@@ -13,7 +13,6 @@ dated before the window (inside the base).
 
 from __future__ import annotations
 
-import contextlib
 import json
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
@@ -305,10 +304,16 @@ def _halts(
     clock: FixedClock,
     session: date,
     minute: int = 0,
+    *,
+    halts: bool,
 ) -> list[dict[str, Any]]:
-    """Reconcile; return the row's recorded mismatches. A book-level one raises, a
-    name-level one is a break (T282d) and does not."""
-    with contextlib.suppress(ReconciliationError):
+    """Reconcile; return the row's recorded mismatches. A book-level one (cash)
+    raises, a name-level one is a break (T282d) and does not. `halts` is what the
+    case expects, and it is asserted either way (Greptile #2466, #2505)."""
+    if halts:
+        with pytest.raises(ReconciliationError):
+            _reconcile(settings, fake, window, clock, session, minute)
+    else:
         _reconcile(settings, fake, window, clock, session, minute)
     row = _rows(settings, window)[-1]
     mismatches: list[dict[str, Any]] = json.loads(row.mismatches_json or "")["mismatches"]
@@ -424,7 +429,7 @@ def test_cash_above_the_due_halts_on_cash(
     _merger(journal_settings)
     _removed(fake, DUE + 1.0)
 
-    mismatches = _halts(journal_settings, fake, open_window, fixed_clock, S)
+    mismatches = _halts(journal_settings, fake, open_window, fixed_clock, S, halts=True)
 
     assert [m["kind"] for m in mismatches] == ["cash"]
     assert _adjustments(journal_settings, open_window) == []
@@ -497,9 +502,9 @@ def test_a_credit_above_the_rest_of_the_due_halts_on_cash(
     assert _reconcile(journal_settings, fake, open_window, fixed_clock, S).status == OK
 
     fake.extra_cash = 700.0
-    assert [m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S2)] == [
-        "cash"
-    ]
+    assert [
+        m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S2, halts=True)
+    ] == ["cash"]
 
 
 def test_a_due_not_met_by_the_windows_end_halts_once_then_closes(
@@ -516,7 +521,7 @@ def test_a_due_not_met_by_the_windows_end_halts_once_then_closes(
     assert not _open(journal_settings, open_window, WINDOW_END).mergers[MTUM].final
 
     assert _open(journal_settings, open_window, AFTER).mergers[MTUM].final
-    mismatches = _halts(journal_settings, fake, open_window, fixed_clock, AFTER)
+    mismatches = _halts(journal_settings, fake, open_window, fixed_clock, AFTER, halts=True)
 
     (cash,) = mismatches
     assert cash["kind"] == "cash" and cash["security_id"] == MTUM
@@ -556,7 +561,7 @@ def test_with_no_row_and_no_delisting_a_removal_halts_as_today(
     _hold(journal_settings, fake, open_window)
     _removed(fake, DUE)
 
-    mismatches = _halts(journal_settings, fake, open_window, fixed_clock, S)
+    mismatches = _halts(journal_settings, fake, open_window, fixed_clock, S, halts=True)
 
     assert sorted(m["kind"] for m in mismatches) == ["cash", "ledger_only_position"]
     assert _open(journal_settings, open_window, S).mergers == {}
@@ -576,7 +581,9 @@ def test_a_row_known_only_after_close_s_minus_1_explains_nothing_at_s(
     _removed(fake, DUE)
 
     assert _open(journal_settings, open_window, S).mergers == {}
-    kinds = sorted(m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S))
+    kinds = sorted(
+        m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S, halts=True)
+    )
     assert kinds == ["cash", "ledger_only_position"]
     assert _open(journal_settings, open_window, S2).mergers[MTUM].merger_id == M1
 
@@ -595,16 +602,17 @@ def test_a_halted_removal_whose_row_is_stored_after_the_window(
     paid: float,
     halts_once: bool,
 ) -> None:
-    """The removal halts at S; the row is first known at close(AFTER), after its
-    window. The resumed run explains the held acquiree (open under (a)) and
+    """At S the removal's cash is unexplained and halts when it arrived (`paid` the
+    due) and is a name-level break when none arrived; the row is first known at
+    close(AFTER), after its window. The resumed run explains the held acquiree (open under (a)) and
     journals the removal once; a total short of the due halts on `cash` once."""
     _hold(journal_settings, fake, open_window)
     _removed(fake, paid)
-    _halts(journal_settings, fake, open_window, fixed_clock, S)
+    _halts(journal_settings, fake, open_window, fixed_clock, S, halts=not halts_once)
     _merger(journal_settings, known_at=session_close(AFTER))
 
     if halts_once:
-        (cash,) = _halts(journal_settings, fake, open_window, fixed_clock, LATER)
+        (cash,) = _halts(journal_settings, fake, open_window, fixed_clock, LATER, halts=True)
         assert cash["kind"] == "cash" and repr(M1) in cash["detail"]
     assert _reconcile(journal_settings, fake, open_window, fixed_clock, LATER, 30).status == OK
     (row,) = _adjustments(journal_settings, open_window)
@@ -660,9 +668,9 @@ def test_stock_merger_known_after_band_removal_gets_no_unchecked_cil_allowance(
 
     assert _open(journal_settings, open_window, S2).mergers == {}
     fake.extra_cash = 100.0
-    assert [m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S2)] == [
-        "cash"
-    ]
+    assert [
+        m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S2, halts=True)
+    ] == ["cash"]
 
 
 def test_a_row_stored_after_its_window_for_a_band_removal_opens_nothing(
@@ -679,7 +687,10 @@ def test_a_row_stored_after_its_window_for_a_band_removal_opens_nothing(
 
     assert _open(journal_settings, open_window, LATER).mergers == {}
     fake.extra_cash = DUE
-    kinds = [m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, LATER)]
+    kinds = [
+        m["kind"]
+        for m in _halts(journal_settings, fake, open_window, fixed_clock, LATER, halts=True)
+    ]
     assert kinds == ["cash"]
 
 
@@ -707,7 +718,7 @@ def test_two_rows_known_before_the_removal_halt_merger_conflict_once_then_fall_b
     _delisting(journal_settings, MTUM, KNOWN)
     _removed(fake, DUE)
 
-    (conflict,) = _halts(journal_settings, fake, open_window, fixed_clock, S)
+    (conflict,) = _halts(journal_settings, fake, open_window, fixed_clock, S, halts=False)
 
     assert conflict["kind"] == MERGER_CONFLICT and conflict["security_id"] == MTUM
     assert conflict["detail"] == (f"merger ids [{M1!r}, {M2!r}] for {MTUM} effective 2026-10-01")
@@ -738,13 +749,15 @@ def test_a_second_row_after_the_first_explained_the_removal_halts_once(
     assert _reconcile(journal_settings, fake, open_window, fixed_clock, S).status == OK
     _merger(journal_settings, M2, session_close(S))
 
-    (conflict,) = _halts(journal_settings, fake, open_window, fixed_clock, S2)
+    (conflict,) = _halts(journal_settings, fake, open_window, fixed_clock, S2, halts=False)
     assert conflict["kind"] == MERGER_CONFLICT
     assert repr(M1) in conflict["detail"] and repr(M2) in conflict["detail"]
 
     _stays_on_the_open_finding(journal_settings, fake, open_window, fixed_clock, S2, 30)
     fake.extra_cash = DUE
-    kinds = [m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S3)]
+    kinds = [
+        m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S3, halts=True)
+    ]
     assert kinds == ["cash"]
     assert len(_adjustments(journal_settings, open_window)) == 1
 
@@ -788,7 +801,9 @@ def test_a_stock_merger_without_a_receipt_halts_on_quantity(
     _merger(journal_settings, kind="stock", acquirer=SPY)
     _removed(fake, 0.0)
 
-    kinds = [m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S)]
+    kinds = [
+        m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S, halts=False)
+    ]
     assert kinds == ["quantity"]
 
 
@@ -847,7 +862,7 @@ def test_stock_merger_receipt_below_band_halts_on_quantity(
     _removed(fake)
     fake.extra_quantity["SPY"] = 0.5  # one share below the band's 1.5 lower edge
     assert "quantity" in [
-        m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S)
+        m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S, halts=False)
     ]
     assert _adjustments(journal_settings, open_window) == []
 

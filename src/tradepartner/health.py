@@ -86,6 +86,10 @@ here is this module's and is stated once:
   (`"<security_id>@<valid_from>"`), in that rule's row shape, so an accepted
   pair is listed, never silently hidden.
 - **Settings**: `universe.liquidity_rule_enabled` and `execution.fill_price`.
+- **Implausible Form 4 dates**: stored transactions known at `t` whose transaction
+  date is impossible: before `events.form4_min_transaction_date` or after the
+  filing's New York acceptance day plus `events.form4_after_acceptance_days`.
+  Report-only warning; source rows stay as filed.
 - **Statement facts** (`statement`, #660, T77c): `edgar.statement_facts_enabled`'s
   state; while it is on, `statement_coverage`'s share of `universe_as_of(T)`
   names whose issuer has a `revenue` and a `total_assets` row known at `t`
@@ -449,6 +453,7 @@ from tradepartner.store.asof import (
     _traded,
     _validate_t,
     borrow_status_as_of,
+    form4_date_plausibility_sql,
     listings_as_of,
     live_actions_as_of,
     mergers_as_of,
@@ -1890,6 +1895,7 @@ class HealthReport:
     mergers: MergersHealth
     figi_types: FigiTypes
     duplicate_dividends: DuplicateDividends
+    implausible_form4_dates: int
     filename_listings: FilenameListings
     successor_chains: SuccessorChains
     integrity: tuple[IntegrityCheck, ...]
@@ -2054,6 +2060,20 @@ def health_report(
         mergers=_mergers_report(conn, t, ingests),
         figi_types=_figi_types_report(conn, t, session, settings, current, classes),
         duplicate_dividends=dividends,
+        implausible_form4_dates=int(
+            (
+                conn.execute(
+                    "SELECT count(*) FROM sec_form4_transactions WHERE known_at <= ? AND NOT ("
+                    + form4_date_plausibility_sql(
+                        settings.events.form4_min_transaction_date,
+                        settings.events.form4_after_acceptance_days,
+                    )
+                    + ")",
+                    [t],
+                ).fetchone()
+                or (0,)
+            )[0]
+        ),
         filename_listings=_filename_listings(conn, t, listings),
         successor_chains=successor_chains(conn, t, settings, chain_candidates),
         integrity=_integrity_checks(conn, t, settings, listings, overlaps, dividends),

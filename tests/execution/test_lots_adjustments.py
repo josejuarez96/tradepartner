@@ -1125,3 +1125,155 @@ def test_open_lots_drop_a_sold_lot_and_keep_the_rest_of_a_partial_one() -> None:
     assert [(h.lot_id, h.quantity, h.basis, h.position_side) for h in held] == [
         (2, 10.0, 550.0, "long")
     ]
+
+
+# --- true-ups (paper spec amendment 2026-10-26 #2266, items 6 and 9) -------------------
+
+
+@pytest.mark.parametrize("kind", ["auto_true_up", "owner_true_up"])
+def test_a_positive_true_up_opens_a_zero_basis_lot_that_is_never_a_replacement(kind: str) -> None:
+    """Hand values:
+
+      03-03 buy 10 @ 50                        lot 1: basis 500
+      03-04 true-up to 12.5 (delta +2.5)       lot 2: 2.5 shares, basis 0, dated 03-04
+      03-05 sell 12.5 @ 40                     lot 1: pnl -100; lot 2: pnl +100
+    Lot 2 was bought by nobody, so it is no wash-sale replacement for lot 1's loss.
+    """
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303)
+    book.adjust(kind, D0304, "SEC_X", quantity=2.5, explanation={"broker_quantity": 12.5})
+    book.trade("sell", 12.5, 40.0, D0305)
+
+    lot_list, disposals, flags = book.run(D0305)
+
+    assert [(lot.quantity, lot.cost_basis, lot.trade_date_local) for lot in lot_list] == [
+        (10.0, 500.0, D0303),
+        (2.5, 0.0, D0304),
+    ]
+    assert [(d.lot_id, d.quantity, d.proceeds, d.realised_pnl) for d in disposals] == [
+        (1, 10.0, 400.0, -100.0),
+        (2, 2.5, 100.0, 100.0),
+    ]
+    assert flags == []
+
+
+def test_a_negative_true_up_closes_lots_fifo_at_zero_proceeds() -> None:
+    """Hand values:
+
+      03-03 buy 4 @ 50                         lot 1: basis 200
+      03-04 buy 6 @ 60                         lot 2: basis 360
+      03-05 true-up to 7 (delta -3)            lot 1: 3 shares closed, proceeds 0, pnl -150
+    The cash, if any, is booked by its own row, so the disposal carries none.
+    """
+    book = Book()
+    book.trade("buy", 4, 50.0, D0303)
+    book.trade("buy", 6, 60.0, D0304)
+    book.adjust("auto_true_up", D0305, "SEC_X", quantity=-3.0, explanation={"broker_quantity": 7.0})
+
+    _, disposals, _ = book.run(D0305)
+
+    assert [(d.lot_id, d.quantity, d.proceeds, d.realised_pnl) for d in disposals] == [
+        (1, 3.0, 0.0, -150.0)
+    ]
+
+
+def test_a_true_up_is_judged_against_its_absolute_quantity_not_its_delta() -> None:
+    """A split with an earlier ex-date that lands after the true-up was written is
+    already in the broker's figure. Hand values:
+
+      03-03 buy 10 @ 50
+      03-04 true-up to 21 (written when the ledger held 10 and the broker 21: delta +11)
+      split 2:1, ex-date 03-04 (known late): lot 1 becomes 20 shares
+    The lots must total the absolute 21, so the true-up opens 1 share, not 11.
+    """
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303)
+    book.adjust(
+        "auto_true_up", D0304, "SEC_X", quantity=11.0, explanation={"broker_quantity": 21.0}
+    )
+
+    lot_list, _, _ = book.run(D0304, _splits(("SEC_X", D0304, 2.0)))
+
+    assert sum(lot.quantity for lot in lot_list) == 21.0
+    assert [lot.quantity for lot in lot_list] == [20.0, 1.0]
+
+
+def test_a_cash_only_true_up_has_no_lot_effect_and_a_quantity_one_needs_the_absolute() -> None:
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303)
+    book.adjust("auto_true_up", D0304, "SEC_X", cash=10.0)
+    lot_list, disposals, _ = book.run(D0304)
+    assert [lot.quantity for lot in lot_list] == [10.0] and disposals == []
+
+    book.adjust("auto_true_up", D0305, "SEC_X", quantity=1.0)
+    with pytest.raises(ValueError, match="broker_quantity"):
+        book.run(D0305)
+
+
+def test_a_true_up_on_an_open_short_lot_raises() -> None:
+    book = Book()
+    _short_open(book)
+    book.adjust("auto_true_up", D0305, "SEC_X", quantity=1.0, explanation={"broker_quantity": 1.0})
+    with pytest.raises(LotLedgerError):
+        book.run(D0305)
+
+
+def test_a_fill_journaled_after_a_true_up_on_its_session_is_not_overwritten() -> None:
+    """Safety/quant pass 1: the true-up states the name as of its broker read; a
+    fill stamped after it, on the same session, adds to it. Hand values:
+
+      03-03 buy 10 @ 50
+      03-04 true-up to 10.01 (stamped 03-04 close + 30 min)
+      03-04 buy 5 @ 40 journaled after the true-up -> 15.01 shares, nothing closed
+    """
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303)
+    book.adjust(
+        "auto_true_up", D0304, "SEC_X", quantity=0.01, explanation={"broker_quantity": 10.01}
+    )
+    book.trade("buy", 5, 40.0, D0304)
+    late = book.fills[-1]
+    book.fills[-1] = OrderedFill(
+        FillRow(**{**late.fill.__dict__, "known_at": session_close(D0304) + timedelta(hours=2)}),
+        late.side,
+        late.security_id,
+        late.symbol,
+        late.window_id,
+        late.run_id,
+    )
+
+    lot_list, disposals, _ = book.run(D0304)
+
+    assert disposals == []
+    assert sum(lot.quantity for lot in lot_list) == pytest.approx(15.01)
+
+
+def test_a_fill_between_two_true_ups_of_one_session_is_counted_once() -> None:
+    """Steps 4 and 8 both reconcile on one session: true-up to 10.01, a buy of 5,
+    then a second true-up to 15.01 (its broker read holds the buy). Ordered by
+    their stamps the lots total 15.01, not 20.01."""
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303)
+    book.adjust(
+        "auto_true_up", D0304, "SEC_X", quantity=0.01, explanation={"broker_quantity": 10.01}
+    )
+    book.trade("buy", 5, 40.0, D0304)
+    late = book.fills[-1]
+    book.fills[-1] = OrderedFill(
+        FillRow(**{**late.fill.__dict__, "known_at": session_close(D0304) + timedelta(hours=1)}),
+        late.side,
+        late.security_id,
+        late.symbol,
+        late.window_id,
+        late.run_id,
+    )
+    second = book.adjust(
+        "auto_true_up", D0304, "SEC_X", quantity=0.0, explanation={"broker_quantity": 15.01}
+    )
+    book.adjustments[-1] = AdjustmentRow(
+        **{**second.__dict__, "known_at": session_close(D0304) + timedelta(hours=2)}
+    )
+
+    lot_list, _, _ = book.run(D0304)
+
+    assert sum(lot.quantity for lot in lot_list) == pytest.approx(15.01)
