@@ -217,6 +217,7 @@ from tradepartner.store.asof import (
     live_actions_as_of,
     mergers_as_of,
     prices_as_of,
+    spinoff_allocations_as_of,
     symbol_changes_as_of,
 )
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
@@ -1497,15 +1498,67 @@ def _open_orders(
     return orders, pending, sums
 
 
+def spinoff_receipt_terms(
+    conn: duckdb.DuckDBPyConnection,
+    cut: datetime,
+    actions: pl.DataFrame,
+    child: str,
+    parent: str,
+    through: date,
+) -> dict[str, object]:
+    """The `explanation_json` keys a `spinoff_receipt` of `child` carries (paper
+    spec amendment 2026-10-20, #1976, items 2 and 3): `parent_security_id`, the
+    spin-off's `ex_date` (the latest stored one on or before `through`, which
+    fixes the parent lots entitled to the child) and, only when one is stored
+    with `known_at <= cut` (close(S-1)), the owner-entered `basis_allocation`.
+    A fraction known later is not applied (no look-ahead), and the receipt is
+    never rewritten once journaled."""
+    terms: dict[str, object] = {"parent_security_id": parent}
+    ex_dates = [
+        row["ex_date"]
+        for row in actions.filter(
+            (pl.col("action_type") == _SPINOFF)
+            & (pl.col("security_id") == child)
+            & (pl.col("source_action_id") == parent)
+            & (pl.col("ex_date") <= through)
+        ).iter_rows(named=True)
+    ]
+    if not ex_dates:
+        return terms
+    ex_date = max(ex_dates)
+    return spinoff_terms_at(conn, cut, parent, child, ex_date)
+
+
+def spinoff_terms_at(
+    conn: duckdb.DuckDBPyConnection, cut: datetime, parent: str, child: str, ex_date: date
+) -> dict[str, object]:
+    """`spinoff_receipt_terms` for a known spin-off: the parent, `ex_date` and the
+    allocation stored with `known_at <= cut`, if any. `execution.window` writes
+    its residue receipt's terms through this too (#1976 item 2)."""
+    terms: dict[str, object] = {"parent_security_id": parent, "ex_date": ex_date.isoformat()}
+    stored = spinoff_allocations_as_of(conn, cut).filter(
+        (pl.col("parent_security_id") == parent)
+        & (pl.col("child_security_id") == child)
+        & (pl.col("ex_date") == ex_date)
+    )
+    if not stored.is_empty():
+        terms["basis_allocation"] = float(stored["basis_allocation"][0])
+    return terms
+
+
 def _explanation_json(
     text: str,
     reconciliation_id: int | None,
     merger_id: str | None = None,
     merger_terms: Mapping[str, object] | None = None,
+    spinoff_terms: Mapping[str, object] | None = None,
 ) -> str:
     """An adjustment's `explanation_json`: its text, the reconciliation that
-    journaled it and, for a merger's row, the merger id (#1762, T249)."""
+    journaled it and, for a merger's row, the merger id (#1762, T249) or, for a
+    spin-off receipt, its parent, ex-date and allocation (#1976, T255)."""
     payload: dict[str, object] = {"explanation": text, "reconciliation_id": reconciliation_id}
+    if spinoff_terms is not None:
+        payload.update(spinoff_terms)
     if merger_id is not None:
         payload["merger_id"] = merger_id
     if merger_terms is not None:
@@ -2207,6 +2260,17 @@ def reconcile_now(
     )
     with connect() as conn:
         evidence = _break_evidence(conn, cut, settings, names)
+        receipts = {
+            a.security_id
+            for a in (*result.adjustments, *result.explained)
+            if a.kind == "spinoff_receipt" and a.security_id in explanations.spinoffs
+        }
+        receipt_terms = {
+            child: spinoff_receipt_terms(
+                conn, cut, actions, child, explanations.spinoffs[child][0], session
+            )
+            for child in sorted(c for c in receipts if c is not None)
+        }
         open_now = open_breaks(conn, window_id)
         retained_finding = any(
             any(part["kind"] in break_rules.FINDING_KINDS for part in json.loads(row.parts_json))
@@ -2341,6 +2405,9 @@ def reconcile_now(
                             reconciliation_id,
                             adjustment.merger_id,
                             adjustment.merger_terms,
+                            receipt_terms.get(adjustment.security_id or "")
+                            if adjustment.kind == "spinoff_receipt"
+                            else None,
                         ),
                         book_id=window.book_id,
                         broker_activity_id=adjustment.broker_activity_id,

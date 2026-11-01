@@ -277,6 +277,7 @@ from tradepartner.execution.reconcile_run import (
     explanations_as_of,
     frozen_risk,
     reconcile_now,
+    spinoff_terms_at,
 )
 from tradepartner.store import registry
 from tradepartner.store.asof import live_actions_as_of
@@ -670,7 +671,7 @@ class _FlatnessPlan:
 
     carried: list[_Residue]
     carried_session: date | None
-    spinoff_receipts: list[tuple[str, float, date]]  # (security_id, quantity, session)
+    spinoff_receipts: list[tuple[str, float, date, str]]  # (child, quantity, ex_date, parent)
 
 
 def _check_flat(
@@ -712,7 +713,7 @@ def _check_flat(
             "by a broker position within the frozen quantity tolerance",
         )
 
-    spinoff_receipts: list[tuple[str, float, date]] = []
+    spinoff_receipts: list[tuple[str, float, date, str]] = []
     if carried and stated_on is not None:
         for residue in carried:
             for spinoff in _spinoffs_of(actions, residue.security_id, stated_on, now):
@@ -739,7 +740,9 @@ def _check_flat(
                 received = unmatched_symbols[child_ticker]
                 if abs(received - expected_today) <= tolerance:
                     del unmatched_symbols[child_ticker]
-                    spinoff_receipts.append((child, expected_at_ex_date, ex_date))
+                    spinoff_receipts.append(
+                        (child, expected_at_ex_date, ex_date, residue.security_id)
+                    )
 
     if unmatched_symbols:
         raise StartRefusedError(
@@ -950,7 +953,16 @@ def start(
                         ingested_at=reading,
                     ),
                 )
-            for security_id, quantity, ex_date in plan.spinoff_receipts:
+            for security_id, quantity, ex_date, parent in plan.spinoff_receipts:
+                # The same keys `reconcile_run` writes (#1976 item 2): the
+                # allocation known at close(ex_date - 1), if any.
+                terms = spinoff_terms_at(
+                    write_conn,
+                    session_close(previous_session(ex_date)),
+                    parent,
+                    security_id,
+                    ex_date,
+                )
                 append(
                     write_conn,
                     AdjustmentRow(
@@ -962,6 +974,11 @@ def start(
                         security_id=security_id,
                         quantity=quantity,
                         cash=None,
+                        explanation_json=json.dumps(
+                            {"explanation": f"spin-off child of {parent}", **terms},
+                            sort_keys=True,
+                            allow_nan=False,
+                        ),
                         book_id=row.book_id,
                         known_at=reading,
                         ingested_at=reading,
