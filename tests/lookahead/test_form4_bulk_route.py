@@ -228,3 +228,51 @@ def test_a_later_xml_fetch_is_invisible_in_a_store_truncated_before_it(
     assert late in set(later["accession"])
     manifest = parse_manifest((root / "manifests" / str(message_digest(first))).read_bytes())
     assert {entry["accession"] for entry in manifest["entries"]} == {early}
+
+
+def test_comparison_writes_no_fact_and_hides_a_later_xml_fetch() -> None:
+    """T349 (#2714): comparing bulk and XML rows is pure: it adds no store row, and an XML
+    row fetched after T stays invisible to an as-of read at T (a store truncated before
+    the fetch matches the store that compared)."""
+    from dataclasses import replace
+    from decimal import Decimal
+
+    from tradepartner.adapters.edgar import Form4Transaction
+    from tradepartner.adapters.form4_compare import RunTally, compare_rows, declaration_from
+
+    fetch_at = datetime(2026, 3, 31, 21, tzinfo=UTC)
+    before = datetime(2026, 3, 31, 20, tzinfo=UTC)
+    settings = Settings(_env_file=None, events=EventsConfig(sec_forms_read_enabled=True))
+    row = Form4Transaction(
+        "0000000001", "0000000002", 0, True, False, False, False, date(2026, 3, 30), None, "P", "A",
+        Decimal(10), Decimal("5.00"), Decimal(20), "D", "Common", None,
+    )  # fmt: skip
+    full = duckdb.connect(":memory:")
+    truncated = duckdb.connect(":memory:")
+    for conn in (full, truncated):
+        schema.init_schema(conn)
+    filing = SecFormFiling(
+        "0000000001-26-000001",
+        "4",
+        fetch_at,
+        date(2026, 3, 31),
+        ("0000000001",),
+        ("0000000002",),
+        (row,),
+    )
+    write_sec_form_accession(full, filing, ingested_at=fetch_at, source="sec_form4_xml")
+    count = "select count(*) from sec_filing_events"
+    rows_before = full.execute(count).fetchone()
+    tally = RunTally()
+    tally.add(
+        "0000000001-26-000001",
+        compare_rows([row], [replace(row, price=Decimal("6"))], declaration_from(settings.events)),
+    )
+    assert tally.disagreeing == 1
+    assert full.execute(count).fetchone() == rows_before
+    read_before = asof.sec_form4_transactions_as_of(full, before, settings=settings)
+    assert read_before.is_empty()
+    assert read_before.equals(
+        asof.sec_form4_transactions_as_of(truncated, before, settings=settings)
+    )
+    assert not asof.sec_form4_transactions_as_of(full, fetch_at, settings=settings).is_empty()

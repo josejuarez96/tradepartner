@@ -580,6 +580,28 @@ class CoverageConfig(_ClosedConfig):
         return tuple(parse_reference_name(entry) for entry in self.reference_names)
 
 
+# The fields rule 5 compares between the bulk data set and the XML (Form4Transaction's
+# names). Only the three numeric ones may carry a tolerance; the rest compare exactly.
+FORM4_TOLERANCE_FIELDS: tuple[str, ...] = ("price", "shares", "shares_owned_after")
+FORM4_COMPARE_FIELDS: tuple[str, ...] = (
+    "issuer_cik",
+    "filer_cik",
+    "line_no",
+    "is_director",
+    "is_officer",
+    "is_ten_percent_owner",
+    "is_other",
+    "transaction_date",
+    "deemed_execution_date",
+    "transaction_code",
+    "acquired_disposed",
+    *FORM4_TOLERANCE_FIELDS,
+    "ownership_form",
+    "security_title",
+    "date_of_original_submission",
+)
+
+
 class EventsConfig(_ClosedConfig):
     """SEC ownership event forms (plan T305, spec amendment 2026-10-28, #2435).
 
@@ -629,3 +651,37 @@ class EventsConfig(_ClosedConfig):
     form4_multi_owner_xml: bool = True
     sec_forms_max_requests: int = Field(default=40_000, gt=0, le=200_000)
     form4_bulk_max_member_bytes: int = Field(default=1024**3, gt=0, le=8 * 1024**3)
+    # Rule 5 per-field source comparison (plan T349, #2714, spec amendment 2026-10-31 item 6).
+    # `form4_compare_trusted`: which source's row is stored on a disagreement, per shared
+    # field ("xml" or "bulk"); a field left out is trusted to the XML. `form4_compare_decimals`:
+    # the approved precision for price, shares and shares-owned-after (2, as the data set
+    # rounds them). `form4_compare_tolerance`: extra absolute tolerance per rounded field after
+    # rounding (default none). Identity, owner, line number and every other field are exact
+    # and take no tolerance. `form4_compare_threshold`: the share of XML-fetched accessions
+    # that may disagree; unset (None) reports only and keeps the order-sample refusal.
+    form4_compare_trusted: dict[str, Literal["xml", "bulk"]] = Field(default_factory=dict)
+    form4_compare_decimals: int = Field(default=2, ge=0, le=8)
+    form4_compare_tolerance: dict[str, Decimal] = Field(default_factory=dict)
+    form4_compare_threshold: Decimal | None = Field(default=None, gt=0, le=1)
+
+    @field_validator("form4_compare_trusted")
+    @classmethod
+    def _check_compare_trusted(
+        cls, value: dict[str, Literal["xml", "bulk"]]
+    ) -> dict[str, Literal["xml", "bulk"]]:
+        unknown = sorted(set(value) - set(FORM4_COMPARE_FIELDS))
+        if unknown:
+            raise ValueError(f"form4_compare_trusted names unknown fields: {unknown}")
+        return value
+
+    @field_validator("form4_compare_tolerance")
+    @classmethod
+    def _check_compare_tolerance(cls, value: dict[str, Decimal]) -> dict[str, Decimal]:
+        bad = sorted(set(value) - set(FORM4_TOLERANCE_FIELDS))
+        if bad:
+            raise ValueError(
+                f"form4_compare_tolerance applies only to {sorted(FORM4_TOLERANCE_FIELDS)}: {bad}"
+            )
+        if any(not v.is_finite() or v < 0 for v in value.values()):
+            raise ValueError("form4_compare_tolerance must be finite and not negative")
+        return value
