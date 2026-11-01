@@ -89,17 +89,20 @@ def insider_zip_path(settings: Settings, quarter: Quarter) -> Path:
     )
 
 
-def insider_zip_fetch(settings: Settings, quarter: Quarter) -> tuple[str | None, datetime | None]:
+def insider_zip_fetch(
+    settings: Settings, quarter: Quarter, sha256: str
+) -> tuple[str | None, datetime | None]:
     """The URL and UTC fetch time `edgar_raw.insider_bulk_zip` recorded for the
-    cached zip (plan T348), or `(None, None)` for a zip cached before that or an
-    unreadable record."""
+    cached zip whose SHA-256 is `sha256` (plan T348), or `(None, None)` for a zip
+    cached before that, an unreadable record, or a record of other bytes."""
     path = edgar_raw.insider_fetch_path(insider_zip_path(settings, quarter))
     try:
         record = json.loads(path.read_text())
         url, at = record["url"], datetime.fromisoformat(record["fetched_at"])
+        recorded = record["sha256"]
     except (OSError, ValueError, KeyError, TypeError):
         return None, None
-    if not isinstance(url, str) or at.utcoffset() is None:
+    if not isinstance(url, str) or at.utcoffset() is None or recorded != sha256:
         return None, None
     return url, at
 

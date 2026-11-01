@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import zipfile
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -613,14 +614,17 @@ def test_insider_zip_fetch_records_its_url_and_utc_time(
         update={"edgar": settings.edgar.model_copy(update={"cache_dir": tmp_path / "cache"})}
     )
     quarter = Quarter(2026, 1)
-    assert insider_zip_fetch(settings, quarter) == (None, None)
+    assert insider_zip_fetch(settings, quarter, "0" * 64) == (None, None)
     before = datetime.now(UTC)
     fetched = edgar_raw.insider_bulk_zip(
         "2026q1", settings=settings, client=httpx.Client(transport=httpx.MockTransport(response))
     )
     assert fetched is not None and fetched[0] == insider_zip_path(settings, quarter)
-    url, at = insider_zip_fetch(settings, quarter)
+    digest = hashlib.sha256(buffer.read_bytes()).hexdigest()
+    url, at = insider_zip_fetch(settings, quarter, digest)
     assert url == sent[-1] and "datastandardsinnovation" in url
     assert at is not None and at.tzinfo is not None and at >= before
+    # A record of other bytes (a stale record beside a replaced zip) is not cited.
+    assert insider_zip_fetch(settings, quarter, "f" * 64) == (None, None)
     insider_zip_path(settings, quarter).with_name("2026q1_form345.fetch.json").write_text("{")
-    assert insider_zip_fetch(settings, quarter) == (None, None)
+    assert insider_zip_fetch(settings, quarter, digest) == (None, None)

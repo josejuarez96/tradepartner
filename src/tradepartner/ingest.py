@@ -270,6 +270,7 @@ from tradepartner.adapters.form4_archive import (
     prior_xml_hashes,
     quarter_message,
     recheck_verdict,
+    rechecked_against,
     zip_changed,
 )
 from tradepartner.adapters.form4_bulk_route import (
@@ -1638,19 +1639,25 @@ class _Form4Provenance:
     writer row cite it, in the same transaction. Every archive error propagates,
     so a refused write fails the source run and its rows roll back."""
 
-    def __init__(self, settings: Settings, run_id: str, writer: str) -> None:
+    def __init__(self, settings: Settings, run_id: str, writer: str, mode: str) -> None:
         self.settings = settings
         self.run_id = run_id
         self.writer = writer
+        self.mode = mode
         self.entries: list[dict[str, object]] = []
         self.zips: dict[Quarter, RawInput] = {}
         self.fetched: dict[str, RawInput] = {}
         self.digest: str | None = None
 
     @classmethod
-    def start(cls, settings: Settings, *, run_id: str, writer: str) -> _Form4Provenance | None:
-        """A recorder for writer run `run_id`, or `None` with the archive off."""
-        return cls(settings, run_id, writer) if raw_archive.archive_on(settings) else None
+    def start(
+        cls, settings: Settings, *, run_id: str, writer: str, mode: str = "backfill"
+    ) -> _Form4Provenance | None:
+        """A recorder for writer run `run_id` (source `writer`, run mode `mode`), or
+        `None` with the archive off."""
+        if not raw_archive.archive_on(settings):
+            return None
+        return cls(settings, run_id, writer, mode)
 
     def keep_xml(self, accession: str, fetched: FetchedXml) -> None:
         """`EdgarFilingSource.form4_xml_keeper`: keep the body before it is parsed."""
@@ -1670,7 +1677,7 @@ class _Form4Provenance:
                     f"insider zip {quarter.year}q{quarter.number} changed while it was "
                     f"kept ({kept.sha256} is not the checked {digest}); rerun"
                 )
-        url, fetched_at = insider_zip_fetch(self.settings, quarter)
+        url, fetched_at = insider_zip_fetch(self.settings, quarter, digest)
         self.zips[quarter] = RawInput(digest, url, fetched_at, _FORM4_BULK_PARSER)
 
     def xml_input(self, accession: str) -> RawInput:
@@ -1724,7 +1731,7 @@ class _Form4Provenance:
             body = build_manifest(
                 run_id=self.run_id,
                 source=self.writer,
-                mode="backfill",
+                mode=self.mode,
                 entries=self.entries,
                 zips=zips,
             )
@@ -1738,32 +1745,29 @@ def _provenance_clause(provenance: _Form4Provenance | None) -> str:
     return "" if provenance is None else f"; {PROVENANCE_KEY}={provenance.finish()}"
 
 
-def _prior_xml_hashes(
-    conn: duckdb.DuckDBPyConnection, settings: Settings, wanted: set[str], counts: Counter[str]
-) -> dict[str, str]:
-    """The held XML hash of each wanted accession, from the manifest of the writer
-    run whose entry wrote its stored row (#2714 item 5), newest writer first. Only
-    manifests are read, never a raw body; a missing or offline one is counted and
-    passed over, so its accessions compare by rows alone."""
-    found: dict[str, str] = {}
+def _form4_manifests(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, counts: Counter[str]
+) -> list[dict[str, Any]]:
+    """Every Form 4 writer run's manifest that its run row names, newest writer
+    first: the source of the held XML hashes and of the accessions already
+    rechecked against a zip hash (#2714 item 5). Read only when a changed zip
+    has held XML to recheck. Only manifests are read, never a raw body; a missing
+    or offline one is counted and passed over, so its accessions compare by rows
+    alone and are rechecked once more."""
+    manifests: list[dict[str, Any]] = []
     runs = conn.execute(
         "SELECT message FROM ingestion_runs WHERE source IN ('edgar', 'sec_forms') "
         "AND mode = 'backfill' ORDER BY started_at DESC, finished_at DESC NULLS LAST"
     ).fetchall()
     for (message,) in runs:
-        if len(found) == len(wanted):
-            break
         digest = message_digest(message)
         if digest is None:
             continue
         try:
-            manifest = parse_manifest(raw_archive.read_manifest(settings, digest))
+            manifests.append(parse_manifest(raw_archive.read_manifest(settings, digest)))
         except (raw_archive.RawArchiveMissingError, raw_archive.RawArchiveOfflineError):
             counts["sec_forms_provenance_manifest_unread"] += 1
-            continue
-        for accession, sha in prior_xml_hashes([manifest], wanted - found.keys()).items():
-            found[accession] = sha
-    return found
+    return manifests
 
 
 def _bulk_run_fields(message: str | None) -> dict[str, str]:
@@ -2015,6 +2019,18 @@ def _form4_bulk(
             sum(accession in skip for accession in chosen),
             time.monotonic() - started,
         )
+    # Rule 4: an accession already rechecked against its quarter's current zip hash
+    # (by an earlier run whose recheck elsewhere in the quarter failed) is not
+    # fetched again; only the failed ones are.
+    manifest_counts: Counter[str] = Counter()
+    manifests = _form4_manifests(conn, settings, manifest_counts) if rechecks else []
+    for quarter, due in list(rechecks.items()):
+        label = f"{quarter.year}q{quarter.number}"
+        done = rechecked_against(manifests, label, digests[quarter])
+        rechecks[quarter] = [row for row in due if row[0] not in done]
+        xml_expected -= len(due) - len(rechecks[quarter])
+        if not rechecks[quarter]:
+            del rechecks[quarter]
     first_pages = {cik for _accession, cik, _form, _filed in stamp_work}
     by_cik: dict[str, list[str]] = defaultdict(list)
     for accession, cik, _form, _filed in stamp_work:
@@ -2116,13 +2132,16 @@ def _form4_bulk(
     quarter_remaining: Counter[Quarter] = Counter()
     checked_digests = completed.copy()
     route_quarters = sorted(queued_by_quarter)
+    counts.update(manifest_counts)
     recheck_wanted = {row[0] for rows in rechecks.values() for row in rows}
-    prior = _prior_xml_hashes(conn, settings, recheck_wanted, counts) if recheck_wanted else {}
+    prior = prior_xml_hashes(manifests, recheck_wanted)
     rechecked: set[str] = set()
 
     def recheck(quarter: Quarter) -> BulkRouteResult | None:
         """Recheck the quarter's held XML accessions after a zip change; a result
-        only on a budget stop, which then stands in for the route's."""
+        only on a budget stop, which then stands in for the route's. A failed
+        recheck counts in the quarter's `remaining`, so its row is `partial`."""
+        nonlocal remaining
         if provenance is None:
             return None
         due = rechecks.get(quarter, [])
@@ -2137,6 +2156,8 @@ def _form4_bulk(
                 return BulkRouteResult(stop, source.requests, len(due) - position + pending)
             if filing is None:
                 counts["sec_forms_xml_recheck_failed"] += 1
+                quarter_remaining[quarter] += 1
+                remaining += 1
                 continue
             verdict = recheck_verdict(prior.get(accession), provenance.xml_input(accession).sha256)
             counts[f"sec_forms_xml_recheck_{verdict}"] += 1
@@ -2389,7 +2410,9 @@ def ingest_sec_forms(
         subjects = frozenset(
             cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
         )
-        provenance = _Form4Provenance.start(settings, run_id=run_id, writer=SEC_FORMS_SOURCE)
+        provenance = _Form4Provenance.start(
+            settings, run_id=run_id, writer=SEC_FORMS_SOURCE, mode="backfill"
+        )
         added, message = _write_sec_forms(
             conn, settings, filings, lambda: held, subjects, now, form4=True, provenance=provenance
         )
@@ -2524,7 +2547,9 @@ def _ingest_filings(
     if settings.events.sec_forms_enabled:
         form4 = _FORM4_BACKFILL.get()
         if form4:
-            form4_provenance = _Form4Provenance.start(settings, run_id=run_id, writer="edgar")
+            form4_provenance = _Form4Provenance.start(
+                settings, run_id=run_id, writer="edgar", mode="backfill"
+            )
         subjects = frozenset(
             cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
         )

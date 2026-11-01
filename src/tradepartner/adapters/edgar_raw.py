@@ -1287,9 +1287,18 @@ def insider_bulk_zip(
             if error.response.status_code != httpx.codes.NOT_FOUND:
                 raise
             continue
-        # Plan T348: the URL and UTC fetch time of these bytes, for the Form 4
-        # writer's provenance manifest (`form4_bulk_route.insider_zip_fetch`).
-        stamp = {"url": url, "fetched_at": datetime.now(UTC).isoformat()}
+        # Plan T348: the URL, UTC fetch time and SHA-256 of these bytes, for the
+        # Form 4 writer's manifest (`form4_bulk_route.insider_zip_fetch`); the hash
+        # ties the record to the bytes, so a stale record is never cited.
+        digest = hashlib.sha256()
+        with fetched[0].open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        stamp = {
+            "url": url,
+            "fetched_at": datetime.now(UTC).isoformat(),
+            "sha256": digest.hexdigest(),
+        }
         write_atomic(insider_fetch_path(dest), json.dumps(stamp).encode())
         return fetched
     return None

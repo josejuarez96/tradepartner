@@ -24,10 +24,11 @@ re-derive: no store, no network, no file system.
   `provenance_sha256` second, then `zip_sha256` and the rest, so both digests
   fit inside the 200-character `ingest.max_message_chars` test cap (163
   characters).
-- **Rule 4** (`zip_changed`, `recheck_verdict`, `prior_xml_hashes`): a held
-  accession makes no XML request unless its quarter's zip hash changed from a
-  recorded check; a recheck compares the new XML hash with the hash in the
-  manifest whose entry wrote the stored row.
+- **Rule 4** (`zip_changed`, `recheck_verdict`, `prior_xml_hashes`,
+  `rechecked_against`): a held accession makes no XML request unless its
+  quarter's zip hash changed from a recorded check, and then only once per zip
+  hash; a recheck compares the new XML hash with the hash in the manifest whose
+  entry wrote the stored row.
 - **Match** (`find_entry`): a stored row maps to exactly one manifest entry by
   row source, mode, accession, table key and row digest, never by an
   `ingested_at` window; none or several is an error.
@@ -248,6 +249,28 @@ def prior_xml_hashes(
             ):
                 found[accession] = entry["raw_sha256"]
     return found
+
+
+def rechecked_against(
+    manifests: Iterable[Mapping[str, Any]], quarter: str, zip_sha256: str
+) -> set[str]:
+    """The accessions whose XML a writer already rechecked (or fetched and wrote)
+    while `quarter`'s zip had this hash: entries of a manifest whose zips list it,
+    other than `not_written`. A failed recheck is not among them, so only it is
+    rechecked on the next run."""
+    done: set[str] = set()
+    for manifest in manifests:
+        if not any(
+            item.get("quarter") == quarter and item.get("sha256") == zip_sha256
+            for item in manifest.get("zips", ())
+        ):
+            continue
+        done.update(
+            entry["accession"]
+            for entry in manifest["entries"]
+            if entry.get("row_source") == XML_SOURCE and entry.get("outcome") != "not_written"
+        )
+    return done
 
 
 def find_entry(

@@ -273,3 +273,17 @@ def test_an_entry_is_matched_by_writer_source_mode_accession_key_and_digest() ->
         find_entry(
             [*manifests, _manifest("copy", "sec_forms", "backfill", _xml_entry())], **criteria
         )
+
+
+def test_rechecked_against_names_only_inputs_read_under_that_zip_hash() -> None:
+    zips = [{"quarter": "2026q3", "sha256": ZIP_SHA, "url": None, "fetched_at": None}]
+    done = _xml_entry(outcome="recheck_same")
+    failed = {**_xml_entry(accession="b", outcome="not_written")}
+    manifest = parse_manifest(
+        build_manifest(
+            run_id="r", source="edgar", mode="backfill", entries=[done, failed], zips=zips
+        )
+    )
+    assert fa.rechecked_against([manifest], "2026q3", ZIP_SHA) == {EVENT["accession"]}
+    assert fa.rechecked_against([manifest], "2026q3", "9" * 64) == set()
+    assert fa.rechecked_against([manifest], "2026q2", ZIP_SHA) == set()

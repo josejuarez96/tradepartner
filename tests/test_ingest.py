@@ -8734,7 +8734,12 @@ class _Form4Xml:
     request returns `body` and is counted in `fetches`."""
 
     def __init__(
-        self, settings: Settings, monkeypatch: pytest.MonkeyPatch, *, accession: str
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        accession: str,
+        extra: tuple[str, ...] = (),
     ) -> None:
         from tradepartner import diskfloor
         from tradepartner.adapters import edgar_raw
@@ -8753,22 +8758,33 @@ class _Form4Xml:
         self.zip = b"insider zip v1"
         self.bulk = InsiderBulk({})
         self.fetches: list[str] = []
-        record = SubmissionRecord(
-            accession, "4", "form4.xml", False, self.accepted, filing_date=self.filed
-        )
+        #: Accessions whose stamp lookup fails (a recheck that gets no filing back).
+        self.unstampable: set[str] = set()
+        names = (accession, *extra)
+        records = {
+            name: SubmissionRecord(
+                name, "4", "form4.xml", False, self.accepted, filing_date=self.filed
+            )
+            for name in names
+        }
         self.source = EdgarFilingSource(settings, client=httpx.Client(), clock=lambda: self.now)
-        row = UnstampedFiling(self.issuer, "Issuer", "4", accession, self.filed)
-        monkeypatch.setattr(self.source, "_rows", lambda *_: iter([((2026, 3), row)]))
+        rows = [
+            ((2026, 3), UnstampedFiling(self.issuer, "Issuer", "4", name, self.filed))
+            for name in names
+        ]
+        monkeypatch.setattr(self.source, "_rows", lambda *_: iter(rows))
         monkeypatch.setattr(self.source, "_load_stamps", lambda *_: {})
         monkeypatch.setattr(
-            self.source,
-            "_fetch_submissions",
-            lambda *_: SimpleNamespace(records={accession: record}),
+            self.source, "_fetch_submissions", lambda *_: SimpleNamespace(records=records)
         )
-        monkeypatch.setattr(self.source, "_sec_stamped", lambda *_: record)
+        monkeypatch.setattr(
+            self.source,
+            "_sec_stamped",
+            lambda _cik, name, _filed: None if name in self.unstampable else records[name],
+        )
 
-        def fetch(*_args: Any, **_kwargs: Any) -> edgar_raw.FetchedXml:
-            self.fetches.append(accession)
+        def fetch(_cik: str, name: str, *_args: Any, **_kwargs: Any) -> edgar_raw.FetchedXml:
+            self.fetches.append(name)
             return edgar_raw.FetchedXml(_F4_XML_URL, self.body, self.body.decode(), self.now)
 
         monkeypatch.setattr(edgar_raw, "fetch_filing_xml", fetch)
@@ -8789,9 +8805,9 @@ class _Form4Xml:
         self.fetches.append(self.accession)
         return self.body.decode()
 
-    def bulk_record(self) -> BulkAccession:
+    def bulk_record(self, accession: str | None = None) -> BulkAccession:
         return BulkAccession(
-            self.accession,
+            accession or self.accession,
             "4",
             self.filed,
             self.issuer,
@@ -8953,6 +8969,45 @@ def test_form4_changed_zip_rechecks_a_held_xml_accession_once(
     # Once rechecked, the quarter's checked digest moved: no further request.
     case.run(fixture_store, later + timedelta(days=1), "writer-3")
     assert case.fetches == [case.accession] * 2
+
+
+def test_form4_failed_recheck_is_counted_and_only_it_is_rechecked_again(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recheck that gets no filing back leaves its quarter `partial`, counted in
+    `remaining`; the next run rechecks only that accession, not those already
+    rechecked against the same zip hash (quant-auditor pass 1 on #2756)."""
+    other = "0000320193-26-000124"
+    enabled = _archive_settings(settings, tmp_path)
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123", extra=(other,))
+    case.run(fixture_store, case.now)
+    assert sorted(case.fetches) == sorted([case.accession, other])
+    case.zip = b"insider zip v2"
+    case.bulk = InsiderBulk({a: case.bulk_record(a) for a in (case.accession, other)})
+    case.unstampable = {other}
+    case.fetches.clear()
+    later = case.now + timedelta(days=1)
+    _added, message, _p = case.run(fixture_store, later, "writer-2")
+    assert case.fetches == [case.accession]
+    assert "sec_forms_xml_recheck_failed: 1" in message
+    status, quarter = fixture_store.execute(
+        "SELECT status, message FROM ingestion_runs WHERE source = 'sec_insider_bulk' "
+        "ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    fields = ingest_module._bulk_run_fields(quarter)
+    assert status == "partial" and fields["remaining"] == "1"
+    assert fields["checked_sha256"] == hashlib.sha256(b"insider zip v1").hexdigest()
+    # Next run: only the failed accession is rechecked; once it succeeds, none is.
+    case.unstampable = set()
+    case.fetches.clear()
+    case.run(fixture_store, later + timedelta(days=1), "writer-3")
+    assert case.fetches == [other]
+    case.fetches.clear()
+    case.run(fixture_store, later + timedelta(days=2), "writer-4")
+    assert case.fetches == []
 
 
 def test_form4_failed_archive_write_blocks_the_accessions_rows(
