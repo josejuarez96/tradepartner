@@ -64,6 +64,7 @@ callers omit it and get the module's shared, lazily-built client.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -512,6 +513,150 @@ def company_facts(
         client=client,
     )
     return response.json()
+
+
+_DAILY_INDEX_ROOT = "https://www.sec.gov/Archives/edgar/daily-index"
+_DAILY_FORM_NAME = re.compile(r"form\.(\d{4})(\d{2})(\d{2})\.idx")
+
+
+def _index_period(year: int, quarter: int) -> str:
+    if year < 1993 or quarter not in (1, 2, 3, 4):
+        raise ValueError(f"invalid EDGAR index quarter: {year} QTR{quarter}")
+    return f"{year}/QTR{quarter}"
+
+
+def daily_index_file_path(
+    year: int, quarter: int, name: str, *, settings: Settings | None = None
+) -> Path:
+    """Validated local path for one cached daily form index."""
+    period = _index_period(year, quarter)
+    match = _DAILY_FORM_NAME.fullmatch(name)
+    if match is None or int(match[1]) != year or (int(match[2]) - 1) // 3 + 1 != quarter:
+        raise InvalidFilingReferenceError(f"not a daily form file for {period}: {name!r}")
+    settings = settings or get_settings()
+    return Path(settings.edgar.cache_dir) / "daily-index" / period / name
+
+
+def daily_index_listing(
+    year: int,
+    quarter: int,
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> Any:
+    """SEC's JSON quarter directory listing, fetched through the shared limiter."""
+    period = _index_period(year, quarter)
+    settings = settings or get_settings()
+    return _get(f"{_DAILY_INDEX_ROOT}/{period}/index.json", settings=settings, client=client).json()
+
+
+def daily_index_file(
+    year: int,
+    quarter: int,
+    name: str,
+    *,
+    refresh: bool = False,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> Path:
+    """Cache one listed daily file, or reuse its local copy without a request."""
+    settings = settings or get_settings()
+    dest = daily_index_file_path(year, quarter, name, settings=settings)
+    if dest.is_file() and not refresh:
+        return dest
+    period = _index_period(year, quarter)
+    response = _get(f"{_DAILY_INDEX_ROOT}/{period}/{name}", settings=settings, client=client)
+    write_atomic(dest, response.content)
+    return dest
+
+
+def cached_daily_index_files(
+    year: int,
+    quarter: int,
+    names: Iterable[str],
+    *,
+    settings: Settings | None = None,
+) -> tuple[Path, ...]:
+    """Read cached daily files for a rebuild; fail closed when one is missing."""
+    settings = settings or get_settings()
+    paths = tuple(daily_index_file_path(year, quarter, name, settings=settings) for name in names)
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    return paths
+
+
+def cached_quarterly_index(
+    year: int,
+    quarter: int,
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> tuple[Path, bool]:
+    """Conditionally fetch a quarterly index; retain changed old bodies by hash.
+
+    Return the nightly cache path and whether its bytes changed. A 304 leaves
+    the cached file untouched; a differing 200 atomically replaces it.
+    """
+    period = _index_period(year, quarter)
+    settings = settings or get_settings()
+    dest = Path(settings.edgar.cache_dir) / "full-index" / period / "form.idx"
+    sidecar = dest.with_name("form.idx.validators.json")
+    headers: dict[str, str] = {}
+    if dest.is_file() and sidecar.is_file():
+        try:
+            saved = json.loads(sidecar.read_text())
+            stat = dest.stat()
+            if saved.get("size") == stat.st_size and saved.get("mtime_ns") == stat.st_mtime_ns:
+                for key, request_key in (
+                    ("etag", "If-None-Match"),
+                    ("last_modified", "If-Modified-Since"),
+                ):
+                    value = saved.get(key)
+                    if _usable_validator(value):
+                        headers[request_key] = value
+        except (OSError, ValueError, AttributeError):
+            pass
+    url = f"https://www.sec.gov/Archives/edgar/full-index/{period}/form.idx"
+    try:
+        response = _get(url, settings=settings, extra_headers=headers, client=client)
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code != httpx.codes.NOT_MODIFIED:
+            raise
+        response = error.response
+        _RATE_LIMIT_BLOCK.clear()
+    if response.status_code == httpx.codes.NOT_MODIFIED:
+        if not headers or not dest.is_file():
+            raise ValueError("quarterly index returned 304 without a cached validated copy")
+        return dest, False
+    body = response.content
+    if dest.is_file():
+        old = dest.read_bytes()
+        if old == body:
+            stat = dest.stat()
+            same_validators: dict[str, str | int] = {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+            for key, response_key in (("etag", "ETag"), ("last_modified", "Last-Modified")):
+                value = response.headers.get(response_key)
+                if _usable_validator(value):
+                    same_validators[key] = value
+            write_atomic(sidecar, json.dumps(same_validators).encode())
+            return dest, False
+        digest = hashlib.sha256(old).hexdigest()
+        snapshot = dest.with_name(f"form.idx.{digest}.snapshot")
+        if not snapshot.is_file():
+            write_atomic(snapshot, old)
+    write_atomic(dest, body)
+    stat = dest.stat()
+    validators: dict[str, str | int] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    for key, response_key in (("etag", "ETag"), ("last_modified", "Last-Modified")):
+        value = response.headers.get(response_key)
+        if _usable_validator(value):
+            validators[key] = value
+    write_atomic(sidecar, json.dumps(validators).encode())
+    return dest, True
 
 
 def filing_index_quarter(
