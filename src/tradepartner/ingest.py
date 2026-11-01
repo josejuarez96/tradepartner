@@ -1440,7 +1440,13 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None
             recorded.sec_subjects = frozenset(
                 cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
             )
-    _fetch_and_gate(recorded, settings)
+    try:
+        _fetch_and_gate(recorded, settings)
+    finally:
+        # A full repair's index handle (#2822): no store handle outlives the pass.
+        release = getattr(_unwrap(recorded), "release_index", None)
+        if callable(release):
+            release()
     _check_source_failures(_unwrap(recorded), dry_run=dry_run)
     recorded.frozen = True
 

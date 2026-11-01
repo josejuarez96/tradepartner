@@ -2350,6 +2350,19 @@ def test_dead_class_filings_below_one_is_refused(settings: Settings) -> None:
         fact_rows([], master, classes, ingested_at=NOW, dead_class_filings=0)
 
 
+def test_prefetch_releases_the_source_index_after_the_fetch_pass(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2822: a full repair's store handle never outlives the fetch pass, so the
+    master-retract dry run and the price read can open the store."""
+    source = _filings()
+    released: list[bool] = []
+    monkeypatch.setattr(source, "release_index", lambda: released.append(True), raising=False)
+    recorded = _Recorded(source)
+    _prefetch(recorded, settings, dry_run=True)
+    assert released == [True] and recorded.frozen
+
+
 def test_filename_evidence_is_fetched_before_freeze_only_when_enabled(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:

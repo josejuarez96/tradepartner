@@ -3452,3 +3452,85 @@ def test_a_cached_v5_cover_page_is_no_longer_served(settings: Settings) -> None:
     )
     source = _source(settings, EdgarRouter())
     assert source._load_cover_cache(accession) is None
+
+
+def _seeded_store_settings(tmp_path: Path, clock: datetime) -> Settings:
+    base = edgar_settings(tmp_path)
+    settings = base.model_copy(
+        update={"store": base.store.model_copy(update={"path": str(tmp_path / "store.duckdb")})}
+    )
+    conn = duckdb.connect(settings.store.path)
+    schema.init_schema(conn)
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, started_at, status, mode) "
+        "VALUES ('seed', 'edgar_index', ?, 'ok', 'rebuild')",
+        [clock],
+    )
+    conn.close()
+    return settings
+
+
+def test_released_repair_index_frees_the_store_and_refuses_later_reads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#2822 safety: after the fetch pass, a read-only open in this process
+    succeeds (the master-retract dry run), and no reader falls back to the
+    quarterly walk."""
+    from tradepartner.store.db import open_read_only
+
+    settings = _seeded_store_settings(tmp_path, CLOCK)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK, prefer_stored_index=True)
+    monkeypatch.setattr(source, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    assert source.filing_index() == []
+    source.release_index()
+    with open_read_only(settings) as conn:
+        assert conn.execute("SELECT count(*) FROM ingestion_runs").fetchone() == (1,)
+    with pytest.raises(RuntimeError, match="released"):
+        source.delistings()
+
+
+def test_pending_settle_check_uses_first_known_filed_on_quarter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Quant S1 (#2822): a filing of Apr 1 first listed by a quarterly file
+    dated Mar 31 settles with Q2, not Q1, so a lagging submissions answer
+    on Apr 5 writes no unstampable marker for the 13D or the Form 25."""
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2026, 1, 1)}
+            )
+        }
+    )
+    clock = datetime(2026, 4, 5, 16, tzinfo=UTC)
+    source = EdgarFilingSource(settings, clock=lambda: clock)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    rows = [
+        ("0000000003", "SC 13D", "0000000003-26-000140"),
+        ("0000000004", "25", "0000000005-26-000141"),
+    ]
+    conn.executemany(
+        "INSERT INTO filing_index_pending "
+        "(cik, accession, form, company_name, filed_on, listed_on) "
+        "VALUES (?, ?, ?, 'Issuer', ?, ?)",
+        [
+            (cik, accession, form, date(2026, 4, 1), date(2026, 3, 31))
+            for cik, form, accession in rows
+        ],
+    )
+    source.use_index(conn)
+    other = SubmissionRecord("0000000009-26-000001", "8-K", "x.htm", False, clock)
+    monkeypatch.setattr(
+        source,
+        "_fetch_submissions",
+        lambda _cik, _wanted: edgar_source_module._Submissions({other.accession: other}, [], clock),
+    )
+    monkeypatch.setattr(source, "_sgml_checked", lambda _cik, records: dict(records))
+    cik_13d, _, accession_13d = rows[0]
+    assert source.sec_form_stamp(cik_13d, accession_13d, date(2026, 4, 1)) is None
+    assert accession_13d not in source._load_stamps(cik_13d)
+    assert source.delistings() == []
+    cik_25, _, accession_25 = rows[1]
+    assert accession_25 not in source._load_stamps(cik_25)

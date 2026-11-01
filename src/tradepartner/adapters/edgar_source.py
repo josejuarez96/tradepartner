@@ -359,6 +359,7 @@ from tradepartner.calendar import is_session, next_session
 from tradepartner.config import Settings, clean_message
 from tradepartner.health import EDGAR_FILING_DATE_CUTOFF, clock_suspect
 from tradepartner.store import filing_index as stored_index
+from tradepartner.store.db import StoreLockedError, _is_lock_error, configure_connection
 from tradepartner.store.filing_index import FilingRow
 from tradepartner.store.master import _is_plain_common
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -637,6 +638,7 @@ class EdgarFilingSource(FilingSource):
         self._index_conn: duckdb.DuckDBPyConnection | None = None
         self._owned_index_conn: duckdb.DuckDBPyConnection | None = None
         self._index_checked = False
+        self._index_released = False
         self._prefer_stored_index = prefer_stored_index
         self._index_new_rows: tuple[stored_index.FilingRow | stored_index.Listing, ...] = ()
         self._index_touched_ciks: frozenset[str] | None = None
@@ -848,6 +850,7 @@ class EdgarFilingSource(FilingSource):
         if self._owned_index_conn is not None:
             self.close()
         self._index_checked = True
+        self._index_released = False
         self._index_conn = conn
         self._index_new_rows = tuple(new_rows)
         self._index_touched_ciks = touched_ciks
@@ -860,8 +863,21 @@ class EdgarFilingSource(FilingSource):
             self._owned_index_conn = None
             self._index_conn = None
 
+    def release_index(self) -> None:
+        """End of the fetch pass: drop the repair's store handle (#2822).
+
+        The build then answers from the recorded pass, so the dry run's
+        read-only connection and other processes are not locked out. A later
+        index read raises instead of silently walking the quarterly files.
+        """
+        if self._owned_index_conn is not None:
+            self.close()
+            self._index_released = True
+
     def _maybe_use_stored_index(self) -> None:
         """Full repair and rebuild commands use a completed index seed."""
+        if self._index_released:
+            raise RuntimeError("stored filing index read after the fetch pass released it")
         if self._index_checked or not self._prefer_stored_index:
             return
         self._index_checked = True
@@ -869,8 +885,14 @@ class EdgarFilingSource(FilingSource):
         if not path.is_file():
             return
         # Keep the same connection mode as the later writer: DuckDB rejects
-        # simultaneous read-only and read-write handles to one store.
-        conn = duckdb.connect(str(path))
+        # simultaneous read-only and read-write handles to one store. The
+        # fetch pass releases it (`release_index`) before any other opens.
+        try:
+            conn = configure_connection(duckdb.connect(str(path)), self._settings.store)
+        except duckdb.IOException as exc:
+            if _is_lock_error(exc):
+                raise StoreLockedError("store busy: the filing index is locked") from None
+            raise
         try:
             seed = conn.execute(
                 "SELECT max(started_at) FROM ingestion_runs WHERE source = 'edgar_index' "
@@ -888,11 +910,13 @@ class EdgarFilingSource(FilingSource):
                 and latest_edgar[0] is not None
                 and latest_edgar[0] > seed[0]
             ):
-                conn.close()
                 raise RuntimeError("stored filing index is stale; rebuild the index before repair")
         except duckdb.CatalogException:
             conn.close()
             return  # a pre-T318 store has no cursor table
+        except BaseException:
+            conn.close()
+            raise
         self.use_index(conn)
         self._owned_index_conn = conn
 
@@ -1954,10 +1978,9 @@ class EdgarFilingSource(FilingSource):
             ),
             None,
         )
-        pending_quarter: Quarter | None = None
         if self._index_conn is not None and first_row is None:
             pending = self._index_conn.execute(
-                "SELECT filed_on, listed_on FROM filing_index_pending "
+                "SELECT filed_on FROM filing_index_pending "
                 "WHERE cik = ? AND accession = ? AND listed_on <= ? AND listed_on >= ?",
                 [
                     issuer_cik,
@@ -1968,8 +1991,10 @@ class EdgarFilingSource(FilingSource):
             ).fetchone()
             if pending is None:
                 return None
+            # The settle check dates a pending row by its first-known filed_on
+            # (T323a), never by listed_on, which a quarterly file can set a
+            # quarter early.
             filed_date = pending[0]
-            pending_quarter = (pending[1].year, (pending[1].month - 1) // 3 + 1)
         if first_row is not None:
             filed_date = first_row.filed_on
         stamps = self._load_stamps(issuer_cik)
@@ -1995,7 +2020,7 @@ class EdgarFilingSource(FilingSource):
             submissions = self._fetch_submissions(issuer_cik, {accession})
             found = submissions.records.get(accession)
             if found is None:
-                quarter = pending_quarter or (filed_date.year, (filed_date.month - 1) // 3 + 1)
+                quarter = (filed_date.year, (filed_date.month - 1) // 3 + 1)
                 if not submissions.empty and self._settled(quarter, submissions.fetched_at):
                     stamps[accession] = SubmissionRecord(accession, "", "", False, None)
                     self._save_stamps(issuer_cik, stamps)
@@ -3149,18 +3174,10 @@ class EdgarFilingSource(FilingSource):
             preferred_cik = {
                 accession: row.cik for accession, row in first_per_accession(selected).items()
             }
-            pending_quarters = {
-                (cik, accession): (listed_on.year, (listed_on.month - 1) // 3 + 1)
-                for cik, accession, listed_on in self._index_conn.execute(
-                    "SELECT cik, accession, listed_on FROM filing_index_pending"
-                ).fetchall()
-            }
             pending_kept: dict[str, dict[str, tuple[UnstampedFiling, Quarter]]] = {}
             for filing in selected:
-                quarter = pending_quarters.get(
-                    (filing.cik, filing.accession),
-                    (filing.filed_on.year, (filing.filed_on.month - 1) // 3 + 1),
-                )
+                # Settle by the first-known filed_on's quarter, pending or not.
+                quarter = (filing.filed_on.year, (filing.filed_on.month - 1) // 3 + 1)
                 kept.setdefault(filing.cik, {}).setdefault(filing.accession, (filing, quarter))
                 if (filing.cik, filing.accession) in pending_keys:
                     pending_kept.setdefault(filing.cik, {})[filing.accession] = (filing, quarter)
