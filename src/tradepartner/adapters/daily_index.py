@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-_DAILY_NAME = re.compile(r"form\.(\d{4})(\d{2})(\d{2})\.idx")
+DAILY_FORM_NAME = re.compile(r"form\.(\d{4})(\d{2})(\d{2})\.idx")
 
 
 @dataclass(frozen=True)
@@ -26,8 +26,9 @@ def parse_daily_listing(
     """Extract only dated form files belonging to the requested quarter.
 
     File names come exclusively from the listing, never a guessed calendar.
-    The listing's size and last-modified text are cursor values, not an
-    estimate of decoded body bytes or a point-in-time fact stamp.
+    The listing's size and last-modified text are opaque cursor values. SEC's
+    last-modified text is Eastern wall time without a zone; it must not be
+    parsed as UTC or used as `listed_on` by later tasks.
     """
     if quarter not in (1, 2, 3, 4):
         raise ValueError(f"quarter must be 1-4, got {quarter}")
@@ -39,7 +40,7 @@ def parse_daily_listing(
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             raise ValueError("daily index listing has a malformed item")
         name = item["name"]
-        match = _DAILY_NAME.fullmatch(name)
+        match = DAILY_FORM_NAME.fullmatch(name)
         if match is None:
             continue
         listed_year, month, _day = map(int, match.groups())

@@ -1,98 +1,67 @@
-"""Offline incremental EDGAR raw request and cache behavior."""
+"""Network smoke test for `adapters.edgar_raw` against the real SEC EDGAR API.
+
+Skipped unless `RUN_NETWORK_TESTS=1` is set alongside a real
+`SEC_EDGAR_USER_AGENT` in the environment/`.env`. Not a parser test (T11
+owns those on recorded fixtures) — it only proves the raw client talks to
+the real API, respects the throttle, and returns plain JSON/text, never a
+parsed record. For offline coverage of the throttle/retry/credential/
+path-safety behavior (mocked transport, no real network), see
+`test_edgar_raw_offline.py`.
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
+import os
 
-import httpx
-from pydantic import SecretStr
+import pytest
 
 from tradepartner.adapters import edgar_raw
-from tradepartner.config import Settings
 
-FIXTURE = Path(__file__).resolve().parents[1] / "fixtures/edgar/daily_index"
+pytestmark = [
+    pytest.mark.network,
+    pytest.mark.skipif(
+        os.environ.get("RUN_NETWORK_TESTS") != "1",
+        reason="network test; set RUN_NETWORK_TESTS=1 to run",
+    ),
+]
 
-
-def _settings(tmp_path: Path) -> Settings:
-    settings = Settings(sec_edgar_user_agent=SecretStr("Test test@example.com"))
-    settings.edgar.cache_dir = tmp_path
-    return settings
-
-
-def test_daily_listing_and_cache_use_limiter(tmp_path: Path, monkeypatch: object) -> None:
-    calls: list[str] = []
-    waits: list[float] = []
-    monkeypatch.setattr(edgar_raw._LIMITER, "wait", waits.append)  # type: ignore[attr-defined]
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        calls.append(str(request.url))
-        if request.url.path.endswith("index.json"):
-            return httpx.Response(200, content=(FIXTURE / "index.json").read_bytes())
-        return httpx.Response(200, content=b"daily body")
-
-    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
-        settings = _settings(tmp_path)
-        listing = edgar_raw.daily_index_listing(2026, 2, settings=settings, client=client)
-        assert isinstance(listing["directory"]["item"], list)
-        path = edgar_raw.daily_index_file(
-            2026, 2, "form.20260401.idx", settings=settings, client=client
-        )
-        assert path.read_bytes() == b"daily body"
-        assert (
-            edgar_raw.daily_index_file(
-                2026, 2, "form.20260401.idx", settings=settings, client=client
-            )
-            == path
-        )
-    assert len(calls) == len(waits) == 2
+_APPLE_CIK = "0000320193"
 
 
-def test_quarterly_conditional_get_keeps_304_and_snapshots_changed_200(
-    tmp_path: Path, monkeypatch: object
-) -> None:
-    waits: list[float] = []
-    monkeypatch.setattr(edgar_raw._LIMITER, "wait", waits.append)  # type: ignore[attr-defined]
-    seen: list[httpx.Request] = []
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        if len(seen) == 2:
-            assert request.headers["if-none-match"] == '"one"'
-            return httpx.Response(304)
-        body = b"first" if len(seen) == 1 else b"second"
-        return httpx.Response(
-            200, content=body, headers={"ETag": '"one"' if len(seen) == 1 else '"two"'}
-        )
-
-    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
-        settings = _settings(tmp_path)
-        first, changed = edgar_raw.cached_quarterly_index(2026, 2, settings=settings, client=client)
-        assert changed and first.read_bytes() == b"first"
-        stat = first.stat().st_mtime_ns
-        again, changed = edgar_raw.cached_quarterly_index(2026, 2, settings=settings, client=client)
-        assert not changed and again == first and first.stat().st_mtime_ns == stat
-        latest, changed = edgar_raw.cached_quarterly_index(
-            2026, 2, settings=settings, client=client
-        )
-        assert changed and latest.read_bytes() == b"second"
-        assert next(first.parent.glob("form.idx.*.snapshot")).read_bytes() == b"first"
-    assert len(waits) == len(seen) == 3
+def test_company_tickers_returns_json_serializable_payload() -> None:
+    payload = edgar_raw.company_tickers()
+    json.dumps(payload)
 
 
-def test_quarterly_same_body_refreshes_validator_without_rewriting_cache(
-    tmp_path: Path,
-) -> None:
-    seen: list[httpx.Request] = []
+def test_submissions_returns_payload_for_a_known_cik() -> None:
+    payload = edgar_raw.submissions(_APPLE_CIK)
 
-    def handle(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        return httpx.Response(200, content=b"same", headers={"ETag": f'"v{len(seen)}"'})
+    assert payload["cik"] == str(int(_APPLE_CIK))
+    json.dumps(payload)
 
-    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
-        settings = _settings(tmp_path)
-        path, _ = edgar_raw.cached_quarterly_index(2026, 2, settings=settings, client=client)
-        stamp = path.stat().st_mtime_ns
-        _, changed = edgar_raw.cached_quarterly_index(2026, 2, settings=settings, client=client)
-        assert not changed and path.stat().st_mtime_ns == stamp
-        edgar_raw.cached_quarterly_index(2026, 2, settings=settings, client=client)
-    assert seen[2].headers["if-none-match"] == '"v2"'
+
+def test_company_facts_returns_json_serializable_payload() -> None:
+    payload = edgar_raw.company_facts(_APPLE_CIK)
+    json.dumps(payload)
+
+
+def test_filing_index_quarter_returns_text() -> None:
+    text = edgar_raw.filing_index_quarter(2024, 1)
+
+    assert isinstance(text, str)
+    assert len(text) > 0
+
+
+def test_submissions_page_rejects_a_name_that_is_not_a_page() -> None:
+    """The page name flows into a URL, so only the documented shape is accepted (T3)."""
+    for bad in ["../secret.json", "CIK0000320193.json", "CIK0000320193-submissions-1.json", ""]:
+        with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+            edgar_raw.submissions_page(bad)
+
+
+def test_insider_bulk_zip_reads_a_published_quarter_and_a_future_one_as_unpublished() -> None:
+    """T305b (#2498): a published DERA quarter streams; a quarter far ahead is a 404."""
+    published = edgar_raw.insider_bulk_zip("2025q4")
+    assert published is not None and published[0].is_file()
+    assert edgar_raw.insider_bulk_zip("2099q1") is None

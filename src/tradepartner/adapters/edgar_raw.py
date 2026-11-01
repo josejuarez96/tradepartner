@@ -64,6 +64,7 @@ callers omit it and get the module's shared, lazily-built client.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import math
@@ -83,6 +84,7 @@ from typing import Any
 import httpx
 from pydantic import SecretStr
 
+from tradepartner.adapters.daily_index import DAILY_FORM_NAME, DailyIndexFile
 from tradepartner.config import Settings, get_settings
 
 #: `429`/`503`: SEC's standard "back off" statuses, retried with capped
@@ -516,11 +518,12 @@ def company_facts(
 
 
 _DAILY_INDEX_ROOT = "https://www.sec.gov/Archives/edgar/daily-index"
-_DAILY_FORM_NAME = re.compile(r"form\.(\d{4})(\d{2})(\d{2})\.idx")
 
 
 def _index_period(year: int, quarter: int) -> str:
-    if year < 1993 or quarter not in (1, 2, 3, 4):
+    from tradepartner.adapters.edgar_source import CENSUS_FIRST_YEAR
+
+    if year < CENSUS_FIRST_YEAR or quarter not in (1, 2, 3, 4):
         raise ValueError(f"invalid EDGAR index quarter: {year} QTR{quarter}")
     return f"{year}/QTR{quarter}"
 
@@ -530,7 +533,7 @@ def daily_index_file_path(
 ) -> Path:
     """Validated local path for one cached daily form index."""
     period = _index_period(year, quarter)
-    match = _DAILY_FORM_NAME.fullmatch(name)
+    match = DAILY_FORM_NAME.fullmatch(name)
     if match is None or int(match[1]) != year or (int(match[2]) - 1) // 3 + 1 != quarter:
         raise InvalidFilingReferenceError(f"not a daily form file for {period}: {name!r}")
     settings = settings or get_settings()
@@ -553,20 +556,56 @@ def daily_index_listing(
 def daily_index_file(
     year: int,
     quarter: int,
-    name: str,
+    file: DailyIndexFile,
     *,
     refresh: bool = False,
     settings: Settings | None = None,
     client: httpx.Client | None = None,
 ) -> Path:
-    """Cache one listed daily file, or reuse its local copy without a request."""
+    """Cache a listed daily file; preserve old raw bytes when SEC re-posts it.
+
+    The caller must pass a file from `parse_daily_listing`, so no guessed date
+    reaches the request. Its opaque listing fields determine cache freshness.
+    """
     settings = settings or get_settings()
-    dest = daily_index_file_path(year, quarter, name, settings=settings)
-    if dest.is_file() and not refresh:
-        return dest
+    dest = daily_index_file_path(year, quarter, file.name, settings=settings)
     period = _index_period(year, quarter)
-    response = _get(f"{_DAILY_INDEX_ROOT}/{period}/{name}", settings=settings, client=client)
-    write_atomic(dest, response.content)
+    if file.path != f"daily-index/{period}/{file.name}":
+        raise InvalidFilingReferenceError(f"daily index path does not match {file.name!r}")
+    sidecar = dest.with_name(f"{dest.name}.listing.json")
+    cursor = {"last_modified": file.last_modified, "size": file.size}
+    if dest.is_file() and sidecar.is_file() and not refresh:
+        try:
+            if sidecar.stat().st_size > _VALIDATORS_SIDECAR_MAX_BYTES:
+                raise ValueError("daily index sidecar too large")
+            saved = json.loads(sidecar.read_text())
+            stat = dest.stat()
+            if (
+                isinstance(saved, dict)
+                and all(saved.get(key) == value for key, value in cursor.items())
+                and saved.get("body_size") == stat.st_size
+                and saved.get("body_mtime_ns") == stat.st_mtime_ns
+            ):
+                return dest
+        except (OSError, ValueError):
+            pass
+    response = _get(f"{_DAILY_INDEX_ROOT}/{period}/{file.name}", settings=settings, client=client)
+    body = response.content
+    if dest.is_file():
+        old = dest.read_bytes()
+        if old != body:
+            snapshot = dest.with_name(f"{dest.name}.{hashlib.sha256(old).hexdigest()}.snapshot")
+            if not snapshot.is_file():
+                write_atomic(snapshot, old)
+    if not dest.is_file() or old != body:
+        write_atomic(dest, body)
+    stat = dest.stat()
+    write_atomic(
+        sidecar,
+        json.dumps(
+            {**cursor, "body_size": stat.st_size, "body_mtime_ns": stat.st_mtime_ns}
+        ).encode(),
+    )
     return dest
 
 
@@ -593,30 +632,15 @@ def cached_quarterly_index(
     settings: Settings | None = None,
     client: httpx.Client | None = None,
 ) -> tuple[Path, bool]:
-    """Conditionally fetch a quarterly index; retain changed old bodies by hash.
+    """Conditionally fetch a settled quarter; retain changed old bodies by hash.
 
-    Return the nightly cache path and whether its bytes changed. A 304 leaves
-    the cached file untouched; a differing 200 atomically replaces it.
+    Call for settled quarters only. Return the rebuild cache path and whether
+    decoded bytes changed. A 304 leaves it untouched; a differing 200 replaces it.
     """
     period = _index_period(year, quarter)
     settings = settings or get_settings()
-    dest = Path(settings.edgar.cache_dir) / "full-index" / period / "form.idx"
-    sidecar = dest.with_name("form.idx.validators.json")
-    headers: dict[str, str] = {}
-    if dest.is_file() and sidecar.is_file():
-        try:
-            saved = json.loads(sidecar.read_text())
-            stat = dest.stat()
-            if saved.get("size") == stat.st_size and saved.get("mtime_ns") == stat.st_mtime_ns:
-                for key, request_key in (
-                    ("etag", "If-None-Match"),
-                    ("last_modified", "If-Modified-Since"),
-                ):
-                    value = saved.get(key)
-                    if _usable_validator(value):
-                        headers[request_key] = value
-        except (OSError, ValueError, AttributeError):
-            pass
+    dest = Path(settings.edgar.cache_dir) / "index" / f"{year}-QTR{quarter}.idx.gz"
+    headers = _conditional_headers(dest, archive_kind="gzip")
     url = f"https://www.sec.gov/Archives/edgar/full-index/{period}/form.idx"
     try:
         response = _get(url, settings=settings, extra_headers=headers, client=client)
@@ -631,31 +655,20 @@ def cached_quarterly_index(
         return dest, False
     body = response.content
     if dest.is_file():
-        old = dest.read_bytes()
+        old_encoded = dest.read_bytes()
+        try:
+            old = gzip.decompress(old_encoded)
+        except (OSError, EOFError, zlib.error):
+            old = None
         if old == body:
-            stat = dest.stat()
-            same_validators: dict[str, str | int] = {
-                "size": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns,
-            }
-            for key, response_key in (("etag", "ETag"), ("last_modified", "Last-Modified")):
-                value = response.headers.get(response_key)
-                if _usable_validator(value):
-                    same_validators[key] = value
-            write_atomic(sidecar, json.dumps(same_validators).encode())
+            _write_validators(dest, response.headers)
             return dest, False
-        digest = hashlib.sha256(old).hexdigest()
-        snapshot = dest.with_name(f"form.idx.{digest}.snapshot")
+        digest = hashlib.sha256(old if old is not None else old_encoded).hexdigest()
+        snapshot = dest.with_name(f"{dest.name}.{digest}.snapshot")
         if not snapshot.is_file():
-            write_atomic(snapshot, old)
-    write_atomic(dest, body)
-    stat = dest.stat()
-    validators: dict[str, str | int] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-    for key, response_key in (("etag", "ETag"), ("last_modified", "Last-Modified")):
-        value = response.headers.get(response_key)
-        if _usable_validator(value):
-            validators[key] = value
-    write_atomic(sidecar, json.dumps(validators).encode())
+            write_atomic(snapshot, gzip.compress(old, mtime=0) if old is not None else old_encoded)
+    write_atomic(dest, gzip.compress(body, mtime=0))
+    _write_validators(dest, response.headers)
     return dest, True
 
 
@@ -968,23 +981,26 @@ def _validators_path(dest: Path) -> Path:
     return dest.with_name(f"{dest.name}.validators.json")
 
 
-def _conditional_headers(dest: Path) -> dict[str, str]:
-    """`If-Modified-Since` / `If-None-Match` for the zip cached at `dest`, from
-    its sidecar; empty (an unconditional `GET`, the pre-#2594 behaviour) when
-    there is no cached zip, no readable sidecar, a sidecar whose recorded size
-    or `st_mtime_ns` is not the cached file's (so a zip replaced by hand is
-    never vouched for by the old copy's validators), a sidecar over `_VALIDATORS_SIDECAR_MAX_BYTES`,
-    any validator that is not printable ASCII (`_usable_validator`), none at
-    all, or a cached file that does not open as a zip."""
+def _conditional_headers(dest: Path, *, archive_kind: str = "zip") -> dict[str, str]:
+    """`If-Modified-Since` / `If-None-Match` for the archive cached at `dest`, from
+    its sidecar. Empty headers request an unconditional GET when the cached
+    archive, its sidecar, or its validators are absent or invalid. The size
+    cap and size/mtime binding prevent a stale sidecar from validating a
+    replaced file. `archive_kind` selects zip or gzip integrity checking."""
     sidecar_path = _validators_path(dest)
     try:
         if sidecar_path.stat().st_size > _VALIDATORS_SIDECAR_MAX_BYTES:
             return {}
         sidecar = json.loads(sidecar_path.read_text())
         stat = dest.stat()
-        with zipfile.ZipFile(dest):
-            pass
-    except (OSError, ValueError, RecursionError, zipfile.BadZipFile):
+        if archive_kind == "zip":
+            with zipfile.ZipFile(dest):
+                pass
+        elif archive_kind == "gzip":
+            gzip.decompress(dest.read_bytes())
+        else:
+            raise ValueError(f"unknown archive kind: {archive_kind}")
+    except (OSError, ValueError, RecursionError, zipfile.BadZipFile, EOFError, zlib.error):
         return {}
     if (
         not isinstance(sidecar, dict)
