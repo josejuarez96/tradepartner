@@ -1,0 +1,3 @@
+- T342 recount (#2679): FAIL, $200M has at most 47 opportunistic events (floor 400) and no treated delister; the B7 study is INSUFFICIENT at its feasibility gate, T332-T341 and T344 struck. Owner: N +2, ledger value.
+### Changed
+- B7 Form 4 insider study: T342 counts-only recount recorded FAIL ($200M: 47 < 400 events, zero treated delisters); B7 backlog and ladder-ledger rows record the study INSUFFICIENT under its own feasibility gate (docs/research/2026-11-form4-insider-feasibility-recount.md).
