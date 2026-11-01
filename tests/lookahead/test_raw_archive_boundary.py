@@ -23,7 +23,7 @@ default, and splits by capability:
   `TRADEPARTNER_RAW_ARCHIVE`, the re-derive module).
 
 A text scan, not only an AST walk, so a dynamic import, an environment read or a
-settings attribute is caught too. T347, T348, T352 and T361 extend the lists for
+settings attribute is caught too. T347, T348, T352 and T361a extend the lists for
 the modules they add.
 """
 
@@ -38,8 +38,12 @@ _REPO = Path(__file__).resolve().parents[2]
 _SRC = _REPO / "src" / "tradepartner"
 _SCRIPTS = _REPO / "scripts"
 
-#: May read bodies: the helper itself and re-derive.
-_READERS_ALLOWED = frozenset({"store/raw_archive.py", "store/raw_rederive.py"})
+#: May read bodies: the helper itself, re-derive and the cache migration, whose
+#: `restore_files` copies hash-checked bodies back to the paths they came from
+#: (#2743 item 4: it is no research or backtest reader).
+_READERS_ALLOWED = frozenset(
+    {"store/raw_archive.py", "store/raw_rederive.py", "store/raw_archive_migrate.py"}
+)
 #: May name the archive's root and config: they define and check it.
 _ROOT_ALLOWED = frozenset({"config.py", "store/raw_archive_config.py", *_READERS_ALLOWED})
 #: The ingest modules that may write through the helper (#2714 items 1 and 5):

@@ -206,10 +206,11 @@ def test_at_the_limit_is_not_within() -> None:
 
 
 def test_held_shorts_leave_the_cash_row_and_count_gross_by_absolute_value() -> None:
-    # Cash 30,000 includes 20,000 of short proceeds; long A 90,000, short B -20,000.
+    # Cash 30,000 includes 20,000 of short proceeds; the short mark is an
+    # unsigned 20,000 liability, tagged by position_side, as T232's ledger is.
     marks = (
         _mark("A", 90_000.0, cash=30_000.0),
-        _mark("B", -20_000.0, cash=30_000.0, side="short"),
+        _mark("B", 20_000.0, cash=30_000.0, side="short"),
     )
     card = headroom.compute(_window(), marks, (), _RISK)
     assert card.equity == pytest.approx(100_000.0)
@@ -221,7 +222,7 @@ def test_held_shorts_leave_the_cash_row_and_count_gross_by_absolute_value() -> N
 def test_cash_is_floored_at_zero_when_shorts_exceed_it() -> None:
     marks = (
         _mark("A", 105_000.0, cash=5_000.0),
-        _mark("B", -10_000.0, cash=5_000.0, side="short"),
+        _mark("B", 10_000.0, cash=5_000.0, side="short"),
     )
     assert _row(headroom.compute(_window(), marks, (), _RISK), "cash").value == 0.0
 

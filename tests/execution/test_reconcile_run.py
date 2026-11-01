@@ -2348,8 +2348,18 @@ def test_late_dividend_cash_without_an_eligible_due_halts(
     fake.extra_cash = amount
     if case in ("expired", "wrong_amount"):
         # A held name's unexplained dividend cash is a name cash break (#2266 item 1).
+        # $5 is immaterial by default and would be auto-accepted (item 6), so the
+        # threshold is 0 here: this test is about the attribution, not the size.
+        always_material = FROZEN.model_copy(update={"break_materiality_usd": 0.0})
         assert (
-            _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay_date).status
+            _reconcile(
+                journal_settings,
+                fake,
+                open_window,
+                fixed_clock,
+                session=pay_date,
+                frozen=always_material,
+            ).status
             == "breaks"
         )
         return
@@ -5111,3 +5121,365 @@ def test_signed_book_reads_a_long_short_hypothesis_as_signed(
     )
     with open_for_write(journal_settings) as conn:
         assert _REAL_SIGNED_BOOK(conn, known) is True
+
+
+# --- auto-acceptance and true-up semantics (T283a; #2266 items 5, 6, 8, 9) -----------
+
+
+def _events(settings: Settings, window: PaperWindowRow) -> list[Any]:
+    with open_read_only(settings) as conn:
+        return break_events_for(conn, window.window_id or 0)
+
+
+def _credit(fake: BookedFake, activity_id: str, amount: float, day: date = S) -> None:
+    """A not-due `MA` credit tagged to SPY: a name cash break of `amount`."""
+    fake.activities = [
+        *fake.activities,
+        CashActivity(activity_id, "MA", day, "executed", amount, "SPY"),
+    ]
+    fake.extra_cash += amount
+
+
+def test_every_break_auto_accepted_is_ok_and_engages_nothing(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Item 16 Auto-acceptance: $10 on a $100,000 book writes `opened`, `auto_accepted`
+    and one `auto_true_up`, with no restriction; the row is `ok` (T282d's rule for
+    `breaks` never applies) and the command raises nothing and engages no switch."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _credit(fake, "tiny-credit", 10.0)
+
+    result = _command(journal_settings, fake, fixed_clock)
+
+    assert result.status == OK
+    (row,) = _rows(journal_settings, frozen_window)
+    assert row.status == OK and row.broker_cash == pytest.approx(100_010.0 - 10 * PRICE)
+    events = _events(journal_settings, frozen_window)
+    assert [(e.event, e.material, e.dollar_size) for e in events] == [
+        ("opened", False, 10.0),
+        ("auto_accepted", False, 10.0),
+    ]
+    assert events[0].break_id == events[1].break_id
+    (true_up,) = [
+        a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
+    ]
+    assert (true_up.security_id, true_up.cash, true_up.quantity) == (SPY, 10.0, None)
+    assert true_up.broker_activity_id == "tiny-credit"
+    assert json.loads(events[1].adjustment_ids_json or "") == [true_up.adjustment_id]
+    terms = json.loads(true_up.explanation_json or "")
+    assert (terms["size"], terms["prior_auto_accepted"], terms["cumulative_auto_accepted"]) == (
+        10.0,
+        0.0,
+        10.0,
+    )
+    assert terms["break_materiality_usd"] == FROZEN.break_materiality_usd
+    with open_read_only(journal_settings) as conn:
+        assert kill_switch_events_for(conn, frozen_window.window_id or 0) == []
+        assert (
+            break_rules.restricted_names(break_events_for(conn, frozen_window.window_id or 0))
+            == frozenset()
+        )
+
+    # The next reconciliation sees the activity as booked and the ledger as the broker.
+    fixed_clock.advance(minutes=5)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+    assert len(_events(journal_settings, frozen_window)) == 2
+
+
+def test_a_quantity_break_is_adopted_at_the_brokers_absolute_quantity(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 0.04  # about $10 at the fixture reference price
+
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+
+    (true_up,) = [
+        a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
+    ]
+    assert (true_up.security_id, true_up.cash, true_up.broker_activity_id) == (SPY, None, None)
+    assert true_up.quantity == pytest.approx(0.04)
+    terms = json.loads(true_up.explanation_json or "")
+    assert (terms["broker_quantity"], terms["ledger_quantity"]) == (10.04, 10.0)
+    with open_read_only(journal_settings) as conn:
+        state = _journal_state(conn, frozen_window.window_id or 0, fixed_clock())
+        ledger = _ledger(
+            state,
+            live_actions_as_of(conn, CUT),
+            frozen_window,
+            S,
+            FROZEN.reconcile_quantity_tolerance,
+        )
+    assert ledger.positions[SPY] == 10.04
+    fixed_clock.advance(minutes=5)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+
+
+def test_a_late_split_with_an_earlier_ex_date_does_not_change_an_adopted_quantity(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Item 9: a true-up sets the figure. A split row that lands later with an earlier
+    `ex_date` is already in the broker's quantity and is never applied on top; a split
+    with a later `ex_date` still is."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 0.04
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+    later = next_session(S)
+    stamp = session_close(S) + timedelta(hours=2)
+    for ex_date, ratio in ((S - timedelta(days=1), 2.0), (later, 3.0)):
+        _fact(
+            journal_settings,
+            "corporate_actions",
+            security_id=SPY,
+            action_type="split",
+            ex_date=ex_date,
+            ratio_or_amount=ratio,
+            known_at=stamp,
+            ingested_at=stamp,
+            source="alpaca",
+            provenance="action",
+        )
+
+    def quantity(through: date) -> float:
+        with open_read_only(journal_settings) as conn:
+            state = _journal_state(conn, frozen_window.window_id or 0, session_close(through))
+            actions = live_actions_as_of(conn, session_close(through))
+            return _ledger(
+                state, actions, frozen_window, through, FROZEN.reconcile_quantity_tolerance
+            ).positions[SPY]
+
+    assert quantity(S) == pytest.approx(10.04)  # the earlier split is not applied on top
+    assert quantity(later) == pytest.approx(10.04 * 3.0)  # the later one is
+
+
+def test_a_break_still_open_keeps_breaks_while_another_is_accepted(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """T283a's pinned pair: a material break keeps the `breaks` status (and, since
+    T282d, restricts its name and engages nothing); a small one beside it is accepted
+    and its cash stays inside the base, the open one's outside it."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0, (MTUM, "MTUM"): 10.0})
+    _credit(fake, "tiny-credit", 10.0)
+    fake.activities = [
+        *fake.activities,
+        CashActivity("big-credit", "MA", S, "executed", 30.0, "MTUM"),
+    ]
+    fake.extra_cash += 30.0
+
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+
+    (row,) = _rows(journal_settings, frozen_window)
+    payload = json.loads(row.mismatches_json or "")
+    assert row.broker_cash == pytest.approx(100_040.0 - 20 * PRICE - 30.0)
+    assert payload["raw_broker_cash"] == pytest.approx(100_040.0 - 20 * PRICE)
+    ids = {a["activity_id"] for a in payload["activities"]}
+    assert "tiny-credit" in ids and "big-credit" not in ids
+    assert [
+        (e.security_id, e.event, e.material) for e in _events(journal_settings, frozen_window)
+    ] == [
+        (MTUM, "opened", True),
+        (SPY, "opened", False),
+        (SPY, "auto_accepted", False),
+    ]
+    assert [a.broker_activity_id for a in _adjustments(journal_settings, frozen_window)] == [
+        "tiny-credit"
+    ]
+
+
+def test_the_third_ten_dollars_on_one_name_is_material_under_the_cumulative_bound(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Item 5: prior plus this one, so a leak of a few dollars a session cannot be
+    accepted forever. $10, then $10 (cumulative $20) are accepted; the third makes
+    $30 against the $25 bound and is opened material, with no adjustment."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    day = S
+    statuses = []
+    for n in range(3):
+        if n:
+            day = next_session(day)
+            fixed_clock.now = session_close(day) + timedelta(hours=2)
+        _credit(fake, f"leak-{n}", 10.0, day)
+        statuses.append(
+            _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=day).status
+        )
+
+    assert statuses == [OK, OK, "breaks"]
+    events = _events(journal_settings, frozen_window)
+    assert [e.event for e in events] == ["opened", "auto_accepted"] * 2 + ["opened"]
+    assert events[-1].material is True
+    booked = [a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"]
+    assert [a.broker_activity_id for a in booked] == ["leak-0", "leak-1"]
+    assert json.loads(booked[1].explanation_json or "")["cumulative_auto_accepted"] == 20.0
+
+
+def _lag(settings: Settings, fake: BookedFake, run_id: int, clock: FixedClock) -> None:
+    """Leave one acknowledged order partly filled at the broker and unfilled in the
+    journal: the next reconciliation is `fills_lagging`."""
+    _order(
+        settings,
+        run_id,
+        "tp-lag",
+        MTUM,
+        "MTUM",
+        5.0,
+        events=("pending", "accepted"),
+        fill=False,
+        at=clock() - timedelta(minutes=30),
+    )
+    fake.submit(OrderRequest("tp-lag", "MTUM", Side.BUY, quantity=5.0))
+    fake.apply("tp-lag", PartialFill(2.0, PRICE))
+
+
+def test_a_deferred_small_break_is_accepted_by_the_next_eligible_reconciliation(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Item 6: beside a lagging fill the immaterial break is written `opened`, books no
+    adjustment and restricts nothing (the lag keeps T281's halt on the run). The next
+    `ok` reconciliation re-tests it and writes `auto_accepted` with its `auto_true_up`."""
+    run_id = _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _lag(journal_settings, fake, run_id, fixed_clock)
+    _credit(fake, "deferred", 10.0)
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock)
+
+    assert _rows(journal_settings, frozen_window)[-1].status == FILLS_LAGGING
+    assert [(e.event, e.material) for e in _events(journal_settings, frozen_window)] == [
+        ("opened", False)
+    ]
+    assert [
+        a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
+    ] == []
+    with open_read_only(journal_settings) as conn:
+        events = break_events_for(conn, frozen_window.window_id or 0)
+        assert break_rules.restricted_names(events) == frozenset()
+
+    # The lag clears: the fill is journaled, the order terminal at the broker.
+    fixed_clock.advance(minutes=5)
+    _journal_fill(journal_settings, "tp-lag", 2.0, at=fixed_clock(), accept=False)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+
+    events = _events(journal_settings, frozen_window)
+    assert [e.event for e in events] == ["opened", "auto_accepted"]
+    assert events[0].break_id == events[1].break_id
+    assert [
+        a.broker_activity_id
+        for a in _adjustments(journal_settings, frozen_window)
+        if a.kind == "auto_true_up"
+    ] == ["deferred"]
+
+
+def test_a_deferred_small_break_that_grows_past_materiality_stays_open_and_material(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """PR #2267 pass 6: re-tested at the eligible reconciliation, the break is $40: it is
+    `observed` material, restricts its name and books no automatic adjustment."""
+    run_id = _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _lag(journal_settings, fake, run_id, fixed_clock)
+    _credit(fake, "deferred", 10.0)
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock)
+    fixed_clock.advance(minutes=5)
+    _journal_fill(journal_settings, "tp-lag", 2.0, at=fixed_clock(), accept=False)
+    _credit(fake, "grown", 30.0)
+
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+
+    events = _events(journal_settings, frozen_window)
+    assert [(e.event, e.material, e.dollar_size) for e in events] == [
+        ("opened", False, 10.0),
+        ("observed", True, 40.0),
+    ]
+    assert [
+        a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
+    ] == []
+    with open_read_only(journal_settings) as conn:
+        assert break_rules.restricted_names(
+            break_events_for(conn, frozen_window.window_id or 0)
+        ) == {SPY}
+
+    # And once material, a break that shrinks is not auto-accepted ("material from then on").
+    fake.activities = [a for a in fake.activities if a.activity_id != "grown"]
+    fake.extra_cash -= 30.0
+    fixed_clock.advance(minutes=5)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+    assert [
+        a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
+    ] == []
+
+
+def test_opposite_cash_activities_do_not_net_into_an_immaterial_break(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Safety pass 1: +$30 and -$30 on one name net to $0 but are $60 of activity:
+    the break is judged on the gross and stays open, restricted, unadjusted."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _credit(fake, "plus", 30.0)
+    _credit(fake, "minus", -30.0)
+
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+
+    assert [(e.event, e.material) for e in _events(journal_settings, frozen_window)] == [
+        ("opened", True)
+    ]
+    assert [
+        a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
+    ] == []
+
+
+def test_a_fill_journaled_after_a_true_up_is_not_overwritten_by_it(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Quant/safety pass 1: the true-up is the broker's figure at its read; a fill
+    journaled later on the same session adds to it."""
+    run_id = _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 0.04
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+    fixed_clock.advance(minutes=5)
+    _order(
+        journal_settings,
+        run_id,
+        "tp-after",
+        SPY,
+        "SPY",
+        5.0,
+        at=fixed_clock(),
+    )
+    with open_read_only(journal_settings) as conn:
+        state = _journal_state(conn, frozen_window.window_id or 0, fixed_clock())
+        ledger = _ledger(
+            state,
+            live_actions_as_of(conn, CUT),
+            frozen_window,
+            S,
+            FROZEN.reconcile_quantity_tolerance,
+        )
+    assert ledger.positions[SPY] == pytest.approx(15.04)

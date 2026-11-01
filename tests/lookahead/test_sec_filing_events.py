@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime
 
 import duckdb
 import pytest
+from pydantic import ValidationError
 
 from tradepartner.config import EventsConfig, Settings
 from tradepartner.store import asof, schema
@@ -156,6 +157,129 @@ def test_sec_reads_agree_with_truncated_store() -> None:
     assert asof.sec_filing_events_as_of(
         full, late, ["SC 13D"], subject_cik="other", settings=settings
     ).is_empty()
+
+
+def test_form4_date_plausibility_uses_own_acceptance_and_reports_exclusions() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accepted = datetime(2026, 10, 28, 2, 0, tzinfo=UTC)  # Oct 27 in New York
+    for line, transaction_day in enumerate(
+        (date(2026, 10, 27), date(1999, 12, 31), date(2026, 10, 28))
+    ):
+        conn.execute(
+            "INSERT INTO sec_form4_transactions VALUES (" + ", ".join(["?"] * 23) + ")",
+            [
+                "0002",
+                "issuer",
+                "owner",
+                line,
+                False,
+                True,
+                False,
+                False,
+                transaction_day,
+                None,
+                "P",
+                "A",
+                10,
+                2,
+                10,
+                "D",
+                "Common",
+                None,
+                accepted,
+                accepted,
+                accepted,
+                "edgar",
+                "filing",
+            ],
+        )
+    settings = Settings(_env_file=None, events=EventsConfig(sec_forms_read_enabled=True))
+    rows, excluded = asof.sec_form4_transactions_as_of(
+        conn, accepted, settings=settings, with_excluded_count=True
+    )
+    assert rows["line_no"].to_list() == [0]
+    assert excluded == 2
+    assert (
+        len(
+            asof.sec_form4_transactions_as_of(
+                conn, accepted, settings=settings, include_implausible=True
+            )
+        )
+        == 3
+    )
+    assert conn.execute("SELECT count(*) FROM sec_form4_transactions").fetchone()[0] == 3
+    assert asof.sec_form4_transactions_as_of(
+        conn, accepted.replace(year=2030), settings=settings
+    ).equals(rows)
+
+
+def _insert_form4(
+    conn: duckdb.DuckDBPyConnection, line: int, day: date, accepted: datetime
+) -> None:
+    conn.execute(
+        "INSERT INTO sec_form4_transactions VALUES (" + ", ".join(["?"] * 23) + ")",
+        [
+            "0003", "issuer", "owner", line, False, True, False, False, day, None, "P", "A",
+            10, 2, 10, "D", "Common", None, accepted, accepted, accepted, "edgar", "filing",
+        ],
+    )  # fmt: skip
+
+
+def test_form4_four_year_late_filing_is_returned_by_default() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accepted = datetime(2026, 10, 28, 14, tzinfo=UTC)
+    _insert_form4(conn, 0, date(2022, 10, 1), accepted)
+    settings = Settings(_env_file=None, events=EventsConfig(sec_forms_read_enabled=True))
+    rows, excluded = asof.sec_form4_transactions_as_of(
+        conn, accepted, settings=settings, with_excluded_count=True
+    )
+    assert rows["line_no"].to_list() == [0]
+    assert excluded == 0
+
+
+def test_form4_floor_is_configurable() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accepted = datetime(2026, 10, 28, 14, tzinfo=UTC)
+    _insert_form4(conn, 0, date(2010, 5, 1), accepted)
+    _insert_form4(conn, 1, date(1999, 12, 31), accepted)
+    base = Settings(_env_file=None, events=EventsConfig(sec_forms_read_enabled=True))
+    assert asof.sec_form4_transactions_as_of(conn, accepted, settings=base)[
+        "line_no"
+    ].to_list() == [0]
+    raised = Settings(
+        _env_file=None,
+        events=EventsConfig(
+            sec_forms_read_enabled=True, form4_min_transaction_date=date(2015, 1, 1)
+        ),
+    )
+    assert asof.sec_form4_transactions_as_of(conn, accepted, settings=raised).is_empty()
+
+
+def test_form4_after_acceptance_tolerance_is_configurable() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accepted = datetime(2026, 10, 28, 14, tzinfo=UTC)
+    _insert_form4(conn, 0, date(2026, 10, 30), accepted)  # two days after acceptance
+    strict = Settings(_env_file=None, events=EventsConfig(sec_forms_read_enabled=True))
+    assert asof.sec_form4_transactions_as_of(conn, accepted, settings=strict).is_empty()
+    for days, expected in ((1, 0), (2, 1)):
+        loose = Settings(
+            _env_file=None,
+            events=EventsConfig(sec_forms_read_enabled=True, form4_after_acceptance_days=days),
+        )
+        assert len(asof.sec_form4_transactions_as_of(conn, accepted, settings=loose)) == expected
+
+
+def test_form4_date_config_validation() -> None:
+    assert EventsConfig().form4_min_transaction_date == date(2000, 1, 1)
+    assert EventsConfig().form4_after_acceptance_days == 0
+    with pytest.raises(ValidationError):
+        EventsConfig(form4_after_acceptance_days=-1)
+    with pytest.raises(ValidationError):
+        EventsConfig(form4_min_transaction_date="not-a-date")
 
 
 def test_version_38_migration_keeps_existing_filing_rows() -> None:

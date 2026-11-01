@@ -127,13 +127,7 @@ def test_filled_rebalance_rerun_sends_no_duplicate_orders(
     "require_short_mark",
     [
         False,
-        pytest.param(
-            True,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="#2038: marks_for omits Ledger.short_holdings",
-            ),
-        ),
+        True,
     ],
 )
 def test_one_session_readers_agree_with_the_journal(

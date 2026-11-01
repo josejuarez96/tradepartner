@@ -350,10 +350,11 @@ from tradepartner.store.master import (
     build_master,
     chain_candidates,
     primary_security_id,
+    record_snapshot_sightings,
     securities_as_of,
     security_cik,
     session_of,
-    stored_snapshot_fetches,
+    stored_snapshot_history,
 )
 from tradepartner.store.master import (
     _held_ids as _master_held_ids,
@@ -2535,12 +2536,13 @@ def _ingest_filings(
             )
         _fetch_and_gate(recorded, settings)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
-    # Each run fetches only today's SEC ticker file: the stored snapshot rows
-    # are the earlier fetches, so a rename is judged against them (#2291).
-    earlier = stored_snapshot_fetches(conn, now)
+    # Each run fetches only today's SEC ticker file. Stored sightings include
+    # pending first observations, so a rename needs confirmation (#2295).
+    earlier = stored_snapshot_history(conn, now)
     master, delistings, classes, facts, unmatched = _build_filings(
         recorded, settings, now, earlier_fetches=earlier
     )
+    record_snapshot_sightings(conn, recorded.companies_snapshot(), now, master.listings)
     restamped = ""
     if restamp is not None:
         result = restamp_from_manifest(
