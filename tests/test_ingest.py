@@ -9033,6 +9033,115 @@ def test_form4_failed_archive_write_blocks_the_accessions_rows(
     ).fetchone() == (0,)
 
 
+def test_form4_dry_run_archives_nothing_and_reports_what_it_would_keep(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dry run has no archive side effect: no raw body and no manifest (no run row
+    could cite one). Its message reports the bodies and bytes it would keep and
+    names no `provenance_sha256`. A real run then keeps the same bodies."""
+    from tradepartner.adapters.form4_archive import message_digest
+
+    enabled = _archive_settings(settings, tmp_path)
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123")
+    root = tmp_path / "archive"
+
+    def work(conn: duckdb.DuckDBPyConnection, run_id: str) -> tuple[int, str]:
+        provenance = ingest_module._Form4Provenance.start(
+            enabled, run_id=run_id, writer="sec_forms"
+        )
+        added, message = ingest_module._write_form4_bulk(
+            conn, enabled, case.source, frozenset({case.issuer}), case.now, provenance=provenance
+        )
+        return added, f"1 subjects{ingest_module._provenance_clause(provenance)}; {message}"
+
+    def run(dry_run: bool) -> SourceRun:
+        return ingest_module._run_source(
+            "sec_forms", work, enabled, case.now, lambda: case.now, "x", dry_run, "backfill"
+        )
+
+    dry = run(True)
+    assert dry.status == "ok", dry.message
+    assert case.fetches == [case.accession]
+    assert [path for path in root.rglob("*") if path.is_file()] == []
+    assert message_digest(dry.message) is None
+    nbytes = len(case.body) + len(case.zip)
+    assert f"raw_archive_would_keep_bodies: 2, raw_archive_would_keep_bytes: {nbytes}" in (
+        dry.message
+    )
+    real = run(False)
+    assert real.status == "ok", real.message
+    assert _archived_bodies(root) == {
+        hashlib.sha256(case.body).hexdigest(),
+        hashlib.sha256(case.zip).hexdigest(),
+    }
+    assert message_digest(real.message) is not None
+
+
+def test_form4_accession_fetched_twice_records_both_hashes_and_one_row_match(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An accession fetched twice in one run (an order sample, then the XML route)
+    names both body hashes in the manifest, both kept; only the entry whose body
+    produced the stored row lists it, so `find_entry` still finds exactly one."""
+    from tradepartner import diskfloor
+    from tradepartner.adapters import edgar_raw
+    from tradepartner.adapters.form4_archive import (
+        XML_SOURCE,
+        find_entry,
+        parse_manifest,
+        row_digest,
+    )
+    from tradepartner.adapters.form4_route import Quarter
+
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _path: 10**15)
+    enabled = _archive_settings(settings, tmp_path)
+    accession = "0000320193-26-000123"
+    first, second = b"<form4>sample</form4>", b"<form4>route</form4>"
+    at = datetime(2026, 10, 2, tzinfo=UTC)
+    row = {"accession": accession, "filer_cik": "0000000001", "line_no": 1, "shares": "5"}
+
+    def manifest() -> tuple[str, dict[str, Any]]:
+        provenance = ingest_module._Form4Provenance.start(
+            enabled, run_id="writer-1", writer="sec_forms"
+        )
+        assert provenance is not None
+        for position, body in enumerate((first, second)):
+            fetched = edgar_raw.FetchedXml(
+                _F4_XML_URL, body, body.decode(), at + timedelta(seconds=position)
+            )
+            provenance.keep_xml(accession, fetched)
+        assert provenance.xml_input(accession).sha256 == hashlib.sha256(second).hexdigest()
+        rows = {"sec_form4_transactions": [row]}
+        provenance.record(accession, XML_SOURCE, Quarter(2026, 3), "added", rows)
+        digest = provenance.finish()
+        return digest, parse_manifest((tmp_path / "archive" / "manifests" / digest).read_bytes())
+
+    digest, document = manifest()
+    first_sha = hashlib.sha256(first).hexdigest()
+    second_sha = hashlib.sha256(second).hexdigest()
+    assert {first_sha, second_sha} <= _archived_bodies(tmp_path / "archive")
+    by_hash = {entry["raw_sha256"]: entry for entry in document["entries"]}
+    assert set(by_hash) == {first_sha, second_sha}
+    assert by_hash[second_sha]["outcome"] == "added" and by_hash[second_sha]["rows"]
+    assert by_hash[first_sha]["outcome"] == "not_written" and by_hash[first_sha]["rows"] == []
+    run_id, entry = find_entry(
+        [document],
+        row_source=XML_SOURCE,
+        mode="backfill",
+        accession=accession,
+        table="sec_form4_transactions",
+        key=[accession, "0000000001", 1],
+        digest=row_digest(row),
+    )
+    assert run_id == "writer-1" and entry["raw_sha256"] == second_sha
+    # The same fetches give the same manifest bytes: the entry order is fixed.
+    assert manifest()[0] == digest
+
+
 def test_form4_quarter_message_keeps_both_digests_under_a_200_character_cap(
     fixture_store: duckdb.DuckDBPyConnection,
     settings: Settings,

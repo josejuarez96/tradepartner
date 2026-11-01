@@ -206,6 +206,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hashlib
 import json
 import logging
 import re
@@ -1072,6 +1073,8 @@ def ingest_actions_backfill(
 
 
 _FORM4_BACKFILL: ContextVar[bool] = ContextVar("form4_backfill", default=False)
+#: Set while a dry-run chunk's `work` runs, so the Form 4 recorder keeps nothing (T348).
+_DRY_RUN: ContextVar[bool] = ContextVar("dry_run", default=False)
 
 
 def _run_source(
@@ -1107,9 +1110,11 @@ def _run_source(
         with open_for_write(settings) as conn:
             init_schema(conn)
             token = _FORM4_BACKFILL.set(mode == "backfill" and name == "edgar")
+            dry_token = _DRY_RUN.set(dry_run)
             try:
                 rows, message = work(conn, run_id)
             finally:
+                _DRY_RUN.reset(dry_token)
                 _FORM4_BACKFILL.reset(token)
             if dry_run:
                 raise _DryRun(rows, message)
@@ -1637,16 +1642,32 @@ class _Form4Provenance:
     `finish` writes the run's one manifest (`form4_archive.build_manifest`) and
     fixes its digest; the quarter rows and the enclosing `edgar` or `sec_forms`
     writer row cite it, in the same transaction. Every archive error propagates,
-    so a refused write fails the source run and its rows roll back."""
+    so a refused write fails the source run and its rows roll back.
 
-    def __init__(self, settings: Settings, run_id: str, writer: str, mode: str) -> None:
+    An accession fetched more than once in the run (an order sample, then the XML
+    route) keeps every body. The latest fetch is the one being parsed, so the
+    entry that writes or compares rows takes it; each earlier fetch is entered as
+    `not_written`, with no rows. Every hash is in the manifest, and a stored row
+    still matches exactly one entry (`find_entry`'s rule).
+
+    A recorder started inside a dry-run chunk (`dry_run`) writes nothing to the
+    archive, neither body nor manifest: it hashes what it would keep and reports
+    the count and bytes (`dry_run_clause`), and no run message names a digest."""
+
+    def __init__(
+        self, settings: Settings, run_id: str, writer: str, mode: str, *, dry_run: bool = False
+    ) -> None:
         self.settings = settings
         self.run_id = run_id
         self.writer = writer
         self.mode = mode
+        self.dry_run = dry_run
         self.entries: list[dict[str, object]] = []
         self.zips: dict[Quarter, RawInput] = {}
-        self.fetched: dict[str, RawInput] = {}
+        self.fetched: dict[str, list[RawInput]] = {}
+        #: A dry run's would-be archive writes: body hash to size, and the manifest's size.
+        self.would_keep: dict[str, int] = {}
+        self.would_manifest_bytes = 0
         self.digest: str | None = None
 
     @classmethod
@@ -1654,37 +1675,45 @@ class _Form4Provenance:
         cls, settings: Settings, *, run_id: str, writer: str, mode: str = "backfill"
     ) -> _Form4Provenance | None:
         """A recorder for writer run `run_id` (source `writer`, run mode `mode`), or
-        `None` with the archive off."""
+        `None` with the archive off. Inside a dry-run chunk it keeps nothing."""
         if not raw_archive.archive_on(settings):
             return None
-        return cls(settings, run_id, writer, mode)
+        return cls(settings, run_id, writer, mode, dry_run=_DRY_RUN.get())
+
+    def _keep(self, body: bytes) -> str:
+        """Archive `body` (a dry run only notes it, if not held) and return its hash."""
+        if not self.dry_run:
+            return raw_archive.archive_body(self.settings, body).sha256
+        sha256 = hashlib.sha256(body).hexdigest()
+        if sha256 not in self.would_keep and not raw_archive.is_archived(self.settings, sha256):
+            self.would_keep[sha256] = len(body)
+        return sha256
 
     def keep_xml(self, accession: str, fetched: FetchedXml) -> None:
         """`EdgarFilingSource.form4_xml_keeper`: keep the body before it is parsed."""
-        kept = raw_archive.archive_body(self.settings, fetched.body)
-        self.fetched[accession] = RawInput(
-            kept.sha256, fetched.url, fetched.fetched_at, _FORM4_XML_PARSER
+        sha256 = self._keep(fetched.body)
+        self.fetched.setdefault(accession, []).append(
+            RawInput(sha256, fetched.url, fetched.fetched_at, _FORM4_XML_PARSER)
         )
 
     def keep_zip(self, quarter: Quarter, digest: str) -> None:
         """Keep the quarter's insider zip by hash unless that hash is held."""
         if not raw_archive.is_archived(self.settings, digest):
-            kept = raw_archive.archive_body(
-                self.settings, insider_zip_path(self.settings, quarter).read_bytes()
-            )
-            if kept.sha256 != digest:
+            kept = self._keep(insider_zip_path(self.settings, quarter).read_bytes())
+            if kept != digest:
                 raise RuntimeError(
                     f"insider zip {quarter.year}q{quarter.number} changed while it was "
-                    f"kept ({kept.sha256} is not the checked {digest}); rerun"
+                    f"kept ({kept} is not the checked {digest}); rerun"
                 )
         url, fetched_at = insider_zip_fetch(self.settings, quarter, digest)
         self.zips[quarter] = RawInput(digest, url, fetched_at, _FORM4_BULK_PARSER)
 
     def xml_input(self, accession: str) -> RawInput:
-        """The kept XML of an accession about to be written or compared."""
-        if accession not in self.fetched:
+        """The kept XML of an accession about to be written or compared: its latest
+        fetch, the body just parsed."""
+        if not self.fetched.get(accession):
             raise RuntimeError(f"Form 4 XML {accession} was not kept before parse")
-        return self.fetched[accession]
+        return self.fetched[accession][-1]
 
     def record(
         self,
@@ -1696,7 +1725,10 @@ class _Form4Provenance:
     ) -> None:
         """One input's entry; an XML input leaves the fetched set once recorded."""
         if row_source == XML_SOURCE:
-            raw = self.fetched.pop(accession)
+            raw = self.xml_input(accession)
+            self.fetched[accession].pop()
+            if not self.fetched[accession]:
+                del self.fetched[accession]
         elif quarter is None:
             raise ValueError("a bulk entry names its quarter")
         else:
@@ -1714,10 +1746,13 @@ class _Form4Provenance:
 
     def finish(self) -> str:
         """Write the run's manifest once and return its digest. A fetched XML that
-        wrote nothing (an order sample, a refused parse) is entered as such."""
+        wrote nothing (an order sample, a refused parse, an earlier fetch of an
+        accession fetched again) is entered as such. A dry run writes no manifest;
+        the digest is then the hash of the bytes it would write, cited nowhere."""
         if self.digest is None:
             for accession in sorted(self.fetched):
-                self.record(accession, XML_SOURCE, None, "not_written", {})
+                while accession in self.fetched:
+                    self.record(accession, XML_SOURCE, None, "not_written", {})
             zips = [
                 {
                     "quarter": f"{quarter.year}q{quarter.number}",
@@ -1735,14 +1770,32 @@ class _Form4Provenance:
                 entries=self.entries,
                 zips=zips,
             )
-            self.digest = raw_archive.archive_manifest(self.settings, body).sha256
+            if self.dry_run:
+                self.would_manifest_bytes = len(body)
+                self.digest = hashlib.sha256(body).hexdigest()
+            else:
+                self.digest = raw_archive.archive_manifest(self.settings, body).sha256
         return self.digest
+
+    def dry_run_clause(self) -> str:
+        """What a dry run would have kept: new raw bodies, their bytes, and the manifest."""
+        self.finish()
+        return (
+            f"; raw_archive_would_keep_bodies: {len(self.would_keep)}, "
+            f"raw_archive_would_keep_bytes: {sum(self.would_keep.values())}, "
+            f"raw_archive_would_keep_manifest_bytes: {self.would_manifest_bytes}"
+        )
 
 
 def _provenance_clause(provenance: _Form4Provenance | None) -> str:
     """`; provenance_sha256=<hex>` for a writer message, placed by the caller
-    before any text `ingest.max_message_chars` can cut; empty with the archive off."""
-    return "" if provenance is None else f"; {PROVENANCE_KEY}={provenance.finish()}"
+    before any text `ingest.max_message_chars` can cut; empty with the archive off.
+    A dry run names no digest (no manifest was written) and reports what it would keep."""
+    if provenance is None:
+        return ""
+    if provenance.dry_run:
+        return provenance.dry_run_clause()
+    return f"; {PROVENANCE_KEY}={provenance.finish()}"
 
 
 def _form4_manifests(
@@ -2250,7 +2303,10 @@ def _form4_bulk(
     if cross_route_disagree:
         counts["sec_forms_bulk_xml_disagree"] = cross_route_disagree
     # The manifest is written and its digest fixed before any run row cites it.
+    # A dry run's quarter rows (rolled back) name no digest: no manifest was written.
     provenance_digest = None if provenance is None else provenance.finish()
+    if provenance is not None and provenance.dry_run:
+        provenance_digest = None
     for quarter in sorted(filing_quarters):
         label = f"{quarter.year}q{quarter.number}"
         selected_count = len(queued_by_quarter.get(quarter, ()))
