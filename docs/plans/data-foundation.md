@@ -377,7 +377,7 @@ The longest chain is now 6: T317 → T318 → T319 → T323 → T323b → T324. 
   - Both sit beside T184h and T198.
 - `adapters/edgar_raw.py`: T319a alone.
 - `store/master.py` and `store/classify.py`: T323a (per-CIK reads by query) beside T198.
-- `cli.py`: T323 beside T204, T283b, T283c and T284.
+- `cli.py`: T323 beside T204, T283b, T283c2 and T284.
 - `store/schema.py`, `tests/conftest.py` and the schema-pin tests: T318 alone among open tasks. `store/filing_index.py` and its test: T318 alone.
 - `ingest.py` and `tests/test_ingest.py`: a declared chain of two. T318b comes first (the restamp's match), then T323 (amended 2026-10-31, #2703: was T318).
 - `health.py` and `tests/test_health.py`: T318b (`--check`) and T321 (two warnings), beside T307c and T329, all on disjoint parts; whichever lands later merges `main` first (amended 2026-10-31, #2703: was a T318 → T321 chain).
