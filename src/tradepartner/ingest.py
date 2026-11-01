@@ -1579,6 +1579,11 @@ def _stored_xml_form4_transactions(
     return {accession: tuple(items) for accession, items in grouped.items()}
 
 
+def _bulk_run_fields(message: str | None) -> dict[str, str]:
+    """The `key=value` fields of one `sec_insider_bulk` run message, split on `;`."""
+    return dict(part.strip().split("=", 1) for part in (message or "").split(";") if "=" in part)
+
+
 def _write_form4_bulk(
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
@@ -1645,9 +1650,7 @@ def _write_form4_bulk(
         "WHERE source='sec_insider_bulk' AND status IN ('ok', 'partial') "
         "ORDER BY finished_at NULLS FIRST, started_at, run_id"
     ).fetchall():
-        parts = dict(
-            part.strip().split("=", 1) for part in (message or "").split(";") if "=" in part
-        )
+        parts = _bulk_run_fields(message)
         # Older rows only recorded the loaded digest. New rows explicitly carry
         # the last digest checked, including "none" when there was no prior check.
         digest = parts.get("checked_sha256", parts.get("zip_sha256"))
@@ -1662,6 +1665,7 @@ def _write_form4_bulk(
     selected: dict[str, list[Form4IndexRow]] = {}
     queued_by_quarter: dict[Quarter, list[Form4IndexRow]] = {}
     skip: set[str] = set()
+    multi_owner_stored: Counter[Quarter] = Counter()
     stamp_work: list[Form4IndexRow] = []
     cross_route_disagree = samples = xml_expected = 0
     for quarter in sorted(filing_quarters):
@@ -1719,12 +1723,21 @@ def _write_form4_bulk(
                     if not rows_agree(accession_bulk.transactions, xml_rows):
                         cross_route_disagree += 1
                 skip.add(accession)
-            elif (
-                stored_source == "sec_insider_bulk"
-                and digests.get(quarter) is not None
-                and completed.get(f"{quarter.year}q{quarter.number}") == digests[quarter]
-            ):
-                skip.add(accession)
+            elif stored_source == "sec_insider_bulk":
+                stored_multi_owner = (
+                    settings.events.form4_multi_owner_xml
+                    and quarter_bulk is not None
+                    and (record := quarter_bulk.accessions.get(accession)) is not None
+                    and len(set(record.filer_ciks)) > 1
+                )
+                if stored_multi_owner:
+                    # #2720 releases stored bulk roles after the owner reviews them.
+                    multi_owner_stored[quarter] += 1
+                if stored_multi_owner or (
+                    digests.get(quarter) is not None
+                    and completed.get(f"{quarter.year}q{quarter.number}") == digests[quarter]
+                ):
+                    skip.add(accession)
         pending = [row for row in queued_by_quarter[quarter] if row[0] not in skip]
         state = quarter_state(quarter, downloaded=quarter_bulk is not None, run_date=now.date())
         if quarter not in unreadable and state is not QuarterState.MISSING:
@@ -1740,6 +1753,10 @@ def _write_form4_bulk(
                 and quarter_bulk.accessions[accession].issuer_cik == cik
                 and not quarter_bulk.accessions[accession].identity_bad
                 and not quarter_bulk.accessions[accession].order_bad
+                and (
+                    not settings.events.form4_multi_owner_xml
+                    or len(set(quarter_bulk.accessions[accession].filer_ciks)) == 1
+                )
                 and len(quarter_bulk.accessions[accession].rows) >= 2
             )
             samples += min(settings.events.form4_bulk_order_sample, eligible)
@@ -1749,16 +1766,17 @@ def _write_form4_bulk(
                     quarter_bulk.accessions.get(accession) if quarter_bulk is not None else None
                 )
                 if (
-                    route_accession(
-                        candidate,
-                        state=state,
-                        submissions_form=form,
-                        submissions_filing_date=filed,
-                        price_below=settings.events.form4_xml_price_below,
-                        zero_price_codes=settings.events.form4_zero_price_xml_codes,
-                    ).route
-                    is Route.XML
-                ):
+                    settings.events.form4_multi_owner_xml
+                    and candidate is not None
+                    and len(set(candidate.filer_ciks)) > 1
+                ) or route_accession(
+                    candidate,
+                    state=state,
+                    submissions_form=form,
+                    submissions_filing_date=filed,
+                    price_below=settings.events.form4_xml_price_below,
+                    zero_price_codes=settings.events.form4_zero_price_xml_codes,
+                ).route is Route.XML:
                     xml_expected += 1
         del loaded, quarter_bulk, xml_saved  # released before the next quarter is read
         _LOGGER.info(
@@ -1790,7 +1808,9 @@ def _write_form4_bulk(
     if plan.refused:
         return (
             0,
-            f"Form 4 bulk: {len(selected)} selected; {plan.message()}; sec_forms_budget_refused: 1",
+            f"Form 4 bulk: {len(selected)} selected; {plan.message()}; "
+            f"sec_forms_budget_refused: 1; "
+            f"sec_forms_bulk_multi_owner_stored: {sum(multi_owner_stored.values())}",
         )
 
     added = 0
@@ -1848,7 +1868,10 @@ def _write_form4_bulk(
         edgar_raw.write_atomic(order_check_path(settings, quarter, digests[quarter]), b"passed")
 
     counts: Counter[str] = Counter(load_counts)
+    counts["sec_forms_bulk_multi_owner_stored"] = sum(multi_owner_stored.values())
     remaining = 0
+    # Each quarter's own unwritten count, for its run row (#2728); they sum to `remaining`.
+    quarter_remaining: Counter[Quarter] = Counter()
     checked_digests = completed.copy()
     route_quarters = sorted(queued_by_quarter)
     for position, quarter in enumerate(route_quarters):
@@ -1882,6 +1905,7 @@ def _write_form4_bulk(
             price_below=settings.events.form4_xml_price_below,
             zero_price_codes=tuple(settings.events.form4_zero_price_xml_codes),
             order_sample_size=settings.events.form4_bulk_order_sample,
+            multi_owner_xml=settings.events.form4_multi_owner_xml,
             budget=settings.events.sec_forms_max_requests,
             request_count=lambda: source.requests,
             checked=checked,
@@ -1894,6 +1918,7 @@ def _write_form4_bulk(
         del quarter_bulk  # released before the next quarter is read
         counts.update(result.counts)
         remaining += result.remaining
+        quarter_remaining[quarter] += result.remaining
         # A failed stored accession must be compared again on the next run. New
         # accession failures do not prevent the digest from advancing (#2688).
         routed_stored = {row[0] for row in rows if row[0] not in skip and row[0] in stored}
@@ -1918,14 +1943,10 @@ def _write_form4_bulk(
             time.monotonic() - started,
         )
         if result.counts.get("sec_forms_budget_stopped"):
-            remaining += len(
-                {
-                    row
-                    for later in route_quarters[position + 1 :]
-                    for row in queued_by_quarter[later]
-                    if row[0] not in skip
-                }
-            )
+            for later in route_quarters[position + 1 :]:
+                unreached = len({row for row in queued_by_quarter[later] if row[0] not in skip})
+                quarter_remaining[later] += unreached
+                remaining += unreached
             break
     if cross_route_disagree:
         counts["sec_forms_bulk_xml_disagree"] = cross_route_disagree
@@ -1933,12 +1954,17 @@ def _write_form4_bulk(
         label = f"{quarter.year}q{quarter.number}"
         selected_count = len(queued_by_quarter.get(quarter, ()))
         digest = digests.get(quarter, "none")
+        # `remaining` is this quarter's own count and sets its status; `run_remaining`
+        # is the whole run's (#2728). `_bulk_run_fields` reads the digests back.
         run_message = (
+            f"quarter={label}; "
             f"zip_sha256={digest}; checked_sha256={checked_digests.get(label, 'none')}; "
             f"selected={selected_count}; "
             f"rows_added={quarter_added[quarter]}; rows_changed={quarter_changed[quarter]}; "
-            f"remaining={remaining}"
+            f"remaining={quarter_remaining[quarter]}; run_remaining={remaining}; "
+            f"sec_forms_bulk_multi_owner_stored={multi_owner_stored[quarter]}"
         )
+        complete = quarter_remaining[quarter] == 0 and quarter not in unreadable
         _write_run(
             conn,
             uuid.uuid4().hex,
@@ -1946,7 +1972,7 @@ def _write_form4_bulk(
             now,
             SourceRun(
                 "sec_insider_bulk",
-                "ok" if remaining == 0 and quarter not in unreadable else "partial",
+                "ok" if complete else "partial",
                 quarter_added[quarter],
                 label,
                 run_message,

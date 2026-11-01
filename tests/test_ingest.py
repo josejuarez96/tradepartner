@@ -7483,6 +7483,129 @@ def test_form4_bulk_budget_stop_counts_later_quarter_rows(
     assert "3 remaining" in message
 
 
+def _three_quarter_bulk_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    route: Callable[..., BulkRouteResult],
+) -> tuple[int, str, dict[str, tuple[str, int, str]]]:
+    """One bulk run over 2026q1 (one row), 2026q2 (one) and 2026q3 (two) with `route`
+    in place of the route; returns the run's figures and each quarter's run row."""
+    from tradepartner.adapters.form4_route import Quarter
+
+    now = datetime(2026, 10, 2, tzinfo=UTC)
+    enabled = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(enabled, client=httpx.Client(), clock=lambda: now)
+    filed = (date(2026, 3, 31), date(2026, 5, 1), date(2026, 8, 3), date(2026, 8, 4))
+    rows = [
+        UnstampedFiling(ACME, "ACME", "4", f"0001577526-26-0000{i:02d}", day)
+        for i, day in enumerate(filed)
+    ]
+    monkeypatch.setattr(
+        source,
+        "_rows",
+        lambda *_: iter([((r.filed_on.year, (r.filed_on.month - 1) // 3 + 1), r) for r in rows]),
+    )
+    monkeypatch.setattr(source, "_load_stamps", lambda *_: {})
+
+    def load(quarters: Iterable[Quarter], **_kwargs: Any) -> Any:
+        quarter = next(iter(quarters))
+        return {quarter: InsiderBulk({})}, {quarter: "a" * 64}, Counter(), frozenset()
+
+    monkeypatch.setattr(ingest_module, "load_bulk_quarters", load)
+    monkeypatch.setattr(ingest_module, "run_form4_bulk_route", route)
+    added, message = ingest_module._write_form4_bulk(
+        fixture_store, enabled, source, frozenset({ACME}), now
+    )
+    runs = {
+        cursor: (status, rows_added, run_message)
+        for cursor, status, rows_added, run_message in fixture_store.execute(
+            "SELECT chunk_cursor, status, rows_added, message FROM ingestion_runs "
+            "WHERE source = 'sec_insider_bulk'"
+        ).fetchall()
+    }
+    return added, message, runs
+
+
+def test_form4_bulk_quarter_rows_carry_their_own_remaining_and_status(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2728: a complete quarter reads `ok` with its own `remaining=0`; a budget stop
+    leaves its quarter and every unreached one `partial` with their own counts."""
+    from tradepartner.adapters.form4_route import Quarter
+
+    def route(rows: Iterable[tuple[str, str, str, date]], **kwargs: Any) -> BulkRouteResult:
+        quarter = kwargs["accession_quarters"][next(iter(rows))[0]]
+        if quarter == Quarter(2026, 1):
+            return BulkRouteResult(Counter(), 0, 0)
+        return BulkRouteResult(Counter({"sec_forms_budget_stopped": 1}), 0, 1)
+
+    added, message, runs = _three_quarter_bulk_run(fixture_store, settings, monkeypatch, route)
+    assert added == 0 and "3 remaining" in message
+    assert {cursor: status for cursor, (status, _, _) in runs.items()} == {
+        "2026q1": "ok",
+        "2026q2": "partial",
+        "2026q3": "partial",
+    }
+    fields_by_quarter = {
+        cursor: ingest_module._bulk_run_fields(run_message)
+        for cursor, (_, _, run_message) in runs.items()
+    }
+    assert {cursor: f["remaining"] for cursor, f in fields_by_quarter.items()} == {
+        "2026q1": "0",
+        "2026q2": "1",
+        "2026q3": "2",
+    }
+    assert all(f["quarter"] == cursor for cursor, f in fields_by_quarter.items())
+    assert all(f["run_remaining"] == "3" for f in fields_by_quarter.values())
+    # The planner's reader still finds the digests in the new message.
+    assert fields_by_quarter["2026q1"]["checked_sha256"] == "a" * 64
+    assert fields_by_quarter["2026q2"]["zip_sha256"] == "a" * 64
+    assert fields_by_quarter["2026q2"]["checked_sha256"] == "none"
+
+
+def test_form4_bulk_quarter_rows_change_only_the_run_rows_not_the_store(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2728, no look-ahead: per-quarter reporting writes the same facts a direct write
+    would, each at its acceptance time, and nothing for an unfinished quarter."""
+    from tradepartner.adapters.form4_route import Quarter
+
+    accepted = datetime(2026, 3, 31, 21, tzinfo=UTC)
+    filing = SecFormFiling(
+        "0001577526-26-000000", "4", accepted, date(2026, 3, 31), (ACME,), (ACME,), ()
+    )
+
+    def route(rows: Iterable[tuple[str, str, str, date]], **kwargs: Any) -> BulkRouteResult:
+        quarter = kwargs["accession_quarters"][next(iter(rows))[0]]
+        if quarter == Quarter(2026, 1):
+            kwargs["write_bulk"](filing, quarter)
+            return BulkRouteResult(Counter(), 0, 0)
+        return BulkRouteResult(Counter(), 0, len(list(rows)))
+
+    columns = "accession, form, accepted_at, known_at, filed_date, subject_cik, filer_cik"
+    before = fixture_store.execute(f"SELECT {columns} FROM sec_filing_events").fetchall()
+    _added, _message, runs = _three_quarter_bulk_run(fixture_store, settings, monkeypatch, route)
+    after = fixture_store.execute(f"SELECT {columns} FROM sec_filing_events").fetchall()
+    direct = duckdb.connect(":memory:")
+    init_schema(direct)
+    ingest_module.write_sec_form_accession(
+        direct, filing, ingested_at=datetime(2026, 10, 2, tzinfo=UTC), source="sec_insider_bulk"
+    )
+    assert (
+        sorted(set(after) - set(before))
+        == direct.execute(f"SELECT {columns} FROM sec_filing_events").fetchall()
+    )
+    assert all(row[3] == accepted for row in set(after) - set(before))
+    assert runs["2026q1"][0] == "ok" and runs["2026q3"][0] == "partial"
+
+
 def test_form4_bulk_unreached_quarter_keeps_previous_checked_digest(
     fixture_store: duckdb.DuckDBPyConnection,
     settings: Settings,
@@ -7846,15 +7969,25 @@ def test_form4_bulk_cross_route_comparison_never_rewrites_xml(
 
 
 @pytest.mark.parametrize(
-    "partial_digest, routed",
-    [("a" * 64, False), ("b" * 64, True), ("none", True), ("", True), (None, True)],
+    "partial_digest, routed, multi_owner, multi_owner_xml",
+    [
+        ("a" * 64, False, False, True),
+        ("b" * 64, True, False, True),
+        ("none", True, False, True),
+        ("", True, False, True),
+        (None, True, False, True),
+        ("b" * 64, False, True, True),
+        ("b" * 64, True, True, False),
+    ],
 )
-def test_form4_bulk_partial_run_skips_only_stored_matching_digest(
+def test_form4_bulk_partial_run_skips_matching_digest_or_stored_multi_owner(
     fixture_store: duckdb.DuckDBPyConnection,
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
     partial_digest: str | None,
     routed: bool,
+    multi_owner: bool,
+    multi_owner_xml: bool,
 ) -> None:
     from tradepartner.adapters.form4_route import Quarter
 
@@ -7898,7 +8031,11 @@ def test_form4_bulk_partial_run_skips_only_stored_matching_digest(
             ],
         )
     enabled = settings.model_copy(
-        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "form4_multi_owner_xml": multi_owner_xml}
+            )
+        }
     )
     source = EdgarFilingSource(enabled, client=httpx.Client(), clock=lambda: accepted)
     row = UnstampedFiling(parsed.issuer_cik, "Issuer", "4", accession, filed)
@@ -7920,7 +8057,7 @@ def test_form4_bulk_partial_run_skips_only_stored_matching_digest(
         "4",
         filed,
         parsed.issuer_cik,
-        parsed.filer_ciks,
+        (*parsed.filer_ciks, "0000000002") if multi_owner else parsed.filer_ciks,
         parsed.transactions,
         0,
         (),
@@ -7944,6 +8081,15 @@ def test_form4_bulk_partial_run_skips_only_stored_matching_digest(
     assert added == 0
     assert calls == ([f"submissions:{accession}", f"stamp:{accession}"] if routed else [])
     assert ("1 remaining" in message) is routed
+    assert ("sec_forms_bulk_multi_owner_stored: 1" in message) is (multi_owner and multi_owner_xml)
+    latest_run = fixture_store.execute(
+        "SELECT message FROM ingestion_runs WHERE source = 'sec_insider_bulk' "
+        "AND message LIKE '%sec_forms_bulk_multi_owner_stored=%' LIMIT 1"
+    ).fetchone()
+    assert latest_run is not None
+    assert ("sec_forms_bulk_multi_owner_stored=1" in latest_run[0]) is (
+        multi_owner and multi_owner_xml
+    )
 
 
 def test_form4_bulk_planner_reads_stored_xml_rows_once_per_quarter(

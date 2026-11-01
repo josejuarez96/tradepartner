@@ -664,6 +664,29 @@ def test_last_ingests_keeps_an_unknown_source_after_the_known_ones(
     assert sources == ["edgar", "alpaca", "fred", "vendor_x"]
 
 
+def test_last_ingests_summarises_one_run_written_as_several_rows(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#2728: a bulk run writes one row per quarter at one time; the latest line sums
+    them up in cursor order instead of showing whichever row sorts last by run id."""
+    day = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    for run_id, cursor, status in (
+        ("b3", "2020q1", "ok"),
+        ("b1", "2020q3", "partial"),
+        ("b2", "2020q2", "ok"),
+    ):
+        _run(fixture_store, run_id, "sec_insider_bulk", status, day, cursor=cursor, mode="backfill")
+    bulk = next(i for i in last_ingests(fixture_store, T_END) if i.source == "sec_insider_bulk")
+    assert bulk.latest_status == "partial"
+    assert bulk.latest_message == "3 rows (2020q1 to 2020q3): 2 ok; not ok: 2020q3 partial"
+    assert bulk.last_ok_cursor == "2020q2"
+    fixture_store.execute("UPDATE ingestion_runs SET status = 'ok' WHERE run_id = 'b1'")
+    bulk = next(i for i in last_ingests(fixture_store, T_END) if i.source == "sec_insider_bulk")
+    assert bulk.latest_status == "ok"
+    assert bulk.latest_message == "3 rows (2020q1 to 2020q3): 3 ok"
+    assert bulk.last_ok_cursor == "2020q3"
+
+
 # --- Coverage ---------------------------------------------------------------
 
 
