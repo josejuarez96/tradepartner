@@ -1374,6 +1374,66 @@ def test_health_warns_when_the_last_edgar_run_reports_quarantined_accessions(
     assert "2 quarantined" in result.output
 
 
+@pytest.mark.parametrize(
+    ("message", "warning"),
+    [
+        (
+            "incremental_drift: 2; incremental_drift_ciks: 0000000007 0000000009; "
+            "index_stamp_changed: 0",
+            "incremental_drift: 2 (0000000007 0000000009)",
+        ),
+        ("incremental_drift: 0; index_stamp_changed: 3", "index_stamp_changed: 3"),
+    ],
+)
+def test_health_prints_and_counts_incremental_edgar_warnings(
+    tmp_path: Path, fixture_store_path: Path, message: str, warning: str
+) -> None:
+    settings = _settings(tmp_path, store=fixture_store_path)
+    _run_row(settings, "incremental", "edgar_index", "ok", T_END - timedelta(hours=1), message)
+    result = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "incremental EDGAR:" in result.output
+    assert f"  warning: {warning}" in result.output
+    assert result.output.startswith("Data: checks pass with 1 warning(s), bars current to ")
+    assert result.output.rstrip().endswith("health: 0 failures, 1 warnings")
+
+
+def test_health_counts_both_incremental_edgar_warnings(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    settings = _settings(tmp_path, store=fixture_store_path)
+    _run_row(
+        settings,
+        "incremental",
+        "edgar_index",
+        "ok",
+        T_END - timedelta(hours=1),
+        "incremental_drift: 1; index_stamp_changed: 2",
+    )
+    result = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "  warning: incremental_drift: 1" in result.output
+    assert "  warning: index_stamp_changed: 2" in result.output
+    assert result.output.startswith("Data: checks pass with 2 warning(s), bars current to ")
+    assert result.output.rstrip().endswith("health: 0 failures, 2 warnings")
+
+
+@pytest.mark.parametrize("message", [None, "incremental_drift: 0; index_stamp_changed: 0"])
+def test_health_has_no_incremental_edgar_warning_without_positive_counts(
+    tmp_path: Path, fixture_store_path: Path, message: str | None
+) -> None:
+    settings = _settings(tmp_path, store=fixture_store_path)
+    if message is not None:
+        _run_row(settings, "incremental", "edgar_index", "ok", T_END - timedelta(hours=1), message)
+    result = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "incremental EDGAR:" not in result.output
+    assert "  warning: incremental_drift:" not in result.output
+    assert "  warning: index_stamp_changed:" not in result.output
+    assert result.output.startswith("Data: checks pass, bars current to ")
+    assert result.output.rstrip().endswith("health: OK")
+
+
 def _equal_cash(conn: duckdb.DuckDBPyConnection, sid: str, action_id: str) -> None:
     known = session_close(date(2020, 3, 13))
     insert_row(
