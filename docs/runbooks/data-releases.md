@@ -36,6 +36,17 @@ The store holds the record. The commands, all in the `decision data-release` gro
 
 The real runs of `repair-resolution`, `repair-bars`, `repair-dividends`, `delete-master-rows` and `master-retract --apply` take `--release <name>` and refuse unless that release is open. The commands compute the numbers in the field table below, so you no longer copy them by hand.
 
+### Multi-owner Form 4 role repair (#2720)
+
+Use this sequence before the Form 4 study. The recheck reads the store without writing and caches fetched XML under `edgar.cache_dir/form4_multi_owner/`. Each accession can need an index and XML request. The printed request estimate is an upper bound to compare with `events.sec_forms_max_requests`.
+
+1. `uv run tradepartner recheck-form4-multi-owner --count-only --from-quarter 2022q4 --to-quarter 2025q1` (omit the quarter flags for all stored quarters).
+2. `uv run tradepartner recheck-form4-multi-owner --output form4-multi-owner.json --max-requests N --from-quarter 2022q4 --to-quarter 2025q1`. If interrupted, repeat with `--resume form4-multi-owner.json`; completed accessions are not fetched again.
+3. Review the printed manifest SHA-256 and `form4-multi-owner.summary.json`. The manifest contains only `roles_differ` rows. Investigate the listed `other_difference` and `unreadable` accessions separately; this repair does not alter them.
+4. Back up the store, then open one named release: `uv run tradepartner store backup`; `uv run tradepartner decision data-release open --name NAME --backup PATH --reason "#2720 XML-confirmed Form 4 roles"`.
+5. `uv run tradepartner repair-form4-multi-owner --manifest form4-multi-owner.json --release NAME --expect-rows N --dry-run`, then repeat without `--dry-run` using the reviewed changed-row count. A rerun with `--expect-rows 0` must report zero.
+6. Close the release with `uv run tradepartner decision data-release close --name NAME --from SESSION --to SESSION`, using the touched transaction sessions.
+
 The legacy file lives beside the store, in `data/` (gitignored, so it never reaches the public repo). Each entry was one `[[release]]` table, append-only. Its format, still what `import-file` reads (the numbers are illustrative):
 
 ```toml
