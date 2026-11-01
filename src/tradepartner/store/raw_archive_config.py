@@ -25,11 +25,13 @@ the variable and the config key instead. The path is also a `SecretStr` on
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
 from tradepartner import diskfloor
 from tradepartner.config import Settings
+from tradepartner.store.raw_archive_plan import MigrationConfig
 
 #: The environment variable that holds the archive root.
 ARCHIVE_ENV_NAME = "TRADEPARTNER_RAW_ARCHIVE"
@@ -134,3 +136,16 @@ def check_archive_write(settings: Settings, root: Path, size_bytes: int) -> None
             f"free, below {FLOOR_KEY} ({floor_gb:g} GB); "
             "free up disk space and rerun"
         )
+
+
+def migration_config(settings: Settings) -> MigrationConfig:
+    """The existing-cache migration planner's settings (plan T360, #2758; spec
+    amendment #2743): `raw_archive.migrate_extra_paths`, the write floor in whole
+    bytes (rounded up, so the plan never projects a copy the guard would refuse)
+    and `edgar.bulk_stamps_enabled`. Reads settings only."""
+    archive = settings.raw_archive
+    return MigrationConfig(
+        extra_paths=tuple(archive.migrate_extra_paths),
+        floor_bytes=math.ceil(archive.min_free_disk_gb * diskfloor.GB),
+        bulk_stamps_enabled=settings.edgar.bulk_stamps_enabled,
+    )
