@@ -27,6 +27,7 @@ from tradepartner.adapters.edgar_insider_bulk import (
     read_insider_bulk,
 )
 from tradepartner.adapters.filings import SecFormFiling
+from tradepartner.adapters.form4_owner_route import refusal as owner_refusal
 from tradepartner.adapters.form4_route import (
     IDENTITY_BAD,
     AccessionRoute,
@@ -368,6 +369,17 @@ def run_form4_bulk_route(
                 if filing is None:
                     if not source_counts_failures:
                         counts["sec_forms_fetch_failed"] += 1
+                    remaining += 1
+                    continue
+                reason = (
+                    owner_refusal(
+                        filing, accession_bulk.filer_ciks if accession_bulk is not None else None
+                    )
+                    if multi_owner_xml
+                    else None
+                )
+                if reason is not None:  # #2711: no owner is guessed or duplicated
+                    counts[reason] += 1
                     remaining += 1
                     continue
                 filing = replace(filing, form=submissions_form, filed_date=submissions_filed)
