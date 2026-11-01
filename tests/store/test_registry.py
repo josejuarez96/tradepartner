@@ -1191,6 +1191,7 @@ def test_every_fact_table_is_classified_for_trial_vintage(
             "spinoff_allocations",
             "sec_filing_events",
             "sec_form4_transactions",
+            "snapshot_sightings",  # trials read listings, never raw SEC observations
             "delisting_reasons",
         }
         assert included.isdisjoint(excluded)

@@ -741,8 +741,8 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
     # version 24 (#1506) `borrow_status`, version 28 (#1506, T172b)
     # `symbol_changes`, version 30 (#1713, T189c) `openfigi_types` and
     # version 31 (#821, T187) `successor_chains` and version 35 (#1762, T248c)
-    # `mergers` and version 37 (#2266, T280a) `reconcile_breaks`, all empty; nothing else
-    # gains a table.
+    # `mergers` and version 37 (#2266, T280a) `reconcile_breaks` and version 42
+    # (#2295) `snapshot_sightings`, all empty; nothing else gains a table.
     assert rows_after == {
         **rows_before,
         "filing_events": [],
@@ -756,6 +756,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         "reconcile_breaks": [],
         "sec_filing_events": [],
         "sec_form4_transactions": [],
+        "snapshot_sightings": [],
         "delisting_reasons": [],
     }
     # And the migrated store is shaped exactly as a fresh one.

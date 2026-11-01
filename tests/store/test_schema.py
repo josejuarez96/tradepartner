@@ -1332,6 +1332,7 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "spinoff_allocations",
             "sec_filing_events",
             "sec_form4_transactions",
+            "snapshot_sightings",
             "delisting_reasons",
         }
         assert {table for table in shape_before if shape_after[table] != shape_before[table]} == {
@@ -2391,6 +2392,25 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_DELISTING_REASONS_VERSION + 1
 
 
+def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        conn.execute("DROP TABLE delisting_reasons")
+        conn.execute("DROP TABLE snapshot_sightings")
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version VALUES (41, TIMESTAMPTZ '2026-10-27 00:00:00+00')")
+        assert max(_versions(conn)) == schema._PRE_SNAPSHOT_SIGHTINGS_VERSION == 41
+        schema.init_schema(conn)
+        assert "snapshot_sightings" in _shape(conn)
+        assert max(_versions(conn)) == schema.CURRENT_SCHEMA_VERSION
+        assert _versions(conn) == [41, 42, 43]
+        schema.init_schema(conn)
+        assert _versions(conn) == [41, 42, 43]
+    finally:
+        conn.close()
+
+
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
 
 _OVERRIDE_AT = datetime(2026, 10, 3, 14, 0, tzinfo=UTC)
@@ -2972,6 +2992,7 @@ def test_version_39_adds_only_spinoff_allocations() -> None:
             "spinoff_allocations",
             "sec_filing_events",
             "sec_form4_transactions",
+            "snapshot_sightings",
             "delisting_reasons",
         ):
             conn.execute(f"DROP TABLE {table}")
@@ -2982,11 +3003,13 @@ def test_version_39_adds_only_spinoff_allocations() -> None:
         assert versions == [38]
         schema.init_schema(conn)
         after = _shape(conn)
-        # The same open also takes T306's version 40 (#2539) and 41 (#2617).
+        # The same open also takes T306's version 40 (#2539), 41 (#2617) and 42
+        # (#2295).
         assert set(after) - set(before) == {
             "spinoff_allocations",
             "sec_filing_events",
             "sec_form4_transactions",
+            "snapshot_sightings",
             "delisting_reasons",
         }
         assert {name: after[name] for name in before} == before
@@ -3005,6 +3028,7 @@ def test_read_only_version_38_store_keeps_existing_reads(tmp_path: Path) -> None
         "spinoff_allocations",
         "sec_filing_events",
         "sec_form4_transactions",
+        "snapshot_sightings",
         "delisting_reasons",
     ):
         conn.execute(f"DROP TABLE {table}")

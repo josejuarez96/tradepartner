@@ -171,12 +171,8 @@ def test_v42_store_adds_only_reason_table(tmp_path: Path) -> None:
         assert conn.execute("SELECT * FROM delistings").fetchall() == original
 
 
-def test_version_42_has_its_migration_before_43_records_it() -> None:
-    """Merge gate for B2 (quant-auditor, PR #2684): T326 depends on #2665
-    (plan), which owns version 42. A version-41 store opened here records 42
-    and 43, so this PR must not land before #2665's `snapshot_sightings`
-    migration is on main. This test fails until then, keeping the PR red and
-    off any merge train; once main has #2665, swap the reserved-version line in
-    `schema.py`'s two migratable lists for #2665's constant."""
+def test_version_43_builds_on_the_snapshot_sightings_version() -> None:
+    """Version 42 is #2665's `snapshot_sightings`; this PR's migration is 42 -> 43."""
     assert "snapshot_sightings" in schema.TABLE_NAMES
+    assert schema._PRE_DELISTING_REASONS_VERSION == schema._PRE_SNAPSHOT_SIGHTINGS_VERSION + 1
     assert schema._PRE_DELISTING_REASONS_VERSION + 1 == schema.CURRENT_SCHEMA_VERSION
