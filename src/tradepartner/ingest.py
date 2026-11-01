@@ -3278,7 +3278,7 @@ def restamp_from_manifest(
             f"(SELECT 1 FROM {table} o WHERE {same_key} AND {target})"
         ).fetchall():
             refused.setdefault(cik, f"{table}: a row is already stored at the new stamp")
-    _stage_filing_index_changes(conn, moving)
+    _stage_filing_index_changes(conn, moving, filed)
     for cik, why in _filing_index_refusals(conn, filed).items():
         refused.setdefault(cik, why)
     if refused:
@@ -3332,22 +3332,34 @@ _FILING_INDEX_MATCH = (
     "FROM filing_index t JOIN _restamp_accession a ON a.cik = t.cik "
     "AND a.accession = t.accession AND a.old = t.accepted_at "
     "WHERE t.source = 'edgar' AND t.provenance = 'filing' "
-    "AND t.cik NOT IN (SELECT cik FROM _restamp_refused)"
+    "AND t.cik NOT IN (SELECT cik FROM _restamp_refused) "
+    "AND a.subject NOT IN (SELECT cik FROM _restamp_refused)"
 )
 
 
 def _stage_filing_index_changes(
-    conn: duckdb.DuckDBPyConnection, moving: Sequence[ManifestRow]
+    conn: duckdb.DuckDBPyConnection,
+    moving: Sequence[ManifestRow],
+    filed: Mapping[str, DelistingFiling],
 ) -> None:
-    """The moving changes as `_restamp_accession(cik, accession, old, new)`,
-    the `(cik, accession)` match path of the `filing_index` rows (T318b)."""
+    """The moving changes as `_restamp_accession(cik, accession, old, new,
+    subject)`, the `(cik, accession)` match path of the `filing_index` rows
+    (T318b). `subject` is a Form 25's subject CIK (else the filer's): a refused
+    subject keeps the index row where its derived rows stay."""
     conn.execute(
         "CREATE TEMP TABLE _restamp_accession "
-        "(cik VARCHAR, accession VARCHAR, old TIMESTAMPTZ, new TIMESTAMPTZ)"
+        "(cik VARCHAR, accession VARCHAR, old TIMESTAMPTZ, new TIMESTAMPTZ, subject VARCHAR)"
     )
-    rows = sorted({(c.cik, c.accession, c.old_stamp, c.new_stamp) for c in moving})
+    rows = sorted(
+        {
+            (c.cik, c.accession, c.old_stamp, c.new_stamp, filed[c.accession].cik)
+            if c.accession in filed
+            else (c.cik, c.accession, c.old_stamp, c.new_stamp, c.cik)
+            for c in moving
+        }
+    )
     if rows:
-        conn.executemany("INSERT INTO _restamp_accession VALUES (?, ?, ?, ?)", rows)
+        conn.executemany("INSERT INTO _restamp_accession VALUES (?, ?, ?, ?, ?)", rows)
 
 
 def _filing_index_refusals(

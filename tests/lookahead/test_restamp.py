@@ -1135,3 +1135,22 @@ def test_a_rerun_of_the_same_manifest_moves_no_filing_index_row(
     )
     assert again.moved["filing_index"] == 0
     assert _fi_rows(early_store) == once
+
+
+def test_a_refused_form_25_subject_keeps_the_filers_index_row_where_it_is(
+    settings: Settings, early_store: _Store
+) -> None:
+    """ACME is refused (a date-crossing change), so its delisting stays and the
+    exchange's 25-NSE index row must stay with it."""
+    old_nse = _early(A_25NSE[1])
+    nse_first = _fi_row(EXCHANGE, A_25NSE[0], old_nse, form="25-NSE")
+    _seed_filing_index(settings, [nse_first])
+    crossing = datetime(2019, 3, 5, 5, 30, tzinfo=UTC)
+    manifest = [
+        *_acme_manifest(),
+        ManifestRow(ACME, A_COVER[0] + "x", _early(A_COVER[1]), crossing, "sgml", "test"),
+    ]
+    _, _, (result,) = _ingest(settings, _source(acme_early=True), now=RESTAMP_RUN, restamp=manifest)
+    assert ACME in result.refused
+    exchange = next(r for r in _fi_rows(early_store) if r[0] == EXCHANGE)
+    assert exchange[2] == old_nse
