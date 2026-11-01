@@ -215,7 +215,16 @@ import traceback
 import uuid
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
-from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence, Sized
+from collections.abc import (
+    Callable,
+    Collection,
+    Container,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+    Sized,
+)
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -1292,6 +1301,18 @@ class _Recorded(FilingSource):
 
     def filing_index(self, since: datetime | None = None) -> list[FilingIndexEntry]:
         return list(self._ask("filing_index", since))
+
+    def filing_index_for_cik(self, cik: str) -> list[FilingIndexEntry]:
+        """Keep the source's bounded CIK query through the fetch-pass recorder."""
+        if callable(getattr(self._source, "filing_index_for_cik", None)):
+            return list(self._ask("filing_index_for_cik", cik))
+        return [entry for entry in self.filing_index() if entry.cik == cik]
+
+    def filing_index_for_forms(self, forms: Collection[str]) -> list[FilingIndexEntry]:
+        """Keep cross-CIK form queries bounded and deterministic."""
+        if callable(getattr(self._source, "filing_index_for_forms", None)):
+            return list(self._ask("filing_index_for_forms", tuple(sorted(forms))))
+        return [entry for entry in self.filing_index() if entry.form in forms]
 
     def companies_snapshot(self) -> list[CompanySnapshotEntry]:
         return list(self._ask("companies_snapshot"))

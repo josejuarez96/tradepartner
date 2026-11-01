@@ -38,6 +38,7 @@ from tradepartner.adapters.filings import (
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.config import Settings
+from tradepartner.ingest import _Recorded
 from tradepartner.store import filing_index as stored_index
 from tradepartner.store import schema
 from tradepartner.store.asof import listings_as_of
@@ -76,7 +77,7 @@ def test_cross_cik_and_per_cik_index_queries_skip_full_materialization(
     rows = [
         stored_index.Listing(
             cik,
-            f"{cik}-26-000001",
+            f"{cik}-26-{i:06d}",
             form,
             "Issuer",
             date(2026, 9, 24),
@@ -84,7 +85,9 @@ def test_cross_cik_and_per_cik_index_queries_skip_full_materialization(
             date(2026, 9, 24),
             True,
         )
-        for cik, form in ((ACME, "10-K"), (OLDCO, "8-K12B"))
+        for i, (cik, form) in enumerate(
+            ((ACME, "10-K"), (OLDCO, "10-K"), (OLDCO, "8-K12B")), start=1
+        )
     ]
     stored_index.insert_listings(conn, rows, INGESTED_AT)
     source = EdgarFilingSource(settings, clock=lambda: INGESTED_AT)
@@ -92,6 +95,9 @@ def test_cross_cik_and_per_cik_index_queries_skip_full_materialization(
     monkeypatch.setattr(source, "filing_index", lambda *_args: pytest.fail("full index"))
     assert [row.cik for row in _filing_index_for_cik(source, ACME)] == [ACME]
     assert [row.cik for row in _filing_index_for_forms(source, {"8-K12B"})] == [OLDCO]
+    recorded = _Recorded(source)
+    assert [row.cik for row in _filing_index_for_cik(recorded, ACME)] == [ACME]
+    assert [row.cik for row in _filing_index_for_forms(recorded, {"8-K12B"})] == [OLDCO]
 
 
 FETCHED_AT = datetime(2026, 9, 24, 14, 0, tzinfo=UTC)

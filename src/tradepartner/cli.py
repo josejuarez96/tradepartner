@@ -1129,6 +1129,13 @@ _SERIES_ORDER = ("strategy", "SPY", "MTUM")
 _LEVEL_METRICS = ("cagr", "sharpe_annual", "excess_cagr_spy", "max_drawdown", "cost_drag")
 
 
+def _close_source(source: object) -> None:
+    """Release a store connection a filing source opened, when it has one."""
+    close = getattr(source, "close", None)
+    if callable(close):
+        close()
+
+
 def _scrubbed(text: str, settings: Settings) -> str:
     """`text` with every configured secret, email and key-shaped token replaced,
     by the `cli_record` fixture scrub, for text that can carry an exception's words."""
@@ -2809,6 +2816,7 @@ def make_app(
             clock=clock,
             reuse_cached=bulk_from_cache,
             event_forms=s.edgar.event_forms,
+            prefer_stored_index=restamp is not None or rebuild_classifications,
         )
         if sec_forms_only:
             show_ingest_progress()
@@ -2863,6 +2871,8 @@ def make_app(
                 if scheduled_shape:
                     heartbeat.ping(s, "ingest", ok=False)  # off-Mac dead-man's switch (#2155)
                 raise
+            finally:
+                _close_source(filings)
             if scheduled_shape:
                 heartbeat.ping(s, "ingest", ok=result.exit_code == 0)
         _print_result(result)
@@ -3426,7 +3436,7 @@ def make_app(
                 "Set them in .env (see .env.example).",
                 USAGE_ERROR,
             )
-        filings = EdgarFilingSource(s, client=edgar_client, clock=clock)
+        filings = EdgarFilingSource(s, client=edgar_client, clock=clock, prefer_stored_index=True)
         try:
             result = master_retract(
                 s,
@@ -3441,6 +3451,8 @@ def make_app(
             raise _fail(f"store busy: {exc}", 1) from None
         except RetractRefused as exc:
             raise _fail(f"retract refused: {_scrubbed(str(exc), s)}", 1) from None
+        finally:
+            _close_source(filings)
         typer.echo(result.summary())
         for line in result.lines():
             typer.echo(line)
