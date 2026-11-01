@@ -200,6 +200,8 @@ I searched `docs/research/` for earlier probe desk reads that read returns (ever
 5. **Backfill before 2026-10-30.** B9, IRRX, Q1 (2026-10-19) and L-1 are open-data reads that the ladder ledger already holds, from before the search limit began. Recommendation: do not backfill them. They raise no N under open question 1 (a) and do not count toward the limit.
 6. **Correcting a wrong record.** As specified, nothing withdraws a record, so an error over-counts N, the conservative side. The alternative is a `research_decisions` row of a new kind `exposure_withdraw` with a reason, which `family_exposure_count` respects. Recommendation: none in v1; a withdraw path is a way to shrink N.
 
+**Decided, owner, 2026-10-31 ("go with recs", PR #2727):** every recommendation above is accepted. 1: (a), `open_data` records do not raise N. 2: (b) for family holdouts: a `store` record that overlaps one is a spend, unioned into `family_holdout_spends`, requires `--holdout-reason`, and leaves `family_exposure_count`; ADR 0016's exam interval is flagged only; an `open_data` overlap (CBOperProf's) is (ii), a disclosure shown on the page. 3: one record per launch (candidate 5 is N +2). 4: (b), an unverified record behind `--probe-unavailable --reason`, for `open_data` records only. 5: no backfill of reads before 2026-10-30. 6: no withdraw path in v1.
+
 ## Acceptance criteria (testable)
 
 Schema and append-only
