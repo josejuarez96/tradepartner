@@ -1103,6 +1103,7 @@ class EdgarFilingSource(FilingSource):
                         pending_row.form,
                         pending_row.accession,
                         pending_row.filed_on,
+                        pending_row.list_position,
                     ),
                     pending_row.listed_on,
                     True,
@@ -1147,6 +1148,7 @@ class EdgarFilingSource(FilingSource):
                             first.company_name,
                             first.filed_on,
                             first_day,
+                            first.list_position,
                         ),
                     )
                     if any(r.filed_on != first.filed_on for r, _, _, _ in listings[1:]):
@@ -1165,6 +1167,7 @@ class EdgarFilingSource(FilingSource):
                     first_day,
                     stamp,
                     now,
+                    first.list_position,
                 )
                 rows_out.append(old)
                 source_daily.append(first_daily)
@@ -1202,6 +1205,7 @@ class EdgarFilingSource(FilingSource):
                             day,
                             now,
                             now,
+                            old.list_position,
                         )
                     )
                     source_daily.append(is_daily)

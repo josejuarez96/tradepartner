@@ -83,6 +83,7 @@ class PendingIndexRow:
     company_name: str
     filed_on: date
     listed_on: date
+    list_position: int | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +134,7 @@ class IncrementalIndexResult:
                 r.accepted_at,
                 r.listed_on,
                 daily,
+                r.list_position,
             )
             for r, daily in zip(self.rows, self.is_daily, strict=True)
         )

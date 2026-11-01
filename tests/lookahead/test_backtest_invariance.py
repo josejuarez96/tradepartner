@@ -770,7 +770,8 @@ def test_a_shares_fact_accepted_after_close_t_i_reaches_only_plans_after_t_i(
 #: #2295 (version 42) and T326 (#2682, version 43) moved it only by hashing the new, empty
 #: `snapshot_sightings` and `delisting_reasons` tables' names, and T318 (#2740, version 45)
 #: by hashing the empty `filing_index` table's name; without them the hash is
-#: T306's f3c2dc45...42ff1ec.
+#: T306's f3c2dc45...42ff1ec. #2813 (version 46) adds a nullable column to the empty
+#: `filing_index` table, which the hash does not see: the pin is unchanged.
 TEMPLATE_FINGERPRINT = "b1109eb77a1118dc11867dc4b00ffafb4c7fd54edb2217186bb94387b3c1eb42"
 
 
