@@ -4,7 +4,7 @@ Owner-run. This page installs `tradepartner ingest` and `tradepartner paper run`
 
 The `collect` plist is a placeholder until the event collectors merge (last section).
 
-**Status of the `paper run` section below (2026-10-19).** The `paper` commands are built and in the CLI: `start`, `stop`, `run`, `reconcile`, `kill`, `resume`, `report`, `check`, `shakedown`, `status`, `abandon`, `override`, `settle` and `lots-reconcile`. Where this page still says **(built by T67)** or **(built by T64b/T67)** after a command, read it as a note on where the command came from; it does not mean the command is missing. The six `paper.*` timing keys were set from Probe 3's measurements (plan task T70), so the sample schedule below uses real values; if you change a key in `config.py`, recompute the schedule. Nothing below instructs bypassing a risk check, releasing the kill switch without a reconciliation, or putting a secret on a command line; where that is tempting there is no flag for it, by design (spec req 16).
+**Status of the `paper run` section below (2026-10-19).** The `paper` commands are built and in the CLI: `start`, `stop`, `run`, `reconcile`, `kill`, `resume`, `report`, `check`, `shakedown`, `status`, `abandon`, `override`, `settle`, `true-up` and `lots-reconcile`. Where this page still says **(built by T67)** or **(built by T64b/T67)** after a command, read it as a note on where the command came from; it does not mean the command is missing. The six `paper.*` timing keys were set from Probe 3's measurements (plan task T70), so the sample schedule below uses real values; if you change a key in `config.py`, recompute the schedule. Nothing below instructs bypassing a risk check, releasing the kill switch without a reconciliation, or putting a secret on a command line; where that is tempting there is no flag for it, by design (spec req 16).
 
 ## What the job does
 
@@ -41,7 +41,7 @@ After EDGAR recovers, ingest tries missing bars for eligible new names on recent
 
 ## Before pulling a schema migration
 
-`tradepartner ingest` and paper write commands `start`, `stop`, `run`, `reconcile`, `resume`, `abandon`, `settle` and non-kill-switch `override` migrate an older store before journaling or calling the broker. **`paper kill` and `paper override --kind engage_kill_switch` skip migration so a migration failure cannot block engagement.** Paper read-only commands (`report`, `check`, `shakedown`, `status` and `lots-reconcile`) refuse an older store with the stored and code schema versions and tell you to run ingest or a paper write command that migrates. There is no separate `migrate` command or prompt. The first scheduled `ingest` or `paper run` after a schema bump migrates the store; older code cannot read it afterwards. The code's version is `CURRENT_SCHEMA_VERSION` in `src/tradepartner/store/schema.py`. Check before you pull:
+`tradepartner ingest` and paper write commands `start`, `stop`, `run`, `reconcile`, `resume`, `abandon`, `settle`, `true-up` and non-kill-switch `override` migrate an older store before journaling or calling the broker. **`paper kill` and `paper override --kind engage_kill_switch` skip migration so a migration failure cannot block engagement.** Paper read-only commands (`report`, `check`, `shakedown`, `status` and `lots-reconcile`) refuse an older store with the stored and code schema versions and tell you to run ingest or a paper write command that migrates. There is no separate `migrate` command or prompt. The first scheduled `ingest` or `paper run` after a schema bump migrates the store; older code cannot read it afterwards. The code's version is `CURRENT_SCHEMA_VERSION` in `src/tradepartner/store/schema.py`. Check before you pull:
 
 ```bash
 git fetch origin && git diff HEAD origin/main -- src/tradepartner/store/schema.py | grep '^[-+]CURRENT_SCHEMA_VERSION ='
@@ -370,7 +370,7 @@ Convert `started_at` to New York time and read it against `[open(S) - paper.subm
 
 **The fallback: one plist per book, staggered.** Only once a book has been seen to miss the window (its `started_at` outside it, or a `missed_run` alert, or a catch-up for a rebalance that should have traded on its session), split the job. For each book, copy the paper plist to `com.tradepartner.paper.<book>.plist` and change three things: the `Label` (`com.tradepartner.paper.<book>`), the arguments (add `<string>--book</string>` and `<string>BOOK</string>` after `<string>run</string>`), and the log names (`paper.<book>.log`, `paper.<book>.err.log`). Give each a different `StartCalendarInterval` Minute, a few minutes apart and all inside the window with room for the earlier book's sells (for example `main` at 08:05 and the next book at 08:20), and **remove the all-books job** (`launchctl bootout gui/$(id -u)/com.tradepartner.paper`) so no book is run twice. Install, test and pause each as above. The run lock is per book, so the staggered jobs cannot step on each other; two jobs for the same book would just produce a `locked` alert.
 
-**`--book` on every command.** Every `paper` command except `shakedown` takes `--book <token>`, default `paper.book_id` (`main`): `start`, `stop`, `run`, `reconcile`, `kill`, `resume`, `report`, `check`, `status`, `abandon`, `override`, `settle` and `lots-reconcile` (which reads that book's lot set). A token outside the grammar is a usage error (exit 2) before the store is opened. `--book` picks a book's paper key pair, never an endpoint. Examples:
+**`--book` on every command.** Every `paper` command except `shakedown` takes `--book <token>`, default `paper.book_id` (`main`): `start`, `stop`, `run`, `reconcile`, `kill`, `resume`, `report`, `check`, `status`, `abandon`, `override`, `settle`, `true-up` and `lots-reconcile` (which reads that book's lot set). A token outside the grammar is a usage error (exit 2) before the store is opened. `--book` picks a book's paper key pair, never an endpoint. Examples:
 
 ```bash
 uv run tradepartner paper status --all              # one summary line per book
@@ -522,6 +522,31 @@ Three corporate events can stop a book today. On 2026-10-26 the owner decided th
 | Ticker change (#2185) | A **halt**. A sell, trim or forced exit of the renamed held name gets a 404 from Alpaca for its old ticker, and the run halts with a `reconciliation` alert, the kill switch engaged, and the message `the broker does not know held names [<security_id>]` (`wrapper.py`, `_refuse_unknown_held`). A buy that adds to the held name halts the same way. `paper reconcile` meanwhile reads `ok` and maps the new symbol. | The old and the new ticker's asset pages, and the position's symbol in Alpaca's Positions (dashboard page names NOT VERIFIED from the repo). Look hardest at whether the old ticker now belongs to a different company. | `paper resume` will reconcile `ok` and release, and the next run that sells the name halts again; no command repairs the symbol. Keep the book halted and tell the orchestrator, or take the `abandon` path. If the old ticker is reused by another issuer, a sell could reach the wrong security: keep the switch engaged and do not resume. |
 
 The rules, when built: a dividend is expected from the ex-date (shares held times amount) and accepted when the credit tagged to the symbol falls between the ex-date and the pay date plus a configured grace, within a configured tolerance; a split's cash in lieu is accepted within a configured number of sessions and tolerance of the fractional remainder times the price; reconcile and the order path share one symbol map, and a name whose symbol is ambiguous that session is skipped, never traded under the old symbol. Unmatched or unexpected cash still halts in every case.
+
+### `paper true-up`: adopt the broker's figure for one break (#2266 item 9)
+
+A **break** is a name-level difference reconciliation could not explain (the paper spec's 2026-10-26 amendment): it restricts one name (no buys or adds; sells only down to the smaller of the two books) while the rest of the book trades. An immaterial one is accepted automatically. A material one waits for you. `paper status --book <token>` lists the open breaks with their ids, and the `reconcile_break` alert names the command line. When you have checked at Alpaca that the broker's figure is the right one (its Activities and Positions pages; their names are NOT VERIFIED from the repo), adopt it:
+
+```bash
+uv run tradepartner paper true-up --break "<break_id>" --reason "what you checked at Alpaca and why its figure is right"   # add --book <token> for a book other than main
+```
+
+**Gates.** It runs whether or not the kill switch is engaged, so a `break_cap` halt can be cleared before `paper resume`. It takes the run lock, then reads the broker fresh (`account`, `positions`, cash activities). It writes nothing, exits non-zero and prints the code when:
+
+| Code | Why | What to do |
+|---|---|---|
+| usage error (2), or `reason` | `--reason` missing or blank; there is no default. | Say what you checked. |
+| `locked` | A run, reconcile or other command holds the book. | Wait for it to finish. |
+| `no_window` | No window is open for the book. | Nothing to true up. |
+| `not_open` | The break is closed (accepted, explained, resolved, or already trued up) or the id is wrong. | Copy the id from `paper status --book`. |
+| `account_mismatch` | The broker's account is not the window's. | Check the book's keys in `.env`; never put them on a command line. |
+| `open_order` | An order of the window on the name is not terminal, so a fill may still land. | Wait for the next run to collect it, then `paper reconcile`. |
+| `moved` | The broker's quantity or cash on the name, or the ledger's quantity, changed since the break's latest event, or a new activity on the name appeared. | Run `paper reconcile --book <token>` so the break shows the current figures, read them, then true up again. The size you accept is the size written. |
+| `short_name` | The name is held short on either book; a short true-up is not built. | Keep the name restricted, or end the window with `paper abandon` ([abandon](#abandon-the-last-resort-and-the-strictly-flat-rule-after-it)). |
+
+**What it writes (the audit trail).** One write chunk, all at one clock reading taken after the broker read: `owner_true_up` adjustments, dated the command's session (never back-dated), and one `trued_up` event on the break naming them and your reason. A quantity part gets one row whose quantity is the delta (broker minus ledger); the ledger states the name at the broker's absolute figure from then on. Each cash activity gets its own row keyed by its activity id, so it is booked once. An `unknown_symbol`, `merger_conflict` or `unexplained_dividend_group` part is **acknowledged, not adopted**: its row carries no quantity and no cash, only the finding's key, and reconciliation does not reopen it while it sees the same key. A changed key (another quantity of the unknown symbol, another merger id, another ex-date) opens a new break. For an `unknown_symbol` the broker's shares stay outside the ledger's equity: say so in your reason. Every row's `explanation_json` holds the break id, your reason and the broker and ledger figures read. Nothing is deleted or edited; the next `paper reconcile` should then read `ok` for that name.
+
+There is no `--all`, pattern, `--force` or `--size` flag, and no flag skips the broker read. **Reversal (`paper true-up --reverse`) is not built yet**: a true-up is final until it is. If you trued up the wrong break, tell the orchestrator; do not try to offset it by hand at Alpaca.
 
 ### The kill-switch drill (ADR 0017 part E.4)
 

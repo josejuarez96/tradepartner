@@ -279,14 +279,16 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
 - `tradepartner paper start --hypothesis <slug>`, `stop --reason`, `run`,
   `reconcile`, `kill --reason`, `resume --reason [--accept-broker-fills]
   [--accept-rejections]`, `report`, `check`, `status`, `abandon --reason`,
-  `override --kind [--session --name] --reason` (T67) and `settle --order
-  <client_order_id> --reason` (T84c; `--order` exactly once) each call the one
+  `override --kind [--session --name] --reason` (T67), `settle --order
+  <client_order_id> --reason` (T84c; `--order` exactly once) and `true-up --break
+  <break_id> --reason` (T283b; `--break` exactly once) each call the one
   `execution` function of that name (`window.start`, `window.stop`,
   `run.tracking_run`, `reconcile_run.reconcile_command`, `window.kill`,
   `resume.resume`, `report.report`, `check.check`, `ops.page_data`,
   `window.abandon`, `window.override`, the page's own writer,
-  `window.settle_order`; `settle` refuses each of req 17's gates by its reason
-  code, and a `ClockError` or a broker error is a failure). The broker comes
+  `window.settle_order`, `true_up.true_up`; `settle` refuses each of req 17's
+  gates by its reason code, `true-up` each of #2266 item 9's, and a `ClockError`
+  or a broker error is a failure). The broker comes
   from `execution.brokers.build_broker` (a test injects one through `make_app`'s
   `broker`), built with the command's one clock object, which the command also
   hands to the function, so the wrapper `run` builds holds the same clock as the
@@ -313,7 +315,7 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
   error, 3 when `kill` cannot write its row, and `PAPER_REFUSAL_EXIT`'s code for
   `refused` (the reason code is printed), `locked` and `no_window`.
   **Books** (ADR 0017 B.2 to B.5, plan T155b). `start`, `stop`, `run`,
-  `reconcile`, `kill`, `resume`, `abandon`, `override` and `settle` take `--book
+  `reconcile`, `kill`, `resume`, `abandon`, `override`, `settle` and `true-up` take `--book
   <token>` (default `paper.book_id`; a token outside the grammar is a usage
   error, 2, before the store is opened or any broker built), pass the book to
   their `execution` function and build the broker with `build_broker(settings,
@@ -474,6 +476,7 @@ from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
 from tradepartner.execution import shakedown as paper_shakedown
 from tradepartner.execution import slippage as paper_slippage
+from tradepartner.execution import true_up as paper_true_up
 from tradepartner.execution.brokers import build_broker
 from tradepartner.execution.lock import LockHeld
 from tradepartner.execution.lots_reconcile import BrokerLotRow
@@ -5697,6 +5700,39 @@ def make_app(
         _echo_scrubbed(
             f"paper settle: {result.client_order_id} settled (override {result.override_id}, "
             f"at {_fmt(result.known_at)}{', reset' if result.reset else ''})",
+            s,
+        )
+
+    @paper_app.command("true-up")
+    def paper_true_up_(
+        break_id: Annotated[
+            list[str],
+            typer.Option("--break", help="the open break's id, once", allow_from_autoenv=False),
+        ],
+        reason: Annotated[str, _REASON_OPTION],
+        book: Annotated[str | None, _BOOK_OPTION] = None,
+    ) -> None:
+        """Adopt the broker's figures for one open reconciliation break, owner-only
+        (paper spec amendment 2026-10-26 #2266, item 9)."""
+        if len(break_id) != 1:
+            raise _fail("--break is given exactly once", USAGE_ERROR)
+        if _blank_text(break_id[0]):
+            raise _fail("--break must be non-blank", USAGE_ERROR)
+        (chosen_break,) = break_id
+        chosen = _checked_book(book)
+        s = paper_settings(reason)
+        paper_schema_gate(s)
+        bk = _resolve_book(s, chosen)
+        result = _paper_call(
+            s,
+            lambda: paper_true_up.true_up(
+                s, write_chunk(s), broker(s, clock, bk), clock, chosen_break, reason, book_id=bk
+            ),
+        )
+        _echo_scrubbed(
+            f"paper true-up: {result.break_id} trued up (event {result.event_id}, "
+            f"adjustments {', '.join(str(i) for i in result.adjustment_ids) or 'none'}, "
+            f"at {_fmt(result.known_at)})",
             s,
         )
 

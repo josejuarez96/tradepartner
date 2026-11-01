@@ -1783,6 +1783,64 @@ def _auto_true_up_rows(
     return rows
 
 
+def _finding_key(mismatch: Mismatch, positions: Mapping[str, Position]) -> str | None:
+    """A finding part's `finding_key` (#2266 item 4), or None for any other kind."""
+    if mismatch.kind == break_rules.UNKNOWN_SYMBOL and mismatch.symbol is not None:
+        return break_rules.unknown_symbol_key(mismatch.symbol, positions[mismatch.symbol].quantity)
+    if mismatch.kind == MERGER_CONFLICT:
+        # The conflict detail is made by _conflict_detail from the
+        # sorted deal ids. Parse that fixed format, never its wording.
+        match = re.search(r"merger ids (\[[^\]]*\]) for ", mismatch.detail)
+        if match is None:
+            raise ValueError("merger conflict has no deal ids")
+        ids = ast.literal_eval(match.group(1))
+        if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+            raise ValueError("merger conflict has invalid deal ids")
+        return break_rules.merger_conflict_key(ids)
+    if mismatch.kind == UNEXPLAINED_DIVIDEND_GROUP:
+        dates = re.findall(r"ex-date (\d{4}-\d{2}-\d{2})", mismatch.detail)
+        if not dates or mismatch.security_id is None:
+            raise ValueError("dividend finding has no name or ex-date")
+        return break_rules.dividend_group_key(
+            mismatch.security_id, (date.fromisoformat(day) for day in dates)
+        )
+    return None
+
+
+def acknowledged_keys(events: Iterable[ReconcileBreakRow]) -> frozenset[str]:
+    """The `finding_key`s an owner true-up acknowledged (#2266 item 9): the finding
+    parts of every break whose latest event is `trued_up`. The classifier does not
+    reopen a break while `compare` raises one of these keys again."""
+    latest: dict[str, ReconcileBreakRow] = {}
+    for event in sorted(events, key=lambda e: e.event_id or 0):
+        latest[event.break_id] = event
+    return frozenset(
+        part["finding_key"]
+        for event in latest.values()
+        if event.event == "trued_up"
+        for part in json.loads(event.parts_json)
+        if part["kind"] in break_rules.FINDING_KINDS and part.get("finding_key") is not None
+    )
+
+
+def _without_acknowledged(
+    result: Reconciliation,
+    acknowledged: frozenset[str],
+    positions: Mapping[str, Position],
+    account_cash: float,
+) -> Reconciliation:
+    """`result` less every finding mismatch whose key an owner true-up acknowledged
+    (#2266 item 9), its status re-derived in `compare`'s order. A `breaks` result
+    left with no residual is `ok`, its base the broker's cash."""
+    kept = tuple(m for m in result.mismatches if _finding_key(m, positions) not in acknowledged)
+    if len(kept) == len(result.mismatches):
+        return result
+    result = replace(result, mismatches=kept)
+    if result.status == BREAKS and not kept:
+        return replace(result, status=OK, broker_cash=account_cash, adjustments=result.explained)
+    return result
+
+
 def _write_break_events(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -1849,28 +1907,7 @@ def _write_break_events(
             old = next((p for p in old_parts if p["kind"] == mismatch.kind), None)
             if old is not None:
                 cause = old["cause"]
-            finding = None
-            if mismatch.kind == break_rules.UNKNOWN_SYMBOL and mismatch.symbol is not None:
-                finding = break_rules.unknown_symbol_key(
-                    mismatch.symbol, positions[mismatch.symbol].quantity
-                )
-            elif mismatch.kind == MERGER_CONFLICT:
-                # The conflict detail is made by _conflict_detail from the
-                # sorted deal ids. Parse that fixed format, never its wording.
-                match = re.search(r"merger ids (\[[^\]]*\]) for ", mismatch.detail)
-                if match is None:
-                    raise ValueError("merger conflict has no deal ids")
-                ids = ast.literal_eval(match.group(1))
-                if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
-                    raise ValueError("merger conflict has invalid deal ids")
-                finding = break_rules.merger_conflict_key(ids)
-            elif mismatch.kind == UNEXPLAINED_DIVIDEND_GROUP:
-                dates = re.findall(r"ex-date (\d{4}-\d{2}-\d{2})", mismatch.detail)
-                if not dates or mismatch.security_id is None:
-                    raise ValueError("dividend finding has no name or ex-date")
-                finding = break_rules.dividend_group_key(
-                    mismatch.security_id, (date.fromisoformat(day) for day in dates)
-                )
+            finding = _finding_key(mismatch, positions)
             parts.append(
                 break_rules.BreakPart(
                     kind=mismatch.kind,
@@ -2202,6 +2239,15 @@ def reconcile_now(
             ),
         )
 
+    with connect() as conn:
+        # Item 9: an acknowledged finding raised again with the same key is no
+        # break; a changed key (another quantity, merger id or ex-date) is.
+        result = _without_acknowledged(
+            result,
+            acknowledged_keys(break_events_for(conn, window_id)),
+            positions,
+            float(account.cash),
+        )
     names = {m.security_id for m in result.mismatches if m.security_id is not None} | set(
         ledger.positions
     )
