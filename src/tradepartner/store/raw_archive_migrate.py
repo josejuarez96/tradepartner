@@ -1,6 +1,6 @@
-"""The existing-cache migration runner, move class (plan T361a, #2765; data-foundation
-spec amendment 2026-10-31, #2743, items 2, 4 and 7). The backup class and
-restore are later slices of the same plan line (split proposed in #2766).
+"""The existing-cache migration runner, move and backup classes (plan T361a, #2765,
+and T361b, #2775; data-foundation spec amendment 2026-10-31, #2743, items 2, 3, 4,
+6 and 7). Restore is a later slice (T361c).
 
 `apply_migration` moves the files T360's planner classes as `move` out of
 `edgar.cache_dir` into the raw archive by content hash, with no SEC request and
@@ -10,6 +10,20 @@ fsynced journal, rename it under its hash (`raw_archive.adopt_file`), then appen
 uploads, writes the content-addressed **migration manifest**, appends one line per
 moved path to the **tombstone index** `_archived/index.jsonl`, and closes the
 journal. Journal, manifest and index stay on the laptop and are never evicted.
+
+**Backups (T361b).** After the moves and their evictions, each backup-class file
+(`stamps/v1/`, its restamp manifests and backups) is copied, never moved: read,
+hashed, an intent line journaled, written through `archive_body` (floor-checked
+against the file's bytes, atomic, deduplicated by hash), then the source is
+re-hashed. A source rewritten meanwhile is re-read and retried once, then
+reported (`changed`); the superseded copy stays, a valid body for its own hash,
+since no archive body is ever deleted. The copies are then confirmed and evicted
+like the moves (`evicted`, `pending_upload`, or `backed_up` when eviction failed).
+Below the floor `RawArchiveFloorError` stops the run with no partial file and a
+rerun resumes at that file. A file whose hash the archive already holds is only
+confirmed. The manifest lists every backup file with its hash, so each run is a
+complete snapshot. A run that moves nothing and meets no new backup hash changes
+nothing. No backup source is moved or unlinked.
 
 **Refusals.** The archive root and the cache must share a filesystem; otherwise
 the run refuses before any change (`MigrationRefusedError`). The move phase never
@@ -49,6 +63,7 @@ from tradepartner.config import TOMBSTONE_DIR, Settings
 from tradepartner.store.raw_archive import (
     ICloudItems,
     adopt_file,
+    archive_body,
     archive_manifest,
     evict_uploaded,
     is_archived,
@@ -86,10 +101,16 @@ class MigrationResult:
     run_id: str
     manifest_sha256: str
     states: dict[str, str] = field(default_factory=dict)
+    backup_states: dict[str, str] = field(default_factory=dict)
 
     def count(self, state: str) -> int:
-        """How many paths ended in `state`."""
+        """How many moved-class paths ended in `state`."""
         return sum(1 for s in self.states.values() if s == state)
+
+    def backup_count(self, state: str) -> int:
+        """How many backup-class paths ended in `state` (`evicted`,
+        `pending_upload`, `backed_up` or `changed`)."""
+        return sum(1 for s in self.backup_states.values() if s == state)
 
 
 def _step(_name: str) -> None:
@@ -251,13 +272,8 @@ def apply_migration(
             _step("intent")
             settled(planned.path, _settle(settings, cache_dir, icloud, intent, sha))
 
-    if not intents:  # nothing to move: leave no trace
-        if len(_read_lines(journal)) != 1:
-            raise MigrationStoppedError("the journal holds records but names no file")
-        journal.unlink()
-        return MigrationResult(run_id=run, manifest_sha256="")
-
-    if not any(r["op"] == "evicted" for r in _read_lines(journal)):
+    backups = [f for f in plan.files if f.klass is MigrationClass.BACKUP]
+    if intents and not any(r["op"] == "evicted" for r in _read_lines(journal)):
         hashes = list(
             dict.fromkeys(
                 intents[p]["sha256"] for p, st in states.items() if st in {"moved", "duplicate"}
@@ -272,9 +288,35 @@ def apply_migration(
                 elif sha in report.pending_upload:
                     states[path] = "pending_upload"
         _append(journal, {"op": "evicted", "states": states})
-    else:
+    elif intents:
         states = next(r for r in _read_lines(journal) if r["op"] == "evicted")["states"]
     _step("evict")
+
+    bsettled = _backup_phase(settings, cache_dir, journal, backups)
+    fresh = any(r["new"] for r in _read_lines(journal) if r["op"] == "bsettled")
+    if not intents and not fresh:  # nothing to move or copy: leave no trace
+        if any(r["op"] not in {"start", "bintent", "bsettled"} for r in _read_lines(journal)):
+            raise MigrationStoppedError("the journal holds records but names no file")
+        journal.unlink()
+        return MigrationResult(run_id=run, manifest_sha256="")
+
+    bstates = {p: r["state"] for p, r in bsettled.items()}
+    bevicted = next((r for r in _read_lines(journal) if r["op"] == "bevicted"), None)
+    if bevicted is None:
+        held = {p: r["sha256"] for p, r in bsettled.items() if r["state"] == "backed_up"}
+        report = (
+            evict_uploaded(settings, list(dict.fromkeys(held.values())), icloud) if held else None
+        )
+        if report is not None:
+            for path, sha in held.items():
+                if sha in report.evicted or sha in report.already_evicted:
+                    bstates[path] = "evicted"
+                elif sha in report.pending_upload:
+                    bstates[path] = "pending_upload"
+        _append(journal, {"op": "bevicted", "states": bstates})
+    else:
+        bstates = bevicted["states"]
+    _step("backup_evict")
 
     records = _read_lines(journal)
     finish = next((r for r in records if r["op"] == "finish"), None)
@@ -283,7 +325,9 @@ def apply_migration(
         _append(journal, finish)
     manifest = next((r for r in records if r["op"] == "manifest"), None)
     if manifest is None:
-        body = _manifest_body(run, start["at"], finish["at"], intents, states, plan.files)
+        body = _manifest_body(
+            run, start["at"], finish["at"], intents, states, bsettled, bstates, backups
+        )
         digest = archive_manifest(settings, body).sha256
         manifest = {"op": "manifest", "digest": digest}
         _append(journal, manifest)
@@ -308,7 +352,9 @@ def apply_migration(
     _append(journal, {"op": "done"})
     os.replace(journal, keep_dir / f"journal-{run}.jsonl")
     _fsync_dir(keep_dir)
-    return MigrationResult(run_id=run, manifest_sha256=manifest["digest"], states=states)
+    return MigrationResult(
+        run_id=run, manifest_sha256=manifest["digest"], states=states, backup_states=bstates
+    )
 
 
 def _manifest_body(
@@ -317,7 +363,9 @@ def _manifest_body(
     finished: str,
     intents: dict[str, dict[str, Any]],
     states: dict[str, str],
-    planned: tuple[PlannedFile, ...],
+    bsettled: dict[str, dict[str, Any]],
+    bstates: dict[str, str],
+    backups: list[PlannedFile],
 ) -> bytes:
     files = [
         {
@@ -333,17 +381,55 @@ def _manifest_body(
     files += [
         {
             "path": f.path,
-            "bytes": f.size_bytes,
-            "sha256": None,
+            "bytes": bsettled[f.path]["bytes"] if f.path in bsettled else f.size_bytes,
+            "sha256": bsettled[f.path]["sha256"] if f.path in bsettled else None,
             "mtime_ns": f.mtime_ns,
             "class": "backup",
-            "state": "backup_pending",
+            "state": bstates.get(f.path, "backup_pending"),
         }
-        for f in planned
-        if f.klass is MigrationClass.BACKUP
+        for f in backups
     ]
     doc = {"run_id": run, "started_at": started, "finished_at": finished, "files": files}
     return json.dumps(doc, sort_keys=True).encode()
+
+
+def _backup_one(settings: Settings, journal: Path, path: str, source: Path) -> dict[str, Any]:
+    """Copy one backup file into the archive; the settled record (module docstring:
+    Backups). A source that is gone, or still changing after one retry, is `changed`."""
+    for _attempt in range(2):
+        try:
+            body = source.read_bytes()
+        except FileNotFoundError:
+            break
+        sha = hashlib.sha256(body).hexdigest()
+        fresh = not is_archived(settings, sha)
+        _append(journal, {"op": "bintent", "path": path, "sha256": sha, "bytes": len(body)})
+        _step("backup_intent")
+        if fresh:
+            archive_body(settings, body)  # the floor error stops the run, resumable
+        _step("backup_copy")
+        try:
+            stable = _sha256_file(source) == sha
+        except FileNotFoundError:
+            break
+        if stable:
+            return {"state": "backed_up", "sha256": sha, "bytes": len(body), "new": fresh}
+    return {"state": "changed", "sha256": None, "bytes": 0, "new": False}
+
+
+def _backup_phase(
+    settings: Settings, cache_dir: Path, journal: Path, backups: list[PlannedFile]
+) -> dict[str, dict[str, Any]]:
+    """Copy every backup file the journal has not settled yet; return all settled."""
+    done = {r["path"]: r for r in _read_lines(journal) if r["op"] == "bsettled"}
+    for planned in backups:
+        if planned.path in done:
+            continue
+        record = _backup_one(settings, journal, planned.path, cache_dir / planned.path)
+        record = {"op": "bsettled", "path": planned.path, **record}
+        _append(journal, record)
+        done[planned.path] = record
+    return done
 
 
 def _intent(planned: PlannedFile, sha: str) -> dict[str, Any]:
