@@ -1720,6 +1720,30 @@ what = "Read-only baseline of accession-level Form 4 disagreements and XML reque
 why = "The owner needs measured counts before setting the rule-5 failure threshold."
 unblocks = ["task:T351"]
 
+[task.T355]
+what = "Add the research_exposures table and a nullable trial_results.n_exposure column at the next free schema version (44 after 41 to 43)."
+why = "A desk read that reads returns outside the backtester needs a row, or the family's N misses that look (#2723)."
+unblocks = ["task:T356"]
+
+[task.T356]
+what = "Write exposure records that hash their own probe file, and add the store-source exposures to a family's N as its third part."
+why = "N must count every look at the store's returns; candidate 5 alone is two looks the registry did not count (#2723)."
+unblocks = ["task:T357", "task:T358"]
+
+[task.T357]
+what = "Add the exposure record and exposures CLI commands, with no edit, delete or withdraw command."
+why = "The owner records desk reads in one checked command, and the candidate list is a cross-check on the search tally (#2723)."
+unblocks = ["task:T359"]
+
+[task.T358]
+what = "Show exposures on the research view, and split today's N on the backtest page into trials, research runs and exposures."
+why = "A reviewer should see what raised N and which reads only disclosed exposure (#2723)."
+
+[task.T359]
+what = "Owner backfill: record candidate 5's two store launches and the open-data desk reads since 2026-10-30."
+why = "The profitability family's N must rise by exactly 2 before the next profitability trial is judged (#2723)."
+unblocks = ["issue:2723"]
+
 
 
 [research.2026-10-30-equity-issuance-desk-read]

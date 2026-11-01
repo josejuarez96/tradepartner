@@ -42,7 +42,7 @@ from tradepartner.adapters.form4_route import (
 from tradepartner.config import Settings
 
 Form4IndexRow = tuple[str, str, str, date]  # accession, issuer CIK, form, filing date
-BULK_READER_VERSION = 3  # CSV-quoted security titles (#2706); 2: joined roles (#2691).
+BULK_READER_VERSION = 4  # Recheck order samples after multi-owner exclusion (#2711).
 
 
 class RequestBudgetStopped(Exception):
@@ -147,11 +147,24 @@ def load_bulk_quarters(
 
 
 def order_check_path(settings: Settings, quarter: Quarter, digest: str) -> Path:
-    """Cache marker keyed by zip bytes and every parser version affecting parity."""
+    """Cache marker keyed by zip bytes and every parser version affecting parity.
+
+    A marker from an older version (`BULK_READER_VERSION`, the parsers, the multi-owner
+    switch) no longer matches, so the quarter's order is checked again on purpose
+    (#2728): the reader that wrote the marker is not the one about to write bulk rows.
+    The re-check is bounded to the leftovers: the sample is drawn only from the
+    quarter's queued accessions (stored ones are skipped before the route, and a
+    quarter with none queued is not read at all), at most `form4_bulk_order_sample`
+    XML requests per quarter, and a passing sample writes the new marker. The sample
+    is deterministic, so a quarter whose leftovers mismatch stays held each run.
+    """
     from tradepartner.adapters.edgar_source import PARSER_VERSION
 
     label = f"{quarter.year}q{quarter.number}"
-    version = f"b{BULK_READER_VERSION}-x{SEC_FORMS_PARSER_VERSION}-s{PARSER_VERSION}"
+    version = (
+        f"b{BULK_READER_VERSION}-x{SEC_FORMS_PARSER_VERSION}-s{PARSER_VERSION}"
+        f"-m{int(settings.events.form4_multi_owner_xml)}"
+    )
     return (
         Path(settings.edgar.cache_dir)
         / "insider"
@@ -187,6 +200,7 @@ def run_form4_bulk_route(
     zero_price_codes: tuple[str, ...],
     order_sample_size: int,
     budget: int,
+    multi_owner_xml: bool = True,
     request_count: Callable[[], int] | None = None,
     checked: Callable[[Quarter], bool] | None = None,
     remember_check: Callable[[Quarter], None] | None = None,
@@ -248,6 +262,7 @@ def run_form4_bulk_route(
                 and bulk.accessions[accession].issuer_cik == cik
                 and not bulk.accessions[accession].identity_bad
                 and not bulk.accessions[accession].order_bad
+                and (not multi_owner_xml or len(set(bulk.accessions[accession].filer_ciks)) == 1)
             }
             sample = order_sample(candidates, order_sample_size)
             if not sample:
@@ -295,7 +310,13 @@ def run_form4_bulk_route(
                 continue
             accession_bulk = bulk.accessions.get(accession) if bulk is not None else None
             decision = (
-                AccessionRoute(Route.XML, IDENTITY_BAD)
+                AccessionRoute(Route.XML, "sec_forms_bulk_multi_owner_xml")
+                if (
+                    multi_owner_xml
+                    and accession_bulk is not None
+                    and len(set(accession_bulk.filer_ciks)) > 1
+                )
+                else AccessionRoute(Route.XML, IDENTITY_BAD)
                 if accession_bulk is not None and accession_bulk.issuer_cik != cik
                 else route_accession(
                     accession_bulk,

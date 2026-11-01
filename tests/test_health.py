@@ -89,6 +89,7 @@ from tradepartner.health import (
     filing_event_counts,
     health_report,
     health_verdict,
+    incremental_edgar_counts,
     integrity_checks,
     last_ingests,
     listed_without_bars,
@@ -102,6 +103,7 @@ from tradepartner.health import (
 from tradepartner.store.db import configure_connection, insert_row
 from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.store.dividend_reviews import ReviewedGroup, reviewed_groups
+from tradepartner.store.drift_check import DriftReport, drift_message
 from tradepartner.store.index_members import IndexInterval, IndexMembers, IndexMembersError
 from tradepartner.store.master import first_session
 from tradepartner.store.schema import TABLE_NAMES, TABLE_PROVENANCE_VALUES
@@ -660,6 +662,29 @@ def test_last_ingests_keeps_an_unknown_source_after_the_known_ones(
     _run(fixture_store, "x1", "vendor_x", "ok", datetime(2020, 6, 29, 22, tzinfo=UTC))
     sources = [i.source for i in last_ingests(fixture_store, T_END)]
     assert sources == ["edgar", "alpaca", "fred", "vendor_x"]
+
+
+def test_last_ingests_summarises_one_run_written_as_several_rows(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#2728: a bulk run writes one row per quarter at one time; the latest line sums
+    them up in cursor order instead of showing whichever row sorts last by run id."""
+    day = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    for run_id, cursor, status in (
+        ("b3", "2020q1", "ok"),
+        ("b1", "2020q3", "partial"),
+        ("b2", "2020q2", "ok"),
+    ):
+        _run(fixture_store, run_id, "sec_insider_bulk", status, day, cursor=cursor, mode="backfill")
+    bulk = next(i for i in last_ingests(fixture_store, T_END) if i.source == "sec_insider_bulk")
+    assert bulk.latest_status == "partial"
+    assert bulk.latest_message == "3 rows (2020q1 to 2020q3): 2 ok; not ok: 2020q3 partial"
+    assert bulk.last_ok_cursor == "2020q2"
+    fixture_store.execute("UPDATE ingestion_runs SET status = 'ok' WHERE run_id = 'b1'")
+    bulk = next(i for i in last_ingests(fixture_store, T_END) if i.source == "sec_insider_bulk")
+    assert bulk.latest_status == "ok"
+    assert bulk.latest_message == "3 rows (2020q1 to 2020q3): 3 ok"
+    assert bulk.last_ok_cursor == "2020q3"
 
 
 # --- Coverage ---------------------------------------------------------------
@@ -4722,3 +4747,33 @@ def test_sec_form_violation_frame_has_identity_columns(
     assert expected_identity.issubset(actual_columns), (
         f"Missing identity columns for {table} unique: {expected_identity - actual_columns}"
     )
+
+
+def test_incremental_edgar_warnings_show_drift_with_its_ciks_and_changed_stamps(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    drift = drift_message(DriftReport(checked=40, drifted=("0000000007", "0000000009")))
+    message = f"10 securities; {drift}, index_stamp_changed: 3; missing benchmarks: none"
+    _run(fixture_store, "r-inc", "edgar_index", "ok", T_END - timedelta(hours=2), message=message)
+    # A later run without the figures neither clears nor repeats the warning.
+    _run(fixture_store, "r-later", "edgar", "failed", T_END - timedelta(hours=1), message="boom")
+    block = health_report(fixture_store, T_END, _settings()).incremental_edgar
+    assert block.counts == {"incremental_drift": 2, "index_stamp_changed": 3}
+    assert block.drift_ciks == ("0000000007", "0000000009")
+    assert block.warnings == (
+        "incremental_drift: 2 (0000000007 0000000009)",
+        "index_stamp_changed: 3",
+    )
+
+
+def test_incremental_edgar_is_quiet_without_counts_or_with_zero(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    assert health_report(fixture_store, T_END, _settings()).incremental_edgar.warnings == ()
+    message = "incremental_drift: 0, index_stamp_changed: 0"
+    _run(fixture_store, "r-inc0", "edgar", "ok", T_END - timedelta(hours=1), message=message)
+    block = health_report(fixture_store, T_END, _settings()).incremental_edgar
+    assert block.counts == {"incremental_drift": 0, "index_stamp_changed": 0}
+    assert block.warnings == ()
+    assert incremental_edgar_counts(None) == {}
+    assert incremental_edgar_counts("statement_added: 3") == {}

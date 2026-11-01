@@ -18,8 +18,9 @@ here is this module's and is stated once:
   `backfill`, `import`), per source
   (`ingest.SOURCES` first, then any other source in the table,
   alphabetically): the finish time and cursor of the last `ok` run,
-  and the status, start and message of the latest run of any status. A source
-  that never ran shows `None`s. A maintenance or repair mode (`retract`,
+  and the status, start and message of the latest run of any status (rows
+  sharing the latest start time are one run, summed up by `_latest_line`;
+  #2728). A source that never ran shows `None`s. A maintenance or repair mode (`retract`,
   `actions`, `holes`, `repair`, `action_retract`, or any mode added later) is
   not an ingest and is left out, so it never hides the latest ingest's status.
 - **Coverage** (`coverage`): the population of ingest's staleness check
@@ -111,6 +112,14 @@ here is this module's and is stated once:
   warning while `items_missing` or `clock_suspect` is positive. Coverage is
   reported, not thresholded. `clock_suspect` is the clock detector's rule
   (a health finding, never a repair): a stamp that fits only a moved clock.
+
+- **Incremental EDGAR** (`incremental_edgar`, #2629, T321): `counts` is
+  `incremental_edgar_counts` of the latest `edgar` or `edgar_index` run
+  message that carries them
+  (`incremental_drift: N`, `index_stamp_changed: N`), with the CIKs the
+  drift check named; a warning while either is positive. A drifted CIK means
+  a rule changed in code without a `BUILD_RULES_VERSION` bump; a changed stamp
+  is an owner repair release (spec amendment 2026-10-30). Report-only.
 
 - **Rates** (`rates`, #1498, T169e): per configured or stored series, the
   stored row count, latest observation, vintage and stamp, revised-key count,
@@ -397,7 +406,7 @@ import re
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from itertools import pairwise
 from typing import Any
@@ -904,6 +913,67 @@ class FilingEvents:
             for name in ("items_missing", "clock_suspect")
             if self.counts.get(name, 0) > 0
         )
+
+
+#: `incremental_drift: <N>` and `index_stamp_changed: <N>` (the incremental
+#: EDGAR ingest's run-message figures, #2629), and the drift check's named
+#: CIKs, `incremental_drift_ciks: a b c` (`store.drift_check.drift_message`).
+_INCREMENTAL_COUNT = re.compile(r"\b(incremental_drift|index_stamp_changed): (\d+)\b")
+_INCREMENTAL_CIKS = re.compile(r"\bincremental_drift_ciks: ([0-9 ]+)")
+
+
+def incremental_edgar_counts(message: str | None) -> dict[str, int]:
+    """The `incremental_drift` and `index_stamp_changed` figures of an EDGAR
+    run's message (#2629), keyed by name. Empty when `message` is `None` or
+    names neither (a nightly before the incremental ingest)."""
+    if not message:
+        return {}
+    return {name: int(n) for name, n in _INCREMENTAL_COUNT.findall(message)}
+
+
+@dataclass(frozen=True, eq=False)
+class IncrementalEdgar:
+    """The incremental EDGAR ingest's two report-only warnings (#2629, T321;
+    module docstring). `counts` is `incremental_edgar_counts` of the latest
+    EDGAR run's message and `drift_ciks` the CIKs it names (up to ten)."""
+
+    counts: dict[str, int]
+    drift_ciks: tuple[str, ...] = ()
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        """`incremental_drift` (naming its CIKs) and `index_stamp_changed`,
+        each while its count in the latest run is positive."""
+        out: list[str] = []
+        drift = self.counts.get("incremental_drift", 0)
+        if drift > 0:
+            named = f" ({' '.join(self.drift_ciks)})" if self.drift_ciks else ""
+            out.append(f"incremental_drift: {drift}{named}")
+        changed = self.counts.get("index_stamp_changed", 0)
+        if changed > 0:
+            out.append(f"index_stamp_changed: {changed}")
+        return tuple(out)
+
+
+def _incremental_edgar_report(conn: duckdb.DuckDBPyConnection, t: datetime) -> IncrementalEdgar:
+    """The latest run of `edgar` or `edgar_index` finished by `t` whose
+    message carries either figure (the driver writes both on the
+    `edgar_index` row); a later run without them neither clears nor shows."""
+    row = conn.execute(
+        """
+        SELECT message FROM ingestion_runs
+        WHERE source IN ('edgar', 'edgar_index') AND coalesce(finished_at, started_at) <= ?
+          AND (message LIKE '%incremental_drift:%' OR message LIKE '%index_stamp_changed:%')
+        ORDER BY started_at DESC, run_id DESC LIMIT 1
+        """,
+        [t],
+    ).fetchone()
+    message = None if row is None else row[0]
+    named = _INCREMENTAL_CIKS.search(message or "")
+    return IncrementalEdgar(
+        counts=incremental_edgar_counts(message),
+        drift_ciks=tuple(named.group(1).split()) if named else (),
+    )
 
 
 _REFERENCE_MISSING_SCHEMA: dict[str, Any] = {
@@ -1825,6 +1895,8 @@ class HealthReport:
     integrity: tuple[IntegrityCheck, ...]
     #: `None` when the block was not computed ("not computed", never a pass).
     coverage_reference: CoverageReference | None = None
+    #: The incremental EDGAR ingest's warnings (#2629).
+    incremental_edgar: IncrementalEdgar = field(default_factory=lambda: IncrementalEdgar({}))
 
     @property
     def failures(self) -> tuple[str, ...]:
@@ -1976,6 +2048,7 @@ def health_report(
         },
         statement=_statement_facts_report(conn, t, settings, ingests),
         filing_events=_filing_events_report(conn, settings, ingests),
+        incremental_edgar=_incremental_edgar_report(conn, t),
         rates=_rates_report(conn, t, settings),
         borrow=_borrow_report(conn, t, session, settings),
         mergers=_mergers_report(conn, t, ingests),
@@ -2747,19 +2820,36 @@ def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestSt
     for source in (*SOURCES, *extra):
         rows = by_source.get(source, [])
         ok_rows = [r for r in rows if r[1] == OK and r[3] is not None]
-        last_ok = max(ok_rows, key=lambda r: r[3], default=None)
+        last_ok = max(ok_rows, key=lambda r: (r[3], r[4] or ""), default=None)
         latest = rows[-1] if rows else None
+        status, message = (None, None) if latest is None else _latest_line(rows)
         out.append(
             IngestStatus(
                 source=source,
                 last_ok_finished_at=None if last_ok is None else last_ok[3],
                 last_ok_cursor=None if last_ok is None else last_ok[4],
-                latest_status=None if latest is None else latest[1],
+                latest_status=status,
                 latest_started_at=None if latest is None else latest[2],
-                latest_message=None if latest is None else latest[5],
+                latest_message=message,
             )
         )
     return tuple(out)
+
+
+def _latest_line(rows: list[tuple[Any, ...]]) -> tuple[str, str | None]:
+    """The latest run's status and message. One run can write several rows at one start
+    time (the Form 4 bulk backfill writes one per quarter, #2728): those are summed up in
+    cursor order, `ok` only when every row is, so no row is picked by its random run id."""
+    latest = rows[-1]
+    tied = sorted((r for r in rows if r[2] == latest[2]), key=lambda r: r[4] or "")
+    if len(tied) == 1:
+        return latest[1], latest[5]
+    not_ok = [r for r in tied if r[1] != OK]
+    status = OK if not not_ok else not_ok[0][1] if len({r[1] for r in not_ok}) == 1 else "mixed"
+    message = f"{len(tied)} rows ({tied[0][4]} to {tied[-1][4]}): {len(tied) - len(not_ok)} ok"
+    if not_ok:
+        message += "; not ok: " + ", ".join(f"{r[4]} {r[1]}" for r in not_ok)
+    return status, message
 
 
 def _current_from(listings: pl.DataFrame, session: date) -> dict[str, dict[str, Any]]:
