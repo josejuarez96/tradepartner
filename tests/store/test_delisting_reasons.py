@@ -175,4 +175,4 @@ def test_version_43_builds_on_the_snapshot_sightings_version() -> None:
     """Version 42 is #2665's `snapshot_sightings`; this PR's migration is 42 -> 43."""
     assert "snapshot_sightings" in schema.TABLE_NAMES
     assert schema._PRE_DELISTING_REASONS_VERSION == schema._PRE_SNAPSHOT_SIGHTINGS_VERSION + 1
-    assert schema._PRE_DELISTING_REASONS_VERSION + 1 == schema.CURRENT_SCHEMA_VERSION
+    assert schema._PRE_DELISTING_REASONS_VERSION + 1 == schema._PRE_RESEARCH_EXPOSURES_VERSION
