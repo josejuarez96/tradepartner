@@ -276,6 +276,15 @@ def test_as_of_last_updated_and_staleness(store_path: Path) -> None:
     assert fresh.as_of is not None and fresh.as_of >= known[0]
     assert fresh.last_updated == FINISHED
     assert fresh.stale_sessions == 0
+    allocation_time = session_close(LAST) + timedelta(hours=1)
+    with duckdb.connect(str(store_path)) as conn:
+        conn.execute(
+            "INSERT INTO spinoff_allocations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ["P", "C", LAST, 0.3, allocation_time, allocation_time, "owner", "owner"],
+        )
+    with _connect(store_path) as conn:
+        after_allocation = health_page.load_health_view(conn, T, _settings(store_path), WINDOW)
+    assert after_allocation.as_of == fresh.as_of
     # 2020-07-01, 07-02, 07-06 and 07-07 have no bars (07-03 is a holiday).
     assert stale.stale_sessions == 4
 
@@ -752,3 +761,19 @@ def test_render_leads_with_a_fine_verdict_on_a_current_store(
     monkeypatch: pytest.MonkeyPatch, store_path: Path
 ) -> None:
     assert "Data: checks pass" in _text(_app(monkeypatch, store_path))
+
+
+def test_a_sec_forms_backfill_run_is_not_last_updated(store_path: Path) -> None:
+    """#2624: a forms-only backfill's run rows never make the page look updated."""
+    later = FINISHED + timedelta(minutes=30)
+    for run_id, source in (("2624a", "sec_forms"), ("2624b", "sec_insider_bulk")):
+        _write(
+            store_path,
+            "INSERT INTO ingestion_runs VALUES (?, ?, ?, 'ok', ?, 'backfill', 0, 'x', 'x')",
+            [run_id, later, later, source],
+        )
+    with _connect(store_path) as conn:
+        view = health_page.load_health_view(
+            conn, later + timedelta(minutes=1), _settings(store_path), WINDOW
+        )
+    assert view.last_updated == FINISHED

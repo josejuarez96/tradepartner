@@ -30,7 +30,7 @@ from tradepartner.backfill import FILLED, NO_HOLE, UNASSIGNED, Hole, HoleFill, N
 from tradepartner.calendar import session_close
 from tradepartner.config import Settings
 from tradepartner.ingest import FAILED, OK, STALE, IngestResult, RestampResult, SourceRun
-from tradepartner.store import journal, registry
+from tradepartner.store import journal, registry, schema
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.dividend_reviews import ReviewedGroup
 from tradepartner.store.schema import init_schema
@@ -55,6 +55,96 @@ def _settings(tmp_path: Path, store: Path | None = None, **overrides: Any) -> Se
 def _invoke(settings: Settings, args: Sequence[str], **kwargs: Any) -> Any:  # click.testing.Result
     app = cli.make_app(settings=lambda: settings, clock=kwargs.pop("clock", lambda: NOW), **kwargs)
     return CliRunner().invoke(app, list(args))
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["ingest", "--source", "fred"],
+        ["ingest", "--source", "alpaca", "--backfill", "--since", "2020-01-01"],
+        ["ingest", "--source", "alpaca", "--backfill", "--since", "2020-01-01", "--fill-holes"],
+        ["ingest", "--source", "alpaca_assets", "--import-dir", "/tmp/nonexistent-assets"],
+        ["ingest", "--source", "openfigi"],
+    ],
+)
+def test_ingest_entry_points_migrate_before_source_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> None:
+    from tradepartner.store import migrate as store_migrate
+
+    settings = _settings(tmp_path)
+    if args[-1] == "openfigi":
+        settings = settings.model_copy(
+            update={"openfigi": settings.openfigi.model_copy(update={"enabled": True})}
+        )
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        conn.execute("UPDATE schema_version SET version = ?", [schema.CURRENT_SCHEMA_VERSION - 1])
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+    monkeypatch.setattr(cli, "_missing_secrets", lambda *_: [])
+
+    def refuse(_settings: Settings) -> None:
+        raise schema.SchemaMigrationRequiredError("migration refused")
+
+    monkeypatch.setattr(store_migrate, "migrate", refuse)
+    result = _invoke(settings, args)
+    assert result.exit_code != 0, result.output
+    assert "migration refused" in result.output
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM ingestion_runs").fetchone() == (0,)
+
+
+def test_ingest_dry_run_refuses_older_store_without_migrating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import migrate as store_migrate
+
+    settings = _settings(tmp_path)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        conn.execute("UPDATE schema_version SET version = ?", [schema.CURRENT_SCHEMA_VERSION - 1])
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+    monkeypatch.setattr(cli, "_missing_secrets", lambda *_: [])
+    monkeypatch.setattr(store_migrate, "migrate", lambda _: pytest.fail("dry-run migrated"))
+    result = _invoke(settings, ["ingest", "--source", "fred", "--dry-run"])
+    assert result.exit_code != 0
+    assert "tradepartner ingest" in result.output
+
+
+def test_scheduled_ingest_migration_refusal_pings_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import migrate as store_migrate
+
+    settings = _settings(tmp_path)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        conn.execute("UPDATE schema_version SET version = ?", [schema.CURRENT_SCHEMA_VERSION - 1])
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+    monkeypatch.setattr(cli, "_missing_secrets", lambda *_: [])
+    calls: list[tuple[str, bool]] = []
+    monkeypatch.setattr(cli.heartbeat, "ping", lambda _s, job, *, ok: calls.append((job, ok)))
+
+    def refuse(_settings: Settings) -> None:
+        raise schema.SchemaMigrationRequiredError("migration refused")
+
+    monkeypatch.setattr(store_migrate, "migrate", refuse)
+    result = _invoke(settings, ["ingest"])
+    assert result.exit_code == 1
+    assert calls == [("ingest", False)]
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM ingestion_runs").fetchone() == (0,)
+
+
+def test_fill_holes_on_missing_store_refuses_before_migration(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    result = _invoke(
+        settings,
+        ["ingest", "--backfill", "--since", "2020-01-01", "--source", "alpaca", "--fill-holes"],
+    )
+    assert result.exit_code != 0
+    assert "no store" in result.output
+    assert not Path(settings.store.path).exists()
 
 
 def _run_row(
@@ -600,7 +690,8 @@ class _FillRecorder:
 
 
 def _with_store(settings: Settings) -> Settings:
-    Path(settings.store.path).touch()
+    with open_for_write(settings) as conn:
+        init_schema(conn)
     return settings
 
 
@@ -1281,6 +1372,66 @@ def test_health_warns_when_the_last_edgar_run_reports_quarantined_accessions(
     assert result.exit_code == 0, result.output  # a warning, not a failed rule
     assert "warning" in result.output.lower()
     assert "2 quarantined" in result.output
+
+
+@pytest.mark.parametrize(
+    ("message", "warning"),
+    [
+        (
+            "incremental_drift: 2; incremental_drift_ciks: 0000000007 0000000009; "
+            "index_stamp_changed: 0",
+            "incremental_drift: 2 (0000000007 0000000009)",
+        ),
+        ("incremental_drift: 0; index_stamp_changed: 3", "index_stamp_changed: 3"),
+    ],
+)
+def test_health_prints_and_counts_incremental_edgar_warnings(
+    tmp_path: Path, fixture_store_path: Path, message: str, warning: str
+) -> None:
+    settings = _settings(tmp_path, store=fixture_store_path)
+    _run_row(settings, "incremental", "edgar_index", "ok", T_END - timedelta(hours=1), message)
+    result = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "incremental EDGAR:" in result.output
+    assert f"  warning: {warning}" in result.output
+    assert result.output.startswith("Data: checks pass with 1 warning(s), bars current to ")
+    assert result.output.rstrip().endswith("health: 0 failures, 1 warnings")
+
+
+def test_health_counts_both_incremental_edgar_warnings(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    settings = _settings(tmp_path, store=fixture_store_path)
+    _run_row(
+        settings,
+        "incremental",
+        "edgar_index",
+        "ok",
+        T_END - timedelta(hours=1),
+        "incremental_drift: 1; index_stamp_changed: 2",
+    )
+    result = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "  warning: incremental_drift: 1" in result.output
+    assert "  warning: index_stamp_changed: 2" in result.output
+    assert result.output.startswith("Data: checks pass with 2 warning(s), bars current to ")
+    assert result.output.rstrip().endswith("health: 0 failures, 2 warnings")
+
+
+@pytest.mark.parametrize("message", [None, "incremental_drift: 0; index_stamp_changed: 0"])
+def test_health_has_no_incremental_edgar_warning_without_positive_counts(
+    tmp_path: Path, fixture_store_path: Path, message: str | None
+) -> None:
+    settings = _settings(tmp_path, store=fixture_store_path)
+    if message is not None:
+        _run_row(settings, "incremental", "edgar_index", "ok", T_END - timedelta(hours=1), message)
+    result = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "incremental EDGAR:" not in result.output
+    assert "  warning: incremental_drift:" not in result.output
+    assert "  warning: index_stamp_changed:" not in result.output
+    assert result.output.startswith("Data: checks pass, bars current to ")
+    assert result.output.rstrip().endswith("health: OK")
 
 
 def _equal_cash(conn: duckdb.DuckDBPyConnection, sid: str, action_id: str) -> None:
@@ -2529,3 +2680,60 @@ def test_census_sec_forms_treats_open_quarter_404_as_empty(
     assert "1993" in result.output and "2024" in result.output
     assert "walk stopped" not in result.output
     assert not Path(secrets_set.store.path).exists()
+
+
+# --- ingest --sec-forms-only (#2624) ------------------------------------------------
+
+
+def _forms_settings(settings: Settings, **events: Any) -> Settings:
+    update = {"sec_forms_enabled": True, "sec_forms": ["4", "4/A"], **events}
+    return settings.model_copy(update={"events": settings.events.model_copy(update=update)})
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("ingest", "--sec-forms-only"),
+        ("ingest", "--source", "alpaca", "--sec-forms-only"),
+        ("ingest", "--source", "edgar", "--sec-forms-only", "--backfill", "--since", "2016-01-01"),
+        ("ingest", "--source", "edgar", "--sec-forms-only", "--dry-run"),
+    ],
+)
+def test_sec_forms_only_needs_edgar_and_no_other_flag(
+    secrets_set: Settings, args: Sequence[str]
+) -> None:
+    result = _invoke(_forms_settings(secrets_set), args)
+    assert result.exit_code == cli.USAGE_ERROR
+    assert "--sec-forms-only needs --source edgar" in result.output
+    assert not Path(secrets_set.store.path).exists()
+
+
+def test_sec_forms_only_needs_the_collection_switch(secrets_set: Settings) -> None:
+    result = _invoke(secrets_set, ["ingest", "--source", "edgar", "--sec-forms-only"])
+    assert result.exit_code == cli.USAGE_ERROR
+    assert "needs events.sec_forms_enabled" in result.output
+    assert not Path(secrets_set.store.path).exists()
+
+
+def test_census_refuses_sec_forms_only_without_a_store(secrets_set: Settings) -> None:
+    result = _invoke(secrets_set, ["ingest", "--census-sec-forms", "--sec-forms-only"])
+    assert result.exit_code == cli.USAGE_ERROR
+    assert "--census-sec-forms stands alone" in result.output
+    assert not Path(secrets_set.store.path).exists()
+
+
+def test_sec_forms_only_reads_no_index_quarter_before_the_backfill_start(
+    secrets_set: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _s: None)
+    settings = _forms_settings(secrets_set, sec_forms_backfill_start=date(2024, 10, 1))
+    result, seen = _census_run(settings, ("ingest", "--source", "edgar", "--sec-forms-only"))
+    assert result.exit_code == 0, result.output
+    assert "sec_forms" in result.output and "Form 4 bulk: 0 selected" in result.output
+    # Only the start's quarter and the clock's: no 1993 index, no master build's requests.
+    assert [r.url.path.split("/")[-3:-1] for r in seen] == [["2024", "QTR4"], ["2025", "QTR1"]]
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert conn.execute("SELECT source, mode FROM ingestion_runs").fetchall() == [
+            ("sec_forms", "backfill")
+        ]
+        assert conn.execute("SELECT count(*) FROM securities").fetchone() == (0,)

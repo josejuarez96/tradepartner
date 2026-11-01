@@ -65,6 +65,11 @@ def sandbox_marker(settings: Settings) -> Path:
     return Path(f"{settings.store.path}.sandbox")
 
 
+def _resolved_sandbox_marker(settings: Settings) -> Path:
+    """The sandbox marker beside the fully resolved store path (symlinks followed)."""
+    return Path(f"{Path(settings.store.path).resolve()}.sandbox")
+
+
 def sandbox_store_refusal(settings: Settings, book_id: str) -> str | None:
     """Why `book_id` may not run on `settings.store.path`, or `None` (owner decision
     2026-10-28, docs/runbooks/sandbox.md). Both directions, so the copy (which holds the
@@ -72,12 +77,15 @@ def sandbox_store_refusal(settings: Settings, book_id: str) -> str | None:
     store never mix: book `sandbox` needs a store that resolves under a fixed temp root
     AND carries the marker; every other book is refused on a marked store. Pure reads."""
     store = Path(settings.store.path).resolve()
-    marked = sandbox_marker(settings).is_file()
+    # The marker beside the RESOLVED store decides: a file symlink to a marked copy is
+    # the sandbox; a symlink (even one with a marker beside it) to the live store is not.
+    marked = _resolved_sandbox_marker(settings).is_file()
     if book_id != SANDBOX_BOOK_ID:
         if marked:
             return (
                 f"book {book_id!r} is refused on a sandbox copy of the store (marker "
-                f"{sandbox_marker(settings).name} present): only book {SANDBOX_BOOK_ID!r} "
+                f"{_resolved_sandbox_marker(settings).name} present): only book "
+                f"{SANDBOX_BOOK_ID!r} "
                 "runs there (docs/runbooks/sandbox.md)"
             )
         return None
@@ -102,17 +110,23 @@ def resolve_book(settings: Settings, book_id: str | None) -> str:
     return book
 
 
+def _resolved_store(settings: Settings) -> Path:
+    """The fully resolved store path (symlinks followed), so a symlink and its target
+    take the same lock (#2557). A path with no symlink in it keeps its lock names."""
+    return Path(settings.store.path).resolve()
+
+
 def lock_path(settings: Settings, book_id: str | None = None) -> Path:
     """`<store.path>.paper.<book>.lock`, beside the store it guards; `book_id`
     defaults to `paper.book_id`. `ValueError` outside the book token grammar."""
-    return Path(f"{settings.store.path}.paper.{resolve_book(settings, book_id)}.lock")
+    return Path(f"{_resolved_store(settings)}.paper.{resolve_book(settings, book_id)}.lock")
 
 
 def legacy_lock_path(settings: Settings) -> Path:
     """`<store.path>.paper.lock`, the one lock before books (T59). Book `main`
     takes it too (after its own), so a process still on the old code and one on
     the new exclude each other across the upgrade while H1's window is open."""
-    return Path(f"{settings.store.path}.paper.lock")
+    return Path(f"{_resolved_store(settings)}.paper.lock")
 
 
 def _holder(path: Path) -> str:

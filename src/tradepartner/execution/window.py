@@ -258,6 +258,7 @@ from tradepartner.config import (
     FROZEN_EXECUTION_KEYS,
     FROZEN_PAPER_KEYS,
     PAPER_FAMILIES,
+    SANDBOX_BOOK_ID,
     Cadence,
     RiskConfig,
     Settings,
@@ -783,6 +784,7 @@ def start(
     slug: str,
     *,
     book_id: str | None = None,
+    now: bool = False,
 ) -> StartResult:
     """`paper start --book <book> --hypothesis <slug>` (module docstring; `book_id`
     defaults to `paper.book_id`). Raises `LockHeld` while another process holds
@@ -790,6 +792,8 @@ def start(
     `ValueError` for a book outside the token grammar, and `StartRefusedError`
     for every other refusal, all before any write."""
     book = resolve_book(settings, book_id)
+    if now and book != SANDBOX_BOOK_ID:
+        raise ValueError("--now is only for book 'sandbox' on a marked temp copy")
     with run_lock(settings, book):
         with connect() as conn:
             hyp = registry.get_hypothesis(conn, slug)
@@ -812,15 +816,15 @@ def start(
                     f"no gap_signoff for {slug!r} references an ok, non-synthetic, "
                     "in_sample trial of this hypothesis",
                 )
-            now = _read_clock(clock)
+            reading = _read_clock(clock)
             forward = _forward(conn, hyp)
             if forward:
-                if _ny_date(now) < hyp.holdout_start:
+                if _ny_date(reading) < hyp.holdout_start:
                     raise StartRefusedError(
                         "holdout_not_complete",
                         f"{slug!r}'s forward holdout.start ({hyp.holdout_start}) has not passed",
                     )
-            elif not _holdout_end_completed(hyp.holdout_end, now, cadence):
+            elif not _holdout_end_completed(hyp.holdout_end, reading, cadence):
                 raise StartRefusedError(
                     "holdout_not_complete",
                     f"{slug!r}'s frozen holdout.end ({hyp.holdout_end}) is not a "
@@ -838,9 +842,24 @@ def start(
                 other_accounts = {}
             except SchemaVersionError as exc:
                 raise StartRefusedError(SCHEMA_VERSION, str(exc)) from exc
-            today = _ny_date(now)
-            listings = listing_ends_as_of(conn, now, settings)
-            actions = live_actions_as_of(conn, now)
+            today = _ny_date(reading)
+            listings = listing_ends_as_of(conn, reading, settings)
+            actions = live_actions_as_of(conn, reading)
+            if now:
+                if cadence != "daily":
+                    raise StartRefusedError("now_cadence", "--now needs a daily rebalance cadence")
+                t_0_now = previous_session(today)
+                if t_0_now <= hyp.holdout_end and not forward:
+                    raise StartRefusedError("now_data", "--now needs a close after the holdout")
+                if forward and t_0_now < hyp.holdout_start:
+                    raise StartRefusedError("now_data", "--now needs a close inside the holdout")
+                if not conn.execute(
+                    "SELECT 1 FROM prices_daily WHERE session = ? AND known_at <= ? LIMIT 1",
+                    [t_0_now, session_close(t_0_now)],
+                ).fetchone():
+                    raise StartRefusedError(
+                        "now_data", "--now needs the previous session's stored close"
+                    )
 
         try:
             account = broker.account()
@@ -876,11 +895,12 @@ def start(
             now=today,
         )
 
-        t_0 = (
-            _forward_first_session(hyp.holdout_start, today, cadence)
-            if forward
-            else _first_rebalance_session(hyp.holdout_end, today, cadence)
-        )
+        if now:
+            t_0 = t_0_now
+        elif forward:
+            t_0 = _forward_first_session(hyp.holdout_start, today, cadence)
+        else:
+            t_0 = _first_rebalance_session(hyp.holdout_end, today, cadence)
         commit, _dirty = registry.code_version()
         params = _frozen_params(settings, registered, cadence)
         frozen_json = registry.canonical_params_json(params)
@@ -893,7 +913,7 @@ def start(
             starting_cash=account.cash,
             starting_equity=account.equity,
             code_version=commit,
-            started_at=now,
+            started_at=reading,
             frozen_json=frozen_json,
             frozen_sha256=frozen_sha256,
             book_id=book,
@@ -901,8 +921,8 @@ def start(
             # the start is inside the base and never booked; it is a DB column,
             # not part of `frozen_json` or its hash (#1583, T183).
             activities_seen_json=json.dumps(sorted({a.activity_id for a in activities})),
-            known_at=now,
-            ingested_at=now,
+            known_at=reading,
+            ingested_at=reading,
         )
 
         with open_for_write(settings) as write_conn:
@@ -926,8 +946,8 @@ def start(
                         quantity=residue.quantity,
                         cash=None,
                         book_id=row.book_id,
-                        known_at=now,
-                        ingested_at=now,
+                        known_at=reading,
+                        ingested_at=reading,
                     ),
                 )
             for security_id, quantity, ex_date in plan.spinoff_receipts:
@@ -943,8 +963,8 @@ def start(
                         quantity=quantity,
                         cash=None,
                         book_id=row.book_id,
-                        known_at=now,
-                        ingested_at=now,
+                        known_at=reading,
+                        ingested_at=reading,
                     ),
                 )
 

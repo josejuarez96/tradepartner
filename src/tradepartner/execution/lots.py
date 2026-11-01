@@ -62,8 +62,15 @@ journal. Nothing here reads a clock or the store.
   basis to it); a **carried residue** opens a zero-basis lot on its session; a
   **stock merger** (a `corporate_action_cash` and a `merger_receipt` naming one
   `merger_id`) re-keys the target's lots to the acquirer at the ratio of the two
-  quantities, carrying basis and date, with no disposal. A residue or a
-  spin-off child is never a wash-sale replacement. Any corporate action on an
+  quantities, carrying basis and date, with no disposal. A **true-up** (an
+  `auto_true_up` or `owner_true_up` row with a quantity, paper spec amendment
+  2026-10-26 #2266, item 9) states the name at the broker's absolute quantity
+  its `explanation_json` carries: a shortfall of lots opens one zero-basis lot
+  on the row's session, an excess closes lots first in, first out at zero
+  proceeds (cash is booked by its own rows). The lots are compared with the
+  absolute figure, not the row's delta, so a split the true-up suppressed
+  never leaves the lots and the positions ledger apart. A residue, a true-up
+  lot or a spin-off child is never a wash-sale replacement. Any corporate action on an
   open short lot raises (short lots are Phase 6).
 
 Amounts are computed in `Fraction` from each float's `repr`, so FIFO residues
@@ -88,7 +95,7 @@ import polars as pl
 
 from tradepartner.adapters.broker import Asset
 from tradepartner.calendar import session_close
-from tradepartner.execution.ledger import _split_ratio
+from tradepartner.execution.ledger import TRUE_UP_KINDS, _split_ratio, true_up_quantity
 from tradepartner.store.journal import AdjustmentRow, OrderedFill, OrderRow
 from tradepartner.store.schema import LONG
 
@@ -108,6 +115,9 @@ _RANK_SPLIT = 0
 _RANK_CASH_IN_LIEU = 1
 _RANK_FILL = 2
 _RANK_ADJUSTMENT = _RANK_FILL + 1
+# A true-up states its name after every other row of its session, and a fill
+# journaled after it (the broker's figure did not hold it) comes after the true-up.
+_RANK_TRUE_UP = _RANK_ADJUSTMENT + 1
 
 _SPLIT = "split"
 _CASH_IN_LIEU = "cash_in_lieu"
@@ -210,6 +220,7 @@ class _Trade:
     client_order_id: str
     book_id: str  # the order's book (ADR 0015 seam 1, plan T133)
     position_side: str = LONG  # the order's `position_side` (T232)
+    known_at: datetime | None = None  # when its latest fill was journaled
 
 
 @dataclass
@@ -644,6 +655,41 @@ class _Ledger:
         _require_long_delta(row, negative=False)
         self._receipt(row, security, _ZERO)
 
+    def true_up(self, row: AdjustmentRow) -> None:
+        """A true-up states the name at the broker's absolute quantity (item 9):
+        open a zero-basis lot for a shortfall, or close lots FIFO at zero
+        proceeds for an excess. A true-up on a name with an open short lot
+        raises (short lots are Phase 6)."""
+        security = _security(row)
+        self.refuse_short(security, row.kind)
+        absolute = true_up_quantity(row)
+        if absolute is None:
+            return
+        held = self.longs.get(security, [])
+        gap = _exact(absolute) - sum((lot.quantity for lot in held), _ZERO)
+        if gap > _ZERO:
+            lot = self.open_lot(
+                security,
+                self.symbol_of(security),
+                _session_at(row),
+                gap,
+                _ZERO,
+                fill_id=None,
+                client_order_id=_placeholder(row),
+                book_id=row.book_id,
+            )
+            self.no_replacement.add(lot.lot_id)
+        elif gap < _ZERO:
+            closed = _close_fifo(held, -gap, _describe(row))
+            self.dispose(
+                closed,
+                lambda sold: _ZERO,
+                trade_at=_session_at(row),
+                fill_id=None,
+                client_order_id=_placeholder(row),
+                book_id=None,
+            )
+
     def _receipt(self, row: AdjustmentRow, security: str, basis: Fraction) -> None:
         lot = self.open_lot(
             security,
@@ -857,13 +903,28 @@ def _events(
                     partial(_Ledger.split, security_id=security_id, ratio=_split_ratio(ratio)),
                 )
             )
-    for trade in _trades(fills, orders):
+    true_ups = [
+        r
+        for r in adjustments
+        if r.kind in TRUE_UP_KINDS
+        and r.quantity is not None
+        and (through is None or r.session <= through)
+    ]
+    for trade in _trades(fills, orders, true_ups):
+        day = trade.trade_at.astimezone(_EXCHANGE_TZ).date()
+        after_true_up = trade.known_at is not None and any(
+            r.security_id == trade.security_id and r.session == day and r.known_at < trade.known_at
+            for r in true_ups
+        )
         events.append(
             (
                 (
-                    trade.trade_at.astimezone(_EXCHANGE_TZ).date(),
-                    _RANK_FILL,
-                    trade.trade_at,
+                    day,
+                    _RANK_TRUE_UP if after_true_up else _RANK_FILL,
+                    trade.known_at if after_true_up else trade.trade_at,
+                    # A fill stamped at a true-up's own instant is inside its
+                    # figure: it replays first, whatever the ids (#2479).
+                    0,
                     trade.order_key,
                 ),
                 partial(_Ledger.trade, trade=trade),
@@ -913,8 +974,19 @@ def _events(
             row, removals, receipts, cash_rows, band_cash, late.get(id(row), ())
         )
         if action is not None:
-            rank = _RANK_CASH_IN_LIEU if row.kind == _CASH_IN_LIEU else _RANK_ADJUSTMENT
-            events.append(((row.session, rank, *_adjustment_key(row)), action))
+            if row.kind in TRUE_UP_KINDS:
+                # In the order the positions ledger replays them: by the stamp.
+                key: tuple[object, ...] = (
+                    row.session,
+                    _RANK_TRUE_UP,
+                    row.known_at,
+                    1,
+                    row.adjustment_id or 0,
+                )
+            else:
+                rank = _RANK_CASH_IN_LIEU if row.kind == _CASH_IN_LIEU else _RANK_ADJUSTMENT
+                key = (row.session, rank, *_adjustment_key(row))
+            events.append((key, action))
     return events
 
 
@@ -1019,12 +1091,21 @@ def _adjustment_event(
         return partial(_Ledger.spinoff, row=row)
     if row.kind == _CARRIED_RESIDUE:
         return partial(_Ledger.residue, row=row)
+    if row.kind in TRUE_UP_KINDS:
+        return partial(_Ledger.true_up, row=row)
     return None
 
 
-def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_Trade]:
+def _trades(
+    fills: Sequence[OrderedFill],
+    orders: Sequence[OrderRow],
+    true_ups: Sequence[AdjustmentRow] = (),
+) -> list[_Trade]:
     """One `_Trade` per fill, or per order when any of its fills is implied,
-    in trade order."""
+    in trade order. An implied order's fills merge only within the span between
+    two true-ups of its name and session: a true-up holds the fills stamped
+    before it, so a fill caught up by it and a residual added after it are
+    separate trades, each replayed on its own side of the true-up (#2479)."""
     known = {order.client_order_id: order for order in orders}
     by_order: dict[str, list[OrderedFill]] = {}
     for item in fills:
@@ -1046,7 +1127,28 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
             raise LotLedgerError(f"fill {row.fill_id} has a naive filled_at")
         by_order.setdefault(row.client_order_id, []).append(item)
     trades: list[_Trade] = []
-    for group in by_order.values():
+
+    def _span(item: OrderedFill) -> tuple[date, int]:
+        day = item.fill.filled_at.astimezone(_EXCHANGE_TZ).date()
+        earlier = sum(
+            1
+            for r in true_ups
+            if r.security_id == item.security_id
+            and r.session == day
+            and r.known_at < item.fill.known_at
+        )
+        return day, earlier
+
+    spans: list[list[OrderedFill]] = []
+    for whole in by_order.values():
+        if any(item.fill.price_implied for item in whole):
+            split: dict[tuple[date, int], list[OrderedFill]] = {}
+            for item in whole:
+                split.setdefault(_span(item), []).append(item)
+            spans.extend(split.values())
+        else:
+            spans.append(whole)
+    for group in spans:
         parts = [(item, _dec(item.fill.quantity), _dec(item.fill.price)) for item in group]
         if any(item.fill.price_implied for item in group):
             first = min(group, key=lambda item: (item.fill.filled_at, _fill_key(item)))
@@ -1063,6 +1165,7 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
                     client_order_id=first.fill.client_order_id,
                     book_id=known[first.fill.client_order_id].book_id,
                     position_side=known[first.fill.client_order_id].position_side,
+                    known_at=max(item.fill.known_at for item in group),
                 )
             )
             continue
@@ -1079,6 +1182,7 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
                 client_order_id=item.fill.client_order_id,
                 book_id=known[item.fill.client_order_id].book_id,
                 position_side=known[item.fill.client_order_id].position_side,
+                known_at=item.fill.known_at,
             )
             for item, quantity, price in parts
         )

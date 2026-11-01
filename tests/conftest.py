@@ -59,6 +59,13 @@ from tradepartner.store.db import configure_connection, utc_now
 _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
 _FIXTURES_CHAINS_DIR = _FIXTURES_UNIVERSE_DIR / "chains"
 
+
+@pytest.fixture(autouse=True)
+def _legacy_schema_migration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep existing seeded older-store migration tests on their intended path."""
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", True)
+
+
 # CI shards pytest across N parallel jobs (#1112); this keeps the same test run as
 # one process, just split into N invocations with no new dependency. Weight is each
 # unit's estimated CPU seconds (`call` + `setup` + `teardown`, summed when a unit covers
@@ -724,6 +731,7 @@ def version_4_store(path: Path) -> Path:
             + schema._OPENFIGI_TYPES_TABLE_DDL
             + schema._SUCCESSOR_CHAINS_TABLE_DDL
             + schema._MERGERS_TABLE_DDL
+            + schema._SNAPSHOT_SIGHTINGS_TABLE_DDL
         ):
             conn.execute(ddl)
         schema._migrate_filing_name(conn)

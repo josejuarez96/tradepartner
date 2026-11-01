@@ -380,7 +380,10 @@ def test_held_delisted_name_is_decided_on_the_next_rebalance(env: Env, tmp_path:
     assert ("SEC_DUAL_B", "forced_exit") in decisions
     # Today the forced exit of an untradable name closes with a note, not an order,
     # and the position stays at the broker: recorded as-is, no fix here.
-    assert outcome.notes == ("forced exit of SEC_DUAL_B (delisted) closed: untradable",)
+    # Timing notes (#2620) ride along; the decision note is the only other one.
+    assert tuple(n for n in outcome.notes if not n.startswith("paper_phase ")) == (
+        "forced exit of SEC_DUAL_B (delisted) closed: untradable",
+    )
     assert not [o for o in env.orders() if o[1] == "SEC_DUAL_B" and o[4] == day]
     assert "DUALB" in env.held()
     assert env.alerts("halted") == []

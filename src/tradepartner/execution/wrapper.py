@@ -267,6 +267,7 @@ from tradepartner.execution.collect import (
     note_unjudged,
 )
 from tradepartner.execution.ledger import Ledger, from_journal
+from tradepartner.execution.lock import sandbox_store_refusal
 from tradepartner.execution.plan import SHORT, BuyCosts, DecisionState, decision_state, residue
 from tradepartner.execution.planning import current_listings, reference_prices
 from tradepartner.execution.reattempts import attempt_scope, write_offs
@@ -709,6 +710,22 @@ class RiskGatedBroker:
         self._last = reading
         return reading
 
+    def _phase_time(
+        self,
+        notes: list[str],
+        phase: str,
+        stamp: datetime | None = None,
+        *,
+        count: int | None = None,
+    ) -> None:
+        """Add a UTC phase reading (or, with `count`, a count) to the run's existing
+        result notes (#2620)."""
+        if count is not None:
+            notes.append(f"paper_phase {phase}={count}")
+            return
+        at = self.read_clock() if stamp is None else stamp
+        notes.append(f"paper_phase {phase}={at.isoformat()}")
+
     def clock_precheck(self, session: date, last_ok_ingest: datetime | None) -> datetime:
         """The pre-check before a phase's first submit (module docstring); return
         the reading or raise `ClockError`. `last_ok_ingest` is the latest `ok`
@@ -924,6 +941,9 @@ class RiskGatedBroker:
             skips, counted = (*skips, *refused), counted + len(refused)
             if self._killed:
                 return BatchOutcome(_SKIPPED_KILL_SWITCH, tuple(submitted), skips)
+            # After the kill-switch return, so a clock read can't change the halt path.
+            if submitted:
+                self._phase_time(notes, "sells_submitted")
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
                 self._await_sells(run, [row for row, _ in gated.to_submit], book, notes)
         if not any(d.side == _BUY for d in decisions):
@@ -978,6 +998,7 @@ class RiskGatedBroker:
             session=run.session,
             ended=book.ended,
         )
+        self._phase_time(notes, "buys_sized")
         built = replace(built, skips=(*built.skips, *unsent))
         # A buy adding to a held name the broker lacks is a disagreement, not a skip.
         _refuse_unknown_held(assets, book, buys=True)
@@ -1012,6 +1033,17 @@ class RiskGatedBroker:
             in_flight=not scope.last,
             plan_decisions=plan_decisions,
         )
+        first_buy: datetime | None = None
+        last_buy: datetime | None = None
+
+        def buy_submitted() -> None:
+            nonlocal first_buy, last_buy
+            stamp = self.read_clock()
+            if first_buy is None:
+                first_buy = stamp
+                self._phase_time(notes, "first_buy_submitted", stamp)
+            last_buy = stamp
+
         submitted, refused = self._submit_all(
             run,
             gated.to_submit,
@@ -1020,7 +1052,10 @@ class RiskGatedBroker:
             frozenset(book.ledger.positions),
             book.last_ok_ingest,
             window=book.window,
+            on_submit=buy_submitted,
         )
+        if last_buy is not None:
+            self._phase_time(notes, "last_buy_submitted", last_buy)
         refused_ids = {s.decision_id for s in refused}
         collected_written_off = self._collect(
             run,
@@ -1626,6 +1661,7 @@ class RiskGatedBroker:
         last_ok_ingest: datetime | None = None,
         *,
         window: PaperWindowRow,
+        on_submit: Callable[[], None] | None = None,
     ) -> tuple[list[str], list[Skip]]:
         """Submit each journaled request in order and await its acknowledgement;
         `submit`'s `Order` passes the shape check after the acknowledgement's
@@ -1660,7 +1696,7 @@ class RiskGatedBroker:
             # (`store.writer_lock_retry_seconds`), the switch read's included, may
             # have run the clock past the window, and nothing is sent outside it
             # (#2178).
-            if not self._in_submit_window(run.session):
+            if not self._in_submit_window(run.session, run):
                 self._phase_incomplete = True
                 self._close_unsent(run, [r for r, _ in pairs[index:]])
                 break
@@ -1684,6 +1720,8 @@ class RiskGatedBroker:
                     ) from None
                 continue
             else:
+                if on_submit is not None:
+                    on_submit()
                 if not self._acknowledge(run, request.client_order_id):
                     self._recheck = True
                     self._set_aside.add(request.client_order_id)
@@ -1693,13 +1731,18 @@ class RiskGatedBroker:
             submitted.append(request.client_order_id)
         return submitted, refused
 
-    def _in_submit_window(self, session: date) -> bool:
+    def _in_submit_window(self, session: date, run: PaperRunRow) -> bool:
         """Whether the clock reads inside [open(S) - `paper.submit_window_before_open_minutes`,
         open(S) + `paper.submit_window_after_open_minutes`] (the interval of
         `run.submit_window`)."""
         paper = self._settings.paper
         opening = self._calendar.session_open(session)
         now = self.read_clock()
+        if (
+            self._run_book(run) == "sandbox"
+            and sandbox_store_refusal(self._settings, "sandbox") is None
+        ):
+            return opening <= now <= self._calendar.session_close(session)
         return (
             opening - timedelta(minutes=paper.submit_window_before_open_minutes)
             <= now
@@ -1843,15 +1886,22 @@ class RiskGatedBroker:
         waiting = [
             row.client_order_id for row in sells if row.client_order_id not in self._set_aside
         ]
+        round_number = 0
         while waiting:
             waiting = [
                 c for c in waiting if self._broker.get_order(c).status not in TERMINAL_STATUSES
             ]
             now = self.read_clock()
+            round_number += 1
             if not waiting or now >= deadline:
                 break
             self._sleep(min(paper.poll_interval_seconds, (deadline - now).total_seconds()))
+        self._phase_time(notes, "sells_poll_rounds", count=round_number)
+        if not waiting:
+            self._phase_time(notes, "sells_terminal")
+        self._phase_time(notes, "sell_collection_start")
         self._collect(run, sells, price_band=self._price_band(run, book), notes=notes)
+        self._phase_time(notes, "sell_collection_end")
 
     def _price_band(self, run: PaperRunRow, book: _Book) -> PriceBand:
         """The fill-price band (#1981) over the book's reference prices."""

@@ -44,6 +44,7 @@ groups = ["early", "late", "normal"]
 peer_group = "normal"
 entry = "next_session_after_date"
 facts_read = "window_end"
+matching = "ex_post"
 bucket_by = ["quarter", "stratum"]
 peer_by = ["stratum"]
 n_buckets = 3

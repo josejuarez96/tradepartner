@@ -68,7 +68,7 @@ def test_short_report_terms_are_hand_values() -> None:
     )
     trial = TrialPeriods(sessions=(T0, T1), equity={T0: 1000.0, T1: 1000.0}, cost_paid={T0: 0.0})
     period = compare_periods(
-        window, trial, journal, actions, lambda _name, _date: 10.0, lambda _name, _date: 10.0, None
+        window, trial, journal, actions, lambda _name, _date: 10.0, None
     ).periods[0]
     assert period.short_dividend_term == 5.0 / 1000.0
     assert period.dividend_term == -5.0 / 1000.0
@@ -100,7 +100,6 @@ def test_long_report_has_no_short_line() -> None:
         trial,
         journal,
         pl.DataFrame(),
-        lambda _name, _date: 10.0,
         lambda _name, _date: 10.0,
         None,
     ).periods[0]
@@ -138,6 +137,4 @@ def test_short_fee_refuses_missing_intermediate_mark() -> None:
     )
     trial = TrialPeriods(sessions=(T0, t2), equity={T0: 1000.0, t2: 1000.0}, cost_paid={T0: 0.0})
     with pytest.raises(ValueError, match="no mark for short fee"):
-        compare_periods(
-            window, trial, journal, pl.DataFrame(), lambda _n, _d: 10.0, lambda _n, _d: 10.0, None
-        )
+        compare_periods(window, trial, journal, pl.DataFrame(), lambda _n, _d: 10.0, None)

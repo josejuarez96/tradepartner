@@ -19,7 +19,8 @@ quarter's full text is parsed at a time.
 
 **Caches.** A quarter's raw `form.idx` is cached, gzipped, only when fetched
 `edgar.index_settle_days` or more after its Eastern-time end; younger
-quarters are re-fetched every call. Acceptance times are cached per CIK,
+quarters are re-fetched by a new source instance. The full stamped index is
+kept once per source instance. Acceptance times are cached per CIK,
 one reduced record per accession, under a directory named by
 `PARSER_VERSION`, so a parser fix re-stamps. A cache file that does not
 decode (truncated, older version) is ignored and re-fetched. Every write
@@ -285,7 +286,7 @@ import re
 import shutil
 import zipfile
 import zlib
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
@@ -300,7 +301,9 @@ import httpx
 
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar import (
+    SEC_FORMS_PARSER_VERSION,
     CoverPageParse,
+    FilingParties,
     FsnFiling,
     FsnShare,
     SgmlNoAcceptanceError,
@@ -318,7 +321,10 @@ from tradepartner.adapters.edgar import (
     parse_cover_page,
     parse_delisting,
     parse_filing_index,
+    parse_form4,
     parse_fsn,
+    parse_schedule_13d_xml,
+    parse_sgml_13d_parties,
     parse_sgml_header,
     parse_statement_facts,
     sgml_acceptance,
@@ -335,6 +341,7 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    SecFormFiling,
     StatementFactRecord,
 )
 from tradepartner.calendar import is_session, next_session
@@ -569,6 +576,7 @@ class EdgarFilingSource(FilingSource):
         self._client = client or httpx.Client(timeout=settings.edgar.request_timeout_seconds)
         hooks = self._client.event_hooks
         hooks["request"] = [*hooks.get("request", []), self._count]
+        hooks["response"] = [*hooks.get("response", []), self._count_not_modified]
         self._client.event_hooks = hooks
         self._clock = clock or (lambda: datetime.now(UTC))
         self._cache = Path(settings.edgar.cache_dir)
@@ -579,12 +587,31 @@ class EdgarFilingSource(FilingSource):
         # last read or written; the forms `filing_events` answers (T164e
         # passes `edgar.event_forms`); the counts, each CIK counted once.
         self._items_refreshed: dict[str, bool] = {}
+        # #2632: the last parsed stamps file (CIK, records, items_refreshed),
+        # dropped when that CIK's file is written.
+        self._stamps_memo: tuple[str, dict[str, SubmissionRecord], bool, int, int] | None = None
         self._event_forms = frozenset(event_forms)
         self._events_counted: set[str] = set()
         self.filing_events_unstamped = 0
         self.filing_events_items_missing = 0
         self.filing_events_clock_suspect = 0
         self.filing_events_clock_suspect_accessions: list[str] = []
+        self.sec_forms_counts: dict[str, int] = defaultdict(int)
+        # Plan T348: the ingest driver's Form 4 XML keeper, called with each fetched
+        # body before it is parsed; `None` (the archive off) fetches as before.
+        self.form4_xml_keeper: Callable[[str, edgar_raw.FetchedXml], object] | None = None
+        self.sec_forms_requests: dict[str, int] = defaultdict(
+            int,
+            total=0,
+            headers=0,
+            submissions=0,
+            submissions_pages=0,
+            other=0,
+            retries_backoffs=0,
+        )
+        self._sec_header_text: OrderedDict[tuple[str, str, int], str] = OrderedDict()
+        self._sec_forms_request_active = False
+        self._sec_forms_counted: set[tuple[str, str]] = set()
         self._clock_suspect_seen: set[tuple[str, str]] = set()
         self._open_quarters: dict[Quarter, str] = {}
         # #578: quarters whose form.idx did not parse, recorded once per instance.
@@ -592,6 +619,7 @@ class EdgarFilingSource(FilingSource):
         self.requests = 0
         self.skipped_filers = 0
         self.unstamped_filings: list[UnstampedFiling] = []
+        self._filing_index_entries: tuple[FilingIndexEntry, ...] | None = None
         self.fsn_duplicates = 0
         self.fsn_reissued = 0
         self.fsn_reissue_undetected = 0
@@ -682,6 +710,9 @@ class EdgarFilingSource(FilingSource):
         # of the per-CIK API instead; counted for the run's summary.
         self.facts_bulk_empty = 0
         self.submissions_bulk_empty = 0
+        # #2594: nightly bulk zips SEC answered `304 Not Modified`, so the
+        # cached copy was kept; a count that never drops to 0 is a frozen zip.
+        self.bulk_not_modified = 0
         # #576: per-CIK API answers of 200 `{}` (SEC's "nothing here").
         self.facts_api_empty = 0
         self.submissions_api_empty = 0
@@ -735,6 +766,38 @@ class EdgarFilingSource(FilingSource):
 
     def _count(self, request: httpx.Request) -> None:
         self.requests += 1
+        if not self._sec_forms_request_active:
+            return
+        self.sec_forms_requests["total"] += 1
+        path = request.url.path
+        if path.endswith(".txt") and "/Archives/edgar/data/" in path:
+            self.sec_forms_requests["headers"] += 1
+        elif re.fullmatch(r"/submissions/CIK\d{10}\.json", path):
+            self.sec_forms_requests["submissions"] += 1
+        elif path.startswith("/submissions/"):
+            self.sec_forms_requests["submissions_pages"] += 1
+        else:
+            self.sec_forms_requests["other"] += 1
+
+    def _count_not_modified(self, response: httpx.Response) -> None:
+        """Count a `304` to a conditional bulk-zip `GET` (#2594): the run kept
+        its cached `submissions.zip` / `companyfacts.zip`."""
+        if response.status_code == httpx.codes.NOT_MODIFIED and response.request.url.path.endswith(
+            ".zip"
+        ):
+            self.bulk_not_modified += 1
+
+    def _sec_header(self, cik: str, accession: str, size: int) -> str:
+        key = (cik, accession, size)
+        if key not in self._sec_header_text:
+            self._sec_header_text[key] = edgar_raw.filing_sgml_header(
+                cik, accession, header_bytes=size, settings=self._settings, client=self._client
+            )
+            if len(self._sec_header_text) > 8:
+                self._sec_header_text.popitem(last=False)
+        else:
+            self._sec_header_text.move_to_end(key)
+        return self._sec_header_text[key]
 
     def _now(self) -> datetime:
         return ensure_tz_aware_utc(self._clock(), field_name="clock()")
@@ -746,6 +809,10 @@ class EdgarFilingSource(FilingSource):
         times; unstamped rows go to `.unstamped_filings`, never the result."""
         if since is not None:
             since = ensure_tz_aware_utc(since, field_name="since")
+        if self._filing_index_entries is not None:
+            return [
+                e for e in self._filing_index_entries if since is None or e.accepted_at >= since
+            ]
         self.unstamped_filings, self._open_quarters = [], {}
         start = (self._settings.edgar.index_first_year, 1)
         last = quarter_of(self._now())
@@ -765,6 +832,14 @@ class EdgarFilingSource(FilingSource):
                     issuers.add(row.cik)  # the subject of a delisting
         self.skipped_filers = len(filers - issuers)
 
+        # #2616: the full history is millions of rows, so each kept row shares
+        # one string per CIK, company name and form (and one date per day)
+        # instead of carrying the parser's own copies; each CIK's rows are
+        # dropped as its entries are made, and `_stamp_each` holds one CIK's
+        # stamps at a time, so the rows, the stamps and the entries are never
+        # all held at once.
+        strings: dict[str, str] = {}
+        days: dict[date, date] = {}
         kept: dict[str, dict[str, tuple[UnstampedFiling, Quarter]]] = {}
         for quarter, row in self._rows(quarters, last):
             if row.cik not in issuers:
@@ -775,22 +850,38 @@ class EdgarFilingSource(FilingSource):
                 and len(delisting_ciks[row.accession]) > 1
             ):
                 continue  # the exchange's copy of a 25-NSE; the subject company keeps it
-            kept.setdefault(row.cik, {}).setdefault(row.accession, (row, quarter))
+            rows = kept.get(row.cik)
+            if rows is None:
+                rows = kept[strings.setdefault(row.cik, row.cik)] = {}
+            if row.accession not in rows:
+                shared = UnstampedFiling(
+                    strings.setdefault(row.cik, row.cik),
+                    strings.setdefault(row.company_name, row.company_name),
+                    strings.setdefault(row.form, row.form),
+                    row.accession,
+                    days.setdefault(row.filed_on, row.filed_on),
+                )
+                rows[row.accession] = (shared, quarter)
+        del strings, days
 
-        stamps = self._stamp(kept)
         entries: list[FilingIndexEntry] = []
-        for cik, rows in kept.items():
-            for accession, (row, _) in rows.items():
-                record = stamps[cik].get(accession)
+        unstamped: list[UnstampedFiling] = []
+        for cik, stamps in self._stamp_each(kept):
+            for accession, (row, _) in kept.pop(cik).items():
+                record = stamps.get(accession)
                 if record is None or record.accepted_at is None:
-                    self.unstamped_filings.append(row)
-                elif since is None or record.accepted_at >= since:
+                    unstamped.append(row)
+                else:
                     at = record.accepted_at
-                    entries.append(FilingIndexEntry(cik, row.company_name, row.form, accession, at))
+                    entries.append(
+                        FilingIndexEntry(row.cik, row.company_name, row.form, accession, at)
+                    )
         entries.sort(key=lambda e: (e.accepted_at, e.accession, e.cik))
-        self.unstamped_filings.sort(key=lambda r: (r.filed_on, r.accession, r.cik))
+        self.unstamped_filings = sorted(unstamped, key=lambda r: (r.filed_on, r.accession, r.cik))
         self._filing_index_ran = True
-        return entries
+        self._filing_index_entries = tuple(entries)
+        del entries
+        return [e for e in self._filing_index_entries if since is None or e.accepted_at >= since]
 
     def _rows(
         self, quarters: Sequence[Quarter], open_quarter: Quarter
@@ -849,9 +940,29 @@ class EdgarFilingSource(FilingSource):
     def _stamp(
         self, kept: Mapping[str, Mapping[str, tuple[UnstampedFiling, Quarter]]]
     ) -> dict[str, dict[str, SubmissionRecord]]:
-        stamps = {cik: self._load_stamps(cik) for cik in kept}
-        pending = {cik: {a for a in rows if a not in stamps[cik]} for cik, rows in kept.items()}
-        pending = {cik: wanted for cik, wanted in pending.items() if wanted}
+        """Every kept CIK's stamps at once (`_stamp_each`, collected)."""
+        return dict(self._stamp_each(kept))
+
+    def _stamp_each(
+        self, kept: Mapping[str, Mapping[str, tuple[UnstampedFiling, Quarter]]]
+    ) -> Iterator[tuple[str, dict[str, SubmissionRecord]]]:
+        """Each kept CIK with its stamps, the new ones fetched and cached.
+
+        #2616: a CIK with nothing to stamp is yielded as soon as its stamps
+        are read, so only the CIKs with a filing still to stamp (a night's
+        new filings, in steady state) are held together while they are
+        stamped; those are yielded last. The caller may drop a yielded CIK
+        from `kept`; the CIKs are listed before the first is read."""
+        stamps: dict[str, dict[str, SubmissionRecord]] = {}
+        pending: dict[str, set[str]] = {}
+        for cik in list(kept):
+            loaded = self._load_stamps(cik)
+            wanted = {a for a in kept[cik] if a not in loaded}
+            if wanted:
+                stamps[cik], pending[cik] = loaded, wanted
+            else:
+                yield cik, loaded
+            del loaded
         unparsed: set[str] = set()
         edgar = self._settings.edgar
         if edgar.bulk_stamps_enabled and len(pending) > edgar.bulk_stamp_threshold_ciks:
@@ -874,7 +985,7 @@ class EdgarFilingSource(FilingSource):
                     self._check_event_clock(cik, record)
                 stamps[cik].update(new)
                 self._save_stamps(cik, stamps[cik])
-        return stamps
+        yield from stamps.items()
 
     def _sgml_checked(
         self, cik: str, new: Mapping[str, SubmissionRecord]
@@ -987,9 +1098,7 @@ class EdgarFilingSource(FilingSource):
         sizes = (self._settings.edgar.header_bytes, self._settings.edgar.stamp_header_bytes)
         for attempt, size in enumerate(sizes):
             try:
-                text = edgar_raw.filing_sgml_header(
-                    cik, accession, header_bytes=size, settings=self._settings, client=self._client
-                )
+                text = self._sec_header(cik, accession, size)
                 return sgml_acceptance(text, accession)
             except httpx.HTTPStatusError as error:
                 if error.response.status_code not in (404, 410):
@@ -1130,12 +1239,327 @@ class EdgarFilingSource(FilingSource):
     def _stamps_path(self, cik: str) -> Path:
         return self._cache / "stamps" / f"v{PARSER_VERSION}" / f"{cik}.json"
 
+    def sec_form_stamp(
+        self, issuer_cik: str, accession: str, filed_date: date
+    ) -> SubmissionRecord | None:
+        """Look up an issuer accession in the checked stamp cache or its submissions.
+
+        An unlisted accession has no stamp. Older pages are fetched only while
+        it remains missing; the SGML anchor applies before a new stamp is cached.
+        This is the issuer-stamp seam used by T307d's bulk route.
+        """
+        if not self._settings.events.sec_forms_enabled:
+            return None
+        _validate_cik(issuer_cik)
+        edgar_raw.validate_accession(accession)
+        stamps = self._load_stamps(issuer_cik)
+        if accession not in stamps:
+            submissions = self._fetch_submissions(issuer_cik, {accession})
+            found = submissions.records.get(accession)
+            if found is None:
+                quarter = (filed_date.year, (filed_date.month - 1) // 3 + 1)
+                if not submissions.empty and self._settled(quarter, submissions.fetched_at):
+                    stamps[accession] = SubmissionRecord(accession, "", "", False, None)
+                    self._save_stamps(issuer_cik, stamps)
+                return None
+            checked = self._sgml_checked(issuer_cik, {accession: found})
+            if accession not in checked:
+                return None
+            stamps.update(checked)
+            self._save_stamps(issuer_cik, stamps)
+        record = stamps[accession]
+        return replace(record, filing_date=filed_date) if record.accepted_at is not None else None
+
+    def _sec_count(self, reason: str, accession: str) -> None:
+        key = (reason, accession)
+        if key not in self._sec_forms_counted:
+            self._sec_forms_counted.add(key)
+            self.sec_forms_counts[reason] += 1
+
+    def _sec_identity_missing(self, accession: str) -> bool:
+        path = self._cache / "sec_forms_identity" / f"v{SEC_FORMS_PARSER_VERSION}" / accession
+        return path.exists()
+
+    def _sec_mark_identity_missing(self, accession: str) -> None:
+        path = self._cache / "sec_forms_identity" / f"v{SEC_FORMS_PARSER_VERSION}" / accession
+        edgar_raw.write_atomic(path, b"missing")
+        self._sec_count("identity_missing", accession)
+
+    def _sec_xml(self, cik: str, record: SubmissionRecord) -> str:
+        return edgar_raw.filing_xml(
+            cik,
+            record.accession,
+            self._sec_xml_name(cik, record),
+            settings=self._settings,
+            client=self._client,
+        )
+
+    def _sec_xml_kept(self, cik: str, record: SubmissionRecord) -> edgar_raw.FetchedXml:
+        """As `_sec_xml`, with the raw bytes for `form4_xml_keeper` (plan T348)."""
+        return edgar_raw.fetch_filing_xml(
+            cik,
+            record.accession,
+            self._sec_xml_name(cik, record),
+            settings=self._settings,
+            client=self._client,
+        )
+
+    def _sec_xml_name(self, cik: str, record: SubmissionRecord) -> str:
+        filename = record.primary_document
+        if not filename.lower().endswith(".xml"):
+            names = edgar_raw.filing_index(
+                cik, record.accession, settings=self._settings, client=self._client
+            )
+            xml_names = [name for name in names if name.lower().endswith(".xml")]
+            if len(xml_names) != 1:
+                raise ValueError(f"{record.accession}: no unique XML document")
+            filename = xml_names[0]
+        # The submissions primaryDocument can name an XSL-rendered copy. The
+        # parser needs the root XML, as the other EDGAR document readers do.
+        return re.sub(r"^xsl[^/]*/", "", filename)
+
+    def _sec_13d_header(self, cik: str, accession: str) -> str:
+        """Read an unstructured 13D header, retrying the larger SGML stamp cap."""
+        sizes = dict.fromkeys(
+            (self._settings.edgar.header_bytes, self._settings.edgar.stamp_header_bytes)
+        )
+        for size in sizes:
+            document = self._sec_header(cik, accession, size)
+            if "</SEC-HEADER>" in document:
+                return document
+        raise ValueError(f"{accession}: SGML header truncated at stamp_header_bytes")
+
+    def _sec_parties_path(self, accession: str) -> Path:
+        return (
+            self._cache / "sec_forms_parties" / f"v{SEC_FORMS_PARSER_VERSION}" / f"{accession}.json"
+        )
+
+    def _sec_cached_parties(self, accession: str, form: str) -> FilingParties | None:
+        try:
+            data = json.loads(self._sec_parties_path(accession).read_bytes())
+            if data["form"] != form:
+                return None
+            subjects, filers = data["subjects"], data["filers"]
+            if (
+                not subjects
+                or not filers
+                or not all(isinstance(c, str) for c in (*subjects, *filers))
+            ):
+                return None
+            return FilingParties(tuple(subjects), tuple(filers))
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _sec_save_parties(self, accession: str, form: str, parties: FilingParties) -> None:
+        data = {"form": form, "subjects": parties.subject_ciks, "filers": parties.filer_ciks}
+        edgar_raw.write_atomic(self._sec_parties_path(accession), json.dumps(data).encode("utf-8"))
+
+    def _sec_stamped(self, cik: str, accession: str, filed_date: date) -> SubmissionRecord | None:
+        record = self.sec_form_stamp(cik, accession, filed_date)
+        if record is None or record.accepted_at is None:
+            cached = self._load_stamps(cik).get(accession)
+            self._sec_count(
+                "unstampable" if cached is not None and cached.accepted_at is None else "unstamped",
+                accession,
+            )
+            return None
+        if clock_suspect(record.accepted_at, filed_date):
+            self._sec_count("clock_suspect", accession)
+            return None
+        if record.accepted_at > self._now():
+            self._sec_count("not_yet_known", accession)
+            return None
+        return record
+
+    def sec_form4_accession(
+        self, issuer_cik: str, accession: str, filed_date: date
+    ) -> SecFormFiling | None:
+        """Fetch, parse and stamp exactly one Form 4 XML accession for T307d.
+
+        This selects no accessions. The caller chooses the XML route first and
+        writes the returned filing with `ingest.write_sec_form_accession`.
+        """
+        edgar_raw.validate_accession(accession)
+        if not self._settings.events.sec_forms_enabled:
+            return None
+        if self._sec_identity_missing(accession):
+            self._sec_count("identity_missing", accession)
+            return None
+        record = self._sec_stamped(issuer_cik, accession, filed_date)
+        if (
+            record is None
+            or record.accepted_at is None
+            or record.form not in ("4", "4/A")
+            or record.form not in self._settings.events.sec_forms
+        ):
+            return None
+        keeper = self.form4_xml_keeper
+        xml: str | None
+        if keeper is None:
+            xml = self._guarded(accession, "4", partial(self._sec_xml, issuer_cik, record))
+        else:
+            fetched = self._guarded(accession, "4", partial(self._sec_xml_kept, issuer_cik, record))
+            if fetched is not None:
+                # Kept before parse (#2714 item 1), outside `_guarded`: a refused
+                # archive write fails the run, never a skipped filing.
+                keeper(accession, fetched)
+            xml = None if fetched is None else fetched.text
+        if xml is None:
+            self._sec_count("fetch_failed", accession)
+            return None
+        try:
+            parsed = parse_form4(xml)
+        except ValueError:
+            self._sec_mark_identity_missing(accession)
+            return None
+        if parsed.issuer_cik != issuer_cik:
+            self._sec_count("issuer_mismatch", accession)
+            return None
+        key = ("form4_row_skipped", accession)
+        if key not in self._sec_forms_counted:
+            self._sec_forms_counted.add(key)
+            self.sec_forms_counts["form4_row_skipped"] += parsed.skipped
+        return SecFormFiling(
+            accession,
+            record.form,
+            record.accepted_at,
+            filed_date,
+            (parsed.issuer_cik,),
+            parsed.filer_ciks,
+            parsed.transactions,
+        )
+
+    def sec_forms_13d(self, subjects: frozenset[str] | None = None) -> list[SecFormFiling]:
+        """Discover all 13D spellings, including filings under filer-only CIKs.
+
+        The caller's subject set skips cached non-subjects before any request.
+        Index CIKs never qualify a subject or create a security.
+        """
+        if not self._settings.events.sec_forms_enabled:
+            return []
+        self._sec_forms_request_active = True
+        try:
+            with edgar_raw.observe_retries(self._sec_retry):
+                return self._sec_forms_13d_impl(subjects)
+        finally:
+            self._sec_forms_request_active = False
+
+    def _sec_retry(self) -> None:
+        self.sec_forms_requests["retries_backoffs"] += 1
+
+    def _sec_forms_13d_impl(self, subjects: frozenset[str] | None) -> list[SecFormFiling]:
+        start = (
+            max(
+                self._settings.edgar.index_first_year,
+                self._settings.events.sec_forms_backfill_start.year,
+            ),
+            1,
+        )
+        last = quarter_of(self._now())
+        quarters = [
+            (y, q)
+            for y in range(start[0], last[0] + 1)
+            for q in range(1, 5)
+            if start <= (y, q) <= last
+        ]
+        wanted = frozenset(self._settings.events.sec_forms) & frozenset(
+            {"SC 13D", "SC 13D/A", "SCHEDULE 13D", "SCHEDULE 13D/A"}
+        )
+        accessions: dict[str, UnstampedFiling] = {}
+        for _, row in self._rows(quarters, last):
+            if (
+                row.form in wanted
+                and row.filed_on >= self._settings.events.sec_forms_backfill_start
+            ):
+                accessions.setdefault(row.accession, row)
+        result: list[SecFormFiling] = []
+        for accession, row in accessions.items():
+            if self._sec_identity_missing(accession):
+                self._sec_count("identity_missing", accession)
+                continue
+            parties = self._sec_cached_parties(accession, row.form)
+            if (
+                parties is not None
+                and subjects is not None
+                and not subjects.intersection(parties.subject_ciks)
+            ):
+                continue
+            if parties is None and row.form.startswith("SC "):
+                document = self._guarded(
+                    accession,
+                    row.form.removesuffix("/A"),
+                    partial(self._sec_13d_header, row.cik, accession),
+                )
+                if document is None:
+                    self._sec_count("fetch_failed", accession)
+                    continue
+                try:
+                    parties = parse_sgml_13d_parties(document, accession)
+                except ValueError:
+                    self._sec_mark_identity_missing(accession)
+                    continue
+                self._sec_save_parties(accession, row.form, parties)
+                if subjects is not None and not subjects.intersection(parties.subject_ciks):
+                    continue
+            record = self._sec_stamped(row.cik, accession, row.filed_on)
+            if record is None or record.accepted_at is None:
+                continue
+            if record.form != row.form:
+                self._sec_count("form_mismatch", accession)
+                continue
+            parties = self._sec_cached_parties(accession, row.form)
+            if parties is None:
+                if row.form.startswith("SC "):
+                    fetch = partial(self._sec_13d_header, row.cik, accession)
+                else:
+                    fetch = partial(self._sec_xml, row.cik, record)
+                document = self._guarded(accession, row.form.removesuffix("/A"), fetch)
+                if document is None:
+                    self._sec_count("fetch_failed", accession)
+                    continue
+                try:
+                    parties = (
+                        parse_sgml_13d_parties(document, accession)
+                        if row.form.startswith("SC ")
+                        else parse_schedule_13d_xml(document)
+                    )
+                except ValueError:
+                    self._sec_mark_identity_missing(accession)
+                    continue
+                self._sec_save_parties(accession, row.form, parties)
+            if subjects is not None and not subjects.intersection(parties.subject_ciks):
+                continue
+            result.append(
+                SecFormFiling(
+                    accession,
+                    row.form,
+                    record.accepted_at,
+                    row.filed_on,
+                    parties.subject_ciks,
+                    parties.filer_ciks,
+                )
+            )
+        return sorted(result, key=lambda filing: (filing.accepted_at, filing.accession))
+
     def _load_stamps(self, cik: str) -> dict[str, SubmissionRecord]:
         """`cik`'s stamps in either layout (module docstring, "Stamps layout");
         `{}` for an absent, truncated or unknown file. Records the file's
-        `items_refreshed` flag for `_save_stamps` (`True` with no file)."""
+        `items_refreshed` flag for `_save_stamps` (`True` with no file).
+        The last file parsed is kept (#2632), so consecutive reads of one CIK
+        parse it once; each read returns its own dict, and a write drops it."""
+        memo = self._stamps_memo
+        path = self._stamps_path(cik)
         try:
-            data = json.loads(self._stamps_path(cik).read_bytes())
+            stat = path.stat()
+        except OSError:
+            self._stamps_memo = None
+            self._items_refreshed.pop(cik, None)
+            return {}
+        if memo is not None and memo[0] == cik and memo[3:] == (stat.st_mtime_ns, stat.st_size):
+            self._items_refreshed[cik] = memo[2]
+            return dict(memo[1])
+        try:
+            data = json.loads(path.read_bytes())
             if data["version"] != PARSER_VERSION or data["cik"] != cik:
                 raise ValueError("another version or CIK")
             layout = data.get("layout", _OLD_STAMPS_LAYOUT)
@@ -1167,6 +1591,7 @@ class EdgarFilingSource(FilingSource):
             self._items_refreshed.pop(cik, None)
             return {}  # absent, truncated or another layout: stamp again
         self._items_refreshed[cik] = refreshed
+        self._stamps_memo = (cik, dict(records), refreshed, stat.st_mtime_ns, stat.st_size)
         return records
 
     def _save_stamps(
@@ -1179,6 +1604,8 @@ class EdgarFilingSource(FilingSource):
         """Write `cik`'s stamps in `STAMPS_LAYOUT`. `items_refreshed` defaults
         to the flag `_load_stamps` last read for the CIK (`True` if none), so
         a stamping pass never marks an old-layout file refreshed."""
+        if self._stamps_memo is not None and self._stamps_memo[0] == cik:
+            self._stamps_memo = None
         if items_refreshed is None:
             items_refreshed = self._items_refreshed.get(cik, True)
         data = {
@@ -1961,7 +2388,11 @@ class EdgarFilingSource(FilingSource):
                 continue  # the exchange's copy of a 25-NSE; the subject company keeps it
             kept.setdefault(row.cik, {}).setdefault(row.accession, (row, quarter))
 
-        stamps = self._stamp(kept)
+        # #2616: of each CIK's full-history stamps, only its delisting rows'.
+        stamps = {
+            cik: {a: loaded[a] for a in kept[cik] if a in loaded}
+            for cik, loaded in self._stamp_each(kept)
+        }
         # One result per accession (plan T11f): a Form 25 kept under several
         # CIKs is served once, from the first CIK (index order) that stamps it.
         candidates: dict[str, list[tuple[str, SubmissionRecord | None]]] = {}

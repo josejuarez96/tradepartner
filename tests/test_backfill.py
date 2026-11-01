@@ -70,6 +70,36 @@ from tradepartner.calendar import is_session
 from tradepartner.config import Settings
 from tradepartner.ingest import FAILED, LOCKED, OK, STALE, ingest_session
 
+
+def test_older_store_backfill_refusal_creates_no_run(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from typer.testing import CliRunner
+
+    from tradepartner import cli
+    from tradepartner.store import backup, schema
+    from tradepartner.store.db import open_for_write
+
+    with open_for_write(settings) as conn:
+        schema.init_schema(conn)
+        conn.execute("UPDATE schema_version SET version = ?", [schema.CURRENT_SCHEMA_VERSION - 1])
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+    monkeypatch.setattr(cli, "_missing_secrets", lambda *_: [])
+
+    def refuse(_settings: Settings) -> None:
+        raise backup.BackupError("copy refused")
+
+    monkeypatch.setattr(backup, "check_backup_disk_space", refuse)
+    result = CliRunner().invoke(
+        cli.make_app(settings=lambda: settings),
+        ["ingest", "--source", "alpaca", "--backfill", "--since", "2020-01-01"],
+    )
+    assert result.exit_code != 0
+    assert "copy refused" in result.output
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM ingestion_runs").fetchone() == (0,)
+
+
 SINCE = date(2019, 4, 10)
 IDS = (ACME, DUAL, DUAL_B, SPY)
 

@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import ast
 import inspect
+import shutil
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Protocol
 
@@ -428,7 +430,9 @@ def test_run_notes_receive_unjudged_wrapper_phase_fills(
         "SELECT client_order_id FROM orders WHERE run_id = ? AND security_id = ? AND side = ?",
         [env.run.run_id, victim, side],
     )
-    assert notes == [f"fill-price band: no reference price for {coid}"]
+    assert [note for note in notes if not note.startswith("paper_phase ")] == [
+        f"fill-price band: no reference price for {coid}"
+    ]
 
 
 # --- the reference price ---------------------------------------------------------------
@@ -1310,6 +1314,79 @@ def test_an_engaged_switch_before_the_sells_submits_nothing(
 
 
 # --- the timing and the cash ------------------------------------------------------------------
+
+
+def test_paper_phase_times_keep_broker_calls(
+    env: Env,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class TestClock:
+        def __init__(self, now: datetime) -> None:
+            self.now = now
+
+        def __call__(self) -> datetime:
+            return self.now
+
+        def advance(self, **delta: float) -> datetime:
+            self.now += timedelta(**delta)
+            return self.now
+
+    second_path = tmp_path / "without-timing.duckdb"
+    shutil.copyfile(env.settings.store.path, second_path)
+    baseline = Env(
+        _settings(str(second_path)), env.window, TestClock(env.clock.now), env.earlier, env.run
+    )
+
+    def run_case(
+        case: Env, conn: duckdb.DuckDBPyConnection, *, enabled: bool
+    ) -> tuple[Any, list[str]]:
+        _hold(case, A, 10.0)
+        case.clock.now = session_open(S) + timedelta(minutes=1)
+        trim = _decision(case, A, "sell", notional=500.0)
+        buy = _decision(case, B, "buy", notional=300.0)
+        start = len(case.fake.calls)
+
+        def on_submit(_request: OrderRequest) -> None:
+            case.clock.advance(seconds=1)
+
+        def sleep(seconds: float) -> None:
+            case.clock.advance(seconds=seconds)
+            for request in _submits(case.fake):
+                if request.side == Side.SELL:
+                    case.fake.simulate_fill(request.client_order_id)
+
+        case.fake.on_submit = on_submit
+        gate = _gate(case, conn)
+        gate._sleep = sleep
+        if not enabled:
+            monkeypatch.setattr(gate, "_phase_time", lambda *args, **kwargs: None)
+        notes: list[str] = []
+        gate.execute(case.run, [trim, buy], (), notes=notes)
+        return case.fake.calls[start:], notes
+
+    with duckdb.connect(str(second_path)) as baseline_conn:
+        expected_calls, baseline_notes = run_case(baseline, baseline_conn, enabled=False)
+    actual_calls, notes = run_case(env, alerter_conn, enabled=True)
+    assert actual_calls == expected_calls
+    assert baseline_notes == []
+    at = session_open(S) + timedelta(minutes=1)
+    expected = [
+        ("sells_submitted", 1),
+        ("sells_terminal", 16),
+        ("sell_collection_start", 16),
+        ("sell_collection_end", 16),
+        ("buys_sized", 16),
+        ("first_buy_submitted", 17),
+        ("last_buy_submitted", 17),
+    ]
+    stamped = [
+        f"paper_phase {phase}={(at + timedelta(seconds=seconds)).isoformat()}"
+        for phase, seconds in expected
+    ]
+    # One count note for the polling rounds, not one note per round.
+    assert notes == [stamped[0], "paper_phase sells_poll_rounds=2", *stamped[1:]]
 
 
 def test_sells_go_before_the_open_and_no_buy_before_the_sells_deadline(

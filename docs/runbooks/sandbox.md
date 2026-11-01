@@ -17,7 +17,7 @@ Nothing else is declared: a book is just a token with a pair. The adapter refuse
 
 | Guard | Where it comes from |
 |---|---|
-| Both directions. Book `sandbox` runs only if `store.path` resolves under `/tmp` (symlinks resolved) AND the marker file `<store.path>.sandbox` exists beside it; every other book is refused on a store with that marker, so a bare `paper run` on the copy cannot trade the real books with their real keys. A refusal is exit 2 on every `paper` command (a `paper run` also pings `/fail`), and `build_broker` refuses before a key is read. | `lock.resolve_book`, `brokers.build_broker`, tests in `tests/execution/test_sandbox_book.py` |
+| Both directions. Book `sandbox` runs only if `store.path` resolves under `/tmp` (symlinks resolved) AND the marker file `<resolved store.path>.sandbox` exists beside the resolved path (a file symlink to a marked copy is the sandbox; a symlink to the live store never is); every other book is refused on a store with that marker, so a bare `paper run` on the copy cannot trade the real books with their real keys. A refusal is exit 2 on every `paper` command (a `paper run` also pings `/fail`), and `build_broker` refuses before a key is read. | `lock.resolve_book`, `brokers.build_broker`, tests in `tests/execution/test_sandbox_book.py` |
 | Account check (#2187): `resume`, `abandon` and `reconcile` compare the broker's `account_id` with the one the window recorded at `paper start`, and refuse on a mismatch. So the sandbox's keys cannot settle another book's window, nor another book's keys the sandbox's. | `execution/window.py`, `resume.py`, `reconcile_run.py` |
 | A book is run only from the store it is in. The scheduled `paper run` (no `--book`) runs the live store's open windows, and the sandbox has none there. The plist and `ingest` read the live `data/tradepartner.duckdb`, never the copy. | `scheduling.md`, "Several books" |
 | `paper run --book X` by hand only ever pings the heartbeat `/fail`, never OK (below). | `heartbeat.py` |
@@ -42,25 +42,26 @@ Work in your team folder, on the branch under test. Use the placeholders below; 
    ```
    Blank heartbeat URLs mean no ping at all. If `alerts.channels` includes `email`, also `export ALERTS__CHANNELS='["store"]'`. Check `echo $STORE__PATH` is under `/tmp` and `$STORE__PATH.sandbox` exists before the next step.
 3. **Check out the branch under test** in a team folder (`team.py start <name>`), and `uv sync` there. All commands below run from it.
-4. **Flatten leftover sandbox positions.** The account is shared across runs. In the Alpaca paper dashboard (owner), close every position and cancel every open order for that account, or run `paper abandon --book sandbox --reason "reset"` if a previous copy's window is in this copy. `paper start` needs the account strictly flat of anything it does not own.
+4. **Flatten leftover sandbox positions.** The account is shared across runs. In the Alpaca paper dashboard (owner), close every position and cancel every open order for that account. If a previous copy's window is in this copy, `paper abandon --book sandbox --reason "reset"` ends it, but it refuses while the window has open orders and it never flattens (remaining positions become recorded residues), so flattening stays the owner's dashboard step or a direct close on the verified sandbox account. `paper start` needs the account strictly flat of anything it does not own.
 5. **Start.** Use a registered, signed-off, small test strategy. The copy already holds `momentum-daily-shakedown` (the daily machine-test book, rebalanced every session):
    ```bash
-   uv run tradepartner paper start --hypothesis momentum-daily-shakedown --book sandbox
+   uv run tradepartner paper start --hypothesis momentum-daily-shakedown --book sandbox --now
    ```
    Note the printed window id and `account_id`: it must be the sandbox account's, not another book's.
-6. **Run the scenarios**, inside the submit window (scheduling.md, "The submit window"), each followed by `uv run tradepartner paper status --book sandbox`:
+   `--now` starts from the latest stored prior session close, so the first fill session is today. It requires a daily-cadence hypothesis, a marked temp store copy, and a prior-session bar already known to the store. It is refused on every real book.
+6. **Run the scenarios** during the XNYS session's market hours (normally 09:30–16:00 ET; the calendar handles early closes), each followed by `uv run tradepartner paper status --book sandbox`. Sandbox runs record `sandbox: submit window skipped` in their notes; all other order and risk checks still apply:
 
    | Scenario | How | Expected |
    |---|---|---|
    | Submit | `paper run --book sandbox` | orders sent once, each with a `client_order_id`, journal rows `submitted`, no duplicates on a repeat run |
    | Partial fill | a thinly traded name or a tiny `qty` limit in a test branch; or read a partial from the journal | `partially_filled` then `filled`, quantities add up, reconciliation `ok` |
-   | Cancel | `paper stop --book sandbox` with an order open, then `paper run --book sandbox` | the order is cancelled and recorded once, the window `closed` after the stop run |
+   | Cancel | `paper stop --book sandbox --reason "..."` with an order open, then `paper run --book sandbox` (the stop run), then `paper stop --book sandbox --reason "..."` again | first call requests stop (`REQUESTED`), stop run cancels the order, second call closes the window (`CLOSED`) after the stop run |
    | Reconcile | `paper reconcile --book sandbox` | status `ok`, broker cash and positions equal the ledger |
    | Kill and resume | `paper kill --book sandbox --reason test`, `paper run --book sandbox` (ends `skipped_kill_switch`), `paper resume --book sandbox --reason test` | no order sent while killed, resume reconciles first and clears the switch |
    | Report | `paper report --book sandbox` | ends at the last marked session, refuses before any trial |
 
    Compare each outcome with the Expected column and with the fix's own acceptance criteria; write the exact commands, outputs and verdicts in the PR.
-7. **Leave the account flat.** `paper stop --book sandbox` and a stop run, or the dashboard close-all (owner). Check `paper status --book sandbox` shows no position.
+7. **Leave the account flat.** `paper stop --book sandbox --reason "..."` (request), `paper run --book sandbox` (the stop run), `paper stop --book sandbox --reason "..."` again (closed), or the dashboard close-all (owner). Check `paper status --book sandbox` shows no position.
 8. **Delete the copy** (owner, or you for a directory you made under `/tmp`): `rm -r "$SBX"` and `unset STORE__PATH ALERT_HEARTBEAT_URL_PAPER ALERT_HEARTBEAT_URL_INGEST ALERTS__CHANNELS`. A copy kept around is a store with live keys' windows in it; do not reuse it.
 
 ## Rules

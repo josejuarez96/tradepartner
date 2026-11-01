@@ -44,6 +44,20 @@ def test_c1b_study_parses_and_is_hashed(tmp_path: Path) -> None:
     assert changed.params_sha256 != result.params_sha256
     assert result.study is not None
     assert result.study["configurations"] == 2
+    assert result.study["matching"] == "ex_post"
+
+
+def test_matching_is_optional_causal_default_and_explicit_ex_post_is_hashed(
+    tmp_path: Path,
+) -> None:
+    source = FIXTURE.read_text()
+    causal = _parse(tmp_path / "causal", source.replace('matching = "ex_post"\n', ""))
+    assert causal.study is not None
+    assert "matching" not in causal.study
+    ex_post = _parse(tmp_path / "expost", source)
+    assert ex_post.params_sha256 != causal.params_sha256
+    with pytest.raises(ExperimentFileError, match=r"study\.matching"):
+        _parse(tmp_path / "invalid", source.replace('matching = "ex_post"', 'matching = "other"'))
 
 
 @pytest.mark.parametrize(
@@ -73,3 +87,55 @@ def test_study_refusals(tmp_path: Path, old: str, new: str, match: str) -> None:
     assert old in source
     with pytest.raises(ExperimentFileError, match=match):
         _parse(tmp_path, source.replace(old, new, 1))
+
+
+@pytest.mark.parametrize(
+    ("key", "bad_value", "match"),
+    [
+        ("min_volume_bars", "21", r"study\.min_volume_bars must not exceed study\.volume_lookback"),
+        ("beta_min_bars", "121", r"study\.beta_min_bars must not exceed study\.beta_lookback"),
+    ],
+)
+def test_study_min_bars_exceeds_lookback_refused(
+    tmp_path: Path, key: str, bad_value: str, match: str
+) -> None:
+    source = FIXTURE.read_text()
+    old_line = f"{key} = 10" if key == "min_volume_bars" else f"{key} = 60"
+    new_line = f"{key} = {bad_value}"
+    assert old_line in source
+    with pytest.raises(ExperimentFileError, match=match):
+        _parse(tmp_path, source.replace(old_line, new_line, 1))
+
+
+_ONE_SIDED = "each bound one-sided 95% (mean -/+ 1.645 SE)"
+_TWO_SIDED = "each bound two-sided 95% (mean -/+ 1.96 SE)"
+
+
+def test_two_sided_study_registers_with_two_sided_z(tmp_path: Path) -> None:
+    source = FIXTURE.read_text()
+    assert _ONE_SIDED in source and "z = 1.645" in source
+    changed = source.replace(_ONE_SIDED, _TWO_SIDED, 1).replace("z = 1.645", "z = 1.96", 1)
+    assert json.loads(_parse(tmp_path, changed).params_json)["study"]["z"] == 1.96
+
+
+@pytest.mark.parametrize(
+    ("inference", "z", "match"),
+    [
+        (_ONE_SIDED, "1.96", r"study\.z must match"),
+        (_TWO_SIDED, "1.645", r"study\.z must match"),
+        ("each bound 95% (mean -/+ 1.645 SE)", "1.645", r"one-sided or two-sided"),
+        (
+            "each bound one-sided and two-sided 95% (mean -/+ 1.645 SE)",
+            "1.645",
+            r"one-sided or two-sided",
+        ),
+    ],
+)
+def test_study_z_must_match_declared_interval_side(
+    tmp_path: Path, inference: str, z: str, match: str
+) -> None:
+    source = (
+        FIXTURE.read_text().replace(_ONE_SIDED, inference, 1).replace("z = 1.645", f"z = {z}", 1)
+    )
+    with pytest.raises(ExperimentFileError, match=match):
+        _parse(tmp_path, source)

@@ -605,8 +605,9 @@ class EventsConfig(_ClosedConfig):
     )
     sec_forms_enabled: bool = False
     sec_forms_read_enabled: bool = False
-    # The Form 4 bulk route (plan T305b, #2498 amendment). None of these is a frozen key.
-    # `sec_forms_backfill_start`: the first filing date the backfill takes.
+    # SEC forms collection (plan T305b, #2498 amendment). None of these is a frozen key.
+    # `sec_forms_backfill_start`: the first filing date for Form 4 backfill and
+    # every 13D scan, including daily runs.
     # `form4_xml_price_below`: an accession with a bulk price under it goes to XML (the
     # set rounds prices to 2 decimals). `form4_zero_price_xml_codes`: a 0.00 price counts
     # as under it only for these transaction codes (an award or gift reports 0 truly).
@@ -620,5 +621,6 @@ class EventsConfig(_ClosedConfig):
         default_factory=lambda: ["P", "S"]
     )
     form4_bulk_order_sample: int = Field(default=20, gt=0, le=1_000)
+    form4_multi_owner_xml: bool = True
     sec_forms_max_requests: int = Field(default=40_000, gt=0, le=200_000)
     form4_bulk_max_member_bytes: int = Field(default=1024**3, gt=0, le=8 * 1024**3)

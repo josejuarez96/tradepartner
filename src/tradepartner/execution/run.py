@@ -253,7 +253,7 @@ from tradepartner.execution.collect import (
     note_unjudged,
 )
 from tradepartner.execution.ledger import Ledger, from_journal
-from tradepartner.execution.lock import LockHeld, resolve_book, run_lock
+from tradepartner.execution.lock import LockHeld, resolve_book, run_lock, sandbox_store_refusal
 from tradepartner.execution.lots import LedgerAccount
 from tradepartner.execution.outcomes import write_outcomes_and_lots
 from tradepartner.execution.plan import (
@@ -600,6 +600,17 @@ def window_journal_inputs(
 def _in_submit_window(context: StepContext) -> bool:
     """Whether the batch may start now; a note on the run when it may not."""
     now = context.gate.read_clock()
+    if (
+        context.window.book_id == "sandbox"
+        and sandbox_store_refusal(context.settings, context.window.book_id) is None
+    ):
+        if calendar.session_open(context.session) <= now <= calendar.session_close(context.session):
+            note = "sandbox: submit window skipped"
+            if note not in context.notes:
+                context.notes.append(note)
+            return True
+        context.notes.append("sandbox: outside market hours; nothing submitted")
+        return False
     start, end = submit_window(context.settings, context.session)
     if start <= now <= end:
         return True

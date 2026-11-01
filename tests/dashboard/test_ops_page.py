@@ -287,7 +287,6 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path, now: datetime = _NOW
     # Freeze the clock the page reads to the instant S-1 was derived from, so a
     # slow shard whose wall clock crosses a session boundary between import and
     # render cannot advance the required session past the fixture's run (#1263).
-    monkeypatch.setattr(ops, "utc_now", lambda: now)
     monkeypatch.setattr(ops_page, "utc_now", lambda: now)
     at = AppTest.from_file(_APP_PATH)
     at.run()
@@ -508,10 +507,9 @@ def test_stale_chip_survives_a_session_boundary(
 ) -> None:
     """Regression for #1263: a shard that imports before a session boundary and
     renders after it must not paint `stale` for the fixture's finished run.
-    Simulates the ambient clock one session past S-1; a page that reads that
-    clock (instead of the fixture's own frozen instant) then requires a later
-    session the fixture has no run for."""
-    monkeypatch.setattr(ops, "utc_now", lambda: _AFTER_BOUNDARY)
+    The page reads its one clock (`_app` pins it) and hands it to `ops`, which
+    has no wall clock of its own to read past S-1 (#2655)."""
+    assert not hasattr(ops, "utc_now")
     at = _app(monkeypatch, seeded_store)
     assert not at.exception
     assert "stale" not in _text(at).lower()
@@ -877,14 +875,32 @@ def test_one_book_shows_its_summary_row_and_no_selector(
     assert all(sb.key != ops_page.BOOK_KEY for sb in at.selectbox)
 
 
+def test_ops_page_hides_phase_notes_without_changing_the_result_row(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    raw = "paper_phase started=1; check fill; paper_phase finished=2"
+    with duckdb.connect(str(seeded_store)) as conn:
+        conn.execute("UPDATE paper_run_results SET message = ?", [raw])
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    assert "check fill" in _text(at)
+    assert "paper_phase" not in _text(at)
+    with duckdb.connect(str(seeded_store), read_only=True) as conn:
+        assert conn.execute("SELECT message FROM paper_run_results").fetchone() == (raw,)
+    with duckdb.connect(str(seeded_store)) as conn:
+        conn.execute("UPDATE paper_run_results SET message = 'paper_phase only=1'")
+    at = _app(monkeypatch, seeded_store)
+    assert "Last run:" not in _text(at)
+    assert "last run:" not in _text(at)
+
+
 def test_summary_names_traded_rebalance_without_marking_next_daily_one_done(
     monkeypatch: pytest.MonkeyPatch, seeded_store: Path
 ) -> None:
     settings = Settings(_env_file=None, store={"path": str(seeded_store)})
     with duckdb.connect(str(seeded_store), read_only=True) as conn:
-        (row,) = ops.book_summaries(conn, settings)
+        (row,) = ops.book_summaries(conn, settings, now=_NOW)
     today = datetime(2026, 10, 30, 14, tzinfo=UTC)
-    monkeypatch.setattr(ops, "utc_now", lambda: today)
     row = replace(
         row,
         last_run_kind="rebalance",
@@ -892,7 +908,7 @@ def test_summary_names_traded_rebalance_without_marking_next_daily_one_done(
         last_run_session=today.date(),
         next_rebalance_session=today.date(),
     )
-    (label,) = ops_page._summary_table((row,))["next_rebalance"].to_list()
+    (label,) = ops_page._summary_table((row,), today)["next_rebalance"].to_list()
     assert label == "2026-10-30; rebalance 2026-10-29 traded today"
 
 
@@ -900,11 +916,10 @@ def test_summary_names_rebalance_run_with_no_orders(
     monkeypatch: pytest.MonkeyPatch, seeded_store: Path
 ) -> None:
     _add_book_b(seeded_store)
-    monkeypatch.setattr(ops, "utc_now", lambda: _T0)
     settings = Settings(_env_file=None, store={"path": str(seeded_store)})
     with duckdb.connect(str(seeded_store), read_only=True) as conn:
-        b = next(row for row in ops.book_summaries(conn, settings) if row.book_id == "b")
-    (label,) = ops_page._summary_table((b,))["next_rebalance"].to_list()
+        b = next(row for row in ops.book_summaries(conn, settings, now=_T0) if row.book_id == "b")
+    (label,) = ops_page._summary_table((b,), _T0)["next_rebalance"].to_list()
     assert f"rebalance {ops.previous_session(_S_MINUS_1)} ran today with no orders" in label
     assert "traded today" not in label
 

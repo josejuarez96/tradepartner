@@ -18,8 +18,9 @@ here is this module's and is stated once:
   `backfill`, `import`), per source
   (`ingest.SOURCES` first, then any other source in the table,
   alphabetically): the finish time and cursor of the last `ok` run,
-  and the status, start and message of the latest run of any status. A source
-  that never ran shows `None`s. A maintenance or repair mode (`retract`,
+  and the status, start and message of the latest run of any status (rows
+  sharing the latest start time are one run, summed up by `_latest_line`;
+  #2728). A source that never ran shows `None`s. A maintenance or repair mode (`retract`,
   `actions`, `holes`, `repair`, `action_retract`, or any mode added later) is
   not an ingest and is left out, so it never hides the latest ingest's status.
 - **Coverage** (`coverage`): the population of ingest's staleness check
@@ -112,6 +113,14 @@ here is this module's and is stated once:
   reported, not thresholded. `clock_suspect` is the clock detector's rule
   (a health finding, never a repair): a stamp that fits only a moved clock.
 
+- **Incremental EDGAR** (`incremental_edgar`, #2629, T321): `counts` is
+  `incremental_edgar_counts` of the latest `edgar` or `edgar_index` run
+  message that carries them
+  (`incremental_drift: N`, `index_stamp_changed: N`), with the CIKs the
+  drift check named; a warning while either is positive. A drifted CIK means
+  a rule changed in code without a `BUILD_RULES_VERSION` bump; a changed stamp
+  is an owner repair release (spec amendment 2026-10-30). Report-only.
+
 - **Rates** (`rates`, #1498, T169e): per configured or stored series, the
   stored row count, latest observation, vintage and stamp, revised-key count,
   the longest missing XNYS-session span between observations, and the last
@@ -200,6 +209,16 @@ derived at `t`, as the data is read.
   `provenance_allowed` (the table's own set, `schema.TABLE_PROVENANCE_VALUES`)
   on every fact table. The schema's constraints already block these; the rules
   make a store written by other code, or a changed schema, show it.
+- The SEC ownership form rules (#2571, T307c), four per table on
+  `sec_filing_events` and `sec_form4_transactions`, over every stored row
+  whatever its `known_at`, and whether or not `events.sec_forms_enabled`
+  collects: `*_known_at_is_accepted_at` (`known_at` equals `accepted_at`),
+  `*_timestamps_aware` (both timestamp columns are `TIMESTAMPTZ`),
+  `*_unique` (no duplicate identity) and `*_identity_not_null`. The identity
+  is (`accession`, `subject_cik`, `filer_cik`) for `sec_filing_events` and
+  (`accession`, `filer_cik`, `line_no`) for `sec_form4_transactions`; the
+  `*_known_at_is_accepted_at` and `*_unique` frames carry it in full. A store
+  without a table passes that table's four rules.
 - `bars_on_sessions`: every `prices_daily.session` is an XNYS session in the
   configured calendar range.
 - `no_duplicate_bars`: no two bars share `(security_id, session, known_at)`.
@@ -387,7 +406,7 @@ import re
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from itertools import pairwise
 from typing import Any
@@ -504,6 +523,14 @@ FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT = "filing_events_known_at_is_accepted_at"
 FILING_EVENTS_FORM_ALLOWED = "filing_events_form_allowed"
 FILING_EVENTS_ITEMS_NOT_NULL = "filing_events_items_not_null"
 FILING_EVENTS_UNIQUE = "filing_events_unique"
+SEC_FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT = "sec_filing_events_known_at_is_accepted_at"
+SEC_FILING_EVENTS_TIMESTAMPS_AWARE = "sec_filing_events_timestamps_aware"
+SEC_FILING_EVENTS_UNIQUE = "sec_filing_events_unique"
+SEC_FILING_EVENTS_IDENTITY_NOT_NULL = "sec_filing_events_identity_not_null"
+SEC_FORM4_TRANSACTIONS_KNOWN_AT_IS_ACCEPTED_AT = "sec_form4_transactions_known_at_is_accepted_at"
+SEC_FORM4_TRANSACTIONS_TIMESTAMPS_AWARE = "sec_form4_transactions_timestamps_aware"
+SEC_FORM4_TRANSACTIONS_UNIQUE = "sec_form4_transactions_unique"
+SEC_FORM4_TRANSACTIONS_IDENTITY_NOT_NULL = "sec_form4_transactions_identity_not_null"
 #: The coverage check's rule (#1541): reported from the `coverage_reference`
 #: block, never from `INTEGRITY_RULES` (module docstring).
 COVERAGE_REFERENCE_NAMES = "coverage_reference_names"
@@ -567,6 +594,14 @@ INTEGRITY_RULES: tuple[str, ...] = (
     FILING_EVENTS_FORM_ALLOWED,
     FILING_EVENTS_ITEMS_NOT_NULL,
     FILING_EVENTS_UNIQUE,
+    SEC_FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
+    SEC_FILING_EVENTS_TIMESTAMPS_AWARE,
+    SEC_FILING_EVENTS_UNIQUE,
+    SEC_FILING_EVENTS_IDENTITY_NOT_NULL,
+    SEC_FORM4_TRANSACTIONS_KNOWN_AT_IS_ACCEPTED_AT,
+    SEC_FORM4_TRANSACTIONS_TIMESTAMPS_AWARE,
+    SEC_FORM4_TRANSACTIONS_UNIQUE,
+    SEC_FORM4_TRANSACTIONS_IDENTITY_NOT_NULL,
     SESSION_HOLES,
     RATE_KNOWN_AT,
     RATE_UNIQUE,
@@ -878,6 +913,67 @@ class FilingEvents:
             for name in ("items_missing", "clock_suspect")
             if self.counts.get(name, 0) > 0
         )
+
+
+#: `incremental_drift: <N>` and `index_stamp_changed: <N>` (the incremental
+#: EDGAR ingest's run-message figures, #2629), and the drift check's named
+#: CIKs, `incremental_drift_ciks: a b c` (`store.drift_check.drift_message`).
+_INCREMENTAL_COUNT = re.compile(r"\b(incremental_drift|index_stamp_changed): (\d+)\b")
+_INCREMENTAL_CIKS = re.compile(r"\bincremental_drift_ciks: ([0-9 ]+)")
+
+
+def incremental_edgar_counts(message: str | None) -> dict[str, int]:
+    """The `incremental_drift` and `index_stamp_changed` figures of an EDGAR
+    run's message (#2629), keyed by name. Empty when `message` is `None` or
+    names neither (a nightly before the incremental ingest)."""
+    if not message:
+        return {}
+    return {name: int(n) for name, n in _INCREMENTAL_COUNT.findall(message)}
+
+
+@dataclass(frozen=True, eq=False)
+class IncrementalEdgar:
+    """The incremental EDGAR ingest's two report-only warnings (#2629, T321;
+    module docstring). `counts` is `incremental_edgar_counts` of the latest
+    EDGAR run's message and `drift_ciks` the CIKs it names (up to ten)."""
+
+    counts: dict[str, int]
+    drift_ciks: tuple[str, ...] = ()
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        """`incremental_drift` (naming its CIKs) and `index_stamp_changed`,
+        each while its count in the latest run is positive."""
+        out: list[str] = []
+        drift = self.counts.get("incremental_drift", 0)
+        if drift > 0:
+            named = f" ({' '.join(self.drift_ciks)})" if self.drift_ciks else ""
+            out.append(f"incremental_drift: {drift}{named}")
+        changed = self.counts.get("index_stamp_changed", 0)
+        if changed > 0:
+            out.append(f"index_stamp_changed: {changed}")
+        return tuple(out)
+
+
+def _incremental_edgar_report(conn: duckdb.DuckDBPyConnection, t: datetime) -> IncrementalEdgar:
+    """The latest run of `edgar` or `edgar_index` finished by `t` whose
+    message carries either figure (the driver writes both on the
+    `edgar_index` row); a later run without them neither clears nor shows."""
+    row = conn.execute(
+        """
+        SELECT message FROM ingestion_runs
+        WHERE source IN ('edgar', 'edgar_index') AND coalesce(finished_at, started_at) <= ?
+          AND (message LIKE '%incremental_drift:%' OR message LIKE '%index_stamp_changed:%')
+        ORDER BY started_at DESC, run_id DESC LIMIT 1
+        """,
+        [t],
+    ).fetchone()
+    message = None if row is None else row[0]
+    named = _INCREMENTAL_CIKS.search(message or "")
+    return IncrementalEdgar(
+        counts=incremental_edgar_counts(message),
+        drift_ciks=tuple(named.group(1).split()) if named else (),
+    )
 
 
 _REFERENCE_MISSING_SCHEMA: dict[str, Any] = {
@@ -1799,6 +1895,8 @@ class HealthReport:
     integrity: tuple[IntegrityCheck, ...]
     #: `None` when the block was not computed ("not computed", never a pass).
     coverage_reference: CoverageReference | None = None
+    #: The incremental EDGAR ingest's warnings (#2629).
+    incremental_edgar: IncrementalEdgar = field(default_factory=lambda: IncrementalEdgar({}))
 
     @property
     def failures(self) -> tuple[str, ...]:
@@ -1950,6 +2048,7 @@ def health_report(
         },
         statement=_statement_facts_report(conn, t, settings, ingests),
         filing_events=_filing_events_report(conn, settings, ingests),
+        incremental_edgar=_incremental_edgar_report(conn, t),
         rates=_rates_report(conn, t, settings),
         borrow=_borrow_report(conn, t, session, settings),
         mergers=_mergers_report(conn, t, ingests),
@@ -2721,19 +2820,36 @@ def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestSt
     for source in (*SOURCES, *extra):
         rows = by_source.get(source, [])
         ok_rows = [r for r in rows if r[1] == OK and r[3] is not None]
-        last_ok = max(ok_rows, key=lambda r: r[3], default=None)
+        last_ok = max(ok_rows, key=lambda r: (r[3], r[4] or ""), default=None)
         latest = rows[-1] if rows else None
+        status, message = (None, None) if latest is None else _latest_line(rows)
         out.append(
             IngestStatus(
                 source=source,
                 last_ok_finished_at=None if last_ok is None else last_ok[3],
                 last_ok_cursor=None if last_ok is None else last_ok[4],
-                latest_status=None if latest is None else latest[1],
+                latest_status=status,
                 latest_started_at=None if latest is None else latest[2],
-                latest_message=None if latest is None else latest[5],
+                latest_message=message,
             )
         )
     return tuple(out)
+
+
+def _latest_line(rows: list[tuple[Any, ...]]) -> tuple[str, str | None]:
+    """The latest run's status and message. One run can write several rows at one start
+    time (the Form 4 bulk backfill writes one per quarter, #2728): those are summed up in
+    cursor order, `ok` only when every row is, so no row is picked by its random run id."""
+    latest = rows[-1]
+    tied = sorted((r for r in rows if r[2] == latest[2]), key=lambda r: r[4] or "")
+    if len(tied) == 1:
+        return latest[1], latest[5]
+    not_ok = [r for r in tied if r[1] != OK]
+    status = OK if not not_ok else not_ok[0][1] if len({r[1] for r in not_ok}) == 1 else "mixed"
+    message = f"{len(tied)} rows ({tied[0][4]} to {tied[-1][4]}): {len(tied) - len(not_ok)} ok"
+    if not_ok:
+        message += "; not ok: " + ", ".join(f"{r[4]} {r[1]}" for r in not_ok)
+    return status, message
 
 
 def _current_from(listings: pl.DataFrame, session: date) -> dict[str, dict[str, Any]]:
@@ -3047,6 +3163,7 @@ def _integrity_checks(
         STATEMENT_DERIVED_MATCHES_COMPONENTS: _statement_derived_matches_components(conn),
         STATEMENT_BASIS_ALLOWED: _statement_basis_allowed(conn),
         **_filing_event_rules(conn, settings),
+        **_sec_form_rules(conn),
         SESSION_HOLES: _session_holes(conn, t, settings),
         **_rate_rules(conn),
         **_new_action_stamp_rules(conn),
@@ -3802,3 +3919,104 @@ def _filing_event_rules(
         FILING_EVENTS_ITEMS_NOT_NULL: keys("WHERE items IS NULL"),
         FILING_EVENTS_UNIQUE: keys("", "HAVING count(*) > 1"),
     }
+
+
+_SEC_FORM_IDENTITIES: dict[str, tuple[str, ...]] = {
+    "sec_filing_events": ("accession", "subject_cik", "filer_cik"),
+    "sec_form4_transactions": ("accession", "filer_cik", "line_no"),
+}
+_SEC_FORM_RULES: dict[str, tuple[str, str, str, str]] = {
+    "sec_filing_events": (
+        SEC_FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
+        SEC_FILING_EVENTS_TIMESTAMPS_AWARE,
+        SEC_FILING_EVENTS_UNIQUE,
+        SEC_FILING_EVENTS_IDENTITY_NOT_NULL,
+    ),
+    "sec_form4_transactions": (
+        SEC_FORM4_TRANSACTIONS_KNOWN_AT_IS_ACCEPTED_AT,
+        SEC_FORM4_TRANSACTIONS_TIMESTAMPS_AWARE,
+        SEC_FORM4_TRANSACTIONS_UNIQUE,
+        SEC_FORM4_TRANSACTIONS_IDENTITY_NOT_NULL,
+    ),
+}
+_SEC_FORM_KEY_SCHEMA: dict[str, Any] = {
+    "accession": pl.Utf8,
+    "subject_cik": pl.Utf8,
+    "filer_cik": pl.Utf8,
+    "line_no": pl.Int64,
+    "rows": pl.Int64,
+}
+_SEC_FORM_COLUMN_SCHEMA: dict[str, Any] = {
+    "column": pl.Utf8,
+    "rows": pl.Int64,
+}
+
+
+def _sec_form_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
+    """Check SEC ownership identity and acceptance stamps in the store."""
+    present = _present_tables(conn)
+    rules: dict[str, pl.DataFrame] = {}
+    for table, identity in _SEC_FORM_IDENTITIES.items():
+        key_schema = _SEC_FORM_KEY_SCHEMA
+        column_schema = _SEC_FORM_COLUMN_SCHEMA
+        (
+            known_at_rule,
+            timestamps_rule,
+            unique_rule,
+            identity_not_null_rule,
+        ) = _SEC_FORM_RULES[table]
+        if table not in present:
+            rules[known_at_rule] = pl.DataFrame(schema=key_schema)
+            rules[timestamps_rule] = pl.DataFrame(schema=column_schema)
+            rules[unique_rule] = pl.DataFrame(schema=key_schema)
+            rules[identity_not_null_rule] = pl.DataFrame(schema=column_schema)
+            continue
+
+        def keys(
+            where: str,
+            having: str = "",
+            table_name: str = table,
+            columns: tuple[str, ...] = identity,
+            schema: dict[str, Any] = key_schema,
+        ) -> pl.DataFrame:
+            select_cols = ", ".join(columns)
+            found = conn.execute(
+                f"SELECT {select_cols}, count(*) FROM {table_name} {where} "
+                f"GROUP BY {select_cols} {having} ORDER BY accession"
+            ).fetchall()
+            rows: list[dict[str, Any]] = []
+            for row in found:
+                d = {"rows": int(row[-1])}
+                for i, col in enumerate(columns):
+                    d[col] = row[i]
+                rows.append(d)
+            return pl.DataFrame(rows, schema=schema)
+
+        rules[known_at_rule] = keys("WHERE known_at IS DISTINCT FROM accepted_at")
+        rules[unique_rule] = keys("", "HAVING count(*) > 1")
+        null_counts = []
+        for column in identity:
+            count_row = conn.execute(
+                f"SELECT count(*) FROM {table} WHERE {column} IS NULL"
+            ).fetchone()
+            null_counts.append({"column": column, "rows": int(count_row[0]) if count_row else 0})
+        rules[identity_not_null_rule] = pl.DataFrame(
+            [row for row in null_counts if row["rows"]], schema=column_schema
+        )
+        types = conn.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name = ? AND table_catalog = current_database() "
+            "AND table_schema = current_schema() "
+            "AND column_name IN ('known_at', 'accepted_at')",
+            [table],
+        ).fetchall()
+        type_by_column = dict(types)
+        rules[timestamps_rule] = pl.DataFrame(
+            [
+                {"column": column, "rows": 1}
+                for column in ("known_at", "accepted_at")
+                if type_by_column.get(column) != "TIMESTAMP WITH TIME ZONE"
+            ],
+            schema=column_schema,
+        )
+    return rules

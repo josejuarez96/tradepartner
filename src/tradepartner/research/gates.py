@@ -35,7 +35,9 @@ The gates, in spec order:
    precedes registration"); a confirmatory `agreement` run additionally
    needs its bound dataset `locked`, else `refused_split` ("label export not
    locked").
-6. **Verdict** (`compute_verdict`, req 8). `underpowered` when
+6. **Verdict** (`compute_verdict`, req 8). `not_computable` when the
+   primary statistic or either interval bound is NaN or infinite (#2617), first
+   of all; `underpowered` when
    `n_clusters < min_clusters`, regardless of the interval; otherwise `n/a`
    without a threshold, else `pass` when the interval excludes the
    threshold on the registered side and `fail` otherwise. Never the point
@@ -44,6 +46,7 @@ The gates, in spec order:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Literal
@@ -58,7 +61,7 @@ BudgetOutcome = Literal["ok", "refused_budget"]
 ConfirmatoryOutcome = Literal["ok", "refused_split"]
 ConfirmatoryBasis = Literal["predates_dataset", "sealed_split", "none"]
 Direction = Literal["greater", "less"]
-Verdict = Literal["pass", "fail", "underpowered", "n/a"]
+Verdict = Literal["pass", "fail", "underpowered", "n/a", "not_computable"]
 
 
 @dataclass(frozen=True)
@@ -397,13 +400,21 @@ def compute_verdict(
     threshold: float | None,
     ci_low: float,
     ci_high: float,
+    *,
+    value: float | None = None,
 ) -> Verdict:
     """Req 8: computed from the interval, never the point estimate.
-    `underpowered` beats every other outcome, including a threshold the
+    `not_computable` when `value` (the primary statistic, if given), `ci_low`
+    or `ci_high` is NaN or infinite: no evidence, never a quiet `fail` (a NaN
+    bound compares false against any threshold; #2617, owner 2026-10-30). It
+    beats every other outcome, `underpowered` included.
+    `underpowered` beats every other outcome after that, including a threshold the
     interval would otherwise clear. `direction = less` passes when the
     interval's upper bound is strictly below the threshold; `greater` passes
     when its lower bound is strictly above. No threshold is always `n/a`
     once the cluster floor is met."""
+    if not all(math.isfinite(x) for x in (ci_low, ci_high, *(() if value is None else (value,)))):
+        return "not_computable"
     if n_clusters < min_clusters:
         return "underpowered"
     if threshold is None:

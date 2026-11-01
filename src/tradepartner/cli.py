@@ -37,6 +37,10 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   when the file passes and still matches the store
   (`ingest.restamp_from_manifest`); any other in-window change still fails
   the run with nothing written.
+  `--source edgar --sec-forms-only` (#2624) runs `ingest.ingest_sec_forms`:
+  the EDGAR backfill's SEC ownership forms step alone, from
+  `events.sec_forms_backfill_start`, for the stored securities' CIKs, with no
+  full filing index or master build; it takes no other flag.
 - `tradepartner backfill-benchmark SYMBOL --since DATE [--cik --name
   --exchange]` runs `backfill.backfill_benchmark` (#840): the owner's one-off
   for a configured benchmark the store lacks (MTUM), seeded from the three
@@ -89,6 +93,21 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   (`store/dividend_reviews.csv`) with an ex-date on or before `--to`, counts
   the later ones deferred, and lists every stale entry (a dry run exits 1 on
   any; a real run refuses).
+- `tradepartner build-form4-roles-manifest --zip-dir DIR --output FILE`
+  reads the store and cached insider zips to list rows with the old bulk role
+  parse. `repair-form4-roles --manifest FILE --release NAME --expect-rows N
+  [--dry-run]` checks every stored key, source row, zip hash and raw role before
+  updating the four flags and `ingested_at` inside the open release (#2697).
+- `tradepartner recheck-form4-multi-owner --count-only [--from-quarter YYYYqN
+  --to-quarter YYYYqN]` estimates the SEC requests. With `--output FILE
+  --max-requests N [--resume FILE]`, it rechecks bulk multi-owner Form 4
+  accessions against cached SEC XML, writing a manifest and summary.
+  `repair-form4-multi-owner --manifest FILE --release NAME --expect-rows N
+  [--dry-run]` applies only reviewed role changes in the open release (#2720).
+- `tradepartner build-form4-titles-manifest --zip-dir DIR --output FILE`
+  compares stored bulk titles with the fixed cached-zip parser. `repair-form4-titles
+  --manifest FILE --release NAME --expect-rows N [--dry-run]` changes only
+  CSV-quoted titles inside an open release (#2708).
 - `tradepartner action-retract --security <id> --action-id <source id>
   --reason <text> [--reinstate] (--dry-run | --expect-known-at <iso>)` runs
   `action_retract.retract_action` (#2092, data-foundation plan T262): it
@@ -175,7 +194,17 @@ Research registry (research-registry spec req 11 and req 14; plan T83):
   run's result. `--spend-holdout` without a non-blank reason, a reason without
   its flag, `--holdout-repeat` without `--spend-holdout`, `--configurations`
   under 1 and a config that is not a JSON object are refused before anything is
-  written, as are an unknown slug or dataset.
+  written, as are an unknown slug or dataset. A registration with a `[study]`
+  table takes `--configurations` from its `study.configurations` and refuses a
+  different value (amendment 2026-10-28 #2440); any other defaults to 1.
+- `tradepartner experiment study --run <id>` runs the event-study runner on an
+  unfinished run (`attach_run`, `research.load_dataset`, `run_study`,
+  `write_result`) and prints its primary, kill lines and artifact through the
+  `cli_record` scrub. A run with a result row, a registration without
+  `[study]`, a run under a superseded registration and a handle from another
+  store are refused (exit 2) with nothing written; any exception after that
+  closes the run `failed` with its scrubbed message (exit 1, as does a
+  `failed` result).
 - `tradepartner experiment abandon --run <id> --reason` appends the run's
   `abandoned` result.
 - `tradepartner experiments [--registration] [--family] [--kind]
@@ -378,7 +407,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import UTC, date, datetime
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Annotated, Any, NoReturn
 from zoneinfo import ZoneInfo
 
@@ -400,6 +429,7 @@ from tradepartner.adapters.edgar_source import (
     census_filing_index,
 )
 from tradepartner.adapters.filings import FilingHeader
+from tradepartner.adapters.form4_bulk_route import RequestBudgetStopped
 from tradepartner.adapters.fred_rates import FredRateSource
 from tradepartner.adapters.prices import (
     Bar,
@@ -430,7 +460,15 @@ from tradepartner.corpus import departure_fetch
 from tradepartner.diskfloor import ingest_floor_refusal, low_disk_warning
 from tradepartner.execution import check as paper_check
 from tradepartner.execution import lock as paper_lock
-from tradepartner.execution import lots_reconcile, ops, plain, reconcile_run, waiting, window
+from tradepartner.execution import (
+    lots_reconcile,
+    ops,
+    paper_message,
+    plain,
+    reconcile_run,
+    waiting,
+    window,
+)
 from tradepartner.execution import report as paper_report
 from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
@@ -467,10 +505,12 @@ from tradepartner.ingest import (
     ingest_assets,
     ingest_openfigi,
     ingest_rates,
+    ingest_sec_forms,
     ingest_session,
     manifest_release,
     rates_seeded,
     read_manifest,
+    show_ingest_progress,
 )
 from tradepartner.repair import (
     HeaderLookup,
@@ -482,7 +522,48 @@ from tradepartner.repair import (
     retract_dividends,
     store_resolver,
 )
-from tradepartner.research import EVERY_ROW_SPLITS, DatasetChanged, datafiles
+from tradepartner.repair_form4_multi_owner import (
+    MultiOwnerRepairRefused,
+    recheck_form4_multi_owner,
+)
+from tradepartner.repair_form4_multi_owner import (
+    count_candidates as count_form4_multi_owner,
+)
+from tradepartner.repair_form4_multi_owner import (
+    manifest_digest as form4_multi_owner_manifest_digest,
+)
+from tradepartner.repair_form4_multi_owner import (
+    repair_form4_multi_owner as apply_form4_multi_owner_repair,
+)
+from tradepartner.repair_form4_roles import (
+    RoleRepairRefused,
+)
+from tradepartner.repair_form4_roles import (
+    build_manifest as build_form4_roles_manifest,
+)
+from tradepartner.repair_form4_roles import (
+    repair_form4_roles as apply_form4_roles_repair,
+)
+from tradepartner.repair_form4_titles import (
+    TitleRepairRefused,
+)
+from tradepartner.repair_form4_titles import (
+    build_manifest as build_form4_titles_manifest,
+)
+from tradepartner.repair_form4_titles import (
+    manifest_sha256 as form4_titles_manifest_sha256,
+)
+from tradepartner.repair_form4_titles import (
+    repair_form4_titles as apply_form4_titles_repair,
+)
+from tradepartner.research import (
+    EVERY_ROW_SPLITS,
+    DatasetChanged,
+    RunHandle,
+    datafiles,
+    load_dataset,
+)
+from tradepartner.research.event_study.run import run_study
 from tradepartner.research.experiment import (
     SPLITS,
     ExperimentFileError,
@@ -500,6 +581,7 @@ from tradepartner.research.experiment import (
 )
 from tradepartner.research.gates import Flags as ResearchFlags
 from tradepartner.research.gates import Reasons as ResearchReasons
+from tradepartner.research.interrupt_guard import run_with_sigint_ignored
 from tradepartner.research.labeling import frame as labeling_frame
 from tradepartner.research.labeling import gold, job, review, scoring
 from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET, REVERSED_OPTION_SET
@@ -514,6 +596,7 @@ from tradepartner.store import (
     research,
     schema,
 )
+from tradepartner.store import migrate as store_migrate
 from tradepartner.store.asof import ASSETS_SOURCE
 from tradepartner.store.db import (
     StoreLockedError,
@@ -781,6 +864,10 @@ def _print_report(report: HealthReport) -> None:
         echo(f"  {s.source}: last ok {last_ok} (cursor {s.last_ok_cursor})")
         if s.latest_status is not None:
             echo(f"    latest: {s.latest_status}: {s.latest_message}")
+    if report.incremental_edgar.warnings:
+        echo("incremental EDGAR:")
+        for warning in report.incremental_edgar.warnings:
+            echo(f"  warning: {warning}")
     c = report.coverage
     echo(
         f"coverage: {len(c.live) - len(c.missing)} of {len(c.live)} live names "
@@ -1346,6 +1433,159 @@ def _sealed_periods(extra: Sequence[str]) -> list[tuple[date, date]]:
     return periods
 
 
+def _study_table(record: research.RegistrationRecord) -> dict[str, Any] | None:
+    """The registration's frozen `[study]` table, from its hashed `params_json`."""
+    study = json.loads(record.params_json).get("study")
+    return study if isinstance(study, dict) else None
+
+
+def _study_configurations(slug: str, study: Mapping[str, Any]) -> int:
+    """`study.configurations`, refused (ValueError) when absent or not a positive int."""
+    value = study.get("configurations")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{slug}: study.configurations is missing or not a positive integer")
+    return value
+
+
+def _declared_configurations(record: research.RegistrationRecord, given: int | None) -> int:
+    """`experiment open`'s configurations: a `[study]` registration's
+    `study.configurations`, refusing a different value (#2440); else `given` or 1."""
+    study = _study_table(record)
+    if study is None:
+        return 1 if given is None else given
+    declared = _study_configurations(record.slug, study)
+    if given is not None and given != declared:
+        raise ValueError(
+            f"--configurations {given} differs from {record.slug}'s study.configurations "
+            f"{declared}; the file declares the run's configurations"
+        )
+    return declared
+
+
+def _close_study_failed(settings: Settings, handle: RunHandle, message: str) -> str:
+    """Close `handle`'s run `failed` with `message`; returns the line saying what happened."""
+    try:
+        with open_for_write(settings) as conn:
+            research.close_run(conn, handle, "failed", message)
+    except research.RunAlreadyClosed:
+        return f"run {handle.run_id}: already has its result row"
+    except Exception as exc:  # the run stays unfinished: say so, never hide it
+        return (
+            f"run {handle.run_id}: could not be closed ({type(exc).__name__}: {exc}); it is "
+            "unfinished, close it with `experiment abandon`"
+        )
+    return f"run {handle.run_id}: failed ({handle.slug})"
+
+
+def _study_scrubbed(text: str, settings: Settings) -> str:
+    """Scrub secrets and local paths from study result and failure text."""
+    text = _scrubbed(text, settings)
+    paths = {
+        str(Path.home()),
+        str(settings.store.path),
+        str(Path(settings.store.path).resolve()),
+    }
+    for path in sorted(paths, key=len, reverse=True):
+        if path not in {"", ".", "/"}:
+            text = text.replace(path, "<path>")
+    return text
+
+
+def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None = None) -> None:
+    """`experiment study --run <id>` (amendment 2026-10-28 #2440, plan T304).
+
+    Refusals (exit 2) write nothing; after them any exception closes the run
+    `failed` with its scrubbed message (exit 1). `real` is the settings whose
+    store is the real one for `attach_run`'s synthetic rule. The command passes
+    none, so its configured store is the real store and only a non-synthetic
+    run attaches; a test passes the original's settings to study a synthetic
+    run on a temp-file copy, which every count excludes.
+    """
+    if (missing := _store_missing(settings)) is not None:
+        raise missing
+    real_store = real if real is not None else settings
+    try:
+        with open_for_write(settings) as conn:
+            schema.init_schema(conn)
+            handle = research.attach_run(conn, run_id, settings=real_store)
+            record = research.get_registration(conn, handle.slug)
+    except StoreLockedError as exc:
+        raise _fail(f"store busy: {exc}", 1) from None
+    except _RESEARCH_REFUSALS as exc:
+        raise _refusal(exc, settings) from None
+    if handle.database != str(Path(settings.store.path).resolve()):
+        raise _refusal(ValueError(f"run {run_id} was opened on another store"), settings)
+    if record.registration_id != handle.registration_id:
+        raise _refusal(
+            ValueError(
+                f"run {run_id} is under registration {handle.registration_id}, superseded by "
+                f"{record.registration_id}; abandon it"
+            ),
+            settings,
+        )
+    design = _study_table(record)
+    if design is None:
+        raise _refusal(ValueError(f"run {run_id}: {record.slug} has no [study] table"), settings)
+    try:
+        n_configurations = _study_configurations(record.slug, design)
+    except ValueError as exc:
+        raise _refusal(exc, settings) from None
+    study = SimpleNamespace(
+        slug=record.slug,
+        study=design,
+        window_start=record.window_start,
+        window_end=record.window_end,
+    )
+    try:
+        result = run_study(handle, study, load_dataset(handle), settings=settings)
+        primary = result.primary
+        with open_for_write(settings) as conn:
+            outcome = research.write_result(
+                conn,
+                handle,
+                primary_value=float(primary["value"]),
+                primary_ci_low=float(primary["ci_low"]),
+                primary_ci_high=float(primary["ci_high"]),
+                n_observations=int(primary["n"]),
+                n_clusters=int(primary["n_clusters"]),
+                n_configurations=n_configurations,
+                artifact_sha256=result.artifact_sha256,
+                artifact_path=str(result.artifact_path),
+                secondary=result.secondary,
+                exploratory=result.exploratory,
+            )
+    except BaseException as exc:  # any exception closes the run failed (#2440)
+        message = _study_scrubbed(f"{type(exc).__name__}: {exc}", settings)
+        _echo_scrubbed(
+            _study_scrubbed(
+                run_with_sigint_ignored(lambda: _close_study_failed(settings, handle, message)),
+                settings,
+            ),
+            settings,
+        )
+        _echo_scrubbed(f"  {message}", settings)
+        raise typer.Exit(INTERRUPTED_EXIT if isinstance(exc, KeyboardInterrupt) else 1) from None
+    kills = ", ".join(
+        f"{name} {'killed' if line['killed'] else 'holds'}"
+        for name, line in result.summary["kill"].items()
+    )
+    _echo_scrubbed(
+        "\n".join(
+            (
+                f"run {run_id}: {outcome} ({handle.slug}, {n_configurations} configurations)",
+                f"  primary {_fmt(primary['value'])} bp [{_fmt(primary['ci_low'])}, "
+                f"{_fmt(primary['ci_high'])}] over {primary['n']} events, "
+                f"{primary['n_clusters']} clusters",
+                f"  kill lines: {kills or 'none'}",
+                f"  artifact {result.artifact_path} sha256 {result.artifact_sha256}",
+            )
+        ),
+        settings,
+    )
+    if outcome != "ok":
+        raise typer.Exit(1)
+
+
 def _flag_names(run: research.RunSummary) -> str:
     flags = [
         name
@@ -1676,6 +1916,8 @@ def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
         message, code = f"refused: {exc.reason}: {exc}", PAPER_REFUSAL_EXIT["refused"]
     except registry.UnknownHypothesis as exc:
         message, code = f"refused: unknown_hypothesis: {exc}", PAPER_REFUSAL_EXIT["refused"]
+    except (schema.SchemaVersionError, store_backup_module.BackupError) as exc:
+        message, code = f"refused: {exc}", PAPER_REFUSAL_EXIT["refused"]
     except window.KillWriteFailed as exc:
         message, code = f"failed: {exc}", WRITE_FAILED_EXIT_CODE
     except Exception as exc:
@@ -1743,7 +1985,7 @@ def _book_first_lines(
     return lines
 
 
-def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
+def _summary_lines(summaries: Sequence[ops.BookSummary], now: datetime) -> list[str]:
     """`paper status --all`: the operations page's one-row-per-book summary (spec
     req 12 as amended 2026-10-09), one line per book in token order."""
     if not summaries:
@@ -1756,7 +1998,7 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
             if state.engaged
             else ("run in progress" if state.run_in_progress else "released")
         )
-        traded = ops.rebalance_traded_today(row)
+        traded = ops.rebalance_traded_today(row, now=now)
         line = (
             f"book {row.book_id}: window {row.window.window_id} "
             f"{'open' if row.is_open else 'closed'}; positions {row.positions_count}; "
@@ -1770,6 +2012,8 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
             line += f"; rebalance {traded} {result}"
         if row.open_orders_count and row.last_run_kind == "rebalance":
             line += f"; {_FILLS_NOTE}"
+        if message := paper_message.owner_message(row.last_run_message):
+            line += f"; {message}"
         lines.append(line)
     return lines
 
@@ -1843,6 +2087,8 @@ def _status_lines(
         *_edgar_age_lines(data.edgar_age),
         f"alerts ({len(data.alerts)}{', capped' if data.alerts_capped else ''}):",
     ]
+    if message := paper_message.owner_message(data.last_run_message):
+        lines.insert(-1, f"last run: {message}")
     lines += [f"  #{a.alert_id} {a.at} {a.kind} {a.session}: {a.message}" for a in data.alerts]
     return lines
 
@@ -2318,6 +2564,16 @@ def make_app(
                 help="with --census-sec-forms: the assumed size of one filing XML, in bytes",
             ),
         ] = CENSUS_XML_BYTES_ASSUMED,
+        sec_forms_only: Annotated[
+            bool,
+            typer.Option(
+                "--sec-forms-only",
+                help=(
+                    "with --source edgar: only the SEC ownership forms backfill, from "
+                    "events.sec_forms_backfill_start, no full EDGAR pass (#2624)"
+                ),
+            ),
+        ] = False,
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
         if source not in ("all", *SOURCES, ASSETS_SOURCE, "openfigi"):
@@ -2338,8 +2594,25 @@ def make_app(
                     fill_holes_, security is not None, bulk_from_cache, rebuild_statement_facts,
                     rebuild_filing_events, rebuild_classifications, restamp_from is not None,
                     restamp_window_earlier_ok is not None, import_dir is not None,
+                    sec_forms_only,
                 ),
             )  # fmt: skip
+        if sec_forms_only and (
+            source != "edgar"
+            or any(
+                (
+                    backfill_, since is not None, actions_backfill, through is not None, dry_run,
+                    fill_holes_, security is not None, bulk_from_cache, rebuild_statement_facts,
+                    rebuild_filing_events, rebuild_classifications, restamp_from is not None,
+                    restamp_window_earlier_ok is not None, import_dir is not None,
+                )
+            )
+        ):  # fmt: skip
+            raise _fail(
+                "--sec-forms-only needs --source edgar and no other flag "
+                "(it starts at events.sec_forms_backfill_start)",
+                USAGE_ERROR,
+            )
         if import_dir is not None and source != ASSETS_SOURCE:
             raise _fail(f"--import-dir needs --source {ASSETS_SOURCE}", USAGE_ERROR)
         if source == ASSETS_SOURCE and backfill_:
@@ -2414,19 +2687,20 @@ def make_app(
                 raise _fail(f"--through must be YYYY-MM-DD, got {through!r}", USAGE_ERROR) from None
         base = settings()  # the edges get the caller's own Settings; only the store wait differs
         s = _writer_settings(base)
+        scheduled_ingest = (
+            source == "all"
+            and start is None
+            and not dry_run
+            and restamp is None
+            and not (rebuild_statement_facts or rebuild_filing_events or rebuild_classifications)
+        )
         if (refusal := ingest_floor_refusal(s)) is not None:
             # Before any store write, so it can never fire mid-write (#2454).
-            if (
-                source == "all"
-                and start is None
-                and not dry_run
-                and restamp is None
-                and not (
-                    rebuild_statement_facts or rebuild_filing_events or rebuild_classifications
-                )
-            ):
+            if scheduled_ingest:
                 heartbeat.ping(s, "ingest", ok=False)  # same shape as the scheduled job (#2155)
             raise _fail(refusal, 1)
+        if sec_forms_only and not s.events.sec_forms_enabled:
+            raise _fail("--sec-forms-only needs events.sec_forms_enabled", USAGE_ERROR)
         if source == "openfigi" and not s.openfigi.enabled:
             raise _fail("--source openfigi needs openfigi.enabled=true", USAGE_ERROR)
         if actions_backfill:
@@ -2445,20 +2719,47 @@ def make_app(
             )
         if rebuild_filing_events and not s.edgar.filing_events_enabled:
             raise _fail("--rebuild-filing-events needs edgar.filing_events_enabled", USAGE_ERROR)
-        if fill_holes_ and start is not None:
-            if (absent := _store_missing(s)) is not None:
-                raise absent
-            if dry_run:  # fetches nothing: no secret needed
-                listed = fill_holes(
-                    s,
-                    prices=_NoPrices(),
-                    since=start,
-                    clock=clock,
-                    dry_run=True,
-                    securities=named,
+        if fill_holes_ and (absent := _store_missing(s)) is not None:
+            raise absent
+        if import_dir is None and not (fill_holes_ and dry_run):
+            missing = _missing_secrets(s, source)
+            if missing:
+                raise _fail(
+                    f"missing required secret(s): {', '.join(missing)}. "
+                    "Set them in .env (see .env.example).",
+                    USAGE_ERROR,
                 )
-                _print_holes(listed)
-                raise typer.Exit(listed.exit_code)
+        try:
+            if dry_run:
+                if Path(s.store.path).is_file():
+                    with open_read_only(s) as conn:
+                        stored = schema.stored_version(conn)
+                    if stored != schema.CURRENT_SCHEMA_VERSION:
+                        raise schema.SchemaVersionError(
+                            f"store at schema {stored}, code at {schema.CURRENT_SCHEMA_VERSION}: "
+                            "run `tradepartner ingest` without --dry-run first"
+                        )
+            else:
+                store_migrate.migrate(s)
+        except (
+            schema.SchemaVersionError,
+            store_backup_module.BackupError,
+            StoreLockedError,
+        ) as exc:
+            if scheduled_ingest:
+                heartbeat.ping(s, "ingest", ok=False)
+            raise _fail(_scrubbed(f"refused: {exc}", s), 1) from None
+        if fill_holes_ and start is not None and dry_run:  # fetches nothing: no secret needed
+            listed = fill_holes(
+                s,
+                prices=_NoPrices(),
+                since=start,
+                clock=clock,
+                dry_run=True,
+                securities=named,
+            )
+            _print_holes(listed)
+            raise typer.Exit(listed.exit_code)
         if import_dir is not None:  # no request: no secret needed
             try:
                 imported = import_assets(s, import_dir, clock=clock, dry_run=dry_run)
@@ -2466,13 +2767,6 @@ def make_app(
                 raise _fail(f"--import-dir: {exc}", USAGE_ERROR) from None
             _print_import(imported)
             raise typer.Exit(imported.exit_code)
-        missing = _missing_secrets(s, source)
-        if missing:
-            raise _fail(
-                f"missing required secret(s): {', '.join(missing)}. "
-                "Set them in .env (see .env.example).",
-                USAGE_ERROR,
-            )
         if actions_backfill:
             assert start is not None
             result = ingest_actions_backfill(
@@ -2511,6 +2805,11 @@ def make_app(
             reuse_cached=bulk_from_cache,
             event_forms=s.edgar.event_forms,
         )
+        if sec_forms_only:
+            show_ingest_progress()
+            result = ingest_sec_forms(s, filings, clock=clock)
+            _print_result(result)
+            raise typer.Exit(result.exit_code)
         prices = (
             price_source(s)
             if price_source
@@ -2687,6 +2986,160 @@ def make_app(
         except ValueError as exc:
             raise _fail(f"refused: {exc}", USAGE_ERROR) from None
         typer.echo(result.summary())
+
+    @app.command("recheck-form4-multi-owner")
+    def recheck_form4_multi_owner_command(
+        output: Annotated[Path | None, typer.Option(help="JSON manifest path")] = None,
+        max_requests: Annotated[
+            int | None, typer.Option(help="request budget, required for recheck")
+        ] = None,
+        from_quarter: Annotated[
+            str | None, typer.Option(help="first filing quarter, YYYYqN")
+        ] = None,
+        to_quarter: Annotated[str | None, typer.Option(help="last filing quarter, YYYYqN")] = None,
+        resume_file: Annotated[
+            Path | None, typer.Option("--resume", help="partial manifest to resume")
+        ] = None,
+        count_only: Annotated[bool, typer.Option(help="estimate without SEC requests")] = False,
+    ) -> None:
+        """Count or recheck stored bulk multi-owner Form 4 filings against SEC XML."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            counts = count_form4_multi_owner(s, from_quarter=from_quarter, to_quarter=to_quarter)
+            total = sum(counts.values())
+            if count_only:
+                for quarter, count in counts.items():
+                    typer.echo(f"{quarter}: {count} accessions, at least {2 * count} requests")
+                typer.echo(
+                    f"total: {total} accessions, at least {2 * total} requests; "
+                    "allow headroom for retries"
+                )
+                return
+            if output is None or max_requests is None:
+                raise _fail("--output and --max-requests are required", USAGE_ERROR)
+            summary = recheck_form4_multi_owner(
+                s,
+                output,
+                max_requests=max_requests,
+                from_quarter=from_quarter,
+                to_quarter=to_quarter,
+                resume=resume_file,
+                client=edgar_client,
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RequestBudgetStopped:
+            assert output is not None
+            raise _fail(
+                f"request budget reached; partial manifest kept at {output}; "
+                f"re-run with --resume {output}",
+                1,
+            ) from None
+        except (MultiOwnerRepairRefused, OSError, ValueError) as exc:
+            raise _fail(f"recheck refused: {exc}", 1) from None
+        digest = form4_multi_owner_manifest_digest(output)
+        typer.echo(f"manifest: {output}; sha256 {digest}")
+        typer.echo(f"summary: {output.with_suffix('.summary.json')}; {summary['counts']}")
+        typer.echo(f"XML cache: {summary['cache_dir']}/form4_multi_owner")
+
+    @app.command("repair-form4-multi-owner")
+    def repair_form4_multi_owner_command(
+        manifest: Annotated[Path, typer.Option(help="reviewed XML recheck manifest")],
+        release: Annotated[str, typer.Option(help="the open data release")],
+        expect_rows: Annotated[int, typer.Option(help="expected changed-row count")],
+        dry_run: Annotated[bool, typer.Option(help="count changes without writing")] = False,
+    ) -> None:
+        """Apply only the XML-confirmed role changes under an open release."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            count = apply_form4_multi_owner_repair(
+                s, manifest, release, expect_rows, dry_run=dry_run, clock=clock
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except (MultiOwnerRepairRefused, ValueError) as exc:
+            raise _fail(f"repair refused: {exc}", 1) from None
+        typer.echo(f"form4 multi-owner: {count} rows {'would change' if dry_run else 'changed'}")
+
+    @app.command("repair-form4-roles")
+    def repair_form4_roles_command(
+        manifest: Annotated[Path, typer.Option(help="reviewed JSON manifest")],
+        release: Annotated[str, typer.Option(help="the open data release")],
+        expect_rows: Annotated[int, typer.Option(help="the dry run's changed-row count")],
+        dry_run: Annotated[bool, typer.Option(help="count changes without writing")] = False,
+    ) -> None:
+        """Repair bulk Form 4 roles against the cached zip and a reviewed manifest."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            count = apply_form4_roles_repair(
+                s, manifest, release, expect_rows, dry_run=dry_run, clock=clock
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RoleRepairRefused as exc:
+            raise _fail(f"repair refused: {exc}", 1) from None
+        typer.echo(f"form4 roles: {count} rows {'would change' if dry_run else 'changed'}")
+
+    @app.command("build-form4-roles-manifest")
+    def build_form4_roles_manifest_command(
+        zip_dir: Annotated[Path, typer.Option(help="directory of cached *_form345.zip files")],
+        output: Annotated[Path, typer.Option(help="reviewable JSON manifest path")],
+    ) -> None:
+        """Build a role repair manifest from the store and cached SEC zips."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            count = build_form4_roles_manifest(s, sorted(zip_dir.glob("*_form345.zip")), output)
+        except (StoreLockedError, ValueError, OSError) as exc:
+            raise _fail(f"manifest refused: {exc}", 1) from None
+        typer.echo(f"form4 roles manifest: {count} rows")
+
+    @app.command("repair-form4-titles")
+    def repair_form4_titles_command(
+        manifest: Annotated[Path, typer.Option(help="reviewed JSON manifest")],
+        release: Annotated[str, typer.Option(help="the open data release")],
+        expect_rows: Annotated[int, typer.Option(help="the dry run's changed-row count")],
+        dry_run: Annotated[bool, typer.Option(help="count changes without writing")] = False,
+    ) -> None:
+        """Repair CSV-quoted bulk Form 4 titles against a reviewed manifest."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            count = apply_form4_titles_repair(
+                s, manifest, release, expect_rows, dry_run=dry_run, clock=clock
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except TitleRepairRefused as exc:
+            raise _fail(f"repair refused: {exc}", 1) from None
+        typer.echo(f"form4 titles: {count} rows {'would change' if dry_run else 'changed'}")
+
+    @app.command("build-form4-titles-manifest")
+    def build_form4_titles_manifest_command(
+        output: Annotated[Path, typer.Option(help="reviewable JSON manifest path")],
+        zip_dir: Annotated[
+            Path | None, typer.Option(help="directory of cached *_form345.zip files")
+        ] = None,
+    ) -> None:
+        """Build a title repair manifest from the store and cached SEC zips."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            cache_dir = zip_dir if zip_dir is not None else Path(s.edgar.cache_dir) / "insider"
+            count = build_form4_titles_manifest(s, sorted(cache_dir.glob("*_form345.zip")), output)
+        except (StoreLockedError, ValueError, OSError) as exc:
+            raise _fail(f"manifest refused: {exc}", 1) from None
+        digest = form4_titles_manifest_sha256(output)
+        typer.echo(f"form4 titles manifest: {count} rows; sha256 {digest}")
 
     @app.command("repair-dividends")
     def repair_dividends(
@@ -3041,6 +3494,7 @@ def make_app(
         expected_warnings = (
             (1 if _quarantined(report) > 0 else 0)
             + (1 if report.duplicate_dividends.pending else 0)
+            + len(report.incremental_edgar.warnings)
             + chain_breaks
             + (1 if (disk_warning := low_disk_warning(s)) is not None else 0)
         )
@@ -3062,6 +3516,7 @@ def make_app(
                 "(`tradepartner repair-dividends`); each still counts its payment twice",
                 err=True,
             )
+        warnings += len(report.incremental_edgar.warnings)
         for row in report.successor_chains.frame.filter(pl.col("price_break")).iter_rows(
             named=True
         ):
@@ -3812,8 +4267,12 @@ def make_app(
         split: Annotated[str, typer.Option(help="the split to bind")],
         config: Annotated[Path, typer.Option(help="the run's config, a JSON object file")],
         configurations: Annotated[
-            int, typer.Option(help="configurations this run will evaluate")
-        ] = 1,
+            int | None,
+            typer.Option(
+                help="configurations this run will evaluate (default: the file's "
+                "study.configurations, else 1)"
+            ),
+        ] = None,
         spend_holdout: Annotated[
             bool, typer.Option(help="open a run touching a protected window (needs a reason)")
         ] = False,
@@ -3830,13 +4289,16 @@ def make_app(
             raise _fail("--holdout-reason goes with --spend-holdout", USAGE_ERROR)
         if holdout_repeat and not spend_holdout:
             raise _fail("--holdout-repeat goes with --spend-holdout", USAGE_ERROR)
-        if configurations < 1:
+        if configurations is not None and configurations < 1:
             raise _fail("--configurations must be at least 1", USAGE_ERROR)
         s = settings()
         run_config = _read_config(config, s)
         try:
             with open_for_write(s) as conn:
                 schema.init_schema(conn)
+                declared = _declared_configurations(
+                    research.get_registration(conn, slug), configurations
+                )
                 handle = research.open_run(
                     conn,
                     slug,
@@ -3847,7 +4309,7 @@ def make_app(
                     note,
                     flags=ResearchFlags(spend_holdout=spend_holdout, holdout_repeat=holdout_repeat),
                     reasons=ResearchReasons(holdout_reason=holdout_reason),
-                    configurations=configurations,
+                    configurations=declared,
                     settings=s,
                 )
                 listed = research.list_runs(conn, registration=handle.slug)
@@ -3890,6 +4352,13 @@ def make_app(
         except _RESEARCH_REFUSALS as exc:
             raise _refusal(exc, s) from None
         typer.echo(f"run {run}: abandoned ({handle.slug})")
+
+    @experiment_app.command("study")
+    def experiment_study(
+        run: Annotated[int, typer.Option(help="the unfinished run to study")],
+    ) -> None:
+        """Run the event-study runner on an open run and record its result."""
+        _experiment_study(settings(), run)
 
     @app.command()
     def experiments(
@@ -4557,12 +5026,7 @@ def make_app(
     ) -> None:
         """Migrate or refuse after option validation, before journal or broker work."""
         if not read_only:
-
-            def migrate() -> None:
-                with open_for_write(s) as conn:
-                    schema.init_schema(conn)
-
-            _paper_call(s, migrate)
+            _paper_call(s, lambda: store_migrate.migrate(s))
             return
 
         def read_version() -> int | None:
@@ -4592,7 +5056,7 @@ def make_app(
             found = "no schema" if version is None else f"schema {version}"
             message = (
                 f"store at {found}, code at {schema.CURRENT_SCHEMA_VERSION}: "
-                "run `tradepartner ingest` or any paper write command to migrate"
+                "run `tradepartner ingest` or a paper write command to migrate"
             )
         raise _fail(_scrubbed(message, s), refusal_exit)
 
@@ -4603,16 +5067,27 @@ def make_app(
     def paper_start(
         hypothesis: Annotated[str, typer.Option(help="the registered hypothesis slug")],
         book: Annotated[str | None, _BOOK_OPTION] = None,
+        now: Annotated[
+            bool, typer.Option("--now", help="start the sandbox book from the latest close")
+        ] = False,
     ) -> None:
         """Open a paper window for a signed-off hypothesis in the book (spec req 14)."""
         chosen = _checked_book(book)
         s = paper_settings()
         paper_schema_gate(s)
         bk = _resolve_book(s, chosen)
+        if now and bk != "sandbox":
+            raise _fail("--now is only for book 'sandbox' on a marked temp copy", USAGE_ERROR)
         result = _paper_call(
             s,
             lambda: window.start(
-                s, lambda: open_read_only(s), broker(s, clock, bk), clock, hypothesis, book_id=bk
+                s,
+                lambda: open_read_only(s),
+                broker(s, clock, bk),
+                clock,
+                hypothesis,
+                book_id=bk,
+                now=now,
             ),
         )
         opened = result.window
@@ -4907,6 +5382,16 @@ def make_app(
                 f"{m.residue_term:.6f} cost {m.modelled_cost:.6f}"
                 f"{' excluded' if m.excluded else ''}{' missed' if m.missed else ''}"
                 f"{' override' if m.override else ''} {'pass' if m.passed else 'FAIL'}"
+                + (
+                    f" (residue untradable: {', '.join(m.residue_untradable)})"
+                    if m.residue_untradable
+                    else ""
+                )
+                + (
+                    f" (residue trued up: {', '.join(m.residue_trued_up)})"
+                    if m.residue_trued_up
+                    else ""
+                )
                 for m in comparison.periods
             ),
             *(
@@ -5029,21 +5514,21 @@ def make_app(
                     ops.OwnerQueue,
                     tuple[ops.OverdueDelisting, ...],
                     ops.EdgarAge | None,
+                    datetime,
                 ]
                 | str
             ):
                 with open_read_only(s) as conn:
                     try:
-                        summaries = ops.book_summaries(conn, s)
-                        queue = ops.owner_queue(
-                            conn, s, ensure_tz_aware_utc(clock(), field_name="clock()")
-                        )
                         now = ensure_tz_aware_utc(clock(), field_name="clock()")
+                        summaries = ops.book_summaries(conn, s, now=now)
+                        queue = ops.owner_queue(conn, s, now)
                         return (
                             summaries,
                             queue,
                             ops.overdue_delisting_cash(conn),
                             ops.edgar_age(conn, s, now),
+                            now,
                         )
                     except schema.SchemaVersionError as exc:
                         return str(exc)
@@ -5052,16 +5537,15 @@ def make_app(
             if isinstance(result, str):  # the journal predates version 17
                 _echo_scrubbed(f"paper status: {result}", s)
                 raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
-            summaries, queue, overdue, edgar = result
+            summaries, queue, overdue, edgar, now = result
             items = queue.items
-            now = ensure_tz_aware_utc(clock(), field_name="clock()")
             overdue_lines = _overdue_delisting_lines(overdue)
             edgar_lines = _edgar_age_lines(edgar)
             # the open span's progress (#2298): not a problem, so not an item
             progress_lines = [queue.shakedown_progress] if queue.shakedown_progress else []
             if not summaries:  # no window yet: nothing to lead with
                 for line in (
-                    *_summary_lines(summaries),
+                    *_summary_lines(summaries, now),
                     *overdue_lines,
                     *edgar_lines,
                     *_waiting_lines(items),
@@ -5075,14 +5559,16 @@ def make_app(
                 *progress_lines,
                 *overdue_lines,
                 *edgar_lines,
-                *_summary_lines(summaries),
+                *_summary_lines(summaries, now),
             ):
                 _echo_scrubbed(line, s)
             return
 
         def read() -> tuple[ops.OpsData, paper_slippage.Slippage | None]:
             with open_read_only(s) as conn:
-                page = ops.page_data(conn, s, chosen)
+                page = ops.page_data(
+                    conn, s, chosen, now=ensure_tz_aware_utc(clock(), field_name="clock()")
+                )
                 window_id = page.window.window_id if page.window is not None else None
                 if window_id is None or page.journal_outdated is not None:
                     return page, None

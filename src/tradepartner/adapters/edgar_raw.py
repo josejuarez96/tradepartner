@@ -46,6 +46,15 @@ streamed `GET`, each attempt and retry still behind `_RateLimiter`:
   still corrupt after that raises `zipfile.BadZipFile`. Each download is
   checked in its temp file before it replaces the cached zip, so a corrupt
   one never overwrites the previous good copy (#761).
+- **The nightly bulk zips** (`submissions.zip`, `companyfacts.zip`; #2594)
+  are fetched with a conditional `GET`: the validators (`Last-Modified`,
+  `ETag`) of the copy already cached are kept in a sidecar beside it
+  (`_validators_path`, bound to the zip by its size and `st_mtime_ns`),
+  sent as `If-Modified-Since` / `If-None-Match`, and a `304` keeps the
+  cached zip untouched. A missing, unreadable or mismatched sidecar sends
+  an unconditional `GET`, as before. The FSN and insider zips
+  are not fetched this way: their callers `HEAD` first and compare against
+  their own manifests.
 
 Every public function takes an optional `client: httpx.Client` so tests
 can inject an `httpx.MockTransport`-backed client without any real
@@ -55,6 +64,9 @@ callers omit it and get the module's shared, lazily-built client.
 
 from __future__ import annotations
 
+import gzip
+import hashlib
+import json
 import math
 import os
 import re
@@ -63,13 +75,18 @@ import threading
 import time
 import zipfile
 import zlib
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 from pydantic import SecretStr
 
+from tradepartner.adapters.daily_index import DAILY_FORM_NAME, DailyIndexFile
 from tradepartner.config import Settings, get_settings
 
 #: `429`/`503`: SEC's standard "back off" statuses, retried with capped
@@ -259,6 +276,21 @@ def _backoff_seconds(
     )
 
 
+_retry_observer: ContextVar[Callable[[], None] | None] = ContextVar(
+    "edgar_retry_observer", default=None
+)
+
+
+@contextmanager
+def observe_retries(observer: Callable[[], None]) -> Iterator[None]:
+    """Count actual retry waits for one caller without changing the shared limiter."""
+    token = _retry_observer.set(observer)
+    try:
+        yield
+    finally:
+        _retry_observer.reset(token)
+
+
 class _RetryPolicy:
     """One request's retry state and decisions (see the module docstring),
     shared by `_execute_with_retry` and the streamed `GET` in
@@ -282,6 +314,8 @@ class _RetryPolicy:
         if self._attempt + 1 >= self._settings.edgar.retry_max_attempts:
             return False
         time.sleep(_backoff_seconds(self._attempt, self._settings, None))
+        if observer := _retry_observer.get():
+            observer()
         self._attempt += 1
         return True
 
@@ -300,6 +334,8 @@ class _RetryPolicy:
         if status in _TRANSIENT_STATUS_CODES:
             if self._attempt + 1 < self._settings.edgar.retry_max_attempts:
                 time.sleep(_backoff_seconds(self._attempt, self._settings, response))
+                if observer := _retry_observer.get():
+                    observer()
                 self._attempt += 1
                 return True
             if status == _BLOCK_429_STATUS_CODE:
@@ -318,6 +354,8 @@ class _RetryPolicy:
         self._rate_limit_waited = True
         _RATE_LIMIT_BLOCK.set()
         time.sleep(self._settings.edgar.rate_limit_wait_seconds)
+        if observer := _retry_observer.get():
+            observer()
         return True
 
 
@@ -481,6 +519,161 @@ def company_facts(
     return response.json()
 
 
+_DAILY_INDEX_ROOT = "https://www.sec.gov/Archives/edgar/daily-index"
+
+
+def _index_period(year: int, quarter: int) -> str:
+    from tradepartner.adapters.edgar_source import CENSUS_FIRST_YEAR
+
+    if year < CENSUS_FIRST_YEAR or quarter not in (1, 2, 3, 4):
+        raise ValueError(f"invalid EDGAR index quarter: {year} QTR{quarter}")
+    return f"{year}/QTR{quarter}"
+
+
+def daily_index_file_path(
+    year: int, quarter: int, name: str, *, settings: Settings | None = None
+) -> Path:
+    """Validated local path for one cached daily form index."""
+    period = _index_period(year, quarter)
+    match = DAILY_FORM_NAME.fullmatch(name)
+    if match is None or int(match[1]) != year or (int(match[2]) - 1) // 3 + 1 != quarter:
+        raise InvalidFilingReferenceError(f"not a daily form file for {period}: {name!r}")
+    settings = settings or get_settings()
+    return Path(settings.edgar.cache_dir) / "daily-index" / period / name
+
+
+def daily_index_listing(
+    year: int,
+    quarter: int,
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> Any:
+    """SEC's JSON quarter directory listing, fetched through the shared limiter."""
+    period = _index_period(year, quarter)
+    settings = settings or get_settings()
+    return _get(f"{_DAILY_INDEX_ROOT}/{period}/index.json", settings=settings, client=client).json()
+
+
+def daily_index_file(
+    year: int,
+    quarter: int,
+    file: DailyIndexFile,
+    *,
+    refresh: bool = False,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> Path:
+    """Cache a listed daily file; preserve old raw bytes when SEC re-posts it.
+
+    The caller must pass a file from `parse_daily_listing`, so no guessed date
+    reaches the request. Its opaque listing fields determine cache freshness.
+    """
+    settings = settings or get_settings()
+    dest = daily_index_file_path(year, quarter, file.name, settings=settings)
+    period = _index_period(year, quarter)
+    if file.path != f"daily-index/{period}/{file.name}":
+        raise InvalidFilingReferenceError(f"daily index path does not match {file.name!r}")
+    sidecar = dest.with_name(f"{dest.name}.listing.json")
+    cursor = {"last_modified": file.last_modified, "size": file.size}
+    if dest.is_file() and sidecar.is_file() and not refresh:
+        try:
+            if sidecar.stat().st_size > _VALIDATORS_SIDECAR_MAX_BYTES:
+                raise ValueError("daily index sidecar too large")
+            saved = json.loads(sidecar.read_text())
+            stat = dest.stat()
+            if (
+                isinstance(saved, dict)
+                and all(saved.get(key) == value for key, value in cursor.items())
+                and saved.get("body_size") == stat.st_size
+                and saved.get("body_mtime_ns") == stat.st_mtime_ns
+            ):
+                return dest
+        except (OSError, ValueError):
+            pass
+    response = _get(f"{_DAILY_INDEX_ROOT}/{period}/{file.name}", settings=settings, client=client)
+    body = response.content
+    if dest.is_file():
+        old = dest.read_bytes()
+        if old != body:
+            snapshot = dest.with_name(f"{dest.name}.{hashlib.sha256(old).hexdigest()}.snapshot")
+            if not snapshot.is_file():
+                write_atomic(snapshot, old)
+    if not dest.is_file() or old != body:
+        write_atomic(dest, body)
+    stat = dest.stat()
+    write_atomic(
+        sidecar,
+        json.dumps(
+            {**cursor, "body_size": stat.st_size, "body_mtime_ns": stat.st_mtime_ns}
+        ).encode(),
+    )
+    return dest
+
+
+def cached_daily_index_files(
+    year: int,
+    quarter: int,
+    names: Iterable[str],
+    *,
+    settings: Settings | None = None,
+) -> tuple[Path, ...]:
+    """Read cached daily files for a rebuild; fail closed when one is missing."""
+    settings = settings or get_settings()
+    paths = tuple(daily_index_file_path(year, quarter, name, settings=settings) for name in names)
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    return paths
+
+
+def cached_quarterly_index(
+    year: int,
+    quarter: int,
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> tuple[Path, bool]:
+    """Conditionally fetch a settled quarter; retain changed old bodies by hash.
+
+    Call for settled quarters only. Return the rebuild cache path and whether
+    decoded bytes changed. A 304 leaves it untouched; a differing 200 replaces it.
+    """
+    period = _index_period(year, quarter)
+    settings = settings or get_settings()
+    dest = Path(settings.edgar.cache_dir) / "index" / f"{year}-QTR{quarter}.idx.gz"
+    headers = _conditional_headers(dest, archive_kind="gzip")
+    url = f"https://www.sec.gov/Archives/edgar/full-index/{period}/form.idx"
+    try:
+        response = _get(url, settings=settings, extra_headers=headers, client=client)
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code != httpx.codes.NOT_MODIFIED:
+            raise
+        response = error.response
+        _RATE_LIMIT_BLOCK.clear()
+    if response.status_code == httpx.codes.NOT_MODIFIED:
+        if not headers or not dest.is_file():
+            raise ValueError("quarterly index returned 304 without a cached validated copy")
+        return dest, False
+    body = response.content
+    if dest.is_file():
+        old_encoded = dest.read_bytes()
+        try:
+            old = gzip.decompress(old_encoded)
+        except (OSError, EOFError, zlib.error):
+            old = None
+        if old == body:
+            _write_validators(dest, response.headers)
+            return dest, False
+        digest = hashlib.sha256(old if old is not None else old_encoded).hexdigest()
+        snapshot = dest.with_name(f"{dest.name}.{digest}.snapshot")
+        if not snapshot.is_file():
+            write_atomic(snapshot, gzip.compress(old, mtime=0) if old is not None else old_encoded)
+    write_atomic(dest, gzip.compress(body, mtime=0))
+    _write_validators(dest, response.headers)
+    return dest, True
+
+
 def filing_index_quarter(
     year: int,
     qtr: int,
@@ -537,6 +730,57 @@ def _filing_url(cik: str, accession: str, filename: str) -> str:
         f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/"
         f"{accession.replace('-', '')}/{filename}"
     )
+
+
+def _filing_xml_url(cik: str, accession: str, filename: str) -> str:
+    if not re.fullmatch(r"\d{1,10}", cik):
+        raise InvalidFilingReferenceError(f"filing CIK must be digits, got {cik!r}")
+    _validate_accession(accession)
+    _validate_relative_filename(filename)
+    if not filename.lower().endswith(".xml"):
+        raise InvalidFilingReferenceError(f"filing document is not XML: {filename!r}")
+    return _filing_url(cik, accession, filename)
+
+
+def filing_xml(
+    cik: str,
+    accession: str,
+    filename: str,
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> str:
+    """Fetch one accession's XML through the shared EDGAR limiter and retry policy."""
+    url = _filing_xml_url(cik, accession, filename)
+    settings = settings or get_settings()
+    return _get(url, settings=settings, client=client).text
+
+
+@dataclass(frozen=True)
+class FetchedXml:
+    """One fetched filing XML (plan T348): its URL, the response's exact bytes (the
+    body kept before parse), the decoded text the parser reads, as `filing_xml`
+    returns it, and the UTC time the response arrived."""
+
+    url: str
+    body: bytes
+    text: str
+    fetched_at: datetime
+
+
+def fetch_filing_xml(
+    cik: str,
+    accession: str,
+    filename: str,
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> FetchedXml:
+    """`filing_xml`'s one request, keeping the raw bytes, URL and fetch time."""
+    url = _filing_xml_url(cik, accession, filename)
+    settings = settings or get_settings()
+    response = _get(url, settings=settings, client=client)
+    return FetchedXml(url, response.content, response.text, datetime.now(UTC))
 
 
 def filing_index(
@@ -691,8 +935,9 @@ def download_filing_file(
 def _stream_to(url: str, dest: Path, *, settings: Settings, client: httpx.Client | None) -> Path:
     """Stream `url` to `dest` behind the throttle and `User-Agent`, the
     module's retry policy, and one re-download if it arrives corrupt, through
-    a temp file and `os.replace`."""
-    return _stream_to_with_headers(url, dest, settings=settings, client=client)[0]
+    a temp file and `os.replace`; a conditional `GET` against the cached copy,
+    kept as it is on a `304` (#2594)."""
+    return _stream_to_with_headers(url, dest, settings=settings, client=client, conditional=True)[0]
 
 
 def _write_stream_to_temp(dest: Path, chunks: Iterable[bytes]) -> Path:
@@ -711,14 +956,18 @@ def _write_stream_to_temp(dest: Path, chunks: Iterable[bytes]) -> Path:
     return Path(tmp)
 
 
-def _replace_if_valid_zip(tmp: Path, dest: Path) -> bool:
+def _replace_if_valid_zip(tmp: Path, dest: Path, *, stale: Path | None = None) -> bool:
     """Move `tmp` over `dest` if it is a sound zip and return `True`; else
     delete it and return `False`, leaving any previous `dest` in place
     (#761: the check runs before `os.replace`, never after). `tmp` is gone
-    either way, including on an error."""
+    either way, including on an error. `stale` (the old copy's validators
+    sidecar, #2594) is deleted just before the replace, so it never describes
+    a zip it was not written for."""
     try:
         if _zip_is_corrupt(tmp):
             return False
+        if stale is not None:
+            stale.unlink(missing_ok=True)
         os.replace(tmp, dest)
         return True
     finally:
@@ -739,8 +988,92 @@ def _zip_is_corrupt(path: Path) -> bool:
         return True
 
 
+#: The response validators a conditional bulk `GET` keeps (#2594), as
+#: `(sidecar key, response header, request header)`.
+_VALIDATORS = (
+    ("last_modified", "Last-Modified", "If-Modified-Since"),
+    ("etag", "ETag", "If-None-Match"),
+)
+
+
+#: A validators sidecar holds a size and two short header values; anything
+#: larger is not one this module wrote, and is refused before it is parsed.
+_VALIDATORS_SIDECAR_MAX_BYTES = 4096
+
+
+def _usable_validator(value: object) -> bool:
+    """Whether `value` may go into a request header: a non-blank, printable
+    ASCII string (so never a CR/LF or other control character)."""
+    return (
+        isinstance(value, str) and bool(value.strip()) and value.isascii() and value.isprintable()
+    )
+
+
+def _validators_path(dest: Path) -> Path:
+    """The sidecar beside a cached bulk zip holding its response validators
+    and size (#2594); kept next to the file, never in the store."""
+    return dest.with_name(f"{dest.name}.validators.json")
+
+
+def _conditional_headers(dest: Path, *, archive_kind: str = "zip") -> dict[str, str]:
+    """`If-Modified-Since` / `If-None-Match` for the archive cached at `dest`, from
+    its sidecar. Empty headers request an unconditional GET when the cached
+    archive, its sidecar, or its validators are absent or invalid. The size
+    cap and size/mtime binding prevent a stale sidecar from validating a
+    replaced file. `archive_kind` selects zip or gzip integrity checking."""
+    sidecar_path = _validators_path(dest)
+    try:
+        if sidecar_path.stat().st_size > _VALIDATORS_SIDECAR_MAX_BYTES:
+            return {}
+        sidecar = json.loads(sidecar_path.read_text())
+        stat = dest.stat()
+        if archive_kind == "zip":
+            with zipfile.ZipFile(dest):
+                pass
+        elif archive_kind == "gzip":
+            gzip.decompress(dest.read_bytes())
+        else:
+            raise ValueError(f"unknown archive kind: {archive_kind}")
+    except (OSError, ValueError, RecursionError, zipfile.BadZipFile, EOFError, zlib.error):
+        return {}
+    if (
+        not isinstance(sidecar, dict)
+        or sidecar.get("size") != stat.st_size
+        or sidecar.get("mtime_ns") != stat.st_mtime_ns
+    ):
+        return {}
+    present = {
+        request_header: sidecar[key]
+        for key, _response_header, request_header in _VALIDATORS
+        if sidecar.get(key) is not None
+    }
+    if not all(_usable_validator(value) for value in present.values()):
+        return {}
+    return present
+
+
+def _write_validators(dest: Path, headers: httpx.Headers) -> None:
+    """Record the validators of the zip just written to `dest` in its sidecar
+    (atomically), or leave none when the response sent no validator or any
+    validator that is not printable ASCII (`_usable_validator`)."""
+    validators = {
+        key: value
+        for key, response_header, _request_header in _VALIDATORS
+        if (value := headers.get(response_header, "").strip())
+    }
+    if validators and all(_usable_validator(value) for value in validators.values()):
+        stat = dest.stat()
+        payload = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, **validators}
+        write_atomic(_validators_path(dest), json.dumps(payload).encode())
+
+
 def _stream_to_with_headers(
-    url: str, dest: Path, *, settings: Settings, client: httpx.Client | None
+    url: str,
+    dest: Path,
+    *,
+    settings: Settings,
+    client: httpx.Client | None,
+    conditional: bool = False,
 ) -> tuple[Path, httpx.Headers]:
     """As `_stream_to`, but also returns the response headers (T11c: `Last-
     Modified`, `ETag` and `Content-Length` go into the FSN period manifest).
@@ -754,6 +1087,12 @@ def _stream_to_with_headers(
     `dest` (if any) untouched (#761). The
     status and transport-error decisions are `_RetryPolicy`'s, the same as
     every other request here.
+
+    With `conditional` (#2594) the request carries the cached copy's
+    validators (`_conditional_headers`); a `304` returns `dest` as it stands,
+    with no write, and a `200` that replaces `dest` records its validators
+    for the next run. A `304` to a request that sent no validator raises, as
+    any other unexpected status.
     """
     headers = {"User-Agent": _user_agent(settings)}
     http_client = (
@@ -762,6 +1101,9 @@ def _stream_to_with_headers(
     timeout = settings.edgar.request_timeout_seconds
     min_interval_seconds = 1.0 / settings.edgar.requests_per_second
     dest.parent.mkdir(parents=True, exist_ok=True)
+    validator_headers = _conditional_headers(dest) if conditional else {}
+    headers.update(validator_headers)
+    sent_validator = bool(validator_headers)
 
     policy = _RetryPolicy(settings)
     zip_redownloaded = False
@@ -769,6 +1111,9 @@ def _stream_to_with_headers(
         _LIMITER.wait(min_interval_seconds)
         try:
             with http_client.stream("GET", url, headers=headers, timeout=timeout) as response:
+                if sent_validator and response.status_code == httpx.codes.NOT_MODIFIED:
+                    _RATE_LIMIT_BLOCK.clear()
+                    return dest, response.headers
                 if policy.retry_after_response(response):
                     continue
                 response_headers = response.headers
@@ -778,11 +1123,17 @@ def _stream_to_with_headers(
                 continue
             raise
 
-        if not _replace_if_valid_zip(tmp, dest):
+        stale = _validators_path(dest) if conditional else None
+        if not _replace_if_valid_zip(tmp, dest, stale=stale):
             if zip_redownloaded:
                 raise zipfile.BadZipFile(f"{dest} still corrupt after one re-download")
             zip_redownloaded = True
             continue
+        if conditional:
+            # The zip is already in place; a sidecar that cannot be written only
+            # costs the next run an unconditional `GET`, never this download.
+            with suppress(OSError):
+                _write_validators(dest, response_headers)
         return dest, response_headers
 
 
@@ -894,9 +1245,16 @@ def fsn_validators(
 
 # --- SEC insider transactions data sets (T305b, #2498) -----------------------
 
-_INSIDER_BULK_URL = (
+#: Where SEC serves a quarter's zip, tried in order; the first non-404 wins. The
+#: data-set page lists 2006q1 to 2026q1 under `structureddata` and 2026q2 onward under
+#: `datastandardsinnovation` (#2728: 2026q2 404'd on the first path only and was
+#: counted as a missing quarter). The legacy path goes first: it holds every quarter
+#: but the newest, so a run pays one extra request per quarter published after the move.
+_INSIDER_BULK_URLS = (
     "https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/"
-    "{quarter}_form345.zip"
+    "{quarter}_form345.zip",
+    "https://www.sec.gov/files/datastandardsinnovation/data/insider-transactions-data-sets/"
+    "{quarter}_form345.zip",
 )
 _INSIDER_QUARTER_RE = re.compile(r"\d{4}q[1-4]")
 
@@ -915,19 +1273,40 @@ def insider_bulk_zip(
     `<quarter>_form345.zip`) into `edgar.cache_dir/insider/`; returns its path and
     response headers (`Last-Modified`, `Content-Length`), through
     `_stream_to_with_headers`: the shared limiter, the one retry policy and the zip
-    CRC check. A 404 returns `None`: the quarter is not published (the caller decides
-    whether that is the current quarter or a missing one). Any other failure raises."""
+    CRC check. Each of `_INSIDER_BULK_URLS` is tried in turn; a 404 on every one returns
+    `None`: the quarter is not published (the caller decides whether that is the current
+    quarter or a missing one). Any other failure raises."""
     _validate_insider_quarter(quarter)
     settings = settings or get_settings()
     dest = Path(settings.edgar.cache_dir) / "insider" / f"{quarter}_form345.zip"
-    try:
-        return _stream_to_with_headers(
-            _INSIDER_BULK_URL.format(quarter=quarter), dest, settings=settings, client=client
-        )
-    except httpx.HTTPStatusError as error:
-        if error.response.status_code == httpx.codes.NOT_FOUND:
-            return None
-        raise
+    for template in _INSIDER_BULK_URLS:
+        url = template.format(quarter=quarter)
+        try:
+            fetched = _stream_to_with_headers(url, dest, settings=settings, client=client)
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code != httpx.codes.NOT_FOUND:
+                raise
+            continue
+        # Plan T348: the URL, UTC fetch time and SHA-256 of these bytes, for the
+        # Form 4 writer's manifest (`form4_bulk_route.insider_zip_fetch`); the hash
+        # ties the record to the bytes, so a stale record is never cited.
+        digest = hashlib.sha256()
+        with fetched[0].open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        stamp = {
+            "url": url,
+            "fetched_at": datetime.now(UTC).isoformat(),
+            "sha256": digest.hexdigest(),
+        }
+        write_atomic(insider_fetch_path(dest), json.dumps(stamp).encode())
+        return fetched
+    return None
+
+
+def insider_fetch_path(zip_path: Path) -> Path:
+    """The fetch record beside an insider zip: `<quarter>_form345.fetch.json`."""
+    return zip_path.with_name(zip_path.name.removesuffix(".zip") + ".fetch.json")
 
 
 def insider_bulk_validators(
@@ -935,33 +1314,40 @@ def insider_bulk_validators(
 ) -> httpx.Headers | None:
     """An unconditional `HEAD` of one quarter's insider zip behind the same limiter,
     retry and `User-Agent`; returns the validators (`Last-Modified`, `ETag`,
-    `Content-Length`) the cached zip is compared with, or `None` on a 404."""
+    `Content-Length`) the cached zip is compared with, or `None` when every one of
+    `_INSIDER_BULK_URLS` is a 404."""
     _validate_insider_quarter(quarter)
     settings = settings or get_settings()
-    url = _INSIDER_BULK_URL.format(quarter=quarter)
     headers = {"User-Agent": _user_agent(settings)}
     http_client = (
         client if client is not None else _default_client(settings.edgar.request_timeout_seconds)
     )
     timeout = settings.edgar.request_timeout_seconds
-    try:
-        response = _execute_with_retry(
-            lambda: http_client.request("HEAD", url, headers=headers, timeout=timeout),
-            settings=settings,
-            min_interval_seconds=1.0 / settings.edgar.requests_per_second,
-        )
-    except httpx.HTTPStatusError as error:
-        if error.response.status_code == httpx.codes.NOT_FOUND:
-            return None
-        raise
-    return response.headers
+
+    def head(url: str) -> Callable[[], httpx.Response]:
+        return lambda: http_client.request("HEAD", url, headers=headers, timeout=timeout)
+
+    for template in _INSIDER_BULK_URLS:
+        try:
+            response = _execute_with_retry(
+                head(template.format(quarter=quarter)),
+                settings=settings,
+                min_interval_seconds=1.0 / settings.edgar.requests_per_second,
+            )
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code != httpx.codes.NOT_FOUND:
+                raise
+            continue
+        return response.headers
+    return None
 
 
 def bulk_submissions(
     *, settings: Settings | None = None, client: httpx.Client | None = None
 ) -> Path:
     """The nightly `submissions.zip` (every CIK's submissions and older pages,
-    rebuilt about 03:00 ET), streamed to `edgar.cache_dir/bulk/submissions.zip`."""
+    rebuilt about 03:00 ET), streamed to `edgar.cache_dir/bulk/submissions.zip`
+    with a conditional `GET`: a `304` keeps the cached copy (#2594)."""
     settings = settings or get_settings()
     return _stream_to(
         "https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip",
@@ -977,7 +1363,8 @@ def bulk_company_facts(
     client: httpx.Client | None = None,
     reuse_cached: bool = False,
 ) -> Path:
-    """The nightly `companyfacts.zip`, streamed to `edgar.cache_dir/bulk/companyfacts.zip`.
+    """The nightly `companyfacts.zip`, streamed to `edgar.cache_dir/bulk/companyfacts.zip`
+    with a conditional `GET`: a `304` keeps the cached copy (#2594).
 
     With `reuse_cached` (`ingest --bulk-from-cache`, #660) the file already
     there is returned as it stands with no request, provided it opens as a

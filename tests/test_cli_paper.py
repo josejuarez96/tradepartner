@@ -45,6 +45,7 @@ from tradepartner.execution.lock import run_lock
 from tradepartner.execution.lots_reconcile import BrokerLotRow
 from tradepartner.execution.wrapper import WRITE_FAILED_EXIT_CODE
 from tradepartner.store import journal, registry, schema
+from tradepartner.store import migrate as store_migrate
 from tradepartner.store.db import open_for_write
 from tradepartner.store.journal import (
     DecisionRow,
@@ -503,7 +504,7 @@ NO_WINDOW = cli.PAPER_REFUSAL_EXIT["no_window"]
 #: Every `paper` command's exact options (spec req 16: no endpoint, run-session,
 #: store-path or bypass flag; `override --session` is the override's rebalance session).
 PAPER_OPTIONS = {
-    "start": {"--hypothesis", "--book"},
+    "start": {"--hypothesis", "--book", "--now"},
     "stop": {"--reason", "--book"},
     "run": {"--book"},
     "reconcile": {"--book"},
@@ -893,10 +894,11 @@ def _downgrade_to_34(path: Path) -> None:
 
 @pytest.mark.usefixtures("started")
 def test_resume_migrates_old_store_before_journaling(
-    live: Path, clock: _Clock, factory: _Factory
+    live: Path, clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     assert _paper(clock, factory, "kill", "--reason", LONG_REASON).exit_code == 0
     _downgrade_to_34(live)
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
 
     out = _paper(clock, factory, "resume", "--reason", LONG_REASON)
 
@@ -917,18 +919,58 @@ def test_resume_migration_failure_precedes_journal_and_broker(
     _downgrade_to_34(live)
     calls_before = factory.fake.calls
 
-    def fail_migration(_conn: duckdb.DuckDBPyConnection) -> None:
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+
+    def fail_migration(_settings: Settings) -> None:
         raise schema.SchemaVersionError("migration failed")
 
-    monkeypatch.setattr(schema, "init_schema", fail_migration)
+    monkeypatch.setattr(store_migrate, "migrate", fail_migration)
     out = _paper(clock, factory, "resume", "--reason", LONG_REASON)
 
-    assert out.exit_code != 0
+    assert out.exit_code == REFUSED
     assert "migration failed" in out.output
     assert factory.fake.calls == calls_before
     with duckdb.connect(str(live), read_only=True) as conn:
         assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (34,)
         assert conn.execute("SELECT COUNT(*) FROM resume_invocations").fetchone() == (0,)
+
+
+@pytest.mark.usefixtures("started")
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("start", "--hypothesis", "h1"),
+        ("stop", "--reason", LONG_REASON),
+        ("run",),
+        ("reconcile",),
+        ("resume", "--reason", LONG_REASON),
+        ("abandon", "--reason", LONG_REASON),
+        ("settle", "--order", "order-1", "--reason", LONG_REASON),
+        ("override", "--kind", "exclude_name", "--reason", LONG_REASON),
+        ("override", "--kind", "keep_name", "--reason", LONG_REASON),
+    ],
+)
+def test_paper_write_commands_refuse_when_migration_refuses(
+    live: Path,
+    clock: _Clock,
+    factory: _Factory,
+    monkeypatch: pytest.MonkeyPatch,
+    args: tuple[str, ...],
+) -> None:
+    _downgrade_to_34(live)
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+
+    def refuse(_settings: Settings) -> None:
+        raise schema.SchemaMigrationRequiredError("migration refused")
+
+    monkeypatch.setattr(store_migrate, "migrate", refuse)
+    calls_before = factory.fake.calls
+    out = _paper(clock, factory, *args)
+    assert out.exit_code == REFUSED, (args, out.output)
+    assert "migration refused" in out.output
+    assert factory.fake.calls == calls_before
+    with duckdb.connect(str(live), read_only=True) as conn:
+        assert schema.stored_version(conn) == 34
 
 
 @pytest.mark.usefixtures("started")
@@ -946,6 +988,32 @@ def test_read_only_paper_command_refuses_old_store_without_writing(
     assert "tradepartner ingest" in out.output
     assert _sha256(live) == before
     assert factory.fake.calls == calls_before
+
+
+@pytest.mark.usefixtures("started")
+@pytest.mark.parametrize(
+    "args", [("report",), ("check",), ("shakedown",), ("status",), ("lots-reconcile",)]
+)
+def test_read_only_paper_commands_refuse_older_store(
+    live: Path,
+    export_file: Path,
+    clock: _Clock,
+    factory: _Factory,
+    monkeypatch: pytest.MonkeyPatch,
+    args: tuple[str, ...],
+) -> None:
+    _downgrade_to_34(live)
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+    before = _sha256(live)
+    command_args = (
+        (*args, "--export", str(export_file), "--tax-year", "2025")
+        if args[0] == "lots-reconcile"
+        else args
+    )
+    out = _paper(clock, factory, *command_args)
+    expected = EXIT["schema_version"] if args[0] == "lots-reconcile" else REFUSED
+    assert out.exit_code == expected, (args, out.output)
+    assert _sha256(live) == before
 
 
 @pytest.mark.usefixtures("started")
@@ -980,6 +1048,31 @@ def test_kill_switch_override_survives_migration_failure(
 
     assert out.exit_code == 0, out.output
     assert _count("overrides") == 1
+
+
+@pytest.mark.usefixtures("started")
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("kill", "--reason", LONG_REASON),
+        ("kill", "--all", "--reason", LONG_REASON),
+        ("override", "--kind", "engage_kill_switch", "--reason", LONG_REASON),
+    ],
+)
+def test_emergency_paper_commands_skip_migration(
+    live: Path,
+    clock: _Clock,
+    factory: _Factory,
+    monkeypatch: pytest.MonkeyPatch,
+    args: tuple[str, ...],
+) -> None:
+    _downgrade_to_34(live)
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+    monkeypatch.setattr(store_migrate, "migrate", lambda _: pytest.fail("migration called"))
+    out = _paper(clock, factory, *args)
+    assert out.exit_code == 0, (args, out.output)
+    with duckdb.connect(str(live), read_only=True) as conn:
+        assert schema.stored_version(conn) == 34
 
 
 @pytest.mark.usefixtures("started")
@@ -1857,7 +1950,6 @@ def test_status_prints_alert_ids_for_each_book(clock: _Clock, factory: _Factory)
 def test_status_all_prints_one_summary_line_per_book(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:
-    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
     b_window = _open_book_b()
     out = _paper(clock, factory, "status", "--all")
     assert out.exit_code == 0, out.output
@@ -1964,7 +2056,6 @@ _EDGAR_LINE_3 = (
 def test_status_stays_quiet_below_the_edgar_age_limit(
     clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
     _edgar_run(datetime(2026, 9, 28, 22, tzinfo=UTC))  # covers 09-28: 2 sessions by 10-01
     for args in (("status",), ("status", "--all")):
         out = _paper(clock, factory, *args)
@@ -1976,7 +2067,6 @@ def test_status_stays_quiet_below_the_edgar_age_limit(
 def test_status_shows_edgar_data_three_sessions_old(
     clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
     _edgar_run(datetime(2026, 9, 25, 22, tzinfo=UTC))  # covers 09-25: 3 sessions by 10-01
     out = _paper(clock, factory, "status")
     assert out.exit_code == 0, out.output
@@ -1991,7 +2081,6 @@ def test_status_shows_edgar_data_three_sessions_old(
 def test_edgar_age_ignores_failed_and_other_source_runs_and_resets_on_an_ok_run(
     clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
     _edgar_run(datetime(2026, 9, 25, 22, tzinfo=UTC))
     _edgar_run(datetime(2026, 9, 30, 22, tzinfo=UTC), status="failed")
     _edgar_run(datetime(2026, 9, 30, 22, tzinfo=UTC), source="alpaca")
@@ -2028,7 +2117,6 @@ def test_edgar_age_counts_sessions_not_weekdays_across_thanksgiving(
 def test_status_names_no_edgar_ingest_without_an_ok_run(
     clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
     _edgar_run(datetime(2026, 9, 30, 22, tzinfo=UTC), status="failed")
     _edgar_run(datetime(2026, 9, 30, 22, tzinfo=UTC), source="alpaca")
     for args in (("status",), ("status", "--all")):
@@ -2075,6 +2163,19 @@ def test_status_all_shows_a_secret_in_the_kill_reason_scrubbed(
     assert out.exit_code == 0, out.output
     assert "reason given: stop key" in out.output
     assert secret not in out.output
+
+
+@pytest.mark.usefixtures("started")
+def test_status_all_reads_the_injected_clock_not_the_wall_clock(
+    clock: _Clock, factory: _Factory
+) -> None:
+    """#2655: `paper status --all` names the next rebalance after the command's
+    clock, here pinned in January 2027, whatever month the wall clock is in."""
+    clock.now = datetime(2027, 1, 5, 15, tzinfo=UTC)
+    out = _paper(clock, factory, "status", "--all")
+    assert out.exit_code == 0, out.output
+    assert "next rebalance 2027-01-29 (data day; trades the next session)" in out.output
+    assert "next rebalance 2026-" not in out.output
 
 
 @pytest.mark.usefixtures("started")
@@ -2151,7 +2252,7 @@ def test_status_summary_labels_completed_rebalance_and_fill_lag(
 ) -> None:
     """A fill-session run names its own rebalance and whether it placed orders."""
     run_at = datetime.combine(fill_day, datetime.min.time(), tzinfo=UTC) + timedelta(hours=14)
-    monkeypatch.setattr(ops, "utc_now", lambda: run_at)
+    clock.now = run_at
     with open_for_write(_settings()) as conn:
         window = journal.latest_window(conn, "main")
         assert window is not None and window.window_id is not None
@@ -2338,6 +2439,16 @@ def test_report_passes_the_book_and_prints_the_same_lines(
     assert (plain.exit_code, plain.output) == (0, expected)
     assert (for_b.exit_code, for_b.output) == (0, expected)
     assert books == [None, "b"]
+    flagged = replace(canned.comparison.periods[0], residue_untradable=("0001739445",))
+    canned = replace(canned, comparison=replace(canned.comparison, periods=(flagged,)))
+    flagged_out = _paper(clock, factory, "report")
+    assert flagged_out.exit_code == 0
+    assert "(residue untradable: 0001739445)" in flagged_out.output
+    trued_up = replace(canned.comparison.periods[0], residue_trued_up=("0001739445",))
+    canned = replace(canned, comparison=replace(canned.comparison, periods=(trued_up,)))
+    trued_up_out = _paper(clock, factory, "report")
+    assert trued_up_out.exit_code == 0
+    assert "(residue trued up: 0001739445)" in trued_up_out.output
 
 
 def test_short_report_prints_dividends_and_headline_fee(
@@ -2649,7 +2760,7 @@ def test_paper_shakedown_exits_zero_when_every_line_passes_on_a_read_only_store(
 def test_status_all_on_an_outdated_journal_is_refused_not_a_crash(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:
-    def outdated(*_args: Any) -> Any:
+    def outdated(*_args: Any, **_kwargs: Any) -> Any:
         raise schema.SchemaVersionError("the journal predates schema version 17")
 
     monkeypatch.setattr(ops, "book_summaries", outdated)
@@ -2787,6 +2898,31 @@ def test_book_sandbox_on_a_store_outside_temp_is_refused_before_any_broker(
     assert _sha256(store) == before
 
 
+@pytest.mark.parametrize("book", ["main", "daily"])
+def test_paper_start_now_refuses_real_books_without_a_store_write(
+    clock: _Clock, factory: _Factory, book: str
+) -> None:
+    store = Path(_settings().store.path)
+    before = _sha256(store)
+    out = _paper(clock, factory, "start", "--hypothesis", "h1", "--book", book, "--now")
+    assert out.exit_code == 2, out.output
+    assert "--now is only for book 'sandbox'" in out.output
+    assert factory.clocks == []
+    assert _sha256(store) == before
+
+
+def test_paper_start_now_refuses_unmarked_sandbox_store_without_a_write(
+    clock: _Clock, factory: _Factory
+) -> None:
+    store = Path(_settings().store.path)
+    before = _sha256(store)
+    out = _paper(clock, factory, "start", "--hypothesis", "h1", "--book", "sandbox", "--now")
+    assert out.exit_code == 2, out.output
+    assert "temp copy" in out.output
+    assert factory.clocks == []
+    assert _sha256(store) == before
+
+
 @pytest.mark.parametrize("args", [["--book", "sandbox"], ["--book", "main"], []])
 def test_paper_run_on_a_marked_sandbox_copy_is_refused_unless_book_sandbox_is_valid(
     clock: _Clock,
@@ -2808,3 +2944,54 @@ def test_paper_run_on_a_marked_sandbox_copy_is_refused_unless_book_sandbox_is_va
     assert "--book:" in out.output
     assert factory.clocks == []
     assert _sha256(store) == before
+
+
+def test_status_line_shows_the_net_positions_value() -> None:
+    """The `positions` line prints long minus short (#2561); a long-only value
+    prints as before."""
+    from tradepartner.execution.ops import OpsData
+
+    data = OpsData(
+        window=_window(1, datetime(2026, 10, 1, 14, 0, tzinfo=UTC)),
+        positions_count=2,
+        positions_value=60.0,
+    )
+    assert "positions 2 (value 60.00); open orders 0; targets 0" in cli._status_lines(data)[2]
+
+
+def test_status_hides_phase_notes_but_shows_other_run_notes() -> None:
+    from tradepartner.execution.ops import OpsData
+
+    raw = "paper_phase first=1; check fill; paper_phase last=2"
+    data = OpsData(
+        window=_window(1, datetime(2026, 10, 1, 14, 0, tzinfo=UTC)),
+        last_run_message=raw,
+    )
+    lines = cli._status_lines(data)
+    assert "last run: check fill" in lines
+    assert "paper_phase" not in "\n".join(lines)
+    assert "last run:" not in "\n".join(
+        cli._status_lines(replace(data, last_run_message="paper_phase first=1"))
+    )
+    assert data.last_run_message == raw
+
+
+def test_status_all_hides_phase_notes_but_keeps_other_run_notes() -> None:
+    row = SimpleNamespace(
+        book_id="main",
+        window=SimpleNamespace(window_id=1),
+        is_open=True,
+        positions_count=0,
+        open_orders_count=0,
+        switch_state=SimpleNamespace(engaged=False, run_in_progress=False),
+        last_run_status="ok",
+        last_run_kind="tracking",
+        last_run_session=None,
+        last_run_has_orders=False,
+        next_rebalance_session=None,
+        last_run_message="paper_phase started=1; check fill; paper_phase finished=2",
+    )
+    assert cli._summary_lines((row,), SESSION_CLOCK)[0].endswith("; check fill")
+    row.last_run_message = "paper_phase started=1"
+    assert "check fill" not in cli._summary_lines((row,), SESSION_CLOCK)[0]
+    assert "paper_phase" not in cli._summary_lines((row,), SESSION_CLOCK)[0]

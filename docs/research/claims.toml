@@ -3237,6 +3237,17 @@ source = "docs/research/2026-10-28-c1-filing-delay-results.md; docs/experiments/
 bears_on = ["backlog:C1"]
 note = "Registry runs: C1 run 2 (vs SPY; superseded, size and beta not signal) and C1b run 3 (artifact data/research/c1b-filing-delay-matched/c1b-filing-delay-matched-run3.json, t_min long -1.46, short -2.78). Retired by the owner 2026-10-27, killed on survivor data (#2371, #2411)."
 
+[[claim]]
+id = "TP-9"
+statement = "The B7 registered event study of opportunistic officer/director Form 4 code-P purchases is INSUFFICIENT under its own feasibility gate: on a complete snapshot (0 of 32 quarters 2016Q1-2023Q4 below the T343 ratio), the $200M stratum has at most 47 opportunistic events in the 2020-2023 window against the frozen 400 floor and no Form 25 delisted security in its treated pool, while all names has 2,882 (0.6% missing entry bars, treated and neutral delister coverage 100% and 93.6%); the frozen line needs both strata, so B7 was retired by the owner on 2026-10-31 without a return run."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "Counts and coverage only, no return read: T342 recount (recount.py sha256 9dcb98de00428c2e6c22c47214a1222238186d16ec4868abaee5c746fef13c15) on a byte copy of the owner's store taken 2026-10-31 21:18 New York, after the 20:11 backfill run and before the #2720 roles correction; n is an upper bound (no_mcap and no_beta drops not applied); frozen design from the 2026-10-31 desk read and the owner's T343 answers, no value changed"
+source = "docs/research/2026-11-form4-insider-feasibility-recount.md"
+section = "Answer"
+bears_on = ["backlog:B7"]
+note = "Family N not charged (owner, 2026-10-31, 'Go with recs': no run opened, no return read). Leaves G2-B (MIXED) and G2-A (NOT SUPPORTED) as graded; it says nothing about the size of the effect, only that the frozen test cannot be decided in this store's window. T332 to T341 and T344 are struck by a follow-up plan PR. A later insider-purchase test needs a new registration."
+
 # ===== 2026-10-11-sharadar-overlap-test.md =====
 
 [[claim]]
@@ -3346,3 +3357,14 @@ scope = "free-model EDGAR list `sc13d.csv` joined to the store copy on CIK; comm
 source = "docs/research/2026-10-28-strategy-frontier-verified.md"
 section = "Lead-by-lead table"
 note = "TP- result (own query). The 13D forms are not in the store; the list came from EDGAR by the overnight job."
+
+[[claim]]
+id = "TP-FC-1"
+statement = "Over the paper sessions of 2026-10-20, 10-26 and 10-27, per order against the arrival price, buys cost +38.9 bp (95% +31.9 to +46.8) and sells +9.5 bp (+1.8 to +20.2), +24.2 bp per side (+18.9 to +30.6), above B10's 12 bp rung-1 line; in names over $200M daily dollar volume it is +10.6 bp (+6.0 to +15.4) against arrival, equal-weighted, and +17.9 bp (+11.3 to +24.4) against the open as currently executed; buys fill 375 to 618 s after the open on rebalance days because the run submits them only after every sell is terminal."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "593 orders, 918 fills, paper simulator, 3 sessions (10-20 buys only, $494 each; 10-26 and 10-27 mostly $1-50); arrival = SIP NBBO mid at submitted_at for post-open orders, SIP open for pre-open orders; order-level iid bootstrap, a lower bound on the uncertainty"
+source = "docs/research/2026-10-30-paper-fill-cost-arrival.md"
+section = "Rung-1 figures (one bootstrap run, seed 26082)"
+bears_on = ["backlog:B10", "adr:0023", "spec:paper-trading"]
+note = "TP- result (own query). Paper fills do not measure live slippage. Refines TP-FV-3 (vs the open): the buy drift between the open and the submit, +16.4 bp on two sessions, was positive on both sessions (+30.8 bp over $200M), sign in general untested. The buy delay is the two-phase design (paper-trading spec req 3), not the broker."

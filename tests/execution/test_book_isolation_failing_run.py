@@ -4,7 +4,10 @@ unchanged (#2459; ADR 0017 B.3, ADR 0015 seam 1).
 Two books share one store, each with an open rebalance window and its own
 account and scripted fake. Book A's broker raises on `submit`; both books run.
 Book B's orders, fills and fake-broker call log must equal a baseline run of B
-alone (same setup, A never runs), and no row of A carries B's account.
+alone (same setup, A never runs), and no row of A carries B's account. The
+monitoring reads (`ops.book_summaries`, behind `paper status --all` and the
+operations page, and `ops.waiting_on_owner`) mark A failed and B not, and B's
+next run is valid (#2602).
 
 The harness is `test_run_trade.py`'s `Env`, one per book on one store copy.
 Ids (`run_id`, `decision_id`, ...) legitimately differ between the two runs
@@ -24,7 +27,10 @@ import pytest
 
 from tradepartner.adapters.broker import OrderRequest
 from tradepartner.adapters.fake_broker import FakeBroker
+from tradepartner.calendar import next_session
 from tradepartner.config import Settings
+from tradepartner.execution import ops
+from tradepartner.store.db import open_read_only, utc_now
 
 from .test_run_trade import (
     BROKER_ASSETS,
@@ -266,3 +272,100 @@ def test_book_bs_buys_left_open_by_an_earlier_window_still_count_and_as_never_do
     assert len(orders) == 3
     assert windows == {first_window}, "B's buys come from its earlier window, not the new one"
     assert all(o.book_id == BOOK_B for o in orders)
+
+
+def _a_failed_then_b_ran(fixture_store_path: Path, tmp_path: Path) -> tuple[Env, Env]:
+    a, b = _two_books(fixture_store_path, tmp_path)
+    _fail_a_submit(a)
+    with pytest.raises(SubmitDown):
+        a.run(NOW)
+    assert b.run(NOW).status == "ok"
+    return a, b
+
+
+def test_status_and_ops_summaries_mark_book_a_failed_and_book_b_not(
+    fixture_store_path: Path, tmp_path: Path
+) -> None:
+    """#2602: the one-row-per-book summary that `paper status --all` and
+    the operations page print shows A's run halted, its switch engaged by A's own
+    fault, and B's run ok, its switch not engaged."""
+    _, b = _a_failed_then_b_ran(fixture_store_path, tmp_path)
+    with open_read_only(b.settings) as conn:
+        summaries = {s.book_id: s for s in ops.book_summaries(conn, b.settings, now=utc_now())}
+    assert set(summaries) == {BOOK_A, BOOK_B}
+    a_row, b_row = summaries[BOOK_A], summaries[BOOK_B]
+
+    assert a_row.last_run_status == "halted"
+    assert a_row.switch_state.engaged
+    assert a_row.switch_state.engaged_row is not None
+    assert a_row.switch_state.engaged_row.fault_type == SubmitDown.__name__
+    assert a_row.window.account_id == ACCOUNT_A
+
+    assert b_row.last_run_status == "ok"
+    assert b_row.last_run_has_orders
+    assert not b_row.switch_state.engaged
+    assert b_row.switch_state.causes == ()
+    assert b_row.window.account_id == ACCOUNT_B
+
+
+def test_waiting_on_owner_names_book_a_and_nothing_for_book_b(
+    fixture_store_path: Path, tmp_path: Path
+) -> None:
+    """#2602: the "waiting on me" read, at the next session's open (both
+    books ran on its S-1, so no `missed_run`), holds A's kill switch, with A's
+    resume command, and no item for B."""
+    _, b = _a_failed_then_b_ran(fixture_store_path, tmp_path)
+    with open_read_only(b.settings) as conn:
+        items = ops.waiting_on_owner(conn, b.settings, at(next_session(F_0), 13, 0))
+    assert [(i.book_id, i.kind) for i in items] == [(BOOK_A, "kill_switch_engaged")]
+    (item,) = items
+    assert "SubmitDown" in item.detail
+    assert item.command is not None and f"--book {BOOK_A}" in item.command
+
+
+def test_book_bs_next_run_after_book_as_failure_is_valid(
+    fixture_store_path: Path, tmp_path: Path
+) -> None:
+    """B's due rebalance after A fails submits its own plan once, then stays valid."""
+    a, b = _two_books(fixture_store_path, tmp_path)
+    a_attempts = _fail_a_submit(a)
+    with pytest.raises(SubmitDown):
+        a.run(NOW)
+    assert a_attempts
+    assert not b.submits()
+
+    outcome = b.run(NOW)
+    assert outcome.status == "ok", b.result(b.latest_run())
+    assert outcome.kind == "rebalance"
+    assert not outcome.engaged
+    status, fault, message = b.result(outcome.run_id)
+    # Only timing notes (#2620) may ride on an ok rebalance's message.
+    assert (status, fault) == ("ok", None)
+    assert all(part.startswith("paper_phase ") for part in (message or "").split("; ") if part)
+    ((planned,),) = b.query("SELECT n_targets FROM paper_plans WHERE run_id = ?", [outcome.run_id])
+    b_submits = b.submits()
+    b_ids = [request.client_order_id for request in b_submits]
+    a_ids = {request.client_order_id for request in a_attempts}
+    assert planned == len(b_submits) == 3
+    assert len(set(b_ids)) == len(b_ids)
+    assert all(f"-{BOOK_B}-" in cid for cid in b_ids)
+    assert not (set(b_ids) & a_ids)
+    journal_ids = {
+        row[0]
+        for row in b.query("SELECT client_order_id FROM orders WHERE run_id = ?", [outcome.run_id])
+    }
+    assert journal_ids == set(b_ids)
+
+    orders_before = b.query("SELECT client_order_id FROM orders ORDER BY 1")
+    held_before = b.held()
+    follow_up = b.run(at(next_session(F_0)))
+    assert follow_up.status == "ok", b.result(b.latest_run())
+    assert len(b.submits()) == planned, "the follow-up sends no duplicate orders"
+    assert b.query("SELECT client_order_id FROM orders ORDER BY 1") == orders_before
+    assert b.held() == held_before
+
+    with open_read_only(b.settings) as conn:
+        summaries = {s.book_id: s for s in ops.book_summaries(conn, b.settings, now=utc_now())}
+    assert not summaries[BOOK_B].switch_state.engaged
+    assert summaries[BOOK_B].last_run_status == "ok"
+    assert summaries[BOOK_A].switch_state.engaged
