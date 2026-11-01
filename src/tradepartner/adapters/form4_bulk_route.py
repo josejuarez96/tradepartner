@@ -147,7 +147,17 @@ def load_bulk_quarters(
 
 
 def order_check_path(settings: Settings, quarter: Quarter, digest: str) -> Path:
-    """Cache marker keyed by zip bytes and every parser version affecting parity."""
+    """Cache marker keyed by zip bytes and every parser version affecting parity.
+
+    A marker from an older version (`BULK_READER_VERSION`, the parsers, the multi-owner
+    switch) no longer matches, so the quarter's order is checked again on purpose
+    (#2728): the reader that wrote the marker is not the one about to write bulk rows.
+    The re-check is bounded to the leftovers: the sample is drawn only from the
+    quarter's queued accessions (stored ones are skipped before the route, and a
+    quarter with none queued is not read at all), at most `form4_bulk_order_sample`
+    XML requests per quarter, and a passing sample writes the new marker. The sample
+    is deterministic, so a quarter whose leftovers mismatch stays held each run.
+    """
     from tradepartner.adapters.edgar_source import PARSER_VERSION
 
     label = f"{quarter.year}q{quarter.number}"
