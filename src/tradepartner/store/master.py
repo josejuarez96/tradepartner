@@ -159,7 +159,7 @@ from collections import defaultdict
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 import polars as pl
@@ -1043,6 +1043,22 @@ def _first_per_line(entries: Iterable[CompanySnapshotEntry]) -> tuple[CompanySna
     return tuple(first.values())
 
 
+def _filing_index_for_cik(source: FilingSource, cik: str) -> list[FilingIndexEntry]:
+    """Use a store-backed CIK query when the source offers one."""
+    reader = getattr(source, "filing_index_for_cik", None)
+    if callable(reader):
+        return cast(list[FilingIndexEntry], reader(cik))
+    return [entry for entry in source.filing_index() if entry.cik == cik]
+
+
+def _filing_index_for_forms(source: FilingSource, forms: Collection[str]) -> list[FilingIndexEntry]:
+    """Use a store-backed cross-CIK form query when offered."""
+    reader = getattr(source, "filing_index_for_forms", None)
+    if callable(reader):
+        return cast(list[FilingIndexEntry], reader(forms))
+    return [entry for entry in source.filing_index() if entry.form in forms]
+
+
 def build_master(
     source: FilingSource,
     settings: Settings,
@@ -1182,7 +1198,11 @@ def build_chains(
     entries = parse_chains(settings.master.chains)
     if not entries:
         return ChainBuild((), ())
-    index = {(entry.cik, entry.accession): entry for entry in source.filing_index()}
+    index = {
+        (entry.cik, entry.accession): entry
+        for successor_cik in {security_cik(successor) for _, successor, _ in entries}
+        for entry in _filing_index_for_cik(source, successor_cik)
+    }
     securities = {row["security_id"]: row for row in master.securities}
     listings: dict[str, list[Row]] = defaultdict(list)
     for row in master.listings:
@@ -1298,7 +1318,7 @@ def chain_candidates(
     taken = {successor for _, successor, _ in entries}
     dismissed = set(settings.master.chains_dismissed)
     window = settings.master.chain_window_sessions
-    filers = {item.cik for item in source.filing_index() if item.form in SUCCESSOR_EVIDENCE_FORMS}
+    filers = {item.cik for item in _filing_index_for_forms(source, SUCCESSOR_EVIDENCE_FORMS)}
     if not filers:
         return ()
     listings: dict[str, list[Row]] = defaultdict(list)
