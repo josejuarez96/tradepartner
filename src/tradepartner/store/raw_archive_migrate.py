@@ -117,7 +117,7 @@ def _fsync_dir(directory: Path) -> None:
 
 
 def _read_lines(path: Path) -> list[dict[str, Any]]:
-    """The records of an append-only JSON-lines file; a torn last line is dropped."""
+    """The records of an append-only JSON-lines file; a torn line is skipped."""
     if not path.exists():
         return []
     out: list[dict[str, Any]] = []
@@ -125,7 +125,7 @@ def _read_lines(path: Path) -> list[dict[str, Any]]:
         try:
             out.append(json.loads(line))
         except json.JSONDecodeError:
-            break
+            continue  # a torn line (a cut write); the lines after it still count
     return out
 
 
@@ -133,6 +133,8 @@ def _append(path: Path, *records: dict[str, Any]) -> None:
     """Append and fsync the records (and the directory, when the file is new)."""
     fresh = not path.exists()
     with path.open("a", encoding="utf-8") as handle:
+        if not fresh and path.stat().st_size and path.read_bytes()[-1:] != b"\n":
+            handle.write("\n")  # end a torn line so the next record starts clean
         for record in records:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
         handle.flush()
@@ -241,6 +243,8 @@ def apply_migration(
             settled(planned.path, _settle(settings, cache_dir, icloud, intent, sha))
 
     if not intents:  # nothing to move: leave no trace
+        if len(_read_lines(journal)) != 1:
+            raise MigrationStoppedError("the journal holds records but names no file")
         journal.unlink()
         return MigrationResult(run_id=run, manifest_sha256="")
 

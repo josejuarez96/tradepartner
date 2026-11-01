@@ -307,3 +307,24 @@ def test_a_rerun_with_nothing_to_move_changes_nothing(rig: Rig) -> None:
     again = rig.run()
     assert again.states == {} and again.manifest_sha256 == ""
     assert (_end_state(rig), sorted(os.listdir(rig.cache / "_archived"))) == before
+
+
+def test_a_torn_journal_line_does_not_hide_later_records(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = rig.cache / "_archived" / "journal.jsonl"
+    journal.parent.mkdir()
+    start = {"op": "start", "run": "r1", "at": NOW.isoformat()}
+    journal.write_text(json.dumps(start) + '\n{"op": "inte')
+
+    def stop(name: str) -> None:
+        if name == "evict":
+            raise Boom
+
+    monkeypatch.setattr(raw_archive_migrate, "_step", stop)
+    with pytest.raises(Boom):
+        rig.run()
+    monkeypatch.setattr(raw_archive_migrate, "_step", lambda _n: None)
+    result = rig.run()
+    assert len(rig.index()) == 2
+    assert result.count("evicted") == 2
