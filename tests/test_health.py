@@ -278,8 +278,9 @@ def test_implausible_form4_dates_are_warning_only(fixture_store: duckdb.DuckDBPy
     accepted = datetime(2020, 6, 29, 14, tzinfo=UTC)
     later = datetime(2020, 7, 1, 14, tzinfo=UTC)
     for line, stamp, transaction_day in (
-        (0, accepted, date(2016, 6, 29)),
-        (1, later, date(2016, 7, 1)),
+        (0, accepted, date(1999, 6, 29)),
+        (1, later, date(1999, 7, 1)),
+        (2, accepted, date(2016, 6, 29)),  # four years late: plausible
     ):
         fixture_store.execute(
             "INSERT INTO sec_form4_transactions VALUES (" + ", ".join(["?"] * 23) + ")",
@@ -312,7 +313,7 @@ def test_implausible_form4_dates_are_warning_only(fixture_store: duckdb.DuckDBPy
     report = health.health_report(fixture_store, T_END, _settings())
     assert report.implausible_form4_dates == 1
     assert report.ok
-    assert fixture_store.execute("SELECT count(*) FROM sec_form4_transactions").fetchone()[0] == 2
+    assert fixture_store.execute("SELECT count(*) FROM sec_form4_transactions").fetchone()[0] == 3
 
 
 def _settings(**overrides: Any) -> Settings:

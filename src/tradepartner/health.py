@@ -87,8 +87,9 @@ here is this module's and is stated once:
   pair is listed, never silently hidden.
 - **Settings**: `universe.liquidity_rule_enabled` and `execution.fill_price`.
 - **Implausible Form 4 dates**: stored transactions known at `t` whose transaction
-  date falls outside the filing's New York acceptance-day window configured by
-  `events.form4_max_age_years`. Report-only warning; source rows stay as filed.
+  date is impossible: before `events.form4_min_transaction_date` or after the
+  filing's New York acceptance day plus `events.form4_after_acceptance_days`.
+  Report-only warning; source rows stay as filed.
 - **Statement facts** (`statement`, #660, T77c): `edgar.statement_facts_enabled`'s
   state; while it is on, `statement_coverage`'s share of `universe_as_of(T)`
   names whose issuer has a `revenue` and a `total_assets` row known at `t`
@@ -2063,7 +2064,10 @@ def health_report(
             (
                 conn.execute(
                     "SELECT count(*) FROM sec_form4_transactions WHERE known_at <= ? AND NOT ("
-                    + form4_date_plausibility_sql(settings.events.form4_max_age_years)
+                    + form4_date_plausibility_sql(
+                        settings.events.form4_min_transaction_date,
+                        settings.events.form4_after_acceptance_days,
+                    )
                     + ")",
                     [t],
                 ).fetchone()

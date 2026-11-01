@@ -621,8 +621,11 @@ class EventsConfig(_ClosedConfig):
         default_factory=lambda: ["P", "S"]
     )
     form4_bulk_order_sample: int = Field(default=20, gt=0, le=1_000)
-    # Filing-entered transaction dates may precede acceptance by this many calendar years.
-    form4_max_age_years: int = Field(default=2, gt=0)
+    # A filer-entered transaction date is implausible only when it is impossible: before this
+    # floor, or more than `form4_after_acceptance_days` after the New York acceptance day.
+    # Late filings (dated years before acceptance, after the floor) stay readable (#2754).
+    form4_min_transaction_date: date = Field(default=date(2000, 1, 1))
+    form4_after_acceptance_days: int = Field(default=0, ge=0)
     form4_multi_owner_xml: bool = True
     sec_forms_max_requests: int = Field(default=40_000, gt=0, le=200_000)
     form4_bulk_max_member_bytes: int = Field(default=1024**3, gt=0, le=8 * 1024**3)

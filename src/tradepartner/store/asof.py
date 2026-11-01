@@ -1491,18 +1491,22 @@ def sec_filing_events_as_of(
     ).pl()
 
 
-def form4_date_plausibility_sql(max_age_years: int) -> str:
-    """SQL predicate for a Form 4 date within the filing's own New York acceptance day.
+def form4_date_plausibility_sql(min_transaction_date: date, after_acceptance_days: int) -> str:
+    """SQL predicate for a Form 4 transaction date that is possible, not merely recent.
 
-    This pure expression is shared by as-of reads and health. It never uses
-    the query time or a later filing to judge a transaction date.
+    The lower bound is a configured floor (before it the date is a typo). The upper
+    bound is deliberate: a transaction cannot happen after the filing that reports it
+    was accepted (New York day, plus the configured tolerance in days). A late filing,
+    dated years before acceptance but after the floor, is plausible and stays readable.
+    This pure expression is shared by as-of reads and health. It never uses the query
+    time or a later filing to judge a transaction date.
     """
-    if max_age_years <= 0:
-        raise ValueError("max_age_years must be positive")
+    if after_acceptance_days < 0:
+        raise ValueError("after_acceptance_days must be >= 0")
     accepted_day = "CAST(accepted_at AT TIME ZONE 'America/New_York' AS DATE)"
     return (
-        f"transaction_date BETWEEN {accepted_day} - INTERVAL '{max_age_years} years' "
-        f"AND {accepted_day}"
+        f"transaction_date >= DATE '{min_transaction_date.isoformat()}' "
+        f"AND transaction_date <= {accepted_day} + INTERVAL '{int(after_acceptance_days)} days'"
     )
 
 
@@ -1544,8 +1548,11 @@ def sec_form4_transactions_as_of(
     Bulk share counts may be rounded to two decimal places. A 4/A has its own
     accession and coexists with its original; a consumer must decide how to
     treat amendments. Transaction and deemed execution dates are filer-entered
-    dates, not clocks. By default, exclude dates outside the filing's own
-    acceptance-day window. Request `with_excluded_count` for the count removed.
+    dates, not clocks. By default, exclude impossible dates: before
+    `events.form4_min_transaction_date` or after the filing's own New York acceptance day
+    plus `events.form4_after_acceptance_days`. The upper bound is deliberate (a trade
+    cannot postdate its own filing); late filings stay readable.
+    Request `with_excluded_count` for the count removed.
     """
     active_settings = settings if settings is not None else get_settings()
     _require_sec_forms_read(active_settings)
@@ -1555,7 +1562,10 @@ def sec_form4_transactions_as_of(
     if subject_cik is not None:
         subject_filter = " AND issuer_cik = ?"
         params.append(subject_cik)
-    predicate = form4_date_plausibility_sql(active_settings.events.form4_max_age_years)
+    predicate = form4_date_plausibility_sql(
+        active_settings.events.form4_min_transaction_date,
+        active_settings.events.form4_after_acceptance_days,
+    )
     base = f"FROM sec_form4_transactions WHERE known_at <= ?{subject_filter}"
     excluded = 0
     if with_excluded_count and not include_implausible:
