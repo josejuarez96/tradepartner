@@ -18,7 +18,7 @@ from tradepartner.adapters.edgar_insider_bulk import (
     _table,
 )
 from tradepartner.config import Settings
-from tradepartner.ingest import SourceRun, _write_run
+from tradepartner.ingest import SourceRun, write_run
 from tradepartner.repair import REPAIR, REPAIRED, release_refusal
 from tradepartner.store.db import open_for_write, open_read_only, utc_now
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -30,7 +30,8 @@ class RoleRepairRefused(ValueError):
     """The manifest, cached source, stored row, count, or release did not match."""
 
 
-def _sha(path: Path) -> str:
+def sha_file(path: Path) -> str:
+    """Return the SHA-256 digest of a file without loading it all at once."""
     digest = hashlib.sha256()
     with path.open("rb") as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
@@ -61,7 +62,7 @@ def build_manifest(settings: Settings, zips: Iterable[Path], output: Path) -> in
     for path in zips:
         found_zip = True
         resolved = path.resolve()
-        sha = _sha(resolved)
+        sha = sha_file(resolved)
         for key, raw in _owners(resolved).items():
             if key in owners:
                 raise RoleRepairRefused(f"owner {key} occurs in multiple zips")
@@ -134,7 +135,7 @@ def repair_form4_roles(
         try:
             path = str(Path(entry["zip"]).resolve())
             if path not in zip_hashes:
-                zip_hashes[path] = _sha(Path(path))
+                zip_hashes[path] = sha_file(Path(path))
             if zip_hashes[path] != entry["sha256"]:
                 raise RoleRepairRefused(f"zip sha256 differs: {path}")
             if path not in zip_data:
@@ -217,7 +218,7 @@ def repair_form4_roles(
             run = SourceRun(
                 "edgar", REPAIRED, 0, "", f"form4 roles: {len(changes)} rows; release {release}"
             )
-            _write_run(
+            write_run(
                 conn,
                 uuid.uuid4().hex,
                 started,

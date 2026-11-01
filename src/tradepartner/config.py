@@ -1123,6 +1123,77 @@ class ResearchConfig(BaseModel):
     claude: ResearchClaudeConfig = Field(default_factory=ResearchClaudeConfig)
 
 
+#: The cache folder that holds the moved-file tombstone index (spec amendment
+#: #2743 item 4); no migration ever moves it.
+TOMBSTONE_DIR = "_archived"
+
+
+def check_cache_relative_path(value: str, key: str) -> str:
+    """Refuse `value` unless it is a clean POSIX path relative to `edgar.cache_dir`:
+    not empty, not absolute, no `~` start, no backslash or NUL, and every
+    `/`-separated part non-blank and neither `.` nor `..` (so no leading, trailing
+    or doubled slash). Returns `value` unchanged; `key` names the source in the
+    message, never the value's directory."""
+    if not value or value.startswith(("/", "~")) or "\\" in value or "\x00" in value:
+        raise ValueError(f"{key}: {value!r} is not a path relative to the EDGAR cache")
+    for part in value.split("/"):
+        if not part.strip() or part != part.strip() or part in {".", ".."}:
+            raise ValueError(f"{key}: {value!r} is not a clean relative path")
+    return value
+
+
+class RawArchiveConfig(_ClosedConfig):
+    """The local raw archive's disk floor (plan T345, #2744; ADR 0028, Upload and
+    Disk; data-foundation spec amendment #2714 item 3).
+
+    `min_free_disk_gb` is the free space, in GB, the archive's disk must keep after
+    an archive write: the guard (`store.raw_archive_config.check_archive_write`)
+    subtracts the file's size from the free space and refuses a result below it.
+    It fails closed, so unlike `ingest.min_free_disk_gb` it cannot be 0 ("off").
+    The archive's path is not here: it is the top-level `TRADEPARTNER_RAW_ARCHIVE`
+    (`Settings.tradepartner_raw_archive`), held in `.env` only. Not frozen, part of
+    no hypothesis.
+
+    The iCloud waits (plan T346, #2751) bound how long `store.raw_archive` polls
+    for a confirmed upload before an eviction and for local copies before a
+    re-derive. Each wait is `max(<kind>_wait_min_s, transfer_wait_s_per_mb x MB)`
+    over the bytes awaited. T354 measured 20 MB uploaded in 11 s
+    (docs/research/2026-10-31-icloud-status-probe.md); the orchestrator's follow-up
+    run of 2026-11-01 05:50 UTC (`~/tradepartner-probes/icloud/evict-space-out.txt`)
+    measured 200 MB uploaded in 41 s, with free space back only after about 5 min
+    of an eviction. On an upload timeout the file stays local, counted against the floor
+    and reported pending; on a download timeout the re-derive refuses to start.
+    `poll_interval_s` spaces the status polls and `command_timeout_s` caps each
+    `osascript` or `brctl` call.
+    """
+
+    min_free_disk_gb: float = Field(default=10.0, gt=0)
+    upload_wait_min_s: float = Field(default=300.0, gt=0)
+    download_wait_min_s: float = Field(default=300.0, gt=0)
+    transfer_wait_s_per_mb: float = Field(default=0.2, ge=0)
+    poll_interval_s: float = Field(default=5.0, gt=0)
+    command_timeout_s: float = Field(default=60.0, gt=0)
+    migrate_extra_paths: list[str] = Field(default_factory=list)
+
+    @field_validator("migrate_extra_paths")
+    @classmethod
+    def _check_migrate_extra_paths(cls, value: list[str]) -> list[str]:
+        """Each entry is a clean path relative to `edgar.cache_dir` (plan T360,
+        #2758; spec amendment #2743 item 1 (c)): no absolute path, `~`, `.`, `..`,
+        backslash, empty or blank part, never the tombstone index's `_archived/`,
+        and no repeat. The value names no account, so it is a plain list."""
+        for entry in value:
+            check_cache_relative_path(entry, "raw_archive.migrate_extra_paths")
+            if entry.split("/", 1)[0] == TOMBSTONE_DIR:
+                raise ValueError(
+                    f"raw_archive.migrate_extra_paths may not name {TOMBSTONE_DIR}/, "
+                    "the tombstone index"
+                )
+        if len(set(value)) != len(value):
+            raise ValueError("raw_archive.migrate_extra_paths names a path twice")
+        return value
+
+
 class Settings(BaseSettings):
     """Root application settings, loaded from env vars and an optional `.env`."""
 
@@ -1179,6 +1250,8 @@ class Settings(BaseSettings):
     ui: UiConfig = Field(default_factory=UiConfig)
     # T305 (#2435): SEC ownership event forms; not frozen, last so no section shifts.
     events: EventsConfig = Field(default_factory=EventsConfig)
+    # T345 (#2744): the raw archive's write floor; not frozen, last so no section shifts.
+    raw_archive: RawArchiveConfig = Field(default_factory=RawArchiveConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
@@ -1213,6 +1286,12 @@ class Settings(BaseSettings):
     # real model client cannot be built (ADR 0013 point 3 (e)).
     typesafe_api_key: SecretStr | None = Field(default=None)
     research_claude_api_key: SecretStr | None = Field(default=None)
+    # T345 (#2744; ADR 0028): the local raw archive's root, env `TRADEPARTNER_RAW_ARCHIVE`,
+    # set only in `.env`. Unset or blank means the archive is off. A `SecretStr` because
+    # the path names the macOS account (and may name an iCloud folder): `repr` hides it
+    # and `secret_values` redacts it from every stored message. Read and checked only
+    # by `store/raw_archive_config.py`, never validated here (#1093).
+    tradepartner_raw_archive: SecretStr | None = Field(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         # A per-instance default (not a class-level `model_config` value) so

@@ -64,6 +64,8 @@ callers omit it and get the module's shared, lazily-built client.
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import math
 import os
@@ -76,12 +78,15 @@ import zlib
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 from pydantic import SecretStr
 
+from tradepartner.adapters.daily_index import DAILY_FORM_NAME, DailyIndexFile
 from tradepartner.config import Settings, get_settings
 
 #: `429`/`503`: SEC's standard "back off" statuses, retried with capped
@@ -514,6 +519,161 @@ def company_facts(
     return response.json()
 
 
+_DAILY_INDEX_ROOT = "https://www.sec.gov/Archives/edgar/daily-index"
+
+
+def _index_period(year: int, quarter: int) -> str:
+    from tradepartner.adapters.edgar_source import CENSUS_FIRST_YEAR
+
+    if year < CENSUS_FIRST_YEAR or quarter not in (1, 2, 3, 4):
+        raise ValueError(f"invalid EDGAR index quarter: {year} QTR{quarter}")
+    return f"{year}/QTR{quarter}"
+
+
+def daily_index_file_path(
+    year: int, quarter: int, name: str, *, settings: Settings | None = None
+) -> Path:
+    """Validated local path for one cached daily form index."""
+    period = _index_period(year, quarter)
+    match = DAILY_FORM_NAME.fullmatch(name)
+    if match is None or int(match[1]) != year or (int(match[2]) - 1) // 3 + 1 != quarter:
+        raise InvalidFilingReferenceError(f"not a daily form file for {period}: {name!r}")
+    settings = settings or get_settings()
+    return Path(settings.edgar.cache_dir) / "daily-index" / period / name
+
+
+def daily_index_listing(
+    year: int,
+    quarter: int,
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> Any:
+    """SEC's JSON quarter directory listing, fetched through the shared limiter."""
+    period = _index_period(year, quarter)
+    settings = settings or get_settings()
+    return _get(f"{_DAILY_INDEX_ROOT}/{period}/index.json", settings=settings, client=client).json()
+
+
+def daily_index_file(
+    year: int,
+    quarter: int,
+    file: DailyIndexFile,
+    *,
+    refresh: bool = False,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> Path:
+    """Cache a listed daily file; preserve old raw bytes when SEC re-posts it.
+
+    The caller must pass a file from `parse_daily_listing`, so no guessed date
+    reaches the request. Its opaque listing fields determine cache freshness.
+    """
+    settings = settings or get_settings()
+    dest = daily_index_file_path(year, quarter, file.name, settings=settings)
+    period = _index_period(year, quarter)
+    if file.path != f"daily-index/{period}/{file.name}":
+        raise InvalidFilingReferenceError(f"daily index path does not match {file.name!r}")
+    sidecar = dest.with_name(f"{dest.name}.listing.json")
+    cursor = {"last_modified": file.last_modified, "size": file.size}
+    if dest.is_file() and sidecar.is_file() and not refresh:
+        try:
+            if sidecar.stat().st_size > _VALIDATORS_SIDECAR_MAX_BYTES:
+                raise ValueError("daily index sidecar too large")
+            saved = json.loads(sidecar.read_text())
+            stat = dest.stat()
+            if (
+                isinstance(saved, dict)
+                and all(saved.get(key) == value for key, value in cursor.items())
+                and saved.get("body_size") == stat.st_size
+                and saved.get("body_mtime_ns") == stat.st_mtime_ns
+            ):
+                return dest
+        except (OSError, ValueError):
+            pass
+    response = _get(f"{_DAILY_INDEX_ROOT}/{period}/{file.name}", settings=settings, client=client)
+    body = response.content
+    if dest.is_file():
+        old = dest.read_bytes()
+        if old != body:
+            snapshot = dest.with_name(f"{dest.name}.{hashlib.sha256(old).hexdigest()}.snapshot")
+            if not snapshot.is_file():
+                write_atomic(snapshot, old)
+    if not dest.is_file() or old != body:
+        write_atomic(dest, body)
+    stat = dest.stat()
+    write_atomic(
+        sidecar,
+        json.dumps(
+            {**cursor, "body_size": stat.st_size, "body_mtime_ns": stat.st_mtime_ns}
+        ).encode(),
+    )
+    return dest
+
+
+def cached_daily_index_files(
+    year: int,
+    quarter: int,
+    names: Iterable[str],
+    *,
+    settings: Settings | None = None,
+) -> tuple[Path, ...]:
+    """Read cached daily files for a rebuild; fail closed when one is missing."""
+    settings = settings or get_settings()
+    paths = tuple(daily_index_file_path(year, quarter, name, settings=settings) for name in names)
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    return paths
+
+
+def cached_quarterly_index(
+    year: int,
+    quarter: int,
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> tuple[Path, bool]:
+    """Conditionally fetch a settled quarter; retain changed old bodies by hash.
+
+    Call for settled quarters only. Return the rebuild cache path and whether
+    decoded bytes changed. A 304 leaves it untouched; a differing 200 replaces it.
+    """
+    period = _index_period(year, quarter)
+    settings = settings or get_settings()
+    dest = Path(settings.edgar.cache_dir) / "index" / f"{year}-QTR{quarter}.idx.gz"
+    headers = _conditional_headers(dest, archive_kind="gzip")
+    url = f"https://www.sec.gov/Archives/edgar/full-index/{period}/form.idx"
+    try:
+        response = _get(url, settings=settings, extra_headers=headers, client=client)
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code != httpx.codes.NOT_MODIFIED:
+            raise
+        response = error.response
+        _RATE_LIMIT_BLOCK.clear()
+    if response.status_code == httpx.codes.NOT_MODIFIED:
+        if not headers or not dest.is_file():
+            raise ValueError("quarterly index returned 304 without a cached validated copy")
+        return dest, False
+    body = response.content
+    if dest.is_file():
+        old_encoded = dest.read_bytes()
+        try:
+            old = gzip.decompress(old_encoded)
+        except (OSError, EOFError, zlib.error):
+            old = None
+        if old == body:
+            _write_validators(dest, response.headers)
+            return dest, False
+        digest = hashlib.sha256(old if old is not None else old_encoded).hexdigest()
+        snapshot = dest.with_name(f"{dest.name}.{digest}.snapshot")
+        if not snapshot.is_file():
+            write_atomic(snapshot, gzip.compress(old, mtime=0) if old is not None else old_encoded)
+    write_atomic(dest, gzip.compress(body, mtime=0))
+    _write_validators(dest, response.headers)
+    return dest, True
+
+
 def filing_index_quarter(
     year: int,
     qtr: int,
@@ -572,6 +732,16 @@ def _filing_url(cik: str, accession: str, filename: str) -> str:
     )
 
 
+def _filing_xml_url(cik: str, accession: str, filename: str) -> str:
+    if not re.fullmatch(r"\d{1,10}", cik):
+        raise InvalidFilingReferenceError(f"filing CIK must be digits, got {cik!r}")
+    _validate_accession(accession)
+    _validate_relative_filename(filename)
+    if not filename.lower().endswith(".xml"):
+        raise InvalidFilingReferenceError(f"filing document is not XML: {filename!r}")
+    return _filing_url(cik, accession, filename)
+
+
 def filing_xml(
     cik: str,
     accession: str,
@@ -581,14 +751,36 @@ def filing_xml(
     client: httpx.Client | None = None,
 ) -> str:
     """Fetch one accession's XML through the shared EDGAR limiter and retry policy."""
-    if not re.fullmatch(r"\d{1,10}", cik):
-        raise InvalidFilingReferenceError(f"filing CIK must be digits, got {cik!r}")
-    _validate_accession(accession)
-    _validate_relative_filename(filename)
-    if not filename.lower().endswith(".xml"):
-        raise InvalidFilingReferenceError(f"filing document is not XML: {filename!r}")
+    url = _filing_xml_url(cik, accession, filename)
     settings = settings or get_settings()
-    return _get(_filing_url(cik, accession, filename), settings=settings, client=client).text
+    return _get(url, settings=settings, client=client).text
+
+
+@dataclass(frozen=True)
+class FetchedXml:
+    """One fetched filing XML (plan T348): its URL, the response's exact bytes (the
+    body kept before parse), the decoded text the parser reads, as `filing_xml`
+    returns it, and the UTC time the response arrived."""
+
+    url: str
+    body: bytes
+    text: str
+    fetched_at: datetime
+
+
+def fetch_filing_xml(
+    cik: str,
+    accession: str,
+    filename: str,
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> FetchedXml:
+    """`filing_xml`'s one request, keeping the raw bytes, URL and fetch time."""
+    url = _filing_xml_url(cik, accession, filename)
+    settings = settings or get_settings()
+    response = _get(url, settings=settings, client=client)
+    return FetchedXml(url, response.content, response.text, datetime.now(UTC))
 
 
 def filing_index(
@@ -823,23 +1015,26 @@ def _validators_path(dest: Path) -> Path:
     return dest.with_name(f"{dest.name}.validators.json")
 
 
-def _conditional_headers(dest: Path) -> dict[str, str]:
-    """`If-Modified-Since` / `If-None-Match` for the zip cached at `dest`, from
-    its sidecar; empty (an unconditional `GET`, the pre-#2594 behaviour) when
-    there is no cached zip, no readable sidecar, a sidecar whose recorded size
-    or `st_mtime_ns` is not the cached file's (so a zip replaced by hand is
-    never vouched for by the old copy's validators), a sidecar over `_VALIDATORS_SIDECAR_MAX_BYTES`,
-    any validator that is not printable ASCII (`_usable_validator`), none at
-    all, or a cached file that does not open as a zip."""
+def _conditional_headers(dest: Path, *, archive_kind: str = "zip") -> dict[str, str]:
+    """`If-Modified-Since` / `If-None-Match` for the archive cached at `dest`, from
+    its sidecar. Empty headers request an unconditional GET when the cached
+    archive, its sidecar, or its validators are absent or invalid. The size
+    cap and size/mtime binding prevent a stale sidecar from validating a
+    replaced file. `archive_kind` selects zip or gzip integrity checking."""
     sidecar_path = _validators_path(dest)
     try:
         if sidecar_path.stat().st_size > _VALIDATORS_SIDECAR_MAX_BYTES:
             return {}
         sidecar = json.loads(sidecar_path.read_text())
         stat = dest.stat()
-        with zipfile.ZipFile(dest):
-            pass
-    except (OSError, ValueError, RecursionError, zipfile.BadZipFile):
+        if archive_kind == "zip":
+            with zipfile.ZipFile(dest):
+                pass
+        elif archive_kind == "gzip":
+            gzip.decompress(dest.read_bytes())
+        else:
+            raise ValueError(f"unknown archive kind: {archive_kind}")
+    except (OSError, ValueError, RecursionError, zipfile.BadZipFile, EOFError, zlib.error):
         return {}
     if (
         not isinstance(sidecar, dict)
@@ -1085,14 +1280,33 @@ def insider_bulk_zip(
     settings = settings or get_settings()
     dest = Path(settings.edgar.cache_dir) / "insider" / f"{quarter}_form345.zip"
     for template in _INSIDER_BULK_URLS:
+        url = template.format(quarter=quarter)
         try:
-            return _stream_to_with_headers(
-                template.format(quarter=quarter), dest, settings=settings, client=client
-            )
+            fetched = _stream_to_with_headers(url, dest, settings=settings, client=client)
         except httpx.HTTPStatusError as error:
             if error.response.status_code != httpx.codes.NOT_FOUND:
                 raise
+            continue
+        # Plan T348: the URL, UTC fetch time and SHA-256 of these bytes, for the
+        # Form 4 writer's manifest (`form4_bulk_route.insider_zip_fetch`); the hash
+        # ties the record to the bytes, so a stale record is never cited.
+        digest = hashlib.sha256()
+        with fetched[0].open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        stamp = {
+            "url": url,
+            "fetched_at": datetime.now(UTC).isoformat(),
+            "sha256": digest.hexdigest(),
+        }
+        write_atomic(insider_fetch_path(dest), json.dumps(stamp).encode())
+        return fetched
     return None
+
+
+def insider_fetch_path(zip_path: Path) -> Path:
+    """The fetch record beside an insider zip: `<quarter>_form345.fetch.json`."""
+    return zip_path.with_name(zip_path.name.removesuffix(".zip") + ".fetch.json")
 
 
 def insider_bulk_validators(
