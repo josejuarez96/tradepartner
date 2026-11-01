@@ -1,4 +1,4 @@
-task: T326 (PR #2684)
+task: T326 (PR #2772)
 - T326 adds point-in-time delisting reason revisions without changing listing or execution reads (#2682).
 
 ### Added
