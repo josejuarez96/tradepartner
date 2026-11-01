@@ -40,9 +40,15 @@ _SCRIPTS = _REPO / "scripts"
 
 #: May read bodies: the helper itself, re-derive and the cache migration, whose
 #: `restore_files` copies hash-checked bodies back to the paths they came from
-#: (#2743 item 4: it is no research or backtest reader).
+#: (#2743 item 4: it is no research or backtest reader), and its two commands
+#: (`archive_cmd`, T362), which `cli.py` imports so that it names no archive module.
 _READERS_ALLOWED = frozenset(
-    {"store/raw_archive.py", "store/raw_rederive.py", "store/raw_archive_migrate.py"}
+    {
+        "store/raw_archive.py",
+        "store/raw_rederive.py",
+        "store/raw_archive_migrate.py",
+        "store/archive_cmd.py",
+    }
 )
 #: May name the archive's root and config: they define and check it.
 _ROOT_ALLOWED = frozenset({"config.py", "store/raw_archive_config.py", *_READERS_ALLOWED})

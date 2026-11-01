@@ -589,8 +589,8 @@ from tradepartner.research.labeling import frame as labeling_frame
 from tradepartner.research.labeling import gold, job, review, scoring
 from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET, REVERSED_OPTION_SET
 from tradepartner.retract import RetractRefused, master_retract
-from tradepartner.store import backup as store_backup_module
 from tradepartner.store import (
+    archive_cmd,
     journal,
     lab_queries,
     lab_registry,
@@ -599,6 +599,7 @@ from tradepartner.store import (
     research,
     schema,
 )
+from tradepartner.store import backup as store_backup_module
 from tradepartner.store import migrate as store_migrate
 from tradepartner.store.asof import ASSETS_SOURCE
 from tradepartner.store.db import (
@@ -2456,6 +2457,7 @@ def make_app(
     sweep_clock: lab.Clock | None = None,
     broker: BrokerFactory = build_broker,
     model_client: job.ClientFactory = job.CLIENT_FACTORY,
+    icloud: archive_cmd.IcloudFactory = archive_cmd.default_icloud,
 ) -> typer.Typer:
     """The `tradepartner` Typer app over the given edges (module docstring)."""
     app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
@@ -4423,6 +4425,46 @@ def make_app(
             typer.echo(f"log copy: {result.wal_copy_path}")
         typer.echo(f"manifest: {result.manifest_path}")
         typer.echo(f"code commit {result.git_commit}, schema version {result.schema_version}")
+
+    archive_app = typer.Typer(
+        no_args_is_help=True, help="Move the old EDGAR cache into the archive."
+    )
+    app.add_typer(archive_app, name="archive")
+
+    @archive_app.command("migrate-cache")
+    def archive_migrate_cache(
+        apply_: Annotated[
+            bool,
+            typer.Option("--apply", help="do it; without this flag the plan is printed only"),
+        ] = False,
+    ) -> None:
+        """Move the dead cache versions and the corpus raw files into the raw archive and
+        copy `stamps/`. A dry run unless `--apply`; `--apply` refuses while the store is in
+        use. No SEC request, no store row."""
+        s = settings()
+        try:
+            lines = archive_cmd.migrate_cache(s, icloud(s), apply=apply_)
+        except archive_cmd.REFUSALS as exc:
+            raise _fail(_scrubbed(f"migrate-cache refused: {_describe(exc)}", s), 1) from None
+        for line in lines:
+            _echo_scrubbed(line, s)
+
+    @archive_app.command("restore")
+    def archive_restore(
+        path: Annotated[str, typer.Option("--path", help="a cache-relative file or folder")],
+        run: Annotated[
+            str | None, typer.Option("--run", help="restore a whole earlier run (default: latest)")
+        ] = None,
+    ) -> None:
+        """Copy archived files back to their original paths and times. Never overwrites a
+        local file; the archive keeps its copies."""
+        s = settings()
+        try:
+            lines = archive_cmd.restore(s, icloud(s), path=path, run=run)
+        except archive_cmd.REFUSALS as exc:
+            raise _fail(_scrubbed(f"restore refused: {_describe(exc)}", s), 1) from None
+        for line in lines:
+            _echo_scrubbed(line, s)
 
     dataset_app = typer.Typer(no_args_is_help=True, help="Register research datasets.")
     app.add_typer(dataset_app, name="dataset")

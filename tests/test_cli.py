@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -2777,3 +2778,149 @@ def test_sec_forms_only_reads_no_index_quarter_before_the_backfill_start(
             ("sec_forms", "backfill")
         ]
         assert conn.execute("SELECT count(*) FROM securities").fetchone() == (0,)
+
+
+# --- archive migrate-cache and restore (plan T362, #2743) ---------------------------
+
+
+class _ArchiveRig:
+    """A cache with one file per class, a fake archive root and fake iCloud."""
+
+    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tradepartner import diskfloor
+        from tradepartner.store.raw_archive import ItemStatus
+        from tradepartner.store.raw_archive_plan import current_versions
+
+        monkeypatch.setattr(diskfloor, "free_bytes", lambda _p: 500 * 10**9)
+        monkeypatch.delenv("TRADEPARTNER_RAW_ARCHIVE", raising=False)
+        self.root = tmp_path / "icloud-root" / "archive"
+        self.root.mkdir(parents=True)
+        self.settings = _settings(
+            tmp_path,
+            tradepartner_raw_archive=str(self.root),
+            raw_archive={"upload_wait_min_s": 0.01, "download_wait_min_s": 0.05},
+        )
+        self.cache = Path(self.settings.edgar.cache_dir)
+        self.dead = f"fsn/v{current_versions()['fsn'] + 7}/a.json"
+        for rel, data in {
+            self.dead: b"dead-a",
+            "corpus/departure-reason/raw/b.json": b"corpus-b",
+            "stamps/v1/0001.json": b"stamp",
+            "bulk/companyfacts.zip": b"bulk",
+        }.items():
+            path = self.cache / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            os.utime(path, ns=(1_700_000_000 * 10**9,) * 2)
+        self.evicted: set[Path] = set()
+
+        class Fake:
+            def status(_self, paths: Sequence[Path]) -> dict[Path, Any]:
+                return {
+                    p: ItemStatus(
+                        uploaded=True, current=p not in self.evicted, dataless=p in self.evicted
+                    )
+                    for p in paths
+                }
+
+            def evict(_self, path: Path) -> None:
+                self.evicted.add(path)
+
+            def download(_self, path: Path) -> None:
+                self.evicted.discard(path)
+
+        self.icloud = Fake()
+
+    def run(self, *args: str) -> Any:
+        return _invoke(self.settings, ["archive", *args], icloud=lambda _s: self.icloud)
+
+    def tree(self) -> dict[str, bytes]:
+        return {
+            p.relative_to(self.cache).as_posix(): p.read_bytes()
+            for p in sorted(self.cache.rglob("*"))
+            if p.is_file()
+        }
+
+
+@pytest.fixture
+def arch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _ArchiveRig:
+    return _ArchiveRig(tmp_path, monkeypatch)
+
+
+def test_migrate_cache_dry_run_prints_the_plan_and_writes_nothing(
+    arch: _ArchiveRig, tmp_path: Path
+) -> None:
+    before = arch.tree()
+    result = arch.run("migrate-cache")
+
+    assert result.exit_code == 0, result.output
+    for text in (
+        "dry run",
+        "move",
+        "backup",
+        arch.dead.rsplit("/", 1)[0],
+        "corpus/departure-reason/raw",
+        "stamps/v1",
+        "duplicates",
+        "bytes to free",
+        "transient backup bytes",
+        "projected free",
+        "floor",
+    ):
+        assert text in result.output
+    assert arch.tree() == before
+    assert not (arch.cache / "_archived").exists()
+    assert list(arch.root.iterdir()) == []
+    assert str(arch.root) not in result.output
+    assert tmp_path.name not in result.output  # no archive path, no account
+
+
+def test_migrate_cache_apply_refuses_while_the_store_is_locked(arch: _ArchiveRig) -> None:
+    before = arch.tree()
+    with open_for_write(arch.settings):
+        result = arch.run("migrate-cache", "--apply")
+
+    assert result.exit_code != 0
+    assert "store" in result.output.lower()
+    assert arch.tree() == before
+    assert not (arch.cache / "_archived").exists()
+    assert list(arch.root.iterdir()) == []
+
+
+def test_migrate_cache_apply_then_restore_round_trips_the_bytes(arch: _ArchiveRig) -> None:
+    mtime = (arch.cache / arch.dead).stat().st_mtime_ns
+    applied = arch.run("migrate-cache", "--apply")
+
+    assert applied.exit_code == 0, applied.output
+    assert not (arch.cache / arch.dead).exists()
+    assert (arch.cache / "stamps/v1/0001.json").exists()  # backups stay
+    assert "pending_upload" in applied.output
+    assert str(arch.root) not in applied.output
+
+    restored = arch.run("restore", "--path", arch.dead)
+
+    assert restored.exit_code == 0, restored.output
+    assert (arch.cache / arch.dead).read_bytes() == b"dead-a"
+    assert (arch.cache / arch.dead).stat().st_mtime_ns == mtime
+
+
+@pytest.mark.parametrize("path", ["nothing/here", "stamps/v1/0001.json"])
+def test_restore_refuses_with_a_plain_message_and_writes_nothing(
+    arch: _ArchiveRig, path: str
+) -> None:
+    arch.run("migrate-cache", "--apply")
+    before = arch.tree()
+    result = arch.run("restore", "--path", path)
+
+    assert result.exit_code != 0
+    assert "nothing was restored" in result.output
+    assert str(arch.root) not in result.output
+    assert arch.tree() == before
+
+
+def test_archive_commands_refuse_when_the_archive_is_off(arch: _ArchiveRig) -> None:
+    arch.settings = arch.settings.model_copy(update={"tradepartner_raw_archive": None})
+    for args in (["migrate-cache"], ["restore", "--path", "fsn"]):
+        result = arch.run(*args)
+        assert result.exit_code != 0
+        assert "TRADEPARTNER_RAW_ARCHIVE" in result.output
