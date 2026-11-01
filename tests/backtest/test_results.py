@@ -9,9 +9,10 @@ and `series_metrics` refuses a zero-variance series.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterator
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from itertools import pairwise
 from pathlib import Path
@@ -694,7 +695,7 @@ class TestResearchRunsInN:
         assert _result_row(conn, first.trial_id)["n_research"] == 0
         assert _research_run(conn, settings, tmp_path, "r0", configurations=3) == "ok"
         assert family_n(conn, "momentum") == 1 + 3
-        assert family_n_split(conn, "momentum") == FamilyN(trials=1, research=3)
+        assert family_n_split(conn, "momentum") == FamilyN(trials=1, research=3, exposures=0)
         second, _, _ = _trial(conn, settings, tmp_path, start=LATER_START)
         row = _result_row(conn, second.trial_id)
         assert row["n_trials"] == 2 + 3
@@ -729,7 +730,7 @@ class TestResearchRunsInN:
         _register(conn, settings)
         _trial(conn, settings, tmp_path)
         assert _research_run(conn, settings, tmp_path, "x0", configurations=3, **run) == "ok"
-        assert family_n_split(conn, "momentum") == FamilyN(trials=1, research=0)
+        assert family_n_split(conn, "momentum") == FamilyN(trials=1, research=0, exposures=0)
         after, _, _ = _trial(conn, settings, tmp_path, start=LATER_START)
         row = _result_row(conn, after.trial_id)
         assert (row["n_trials"], row["n_research"]) == (2, 0)
@@ -761,6 +762,153 @@ class TestResearchRunsInN:
         with pytest.raises(schema.ResearchNotInitialised):
             write_results(conn, handle, results, settings)
         assert _count(conn, "trial_metrics", handle.trial_id) == 0
+
+
+#: A desk read's launch time, after every window below and before today.
+_READ_AT = datetime(2026, 10, 31, 20, 0, tzinfo=UTC)
+
+
+def _profitability(conn: duckdb.DuckDBPyConnection, settings: Settings) -> Settings:
+    """Register `b3` in family `profitability` and return its frozen settings."""
+    registry.register_hypothesis(
+        conn,
+        slug="b3",
+        family="profitability",
+        title="b3 title",
+        doc_path="docs/hypotheses/b3.md",
+        doc_sha256="d" * 64,
+        params=frozen_params_of(settings, family="profitability"),
+        in_sample_start=START,
+        holdout_start=HOLDOUT[0],
+        holdout_end=HOLDOUT[1],
+        registered_by="owner",
+        settings=settings,
+    )
+    return load_frozen(conn, "b3", settings=settings)
+
+
+def _b3_trial(
+    conn: duckdb.DuckDBPyConnection, frozen: Settings, tmp_path: Path, start: date = START
+) -> registry.TrialHandle:
+    handle = _open(conn, frozen, tmp_path, slug="b3", start=start)
+    assert write_results(conn, handle, _run(frozen, handle, start=start), frozen) == "ok"
+    return handle
+
+
+def _exposure(
+    conn: duckdb.DuckDBPyConnection,
+    tmp_path: Path,
+    settings: Settings,
+    tag: str,
+    *,
+    source: str = "store",
+    read_at: datetime = _READ_AT,
+) -> research.ExposureRecord:
+    """One desk-read launch in `profitability` whose probe predates `read_at`."""
+    probe = tmp_path / f"probe-{tag}.py"
+    probe.write_text(f"print('{tag}')\n", encoding="utf-8")
+    old = (read_at.timestamp() - 3600,) * 2
+    os.utime(probe, old)
+    kill_line = tmp_path / f"kill-{tag}.md"
+    kill_line.write_text("kill line\n", encoding="utf-8")
+    return research.record_exposure(
+        conn,
+        research.ExposureInput(
+            candidate_ref=f"#{tag}",
+            source=source,
+            family="profitability",
+            kill_line_url="https://github.com/o/r/issues/2689#issuecomment-1",
+            kill_line_file=kill_line,
+            kill_line_posted_at=datetime(2026, 10, 31, 19, 0, tzinfo=UTC),
+            probe_path=probe,
+            probe_sha256=hash_file(probe),
+            read_at=read_at,
+            window_start=date(2020, 8, 31),
+            window_end=date(2023, 12, 29),
+            pins={"store_max_ingested_at": "2026-10-31T04:41:00+00:00"},
+            n_configurations=1,
+            verdict="fail",
+            desk_read_path="docs/research/desk-read.md",
+        ),
+        "test",
+        settings=settings,
+        repo_dir=tmp_path,
+    )
+
+
+class TestExposuresInN:
+    """N's third part is `family_exposure_count`; V is the backtest pairs' alone
+    (research-registry spec amendment 2026-10-31, #2723; backtest spec req 8 as amended
+    by T356)."""
+
+    def test_store_records_raise_n_and_leave_v(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, fixture_store_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        frozen = _profitability(conn, settings)
+        first = _b3_trial(conn, frozen, tmp_path)
+        assert _result_row(conn, first.trial_id)["n_exposure"] == 0
+        # The fixture store is the "real" store here, so these records are not synthetic.
+        real = _settings(tmp_path, store={"path": str(fixture_store_path)})
+        assert not _exposure(conn, tmp_path, real, "a").synthetic
+        _exposure(conn, tmp_path, real, "b")
+        _exposure(conn, tmp_path, real, "c", source="open_data")
+        assert _exposure(conn, tmp_path, settings, "d").synthetic
+        assert research.family_exposure_count(conn, "profitability") == 2
+        assert family_n_split(conn, "profitability") == FamilyN(trials=1, research=0, exposures=2)
+        second = _b3_trial(conn, frozen, tmp_path, start=LATER_START)
+        row = _result_row(conn, second.trial_id)
+        assert (row["n_trials"], row["n_research"], row["n_exposure"]) == (2 + 2, 0, 2)
+        # V and the pair Sharpes are the two backtest pairs' only.
+        family = registry.family_sharpes(conn, "profitability")
+        assert family.n_trials == 2
+        pairs = [
+            _annual(_metrics(conn, h.trial_id, "strategy", BASE), "sharpe_period")
+            for h in (first, second)
+        ]
+        assert sorted(family.raw) == pytest.approx(sorted(pairs))
+        base = _metrics(conn, second.trial_id, "strategy", BASE)
+        expected = deflated_sharpe(base, "raw", n_trials=4, pair_sharpes=pairs, periods_per_year=12)
+        assert row["sharpe_variance"] == pytest.approx(expected.sharpe_variance)
+        assert row["sr_star"] == pytest.approx(expected.sr_star)
+
+    def test_a_later_record_never_back_stamps_a_stored_n(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, fixture_store_path: Path
+    ) -> None:
+        """No look-ahead, no back-stamp: a record whose `read_at` is before a result,
+        written after it, leaves the result's stored N parts as they were; its
+        `known_at` is the write time, and only today's N rises."""
+        settings = _settings(tmp_path)
+        frozen = _profitability(conn, settings)
+        handle = _b3_trial(conn, frozen, tmp_path)
+        before = _result_row(conn, handle.trial_id)
+        written_after = datetime.now(UTC)
+        record = _exposure(
+            conn,
+            tmp_path,
+            _settings(tmp_path, store={"path": str(fixture_store_path)}),
+            "late",
+            read_at=before["finished_at"] - timedelta(minutes=1),
+        )
+        assert record.read_at < before["finished_at"] <= record.known_at
+        assert record.known_at >= written_after
+        after = _result_row(conn, handle.trial_id)
+        for column in ("n_trials", "n_research", "n_exposure"):
+            assert after[column] == before[column]
+        assert (before["n_trials"], before["n_exposure"]) == (1, 0)
+        assert family_n(conn, "profitability") == 1 + 1
+
+    def test_a_store_without_the_exposure_table_reads_exposures_as_none(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """A read-only open of a store before schema 44 has the research tables but no
+        `research_exposures`: the part is None and N is as before."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        _trial(conn, settings, tmp_path)
+        conn.execute("DROP TABLE research_exposures")
+        assert family_n_split(conn, "momentum") == FamilyN(trials=1, research=0, exposures=None)
+        assert family_n(conn, "momentum") == 1
 
 
 class TestVersionPColumns:

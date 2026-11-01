@@ -58,15 +58,32 @@ runtime store's latest `ingested_at` moved for an `economic` or `return` run. It
 returns rather than raises so the row survives the commit.
 
 **Counts** (req 9). `family_run_count` is the research share of a family's N.
+
+**Exposures** (spec amendment 2026-10-31, #2723; plan T356). A desk read that
+computed returns outside a `TrialHandle` or `RunHandle` is recorded as disclosed
+exposure, one `research_exposures` row per launch. `record_exposure` is the only
+writer: it hashes the probe, the kill-line copy and every input file itself before
+it inserts, refuses every rule the amendment lists, computes `kill_line_basis`,
+`probe_verified`, `overlaps_holdout`, `post_boundary` and `synthetic`, and returns
+the existing row for a repeated `(candidate_ref, probe_sha256, read_at)`. Its
+`known_at` is the write time, never `read_at`. `family_exposure_count` is N's third
+part: Σ `n_configurations` over non-synthetic `store` records of the family that do
+not overlap one of its hypotheses' holdouts (such a record is a spend and needs a
+holdout reason, owner decision on open question 2). `open_data` records never
+enter N (open question 1) and may be unverified (open question 4). Nothing edits,
+deletes or withdraws a record (open question 6). `schema.require_research` ignores
+`research_exposures`, so these readers check the table themselves and raise
+`ExposuresNotInitialised` on a store without it.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final, Literal
@@ -109,7 +126,12 @@ from tradepartner.store.registry import (
     code_version,
     store_max_ingested_at,
 )
-from tradepartner.store.schema import RESEARCH_OUTCOMES, RESEARCH_SPLITS, require_research
+from tradepartner.store.schema import (
+    RESEARCH_OUTCOMES,
+    RESEARCH_SPLITS,
+    ResearchNotInitialised,
+    require_research,
+)
 
 UNFINISHED: Final = "unfinished"
 DATASET_CHANGED_MESSAGE: Final = "dataset changed during run"
@@ -1220,3 +1242,460 @@ def list_runs(
         [registration, registration, family, family, kind, kind, include_synthetic],
     ).fetchall()
     return [RunSummary(*row) for row in rows]
+
+
+# --- exposures (amendment 2026-10-31, #2723) ---------------------------------
+
+#: Where a desk read's returns came from (amendment, Definitions, Source).
+EXPOSURE_SOURCES: Final = ("store", "open_data")
+#: The desk read's verdict, copied from its note (amendment, required fields).
+EXPOSURE_VERDICTS: Final = ("pass", "fail", "insufficient", "incomplete")
+#: `kill_line_basis`, computed from `kill_line_posted_at` and `read_at`.
+KILL_LINE_BASES: Final = ("posted_before_read", "posted_after_read")
+#: The `data_pin_json` entry a `store` record must carry (backtest spec req 9).
+STORE_PIN: Final = "store_max_ingested_at"
+#: An entry the write hashed itself from a file whose mtime is at or before `read_at`.
+MEASURED: Final = "measured"
+#: A value the writer passed, or an input file changed after `read_at`.
+DECLARED: Final = "declared"
+#: The desk-read note's directory, relative to the repository root.
+DESK_READ_DIR: Final = "docs/research/"
+
+_ISSUE_COMMENT_URL: Final = re.compile(
+    r"^https://github\.com/[\w.-]+/[\w.-]+/issues/\d+#issuecomment-\d+$"
+)
+_BLOB_AT_COMMIT_URL: Final = re.compile(
+    r"^https://github\.com/[\w.-]+/[\w.-]+/blob/[0-9a-f]{7,40}/\S+$"
+)
+_HTTPS_URL: Final = re.compile(r"^https://\S+$")
+_SHA256_HEX: Final = re.compile(r"^[0-9a-f]{64}$")
+
+_EXPOSURE_COLUMNS: Final = (
+    "exposure_id, candidate_ref, source, family, kill_line_url, kill_line_sha256, "
+    "kill_line_posted_at, kill_line_basis, probe_path, probe_sha256, probe_verified, "
+    "read_at, window_start, window_end, data_pin_json, n_configurations, verdict, "
+    "desk_read_path, audit_url, overlaps_holdout, holdout_reason, post_boundary, "
+    "synthetic, recorded_by, code_version, code_dirty, note, known_at"
+)
+_DATA_PIN_INDEX: Final = 14
+
+
+class ExposuresNotInitialised(ResearchNotInitialised):
+    """The store has no `research_exposures` table: one before the exposure
+    migration (schema 44) that only a read-only connection has opened."""
+
+
+@dataclass(frozen=True)
+class ExposureInput:
+    """What the writer declares about one launch (amendment, required fields).
+
+    Files are passed, never their hashes alone: `record_exposure` hashes
+    `probe_path`, `kill_line_file` and every one of `inputs` itself. `pins` are
+    declared values (`store_max_ingested_at` for a `store` record). With
+    `probe_unavailable_reason` set, the launch's script no longer exists:
+    `probe_path` and `probe_sha256` stay None and the record is unverified,
+    allowed for `open_data` only (open question 4 (b))."""
+
+    candidate_ref: str
+    source: str
+    kill_line_url: str
+    kill_line_file: Path
+    kill_line_posted_at: datetime
+    read_at: datetime
+    window_start: date
+    window_end: date
+    n_configurations: int
+    verdict: str
+    desk_read_path: str
+    family: str | None = None
+    probe_path: Path | None = None
+    probe_sha256: str | None = None
+    probe_unavailable_reason: str | None = None
+    inputs: tuple[Path, ...] = ()
+    pins: Mapping[str, str] | None = None
+    audit_url: str | None = None
+    holdout_reason: str | None = None
+    note: str | None = None
+
+
+@dataclass(frozen=True)
+class ExposureRecord:
+    """One `research_exposures` row, `data_pin_json` decoded."""
+
+    exposure_id: int
+    candidate_ref: str
+    source: str
+    family: str | None
+    kill_line_url: str
+    kill_line_sha256: str
+    kill_line_posted_at: datetime
+    kill_line_basis: str
+    probe_path: str | None
+    probe_sha256: str | None
+    probe_verified: bool
+    read_at: datetime
+    window_start: date
+    window_end: date
+    data_pin: Mapping[str, Any]
+    n_configurations: int
+    verdict: str
+    desk_read_path: str
+    audit_url: str | None
+    overlaps_holdout: bool
+    holdout_reason: str | None
+    post_boundary: bool
+    synthetic: bool
+    recorded_by: str
+    code_version: str
+    code_dirty: bool | None
+    note: str | None
+    known_at: datetime
+
+
+@dataclass(frozen=True)
+class ExposureCandidate:
+    """One distinct candidate with records on or after a date: its first such
+    `read_at`, those records oldest first, their verdicts, and whether it also
+    has records from before the date (amendment, "the search tally")."""
+
+    candidate_ref: str
+    first_read_at: datetime
+    records: tuple[ExposureRecord, ...]
+    verdicts: tuple[str, ...]
+    earlier_records: bool
+
+
+def _require_exposures(conn: duckdb.DuckDBPyConnection) -> None:
+    (present,) = conn.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() "
+        "AND schema_name = current_schema() AND table_name = 'research_exposures'"
+    ).fetchone()
+    if not present:
+        raise ExposuresNotInitialised(
+            "research exposures not initialised (no research_exposures table); "
+            "any writing command migrates the store to the current version"
+        )
+
+
+def _exposure_from_row(row: Sequence[Any]) -> ExposureRecord:
+    values = list(row)
+    values[_DATA_PIN_INDEX] = json.loads(values[_DATA_PIN_INDEX])
+    return ExposureRecord(*values)
+
+
+def _sha256_file(path: Path, what: str) -> str:
+    try:
+        return sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ResearchError(f"{what} {str(path)!r} cannot be read: {exc}") from exc
+
+
+def _mtime(path: Path) -> datetime:
+    return datetime.fromtimestamp(path.stat().st_mtime, UTC)
+
+
+def _aware(value: datetime, field: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ResearchError(f"{field} {value.isoformat()} is naive; give it a UTC offset")
+    return value.astimezone(UTC)
+
+
+def _check_exposure_text(spec: ExposureInput, families: Sequence[str]) -> None:
+    """The refusals that read no file and no row."""
+    if not spec.candidate_ref.strip():
+        raise ResearchError("an exposure needs a non-blank candidate_ref")
+    if spec.source not in EXPOSURE_SOURCES:
+        raise ResearchError(f"source {spec.source!r} is not one of {EXPOSURE_SOURCES}")
+    if spec.source == "store" and spec.family is None:
+        raise ResearchError("a store exposure needs a family")
+    if spec.family is not None and spec.family not in families:
+        raise ResearchError(f"family {spec.family!r} is not in hypotheses.families {families}")
+    if not (
+        _ISSUE_COMMENT_URL.match(spec.kill_line_url)
+        or _BLOB_AT_COMMIT_URL.match(spec.kill_line_url)
+    ):
+        raise ResearchError(
+            f"kill_line_url {spec.kill_line_url!r} is neither an issue-comment URL "
+            "(.../issues/<n>#issuecomment-<id>) nor a file at a commit (.../blob/<sha>/...)"
+        )
+    if spec.audit_url is not None and not _HTTPS_URL.match(spec.audit_url):
+        raise ResearchError(f"audit_url {spec.audit_url!r} is not an https URL")
+    if spec.verdict not in EXPOSURE_VERDICTS:
+        raise ResearchError(f"verdict {spec.verdict!r} is not one of {EXPOSURE_VERDICTS}")
+    if spec.n_configurations < 1:
+        raise ResearchError("an exposure counts at least one configuration")
+    desk = Path(spec.desk_read_path)
+    if (
+        desk.is_absolute()
+        or ".." in desk.parts
+        or not spec.desk_read_path.startswith(DESK_READ_DIR)
+        or desk.as_posix() == DESK_READ_DIR.rstrip("/")
+    ):
+        raise ResearchError(
+            f"desk_read_path {spec.desk_read_path!r} is not a relative path under {DESK_READ_DIR}"
+        )
+    if spec.window_end < spec.window_start:
+        raise ResearchError(
+            f"window_end {spec.window_end} is before window_start {spec.window_start}"
+        )
+
+
+def _probe(spec: ExposureInput, read_at: datetime) -> tuple[str | None, str | None, bool | None]:
+    """`(probe_path, probe_sha256, mtime at or before read_at)`; the file is hashed
+    here and a mismatch with the declared hash is refused. None for the mtime when
+    the probe is unavailable."""
+    if spec.probe_unavailable_reason is not None:
+        if not spec.probe_unavailable_reason.strip():
+            raise ResearchError("an unavailable probe needs a non-blank reason")
+        if spec.source != "open_data":
+            raise ResearchError(
+                "an unavailable probe is allowed for open_data records only; a store "
+                "record raises N and must hash its probe"
+            )
+        if spec.probe_path is not None or spec.probe_sha256 is not None:
+            raise ResearchError("an unavailable probe takes no probe path or hash")
+        return None, None, None
+    if spec.probe_path is None or spec.probe_sha256 is None:
+        raise ResearchError("an exposure needs the probe file and its declared SHA-256")
+    declared = spec.probe_sha256.strip().lower()
+    if not _SHA256_HEX.match(declared):
+        raise ResearchError(f"probe_sha256 {spec.probe_sha256!r} is not a SHA-256 hex digest")
+    actual = _sha256_file(spec.probe_path, "probe")
+    if actual != declared:
+        raise ResearchError(
+            f"probe sha mismatch: {str(spec.probe_path)!r} hashes to {actual}, "
+            f"not the declared {declared}"
+        )
+    return str(spec.probe_path), actual, _mtime(spec.probe_path) <= read_at
+
+
+def _data_pin(spec: ExposureInput, read_at: datetime) -> dict[str, Any]:
+    """`data_pin_json`: every input file hashed here, `measured` when its mtime is at
+    or before `read_at` and `declared` otherwise, plus every declared pin."""
+    inputs = []
+    for path in spec.inputs:
+        digest = _sha256_file(path, "input")
+        inputs.append(
+            {
+                "name": path.name,
+                "path": str(path),
+                "sha256": digest,
+                "basis": MEASURED if _mtime(path) <= read_at else DECLARED,
+            }
+        )
+    pins: dict[str, dict[str, str]] = {}
+    for name, value in sorted((spec.pins or {}).items()):
+        if not name.strip() or not str(value).strip():
+            raise ResearchError(f"pin {name!r}={value!r} needs a name and a value")
+        pins[name] = {"value": str(value), "basis": DECLARED}
+    if STORE_PIN in pins:
+        try:
+            pinned = datetime.fromisoformat(pins[STORE_PIN]["value"])
+        except ValueError as exc:
+            raise ResearchError(f"{STORE_PIN} pin is not an ISO timestamp: {exc}") from exc
+        pins[STORE_PIN]["value"] = _aware(pinned, STORE_PIN).isoformat()
+    if spec.source == "store" and STORE_PIN not in pins:
+        raise ResearchError(f"a store exposure needs a {STORE_PIN} pin")
+    return {"inputs": inputs, "pins": pins}
+
+
+def _hash_durable_before(
+    conn: duckdb.DuckDBPyConnection,
+    digest: str,
+    kill_line_text: str,
+    kill_line_posted_at: datetime,
+    read_at: datetime,
+) -> bool:
+    """Whether `digest` was durable at or before `read_at`: in the kill line
+    posted by then, or in a record written by then."""
+    if kill_line_posted_at <= read_at and digest in kill_line_text:
+        return True
+    return (
+        conn.execute(
+            "SELECT 1 FROM research_exposures WHERE probe_sha256 = ? AND known_at <= ? LIMIT 1",
+            [digest, read_at],
+        ).fetchone()
+        is not None
+    )
+
+
+def record_exposure(
+    conn: duckdb.DuckDBPyConnection,
+    spec: ExposureInput,
+    recorded_by: str,
+    *,
+    settings: Settings | None = None,
+    repo_dir: Path | None = None,
+) -> ExposureRecord:
+    """Record one desk-read launch (module docstring, "Exposures") and return its row.
+
+    Raises `ResearchError`, writing nothing, on: a blank candidate; a source outside
+    `EXPOSURE_SOURCES`; a `store` record without a family or a `store_max_ingested_at`
+    pin; a family outside `hypotheses.families`; a kill-line URL that is neither an
+    issue comment nor a blob at a commit; a naive timestamp; `read_at` after the write;
+    `window_end` before `window_start` or after `read_at`'s date; `n_configurations <
+    1`; a verdict outside the set; a desk-read path outside `docs/research/`; a probe
+    whose hash differs from the declared one; an unverified `store` probe; a `store`
+    record overlapping a family holdout without `holdout_reason`, and a reason on a
+    record that spends nothing. A repeated `(candidate_ref, probe_sha256, read_at)`
+    returns the existing row and adds none."""
+    _require_exposures(conn)
+    settings = settings if settings is not None else get_settings()
+    known_at = utc_now()
+    _check_exposure_text(spec, settings.hypotheses.families)
+    read_at = _aware(spec.read_at, "read_at")
+    posted_at = _aware(spec.kill_line_posted_at, "kill_line_posted_at")
+    if read_at > known_at:
+        raise ResearchError(f"read_at {read_at.isoformat()} is after the write ({known_at})")
+    if spec.window_end > read_at.date():
+        raise ResearchError(
+            f"window_end {spec.window_end} is after read_at's date {read_at.date()}"
+        )
+    kill_line_bytes = spec.kill_line_file.read_bytes() if spec.kill_line_file.is_file() else None
+    if kill_line_bytes is None:
+        raise ResearchError(f"kill-line copy {str(spec.kill_line_file)!r} cannot be read")
+    kill_line_sha = sha256(kill_line_bytes).hexdigest()
+    probe_path, probe_sha, mtime_ok = _probe(spec, read_at)
+    data_pin = _data_pin(spec, read_at)
+    verified = probe_sha is not None and (
+        bool(mtime_ok)
+        or _hash_durable_before(
+            conn, probe_sha, kill_line_bytes.decode("utf-8", "replace"), posted_at, read_at
+        )
+    )
+    if spec.source == "store" and not verified:
+        raise ResearchError(
+            "probe not verified: its hash was not durable at or before read_at and the "
+            "file changed after it; a store record must prove what ran"
+        )
+    window = Span(spec.window_start, spec.window_end)
+    overlaps = any(window.overlaps(h) for h in _family_holdouts(conn, spec.family))
+    spends = spec.source == "store" and overlaps
+    reason = spec.holdout_reason.strip() if spec.holdout_reason is not None else None
+    if spends and not reason:
+        raise ResearchError(
+            "the window overlaps a holdout of the family: a store record there is a "
+            "holdout spend and needs a holdout reason"
+        )
+    if not spends and spec.holdout_reason is not None:
+        raise ResearchError("a holdout reason is only for a store record that spends a holdout")
+    existing = conn.execute(
+        f"SELECT {_EXPOSURE_COLUMNS} FROM research_exposures WHERE candidate_ref = ? "
+        "AND COALESCE(probe_sha256, '') = ? AND read_at = ?",
+        [spec.candidate_ref, probe_sha or "", read_at],
+    ).fetchone()
+    if existing is not None:
+        return _exposure_from_row(existing)
+    boundary = boundary_date(conn)
+    note = spec.note
+    if spec.probe_unavailable_reason is not None:
+        unavailable = f"probe unavailable: {spec.probe_unavailable_reason.strip()}"
+        note = unavailable if note is None else f"{unavailable}; {note}"
+    commit, dirty = code_version(repo_dir)
+    exposure_id = _next_id(conn, "research_exposures", "exposure_id")
+    insert_row(
+        conn,
+        "research_exposures",
+        {
+            "exposure_id": exposure_id,
+            "candidate_ref": spec.candidate_ref,
+            "source": spec.source,
+            "family": spec.family,
+            "kill_line_url": spec.kill_line_url,
+            "kill_line_sha256": kill_line_sha,
+            "kill_line_posted_at": posted_at,
+            "kill_line_basis": KILL_LINE_BASES[0] if posted_at <= read_at else KILL_LINE_BASES[1],
+            "probe_path": probe_path,
+            "probe_sha256": probe_sha,
+            "probe_verified": verified,
+            "read_at": read_at,
+            "window_start": spec.window_start,
+            "window_end": spec.window_end,
+            "data_pin_json": canonical_params_json(data_pin),
+            "n_configurations": spec.n_configurations,
+            "verdict": spec.verdict,
+            "desk_read_path": spec.desk_read_path,
+            "audit_url": spec.audit_url,
+            "overlaps_holdout": overlaps,
+            "holdout_reason": reason if spends else None,
+            "post_boundary": boundary is not None and spec.window_end >= boundary,
+            "synthetic": not _is_real_store(conn, settings),
+            "recorded_by": recorded_by,
+            "code_version": commit,
+            "code_dirty": dirty,
+            "note": note,
+            "known_at": known_at,
+        },
+    )
+    row = conn.execute(
+        f"SELECT {_EXPOSURE_COLUMNS} FROM research_exposures WHERE exposure_id = ?",
+        [exposure_id],
+    ).fetchone()
+    assert row is not None
+    return _exposure_from_row(row)
+
+
+def list_exposures(
+    conn: duckdb.DuckDBPyConnection,
+    family: str | None = None,
+    candidate: str | None = None,
+    include_synthetic: bool = False,
+) -> list[ExposureRecord]:
+    """Exposure records newest first, optionally for one family or candidate;
+    synthetic hidden unless asked for."""
+    _require_exposures(conn)
+    rows = conn.execute(
+        f"SELECT {_EXPOSURE_COLUMNS} FROM research_exposures "
+        "WHERE (? IS NULL OR family = ?) AND (? IS NULL OR candidate_ref = ?) "
+        "AND (? OR NOT synthetic) ORDER BY exposure_id DESC",
+        [family, family, candidate, candidate, include_synthetic],
+    ).fetchall()
+    return [_exposure_from_row(row) for row in rows]
+
+
+def exposure_candidates(
+    conn: duckdb.DuckDBPyConnection, since: date, include_synthetic: bool = False
+) -> list[ExposureCandidate]:
+    """Each distinct candidate with a record whose `read_at` (UTC date) is on or
+    after `since`, `store` and `open_data` both, in order of that first read
+    (amendment, "How it enters the search tally"). It checks the search tally;
+    it is not the count."""
+    records = sorted(
+        list_exposures(conn, include_synthetic=include_synthetic),
+        key=lambda r: (r.read_at, r.exposure_id),
+    )
+    by_candidate: dict[str, list[ExposureRecord]] = {}
+    earlier: set[str] = set()
+    for record in records:
+        if record.read_at.astimezone(UTC).date() >= since:
+            by_candidate.setdefault(record.candidate_ref, []).append(record)
+        else:
+            earlier.add(record.candidate_ref)
+    return sorted(
+        (
+            ExposureCandidate(
+                candidate_ref=ref,
+                first_read_at=found[0].read_at,
+                records=tuple(found),
+                verdicts=tuple(r.verdict for r in found),
+                earlier_records=ref in earlier,
+            )
+            for ref, found in by_candidate.items()
+        ),
+        key=lambda c: (c.first_read_at, c.candidate_ref),
+    )
+
+
+def family_exposure_count(conn: duckdb.DuckDBPyConnection, family: str) -> int:
+    """N's third part (amendment, "How it enters N"): Σ `n_configurations` over the
+    non-synthetic `store` records of `family` that spend no holdout. `open_data`
+    records add nothing (open question 1), and neither does a holdout-spending
+    record (open question 2 (b): a spend, not an in-sample look)."""
+    _require_exposures(conn)
+    row = conn.execute(
+        "SELECT COALESCE(SUM(n_configurations), 0) FROM research_exposures "
+        "WHERE family = ? AND source = 'store' AND NOT synthetic AND NOT overlaps_holdout",
+        [family],
+    ).fetchone()
+    assert row is not None
+    return int(row[0])
