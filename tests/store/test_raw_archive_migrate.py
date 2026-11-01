@@ -100,6 +100,10 @@ class Rig:
         path = self.cache / "_archived" / "index.jsonl"
         return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
 
+    def append_index(self, record: dict[str, object]) -> None:
+        with (self.cache / "_archived" / "index.jsonl").open("a") as f:
+            f.write(json.dumps(record) + "\n")
+
     def tree(self) -> dict[str, bytes]:
         return {
             p.relative_to(self.cache).as_posix(): p.read_bytes()
@@ -658,3 +662,58 @@ def test_restore_rechecks_the_floor_after_the_downloads_used_space(
     with pytest.raises(RawArchiveFloorError):
         _restore(rig, DEAD)
     assert not (rig.cache / DEAD / "a.json").exists()
+
+
+# --- restore after a partial restore (#2793) ---------------------------------
+
+B_REL = "corpus/departure-reason/raw/b.json"
+C_REL = "corpus/departure-reason/raw/c.json"
+
+
+def test_a_folder_restore_after_a_partial_restore_restores_only_the_rest(rig: Rig) -> None:
+    rig.icloud = RestoreICloud()
+    rig.put(C_REL, b"corpus-c")
+    rig.run()
+    assert set(_restore(rig, B_REL).restored) == {B_REL}
+    result = _restore(rig, "corpus/departure-reason")
+    assert set(result.restored) == {C_REL}
+    assert (rig.cache / B_REL).read_bytes() == b"corpus-b"
+    assert (rig.cache / C_REL).read_bytes() == b"corpus-c"
+
+
+def test_a_folder_restore_with_nothing_left_exits_cleanly_but_a_miss_still_refuses(
+    rig: Rig,
+) -> None:
+    rig.icloud = RestoreICloud()
+    rig.run()
+    _restore(rig, "corpus/departure-reason")
+    index = rig.index()
+    assert _restore(rig, "corpus/departure-reason").restored == {}
+    assert rig.index() == index
+    with pytest.raises(RestoreRefusedError):
+        _restore(rig, "nope/")
+
+
+def test_a_path_moved_again_after_a_restore_is_restorable_again(rig: Rig) -> None:
+    rig.icloud = RestoreICloud()
+    rig.run()
+    _restore(rig, B_REL)
+    (rig.cache / B_REL).unlink()
+    rig.append_index(
+        {
+            "op": "moved",
+            "path": B_REL,
+            "bytes": 8,
+            "sha256": _sha(b"corpus-b"),
+            "mtime_ns": 1_600_000_000,
+        }
+    )
+    assert set(_restore(rig, B_REL).restored) == {B_REL}
+
+
+def test_an_index_line_with_no_path_is_skipped_by_restore(rig: Rig) -> None:
+    rig.icloud = RestoreICloud()
+    rig.run()
+    rig.append_index({"op": "moved"})
+    rig.append_index({"op": "restored"})
+    assert set(_restore(rig, B_REL).restored) == {B_REL}

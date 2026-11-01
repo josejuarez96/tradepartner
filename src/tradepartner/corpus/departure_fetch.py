@@ -340,6 +340,8 @@ def _tombstoned(cache_dir: Path) -> frozenset[str]:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+                continue  # a line with no path names no file: skipped, as a torn line is
             latest[record["path"]] = record.get("op") != "restored"
     return frozenset(path for path, moved in latest.items() if moved)
 
