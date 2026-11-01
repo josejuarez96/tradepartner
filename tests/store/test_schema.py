@@ -1318,6 +1318,10 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "spinoff_allocations",
             "sec_filing_events",
             "sec_form4_transactions",
+            "filing_index",
+            "filing_index_pending",
+            "edgar_filers",
+            "edgar_index_files",
         }
         assert {table for table in shape_before if shape_after[table] != shape_before[table]} == {
             "listings",
@@ -2373,7 +2377,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_NOT_COMPUTABLE_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FILING_INDEX_VERSION + 1
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
@@ -2953,9 +2957,17 @@ def test_version_39_adds_only_spinoff_allocations() -> None:
     conn = duckdb.connect(":memory:")
     try:
         schema.init_schema(conn)
-        for table in ("spinoff_allocations", "sec_filing_events", "sec_form4_transactions"):
+        for table in (
+            "spinoff_allocations",
+            "sec_filing_events",
+            "sec_form4_transactions",
+            "filing_index",
+            "filing_index_pending",
+            "edgar_filers",
+            "edgar_index_files",
+        ):
             conn.execute(f"DROP TABLE {table}")
-        conn.execute("DELETE FROM schema_version WHERE version IN (39, 40, 41)")
+        conn.execute("DELETE FROM schema_version WHERE version > 38")
         conn.execute("INSERT INTO schema_version VALUES (38, TIMESTAMPTZ '2026-10-27 00:00:00+00')")
         before = _shape(conn)
         versions = _versions(conn)
@@ -2967,11 +2979,15 @@ def test_version_39_adds_only_spinoff_allocations() -> None:
             "spinoff_allocations",
             "sec_filing_events",
             "sec_form4_transactions",
+            "filing_index",
+            "filing_index_pending",
+            "edgar_filers",
+            "edgar_index_files",
         }
         assert {name: after[name] for name in before} == before
-        assert _versions(conn) == [38, 39, 40, 41]
+        assert _versions(conn) == list(range(38, schema.CURRENT_SCHEMA_VERSION + 1))
         schema.init_schema(conn)
-        assert _versions(conn) == [38, 39, 40, 41]
+        assert _versions(conn) == list(range(38, schema.CURRENT_SCHEMA_VERSION + 1))
     finally:
         conn.close()
 
@@ -2980,9 +2996,17 @@ def test_read_only_version_38_store_keeps_existing_reads(tmp_path: Path) -> None
     path = tmp_path / "v38.duckdb"
     conn = duckdb.connect(str(path))
     schema.init_schema(conn)
-    for table in ("spinoff_allocations", "sec_filing_events", "sec_form4_transactions"):
+    for table in (
+        "spinoff_allocations",
+        "sec_filing_events",
+        "sec_form4_transactions",
+        "filing_index",
+        "filing_index_pending",
+        "edgar_filers",
+        "edgar_index_files",
+    ):
         conn.execute(f"DROP TABLE {table}")
-    conn.execute("DELETE FROM schema_version WHERE version IN (39, 40, 41)")
+    conn.execute("DELETE FROM schema_version WHERE version > 38")
     conn.execute("INSERT INTO schema_version VALUES (38, TIMESTAMPTZ '2026-10-27 00:00:00+00')")
     conn.close()
     ro = duckdb.connect(str(path), read_only=True)

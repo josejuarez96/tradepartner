@@ -596,7 +596,11 @@ registry; #83 took version 2 first, so the registry is version 3):
   and the count and run ids logged. A read-only connection
   accepts a version-40 store: every read works (no `not_computable` row can
   exist there), and the next writable `init_schema` call migrates it.
-- **A later DDL change goes to version 42**, with its own migration and a
+- **Version 42** (T318, #2740): additive `filing_index` revisions and the
+  `filing_index_pending`, `edgar_filers` and `edgar_index_files` state tables.
+  Earlier rows and tables are unchanged; read-only version-41 stores still
+  serve their existing readers.
+- **A later DDL change goes to version 43**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -716,6 +720,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "facts": ("filing",),
     "statement_facts": ("filing",),
     "filing_events": ("filing",),
+    "filing_index": ("filing",),
     "sec_filing_events": ("filing",),
     "sec_form4_transactions": ("filing",),
     "rates": ("release",),
@@ -916,9 +921,11 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   (`_migrate_not_computable`), every row kept, and every verdict on a
 #:   non-finite stored primary relabelled `not_computable`, each with a
 #:   `verdict_relabel` decision (#2658, #2660).
-#: - A later DDL change goes to version 42, with its own migration and a
+#: - 42 (T318, #2740): additive EDGAR filing-index fact and cursor tables.
+#: - A later DDL change gets its own version and migration, with a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 41
+_PRE_FILING_INDEX_VERSION = 41
+CURRENT_SCHEMA_VERSION = _PRE_FILING_INDEX_VERSION + 1
 
 #: Last version without the owner-entered Form 8937 allocation table.
 _PRE_SPINOFF_ALLOCATIONS_VERSION = 38
@@ -1346,6 +1353,59 @@ CREATE TABLE IF NOT EXISTS filing_events (
 )
 """
 
+# T318: the first row uses the SEC acceptance stamp; later filed-on corrections
+# keep that stamp and take the writer's clock as their revision known_at.
+_CREATE_FILING_INDEX = f"""
+CREATE TABLE IF NOT EXISTS filing_index (
+    cik VARCHAR NOT NULL,
+    accession VARCHAR NOT NULL,
+    form VARCHAR NOT NULL,
+    company_name VARCHAR NOT NULL,
+    filed_on DATE NOT NULL,
+    accepted_at TIMESTAMPTZ NOT NULL,
+    listed_on DATE NOT NULL,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["filing_index"])},
+    UNIQUE (cik, accession, known_at)
+)
+"""
+
+_CREATE_FILING_INDEX_PENDING = """
+CREATE TABLE IF NOT EXISTS filing_index_pending (
+    cik VARCHAR NOT NULL,
+    accession VARCHAR NOT NULL,
+    form VARCHAR NOT NULL,
+    company_name VARCHAR NOT NULL,
+    filed_on DATE NOT NULL,
+    listed_on DATE NOT NULL,
+    PRIMARY KEY (cik, accession)
+)
+"""
+
+_CREATE_EDGAR_FILERS = """
+CREATE TABLE IF NOT EXISTS edgar_filers (
+    cik VARCHAR NOT NULL PRIMARY KEY,
+    first_quarter VARCHAR NOT NULL,
+    last_quarter VARCHAR NOT NULL
+)
+"""
+
+_CREATE_EDGAR_INDEX_FILES = """
+CREATE TABLE IF NOT EXISTS edgar_index_files (
+    path VARCHAR NOT NULL PRIMARY KEY,
+    last_modified TIMESTAMPTZ,
+    size BIGINT NOT NULL,
+    sha256 VARCHAR NOT NULL,
+    run_id VARCHAR NOT NULL
+)
+"""
+
+_FILING_INDEX_TABLE_DDL: tuple[str, ...] = (
+    _CREATE_FILING_INDEX,
+    _CREATE_FILING_INDEX_PENDING,
+    _CREATE_EDGAR_FILERS,
+    _CREATE_EDGAR_INDEX_FILES,
+)
+
 # Ownership events keep the subject and every reporting owner separate from the
 # issuer-only 8-K table. The identity excludes known_at so a re-read cannot revise it.
 _CREATE_SEC_FILING_EVENTS = f"""
@@ -1608,9 +1668,9 @@ CREATE TABLE IF NOT EXISTS spinoff_allocations (
 """
 _SPINOFF_ALLOCATIONS_TABLE_DDL: tuple[str, ...] = (_CREATE_SPINOFF_ALLOCATIONS,)
 
-#: Every table this module owns, in dependency-free creation order (no
-#: foreign keys are declared, so order only needs schema_version last for
-#: readability). Used by `init_schema` and exposed for the test loader.
+#: The fact tables plus ingestion and schema bookkeeping. Non-fact EDGAR
+#: cursor tables are in `MASTER_CHECK_TABLE_NAMES` for store inventory and
+#: excluded here so the truncation harness filters only `known_at` tables.
 TABLE_NAMES: tuple[str, ...] = (
     "securities",
     "listings",
@@ -1621,6 +1681,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "facts",
     "statement_facts",
     "filing_events",
+    "filing_index",
     "sec_filing_events",
     "sec_form4_transactions",
     "rates",
@@ -1777,10 +1838,15 @@ CREATE TABLE IF NOT EXISTS master_underived (
 )
 """
 
-#: Tables new at version 11 (#859), created by `init_schema`'s DDL pass. Kept
-#: out of `TABLE_NAMES` (not a fact table; the look-ahead harness truncates
-#: only those).
-MASTER_CHECK_TABLE_NAMES: tuple[str, ...] = ("master_underived",)
+#: Non-fact state tables (`master_underived` from version 11, EDGAR index
+#: cursor state from T318). Kept out of `TABLE_NAMES` because the look-ahead
+#: harness truncates only tables with `known_at`.
+MASTER_CHECK_TABLE_NAMES: tuple[str, ...] = (
+    "master_underived",
+    "filing_index_pending",
+    "edgar_filers",
+    "edgar_index_files",
+)
 _MASTER_UNDERIVED_TABLE_DDL: tuple[str, ...] = (_CREATE_MASTER_UNDERIVED,)
 
 
@@ -3307,6 +3373,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_SPINOFF_ALLOCATIONS_VERSION,
         _PRE_SEC_FORMS_VERSION,
         _PRE_NOT_COMPUTABLE_VERSION,
+        _PRE_FILING_INDEX_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -4385,7 +4452,7 @@ def _migrate_not_computable(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 40 store to version 41.
+    version-2 to the current schema version.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -4397,7 +4464,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION` and no lab table; a version-40 or earlier store
+    `CURRENT_SCHEMA_VERSION` and no lab table; a previous-version store gains
+    the four additive EDGAR index tables, preserving all earlier rows; a version-40 or earlier store
     gets `research_results` rebuilt with `not_computable` in its verdict
     `CHECK` and `research_decisions` with `verdict_relabel` in its kind
     `CHECK` where they lack them, every row kept in insertion order, every
@@ -4578,6 +4646,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_SPINOFF_ALLOCATIONS_VERSION,
         _PRE_SEC_FORMS_VERSION,
         _PRE_NOT_COMPUTABLE_VERSION,
+        _PRE_FILING_INDEX_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4629,6 +4698,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _MERGERS_TABLE_DDL
             + _BREAKS_TABLE_DDL
             + _SPINOFF_ALLOCATIONS_TABLE_DDL
+            + _FILING_INDEX_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)

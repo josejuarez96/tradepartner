@@ -317,7 +317,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_NOT_COMPUTABLE_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FILING_INDEX_VERSION + 1
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -756,6 +756,10 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         "reconcile_breaks": [],
         "sec_filing_events": [],
         "sec_form4_transactions": [],
+        "filing_index": [],
+        "filing_index_pending": [],
+        "edgar_filers": [],
+        "edgar_index_files": [],
     }
     # And the migrated store is shaped exactly as a fresh one.
     # (A fresh store gets version 18's and version 20's two kinds before the lab's
@@ -891,10 +895,17 @@ def test_the_migration_from_version_40_widens_the_verdict_check(tmp_path: Path) 
     path = tmp_path / "v40.duckdb"
     rows = _version_40_store(path)
     with duckdb.connect(str(path)) as c:
-        rebuilt = ("research_results", "research_decisions")
+        rebuilt = (
+            "research_results",
+            "research_decisions",
+            "filing_index",
+            "filing_index_pending",
+            "edgar_filers",
+            "edgar_index_files",
+        )
         before = {name: sql for name, sql in _ddl(c).items() if name not in rebuilt}
         schema.init_schema(c)
-        assert _versions(c) == [40, 41]
+        assert _versions(c) == list(range(40, schema.CURRENT_SCHEMA_VERSION + 1))
         assert "'not_computable'" in schema._check_text(c, "research_results", "verdict")
         # Every row kept, byte-identical, in insertion order, but run 3's verdict:
         # its NaN interval bound relabels its `fail` (#2658); no other table moved.
@@ -915,7 +926,7 @@ def test_the_migration_from_version_40_widens_the_verdict_check(tmp_path: Path) 
         after = _ddl(c)
         schema.init_schema(c)
         assert _ddl(c) == after
-        assert _versions(c) == [40, 41]
+        assert _versions(c) == list(range(40, schema.CURRENT_SCHEMA_VERSION + 1))
 
 
 def conn_ddl() -> str:

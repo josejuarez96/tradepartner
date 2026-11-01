@@ -529,6 +529,8 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
     "facts",
     "statement_facts",
     "filing_events",
+    # EDGAR filing_index and its three state tables are ingest inputs only.
+    # An index revision cannot stale a trial whose readers never use it.
     # SEC ownership events are deliberately absent: no registered trial reads
     # them until a separate strategy and input fingerprint rule are approved.
     # #821 (T187): a `successor_chains` row stales every registered trial whose
