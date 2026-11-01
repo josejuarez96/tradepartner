@@ -3680,3 +3680,40 @@ def test_delisting_policies_are_pinned_by_value() -> None:
         assert all(-1.0 <= shock < 0.0 for shock in policy.shocks.values())
         with pytest.raises(TypeError):
             policy.shocks["NYSE_ARCA"] = 0.0  # type: ignore[index]
+
+
+# --- T349 (#2714): rule 5 per-field source comparison keys ---
+
+_COMPARE_KEYS = {
+    "events.form4_compare_trusted",
+    "events.form4_compare_decimals",
+    "events.form4_compare_tolerance",
+    "events.form4_compare_threshold",
+}
+
+
+def test_events_form4_compare_keys_default_report_only_and_stay_unfrozen() -> None:
+    from tradepartner.backtest import frozen, hypothesis
+
+    e = Settings(_env_file=None).events
+    assert e.form4_compare_threshold is None
+    assert e.form4_compare_decimals == 2
+    assert e.form4_compare_trusted == {} and e.form4_compare_tolerance == {}
+    assert _COMPARE_KEYS.isdisjoint(hypothesis.frozen_keys())
+    assert _COMPARE_KEYS.isdisjoint(frozen.CANONICAL_EXCLUDED_KEYS)
+    assert _COMPARE_KEYS.isdisjoint({k for k, _d, _v in frozen.FROZEN_KEY_DEFAULTS})
+
+
+def test_events_form4_compare_keys_refuse_nonsense() -> None:
+    for bad in (
+        {"form4_compare_threshold": 0},
+        {"form4_compare_threshold": 2},
+        {"form4_compare_decimals": -1},
+        {"form4_compare_decimals": 9},
+        {"form4_compare_trusted": {"price": "both"}},
+        {"form4_compare_trusted": {"nope": "xml"}},
+        {"form4_compare_tolerance": {"filer_cik": 1}},
+        {"form4_compare_tolerance": {"price": -1}},
+    ):
+        with pytest.raises(ValueError):
+            Settings(_env_file=None, events=bad)

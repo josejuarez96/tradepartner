@@ -3388,26 +3388,121 @@ def test_no_adapter_is_imported() -> None:
     assert "fake_broker" not in source and "alpaca_broker" not in source
 
 
-def test_stock_dividends_picks_only_in_band_splits_before_the_session() -> None:
-    """#1627: `_stock_dividends` seats a `CIL` beside a held stock dividend, so it
-    must read a stock-only band: a `split` with `1 < ratio <= stock_dividend_max_rate`
-    whose ex-date is at or before the session, and never a 2:1 split, a reverse
-    split, a non-split row, or a split whose ex-date has not passed. The result is
-    `(ex_date, last_acceptable_CIL_date, ratio)`; a zero lag keeps the window on
-    the ex-date."""
+def test_stock_dividends_picks_any_split_before_the_session() -> None:
+    """#2184: `_stock_dividends` seats a `CIL` beside any held split that can leave
+    a fractional share, so it reads every `split` row whose ex-date is at or before
+    the session: an in-band stock dividend, a forward split above
+    `stock_dividend_max_rate` and a reverse split (ratio < 1) alike, and never a
+    non-split row, a ratio of 1 (or less than 0), or a split whose ex-date has not
+    passed. The result is `(ex_date, last_acceptable_CIL_date, ratio)`; a zero lag
+    keeps the window on the ex-date."""
     actions = pl.DataFrame(
         {
-            "security_id": ["A", "B", "C", "D", "E", "F"],
-            "action_type": ["split", "split", "split", "split", "dividend", "split"],
-            "ex_date": [S, S, S, S, S, S + timedelta(days=1)],
-            "ratio_or_amount": [1.005, 2.0, 1.20, 0.5, 1.1, 1.10],
+            "security_id": ["A", "B", "C", "D", "E", "F", "G", "H"],
+            "action_type": ["split"] * 4 + ["dividend"] + ["split"] * 3,
+            "ex_date": [S, S, S, S, S, S + timedelta(days=1), S, S],
+            "ratio_or_amount": [1.005, 2.0, 1.20, 0.1, 1.1, 1.10, 1.0, -2.0],
         }
     )
 
-    assert reconcile_run._stock_dividends(actions, S, 1.25, 0) == {
+    assert reconcile_run._stock_dividends(actions, S, 0) == {
         "A": (S, S, 1.005),
+        "B": (S, S, 2.0),
         "C": (S, S, 1.20),
+        "D": (S, S, 0.1),
     }
+
+
+def _fractional_split_case(
+    settings: Settings,
+    fake: BookedFake,
+    window: PaperWindowRow,
+    ratio: float,
+    held: float,
+    broker_whole: float,
+    pay: bool = True,
+) -> float:
+    """Hold `held` SPY, store a split of `ratio` at S, and make the fake broker
+    credit `broker_whole` shares plus (when `pay`) a `CIL` of the fraction at the
+    post-ex price (the pre-ex close / ratio). Returns the expected cash."""
+    reference = _reference(settings, SPY)
+    _hold(settings, fake, window, {(SPY, "SPY"): held})
+    _split(settings, SPY, ratio, CUT - timedelta(hours=1))
+    fraction = held * ratio - broker_whole
+    expected = fraction * (reference / ratio)
+    fake.extra_quantity = {"SPY": broker_whole - held}
+    if pay:
+        fake.extra_cash = expected
+        fake.activities = [_CIL_ACTIVITY("act-cil", expected)]
+    return expected
+
+
+@pytest.mark.parametrize(("ratio", "whole"), [(1.5, 22.0), (0.1, 1.0)])
+def test_cash_in_lieu_of_a_forward_or_reverse_split_reconciles_ok(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    ratio: float,
+    whole: float,
+) -> None:
+    """#2184 probes: 15 shares through a 3-for-2 (22.5 -> 22 + 0.5) and a 1-for-10
+    reverse split (1.5 -> 1 + 0.5) reconcile `ok` with one `cash_in_lieu` row."""
+    _fractional_split_case(journal_settings, fake, open_window, ratio, 15.0, whole)
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert [
+        (a.kind, a.broker_activity_id) for a in _adjustments(journal_settings, open_window)
+    ] == [("cash_in_lieu", "act-cil")]
+
+
+def test_a_whole_reverse_split_result_reconciles_without_a_cash_in_lieu(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2184: 20 shares at 1-for-10 are 2 whole shares; no `CIL`, no adjustment."""
+    _fractional_split_case(journal_settings, fake, open_window, 0.1, 20.0, 2.0, pay=False)
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_a_reverse_split_cash_in_lieu_beyond_the_tolerance_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2184: the amount check is unchanged for a reverse split: 85% of the
+    expected cash is off beyond `risk.cash_in_lieu_tolerance` and halts."""
+    expected = _fractional_split_case(journal_settings, fake, open_window, 0.1, 15.0, 1.0)
+    fake.extra_cash = expected * 0.85
+    fake.activities = [_CIL_ACTIVITY("act-cil", expected * 0.85)]
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+
+def test_a_cash_in_lieu_on_a_name_with_no_split_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2184: widening the ratio guard adds no split-less name: a `CIL` for a held
+    name with no split stays `unexplained_activity`."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 15.0})
+    fake.extra_cash = 50.0
+    fake.activities = [_CIL_ACTIVITY("act-cil", 50.0)]
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
 
 
 # --- review follow-ups: the cash base, dedupe, the reference cut, failures ----

@@ -115,6 +115,39 @@ def test_incremental_pairing_uses_stored_and_new_rows(
     assert [(r.cik, r.accession) for r in result.rows] == [(APPLE, accession)]
 
 
+def test_incremental_writes_first_listing_position(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The parser numbers data rows; a duplicate keeps its first position (#2813)."""
+    from tradepartner.adapters.edgar import parse_filing_index
+
+    text = (
+        index_header()
+        + index_line("10-K", "Other", int(APPLE) + 1, "2026-04-01", "0000000001-26-000009")
+        + index_line("10-K", "Company", int(APPLE), "2026-04-01", "0000320193-26-000001")
+        + index_line("10-K", "Company", int(APPLE), "2026-04-01", "0000320193-26-000001")
+    )
+    parsed = parse_filing_index(text, {}).unstamped
+    assert [r.list_position for r in parsed] == [0, 1, 2]
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    file = _incremental_file(date(2026, 4, 1))
+    monkeypatch.setattr(source, "_incremental_daily_rows", lambda _file: parsed)
+    monkeypatch.setattr(
+        source,
+        "_incremental_stamps",
+        lambda rows: {
+            (name, acc): datetime(2026, 4, 1, tzinfo=UTC)
+            for name, by_accession in rows.items()
+            for acc in by_accession
+        },
+    )
+    result = source.incremental_index(
+        _incremental_state(files=(file,), issuer_ciks=frozenset({APPLE}))
+    )
+    assert {r.cik: r.list_position for r in result.listings}[APPLE] == 1
+    assert sum(r.cik == APPLE for r in result.listings) == 1
+
+
 def test_incremental_repost_and_cross_quarter_revision(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

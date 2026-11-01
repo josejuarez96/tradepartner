@@ -873,12 +873,14 @@ def _spinoffs(
 
 
 def _stock_dividends(
-    actions: pl.DataFrame, session: date, max_rate: float, max_lag_sessions: int
+    actions: pl.DataFrame, session: date, max_lag_sessions: int
 ) -> dict[str, tuple[date, date, float]]:
-    """`security_id`s with a stock dividend stored as a `SPLIT` action (#1627):
-    a ratio in `(1, max_rate]` — the same `alpaca.stock_dividend_max_rate` guard
-    `#1618` (T186-family) stores one by — each mapped to `(first_date, last_date,
-    ratio)`: the name's latest `ex_date <= session`, that ex-date advanced up to
+    """`security_id`s with a split of any kind stored as a `SPLIT` action (#1627,
+    widened by #2184): a stock dividend in `(1, alpaca.stock_dividend_max_rate]`,
+    a forward split above it, or a reverse split (ratio < 1), so any split that
+    can leave a fractional share is explained; only a ratio of 1 or less than or
+    equal to 0 is excluded. Each is mapped to `(first_date, last_date, ratio)`: the
+    name's latest `ex_date <= session`, that ex-date advanced up to
     `max_lag_sessions` XNYS sessions (the `alpaca.cash_in_lieu_max_lag_sessions`
     window Alpaca pays cash in lieu on, the payable date), clamped to `session`,
     and its ratio. A `CIL` cash-in-lieu activity is reconciled into a
@@ -887,8 +889,8 @@ def _stock_dividends(
     whole shares plus cash); otherwise it is `unexplained_activity`."""
     rows = actions.filter(
         (pl.col("action_type") == _SPLIT)
-        & (pl.col("ratio_or_amount") > 1)
-        & (pl.col("ratio_or_amount") <= max_rate)
+        & (pl.col("ratio_or_amount") > 0)
+        & (pl.col("ratio_or_amount") != 1)
         & (pl.col("ex_date") <= session)
     )
     latest: dict[str, tuple[date, float]] = {}
@@ -991,7 +993,6 @@ def _explanations(
     stock_dividends = _stock_dividends(
         actions,
         session,
-        settings.alpaca.stock_dividend_max_rate,
         settings.alpaca.cash_in_lieu_max_lag_sessions,
     )
     return Explanations(
@@ -1836,6 +1837,85 @@ def _auto_true_up_rows(
     return rows
 
 
+def _finding_key(mismatch: Mismatch, positions: Mapping[str, Position]) -> str | None:
+    """A finding part's `finding_key` (#2266 item 4), or None for any other kind."""
+    if mismatch.kind == break_rules.UNKNOWN_SYMBOL and mismatch.symbol is not None:
+        return break_rules.unknown_symbol_key(mismatch.symbol, positions[mismatch.symbol].quantity)
+    if mismatch.kind == MERGER_CONFLICT:
+        # The conflict detail is made by _conflict_detail from the
+        # sorted deal ids. Parse that fixed format, never its wording.
+        match = re.search(r"merger ids (\[[^\]]*\]) for ", mismatch.detail)
+        if match is None:
+            raise ValueError("merger conflict has no deal ids")
+        ids = ast.literal_eval(match.group(1))
+        if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+            raise ValueError("merger conflict has invalid deal ids")
+        return break_rules.merger_conflict_key(ids)
+    if mismatch.kind == UNEXPLAINED_DIVIDEND_GROUP:
+        dates = re.findall(r"ex-date (\d{4}-\d{2}-\d{2})", mismatch.detail)
+        if not dates or mismatch.security_id is None:
+            raise ValueError("dividend finding has no name or ex-date")
+        return break_rules.dividend_group_key(
+            mismatch.security_id, (date.fromisoformat(day) for day in dates)
+        )
+    return None
+
+
+def acknowledged_keys(events: Iterable[ReconcileBreakRow]) -> frozenset[str]:
+    """The `finding_key`s an owner true-up acknowledged (#2266 item 9): the finding
+    parts of every break whose latest event is `trued_up`. The classifier does not
+    reopen a break while `compare` raises one of these keys again."""
+    latest: dict[str, ReconcileBreakRow] = {}
+    for event in sorted(events, key=lambda e: e.event_id or 0):
+        latest[event.break_id] = event
+    return frozenset(
+        part["finding_key"]
+        for event in latest.values()
+        if event.event == "trued_up"
+        for part in json.loads(event.parts_json)
+        if part["kind"] in break_rules.FINDING_KINDS and part.get("finding_key") is not None
+    )
+
+
+def _acknowledged(
+    mismatch: Mismatch,
+    acknowledged: frozenset[str],
+    positions: Mapping[str, Position],
+    open_names: Collection[str],
+) -> bool:
+    """Whether an owner true-up acknowledged this finding (#2266 item 9). Never
+    while a break is open on its name, so that break keeps its current figures and
+    can still be trued up; a key that cannot be read is not acknowledged (the
+    break-event write then fails closed on it, as before)."""
+    if not acknowledged or (mismatch.security_id or mismatch.symbol) in open_names:
+        return False
+    try:
+        return _finding_key(mismatch, positions) in acknowledged
+    except ValueError:
+        return False
+
+
+def _without_acknowledged(
+    result: Reconciliation,
+    acknowledged: frozenset[str],
+    positions: Mapping[str, Position],
+    account_cash: float,
+    open_names: Collection[str] = (),
+) -> Reconciliation:
+    """`result` less every finding mismatch whose key an owner true-up acknowledged
+    (#2266 item 9), its status re-derived in `compare`'s order. A `breaks` result
+    left with no residual is `ok`, its base the broker's cash."""
+    kept = tuple(
+        m for m in result.mismatches if not _acknowledged(m, acknowledged, positions, open_names)
+    )
+    if len(kept) == len(result.mismatches):
+        return result
+    result = replace(result, mismatches=kept)
+    if result.status == BREAKS and not kept:
+        return replace(result, status=OK, broker_cash=account_cash, adjustments=result.explained)
+    return result
+
+
 def _write_break_events(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -1902,28 +1982,7 @@ def _write_break_events(
             old = next((p for p in old_parts if p["kind"] == mismatch.kind), None)
             if old is not None:
                 cause = old["cause"]
-            finding = None
-            if mismatch.kind == break_rules.UNKNOWN_SYMBOL and mismatch.symbol is not None:
-                finding = break_rules.unknown_symbol_key(
-                    mismatch.symbol, positions[mismatch.symbol].quantity
-                )
-            elif mismatch.kind == MERGER_CONFLICT:
-                # The conflict detail is made by _conflict_detail from the
-                # sorted deal ids. Parse that fixed format, never its wording.
-                match = re.search(r"merger ids (\[[^\]]*\]) for ", mismatch.detail)
-                if match is None:
-                    raise ValueError("merger conflict has no deal ids")
-                ids = ast.literal_eval(match.group(1))
-                if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
-                    raise ValueError("merger conflict has invalid deal ids")
-                finding = break_rules.merger_conflict_key(ids)
-            elif mismatch.kind == UNEXPLAINED_DIVIDEND_GROUP:
-                dates = re.findall(r"ex-date (\d{4}-\d{2}-\d{2})", mismatch.detail)
-                if not dates or mismatch.security_id is None:
-                    raise ValueError("dividend finding has no name or ex-date")
-                finding = break_rules.dividend_group_key(
-                    mismatch.security_id, (date.fromisoformat(day) for day in dates)
-                )
+            finding = _finding_key(mismatch, positions)
             parts.append(
                 break_rules.BreakPart(
                     kind=mismatch.kind,
@@ -2255,6 +2314,16 @@ def reconcile_now(
             ),
         )
 
+    with connect() as conn:
+        # Item 9: an acknowledged finding raised again with the same key is no
+        # break; a changed key (another quantity, merger id or ex-date) is.
+        result = _without_acknowledged(
+            result,
+            acknowledged_keys(e for e in break_events_for(conn, window_id) if e.known_at <= as_of),
+            positions,
+            float(account.cash),
+            {row.name for row in open_breaks(conn, window_id) if row.name is not None},
+        )
     names = {m.security_id for m in result.mismatches if m.security_id is not None} | set(
         ledger.positions
     )

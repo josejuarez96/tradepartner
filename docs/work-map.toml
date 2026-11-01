@@ -1655,22 +1655,37 @@ unblocks = ["task:T326"]
 
 [task.T326]
 what = "Add separate delisting reason fact rows and as-of reads after schema versions 41 and 42; universe and execution reads remain blind."
-why = "An exit can only use evidence visible at its deciding read and registered cutoff under the approved timing rule."
-unblocks = ["task:T327", "task:T328"]
+why = "An exit can only use evidence known by the trial's registered data cutoff (owner, 2026-10-31)."
+unblocks = ["task:T327", "task:T328a", "task:T328b"]
 
 [task.T327]
 what = "Classify delisting reasons from Form 25 and matched 8-K item evidence."
 why = "Failure and merger exits need distinct, auditable evidence."
 unblocks = ["task:T329"]
 
-[task.T328]
-what = "Register a frozen failure-delisting return policy, severe unknown-exit variant, and conditional reason/merger trial vintage."
-why = "A last-close exit can overstate returns after a failed listing, and backfilled evidence must stale affected trials."
+[task.T328a]
+what = "Add the frozen failure-delisting return key with its versioned exchange maps, and refuse it for shorts and until the engine applies it."
+why = "A last-close exit can overstate returns after a failed listing; the key must land without moving any stored fingerprint."
+unblocks = ["task:T328d"]
+
+[task.T328b]
+what = "Add the two exit-evidence provider reads, delisting reasons and merger consideration, known at the trial's data cutoff."
+why = "The engine and the coverage report need one written read contract, implemented by the store provider in the same PR."
+unblocks = ["task:T328c"]
+
+[task.T328c]
+what = "Apply failure shocks and merger consideration at delisting exits under a nonzero policy, with fallback and conflict counts."
+why = "Confirmed failures and mergers need explicit, counted exit values; 0% runs stay byte-identical."
 unblocks = ["task:T329"]
 
+[task.T328d]
+what = "Count reason and merger rows in the trial vintage only under a nonzero delisting policy, in every per-trial vintage caller."
+why = "Backfilled evidence must stale affected trials while 0% trials keep their vintage."
+unblocks = ["task:T328c", "task:T329"]
+
 [task.T329]
-what = "Feed deciding-read-visible reasons and mergers only to backtest exit costs; report unknown coverage and withheld shocks."
-why = "Later evidence must not change an earlier exit under the approved timing rule."
+what = "Report unknown-exit count and share beside every grid row, and delisting reason coverage in health, with reasons known by the registered data cutoff."
+why = "Every grid row, including last close only, must show how much of its exit evidence is unknown."
 
 [task.T354]
 what = "Read-only macOS spike to pin iCloud upload status, brctl commands and a bounded confirmation wait."
