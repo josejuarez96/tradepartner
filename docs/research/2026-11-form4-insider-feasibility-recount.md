@@ -13,7 +13,7 @@ The snapshot is complete under the T343 ratio rule: 0 of 32 quarters are below 0
 
 All names passes every gate on these counts: 2,882 events, 0.6% missing entry bars, and treated and neutral delister coverage of 100% and 93.6%. But the frozen kill line is conjunctive across strata ("n_eff ≥ 400 in **each** stratum"), and the plan says the recount "may not ... drop a stratum". So all names alone cannot carry the study. The plan's outcome on FAIL therefore applies. The study is recorded INSUFFICIENT by this note and by the B7 rows of the [hypothesis backlog](hypothesis-backlog.md), and T332 to T341 and T344 are struck, not built.
 
-Confidence: **high** that the label is FAIL. Both $200M clauses hold under every interpretation choice the script made (see [Robustness](#why-the-fail-is-robust)). The 47 is an upper bound.
+Confidence: **high** that the label is FAIL. The floor clause holds under every interpretation choice the script made and alone carries the FAIL. The treated-delister clause holds under choices 1 to 7 and 10; under choice 8 and #2720 only the floor decides (see [Robustness](#why-the-fail-is-robust)). The 47 is an upper bound.
 
 ## What ran
 
@@ -32,7 +32,7 @@ Confidence: **high** that the label is FAIL. Both $200M clauses hold under every
 
 ## Snapshot completeness (T343 ratio, blocking)
 
-**COMPLETE: 0 of 32 quarters (2016Q1 to 2023Q4) below 0.8 × median; no quarter with zero accessions.** The lowest ratios are 2023Q4 0.92 (its last two days are cut by the read boundary, choice 6), 2019Q4 0.92 and 2022Q4 0.93. Every year from 2017 to 2023 is fully observed (A1). 2016 is not, by rule, since A1 requires 2017 or later. The first run's nearly empty quarters (2018Q4, 2019Q1, 2019Q3 to Q4, 2020Q1, 2020Q3, 2021Q3) are now at 0.92 (2019Q4) to 1.11.
+**COMPLETE: 0 of 32 quarters (2016Q1 to 2023Q4) below 0.8 × median; no quarter with zero accessions.** The lowest ratios are 2023Q4 0.92 (its last two days are cut by the read boundary, choice 6), 2019Q4 0.92, and 2022Q4 and 2023Q3 0.93. Every year from 2017 to 2023 is fully observed (A1). 2016 is not, by rule, since A1 requires 2017 or later. The first run's nearly empty quarters (2018Q4, 2019Q1, 2019Q3 to Q4, 2020Q1, 2020Q3, 2021Q3) are now at 0.92 (2019Q4) to 1.11.
 
 Qualifying-row series (non-blocking): rows ratio from 0.70 (2019Q4) to 1.69 (2018Q4). The per-quarter table is in `recount-diag.txt` (`[ratio]` lines).
 
@@ -62,30 +62,30 @@ At vote level, 10,353 of 55,229 window votes (18.7%) are classifiable. Of the un
 
 The effective-date reading is near 0 because `effective_on` is always the filing date + 10 days in this store (T343, known data limits). It is reported only.
 
-**Against the first, partial run** (plan amendment): $200M rose from 16 to 47, all names from 1,830 to 2,882, missing entry bars fell from about 35% to 0.6%, and all-names neutral delister coverage rose from 8% to 27% to 93.6%. Two things moved these numbers: the second backfill run, and T343's A3, which takes unmapped issuers out of the entry-bar denominator. Only the $200M stratum still fails.
+**Against the first, partial run** (plan amendment; its counts were not necessarily the same quantities as these, so this is a rough comparison): the plan reports 16 opportunistic events at $200M and 1,830 in all names, about 35% of all-names events without an entry bar, and 8% to 27% neutral in-span delister coverage (stratum not stated). This run gives n = 47 and 2,882, 0.6% and 93.6% (all names). Two changes are plausible causes, the second backfill run and T343's A3 (unmapped issuers leave the entry-bar denominator), but their shares were not measured. Only the $200M stratum still fails.
 
 ## Why the FAIL is robust
 
-Each $200M clause is enough for FAIL by itself, and each holds under every choice in the script's README:
+Each $200M clause is enough for FAIL by itself. The floor clause holds under every choice in the script's README and alone carries the FAIL; the treated-delister clause holds under choices 1 to 7 and 10, and under choice 8 only the floor decides. Where a cell is reasoning rather than a counted bound, it says so:
 
 | # | Choice | Can it move the $200M floor (47 vs 400)? | The treated-delister clause? |
 |---|---|---|---|
 | 1 | "Otherwise eligible" leaves out the runner's `no_mcap` and `no_beta` drops (they need shares facts and adjusted bars) | Only down: applying them can remove events, never add one. **The true n is at most 47** | Removing events cannot add a delister |
 | 2 | Treated pool for coverage = opportunistic (alt adds routine) | No (the floor is opportunistic by the frozen table) | No: alt is also 0 / 0 |
 | 3 | Neutral pool sessions = entry sessions of eligible opportunistic events | No | No (it touches the neutral pool only) |
-| 4 | "Between entry and scheduled exit" includes both ends | No | No: the delisted-any-time reading, which takes any last listed session at or after entry, is also 0 / 0. None of the 47 events is on a Form 25 delister |
+| 4 | "Between entry and scheduled exit" includes both ends | No | No: the delisted-any-time reading, which takes any last listed session at or after entry, is also 0 / 0. None of the 47 events is on an A6 delister with a last listed session at or after entry |
 | 5 | Bar existence on raw traded bars, not adjusted | Not upward. The price and liquidity filters use raw close and volume as A3 pins. `no_entry_bar` is 0 of 47, so n already equals the eligible count and cannot exceed it | No |
 | 6 | Ratio counts use form `4` only; 2023Q4 cut at the boundary | No. Another ratio reading can only add an "incomplete snapshot" clause, which is another FAIL | No |
 | 7 | History from 2017-01-01; the window filter is on acceptance, before coalescing | No. History from 2017-01-01 and acceptances 2020-01-01 to 2023-11-30 are the frozen values applied as written, and A1 already rules out years before 2017 as observed | No |
-| 8 | `securities` CIK map as of the window-end cut; classification as of each entry cutoff | No. The script's own diagnostic bounds it: only 257 `no_common_security` events, of any kind and any liquidity, would map under the window-end classification. 47 + 257 = 304 < 400 even if every one were opportunistic, at least $200M and had an entry bar. A read later than the cutoff is outside the frozen boundary | It could add a delister only among those 257; the floor clause fails anyway |
-| 9 | A3's class choice uses the bar on E−1 | No. The rule already picks the most liquid common class, so another class cannot raise the dollar volume | No |
+| 8 | `securities` CIK map as of the window-end cut; classification as of each entry cutoff | No. Classification half (counted): the script's diagnostic gives only 257 `no_common_security` events, of any kind and any liquidity, that would map under the window-end classification; 47 + 257 = 304 < 400 even if every one were opportunistic, at least $200M and had an entry bar. CIK-map half (reasoning): the window-end cut is the latest read the boundary allows, so an earlier map (as of each entry cutoff) would know the same or fewer securities | Not shown robust: a remapped event could sit on a delister. Only the floor decides here |
+| 9 | A3's class choice uses the bar on E−1 | No for the class choice: the rule already picks the most liquid common class, so another class cannot raise the dollar volume. Reasoning, not a bound: a different "prior raw bar" (the last bar before E rather than E−1) could admit a security with no bar on E−1; at a $200M median dollar volume such gaps are implausible at the 353-event scale | Reasoning only, as for the floor |
 | 10 | The Form 4 tables are read by direct SQL, not the gated `sec_*_as_of` readers | No. The schema enforces `known_at = accepted_at`, and the script cuts on `accepted_at <= close(2023-12-29)`. The gated readers return the same rows | No |
 
-The orchestrator's brief speaks of eleven interpretation choices. The README numbers ten, so this table covers ten. Choices 1, 5 and 9 can only lower n, and choice 8 has a stated ceiling of 304. No choice can lift the $200M stratum to 400.
+Choices 1 and 5 can only lower n, choice 8's classification half has a counted ceiling of 304, and choices 8 (CIK map) and 9 are bounded by reasoning. No choice can lift the $200M stratum to 400.
 
 **#2720, multi-owner roles (reasoning, not a measurement).** The correction re-pins officer and director flags among the reporting owners of stored multi-owner filings. The orchestrator gives about 46k such filings in the store, a figure not re-counted here. #2720 estimates 50 to 60 mispinned accessions among about 9,820 multi-owner accessions from 2022q4 to 2025q1, and fewer elsewhere. Two confirmed rows are wrong.
 
-A role fix changes which owner's lines qualify and so which (filer, issuer) votes and histories exist. It cannot change an event's issuer, acceptance, price, dollar volume, bars or delisting. So it cannot touch what cuts $200M from 3,662 mapped opportunistic events to 47, which is the dollar-volume floor, and it cannot add a delister. To reach 400 it would have to create 353 new opportunistic $200M events. It would do that by giving hundreds of liquid-name insiders three prior years of qualifying purchases, or a qualifying role, that they lack today. That needs on the order of hundreds of corrected accessions concentrated in $200M names, against the issue's estimate of tens.
+A role fix changes which owner's lines qualify and so which (filer, issuer) votes and histories exist. It cannot change an event's issuer, acceptance, price, dollar volume or bars. At $200M, 1,146 events of any kind are otherwise eligible and only 51 of them are classifiable (47 opportunistic, 4 routine). To reach 400, the fix would have to turn 353 of the 1,095 unclassifiable ones opportunistic (or create new eligible events) by giving their insiders three prior years of qualifying purchases, or a qualifying role, that they lack today. One corrected accession can serve as history for several later votes of the same (filer, issuer) pair, but even so this needs on the order of a hundred or more corrected accessions concentrated in $200M names, against the issue's estimate of tens. A new or relabelled event could sit on a security that later delists, so #2720 could in principle add a treated delister; for #2720, as for choice 8, only the floor decides.
 
 The weakest link is that estimate. #2720's own step 1 counts the corrected accessions and will confirm or refute it. #2708 changes only `security_title`, which nothing here reads.
 
@@ -93,7 +93,7 @@ The weakest link is that estimate. #2720's own step 1 counts the corrected acces
 
 - **The study is INSUFFICIENT under its own feasibility gate.** This note is the result. The B7 summary row, the B7 item and the B7 ladder-ledger row in the [hypothesis backlog](hypothesis-backlog.md) are updated in the same PR (class B).
 - **T332 to T341 and T344 are struck, not built** (plan amendment). This PR does not edit the plan file: the T342 line names only this note and the B7 row. Striking the lines is an owner item below.
-- **Family N under research-registry req 9.** The frozen table says "Count **N +2** ... even if a run fails or is refused". No run was opened, so N has not moved. The plan asks this note to state whether the owner charges the +2. **He has not said; it is open question 1.**
+- **Family N under research-registry req 9.** The frozen table says "Count **N +2** ... even if a run fails or is refused". No run was opened, so N has not moved. The plan asks this note to state whether the owner charges the +2. **He has not said yet; it is open question 1, to be answered on this PR (class B, so it waits for his word anyway) and recorded here and in the B7 rows before merge.**
 - The search-limit tally already counts B7 as candidate 3, with its registered event study counted with it. That does not change.
 
 ## Open questions for the owner
@@ -102,13 +102,14 @@ The weakest link is that estimate. #2720's own step 1 counts the corrected acces
 2. **Ledger decision value:** the plan directs "INSUFFICIENT" but not a ledger `decision` value. The B7 row now reads "registered study INSUFFICIENT at its feasibility gate". Should it read `retired`, `parked` or `deferred: <reason>` (for example, re-entry only with a new registration)?
 3. **Striking T332 to T341 and T344** in `docs/plans/research-registry.md`: in a follow-up PR (class B), or by the fold?
 4. **L5:** should the verdict also get a `TP-` claim in [claims.toml](claims.toml)? Ladder rule L5 records ladder verdicts that way, and this PR does not add one.
+5. **Committed queries:** the plan asks for the method's queries in this note's appendix; the appendix gives gate definitions in words. Commit `recount.py` (sha256 above) or its SQL into the repo, or waive it?
 
 ## Caveats & gaps
 
 - The run preceded #2720. The script README's step 1 asked for #2720 first, and the robustness argument for it is reasoning, not a recount.
 - n is an upper bound: the `no_mcap` and `no_beta` drops were not applied.
 - The all-names treated delister set is two securities, so its 100% coverage is thin and reported only.
-- The method is committed below as gate definitions. The script itself lives outside the repo, pinned by its sha256. T340 planned to re-run "T342's committed coverage queries"; with the study struck, that need lapses.
+- The method is committed below as gate definitions, not as queries. The plan's T342 line asks for the queries in an appendix; the script that ran lives outside the repo (`~/tradepartner-probes/t342/`), pinned by its sha256, so the FAIL cannot be re-run from the repo alone. Committing the script or its SQL, or waiving that, is open question 5.
 - Voluntary delistings are absent: the store holds exchange-filed 25-NSE forms only (T343, known data limits).
 
 ## UNVERIFIED items
