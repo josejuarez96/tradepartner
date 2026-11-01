@@ -1,6 +1,6 @@
-"""The existing-cache migration runner, move and backup classes (plan T361a, #2765,
-and T361b, #2775; data-foundation spec amendment 2026-10-31, #2743, items 2, 3, 4,
-6 and 7). Restore is a later slice (T361c).
+"""The existing-cache migration runner, move and backup classes, and restore (plan
+T361a, #2765, T361b, #2775 and T361c, #2777; data-foundation spec amendment
+2026-10-31, #2743, items 2 to 7).
 
 `apply_migration` moves the files T360's planner classes as `move` out of
 `edgar.cache_dir` into the raw archive by content hash, with no SEC request and
@@ -43,6 +43,19 @@ body archived is marked moved; one with neither stops the run loudly
 (`MigrationStoppedError`). A changed source is skipped and reported. The manifest
 is built from the journal alone, so it is the same digest however often the run
 was cut. A run with nothing left to move changes nothing but a closed journal.
+
+**Restore (T361c).** `restore_files(settings, cache_dir, icloud, path=..., run=...)`
+is the only way back (item 5). The files come from the tombstone index (moved
+files, the latest line per path) and from a run's migration manifest (backup
+files, and with `run` every file of that manifest); `run` defaults to the latest
+run. `path` is one relative path or a folder prefix. It refuses, with nothing
+written, when nothing matches, when any target already exists locally (each is
+named; the owner moves it aside), when the floor would be crossed, or when T346's
+`download_inputs` finds a body offline or mismatched. Each body is then streamed
+to a temp file beside its target, hashed, set to the original mtime, and linked
+into place (`os.link` never replaces); a failure removes every file this call
+made. A `restored` line (`"op": "restored"`) per file is appended to the index.
+Restore copies: the archived body stays.
 """
 
 from __future__ import annotations
@@ -65,12 +78,19 @@ from tradepartner.store.raw_archive import (
     adopt_file,
     archive_body,
     archive_manifest,
+    body_path,
+    download_inputs,
     evict_uploaded,
     is_archived,
     local_body_matches,
+    read_manifest,
     same_filesystem,
 )
-from tradepartner.store.raw_archive_config import migration_config
+from tradepartner.store.raw_archive_config import (
+    check_archive_write,
+    migration_config,
+    require_archive_root,
+)
 from tradepartner.store.raw_archive_plan import (
     CacheFile,
     MigrationClass,
@@ -448,3 +468,134 @@ def _intent(planned: PlannedFile, sha: str) -> dict[str, Any]:
         "mtime_ns": planned.mtime_ns,
         "sha256": sha,
     }
+
+
+class RestoreRefusedError(RuntimeError):
+    """A restore refuses with nothing written (no match, or a local file in the way)."""
+
+
+@dataclass(frozen=True)
+class RestoreResult:
+    """One `restore_files` call: the run restored from and each path's SHA-256."""
+
+    run_id: str | None
+    restored: dict[str, str]
+
+
+def _in_scope(candidate: str, path: str) -> bool:
+    prefix = path.strip("/")
+    return not prefix or candidate == prefix or candidate.startswith(prefix + "/")
+
+
+def _closed_runs(keep_dir: Path) -> dict[str, tuple[str, str]]:
+    """Closed runs, run id -> (started_at, manifest digest), from the journals."""
+    out: dict[str, tuple[str, str]] = {}
+    for journal in keep_dir.glob("journal-*.jsonl"):
+        records = _read_lines(journal)
+        start = next((r for r in records if r["op"] == "start"), None)
+        manifest = next((r for r in records if r["op"] == "manifest"), None)
+        if start is not None and manifest is not None:
+            out[start["run"]] = (start["at"], manifest["digest"])
+    return out
+
+
+def _restore_plan(
+    settings: Settings, keep_dir: Path, path: str, run: str | None
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """The entries (path, sha256, bytes, mtime_ns, run) a restore would write."""
+    runs = _closed_runs(keep_dir)
+    if run is not None and run not in runs:
+        raise RestoreRefusedError(f"unknown run {run}; nothing was restored")
+    chosen = run or max(runs, key=lambda r: runs[r][0], default=None)
+    entries: dict[str, dict[str, Any]] = {}
+    if run is None:  # moved files: the latest tombstone line per path
+        for line in _read_lines(keep_dir / INDEX):
+            if line.get("op") == "restored":
+                continue
+            entries[line["path"]] = line
+    if chosen is not None:
+        doc = json.loads(read_manifest(settings, runs[chosen][1]))
+        for item in doc["files"]:
+            if item["sha256"] is None or item["state"] in {"changed", "duplicate_kept"}:
+                continue
+            if run is not None or item["class"] == "backup":
+                entries[item["path"]] = {**item, "run": chosen}
+    return chosen, [e for p, e in sorted(entries.items()) if _in_scope(p, path)]
+
+
+def restore_files(
+    settings: Settings,
+    cache_dir: Path,
+    icloud: ICloudItems,
+    *,
+    path: str,
+    run: str | None = None,
+    now: Callable[[], datetime] = _utcnow,
+) -> RestoreResult:
+    """Copy archived files back to their original paths and mtimes (module
+    docstring: Restore). Raises `RestoreRefusedError`, or T346's offline,
+    integrity and floor errors, always before any file is written."""
+    keep_dir = cache_dir / TOMBSTONE_DIR
+    chosen, entries = _restore_plan(settings, keep_dir, path, run)
+    if not entries:
+        raise RestoreRefusedError(f"no archived file matches {path!r}; nothing was restored")
+    present = [e["path"] for e in entries if os.path.lexists(cache_dir / e["path"])]
+    if present:
+        raise RestoreRefusedError(
+            "restore never overwrites a local file; move these aside first: "
+            + ", ".join(present)
+            + "; nothing was restored"
+        )
+    root = require_archive_root(settings)
+    check_archive_write(settings, cache_dir, sum(e["bytes"] for e in entries))
+    download_inputs(settings, list(dict.fromkeys(e["sha256"] for e in entries)), icloud)
+    # the downloads used space too: check the copies again against what is left
+    check_archive_write(settings, cache_dir, sum(e["bytes"] for e in entries))
+
+    staged: list[tuple[Path, Path, dict[str, Any]]] = []
+    linked: list[Path] = []
+    try:
+        for entry in entries:
+            target = cache_dir / entry["path"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temp = target.parent / f".restore-{uuid.uuid4().hex}"
+            staged.append((temp, target, entry))
+            digest = hashlib.sha256()
+            with body_path(root, entry["sha256"]).open("rb") as src, temp.open("wb") as dst:
+                while chunk := src.read(_CHUNK):
+                    digest.update(chunk)
+                    dst.write(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+            if digest.hexdigest() != entry["sha256"]:
+                raise RestoreRefusedError(f"{entry['path']}: the archived body changed mid-copy")
+            os.utime(temp, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+        for temp, target, _entry in staged:
+            os.link(temp, target)
+            linked.append(target)
+    except BaseException:
+        for target in linked:
+            target.unlink(missing_ok=True)
+        raise
+    finally:
+        for temp, _target, _entry in staged:
+            temp.unlink(missing_ok=True)
+    for directory in {t.parent for _t, t, _e in staged}:
+        _fsync_dir(directory)
+    stamp = now().isoformat()
+    _append(
+        keep_dir / INDEX,
+        *(
+            {
+                "op": "restored",
+                "path": e["path"],
+                "bytes": e["bytes"],
+                "sha256": e["sha256"],
+                "mtime_ns": e["mtime_ns"],
+                "run": e.get("run"),
+                "restored_at": stamp,
+            }
+            for _t, _p, e in staged
+        ),
+    )
+    return RestoreResult(run_id=chosen, restored={e["path"]: e["sha256"] for e in entries})
