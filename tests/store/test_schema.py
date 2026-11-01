@@ -2413,9 +2413,9 @@ def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
         schema.init_schema(conn)
         assert "snapshot_sightings" in _shape(conn)
         assert max(_versions(conn)) == schema.CURRENT_SCHEMA_VERSION
-        assert _versions(conn) == [41, 42, 43, 44, 45]
+        assert _versions(conn) == [41, 42, 43, 44, 45, 46]
         schema.init_schema(conn)
-        assert _versions(conn) == [41, 42, 43, 44, 45]
+        assert _versions(conn) == [41, 42, 43, 44, 45, 46]
     finally:
         conn.close()
 
