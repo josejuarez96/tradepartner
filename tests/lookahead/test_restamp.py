@@ -1154,3 +1154,30 @@ def test_a_refused_form_25_subject_keeps_the_filers_index_row_where_it_is(
     assert ACME in result.refused
     exchange = next(r for r in _fi_rows(early_store) if r[0] == EXCHANGE)
     assert exchange[2] == old_nse
+
+
+def test_a_refused_form_25_accession_does_not_freeze_the_filers_other_index_rows(
+    settings: Settings, early_store: _Store
+) -> None:
+    """#2807: the exchange files two accessions. One (ACME's 25-NSE) is refused
+    for a revision known at its new acceptance; it stays and is named. The
+    exchange's other accession still moves."""
+    old_nse, new_nse = _early(A_25NSE[1]), A_25NSE[1]
+    other_accession = f"{EXCHANGE}-19-000008"
+    old_other, new_other = _early(A_COVER[1]), A_COVER[1]
+    nse_first = _fi_row(EXCHANGE, A_25NSE[0], old_nse, form="25-NSE")
+    other_first = _fi_row(EXCHANGE, other_accession, old_other, form="25-NSE")
+    _seed_filing_index(settings, [nse_first, _fi_revision(nse_first, new_nse), other_first])
+    manifest = [
+        *_acme_manifest(),
+        ManifestRow(EXCHANGE, other_accession, old_other, new_other, "sgml", "test"),
+    ]
+
+    _, _, (result,) = _ingest(settings, _source(acme_early=True), now=RESTAMP_RUN, restamp=manifest)
+
+    assert EXCHANGE not in result.refused
+    assert A_25NSE[0] in result.refused[ACME]
+    rows = {(r[1], r[3]): r for r in _fi_rows(early_store) if r[0] == EXCHANGE}
+    assert rows[(A_25NSE[0], old_nse)][2] == old_nse  # the refused accession stays
+    assert rows[(other_accession, new_other)][2] == new_other  # the other one moves
+    assert result.moved["filing_index"] == 1
