@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import zipfile
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -567,3 +568,63 @@ def test_order_check_repeats_when_zip_or_parser_version_changes(
     assert not order_check_path(settings, quarter, "zip-a").exists()
     monkeypatch.setattr(edgar_source, "PARSER_VERSION", edgar_source.PARSER_VERSION + 1)
     assert not order_check_path(settings, quarter, "zip-a").exists()
+
+
+def test_a_held_accession_makes_no_request_and_no_write(tmp_path: Path) -> None:
+    """Rule 4 (#2714 item 5): the store's held set is skipped before any stamp or
+    XML request, so a rerun with nothing new asks SEC for nothing."""
+    held = ("0001577526-26-000036", "0001577526", "4", date(2026, 3, 31))
+    result = run_form4_bulk_route(
+        [held],
+        quarters={Quarter(2026, 1): _bulk(tmp_path)},
+        stamp=lambda *_: pytest.fail("a held accession was stamped"),
+        xml=lambda *_: pytest.fail("a held accession fetched XML"),
+        write=lambda *_: pytest.fail("a held accession was written"),
+        now=datetime(2026, 4, 1, tzinfo=UTC),
+        price_below=1,
+        zero_price_codes=("P", "S"),
+        order_sample_size=0,
+        budget=10,
+        skip_accessions=frozenset({held[0]}),
+    )
+    assert (result.requests, result.remaining) == (0, 0)
+
+
+def test_insider_zip_fetch_records_its_url_and_utc_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T348: a downloaded insider zip leaves its URL and fetch time beside it, for
+    the writer's manifest; a zip cached before that reads as unknown."""
+    from tradepartner.adapters.form4_bulk_route import insider_zip_fetch, insider_zip_path
+
+    monkeypatch.setattr(edgar_raw._LIMITER, "wait", lambda _s: None)
+    buffer = tmp_path / "source.zip"
+    with zipfile.ZipFile(buffer, "w") as handle:
+        handle.writestr("SUBMISSION.tsv", "ACCESSION_NUMBER\n")
+    sent: list[str] = []
+
+    def response(request: httpx.Request) -> httpx.Response:
+        sent.append(str(request.url))
+        if "structureddata" in str(request.url):
+            return httpx.Response(404)
+        return httpx.Response(200, content=buffer.read_bytes())
+
+    settings = Settings(_env_file=None, sec_edgar_user_agent="Offline Test test@example.com")
+    settings = settings.model_copy(
+        update={"edgar": settings.edgar.model_copy(update={"cache_dir": tmp_path / "cache"})}
+    )
+    quarter = Quarter(2026, 1)
+    assert insider_zip_fetch(settings, quarter, "0" * 64) == (None, None)
+    before = datetime.now(UTC)
+    fetched = edgar_raw.insider_bulk_zip(
+        "2026q1", settings=settings, client=httpx.Client(transport=httpx.MockTransport(response))
+    )
+    assert fetched is not None and fetched[0] == insider_zip_path(settings, quarter)
+    digest = hashlib.sha256(buffer.read_bytes()).hexdigest()
+    url, at = insider_zip_fetch(settings, quarter, digest)
+    assert url == sent[-1] and "datastandardsinnovation" in url
+    assert at is not None and at.tzinfo is not None and at >= before
+    # A record of other bytes (a stale record beside a replaced zip) is not cited.
+    assert insider_zip_fetch(settings, quarter, "f" * 64) == (None, None)
+    insider_zip_path(settings, quarter).with_name("2026q1_form345.fetch.json").write_text("{")
+    assert insider_zip_fetch(settings, quarter, digest) == (None, None)

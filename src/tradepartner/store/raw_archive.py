@@ -81,7 +81,11 @@ from typing import Protocol
 
 from tradepartner import diskfloor
 from tradepartner.config import Settings
-from tradepartner.store.raw_archive_config import check_archive_write, require_archive_root
+from tradepartner.store.raw_archive_config import (
+    archive_root,
+    check_archive_write,
+    require_archive_root,
+)
 
 #: Raw bodies live under this directory of the archive root.
 BODY_DIR = "raw"
@@ -410,6 +414,19 @@ def archive_manifest(settings: Settings, body: bytes) -> Archived:
     local: no pass here evicts one."""
     root = require_archive_root(settings)
     return _write(settings, root, manifest_path(root, hashlib.sha256(body).hexdigest()), body)
+
+
+def archive_on(settings: Settings) -> bool:
+    """Whether the archive is configured, for a writer that may not name its root
+    (plan T348). `False` when `TRADEPARTNER_RAW_ARCHIVE` is unset or blank: the
+    writer behaves as before the archive existed. `True` once the set root passes
+    `require_archive_root`; a set but unusable root raises
+    `RawArchiveUnavailableError`, so the source run fails before any derived row
+    (spec amendment #2714 item 2)."""
+    if archive_root(settings) is None:
+        return False
+    require_archive_root(settings)
+    return True
 
 
 def is_archived(settings: Settings, sha256: str) -> bool:

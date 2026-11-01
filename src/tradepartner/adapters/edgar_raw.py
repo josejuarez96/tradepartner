@@ -78,6 +78,8 @@ import zlib
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -730,6 +732,16 @@ def _filing_url(cik: str, accession: str, filename: str) -> str:
     )
 
 
+def _filing_xml_url(cik: str, accession: str, filename: str) -> str:
+    if not re.fullmatch(r"\d{1,10}", cik):
+        raise InvalidFilingReferenceError(f"filing CIK must be digits, got {cik!r}")
+    _validate_accession(accession)
+    _validate_relative_filename(filename)
+    if not filename.lower().endswith(".xml"):
+        raise InvalidFilingReferenceError(f"filing document is not XML: {filename!r}")
+    return _filing_url(cik, accession, filename)
+
+
 def filing_xml(
     cik: str,
     accession: str,
@@ -739,14 +751,36 @@ def filing_xml(
     client: httpx.Client | None = None,
 ) -> str:
     """Fetch one accession's XML through the shared EDGAR limiter and retry policy."""
-    if not re.fullmatch(r"\d{1,10}", cik):
-        raise InvalidFilingReferenceError(f"filing CIK must be digits, got {cik!r}")
-    _validate_accession(accession)
-    _validate_relative_filename(filename)
-    if not filename.lower().endswith(".xml"):
-        raise InvalidFilingReferenceError(f"filing document is not XML: {filename!r}")
+    url = _filing_xml_url(cik, accession, filename)
     settings = settings or get_settings()
-    return _get(_filing_url(cik, accession, filename), settings=settings, client=client).text
+    return _get(url, settings=settings, client=client).text
+
+
+@dataclass(frozen=True)
+class FetchedXml:
+    """One fetched filing XML (plan T348): its URL, the response's exact bytes (the
+    body kept before parse), the decoded text the parser reads, as `filing_xml`
+    returns it, and the UTC time the response arrived."""
+
+    url: str
+    body: bytes
+    text: str
+    fetched_at: datetime
+
+
+def fetch_filing_xml(
+    cik: str,
+    accession: str,
+    filename: str,
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> FetchedXml:
+    """`filing_xml`'s one request, keeping the raw bytes, URL and fetch time."""
+    url = _filing_xml_url(cik, accession, filename)
+    settings = settings or get_settings()
+    response = _get(url, settings=settings, client=client)
+    return FetchedXml(url, response.content, response.text, datetime.now(UTC))
 
 
 def filing_index(
@@ -1246,14 +1280,33 @@ def insider_bulk_zip(
     settings = settings or get_settings()
     dest = Path(settings.edgar.cache_dir) / "insider" / f"{quarter}_form345.zip"
     for template in _INSIDER_BULK_URLS:
+        url = template.format(quarter=quarter)
         try:
-            return _stream_to_with_headers(
-                template.format(quarter=quarter), dest, settings=settings, client=client
-            )
+            fetched = _stream_to_with_headers(url, dest, settings=settings, client=client)
         except httpx.HTTPStatusError as error:
             if error.response.status_code != httpx.codes.NOT_FOUND:
                 raise
+            continue
+        # Plan T348: the URL, UTC fetch time and SHA-256 of these bytes, for the
+        # Form 4 writer's manifest (`form4_bulk_route.insider_zip_fetch`); the hash
+        # ties the record to the bytes, so a stale record is never cited.
+        digest = hashlib.sha256()
+        with fetched[0].open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        stamp = {
+            "url": url,
+            "fetched_at": datetime.now(UTC).isoformat(),
+            "sha256": digest.hexdigest(),
+        }
+        write_atomic(insider_fetch_path(dest), json.dumps(stamp).encode())
+        return fetched
     return None
+
+
+def insider_fetch_path(zip_path: Path) -> Path:
+    """The fetch record beside an insider zip: `<quarter>_form345.fetch.json`."""
+    return zip_path.with_name(zip_path.name.removesuffix(".zip") + ".fetch.json")
 
 
 def insider_bulk_validators(

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hashlib
 import json
 import subprocess
 import sys
@@ -7247,7 +7248,10 @@ def test_form4_bulk_ingest_call_is_disabled_by_default_and_backfill_only(
         _source: FixtureFilingSource,
         _subjects: frozenset[str],
         now: datetime,
+        *,
+        provenance: object = None,
     ) -> tuple[int, str]:
+        assert provenance is None  # the archive is off in this test
         calls.append(now)
         return 0, "Form 4 bulk called"
 
@@ -8701,3 +8705,585 @@ def test_form4_route_reads_each_issuers_stamps_file_once_per_quarter(
     assert len(source._load_stamps(other)) == 3 and parses == [ACME, other]
     source._save_stamps(other, {})
     assert source._load_stamps(other) == {} and parses == [ACME, other, other]
+
+
+# --- T348 (#2755): Form 4 raw retention and the rule-4 skip --------------------------
+
+_F4_XML = Path(__file__).parent / "fixtures/edgar/sec_forms/form4_purchase_gift_indirect.xml"
+_F4_XML_URL = "https://www.sec.gov/Archives/edgar/data/320193/000032019326000123/form4.xml"
+
+
+def _archive_settings(settings: Settings, tmp_path: Path, *, on: bool = True) -> Settings:
+    """Form 4 enabled, the EDGAR cache in `tmp_path` and, when `on`, a temp archive."""
+    root = tmp_path / "archive"
+    root.mkdir(exist_ok=True)
+    update: dict[str, Any] = {
+        "edgar": settings.edgar.model_copy(update={"cache_dir": str(tmp_path / "edgar")}),
+        "events": settings.events.model_copy(update={"sec_forms_enabled": True}),
+    }
+    if on:
+        from pydantic import SecretStr
+
+        update["tradepartner_raw_archive"] = SecretStr(str(root))
+    return settings.model_copy(update=update)
+
+
+class _Form4Xml:
+    """One XML-routed Form 4 accession over fake SEC seams: the bulk zip in
+    `edgar.cache_dir` holds `zip` (its digest is its real SHA-256), and the XML
+    request returns `body` and is counted in `fetches`."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        accession: str,
+        extra: tuple[str, ...] = (),
+    ) -> None:
+        from tradepartner import diskfloor
+        from tradepartner.adapters import edgar_raw
+        from tradepartner.adapters.form4_bulk_route import insider_zip_path
+        from tradepartner.adapters.form4_route import Quarter
+
+        self.settings = settings
+        self.parsed = parse_form4(_F4_XML.read_text())
+        self.issuer = self.parsed.issuer_cik
+        self.accession = accession
+        self.filed = date(2026, 9, 24)
+        self.accepted = datetime(2026, 9, 24, 21, tzinfo=UTC)
+        self.now = datetime(2026, 10, 2, tzinfo=UTC)
+        self.quarter = Quarter(2026, 3)
+        self.body = _F4_XML.read_bytes()
+        self.zip = b"insider zip v1"
+        self.bulk = InsiderBulk({})
+        self.fetches: list[str] = []
+        #: Accessions whose stamp lookup fails (a recheck that gets no filing back).
+        self.unstampable: set[str] = set()
+        names = (accession, *extra)
+        records = {
+            name: SubmissionRecord(
+                name, "4", "form4.xml", False, self.accepted, filing_date=self.filed
+            )
+            for name in names
+        }
+        self.source = EdgarFilingSource(settings, client=httpx.Client(), clock=lambda: self.now)
+        rows = [
+            ((2026, 3), UnstampedFiling(self.issuer, "Issuer", "4", name, self.filed))
+            for name in names
+        ]
+        monkeypatch.setattr(self.source, "_rows", lambda *_: iter(rows))
+        monkeypatch.setattr(self.source, "_load_stamps", lambda *_: {})
+        monkeypatch.setattr(
+            self.source, "_fetch_submissions", lambda *_: SimpleNamespace(records=records)
+        )
+        monkeypatch.setattr(
+            self.source,
+            "_sec_stamped",
+            lambda _cik, name, _filed: None if name in self.unstampable else records[name],
+        )
+
+        def fetch(_cik: str, name: str, *_args: Any, **_kwargs: Any) -> edgar_raw.FetchedXml:
+            self.fetches.append(name)
+            return edgar_raw.FetchedXml(_F4_XML_URL, self.body, self.body.decode(), self.now)
+
+        monkeypatch.setattr(edgar_raw, "fetch_filing_xml", fetch)
+        monkeypatch.setattr(edgar_raw, "filing_xml", lambda *_a, **_k: self.fetch_text())
+        zip_path = insider_zip_path(settings, self.quarter)
+
+        def load(_quarters: Iterable[Any], **kwargs: Any) -> Any:
+            if kwargs.get("revalidate", True):
+                zip_path.parent.mkdir(parents=True, exist_ok=True)
+                zip_path.write_bytes(self.zip)
+            digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+            return {self.quarter: self.bulk}, {self.quarter: digest}, Counter(), frozenset()
+
+        monkeypatch.setattr(ingest_module, "load_bulk_quarters", load)
+        monkeypatch.setattr(diskfloor, "free_bytes", lambda _path: 10**15)
+
+    def fetch_text(self) -> str:
+        self.fetches.append(self.accession)
+        return self.body.decode()
+
+    def bulk_record(self, accession: str | None = None) -> BulkAccession:
+        return BulkAccession(
+            accession or self.accession,
+            "4",
+            self.filed,
+            self.issuer,
+            self.parsed.filer_ciks,
+            self.parsed.transactions,
+            0,
+            (),
+            False,
+            False,
+        )
+
+    def run(
+        self, conn: duckdb.DuckDBPyConnection, now: datetime, run_id: str = "writer-1"
+    ) -> tuple[int, str, Any]:
+        """One `sec_forms` writer run: the Form 4 step, then the writer's run row."""
+        self.now = now
+        provenance = ingest_module._Form4Provenance.start(
+            self.settings, run_id=run_id, writer="sec_forms"
+        )
+        added, message = ingest_module._write_form4_bulk(
+            conn,
+            self.settings,
+            self.source,
+            frozenset({self.issuer}),
+            now,
+            provenance=provenance,
+        )
+        clause = ingest_module._provenance_clause(provenance)
+        ingest_module.write_run(
+            conn,
+            run_id,
+            now,
+            now,
+            SourceRun("sec_forms", "ok", added, "since=x", f"1 subjects{clause}; {message}"),
+            mode="backfill",
+        )
+        return added, message, provenance
+
+
+def _held_rows(conn: duckdb.DuckDBPyConnection) -> int:
+    return conn.execute(
+        "SELECT (SELECT count(*) FROM sec_filing_events) "
+        "+ (SELECT count(*) FROM sec_form4_transactions)"
+    ).fetchone()[0]
+
+
+def _quarter_message(conn: duckdb.DuckDBPyConnection) -> str:
+    return conn.execute(
+        "SELECT message FROM ingestion_runs WHERE source = 'sec_insider_bulk' "
+        "ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()[0]
+
+
+def _archived_bodies(root: Path) -> set[str]:
+    return {path.name for path in (root / "raw").rglob("*") if path.is_file()}
+
+
+def test_form4_new_accession_is_kept_before_parse_fetched_once_and_skipped_on_rerun(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tradepartner.adapters.form4_archive import message_digest, parse_manifest
+
+    enabled = _archive_settings(settings, tmp_path)
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123")
+    added, _message, provenance = case.run(fixture_store, case.now)
+    root = tmp_path / "archive"
+    xml_sha = hashlib.sha256(case.body).hexdigest()
+    zip_sha = hashlib.sha256(case.zip).hexdigest()
+    assert added > 0 and case.fetches == [case.accession]
+    # The XML body and the new zip are both kept by hash; the manifest is local.
+    assert _archived_bodies(root) == {xml_sha, zip_sha}
+    manifest = parse_manifest((root / "manifests" / provenance.digest).read_bytes())
+    assert manifest["writer"] == {"run_id": "writer-1", "source": "sec_forms", "mode": "backfill"}
+    (entry,) = manifest["entries"]
+    assert entry["accession"] == case.accession and entry["row_source"] == "sec_form4_xml"
+    assert entry["raw_sha256"] == xml_sha and entry["url"] == _F4_XML_URL
+    assert entry["fetched_at"] == case.now.isoformat() and entry["outcome"] == "added"
+    assert len(entry["rows"]) == added
+    assert manifest["zips"] == [
+        {
+            "quarter": "2026q3",
+            "sha256": zip_sha,
+            "url": None,
+            "fetched_at": None,
+            "parser_version": entry_zip_parser(),
+        }
+    ]
+    # The quarter row and the writer row both cite the manifest.
+    quarter = _quarter_message(fixture_store)
+    assert quarter.startswith(f"checked_sha256={zip_sha}; provenance_sha256={provenance.digest}")
+    writer = fixture_store.execute(
+        "SELECT message FROM ingestion_runs WHERE run_id = 'writer-1'"
+    ).fetchone()[0]
+    assert message_digest(writer) == provenance.digest
+    # Rerun with nothing new: no XML request and no row.
+    held = _held_rows(fixture_store)
+    added, _message, _p = case.run(fixture_store, case.now + timedelta(days=1), "writer-2")
+    assert added == 0 and case.fetches == [case.accession]
+    assert _held_rows(fixture_store) == held
+
+
+def entry_zip_parser() -> str:
+    from tradepartner.adapters.form4_bulk_route import BULK_READER_VERSION
+
+    return f"bulk_reader={BULK_READER_VERSION}"
+
+
+@pytest.mark.parametrize("changed_body", [False, True])
+def test_form4_changed_zip_rechecks_a_held_xml_accession_once(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_body: bool,
+) -> None:
+    """#2714 item 5: a changed bulk zip hash rechecks the held accession once; an
+    identical XML hash writes nothing, a differing one keeps both bodies and takes
+    the changed-row refusal path; the next run makes no request."""
+    from tradepartner.adapters.form4_archive import parse_manifest
+
+    enabled = _archive_settings(settings, tmp_path)
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123")
+    case.run(fixture_store, case.now)
+    stored = fixture_store.execute(
+        "SELECT * FROM sec_form4_transactions ORDER BY filer_cik, line_no"
+    ).fetchall()
+    first_sha = hashlib.sha256(case.body).hexdigest()
+    case.zip = b"insider zip v2"
+    case.bulk = InsiderBulk({case.accession: case.bulk_record()})
+    if changed_body:
+        case.body = case.body.replace(b"<value>12.34</value>", b"<value>12.35</value>", 1)
+    later = case.now + timedelta(days=1)
+    added, message, provenance = case.run(fixture_store, later, "writer-2")
+    assert added == 0 and case.fetches == [case.accession] * 2
+    root = tmp_path / "archive"
+    new_sha = hashlib.sha256(case.body).hexdigest()
+    assert {first_sha, new_sha} <= _archived_bodies(root)
+    # The changed zip is kept by its own hash beside the first one.
+    zips = {hashlib.sha256(b).hexdigest() for b in (b"insider zip v1", b"insider zip v2")}
+    assert zips <= _archived_bodies(root)
+    (entry,) = parse_manifest((root / "manifests" / provenance.digest).read_bytes())["entries"]
+    assert entry["raw_sha256"] == new_sha and entry["rows"] == []
+    if changed_body:
+        assert entry["outcome"] == "changed_refused"
+        assert "sec_forms_xml_recheck_changed: 1" in message
+        assert "sec_forms_changed: 1" in message
+    else:
+        assert entry["outcome"] == "recheck_same"
+        assert "sec_forms_xml_recheck_same: 1" in message
+    assert (
+        fixture_store.execute(
+            "SELECT * FROM sec_form4_transactions ORDER BY filer_cik, line_no"
+        ).fetchall()
+        == stored
+    )
+    # Once rechecked, the quarter's checked digest moved: no further request.
+    case.run(fixture_store, later + timedelta(days=1), "writer-3")
+    assert case.fetches == [case.accession] * 2
+
+
+def test_form4_failed_recheck_is_counted_and_only_it_is_rechecked_again(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recheck that gets no filing back leaves its quarter `partial`, counted in
+    `remaining`; the next run rechecks only that accession, not those already
+    rechecked against the same zip hash (quant-auditor pass 1 on #2756)."""
+    other = "0000320193-26-000124"
+    enabled = _archive_settings(settings, tmp_path)
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123", extra=(other,))
+    case.run(fixture_store, case.now)
+    assert sorted(case.fetches) == sorted([case.accession, other])
+    case.zip = b"insider zip v2"
+    case.bulk = InsiderBulk({a: case.bulk_record(a) for a in (case.accession, other)})
+    case.unstampable = {other}
+    case.fetches.clear()
+    later = case.now + timedelta(days=1)
+    _added, message, _p = case.run(fixture_store, later, "writer-2")
+    assert case.fetches == [case.accession]
+    assert "sec_forms_xml_recheck_failed: 1" in message
+    status, quarter = fixture_store.execute(
+        "SELECT status, message FROM ingestion_runs WHERE source = 'sec_insider_bulk' "
+        "ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    fields = ingest_module._bulk_run_fields(quarter)
+    assert status == "partial" and fields["remaining"] == "1"
+    assert fields["checked_sha256"] == hashlib.sha256(b"insider zip v1").hexdigest()
+    # Next run: only the failed accession is rechecked; once it succeeds, none is.
+    case.unstampable = set()
+    case.fetches.clear()
+    case.run(fixture_store, later + timedelta(days=1), "writer-3")
+    assert case.fetches == [other]
+    case.fetches.clear()
+    case.run(fixture_store, later + timedelta(days=2), "writer-4")
+    assert case.fetches == []
+
+
+def test_form4_failed_archive_write_blocks_the_accessions_rows(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tradepartner import diskfloor
+    from tradepartner.store.raw_archive_config import RawArchiveFloorError
+
+    enabled = _archive_settings(settings, tmp_path)
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123")
+    zip_free = [10**15]
+    # The zip fits; the XML body would cross the floor.
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _path: zip_free.pop() if zip_free else 1)
+    with pytest.raises(RawArchiveFloorError):
+        case.run(fixture_store, case.now)
+    assert case.fetches == [case.accession]
+    assert _held_rows(fixture_store) == 0
+    assert fixture_store.execute(
+        "SELECT count(*) FROM ingestion_runs WHERE source = 'sec_insider_bulk'"
+    ).fetchone() == (0,)
+
+
+def test_form4_dry_run_archives_nothing_and_reports_what_it_would_keep(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dry run has no archive side effect: no raw body and no manifest (no run row
+    could cite one). Its message reports the bodies and bytes it would keep and
+    names no `provenance_sha256`. A real run then keeps the same bodies."""
+    from tradepartner.adapters.form4_archive import message_digest
+
+    enabled = _archive_settings(settings, tmp_path)
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123")
+    root = tmp_path / "archive"
+
+    def work(conn: duckdb.DuckDBPyConnection, run_id: str) -> tuple[int, str]:
+        provenance = ingest_module._Form4Provenance.start(
+            enabled, run_id=run_id, writer="sec_forms"
+        )
+        added, message = ingest_module._write_form4_bulk(
+            conn, enabled, case.source, frozenset({case.issuer}), case.now, provenance=provenance
+        )
+        return added, f"1 subjects{ingest_module._provenance_clause(provenance)}; {message}"
+
+    def run(dry_run: bool) -> SourceRun:
+        return ingest_module._run_source(
+            "sec_forms", work, enabled, case.now, lambda: case.now, "x", dry_run, "backfill"
+        )
+
+    dry = run(True)
+    assert dry.status == "ok", dry.message
+    assert case.fetches == [case.accession]
+    assert [path for path in root.rglob("*") if path.is_file()] == []
+    assert message_digest(dry.message) is None
+    nbytes = len(case.body) + len(case.zip)
+    assert f"raw_archive_would_keep_bodies: 2, raw_archive_would_keep_bytes: {nbytes}" in (
+        dry.message
+    )
+    real = run(False)
+    assert real.status == "ok", real.message
+    assert _archived_bodies(root) == {
+        hashlib.sha256(case.body).hexdigest(),
+        hashlib.sha256(case.zip).hexdigest(),
+    }
+    assert message_digest(real.message) is not None
+
+
+def test_form4_accession_fetched_twice_records_both_hashes_and_one_row_match(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An accession fetched twice in one run (an order sample, then the XML route)
+    names both body hashes in the manifest, both kept; only the entry whose body
+    produced the stored row lists it, so `find_entry` still finds exactly one."""
+    from tradepartner import diskfloor
+    from tradepartner.adapters import edgar_raw
+    from tradepartner.adapters.form4_archive import (
+        XML_SOURCE,
+        find_entry,
+        parse_manifest,
+        row_digest,
+    )
+    from tradepartner.adapters.form4_route import Quarter
+
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _path: 10**15)
+    enabled = _archive_settings(settings, tmp_path)
+    accession = "0000320193-26-000123"
+    first, second = b"<form4>sample</form4>", b"<form4>route</form4>"
+    at = datetime(2026, 10, 2, tzinfo=UTC)
+    row = {"accession": accession, "filer_cik": "0000000001", "line_no": 1, "shares": "5"}
+
+    def manifest() -> tuple[str, dict[str, Any]]:
+        provenance = ingest_module._Form4Provenance.start(
+            enabled, run_id="writer-1", writer="sec_forms"
+        )
+        assert provenance is not None
+        for position, body in enumerate((first, second)):
+            fetched = edgar_raw.FetchedXml(
+                _F4_XML_URL, body, body.decode(), at + timedelta(seconds=position)
+            )
+            provenance.keep_xml(accession, fetched)
+        assert provenance.xml_input(accession).sha256 == hashlib.sha256(second).hexdigest()
+        rows = {"sec_form4_transactions": [row]}
+        provenance.record(accession, XML_SOURCE, Quarter(2026, 3), "added", rows)
+        digest = provenance.finish()
+        return digest, parse_manifest((tmp_path / "archive" / "manifests" / digest).read_bytes())
+
+    digest, document = manifest()
+    first_sha = hashlib.sha256(first).hexdigest()
+    second_sha = hashlib.sha256(second).hexdigest()
+    assert {first_sha, second_sha} <= _archived_bodies(tmp_path / "archive")
+    by_hash = {entry["raw_sha256"]: entry for entry in document["entries"]}
+    assert set(by_hash) == {first_sha, second_sha}
+    assert by_hash[second_sha]["outcome"] == "added" and by_hash[second_sha]["rows"]
+    assert by_hash[first_sha]["outcome"] == "not_written" and by_hash[first_sha]["rows"] == []
+    run_id, entry = find_entry(
+        [document],
+        row_source=XML_SOURCE,
+        mode="backfill",
+        accession=accession,
+        table="sec_form4_transactions",
+        key=[accession, "0000000001", 1],
+        digest=row_digest(row),
+    )
+    assert run_id == "writer-1" and entry["raw_sha256"] == second_sha
+    # The same fetches give the same manifest bytes: the entry order is fixed.
+    assert manifest()[0] == digest
+
+
+def test_form4_quarter_message_keeps_both_digests_under_a_200_character_cap(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bulk-skip parser still reads `checked_sha256` with `provenance_sha256`
+    present when `ingest.max_message_chars` is 200, so the next run skips."""
+    enabled = _archive_settings(settings, tmp_path)
+    enabled = enabled.model_copy(
+        update={"ingest": enabled.ingest.model_copy(update={"max_message_chars": 200})}
+    )
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123")
+    _added, _message, provenance = case.run(fixture_store, case.now)
+    message = _quarter_message(fixture_store)
+    assert len(message) == 200
+    fields = ingest_module._bulk_run_fields(message)
+    assert fields["checked_sha256"] == hashlib.sha256(case.zip).hexdigest()
+    assert fields["provenance_sha256"] == provenance.digest
+    # The planner reads the cut rows' digests: a changed zip rechecks once, and the
+    # recheck's own cut row then holds the new digest, so the next run asks nothing.
+    case.zip = b"insider zip v2"
+    case.bulk = InsiderBulk({case.accession: case.bulk_record()})
+    case.run(fixture_store, case.now + timedelta(days=1), "writer-2")
+    assert case.fetches == [case.accession] * 2
+    case.run(fixture_store, case.now + timedelta(days=2), "writer-3")
+    assert case.fetches == [case.accession] * 2
+
+
+def test_form4_with_the_archive_off_behaves_as_before(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No archive: no write, no manifest, no provenance key, no changed-zip recheck,
+    and the XML comes through today's `filing_xml` call."""
+    off = _archive_settings(settings, tmp_path, on=False)
+    case = _Form4Xml(off, monkeypatch, accession="0000320193-26-000123")
+    added, _message, provenance = case.run(fixture_store, case.now)
+    assert provenance is None and added > 0 and case.fetches == [case.accession]
+    assert list((tmp_path / "archive").iterdir()) == []
+    assert "provenance_sha256" not in _quarter_message(fixture_store)
+    case.zip = b"insider zip v2"
+    case.bulk = InsiderBulk({case.accession: case.bulk_record()})
+    case.run(fixture_store, case.now + timedelta(days=1), "writer-2")
+    assert case.fetches == [case.accession]
+    assert list((tmp_path / "archive").iterdir()) == []
+
+
+def test_form4_bulk_with_the_archive_on_needs_its_writers_provenance(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enabled = _archive_settings(settings, tmp_path)
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123")
+    with pytest.raises(ValueError, match="provenance"):
+        ingest_module._write_form4_bulk(
+            fixture_store, enabled, case.source, frozenset({case.issuer}), case.now
+        )
+
+
+def test_sec_forms_run_cites_its_manifest_and_rows_map_by_run_not_by_stamp(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: the `sec_forms` writer row carries `provenance_sha256` inside a
+    200-character cap; its zero-width quarter row cites the same digest; each stored
+    bulk row (stamped with the commit time) maps by writer run ID, row source, mode,
+    accession, table key and digest to exactly one manifest entry."""
+    from tradepartner import diskfloor
+    from tradepartner.adapters import edgar_source
+    from tradepartner.adapters.form4_archive import (
+        TABLE_KEYS,
+        find_entry,
+        message_digest,
+        parse_manifest,
+        row_digest,
+    )
+    from tradepartner.adapters.form4_bulk_route import insider_zip_path
+    from tradepartner.backfill import backfill
+
+    filing = _acme_form4()
+    monkeypatch.setattr(edgar_source, "EdgarFilingSource", FixtureFilingSource)
+    fake = _fake_bulk(filing)
+    enabled = _archive_settings(settings, tmp_path).model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"max_message_chars": 200})}
+    )
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _path: 10**15)
+
+    def load(quarters: Iterable[Any], **kwargs: Any) -> Any:
+        bulk, _digests, counts, bad = fake(quarters, **kwargs)
+        digests = {}
+        for quarter in bulk:
+            path = insider_zip_path(enabled, quarter)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"zip {quarter}".encode())
+            digests[quarter] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return bulk, digests, counts, bad
+
+    monkeypatch.setattr(ingest_module, "load_bulk_quarters", load)
+    master = backfill(
+        settings,
+        prices=_Prices(),
+        filings=_filings(),
+        since=SESSION,
+        source="edgar",
+        clock=lambda: NOW,
+    )
+    assert master.ok, master.runs
+    run = ingest_module.ingest_sec_forms(enabled, _forms_source(filing), clock=lambda: _LATER)
+    assert run.ok, run.runs
+    digest = message_digest(run.runs[0].message)
+    assert digest is not None and len(run.runs[0].message) <= 200
+    manifest = parse_manifest((tmp_path / "archive" / "manifests" / digest).read_bytes())
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        (writer_id,) = conn.execute(
+            "SELECT run_id FROM ingestion_runs WHERE source = 'sec_forms'"
+        ).fetchone()
+        quarter_rows = conn.execute(
+            "SELECT started_at, finished_at, message FROM ingestion_runs "
+            "WHERE source = 'sec_insider_bulk'"
+        ).fetchall()
+        cursor = conn.execute("SELECT * FROM sec_form4_transactions")
+        columns = [column[0] for column in cursor.description]
+        stored = [dict(zip(columns, values, strict=True)) for values in cursor.fetchall()]
+    assert manifest["writer"] == {"run_id": writer_id, "source": "sec_forms", "mode": "backfill"}
+    assert quarter_rows and all(
+        start == end == _LATER and message_digest(text) == digest
+        for start, end, text in quarter_rows
+    )
+    assert stored and {row["ingested_at"] for row in stored} == {_LATER}
+    for row in stored:
+        run_id, entry = find_entry(
+            [manifest],
+            row_source="sec_insider_bulk",
+            mode="backfill",
+            accession=row["accession"],
+            table="sec_form4_transactions",
+            key=[row[c] for c in TABLE_KEYS["sec_form4_transactions"]],
+            digest=row_digest(row),
+        )
+        assert run_id == writer_id and entry["quarter"] == "2018q4"
+        assert entry["raw_sha256"] in {z["sha256"] for z in manifest["zips"]}
