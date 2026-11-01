@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from collections.abc import Callable, Iterable
@@ -11,9 +12,9 @@ from typing import Any
 
 from tradepartner.adapters.edgar_insider_bulk import read_insider_bulk
 from tradepartner.config import Settings
-from tradepartner.ingest import SourceRun, _write_run
+from tradepartner.ingest import SourceRun, write_run
 from tradepartner.repair import REPAIR, REPAIRED, release_refusal
-from tradepartner.repair_form4_roles import _sha
+from tradepartner.repair_form4_roles import sha_file
 from tradepartner.store.db import open_for_write, open_read_only, utc_now
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -24,7 +25,7 @@ class TitleRepairRefused(ValueError):
 
 def manifest_sha256(path: Path) -> str:
     """Return the SHA-256 of the reviewed manifest's exact bytes."""
-    return _sha(path)
+    return sha_file(path)
 
 
 def _quoted(title: str) -> str:
@@ -49,7 +50,7 @@ def build_manifest(settings: Settings, zips: Iterable[Path], output: Path) -> in
     for path in zips:
         found = True
         resolved = path.resolve()
-        sha = _sha(resolved)
+        sha = sha_file(resolved)
         for key, title in _source_rows(resolved).items():
             if key in source:
                 raise TitleRepairRefused(f"transaction {key} occurs in multiple zips")
@@ -105,11 +106,13 @@ def repair_form4_titles(
     dry_run: bool = False,
     clock: Callable[[], datetime] = utc_now,
 ) -> int:
-    """Validate the manifest and update only security_title in one transaction."""
+    """Validate the manifest and update changed titles and ingested_at atomically."""
     if expect_rows < 0:
         raise TitleRepairRefused("--expect-rows must be nonnegative")
     try:
-        document = json.loads(manifest.read_text())
+        manifest_bytes = manifest.read_bytes()
+        manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+        document = json.loads(manifest_bytes)
         if document["version"] != 1 or not isinstance(document["rows"], list):
             raise ValueError("unsupported manifest")
         entries = document["rows"]
@@ -128,7 +131,7 @@ def repair_form4_titles(
             seen.add(key)
             path = str(Path(entry["zip"]).resolve())
             if path not in hashes:
-                hashes[path] = _sha(Path(path))
+                hashes[path] = sha_file(Path(path))
             if hashes[path] != entry["sha256"]:
                 raise TitleRepairRefused(f"zip sha256 differs: {path}")
             if path not in sources:
@@ -169,6 +172,7 @@ def repair_form4_titles(
         if len(changes) != expect_rows:
             raise TitleRepairRefused(f"found {len(changes)} rows; expected {expect_rows}")
         if not dry_run and changes:
+            at = ensure_tz_aware_utc(clock(), field_name="clock")
             conn.execute(
                 "CREATE TEMP TABLE _form4_title_changes ("
                 "accession VARCHAR, filer_cik VARCHAR, line_no INTEGER, security_title VARCHAR)"
@@ -179,9 +183,11 @@ def repair_form4_titles(
             )
             updated = conn.execute(
                 "UPDATE sec_form4_transactions AS stored SET "
-                "security_title = changed.security_title FROM _form4_title_changes AS changed "
+                "security_title = changed.security_title, ingested_at = ? "
+                "FROM _form4_title_changes AS changed "
                 "WHERE stored.accession = changed.accession "
-                "AND stored.filer_cik = changed.filer_cik AND stored.line_no = changed.line_no"
+                "AND stored.filer_cik = changed.filer_cik AND stored.line_no = changed.line_no",
+                [at],
             ).fetchone()
             if updated is None or int(updated[0]) != len(changes):
                 raise TitleRepairRefused(
@@ -195,9 +201,9 @@ def repair_form4_titles(
                 0,
                 "",
                 f"form4 titles: {len(changes)} rows; release {release}; "
-                f"manifest sha256 {manifest_sha256(manifest)}",
+                f"manifest sha256 {manifest_digest}",
             )
-            _write_run(
+            write_run(
                 conn,
                 uuid.uuid4().hex,
                 started,

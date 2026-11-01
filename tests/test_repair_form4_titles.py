@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -132,7 +133,9 @@ def test_apply_dry_real_idempotent_and_all_other_columns(
     after = _row(settings)
     assert after[:16] == before[:16]
     assert after[16] == NEW
-    assert after[17:] == before[17:]
+    assert after[17:20] == before[17:20]
+    assert after[20] == NOW
+    assert after[21:] == before[21:]
     with open_for_write(settings) as conn:
         runs = conn.execute(
             "SELECT status, mode, message, finished_at FROM ingestion_runs"
@@ -143,6 +146,66 @@ def test_apply_dry_real_idempotent_and_all_other_columns(
     assert runs[0][3].tzinfo is not None
     assert repair_form4_titles(settings, manifest, "titles-2708", 0) == 0
     assert _row(settings) == after
+
+
+def test_apply_stamps_changed_rows_only(settings: Settings, tmp_path: Path) -> None:
+    zip_path, manifest = _fixture(settings, tmp_path)
+    build_manifest(settings, [zip_path], manifest)
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "INSERT INTO sec_form4_transactions "
+            "SELECT * REPLACE (2 AS line_no, ? AS security_title) "
+            "FROM sec_form4_transactions",
+            [NEW],
+        )
+        before = conn.execute(
+            "SELECT line_no, security_title, known_at, ingested_at "
+            "FROM sec_form4_transactions ORDER BY line_no"
+        ).fetchall()
+    assert repair_form4_titles(settings, manifest, "titles-2708", 1, clock=lambda: NOW) == 1
+    with open_for_write(settings) as conn:
+        after = conn.execute(
+            "SELECT line_no, security_title, known_at, ingested_at "
+            "FROM sec_form4_transactions ORDER BY line_no"
+        ).fetchall()
+    assert after[0] == (0, NEW, OLD, NOW)
+    assert after[1] == before[1]
+
+
+def test_run_logs_validated_manifest_bytes(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    zip_path, manifest = _fixture(settings, tmp_path)
+    build_manifest(settings, [zip_path], manifest)
+    digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    real_write_run = titles_module.write_run
+
+    def change_manifest_before_logging(*args: object) -> None:
+        manifest.write_text("changed after validation")
+        real_write_run(*args)
+
+    monkeypatch.setattr(titles_module, "write_run", change_manifest_before_logging)
+    assert repair_form4_titles(settings, manifest, "titles-2708", 1, clock=lambda: NOW) == 1
+    with open_for_write(settings) as conn:
+        message = conn.execute("SELECT message FROM ingestion_runs").fetchone()[0]
+    assert f"manifest sha256 {digest}" in message
+
+
+def test_builder_defaults_to_configured_insider_cache(settings: Settings, tmp_path: Path) -> None:
+    zip_path, _ = _fixture(settings, tmp_path)
+    insider = tmp_path / "insider"
+    insider.mkdir()
+    zip_path.rename(insider / zip_path.name)
+    configured = settings.model_copy(
+        update={"edgar": settings.edgar.model_copy(update={"cache_dir": tmp_path})}
+    )
+    manifest = tmp_path / "default.json"
+    built = CliRunner().invoke(
+        cli.make_app(settings=lambda: configured),
+        ["build-form4-titles-manifest", "--output", str(manifest)],
+    )
+    assert built.exit_code == 0, built.output
+    assert len(json.loads(manifest.read_text())["rows"]) == 1
 
 
 @pytest.mark.parametrize("change", ["count", "release", "stale", "sha"])

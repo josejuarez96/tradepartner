@@ -3010,15 +3010,18 @@ def make_app(
 
     @app.command("build-form4-titles-manifest")
     def build_form4_titles_manifest_command(
-        zip_dir: Annotated[Path, typer.Option(help="directory of cached *_form345.zip files")],
         output: Annotated[Path, typer.Option(help="reviewable JSON manifest path")],
+        zip_dir: Annotated[
+            Path | None, typer.Option(help="directory of cached *_form345.zip files")
+        ] = None,
     ) -> None:
         """Build a title repair manifest from the store and cached SEC zips."""
         s = settings()
         if (missing := _store_missing(s)) is not None:
             raise missing
         try:
-            count = build_form4_titles_manifest(s, sorted(zip_dir.glob("*_form345.zip")), output)
+            cache_dir = zip_dir if zip_dir is not None else Path(s.edgar.cache_dir) / "insider"
+            count = build_form4_titles_manifest(s, sorted(cache_dir.glob("*_form345.zip")), output)
         except (StoreLockedError, ValueError, OSError) as exc:
             raise _fail(f"manifest refused: {exc}", 1) from None
         digest = form4_titles_manifest_sha256(output)
