@@ -597,6 +597,9 @@ class EdgarFilingSource(FilingSource):
         self.filing_events_clock_suspect = 0
         self.filing_events_clock_suspect_accessions: list[str] = []
         self.sec_forms_counts: dict[str, int] = defaultdict(int)
+        # Plan T348: the ingest driver's Form 4 XML keeper, called with each fetched
+        # body before it is parsed; `None` (the archive off) fetches as before.
+        self.form4_xml_keeper: Callable[[str, edgar_raw.FetchedXml], object] | None = None
         self.sec_forms_requests: dict[str, int] = defaultdict(
             int,
             total=0,
@@ -1283,6 +1286,25 @@ class EdgarFilingSource(FilingSource):
         self._sec_count("identity_missing", accession)
 
     def _sec_xml(self, cik: str, record: SubmissionRecord) -> str:
+        return edgar_raw.filing_xml(
+            cik,
+            record.accession,
+            self._sec_xml_name(cik, record),
+            settings=self._settings,
+            client=self._client,
+        )
+
+    def _sec_xml_kept(self, cik: str, record: SubmissionRecord) -> edgar_raw.FetchedXml:
+        """As `_sec_xml`, with the raw bytes for `form4_xml_keeper` (plan T348)."""
+        return edgar_raw.fetch_filing_xml(
+            cik,
+            record.accession,
+            self._sec_xml_name(cik, record),
+            settings=self._settings,
+            client=self._client,
+        )
+
+    def _sec_xml_name(self, cik: str, record: SubmissionRecord) -> str:
         filename = record.primary_document
         if not filename.lower().endswith(".xml"):
             names = edgar_raw.filing_index(
@@ -1294,10 +1316,7 @@ class EdgarFilingSource(FilingSource):
             filename = xml_names[0]
         # The submissions primaryDocument can name an XSL-rendered copy. The
         # parser needs the root XML, as the other EDGAR document readers do.
-        filename = re.sub(r"^xsl[^/]*/", "", filename)
-        return edgar_raw.filing_xml(
-            cik, record.accession, filename, settings=self._settings, client=self._client
-        )
+        return re.sub(r"^xsl[^/]*/", "", filename)
 
     def _sec_13d_header(self, cik: str, accession: str) -> str:
         """Read an unstructured 13D header, retrying the larger SGML stamp cap."""
@@ -1374,7 +1393,17 @@ class EdgarFilingSource(FilingSource):
             or record.form not in self._settings.events.sec_forms
         ):
             return None
-        xml = self._guarded(accession, "4", partial(self._sec_xml, issuer_cik, record))
+        keeper = self.form4_xml_keeper
+        xml: str | None
+        if keeper is None:
+            xml = self._guarded(accession, "4", partial(self._sec_xml, issuer_cik, record))
+        else:
+            fetched = self._guarded(accession, "4", partial(self._sec_xml_kept, issuer_cik, record))
+            if fetched is not None:
+                # Kept before parse (#2714 item 1), outside `_guarded`: a refused
+                # archive write fails the run, never a skipped filing.
+                keeper(accession, fetched)
+            xml = None if fetched is None else fetched.text
         if xml is None:
             self._sec_count("fetch_failed", accession)
             return None
