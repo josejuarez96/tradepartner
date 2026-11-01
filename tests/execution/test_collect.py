@@ -840,6 +840,36 @@ def test_a_rejection_observed_earlier_is_not_judged_again(
     assert later.rejections == ()
 
 
+def test_another_books_rejections_are_not_judged_in_this_books_collection(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2475: book B's collection judges B's rejections only; book A's rejected
+    run is A's to judge, never B's verdict (and never a RejectionCapError for B)."""
+    frozen = RiskConfig(max_rejections_per_run=0)
+    a_run, a_orders = _rejecting_run(
+        journal_settings, open_window, scripted_fake, fixed_clock, rejected=2
+    )
+    a_seen = _collect(
+        journal_settings, scripted_fake, fixed_clock, a_orders, writer_id=a_run, frozen=frozen
+    )
+    assert a_seen.rejections, "book A judges its own rejected run"
+    fixed_clock.advance(minutes=5)
+    (b_window_id,) = _append(
+        journal_settings, replace(open_window, window_id=None, book_id="bbbb", account_id="PB1")
+    )
+    b_window = replace(open_window, window_id=b_window_id, book_id="bbbb", account_id="PB1")
+    b_run = _run(journal_settings, b_window, fixed_clock())
+    b_order = _order(journal_settings, scripted_fake, fixed_clock, b_run, "tp-bbbb-1")
+    b_order = replace(b_order, book_id="bbbb")
+    collected = _collect(
+        journal_settings, scripted_fake, fixed_clock, [b_order], writer_id=b_run, frozen=frozen
+    )
+    assert collected.rejections == ()
+
+
 def _event(client_order_id: str, status: str, minute: int = 0) -> OrderEventRow:
     at = datetime(2026, 10, 1, 14, minute, tzinfo=UTC)
     return OrderEventRow(

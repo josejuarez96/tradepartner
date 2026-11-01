@@ -571,7 +571,7 @@ what = "Slims the always-loaded STATUS to a board with the last 10 done lines, o
 why = "Every session re-read a 10k-token STATUS on every turn; a smaller, bounded board keeps each session's context for the work itself."
 
 [issue.460]
-what = "Spec and plan for a merge train: batch the ready PRs, build one combined branch, run CI once, bisect on red, squash-merge only trees that ran green, on the owner's word per batch."
+what = "Spec and plan for a merge train: batch the ready PRs, build one combined branch, run CI once, bisect on red, squash-merge only trees that ran green, on the owner's word per batch (2026-10-27: the orchestrator, unasked)."
 why = "Green PRs merged one after another broke main twice on 2026-10-01 (#430 after #387, #444 with #429); refreshing each PR costs a 30-minute run per merge, which serialises every window behind the owner."
 unblocks = ["spec:merge-train", "plan:merge-train"]
 
@@ -1480,6 +1480,11 @@ what = "Reconcile by breaks: a broker difference the explainers do not clear res
 why = "Stops every rare corporate event from halting the whole book and becoming an issue and a PR, and stops one external event from restarting the daily book's shakedown span (#2266, subsumes #2156)."
 unblocks = ["issue:2156", "phase:6"]
 
+[adr.0026]
+what = "Phone access: Tailscale Serve (Funnel removed by policy) proxies HTTPS on the owner's tailnet to a second, read-only Streamlit process on its own loopback port, which requires the owner's tailnet login, its tailnet Host and its own Origin on every script run before any widget or store read and has no write of any kind; the desk instance gains Host, Origin and proxied-header refusals."
+why = "The owner wants to read his books from his phone; this opens that path without opening the LAN or any write, answers ADR 0018 open question 5 and records the phone path T278's plan line was parked on (T278 itself is in PR #2385)."
+unblocks = ["task:T278"]
+
 [task.T289]
 what = "The Lab's listing of the checkout's sweep and hypothesis files, with registry and git state, and a sweep's frozen preview."
 why = "The owner sees what is registered, changed or unmerged before he registers anything from the app (#2304)."
@@ -1531,3 +1536,251 @@ unblocks = ["task:T294"]
 what = "The charter's Interface line names the dashboard's child-process writes: stop a book, register a strategy, run a counted trial."
 why = "The charter still says the override is the only write; ADR 0018's amendment asks for this line before the app runs trials (#2304)."
 unblocks = ["task:T294"]
+
+[task.T305b]
+what = "A pure reader of the SEC's quarterly insider bulk data set into Form 4 rows, the zip fetch and the five bulk-route config keys."
+why = "It cuts the Form 4 backfill from about 64 hours of XML fetches to about 1 hour (#2498), and needs no store, so it can merge at once."
+unblocks = ["task:T305c"]
+
+[task.T305c]
+what = "The pure Form 4 bulk-route rules: which source each accession takes, the line-order sample and row comparison, and the request plan against the budget."
+why = "Keeping the rules pure lets them be tested and merged ahead of the driver, so the driver stays small (#2498)."
+unblocks = ["task:T307d"]
+
+[task.T307d]
+what = "The Form 4 backfill driver: one route per accession (bulk, or XML for the current quarter and prices under $1), acceptance from submissions, the line-order check and the request budget."
+why = "It writes the insider rows that hypothesis B7 reads, dated by acceptance and never by the bulk filing date (#2498)."
+unblocks = ["task:T308"]
+
+[plan.config-split]
+what = "How config.py is split into sibling modules without a behaviour change: the review prefixes widened to stems (T309), golden tests (T310), then five verbatim moves into config_base.py, config_data.py, config_edgar.py and config_backtest.py (T311 to T315), with Settings, paper, execution, research and Lab left in config.py."
+why = "config.py is the most-changed file (126 merges since 2026-09-28) and one file for every domain makes unrelated PRs collide; smaller files cut the conflicts and the review size."
+
+[task.T309]
+what = "ready_pr.py's quant and safety review prefixes widened from file names to stems (config, cli, health, ingest, adapters/edgar for quant), with a test that new sibling modules keep their reviewers."
+why = "Without it a new config_data.py or ingest_edgar.py would merge with no specialist review."
+
+[task.T310]
+what = "Golden tests that pin the config's observable output: the Settings dump and JSON schema, the frozen keys, every family's parameter hash, the env-var names, the importable names, and a synthetic .env loading."
+why = "They are the proof that each later move changes nothing; without them a verbatim move is only trusted, not shown."
+
+[task.T311]
+what = "config_base.py holds the two shared base definitions, _ClosedConfig and _PHASE3_MODEL_CONFIG, re-exported from config.py."
+why = "Every later module needs them and must not import config.py, so they move first."
+
+[task.T312]
+what = "The calendar, store, ingest and rates sections move verbatim to config_data.py, re-exported from config.py."
+why = "The first data slice; nothing open edits these classes, so it can land early."
+
+[task.T313]
+what = "The EDGAR and master sections and their parse helpers move verbatim to their own config_edgar.py, re-exported from config.py."
+why = "EDGAR config is the busiest data section; moving it ends most data-side collisions in config.py."
+
+[task.T314]
+what = "The remaining data sections (universe, health, borrow, index check, OpenFIGI, adjust, gap, coverage, events) move verbatim to config_data.py."
+why = "Completes the data side of the split, so data PRs stop touching config.py."
+
+[task.T315]
+what = "The backtest sections, the family registry and the hypothesis enumerations move verbatim to config_backtest.py; frozen.py and hypothesis.py keep importing from config.py."
+why = "Backtest PRs stop colliding with data and paper PRs in config.py, and frozen keys and hashes stay byte-identical."
+
+[task.T317]
+what = "A read-only probe of SEC's daily index files: recorded fixtures, and whether the daily files add up to the quarterly index, keep its row order, carry validators, and when each day's file appears."
+why = "Its answers decide two owner rules and the table size before any schema work on the incremental nightly EDGAR ingest (#2629)."
+unblocks = ["task:T318", "task:T319a", "task:T319b"]
+
+[task.T318]
+what = "The filing_index table (the stamped EDGAR index with known_at = acceptance, and a dated revision row for a later SEC filed_on), its three state tables and the module that reads and writes them."
+why = "Storing the stamped index is what lets the nightly stop re-walking 33 years of EDGAR every run (#2629)."
+unblocks = ["task:T318b", "task:T319", "task:T323a", "task:T347"]
+
+[task.T318b]
+what = "The --check rules for filing_index, its filed_on revisions included, and the restamp's match on (cik, accession)."
+why = "They keep a stored index row's known_at honest and let a stamps repair move every revision of an accession (#2629, #2703)."
+unblocks = ["task:T323"]
+
+[task.T319]
+what = "The EDGAR adapter's incremental read: the new daily rows, the issuer rule, a new issuer's earlier rows, and stamps for new rows only."
+why = "It replaces the full-history walk that took 97 to 115 min a night with a read of what is new (#2629)."
+unblocks = ["task:T323", "task:T347"]
+
+[task.T319a]
+what = "The new EDGAR requests (daily directory listing, daily file, conditional GET of a quarterly file) and the pure choice of which daily files are unread or re-posted."
+why = "It is the cursor: the nightly reads only what it has not read, with no date guessed (#2629)."
+unblocks = ["task:T319"]
+
+[task.T319b]
+what = "The pure settled-quarter reconcile: which quarters to check on a run and how a quarterly index's rows compare with the stored ones."
+why = "It catches rows SEC adds to a closed quarter after the daily files, so the stored history stays complete (#2629)."
+unblocks = ["task:T319"]
+
+[task.T320]
+what = "A pure rule for which CIKs a night must rebuild: new filings, incomplete caches, retries, FSN periods, snapshot changes, list edits and clock-driven cases."
+why = "Rebuilding only those CIKs is what makes the nightly fast without changing any row a full rebuild would write (#2629)."
+unblocks = ["task:T323"]
+
+[task.T321]
+what = "The underived-row check carried forward for untouched CIKs, and a rotating read-only rebuild that checks every CIK against the store within 28 days."
+why = "It keeps health's master check complete and catches a rule change that missed its version bump (#2629)."
+unblocks = ["task:T323"]
+
+[task.T322]
+what = "A pure rule fingerprint over the settings, cache versions and schema the master builds read, plus a BUILD_RULES_VERSION constant."
+why = "A rule change must fail the nightly and ask for a full rebuild, never leave old rules on untouched names (#2629)."
+unblocks = ["task:T323"]
+
+[task.T323]
+what = "The ingest driver that runs the incremental nightly EDGAR path behind edgar.incremental_index, and the resumable --rebuild-index full walk."
+why = "It puts the pieces together behind one switch, so the owner can roll back to today's full walk (#2629)."
+unblocks = ["task:T323b", "task:T347"]
+
+[task.T323a]
+what = "The master, classification, delisting and 13D readers move from the quarterly walk to the filing_index table, which becomes the one stamp source."
+why = "It removes the last full-history list from memory, the fix #2623 asked for (#2629)."
+unblocks = ["task:T323"]
+
+[task.T323b]
+what = "The 100-day proof that an incremental store equals a full rebuild, and that peak memory stays flat from 2 to 20 years of history."
+why = "It is the evidence that the speed-up changes no stored fact (#2629)."
+unblocks = ["task:T324", "task:T347"]
+
+[task.T324]
+what = "Owner step: seed the table on the real store, compare on a copy, turn the key on, and post 5 nightly runs' times and memory."
+why = "The nightly EDGAR run drops from about 2 hours and 4 GB to minutes and flat memory, after the 2026-10-31 sitting (#2629)."
+
+[issue.2670]
+what = "Amend the data-foundation direction for delisting reasons and returns and cash-based operating profitability inputs."
+why = "As-of reason evidence and a frozen exit policy make future candidate tests reviewable."
+unblocks = ["task:T326"]
+
+[task.T326]
+what = "Add separate delisting reason fact rows and as-of reads after schema versions 41 and 42; universe and execution reads remain blind."
+why = "An exit can only use evidence visible at its deciding read and registered cutoff under the approved timing rule."
+unblocks = ["task:T327", "task:T328"]
+
+[task.T327]
+what = "Classify delisting reasons from Form 25 and matched 8-K item evidence."
+why = "Failure and merger exits need distinct, auditable evidence."
+unblocks = ["task:T329"]
+
+[task.T328]
+what = "Register a frozen failure-delisting return policy, severe unknown-exit variant, and conditional reason/merger trial vintage."
+why = "A last-close exit can overstate returns after a failed listing, and backfilled evidence must stale affected trials."
+unblocks = ["task:T329"]
+
+[task.T329]
+what = "Feed deciding-read-visible reasons and mergers only to backtest exit costs; report unknown coverage and withheld shocks."
+why = "Later evidence must not change an earlier exit under the approved timing rule."
+
+[task.T354]
+what = "Read-only macOS spike to pin iCloud upload status, brctl commands and a bounded confirmation wait."
+why = "Eviction must wait for a reliable upload signal; an unconfirmed file remains local and counted."
+unblocks = ["task:T346", "task:T361"]
+
+[task.T345]
+what = "Configure the local raw archive path and refuse writes that breach the iCloud disk floor."
+why = "Raw-first ingest must fail safely without committing an account-specific path."
+unblocks = ["task:T346", "task:T360"]
+
+[task.T346]
+what = "Keep raw bodies by content hash and verify iCloud upload, eviction, download and integrity."
+why = "Form 4 XML and daily index inputs must survive parser fixes and sync eviction."
+unblocks = ["task:T347", "task:T348", "task:T361"]
+
+[task.T347]
+what = "Archive daily index files before parsing and record their hashes, URLs, fetch times and parser versions in runs."
+why = "A corrected daily file must remain available for a point-in-time rebuild."
+unblocks = ["task:T352"]
+
+[task.T348]
+what = "Archive fetched Form 4 XML and insider zips with new hashes before parsing; skip unchanged held accessions."
+why = "Reruns should fetch only new filings while retaining the exact source for repair."
+unblocks = ["task:T350", "task:T352"]
+
+[task.T349]
+what = "Declare per-field Form 4 source trust and tolerances and count disagreements."
+why = "A measured threshold replaces a single-mismatch quarter stop."
+unblocks = ["task:T351", "task:T353"]
+
+[task.T350]
+what = "Route multi-owner Form 4 accessions to XML and keep transaction-owner associations."
+why = "Bulk owner joins can assign a transaction to the wrong reporting owner."
+unblocks = ["task:T351"]
+
+[task.T351]
+what = "Apply per-source disagreement thresholds in Form 4 ingest and health."
+why = "A differing sampled filing should not discard an otherwise usable quarter."
+
+[task.T352]
+what = "Re-derive from named raw hashes, including archived insider zips, and enforce the archive's no-look-ahead reader boundary."
+why = "Parser repairs need exact historical inputs without exposing later files to research reads."
+
+[task.T360]
+what = "Plan which parts of the existing EDGAR cache move into the raw archive, which are backed up and which stay, with bytes to free."
+why = "About 1.4 GB of dead cache versions and raw corpus sit on a laptop near its 10 GB disk floor (#2743)."
+unblocks = ["task:T361"]
+
+[task.T361]
+what = "Move the planned cache files into the raw archive by rename and hash, back up the stamps, and resume or restore any run."
+why = "Disk is freed only after upload is confirmed, and every moved byte stays restorable without a fresh SEC fetch."
+unblocks = ["task:T362"]
+
+[task.T362]
+what = "Add the archive migrate-cache and restore commands, and make the departure corpus fetch refuse a file that was archived."
+why = "The owner needs a dry run before moving anything, and a corpus re-fetch must never replace an archived body with later content."
+
+[task.T353]
+what = "Read-only baseline of accession-level Form 4 disagreements and XML request cost over #2706's 11 quarters."
+why = "The owner needs measured counts before setting the rule-5 failure threshold."
+unblocks = ["task:T351"]
+
+[task.T355]
+what = "Add the research_exposures table and a nullable trial_results.n_exposure column at the next free schema version (44 after 41 to 43)."
+why = "A desk read that reads returns outside the backtester needs a row, or the family's N misses that look (#2723)."
+unblocks = ["task:T356"]
+
+[task.T356]
+what = "Write exposure records that hash their own probe file, and add the store-source exposures to a family's N as its third part."
+why = "N must count every look at the store's returns; candidate 5 alone is two looks the registry did not count (#2723)."
+unblocks = ["task:T357", "task:T358"]
+
+[task.T357]
+what = "Add the exposure record and exposures CLI commands, with no edit, delete or withdraw command."
+why = "The owner records desk reads in one checked command, and the candidate list is a cross-check on the search tally (#2723)."
+unblocks = ["task:T359"]
+
+[task.T358]
+what = "Show exposures on the research view, and split today's N on the backtest page into trials, research runs and exposures."
+why = "A reviewer should see what raised N and which reads only disclosed exposure (#2723)."
+
+[task.T359]
+what = "Owner backfill: record candidate 5's two store launches and the open-data desk reads since 2026-10-30."
+why = "The profitability family's N must rise by exactly 2 before the next profitability trial is judged (#2723)."
+unblocks = ["issue:2723"]
+
+
+
+[research.2026-10-30-equity-issuance-desk-read]
+what = "Read the composite and one-year share-issuance Chen-Zimmermann legs against a prewritten cost and strength line."
+why = "It retires the issuance line at the desk read: CompEquIss, ShareIss1Y and NetEquityFinance fail; Q1 is killed (#2669)."
+unblocks = ["issue:2669"]
+
+[research.2026-10-31-form4-insider-purchases-desk-read]
+what = "Check opportunistic Form 4 purchases against a timestamped net-of-cost, acceptance-timed monthly kill line."
+why = "It records an INSUFFICIENT desk read and the owner-approved frozen registered event study, after counts-only feasibility (#2673).; retired after the T342 FAIL (#2734, #2736)"
+unblocks = ["issue:2673"]
+
+[research.2026-11-form4-insider-feasibility-recount]
+what = "T342's counts-only recount of the Form 4 insider-purchase study on a store copy: FAIL, the $200M stratum has at most 47 opportunistic events and no treated delister."
+why = "It records the B7 registered event study as INSUFFICIENT under its own feasibility gate, so T332 to T341 and T344 are struck rather than built (#2679)."
+unblocks = ["issue:2679"]
+
+[research.2026-11-form4-insider-feasibility-recount-appendix]
+what = "The byte-for-byte source of the T342 recount script (sha256 9dcb98de...), the method appendix of the T342 note."
+why = "It lets the B7 FAIL be audited and re-run from the repo, as the T342 plan line requires (#2679)."
+unblocks = ["issue:2679"]
+
+[research.2026-10-31-cash-op-profitability-desk-read]
+what = "Read cash-based operating profitability in both Chen-Zimmermann portfolio files against a frozen cost and leg line."
+why = "The weak short leg retires this candidate; T330 and T331 must not be built for it, struck by the owner on 2026-10-31 (#2677)."
+unblocks = ["issue:2675"]

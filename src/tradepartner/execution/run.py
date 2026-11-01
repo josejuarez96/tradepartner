@@ -253,7 +253,7 @@ from tradepartner.execution.collect import (
     note_unjudged,
 )
 from tradepartner.execution.ledger import Ledger, from_journal
-from tradepartner.execution.lock import LockHeld, resolve_book, run_lock
+from tradepartner.execution.lock import LockHeld, resolve_book, run_lock, sandbox_store_refusal
 from tradepartner.execution.lots import LedgerAccount
 from tradepartner.execution.outcomes import write_outcomes_and_lots
 from tradepartner.execution.plan import (
@@ -264,7 +264,13 @@ from tradepartner.execution.plan import (
     residue,
     stop_session,
 )
-from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, Mismatch, Reconciliation
+from tradepartner.execution.reconcile import (
+    BREAKS,
+    FILLS_LAGGING,
+    MISMATCH,
+    Mismatch,
+    Reconciliation,
+)
 from tradepartner.execution.reconcile import OK as RECONCILED
 from tradepartner.execution.reconcile_run import (
     frozen_risk,
@@ -594,6 +600,17 @@ def window_journal_inputs(
 def _in_submit_window(context: StepContext) -> bool:
     """Whether the batch may start now; a note on the run when it may not."""
     now = context.gate.read_clock()
+    if (
+        context.window.book_id == "sandbox"
+        and sandbox_store_refusal(context.settings, context.window.book_id) is None
+    ):
+        if calendar.session_open(context.session) <= now <= calendar.session_close(context.session):
+            note = "sandbox: submit window skipped"
+            if note not in context.notes:
+                context.notes.append(note)
+            return True
+        context.notes.append("sandbox: outside market hours; nothing submitted")
+        return False
     start, end = submit_window(context.settings, context.session)
     if start <= now <= end:
         return True
@@ -649,6 +666,13 @@ class _ExitBook:
         return {k: v for k, v in self.ledger.positions.items() if k not in self.ambiguous}
 
 
+def _is_cash_base(row: ReconciliationRow) -> bool:
+    """Whether a reconciliation row states the ledger's cash: an `ok` row, or a
+    `breaks` row that carries its `broker_cash` (T282b), as the planning and
+    wrapper readers."""
+    return row.status == RECONCILED or (row.status == BREAKS and row.broker_cash is not None)
+
+
 def _exit_book(context: StepContext) -> _ExitBook:
     """Step 7's reads, every store fact as of close(S-1)."""
     session = context.session
@@ -664,7 +688,7 @@ def _exit_book(context: StepContext) -> _ExitBook:
         ok_rows = [
             r
             for r in reconciliations_for(conn, window_id)
-            if r.status == RECONCILED and r.at.astimezone(_NEW_YORK).date() <= session
+            if _is_cash_base(r) and r.at.astimezone(_NEW_YORK).date() <= session
         ]
         ledger = from_journal(
             fills_for(conn, window_id=window_id),
@@ -2024,9 +2048,7 @@ class _Run:
             fills = fills_for(conn, window_id=self.window_id)
             orders = orders_for(conn, window_id=self.window_id)
             adjustments = adjustments_for(conn, self.window_id)
-            ok_rows = [
-                r for r in reconciliations_for(conn, self.window_id) if r.status == RECONCILED
-            ]
+            ok_rows = [r for r in reconciliations_for(conn, self.window_id) if _is_cash_base(r)]
 
         def ledger(through: date) -> Ledger:
             stated = [r for r in ok_rows if r.at.astimezone(_NEW_YORK).date() <= through]

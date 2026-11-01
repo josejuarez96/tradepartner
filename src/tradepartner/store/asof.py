@@ -782,9 +782,10 @@ def live_actions_as_of(
 
     A spin-off parented by a predecessor and one parented by its successor,
     for the same child, share one identity after the #2127 re-key; `_own`
-    follows the child's chain, so both rank 0 and the later-known row wins,
-    not the successor's own (#821). Both describe the same event; no store
-    holds both today (#2147).
+    follows the child's chain, so both rank alike (0 when the child itself
+    has no chain) and the later-known row wins (on equal `known_at` the
+    pick is unspecified), not the successor's own (#821). Both describe
+    the same event; no store holds both today (#2147).
     """
     t = _validate_t(t)
     with _chains_registered(conn, t) as chains:
@@ -1112,6 +1113,22 @@ def symbol_changes_as_of(
     ).pl()
 
 
+def spinoff_allocations_as_of(conn: duckdb.DuckDBPyConnection, t: datetime) -> pl.DataFrame:
+    """Latest owner-entered basis fraction per spin-off known at ``t``."""
+    t = _validate_t(t)
+    return conn.execute(
+        """SELECT * EXCLUDE (_rn) FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY parent_security_id, child_security_id, ex_date
+                ORDER BY known_at DESC
+            ) AS _rn
+            FROM spinoff_allocations WHERE known_at <= ?
+        ) WHERE _rn = 1
+        ORDER BY parent_security_id, child_security_id, ex_date""",
+        [t],
+    ).pl()
+
+
 def mergers_as_of(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -1435,6 +1452,71 @@ def filing_events_as_of(
         return conn.execute(sql, params).pl()
     finally:
         conn.unregister(_FILING_EVENT_SECURITIES_VIEW)
+
+
+def _require_sec_forms_read(settings: Settings | None) -> None:
+    """Keep ownership events outside existing research reads until enabled."""
+    if not (settings if settings is not None else get_settings()).events.sec_forms_read_enabled:
+        raise PermissionError("events.sec_forms_read_enabled is false")
+
+
+def sec_filing_events_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    forms: Sequence[str],
+    subject_cik: str | None = None,
+    *,
+    settings: Settings | None = None,
+) -> pl.DataFrame:
+    """Read ownership filings by subject CIK at their UTC acceptance instant.
+
+    Forms match verbatim. No filer is resolved into a security, and a filing
+    accepted after the session close is invisible at that close.
+    """
+    _require_sec_forms_read(settings)
+    t = _validate_t(t)
+    form_list = _string_list(forms, name="forms")
+    if form_list is None:
+        raise TypeError("forms must be a sequence of strings")
+    params: list[Any] = [t, form_list]
+    subject_filter = ""
+    if subject_cik is not None:
+        subject_filter = " AND subject_cik = ?"
+        params.append(subject_cik)
+    return conn.execute(
+        "SELECT * FROM sec_filing_events WHERE known_at <= ? "
+        f"AND list_contains(?::VARCHAR[], form){subject_filter} "
+        "ORDER BY known_at, accession, subject_cik, filer_cik",
+        params,
+    ).pl()
+
+
+def sec_form4_transactions_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    subject_cik: str | None = None,
+    *,
+    settings: Settings | None = None,
+) -> pl.DataFrame:
+    """Read non-derivative Form 4 rows by issuer CIK at acceptance time.
+
+    Bulk share counts may be rounded to two decimal places. A 4/A has its own
+    accession and coexists with its original; a consumer must decide how to
+    treat amendments. Transaction and deemed execution dates are filer-entered
+    dates, not clocks.
+    """
+    _require_sec_forms_read(settings)
+    t = _validate_t(t)
+    params: list[Any] = [t]
+    subject_filter = ""
+    if subject_cik is not None:
+        subject_filter = " AND issuer_cik = ?"
+        params.append(subject_cik)
+    return conn.execute(
+        "SELECT * FROM sec_form4_transactions WHERE known_at <= ?"
+        f"{subject_filter} ORDER BY known_at, accession, filer_cik, line_no",
+        params,
+    ).pl()
 
 
 def _latest_assets_observation(conn: duckdb.DuckDBPyConnection, t: datetime) -> datetime | None:

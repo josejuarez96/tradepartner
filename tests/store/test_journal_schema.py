@@ -38,11 +38,13 @@ from tradepartner.store.journal import (
     PaperRunRow,
     PaperWindowRow,
     ReconcileBreakRow,
+    ReconciliationRow,
     alerts_for,
     append,
     break_events_for,
     break_id_for,
     fills_for,
+    last_ok_reconciliation,
     latest_window,
     open_breaks,
     open_window,
@@ -1249,11 +1251,14 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
         if name
         not in (
             "schema_version",
+            "spinoff_allocations",
             "trial_results",
             "trial_rebalances",
             "trial_metrics",
             "trials",
             "owner_decisions",
+            "sec_filing_events",
+            "sec_form4_transactions",
         )
         and name not in schema.RETRACTABLE_TABLES
         and name not in lab_schema.LAB_TABLE_NAMES
@@ -2735,3 +2740,39 @@ def test_an_auto_accepted_break_does_not_reopen(fresh: duckdb.DuckDBPyConnection
     append(fresh, _break("auto_accepted"))
     with pytest.raises(BreakOrderError, match="only a trued_up break reopens"):
         append(fresh, _break("reopened"))
+
+
+def test_last_ok_reconciliation_uses_the_latest_breaks_base(
+    fresh: duckdb.DuckDBPyConnection,
+) -> None:
+    for status, cash, at in (
+        ("ok", 100.0, _NOW - timedelta(minutes=2)),
+        ("breaks", 80.0, _NOW - timedelta(minutes=1)),
+    ):
+        append(
+            fresh,
+            ReconciliationRow(
+                window_id=1,
+                at=at,
+                status=status,
+                broker_cash=cash,
+                known_at=at,
+                ingested_at=at,
+            ),
+        )
+    row = last_ok_reconciliation(fresh, 1)
+    assert row is not None and (row.status, row.broker_cash) == ("breaks", 80.0)
+    later = _NOW
+    append(
+        fresh,
+        ReconciliationRow(
+            window_id=1,
+            at=later,
+            status="breaks",
+            broker_cash=None,  # T281 wrote breaks without a cash base.
+            known_at=later,
+            ingested_at=later,
+        ),
+    )
+    row = last_ok_reconciliation(fresh, 1)
+    assert row is not None and (row.status, row.broker_cash) == ("breaks", 80.0)

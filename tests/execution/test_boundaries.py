@@ -54,6 +54,20 @@ from tradepartner.store.schema import JOURNAL_TABLE_NAMES
 
 SRC = Path(__file__).resolve().parents[2] / "src"
 
+
+def test_sec_ownership_tables_do_not_reach_trading_or_universe() -> None:
+    """Research-only SEC forms cannot enter existing signal or order paths."""
+    restricted = [SRC / "tradepartner" / "universe.py"]
+    restricted.extend((SRC / "tradepartner" / "backtest").rglob("*.py"))
+    restricted.extend((SRC / "tradepartner" / "execution").rglob("*.py"))
+    for path in restricted:
+        source = path.read_text()
+        assert "sec_filing_events" not in source, path
+        assert "sec_form4_transactions" not in source, path
+        assert "sec_filing_events_as_of" not in source, path
+        assert "sec_form4_transactions_as_of" not in source, path
+
+
 BROKER_CLASSES = frozenset({"AlpacaBroker", "FakeBroker"})
 ALPACA_BROKER_MODULE = "tradepartner.adapters.alpaca_broker"
 BROKER_MODULES = (ALPACA_BROKER_MODULE, "tradepartner.adapters.fake_broker")

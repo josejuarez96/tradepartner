@@ -27,6 +27,7 @@ initialised" pattern): a store with no paper-trading journal yet
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import altair as alt
 import duckdb
@@ -36,7 +37,7 @@ import streamlit as st
 from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
-from tradepartner.execution import headroom, ops, plain, waiting
+from tradepartner.execution import headroom, ops, paper_message, plain, waiting
 from tradepartner.execution.ops import OpsData, OrderChain, RankedSignal
 from tradepartner.execution.switch import SwitchState
 from tradepartner.store import journal
@@ -134,7 +135,7 @@ def _rebalance_result(row: ops.BookSummary) -> str:
     return "traded today" if row.last_run_has_orders else "ran today with no orders"
 
 
-def _summary_table(summaries: tuple[ops.BookSummary, ...]) -> pl.DataFrame:
+def _summary_table(summaries: tuple[ops.BookSummary, ...], now: datetime) -> pl.DataFrame:
     return pl.DataFrame(
         [
             {
@@ -149,7 +150,7 @@ def _summary_table(summaries: tuple[ops.BookSummary, ...]) -> pl.DataFrame:
                     str(row.next_rebalance_session or "-")
                     + (
                         f"; rebalance {traded} {_rebalance_result(row)}"
-                        if (traded := ops.rebalance_traded_today(row)) is not None
+                        if (traded := ops.rebalance_traded_today(row, now=now)) is not None
                         else ""
                     )
                 ),
@@ -166,7 +167,7 @@ def _book_summaries(
     """The summary rows, or none on a journal too old to read (the outdated
     panel below names it)."""
     try:
-        return ops.book_summaries(conn, settings)
+        return ops.book_summaries(conn, settings, now=utc_now())
     except SchemaVersionError:
         return ()
 
@@ -186,7 +187,10 @@ def _selected_book(summaries: tuple[ops.BookSummary, ...], default: str) -> str:
 def _summary_card(summaries: tuple[ops.BookSummary, ...]) -> None:
     with st.container(border=True):
         st.subheader("Books")
-        st.dataframe(_summary_table(summaries), hide_index=True)
+        st.dataframe(_summary_table(summaries, utc_now()), hide_index=True)
+        for row in summaries:
+            if message := paper_message.owner_message(row.last_run_message):
+                st.caption(f"{row.book_id} last run: {message}")
 
 
 def _waiting_card(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
@@ -574,7 +578,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
     if summaries:
         _summary_card(summaries)
     book = _selected_book(summaries, settings.paper.book_id)
-    data = ops.page_data(conn, settings, book)
+    data = ops.page_data(conn, settings, book, now=utc_now())
 
     if data.journal_not_initialised:
         _render_journal_not_initialised()
@@ -596,6 +600,8 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
         )
 
     _kpis(data)
+    if message := paper_message.owner_message(data.last_run_message):
+        st.caption(f"Last run: {message}")
     _risk_card(conn, data.window)
     if data.open_orders_count and data.last_run_kind == "rebalance":
         st.info("Fills are recorded at the next scheduled run")

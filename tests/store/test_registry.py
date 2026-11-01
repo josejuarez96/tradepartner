@@ -247,12 +247,13 @@ def test_oracle_family_refused_on_the_real_store_and_accepted_on_a_temp_file(
     assert _register(conn, settings, family="oracle").family == "oracle"
 
 
+@pytest.mark.parametrize("family", ["filing_delay", "spinoff"])
 def test_register_refuses_experiment_only_family(
-    conn: duckdb.DuckDBPyConnection, settings: Settings
+    conn: duckdb.DuckDBPyConnection, settings: Settings, family: str
 ) -> None:
     """An experiment-only family (not engine-ready) is refused."""
     with pytest.raises(registry.RegistryError, match="experiment-only"):
-        _register(conn, settings, family="filing_delay")
+        _register(conn, settings, family=family)
 
 
 # --- trials --------------------------------------------------------------
@@ -1187,6 +1188,9 @@ def test_every_fact_table_is_classified_for_trial_vintage(
             "symbol_changes",
             "openfigi_types",
             "mergers",
+            "spinoff_allocations",
+            "sec_filing_events",
+            "sec_form4_transactions",
             "snapshot_sightings",  # trials read listings, never raw SEC observations
         }
         assert included.isdisjoint(excluded)
@@ -2477,3 +2481,58 @@ def test_a_check_only_dividend_alone_moves_nothing_but_a_universe_dividend_does(
     )
     for flag in (False, True):
         assert registry.data_vintage(fixture_store, cutoff, spin_offs=flag) == _LATE_INGEST
+
+
+def test_spinoff_allocation_does_not_move_trial_vintage(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    cutoff = datetime(2020, 1, 1, tzinfo=UTC)
+    before = registry.data_vintage(fixture_store, cutoff, spin_offs=True)
+    stamp = datetime(2019, 1, 1, tzinfo=UTC)
+    fixture_store.execute(
+        "INSERT INTO spinoff_allocations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ["P", "C", date(2018, 12, 13), 0.3, stamp, stamp, "owner", "owner"],
+    )
+    assert registry.data_vintage(fixture_store, cutoff, spin_offs=True) == before
+
+
+def test_sec_ownership_rows_do_not_move_trial_vintage() -> None:
+    """Collecting research-only ownership events cannot stale a trial."""
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    stamp = datetime(2026, 10, 28, 21, tzinfo=UTC)
+    before = registry.data_vintage(conn, stamp)
+    conn.execute(
+        "INSERT INTO sec_filing_events VALUES ('accession', '4', ?, '2026-10-28', "
+        "'issuer', 'owner', ?, ?, 'edgar', 'filing')",
+        [stamp, stamp, stamp],
+    )
+    conn.execute(
+        "INSERT INTO sec_form4_transactions VALUES (" + ", ".join(["?"] * 23) + ")",
+        [
+            "accession",
+            "issuer",
+            "owner",
+            0,
+            False,
+            True,
+            False,
+            False,
+            date(2026, 10, 28),
+            None,
+            "P",
+            "A",
+            10,
+            2,
+            10,
+            "D",
+            "Common",
+            None,
+            stamp,
+            stamp,
+            stamp,
+            "edgar",
+            "filing",
+        ],
+    )
+    assert registry.data_vintage(conn, stamp) == before

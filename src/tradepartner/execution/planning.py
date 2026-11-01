@@ -98,6 +98,7 @@ from tradepartner.backtest.strategies import signal_for
 from tradepartner.calendar import all_sessions, is_session, previous_session, session_close
 from tradepartner.config import PAPER_FAMILIES, Cadence, HypothesisFamily, RiskConfig, Settings
 from tradepartner.errors import StaleDataError, SystemFaultError, UniverseCollapseError
+from tradepartner.execution import breaks as break_rules
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.plan import (
     AssetFlags,
@@ -501,7 +502,8 @@ def _ledger(
     ok = [
         r
         for r in store_journal.reconciliations_for(conn, window_id)
-        if r.status == _OK and r.at.astimezone(_NEW_YORK).date() <= session
+        if (r.status == _OK or (r.status == "breaks" and r.broker_cash is not None))
+        and r.at.astimezone(_NEW_YORK).date() <= session
     ]
     return from_journal(
         store_journal.fills_for(conn, window_id=window_id),
@@ -776,6 +778,8 @@ def _write(
             n_orders_below_min_at_live_capital=decided.n_orders_below_min_at_live_capital,
             known_at=now,
             ingested_at=now,
+            n_assets_intersected=plan.n_assets_intersected,
+            assets_intersection_skipped=plan.assets_intersection_skipped,
         ),
     )
     return tuple(rows)
@@ -838,6 +842,14 @@ def plan_rebalance(
     if lagging:
         return PlanOutcome(t_i, "lagging")
     reads = _read(conn, window, window.window_id, session, settings, frozen, assets_read)
+    # Paper spec amendment 2026-10-26 (#2266) items 5 and 7: past the break cap the
+    # book is halted (nothing is planned); else a name with an open material break
+    # takes no added exposure.
+    open_now = store_journal.open_breaks(conn, window.window_id)
+    break_rules.require_under_cap(
+        open_now, reads.ledger, reads.prices, risk=frozen, window_id=window.window_id
+    )
+    restricted = break_rules.restricted_names(open_now)
     conn.begin()
     try:
         handle = _trial(lambda: _open_trial(conn, reads, t_i, settings, cadence), "its open")
@@ -874,6 +886,7 @@ def plan_rebalance(
             costs=BuyCosts(costs.per_side_bps, Commissions.from_config(costs)),
             band=band,
             hold=None,
+            restricted=restricted,
         )
         rows = _write(conn, journal, run.run_id, t_i, plan, decided, handle, now, window.book_id)
         _trial(lambda: _close_ok(conn, handle), "its result")

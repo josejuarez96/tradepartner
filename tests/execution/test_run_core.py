@@ -26,15 +26,17 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import duckdb
+import polars as pl
 import pytest
 from alpaca.common.exceptions import APIError
 
-from tradepartner.adapters.broker import OrderRequest, Side
+from tradepartner.adapters.broker import CashActivity, OrderRequest, Side
 from tradepartner.adapters.fake_broker import FakeBroker, PartialFill, Reject
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.config import FROZEN_COSTS_KEYS, CostsConfig, RiskConfig, Settings
@@ -257,6 +259,7 @@ class Env:
         *,
         quantity: float = 1.0,
         submit: bool = True,
+        book_id: str = "main",
     ) -> OrderRow:
         """A forced-exit buy's decision, `orders` row and `pending` event, and,
         unless `submit=False` (the broker never got it), the fake's submit and
@@ -288,6 +291,7 @@ class Env:
             side="buy",
             quantity=quantity,
             sells_in_flight_at_submit=False,
+            book_id=book_id,
             known_at=at,
             ingested_at=at,
         )
@@ -853,7 +857,7 @@ def test_the_lag_bound_mismatch_row_carries_a_non_default_book(env: Env) -> None
     env.ingest(_at(MON, 21))
     earlier = env.past_run(window, _at(MON))
     env.fake.lag_fills(None)
-    env.order(earlier, "tp-lag", _at(MON), quantity=2.0)
+    env.order(earlier, "tp-lag", _at(MON), quantity=2.0, book_id="fx")
     env.fake.apply("tp-lag", PartialFill(1.0, PRICE))
     seen = _at(MON, 14)
     env.append(
@@ -1140,6 +1144,108 @@ def test_the_next_run_derives_engaged_from_a_failed_run(env: Env, step_fails: No
         env.run(_at(TUE))
     env.ingest(_at(TUE, 21))
     assert env.run(_at(WED)).status == "skipped_kill_switch"
+
+
+def _breaks_base(env: Env, window: PaperWindowRow, cash: float) -> None:
+    """A `breaks` reconciliation stated Monday (T282b's base: raw cash less the
+    open name cash)."""
+    seen = _at(MON, 21)
+    env.append(
+        ReconciliationRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            at=seen,
+            status="breaks",
+            broker_cash=cash,
+            mismatches_json=json.dumps({"mismatches": [], "activities": []}),
+            known_at=seen,
+            ingested_at=seen,
+        )
+    )
+
+
+def _step_context(env: Env, window: PaperWindowRow) -> run_module.StepContext:
+    run = PaperRunRow(
+        run_id=1,
+        window_id=window.window_id,  # type: ignore[arg-type]
+        session=TUE,
+        kind="mark",
+        started_at=_at(TUE),
+        invoked_by="tty",
+        code_version="test",
+        known_at=_at(TUE),
+        ingested_at=_at(TUE),
+    )
+    return run_module.StepContext(
+        settings=env.settings,
+        connect=env.connect,
+        gate=None,  # type: ignore[arg-type]
+        window=window,
+        frozen=RiskConfig(),
+        run=run,
+        session=TUE,
+        assets={},
+        assets_read=lambda _symbols: {},
+        plan=None,
+        lagging=False,
+    )
+
+
+def test_the_exit_book_reads_a_breaks_row_as_its_cash_base(env: Env) -> None:
+    window = _marked(env)
+    _breaks_base(env, window, 90_000.0)
+    assert run_module._exit_book(_step_context(env, window)).ledger.cash == pytest.approx(90_000.0)
+
+
+def test_the_exit_book_ignores_a_breaks_row_with_no_cash(env: Env) -> None:
+    window = _marked(env)
+    _breaks_base(env, window, 90_000.0)
+    seen = _at(MON, 22)
+    env.append(
+        ReconciliationRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            at=seen,
+            status="breaks",
+            broker_cash=None,
+            known_at=seen,
+            ingested_at=seen,
+        )
+    )
+    assert run_module._exit_book(_step_context(env, window)).ledger.cash == pytest.approx(90_000.0)
+
+
+def test_the_run_ledger_reads_a_breaks_row_as_its_cash_base(env: Env) -> None:
+    window = _marked(env)
+    _breaks_base(env, window, 90_000.0)
+    run = object.__new__(run_module._Run)
+    run.settings = env.settings
+    run.window = window
+    run.window_id = window.window_id  # type: ignore[assignment]
+    run.frozen = RiskConfig()
+    ledger = run._ledger_for(pl.DataFrame())(TUE)
+    assert ledger.cash == pytest.approx(90_000.0)
+
+
+def test_a_run_on_a_breaks_reconciliation_restricts_the_name_and_ends_ok(
+    env: Env, exits_done: list[object]
+) -> None:
+    """T282d (#2266 item 7) removes T282c's temporary halt: a `breaks` reconciliation
+    writes its row and event, engages no switch and the run ends `ok`."""
+    window = _marked(env)
+    _hold_spy(env, window)
+    env.fake.activities.append(CashActivity("open-credit", "MA", MON, "executed", 30.0, "SPY"))
+    env.fake._cash += Decimal(30)
+
+    outcome = env.run(_at(TUE))
+
+    assert outcome.status == "ok"
+    assert env.query("SELECT status FROM reconciliations ORDER BY reconciliation_id")[-1] == (
+        "breaks",
+    )
+    assert env.results()[env.latest_run()][0] == "ok"
+    assert env.query("SELECT state FROM kill_switch") == []
+    assert env.query("SELECT event, security_id FROM reconcile_breaks")[0] == ("opened", SPY)
+    # The one submit is `_hold_spy`'s seed order, placed before the run.
+    assert env.broker_methods().count("submit") == 1
 
 
 def test_an_ok_run_reconciles_twice_and_ends_ok(env: Env, exits_done: list[object]) -> None:

@@ -18,6 +18,7 @@ from datetime import datetime
 from tradepartner.adapters.alpaca_broker import AlpacaBroker
 from tradepartner.adapters.broker import Broker
 from tradepartner.config import Settings
+from tradepartner.execution.lock import sandbox_store_refusal
 
 __all__ = ["build_broker"]
 
@@ -26,5 +27,9 @@ def build_broker(settings: Settings, clock: Callable[[], datetime], book_id: str
     """The production broker: `AlpacaBroker` on the paper endpoint, over
     `settings` (pacing, broker facts), `book_id`'s own paper key pair (never
     another book's, never the data keys; a book with none is refused before any
-    client is built) and the shared `clock`."""
+    client is built) and the shared `clock`. Book `sandbox` is refused unless the store
+    is a temp copy (`lock.sandbox_store_refusal`), before any client is built."""
+    refusal = sandbox_store_refusal(settings, book_id)
+    if refusal is not None:
+        raise ValueError(refusal)
     return AlpacaBroker(settings, clock, book_id=book_id)

@@ -207,20 +207,25 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import logging
 import re
 import time
 import traceback
 import uuid
 from bisect import bisect_left, bisect_right
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence, Sized
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from tradepartner.adapters.edgar_source import EdgarFilingSource
 
 import duckdb
 import pyarrow as pa
@@ -233,7 +238,7 @@ from tradepartner.adapters.borrow import (
     parse_assets,
     snapshot_rows,
 )
-from tradepartner.adapters.edgar import StatementConflict, duration_class
+from tradepartner.adapters.edgar import Form4Transaction, StatementConflict, duration_class
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverPage,
@@ -244,7 +249,27 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    SecFormFiling,
     StatementFactRecord,
+)
+from tradepartner.adapters.form4_bulk_route import (
+    Form4IndexRow,
+    RequestBudgetStopped,
+    load_bulk_quarters,
+    order_check_path,
+    request_budget,
+    run_form4_bulk_route,
+)
+from tradepartner.adapters.form4_route import (
+    Quarter,
+    QuarterState,
+    RequestCounts,
+    Route,
+    plan_requests,
+    quarter_of,
+    quarter_state,
+    route_accession,
+    rows_agree,
 )
 from tradepartner.adapters.openfigi import FigiType, parse_mapping
 from tradepartner.adapters.openfigi_raw import map_tickers
@@ -319,9 +344,20 @@ from tradepartner.store.restamp_precheck import (
     window_first_session,
 )
 from tradepartner.store.retraction import record_underived, split_kept, stored_underived
-from tradepartner.store.schema import init_schema
+from tradepartner.store.schema import atomic, init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT, member_links_title
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def show_ingest_progress() -> None:
+    """Print this module's progress messages (the Form 4 bulk route's, #2681) to stderr."""
+    if not _LOGGER.handlers:
+        _LOGGER.addHandler(logging.StreamHandler())
+    _LOGGER.setLevel(logging.INFO)
+    _LOGGER.propagate = False
+
 
 OK, STALE, FAILED, LOCKED = "ok", "stale", "failed", "locked"
 ACTIONS_FILLED = "filled"
@@ -1010,6 +1046,9 @@ def ingest_actions_backfill(
     return IngestResult(tuple(runs))
 
 
+_FORM4_BACKFILL: ContextVar[bool] = ContextVar("form4_backfill", default=False)
+
+
 def _run_source(
     name: str,
     work: Callable[[duckdb.DuckDBPyConnection, str], tuple[int, str]],
@@ -1042,7 +1081,11 @@ def _run_source(
             prepare()
         with open_for_write(settings) as conn:
             init_schema(conn)
-            rows, message = work(conn, run_id)
+            token = _FORM4_BACKFILL.set(mode == "backfill" and name == "edgar")
+            try:
+                rows, message = work(conn, run_id)
+            finally:
+                _FORM4_BACKFILL.reset(token)
             if dry_run:
                 raise _DryRun(rows, message)
             run = outcome(success_status, rows, message)
@@ -1156,7 +1199,7 @@ def _with_frames(message: str, exc: BaseException, settings: Settings) -> str:
 _clean = clean_message
 
 
-def _write_run(
+def write_run(
     conn: duckdb.DuckDBPyConnection,
     run_id: str,
     started_at: datetime,
@@ -1164,6 +1207,7 @@ def _write_run(
     run: SourceRun,
     mode: str = MODE,
 ) -> None:
+    """Record one source run on the caller's store connection."""
     insert_row(
         conn,
         "ingestion_runs",
@@ -1179,6 +1223,9 @@ def _write_run(
             "message": run.message,
         },
     )
+
+
+_write_run: Callable[..., None] = write_run
 
 
 # --- the EDGAR chunk --------------------------------------------------------
@@ -1199,6 +1246,8 @@ class _Recorded(FilingSource):
         self._statement_filled: set[str] = set()  # #660: which CIKs, never the records
         self._events_asked: set[str] = set()  # #1358: which CIKs, never the records
         self.frozen = False
+        self.sec_subjects: frozenset[str] = frozenset()
+        self.sec_forms_subjects: frozenset[str] = frozenset()
         #: CIKs whose filename answer is partial (#1597, T184b), read at the fetch pass.
         self.filename_incomplete_ciks: set[str] = set()
 
@@ -1268,6 +1317,10 @@ class _Recorded(FilingSource):
             return records
         return self._source.filing_events(cik)
 
+    def sec_forms_13d(self, subjects: frozenset[str] | None = None) -> list[SecFormFiling]:
+        """Record the 13D discovery before the store write lock is acquired."""
+        return list(self._ask("sec_forms_13d", subjects))
+
 
 def _unwrap(filings: FilingSource) -> FilingSource:
     """The adapter under any number of `_Recorded` wrappers (T17's fetch
@@ -1308,7 +1361,8 @@ def _unjudged_ciks(filings: FilingSource) -> Unjudged:
 
 
 def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None:
-    """The fetch pass: every filing question, with no store connection open;
+    """The fetch pass: snapshot existing SEC subject CIKs, then ask every
+    filing question with no store connection open;
     then `check_failures()` (T11h), if the source under `recorded` has one,
     before the lock; then `recorded` answers only from what it holds.
 
@@ -1329,8 +1383,19 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None
     later step can fail because an input was treated as absent), the gate
     still fails the run with the full list and names that error, so the
     error never hides the list."""
+    if settings.events.sec_forms_enabled and Path(settings.store.path).exists():
+        with open_read_only(settings, retry=True) as conn:
+            recorded.sec_subjects = frozenset(
+                cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+            )
     _fetch_and_gate(recorded, settings)
-    source = _unwrap(recorded)
+    _check_source_failures(_unwrap(recorded), dry_run=dry_run)
+    recorded.frozen = True
+
+
+def _check_source_failures(source: object, *, dry_run: bool) -> None:
+    """T11h's failure check on `source` (`check_failures`, when it has one), before
+    the lock; on a failed non-dry check, `record_failed_check` first (see `_prefetch`)."""
     check_failures = getattr(source, "check_failures", None)
     if check_failures is not None:
         try:
@@ -1346,7 +1411,6 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None
                         f"{type(record_error).__name__}: {record_error}"
                     ) from record_error
             raise
-    recorded.frozen = True
 
 
 def _fetch_and_gate(recorded: _Recorded, settings: Settings) -> None:
@@ -1381,6 +1445,678 @@ _EMPTY_COUNTS: tuple[tuple[str, str], ...] = (
 )
 
 
+@dataclass(frozen=True)
+class SecFormWrite:
+    """Per-accession ownership write counts for the ingestion run message."""
+
+    added: int = 0
+    changed: int = 0
+    not_yet_known: int = 0
+
+
+def write_sec_form_accession(
+    conn: duckdb.DuckDBPyConnection,
+    filing: SecFormFiling,
+    *,
+    ingested_at: datetime,
+    source: str | None = None,
+    stored: set[str] | None = None,
+) -> SecFormWrite:
+    """Write one ownership accession atomically, refusing any differing re-read.
+
+    The caller fetches and parses before opening the store. This one-accession
+    seam is also the writer for T307d's selected Form 4 route. `stored`, when
+    given, is every accession with a row in either table (the caller read it in
+    this transaction): an accession outside it is inserted with no read of the
+    tables, and is added to it (#2624; the backfill's reads scanned both tables
+    once per accession).
+    """
+    ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
+    if filing.accepted_at > ingested_at:
+        return SecFormWrite(not_yet_known=1)
+    if source is None:
+        source = (
+            "sec_form4_xml"
+            if filing.form in ("4", "4/A")
+            else "sec_13d_xml"
+            if filing.form.startswith("SCHEDULE")
+            else "sec_13d_sgml"
+        )
+    common: Row = {
+        "accepted_at": filing.accepted_at,
+        "known_at": filing.accepted_at,
+        "ingested_at": ingested_at,
+        "source": source,
+        "provenance": "filing",
+    }
+    event_rows: list[Row] = [
+        {
+            "accession": filing.accession,
+            "form": filing.form,
+            "filed_date": filing.filed_date,
+            "subject_cik": subject,
+            "filer_cik": filer,
+            **common,
+        }
+        for subject in filing.subject_ciks
+        for filer in filing.filer_ciks
+    ]
+    transaction_rows: list[Row] = [
+        {"accession": filing.accession, **asdict(transaction), **common}
+        for transaction in filing.transactions
+    ]
+    wanted = {
+        "sec_filing_events": event_rows,
+        "sec_form4_transactions": transaction_rows,
+    }
+    with atomic(conn):
+        existing: dict[str, list[Row]] = {table: [] for table in wanted}
+        for table in wanted if stored is None or filing.accession in stored else ():
+            if table == "sec_filing_events" and filing.form not in ("4", "4/A"):
+                if len(filing.subject_ciks) != 1:
+                    raise ValueError("write each 13D subject separately")
+                cursor = conn.execute(
+                    "SELECT * FROM sec_filing_events WHERE accession = ? AND subject_cik = ?",
+                    [filing.accession, filing.subject_ciks[0]],
+                )
+            else:
+                cursor = conn.execute(
+                    f"SELECT * FROM {table} WHERE accession = ?", [filing.accession]
+                )
+            columns = [column[0] for column in cursor.description]
+            existing[table] = [
+                dict(zip(columns, values, strict=True)) for values in cursor.fetchall()
+            ]
+        if any(existing.values()):
+
+            def comparable(rows: list[Row]) -> list[tuple[tuple[str, Any], ...]]:
+                return sorted(
+                    (
+                        tuple(
+                            sorted(
+                                (key, value) for key, value in row.items() if key != "ingested_at"
+                            )
+                        )
+                        for row in rows
+                    ),
+                    key=repr,
+                )
+
+            if all(
+                comparable(existing[table]) == comparable(rows) for table, rows in wanted.items()
+            ):
+                return SecFormWrite()
+            return SecFormWrite(changed=1)
+        for table, rows in wanted.items():
+            if not rows:
+                continue
+            columns = list(rows[0])
+            names = ", ".join(columns)
+            placeholders = ", ".join("?" for _ in columns)
+            conn.executemany(
+                f"INSERT INTO {table} ({names}) VALUES ({placeholders})",
+                [[row[column] for column in columns] for row in rows],
+            )
+        if stored is not None:
+            stored.add(filing.accession)
+    return SecFormWrite(added=len(event_rows) + len(transaction_rows))
+
+
+def _stored_xml_form4_transactions(
+    conn: duckdb.DuckDBPyConnection, accessions: set[str]
+) -> dict[str, tuple[Form4Transaction, ...]]:
+    """Read the stored XML accessions' transaction rows in one table pass."""
+    if not accessions:
+        return {}
+    columns = ", ".join(item.name for item in fields(Form4Transaction))
+    rows = conn.execute(
+        f"SELECT accession, {columns} FROM sec_form4_transactions "
+        "WHERE accession IN (SELECT UNNEST(?))",
+        [sorted(accessions)],
+    ).fetchall()
+    grouped: dict[str, list[Form4Transaction]] = defaultdict(list)
+    for accession, *values in rows:
+        grouped[accession].append(Form4Transaction(*values))
+    return {accession: tuple(items) for accession, items in grouped.items()}
+
+
+def _bulk_run_fields(message: str | None) -> dict[str, str]:
+    """The `key=value` fields of one `sec_insider_bulk` run message, split on `;`."""
+    return dict(part.strip().split("=", 1) for part in (message or "").split(";") if "=" in part)
+
+
+def _write_form4_bulk(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    source: EdgarFilingSource,
+    subjects: frozenset[str],
+    now: datetime,
+) -> tuple[int, str]:
+    """Select the subject issuers' Form 4 index rows and run the bulk route.
+
+    The owner's CLI entry is ``ingest --source edgar --backfill --since DATE``.
+    The switch is off by default. Its run message gives the plan and progress.
+    """
+    from tradepartner.adapters import edgar_raw
+
+    start = settings.events.sec_forms_backfill_start
+    latest = quarter_of(now.date())
+    quarters = [
+        (year, number)
+        for year in range(start.year, latest.year + 1)
+        for number in range(1, 5)
+        if (start.year, (start.month - 1) // 3 + 1)
+        <= (year, number)
+        <= (latest.year, latest.number)
+    ]
+    candidates: dict[str, list[Form4IndexRow]] = defaultdict(list)
+    for _quarter, row in source._rows(quarters, (latest.year, latest.number)):
+        if (
+            row.form in ("4", "4/A")
+            and row.form in settings.events.sec_forms
+            and row.cik in subjects
+            and row.filed_on >= start
+        ):
+            entry = (row.accession, row.cik, row.form, row.filed_on)
+            if entry not in candidates[row.accession]:
+                candidates[row.accession].append(entry)
+    if not candidates:
+        return 0, "Form 4 bulk: 0 selected, 0 requests, 0 remaining"
+    # One quarter's bulk set in memory at a time (#2624): the plan reads each
+    # quarter once and releases it; the route reads it again from the zip the
+    # plan validated, with no request. Keep all index rows of an accession in
+    # one quarter even when their filing dates disagree.
+    by_quarter: dict[Quarter, dict[str, list[Form4IndexRow]]] = defaultdict(dict)
+    accession_quarters: dict[str, Quarter] = {}
+    for accession, rows in candidates.items():
+        quarter = quarter_of(rows[0][3])
+        accession_quarters[accession] = quarter
+        by_quarter[quarter][accession] = rows
+    filing_quarters = set(by_quarter)
+    started = time.monotonic()
+    _LOGGER.info(
+        "Form 4 bulk planning: %d candidates across %d quarters",
+        len(candidates),
+        len(filing_quarters),
+    )
+    stored = {
+        accession: stored_source
+        for accession, stored_source in conn.execute(
+            "SELECT DISTINCT accession, source FROM sec_filing_events WHERE form IN ('4', '4/A')"
+        ).fetchall()
+    }
+    completed: dict[str, str] = {}
+    for cursor, message in conn.execute(
+        "SELECT chunk_cursor, message FROM ingestion_runs "
+        "WHERE source='sec_insider_bulk' AND status IN ('ok', 'partial') "
+        "ORDER BY finished_at NULLS FIRST, started_at, run_id"
+    ).fetchall():
+        parts = _bulk_run_fields(message)
+        # Older rows only recorded the loaded digest. New rows explicitly carry
+        # the last digest checked, including "none" when there was no prior check.
+        digest = parts.get("checked_sha256", parts.get("zip_sha256"))
+        if digest is None:
+            completed.pop(cursor, None)
+        else:
+            completed[cursor] = digest
+    load_counts: Counter[str] = Counter()
+    digests: dict[Quarter, str] = {}
+    unreadable: set[Quarter] = set()
+    published: set[Quarter] = set()
+    selected: dict[str, list[Form4IndexRow]] = {}
+    queued_by_quarter: dict[Quarter, list[Form4IndexRow]] = {}
+    skip: set[str] = set()
+    multi_owner_stored: Counter[Quarter] = Counter()
+    stamp_work: list[Form4IndexRow] = []
+    cross_route_disagree = samples = xml_expected = 0
+    for quarter in sorted(filing_quarters):
+        loaded, quarter_digests, quarter_counts, bad = load_bulk_quarters(
+            {quarter}, settings=settings, client=source._client
+        )
+        load_counts.update(quarter_counts)
+        unreadable.update(bad)
+        digests.update(quarter_digests)
+        quarter_bulk = loaded.get(quarter)
+        if quarter_bulk is not None:
+            published.add(quarter)
+        chosen: list[str] = []
+        for accession, rows in by_quarter.get(quarter, {}).items():
+            bulk_record = (
+                quarter_bulk.accessions.get(accession) if quarter_bulk is not None else None
+            )
+            if bulk_record is not None:
+                if bulk_record.issuer_cik is not None and bulk_record.issuer_cik not in subjects:
+                    continue
+                # A Form 4 can also be indexed under a reporting owner's CIK. The
+                # published data set names the issuer; use that row, irrespective
+                # of index order, and never stamp from the owner's payload.
+                issuer_rows = [row for row in rows if row[1] == bulk_record.issuer_cik]
+                selected[accession] = issuer_rows or rows
+            else:
+                # For an unpublished or bulk-missing accession, the XML parser
+                # checks issuer identity; try each subject-index candidate.
+                selected[accession] = rows
+            chosen.append(accession)
+        queued_by_quarter[quarter] = [row for accession in chosen for row in selected[accession]]
+        # One read per quarter, freed with the quarter (#2681), not one per accession.
+        xml_saved = _stored_xml_form4_transactions(
+            conn,
+            {
+                accession
+                for accession in chosen
+                if stored.get(accession) == "sec_form4_xml"
+                and quarter_bulk is not None
+                and accession in quarter_bulk.accessions
+            },
+        )
+        for accession in chosen:
+            stored_source = stored.get(accession)
+            if stored_source == "sec_form4_xml":
+                accession_bulk = (
+                    quarter_bulk.accessions.get(accession) if quarter_bulk is not None else None
+                )
+                if (
+                    accession_bulk is not None
+                    and not accession_bulk.identity_bad
+                    and not accession_bulk.order_bad
+                ):
+                    xml_rows = xml_saved.get(accession, ())
+                    if not rows_agree(accession_bulk.transactions, xml_rows):
+                        cross_route_disagree += 1
+                skip.add(accession)
+            elif stored_source == "sec_insider_bulk":
+                stored_multi_owner = (
+                    settings.events.form4_multi_owner_xml
+                    and quarter_bulk is not None
+                    and (record := quarter_bulk.accessions.get(accession)) is not None
+                    and len(set(record.filer_ciks)) > 1
+                )
+                if stored_multi_owner:
+                    # #2720 releases stored bulk roles after the owner reviews them.
+                    multi_owner_stored[quarter] += 1
+                if stored_multi_owner or (
+                    digests.get(quarter) is not None
+                    and completed.get(f"{quarter.year}q{quarter.number}") == digests[quarter]
+                ):
+                    skip.add(accession)
+        pending = [row for row in queued_by_quarter[quarter] if row[0] not in skip]
+        state = quarter_state(quarter, downloaded=quarter_bulk is not None, run_date=now.date())
+        if quarter not in unreadable and state is not QuarterState.MISSING:
+            stamp_work.extend(pending)
+        if (
+            quarter_bulk is not None
+            and not order_check_path(settings, quarter, digests[quarter]).exists()
+        ):
+            eligible = sum(
+                1
+                for accession, cik, _form, _filed in pending
+                if accession in quarter_bulk.accessions
+                and quarter_bulk.accessions[accession].issuer_cik == cik
+                and not quarter_bulk.accessions[accession].identity_bad
+                and not quarter_bulk.accessions[accession].order_bad
+                and (
+                    not settings.events.form4_multi_owner_xml
+                    or len(set(quarter_bulk.accessions[accession].filer_ciks)) == 1
+                )
+                and len(quarter_bulk.accessions[accession].rows) >= 2
+            )
+            samples += min(settings.events.form4_bulk_order_sample, eligible)
+        if quarter not in unreadable and state is not QuarterState.MISSING:
+            for accession, _cik, form, filed in pending:
+                candidate = (
+                    quarter_bulk.accessions.get(accession) if quarter_bulk is not None else None
+                )
+                if (
+                    settings.events.form4_multi_owner_xml
+                    and candidate is not None
+                    and len(set(candidate.filer_ciks)) > 1
+                ) or route_accession(
+                    candidate,
+                    state=state,
+                    submissions_form=form,
+                    submissions_filing_date=filed,
+                    price_below=settings.events.form4_xml_price_below,
+                    zero_price_codes=settings.events.form4_zero_price_xml_codes,
+                ).route is Route.XML:
+                    xml_expected += 1
+        del loaded, quarter_bulk, xml_saved  # released before the next quarter is read
+        _LOGGER.info(
+            "Form 4 bulk planned %dq%d: %d accessions queued, %d skipped; %.1fs elapsed",
+            quarter.year,
+            quarter.number,
+            len(chosen),
+            sum(accession in skip for accession in chosen),
+            time.monotonic() - started,
+        )
+    first_pages = {cik for _accession, cik, _form, _filed in stamp_work}
+    by_cik: dict[str, list[str]] = defaultdict(list)
+    for accession, cik, _form, _filed in stamp_work:
+        by_cik[cik].append(accession)
+    missing_stamps = 0
+    for cik, accessions in by_cik.items():
+        cached = source._load_stamps(cik)  # read once per issuer, not once per accession
+        missing_stamps += sum(accession not in cached for accession in accessions)
+    plan = plan_requests(
+        RequestCounts(
+            submissions_first_pages=len(first_pages),
+            anchor_headers=missing_stamps if settings.edgar.stamp_sgml_check else 0,
+            xml_fetches=xml_expected,
+            order_samples=samples,
+        ),
+        budget=settings.events.sec_forms_max_requests,
+        already_spent=source.requests,
+    )
+    if plan.refused:
+        return (
+            0,
+            f"Form 4 bulk: {len(selected)} selected; {plan.message()}; "
+            f"sec_forms_budget_refused: 1; "
+            f"sec_forms_bulk_multi_owner_stored: {sum(multi_owner_stored.values())}",
+        )
+
+    added = 0
+    quarter_added: Counter[Quarter] = Counter()
+    quarter_changed: Counter[Quarter] = Counter()
+    written_stored: set[str] = set()
+
+    held = {
+        accession
+        for table in ("sec_filing_events", "sec_form4_transactions")
+        for (accession,) in conn.execute(f"SELECT DISTINCT accession FROM {table}").fetchall()
+    }
+
+    def write_xml(filing: SecFormFiling) -> SecFormWrite:
+        nonlocal added
+        tally = write_sec_form_accession(
+            conn, filing, ingested_at=now, source="sec_form4_xml", stored=held
+        )
+        if filing.accession in stored:
+            written_stored.add(filing.accession)
+        added += tally.added
+        quarter = quarter_of(filing.filed_date)
+        quarter_added[quarter] += tally.added
+        quarter_changed[quarter] += tally.changed
+        return tally
+
+    def write_bulk(filing: SecFormFiling, quarter: Quarter) -> SecFormWrite:
+        nonlocal added
+        tally = write_sec_form_accession(
+            conn, filing, ingested_at=now, source="sec_insider_bulk", stored=held
+        )
+        if filing.accession in stored:
+            written_stored.add(filing.accession)
+        added += tally.added
+        quarter_added[quarter] += tally.added
+        quarter_changed[quarter] += tally.changed
+        return tally
+
+    def stamp(cik: str, accession: str, filed: date) -> tuple[datetime, str, date] | None:
+        payload = source._fetch_submissions(cik, {accession}).records.get(accession)
+        checked = source._sec_stamped(cik, accession, filed)
+        if (
+            payload is None
+            or payload.filing_date is None
+            or checked is None
+            or checked.accepted_at is None
+        ):
+            return None
+        return checked.accepted_at, payload.form, payload.filing_date
+
+    def checked(quarter: Quarter) -> bool:
+        return order_check_path(settings, quarter, digests[quarter]).exists()
+
+    def remember(quarter: Quarter) -> None:
+        edgar_raw.write_atomic(order_check_path(settings, quarter, digests[quarter]), b"passed")
+
+    counts: Counter[str] = Counter(load_counts)
+    counts["sec_forms_bulk_multi_owner_stored"] = sum(multi_owner_stored.values())
+    remaining = 0
+    # Each quarter's own unwritten count, for its run row (#2728); they sum to `remaining`.
+    quarter_remaining: Counter[Quarter] = Counter()
+    checked_digests = completed.copy()
+    route_quarters = sorted(queued_by_quarter)
+    for position, quarter in enumerate(route_quarters):
+        rows = queued_by_quarter[quarter]
+        quarter_bulk = None
+        # A quarter whose every accession is skipped is not read again.
+        needed = any(row[0] not in skip for row in rows)
+        if needed and quarter in published and quarter not in unreadable:
+            reread, reread_digests, _counts, bad = load_bulk_quarters(
+                {quarter}, settings=settings, client=source._client, revalidate=False
+            )
+            quarter_bulk = reread.get(quarter)
+            if (
+                quarter in bad
+                or quarter_bulk is None
+                or reread_digests.get(quarter) != digests[quarter]
+            ):
+                # The zip changed since the plan read it: fail closed for the quarter.
+                counts["sec_forms_bulk_unreadable"] += 1
+                unreadable.add(quarter)
+                quarter_bulk = None
+            del reread
+        result = run_form4_bulk_route(
+            rows,
+            quarters={quarter: quarter_bulk},
+            stamp=stamp,
+            xml=source.sec_form4_accession,
+            write=write_xml,
+            write_bulk=write_bulk,
+            now=now,
+            price_below=settings.events.form4_xml_price_below,
+            zero_price_codes=tuple(settings.events.form4_zero_price_xml_codes),
+            order_sample_size=settings.events.form4_bulk_order_sample,
+            multi_owner_xml=settings.events.form4_multi_owner_xml,
+            budget=settings.events.sec_forms_max_requests,
+            request_count=lambda: source.requests,
+            checked=checked,
+            remember_check=remember,
+            skip_accessions=frozenset(skip),
+            blocked_quarters=frozenset(unreadable),
+            source_counts_failures=True,
+            accession_quarters=accession_quarters,
+        )
+        del quarter_bulk  # released before the next quarter is read
+        counts.update(result.counts)
+        remaining += result.remaining
+        quarter_remaining[quarter] += result.remaining
+        # A failed stored accession must be compared again on the next run. New
+        # accession failures do not prevent the digest from advancing (#2688).
+        routed_stored = {row[0] for row in rows if row[0] not in skip and row[0] in stored}
+        if (
+            not result.counts.get("sec_forms_budget_stopped")
+            and not result.counts.get("sec_forms_bulk_order_mismatch")
+            and quarter not in unreadable
+            and routed_stored <= written_stored
+        ):
+            digest = digests.get(quarter)
+            if digest is not None:
+                checked_digests[f"{quarter.year}q{quarter.number}"] = digest
+        _LOGGER.info(
+            "Form 4 bulk routed %dq%d: %d queued, %d added, %d remaining, "
+            "%d requests; %.1fs elapsed",
+            quarter.year,
+            quarter.number,
+            len(rows),
+            quarter_added[quarter],
+            result.remaining,
+            source.requests,
+            time.monotonic() - started,
+        )
+        if result.counts.get("sec_forms_budget_stopped"):
+            for later in route_quarters[position + 1 :]:
+                unreached = len({row for row in queued_by_quarter[later] if row[0] not in skip})
+                quarter_remaining[later] += unreached
+                remaining += unreached
+            break
+    if cross_route_disagree:
+        counts["sec_forms_bulk_xml_disagree"] = cross_route_disagree
+    for quarter in sorted(filing_quarters):
+        label = f"{quarter.year}q{quarter.number}"
+        selected_count = len(queued_by_quarter.get(quarter, ()))
+        digest = digests.get(quarter, "none")
+        # `remaining` is this quarter's own count and sets its status; `run_remaining`
+        # is the whole run's (#2728). `_bulk_run_fields` reads the digests back.
+        run_message = (
+            f"quarter={label}; "
+            f"zip_sha256={digest}; checked_sha256={checked_digests.get(label, 'none')}; "
+            f"selected={selected_count}; "
+            f"rows_added={quarter_added[quarter]}; rows_changed={quarter_changed[quarter]}; "
+            f"remaining={quarter_remaining[quarter]}; run_remaining={remaining}; "
+            f"sec_forms_bulk_multi_owner_stored={multi_owner_stored[quarter]}"
+        )
+        complete = quarter_remaining[quarter] == 0 and quarter not in unreadable
+        _write_run(
+            conn,
+            uuid.uuid4().hex,
+            now,
+            now,
+            SourceRun(
+                "sec_insider_bulk",
+                "ok" if complete else "partial",
+                quarter_added[quarter],
+                label,
+                run_message,
+            ),
+            mode="backfill",
+        )
+    figures = ", ".join(f"{name}: {count}" for name, count in sorted(counts.items()))
+    return added, (
+        f"Form 4 bulk: {len(selected)} selected, {added} rows added, "
+        f"{source.requests} requests, {remaining} remaining; {plan.message()}; {figures}"
+    )
+
+
+def _write_sec_forms(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    raw_source: FilingSource,
+    filings_13d: Callable[[], Sequence[SecFormFiling]],
+    subjects: frozenset[str],
+    now: datetime,
+    *,
+    form4: bool,
+) -> tuple[int, str]:
+    """The SEC ownership forms step: the Form 4 bulk backfill when `form4` is set
+    (an EDGAR backfill) and the 13D filings `filings_13d` returns, each written for
+    its subject CIKs in `subjects`. Returns the rows added and the run-message clause.
+    The EDGAR chunk and `ingest_sec_forms` (#2624) both write through it."""
+    from tradepartner.adapters.edgar_source import EdgarFilingSource
+
+    sec_added = sec_changed = sec_future = 0
+    form4_message = ""
+    if (
+        form4
+        and isinstance(raw_source, EdgarFilingSource)
+        and any(form in settings.events.sec_forms for form in ("4", "4/A"))
+    ):
+        try:
+            with request_budget(
+                raw_source._client,
+                lambda: raw_source.requests,
+                settings.events.sec_forms_max_requests,
+            ):
+                form4_added, form4_message = _write_form4_bulk(
+                    conn, settings, raw_source, subjects, now
+                )
+        except RequestBudgetStopped:
+            form4_added = 0
+            form4_message = (
+                f"Form 4 bulk: {raw_source.requests} requests; sec_forms_budget_stopped: 1"
+            )
+        sec_added += form4_added
+    for filing in filings_13d():
+        for subject in filing.subject_ciks:
+            if subject not in subjects:
+                continue
+            sec_write = write_sec_form_accession(
+                conn, replace(filing, subject_ciks=(subject,)), ingested_at=now
+            )
+            sec_added += sec_write.added
+            sec_changed += sec_write.changed
+            sec_future += sec_write.not_yet_known
+    source_counts = getattr(raw_source, "sec_forms_counts", {})
+    figures = {"added": sec_added, "changed": sec_changed, "not_yet_known": sec_future}
+    for name, count in source_counts.items():
+        figures[name] = figures.get(name, 0) + count
+    for name, count in getattr(raw_source, "sec_forms_requests", {}).items():
+        figures[f"requests_{name}"] = count
+    message = "; " + ", ".join(f"sec_forms_{name}: {count}" for name, count in figures.items())
+    if form4_message:
+        message += f"; {form4_message}"
+    return sec_added, message
+
+
+#: The run-row source of `ingest_sec_forms` (#2624); its quarters keep their
+#: own `sec_insider_bulk` rows, as in the EDGAR chunk.
+SEC_FORMS_SOURCE = "sec_forms"
+#: The run-row sources of the SEC forms backfill: they say nothing about when
+#: the bars or the master arrived, so freshness reads skip them (#2624).
+SEC_FORMS_BACKFILL_SOURCES = frozenset({SEC_FORMS_SOURCE, "sec_insider_bulk"})
+_SEC_13D_FORMS = frozenset({"SC 13D", "SC 13D/A", "SCHEDULE 13D", "SCHEDULE 13D/A"})
+
+
+def ingest_sec_forms(
+    settings: Settings,
+    filings: EdgarFilingSource,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+) -> IngestResult:
+    """The SEC ownership forms backfill alone (#2624, `ingest --source edgar
+    --sec-forms-only`): the EDGAR backfill's SEC forms step with no filing index
+    since 1993, master build, facts or events. It reads only the quarterly index
+    rows from `events.sec_forms_backfill_start` and writes the Form 4 and 13D rows
+    and run rows the EDGAR chunk's step writes (`_write_sec_forms`), for the
+    subject CIKs of the stored `securities`. A CIK the day's master build would
+    add is not a subject until a full EDGAR run stores it. One run row, source
+    `sec_forms`, mode `backfill`; no other table is written."""
+    if not settings.events.sec_forms_enabled:
+        raise ValueError("ingest_sec_forms needs events.sec_forms_enabled")
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    held: list[SecFormFiling] = []
+
+    def gate() -> None:
+        validation = getattr(filings, "validation_failures", None)
+        if validation is not None:
+            counted = {label: getattr(filings, name, 0) for name, label in _EMPTY_COUNTS}
+            validation.raise_if_any(settings, counted)
+
+    def prepare() -> None:
+        # The 13D fetches, with no store connection open, as `_prefetch` makes them.
+        with open_read_only(settings, retry=True) as conn:
+            subjects = frozenset(
+                cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+            )
+        if _SEC_13D_FORMS & frozenset(settings.events.sec_forms):
+            held.extend(filings.sec_forms_13d(subjects))
+        gate()
+        _check_source_failures(filings, dry_run=False)
+
+    def work(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+        subjects = frozenset(
+            cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+        )
+        added, message = _write_sec_forms(
+            conn, settings, filings, lambda: held, subjects, now, form4=True
+        )
+        gate()  # a quarter index the Form 4 walk could not parse fails the run
+        return added, f"{len(subjects)} subjects{message}"
+
+    run = _run_source(
+        SEC_FORMS_SOURCE,
+        work,
+        settings,
+        now,
+        clock,
+        f"since={settings.events.sec_forms_backfill_start.isoformat()}",
+        dry_run=False,
+        mode="backfill",
+        prepare=prepare,
+        after_commit=getattr(filings, "record_failures", None),
+    )
+    return IngestResult((run,))
+
+
 def _ingest_filings(
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
@@ -1410,6 +2146,10 @@ def _ingest_filings(
     # recompute it (#564). A caller that hands an unfrozen source still
     # meets the input-validation gate before any row is written (#578).
     if not (isinstance(filings, _Recorded) and filings.frozen):
+        if settings.events.sec_forms_enabled:
+            recorded.sec_subjects = frozenset(
+                cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+            )
         _fetch_and_gate(recorded, settings)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     # Each run fetches only today's SEC ticker file. Stored sightings include
@@ -1485,6 +2225,26 @@ def _ingest_filings(
         events = event_tally.message(_unwrap(filings))
     elif rebuild_filing_events:
         raise ValueError(_REBUILD_EVENTS_NEEDS_SWITCH)
+    sec_forms = ""
+    if settings.events.sec_forms_enabled:
+        subjects = frozenset(
+            cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+        )
+        prefetch_subjects = (
+            filings.sec_forms_subjects
+            if isinstance(filings, _Recorded) and filings.frozen
+            else recorded.sec_forms_subjects
+        )
+        sec_added, sec_forms = _write_sec_forms(
+            conn,
+            settings,
+            _unwrap(filings),
+            lambda: recorded.sec_forms_13d(prefetch_subjects),
+            subjects,
+            now,
+            form4=_FORM4_BACKFILL.get(),
+        )
+        added += sec_added
     skip = _unjudged_ciks(recorded).ciks
     keep = frozenset(settings.master.keep_successors)  # owner-accepted (#922)
     derived = frozenset(row["security_id"] for row in master.securities)
@@ -1493,7 +2253,7 @@ def _ingest_filings(
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
-        f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}"
+        f"{statements}{events}{sec_forms}{rebuilt}{restamped}{_source_counts(filings)}"
         f"{_filename_counts(master, delistings, filings)}{chains}{candidates}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
@@ -1645,6 +2405,7 @@ def _source_counts(filings: FilingSource) -> str:
         ("facts_missing", "facts missing"),  # T11h: T11e's company-facts-404 leftover
         ("facts_bulk_empty", "empty bulk facts"),  # #566: `{}` companyfacts.zip members
         ("submissions_bulk_empty", "empty bulk submissions"),
+        ("bulk_not_modified", "bulk zips kept (304)"),  # #2594: conditional GET hits
         ("facts_api_empty", "empty API facts"),  # #576: per-CIK API 200 `{}`
         ("submissions_api_empty", "empty API submissions"),
         ("stamp_check_mismatched_ciks", "CIKs stamped from SGML"),  # #1494
@@ -1695,6 +2456,13 @@ def _build_filings(
     if fetch and settings.edgar.filing_events_enabled:  # #1358: full history, every run
         for cik in ciks:
             filings.filing_events(cik)
+    if fetch and settings.events.sec_forms_enabled:
+        subjects = getattr(filings, "sec_subjects", frozenset()) | frozenset(
+            row["cik"] for row in master.securities
+        )
+        if isinstance(filings, _Recorded):
+            filings.sec_forms_subjects = subjects
+        filings.sec_forms_13d(subjects)
     link = settings.edgar.class_member_link
     facts, unmatched = fact_rows(
         records,

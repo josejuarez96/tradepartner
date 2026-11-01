@@ -59,6 +59,13 @@ from tradepartner.store.db import configure_connection, utc_now
 _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
 _FIXTURES_CHAINS_DIR = _FIXTURES_UNIVERSE_DIR / "chains"
 
+
+@pytest.fixture(autouse=True)
+def _legacy_schema_migration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep existing seeded older-store migration tests on their intended path."""
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", True)
+
+
 # CI shards pytest across N parallel jobs (#1112); this keeps the same test run as
 # one process, just split into N invocations with no new dependency. Weight is each
 # unit's estimated CPU seconds (`call` + `setup` + `teardown`, summed when a unit covers
@@ -548,6 +555,9 @@ def _load_table_csvs(conn: duckdb.DuckDBPyConnection, fixtures_dir: Path) -> Non
                 f"fixture CSV {csv_path.name!r} does not match any store "
                 f"table name (known tables: {schema.TABLE_NAMES})"
             )
+        # Old-version fixtures omit tables introduced after their schema version.
+        if table == "spinoff_allocations" and not _table_column_types(conn, table):
+            continue
         column_types = _table_column_types(conn, table)
         _assert_header_matches_columns(csv_path, table, column_types)
         _assert_cell_formats(csv_path, column_types)
@@ -733,3 +743,13 @@ def version_4_store(path: Path) -> Path:
     finally:
         conn.close()
     return path
+
+
+@pytest.fixture(autouse=True)
+def _plenty_of_free_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ingest floor and health's low-disk warning (#2454) read the real disk
+    through `diskfloor.free_bytes`; no test's outcome may depend on the machine's
+    free space, so every test sees 1 TB free unless it replaces the seam."""
+    from tradepartner import diskfloor
+
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda path: 1_000_000_000_000)

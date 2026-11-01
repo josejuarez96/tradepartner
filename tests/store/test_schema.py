@@ -284,6 +284,25 @@ def test_init_schema_raises_on_schema_version_mismatch(
         schema.init_schema(fixture_store)
 
 
+def test_older_writable_store_requires_explicit_migration(
+    fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture_store.execute(
+        "DELETE FROM schema_version WHERE version = ?", [schema.CURRENT_SCHEMA_VERSION]
+    )
+    fixture_store.execute(
+        "INSERT INTO schema_version VALUES (?, current_timestamp)",
+        [schema.CURRENT_SCHEMA_VERSION - 1],
+    )
+    before = fixture_store.execute("SELECT * FROM schema_version").fetchall()
+    runs_before = fixture_store.execute("SELECT COUNT(*) FROM ingestion_runs").fetchone()
+    monkeypatch.setattr(schema, "_ALLOW_MIGRATION", False)
+    with pytest.raises(schema.SchemaMigrationRequiredError, match=r"run `tradepartner ingest`"):
+        schema.init_schema(fixture_store)
+    assert fixture_store.execute("SELECT * FROM schema_version").fetchall() == before
+    assert fixture_store.execute("SELECT COUNT(*) FROM ingestion_runs").fetchone() == runs_before
+
+
 def test_configure_connection_disables_extension_autoinstall_and_autoload(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -1296,6 +1315,9 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "successor_chains",
             "mergers",
             "reconcile_breaks",
+            "spinoff_allocations",
+            "sec_filing_events",
+            "sec_form4_transactions",
             "snapshot_sightings",
         }
         assert {table for table in shape_before if shape_after[table] != shape_before[table]} == {
@@ -2352,21 +2374,21 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 2
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_SNAPSHOT_SIGHTINGS_VERSION + 1
 
 
-def test_version_39_adds_snapshot_sightings_to_a_version_38_store() -> None:
+def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
     conn = duckdb.connect(":memory:")
     try:
         schema.init_schema(conn)
         conn.execute("DROP TABLE snapshot_sightings")
-        conn.execute("UPDATE schema_version SET version = 38 WHERE version = 39")
-        assert max(_versions(conn)) == 38
+        conn.execute("UPDATE schema_version SET version = 41 WHERE version = 42")
+        assert max(_versions(conn)) == schema._PRE_SNAPSHOT_SIGHTINGS_VERSION == 41
         schema.init_schema(conn)
         assert "snapshot_sightings" in _shape(conn)
-        assert max(_versions(conn)) == 39
+        assert max(_versions(conn)) == 42
         schema.init_schema(conn)
-        assert _versions(conn).count(39) == 1
+        assert _versions(conn).count(42) == 1
     finally:
         conn.close()
 
@@ -2895,7 +2917,7 @@ def test_the_version_38_migration_adds_the_intersection_columns_and_nothing_else
         for table in ("trial_rebalances", "paper_plans"):
             assert {name for name, _ in _ASSETS_INTERSECTION_ADDED} <= _table_columns(conn, table)
         assert {i: indexes_after[i] for i in indexes_before} == indexes_before
-        assert _versions(conn) == [37, 38, schema.CURRENT_SCHEMA_VERSION]
+        assert _versions(conn) == list(range(37, schema.CURRENT_SCHEMA_VERSION + 1))
         # Every existing row is kept; the two columns are NULL there.
         for table in ("trial_rebalances", "paper_plans"):
             assert conn.execute(
@@ -2920,10 +2942,9 @@ def test_read_only_open_of_a_version_37_store_still_serves_every_other_read(
 ) -> None:
     """A read-only connection never migrates: a version-37 store passes, its
     `schema_version` stays 37, its `trial_rebalances` and `paper_plans` lack the two
-    version-38 columns, and every read not naming them works (plan T241).
-    `journal.plans_for` names every `PaperPlanRow` field, so it reads the two as
-    NULL there instead of failing on the missing columns: the dashboard's
-    Operations page calls it on a read-only store (safety review of PR #2105)."""
+    version-38 columns, and reads not naming them work (plan T241).
+    `journal.plans_for` refuses the unmigrated store before selecting the
+    missing columns."""
     path = tmp_path / "v37.duckdb"
     conn = duckdb.connect(str(path))
     try:
@@ -2940,4 +2961,63 @@ def test_read_only_open_of_a_version_37_store_still_serves_every_other_read(
         assert ro.execute("SELECT count(*) FROM paper_plans").fetchone() == (0,)
         for table in ("trial_rebalances", "paper_plans"):
             assert not {name for name, _ in _ASSETS_INTERSECTION_ADDED} <= _table_columns(ro, table)
-        assert journal.plans_for(ro, 1) == []
+        with pytest.raises(schema.SchemaVersionError, match="paper plans require schema version"):
+            journal.plans_for(ro, 1)
+
+
+def test_version_39_adds_only_spinoff_allocations() -> None:
+    """A version-38 store gains the allocation table and one version row."""
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        for table in (
+            "spinoff_allocations",
+            "sec_filing_events",
+            "sec_form4_transactions",
+            "snapshot_sightings",
+        ):
+            conn.execute(f"DROP TABLE {table}")
+        conn.execute("DELETE FROM schema_version WHERE version IN (39, 40, 41, 42)")
+        conn.execute("INSERT INTO schema_version VALUES (38, TIMESTAMPTZ '2026-10-27 00:00:00+00')")
+        before = _shape(conn)
+        versions = _versions(conn)
+        assert versions == [38]
+        schema.init_schema(conn)
+        after = _shape(conn)
+        # The same open also takes T306's version 40 (#2539), 41 (#2617) and 42
+        # (#2295).
+        assert set(after) - set(before) == {
+            "spinoff_allocations",
+            "sec_filing_events",
+            "sec_form4_transactions",
+            "snapshot_sightings",
+        }
+        assert {name: after[name] for name in before} == before
+        assert _versions(conn) == [38, 39, 40, 41, 42]
+        schema.init_schema(conn)
+        assert _versions(conn) == [38, 39, 40, 41, 42]
+    finally:
+        conn.close()
+
+
+def test_read_only_version_38_store_keeps_existing_reads(tmp_path: Path) -> None:
+    path = tmp_path / "v38.duckdb"
+    conn = duckdb.connect(str(path))
+    schema.init_schema(conn)
+    for table in (
+        "spinoff_allocations",
+        "sec_filing_events",
+        "sec_form4_transactions",
+        "snapshot_sightings",
+    ):
+        conn.execute(f"DROP TABLE {table}")
+    conn.execute("DELETE FROM schema_version WHERE version IN (39, 40, 41, 42)")
+    conn.execute("INSERT INTO schema_version VALUES (38, TIMESTAMPTZ '2026-10-27 00:00:00+00')")
+    conn.close()
+    ro = duckdb.connect(str(path), read_only=True)
+    try:
+        schema.init_schema(ro)
+        assert schema.stored_version(ro) == 38
+        assert ro.execute("SELECT count(*) FROM corporate_actions").fetchone() == (0,)
+    finally:
+        ro.close()

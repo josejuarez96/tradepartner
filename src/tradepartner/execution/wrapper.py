@@ -210,7 +210,7 @@ import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, NoReturn, Protocol
@@ -256,6 +256,7 @@ from tradepartner.errors import (
     StaleDataError,
     SystemFaultError,
 )
+from tradepartner.execution import breaks as break_rules
 from tradepartner.execution import phases, switch
 from tradepartner.execution.alerts import Alerter
 from tradepartner.execution.collect import (
@@ -266,7 +267,8 @@ from tradepartner.execution.collect import (
     note_unjudged,
 )
 from tradepartner.execution.ledger import Ledger, from_journal
-from tradepartner.execution.plan import BuyCosts, DecisionState, decision_state, residue
+from tradepartner.execution.lock import sandbox_store_refusal
+from tradepartner.execution.plan import SHORT, BuyCosts, DecisionState, decision_state, residue
 from tradepartner.execution.planning import current_listings, reference_prices
 from tradepartner.execution.reattempts import attempt_scope, write_offs
 from tradepartner.execution.reconcile_run import order_symbols
@@ -277,6 +279,7 @@ from tradepartner.execution.risk import (
     Violations,
     _buy_cash,
     check_phase,
+    open_sold,
     order_shape_violation,
     skip_cap,
     unfilled_sells,
@@ -300,6 +303,7 @@ from tradepartner.store.journal import (
     PaperRunRow,
     PaperWindowRow,
     RebalanceEventRow,
+    ReconcileBreakRow,
     adjustments_for,
     append,
     check_book_id,
@@ -307,6 +311,7 @@ from tradepartner.store.journal import (
     fills_for,
     kill_switch_events_for,
     non_terminal_orders,
+    open_breaks,
     order_events_for,
     orders_for,
     pending_orders,
@@ -449,6 +454,7 @@ _UNFUNDED = "unfunded"
 _MISSED = "missed"
 _LIMIT_BREACH = "limit_breach"
 _SKIP_CAP = "skip_cap"
+_SKIP_RESTRICTED = "skip_restricted"
 _COSTS_PREFIX = "costs."
 
 
@@ -540,6 +546,18 @@ class BatchOutcome:
     cash_left: float | None = None
 
 
+def _own_book_rows(
+    conn: duckdb.DuckDBPyConnection, book_id: str
+) -> tuple[list[OrderRow], list[OrderEventRow], list[OrderedFill]]:
+    """Every order, event and live fill of book `book_id`, across all its windows
+    and sessions (a buy left open by an earlier window still counts), and none of
+    another book (its own account, #2475): what the open-buy reserve reads."""
+    orders = [o for o in orders_for(conn, window_id=None) if o.book_id == book_id]
+    ids = {o.client_order_id for o in orders}
+    events = [e for e in order_events_for(conn, window_id=None) if e.client_order_id in ids]
+    return orders, events, fills_for(conn, client_order_ids=ids)
+
+
 @dataclass(frozen=True)
 class _Book:
     """One phase's read of the journal and the store, every store fact as of
@@ -548,8 +566,8 @@ class _Book:
     that has none, the reason, raised when read: #569), each decision's state and each sold name's
     residue, the broker symbols, unmappable names (#1729) and ended listings
     of the batch's names, every own
-    order, event and live fill of any window, and the last `ok` daily price
-    ingest's `finished_at` (`last_ok_price_ingest`)."""
+    order, event and live fill of any window, its open breaks, and the last
+    `ok` daily price ingest's `finished_at` (`last_ok_price_ingest`)."""
 
     window: PaperWindowRow
     costs: BuyCosts
@@ -569,11 +587,23 @@ class _Book:
     #: The batch's names the one symbol map leaves ambiguous after a ticker
     #: change, each with its note (#2185): never read or sent, handled per name.
     ambiguous: Mapping[str, str] = field(default_factory=dict)
+    open_breaks: Sequence[ReconcileBreakRow] = ()
 
     def price_of(self, security_id: str) -> float:
         """The reference price on S, or `ValueError` for a name not read or
         read without one (`unpriced`, #569)."""
         return _price_lookup(self.prices, self.unpriced)(security_id)
+
+
+@dataclass(frozen=True)
+class _RestrictedSkip(Skip):
+    """A phase-time `skip_restricted` (paper spec amendment 2026-10-26, #2266, item
+    7): a name with an open material break takes no added exposure. It is no broker
+    refusal, so it never counts toward `risk.max_skips_per_run` and its share."""
+
+    @property
+    def counts_toward_cap(self) -> bool:
+        return False
 
 
 @dataclass(frozen=True)
@@ -679,6 +709,22 @@ class RiskGatedBroker:
             )
         self._last = reading
         return reading
+
+    def _phase_time(
+        self,
+        notes: list[str],
+        phase: str,
+        stamp: datetime | None = None,
+        *,
+        count: int | None = None,
+    ) -> None:
+        """Add a UTC phase reading (or, with `count`, a count) to the run's existing
+        result notes (#2620)."""
+        if count is not None:
+            notes.append(f"paper_phase {phase}={count}")
+            return
+        at = self.read_clock() if stamp is None else stamp
+        notes.append(f"paper_phase {phase}={at.isoformat()}")
 
     def clock_precheck(self, session: date, last_ok_ingest: datetime | None) -> datetime:
         """The pre-check before a phase's first submit (module docstring); return
@@ -818,6 +864,7 @@ class RiskGatedBroker:
         # `missed` (ADR 0010 point 2), whichever decisions that phase held.
         rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
         book = self._read_book(run, rows)
+        self._check_break_cap(run, book)
         if any(d.side == _BUY for d in decisions) and not self._engaged(run, book.window):
             # The buys phase's reserve prices every open quantity buy: a name
             # of one with no price halts here, before any sell is submitted,
@@ -894,6 +941,9 @@ class RiskGatedBroker:
             skips, counted = (*skips, *refused), counted + len(refused)
             if self._killed:
                 return BatchOutcome(_SKIPPED_KILL_SWITCH, tuple(submitted), skips)
+            # After the kill-switch return, so a clock read can't change the halt path.
+            if submitted:
+                self._phase_time(notes, "sells_submitted")
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
                 self._await_sells(run, [row for row, _ in gated.to_submit], book, notes)
         if not any(d.side == _BUY for d in decisions):
@@ -948,6 +998,7 @@ class RiskGatedBroker:
             session=run.session,
             ended=book.ended,
         )
+        self._phase_time(notes, "buys_sized")
         built = replace(built, skips=(*built.skips, *unsent))
         # A buy adding to a held name the broker lacks is a disagreement, not a skip.
         _refuse_unknown_held(assets, book, buys=True)
@@ -982,6 +1033,17 @@ class RiskGatedBroker:
             in_flight=not scope.last,
             plan_decisions=plan_decisions,
         )
+        first_buy: datetime | None = None
+        last_buy: datetime | None = None
+
+        def buy_submitted() -> None:
+            nonlocal first_buy, last_buy
+            stamp = self.read_clock()
+            if first_buy is None:
+                first_buy = stamp
+                self._phase_time(notes, "first_buy_submitted", stamp)
+            last_buy = stamp
+
         submitted, refused = self._submit_all(
             run,
             gated.to_submit,
@@ -990,7 +1052,10 @@ class RiskGatedBroker:
             frozenset(book.ledger.positions),
             book.last_ok_ingest,
             window=book.window,
+            on_submit=buy_submitted,
         )
+        if last_buy is not None:
+            self._phase_time(notes, "last_buy_submitted", last_buy)
         refused_ids = {s.decision_id for s in refused}
         collected_written_off = self._collect(
             run,
@@ -1047,10 +1112,9 @@ class RiskGatedBroker:
         )
 
     def _buys_cash(self, account: Account, book: _Book, session: date) -> float:
-        """**The one cash read** spec req 2 may amend (the declared stub, module
-        docstring): max(0, `account().cash` - the open-buy reserve), never
-        `buying_power`. A `ValueError` from the reserve halts the buys phase;
-        there is no fallback to a zero reserve or the full cash."""
+        """Cash available to buys: broker cash less the open-buy reserve,
+        unresolved sell proceeds and positive open name cash breaks, floored at
+        zero. Invalid reserve or break data halts the phase."""
         reserve = open_buy_reserve(
             book.orders,
             book.events,
@@ -1061,7 +1125,25 @@ class RiskGatedBroker:
             session=session,
         )
         proceeds = self._unresolved_proceeds(book)
-        return float(max(Decimal(repr(float(account.cash))) - reserve - proceeds, Decimal(0)))
+        broken_cash = Decimal(0)
+        for row in book.open_breaks:
+            parts = json.loads(row.parts_json)
+            if not isinstance(parts, list):
+                raise ValueError(f"break {row.break_id} has invalid parts")
+            for part in parts:
+                if not isinstance(part, dict):
+                    raise ValueError(f"break {row.break_id} has invalid part")
+                if part.get("kind") == "name_cash":
+                    cash_amount = part.get("cash_amount")
+                    if not isinstance(cash_amount, (int, float)) or isinstance(cash_amount, bool):
+                        raise ValueError(f"break {row.break_id} has invalid cash")
+                    amount = Decimal(str(cash_amount))
+                    if not amount.is_finite():
+                        raise ValueError(f"break {row.break_id} has non-finite cash")
+                    broken_cash += max(amount, Decimal(0))
+        return float(
+            max(Decimal(repr(float(account.cash))) - reserve - proceeds - broken_cash, Decimal(0))
+        )
 
     def _unresolved_proceeds(self, book: _Book) -> Decimal:
         """The most the own `pending_unresolved` sells may have credited: quantity
@@ -1119,6 +1201,7 @@ class RiskGatedBroker:
         phase's first submit (`refused_position_side`, ADR 0015 seam 2)."""
         assert run.session is not None and run.run_id is not None
         session = run.session
+        built = self._restrict(run, book, built, session)
         self._requests(built, book, session)
         candidates = [
             o.to_risk(str(book.symbols[o.security_id]), listing_ended=o.security_id in book.ended)
@@ -1221,6 +1304,105 @@ class RiskGatedBroker:
         counted += sum(s.counts_toward_cap for s in verdict.skips)
         return _Gated(tuple(pairs), skips, counted, final.orders)
 
+    def _open_breaks(self, run: PaperRunRow) -> list[ReconcileBreakRow]:
+        """The latest event of each open break of the run's window."""
+        with self._journal() as conn:
+            return open_breaks(conn, run.window_id)
+
+    def _check_break_cap(self, run: PaperRunRow, book: _Book) -> None:
+        """Item 5's `break_cap`, a book-level halt: more open material breaks than
+        `risk.max_open_breaks`, or their sizes above `risk.max_open_break_share` of the
+        ledger equity, raises `ReconciliationError` before any order is built."""
+        break_rules.require_under_cap(
+            self._open_breaks(run),
+            book.ledger,
+            book.prices,
+            risk=self._frozen,
+            window_id=run.window_id,
+        )
+
+    def _restrict(
+        self, run: PaperRunRow, book: _Book, built: phases.PhaseOrders, session: date
+    ) -> phases.PhaseOrders:
+        """Item 7's restriction on every order of a phase, whatever the plan said.
+
+        A name with an open material break takes no order that opens or adds
+        exposure (a buy of a long, a short open): it is a `skip_restricted`, uncounted
+        by the skip cap. A reducing order (a long's sell, a short's cover, a forced
+        exit, `paper stop`'s close) is cut to `reducing_limit(ledger, broker)` and
+        rounded down to the order's basis, so it can never cross zero on either book;
+        an order the limit leaves empty is a `skip_restricted` too. The broker's
+        positions are read only when such an order exists."""
+        restricted = break_rules.restricted_names(self._open_breaks(run))
+        if not restricted & {o.security_id for o in built.orders}:
+            return built
+        held = (
+            self._broker.positions()
+            if any(o.security_id in restricted for o in built.orders)
+            else {}
+        )
+        kept: list[phases.PhaseOrder] = []
+        skips: list[Skip] = []
+        decimals = self._decimals()
+        # The name's own sells (a short's covers, below) still open at the broker are
+        # shares already spoken for on both books: they come off both sides of the limit.
+        done = {e.client_order_id for e in book.events if e.status in TERMINAL_ORDER_STATUSES}
+        open_covers: dict[str, float] = {}
+        for o in book.orders:
+            if (
+                o.client_order_id not in done
+                and o.side == _BUY
+                and o.position_side == SHORT
+                and o.quantity is not None
+            ):
+                open_covers[o.security_id] = open_covers.get(o.security_id, 0.0) + o.quantity
+        open_now = open_sold(
+            _open_sells(book, {o.security_id for o in built.orders}, session), decimals
+        )
+        for order in built.orders:
+            if order.security_id not in restricted:
+                kept.append(order)
+                continue
+            short = order.position_side == SHORT
+            reducing = (order.side == _BUY) if short else (order.side == _SELL)
+            if not reducing:
+                skips.append(
+                    _RestrictedSkip(order.decision_id, order.security_id, _SKIP_RESTRICTED)
+                )
+                continue
+            sid = order.security_id
+            ledger_quantity = book.ledger.positions.get(sid, 0.0) - book.ledger.short_holdings.get(
+                sid, 0.0
+            )
+            symbol = book.symbols[sid]
+            position = held.get(canonical_symbol(symbol)) if symbol is not None else None
+            broker_quantity = position.quantity if position is not None else 0.0
+            # A long's sell is netted by its open sells; a short's cover by its open
+            # covers (the whole quantity of each non-terminal one: fail closed). A
+            # short-opening sell is never netted: it deepens the short. Signed, the
+            # open sells come off a long and the open covers go onto a short.
+            spoken = -open_covers.get(sid, 0.0) if short else float(open_now.get(sid, Decimal(0)))
+            limit = break_rules.reducing_limit(ledger_quantity - spoken, broker_quantity - spoken)
+            wanted = (
+                order.quantity
+                if order.quantity is not None
+                else (order.notional or 0.0) / order.price
+            )
+            quantity = min(wanted, limit)
+            step = Decimal(1).scaleb(-decimals)
+            rounded = Decimal(repr(quantity)).quantize(
+                Decimal(1) if order.whole_share else step, rounding=ROUND_DOWN
+            )
+            if rounded <= 0:
+                skips.append(_RestrictedSkip(order.decision_id, sid, _SKIP_RESTRICTED))
+            elif float(rounded) >= wanted and order.quantity is not None:
+                kept.append(order)
+            else:
+                kept.append(replace(order, quantity=float(rounded), notional=None))
+        if not skips and len(kept) == len(built.orders) and kept == list(built.orders):
+            return built
+        return replace(built, orders=tuple(kept), skips=(*built.skips, *skips))
+
     def _refuse(self, run: PaperRunRow, verdict: Violations, missed: Sequence[date]) -> NoReturn:
         """Raise the batch's violation: `LimitBreachError` when any rule is a
         `limit_breach`, else `SkipCapError`, after a `missed` row for each
@@ -1301,7 +1483,8 @@ class RiskGatedBroker:
             ok = [
                 r
                 for r in reconciliations_for(conn, window_id)
-                if r.status == _OK and r.at.astimezone(_NEW_YORK).date() <= session
+                if (r.status == _OK or (r.status == "breaks" and r.broker_cash is not None))
+                and r.at.astimezone(_NEW_YORK).date() <= session
             ]
             ledger = from_journal(
                 fills_for(conn, window_id=window_id),
@@ -1314,9 +1497,7 @@ class RiskGatedBroker:
                 window_id=window_id,
                 quantity_tolerance=self._frozen.reconcile_quantity_tolerance,
             )
-            orders = orders_for(conn, window_id=None)
-            events = order_events_for(conn, window_id=None)
-            fills = fills_for(conn)
+            orders, events, fills = _own_book_rows(conn, window.book_id)
             journaled = decisions_for(conn, window_id)
             terminal = {e.client_order_id for e in events if e.status in TERMINAL_ORDER_STATUSES}
             # The batch's and the ledger's names are priced here: a missing
@@ -1337,6 +1518,7 @@ class RiskGatedBroker:
                 [r.run for r in runs_for(conn, window_id)],
             )
             last_ok_ingest = _last_ok_ingest(conn)
+            active_breaks = open_breaks(conn, window_id)
         events_of = {d.decision.decision_id: d.events for d in journaled}
         price_of = _price_lookup(prices, unpriced)
         states: dict[int, DecisionState] = {}
@@ -1389,6 +1571,7 @@ class RiskGatedBroker:
             fills,
             last_ok_ingest,
             ambiguous,
+            active_breaks,
         )
 
     def _engaged(self, run: PaperRunRow, window: PaperWindowRow) -> bool:
@@ -1478,6 +1661,7 @@ class RiskGatedBroker:
         last_ok_ingest: datetime | None = None,
         *,
         window: PaperWindowRow,
+        on_submit: Callable[[], None] | None = None,
     ) -> tuple[list[str], list[Skip]]:
         """Submit each journaled request in order and await its acknowledgement;
         `submit`'s `Order` passes the shape check after the acknowledgement's
@@ -1512,7 +1696,7 @@ class RiskGatedBroker:
             # (`store.writer_lock_retry_seconds`), the switch read's included, may
             # have run the clock past the window, and nothing is sent outside it
             # (#2178).
-            if not self._in_submit_window(run.session):
+            if not self._in_submit_window(run.session, run):
                 self._phase_incomplete = True
                 self._close_unsent(run, [r for r, _ in pairs[index:]])
                 break
@@ -1536,6 +1720,8 @@ class RiskGatedBroker:
                     ) from None
                 continue
             else:
+                if on_submit is not None:
+                    on_submit()
                 if not self._acknowledge(run, request.client_order_id):
                     self._recheck = True
                     self._set_aside.add(request.client_order_id)
@@ -1545,13 +1731,18 @@ class RiskGatedBroker:
             submitted.append(request.client_order_id)
         return submitted, refused
 
-    def _in_submit_window(self, session: date) -> bool:
+    def _in_submit_window(self, session: date, run: PaperRunRow) -> bool:
         """Whether the clock reads inside [open(S) - `paper.submit_window_before_open_minutes`,
         open(S) + `paper.submit_window_after_open_minutes`] (the interval of
         `run.submit_window`)."""
         paper = self._settings.paper
         opening = self._calendar.session_open(session)
         now = self.read_clock()
+        if (
+            self._run_book(run) == "sandbox"
+            and sandbox_store_refusal(self._settings, "sandbox") is None
+        ):
+            return opening <= now <= self._calendar.session_close(session)
         return (
             opening - timedelta(minutes=paper.submit_window_before_open_minutes)
             <= now
@@ -1695,15 +1886,22 @@ class RiskGatedBroker:
         waiting = [
             row.client_order_id for row in sells if row.client_order_id not in self._set_aside
         ]
+        round_number = 0
         while waiting:
             waiting = [
                 c for c in waiting if self._broker.get_order(c).status not in TERMINAL_STATUSES
             ]
             now = self.read_clock()
+            round_number += 1
             if not waiting or now >= deadline:
                 break
             self._sleep(min(paper.poll_interval_seconds, (deadline - now).total_seconds()))
+        self._phase_time(notes, "sells_poll_rounds", count=round_number)
+        if not waiting:
+            self._phase_time(notes, "sells_terminal")
+        self._phase_time(notes, "sell_collection_start")
         self._collect(run, sells, price_band=self._price_band(run, book), notes=notes)
+        self._phase_time(notes, "sell_collection_end")
 
     def _price_band(self, run: PaperRunRow, book: _Book) -> PriceBand:
         """The fill-price band (#1981) over the book's reference prices."""

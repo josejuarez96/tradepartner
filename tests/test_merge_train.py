@@ -86,7 +86,7 @@ def _eligible(
 
 def test_a_ready_pr_is_eligible_even_when_behind_main() -> None:
     """AC2: nothing in the checks reads how far behind `main` the PR is."""
-    assert _eligible() is None
+    assert _eligible(_pr(labels=("owner-ok",))) is None
 
 
 @pytest.mark.parametrize(
@@ -99,6 +99,8 @@ def test_a_ready_pr_is_eligible_even_when_behind_main() -> None:
         (_pr(base="develop"), None, PATHS, (), "(b)"),
         (_pr(labels=("parked",)), None, PATHS, (), "(c)"),
         (_pr(labels=("hold",)), None, PATHS, (), "(c) on hold"),
+        (_pr(labels=("Hold",)), None, PATHS, (), "(c) on hold"),
+        (_pr(labels=("Parked",)), None, PATHS, (), "(c) parked"),
         (
             None,
             None,
@@ -113,6 +115,13 @@ def test_a_ready_pr_is_eligible_even_when_behind_main() -> None:
         (_pr(body="- [x] done\n"), None, PATHS, (), "(g)"),
         (None, None, ("scripts/team.py",), (), "(h)"),
         (_pr(fragment_texts=("status only\n",)), None, PATHS, (), "(h)"),
+        (
+            _pr(fragment_texts=(FRAGMENT,)),
+            None,
+            ("scripts/team.py", "changelog.d/12-thing.md"),
+            (),
+            "(k)",
+        ),
         (None, None, SAFETY_PATHS, ("safety-reviewer: PASS WITH FIXES",), "(i)"),
     ],
 )
@@ -137,19 +146,48 @@ def test_a_culprit_is_eligible_again_once_its_head_changes_and_ineligible_does_n
 ):
     culprit = _c(mt.comment("CULPRIT", "20261001-120000-abcdef1", head=HEAD))
     ineligible = _c("merge-train: INELIGIBLE batch 20261002-120000-abcdef1\n(d) culprit")
-    assert _eligible(comments=(culprit, ineligible)).startswith("(d)")
-    assert _eligible(_pr(head="c" * 40), _checks(sha="c" * 40), comments=(culprit,)) is None
+    assert _eligible(_pr(labels=("owner-ok",)), comments=(culprit, ineligible)).startswith("(d)")
+    assert (
+        _eligible(
+            _pr(head="c" * 40, labels=("owner-ok",)), _checks(sha="c" * 40), comments=(culprit,)
+        )
+        is None
+    )
     later = _c("merge-train: HELD batch 20261002-120000-abcdef1\nafter the culprit")
-    assert _eligible(comments=(culprit, later)) is None
+    assert _eligible(_pr(labels=("owner-ok",)), comments=(culprit, later)) is None
 
 
 def test_only_the_owners_comments_count() -> None:
     """AC1b: a pasted verdict or a forged train line from another login is invisible."""
     forged_pass = _c("safety-reviewer: PASS", author="someone")
-    assert _eligible(paths=SAFETY_PATHS, comments=(forged_pass,)).startswith("(i)")
-    assert _eligible(paths=SAFETY_PATHS, comments=(_c("safety-reviewer: PASS"),)) is None
+    assert _eligible(
+        _pr(labels=("owner-ok",)), paths=SAFETY_PATHS, comments=(forged_pass,)
+    ).startswith("(i)")
+    assert (
+        _eligible(
+            _pr(labels=("owner-ok",)), paths=SAFETY_PATHS, comments=(_c("safety-reviewer: PASS"),)
+        )
+        is None
+    )
     forged_culprit = _c(f"merge-train: CULPRIT batch x\nhead {HEAD}", author="someone")
-    assert _eligible(comments=(forged_culprit,)) is None
+    assert _eligible(_pr(labels=("owner-ok",)), comments=(forged_culprit,)) is None
+
+
+def test_class_b_pr_is_eligible_with_owner_ok_label() -> None:
+    """A class-B PR (paths outside CLASS_A_PREFIXES) is eligible with owner-ok label."""
+    assert (
+        _eligible(
+            _pr(labels=("owner-ok",), fragment_texts=(FRAGMENT,)),
+            paths=("scripts/team.py", "changelog.d/12-thing.md"),
+        )
+        is None
+    )
+
+
+def test_class_a_only_pr_is_eligible_without_owner_ok() -> None:
+    """A class-A-only PR (src/ and tests/ paths) is eligible without owner-ok label."""
+    class_a_paths = ("src/tradepartner/x.py", "tests/test_x.py", "changelog.d/12-thing.md")
+    assert _eligible(paths=class_a_paths) is None
 
 
 # --- AC3: order --------------------------------------------------------------------------
@@ -414,11 +452,11 @@ def test_the_culprit_rule_reads_an_exact_head_line() -> None:
     batch = "20261001-120000-abcdef1"
     text = mt.comment("CULPRIT", batch, head=HEAD, prefix=2)
     assert f"\nhead {HEAD}\n" in f"{text}\n"
-    assert _eligible(comments=(_c(text),)).startswith("(d)")
+    assert _eligible(_pr(labels=("owner-ok",)), comments=(_c(text),)).startswith("(d)")
     short = mt.comment("CULPRIT", batch, head=HEAD[:7])
-    assert _eligible(comments=(_c(short),)) is None
+    assert _eligible(_pr(labels=("owner-ok",)), comments=(_c(short),)) is None
     quoted = _c(f"merge-train: CULPRIT batch {batch}\nhead {'b' * 40}\nnot {HEAD}")
-    assert _eligible(comments=(quoted,)) is None
+    assert _eligible(_pr(labels=("owner-ok",)), comments=(quoted,)) is None
 
 
 def test_a_skipped_claims_run_is_not_green() -> None:
@@ -426,7 +464,60 @@ def test_a_skipped_claims_run_is_not_green() -> None:
         ready_pr.CheckRun("checks", "COMPLETED", "SUCCESS"),
         ready_pr.CheckRun("claims", "COMPLETED", "SKIPPED"),
     )
-    assert _eligible(checks=ready_pr.HeadChecks(HEAD, runs)).startswith("(e)")
+    assert _eligible(_pr(labels=("owner-ok",)), checks=ready_pr.HeadChecks(HEAD, runs)).startswith(
+        "(e)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("earlier", "latest", "eligible"),
+    [
+        (("FAILURE", "COMPLETED"), ("SUCCESS", "COMPLETED"), True),
+        (("SUCCESS", "COMPLETED"), ("FAILURE", "COMPLETED"), False),
+        (("SUCCESS", "COMPLETED"), ("", "IN_PROGRESS"), False),
+    ],
+)
+def test_eligibility_uses_latest_named_run(
+    earlier: tuple[str, str], latest: tuple[str, str], eligible: bool
+) -> None:
+    cr = ready_pr.CheckRun
+    runs = (
+        cr("checks", earlier[1], earlier[0], 10, "2026-10-27T10:00:00Z"),
+        cr("checks", latest[1], latest[0], 11, "2026-10-27T10:05:00Z"),
+        cr("claims", "COMPLETED", "SUCCESS", 11, "2026-10-27T10:05:00Z"),
+    )
+    reason = _eligible(_pr(labels=("owner-ok",)), checks=ready_pr.HeadChecks(HEAD, runs))
+    assert (reason is None) is eligible
+    if not eligible:
+        assert reason is not None and reason.startswith("(e)")
+
+
+def test_head_checks_fetch_keeps_run_ordering_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = mt.ShellRunner(tmp_path)
+    rollup = [
+        {
+            "name": "checks",
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+            "detailsUrl": f"https://github.com/{REPO}/actions/runs/{run_id}",
+            "startedAt": started,
+        }
+        for conclusion, run_id, started in (
+            ("FAILURE", 10, "2026-10-27T10:00:00Z"),
+            ("SUCCESS", 11, "2026-10-27T10:05:00Z"),
+        )
+    ]
+    rollup.append({"name": "claims", "status": "COMPLETED", "conclusion": "SUCCESS"})
+    monkeypatch.setattr(
+        runner,
+        "_gh",
+        lambda *args: json.dumps({"headRefOid": HEAD, "statusCheckRollup": rollup}),
+    )
+    checks = runner._head_checks(30)
+    assert [run.run_id for run in checks.runs[:2]] == [10, 11]
+    assert _eligible(_pr(labels=("owner-ok",)), checks=checks) is None
 
 
 @pytest.mark.parametrize(("green", "red"), [(-1, 0), (4, 5), (2, 2), (3, 2)])
@@ -714,16 +805,16 @@ def test_build_green_batch_posts_tested_naming_the_full_batch_prefix() -> None:
 
 def test_build_drops_a_conflicting_pr_and_the_train_has_no_merge_in_progress() -> None:
     fake = FakeRunner()
-    fake.add_pr(1, diff_paths=("a.py", "changelog.d/1-x.md"))
-    fake.add_pr(2, diff_paths=("a.py", "changelog.d/2-x.md"))
-    fake.add_pr(3, diff_paths=("c.py", "changelog.d/3-x.md"))
-    fake.conflicts[2] = {"a.py"}
+    fake.add_pr(1, diff_paths=("src/a.py", "changelog.d/1-x.md"))
+    fake.add_pr(2, diff_paths=("src/a.py", "changelog.d/2-x.md"))
+    fake.add_pr(3, diff_paths=("src/c.py", "changelog.d/3-x.md"))
+    fake.conflicts[2] = {"src/a.py"}
     fake.script_run(fake.base, [GREEN_MAIN])
     fake.script_run("commit2", [GREEN_FULL])  # PR1 then PR3 accepted: commit1, commit2
     record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
     by_number = {p.number: p for p in record.prs}
     assert by_number[2].state == "dropped"
-    assert by_number[2].paths == ["a.py"]
+    assert by_number[2].paths == ["src/a.py"]
     assert by_number[2].conflicts_with == [1]
     assert by_number[1].state == "accepted"
     assert by_number[3].state == "accepted"
@@ -734,7 +825,7 @@ def test_build_drops_a_conflicting_pr_and_the_train_has_no_merge_in_progress() -
     assert fake.worktrees_added == fake.worktrees_removed
     dropped_text = next(t for n, t in fake.comments_posted if n == 2)
     assert dropped_text.startswith(f"merge-train: DROPPED batch {record.batch_id}")
-    assert "a.py" in dropped_text and "#1" in dropped_text
+    assert "src/a.py" in dropped_text and "#1" in dropped_text
 
 
 # -- AC5: an already-merged PR is skipped with no comment -------------------------------
@@ -787,8 +878,12 @@ def test_the_inconclusive_comment_names_uv_lock_prs_on_build_and_on_resume() -> 
     """req 4, AC7: two accepted PRs touching uv.lock are named on an Install failure, and
     the same holds after `--resume` re-attaches (safety review of #521, SHOULD FIX 5)."""
     fake = FakeRunner()
-    fake.add_pr(1, diff_paths=("uv.lock", "changelog.d/1-x.md"), comments=LOCK_PASS)
-    fake.add_pr(2, diff_paths=("uv.lock", "changelog.d/2-x.md"), comments=LOCK_PASS)
+    fake.add_pr(
+        1, diff_paths=("uv.lock", "changelog.d/1-x.md"), comments=LOCK_PASS, labels=("owner-ok",)
+    )
+    fake.add_pr(
+        2, diff_paths=("uv.lock", "changelog.d/2-x.md"), comments=LOCK_PASS, labels=("owner-ok",)
+    )
     fake.script_run(fake.base, [GREEN_MAIN])
     install_failed = _run(
         run_id=5,
@@ -803,8 +898,12 @@ def test_the_inconclusive_comment_names_uv_lock_prs_on_build_and_on_resume() -> 
     assert "uv.lock" in text1 and "#1, #2" in text1
 
     resumer = FakeRunner()
-    resumer.add_pr(1, diff_paths=("uv.lock", "changelog.d/1-x.md"), comments=LOCK_PASS)
-    resumer.add_pr(2, diff_paths=("uv.lock", "changelog.d/2-x.md"), comments=LOCK_PASS)
+    resumer.add_pr(
+        1, diff_paths=("uv.lock", "changelog.d/1-x.md"), comments=LOCK_PASS, labels=("owner-ok",)
+    )
+    resumer.add_pr(
+        2, diff_paths=("uv.lock", "changelog.d/2-x.md"), comments=LOCK_PASS, labels=("owner-ok",)
+    )
     resumer.script_run(record.train_sha, [install_failed])
     resumed = mt.run_build_resume(resumer, record.batch_id, timeout_s=10, poll_s=0)
     assert resumed.outcome == "inconclusive"
@@ -1993,7 +2092,7 @@ def test_shell_runner_pr_data_reads_the_fragment_at_the_head_so_h_passes(
                     "headRefName": "fix/7-x",
                     "headRefOid": head,
                     "body": "Closes #7\n",
-                    "labels": [],
+                    "labels": [{"name": "owner-ok"}],
                     "comments": [],
                     "title": "x",
                 }
@@ -2100,7 +2199,7 @@ def _real_pr_data(
                     "headRefName": "fix/7-x",
                     "headRefOid": head,
                     "body": "Closes #7\n",
-                    "labels": [],
+                    "labels": [{"name": "owner-ok"}],
                     "comments": [],
                     "title": "x",
                 }
@@ -2172,7 +2271,10 @@ def test_shell_runner_pr_data_reads_review_threads_so_j_refuses_an_unresolved_on
 def test_eligibility_fails_closed_when_review_threads_were_never_read() -> None:
     """#731: `unresolved_threads=None` means nobody read them (the #764 trap: a field only
     tests fill); that is ineligible, never eligible."""
-    assert _eligible(_pr(unresolved_threads=None)) == "(j) review threads not read"
+    assert (
+        _eligible(_pr(unresolved_threads=None, labels=("owner-ok",)))
+        == "(j) review threads not read"
+    )
 
 
 @pytest.mark.parametrize(

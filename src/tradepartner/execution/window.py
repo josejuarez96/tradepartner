@@ -154,7 +154,10 @@ a false `no_window` (#1261, T132).
   also `not_executed`); `reconciliation`, when its own `reconcile_now` for
   the clock's session (`reconcile_run.command_session`) with the frozen risk
   section raises a mismatch (the row is written and the switch engaged with
-  source `fault`, as `paper reconcile` does) or ends in any status but `ok`;
+  source `fault`, as `paper reconcile` does) or ends in any status but `ok` or
+  `breaks`; `open_breaks`, when it ends `breaks` while a material break is open
+  (a safe `breaks` row, one with only immaterial breaks, is the ledger's base
+  like `ok`, T282d, #2266 item 10);
   `not_flat`, naming each short holding (the system is long-only) and each
   name the ledger holds above its residue
   (`plan.residue`) by more than the frozen
@@ -255,6 +258,7 @@ from tradepartner.config import (
     FROZEN_EXECUTION_KEYS,
     FROZEN_PAPER_KEYS,
     PAPER_FAMILIES,
+    SANDBOX_BOOK_ID,
     Cadence,
     RiskConfig,
     Settings,
@@ -267,7 +271,7 @@ from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.outcomes import NOT_EXECUTED, filled_outcome_kind
 from tradepartner.execution.plan import current_listings
-from tradepartner.execution.reconcile import OK
+from tradepartner.execution.reconcile import BREAKS, OK
 from tradepartner.execution.reconcile_run import (
     command_session,
     explanations_as_of,
@@ -297,6 +301,7 @@ from tradepartner.store.journal import (
     kill_switch_events_for,
     latest_window,
     non_terminal_orders,
+    open_breaks,
     open_window,
     order_events_for,
     orders_for,
@@ -779,6 +784,7 @@ def start(
     slug: str,
     *,
     book_id: str | None = None,
+    now: bool = False,
 ) -> StartResult:
     """`paper start --book <book> --hypothesis <slug>` (module docstring; `book_id`
     defaults to `paper.book_id`). Raises `LockHeld` while another process holds
@@ -786,6 +792,8 @@ def start(
     `ValueError` for a book outside the token grammar, and `StartRefusedError`
     for every other refusal, all before any write."""
     book = resolve_book(settings, book_id)
+    if now and book != SANDBOX_BOOK_ID:
+        raise ValueError("--now is only for book 'sandbox' on a marked temp copy")
     with run_lock(settings, book):
         with connect() as conn:
             hyp = registry.get_hypothesis(conn, slug)
@@ -808,15 +816,15 @@ def start(
                     f"no gap_signoff for {slug!r} references an ok, non-synthetic, "
                     "in_sample trial of this hypothesis",
                 )
-            now = _read_clock(clock)
+            reading = _read_clock(clock)
             forward = _forward(conn, hyp)
             if forward:
-                if _ny_date(now) < hyp.holdout_start:
+                if _ny_date(reading) < hyp.holdout_start:
                     raise StartRefusedError(
                         "holdout_not_complete",
                         f"{slug!r}'s forward holdout.start ({hyp.holdout_start}) has not passed",
                     )
-            elif not _holdout_end_completed(hyp.holdout_end, now, cadence):
+            elif not _holdout_end_completed(hyp.holdout_end, reading, cadence):
                 raise StartRefusedError(
                     "holdout_not_complete",
                     f"{slug!r}'s frozen holdout.end ({hyp.holdout_end}) is not a "
@@ -834,9 +842,24 @@ def start(
                 other_accounts = {}
             except SchemaVersionError as exc:
                 raise StartRefusedError(SCHEMA_VERSION, str(exc)) from exc
-            today = _ny_date(now)
-            listings = listing_ends_as_of(conn, now, settings)
-            actions = live_actions_as_of(conn, now)
+            today = _ny_date(reading)
+            listings = listing_ends_as_of(conn, reading, settings)
+            actions = live_actions_as_of(conn, reading)
+            if now:
+                if cadence != "daily":
+                    raise StartRefusedError("now_cadence", "--now needs a daily rebalance cadence")
+                t_0_now = previous_session(today)
+                if t_0_now <= hyp.holdout_end and not forward:
+                    raise StartRefusedError("now_data", "--now needs a close after the holdout")
+                if forward and t_0_now < hyp.holdout_start:
+                    raise StartRefusedError("now_data", "--now needs a close inside the holdout")
+                if not conn.execute(
+                    "SELECT 1 FROM prices_daily WHERE session = ? AND known_at <= ? LIMIT 1",
+                    [t_0_now, session_close(t_0_now)],
+                ).fetchone():
+                    raise StartRefusedError(
+                        "now_data", "--now needs the previous session's stored close"
+                    )
 
         try:
             account = broker.account()
@@ -872,11 +895,12 @@ def start(
             now=today,
         )
 
-        t_0 = (
-            _forward_first_session(hyp.holdout_start, today, cadence)
-            if forward
-            else _first_rebalance_session(hyp.holdout_end, today, cadence)
-        )
+        if now:
+            t_0 = t_0_now
+        elif forward:
+            t_0 = _forward_first_session(hyp.holdout_start, today, cadence)
+        else:
+            t_0 = _first_rebalance_session(hyp.holdout_end, today, cadence)
         commit, _dirty = registry.code_version()
         params = _frozen_params(settings, registered, cadence)
         frozen_json = registry.canonical_params_json(params)
@@ -889,7 +913,7 @@ def start(
             starting_cash=account.cash,
             starting_equity=account.equity,
             code_version=commit,
-            started_at=now,
+            started_at=reading,
             frozen_json=frozen_json,
             frozen_sha256=frozen_sha256,
             book_id=book,
@@ -897,8 +921,8 @@ def start(
             # the start is inside the base and never booked; it is a DB column,
             # not part of `frozen_json` or its hash (#1583, T183).
             activities_seen_json=json.dumps(sorted({a.activity_id for a in activities})),
-            known_at=now,
-            ingested_at=now,
+            known_at=reading,
+            ingested_at=reading,
         )
 
         with open_for_write(settings) as write_conn:
@@ -922,8 +946,8 @@ def start(
                         quantity=residue.quantity,
                         cash=None,
                         book_id=row.book_id,
-                        known_at=now,
-                        ingested_at=now,
+                        known_at=reading,
+                        ingested_at=reading,
                     ),
                 )
             for security_id, quantity, ex_date in plan.spinoff_receipts:
@@ -939,8 +963,8 @@ def start(
                         quantity=quantity,
                         cash=None,
                         book_id=row.book_id,
-                        known_at=now,
-                        ingested_at=now,
+                        known_at=reading,
+                        ingested_at=reading,
                     ),
                 )
 
@@ -969,6 +993,8 @@ NOT_FLAT = "not_flat"
 OVERRIDE = "override"
 MULTIPLE_OPEN_WINDOWS = "multiple_open_windows"
 OPEN_ORDERS = "open_orders"
+#: `stop` refuses while an open material break remains (T282d, #2266 item 10).
+OPEN_BREAKS = "open_breaks"
 
 REQUESTED = "requested"
 CLOSED = "closed"
@@ -1159,6 +1185,12 @@ def _origin(parts: dict[str, float], security_id: str) -> str:
     raise ValueError(f"the residue of {security_id} has no part with an origin")
 
 
+def _is_base(row: Any) -> bool:
+    """Whether a reconciliation row states the ledger's cash: an `ok` row, or a
+    `breaks` row that carries its base cash (T282b, T282c's `run._is_cash_base`)."""
+    return row.status == OK or (row.status == BREAKS and row.broker_cash is not None)
+
+
 def _residues(
     connect: Connect, window: PaperWindowRow, session: date, frozen: RiskConfig
 ) -> dict[str, dict[str, Any]]:
@@ -1171,7 +1203,7 @@ def _residues(
         fills = fills_for(conn, window_id=window_id)
         orders = orders_for(conn, window_id=window_id)
         adjustments = adjustments_for(conn, window_id)
-        ok_rows = [r for r in reconciliations_for(conn, window_id) if r.status == OK]
+        ok_rows = [r for r in reconciliations_for(conn, window_id) if _is_base(r)]
         decided = decisions_for(conn, window_id)
         marks = positions_daily_for(conn, window_id)
         runs = [r.run for r in runs_for(conn, window_id)]
@@ -1350,13 +1382,24 @@ def stop(
             raise WindowCommandRefused(RECONCILIATION, message) from exc
         with connect() as conn:
             reconciliation = _latest_reconciliation(conn, window_id)
-        if result.status != OK:
+        if result.status not in (OK, BREAKS):
             waiting = ", ".join((*result.lagging_ids, *result.pending_ids)) or "none listed"
             raise WindowCommandRefused(
                 RECONCILIATION,
                 f"reconciliation {reconciliation.reconciliation_id} is {result.status}, "
-                f"not ok (orders: {waiting})",
+                f"not ok or breaks (orders: {waiting})",
             )
+        if result.status == BREAKS:
+            with connect() as conn:
+                material = [b for b in open_breaks(conn, window_id) if b.material]
+            if material:
+                names = ", ".join(sorted(b.break_id for b in material))
+                raise WindowCommandRefused(
+                    OPEN_BREAKS,
+                    f"reconciliation {reconciliation.reconciliation_id} leaves "
+                    f"{len(material)} open material break(s), true them up or let the "
+                    f"broker clear them first: {names}",
+                )
 
         residues = _residues(connect, window, session, frozen)
         residues_json = json.dumps(residues, sort_keys=True, allow_nan=False)
@@ -1831,7 +1874,7 @@ def _ledger_view(
             f"the clock reading {as_of.isoformat()} is before journal row stamped "
             f"{max(stamps).isoformat()}"
         )
-    stated = [r for r in reconciliations if r.status == OK and _ny_date(r.at) <= session]
+    stated = [r for r in reconciliations if _is_base(r) and _ny_date(r.at) <= session]
     ledger = from_journal(
         fills,
         orders,

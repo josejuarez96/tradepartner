@@ -243,6 +243,7 @@ def test_edgar_filing_source_defaults() -> None:
     s = _settings()
     assert s.edgar.index_first_year == 1993
     assert s.edgar.index_settle_days == 3
+    assert s.edgar.reconcile_recent_quarters == 8
     assert s.edgar.bulk_stamp_threshold_ciks == 500
     assert s.edgar.bulk_stamps_enabled is False
     assert s.edgar.cover_page_forms == ["10-K", "10-Q", "20-F", "40-F"]
@@ -656,6 +657,7 @@ def test_edgar_failure_policy_defaults() -> None:
     [
         ("index_first_year", 1992),
         ("index_settle_days", -1),
+        ("reconcile_recent_quarters", 0),
         ("bulk_stamp_threshold_ciks", 0),
         ("fsn_first_year", 2008),
         ("header_first_year", 1992),
@@ -1008,6 +1010,7 @@ def test_hypotheses_families_default() -> None:
         "profitability",
         "combined",
         "filing_delay",
+        "spinoff",
     ]
 
 
@@ -1492,6 +1495,7 @@ def test_family_parents_derives_without_oracle_at_today_s_values() -> None:
         "profitability": None,
         "combined": "momentum",
         "filing_delay": None,
+        "spinoff": None,
     }
 
 
@@ -3404,3 +3408,195 @@ def test_ui_lab_orphan_after_hours_defaults_to_24_and_must_be_positive() -> None
     for bad in (0, -1):
         with pytest.raises(ValidationError):
             Settings(_env_file=None, ui={"lab_orphan_after_hours": bad})
+
+
+def test_ui_lab_poll_seconds_is_positive() -> None:
+    assert Settings(_env_file=None).ui.lab_poll_seconds > 0
+    assert Settings(_env_file=None, ui={"lab_poll_seconds": 4}).ui.lab_poll_seconds == 4
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, ui={"lab_poll_seconds": 0})
+
+
+def test_ui_lab_slot_grace_seconds_default_and_bounds() -> None:
+    """#2357: the grace window while a slot file with no PID yet is protected."""
+    assert _settings().ui.lab_slot_grace_seconds == 30.0
+    assert (
+        Settings(_env_file=None, ui={"lab_slot_grace_seconds": 15.0}).ui.lab_slot_grace_seconds
+        == 15.0
+    )
+    for bad in (0, -1, -0.5):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"lab_slot_grace_seconds": bad})
+
+
+def test_ui_lab_tail_bytes_default_and_bounds() -> None:
+    """#2357: the log tail size the Lab page shows."""
+    assert _settings().ui.lab_tail_bytes == 4000
+    assert Settings(_env_file=None, ui={"lab_tail_bytes": 2000}).ui.lab_tail_bytes == 2000
+    for bad in (0, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"lab_tail_bytes": bad})
+
+
+def test_ui_lab_ps_timeout_seconds_default_and_bounds() -> None:
+    """#2357: the `ps` timeout when checking a child's start time."""
+    assert _settings().ui.lab_ps_timeout_seconds == 10.0
+    assert (
+        Settings(_env_file=None, ui={"lab_ps_timeout_seconds": 5.0}).ui.lab_ps_timeout_seconds
+        == 5.0
+    )
+    for bad in (0, -1, -0.5):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, ui={"lab_ps_timeout_seconds": bad})
+
+
+def test_events_sec_forms_defaults() -> None:
+    """T305 (#2435): the six event forms, collection and reads both off."""
+    s = Settings(_env_file=None)
+    assert s.events.sec_forms == [
+        "SC 13D",
+        "SC 13D/A",
+        "SCHEDULE 13D",
+        "SCHEDULE 13D/A",
+        "4",
+        "4/A",
+    ]
+    assert s.events.sec_forms_enabled is False
+    assert s.events.sec_forms_read_enabled is False
+
+
+def test_events_sec_forms_refuses_empty_or_blank_and_unknown_keys() -> None:
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, events={"sec_forms": []})
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, events={"sec_forms": [" "]})
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, events={"nope": 1})
+
+
+def test_events_sec_forms_keys_sit_outside_every_frozen_canonical_set() -> None:
+    """T305 (#2435): none of the three keys is a frozen key of any family, so changing
+    one never changes a registered backtest input, its canonical set or its fingerprint;
+    and `master.issuer_forms` is untouched."""
+    from datetime import date
+
+    from tradepartner.backtest import frozen, hypothesis
+
+    keys = {"events.sec_forms", "events.sec_forms_enabled", "events.sec_forms_read_enabled"}
+    assert keys.isdisjoint(hypothesis.frozen_keys())
+    assert keys.isdisjoint(frozen.CANONICAL_EXCLUDED_KEYS)
+    assert keys.isdisjoint({key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS})
+    assert "events" not in {k.partition(".")[0] for k in hypothesis.frozen_keys()}
+    fixture = Path(__file__).parent / "fixtures" / "hypotheses" / "fixture-momentum.md"
+    parsed = hypothesis.parse_file(fixture)
+    base = Settings(_env_file=None)
+    flipped = Settings(
+        _env_file=None,
+        events={"sec_forms": ["4"], "sec_forms_enabled": True, "sec_forms_read_enabled": True},
+    )
+    # What a registration stores (and so its params hash and fingerprint) ignores them.
+    stored = hypothesis.frozen_params(parsed, base)
+    assert hypothesis.frozen_params(parsed, flipped) == stored
+    assert not any(k.startswith("events.") for k in stored)
+    assert frozen.fingerprint("momentum", stored, date(2019, 11, 29)) == frozen.fingerprint(
+        "momentum", hypothesis.frozen_params(parsed, flipped), date(2019, 11, 29)
+    )
+    assert Settings(_env_file=None).master.issuer_forms[-2:] == ["25", "25-NSE"]
+
+
+_BULK_KEYS = {
+    "events.sec_forms_backfill_start",
+    "events.form4_xml_price_below",
+    "events.form4_zero_price_xml_codes",
+    "events.form4_bulk_order_sample",
+    "events.form4_multi_owner_xml",
+    "events.sec_forms_max_requests",
+    "events.form4_bulk_max_member_bytes",
+}
+
+
+def test_events_form4_bulk_keys_default_as_the_amendment_says() -> None:
+    """T305b (#2498): backfill from 2016-01-01, under $1 goes to XML, a 0.00 price only
+    for P and S, 20 order-sample accessions, 40,000 requests per run."""
+    from datetime import date
+    from decimal import Decimal
+
+    e = Settings(_env_file=None).events
+    assert e.sec_forms_backfill_start == date(2016, 1, 1)
+    assert e.form4_xml_price_below == Decimal("1.00")
+    assert e.form4_zero_price_xml_codes == ["P", "S"]
+    assert e.form4_bulk_order_sample == 20
+    assert e.form4_multi_owner_xml is True
+    assert e.sec_forms_max_requests == 40_000
+
+
+def test_events_form4_bulk_keys_refuse_nonsense() -> None:
+    for bad in (
+        {"form4_xml_price_below": 0},
+        {"form4_xml_price_below": -1},
+        {"form4_bulk_order_sample": 0},
+        {"sec_forms_max_requests": 0},
+        {"form4_bulk_order_sample": 1_001},
+        {"sec_forms_max_requests": 200_001},
+        {"form4_bulk_max_member_bytes": 0},
+        {"form4_bulk_max_member_bytes": 8 * 1024**3 + 1},
+        {"form4_zero_price_xml_codes": [" "]},
+        {"sec_forms_backfill_start": "not-a-date"},
+    ):
+        with pytest.raises(ValueError):
+            Settings(_env_file=None, events=bad)
+    # An empty code list is allowed: no code sends a 0.00 price to XML.
+    assert Settings(_env_file=None, events={"form4_zero_price_xml_codes": []}).events
+
+
+def test_events_form4_bulk_keys_sit_outside_every_frozen_canonical_set() -> None:
+    from tradepartner.backtest import frozen, hypothesis
+
+    assert _BULK_KEYS.isdisjoint(hypothesis.frozen_keys())
+    assert _BULK_KEYS.isdisjoint(frozen.CANONICAL_EXCLUDED_KEYS)
+    assert _BULK_KEYS.isdisjoint({key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS})
+
+
+# --- T345 (#2744): the local raw archive's path and disk floor (ADR 0028) ---
+
+
+def test_raw_archive_defaults_name_no_path_and_a_ten_gb_floor() -> None:
+    """No archive path is committed: unset by default, so the archive is off; the
+    write floor defaults to ADR 0028's 10 GB."""
+    s = _settings()
+    assert s.tradepartner_raw_archive is None
+    assert s.raw_archive.min_free_disk_gb == 10.0
+
+
+def test_raw_archive_path_is_read_from_its_env_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRADEPARTNER_RAW_ARCHIVE", str(tmp_path))
+    monkeypatch.setenv("RAW_ARCHIVE__MIN_FREE_DISK_GB", "12.5")
+    s = _settings()
+    assert s.tradepartner_raw_archive is not None
+    assert s.tradepartner_raw_archive.get_secret_value() == str(tmp_path)
+    assert s.raw_archive.min_free_disk_gb == 12.5
+    assert str(tmp_path) in secret_values(s)
+    assert str(tmp_path) not in repr(s)
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf")])
+def test_raw_archive_floor_cannot_be_turned_off(bad: float) -> None:
+    """Fail closed: unlike `ingest.min_free_disk_gb`, 0 is not 'off' here."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, raw_archive={"min_free_disk_gb": bad})
+
+
+def test_env_example_names_the_raw_archive_with_an_empty_value() -> None:
+    """`.env.example` names the variable but commits no path or account (spec
+    amendment #2714 item 2)."""
+    env_example = Path(__file__).resolve().parents[1] / ".env.example"
+    lines = [
+        line.lstrip("# ").strip()
+        for line in env_example.read_text(encoding="utf-8").splitlines()
+        if "TRADEPARTNER_RAW_ARCHIVE" in line and "=" in line
+    ]
+    assert lines == ["TRADEPARTNER_RAW_ARCHIVE="]
+    text = env_example.read_text(encoding="utf-8")
+    assert "Mobile Documents" not in text and "CloudDocs" not in text

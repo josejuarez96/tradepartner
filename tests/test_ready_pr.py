@@ -251,6 +251,19 @@ def test_edgar_source_requires_the_quant_audit() -> None:
     }
 
 
+def test_review_prefixes_are_stems_so_a_config_split_stays_covered() -> None:
+    # config-split T309: a split module keeps the review its parent file had
+    both = {"quant-auditor", "safety-reviewer"}
+    for name in ("config_data", "config_edgar", "config_backtest", "config_base", "ingest_edgar"):
+        assert ready_pr.required_reviews([f"src/tradepartner/{name}.py"]) == both, name
+    for path in (
+        "src/tradepartner/health_rules.py",
+        "src/tradepartner/adapters/edgar_insider_bulk.py",
+    ):
+        assert ready_pr.required_reviews([path]) == {"quant-auditor"}, path
+    assert ready_pr.required_reviews(["src/tradepartner/cli_commands.py"]) == {"safety-reviewer"}
+
+
 def test_uv_lock_requires_the_safety_review() -> None:
     # dependency pins, like pyproject.toml (#382)
     assert ready_pr.required_reviews(["uv.lock"]) == {"safety-reviewer"}
@@ -376,6 +389,37 @@ def test_checks_state_needs_the_exact_commit_and_completed_runs() -> None:
     assert ready_pr.checks_state(hc("abc", non_matrix), "abc") == "failure"
 
 
+@pytest.mark.parametrize(
+    ("earlier", "latest", "expected"),
+    [
+        (("FAILURE", "COMPLETED"), ("SUCCESS", "COMPLETED"), "success"),
+        (("SUCCESS", "COMPLETED"), ("FAILURE", "COMPLETED"), "failure"),
+        (("SUCCESS", "COMPLETED"), ("", "IN_PROGRESS"), "pending"),
+    ],
+)
+def test_checks_state_uses_latest_named_run(
+    earlier: tuple[str, str], latest: tuple[str, str], expected: str
+) -> None:
+    cr = ready_pr.CheckRun
+    runs = (
+        cr("checks", earlier[1], earlier[0], 10, "2026-10-27T10:00:00Z"),
+        cr("checks", latest[1], latest[0], 11, "2026-10-27T10:05:00Z"),
+        cr("claims", "COMPLETED", "SUCCESS", 11, "2026-10-27T10:05:00Z"),
+    )
+    assert ready_pr.checks_state(ready_pr.HeadChecks("abc", runs), "abc") == expected
+    reversed_checks = ready_pr.HeadChecks("abc", tuple(reversed(runs)))
+    assert ready_pr.checks_state(reversed_checks, "abc") == expected
+
+
+def test_checks_state_uses_start_time_for_reruns_of_one_workflow() -> None:
+    cr = ready_pr.CheckRun
+    runs = (
+        cr("checks", "COMPLETED", "FAILURE", 10, "2026-10-27T10:00:00Z"),
+        cr("checks", "COMPLETED", "SUCCESS", 10, "2026-10-27T10:05:00Z"),
+    )
+    assert ready_pr.checks_state(ready_pr.HeadChecks("abc", runs), "abc") == "success"
+
+
 def test_a_cancelled_draft_shard_is_superseded_by_the_labelled_full_run() -> None:
     """#1254: a draft run cancelled by the labelled `ci:full` run leaves its matrix job as
     the bare ``pytest-shard`` (cancelled), while the full run reports its shards as
@@ -400,7 +444,8 @@ def test_a_cancelled_draft_shard_is_superseded_by_the_labelled_full_run() -> Non
 
 def test_a_cancelled_check_with_a_different_name_is_superseded_by_a_later_success() -> None:
     """#1844: the draft run's cancelled `pytest-shard` and `claims-x` share no name with the
-    full run's checks; a later workflow run's SUCCESS (by run id, else start time) excuses them."""
+    full run's checks; a later workflow run's SUCCESS (by run_id only) excuses them.
+    Unknown run_ids (0) cannot establish ordering, so no excusal occurs."""
     hc = ready_pr.HeadChecks
     cr = ready_pr.CheckRun
     draft = (
@@ -412,11 +457,12 @@ def test_a_cancelled_check_with_a_different_name_is_superseded_by_a_later_succes
         cr("checks", "COMPLETED", "SUCCESS", 11, "2026-10-18T10:05:00Z"),
     )
     assert ready_pr.checks_state(hc("abc", (*draft, *full)), "abc") == "success"
+    # Unknown run_ids (0): cannot determine ordering, so cross-name excusal does not apply.
     by_time = (
         cr("odd-job", "COMPLETED", "CANCELLED", 0, "2026-10-18T10:00:00Z"),
         cr("checks", "COMPLETED", "SUCCESS", 0, "2026-10-18T10:05:00Z"),
     )
-    assert ready_pr.checks_state(hc("abc", by_time), "abc") == "success"
+    assert ready_pr.checks_state(hc("abc", by_time), "abc") == "failure"
 
 
 def test_failed_aggregator_from_cancelled_1856_run_waits_for_newer_full_run() -> None:
@@ -478,6 +524,34 @@ def test_a_cancelled_check_with_no_later_success_still_fails() -> None:
         cr("checks", "COMPLETED", "SUCCESS"),
     )
     assert ready_pr.checks_state(hc("abc", unordered), "abc") == "failure"
+
+
+def test_cross_name_excusal_requires_different_later_run_id() -> None:
+    """Cross-name rule (#1844): a cancelled check is excused only by a SUCCESS in a
+    *different, later* workflow run (by run_id). Same run_id with later start time
+    does NOT excuse it — the cancelled check never passed in that run."""
+    hc = ready_pr.HeadChecks
+    cr = ready_pr.CheckRun
+    # Same workflow run (run_id=10): cancelled `claims` at 10:00, successful `checks` at 10:05.
+    # The cross-name rule must NOT excuse `claims` because it's the same run.
+    same_run = (
+        cr("claims", "COMPLETED", "CANCELLED", 10, "2026-10-18T10:00:00Z"),
+        cr("checks", "COMPLETED", "SUCCESS", 10, "2026-10-18T10:05:00Z"),
+    )
+    assert ready_pr.checks_state(hc("abc", same_run), "abc") == "failure"
+    # Different run_id (11 > 10): cancelled `claims` in run 10, successful `checks` in run 11.
+    # This SHOULD be excused by the cross-name rule.
+    later_run = (
+        cr("claims", "COMPLETED", "CANCELLED", 10, "2026-10-18T10:00:00Z"),
+        cr("checks", "COMPLETED", "SUCCESS", 11, "2026-10-18T10:05:00Z"),
+    )
+    assert ready_pr.checks_state(hc("abc", later_run), "abc") == "success"
+    # Unknown run_id (0): cannot determine ordering, so no excusal.
+    unknown_run_id = (
+        cr("claims", "COMPLETED", "CANCELLED", 0, "2026-10-18T10:00:00Z"),
+        cr("checks", "COMPLETED", "SUCCESS", 0, "2026-10-18T10:05:00Z"),
+    )
+    assert ready_pr.checks_state(hc("abc", unknown_run_id), "abc") == "failure"
 
 
 # ── the flow, on a fake runner ──────────────────────────────────────────────────
@@ -1631,6 +1705,13 @@ def test_a_failing_static_test_stops_before_the_push() -> None:
     with pytest.raises(ready_pr.ReadyError, match="static invariant tests failed"):
         ready_pr.ready(r, 69)
     assert r.pushed == []
+
+
+def test_every_static_invariant_test_file_exists() -> None:
+    """A renamed test file would silently drop out of the static check (#2387)."""
+    root = Path(__file__).resolve().parents[1]
+    for entry in ready_pr.STATIC_INVARIANT_TESTS:
+        assert (root / entry.split("::")[0]).is_file(), entry
 
 
 def test_book_page_requires_the_safety_review() -> None:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 import runpy
 import tomllib
 from collections.abc import Iterator
@@ -27,7 +28,7 @@ from dashboard_nav import NavCall, nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import Settings
-from tradepartner.dashboard import book_page, home_page, override_page, research_page
+from tradepartner.dashboard import book_page, home_page, override_page, research_page, theme
 from tradepartner.dashboard.app import (
     StoreState,
     StoreUnavailable,
@@ -35,7 +36,7 @@ from tradepartner.dashboard.app import (
     open_store_connection,
 )
 from tradepartner.store import schema
-from tradepartner.store.db import open_for_write
+from tradepartner.store.db import StoreLockedError, open_for_write
 
 _APP_PATH = str(
     Path(__file__).resolve().parents[2] / "src" / "tradepartner" / "dashboard" / "app.py"
@@ -45,7 +46,7 @@ _CONFIG_TOML = Path(__file__).resolve().parents[2] / ".streamlit" / "config.toml
 
 _DASHBOARD_DIR = Path(_APP_PATH).parent
 
-_TOP_TITLES = ["Home", "Research", "Books"]
+_TOP_TITLES = ["Home", "Research", "Lab", "Books"]
 _DETAIL_TITLES = [
     "Data health",
     "Backtest",
@@ -62,7 +63,7 @@ def _run_app(monkeypatch: pytest.MonkeyPatch, store_path: Path, page: str = "Hom
     monkeypatch.setenv("STORE__PATH", str(store_path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", page)
-    at = AppTest.from_file(_APP_PATH)
+    at = AppTest.from_file(_APP_PATH, default_timeout=60)
     at.run()
     return at
 
@@ -148,6 +149,35 @@ def test_open_store_connection_propagates_page_body_errors(settings: Settings) -
     with pytest.raises(_PageBoom), open_store_connection(settings) as store:
         assert isinstance(store, duckdb.DuckDBPyConnection)
         raise _PageBoom("simulated page-body failure")
+
+
+def test_data_health_shows_busy_if_a_later_read_is_locked(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings
+) -> None:
+    import tradepartner.dashboard.app as app_module
+
+    with open_for_write(settings) as conn:
+        schema.init_schema(conn)
+    real_open = app_module.open_read_only
+    calls = 0
+    shown: list[str] = []
+
+    @contextmanager
+    def lock_second_read(config: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise StoreLockedError("writer acquired the store")
+        with real_open(config) as conn:
+            yield conn
+
+    monkeypatch.setattr(app_module, "open_read_only", lock_second_read)
+    monkeypatch.setattr(app_module, "render_busy", lambda _settings: shown.append("busy"))
+    app_module._render_page(
+        settings, "Data health", lambda conn, _settings: conn.execute("SELECT 1").fetchone()
+    )
+    assert calls == 2
+    assert shown == ["busy"]
 
 
 def test_dashboard_app_module_never_imports_open_for_write() -> None:
@@ -243,6 +273,55 @@ def test_render_ok_state_builds_the_top_nav(
         "Details": _DETAIL_TITLES,
     }
     assert [p.title for p in pages[""] if p.url_path == ""] == ["Home"]
+
+
+def _bottom_bar_markup(at: AppTest) -> str:
+    """The shell's one phone-bar `st.html` block (it carries `theme.PHONE_NAV_CLASS`)."""
+    blocks = [str(b.value) for b in at.get("html") if theme.PHONE_NAV_CLASS in str(b.value)]
+    assert len(blocks) == 1
+    return blocks[0]
+
+
+def test_bottom_bar_has_one_link_per_top_nav_page_and_the_top_nav_stays(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    nav_calls: list[NavCall],
+) -> None:
+    at = _run_app(monkeypatch, _init_store(tmp_path))
+    assert not at.exception
+    markup = _bottom_bar_markup(at)
+    labels = re.findall(r"<a [^>]*>([^<]+)</a>", markup)
+    assert labels == _TOP_TITLES
+    hrefs = re.findall(r'href="([^"]*)"', markup)
+    assert hrefs == ["/", "/research", "/lab", "/books"]
+    assert 'target="_self"' in markup
+    # desktop keeps the top nav
+    [(_pages, kwargs)] = nav_calls
+    assert kwargs == {"position": "top"}
+
+
+def test_bottom_bar_is_drawn_once_whichever_page_is_selected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path = _init_store(tmp_path)
+    for page in ("Home", "Books", "Backtest"):
+        at = _run_app(monkeypatch, store_path, page)
+        assert not at.exception
+        _bottom_bar_markup(at)
+
+
+def test_bottom_bar_is_absent_when_the_server_options_are_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real_get_option = st.get_option
+    monkeypatch.setattr(
+        st,
+        "get_option",
+        lambda key: "0.0.0.0" if key == "server.address" else real_get_option(key),
+    )
+    at = _run_app(monkeypatch, _init_store(tmp_path))
+    assert at.error
+    assert not [b for b in at.get("html") if theme.PHONE_NAV_CLASS in str(b.value)]
 
 
 def test_home_and_books_route_with_the_final_signature(

@@ -57,7 +57,15 @@ _PHASE3_REGISTRY = tuple(
 _UNTOUCHED_TABLES = tuple(
     name
     for name in schema.TABLE_NAMES
-    if name not in ("corporate_actions", "schema_version", *schema.RETRACTABLE_TABLES)
+    if name
+    not in (
+        "corporate_actions",
+        "schema_version",
+        "spinoff_allocations",
+        "sec_filing_events",
+        "sec_form4_transactions",
+        *schema.RETRACTABLE_TABLES,
+    )
 )
 
 #: Tables an older migration than the one under test rebuilt, so only their

@@ -119,16 +119,15 @@ QUANT_PREFIXES = (
     "src/tradepartner/adapters/filings",
     "src/tradepartner/adapters/fixture_",
     "src/tradepartner/adapters/alpaca_prices",
-    "src/tradepartner/adapters/edgar.py",
-    "src/tradepartner/adapters/edgar_source.py",
+    "src/tradepartner/adapters/edgar",
     "src/tradepartner/calendar.py",
-    "src/tradepartner/config.py",
+    "src/tradepartner/config",
     "src/tradepartner/timeutil.py",
     "src/tradepartner/universe.py",
     "src/tradepartner/gap.py",
-    "src/tradepartner/ingest.py",
+    "src/tradepartner/ingest",
     "src/tradepartner/backfill.py",
-    "src/tradepartner/health.py",
+    "src/tradepartner/health",
     "src/tradepartner/backtest/",
     "src/tradepartner/execution/",
     # the Lab page's child-process modules register and run hypotheses (#2304)
@@ -147,9 +146,9 @@ SAFETY_PREFIXES = (
     "src/tradepartner/adapters/alpaca_prices",
     "src/tradepartner/adapters/edgar.py",
     "src/tradepartner/cli_record.py",
-    "src/tradepartner/cli.py",
-    "src/tradepartner/config.py",
-    "src/tradepartner/ingest.py",
+    "src/tradepartner/cli",
+    "src/tradepartner/config",
+    "src/tradepartner/ingest",
     "src/tradepartner/execution/",
     "src/tradepartner/errors.py",
     "src/tradepartner/llm/",
@@ -474,12 +473,22 @@ def is_cancelled(run: CheckRun) -> bool:
 
 def is_later_than(run: CheckRun, other: CheckRun) -> bool:
     """Whether ``run`` belongs to a later workflow run than ``other``: by run id when both
-    are known, else by start time. Unknown ordering is never "later"."""
-    if run.run_id and other.run_id:
+    are known, else by start time. A rerun can share a workflow id, so its later start
+    time breaks that tie. Unknown ordering is never "later"."""
+    if run.run_id and other.run_id and run.run_id != other.run_id:
         return run.run_id > other.run_id
     if run.started_at and other.started_at:
         return run.started_at > other.started_at
     return False
+
+
+def latest_named_runs(runs: Sequence[CheckRun]) -> tuple[CheckRun, ...]:
+    """Keep each check name's latest known run; retain ambiguous peers to fail closed."""
+    return tuple(
+        run
+        for run in runs
+        if not any(other.name == run.name and is_later_than(other, run) for other in runs)
+    )
 
 
 def checks_state(checks: HeadChecks, sha: str) -> str:
@@ -513,7 +522,7 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
         return "pending"
     live = [
         (run, matrix_base(run.name), is_cancelled(run))
-        for run in checks.runs
+        for run in latest_named_runs(checks.runs)
         if run.name != DRAFT_CHECKS
     ]
     # The exact names and bare matrix names a finished, non-cancelled run excuses.
@@ -522,9 +531,14 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
         if not cancelled:
             finished.add(run.name)
             finished.add(base)
+
     # A cancelled check is also excused by a SUCCESS in a later workflow run on this head,
     # whatever the names (the draft run's cancelled `pytest-shard` vs the full run's
-    # `pytest-shard (N)`, #1844).
+    # `pytest-shard (N)`, #1844). Cross-name excusal requires a DIFFERENT, LATER run_id;
+    # same run_id with later start time does not count (the cancelled check never passed).
+    def _cross_run_later(ok: CheckRun, cancelled: CheckRun) -> bool:
+        return ok.run_id != 0 and cancelled.run_id != 0 and ok.run_id > cancelled.run_id
+
     succeeded = [
         run
         for run, _base, cancelled in live
@@ -543,11 +557,10 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
             and run.run_id != 0
             and any(
                 old.name == "checks-fast" and is_cancelled(old) and old.run_id == run.run_id
-                for old, _base, _cancelled in live
+                for old in checks.runs
             )
             and any(
-                newer.name == "checks-fast" and is_later_than(newer, run)
-                for newer, _base, _cancelled in live
+                newer.name == "checks-fast" and is_later_than(newer, run) for newer in checks.runs
             )
         )
 
@@ -560,7 +573,7 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
             and (
                 run.name in finished
                 # never a cancelled `checks`: only a later `checks` excuses it (#1201)
-                or (run.name != "checks" and any(is_later_than(ok, run) for ok in succeeded))
+                or (run.name != "checks" and any(_cross_run_later(ok, run) for ok in succeeded))
             )
         )
     ]

@@ -39,6 +39,15 @@ import ready_pr
 RED_STEPS = ("Hygiene", "Fragments", "Lint", "Format", "Types", "Tests")
 #: A failed job shorter than this with no checked step is the infrastructure case.
 INCONCLUSIVE_SECONDS = 60
+#: Paths that are class A (CLAUDE.md rule 1): changes here merge freely on the train.
+CLASS_A_PREFIXES = (
+    "src/",
+    "tests/",
+    "docs/research/",
+    "docs/retros/",
+    "docs/runbooks/",
+    "changelog.d/",
+)
 #: Every train comment's first line starts with this.
 COMMENT_PREFIX = "merge-train:"
 OUTCOMES = (
@@ -204,15 +213,20 @@ def eligibility(
         return "(a) not open, or a draft"
     if pr.base != "main":
         return f"(b) base is {pr.base}, not main"
-    if "parked" in pr.labels:
+    labels = {label.lower() for label in pr.labels}
+    if "parked" in labels:
         return "(c) parked"
-    if "hold" in pr.labels:
+    if "hold" in labels:
         return "(c) on hold"
     bodies = owner_bodies(comments, pr.owner)
     train = [(line, b) for b in bodies if (line := _train_line(b)) and line[0] != "INELIGIBLE"]
     if train and train[-1][0][0] == "CULPRIT" and _head_line(train[-1][1]) == pr.head:
         return "(d) culprit at its current head"
-    green = {r.name for r in head_checks.runs if r.conclusion.upper() == "SUCCESS"}
+    green = {
+        r.name
+        for r in ready_pr.latest_named_runs(head_checks.runs)
+        if r.status.upper() == "COMPLETED" and r.conclusion.upper() == "SUCCESS"
+    }
     if (
         not set(_REQUIRED_CHECKS) <= green
         or ready_pr.checks_state(head_checks, pr.head) != "success"
@@ -235,6 +249,9 @@ def eligibility(
     if pr.unresolved_threads:
         plural = "" if pr.unresolved_threads == 1 else "s"
         return f"(j) {pr.unresolved_threads} unresolved review thread{plural}"
+    class_b = [p for p in diff_paths if not p.startswith(CLASS_A_PREFIXES)]
+    if class_b and "owner-ok" not in labels:
+        return f"(k) class B ({class_b[0]}): needs the owner-ok label (the owner's word)"
     return None
 
 
@@ -1402,6 +1419,8 @@ class ShellRunner:
                 str(c.get("name") or c.get("context") or "?"),
                 str(c.get("status") or ("COMPLETED" if c.get("conclusion") else "")),
                 str(c.get("conclusion") or c.get("state") or ""),
+                ready_pr._run_id(str(c.get("detailsUrl") or "")),
+                str(c.get("startedAt") or ""),
             )
             for c in raw.get("statusCheckRollup") or []
         )

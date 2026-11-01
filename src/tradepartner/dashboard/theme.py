@@ -201,3 +201,38 @@ def style[Chart: (alt.Chart, alt.LayerChart)](chart: Chart, palette: Palette) ->
         .configure_range(category=list(palette.series))
     )
     return styled
+
+
+#: Phone layout (T278, #2170). Streamlit already stacks `st.columns` below about
+#: 640 px; the shell adds only a fixed bottom bar of the top-nav tabs and card spacing.
+PHONE_MAX_WIDTH_PX: Final = 640
+PHONE_NAV_CLASS: Final = "tp-phone-nav"
+_PHONE_BAR_HEIGHT_PX: Final = 56
+
+
+def phone_css(palette: Palette) -> str:
+    """One scoped `<style>` block for the phone layout: the bottom bar is hidden above
+    `PHONE_MAX_WIDTH_PX` and fixed to the bottom edge at or below it, with the page's
+    spacing tightened to the 16 px gutter of docs/design/dashboard.md. Colours come from
+    `palette`; the block holds no external URL, import or script."""
+    bar = PHONE_NAV_CLASS
+    return f"""<style>
+.{bar} {{ display: none; }}
+@media (max-width: {PHONE_MAX_WIDTH_PX}px) {{
+  .{bar} {{
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 999990;
+    display: flex; height: {_PHONE_BAR_HEIGHT_PX}px;
+    padding-bottom: env(safe-area-inset-bottom);
+    background: {palette.surface}; border-top: 1px solid {palette.border};
+  }}
+  .{bar} a {{
+    flex: 1 1 0; display: flex; align-items: center; justify-content: center;
+    color: {palette.text_secondary}; font-size: 0.85rem; text-decoration: none;
+  }}
+  .{bar} a:hover, .{bar} a:focus {{ color: {palette.accent}; }}
+  [data-testid="stMainBlockContainer"] {{
+    padding: 4rem 1rem {_PHONE_BAR_HEIGHT_PX + 24}px 1rem;
+  }}
+  [data-testid="stVerticalBlock"] {{ gap: 1rem; }}
+}}
+</style>"""

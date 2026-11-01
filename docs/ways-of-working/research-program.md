@@ -37,6 +37,19 @@ Each entry states the claims it tests; the **prior** (the expected effect, norma
 
 An item is promoted only when all five hold: (1) its data exists **point-in-time** in the store, or a data spec for it is merged; (2) the engine can run its family, or the engine work is a merged plan task; (3) its prior, kill criterion and holdout are written in a hypothesis file from the [template](../templates/hypothesis.md); (4) the family's trial budget is stated, how many variants will run, all of them counted (QI-11); (5) the owner merges the hypothesis file and runs `hypothesis register`. Semantic and model-derived features have stricter gates, the [ML validation brief](../research/2026-10-03-ml-validation-methodology-brief.md#2-scope-and-stage-gates); none is promoted before those pass.
 
+### 4a. Feasibility check, before an experiment file
+
+Before anyone drafts an experiment file (or a hypothesis file) for an idea, the idea passes this check, and the result is recorded in its row of the [ladder ledger](../research/hypothesis-backlog.md#ladder-ledger) (`feasibility`, `decision`). All reads are read-only and respect the [development boundary](#zones). Six items:
+
+- **(a) A causal timestamp exists in held data:** the event's `known_at` is in the store, so the signal could be acted on when it was known.
+- **(b) Event counts per year**, from a read-only count over the window, nothing after the development boundary and no returns.
+- **(c) Power (cheap screen, not a power calculation):** the effective number of independent events n where expected t reaches 1.0 at a plausible effect (literature effect × QI-2 haircut), n = (sd / effect)^2. n is effective, not raw: divide raw count by same-date clustering factor, and by holding period / spacing when holds overlap (e.g., 60-session holds spaced 20 apart ≈ 1/3). State correction in ledger row. t = 1.0 is far below confirmation (kill lines and deflated Sharpe decide). Fewer events → `deferred`; a kill would say nothing.
+- **(d) Gross edge plausibly above round-trip cost:** the plausible effect exceeds 60 bp (30 bp per side, the figure C1, C1b and C2 use) unless rung 1's measured slippage says otherwise.
+- **(e) The design uses a matched benchmark, and one is available** (peers of the same size, form and date). Never SPY for small stocks: [C1](../experiments/c1-filing-delay.md) run 2 against SPY showed size and beta, not the signal, until [C1b](../experiments/c1b-filing-delay-matched.md) (run 3) matched peers.
+- **(f) Delisted names are covered for the window.** Count, read-only, how many of the issuers that left the market in the window have bars (or the event's outcome data); if most are missing, any kill is recorded as "killed on survivor data" and the owner decides whether it retires the idea. [C1](../experiments/c1-filing-delay.md) had bars for 4 of 1,301 issuers that stopped filing in 2017-2019 (CLAUDE.md rule 6).
+
+Record `pass` or `deferred: <item and reason>` (an item met in part counts as failed). Ideas already open before this rule (`pre-gate` rows) pass the check before their experiment file is drafted. An idea that fails any item is recorded as `deferred: <reason>` and nothing is built or registered for it; it re-enters when the reason is removed (more history, an ingest). C2 is the case: [#2403](../experiments/c2-spinoff-children.md) counted 8 to 12 readable events, too few to reach t >= 1.0 at a plausible effect. C2's own count probes read past the boundary before this rule; a forward check does not. A deferred idea costs a ledger row, not an experiment file.
+
 ### 5. Test
 
 Unchanged: every run is a trial; the holdout is spent once; results are reported beside SPY and MTUM; deflated Sharpe uses the family's trial count. Which data a run may read is [ADR 0016](../decisions/0016-development-boundary-and-forward-exams.md)'s rule; the principles are under [Zones](#zones).
@@ -48,6 +61,10 @@ When a hypothesis reaches a verdict (in-sample, holdout, or retirement): the res
 ### 7. Research → decision
 
 A claim that would change **the tool itself** (new data to ingest, a model's authority, the universe, a risk rule) goes to an ADR citing the claim ids, never straight into code. Waiting on the owner: research-only model benchmarking (ADR 0008, claims-pilot tension CP-X2); filing-text ingest; Form 4 ingest.
+
+### Registration defaults
+
+- **Liquidity floor (owner, 2026-10-30, [#836](https://github.com/josejuarez96/tradepartner/issues/836#issuecomment-6537997869), #2667):** every daily or weekly paper book's universe gets a floor of **$200M** on the median raw close x volume over the 20 sessions before `t` (as of `known_at` <= `t`), frozen per registration. "Daily or weekly" means cadence `daily` or `week_end`. It is a default for new registrations (it sets the default under [ADR 0023 D4](../decisions/0023-break-first-fast-books-paper-exam.md)'s universe rule), recorded in the registration, not in code; existing registrations are not changed retroactively. The universe config key that carries it does not exist yet and needs a plan task (open).
 
 ## Zones
 
@@ -84,3 +101,5 @@ The owner's line: research freedom in development, evidence discipline in valida
 | 2026-10-03 | Draft v0.1: the loop, the claims register, the backlog, promotion gates | #620, PR #621 |
 | 2026-10-09 | Zones, the development boundary and forward exams, from the owner's decisions of 2026-10-08 | #1331, #1301 |
 | 2026-10-18 | Rewritten for length, meaning unchanged; the loop as a numbered list; the 10-08 track snapshot points at STATUS | #1752 |
+| 2026-10-27 | Stage 4a: the feasibility check before an experiment file; ledger gains `feasibility` and `decision` | #2409 |
+| 2026-10-30 | Registration defaults: the $200M dollar-volume floor for daily and weekly books | #2667 |

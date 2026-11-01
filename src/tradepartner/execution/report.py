@@ -1,8 +1,8 @@
 """Tracking comparison, per-period decomposition (Phase 4 spec req 10, ADR 0005
 check 1; plan T65; per book and per period, ADR 0017 B.7 and C, plan T156).
 
-`compare_periods(window, trial, journal, actions, prices, closes,
-stop_session) -> PeriodComparison` is pure: no clock, no store, no live
+`compare_periods(window, trial, journal, actions, prices, stop_session)` is pure:
+no clock, no store, no live
 `Settings` read. Per rebalance period i of the window's cadence (a month at
 `month_end`, an ISO week at `week_end`, a session at `daily`; spec req 10 as
 amended 2026-10-09) (consecutive sessions
@@ -17,8 +17,9 @@ computes:
   `known_at <= close(T_{i+1})` of amount x the ledger quantity held on the
   ex-date (`positions_daily`), excluding any dividend the broker already
   credited (an `adjustments` row of kind `dividend_cash` for the same name
-  and session, req 6: paper got the cash already, so counting it again would
-  double it);
+  that the T_{i+1} mark absorbed: `session <= T_{i+1}` and `known_at` no
+  later than that mark's, the residue term's cut; req 6: paper got the cash
+  already, so counting it again would double it);
 - the **fill-timing term**: over equity at close(T_i), [sum over buys of
   (the paper fill price - the frozen `execution.fill_price` bar price on the
   fill's session) x filled quantity, less the same sum over sells], so a buy
@@ -27,16 +28,8 @@ computes:
   module never reads `Settings.execution.fill_price` itself: the caller binds
   `prices` once from the window's frozen key, req 14, #366 Q20, #526);
 - the **residual**: raw + dividend term + fill-timing term;
-- the **residue term**, printed beside the others and never folded into the
-  residual: over equity at close(T_i), the sum over names with a residue at
-  close(T_i) (`execution.plan.residue`, evaluated on rows known at close(T_i))
-  of the residue quantity x (close(T_{i+1}) split-adjusted back to T_i's
-  basis, minus close(T_i)) -- `closes` is the caller's separate bound
-  accessor for these close(T_i)/close(T_{i+1}) reads, always the `close`
-  bar regardless of the frozen `execution.fill_price` (#606: a hypothesis
-  registered with `fill_price = open` must not value residues at the open;
-  residues price at the close, like the marks, the same as every other
-  term's close(T_i)/close(T_{i+1}) reads);
+- the **residue term**: each T_i residue's share of its journal P&L, using the
+  two marks' values and adjustment cash absorbed by the second mark only;
 - the **modelled cost**: the trial's base-level `cost_paid` at T_i over the
   trial's own equity at close(T_i) (spec req 10: "the trial's base-level
   `cost_paid` at T_i over its equity at close(T_i)" - "its" is the trial's,
@@ -59,10 +52,12 @@ is read for `paper.tracking_k` and `paper.tracking_rule` only, never live
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from itertools import pairwise
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -77,10 +72,10 @@ from tradepartner.calendar import (
     previous_session,
     session_close,
 )
-from tradepartner.config import Cadence, Settings
-from tradepartner.execution.ledger import Ledger
+from tradepartner.config import Cadence, RiskConfig, Settings
+from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.lock import resolve_book
-from tradepartner.execution.marks import equity_at
+from tradepartner.execution.marks import UnreadableMarkError, equity_at
 from tradepartner.execution.plan import residue as residue_of
 from tradepartner.execution.plan import stop_session as stop_session_of_request
 from tradepartner.execution.slippage import Slippage, window_slippage
@@ -200,6 +195,10 @@ class PeriodRow:
     skip_names: tuple[str, ...]
     excluded: bool
     passed: bool
+    #: Residue names whose mark says tradable is false or unknown.
+    residue_untradable: tuple[str, ...] = ()
+    #: Residue names with an absorbed quantity true-up.
+    residue_trued_up: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -289,22 +288,6 @@ def _actions_as_of(actions: pl.DataFrame, t: datetime) -> pl.DataFrame:
     return frame
 
 
-def _split_factor(
-    actions_as_of_next: pl.DataFrame, security_id: str, after: date, through: date
-) -> float:
-    """The product of split ratios of `security_id` with `after < ex_date <= through`."""
-    if actions_as_of_next.is_empty():
-        return 1.0
-    factor = 1.0
-    for row in actions_as_of_next.filter(
-        (pl.col("security_id") == security_id) & (pl.col("action_type") == _SPLIT)
-    ).iter_rows(named=True):
-        ex_date = row["ex_date"]
-        if after < ex_date <= through:
-            factor *= float(row["ratio_or_amount"])
-    return factor
-
-
 def _dividend_term(
     actions_as_of_next: pl.DataFrame,
     adjustments: Sequence[AdjustmentRow],
@@ -317,17 +300,20 @@ def _dividend_term(
     #: Sessions a `dividend_cash` adjustment was journaled for each name:
     #: reconcile stamps it at the reconciliation session, on or after the
     #: ex-date (`execution.reconcile_run._dividends`), never on the ex-date
-    #: itself, so the match is "on or after", not "equal to". Only a credit
-    #: known by close(T_{i+1}) counts (the same cutoff the dividend term
-    #: itself is computed under): a later credit was not knowable when this
-    #: period was last reported and must not retroactively zero its term.
-    cutoff = session_close(t_next)
+    #: itself, so the match is "on or after", not "equal to". A credit counts
+    #: when the T_{i+1} mark absorbed it (`session <= T_{i+1}` and `known_at`
+    #: no later than that mark's own `known_at`), the same cut the residue
+    #: term uses (spec amendment 2026-10-29, item 3). So a credit is either in
+    #: paper equity at T_{i+1} and not added back, or uncredited; a credit
+    #: journaled after that mark was written was not in the period's return.
+    absorbed_at = max(m.known_at for m in marks if m.session == t_next)
     credited: dict[str, list[date]] = {}
     for adjustment in adjustments:
         if (
             adjustment.kind == _DIVIDEND_CASH
             and adjustment.security_id is not None
-            and adjustment.known_at <= cutoff
+            and adjustment.session <= t_next
+            and adjustment.known_at <= absorbed_at
         ):
             credited.setdefault(adjustment.security_id, []).append(adjustment.session)
     total = 0.0
@@ -368,57 +354,465 @@ def _fill_timing_term(
     return total
 
 
-def _residue_term(
+def _residues_at(
     journal: Journal,
-    actions_as_of_i: pl.DataFrame,
-    actions_as_of_next: pl.DataFrame,
-    closes: PriceOf,
+    actions: pl.DataFrame,
     window_id: int,
-    t_i: date,
-    t_next: date,
-) -> float:
-    held = {
-        row.security_id: row.quantity
-        for row in journal.positions_daily
-        if row.session == t_i and row.security_id is not None and row.quantity != 0
+    day: date,
+    period_end: date | None = None,
+) -> dict[str, float]:
+    """Residues visible at a session's own mark, including its opening cut."""
+    marks = {
+        m.security_id: m for m in journal.positions_daily if m.session == day and m.security_id
     }
-    if not held:
-        return 0.0
-    #: `execution.plan.residue` requires its `decisions`, `decision_events`
-    #: and `positions_daily` rows to be those known to the run on the ledger's
-    #: session (its own docstring), and raises on a row whose run is not among
-    #: `runs`: restrict all four to runs at or before T_i so a later period's
-    #: decision (e.g. a later `dust` or `untradable` close) can never reach
-    #: back into this period's residue (no look-ahead).
-    known_runs = tuple(r for r in journal.runs if r.session is not None and r.session <= t_i)
-    known_run_ids = {r.run_id for r in known_runs}
-    known_decisions = [d for d in journal.decisions if d.run_id in known_run_ids]
-    known_decision_events = [e for e in journal.decision_events if e.run_id in known_run_ids]
-    known_marks = [m for m in journal.positions_daily if m.run_id in known_run_ids]
-    total = 0.0
-    for security_id, quantity in held.items():
-        ledger = Ledger(positions={security_id: quantity}, cash=0.0, through=t_i)
-        quantity_at_risk = residue_of(
-            security_id,
-            journal.adjustments,
-            known_decisions,
-            known_decision_events,
-            known_marks,
-            ledger,
-            actions_as_of_i,
+    if not marks:
+        return {}
+    k = max(m.known_at for m in journal.positions_daily if m.session == day)
+    known_runs = tuple(
+        r for r in journal.runs if r.session is not None and r.session <= day and r.known_at <= k
+    )
+    run_ids = {r.run_id for r in known_runs}
+    decisions = [d for d in journal.decisions if d.run_id in run_ids and d.known_at <= k]
+    events = [e for e in journal.decision_events if e.run_id in run_ids and e.known_at <= k]
+    earlier_marks = [
+        m
+        for m in journal.positions_daily
+        if m.run_id in run_ids and m.known_at <= k and m.session <= day
+    ]
+    adjustments = [a for a in journal.adjustments if a.known_at <= session_close(day)]
+    historical = {
+        a.security_id
+        for a in adjustments
+        if a.window_id == window_id and a.session <= day and a.kind == "carried_residue"
+    }
+    skipped = {
+        e.decision_id
+        for e in events
+        if e.status == "skipped" and e.reason in {"dust", "untradable"}
+    }
+    historical.update(d.security_id for d in decisions if d.decision_id in skipped)
+    result: dict[str, float] = {}
+    for name, mark in marks.items():
+        if mark.quantity < 0 or mark.position_side == "short":
+            if name in historical:
+                raise ValueError(f"{name} {day} to {period_end or day}: short residue")
+            continue
+        quantity = residue_of(
+            name,
+            adjustments,
+            decisions,
+            events,
+            earlier_marks,
+            Ledger(positions={name: mark.quantity}, cash=0.0, through=day),
+            _actions_as_of(actions, session_close(day)),
             window_id=window_id,
             runs=known_runs,
         )
-        if quantity_at_risk == 0.0:
+        if quantity:
+            result[name] = quantity
+    return result
+
+
+def _receipt_source(
+    row: AdjustmentRow,
+    source_rows: Sequence[AdjustmentRow],
+    actions: pl.DataFrame,
+    t_i: date,
+    t_next: date,
+) -> str:
+    name = row.security_id
+    if name is None:
+        raise ValueError(f"{t_i} to {t_next}: {row.kind} names no security")
+    prefix = f"{name} {t_i} to {t_next}: {row.kind}"
+    try:
+        details = json.loads(row.explanation_json or "{}")
+    except ValueError as exc:
+        raise ValueError(f"{prefix} unreadable explanation") from exc
+    if not isinstance(details, dict):
+        raise ValueError(f"{prefix} unreadable explanation")
+    if row.kind == "merger_receipt":
+        merger_id = details.get("merger_id")
+        sources = {
+            a.security_id
+            for a in source_rows
+            if a.kind == "corporate_action_cash"
+            and a.security_id
+            and a.explanation_json
+            and isinstance(merger_id, str)
+            and _merger_id(a) == merger_id
+        }
+        if len(sources) != 1:
+            raise ValueError(f"{prefix} has {'no' if not sources else 'multiple'} merger source")
+        return next(iter(sources))
+    candidates = [
+        a
+        for a in actions.iter_rows(named=True)
+        if a["action_type"] == "spinoff" and a["security_id"] == name and a["ex_date"] <= t_next
+    ]
+    parents = {a.get("source_action_id") for a in candidates if a.get("source_action_id")}
+    if len(parents) != 1 or (
+        details.get("parent_security_id") and details["parent_security_id"] not in parents
+    ):
+        raise ValueError(f"{prefix} has no matching spinoff action or parent disagreement")
+    return str(next(iter(parents)))
+
+
+def _merger_id(row: AdjustmentRow) -> str | None:
+    try:
+        payload = json.loads(row.explanation_json or "{}")
+    except ValueError:
+        return None
+    value = payload.get("merger_id") if isinstance(payload, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def _dividend_fraction(
+    row: AdjustmentRow,
+    journal: Journal,
+    actions: pl.DataFrame,
+    window: PaperWindowRow,
+    window_id: int,
+    t_i: date,
+    t_next: date,
+    k_next: datetime,
+    residue_at_start: float | None,
+    rebalance_sessions: Sequence[date],
+) -> float:
+    """Residue share of the oldest unnetted dividend entitlement."""
+    name = row.security_id
+    if name is None:
+        raise ValueError(f"{t_i} to {t_next}: dividend_cash names no security")
+    try:
+        frozen = json.loads(window.frozen_json)
+        if not isinstance(frozen, dict):
+            raise ValueError("frozen settings are not an object")
+        credit_sessions = int(
+            frozen.get(
+                "risk.reconcile_dividend_credit_sessions",
+                RiskConfig().reconcile_dividend_credit_sessions,
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} {t_i} to {t_next}: unreadable dividend credit window") from exc
+    earliest = row.session
+    for _ in range(credit_sessions):
+        earliest = previous_session(earliest)
+    actions_at_credit = _actions_as_of(actions, session_close(row.session))
+    candidates = sorted(
+        a["ex_date"]
+        for a in actions_at_credit.iter_rows(named=True)
+        if a["action_type"] == "dividend"
+        and a["security_id"] == name
+        and earliest < a["ex_date"] <= row.session
+    )
+    prior_credits = sum(
+        1
+        for a in journal.adjustments
+        if a.window_id == window_id
+        and a.security_id == name
+        and a.kind == "dividend_cash"
+        and a.known_at <= k_next
+        and a.session > earliest
+        and (a.session, a.known_at) < (row.session, row.known_at)
+    )
+    if prior_credits >= len(candidates):
+        raise ValueError(f"{name} {t_i} to {t_next}: dividend_cash has no ex-date")
+    entitlement_day = previous_session(candidates[prior_credits])
+    mark = next(
+        (
+            m
+            for m in journal.positions_daily
+            if m.security_id == name and m.session == entitlement_day and m.known_at <= k_next
+        ),
+        None,
+    )
+    if mark is None or mark.quantity <= 0:
+        raise ValueError(f"{name} {t_i} to {t_next}: dividend_cash has no entitlement mark")
+    if residue_at_start is None:
+        basis_day = next(
+            (day for day in reversed(rebalance_sessions) if day <= entitlement_day), None
+        )
+        residue_at_start = (
+            _residues_at(journal, actions, window_id, basis_day).get(name, 0.0)
+            if basis_day is not None
+            else 0.0
+        )
+    return residue_at_start / mark.quantity
+
+
+def _residue_term(
+    journal: Journal,
+    actions: pl.DataFrame,
+    window: PaperWindowRow,
+    window_id: int,
+    t_i: date,
+    t_next: date,
+    rebalance_sessions: Sequence[date],
+) -> tuple[float, tuple[str, ...], tuple[str, ...]]:
+    """Return marked journal P&L of T_i residues and their untradable names."""
+    marks_i = {
+        m.security_id: m
+        for m in journal.positions_daily
+        if m.session == t_i and m.security_id is not None
+    }
+    marks_next = {
+        m.security_id: m
+        for m in journal.positions_daily
+        if m.session == t_next and m.security_id is not None
+    }
+    k_i = max(m.known_at for m in journal.positions_daily if m.session == t_i)
+    k_next = max(m.known_at for m in journal.positions_daily if m.session == t_next)
+    period_rows = [
+        a
+        for a in journal.adjustments
+        if a.window_id == window_id
+        and a.security_id is not None
+        and a.session <= t_next
+        and a.known_at <= k_next
+        and not (a.session <= t_i and a.known_at <= k_i)
+    ]
+    residues = _residues_at(journal, actions, window_id, t_i, t_next)
+    actions_next = _actions_as_of(actions, session_close(t_next))
+    source_rows = [
+        a
+        for a in journal.adjustments
+        if a.window_id == window_id and a.session <= t_next and a.known_at <= k_next
+    ]
+    for a in period_rows:
+        if a.kind == "carried_residue":
+            raise ValueError(f"{a.security_id} {t_i} to {t_next}: carried_residue inside period")
+        if a.kind not in {
+            "corporate_action_cash",
+            "dividend_cash",
+            "cash_in_lieu",
+            "merger_receipt",
+            "spinoff_receipt",
+            "auto_true_up",
+            "owner_true_up",
+        }:
+            raise ValueError(f"{a.security_id} {t_i} to {t_next}: unclassified {a.kind}")
+    receipts: dict[str, float] = {}
+    received: dict[str, float] = {}
+    quantity_names: set[str] = set()
+    for a in period_rows:
+        name = a.security_id
+        if name is None:
             continue
-        close_i = closes(security_id, t_i)
-        close_next = closes(security_id, t_next)
-        if close_i is None or close_next is None:
-            raise ValueError(f"no close for {security_id} on {t_i} or {t_next}")
-        factor = _split_factor(actions_as_of_next, security_id, t_i, t_next)
-        adjusted_next = close_next * factor
-        total += quantity_at_risk * (adjusted_next - close_i)
-    return total
+        had_residue = (
+            any(
+                name in _residues_at(journal, actions, window_id, day)
+                for day in rebalance_sessions
+                if day < t_i and any(m.session == day for m in journal.positions_daily)
+            )
+            if name not in marks_i
+            else False
+        )
+        if (
+            name not in marks_i
+            and a.kind
+            not in {
+                "merger_receipt",
+                "spinoff_receipt",
+                "corporate_action_cash",
+                "dividend_cash",
+            }
+            and had_residue
+        ):
+            raise ValueError(f"{name} {t_i} to {t_next}: {a.kind} on unheld name")
+        if name not in marks_i and a.kind == "corporate_action_cash":
+            try:
+                details = json.loads(a.explanation_json or "{}")
+            except (TypeError, ValueError):
+                details = {}
+            late = (
+                not a.quantity
+                and isinstance(details, dict)
+                and (details.get("delisting_cash") is True or _merger_id(a))
+            )
+            if not late and had_residue:
+                raise ValueError(f"{name} {t_i} to {t_next}: corporate_action_cash on unheld name")
+        if a.quantity:
+            quantity_names.add(name)
+        if a.kind not in {"merger_receipt", "spinoff_receipt"}:
+            continue
+        source = _receipt_source(a, source_rows, actions_next, t_i, t_next)
+        if a.quantity:
+            quantity_names.add(source)
+        receiver = marks_next.get(name)
+        if receiver is None or receiver.mark_price is None:
+            raise ValueError(f"{name} {t_i} to {t_next}: {a.kind} receiver has no mark_price")
+        value = (a.quantity or 0.0) * receiver.mark_price
+        receipts[source] = receipts.get(source, 0.0) + value
+        received[name] = received.get(name, 0.0) + value
+    live_fills = [
+        f
+        for f in journal.fills
+        if f.fill.superseded_by is None
+        and f.fill.known_at <= k_next
+        and t_i < _local(f.fill.filled_at) <= t_next
+    ]
+    total = 0.0
+    untradable: list[str] = []
+    trued_up: list[str] = []
+    for name, residue in residues.items():
+        mark_i = marks_i[name]
+        rows = [a for a in period_rows if a.security_id == name]
+        has_fill = any(f.security_id == name for f in live_fills)
+        if has_fill and name in quantity_names:
+            raise ValueError(f"{name} {t_i} to {t_next}: fill with quantity-bearing period row")
+        mark_next = marks_next.get(name)
+        if mark_next is not None and mark_next.position_side == "short":
+            raise ValueError(f"{name} {t_i} to {t_next}: short residue")
+        if mark_next is None and not has_fill and not any(a.quantity for a in rows):
+            raise ValueError(f"{name} {t_i} to {t_next}: unexplained missing mark")
+        if mark_i.tradable is not True or (
+            mark_next is not None and mark_next.tradable is not True
+        ):
+            untradable.append(name)
+        value_next = mark_next.value if mark_next is not None else 0.0
+        if has_fill:
+            try:
+                frozen = json.loads(window.frozen_json)
+                if not isinstance(frozen, dict):
+                    raise ValueError("frozen settings are not an object")
+                tolerance = float(
+                    frozen.get(
+                        "risk.reconcile_quantity_tolerance",
+                        RiskConfig().reconcile_quantity_tolerance,
+                    )
+                )
+                held = from_journal(
+                    [
+                        f
+                        for f in journal.fills
+                        if f.fill.superseded_by is None
+                        and f.fill.known_at <= k_next
+                        and _local(f.fill.filled_at) <= t_i
+                    ],
+                    journal.orders,
+                    [
+                        a
+                        for a in journal.adjustments
+                        if a.window_id == window_id and a.session <= t_next and a.known_at <= k_next
+                    ],
+                    actions_next,
+                    None,
+                    window.starting_cash,
+                    t_next,
+                    window_id=window_id,
+                    quantity_tolerance=tolerance,
+                )
+                if mark_next is None or mark_next.mark_price is None:
+                    raise ValueError("no next mark_price")
+                value_next = held.positions.get(name, 0.0) * mark_next.mark_price
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} {t_i} to {t_next}: ledger replay: {exc}") from exc
+        if mark_i.value is None or value_next is None:
+            raise ValueError(f"{name} {t_i} to {t_next}: missing mark value")
+        if any(a.kind in {"auto_true_up", "owner_true_up"} for a in rows):
+            trued_up.append(name)
+        ordinary_cash = math.fsum((a.cash or 0.0) for a in rows if a.kind != "dividend_cash")
+        dividend_cash = 0.0
+        for row in rows:
+            if row.kind != "dividend_cash":
+                continue
+            fraction = (
+                _dividend_fraction(
+                    row,
+                    journal,
+                    actions,
+                    window,
+                    window_id,
+                    t_i,
+                    t_next,
+                    k_next,
+                    residue,
+                    rebalance_sessions,
+                )
+                if has_fill
+                else residue / mark_i.quantity
+            )
+            dividend_cash += fraction * (row.cash or 0.0)
+        total += (
+            residue
+            / mark_i.quantity
+            * (
+                value_next
+                - mark_i.value
+                + ordinary_cash
+                + receipts.get(name, 0.0)
+                - received.get(name, 0.0)
+            )
+        )
+        total += dividend_cash
+    # A late cash or stock receipt uses the fraction at the exit mark.
+    late_flows: dict[str, float] = dict(receipts)
+    for row in period_rows:
+        name = row.security_id
+        if name is not None and name not in marks_i and row.kind == "dividend_cash":
+            had_residue = any(
+                name in _residues_at(journal, actions, window_id, day)
+                for day in rebalance_sessions
+                if day < t_i and any(m.session == day for m in journal.positions_daily)
+            )
+            if had_residue:
+                fraction = _dividend_fraction(
+                    row,
+                    journal,
+                    actions,
+                    window,
+                    window_id,
+                    t_i,
+                    t_next,
+                    k_next,
+                    None,
+                    rebalance_sessions,
+                )
+                total += fraction * (row.cash or 0.0)
+            continue
+        if name is None or name in marks_i or row.kind != "corporate_action_cash" or row.quantity:
+            continue
+        try:
+            details = json.loads(row.explanation_json or "{}")
+        except ValueError:
+            details = {}
+        if isinstance(details, dict) and (details.get("delisting_cash") is True or _merger_id(row)):
+            late_flows[name] = late_flows.get(name, 0.0) + (row.cash or 0.0)
+    for name, flow in late_flows.items():
+        if name in marks_i or not flow:
+            continue
+        exit_start = next(
+            (
+                start
+                for start, end in reversed(list(pairwise(rebalance_sessions)))
+                if end <= t_i
+                and any(
+                    m.security_id == name and m.session == start and m.known_at <= k_next
+                    for m in journal.positions_daily
+                )
+                and not any(
+                    m.security_id == name and m.session == end and m.known_at <= k_next
+                    for m in journal.positions_daily
+                )
+            ),
+            None,
+        )
+        if exit_start is None:
+            # No held exit period means there was no residue to allocate.
+            continue
+        exit_mark = next(
+            m
+            for m in journal.positions_daily
+            if m.security_id == name and m.session == exit_start and m.known_at <= k_next
+        )
+        if exit_mark.quantity <= 0:
+            raise ValueError(f"{name} {t_i} to {t_next}: late cash has no positive exit quantity")
+        fraction = (
+            _residues_at(journal, actions, window_id, exit_start).get(name, 0.0)
+            / exit_mark.quantity
+        )
+        total += fraction * flow
+    return total, tuple(sorted(untradable)), tuple(sorted(trued_up))
 
 
 def compare_periods(
@@ -427,7 +821,6 @@ def compare_periods(
     journal: Journal,
     actions: pl.DataFrame,
     prices: PriceOf,
-    closes: PriceOf,
     stop_session: date | None,
 ) -> PeriodComparison:
     """The req 10 tracking comparison, every term per period (module docstring).
@@ -438,10 +831,7 @@ def compare_periods(
     for the dividend and split terms, since no single cutoff serves every
     period. `window.window_id` must be set.
 
-    `prices` serves only the fill-timing term's frozen-bar reads; `closes`
-    serves the residue term's close(T_i)/close(T_{i+1}) reads and always
-    reads the `close` bar, whatever `execution.fill_price` froze (#606):
-    residues price at the close, like the marks, regardless of fill_price.
+    `prices` serves only the fill-timing term. Residues use the journal marks.
     """
     if window.window_id is None:
         raise ValueError("the window has no window_id")
@@ -462,7 +852,6 @@ def compare_periods(
         trial_return = trial.equity[t_next] / trial.equity[t_i] - 1
         raw = paper_return - trial_return
 
-        actions_as_of_i = _actions_as_of(actions, session_close(t_i))
         actions_as_of_next = _actions_as_of(actions, session_close(t_next))
 
         dividend_term = (
@@ -473,12 +862,10 @@ def compare_periods(
         )
         fill_timing_term = _fill_timing_term(live_fills, prices, t_i, t_next) / paper_equity_i
         residual = raw + dividend_term + fill_timing_term
-        residue_term = (
-            _residue_term(
-                journal, actions_as_of_i, actions_as_of_next, closes, window.window_id, t_i, t_next
-            )
-            / paper_equity_i
+        residue_sum, residue_untradable, residue_trued_up = _residue_term(
+            journal, actions, window, window.window_id, t_i, t_next, trial.sessions
         )
+        residue_term = residue_sum / paper_equity_i
         modelled_cost = trial.cost_paid[t_i] / trial.equity[t_i]
 
         missed = any(
@@ -520,6 +907,8 @@ def compare_periods(
                 skip_names=skip_names,
                 excluded=excluded,
                 passed=period_passed,
+                residue_untradable=residue_untradable,
+                residue_trued_up=residue_trued_up,
             )
         )
 
@@ -714,11 +1103,25 @@ class Report:
     #: Why `slippage` is None when the computation raised (#1741): `paper report`
     #: prints `slippage n/a (<reason>)` and the `paper_reports` row is still written.
     slippage_note: str | None = None
+    #: Set when the window was capped short of the last completed rebalance session
+    #: because the book has no marks there (a halted session, #2448).
+    window_note: str | None = None
+
+
+class MarksMissing(ValueError):
+    """A rebalance session inside the report window has no `positions_daily` mark
+    (#2448), or has one that cannot be read (#2470: no cash, a non-finite value).
+    `report` raises it before any trial opens, so nothing is written."""
+
+
+#: The tracking trial's Sharpe needs two period returns, and N rebalance sessions give
+#: N - 1 of them, so a report needs three sessions (#2468).
+_MIN_REBALANCE_SESSIONS = 3
 
 
 class NothingToCompareYet(Exception):
-    """A book with fewer than two rebalance sessions through the last completed one
-    has no period to compare (#1923). `report` raises it before any trial opens, so
+    """A book with fewer than three rebalance sessions through the last completed one
+    has too few periods to compare (#1923, #2468). `report` raises it before any trial opens, so
     nothing is written: no refused `in_sample` row, no failed tracking row."""
 
 
@@ -889,9 +1292,9 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
     than after paying for a trial run; quant-auditor finding on PR #525; `paper
     start` writes it since #526, so only a window started earlier lacks it), or
     when the tracking trial does not finish `ok`. Raises `NothingToCompareYet`, with
-    nothing written, when fewer than two rebalance sessions fall in `[T_0, last
-    completed T]` (#1923): the engine needs two, and a refused or failed trial row is
-    noise in the registry.
+    nothing written, when fewer than three rebalance sessions fall in `[T_0, last
+    completed T]` (#1923, #2468): the engine needs two period returns, so three, and a refused or
+    failed trial row is noise in the registry.
 
     "Last completed T" is capped strictly before the window's stop session
     (req 15), when it has one: a stopped window's `last completed T` is never
@@ -916,12 +1319,44 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
         stop_session = _stop_session_of(store_journal.window_stops_for(conn, window_id))
         while stop_session is not None and last_t >= stop_session:
             last_t = _before(last_t, cadence)
+        mark_rows = store_journal.positions_daily_for(conn, window_id)
+        marked = {m.session for m in mark_rows}
 
-    if last_t < t0 or len(rebalance_sessions(t0, last_t, cadence)) < 2:
+    #: The window ends at the last rebalance session the book has marks for (#2448):
+    #: a session the kill switch halted has none, and asking the comparison for its
+    #: equity would raise after the trial opened. Reported, never silent.
+    completed_t = last_t
+    last_marked = max(marked) if marked else None
+    while last_t >= t0 and (last_marked is None or last_t > last_marked):
+        last_t = _before(last_t, cadence)
+    window_note: str | None = None
+    if last_t != completed_t:
+        window_note = (
+            f"report ends at {last_t}, not the last completed rebalance {completed_t}: "
+            f"the book has no marks after {last_marked} (halted or not yet marked)"
+        )
+
+    if last_t < t0 or len(rebalance_sessions(t0, last_t, cadence)) < _MIN_REBALANCE_SESSIONS:
         raise NothingToCompareYet(
             f"paper report: nothing to compare yet for book {book!r}; a report needs at "
-            f"least two rebalances and the first is {t0} (last completed: {last_t})"
+            f"least three rebalances (two period returns) and the first is {t0} "
+            f"(last marked rebalance: {last_t})"
         )
+
+    missing = [t for t in rebalance_sessions(t0, last_t, cadence) if t not in marked]
+    if missing:
+        raise MarksMissing(
+            f"paper report: no marks for rebalance session(s) {', '.join(map(str, missing))} "
+            f"of book {book!r}; nothing was written"
+        )
+    for t in rebalance_sessions(t0, last_t, cadence):
+        try:
+            equity_at(mark_rows, t)
+        except UnreadableMarkError as exc:
+            raise MarksMissing(
+                f"paper report: the mark for rebalance session {t} of book {book!r} "
+                f"cannot be read ({exc}); nothing was written"
+            ) from exc
 
     outcome = run_hypothesis(
         hypothesis.slug,
@@ -941,12 +1376,7 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
         journal = _journal_for(conn, window_id)
         actions = conn.execute("SELECT * FROM corporate_actions").pl()
         prices = _price_of(conn, fill_price_key)
-        #: Residues always price at the close, like the marks, never through
-        #: the frozen `execution.fill_price` bar (#606): bound separately
-        #: from `prices` so a window frozen with `fill_price = "open"` cannot
-        #: value a residue at the open.
-        closes = _price_of(conn, "close")
-        comparison = compare_periods(window, trial, journal, actions, prices, closes, stop_session)
+        comparison = compare_periods(window, trial, journal, actions, prices, stop_session)
         targets = compare_targets(window, trial, journal, conn)
         fill_slippage, slippage_note = _slippage_for_report(conn, window_id)
 
@@ -968,4 +1398,5 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
         paper_report=paper_report_row,
         slippage=fill_slippage,
         slippage_note=slippage_note,
+        window_note=window_note,
     )

@@ -13,6 +13,7 @@ dated before the window (inside the base).
 
 from __future__ import annotations
 
+import contextlib
 import json
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
@@ -291,6 +292,12 @@ def _reconcile(
     )
 
 
+@pytest.fixture(autouse=True)
+def _long_only_book(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These windows name no registered hypothesis; read each as `long_only`."""
+    monkeypatch.setattr(reconcile_module, "_signed_book", lambda conn, window: False)
+
+
 def _halts(
     settings: Settings,
     fake: FakeBroker,
@@ -299,15 +306,16 @@ def _halts(
     session: date,
     minute: int = 0,
 ) -> list[dict[str, Any]]:
-    """Reconcile expecting a mismatch; return the row's recorded mismatches."""
-    with pytest.raises(ReconciliationError):
+    """Reconcile; return the row's recorded mismatches. A book-level one raises, a
+    name-level one is a break (T282d) and does not."""
+    with contextlib.suppress(ReconciliationError):
         _reconcile(settings, fake, window, clock, session, minute)
     row = _rows(settings, window)[-1]
     mismatches: list[dict[str, Any]] = json.loads(row.mismatches_json or "")["mismatches"]
     return mismatches
 
 
-def _still_halts_on_the_open_finding(
+def _stays_on_the_open_finding(
     settings: Settings,
     fake: FakeBroker,
     window: PaperWindowRow,
@@ -315,17 +323,15 @@ def _still_halts_on_the_open_finding(
     session: date,
     minute: int = 0,
 ) -> None:
-    """The reconcile after a `merger_conflict` explains its removal but still halts.
+    """The reconcile after a `merger_conflict` explains its removal but the finding stays open.
 
     Paper spec amendment #2266 item 8: a `finding_key` part (`merger_conflict`)
-    never closes on its own; only `paper true-up` (T282) closes it. T281 keeps
-    the halt (`open finding`, no order) until then, so the old "resume, then
-    `ok`" no longer holds: the row is `breaks` (the finding part) and the
-    delisting band is asserted on the row's `explained` entry, and the run
-    raises.
+    never closes on its own; only `paper true-up` (T283b) closes it. So the old
+    "resume, then `ok`" no longer holds: the row is `breaks` (the finding part). It
+    restricts the name and halts nothing (T282d); a caller that needs the delisting
+    band asserts it on the row's `explained` entry.
     """
-    with pytest.raises(ReconciliationError, match="open finding"):
-        _reconcile(settings, fake, window, clock, session, minute)
+    _reconcile(settings, fake, window, clock, session, minute)
     assert _rows(settings, window)[-1].status == BREAKS
 
 
@@ -705,17 +711,15 @@ def test_two_rows_known_before_the_removal_halt_merger_conflict_once_then_fall_b
 
     assert conflict["kind"] == MERGER_CONFLICT and conflict["security_id"] == MTUM
     assert conflict["detail"] == (f"merger ids [{M1!r}, {M2!r}] for {MTUM} effective 2026-10-01")
-    _still_halts_on_the_open_finding(journal_settings, fake, open_window, fixed_clock, S, 30)
-    # T281 books no adjustment on a `breaks` row (not yet a cash base, T282b), so
-    # the explanation is recorded on the row and the band is journaled once the
-    # finding is trued up. The fall-back itself is unchanged: the delisting band
-    # explains the removal and neither merger id is read again.
-    assert _adjustments(journal_settings, open_window) == []
-    (explained,) = json.loads(_rows(journal_settings, open_window)[-1].mismatches_json or "")[
-        "explained"
-    ]
-    assert explained["explanation"] == "listing ended"
-    assert explained["quantity"] == pytest.approx(-HELD)
+    _stays_on_the_open_finding(journal_settings, fake, open_window, fixed_clock, S, 30)
+    # Amendment item 10 books the explained delisting band on a `breaks` cash base.
+    (adjustment,) = _adjustments(journal_settings, open_window)
+    assert (adjustment.kind, adjustment.quantity, adjustment.cash) == (
+        "corporate_action_cash",
+        pytest.approx(-HELD),
+        pytest.approx(DUE),
+    )
+    assert json.loads(adjustment.explanation_json or "")["explanation"] == "listing ended"
     assert _open(journal_settings, open_window, S2).mergers == {}
 
 
@@ -738,7 +742,7 @@ def test_a_second_row_after_the_first_explained_the_removal_halts_once(
     assert conflict["kind"] == MERGER_CONFLICT
     assert repr(M1) in conflict["detail"] and repr(M2) in conflict["detail"]
 
-    _still_halts_on_the_open_finding(journal_settings, fake, open_window, fixed_clock, S2, 30)
+    _stays_on_the_open_finding(journal_settings, fake, open_window, fixed_clock, S2, 30)
     fake.extra_cash = DUE
     kinds = [m["kind"] for m in _halts(journal_settings, fake, open_window, fixed_clock, S3)]
     assert kinds == ["cash"]

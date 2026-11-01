@@ -363,3 +363,94 @@ def test_open_breaks_refuses_an_unwritten_event() -> None:
     row = _event(1, "7:A:1", "opened")
     with pytest.raises(ValueError, match="event_id"):
         breaks.open_breaks([replace(row, event_id=None)])
+
+
+# --- restriction and the cap over open material breaks (T282a; items 5 and 7) ----------
+
+
+def _open(
+    event_id: int,
+    security_id: str | None,
+    *,
+    material: bool = True,
+    size: float | None = 10.0,
+    event: str = "opened",
+    symbol: str | None = None,
+) -> ReconcileBreakRow:
+    name = security_id or symbol
+    return replace(
+        _event(event_id, f"7:{name}:1", event),
+        security_id=security_id,
+        symbol=symbol,
+        material=material,
+        dollar_size=size,
+    )
+
+
+def test_restricted_names_are_the_open_material_breaks_security_ids() -> None:
+    """Item 7: restriction is derived: an open material break on the name, and nothing else."""
+    events = [
+        _open(1, "A"),
+        _open(2, "B", material=False),
+        _open(3, "C"),
+        _open(4, "C", event="trued_up"),
+        _open(5, None, symbol="ZZZ"),
+        _open(6, "D", event="observed"),
+    ]
+    assert breaks.restricted_names(events) == frozenset({"A", "D"})
+    assert breaks.restricted_names([]) == frozenset()
+
+
+def test_the_cap_is_four_material_breaks_or_one_above_two_percent() -> None:
+    """The spec's acceptance: four material breaks, or one above 2 % of equity."""
+    equity = 100_000.0
+    three = [_open(i, name) for i, name in enumerate("ABC", 1)]
+    assert not breaks.cap_exceeded(three, ledger_equity=equity, risk=RISK)
+    assert breaks.cap_exceeded([*three, _open(4, "D")], ledger_equity=equity, risk=RISK)
+    assert not breaks.cap_exceeded([_open(1, "A", size=2_000.0)], ledger_equity=equity, risk=RISK)
+    assert breaks.cap_exceeded([_open(1, "A", size=2_000.01)], ledger_equity=equity, risk=RISK)
+
+
+def test_the_cap_ignores_immaterial_and_closed_breaks_and_counts_unpriced_by_count() -> None:
+    equity = 100_000.0
+    quiet = [
+        _open(1, "A", material=False, size=50_000.0),
+        _open(2, "B"),
+        _open(3, "B", event="resolved_by_broker"),
+        _open(4, "C", size=None),
+        _open(5, None, symbol="ZZZ", size=None),
+    ]
+    assert not breaks.cap_exceeded(quiet, ledger_equity=equity, risk=RISK)
+    assert breaks.cap_exceeded(
+        [*quiet, _open(6, "D"), _open(7, "E")], ledger_equity=equity, risk=RISK
+    )
+
+
+def test_a_cap_of_zero_makes_every_material_break_a_halt() -> None:
+    zero = RiskConfig(max_open_breaks=0)
+    assert breaks.cap_exceeded([_open(1, "A")], ledger_equity=100_000.0, risk=zero)
+    assert not breaks.cap_exceeded([_open(1, "A", material=False)], ledger_equity=1e5, risk=zero)
+
+
+@pytest.mark.parametrize(
+    ("ledger", "broker", "limit"),
+    [
+        (10.0, 6.0, 6.0),
+        (6.0, 10.0, 6.0),
+        (10.0, 0.0, 0.0),
+        (0.0, 10.0, 0.0),
+        (10.0, -3.0, 0.0),  # the broker is short what the ledger holds long: never cross zero
+        (-10.0, -4.0, 4.0),  # a short cover
+        (-10.0, 4.0, 0.0),
+    ],
+)
+def test_a_reducing_order_never_crosses_zero_on_either_book(
+    ledger: float, broker: float, limit: float
+) -> None:
+    assert breaks.reducing_limit(ledger, broker) == limit
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_a_reducing_limit_of_a_non_finite_quantity_is_refused(bad: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        breaks.reducing_limit(bad, 1.0)
