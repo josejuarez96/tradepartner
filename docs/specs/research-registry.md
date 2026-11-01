@@ -160,11 +160,13 @@ The verdict is the desk read's, not the registry's. The probe's code computed th
 
 *Never a tradable trial.* A record writes no row to `hypotheses`, `trials`, `trial_results`, `research_registrations` or `research_runs`. It issues no handle, cannot be bound by a run, and spends no holdout under req 5 (open question 2). Nothing reads `research_exposures` except `family_exposure_count`, the listings and the research view. Req 13's isolation test covers the new table name through `RESEARCH_TABLE_NAMES`, and its allowlist is unchanged. A record is evidence that a look happened, never evidence for promotion: a later hypothesis, sweep or experiment file for the same mechanism lists the record ids in its prior-evidence disclosure, as for runs (req 10), and that file is a new registration under the backtest or research rules with its own N.
 
-*Going forward.* A desk read note that reports a launch cites its exposure ids. The quant-auditor's desk-read audit checks that every launch the note lists has one record, with the probe hash the audit reviewed. A new probe prints its own SHA-256, the store's `store_max_ingested_at` and each input's SHA-256 before its first return read, so the pin can be `measured` from its output. That is a probe convention, which the auditor reads; the registry cannot check it.
+*Going forward.* A desk read note that reports a launch cites its exposure ids. A file's mtime is easy to change, so an mtime-based `probe_verified` proves little on its own; the quant-auditor's desk-read audit is the real check. The audit checks that every launch the note lists has one record, with the probe hash the audit reviewed. A new probe prints its own SHA-256, the store's `store_max_ingested_at` and each input's SHA-256 before its first return read, so the pin can be `measured` from its output. That is a probe convention, which the auditor reads; the registry cannot check it.
 
 *Backfill.* These are owner steps after the CLI ships (plan T359), and each is written as an ordinary record with today's `known_at`:
 
 Every `read_at` below is declared from the evidence named in its row. Where none exists, T359 writes the best bound in `note` and marks it UNVERIFIED. `kill_line_basis` is then computed from that `read_at`, never asserted.
+
+For candidate 5, `store_max_ingested_at` is `declared`: the maximum `ingested_at` among rows with `ingested_at <= read_at` on the store the probe read (the 2026-10-31 04:41 store named in the desk read), and T359 records how it was obtained in `note`.
 
 | Candidate | Source, family | Launch, probe SHA-256 | `read_at` source | Window | Configurations | Verdict | Kill line, expected basis | Counts in N |
 |---|---|---|---|---|---|---|---|---|
