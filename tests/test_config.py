@@ -3555,3 +3555,48 @@ def test_events_form4_bulk_keys_sit_outside_every_frozen_canonical_set() -> None
     assert _BULK_KEYS.isdisjoint(hypothesis.frozen_keys())
     assert _BULK_KEYS.isdisjoint(frozen.CANONICAL_EXCLUDED_KEYS)
     assert _BULK_KEYS.isdisjoint({key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS})
+
+
+# --- T345 (#2744): the local raw archive's path and disk floor (ADR 0028) ---
+
+
+def test_raw_archive_defaults_name_no_path_and_a_ten_gb_floor() -> None:
+    """No archive path is committed: unset by default, so the archive is off; the
+    write floor defaults to ADR 0028's 10 GB."""
+    s = _settings()
+    assert s.tradepartner_raw_archive is None
+    assert s.raw_archive.min_free_disk_gb == 10.0
+
+
+def test_raw_archive_path_is_read_from_its_env_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRADEPARTNER_RAW_ARCHIVE", str(tmp_path))
+    monkeypatch.setenv("RAW_ARCHIVE__MIN_FREE_DISK_GB", "12.5")
+    s = _settings()
+    assert s.tradepartner_raw_archive is not None
+    assert s.tradepartner_raw_archive.get_secret_value() == str(tmp_path)
+    assert s.raw_archive.min_free_disk_gb == 12.5
+    assert str(tmp_path) in secret_values(s)
+    assert str(tmp_path) not in repr(s)
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf")])
+def test_raw_archive_floor_cannot_be_turned_off(bad: float) -> None:
+    """Fail closed: unlike `ingest.min_free_disk_gb`, 0 is not 'off' here."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, raw_archive={"min_free_disk_gb": bad})
+
+
+def test_env_example_names_the_raw_archive_with_an_empty_value() -> None:
+    """`.env.example` names the variable but commits no path or account (spec
+    amendment #2714 item 2)."""
+    env_example = Path(__file__).resolve().parents[1] / ".env.example"
+    lines = [
+        line.lstrip("# ").strip()
+        for line in env_example.read_text(encoding="utf-8").splitlines()
+        if "TRADEPARTNER_RAW_ARCHIVE" in line and "=" in line
+    ]
+    assert lines == ["TRADEPARTNER_RAW_ARCHIVE="]
+    text = env_example.read_text(encoding="utf-8")
+    assert "Mobile Documents" not in text and "CloudDocs" not in text
