@@ -1,6 +1,6 @@
 """The existing-cache migration runner, move class (plan T361, #2765; data-foundation
-spec amendment 2026-10-31, #2743, items 2, 4 and 7). The backup class (T361) and
-restore (T361) are later slices of the same plan line.
+spec amendment 2026-10-31, #2743, items 2, 4 and 7). The backup class and
+restore are later slices of the same plan line (split proposed in #2766).
 
 `apply_migration` moves the files T360's planner classes as `move` out of
 `edgar.cache_dir` into the raw archive by content hash, with no SEC request and
