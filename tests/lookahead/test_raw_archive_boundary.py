@@ -38,8 +38,12 @@ _REPO = Path(__file__).resolve().parents[2]
 _SRC = _REPO / "src" / "tradepartner"
 _SCRIPTS = _REPO / "scripts"
 
-#: May read bodies: the helper itself and re-derive.
-_READERS_ALLOWED = frozenset({"store/raw_archive.py", "store/raw_rederive.py"})
+#: May read bodies: the helper itself, re-derive and the cache migration, whose
+#: `restore_files` copies hash-checked bodies back to the paths they came from
+#: (#2743 item 4: it is no research or backtest reader).
+_READERS_ALLOWED = frozenset(
+    {"store/raw_archive.py", "store/raw_rederive.py", "store/raw_archive_migrate.py"}
+)
 #: May name the archive's root and config: they define and check it.
 _ROOT_ALLOWED = frozenset({"config.py", "store/raw_archive_config.py", *_READERS_ALLOWED})
 #: The ingest modules that may write through the helper (#2714 items 1 and 5):
@@ -53,7 +57,6 @@ _WRITERS = frozenset(
         "adapters/edgar_raw.py",
         "adapters/form4_bulk_route.py",
         "adapters/form4_route.py",
-        "store/raw_archive_migrate.py",
     }
 )
 #: Any text naming the archive or the re-derive module.
