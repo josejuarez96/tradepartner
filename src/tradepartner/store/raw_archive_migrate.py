@@ -549,6 +549,8 @@ def restore_files(
     root = require_archive_root(settings)
     check_archive_write(settings, cache_dir, sum(e["bytes"] for e in entries))
     download_inputs(settings, list(dict.fromkeys(e["sha256"] for e in entries)), icloud)
+    # the downloads used space too: check the copies again against what is left
+    check_archive_write(settings, cache_dir, sum(e["bytes"] for e in entries))
 
     staged: list[tuple[Path, Path, dict[str, Any]]] = []
     linked: list[Path] = []

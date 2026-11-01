@@ -70,7 +70,11 @@ class Rig:
         self.settings = Settings(
             _env_file=None,
             tradepartner_raw_archive=str(self.root),
-            raw_archive={"upload_wait_min_s": 0.01, "poll_interval_s": 0.01},
+            raw_archive={
+                "upload_wait_min_s": 0.01,
+                "download_wait_min_s": 0.05,
+                "poll_interval_s": 0.01,
+            },
         )
 
     def put(self, rel: str, data: bytes, mtime: int = 1_700_000_000) -> Path:
@@ -562,10 +566,18 @@ def test_restored_bytes_path_and_mtime_equal_the_original_and_the_body_stays(rig
 
 
 def test_restore_refuses_an_offline_body_with_nothing_written(rig: Rig) -> None:
-    rig.run()  # FakeICloud.download raises: the bodies are evicted and cannot come back
+    rig.run()
+
+    class Stuck(FakeICloud):
+        def download(self, path: Path) -> None:  # the download never lands
+            return None
+
+    stuck = Stuck()
+    stuck.evicted = set(rig.icloud.evicted)
+    rig.icloud = stuck
     before = rig.tree()
     index = rig.index()
-    with pytest.raises(AssertionError):
+    with pytest.raises(raw_archive.RawArchiveOfflineError):
         _restore(rig, DEAD)
     assert rig.tree() == before
     assert rig.index() == index
