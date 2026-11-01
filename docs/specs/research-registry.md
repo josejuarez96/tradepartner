@@ -166,7 +166,7 @@ The verdict is the desk read's, not the registry's. The probe's code computed th
 
 Every `read_at` below is declared from the evidence named in its row. Where none exists, T359 writes the best bound in `note` and marks it UNVERIFIED. `kill_line_basis` is then computed from that `read_at`, never asserted.
 
-For candidate 5, `store_max_ingested_at` is `declared`: the maximum `ingested_at` among rows with `ingested_at <= read_at` on the store the probe read (the 2026-10-31 04:41 store named in the desk read), and T359 records how it was obtained in `note`.
+For candidate 5, `store_max_ingested_at` is `declared`: the maximum `ingested_at` among rows with `ingested_at <= read_at` on the store the probe read (the 2026-10-31 04:41 store named in the desk read), and T359 records how it was obtained in `note`. The backup `data/tradepartner.duckdb.bak-20261031-0441` is that store's copy, so T359 reads the maximum from it directly while it exists; only without it does T359 apply the filter above to the live store, and then its `note` says whether any release since rewrote or deleted rows from before `read_at` (roles-2691 rewrote 30,439 Form 4 rows' `ingested_at` on 2026-10-31).
 
 | Candidate | Source, family | Launch, probe SHA-256 | `read_at` source | Window | Configurations | Verdict | Kill line, expected basis | Counts in N |
 |---|---|---|---|---|---|---|---|---|
