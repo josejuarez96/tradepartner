@@ -38,6 +38,7 @@ from tradepartner.store.journal import (
     PaperWindowRow,
     PaperWindowStopRow,
     PositionDailyRow,
+    ReconcileBreakRow,
     ReconciliationRow,
     append,
 )
@@ -276,6 +277,59 @@ def test_no_reconciliation_is_never_a_match(journal_settings: Settings) -> None:
     assert safety is not None
     assert not safety.reconciliation.matches
     assert safety.reconciliation.text == book_view.NO_RECONCILIATION
+
+
+def _break_event(name: str, event: str, *, known: datetime = KNOWN) -> ReconcileBreakRow:
+    return ReconcileBreakRow(
+        break_id=f"1:{name}:1",
+        window_id=1,
+        book_id="main",
+        event=event,
+        parts_json="[]",
+        cause="unattributed",
+        security_id=name,
+        material=True,
+        first_seen_session=T1,
+        reconciliation_id=1,
+        known_at=known,
+        ingested_at=known,
+    )
+
+
+def test_a_breaks_row_counts_every_open_break_not_only_its_listed_names(
+    journal_settings: Settings,
+) -> None:
+    """Greptile #2466: a retained finding stays open without being listed in this
+    reconciliation's mismatches; one name listed and one retained are two breaks."""
+    _seed(journal_settings)
+    listed = {"mismatches": [{"security_id": "SEC_A", "kind": "quantity"}]}
+    _append(
+        journal_settings,
+        _break_event("SEC_A", "opened"),
+        _break_event("SEC_B", "opened"),
+        _break_event("SEC_C", "opened"),
+        _break_event("SEC_C", "auto_accepted"),
+        _reconciliation("breaks", payload=listed),
+    )
+    safety = _view(journal_settings).safety
+    assert safety is not None
+    assert "except 2 open breaks." in safety.reconciliation.text
+
+
+def test_a_break_known_after_the_displayed_reconciliation_is_not_counted(
+    journal_settings: Settings,
+) -> None:
+    _seed(journal_settings)
+    listed = {"mismatches": [{"security_id": "SEC_A", "kind": "quantity"}]}
+    _append(
+        journal_settings,
+        _break_event("SEC_A", "opened"),
+        _break_event("SEC_B", "opened", known=KNOWN + timedelta(hours=1)),
+        _reconciliation("breaks", payload=listed),
+    )
+    safety = _view(journal_settings).safety
+    assert safety is not None
+    assert "except 1 open break." in safety.reconciliation.text
 
 
 def test_an_ok_row_without_a_stored_cash_difference_uses_tolerance_wording(
