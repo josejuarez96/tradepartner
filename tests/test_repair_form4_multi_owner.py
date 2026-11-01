@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import duckdb
 import httpx
@@ -17,6 +18,7 @@ from typer.testing import CliRunner
 
 from tradepartner import cli
 from tradepartner import repair_form4_multi_owner as multi_module
+from tradepartner.adapters.form4_bulk_route import RequestBudgetStopped
 from tradepartner.config import Settings
 from tradepartner.repair_form4_multi_owner import (
     MultiOwnerRepairRefused,
@@ -41,6 +43,8 @@ def test_selection_counts_distinct_bulk_owners(settings: Settings) -> None:
             ("0000000001-25-000002", "0000000001", 0, "sec_insider_bulk"),
             ("0000000001-25-000003", "0000000001", 0, "edgar"),
             ("0000000001-25-000003", "0000000002", 0, "edgar"),
+            ("0000000001-25-000004", "0000000001", 0, "sec_insider_bulk"),
+            ("0000000001-25-000004", "0000000002", 0, "edgar"),
         ):
             insert_row(
                 conn,
@@ -74,9 +78,44 @@ def test_selection_counts_distinct_bulk_owners(settings: Settings) -> None:
     assert count_candidates(settings) == {"2025q1": 1}
 
 
+def test_quarter_uses_new_york_acceptance_date(settings: Settings) -> None:
+    _four_accessions(settings)
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "UPDATE sec_form4_transactions SET accepted_at = ?, known_at = ?, ingested_at = ?",
+            [datetime(2025, 4, 1, 0, 30, tzinfo=UTC)] * 3,
+        )
+    assert count_candidates(settings, from_quarter="2025q1", to_quarter="2025q1") == {"2025q1": 4}
+    assert count_candidates(settings, from_quarter="2025q2", to_quarter="2025q2") == {}
+
+
 def test_invalid_quarter_refused(settings: Settings) -> None:
     with pytest.raises(ValueError, match="quarter"):
         count_candidates(settings, from_quarter="2025q5")
+
+
+def test_mixed_source_accession_compares_bulk_rows_only(settings: Settings, tmp_path: Path) -> None:
+    accessions = _four_accessions(settings)
+    with open_for_write(settings) as conn:
+        source = conn.execute(
+            "SELECT * FROM sec_form4_transactions WHERE accession = ? AND filer_cik = ?",
+            [accessions[0], "0000000001"],
+        )
+        columns = [column[0] for column in source.description]
+        row = dict(zip(columns, source.fetchone(), strict=True))
+        row["filer_cik"] = "0000000003"
+        row["source"] = "edgar"
+        insert_row(conn, "sec_form4_transactions", row)
+    assert count_candidates(settings) == {"2025q1": 4}
+    output = tmp_path / "manifest.json"
+    summary = recheck_form4_multi_owner(
+        settings,
+        output,
+        max_requests=8,
+        fetch_xml=lambda _s, _c, _i, _a: _xml(),
+    )
+    assert summary["counts"]["agrees"] == 4
+    assert json.loads(output.read_text())["results"][accessions[0]]["class"] == "agrees"
 
 
 def _xml(*, director: bool = False, shares: int = 1) -> str:
@@ -150,7 +189,7 @@ def test_classification_budget_resume_and_apply(settings: Settings, tmp_path: Pa
         return xmls[accession]
 
     output = tmp_path / "manifest.json"
-    with pytest.raises(MultiOwnerRepairRefused, match="need up to 8 requests"):
+    with pytest.raises(MultiOwnerRepairRefused, match="need at least 8 requests"):
         recheck_form4_multi_owner(settings, output, max_requests=7, fetch_xml=fake)
     assert not called
     assert count_candidates(settings) == {"2025q1": 4}
@@ -161,6 +200,7 @@ def test_classification_budget_resume_and_apply(settings: Settings, tmp_path: Pa
         "roles_differ": 1,
         "other_difference": 1,
         "unreadable": 1,
+        "retry": 0,
     }
     assert summary["other_difference"] == [accessions[2]]
     assert summary["unreadable"] == [accessions[3]]
@@ -289,8 +329,122 @@ def test_cli_count_only_makes_no_requests(settings: Settings) -> None:
             ["recheck-form4-multi-owner", "--count-only"],
         )
     assert result.exit_code == 0, result.output
-    assert "2025q1: 4 accessions, up to 8 requests" in result.output
+    assert "2025q1: 4 accessions, at least 8 requests" in result.output
     assert calls == 0
+
+
+def test_transient_http_retried_on_resume(settings: Settings, tmp_path: Path) -> None:
+    accessions = _four_accessions(settings)
+    output = tmp_path / "manifest.json"
+    failed = {accessions[0], accessions[1]}
+    calls: list[str] = []
+
+    def fetch(_s: Settings, _c: httpx.Client, _i: str, accession: str) -> str:
+        calls.append(accession)
+        if accession in failed:
+            if accession == accessions[0]:
+                raise httpx.ConnectError("offline")
+            request = httpx.Request("GET", "https://example.test/file.xml")
+            response = httpx.Response(503, request=request)
+            raise httpx.HTTPStatusError("server error", request=request, response=response)
+        return _xml()
+
+    summary = recheck_form4_multi_owner(settings, output, max_requests=8, fetch_xml=fetch)
+    assert summary["counts"]["retry"] == 2
+    assert summary["counts"]["unreadable"] == 0
+    assert not json.loads(output.read_text())["rows"]
+    with pytest.raises(MultiOwnerRepairRefused, match="resume the recheck"):
+        repair_form4_multi_owner(settings, output, "multi-2720", 0)
+    failed.clear()
+    calls.clear()
+    summary = recheck_form4_multi_owner(
+        settings, output, max_requests=4, resume=output, fetch_xml=fetch
+    )
+    assert calls == accessions[:2]
+    assert summary["counts"]["agrees"] == 4
+
+
+def test_http_404_is_unreadable_and_not_refetched(settings: Settings, tmp_path: Path) -> None:
+    accessions = _four_accessions(settings)
+    output = tmp_path / "manifest.json"
+    calls: list[str] = []
+
+    def fetch(_s: Settings, _c: httpx.Client, _i: str, accession: str) -> str:
+        calls.append(accession)
+        if accession == accessions[0]:
+            request = httpx.Request("GET", "https://example.test/file.xml")
+            response = httpx.Response(404, request=request)
+            raise httpx.HTTPStatusError("not found", request=request, response=response)
+        return _xml()
+
+    summary = recheck_form4_multi_owner(settings, output, max_requests=8, fetch_xml=fetch)
+    assert summary["unreadable"] == accessions[:1]
+    calls.clear()
+    recheck_form4_multi_owner(settings, output, max_requests=0, resume=output, fetch_xml=fetch)
+    assert calls == []
+
+
+def test_cli_budget_stop_keeps_partial_manifest(settings: Settings, tmp_path: Path) -> None:
+    _four_accessions(settings)
+    output = tmp_path / "manifest.json"
+
+    def stopped(*_args: object, **_kwargs: object) -> dict[str, object]:
+        output.write_text('{"version": 1, "results": {}}')
+        raise RequestBudgetStopped
+
+    with patch.object(cli, "recheck_form4_multi_owner", stopped):
+        result = CliRunner().invoke(
+            cli.make_app(settings=lambda: settings),
+            ["recheck-form4-multi-owner", "--output", str(output), "--max-requests", "8"],
+        )
+    assert result.exit_code != 0
+    assert "--resume" in result.output
+    assert str(output) in result.output
+    assert json.loads(output.read_text())["results"] == {}
+
+
+def test_apply_value_error_is_clean_cli_refusal(settings: Settings, tmp_path: Path) -> None:
+    accessions = _four_accessions(settings)
+    manifest = tmp_path / "manifest.json"
+    recheck_form4_multi_owner(
+        settings,
+        manifest,
+        max_requests=8,
+        fetch_xml=lambda _s, _c, _i, a: _xml(director=a == accessions[0]),
+    )
+    with open_for_write(settings) as conn:
+        registry.open_data_release(
+            conn, conn, name="multi-2720", backup_path="b.duckdb", reason="#2720"
+        )
+    before = _all_rows(settings)
+    original = multi_module._classify
+    calls = 0
+
+    def fail_in_transaction(*args: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("bad XML during apply")
+        return original(*args)  # type: ignore[arg-type]
+
+    with patch.object(multi_module, "_classify", fail_in_transaction):
+        result = CliRunner().invoke(
+            cli.make_app(settings=lambda: settings, clock=lambda: NOW),
+            [
+                "repair-form4-multi-owner",
+                "--manifest",
+                str(manifest),
+                "--release",
+                "multi-2720",
+                "--expect-rows",
+                "1",
+            ],
+        )
+    assert result.exit_code == 1
+    assert "repair refused: XML recheck failed" in result.output
+    assert "bad XML during apply" in result.output
+    assert "Traceback" not in result.output
+    assert _all_rows(settings) == before
 
 
 def test_update_count_mismatch_rolls_back(

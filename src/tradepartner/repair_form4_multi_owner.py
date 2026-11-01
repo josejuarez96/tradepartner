@@ -12,6 +12,7 @@ from dataclasses import fields, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import duckdb
 import httpx
@@ -19,7 +20,7 @@ import httpx
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar import Form4Transaction, parse_form4
 from tradepartner.adapters.form4_bulk_route import request_budget
-from tradepartner.adapters.form4_route import rows_agree
+from tradepartner.adapters.form4_route import quarter_of, rows_agree
 from tradepartner.config import Settings
 from tradepartner.ingest import SourceRun, _write_run
 from tradepartner.repair import REPAIR, REPAIRED, release_refusal
@@ -29,6 +30,7 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 _FLAGS = ("is_director", "is_officer", "is_ten_percent_owner", "is_other")
 _FIELDS = tuple(field.name for field in fields(Form4Transaction))
 _QUARTER = re.compile(r"^(\d{4})q([1-4])$")
+_NEW_YORK = ZoneInfo("America/New_York")
 
 
 class MultiOwnerRepairRefused(ValueError):
@@ -60,15 +62,17 @@ def _selected(
         raise MultiOwnerRepairRefused("from-quarter follows to-quarter")
     with open_read_only(settings) as conn:
         raw = conn.execute(
-            "SELECT accession, min(issuer_cik), min(accepted_at) "
+            "SELECT accession, min(issuer_cik) FILTER (WHERE source = 'sec_insider_bulk'), "
+            "min(accepted_at) FILTER (WHERE source = 'sec_insider_bulk') "
             "FROM sec_form4_transactions GROUP BY accession "
-            "HAVING count(DISTINCT filer_cik) > 1 "
-            "AND count(*) FILTER (WHERE source <> 'sec_insider_bulk') = 0 "
+            "HAVING count(DISTINCT filer_cik) "
+            "FILTER (WHERE source = 'sec_insider_bulk') > 1 "
             "ORDER BY accession"
         ).fetchall()
     result = []
     for accession, issuer, accepted in raw:
-        quarter = f"{accepted.year}q{(accepted.month - 1) // 3 + 1}"
+        filing_quarter = quarter_of(accepted.astimezone(_NEW_YORK).date())
+        quarter = f"{filing_quarter.year}q{filing_quarter.number}"
         if (first is None or quarter >= first) and (last is None or quarter <= last):
             result.append((accession, issuer, quarter))
     return result
@@ -87,7 +91,7 @@ def _stored_conn(conn: duckdb.DuckDBPyConnection, accession: str) -> tuple[Form4
     columns = ", ".join(_FIELDS)
     rows = conn.execute(
         f"SELECT {columns} FROM sec_form4_transactions WHERE accession = ? "
-        "ORDER BY filer_cik, line_no",
+        "AND source = 'sec_insider_bulk' ORDER BY filer_cik, line_no",
         [accession],
     ).fetchall()
     return tuple(Form4Transaction(*row) for row in rows)
@@ -166,14 +170,18 @@ def recheck_form4_multi_owner(
         document = json.loads(resume.read_text())
         if document.get("version") != 1 or not isinstance(document.get("results"), dict):
             raise MultiOwnerRepairRefused("invalid resume file")
-        completed = document["results"]
+        completed = {
+            accession: result
+            for accession, result in document["results"].items()
+            if result["class"] != "retry"
+        }
         if not set(completed).issubset({row[0] for row in selected}):
             raise MultiOwnerRepairRefused("resume contains accessions outside selection")
     pending = [row for row in selected if row[0] not in completed]
     needed = 2 * len(pending)
     if max_requests < needed or max_requests > settings.events.sec_forms_max_requests:
         raise MultiOwnerRepairRefused(
-            f"need up to {needed} requests for {len(pending)} accessions; "
+            f"need at least {needed} requests for {len(pending)} accessions, excluding retries; "
             f"--max-requests is {max_requests}, configured sec_forms_max_requests "
             f"is {settings.events.sec_forms_max_requests}"
         )
@@ -202,7 +210,16 @@ def recheck_form4_multi_owner(
                     edgar_raw.write_atomic(cache_path, xml.encode("utf-8"))
                     for row in rows:
                         row["xml_path"] = str(cache_path.resolve())
-                except (OSError, ValueError, httpx.HTTPError) as exc:
+                except httpx.HTTPStatusError as exc:
+                    classification, rows = (
+                        ("unreadable" if exc.response.status_code == 404 else "retry"),
+                        [],
+                    )
+                    reason = str(exc)
+                except (OSError, httpx.HTTPError) as exc:
+                    classification, rows = "retry", []
+                    reason = str(exc)
+                except ValueError as exc:
                     classification, rows = "unreadable", []
                     reason = str(exc)
                 else:
@@ -228,12 +245,13 @@ def recheck_form4_multi_owner(
     summary = {
         "counts": {
             name: class_counts[name]
-            for name in ("agrees", "roles_differ", "other_difference", "unreadable")
+            for name in ("agrees", "roles_differ", "other_difference", "unreadable", "retry")
         },
         "other_difference": sorted(
             k for k, v in completed.items() if v["class"] == "other_difference"
         ),
         "unreadable": sorted(k for k, v in completed.items() if v["class"] == "unreadable"),
+        "retry": sorted(k for k, v in completed.items() if v["class"] == "retry"),
         "cache_dir": str(Path(settings.edgar.cache_dir).resolve()),
         "requests": requests,
     }
@@ -258,6 +276,8 @@ def repair_form4_multi_owner(
         if document["version"] != 1 or not isinstance(document["rows"], list):
             raise ValueError("unsupported manifest")
         entries = document["rows"]
+        if any(result["class"] == "retry" for result in document.get("results", {}).values()):
+            raise ValueError("transient fetch failures remain; resume the recheck")
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise MultiOwnerRepairRefused(f"invalid manifest: {exc}") from exc
     seen: set[tuple[str, str, int]] = set()
@@ -306,7 +326,12 @@ def repair_form4_multi_owner(
                 for entry in accession_entries
             ):
                 raise MultiOwnerRepairRefused(f"cached XML changed for {accession}")
-            classification, computed = _classify(accession, _stored_conn(conn, accession), xml_text)
+            try:
+                classification, computed = _classify(
+                    accession, _stored_conn(conn, accession), xml_text
+                )
+            except ValueError as exc:
+                raise MultiOwnerRepairRefused(f"XML recheck failed for {accession}: {exc}") from exc
             if classification not in ("agrees", "roles_differ"):
                 raise MultiOwnerRepairRefused(f"stored non-role fields differ for {accession}")
             reviewed = {tuple(entry["key"]): entry for entry in accession_entries}

@@ -425,6 +425,7 @@ from tradepartner.adapters.edgar_source import (
     census_filing_index,
 )
 from tradepartner.adapters.filings import FilingHeader
+from tradepartner.adapters.form4_bulk_route import RequestBudgetStopped
 from tradepartner.adapters.fred_rates import FredRateSource
 from tradepartner.adapters.prices import (
     Bar,
@@ -2978,8 +2979,11 @@ def make_app(
             total = sum(counts.values())
             if count_only:
                 for quarter, count in counts.items():
-                    typer.echo(f"{quarter}: {count} accessions, up to {2 * count} requests")
-                typer.echo(f"total: {total} accessions, up to {2 * total} requests")
+                    typer.echo(f"{quarter}: {count} accessions, at least {2 * count} requests")
+                typer.echo(
+                    f"total: {total} accessions, at least {2 * total} requests; "
+                    "allow headroom for retries"
+                )
                 return
             if output is None or max_requests is None:
                 raise _fail("--output and --max-requests are required", USAGE_ERROR)
@@ -2994,6 +2998,13 @@ def make_app(
             )
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
+        except RequestBudgetStopped:
+            assert output is not None
+            raise _fail(
+                f"request budget reached; partial manifest kept at {output}; "
+                f"re-run with --resume {output}",
+                1,
+            ) from None
         except (MultiOwnerRepairRefused, OSError, ValueError) as exc:
             raise _fail(f"recheck refused: {exc}", 1) from None
         digest = form4_multi_owner_manifest_digest(output)
@@ -3018,7 +3029,7 @@ def make_app(
             )
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
-        except MultiOwnerRepairRefused as exc:
+        except (MultiOwnerRepairRefused, ValueError) as exc:
             raise _fail(f"repair refused: {exc}", 1) from None
         typer.echo(f"form4 multi-owner: {count} rows {'would change' if dry_run else 'changed'}")
 

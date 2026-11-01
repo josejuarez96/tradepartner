@@ -38,14 +38,15 @@ The real runs of `repair-resolution`, `repair-bars`, `repair-dividends`, `delete
 
 ### Multi-owner Form 4 role repair (#2720)
 
-Use this sequence before the Form 4 study. The recheck reads the store without writing and caches fetched XML under `edgar.cache_dir/form4_multi_owner/`. Each accession can need an index and XML request. The printed request estimate is an upper bound to compare with `events.sec_forms_max_requests`.
+Use this sequence before the Form 4 study. The recheck reads the store without writing and caches fetched XML under `edgar.cache_dir/form4_multi_owner/`. Each accession normally needs an index and XML request. The printed 2N estimate is a floor; retries consume additional requests. At 46,358 stored multi-owner accessions, the base estimate is 92,716 requests (about 92.7k), above the default `events.sec_forms_max_requests` cap of 40,000. Run separate quarter ranges, each with its own output file, leaving headroom for retries. Check the count for each range before fetching; a range needing 40,000 or more base requests must be split further.
 
-1. `uv run tradepartner recheck-form4-multi-owner --count-only --from-quarter 2022q4 --to-quarter 2025q1` (omit the quarter flags for all stored quarters).
-2. `uv run tradepartner recheck-form4-multi-owner --output form4-multi-owner.json --max-requests N --from-quarter 2022q4 --to-quarter 2025q1`. If interrupted, repeat with `--resume form4-multi-owner.json`; completed accessions are not fetched again.
-3. Review the printed manifest SHA-256 and `form4-multi-owner.summary.json`. The manifest contains only `roles_differ` rows. Investigate the listed `other_difference` and `unreadable` accessions separately; this repair does not alter them.
-4. Back up the store, then open one named release: `uv run tradepartner store backup`; `uv run tradepartner decision data-release open --name NAME --backup PATH --reason "#2720 XML-confirmed Form 4 roles"`.
-5. `uv run tradepartner repair-form4-multi-owner --manifest form4-multi-owner.json --release NAME --expect-rows N --dry-run`, then repeat without `--dry-run` using the reviewed changed-row count. A rerun with `--expect-rows 0` must report zero.
-6. Close the release with `uv run tradepartner decision data-release close --name NAME --from SESSION --to SESSION`, using the touched transaction sessions.
+1. `uv run tradepartner recheck-form4-multi-owner --count-only` to list every stored quarter. Use the reported counts to choose consecutive ranges under the request cap with retry headroom. One quarter per range is a simple starting point.
+2. For each range, run `uv run tradepartner recheck-form4-multi-owner --count-only --from-quarter 2022q4 --to-quarter 2022q4`, then `uv run tradepartner recheck-form4-multi-owner --output form4-multi-owner-2022q4.json --max-requests N --from-quarter 2022q4 --to-quarter 2022q4`. Repeat for the next quarter (for example `2023q1`) through the last reported quarter, changing the range and output name each time. Choose N above the printed floor but no higher than the configured cap.
+3. If a range stops or its summary lists `retry` accessions, repeat its command with `--resume form4-multi-owner-2022q4.json`. Completed accessions are not fetched again; transient failures are. Do not apply a manifest while `retry` accessions remain.
+4. Review each manifest SHA-256 and matching `.summary.json`. Each manifest contains only `roles_differ` rows. Investigate `other_difference` and `unreadable` accessions separately; this repair does not alter them.
+5. Back up the store, then open one named release: `uv run tradepartner store backup`; `uv run tradepartner decision data-release open --name NAME --backup PATH --reason "#2720 XML-confirmed Form 4 roles"`.
+6. For **each** reviewed range manifest, run `uv run tradepartner repair-form4-multi-owner --manifest form4-multi-owner-2022q4.json --release NAME --expect-rows N --dry-run`, then repeat without `--dry-run` using that manifest's reviewed changed-row count. A rerun with `--expect-rows 0` must report zero.
+7. Close the release with `uv run tradepartner decision data-release close --name NAME --from SESSION --to SESSION`, using the touched transaction sessions.
 
 The legacy file lives beside the store, in `data/` (gitignored, so it never reaches the public repo). Each entry was one `[[release]]` table, append-only. Its format, still what `import-file` reads (the numbers are illustrative):
 
