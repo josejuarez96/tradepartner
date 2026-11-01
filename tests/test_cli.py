@@ -1427,8 +1427,7 @@ def test_health_has_no_incremental_edgar_warning_without_positive_counts(
         _run_row(settings, "incremental", "edgar_index", "ok", T_END - timedelta(hours=1), message)
     result = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
     assert result.exit_code == 0, result.output
-    if message is None:
-        assert "incremental EDGAR:" not in result.output
+    assert "incremental EDGAR:" not in result.output
     assert "  warning: incremental_drift:" not in result.output
     assert "  warning: index_stamp_changed:" not in result.output
     assert result.output.startswith("Data: checks pass, bars current to ")

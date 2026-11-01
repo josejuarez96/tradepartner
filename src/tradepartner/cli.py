@@ -828,7 +828,7 @@ def _print_report(report: HealthReport) -> None:
         echo(f"  {s.source}: last ok {last_ok} (cursor {s.last_ok_cursor})")
         if s.latest_status is not None:
             echo(f"    latest: {s.latest_status}: {s.latest_message}")
-    if report.incremental_edgar.counts:
+    if report.incremental_edgar.warnings:
         echo("incremental EDGAR:")
         for warning in report.incremental_edgar.warnings:
             echo(f"  warning: {warning}")
