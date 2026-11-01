@@ -38,7 +38,7 @@ The real runs of `repair-resolution`, `repair-bars`, `repair-dividends`, `delete
 
 ### Multi-owner Form 4 role repair (#2720)
 
-Use this sequence before the Form 4 study. The recheck reads the store without writing and caches fetched XML under `edgar.cache_dir/form4_multi_owner/`. Each accession normally needs an index and XML request. The printed 2N estimate is a floor; retries consume additional requests. At 46,358 stored multi-owner accessions, the base estimate is 92,716 requests (about 92.7k), above the default `events.sec_forms_max_requests` cap of 40,000. Run separate quarter ranges, each with its own output file, leaving headroom for retries. Check the count for each range before fetching; a range needing 40,000 or more base requests must be split further.
+Use this sequence to correct stored multi-owner roles (the Form 4 study that first needed it is retired, #2734). The recheck reads the store without writing and caches fetched XML under `edgar.cache_dir/form4_multi_owner/`. Each accession normally needs an index and XML request. The printed 2N estimate is a floor; retries consume additional requests. At 46,358 stored multi-owner accessions, the base estimate is 92,716 requests (about 92.7k), above the default `events.sec_forms_max_requests` cap of 40,000. Run separate quarter ranges, each with its own output file, leaving headroom for retries. Check the count for each range before fetching; a range needing 40,000 or more base requests must be split further.
 
 1. `uv run tradepartner recheck-form4-multi-owner --count-only` to list every stored quarter. Use the reported counts to choose consecutive ranges under the request cap with retry headroom. One quarter per range is a simple starting point.
 2. For each range, run `uv run tradepartner recheck-form4-multi-owner --count-only --from-quarter 2022q4 --to-quarter 2022q4`, then `uv run tradepartner recheck-form4-multi-owner --output form4-multi-owner-2022q4.json --max-requests N --from-quarter 2022q4 --to-quarter 2022q4`. Repeat for the next quarter (for example `2023q1`) through the last reported quarter, changing the range and output name each time. Choose N above the printed floor but no higher than the configured cap.
@@ -47,6 +47,18 @@ Use this sequence before the Form 4 study. The recheck reads the store without w
 5. Back up the store, then open one named release: `uv run tradepartner store backup`; `uv run tradepartner decision data-release open --name NAME --backup PATH --reason "#2720 XML-confirmed Form 4 roles"`.
 6. For **each** reviewed range manifest, run `uv run tradepartner repair-form4-multi-owner --manifest form4-multi-owner-2022q4.json --release NAME --expect-rows N --dry-run`, then repeat without `--dry-run` using that manifest's reviewed changed-row count. A rerun with `--expect-rows 0` must report zero.
 7. Close the release with `uv run tradepartner decision data-release close --name NAME --from SESSION --to SESSION`, using the touched transaction sessions.
+
+### Bulk Form 4 title repair (#2708)
+
+The bulk parser reads title values from `NONDERIV_TRANS` only. It does not read `DERIV_TRANS`, `NONDERIV_HOLDING`, or `DERIV_HOLDING`. For the old CSV-wrapped title values, build and review a deterministic manifest from the cached quarter zips and the read-only store:
+
+```bash
+uv run tradepartner build-form4-titles-manifest --zip-dir data/edgar_cache/insider --output /tmp/form4-titles.json
+uv run tradepartner repair-form4-titles --manifest /tmp/form4-titles.json --release <open-release> --expect-rows <manifest-count> --dry-run
+uv run tradepartner repair-form4-titles --manifest /tmp/form4-titles.json --release <open-release> --expect-rows <dry-run-count>
+```
+
+Keep the printed manifest SHA-256 with the release notes. The builder defaults to the configured EDGAR insider cache directory and refuses unmatched stored bulk rows and title differences beyond the SEC's CSV quoting. The apply step verifies the zip hashes and current row values, changes `security_title` and `ingested_at` on changed rows, and records the manifest hash in `ingestion_runs`. `known_at` stays unchanged. Take the backup and open the named release first; close it with the affected sessions after verification.
 
 The legacy file lives beside the store, in `data/` (gitignored, so it never reaches the public repo). Each entry was one `[[release]]` table, append-only. Its format, still what `import-file` reads (the numbers are illustrative):
 

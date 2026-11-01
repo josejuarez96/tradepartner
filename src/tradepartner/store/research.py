@@ -1059,7 +1059,9 @@ def write_result(
     return `"failed"` when `n_configurations`
     exceeds the declaration, the export's hash moved, or the store's latest
     `ingested_at` moved for an `economic` or `return` run (req 8). `secondary`
-    holds the declared secondary metrics only."""
+    holds the declared secondary metrics only. A NaN or infinite primary value
+    or interval bound is still recorded `ok`, as given, with the verdict
+    `not_computable` (no evidence, never a `fail`; #2617)."""
     _check_open(conn, handle)
     registration = _registration_where(conn, "registration_id = ?", handle.registration_id)
     assert registration is not None
@@ -1092,6 +1094,7 @@ def write_result(
         registration.primary_threshold,
         primary_ci_low,
         primary_ci_high,
+        value=primary_value,
     )
     _insert_result(
         conn,
