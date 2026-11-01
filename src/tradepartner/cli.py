@@ -828,6 +828,10 @@ def _print_report(report: HealthReport) -> None:
         echo(f"  {s.source}: last ok {last_ok} (cursor {s.last_ok_cursor})")
         if s.latest_status is not None:
             echo(f"    latest: {s.latest_status}: {s.latest_message}")
+    if report.incremental_edgar.counts:
+        echo("incremental EDGAR:")
+        for warning in report.incremental_edgar.warnings:
+            echo(f"  warning: {warning}")
     c = report.coverage
     echo(
         f"coverage: {len(c.live) - len(c.missing)} of {len(c.live)} live names "
@@ -3324,6 +3328,7 @@ def make_app(
         expected_warnings = (
             (1 if _quarantined(report) > 0 else 0)
             + (1 if report.duplicate_dividends.pending else 0)
+            + len(report.incremental_edgar.warnings)
             + chain_breaks
             + (1 if (disk_warning := low_disk_warning(s)) is not None else 0)
         )
@@ -3345,6 +3350,7 @@ def make_app(
                 "(`tradepartner repair-dividends`); each still counts its payment twice",
                 err=True,
             )
+        warnings += len(report.incremental_edgar.warnings)
         for row in report.successor_chains.frame.filter(pl.col("price_break")).iter_rows(
             named=True
         ):
