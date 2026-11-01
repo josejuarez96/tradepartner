@@ -1675,7 +1675,7 @@ why = "Later evidence must not change an earlier exit under the approved timing 
 [task.T354]
 what = "Read-only macOS spike to pin iCloud upload status, brctl commands and a bounded confirmation wait."
 why = "Eviction must wait for a reliable upload signal; an unconfirmed file remains local and counted."
-unblocks = ["task:T346"]
+unblocks = ["task:T346", "task:T360"]
 
 [task.T345]
 what = "Configure the local raw archive path and refuse writes that breach the iCloud disk floor."
@@ -1685,7 +1685,7 @@ unblocks = ["task:T346"]
 [task.T346]
 what = "Keep raw bodies by content hash and verify iCloud upload, eviction, download and integrity."
 why = "Form 4 XML and daily index inputs must survive parser fixes and sync eviction."
-unblocks = ["task:T347", "task:T348"]
+unblocks = ["task:T347", "task:T348", "task:T360"]
 
 [task.T347]
 what = "Archive daily index files before parsing and record their hashes, URLs, fetch times and parser versions in runs."
@@ -1714,6 +1714,15 @@ why = "A differing sampled filing should not discard an otherwise usable quarter
 [task.T352]
 what = "Re-derive from named raw hashes, including archived insider zips, and enforce the archive's no-look-ahead reader boundary."
 why = "Parser repairs need exact historical inputs without exposing later files to research reads."
+
+[task.T360]
+what = "Plan and run the move of the existing EDGAR cache's off-nightly parts into the raw archive by hash, with a back-up copy of the stamps."
+why = "About 1.8 GB of dead cache versions, raw corpus and old insider zips sit on a laptop near its 10 GB disk floor (#2743)."
+unblocks = ["task:T361"]
+
+[task.T361]
+what = "Add the archive migrate-cache and restore commands, and make the departure corpus fetch refuse a file that was archived."
+why = "The owner needs a dry run before moving anything, and a corpus re-fetch must never replace an archived body with later content."
 
 [task.T353]
 what = "Read-only baseline of accession-level Form 4 disagreements and XML request cost over #2706's 11 quarters."
