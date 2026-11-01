@@ -1073,8 +1073,8 @@ def test_residue_missing_exit_refuses_but_other_short_is_skipped() -> None:
     trial = _trial({T0: 100_000, T1: 100_000}, {T0: 0})
     with pytest.raises(ValueError, match=f"{A}.*{T0}.*{T1}.*unexplained"):
         compare_periods(_window(), trial, journal, _no_actions(), _no_price, None)
-    short = replace(_position_mark(T0, B, -2, 10, cash=100_020), position_side="short")
-    short_next = replace(_position_mark(T1, B, -2, 10, cash=100_020), position_side="short")
+    short = replace(_position_mark(T0, B, 2, 10, cash=100_020), position_side="short")
+    short_next = replace(_position_mark(T1, B, 2, 10, cash=100_020), position_side="short")
     journal = _journal(positions_daily=[short, short_next])
     result = compare_periods(_window(), trial, journal, _no_actions(), _no_price, None)
     assert result.periods[0].residue_term == 0
@@ -1826,7 +1826,7 @@ def test_residue_quantity_uses_close_cut_even_when_mark_is_written_later(
 
 def test_short_mark_on_residue_name_refuses() -> None:
     mark_i = _position_mark(T0, A, 10, 20, cash=99_800)
-    mark_next = replace(_position_mark(T1, A, -10, 20, cash=100_200), position_side="short")
+    mark_next = replace(_position_mark(T1, A, 10, 20, cash=100_200), position_side="short")
     carried = AdjustmentRow(
         window_id=WINDOW_ID,
         session=T0,
@@ -1851,8 +1851,8 @@ def test_short_mark_on_residue_name_refuses() -> None:
 
 def test_short_opening_mark_on_carried_residue_refuses() -> None:
     marks = [
-        replace(_position_mark(T0, A, -10, 20, cash=100_200), position_side="short"),
-        replace(_position_mark(T1, A, -10, 20, cash=100_200), position_side="short"),
+        replace(_position_mark(T0, A, 10, 20, cash=100_200), position_side="short"),
+        replace(_position_mark(T1, A, 10, 20, cash=100_200), position_side="short"),
     ]
     carried = AdjustmentRow(
         window_id=WINDOW_ID,
