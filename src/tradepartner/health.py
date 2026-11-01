@@ -223,6 +223,21 @@ derived at `t`, as the data is read.
   (`accession`, `filer_cik`, `line_no`) for `sec_form4_transactions`; the
   `*_known_at_is_accepted_at` and `*_unique` frames carry it in full. A store
   without a table passes that table's four rules.
+- The `filing_index` revision rules (#2629, #2703, T318b), over every stored
+  row whatever its `known_at`, per `(cik, accession)` ordered by `known_at`:
+  `filing_index_first_known_at_is_accepted_at` (the earliest row's `known_at`
+  equals its `accepted_at`), `filing_index_revision_known_at_after_accepted_at`
+  (every later row has `known_at > accepted_at`),
+  `filing_index_revision_listed_on_ordered` (a later row's `listed_on` is on or
+  after the row before it), `filing_index_revision_matches_first` (a later
+  row's form, company name and `accepted_at` equal the earliest row's),
+  `filing_index_revision_filed_on_changes` (a later row's `filed_on` differs
+  from the row before it) and `filing_index_timestamps_aware` (`known_at`,
+  `accepted_at` and `ingested_at` are `TIMESTAMPTZ`). The frames carry
+  (`cik`, `accession`, rows), except the last, which carries the columns. The
+  common `known_at <= ingested_at` rule covers the rest, as the restamp sets
+  `ingested_at` on every row it moves. A store without the table passes all
+  six; a clean store holding a revision passes them.
 - `bars_on_sessions`: every `prices_daily.session` is an XNYS session in the
   configured calendar range.
 - `no_duplicate_bars`: no two bars share `(security_id, session, known_at)`.
@@ -528,6 +543,14 @@ FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT = "filing_events_known_at_is_accepted_at"
 FILING_EVENTS_FORM_ALLOWED = "filing_events_form_allowed"
 FILING_EVENTS_ITEMS_NOT_NULL = "filing_events_items_not_null"
 FILING_EVENTS_UNIQUE = "filing_events_unique"
+FILING_INDEX_FIRST_KNOWN_AT_IS_ACCEPTED_AT = "filing_index_first_known_at_is_accepted_at"
+FILING_INDEX_REVISION_KNOWN_AT_AFTER_ACCEPTED_AT = (
+    "filing_index_revision_known_at_after_accepted_at"
+)
+FILING_INDEX_REVISION_LISTED_ON_ORDERED = "filing_index_revision_listed_on_ordered"
+FILING_INDEX_REVISION_MATCHES_FIRST = "filing_index_revision_matches_first"
+FILING_INDEX_REVISION_FILED_ON_CHANGES = "filing_index_revision_filed_on_changes"
+FILING_INDEX_TIMESTAMPS_AWARE = "filing_index_timestamps_aware"
 SEC_FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT = "sec_filing_events_known_at_is_accepted_at"
 SEC_FILING_EVENTS_TIMESTAMPS_AWARE = "sec_filing_events_timestamps_aware"
 SEC_FILING_EVENTS_UNIQUE = "sec_filing_events_unique"
@@ -599,6 +622,12 @@ INTEGRITY_RULES: tuple[str, ...] = (
     FILING_EVENTS_FORM_ALLOWED,
     FILING_EVENTS_ITEMS_NOT_NULL,
     FILING_EVENTS_UNIQUE,
+    FILING_INDEX_FIRST_KNOWN_AT_IS_ACCEPTED_AT,
+    FILING_INDEX_REVISION_KNOWN_AT_AFTER_ACCEPTED_AT,
+    FILING_INDEX_REVISION_LISTED_ON_ORDERED,
+    FILING_INDEX_REVISION_MATCHES_FIRST,
+    FILING_INDEX_REVISION_FILED_ON_CHANGES,
+    FILING_INDEX_TIMESTAMPS_AWARE,
     SEC_FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
     SEC_FILING_EVENTS_TIMESTAMPS_AWARE,
     SEC_FILING_EVENTS_UNIQUE,
@@ -3183,6 +3212,7 @@ def _integrity_checks(
         STATEMENT_DERIVED_MATCHES_COMPONENTS: _statement_derived_matches_components(conn),
         STATEMENT_BASIS_ALLOWED: _statement_basis_allowed(conn),
         **_filing_event_rules(conn, settings),
+        **_filing_index_rules(conn),
         **_sec_form_rules(conn),
         SESSION_HOLES: _session_holes(conn, t, settings),
         **_rate_rules(conn),
@@ -3939,6 +3969,80 @@ def _filing_event_rules(
         FILING_EVENTS_ITEMS_NOT_NULL: keys("WHERE items IS NULL"),
         FILING_EVENTS_UNIQUE: keys("", "HAVING count(*) > 1"),
     }
+
+
+_FILING_INDEX_COLUMN_SCHEMA: dict[str, Any] = {"column": pl.Utf8, "rows": pl.Int64}
+_FILING_INDEX_STAMPS = ("known_at", "accepted_at", "ingested_at")
+
+#: Each revision rule's `WHERE` over `_FILING_INDEX_ROWS` (T318b): `n` is the
+#: row's place in its accession's `known_at` order, `first_*` the earliest row's
+#: values and `prev_*` the row before it.
+_FILING_INDEX_WHERE: dict[str, str] = {
+    FILING_INDEX_FIRST_KNOWN_AT_IS_ACCEPTED_AT: "n = 1 AND known_at IS DISTINCT FROM accepted_at",
+    FILING_INDEX_REVISION_KNOWN_AT_AFTER_ACCEPTED_AT: "n > 1 AND NOT (known_at > accepted_at)",
+    FILING_INDEX_REVISION_LISTED_ON_ORDERED: "n > 1 AND NOT (listed_on >= prev_listed_on)",
+    FILING_INDEX_REVISION_MATCHES_FIRST: (
+        "n > 1 AND (form IS DISTINCT FROM first_form "
+        "OR company_name IS DISTINCT FROM first_company_name "
+        "OR accepted_at IS DISTINCT FROM first_accepted_at)"
+    ),
+    FILING_INDEX_REVISION_FILED_ON_CHANGES: "n > 1 AND NOT (filed_on <> prev_filed_on)",
+}
+_FILING_INDEX_ROWS = """
+    WITH r AS (
+        SELECT cik, accession, form, company_name, filed_on, accepted_at, listed_on, known_at,
+            row_number() OVER w AS n,
+            lag(listed_on) OVER w AS prev_listed_on,
+            lag(filed_on) OVER w AS prev_filed_on,
+            first_value(form) OVER w AS first_form,
+            first_value(company_name) OVER w AS first_company_name,
+            first_value(accepted_at) OVER w AS first_accepted_at
+        FROM filing_index
+        WINDOW w AS (PARTITION BY cik, accession ORDER BY known_at, listed_on)
+    )
+"""
+
+
+def _filing_index_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
+    """The six `filing_index` revision rules (module docstring, #2703): offending
+    keys (`cik`, `accession`, rows) or, for the timestamp rule, the columns that
+    are not `TIMESTAMPTZ`. A store without the table passes all six."""
+    rules: dict[str, pl.DataFrame] = {}
+    present = "filing_index" in _present_tables(conn)
+    for rule, where in _FILING_INDEX_WHERE.items():
+        found = (
+            conn.execute(
+                f"{_FILING_INDEX_ROWS} SELECT cik, accession, count(*) FROM r WHERE {where} "
+                "GROUP BY cik, accession ORDER BY cik, accession"
+            ).fetchall()
+            if present
+            else []
+        )
+        rules[rule] = pl.DataFrame(
+            [{"cik": c, "accession": a, "rows": int(n)} for c, a, n in found],
+            schema=_EVENT_KEY_SCHEMA,
+        )
+    types = (
+        dict(
+            conn.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_name = 'filing_index' AND table_catalog = current_database() "
+                "AND table_schema = current_schema() AND column_name IN (?, ?, ?)",
+                list(_FILING_INDEX_STAMPS),
+            ).fetchall()
+        )
+        if present
+        else {}
+    )
+    rules[FILING_INDEX_TIMESTAMPS_AWARE] = pl.DataFrame(
+        [
+            {"column": column, "rows": 1}
+            for column in _FILING_INDEX_STAMPS
+            if present and types.get(column) != "TIMESTAMP WITH TIME ZONE"
+        ],
+        schema=_FILING_INDEX_COLUMN_SCHEMA,
+    )
+    return rules
 
 
 _SEC_FORM_IDENTITIES: dict[str, tuple[str, ...]] = {
