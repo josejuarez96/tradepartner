@@ -30,7 +30,7 @@ from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.calendar import next_session
 from tradepartner.config import Settings
 from tradepartner.execution import ops
-from tradepartner.store.db import open_read_only
+from tradepartner.store.db import open_read_only, utc_now
 
 from .test_run_trade import (
     BROKER_ASSETS,
@@ -291,7 +291,7 @@ def test_status_and_ops_summaries_mark_book_a_failed_and_book_b_not(
     fault, and B's run ok, its switch not engaged."""
     _, b = _a_failed_then_b_ran(fixture_store_path, tmp_path)
     with open_read_only(b.settings) as conn:
-        summaries = {s.book_id: s for s in ops.book_summaries(conn, b.settings)}
+        summaries = {s.book_id: s for s in ops.book_summaries(conn, b.settings, now=utc_now())}
     assert set(summaries) == {BOOK_A, BOOK_B}
     a_row, b_row = summaries[BOOK_A], summaries[BOOK_B]
 
@@ -365,7 +365,7 @@ def test_book_bs_next_run_after_book_as_failure_is_valid(
     assert b.held() == held_before
 
     with open_read_only(b.settings) as conn:
-        summaries = {s.book_id: s for s in ops.book_summaries(conn, b.settings)}
+        summaries = {s.book_id: s for s in ops.book_summaries(conn, b.settings, now=utc_now())}
     assert not summaries[BOOK_B].switch_state.engaged
     assert summaries[BOOK_B].last_run_status == "ok"
     assert summaries[BOOK_A].switch_state.engaged

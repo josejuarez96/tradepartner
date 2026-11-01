@@ -89,6 +89,7 @@ EXCLUDED_SETTINGS_KEYS = (
     "edgar.max_failed_filing_share",
     "edgar.max_validation_listed",
     "edgar.incremental_index",  # T323 adds the gate's on/off switch.
+    "edgar.reconcile_recent_quarters",  # T319b: which quarters to re-read, not a build rule.
 )
 
 CACHE_VERSION_NAMES = (

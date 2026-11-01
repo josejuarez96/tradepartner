@@ -22,7 +22,7 @@ from tradepartner.dashboard import research_page
 from tradepartner.execution import home_view, ops
 from tradepartner.execution.waiting import KIND_ORDER, WaitingItem
 from tradepartner.store import schema
-from tradepartner.store.db import open_for_write, open_read_only
+from tradepartner.store.db import open_for_write, open_read_only, utc_now
 from tradepartner.store.journal import (
     PaperReportRow,
     PaperRunResultRow,
@@ -282,7 +282,7 @@ def test_strategy_sentence_uses_the_blurb_then_the_registry_title(
     blurbs = tmp_path / "b.toml"
     blurbs.write_text('[blurbs]\n"h1-momentum-12-1" = "Holds last year\'s winners."\n')
     with open_read_only(store) as conn:
-        (main,) = (s for s in ops.book_summaries(conn, store) if s.book_id == "main")
+        (main,) = (s for s in ops.book_summaries(conn, store, now=utc_now()) if s.book_id == "main")
         assert home_view.strategy_sentence(conn, main, blurbs) == "Holds last year's winners."
         blurbs.write_text('[blurbs]\n"another-slug" = "Not this one."\n')
         assert home_view.strategy_sentence(conn, main, blurbs) == "Registry title"

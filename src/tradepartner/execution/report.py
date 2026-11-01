@@ -75,7 +75,7 @@ from tradepartner.calendar import (
 from tradepartner.config import Cadence, RiskConfig, Settings
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.lock import resolve_book
-from tradepartner.execution.marks import equity_at
+from tradepartner.execution.marks import UnreadableMarkError, equity_at
 from tradepartner.execution.plan import residue as residue_of
 from tradepartner.execution.plan import stop_session as stop_session_of_request
 from tradepartner.execution.slippage import Slippage, window_slippage
@@ -1110,12 +1110,18 @@ class Report:
 
 class MarksMissing(ValueError):
     """A rebalance session inside the report window has no `positions_daily` mark
-    (#2448). `report` raises it before any trial opens, so nothing is written."""
+    (#2448), or has one that cannot be read (#2470: no cash, a non-finite value).
+    `report` raises it before any trial opens, so nothing is written."""
+
+
+#: The tracking trial's Sharpe needs two period returns, and N rebalance sessions give
+#: N - 1 of them, so a report needs three sessions (#2468).
+_MIN_REBALANCE_SESSIONS = 3
 
 
 class NothingToCompareYet(Exception):
-    """A book with fewer than two rebalance sessions through the last completed one
-    has no period to compare (#1923). `report` raises it before any trial opens, so
+    """A book with fewer than three rebalance sessions through the last completed one
+    has too few periods to compare (#1923, #2468). `report` raises it before any trial opens, so
     nothing is written: no refused `in_sample` row, no failed tracking row."""
 
 
@@ -1286,9 +1292,9 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
     than after paying for a trial run; quant-auditor finding on PR #525; `paper
     start` writes it since #526, so only a window started earlier lacks it), or
     when the tracking trial does not finish `ok`. Raises `NothingToCompareYet`, with
-    nothing written, when fewer than two rebalance sessions fall in `[T_0, last
-    completed T]` (#1923): the engine needs two, and a refused or failed trial row is
-    noise in the registry.
+    nothing written, when fewer than three rebalance sessions fall in `[T_0, last
+    completed T]` (#1923, #2468): the engine needs two period returns, so three, and a refused or
+    failed trial row is noise in the registry.
 
     "Last completed T" is capped strictly before the window's stop session
     (req 15), when it has one: a stopped window's `last completed T` is never
@@ -1313,7 +1319,8 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
         stop_session = _stop_session_of(store_journal.window_stops_for(conn, window_id))
         while stop_session is not None and last_t >= stop_session:
             last_t = _before(last_t, cadence)
-        marked = {m.session for m in store_journal.positions_daily_for(conn, window_id)}
+        mark_rows = store_journal.positions_daily_for(conn, window_id)
+        marked = {m.session for m in mark_rows}
 
     #: The window ends at the last rebalance session the book has marks for (#2448):
     #: a session the kill switch halted has none, and asking the comparison for its
@@ -1329,10 +1336,11 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
             f"the book has no marks after {last_marked} (halted or not yet marked)"
         )
 
-    if last_t < t0 or len(rebalance_sessions(t0, last_t, cadence)) < 2:
+    if last_t < t0 or len(rebalance_sessions(t0, last_t, cadence)) < _MIN_REBALANCE_SESSIONS:
         raise NothingToCompareYet(
             f"paper report: nothing to compare yet for book {book!r}; a report needs at "
-            f"least two rebalances and the first is {t0} (last marked rebalance: {last_t})"
+            f"least three rebalances (two period returns) and the first is {t0} "
+            f"(last marked rebalance: {last_t})"
         )
 
     missing = [t for t in rebalance_sessions(t0, last_t, cadence) if t not in marked]
@@ -1341,6 +1349,14 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
             f"paper report: no marks for rebalance session(s) {', '.join(map(str, missing))} "
             f"of book {book!r}; nothing was written"
         )
+    for t in rebalance_sessions(t0, last_t, cadence):
+        try:
+            equity_at(mark_rows, t)
+        except UnreadableMarkError as exc:
+            raise MarksMissing(
+                f"paper report: the mark for rebalance session {t} of book {book!r} "
+                f"cannot be read ({exc}); nothing was written"
+            ) from exc
 
     outcome = run_hypothesis(
         hypothesis.slug,

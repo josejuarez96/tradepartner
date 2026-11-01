@@ -151,7 +151,6 @@ from tradepartner.ingest import OK as INGEST_OK
 from tradepartner.store import journal, registry
 from tradepartner.store.asof import adjusted_prices_as_of
 from tradepartner.store.benchmarks import BenchmarkIdentityError, benchmark_security_ids
-from tradepartner.store.db import utc_now
 from tradepartner.store.journal import (
     CLOSING_STOP_STATES,
     TERMINAL_ORDER_STATUSES,
@@ -364,12 +363,14 @@ class BookSummary:
     last_run_message: str | None = None
 
 
-def rebalance_traded_today(row: BookSummary) -> date | None:
-    """The rebalance handled by today's completed fill-session run, if any."""
+def rebalance_traded_today(row: BookSummary, *, now: datetime) -> date | None:
+    """The rebalance handled by the completed fill-session run of `now`'s New York
+    date (the caller's clock, #2655), if any."""
     if (
         row.last_run_kind != "rebalance"
         or row.last_run_status != "ok"
-        or row.last_run_session != utc_now().astimezone(_NEW_YORK).date()
+        or row.last_run_session
+        != ensure_tz_aware_utc(now, field_name="now").astimezone(_NEW_YORK).date()
     ):
         return None
     return previous_session(row.last_run_session)
@@ -892,13 +893,19 @@ def _positions(conn: duckdb.DuckDBPyConnection, window_id: int) -> tuple[int, fl
 
 
 def page_data(
-    conn: duckdb.DuckDBPyConnection, settings: Settings, book_id: str | None = None
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    book_id: str | None = None,
+    *,
+    now: datetime,
 ) -> OpsData:
     """Everything the operations page and `paper status` (T67) show for one book
     (`book_id`, default `paper.book_id`; ADR 0017 B.7), read once through `conn`
     (the shell's read-only connection). Never writes to the store, never takes
     the run lock and never engages or releases the switch (module docstring).
-    `ValueError` for a book outside the token grammar."""
+    `ValueError` for a book outside the token grammar. `now` is the caller's
+    clock (#2655): staleness and the EDGAR age are read at it."""
+    now = ensure_tz_aware_utc(now, field_name="now")
     limit = settings.dashboard.page_row_limit
     book = lock.resolve_book(settings, book_id)
     try:
@@ -934,14 +941,17 @@ def page_data(
     latest_run = latest_run_with_result.run if latest_run_with_result is not None else None
     results = [rw.result for rw in runs_with_results if rw.result is not None]
 
-    s_minus_1 = _required_run_session(utc_now())
+    s_minus_1 = _required_run_session(now)
     stale, last_updated = _stale_and_last_updated(conn, window_id, s_minus_1)
 
     positions_count, positions_value = _positions(conn, window_id)
 
     open_orders_count = _open_orders_count(conn, window_id)
 
-    plan = _latest(journal.plans_for(conn, window_id))
+    try:
+        plan = _latest(journal.plans_for(conn, window_id))
+    except SchemaVersionError as exc:
+        return OpsData(journal_outdated=str(exc), book_id=book)
     targets_count = plan.n_targets if plan is not None else 0
     ranking = _build_ranking(conn, window_id, plan) if plan is not None else ()
 
@@ -999,7 +1009,7 @@ def page_data(
         alerts_capped=alerts_capped,
         reconciliation=reconciliation,
         overdue_delisting=_overdue_delisting(conn, book, window_id),
-        edgar_age=edgar_age(conn, settings, utc_now()),
+        edgar_age=edgar_age(conn, settings, now),
     )
 
 
@@ -1128,7 +1138,9 @@ def _next_rebalance_session(
     return next((t for t in sessions if session_close(t) > now), None)
 
 
-def _summary(conn: duckdb.DuckDBPyConnection, settings: Settings, book: str) -> BookSummary | None:
+def _summary(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, book: str, now: datetime
+) -> BookSummary | None:
     window = journal.latest_window(conn, book)
     if window is None or window.window_id is None:
         return None
@@ -1170,23 +1182,25 @@ def _summary(conn: duckdb.DuckDBPyConnection, settings: Settings, book: str) -> 
         last_run_kind=latest_run.run.kind if latest_run is not None else None,
         last_run_session=latest_run.run.session if latest_run is not None else None,
         last_run_has_orders=last_run_has_orders,
-        next_rebalance_session=(
-            _next_rebalance_session(conn, window, utc_now()) if is_open else None
-        ),
+        next_rebalance_session=(_next_rebalance_session(conn, window, now) if is_open else None),
         last_run_message=latest_run.result.message if latest_run and latest_run.result else None,
     )
 
 
-def book_summaries(conn: duckdb.DuckDBPyConnection, settings: Settings) -> tuple[BookSummary, ...]:
+def book_summaries(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, *, now: datetime
+) -> tuple[BookSummary, ...]:
     """The one-row-per-book summary (module docstring), every book with a window
     in token order; empty before the first `paper start` and on a store with no
     journal. A journal too old to read raises `SchemaVersionError` (its message
-    names the fix). Reads only, like `page_data`."""
+    names the fix). Reads only, like `page_data`. `now` is the caller's clock
+    (#2655): each open book's next rebalance is the first after it."""
+    now = ensure_tz_aware_utc(now, field_name="now")
     try:
         books = book_ids(conn)
     except JournalNotInitialised:
         return ()
-    summaries = (_summary(conn, settings, book) for book in books)
+    summaries = (_summary(conn, settings, book, now) for book in books)
     return tuple(summary for summary in summaries if summary is not None)
 
 
@@ -1202,8 +1216,9 @@ def _capped_fills(
 
 _BENCHMARK_SYMBOL = "SPY"
 
-#: `paper report` needs two rebalance sessions to compare (`NothingToCompareYet`, #1923).
-_REPORT_MIN_REBALANCES = 2
+#: `paper report` needs three rebalance sessions (two period returns) to compare
+#: (`NothingToCompareYet`, #1923, #2468); a test pins this to `report`'s own floor.
+_REPORT_MIN_REBALANCES = 3
 
 #: `paper report`'s own search bound for "last completed T" (`report._REBALANCE_SEARCH`).
 _REPORT_SEARCH = timedelta(days=62)
@@ -1376,7 +1391,11 @@ def _trial_line(
 
 
 def performance_data(
-    conn: duckdb.DuckDBPyConnection, settings: Settings, book_id: str | None = None
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    book_id: str | None = None,
+    *,
+    now: datetime,
 ) -> PerformanceData | None:
     """The per-book performance card's data (plan T251, paper spec amendment
     2026-10-20): the window's equity from B, daily P&L, SPY total return at the
@@ -1388,7 +1407,7 @@ def performance_data(
     back as flags on the result (as `page_data` does). A missing SPY identity or
     bar is `benchmark_error`, not a raise; `UnreadableMarkError` from an unreadable
     mark propagates, for the shell's unreadable panel."""
-    header = page_data(conn, settings, book_id)
+    header = page_data(conn, settings, book_id, now=now)
     if header.journal_not_initialised or header.journal_outdated is not None:
         return PerformanceData(
             book_id=header.book_id,
@@ -1524,8 +1543,9 @@ def _waiting_report(
     second: date | None = None
     if not has_report and count is not None and count >= _REPORT_MIN_REBALANCES:
         first = window.first_rebalance_session
-        sessions = rebalance_sessions(first, first + _REPORT_SEARCH, window_cadence(conn, window))
-        second = sessions[1]
+        span = _REPORT_SEARCH * _REPORT_MIN_REBALANCES
+        sessions = rebalance_sessions(first, first + span, window_cadence(conn, window))
+        second = sessions[_REPORT_MIN_REBALANCES - 1]
     return waiting.ReportFacts(
         tracking_count=count,
         has_report=has_report,
