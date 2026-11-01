@@ -84,14 +84,62 @@ def test_unset_archive_refused_where_one_is_required() -> None:
 def test_existing_writable_directory_is_accepted(tmp_path: Path) -> None:
     root = tmp_path / "archive"
     root.mkdir()
-    assert require_archive_root(_settings(root)) == root.resolve()
+    assert require_archive_root(_settings(root)) == root
     assert archive_root(_settings(root)) == root
 
 
-def test_home_relative_path_is_expanded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("value", ["~/archive", "~"])
+def test_home_relative_path_refused(
+    value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`~` is not expanded: the expanded path would differ from the redacted literal,
+    so an error naming it would leak the account name (#2746 safety review)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / "archive").mkdir()
-    assert require_archive_root(_settings("~/archive")) == (tmp_path / "archive").resolve()
+    with pytest.raises(RawArchiveUnavailableError, match="absolute"):
+        require_archive_root(_settings(value))
+
+
+def test_symlinked_root_refused(tmp_path: Path) -> None:
+    """A root that resolves elsewhere is refused: only the literal value is redacted,
+    and the resolved path carries the account name."""
+    target = tmp_path / "jdoe-real"
+    target.mkdir()
+    link = tmp_path / "archive-link"
+    link.symlink_to(target)
+    with pytest.raises(RawArchiveUnavailableError, match="resolved") as excinfo:
+        require_archive_root(_settings(link))
+    _assert_hidden(str(excinfo.value), target)
+    _assert_hidden(str(excinfo.value), link)
+
+
+@pytest.mark.parametrize("suffix", ["/", "/.", "/../archive", "//"])
+def test_unnormalised_root_refused(suffix: str, tmp_path: Path) -> None:
+    """A trailing slash, `.` or `..` makes the used path differ from the literal."""
+    (tmp_path / "archive").mkdir()
+    with pytest.raises(RawArchiveUnavailableError, match="resolved"):
+        require_archive_root(_settings(f"{tmp_path / 'archive'}{suffix}"))
+
+
+@pytest.mark.parametrize("value", ["/", "/tmp"])
+def test_too_short_root_refused(value: str) -> None:
+    """A root of fewer than two parts below `/` would make every scrubber redact
+    every `/` in stored text."""
+    with pytest.raises(RawArchiveUnavailableError, match="too short"):
+        require_archive_root(_settings(value))
+
+
+def test_returned_root_is_the_redacted_literal(tmp_path: Path) -> None:
+    """What callers write under (and may name in an `OSError`) is exactly the string
+    `secret_values` redacts."""
+    from tradepartner.config import clean_message, secret_values
+
+    root = tmp_path / "archive"
+    root.mkdir()
+    settings = _settings(root)
+    used = require_archive_root(settings)
+    assert str(used) in secret_values(settings)
+    assert str(used) not in clean_message(f"[Errno 28] No space left: '{used}/ab/cd'", settings)
 
 
 def test_missing_path_refused_without_naming_it(tmp_path: Path) -> None:

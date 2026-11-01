@@ -7,9 +7,10 @@ helper to call:
 - **Path** (spec amendment #2714 item 2). The root is `TRADEPARTNER_RAW_ARCHIVE`,
   held in `.env` only, never a committed path or account name. Unset or blank
   means the archive is off (`archive_root` returns `None`). Where an archive is
-  needed, `require_archive_root` refuses an unset, relative, missing, non-directory
-  or unwritable root. It never creates the directory, so a typo cannot start a
-  second archive.
+  needed, `require_archive_root` refuses an unset, relative, too short, unresolved
+  (`~`, symlink, `.`, `..`, trailing slash), missing, non-directory or unwritable
+  root. It never creates the directory, so a typo cannot start a second archive.
+  T347 and T348 call it where retention needs the archive.
 - **Floor** (ADR 0028 Upload; amendment item 3). `check_archive_write` refuses a
   write that would leave less than `raw_archive.min_free_disk_gb` free on the
   archive's disk, counting the file's own size: free bytes minus the file's bytes
@@ -34,6 +35,9 @@ from tradepartner.config import Settings
 ARCHIVE_ENV_NAME = "TRADEPARTNER_RAW_ARCHIVE"
 #: The config key that holds the write floor.
 FLOOR_KEY = "raw_archive.min_free_disk_gb"
+#: The fewest parts below `/` a root may have: a root of `/` or `/Users` would make
+#: every scrubber redact every such prefix in stored text.
+MIN_ROOT_PARTS = 2
 
 
 class RawArchiveUnavailableError(RuntimeError):
@@ -45,30 +49,51 @@ class RawArchiveFloorError(RuntimeError):
 
 
 def archive_root(settings: Settings) -> Path | None:
-    """The configured archive root (with `~` expanded), or `None` when it is unset or
-    blank: the archive is off. Reads the setting only; it does not touch the disk."""
+    """The configured archive root exactly as set (stripped, `~` not expanded), or
+    `None` when it is unset or blank: the archive is off. Reads the setting only; it
+    does not touch the disk."""
+    text = _archive_text(settings)
+    return None if text is None else Path(text)
+
+
+def _archive_text(settings: Settings) -> str | None:
+    """The stripped setting, as `config.secret_values` holds it, or `None` if blank."""
     secret = settings.tradepartner_raw_archive
     if secret is None:
         return None
-    text = secret.get_secret_value().strip()
-    if not text:
-        return None
-    return Path(text).expanduser()
+    return secret.get_secret_value().strip() or None
 
 
 def require_archive_root(settings: Settings) -> Path:
-    """The archive root, resolved, once it is checked to be an existing, writable
-    directory given as an absolute path. Raises `RawArchiveUnavailableError`
-    otherwise; the message names `TRADEPARTNER_RAW_ARCHIVE`, never the path."""
-    root = archive_root(settings)
-    if root is None:
+    """The archive root once it is checked to be an existing, writable directory.
+    Raises `RawArchiveUnavailableError` otherwise; the message names
+    `TRADEPARTNER_RAW_ARCHIVE`, never the path.
+
+    The value must already be its own resolved, absolute form: no `~`, no symlink,
+    no `.`, `..` or trailing slash, and at least `MIN_ROOT_PARTS` parts below `/`.
+    So the returned path, and any `OSError` text naming a file under it, is the very
+    string `config.secret_values` redacts; an expanded or resolved form would carry
+    the account name past every scrubber (#2746 safety review)."""
+    text = _archive_text(settings)
+    if text is None:
         raise RawArchiveUnavailableError(f"raw archive is off: {ARCHIVE_ENV_NAME} is not set")
+    root = Path(text)
     if not root.is_absolute():
         raise RawArchiveUnavailableError(
             f"{ARCHIVE_ENV_NAME} must be an absolute path (a relative one follows the "
             "working directory)"
         )
+    if len(root.parts) - 1 < MIN_ROOT_PARTS:
+        raise RawArchiveUnavailableError(
+            f"{ARCHIVE_ENV_NAME} is too short: name a directory at least "
+            f"{MIN_ROOT_PARTS} levels below /"
+        )
     try:
+        if str(root.resolve()) != text:
+            raise RawArchiveUnavailableError(
+                f"{ARCHIVE_ENV_NAME} must be written as its resolved path (no symlink, "
+                "`.`, `..` or trailing slash)"
+            )
         is_dir = root.is_dir()
         exists = is_dir or root.exists()
     except OSError as exc:
@@ -85,7 +110,7 @@ def require_archive_root(settings: Settings) -> Path:
         raise RawArchiveUnavailableError(
             f"{ARCHIVE_ENV_NAME} names a directory that is not writable"
         )
-    return root.resolve()
+    return root
 
 
 def check_archive_write(settings: Settings, root: Path, size_bytes: int) -> None:
