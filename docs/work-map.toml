@@ -221,6 +221,11 @@ what = "The planning conversation's findings and open questions, graded by evide
 why = "Source of the G1 to G8 research questions and the Phase 1 decisions."
 unblocks = ["phase:1"]
 
+[research.2026-10-31-icloud-status-probe]
+what = "Pins the iCloud upload, eviction and download status probe for the raw archive (T354)."
+why = "T346 needs a reliable upload signal and a bounded wait before it evicts anything."
+unblocks = ["task:T346"]
+
 [research.2026-09-24-tooling-survey]
 what = "Raw GitHub numbers on candidate backtesting and data libraries."
 why = "Input to the tooling decision record."
