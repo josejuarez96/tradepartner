@@ -491,3 +491,29 @@ def test_a_vanished_backup_source_is_reported_not_fatal(
     monkeypatch.setattr(raw_archive_migrate, "_listing", listing)
     result = rig.run()
     assert result.backup_states["stamps/v1/0002.json"] == "changed"
+
+
+@pytest.mark.parametrize("step", ["backup_intent", "backup_copy"])
+def test_a_backup_only_run_cut_before_its_settle_still_writes_the_manifest(
+    rig: Rig, step: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fired: list[str] = []
+
+    def stop(name: str) -> None:
+        if name == step and not fired:
+            fired.append(name)
+            raise Boom
+
+    monkeypatch.setattr(raw_archive_migrate, "_step", stop)
+    clean = tmp_rig = Rig(rig.cache.parent / "clean")
+    clean.put("stamps/v1/0001.json", b"stamp")
+    for p in [rig.cache / DEAD, rig.cache / "corpus", rig.cache / "bulk"]:
+        import shutil
+
+        shutil.rmtree(p)
+    with pytest.raises(Boom):
+        rig.run()
+    monkeypatch.setattr(raw_archive_migrate, "_step", lambda _n: None)
+    result = rig.run()
+    assert result.manifest_sha256 == tmp_rig.run().manifest_sha256 != ""
+    assert result.backup_states == {"stamps/v1/0001.json": "evicted"}

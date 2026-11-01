@@ -393,7 +393,9 @@ def _manifest_body(
     return json.dumps(doc, sort_keys=True).encode()
 
 
-def _backup_one(settings: Settings, journal: Path, path: str, source: Path) -> dict[str, Any]:
+def _backup_one(
+    settings: Settings, journal: Path, path: str, source: Path, prior: set[tuple[str, str]]
+) -> dict[str, Any]:
     """Copy one backup file into the archive; the settled record (module docstring:
     Backups). A source that is gone, or still changing after one retry, is `changed`."""
     for _attempt in range(2):
@@ -402,8 +404,12 @@ def _backup_one(settings: Settings, journal: Path, path: str, source: Path) -> d
         except FileNotFoundError:
             break
         sha = hashlib.sha256(body).hexdigest()
-        fresh = not is_archived(settings, sha)
-        _append(journal, {"op": "bintent", "path": path, "sha256": sha, "bytes": len(body)})
+        # new: this run wrote the body (also when a cut run already did, see `prior`)
+        fresh = (path, sha) in prior or not is_archived(settings, sha)
+        _append(
+            journal,
+            {"op": "bintent", "path": path, "sha256": sha, "bytes": len(body), "new": fresh},
+        )
         _step("backup_intent")
         if fresh:
             archive_body(settings, body)  # the floor error stops the run, resumable
@@ -421,11 +427,13 @@ def _backup_phase(
     settings: Settings, cache_dir: Path, journal: Path, backups: list[PlannedFile]
 ) -> dict[str, dict[str, Any]]:
     """Copy every backup file the journal has not settled yet; return all settled."""
-    done = {r["path"]: r for r in _read_lines(journal) if r["op"] == "bsettled"}
+    records = _read_lines(journal)
+    done = {r["path"]: r for r in records if r["op"] == "bsettled"}
+    prior = {(r["path"], r["sha256"]) for r in records if r["op"] == "bintent" and r["new"]}
     for planned in backups:
         if planned.path in done:
             continue
-        record = _backup_one(settings, journal, planned.path, cache_dir / planned.path)
+        record = _backup_one(settings, journal, planned.path, cache_dir / planned.path, prior)
         record = {"op": "bsettled", "path": planned.path, **record}
         _append(journal, record)
         done[planned.path] = record
