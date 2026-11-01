@@ -18,8 +18,9 @@ here is this module's and is stated once:
   `backfill`, `import`), per source
   (`ingest.SOURCES` first, then any other source in the table,
   alphabetically): the finish time and cursor of the last `ok` run,
-  and the status, start and message of the latest run of any status. A source
-  that never ran shows `None`s. A maintenance or repair mode (`retract`,
+  and the status, start and message of the latest run of any status (rows
+  sharing the latest start time are one run, summed up by `_latest_line`;
+  #2728). A source that never ran shows `None`s. A maintenance or repair mode (`retract`,
   `actions`, `holes`, `repair`, `action_retract`, or any mode added later) is
   not an ingest and is left out, so it never hides the latest ingest's status.
 - **Coverage** (`coverage`): the population of ingest's staleness check
@@ -2819,19 +2820,36 @@ def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestSt
     for source in (*SOURCES, *extra):
         rows = by_source.get(source, [])
         ok_rows = [r for r in rows if r[1] == OK and r[3] is not None]
-        last_ok = max(ok_rows, key=lambda r: r[3], default=None)
+        last_ok = max(ok_rows, key=lambda r: (r[3], r[4] or ""), default=None)
         latest = rows[-1] if rows else None
+        status, message = (None, None) if latest is None else _latest_line(rows)
         out.append(
             IngestStatus(
                 source=source,
                 last_ok_finished_at=None if last_ok is None else last_ok[3],
                 last_ok_cursor=None if last_ok is None else last_ok[4],
-                latest_status=None if latest is None else latest[1],
+                latest_status=status,
                 latest_started_at=None if latest is None else latest[2],
-                latest_message=None if latest is None else latest[5],
+                latest_message=message,
             )
         )
     return tuple(out)
+
+
+def _latest_line(rows: list[tuple[Any, ...]]) -> tuple[str, str | None]:
+    """The latest run's status and message. One run can write several rows at one start
+    time (the Form 4 bulk backfill writes one per quarter, #2728): those are summed up in
+    cursor order, `ok` only when every row is, so no row is picked by its random run id."""
+    latest = rows[-1]
+    tied = sorted((r for r in rows if r[2] == latest[2]), key=lambda r: r[4] or "")
+    if len(tied) == 1:
+        return latest[1], latest[5]
+    not_ok = [r for r in tied if r[1] != OK]
+    status = OK if not not_ok else not_ok[0][1] if len({r[1] for r in not_ok}) == 1 else "mixed"
+    message = f"{len(tied)} rows ({tied[0][4]} to {tied[-1][4]}): {len(tied) - len(not_ok)} ok"
+    if not_ok:
+        message += "; not ok: " + ", ".join(f"{r[4]} {r[1]}" for r in not_ok)
+    return status, message
 
 
 def _current_from(listings: pl.DataFrame, session: date) -> dict[str, dict[str, Any]]:
