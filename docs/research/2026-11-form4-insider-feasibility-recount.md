@@ -94,7 +94,7 @@ The weakest link is that estimate. #2720's own step 1 counts the corrected acces
 - **The study is INSUFFICIENT under its own feasibility gate.** This note is the result. The B7 summary row, the B7 item and the B7 ladder-ledger row in the [hypothesis backlog](hypothesis-backlog.md) are updated in the same PR (class B).
 - **T332 to T341 and T344 are struck, not built** (plan amendment). This PR does not edit the plan file, because the T342 line names only this note and the B7 row. A follow-up class-B plan PR strikes them; the fold does not.
 - **Family N under research-registry req 9.** The frozen table says "Count **N +2** ... even if a run fails or is refused". No run was opened, so N has not moved. The plan asks this note to state whether the owner charges the +2. **The +2 is not charged.** **Owner's word, 2026-10-31: "Go with recs"** (on PR #2734's five questions): no run was opened and no return was read, and family N counts looks at returns.
-- **Ledger decision: `retired`** (owner's word, as above). The 2016 to 2023 window is fully loaded, so no further data can rescue the $200M floor. The B7 summary row, item and ladder-ledger row say so.
+- **Ledger decision: `retired`** (owner's word, as above). the 2016 to 2023 window is loaded except about 186 Form 4 accessions (mostly 2020q2 and 2020q3), which cannot move 47 to 400, so no further data can rescue the $200M floor. The B7 summary row, item and ladder-ledger row say so.
 - **`TP-9`** is added to [claims.toml](claims.toml). Ladder rule L5 and [research-program](../ways-of-working/research-program.md) step 6 record a ladder verdict or retirement as a `TP-` claim.
 - The search-limit tally already counts B7 as candidate 3, with its registered event study counted with it. That does not change.
 
@@ -103,7 +103,7 @@ The weakest link is that estimate. #2720's own step 1 counts the corrected acces
 **Owner's word, 2026-10-31: "Go with recs"** (on PR #2734's five questions). The five questions this note first left open are now answered:
 
 1. **N +2:** not charged. No run was opened and no return was read, and family N counts looks at returns.
-2. **Ledger decision:** `retired`. The 2016 to 2023 window is fully loaded, so no further data can rescue the floor.
+2. **Ledger decision:** `retired`. the 2016 to 2023 window is loaded except about 186 Form 4 accessions (mostly 2020q2 and 2020q3), which cannot move 47 to 400, so no further data can rescue the floor.
 3. **T332 to T341 and T344:** a follow-up class-B plan PR strikes them. This PR does not, and neither does the fold.
 4. **`TP-` claim:** L5 requires one for a retirement. It is `TP-9`.
 5. **Queries:** the script is committed byte for byte in the [appendix file](2026-11-form4-insider-feasibility-recount-appendix.md). The original's sha256 is `9dcb98de00428c2e6c22c47214a1222238186d16ec4868abaee5c746fef13c15`, and the fenced block reproduces it.
