@@ -3600,3 +3600,41 @@ def test_env_example_names_the_raw_archive_with_an_empty_value() -> None:
     assert lines == ["TRADEPARTNER_RAW_ARCHIVE="]
     text = env_example.read_text(encoding="utf-8")
     assert "Mobile Documents" not in text and "CloudDocs" not in text
+
+
+# --- T346 (#2751): the raw archive's bounded iCloud waits (ADR 0028 Upload, Disk) ---
+
+
+def test_raw_archive_wait_defaults_follow_the_t354_probe() -> None:
+    """T354 measured 20 MB uploaded in 11 s and 200 MB in 41 s: the bounded wait is
+    max(300 s, 0.2 s per MB), polled every 5 s (docs/research/2026-10-31-icloud-
+    status-probe.md)."""
+    a = _settings().raw_archive
+    assert a.upload_wait_min_s == 300.0
+    assert a.download_wait_min_s == 300.0
+    assert a.transfer_wait_s_per_mb == 0.2
+    assert a.poll_interval_s == 5.0
+    assert a.command_timeout_s == 60.0
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "upload_wait_min_s",
+        "download_wait_min_s",
+        "poll_interval_s",
+        "command_timeout_s",
+    ],
+)
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf")])
+def test_raw_archive_waits_must_be_positive_and_finite(key: str, bad: float) -> None:
+    """A zero wait would never confirm an upload (nothing evicted, safe but silent);
+    an infinite one is not bounded. Both are refused."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, raw_archive={key: bad})
+
+
+@pytest.mark.parametrize("bad", [-0.1, float("nan"), float("inf")])
+def test_raw_archive_per_mb_wait_is_finite_and_not_negative(bad: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, raw_archive={"transfer_wait_s_per_mb": bad})

@@ -1134,9 +1134,23 @@ class RawArchiveConfig(_ClosedConfig):
     The archive's path is not here: it is the top-level `TRADEPARTNER_RAW_ARCHIVE`
     (`Settings.tradepartner_raw_archive`), held in `.env` only. Not frozen, part of
     no hypothesis.
+
+    The iCloud waits (plan T346, #2751) bound how long `store.raw_archive` polls
+    for a confirmed upload before an eviction and for local copies before a
+    re-derive. Each wait is `max(<kind>_wait_min_s, transfer_wait_s_per_mb x MB)`
+    over the bytes awaited; T354 measured 20 MB uploaded in 11 s and 200 MB in
+    41 s. On an upload timeout the file stays local, counted against the floor
+    and reported pending; on a download timeout the re-derive refuses to start.
+    `poll_interval_s` spaces the status polls and `command_timeout_s` caps each
+    `osascript` or `brctl` call.
     """
 
     min_free_disk_gb: float = Field(default=10.0, gt=0)
+    upload_wait_min_s: float = Field(default=300.0, gt=0)
+    download_wait_min_s: float = Field(default=300.0, gt=0)
+    transfer_wait_s_per_mb: float = Field(default=0.2, ge=0)
+    poll_interval_s: float = Field(default=5.0, gt=0)
+    command_timeout_s: float = Field(default=60.0, gt=0)
 
 
 class Settings(BaseSettings):
