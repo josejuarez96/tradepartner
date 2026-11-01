@@ -717,3 +717,16 @@ def test_an_index_line_with_no_path_is_skipped_by_restore(rig: Rig) -> None:
     rig.append_index({"op": "moved"})
     rig.append_index({"op": "restored"})
     assert set(_restore(rig, B_REL).restored) == {B_REL}
+
+
+def test_the_restore_command_says_when_nothing_is_left(rig: Rig) -> None:
+    from tradepartner.store import archive_cmd
+
+    rig.icloud = RestoreICloud()
+    rig.run()
+    _restore(rig, "corpus/departure-reason")
+    settings = rig.settings.model_copy(
+        update={"edgar": rig.settings.edgar.model_copy(update={"cache_dir": str(rig.cache)})}
+    )
+    lines = archive_cmd.restore(settings, rig.icloud, path="corpus/departure-reason", run=None)
+    assert lines and "nothing left to restore" in lines[0]
