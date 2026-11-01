@@ -2049,7 +2049,10 @@ def _for_book(book: str | None) -> str:
 
 
 def _status_lines(
-    data: ops.OpsData, book: str | None = None, fill_slippage: paper_slippage.Slippage | None = None
+    data: ops.OpsData,
+    book: str | None = None,
+    fill_slippage: paper_slippage.Slippage | None = None,
+    short_values: tuple[float | None, float] | None = None,
 ) -> list[str]:
     """`paper status`: the operations page's numbers (spec req 12), one per line."""
     if data.journal_outdated is not None:
@@ -2066,6 +2069,15 @@ def _status_lines(
         + ("; STALE: no run for S-1" if data.stale else ""),
         f"positions {data.positions_count} (value {data.positions_value:.2f}); open orders "
         f"{data.open_orders_count}; targets {data.targets_count}",
+        *(
+            [
+                "short value: broker "
+                + ("n/a" if short_values[0] is None else f"{short_values[0]:.2f}")
+                + f"; ledger {short_values[1]:.2f}"
+            ]
+            if short_values is not None
+            else []
+        ),
         *([_FILLS_NOTE] if data.open_orders_count and data.last_run_kind == "rebalance" else []),
         f"kill switch {switch_text} (causes: {causes})",
         "reconciliation "
@@ -5396,6 +5408,11 @@ def make_app(
                 for t in result.targets.rows
             ),
             *paper_slippage.slippage_report_lines(result.slippage, result.slippage_note),
+            *(
+                f"  {m.rebalance_session}: {m.short_report_line}"
+                for m in comparison.periods
+                if m.short_report_line is not None
+            ),
             *([f"paper report: {result.window_note}"] if result.window_note else []),
         ]
         for line in lines:
@@ -5571,7 +5588,35 @@ def make_app(
                 )
 
         data, fill_slippage = _paper_call(s, read)
-        for line in _status_lines(data, chosen, fill_slippage):
+
+        def short_values() -> tuple[float | None, float] | None:
+            if data.window is None or data.journal_outdated is not None:
+                return None
+            try:
+                frozen = json.loads(data.window.frozen_json)
+            except json.JSONDecodeError:
+                return None  # pre-existing long status remains readable
+            if not isinstance(frozen, dict):
+                return None
+            if frozen.get("portfolio.side", "long_only") != "long_short":
+                return None
+            assert data.window.window_id is not None
+            with open_read_only(s) as conn:
+                rows = journal.positions_daily_for(conn, data.window.window_id)
+            last_session = max((r.session for r in rows), default=None)
+            ledger_value = -sum(
+                r.value or 0.0
+                for r in rows
+                if r.session == last_session and r.position_side == "short"
+            )
+            try:
+                broker_value = broker(s, clock, data.book_id).account().short_market_value
+            except Exception:
+                broker_value = None  # diagnostics still print when the broker is unavailable
+            return broker_value, ledger_value
+
+        values = _paper_call(s, short_values)
+        for line in _status_lines(data, chosen, fill_slippage, values):
             _echo_scrubbed(line, s)
         if data.journal_outdated is not None:
             raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
