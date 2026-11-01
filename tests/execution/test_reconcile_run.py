@@ -247,6 +247,29 @@ def _spinoff(
     )
 
 
+def _allocation(
+    settings: Settings,
+    parent: str,
+    child: str,
+    fraction: float,
+    known_at: datetime,
+    ex_date: date = S,
+) -> None:
+    """An owner-entered `spinoff_allocations` row (T254), stamped `known_at`."""
+    _fact(
+        settings,
+        "spinoff_allocations",
+        parent_security_id=parent,
+        child_security_id=child,
+        ex_date=ex_date,
+        basis_allocation=fraction,
+        known_at=known_at,
+        ingested_at=known_at,
+        source="owner",
+        provenance="owner",
+    )
+
+
 def _delisting(settings: Settings, security_id: str, filed_at: datetime) -> None:
     _fact(
         settings,
@@ -1536,6 +1559,88 @@ def test_a_broker_booked_spinoff_child_journals_a_spinoff_receipt(
         4.0,
         None,
     )
+
+
+def _receipt_terms(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    *,
+    allocations: Sequence[tuple[float, datetime]],
+) -> dict[str, Any]:
+    """Reconcile the 4.0 `MTUM` child of 10 `SPY` on S2 and return the receipt's
+    parsed `explanation_json`."""
+    fake.activities = [FUNDING]
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _spinoff(journal_settings, MTUM, SPY, 0.4, STAMP, ex_date=EX)
+    for fraction, known_at in allocations:
+        _allocation(journal_settings, SPY, MTUM, fraction, known_at, ex_date=EX)
+    fake.extra_quantity = {"MTUM": 4.0}
+    fixed_clock.advance(days=1)
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+
+    assert result.status == OK
+    (adjustment,) = _adjustments(journal_settings, open_window)
+    assert adjustment.kind == "spinoff_receipt"
+    assert adjustment.explanation_json is not None
+    terms: dict[str, Any] = json.loads(adjustment.explanation_json)
+    return terms
+
+
+def test_a_spinoff_receipt_is_journaled_with_its_parent_and_a_stored_allocation(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """T255 (#1976 item 2): the receipt names the parent, the ex-date and the
+    fraction stored at close(S2-1); a later Form 8937 revision is not read."""
+    terms = _receipt_terms(
+        journal_settings,
+        fake,
+        open_window,
+        fixed_clock,
+        allocations=[(0.15, STAMP - timedelta(days=1)), (0.2, STAMP)],
+    )
+
+    assert terms["parent_security_id"] == SPY
+    assert terms["ex_date"] == EX.isoformat()
+    assert terms["basis_allocation"] == 0.2
+    assert terms["explanation"] == f"spin-off child of {SPY}"
+
+
+def test_a_spinoff_receipt_without_a_stored_allocation_names_the_parent_alone(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    terms = _receipt_terms(journal_settings, fake, open_window, fixed_clock, allocations=[])
+
+    assert terms["parent_security_id"] == SPY
+    assert "basis_allocation" not in terms
+
+
+def test_an_allocation_known_after_the_cutoff_is_not_applied(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """No look-ahead: a fraction stamped a minute after close(S2-1) is invisible
+    to the receipt journaled on S2; the receipt keeps zero basis."""
+    terms = _receipt_terms(
+        journal_settings,
+        fake,
+        open_window,
+        fixed_clock,
+        allocations=[(0.2, STAMP + timedelta(minutes=1))],
+    )
+
+    assert terms["parent_security_id"] == SPY
+    assert "basis_allocation" not in terms
 
 
 def test_a_wrong_spinoff_ratio_still_halts(
