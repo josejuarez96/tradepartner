@@ -1334,6 +1334,10 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "sec_form4_transactions",
             "snapshot_sightings",
             "delisting_reasons",
+            "filing_index",
+            "filing_index_pending",
+            "edgar_filers",
+            "edgar_index_files",
         }
         assert {table for table in shape_before if shape_after[table] != shape_before[table]} == {
             "listings",
@@ -2390,13 +2394,15 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESEARCH_EXPOSURES_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FILING_INDEX_VERSION + 1
 
 
 def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
     conn = duckdb.connect(":memory:")
     try:
         schema.init_schema(conn)
+        for table in ("filing_index", "filing_index_pending", "edgar_filers", "edgar_index_files"):
+            conn.execute(f"DROP TABLE {table}")
         conn.execute("DROP TABLE research_exposures")
         conn.execute("ALTER TABLE trial_results DROP COLUMN n_exposure")
         conn.execute("DROP TABLE delisting_reasons")
@@ -2407,9 +2413,9 @@ def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
         schema.init_schema(conn)
         assert "snapshot_sightings" in _shape(conn)
         assert max(_versions(conn)) == schema.CURRENT_SCHEMA_VERSION
-        assert _versions(conn) == [41, 42, 43, 44]
+        assert _versions(conn) == [41, 42, 43, 44, 45]
         schema.init_schema(conn)
-        assert _versions(conn) == [41, 42, 43, 44]
+        assert _versions(conn) == [41, 42, 43, 44, 45]
     finally:
         conn.close()
 
@@ -2998,6 +3004,10 @@ def test_version_39_adds_only_spinoff_allocations() -> None:
             "snapshot_sightings",
             "delisting_reasons",
             "research_exposures",
+            "filing_index",
+            "filing_index_pending",
+            "edgar_filers",
+            "edgar_index_files",
         ):
             conn.execute(f"DROP TABLE {table}")
         conn.execute("ALTER TABLE trial_results DROP COLUMN n_exposure")
@@ -3017,6 +3027,10 @@ def test_version_39_adds_only_spinoff_allocations() -> None:
             "snapshot_sightings",
             "delisting_reasons",
             "research_exposures",
+            "filing_index",
+            "filing_index_pending",
+            "edgar_filers",
+            "edgar_index_files",
         }
         assert {name: after[name] for name in before if name != "trial_results"} == {
             name: sql for name, sql in before.items() if name != "trial_results"
@@ -3039,6 +3053,10 @@ def test_read_only_version_38_store_keeps_existing_reads(tmp_path: Path) -> None
         "snapshot_sightings",
         "delisting_reasons",
         "research_exposures",
+        "filing_index",
+        "filing_index_pending",
+        "edgar_filers",
+        "edgar_index_files",
     ):
         conn.execute(f"DROP TABLE {table}")
     conn.execute("ALTER TABLE trial_results DROP COLUMN n_exposure")

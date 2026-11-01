@@ -55,6 +55,16 @@ from tradepartner.store.schema import JOURNAL_TABLE_NAMES
 SRC = Path(__file__).resolve().parents[2] / "src"
 
 
+def test_filing_index_stays_out_of_strategy_and_universe() -> None:
+    """The EDGAR index is an ingest input, never a trial input."""
+    restricted = [SRC / "tradepartner" / "universe.py"]
+    restricted.extend((SRC / "tradepartner" / "backtest").rglob("*.py"))
+    restricted.extend((SRC / "tradepartner" / "signals").rglob("*.py"))
+    for path in restricted:
+        source = path.read_text()
+        assert "filing_index" not in source, path
+
+
 def test_sec_ownership_tables_do_not_reach_trading_or_universe() -> None:
     """Research-only SEC forms cannot enter existing signal or order paths."""
     restricted = [SRC / "tradepartner" / "universe.py"]
