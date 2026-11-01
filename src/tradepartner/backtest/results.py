@@ -59,6 +59,15 @@ regression has no Sharpe). A store without the research tables (one a read-only
 connection opened before version 12) reads the research part as None and N as the
 backtest count; `write_results` refuses such a store before any write, since every
 writing command migrates first.
+
+**Desk-read exposures raise N, never V** (research-registry spec amendment 2026-10-31,
+#2723; backtest spec req 8 as amended by T356). N's third part is
+`store.research.family_exposure_count`: Σ `n_configurations` over the family's
+non-synthetic `store` exposure records that spend no holdout. `family_n_split` returns it
+as `exposures`, `write_results` stores it in `trial_results.n_exposure` and adds it to
+`n_trials`. A desk read stores no Sharpe, so V and the pair Sharpes are unchanged. A
+store without `research_exposures` (a read-only open before schema 44) reads the part as
+None and N without it.
 """
 
 from __future__ import annotations
@@ -136,40 +145,51 @@ CADENCE_KEY = "schedule.rebalance_cadence"
 
 @dataclass(frozen=True)
 class FamilyN:
-    """A family's N in its two parts: `trials`, the counted backtest trials, and
-    `research`, `family_run_count` (None on a store without the research registry)."""
+    """A family's N in its three parts: `trials`, the counted backtest trials;
+    `research`, `family_run_count` (None on a store without the research registry);
+    and `exposures`, `family_exposure_count` (None on a store without
+    `research_exposures`)."""
 
     trials: int
     research: int | None
+    exposures: int | None = None
 
     @property
     def total(self) -> int:
-        """N: the backtest trials plus the research runs' configurations."""
-        return self.trials + (self.research or 0)
+        """N: the backtest trials plus the research runs' and the exposures'
+        configurations."""
+        return self.trials + (self.research or 0) + (self.exposures or 0)
 
 
 @dataclass(frozen=True)
 class _StatisticsWithResearch(ResultStatistics):
     """`ResultStatistics` plus `trial_results.n_research` (research-registry spec req
-    9): `registry.write_result` writes every field of the statistics it is given."""
+    9) and `trial_results.n_exposure` (its amendment 2026-10-31, #2723):
+    `registry.write_result` writes every field of the statistics it is given."""
 
     n_research: int | None = None
+    n_exposure: int | None = None
 
 
 def family_n_split(
     conn: duckdb.DuckDBPyConnection, family: str, *, pending: TrialHandle | None = None
 ) -> FamilyN:
-    """`family`'s N in its two parts (module docstring, "Research runs raise N"):
+    """`family`'s N in its three parts (module docstring, "Research runs raise N"):
     its `ok`, non-synthetic, in-sample trials, reruns and every variant's included
     (backtest spec req 8; strategy-lab spec req 3), with `pending` counted as
-    `registry.family_sharpes` does; and `research.family_run_count`, None when the
-    store has no research tables."""
+    `registry.family_sharpes` does; `research.family_run_count`, None when the
+    store has no research tables; and `research.family_exposure_count`, None when
+    it has no `research_exposures` table."""
     trials = registry.count_counted_trials(conn, family, pending)
     try:
         runs: int | None = research.family_run_count(conn, family)
     except schema.ResearchNotInitialised:
         runs = None
-    return FamilyN(trials=trials, research=runs)
+    try:
+        exposures: int | None = research.family_exposure_count(conn, family)
+    except schema.ResearchNotInitialised:  # `ExposuresNotInitialised` is a subclass
+        exposures = None
+    return FamilyN(trials=trials, research=runs, exposures=exposures)
 
 
 def family_n(
@@ -625,5 +645,7 @@ def write_results(
         base_metrics, base.rebalances, family, params, n_trials=n.total, cadence=cadence
     )
     return registry.write_result(
-        conn, handle, _StatisticsWithResearch(**asdict(stats), n_research=n.research)
+        conn,
+        handle,
+        _StatisticsWithResearch(**asdict(stats), n_research=n.research, n_exposure=n.exposures),
     )
