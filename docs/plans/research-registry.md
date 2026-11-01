@@ -81,7 +81,7 @@ Lanes: T302 lands first (it owns the shared `__init__.py` files); T300 and T301 
 | view | T83c | T81 merged; beside T83 |
 | study | T302 → (T300, T301) → T303 → T304 | the spec amendment of 2026-10-28 (#2440) is accepted and its open questions answered |
 | exposure | T355 → T356 → (T357, T358); T357 → T359 | the 2026-10-31 (#2723) amendment merges; T355 lands after schema versions 41 to 43 |
-| form4-study | T343 + T308 → T342 (PASS) → (T332, T333, T334, T336); (T332, T333, T334) → T335; (T334, T336) → T337 → T344; T333 → (T338, T339); (T335, T338) → T340; (T344, T339, T340) → T341 | this amendment merges; nothing past T342 starts unless it passes |
+| form4-study | T343 + T308 → T342 (FAIL 2026-10-31, #2734); the rest struck (#2736) | this amendment merges; nothing past T342 starts unless it passes |
 
 ## Verification
 
