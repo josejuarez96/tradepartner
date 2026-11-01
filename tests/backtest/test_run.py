@@ -760,6 +760,7 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
                 "master.chain_max_price_ratio",
                 "adjust.apply_spin_offs",
                 "strategy.hold_top_fraction",
+                "backtest.delisting_failure_return",
                 "portfolio.",
                 "costs.borrow",
             )
@@ -877,6 +878,7 @@ def _register_more(
             "master.chain_max_price_ratio",
             "adjust.apply_spin_offs",
             "strategy.hold_top_fraction",
+            "backtest.delisting_failure_return",
             "portfolio.",
             "costs.borrow",
         )

@@ -114,6 +114,10 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # 0.0 and [] no stored canonical set or fingerprint moves.
     ("costs.borrow_bps_per_year", 0.0, 34),
     ("costs.borrow_sensitivity_bps", [], 34),
+    # T328a: the delisting failure-return policy (data-foundation spec amendment #2670,
+    # req 2). A post-registration key (`POST_REGISTRATION_BACKTEST_KEYS`): at `none` no
+    # stored canonical set or fingerprint moves; another value is a new fingerprint.
+    ("backtest.delisting_failure_return", "none", 45),
 )
 
 #: Keys added to a family's own listed section **after** that family's first
@@ -154,6 +158,15 @@ POST_REGISTRATION_COST_KEYS: Final[frozenset[str]] = frozenset(
 #: T211c: the opt-in `adjust.apply_spin_offs` (backtest spec amendment #1894). A
 #: post-registration key like `POST_REGISTRATION_COST_KEYS`, not in its own section.
 POST_REGISTRATION_ADJUST_KEYS: Final[frozenset[str]] = frozenset({"adjust.apply_spin_offs"})
+
+#: T328a: the delisting failure-return policy (data-foundation spec amendment #2670,
+#: req 2). Post-registration like `POST_REGISTRATION_ADJUST_KEYS`: not required of a file
+#: or a fixed block, frozen at `none` when absent, never from live `Settings`, a
+#: fingerprint key outside the promotion identity. Pinned by value in
+#: `tests/backtest/test_frozen_defaults.py`.
+POST_REGISTRATION_BACKTEST_KEYS: Final[frozenset[str]] = frozenset(
+    {"backtest.delisting_failure_return"}
+)
 
 #: T219: the five `portfolio.*` keys (backtest spec amendment #1872, item 1). A
 #: post-registration set beside `POST_REGISTRATION_COST_KEYS`, for a section listed by no
@@ -275,6 +288,7 @@ _FINGERPRINT_KEYS: Final = (
     "holdout.start",
     "holdout.end",
     "adjust.apply_spin_offs",
+    "backtest.delisting_failure_return",
     "portfolio.side",
     "portfolio.gross_exposure",
     "portfolio.net_exposure",

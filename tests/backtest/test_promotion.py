@@ -918,3 +918,23 @@ def test_a_long_only_file_promotes_as_before(lab: Lab) -> None:
     sweep, variants = _won(lab)
     outcome = lab.promote(lab.promoted_file(sweep, variants[0]))
     assert frozen.frozen_values(outcome.promoted)["portfolio.side"] == "long_only"
+
+
+# --- T328a: the delisting policy key is outside the promotion identity (#2670) ---------
+
+
+@pytest.mark.parametrize("value", ["failure_v1", "severe_v1"])
+def test_the_delisting_policy_does_not_move_the_promotion_identity(value: str) -> None:
+    """Like `adjust.apply_spin_offs`: a fingerprint key, so each grid row is its own
+    hypothesis, but one strategy for promotion."""
+    source = Path(__file__).resolve().parents[1] / "fixtures" / "hypotheses"
+    parsed = hypothesis.parse_file(source / "fixture-momentum.md")
+    params = hypothesis.frozen_params(parsed, Settings(_env_file=None))  # type: ignore[call-arg]
+    moved = {**params, "backtest.delisting_failure_return": value}
+    start = parsed.in_sample_start
+    assert frozen.fingerprint("momentum", moved, start) != frozen.fingerprint(
+        "momentum", params, start
+    )
+    assert promotion.promotion_identity("momentum", moved, start) == (
+        promotion.promotion_identity("momentum", params, start)
+    )
