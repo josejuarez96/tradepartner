@@ -1,13 +1,13 @@
-"""The existing-cache migration runner, move class (plan T361a, #2765; spec
-amendment #2743 items 2, 4 and 7). Everything runs under `tmp_path`, with the disk
-and iCloud faked (`FakeICloud`), so no real archive, cache or store is touched."""
+"""The existing-cache migration runner, move and backup classes (plan T361a, #2765,
+and T361b, #2775; spec amendment #2743 items 2, 3, 4 and 7). Everything runs under `tmp_path`,
+with the disk and iCloud faked (`FakeICloud`), so no real archive, cache or store is touched."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -23,7 +23,7 @@ from tradepartner.store.raw_archive_migrate import (
     MigrationStoppedError,
     apply_migration,
 )
-from tradepartner.store.raw_archive_plan import current_versions
+from tradepartner.store.raw_archive_plan import CacheFile, current_versions
 
 GB = 1_000_000_000
 NOW = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
@@ -134,7 +134,9 @@ def test_move_class_files_move_by_hash_and_the_rest_stays(rig: Rig) -> None:
     manifest = json.loads((rig.root / "manifests" / result.manifest_sha256).read_text())
     by_path = {f["path"]: f for f in manifest["files"]}
     assert by_path[f"{DEAD}/a.json"]["state"] == "evicted"
-    assert by_path["stamps/v1/0001.json"]["state"] == "backup_pending"
+    assert by_path["stamps/v1/0001.json"]["state"] == "evicted"
+    assert by_path["stamps/v1/0001.json"]["sha256"] == _sha(b"stamp")
+    assert by_path["stamps/v1/0001.json"]["class"] == "backup"
     assert manifest["started_at"] == NOW.isoformat()
     assert (rig.cache / "_archived" / "journal-r1.jsonl").exists()
     assert not (rig.cache / "_archived" / "journal.jsonl").exists()
@@ -328,3 +330,190 @@ def test_a_torn_journal_line_does_not_hide_later_records(
     result = rig.run()
     assert len(rig.index()) == 2
     assert result.count("evicted") == 2
+
+
+# ---- backup class (T361b) ----
+
+
+def _manifest(rig: Rig, digest: str) -> dict[str, dict[str, object]]:
+    doc = json.loads((rig.root / "manifests" / digest).read_text())
+    return {f["path"]: f for f in doc["files"]}
+
+
+def test_backups_are_copied_by_hash_confirmed_evicted_and_never_moved(rig: Rig) -> None:
+    rig.put("stamps/v1.restamp-x/m.json", b"manifest")
+    rig.put("stamps/v1.rel.bak", b"bak")
+    before = {k: v for k, v in rig.tree().items() if k.startswith("stamps")}
+    result = rig.run()
+    assert rig.tree().items() >= before.items()  # every backup source is untouched
+    assert result.backup_count("evicted") == 3
+    for data in (b"stamp", b"manifest", b"bak"):
+        assert body_path(rig.root, _sha(data)).exists()
+    assert body_path(rig.root, _sha(b"stamp")) in rig.icloud.evicted
+    by_path = _manifest(rig, result.manifest_sha256)
+    assert {p: f["sha256"] for p, f in by_path.items() if f["class"] == "backup"} == {
+        "stamps/v1/0001.json": _sha(b"stamp"),
+        "stamps/v1.restamp-x/m.json": _sha(b"manifest"),
+        "stamps/v1.rel.bak": _sha(b"bak"),
+    }
+    assert "stamps/v1/0001.json" not in {r["path"] for r in rig.index()}  # not tombstoned
+
+
+def test_identical_backup_bytes_are_stored_once(rig: Rig) -> None:
+    rig.put("stamps/v1/0002.json", b"stamp")
+    result = rig.run()
+    assert result.backup_count("evicted") == 2
+    bodies = [p for p in rig.root.rglob("*") if p.is_file() and p.name == _sha(b"stamp")]
+    assert len(bodies) == 1
+
+
+def test_a_second_apply_after_a_stamps_rewrite_copies_only_the_changed_files(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.put("stamps/v1/0002.json", b"other")
+    first = rig.run()
+    rig.put("stamps/v1/0001.json", b"stamp-rewritten")
+    written: list[int] = []
+    real = raw_archive_migrate.archive_body
+    monkeypatch.setattr(
+        raw_archive_migrate, "archive_body", lambda s, b: (written.append(len(b)), real(s, b))[1]
+    )
+    second = rig.run()
+    assert written == [len(b"stamp-rewritten")]
+    assert second.manifest_sha256 != first.manifest_sha256
+    snap = {p: f["sha256"] for p, f in _manifest(rig, second.manifest_sha256).items()}
+    assert snap["stamps/v1/0001.json"] == _sha(b"stamp-rewritten")
+    assert snap["stamps/v1/0002.json"] == _sha(b"other")  # the full snapshot
+    old = _manifest(rig, first.manifest_sha256)
+    assert old["stamps/v1/0001.json"]["sha256"] == _sha(b"stamp")
+
+
+def test_below_the_floor_a_backup_stops_with_no_partial_file_and_resumes(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _p: 10 * GB + 3)  # room for 3 bytes
+    with pytest.raises(RawArchiveFloorError):
+        rig.run()
+    assert not body_path(rig.root, _sha(b"stamp")).exists()
+    assert not [p for p in rig.root.rglob("*") if p.name.endswith(".tmp.nosync")]
+    assert (rig.cache / "stamps/v1/0001.json").read_bytes() == b"stamp"
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _p: 500 * GB)
+    result = rig.run()
+    assert result.backup_count("evicted") == 1
+    assert body_path(rig.root, _sha(b"stamp")).exists()
+
+
+def test_a_backup_source_rewritten_during_its_copy_is_retried_once_then_reported(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = rig.cache / "stamps/v1/0001.json"
+    count = [0]
+
+    def churn(name: str) -> None:
+        if name == "backup_copy":
+            count[0] += 1
+            path.write_bytes(b"churn-%d" % count[0])
+
+    monkeypatch.setattr(raw_archive_migrate, "_step", churn)
+    result = rig.run()
+    assert count[0] == 2  # one try and one retry
+    assert result.backup_states == {"stamps/v1/0001.json": "changed"}
+
+    flaky = [True]
+
+    def once(name: str) -> None:
+        if name == "backup_copy" and flaky[0]:
+            flaky[0] = False
+            path.write_bytes(b"once")
+
+    monkeypatch.setattr(raw_archive_migrate, "_step", once)
+    rig.put("stamps/v1/0001.json", b"first")
+    again = rig.run()
+    assert again.backup_states == {"stamps/v1/0001.json": "evicted"}
+    assert _sha(b"once") in {p.name for p in rig.root.rglob("*")}
+
+
+def test_an_unconfirmed_backup_upload_stays_pending_and_counted(rig: Rig) -> None:
+    rig.icloud.never_upload = True
+    result = rig.run()
+    assert result.backup_states == {"stamps/v1/0001.json": "pending_upload"}
+    assert result.backup_count("pending_upload") == 1
+    assert body_path(rig.root, _sha(b"stamp")).read_bytes() == b"stamp"
+    assert _manifest(rig, result.manifest_sha256)["stamps/v1/0001.json"]["state"] == (
+        "pending_upload"
+    )
+
+
+@pytest.mark.parametrize(
+    "step", ["backup_intent", "backup_copy", "backup_evict", "manifest", "evict"]
+)
+def test_an_interrupted_backup_run_resumes_to_the_uninterrupted_end_state(
+    tmp_path: Path, step: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rigs = (Rig(tmp_path / "whole"), Rig(tmp_path / "cut"))
+    for r in rigs:
+        r.put(f"{DEAD}/a.json", b"dead-a")
+        r.put("stamps/v1/0001.json", b"stamp")
+        r.put("stamps/v1/0002.json", b"stamp-2")
+    whole, cut = rigs
+    expected = whole.run()
+    fired: list[str] = []
+
+    def stop(name: str) -> None:
+        if name == step and not fired:
+            fired.append(name)
+            raise Boom
+
+    monkeypatch.setattr(raw_archive_migrate, "_step", stop)
+    with pytest.raises(Boom):
+        cut.run()
+    monkeypatch.setattr(raw_archive_migrate, "_step", lambda _n: None)
+    result = cut.run()
+    assert result.manifest_sha256 == expected.manifest_sha256
+    assert result.backup_states == expected.backup_states
+    assert _end_state(cut)[0] == _end_state(whole)[0]
+    assert _end_state(cut)[2] == _end_state(whole)[2]
+    assert len(cut.index()) == 1
+
+
+def test_a_vanished_backup_source_is_reported_not_fatal(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (rig.cache / "stamps/v1/0001.json").unlink()
+    rig.put("stamps/v1/0002.json", b"two")
+    # the planner lists what exists; simulate the file vanishing after planning
+    real = raw_archive_migrate._listing
+
+    def listing(cache: Path) -> Iterator[CacheFile]:
+        yield from real(cache)
+        os.unlink(cache / "stamps/v1/0002.json")
+
+    monkeypatch.setattr(raw_archive_migrate, "_listing", listing)
+    result = rig.run()
+    assert result.backup_states["stamps/v1/0002.json"] == "changed"
+
+
+@pytest.mark.parametrize("step", ["backup_intent", "backup_copy"])
+def test_a_backup_only_run_cut_before_its_settle_still_writes_the_manifest(
+    rig: Rig, step: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fired: list[str] = []
+
+    def stop(name: str) -> None:
+        if name == step and not fired:
+            fired.append(name)
+            raise Boom
+
+    monkeypatch.setattr(raw_archive_migrate, "_step", stop)
+    clean = tmp_rig = Rig(rig.cache.parent / "clean")
+    clean.put("stamps/v1/0001.json", b"stamp")
+    for p in [rig.cache / DEAD, rig.cache / "corpus", rig.cache / "bulk"]:
+        import shutil
+
+        shutil.rmtree(p)
+    with pytest.raises(Boom):
+        rig.run()
+    monkeypatch.setattr(raw_archive_migrate, "_step", lambda _n: None)
+    result = rig.run()
+    assert result.manifest_sha256 == tmp_rig.run().manifest_sha256 != ""
+    assert result.backup_states == {"stamps/v1/0001.json": "evicted"}
