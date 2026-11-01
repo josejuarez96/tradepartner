@@ -317,7 +317,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_NOT_COMPUTABLE_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_SNAPSHOT_SIGHTINGS_VERSION + 1
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -741,8 +741,8 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
     # version 24 (#1506) `borrow_status`, version 28 (#1506, T172b)
     # `symbol_changes`, version 30 (#1713, T189c) `openfigi_types` and
     # version 31 (#821, T187) `successor_chains` and version 35 (#1762, T248c)
-    # `mergers` and version 37 (#2266, T280a) `reconcile_breaks`, all empty; nothing else
-    # gains a table.
+    # `mergers` and version 37 (#2266, T280a) `reconcile_breaks` and version 42
+    # (#2295) `snapshot_sightings`, all empty; nothing else gains a table.
     assert rows_after == {
         **rows_before,
         "filing_events": [],
@@ -756,6 +756,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         "reconcile_breaks": [],
         "sec_filing_events": [],
         "sec_form4_transactions": [],
+        "snapshot_sightings": [],
     }
     # And the migrated store is shaped exactly as a fresh one.
     # (A fresh store gets version 18's and version 20's two kinds before the lab's
@@ -894,7 +895,7 @@ def test_the_migration_from_version_40_widens_the_verdict_check(tmp_path: Path) 
         rebuilt = ("research_results", "research_decisions")
         before = {name: sql for name, sql in _ddl(c).items() if name not in rebuilt}
         schema.init_schema(c)
-        assert _versions(c) == [40, 41]
+        assert _versions(c) == [40, 41, 42]
         assert "'not_computable'" in schema._check_text(c, "research_results", "verdict")
         # Every row kept, byte-identical, in insertion order, but run 3's verdict:
         # its NaN interval bound relabels its `fail` (#2658); no other table moved.
@@ -915,7 +916,7 @@ def test_the_migration_from_version_40_widens_the_verdict_check(tmp_path: Path) 
         after = _ddl(c)
         schema.init_schema(c)
         assert _ddl(c) == after
-        assert _versions(c) == [40, 41]
+        assert _versions(c) == [40, 41, 42]
 
 
 def conn_ddl() -> str:
