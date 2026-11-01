@@ -4,7 +4,7 @@
 
 This is the full source of `~/tradepartner-probes/t342/recount.py`, the script the orchestrator ran on 2026-10-31 on a store copy. The copy below is byte for byte. The original file's sha256 is `9dcb98de00428c2e6c22c47214a1222238186d16ec4868abaee5c746fef13c15`, and the script prints the same hash on its first output line. The fenced block, without its fence lines, reproduces that hash. It lives in a Markdown appendix rather than as a `.py` file so that the repository's formatter cannot rewrite it and change the hash. Run instructions are in the note's [What ran](2026-11-form4-insider-feasibility-recount.md#what-ran) section. It must be run only on a copy of the store, never the live file.
 
-```python
+```text
 """T342 counts-only feasibility recount for the Form 4 insider-purchase study (#2679).
 
 Usage (on a COPY of the store, never the live file):
