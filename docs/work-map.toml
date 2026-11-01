@@ -1642,7 +1642,7 @@ unblocks = ["task:T323"]
 [task.T323b]
 what = "The 100-day proof that an incremental store equals a full rebuild, and that peak memory stays flat from 2 to 20 years of history."
 why = "It is the evidence that the speed-up changes no stored fact (#2629)."
-unblocks = ["task:T324"]
+unblocks = ["task:T324", "task:T347"]
 
 [task.T324]
 what = "Owner step: seed the table on the real store, compare on a copy, turn the key on, and post 5 nightly runs' times and memory."
@@ -1680,7 +1680,7 @@ unblocks = ["task:T346"]
 [task.T345]
 what = "Configure the local raw archive path and refuse writes that breach the iCloud disk floor."
 why = "Raw-first ingest must fail safely without committing an account-specific path."
-unblocks = ["task:T354"]
+unblocks = ["task:T346"]
 
 [task.T346]
 what = "Keep raw bodies by content hash and verify iCloud upload, eviction, download and integrity."
