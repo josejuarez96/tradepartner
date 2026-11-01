@@ -32,6 +32,7 @@ from tradepartner.store.delistings import (
     DelistingBuild,
     build_delistings,
     delistings_as_of,
+    delistings_with_reasons_as_of,
     derive_listing_ends,
     listing_ends_as_of,
     write_delistings,
@@ -203,6 +204,16 @@ def _delisting(sid: str, exchange: str, filed_at: datetime) -> dict[str, Any]:
         "source": "edgar",
         "provenance": "filing",
     }
+
+
+def test_delisting_without_reason_reads_unknown(synthetic: duckdb.DuckDBPyConnection) -> None:
+    filed_at = _at(2020, 1, 2)
+    insert_row(synthetic, "delistings", _delisting("S", "NASDAQ", filed_at))
+    assert delistings_with_reasons_as_of(synthetic, filed_at - timedelta(microseconds=1)).is_empty()
+    rows = delistings_with_reasons_as_of(synthetic, filed_at)
+    assert rows.select("security_id", "reason", "reason_source").rows() == [
+        ("S", "unknown", "unknown")
+    ]
 
 
 def _bar(sid: str, session: date) -> dict[str, Any]:

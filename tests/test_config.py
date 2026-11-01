@@ -3555,3 +3555,87 @@ def test_events_form4_bulk_keys_sit_outside_every_frozen_canonical_set() -> None
     assert _BULK_KEYS.isdisjoint(hypothesis.frozen_keys())
     assert _BULK_KEYS.isdisjoint(frozen.CANONICAL_EXCLUDED_KEYS)
     assert _BULK_KEYS.isdisjoint({key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS})
+
+
+# --- T345 (#2744): the local raw archive's path and disk floor (ADR 0028) ---
+
+
+def test_raw_archive_defaults_name_no_path_and_a_ten_gb_floor() -> None:
+    """No archive path is committed: unset by default, so the archive is off; the
+    write floor defaults to ADR 0028's 10 GB."""
+    s = _settings()
+    assert s.tradepartner_raw_archive is None
+    assert s.raw_archive.min_free_disk_gb == 10.0
+
+
+def test_raw_archive_path_is_read_from_its_env_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRADEPARTNER_RAW_ARCHIVE", str(tmp_path))
+    monkeypatch.setenv("RAW_ARCHIVE__MIN_FREE_DISK_GB", "12.5")
+    s = _settings()
+    assert s.tradepartner_raw_archive is not None
+    assert s.tradepartner_raw_archive.get_secret_value() == str(tmp_path)
+    assert s.raw_archive.min_free_disk_gb == 12.5
+    assert str(tmp_path) in secret_values(s)
+    assert str(tmp_path) not in repr(s)
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf")])
+def test_raw_archive_floor_cannot_be_turned_off(bad: float) -> None:
+    """Fail closed: unlike `ingest.min_free_disk_gb`, 0 is not 'off' here."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, raw_archive={"min_free_disk_gb": bad})
+
+
+def test_env_example_names_the_raw_archive_with_an_empty_value() -> None:
+    """`.env.example` names the variable but commits no path or account (spec
+    amendment #2714 item 2)."""
+    env_example = Path(__file__).resolve().parents[1] / ".env.example"
+    lines = [
+        line.lstrip("# ").strip()
+        for line in env_example.read_text(encoding="utf-8").splitlines()
+        if "TRADEPARTNER_RAW_ARCHIVE" in line and "=" in line
+    ]
+    assert lines == ["TRADEPARTNER_RAW_ARCHIVE="]
+    text = env_example.read_text(encoding="utf-8")
+    assert "Mobile Documents" not in text and "CloudDocs" not in text
+
+
+# --- T346 (#2751): the raw archive's bounded iCloud waits (ADR 0028 Upload, Disk) ---
+
+
+def test_raw_archive_wait_defaults_follow_the_t354_probe() -> None:
+    """T354 measured 20 MB uploaded in 11 s (docs/research/2026-10-31-icloud-status-
+    probe.md) and the 2026-11-01 05:50 UTC follow-up run 200 MB in 41 s
+    (`~/tradepartner-probes/icloud/evict-space-out.txt`): the bounded wait is
+    max(300 s, 0.2 s per MB), polled every 5 s."""
+    a = _settings().raw_archive
+    assert a.upload_wait_min_s == 300.0
+    assert a.download_wait_min_s == 300.0
+    assert a.transfer_wait_s_per_mb == 0.2
+    assert a.poll_interval_s == 5.0
+    assert a.command_timeout_s == 60.0
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "upload_wait_min_s",
+        "download_wait_min_s",
+        "poll_interval_s",
+        "command_timeout_s",
+    ],
+)
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf")])
+def test_raw_archive_waits_must_be_positive_and_finite(key: str, bad: float) -> None:
+    """A zero wait would never confirm an upload (nothing evicted, safe but silent);
+    an infinite one is not bounded. Both are refused."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, raw_archive={key: bad})
+
+
+@pytest.mark.parametrize("bad", [-0.1, float("nan"), float("inf")])
+def test_raw_archive_per_mb_wait_is_finite_and_not_negative(bad: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, raw_archive={"transfer_wait_s_per_mb": bad})

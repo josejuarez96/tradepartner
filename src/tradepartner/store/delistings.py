@@ -280,6 +280,45 @@ def delistings_as_of(
     return _latest_as_of(conn, "delistings", _DELISTING_KEY, _validate_t(t), security_ids)
 
 
+def delistings_with_reasons_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None = None,
+) -> pl.DataFrame:
+    """Return known Form 25 episodes with their latest reason, or `unknown`."""
+    from tradepartner.store.delisting_reasons import delisting_reasons_as_of
+
+    t = _validate_t(t)
+    episodes = delistings_as_of(conn, t, security_ids)
+    reasons = delisting_reasons_as_of(conn, t, security_ids).select(
+        "security_id",
+        "delisting_form",
+        "delisting_class_title",
+        "delisting_exchange",
+        "delisting_filed_at",
+        "reason",
+        "reason_source",
+        "reason_evidence_form",
+        "reason_evidence_accession",
+        "reason_known_at",
+    )
+    return episodes.join(
+        reasons,
+        left_on=_DELISTING_KEY,
+        right_on=(
+            "security_id",
+            "delisting_form",
+            "delisting_class_title",
+            "delisting_exchange",
+            "delisting_filed_at",
+        ),
+        how="left",
+    ).with_columns(
+        pl.col("reason").fill_null("unknown"),
+        pl.col("reason_source").fill_null("unknown"),
+    )
+
+
 @cache
 def _window(filing_session: date, sessions: int) -> tuple[date, date]:
     low = high = filing_session

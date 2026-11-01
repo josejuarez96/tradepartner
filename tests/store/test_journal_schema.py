@@ -1259,6 +1259,7 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
             "owner_decisions",
             "sec_filing_events",
             "sec_form4_transactions",
+            "delisting_reasons",
             "filing_index",
         )
         and name not in schema.RETRACTABLE_TABLES

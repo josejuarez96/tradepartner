@@ -64,6 +64,7 @@ _UNTOUCHED_TABLES = tuple(
         "spinoff_allocations",
         "sec_filing_events",
         "sec_form4_transactions",
+        "delisting_reasons",
         "filing_index",
         *schema.RETRACTABLE_TABLES,
     )
@@ -134,6 +135,7 @@ def _make_old_store(path: Path, version: int) -> None:
             + schema._OPENFIGI_TYPES_TABLE_DDL
             + schema._SUCCESSOR_CHAINS_TABLE_DDL
             + schema._MERGERS_TABLE_DDL
+            + schema._SNAPSHOT_SIGHTINGS_TABLE_DDL
         ):
             conn.execute(ddl)
         if version >= 3:

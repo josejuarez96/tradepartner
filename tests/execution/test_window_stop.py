@@ -66,6 +66,7 @@ from tradepartner.store.journal import (
     PaperWindowStopRow,
     PositionDailyRow,
     append,
+    break_events_for,
     kill_switch_events_for,
     open_window,
     order_events_for,
@@ -748,11 +749,13 @@ def test_stop_refuses_open_breaks_while_a_material_break_remains(
     assert _count(journal_settings, "reconcile_breaks") == 1
 
 
-def test_stop_closes_on_a_breaks_base_when_no_open_break_is_material(
+def test_stop_does_not_refuse_open_breaks_for_an_immaterial_break_it_auto_accepts(
     journal_settings: Settings, fake: FakeBroker, fixed_clock: FixedClock
 ) -> None:
-    """A `breaks` row of immaterial breaks only is a safe base: `_residues`
-    and the close read it as reconciled."""
+    """T283a: below the thresholds the closing reconciliation auto-accepts the break
+    (`opened`, `auto_accepted`), so no material break is open and the close is not
+    refused `open_breaks`. The share is now the ledger's, so the account is simply
+    not flat: the refusal is the flatness check's, unchanged."""
     roomy = FROZEN.model_copy(
         update={"break_materiality_usd": 1_000.0, "break_materiality_bps": 1_000.0}
     )
@@ -760,13 +763,14 @@ def test_stop_closes_on_a_breaks_base_when_no_open_break_is_material(
     _requested(journal_settings, window, DAY1 - timedelta(minutes=50))
     _break_without_cash_gap(journal_settings, fake, fixed_clock)
 
-    result = _stop(journal_settings, fake, fixed_clock)
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        _stop(journal_settings, fake, fixed_clock)
 
-    assert result.state == "closed"
+    reason, _ = _refusal(excinfo)
+    assert reason != OPEN_BREAKS
     with open_read_only(journal_settings) as conn:
-        (row,) = reconciliations_for(conn, window.window_id)  # type: ignore[arg-type]
-    assert row.status == "breaks" and row.reconciliation_id == result.reconciliation_id
-    assert [s.state for s in _stops(journal_settings, window)][-1] == "closed"
+        events = [e.event for e in break_events_for(conn, window.window_id)]  # type: ignore[arg-type]
+    assert events == ["opened", "auto_accepted"]
 
 
 def test_a_closed_windows_halted_run_does_not_engage_the_next_window(
