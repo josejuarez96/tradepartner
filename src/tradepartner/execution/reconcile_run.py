@@ -217,6 +217,7 @@ from tradepartner.store.asof import (
     live_actions_as_of,
     mergers_as_of,
     prices_as_of,
+    spinoff_allocations_as_of,
     symbol_changes_as_of,
 )
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
@@ -1497,15 +1498,67 @@ def _open_orders(
     return orders, pending, sums
 
 
+def spinoff_receipt_terms(
+    conn: duckdb.DuckDBPyConnection,
+    cut: datetime,
+    actions: pl.DataFrame,
+    child: str,
+    parent: str,
+    through: date,
+) -> dict[str, object]:
+    """The `explanation_json` keys a `spinoff_receipt` of `child` carries (paper
+    spec amendment 2026-10-20, #1976, items 2 and 3): `parent_security_id`, the
+    spin-off's `ex_date` (the latest stored one on or before `through`, which
+    fixes the parent lots entitled to the child) and, only when one is stored
+    with `known_at <= cut` (close(S-1)), the owner-entered `basis_allocation`.
+    A fraction known later is not applied (no look-ahead), and the receipt is
+    never rewritten once journaled."""
+    terms: dict[str, object] = {"parent_security_id": parent}
+    ex_dates = [
+        row["ex_date"]
+        for row in actions.filter(
+            (pl.col("action_type") == _SPINOFF)
+            & (pl.col("security_id") == child)
+            & (pl.col("source_action_id") == parent)
+            & (pl.col("ex_date") <= through)
+        ).iter_rows(named=True)
+    ]
+    if not ex_dates:
+        return terms
+    ex_date = max(ex_dates)
+    return spinoff_terms_at(conn, cut, parent, child, ex_date)
+
+
+def spinoff_terms_at(
+    conn: duckdb.DuckDBPyConnection, cut: datetime, parent: str, child: str, ex_date: date
+) -> dict[str, object]:
+    """`spinoff_receipt_terms` for a known spin-off: the parent, `ex_date` and the
+    allocation stored with `known_at <= cut`, if any. `execution.window` writes
+    its residue receipt's terms through this too (#1976 item 2)."""
+    terms: dict[str, object] = {"parent_security_id": parent, "ex_date": ex_date.isoformat()}
+    stored = spinoff_allocations_as_of(conn, cut).filter(
+        (pl.col("parent_security_id") == parent)
+        & (pl.col("child_security_id") == child)
+        & (pl.col("ex_date") == ex_date)
+    )
+    if not stored.is_empty():
+        terms["basis_allocation"] = float(stored["basis_allocation"][0])
+    return terms
+
+
 def _explanation_json(
     text: str,
     reconciliation_id: int | None,
     merger_id: str | None = None,
     merger_terms: Mapping[str, object] | None = None,
+    spinoff_terms: Mapping[str, object] | None = None,
 ) -> str:
     """An adjustment's `explanation_json`: its text, the reconciliation that
-    journaled it and, for a merger's row, the merger id (#1762, T249)."""
+    journaled it and, for a merger's row, the merger id (#1762, T249) or, for a
+    spin-off receipt, its parent, ex-date and allocation (#1976, T255)."""
     payload: dict[str, object] = {"explanation": text, "reconciliation_id": reconciliation_id}
+    if spinoff_terms is not None:
+        payload.update(spinoff_terms)
     if merger_id is not None:
         payload["merger_id"] = merger_id
     if merger_terms is not None:
@@ -1783,6 +1836,85 @@ def _auto_true_up_rows(
     return rows
 
 
+def _finding_key(mismatch: Mismatch, positions: Mapping[str, Position]) -> str | None:
+    """A finding part's `finding_key` (#2266 item 4), or None for any other kind."""
+    if mismatch.kind == break_rules.UNKNOWN_SYMBOL and mismatch.symbol is not None:
+        return break_rules.unknown_symbol_key(mismatch.symbol, positions[mismatch.symbol].quantity)
+    if mismatch.kind == MERGER_CONFLICT:
+        # The conflict detail is made by _conflict_detail from the
+        # sorted deal ids. Parse that fixed format, never its wording.
+        match = re.search(r"merger ids (\[[^\]]*\]) for ", mismatch.detail)
+        if match is None:
+            raise ValueError("merger conflict has no deal ids")
+        ids = ast.literal_eval(match.group(1))
+        if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+            raise ValueError("merger conflict has invalid deal ids")
+        return break_rules.merger_conflict_key(ids)
+    if mismatch.kind == UNEXPLAINED_DIVIDEND_GROUP:
+        dates = re.findall(r"ex-date (\d{4}-\d{2}-\d{2})", mismatch.detail)
+        if not dates or mismatch.security_id is None:
+            raise ValueError("dividend finding has no name or ex-date")
+        return break_rules.dividend_group_key(
+            mismatch.security_id, (date.fromisoformat(day) for day in dates)
+        )
+    return None
+
+
+def acknowledged_keys(events: Iterable[ReconcileBreakRow]) -> frozenset[str]:
+    """The `finding_key`s an owner true-up acknowledged (#2266 item 9): the finding
+    parts of every break whose latest event is `trued_up`. The classifier does not
+    reopen a break while `compare` raises one of these keys again."""
+    latest: dict[str, ReconcileBreakRow] = {}
+    for event in sorted(events, key=lambda e: e.event_id or 0):
+        latest[event.break_id] = event
+    return frozenset(
+        part["finding_key"]
+        for event in latest.values()
+        if event.event == "trued_up"
+        for part in json.loads(event.parts_json)
+        if part["kind"] in break_rules.FINDING_KINDS and part.get("finding_key") is not None
+    )
+
+
+def _acknowledged(
+    mismatch: Mismatch,
+    acknowledged: frozenset[str],
+    positions: Mapping[str, Position],
+    open_names: Collection[str],
+) -> bool:
+    """Whether an owner true-up acknowledged this finding (#2266 item 9). Never
+    while a break is open on its name, so that break keeps its current figures and
+    can still be trued up; a key that cannot be read is not acknowledged (the
+    break-event write then fails closed on it, as before)."""
+    if not acknowledged or (mismatch.security_id or mismatch.symbol) in open_names:
+        return False
+    try:
+        return _finding_key(mismatch, positions) in acknowledged
+    except ValueError:
+        return False
+
+
+def _without_acknowledged(
+    result: Reconciliation,
+    acknowledged: frozenset[str],
+    positions: Mapping[str, Position],
+    account_cash: float,
+    open_names: Collection[str] = (),
+) -> Reconciliation:
+    """`result` less every finding mismatch whose key an owner true-up acknowledged
+    (#2266 item 9), its status re-derived in `compare`'s order. A `breaks` result
+    left with no residual is `ok`, its base the broker's cash."""
+    kept = tuple(
+        m for m in result.mismatches if not _acknowledged(m, acknowledged, positions, open_names)
+    )
+    if len(kept) == len(result.mismatches):
+        return result
+    result = replace(result, mismatches=kept)
+    if result.status == BREAKS and not kept:
+        return replace(result, status=OK, broker_cash=account_cash, adjustments=result.explained)
+    return result
+
+
 def _write_break_events(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -1849,28 +1981,7 @@ def _write_break_events(
             old = next((p for p in old_parts if p["kind"] == mismatch.kind), None)
             if old is not None:
                 cause = old["cause"]
-            finding = None
-            if mismatch.kind == break_rules.UNKNOWN_SYMBOL and mismatch.symbol is not None:
-                finding = break_rules.unknown_symbol_key(
-                    mismatch.symbol, positions[mismatch.symbol].quantity
-                )
-            elif mismatch.kind == MERGER_CONFLICT:
-                # The conflict detail is made by _conflict_detail from the
-                # sorted deal ids. Parse that fixed format, never its wording.
-                match = re.search(r"merger ids (\[[^\]]*\]) for ", mismatch.detail)
-                if match is None:
-                    raise ValueError("merger conflict has no deal ids")
-                ids = ast.literal_eval(match.group(1))
-                if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
-                    raise ValueError("merger conflict has invalid deal ids")
-                finding = break_rules.merger_conflict_key(ids)
-            elif mismatch.kind == UNEXPLAINED_DIVIDEND_GROUP:
-                dates = re.findall(r"ex-date (\d{4}-\d{2}-\d{2})", mismatch.detail)
-                if not dates or mismatch.security_id is None:
-                    raise ValueError("dividend finding has no name or ex-date")
-                finding = break_rules.dividend_group_key(
-                    mismatch.security_id, (date.fromisoformat(day) for day in dates)
-                )
+            finding = _finding_key(mismatch, positions)
             parts.append(
                 break_rules.BreakPart(
                     kind=mismatch.kind,
@@ -2202,11 +2313,32 @@ def reconcile_now(
             ),
         )
 
+    with connect() as conn:
+        # Item 9: an acknowledged finding raised again with the same key is no
+        # break; a changed key (another quantity, merger id or ex-date) is.
+        result = _without_acknowledged(
+            result,
+            acknowledged_keys(e for e in break_events_for(conn, window_id) if e.known_at <= as_of),
+            positions,
+            float(account.cash),
+            {row.name for row in open_breaks(conn, window_id) if row.name is not None},
+        )
     names = {m.security_id for m in result.mismatches if m.security_id is not None} | set(
         ledger.positions
     )
     with connect() as conn:
         evidence = _break_evidence(conn, cut, settings, names)
+        receipts = {
+            a.security_id
+            for a in (*result.adjustments, *result.explained)
+            if a.kind == "spinoff_receipt" and a.security_id in explanations.spinoffs
+        }
+        receipt_terms = {
+            child: spinoff_receipt_terms(
+                conn, cut, actions, child, explanations.spinoffs[child][0], session
+            )
+            for child in sorted(c for c in receipts if c is not None)
+        }
         open_now = open_breaks(conn, window_id)
         retained_finding = any(
             any(part["kind"] in break_rules.FINDING_KINDS for part in json.loads(row.parts_json))
@@ -2341,6 +2473,9 @@ def reconcile_now(
                             reconciliation_id,
                             adjustment.merger_id,
                             adjustment.merger_terms,
+                            receipt_terms.get(adjustment.security_id or "")
+                            if adjustment.kind == "spinoff_receipt"
+                            else None,
                         ),
                         book_id=window.book_id,
                         broker_activity_id=adjustment.broker_activity_id,

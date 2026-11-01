@@ -299,3 +299,94 @@ def test_quarter_read_returns_only_latest_same_quarter_revision() -> None:
     rows = filing_index.by_quarter(conn, 2026, 1, RUN + timedelta(days=2))
     assert len(rows) == 1
     assert rows[0].filed_on == correction.filed_on
+
+
+def _listing(cik: str, position: int | None, *, listed_on: date = date(2026, 4, 1)) -> object:
+    return filing_index.Listing(
+        cik, "0001", "10-K", "Issuer", date(2026, 3, 31), ACCEPTED, listed_on, True, position
+    )
+
+
+def test_listing_order_ignores_physical_insert_order() -> None:
+    """A rebuild that inserts the same rows in another order keeps the first row (#2813)."""
+    listings = [_listing("1", 5), _listing("2", 2), _listing("3", 9)]
+    firsts = []
+    for order in (listings, list(reversed(listings))):
+        conn = duckdb.connect(":memory:")
+        schema.init_schema(conn)
+        for listing in order:
+            filing_index.insert_listings(conn, [listing], RUN)  # type: ignore[list-item]
+        rows = filing_index.accession_listing_order(conn, "0001", RUN)
+        firsts.append([r.cik for r in rows])
+    assert firsts[0] == firsts[1] == ["2", "1", "3"]
+
+
+def test_listing_order_sorts_listed_on_first_and_null_position_last() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    for listing in (
+        _listing("1", None),
+        _listing("2", 7),
+        _listing("3", 99, listed_on=date(2026, 4, 2)),
+    ):
+        filing_index.insert_listings(conn, [listing], RUN)  # type: ignore[list-item]
+    rows = filing_index.accession_listing_order(conn, "0001", RUN)
+    assert [r.cik for r in rows] == ["2", "1", "3"]
+
+
+def test_revision_keeps_the_first_listings_position() -> None:
+    conn2 = duckdb.connect(":memory:")
+    schema.init_schema(conn2)
+    filing_index.insert_listings(conn2, [replace(_entry(), list_position=4)], RUN)
+    corrected = replace(
+        _entry(filed_on=date(2026, 4, 1), listed_on=date(2026, 4, 2)), list_position=0
+    )
+    assert filing_index.insert_listings(conn2, [corrected], RUN + timedelta(days=1)).revised == 1
+    positions = conn2.execute("SELECT list_position FROM filing_index").fetchall()
+    assert positions == [(4,), (4,)]
+
+
+def test_position_migration_keeps_rows_with_null_position() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    filing_index.insert_listings(conn, [_entry()], RUN)
+    old_rows = conn.execute(
+        "SELECT cik, accession, form, company_name, filed_on, accepted_at, listed_on, "
+        "known_at, ingested_at, source, provenance FROM filing_index"
+    ).fetchall()
+    for table in ("filing_index", "filing_index_pending"):
+        conn.execute(f"DROP TABLE {table}")
+    conn.execute(schema._CREATE_FILING_INDEX.replace("list_position INTEGER,", ""))
+    conn.execute(schema._CREATE_FILING_INDEX_PENDING.replace("list_position INTEGER,", ""))
+    conn.executemany(
+        "INSERT INTO filing_index (cik, accession, form, company_name, filed_on, accepted_at, "
+        "listed_on, known_at, ingested_at, source, provenance) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        old_rows,
+    )
+    conn.execute("DELETE FROM schema_version WHERE version = ?", [schema.CURRENT_SCHEMA_VERSION])
+    schema.init_schema(conn)
+    assert conn.execute("SELECT count(*), count(list_position) FROM filing_index").fetchone() == (
+        1,
+        0,
+    )
+    conn.execute("SELECT list_position FROM filing_index_pending")
+    assert schema._PRE_LIST_POSITION_VERSION == 45
+    [version] = conn.execute("SELECT max(version) FROM schema_version").fetchone()
+    assert version == schema.CURRENT_SCHEMA_VERSION
+
+
+def test_position_truncation_invariance() -> None:
+    full = duckdb.connect(":memory:")
+    truncated = duckdb.connect(":memory:")
+    for conn in (full, truncated):
+        schema.init_schema(conn)
+    early = replace(_entry(), list_position=3)
+    other = replace(_entry(), cik="2", accepted_at=ACCEPTED + timedelta(days=2), list_position=1)
+    filing_index.insert_listings(full, [early], RUN)
+    filing_index.insert_listings(truncated, [early], RUN)
+    filing_index.insert_listings(full, [other], RUN + timedelta(days=1))
+    cutoff = ACCEPTED + timedelta(days=1)
+    assert filing_index.accession_listing_order(
+        full, "0001", cutoff
+    ) == filing_index.accession_listing_order(truncated, "0001", cutoff)

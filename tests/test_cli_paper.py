@@ -515,6 +515,7 @@ PAPER_OPTIONS = {
     "status": {"--book", "--all"},
     "abandon": {"--reason", "--book"},
     "settle": {"--order", "--reason", "--book"},
+    "true-up": {"--break", "--reason", "--book"},
     "override": {"--kind", "--session", "--name", "--reason", "--book"},
     "lots-reconcile": {"--export", "--tax-year", "--book"},
     "shakedown": {"--verbose"},
@@ -653,11 +654,13 @@ def test_the_paper_parser_has_exactly_the_planned_flags() -> None:
             assert "--session" not in options, name
 
 
-@pytest.mark.parametrize("command", ["stop", "kill", "resume", "abandon", "override"])
+@pytest.mark.parametrize("command", ["stop", "kill", "resume", "abandon", "override", "true-up"])
 def test_a_missing_or_blank_reason_exits_non_zero_before_any_broker(
     command: str, clock: _Clock, factory: _Factory
 ) -> None:
-    extra = ["--kind", "engage_kill_switch"] if command == "override" else []
+    extra = {"override": ["--kind", "engage_kill_switch"], "true-up": ["--break", "1:SEC:1"]}.get(
+        command, []
+    )
     missing = _paper(clock, factory, command, *extra)
     blank = _paper(clock, factory, command, *extra, "--reason", "   ")
     assert missing.exit_code == cli.USAGE_ERROR

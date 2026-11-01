@@ -612,7 +612,11 @@ registry; #83 took version 2 first, so the registry is version 3):
   `filing_index_pending`, `edgar_filers` and `edgar_index_files` state tables.
   Earlier rows and tables are unchanged; read-only version-44 stores still
   serve their existing readers.
-- **A later DDL change goes to version 46**, with its own migration and a
+- **Version 46** (#2813): nullable `list_position` on `filing_index` and
+  `filing_index_pending`, a row's 0-based position within its SEC index file,
+  so readers order an accession's rows by `(listed_on, list_position)` and
+  never by rowid. Existing rows keep NULL until the next rebuild.
+- **A later DDL change goes to version 47**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -943,9 +947,11 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 44 (#2761, T355): additive `research_exposures` table and nullable
 #:   `trial_results.n_exposure`.
 #: - 45 (T318, #2740): additive EDGAR filing-index fact and cursor tables.
-#: - A later DDL change goes to version 46, with its own migration and a
+#: - 46 (#2813): nullable `list_position` on `filing_index` and
+#:   `filing_index_pending`.
+#: - A later DDL change goes to version 47, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 45
+CURRENT_SCHEMA_VERSION = 46
 
 #: The last version without `delisting_reasons` (T326, version 43): the
 #: `snapshot_sightings` version (#2665). A named constant, not
@@ -961,6 +967,10 @@ _PRE_RESEARCH_EXPOSURES_VERSION = 43
 #: The last version without the EDGAR filing-index tables (T318, version 45):
 #: the `research_exposures` version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
 _PRE_FILING_INDEX_VERSION = 44
+
+#: The last version without `list_position` on the filing-index tables (#2813,
+#: version 46): the filing-index version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
+_PRE_LIST_POSITION_VERSION = 45
 
 #: Last version without the owner-entered Form 8937 allocation table.
 _PRE_SPINOFF_ALLOCATIONS_VERSION = 38
@@ -1441,6 +1451,7 @@ CREATE TABLE IF NOT EXISTS filing_index (
     filed_on DATE NOT NULL,
     accepted_at TIMESTAMPTZ NOT NULL,
     listed_on DATE NOT NULL,
+    list_position INTEGER,
     {_common_fact_columns(TABLE_PROVENANCE_VALUES["filing_index"])},
     UNIQUE (cik, accession, known_at)
 )
@@ -1454,6 +1465,7 @@ CREATE TABLE IF NOT EXISTS filing_index_pending (
     company_name VARCHAR NOT NULL,
     filed_on DATE NOT NULL,
     listed_on DATE NOT NULL,
+    list_position INTEGER,
     PRIMARY KEY (cik, accession)
 )
 """
@@ -3515,6 +3527,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_DELISTING_REASONS_VERSION,
         _PRE_RESEARCH_EXPOSURES_VERSION,
         _PRE_FILING_INDEX_VERSION,
+        _PRE_LIST_POSITION_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3938,6 +3951,12 @@ def _migrate_n_research(conn: duckdb.DuckDBPyConnection) -> None:
     column here too. Runs inside `init_schema`'s transaction, after its DDL
     pass."""
     _add_nullable_int_columns(conn, "trial_results", (N_RESEARCH_COLUMN,))
+
+
+def _migrate_list_position(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add the nullable `list_position` to the filing-index tables (version 46)."""
+    for table in ("filing_index", "filing_index_pending"):
+        _add_nullable_int_columns(conn, table, ("list_position",))
 
 
 def _migrate_n_exposure(conn: duckdb.DuckDBPyConnection) -> None:
@@ -4802,6 +4821,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_DELISTING_REASONS_VERSION,
         _PRE_RESEARCH_EXPOSURES_VERSION,
         _PRE_FILING_INDEX_VERSION,
+        _PRE_LIST_POSITION_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4862,6 +4882,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _migrate_filing_name(conn)
         _migrate_n_research(conn)
         _migrate_n_exposure(conn)
+        _migrate_list_position(conn)
         _migrate_profitability_rebalance_counts(conn)
         _migrate_assets_intersection(conn)
         _relax_no_history_count(conn)

@@ -29,6 +29,8 @@ class Listing:
     accepted_at: datetime
     listed_on: date
     is_daily: bool
+    #: 0-based position in its source index file (#2813); None when unknown.
+    list_position: int | None = None
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,9 @@ class FilingRow:
     listed_on: date
     known_at: datetime
     ingested_at: datetime
+    #: The first listing's 0-based position in its SEC index file; NULL on
+    #: rows written before schema 46 (#2813). Revisions keep the first row's.
+    list_position: int | None = None
 
 
 @dataclass(frozen=True)
@@ -73,7 +78,8 @@ def _rows(conn: duckdb.DuckDBPyConnection, sql: str, params: list[object]) -> li
 
 
 _SELECT = (
-    "cik, accession, form, company_name, filed_on, accepted_at, listed_on, known_at, ingested_at"
+    "cik, accession, form, company_name, filed_on, accepted_at, listed_on, known_at, ingested_at, "
+    "list_position"
 )
 _LATEST_CIK = (
     "WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY cik, accession "
@@ -149,6 +155,25 @@ def first_known(
     return _rows(conn, sql, params)
 
 
+def accession_listing_order(
+    conn: duckdb.DuckDBPyConnection, accession: str, t: datetime
+) -> list[FilingRow]:
+    """One accession's first-known row per CIK, in SEC listing order (#2813).
+
+    Orders by the first listing's ``(listed_on, list_position)``, then CIK; a
+    NULL position (a row written before schema 46) sorts after a known one.
+    Never by physical row order, which a rebuild or restamp can change. The
+    first element is "the first row SEC lists" for the accession.
+    """
+    sql = (
+        "WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY cik "
+        "ORDER BY known_at ASC) AS rn FROM filing_index WHERE known_at <= ? AND accession = ?) "
+        f"SELECT {_SELECT} FROM ranked WHERE rn = 1 "
+        "ORDER BY listed_on, list_position NULLS LAST, cik"
+    )
+    return _rows(conn, sql, [_utc(t), accession])
+
+
 def snapshot_id(conn: duckdb.DuckDBPyConnection) -> str | None:
     """Last committed EDGAR index writer run id for an optimistic snapshot."""
     row = conn.execute(
@@ -222,7 +247,9 @@ def _insert_accession(
         if first.accepted_at > clock:
             raise ValueError("acceptance is after ingestion clock")
         conn.execute(
-            "INSERT INTO filing_index VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'edgar', 'filing')",
+            "INSERT INTO filing_index (cik, accession, form, company_name, filed_on, "
+            "accepted_at, listed_on, known_at, ingested_at, list_position, source, provenance) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'edgar', 'filing')",
             [
                 first.cik,
                 first.accession,
@@ -233,6 +260,7 @@ def _insert_accession(
                 first.listed_on,
                 first.accepted_at,
                 clock,
+                first.list_position,
             ],
         )
         added = 1
@@ -246,6 +274,7 @@ def _insert_accession(
             first.listed_on,
             first.accepted_at,
             clock,
+            first.list_position,
         )
         candidates = [candidate for candidate in candidates if candidate is not first]
     valid = [
@@ -273,7 +302,9 @@ def _insert_accession(
                 "revision clock must follow the previous known_at; collect one run first"
             )
         conn.execute(
-            "INSERT INTO filing_index VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'edgar', 'filing')",
+            "INSERT INTO filing_index (cik, accession, form, company_name, filed_on, "
+            "accepted_at, listed_on, known_at, ingested_at, list_position, source, provenance) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'edgar', 'filing')",
             [
                 listing.cik,
                 listing.accession,
@@ -284,6 +315,7 @@ def _insert_accession(
                 listing.listed_on,
                 clock,
                 clock,
+                old.list_position,
             ],
         )
         revised = 1

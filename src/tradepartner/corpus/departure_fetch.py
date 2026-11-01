@@ -58,6 +58,12 @@ marker's header not served leaves its `accepted_at` null), and a `404` or
 object per listing end, sorted by filing date and accession) and `counts.json`
 beside `raw/`, both carrying `fetch_version` (`FETCH_VERSION`), so a corpus
 fetched before the SGML acceptances is never taken for one fetched after.
+A miss on a path that `archive migrate-cache` moved out of that cache (the
+tombstone index `_archived/index.jsonl`, latest line per path, a `restored` line
+clearing it) raises `ArchivedCacheMissError` before the request, naming the
+`archive restore` command; a stale index or submissions file that is still on
+disk is refetched as above. A refusal later in a run leaves `corpus.jsonl` as it
+was, since the outputs are written last.
 This module imports nothing from `tradepartner.research`, never opens the
 runtime store, and writes nothing in the research store.
 
@@ -88,7 +94,7 @@ from tradepartner.adapters.edgar import (
     parse_filing_index,
     sgml_acceptance,
 )
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import TOMBSTONE_DIR, Settings, get_settings
 
 #: Written into `counts.json` and every `corpus.jsonl` row. 2: every acceptance
 #: is the filing's SGML header's (T168); the T120 corpus (no field) took the
@@ -318,8 +324,31 @@ class _NotServed:
         return {"document": document, "url": self.url, "status": self.status}
 
 
+class ArchivedCacheMissError(RuntimeError):
+    """A cache miss on a path `archive migrate-cache` moved into the archive: the
+    fetch refuses before any request or output write (plan T362, #2743)."""
+
+
+def _tombstoned(cache_dir: Path) -> frozenset[str]:
+    """Cache paths whose latest `_archived/index.jsonl` line is a move, not a
+    `restored` line (a torn line is skipped). Reads that one file, never the archive."""
+    index = cache_dir / TOMBSTONE_DIR / "index.jsonl"
+    latest: dict[str, bool] = {}
+    if index.is_file():
+        for line in index.read_text("utf-8").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+                continue  # a line with no path names no file: skipped, as a torn line is
+            latest[record["path"]] = record.get("op") != "restored"
+    return frozenset(path for path, moved in latest.items() if moved)
+
+
 class _CachedEdgar:
-    """`edgar_raw` calls behind a raw-response cache under `raw_dir`."""
+    """`edgar_raw` calls behind a raw-response cache under `raw_dir`. A miss on a
+    path in the tombstone index raises `ArchivedCacheMissError` before its request."""
 
     def __init__(
         self, settings: Settings, client: httpx.Client | None, raw_dir: Path, now: datetime
@@ -332,6 +361,23 @@ class _CachedEdgar:
         self._raw_settings = settings.model_copy(update={"edgar": edgar})
         self._client = client
         self._raw_dir = raw_dir
+        self._cache_dir = Path(settings.edgar.cache_dir).resolve()
+        self._moved: frozenset[str] | None = None
+
+    def _guard(self, path: Path) -> None:
+        """Refuse a miss (no file, no remembered 404) on a tombstoned path."""
+        if path.is_file() or self._marker(path).is_file():
+            return
+        if self._moved is None:
+            self._moved = _tombstoned(self._cache_dir)
+        rel = path.relative_to(self._cache_dir).as_posix()
+        if rel in self._moved or f"{rel}.not-served.json" in self._moved:
+            raw = self._raw_dir.relative_to(self._cache_dir).as_posix()
+            raise ArchivedCacheMissError(
+                f"{rel} was moved into the archive by `archive migrate-cache`; run "
+                f"`tradepartner archive restore --path {raw}` first. "
+                "Nothing was requested or written."
+            )
 
     def index_rows(self, year: int, qtr: int, *, complete: bool) -> list[UnstampedFiling]:
         """The quarter's `form.idx` rows of the four listing-end forms."""
@@ -339,6 +385,7 @@ class _CachedEdgar:
         if path.is_file():
             text = path.read_text(encoding="utf-8")
         else:
+            self._guard(path)
             full = edgar_raw.filing_index_quarter(
                 year, qtr, settings=self._settings, client=self._client
             )
@@ -360,6 +407,7 @@ class _CachedEdgar:
             "https://www.sec.gov/Archives/edgar/data/"
             f"{int(cik)}/{accession.replace('-', '')}/{filename}"
         )
+        self._guard(path)
         remembered = self._remembered(path)
         if remembered is not None:
             return remembered
@@ -394,6 +442,7 @@ class _CachedEdgar:
         path = self._header_path(cik, accession)
         if path.is_file():
             return sgml_stamp(path.read_text(encoding="utf-8"), accession)
+        self._guard(path)
         remembered = self._remembered(path)
         if remembered is not None:
             return remembered
@@ -429,6 +478,7 @@ class _CachedEdgar:
             cached = json.loads(path.read_bytes())
             if datetime.fromisoformat(cached["fetched_at"]).date() > open_until:
                 return cached["payload"]
+        self._guard(path)
         remembered = self._remembered(path)
         if remembered is not None:
             return remembered
@@ -454,6 +504,7 @@ class _CachedEdgar:
     def _json(self, path: Path, url: str, fetch: Callable[[], Any]) -> Any:
         if path.is_file():
             return json.loads(path.read_bytes())
+        self._guard(path)
         remembered = self._remembered(path)
         if remembered is not None:
             return remembered

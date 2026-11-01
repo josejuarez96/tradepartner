@@ -20,13 +20,15 @@ from __future__ import annotations
 
 import abc
 import re
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tradepartner.adapters.daily_index import DailyIndexFile
     from tradepartner.adapters.edgar import Form4Transaction
+    from tradepartner.store.filing_index import FilingRow, Listing
 
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -69,6 +71,73 @@ class FilingIndexEntry:
     def __post_init__(self) -> None:
         _check_cik(self.cik)
         _utc(self, "accepted_at")
+
+
+@dataclass(frozen=True)
+class PendingIndexRow:
+    """First listing of an accession whose acceptance has not been found."""
+
+    cik: str
+    accession: str
+    form: str
+    company_name: str
+    filed_on: date
+    listed_on: date
+    list_position: int | None = None
+
+
+@dataclass(frozen=True)
+class IncrementalIndexState:
+    """Read-only snapshot. Daily files cover every unsettled quarter in a walk.
+
+    ``stored`` contains all stored matches for accessions in selected daily,
+    walked, and reconciled files, including their other-CIK 25 copies, plus
+    every stored row in a reconciled quarter for the absent count. It may
+    contain every revision of those keys; the adapter selects the latest.
+    """
+
+    now: datetime
+    stored: tuple[FilingRow, ...]
+    issuer_ciks: frozenset[str]
+    pending: tuple[PendingIndexRow, ...]
+    filers: Mapping[str, tuple[tuple[int, int], tuple[int, int]]]
+    daily_files: tuple[DailyIndexFile, ...]
+    file_cursors: Mapping[str, tuple[str, str]]
+    quarterly: Mapping[tuple[int, int], tuple[str, date]] = field(default_factory=dict)
+    settled_listed_on: Mapping[tuple[int, int], date] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class IncrementalIndexResult:
+    """Rows and counters proposed by the adapter; no store write has occurred."""
+
+    rows: tuple[FilingRow, ...]
+    pending: tuple[PendingIndexRow, ...]
+    filers: Mapping[str, tuple[tuple[int, int], tuple[int, int]]]
+    files_read: tuple[DailyIndexFile, ...]
+    counts: Mapping[str, int]
+    stamp_changed_ciks: frozenset[str]
+    is_daily: tuple[bool, ...] = ()
+
+    @property
+    def listings(self) -> tuple[Listing, ...]:
+        """The T318 writer's input, preserving first rows and revisions."""
+        from tradepartner.store.filing_index import Listing
+
+        return tuple(
+            Listing(
+                r.cik,
+                r.accession,
+                r.form,
+                r.company_name,
+                r.filed_on,
+                r.accepted_at,
+                r.listed_on,
+                daily,
+                r.list_position,
+            )
+            for r, daily in zip(self.rows, self.is_daily, strict=True)
+        )
 
 
 @dataclass(frozen=True)
@@ -347,6 +416,10 @@ class FilingSource(abc.ABC):
         An issuer CIK has at least one `master.issuer_forms` filing other
         than a Form 25 or 25-NSE; other filers (insiders, funds, exchanges)
         are dropped. A 25-NSE sits under its subject company only."""
+
+    def incremental_index(self, state: IncrementalIndexState) -> IncrementalIndexResult:
+        """Propose index rows from a read-only state, without store writes."""
+        raise NotImplementedError
 
     @abc.abstractmethod
     def companies_snapshot(self) -> list[CompanySnapshotEntry]:

@@ -52,7 +52,7 @@ import math
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Final, Protocol
@@ -356,6 +356,9 @@ class UnstampedFiling:
     form: str
     accession: str
     filed_on: date
+    #: 0-based position among the data rows of its source index file (#2813);
+    #: not part of identity, so a row read twice de-duplicates.
+    list_position: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -388,18 +391,20 @@ def parse_filing_index(text: str, acceptance: Mapping[str, datetime]) -> FilingI
     an empty name (#358)."""
     entries: list[FilingIndexEntry] = []
     unstamped: list[UnstampedFiling] = []
+    position = -1
     for line in text.splitlines():
         match = _INDEX_ROW.match(line) or _INDEX_ROW_BLANK_NAME.match(line)
         if match is None:
             if "edgar/data/" in line:
                 raise ValueError(f"form.idx row does not parse: {line.strip()!r}")
             continue
+        position += 1
         cik, accession = _cik(match["cik"]), match["accession"]
         form, name = match["form"], match.groupdict().get("name") or ""
         accepted_at = acceptance.get(accession)
         if accepted_at is None:
             filed_on = date.fromisoformat(match["filed"])
-            unstamped.append(UnstampedFiling(cik, name, form, accession, filed_on))
+            unstamped.append(UnstampedFiling(cik, name, form, accession, filed_on, position))
         else:
             entries.append(FilingIndexEntry(cik, name, form, accession, accepted_at))
     entries.sort(key=lambda e: (e.accepted_at, e.accession, e.cik))
