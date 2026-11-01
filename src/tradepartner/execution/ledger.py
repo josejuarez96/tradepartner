@@ -56,6 +56,15 @@ Conventions this module fixes for the writers (T61 reconcile, T64 window start):
   sizing's (T230). A cover beyond the held short is a journal error
   (`ValueError`), and a fully covered short is dropped like a zero position.
 
+- **True-ups (paper spec amendment 2026-10-26 #2266, items 6 and 9).** An
+  `auto_true_up` or `owner_true_up` row with a quantity states its name at the
+  broker's **absolute** quantity (`explanation_json` key `broker_quantity`; the
+  row's `quantity` is only the delta). It is replayed at its session, after
+  that session's split and fills, and overwrites the position: only a split
+  with a later `ex_date` acts on it, so a split row that lands late with an
+  earlier `ex_date` (already in the broker's figure) is never applied on top.
+  Its cash part is an ordinary row, counted when known after the base.
+
 A row's own date for the split test is its `session` (an adjustment) or the
 New York date of `filled_at` (a fill): a fill on the ex-date is already in
 post-split shares. Quantities within `quantity_tolerance` of zero
@@ -69,26 +78,37 @@ holding, not one grid step less (#1296).
 
 from __future__ import annotations
 
+import json
 import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from fractions import Fraction
 from zoneinfo import ZoneInfo
 
 import polars as pl
 
 from tradepartner.store.journal import AdjustmentRow, OrderedFill, OrderRow, ReconciliationRow
-from tradepartner.store.schema import JOURNAL_ENUMS, LONG
+from tradepartner.store.schema import (
+    AUTO_TRUE_UP_KIND,
+    JOURNAL_ENUMS,
+    LONG,
+    OWNER_TRUE_UP_KIND,
+)
 
 _NEW_YORK = ZoneInfo("America/New_York")
+_STAMP_FLOOR = datetime.min.replace(tzinfo=UTC)
 _SPLIT = "split"
 _OK = "ok"
 _BUY = "buy"
 _SELL = "sell"
 _CASH_IN_LIEU = "cash_in_lieu"
 _SHORT_FILL = "short_fill"
+_TRUE_UP = "true_up"
+#: The adjustment kinds that state a name at the broker's absolute quantity
+#: (paper spec amendment 2026-10-26 #2266, item 9).
+TRUE_UP_KINDS = frozenset({AUTO_TRUE_UP_KIND, OWNER_TRUE_UP_KIND})
 _ADJUSTMENT_KINDS = frozenset(JOURNAL_ENUMS[("adjustments", "kind")])
 
 #: The replay's ranks within one session (#1627): the session's split, then its
@@ -99,6 +119,9 @@ _REPLAY_SPLIT_RANK = "0_split"
 _REPLAY_CASH_IN_LIEU_RANK = "1_cash_in_lieu"
 _REPLAY_FILL_RANK = "2_fill"
 _REPLAY_ADJUSTMENT_RANK = "3_adjustment"
+#: A true-up states its name after every other row of its session; a fill
+#: journaled after it (the broker's figure did not hold it) follows it.
+_REPLAY_TRUE_UP_RANK = "4_true_up_and_late_fill"
 
 
 def _finite(value: float, what: str) -> float:
@@ -253,6 +276,26 @@ def _check_adjustment(row: AdjustmentRow, seen: set[int]) -> None:
         _finite(row.cash, f"adjustment {row.adjustment_id} cash")
 
 
+def true_up_quantity(row: AdjustmentRow) -> float | None:
+    """The absolute broker quantity a true-up row states its name at: its
+    `explanation_json` key `broker_quantity` (item 9: the row's own `quantity`
+    is only the delta). None for a row with no quantity (a cash part or an
+    acknowledged finding); `ValueError` when a quantity row lacks a finite
+    absolute figure, so a true-up never guesses one."""
+    if row.quantity is None:
+        return None
+    try:
+        payload = json.loads(row.explanation_json or "")
+    except ValueError:
+        payload = None
+    value = payload.get("broker_quantity") if isinstance(payload, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(
+            f"adjustment {row.adjustment_id} has no broker_quantity to state the name at"
+        )
+    return _finite(float(value), f"adjustment {row.adjustment_id} broker_quantity")
+
+
 def _cash_base(
     reconciliation: ReconciliationRow | None, window_id: int, starting_cash: float, through: date
 ) -> tuple[float, datetime | None]:
@@ -337,6 +380,12 @@ def from_journal(
         for ex_date, ratio in rows:
             _record(ex_date, _REPLAY_SPLIT_RANK, "split", name, _split_ratio(ratio))
 
+    # A true-up, and any fill journaled after one on its session, replay
+    # together in the order they were stamped: a true-up's absolute quantity
+    # holds every fill stamped at or before it and none stamped after. A tie
+    # therefore replays the fill first (rank 0), then the true-up (rank 1), so
+    # a fill the figure already holds is never counted twice (#2479).
+    ordered: list[tuple[datetime, int, int, date, str, str, Fraction]] = []
     seen_fills: set[int] = set()
     fills_since_base = 0
     for fill in fills:
@@ -348,7 +397,30 @@ def from_journal(
             continue
         sign = 1 if fill.side == _BUY else -1
         kind = _SHORT_FILL if by_id[row.client_order_id].position_side != LONG else "fill"
-        _record(stated_on, _REPLAY_FILL_RANK, kind, fill.security_id, sign * _exact(row.quantity))
+        late = any(
+            a.kind in TRUE_UP_KINDS
+            and a.quantity is not None
+            and a.security_id == fill.security_id
+            and a.session == stated_on
+            and a.known_at < row.known_at
+            for a in adjustments
+        )
+        if late:
+            ordered.append(
+                (
+                    row.known_at,
+                    0,
+                    row.fill_id or 0,
+                    stated_on,
+                    kind,
+                    fill.security_id,
+                    sign * _exact(row.quantity),
+                )
+            )
+        else:
+            _record(
+                stated_on, _REPLAY_FILL_RANK, kind, fill.security_id, sign * _exact(row.quantity)
+            )
         if after_base(row.known_at):
             cash -= sign * row.quantity * row.price
             fills_since_base += 1
@@ -364,9 +436,30 @@ def from_journal(
         order = (
             _REPLAY_CASH_IN_LIEU_RANK
             if adjustment.kind == _CASH_IN_LIEU
+            else _REPLAY_TRUE_UP_RANK
+            if adjustment.kind in TRUE_UP_KINDS
             else _REPLAY_ADJUSTMENT_RANK
         )
-        if adjustment.quantity is not None and adjustment.security_id is not None:
+        if adjustment.kind in TRUE_UP_KINDS and adjustment.security_id is not None:
+            # Item 9: a true-up sets the figure. Replayed after the session's
+            # split and fills, it overwrites what came before; only a split with
+            # a later ex-date still acts on it, so a split row that lands late
+            # with an earlier ex-date (already in the broker's quantity) is
+            # never applied on top.
+            absolute = true_up_quantity(adjustment)
+            if absolute is not None:
+                ordered.append(
+                    (
+                        adjustment.known_at,
+                        1,
+                        adjustment.adjustment_id or 0,
+                        adjustment.session,
+                        _TRUE_UP,
+                        adjustment.security_id,
+                        _exact(absolute),
+                    )
+                )
+        elif adjustment.quantity is not None and adjustment.security_id is not None:
             _record(
                 adjustment.session,
                 order,
@@ -376,6 +469,9 @@ def from_journal(
             )
         if adjustment.cash is not None and after_base(adjustment.known_at):
             cash += adjustment.cash
+
+    for _known_at, _kind_rank, _id, day, kind, security_id, amount in sorted(ordered):
+        _record(day, _REPLAY_TRUE_UP_RANK, kind, security_id, amount)
 
     for _day, _order, _seq, kind, security_id, amount in sorted(replay):
         if kind == "split":
@@ -390,6 +486,8 @@ def from_journal(
                     f"cover of {security_id} is {float(-shorts[security_id])} shares "
                     f"beyond the short"
                 )
+        elif kind == _TRUE_UP:
+            positions[security_id] = amount
         elif kind == _CASH_IN_LIEU:
             # #1627: the row removes a stock dividend's fractional remainder at
             # its own point in the replay, so the issuer's exact `Fraction`

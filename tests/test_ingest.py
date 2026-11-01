@@ -2810,14 +2810,55 @@ def test_a_no_cover_page_rename_is_one_dated_row_across_nightly_runs(
     )
     assert rows == [
         ("STAT", "snapshot_static", date(2018, 3, 5), FETCHED_AT),
-        ("STAX", "snapshot", date(2019, 7, 1), FETCHED_AT + timedelta(days=3)),
+        ("STAX", "snapshot", date(2019, 7, 1), FETCHED_AT + timedelta(days=4)),
     ]
-    assert stored[1] == stored[0] + 1
-    assert stored[3] == stored[2] == stored[1]
+    assert stored[1] == stored[0]
+    assert stored[2] == stored[1] + 1
+    assert stored[3] == stored[2]
     with duckdb.connect(settings.store.path, read_only=True) as conn:
         checks = integrity_checks(conn, nights[-1][0], settings)
     (overlap,) = [c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS]
     assert overlap.passed, overlap.violations
+
+
+def test_snapshot_sightings_store_only_pending_changes(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    nights = [
+        (NOW, FETCHED_AT, "STAT"),
+        (NOW + timedelta(days=3), FETCHED_AT + timedelta(days=3), "STAX"),
+        (NOW + timedelta(days=4), FETCHED_AT + timedelta(days=4), "STAX"),
+        (NOW + timedelta(days=5), FETCHED_AT + timedelta(days=5), "STAX"),
+    ]
+    counts = []
+    for now, fetched_at, ticker in nights:
+        result = _run(
+            settings, now=now, source="edgar", filings=_with_renamed_stat(ticker, fetched_at)
+        )
+        assert result.ok, result.runs[-1].message
+        counts.append(read(f"SELECT count(*) FROM snapshot_sightings WHERE cik = '{STAT}'")[0][0])
+    assert counts == [0, 1, 1, 1]
+
+
+def test_four_nights_of_flapping_snapshot_tickers_write_no_rename(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    for days, ticker in ((0, "STAT"), (3, "STAX"), (4, "STAT"), (5, "STAX")):
+        result = _run(
+            settings,
+            now=NOW + timedelta(days=days),
+            source="edgar",
+            filings=_with_renamed_stat(ticker, FETCHED_AT + timedelta(days=days)),
+        )
+        assert result.ok, result.runs[-1].message
+
+    assert read(
+        "SELECT ticker, provenance, valid_from FROM listings "
+        f"WHERE security_id = '{STAT}' ORDER BY valid_from"
+    ) == [("STAT", "snapshot_static", date(2018, 3, 5))]
+    assert read(
+        f"SELECT ticker FROM snapshot_sightings WHERE cik = '{STAT}' ORDER BY known_at"
+    ) == [("STAX",), ("STAT",), ("STAX",)]
 
 
 def test_a_stored_pre_fix_same_start_pair_gets_one_rename_row(
@@ -2857,7 +2898,10 @@ def test_a_stored_pre_fix_same_start_pair_gets_one_rename_row(
         result = _run(settings, now=NOW + timedelta(days=days), source="edgar", filings=filings)
         assert result.ok, result.runs[-1].message
         stored.append(read(rows_sql))
-    assert stored[0] == [*seeded, ("STAX", "snapshot", date(2019, 7, 1), bad_fetch)]
+    assert stored[0] == [
+        *seeded,
+        ("STAX", "snapshot", date(2019, 7, 1), FETCHED_AT + timedelta(days=4)),
+    ]
     assert stored[1] == stored[0]
     accepted = settings.model_copy(
         update={

@@ -731,6 +731,7 @@ def version_4_store(path: Path) -> Path:
             + schema._OPENFIGI_TYPES_TABLE_DDL
             + schema._SUCCESSOR_CHAINS_TABLE_DDL
             + schema._MERGERS_TABLE_DDL
+            + schema._SNAPSHOT_SIGHTINGS_TABLE_DDL
         ):
             conn.execute(ddl)
         schema._migrate_filing_name(conn)
