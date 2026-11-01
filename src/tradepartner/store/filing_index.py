@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
+from tradepartner.store.schema import atomic
+
 
 @dataclass(frozen=True)
 class Listing:
@@ -159,81 +161,119 @@ def insert_listings(
 ) -> InsertCounts:
     """Insert first rows or one eligible filed-date revision per accession.
 
-    A batch is one writer run. Among listings of an accession, the greatest
-    ``listed_on`` wins and a daily file wins a tie. Identity disagreements
+    The first listing fixes identity and first-known date. Later listings
+    compete by ``listed_on``; a daily file wins a tie. Identity disagreements
     are counted and never written.
     """
     clock = _utc(ingested_at)
     grouped: dict[tuple[str, str], list[Listing]] = {}
     for listing in listings:
         _utc(listing.accepted_at)
+        if listing.listed_on > clock.date():
+            raise ValueError("listing is after ingestion clock")
         key = (listing.cik, listing.accession)
         grouped.setdefault(key, []).append(listing)
     added = revised = changed = stale = 0
-    for (cik, accession), candidates in grouped.items():
-        latest = conn.execute(
-            f"SELECT {_SELECT} FROM filing_index WHERE cik = ? AND accession = ? "
-            "ORDER BY known_at DESC LIMIT 1",
-            [cik, accession],
-        ).fetchone()
-        old = FilingRow(*latest) if latest is not None else None
-        if old is not None:
-            valid = [
-                listing
-                for listing in candidates
-                if (listing.form, listing.company_name, listing.accepted_at)
-                == (old.form, old.company_name, old.accepted_at)
-            ]
-            changed += len(candidates) - len(valid)
-            if not valid:
-                continue
-            candidates = valid
-        listing = max(
+    with atomic(conn):
+        for (cik, accession), candidates in grouped.items():
+            counts = _insert_accession(conn, cik, accession, candidates, clock)
+            added += counts.added
+            revised += counts.revised
+            changed += counts.changed
+            stale += counts.stale
+    return InsertCounts(added, revised, changed, stale)
+
+
+def _insert_accession(
+    conn: duckdb.DuckDBPyConnection,
+    cik: str,
+    accession: str,
+    candidates: list[Listing],
+    clock: datetime,
+) -> InsertCounts:
+    added = revised = changed = stale = 0
+    latest = conn.execute(
+        f"SELECT {_SELECT} FROM filing_index WHERE cik = ? AND accession = ? "
+        "ORDER BY known_at DESC LIMIT 1",
+        [cik, accession],
+    ).fetchone()
+    old = FilingRow(*latest) if latest is not None else None
+    if old is None:
+        first = min(
             enumerate(candidates),
             key=lambda item: (item[1].listed_on, item[1].is_daily, item[0]),
         )[1]
-        if latest is None:
-            if listing.accepted_at > clock:
-                raise ValueError("acceptance is after ingestion clock")
-            conn.execute(
-                "INSERT INTO filing_index VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'edgar', 'filing')",
-                [
-                    listing.cik,
-                    listing.accession,
-                    listing.form,
-                    listing.company_name,
-                    listing.filed_on,
-                    listing.accepted_at,
-                    listing.listed_on,
-                    listing.accepted_at,
-                    clock,
-                ],
-            )
-            added += 1
-            continue
-        assert old is not None
-        if listing.listed_on < old.listed_on:
-            stale += 1
-        elif listing.filed_on == old.filed_on:
-            continue
-        elif listing.listed_on == old.listed_on and not listing.is_daily:
-            stale += 1
-        else:
-            if clock <= old.known_at:
-                raise ValueError("revision clock must follow the previous known_at")
-            conn.execute(
-                "INSERT INTO filing_index VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'edgar', 'filing')",
-                [
-                    listing.cik,
-                    listing.accession,
-                    listing.form,
-                    listing.company_name,
-                    listing.filed_on,
-                    listing.accepted_at,
-                    listing.listed_on,
-                    clock,
-                    clock,
-                ],
-            )
-            revised += 1
+        if first.accepted_at > clock:
+            raise ValueError("acceptance is after ingestion clock")
+        conn.execute(
+            "INSERT INTO filing_index VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'edgar', 'filing')",
+            [
+                first.cik,
+                first.accession,
+                first.form,
+                first.company_name,
+                first.filed_on,
+                first.accepted_at,
+                first.listed_on,
+                first.accepted_at,
+                clock,
+            ],
+        )
+        added = 1
+        old = FilingRow(
+            first.cik,
+            first.accession,
+            first.form,
+            first.company_name,
+            first.filed_on,
+            first.accepted_at,
+            first.listed_on,
+            first.accepted_at,
+            clock,
+        )
+        candidates = [candidate for candidate in candidates if candidate is not first]
+    valid = [
+        listing
+        for listing in candidates
+        if (listing.form, listing.company_name, listing.accepted_at)
+        == (old.form, old.company_name, old.accepted_at)
+    ]
+    changed = len(candidates) - len(valid)
+    if not valid:
+        return InsertCounts(added, revised, changed, stale)
+    listing = max(
+        enumerate(valid),
+        key=lambda item: (item[1].listed_on, item[1].is_daily, item[0]),
+    )[1]
+    if listing.listed_on < old.listed_on:
+        stale = 1
+    elif listing.filed_on == old.filed_on:
+        pass
+    elif listing.listed_on == old.listed_on and not listing.is_daily:
+        stale = 1
+    elif old.known_at == clock and old.known_at != old.accepted_at:
+        # Calls for separate files in one run share a clock and one provisional row.
+        conn.execute(
+            "UPDATE filing_index SET filed_on = ?, listed_on = ? "
+            "WHERE cik = ? AND accession = ? AND known_at = ?",
+            [listing.filed_on, listing.listed_on, cik, accession, clock],
+        )
+    else:
+        if clock <= old.known_at:
+            raise ValueError("revision clock must follow the previous known_at")
+        conn.execute(
+            "INSERT INTO filing_index VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'edgar', 'filing')",
+            [
+                listing.cik,
+                listing.accession,
+                listing.form,
+                listing.company_name,
+                listing.filed_on,
+                listing.accepted_at,
+                listing.listed_on,
+                clock,
+                clock,
+            ],
+        )
+        revised = 1
     return InsertCounts(added, revised, changed, stale)

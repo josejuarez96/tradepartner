@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
 import duckdb
+import pytest
 
 from tradepartner.store import filing_index, schema
 
@@ -21,6 +22,65 @@ def _entry(
     form: str = "10-K",
 ) -> filing_index.Listing:
     return filing_index.Listing("1", "0001", form, "Issuer", filed_on, ACCEPTED, listed_on, daily)
+
+
+def test_two_daily_files_in_one_batch_preserve_first_known_date() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    first = _entry(filed_on=date(2026, 4, 1))
+    corrected = _entry(filed_on=date(2026, 3, 31), listed_on=date(2026, 4, 6))
+    counts = filing_index.insert_listings(conn, [first, corrected], RUN + timedelta(days=4))
+    assert counts == filing_index.InsertCounts(1, 1, 0, 0)
+    rows = conn.execute("SELECT filed_on, known_at FROM filing_index ORDER BY known_at").fetchall()
+    assert rows[0] == (first.filed_on, ACCEPTED)
+    assert rows[1][0] == corrected.filed_on
+    assert rows[1][1] > datetime(2026, 4, 6, tzinfo=UTC)
+    between = datetime(2026, 4, 4, tzinfo=UTC)
+    assert filing_index.by_cik(conn, "1", between)[0].filed_on == first.filed_on
+    assert filing_index.first_known(conn, between)[0].filed_on == first.filed_on
+
+
+def test_per_file_corrections_at_one_clock_are_order_independent() -> None:
+    older = _entry(filed_on=date(2026, 4, 1), listed_on=date(2026, 4, 2))
+    newer = _entry(filed_on=date(2026, 4, 2), listed_on=date(2026, 4, 3))
+    for order in ((older, newer), (newer, older)):
+        conn = duckdb.connect(":memory:")
+        schema.init_schema(conn)
+        filing_index.insert_listings(conn, [_entry()], RUN)
+        for listing in order:
+            filing_index.insert_listings(conn, [listing], RUN + timedelta(days=1))
+        filing_index.insert_listings(conn, [newer], RUN + timedelta(days=1))
+        assert filing_index.by_cik(conn, "1", RUN + timedelta(days=1))[0].filed_on == newer.filed_on
+        assert conn.execute("SELECT count(*) FROM filing_index").fetchone()[0] == 2
+
+
+def test_new_accession_form_conflict_is_counted() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    counts = filing_index.insert_listings(
+        conn, [_entry(), _entry(form="8-K", listed_on=date(2026, 4, 2))], RUN
+    )
+    assert counts == filing_index.InsertCounts(1, 0, 1, 0)
+    assert filing_index.by_cik(conn, "1", RUN)[0].form == "10-K"
+
+
+def test_insert_listings_rolls_back_entire_batch_on_error() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    future = replace(_entry(), cik="2", accession="0002", accepted_at=RUN + timedelta(days=1))
+    with pytest.raises(ValueError, match="acceptance is after ingestion clock"):
+        filing_index.insert_listings(conn, [_entry(), future], RUN)
+    assert conn.execute("SELECT count(*) FROM filing_index").fetchone()[0] == 0
+
+
+def test_revision_cannot_precede_its_listing_date() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    filing_index.insert_listings(conn, [_entry()], RUN)
+    future = _entry(filed_on=date(2026, 4, 2), listed_on=date(2026, 4, 6))
+    with pytest.raises(ValueError, match="listing is after ingestion clock"):
+        filing_index.insert_listings(conn, [future], RUN + timedelta(days=1))
+    assert conn.execute("SELECT count(*) FROM filing_index").fetchone()[0] == 1
 
 
 def test_revision_as_of_and_first_known() -> None:
@@ -110,6 +170,25 @@ def test_truncation_and_trial_vintage() -> None:
     assert registry.data_vintage(full, cutoff) == registry.data_vintage(truncated, cutoff)
     assert registry.data_vintage(full, RUN + timedelta(days=2)) is None
     assert filing_index.by_cik(full, "1", ACCEPTED - timedelta(seconds=1)) == []
+
+
+def test_quarter_and_first_known_hide_future_rows() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    filing_index.insert_listings(conn, [_entry()], RUN)
+    corrected = _entry(filed_on=date(2026, 4, 1), listed_on=date(2026, 4, 2))
+    filing_index.insert_listings(conn, [corrected], RUN + timedelta(days=1))
+    before_acceptance = ACCEPTED - timedelta(seconds=1)
+    between = RUN + timedelta(hours=12)
+    after = RUN + timedelta(days=2)
+    assert filing_index.first_known(conn, before_acceptance) == []
+    assert filing_index.by_quarter(conn, 2026, 1, before_acceptance) == []
+    assert filing_index.by_quarter(conn, 2026, 2, before_acceptance) == []
+    assert filing_index.by_quarter(conn, 2026, 1, between)[0].filed_on == date(2026, 3, 31)
+    assert filing_index.by_quarter(conn, 2026, 2, between) == []
+    assert filing_index.first_known(conn, between)[0].filed_on == date(2026, 3, 31)
+    assert filing_index.by_quarter(conn, 2026, 1, after) == []
+    assert filing_index.by_quarter(conn, 2026, 2, after)[0].filed_on == corrected.filed_on
 
 
 def test_snapshot_id_detects_latest_writer_even_if_failed() -> None:
