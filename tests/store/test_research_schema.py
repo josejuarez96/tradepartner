@@ -317,7 +317,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_SNAPSHOT_SIGHTINGS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_DELISTING_REASONS_VERSION + 1
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -757,6 +757,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         "sec_filing_events": [],
         "sec_form4_transactions": [],
         "snapshot_sightings": [],
+        "delisting_reasons": [],
     }
     # And the migrated store is shaped exactly as a fresh one.
     # (A fresh store gets version 18's and version 20's two kinds before the lab's
@@ -895,7 +896,7 @@ def test_the_migration_from_version_40_widens_the_verdict_check(tmp_path: Path) 
         rebuilt = ("research_results", "research_decisions")
         before = {name: sql for name, sql in _ddl(c).items() if name not in rebuilt}
         schema.init_schema(c)
-        assert _versions(c) == [40, 41, 42]
+        assert _versions(c) == list(range(40, schema.CURRENT_SCHEMA_VERSION + 1))
         assert "'not_computable'" in schema._check_text(c, "research_results", "verdict")
         # Every row kept, byte-identical, in insertion order, but run 3's verdict:
         # its NaN interval bound relabels its `fail` (#2658); no other table moved.
@@ -916,7 +917,7 @@ def test_the_migration_from_version_40_widens_the_verdict_check(tmp_path: Path) 
         after = _ddl(c)
         schema.init_schema(c)
         assert _ddl(c) == after
-        assert _versions(c) == [40, 41, 42]
+        assert _versions(c) == list(range(40, schema.CURRENT_SCHEMA_VERSION + 1))
 
 
 def conn_ddl() -> str:

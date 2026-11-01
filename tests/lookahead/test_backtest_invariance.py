@@ -767,9 +767,10 @@ def test_a_shares_fact_accepted_after_close_t_i_reaches_only_plans_after_t_i(
 #: T254 (#1976) adds a late owner-stamped `spinoff_allocations` fixture row, moving this pin.
 #: T306 (#2539) moved it only by hashing the two new, empty `sec_filing_events` and
 #: `sec_form4_transactions` tables' names; without them the hash is T254's 6b6cfd33...5fb35.
-#: #2295 (version 42) moved it only by hashing the new, empty `snapshot_sightings`
-#: table's name; without it the hash is T306's f3c2dc45...42ff1ec.
-TEMPLATE_FINGERPRINT = "029b728b9d221d44eb3923808f344a84438645a95bf74c2f82832a4d829787f3"
+#: #2295 (version 42) and T326 (#2682, version 43) moved it only by hashing the new, empty
+#: `snapshot_sightings` and `delisting_reasons` tables' names; without them the hash is
+#: T306's f3c2dc45...42ff1ec.
+TEMPLATE_FINGERPRINT = "591c83e2e1a9f02a050ba410aa2fa87036e39d57e95e726b9d111e710cb56b0c"
 
 
 def _bar_revisions(conn: duckdb.DuckDBPyConnection, sid: str, session: date) -> int:

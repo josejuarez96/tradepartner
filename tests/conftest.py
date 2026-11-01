@@ -556,7 +556,9 @@ def _load_table_csvs(conn: duckdb.DuckDBPyConnection, fixtures_dir: Path) -> Non
                 f"table name (known tables: {schema.TABLE_NAMES})"
             )
         # Old-version fixtures omit tables introduced after their schema version.
-        if table == "spinoff_allocations" and not _table_column_types(conn, table):
+        if table in ("spinoff_allocations", "delisting_reasons") and not _table_column_types(
+            conn, table
+        ):
             continue
         column_types = _table_column_types(conn, table)
         _assert_header_matches_columns(csv_path, table, column_types)

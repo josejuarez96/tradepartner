@@ -1192,6 +1192,7 @@ def test_every_fact_table_is_classified_for_trial_vintage(
             "sec_filing_events",
             "sec_form4_transactions",
             "snapshot_sightings",  # trials read listings, never raw SEC observations
+            "delisting_reasons",
         }
         assert included.isdisjoint(excluded)
         # An included name must be a store table, and every store table must
