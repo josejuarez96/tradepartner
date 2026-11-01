@@ -129,11 +129,20 @@ def _read_lines(path: Path) -> list[dict[str, Any]]:
     return out
 
 
+def _last_byte(path: Path) -> bytes:
+    with path.open("rb") as handle:
+        size = handle.seek(0, os.SEEK_END)
+        if not size:
+            return b""
+        handle.seek(size - 1)
+        return handle.read(1)
+
+
 def _append(path: Path, *records: dict[str, Any]) -> None:
     """Append and fsync the records (and the directory, when the file is new)."""
     fresh = not path.exists()
     with path.open("a", encoding="utf-8") as handle:
-        if not fresh and path.stat().st_size and path.read_bytes()[-1:] != b"\n":
+        if not fresh and _last_byte(path) not in (b"", b"\n"):
             handle.write("\n")  # end a torn line so the next record starts clean
         for record in records:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
