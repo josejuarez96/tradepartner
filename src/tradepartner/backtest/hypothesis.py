@@ -241,8 +241,8 @@ FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {
 #: label its signal ignores. `strategy.turnover_top_fraction` left it at T165c (#1358);
 #: `adjust.apply_spin_offs` entered at T211c and left at T211e (#1894);
 #: `strategy.hold_top_fraction` (T238, spec amendment #657) left it at T239, where the
-#: engine applies it. T328's `backtest.delisting_failure_return` (#2670) is in it until
-#: the engine applies the policy (T328's engine task).
+#: engine applies it. T328a's `backtest.delisting_failure_return` (#2670) is in it until
+#: the engine applies the policy (T328c).
 DELISTING_POLICY_KEY: Final = "backtest.delisting_failure_return"
 NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset({DELISTING_POLICY_KEY})
 
@@ -260,7 +260,7 @@ def long_short_refusal(params: Mapping[str, Any]) -> str | None:
     branch here.
 
     `refused_delisting_short`: `backtest.delisting_failure_return` is not `none` (short
-    delisting P&L stays closed until ADR 0024 consequence 5; #2670, plan T328).
+    delisting P&L stays closed until ADR 0024 consequence 5; #2670, plan T328a).
 
     `refused_portfolio`: the family's weighting is `hold`, `strategy.rebalance_band` is
     non-zero, or `strategy.hold_top_fraction` is not its default (none is specified for

@@ -364,7 +364,7 @@ PORTFOLIO_KEYS = (
     "portfolio.short_min_price",
     "portfolio.short_cover_weight",
 )
-#: T328's delisting failure-return policy key (#2670), a table entry at version 45.
+#: T328a's delisting failure-return policy key (#2670), a table entry at version 45.
 DELISTING_POLICY_KEYS = ("backtest.delisting_failure_return",)
 #: T187's successor-chain keys (#821), table entries at version 31.
 CHAIN_KEYS = (
@@ -1353,7 +1353,7 @@ BORROW_ENTRIES = (
 
 
 def test_borrow_entries_are_last_and_pinned_by_value() -> None:
-    """Appended after T219's `portfolio.*` entries, at the current schema version (T328's
+    """Appended after T219's `portfolio.*` entries, at the current schema version (T328a's
     entry follows them); both are post-registration cost keys, the headline alone may
     only rise."""
     assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-3:-1], BORROW_ENTRIES)
@@ -1400,7 +1400,7 @@ def test_a_non_default_borrow_key_moves_the_fingerprint_but_not_the_promotion_id
     ) == promotion.promotion_identity("momentum", params, IN_SAMPLE_START)
 
 
-# --- T328: the delisting failure-return policy (data-foundation amendment #2670) ------
+# --- T328a: the delisting failure-return policy (data-foundation amendment #2670) ------
 
 DELISTING_POLICY_KEY = "backtest.delisting_failure_return"
 

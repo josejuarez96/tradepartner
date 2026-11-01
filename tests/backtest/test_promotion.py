@@ -920,7 +920,7 @@ def test_a_long_only_file_promotes_as_before(lab: Lab) -> None:
     assert frozen.frozen_values(outcome.promoted)["portfolio.side"] == "long_only"
 
 
-# --- T328: the delisting policy key is outside the promotion identity (#2670) ---------
+# --- T328a: the delisting policy key is outside the promotion identity (#2670) ---------
 
 
 @pytest.mark.parametrize("value", ["failure_v1", "severe_v1"])

@@ -1393,7 +1393,7 @@ def test_a_screened_registration_runs_at_its_frozen_fraction(
     and T239 applies `strategy.hold_top_fraction` (#657), so `NOT_YET_APPLIED_KEYS` is
     empty and a registration at 0.20 loads at 0.20 (until T165c, quant-auditor on #1387
     had it refused)."""
-    # T328 (#2670): the delisting policy key waits for its engine task.
+    # T328a (#2670): the delisting policy key waits for its engine task.
     assert frozenset({"backtest.delisting_failure_return"}) == hypothesis.NOT_YET_APPLIED_KEYS
     _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
@@ -2298,7 +2298,7 @@ def test_a_file_may_name_the_borrow_keys(tmp_path: Path, settings: Settings) -> 
     assert params["costs.borrow_sensitivity_bps"] == [0.0, 300.0]
 
 
-# --- T328: the delisting failure-return policy (data-foundation amendment #2670) ------
+# --- T328a: the delisting failure-return policy (data-foundation amendment #2670) ------
 
 DELISTING_POLICY_KEY = "backtest.delisting_failure_return"
 

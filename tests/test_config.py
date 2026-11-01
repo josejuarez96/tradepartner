@@ -3641,7 +3641,7 @@ def test_raw_archive_per_mb_wait_is_finite_and_not_negative(bad: float) -> None:
         Settings(_env_file=None, raw_archive={"transfer_wait_s_per_mb": bad})
 
 
-# --- T328: the delisting failure-return policy (data-foundation amendment #2670) ------
+# --- T328a: the delisting failure-return policy (data-foundation amendment #2670) ------
 
 
 def test_delisting_failure_return_defaults_to_the_last_close_exit() -> None:

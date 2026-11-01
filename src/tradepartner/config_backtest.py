@@ -505,7 +505,7 @@ class HoldoutConfig(BaseModel):
 
 
 #: The frozen delisting failure-return policy versions (data-foundation spec amendment
-#: #2670, req 2; plan T328, owner answer 2026-10-31 on #836). `none` is today's
+#: #2670, req 2; plan T328a, owner answer 2026-10-31 on #836). `none` is today's
 #: last-close exit; a later change to a version's numbers takes a new version name.
 DelistingFailureReturn = Literal["none", "failure_v1", "severe_v1"]
 
@@ -557,7 +557,7 @@ class BacktestConfig(BaseModel):
     delisting_exit: Literal["last_close"] = "last_close"
     stale_exit_sessions: int = Field(default=5, gt=0)
     #: The frozen failure-return policy at delisting exits (`DELISTING_POLICIES`; plan
-    #: T328). `none` reproduces the last-close exit; the engine applies no other value yet.
+    #: T328a). `none` reproduces the last-close exit; the engine applies no other value yet.
     delisting_failure_return: DelistingFailureReturn = "none"
 
     @field_validator("cash_rate")
