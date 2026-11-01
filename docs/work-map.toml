@@ -1590,14 +1590,19 @@ why = "Its answers decide two owner rules and the table size before any schema w
 unblocks = ["task:T318", "task:T319a", "task:T319b"]
 
 [task.T318]
-what = "The filing_index table (the stamped EDGAR index with known_at = acceptance), its three state tables, the --check rules and the restamp match."
+what = "The filing_index table (the stamped EDGAR index with known_at = acceptance, and a dated revision row for a later SEC filed_on), its three state tables and the module that reads and writes them."
 why = "Storing the stamped index is what lets the nightly stop re-walking 33 years of EDGAR every run (#2629)."
-unblocks = ["task:T319", "task:T321", "task:T323a"]
+unblocks = ["task:T318b", "task:T319", "task:T323a", "task:T347"]
+
+[task.T318b]
+what = "The --check rules for filing_index, its filed_on revisions included, and the restamp's match on (cik, accession)."
+why = "They keep a stored index row's known_at honest and let a stamps repair move every revision of an accession (#2629, #2703)."
+unblocks = ["task:T323"]
 
 [task.T319]
 what = "The EDGAR adapter's incremental read: the new daily rows, the issuer rule, a new issuer's earlier rows, and stamps for new rows only."
 why = "It replaces the full-history walk that took 97 to 115 min a night with a read of what is new (#2629)."
-unblocks = ["task:T323"]
+unblocks = ["task:T323", "task:T347"]
 
 [task.T319a]
 what = "The new EDGAR requests (daily directory listing, daily file, conditional GET of a quarterly file) and the pure choice of which daily files are unread or re-posted."
@@ -1622,30 +1627,26 @@ unblocks = ["task:T323"]
 [task.T322]
 what = "A pure rule fingerprint over the settings, cache versions and schema the master builds read, plus a BUILD_RULES_VERSION constant."
 why = "A rule change must fail the nightly and ask for a full rebuild, never leave old rules on untouched names (#2629)."
-unblocks = ["task:T323", "task:T325"]
+unblocks = ["task:T323"]
 
 [task.T323]
 what = "The ingest driver that runs the incremental nightly EDGAR path behind edgar.incremental_index, and the resumable --rebuild-index full walk."
 why = "It puts the pieces together behind one switch, so the owner can roll back to today's full walk (#2629)."
-unblocks = ["task:T323b"]
+unblocks = ["task:T323b", "task:T347"]
 
 [task.T323a]
 what = "The master, classification, delisting and 13D readers move from the quarterly walk to the filing_index table, which becomes the one stamp source."
 why = "It removes the last full-history list from memory, the fix #2623 asked for (#2629)."
-unblocks = ["task:T323", "task:T325"]
+unblocks = ["task:T323"]
 
 [task.T323b]
 what = "The 100-day proof that an incremental store equals a full rebuild, and that peak memory stays flat from 2 to 20 years of history."
 why = "It is the evidence that the speed-up changes no stored fact (#2629)."
-unblocks = ["task:T324"]
+unblocks = ["task:T324", "task:T347"]
 
 [task.T324]
 what = "Owner step: seed the table on the real store, compare on a copy, turn the key on, and post 5 nightly runs' times and memory."
 why = "The nightly EDGAR run drops from about 2 hours and 4 GB to minutes and flat memory, after the 2026-10-31 sitting (#2629)."
-
-[task.T325]
-what = "Conditional: an order-free rule for which index row of an accession the 13D and delisting paths take, built only if the probe finds daily and quarterly files order rows differently."
-why = "The incremental and full builds must pick the same row whatever file they read it from (#2629, owner decision 4)."
 
 [issue.2670]
 what = "Amend the data-foundation direction for delisting reasons and returns and cash-based operating profitability inputs."
@@ -1671,6 +1672,92 @@ unblocks = ["task:T329"]
 what = "Feed deciding-read-visible reasons and mergers only to backtest exit costs; report unknown coverage and withheld shocks."
 why = "Later evidence must not change an earlier exit under the approved timing rule."
 
+[task.T354]
+what = "Read-only macOS spike to pin iCloud upload status, brctl commands and a bounded confirmation wait."
+why = "Eviction must wait for a reliable upload signal; an unconfirmed file remains local and counted."
+unblocks = ["task:T346", "task:T361"]
+
+[task.T345]
+what = "Configure the local raw archive path and refuse writes that breach the iCloud disk floor."
+why = "Raw-first ingest must fail safely without committing an account-specific path."
+unblocks = ["task:T346", "task:T360"]
+
+[task.T346]
+what = "Keep raw bodies by content hash and verify iCloud upload, eviction, download and integrity."
+why = "Form 4 XML and daily index inputs must survive parser fixes and sync eviction."
+unblocks = ["task:T347", "task:T348", "task:T361"]
+
+[task.T347]
+what = "Archive daily index files before parsing and record their hashes, URLs, fetch times and parser versions in runs."
+why = "A corrected daily file must remain available for a point-in-time rebuild."
+unblocks = ["task:T352"]
+
+[task.T348]
+what = "Archive fetched Form 4 XML and insider zips with new hashes before parsing; skip unchanged held accessions."
+why = "Reruns should fetch only new filings while retaining the exact source for repair."
+unblocks = ["task:T350", "task:T352"]
+
+[task.T349]
+what = "Declare per-field Form 4 source trust and tolerances and count disagreements."
+why = "A measured threshold replaces a single-mismatch quarter stop."
+unblocks = ["task:T351", "task:T353"]
+
+[task.T350]
+what = "Route multi-owner Form 4 accessions to XML and keep transaction-owner associations."
+why = "Bulk owner joins can assign a transaction to the wrong reporting owner."
+unblocks = ["task:T351"]
+
+[task.T351]
+what = "Apply per-source disagreement thresholds in Form 4 ingest and health."
+why = "A differing sampled filing should not discard an otherwise usable quarter."
+
+[task.T352]
+what = "Re-derive from named raw hashes, including archived insider zips, and enforce the archive's no-look-ahead reader boundary."
+why = "Parser repairs need exact historical inputs without exposing later files to research reads."
+
+[task.T360]
+what = "Plan which parts of the existing EDGAR cache move into the raw archive, which are backed up and which stay, with bytes to free."
+why = "About 1.4 GB of dead cache versions and raw corpus sit on a laptop near its 10 GB disk floor (#2743)."
+unblocks = ["task:T361"]
+
+[task.T361]
+what = "Move the planned cache files into the raw archive by rename and hash, back up the stamps, and resume or restore any run."
+why = "Disk is freed only after upload is confirmed, and every moved byte stays restorable without a fresh SEC fetch."
+unblocks = ["task:T362"]
+
+[task.T362]
+what = "Add the archive migrate-cache and restore commands, and make the departure corpus fetch refuse a file that was archived."
+why = "The owner needs a dry run before moving anything, and a corpus re-fetch must never replace an archived body with later content."
+
+[task.T353]
+what = "Read-only baseline of accession-level Form 4 disagreements and XML request cost over #2706's 11 quarters."
+why = "The owner needs measured counts before setting the rule-5 failure threshold."
+unblocks = ["task:T351"]
+
+[task.T355]
+what = "Add the research_exposures table and a nullable trial_results.n_exposure column at the next free schema version (44 after 41 to 43)."
+why = "A desk read that reads returns outside the backtester needs a row, or the family's N misses that look (#2723)."
+unblocks = ["task:T356"]
+
+[task.T356]
+what = "Write exposure records that hash their own probe file, and add the store-source exposures to a family's N as its third part."
+why = "N must count every look at the store's returns; candidate 5 alone is two looks the registry did not count (#2723)."
+unblocks = ["task:T357", "task:T358"]
+
+[task.T357]
+what = "Add the exposure record and exposures CLI commands, with no edit, delete or withdraw command."
+why = "The owner records desk reads in one checked command, and the candidate list is a cross-check on the search tally (#2723)."
+unblocks = ["task:T359"]
+
+[task.T358]
+what = "Show exposures on the research view, and split today's N on the backtest page into trials, research runs and exposures."
+why = "A reviewer should see what raised N and which reads only disclosed exposure (#2723)."
+
+[task.T359]
+what = "Owner backfill: record candidate 5's two store launches and the open-data desk reads since 2026-10-30."
+why = "The profitability family's N must rise by exactly 2 before the next profitability trial is judged (#2723)."
+unblocks = ["issue:2723"]
+
 
 
 [research.2026-10-30-equity-issuance-desk-read]
@@ -1680,8 +1767,18 @@ unblocks = ["issue:2669"]
 
 [research.2026-10-31-form4-insider-purchases-desk-read]
 what = "Check opportunistic Form 4 purchases against a timestamped net-of-cost, acceptance-timed monthly kill line."
-why = "It records an INSUFFICIENT desk read and the owner-approved frozen registered event study, after counts-only feasibility (#2673)."
+why = "It records an INSUFFICIENT desk read and the owner-approved frozen registered event study, after counts-only feasibility (#2673).; retired after the T342 FAIL (#2734, #2736)"
 unblocks = ["issue:2673"]
+
+[research.2026-11-form4-insider-feasibility-recount]
+what = "T342's counts-only recount of the Form 4 insider-purchase study on a store copy: FAIL, the $200M stratum has at most 47 opportunistic events and no treated delister."
+why = "It records the B7 registered event study as INSUFFICIENT under its own feasibility gate, so T332 to T341 and T344 are struck rather than built (#2679)."
+unblocks = ["issue:2679"]
+
+[research.2026-11-form4-insider-feasibility-recount-appendix]
+what = "The byte-for-byte source of the T342 recount script (sha256 9dcb98de...), the method appendix of the T342 note."
+why = "It lets the B7 FAIL be audited and re-run from the repo, as the T342 plan line requires (#2679)."
+unblocks = ["issue:2679"]
 
 [research.2026-10-31-cash-op-profitability-desk-read]
 what = "Read cash-based operating profitability in both Chen-Zimmermann portfolio files against a frozen cost and leg line."

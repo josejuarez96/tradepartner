@@ -1123,6 +1123,22 @@ class ResearchConfig(BaseModel):
     claude: ResearchClaudeConfig = Field(default_factory=ResearchClaudeConfig)
 
 
+class RawArchiveConfig(_ClosedConfig):
+    """The local raw archive's disk floor (plan T345, #2744; ADR 0028, Upload and
+    Disk; data-foundation spec amendment #2714 item 3).
+
+    `min_free_disk_gb` is the free space, in GB, the archive's disk must keep after
+    an archive write: the guard (`store.raw_archive_config.check_archive_write`)
+    subtracts the file's size from the free space and refuses a result below it.
+    It fails closed, so unlike `ingest.min_free_disk_gb` it cannot be 0 ("off").
+    The archive's path is not here: it is the top-level `TRADEPARTNER_RAW_ARCHIVE`
+    (`Settings.tradepartner_raw_archive`), held in `.env` only. Not frozen, part of
+    no hypothesis.
+    """
+
+    min_free_disk_gb: float = Field(default=10.0, gt=0)
+
+
 class Settings(BaseSettings):
     """Root application settings, loaded from env vars and an optional `.env`."""
 
@@ -1179,6 +1195,8 @@ class Settings(BaseSettings):
     ui: UiConfig = Field(default_factory=UiConfig)
     # T305 (#2435): SEC ownership event forms; not frozen, last so no section shifts.
     events: EventsConfig = Field(default_factory=EventsConfig)
+    # T345 (#2744): the raw archive's write floor; not frozen, last so no section shifts.
+    raw_archive: RawArchiveConfig = Field(default_factory=RawArchiveConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
@@ -1213,6 +1231,12 @@ class Settings(BaseSettings):
     # real model client cannot be built (ADR 0013 point 3 (e)).
     typesafe_api_key: SecretStr | None = Field(default=None)
     research_claude_api_key: SecretStr | None = Field(default=None)
+    # T345 (#2744; ADR 0028): the local raw archive's root, env `TRADEPARTNER_RAW_ARCHIVE`,
+    # set only in `.env`. Unset or blank means the archive is off. A `SecretStr` because
+    # the path names the macOS account (and may name an iCloud folder): `repr` hides it
+    # and `secret_values` redacts it from every stored message. Read and checked only
+    # by `store/raw_archive_config.py`, never validated here (#1093).
+    tradepartner_raw_archive: SecretStr | None = Field(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         # A per-instance default (not a class-level `model_config` value) so

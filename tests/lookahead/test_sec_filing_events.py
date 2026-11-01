@@ -176,4 +176,4 @@ def test_version_38_migration_keeps_existing_filing_rows() -> None:
     assert {"sec_filing_events", "sec_form4_transactions"} <= {
         name for (name,) in conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
     }
-    assert schema.stored_version(conn) == 40
+    assert schema.stored_version(conn) == schema.CURRENT_SCHEMA_VERSION

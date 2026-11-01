@@ -177,7 +177,11 @@ def _q2(value: Decimal | None) -> Decimal | None:
 
 def _comparable(row: Form4Transaction) -> tuple[object, ...]:
     return tuple(
-        _q2(getattr(row, f.name)) if f.name in _ROUNDED_FIELDS else getattr(row, f.name)
+        _q2(getattr(row, f.name))
+        if f.name in _ROUNDED_FIELDS
+        else " ".join(row.security_title.split())
+        if f.name == "security_title"
+        else getattr(row, f.name)
         for f in fields(Form4Transaction)
     )
 
@@ -186,7 +190,8 @@ def rows_agree(bulk_rows: Sequence[Form4Transaction], xml_rows: Sequence[Form4Tr
     """Whether the bulk and XML rows of one accession are the same rows. Rows are matched
     by `(filer_cik, line_no)`, never by owner position; the keys must be the same set with
     none repeated, and every contract field must be equal, price, shares and shares owned
-    after at 2 decimals. A reordered pair of transactions differs at its keys and fails."""
+    after at 2 decimals and security-title whitespace collapsed. A reordered pair of
+    transactions differs at its keys and fails."""
     bulk_by_key = {(r.filer_cik, r.line_no): r for r in bulk_rows}
     xml_by_key = {(r.filer_cik, r.line_no): r for r in xml_rows}
     if len(bulk_by_key) != len(bulk_rows) or len(xml_by_key) != len(xml_rows):

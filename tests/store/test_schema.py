@@ -2940,10 +2940,9 @@ def test_read_only_open_of_a_version_37_store_still_serves_every_other_read(
 ) -> None:
     """A read-only connection never migrates: a version-37 store passes, its
     `schema_version` stays 37, its `trial_rebalances` and `paper_plans` lack the two
-    version-38 columns, and every read not naming them works (plan T241).
-    `journal.plans_for` names every `PaperPlanRow` field, so it reads the two as
-    NULL there instead of failing on the missing columns: the dashboard's
-    Operations page calls it on a read-only store (safety review of PR #2105)."""
+    version-38 columns, and reads not naming them work (plan T241).
+    `journal.plans_for` refuses the unmigrated store before selecting the
+    missing columns."""
     path = tmp_path / "v37.duckdb"
     conn = duckdb.connect(str(path))
     try:
@@ -2960,7 +2959,8 @@ def test_read_only_open_of_a_version_37_store_still_serves_every_other_read(
         assert ro.execute("SELECT count(*) FROM paper_plans").fetchone() == (0,)
         for table in ("trial_rebalances", "paper_plans"):
             assert not {name for name, _ in _ASSETS_INTERSECTION_ADDED} <= _table_columns(ro, table)
-        assert journal.plans_for(ro, 1) == []
+        with pytest.raises(schema.SchemaVersionError, match="paper plans require schema version"):
+            journal.plans_for(ro, 1)
 
 
 def test_version_39_adds_only_spinoff_allocations() -> None:
@@ -2982,7 +2982,7 @@ def test_version_39_adds_only_spinoff_allocations() -> None:
         assert versions == [38]
         schema.init_schema(conn)
         after = _shape(conn)
-        # The same open also takes T306's version 40 (#2539).
+        # The same open also takes T306's version 40 (#2539) and 41 (#2617).
         assert set(after) - set(before) == {
             "spinoff_allocations",
             "sec_filing_events",

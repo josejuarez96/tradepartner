@@ -4,7 +4,7 @@ never before; the migration keeps every stored row live."""
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,10 +19,14 @@ from tradepartner.store.db import configure_connection, insert_row
 from tradepartner.store.master import MasterBuild, securities_as_of
 from tradepartner.store.retraction import (
     Underived,
+    carry_forward_underived,
+    cik_of,
+    record_underived,
     retraction,
     split_kept,
     stored_underived,
     underived,
+    underived_as_of,
     write_retractions,
 )
 
@@ -278,3 +282,112 @@ def test_split_kept_partitions_by_security_id_and_keeps_order() -> None:
     assert split_kept(found, frozenset(), frozenset()) == (found, ())
     # Derived again: the keep no longer applies (quant audit of #923).
     assert split_kept(found, keep, keep) == (found, ())
+
+
+# --- carry-forward of a touched-only run (#2629, T321) ---------------------------------
+
+CIK_A, CIK_B, CIK_C = "0000000001", "0000000002", "0000000003"
+RUN_START = datetime(2026, 10, 20, 22, 0, tzinfo=UTC)
+
+
+def _stored_pair(cik: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    security = _security(cik) | {"cik": cik}
+    return security, _listing(cik, ticker="T" + cik[-1])
+
+
+def _record_run(c: duckdb.DuckDBPyConnection, run_id: str, started: datetime, found: Any) -> None:
+    insert_row(
+        c,
+        "ingestion_runs",
+        {
+            "run_id": run_id,
+            "started_at": started,
+            "finished_at": started + timedelta(minutes=5),
+            "status": "ok",
+            "source": "edgar",
+            "mode": "session",
+            "rows_added": 0,
+            "chunk_cursor": None,
+            "message": None,
+        },
+    )
+    record_underived(c, run_id, started + timedelta(minutes=5), found)
+
+
+def _set(frame: Any) -> set[tuple[Any, ...]]:
+    return {
+        (r["table"], r["security_id"], r["ticker"], r["exchange"], r["valid_from"], r["known_at"])
+        for r in frame.iter_rows(named=True)
+    }
+
+
+def test_a_touched_only_run_reads_the_same_underived_set_as_a_full_one(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    for cik in (CIK_A, CIK_B, CIK_C):
+        security, listing = _stored_pair(cik)
+        insert_row(conn, "securities", security)
+        insert_row(conn, "listings", listing)
+    # Night 1 (full): the build derives nothing, so all three CIKs are underived.
+    empty = _build((), ())
+    stored = stored_underived(conn, empty, FIXED)
+    assert len(stored) == 6
+    _record_run(conn, "full-1", RUN_START, stored)
+    previous = underived_as_of(conn, RUN_START + timedelta(hours=1))
+
+    # Night 2: only CIK_A is touched, and its rows are derived again.
+    security_a, listing_a = _stored_pair(CIK_A)
+    build_a = _build((security_a,), (listing_a,))
+    touched = frozenset({CIK_A})
+    recomputed = underived(
+        build_a,
+        [r for r in securities_as_of(conn, LATER).iter_rows(named=True) if r["cik"] in touched],
+        [
+            r
+            for r in listings_as_of(conn, LATER).iter_rows(named=True)
+            if cik_of(r["security_id"]) in touched
+        ],
+    )
+    carried = carry_forward_underived(recomputed, previous.iter_rows(named=True), touched)
+    day2 = RUN_START + timedelta(days=1)
+    _record_run(conn, "touched-2", day2, carried)
+
+    # The full run of night 2 judges every CIK against the same build.
+    full = underived(
+        build_a,
+        securities_as_of(conn, LATER).iter_rows(named=True),
+        listings_as_of(conn, LATER).iter_rows(named=True),
+    )
+    _record_run(conn, "full-2", day2 + timedelta(hours=1), full)
+    at = day2 + timedelta(hours=2)
+    assert _set(underived_as_of(conn, day2 + timedelta(minutes=30))) == _set(
+        underived_as_of(conn, at)
+    )
+    assert {row[1] for row in _set(underived_as_of(conn, at))} == {CIK_B, CIK_C}
+
+
+def test_carry_forward_drops_touched_and_skipped_ciks_and_prefers_recomputed() -> None:
+    old = [
+        {"table": "securities", "security_id": CIK_A, "ticker": None, "exchange": None,
+         "valid_from": None, "known_at": KNOWN},
+        {"table": "securities", "security_id": CIK_B, "ticker": None, "exchange": None,
+         "valid_from": None, "known_at": KNOWN},
+        {"table": "securities", "security_id": CIK_C, "ticker": None, "exchange": None,
+         "valid_from": None, "known_at": KNOWN},
+    ]  # fmt: skip
+    fresh = Underived("securities", {"security_id": CIK_A, "known_at": LATER})
+    out = carry_forward_underived([fresh], old, frozenset({CIK_A}), frozenset({CIK_C}))
+    assert [u.key for u in out] == [(CIK_A,), (CIK_B,)]
+    assert out[0].row["known_at"] == LATER
+    assert out[1].row["known_at"] == KNOWN
+    # A pure function: nothing but a new tuple comes back.
+    assert carry_forward_underived([], [], frozenset()) == ()
+
+
+def test_carry_forward_orders_securities_before_listings_by_key() -> None:
+    listing = {"table": "listings", "security_id": CIK_A, "ticker": "A", "exchange": "NYSE",
+               "valid_from": date(2020, 1, 1), "known_at": KNOWN}  # fmt: skip
+    security = {"table": "securities", "security_id": CIK_B, "ticker": None, "exchange": None,
+                "valid_from": None, "known_at": KNOWN}  # fmt: skip
+    out = carry_forward_underived([], [listing, security], frozenset())
+    assert [u.table for u in out] == ["securities", "listings"]
