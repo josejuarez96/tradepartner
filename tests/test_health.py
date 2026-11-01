@@ -273,6 +273,48 @@ LIVE_AT_END = (
 )
 
 
+def test_implausible_form4_dates_are_warning_only(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    """Count only filings known at T; keep every source row in the store."""
+    accepted = datetime(2020, 6, 29, 14, tzinfo=UTC)
+    later = datetime(2020, 7, 1, 14, tzinfo=UTC)
+    for line, stamp, transaction_day in (
+        (0, accepted, date(2016, 6, 29)),
+        (1, later, date(2016, 7, 1)),
+    ):
+        fixture_store.execute(
+            "INSERT INTO sec_form4_transactions VALUES (" + ", ".join(["?"] * 23) + ")",
+            [
+                "implausible",
+                "issuer",
+                "owner",
+                line,
+                False,
+                True,
+                False,
+                False,
+                transaction_day,
+                None,
+                "P",
+                "A",
+                10,
+                2,
+                10,
+                "D",
+                "Common",
+                None,
+                stamp,
+                stamp,
+                stamp,
+                "edgar",
+                "filing",
+            ],
+        )
+    report = health.health_report(fixture_store, T_END, _settings())
+    assert report.implausible_form4_dates == 1
+    assert report.ok
+    assert fixture_store.execute("SELECT count(*) FROM sec_form4_transactions").fetchone()[0] == 2
+
+
 def _settings(**overrides: Any) -> Settings:
     return Settings(_env_file=None, **overrides)
 

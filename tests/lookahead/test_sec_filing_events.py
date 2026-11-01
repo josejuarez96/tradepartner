@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime
 
 import duckdb
 import pytest
+from pydantic import ValidationError
 
 from tradepartner.config import EventsConfig, Settings
 from tradepartner.store import asof, schema
@@ -156,6 +157,72 @@ def test_sec_reads_agree_with_truncated_store() -> None:
     assert asof.sec_filing_events_as_of(
         full, late, ["SC 13D"], subject_cik="other", settings=settings
     ).is_empty()
+
+
+def test_form4_date_plausibility_uses_own_acceptance_and_reports_exclusions() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accepted = datetime(2026, 10, 28, 2, 0, tzinfo=UTC)  # Oct 27 in New York
+    for line, transaction_day in enumerate(
+        (date(2024, 10, 27), date(2024, 10, 26), date(2026, 10, 28))
+    ):
+        conn.execute(
+            "INSERT INTO sec_form4_transactions VALUES (" + ", ".join(["?"] * 23) + ")",
+            [
+                "0002",
+                "issuer",
+                "owner",
+                line,
+                False,
+                True,
+                False,
+                False,
+                transaction_day,
+                None,
+                "P",
+                "A",
+                10,
+                2,
+                10,
+                "D",
+                "Common",
+                None,
+                accepted,
+                accepted,
+                accepted,
+                "edgar",
+                "filing",
+            ],
+        )
+    settings = Settings(
+        _env_file=None, events=EventsConfig(sec_forms_read_enabled=True, form4_max_age_years=2)
+    )
+    rows, excluded = asof.sec_form4_transactions_as_of(
+        conn, accepted, settings=settings, with_excluded_count=True
+    )
+    assert rows["line_no"].to_list() == [0]
+    assert excluded == 2
+    assert (
+        len(
+            asof.sec_form4_transactions_as_of(
+                conn, accepted, settings=settings, include_implausible=True
+            )
+        )
+        == 3
+    )
+    assert conn.execute("SELECT count(*) FROM sec_form4_transactions").fetchone()[0] == 3
+    assert asof.sec_form4_transactions_as_of(
+        conn, accepted.replace(year=2030), settings=settings
+    ).equals(rows)
+    shorter = Settings(
+        _env_file=None, events=EventsConfig(sec_forms_read_enabled=True, form4_max_age_years=1)
+    )
+    assert asof.sec_form4_transactions_as_of(conn, accepted, settings=shorter).is_empty()
+
+
+def test_form4_max_age_must_be_positive() -> None:
+    with pytest.raises(ValidationError):
+        EventsConfig(form4_max_age_years=0)
 
 
 def test_version_38_migration_keeps_existing_filing_rows() -> None:

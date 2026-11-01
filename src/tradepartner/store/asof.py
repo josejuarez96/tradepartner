@@ -275,7 +275,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Final
+from typing import Any, Final, Literal, overload
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -1491,32 +1491,82 @@ def sec_filing_events_as_of(
     ).pl()
 
 
+def form4_date_plausibility_sql(max_age_years: int) -> str:
+    """SQL predicate for a Form 4 date within the filing's own New York acceptance day.
+
+    This pure expression is shared by as-of reads and health. It never uses
+    the query time or a later filing to judge a transaction date.
+    """
+    if max_age_years <= 0:
+        raise ValueError("max_age_years must be positive")
+    accepted_day = "CAST(accepted_at AT TIME ZONE 'America/New_York' AS DATE)"
+    return (
+        f"transaction_date BETWEEN {accepted_day} - INTERVAL '{max_age_years} years' "
+        f"AND {accepted_day}"
+    )
+
+
+@overload
 def sec_form4_transactions_as_of(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
     subject_cik: str | None = None,
     *,
     settings: Settings | None = None,
-) -> pl.DataFrame:
+    include_implausible: bool = False,
+    with_excluded_count: Literal[False] = False,
+) -> pl.DataFrame: ...
+
+
+@overload
+def sec_form4_transactions_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    subject_cik: str | None = None,
+    *,
+    settings: Settings | None = None,
+    include_implausible: bool = False,
+    with_excluded_count: Literal[True],
+) -> tuple[pl.DataFrame, int]: ...
+
+
+def sec_form4_transactions_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    subject_cik: str | None = None,
+    *,
+    settings: Settings | None = None,
+    include_implausible: bool = False,
+    with_excluded_count: bool = False,
+) -> pl.DataFrame | tuple[pl.DataFrame, int]:
     """Read non-derivative Form 4 rows by issuer CIK at acceptance time.
 
     Bulk share counts may be rounded to two decimal places. A 4/A has its own
     accession and coexists with its original; a consumer must decide how to
     treat amendments. Transaction and deemed execution dates are filer-entered
-    dates, not clocks.
+    dates, not clocks. By default, exclude dates outside the filing's own
+    acceptance-day window. Request `with_excluded_count` for the count removed.
     """
-    _require_sec_forms_read(settings)
+    active_settings = settings if settings is not None else get_settings()
+    _require_sec_forms_read(active_settings)
     t = _validate_t(t)
     params: list[Any] = [t]
     subject_filter = ""
     if subject_cik is not None:
         subject_filter = " AND issuer_cik = ?"
         params.append(subject_cik)
-    return conn.execute(
-        "SELECT * FROM sec_form4_transactions WHERE known_at <= ?"
-        f"{subject_filter} ORDER BY known_at, accession, filer_cik, line_no",
+    predicate = form4_date_plausibility_sql(active_settings.events.form4_max_age_years)
+    base = f"FROM sec_form4_transactions WHERE known_at <= ?{subject_filter}"
+    excluded = 0
+    if with_excluded_count and not include_implausible:
+        count_row = conn.execute(f"SELECT count(*) {base} AND NOT ({predicate})", params).fetchone()
+        excluded = int(count_row[0]) if count_row is not None else 0
+    plausible_filter = "" if include_implausible else f" AND ({predicate})"
+    rows = conn.execute(
+        f"SELECT * {base}{plausible_filter} ORDER BY known_at, accession, filer_cik, line_no",
         params,
     ).pl()
+    return (rows, excluded) if with_excluded_count else rows
 
 
 def _latest_assets_observation(conn: duckdb.DuckDBPyConnection, t: datetime) -> datetime | None:
