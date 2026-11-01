@@ -3639,3 +3639,44 @@ def test_raw_archive_waits_must_be_positive_and_finite(key: str, bad: float) -> 
 def test_raw_archive_per_mb_wait_is_finite_and_not_negative(bad: float) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, raw_archive={"transfer_wait_s_per_mb": bad})
+
+
+# --- T328: the delisting failure-return policy (data-foundation amendment #2670) ------
+
+
+def test_delisting_failure_return_defaults_to_the_last_close_exit() -> None:
+    assert _settings().backtest.delisting_failure_return == "none"
+
+
+@pytest.mark.parametrize("value", ["none", "failure_v1", "severe_v1"])
+def test_delisting_failure_return_accepts_each_version(value: str) -> None:
+    settings = Settings(_env_file=None, backtest={"delisting_failure_return": value})
+    assert settings.backtest.delisting_failure_return == value
+
+
+@pytest.mark.parametrize("value", ["default", "0%", "failure_v2", ""])
+def test_delisting_failure_return_refuses_an_unknown_version(value: str) -> None:
+    with pytest.raises(ValidationError, match="delisting_failure_return"):
+        Settings(_env_file=None, backtest={"delisting_failure_return": value})
+
+
+def test_delisting_policies_are_pinned_by_value() -> None:
+    """Append-only: a version's numbers never change; a new map takes a new name.
+    `NYSE_ARCA` and Cboe are unmapped, so the engine refuses them (never 0%)."""
+    from tradepartner.config_backtest import DELISTING_POLICIES, DelistingFailureReturn
+
+    assert set(DELISTING_POLICIES) == set(get_args(DelistingFailureReturn))
+    pinned = {
+        name: (dict(policy.shocks), policy.shock_unknown, policy.merger_window_sessions)
+        for name, policy in DELISTING_POLICIES.items()
+    }
+    assert pinned == {
+        "none": ({}, False, 0),
+        "failure_v1": ({"NYSE": -0.30, "NYSE_AMERICAN": -0.30, "NASDAQ": -0.55}, False, 10),
+        "severe_v1": ({"NYSE": -0.55, "NYSE_AMERICAN": -0.55, "NASDAQ": -1.00}, True, 10),
+    }
+    for policy in DELISTING_POLICIES.values():
+        assert "NYSE_ARCA" not in policy.shocks
+        assert all(-1.0 <= shock < 0.0 for shock in policy.shocks.values())
+        with pytest.raises(TypeError):
+            policy.shocks["NYSE_ARCA"] = 0.0  # type: ignore[index]

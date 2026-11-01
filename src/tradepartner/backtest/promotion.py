@@ -126,14 +126,15 @@ def promotion_identity(family: str, params: Mapping[str, Any], in_sample_start: 
     """The fingerprint computed without the cost keys (spec, Definitions,
     Promotion): one identity for a strategy at every cost base. `costs.per_side_bps`,
     the T210 cost terms (`spread_bps`, `impact_coeff`, `adv_sessions`) and the T211c
-    opt-in `adjust.apply_spin_offs` are fingerprint keys outside the promotion
-    identity."""
+    opt-in `adjust.apply_spin_offs` and T328's `backtest.delisting_failure_return`
+    are fingerprint keys outside the promotion identity."""
     without_cost = {
         k: v
         for k, v in params.items()
         if k != registry.BASE_COST_KEY
         and k not in frozen.POST_REGISTRATION_COST_KEYS
         and k not in frozen.POST_REGISTRATION_ADJUST_KEYS
+        and k not in frozen.POST_REGISTRATION_BACKTEST_KEYS
     }
     return frozen.fingerprint(family, without_cost, in_sample_start)
 

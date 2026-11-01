@@ -6,9 +6,11 @@ imports only `config_base`, never `tradepartner.config`.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
-from typing import Annotated, Literal
+from types import MappingProxyType
+from typing import Annotated, Final, Literal
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
@@ -502,6 +504,39 @@ class HoldoutConfig(BaseModel):
         return self
 
 
+#: The frozen delisting failure-return policy versions (data-foundation spec amendment
+#: #2670, req 2; plan T328, owner answer 2026-10-31 on #836). `none` is today's
+#: last-close exit; a later change to a version's numbers takes a new version name.
+DelistingFailureReturn = Literal["none", "failure_v1", "severe_v1"]
+
+
+@dataclass(frozen=True)
+class DelistingPolicy:
+    """One version's frozen terms: the terminal return by listing exchange applied to a
+    confirmed `performance_failure` or `bankruptcy` exit (an exchange outside the map
+    refuses the policy, never 0%), whether an `unknown` non-merger, non-transfer exit is
+    shocked too, and the merger match window in trading sessions after `end_session`.
+    `merger_acquisition` takes no shock and `voluntary_other` is 0% in every version."""
+
+    shocks: Mapping[str, float]
+    shock_unknown: bool
+    merger_window_sessions: int
+
+
+#: Each version's terms, pinned by value in `tests/test_config.py`. Append-only.
+DELISTING_POLICIES: Final[Mapping[DelistingFailureReturn, DelistingPolicy]] = MappingProxyType(
+    {
+        "none": DelistingPolicy(MappingProxyType({}), False, 0),
+        "failure_v1": DelistingPolicy(
+            MappingProxyType({"NYSE": -0.30, "NYSE_AMERICAN": -0.30, "NASDAQ": -0.55}), False, 10
+        ),
+        "severe_v1": DelistingPolicy(
+            MappingProxyType({"NYSE": -0.55, "NYSE_AMERICAN": -0.55, "NASDAQ": -1.00}), True, 10
+        ),
+    }
+)
+
+
 class BacktestConfig(BaseModel):
     """Engine settings (spec reqs 4 and 5).
 
@@ -521,6 +556,9 @@ class BacktestConfig(BaseModel):
     cash_rate: float | Literal["store"] = 0.0
     delisting_exit: Literal["last_close"] = "last_close"
     stale_exit_sessions: int = Field(default=5, gt=0)
+    #: The frozen failure-return policy at delisting exits (`DELISTING_POLICIES`; plan
+    #: T328). `none` reproduces the last-close exit; the engine applies no other value yet.
+    delisting_failure_return: DelistingFailureReturn = "none"
 
     @field_validator("cash_rate")
     @classmethod
