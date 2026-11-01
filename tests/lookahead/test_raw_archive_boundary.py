@@ -23,7 +23,7 @@ default, and splits by capability:
   `TRADEPARTNER_RAW_ARCHIVE`, the re-derive module).
 
 A text scan, not only an AST walk, so a dynamic import, an environment read or a
-settings attribute is caught too. T347, T348, T352 and T361 extend the lists for
+settings attribute is caught too. T347, T348, T352 and T361a extend the lists for
 the modules they add.
 """
 
@@ -53,6 +53,7 @@ _WRITERS = frozenset(
         "adapters/edgar_raw.py",
         "adapters/form4_bulk_route.py",
         "adapters/form4_route.py",
+        "store/raw_archive_migrate.py",
     }
 )
 #: Any text naming the archive or the re-derive module.

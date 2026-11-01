@@ -664,3 +664,61 @@ def download_inputs(
             )
         out.append(ArchivedBody(sha256=sha, size=os.lstat(path).st_size))
     return tuple(out)
+
+
+def same_filesystem(settings: Settings, directory: Path) -> bool:
+    """Whether `directory` and the archive root are on one filesystem (equal
+    `st_dev`), the condition for `adopt_file`'s rename (#2743 item 2)."""
+    root = require_archive_root(settings)
+    return os.stat(directory).st_dev == os.stat(root).st_dev
+
+
+def adopt_file(settings: Settings, source: Path, sha256: str, *, size: int) -> Archived:
+    """Move a local file into the archive under its hash by rename (plan T361a,
+    #2743 item 2): no bytes are written, so the floor does not apply. The caller
+    hashed `source`; it must still be a regular file of `size` bytes on the
+    archive's filesystem. The final name is made with `os.link` (which never
+    replaces) and the caller then unlinks `source`, so a crash between the two leaves both
+    names of one inode, which a rerun finishes. `created` means the archive now has
+    the name and `source` is the caller's to unlink (this module removes only its
+    own temp files). If the hash is already held the
+    source is left alone and `created` is false (a duplicate, for the caller to
+    settle). Raises `RawArchiveIntegrityError` for a changed or foreign source or
+    a held name of another size."""
+    root = require_archive_root(settings)
+    dest = body_path(root, sha256)
+    _tree(root, dest, create=True)
+    info = os.lstat(source)
+    if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+        raise RawArchiveIntegrityError("refused: the source changed after it was hashed")
+    if info.st_dev != os.stat(dest.parent).st_dev:
+        raise RawArchiveIntegrityError("refused: the source is on another filesystem")
+    held = _held_size(dest)
+    if held is None:
+        try:
+            os.link(source, dest)
+        except FileExistsError:
+            held = _held_size(dest)
+        else:
+            _fsync_dir(dest.parent)
+            return Archived(sha256=sha256, created=True, size=size)
+    if held not in (-1, size):
+        raise RawArchiveIntegrityError(
+            f"archived {sha256} holds {held} bytes, not {size}: the archive is damaged; "
+            "it is left as it is"
+        )
+    if os.path.lexists(dest) and os.path.samestat(info, os.lstat(dest)):
+        # a rename that crashed between its link and the caller's unlink
+        return Archived(sha256=sha256, created=True, size=size)
+    return Archived(sha256=sha256, created=False, size=size)
+
+
+def local_body_matches(settings: Settings, sha256: str, icloud: ICloudItems) -> bool:
+    """Whether the archived body with this hash is local (not evicted, not a
+    placeholder) and re-hashes equal now, the condition for unlinking a duplicate
+    source (#2743 item 2). Never downloads: an evicted body is false."""
+    path = body_path(require_archive_root(settings), sha256)
+    if not os.path.exists(path) or _st_flags(path) & SF_DATALESS:
+        return False
+    state = icloud.status([path]).get(path)
+    return state is not None and _is_local(state) and _hash_file(path) == sha256
