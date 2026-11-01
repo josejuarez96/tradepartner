@@ -3237,6 +3237,17 @@ source = "docs/research/2026-10-28-c1-filing-delay-results.md; docs/experiments/
 bears_on = ["backlog:C1"]
 note = "Registry runs: C1 run 2 (vs SPY; superseded, size and beta not signal) and C1b run 3 (artifact data/research/c1b-filing-delay-matched/c1b-filing-delay-matched-run3.json, t_min long -1.46, short -2.78). Retired by the owner 2026-10-27, killed on survivor data (#2371, #2411)."
 
+[[claim]]
+id = "TP-9"
+statement = "The B7 registered event study of opportunistic officer/director Form 4 code-P purchases is INSUFFICIENT under its own feasibility gate: on a complete snapshot (0 of 32 quarters 2016Q1-2023Q4 below the T343 ratio), the $200M stratum has at most 47 opportunistic events in the 2020-2023 window against the frozen 400 floor and no Form 25 delisted security in its treated pool, while all names has 2,882 (0.6% missing entry bars, treated and neutral delister coverage 100% and 93.6%); the frozen line needs both strata, so B7 was retired by the owner on 2026-10-31 without a return run."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "Counts and coverage only, no return read: T342 recount (recount.py sha256 9dcb98de00428c2e6c22c47214a1222238186d16ec4868abaee5c746fef13c15) on a byte copy of the owner's store taken 2026-10-31 21:18 New York, after the 20:11 backfill run and before the #2720 roles correction; n is an upper bound (no_mcap and no_beta drops not applied); frozen design from the 2026-10-31 desk read and the owner's T343 answers, no value changed"
+source = "docs/research/2026-11-form4-insider-feasibility-recount.md"
+section = "Answer"
+bears_on = ["backlog:B7"]
+note = "Family N not charged (owner, 2026-10-31, 'Go with recs': no run opened, no return read). Leaves G2-B (MIXED) and G2-A (NOT SUPPORTED) as graded; it says nothing about the size of the effect, only that the frozen test cannot be decided in this store's window. T332 to T341 and T344 are struck by a follow-up plan PR. A later insider-purchase test needs a new registration."
+
 # ===== 2026-10-11-sharadar-overlap-test.md =====
 
 [[claim]]
