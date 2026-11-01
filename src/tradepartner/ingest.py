@@ -1224,7 +1224,7 @@ def write_run(
     )
 
 
-_write_run = write_run
+_write_run: Callable[..., None] = write_run
 
 
 # --- the EDGAR chunk --------------------------------------------------------
