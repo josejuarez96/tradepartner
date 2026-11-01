@@ -114,6 +114,64 @@ def test_every_other_book_is_refused_on_the_marked_copy(
         build_broker(s, lambda: None, book)  # type: ignore[arg-type,return-value]
 
 
+def test_file_symlink_to_marked_copy_refuses_other_books(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file symlink pointing to a marked copy: the marker is on the resolved
+    target, so other books must be refused (the sandbox guard checks the
+    resolved path's marker)."""
+    real_copy = tmp_path / "real_copy.duckdb"
+    real_copy.write_text("")
+    (real_copy.parent / (real_copy.name + ".sandbox")).write_text("")
+    link = tmp_path / "link.duckdb"
+    link.symlink_to(real_copy)
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    s = Settings(_env_file=None, store={"path": str(link)})
+    # book sandbox is allowed (resolved path is under temp and has marker)
+    assert resolve_book(s, "sandbox") == "sandbox"
+    # other books are refused because the resolved store has the marker
+    for book in ("main", "daily", "zeta"):
+        with pytest.raises(ValueError, match="sandbox copy"):
+            resolve_book(s, book)
+    with pytest.raises(ValueError, match="sandbox copy"):
+        resolve_book(s, None)  # default book main
+
+
+def test_file_symlink_to_unmarked_copy_refuses_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file symlink pointing to an UNMARKED copy: sandbox is refused because
+    the resolved path lacks the marker."""
+    real_copy = tmp_path / "real_copy.duckdb"
+    real_copy.write_text("")
+    # no .sandbox marker
+    link = tmp_path / "link.duckdb"
+    link.symlink_to(real_copy)
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    s = Settings(_env_file=None, store={"path": str(link)})
+    with pytest.raises(ValueError, match=r"\.sandbox"):
+        resolve_book(s, "sandbox")
+
+
+def test_file_symlink_to_the_live_store_is_never_the_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlink under temp to the unmarked live store, even with a marker beside the
+    link itself: not the sandbox (refused), and book main is not refused."""
+    live = tmp_path / "data" / "live.duckdb"
+    live.parent.mkdir()
+    live.write_text("")
+    link = tmp_path / "tmp" / "link.duckdb"
+    link.parent.mkdir()
+    link.symlink_to(live)
+    (link.parent / "link.duckdb.sandbox").write_text("")
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {link.parent.resolve()})
+    s = Settings(_env_file=None, store={"path": str(link)})
+    with pytest.raises(ValueError, match=r"\.sandbox"):
+        resolve_book(s, "sandbox")
+    assert resolve_book(s, "main") == "main"
+
+
 def test_the_temp_root_is_fixed_not_tmpdir(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TMPDIR", "/")
     assert lock._temp_roots() == {Path("/tmp").resolve()}
