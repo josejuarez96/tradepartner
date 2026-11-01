@@ -213,7 +213,8 @@ def test_comparison_writes_no_fact_and_hides_a_later_xml_fetch() -> None:
     rows_before = full.execute(count).fetchone()
     tally = RunTally()
     tally.add(
-        compare_rows([row], [replace(row, price=Decimal("6"))], declaration_from(settings.events))
+        "0000000001-26-000001",
+        compare_rows([row], [replace(row, price=Decimal("6"))], declaration_from(settings.events)),
     )
     assert tally.disagreeing == 1
     assert full.execute(count).fetchone() == rows_before

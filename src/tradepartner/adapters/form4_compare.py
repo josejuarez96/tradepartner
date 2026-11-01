@@ -101,6 +101,8 @@ def _differs(name: str, bulk: object, xml: object, decl: Declaration) -> bool:
             return a is not b
         return abs(a - b) > decl.rules[name].tolerance
     if name == "security_title":
+        if bulk is None or xml is None:
+            return bulk is not xml
         return " ".join(str(bulk).split()) != " ".join(str(xml).split())
     return bulk != xml
 
@@ -153,15 +155,31 @@ class RunTally:
     """The run's counted comparison: accessions compared and those with a disagreement,
     plus per-field counts that never enter the share."""
 
-    compared: int = 0
-    disagreeing: int = 0
+    seen: set[str] = field(default_factory=set)
+    disagreeing_accessions: set[str] = field(default_factory=set)
     by_field: Counter[str] = field(default_factory=Counter)
 
-    def add(self, disagreements: Sequence[Disagreement]) -> None:
-        """Count one XML-fetched accession compared in this run."""
-        self.compared += 1
+    @property
+    def compared(self) -> int:
+        """Distinct accessions compared."""
+        return len(self.seen)
+
+    @property
+    def disagreeing(self) -> int:
+        """Distinct accessions with at least one disagreement."""
+        return len(self.disagreeing_accessions)
+
+    def add(self, accession: str, disagreements: Sequence[Disagreement]) -> None:
+        """Count one XML-fetched accession compared in this run. A repeated accession
+        counts once in the share (its latest result wins); per-field counts are diagnostic
+        and cover the first result only."""
+        if accession in self.seen:
+            if disagreements:
+                self.disagreeing_accessions.add(accession)
+            return
+        self.seen.add(accession)
         if disagreements:
-            self.disagreeing += 1
+            self.disagreeing_accessions.add(accession)
         self.by_field.update(d.field for d in disagreements)
 
     def share(self) -> Decimal | None:

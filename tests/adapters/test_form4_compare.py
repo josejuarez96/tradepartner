@@ -106,7 +106,9 @@ def test_threshold_key_defaults_unset_and_validates() -> None:
 def tally(compared: int, bad: int) -> RunTally:
     t = RunTally()
     for i in range(compared):
-        t.add(compare_rows([row()], [row(shares=Decimal(1)) if i < bad else row()], decl()))
+        t.add(
+            f"a{i}", compare_rows([row()], [row(shares=Decimal(1)) if i < bad else row()], decl())
+        )
     return t
 
 
@@ -134,7 +136,30 @@ def test_below_and_at_threshold() -> None:
 
 def test_denominator_is_accessions_not_field_disagreements() -> None:
     t = RunTally()
-    t.add(compare_rows([row()], [row(shares=Decimal(1), price=Decimal(1))], decl()))
-    t.add(compare_rows([row()], [row()], decl()))
+    t.add("x", compare_rows([row()], [row(shares=Decimal(1), price=Decimal(1))], decl()))
+    t.add("y", compare_rows([row()], [row()], decl()))
     assert (t.disagreeing, t.compared) == (1, 2)
     assert t.by_field == {"shares": 1, "price": 1}
+
+
+def test_a_repeated_accession_counts_once_in_the_share() -> None:
+    t = RunTally()
+    bad = compare_rows([row()], [row(shares=Decimal(1))], decl())
+    t.add("a", bad)
+    t.add("a", bad)
+    t.add("b", compare_rows([row()], [row()], decl()))
+    assert (t.disagreeing, t.compared) == (1, 2)
+
+
+def test_default_declaration_agrees_exactly_when_rows_agree_does() -> None:
+    from tradepartner.adapters.form4_route import rows_agree
+
+    cases = [
+        ([row()], [row()]),
+        ([row(price=Decimal("10.004"))], [row()]),
+        ([row(price=Decimal("10.005"))], [row()]),
+        ([row(filer_cik="9")], [row()]),
+        ([row(line_no=1)], [row()]),
+    ]
+    for bulk, xml in cases:
+        assert (compare_rows(bulk, xml, decl()) == ()) == rows_agree(bulk, xml)
