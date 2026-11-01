@@ -57,9 +57,10 @@ journal. Nothing here reads a clock or the store.
   **cash in lieu** rounds the name's exact holding down to whole shares and
   disposes of the fraction FIFO at the journaled cash; **`corporate_action_cash`**
   closes the name's lots FIFO as one sale at its cash; a **spin-off receipt**
-  opens a zero-basis lot on its session (or, when `explanation_json` names
-  `parent_security_id` and `basis_allocation`, moves that share of the parent's
-  basis to it); a **carried residue** opens a zero-basis lot on its session; a
+  naming no parent opens a zero-basis lot on its session; naming `parent_security_id`
+  it opens one child lot per parent lot open at the close before its `ex_date`,
+  dated as that lot (IRC 1223(1)) and taking `basis_allocation` (zero when absent)
+  of the basis still open on it; a **carried residue** opens a zero-basis lot on its session; a
   **stock merger** (a `corporate_action_cash` and a `merger_receipt` naming one
   `merger_id`) re-keys the target's lots to the acquirer at the ratio of the two
   quantities, carrying basis and date, with no disposal. A **true-up** (an
@@ -132,6 +133,11 @@ _MERGER_KEY = "merger_id"
 #: `corporate_action_cash` row that is part of the proceeds of the ended-listing
 #: removal row before it.
 _DELISTING_KEY = "delisting_cash"
+#: The `explanation_json` key of a spin-off receipt's ex-date (ISO), the day
+#: whose previous close fixes the parent lots entitled to the child.
+_EX_DATE_KEY = "ex_date"
+#: Sorts a parent snapshot before every other event of its ex-date.
+_RANK_SNAPSHOT = -1
 
 
 class LotLedgerError(ValueError):
@@ -299,6 +305,9 @@ class _Ledger:
         self.longs: dict[str, list[_OpenLot]] = {}
         self.shorts: dict[str, list[_OpenLot]] = {}
         self.no_replacement: set[int] = set()  # lots no purchase made (never a replacement)
+        #: The parent's open lots at the close before a spin-off's ex-date,
+        #: keyed by (parent, ex_date): each lot with its quantity then.
+        self.parent_snapshots: dict[tuple[str, date], list[tuple[_OpenLot, Fraction]]] = {}
 
     # -- lots and disposals ------------------------------------------------------
 
@@ -627,26 +636,48 @@ class _Ledger:
                 book_id=None,
             )
 
+    def snapshot_parent(self, parent: str, ex_date: date) -> None:
+        """Record the parent's open long lots and their quantities as they stand
+        before any event of `ex_date`, which is the close of the session before
+        it. A spin-off's entitlement is fixed there (IRC 1223(1), paper spec
+        amendment #1976 item 3), whatever is bought or sold before the receipt."""
+        key = (parent, ex_date)
+        if key not in self.parent_snapshots:
+            self.parent_snapshots[key] = [
+                (lot, lot.quantity) for lot in self.longs.get(parent, []) if lot.quantity > _ZERO
+            ]
+
     def spinoff(self, row: AdjustmentRow) -> None:
-        """A spin-off child: one zero-basis lot on the session, unless the row
-        names the parent and the fraction of its basis that moves to the child."""
+        """A spin-off child. A row naming no parent opens one zero-basis lot on
+        its session. A row naming the parent opens one child lot per parent lot
+        open at the close before the ex-date, carrying that lot's acquisition
+        instant and `basis_allocation` (zero when absent) times the basis still
+        open on it; a parent with no such lot opens one zero-basis lot on the
+        session (paper spec amendment #1976 item 3)."""
         child = _security(row)
         self.refuse_short(child, row.kind)
         _require_long_delta(row, negative=False)
-        moved = _ZERO
         terms = _explanation(row)
         parent, allocation = terms.get("parent_security_id"), terms.get("basis_allocation")
-        if parent is not None and allocation is not None:
-            if not isinstance(parent, str):
-                raise LotLedgerError(f"spin-off {_describe(row)} names parent {parent!r}")
-            self.refuse_short(parent, row.kind)
-            fraction = _allocation(allocation, row)
-            for lot in self.longs.get(parent, []):
-                share = lot.basis * fraction
-                lot.basis -= share
-                lot.reported_basis -= share
-                moved += share
-        self._receipt(row, child, moved)
+        if parent is None:
+            self._receipt(row, child, _ZERO)
+            return
+        if not isinstance(parent, str):
+            raise LotLedgerError(f"spin-off {_describe(row)} names parent {parent!r}")
+        self.refuse_short(parent, row.kind)
+        fraction = _ZERO if allocation is None else _allocation(allocation, row)
+        entitled = self.parent_snapshots.get((parent, _spinoff_ex_date(row)), [])
+        total = sum((quantity for _, quantity in entitled), _ZERO)
+        if total == _ZERO:
+            self._receipt(row, child, _ZERO)
+            return
+        received = _exact(row.quantity)
+        for lot, quantity in entitled:
+            moved = lot.basis * fraction
+            lot.basis -= moved
+            lot.reported_basis -= moved
+            self._receipt(row, child, moved, received * quantity / total, trade_at=lot.trade_at)
+        self.longs[child].sort(key=lambda held: (held.trade_at, held.lot_id))
 
     def residue(self, row: AdjustmentRow) -> None:
         """A residue carried into the window: a zero-basis lot on its session."""
@@ -690,12 +721,20 @@ class _Ledger:
                 book_id=None,
             )
 
-    def _receipt(self, row: AdjustmentRow, security: str, basis: Fraction) -> None:
+    def _receipt(
+        self,
+        row: AdjustmentRow,
+        security: str,
+        basis: Fraction,
+        quantity: Fraction | None = None,
+        *,
+        trade_at: datetime | None = None,
+    ) -> None:
         lot = self.open_lot(
             security,
             self.symbol_of(security),
-            _session_at(row),
-            _exact(row.quantity),
+            _session_at(row) if trade_at is None else trade_at,
+            _exact(row.quantity) if quantity is None else quantity,
             basis,
             fill_id=None,
             client_order_id=_placeholder(row),
@@ -770,6 +809,21 @@ def _allocation(value: object, row: AdjustmentRow) -> Fraction:
     if not _ZERO <= fraction <= 1:
         raise LotLedgerError(f"spin-off {_describe(row)} has basis_allocation {value!r}")
     return fraction
+
+
+def _spinoff_ex_date(row: AdjustmentRow) -> date:
+    """The ex-date a spin-off receipt names in its `explanation_json` (`ex_date`,
+    ISO), else the receipt's own session; never later than the session."""
+    value = _explanation(row).get(_EX_DATE_KEY)
+    if value is None:
+        return row.session
+    if not isinstance(value, str):
+        raise LotLedgerError(f"spin-off {_describe(row)} has ex_date {value!r}")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        raise LotLedgerError(f"spin-off {_describe(row)} has ex_date {value!r}") from None
+    return min(parsed, row.session)
 
 
 def _merger_id(row: AdjustmentRow) -> str | None:
@@ -967,6 +1021,20 @@ def _events(
                 continue
             cash_rows.setdefault(merger_id, []).append(row)
     late = _late_delisting_cash(window)
+    snapped: set[tuple[str, date]] = set()
+    for row in window:
+        parent = (
+            _explanation(row).get("parent_security_id") if row.kind == _SPINOFF_RECEIPT else None
+        )
+        if isinstance(parent, str) and (parent, _spinoff_ex_date(row)) not in snapped:
+            ex_date = _spinoff_ex_date(row)
+            snapped.add((parent, ex_date))
+            events.append(
+                (
+                    (ex_date, _RANK_SNAPSHOT, parent),
+                    partial(_Ledger.snapshot_parent, parent=parent, ex_date=ex_date),
+                )
+            )
     for row in window:
         if _is_late_delisting_cash(row):
             continue  # included with its removal's proceeds

@@ -55,16 +55,19 @@ Two rules stay true here. Unloaded jobs never run, so load them again right afte
 
 ## After an EDGAR cache version bump
 
-The EDGAR adapter keeps each per-document and per-CIK cache under a versioned directory in `edgar.cache_dir`: `fsn/v{FSN_VERSION}`, `cover/v{COVER_VERSION}`, `header/v{HEADER_VERSION}`, `delisting/v{DELISTING_VERSION}`, and `stamps/` and `facts/` under `v{PARSER_VERSION}` (the constants are in `src/tradepartner/adapters/edgar_source.py`). A pull that bumps one of them makes the next run rebuild that tree under the new number. **Nothing deletes the old tree** (#615): it stays on disk until you remove it. `fsn/v1` was about 21.5 GB, and the disk filled on 2026-10-02. After the first run on the new version has finished `ok`, compare the trees on disk with the current constants, then delete only the superseded trees:
+The EDGAR adapter keeps each per-document and per-CIK cache under a versioned directory in `edgar.cache_dir`: `fsn/v{FSN_VERSION}`, `cover/v{COVER_VERSION}`, `header/v{HEADER_VERSION}`, `delisting/v{DELISTING_VERSION}`, and `stamps/` and `facts/` under `v{PARSER_VERSION}` (the constants are in `src/tradepartner/adapters/edgar_source.py`). A pull that bumps one of them makes the next run rebuild that tree under the new number. **Nothing deletes the old tree** (#615): it stays on disk until you move it. `fsn/v1` was about 21.5 GB, and the disk filled on 2026-10-02. After the first run on the new version has finished `ok`, move the superseded trees into the raw archive instead of deleting them (#2743). Run the dry run first and read it. It prints, per class and folder, the files, bytes, duplicates, bytes to free, the transient backup bytes and the projected free space against the floor, and it writes nothing:
 
 ```bash
-CACHE=$(uv run python -c "from tradepartner.config import get_settings; print(get_settings().edgar.cache_dir)")
-uv run python -c "from tradepartner.adapters import edgar_source as e; print(f'fsn v{e.FSN_VERSION}, cover v{e.COVER_VERSION}, header v{e.HEADER_VERSION}, delisting v{e.DELISTING_VERSION}, stamps+facts v{e.PARSER_VERSION}')"
-du -sh "$CACHE"/*/v*
-rm -rf "$CACHE/fsn/v1"   # example: a tree whose number is below its constant
+uv run tradepartner archive migrate-cache
 ```
 
-Never delete a tree whose number matches its constant, `failed_filings.json` (it holds your accepted failures), or `bulk/` and `index/`, which are not versioned. If you might roll back to the old code, keep the old tree until you're sure you won't.
+Then run it outside the nightly window. It refuses while the store is in use, makes no SEC request and changes no store row:
+
+```bash
+uv run tradepartner archive migrate-cache --apply
+```
+
+A file that is not yet confirmed uploaded stays local and is counted as `pending_upload` in the summary (post that count on #2743). To get a file back, `uv run tradepartner archive restore --path <cache-relative path>` (it never overwrites a local file). `corpus fetch departure-reason` refuses, and names that command, when it needs a file you moved. Never delete a tree whose number matches its constant, `failed_filings.json` (it holds your accepted failures), or `bulk/` and `index/`, which are not versioned. If you might roll back to the old code, keep the old tree until you're sure you won't.
 
 ## EDGAR input-validation list files
 

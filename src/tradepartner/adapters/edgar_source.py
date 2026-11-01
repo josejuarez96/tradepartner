@@ -300,6 +300,7 @@ import duckdb
 import httpx
 
 from tradepartner.adapters import edgar_raw
+from tradepartner.adapters.daily_index import DailyIndexFile, daily_files_to_read
 from tradepartner.adapters.edgar import (
     SEC_FORMS_PARSER_VERSION,
     CoverPageParse,
@@ -341,12 +342,18 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    IncrementalIndexResult,
+    IncrementalIndexState,
+    PendingIndexRow,
     SecFormFiling,
     StatementFactRecord,
 )
+from tradepartner.adapters.form4_route import Quarter as IndexQuarter
+from tradepartner.adapters.index_reconcile import FileRow, StoredRow, reconcile_quarter
 from tradepartner.calendar import is_session, next_session
 from tradepartner.config import Settings, clean_message
 from tradepartner.health import EDGAR_FILING_DATE_CUTOFF, clock_suspect
+from tradepartner.store.filing_index import FilingRow
 from tradepartner.store.master import _is_plain_common
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -882,6 +889,332 @@ class EdgarFilingSource(FilingSource):
         self._filing_index_entries = tuple(entries)
         del entries
         return [e for e in self._filing_index_entries if since is None or e.accepted_at >= since]
+
+    def _incremental_daily_rows(self, file: DailyIndexFile) -> tuple[UnstampedFiling, ...]:
+        """Parse one listed daily file, translating its YYYYMMDD dates for form.idx."""
+        parts = file.name.split(".")
+        day = date.fromisoformat(parts[1])
+        quarter = (day.month - 1) // 3 + 1
+        path = edgar_raw.daily_index_file(
+            day.year, quarter, file, settings=self._settings, client=self._client
+        )
+        text = path.read_text(encoding="utf-8")
+        text = re.sub(
+            r"\b(\d{4})(\d{2})(\d{2})(?=\s+edgar/data/)",
+            r"\1-\2-\3",
+            text,
+        )
+        return parse_filing_index(text, {}).unstamped
+
+    def _incremental_stamps(
+        self, rows: Mapping[str, Mapping[str, tuple[UnstampedFiling, tuple[int, int]]]]
+    ) -> dict[tuple[str, str], datetime | None]:
+        """Use the existing cache and SGML-checked stamping path for candidates."""
+        return {
+            (cik, accession): record.accepted_at
+            for cik, records in self._stamp(rows).items()
+            for accession, record in records.items()
+        }
+
+    def _incremental_walk(
+        self,
+        state: IncrementalIndexState,
+        new_issuers: set[str],
+        filers: Mapping[str, tuple[tuple[int, int], tuple[int, int]]],
+        now: datetime,
+        read_daily: Callable[[DailyIndexFile], tuple[UnstampedFiling, ...]],
+    ) -> Iterator[tuple[UnstampedFiling, date, bool, tuple[int, int]]]:
+        """Walk each quarter once for all newly identified issuer CIKs."""
+        first_quarter = min(filers[cik][0] for cik in new_issuers)
+        last = max(filers[cik][1] for cik in new_issuers)
+        quarter = first_quarter
+        while quarter <= last:
+            year, number = quarter
+            if self._settled(quarter, now):
+                path = self._cache / "index" / f"{year}-QTR{number}.idx.gz"
+                text = gzip.decompress(path.read_bytes()).decode("utf-8")
+                listed_on = state.settled_listed_on[quarter]
+                yield from (
+                    (r, listed_on, False, quarter)
+                    for r in parse_filing_index(text, {}).unstamped
+                    if r.cik in new_issuers
+                )
+            else:
+                files = [
+                    f
+                    for f in state.daily_files
+                    if (
+                        date.fromisoformat(f.name.split(".")[1]).year,
+                        (date.fromisoformat(f.name.split(".")[1]).month - 1) // 3 + 1,
+                    )
+                    == quarter
+                ]
+                if not files:
+                    raise ValueError(f"unsettled quarter {quarter} has no daily listing")
+                for file in files:
+                    day = date.fromisoformat(file.name.split(".")[1])
+                    yield from (
+                        (r, day, True, quarter) for r in read_daily(file) if r.cik in new_issuers
+                    )
+            quarter = (year + 1, 1) if number == 4 else (year, number + 1)
+
+    def incremental_index(self, state: IncrementalIndexState) -> IncrementalIndexResult:
+        """Propose daily, pending and reconcile rows without writing the store."""
+        now = ensure_tz_aware_utc(state.now, field_name="state.now")
+        stored: dict[tuple[str, str], FilingRow] = {}
+        for r in state.stored:
+            key = (r.cik, r.accession)
+            if key not in stored or r.known_at > stored[key].known_at:
+                stored[key] = r
+        filers = dict(state.filers)
+        known_issuers = set(state.issuer_ciks)
+        issuer_forms = set(self._settings.master.issuer_forms) - _DELISTING_FORMS
+        kept_forms = _DELISTING_FORMS | set(self._settings.events.sec_forms)
+        selected = tuple(
+            sorted(daily_files_to_read(state.daily_files, state.file_cursors), key=lambda f: f.name)
+        )
+        parsed_daily: dict[str, tuple[UnstampedFiling, ...]] = {}
+
+        def read_daily(file: DailyIndexFile) -> tuple[UnstampedFiling, ...]:
+            if file.path not in parsed_daily:
+                parsed_daily[file.path] = self._incremental_daily_rows(file)
+            return parsed_daily[file.path]
+
+        daily: list[tuple[UnstampedFiling, date, bool, tuple[int, int]]] = []
+        new_issuers: set[str] = set()
+        for file in selected:
+            day = date.fromisoformat(file.name.split(".")[1])
+            quarter = (day.year, (day.month - 1) // 3 + 1)
+            seen: set[tuple[str, str]] = set()
+            for row in read_daily(file):
+                key = (row.cik, row.accession)
+                if key in seen:
+                    continue
+                seen.add(key)
+                start, end = filers.get(row.cik, (quarter, quarter))
+                filers[row.cik] = min(start, quarter), max(end, quarter)
+                if row.form in issuer_forms and row.cik not in known_issuers:
+                    new_issuers.add(row.cik)
+                if (
+                    row.form in _DELISTING_FORMS
+                    and not _filed_by(row)
+                    and row.cik not in known_issuers
+                ):
+                    new_issuers.add(row.cik)
+                daily.append((row, day, True, quarter))
+        counts: dict[str, int] = defaultdict(int)
+        quarterly_rows: list[tuple[UnstampedFiling, date, bool, tuple[int, int]]] = []
+        latest_for_reconcile = {
+            key: StoredRow(r.cik, r.accession, r.form, r.company_name, r.filed_on, r.listed_on)
+            for key, r in stored.items()
+        }
+        for row, day, _, _ in daily:
+            key = (row.cik, row.accession)
+            have = latest_for_reconcile.get(key)
+            if (
+                have is not None
+                and day >= have.listed_on
+                and (row.form, row.company_name) == (have.form, have.company_name)
+            ):
+                latest_for_reconcile[key] = StoredRow(
+                    row.cik, row.accession, row.form, row.company_name, row.filed_on, day
+                )
+        for quarter, (text, listed_on) in sorted(state.quarterly.items()):
+            if not self._settled(quarter, now):
+                continue
+            parsed = parse_filing_index(text, {}).unstamped
+            for row in parsed:
+                start, end = filers.get(row.cik, (quarter, quarter))
+                filers[row.cik] = min(start, quarter), max(end, quarter)
+            file_rows = [
+                FileRow(r.cik, r.accession, r.form, r.company_name, r.filed_on) for r in parsed
+            ]
+            outcome = reconcile_quarter(
+                file_rows,
+                quarter=IndexQuarter(*quarter),
+                listed_on=listed_on,
+                stored=latest_for_reconcile.values(),
+                issuer_ciks=known_issuers | new_issuers,
+                issuer_forms=issuer_forms,
+                kept_forms=kept_forms,
+            )
+            new_issuers.update(outcome.new_issuer_ciks)
+            new_issuers.update(
+                r.cik
+                for r in parsed
+                if r.form in _DELISTING_FORMS and not _filed_by(r) and r.cik not in known_issuers
+            )
+            counts["index_reconcile_added"] += len(outcome.to_add)
+            counts["index_reconcile_absent"] += outcome.absent
+            counts["index_refused"] += outcome.refused_count
+            counts["index_stale_listing"] += outcome.stale
+            wanted = {(r.cik, r.accession) for r in outcome.to_add + outcome.revisions}
+            quarterly_rows.extend(
+                (r, listed_on, False, quarter) for r in parsed if (r.cik, r.accession) in wanted
+            )
+        # A newly identified issuer contributes its complete earlier history. Read
+        # one quarter at a time for all such CIKs; settled files must be cached.
+        walk = (
+            list(self._incremental_walk(state, new_issuers, filers, now, read_daily))
+            if new_issuers
+            else []
+        )
+        candidates = list(dict.fromkeys(daily + walk + quarterly_rows))
+        pending = {(r.cik, r.accession): r for r in state.pending}
+        grouped: dict[
+            tuple[str, str], list[tuple[UnstampedFiling, date, bool, tuple[int, int]]]
+        ] = {}
+        pair_ciks: dict[str, set[str]] = defaultdict(set)
+        for row, _, _, _ in candidates:
+            pair_ciks[row.accession].add(row.cik)
+        for stored_row in state.stored:
+            pair_ciks[stored_row.accession].add(stored_row.cik)
+        paired_accessions = {
+            r.accession
+            for r, _, _, _ in candidates
+            if r.form in _EXCHANGE_FORMS and not _filed_by(r)
+        }
+        paired_accessions.update(
+            r.accession
+            for r in state.stored
+            if r.form in _EXCHANGE_FORMS and int(r.accession[:10]) != int(r.cik)
+        )
+        allowed_ciks = known_issuers | new_issuers
+        for row, listed_on, is_daily, quarter in candidates:
+            if (
+                row.form in _EXCHANGE_FORMS
+                and _filed_by(row)
+                and row.accession in paired_accessions
+                and len(pair_ciks[row.accession]) > 1
+            ):
+                continue
+            if row.cik not in allowed_ciks and row.form not in kept_forms:
+                continue
+            grouped.setdefault((row.cik, row.accession), []).append(
+                (row, listed_on, is_daily, quarter)
+            )
+        for key, pending_row in pending.items():
+            grouped.setdefault(key, []).insert(
+                0,
+                (
+                    UnstampedFiling(
+                        pending_row.cik,
+                        pending_row.company_name,
+                        pending_row.form,
+                        pending_row.accession,
+                        pending_row.filed_on,
+                    ),
+                    pending_row.listed_on,
+                    True,
+                    # T318's pending table preserves listed_on, not the source
+                    # quarter. For daily files this is the index quarter. A
+                    # settled-quarter Last-Modified may put it later, which
+                    # delays an unstampable decision rather than dating it early.
+                    (pending_row.listed_on.year, (pending_row.listed_on.month - 1) // 3 + 1),
+                ),
+            )
+        stamp_input: dict[str, dict[str, tuple[UnstampedFiling, tuple[int, int]]]] = {}
+        for key, listings in grouped.items():
+            first_pending = listings.pop(0) if key in pending else None
+            listings.sort(key=lambda item: (item[1], not item[2]))
+            if first_pending is not None:
+                listings.insert(0, first_pending)
+            row, _, _, index_quarter = listings[0]
+            stamp_input.setdefault(key[0], {})[key[1]] = (
+                row,
+                index_quarter,
+            )
+        stamps = self._incremental_stamps(stamp_input)
+        rows_out: list[FilingRow] = []
+        source_daily: list[bool] = []
+        changed_ciks: set[str] = set()
+        for key, listings in grouped.items():
+            first, first_day, first_daily, _ = listings[0]
+            old = stored.get(key)
+            stamp = stamps.get(key)
+            if old is not None and stamp is not None and stamp != old.accepted_at:
+                changed_ciks.add(key[0])
+                counts["index_stamp_changed"] += 1
+                continue
+            if old is None:
+                if stamp is None:
+                    pending.setdefault(
+                        key,
+                        PendingIndexRow(
+                            first.cik,
+                            first.accession,
+                            first.form,
+                            first.company_name,
+                            first.filed_on,
+                            first_day,
+                        ),
+                    )
+                    if any(r.filed_on != first.filed_on for r, _, _, _ in listings[1:]):
+                        counts["index_pending_filed_on_changed"] += 1
+                    continue
+                if stamp > now:
+                    raise ValueError("acceptance after run clock")
+                pending.pop(key, None)
+                old = FilingRow(
+                    first.cik,
+                    first.accession,
+                    first.form,
+                    first.company_name,
+                    first.filed_on,
+                    stamp,
+                    first_day,
+                    stamp,
+                    now,
+                )
+                rows_out.append(old)
+                source_daily.append(first_daily)
+                counts["index_added"] += 1
+                listings = listings[1:]
+            if not listings:
+                continue
+            eligible = [
+                (r, day, daily_file)
+                for r, day, daily_file, _ in listings
+                if day > old.listed_on or (day == old.listed_on and daily_file)
+            ]
+            counts["index_stale_listing"] += sum(
+                1 for _, day, _, _ in listings if day < old.listed_on
+            )
+            valid = [
+                (r, day, daily_file)
+                for r, day, daily_file in eligible
+                if (r.form, r.company_name) == (old.form, old.company_name)
+            ]
+            counts["index_refused"] += len(eligible) - len(valid)
+            if valid:
+                row, day, is_daily = max(
+                    enumerate(valid), key=lambda item: (item[1][1], item[1][2], item[0])
+                )[1]
+                if row.filed_on != old.filed_on:
+                    rows_out.append(
+                        FilingRow(
+                            old.cik,
+                            old.accession,
+                            old.form,
+                            old.company_name,
+                            row.filed_on,
+                            old.accepted_at,
+                            day,
+                            now,
+                            now,
+                        )
+                    )
+                    source_daily.append(is_daily)
+                    counts["index_revised"] += 1
+        return IncrementalIndexResult(
+            tuple(rows_out),
+            tuple(pending.values()),
+            filers,
+            selected,
+            counts,
+            frozenset(changed_ciks),
+            tuple(source_daily),
+        )
 
     def _rows(
         self, quarters: Sequence[Quarter], open_quarter: Quarter

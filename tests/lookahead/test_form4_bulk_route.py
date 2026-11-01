@@ -74,6 +74,58 @@ def test_bulk_row_after_close_matches_store_truncated_at_close(tmp_path: Path) -
     assert len(asof.sec_form4_transactions_as_of(full, accepted, settings=settings)) > len(at_close)
 
 
+def test_a_later_multi_owner_association_is_invisible_before_its_acceptance(
+    tmp_path: Path,
+) -> None:
+    """T350 (#2711): a multi-owner accession routed through XML adds its owner rows
+    only from its acceptance time, and a store truncated before it matches."""
+    directory = Path(__file__).parents[1] / "fixtures/edgar/sec_forms/insider_bulk_2026q1"
+    archive = tmp_path / "quarter.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        for name in ("SUBMISSION", "REPORTINGOWNER", "NONDERIV_TRANS"):
+            handle.write(directory / f"{name}.tsv", f"{name}.tsv")
+    bulk = read_insider_bulk(archive)
+    multi = "0001213900-26-037435"
+    facts = bulk.accessions[multi]
+    assert len(set(facts.filer_ciks)) == 2
+    close = datetime(2026, 3, 31, 20, tzinfo=UTC)
+    accepted = datetime(2026, 3, 31, 21, tzinfo=UTC)
+    full = duckdb.connect(":memory:")
+    truncated = duckdb.connect(":memory:")
+    for conn in (full, truncated):
+        schema.init_schema(conn)
+    run_form4_bulk_route(
+        [(multi, "0002025396", "4", date(2026, 3, 31))],
+        quarters={Quarter(2026, 1): bulk},
+        stamp=lambda *_: accepted,
+        xml=lambda *_: SecFormFiling(
+            multi,
+            "4",
+            accepted,
+            date(2026, 3, 31),
+            (facts.issuer_cik,),
+            facts.filer_ciks,
+            facts.transactions,
+        ),
+        write=lambda filing: write_sec_form_accession(
+            full, filing, ingested_at=accepted, source="sec_form4_xml"
+        ),
+        write_bulk=lambda *_: pytest.fail("multi-owner accession written from bulk"),
+        now=accepted,
+        price_below=1,
+        zero_price_codes=("P", "S"),
+        order_sample_size=0,
+        budget=10,
+    )
+    settings = Settings(_env_file=None, events=EventsConfig(sec_forms_read_enabled=True))
+    assert asof.sec_form4_transactions_as_of(full, close, settings=settings).is_empty()
+    assert asof.sec_form4_transactions_as_of(full, close, settings=settings).equals(
+        asof.sec_form4_transactions_as_of(truncated, close, settings=settings)
+    )
+    later = asof.sec_form4_transactions_as_of(full, accepted, settings=settings)
+    assert set(later["filer_cik"]) == set(facts.filer_ciks)
+
+
 def test_a_later_xml_fetch_is_invisible_in_a_store_truncated_before_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

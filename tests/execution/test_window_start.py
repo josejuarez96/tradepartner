@@ -29,6 +29,7 @@ from tradepartner.adapters.broker import (
 from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.adapters.prices import announcement_date_known_at
 from tradepartner.backtest.schedule import fill_session
+from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import FROZEN_COSTS_KEYS, FROZEN_EXECUTION_KEYS, Settings
 from tradepartner.execution import lock, report, window
 from tradepartner.execution.ledger import from_journal
@@ -39,6 +40,7 @@ from tradepartner.store import registry, schema
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
 from tradepartner.store.journal import (
+    AdjustmentRow,
     PaperWindowRow,
     PaperWindowStopRow,
     adjustments_for,
@@ -1066,6 +1068,91 @@ def test_accepts_spinoff_child_of_a_residue(
     assert receipts[0].quantity == pytest.approx(2.0)
     assert receipts[0].origin is None
     assert receipts[0].book_id == "fx"
+
+
+def _start_with_spinoff_child(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+    *,
+    allocation_offset: timedelta | None,
+) -> tuple[AdjustmentRow, date]:
+    """`start` over a 10 `SPY` residue whose 0.2 `SPLT` child sits at the broker.
+    An allocation of 0.2 is stored with `known_at` = close(ex_date - 1) plus
+    `allocation_offset`, when it is not None. Returns the receipt and the
+    ex-date."""
+    stop_at = fixed_clock() - timedelta(days=10)
+    _write_closed_window(
+        journal_settings, ready_hypothesis, at=stop_at, residues={SPY: (10.0, "dust")}
+    )
+    ex_date = (stop_at + timedelta(days=2)).date()
+    _insert_action(
+        journal_settings,
+        security_id=CHILD,
+        action_type="spinoff",
+        ex_date=ex_date,
+        ratio_or_amount=0.2,
+        known_at=announcement_date_known_at((stop_at + timedelta(days=4)).date()),
+        source_action_id=SPY,
+    )
+    if allocation_offset is not None:
+        known = session_close(previous_session(ex_date)) + allocation_offset
+        with open_for_write(journal_settings) as conn:
+            conn.execute(
+                "INSERT INTO spinoff_allocations VALUES (?, ?, ?, 0.2, ?, ?, 'owner', 'owner')",
+                [SPY, CHILD, ex_date, known, known],
+            )
+    fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
+    fake.extra_quantity["SPY"] = 10.0
+    fake.extra_quantity["SPLT"] = 2.0
+    result = window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+    window_id = result.window.window_id
+    assert window_id is not None
+    with open_read_only(journal_settings) as conn:
+        adjustments = adjustments_for(conn, window_id=window_id)
+    [receipt] = [a for a in adjustments if a.kind == "spinoff_receipt"]
+    return receipt, ex_date
+
+
+def test_the_residue_spinoff_receipt_names_its_parent_and_a_stored_allocation(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """T255 (#1976 item 2): the same keys `reconcile_run` writes; the allocation
+    stored with `known_at` = close(ex_date - 1) is read."""
+    receipt, ex_date = _start_with_spinoff_child(
+        journal_settings, fixed_clock, ready_hypothesis, allocation_offset=timedelta(0)
+    )
+
+    terms = json.loads(receipt.explanation_json or "{}")
+    assert terms["parent_security_id"] == SPY
+    assert terms["basis_allocation"] == 0.2
+    assert terms["ex_date"] == ex_date.isoformat()
+
+
+def test_the_residue_spinoff_receipt_without_an_allocation_names_the_parent_alone(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """No allocation stored: the receipt names the parent only (zero basis)."""
+    receipt, _ = _start_with_spinoff_child(
+        journal_settings, fixed_clock, ready_hypothesis, allocation_offset=None
+    )
+    assert json.loads(receipt.explanation_json or "{}")["parent_security_id"] == SPY
+    assert "basis_allocation" not in json.loads(receipt.explanation_json or "{}")
+
+
+def test_the_residue_spinoff_receipt_ignores_an_allocation_known_after_the_cutoff(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    receipt, _ = _start_with_spinoff_child(
+        journal_settings, fixed_clock, ready_hypothesis, allocation_offset=timedelta(minutes=1)
+    )
+    assert "basis_allocation" not in json.loads(receipt.explanation_json or "{}")
 
 
 def test_frozen_hash_stable_across_an_environment_override(
