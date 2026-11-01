@@ -916,6 +916,48 @@ class EdgarFilingSource(FilingSource):
             for accession, record in records.items()
         }
 
+    def _incremental_walk(
+        self,
+        state: IncrementalIndexState,
+        new_issuers: set[str],
+        filers: Mapping[str, tuple[tuple[int, int], tuple[int, int]]],
+        now: datetime,
+        read_daily: Callable[[DailyIndexFile], tuple[UnstampedFiling, ...]],
+    ) -> Iterator[tuple[UnstampedFiling, date, bool, tuple[int, int]]]:
+        """Walk each quarter once for all newly identified issuer CIKs."""
+        first_quarter = min(filers[cik][0] for cik in new_issuers)
+        last = max(filers[cik][1] for cik in new_issuers)
+        quarter = first_quarter
+        while quarter <= last:
+            year, number = quarter
+            if self._settled(quarter, now):
+                path = self._cache / "index" / f"{year}-QTR{number}.idx.gz"
+                text = gzip.decompress(path.read_bytes()).decode("utf-8")
+                listed_on = state.settled_listed_on[quarter]
+                yield from (
+                    (r, listed_on, False, quarter)
+                    for r in parse_filing_index(text, {}).unstamped
+                    if r.cik in new_issuers
+                )
+            else:
+                files = [
+                    f
+                    for f in state.daily_files
+                    if (
+                        date.fromisoformat(f.name.split(".")[1]).year,
+                        (date.fromisoformat(f.name.split(".")[1]).month - 1) // 3 + 1,
+                    )
+                    == quarter
+                ]
+                if not files:
+                    raise ValueError(f"unsettled quarter {quarter} has no daily listing")
+                for file in files:
+                    day = date.fromisoformat(file.name.split(".")[1])
+                    yield from (
+                        (r, day, True, quarter) for r in read_daily(file) if r.cik in new_issuers
+                    )
+            quarter = (year + 1, 1) if number == 4 else (year, number + 1)
+
     def incremental_index(self, state: IncrementalIndexState) -> IncrementalIndexResult:
         """Propose daily, pending and reconcile rows without writing the store."""
         now = ensure_tz_aware_utc(state.now, field_name="state.now")
@@ -1012,39 +1054,11 @@ class EdgarFilingSource(FilingSource):
             )
         # A newly identified issuer contributes its complete earlier history. Read
         # one quarter at a time for all such CIKs; settled files must be cached.
-        walk: list[tuple[UnstampedFiling, date, bool, tuple[int, int]]] = []
-        if new_issuers:
-            first_quarter = min(filers[cik][0] for cik in new_issuers)
-            last = max(filers[cik][1] for cik in new_issuers)
-            quarter = first_quarter
-            while quarter <= last:
-                year, number = quarter
-                if self._settled(quarter, now):
-                    path = self._cache / "index" / f"{year}-QTR{number}.idx.gz"
-                    text = gzip.decompress(path.read_bytes()).decode("utf-8")
-                    rows = parse_filing_index(text, {}).unstamped
-                    listed_on = state.settled_listed_on[quarter]
-                    walk.extend(
-                        (r, listed_on, False, quarter) for r in rows if r.cik in new_issuers
-                    )
-                else:
-                    if not any(
-                        (day.year, (day.month - 1) // 3 + 1) == quarter
-                        for day in (
-                            date.fromisoformat(file.name.split(".")[1])
-                            for file in state.daily_files
-                        )
-                    ):
-                        raise ValueError(f"unsettled quarter {quarter} has no daily listing")
-                    for file in state.daily_files:
-                        day = date.fromisoformat(file.name.split(".")[1])
-                        if (day.year, (day.month - 1) // 3 + 1) == quarter:
-                            walk.extend(
-                                (r, day, True, quarter)
-                                for r in read_daily(file)
-                                if r.cik in new_issuers
-                            )
-                quarter = (year + 1, 1) if number == 4 else (year, number + 1)
+        walk = (
+            list(self._incremental_walk(state, new_issuers, filers, now, read_daily))
+            if new_issuers
+            else []
+        )
         candidates = list(dict.fromkeys(daily + walk + quarterly_rows))
         pending = {(r.cik, r.accession): r for r in state.pending}
         grouped: dict[
@@ -1092,6 +1106,10 @@ class EdgarFilingSource(FilingSource):
                     ),
                     pending_row.listed_on,
                     True,
+                    # T318's pending table preserves listed_on, not the source
+                    # quarter. For daily files this is the index quarter. A
+                    # settled-quarter Last-Modified may put it later, which
+                    # delays an unstampable decision rather than dating it early.
                     (pending_row.listed_on.year, (pending_row.listed_on.month - 1) // 3 + 1),
                 ),
             )

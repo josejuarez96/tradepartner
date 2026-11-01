@@ -151,6 +151,16 @@ def test_incremental_repost_and_cross_quarter_revision(
     )
     assert not old.rows
     assert old.counts["index_stale_listing"] == 1
+    corrected_stored = replace(
+        stored, filed_on=date(2026, 3, 31), known_at=datetime(2026, 4, 2, tzinfo=UTC)
+    )
+    repost = source.incremental_index(
+        _incremental_state(
+            stored=(corrected_stored,), files=(old_file,), issuer_ciks=frozenset({APPLE})
+        )
+    )
+    assert not repost.rows  # the old 04-01 date cannot undo the stored 03-31 correction
+    assert repost.counts["index_stale_listing"] == 1
     changed = source.incremental_index(
         _incremental_state(stored=(stored,), files=(new_file,), issuer_ciks=frozenset({APPLE}))
     )
@@ -164,6 +174,15 @@ def test_incremental_new_issuer_walk_one_pass_for_two(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    walk_calls = 0
+    walk_method = source._incremental_walk
+
+    def count_walk(*args: Any, **kwargs: Any) -> Any:
+        nonlocal walk_calls
+        walk_calls += 1
+        return walk_method(*args, **kwargs)
+
+    monkeypatch.setattr(source, "_incremental_walk", count_walk)
     ciks = (APPLE, "0000789019")
     older = _incremental_file(date(2026, 3, 30))
     newer = _incremental_file(date(2026, 4, 2))
@@ -174,10 +193,8 @@ def test_incremental_new_issuer_walk_one_pass_for_two(
         _incremental_row(cik, f"{int(cik):010d}-26-000002", "10-K", date(2026, 4, 2))
         for cik in ciks
     )
-    calls: list[str] = []
 
     def read(file: DailyIndexFile) -> tuple[UnstampedFiling, ...]:
-        calls.append(file.name)
         return old_rows if file == older else new_rows
 
     monkeypatch.setattr(source, "_incremental_daily_rows", read)
@@ -197,7 +214,7 @@ def test_incremental_new_issuer_walk_one_pass_for_two(
     )
     result = source.incremental_index(state)
     assert {r.accession for r in result.rows} == {r.accession for r in old_rows + new_rows}
-    assert calls.count(older.name) == 1
+    assert walk_calls == 1
     assert result.files_read == (newer,)
 
 
