@@ -1339,6 +1339,7 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "listings",
             "classifications",
             "trial_metrics",
+            "trial_results",
         }
         assert _all_rows(conn, tables_before) == rows_before
         assert _versions(conn) == list(range(25, schema.CURRENT_SCHEMA_VERSION + 1))
@@ -2389,13 +2390,15 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_DELISTING_REASONS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESEARCH_EXPOSURES_VERSION + 1
 
 
 def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
     conn = duckdb.connect(":memory:")
     try:
         schema.init_schema(conn)
+        conn.execute("DROP TABLE research_exposures")
+        conn.execute("ALTER TABLE trial_results DROP COLUMN n_exposure")
         conn.execute("DROP TABLE delisting_reasons")
         conn.execute("DROP TABLE snapshot_sightings")
         conn.execute("DELETE FROM schema_version")
@@ -2404,9 +2407,9 @@ def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
         schema.init_schema(conn)
         assert "snapshot_sightings" in _shape(conn)
         assert max(_versions(conn)) == schema.CURRENT_SCHEMA_VERSION
-        assert _versions(conn) == [41, 42, 43]
+        assert _versions(conn) == [41, 42, 43, 44]
         schema.init_schema(conn)
-        assert _versions(conn) == [41, 42, 43]
+        assert _versions(conn) == [41, 42, 43, 44]
     finally:
         conn.close()
 
@@ -2994,8 +2997,10 @@ def test_version_39_adds_only_spinoff_allocations() -> None:
             "sec_form4_transactions",
             "snapshot_sightings",
             "delisting_reasons",
+            "research_exposures",
         ):
             conn.execute(f"DROP TABLE {table}")
+        conn.execute("ALTER TABLE trial_results DROP COLUMN n_exposure")
         conn.execute("DELETE FROM schema_version WHERE version > 38")
         conn.execute("INSERT INTO schema_version VALUES (38, TIMESTAMPTZ '2026-10-27 00:00:00+00')")
         before = _shape(conn)
@@ -3011,8 +3016,11 @@ def test_version_39_adds_only_spinoff_allocations() -> None:
             "sec_form4_transactions",
             "snapshot_sightings",
             "delisting_reasons",
+            "research_exposures",
         }
-        assert {name: after[name] for name in before} == before
+        assert {name: after[name] for name in before if name != "trial_results"} == {
+            name: sql for name, sql in before.items() if name != "trial_results"
+        }
         assert _versions(conn) == list(range(38, schema.CURRENT_SCHEMA_VERSION + 1))
         schema.init_schema(conn)
         assert _versions(conn) == list(range(38, schema.CURRENT_SCHEMA_VERSION + 1))
@@ -3030,8 +3038,10 @@ def test_read_only_version_38_store_keeps_existing_reads(tmp_path: Path) -> None
         "sec_form4_transactions",
         "snapshot_sightings",
         "delisting_reasons",
+        "research_exposures",
     ):
         conn.execute(f"DROP TABLE {table}")
+    conn.execute("ALTER TABLE trial_results DROP COLUMN n_exposure")
     conn.execute("DELETE FROM schema_version WHERE version > 38")
     conn.execute("INSERT INTO schema_version VALUES (38, TIMESTAMPTZ '2026-10-27 00:00:00+00')")
     conn.close()
