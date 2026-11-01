@@ -641,3 +641,20 @@ def test_restore_stops_below_the_floor_with_nothing_written(
     with pytest.raises(RawArchiveFloorError):
         _restore(rig, DEAD)
     assert not (rig.cache / DEAD / "a.json").exists()
+
+
+def test_restore_rechecks_the_floor_after_the_downloads_used_space(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Shrinking(RestoreICloud):
+        def download(self, path: Path) -> None:
+            super().download(path)
+            free[0] = 1  # the download filled the disk
+
+    rig.icloud = Shrinking()
+    rig.run()
+    free = [500 * GB]
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _p: free[0])
+    with pytest.raises(RawArchiveFloorError):
+        _restore(rig, DEAD)
+    assert not (rig.cache / DEAD / "a.json").exists()
