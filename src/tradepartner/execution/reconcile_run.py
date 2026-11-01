@@ -1823,16 +1823,37 @@ def acknowledged_keys(events: Iterable[ReconcileBreakRow]) -> frozenset[str]:
     )
 
 
+def _acknowledged(
+    mismatch: Mismatch,
+    acknowledged: frozenset[str],
+    positions: Mapping[str, Position],
+    open_names: Collection[str],
+) -> bool:
+    """Whether an owner true-up acknowledged this finding (#2266 item 9). Never
+    while a break is open on its name, so that break keeps its current figures and
+    can still be trued up; a key that cannot be read is not acknowledged (the
+    break-event write then fails closed on it, as before)."""
+    if not acknowledged or (mismatch.security_id or mismatch.symbol) in open_names:
+        return False
+    try:
+        return _finding_key(mismatch, positions) in acknowledged
+    except ValueError:
+        return False
+
+
 def _without_acknowledged(
     result: Reconciliation,
     acknowledged: frozenset[str],
     positions: Mapping[str, Position],
     account_cash: float,
+    open_names: Collection[str] = (),
 ) -> Reconciliation:
     """`result` less every finding mismatch whose key an owner true-up acknowledged
     (#2266 item 9), its status re-derived in `compare`'s order. A `breaks` result
     left with no residual is `ok`, its base the broker's cash."""
-    kept = tuple(m for m in result.mismatches if _finding_key(m, positions) not in acknowledged)
+    kept = tuple(
+        m for m in result.mismatches if not _acknowledged(m, acknowledged, positions, open_names)
+    )
     if len(kept) == len(result.mismatches):
         return result
     result = replace(result, mismatches=kept)
@@ -2244,9 +2265,10 @@ def reconcile_now(
         # break; a changed key (another quantity, merger id or ex-date) is.
         result = _without_acknowledged(
             result,
-            acknowledged_keys(break_events_for(conn, window_id)),
+            acknowledged_keys(e for e in break_events_for(conn, window_id) if e.known_at <= as_of),
             positions,
             float(account.cash),
+            {row.name for row in open_breaks(conn, window_id) if row.name is not None},
         )
     names = {m.security_id for m in result.mismatches if m.security_id is not None} | set(
         ledger.positions

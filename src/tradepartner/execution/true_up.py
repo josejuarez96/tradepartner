@@ -421,7 +421,9 @@ def true_up(
                 f"the true-up stamp {stamp.isoformat()} is not after the gate's reading "
                 f"{now.isoformat()}"
             )
-        session = command_session(stamp)
+        # The session the gate stated the ledger for, so a stamp just past midnight
+        # never dates the rows a session after the figures they were read on.
+        session = command_session(now)
         with connect() as conn:
             # Nothing else writes under the lock, but re-read: the event must still
             # be the break's latest, and no journal row may be stamped after us.

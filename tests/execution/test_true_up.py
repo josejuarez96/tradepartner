@@ -424,3 +424,61 @@ def test_acknowledged_keys_read_only_breaks_whose_latest_event_is_trued_up() -> 
     assert reconcile_run.acknowledged_keys([event(2, "trued_up"), event(1, "opened")]) == {key}
     reopened = [event(1, "opened"), event(2, "trued_up"), event(3, "reopened")]
     assert reconcile_run.acknowledged_keys(reopened) == frozenset()
+
+
+def test_a_key_that_returns_to_an_acknowledged_value_keeps_its_open_break_trueable(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    frozen_window: PaperWindowRow,  # noqa: F811
+    fixed_clock: FixedClock,
+) -> None:
+    """SPYX 5 trued up, then 6 opens a break, then 5 again: the open break keeps
+    the current figure, so its true-up is not refused `moved` forever."""
+    fake.activities = [FUNDING]
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity = {"SPYX": 5.0}
+    _reconcile(journal_settings, fake, frozen_window, fixed_clock)
+    _true_up(
+        journal_settings, fake, fixed_clock, _events(journal_settings, frozen_window)[0].break_id
+    )
+    for quantity in (6.0, 5.0):
+        fake.extra_quantity = {"SPYX": quantity}
+        fixed_clock.advance(seconds=1)
+        assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+    latest = _events(journal_settings, frozen_window)[-1]
+    assert (latest.event, latest.broker_quantity) == ("observed", 5.0)
+
+    _true_up(journal_settings, fake, fixed_clock, latest.break_id)
+    fixed_clock.advance(seconds=1)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "ok"
+
+
+def test_an_acknowledged_finding_row_without_a_security_id_has_no_lot_effect() -> None:
+    """The acknowledgement of an `unknown_symbol` names no `security_id`: the lot
+    ledger must pass over it, never refuse the whole rebuild."""
+    from .test_lots_adjustments import D0303, D0304, Book
+
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303)
+    row = book.adjust("owner_true_up", D0304, "SEC_X", explanation={"finding_key": "k"})
+    book.adjustments[-1] = replace(row, security_id=None)
+
+    lot_list, disposals, _ = book.run(D0304)
+
+    assert [(lot.quantity, lot.cost_basis) for lot in lot_list] == [(10.0, 500.0)]
+    assert disposals == []
+
+
+def test_no_open_window_and_a_held_lock_refuse_before_any_broker_read(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    fixed_clock: FixedClock,
+) -> None:
+    from tradepartner.execution.lock import LockHeld, run_lock
+
+    with pytest.raises(WindowCommandRefused) as refused:
+        _true_up(journal_settings, fake, fixed_clock, "1:SEC_SPY:1")
+    assert refused.value.reason == "no_window"
+    with run_lock(journal_settings, "main"), pytest.raises(LockHeld):
+        _true_up(journal_settings, fake, fixed_clock, "1:SEC_SPY:1")
+    assert not fake.calls

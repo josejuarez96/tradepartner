@@ -660,11 +660,11 @@ class _Ledger:
         open a zero-basis lot for a shortfall, or close lots FIFO at zero
         proceeds for an excess. A true-up on a name with an open short lot
         raises (short lots are Phase 6)."""
-        security = _security(row)
-        self.refuse_short(security, row.kind)
         absolute = true_up_quantity(row)
         if absolute is None:
-            return
+            return  # a cash part or an acknowledged finding (no security_id): no lot effect
+        security = _security(row)
+        self.refuse_short(security, row.kind)
         held = self.longs.get(security, [])
         gap = _exact(absolute) - sum((lot.quantity for lot in held), _ZERO)
         if gap > _ZERO:
