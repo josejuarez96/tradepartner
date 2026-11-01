@@ -4820,3 +4820,161 @@ def test_incremental_edgar_is_quiet_without_counts_or_with_zero(
     assert block.warnings == ()
     assert incremental_edgar_counts(None) == {}
     assert incremental_edgar_counts("statement_added: 3") == {}
+
+
+# --- filing_index revisions (#2629, #2703, T318b) ----------------------------
+
+_FI_RULES = (
+    "filing_index_first_known_at_is_accepted_at",
+    "filing_index_revision_known_at_after_accepted_at",
+    "filing_index_revision_listed_on_ordered",
+    "filing_index_revision_matches_first",
+    "filing_index_revision_filed_on_changes",
+    "filing_index_timestamps_aware",
+)
+_FI_ACCEPTED = datetime(2020, 3, 2, 21, tzinfo=UTC)
+
+
+def _fi_first(accession: str = "ACC-FI-1") -> dict[str, Any]:
+    return {
+        "cik": "0001000011",
+        "accession": accession,
+        "form": "8-K",
+        "company_name": "Acme Corp",
+        "filed_on": date(2020, 3, 3),
+        "accepted_at": _FI_ACCEPTED,
+        "listed_on": date(2020, 3, 3),
+        "known_at": _FI_ACCEPTED,
+        "ingested_at": _FI_ACCEPTED,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def _fi_revision(first: dict[str, Any], **changes: Any) -> dict[str, Any]:
+    known = datetime(2020, 3, 10, 22, tzinfo=UTC)
+    row = first | {
+        "filed_on": date(2020, 3, 4),
+        "listed_on": date(2020, 3, 10),
+        "known_at": known,
+        "ingested_at": known,
+    }
+    return row | changes
+
+
+def _fi_failed(conn: duckdb.DuckDBPyConnection, settings: Settings) -> dict[str, pl.DataFrame]:
+    checks = integrity_checks(conn, T_END, settings)
+    assert {c.rule for c in checks} >= set(_FI_RULES)
+    return {c.rule: c.violations for c in checks if c.rule in _FI_RULES and not c.passed}
+
+
+def test_filing_index_rules_pass_on_a_clean_store_with_a_revision(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    first = _fi_first()
+    insert_row(fixture_store, "filing_index", first)
+    insert_row(fixture_store, "filing_index", _fi_revision(first))
+    second = _fi_first("ACC-FI-2")
+    insert_row(fixture_store, "filing_index", second)
+    assert _fi_failed(fixture_store, settings) == {}
+    report = health_report(fixture_store, T_END, settings)
+    assert report.ok, report.failures
+
+
+def test_filing_index_rules_pass_without_the_table(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    fixture_store.execute("DROP TABLE filing_index")
+    assert _fi_failed(fixture_store, settings) == {}
+
+
+def test_filing_index_first_row_known_at_must_be_accepted_at(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    first = _fi_first()
+    insert_row(loose_store, "filing_index", first | {"known_at": _FI_ACCEPTED + timedelta(hours=1)})
+    failed = _fi_failed(loose_store, settings)
+    assert set(failed) == {"filing_index_first_known_at_is_accepted_at"}
+    assert failed["filing_index_first_known_at_is_accepted_at"]["accession"].to_list() == [
+        "ACC-FI-1"
+    ]
+
+
+@pytest.mark.parametrize("delta", (timedelta(0), timedelta(hours=-1)))
+def test_filing_index_revision_known_at_must_follow_acceptance(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings, delta: timedelta
+) -> None:
+    first = _fi_first()
+    insert_row(loose_store, "filing_index", first)
+    revision = _fi_revision(first, known_at=_FI_ACCEPTED + delta)
+    insert_row(loose_store, "filing_index", revision | {"ingested_at": revision["known_at"]})
+    # An earlier-stamped "revision" sorts first, so only the equal case is the
+    # revision rule; the earlier one breaks the first-row rule instead.
+    failed = _fi_failed(loose_store, settings)
+    if delta == timedelta(0):
+        assert "filing_index_revision_known_at_after_accepted_at" in failed
+    else:
+        assert "filing_index_first_known_at_is_accepted_at" in failed
+
+
+def test_filing_index_revision_listed_on_must_not_go_back(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    first = _fi_first()
+    insert_row(loose_store, "filing_index", first)
+    insert_row(loose_store, "filing_index", _fi_revision(first, listed_on=date(2020, 3, 2)))
+    assert set(_fi_failed(loose_store, settings)) == {"filing_index_revision_listed_on_ordered"}
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        {"form": "8-K/A"},
+        {"company_name": "Other Corp"},
+        {"accepted_at": _FI_ACCEPTED - timedelta(hours=1)},
+    ),
+)
+def test_filing_index_revision_must_match_the_first_row(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings, change: dict[str, Any]
+) -> None:
+    first = _fi_first()
+    insert_row(loose_store, "filing_index", first)
+    insert_row(loose_store, "filing_index", _fi_revision(first, **change))
+    assert set(_fi_failed(loose_store, settings)) == {"filing_index_revision_matches_first"}
+
+
+def test_filing_index_revision_must_change_filed_on_from_the_row_before(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    first = _fi_first()
+    insert_row(loose_store, "filing_index", first)
+    insert_row(loose_store, "filing_index", _fi_revision(first, filed_on=first["filed_on"]))
+    assert set(_fi_failed(loose_store, settings)) == {"filing_index_revision_filed_on_changes"}
+
+
+def test_filing_index_revision_may_return_to_an_earlier_filed_on(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """Only the row before it is compared, so A -> B -> A is clean."""
+    first = _fi_first()
+    second = _fi_revision(first)
+    third = _fi_revision(
+        first,
+        filed_on=first["filed_on"],
+        listed_on=date(2020, 3, 11),
+        known_at=datetime(2020, 3, 11, 22, tzinfo=UTC),
+        ingested_at=datetime(2020, 3, 11, 22, tzinfo=UTC),
+    )
+    for row in (first, second, third):
+        insert_row(loose_store, "filing_index", row)
+    assert _fi_failed(loose_store, settings) == {}
+
+
+@pytest.mark.parametrize("column", ("known_at", "accepted_at", "ingested_at"))
+def test_filing_index_naive_timestamp_fails(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings, column: str
+) -> None:
+    loose_store.execute(f"ALTER TABLE filing_index ALTER COLUMN {column} TYPE TIMESTAMP")
+    insert_row(loose_store, "filing_index", _fi_first())
+    failed = _fi_failed(loose_store, settings)
+    assert failed["filing_index_timestamps_aware"]["column"].to_list() == [column]
