@@ -47,7 +47,7 @@ import pandas as pd
 import streamlit as st
 
 from tradepartner.config import Settings
-from tradepartner.dashboard import book_actions, theme
+from tradepartner.dashboard import book_actions, ops_page, theme
 from tradepartner.execution import book_holdings, book_stats, book_view, home_view, ops
 from tradepartner.execution.marks import UnreadableMarkError
 from tradepartner.store.journal import JournalNotInitialised
@@ -482,8 +482,11 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
     """Draw the Book page from the shell's one read-only connection."""
     try:
         summaries = ops.book_summaries(conn, settings, now=_now())
-    except (JournalNotInitialised, SchemaVersionError):
+    except JournalNotInitialised:
         st.info("No book has started yet, so there is nothing to show.")
+        return
+    except SchemaVersionError as exc:
+        ops_page._render_journal_outdated(str(exc))
         return
     summary = _choose_book(summaries, settings)
     if summary is None:
@@ -495,6 +498,9 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
         )
     except UnreadableMarkError:
         st.error("A day's value for this book could not be read, so the page cannot be drawn.")
+        return
+    except SchemaVersionError as exc:
+        ops_page._render_journal_outdated(str(exc))
         return
     if view.header is None:
         st.info("This book has no window yet, so there is nothing to show.")

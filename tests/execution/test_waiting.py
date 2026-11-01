@@ -316,19 +316,19 @@ def test_a_noted_alert_is_no_item_and_no_span_is_no_item() -> None:
 
 
 def _report(count: int | None, has_report: bool = False) -> ReportFacts:
-    return ReportFacts(tracking_count=count, has_report=has_report, minimum=2, second_rebalance=THU)
+    return ReportFacts(tracking_count=count, has_report=has_report, minimum=3, second_rebalance=THU)
 
 
-def test_report_due_at_two_rebalances_and_gone_once_a_report_exists() -> None:
-    assert build([BookFacts(book_id="main", report=_report(1))], None) == ()
+def test_report_due_at_three_rebalances_and_gone_once_a_report_exists() -> None:
+    assert build([BookFacts(book_id="main", report=_report(2))], None) == ()
     assert build([BookFacts(book_id="main", report=_report(None))], None) == ()
-    (item,) = build([BookFacts(book_id="main", report=_report(2))], None)
+    (item,) = build([BookFacts(book_id="main", report=_report(3))], None)
     assert item == WaitingItem(
         book_id="main",
         kind="report_due",
         since=THU,
         detail=(
-            "2 rebalances tracked and no tracking report yet; `paper report` opens a "
+            "3 rebalances tracked and no tracking report yet; `paper report` opens a "
             "counted tracking trial"
         ),
         command="tradepartner paper report --book main",

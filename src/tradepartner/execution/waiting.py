@@ -42,7 +42,7 @@ clears it, the command the owner types (text only: nothing here runs it).
 6. `report_due`: at least `ReportFacts.minimum` tracked rebalances (`paper
    report`'s count) and no `paper_reports` row yet: only the first report is
    prompted, because every `paper report` opens a counted tracking trial.
-   `since` is the second rebalance session. Command: `paper report`.
+   `since` is the session the report became due (the third rebalance). Command: `paper report`.
 7. `unreadable`: one per book whose rows raised a `ValueError` (an
    `UnreadableMarkError`, `frozen_risk` on an unreadable `frozen_json`,
    `lag_verdict` on an unreadable reconciliation row), carrying every message.
@@ -199,7 +199,7 @@ class RunFacts:
 class ReportFacts:
     """`paper report`'s tracking count (None when the cadence cannot be read),
     whether the window has a `paper_reports` row, the count that makes a report
-    due, and the window's second rebalance session (None when not read)."""
+    due, and the session the report became due (None when not read)."""
 
     tracking_count: int | None
     has_report: bool

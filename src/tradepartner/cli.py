@@ -93,6 +93,11 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   (`store/dividend_reviews.csv`) with an ex-date on or before `--to`, counts
   the later ones deferred, and lists every stale entry (a dry run exits 1 on
   any; a real run refuses).
+- `tradepartner build-form4-roles-manifest --zip-dir DIR --output FILE`
+  reads the store and cached insider zips to list rows with the old bulk role
+  parse. `repair-form4-roles --manifest FILE --release NAME --expect-rows N
+  [--dry-run]` checks every stored key, source row, zip hash and raw role before
+  updating the four flags and `ingested_at` inside the open release (#2697).
 - `tradepartner action-retract --security <id> --action-id <source id>
   --reason <text> [--reinstate] (--dry-run | --expect-known-at <iso>)` runs
   `action_retract.retract_action` (#2092, data-foundation plan T262): it
@@ -494,6 +499,7 @@ from tradepartner.ingest import (
     manifest_release,
     rates_seeded,
     read_manifest,
+    show_ingest_progress,
 )
 from tradepartner.repair import (
     HeaderLookup,
@@ -504,6 +510,15 @@ from tradepartner.repair import (
     repair_resolution,
     retract_dividends,
     store_resolver,
+)
+from tradepartner.repair_form4_roles import (
+    RoleRepairRefused,
+)
+from tradepartner.repair_form4_roles import (
+    build_manifest as build_form4_roles_manifest,
+)
+from tradepartner.repair_form4_roles import (
+    repair_form4_roles as apply_form4_roles_repair,
 )
 from tradepartner.research import (
     EVERY_ROW_SPLITS,
@@ -2739,6 +2754,7 @@ def make_app(
             event_forms=s.edgar.event_forms,
         )
         if sec_forms_only:
+            show_ingest_progress()
             result = ingest_sec_forms(s, filings, clock=clock)
             _print_result(result)
             raise typer.Exit(result.exit_code)
@@ -2918,6 +2934,42 @@ def make_app(
         except ValueError as exc:
             raise _fail(f"refused: {exc}", USAGE_ERROR) from None
         typer.echo(result.summary())
+
+    @app.command("repair-form4-roles")
+    def repair_form4_roles_command(
+        manifest: Annotated[Path, typer.Option(help="reviewed JSON manifest")],
+        release: Annotated[str, typer.Option(help="the open data release")],
+        expect_rows: Annotated[int, typer.Option(help="the dry run's changed-row count")],
+        dry_run: Annotated[bool, typer.Option(help="count changes without writing")] = False,
+    ) -> None:
+        """Repair bulk Form 4 roles against the cached zip and a reviewed manifest."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            count = apply_form4_roles_repair(
+                s, manifest, release, expect_rows, dry_run=dry_run, clock=clock
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RoleRepairRefused as exc:
+            raise _fail(f"repair refused: {exc}", 1) from None
+        typer.echo(f"form4 roles: {count} rows {'would change' if dry_run else 'changed'}")
+
+    @app.command("build-form4-roles-manifest")
+    def build_form4_roles_manifest_command(
+        zip_dir: Annotated[Path, typer.Option(help="directory of cached *_form345.zip files")],
+        output: Annotated[Path, typer.Option(help="reviewable JSON manifest path")],
+    ) -> None:
+        """Build a role repair manifest from the store and cached SEC zips."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            count = build_form4_roles_manifest(s, sorted(zip_dir.glob("*_form345.zip")), output)
+        except (StoreLockedError, ValueError, OSError) as exc:
+            raise _fail(f"manifest refused: {exc}", 1) from None
+        typer.echo(f"form4 roles manifest: {count} rows")
 
     @app.command("repair-dividends")
     def repair_dividends(
