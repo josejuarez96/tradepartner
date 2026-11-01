@@ -98,6 +98,12 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   parse. `repair-form4-roles --manifest FILE --release NAME --expect-rows N
   [--dry-run]` checks every stored key, source row, zip hash and raw role before
   updating the four flags and `ingested_at` inside the open release (#2697).
+- `tradepartner recheck-form4-multi-owner --count-only [--from-quarter YYYYqN
+  --to-quarter YYYYqN]` estimates the SEC requests. With `--output FILE
+  --max-requests N [--resume FILE]`, it rechecks bulk multi-owner Form 4
+  accessions against cached SEC XML, writing a manifest and summary.
+  `repair-form4-multi-owner --manifest FILE --release NAME --expect-rows N
+  [--dry-run]` applies only reviewed role changes in the open release (#2720).
 - `tradepartner build-form4-titles-manifest --zip-dir DIR --output FILE`
   compares stored bulk titles with the fixed cached-zip parser. `repair-form4-titles
   --manifest FILE --release NAME --expect-rows N [--dry-run]` changes only
@@ -423,6 +429,7 @@ from tradepartner.adapters.edgar_source import (
     census_filing_index,
 )
 from tradepartner.adapters.filings import FilingHeader
+from tradepartner.adapters.form4_bulk_route import RequestBudgetStopped
 from tradepartner.adapters.fred_rates import FredRateSource
 from tradepartner.adapters.prices import (
     Bar,
@@ -514,6 +521,19 @@ from tradepartner.repair import (
     repair_resolution,
     retract_dividends,
     store_resolver,
+)
+from tradepartner.repair_form4_multi_owner import (
+    MultiOwnerRepairRefused,
+    recheck_form4_multi_owner,
+)
+from tradepartner.repair_form4_multi_owner import (
+    count_candidates as count_form4_multi_owner,
+)
+from tradepartner.repair_form4_multi_owner import (
+    manifest_digest as form4_multi_owner_manifest_digest,
+)
+from tradepartner.repair_form4_multi_owner import (
+    repair_form4_multi_owner as apply_form4_multi_owner_repair,
 )
 from tradepartner.repair_form4_roles import (
     RoleRepairRefused,
@@ -2954,6 +2974,84 @@ def make_app(
         except ValueError as exc:
             raise _fail(f"refused: {exc}", USAGE_ERROR) from None
         typer.echo(result.summary())
+
+    @app.command("recheck-form4-multi-owner")
+    def recheck_form4_multi_owner_command(
+        output: Annotated[Path | None, typer.Option(help="JSON manifest path")] = None,
+        max_requests: Annotated[
+            int | None, typer.Option(help="request budget, required for recheck")
+        ] = None,
+        from_quarter: Annotated[
+            str | None, typer.Option(help="first filing quarter, YYYYqN")
+        ] = None,
+        to_quarter: Annotated[str | None, typer.Option(help="last filing quarter, YYYYqN")] = None,
+        resume_file: Annotated[
+            Path | None, typer.Option("--resume", help="partial manifest to resume")
+        ] = None,
+        count_only: Annotated[bool, typer.Option(help="estimate without SEC requests")] = False,
+    ) -> None:
+        """Count or recheck stored bulk multi-owner Form 4 filings against SEC XML."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            counts = count_form4_multi_owner(s, from_quarter=from_quarter, to_quarter=to_quarter)
+            total = sum(counts.values())
+            if count_only:
+                for quarter, count in counts.items():
+                    typer.echo(f"{quarter}: {count} accessions, at least {2 * count} requests")
+                typer.echo(
+                    f"total: {total} accessions, at least {2 * total} requests; "
+                    "allow headroom for retries"
+                )
+                return
+            if output is None or max_requests is None:
+                raise _fail("--output and --max-requests are required", USAGE_ERROR)
+            summary = recheck_form4_multi_owner(
+                s,
+                output,
+                max_requests=max_requests,
+                from_quarter=from_quarter,
+                to_quarter=to_quarter,
+                resume=resume_file,
+                client=edgar_client,
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RequestBudgetStopped:
+            assert output is not None
+            raise _fail(
+                f"request budget reached; partial manifest kept at {output}; "
+                f"re-run with --resume {output}",
+                1,
+            ) from None
+        except (MultiOwnerRepairRefused, OSError, ValueError) as exc:
+            raise _fail(f"recheck refused: {exc}", 1) from None
+        digest = form4_multi_owner_manifest_digest(output)
+        typer.echo(f"manifest: {output}; sha256 {digest}")
+        typer.echo(f"summary: {output.with_suffix('.summary.json')}; {summary['counts']}")
+        typer.echo(f"XML cache: {summary['cache_dir']}/form4_multi_owner")
+
+    @app.command("repair-form4-multi-owner")
+    def repair_form4_multi_owner_command(
+        manifest: Annotated[Path, typer.Option(help="reviewed XML recheck manifest")],
+        release: Annotated[str, typer.Option(help="the open data release")],
+        expect_rows: Annotated[int, typer.Option(help="expected changed-row count")],
+        dry_run: Annotated[bool, typer.Option(help="count changes without writing")] = False,
+    ) -> None:
+        """Apply only the XML-confirmed role changes under an open release."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            count = apply_form4_multi_owner_repair(
+                s, manifest, release, expect_rows, dry_run=dry_run, clock=clock
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except (MultiOwnerRepairRefused, ValueError) as exc:
+            raise _fail(f"repair refused: {exc}", 1) from None
+        typer.echo(f"form4 multi-owner: {count} rows {'would change' if dry_run else 'changed'}")
 
     @app.command("repair-form4-roles")
     def repair_form4_roles_command(
