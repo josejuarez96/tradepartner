@@ -60,6 +60,7 @@ import pytest
 
 from tradepartner.calendar import session_close
 from tradepartner.execution import lots
+from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lots import LedgerAccount, LotLedgerError, rebuild
 from tradepartner.store import schema
 from tradepartner.store.asof import live_actions_as_of
@@ -334,6 +335,37 @@ def test_a_reverse_split_with_cash_in_lieu_disposes_of_the_fraction() -> None:
     assert sold.realised_pnl == pytest.approx(6.0)
     assert _basis_closed(1, disposals) == pytest.approx(70.0)
     assert flags == []
+
+
+def test_the_lot_ledger_and_the_positions_ledger_agree_on_a_reverse_split() -> None:
+    """#2184: 15 shares through a 1-for-10 reverse split are 1.5; the broker holds
+    1 whole share and pays cash in lieu for the 0.5. The lot ledger (the 1.5-share
+    lot less the 0.5 disposed) and the positions ledger both end at 1 share."""
+    book = Book()
+    book.trade("buy", 15, 10.0, D0303)
+    book.adjust("cash_in_lieu", D0307, "SEC_X", quantity=-0.5, cash=50.0)
+    actions = _splits(("SEC_X", D0307, 0.1))
+
+    lot_list, disposals, _ = book.run(D0312, actions)
+    positions = from_journal(
+        book.fills,
+        book.orders,
+        book.adjustments,
+        actions,
+        None,
+        100_000.0,
+        D0312,
+        window_id=1,
+        quantity_tolerance=1e-6,
+    ).positions
+
+    [lot] = lot_list
+    [cil] = disposals
+    assert lot.quantity - cil.quantity == pytest.approx(1.0)  # what stays open
+    assert float(positions["SEC_X"]) == pytest.approx(1.0)
+    assert cil.quantity == pytest.approx(0.5)
+    assert cil.proceeds == pytest.approx(50.0)
+    assert cil.realised_pnl == pytest.approx(0.0)  # basis 150 x (0.5 / 1.5) = 50
 
 
 def test_cash_in_lieu_leaves_whole_shares_so_nothing_is_stranded() -> None:

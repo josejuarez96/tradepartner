@@ -1832,6 +1832,70 @@ def test_a_stock_dividend_cash_in_lieu_reconciles_with_no_halt() -> None:
     assert [r.activity_id for r in result.activities] == ["act-cil"]
 
 
+@pytest.mark.parametrize(
+    ("ratio", "ledger", "whole", "cash"),
+    [
+        (1.5, 22.5, 22.0, 0.5 * (120.0 / 1.5)),  # 3-for-2 of 15: 40.00
+        (0.1, 1.5, 1.0, 0.5 * (120.0 / 0.1)),  # 1-for-10 of 15: 600.00
+    ],
+)
+def test_a_cash_in_lieu_of_any_split_reconciles_with_no_halt(
+    ratio: float, ledger: float, whole: float, cash: float
+) -> None:
+    """#2184: a forward split above the stock-dividend band and a reverse split
+    each leave a 0.5-share remainder; the `CIL` is valued at the pre-ex reference
+    divided by the ratio (the post-ex price), and books one `cash_in_lieu`."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=ledger),
+        _positions(AAA=whole),
+        1_000.0 + cash,
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (S, S, ratio)},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
+            activities=(_cil("act-cil", S, cash),),
+        ),
+    )
+
+    assert result.status == "ok"
+    assert [(a.kind, a.cash, a.quantity) for a in result.adjustments] == [
+        ("cash_in_lieu", cash, -0.5)
+    ]
+
+
+def test_a_reverse_split_cash_in_lieu_off_beyond_the_tolerance_halts() -> None:
+    """#2184: the amount check is unchanged for a reverse split."""
+    cash = 0.5 * (120.0 / 0.1) * 0.8
+    result = _run(
+        _ledger(1_000.0, SEC_A=1.5),
+        _positions(AAA=1.0),
+        1_000.0 + cash,
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (S, S, 0.1)},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
+            activities=(_cil("act-cil", S, cash),),
+        ),
+    )
+
+    assert "unexplained_activity" in _kinds(result)
+    assert result.status != "ok"
+
+
+def test_a_whole_reverse_split_result_needs_no_cash_in_lieu() -> None:
+    """#2184: 20 shares at 1-for-10 are 2 whole shares; no `CIL`, nothing to book."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=2.0),
+        _positions(AAA=2.0),
+        1_000.0,
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (S, S, 0.1)},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
+        ),
+    )
+
+    assert result.status == "ok"
+    assert result.adjustments == ()
+
+
 def test_a_cash_in_lieu_within_the_relative_tolerance_books_the_broker_amount() -> None:
     """#1627: the tolerance is `risk.cash_in_lieu_tolerance` and relative, so a
     `CIL` within ~10% of the expected 50.00 still books — and it books the

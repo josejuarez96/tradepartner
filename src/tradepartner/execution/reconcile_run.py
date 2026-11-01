@@ -873,12 +873,14 @@ def _spinoffs(
 
 
 def _stock_dividends(
-    actions: pl.DataFrame, session: date, max_rate: float, max_lag_sessions: int
+    actions: pl.DataFrame, session: date, max_lag_sessions: int
 ) -> dict[str, tuple[date, date, float]]:
-    """`security_id`s with a stock dividend stored as a `SPLIT` action (#1627):
-    a ratio in `(1, max_rate]` — the same `alpaca.stock_dividend_max_rate` guard
-    `#1618` (T186-family) stores one by — each mapped to `(first_date, last_date,
-    ratio)`: the name's latest `ex_date <= session`, that ex-date advanced up to
+    """`security_id`s with a split of any kind stored as a `SPLIT` action (#1627,
+    widened by #2184): a stock dividend in `(1, alpaca.stock_dividend_max_rate]`,
+    a forward split above it, or a reverse split (ratio < 1), so any split that
+    can leave a fractional share is explained; only a ratio of 1 or less than or
+    equal to 0 is excluded. Each is mapped to `(first_date, last_date, ratio)`: the
+    name's latest `ex_date <= session`, that ex-date advanced up to
     `max_lag_sessions` XNYS sessions (the `alpaca.cash_in_lieu_max_lag_sessions`
     window Alpaca pays cash in lieu on, the payable date), clamped to `session`,
     and its ratio. A `CIL` cash-in-lieu activity is reconciled into a
@@ -887,8 +889,8 @@ def _stock_dividends(
     whole shares plus cash); otherwise it is `unexplained_activity`."""
     rows = actions.filter(
         (pl.col("action_type") == _SPLIT)
-        & (pl.col("ratio_or_amount") > 1)
-        & (pl.col("ratio_or_amount") <= max_rate)
+        & (pl.col("ratio_or_amount") > 0)
+        & (pl.col("ratio_or_amount") != 1)
         & (pl.col("ex_date") <= session)
     )
     latest: dict[str, tuple[date, float]] = {}
@@ -991,7 +993,6 @@ def _explanations(
     stock_dividends = _stock_dividends(
         actions,
         session,
-        settings.alpaca.stock_dividend_max_rate,
         settings.alpaca.cash_in_lieu_max_lag_sessions,
     )
     return Explanations(
