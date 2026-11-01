@@ -21,7 +21,9 @@ from tradepartner.store.raw_archive_config import ARCHIVE_ENV_NAME, RawArchiveFl
 from tradepartner.store.raw_archive_migrate import (
     MigrationRefusedError,
     MigrationStoppedError,
+    RestoreRefusedError,
     apply_migration,
+    restore_files,
 )
 from tradepartner.store.raw_archive_plan import CacheFile, current_versions
 
@@ -78,13 +80,15 @@ class Rig:
         os.utime(path, ns=(mtime * 10**9, mtime * 10**9))
         return path
 
-    def run(self, **kw: object) -> raw_archive_migrate.MigrationResult:
+    def run(
+        self, run_id: str = "r1", at: datetime = NOW, **kw: object
+    ) -> raw_archive_migrate.MigrationResult:
         return apply_migration(
             self.settings,
             self.cache,
             self.icloud,
-            run_id="r1",
-            now=lambda: NOW,
+            run_id=run_id,
+            now=lambda: at,
             **kw,  # type: ignore[arg-type]
         )
 
@@ -517,3 +521,111 @@ def test_a_backup_only_run_cut_before_its_settle_still_writes_the_manifest(
     result = rig.run()
     assert result.manifest_sha256 == tmp_rig.run().manifest_sha256 != ""
     assert result.backup_states == {"stamps/v1/0001.json": "evicted"}
+
+
+# --- restore (T361c) ---------------------------------------------------------
+
+
+def _restore(rig: Rig, path: str, **kw: object) -> raw_archive_migrate.RestoreResult:
+    return restore_files(
+        rig.settings,
+        rig.cache,
+        rig.icloud,
+        path=path,
+        now=lambda: NOW,
+        **kw,  # type: ignore[arg-type]
+    )
+
+
+class RestoreICloud(FakeICloud):
+    """Evicted bodies come back local on `download`, as brctl does."""
+
+    def download(self, path: Path) -> None:
+        self.evicted.discard(path)
+
+
+def test_restored_bytes_path_and_mtime_equal_the_original_and_the_body_stays(rig: Rig) -> None:
+    rig.icloud = RestoreICloud()
+    corpus = rig.cache / "corpus/departure-reason/raw/b.json"
+    corpus_mtime = corpus.stat().st_mtime_ns
+    rig.run()
+    result = _restore(rig, "corpus/departure-reason")
+    assert result.restored == {"corpus/departure-reason/raw/b.json": _sha(b"corpus-b")}
+    assert corpus.read_bytes() == b"corpus-b"
+    assert corpus.stat().st_mtime_ns == corpus_mtime
+    assert body_path(rig.root, _sha(b"corpus-b")).exists()  # the archived body stays
+    assert not (rig.cache / DEAD / "a.json").exists()  # out of scope, not restored
+    last = rig.index()[-1]
+    assert last["op"] == "restored"
+    assert last["path"] == "corpus/departure-reason/raw/b.json"
+    assert not [p for p in rig.cache.rglob(".restore-*")]
+
+
+def test_restore_refuses_an_offline_body_with_nothing_written(rig: Rig) -> None:
+    rig.run()  # FakeICloud.download raises: the bodies are evicted and cannot come back
+    before = rig.tree()
+    index = rig.index()
+    with pytest.raises(AssertionError):
+        _restore(rig, DEAD)
+    assert rig.tree() == before
+    assert rig.index() == index
+    assert not (rig.cache / DEAD / "a.json").exists()
+
+
+def test_restore_refuses_a_mismatched_body_with_nothing_written(rig: Rig) -> None:
+    rig.run()
+    body = body_path(rig.root, _sha(b"dead-a"))
+    rig.icloud.evicted.clear()
+    body.write_bytes(b"tampered")
+    index = rig.index()
+    with pytest.raises(raw_archive.RawArchiveIntegrityError):
+        _restore(rig, DEAD)
+    assert not (rig.cache / DEAD / "a.json").exists()
+    assert rig.index() == index
+
+
+def test_restore_never_overwrites_a_local_backup_file_and_names_each(rig: Rig) -> None:
+    rig.put("stamps/v1/0002.json", b"other")
+    rig.run()
+    before = rig.tree()
+    with pytest.raises(RestoreRefusedError) as exc:
+        _restore(rig, "stamps/v1")
+    assert "stamps/v1/0001.json" in str(exc.value)
+    assert "stamps/v1/0002.json" in str(exc.value)
+    assert rig.tree() == before
+
+
+def test_restore_run_from_removed_files_returns_either_snapshot(rig: Rig) -> None:
+    rig.icloud = RestoreICloud()
+    rig.put("stamps/v1/0002.json", b"other")
+    rig.run(run_id="r1")
+    rig.put("stamps/v1/0001.json", b"stamp-rewritten")
+    rig.run(run_id="r2", at=datetime(2026, 11, 2, tzinfo=UTC))
+    snap = {"stamps/v1/0001.json", "stamps/v1/0002.json"}
+    for run, expect in (("r1", b"stamp"), ("r2", b"stamp-rewritten"), (None, b"stamp-rewritten")):
+        for rel in snap:
+            (rig.cache / rel).unlink()
+        result = _restore(rig, "stamps/v1", run=run)
+        assert set(result.restored) == snap
+        assert (rig.cache / "stamps/v1/0001.json").read_bytes() == expect
+        assert (rig.cache / "stamps/v1/0002.json").read_bytes() == b"other"
+    assert body_path(rig.root, _sha(b"stamp")).exists()  # both snapshots' bodies stay
+
+
+def test_restore_refuses_when_nothing_matches_or_the_run_is_unknown(rig: Rig) -> None:
+    rig.run()
+    with pytest.raises(RestoreRefusedError):
+        _restore(rig, "nope/")
+    with pytest.raises(RestoreRefusedError):
+        _restore(rig, "stamps/v1", run="zzz")
+
+
+def test_restore_stops_below_the_floor_with_nothing_written(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.icloud = RestoreICloud()
+    rig.run()
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _p: 1)
+    with pytest.raises(RawArchiveFloorError):
+        _restore(rig, DEAD)
+    assert not (rig.cache / DEAD / "a.json").exists()
