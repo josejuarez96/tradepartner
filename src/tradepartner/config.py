@@ -1138,8 +1138,11 @@ class RawArchiveConfig(_ClosedConfig):
     The iCloud waits (plan T346, #2751) bound how long `store.raw_archive` polls
     for a confirmed upload before an eviction and for local copies before a
     re-derive. Each wait is `max(<kind>_wait_min_s, transfer_wait_s_per_mb x MB)`
-    over the bytes awaited; T354 measured 20 MB uploaded in 11 s and 200 MB in
-    41 s. On an upload timeout the file stays local, counted against the floor
+    over the bytes awaited. T354 measured 20 MB uploaded in 11 s
+    (docs/research/2026-10-31-icloud-status-probe.md); the orchestrator's follow-up
+    run of 2026-11-01 05:50 UTC (`~/tradepartner-probes/icloud/evict-space-out.txt`)
+    measured 200 MB uploaded in 41 s, with free space back only after about 5 min
+    of an eviction. On an upload timeout the file stays local, counted against the floor
     and reported pending; on a download timeout the re-derive refuses to start.
     `poll_interval_s` spaces the status polls and `command_timeout_s` caps each
     `osascript` or `brctl` call.

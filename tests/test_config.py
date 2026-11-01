@@ -3606,9 +3606,10 @@ def test_env_example_names_the_raw_archive_with_an_empty_value() -> None:
 
 
 def test_raw_archive_wait_defaults_follow_the_t354_probe() -> None:
-    """T354 measured 20 MB uploaded in 11 s and 200 MB in 41 s: the bounded wait is
-    max(300 s, 0.2 s per MB), polled every 5 s (docs/research/2026-10-31-icloud-
-    status-probe.md)."""
+    """T354 measured 20 MB uploaded in 11 s (docs/research/2026-10-31-icloud-status-
+    probe.md) and the 2026-11-01 05:50 UTC follow-up run 200 MB in 41 s
+    (`~/tradepartner-probes/icloud/evict-space-out.txt`): the bounded wait is
+    max(300 s, 0.2 s per MB), polled every 5 s."""
     a = _settings().raw_archive
     assert a.upload_wait_min_s == 300.0
     assert a.download_wait_min_s == 300.0

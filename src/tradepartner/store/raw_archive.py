@@ -16,30 +16,39 @@ without a download. A sync conflict copy ("name 2") never matches a name.
 
 **Write** (`archive_body`, `archive_manifest`). A new body is checked against the
 `raw_archive.min_free_disk_gb` floor (free bytes minus its size), written to a
-temp file ending in `.nosync` (iCloud does not sync it), fsynced, and renamed to
-its final name only if that name is still free. A final name therefore exists
-only for a complete body, and no write ever replaces one. An interrupted write
-leaves at most its temp file, which never counts as held.
+temp file ending in `.nosync` (iCloud does not sync it), fsynced, and given its
+final name with `os.link`, which fails if the name exists. A final name
+therefore exists only for a complete body, and no write ever replaces one, even
+under a racing writer. An interrupted write leaves at most its temp file, which
+never counts as held. The `raw/`, shard and `manifests/` directories must be real
+directories, never symlinks, so nothing lands outside the checked root.
 
 **Evict** (`evict_uploaded`), a deferred pass over named body hashes: poll the
 upload status, bounded by `raw_archive.upload_wait_min_s` scaled by size
 (`transfer_wait_s`); once a body's upload is confirmed, re-hash its local copy,
 call `brctl evict`, and require a dataless file afterwards. A body still
 unconfirmed at the deadline stays local, counted (`local_bytes`) and reported
-pending. Manifests are never evicted: the pass takes body hashes only, and
+pending. A failed status or evict call still yields a complete report: the
+bodies it left are `status_failed` or `evict_failed`, local and counted.
+Manifests are never evicted: the pass takes body hashes only, and
 `_evict` refuses any path outside the body tree. Free space is read before and
 after the pass and the measured change reported; an eviction is never counted as
 freed space (APFS returns it minutes later, T354).
 
 **Download** (`download_inputs`), before a re-derive parses anything: every named
 hash must be held; the floor is checked against the bytes the downloads bring
-back; `brctl download` is requested for every non-local body, then each is waited
-for (bounded by `raw_archive.download_wait_min_s`) and re-hashed. Any missing,
+back (an `.icloud` placeholder counts its recorded size, and one without a size
+is refused); `brctl download` is requested for every non-local body, then each
+is waited for (bounded by `raw_archive.download_wait_min_s`). Every body's state
+is checked once more before the re-hash, so a body iCloud evicted again after
+the wait is refused rather than silently downloaded by the hash read. Any missing,
 offline or mismatched body refuses the whole set before a single parse. There is
 no fallback to a fresh fetch.
 
 **Read** (`read_body`, `read_manifest`) re-checks the hash on every read and
-refuses a dataless body instead of downloading it behind the floor's back.
+refuses a dataless body or manifest instead of downloading it behind the floor's
+back. `read_body` is the only way to a body's bytes: `download_inputs` returns
+hashes and sizes, never a path to read unchecked.
 
 Nothing here unlinks, replaces or truncates an archived file: deleting an iCloud
 file deletes its cloud copy (ADR 0028 Upload). The only removal is of this
@@ -55,10 +64,13 @@ name hashes and commands instead.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import plistlib
 import re
+import stat
 import subprocess
 import time
 import uuid
@@ -158,6 +170,24 @@ def _st_flags(path: Path) -> int:
     return int(getattr(os.lstat(path), "st_flags", 0))
 
 
+def _status_row(line: str) -> tuple[str, bool, str | None]:
+    """One `[path, uploaded, downloading status]` row of the JXA output; anything
+    else is an `RawArchiveICloudError` (the message names no path)."""
+    try:
+        row = json.loads(line)
+    except ValueError:
+        row = None
+    if (
+        isinstance(row, list)
+        and len(row) == 3
+        and isinstance(row[0], str)
+        and isinstance(row[1], bool)
+        and (row[2] is None or isinstance(row[2], str))
+    ):
+        return row[0], row[1], row[2]
+    raise RawArchiveICloudError("osascript status returned output it could not read")
+
+
 @dataclass(frozen=True)
 class MacICloud:
     """`ICloudItems` on macOS: `osascript` for status, `brctl` for evict and
@@ -188,11 +218,11 @@ class MacICloud:
             return {}
         argv = ["osascript", "-l", "JavaScript", "-e", _STATUS_SCRIPT, *map(str, paths)]
         out = self._run("osascript status", argv)
-        by_text: dict[str, tuple[bool, object]] = {}
+        by_text: dict[str, tuple[bool, str | None]] = {}
         for line in out.splitlines():
             if line.strip():
-                text, uploaded, downloading = json.loads(line)
-                by_text[str(text)] = (bool(uploaded), downloading)
+                text, uploaded, downloading = _status_row(line)
+                by_text[text] = (uploaded, downloading)
         result = {}
         for path in paths:
             if str(path) not in by_text:
@@ -226,17 +256,19 @@ class Archived:
 
 @dataclass(frozen=True)
 class ArchivedBody:
-    """A body verified local and matching its hash, ready for a re-derive."""
+    """A body verified local and matching its hash, ready for a re-derive. It
+    carries no path: the re-derive reads it with `read_body`, which re-checks the
+    hash, so no read is unchecked."""
 
     sha256: str
-    path: Path
     size: int
 
 
 @dataclass(frozen=True)
 class EvictionReport:
-    """One eviction pass. Every hash lands in exactly one tuple. `local_bytes` is
-    what stays on the laptop (pending, failed or mismatched) and so still counts
+    """One eviction pass. Every hash lands in exactly one tuple, also when a status
+    or evict call fails (`status_failed`, `evict_failed`). `local_bytes` is what
+    stays on the laptop (pending, failed or mismatched) and so still counts
     against the floor; `freed_bytes` is the measured change in free space, never
     the sum of evicted sizes; `upload_lag_s` is the observed time to a confirmed
     upload, from the start of the pass."""
@@ -246,6 +278,7 @@ class EvictionReport:
     pending_upload: tuple[str, ...]
     evict_failed: tuple[str, ...]
     mismatched: tuple[str, ...]
+    status_failed: tuple[str, ...]
     local_bytes: int
     free_before: int
     free_after: int
@@ -279,6 +312,43 @@ def _placeholder(path: Path) -> Path:
     return path.with_name(f".{path.name}{PLACEHOLDER_SUFFIX}")
 
 
+def _placeholder_size(path: Path) -> int | None:
+    """The size an `.icloud` placeholder records for its evicted file
+    (`NSURLFileSizeKey`), or `None` if it records none. The placeholder is a small
+    local plist, so reading it downloads nothing."""
+    try:
+        record = plistlib.loads(_placeholder(path).read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    size = record.get("NSURLFileSizeKey") if isinstance(record, dict) else None
+    return size if isinstance(size, int) and not isinstance(size, bool) and size >= 0 else None
+
+
+def _tree(root: Path, path: Path, *, create: bool) -> None:
+    """Check each directory between `root` and `path` is a real directory, never
+    a symlink, creating missing ones when `create`. Raises
+    `RawArchiveIntegrityError`; the message names the archive part, never the path."""
+    current = root
+    for part in path.parent.relative_to(root).parts:
+        current = current / part
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            if not create:
+                return
+            with contextlib.suppress(FileExistsError):
+                current.mkdir()
+            mode = os.lstat(current).st_mode
+        if stat.S_ISLNK(mode):
+            raise RawArchiveIntegrityError(
+                f"refused: the archive's {part!r} directory is a symlink"
+            )
+        if not stat.S_ISDIR(mode):
+            raise RawArchiveIntegrityError(
+                f"refused: the archive's {part!r} entry is not a directory"
+            )
+
+
 def _held_size(path: Path) -> int | None:
     """The held file's logical size by `lstat` (a dataless file keeps it), `-1` for
     a `.icloud` placeholder (size unknown), `None` if not held. Never reads it."""
@@ -291,19 +361,21 @@ def _held_size(path: Path) -> int | None:
 
 def _write(settings: Settings, root: Path, path: Path, body: bytes) -> Archived:
     sha = path.name
+    _tree(root, path, create=True)
     held = _held_size(path)
     if held is None:
         check_archive_write(settings, root, len(body))
-        path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{sha}.{uuid.uuid4().hex}{TMP_SUFFIX}")
         try:
             with tmp.open("xb") as handle:
                 handle.write(body)
                 handle.flush()
                 os.fsync(handle.fileno())
-            held = _held_size(path)
-            if held is None:
-                tmp.rename(path)
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                held = _held_size(path)
+            else:
                 _fsync_dir(path.parent)
                 return Archived(sha256=sha, created=True, size=len(body))
         finally:
@@ -343,7 +415,9 @@ def archive_manifest(settings: Settings, body: bytes) -> Archived:
 def is_archived(settings: Settings, sha256: str) -> bool:
     """Whether a body with this hash is held, local or evicted, by name only."""
     root = require_archive_root(settings)
-    return _held_size(body_path(root, sha256)) is not None
+    path = body_path(root, sha256)
+    _tree(root, path, create=False)
+    return _held_size(path) is not None
 
 
 def _hash_file(path: Path) -> str:
@@ -354,9 +428,14 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _verified(path: Path, sha256: str, kind: str) -> bytes:
+def _verified(root: Path, path: Path, sha256: str, kind: str) -> bytes:
+    _tree(root, path, create=False)
     if _held_size(path) is None:
         raise RawArchiveMissingError(f"{kind} {sha256} is not in the raw archive")
+    if not os.path.exists(path) or _st_flags(path) & SF_DATALESS:
+        raise RawArchiveOfflineError(
+            f"{kind} {sha256} is not local; reading it would download it unchecked"
+        )
     data = path.read_bytes()
     if hashlib.sha256(data).hexdigest() != sha256:
         raise RawArchiveIntegrityError(f"archived {kind} {sha256} does not match its hash")
@@ -366,7 +445,7 @@ def _verified(path: Path, sha256: str, kind: str) -> bytes:
 def read_manifest(settings: Settings, sha256: str) -> bytes:
     """A manifest's bytes, hash-checked."""
     root = require_archive_root(settings)
-    return _verified(manifest_path(root, sha256), sha256, "manifest")
+    return _verified(root, manifest_path(root, sha256), sha256, "manifest")
 
 
 def read_body(settings: Settings, sha256: str, icloud: ICloudItems) -> bytes:
@@ -375,13 +454,14 @@ def read_body(settings: Settings, sha256: str, icloud: ICloudItems) -> bytes:
     `download_inputs` makes."""
     root = require_archive_root(settings)
     path = body_path(root, sha256)
+    _tree(root, path, create=False)
     if _held_size(path) is None:
         raise RawArchiveMissingError(f"body {sha256} is not in the raw archive")
     if not os.path.exists(path) or not _is_local(icloud.status([path])[path]):
         raise RawArchiveOfflineError(
             f"body {sha256} is not local; run download_inputs for it before reading"
         )
-    return _verified(path, sha256, "body")
+    return _verified(root, path, sha256, "body")
 
 
 def _is_local(state: ItemStatus) -> bool:
@@ -400,6 +480,8 @@ def _held_bodies(root: Path, hashes: Sequence[str]) -> dict[str, Path]:
     """Each named hash's body path, refusing (before any action) any hash that
     names no held body."""
     paths = {sha: body_path(root, sha) for sha in dict.fromkeys(hashes)}
+    for path in paths.values():
+        _tree(root, path, create=False)
     missing = [sha for sha, path in paths.items() if _held_size(path) is None]
     if missing:
         raise RawArchiveMissingError(
@@ -413,6 +495,17 @@ def _evict(root: Path, path: Path, icloud: ICloudItems) -> None:
     if path.parent.parent != root / BODY_DIR:
         raise RawArchiveIntegrityError("refused: only a raw body is evicted, never a manifest")
     icloud.evict(path)
+
+
+def _evict_confirmed(root: Path, path: Path, icloud: ICloudItems) -> bool:
+    """Evict one confirmed-uploaded body; true only if it is then dataless and not
+    current. A failed `brctl` or status call is false: the body stays local."""
+    try:
+        _evict(root, path, icloud)
+        after = icloud.status([path])[path]
+    except RawArchiveICloudError:
+        return False
+    return after.dataless and not after.current
 
 
 def evict_uploaded(
@@ -434,6 +527,7 @@ def evict_uploaded(
     already: list[str] = []
     failed: list[str] = []
     mismatched: list[str] = []
+    status_failed: list[str] = []
     lags: dict[str, float] = {}
     waiting = {sha: path for sha, path in paths.items() if os.path.exists(path)}
     already.extend(sha for sha in paths if sha not in waiting)
@@ -447,7 +541,12 @@ def evict_uploaded(
                 break
             sleep(min(poll, deadline - now))
         first = False
-        states = icloud.status(list(waiting.values()))
+        try:
+            states = icloud.status(list(waiting.values()))
+        except RawArchiveICloudError:
+            status_failed.extend(waiting)
+            waiting.clear()
+            break
         for sha, path in list(waiting.items()):
             state = states[path]
             if state.dataless:
@@ -457,21 +556,20 @@ def evict_uploaded(
                 if _hash_file(path) != sha:
                     mismatched.append(sha)
                 else:
-                    _evict(root, path, icloud)
-                    after = icloud.status([path])[path]
-                    (evicted if after.dataless and not after.current else failed).append(sha)
+                    (evicted if _evict_confirmed(root, path, icloud) else failed).append(sha)
             else:
                 continue
             del waiting[sha]
     pending = list(waiting)
     order = {sha: i for i, sha in enumerate(paths)}
-    local = sum(sizes[sha] for sha in (*pending, *failed, *mismatched))
+    local = sum(sizes[sha] for sha in (*pending, *failed, *mismatched, *status_failed))
     return EvictionReport(
         evicted=tuple(sorted(evicted, key=order.__getitem__)),
         already_evicted=tuple(sorted(already, key=order.__getitem__)),
         pending_upload=tuple(sorted(pending, key=order.__getitem__)),
         evict_failed=tuple(sorted(failed, key=order.__getitem__)),
         mismatched=tuple(sorted(mismatched, key=order.__getitem__)),
+        status_failed=tuple(sorted(status_failed, key=order.__getitem__)),
         local_bytes=local,
         free_before=free_before,
         free_after=diskfloor.free_bytes(root),
@@ -498,9 +596,17 @@ def download_inputs(
     offline = {
         sha: path
         for sha, path in paths.items()
-        if not os.path.exists(path) or not _is_local(states[path])
+        if path not in states or not _is_local(states[path])
     }
-    sizes = {sha: max(_held_size(path) or 0, 0) for sha, path in offline.items()}
+    sizes: dict[str, int] = {}
+    for sha, path in offline.items():
+        size = _held_size(path) if os.path.exists(path) else _placeholder_size(path)
+        if size is None or size < 0:
+            raise RawArchiveOfflineError(
+                f"body {sha} is an .icloud placeholder with no recorded size, so the "
+                "download floor cannot be checked; nothing was downloaded"
+            )
+        sizes[sha] = size
     check_archive_write(settings, root, sum(sizes.values()))
     for path in offline.values():
         icloud.download(path if os.path.exists(path) else _placeholder(path))
@@ -522,11 +628,22 @@ def download_inputs(
             f"{len(offline)} named bodies did not download within the bounded wait: "
             f"{', '.join(offline)}; nothing was parsed"
         )
+    final = icloud.status([path for path in paths.values() if os.path.exists(path)])
+    gone = [
+        sha
+        for sha, path in paths.items()
+        if path not in final or not _is_local(final[path]) or _st_flags(path) & SF_DATALESS
+    ]
+    if gone:
+        raise RawArchiveOfflineError(
+            f"{len(gone)} named bodies were evicted again after the wait: {', '.join(gone)}; "
+            "nothing was read or parsed"
+        )
     out = []
     for sha, path in paths.items():
         if _hash_file(path) != sha:
             raise RawArchiveIntegrityError(
                 f"archived body {sha} does not match its hash after download; nothing was parsed"
             )
-        out.append(ArchivedBody(sha256=sha, path=path, size=os.lstat(path).st_size))
+        out.append(ArchivedBody(sha256=sha, size=os.lstat(path).st_size))
     return tuple(out)

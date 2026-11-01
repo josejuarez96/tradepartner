@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import plistlib
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -128,6 +129,8 @@ class FakeICloud:
         self.calls: list[tuple[str, Path]] = []
         self.evict_sticks = True
         self.default_upload_after: int | None = 0
+        self.status_calls = 0
+        self.fail_status_on: int | None = None
 
     def state(self, path: Path) -> ItemStatus:
         return self.states.get(path, ItemStatus(uploaded=False, current=True, dataless=False))
@@ -136,6 +139,9 @@ class FakeICloud:
         self.states[path] = ItemStatus(uploaded=True, current=False, dataless=True)
 
     def status(self, paths: Sequence[Path]) -> Mapping[Path, ItemStatus]:
+        self.status_calls += 1
+        if self.status_calls == self.fail_status_on:
+            raise RawArchiveICloudError("osascript status failed with exit code 1")
         out = {}
         for path in paths:
             self.calls.append(("status", path))
@@ -177,10 +183,11 @@ _ARMED = [False]
 def _audit(event: str, args: tuple[Any, ...]) -> None:
     if not _ARMED[0] or not args:
         return
-    if event in {"open", "os.remove", "os.rename", "os.rmdir", "shutil.rmtree", "os.truncate"}:
+    watched = {"open", "os.remove", "os.rename", "os.link", "os.rmdir", "shutil.rmtree"}
+    if event in watched | {"os.truncate"}:
         _EVENTS.append((event, os.fspath(args[0]) if isinstance(args[0], str | Path) else ""))
-        if event == "os.rename" and len(args) > 1 and isinstance(args[1], str | Path):
-            _EVENTS.append(("os.rename.to", os.fspath(args[1])))
+        if event in {"os.rename", "os.link"} and len(args) > 1 and isinstance(args[1], str | Path):
+            _EVENTS.append((f"{event}.to", os.fspath(args[1])))
 
 
 sys.addaudithook(_audit)
@@ -202,6 +209,22 @@ def _sha(body: bytes) -> str:
 
 def _archive_files(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*") if p.is_file())
+
+
+def _placeholder(root: Path, sha: str, size: int | None) -> Path:
+    """An older-macOS `.<name>.icloud` placeholder: a plist that records the
+    evicted file's name and size (`NSURLFileSizeKey`); `None` writes no size."""
+    shard = body_path(root, sha).parent
+    shard.mkdir(parents=True, exist_ok=True)
+    record: dict[str, object] = {
+        "NSURLNameKey": sha,
+        "NSURLFileResourceTypeKey": "NSURLFileResourceTypeRegular",
+    }
+    if size is not None:
+        record["NSURLFileSizeKey"] = size
+    path = shard / f".{sha}.icloud"
+    path.write_bytes(plistlib.dumps(record, fmt=plistlib.FMT_BINARY))
+    return path
 
 
 # --- write: identical and changed bodies --------------------------------------------
@@ -369,10 +392,7 @@ def test_an_icloud_placeholder_dedups_without_being_read(root: Path) -> None:
     settings = _settings(root)
     body = b"evicted the old way"
     sha = _sha(body)
-    shard = body_path(root, sha).parent
-    shard.mkdir(parents=True)
-    placeholder = shard / f".{sha}.icloud"
-    placeholder.write_bytes(b"bplist00 placeholder")
+    placeholder = _placeholder(root, sha, len(body))
     with Audit() as events:
         again = archive_body(settings, body)
         held = is_archived(settings, sha)
@@ -575,11 +595,16 @@ def test_no_operation_removes_renames_over_or_truncates_an_archived_file(
     }
     for event, path in events:
         if event in {"os.remove", "os.rmdir", "shutil.rmtree", "os.truncate", "os.rename"}:
+            assert event == "os.remove", (event, path)
             assert path.endswith(raw_archive.TMP_SUFFIX), (event, path)
             assert path not in finals
-    renamed_to = [path for event, path in events if event == "os.rename.to"]
-    # Each new final name is created exactly once, by a rename from its temp file.
-    assert sorted(renamed_to) == sorted(finals)
+    linked_to = [path for event, path in events if event == "os.link.to"]
+    linked_from = [path for event, path in events if event == "os.link"]
+    # Each new final name is created exactly once, by a link from its temp file,
+    # which fails rather than replace a name that exists.
+    assert sorted(linked_to) == sorted(finals)
+    assert all(path.endswith(raw_archive.TMP_SUFFIX) for path in linked_from)
+    assert not any(event == "os.rename.to" for event, _ in events)
     for path in finals:
         assert Path(path).exists()
 
@@ -588,7 +613,7 @@ def test_the_module_source_has_no_delete_call_on_a_final_name() -> None:
     """A static belt to the audit above: the only removal in the module is of its
     own temp file."""
     source = Path(raw_archive.__file__).read_text(encoding="utf-8")
-    for call in ("rmtree", "os.remove(", "os.replace(", ".rmdir(", "os.unlink("):
+    for call in ("rmtree", "os.remove(", "os.replace(", ".rmdir(", "os.unlink(", ".rename("):
         assert call not in source, call
     assert source.count(".unlink(") == 1
     assert "tmp.unlink(missing_ok=True)" in source
@@ -685,10 +710,7 @@ def test_a_placeholder_input_is_downloaded_through_its_placeholder(root: Path) -
     settings = _settings(root)
     body = b"placeholder body"
     sha = _sha(body)
-    shard = body_path(root, sha).parent
-    shard.mkdir(parents=True)
-    placeholder = shard / f".{sha}.icloud"
-    placeholder.write_bytes(b"bplist00")
+    placeholder = _placeholder(root, sha, len(body))
     icloud, clock = FakeICloud(), Clock()
 
     def materialise() -> None:
@@ -726,6 +748,191 @@ def test_every_body_read_is_hash_checked(root: Path) -> None:
 def test_reading_an_absent_body_is_refused(root: Path) -> None:
     with pytest.raises(RawArchiveMissingError):
         read_body(_settings(root), "c" * 64, FakeICloud())
+
+
+# --- review fixes (pass 1 on #2753) ----------------------------------------------------------
+
+
+def test_a_name_created_between_the_check_and_the_write_is_kept_not_replaced(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final name is made by `os.link`, which fails if the name exists, so a
+    racing writer's file is never replaced, even with identical bytes."""
+    settings = _settings(root)
+    body = b"raced"
+    path = body_path(root, _sha(body))
+    real_fsync = os.fsync
+    inodes: list[int] = []
+
+    def racing(fd: int) -> None:
+        real_fsync(fd)
+        if not path.exists():
+            path.write_bytes(body)  # the other writer lands after our check
+            inodes.append(os.lstat(path).st_ino)
+
+    monkeypatch.setattr(raw_archive.os, "fsync", racing)
+    first = archive_body(settings, body)
+    assert first.created is False
+    assert os.lstat(path).st_ino == inodes[0]
+    assert _archive_files(root) == [path]
+
+
+def test_a_placeholder_counts_its_recorded_size_against_the_download_floor(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(root)
+    sha = _sha(b"q" * 5000)
+    _placeholder(root, sha, 5000)
+    icloud, clock = FakeICloud(), Clock()
+    _disk(monkeypatch, 10 * GB + 4999)
+    with pytest.raises(RawArchiveFloorError):
+        _download(settings, [sha], icloud, clock)
+    assert icloud.named("download") == []
+
+
+def test_a_placeholder_with_no_recorded_size_refuses_before_any_download(root: Path) -> None:
+    settings = _settings(root)
+    sha = _sha(b"unknown size")
+    _placeholder(root, sha, None)
+    icloud, clock = FakeICloud(), Clock()
+    with pytest.raises(RawArchiveOfflineError, match="size"):
+        _download(settings, [sha], icloud, clock)
+    assert icloud.named("download") == []
+
+
+def test_a_body_evicted_again_after_the_wait_is_refused_not_re_downloaded(root: Path) -> None:
+    """The final re-hash would read, and so silently download, a body that iCloud
+    evicted after the wait: the state is checked first and the set refused."""
+    settings = _settings(root)
+    sha = archive_body(settings, b"slippery").sha256
+    path = body_path(root, sha)
+
+    class Slippery(FakeICloud):
+        seen_local = False
+
+        def status(self, paths: Sequence[Path]) -> Mapping[Path, ItemStatus]:
+            out = dict(super().status(paths))
+            if path in out and self.named("download"):
+                if self.seen_local:
+                    self.make_dataless(path)
+                    out[path] = self.state(path)
+                elif out[path].current:
+                    self.seen_local = True
+            return out
+
+    icloud, clock = Slippery(), Clock()
+    icloud.make_dataless(path)
+    with Audit() as events, pytest.raises(RawArchiveOfflineError, match=sha):
+        _download(settings, [sha], icloud, clock)
+    assert ("open", str(path)) not in events
+
+
+def test_a_status_error_mid_pass_still_returns_a_complete_report(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(root)
+    a = archive_body(settings, b"first").sha256
+    b = archive_body(settings, b"second, slower").sha256
+    icloud, clock = FakeICloud(), Clock()
+    icloud.upload_after[body_path(root, b)] = 2
+    # Call 1 polls both, call 2 confirms a's eviction, call 3 (b's next poll) fails.
+    icloud.fail_status_on = 3
+    _disk(monkeypatch, 20 * GB, 20 * GB + 5)
+    report = _pass(settings, [a, b], icloud, clock)
+    assert report.evicted == (a,)
+    assert report.status_failed == (b,)
+    assert report.local_bytes == len(b"second, slower")
+    assert report.freed_bytes == 5
+
+
+def test_an_evict_call_error_is_reported_and_the_body_counted_local(root: Path) -> None:
+    settings = _settings(root)
+    sha = archive_body(settings, b"refused evict").sha256
+
+    class Refusing(FakeICloud):
+        def evict(self, path: Path) -> None:
+            raise RawArchiveICloudError("brctl evict failed with exit code 1")
+
+    report = _pass(settings, [sha], Refusing(), Clock())
+    assert report.evict_failed == (sha,)
+    assert report.local_bytes == len(b"refused evict")
+
+
+@pytest.mark.parametrize("tree", ["raw", "shard", "manifests"])
+def test_a_symlinked_archive_directory_is_refused(root: Path, tmp_path: Path, tree: str) -> None:
+    """A symlinked `raw/`, shard or `manifests/` would put bodies outside the
+    checked root: refused before anything is written."""
+    settings = _settings(root)
+    body = b"through a link"
+    sha = _sha(body)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    link = {
+        "raw": root / "raw",
+        "shard": root / "raw" / sha[:2],
+        "manifests": root / "manifests",
+    }[tree]
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(elsewhere, target_is_directory=True)
+    write = archive_manifest if tree == "manifests" else archive_body
+    with pytest.raises(RawArchiveIntegrityError, match="symlink"):
+        write(settings, body)
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_an_archive_directory_that_is_a_file_is_refused(root: Path) -> None:
+    settings = _settings(root)
+    (root / "raw").write_bytes(b"not a directory")
+    with pytest.raises(RawArchiveIntegrityError, match="directory"):
+        archive_body(settings, b"x")
+
+
+def test_a_symlinked_body_tree_is_refused_on_read(root: Path, tmp_path: Path) -> None:
+    settings = _settings(root)
+    body = b"read through a link"
+    sha = _sha(body)
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / sha[:2]).mkdir(parents=True)
+    (elsewhere / sha[:2] / sha).write_bytes(body)
+    (root / "raw").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(RawArchiveIntegrityError, match="symlink"):
+        read_body(settings, sha, FakeICloud())
+    with pytest.raises(RawArchiveIntegrityError, match="symlink"):
+        _download(settings, [sha], FakeICloud(), Clock())
+
+
+def test_a_verified_input_carries_no_path_to_read_unchecked(root: Path) -> None:
+    """`read_body` is the only reader, so every read is hash-checked."""
+    settings = _settings(root)
+    sha = archive_body(settings, b"no path").sha256
+    got = _download(settings, [sha], FakeICloud(), Clock())
+    assert not hasattr(got[0], "path")
+    assert got[0].size == len(b"no path")
+
+
+def test_reading_a_dataless_manifest_is_refused(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Manifests stay local; one iCloud evicted on its own is refused, not
+    downloaded by the read."""
+    settings = _settings(root)
+    sha = archive_manifest(settings, b'{"m": 2}').sha256
+    monkeypatch.setattr(raw_archive, "_st_flags", lambda _p: raw_archive.SF_DATALESS)
+    with Audit() as events, pytest.raises(RawArchiveOfflineError, match=sha):
+        read_manifest(settings, sha)
+    assert ("open", str(manifest_path(root, sha))) not in events
+
+
+@pytest.mark.parametrize(
+    "out",
+    ["not json", "[1]", '["a", true]', '{"a": 1}', '[null, true, "x"]', "[1, 2, 3, 4]"],
+)
+def test_mac_status_refuses_output_it_cannot_parse(tmp_path: Path, out: str) -> None:
+    a = tmp_path / "a"
+    a.write_bytes(b"1")
+    with pytest.raises(RawArchiveICloudError, match="status") as info:
+        MacICloud(timeout_s=1.0, runner=Runner(out)).status([a])
+    assert str(tmp_path) not in str(info.value)
 
 
 # --- MacICloud: the real commands, checked with a fake runner -----------------------------------
