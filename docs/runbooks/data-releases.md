@@ -36,6 +36,18 @@ The store holds the record. The commands, all in the `decision data-release` gro
 
 The real runs of `repair-resolution`, `repair-bars`, `repair-dividends`, `delete-master-rows` and `master-retract --apply` take `--release <name>` and refuse unless that release is open. The commands compute the numbers in the field table below, so you no longer copy them by hand.
 
+### Bulk Form 4 title repair (#2708)
+
+The bulk parser reads title values from `NONDERIV_TRANS` only. It does not read `DERIV_TRANS`, `NONDERIV_HOLDING`, or `DERIV_HOLDING`. For the old CSV-wrapped title values, build and review a deterministic manifest from the cached quarter zips and the read-only store:
+
+```bash
+uv run tradepartner build-form4-titles-manifest --zip-dir data/edgar_cache/bulk --output /tmp/form4-titles.json
+uv run tradepartner repair-form4-titles --manifest /tmp/form4-titles.json --release <open-release> --expect-rows <manifest-count> --dry-run
+uv run tradepartner repair-form4-titles --manifest /tmp/form4-titles.json --release <open-release> --expect-rows <dry-run-count>
+```
+
+Keep the printed manifest SHA-256 with the release notes. The builder refuses unmatched stored bulk rows and title differences beyond the SEC's CSV quoting. The apply step verifies the zip hashes and current row values, changes only `security_title`, and records the manifest hash in `ingestion_runs`. Take the backup and open the named release first; close it with the affected sessions after verification.
+
 The legacy file lives beside the store, in `data/` (gitignored, so it never reaches the public repo). Each entry was one `[[release]]` table, append-only. Its format, still what `import-file` reads (the numbers are illustrative):
 
 ```toml
