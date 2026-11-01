@@ -279,6 +279,21 @@ def test_the_archive_root_must_be_configured(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+def test_archive_on_is_false_unset_true_for_a_good_root_and_refuses_a_bad_one(
+    tmp_path: Path, root: Path
+) -> None:
+    """T348: a writer asks whether the archive is on without naming its root. Unset
+    or blank is off; a set root is checked, so a typo fails the run (#2714 item 2)."""
+    from tradepartner.store.raw_archive_config import RawArchiveUnavailableError
+
+    assert raw_archive.archive_on(Settings(_env_file=None)) is False
+    assert raw_archive.archive_on(Settings(_env_file=None, tradepartner_raw_archive=" ")) is False
+    assert raw_archive.archive_on(_settings(root)) is True
+    with pytest.raises(RawArchiveUnavailableError, match=ARCHIVE_ENV_NAME):
+        raw_archive.archive_on(_settings(tmp_path / "missing"))
+    assert not (tmp_path / "missing").exists()
+
+
 @pytest.mark.parametrize("bad", ["", "ABC", "../" + "0" * 61, "g" * 64, "0" * 63, "0" * 65])
 def test_a_malformed_hash_is_refused_before_any_path_is_built(root: Path, bad: str) -> None:
     with pytest.raises(ValueError, match="SHA-256"):

@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import zipfile
+from collections import Counter
 from datetime import UTC, date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import duckdb
+import httpx
+import pytest
 
 from tradepartner.adapters.edgar_insider_bulk import read_insider_bulk
 from tradepartner.adapters.filings import SecFormFiling
@@ -67,3 +72,107 @@ def test_bulk_row_after_close_matches_store_truncated_at_close(tmp_path: Path) -
     assert not at_close.is_empty()
     assert at_close.equals(asof.sec_form4_transactions_as_of(truncated, close, settings=settings))
     assert len(asof.sec_form4_transactions_as_of(full, accepted, settings=settings)) > len(at_close)
+
+
+def test_a_later_xml_fetch_is_invisible_in_a_store_truncated_before_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T348 (#2714): with the raw archive on, a later run's newly fetched accession
+    adds nothing to an as-of read before its acceptance, matches a store truncated
+    before that run, and never becomes an entry of the earlier run's manifest."""
+    from pydantic import SecretStr
+
+    from tradepartner import diskfloor
+    from tradepartner import ingest as ingest_module
+    from tradepartner.adapters import edgar_raw
+    from tradepartner.adapters.edgar import UnstampedFiling, parse_form4
+    from tradepartner.adapters.edgar_insider_bulk import InsiderBulk
+    from tradepartner.adapters.edgar_source import EdgarFilingSource, SubmissionRecord
+    from tradepartner.adapters.form4_archive import message_digest, parse_manifest
+    from tradepartner.adapters.form4_bulk_route import insider_zip_path
+    from tradepartner.ingest import SourceRun
+
+    xml = Path(__file__).parents[1] / "fixtures/edgar/sec_forms/form4_purchase_gift_indirect.xml"
+    root = tmp_path / "archive"
+    root.mkdir()
+    settings = Settings(
+        _env_file=None,
+        tradepartner_raw_archive=SecretStr(str(root)),
+        edgar={"cache_dir": str(tmp_path / "edgar")},
+        events=EventsConfig(sec_forms_enabled=True, sec_forms_read_enabled=True),
+    )
+    issuer = parse_form4(xml.read_text()).issuer_cik
+    early, late = "0000320193-26-000123", "0000320193-26-000124"
+    filed = {early: date(2026, 9, 24), late: date(2026, 9, 30)}
+    accepted = {a: datetime(d.year, d.month, d.day, 21, tzinfo=UTC) for a, d in filed.items()}
+    bodies = {early: xml.read_bytes(), late: xml.read_bytes() + b"<!-- later -->"}
+    records = {
+        a: SubmissionRecord(a, "4", "form4.xml", False, accepted[a], filing_date=filed[a])
+        for a in filed
+    }
+    quarter = Quarter(2026, 3)
+    zip_path = insider_zip_path(settings, quarter)
+    zip_path.parent.mkdir(parents=True)
+    zip_path.write_bytes(b"insider zip")
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _path: 10**15)
+    monkeypatch.setattr(
+        ingest_module,
+        "load_bulk_quarters",
+        lambda *_a, **_k: (
+            {quarter: InsiderBulk({})},
+            {quarter: hashlib.sha256(zip_path.read_bytes()).hexdigest()},
+            Counter(),
+            frozenset(),
+        ),
+    )
+
+    def run(conn: duckdb.DuckDBPyConnection, now: datetime, run_id: str) -> str:
+        source = EdgarFilingSource(settings, client=httpx.Client(), clock=lambda: now)
+        listed = [a for a in filed if accepted[a] <= now]
+        rows = [((2026, 3), UnstampedFiling(issuer, "Issuer", "4", a, filed[a])) for a in listed]
+        monkeypatch.setattr(source, "_rows", lambda *_: iter(rows))
+        monkeypatch.setattr(source, "_load_stamps", lambda *_: {})
+        monkeypatch.setattr(
+            source, "_fetch_submissions", lambda _cik, _w: SimpleNamespace(records=records)
+        )
+        monkeypatch.setattr(source, "_sec_stamped", lambda _cik, accession, _f: records[accession])
+        monkeypatch.setattr(
+            edgar_raw,
+            "fetch_filing_xml",
+            lambda _cik, accession, _name, **_k: edgar_raw.FetchedXml(
+                f"https://www.sec.gov/{accession}.xml",
+                bodies[accession],
+                bodies[accession].decode(),
+                now,
+            ),
+        )
+        provenance = ingest_module._Form4Provenance.start(
+            settings, run_id=run_id, writer="sec_forms"
+        )
+        added, message = ingest_module._write_form4_bulk(
+            conn, settings, source, frozenset({issuer}), now, provenance=provenance
+        )
+        clause = ingest_module._provenance_clause(provenance)
+        run_row = SourceRun("sec_forms", "ok", added, "x", f"1 subjects{clause}; {message}")
+        ingest_module.write_run(conn, run_id, now, now, run_row, mode="backfill")
+        return clause
+
+    full = duckdb.connect(":memory:")
+    truncated = duckdb.connect(":memory:")
+    for conn in (full, truncated):
+        schema.init_schema(conn)
+    first_at = datetime(2026, 9, 29, tzinfo=UTC)
+    first = run(full, first_at, "first")
+    assert run(truncated, first_at, "first") == first
+    run(full, datetime(2026, 10, 2, tzinfo=UTC), "second")
+    at_first = asof.sec_form4_transactions_as_of(full, first_at, settings=settings)
+    assert not at_first.is_empty() and set(at_first["accession"]) == {early}
+    assert at_first.equals(
+        asof.sec_form4_transactions_as_of(truncated, first_at, settings=settings)
+    )
+    later = asof.sec_form4_transactions_as_of(
+        full, datetime(2026, 10, 2, tzinfo=UTC), settings=settings
+    )
+    assert late in set(later["accession"])
+    manifest = parse_manifest((root / "manifests" / str(message_digest(first))).read_bytes())
+    assert {entry["accession"] for entry in manifest["entries"]} == {early}

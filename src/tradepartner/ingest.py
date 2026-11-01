@@ -225,6 +225,7 @@ from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
+    from tradepartner.adapters.edgar_raw import FetchedXml
     from tradepartner.adapters.edgar_source import EdgarFilingSource
 
 import duckdb
@@ -238,7 +239,12 @@ from tradepartner.adapters.borrow import (
     parse_assets,
     snapshot_rows,
 )
-from tradepartner.adapters.edgar import Form4Transaction, StatementConflict, duration_class
+from tradepartner.adapters.edgar import (
+    SEC_FORMS_PARSER_VERSION,
+    Form4Transaction,
+    StatementConflict,
+    duration_class,
+)
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverPage,
@@ -252,9 +258,27 @@ from tradepartner.adapters.filings import (
     SecFormFiling,
     StatementFactRecord,
 )
+from tradepartner.adapters.form4_archive import (
+    BULK_SOURCE,
+    PROVENANCE_KEY,
+    XML_SOURCE,
+    RawInput,
+    build_manifest,
+    manifest_entry,
+    message_digest,
+    parse_manifest,
+    prior_xml_hashes,
+    quarter_message,
+    recheck_verdict,
+    zip_changed,
+)
 from tradepartner.adapters.form4_bulk_route import (
+    BULK_READER_VERSION,
+    BulkRouteResult,
     Form4IndexRow,
     RequestBudgetStopped,
+    insider_zip_fetch,
+    insider_zip_path,
     load_bulk_quarters,
     order_check_path,
     request_budget,
@@ -295,6 +319,7 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Settings, clean_message
 from tradepartner.gap import stale_listings_at
+from tradepartner.store import raw_archive
 from tradepartner.store.asof import ASSETS_SOURCE, _validate_t
 from tradepartner.store.classify import (
     ClassificationBuild,
@@ -1453,6 +1478,38 @@ class SecFormWrite:
     not_yet_known: int = 0
 
 
+def _sec_form_rows(
+    filing: SecFormFiling, *, ingested_at: datetime, source: str
+) -> dict[str, list[Row]]:
+    """The `sec_filing_events` and `sec_form4_transactions` rows of one accession,
+    as `write_sec_form_accession` inserts them (and T348's manifest digests them)."""
+    common: Row = {
+        "accepted_at": filing.accepted_at,
+        "known_at": filing.accepted_at,
+        "ingested_at": ingested_at,
+        "source": source,
+        "provenance": "filing",
+    }
+    return {
+        "sec_filing_events": [
+            {
+                "accession": filing.accession,
+                "form": filing.form,
+                "filed_date": filing.filed_date,
+                "subject_cik": subject,
+                "filer_cik": filer,
+                **common,
+            }
+            for subject in filing.subject_ciks
+            for filer in filing.filer_ciks
+        ],
+        "sec_form4_transactions": [
+            {"accession": filing.accession, **asdict(transaction), **common}
+            for transaction in filing.transactions
+        ],
+    }
+
+
 def write_sec_form_accession(
     conn: duckdb.DuckDBPyConnection,
     filing: SecFormFiling,
@@ -1481,33 +1538,9 @@ def write_sec_form_accession(
             if filing.form.startswith("SCHEDULE")
             else "sec_13d_sgml"
         )
-    common: Row = {
-        "accepted_at": filing.accepted_at,
-        "known_at": filing.accepted_at,
-        "ingested_at": ingested_at,
-        "source": source,
-        "provenance": "filing",
-    }
-    event_rows: list[Row] = [
-        {
-            "accession": filing.accession,
-            "form": filing.form,
-            "filed_date": filing.filed_date,
-            "subject_cik": subject,
-            "filer_cik": filer,
-            **common,
-        }
-        for subject in filing.subject_ciks
-        for filer in filing.filer_ciks
-    ]
-    transaction_rows: list[Row] = [
-        {"accession": filing.accession, **asdict(transaction), **common}
-        for transaction in filing.transactions
-    ]
-    wanted = {
-        "sec_filing_events": event_rows,
-        "sec_form4_transactions": transaction_rows,
-    }
+    wanted = _sec_form_rows(filing, ingested_at=ingested_at, source=source)
+    event_rows = wanted["sec_filing_events"]
+    transaction_rows = wanted["sec_form4_transactions"]
     with atomic(conn):
         existing: dict[str, list[Row]] = {table: [] for table in wanted}
         for table in wanted if stored is None or filing.accession in stored else ():
@@ -1579,6 +1612,160 @@ def _stored_xml_form4_transactions(
     return {accession: tuple(items) for accession, items in grouped.items()}
 
 
+#: Parser versions a Form 4 manifest entry names (plan T348).
+_FORM4_XML_PARSER = f"sec_forms_parser={SEC_FORMS_PARSER_VERSION}"
+_FORM4_BULK_PARSER = f"bulk_reader={BULK_READER_VERSION}"
+
+
+def _write_outcome(tally: SecFormWrite) -> str:
+    if tally.added:
+        return "added"
+    if tally.changed:
+        return "changed_refused"
+    return "not_yet_known" if tally.not_yet_known else "unchanged"
+
+
+class _Form4Provenance:
+    """One Form 4 writer run's raw retention and provenance manifest (plan T348,
+    #2755; ADR 0028 rules 1 and 2; spec amendment #2714 items 1 and 5).
+
+    Exists only while the raw archive is on (`start` returns `None` when its
+    root is unset, and the Form 4 step then runs as before).
+    `keep_xml` archives each fetched XML body before it is parsed; `keep_zip`
+    archives each insider zip whose SHA-256 is new, before any derived write.
+    `finish` writes the run's one manifest (`form4_archive.build_manifest`) and
+    fixes its digest; the quarter rows and the enclosing `edgar` or `sec_forms`
+    writer row cite it, in the same transaction. Every archive error propagates,
+    so a refused write fails the source run and its rows roll back."""
+
+    def __init__(self, settings: Settings, run_id: str, writer: str) -> None:
+        self.settings = settings
+        self.run_id = run_id
+        self.writer = writer
+        self.entries: list[dict[str, object]] = []
+        self.zips: dict[Quarter, RawInput] = {}
+        self.fetched: dict[str, RawInput] = {}
+        self.digest: str | None = None
+
+    @classmethod
+    def start(cls, settings: Settings, *, run_id: str, writer: str) -> _Form4Provenance | None:
+        """A recorder for writer run `run_id`, or `None` with the archive off."""
+        return cls(settings, run_id, writer) if raw_archive.archive_on(settings) else None
+
+    def keep_xml(self, accession: str, fetched: FetchedXml) -> None:
+        """`EdgarFilingSource.form4_xml_keeper`: keep the body before it is parsed."""
+        kept = raw_archive.archive_body(self.settings, fetched.body)
+        self.fetched[accession] = RawInput(
+            kept.sha256, fetched.url, fetched.fetched_at, _FORM4_XML_PARSER
+        )
+
+    def keep_zip(self, quarter: Quarter, digest: str) -> None:
+        """Keep the quarter's insider zip by hash unless that hash is held."""
+        if not raw_archive.is_archived(self.settings, digest):
+            kept = raw_archive.archive_body(
+                self.settings, insider_zip_path(self.settings, quarter).read_bytes()
+            )
+            if kept.sha256 != digest:
+                raise RuntimeError(
+                    f"insider zip {quarter.year}q{quarter.number} changed while it was "
+                    f"kept ({kept.sha256} is not the checked {digest}); rerun"
+                )
+        url, fetched_at = insider_zip_fetch(self.settings, quarter)
+        self.zips[quarter] = RawInput(digest, url, fetched_at, _FORM4_BULK_PARSER)
+
+    def xml_input(self, accession: str) -> RawInput:
+        """The kept XML of an accession about to be written or compared."""
+        if accession not in self.fetched:
+            raise RuntimeError(f"Form 4 XML {accession} was not kept before parse")
+        return self.fetched[accession]
+
+    def record(
+        self,
+        accession: str,
+        row_source: str,
+        quarter: Quarter | None,
+        outcome: str,
+        rows: Mapping[str, Sequence[Row]],
+    ) -> None:
+        """One input's entry; an XML input leaves the fetched set once recorded."""
+        if row_source == XML_SOURCE:
+            raw = self.fetched.pop(accession)
+        elif quarter is None:
+            raise ValueError("a bulk entry names its quarter")
+        else:
+            raw = self.zips[quarter]
+        self.entries.append(
+            manifest_entry(
+                accession=accession,
+                row_source=row_source,
+                quarter=None if quarter is None else f"{quarter.year}q{quarter.number}",
+                raw=raw,
+                outcome=outcome,
+                rows=rows,
+            )
+        )
+
+    def finish(self) -> str:
+        """Write the run's manifest once and return its digest. A fetched XML that
+        wrote nothing (an order sample, a refused parse) is entered as such."""
+        if self.digest is None:
+            for accession in sorted(self.fetched):
+                self.record(accession, XML_SOURCE, None, "not_written", {})
+            zips = [
+                {
+                    "quarter": f"{quarter.year}q{quarter.number}",
+                    "sha256": raw.sha256,
+                    "url": raw.url,
+                    "fetched_at": None if raw.fetched_at is None else raw.fetched_at.isoformat(),
+                    "parser_version": raw.parser_version,
+                }
+                for quarter, raw in sorted(self.zips.items())
+            ]
+            body = build_manifest(
+                run_id=self.run_id,
+                source=self.writer,
+                mode="backfill",
+                entries=self.entries,
+                zips=zips,
+            )
+            self.digest = raw_archive.archive_manifest(self.settings, body).sha256
+        return self.digest
+
+
+def _provenance_clause(provenance: _Form4Provenance | None) -> str:
+    """`; provenance_sha256=<hex>` for a writer message, placed by the caller
+    before any text `ingest.max_message_chars` can cut; empty with the archive off."""
+    return "" if provenance is None else f"; {PROVENANCE_KEY}={provenance.finish()}"
+
+
+def _prior_xml_hashes(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, wanted: set[str], counts: Counter[str]
+) -> dict[str, str]:
+    """The held XML hash of each wanted accession, from the manifest of the writer
+    run whose entry wrote its stored row (#2714 item 5), newest writer first. Only
+    manifests are read, never a raw body; a missing or offline one is counted and
+    passed over, so its accessions compare by rows alone."""
+    found: dict[str, str] = {}
+    runs = conn.execute(
+        "SELECT message FROM ingestion_runs WHERE source IN ('edgar', 'sec_forms') "
+        "AND mode = 'backfill' ORDER BY started_at DESC, finished_at DESC NULLS LAST"
+    ).fetchall()
+    for (message,) in runs:
+        if len(found) == len(wanted):
+            break
+        digest = message_digest(message)
+        if digest is None:
+            continue
+        try:
+            manifest = parse_manifest(raw_archive.read_manifest(settings, digest))
+        except (raw_archive.RawArchiveMissingError, raw_archive.RawArchiveOfflineError):
+            counts["sec_forms_provenance_manifest_unread"] += 1
+            continue
+        for accession, sha in prior_xml_hashes([manifest], wanted - found.keys()).items():
+            found[accession] = sha
+    return found
+
+
 def _bulk_run_fields(message: str | None) -> dict[str, str]:
     """The `key=value` fields of one `sec_insider_bulk` run message, split on `;`."""
     return dict(part.strip().split("=", 1) for part in (message or "").split(";") if "=" in part)
@@ -1590,12 +1777,37 @@ def _write_form4_bulk(
     source: EdgarFilingSource,
     subjects: frozenset[str],
     now: datetime,
+    *,
+    provenance: _Form4Provenance | None = None,
 ) -> tuple[int, str]:
     """Select the subject issuers' Form 4 index rows and run the bulk route.
 
     The owner's CLI entry is ``ingest --source edgar --backfill --since DATE``.
     The switch is off by default. Its run message gives the plan and progress.
+    With the raw archive on, `provenance` is the enclosing writer run's recorder
+    (plan T348): fetched XML is kept before parse and its manifest is written
+    before the quarter rows; a missing recorder is refused rather than letting a
+    fetch go unkept.
     """
+    if provenance is None and raw_archive.archive_on(settings):
+        raise ValueError("the Form 4 step with the raw archive on needs its writer's provenance")
+    previous = getattr(source, "form4_xml_keeper", None)
+    source.form4_xml_keeper = None if provenance is None else provenance.keep_xml
+    try:
+        return _form4_bulk(conn, settings, source, subjects, now, provenance)
+    finally:
+        source.form4_xml_keeper = previous
+
+
+def _form4_bulk(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    source: EdgarFilingSource,
+    subjects: frozenset[str],
+    now: datetime,
+    provenance: _Form4Provenance | None,
+) -> tuple[int, str]:
+    """`_write_form4_bulk`'s work, with the XML keeper set."""
     from tradepartner.adapters import edgar_raw
 
     start = settings.events.sec_forms_backfill_start
@@ -1666,6 +1878,7 @@ def _write_form4_bulk(
     queued_by_quarter: dict[Quarter, list[Form4IndexRow]] = {}
     skip: set[str] = set()
     multi_owner_stored: Counter[Quarter] = Counter()
+    rechecks: dict[Quarter, list[Form4IndexRow]] = defaultdict(list)
     stamp_work: list[Form4IndexRow] = []
     cross_route_disagree = samples = xml_expected = 0
     for quarter in sorted(filing_quarters):
@@ -1675,6 +1888,9 @@ def _write_form4_bulk(
         load_counts.update(quarter_counts)
         unreadable.update(bad)
         digests.update(quarter_digests)
+        if provenance is not None:
+            for loaded_quarter, loaded_digest in quarter_digests.items():
+                provenance.keep_zip(loaded_quarter, loaded_digest)  # before any derived write
         quarter_bulk = loaded.get(quarter)
         if quarter_bulk is not None:
             published.add(quarter)
@@ -1722,6 +1938,18 @@ def _write_form4_bulk(
                     xml_rows = xml_saved.get(accession, ())
                     if not rows_agree(accession_bulk.transactions, xml_rows):
                         cross_route_disagree += 1
+                # Rule 4 (#2714 item 5): a held XML accession makes no request, unless
+                # its quarter's zip hash changed from a recorded check (archive on):
+                # then it is rechecked once, outside the route.
+                if (
+                    provenance is not None
+                    and accession_bulk is not None
+                    and zip_changed(
+                        completed.get(f"{quarter.year}q{quarter.number}"), digests.get(quarter)
+                    )
+                ):
+                    rechecks[quarter].append(selected[accession][0])
+                    xml_expected += 1
                 skip.add(accession)
             elif stored_source == "sec_insider_bulk":
                 stored_multi_owner = (
@@ -1824,10 +2052,22 @@ def _write_form4_bulk(
         for (accession,) in conn.execute(f"SELECT DISTINCT accession FROM {table}").fetchall()
     }
 
+    def entered(
+        filing: SecFormFiling, row_source: str, quarter: Quarter, tally: SecFormWrite
+    ) -> None:
+        if provenance is not None:
+            rows = _sec_form_rows(filing, ingested_at=now, source=row_source)
+            outcome = _write_outcome(tally)
+            provenance.record(
+                filing.accession, row_source, quarter, outcome, rows if tally.added else {}
+            )
+
     def write_xml(filing: SecFormFiling) -> SecFormWrite:
         nonlocal added
+        if provenance is not None:
+            provenance.xml_input(filing.accession)  # kept before parse, or refused
         tally = write_sec_form_accession(
-            conn, filing, ingested_at=now, source="sec_form4_xml", stored=held
+            conn, filing, ingested_at=now, source=XML_SOURCE, stored=held
         )
         if filing.accession in stored:
             written_stored.add(filing.accession)
@@ -1835,13 +2075,15 @@ def _write_form4_bulk(
         quarter = quarter_of(filing.filed_date)
         quarter_added[quarter] += tally.added
         quarter_changed[quarter] += tally.changed
+        entered(filing, XML_SOURCE, accession_quarters.get(filing.accession, quarter), tally)
         return tally
 
     def write_bulk(filing: SecFormFiling, quarter: Quarter) -> SecFormWrite:
         nonlocal added
         tally = write_sec_form_accession(
-            conn, filing, ingested_at=now, source="sec_insider_bulk", stored=held
+            conn, filing, ingested_at=now, source=BULK_SOURCE, stored=held
         )
+        entered(filing, BULK_SOURCE, quarter, tally)
         if filing.accession in stored:
             written_stored.add(filing.accession)
         added += tally.added
@@ -1874,6 +2116,39 @@ def _write_form4_bulk(
     quarter_remaining: Counter[Quarter] = Counter()
     checked_digests = completed.copy()
     route_quarters = sorted(queued_by_quarter)
+    recheck_wanted = {row[0] for rows in rechecks.values() for row in rows}
+    prior = _prior_xml_hashes(conn, settings, recheck_wanted, counts) if recheck_wanted else {}
+    rechecked: set[str] = set()
+
+    def recheck(quarter: Quarter) -> BulkRouteResult | None:
+        """Recheck the quarter's held XML accessions after a zip change; a result
+        only on a budget stop, which then stands in for the route's."""
+        if provenance is None:
+            return None
+        due = rechecks.get(quarter, [])
+        for position, (accession, cik, _form, filed) in enumerate(due):
+            try:
+                if source.requests >= settings.events.sec_forms_max_requests:
+                    raise RequestBudgetStopped
+                filing = source.sec_form4_accession(cik, accession, filed)
+            except RequestBudgetStopped:
+                pending = sum(row[0] not in skip for row in queued_by_quarter[quarter])
+                stop = Counter({"sec_forms_budget_stopped": 1})
+                return BulkRouteResult(stop, source.requests, len(due) - position + pending)
+            if filing is None:
+                counts["sec_forms_xml_recheck_failed"] += 1
+                continue
+            verdict = recheck_verdict(prior.get(accession), provenance.xml_input(accession).sha256)
+            counts[f"sec_forms_xml_recheck_{verdict}"] += 1
+            if verdict == "same":
+                provenance.record(accession, XML_SOURCE, quarter, "recheck_same", {})
+            else:  # both bodies are kept; a differing row takes the changed-row refusal
+                tally = write_xml(filing)
+                if tally.changed:
+                    counts["sec_forms_changed"] += 1
+            rechecked.add(accession)
+        return None
+
     for position, quarter in enumerate(route_quarters):
         rows = queued_by_quarter[quarter]
         quarter_bulk = None
@@ -1894,7 +2169,8 @@ def _write_form4_bulk(
                 unreadable.add(quarter)
                 quarter_bulk = None
             del reread
-        result = run_form4_bulk_route(
+        stopped = recheck(quarter) if quarter in rechecks else None
+        result = stopped or run_form4_bulk_route(
             rows,
             quarters={quarter: quarter_bulk},
             stamp=stamp,
@@ -1927,6 +2203,7 @@ def _write_form4_bulk(
             and not result.counts.get("sec_forms_bulk_order_mismatch")
             and quarter not in unreadable
             and routed_stored <= written_stored
+            and all(row[0] in rechecked for row in rechecks.get(quarter, ()))
         ):
             digest = digests.get(quarter)
             if digest is not None:
@@ -1945,24 +2222,36 @@ def _write_form4_bulk(
         if result.counts.get("sec_forms_budget_stopped"):
             for later in route_quarters[position + 1 :]:
                 unreached = len({row for row in queued_by_quarter[later] if row[0] not in skip})
+                unreached += len(rechecks.get(later, ()))
                 quarter_remaining[later] += unreached
                 remaining += unreached
             break
     if cross_route_disagree:
         counts["sec_forms_bulk_xml_disagree"] = cross_route_disagree
+    # The manifest is written and its digest fixed before any run row cites it.
+    provenance_digest = None if provenance is None else provenance.finish()
     for quarter in sorted(filing_quarters):
         label = f"{quarter.year}q{quarter.number}"
         selected_count = len(queued_by_quarter.get(quarter, ()))
         digest = digests.get(quarter, "none")
         # `remaining` is this quarter's own count and sets its status; `run_remaining`
         # is the whole run's (#2728). `_bulk_run_fields` reads the digests back.
-        run_message = (
-            f"quarter={label}; "
-            f"zip_sha256={digest}; checked_sha256={checked_digests.get(label, 'none')}; "
-            f"selected={selected_count}; "
-            f"rows_added={quarter_added[quarter]}; rows_changed={quarter_changed[quarter]}; "
-            f"remaining={quarter_remaining[quarter]}; run_remaining={remaining}; "
-            f"sec_forms_bulk_multi_owner_stored={multi_owner_stored[quarter]}"
+        # The digests lead in a pinned order (T348), so `checked_sha256` and
+        # `provenance_sha256` survive a short `ingest.max_message_chars` cut.
+        run_message = _clean(
+            quarter_message(
+                checked=checked_digests.get(label, "none"),
+                provenance=provenance_digest,
+                zip_sha256=digest,
+                rest=(
+                    f"quarter={label}; selected={selected_count}; "
+                    f"rows_added={quarter_added[quarter]}; "
+                    f"rows_changed={quarter_changed[quarter]}; "
+                    f"remaining={quarter_remaining[quarter]}; run_remaining={remaining}; "
+                    f"sec_forms_bulk_multi_owner_stored={multi_owner_stored[quarter]}"
+                ),
+            ),
+            settings,
         )
         complete = quarter_remaining[quarter] == 0 and quarter not in unreadable
         _write_run(
@@ -1995,11 +2284,14 @@ def _write_sec_forms(
     now: datetime,
     *,
     form4: bool,
+    provenance: _Form4Provenance | None = None,
 ) -> tuple[int, str]:
     """The SEC ownership forms step: the Form 4 bulk backfill when `form4` is set
     (an EDGAR backfill) and the 13D filings `filings_13d` returns, each written for
     its subject CIKs in `subjects`. Returns the rows added and the run-message clause.
-    The EDGAR chunk and `ingest_sec_forms` (#2624) both write through it."""
+    The EDGAR chunk and `ingest_sec_forms` (#2624) both write through it.
+    `provenance` is the writer run's Form 4 recorder (T348; `None` with the raw
+    archive off); its manifest is written here even when the step stops early."""
     from tradepartner.adapters.edgar_source import EdgarFilingSource
 
     sec_added = sec_changed = sec_future = 0
@@ -2016,7 +2308,7 @@ def _write_sec_forms(
                 settings.events.sec_forms_max_requests,
             ):
                 form4_added, form4_message = _write_form4_bulk(
-                    conn, settings, raw_source, subjects, now
+                    conn, settings, raw_source, subjects, now, provenance=provenance
                 )
         except RequestBudgetStopped:
             form4_added = 0
@@ -2024,6 +2316,8 @@ def _write_sec_forms(
                 f"Form 4 bulk: {raw_source.requests} requests; sec_forms_budget_stopped: 1"
             )
         sec_added += form4_added
+    if provenance is not None:
+        provenance.finish()
     for filing in filings_13d():
         for subject in filing.subject_ciks:
             if subject not in subjects:
@@ -2091,15 +2385,17 @@ def ingest_sec_forms(
         gate()
         _check_source_failures(filings, dry_run=False)
 
-    def work(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+    def work(conn: duckdb.DuckDBPyConnection, run_id: str) -> tuple[int, str]:
         subjects = frozenset(
             cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
         )
+        provenance = _Form4Provenance.start(settings, run_id=run_id, writer=SEC_FORMS_SOURCE)
         added, message = _write_sec_forms(
-            conn, settings, filings, lambda: held, subjects, now, form4=True
+            conn, settings, filings, lambda: held, subjects, now, form4=True, provenance=provenance
         )
         gate()  # a quarter index the Form 4 walk could not parse fails the run
-        return added, f"{len(subjects)} subjects{message}"
+        # The manifest digest leads, before any text `max_message_chars` can cut (T348).
+        return added, f"{len(subjects)} subjects{_provenance_clause(provenance)}{message}"
 
     run = _run_source(
         SEC_FORMS_SOURCE,
@@ -2224,7 +2520,11 @@ def _ingest_filings(
     elif rebuild_filing_events:
         raise ValueError(_REBUILD_EVENTS_NEEDS_SWITCH)
     sec_forms = ""
+    form4_provenance: _Form4Provenance | None = None
     if settings.events.sec_forms_enabled:
+        form4 = _FORM4_BACKFILL.get()
+        if form4:
+            form4_provenance = _Form4Provenance.start(settings, run_id=run_id, writer="edgar")
         subjects = frozenset(
             cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
         )
@@ -2240,7 +2540,8 @@ def _ingest_filings(
             lambda: recorded.sec_forms_13d(prefetch_subjects),
             subjects,
             now,
-            form4=_FORM4_BACKFILL.get(),
+            form4=form4,
+            provenance=form4_provenance,
         )
         added += sec_added
     skip = _unjudged_ciks(recorded).ciks
@@ -2249,7 +2550,8 @@ def _ingest_filings(
     found, _ = split_kept(stored_underived(conn, master, now, skip), keep, derived)
     record_underived(conn, run_id, now, found)
     message = (
-        f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
+        f"{len(master.securities)} securities{_provenance_clause(form4_provenance)}; "
+        f"unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
         f"{statements}{events}{sec_forms}{rebuilt}{restamped}{_source_counts(filings)}"
         f"{_filename_counts(master, delistings, filings)}{chains}{candidates}; "

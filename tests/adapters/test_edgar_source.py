@@ -143,6 +143,98 @@ def test_sec_form4_accession_fetches_one_recorded_xml(
     assert fetched == [accession]
 
 
+def test_fetch_filing_xml_returns_the_exact_bytes_url_and_utc_fetch_time(
+    tmp_path: Path,
+) -> None:
+    """T348: the kept body is the response's bytes, not re-encoded text."""
+    body = (FIXTURES / "sec_forms/form4_purchase_gift_indirect.xml").read_bytes() + b"\r\n"
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, content=body)
+
+    before = datetime.now(UTC)
+    fetched = edgar_raw.fetch_filing_xml(
+        "320193",
+        "0000320193-26-000123",
+        "form4.xml",
+        settings=edgar_settings(tmp_path),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert fetched.body == body
+    assert fetched.text == body.decode()
+    assert (
+        fetched.url
+        == seen[0]
+        == ("https://www.sec.gov/Archives/edgar/data/320193/000032019326000123/form4.xml")
+    )
+    assert fetched.fetched_at.tzinfo is UTC and fetched.fetched_at >= before
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        edgar_raw.fetch_filing_xml("320193", "0000320193-26-000123", "form4.htm")
+
+
+def _form4_source(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[EdgarFilingSource, str]:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000320193-26-000123"
+    stamp = SubmissionRecord(
+        accession, "4", "form4.xml", False, CLOCK, filing_date=date(2026, 9, 24)
+    )
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: stamp)
+    return source, accession
+
+
+def test_sec_form4_keeper_gets_the_raw_body_before_it_is_parsed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#2714 item 1: with a keeper set, the fetched bytes reach it before the parse;
+    with none set, the fetch is today's `filing_xml` call."""
+    source, accession = _form4_source(monkeypatch, tmp_path)
+    body = (FIXTURES / "sec_forms/form4_purchase_gift_indirect.xml").read_bytes()
+    order: list[str] = []
+    fetched = edgar_raw.FetchedXml("https://www.sec.gov/x/form4.xml", body, body.decode(), CLOCK)
+    monkeypatch.setattr(edgar_raw, "fetch_filing_xml", lambda *_a, **_k: fetched)
+    monkeypatch.setattr(
+        edgar_raw, "filing_xml", lambda *_a, **_k: pytest.fail("a kept fetch used filing_xml")
+    )
+    real_parse = edgar_source_module.parse_form4
+
+    def parse(text: str) -> Any:
+        order.append("parse")
+        return real_parse(text)
+
+    monkeypatch.setattr(edgar_source_module, "parse_form4", parse)
+    source.form4_xml_keeper = lambda got, item: order.append(f"keep {got} {len(item.body)}")
+    filing = source.sec_form4_accession("0000777777", accession, date(2026, 9, 24))
+    assert filing is not None and filing.transactions
+    assert order == [f"keep {accession} {len(body)}", "parse"]
+
+
+def test_sec_form4_failed_keep_raises_and_parses_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A refused archive write fails the run: it is never a skipped filing."""
+    source, accession = _form4_source(monkeypatch, tmp_path)
+    body = (FIXTURES / "sec_forms/form4_purchase_gift_indirect.xml").read_bytes()
+    fetched = edgar_raw.FetchedXml("https://www.sec.gov/x/form4.xml", body, body.decode(), CLOCK)
+    monkeypatch.setattr(edgar_raw, "fetch_filing_xml", lambda *_a, **_k: fetched)
+    monkeypatch.setattr(
+        edgar_source_module, "parse_form4", lambda _t: pytest.fail("parsed before keeping")
+    )
+
+    def refuse(_accession: str, _fetched: edgar_raw.FetchedXml) -> None:
+        raise RuntimeError("archive write refused: below the floor")
+
+    source.form4_xml_keeper = refuse
+    with pytest.raises(RuntimeError, match="below the floor"):
+        source.sec_form4_accession("0000777777", accession, date(2026, 9, 24))
+    assert not source.sec_forms_counts.get("fetch_failed")
+
+
 def test_sec_forms_disabled_never_discovers_or_fetches(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

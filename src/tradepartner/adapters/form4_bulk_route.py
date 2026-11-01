@@ -82,6 +82,28 @@ def _validators(headers: httpx.Headers) -> dict[str, str]:
     }
 
 
+def insider_zip_path(settings: Settings, quarter: Quarter) -> Path:
+    """The cached insider zip of `quarter` under `edgar.cache_dir`."""
+    return (
+        Path(settings.edgar.cache_dir) / "insider" / f"{quarter.year}q{quarter.number}_form345.zip"
+    )
+
+
+def insider_zip_fetch(settings: Settings, quarter: Quarter) -> tuple[str | None, datetime | None]:
+    """The URL and UTC fetch time `edgar_raw.insider_bulk_zip` recorded for the
+    cached zip (plan T348), or `(None, None)` for a zip cached before that or an
+    unreadable record."""
+    path = edgar_raw.insider_fetch_path(insider_zip_path(settings, quarter))
+    try:
+        record = json.loads(path.read_text())
+        url, at = record["url"], datetime.fromisoformat(record["fetched_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, None
+    if not isinstance(url, str) or at.utcoffset() is None:
+        return None, None
+    return url, at
+
+
 def load_bulk_quarters(
     quarters: Iterable[Quarter],
     *,
@@ -103,7 +125,7 @@ def load_bulk_quarters(
     unreadable: set[Quarter] = set()
     for quarter in sorted(set(quarters)):
         label = f"{quarter.year}q{quarter.number}"
-        path = base / f"{label}_form345.zip"
+        path = insider_zip_path(settings, quarter)
         sidecar = base / f"{label}_form345.validators.json"
         saved: dict[str, str] = {}
         try:
