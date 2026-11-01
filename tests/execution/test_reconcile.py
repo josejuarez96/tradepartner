@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
 import pytest
@@ -174,6 +174,27 @@ def test_executed_named_cash_without_a_due_is_a_break(activity_type: str) -> Non
     assert [(m.kind, m.security_id, m.cash_amount, m.activity_ids) for m in result.mismatches] == [
         ("name_cash", "SEC_A", 12.0, ("new-credit",))
     ]
+
+
+def test_an_old_split_does_not_make_a_names_cash_a_candidate() -> None:
+    """#2184: only a split whose CIL window holds the activity's date makes the
+    name's cash a candidate; an old split (window ended before the activity)
+    leaves an `MA` credit a `name_cash` break, even beside a lagging fill whose
+    cash band would otherwise absorb the credit silently."""
+    activity = CashActivity("new-credit", "MA", S, "executed", 12.0, "AAA")
+    old = S - timedelta(days=30)
+    result = _run(
+        _ledger(1_000.0, SEC_A=2.0),
+        _positions(AAA=5.0),
+        1_000.0 - 300.0 + 12.0,
+        journal_open=[_lagging_buy(5.0, 2.0)],
+        explanations=_explanations(
+            activities=(activity,),
+            activity_seen_before=PRIOR,
+            stock_dividends={"SEC_A": (old, old + timedelta(days=14), 0.1)},
+        ),
+    )
+    assert "name_cash" in _kinds(result)
 
 
 def test_cash_on_a_journaled_but_now_unheld_name_is_a_break() -> None:
