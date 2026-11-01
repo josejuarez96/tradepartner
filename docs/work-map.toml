@@ -1770,6 +1770,16 @@ what = "Check opportunistic Form 4 purchases against a timestamped net-of-cost, 
 why = "It records an INSUFFICIENT desk read and the owner-approved frozen registered event study, after counts-only feasibility (#2673)."
 unblocks = ["issue:2673"]
 
+[research.2026-11-form4-insider-feasibility-recount]
+what = "T342's counts-only recount of the Form 4 insider-purchase study on a store copy: FAIL, the $200M stratum has at most 47 opportunistic events and no treated delister."
+why = "It records the B7 registered event study as INSUFFICIENT under its own feasibility gate, so T332 to T341 and T344 are struck rather than built (#2679)."
+unblocks = ["issue:2679"]
+
+[research.2026-11-form4-insider-feasibility-recount-appendix]
+what = "The byte-for-byte source of the T342 recount script (sha256 9dcb98de...), the method appendix of the T342 note."
+why = "It lets the B7 FAIL be audited and re-run from the repo, as the T342 plan line requires (#2679)."
+unblocks = ["issue:2679"]
+
 [research.2026-10-31-cash-op-profitability-desk-read]
 what = "Read cash-based operating profitability in both Chen-Zimmermann portfolio files against a frozen cost and leg line."
 why = "The weak short leg retires this candidate; T330 and T331 must not be built for it, struck by the owner on 2026-10-31 (#2677)."

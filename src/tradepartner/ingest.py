@@ -1198,7 +1198,7 @@ def _with_frames(message: str, exc: BaseException, settings: Settings) -> str:
 _clean = clean_message
 
 
-def _write_run(
+def write_run(
     conn: duckdb.DuckDBPyConnection,
     run_id: str,
     started_at: datetime,
@@ -1206,6 +1206,7 @@ def _write_run(
     run: SourceRun,
     mode: str = MODE,
 ) -> None:
+    """Record one source run on the caller's store connection."""
     insert_row(
         conn,
         "ingestion_runs",
@@ -1221,6 +1222,9 @@ def _write_run(
             "message": run.message,
         },
     )
+
+
+_write_run: Callable[..., None] = write_run
 
 
 # --- the EDGAR chunk --------------------------------------------------------
