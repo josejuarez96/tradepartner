@@ -2817,7 +2817,9 @@ class _ArchiveRig:
         class Fake:
             def status(_self, paths: Sequence[Path]) -> dict[Path, Any]:
                 return {
-                    p: ItemStatus(uploaded=True, current=p not in self.evicted, dataless=False)
+                    p: ItemStatus(
+                        uploaded=True, current=p not in self.evicted, dataless=p in self.evicted
+                    )
                     for p in paths
                 }
 

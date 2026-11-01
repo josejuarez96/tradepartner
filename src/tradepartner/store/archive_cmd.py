@@ -183,7 +183,7 @@ def migrate_cache(settings: Settings, icloud: ICloudItems, *, apply: bool) -> li
         f"migrate-cache applied: run {result.run_id or '-'}",
         f"moved files: {moved}",
         f"backup files: {backed}",
-        f"pending_upload (still local, retry later): "
+        f"pending_upload (still local, not yet confirmed uploaded): "
         f"{result.count('pending_upload') + result.backup_count('pending_upload')}",
     ]
 
