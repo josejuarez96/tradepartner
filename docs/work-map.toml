@@ -1693,7 +1693,7 @@ why = "A corrected daily file must remain available for a point-in-time rebuild.
 unblocks = ["task:T352"]
 
 [task.T348]
-what = "Archive fetched Form 4 XML before parsing and skip unchanged held accessions."
+what = "Archive fetched Form 4 XML and insider zips with new hashes before parsing; skip unchanged held accessions."
 why = "Reruns should fetch only new filings while retaining the exact source for repair."
 unblocks = ["task:T350", "task:T352"]
 
@@ -1712,7 +1712,7 @@ what = "Apply per-source disagreement thresholds in Form 4 ingest and health."
 why = "A differing sampled filing should not discard an otherwise usable quarter."
 
 [task.T352]
-what = "Re-derive from named raw hashes and enforce the archive's no-look-ahead reader boundary."
+what = "Re-derive from named raw hashes, including archived insider zips, and enforce the archive's no-look-ahead reader boundary."
 why = "Parser repairs need exact historical inputs without exposing later files to research reads."
 
 [task.T353]
