@@ -1501,6 +1501,46 @@ def test_health_lists_equal_amount_dividends_and_warns_on_pending(
     assert "duplicate_dividends: pass (1 pending repair)" in checked.output
 
 
+def test_health_warns_about_implausible_form4_dates(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    settings = _settings(tmp_path, store=fixture_store_path)
+    accepted = datetime(2020, 6, 29, 14, tzinfo=UTC)
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "INSERT INTO sec_form4_transactions VALUES (" + ", ".join(["?"] * 23) + ")",
+            [
+                "implausible",
+                "issuer",
+                "owner",
+                0,
+                False,
+                True,
+                False,
+                False,
+                date(2047, 1, 1),
+                None,
+                "P",
+                "A",
+                10,
+                2,
+                10,
+                "D",
+                "Common",
+                None,
+                accepted,
+                accepted,
+                accepted,
+                "edgar",
+                "filing",
+            ],
+        )
+    result = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "warning: 1 stored Form 4 transaction dates" in result.output
+    assert "health: 0 failures, 1 warnings" in result.output
+
+
 def test_health_does_not_warn_when_the_last_edgar_run_quarantined_nothing(
     tmp_path: Path, fixture_store_path: Path
 ) -> None:

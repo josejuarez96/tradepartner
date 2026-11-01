@@ -3494,6 +3494,7 @@ def make_app(
         expected_warnings = (
             (1 if _quarantined(report) > 0 else 0)
             + (1 if report.duplicate_dividends.pending else 0)
+            + (1 if report.implausible_form4_dates else 0)
             + len(report.incremental_edgar.warnings)
             + chain_breaks
             + (1 if (disk_warning := low_disk_warning(s)) is not None else 0)
@@ -3514,6 +3515,13 @@ def make_app(
             typer.echo(
                 f"warning: {pending} listed duplicate dividend keys are pending repair "
                 "(`tradepartner repair-dividends`); each still counts its payment twice",
+                err=True,
+            )
+        if report.implausible_form4_dates:
+            warnings += 1
+            typer.echo(
+                f"warning: {report.implausible_form4_dates} stored Form 4 transaction dates "
+                "fall outside their filing acceptance window; rows remain as filed",
                 err=True,
             )
         warnings += len(report.incremental_edgar.warnings)
