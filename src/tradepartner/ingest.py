@@ -2175,8 +2175,15 @@ def _form4_bulk(
     def checked(quarter: Quarter) -> bool:
         return order_check_path(settings, quarter, digests[quarter]).exists()
 
+    #: A dry run's passing order checks: the marker names it would write (#2757).
+    would_remember: list[str] = []
+
     def remember(quarter: Quarter) -> None:
-        edgar_raw.write_atomic(order_check_path(settings, quarter, digests[quarter]), b"passed")
+        marker = order_check_path(settings, quarter, digests[quarter])
+        if _DRY_RUN.get():  # a dry run changes nothing on disk; it names the marker
+            would_remember.append(marker.name)
+            return
+        edgar_raw.write_atomic(marker, b"passed")
 
     counts: Counter[str] = Counter(load_counts)
     counts["sec_forms_bulk_multi_owner_stored"] = sum(multi_owner_stored.values())
@@ -2346,9 +2353,11 @@ def _form4_bulk(
             mode="backfill",
         )
     figures = ", ".join(f"{name}: {count}" for name, count in sorted(counts.items()))
+    would_write = "".join(f"; order_check_would_write: {name}" for name in would_remember)
     return added, (
         f"Form 4 bulk: {len(selected)} selected, {added} rows added, "
         f"{source.requests} requests, {remaining} remaining; {plan.message()}; {figures}"
+        f"{would_write}"
     )
 
 
