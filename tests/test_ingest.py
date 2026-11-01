@@ -2810,14 +2810,55 @@ def test_a_no_cover_page_rename_is_one_dated_row_across_nightly_runs(
     )
     assert rows == [
         ("STAT", "snapshot_static", date(2018, 3, 5), FETCHED_AT),
-        ("STAX", "snapshot", date(2019, 7, 1), FETCHED_AT + timedelta(days=3)),
+        ("STAX", "snapshot", date(2019, 7, 1), FETCHED_AT + timedelta(days=4)),
     ]
-    assert stored[1] == stored[0] + 1
-    assert stored[3] == stored[2] == stored[1]
+    assert stored[1] == stored[0]
+    assert stored[2] == stored[1] + 1
+    assert stored[3] == stored[2]
     with duckdb.connect(settings.store.path, read_only=True) as conn:
         checks = integrity_checks(conn, nights[-1][0], settings)
     (overlap,) = [c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS]
     assert overlap.passed, overlap.violations
+
+
+def test_snapshot_sightings_store_only_pending_changes(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    nights = [
+        (NOW, FETCHED_AT, "STAT"),
+        (NOW + timedelta(days=3), FETCHED_AT + timedelta(days=3), "STAX"),
+        (NOW + timedelta(days=4), FETCHED_AT + timedelta(days=4), "STAX"),
+        (NOW + timedelta(days=5), FETCHED_AT + timedelta(days=5), "STAX"),
+    ]
+    counts = []
+    for now, fetched_at, ticker in nights:
+        result = _run(
+            settings, now=now, source="edgar", filings=_with_renamed_stat(ticker, fetched_at)
+        )
+        assert result.ok, result.runs[-1].message
+        counts.append(read(f"SELECT count(*) FROM snapshot_sightings WHERE cik = '{STAT}'")[0][0])
+    assert counts == [0, 1, 1, 1]
+
+
+def test_four_nights_of_flapping_snapshot_tickers_write_no_rename(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    for days, ticker in ((0, "STAT"), (3, "STAX"), (4, "STAT"), (5, "STAX")):
+        result = _run(
+            settings,
+            now=NOW + timedelta(days=days),
+            source="edgar",
+            filings=_with_renamed_stat(ticker, FETCHED_AT + timedelta(days=days)),
+        )
+        assert result.ok, result.runs[-1].message
+
+    assert read(
+        "SELECT ticker, provenance, valid_from FROM listings "
+        f"WHERE security_id = '{STAT}' ORDER BY valid_from"
+    ) == [("STAT", "snapshot_static", date(2018, 3, 5))]
+    assert read(
+        f"SELECT ticker FROM snapshot_sightings WHERE cik = '{STAT}' ORDER BY known_at"
+    ) == [("STAX",), ("STAT",), ("STAX",)]
 
 
 def test_a_stored_pre_fix_same_start_pair_gets_one_rename_row(
@@ -2857,7 +2898,10 @@ def test_a_stored_pre_fix_same_start_pair_gets_one_rename_row(
         result = _run(settings, now=NOW + timedelta(days=days), source="edgar", filings=filings)
         assert result.ok, result.runs[-1].message
         stored.append(read(rows_sql))
-    assert stored[0] == [*seeded, ("STAX", "snapshot", date(2019, 7, 1), bad_fetch)]
+    assert stored[0] == [
+        *seeded,
+        ("STAX", "snapshot", date(2019, 7, 1), FETCHED_AT + timedelta(days=4)),
+    ]
     assert stored[1] == stored[0]
     accepted = settings.model_copy(
         update={
@@ -9077,6 +9121,89 @@ def test_form4_dry_run_archives_nothing_and_reports_what_it_would_keep(
         hashlib.sha256(case.zip).hexdigest(),
     }
     assert message_digest(real.message) is not None
+
+
+def _order_checked_bulk(case: _Form4Xml) -> None:
+    """Give `case` a bulk accession with two rows, so its quarter's order is sampled."""
+    from tradepartner.adapters.edgar_insider_bulk import BulkRowFact
+
+    facts = tuple(
+        BulkRowFact(t.line_no, t.transaction_code, t.price, False) for t in case.parsed.transactions
+    )
+    assert len(facts) >= 2
+    case.bulk = InsiderBulk({case.accession: replace(case.bulk_record(), rows=facts)})
+
+
+def test_form4_dry_run_writes_no_order_check_marker_and_names_it(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dry run changes nothing on disk: a passing order sample writes no marker,
+    and the message names the marker a real run would write (#2757). A real run
+    after it still writes the marker."""
+    from tradepartner.adapters.form4_bulk_route import order_check_path
+
+    enabled = _archive_settings(settings, tmp_path, on=False)
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123")
+    _order_checked_bulk(case)
+    marker = order_check_path(enabled, case.quarter, hashlib.sha256(case.zip).hexdigest())
+
+    def work(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+        return ingest_module._write_form4_bulk(
+            conn, enabled, case.source, frozenset({case.issuer}), case.now
+        )
+
+    def run(dry_run: bool) -> SourceRun:
+        return ingest_module._run_source(
+            "sec_forms", work, enabled, case.now, lambda: case.now, "x", dry_run, "backfill"
+        )
+
+    dry = run(True)
+    assert dry.status == "ok", dry.message
+    assert case.accession in case.fetches  # the sample was fetched and passed
+    assert not marker.exists()
+    assert not marker.parent.exists() or list(marker.parent.iterdir()) == []
+    assert f"order_check_would_write: {marker.name}" in dry.message
+    real = run(False)
+    assert real.status == "ok", real.message
+    assert marker.read_bytes() == b"passed"
+    assert "order_check_would_write" not in real.message
+
+
+def test_dry_run_flag_is_reset_after_work_raises(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception inside a dry run's `work` still resets `_DRY_RUN` (#2757): the
+    next real Form 4 run, started outside `_run_source`, archives as normal."""
+    from tradepartner.adapters.form4_archive import message_digest
+
+    enabled = _archive_settings(settings, tmp_path)
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123")
+    seen: list[bool] = []
+
+    def boom(_conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+        seen.append(ingest_module._DRY_RUN.get())
+        raise RuntimeError("source failed mid-chunk")
+
+    failed = ingest_module._run_source(
+        "sec_forms", boom, enabled, case.now, lambda: case.now, "x", True, "backfill"
+    )
+    assert seen == [True]
+    assert failed.status != "ok"
+    assert ingest_module._DRY_RUN.get() is False
+    conn = duckdb.connect(":memory:")
+    init_schema(conn)
+    added, _message, provenance = case.run(conn, case.now)
+    assert provenance is not None and provenance.dry_run is False
+    assert added > 0
+    assert _archived_bodies(tmp_path / "archive") == {
+        hashlib.sha256(case.body).hexdigest(),
+        hashlib.sha256(case.zip).hexdigest(),
+    }
+    assert message_digest(_quarter_message(conn)) is not None
 
 
 def test_form4_accession_fetched_twice_records_both_hashes_and_one_row_match(
