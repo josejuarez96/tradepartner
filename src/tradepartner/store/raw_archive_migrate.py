@@ -501,18 +501,26 @@ def _closed_runs(keep_dir: Path) -> dict[str, tuple[str, str]]:
 
 def _restore_plan(
     settings: Settings, keep_dir: Path, path: str, run: str | None
-) -> tuple[str | None, list[dict[str, Any]]]:
-    """The entries (path, sha256, bytes, mtime_ns, run) a restore would write."""
+) -> tuple[str | None, list[dict[str, Any]], int]:
+    """The entries (path, sha256, bytes, mtime_ns, run) a restore would write, and
+    how many in-scope `restored` lines cleared a tombstone (already back)."""
     runs = _closed_runs(keep_dir)
     if run is not None and run not in runs:
         raise RestoreRefusedError(f"unknown run {run}; nothing was restored")
     chosen = run or max(runs, key=lambda r: runs[r][0], default=None)
     entries: dict[str, dict[str, Any]] = {}
+    cleared = 0
     if run is None:  # moved files: the latest tombstone line per path
         for line in _read_lines(keep_dir / INDEX):
+            path_ = line.get("path")
+            if not isinstance(path_, str):
+                continue  # a line with no path names no file: skipped
             if line.get("op") == "restored":
+                entries.pop(path_, None)  # a later restored line clears the tombstone
+                if _in_scope(path_, path):
+                    cleared += 1
                 continue
-            entries[line["path"]] = line
+            entries[path_] = line
     if chosen is not None:
         doc = json.loads(read_manifest(settings, runs[chosen][1]))
         for item in doc["files"]:
@@ -520,7 +528,7 @@ def _restore_plan(
                 continue
             if run is not None or item["class"] == "backup":
                 entries[item["path"]] = {**item, "run": chosen}
-    return chosen, [e for p, e in sorted(entries.items()) if _in_scope(p, path)]
+    return chosen, [e for p, e in sorted(entries.items()) if _in_scope(p, path)], cleared
 
 
 def restore_files(
@@ -536,7 +544,9 @@ def restore_files(
     docstring: Restore). Raises `RestoreRefusedError`, or T346's offline,
     integrity and floor errors, always before any file is written."""
     keep_dir = cache_dir / TOMBSTONE_DIR
-    chosen, entries = _restore_plan(settings, keep_dir, path, run)
+    chosen, entries, cleared = _restore_plan(settings, keep_dir, path, run)
+    if not entries and cleared:  # everything under `path` is already restored
+        return RestoreResult(run_id=chosen, restored={})
     if not entries:
         raise RestoreRefusedError(f"no archived file matches {path!r}; nothing was restored")
     present = [e["path"] for e in entries if os.path.lexists(cache_dir / e["path"])]

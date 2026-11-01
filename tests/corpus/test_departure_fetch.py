@@ -769,6 +769,17 @@ def test_a_restored_path_is_fetched_as_before(tmp_path: Path) -> None:
     assert INDEX_URL in router.urls()
 
 
+def test_an_index_line_with_no_path_is_skipped_not_a_key_error(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _run(settings, Router(_routes()), now=LATER)
+    paths = _tombstone_raw(settings, delete=True)
+    cache = Path(settings.edgar.cache_dir).resolve()
+    with (cache / "_archived" / "index.jsonl").open("a") as f:
+        f.write(json.dumps({"op": "moved"}) + "\n" + json.dumps({"op": "restored"}) + "\n")
+
+    assert departure_fetch._tombstoned(cache) == frozenset(paths)
+
+
 def test_a_stale_index_is_still_refetched_when_its_file_is_present(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     routes = _routes()

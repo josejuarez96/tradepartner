@@ -7,8 +7,10 @@ hashes the move and backup classes, asks the archive which hashes it holds and
 prints T360's plan, one line per class and folder, with the free-space projection
 against the floor. It writes nothing, not even the tombstone folder. `apply` first
 needs the store's write lock free (a read-only connection is held for the run, so a
-nightly cannot start mid-move), then runs `apply_migration`. Output names cache
-paths and counts only, never the archive root or an account.
+nightly cannot start mid-move; it guards the store database only, not the cache folder,
+so a fetch or ingest writing the cache can still run beside it), then runs
+`apply_migration`. Output names cache paths and counts only, never the archive root or
+an account.
 """
 
 from __future__ import annotations
@@ -193,4 +195,6 @@ def restore(settings: Settings, icloud: ICloudItems, *, path: str, run: str | No
     require_archive_root(settings)
     cache_dir = cache_dir_of(settings)
     result = migrate.restore_files(settings, cache_dir, icloud, path=path, run=run)
+    if not result.restored:
+        return [f"nothing left to restore under {path!r}; every archived file is already back"]
     return [f"restored {len(result.restored)} file(s) under {path!r}; the archive keeps its copies"]
