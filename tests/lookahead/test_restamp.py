@@ -979,3 +979,159 @@ def test_an_s_minus_1_row_crossing_no_instant_still_applies(
     assert status == OK, message
     assert result.refused == {} and result.moved["delistings"] == 1
     assert store.known_ats("delistings", ACME) == {S1_TRUE}
+
+
+# --- filing_index: the (cik, accession) match path (T318b, #2703) -----------
+
+_FI_REVISION_AT = datetime(2019, 6, 1, 22, 0, tzinfo=UTC)
+
+
+def _fi_row(cik: str, accession: str, accepted_at: datetime, **changes: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "cik": cik,
+        "accession": accession,
+        "form": "8-K",
+        "company_name": "Acme Corp",
+        "filed_on": accepted_at.date(),
+        "accepted_at": accepted_at,
+        "listed_on": accepted_at.date(),
+        "known_at": accepted_at,
+        "ingested_at": FIRST_RUN,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+    return row | changes
+
+
+def _seed_filing_index(settings: Settings, rows: Sequence[dict[str, Any]]) -> None:
+    with open_for_write(settings) as conn:
+        for row in rows:
+            insert_row(conn, "filing_index", row)
+
+
+def _fi_revision(first: dict[str, Any], known_at: datetime) -> dict[str, Any]:
+    return first | {
+        "filed_on": first["filed_on"] + timedelta(days=1),
+        "listed_on": known_at.date(),
+        "known_at": known_at,
+        "ingested_at": known_at,
+    }
+
+
+def _fi_rows(store: _Store) -> list[tuple[Any, ...]]:
+    with duckdb.connect(store.path, read_only=True) as conn:
+        conn.execute("SET TimeZone='UTC'")
+        return conn.execute(
+            "SELECT cik, accession, accepted_at, known_at, ingested_at, filed_on "
+            "FROM filing_index ORDER BY cik, accession, known_at"
+        ).fetchall()
+
+
+def test_the_restamp_moves_every_revision_of_a_matched_accession(
+    settings: Settings, early_store: _Store
+) -> None:
+    index_first = _fi_row(ACME, A_INDEX[0], _early(A_INDEX[1]))
+    nse_first = _fi_row(EXCHANGE, A_25NSE[0], _early(A_25NSE[1]), form="25-NSE")
+    other = _fi_row(DUAL, f"{DUAL}-19-000099", datetime(2019, 3, 1, 16, 30, tzinfo=UTC))
+    _seed_filing_index(
+        settings,
+        [
+            index_first,
+            _fi_revision(index_first, _FI_REVISION_AT),
+            nse_first,
+            other,
+            _fi_revision(other, _FI_REVISION_AT),
+        ],
+    )
+    before_other = [r for r in _fi_rows(early_store) if r[0] == DUAL]
+
+    status, message, (result,) = _ingest(
+        settings, _source(acme_early=False), now=RESTAMP_RUN, restamp=_acme_manifest()
+    )
+
+    assert status == OK, message
+    assert result.refused == {}
+    assert result.moved["filing_index"] == 3
+    assert "filing_index 3" in result.message()
+    rows = {(r[0], r[1], r[3]): r for r in _fi_rows(early_store)}
+    new_index, new_nse = A_INDEX[1], A_25NSE[1]
+    # The earliest row's known_at and accepted_at take the new stamp; the
+    # revision takes the new accepted_at and keeps its known_at.
+    first = rows[(ACME, A_INDEX[0], new_index)]
+    revision = rows[(ACME, A_INDEX[0], _FI_REVISION_AT)]
+    assert first[2] == new_index and revision[2] == new_index
+    assert first[4] == revision[4] == RESTAMP_RUN
+    assert revision[5] == index_first["filed_on"] + timedelta(days=1)
+    assert rows[(EXCHANGE, A_25NSE[0], new_nse)][2] == new_nse
+    # An accession outside the manifest does not move.
+    assert [r for r in _fi_rows(early_store) if r[0] == DUAL] == before_other
+    # The rows built from the accession moved too.
+    assert early_store.known_ats("facts", ACME) <= {t for _, t in (A_INDEX, A_COVER, A_25NSE)}
+    assert early_store.known_ats("facts", ACME)
+
+
+def test_the_store_still_passes_the_filing_index_checks_after_the_restamp(
+    settings: Settings, early_store: _Store
+) -> None:
+    from tradepartner import health
+
+    first = _fi_row(ACME, A_INDEX[0], _early(A_INDEX[1]))
+    _seed_filing_index(settings, [first, _fi_revision(first, _FI_REVISION_AT)])
+    _ingest(settings, _source(acme_early=False), now=RESTAMP_RUN, restamp=_acme_manifest())
+
+    with duckdb.connect(early_store.path, read_only=True) as conn:
+        conn.execute("SET TimeZone='UTC'")
+        checks = health.integrity_checks(conn, RESTAMP_RUN, settings)
+    failing = {c.rule for c in checks if not c.passed}
+    assert not {r for r in failing if r.startswith("filing_index_")}
+    assert "known_at_le_ingested_at" not in failing
+
+
+def test_an_accession_acceptance_at_or_after_a_revision_is_refused_and_named(
+    settings: Settings, early_store: _Store
+) -> None:
+    old = _early(A_COVER[1])
+    first = _fi_row(ACME, A_COVER[0], old)
+    # The revision is known before the repaired acceptance would be.
+    _seed_filing_index(settings, [first, _fi_revision(first, old + timedelta(hours=1))])
+    before = _fi_rows(early_store)
+    facts_before = early_store.known_ats("facts", ACME)
+
+    _, _, (result,) = _ingest(
+        settings, _source(acme_early=True), now=RESTAMP_RUN, restamp=_acme_manifest()
+    )
+
+    assert set(result.refused) == {ACME}
+    assert A_COVER[0] in result.refused[ACME] and "filing_index" in result.refused[ACME]
+    assert result.moved["filing_index"] == 0
+    assert _fi_rows(early_store) == before
+    assert early_store.known_ats("facts", ACME) == facts_before
+
+
+def test_a_revision_known_exactly_at_the_new_acceptance_is_refused(
+    settings: Settings, early_store: _Store
+) -> None:
+    old, new = _early(A_COVER[1]), A_COVER[1]
+    first = _fi_row(ACME, A_COVER[0], old)
+    _seed_filing_index(settings, [first, _fi_revision(first, new)])
+    _, _, (result,) = _ingest(
+        settings, _source(acme_early=True), now=RESTAMP_RUN, restamp=_acme_manifest()
+    )
+    assert set(result.refused) == {ACME}
+
+
+def test_a_rerun_of_the_same_manifest_moves_no_filing_index_row(
+    settings: Settings, early_store: _Store
+) -> None:
+    first = _fi_row(ACME, A_INDEX[0], _early(A_INDEX[1]))
+    _seed_filing_index(settings, [first, _fi_revision(first, _FI_REVISION_AT)])
+    _ingest(settings, _source(acme_early=False), now=RESTAMP_RUN, restamp=_acme_manifest())
+    once = _fi_rows(early_store)
+    _, _, (again,) = _ingest(
+        settings,
+        _source(acme_early=False),
+        now=RESTAMP_RUN + timedelta(days=1),
+        restamp=_acme_manifest(),
+    )
+    assert again.moved["filing_index"] == 0
+    assert _fi_rows(early_store) == once

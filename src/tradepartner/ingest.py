@@ -2909,6 +2909,11 @@ RESTAMP_TABLES: tuple[str, ...] = (
     "delistings",
 )
 
+#: The tables the restamp moves by `(cik, accession)` instead of `security_id`
+#: (T318b, #2703): a `filing_index` row has no security, and an accession can
+#: have several revision rows that all move with it.
+RESTAMP_ACCESSION_TABLES: tuple[str, ...] = ("filing_index",)
+
 #: A manifest CIK as the store keeps it: ten digits, zero-padded.
 _MANIFEST_CIK = re.compile(r"\d{10}")
 
@@ -3031,7 +3036,9 @@ class RestampResult:
 
     def message(self) -> str:
         """The run message's restamp part."""
-        moved = ", ".join(f"{t} {self.moved.get(t, 0)}" for t in RESTAMP_TABLES)
+        moved = ", ".join(
+            f"{t} {self.moved.get(t, 0)}" for t in (*RESTAMP_TABLES, *RESTAMP_ACCESSION_TABLES)
+        )
         refused = ", ".join(f"{cik} ({why})" for cik, why in sorted(self.refused.items()))
         return (
             f"; restamp: {self.changes} changes, moved {moved}; "
@@ -3097,6 +3104,16 @@ def restamp_from_manifest(
     do. A moved row gets the new stamp as `known_at` (and as `filed_at`, a
     delisting's stamp) and `ingested_at` as its `ingested_at`; nothing else
     changes.
+
+    **`filing_index`** (T318b, #2703) has its own match path, on
+    `(cik, accession)` with `accepted_at` equal to the old stamp (EDGAR
+    `filing` rows only). It moves every revision of a matched accession: the
+    earliest row (`known_at = accepted_at`) takes the new stamp as both, later
+    rows take it as `accepted_at` and keep their `known_at`; every moved row
+    gets `ingested_at`. An accession whose new stamp is at or after one of
+    its revisions' `known_at`, or that two changes move to different new
+    stamps, is refused: its CIK (and a Form 25's subject CIK) lands in
+    `refused` naming the accession, and none of that CIK's rows move.
 
     **Refused CIKs**, by the matched rows' security CIK (none of the CIK's
     rows move; listed in the result): a change moving a date a column was
@@ -3191,7 +3208,7 @@ def restamp_from_manifest(
                     flags[2],
                 )
             )
-    for temp in ("_restamp_cik", "_restamp_delisting", "_restamp_sids", "_restamp_refused"):
+    for temp in _RESTAMP_TEMPS:
         conn.execute(f"DROP TABLE IF EXISTS {temp}")
     conn.execute(
         "CREATE TEMP TABLE _restamp_cik (cik VARCHAR, old TIMESTAMPTZ, new TIMESTAMPTZ, "
@@ -3261,6 +3278,9 @@ def restamp_from_manifest(
             f"(SELECT 1 FROM {table} o WHERE {same_key} AND {target})"
         ).fetchall():
             refused.setdefault(cik, f"{table}: a row is already stored at the new stamp")
+    _stage_filing_index_changes(conn, moving)
+    for cik, why in _filing_index_refusals(conn, filed).items():
+        refused.setdefault(cik, why)
     if refused:
         conn.executemany("INSERT INTO _restamp_refused VALUES (?)", [[c] for c in sorted(refused)])
     refused_ids = frozenset(
@@ -3285,7 +3305,8 @@ def restamp_from_manifest(
             f"m.new AS new {matched[table]}) u WHERE {table}.rowid = u.rid",
             [ingested_at],
         )
-    for temp in ("_restamp_cik", "_restamp_delisting", "_restamp_sids", "_restamp_refused"):
+    moved["filing_index"] = _move_filing_index(conn, ingested_at)
+    for temp in _RESTAMP_TEMPS:
         conn.execute(f"DROP TABLE {temp}")
     after = {t: _security_ids(conn, t) for t in RESTAMP_TABLES}
     if after != before:
@@ -3294,6 +3315,92 @@ def restamp_from_manifest(
     return RestampResult(
         moved=moved, refused=refused, changes=len(moving), refused_securities=refused_ids
     )
+
+
+#: The temp tables one restamp builds and drops.
+_RESTAMP_TEMPS = (
+    "_restamp_cik",
+    "_restamp_delisting",
+    "_restamp_sids",
+    "_restamp_refused",
+    "_restamp_accession",
+)
+
+#: The `filing_index` rows a change matches: its `(cik, accession)`, the old
+#: stamp as `accepted_at`, EDGAR `filing` provenance, a CIK not refused.
+_FILING_INDEX_MATCH = (
+    "FROM filing_index t JOIN _restamp_accession a ON a.cik = t.cik "
+    "AND a.accession = t.accession AND a.old = t.accepted_at "
+    "WHERE t.source = 'edgar' AND t.provenance = 'filing' "
+    "AND t.cik NOT IN (SELECT cik FROM _restamp_refused)"
+)
+
+
+def _stage_filing_index_changes(
+    conn: duckdb.DuckDBPyConnection, moving: Sequence[ManifestRow]
+) -> None:
+    """The moving changes as `_restamp_accession(cik, accession, old, new)`,
+    the `(cik, accession)` match path of the `filing_index` rows (T318b)."""
+    conn.execute(
+        "CREATE TEMP TABLE _restamp_accession "
+        "(cik VARCHAR, accession VARCHAR, old TIMESTAMPTZ, new TIMESTAMPTZ)"
+    )
+    rows = sorted({(c.cik, c.accession, c.old_stamp, c.new_stamp) for c in moving})
+    if rows:
+        conn.executemany("INSERT INTO _restamp_accession VALUES (?, ?, ?, ?)", rows)
+
+
+def _filing_index_refusals(
+    conn: duckdb.DuckDBPyConnection, filed: Mapping[str, DelistingFiling]
+) -> dict[str, str]:
+    """CIK -> why, for the accessions the `filing_index` rows cannot move: a
+    stored accession (matched on the old stamp) with a revision whose
+    `known_at` is at or before the new stamp, which would leave the revision
+    known before its own acceptance, or two changes giving it different new
+    stamps. A Form 25's subject CIK is refused with the filer's, so the
+    accession's derived rows and its index rows never move apart."""
+    why_by_accession: dict[tuple[str, str], str] = {}
+    for cik, accession in conn.execute(
+        "SELECT DISTINCT t.cik, t.accession "
+        "FROM filing_index t JOIN _restamp_accession a ON a.cik = t.cik "
+        "AND a.accession = t.accession AND a.old = t.accepted_at "
+        "WHERE t.known_at > t.accepted_at AND a.new >= t.known_at"
+    ).fetchall():
+        why_by_accession[(cik, accession)] = (
+            "the new acceptance is at or after a revision's known_at"
+        )
+    for cik, accession in conn.execute(
+        "SELECT DISTINCT a.cik, a.accession FROM _restamp_accession a "
+        "WHERE EXISTS (SELECT 1 FROM _restamp_accession b WHERE b.cik = a.cik "
+        "AND b.accession = a.accession AND b.old = a.old AND b.new <> a.new)"
+    ).fetchall():
+        why_by_accession.setdefault((cik, accession), "one accession, two new stamps")
+    named: dict[str, list[str]] = {}
+    for (cik, accession), why in sorted(why_by_accession.items()):
+        for target in {cik, filed[accession].cik} if accession in filed else {cik}:
+            named.setdefault(target, []).append(f"{accession} ({why})")
+    return {
+        cik: "filing_index: accession " + "; ".join(items) for cik, items in sorted(named.items())
+    }
+
+
+def _move_filing_index(conn: duckdb.DuckDBPyConnection, ingested_at: datetime) -> int:
+    """Move every revision of each matched, unrefused accession; the rows moved.
+    The earliest row (`known_at = accepted_at`) takes the new stamp as both;
+    a later row takes it as `accepted_at` and keeps its `known_at`."""
+    (count,) = conn.execute(f"SELECT count(DISTINCT t.rowid) {_FILING_INDEX_MATCH}").fetchone() or (
+        0,
+    )
+    if count:
+        conn.execute(
+            "UPDATE filing_index SET accepted_at = u.new, ingested_at = ?, "
+            "known_at = CASE WHEN filing_index.known_at = filing_index.accepted_at "
+            "THEN u.new ELSE filing_index.known_at END "
+            f"FROM (SELECT DISTINCT t.rowid AS rid, a.new AS new {_FILING_INDEX_MATCH}) u "
+            "WHERE filing_index.rowid = u.rid",
+            [ingested_at],
+        )
+    return int(count)
 
 
 #: Each restamped table's UNIQUE key without `known_at`: a moved row must not
