@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import zipfile
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -178,9 +180,9 @@ def test_multi_owner_swap_does_not_fail_quarter_order_sample(tmp_path: Path) -> 
         facts = bulk.accessions[accession]
         transactions = facts.transactions
         if accession == multi:
-            transactions = (
-                replace(transactions[0], filer_cik=transactions[1].filer_cik),
-                *transactions[1:],
+            # the #2705 mispin: the XML's roles differ from the bulk join's
+            transactions = tuple(
+                replace(t, is_director=not t.is_director, is_other=True) for t in transactions
             )
         return SecFormFiling(
             accession,
@@ -628,3 +630,104 @@ def test_insider_zip_fetch_records_its_url_and_utc_time(
     assert insider_zip_fetch(settings, quarter, "f" * 64) == (None, None)
     insider_zip_path(settings, quarter).with_name("2026q1_form345.fetch.json").write_text("{")
     assert insider_zip_fetch(settings, quarter, digest) == (None, None)
+
+
+_MULTI = "0001213900-26-037435"
+_ACCEPTED = datetime(2026, 4, 1, tzinfo=UTC)
+
+
+def _route_multi(
+    tmp_path: Path, xml_filing: Callable[[SecFormFiling], SecFormFiling | None], form: str = "4"
+) -> tuple[Counter[str], list[SecFormFiling], int]:
+    bulk = _bulk(tmp_path)
+    facts = bulk.accessions[_MULTI]
+    written: list[SecFormFiling] = []
+    base = SecFormFiling(
+        _MULTI,
+        form,
+        _ACCEPTED,
+        date(2026, 3, 31),
+        (facts.issuer_cik,),
+        facts.filer_ciks,
+        facts.transactions,
+    )
+    result = run_form4_bulk_route(
+        [(_MULTI, "0002025396", form, date(2026, 3, 31))],
+        quarters={Quarter(2026, 1): bulk},
+        stamp=lambda *_: (_ACCEPTED, form, date(2026, 3, 31)),
+        xml=lambda *_: xml_filing(base),
+        write=written.append,
+        write_bulk=lambda *_: pytest.fail("multi-owner accession written from bulk"),
+        now=_ACCEPTED,
+        price_below=1,
+        zero_price_codes=("P", "S"),
+        order_sample_size=0,
+        budget=10,
+        multi_owner_xml=True,
+    )
+    return result.counts, written, result.remaining
+
+
+def test_distinct_associations_are_kept_from_xml(tmp_path: Path) -> None:
+    _counts, written, remaining = _route_multi(tmp_path, lambda f: f)
+    assert remaining == 0 and len(written) == 1
+    pairs = {(t.filer_cik, t.line_no) for t in written[0].transactions}
+    assert len(pairs) == len(written[0].transactions) == 4
+    assert {c for c, _ in pairs} == set(written[0].filer_ciks)
+
+
+def test_bulk_mispin_roles_are_replaced_by_xml_roles(tmp_path: Path) -> None:
+    """The #2705 / #2711 fixture shape: the bulk join gives one owner both roles and
+    the other none, while the XML splits them (Director, TenPercentOwner)."""
+    first, second = _bulk(tmp_path).accessions[_MULTI].filer_ciks
+
+    def xml_roles(filing: SecFormFiling) -> SecFormFiling:
+        rows = tuple(
+            replace(
+                t,
+                is_director=t.filer_cik == first,
+                is_officer=False,
+                is_ten_percent_owner=t.filer_cik == second,
+            )
+            for t in filing.transactions
+        )
+        return replace(filing, transactions=rows)
+
+    _counts, written, _ = _route_multi(tmp_path, xml_roles)
+    stored = {t.filer_cik: (t.is_director, t.is_ten_percent_owner) for t in written[0].transactions}
+    assert stored == {first: (True, False), second: (False, True)}
+
+
+@pytest.mark.parametrize(
+    "mutate, reason",
+    [
+        (lambda f: replace(f, transactions=f.transactions[:-1]), "sec_forms_multi_owner_ambiguous"),
+        (
+            lambda f: replace(f, transactions=(*f.transactions, f.transactions[0])),
+            "sec_forms_multi_owner_ambiguous",
+        ),
+        (
+            lambda f: replace(f, filer_ciks=(*f.filer_ciks, f.filer_ciks[0])),
+            "sec_forms_multi_owner_ambiguous",
+        ),
+        (
+            lambda f: replace(
+                f,
+                filer_ciks=(*f.filer_ciks, "0000000999"),
+            ),
+            "sec_forms_multi_owner_set_mismatch",
+        ),
+    ],
+)
+def test_ambiguous_xml_owner_attribution_is_refused_and_counted(
+    tmp_path: Path, mutate: Callable[[SecFormFiling], SecFormFiling], reason: str
+) -> None:
+    counts, written, remaining = _route_multi(tmp_path, mutate)
+    assert written == [] and remaining == 1
+    assert counts[reason] == 1
+
+
+def test_a_4a_multi_owner_amendment_routes_to_xml_on_its_own(tmp_path: Path) -> None:
+    counts, written, remaining = _route_multi(tmp_path, lambda f: f, form="4/A")
+    assert remaining == 0 and [w.form for w in written] == ["4/A"]
+    assert counts["sec_forms_bulk_multi_owner_xml"] == 1
