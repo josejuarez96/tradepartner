@@ -53,6 +53,7 @@ _WRITERS = frozenset(
         "adapters/edgar_raw.py",
         "adapters/form4_bulk_route.py",
         "adapters/form4_route.py",
+        "store/raw_archive_migrate.py",
     }
 )
 #: Any text naming the archive or the re-derive module.
