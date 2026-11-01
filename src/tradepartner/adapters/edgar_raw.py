@@ -1050,9 +1050,16 @@ def fsn_validators(
 
 # --- SEC insider transactions data sets (T305b, #2498) -----------------------
 
-_INSIDER_BULK_URL = (
+#: Where SEC serves a quarter's zip, tried in order; the first non-404 wins. The
+#: data-set page lists 2006q1 to 2026q1 under `structureddata` and 2026q2 onward under
+#: `datastandardsinnovation` (#2728: 2026q2 404'd on the first path only and was
+#: counted as a missing quarter). The legacy path goes first: it holds every quarter
+#: but the newest, so a run pays one extra request per quarter published after the move.
+_INSIDER_BULK_URLS = (
     "https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/"
-    "{quarter}_form345.zip"
+    "{quarter}_form345.zip",
+    "https://www.sec.gov/files/datastandardsinnovation/data/insider-transactions-data-sets/"
+    "{quarter}_form345.zip",
 )
 _INSIDER_QUARTER_RE = re.compile(r"\d{4}q[1-4]")
 
@@ -1071,19 +1078,21 @@ def insider_bulk_zip(
     `<quarter>_form345.zip`) into `edgar.cache_dir/insider/`; returns its path and
     response headers (`Last-Modified`, `Content-Length`), through
     `_stream_to_with_headers`: the shared limiter, the one retry policy and the zip
-    CRC check. A 404 returns `None`: the quarter is not published (the caller decides
-    whether that is the current quarter or a missing one). Any other failure raises."""
+    CRC check. Each of `_INSIDER_BULK_URLS` is tried in turn; a 404 on every one returns
+    `None`: the quarter is not published (the caller decides whether that is the current
+    quarter or a missing one). Any other failure raises."""
     _validate_insider_quarter(quarter)
     settings = settings or get_settings()
     dest = Path(settings.edgar.cache_dir) / "insider" / f"{quarter}_form345.zip"
-    try:
-        return _stream_to_with_headers(
-            _INSIDER_BULK_URL.format(quarter=quarter), dest, settings=settings, client=client
-        )
-    except httpx.HTTPStatusError as error:
-        if error.response.status_code == httpx.codes.NOT_FOUND:
-            return None
-        raise
+    for template in _INSIDER_BULK_URLS:
+        try:
+            return _stream_to_with_headers(
+                template.format(quarter=quarter), dest, settings=settings, client=client
+            )
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code != httpx.codes.NOT_FOUND:
+                raise
+    return None
 
 
 def insider_bulk_validators(
@@ -1091,26 +1100,32 @@ def insider_bulk_validators(
 ) -> httpx.Headers | None:
     """An unconditional `HEAD` of one quarter's insider zip behind the same limiter,
     retry and `User-Agent`; returns the validators (`Last-Modified`, `ETag`,
-    `Content-Length`) the cached zip is compared with, or `None` on a 404."""
+    `Content-Length`) the cached zip is compared with, or `None` when every one of
+    `_INSIDER_BULK_URLS` is a 404."""
     _validate_insider_quarter(quarter)
     settings = settings or get_settings()
-    url = _INSIDER_BULK_URL.format(quarter=quarter)
     headers = {"User-Agent": _user_agent(settings)}
     http_client = (
         client if client is not None else _default_client(settings.edgar.request_timeout_seconds)
     )
     timeout = settings.edgar.request_timeout_seconds
-    try:
-        response = _execute_with_retry(
-            lambda: http_client.request("HEAD", url, headers=headers, timeout=timeout),
-            settings=settings,
-            min_interval_seconds=1.0 / settings.edgar.requests_per_second,
-        )
-    except httpx.HTTPStatusError as error:
-        if error.response.status_code == httpx.codes.NOT_FOUND:
-            return None
-        raise
-    return response.headers
+
+    def head(url: str) -> Callable[[], httpx.Response]:
+        return lambda: http_client.request("HEAD", url, headers=headers, timeout=timeout)
+
+    for template in _INSIDER_BULK_URLS:
+        try:
+            response = _execute_with_retry(
+                head(template.format(quarter=quarter)),
+                settings=settings,
+                min_interval_seconds=1.0 / settings.edgar.requests_per_second,
+            )
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code != httpx.codes.NOT_FOUND:
+                raise
+            continue
+        return response.headers
+    return None
 
 
 def bulk_submissions(

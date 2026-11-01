@@ -1700,3 +1700,57 @@ def test_the_document_download_rejects_an_unsafe_filename_and_a_zero_cap() -> No
         edgar_raw.filing_document_head(
             "320193", _ACC, "a.htm", max_bytes=0, settings=_settings(), client=client
         )
+
+
+# --- insider data sets moved host path (#2728) -----------------------------------
+
+_LEGACY_INSIDER = "/files/structureddata/data/insider-transactions-data-sets/"
+_CURRENT_INSIDER = "/files/datastandardsinnovation/data/insider-transactions-data-sets/"
+
+
+def _insider_handler(served_at: str | None) -> tuple[_Handler, list[str]]:
+    """Serve `<quarter>_form345.zip` only under `served_at` (None: nowhere); record paths."""
+    asked: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(request.url.path)
+        if served_at is not None and request.url.path.startswith(served_at):
+            return httpx.Response(200, headers={"ETag": "e1"}, content=_valid_zip_bytes())
+        return httpx.Response(404)
+
+    return handler, asked
+
+
+def test_insider_bulk_reads_a_quarter_published_only_under_the_new_path(tmp_path: Path) -> None:
+    """SEC lists 2026q2 onward under `datastandardsinnovation`, older quarters under
+    `structureddata`; a 404 on the first is not "unpublished" until both 404 (#2728)."""
+    settings = _settings(cache_dir=tmp_path)
+    handler, asked = _insider_handler(_CURRENT_INSIDER)
+    client = _mock_client(handler)
+    both = [f"{prefix}2026q2_form345.zip" for prefix in (_LEGACY_INSIDER, _CURRENT_INSIDER)]
+    fetched = edgar_raw.insider_bulk_zip("2026q2", settings=settings, client=client)
+    assert fetched is not None and fetched[0].read_bytes() == _valid_zip_bytes()
+    assert asked == both
+    asked.clear()
+    headers = edgar_raw.insider_bulk_validators("2026q2", settings=settings, client=client)
+    assert headers is not None and headers["etag"] == "e1"
+    assert asked == both
+
+
+def test_insider_bulk_legacy_quarter_costs_one_request(tmp_path: Path) -> None:
+    settings = _settings(cache_dir=tmp_path)
+    handler, asked = _insider_handler(_LEGACY_INSIDER)
+    client = _mock_client(handler)
+    assert edgar_raw.insider_bulk_zip("2025q4", settings=settings, client=client) is not None
+    assert edgar_raw.insider_bulk_validators("2025q4", settings=settings, client=client)
+    assert asked == [f"{_LEGACY_INSIDER}2025q4_form345.zip"] * 2
+
+
+def test_insider_bulk_is_unpublished_only_when_every_path_404s(tmp_path: Path) -> None:
+    settings = _settings(cache_dir=tmp_path)
+    handler, asked = _insider_handler(None)
+    client = _mock_client(handler)
+    assert edgar_raw.insider_bulk_zip("2026q4", settings=settings, client=client) is None
+    assert edgar_raw.insider_bulk_validators("2026q4", settings=settings, client=client) is None
+    assert len(asked) == 4
+    assert not (tmp_path / "insider" / "2026q4_form345.zip").exists()
