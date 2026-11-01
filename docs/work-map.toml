@@ -1666,7 +1666,7 @@ unblocks = ["task:T329"]
 [task.T328a]
 what = "Add the frozen failure-delisting return key with its versioned exchange maps, and refuse it for shorts and until the engine applies it."
 why = "A last-close exit can overstate returns after a failed listing; the key must land without moving any stored fingerprint."
-unblocks = ["task:T328c", "task:T328d"]
+unblocks = ["task:T328d"]
 
 [task.T328b]
 what = "Add the two exit-evidence provider reads, delisting reasons and merger consideration, known at the trial's data cutoff."
@@ -1681,7 +1681,7 @@ unblocks = ["task:T329"]
 [task.T328d]
 what = "Count reason and merger rows in the trial vintage only under a nonzero delisting policy, in every per-trial vintage caller."
 why = "Backfilled evidence must stale affected trials while 0% trials keep their vintage."
-unblocks = ["task:T329"]
+unblocks = ["task:T328c", "task:T329"]
 
 [task.T329]
 what = "Report unknown-exit count and share beside every grid row, and delisting reason coverage in health, with reasons known by the registered data cutoff."
