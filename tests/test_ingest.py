@@ -7846,15 +7846,25 @@ def test_form4_bulk_cross_route_comparison_never_rewrites_xml(
 
 
 @pytest.mark.parametrize(
-    "partial_digest, routed",
-    [("a" * 64, False), ("b" * 64, True), ("none", True), ("", True), (None, True)],
+    "partial_digest, routed, multi_owner, multi_owner_xml",
+    [
+        ("a" * 64, False, False, True),
+        ("b" * 64, True, False, True),
+        ("none", True, False, True),
+        ("", True, False, True),
+        (None, True, False, True),
+        ("b" * 64, False, True, True),
+        ("b" * 64, True, True, False),
+    ],
 )
-def test_form4_bulk_partial_run_skips_only_stored_matching_digest(
+def test_form4_bulk_partial_run_skips_matching_digest_or_stored_multi_owner(
     fixture_store: duckdb.DuckDBPyConnection,
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
     partial_digest: str | None,
     routed: bool,
+    multi_owner: bool,
+    multi_owner_xml: bool,
 ) -> None:
     from tradepartner.adapters.form4_route import Quarter
 
@@ -7898,7 +7908,11 @@ def test_form4_bulk_partial_run_skips_only_stored_matching_digest(
             ],
         )
     enabled = settings.model_copy(
-        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "form4_multi_owner_xml": multi_owner_xml}
+            )
+        }
     )
     source = EdgarFilingSource(enabled, client=httpx.Client(), clock=lambda: accepted)
     row = UnstampedFiling(parsed.issuer_cik, "Issuer", "4", accession, filed)
@@ -7920,7 +7934,7 @@ def test_form4_bulk_partial_run_skips_only_stored_matching_digest(
         "4",
         filed,
         parsed.issuer_cik,
-        parsed.filer_ciks,
+        (*parsed.filer_ciks, "0000000002") if multi_owner else parsed.filer_ciks,
         parsed.transactions,
         0,
         (),
@@ -7944,6 +7958,15 @@ def test_form4_bulk_partial_run_skips_only_stored_matching_digest(
     assert added == 0
     assert calls == ([f"submissions:{accession}", f"stamp:{accession}"] if routed else [])
     assert ("1 remaining" in message) is routed
+    assert ("sec_forms_bulk_multi_owner_stored: 1" in message) is (multi_owner and multi_owner_xml)
+    latest_run = fixture_store.execute(
+        "SELECT message FROM ingestion_runs WHERE source = 'sec_insider_bulk' "
+        "AND message LIKE '%sec_forms_bulk_multi_owner_stored=%' LIMIT 1"
+    ).fetchone()
+    assert latest_run is not None
+    assert ("sec_forms_bulk_multi_owner_stored=1" in latest_run[0]) is (
+        multi_owner and multi_owner_xml
+    )
 
 
 def test_form4_bulk_planner_reads_stored_xml_rows_once_per_quarter(
