@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from tradepartner.adapters import edgar_source
 from tradepartner.config import Settings
+from tradepartner.config_edgar import PRE_2826_STATEMENT_FACTS
 from tradepartner.store import schema
 
 # Bump when a builder changes its derivation from unchanged inputs. Cache and
@@ -66,6 +68,11 @@ PER_NAME_KEYS = (
     "edgar.class_member_overrides",
     "edgar.filename_listings_refused",
 )
+
+# Hashed, and also stored whole on the run row beside the per-name lists, so a later
+# run knows its base names (#2826). They are not in PER_NAME_KEYS: an edit to them
+# trips the gate, and only `additive_statement_change` may excuse a pure addition.
+STORED_STATEMENT_KEYS = ("edgar.statement_tags", "edgar.statement_fact_units")
 
 # Explicit decisions for the pin test. Transport, fetch policy, failure
 # reporting, and health thresholds do not change a builder's derived rows.
@@ -146,5 +153,56 @@ def build_fingerprint(settings: Settings) -> BuildFingerprint:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     return BuildFingerprint(
         hash=hashlib.sha256(encoded).hexdigest(),
-        per_name={key: _setting(settings, key) for key in PER_NAME_KEYS},
+        per_name={key: _setting(settings, key) for key in (*PER_NAME_KEYS, *STORED_STATEMENT_KEYS)},
     )
+
+
+@dataclass(frozen=True)
+class AdditiveChange:
+    """The outcome of `additive_statement_change`: the added names, or why not."""
+
+    added: tuple[str, ...] = ()
+    refusal: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        """True when the only change since the last `ok` run adds statement names."""
+        return self.refusal is None
+
+
+def additive_statement_change(settings: Settings, last_ok_row: Mapping[str, Any]) -> AdditiveChange:
+    """Return the statement names added since the last `ok` run, or the refusal (#2826).
+
+    `last_ok_row` holds `hash` (the run's rule fingerprint) and `per_name` (the
+    stored per-name values). The fingerprint is recomputed with `statement_tags`
+    and `statement_fact_units` cut to the base names: those stored on the row, or
+    `PRE_2826_STATEMENT_FACTS` for a row without them. An exact match with the
+    row's hash means nothing else moved (any other hashed key, a cache, rules or
+    schema version, a changed list, unit, form or `STATEMENT_VERSION` all differ).
+    """
+    stored = (last_ok_row.get("per_name") or {}).get("edgar.statement_tags")
+    base = tuple(stored) if isinstance(stored, Mapping) else PRE_2826_STATEMENT_FACTS
+    base_set = frozenset(base)
+    edgar = settings.edgar
+    restricted = settings.model_copy(
+        update={
+            "edgar": edgar.model_copy(
+                update={
+                    "statement_tags": {
+                        n: v for n, v in edgar.statement_tags.items() if n in base_set
+                    },
+                    "statement_fact_units": {
+                        n: v for n, v in edgar.statement_fact_units.items() if n in base_set
+                    },
+                }
+            )
+        }
+    )
+    if build_fingerprint(restricted).hash != last_ok_row.get("hash"):
+        return AdditiveChange(
+            refusal=(
+                "the build fingerprint changed by more than added statement names; "
+                "run --rebuild-index"
+            )
+        )
+    return AdditiveChange(added=tuple(n for n in edgar.statement_tags if n not in base_set))
