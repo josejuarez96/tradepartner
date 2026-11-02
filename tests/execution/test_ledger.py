@@ -7,9 +7,11 @@ literal check on `execution/ledger.py` is T50's (`tests/test_no_literals.py`).
 from __future__ import annotations
 
 import itertools
+import json
 import math
 import random
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -47,6 +49,94 @@ D9 = date(2026, 10, 9)
 A, B, C = "SEC_A", "SEC_B", "SEC_C"
 TOLERANCE = 1e-6  # stands in for the frozen risk.reconcile_quantity_tolerance
 _ADJUSTMENT_IDS = itertools.count(1)
+
+
+def test_reversal_restores_split_replay_only_from_its_session() -> None:
+    order = _order(A, "buy", D1)
+    fill = _fill(order, 10, 10)
+    true_up = AdjustmentRow(
+        adjustment_id=9001,
+        window_id=WINDOW,
+        session=D7,
+        kind="owner_true_up",
+        security_id=A,
+        quantity=1,
+        explanation_json=json.dumps({"broker_quantity": 21}),
+        known_at=_utc(D7, 21),
+        ingested_at=_utc(D7, 21),
+    )
+    reverse = AdjustmentRow(
+        adjustment_id=9002,
+        window_id=WINDOW,
+        session=D8,
+        kind="owner_true_up",
+        security_id=A,
+        quantity=-1,
+        explanation_json=json.dumps({"reversed_adjustment_id": 9001}),
+        known_at=_utc(D8, 21),
+        ingested_at=_utc(D8, 21),
+    )
+    actions = _splits((A, D5, 2))
+
+    def stated(rows: list[AdjustmentRow], day: date) -> Ledger:
+        return from_journal(
+            [fill],
+            [order],
+            rows,
+            actions,
+            None,
+            1000,
+            day,
+            window_id=WINDOW,
+            quantity_tolerance=TOLERANCE,
+        )
+
+    assert stated([true_up, reverse], D5).positions[A] == 20
+    assert stated([true_up, reverse], D7).positions[A] == 21
+    assert stated([true_up, reverse], D8) == stated([], D8)
+    with pytest.raises(ValueError, match="opposite reversal"):
+        stated([true_up, replace(reverse, quantity=-3)], D8)
+    with pytest.raises(ValueError, match="opposite reversal"):
+        stated([replace(true_up, adjustment_id=8999), reverse], D8)
+
+
+def test_reversal_refuses_wrong_activity_link() -> None:
+    original = AdjustmentRow(
+        adjustment_id=9101,
+        window_id=WINDOW,
+        session=D5,
+        kind="owner_true_up",
+        security_id=A,
+        cash=7,
+        broker_activity_id="actual",
+        known_at=_utc(D5, 21),
+        ingested_at=_utc(D5, 21),
+    )
+    reverse = AdjustmentRow(
+        adjustment_id=9102,
+        window_id=WINDOW,
+        session=D8,
+        kind="owner_true_up",
+        security_id=A,
+        cash=-7,
+        explanation_json=json.dumps(
+            {"reversed_adjustment_id": 9101, "reversed_activity_id": "wrong"}
+        ),
+        known_at=_utc(D8, 21),
+        ingested_at=_utc(D8, 21),
+    )
+    with pytest.raises(ValueError, match="opposite reversal"):
+        from_journal(
+            [],
+            [],
+            [original, reverse],
+            _splits(),
+            None,
+            1000,
+            D8,
+            window_id=WINDOW,
+            quantity_tolerance=TOLERANCE,
+        )
 
 
 def _utc(day: date, hour: int, minute: int = 0) -> datetime:

@@ -74,6 +74,7 @@ from tradepartner.execution.reconcile_run import (
     _journal_state,
     _ledger,
     _read_clock,
+    _rebooked_after,
     _seen_activities,
     _stated_through,
     _window_id,
@@ -318,6 +319,7 @@ def _rows(
     reason: str,
     session: date,
     stamp: datetime,
+    rebooked_after: Mapping[str, int] | None = None,
 ) -> list[AdjustmentRow]:
     """The `owner_true_up` rows (module docstring), quantity part first."""
     parts = json.loads(event.parts_json)
@@ -358,13 +360,25 @@ def _rows(
     if event.security_id is not None and any(p["kind"] in _QUANTITY_KINDS for p in parts):
         delta = Decimal(repr(reading.broker_quantity)) - Decimal(repr(reading.ledger_quantity))
         rows.append(row("owner true-up of a quantity break", {}, quantity=float(delta)))
+    available_rebookings = dict(rebooked_after or {})
     for activity_id, amount in reading.cash_parts:
+        prior_reversal = available_rebookings.pop(activity_id, None)
         rows.append(
             row(
                 "owner true-up of a name cash break",
-                {"activity_id": activity_id},
+                {
+                    "activity_id": activity_id,
+                    **(
+                        {
+                            "rebooked_activity_id": activity_id,
+                            "rebooked_after_adjustment_id": prior_reversal,
+                        }
+                        if prior_reversal is not None
+                        else {}
+                    ),
+                },
                 cash=amount,
-                activity_id=activity_id,
+                activity_id=None if prior_reversal is not None else activity_id,
             )
         )
     for key in sorted(
@@ -439,6 +453,7 @@ def true_up(
                     f"stamped {latest.isoformat()}"
                 )
             ids: list[int] = []
+            rebooked_after = _rebooked_after(adjustments_for(conn, _window_id(window)))
             for adjustment in _rows(
                 window,
                 event,
@@ -447,6 +462,7 @@ def true_up(
                 reason=note,
                 session=session,
                 stamp=stamp,
+                rebooked_after=rebooked_after,
             ):
                 adjustment_id = append(conn, adjustment)
                 if adjustment_id is None:
