@@ -2534,6 +2534,10 @@ def make_app(
                 help="delete and rewrite the covered securities' classifications (#1541)",
             ),
         ] = False,
+        rebuild_index: Annotated[
+            bool,
+            typer.Option("--rebuild-index", help="seed or repair the EDGAR filing index"),
+        ] = False,
         restamp_from: Annotated[
             Path | None,
             typer.Option(
@@ -2606,7 +2610,8 @@ def make_app(
                 others=(
                     backfill_, since is not None, actions_backfill, through is not None, dry_run,
                     fill_holes_, security is not None, bulk_from_cache, rebuild_statement_facts,
-                    rebuild_filing_events, rebuild_classifications, restamp_from is not None,
+                    rebuild_filing_events, rebuild_classifications, rebuild_index,
+                    restamp_from is not None,
                     restamp_window_earlier_ok is not None, import_dir is not None,
                     sec_forms_only,
                 ),
@@ -2617,7 +2622,8 @@ def make_app(
                 (
                     backfill_, since is not None, actions_backfill, through is not None, dry_run,
                     fill_holes_, security is not None, bulk_from_cache, rebuild_statement_facts,
-                    rebuild_filing_events, rebuild_classifications, restamp_from is not None,
+                    rebuild_filing_events, rebuild_classifications, rebuild_index,
+                    restamp_from is not None,
                     restamp_window_earlier_ok is not None, import_dir is not None,
                 )
             )
@@ -2656,9 +2662,22 @@ def make_app(
             ("--rebuild-statement-facts", rebuild_statement_facts),
             ("--rebuild-filing-events", rebuild_filing_events),
             ("--rebuild-classifications", rebuild_classifications),
+            ("--rebuild-index", rebuild_index),
         ):
             if given and (backfill_ or source in ("alpaca", "fred", ASSETS_SOURCE, "openfigi")):
                 raise _fail(f"{flag} is for a session ingest with the edgar source", USAGE_ERROR)
+        if rebuild_index and source != "edgar":
+            raise _fail("--rebuild-index needs --source edgar", USAGE_ERROR)
+        if rebuild_index and (
+            rebuild_statement_facts
+            or rebuild_filing_events
+            or rebuild_classifications
+            or restamp_from is not None
+        ):
+            raise _fail(
+                "--rebuild-index cannot be combined with other rebuild or restamp flags",
+                USAGE_ERROR,
+            )
         restamp: list[ManifestRow] | None = None
         restamped: list[RestampResult] = []
         if restamp_from is not None:
@@ -2706,7 +2725,12 @@ def make_app(
             and start is None
             and not dry_run
             and restamp is None
-            and not (rebuild_statement_facts or rebuild_filing_events or rebuild_classifications)
+            and not (
+                rebuild_statement_facts
+                or rebuild_filing_events
+                or rebuild_classifications
+                or rebuild_index
+            )
         )
         if (refusal := ingest_floor_refusal(s)) is not None:
             # Before any store write, so it can never fire mid-write (#2454).
@@ -2849,7 +2873,10 @@ def make_app(
                 and not dry_run
                 and restamp is None
                 and not (
-                    rebuild_statement_facts or rebuild_filing_events or rebuild_classifications
+                    rebuild_statement_facts
+                    or rebuild_filing_events
+                    or rebuild_classifications
+                    or rebuild_index
                 )
             )
             try:
@@ -2864,6 +2891,7 @@ def make_app(
                     rebuild_statement_facts=rebuild_statement_facts,
                     rebuild_filing_events=rebuild_filing_events,
                     rebuild_classifications=rebuild_classifications,
+                    rebuild_index=rebuild_index,
                     restamp=restamp,
                     on_restamp=restamped.append,
                     restamp_window_ok=window_ok,
