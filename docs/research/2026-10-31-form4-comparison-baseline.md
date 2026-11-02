@@ -9,8 +9,7 @@ Run the T349 comparison at its defaults (2-decimal price and shares, exact ident
 **Recommendation for spec question 1** (owner's call): keep price and shares at 2 decimals with zero extra tolerance, keep identity, owner and order exact, and set `events.form4_compare_threshold = 0.01` (1%).
 
 - It sits above the worst observed quarter (0.70%) with a margin of about 1.4 times, and far above the 0.02% single-owner rate.
-- It is a share, not a count, so it is only meaningful when the denominator is large. A run that compares only the order sample (20 accessions) fails on its first disagreement (1 of 20 is 5%), exactly as the order-sample refusal does today. That is intended: a bad sample should still stop a quarter.
-- A run that compares the sample and every XML-routed accession (about 2,000 to 2,700 per quarter) tolerates up to about 20 to 27 disagreements per quarter before it fails.
+- It is a share over the whole run, so it dilutes the order sample. A run that compares the sample (20 per quarter) and every XML-routed accession (1,856 to 2,712 per quarter) would pass a quarter whose sample is entirely mis-ordered (20 of about 2,276 is 0.9%), and the unchecked bulk rows would then be stored. **Recommend keeping a per-quarter refusal on the order sample alongside the 1% share**: one disagreeing sample accession still stops that quarter's bulk writes, as today, and the 1% share governs the XML-routed comparison. Without that, the 1% line is too loose to guard bulk order. This is a design point for T351 (raise on #2714).
 - Cost of being wrong: at 1%, a quarter with a 0.9% systematic reader fault would pass and store the trusted (XML) row plus an unresolved marker. Markers never change facts, and XML is the trusted source for every field, so the stored row is the right one either way.
 
 Two things the owner should know before enabling it, neither changed here:
@@ -91,7 +90,7 @@ Today's XML fetches per quarter are the XML-routed pending accessions plus the s
 | 2024q2 | 49,447 | 2,256 (1,250 / 1,006) | 2,276 | 2,276 to 4,552 |
 | **Total** | | **23,658** | **23,878** | **23,878 to 47,756** |
 
-A fetch is one request when the submissions primary document is the XML and two when a filing-index lookup comes first. Against `sec_forms_max_requests` = 40,000 per run: any one quarter fits with at least **34,576** left (the busiest, 2016q1, costs at most 5,424), all 11 quarters need **one run at best and two at worst** (23,878 to 47,756 XML requests), and these XML requests come on top of the submissions pages and SGML anchor headers the run already makes. Identity-bad and order-bad accessions numbered zero in all 11 quarters under the current reader, and the header-disagreement and bulk-missing routes need a submissions record, so they are not in these counts.
+A fetch is one request when the submissions primary document is the XML and two when a filing-index lookup comes first. Against `sec_forms_max_requests` = 40,000 per run: any one quarter fits with at least **34,576** left (the busiest, 2016q1, costs at most 5,424), all 11 quarters need, on XML requests alone, **one run at best and two at worst** (23,878 to 47,756; a changed-zip marker recheck adds a few more), and these XML requests come on top of the submissions pages and SGML anchor headers the run already makes. Identity-bad and order-bad accessions numbered zero in all 11 quarters under the current reader, and the header-disagreement and bulk-missing routes need a submissions record, so they are not in these counts.
 
 ## Limits
 
