@@ -6,8 +6,8 @@
 **Verdict:** INSUFFICIENT (on paper): the replay cannot tell whether sending buys before the open saves money  ·  **Confidence:** low
 
 1. **The cost of waiting (the drift from the open to the send) averages zero over four sessions, and it swings by more than 2% from one session to the next.** Daily-book buys sent after the open drifted **-0.3 bp** (order bootstrap -15.5 to +15.6, n 420). The four session means were +33.4, +1.3, +71.1 and -139.6 bp. Bootstrapping over the four sessions gives -96.7 to +56.9. On 10-26, 10-27 and 10-30 waiting cost money. On 11-02 the names fell after the open, so waiting paid.
-2. **Under the pinned counterfactual, sending every post-open buy before the open saves +14.7 bp per buy** (order bootstrap -2.3 to +31.7). That is **+7.3 bp per side** and about **+143 bp a year** at the daily book's turnover (about 9.7 times equity bought per year). Over sessions the interval is -82 to +72 bp per buy. Almost all of the +14.7 is the spread, not the drift. A buy sent after the open pays +22.8 bp against the mid. A pre-open sell in the same liquidity band paid about +7.8 bp against the open, median 0. The saving therefore depends on one assumption: that Alpaca's simulator fills a pre-open market buy at the open print, as it fills our pre-open sells. If a pre-open buy pays the same half-spread, the sign flips to -21.7 bp.
-3. **Under the amended cash rule, V1 could have sent few of these buys early.** The daily book holds almost no cash before its run. Before the open it held $8 to $153 on three of the four sessions (0.3% to 3% of that day's buys). Only after the halted 10-29 run did it hold $3,802 (67% of 10-30's buys). Scaling the +143 bp a year by the share of buys that cash covers gives about **+25 bp a year**.
+2. **Under the pinned counterfactual, sending every post-open buy before the open saves +14.7 bp per buy** (order bootstrap -2.3 to +31.7). That is **+7.3 bp per side** and about **+95 bp a year** at the daily book's turnover (about 6.5 times equity bought per year). Over sessions the interval is -82 to +72 bp per buy. Almost all of the +14.7 is the spread, not the drift. A buy sent after the open pays +22.8 bp against the mid. A pre-open sell in the same liquidity band paid about +7.8 bp against the open, median 0. The saving therefore depends on one assumption: that Alpaca's simulator fills a pre-open market buy at the open print, as it fills our pre-open sells. If a pre-open buy pays the same half-spread, the sign flips to -21.7 bp.
+3. **Under the amended cash rule, V1 could have sent few of these buys early.** The daily book holds almost no cash before its run. Before the open it held $8 to $153 on three of the four sessions (0.3% to 3% of that day's buys). Only after the halted 10-29 run did it hold $3,802 (67% of 10-30's buys). Scaling the +95 bp a year by the share of buys that cash covers gives about **+17 bp a year**. Almost all of that comes from the one session after a halt.
 4. **The buys are late for the reasons the 10-30 note found, and the second book waits too.** Daily buys went out 375 to 688 s after the open. That delay is the slowest sell's simulated fill (164 to 305 s), then 11 s of polling, about 155 s of fill collection, about 72 s of sizing, then serial submits at 1.56 s each. The phase notes (#2621) split this out for the first time on 11-02. The main book had no sells, yet its buys went out 1,075 to 1,231 s after the open. `every_book_run` runs the books one after another, so main's run started one second after daily's ended.
 
 ## Evidence
@@ -83,7 +83,7 @@
   | 10-30 | +3 | +21 | +75 | +38 |
   | 11-02 daily | -47 | -93 | -133 | -159 |
 
-  The move between minutes 5 and 10 is where the buys go out, and it is as large as the whole effect.
+  On 10-26 and 10-30 the largest move came between minutes 5 and 10, when the buys go out. On 11-02 the fall ran from the first minute to minute 15.
 
 ### Q3: the counterfactual and how much it depends on its assumption
 
@@ -93,18 +93,18 @@
 - **Cost rises with order size relative to the name's dollar volume.** By quartile of that ratio, the 10-20 buys cost -6, +48, +70 and +99 bp, and the split share rose from 43% to 90%. 12 of their VWAPs sit above the day's SIP high.
 - **After the open, size does not add cost.** Main's $989 buys on 11-02 paid +24.9 bp against arrival, close to the daily book's $13 buys (+22.8). The split-fill premium shows up only at the opening print.
 
-So the 10-20 buys measure what the simulator does to $500 orders at the open. They are kept below as sensitivity R1, not as the reference for the daily book's $6 to $25 buys.
+So the 10-20 buys measure what the simulator does to $500 orders at the open. They are kept below as sensitivity R1, not as the reference for the daily book's $6 to $23 buys.
 
 Saving per daily post-open buy (actual vs open +22.5 bp, n 420):
 
 | Reference (what a pre-open buy would have cost vs the open) | Saving per buy, bp (95%) | Per side | Per year, bp of equity |
 |---|---|---|---|
-| **R0: pre-open sells, same band (pinned)** | **+14.7 (-2.3 to +31.7)** | **+7.3 (-1.1 to +15.8)** | **+143 (-22 to +308)** |
-| R0, interval over sessions | +14.7 (-82.5 to +72.2) | +7.3 (-41 to +36) | +143 (-802 to +702) |
-| R1: 10-20 pre-open buys, same band | -27.6 (-47.6 to -7.7) | -13.8 | -268 |
-| R2: the buy's own cost vs arrival (spread paid anyway; only the drift is saved) | -0.3 (-16.1 to +15.2) | -0.1 | -3 |
-| R3: fills exactly at the open | +22.5 (+6.3 to +38.2) | +11.2 | +219 |
-| R4: R0 plus the band's post-open half-spread | -21.7 (-38.5 to -4.5) | -10.8 | -211 |
+| **R0: pre-open sells, same band (pinned)** | **+14.7 (-2.3 to +31.7)** | **+7.3 (-1.1 to +15.8)** | **+95 (-15 to +205)** |
+| R0, interval over sessions | +14.7 (-82.5 to +72.2) | +7.3 (-41 to +36) | +95 (-534 to +468) |
+| R1: 10-20 pre-open buys, same band | -27.6 (-47.6 to -7.7) | -13.8 | -179 |
+| R2: the buy's own cost vs arrival (spread paid anyway; only the drift is saved) | -0.3 (-16.1 to +15.2) | -0.1 | -2 |
+| R3: fills exactly at the open | +22.5 (+6.3 to +38.2) | +11.2 | +146 |
+| R4: R0 plus the band's post-open half-spread | -21.7 (-38.5 to -4.5) | -10.8 | -141 |
 
 - **R0 by session:** +48.3, +17.0, +86.4 and -125.6 bp. Its mean of session means is +6.5 (t-interval -141 to +154).
 - **R0 by band:** under $50M -1.5 (-114 to +99); $50-200M +30.0 (+8.6 to +52.1); over $200M +2.3 (-23.2 to +27.6).
@@ -118,8 +118,8 @@ Saving per daily post-open buy (actual vs open +22.5 bp, n 420):
 - **Per buy:** +14.7 bp (-2.3 to +31.7), R0, orders independent.
 - **Per side:** +7.3 bp (-1.1 to +15.8). Sells are already sent pre-open, so they save nothing.
 - **Over sessions** the interval is -82 to +72 per buy. It contains every sensitivity above.
-- **Per year:** daily-book buy turnover averaged 3.86% of equity per rebalance session (4.72%, 2.36%, 5.56%, 2.79%). Over 252 sessions that is 9.7 times equity a year, so the R0 saving is +143 bp a year (-22 to +308, order bootstrap).
-- **Under V1's cash rule** (cash already held, no sell proceeds), only the cash-funded part could go early: 17.7% of buys on average, and that rests on the one post-halt session. That gives about +25 bp a year.
+- **Per year:** the daily book bought 15.4% of equity over the six sessions from 10-26 to 11-02 (4.72%, 2.36%, 5.56% and 2.79% on the four sessions with buys; 10-26 and 10-30 include catch-up after a skipped or halted run). That is 2.57% per elapsed session, or 6.5 times equity a year over 252 sessions. The R0 saving is therefore +95 bp a year (-15 to +205, order bootstrap). Counting from 10-21, the first session after the build, gives 4.3 times and +63 bp.
+- **Under V1's cash rule** (cash already held, no sell proceeds), only the cash-funded part could go early: 17.7% of buys on average (25.7% weighted by notional), and nearly all of it on the one post-halt session. That gives about +17 bp a year (+24 weighted by notional).
 - **The term that matters is the spread, not the drift.** The replay measures the drift well enough to call it zero on average and large on any one day. Whether a pre-open buy avoids the half-spread depends on the simulator, and only V1 itself can show it.
 
 ## Evidence summary
@@ -147,11 +147,12 @@ Saving per daily post-open buy (actual vs open +22.5 bp, n 420):
 - **This does not replace** the spec's alternating V0/V1 measurement (T373) or T371's sandbox run before the open (#2881).
 - **Deviations from the pinned method** (`METHOD.md`):
   - (1) three post-open buys had no valid SIP quote in the 120 s window and are dropped (RUSHB 10-30, SNEX 11-02, CHEF main 11-02);
-  - (2) the minute-bar drift path, the notional-weighted lines and the five-cluster bootstrap were added as description;
-  - (3) the V1 cash-eligible share was added after reading PR #2881.
+  - (2) the minute-bar drift path, the notional-weighted lines, the five-cluster bootstrap and the t-intervals over session means were added as description;
+  - (3) the V1 cash-eligible share was added after reading PR #2881;
+  - (4) after the quant-auditor's review, the annual turnover spreads the buys over the six elapsed sessions (6.5 times a year), not over the four sessions with buys as pinned (9.7 times), which counted catch-up twice.
 
-  None changes the pinned R0 figure.
-- **Annualising** assumes a rebalance every session at the measured turnover. The daily book traded buys on 4 of the 6 sessions since 10-26 (10-28 kill switch, 10-29 halted).
+  None of these changes the per-buy R0 figure.
+- **Annualising** spreads the measured buys over the elapsed sessions (six from 10-26). The daily book traded buys on 4 of those 6 sessions (10-28 kill switch, 10-29 halted). The sessions after a skip or a halt caught up. A per-trading-session average would count that catch-up twice (9.7 times, +143 bp a year).
 
 ## UNVERIFIED items
 - Whether Alpaca's simulator fills a pre-open notional market *buy* at the open print as it does a sell. The only pre-open buys are 10-20's large orders, and only their one-piece fills (n 48, -2.3 bp) suggest it does.
