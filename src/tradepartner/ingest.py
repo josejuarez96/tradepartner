@@ -333,6 +333,7 @@ from tradepartner.calendar import (
     previous_session,
 )
 from tradepartner.config import Settings, clean_message
+from tradepartner.diskfloor import ingest_floor_refusal
 from tradepartner.gap import stale_listings_at
 from tradepartner.store import filing_index as stored_index
 from tradepartner.store import raw_archive
@@ -2646,6 +2647,13 @@ def _rebuild_index_session(
     for year, number in quarters:
         batches: dict[str, _IndexBatch] = {}
         cursor = f"{year}Q{number}"
+        # The seed writes about 2 GB over ~135 chunks: read the floor before each one
+        # (#2841). Stopping here writes no row (the disk is low) and leaves the
+        # earlier partial rows, so a rerun resumes at this quarter.
+        if not dry_run and (refusal := ingest_floor_refusal(settings)) is not None:
+            return IngestResult(
+                (SourceRun("edgar_index", FAILED, 0, cursor, f"{refusal} (before {cursor})"),)
+            )
 
         def prepare_quarter(
             target: dict[str, _IndexBatch] = batches,
