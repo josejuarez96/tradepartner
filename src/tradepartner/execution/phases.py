@@ -101,6 +101,15 @@ capped at 1 against the buys' remainders, so cash beyond the targets (a forced
 exit's proceeds) is never spent. `cash_left` is the cash minus every order's
 modelled cost (`risk._buy_cash`), never negative.
 
+**`open_tranche`** (paper spec amendment 2026-11-01, item 2) picks the long
+notional buys the open tranche (i') sends before the open, from the cash
+already held (`budget`), in `Decimal`: whole names in ascending remainder
+(ties by `security_id`), each taken when its `risk._buy_cash` fits what is left
+of the budget and skipped (the walk goes on) when it does not. Only a long buy
+of a fractionable, tradable name by notional, with a remainder at or above
+`risk.min_order_notional`, is a candidate; a whole-share buy, a cover and a
+name below the minimum are left whole for the after-sells tranche.
+
 **`requests_for`** turns a phase's orders into `OrderRequest`s, validated
 before any is returned: the symbol from the master's listing at close(S-1),
 the id from `ids.client_order_id` off the run's session with the attempt
@@ -144,7 +153,16 @@ from tradepartner.execution.risk import BuyToSize, Skip, round_down, size_buys
 from tradepartner.store.journal import DecisionRow, OrderRow
 from tradepartner.store.schema import DELISTED_REASON, LONG, UNTARGETED_RECEIPT_REASON
 
-__all__ = ["HeldSell", "PhaseOrder", "PhaseOrders", "buy_orders", "requests_for", "sell_orders"]
+__all__ = [
+    "HeldSell",
+    "OpenTranche",
+    "PhaseOrder",
+    "PhaseOrders",
+    "buy_orders",
+    "open_tranche",
+    "requests_for",
+    "sell_orders",
+]
 
 _BUY = "buy"
 _SELL = "sell"
@@ -765,6 +783,77 @@ def buy_orders(
     return PhaseOrders(
         tuple(orders), tuple(skips), tuple(sorted(deferred)), float(left), session=session
     )
+
+
+@dataclass(frozen=True)
+class OpenTranche:
+    """The open tranche's selection: `taken` are its notional buys in the order
+    walked (ascending remainder); `left` every other buy, whole and in input
+    order, for the after-sells tranche. `taken` and `left` partition the input."""
+
+    taken: tuple[PhaseOrder, ...]
+    left: tuple[BuyToSize, ...]
+
+
+def open_tranche(
+    buys: Sequence[BuyToSize],
+    budget: float,
+    price_of: PriceOf,
+    costs: BuyCosts,
+    assets: Mapping[str, BorrowAsset],
+    frozen: RiskConfig,
+) -> OpenTranche:
+    """Select the buys sent before the open (module docstring, `open_tranche`).
+
+    `buys` are the rebalance's open buy decisions with their remainders;
+    `budget` is the cash the tranche may spend (never negative, finite). Each
+    taken order is a notional buy for its remainder floored to the cent, so the
+    sum of `risk._buy_cash` over `taken` is at most `budget`. Pure: no sizing
+    scale, no write-off, nothing deferred.
+    """
+    _finite(budget, "budget")
+    room = Decimal(repr(float(budget)))
+    candidates: list[tuple[Decimal, str, int, BuyToSize, float]] = []
+    for index, buy in enumerate(buys):
+        decision = buy.decision
+        sid = decision.security_id
+        if decision.side != _BUY or decision.position_side != LONG or buy.by_whole_shares:
+            continue
+        asset = assets.get(sid)
+        if asset is None or not (asset.tradable and asset.fractionable):
+            continue
+        notional = _finite(buy.remainder.notional, f"remainder of {sid}")
+        floored = Decimal(repr(notional)).quantize(risk._CENT, rounding=ROUND_DOWN)
+        if floored < Decimal(repr(frozen.min_order_notional)):
+            continue
+        price = _price(price_of, sid)
+        candidates.append((floored, sid, index, buy, price))
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+    taken: list[PhaseOrder] = []
+    taken_at: set[int] = set()
+    for floored, sid, index, buy, price in candidates:
+        notional = float(floored)
+        cash = risk._buy_cash(notional, None, price, False, frozen, costs)
+        if cash > room:
+            continue
+        room -= cash
+        taken_at.add(index)
+        decision = buy.decision
+        taken.append(
+            PhaseOrder(
+                decision_id=_id(decision),
+                security_id=sid,
+                side=_BUY,
+                decision=decision.decision,
+                price=price,
+                notional=notional,
+                whole_share=False,
+                target_weight=decision.target_weight,
+                position_side=LONG,
+            )
+        )
+    left = tuple(b for i, b in enumerate(buys) if i not in taken_at)
+    return OpenTranche(tuple(taken), left)
 
 
 def requests_for(
