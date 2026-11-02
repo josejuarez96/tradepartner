@@ -475,6 +475,24 @@ def test_ingest_rebuild_classifications_reaches_the_session_and_is_off_by_defaul
     assert session.calls[1]["rebuild_classifications"] is True
 
 
+def test_ingest_rebuild_index_reaches_session_and_rejects_other_sources(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    assert _invoke(secrets_set, ["ingest", "--source", "edgar", "--rebuild-index"]).exit_code == 0
+    assert session.calls[0]["rebuild_index"] is True
+    refused = _invoke(secrets_set, ["ingest", "--source", "alpaca", "--rebuild-index"])
+    assert refused.exit_code == 2
+    default_source = _invoke(secrets_set, ["ingest", "--rebuild-index"])
+    assert default_source.exit_code == 2
+    combined = _invoke(
+        secrets_set,
+        ["ingest", "--source", "edgar", "--rebuild-index", "--rebuild-classifications"],
+    )
+    assert combined.exit_code == 2
+    assert len(session.calls) == 1
+
+
 @pytest.mark.parametrize(
     "args",
     [

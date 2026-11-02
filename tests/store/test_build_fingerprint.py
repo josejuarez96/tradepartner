@@ -46,6 +46,27 @@ def test_every_listed_setting_changes_hash(key: str) -> None:
     )
 
 
+# Pinned from main (before #2826 added `edgar.statement_fact_units`).
+MAIN_DEFAULT_HASH = "753a81937c7bfaee20dcb1f7da7398bb128f4e3d9ef96e60434fc10b6699f342"
+
+
+def test_hash_at_defaults_equals_the_hex_pinned_from_main() -> None:
+    assert module.build_fingerprint(Settings(_env_file=None)).hash == MAIN_DEFAULT_HASH
+
+
+def test_statement_fact_units_is_classified_and_hashed_only_when_non_empty() -> None:
+    settings = Settings(_env_file=None)
+    assert "edgar.statement_fact_units" in module.HASHED_SETTINGS_KEYS
+    edgar = settings.edgar.model_copy(update={"statement_fact_units": {}})
+    assert module.build_fingerprint(settings.model_copy(update={"edgar": edgar})).hash == (
+        MAIN_DEFAULT_HASH
+    )
+    edgar = settings.edgar.model_copy(update={"statement_fact_units": {"revenue": ["EUR"]}})
+    assert module.build_fingerprint(settings.model_copy(update={"edgar": edgar})).hash != (
+        MAIN_DEFAULT_HASH
+    )
+
+
 @pytest.mark.parametrize("name", module.CACHE_VERSION_NAMES)
 def test_each_cache_version_changes_hash(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
     settings = Settings(_env_file=None)
@@ -118,5 +139,4 @@ def test_every_master_and_edgar_key_is_classified() -> None:
         "events.sec_forms_backfill_start",
         "events.form4_xml_price_below",
         "events.form4_zero_price_xml_codes",
-        "edgar.incremental_index",
     }

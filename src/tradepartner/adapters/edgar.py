@@ -585,6 +585,7 @@ def parse_statement_facts(
     forms: Iterable[str],
     units: Sequence[str],
     acceptance: Mapping[str, SubmissionStamp],
+    fact_units: Mapping[str, Sequence[str]] | None = None,
 ) -> StatementFactsParse:
     """As-filed statement-fact entries from a companyfacts payload (spec
     amendment 2026-10-03, #660; plan T77). Pure: reported values only, no
@@ -601,7 +602,9 @@ def parse_statement_facts(
       (unknown until submissions names it), unfiltered, so the ingest's hold
       rule sees it; a record with `accepted_at = None` (settled unstampable)
       keeps its form and filter and is emitted unstamped too.
-    - **Units**: only `units` are read, first listed first; entries in any
+    - **Units**: only `units` are read, first listed first (a fact named in
+      `fact_units`, #2826, reads its own ordered list instead; `units` stays
+      the fallback for every other name); entries in any
       other unit are skipped; a filing that carries a fact only in unread
       units, under every tag it uses for it, counts once on `non_unit`.
     - **Malformed** entries (see `_statement_period`) are withheld and
@@ -618,7 +621,7 @@ def parse_statement_facts(
     does any malformed payload structure (a missing key)."""
     cik = _cik(payload["cik"])
     allowed_forms = frozenset(forms)
-    unit_rank = {unit: rank for rank, unit in enumerate(units)}
+    per_fact_units = {name: list(own) for name, own in (fact_units or {}).items()}
     facts: Mapping[str, Any] = payload["facts"]
     # key -> (tag rank, unit rank) -> values; the filing's `filed` per key.
     values: dict[_StatementKey, dict[tuple[int, int], set[float]]] = {}
@@ -628,6 +631,8 @@ def parse_statement_facts(
     unread: set[tuple[str, str]] = set()
     read: set[tuple[str, str]] = set()
     for fact_name, fallbacks in tags.items():
+        read_units = per_fact_units.get(fact_name, units)
+        unit_rank = {unit: rank for rank, unit in enumerate(read_units)}
         for tag_rank, tag in enumerate(fallbacks):
             taxonomy, _, local = tag.partition(":")
             concept = facts.get(taxonomy, {}).get(local)
@@ -686,7 +691,7 @@ def parse_statement_facts(
                 period_start=start,
                 period_end=end,
                 value=found[0],
-                unit=units[rank_of_unit],
+                unit=per_fact_units.get(fact_name, units)[rank_of_unit],
                 form="" if stamp is None else stamp.form,
                 accession=accession,
                 accepted_at=None if stamp is None else stamp.accepted_at,

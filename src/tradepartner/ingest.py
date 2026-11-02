@@ -210,6 +210,8 @@ import hashlib
 import json
 import logging
 import re
+import resource
+import sys
 import time
 import traceback
 import uuid
@@ -229,9 +231,11 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
@@ -330,6 +334,7 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Settings, clean_message
 from tradepartner.gap import stale_listings_at
+from tradepartner.store import filing_index as stored_index
 from tradepartner.store import raw_archive
 from tradepartner.store.asof import ASSETS_SOURCE, _validate_t
 from tradepartner.store.classify import (
@@ -352,6 +357,7 @@ from tradepartner.store.delistings import (
     build_delistings,
     listing_ends_as_of,
 )
+from tradepartner.store.filing_index import snapshot_id as index_snapshot_id
 from tradepartner.store.master import (
     ChainCandidate,
     MasterBuild,
@@ -379,7 +385,13 @@ from tradepartner.store.restamp_precheck import (
     read_instants,
     window_first_session,
 )
-from tradepartner.store.retraction import record_underived, split_kept, stored_underived
+from tradepartner.store.retraction import (
+    carry_forward_underived,
+    record_underived,
+    split_kept,
+    stored_underived,
+    underived_as_of,
+)
 from tradepartner.store.schema import atomic, init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT, member_links_title
@@ -606,6 +618,10 @@ class _Stale(Exception):
     """The source is stale (spec req 10); its chunk is rolled back."""
 
 
+class _IndexConflict(Exception):
+    """The index snapshot changed between the fetch pass and writer lock."""
+
+
 class _DryRun(Exception):
     """Raised to roll a dry-run chunk back after counting its rows."""
 
@@ -827,6 +843,7 @@ def ingest_session(
     rebuild_statement_facts: bool = False,
     rebuild_filing_events: bool = False,
     rebuild_classifications: bool = False,
+    rebuild_index: bool = False,
     restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
     restamp_window_ok: WindowEarlierOk | None = None,
@@ -861,6 +878,15 @@ def ingest_session(
     written for it."""
     if restamp is not None and source != "edgar":
         raise ValueError("restamp needs the edgar source")
+    if rebuild_index and source != "edgar":
+        raise ValueError("rebuild_index needs the edgar source")
+    if rebuild_index and (
+        rebuild_statement_facts
+        or rebuild_filing_events
+        or rebuild_classifications
+        or restamp is not None
+    ):
+        raise ValueError("rebuild_index cannot be combined with other rebuild or restamp flags")
     if restamp_window_ok is not None and restamp is None:
         raise ValueError("restamp_window_ok needs restamp")
     if source not in ("all", *SOURCES, ASSETS_SOURCE):
@@ -889,28 +915,63 @@ def ingest_session(
         raise ValueError("rebuild_filing_events needs the edgar source")
     if rebuild_classifications and source == "alpaca":
         raise ValueError("rebuild_classifications needs the edgar source")
+    if rebuild_index:
+        return _rebuild_index_session(
+            settings, filings, clock=clock, dry_run=dry_run, prices=prices
+        )
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     cursor = expected_session(now, settings).isoformat()
     recorded = _Recorded(filings)
+    indexed = settings.edgar.incremental_index and not (
+        rebuild_index
+        or rebuild_statement_facts
+        or rebuild_filing_events
+        or rebuild_classifications
+        or restamp is not None
+    )
+    index_batches: dict[str, _IndexBatch] = {}
     work: dict[str, Callable[[duckdb.DuckDBPyConnection, str], tuple[int, str]]] = {
-        "edgar": lambda conn, run_id: _ingest_filings(
-            conn,
-            settings,
-            recorded,
-            clock,
-            run_id,
-            rebuild_statement_facts=rebuild_statement_facts,
-            rebuild_filing_events=rebuild_filing_events,
-            rebuild_classifications=rebuild_classifications,
-            restamp=restamp,
-            on_restamp=on_restamp,
-            restamp_window_ok=restamp_window_ok,
+        "edgar": lambda conn, run_id: (
+            _write_indexed_filings(
+                conn,
+                settings,
+                recorded,
+                index_batches["edgar"],
+                clock,
+                run_id,
+                rebuild_statement_facts=rebuild_statement_facts,
+                rebuild_filing_events=rebuild_filing_events,
+                rebuild_classifications=rebuild_classifications,
+                restamp=restamp,
+                on_restamp=on_restamp,
+                restamp_window_ok=restamp_window_ok,
+            )
+            if indexed
+            else _ingest_filings(
+                conn,
+                settings,
+                recorded,
+                clock,
+                run_id,
+                rebuild_statement_facts=rebuild_statement_facts,
+                rebuild_filing_events=rebuild_filing_events,
+                rebuild_classifications=rebuild_classifications,
+                restamp=restamp,
+                on_restamp=on_restamp,
+                restamp_window_ok=restamp_window_ok,
+            )
         ),
         "alpaca": lambda conn, _run_id: _write_prices(conn, fetched["alpaca"]),
     }
     fetched: dict[str, _PriceFetch] = {}
     prepare: dict[str, Callable[[], object] | None] = {
-        "edgar": lambda: _prefetch(recorded, settings, dry_run=dry_run),
+        "edgar": lambda: (
+            index_batches.update(
+                edgar=_prepare_indexed_filings(settings, recorded, clock, dry_run=dry_run)
+            )
+            if indexed
+            else _prefetch(recorded, settings, dry_run=dry_run)
+        ),
         "alpaca": lambda: fetched.update(alpaca=_fetch_prices(settings, prices, now, clock)),
     }
     # T11h: `record_failures` (the failure policy's after-commit hook), edgar
@@ -1142,6 +1203,10 @@ def _run_source(
         return outcome(success_status, dry.rows, f"dry run: {dry}")
     except StoreLockedError as exc:
         return outcome(LOCKED, 0, str(exc))
+    except _IndexConflict as exc:
+        # The snapshot may have been replaced by another writer. Do not add a
+        # failure row that itself changes the version or masks the replacement.
+        return outcome(FAILED, 0, str(exc))
     except _Stale as exc:
         run = outcome(STALE, 0, str(exc))
         return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
@@ -1298,6 +1363,8 @@ class _Recorded(FilingSource):
         self.sec_forms_subjects: frozenset[str] = frozenset()
         #: CIKs whose filename answer is partial (#1597, T184b), read at the fetch pass.
         self.filename_incomplete_ciks: set[str] = set()
+        self.limited_ciks: frozenset[str] | None = None
+        self.benchmark_tickers: frozenset[str] = frozenset()
 
     def _ask(self, method: str, *args: Any) -> Any:
         key = (method, *(tuple(a) if isinstance(a, list) else a for a in args))
@@ -1308,22 +1375,37 @@ class _Recorded(FilingSource):
         return self._answers[key]
 
     def filing_index(self, since: datetime | None = None) -> list[FilingIndexEntry]:
+        if self.limited_ciks is not None:
+            rows = [
+                entry
+                for cik in sorted(self.limited_ciks)
+                for entry in self.filing_index_for_cik(cik)
+                if since is None or entry.accepted_at >= since
+            ]
+            return sorted(rows, key=lambda e: (e.accepted_at, e.accession, e.cik))
         return list(self._ask("filing_index", since))
 
     def filing_index_for_cik(self, cik: str) -> list[FilingIndexEntry]:
         """Keep the source's bounded CIK query through the fetch-pass recorder."""
         if callable(getattr(self._source, "filing_index_for_cik", None)):
             return list(self._ask("filing_index_for_cik", cik))
-        return [entry for entry in self.filing_index() if entry.cik == cik]
+        return [entry for entry in self._ask("filing_index", None) if entry.cik == cik]
 
     def filing_index_for_forms(self, forms: Collection[str]) -> list[FilingIndexEntry]:
         """Keep cross-CIK form queries bounded and deterministic."""
         if callable(getattr(self._source, "filing_index_for_forms", None)):
             return list(self._ask("filing_index_for_forms", tuple(sorted(forms))))
-        return [entry for entry in self.filing_index() if entry.form in forms]
+        return [entry for entry in self._ask("filing_index", None) if entry.form in forms]
 
     def companies_snapshot(self) -> list[CompanySnapshotEntry]:
-        return list(self._ask("companies_snapshot"))
+        rows = list(self._ask("companies_snapshot"))
+        if self.limited_ciks is not None:
+            rows = [
+                row
+                for row in rows
+                if row.cik in self.limited_ciks or row.ticker in self.benchmark_tickers
+            ]
+        return rows
 
     def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
         return list(self._ask("facts", cik, list(names)))
@@ -1335,7 +1417,12 @@ class _Recorded(FilingSource):
         return list(self._ask("cover_pages", cik))
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
-        return list(self._ask("delistings", since))
+        rows = list(self._ask("delistings", since))
+        return (
+            [row for row in rows if row.cik in self.limited_ciks]
+            if self.limited_ciks is not None
+            else rows
+        )
 
     def filename_listings(self, cik: str) -> list[FilenameListing]:
         """Record the CIK's filename evidence in the fetch pass, before the lock."""
@@ -1457,6 +1544,1219 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None
             release()
     _check_source_failures(_unwrap(recorded), dry_run=dry_run)
     recorded.frozen = True
+
+
+def _index_gate(settings: Settings) -> None:
+    """Refuse an incremental read until an ok seed matches today's build rules."""
+    if not Path(settings.store.path).exists():
+        raise ValueError("EDGAR index has no completed seed; run --rebuild-index")
+    with open_read_only(settings, retry=True) as conn:
+        _index_gate_conn(conn, settings)
+
+
+def _index_gate_conn(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    """The same fingerprint predicate, usable again under the writer lock."""
+    from tradepartner.store.build_fingerprint import build_fingerprint
+
+    if index_snapshot_id(conn) is None:
+        raise ValueError("EDGAR index has no completed seed; run --rebuild-index")
+    row = conn.execute(
+        "SELECT message, rowid FROM ingestion_runs WHERE source = 'edgar_index' "
+        "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
+    ).fetchone()
+    partial = conn.execute(
+        "SELECT max(rowid) FROM ingestion_runs WHERE source = 'edgar_index' "
+        "AND mode = 'rebuild_index' AND status = 'partial'"
+    ).fetchone()
+    fingerprint = build_fingerprint(settings).hash
+    if (
+        row is None
+        or f"rule_fingerprint: {fingerprint}" not in str(row[0])
+        or (partial is not None and partial[0] is not None and partial[0] > row[1])
+    ):
+        raise ValueError("EDGAR index rules changed or seed incomplete; run --rebuild-index")
+
+
+@dataclass(frozen=True)
+class _IndexBatch:
+    """A fetched index proposal and the store version it was based on."""
+
+    snapshot: str | None
+    writer_version: int | None
+    proposal: Any
+    files: tuple[tuple[str, datetime, int, str], ...]
+    issuer_ciks: frozenset[str] = frozenset()
+    touched: frozenset[str] = frozenset()
+    rotation: frozenset[str] = frozenset()
+    rotation_recorded: Any = None
+    snapshot_values: Mapping[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
+    touch_cursor: Mapping[str, Any] = field(default_factory=dict)
+
+
+def _index_quarters(first_year: int, now: datetime) -> tuple[tuple[int, int], ...]:
+    eastern = now.astimezone(ZoneInfo("America/New_York"))
+    return tuple(
+        (year, quarter)
+        for year in range(first_year, eastern.year + 1)
+        for quarter in range(1, 5)
+        if (year, quarter) <= (eastern.year, (eastern.month - 1) // 3 + 1)
+    )
+
+
+class _BufferedIndexCursor:
+    """Results copied out of a short store read before any source fetch runs."""
+
+    def __init__(self, rows: list[tuple[Any, ...]], description: Any) -> None:
+        self._rows = rows
+        self.description = description
+        self._position = 0
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        rows = self._rows[self._position :]
+        self._position = len(self._rows)
+        return rows
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        if self._position >= len(self._rows):
+            return None
+        row = self._rows[self._position]
+        self._position += 1
+        return row
+
+
+class _IndexReadProxy:
+    """The T323a reader's connection interface, one bounded read per query."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    def execute(self, sql: str, params: Sequence[object] | None = None) -> _BufferedIndexCursor:
+        with open_read_only(self._settings, retry=True) as conn:
+            cursor = conn.execute(sql, params or [])
+            return _BufferedIndexCursor(cursor.fetchall(), cursor.description)
+
+
+def _writer_version(conn: duckdb.DuckDBPyConnection) -> int | None:
+    """Last run row; any intervening writer deliberately forces a fresh fetch."""
+    row = conn.execute("SELECT max(rowid) FROM ingestion_runs").fetchone()
+    return None if row is None or row[0] is None else int(row[0])
+
+
+def _index_state(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    now: datetime,
+    daily: tuple[Any, ...],
+    quarterly: Mapping[tuple[int, int], tuple[str, date]],
+    settled_listed_on: Mapping[tuple[int, int], date],
+    *,
+    candidate_accessions: frozenset[str] | None = None,
+    candidate_ciks: frozenset[str] = frozenset(),
+    reread_prefix: str | None = None,
+) -> Any:
+    """Read the four cursor tables and the issuer set on one store snapshot.
+
+    ``reread_prefix`` drops the stored daily cursors under that path, so a
+    ``--rebuild-index`` chunk reads every daily file of its quarter again under
+    today's rules; T318's insert writes nothing for a row already stored."""
+    from tradepartner.adapters.filings import IncrementalIndexState, PendingIndexRow
+
+    columns = (
+        "cik, accession, form, company_name, filed_on, accepted_at, listed_on, "
+        "known_at, ingested_at, list_position"
+    )
+    if candidate_accessions is None:
+        raw_rows = conn.execute(
+            f"SELECT {columns} FROM filing_index WHERE known_at <= ?", [now]
+        ).fetchall()
+    else:
+        # The adapter needs the history of listed accessions and the rows of a
+        # new issuer's walk, not the store's entire 15M-row index.
+        raw_rows = []
+        accessions = sorted(candidate_accessions)
+        for start in range(0, len(accessions), 500):
+            chunk = accessions[start : start + 500]
+            marks = ", ".join("?" for _ in chunk)
+            raw_rows.extend(
+                conn.execute(
+                    f"SELECT {columns} FROM filing_index WHERE accession IN ({marks}) "
+                    "AND known_at <= ?",
+                    [*chunk, now],
+                ).fetchall()
+            )
+        for cik in sorted(candidate_ciks):
+            raw_rows.extend(
+                conn.execute(
+                    f"SELECT {columns} FROM filing_index WHERE cik = ? AND known_at <= ?",
+                    [cik, now],
+                ).fetchall()
+            )
+        raw_rows = list({(row[0], row[1], row[7]): row for row in raw_rows}.values())
+    rows = tuple(stored_index.FilingRow(*row) for row in raw_rows)
+    pending = tuple(
+        PendingIndexRow(*row)
+        for row in conn.execute(
+            "SELECT cik, accession, form, company_name, filed_on, listed_on, list_position "
+            "FROM filing_index_pending"
+        ).fetchall()
+    )
+    filers: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {}
+    for cik, first, last in conn.execute(
+        "SELECT cik, first_quarter, last_quarter FROM edgar_filers"
+    ).fetchall():
+        filers[cik] = ((int(first[:4]), int(first[-1])), (int(last[:4]), int(last[-1])))
+    cursors = {
+        path: (
+            last_modified.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S"),
+            str(size),
+        )
+        for path, last_modified, size in conn.execute(
+            "SELECT path, last_modified, size FROM edgar_index_files "
+            "WHERE path LIKE 'daily-index/%'"
+        ).fetchall()
+        if reread_prefix is None or not path.startswith(reread_prefix)
+    }
+    issuer_forms = sorted(set(settings.master.issuer_forms) - {"25", "25-NSE"})
+    placeholders = ", ".join("?" for _ in issuer_forms)
+    issuers = {
+        cik
+        for (cik,) in conn.execute(
+            f"SELECT DISTINCT cik FROM filing_index WHERE form IN ({placeholders}) "
+            "AND known_at <= ?",
+            [*issuer_forms, now],
+        ).fetchall()
+    }
+    issuers.update(cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall())
+    return IncrementalIndexState(
+        now,
+        rows,
+        frozenset(issuers),
+        pending,
+        filers,
+        daily,
+        cursors,
+        quarterly,
+        settled_listed_on,
+    )
+
+
+def _quarter_last_modified(path: Path) -> datetime:
+    """Read the validator bound to a cached quarterly file."""
+    from email.utils import parsedate_to_datetime
+
+    sidecar = path.with_name(f"{path.name}.validators.json")
+    payload = json.loads(sidecar.read_text())
+    stamp = parsedate_to_datetime(payload["last_modified"])
+    return ensure_tz_aware_utc(stamp, field_name="quarter Last-Modified")
+
+
+def _daily_cursor(file: Any) -> Any:
+    """Convert SEC's Eastern wall time and human-readable size for the cursor table."""
+    stamp = datetime.strptime(file.last_modified, "%m/%d/%Y %I:%M:%S %p").replace(
+        tzinfo=ZoneInfo("America/New_York")
+    )
+    size = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(B|KB|MB|GB)", file.size)
+    if size is None:
+        raise ValueError(f"daily index listing has invalid size for {file.name}")
+    multiplier = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}[size[2]]
+    return replace(
+        file,
+        last_modified=stamp.strftime("%Y-%m-%d %H:%M:%S"),
+        size=str(int(Decimal(size[1]) * multiplier)),
+    )
+
+
+def _prepare_index(
+    settings: Settings,
+    source: FilingSource,
+    now: datetime,
+    *,
+    quarter_filter: tuple[int, int] | None = None,
+) -> _IndexBatch:
+    """Fetch index inputs outside the writer lock and propose rows."""
+    from tradepartner.adapters import edgar_raw
+    from tradepartner.adapters.daily_index import daily_files_to_read, parse_daily_listing
+    from tradepartner.adapters.edgar import parse_filing_index
+    from tradepartner.adapters.edgar_source import EdgarFilingSource
+    from tradepartner.adapters.index_reconcile import quarterly_listed_on, select_quarters
+
+    with open_read_only(settings, retry=True) as conn:
+        snapshot = index_snapshot_id(conn)
+        writer_version = _writer_version(conn)
+    # A rebuild chunk re-reads its quarter's daily files: a rule change must
+    # reach the unsettled quarters too, not only the settled `form.idx` ones.
+    reread = (
+        None
+        if quarter_filter is None
+        else f"daily-index/{quarter_filter[0]}/QTR{quarter_filter[1]}/"
+    )
+    daily: list[Any] = []
+    quarterly: dict[tuple[int, int], tuple[str, date]] = {}
+    settled_days: dict[tuple[int, int], date] = {}
+    quarterly_files: list[tuple[str, datetime, int, str]] = []
+    if isinstance(source, EdgarFilingSource):
+        quarters = _index_quarters(settings.edgar.index_first_year, now)
+        for year, number in quarters:
+            if quarter_filter is not None and (year, number) > quarter_filter:
+                continue
+            if source._settled((year, number), now):
+                if quarter_filter is not None and (year, number) != quarter_filter:
+                    continue  # the new-issuer walk uses this quarter's cached copy
+                path, changed = edgar_raw.cached_quarterly_index(
+                    year, number, settings=settings, client=source._client
+                )
+                modified = _quarter_last_modified(path)
+                listed = quarterly_listed_on(modified)
+                settled_days[(year, number)] = listed
+                if changed or quarter_filter is not None:
+                    body = gzip.decompress(path.read_bytes())
+                    quarterly[(year, number)] = body.decode("utf-8"), listed
+                    quarterly_files.append(
+                        (
+                            f"full-index/{year}/QTR{number}/form.idx",
+                            modified,
+                            len(body),
+                            hashlib.sha256(body).hexdigest(),
+                        )
+                    )
+            else:
+                listing = edgar_raw.daily_index_listing(
+                    year, number, settings=settings, client=source._client
+                )
+                daily.extend(
+                    _daily_cursor(file) for file in parse_daily_listing(listing, year, number)
+                )
+        if quarter_filter is None:
+            with open_read_only(settings, retry=True) as conn:
+                last = conn.execute(
+                    "SELECT finished_at FROM ingestion_runs WHERE source = 'edgar_index' "
+                    "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
+                ).fetchone()
+            chosen = select_quarters(
+                now=now,
+                last_ok_run_at=None if last is None else last[0],
+                changed={Quarter(*q) for q in quarterly},
+                settle_days=settings.edgar.index_settle_days,
+                first_year=settings.edgar.index_first_year,
+                recent_quarters=settings.edgar.reconcile_recent_quarters,
+            )
+            for selected in chosen.quarters:
+                q = selected.year, selected.number
+                if q in quarterly:
+                    continue
+                path = Path(settings.edgar.cache_dir) / "index" / f"{q[0]}-QTR{q[1]}.idx.gz"
+                body = gzip.decompress(path.read_bytes())
+                modified = _quarter_last_modified(path)
+                listed = quarterly_listed_on(modified)
+                quarterly[q] = body.decode("utf-8"), listed
+                quarterly_files.append(
+                    (
+                        f"full-index/{q[0]}/QTR{q[1]}/form.idx",
+                        modified,
+                        len(body),
+                        hashlib.sha256(body).hexdigest(),
+                    )
+                )
+        # A new issuer's walk may read an older settled cache without a GET.
+        # Supply its listing date even when this run did not reconcile it.
+        for year, number in _index_quarters(settings.edgar.index_first_year, now):
+            quarter = (year, number)
+            if quarter in settled_days or not source._settled(quarter, now):
+                continue
+            path = Path(settings.edgar.cache_dir) / "index" / f"{year}-QTR{number}.idx.gz"
+            if path.is_file():
+                settled_days[quarter] = quarterly_listed_on(_quarter_last_modified(path))
+    candidate_accessions: frozenset[str] | None = None
+    candidate_ciks: frozenset[str] = frozenset()
+    if isinstance(source, EdgarFilingSource):
+        with open_read_only(settings, retry=True) as conn:
+            old_cursors = {
+                path: (
+                    modified.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S"),
+                    str(size),
+                )
+                for path, modified, size in conn.execute(
+                    "SELECT path, last_modified, size FROM edgar_index_files "
+                    "WHERE path LIKE 'daily-index/%'"
+                ).fetchall()
+                if reread is None or not path.startswith(reread)
+            }
+            known_issuers = {
+                cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+            }
+            listed_forms = sorted(set(settings.master.issuer_forms) - {"25", "25-NSE"})
+            marks = ", ".join("?" for _ in listed_forms)
+            known_issuers.update(
+                cik
+                for (cik,) in conn.execute(
+                    f"SELECT DISTINCT cik FROM filing_index WHERE form IN ({marks}) "
+                    "AND known_at <= ?",
+                    [*listed_forms, now],
+                ).fetchall()
+            )
+        candidates: set[str] = set()
+        possible_new: set[str] = set()
+        issuer_forms = set(settings.master.issuer_forms) | {"25", "25-NSE"}
+        for file in daily_files_to_read(tuple(daily), old_cursors):
+            for row in source._incremental_daily_rows(file):
+                candidates.add(row.accession)
+                if row.form in issuer_forms and row.cik not in known_issuers:
+                    possible_new.add(row.cik)
+        for text, _listed in quarterly.values():
+            for row in parse_filing_index(text, {}).unstamped:
+                candidates.add(row.accession)
+                if row.form in issuer_forms and row.cik not in known_issuers:
+                    possible_new.add(row.cik)
+        with open_read_only(settings, retry=True) as conn:
+            for year, number in quarterly:
+                first_day = date(year, number * 3 - 2, 1)
+                last_day = date(year + 1, 1, 1) if number == 4 else date(year, number * 3 + 1, 1)
+                candidates.update(
+                    accession
+                    for (accession,) in conn.execute(
+                        "SELECT DISTINCT accession FROM filing_index "
+                        "WHERE filed_on >= ? AND filed_on < ?",
+                        [first_day, last_day],
+                    ).fetchall()
+                )
+        candidate_accessions = frozenset(candidates)
+        candidate_ciks = frozenset(possible_new)
+    with open_read_only(settings, retry=True) as conn:
+        state = _index_state(
+            conn,
+            settings,
+            now,
+            tuple(daily),
+            quarterly,
+            settled_days,
+            candidate_accessions=candidate_accessions,
+            candidate_ciks=candidate_ciks,
+            reread_prefix=reread,
+        )
+    proposal = source.incremental_index(state)
+    read_files = list(quarterly_files)
+    daily_read = list(proposal.files_read)
+    if isinstance(source, EdgarFilingSource):
+        issuer_forms = set(settings.master.issuer_forms) | {"25", "25-NSE"}
+        new_issuers = {
+            row.cik
+            for row in proposal.rows
+            if row.cik not in state.issuer_ciks and row.form in issuer_forms
+        }
+        for cik in new_issuers:
+            first, last = proposal.filers[cik]
+            for file in state.daily_files:
+                day = date.fromisoformat(file.name.split(".")[1])
+                quarter = (day.year, (day.month - 1) // 3 + 1)
+                if first <= quarter <= last and file not in daily_read:
+                    daily_read.append(file)
+            for year, number in _index_quarters(settings.edgar.index_first_year, now):
+                quarter = (year, number)
+                if not first <= quarter <= last or quarter not in settled_days:
+                    continue
+                path = Path(settings.edgar.cache_dir) / "index" / f"{year}-QTR{number}.idx.gz"
+                body = gzip.decompress(path.read_bytes())
+                read_files.append(
+                    (
+                        f"full-index/{year}/QTR{number}/form.idx",
+                        _quarter_last_modified(path),
+                        len(body),
+                        hashlib.sha256(body).hexdigest(),
+                    )
+                )
+    for file in daily_read:
+        day = date.fromisoformat(file.name.split(".")[1])
+        path = edgar_raw.daily_index_file_path(
+            day.year, (day.month - 1) // 3 + 1, file.name, settings=settings
+        )
+        body = path.read_bytes()
+        modified = (
+            datetime.fromisoformat(file.last_modified)
+            .replace(tzinfo=ZoneInfo("America/New_York"))
+            .astimezone(UTC)
+        )
+        read_files.append((file.path, modified, int(file.size), hashlib.sha256(body).hexdigest()))
+    return _IndexBatch(
+        snapshot,
+        writer_version,
+        proposal,
+        tuple({item[0]: item for item in read_files}.values()),
+        state.issuer_ciks,
+    )
+
+
+def _write_index_state(
+    conn: duckdb.DuckDBPyConnection,
+    batch: _IndexBatch,
+    now: datetime,
+    run_id: str,
+) -> tuple[int, str]:
+    """Commit T319's proposal and every file cursor with the caller's chunk."""
+    if index_snapshot_id(conn) != batch.snapshot or _writer_version(conn) != batch.writer_version:
+        raise _IndexConflict("EDGAR index changed since the fetch snapshot; retry the run")
+    proposal = batch.proposal
+    counts = _insert_index_listings(conn, proposal.listings, now)
+    desired = {(row.cik, row.accession): row for row in proposal.pending}
+    old_keys = set(conn.execute("SELECT cik, accession FROM filing_index_pending").fetchall())
+    for cik, accession in old_keys - desired.keys():
+        conn.execute(
+            "DELETE FROM filing_index_pending WHERE cik = ? AND accession = ?", [cik, accession]
+        )
+    for row in desired.values():
+        conn.execute(
+            "INSERT OR REPLACE INTO filing_index_pending "
+            "(cik, accession, form, company_name, filed_on, listed_on, list_position) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                row.cik,
+                row.accession,
+                row.form,
+                row.company_name,
+                row.filed_on,
+                row.listed_on,
+                row.list_position,
+            ],
+        )
+    for cik, (first, last) in proposal.filers.items():
+        conn.execute(
+            "INSERT OR REPLACE INTO edgar_filers (cik, first_quarter, last_quarter) "
+            "VALUES (?, ?, ?)",
+            [cik, f"{first[0]}Q{first[1]}", f"{last[0]}Q{last[1]}"],
+        )
+    for path, modified, size, digest in batch.files:
+        conn.execute(
+            "INSERT OR REPLACE INTO edgar_index_files "
+            "(path, last_modified, size, sha256, run_id) VALUES (?, ?, ?, ?, ?)",
+            [path, modified, size, digest, run_id],
+        )
+    numbers = dict(proposal.counts)
+    numbers.update(
+        index_added=counts.added,
+        index_revised=counts.revised,
+        index_refused=numbers.get("index_refused", 0) + counts.changed,
+        index_stale_listing=numbers.get("index_stale_listing", 0) + counts.stale,
+    )
+    message = "; ".join(f"{key}: {value}" for key, value in sorted(numbers.items()))
+    return counts.added + counts.revised, message
+
+
+def _insert_index_listings(
+    conn: duckdb.DuckDBPyConnection,
+    listings: Sequence[stored_index.Listing],
+    now: datetime,
+) -> stored_index.InsertCounts:
+    """Bulk insert an all-new quarter; delegate every mixed/revision case to T318."""
+    import pyarrow as pa
+
+    keys = {(row.cik, row.accession) for row in listings}
+    if not listings or len(keys) != len(listings):
+        return stored_index.insert_listings(conn, list(listings), now)
+    if any(row.accepted_at > now or row.listed_on > now.date() for row in listings):
+        return stored_index.insert_listings(conn, list(listings), now)
+    table = pa.Table.from_pylist(
+        [
+            {
+                "cik": row.cik,
+                "accession": row.accession,
+                "form": row.form,
+                "company_name": row.company_name,
+                "filed_on": row.filed_on,
+                "accepted_at": row.accepted_at,
+                "listed_on": row.listed_on,
+                "list_position": row.list_position,
+            }
+            for row in listings
+        ]
+    )
+    conn.register("_t323_index_batch", table)
+    try:
+        existing = conn.execute(
+            "SELECT count(*) FROM _t323_index_batch b JOIN filing_index f "
+            "ON b.cik = f.cik AND b.accession = f.accession"
+        ).fetchone()
+        if existing is None or existing[0]:
+            return stored_index.insert_listings(conn, list(listings), now)
+        conn.execute(
+            "INSERT INTO filing_index "
+            "(cik, accession, form, company_name, filed_on, accepted_at, listed_on, "
+            "list_position, known_at, ingested_at, source, provenance) "
+            "SELECT cik, accession, form, company_name, filed_on, accepted_at, listed_on, "
+            "list_position, accepted_at, ?, 'edgar', 'filing' FROM _t323_index_batch",
+            [now],
+        )
+        return stored_index.InsertCounts(added=len(listings))
+    finally:
+        conn.unregister("_t323_index_batch")
+
+
+def _index_run_message(settings: Settings, counts: str, files: int) -> str:
+    """Stable metadata at the front of the EDGAR index run row."""
+    from tradepartner.store.build_fingerprint import build_fingerprint
+
+    fingerprint = build_fingerprint(settings)
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_bytes = rss if sys.platform == "darwin" else rss * 1024
+    message = (
+        f"rule_fingerprint: {fingerprint.hash}; "
+        f"files_read: {files}; peak_rss_bytes: {rss_bytes}; {counts}"
+    )
+    if len(message) > settings.ingest.max_message_chars:
+        raise ValueError("EDGAR index run metadata exceeds ingest.max_message_chars")
+    return message
+
+
+def _index_run_cursor(
+    settings: Settings,
+    cursor: str,
+    snapshot_values: Mapping[str, frozenset[tuple[str, str]]] | None = None,
+    touch_cursor: Mapping[str, Any] | None = None,
+) -> str:
+    """Keep the unabridged per-name values on the run row, outside the message cap."""
+    from tradepartner.store.build_fingerprint import build_fingerprint
+
+    return json.dumps(
+        {
+            "cursor": cursor,
+            "per_name": build_fingerprint(settings).per_name,
+            "snapshot": {cik: sorted(values) for cik, values in (snapshot_values or {}).items()},
+            "touch": dict(touch_cursor or {}),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _per_name_entries(values: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Shape config values for T320's per-entry diff, retaining each named CIK."""
+    from tradepartner.store.touched import PerNameEntry
+
+    out: dict[str, dict[str, PerNameEntry]] = {}
+    for name, value in values.items():
+        entries: dict[str, PerNameEntry] = {}
+        items = value.items() if isinstance(value, dict) else enumerate(value)
+        for key, item in items:
+            raw = json.dumps(item, sort_keys=True, default=str)
+            label = str(key) if isinstance(value, dict) else str(item)
+            ciks = frozenset(re.findall(r"(?<!\d)\d{10}(?!\d)", f"{label} {raw}"))
+            entries[label] = PerNameEntry(raw, ciks)
+        out[name] = entries
+    return out
+
+
+def _snapshot_values(
+    entries: Sequence[CompanySnapshotEntry],
+) -> dict[str, frozenset[tuple[str, str]]]:
+    grouped: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    for entry in entries:
+        grouped[entry.cik].add((entry.ticker, entry.exchange))
+    return {cik: frozenset(values) for cik, values in grouped.items()}
+
+
+def _cache_completeness(
+    source: FilingSource, issuer_ciks: frozenset[str]
+) -> tuple[dict[str, bool], dict[str, bool]]:
+    """Check the same per-CIK cache keys T323a uses before choosing touched CIKs."""
+    from tradepartner.adapters import edgar_source
+
+    if not isinstance(source, edgar_source.EdgarFilingSource):
+        return {}, {}
+    facts: dict[str, bool] = {}
+    statements: dict[str, bool] = {}
+    forms = set(source._settings.edgar.cover_page_forms)
+    for cik in issuer_ciks:
+        latest = source._facts_cache_key(source._load_stamps(cik), forms)
+        if latest is None:
+            continue
+        path = source._cache / "facts" / f"v{edgar_source.PARSER_VERSION}" / f"{cik}.json"
+        facts[cik] = edgar_source._cached_latest(path, cik) == latest
+        if source._settings.edgar.statement_facts_enabled:
+            statements[cik] = edgar_source._cached_key(
+                source._statement_cache_path(cik), cik, edgar_source.STATEMENT_VERSION
+            ) == source._statement_key(latest)
+    return facts, statements
+
+
+def _index_touch_state(
+    settings: Settings,
+    source: FilingSource,
+    now: datetime,
+    previous_at: datetime | None,
+    previous: Mapping[str, Any],
+    proposal: Any,
+) -> dict[str, Any]:
+    """Read T320's cache and clock boundaries before limiting the build."""
+    from tradepartner.adapters import edgar_raw, edgar_source
+
+    if not isinstance(source, edgar_source.EdgarFilingSource):
+        return {}
+    failures = {
+        accession: [
+            accession[:10],
+            entry.get("kind") != "collision"
+            and int(entry.get("count", 0)) >= settings.edgar.max_filing_failures,
+            bool(entry.get("accepted", False)),
+        ]
+        for accession, entry in source._failure_store().items()
+    }
+    cached_periods = set(source._cached_fsn_periods())
+    listed_periods = set(edgar_raw.fsn_periods(settings=settings, client=source._client))
+    periods = sorted(cached_periods | listed_periods)
+    prior_periods = set(previous.get("fsn_periods", periods))
+    new_periods = set(periods) - prior_periods
+    new_accessions: set[str] = set()
+    for period in new_periods:
+        manifest = source._load_fsn_manifest(period)
+        if manifest is not None:
+            new_accessions.update(manifest.get("accessions_extracted", ()))
+    old_lag = previous.get("lag_start")
+    starts = [edgar_source._fsn_period_start(period) for period in periods]
+    lag_start = max(starts).isoformat() if starts else None
+    accession_ciks: dict[str, set[str]] = defaultdict(set)
+    for row in proposal.listings:
+        accession_ciks[row.accession].add(row.cik)
+    relevant = set(failures) | set(previous.get("failures", {})) | new_accessions
+    with open_read_only(settings, retry=True) as conn:
+        for accession in sorted(relevant):
+            accession_ciks[accession].update(
+                cik
+                for (cik,) in conn.execute(
+                    "SELECT DISTINCT cik FROM filing_index WHERE accession = ?", [accession]
+                ).fetchall()
+            )
+        settled: set[str] = set()
+        if previous_at is not None:
+            for year, number in _index_quarters(settings.edgar.index_first_year, now):
+                quarter = (year, number)
+                if source._settled(quarter, now) and not source._settled(quarter, previous_at):
+                    first = date(year, 3 * number - 2, 1)
+                    end = date(year + 1, 1, 1) if number == 4 else date(year, 3 * number + 1, 1)
+                    settled.update(
+                        cik
+                        for (cik,) in conn.execute(
+                            "SELECT DISTINCT cik FROM filing_index "
+                            "WHERE filed_on >= ? AND filed_on < ?",
+                            [first, end],
+                        ).fetchall()
+                    )
+        lag_ciks: set[str] = set()
+        if old_lag and lag_start and old_lag != lag_start:
+            lag_ciks.update(
+                cik
+                for (cik,) in conn.execute(
+                    "SELECT DISTINCT cik FROM filing_index WHERE accepted_at >= ? "
+                    "AND accepted_at < ?",
+                    [min(old_lag, lag_start), max(old_lag, lag_start)],
+                ).fetchall()
+            )
+        newly_known: set[str] = set()
+        if previous_at is not None:
+            newly_known.update(
+                cik
+                for (cik,) in conn.execute(
+                    "SELECT DISTINCT cik FROM filing_index WHERE accepted_at > ? "
+                    "AND accepted_at <= ?",
+                    [previous_at, now],
+                ).fetchall()
+            )
+        if new_periods and starts:
+            first_new = min(edgar_source._fsn_period_start(period) for period in new_periods)
+            settled.update(
+                cik
+                for (cik,) in conn.execute(
+                    "SELECT DISTINCT cik FROM filing_index WHERE accepted_at >= ?",
+                    [first_new],
+                ).fetchall()
+            )
+    unread = {
+        cik
+        for cik, count in source._unread_runs().items()
+        if count >= settings.edgar.stamp_sgml_fallback_runs
+    }
+    return {
+        "failures": failures,
+        "fsn_periods": periods,
+        "lag_start": lag_start,
+        "filename_incomplete": sorted(source.filename_incomplete_ciks),
+        "new_fsn_accessions": sorted(new_accessions),
+        "accession_ciks": {key: sorted(value) for key, value in accession_ciks.items()},
+        "settled_ciks": sorted(settled),
+        "lag_window_start_ciks": sorted(lag_ciks),
+        "unread_run_reached_ciks": sorted(unread),
+        "newly_known_ciks": sorted(newly_known),
+    }
+
+
+def _pending_snapshot_ciks(
+    settings: Settings,
+    now: datetime,
+    current: Mapping[str, frozenset[tuple[str, str]]],
+) -> frozenset[str]:
+    """Keep a first ticker sighting in the build until its second fetch confirms it."""
+    with open_read_only(settings, retry=True) as conn:
+        rows = conn.execute(
+            "WITH latest AS (SELECT cik, ticker, exchange, "
+            "row_number() OVER (PARTITION BY cik ORDER BY known_at DESC) AS rn "
+            "FROM snapshot_sightings WHERE known_at <= ?) "
+            "SELECT s.cik, s.ticker, s.exchange FROM latest s WHERE s.rn = 1 "
+            "AND NOT EXISTS (SELECT 1 FROM listings l JOIN securities sec "
+            "ON l.security_id = sec.security_id WHERE sec.cik = s.cik "
+            "AND l.ticker = s.ticker AND l.exchange = s.exchange AND l.known_at <= ?)",
+            [now, now],
+        ).fetchall()
+    return frozenset(
+        cik for cik, ticker, exchange in rows if (ticker, exchange) in current.get(cik, ())
+    )
+
+
+def _touched_for_index(
+    settings: Settings,
+    proposal: Any,
+    previous: Mapping[str, Any],
+    issuer_ciks: frozenset[str],
+    now: datetime,
+    *,
+    source: FilingSource,
+    previous_snapshot: Mapping[str, frozenset[tuple[str, str]]],
+    current_snapshot: Mapping[str, frozenset[tuple[str, str]]],
+    previous_touch: Mapping[str, Any] | None = None,
+    current_touch: Mapping[str, Any] | None = None,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """T320's explicit row and config triggers, then T321's rotation share."""
+    from tradepartner.store.build_fingerprint import build_fingerprint
+    from tradepartner.store.drift_check import rotation_share, session_night
+    from tradepartner.store.touched import FailureState, TouchedInputs, touched_ciks
+
+    per_name = build_fingerprint(settings).per_name
+    fact_complete, statement_complete = _cache_completeness(source, issuer_ciks)
+    chains = set()
+    for entry in settings.master.chains:
+        chains.update(re.findall(r"(?<!\d)\d{10}(?!\d)", entry))
+    before = previous_touch or {}
+    after = current_touch or {}
+
+    def failures(values: Mapping[str, Any]) -> dict[str, FailureState]:
+        return {
+            accession: FailureState(str(value[0]), bool(value[1]), bool(value[2]))
+            for accession, value in values.get("failures", {}).items()
+        }
+
+    inputs = TouchedInputs(
+        inserted_ciks=frozenset(row.cik for row in proposal.rows),
+        companyfacts_complete=fact_complete,
+        statement_complete=statement_complete,
+        previous_failures=failures(before),
+        current_failures=failures(after),
+        filename_incomplete_ciks=frozenset(before.get("filename_incomplete", ())),
+        new_fsn_accessions=frozenset(after.get("new_fsn_accessions", ())),
+        accession_ciks={
+            accession: frozenset(ciks)
+            for accession, ciks in after.get("accession_ciks", {}).items()
+        },
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        previous_per_name_lists=_per_name_entries(previous),
+        current_per_name_lists=_per_name_entries(per_name),
+        master_chains_ciks=frozenset(chains),
+        settled_ciks=frozenset(after.get("settled_ciks", ())),
+        lag_window_start_ciks=frozenset(after.get("lag_window_start_ciks", ())),
+        unread_run_reached_ciks=frozenset(after.get("unread_run_reached_ciks", ())),
+        newly_known_ciks=frozenset(after.get("newly_known_ciks", ())),
+        stamp_changed_ciks=proposal.stamp_changed_ciks,
+    )
+    touched = frozenset(touched_ciks(inputs))
+    rotation = frozenset(
+        rotation_share(
+            issuer_ciks - touched,
+            session_night(now.date()),
+            settings.edgar.verify_rotation_days,
+            "edgar_index",
+        )
+    )
+    return touched, rotation
+
+
+def _prepare_indexed_filings(
+    settings: Settings,
+    recorded: _Recorded,
+    clock: Callable[[], datetime],
+    *,
+    dry_run: bool,
+) -> _IndexBatch:
+    """Gate, fetch T319's index, then fetch the build from table plus proposals."""
+    _index_gate(settings)
+    source = _unwrap(recorded)
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    batch = _prepare_index(settings, source, now)
+    with open_read_only(settings, retry=True) as conn:
+        old = conn.execute(
+            "SELECT chunk_cursor, finished_at FROM ingestion_runs WHERE source = 'edgar_index' "
+            "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+    previous: Mapping[str, Any] = {}
+    previous_touch: Mapping[str, Any] = {}
+    previous_at: datetime | None = None
+    previous_snapshot: Mapping[str, frozenset[tuple[str, str]]] = {}
+    if old is not None:
+        try:
+            prior = json.loads(old[0])
+            previous = prior.get("per_name", {})
+            previous_touch = prior.get("touch", {})
+            previous_at = old[1]
+            previous_snapshot = {
+                cik: frozenset(tuple(pair) for pair in pairs)
+                for cik, pairs in prior.get("snapshot", {}).items()
+            }
+        except (TypeError, ValueError, AttributeError):
+            previous = {}
+    touch_state = _index_touch_state(
+        settings, source, now, previous_at, previous_touch, batch.proposal
+    )
+    current_snapshot = _snapshot_values(list(recorded._ask("companies_snapshot")))
+    touched, rotation = _touched_for_index(
+        settings,
+        batch.proposal,
+        previous,
+        batch.issuer_ciks,
+        now,
+        source=source,
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        previous_touch=previous_touch,
+        current_touch=touch_state,
+    )
+    pending_snapshot = _pending_snapshot_ciks(settings, now, current_snapshot)
+    if pending_snapshot:
+        touched = touched | pending_snapshot
+        rotation = rotation - pending_snapshot
+    batch = replace(
+        batch,
+        touched=touched,
+        rotation=rotation,
+        snapshot_values=current_snapshot,
+        touch_cursor={
+            key: touch_state[key]
+            for key in ("failures", "fsn_periods", "lag_start", "filename_incomplete")
+            if key in touch_state
+        },
+    )
+    recorded.limited_ciks = touched
+    recorded.benchmark_tickers = frozenset(settings.benchmarks)
+    rotated = _Recorded(source) if rotation else None
+    if rotated is not None:
+        rotated.limited_ciks = rotation
+        rotated.benchmark_tickers = frozenset(settings.benchmarks)
+    bind = getattr(source, "use_index", None)
+    if callable(bind):
+        with open_read_only(settings, retry=True) as conn:
+            if (
+                index_snapshot_id(conn) != batch.snapshot
+                or _writer_version(conn) != batch.writer_version
+            ):
+                raise _IndexConflict("EDGAR index changed since the fetch snapshot; retry the run")
+        bind(
+            cast(duckdb.DuckDBPyConnection, _IndexReadProxy(settings)),
+            batch.proposal.listings,
+            touched_ciks=touched | rotation,
+        )
+        _prefetch(recorded, settings, dry_run=dry_run)
+        if rotated is not None:
+            _fetch_and_gate(rotated, settings)
+            rotated.frozen = True
+    else:
+        _prefetch(recorded, settings, dry_run=dry_run)
+        if rotated is not None:
+            _fetch_and_gate(rotated, settings)
+            rotated.frozen = True
+    return replace(batch, rotation_recorded=rotated)
+
+
+def _rotation_report(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    batch: _IndexBatch,
+    now: datetime,
+) -> str:
+    """Rebuild a rotating untouched share read-only and compare current rows."""
+    from tradepartner.store.drift_check import compare_rows, drift_message
+
+    if not batch.rotation or batch.rotation_recorded is None:
+        return "incremental_drift: 0"
+    earlier = tuple(
+        entry
+        for entry in stored_snapshot_history(conn, now)
+        if entry.cik in batch.rotation or entry.ticker in settings.benchmarks
+    )
+    master, delistings, classes, facts, _unmatched = _build_filings(
+        batch.rotation_recorded, settings, now, earlier_fetches=earlier
+    )
+    products: dict[str, Sequence[Row]] = {
+        "securities": master.securities,
+        "listings": master.listings,
+        "delistings": delistings.delistings,
+        "classifications": classes.classifications,
+        "facts": facts,
+    }
+    rebuilt: dict[str, dict[str, list[Row]]] = {}
+    stored: dict[str, dict[str, list[Row]]] = {}
+    for table, rows in products.items():
+        for row in rows:
+            cik = security_cik(row["security_id"])
+            if cik in batch.rotation:
+                rebuilt.setdefault(cik, {}).setdefault(table, []).append(row)
+        ciks = sorted(batch.rotation)
+        for start in range(0, len(ciks), 500):
+            chunk = ciks[start : start + 500]
+            marks = ", ".join("?" for _ in chunk)
+            cursor = conn.execute(
+                f"SELECT * FROM {table} WHERE substr(security_id, 1, 10) IN ({marks}) "
+                "AND known_at <= ?",
+                [*chunk, now],
+            )
+            columns = [item[0] for item in cursor.description]
+            for values in cursor.fetchall():
+                row = dict(zip(columns, values, strict=True))
+                cik = security_cik(row["security_id"])
+                stored.setdefault(cik, {}).setdefault(table, []).append(row)
+    keys = {name: fields[0] for name, fields in _TABLES.items() if name in products}
+    return drift_message(compare_rows(stored, rebuilt, keys=keys))
+
+
+def _write_indexed_filings(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    recorded: _Recorded,
+    batch: _IndexBatch,
+    clock: Callable[[], datetime],
+    run_id: str,
+    *,
+    rebuild_statement_facts: bool,
+    rebuild_filing_events: bool,
+    rebuild_classifications: bool,
+    restamp: Sequence[ManifestRow] | None,
+    on_restamp: Callable[[RestampResult], None] | None,
+    restamp_window_ok: WindowEarlierOk | None,
+) -> tuple[int, str]:
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    _index_gate_conn(conn, settings)
+    index_run_id = uuid.uuid4().hex
+    index_rows, index_counts = _write_index_state(conn, batch, now, index_run_id)
+    source = _unwrap(recorded)
+    bind = getattr(source, "use_index", None)
+    if callable(bind):
+        bind(conn, batch.proposal.listings, touched_ciks=batch.touched | batch.rotation)
+    derived_rows, message = _ingest_filings(
+        conn,
+        settings,
+        recorded,
+        clock,
+        run_id,
+        rebuild_statement_facts=rebuild_statement_facts,
+        rebuild_filing_events=rebuild_filing_events,
+        rebuild_classifications=rebuild_classifications,
+        restamp=restamp,
+        on_restamp=on_restamp,
+        restamp_window_ok=restamp_window_ok,
+        touched_ciks=batch.touched,
+    )
+    rotation_message = _rotation_report(conn, settings, batch, now)
+    touch_cursor = _touch_after_build(
+        settings, source, batch.touch_cursor, recorded.filename_incomplete_ciks
+    )
+    index_counts = (
+        f"{index_counts}; index_stamp_changed: "
+        f"{len(batch.proposal.stamp_changed_ciks)}; {rotation_message}"
+    )
+    index_run = SourceRun(
+        "edgar_index",
+        OK,
+        index_rows,
+        _index_run_cursor(
+            settings,
+            expected_session(now, settings).isoformat(),
+            batch.snapshot_values,
+            touch_cursor,
+        ),
+        _index_run_message(settings, index_counts, len(batch.files)),
+    )
+    _write_run(conn, index_run_id, now, clock(), index_run, MODE)
+    return index_rows + derived_rows, f"{message}; {index_counts}"
+
+
+def _touch_after_build(
+    settings: Settings,
+    source: object,
+    touch_cursor: Mapping[str, Any],
+    recorded_incomplete: Collection[str],
+) -> dict[str, Any]:
+    """The run row's T320 cursor, with the filename and failure state the build left."""
+    out = dict(touch_cursor)
+    incomplete = set(recorded_incomplete)
+    incomplete.update(getattr(source, "filename_incomplete_ciks", ()))
+    out["filename_incomplete"] = sorted(incomplete)
+    failure_store = getattr(source, "_failure_store", None)
+    if callable(failure_store):
+        out["failures"] = {
+            accession: [
+                accession[:10],
+                entry.get("kind") != "collision"
+                and int(entry.get("count", 0)) >= settings.edgar.max_filing_failures,
+                bool(entry.get("accepted", False)),
+            ]
+            for accession, entry in failure_store().items()
+        }
+    return out
+
+
+def _rebuild_index_session(
+    settings: Settings,
+    filings: FilingSource,
+    *,
+    clock: Callable[[], datetime],
+    dry_run: bool,
+    prices: PriceSource,
+) -> IngestResult:
+    """Seed or repair the index in quarter chunks, then publish one ok gate row."""
+    from tradepartner.store.build_fingerprint import build_fingerprint
+
+    del prices  # the CLI permits rebuild only with --source edgar
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    fingerprint = build_fingerprint(settings).hash
+    quarters = _index_quarters(settings.edgar.index_first_year, now)
+    last_partial: str | None = None
+    if not dry_run and Path(settings.store.path).exists():
+        with open_read_only(settings, retry=True) as conn:
+            row = conn.execute(
+                "SELECT chunk_cursor, rowid, message FROM ingestion_runs "
+                "WHERE source = 'edgar_index' "
+                "AND mode = 'rebuild_index' AND status = 'partial' "
+                "ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+            done = conn.execute(
+                "SELECT max(rowid) FROM ingestion_runs WHERE source = 'edgar_index' "
+                "AND status = 'ok'"
+            ).fetchone()
+            if (
+                row is not None
+                and f"rule_fingerprint: {fingerprint}" in str(row[2])
+                and (done is None or done[0] is None or row[1] > done[0])
+            ):
+                last_partial = row[0]
+    if last_partial is not None:
+        quarters = tuple(q for q in quarters if f"{q[0]}Q{q[1]}" > last_partial)
+    for year, number in quarters:
+        batches: dict[str, _IndexBatch] = {}
+        cursor = f"{year}Q{number}"
+
+        def prepare_quarter(
+            target: dict[str, _IndexBatch] = batches,
+            quarter: tuple[int, int] = (year, number),
+        ) -> None:
+            target["current"] = _prepare_index(
+                settings,
+                filings,
+                ensure_tz_aware_utc(clock(), field_name="clock()"),
+                quarter_filter=quarter,
+            )
+
+        def write_quarter(
+            conn: duckdb.DuckDBPyConnection,
+            run_id: str,
+            target: dict[str, _IndexBatch] = batches,
+        ) -> tuple[int, str]:
+            from tradepartner.store.build_fingerprint import build_fingerprint
+
+            batch = target["current"]
+            chunk_now = ensure_tz_aware_utc(clock(), field_name="clock()")
+            added, counts = _write_index_state(conn, batch, chunk_now, run_id)
+            return (
+                added,
+                f"rule_fingerprint: {build_fingerprint(settings).hash}; "
+                f"files_read: {len(batch.files)}; {counts}",
+            )
+
+        chunk = _run_source(
+            "edgar_index",
+            write_quarter,
+            settings,
+            ensure_tz_aware_utc(clock(), field_name="clock()"),
+            clock,
+            cursor,
+            dry_run,
+            mode="rebuild_index",
+            prepare=prepare_quarter,
+            success_status="partial",
+        )
+        if chunk.status != "partial":
+            return IngestResult((chunk,))
+
+    recorded = _Recorded(filings)
+    final_snapshot: dict[str, str | int | None] = {}
+    seed_touch: dict[str, Any] = {}
+
+    def prepare_final() -> None:
+        source = _unwrap(recorded)
+        bind = getattr(source, "use_index", None)
+        with open_read_only(settings, retry=True) as conn:
+            final_snapshot["id"] = index_snapshot_id(conn)
+            final_snapshot["writer"] = _writer_version(conn)
+        if callable(bind):
+            bind(cast(duckdb.DuckDBPyConnection, _IndexReadProxy(settings)))
+        _prefetch(recorded, settings, dry_run=dry_run)
+        # The first nightly diffs T320's inputs against this row (FSN periods,
+        # the lag start, failures, filename-incomplete CIKs, the snapshot).
+        state = _index_touch_state(settings, source, now, None, {}, SimpleNamespace(listings=()))
+        seed_touch.update(
+            {
+                key: state[key]
+                for key in ("failures", "fsn_periods", "lag_start", "filename_incomplete")
+                if key in state
+            }
+        )
+
+    def write_final(conn: duckdb.DuckDBPyConnection, run_id: str) -> tuple[int, str]:
+        if (
+            index_snapshot_id(conn) != final_snapshot["id"]
+            or _writer_version(conn) != final_snapshot["writer"]
+        ):
+            raise _IndexConflict("EDGAR index changed since the fetch snapshot; retry the run")
+        source = _unwrap(recorded)
+        bind = getattr(source, "use_index", None)
+        if callable(bind):
+            bind(conn)
+        added, message = _ingest_filings(conn, settings, recorded, clock, run_id)
+        touch = _touch_after_build(settings, source, seed_touch, recorded.filename_incomplete_ciks)
+        index_run = SourceRun(
+            "edgar_index",
+            OK,
+            0,
+            _index_run_cursor(
+                settings,
+                f"{quarters[-1][0]}Q{quarters[-1][1]}" if quarters else last_partial or "",
+                _snapshot_values(list(recorded._ask("companies_snapshot"))),
+                touch,
+            ),
+            _index_run_message(settings, "index seed complete", 0),
+        )
+        _write_run(conn, uuid.uuid4().hex, now, clock(), index_run, "rebuild_index")
+        return added, message
+
+    try:
+        final = _run_source(
+            "edgar",
+            write_final,
+            settings,
+            ensure_tz_aware_utc(clock(), field_name="clock()"),
+            clock,
+            "rebuild_index",
+            dry_run,
+            mode="rebuild_index",
+            prepare=prepare_final,
+        )
+    finally:
+        release = getattr(_unwrap(filings), "release_index", None)
+        if callable(release):
+            release()
+    return IngestResult((final,))
 
 
 def _check_source_failures(source: object, *, dry_run: bool) -> None:
@@ -2549,6 +3849,7 @@ def _ingest_filings(
     restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
     restamp_window_ok: WindowEarlierOk | None = None,
+    touched_ciks: frozenset[str] | None = None,
 ) -> tuple[int, str]:
     """The EDGAR chunk: build the master, delistings, classifications and
     facts once more from the recorded answers, add what changes an as-of
@@ -2574,6 +3875,12 @@ def _ingest_filings(
     # Each run fetches only today's SEC ticker file. Stored sightings include
     # pending first observations, so a rename needs confirmation (#2295).
     earlier = stored_snapshot_history(conn, now)
+    if touched_ciks is not None:
+        earlier = tuple(
+            entry
+            for entry in earlier
+            if entry.cik in touched_ciks or entry.ticker in settings.benchmarks
+        )
     master, delistings, classes, facts, unmatched = _build_filings(
         recorded, settings, now, earlier_fetches=earlier
     )
@@ -2674,7 +3981,16 @@ def _ingest_filings(
     skip = _unjudged_ciks(recorded).ciks
     keep = frozenset(settings.master.keep_successors)  # owner-accepted (#922)
     derived = frozenset(row["security_id"] for row in master.securities)
-    found, _ = split_kept(stored_underived(conn, master, now, skip), keep, derived)
+    if touched_ciks is None:
+        found, _ = split_kept(stored_underived(conn, master, now, skip), keep, derived)
+    else:
+        all_ciks = frozenset(
+            cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+        )
+        previous = underived_as_of(conn, now).iter_rows(named=True)
+        recomputed = stored_underived(conn, master, now, skip | (all_ciks - touched_ciks))
+        complete = carry_forward_underived(recomputed, previous, touched_ciks, skip)
+        found, _ = split_kept(complete, keep, derived)
     record_underived(conn, run_id, now, found)
     message = (
         f"{len(master.securities)} securities{_provenance_clause(form4_provenance)}; "
