@@ -743,44 +743,6 @@ PINNED_COLUMNS: dict[str, tuple[str, ...]] = {
 KNOWN_DIVERGENCES: dict[
     tuple[int, str], tuple[frozenset[tuple[Any, ...]], frozenset[tuple[Any, ...]]]
 ] = {
-    # After a key-off gap, the first key-on night no longer reads the daily files of
-    # a quarter that settled during the gap; the reconcile inserts the row instead.
-    (2864, "filing_index"): (
-        frozenset(
-            {
-                (
-                    "0000000101",
-                    "0000000101-25-000005",
-                    date(2025, 12, 30),
-                    date(2026, 1, 1),
-                    3,
-                    _utc(date(2025, 12, 30), 22, 0),
-                ),
-            }
-        ),
-        frozenset(
-            {
-                (
-                    "0000000101",
-                    "0000000101-25-000005",
-                    date(2025, 12, 30),
-                    date(2025, 12, 30),
-                    0,
-                    _utc(date(2025, 12, 30), 22, 0),
-                ),
-            }
-        ),
-    ),
-    # The same gap: the incremental store never records those daily files.
-    (2864, "edgar_index_files"): (
-        frozenset(),
-        frozenset(
-            {
-                ("daily-index/2025/QTR4/form.20251230.idx",),
-                ("daily-index/2025/QTR4/form.20251231.idx",),
-            }
-        ),
-    ),
     # One night's daily re-listing and settled-quarter reconcile of one accession:
     # the nightly keeps the daily listed_on, the rebuild's quarter chunk the quarterly.
     (2859, "filing_index"): (
