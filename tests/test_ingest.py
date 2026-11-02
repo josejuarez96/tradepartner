@@ -1768,6 +1768,8 @@ def test_rebuild_index_stops_at_a_chunk_boundary_when_the_disk_floor_is_crossed(
     stopped = _run(configured, source="edgar", rebuild_index=True)
     assert [run.status for run in stopped.runs] == [FAILED]
     assert "min_free_disk_gb" in stopped.runs[0].message
+    assert "seed stopped" in stopped.runs[0].message
+    assert "ingest not started" not in stopped.runs[0].message
     assert quarters == [(2018, 1), (2018, 2)]
     with duckdb.connect(configured.store.path, read_only=True) as conn:
         rows = conn.execute(
@@ -1780,6 +1782,47 @@ def test_rebuild_index_stops_at_a_chunk_boundary_when_the_disk_floor_is_crossed(
     monkeypatch.setattr(diskfloor, "free_bytes", lambda _path: 10**15)
     assert _run(configured, source="edgar", rebuild_index=True).ok
     assert quarters[0] == (2018, 3)
+
+
+def test_rebuild_index_disk_read_error_is_a_failed_row_and_final_publish_has_a_floor(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2857: an OSError reading the disk is a FAILED result, and the step after the
+    last chunk checks the floor too."""
+    from tradepartner import diskfloor
+
+    edgar = settings.edgar.model_copy(update={"index_first_year": 2018})
+    ingest_cfg = settings.ingest.model_copy(update={"min_free_disk_gb": 5.0})
+    configured = settings.model_copy(update={"edgar": edgar, "ingest": ingest_cfg})
+    with open_for_write(configured) as conn:
+        init_schema(conn)
+
+    def broken(_path: Path) -> int:
+        raise OSError("gone")
+
+    monkeypatch.setattr(diskfloor, "free_bytes", broken)
+    result = _run(configured, source="edgar", rebuild_index=True)
+    assert [run.status for run in result.runs] == [FAILED]
+    assert "could not read free disk" in result.runs[0].message
+
+    # Plenty of disk for every chunk; the read just before the final publish is low.
+    real_stop = ingest_module._seed_floor_stop
+    phase: list[str] = []
+
+    monkeypatch.setattr(
+        diskfloor,
+        "free_bytes",
+        lambda _path: 10**9 if phase and phase[-1].startswith("before the final") else 10**15,
+    )
+
+    def spy_final(cfg: Settings, cursor: str, where: str) -> Any:
+        phase.append(where)
+        return real_stop(cfg, cursor, where)
+
+    monkeypatch.setattr(ingest_module, "_seed_floor_stop", spy_final)
+    result = _run(configured, source="edgar", rebuild_index=True)
+    assert [run.status for run in result.runs] == [FAILED]
+    assert "before the final publish" in result.runs[0].message
 
 
 def test_index_read_proxy_releases_store_before_next_fetch(

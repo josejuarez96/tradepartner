@@ -2622,6 +2622,18 @@ def _touch_after_build(
     return out
 
 
+def _seed_floor_stop(settings: Settings, cursor: str, where: str) -> IngestResult | None:
+    """A FAILED result when the disk is under the ingest floor (or unreadable) at
+    a seed step, else `None` (#2857). Writes no row, so a rerun resumes."""
+    try:
+        refusal = ingest_floor_refusal(settings, lead="seed stopped")
+    except OSError as exc:
+        refusal = f"seed stopped: could not read free disk ({type(exc).__name__})"
+    if refusal is None:
+        return None
+    return IngestResult((SourceRun("edgar_index", FAILED, 0, cursor, f"{refusal} ({where})"),))
+
+
 def _rebuild_index_session(
     settings: Settings,
     filings: FilingSource,
@@ -2664,10 +2676,8 @@ def _rebuild_index_session(
         # The seed writes about 2 GB over ~135 chunks: read the floor before each one
         # (#2841). Stopping here writes no row (the disk is low) and leaves the
         # earlier partial rows, so a rerun resumes at this quarter.
-        if not dry_run and (refusal := ingest_floor_refusal(settings)) is not None:
-            return IngestResult(
-                (SourceRun("edgar_index", FAILED, 0, cursor, f"{refusal} (before {cursor})"),)
-            )
+        if not dry_run and (stop := _seed_floor_stop(settings, cursor, f"before {cursor}")):
+            return stop
 
         def prepare_quarter(
             target: dict[str, _IndexBatch] = batches,
@@ -2711,6 +2721,8 @@ def _rebuild_index_session(
         if chunk.status != "partial":
             return IngestResult((chunk,))
 
+    if not dry_run and (stop := _seed_floor_stop(settings, "", "before the final publish")):
+        return stop
     recorded = _Recorded(filings)
     final_snapshot: dict[str, str | int | None] = {}
     seed_touch: dict[str, Any] = {}
