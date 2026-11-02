@@ -1222,12 +1222,15 @@ class _ArchiveCase:
     def manifests(self, runs: Sequence[tuple[Any, ...]]) -> list[dict[str, Any]]:
         from tradepartner.adapters.daily_index import parse_index_manifest
         from tradepartner.adapters.form4_archive import message_digest
-        from tradepartner.store import raw_archive
+        from tradepartner.store.raw_archive import manifest_path
 
         out = []
         for run_id, _mode, _started, message in runs:
             if (digest := message_digest(message)) is not None:
-                manifest = parse_index_manifest(raw_archive.read_manifest(self.settings, digest))
+                # read from disk: `hundred_nights` keeps `read_manifest` patched
+                body = manifest_path(self.root, digest).read_bytes()
+                assert _sha(body) == digest
+                manifest = parse_index_manifest(body)
                 assert manifest["writer"]["run_id"] == run_id
                 out.append(manifest)
         return out
@@ -1413,6 +1416,116 @@ def test_a_later_fetch_is_invisible_to_a_store_truncated_before_it(
         [SECOND, cut],
     )
     assert rows == [(REPOST,)]
+
+
+def test_quarterly_and_pending_quarterly_rows_are_left_out_of_every_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The snapshot exception: a settled quarter's `form.idx` row, and one still
+    pending from it, map to no daily entry. A daily row pending one night maps to
+    its own file's entry once stamped. A dry run
+    keeps nothing and names no digest."""
+    from tradepartner.adapters.daily_index import find_index_entry, index_key
+    from tradepartner.adapters.form4_archive import ProvenanceError, message_digest, row_digest
+
+    case = _archive_case(tmp_path, monkeypatch)
+    old, late, held = f"{LAMBDA}-25-000009", f"{LAMBDA}-25-000010", f"{LAMBDA}-26-000003"
+    stamp = _eastern(date(2026, 3, 3), 12)
+    extra = [
+        _Filing(
+            LAMBDA,
+            "Lambda Corp",
+            "10-Q",
+            old,
+            _eastern(date(2025, 11, 3), 17),
+            date(2025, 11, 3),
+            None,
+            appears=_eastern(date(2025, 11, 3), 22),
+        ),
+        _Filing(
+            LAMBDA,
+            "Lambda Corp",
+            "8-K",
+            late,
+            _eastern(date(2025, 12, 1), 17),
+            date(2025, 12, 1),
+            None,
+            appears=_eastern(date(2025, 12, 1), 22),
+            stamp_from=stamp,
+        ),
+        _Filing(
+            LAMBDA,
+            "Lambda Corp",
+            "8-K",
+            held,
+            _eastern(date(2026, 3, 2), 18),
+            date(2026, 3, 2),
+            date(2026, 3, 2),
+            stamp_from=stamp,
+        ),
+    ]
+    case.sec = _Sec(
+        [*case.sec.filings, *extra],
+        case.sec.issuers,
+        fsn=case.sec.fsn,
+        reposts=case.sec.reposts,
+    )
+    case.settings = _with(case.settings, index_first_year=2025)
+    case.sec.now = _night(date(2026, 3, 2))
+    source = _SimSource(case.settings, case.sec)
+    try:
+        dry = ingest_session(
+            case.settings,
+            prices=_NoPrices(),
+            filings=source,
+            source="edgar",
+            clock=lambda: case.sec.now,
+            rebuild_index=True,
+            dry_run=True,
+        )
+    finally:
+        source.close()
+    assert dry.ok and all(message_digest(run.message) is None for run in dry.runs)
+    assert case.bodies() == set() and not (case.root / "manifests").exists()
+    case.night(2, rebuild=True)
+    pending = _rows(case.settings, "SELECT accession FROM filing_index_pending ORDER BY 1")
+    assert pending == [(late,), (held,)]
+    case.night(3)
+    runs = case.runs()
+    assert "index_unattributed: 0" in runs[-1][3]
+    manifests = case.manifests(runs)
+    with duckdb.connect(case.settings.store.path, read_only=True) as conn:
+        conn.execute("SET TimeZone='UTC'")
+        cursor = conn.execute("SELECT * FROM filing_index")
+        columns = [item[0] for item in cursor.description]
+        stored = {
+            r["accession"]: r
+            for r in (dict(zip(columns, v, strict=True)) for v in cursor.fetchall())
+        }
+
+    def entry(accession: str) -> Mapping[str, Any]:
+        row = stored[accession]
+        return find_index_entry(
+            manifests,
+            mode="session",
+            listed_on=row["listed_on"],
+            key=index_key(row),
+            digest=row_digest(row),
+        )[1]
+
+    assert late not in stored
+    for accession in (old,):
+        for mode in ("session", "rebuild_index"):
+            row = stored[accession]
+            with pytest.raises(ProvenanceError):
+                find_index_entry(
+                    manifests,
+                    mode=mode,
+                    listed_on=row["listed_on"],
+                    key=index_key(row),
+                    digest=row_digest(row),
+                )
+    assert entry(held)["file_date"] == "2026-03-02"
 
 
 # --- the memory bound ----------------------------------------------------------

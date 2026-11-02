@@ -1596,6 +1596,17 @@ class _IndexBatch:
     provenance: _IndexProvenance | None = None
 
 
+_DAILY_LINE = re.compile(rb"\b(\d{8})\s+edgar/data/(\d+)/([\d-]+)\.txt")
+
+
+def _daily_listed(body: bytes) -> frozenset[tuple[str, str, str]]:
+    """The (CIK without zeros, accession, YYYYMMDD filed date) a daily body lists."""
+    return frozenset(
+        (cik.decode(), accession.decode(), filed.decode())
+        for filed, cik, accession in _DAILY_LINE.findall(body)
+    )
+
+
 class _IndexProvenance:
     """One `edgar_index` writer run's daily index retention and manifest (plan
     T347; spec amendment #2714 item 1).
@@ -1606,17 +1617,24 @@ class _IndexProvenance:
     refused (rerun). The archive is write-only here: nothing reads it back.
     `finish`, under the writer's lock, enters every kept file and the
     `filing_index` rows each wrote, archives the manifest and fixes its digest
-    before the run row cites it. A written row whose daily file was read by an
-    earlier run (a pending row stamped now) cites that file's stored hash. A
-    quarterly `form.idx` is not entered (ADR 0028's snapshot exception). A dry
-    run keeps and writes nothing and its message names no digest."""
+    before the run row cites it. A written row is entered under the daily file
+    its `listed_on` names only if that body lists it (CIK, accession, filed
+    date): a body kept this run, or, for a pending row stamped now, the cached
+    body whose hash the store recorded and the archive holds. Any other row
+    (a quarterly `form.idx` row, ADR 0028's snapshot exception, or a pending
+    row first listed there) is left out and counted `index_unattributed`, so a
+    re-derive refuses it. A dry run keeps and writes nothing and its message
+    names no digest."""
 
     def __init__(self, settings: Settings, *, dry_run: bool) -> None:
         self.settings = settings
         self.dry_run = dry_run
         self.kept: dict[str, RawInput] = {}
+        #: Each kept body's listed (CIK, accession, filed date), to check attribution.
+        self.listed: dict[str, frozenset[tuple[str, str, str]]] = {}
         self.before: set[tuple[Any, ...]] = set()
         self.digest: str | None = None
+        self.unattributed = 0
 
     @classmethod
     def start(cls, settings: Settings, *, dry_run: bool) -> _IndexProvenance | None:
@@ -1638,6 +1656,7 @@ class _IndexProvenance:
             raw_archive.archive_body(self.settings, body)
         url, fetched_at = edgar_raw.daily_index_fetch(path, sha256)
         self.kept[file.path] = RawInput(sha256, url, fetched_at, DAILY_PARSER_VERSION)
+        self.listed[file.path] = _daily_listed(body)
 
     @staticmethod
     def _rows(conn: duckdb.DuckDBPyConnection, listings: Sequence[Any]) -> list[dict[str, Any]]:
@@ -1665,6 +1684,30 @@ class _IndexProvenance:
         rows = self._rows(conn, listings)
         self.before = {(r["cik"], r["accession"], r["known_at"]) for r in rows}
 
+    def _earlier(self, conn: duckdb.DuckDBPyConnection, path: str) -> RawInput | None:
+        """The body an earlier run read for `path`: its stored hash, if the local
+        cache still holds those bytes and the archive holds that hash (a stat,
+        never a read). Notes what it lists; `None` if any part is missing."""
+        from tradepartner.adapters import daily_index as di
+        from tradepartner.adapters import edgar_raw
+
+        stored = conn.execute("SELECT sha256 FROM edgar_index_files WHERE path = ?", [path])
+        found = stored.fetchone()
+        day = di.file_date(path.rsplit("/", 1)[-1])
+        cached = edgar_raw.daily_index_file_path(
+            day.year, (day.month - 1) // 3 + 1, path.rsplit("/", 1)[-1], settings=self.settings
+        )
+        if found is None or not cached.is_file():
+            return None
+        body = cached.read_bytes()
+        if hashlib.sha256(body).hexdigest() != found[0]:
+            return None
+        if not self.dry_run and not raw_archive.is_archived(self.settings, found[0]):
+            return None
+        self.listed[path] = _daily_listed(body)
+        url, fetched_at = edgar_raw.daily_index_fetch(cached, found[0])
+        return RawInput(found[0], url, fetched_at, di.DAILY_PARSER_VERSION)
+
     def finish(
         self,
         conn: duckdb.DuckDBPyConnection,
@@ -1681,31 +1724,30 @@ class _IndexProvenance:
         for path, raw in self.kept.items():
             if recorded.get(path, raw.sha256) != raw.sha256:
                 raise RuntimeError(f"daily index {path} changed after it was kept; rerun")
-        daily = {
-            (r.cik, r.accession, r.listed_on, r.filed_on, r.form, r.company_name)
-            for r in listings
-            if r.is_daily
-        }
+        daily = {(r.cik, r.accession, r.listed_on) for r in listings if r.is_daily}
         by_path: dict[str, list[dict[str, Any]]] = {path: [] for path in self.kept}
+        earlier: dict[str, RawInput | None] = {}
+        self.unattributed = 0
         for row in self._rows(conn, listings):
             if (row["cik"], row["accession"], row["known_at"]) in self.before:
                 continue
-            content = (row["cik"], row["accession"], row["listed_on"], row["filed_on"])
-            if (*content, row["form"], row["company_name"]) in daily:
-                by_path.setdefault(di.daily_path(row["listed_on"]), []).append(row)
+            if (row["cik"], row["accession"], row["listed_on"]) not in daily:
+                continue  # a quarterly form.idx row: the snapshot exception
+            path = di.daily_path(row["listed_on"])
+            if path not in self.kept and path not in earlier:
+                earlier[path] = self._earlier(conn, path)
+            listed = (str(int(row["cik"])), row["accession"], f"{row['filed_on']:%Y%m%d}")
+            if (path in self.kept or earlier[path] is not None) and listed in self.listed[path]:
+                by_path.setdefault(path, []).append(row)
+            else:
+                self.unattributed += 1
         entries = []
         for path, rows in sorted(by_path.items()):
-            kept = self.kept.get(path)
-            if kept is not None:
-                raw = kept
-            else:  # read by an earlier run: its stored hash
-                stored = conn.execute(
-                    "SELECT sha256 FROM edgar_index_files WHERE path = ?", [path]
-                ).fetchone()
-                if stored is None:
-                    raise RuntimeError(f"a written daily index row's file {path} has no hash")
-                raw = RawInput(stored[0], di.SEC_ARCHIVES + path, None, di.DAILY_PARSER_VERSION)
-            entries.append(di.index_entry(path=path, raw=raw, parsed=path in self.kept, rows=rows))
+            source_raw = self.kept.get(path) or earlier[path]
+            assert source_raw is not None
+            entries.append(
+                di.index_entry(path=path, raw=source_raw, parsed=path in self.kept, rows=rows)
+            )
         body = di.build_index_manifest(run_id=run_id, mode=mode, entries=entries)
         if self.dry_run:
             self.digest = None
@@ -2200,9 +2242,10 @@ def _write_index_state(
         index_refused=numbers.get("index_refused", 0) + counts.changed,
         index_stale_listing=numbers.get("index_stale_listing", 0) + counts.stale,
     )
-    message = "; ".join(f"{key}: {value}" for key, value in sorted(numbers.items()))
     if batch.provenance is not None:
         batch.provenance.finish(conn, proposal.listings, batch.files, run_id=run_id, mode=mode)
+        numbers["index_unattributed"] = batch.provenance.unattributed
+    message = "; ".join(f"{key}: {value}" for key, value in sorted(numbers.items()))
     return counts.added + counts.revised, message
 
 

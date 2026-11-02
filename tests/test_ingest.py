@@ -10536,3 +10536,72 @@ def test_incremental_rotation_ignores_retracted_and_superseded_stored_rows(
         "SELECT message FROM ingestion_runs WHERE source = 'edgar_index' ORDER BY rowid"
     )[-1][0]
     assert "incremental_drift: 0" in message
+
+
+# --- T347 (#2714): daily index provenance attribution --------------------------
+
+
+def test_index_manifest_credits_a_stamped_pending_row_only_to_a_body_that_lists_it(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pending row comes back with `is_daily` set whatever its first listing.
+    It is entered under an earlier run's daily file only if that cached body,
+    with the stored hash and held in the archive, lists it; a row whose date has
+    no daily file (first listed in a quarterly `form.idx`) or whose body does not
+    list it is counted `index_unattributed`, never a failed run."""
+    from pydantic import SecretStr
+
+    from tradepartner import diskfloor
+    from tradepartner.adapters import edgar_raw
+    from tradepartner.adapters.daily_index import parse_index_manifest
+    from tradepartner.store import filing_index as stored_index
+    from tradepartner.store import raw_archive
+
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _path: 10**15)
+    root = (tmp_path / "archive").resolve()
+    root.mkdir()
+    configured = settings.model_copy(
+        update={
+            "edgar": settings.edgar.model_copy(update={"cache_dir": str(tmp_path / "edgar")}),
+            "tradepartner_raw_archive": SecretStr(str(root)),
+        }
+    )
+    now = datetime(2026, 1, 9, 4, tzinfo=UTC)
+    cik = "0000009999"
+    body = f"10-K  New Corp  9999  20260105    edgar/data/9999/{cik}-26-000001.txt\n".encode()
+    cached = edgar_raw.daily_index_file_path(2026, 1, "form.20260105.idx", settings=configured)
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(body)
+    digest = raw_archive.archive_body(configured, body).sha256
+
+    def listing(n: int, filed: date, listed: date) -> stored_index.Listing:
+        accepted = datetime.combine(filed, datetime.min.time(), UTC)
+        return stored_index.Listing(
+            cik, f"{cik}-26-00000{n}", "10-K", "New Corp", filed, accepted, listed, True, 0
+        )
+
+    listed = listing(1, date(2026, 1, 5), date(2026, 1, 5))  # in the cached body
+    unlisted = listing(2, date(2026, 1, 5), date(2026, 1, 5))  # same file, not in it
+    quarterly = listing(3, date(2025, 12, 1), date(2026, 1, 4))  # a Sunday: no daily file
+    rows = [listed, unlisted, quarterly]
+    provenance = ingest_module._IndexProvenance(configured, dry_run=False)
+    with open_for_write(configured) as conn:
+        init_schema(conn)
+        conn.execute(
+            "INSERT INTO edgar_index_files (path, last_modified, size, sha256, run_id) "
+            "VALUES (?, ?, ?, ?, 'earlier')",
+            ["daily-index/2026/QTR1/form.20260105.idx", now, len(body), digest],
+        )
+        provenance.mark(conn, rows)
+        stored_index.insert_listings(conn, rows, now)
+        provenance.finish(conn, rows, (), run_id="night", mode="session")
+    assert provenance.unattributed == 2
+    assert provenance.digest is not None
+    manifest = parse_index_manifest(raw_archive.read_manifest(configured, provenance.digest))
+    [entry] = manifest["entries"]
+    assert (entry["file_date"], entry["raw_sha256"], entry["parsed"]) == (
+        "2026-01-05",
+        digest,
+        False,
+    )
+    assert [row["key"][1] for row in entry["rows"]] == [listed.accession]
