@@ -617,7 +617,10 @@ def _in_submit_window(context: StepContext) -> bool:
             if note not in context.notes:
                 context.notes.append(note)
             return True
-        context.notes.append("sandbox: outside market hours; nothing submitted")
+        context.notes.append(
+            f"sandbox: outside market hours (window [{start.isoformat()}, {end.isoformat()}]);"
+            " nothing submitted"
+        )
         return False
     start, end = submit_window(context.settings, context.session)
     if start <= now <= end:

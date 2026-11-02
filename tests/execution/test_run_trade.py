@@ -1268,3 +1268,47 @@ def test_a_stop_run_with_an_ambiguous_held_residue_still_exits_the_other_names(
     assert exited == {"SEC_SPLIT_FUTURE": "window_stop", "SEC_TRANSFER": "window_stop"}
     assert message is not None and "DUALB -> DUALBX" in message
     assert "DUALB" in env.held()
+
+
+# --- the sandbox window before the open (paper spec amendment 2026-11-01 item 2, T371) ---
+
+
+def _sandbox_run_env(env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[datetime]:
+    """The run test's env as book `sandbox` on a marked copy; returns the submit times."""
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(env.settings).write_text("")
+    env.settings = env.settings.model_copy(
+        update={"paper": env.settings.paper.model_copy(update={"book_id": "sandbox"})}
+    )
+    env.open_window(tmp_path=tmp_path)
+    submitted_at: list[datetime] = []
+    original = env.fake.submit
+
+    def record(request: OrderRequest) -> Any:
+        submitted_at.append(env.clock.now)
+        return original(request)
+
+    monkeypatch.setattr(env.fake, "submit", record)
+    return submitted_at
+
+
+def test_the_sandbox_run_submits_before_the_open_inside_its_window(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    submitted_at = _sandbox_run_env(env, tmp_path, monkeypatch)
+    outcome = env.run(at(F_0, 13, 0))  # 30 minutes before the open
+    assert outcome.status == "ok"
+    assert submitted_at and all(stamp < session_open(F_0) for stamp in submitted_at)
+    assert "sandbox: submit window skipped" in outcome.notes
+
+
+def test_the_sandbox_run_still_refuses_before_its_window(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    submitted_at = _sandbox_run_env(env, tmp_path, monkeypatch)
+    before = env.settings.paper.submit_window_before_open_minutes
+    assert before == 90
+    outcome = env.run(at(F_0, 11, 59))  # 91 minutes before the 13:30 UTC open
+    assert outcome.status == "ok"
+    assert submitted_at == []
+    assert any("outside market hours" in note for note in outcome.notes)

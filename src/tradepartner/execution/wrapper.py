@@ -756,14 +756,26 @@ class _Opened:
     band: PriceBand | None = None
 
 
-def _long_only(window: PaperWindowRow) -> bool:
-    """Whether the window freezes `portfolio.side` long-only (absent means
-    long-only, as `report` reads it). Unparseable means not (fail closed: no (i'))."""
+def _frozen_side(window: PaperWindowRow) -> str | None:
+    """The window's frozen `portfolio.side` (absent means `long_only`, as `report`
+    reads it), or None when `frozen_json` is not a JSON object."""
     try:
         frozen = json.loads(window.frozen_json)
     except ValueError:
-        return False
-    return isinstance(frozen, dict) and frozen.get("portfolio.side", "long_only") == "long_only"
+        return None
+    return str(frozen.get("portfolio.side", "long_only")) if isinstance(frozen, dict) else None
+
+
+def _long_only(window: PaperWindowRow) -> bool:
+    """Whether phase (i') may run: the window is long-only. Unparseable means not
+    (fail closed: no (i'))."""
+    return _frozen_side(window) == "long_only"
+
+
+def _halts_on_negative_cash(window: PaperWindowRow) -> bool:
+    """Whether item 2's `negative_cash` halt applies: every window but a
+    `long_short` one (fail closed: an unparseable window halts)."""
+    return _frozen_side(window) != "long_short"
 
 
 def _refuse_negative_cash(account: Account, where: str) -> None:
@@ -1207,7 +1219,7 @@ class RiskGatedBroker:
         account = self._broker.account()
         if self._variant is not None:
             self._variant.saw(account.cash)
-            if _long_only(book.window):
+            if _halts_on_negative_cash(book.window):
                 _refuse_negative_cash(account, "phase (ii)")
         cash = self._buys_cash(account, book, run.session)
         if self._variant is not None:

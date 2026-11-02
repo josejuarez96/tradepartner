@@ -432,6 +432,10 @@ def test_long_only_reads_the_frozen_side() -> None:
     assert wrapper._long_only(window('{"portfolio.side": "long_only"}'))
     assert not wrapper._long_only(window('{"portfolio.side": "long_short"}'))
     assert not wrapper._long_only(window("not json"))
+    # The negative-cash halt fails closed: only a long_short window floors instead.
+    assert wrapper._halts_on_negative_cash(window("not json"))
+    assert wrapper._halts_on_negative_cash(window("{}"))
+    assert not wrapper._halts_on_negative_cash(window('{"portfolio.side": "long_short"}'))
 
 
 @pytest.mark.parametrize("timing", ["at_open", "after_sells"])
@@ -456,7 +460,7 @@ _SUBSETS = [s for n in range(3) for s in itertools.combinations((A, C), n)]
 
 
 @pytest.mark.parametrize("unfilled", _SUBSETS, ids=lambda s: "+".join(s) or "none")
-@pytest.mark.parametrize("seed", range(3))
+@pytest.mark.parametrize("seed", range(4))
 def test_the_open_tranche_never_takes_the_cash_below_zero(
     timed_env: Env,
     alerter_conn: duckdb.DuckDBPyConnection,
@@ -469,12 +473,14 @@ def test_the_open_tranche_never_takes_the_cash_below_zero(
     env = timed_env
     rng = random.Random(seed)
     _mapped(env)
-    env.new_fake(cash=2000.0 + rng.uniform(1.0, 400.0))  # B = cash - 2000 held
+    env.new_fake(cash=2000.0 + rng.uniform(1.0, 400.0))  # the holds below spend 2000
     _hold(env, A, 10.0)
     _hold(env, C, 10.0)
     budget = Decimal(repr(env.fake.account().cash))
     sells = [_decision(env, sid, "sell", notional=500.0) for sid in (A, C)]
-    buy = _decision(env, B, "buy", notional=round(float(budget) * rng.uniform(0.5, 1.5), 2))
+    # Even seeds draw a buy inside the cash already held, odd ones one above it.
+    factor = rng.uniform(0.3, 0.95) if seed % 2 == 0 else rng.uniform(1.05, 1.5)
+    buy = _decision(env, B, "buy", notional=round(float(budget) * factor, 2))
     for sid in (A, C):
         env.fake.script(Accept() if sid in unfilled else FillAt())
     env.fake.script(FillAt())
@@ -491,4 +497,7 @@ def test_the_open_tranche_never_takes_the_cash_below_zero(
     # real cash in it (item 2, "No proceeds"); one left live adds nothing.
     assert Decimal(repr(fields["open_notional"])) <= Decimal(repr(fields["idle_cash"]))
     if set(unfilled) == {A, C}:
+        # No sell filled: B is the cash held before the run, and a buy that fits
+        # it is still sent before the open; one that does not waits for (ii).
         assert Decimal(repr(fields["idle_cash"])) == budget
+        assert fields["open_buys"] == (1 if seed % 2 == 0 else 0)
