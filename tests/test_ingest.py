@@ -116,6 +116,7 @@ from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.filing_index import FilingRow
 from tradepartner.store.filing_index import by_cik as stored_index_by_cik
 from tradepartner.store.master import Chain, MasterBuild, build_chains, build_master
+from tradepartner.store.retraction import retraction
 from tradepartner.store.schema import init_schema
 
 
@@ -10453,3 +10454,42 @@ def test_sec_forms_run_cites_its_manifest_and_rows_map_by_run_not_by_stamp(
         )
         assert run_id == writer_id and entry["quarter"] == "2018q4"
         assert entry["raw_sha256"] in {z["sha256"] for z in manifest["zips"]}
+
+
+def test_incremental_rotation_ignores_retracted_and_superseded_stored_rows(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#2840: the drift check compares the as-of current rows, so a retracted
+    listing and an older revision of a key are not drift."""
+    edgar = settings.edgar.model_copy(update={"index_first_year": 2018, "verify_rotation_days": 1})
+    configured = settings.model_copy(update={"edgar": edgar})
+    with open_for_write(configured) as conn:
+        init_schema(conn)
+    source = _filings()
+    assert _run(configured, filings=source, source="edgar", rebuild_index=True).ok
+    with open_for_write(configured) as conn:
+        live = conn.execute(
+            "SELECT * FROM listings WHERE security_id = ? ORDER BY known_at", [ACME]
+        ).fetchall()
+        columns = [item[0] for item in conn.description]
+        row = dict(zip(columns, live[0], strict=True))
+        stale = {**row, "ticker": "OLDX", "known_at": row["known_at"] - timedelta(days=1)}
+        stale["ingested_at"] = stale["known_at"]
+        insert_row(conn, "listings", stale)
+        insert_row(conn, "listings", retraction(stale, row["known_at"]))
+        older = {
+            **row,
+            "class_title": "Older Title",
+            "known_at": row["known_at"] - timedelta(days=2),
+        }
+        older["ingested_at"] = older["known_at"]
+        insert_row(conn, "listings", older)
+    enabled = configured.model_copy(
+        update={"edgar": edgar.model_copy(update={"incremental_index": True})}
+    )
+    result = _run(enabled, filings=source, source="edgar")
+    assert result.ok, result.runs[0].message
+    message = read(
+        "SELECT message FROM ingestion_runs WHERE source = 'edgar_index' ORDER BY rowid"
+    )[-1][0]
+    assert "incremental_drift: 0" in message
