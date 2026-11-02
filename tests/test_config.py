@@ -3735,3 +3735,51 @@ def test_events_form4_compare_keys_refuse_nonsense() -> None:
     ):
         with pytest.raises(ValueError):
             Settings(_env_file=None, events=bad)
+
+
+def test_paper_execution_defaults_and_opg_cutoff() -> None:
+    s = _settings()
+    assert s.paper.execution == {}
+    assert s.alpaca.opg_cutoff_minutes_before_open == 3
+
+
+def test_opg_cutoff_below_two_refused() -> None:
+    with pytest.raises(ValidationError):
+        Settings(alpaca={"opg_cutoff_minutes_before_open": 1})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"buy_timing": "alternate"},
+        {"buy_timing": "alternate", "alternate_start": "2026-11-26"},
+        {"buy_timing": "at_open", "alternate_start": "2026-11-23"},
+        {"cash_sleeve_fraction": 0.11},
+        {"cash_sleeve_fraction": -0.01},
+        {"auction": "closing"},
+        {"auction": "opening"},
+    ],
+)
+def test_paper_execution_entry_refused(entry: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(paper={"execution": {"daily": entry}})  # type: ignore[arg-type]
+
+
+def test_paper_execution_key_must_be_book_token() -> None:
+    with pytest.raises(ValidationError, match="book tokens"):
+        Settings(paper={"execution": {"da-ily": {}}})  # type: ignore[arg-type]
+
+
+def test_paper_execution_valid_alternate_accepted() -> None:
+    s = Settings(
+        paper={  # type: ignore[arg-type]
+            "execution": {
+                "daily": {
+                    "buy_timing": "alternate",
+                    "alternate_start": "2026-11-23",
+                    "cash_sleeve_fraction": 0.05,
+                }
+            }
+        }
+    )
+    assert s.paper.execution["daily"].alternate_start == date(2026, 11, 23)
