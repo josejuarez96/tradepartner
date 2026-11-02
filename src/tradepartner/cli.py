@@ -1131,9 +1131,11 @@ _LEVEL_METRICS = ("cagr", "sharpe_annual", "excess_cagr_spy", "max_drawdown", "c
 
 def _close_source(source: object) -> None:
     """Release a store connection a filing source opened, when it has one."""
-    close = getattr(source, "close", None)
-    if callable(close):
-        close()
+    try:
+        close = source.close  # type: ignore[attr-defined]
+    except AttributeError:
+        return  # a fixture source holds no store handle
+    close()
 
 
 def _scrubbed(text: str, settings: Settings) -> str:
