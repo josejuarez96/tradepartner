@@ -64,15 +64,9 @@ def _is_named_constant(node: ast.expr) -> bool:
 
 
 def _filters_fact_name(func: ast.AST) -> bool:
-    """Whether `func` has `<...col("fact_name")...>.is_in(<named constant>)` or a
-    SQL `fact_name IN` string."""
+    """Whether `func` has `<...col("fact_name")...>.is_in(<allowed constant>)`. A SQL
+    `fact_name IN` string does not count: no scanned module reads the table in SQL."""
     for node in ast.walk(func):
-        if (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and re.search(r"\bfact_name\s+IN\b", node.value, re.IGNORECASE)
-        ):
-            return True
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -88,7 +82,26 @@ def _filters_fact_name(func: ast.AST) -> bool:
     return False
 
 
+def _table_name_values(func: ast.AST) -> bool:
+    """Whether `func` binds or passes the bare table name `"statement_facts"` (a
+    variable or an argument), as `table = "statement_facts"` then a query on it. A
+    tuple element, as the engine's provider read keys, is a label, not a read."""
+    for node in ast.walk(func):
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign | ast.AnnAssign):
+            value = node.value
+        elif isinstance(node, ast.Call):
+            for arg in node.args:
+                if isinstance(arg, ast.Constant) and arg.value == "statement_facts":
+                    return True
+        if isinstance(value, ast.Constant) and value.value == "statement_facts":
+            return True
+    return False
+
+
 def _reads_statement_facts(func: ast.AST) -> bool:
+    if _table_name_values(func):
+        return True
     for node in ast.walk(func):
         if isinstance(node, ast.Call):
             callee = node.func
@@ -162,5 +175,13 @@ def test_the_scan_fails_on_a_planted_unfiltered_read() -> None:
     assert unfiltered_readers(named) == []
     other = named.replace("STATEMENT_FACT_NAMES", "NEW_NAMES")
     assert unfiltered_readers(other) == ["read"]
+    planted_sql = (
+        "def read(c):\n"
+        "    sql = \"SELECT * FROM statement_facts WHERE fact_name IN ('eps_diluted')\"\n"
+        "    return c.execute(sql)\n"
+    )
+    assert unfiltered_readers(planted_sql) == ["read"]
+    variable = 'def read(c):\n    table = "statement_facts"\n    return c.execute(table)\n'
+    assert unfiltered_readers(variable) == ["read"]
     join = 'def read(c):\n    return c.execute("SELECT * FROM x JOIN statement_facts f ON 1")\n'
     assert unfiltered_readers(join) == ["read"]
