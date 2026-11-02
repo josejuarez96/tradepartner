@@ -1797,10 +1797,29 @@ def _prepare_index(
     quarterly_files: list[tuple[str, datetime, int, str]] = []
     if isinstance(source, EdgarFilingSource):
         quarters = _index_quarters(settings.edgar.index_first_year, now)
+        with open_read_only(settings, retry=True) as conn:
+            last = conn.execute(
+                "SELECT finished_at FROM ingestion_runs WHERE source = 'edgar_index' "
+                "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
         for year, number in quarters:
             if quarter_filter is not None and (year, number) > quarter_filter:
                 continue
             if source._settled((year, number), now):
+                # #2864: a quarter that settled since the last ok index run (a
+                # key-off gap) still owes its daily files, which a nightly
+                # run would have read before the quarter settled.
+                if (
+                    quarter_filter is None
+                    and last is not None
+                    and not source._settled((year, number), last[0])
+                ):
+                    listing = edgar_raw.daily_index_listing(
+                        year, number, settings=settings, client=source._client
+                    )
+                    daily.extend(
+                        _daily_cursor(file) for file in parse_daily_listing(listing, year, number)
+                    )
                 if quarter_filter is not None and (year, number) != quarter_filter:
                     continue  # the new-issuer walk uses this quarter's cached copy
                 path, changed = edgar_raw.cached_quarterly_index(
@@ -1828,11 +1847,6 @@ def _prepare_index(
                     _daily_cursor(file) for file in parse_daily_listing(listing, year, number)
                 )
         if quarter_filter is None:
-            with open_read_only(settings, retry=True) as conn:
-                last = conn.execute(
-                    "SELECT finished_at FROM ingestion_runs WHERE source = 'edgar_index' "
-                    "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
-                ).fetchone()
             chosen = select_quarters(
                 now=now,
                 last_ok_run_at=None if last is None else last[0],
