@@ -519,7 +519,9 @@ def _risk_table(card: headroom.Headroom) -> pl.DataFrame:
     )
 
 
-def _risk_card(conn: duckdb.DuckDBPyConnection, window: journal.PaperWindowRow) -> None:
+def _risk_card(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, window: journal.PaperWindowRow
+) -> None:
     """The Risk card (plan T260): each limit the run enforces, the window's
     frozen value, the headroom left and what crossing it does
     (`execution.headroom`). An unreadable mark or `frozen_json` shows its
@@ -527,7 +529,7 @@ def _risk_card(conn: duckdb.DuckDBPyConnection, window: journal.PaperWindowRow) 
     with st.container(border=True):
         st.subheader("Risk")
         try:
-            card = headroom.read(conn, window)
+            card = headroom.read(conn, window, settings)
         except ValueError as exc:  # UnreadableMarkError is a ValueError
             theme.status_badge("Risk limits unreadable", "critical")
             st.caption(str(exc))
@@ -602,7 +604,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
     _kpis(data)
     if message := paper_message.owner_message(data.last_run_message):
         st.caption(f"Last run: {message}")
-    _risk_card(conn, data.window)
+    _risk_card(conn, settings, data.window)
     if data.open_orders_count and data.last_run_kind == "rebalance":
         st.info("Fills are recorded at the next scheduled run")
     symbols = _symbols(conn, data)

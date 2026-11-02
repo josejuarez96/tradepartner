@@ -80,6 +80,7 @@ from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -602,13 +603,33 @@ def daily_index_file(
     if not dest.is_file() or old != body:
         write_atomic(dest, body)
     stat = dest.stat()
+    fetch = {  # plan T347: the URL and UTC fetch time of these exact bytes
+        "url": str(response.url),
+        "fetched_at": datetime.now(UTC).isoformat(),
+        "sha256": hashlib.sha256(body).hexdigest(),
+    }
     write_atomic(
         sidecar,
         json.dumps(
-            {**cursor, "body_size": stat.st_size, "body_mtime_ns": stat.st_mtime_ns}
+            {**cursor, **fetch, "body_size": stat.st_size, "body_mtime_ns": stat.st_mtime_ns}
         ).encode(),
     )
     return dest
+
+
+def daily_index_fetch(path: Path, sha256: str) -> tuple[str | None, datetime | None]:
+    """The URL and UTC fetch time `daily_index_file` recorded for the cached daily
+    file at `path` whose SHA-256 is `sha256` (plan T347), or `(None, None)` for a
+    file cached before that, an unreadable record, or a record of other bytes."""
+    try:
+        record = json.loads(path.with_name(f"{path.name}.listing.json").read_text())
+        url, at = record["url"], datetime.fromisoformat(record["fetched_at"])
+        recorded = record["sha256"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, None
+    if not isinstance(url, str) or at.utcoffset() is None or recorded != sha256:
+        return None, None
+    return url, at.astimezone(UTC)
 
 
 def cached_daily_index_files(
@@ -1013,6 +1034,31 @@ def _validators_path(dest: Path) -> Path:
     """The sidecar beside a cached bulk zip holding its response validators
     and size (#2594); kept next to the file, never in the store."""
     return dest.with_name(f"{dest.name}.validators.json")
+
+
+def bulk_built_at(dest: Path) -> datetime | None:
+    """When the cached bulk archive at `dest` was built, as tz-aware UTC: its
+    sidecar's `Last-Modified` (#2594) while the sidecar's size and mtime bind
+    it to the file, else the file's mtime (written after SEC built it); `None`
+    with no file."""
+    try:
+        stat = dest.stat()
+    except OSError:
+        return None
+    try:
+        sidecar = json.loads(_validators_path(dest).read_text())
+        if (
+            isinstance(sidecar, dict)
+            and sidecar.get("size") == stat.st_size
+            and sidecar.get("mtime_ns") == stat.st_mtime_ns
+            and isinstance(sidecar.get("last_modified"), str)
+        ):
+            built = parsedate_to_datetime(sidecar["last_modified"])
+            if built.tzinfo is not None:
+                return built.astimezone(UTC)
+    except (OSError, ValueError, TypeError, RecursionError):
+        pass
+    return datetime.fromtimestamp(stat.st_mtime, UTC)
 
 
 def _conditional_headers(dest: Path, *, archive_kind: str = "zip") -> dict[str, str]:

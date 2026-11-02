@@ -82,6 +82,7 @@ def test_items_come_out_most_urgent_first() -> None:
     kinds = [n.kind for n in home_view._needs_you(items, (late,))]
     assert kinds == [
         "kill_switch_engaged",
+        "reconcile_break",
         "order_lagging",
         "overdue_delisting",
         "missed_run",
@@ -122,12 +123,39 @@ def _summary(book: str = "main", *, engaged: bool = False, **over: Any) -> Any:
         "last_run_session": date(2026, 10, 2),
         "last_run_status": "ok",
         "window": SimpleNamespace(first_rebalance_session=date(2026, 9, 30)),
+        "restricted": (),
     }
     return SimpleNamespace(**{**fields, **over})
 
 
-def _need(kind: str) -> home_view.NeedsYou:
-    return home_view.NeedsYou("main", kind, "t", "s.", "a")
+def _need(kind: str, *, aged: bool = False) -> home_view.NeedsYou:
+    return home_view.NeedsYou("main", kind, "t", "s.", "a", aged=aged)
+
+
+def test_an_open_break_is_amber_and_says_the_book_is_not_halted() -> None:
+    # #2266 item 12: a book with only breaks is restricted, not halted
+    line = home_view._status(Settings(_env_file=None), (_summary(),), (_need("reconcile_break"),))
+    assert line.level == "amber"
+    assert "restricted" in line.text and "not halted" in line.text
+
+
+def test_an_aged_break_turns_the_status_line_red_without_calling_the_book_halted() -> None:
+    needs = (_need("reconcile_break", aged=True),)
+    line = home_view._status(Settings(_env_file=None), (_summary(),), needs)
+    assert line.level == "red" and "halted" not in line.text.replace("not halted", "")
+
+
+def test_an_aged_break_item_carries_aged_and_the_true_up_command() -> None:
+    item = WaitingItem(
+        book_id="daily",
+        kind="reconcile_break",
+        since=date(2026, 10, 1),
+        detail="RAW DETAIL",
+        command='tradepartner paper true-up --book daily --break 1:S:2 --reason "<why>"',
+        aged=True,
+    )
+    (out,) = home_view._needs_you((item,), ())
+    assert out.aged and out.action == item.command and "too long" in out.title
 
 
 def test_the_status_line_is_normal_with_nothing_waiting() -> None:
@@ -163,6 +191,9 @@ def test_the_pill() -> None:
     assert home_view._pill(_summary()) == "Trading"
     assert home_view._pill(_summary(last_run_session=None)) == "Starts Wednesday"
     assert home_view._pill(_summary(engaged=True)) == "Halted"
+    # #2266 item 12: restricted, not halted, while the switch is off
+    assert home_view._pill(_summary(restricted=("AAPL",))) == "Restricted"
+    assert home_view._pill(_summary(engaged=True, restricted=("AAPL",))) == "Halted"
     assert home_view._pill(_summary(is_open=False)) == "Closed"
 
 

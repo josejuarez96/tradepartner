@@ -19,13 +19,13 @@ import json
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
 import pytest
 
-from tradepartner.config import Settings
+from tradepartner.config import RiskConfig, Settings
 from tradepartner.execution import ops
 from tradepartner.execution import shakedown as shakedown_module
 from tradepartner.execution.shakedown import Shakedown, ShakedownLine, shakedown
@@ -91,6 +91,7 @@ _ID_COLUMNS = {
     "kill_switch": "event_id",
     "alerts": "alert_id",
     "fills": "fill_id",
+    "reconcile_breaks": "event_id",
 }
 
 
@@ -132,8 +133,16 @@ class _Journal:
         book_id: str = "main",
         started: datetime = WINDOW_STARTED,
         min_reason: int = 10,
+        full_risk: bool = False,
     ) -> None:
-        frozen = {
+        # `full_risk` freezes every `risk.*` key, as `paper start` does, for the
+        # E.2 break-age check (`frozen_risk`); the other lines read three keys.
+        base = (
+            {f"risk.{k}": v for k, v in RiskConfig().model_dump(mode="json").items()}
+            if full_risk
+            else {}
+        )
+        frozen = base | {
             "paper.min_override_reason_chars": min_reason,
             "paper.min_rebalances": 6,
             "risk.reconcile_cash_tolerance": CASH_TOLERANCE,
@@ -289,6 +298,37 @@ class _Journal:
         )
         return rid
 
+    def brk(
+        self,
+        event: str,
+        at: datetime,
+        *,
+        cause: str = "corporate_action",
+        first_seen: date = D2,
+        break_id: str = "1:SEC_A:9",
+        kind: str = "quantity",
+    ) -> None:
+        """One `reconcile_breaks` event on SEC_A whose one part has `cause`."""
+        part = {"kind": kind, "cause": cause, "ledger_quantity": 10.0, "broker_quantity": 9.0}
+        reason = "checked in Alpaca" if event in ("trued_up", "reopened") else None
+        self.conn.execute(
+            "INSERT INTO reconcile_breaks (event_id, break_id, window_id, book_id, event, "
+            "parts_json, cause, security_id, symbol, dollar_size, material, "
+            "first_seen_session, reconciliation_id, reason, known_at, ingested_at) "
+            "VALUES (?, ?, 1, 'main', ?, ?, ?, 'SEC_A', 'AAA', 100.0, TRUE, ?, 1, ?, ?, ?)",
+            [
+                self.next_id("reconcile_breaks"),
+                break_id,
+                event,
+                json.dumps([part]),
+                cause,
+                first_seen,
+                reason,
+                at,
+                at,
+            ],
+        )
+
     def switch(
         self, at: datetime, state: str, source: str = "owner", *, window_id: int = 1
     ) -> None:
@@ -350,6 +390,7 @@ def _hypothesis(conn: duckdb.DuckDBPyConnection) -> None:
 def _clean(
     conn: duckdb.DuckDBPyConnection,
     *,
+    full_risk: bool = False,
     drill: bool = True,
     drill_orders: bool = False,
     second_fill: bool = True,
@@ -359,7 +400,7 @@ def _clean(
     j = _Journal(conn)
     _hypothesis(conn)
     j.span()
-    j.window()
+    j.window(full_risk=full_risk)
     for session, has_order in ((D1, True), (D2, True)):
         run_id = j.run(session)
         if has_order:
@@ -1571,3 +1612,135 @@ def test_the_queue_read_on_a_year_of_orders_stays_within_the_read_budget(
             elapsed_times.append(time.monotonic() - started)
     assert queue.shakedown_progress is not None  # the shakedown really ran
     assert min(elapsed_times) < fast.store.lock_retry_seconds / 2
+
+
+# --- breaks (ADR 0017's 2026-10-26 amendment; paper spec #2266 items 14 and 16; T284) ---
+
+
+def _waiting_failing(result: Shakedown) -> list[str | None]:
+    from tradepartner.execution.waiting import ShakedownFacts, build
+
+    items = build([], None, ShakedownFacts(lines=result.lines))
+    return [i.line for i in items if i.kind == "shakedown_failing"]
+
+
+@pytest.mark.usefixtures("health")
+def test_an_unattributed_break_keeps_the_span_pending_until_its_closing_event(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn, full_risk=True)
+    j.brk("opened", _at(D2, 20), cause="unattributed")
+    conn.close()
+    pending = _run(settings)
+    assert pending.span.start is None and "unattributed break 1:SEC_A:9" in (
+        pending.span.restart or ""
+    )
+    e2 = _line(pending, "E.2 reconciliation")
+    assert not e2.passed and e2.state == "in_progress"
+    assert any("pending its closing event" in p for p in e2.progress) and not e2.problems
+    # the pending one is progress, never a `shakedown_failing` item
+    assert "E.2 reconciliation" not in _waiting_failing(pending)
+
+    with open_for_write(settings) as write:
+        _Journal(write).brk("auto_accepted", _at(D3, 21), cause="unattributed")
+    restarted = _run(settings)
+    # restarts at the session after the closing event; nothing completed since
+    assert restarted.span.start == D4 and restarted.span.sessions == ()
+    assert "closed auto_accepted" in (restarted.span.restart or "")
+    assert _line(restarted, "E.2 reconciliation").passed
+
+
+@pytest.mark.usefixtures("health")
+def test_an_unattributed_part_observed_on_an_external_break_restarts_too(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn, full_risk=True)
+    j.brk("opened", _at(D1, 20), cause="corporate_action")
+    j.brk("observed", _at(D2, 20), cause="unattributed")
+    conn.close()
+    assert _run(settings).span.start is None
+
+
+@pytest.mark.usefixtures("health")
+def test_a_corporate_action_break_neither_restarts_the_span_nor_fails_e2(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn, full_risk=True)
+    j.brk("opened", _at(D2, 20))
+    conn.close()
+    still_open = _run(settings)
+    assert still_open.span.start == D1 and still_open.span.sessions == (D1, D2, D3)
+    e2 = _line(still_open, "E.2 reconciliation")
+    # an open external break younger than risk.break_max_age_sessions passes
+    assert e2.passed, e2.detail
+    assert "corporate_action 1 (still open 1)" in e2.detail
+
+    # a typed true-up closes it with no `shakedown_note` (open question 45)
+    with open_for_write(settings) as write:
+        _Journal(write).brk("trued_up", _at(D3, 21))
+    trued = _run(settings)
+    assert trued.passed, [(line.name, line.detail) for line in trued.lines]
+    assert "corporate_action 1 (trued_up 1)" in _line(trued, "E.2 reconciliation").detail
+    with open_read_only(settings) as read:
+        assert read.execute(
+            "SELECT COUNT(*) FROM owner_decisions WHERE kind = 'shakedown_note'"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.usefixtures("health")
+def test_an_aged_external_break_fails_e2_and_is_a_waiting_item(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn, full_risk=True)
+    # first seen 2026-10-05: 9 sessions old on 2026-10-15, past the default 5
+    j.brk("opened", _at(date(2026, 10, 5), 20), first_seen=date(2026, 10, 5))
+    conn.close()
+    result = _run(settings)
+    assert result.span.start == D1  # external: no restart
+    e2 = _line(result, "E.2 reconciliation")
+    assert not e2.passed and e2.state == "failing"
+    assert any("9 session(s) old" in p and "past 5" in p for p in e2.problems)
+    assert _waiting_failing(result) == ["E.2 reconciliation"]
+
+
+@pytest.mark.usefixtures("health")
+def test_fills_lagging_followed_by_breaks_passes(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn)
+    j.reconciliation(_at(D3, 19), "fills_lagging")
+    j.reconciliation(_at(D3, 20), "breaks")
+    conn.close()
+    e2 = _line(_run(settings), "E.2 reconciliation")
+    assert e2.passed, e2.detail
+    assert "1 pending_unresolved/fills_lagging row(s) and 1 breaks row(s)" in e2.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_a_break_event_known_after_now_is_not_read(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn, full_risk=True)
+    j.brk("opened", NOW + timedelta(hours=1), cause="unattributed")
+    j.brk("opened", NOW + timedelta(hours=2), first_seen=date(2026, 10, 5), break_id="1:B:1")
+    conn.close()
+    result = _run(settings)
+    assert result.span.start == D1 and result.passed, [(x.name, x.detail) for x in result.lines]
+
+
+@pytest.mark.usefixtures("health")
+def test_a_closed_window_ends_an_unattributed_breaks_pending_restart(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    # quant review of PR #2916: an abandoned window's break never closes; its
+    # closing stop releases the restart as it does a mismatch's
+    j = _clean(conn, full_risk=True)
+    j.brk("opened", _at(D2, 20), cause="unattributed")
+    conn.execute(
+        'INSERT INTO paper_window_stops (window_id, state, "at", reason, known_at, ingested_at) '
+        "VALUES (1, 'abandoned', ?, 'abandoned for the test', ?, ?)",
+        [_at(D3, 21), _at(D3, 21), _at(D3, 21)],
+    )
+    conn.close()
+    span = _run(settings).span
+    assert span.start == D4 and "window closed" in (span.restart or "")

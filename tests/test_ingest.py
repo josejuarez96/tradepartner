@@ -116,6 +116,7 @@ from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.filing_index import FilingRow
 from tradepartner.store.filing_index import by_cik as stored_index_by_cik
 from tradepartner.store.master import Chain, MasterBuild, build_chains, build_master
+from tradepartner.store.retraction import retraction
 from tradepartner.store.schema import init_schema
 
 
@@ -1767,6 +1768,8 @@ def test_rebuild_index_stops_at_a_chunk_boundary_when_the_disk_floor_is_crossed(
     stopped = _run(configured, source="edgar", rebuild_index=True)
     assert [run.status for run in stopped.runs] == [FAILED]
     assert "min_free_disk_gb" in stopped.runs[0].message
+    assert "seed stopped" in stopped.runs[0].message
+    assert "ingest not started" not in stopped.runs[0].message
     assert quarters == [(2018, 1), (2018, 2)]
     with duckdb.connect(configured.store.path, read_only=True) as conn:
         rows = conn.execute(
@@ -1779,6 +1782,47 @@ def test_rebuild_index_stops_at_a_chunk_boundary_when_the_disk_floor_is_crossed(
     monkeypatch.setattr(diskfloor, "free_bytes", lambda _path: 10**15)
     assert _run(configured, source="edgar", rebuild_index=True).ok
     assert quarters[0] == (2018, 3)
+
+
+def test_rebuild_index_disk_read_error_is_a_failed_row_and_final_publish_has_a_floor(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2857: an OSError reading the disk is a FAILED result, and the step after the
+    last chunk checks the floor too."""
+    from tradepartner import diskfloor
+
+    edgar = settings.edgar.model_copy(update={"index_first_year": 2018})
+    ingest_cfg = settings.ingest.model_copy(update={"min_free_disk_gb": 5.0})
+    configured = settings.model_copy(update={"edgar": edgar, "ingest": ingest_cfg})
+    with open_for_write(configured) as conn:
+        init_schema(conn)
+
+    def broken(_path: Path) -> int:
+        raise OSError("gone")
+
+    monkeypatch.setattr(diskfloor, "free_bytes", broken)
+    result = _run(configured, source="edgar", rebuild_index=True)
+    assert [run.status for run in result.runs] == [FAILED]
+    assert "could not read free disk" in result.runs[0].message
+
+    # Plenty of disk for every chunk; the read just before the final publish is low.
+    real_stop = ingest_module._seed_floor_stop
+    phase: list[str] = []
+
+    monkeypatch.setattr(
+        diskfloor,
+        "free_bytes",
+        lambda _path: 10**9 if phase and phase[-1].startswith("before the final") else 10**15,
+    )
+
+    def spy_final(cfg: Settings, cursor: str, where: str) -> Any:
+        phase.append(where)
+        return real_stop(cfg, cursor, where)
+
+    monkeypatch.setattr(ingest_module, "_seed_floor_stop", spy_final)
+    result = _run(configured, source="edgar", rebuild_index=True)
+    assert [run.status for run in result.runs] == [FAILED]
+    assert "before the final publish" in result.runs[0].message
 
 
 def test_index_read_proxy_releases_store_before_next_fetch(
@@ -10711,13 +10755,15 @@ def test_statement_backfill_dry_run_writes_nothing(
     assert (_statement_rows(read), read("SELECT * FROM ingestion_runs ORDER BY ALL")) == before
 
 
-def test_statement_backfill_reads_stamps_from_the_index_with_no_submissions_zip(
+def test_statement_backfill_adapter_mode_makes_no_request(
     tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:
-    """The real adapter under `--bulk-from-cache`, its FSN loaded and every
-    table accession in its stamps cache: stamps from `filing_index`, facts
-    from the cached `companyfacts.zip`, no request, no `submissions.zip`
-    read and no shares `facts` cache file written."""
+    """The real adapter as the CLI builds it (`reuse_cached`, statement-backfill
+    mode, #2887), over a transport that answers nothing: stamps from
+    `filing_index`, facts from the cached `companyfacts.zip`, an accession
+    with no cached stamp skipped and counted, a zip-absent CIK whose cached
+    result is empty for the same latest filing carried forward. No request,
+    no `submissions.zip`, no FSN or shares `facts` cache file written."""
     import zipfile
 
     from tradepartner.adapters import edgar_source
@@ -10729,63 +10775,72 @@ def test_statement_backfill_reads_stamps_from_the_index_with_no_submissions_zip(
         edgar={"cache_dir": str(tmp_path / "cache"), "statement_facts_enabled": True},
     )
     base, added = _seeded_for_backfill(settings)
-    accession = f"{ACME}-19-000001"
+    acme, unstamped, dual = f"{ACME}-19-000001", f"{ACME}-19-000009", f"{DUAL}-19-000001"
     with open_for_write(base) as conn:
-        insert_row(
-            conn,
-            "filing_index",
-            {
-                "cik": ACME,
-                "accession": accession,
-                "form": "10-K",
-                "company_name": "Acme Corp",
-                "filed_on": date(2019, 3, 1),
-                "accepted_at": _at(2019, 3, 1),
-                "listed_on": date(2019, 3, 1),
-                "known_at": _at(2019, 3, 1),
-                "ingested_at": NOW,
-                "source": "edgar",
-                "provenance": "filing",
-            },
-        )
+        for cik, accession, day in ((ACME, acme, 1), (ACME, unstamped, 2), (DUAL, dual, 4)):
+            insert_row(
+                conn,
+                "filing_index",
+                {
+                    "cik": cik,
+                    "accession": accession,
+                    "form": "10-K",
+                    "company_name": "Co",
+                    "filed_on": date(2019, 3, day),
+                    "accepted_at": _at(2019, 3, day),
+                    "listed_on": date(2019, 3, day),
+                    "known_at": _at(2019, 3, day),
+                    "ingested_at": NOW,
+                    "source": "edgar",
+                    "provenance": "filing",
+                },
+            )
     body = {
         "cik": int(ACME),
         "facts": {
             "us-gaap": {
-                "Revenues": {"units": {"USD": [_companyfacts_entry(accession, FY18, 100)]}},
-                "NetIncomeLoss": {"units": {"USD": [_companyfacts_entry(accession, FY18, 9)]}},
+                "Revenues": {"units": {"USD": [_companyfacts_entry(acme, FY18, 100)]}},
+                "NetIncomeLoss": {"units": {"USD": [_companyfacts_entry(acme, FY18, 9)]}},
             }
         },
     }
-    bulk = tmp_path / "cache" / "bulk"
-    bulk.mkdir(parents=True)
-    with zipfile.ZipFile(bulk / "companyfacts.zip", "w") as archive:
-        archive.writestr(f"CIK{ACME}.json", json.dumps(body))
+    cache = tmp_path / "cache"
+    (cache / "bulk").mkdir(parents=True)
+    with zipfile.ZipFile(cache / "bulk" / "companyfacts.zip", "w") as archive:
+        archive.writestr(f"CIK{ACME}.json", json.dumps(body))  # DUAL is absent
+    # The caches an earlier nightly left: stamp metadata (no acceptance: that
+    # comes from the table) and DUAL's empty result under the old tag digest.
+    writer = EdgarFilingSource(base, clock=lambda: NOW)
+    writer._save_stamps(ACME, {acme: SubmissionRecord(acme, "10-K", "a.htm", True, None)})
+    writer._save_stamps(DUAL, {dual: SubmissionRecord(dual, "10-K", "d.htm", True, None)})
+    empty = {"version": edgar_source.STATEMENT_VERSION, "cik": DUAL, "records": [], "conflicts": []}
+    empty["key"] = writer._statement_key(dual)
+    writer._statement_cache_path(DUAL).parent.mkdir(parents=True, exist_ok=True)
+    writer._statement_cache_path(DUAL).write_text(json.dumps(empty))
+    before = {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in cache.rglob("*") if p.is_file()}
     urls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         urls.append(str(request.url))
-        return httpx.Response(404)
+        return httpx.Response(503)
 
     adapter = EdgarFilingSource(
         added,
         client=httpx.Client(transport=httpx.MockTransport(handler)),
         clock=lambda: NOW,
         reuse_cached=True,
+        statement_backfill=True,
     )
-    adapter._fsn_ready = True
-    adapter._fsn_loaded_periods = ("2099_01",)
-    adapter._save_stamps(
-        ACME, {accession: SubmissionRecord(accession, "10-K", "doc.htm", True, None)}
-    )  # cache metadata only: the acceptance comes from the table
-    facts_dir = tmp_path / "cache" / "facts"
     result = _backfill(added, adapter)
     assert result.ok, result.runs[0].message
     assert urls == []
-    assert not (bulk / "submissions.zip").exists()
-    assert not facts_dir.exists() or not any(facts_dir.rglob("*.json"))
-    assert ("net_income", FY18[1], 9, accession) in [r[:4] for r in _statement_rows(read)]
-    assert (tmp_path / "cache" / "statement_facts" / f"v{edgar_source.STATEMENT_VERSION}").is_dir()
+    counts = statement_counts(result.runs[0].message)
+    assert (counts["stamps_missing"], counts["absent_carried"]) == (1, 1)
+    after = {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in cache.rglob("*") if p.is_file()}
+    changed = {p for p, state in after.items() if before.get(p) != state}
+    assert changed and {p.parent.parent.name for p in changed} == {"statement_facts"}
+    assert not (cache / "bulk" / "submissions.zip").exists()
+    assert ("net_income", FY18[1], 9, acme) in [r[:4] for r in _statement_rows(read)]
 
 
 def test_statement_backfill_refuses_a_per_name_edit_beside_the_addition(
@@ -10818,3 +10873,111 @@ def test_the_nightly_window_starts_at_the_last_index_read_not_the_backfill(
         cursor, previous_at = ingest_module._last_ok_index_row(conn)
     assert cursor == '{"per_name": "backfill"}'
     assert previous_at == NOW
+
+
+def test_incremental_rotation_ignores_retracted_and_superseded_stored_rows(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#2840: the drift check compares the as-of current rows, so a retracted
+    listing and an older revision of a key are not drift."""
+    edgar = settings.edgar.model_copy(update={"index_first_year": 2018, "verify_rotation_days": 1})
+    configured = settings.model_copy(update={"edgar": edgar})
+    with open_for_write(configured) as conn:
+        init_schema(conn)
+    source = _filings()
+    assert _run(configured, filings=source, source="edgar", rebuild_index=True).ok
+    with open_for_write(configured) as conn:
+        live = conn.execute(
+            "SELECT * FROM listings WHERE security_id = ? ORDER BY known_at", [ACME]
+        ).fetchall()
+        columns = [item[0] for item in conn.description]
+        row = dict(zip(columns, live[0], strict=True))
+        stale = {**row, "ticker": "OLDX", "known_at": row["known_at"] - timedelta(days=1)}
+        stale["ingested_at"] = stale["known_at"]
+        insert_row(conn, "listings", stale)
+        insert_row(conn, "listings", retraction(stale, row["known_at"]))
+        older = {
+            **row,
+            "class_title": "Older Title",
+            "known_at": row["known_at"] - timedelta(days=2),
+        }
+        older["ingested_at"] = older["known_at"]
+        insert_row(conn, "listings", older)
+    enabled = configured.model_copy(
+        update={"edgar": edgar.model_copy(update={"incremental_index": True})}
+    )
+    result = _run(enabled, filings=source, source="edgar")
+    assert result.ok, result.runs[0].message
+    message = read(
+        "SELECT message FROM ingestion_runs WHERE source = 'edgar_index' ORDER BY rowid"
+    )[-1][0]
+    assert "incremental_drift: 0" in message
+
+
+# --- T347 (#2714): daily index provenance attribution --------------------------
+
+
+def test_index_manifest_credits_a_stamped_pending_row_only_to_a_body_that_lists_it(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pending row comes back with `is_daily` set whatever its first listing.
+    It is entered under an earlier run's daily file only if that cached body,
+    with the stored hash and held in the archive, lists it; a row whose date has
+    no daily file (first listed in a quarterly `form.idx`) or whose body does not
+    list it is counted `index_unattributed`, never a failed run."""
+    from pydantic import SecretStr
+
+    from tradepartner import diskfloor
+    from tradepartner.adapters import edgar_raw
+    from tradepartner.adapters.daily_index import parse_index_manifest
+    from tradepartner.store import filing_index as stored_index
+    from tradepartner.store import raw_archive
+
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _path: 10**15)
+    root = (tmp_path / "archive").resolve()
+    root.mkdir()
+    configured = settings.model_copy(
+        update={
+            "edgar": settings.edgar.model_copy(update={"cache_dir": str(tmp_path / "edgar")}),
+            "tradepartner_raw_archive": SecretStr(str(root)),
+        }
+    )
+    now = datetime(2026, 1, 9, 4, tzinfo=UTC)
+    cik = "0000009999"
+    body = f"10-K  New Corp  9999  20260105    edgar/data/9999/{cik}-26-000001.txt\n".encode()
+    cached = edgar_raw.daily_index_file_path(2026, 1, "form.20260105.idx", settings=configured)
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(body)
+    digest = raw_archive.archive_body(configured, body).sha256
+
+    def listing(n: int, filed: date, listed: date) -> stored_index.Listing:
+        accepted = datetime.combine(filed, datetime.min.time(), UTC)
+        return stored_index.Listing(
+            cik, f"{cik}-26-00000{n}", "10-K", "New Corp", filed, accepted, listed, True, 0
+        )
+
+    listed = listing(1, date(2026, 1, 5), date(2026, 1, 5))  # in the cached body
+    unlisted = listing(2, date(2026, 1, 5), date(2026, 1, 5))  # same file, not in it
+    quarterly = listing(3, date(2025, 12, 1), date(2026, 1, 4))  # a Sunday: no daily file
+    rows = [listed, unlisted, quarterly]
+    provenance = ingest_module._IndexProvenance(configured, dry_run=False)
+    with open_for_write(configured) as conn:
+        init_schema(conn)
+        conn.execute(
+            "INSERT INTO edgar_index_files (path, last_modified, size, sha256, run_id) "
+            "VALUES (?, ?, ?, ?, 'earlier')",
+            ["daily-index/2026/QTR1/form.20260105.idx", now, len(body), digest],
+        )
+        provenance.mark(conn, rows)
+        stored_index.insert_listings(conn, rows, now)
+        provenance.finish(conn, rows, (), run_id="night", mode="session")
+    assert provenance.unattributed == 2
+    assert provenance.digest is not None
+    manifest = parse_index_manifest(raw_archive.read_manifest(configured, provenance.digest))
+    [entry] = manifest["entries"]
+    assert (entry["file_date"], entry["raw_sha256"], entry["parsed"]) == (
+        "2026-01-05",
+        digest,
+        False,
+    )
+    assert [row["key"][1] for row in entry["rows"]] == [listed.accession]

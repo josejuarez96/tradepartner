@@ -54,6 +54,7 @@ from tradepartner.execution import (
     shakedown,
 )
 from tradepartner.execution import breaks as breaks_rules
+from tradepartner.execution.buy_timing import execution_for
 from tradepartner.execution.marks import equity_at
 from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.execution.switch import SwitchState, derive
@@ -98,7 +99,10 @@ class Header:
     """The page header. `status` is `closed` for a closed or abandoned window, else
     `running` or `stopped` (`switch.derive`);
     `value` is the book's equity at `as_of_session`; the returns are percents over
-    the since-start range (None until the book has a mark, or SPY is missing)."""
+    the since-start range (None until the book has a mark, or SPY is missing).
+    `restricted` names the holdings an open material break restricts (#2266 item
+    7): a `running` book with restrictions still trades every other name, and is
+    never `stopped` for them (item 12)."""
 
     status: Literal["running", "stopped", "closed"]
     as_of_session: date | None
@@ -106,6 +110,7 @@ class Header:
     since_start_return_pct: float | None
     spy_return_pct: float | None
     benchmark_error: str | None
+    restricted: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -315,6 +320,7 @@ def _limit_sentence(row: headroom.LimitRow) -> str:
 
 def _limits(
     conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
     window: PaperWindowRow,
     marks: list[PositionDailyRow],
     ks_rows: list[KillSwitchRow],
@@ -324,7 +330,12 @@ def _limits(
     session = max((m.session for m in marks), default=None)
     last = [m for m in marks if m.session == session]
     card = headroom.compute(
-        window, last, ks_rows, frozen_risk(window), side=headroom._side(conn, window)
+        window,
+        last,
+        ks_rows,
+        frozen_risk(window),
+        side=headroom._side(conn, window),
+        sleeve_fraction=execution_for(settings, window.book_id).cash_sleeve_fraction,
     )
     return tuple(LimitLine(r.key, _limit_sentence(r), r.status) for r in card.rows)
 
@@ -341,6 +352,21 @@ def _json(text: str | None) -> dict[str, Any] | None:
 
 def _money(amount: float) -> str:
     return f"${abs(amount):,.2f}"
+
+
+def _restricted(break_events: list[ReconcileBreakRow], now: datetime) -> tuple[str, ...]:
+    """The names (broker symbol, else `security_id`) an open material break known
+    at `now` restricts (`breaks.restricted_names`'s rule)."""
+    open_now = breaks_rules.open_breaks([e for e in break_events if e.known_at <= now])
+    return tuple(
+        sorted(
+            {
+                e.symbol or e.security_id
+                for e in open_now.values()
+                if e.material and e.security_id is not None
+            }
+        )
+    )
 
 
 def _reconciliation(
@@ -381,9 +407,15 @@ def _reconciliation(
             if count == 0
             else f"{count} open {'break' if count == 1 else 'breaks'}"
         )
+        restricted = _restricted(break_events or [], now)
+        held = (
+            f" Trading is restricted in {', '.join(restricted)}; the rest of the book trades."
+            if restricted
+            else ""
+        )
         return ReconciliationView(
             False,
-            f"Matches Alpaca as of {stamp} except {what}.",
+            f"Matches Alpaca as of {stamp} except {what}.{held}",
             row.at,
             cash_tol,
         )
@@ -615,15 +647,16 @@ def build(
     )
     holdings = _holdings(conn, window_id, marks, as_of, now, top_n) if as_of is not None else None
 
+    break_events = journal.break_events_for(conn, window_id)
     safety = Safety(
         _reconciliation(
             window,
             _known(journal.reconciliations_for(conn, window_id), now),
             now,
-            journal.break_events_for(conn, window_id),
+            break_events,
         ),
         _kill_switch(state, runs, closed),
-        _limits(conn, window, marks, ks_rows),
+        _limits(conn, settings, window, marks, ks_rows),
     )
     return replace(
         empty,
@@ -635,6 +668,7 @@ def build(
             since_book,
             since_spy,
             spy_error,
+            () if closed else _restricted(break_events, now),
         ),
         performance=performance,
         today=today,

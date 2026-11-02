@@ -1414,6 +1414,43 @@ def _refusal(exc: BaseException, settings: Settings) -> typer.Exit:
     return _fail(_scrubbed(f"refused: {exc}", settings), USAGE_ERROR)
 
 
+def _parse_aware(flag: str, value: str) -> datetime:
+    """An ISO datetime that carries its UTC offset, returned in UTC; a naive one is a
+    usage error (exit 2) before anything is written."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise _fail(f"{flag} {value!r} is not an ISO datetime", USAGE_ERROR) from None
+    if parsed.tzinfo is None:
+        raise _fail(
+            f"{flag} {value!r} has no UTC offset; give one, e.g. 2026-10-31T20:00:00+00:00",
+            USAGE_ERROR,
+        )
+    return parsed.astimezone(UTC)
+
+
+def _exposure_pins(values: Sequence[str]) -> dict[str, str]:
+    """`--pin name=value` pairs; one without an `=` or a name is a usage error."""
+    pins: dict[str, str] = {}
+    for item in values:
+        name, sep, value = item.partition("=")
+        if not sep or not name.strip():
+            raise _fail(f"--pin {item!r} must be <name>=<value>", USAGE_ERROR)
+        pins[name.strip()] = value
+    return pins
+
+
+def _exposure_line(r: research.ExposureRecord) -> str:
+    holdout = "spends-holdout" if r.overlaps_holdout else "-"
+    return (
+        f"{r.exposure_id}  {r.candidate_ref}  {r.source}  {_fmt(r.family)}  "
+        f"{r.read_at.isoformat()}  {r.window_start}..{r.window_end}  "
+        f"{r.n_configurations}  {r.verdict}  {holdout}  "
+        f"{'verified' if r.probe_verified else 'unverified'}  "
+        f"{'synthetic' if r.synthetic else 'real'}"
+    )
+
+
 def _read_config(path: Path, settings: Settings) -> dict[str, Any]:
     """`--config`'s JSON object, refused (exit 2) before anything is written."""
     try:
@@ -1993,6 +2030,9 @@ def _book_first_lines(
             state = "window closed"
         elif row.switch_state.run_in_progress:
             state = "run in progress"
+        elif row.restricted:
+            # #2266 item 12: a book with only breaks trades every other name
+            state = f"trading, restricted in {', '.join(row.restricted)} (not halted)"
         else:
             state = "trading"
         lines.append(f"{row.book_id}: {state}, {_plural(len(mine) + late, 'issue')}")
@@ -2021,6 +2061,10 @@ def _summary_lines(summaries: Sequence[ops.BookSummary], now: datetime) -> list[
             f"next rebalance {_fmt(row.next_rebalance_session)}"
             + ("" if row.next_rebalance_session is None else " (data day; trades the next session)")
         )
+        if row.open_breaks:
+            line += f"; open breaks {row.open_breaks}" + (
+                f" (restricted: {', '.join(row.restricted)})" if row.restricted else ""
+            )
         if traded is not None:
             result = "traded today" if row.last_run_has_orders else "ran today with no orders"
             line += f"; rebalance {traded} {result}"
@@ -2062,6 +2106,24 @@ def _for_book(book: str | None) -> str:
     return "" if book is None else f" for book {book!r}"
 
 
+def _break_lines(data: ops.OpsData) -> list[str]:
+    """`paper status --book`'s "Open breaks" block (#2266 item 12): one line per
+    open break, then the window's closed count; nothing when the window has none."""
+    if data.breaks_error is not None:
+        return [f"open breaks: could not be read ({data.breaks_error})"]
+    if not data.breaks and not data.closed_breaks:
+        return []
+    lines = [f"Open breaks ({len(data.breaks)}; {data.closed_breaks} closed in this window):"]
+    for b in data.breaks:
+        size = "unpriced" if b.dollar_size is None else f"{b.dollar_size:.2f}"
+        lines.append(
+            f"  {b.break_id} {'/'.join(b.kinds)} {b.name}: size {size}; first seen "
+            f"{b.first_seen_session}; age {b.age}; cause {b.cause or '-'}; {b.state}"
+            + ("; restricted" if b.restricted else "")
+        )
+    return lines
+
+
 def _status_lines(
     data: ops.OpsData,
     book: str | None = None,
@@ -2096,6 +2158,7 @@ def _status_lines(
         f"kill switch {switch_text} (causes: {causes})",
         "reconciliation "
         + ("n/a" if recon is None else f"{recon.reconciliation_id} {recon.status} at {recon.at}"),
+        *_break_lines(data),
         *paper_slippage.slippage_report_lines(fill_slippage),
         *(item.line for item in data.overdue_delisting),
         *_edgar_age_lines(data.edgar_age),
@@ -2873,6 +2936,7 @@ def make_app(
             client=edgar_client,
             clock=clock,
             reuse_cached=bulk_from_cache,
+            statement_backfill=statement_backfill,
             event_forms=s.edgar.event_forms,
             prefer_stored_index=restamp is not None or rebuild_classifications,
         )
@@ -4477,6 +4541,136 @@ def make_app(
                 f"{r.run_id}  {r.slug}  {r.kind}  {r.split}  {r.outcome}  {_fmt(r.verdict)}  "
                 f"{basis}  {_flag_names(r)}  {message}"
             )
+
+    exposure_app = typer.Typer(
+        no_args_is_help=True,
+        help="Record desk-read exposure. There is no edit, delete or withdraw command.",
+    )
+    app.add_typer(exposure_app, name="exposure")
+
+    @exposure_app.command("record")
+    def exposure_record(
+        candidate: Annotated[str, typer.Option(help="the candidate ref, e.g. #2689")],
+        source: Annotated[str, typer.Option(help="store or open_data")],
+        kill_line_url: Annotated[str, typer.Option(help="the frozen kill line's URL")],
+        kill_line_file: Annotated[Path, typer.Option(help="a copy of the kill line")],
+        kill_line_posted_at: Annotated[str, typer.Option(help="ISO time with an offset")],
+        read_at: Annotated[str, typer.Option(help="ISO time with an offset")],
+        window_start: Annotated[str, typer.Option(help="first day read, YYYY-MM-DD")],
+        window_end: Annotated[str, typer.Option(help="last day read, YYYY-MM-DD")],
+        configurations: Annotated[int, typer.Option(help="configurations the launch tried")],
+        verdict: Annotated[str, typer.Option(help="pass, fail, insufficient or incomplete")],
+        desk_read: Annotated[str, typer.Option(help="the note, under docs/research/")],
+        family: Annotated[str | None, typer.Option(help="the hypothesis family")] = None,
+        probe: Annotated[Path | None, typer.Option(help="the probe script")] = None,
+        probe_sha256: Annotated[str | None, typer.Option(help="its declared SHA-256")] = None,
+        probe_unavailable: Annotated[
+            bool, typer.Option(help="the script no longer exists (open_data only)")
+        ] = False,
+        reason: Annotated[str | None, typer.Option(help="why the probe is unavailable")] = None,
+        input_files: Annotated[
+            list[Path] | None, typer.Option("--input", help="an input file (repeatable)")
+        ] = None,
+        pin: Annotated[
+            list[str] | None, typer.Option(help="a data pin <name>=<value> (repeatable)")
+        ] = None,
+        audit_url: Annotated[str | None, typer.Option(help="the audit's URL")] = None,
+        holdout_reason: Annotated[
+            str | None, typer.Option(help="why a store record spends a holdout")
+        ] = None,
+        note: Annotated[str | None, typer.Option(help="a note stored with the record")] = None,
+    ) -> None:
+        """Record one desk-read launch and print its id. A repeat of a record prints
+        the first id and writes nothing. Exit 2 on a refusal, with nothing written."""
+        s = settings()
+        if probe_unavailable != (reason is not None):
+            raise _fail("--probe-unavailable and --reason go together", USAGE_ERROR)
+        start = _parse_day("--window-start", window_start)
+        end = _parse_day("--window-end", window_end)
+        assert start is not None and end is not None
+        spec = research.ExposureInput(
+            candidate_ref=candidate,
+            source=source,
+            kill_line_url=kill_line_url,
+            kill_line_file=kill_line_file,
+            kill_line_posted_at=_parse_aware("--kill-line-posted-at", kill_line_posted_at),
+            read_at=_parse_aware("--read-at", read_at),
+            window_start=start,
+            window_end=end,
+            n_configurations=configurations,
+            verdict=verdict,
+            desk_read_path=desk_read,
+            family=family,
+            probe_path=probe,
+            probe_sha256=probe_sha256,
+            probe_unavailable_reason=reason if probe_unavailable else None,
+            inputs=tuple(input_files or ()),
+            pins=_exposure_pins(pin or ()),
+            audit_url=audit_url,
+            holdout_reason=holdout_reason,
+            note=note,
+        )
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                record = research.record_exposure(conn, spec, _REGISTERED_BY, settings=s)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except (*_RESEARCH_REFUSALS, OSError) as exc:
+            raise _refusal(exc, s) from None
+        _echo_scrubbed(f"exposure {record.exposure_id}", s)
+
+    @app.command()
+    def exposures(
+        family: Annotated[str | None, typer.Option(help="only this family")] = None,
+        candidate: Annotated[str | None, typer.Option(help="only this candidate")] = None,
+        include_synthetic: Annotated[bool, typer.Option(help="list synthetic records too")] = False,
+        candidates: Annotated[
+            bool, typer.Option(help="list each candidate with its first read (needs --since)")
+        ] = False,
+        since: Annotated[str | None, typer.Option(help="with --candidates, YYYY-MM-DD")] = None,
+    ) -> None:
+        """List desk-read exposure records newest first, or with `--candidates --since
+        <date>` each distinct candidate read on or after the date (the search-tally check)."""
+        s = settings()
+        if candidates != (since is not None):
+            raise _fail("--candidates and --since go together", USAGE_ERROR)
+        since_day = _parse_day("--since", since)
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_read_only(s) as conn:
+                schema.init_schema(conn)  # read-only: checks the version, never migrates
+                if since_day is not None:
+                    found = research.exposure_candidates(conn, since_day, include_synthetic)
+                    listed = []
+                else:
+                    found = []
+                    listed = research.list_exposures(conn, family, candidate, include_synthetic)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except research.ExposuresNotInitialised as exc:
+            raise _fail(str(exc), 1) from None
+        except (schema.ResearchNotInitialised, schema.RegistryNotInitialised):
+            raise _fail("research registry not initialised", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
+        if since_day is not None:
+            _echo_scrubbed("candidate  first_read_at  records  verdicts  earlier_records", s)
+            for c in found:
+                _echo_scrubbed(
+                    f"{c.candidate_ref}  {c.first_read_at.isoformat()}  {len(c.records)}  "
+                    f"{','.join(c.verdicts)}  {'yes' if c.earlier_records else 'no'}",
+                    s,
+                )
+            return
+        _echo_scrubbed(
+            "id  candidate  source  family  read_at  window  configs  verdict  holdout  "
+            "probe  store",
+            s,
+        )
+        for r in listed:
+            _echo_scrubbed(_exposure_line(r), s)
 
     store_app = typer.Typer(no_args_is_help=True, help="Look after the store file.")
     app.add_typer(store_app, name="store")

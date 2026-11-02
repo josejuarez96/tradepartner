@@ -1783,6 +1783,124 @@ def test_residue_true_up_is_listed(kind: str) -> None:
     assert result.periods[0].residue_trued_up == (A,)
 
 
+def test_reversed_true_up_has_no_paper_check_residue_effect() -> None:
+    marks = [_position_mark(T0, A, 5, 20, cash=99_900), _position_mark(T1, A, 5, 20, cash=99_900)]
+    carried = AdjustmentRow(
+        adjustment_id=1,
+        window_id=WINDOW_ID,
+        session=T0,
+        kind="carried_residue",
+        origin="dust",
+        security_id=A,
+        quantity=5,
+        known_at=_utc(T0),
+        ingested_at=_utc(T0),
+    )
+    booked = AdjustmentRow(
+        adjustment_id=2,
+        window_id=WINDOW_ID,
+        session=T1,
+        kind="owner_true_up",
+        security_id=A,
+        quantity=1,
+        explanation_json=json.dumps({"broker_quantity": 6}),
+        known_at=_utc(T1) - timedelta(seconds=2),
+        ingested_at=_utc(T1) - timedelta(seconds=2),
+    )
+    reversed_row = AdjustmentRow(
+        adjustment_id=3,
+        window_id=WINDOW_ID,
+        session=T1,
+        kind="owner_true_up",
+        security_id=A,
+        quantity=-1,
+        explanation_json=json.dumps({"reversed_adjustment_id": 2}),
+        known_at=_utc(T1) - timedelta(seconds=1),
+        ingested_at=_utc(T1) - timedelta(seconds=1),
+    )
+
+    def check(rows: list[AdjustmentRow]) -> tuple[float, tuple[str, ...]]:
+        result = compare_periods(
+            _window(),
+            _trial({T0: 100_000, T1: 100_000}, {T0: 0}),
+            _journal(positions_daily=marks, adjustments=rows),
+            _no_actions(),
+            _no_price,
+            None,
+        )
+        return result.periods[0].residue_term, result.periods[0].residue_trued_up
+
+    assert check([carried, booked, reversed_row]) == check([carried])
+
+
+def test_later_period_reversal_labels_the_residue_change() -> None:
+    marks = [
+        _position_mark(T0, A, 5, 20, cash=99_900),
+        _position_mark(T1, A, 6, 20, cash=99_900),
+        _position_mark(T2, A, 5, 20, cash=99_900),
+    ]
+    carried = AdjustmentRow(
+        adjustment_id=21,
+        window_id=WINDOW_ID,
+        session=T0,
+        kind="carried_residue",
+        origin="dust",
+        security_id=A,
+        quantity=5,
+        known_at=_utc(T0),
+        ingested_at=_utc(T0),
+    )
+    booked = AdjustmentRow(
+        adjustment_id=22,
+        window_id=WINDOW_ID,
+        session=T1,
+        kind="owner_true_up",
+        security_id=A,
+        quantity=1,
+        explanation_json=json.dumps({"broker_quantity": 6}),
+        known_at=_utc(T1) - timedelta(seconds=1),
+        ingested_at=_utc(T1) - timedelta(seconds=1),
+    )
+    reversed_row = AdjustmentRow(
+        adjustment_id=23,
+        window_id=WINDOW_ID,
+        session=T2,
+        kind="owner_true_up",
+        security_id=A,
+        quantity=-1,
+        explanation_json=json.dumps({"reversed_adjustment_id": 22}),
+        known_at=_utc(T2) - timedelta(seconds=1),
+        ingested_at=_utc(T2) - timedelta(seconds=1),
+    )
+    result = compare_periods(
+        _window(),
+        _trial({T0: 100_000, T1: 100_020, T2: 100_000}, {T0: 0, T1: 0}, (T0, T1, T2)),
+        _journal(
+            positions_daily=marks,
+            adjustments=[carried, booked, reversed_row],
+            runs=(_run(1, T0), _run(2, T1), _run(3, T2)),
+        ),
+        _no_actions(),
+        _no_price,
+        None,
+    )
+    without_reversal = compare_periods(
+        _window(),
+        _trial({T0: 100_000, T1: 100_020, T2: 100_000}, {T0: 0, T1: 0}, (T0, T1, T2)),
+        _journal(
+            positions_daily=marks,
+            adjustments=[carried, booked],
+            runs=(_run(1, T0), _run(2, T1), _run(3, T2)),
+        ),
+        _no_actions(),
+        _no_price,
+        None,
+    )
+    assert result.periods[0].residue_trued_up == (A,)
+    assert result.periods[0].residue_term == without_reversal.periods[0].residue_term
+    assert result.periods[1].residue_trued_up == (A,)
+
+
 def test_residue_quantity_uses_close_cut_even_when_mark_is_written_later(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

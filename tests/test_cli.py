@@ -2958,9 +2958,11 @@ def test_ingest_statement_backfill_reaches_the_session_with_the_cached_zip(
     result = _invoke(secrets_set, args)
     assert result.exit_code == 0, result.output
     assert built.kwargs[0]["reuse_cached"] is True
+    assert built.kwargs[0]["statement_backfill"] is True  # the adapter's local-caches mode
     assert session.calls[0]["statement_backfill"] is True
     assert _invoke(secrets_set, ["ingest", "--source", "edgar"]).exit_code == 0
     assert session.calls[1]["statement_backfill"] is False
+    assert built.kwargs[1]["statement_backfill"] is False
 
 
 @pytest.mark.parametrize(

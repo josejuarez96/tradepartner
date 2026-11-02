@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import json
 import time
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -332,6 +333,30 @@ def test_a_break_known_after_the_displayed_reconciliation_is_not_counted(
     assert "except 1 open break." in safety.reconciliation.text
 
 
+def test_a_book_with_only_breaks_is_running_and_names_its_restricted_holdings(
+    journal_settings: Settings,
+) -> None:
+    """#2266 item 12 (T284): open material breaks restrict their names; the book is
+    `running`, never `stopped`, and an immaterial or closed break restricts nothing."""
+    _seed(journal_settings)
+    listed = {"mismatches": [{"security_id": "SEC_A", "kind": "quantity"}]}
+    _append(
+        journal_settings,
+        _break_event("SEC_A", "opened"),
+        replace(_break_event("SEC_B", "opened"), material=False, dollar_size=1.0),
+        _break_event("SEC_C", "opened"),
+        replace(_break_event("SEC_C", "trued_up"), reason="checked in Alpaca"),
+        _reconciliation("breaks", payload=listed),
+    )
+    view = _view(journal_settings)
+    assert view.header is not None and view.safety is not None
+    assert view.header.status == "running" and view.header.restricted == ("SEC_A",)
+    assert view.safety.kill_switch.running
+    assert "Trading is restricted in SEC_A; the rest of the book trades." in (
+        view.safety.reconciliation.text
+    )
+
+
 def test_an_ok_row_without_a_stored_cash_difference_uses_tolerance_wording(
     journal_settings: Settings,
 ) -> None:
@@ -466,6 +491,28 @@ def test_the_limits_come_out_in_plain_words(journal_settings: Settings) -> None:
     limits = _view(journal_settings).safety.limits  # type: ignore[union-attr]
     assert [line.key for line in limits] == ["cash", "gross", "position", "drawdown"]
     assert all("points" in line.sentence and "Past it" in line.sentence for line in limits)
+
+
+def _cash_sentence(settings: Settings) -> str:
+    limits = _view(settings).safety.limits  # type: ignore[union-attr]
+    return next(line.sentence for line in limits if line.key == "cash")
+
+
+def test_the_cash_limit_line_takes_the_books_sleeve_off(journal_settings: Settings) -> None:
+    _seed(journal_settings)
+    base = _cash_sentence(journal_settings)
+    mapped = Settings(
+        _env_file=None,
+        store={"path": str(journal_settings.store.path)},
+        paper={"execution": {"main": {"cash_sleeve_fraction": 0.03}}},
+    )
+    other = Settings(
+        _env_file=None,
+        store={"path": str(journal_settings.store.path)},
+        paper={"execution": {"zzz": {"cash_sleeve_fraction": 0.03}}},
+    )
+    assert _cash_sentence(mapped) != base
+    assert _cash_sentence(other) == base  # a book outside paper.execution is unchanged
 
 
 # --- the backtest part --------------------------------------------------------------

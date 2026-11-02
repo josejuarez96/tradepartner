@@ -15,7 +15,14 @@ clears it, the command the owner types (text only: nothing here runs it).
    row's `at`; with no `engaged` row (a crashed or faulted run, or an unfinished
    one, engages it alone) it is the `started_at` of the earliest run that
    engages it. Command: `paper resume`.
-2. `order_lagging`: a non-terminal order whose `collect.lag_verdict` is
+2. `reconcile_break` (#2266 item 12; T284): one per open break of the window
+   (`alerts.latest_open_breaks`), named by id, kinds, name, size, age, cause and
+   whether it restricts the name. `since` is the break's `opened` event's
+   `known_at`; `aged` is True once it is older than the frozen
+   `risk.break_max_age_sessions` at the command's session (`alerts.is_aged`).
+   Command: `paper true-up`, the reason left for the owner. A break never
+   engages the kill switch, so it is never `kill_switch_engaged`.
+3. `order_lagging`: a non-terminal order whose `collect.lag_verdict` is
    `breached` under the window's frozen `RiskConfig`, judged at S-1
    (`ops._required_run_session(now)`): the session of the last run the owner
    can already expect to have happened, so the item shows exactly the breaches
@@ -25,13 +32,13 @@ clears it, the command the owner types (text only: nothing here runs it).
    breach no run has reached (the spec-critic follow-up on the plan line).
    `since` is the verdict's anchor. Command: `paper settle`, only once Alpaca no
    longer knows the order.
-3. `missed_run`: no run of the window on S-1 (`ops._stale_and_last_updated`'s
+4. `missed_run`: no run of the window on S-1 (`ops._stale_and_last_updated`'s
    `stale`), skipped for a window started after S-1's close. `since` is S-1.
    No command: the detail says what to check (scheduling runbook).
-4. `shakedown_note`: a `stale_data` or `missed_run` alert at or after the open
+5. `shakedown_note`: a `stale_data` or `missed_run` alert at or after the open
    span's `start_at` (and at or before `now`) that no `shakedown_note` names.
    `since` is the alert's `at`. Command: `decision shakedown-note`.
-5. `shakedown_failing` (#2298): one per `paper shakedown` line whose `state` is
+6. `shakedown_failing` (#2298): one per `paper shakedown` line whose `state` is
    `failing` (`execution.shakedown.ShakedownLine.state`, never its printed
    text), or one when the shakedown could not be read (`ShakedownFacts.error`).
    A line `in_progress` (sessions or order sessions still short, the span
@@ -39,11 +46,11 @@ clears it, the command the owner types (text only: nothing here runs it).
    `paper status --all`. The book is `SHAKEDOWN_BOOK` (the shakedown judges
    every book at once); `since` is None. Command: `paper shakedown`, which prints
    the whole line; the detail names the next step.
-6. `report_due`: at least `ReportFacts.minimum` tracked rebalances (`paper
+7. `report_due`: at least `ReportFacts.minimum` tracked rebalances (`paper
    report`'s count) and no `paper_reports` row yet: only the first report is
    prompted, because every `paper report` opens a counted tracking trial.
    `since` is the session the report became due (the third rebalance). Command: `paper report`.
-7. `unreadable`: one per book whose rows raised a `ValueError` (an
+8. `unreadable`: one per book whose rows raised a `ValueError` (an
    `UnreadableMarkError`, `frozen_risk` on an unreadable `frozen_json`,
    `lag_verdict` on an unreadable reconciliation row), carrying every message.
    No command. The book's kinds that read fine still come out, and so do every
@@ -60,6 +67,13 @@ from zoneinfo import ZoneInfo
 
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig
+from tradepartner.execution.alerts import (
+    break_age,
+    break_kinds,
+    is_aged,
+    latest_open_breaks,
+    true_up_command,
+)
 from tradepartner.execution.collect import lag_verdict
 from tradepartner.execution.plain import plain_causes
 from tradepartner.execution.shakedown import ShakedownLine
@@ -68,6 +82,7 @@ from tradepartner.store.journal import (
     KillSwitchRow,
     OrderRow,
     PaperWindowRow,
+    ReconcileBreakRow,
     ReconciliationRow,
     RunWithResult,
 )
@@ -77,6 +92,7 @@ __all__ = [
     "NOTED_ALERT_KINDS",
     "SHAKEDOWN_BOOK",
     "BookFacts",
+    "BreakFacts",
     "LagFacts",
     "ReportFacts",
     "RunFacts",
@@ -95,6 +111,7 @@ _NEW_YORK = ZoneInfo("America/New_York")
 
 WaitingKind = Literal[
     "kill_switch_engaged",
+    "reconcile_break",
     "order_lagging",
     "missed_run",
     "shakedown_note",
@@ -106,6 +123,7 @@ WaitingKind = Literal[
 #: The fixed order items come out in, kind first (module docstring).
 KIND_ORDER: Final[tuple[WaitingKind, ...]] = (
     "kill_switch_engaged",
+    "reconcile_break",
     "order_lagging",
     "missed_run",
     "shakedown_note",
@@ -127,8 +145,8 @@ _SHAKEDOWN_NEXT: Final[dict[str, str]] = {
         "`decision shakedown-note` on its alert, any other result is a run to look into"
     ),
     "E.2": (
-        "find the mismatch in `paper status --book <book>`, fix its cause and resume; "
-        "a mismatch restarts the span"
+        "find the mismatch or the aged break in `paper status --book <book>`: fix a "
+        "mismatch's cause and resume (it restarts the span), true up an aged break"
     ),
     "E.3": (
         "an order filled beyond its plan or a limit was breached: look at the named "
@@ -154,7 +172,8 @@ class WaitingItem:
     session (by kind, module docstring), None for `unreadable`; `command` is the
     text the owner types to clear it, None where no command does; `line` is the
     shakedown line a `shakedown_failing` item is about (None otherwise, and for
-    an unreadable shakedown)."""
+    an unreadable shakedown); `aged` is True only for a `reconcile_break` item
+    past the frozen `risk.break_max_age_sessions`."""
 
     book_id: str
     kind: WaitingKind
@@ -162,6 +181,7 @@ class WaitingItem:
     detail: str
     command: str | None
     line: str | None = None
+    aged: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -208,6 +228,17 @@ class ReportFacts:
 
 
 @dataclass(frozen=True, kw_only=True)
+class BreakFacts:
+    """The window's `reconcile_breaks` events (any order: read in write order),
+    the session their age is judged at and the frozen
+    `risk.break_max_age_sessions`."""
+
+    events: tuple[ReconcileBreakRow, ...]
+    session: date
+    max_age_sessions: int
+
+
+@dataclass(frozen=True, kw_only=True)
 class BookFacts:
     """One open window's inputs. A section is None when it was not read (its
     read raised); `errors` carries the messages of the reads that raised."""
@@ -217,6 +248,7 @@ class BookFacts:
     lag: LagFacts | None = None
     run: RunFacts | None = None
     report: ReportFacts | None = None
+    breaks: BreakFacts | None = None
     errors: tuple[str, ...] = ()
 
 
@@ -286,6 +318,38 @@ def _kill_switch_item(book_id: str, facts: SwitchFacts) -> WaitingItem | None:
         + (f"; reason given: {_one_line(why)}" if why else ""),
         command=f'tradepartner paper resume --book {book_id} --reason "<why>"',
     )
+
+
+def _break_items(book_id: str, facts: BreakFacts) -> list[WaitingItem]:
+    opened = {e.break_id: e.known_at for e in facts.events if e.event == "opened"}
+    items: list[WaitingItem] = []
+    for event in latest_open_breaks(facts.events):
+        aged = is_aged(event, facts.session, facts.max_age_sessions)
+        size = "unpriced" if event.dollar_size is None else f"${event.dollar_size:,.2f}"
+        age = break_age(event.first_seen_session, facts.session)
+        items.append(
+            WaitingItem(
+                book_id=book_id,
+                kind="reconcile_break",
+                since=opened.get(event.break_id, event.known_at),
+                detail=(
+                    f"break {event.break_id} ({', '.join(break_kinds(event))}) on "
+                    f"{event.name}: {size}, first seen {event.first_seen_session.isoformat()}, "
+                    f"{age} session(s) old"
+                    + (f" (aged past {facts.max_age_sessions})" if aged else "")
+                    + f", cause {event.cause or 'unknown'}, "
+                    + (
+                        "restricted (no buys or adds)"
+                        if event.material and event.security_id is not None
+                        else "not restricted"
+                    )
+                    + "; check Alpaca, then true it up"
+                ),
+                command=true_up_command(book_id, event.break_id),
+                aged=aged,
+            )
+        )
+    return items
 
 
 def _order_lagging_items(book_id: str, facts: LagFacts) -> list[WaitingItem]:
@@ -434,6 +498,8 @@ def _book_items(book: BookFacts) -> list[WaitingItem]:
         item = _kill_switch_item(book.book_id, book.switch)
         if item is not None:
             items.append(item)
+    if book.breaks is not None:
+        items.extend(_break_items(book.book_id, book.breaks))
     if book.lag is not None:
         try:
             items.extend(_order_lagging_items(book.book_id, book.lag))

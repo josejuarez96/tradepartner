@@ -582,13 +582,30 @@ class EdgarFilingSource(FilingSource):
         reuse_cached: bool = False,
         event_forms: Sequence[str] = ("8-K", "8-K/A"),
         prefer_stored_index: bool = False,
+        statement_backfill: bool = False,
     ) -> None:
         if not event_forms:
             raise ValueError("event_forms must name at least one form (spec: never empty)")
+        if statement_backfill and not reuse_cached:
+            raise ValueError("statement_backfill reads local caches only: it needs reuse_cached")
         self._settings = settings
         # #660 (`ingest --bulk-from-cache`): company facts always from the
         # cached `companyfacts.zip`, with no request for it.
         self._reuse_cached = reuse_cached
+        # #2872/#2837 (T365's `--statement-backfill`): `statement_facts` reads
+        # local caches only. FSN loads from the cached manifests (no listing,
+        # `HEAD` or extraction, and no `filing_index()` first); a stored index
+        # accession with no cached stamp is skipped and counted on
+        # `.statement_stamps_missing`, never fetched; a CIK the cached zip
+        # lacks whose statement cache holds an empty result under the same
+        # latest accession is carried forward with no request, counted on
+        # `.statement_absent_carried`. The per-CIK companyfacts API is still
+        # asked otherwise (spec item 1 allows it).
+        self._statement_backfill = statement_backfill
+        self.statement_stamps_missing = 0
+        self._stamps_missing: dict[str, int] = {}
+        self.statement_absent_carried = 0
+        self._absent_carried: set[str] = set()
         self._client = client or httpx.Client(timeout=settings.edgar.request_timeout_seconds)
         hooks = self._client.event_hooks
         hooks["request"] = [*hooks.get("request", []), self._count]
@@ -616,6 +633,9 @@ class EdgarFilingSource(FilingSource):
         # Plan T348: the ingest driver's Form 4 XML keeper, called with each fetched
         # body before it is parsed; `None` (the archive off) fetches as before.
         self.form4_xml_keeper: Callable[[str, edgar_raw.FetchedXml], object] | None = None
+        # Plan T347: the driver's daily index keeper, called with each cached daily
+        # file's body before it is parsed; `None` (the archive off) reads as before.
+        self.daily_index_keeper: Callable[[DailyIndexFile, Path, bytes], object] | None = None
         self.sec_forms_requests: dict[str, int] = defaultdict(
             int,
             total=0,
@@ -980,10 +1000,17 @@ class EdgarFilingSource(FilingSource):
         self._maybe_use_stored_index()
         cached = self._load_stamps(cik)
         if self._index_conn is None:
+            if self._statement_backfill:  # #2872: stamps come from `filing_index` alone
+                raise RuntimeError("statement_backfill needs the stored filing index bound")
             return cached
         first_rows = self._index_for_cik(cik, first=True)
         missing = {row.accession for row in first_rows if row.accession not in cached}
-        if missing:
+        if self._statement_backfill:
+            # #2872: skipped and counted (each CIK once per run), never fetched
+            # and never given a run-time stamp.
+            self.statement_stamps_missing += len(missing) - self._stamps_missing.get(cik, 0)
+            self._stamps_missing[cik] = len(missing)
+        elif missing:
             submissions = self._fetch_submissions(cik, missing)
             fetched = self._sgml_checked(
                 cik,
@@ -1309,7 +1336,11 @@ class EdgarFilingSource(FilingSource):
         path = edgar_raw.daily_index_file(
             day.year, quarter, file, settings=self._settings, client=self._client
         )
-        text = path.read_text(encoding="utf-8")
+        body = path.read_bytes()
+        if self.daily_index_keeper is not None:
+            self.daily_index_keeper(file, path, body)  # kept before it is parsed
+        # `read_text`'s universal newlines, as before the keeper
+        text = body.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         text = re.sub(
             r"\b(\d{4})(\d{2})(\d{2})(?=\s+edgar/data/)",
             r"\1-\2-\3",
@@ -1537,6 +1568,34 @@ class EdgarFilingSource(FilingSource):
                 index_quarter,
             )
         stamps = self._incremental_stamps(stamp_input)
+        # #2858: a pending row holds only its first listing, so a later listing of
+        # the accession (a filed_on correction) sits in a daily file the cursor has
+        # passed. When the stamp arrives, read the cached daily files after the
+        # first listing again, as a rebuild of the quarter would.
+        stamped_now = {
+            key: pending[key].listed_on
+            for key in pending
+            if stamps.get(key) is not None and key not in stored
+        }
+        if stamped_now:
+            earliest = min(stamped_now.values())
+            for file in sorted(state.daily_files, key=lambda f: f.name):
+                day = date.fromisoformat(file.name.split(".")[1])
+                if day < earliest or file in selected:
+                    continue
+                quarter = (day.year, (day.month - 1) // 3 + 1)
+                seen_late: set[tuple[str, str]] = set()
+                for row in read_daily(file):
+                    key = (row.cik, row.accession)
+                    if (
+                        key in seen_late
+                        or key not in stamped_now
+                        or day <= stamped_now[key]
+                        or (row.cik not in allowed_ciks and row.form not in kept_forms)
+                    ):
+                        continue
+                    seen_late.add(key)
+                    grouped[key].append((row, day, True, quarter))
         rows_out: list[FilingRow] = []
         source_daily: list[bool] = []
         changed_ciks: set[str] = set()
@@ -2629,6 +2688,10 @@ class EdgarFilingSource(FilingSource):
         """
         if self._fsn_ready:
             return
+        if self._statement_backfill:
+            self._load_cached_fsn()  # #2872: no listing, HEAD or extraction
+            self._fsn_ready = True
+            return
         if not self._filing_index_ran:
             raise RuntimeError("_ensure_fsn: filing_index() must run first")
         self.fsn_duplicates = 0
@@ -2694,6 +2757,12 @@ class EdgarFilingSource(FilingSource):
             elif now != then:
                 self.fsn_reissued += 1  # re-issued: same period, new content
 
+        self._load_cached_fsn()
+        self._fsn_ready = True
+
+    def _load_cached_fsn(self) -> None:
+        """The failed and extracted accessions and the loaded periods, from
+        the cached manifests from `edgar.fsn_first_year` on (no request)."""
         failed: set[str] = set()
         extracted: set[str] = set()
         loaded: list[str] = []
@@ -2708,8 +2777,6 @@ class EdgarFilingSource(FilingSource):
         self._fsn_failed_accessions = frozenset(failed)
         self._fsn_extracted_accessions = frozenset(extracted)
         self._fsn_loaded_periods = tuple(loaded)
-
-        self._fsn_ready = True
 
     def _extract_fsn_period(
         self, period: str, kept_forms: set[str], known_accessions: set[str], *, persist: bool
@@ -4225,6 +4292,13 @@ class EdgarFilingSource(FilingSource):
             self._statement_requested[cik] = key
             self._set_statement_parse_counts(cik, 0, 0, 0)
             return cached
+        if self._statement_backfill and self._absent_and_empty(cik, path, stamps[latest]):
+            # #2837: the zip lacks the CIK and its cached result for this
+            # latest accession is already empty: written as that 404 was.
+            if cik not in self._absent_carried:
+                self._absent_carried.add(cik)
+                self.statement_absent_carried += 1
+            return self._fill_statement_cache(cik, stamps, latest, None, True, None)
         payload, complete, origin = self._company_facts_payload(cik, latest)
         return self._fill_statement_cache(cik, stamps, latest, payload, complete, origin)
 
@@ -4506,6 +4580,51 @@ class EdgarFilingSource(FilingSource):
                 stale += 1
         return stale
 
+    def _decide_facts_bulk(self) -> None:
+        """Open `companyfacts.zip` (or choose the per-CIK API) once per run:
+        the stamping rule `_company_facts_payload` documents."""
+        if self._facts_bulk is not None:
+            return
+        if (
+            self._reuse_cached
+            or self._stale_fact_caches() > self._settings.edgar.bulk_stamp_threshold_ciks
+        ):
+            path = edgar_raw.bulk_company_facts(
+                settings=self._settings, client=self._client, reuse_cached=self._reuse_cached
+            )
+            with zipfile.ZipFile(path) as bulk:
+                self._facts_bulk = (path, frozenset(bulk.namelist()))
+        else:
+            self._facts_bulk = False
+
+    def _absent_and_empty(self, cik: str, path: Path, latest: SubmissionRecord) -> bool:
+        """#2837: whether the cached zip, built at or after `latest`'s
+        acceptance, has no member for `cik`, and its statement cache file
+        holds no record and no conflict under `latest` (any tag digest).
+        SEC then had no XBRL facts for the CIK through `latest`, so the empty
+        file is the per-CIK API's 404 or empty object, not a payload that
+        carried none of the old tags. A file under another accession (a
+        newer filing), or an unparsed payload's (keyed by no accession),
+        does not qualify; nor does a zip built before `latest` (its facts
+        may postdate the zip)."""
+        self._decide_facts_bulk()
+        if not isinstance(self._facts_bulk, tuple) or f"CIK{cik}.json" in self._facts_bulk[1]:
+            return False
+        built = edgar_raw.bulk_built_at(self._facts_bulk[0])
+        if built is None or latest.accepted_at is None or built < latest.accepted_at:
+            return False
+        try:
+            data = json.loads(path.read_bytes())
+            return bool(
+                data["version"] == STATEMENT_VERSION
+                and data["cik"] == cik
+                and str(data["key"]).partition("|")[0] == latest.accession
+                and data["records"] == []
+                and data["conflicts"] == []
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+
     def _company_facts_payload(self, cik: str, latest: str) -> tuple[Any | None, bool, str | None]:
         """The raw company-facts payload, whether it already holds
         `latest` (the filing the cache is keyed by) and the validation input
@@ -4535,18 +4654,7 @@ class EdgarFilingSource(FilingSource):
         for a zip member the per-CIK API is not asked, since its answer would
         likely share the shape (#599). The caller records a payload that
         `parse_company_facts` refuses the same way, under its origin."""
-        if self._facts_bulk is None:
-            if (
-                self._reuse_cached
-                or self._stale_fact_caches() > self._settings.edgar.bulk_stamp_threshold_ciks
-            ):
-                path = edgar_raw.bulk_company_facts(
-                    settings=self._settings, client=self._client, reuse_cached=self._reuse_cached
-                )
-                with zipfile.ZipFile(path) as bulk:
-                    self._facts_bulk = (path, frozenset(bulk.namelist()))
-            else:
-                self._facts_bulk = False
+        self._decide_facts_bulk()
         bulk_payload: Any | None = None
         if isinstance(self._facts_bulk, tuple) and f"CIK{cik}.json" in self._facts_bulk[1]:
             bulk_path = self._facts_bulk[0]

@@ -344,6 +344,44 @@ def test_a_plan_journals_signals_decisions_and_the_plan_row(env: Env) -> None:
     assert [d.decision for d in journaled] == list(outcome.decisions)
 
 
+def _targets_under(env: Env, execution: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
+    """The plan's journaled (side, quantity, notional, target) per name with
+    `paper.execution` set to `execution`."""
+    env.settings = Settings(
+        _env_file=None,
+        store={"path": str(env.settings.store.path)},
+        paper={"live_capital_reference": LIVE_CAPITAL, "execution": execution},
+    )
+    return {
+        sid: (d.side, d.planned_quantity, d.planned_notional, d.target_notional)
+        for sid, d in _decisions(env.plan()).items()
+    }
+
+
+def test_a_mapped_book_with_a_sleeve_leaves_it_in_the_targets_and_others_are_unchanged(
+    fixture_store_path: Path, tmp_path: Path
+) -> None:
+    """#2869: c from `paper.execution[book]` reaches `decisions_from`; c = 0 and an
+    unmapped book keep today's targets and orders."""
+    results: dict[str, dict[str, tuple[Any, ...]]] = {}
+    for name, execution in {
+        "unmapped": {},
+        "other_book": {"daily": {"cash_sleeve_fraction": 0.1}},
+        "zero": {"main": {"cash_sleeve_fraction": 0.0}},
+        "sleeve": {"main": {"cash_sleeve_fraction": 0.1}},
+    }.items():
+        with open_env(fixture_store_path, tmp_path / name) as env:
+            results[name] = _targets_under(env, execution)
+    assert results["zero"] == results["unmapped"] == results["other_book"]
+    base, sleeve = results["unmapped"], results["sleeve"]
+    buys = [sid for sid, row in base.items() if row[0] == "buy"]
+    assert buys
+    for sid in buys:
+        assert sleeve[sid][3] < base[sid][3]
+    for sid in set(base) - set(buys):
+        assert sleeve[sid] == base[sid]
+
+
 def test_the_plan_trial_is_tracking_closed_ok_with_no_metrics(env: Env) -> None:
     sharpes = registry.family_sharpes(env.conn, "momentum")
     outcome = env.plan()

@@ -33,16 +33,17 @@ def store_free_gb(settings: Settings) -> float:
     return free_bytes(Path(settings.store.path)) / GB
 
 
-def ingest_floor_refusal(settings: Settings) -> str | None:
+def ingest_floor_refusal(settings: Settings, *, lead: str = "ingest not started") -> str | None:
     """The refusal text when the store's disk is below `ingest.min_free_disk_gb`,
-    else `None`. A floor of 0 skips the check (and the disk read)."""
+    else `None`. A floor of 0 skips the check (and the disk read). `lead` opens
+    the text; a seed stopping between chunks passes its own (#2857)."""
     floor = settings.ingest.min_free_disk_gb
     if floor <= 0:
         return None
     free = store_free_gb(settings)
     if free < floor:
         return (
-            f"ingest not started: {free:.1f} GB free is below ingest.min_free_disk_gb "
+            f"{lead}: {free:.1f} GB free is below ingest.min_free_disk_gb "
             f"({floor:g} GB); free up disk space and rerun"
         )
     return None

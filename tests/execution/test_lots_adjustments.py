@@ -202,6 +202,49 @@ SYMBOLS = {
 }
 
 
+def test_reversal_restores_lots_and_split_only_from_its_session() -> None:
+    book = Book()
+    book.trade("buy", 10, 10, D0303)
+    original = book.adjust(
+        "owner_true_up", D0305, "SEC_X", quantity=1, explanation={"broker_quantity": 21}
+    )
+    book.adjust(
+        "owner_true_up",
+        D0306,
+        "SEC_X",
+        quantity=-1,
+        explanation={"reversed_adjustment_id": original.adjustment_id},
+    )
+    actions = _splits(("SEC_X", D0304, 2))
+    before = book.run(D0305, actions)[0]
+    assert before == book.run(D0305, actions, adjustments=[original])[0]
+    after = book.run(D0306, actions)
+    baseline = book.run(D0306, actions, adjustments=[])
+    assert sum(lot.quantity for lot in before) == 21
+    assert after == baseline
+
+
+def test_malformed_reversal_is_a_lot_ledger_error() -> None:
+    book = Book()
+    book.trade("buy", 10, 10, D0303)
+    original = book.adjust(
+        "owner_true_up",
+        D0304,
+        "SEC_X",
+        quantity=2,
+        explanation={"broker_quantity": 12},
+    )
+    book.adjust(
+        "owner_true_up",
+        D0305,
+        "SEC_X",
+        quantity=-3,
+        explanation={"reversed_adjustment_id": original.adjustment_id},
+    )
+    with pytest.raises(LotLedgerError, match="opposite reversal"):
+        book.run(D0305)
+
+
 def _splits(*rows: tuple[str, date, float]) -> pl.DataFrame:
     """A frame shaped like `live_actions_as_of`, holding only split rows."""
     return pl.DataFrame(
