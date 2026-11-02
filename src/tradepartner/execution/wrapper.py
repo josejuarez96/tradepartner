@@ -565,9 +565,10 @@ class _Variant:
     amendment 2026-11-01, T370): the arm from `buy_timing.arm_for`, the configured
     timing and c, the sleeve c x E the buys phase kept (or c x the batch-start
     ledger equity when no buys phase read the cash), `idle_cash` B from one
-    `account()` read after the sells' last submit (or at the batch start with no
-    sells phase), and `min_cash`, the lowest raw `account().cash` read in the
-    batch. Phase (i') is T371's, so its counts are 0 here."""
+    `account()` read after the sells' last submit when a buys phase follows and the
+    switch reads clear (with no sells phase, the buys phase's own read; `na` on a
+    batch with no buys phase or a killed one), and `min_cash`, the lowest raw
+    `account().cash` read in the batch. Phase (i') is T371's, so its counts are 0 here."""
 
     arm: str
     timing: str
@@ -989,8 +990,8 @@ class RiskGatedBroker:
         skips: tuple[Skip, ...] = ()
         counted = 0
         has_sells = bool(attempt_scope(rows, book.states, phase=_SELL).attempts)
-        if self._variant is not None and not has_sells:
-            self._note_idle(run, rows, book)  # item 6: at the batch start, no sells phase
+        # Item 6: with no sells phase, B is (ii)'s own read, after its switch check.
+        idle_at_buys = self._variant is not None and not has_sells
         if has_sells:
             if self._engaged(run, book.window):
                 return BatchOutcome(_SKIPPED_KILL_SWITCH)
@@ -1048,8 +1049,15 @@ class RiskGatedBroker:
             skips, counted = (*skips, *refused), counted + len(refused)
             if self._killed:
                 return BatchOutcome(_SKIPPED_KILL_SWITCH, tuple(submitted), skips)
-            if self._variant is not None:
-                self._note_idle(run, rows)  # item 6: after the sells' last submit
+            if (
+                self._variant is not None
+                and any(d.side == _BUY for d in decisions)
+                and not self._engaged(run, book.window)
+            ):
+                # Item 6: B after the sells' last submit, only when a buys phase
+                # follows and the switch reads clear, so a read that only feeds the
+                # record never changes how a sells-only or killed batch ends.
+                self._note_idle(run, rows)
             # After the kill-switch return, so a clock read can't change the halt path.
             if submitted:
                 self._phase_time(notes, "sells_submitted")
@@ -1058,7 +1066,15 @@ class RiskGatedBroker:
         if not any(d.side == _BUY for d in decisions):
             return BatchOutcome(_OK, tuple(submitted), skips)
         bought = self._buys(
-            run, rows, rebalance, sold, len(submitted), counted, len(decisions), notes
+            run,
+            rows,
+            rebalance,
+            sold,
+            len(submitted),
+            counted,
+            len(decisions),
+            notes,
+            idle_at_buys=idle_at_buys,
         )
         return BatchOutcome(
             bought.status,
@@ -1080,8 +1096,12 @@ class RiskGatedBroker:
         prior_skips: int,
         plan_decisions: int,
         notes: list[str],
+        *,
+        idle_at_buys: bool = False,
     ) -> BatchOutcome:
-        """The buys phase, read after the sells' collection (module docstring)."""
+        """The buys phase, read after the sells' collection (module docstring).
+        `idle_at_buys`: the batch had no sells phase, so this phase's cash read is
+        item 6's `idle_cash` too."""
         assert run.session is not None
         book = self._read_book(run, rows)
         scope = attempt_scope(rows, book.states, phase=_BUY)
@@ -1096,6 +1116,8 @@ class RiskGatedBroker:
         if self._variant is not None:
             # Item 3: (ii) never spends below the sleeve c x E, E at this read.
             self._variant.saw(account.cash)
+            if idle_at_buys:
+                self._variant.idle_cash = cash
             sleeve = self._variant.fraction * _ledger_equity(book)
             self._variant.sleeve_cash = sleeve
             if sleeve > 0:
@@ -1251,16 +1273,14 @@ class RiskGatedBroker:
             variant.sleeve_cash = None
         return variant
 
-    def _note_idle(
-        self, run: PaperRunRow, rows: Sequence[DecisionRow], book: _Book | None = None
-    ) -> None:
-        """Item 6's `idle_cash`: B (`_buys_cash`, no sleeve) from one `account()`
-        read, counted toward `min_cash`; `book` is re-read when not given."""
+    def _note_idle(self, run: PaperRunRow, rows: Sequence[DecisionRow]) -> None:
+        """Item 6's `idle_cash` after the sells' last submit: B (`_buys_cash`, no
+        sleeve) from one `account()` read on a fresh book read, counted toward
+        `min_cash`."""
         assert self._variant is not None and run.session is not None
         account = self._broker.account()
         self._variant.saw(account.cash)
-        current = book if book is not None else self._read_book(run, rows)
-        self._variant.idle_cash = self._buys_cash(account, current, run.session)
+        self._variant.idle_cash = self._buys_cash(account, self._read_book(run, rows), run.session)
 
     def _buys_cash(self, account: Account, book: _Book, session: date) -> float:
         """Cash available to buys: broker cash less the open-buy reserve,

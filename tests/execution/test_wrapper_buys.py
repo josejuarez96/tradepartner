@@ -40,10 +40,12 @@ from .test_wrapper_phases import (
     _execute,
     _gate,
     _hold,
+    _override,
     _query,
     _retick,
     _run,
     _settings,
+    _stale_order,
     _submits,
 )
 
@@ -460,3 +462,49 @@ def test_a_sleeve_not_yet_full_shrinks_the_buy_never_the_sell(
     assert env.fake.account().cash >= sleeve
     (line,) = _variant_lines(notes)
     assert paper_execution_fields(line)["sleeve_cash"] == pytest.approx(sleeve)
+
+
+@pytest.mark.parametrize("with_sell", [False, True])
+def test_a_mapped_book_with_the_switch_engaged_still_skips_before_any_read(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, with_sell: bool
+) -> None:
+    """#692 on a book in the map: the record's reads never run ahead of the switch,
+    so an unpriced open buy still ends `skipped_kill_switch` with no broker call."""
+    _mapped(env, cash_sleeve_fraction=0.05)
+    env.new_fake(cash=10_000.0)
+    _stale_order(env, "buy", quantity=3.0)
+    batch = [_decision(env, B, "buy", notional=1000.0)]
+    if with_sell:
+        _hold(env, A, 10.0)
+        batch.insert(0, _decision(env, A, "sell", notional=300.0))
+    _override(env)
+    calls = len(env.fake.calls)
+    notes: list[str] = []
+
+    outcome = _gate(env, alerter_conn).execute(env.run, batch, (), notes=notes)
+
+    assert outcome.status == "skipped_kill_switch"
+    assert not env.fake.calls[calls:]
+    (line,) = _variant_lines(notes)
+    assert paper_execution_fields(line)["idle_cash"] is None
+
+
+def test_a_sells_only_batch_on_a_mapped_book_reads_no_cash(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """With no buys phase to follow, no `account()` read is added after the sells:
+    the line's `idle_cash` and `min_cash` are `na`."""
+    _mapped(env, cash_sleeve_fraction=0.05)
+    _hold(env, A, 10.0)
+    trim = _decision(env, A, "sell", notional=500.0)
+    env.fake.script(FillAt())
+    calls = len(env.fake.calls)
+    notes: list[str] = []
+
+    outcome = _gate(env, alerter_conn).execute(env.run, [trim], (), notes=notes)
+
+    assert outcome.status == "ok"
+    assert "account" not in [c.method for c in env.fake.calls[calls:]]
+    (line,) = _variant_lines(notes)
+    fields = paper_execution_fields(line)
+    assert (fields["idle_cash"], fields["min_cash"]) == (None, None)
