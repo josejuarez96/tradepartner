@@ -94,6 +94,7 @@ def test_build_rules_and_schema_versions_change_hash(monkeypatch: pytest.MonkeyP
         "edgar.cache_dir",
         "edgar.stamp_header_bytes",
         "edgar.incremental_index",
+        "edgar.statement_backfill_chunk_ciks",
         "master.chains",
         "master.chains_dismissed",
         "master.keep_successors",

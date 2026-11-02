@@ -10453,3 +10453,335 @@ def test_sec_forms_run_cites_its_manifest_and_rows_map_by_run_not_by_stamp(
         )
         assert run_id == writer_id and entry["quarter"] == "2018q4"
         assert entry["raw_sha256"] in {z["sha256"] for z in manifest["zips"]}
+
+
+# --- the additive statement backfill (#2826, plan T365) ---------------------
+
+_NET = "us-gaap:NetIncomeLoss"
+_DUAL_F1 = f"{DUAL}-19-000101"
+_BACKFILL_RECORDS = (
+    _sf("revenue", 100, F1, AT1),
+    _sf("revenue", 110, F2, AT2, comparative=True),  # restated: counted, not stored
+    _sf("net_income", 7, F1, AT1, tag=_NET),
+    _sf("net_income", 7, F2, AT2, tag=_NET, comparative=True),
+    _sf("revenue", 50, _DUAL_F1, AT1, cik=DUAL),
+    _sf("net_income", 5, _DUAL_F1, AT1, cik=DUAL, tag=_NET),
+)
+
+
+class _NamedStatements(_StatementSource):
+    """`_StatementSource` answering only the names `settings` lists, as the
+    adapter's parse reads only the configured tags."""
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(_BACKFILL_RECORDS)
+        self._names = set(settings.edgar.statement_tags)
+
+    def statement_facts(self, cik: str) -> list[StatementFactRecord]:
+        return [r for r in super().statement_facts(cik) if r.fact_name in self._names]
+
+
+def _seeded_for_backfill(settings: Settings, **edgar: Any) -> tuple[Settings, Settings]:
+    """A store built under the eight names with an ok index row, and the same
+    settings with `net_income` added (and `edgar` applied to both)."""
+    base = _switched(settings)
+    base = base.model_copy(update={"edgar": base.edgar.model_copy(update=edgar)})
+    tags = {**base.edgar.statement_tags, "net_income": [_NET]}
+    added = base.model_copy(
+        update={"edgar": base.edgar.model_copy(update={"statement_tags": tags})}
+    )
+    _edgar(base, _NamedStatements(base))
+    with open_for_write(base) as conn:
+        seed = SourceRun(
+            "edgar_index",
+            OK,
+            0,
+            ingest_module._index_run_cursor(base, "seed", {}, {"lag_start": "2019-01-01"}),
+            ingest_module._index_run_message(base, "index seed complete", 0),
+        )
+        ingest_module.write_run(conn, "seed-index", NOW, NOW, seed, "rebuild_index")
+    return base, added
+
+
+def _backfill(
+    settings: Settings, source: FilingSource | None = None, **kwargs: Any
+) -> IngestResult:
+    return ingest_session(
+        settings,
+        prices=_Prices(),
+        filings=source if source is not None else _NamedStatements(settings),
+        source="edgar",
+        clock=lambda: NOW,
+        statement_backfill=True,
+        **kwargs,
+    )
+
+
+def _other_tables(read: Callable[[str], list[tuple[Any, ...]]]) -> dict[str, list[Any]]:
+    names = [
+        name
+        for (name,) in read("SELECT table_name FROM information_schema.tables ORDER BY 1")
+        if name not in ("statement_facts", "ingestion_runs")
+    ]
+    return {name: read(f"SELECT * FROM {name} ORDER BY ALL") for name in names}
+
+
+def _backfill_runs(read: Callable[[str], list[tuple[Any, ...]]]) -> list[tuple[Any, ...]]:
+    return read(
+        "SELECT status, rows_added, chunk_cursor FROM ingestion_runs "
+        "WHERE mode = 'statement_backfill' ORDER BY rowid"
+    )
+
+
+def test_statement_backfill_adds_only_the_new_name_and_a_rerun_adds_nothing(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    base, added = _seeded_for_backfill(settings, statement_backfill_chunk_ciks=1)
+    plain = statement_counts(_edgar(base, _NamedStatements(base)).message)
+    existing = _statement_rows(read)
+    others = _other_tables(read)
+    result = _backfill(added)
+    assert result.ok, result.runs[0].message
+    rows = _statement_rows(read)
+    assert [r for r in rows if r[0] != "net_income"] == existing
+    assert [(r[0], r[2], r[3]) for r in rows if r[0] == "net_income"] == [
+        ("net_income", 7, F1),
+        ("net_income", 5, _DUAL_F1),
+    ]
+    assert _other_tables(read) == others
+    digest = ingest_module.statement_tags_digest(added)
+    runs = _backfill_runs(read)
+    assert runs[:2] == [
+        ("partial", 1, f"statement_backfill;through={ACME};tags={digest}"),
+        ("partial", 1, f"statement_backfill;through={DUAL};tags={digest}"),
+    ]
+    assert [r[0] for r in runs] == ["partial", "partial", OK]
+    final = json.loads(runs[2][2])
+    assert final["per_name"]["edgar.statement_tags"]["net_income"] == [_NET]
+    assert final["touch"] == {"lag_start": "2019-01-01"}
+    (message,) = read("SELECT message FROM ingestion_runs WHERE mode = 'statement_backfill' "
+                      "AND status = 'ok'")[0]  # fmt: skip
+    assert message.startswith(f"rule_fingerprint: {build_fingerprint(added).hash}; ")
+    counts = statement_counts(message)
+    # The existing names add nothing, and count exactly what a plain run counts.
+    assert counts["added"] == 2
+    assert (counts["restated"], counts["vintage_late"]) == (
+        plain["restated"],
+        plain["vintage_late"],
+    )
+    assert plain["restated"] == 1
+
+    rerun = _backfill(added)
+    assert rerun.ok
+    assert _statement_rows(read) == rows
+    assert len(_backfill_runs(read)) == 3
+
+
+def test_statement_backfill_failed_chunk_keeps_the_last_commit_and_resumes(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    read: Callable[[str], list[tuple[Any, ...]]],
+) -> None:
+    _, added = _seeded_for_backfill(settings, statement_backfill_chunk_ciks=1)
+    original = ingest_module._write_statement_facts
+
+    def broken(conn: Any, filings: Any, ciks: Sequence[str], *args: Any, **kw: Any) -> Any:
+        counts = original(conn, filings, ciks, *args, **kw)
+        if DUAL in ciks:
+            raise RuntimeError("failed after the DUAL insert")
+        return counts
+
+    monkeypatch.setattr(ingest_module, "_write_statement_facts", broken)
+    failed = _backfill(added)
+    assert failed.runs[0].status == FAILED
+    after_first = _statement_rows(read)
+    assert [(r[0], r[3]) for r in after_first if r[0] == "net_income"] == [("net_income", F1)]
+    assert [r[0] for r in _backfill_runs(read)] == ["partial", FAILED]
+
+    monkeypatch.setattr(ingest_module, "_write_statement_facts", original)
+    source = _NamedStatements(added)
+    assert _backfill(added, source).ok
+    assert set(source.calls) == {DUAL}  # resumed after the committed ACME chunk
+    assert [(r[0], r[3]) for r in _statement_rows(read) if r[0] == "net_income"] == [
+        ("net_income", F1),
+        ("net_income", _DUAL_F1),
+    ]
+
+
+@pytest.mark.parametrize("change", ["list", "migration"])
+def test_statement_backfill_refuses_a_non_additive_change_before_any_write(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    read: Callable[[str], list[tuple[Any, ...]]],
+    change: str,
+) -> None:
+    from tradepartner.store import schema
+
+    _, added = _seeded_for_backfill(settings)
+    if change == "list":
+        tags = {**added.edgar.statement_tags, "revenue": ["us-gaap:Revenues"]}
+        added = added.model_copy(
+            update={"edgar": added.edgar.model_copy(update={"statement_tags": tags})}
+        )
+    else:
+        monkeypatch.setattr(schema, "CURRENT_SCHEMA_VERSION", schema.CURRENT_SCHEMA_VERSION + 1)
+    before = (_statement_rows(read), read("SELECT count(*) FROM ingestion_runs"))
+    source = _NamedStatements(added)
+    result = _backfill(added, source)
+    assert result.runs[0].status == FAILED
+    assert "--rebuild-index" in result.runs[0].message
+    assert ingest_module.statement_backfill_refusal(added) == result.runs[0].message
+    assert source.calls == []
+    assert (_statement_rows(read), read("SELECT count(*) FROM ingestion_runs")) == before
+
+
+def test_statement_backfill_disk_floor_stops_before_a_chunk_and_the_gate_waits_for_ok(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    read: Callable[[str], list[tuple[Any, ...]]],
+) -> None:
+    from tradepartner import diskfloor
+
+    _, added = _seeded_for_backfill(settings, statement_backfill_chunk_ciks=1)
+    added = added.model_copy(
+        update={"ingest": added.ingest.model_copy(update={"min_free_disk_gb": 5.0})}
+    )
+    enabled = added.model_copy(
+        update={"edgar": added.edgar.model_copy(update={"incremental_index": True})}
+    )
+    with pytest.raises(ValueError, match="rules changed"):
+        ingest_module._index_gate(enabled)
+    reads: list[int] = []
+
+    def free(_path: Path) -> int:
+        reads.append(1)
+        return 10**15 if len(reads) <= 1 else 10**9
+
+    monkeypatch.setattr(diskfloor, "free_bytes", free)
+    source = _NamedStatements(added)
+    stopped = _backfill(added, source)
+    assert stopped.runs[0].status == FAILED
+    assert "min_free_disk_gb" in stopped.runs[0].message
+    assert set(source.calls) == {ACME}
+    assert [r[0] for r in _backfill_runs(read)] == ["partial"]
+    with pytest.raises(ValueError, match="rules changed"):
+        ingest_module._index_gate(enabled)  # a partial row never opens the gate
+
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _path: 10**15)
+    assert _backfill(added).ok
+    assert [r[0] for r in _backfill_runs(read)] == ["partial", "partial", OK]
+    ingest_module._index_gate(enabled)  # opens on the final ok row
+
+
+def test_statement_backfill_refuses_a_resume_under_another_digest(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    read: Callable[[str], list[tuple[Any, ...]]],
+) -> None:
+    from tradepartner import diskfloor
+
+    _, added = _seeded_for_backfill(settings, statement_backfill_chunk_ciks=1)
+    reads: list[int] = []
+    monkeypatch.setattr(
+        diskfloor, "free_bytes", lambda _p: 10**15 if reads.append(1) or len(reads) <= 1 else 0
+    )
+    floored = added.model_copy(
+        update={"ingest": added.ingest.model_copy(update={"min_free_disk_gb": 5.0})}
+    )
+    assert _backfill(floored).runs[0].status == FAILED
+    tags = {**added.edgar.statement_tags, "operating_income": ["us-gaap:OperatingIncomeLoss"]}
+    other = added.model_copy(
+        update={"edgar": added.edgar.model_copy(update={"statement_tags": tags})}
+    )
+    before = (_statement_rows(read), _backfill_runs(read))
+    result = _backfill(other)
+    assert result.runs[0].status == FAILED
+    assert "--rebuild-statement-facts" in result.runs[0].message
+    assert (_statement_rows(read), _backfill_runs(read)) == before
+
+
+def test_statement_backfill_dry_run_writes_nothing(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    _, added = _seeded_for_backfill(settings, statement_backfill_chunk_ciks=1)
+    before = (_statement_rows(read), read("SELECT * FROM ingestion_runs ORDER BY ALL"))
+    result = _backfill(added, dry_run=True)
+    assert result.ok, result.runs[0].message
+    assert "dry run" in result.runs[0].message
+    assert (_statement_rows(read), read("SELECT * FROM ingestion_runs ORDER BY ALL")) == before
+
+
+def test_statement_backfill_reads_stamps_from_the_index_with_no_submissions_zip(
+    tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """The real adapter under `--bulk-from-cache`: stamps from `filing_index`,
+    facts from the cached `companyfacts.zip`, no request at all, no
+    `submissions.zip` read and no shares `facts` cache file written."""
+    import zipfile
+
+    from tradepartner.adapters import edgar_source
+
+    settings = Settings(
+        _env_file=None,
+        sec_edgar_user_agent="TradePartner test-agent test@example.com",
+        store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
+        edgar={"cache_dir": str(tmp_path / "cache"), "statement_facts_enabled": True},
+    )
+    base, added = _seeded_for_backfill(settings)
+    accession = f"{ACME}-19-000001"
+    with open_for_write(base) as conn:
+        insert_row(
+            conn,
+            "filing_index",
+            {
+                "cik": ACME,
+                "accession": accession,
+                "form": "10-K",
+                "company_name": "Acme Corp",
+                "filed_on": date(2019, 3, 1),
+                "accepted_at": _at(2019, 3, 1),
+                "listed_on": date(2019, 3, 1),
+                "known_at": _at(2019, 3, 1),
+                "ingested_at": NOW,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    body = {
+        "cik": int(ACME),
+        "facts": {
+            "us-gaap": {
+                "Revenues": {"units": {"USD": [_companyfacts_entry(accession, FY18, 100)]}},
+                "NetIncomeLoss": {"units": {"USD": [_companyfacts_entry(accession, FY18, 9)]}},
+            }
+        },
+    }
+    bulk = tmp_path / "cache" / "bulk"
+    bulk.mkdir(parents=True)
+    with zipfile.ZipFile(bulk / "companyfacts.zip", "w") as archive:
+        archive.writestr(f"CIK{ACME}.json", json.dumps(body))
+    urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        urls.append(str(request.url))
+        return httpx.Response(404)
+
+    adapter = EdgarFilingSource(
+        added,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        clock=lambda: NOW,
+        reuse_cached=True,
+    )
+    adapter._fsn_ready = True
+    adapter._fsn_loaded_periods = ("2099_01",)
+    adapter._save_stamps(
+        ACME, {accession: SubmissionRecord(accession, "10-K", "doc.htm", True, None)}
+    )  # cache metadata only: the acceptance comes from the table
+    facts_dir = tmp_path / "cache" / "facts"
+    result = _backfill(added, adapter)
+    assert result.ok, result.runs[0].message
+    assert urls == []
+    assert not (bulk / "submissions.zip").exists()
+    assert not facts_dir.exists() or not any(facts_dir.rglob("*.json"))
+    assert ("net_income", FY18[1], 9, accession) in [r[:4] for r in _statement_rows(read)]
+    assert (tmp_path / "cache" / "statement_facts" / f"v{edgar_source.STATEMENT_VERSION}").is_dir()

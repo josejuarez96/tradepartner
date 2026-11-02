@@ -99,6 +99,7 @@ EXCLUDED_SETTINGS_KEYS = (
     "edgar.incremental_index",  # T323 adds the gate's on/off switch.
     "edgar.reconcile_recent_quarters",  # T319b: which quarters to re-read, not a build rule.
     "edgar.verify_rotation_days",  # Health sampling window, not a derivation rule.
+    "edgar.statement_backfill_chunk_ciks",  # T365: chunk size, not a derivation rule.
 )
 
 CACHE_VERSION_NAMES = (

@@ -167,6 +167,9 @@ class EdgarConfig(BaseModel):
     # reconciles this many of the latest settled quarters, beside the HEAD-ETag test.
     reconcile_recent_quarters: int = Field(default=8, ge=1)
     incremental_index: bool = False
+    # T365 (#2826): issuer CIKs per `ingest --statement-backfill` chunk, each one
+    # transaction and one `partial` run row; changes no derived row.
+    statement_backfill_chunk_ciks: int = Field(default=1000, gt=0)
     verify_rotation_days: int = Field(default=28, ge=1)
     bulk_stamp_threshold_ciks: int = Field(default=500, gt=0)
     # #1382 guard: SEC's `submissions.zip` serves `acceptanceDateTime` moved by
