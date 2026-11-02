@@ -215,7 +215,16 @@ import traceback
 import uuid
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
-from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence, Sized
+from collections.abc import (
+    Callable,
+    Collection,
+    Container,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+    Sized,
+)
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -939,18 +948,26 @@ def ingest_session(
 
     runs: list[SourceRun] = []
     for name in ("edgar", "alpaca") if source == "all" else (source,):
-        run = _run_source(
-            name,
-            work[name],
-            settings,
-            now,
-            clock,
-            cursor,
-            dry_run,
-            prepare=prepare[name],
-            after_commit=after_commit[name],
-            recover=recover_alpaca if name == "alpaca" else None,
-        )
+        try:
+            run = _run_source(
+                name,
+                work[name],
+                settings,
+                now,
+                clock,
+                cursor,
+                dry_run,
+                prepare=prepare[name],
+                after_commit=after_commit[name],
+                recover=recover_alpaca if name == "alpaca" else None,
+            )
+        finally:
+            if name == "edgar":
+                # #2822: the write step's reopened index handle ends with the
+                # chunk, so the alpaca chunk's read-only price read can open.
+                release = getattr(_unwrap(filings), "release_index", None)
+                if callable(release):
+                    release()
         runs.append(run)
         if run.status == LOCKED:  # the store, not the source: the next would wait out the same lock
             break
@@ -1293,6 +1310,18 @@ class _Recorded(FilingSource):
     def filing_index(self, since: datetime | None = None) -> list[FilingIndexEntry]:
         return list(self._ask("filing_index", since))
 
+    def filing_index_for_cik(self, cik: str) -> list[FilingIndexEntry]:
+        """Keep the source's bounded CIK query through the fetch-pass recorder."""
+        if callable(getattr(self._source, "filing_index_for_cik", None)):
+            return list(self._ask("filing_index_for_cik", cik))
+        return [entry for entry in self.filing_index() if entry.cik == cik]
+
+    def filing_index_for_forms(self, forms: Collection[str]) -> list[FilingIndexEntry]:
+        """Keep cross-CIK form queries bounded and deterministic."""
+        if callable(getattr(self._source, "filing_index_for_forms", None)):
+            return list(self._ask("filing_index_for_forms", tuple(sorted(forms))))
+        return [entry for entry in self.filing_index() if entry.form in forms]
+
     def companies_snapshot(self) -> list[CompanySnapshotEntry]:
         return list(self._ask("companies_snapshot"))
 
@@ -1419,7 +1448,13 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None
             recorded.sec_subjects = frozenset(
                 cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
             )
-    _fetch_and_gate(recorded, settings)
+    try:
+        _fetch_and_gate(recorded, settings)
+    finally:
+        # A full repair's index handle (#2822): no store handle outlives the pass.
+        release = getattr(_unwrap(recorded), "release_index", None)
+        if callable(release):
+            release()
     _check_source_failures(_unwrap(recorded), dry_run=dry_run)
     recorded.frozen = True
 

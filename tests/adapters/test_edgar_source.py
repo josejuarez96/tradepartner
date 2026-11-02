@@ -21,6 +21,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import httpx
 import pytest
 from edgar_transport import (
@@ -53,9 +54,13 @@ from tradepartner.adapters.filings import (
     DelistingFiling,
     FilingIndexEntry,
     IncrementalIndexState,
+    SecFormFiling,
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.config import Settings
+from tradepartner.ingest import write_sec_form_accession
+from tradepartner.store import filing_index as stored_index
+from tradepartner.store import schema
 from tradepartner.store.filing_index import FilingRow
 from tradepartner.store.master import build_master
 
@@ -622,6 +627,764 @@ def test_sec_form_stamp_uses_cache_and_refuses_unlisted(
     assert source.sec_form_stamp(APPLE, accession, date(2026, 9, 24)) == record
     assert source.sec_form_stamp(APPLE, "0000320193-26-999999", date(2026, 9, 24)) is None
     assert calls == [APPLE, APPLE]
+
+
+def test_stored_index_stamp_wins_over_stamps_cache(tmp_path: Path) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000123"
+    accepted = CLOCK - timedelta(days=1)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                accession,
+                "10-K",
+                "Apple",
+                date(2026, 9, 24),
+                accepted,
+                date(2026, 9, 24),
+                True,
+            )
+        ],
+        CLOCK,
+    )
+    source._save_stamps(
+        APPLE,
+        {
+            accession: SubmissionRecord(
+                accession, "10-Q", "document.htm", False, CLOCK - timedelta(days=2)
+            )
+        },
+    )
+    source.use_index(conn)
+    records = source._read_stamps(APPLE)
+    assert records[accession].accepted_at == accepted
+    assert records[accession].form == "10-K"
+
+
+def test_filing_index_reads_table_and_uncommitted_rows_without_quarter_walk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    stored = stored_index.Listing(
+        APPLE,
+        "0000320193-26-000123",
+        "10-K",
+        "Apple",
+        date(2026, 9, 23),
+        CLOCK - timedelta(days=2),
+        date(2026, 9, 23),
+        True,
+    )
+    fresh = stored_index.Listing(
+        APPLE,
+        "0000320193-26-000124",
+        "10-Q",
+        "Apple",
+        date(2026, 9, 24),
+        CLOCK - timedelta(days=1),
+        date(2026, 9, 24),
+        True,
+    )
+    stored_index.insert_listings(conn, [stored], CLOCK)
+    source.use_index(conn, [fresh])
+    monkeypatch.setattr(source, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    assert [entry.accession for entry in source.filing_index()] == [
+        stored.accession,
+        fresh.accession,
+    ]
+
+
+def test_table_index_matches_quarterly_walk_for_issuer_history(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    accepted = CLOCK - timedelta(days=1)
+    rows = [
+        UnstampedFiling(APPLE, "Apple", form, f"0000320193-26-{n:06d}", date(2026, 9, 24))
+        for n, form in ((1, "10-K"), (2, "8-K"))
+    ]
+    quarterly = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    monkeypatch.setattr(quarterly, "_rows", lambda *_args: iter(((2026, 3), row) for row in rows))
+    monkeypatch.setattr(
+        quarterly,
+        "_stamp_each",
+        lambda _kept: iter(
+            [
+                (
+                    APPLE,
+                    {
+                        row.accession: SubmissionRecord(
+                            row.accession, row.form, "document.htm", False, accepted
+                        )
+                        for row in rows
+                    },
+                )
+            ]
+        ),
+    )
+    expected = quarterly.filing_index()
+
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                row.cik,
+                row.accession,
+                row.form,
+                row.company_name,
+                row.filed_on,
+                accepted,
+                row.filed_on,
+                True,
+            )
+            for row in rows
+        ],
+        CLOCK,
+    )
+    table = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    table.use_index(conn)
+    monkeypatch.setattr(table, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    assert table.filing_index() == expected
+    assert table.filing_index_for_cik(APPLE) == expected
+    assert table.filing_index_for_forms({"8-K"}) == [e for e in expected if e.form == "8-K"]
+
+
+def test_table_index_matches_quarterly_issuer_and_exchange_copy_rules(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    accepted = CLOCK - timedelta(days=1)
+    exchange_accession = "0000000007-26-000002"
+    spec = [
+        (APPLE, "10-K", "0000320193-26-000001"),
+        ("0000000003", "SC 13D", "0000000003-26-000001"),
+        ("0000000004", "25", "0000000005-26-000001"),
+        ("0000000006", "25", "0000000006-26-000001"),
+        ("0000000007", "10-K", "0000000007-26-000001"),
+        ("0000000007", "25-NSE", exchange_accession),
+        ("0000000008", "25-NSE", exchange_accession),
+    ]
+    rows = [
+        UnstampedFiling(cik, "Issuer", form, accession, date(2026, 9, 24))
+        for cik, form, accession in spec
+    ]
+    quarterly = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    monkeypatch.setattr(quarterly, "_rows", lambda *_args: iter(((2026, 3), row) for row in rows))
+
+    def stamps(kept: Any) -> Any:
+        return iter(
+            [
+                (
+                    cik,
+                    {
+                        accession: SubmissionRecord(accession, row.form, "doc.xml", False, accepted)
+                        for accession, (row, _quarter) in by_accession.items()
+                    },
+                )
+                for cik, by_accession in kept.items()
+            ]
+        )
+
+    monkeypatch.setattr(quarterly, "_stamp_each", stamps)
+    expected = quarterly.filing_index()
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                row.cik,
+                row.accession,
+                row.form,
+                row.company_name,
+                row.filed_on,
+                accepted,
+                row.filed_on,
+                True,
+                0 if row.cik != "0000000008" else 1,
+            )
+            for row in rows
+        ],
+        CLOCK,
+    )
+    table = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    table.use_index(conn)
+    monkeypatch.setattr(table, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    assert table.filing_index() == expected
+    assert table.filing_index_for_cik("0000000003") == []
+    assert table.filing_index_for_cik("0000000006") == []
+    assert table.filing_index_for_forms({"25-NSE"}) == [
+        entry for entry in expected if entry.form == "25-NSE"
+    ]
+
+
+def test_completed_index_seed_routes_full_rebuild_to_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    base = edgar_settings(tmp_path)
+    settings = base.model_copy(
+        update={"store": base.store.model_copy(update={"path": str(tmp_path / "store.duckdb")})}
+    )
+    conn = duckdb.connect(settings.store.path)
+    schema.init_schema(conn)
+    accession = "0000320193-26-000123"
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                accession,
+                "10-K",
+                "Apple",
+                date(2026, 9, 24),
+                CLOCK - timedelta(days=1),
+                date(2026, 9, 24),
+                True,
+            )
+        ],
+        CLOCK,
+    )
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, started_at, status, mode) "
+        "VALUES ('seed', 'edgar_index', ?, 'ok', 'rebuild')",
+        [CLOCK],
+    )
+    conn.close()
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK, prefer_stored_index=True)
+    monkeypatch.setattr(source, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    assert [entry.accession for entry in source.filing_index()] == [accession]
+
+    nightly = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    monkeypatch.setattr(nightly, "_rows", lambda *_args: iter(()))
+    assert nightly.filing_index() == []  # key-off nightly still walks the quarterly files
+
+    stale_repair = EdgarFilingSource(
+        settings, clock=lambda: CLOCK + timedelta(days=1), prefer_stored_index=True
+    )
+    with pytest.raises(RuntimeError, match="stored filing index is stale"):
+        stale_repair.filing_index()
+
+
+def test_table_delisting_fetches_missing_stamp_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000128"
+    accepted = CLOCK - timedelta(days=1)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                accession,
+                "25",
+                "Apple",
+                date(2026, 9, 24),
+                accepted,
+                date(2026, 9, 24),
+                True,
+            )
+        ],
+        CLOCK,
+    )
+    source.use_index(conn)
+    record = SubmissionRecord(accession, "25", "form25.xml", False, accepted)
+    calls: list[set[str]] = []
+
+    def fetch(_cik: str, wanted: set[str]) -> edgar_source_module._Submissions:
+        calls.append(wanted)
+        return edgar_source_module._Submissions({accession: record}, [], CLOCK)
+
+    monkeypatch.setattr(source, "_fetch_submissions", fetch)
+    monkeypatch.setattr(source, "_sgml_checked", lambda _cik, records: dict(records))
+    monkeypatch.setattr(
+        source,
+        "_fetch_delisting",
+        lambda cik, acc, form, _document, at: DelistingFiling(cik, form, "Common", "NYSE", acc, at),
+    )
+    assert [filing.accession for filing in source.delistings()] == [accession]
+    assert calls == [{accession}]
+
+
+def test_table_filing_events_refresh_keeps_cache_only_records_and_stamp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000129"
+    accepted = CLOCK - timedelta(days=1)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                accession,
+                "8-K",
+                "Apple",
+                date(2026, 9, 24),
+                accepted,
+                date(2026, 9, 24),
+                True,
+            )
+        ],
+        CLOCK,
+    )
+    sentinel = "0000320193-26-000130"
+    cached_at = accepted - timedelta(hours=1)
+    source._save_stamps(
+        APPLE,
+        {
+            accession: SubmissionRecord(accession, "8-K", "document.htm", False, cached_at),
+            sentinel: SubmissionRecord(sentinel, "8-K", "", False, None),
+        },
+        items_refreshed=False,
+    )
+    source.use_index(conn)
+    monkeypatch.setattr(
+        source,
+        "_items_source",
+        lambda _cik, _wanted: (
+            {
+                accession: SubmissionRecord(
+                    accession, "8-K", "document.htm", False, cached_at, "1.01"
+                )
+            },
+            True,
+        ),
+    )
+    assert [event.accepted_at for event in source.filing_events(APPLE)] == [accepted]
+    cached = source._load_stamps(APPLE)
+    assert cached[accession].accepted_at == cached_at
+    assert cached[accession].items == "1.01"
+    assert cached[sentinel].accepted_at is None
+
+
+def test_pending_table_rows_remain_unstamped_and_counted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2026, 1, 1)}
+            )
+        }
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    rows = [
+        (APPLE, "10-K", "0000320193-26-000131"),
+        ("0000000004", "25", "0000000005-26-000132"),
+        ("0000000003", "SC 13D", "0000000003-26-000133"),
+    ]
+    conn.executemany(
+        "INSERT INTO filing_index_pending "
+        "(cik, accession, form, company_name, filed_on, listed_on) "
+        "VALUES (?, ?, ?, 'Issuer', ?, ?)",
+        [
+            (cik, accession, form, date(2026, 9, 24), date(2026, 9, 24))
+            for cik, form, accession in rows
+        ],
+    )
+    source.use_index(conn)
+    assert source.filing_index() == []
+    assert {row.accession for row in source.unstamped_filings} == {rows[0][2], rows[1][2]}
+    pending_13d = source._stored_13d_rows({"SC 13D"})
+    assert [row.accession for row in pending_13d] == [rows[2][2]]
+    # SEC has not published the acceptance yet: the submissions answer is empty.
+    monkeypatch.setattr(
+        source,
+        "_fetch_submissions",
+        lambda _cik, _wanted: edgar_source_module._Submissions({}, [], CLOCK, empty=True),
+    )
+    assert (
+        source._sec_stamped(pending_13d[0].cik, pending_13d[0].accession, pending_13d[0].filed_on)
+        is None
+    )
+    assert source.sec_forms_counts["unstamped"] == 1
+    monkeypatch.setattr(source, "_stamp_each", lambda kept: iter((cik, {}) for cik in kept))
+    assert source.delistings() == []
+    assert source.unstamped_delistings == 1
+
+
+def test_pending_form25_is_stamped_on_demand(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000000005-26-000137"
+    cik = "0000000004"
+    conn.execute(
+        "INSERT INTO filing_index_pending "
+        "(cik, accession, form, company_name, filed_on, listed_on) "
+        "VALUES (?, ?, '25', 'Issuer', ?, ?)",
+        [cik, accession, date(2026, 9, 24), date(2026, 9, 24)],
+    )
+    source.use_index(conn)
+    record = SubmissionRecord(accession, "25", "form25.xml", False, CLOCK - timedelta(days=1))
+    monkeypatch.setattr(
+        source,
+        "_fetch_submissions",
+        lambda _cik, _wanted: edgar_source_module._Submissions({accession: record}, [], CLOCK),
+    )
+    monkeypatch.setattr(source, "_sgml_checked", lambda _cik, records: dict(records))
+    monkeypatch.setattr(
+        source,
+        "_fetch_delisting",
+        lambda issuer, acc, form, _document, at: DelistingFiling(
+            issuer, form, "Common", "NYSE", acc, at
+        ),
+    )
+    assert [row.accession for row in source.delistings()] == [accession]
+    assert source.unstamped_delistings == 0
+
+
+def test_table_readers_honor_index_first_year(tmp_path: Path) -> None:
+    settings = edgar_settings(tmp_path, index_first_year=2026)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    old = stored_index.Listing(
+        APPLE,
+        "0000320193-25-000001",
+        "10-K",
+        "Apple",
+        date(2025, 9, 24),
+        CLOCK - timedelta(days=366),
+        date(2025, 9, 24),
+        False,
+    )
+    old_delisting = replace(old, accession="0000320193-25-000002", form="25")
+    current = replace(
+        old,
+        accession="0000320193-26-000001",
+        filed_on=date(2026, 9, 24),
+        accepted_at=CLOCK - timedelta(days=1),
+        listed_on=date(2026, 9, 24),
+    )
+    stored_index.insert_listings(conn, [old, old_delisting, current], CLOCK)
+    source.use_index(conn)
+    assert [row.accession for row in source.filing_index()] == [current.accession]
+    assert [row.accession for row in source.filing_index_for_cik(APPLE)] == [current.accession]
+    assert source.delistings() == []
+
+
+def test_uncommitted_revision_waits_for_its_known_at(tmp_path: Path) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    later = FilingRow(
+        APPLE,
+        "0000320193-26-000136",
+        "10-K",
+        "Apple",
+        date(2026, 9, 24),
+        CLOCK - timedelta(days=1),
+        date(2026, 9, 24),
+        CLOCK + timedelta(days=1),
+        CLOCK + timedelta(days=1),
+    )
+    source.use_index(conn, [later])
+    assert source.filing_index() == []
+    assert source.filing_index_for_cik(APPLE) == []
+
+
+def test_13d_cutoff_uses_first_known_date_and_counts_crossing(tmp_path: Path) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2026, 1, 1)}
+            )
+        }
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000123"
+    first = stored_index.Listing(
+        APPLE,
+        accession,
+        "SC 13D",
+        "Apple",
+        date(2025, 12, 31),
+        CLOCK - timedelta(days=3),
+        date(2026, 1, 2),
+        True,
+    )
+    corrected = replace(first, filed_on=date(2026, 1, 2), listed_on=date(2026, 1, 3))
+    stored_index.insert_listings(conn, [first], CLOCK - timedelta(days=2))
+    stored_index.insert_listings(conn, [corrected], CLOCK - timedelta(days=1))
+    source._save_stamps(
+        APPLE,
+        {
+            accession: SubmissionRecord(
+                accession, "SC 13D", "document.htm", False, first.accepted_at
+            )
+        },
+    )
+    source.use_index(conn)
+    assert source._stored_13d_rows({"SC 13D"}) == []
+    assert source.sec_forms_counts["sec_forms_cutoff_corrected"] == 1
+    assert source.sec_form_stamp(APPLE, accession, corrected.filed_on).filing_date == first.filed_on
+
+
+def test_stored_13d_first_row_keeps_sec_order_when_cik_order_differs(tmp_path: Path) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2026, 1, 1)}
+            )
+        }
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000000002-26-000001"
+    rows = [
+        stored_index.Listing(
+            cik,
+            accession,
+            "SC 13D",
+            "Issuer",
+            date(2026, 9, 24),
+            CLOCK - timedelta(days=1),
+            date(2026, 9, 24),
+            True,
+        )
+        for cik in ("0000000002", "0000000001")
+    ]
+    rows = [replace(row, list_position=position) for position, row in enumerate(rows)]
+    stored_index.insert_listings(conn, rows, CLOCK)
+    source.use_index(conn)
+    assert source._stored_13d_rows({"SC 13D"})[0].cik == "0000000002"
+
+
+def test_first_known_sec_filed_date_refuses_other_stored_date(tmp_path: Path) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000125"
+    first = stored_index.Listing(
+        APPLE,
+        accession,
+        "SC 13D",
+        "Apple",
+        date(2026, 9, 23),
+        CLOCK - timedelta(days=3),
+        date(2026, 9, 23),
+        True,
+    )
+    corrected = replace(first, filed_on=date(2026, 9, 24), listed_on=date(2026, 9, 24))
+    stored_index.insert_listings(conn, [first], CLOCK - timedelta(days=2))
+    stored_index.insert_listings(conn, [corrected], CLOCK - timedelta(days=1))
+    source._save_stamps(
+        APPLE,
+        {
+            accession: SubmissionRecord(
+                accession, "SC 13D", "document.htm", False, first.accepted_at
+            )
+        },
+    )
+    source.use_index(conn)
+    record = source.sec_form_stamp(APPLE, accession, corrected.filed_on)
+    assert record is not None and record.filing_date == first.filed_on
+    stored = SecFormFiling(
+        accession, first.form, first.accepted_at, corrected.filed_on, (APPLE,), (APPLE,)
+    )
+    derived = replace(stored, filed_date=record.filing_date)
+    assert write_sec_form_accession(conn, stored, ingested_at=CLOCK).added == 1
+    assert write_sec_form_accession(conn, derived, ingested_at=CLOCK).changed == 1
+
+
+def test_table_event_clock_uses_first_known_date_after_correction(tmp_path: Path) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK + timedelta(days=2))
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000135"
+    accepted = CLOCK
+    first = stored_index.Listing(
+        APPLE,
+        accession,
+        "8-K",
+        "Apple",
+        date(2026, 9, 24),
+        accepted,
+        date(2026, 9, 24),
+        True,
+    )
+    stored_index.insert_listings(conn, [first], CLOCK)
+    stored_index.insert_listings(
+        conn,
+        [replace(first, filed_on=date(2026, 9, 23), listed_on=date(2026, 9, 25))],
+        CLOCK + timedelta(days=1),
+    )
+    source.use_index(conn)
+    source._check_event_clock(
+        APPLE,
+        SubmissionRecord(
+            accession, "8-K", "document.htm", False, accepted, filing_date=date(2026, 9, 23)
+        ),
+    )
+    assert source.filing_events_clock_suspect == 0
+
+
+def test_delistings_reads_stored_index_without_quarter_walk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000123"
+    accepted = CLOCK - timedelta(days=1)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                accession,
+                "25",
+                "Apple",
+                date(2026, 9, 24),
+                accepted,
+                date(2026, 9, 24),
+                True,
+            )
+        ],
+        CLOCK,
+    )
+    source._save_stamps(
+        APPLE, {accession: SubmissionRecord(accession, "25", "form25.xml", False, accepted)}
+    )
+    source._save_delisting_cache(
+        accession, DelistingFiling(APPLE, "25", "Common", "NASDAQ", accession, accepted)
+    )
+    source.use_index(conn)
+    monkeypatch.setattr(source, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    assert [row.accession for row in source.delistings()] == [accession]
+
+
+def test_stored_delisting_uses_first_sec_row_across_cik_groups(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    first_cik, second_cik = "0000000002", "0000000001"
+    target = "0000000002-26-000001"
+    rows = [
+        stored_index.Listing(
+            second_cik,
+            "0000000001-26-000000",
+            "25",
+            "Other",
+            date(2026, 9, 23),
+            CLOCK - timedelta(days=2),
+            date(2026, 9, 23),
+            True,
+        ),
+        *[
+            stored_index.Listing(
+                cik,
+                target,
+                "25",
+                "Issuer",
+                date(2026, 9, 24),
+                CLOCK - timedelta(days=1),
+                date(2026, 9, 24),
+                True,
+            )
+            for cik in (first_cik, second_cik)
+        ],
+    ]
+    rows[-2:] = [replace(row, list_position=position) for position, row in enumerate(rows[-2:])]
+    stored_index.insert_listings(conn, rows, CLOCK)
+    for cik in {row.cik for row in rows}:
+        source._save_stamps(
+            cik,
+            {
+                row.accession: SubmissionRecord(
+                    row.accession, row.form, "form25.xml", False, row.accepted_at
+                )
+                for row in rows
+                if row.cik == cik
+            },
+        )
+    source.use_index(conn)
+    monkeypatch.setattr(
+        source,
+        "_fetch_delisting",
+        lambda cik, accession, form, _document, accepted: DelistingFiling(
+            cik, form, "Common", "NYSE", accession, accepted
+        ),
+    )
+    filings = source.delistings()
+    assert next(filing.cik for filing in filings if filing.accession == target) == first_cik
+
+
+def test_stale_fact_count_opens_only_touched_cik_stamps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    other = "0000000002"
+    rows = [
+        stored_index.Listing(
+            cik,
+            f"{i:010d}-26-000001",
+            "10-K",
+            "Issuer",
+            date(2026, 9, 24),
+            CLOCK - timedelta(days=1),
+            date(2026, 9, 24),
+            True,
+        )
+        for i, cik in ((320193, APPLE), (2, other))
+    ]
+    stored_index.insert_listings(conn, rows, CLOCK)
+    for row in rows:
+        source._save_stamps(
+            row.cik,
+            {
+                row.accession: SubmissionRecord(
+                    row.accession, row.form, "document.htm", False, row.accepted_at
+                )
+            },
+        )
+    source.use_index(conn, touched_ciks=frozenset({APPLE}))
+    load = source._load_stamps
+    monkeypatch.setattr(
+        source,
+        "_load_stamps",
+        lambda cik: load(cik) if cik == APPLE else pytest.fail("untouched stamps loaded"),
+    )
+    assert source._stale_fact_caches() == 1
 
 
 def test_sec_13d_discovery_reads_filer_index_and_document_subject(
@@ -2689,3 +3452,120 @@ def test_a_cached_v5_cover_page_is_no_longer_served(settings: Settings) -> None:
     )
     source = _source(settings, EdgarRouter())
     assert source._load_cover_cache(accession) is None
+
+
+def _seeded_store_settings(tmp_path: Path, clock: datetime) -> Settings:
+    base = edgar_settings(tmp_path)
+    settings = base.model_copy(
+        update={"store": base.store.model_copy(update={"path": str(tmp_path / "store.duckdb")})}
+    )
+    conn = duckdb.connect(settings.store.path)
+    schema.init_schema(conn)
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, started_at, status, mode) "
+        "VALUES ('seed', 'edgar_index', ?, 'ok', 'rebuild')",
+        [clock],
+    )
+    conn.close()
+    return settings
+
+
+def test_released_repair_index_frees_the_store_and_reopens_for_the_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#2822 safety: after the fetch pass a read-only open in this process
+    succeeds (the master-retract dry run, the price read); a raw-source read
+    meanwhile fails closed; the write step's raw reads (`chain_candidates`'
+    form query) reopen the same table beside the writer, never the
+    quarterly walk."""
+    from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only
+    from tradepartner.store.master import SUCCESSOR_EVIDENCE_FORMS, _filing_index_for_forms
+
+    settings = _seeded_store_settings(tmp_path, CLOCK)
+    conn = duckdb.connect(settings.store.path)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                "0000320193-26-000150",
+                "8-K12B",
+                "Apple",
+                date(2026, 9, 24),
+                CLOCK - timedelta(days=1),
+                date(2026, 9, 24),
+                True,
+            ),
+            stored_index.Listing(
+                APPLE,
+                "0000320193-26-000151",
+                "10-K",
+                "Apple",
+                date(2026, 9, 24),
+                CLOCK - timedelta(days=1),
+                date(2026, 9, 24),
+                True,
+            ),
+        ],
+        CLOCK,
+    )
+    conn.close()
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK, prefer_stored_index=True)
+    monkeypatch.setattr(source, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    before = _filing_index_for_forms(source, SUCCESSOR_EVIDENCE_FORMS)
+    assert [entry.accession for entry in before] == ["0000320193-26-000150"]
+    source.release_index()
+    with open_read_only(settings) as read:
+        assert read.execute("SELECT count(*) FROM ingestion_runs").fetchone() == (1,)
+        with pytest.raises(StoreLockedError, match="store busy"):
+            source.delistings()
+    with open_for_write(settings):
+        assert _filing_index_for_forms(source, SUCCESSOR_EVIDENCE_FORMS) == before
+    source.close()
+
+
+def test_pending_settle_check_uses_first_known_filed_on_quarter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Quant S1 (#2822): a filing of Apr 1 first listed by a quarterly file
+    dated Mar 31 settles with Q2, not Q1, so a lagging submissions answer
+    on Apr 5 writes no unstampable marker for the 13D or the Form 25."""
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2026, 1, 1)}
+            )
+        }
+    )
+    clock = datetime(2026, 4, 5, 16, tzinfo=UTC)
+    source = EdgarFilingSource(settings, clock=lambda: clock)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    rows = [
+        ("0000000003", "SC 13D", "0000000003-26-000140"),
+        ("0000000004", "25", "0000000005-26-000141"),
+    ]
+    conn.executemany(
+        "INSERT INTO filing_index_pending "
+        "(cik, accession, form, company_name, filed_on, listed_on) "
+        "VALUES (?, ?, ?, 'Issuer', ?, ?)",
+        [
+            (cik, accession, form, date(2026, 4, 1), date(2026, 3, 31))
+            for cik, form, accession in rows
+        ],
+    )
+    source.use_index(conn)
+    other = SubmissionRecord("0000000009-26-000001", "8-K", "x.htm", False, clock)
+    monkeypatch.setattr(
+        source,
+        "_fetch_submissions",
+        lambda _cik, _wanted: edgar_source_module._Submissions({other.accession: other}, [], clock),
+    )
+    monkeypatch.setattr(source, "_sgml_checked", lambda _cik, records: dict(records))
+    cik_13d, _, accession_13d = rows[0]
+    assert source.sec_form_stamp(cik_13d, accession_13d, date(2026, 4, 1)) is None
+    assert accession_13d not in source._load_stamps(cik_13d)
+    assert source.delistings() == []
+    cik_25, _, accession_25 = rows[1]
+    assert accession_25 not in source._load_stamps(cik_25)

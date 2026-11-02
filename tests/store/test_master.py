@@ -27,6 +27,7 @@ import pytest
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 
 from tradepartner.adapters.alpaca_prices import ListingResolver, registrant_evidence
+from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
@@ -37,6 +38,8 @@ from tradepartner.adapters.filings import (
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.config import Settings
+from tradepartner.ingest import _Recorded
+from tradepartner.store import filing_index as stored_index
 from tradepartner.store import schema
 from tradepartner.store.asof import listings_as_of
 from tradepartner.store.db import configure_connection, insert_row
@@ -48,6 +51,8 @@ from tradepartner.store.master import (
     MasterBuild,
     ShownSpan,
     Succession,
+    _filing_index_for_cik,
+    _filing_index_for_forms,
     _refuse_separator,
     build_chains,
     build_master,
@@ -61,6 +66,40 @@ from tradepartner.store.master import (
 )
 
 INGESTED_AT = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+
+
+def test_cross_cik_and_per_cik_index_queries_skip_full_materialization(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = Settings(_env_file=None, edgar={"cache_dir": str(tmp_path)})
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    rows = [
+        stored_index.Listing(
+            cik,
+            f"{cik}-26-{i:06d}",
+            form,
+            "Issuer",
+            date(2026, 9, 24),
+            INGESTED_AT - timedelta(days=1),
+            date(2026, 9, 24),
+            True,
+        )
+        for i, (cik, form) in enumerate(
+            ((ACME, "10-K"), (OLDCO, "10-K"), (OLDCO, "8-K12B")), start=1
+        )
+    ]
+    stored_index.insert_listings(conn, rows, INGESTED_AT)
+    source = EdgarFilingSource(settings, clock=lambda: INGESTED_AT)
+    source.use_index(conn, touched_ciks=frozenset({ACME}))
+    monkeypatch.setattr(source, "filing_index", lambda *_args: pytest.fail("full index"))
+    assert [row.cik for row in _filing_index_for_cik(source, ACME)] == [ACME]
+    assert [row.cik for row in _filing_index_for_forms(source, {"8-K12B"})] == [OLDCO]
+    recorded = _Recorded(source)
+    assert [row.cik for row in _filing_index_for_cik(recorded, ACME)] == [ACME]
+    assert [row.cik for row in _filing_index_for_forms(recorded, {"8-K12B"})] == [OLDCO]
+
+
 FETCHED_AT = datetime(2026, 9, 24, 14, 0, tzinfo=UTC)
 
 ACME = "0000000001"  # 10-K filer from 2005; a Form 4 names it as subject earlier

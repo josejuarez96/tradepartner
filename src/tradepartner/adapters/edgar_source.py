@@ -287,7 +287,7 @@ import shutil
 import zipfile
 import zlib
 from collections import OrderedDict, defaultdict
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -300,6 +300,11 @@ import duckdb
 import httpx
 
 from tradepartner.adapters import edgar_raw
+from tradepartner.adapters.accession_rows import (
+    AccessionRow,
+    first_per_accession,
+    issuer_delistings,
+)
 from tradepartner.adapters.daily_index import DailyIndexFile, daily_files_to_read
 from tradepartner.adapters.edgar import (
     SEC_FORMS_PARSER_VERSION,
@@ -353,6 +358,8 @@ from tradepartner.adapters.index_reconcile import FileRow, StoredRow, reconcile_
 from tradepartner.calendar import is_session, next_session
 from tradepartner.config import Settings, clean_message
 from tradepartner.health import EDGAR_FILING_DATE_CUTOFF, clock_suspect
+from tradepartner.store import filing_index as stored_index
+from tradepartner.store.db import StoreLockedError, _is_lock_error, configure_connection
 from tradepartner.store.filing_index import FilingRow
 from tradepartner.store.master import _is_plain_common
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -573,6 +580,7 @@ class EdgarFilingSource(FilingSource):
         *,
         reuse_cached: bool = False,
         event_forms: Sequence[str] = ("8-K", "8-K/A"),
+        prefer_stored_index: bool = False,
     ) -> None:
         if not event_forms:
             raise ValueError("event_forms must name at least one form (spec: never empty)")
@@ -627,6 +635,13 @@ class EdgarFilingSource(FilingSource):
         self.skipped_filers = 0
         self.unstamped_filings: list[UnstampedFiling] = []
         self._filing_index_entries: tuple[FilingIndexEntry, ...] | None = None
+        self._index_conn: duckdb.DuckDBPyConnection | None = None
+        self._owned_index_conn: duckdb.DuckDBPyConnection | None = None
+        self._index_checked = False
+        self._index_released = False
+        self._prefer_stored_index = prefer_stored_index
+        self._index_new_rows: tuple[stored_index.FilingRow | stored_index.Listing, ...] = ()
+        self._index_touched_ciks: frozenset[str] | None = None
         self.fsn_duplicates = 0
         self.fsn_reissued = 0
         self.fsn_reissue_undetected = 0
@@ -809,6 +824,182 @@ class EdgarFilingSource(FilingSource):
     def _now(self) -> datetime:
         return ensure_tz_aware_utc(self._clock(), field_name="clock()")
 
+    def _new_index_row_visible(self, row: stored_index.FilingRow | stored_index.Listing) -> bool:
+        # A Listing is this run's uncommitted first row; a FilingRow can be a
+        # revision whose publication (known_at) follows its acceptance.
+        return row.accepted_at <= self._now() and (
+            not isinstance(row, stored_index.FilingRow) or row.known_at <= self._now()
+        )
+
+    def _index_row_known_at(self, row: stored_index.FilingRow | stored_index.Listing) -> datetime:
+        return row.known_at if isinstance(row, stored_index.FilingRow) else self._now()
+
+    def use_index(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        new_rows: Sequence[stored_index.FilingRow | stored_index.Listing] = (),
+        *,
+        touched_ciks: frozenset[str] | None = None,
+    ) -> None:
+        """Read stored filings plus this run's uncommitted listings for builds.
+
+        The caller owns the connection and keeps it open through the build.
+        Rows are read at this source's clock; a later revision cannot enter an
+        earlier build. ``new_rows`` is independent of the incremental reader.
+        """
+        if self._owned_index_conn is not None:
+            self.close()
+        self._index_checked = True
+        self._index_released = False
+        self._index_conn = conn
+        self._index_new_rows = tuple(new_rows)
+        self._index_touched_ciks = touched_ciks
+        self._filing_index_entries = None
+
+    def close(self) -> None:
+        """Release a store connection opened for an explicit full repair."""
+        if self._owned_index_conn is not None:
+            self._owned_index_conn.close()
+            self._owned_index_conn = None
+            self._index_conn = None
+
+    def release_index(self) -> None:
+        """End of the fetch pass: drop the repair's store handle (#2822).
+
+        The handle is released so the dry run's read-only connection, the
+        price read and other processes are not locked out between the fetch
+        pass and the write. A later read on the raw source (the write step's
+        `chain_candidates`, the SEC forms writer) reopens the same store in
+        the writer's mode; a reopen that meets a read-only handle in this
+        process fails closed with `StoreLockedError`, never walking the
+        quarterly files instead.
+        """
+        if self._owned_index_conn is not None:
+            self.close()
+            self._index_released = True
+
+    def _open_index(self, path: Path) -> duckdb.DuckDBPyConnection:
+        """A configured read-write handle; a lock or a same-process mode
+        conflict is `StoreLockedError` with fixed text (no path, no PID)."""
+        try:
+            conn = duckdb.connect(str(path))
+        except duckdb.IOException as exc:
+            if _is_lock_error(exc):
+                raise StoreLockedError("store busy: the filing index is locked") from None
+            raise
+        except duckdb.ConnectionException:
+            raise StoreLockedError(
+                "store busy: the filing index is open in this process in another mode"
+            ) from None
+        try:
+            return configure_connection(conn, self._settings.store)
+        except BaseException:
+            conn.close()
+            raise
+
+    def _maybe_use_stored_index(self) -> None:
+        """Full repair and rebuild commands use a completed index seed."""
+        if self._index_released:
+            # Reopen the index this run already checked and read; the seed
+            # check is not repeated, so the run cannot switch readers midway.
+            # The new handle reads committed rows only, never the writer's
+            # open transaction; a repair run writes no filing_index row, so
+            # it reads the rows the fetch pass read.
+            conn = self._open_index(Path(self._settings.store.path))
+            memo = self._filing_index_entries
+            self.use_index(conn)
+            self._filing_index_entries = memo  # same table, same clock
+            self._owned_index_conn = conn
+            return
+        if self._index_checked or not self._prefer_stored_index:
+            return
+        self._index_checked = True
+        path = Path(self._settings.store.path)
+        if not path.is_file():
+            return
+        # Keep the same connection mode as the later writer: DuckDB rejects
+        # simultaneous read-only and read-write handles to one store. The
+        # fetch pass releases it (`release_index`) before any other opens.
+        conn = self._open_index(path)
+        try:
+            seed = conn.execute(
+                "SELECT max(started_at) FROM ingestion_runs WHERE source = 'edgar_index' "
+                "AND status = 'ok'"
+            ).fetchone()
+            if seed is None or seed[0] is None:
+                conn.close()
+                return
+            latest_edgar = conn.execute(
+                "SELECT max(started_at) FROM ingestion_runs WHERE source = 'edgar' "
+                "AND status = 'ok'"
+            ).fetchone()
+            if seed[0].astimezone(UTC).date() < self._now().date() or (
+                latest_edgar is not None
+                and latest_edgar[0] is not None
+                and latest_edgar[0] > seed[0]
+            ):
+                raise RuntimeError("stored filing index is stale; rebuild the index before repair")
+        except duckdb.CatalogException:
+            conn.close()
+            return  # a pre-T318 store has no cursor table
+        except BaseException:
+            conn.close()
+            raise
+        self.use_index(conn)
+        self._owned_index_conn = conn
+
+    def _index_for_cik(
+        self, cik: str, *, first: bool = False
+    ) -> list[stored_index.FilingRow | stored_index.Listing]:
+        if self._index_conn is None:
+            return []
+        stored_rows = (
+            stored_index.first_known(self._index_conn, self._now(), cik=cik)
+            if first
+            else stored_index.by_cik(self._index_conn, cik, self._now())
+        )
+        first_day = date(self._settings.edgar.index_first_year, 1, 1)
+        stored_rows = [row for row in stored_rows if row.listed_on >= first_day]
+        by_key: dict[tuple[str, str], stored_index.FilingRow | stored_index.Listing] = {
+            (row.cik, row.accession): row for row in stored_rows
+        }
+        for row in self._index_new_rows:
+            if row.cik == cik and self._new_index_row_visible(row) and row.listed_on >= first_day:
+                key = (row.cik, row.accession)
+                if first:
+                    by_key.setdefault(key, row)
+                elif key not in by_key or self._index_row_known_at(row) > self._index_row_known_at(
+                    by_key[key]
+                ):
+                    by_key[key] = row
+        return list(by_key.values())
+
+    def _read_stamps(self, cik: str) -> dict[str, SubmissionRecord]:
+        """Use cache metadata but only the table's form and acceptance stamp."""
+        self._maybe_use_stored_index()
+        cached = self._load_stamps(cik)
+        if self._index_conn is None:
+            return cached
+        first_rows = self._index_for_cik(cik, first=True)
+        missing = {row.accession for row in first_rows if row.accession not in cached}
+        if missing:
+            submissions = self._fetch_submissions(cik, missing)
+            fetched = self._sgml_checked(
+                cik,
+                {a: submissions.records[a] for a in missing if a in submissions.records},
+            )
+            if fetched:
+                cached.update(fetched)
+                self._save_stamps(cik, cached)
+        records: dict[str, SubmissionRecord] = {}
+        for row in first_rows:
+            prior = cached.get(row.accession)
+            if prior is not None:
+                records[row.accession] = replace(
+                    prior, form=row.form, accepted_at=row.accepted_at, filing_date=row.filed_on
+                )
+        return records
+
     # --- the filing index --------------------------------------------------
 
     def filing_index(self, since: datetime | None = None) -> list[FilingIndexEntry]:
@@ -816,10 +1007,14 @@ class EdgarFilingSource(FilingSource):
         times; unstamped rows go to `.unstamped_filings`, never the result."""
         if since is not None:
             since = ensure_tz_aware_utc(since, field_name="since")
+        self._maybe_use_stored_index()
         if self._filing_index_entries is not None:
             return [
                 e for e in self._filing_index_entries if since is None or e.accepted_at >= since
             ]
+        if self._index_conn is not None:
+            stored_entries = self._stored_filing_index()
+            return [e for e in stored_entries if since is None or e.accepted_at >= since]
         self.unstamped_filings, self._open_quarters = [], {}
         start = (self._settings.edgar.index_first_year, 1)
         last = quarter_of(self._now())
@@ -889,6 +1084,221 @@ class EdgarFilingSource(FilingSource):
         self._filing_index_entries = tuple(entries)
         del entries
         return [e for e in self._filing_index_entries if since is None or e.accepted_at >= since]
+
+    def _stored_filing_index(self) -> list[FilingIndexEntry]:
+        """Full issuer history from the table under the quarterly walk's rules."""
+        assert self._index_conn is not None
+        issuers = self._stored_issuer_ciks()
+        entries = [entry for cik in sorted(issuers) for entry in self._issuer_entries(cik)]
+        entries.sort(key=lambda entry: (entry.accepted_at, entry.accession, entry.cik))
+        self.unstamped_filings = [
+            row
+            for row in self._pending_rows()
+            if row.cik in issuers and not self._pending_exchange_copy(row)
+        ]
+        self._filing_index_entries = tuple(entries)
+        self._filing_index_ran = True
+        return entries
+
+    def _stored_issuer_ciks(self) -> set[str]:
+        """Apply the quarterly walk's issuer and delisting-subject rule."""
+        assert self._index_conn is not None
+        issuer_forms = set(self._settings.master.issuer_forms) - _DELISTING_FORMS
+        first_day = date(self._settings.edgar.index_first_year, 1, 1)
+        placeholders = ", ".join("?" for _ in issuer_forms)
+        issuers = {
+            row[0]
+            for row in self._index_conn.execute(
+                f"SELECT DISTINCT cik FROM filing_index WHERE form IN ({placeholders}) "
+                "AND known_at <= ? AND listed_on >= ?",
+                [*sorted(issuer_forms), self._now(), first_day],
+            ).fetchall()
+        }
+        for form in _DELISTING_FORMS:
+            for first_row in stored_index.first_known(self._index_conn, self._now(), form=form):
+                if first_row.listed_on >= first_day and not _filed_by(first_row):
+                    issuers.add(first_row.cik)
+        for fresh_row in self._index_new_rows:
+            if (
+                self._new_index_row_visible(fresh_row)
+                and fresh_row.listed_on >= first_day
+                and (
+                    fresh_row.form in issuer_forms
+                    or (fresh_row.form in _DELISTING_FORMS and not _filed_by(fresh_row))
+                )
+            ):
+                issuers.add(fresh_row.cik)
+        for pending in self._pending_rows():
+            if pending.form in issuer_forms or (
+                pending.form in _DELISTING_FORMS and not _filed_by(pending)
+            ):
+                issuers.add(pending.cik)
+        return issuers
+
+    def _pending_rows(
+        self, forms: Collection[str] | None = None, *, cik: str | None = None
+    ) -> list[UnstampedFiling]:
+        assert self._index_conn is not None
+        predicate = " AND cik = ?" if cik is not None else ""
+        params: list[date | str] = [
+            self._now().astimezone(_EASTERN).date(),
+            date(self._settings.edgar.index_first_year, 1, 1),
+        ]
+        if cik is not None:
+            params.append(cik)
+        rows = self._index_conn.execute(
+            "SELECT cik, company_name, form, accession, filed_on FROM filing_index_pending "
+            f"WHERE listed_on <= ? AND listed_on >= ?{predicate} "
+            "ORDER BY listed_on, list_position NULLS LAST, cik",
+            params,
+        ).fetchall()
+        return [
+            UnstampedFiling(cik, name, form, accession, filed_on)
+            for cik, name, form, accession, filed_on in rows
+            if forms is None or form in forms
+        ]
+
+    def _pending_exchange_copy(self, row: UnstampedFiling) -> bool:
+        if row.form not in _EXCHANGE_FORMS or not _filed_by(row):
+            return False
+        assert self._index_conn is not None
+        known = stored_index.accession_listing_order(self._index_conn, row.accession, self._now())
+        pending = self._pending_rows(_EXCHANGE_FORMS)
+        ciks = {r.cik for r in known if r.accession == row.accession}
+        ciks.update(r.cik for r in pending if r.accession == row.accession)
+        return len(ciks) > 1
+
+    def _exchange_copy(self, row: stored_index.FilingRow | stored_index.Listing) -> bool:
+        if row.form not in _EXCHANGE_FORMS or not _filed_by(row):
+            return False
+        assert self._index_conn is not None
+        ciks = {
+            listed.cik
+            for listed in stored_index.accession_listing_order(
+                self._index_conn, row.accession, self._now()
+            )
+        }
+        ciks.update(
+            listed.cik
+            for listed in self._index_new_rows
+            if listed.accession == row.accession and self._new_index_row_visible(listed)
+        )
+        return len(ciks) > 1
+
+    def _is_issuer_cik(self, cik: str) -> bool:
+        issuer_forms = set(self._settings.master.issuer_forms) - _DELISTING_FORMS
+        return any(
+            row.form in issuer_forms or (row.form in _DELISTING_FORMS and not _filed_by(row))
+            for row in (*self._index_for_cik(cik, first=True), *self._pending_rows(cik=cik))
+        )
+
+    def _issuer_entries(self, cik: str) -> list[FilingIndexEntry]:
+        return [
+            FilingIndexEntry(row.cik, row.company_name, row.form, row.accession, row.accepted_at)
+            for row in self._index_for_cik(cik, first=True)
+            if not self._exchange_copy(row)
+        ]
+
+    def _stored_form_rows(
+        self, forms: Collection[str], *, first: bool
+    ) -> list[stored_index.FilingRow | stored_index.Listing]:
+        """Visible table rows of selected forms, with uncommitted rows added."""
+        assert self._index_conn is not None
+        rows: list[stored_index.FilingRow | stored_index.Listing] = []
+        for form in forms:
+            if first:
+                rows.extend(stored_index.first_known(self._index_conn, self._now(), form=form))
+            else:
+                rows.extend(stored_index.by_form(self._index_conn, form, self._now()))
+        first_day = date(self._settings.edgar.index_first_year, 1, 1)
+        rows = [row for row in rows if row.listed_on >= first_day]
+        by_key: dict[tuple[str, str], stored_index.FilingRow | stored_index.Listing] = {
+            (row.cik, row.accession): row for row in rows
+        }
+        for row in self._index_new_rows:
+            if (
+                row.form in forms
+                and self._new_index_row_visible(row)
+                and row.listed_on >= first_day
+            ):
+                key = (row.cik, row.accession)
+                if first:
+                    by_key.setdefault(key, row)
+                elif key not in by_key or self._index_row_known_at(row) > self._index_row_known_at(
+                    by_key[key]
+                ):
+                    by_key[key] = row
+        # The stored API supplies first-listing metadata for shared accessions.
+        # Physical insertion order changes during rebuilds and restamps.
+        counts: dict[str, int] = {}
+        for row in by_key.values():
+            counts[row.accession] = counts.get(row.accession, 0) + 1
+        order_rows = {
+            (row.cik, row.accession): row
+            for accession, count in counts.items()
+            if count > 1
+            for row in stored_index.accession_listing_order(
+                self._index_conn, accession, self._now()
+            )
+        }
+
+        def listing_key(
+            row: stored_index.FilingRow | stored_index.Listing,
+        ) -> tuple[date, bool, int, str]:
+            listed = order_rows.get((row.cik, row.accession), row)
+            return (
+                listed.listed_on,
+                listed.list_position is None,
+                listed.list_position if listed.list_position is not None else 0,
+                listed.cik,
+            )
+
+        return sorted(
+            by_key.values(),
+            key=lambda row: (
+                row.accepted_at,
+                row.accession,
+                listing_key(row),
+            ),
+        )
+
+    def filing_index_for_cik(self, cik: str) -> list[FilingIndexEntry]:
+        """Read one CIK's complete visible history from the table when bound."""
+        self._maybe_use_stored_index()
+        if self._index_conn is None:
+            return [entry for entry in self.filing_index() if entry.cik == cik]
+        return self._issuer_entries(cik) if self._is_issuer_cik(cik) else []
+
+    def filing_index_for_forms(self, forms: Collection[str]) -> list[FilingIndexEntry]:
+        """Read selected forms across CIKs, including filer-only CIKs."""
+        self._maybe_use_stored_index()
+        if self._index_conn is None:
+            return [entry for entry in self.filing_index() if entry.form in forms]
+        issuers = self._stored_issuer_ciks()
+        return [
+            FilingIndexEntry(row.cik, row.company_name, row.form, row.accession, row.accepted_at)
+            for row in self._stored_form_rows(forms, first=True)
+            if row.cik in issuers and not self._exchange_copy(row)
+        ]
+
+    def _stored_13d_rows(self, forms: Collection[str]) -> list[UnstampedFiling]:
+        assert self._index_conn is not None
+        cutoff = self._settings.events.sec_forms_backfill_start
+        first_rows = self._stored_form_rows(forms, first=True)
+        latest = {
+            (row.cik, row.accession): row for row in self._stored_form_rows(forms, first=False)
+        }
+        for row in first_rows:
+            revision = latest[(row.cik, row.accession)]
+            if (row.filed_on >= cutoff) != (revision.filed_on >= cutoff):
+                self._sec_count("sec_forms_cutoff_corrected", row.accession)
+        selected = [
+            UnstampedFiling(row.cik, row.company_name, row.form, row.accession, row.filed_on)
+            for row in first_rows
+            if row.filed_on >= cutoff
+        ]
+        selected.extend(row for row in self._pending_rows(forms) if row.filed_on >= cutoff)
+        return list(first_per_accession(selected).values())
 
     def _incremental_daily_rows(self, file: DailyIndexFile) -> tuple[UnstampedFiling, ...]:
         """Parse one listed daily file, translating its YYYYMMDD dates for form.idx."""
@@ -1587,9 +1997,55 @@ class EdgarFilingSource(FilingSource):
         """
         if not self._settings.events.sec_forms_enabled:
             return None
+        self._maybe_use_stored_index()
         _validate_cik(issuer_cik)
         edgar_raw.validate_accession(accession)
+        first_row = next(
+            (
+                row
+                for row in self._index_for_cik(issuer_cik, first=True)
+                if row.accession == accession
+            ),
+            None,
+        )
+        if self._index_conn is not None and first_row is None:
+            pending = self._index_conn.execute(
+                "SELECT filed_on FROM filing_index_pending "
+                "WHERE cik = ? AND accession = ? AND listed_on <= ? AND listed_on >= ?",
+                [
+                    issuer_cik,
+                    accession,
+                    self._now().astimezone(_EASTERN).date(),
+                    date(self._settings.edgar.index_first_year, 1, 1),
+                ],
+            ).fetchone()
+            if pending is None:
+                return None
+            # The settle check dates a pending row by its first-known filed_on
+            # (T323a), never by listed_on, which a quarterly file can set a
+            # quarter early.
+            filed_date = pending[0]
+        if first_row is not None:
+            filed_date = first_row.filed_on
         stamps = self._load_stamps(issuer_cik)
+        if first_row is not None:
+            record = stamps.get(accession)
+            if record is None:
+                submissions = self._fetch_submissions(issuer_cik, {accession})
+                fetched = submissions.records.get(accession)
+                if fetched is None:
+                    return None
+                record = self._sgml_checked(issuer_cik, {accession: fetched}).get(accession)
+                if record is None:
+                    return None
+                stamps[accession] = record
+                self._save_stamps(issuer_cik, stamps)
+            return replace(
+                record,
+                form=first_row.form,
+                accepted_at=first_row.accepted_at,
+                filing_date=filed_date,
+            )
         if accession not in stamps:
             submissions = self._fetch_submissions(issuer_cik, {accession})
             found = submissions.records.get(accession)
@@ -1700,7 +2156,8 @@ class EdgarFilingSource(FilingSource):
                 accession,
             )
             return None
-        if clock_suspect(record.accepted_at, filed_date):
+        effective_date = record.filing_date if self._index_conn is not None else filed_date
+        if clock_suspect(record.accepted_at, effective_date or filed_date):
             self._sec_count("clock_suspect", accession)
             return None
         if record.accepted_at > self._now():
@@ -1760,7 +2217,9 @@ class EdgarFilingSource(FilingSource):
             accession,
             record.form,
             record.accepted_at,
-            filed_date,
+            record.filing_date
+            if self._index_conn is not None and record.filing_date
+            else filed_date,
             (parsed.issuer_cik,),
             parsed.filer_ciks,
             parsed.transactions,
@@ -1785,6 +2244,7 @@ class EdgarFilingSource(FilingSource):
         self.sec_forms_requests["retries_backoffs"] += 1
 
     def _sec_forms_13d_impl(self, subjects: frozenset[str] | None) -> list[SecFormFiling]:
+        self._maybe_use_stored_index()
         start = (
             max(
                 self._settings.edgar.index_first_year,
@@ -1803,12 +2263,15 @@ class EdgarFilingSource(FilingSource):
             {"SC 13D", "SC 13D/A", "SCHEDULE 13D", "SCHEDULE 13D/A"}
         )
         accessions: dict[str, UnstampedFiling] = {}
-        for _, row in self._rows(quarters, last):
-            if (
-                row.form in wanted
-                and row.filed_on >= self._settings.events.sec_forms_backfill_start
-            ):
-                accessions.setdefault(row.accession, row)
+        if self._index_conn is not None:
+            accessions = first_per_accession(self._stored_13d_rows(wanted))
+        else:
+            for _, row in self._rows(quarters, last):
+                if (
+                    row.form in wanted
+                    and row.filed_on >= self._settings.events.sec_forms_backfill_start
+                ):
+                    accessions.setdefault(row.accession, row)
         result: list[SecFormFiling] = []
         for accession, row in accessions.items():
             if self._sec_identity_missing(accession):
@@ -1967,6 +2430,20 @@ class EdgarFilingSource(FilingSource):
     # --- filing events (T164c, #1358) ----------------------------------------
 
     def _check_event_clock(self, cik: str, record: SubmissionRecord) -> None:
+        self._maybe_use_stored_index()
+        if self._index_conn is not None:
+            first_row = next(
+                (
+                    row
+                    for row in self._index_for_cik(cik, first=True)
+                    if row.accession == record.accession
+                ),
+                None,
+            )
+            if first_row is not None:
+                record = replace(
+                    record, accepted_at=first_row.accepted_at, filing_date=first_row.filed_on
+                )
         key = (cik, record.accession)
         if (
             record.form in self._event_forms
@@ -1993,9 +2470,10 @@ class EdgarFilingSource(FilingSource):
         accessions whose `items` is still unknown after the refresh, a
         terminal state), each CIK counted once per instance, once refreshed."""
         _validate_cik(cik)
-        stamps = self._load_stamps(cik)
+        stamps = self._read_stamps(cik)
         if stamps and not self._items_refreshed.get(cik, True):
-            stamps = self._refresh_items(cik, stamps)
+            self._refresh_items(cik, self._load_stamps(cik))
+            stamps = self._read_stamps(cik)
         refreshed = self._items_refreshed.get(cik, True)
         events: list[FilingEvent] = []
         unstamped = missing = 0
@@ -2449,7 +2927,7 @@ class EdgarFilingSource(FilingSource):
         module docstring's "Cover pages and headers" section."""
         pages = [
             CoverPage(cik, record.accession, record.accepted_at, payload.listings)
-            for record, payload in self._cover_sources(cik, self._load_stamps(cik))
+            for record, payload in self._cover_sources(cik, self._read_stamps(cik))
             if record.accepted_at is not None
         ]
         pages.sort(key=lambda p: (p.accepted_at, p.accession))
@@ -2578,7 +3056,7 @@ class EdgarFilingSource(FilingSource):
         FSN with no request, plus a ranged SGML header where the module
         docstring's "Cover pages and headers" section says one is owed."""
         self._ensure_fsn()
-        stamps = self._load_stamps(cik)
+        stamps = self._read_stamps(cik)
         fsn_cache = self._load_fsn_cache(cik)
         wanted = set(forms)
         lag_start = self._lag_window_start()
@@ -2701,6 +3179,7 @@ class EdgarFilingSource(FilingSource):
         parse, or a quarantined accession (T11h), makes no request."""
         if since is not None:
             since = ensure_tz_aware_utc(since, field_name="since")
+        self._maybe_use_stored_index()
         self.pre_xml_delistings = 0
         self.unstamped_delistings = 0
         start = (self._settings.edgar.index_first_year, 1)
@@ -2708,28 +3187,60 @@ class EdgarFilingSource(FilingSource):
         quarters = [(y, q) for y in range(start[0], last[0] + 1) for q in range(1, 5)]
         quarters = [q for q in quarters if start <= q <= last]
 
-        delisting_ciks: dict[str, set[str]] = {}
-        for _, row in self._rows(quarters, last):
-            if row.form in _DELISTING_FORMS:
-                delisting_ciks.setdefault(row.accession, set()).add(row.cik)
-
         kept: dict[str, dict[str, tuple[UnstampedFiling, Quarter]]] = {}
-        for quarter, row in self._rows(quarters, last):
-            if row.form not in _DELISTING_FORMS:
-                continue
-            if (
-                row.form in _EXCHANGE_FORMS
-                and _filed_by(row)
-                and len(delisting_ciks[row.accession]) > 1
-            ):
-                continue  # the exchange's copy of a 25-NSE; the subject company keeps it
-            kept.setdefault(row.cik, {}).setdefault(row.accession, (row, quarter))
-
-        # #2616: of each CIK's full-history stamps, only its delisting rows'.
-        stamps = {
-            cik: {a: loaded[a] for a in kept[cik] if a in loaded}
-            for cik, loaded in self._stamp_each(kept)
-        }
+        preferred_cik: dict[str, str] = {}
+        if self._index_conn is not None:
+            stored = self._stored_form_rows(_DELISTING_FORMS, first=True)
+            pending = self._pending_rows(_DELISTING_FORMS)
+            pending_keys = {(row.cik, row.accession) for row in pending}
+            selected = issuer_delistings(
+                [
+                    UnstampedFiling(
+                        row.cik, row.company_name, row.form, row.accession, row.filed_on
+                    )
+                    for row in stored
+                ]
+                + pending
+            )
+            preferred_cik = {
+                accession: row.cik for accession, row in first_per_accession(selected).items()
+            }
+            pending_kept: dict[str, dict[str, tuple[UnstampedFiling, Quarter]]] = {}
+            for filing in selected:
+                # Settle by the first-known filed_on's quarter, pending or not.
+                quarter = (filing.filed_on.year, (filing.filed_on.month - 1) // 3 + 1)
+                kept.setdefault(filing.cik, {}).setdefault(filing.accession, (filing, quarter))
+                if (filing.cik, filing.accession) in pending_keys:
+                    pending_kept.setdefault(filing.cik, {})[filing.accession] = (filing, quarter)
+            stamps = {
+                cik: {a: loaded[a] for a in kept[cik] if a in loaded}
+                for cik in kept
+                for loaded in (self._read_stamps(cik),)
+            }
+            for cik, loaded in self._stamp_each(pending_kept):
+                stamps[cik].update({a: loaded[a] for a in pending_kept[cik] if a in loaded})
+        else:
+            delisting_ciks: dict[str, set[str]] = {}
+            for _, quarterly_row in self._rows(quarters, last):
+                if quarterly_row.form in _DELISTING_FORMS:
+                    delisting_ciks.setdefault(quarterly_row.accession, set()).add(quarterly_row.cik)
+            for quarter, quarterly_row in self._rows(quarters, last):
+                if quarterly_row.form not in _DELISTING_FORMS:
+                    continue
+                if (
+                    quarterly_row.form in _EXCHANGE_FORMS
+                    and _filed_by(quarterly_row)
+                    and len(delisting_ciks[quarterly_row.accession]) > 1
+                ):
+                    continue  # the exchange's copy of a 25-NSE
+                kept.setdefault(quarterly_row.cik, {}).setdefault(
+                    quarterly_row.accession, (quarterly_row, quarter)
+                )
+            # #2616: of each CIK's full-history stamps, only its delisting rows'.
+            stamps = {
+                cik: {a: loaded[a] for a in kept[cik] if a in loaded}
+                for cik, loaded in self._stamp_each(kept)
+            }
         # One result per accession (plan T11f): a Form 25 kept under several
         # CIKs is served once, from the first CIK (index order) that stamps it.
         candidates: dict[str, list[tuple[str, SubmissionRecord | None]]] = {}
@@ -2743,6 +3254,8 @@ class EdgarFilingSource(FilingSource):
                 for c, r in options
                 if r is not None and r.accepted_at is not None
             ]
+            if accession in preferred_cik:
+                stamped.sort(key=lambda candidate: candidate[0] != preferred_cik[accession])
             if not stamped:
                 # Every unstamped delisting accession, so an exchange-only 25-NSE
                 # (a row `filing_index` never keeps) is visible too. It overlaps
@@ -2873,7 +3386,7 @@ class EdgarFilingSource(FilingSource):
         _validate_cik(cik)
         self._ensure_fsn()
         edgar_settings = self._settings.edgar
-        stamps = self._load_stamps(cik)
+        stamps = self._read_stamps(cik)
         cache = self._load_filename_cache(cik)
         first_cover = self._first_cover_filing(cik, stamps)
         first_cover_at = first_cover.accepted_at if first_cover is not None else None
@@ -3517,7 +4030,7 @@ class EdgarFilingSource(FilingSource):
         _validate_cik(cik)
         self._ensure_fsn()
         wanted = set(names)
-        stamps = self._load_stamps(cik)
+        stamps = self._read_stamps(cik)
         company = self._company_facts(cik, stamps, wanted)  # accession -> unstamped facts
         by_key: dict[tuple[str, str, str], dict[str, list[_CachedFact]]] = {}
 
@@ -3618,7 +4131,7 @@ class EdgarFilingSource(FilingSource):
         if not self._settings.edgar.statement_facts_enabled:
             return []
         self._ensure_fsn()
-        stamps = self._load_stamps(cik)
+        stamps = self._read_stamps(cik)
         cached = self._statement_cache(cik, stamps)
         if cached is None:
             return []  # no stamped cover-form accession: nothing asked, as `facts`
@@ -3961,14 +4474,22 @@ class EdgarFilingSource(FilingSource):
         """Stamped CIKs whose facts cache, or (only while the switch is on,
         #660) statement cache, is not keyed by their latest cover-form
         accession: the bulk decision's count."""
+        self._maybe_use_stored_index()
         statements = self._settings.edgar.statement_facts_enabled
         cover_forms = set(self._settings.edgar.cover_page_forms)
         stale = 0
-        for stamps_path in self._stamps_path("0").parent.glob("*.json"):
-            other = stamps_path.stem
+        if self._index_conn is not None and self._index_touched_ciks is None:
+            # A full repair takes the bulk zip without scanning every stamps file.
+            return self._settings.edgar.bulk_stamp_threshold_ciks + 1
+        if self._index_conn is not None:
+            assert self._index_touched_ciks is not None
+            ciks: Iterable[str] = self._index_touched_ciks
+        else:
+            ciks = (path.stem for path in self._stamps_path("0").parent.glob("*.json"))
+        for other in ciks:
             if not _CIK_PATTERN.fullmatch(other):
                 continue  # not a stamps file
-            other_latest = self._facts_cache_key(self._load_stamps(other), cover_forms)
+            other_latest = self._facts_cache_key(self._read_stamps(other), cover_forms)
             if other_latest is None:
                 continue
             cache = self._cache / "facts" / f"v{PARSER_VERSION}" / f"{other}.json"
@@ -4268,7 +4789,7 @@ def _validate_cik(cik: str) -> None:
         raise ValueError(f"cik must be a 10-digit zero-padded string, got {cik!r}")
 
 
-def _filed_by(row: UnstampedFiling) -> bool:
+def _filed_by(row: AccessionRow) -> bool:
     """Whether `row` is listed under the CIK that submitted it (the accession prefix)."""
     return int(row.accession[:10]) == int(row.cik)
 
