@@ -140,7 +140,7 @@ The pipeline starts as one manual campaign, not a monthly operation.
 - [ ] Given the selection, when it is made, then at most one card is forwarded, chosen without any return having been read for it, and its strict-tier file states k and the batch denominator in its disclosure and in its frozen kill line.
 - [ ] Given a fast look of form (a), or any scratch read of store returns allowed under D5, when its exposure record is read (or, before T357 ships, the record's fields on the card), then `kill_line_basis` is `posted_before_read` (the kill line's comment `created_at` or commit time is at or before `read_at`), and the batch row names the denominator.
 - [ ] Given any card, mining pass, fast look or rung 2-O run of the pilot, when its reads are listed, then none touches a store row whose `known_at` or session is on or after 2026-10-01 (execution-cost measurement excepted), every stage-4a event count ends at 2023-12-29, and every census of held fields ends at 2026-09-30.
-- [ ] Given the pilot's page, when the owner reads it, then it states the verdict under the working / failing test (at least one candidate reached the strict tier that the ad hoc route would not have picked; or none did, or the admitted cards resemble the eight killed), the agent-days spent, and the stop rule's outcome.
+- [ ] Given the pilot's page, when the owner reads it, then it states the verdict under the working / failing test (at least one candidate reached the strict tier that the ad hoc route would not have picked; or none did, or the admitted cards are of the two kinds already killed: a published slow anomaly in liquid names, or a fast signal at today's cost), the agent-days spent, and the stop rule's outcome.
 
 ## Out of scope
 
