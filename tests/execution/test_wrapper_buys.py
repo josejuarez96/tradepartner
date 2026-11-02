@@ -382,20 +382,20 @@ def test_idle_cash_is_read_after_the_sells_last_submit(
 @pytest.mark.parametrize(
     ("execution", "arm", "fallback"),
     [
-        ({"buy_timing": "at_open"}, "V1", "open_tranche_not_built"),
-        ({"buy_timing": "alternate", "alternate_start": S}, "V1", "open_tranche_not_built"),
+        ({"buy_timing": "at_open"}, "V1", "no_sells"),
+        ({"buy_timing": "alternate", "alternate_start": S}, "V1", "no_sells"),
         ({"buy_timing": "alternate", "alternate_start": PREV}, "V0", "none"),
     ],
 )
-def test_the_line_carries_the_arm_and_a_v1_session_still_runs_two_phases(
+def test_the_line_carries_the_arm_and_a_v1_session_with_no_sells_runs_two_phases(
     env: Env,
     alerter_conn: duckdb.DuckDBPyConnection,
     execution: dict[str, Any],
     arm: str,
     fallback: str,
 ) -> None:
-    """Until T371 a V1 session keeps its arm and says why it ran as V0; its orders
-    are the V0 run's."""
+    """A V1 batch with no sells phase runs no phase (i') (T371, item 2): it keeps its
+    arm, notes `fallback=no_sells`, and its orders are the V0 run's."""
     _mapped(env, **execution)
     env.new_fake(cash=610.0)
     for _ in range(3):
