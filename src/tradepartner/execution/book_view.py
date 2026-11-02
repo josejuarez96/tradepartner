@@ -54,6 +54,7 @@ from tradepartner.execution import (
     shakedown,
 )
 from tradepartner.execution import breaks as breaks_rules
+from tradepartner.execution.buy_timing import execution_for
 from tradepartner.execution.marks import equity_at
 from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.execution.switch import SwitchState, derive
@@ -315,6 +316,7 @@ def _limit_sentence(row: headroom.LimitRow) -> str:
 
 def _limits(
     conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
     window: PaperWindowRow,
     marks: list[PositionDailyRow],
     ks_rows: list[KillSwitchRow],
@@ -324,7 +326,12 @@ def _limits(
     session = max((m.session for m in marks), default=None)
     last = [m for m in marks if m.session == session]
     card = headroom.compute(
-        window, last, ks_rows, frozen_risk(window), side=headroom._side(conn, window)
+        window,
+        last,
+        ks_rows,
+        frozen_risk(window),
+        side=headroom._side(conn, window),
+        sleeve_fraction=execution_for(settings, window.book_id).cash_sleeve_fraction,
     )
     return tuple(LimitLine(r.key, _limit_sentence(r), r.status) for r in card.rows)
 
@@ -623,7 +630,7 @@ def build(
             journal.break_events_for(conn, window_id),
         ),
         _kill_switch(state, runs, closed),
-        _limits(conn, window, marks, ks_rows),
+        _limits(conn, settings, window, marks, ks_rows),
     )
     return replace(
         empty,

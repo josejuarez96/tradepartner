@@ -468,6 +468,28 @@ def test_the_limits_come_out_in_plain_words(journal_settings: Settings) -> None:
     assert all("points" in line.sentence and "Past it" in line.sentence for line in limits)
 
 
+def _cash_sentence(settings: Settings) -> str:
+    limits = _view(settings).safety.limits  # type: ignore[union-attr]
+    return next(line.sentence for line in limits if line.key == "cash")
+
+
+def test_the_cash_limit_line_takes_the_books_sleeve_off(journal_settings: Settings) -> None:
+    _seed(journal_settings)
+    base = _cash_sentence(journal_settings)
+    mapped = Settings(
+        _env_file=None,
+        store={"path": str(journal_settings.store.path)},
+        paper={"execution": {"main": {"cash_sleeve_fraction": 0.03}}},
+    )
+    other = Settings(
+        _env_file=None,
+        store={"path": str(journal_settings.store.path)},
+        paper={"execution": {"zzz": {"cash_sleeve_fraction": 0.03}}},
+    )
+    assert _cash_sentence(mapped) != base
+    assert _cash_sentence(other) == base  # a book outside paper.execution is unchanged
+
+
 # --- the backtest part --------------------------------------------------------------
 
 
