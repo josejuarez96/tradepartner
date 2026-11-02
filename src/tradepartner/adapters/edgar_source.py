@@ -162,7 +162,8 @@ recorded once and is absent for both caches. The parsed cache
 `parse_statement_facts` yields with no stamps (unfiltered, unstamped) and
 the conflicts, keyed by the CIK's latest stamped cover-form accession (the
 accession a trailing payload reached, so the next run re-parses it) and a
-digest of `edgar.statement_tags` and `statement_units`. Every read stamps
+digest of `edgar.statement_tags`, `statement_units` and, when set,
+`statement_fact_units`. Every read stamps
 from `_load_stamps`: an accession with no record is emitted with
 `accepted_at = None`, form `""`; one whose form is outside
 `edgar.statement_forms` is dropped; one settled unstampable is dropped and
@@ -4194,7 +4195,10 @@ class EdgarFilingSource(FilingSource):
         """The statement cache key: `accession` and a digest of the
         configured tags (with their order, the precedence) and units."""
         edgar = self._settings.edgar
-        config = json.dumps([edgar.statement_tags, edgar.statement_units])
+        parts: list[Any] = [edgar.statement_tags, edgar.statement_units]
+        if edgar.statement_fact_units:  # #2826: only when set, so every old key holds
+            parts.append(edgar.statement_fact_units)
+        config = json.dumps(parts)
         return f"{accession}|{hashlib.sha256(config.encode('utf-8')).hexdigest()[:16]}"
 
     def _statement_cache(
@@ -4241,17 +4245,18 @@ class EdgarFilingSource(FilingSource):
         recorded under `origin` and cached empty under a key no run matches."""
         edgar = self._settings.edgar
         tags, forms, units = edgar.statement_tags, edgar.statement_forms, edgar.statement_units
+        fact_units = edgar.statement_fact_units
         # Forms filter the counting parse; the acceptance check is the read's.
         unaccepted = {a: replace(r, accepted_at=None) for a, r in stamps.items()}
 
         def parse() -> tuple[StatementFactsParse, StatementFactsParse, bool] | None:
             if payload is None:  # no XBRL facts at all, or recorded upstream
                 return None
-            entries = parse_statement_facts(payload, tags, forms, units, {})
+            entries = parse_statement_facts(payload, tags, forms, units, {}, fact_units)
             own = _without_accessions(payload, tags, self._statement_foreign(cik))
             return (
                 entries,
-                parse_statement_facts(own, tags, forms, units, unaccepted),
+                parse_statement_facts(own, tags, forms, units, unaccepted, fact_units),
                 _carries_a_tag(payload, tags),
             )
 

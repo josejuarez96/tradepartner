@@ -440,6 +440,24 @@ def test_edgar_statement_tag_must_be_taxonomy_qualified(tag: str) -> None:
         Settings(_env_file=None, edgar={"statement_tags": {"revenue": [tag]}})
 
 
+def test_edgar_statement_fact_units_default_is_empty_and_checked() -> None:
+    """#2826: empty by default; a key must name a fact in `statement_tags`."""
+    assert Settings(_env_file=None).edgar.statement_fact_units == {}
+    ok = Settings(_env_file=None, edgar={"statement_fact_units": {"revenue": ["USD", "EUR"]}})
+    assert ok.edgar.statement_fact_units == {"revenue": ["USD", "EUR"]}
+    with pytest.raises(ValidationError, match="not in statement_tags"):
+        Settings(_env_file=None, edgar={"statement_fact_units": {"eps_basic": ["USD/shares"]}})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, edgar={"statement_fact_units": {"revenue": []}})
+
+
+def test_pre_2826_statement_facts_are_the_default_names() -> None:
+    from tradepartner.config_edgar import PRE_2826_STATEMENT_FACTS
+
+    assert set(PRE_2826_STATEMENT_FACTS) == set(Settings(_env_file=None).edgar.statement_tags)
+    assert len(PRE_2826_STATEMENT_FACTS) == 8
+
+
 def test_edgar_statement_keys_override() -> None:
     s = Settings(
         _env_file=None,

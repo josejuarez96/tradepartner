@@ -9,13 +9,14 @@ from __future__ import annotations
 import re
 from datetime import date
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Self
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
     field_validator,
+    model_validator,
 )
 
 from tradepartner.config_base import _ClosedConfig
@@ -73,6 +74,20 @@ _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
     "net_interest_income": ("us-gaap:InterestIncomeExpenseNet",),
     "noninterest_income": ("us-gaap:NoninterestIncome",),
 }
+
+# The eight names held before #2826 (spec amendment 2026-11-01): the base set
+# of the additive backfill (T365) and T366's vintage rule.
+PRE_2826_STATEMENT_FACTS: tuple[str, ...] = (
+    "revenue",
+    "cost_of_revenue",
+    "gross_profit",
+    "operating_cash_flow",
+    "total_assets",
+    "revenue_financial",
+    "net_interest_income",
+    "noninterest_income",
+)
+
 #: A CIK as the store keys it, and a lettered common-class member (#1169).
 _CIK = re.compile(r"\d{10}")
 _CLASS_MEMBER = re.compile(r"CommonClass[A-Z]")
@@ -229,6 +244,12 @@ class EdgarConfig(BaseModel):
         min_length=1,
     )
     statement_units: list[str] = Field(default_factory=lambda: ["USD"], min_length=1)
+    # #2826: a fact's own ordered unit list (EPS reads `USD/shares`). Empty by
+    # default; a name it does not list reads `statement_units`. A key must name
+    # a fact in `statement_tags`, and no list is empty.
+    statement_fact_units: dict[str, Annotated[list[str], Field(min_length=1)]] = Field(
+        default_factory=dict
+    )
     # T164e (#1358, spec amendment 2026-10-09): filing events. While the
     # switch is off the ingest never asks `filing_events`, so the adapter makes
     # no request and no cache write for it and no row is added. It stays off
@@ -355,6 +376,15 @@ class EdgarConfig(BaseModel):
                         f"edgar.statement_tags[{name!r}]: {tag!r} is not `taxonomy:tag`"
                     )
         return value
+
+    @model_validator(mode="after")
+    def _statement_fact_units_name_known_facts(self) -> Self:
+        """A `statement_fact_units` key names a fact in `statement_tags` (#2826),
+        so a typo cannot silently read nothing."""
+        unknown = sorted(set(self.statement_fact_units) - set(self.statement_tags))
+        if unknown:
+            raise ValueError(f"edgar.statement_fact_units: {unknown} not in statement_tags")
+        return self
 
     @property
     def header_start_year(self) -> int:
