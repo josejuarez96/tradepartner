@@ -3199,8 +3199,8 @@ def statement_backfill_session(
 
     source = _unwrap(filings)
     if isinstance(source, EdgarFilingSource) and not source._statement_backfill:
-        # #2873: only the adapter's local-caches mode is guaranteed to make no
-        # request; any other EDGAR adapter would fetch.
+        # #2873: only the adapter's backfill mode reads local caches (it may
+        # still ask the per-CIK companyfacts API); any other mode would fetch more.
         raise ValueError("statement_backfill needs the EDGAR adapter in statement-backfill mode")
     remaining = [cik for cik in ciks if start.through is None or cik > start.through]
     size = settings.edgar.statement_backfill_chunk_ciks
