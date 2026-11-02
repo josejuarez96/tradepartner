@@ -14,13 +14,15 @@ Scenarios use `FixtureFilingSource` with synthetic records, as in
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import ClassVar
 
 import duckdb
 import pytest
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 
+from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
@@ -30,10 +32,12 @@ from tradepartner.adapters.filings import (
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.config import Settings
+from tradepartner.store import filing_index as stored_index
 from tradepartner.store import schema
 from tradepartner.store.classify import (
     EQUITY,
     ClassificationBuild,
+    _evidence,
     _title_type,
     build_classifications,
     classifications_as_of,
@@ -46,6 +50,33 @@ from tradepartner.store.db import configure_connection
 from tradepartner.store.master import MasterBuild, build_master, primary_security_id, write_master
 
 INGESTED_AT = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+
+
+def test_classification_evidence_reads_only_its_cik_from_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = Settings(_env_file=None, edgar={"cache_dir": str(tmp_path)})
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    row = stored_index.Listing(
+        PLAIN,
+        "0000000101-26-000001",
+        "10-K",
+        "Co",
+        date(2026, 9, 24),
+        INGESTED_AT - timedelta(days=1),
+        date(2026, 9, 24),
+        True,
+    )
+    stored_index.insert_listings(conn, [row], INGESTED_AT)
+    source = EdgarFilingSource(settings, clock=lambda: INGESTED_AT)
+    source.use_index(conn)
+    monkeypatch.setattr(source, "filing_index", lambda *_args: pytest.fail("full index"))
+    monkeypatch.setattr(source, "filing_headers", lambda *_args: [])
+    evidence = _evidence(source, {PLAIN}, settings)
+    assert evidence[PLAIN].forms == ((row.accepted_at, "10-K"),)
+
+
 FETCHED_AT = datetime(2026, 9, 24, 14, 0, tzinfo=UTC)
 
 PLAIN = "0000000101"  # 10-K from 2015, a common cover page from 2019

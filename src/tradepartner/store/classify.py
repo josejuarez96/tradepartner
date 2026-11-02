@@ -102,7 +102,7 @@ from tradepartner.adapters.filings import FilingSource
 from tradepartner.config import Settings
 from tradepartner.store.asof import _latest_as_of, _validate_t
 from tradepartner.store.db import insert_row
-from tradepartner.store.master import MasterBuild, _is_common, _norm_title
+from tradepartner.store.master import MasterBuild, _filing_index_for_cik, _is_common, _norm_title
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 COMMON = "common"
@@ -486,9 +486,9 @@ def _evidence(
 ) -> dict[str, _Evidence]:
     wanted = set(ciks)
     forms: dict[str, list[tuple[datetime, str, str]]] = defaultdict(list)
-    for entry in source.filing_index():  # full history, as the master reads it
-        if entry.cik in wanted:
-            forms[entry.cik].append((entry.accepted_at, entry.accession, _base_form(entry.form)))
+    for cik in wanted:
+        for entry in _filing_index_for_cik(source, cik):
+            forms[cik].append((entry.accepted_at, entry.accession, _base_form(entry.form)))
     out: dict[str, _Evidence] = {}
     for cik in wanted:
         headers = source.filing_headers(cik, settings.edgar.header_forms)

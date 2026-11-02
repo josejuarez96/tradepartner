@@ -28,8 +28,10 @@ from tradepartner.adapters.broker import (
 )
 from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.adapters.prices import announcement_date_known_at
+from tradepartner.backtest.schedule import fill_session
+from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import FROZEN_COSTS_KEYS, FROZEN_EXECUTION_KEYS, Settings
-from tradepartner.execution import report, window
+from tradepartner.execution import lock, report, window
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.reconcile_run import frozen_risk
@@ -38,6 +40,7 @@ from tradepartner.store import registry, schema
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
 from tradepartner.store.journal import (
+    AdjustmentRow,
     PaperWindowRow,
     PaperWindowStopRow,
     adjustments_for,
@@ -521,6 +524,125 @@ def test_accepts_a_week_end_and_a_daily_registration(
     assert frozen["paper.tracking_k"] == 2.0
 
 
+def test_sandbox_now_starts_from_the_previous_stored_close(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(journal_settings).write_text("")
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(
+            conn,
+            journal_settings,
+            "now",
+            date(2026, 8, 31),
+            params=_params(**{"schedule.rebalance_cadence": "daily"}),
+        )
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+        conn.execute(
+            "INSERT INTO prices_daily (security_id, session, open, high, low, close, "
+            "volume, known_at, ingested_at, source, provenance) "
+            "VALUES ('SEC_SPY', '2026-09-30', 100, 100, 100, 100, 1000, ?, ?, 'test', 'bar')",
+            [datetime(2026, 9, 30, 20, tzinfo=UTC)] * 2,
+        )
+    result = window.start(
+        journal_settings,
+        _connect(journal_settings),
+        _fake(fixed_clock),
+        fixed_clock,
+        "now",
+        book_id="sandbox",
+        now=True,
+    )
+    assert result.window.first_rebalance_session == date(2026, 9, 30)
+    assert fill_session(result.window.first_rebalance_session, "daily") == date(2026, 10, 1)
+
+
+@pytest.mark.parametrize("case", ["wrong_cadence", "missing_close", "late_close", "post_close"])
+def test_sandbox_now_refuses_without_a_known_daily_prior_close(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(journal_settings).write_text("")
+    cadence = "month_end" if case == "wrong_cadence" else "daily"
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(
+            conn,
+            journal_settings,
+            "now-refused",
+            date(2026, 8, 31),
+            params=_params(**{"schedule.rebalance_cadence": cadence}),
+        )
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+        if case in ("late_close", "post_close"):
+            stamp = (
+                fixed_clock() + timedelta(days=1)
+                if case == "late_close"
+                else datetime(2026, 9, 30, 21, tzinfo=UTC)
+            )
+            conn.execute(
+                "INSERT INTO prices_daily (security_id, session, open, high, low, close, "
+                "volume, known_at, ingested_at, source, provenance) "
+                "VALUES ('SEC_SPY', '2026-09-30', 100, 100, 100, 100, 1000, ?, ?, 'test', 'bar')",
+                [stamp, stamp],
+            )
+    reason = "now_cadence" if case == "wrong_cadence" else "now_data"
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings,
+            _connect(journal_settings),
+            _fake(fixed_clock),
+            fixed_clock,
+            "now-refused",
+            book_id="sandbox",
+            now=True,
+        )
+    assert exc.value.reason == reason
+    with open_for_write(journal_settings) as conn:
+        assert latest_window(conn, "sandbox") is None
+
+
+@pytest.mark.parametrize("book", ["main", "daily"])
+def test_now_refuses_real_books_before_a_write(
+    journal_settings: Settings, fixed_clock: FixedClock, book: str
+) -> None:
+    with pytest.raises(ValueError, match="sandbox"):
+        window.start(
+            journal_settings,
+            _connect(journal_settings),
+            _fake(fixed_clock),
+            fixed_clock,
+            "missing",
+            book_id=book,
+            now=True,
+        )
+    with open_for_write(journal_settings) as conn:
+        assert latest_window(conn, book) is None
+
+
+def test_now_refuses_unmarked_store_before_a_write(
+    journal_settings: Settings, fixed_clock: FixedClock
+) -> None:
+    with pytest.raises(ValueError, match="temp copy"):
+        window.start(
+            journal_settings,
+            _connect(journal_settings),
+            _fake(fixed_clock),
+            fixed_clock,
+            "missing",
+            book_id="sandbox",
+            now=True,
+        )
+    with open_for_write(journal_settings) as conn:
+        assert latest_window(conn, "sandbox") is None
+
+
 def test_accepts_an_operations_book_after_a_signoff_on_its_own_trial(
     journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
 ) -> None:
@@ -946,6 +1068,91 @@ def test_accepts_spinoff_child_of_a_residue(
     assert receipts[0].quantity == pytest.approx(2.0)
     assert receipts[0].origin is None
     assert receipts[0].book_id == "fx"
+
+
+def _start_with_spinoff_child(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+    *,
+    allocation_offset: timedelta | None,
+) -> tuple[AdjustmentRow, date]:
+    """`start` over a 10 `SPY` residue whose 0.2 `SPLT` child sits at the broker.
+    An allocation of 0.2 is stored with `known_at` = close(ex_date - 1) plus
+    `allocation_offset`, when it is not None. Returns the receipt and the
+    ex-date."""
+    stop_at = fixed_clock() - timedelta(days=10)
+    _write_closed_window(
+        journal_settings, ready_hypothesis, at=stop_at, residues={SPY: (10.0, "dust")}
+    )
+    ex_date = (stop_at + timedelta(days=2)).date()
+    _insert_action(
+        journal_settings,
+        security_id=CHILD,
+        action_type="spinoff",
+        ex_date=ex_date,
+        ratio_or_amount=0.2,
+        known_at=announcement_date_known_at((stop_at + timedelta(days=4)).date()),
+        source_action_id=SPY,
+    )
+    if allocation_offset is not None:
+        known = session_close(previous_session(ex_date)) + allocation_offset
+        with open_for_write(journal_settings) as conn:
+            conn.execute(
+                "INSERT INTO spinoff_allocations VALUES (?, ?, ?, 0.2, ?, ?, 'owner', 'owner')",
+                [SPY, CHILD, ex_date, known, known],
+            )
+    fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
+    fake.extra_quantity["SPY"] = 10.0
+    fake.extra_quantity["SPLT"] = 2.0
+    result = window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+    window_id = result.window.window_id
+    assert window_id is not None
+    with open_read_only(journal_settings) as conn:
+        adjustments = adjustments_for(conn, window_id=window_id)
+    [receipt] = [a for a in adjustments if a.kind == "spinoff_receipt"]
+    return receipt, ex_date
+
+
+def test_the_residue_spinoff_receipt_names_its_parent_and_a_stored_allocation(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """T255 (#1976 item 2): the same keys `reconcile_run` writes; the allocation
+    stored with `known_at` = close(ex_date - 1) is read."""
+    receipt, ex_date = _start_with_spinoff_child(
+        journal_settings, fixed_clock, ready_hypothesis, allocation_offset=timedelta(0)
+    )
+
+    terms = json.loads(receipt.explanation_json or "{}")
+    assert terms["parent_security_id"] == SPY
+    assert terms["basis_allocation"] == 0.2
+    assert terms["ex_date"] == ex_date.isoformat()
+
+
+def test_the_residue_spinoff_receipt_without_an_allocation_names_the_parent_alone(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """No allocation stored: the receipt names the parent only (zero basis)."""
+    receipt, _ = _start_with_spinoff_child(
+        journal_settings, fixed_clock, ready_hypothesis, allocation_offset=None
+    )
+    assert json.loads(receipt.explanation_json or "{}")["parent_security_id"] == SPY
+    assert "basis_allocation" not in json.loads(receipt.explanation_json or "{}")
+
+
+def test_the_residue_spinoff_receipt_ignores_an_allocation_known_after_the_cutoff(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    receipt, _ = _start_with_spinoff_child(
+        journal_settings, fixed_clock, ready_hypothesis, allocation_offset=timedelta(minutes=1)
+    )
+    assert "basis_allocation" not in json.loads(receipt.explanation_json or "{}")
 
 
 def test_frozen_hash_stable_across_an_environment_override(

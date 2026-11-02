@@ -972,7 +972,7 @@ def test_an_earlier_sgml_move_in_the_window_needs_a_passing_precheck(tmp_path: P
         {"passed": False},
         {"release": "restamp-other"},
         {"window": date(2026, 10, 8)},
-        {"made_at": datetime.now(UTC) - timedelta(days=1)},
+        {"made_at": datetime.now(UTC) - timedelta(days=2)},  # not 24h: see the DST test
     ],
 )
 def test_a_precheck_that_does_not_fit_is_refused(tmp_path: Path, bad: dict[str, Any]) -> None:
@@ -982,6 +982,19 @@ def test_a_precheck_that_does_not_fit_is_refused(tmp_path: Path, bad: dict[str, 
     assert _apply(c, sec, "--window-earlier-ok", str(file)) == 1
     assert sec.calls == []
     assert c.snapshot() == before
+
+
+def test_a_precheck_24h_old_on_the_fall_back_day_is_the_same_new_york_day(tmp_path: Path) -> None:
+    """#2861: on 2026-11-01 (DST ends 06:00 UTC) 04:20 UTC is 00:20 EDT on the
+    1st, so a pre-check made 24h earlier is the same New York date and fits;
+    the script compares New York dates, not elapsed hours. The clock is fixed."""
+    now = datetime(2026, 11, 2, 4, 20, tzinfo=UTC)  # 23:20 EST on 2026-11-01
+    file = precheck(tmp_path / "p.json", made_at=now - timedelta(days=1))
+    got = repair_stamps.load_precheck(file, release="restamp-1382", window_start=WINDOW, now=now)
+    assert got.path == file
+    stale = precheck(tmp_path / "q.json", made_at=now - timedelta(days=2))
+    with pytest.raises(repair_stamps.RepairStop):
+        repair_stamps.load_precheck(stale, release="restamp-1382", window_start=WINDOW, now=now)
 
 
 def test_a_read_instant_inside_the_move_aborts_before_writing(tmp_path: Path, capsys: Any) -> None:

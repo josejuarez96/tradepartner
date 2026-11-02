@@ -1,0 +1,1 @@
+- Equity issuance desk read: CompEquIss, ShareIss1Y and NetEquityFinance fail the frozen line or check; Q1 fails its declared read, retiring the issuance line ([#2669](https://github.com/josejuarez96/tradepartner/issues/2669)).

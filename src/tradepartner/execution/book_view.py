@@ -53,6 +53,8 @@ from tradepartner.execution import (
     plain,
     shakedown,
 )
+from tradepartner.execution import breaks as breaks_rules
+from tradepartner.execution.buy_timing import execution_for
 from tradepartner.execution.marks import equity_at
 from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.execution.switch import SwitchState, derive
@@ -68,6 +70,7 @@ from tradepartner.store.journal import (
     PaperRunRow,
     PaperWindowRow,
     PositionDailyRow,
+    ReconcileBreakRow,
     ReconciliationRow,
 )
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -96,7 +99,10 @@ class Header:
     """The page header. `status` is `closed` for a closed or abandoned window, else
     `running` or `stopped` (`switch.derive`);
     `value` is the book's equity at `as_of_session`; the returns are percents over
-    the since-start range (None until the book has a mark, or SPY is missing)."""
+    the since-start range (None until the book has a mark, or SPY is missing).
+    `restricted` names the holdings an open material break restricts (#2266 item
+    7): a `running` book with restrictions still trades every other name, and is
+    never `stopped` for them (item 12)."""
 
     status: Literal["running", "stopped", "closed"]
     as_of_session: date | None
@@ -104,6 +110,7 @@ class Header:
     since_start_return_pct: float | None
     spy_return_pct: float | None
     benchmark_error: str | None
+    restricted: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -313,6 +320,7 @@ def _limit_sentence(row: headroom.LimitRow) -> str:
 
 def _limits(
     conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
     window: PaperWindowRow,
     marks: list[PositionDailyRow],
     ks_rows: list[KillSwitchRow],
@@ -322,7 +330,12 @@ def _limits(
     session = max((m.session for m in marks), default=None)
     last = [m for m in marks if m.session == session]
     card = headroom.compute(
-        window, last, ks_rows, frozen_risk(window), side=headroom._side(conn, window)
+        window,
+        last,
+        ks_rows,
+        frozen_risk(window),
+        side=headroom._side(conn, window),
+        sleeve_fraction=execution_for(settings, window.book_id).cash_sleeve_fraction,
     )
     return tuple(LimitLine(r.key, _limit_sentence(r), r.status) for r in card.rows)
 
@@ -341,8 +354,26 @@ def _money(amount: float) -> str:
     return f"${abs(amount):,.2f}"
 
 
+def _restricted(break_events: list[ReconcileBreakRow], now: datetime) -> tuple[str, ...]:
+    """The names (broker symbol, else `security_id`) an open material break known
+    at `now` restricts (`breaks.restricted_names`'s rule)."""
+    open_now = breaks_rules.open_breaks([e for e in break_events if e.known_at <= now])
+    return tuple(
+        sorted(
+            {
+                e.symbol or e.security_id
+                for e in open_now.values()
+                if e.material and e.security_id is not None
+            }
+        )
+    )
+
+
 def _reconciliation(
-    window: PaperWindowRow, rows: list[ReconciliationRow], now: datetime
+    window: PaperWindowRow,
+    rows: list[ReconciliationRow],
+    now: datetime,
+    break_events: list[ReconcileBreakRow] | None = None,
 ) -> ReconciliationView:
     known = [r for r in rows if r.known_at <= now and r.at <= now]
     if not known:
@@ -353,6 +384,41 @@ def _reconciliation(
     quantity_tol = float(risk.reconcile_quantity_tolerance)
     stamp = row.at.isoformat()
     payload = _json(row.mismatches_json)
+    if row.status == "breaks":
+        # Paper spec amendment 2026-10-26 (#2266) item 10: a `breaks` row is a
+        # reconciliation with named differences, not a full mismatch. Count the
+        # names; `matches` stays False, it is not a checked match.
+        mismatches = payload.get("mismatches") if payload is not None else None
+        names = {
+            m.get("security_id") or m.get("symbol") or m.get("kind")
+            for m in (mismatches if isinstance(mismatches, list) else [])
+            if isinstance(m, dict)
+        }
+        count = len(names)
+        if break_events:
+            # ADR 0025 item 2: every open break counts, not only the names this
+            # row's payload lists (a retained finding stays open without being
+            # re-listed). Read at the row's own cut, `known_at <= row.known_at`.
+            cut = min(now, row.known_at)
+            open_now = breaks_rules.open_breaks([e for e in break_events if e.known_at <= cut])
+            count = max(count, len(open_now))
+        what = (
+            "an open finding"
+            if count == 0
+            else f"{count} open {'break' if count == 1 else 'breaks'}"
+        )
+        restricted = _restricted(break_events or [], now)
+        held = (
+            f" Trading is restricted in {', '.join(restricted)}; the rest of the book trades."
+            if restricted
+            else ""
+        )
+        return ReconciliationView(
+            False,
+            f"Matches Alpaca as of {stamp} except {what}.{held}",
+            row.at,
+            cash_tol,
+        )
     if row.status != "ok":
         why = _STATUS_WORDS.get(row.status, f"its status is {row.status}")
         detail = ""
@@ -581,10 +647,16 @@ def build(
     )
     holdings = _holdings(conn, window_id, marks, as_of, now, top_n) if as_of is not None else None
 
+    break_events = journal.break_events_for(conn, window_id)
     safety = Safety(
-        _reconciliation(window, _known(journal.reconciliations_for(conn, window_id), now), now),
+        _reconciliation(
+            window,
+            _known(journal.reconciliations_for(conn, window_id), now),
+            now,
+            break_events,
+        ),
         _kill_switch(state, runs, closed),
-        _limits(conn, window, marks, ks_rows),
+        _limits(conn, settings, window, marks, ks_rows),
     )
     return replace(
         empty,
@@ -596,6 +668,7 @@ def build(
             since_book,
             since_spy,
             spy_error,
+            () if closed else _restricted(break_events, now),
         ),
         performance=performance,
         today=today,

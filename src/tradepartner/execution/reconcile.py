@@ -326,7 +326,7 @@ class Explanations:
     dividend_findings: Mapping[str, str] = field(default_factory=dict)
     reference_prices: Mapping[str, float] = field(default_factory=dict)
     #: Held `security_id`s with a stock dividend (#1627) stored as a `split` action
-    #: (its ratio in `(1, alpaca.stock_dividend_max_rate]`), each with
+    #: (any split ratio > 0 and != 1, #2184; a stock dividend, #1627), each with
     #: `(first_date, last_date, ratio)` and `ex_date <= S`: the ex-date, the last
     #: session a `CIL` for it may post (`first_date` +
     #: `alpaca.cash_in_lieu_max_lag_sessions`, the payable-date window), and the
@@ -550,6 +550,14 @@ def _activity_mismatch(activity: CashActivity, inside_base: bool) -> Mismatch | 
     return Mismatch("unexplained_activity", detail)
 
 
+def _in_split_window(explanations: Explanations, name: str, activity: CashActivity) -> bool:
+    """True when `activity` is dated inside `name`'s split CIL window
+    (`stock_dividends[name]`, #2184): an old split no longer makes the name's
+    cash a candidate."""
+    window = explanations.stock_dividends.get(name)
+    return window is not None and window[0] <= activity.date <= window[1]
+
+
 def _place_cash_in_lieu(
     activity: CashActivity,
     explanations: Explanations,
@@ -559,7 +567,7 @@ def _place_cash_in_lieu(
     q_tol: float,
     tolerance: float,
 ) -> tuple[Mismatch | None, ProposedAdjustment | None]:
-    """Place a `CIL` cash-in-lieu activity for a held stock dividend (#1627): the
+    """Place a `CIL` cash-in-lieu activity for a held split (#1627, any split #2184): the
     book must hold the stock-dividend issuer, the broker must credit the whole
     shares (floor of the ledger's fractional expectation) and the CIL's
     `net_amount` must match the expected cash within `tolerance`
@@ -749,7 +757,7 @@ def compare(
             or name in explanations.mergers
             or name in explanations.ended
             or name in explanations.spinoffs
-            or name in explanations.stock_dividends
+            or _in_split_window(explanations, name, activity)
             or name in explanations.delisted_cash
         )
         (candidate_cash if candidate else named_cash).append((name, activity))

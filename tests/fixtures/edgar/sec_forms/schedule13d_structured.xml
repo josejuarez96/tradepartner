@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<edgarSubmission xmlns="http://www.sec.gov/edgar/schedule13D" xmlns:com="http://www.sec.gov/edgar/common">
+  <headerData>
+    <submissionType>SCHEDULE 13D</submissionType>
+    <filerInfo>
+      <filer>
+        <filerCredentials>
+          <cik>0000444444</cik>
+        </filerCredentials>
+      </filer>
+    </filerInfo>
+  </headerData>
+  <formData>
+    <coverPageHeader>
+      <securitiesClassTitle>Common Stock</securitiesClassTitle>
+      <dateOfEvent>12/02/2024</dateOfEvent>
+      <issuerInfo>
+        <issuerCIK>0000555555</issuerCIK>
+        <issuerCUSIP>123456789</issuerCUSIP>
+        <issuerName>TARGET GADGETS CORP</issuerName>
+      </issuerInfo>
+    </coverPageHeader>
+    <reportingPersons>
+      <reportingPersonInfo>
+        <reportingPersonCIK>0000444444</reportingPersonCIK>
+        <reportingPersonName>ACTIVIST ONE LP</reportingPersonName>
+      </reportingPersonInfo>
+      <reportingPersonInfo>
+        <reportingPersonCIK>0000666666</reportingPersonCIK>
+        <reportingPersonName>ACTIVIST TWO LLC</reportingPersonName>
+      </reportingPersonInfo>
+      <reportingPersonInfo>
+        <reportingPersonCIK>0000444444</reportingPersonCIK>
+        <reportingPersonName>ACTIVIST ONE LP (duplicate listing)</reportingPersonName>
+      </reportingPersonInfo>
+    </reportingPersons>
+  </formData>
+</edgarSubmission>

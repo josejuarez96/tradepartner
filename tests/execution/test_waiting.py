@@ -16,6 +16,7 @@ from tradepartner.execution.waiting import (
     KIND_ORDER,
     SHAKEDOWN_BOOK,
     BookFacts,
+    BreakFacts,
     LagFacts,
     ReportFacts,
     RunFacts,
@@ -34,6 +35,7 @@ from tradepartner.store.journal import (
     PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
+    ReconcileBreakRow,
     ReconciliationRow,
     RunWithResult,
 )
@@ -316,19 +318,19 @@ def test_a_noted_alert_is_no_item_and_no_span_is_no_item() -> None:
 
 
 def _report(count: int | None, has_report: bool = False) -> ReportFacts:
-    return ReportFacts(tracking_count=count, has_report=has_report, minimum=2, second_rebalance=THU)
+    return ReportFacts(tracking_count=count, has_report=has_report, minimum=3, second_rebalance=THU)
 
 
-def test_report_due_at_two_rebalances_and_gone_once_a_report_exists() -> None:
-    assert build([BookFacts(book_id="main", report=_report(1))], None) == ()
+def test_report_due_at_three_rebalances_and_gone_once_a_report_exists() -> None:
+    assert build([BookFacts(book_id="main", report=_report(2))], None) == ()
     assert build([BookFacts(book_id="main", report=_report(None))], None) == ()
-    (item,) = build([BookFacts(book_id="main", report=_report(2))], None)
+    (item,) = build([BookFacts(book_id="main", report=_report(3))], None)
     assert item == WaitingItem(
         book_id="main",
         kind="report_due",
         since=THU,
         detail=(
-            "2 rebalances tracked and no tracking report yet; `paper report` opens a "
+            "3 rebalances tracked and no tracking report yet; `paper report` opens a "
             "counted tracking trial"
         ),
         command="tradepartner paper report --book main",
@@ -499,3 +501,77 @@ def test_progress_words_name_the_lines_in_progress_and_count_the_failing() -> No
 def test_an_unknown_line_points_at_paper_shakedown() -> None:
     assert "tradepartner paper shakedown --verbose" in shakedown_next_step("E.9 new")
     assert "tradepartner paper shakedown --verbose" in shakedown_next_step(None)
+
+
+# --- reconcile breaks (paper spec #2266 item 12; T284) -------------------------------
+
+
+def _break(
+    event: str,
+    *,
+    event_id: int,
+    first_seen: date = MON,
+    known_at: datetime | None = None,
+    break_id: str = "1:SEC_A:7",
+    material: bool = True,
+    security_id: str | None = "SEC_A",
+) -> ReconcileBreakRow:
+    stamp = known_at or _at(first_seen, 21)
+    return ReconcileBreakRow(
+        event_id=event_id,
+        break_id=break_id,
+        window_id=1,
+        book_id="main",
+        event=event,
+        parts_json=json.dumps([{"kind": "quantity", "cause": "corporate_action"}]),
+        cause="corporate_action",
+        security_id=security_id,
+        symbol="AAA",
+        dollar_size=1234.5,
+        material=material,
+        first_seen_session=first_seen,
+        reconciliation_id=3,
+        known_at=stamp,
+        ingested_at=stamp,
+    )
+
+
+def _breaks(*events: ReconcileBreakRow, session: date, max_age: int = 5) -> BreakFacts:
+    return BreakFacts(events=events, session=session, max_age_sessions=max_age)
+
+
+def test_an_aged_break_is_an_item_with_aged_true() -> None:
+    # first seen Mon 2026-10-05; Tue 2026-10-13 is its 7th session, past 5
+    opened = _break("opened", event_id=1)
+    seen = _break("observed", event_id=2, known_at=_at(TUE, 21))
+    (item,) = build(
+        [BookFacts(book_id="main", breaks=_breaks(opened, seen, session=date(2026, 10, 13)))], None
+    )
+    assert item.kind == "reconcile_break" and item.aged
+    assert item.since == opened.known_at  # the `opened` event, not the latest one
+    assert item.command == (
+        'tradepartner paper true-up --book main --break 1:SEC_A:7 --reason "<why>"'
+    )
+    assert "7 session(s) old (aged past 5)" in item.detail and "restricted" in item.detail
+
+
+def test_a_young_break_is_an_item_not_aged_and_a_closed_one_is_no_item() -> None:
+    young = _breaks(_break("opened", event_id=1), session=TUE)
+    (item,) = build([BookFacts(book_id="main", breaks=young)], None)
+    assert item.kind == "reconcile_break" and not item.aged
+    assert "2 session(s) old," in item.detail
+    closed = _breaks(
+        _break("opened", event_id=1), _break("trued_up", event_id=2), session=date(2026, 10, 30)
+    )
+    assert build([BookFacts(book_id="main", breaks=closed)], None) == ()
+
+
+def test_an_immaterial_or_symbol_only_break_restricts_nothing() -> None:
+    facts = _breaks(_break("opened", event_id=1, material=False), session=TUE)
+    (item,) = build([BookFacts(book_id="main", breaks=facts)], None)
+    assert "not restricted" in item.detail
+
+
+def test_a_break_sorts_after_the_kill_switch_and_before_a_lagging_order() -> None:
+    assert KIND_ORDER.index("kill_switch_engaged") == KIND_ORDER.index("reconcile_break") - 1
+    assert KIND_ORDER.index("reconcile_break") < KIND_ORDER.index("order_lagging")

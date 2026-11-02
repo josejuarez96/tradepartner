@@ -574,7 +574,49 @@ registry; #83 took version 2 first, so the registry is version 3):
   works (`journal.plans_for`, which names `paper_plans`'s two, reads them as
   NULL there; no read names `trial_rebalances`'s before T242), and the next
   writable `init_schema` call migrates the store.
-- **A later DDL change goes to version 39**, with its own migration and a
+- **Version 39** (#1976, T254): adds `spinoff_allocations`, the owner-entered
+  Form 8937 basis fraction keyed by parent, child and ex-date, with revisions
+  stamped at the write clock. Additive; no existing rows or tables change.
+  `registry.data_vintage` excludes it, while the store maximum includes it.
+- **Version 40** (#2539, T306): `sec_filing_events` and
+  `sec_form4_transactions` are additive main-store tables. Reads are gated by
+  `events.sec_forms_read_enabled`; read-only version-38 and version-39 stores
+  serve earlier reads and fail ownership reads on the missing tables.
+- **Version 41** (#2617; research-registry spec req 8 as amended
+  2026-10-30): `research_results.verdict` gains `not_computable`, appended
+  last, the verdict of an `ok` result whose primary statistic or interval
+  bound is NaN or infinite (no evidence, never a `fail`), and
+  `research_decisions.kind` gains `verdict_relabel`. The sets only grow, so no
+  stored row falls outside them; DuckDB cannot change a `CHECK` in place, so
+  `_migrate_not_computable` rebuilds both tables through staging tables where
+  a `CHECK` lacks its value, every row kept in insertion order and
+  byte-identical. Then every stored verdict whose result's primary value or
+  bound is NaN or infinite is set to `not_computable` (#2658, #2660: from the
+  stored values only), each relabel appended as a `verdict_relabel` decision
+  and the count and run ids logged. A read-only connection
+  accepts a version-40 store: every read works (no `not_computable` row can
+  exist there), and the next writable `init_schema` call migrates it.
+- **Version 42** (#2291, #2295): adds `snapshot_sightings` for SEC ticker
+  observations awaiting rename confirmation. The migration is additive;
+  existing fact rows remain untouched. `known_at` is the fetch instant, and
+  the look-ahead harness truncates this table with the other dated tables.
+- **Version 43** (T326): adds `delisting_reasons` as a separate fact table.
+  Reason revisions are keyed to the Form 25 episode, with evidence acceptance
+  stored as `reason_known_at` and checked equal to `known_at`. The migration
+  is additive; it builds on version 42 and rewrites no existing row.
+- **Version 44** (#2761, T355): additive `research_exposures` table and
+  nullable `trial_results.n_exposure`. The probe hash may be NULL only on an
+  unverified open-data record. A unique expression index treats NULL hashes
+  as empty strings. Existing tables' DDL and rows are preserved.
+- **Version 45** (T318, #2740): additive `filing_index` revisions and the
+  `filing_index_pending`, `edgar_filers` and `edgar_index_files` state tables.
+  Earlier rows and tables are unchanged; read-only version-44 stores still
+  serve their existing readers.
+- **Version 46** (#2813): nullable `list_position` on `filing_index` and
+  `filing_index_pending`, a row's 0-based position within its SEC index file,
+  so readers order an accession's rows by `(listed_on, list_position)` and
+  never by rowid. Existing rows keep NULL until the next rebuild.
+- **A later DDL change goes to version 47**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -643,6 +685,8 @@ they shape this DDL):
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Final, TypedDict
@@ -650,6 +694,8 @@ from typing import Final, TypedDict
 import duckdb
 
 from tradepartner.store.db import configure_connection, forget_column_types, utc_now
+
+_log = logging.getLogger(__name__)
 
 #: Every provenance value used anywhere in the store (spec "Definitions").
 #: No single table allows all of these — see `TABLE_PROVENANCE_VALUES`.
@@ -685,18 +731,26 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "listings": (*_V4_MASTER_PROVENANCE, "filing_name"),
     "classifications": (*_V4_MASTER_PROVENANCE, "filing_name"),
     "delistings": ("filing",),
+    "delisting_reasons": ("filing",),
     "prices_daily": ("bar",),
     "corporate_actions": ("action",),
     "facts": ("filing",),
     "statement_facts": ("filing",),
     "filing_events": ("filing",),
+    "filing_index": ("filing",),
+    "sec_filing_events": ("filing",),
+    "sec_form4_transactions": ("filing",),
     "rates": ("release",),
     "borrow_status": ("snapshot",),
     "symbol_changes": ("action",),
     "openfigi_types": ("openfigi",),
     "successor_chains": ("filing",),
     "mergers": ("action",),
+    "spinoff_allocations": ("owner",),
 }
+
+# `snapshot_sightings` belongs to TABLE_NAMES for as-of truncation, but has
+# no `source` or `provenance`: it records raw fetch observations, not facts.
 
 #: `statement_facts.basis` (#660): `reported` for an as-filed value,
 #: `derived` for a `gross_profit` row the ingest computed from the stored
@@ -878,9 +932,48 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   (NULL on every existing row) by `ALTER TABLE`
 #:   (`_migrate_assets_intersection`); the pinned DDL strings do not change
 #:   (module docstring, "Schema versions").
-#: - A later DDL change goes to version 39, with its own migration and a
+#: - 39 (#1976, T254): additive owner-entered `spinoff_allocations` table.
+#: - 40 (#2539, T306): additive `sec_filing_events` and
+#:   `sec_form4_transactions` tables, read behind
+#:   `events.sec_forms_read_enabled`.
+#: - 41 (#2617): `research_results.verdict` gains `not_computable` and
+#:   `research_decisions.kind` `verdict_relabel`; both tables are rebuilt
+#:   (`_migrate_not_computable`), every row kept, and every verdict on a
+#:   non-finite stored primary relabelled `not_computable`, each with a
+#:   `verdict_relabel` decision (#2658, #2660).
+#: - 42 (#2291, #2295): additive `snapshot_sightings` table for pending
+#:   SEC ticker observations; no existing table changes.
+#: - 43 (T326): additive `delisting_reasons` fact table.
+#: - 44 (#2761, T355): additive `research_exposures` table and nullable
+#:   `trial_results.n_exposure`.
+#: - 45 (T318, #2740): additive EDGAR filing-index fact and cursor tables.
+#: - 46 (#2813): nullable `list_position` on `filing_index` and
+#:   `filing_index_pending`.
+#: - A later DDL change goes to version 47, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 38
+CURRENT_SCHEMA_VERSION = 46
+
+#: The last version without `delisting_reasons` (T326, version 43): the
+#: `snapshot_sightings` version (#2665). A named constant, not
+#: `CURRENT_SCHEMA_VERSION - 1`, so a later bump keeps a v42 store
+#: opening and migrating.
+_PRE_DELISTING_REASONS_VERSION = 42
+
+#: The last version without `research_exposures` and `trial_results.n_exposure`
+#: (T355, version 44): the `delisting_reasons` version. Named, never
+#: `CURRENT_SCHEMA_VERSION - 1`, so a later bump keeps a v43 store migrating.
+_PRE_RESEARCH_EXPOSURES_VERSION = 43
+
+#: The last version without the EDGAR filing-index tables (T318, version 45):
+#: the `research_exposures` version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
+_PRE_FILING_INDEX_VERSION = 44
+
+#: The last version without `list_position` on the filing-index tables (#2813,
+#: version 46): the filing-index version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
+_PRE_LIST_POSITION_VERSION = 45
+
+#: Last version without the owner-entered Form 8937 allocation table.
+_PRE_SPINOFF_ALLOCATIONS_VERSION = 38
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -1055,11 +1148,32 @@ _PRE_BREAKS_VERSION = 36
 #: T242.
 _PRE_ASSETS_INTERSECTION_VERSION = 37
 
+# Version 39 belongs to T254; T306's additive ownership tables are version 40.
+_PRE_SEC_FORMS_VERSION = 39
+
+#: The last version without the `not_computable` research verdict and the
+#: `verdict_relabel` decision kind (#2617, version 41): read-only connections
+#: serve every read, since no read depends on either `CHECK` and no such row
+#: can exist there.
+_PRE_NOT_COMPUTABLE_VERSION = 40
+
+#: The last version without `snapshot_sightings` (#2291, #2295, version 42).
+_PRE_SNAPSHOT_SIGHTINGS_VERSION = 41
+
 
 class SchemaVersionError(RuntimeError):
     """The store's `schema_version` table records a version this code has
     no migration from — it does not know that shape and refuses to
     operate on it rather than guessing."""
+
+
+class SchemaMigrationRequiredError(SchemaVersionError):
+    """An older writable store requires the explicit backed-up migration."""
+
+
+# Only store.migrate enables this around its init_schema call. Tests replace it
+# for legacy migration fixtures; there is deliberately no settings/env route.
+_ALLOW_MIGRATION = False
 
 
 class RegistryNotInitialised(RuntimeError):
@@ -1116,6 +1230,18 @@ CREATE TABLE IF NOT EXISTS listings (
 )
 """
 
+_CREATE_SNAPSHOT_SIGHTINGS = """
+CREATE TABLE IF NOT EXISTS snapshot_sightings (
+    cik VARCHAR NOT NULL,
+    ticker VARCHAR NOT NULL,
+    exchange VARCHAR NOT NULL,
+    known_at TIMESTAMPTZ NOT NULL,
+    ingested_at TIMESTAMPTZ NOT NULL,
+    CHECK (known_at <= ingested_at),
+    UNIQUE (cik, ticker, exchange, known_at)
+)
+"""
+
 _CREATE_CLASSIFICATIONS = f"""
 CREATE TABLE IF NOT EXISTS classifications (
     security_id VARCHAR NOT NULL,
@@ -1145,6 +1271,33 @@ CREATE TABLE IF NOT EXISTS delistings (
     UNIQUE (security_id, form, class_title, exchange, filed_at, known_at)
 )
 """
+
+# Reason evidence is a revision of one Form 25 episode, never a revision of
+# its listing end. The episode key is the existing delistings natural key.
+_CREATE_DELISTING_REASONS = f"""
+CREATE TABLE IF NOT EXISTS delisting_reasons (
+    security_id VARCHAR NOT NULL,
+    delisting_form VARCHAR NOT NULL,
+    delisting_class_title VARCHAR NOT NULL,
+    delisting_exchange VARCHAR NOT NULL,
+    delisting_filed_at TIMESTAMPTZ NOT NULL,
+    reason VARCHAR NOT NULL,
+    reason_evidence_form VARCHAR NOT NULL,
+    reason_evidence_accession VARCHAR,
+    reason_source VARCHAR NOT NULL,
+    reason_known_at TIMESTAMPTZ NOT NULL,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["delisting_reasons"])},
+    CHECK (known_at = reason_known_at),
+    CHECK (reason IN ('performance_failure', 'bankruptcy', 'merger_acquisition',
+                     'voluntary_other', 'unknown')),
+    CHECK (reason_source IN ('form25_provision', 'form25_text', 'eightk_item', 'unknown')),
+    CHECK (reason_source = 'unknown' OR reason_evidence_accession IS NOT NULL),
+    UNIQUE (security_id, delisting_form, delisting_class_title,
+            delisting_exchange, delisting_filed_at, known_at)
+)
+"""
+
+_DELISTING_REASONS_TABLE_DDL: tuple[str, ...] = (_CREATE_DELISTING_REASONS,)
 
 _CREATE_PRICES_DAILY = f"""
 CREATE TABLE IF NOT EXISTS prices_daily (
@@ -1284,6 +1437,106 @@ CREATE TABLE IF NOT EXISTS filing_events (
     {_common_fact_columns(TABLE_PROVENANCE_VALUES["filing_events"])},
     CHECK (known_at = accepted_at),
     UNIQUE (cik, accession)
+)
+"""
+
+# T318: the first row uses the SEC acceptance stamp; later filed-on corrections
+# keep that stamp and take the writer's clock as their revision known_at.
+_CREATE_FILING_INDEX = f"""
+CREATE TABLE IF NOT EXISTS filing_index (
+    cik VARCHAR NOT NULL,
+    accession VARCHAR NOT NULL,
+    form VARCHAR NOT NULL,
+    company_name VARCHAR NOT NULL,
+    filed_on DATE NOT NULL,
+    accepted_at TIMESTAMPTZ NOT NULL,
+    listed_on DATE NOT NULL,
+    list_position INTEGER,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["filing_index"])},
+    UNIQUE (cik, accession, known_at)
+)
+"""
+
+_CREATE_FILING_INDEX_PENDING = """
+CREATE TABLE IF NOT EXISTS filing_index_pending (
+    cik VARCHAR NOT NULL,
+    accession VARCHAR NOT NULL,
+    form VARCHAR NOT NULL,
+    company_name VARCHAR NOT NULL,
+    filed_on DATE NOT NULL,
+    listed_on DATE NOT NULL,
+    list_position INTEGER,
+    PRIMARY KEY (cik, accession)
+)
+"""
+
+_CREATE_EDGAR_FILERS = """
+CREATE TABLE IF NOT EXISTS edgar_filers (
+    cik VARCHAR NOT NULL PRIMARY KEY,
+    first_quarter VARCHAR NOT NULL,
+    last_quarter VARCHAR NOT NULL
+)
+"""
+
+_CREATE_EDGAR_INDEX_FILES = """
+CREATE TABLE IF NOT EXISTS edgar_index_files (
+    path VARCHAR NOT NULL PRIMARY KEY,
+    last_modified TIMESTAMPTZ,
+    size BIGINT NOT NULL,
+    sha256 VARCHAR NOT NULL,
+    run_id VARCHAR NOT NULL
+)
+"""
+
+_FILING_INDEX_TABLE_DDL: tuple[str, ...] = (
+    _CREATE_FILING_INDEX,
+    _CREATE_FILING_INDEX_PENDING,
+    _CREATE_EDGAR_FILERS,
+    _CREATE_EDGAR_INDEX_FILES,
+)
+
+# Ownership events keep the subject and every reporting owner separate from the
+# issuer-only 8-K table. The identity excludes known_at so a re-read cannot revise it.
+_CREATE_SEC_FILING_EVENTS = f"""
+CREATE TABLE IF NOT EXISTS sec_filing_events (
+    accession VARCHAR NOT NULL,
+    form VARCHAR NOT NULL,
+    accepted_at TIMESTAMPTZ NOT NULL,
+    filed_date DATE NOT NULL,
+    subject_cik VARCHAR NOT NULL,
+    filer_cik VARCHAR NOT NULL,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["sec_filing_events"])},
+    CHECK (known_at = accepted_at),
+    UNIQUE (accession, subject_cik, filer_cik)
+)
+"""
+
+_CREATE_SEC_FORM4_TRANSACTIONS = f"""
+CREATE TABLE IF NOT EXISTS sec_form4_transactions (
+    accession VARCHAR NOT NULL,
+    issuer_cik VARCHAR NOT NULL,
+    filer_cik VARCHAR NOT NULL,
+    line_no INTEGER NOT NULL,
+    is_director BOOLEAN NOT NULL,
+    is_officer BOOLEAN NOT NULL,
+    is_ten_percent_owner BOOLEAN NOT NULL,
+    is_other BOOLEAN NOT NULL,
+    transaction_date DATE NOT NULL,
+    deemed_execution_date DATE,
+    transaction_code VARCHAR NOT NULL,
+    acquired_disposed VARCHAR NOT NULL,
+    shares DECIMAL(38, 10) NOT NULL,
+    price DECIMAL(38, 10),
+    shares_owned_after DECIMAL(38, 10),
+    ownership_form VARCHAR NOT NULL,
+    security_title VARCHAR NOT NULL,
+    date_of_original_submission DATE,
+    accepted_at TIMESTAMPTZ NOT NULL,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["sec_form4_transactions"])},
+    CHECK (known_at = accepted_at),
+    CHECK (line_no >= 0),
+    CHECK (acquired_disposed IN ('A', 'D')),
+    UNIQUE (accession, filer_cik, line_no)
 )
 """
 
@@ -1490,25 +1743,45 @@ CREATE TABLE IF NOT EXISTS successor_chains (
 )
 """
 
-#: Every table this module owns, in dependency-free creation order (no
-#: foreign keys are declared, so order only needs schema_version last for
-#: readability). Used by `init_schema` and exposed for the test loader.
+# Owner-entered Form 8937 fractions. Each revision is an append-only row at
+# the owner's actual write clock; the spin-off date is only the natural key.
+_CREATE_SPINOFF_ALLOCATIONS = f"""
+CREATE TABLE IF NOT EXISTS spinoff_allocations (
+    parent_security_id VARCHAR NOT NULL,
+    child_security_id VARCHAR NOT NULL,
+    ex_date DATE NOT NULL,
+    basis_allocation DOUBLE NOT NULL CHECK (basis_allocation BETWEEN 0 AND 1),
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["spinoff_allocations"])},
+    UNIQUE (parent_security_id, child_security_id, ex_date, known_at)
+)
+"""
+_SPINOFF_ALLOCATIONS_TABLE_DDL: tuple[str, ...] = (_CREATE_SPINOFF_ALLOCATIONS,)
+
+#: The fact tables plus ingestion and schema bookkeeping. Non-fact EDGAR
+#: cursor tables are in `MASTER_CHECK_TABLE_NAMES` for store inventory and
+#: excluded here so the truncation harness filters only `known_at` tables.
 TABLE_NAMES: tuple[str, ...] = (
     "securities",
     "listings",
+    "snapshot_sightings",
     "classifications",
     "delistings",
+    "delisting_reasons",
     "prices_daily",
     "corporate_actions",
     "facts",
     "statement_facts",
     "filing_events",
+    "filing_index",
+    "sec_filing_events",
+    "sec_form4_transactions",
     "rates",
     "borrow_status",
     "symbol_changes",
     "openfigi_types",
     "successor_chains",
     "mergers",
+    "spinoff_allocations",
     "ingestion_runs",
     "schema_version",
 )
@@ -1533,6 +1806,8 @@ _TABLE_DDL: tuple[str, ...] = (
     _CREATE_SCHEMA_VERSION,
 )
 
+_SNAPSHOT_SIGHTINGS_TABLE_DDL: tuple[str, ...] = (_CREATE_SNAPSHOT_SIGHTINGS,)
+
 #: `statement_facts` (#660, T76), added at version 10: its own tuple rather
 #: than folded into `_TABLE_DDL` above, so that tuple's version-4 pin never
 #: has to move again (quant-auditor review of PR #729). Pinned by hash in
@@ -1546,6 +1821,10 @@ _STATEMENT_FACTS_TABLE_DDL: tuple[str, ...] = (_CREATE_STATEMENT_FACTS,)
 #: `tests/store/test_schema.py`; a later edit of this DDL goes to the next
 #: schema version with its own migration.
 _FILING_EVENTS_TABLE_DDL: tuple[str, ...] = (_CREATE_FILING_EVENTS,)
+_SEC_FORMS_TABLE_DDL: tuple[str, ...] = (
+    _CREATE_SEC_FILING_EVENTS,
+    _CREATE_SEC_FORM4_TRANSACTIONS,
+)
 
 #: `rates` (#1498, T169), added at version 23: its own tuple, as
 #: `_FILING_EVENTS_TABLE_DDL` is, so no earlier pin moves. Pinned by hash in
@@ -1652,10 +1931,15 @@ CREATE TABLE IF NOT EXISTS master_underived (
 )
 """
 
-#: Tables new at version 11 (#859), created by `init_schema`'s DDL pass. Kept
-#: out of `TABLE_NAMES` (not a fact table; the look-ahead harness truncates
-#: only those).
-MASTER_CHECK_TABLE_NAMES: tuple[str, ...] = ("master_underived",)
+#: Non-fact state tables (`master_underived` from version 11, EDGAR index
+#: cursor state from T318). Kept out of `TABLE_NAMES` because the look-ahead
+#: harness truncates only tables with `known_at`.
+MASTER_CHECK_TABLE_NAMES: tuple[str, ...] = (
+    "master_underived",
+    "filing_index_pending",
+    "edgar_filers",
+    "edgar_index_files",
+)
 _MASTER_UNDERIVED_TABLE_DDL: tuple[str, ...] = (_CREATE_MASTER_UNDERIVED,)
 
 
@@ -2845,12 +3129,14 @@ RESEARCH_OUTCOMES: tuple[str, ...] = (
     "abandoned",
 )
 
-#: `research_results.verdict` (req 8), set exactly on an `ok` result.
-RESEARCH_VERDICTS: tuple[str, ...] = ("pass", "fail", "underpowered", "n/a")
+#: `research_results.verdict` (req 8), set exactly on an `ok` result;
+#: `not_computable` (version 41, #2617) for a NaN or infinite primary.
+RESEARCH_VERDICTS: tuple[str, ...] = ("pass", "fail", "underpowered", "n/a", "not_computable")
 
 #: `research_decisions.kind` (req 2's `budget_amend`, req 5's `holdout_spend`;
 #: the earlier draft's `import` was dropped with req 12, #810).
-RESEARCH_DECISION_KINDS: tuple[str, ...] = ("holdout_spend", "budget_amend")
+#: `verdict_relabel` (version 41, #2660) is written only by `_migrate_not_computable`.
+RESEARCH_DECISION_KINDS: tuple[str, ...] = ("holdout_spend", "budget_amend", "verdict_relabel")
 
 #: Every enumerated research column and its allowed values, one `CHECK` each
 #: (`stage`, an integer, has its own `CHECK` over `RESEARCH_STAGES`).
@@ -3044,6 +3330,51 @@ CREATE TABLE IF NOT EXISTS research_decisions (
 )
 """
 
+# One row per launch that reached a return read outside a trial or run.
+_CREATE_RESEARCH_EXPOSURES = """
+CREATE TABLE IF NOT EXISTS research_exposures (
+    exposure_id BIGINT NOT NULL PRIMARY KEY,
+    candidate_ref VARCHAR NOT NULL,
+    source VARCHAR NOT NULL,
+    family VARCHAR,
+    kill_line_url VARCHAR NOT NULL,
+    kill_line_sha256 VARCHAR NOT NULL,
+    kill_line_posted_at TIMESTAMPTZ NOT NULL,
+    kill_line_basis VARCHAR NOT NULL,
+    probe_path VARCHAR,
+    probe_sha256 VARCHAR,
+    probe_verified BOOLEAN NOT NULL,
+    read_at TIMESTAMPTZ NOT NULL,
+    window_start DATE NOT NULL,
+    window_end DATE NOT NULL,
+    data_pin_json VARCHAR NOT NULL,
+    n_configurations INTEGER NOT NULL,
+    verdict VARCHAR NOT NULL,
+    desk_read_path VARCHAR NOT NULL,
+    audit_url VARCHAR,
+    overlaps_holdout BOOLEAN NOT NULL,
+    holdout_reason VARCHAR,
+    post_boundary BOOLEAN NOT NULL,
+    synthetic BOOLEAN NOT NULL,
+    recorded_by VARCHAR NOT NULL,
+    code_version VARCHAR NOT NULL,
+    code_dirty BOOLEAN,
+    note VARCHAR,
+    known_at TIMESTAMPTZ NOT NULL,
+    CHECK (source IN ('store', 'open_data')),
+    CHECK (verdict IN ('pass', 'fail', 'insufficient', 'incomplete')),
+    CHECK (kill_line_basis IN ('posted_before_read', 'posted_after_read')),
+    CHECK (probe_verified OR source = 'open_data'),
+    CHECK (probe_sha256 IS NOT NULL OR NOT probe_verified),
+    CHECK (n_configurations >= 1)
+)
+"""
+
+_CREATE_RESEARCH_EXPOSURES_UNIQUE = """
+CREATE UNIQUE INDEX IF NOT EXISTS research_exposures_launch_unique
+ON research_exposures (candidate_ref, COALESCE(probe_sha256, ''), read_at)
+"""
+
 #: The research-registry tables added at schema version 12, disjoint from
 #: `TABLE_NAMES` (the look-ahead harness never sees them), `REGISTRY_TABLE_NAMES`
 #: and `JOURNAL_TABLE_NAMES`.
@@ -3053,6 +3384,7 @@ RESEARCH_TABLE_NAMES: tuple[str, ...] = (
     "research_runs",
     "research_results",
     "research_decisions",
+    "research_exposures",
 )
 
 _RESEARCH_TABLE_DDL: tuple[str, ...] = (
@@ -3061,6 +3393,8 @@ _RESEARCH_TABLE_DDL: tuple[str, ...] = (
     _CREATE_RESEARCH_RUNS,
     _CREATE_RESEARCH_RESULTS,
     _CREATE_RESEARCH_DECISIONS,
+    _CREATE_RESEARCH_EXPOSURES,
+    _CREATE_RESEARCH_EXPOSURES_UNIQUE,
 )
 
 #: The column version 12 adds to `trial_results` (req 9): the research share of
@@ -3068,6 +3402,9 @@ _RESEARCH_TABLE_DDL: tuple[str, ...] = (
 #: `ALTER TABLE` after the DDL pass (`_migrate_n_research`), so the pinned
 #: `_REGISTRY_TABLE_DDL` never changes.
 N_RESEARCH_COLUMN = "n_research"
+
+#: Nullable share of backtest N from desk-read exposures (version 44, T355).
+N_EXPOSURE_COLUMN = "n_exposure"
 
 #: The six columns version 13 adds to `trial_rebalances` (#720, #1033, T85d):
 #: the `profitability` family's per-rebalance ranking and exclusion counts,
@@ -3096,16 +3433,22 @@ REBALANCE_COUNT_COLUMNS: tuple[str, ...] = (
 
 
 def require_research(conn: duckdb.DuckDBPyConnection) -> None:
-    """Raise `ResearchNotInitialised` unless every `RESEARCH_TABLE_NAMES` table
-    exists. The research readers (T81's `store.research`, T83c's page) call it
-    before their first query."""
+    """Require the registry tables used by existing research readers.
+
+    `research_exposures` is excluded, and no version is read: a read-only store
+    from before the exposure migration still serves those readers (the
+    review module's no-runtime-table test pins that `require_research` reads
+    nothing but table metadata); exposure-specific readers check their own
+    table.
+    """
+    names = tuple(n for n in RESEARCH_TABLE_NAMES if n != "research_exposures")
     (present,) = conn.execute(  # type: ignore[misc]
         "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() "
         "AND schema_name = current_schema() AND table_name IN "
-        f"({', '.join('?' for _ in RESEARCH_TABLE_NAMES)})",
-        list(RESEARCH_TABLE_NAMES),
+        f"({', '.join('?' for _ in names)})",
+        list(names),
     ).fetchone()
-    if present != len(RESEARCH_TABLE_NAMES):
+    if present != len(names):
         raise ResearchNotInitialised(
             "research registry not initialised (a research table is missing); "
             "any writing command migrates the store to the current version"
@@ -3177,6 +3520,14 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_MERGER_RECEIPT_VERSION,
         _PRE_BREAKS_VERSION,
         _PRE_ASSETS_INTERSECTION_VERSION,
+        _PRE_SPINOFF_ALLOCATIONS_VERSION,
+        _PRE_SEC_FORMS_VERSION,
+        _PRE_NOT_COMPUTABLE_VERSION,
+        _PRE_SNAPSHOT_SIGHTINGS_VERSION,
+        _PRE_DELISTING_REASONS_VERSION,
+        _PRE_RESEARCH_EXPOSURES_VERSION,
+        _PRE_FILING_INDEX_VERSION,
+        _PRE_LIST_POSITION_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3214,10 +3565,14 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # version 33 every read (no short reason can exist there); version 34
         # every read but `mergers`; versions 35 and 36 every read (the break
         # readers find no `reconcile_breaks` at 35 or 36 and return no event);
-        # version 37 every read (no read names the two version-38
-        # `trial_rebalances` columns before T242, and `journal._select` reads
-        # `paper_plans`'s same two as NULL where they are missing); those rows
-        # predate the record.
+        # version 37 every read but `journal.plans_for`, which requires the
+        # version-38 intersection columns on `paper_plans` (and hence `paper
+        # report`, `paper check` and Operations need a migrated store);
+        # version 40 every read (no `not_computable` verdict can exist there,
+        # #2617); version 41 every read (only the writing SEC ticker ingest
+        # names `snapshot_sightings`, #2295); version 43 every existing read
+        # (no `research_exposures` or `trial_results.n_exposure` until 44,
+        # T355).
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3596,6 +3951,17 @@ def _migrate_n_research(conn: duckdb.DuckDBPyConnection) -> None:
     column here too. Runs inside `init_schema`'s transaction, after its DDL
     pass."""
     _add_nullable_int_columns(conn, "trial_results", (N_RESEARCH_COLUMN,))
+
+
+def _migrate_list_position(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add the nullable `list_position` to the filing-index tables (version 46)."""
+    for table in ("filing_index", "filing_index_pending"):
+        _add_nullable_int_columns(conn, table, ("list_position",))
+
+
+def _migrate_n_exposure(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add the nullable desk-read share of N without rebuilding old results."""
+    _add_nullable_int_columns(conn, "trial_results", (N_EXPOSURE_COLUMN,))
 
 
 def _migrate_profitability_rebalance_counts(conn: duckdb.DuckDBPyConnection) -> None:
@@ -4156,9 +4522,105 @@ def _migrate_breaks(conn: duckdb.DuckDBPyConnection) -> None:
     forget_column_types(conn)
 
 
+#: `made_by` on the `verdict_relabel` decisions the version-41 migration writes.
+NOT_COMPUTABLE_RELABEL_BY: Final = "schema-41 migration"
+
+
+def _rebuild_research_table(conn: duckdb.DuckDBPyConnection, table: str, create: str) -> None:
+    """Rebuild research `table` from its current DDL `create` through a staging
+    table, every row kept in insertion order and byte-identical."""
+    staging = f"{table}_v41"
+    conn.execute(
+        create.replace(f"CREATE TABLE IF NOT EXISTS {table} (", f"CREATE TABLE {staging} (", 1)
+    )
+    conn.execute(f"INSERT INTO {staging} BY NAME SELECT * FROM {table} ORDER BY rowid")
+    conn.execute(f"DROP TABLE {table}")
+    conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+
+
+def _migrate_not_computable(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 41 (module docstring, "Schema versions"; #2617): widen
+    `research_results.verdict` with `not_computable` and
+    `research_decisions.kind` with `verdict_relabel`, each table rebuilt only
+    where its `CHECK` lacks the value (the DDL pass creates both at their
+    current shape on a store that had none), every row kept in insertion order.
+    The sets only grow, so no stored value can fall outside them. Runs inside
+    `init_schema`'s transaction, after the DDL pass.
+
+    Then the one relabel (#2658, #2660, owner 2026-10-30), only when the verdict
+    `CHECK` was widened here: every result with a verdict whose stored
+    `primary_value`, `primary_ci_low` or `primary_ci_high` is NaN or infinite
+    (how `write_result` stored them; NULL is not non-finite) gets
+    `not_computable`, the verdict `compute_verdict` now gives it. Derived from
+    the stored values only, nothing is recomputed, and no other column moves.
+    Each relabel appends a `verdict_relabel` decision (the run, its
+    registration, the old and new verdicts and the schema version in
+    `values_json`, made by `NOT_COMPUTABLE_RELABEL_BY`, at the clock), and the
+    count and run ids are logged."""
+    if "'verdict_relabel'" not in _check_text(conn, "research_decisions", "kind"):
+        _rebuild_research_table(conn, "research_decisions", _CREATE_RESEARCH_DECISIONS)
+    if "'not_computable'" in _check_text(conn, "research_results", "verdict"):
+        forget_column_types(conn)
+        return
+    non_finite = " OR ".join(
+        f"NOT isfinite(x.{column})"
+        for column in ("primary_value", "primary_ci_low", "primary_ci_high")
+    )
+    relabelled = [
+        (int(run_id), None if registration_id is None else int(registration_id), str(verdict))
+        for run_id, registration_id, verdict in conn.execute(
+            "SELECT x.run_id, r.registration_id, x.verdict FROM research_results x "
+            "LEFT JOIN research_runs r ON r.run_id = x.run_id "
+            f"WHERE x.verdict IS NOT NULL AND ({non_finite}) ORDER BY x.run_id"
+        ).fetchall()
+    ]
+    _rebuild_research_table(conn, "research_results", _CREATE_RESEARCH_RESULTS)
+    if not relabelled:
+        forget_column_types(conn)
+        return
+    conn.execute(
+        "UPDATE research_results SET verdict = 'not_computable' WHERE run_id IN "
+        f"({', '.join('?' for _ in relabelled)})",
+        [run_id for run_id, _, _ in relabelled],
+    )
+    last = conn.execute("SELECT COALESCE(MAX(decision_id), 0) FROM research_decisions").fetchone()
+    next_id = 1 + (0 if last is None else int(last[0]))
+    at = utc_now()
+    for offset, (run_id, registration_id, verdict) in enumerate(relabelled):
+        values = json.dumps(
+            {
+                "new_verdict": "not_computable",
+                "old_verdict": verdict,
+                "schema_version": _PRE_NOT_COMPUTABLE_VERSION + 1,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        conn.execute(
+            "INSERT INTO research_decisions (decision_id, kind, registration_id, run_id, "
+            "values_json, reason, made_by, known_at) "
+            "VALUES (?, 'verdict_relabel', ?, ?, ?, ?, ?, ?)",
+            [
+                next_id + offset,
+                registration_id,
+                run_id,
+                values,
+                "non-finite primary statistic or interval bound (#2617, #2658, #2660)",
+                NOT_COMPUTABLE_RELABEL_BY,
+                at,
+            ],
+        )
+    forget_column_types(conn)
+    _log.warning(
+        "schema 41: relabelled %d research result(s) to not_computable: %s",
+        len(relabelled),
+        [(run_id, verdict) for run_id, _, verdict in relabelled],
+    )
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 37 store to version 38.
+    version-2 to 44 store to version 45.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -4170,7 +4632,16 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION` and no lab table; every store gets
+    `CURRENT_SCHEMA_VERSION` and no lab table; a version-44 store gains the four additive EDGAR
+    index tables, preserving all earlier rows; a version-43 store also gains
+    `research_exposures` and nullable `trial_results.n_exposure`;
+    a version-40 or earlier store
+    gets `research_results` rebuilt with `not_computable` in its verdict
+    `CHECK` and `research_decisions` with `verdict_relabel` in its kind
+    `CHECK` where they lack them, every row kept in insertion order, every
+    verdict on a non-finite stored primary relabelled `not_computable` with a
+    `verdict_relabel` decision (#2658, #2660), and a version-41 row (#2617);
+    every store gets
     `trial_rebalances` and `paper_plans` each with `n_assets_intersected` and
     `assets_intersection_skipped` added (NULL on every existing row; a
     version-37 store gets a version-38 row; plan T241); every store gets
@@ -4256,8 +4727,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-37 (every read; `paper_plans`'s
-    two version-38 columns read as NULL through `journal`), 36 and
+    On a read-only connection no DDL runs: a version-43 store serves its existing
+    reads, with no exposure table or `n_exposure`; a version-40, 39 or 38 (every read;
+    no `not_computable` verdict can exist at 40) store passes, as does a
+    version-37 (every read; `paper_plans`'s two version-38 columns read as
+    NULL through `journal`), 36 and
     35 (every read; the break readers return no event), 34
     (every read but `mergers`, missing there), 33 (every read; the short reasons
     only widen a `CHECK`), 32 (every read; the
@@ -4340,10 +4814,23 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_MERGER_RECEIPT_VERSION,
         _PRE_BREAKS_VERSION,
         _PRE_ASSETS_INTERSECTION_VERSION,
+        _PRE_SPINOFF_ALLOCATIONS_VERSION,
+        _PRE_SEC_FORMS_VERSION,
+        _PRE_NOT_COMPUTABLE_VERSION,
+        _PRE_SNAPSHOT_SIGHTINGS_VERSION,
+        _PRE_DELISTING_REASONS_VERSION,
+        _PRE_RESEARCH_EXPOSURES_VERSION,
+        _PRE_FILING_INDEX_VERSION,
+        _PRE_LIST_POSITION_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
             f"store schema_version is {max_version}, this code expects {CURRENT_SCHEMA_VERSION}"
+        )
+    if max_version is not None and max_version < CURRENT_SCHEMA_VERSION and not _ALLOW_MIGRATION:
+        raise SchemaMigrationRequiredError(
+            f"store schema_version is {max_version}, this code expects {CURRENT_SCHEMA_VERSION}; "
+            "run `tradepartner ingest` to back up and migrate the store"
         )
     with atomic(conn):
         if max_version in pre_identity:
@@ -4377,6 +4864,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _RESEARCH_TABLE_DDL
             + _REBALANCE_COUNTS_TABLE_DDL
             + _FILING_EVENTS_TABLE_DDL
+            + _SEC_FORMS_TABLE_DDL
             + _RATES_TABLE_DDL
             + _BORROW_STATUS_TABLE_DDL
             + _SYMBOL_CHANGES_TABLE_DDL
@@ -4384,11 +4872,17 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _SUCCESSOR_CHAINS_TABLE_DDL
             + _MERGERS_TABLE_DDL
             + _BREAKS_TABLE_DDL
+            + _SPINOFF_ALLOCATIONS_TABLE_DDL
+            + _SNAPSHOT_SIGHTINGS_TABLE_DDL
+            + _DELISTING_REASONS_TABLE_DDL
+            + _FILING_INDEX_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)
         _migrate_filing_name(conn)
         _migrate_n_research(conn)
+        _migrate_n_exposure(conn)
+        _migrate_list_position(conn)
         _migrate_profitability_rebalance_counts(conn)
         _migrate_assets_intersection(conn)
         _relax_no_history_count(conn)
@@ -4429,6 +4923,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_short_reasons(conn)
         if max_version is not None and max_version <= _PRE_BREAKS_VERSION:
             _migrate_breaks(conn)
+        if max_version is not None and max_version <= _PRE_NOT_COMPUTABLE_VERSION:
+            _migrate_not_computable(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
             applied_at = utc_now()

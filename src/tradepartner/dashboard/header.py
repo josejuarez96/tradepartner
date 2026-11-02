@@ -8,8 +8,9 @@ one missing those tables).
 
 The borrow snapshot's table and source are left out of both (#1506, T171b:
 `borrow_status` is fetched after every other source and is read by nothing
-these two numbers describe, so a morning snapshot must not show the store
-fresher than its bars).
+these two numbers describe). SEC ownership tables and owner-entered spin-off
+allocations are also excluded from "as of" so they cannot make stale bars
+appear current.
 """
 
 from __future__ import annotations
@@ -21,20 +22,27 @@ from typing import Final
 import duckdb
 import streamlit as st
 
-from tradepartner.ingest import OK
+from tradepartner.ingest import OK, SEC_FORMS_BACKFILL_SOURCES
 from tradepartner.store.asof import ASSETS_SOURCE
 from tradepartner.store.schema import TABLE_PROVENANCE_VALUES
 
 #: Fact tables the freshness reads skip (#1506, T171b). A `borrow_status`
 #: snapshot runs after the bars and is read by nothing the header describes,
 # so a morning snapshot must not show the store fresher than its bars: the
-# "as of" reads the latest `known_at` of every other fact table.
-_FRESHNESS_SKIPPED_TABLES: Final[frozenset[str]] = frozenset({"borrow_status"})
+# "as of" reads the latest `known_at` of every other fact table. The SEC
+# ownership tables (#2624) hold filing acceptances, not bars, and a forms
+# backfill writes them alone, so they are skipped too. Owner-entered spin-off
+# allocations are also independent of the bars and must not advance "as of".
+_FRESHNESS_SKIPPED_TABLES: Final[frozenset[str]] = frozenset(
+    {"borrow_status", "sec_filing_events", "sec_form4_transactions", "spinoff_allocations"}
+)
 
 #: Ingest sources the freshness reads skip, beside `ASSETS_SOURCE`'s own
 #: reader in `store.asof`: the borrow snapshot's run row has nothing to do
-#: with when the bars arrived.
-_FRESHNESS_SKIPPED_SOURCES: Final[frozenset[str]] = frozenset({ASSETS_SOURCE})
+#: with when the bars arrived, nor have the SEC forms backfill's (#2624).
+FRESHNESS_SKIPPED_SOURCES: Final[frozenset[str]] = frozenset(
+    {ASSETS_SOURCE, *SEC_FORMS_BACKFILL_SOURCES}
+)
 
 
 @dataclass(frozen=True)
@@ -53,10 +61,10 @@ def now() -> datetime:
 def store_freshness(conn: duckdb.DuckDBPyConnection, t: datetime) -> Freshness:
     """The freshness at `t`: as of and last updated (module docstring).
 
-    Both leave out the borrow snapshot (#1506, T171b): `_FRESHNESS_SKIPPED_TABLES`
-    from the `known_at` reads and `_FRESHNESS_SKIPPED_SOURCES` from the run
-    reads, so neither a table nothing here describes nor an ingest that runs
-    after every other can make the store look fresher than its bars.
+    `_FRESHNESS_SKIPPED_TABLES` leaves out the borrow snapshot, SEC ownership
+    rows, and owner-entered spin-off allocations from the `known_at` reads.
+    `FRESHNESS_SKIPPED_SOURCES` excludes their unrelated ingest runs from the
+    last-updated read.
     """
     tables = conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
     present = {name for (name,) in tables}
@@ -70,7 +78,7 @@ def store_freshness(conn: duckdb.DuckDBPyConnection, t: datetime) -> Freshness:
         conn.execute(
             "SELECT max(finished_at) FROM ingestion_runs WHERE status = ? AND finished_at <= ? "
             "AND source NOT IN (SELECT unnest(?::VARCHAR[]))",
-            [OK, t, sorted(_FRESHNESS_SKIPPED_SOURCES)],
+            [OK, t, sorted(FRESHNESS_SKIPPED_SOURCES)],
         ).fetchone()
         if "ingestion_runs" in present
         else None

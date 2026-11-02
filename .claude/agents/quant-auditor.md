@@ -20,6 +20,9 @@ Get the diff (`gh pr diff <n>` or `git diff origin/main...HEAD`) and read the su
 | 6 | Calendar | Holidays, half days, DST? A trading calendar, not weekdays? |
 | 7 | Numbers from code | Does any decision-relevant number come from LLM output? |
 | 8 | Tests | Would a test fail if look-ahead were introduced (e.g. "a signal at t is unchanged when data after t is removed")? |
+| 9 | Build rules | If `build_master`, `build_chains`, `build_classifications`, `build_delistings` or `fact_rows` derive different rows from unchanged inputs, was `BUILD_RULES_VERSION` bumped in `store/build_fingerprint.py`? Check `store/master.py`, `store/classify.py`, `store/delistings.py`, `ingest.py` and their helpers (e.g. `store/filename_listings.py`, `config.py`, `adapters/filings.py`). Report a BLOCKER if not; a parser change with a tracked cache-version bump changes the input. |
+| 10 | Fingerprint inputs | BLOCKER if a new setting read by those builders is absent from `HASHED_SETTINGS_KEYS` and `PER_NAME_KEYS`, or an `EXCLUDED_SETTINGS_KEYS` entry changes rows. The pin test covers only `master.*` and `edgar.*`. |
+| 11 | Cache versions | BLOCKER if a new or bumped cache-version constant changes builder inputs but the fingerprint cannot read it through `CACHE_VERSION_NAMES`. Note that changing a listed constant forces a full rebuild. |
 
 ## Tests
 CI runs the full suite; don't repeat it. Run only the test files the diff adds or changes. For each new test that guards a fix, also run it against the merge-base code (`git show $(git merge-base origin/main HEAD):<path>` into a scratch copy) to show it fails without the fix. Never run the whole suite or a whole directory such as `tests/lookahead/` (its cadence cases take minutes each). Use `PYTEST_ADDOPTS=--basetemp=<scratchpad>/pytest`. If a check needs no test, run none and say so.

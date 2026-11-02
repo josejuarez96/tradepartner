@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
 import pytest
@@ -174,6 +174,27 @@ def test_executed_named_cash_without_a_due_is_a_break(activity_type: str) -> Non
     assert [(m.kind, m.security_id, m.cash_amount, m.activity_ids) for m in result.mismatches] == [
         ("name_cash", "SEC_A", 12.0, ("new-credit",))
     ]
+
+
+def test_an_old_split_does_not_make_a_names_cash_a_candidate() -> None:
+    """#2184: only a split whose CIL window holds the activity's date makes the
+    name's cash a candidate; an old split (window ended before the activity)
+    leaves an `MA` credit a `name_cash` break, even beside a lagging fill whose
+    cash band would otherwise absorb the credit silently."""
+    activity = CashActivity("new-credit", "MA", S, "executed", 12.0, "AAA")
+    old = S - timedelta(days=30)
+    result = _run(
+        _ledger(1_000.0, SEC_A=2.0),
+        _positions(AAA=5.0),
+        1_000.0 - 300.0 + 12.0,
+        journal_open=[_lagging_buy(5.0, 2.0)],
+        explanations=_explanations(
+            activities=(activity,),
+            activity_seen_before=PRIOR,
+            stock_dividends={"SEC_A": (old, old + timedelta(days=14), 0.1)},
+        ),
+    )
+    assert "name_cash" in _kinds(result)
 
 
 def test_cash_on_a_journaled_but_now_unheld_name_is_a_break() -> None:
@@ -1830,6 +1851,70 @@ def test_a_stock_dividend_cash_in_lieu_reconciles_with_no_halt() -> None:
         for a in result.adjustments
     ] == [("cash_in_lieu", 50.0, "SEC_A", -0.5, "act-cil")]
     assert [r.activity_id for r in result.activities] == ["act-cil"]
+
+
+@pytest.mark.parametrize(
+    ("ratio", "ledger", "whole", "cash"),
+    [
+        (1.5, 22.5, 22.0, 0.5 * (120.0 / 1.5)),  # 3-for-2 of 15: 40.00
+        (0.1, 1.5, 1.0, 0.5 * (120.0 / 0.1)),  # 1-for-10 of 15: 600.00
+    ],
+)
+def test_a_cash_in_lieu_of_any_split_reconciles_with_no_halt(
+    ratio: float, ledger: float, whole: float, cash: float
+) -> None:
+    """#2184: a forward split above the stock-dividend band and a reverse split
+    each leave a 0.5-share remainder; the `CIL` is valued at the pre-ex reference
+    divided by the ratio (the post-ex price), and books one `cash_in_lieu`."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=ledger),
+        _positions(AAA=whole),
+        1_000.0 + cash,
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (S, S, ratio)},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
+            activities=(_cil("act-cil", S, cash),),
+        ),
+    )
+
+    assert result.status == "ok"
+    assert [(a.kind, a.cash, a.quantity) for a in result.adjustments] == [
+        ("cash_in_lieu", cash, -0.5)
+    ]
+
+
+def test_a_reverse_split_cash_in_lieu_off_beyond_the_tolerance_halts() -> None:
+    """#2184: the amount check is unchanged for a reverse split."""
+    cash = 0.5 * (120.0 / 0.1) * 0.8
+    result = _run(
+        _ledger(1_000.0, SEC_A=1.5),
+        _positions(AAA=1.0),
+        1_000.0 + cash,
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (S, S, 0.1)},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
+            activities=(_cil("act-cil", S, cash),),
+        ),
+    )
+
+    assert "unexplained_activity" in _kinds(result)
+    assert result.status != "ok"
+
+
+def test_a_whole_reverse_split_result_needs_no_cash_in_lieu() -> None:
+    """#2184: 20 shares at 1-for-10 are 2 whole shares; no `CIL`, nothing to book."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=2.0),
+        _positions(AAA=2.0),
+        1_000.0,
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (S, S, 0.1)},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
+        ),
+    )
+
+    assert result.status == "ok"
+    assert result.adjustments == ()
 
 
 def test_a_cash_in_lieu_within_the_relative_tolerance_books_the_broker_amount() -> None:

@@ -42,9 +42,12 @@ The only way the kill switch is released. In the req 5 order:
 6. `reconcile_now` (T61) for the clock's session, its journal cut (`as_of`)
    a clock reading taken after every row steps 1 to 5 wrote. A mismatch refuses (the
    mismatch row is written, the switch stays engaged, and is engaged with
-   source `fault` if nothing had engaged it). Any other status but
-   `ok` refuses too: `switch.release` takes only an `ok` reconciliation, so
-   a lag inside the bound (`fills_lagging`) waits for the feed. That is
+   source `fault` if nothing had engaged it). Any other status but `ok` or
+   `breaks` refuses too: `switch.release` takes only those, so a lag inside
+   the bound (`fills_lagging`) waits for the feed. A `breaks` reconciliation
+   releases (T282d, paper spec amendment 2026-10-26, #2266, item 10): the names
+   it restricts stay restricted, and the cap it passed is the `break_cap` a
+   `mismatch` would have refused. That is
    stricter than req 8's "a lag inside the bound passes"; the PR raises it.
 7. Release (`switch.release`) with the `resume_id`, that reconciliation's id
    and the drawdown peak: the ledger equity at the window's last mark (its
@@ -138,7 +141,7 @@ from tradepartner.execution.collect import (
     rejection_breaches,
 )
 from tradepartner.execution.lock import resolve_book, run_lock
-from tradepartner.execution.reconcile import OK
+from tradepartner.execution.reconcile import BREAKS, OK
 from tradepartner.execution.reconcile_run import (
     command_session,
     frozen_risk,
@@ -687,10 +690,11 @@ def resume(
             )
             events = kill_switch_events_for(conn, window_id)
             mark_rows = positions_daily_for(conn, window_id)
-        if result.status != OK:
+        if result.status not in (OK, BREAKS):
             return outcome(
                 REFUSED,
-                f"reconciliation {reconciliation_id} is {result.status}; a release needs ok",
+                f"reconciliation {reconciliation_id} is {result.status}; a release needs "
+                f"{OK} or {BREAKS}",
                 reconciliation_id=reconciliation_id,
             )
         if not _switch(connect, window).engaged:

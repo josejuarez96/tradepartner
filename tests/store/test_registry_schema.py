@@ -57,7 +57,17 @@ _PHASE3_REGISTRY = tuple(
 _UNTOUCHED_TABLES = tuple(
     name
     for name in schema.TABLE_NAMES
-    if name not in ("corporate_actions", "schema_version", *schema.RETRACTABLE_TABLES)
+    if name
+    not in (
+        "corporate_actions",
+        "schema_version",
+        "spinoff_allocations",
+        "sec_filing_events",
+        "sec_form4_transactions",
+        "delisting_reasons",
+        "filing_index",
+        *schema.RETRACTABLE_TABLES,
+    )
 )
 
 #: Tables an older migration than the one under test rebuilt, so only their
@@ -125,6 +135,7 @@ def _make_old_store(path: Path, version: int) -> None:
             + schema._OPENFIGI_TYPES_TABLE_DDL
             + schema._SUCCESSOR_CHAINS_TABLE_DDL
             + schema._MERGERS_TABLE_DDL
+            + schema._SNAPSHOT_SIGHTINGS_TABLE_DDL
         ):
             conn.execute(ddl)
         if version >= 3:
@@ -237,7 +248,7 @@ def test_registry_table_names_disjoint_from_fact_table_names() -> None:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_LIST_POSITION_VERSION + 1
 
 
 def test_fresh_init_creates_every_table_at_version_26() -> None:
