@@ -600,6 +600,9 @@ def data_vintage(
     the release-level vintages stay `False`. At `False` a `spinoff` row moves no
     vintage, so H1's and the TWIN's stored vintages and every pinned digest are
     unchanged.
+
+    `statement_facts` counts only `PRE_2826_STATEMENT_FACTS` (#2826, T366), so a
+    new statement name's rows stale no trial.
     """
     if cutoff.tzinfo is None:
         raise ValueError(f"cutoff must be timezone-aware, got {cutoff!r}")

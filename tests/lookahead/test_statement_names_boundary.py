@@ -25,10 +25,12 @@ from tradepartner.backtest import provider
 from tradepartner.config_edgar import _STATEMENT_TAGS, PRE_2826_STATEMENT_FACTS
 
 _SRC = Path(__file__).resolve().parents[2] / "src" / "tradepartner"
-_READ_SQL = re.compile(r"\bFROM\s+statement_facts\b", re.IGNORECASE)
+_READ_SQL = re.compile(r"\b(?:FROM|JOIN)\s+statement_facts\b", re.IGNORECASE)
 _HELD = frozenset(PRE_2826_STATEMENT_FACTS)
 #: A name the backfill will add, so the scan bites before T365 lands it in the config.
-_EXAMPLE_NEW = frozenset({"eps_diluted", "net_income"})
+_EXAMPLE_NEW = frozenset(
+    {"eps_diluted", "eps_basic", "net_income", "operating_income", "total_liabilities"}
+)
 
 
 def _scanned() -> list[Path]:
@@ -52,8 +54,13 @@ def literal_new_names(source: str, new_names: frozenset[str]) -> list[str]:
     )
 
 
+#: The constants a reader may filter on; each is checked to lie inside the held names.
+_ALLOWED_CONSTANTS = frozenset({"STATEMENT_FACT_NAMES", "PRE_2826_STATEMENT_FACTS"})
+
+
 def _is_named_constant(node: ast.expr) -> bool:
-    return isinstance(node, ast.Name | ast.Attribute)
+    name = node.id if isinstance(node, ast.Name) else getattr(node, "attr", "")
+    return name in _ALLOWED_CONSTANTS
 
 
 def _filters_fact_name(func: ast.AST) -> bool:
@@ -150,6 +157,10 @@ def test_the_scan_fails_on_a_planted_unfiltered_read() -> None:
     named = (
         "def read(c, t):\n"
         "    f = statement_facts_as_of(c, t)\n"
-        '    return f.filter(pl.col("fact_name").is_in(NAMES))\n'
+        '    return f.filter(pl.col("fact_name").is_in(STATEMENT_FACT_NAMES))\n'
     )
     assert unfiltered_readers(named) == []
+    other = named.replace("STATEMENT_FACT_NAMES", "NEW_NAMES")
+    assert unfiltered_readers(other) == ["read"]
+    join = 'def read(c):\n    return c.execute("SELECT * FROM x JOIN statement_facts f ON 1")\n'
+    assert unfiltered_readers(join) == ["read"]
