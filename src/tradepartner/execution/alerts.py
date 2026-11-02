@@ -119,6 +119,7 @@ __all__ = [
     "Alerter",
     "Delivery",
     "break_age",
+    "break_alert_cut",
     "break_kinds",
     "is_aged",
     "latest_open_breaks",
@@ -205,6 +206,20 @@ def break_kinds(event: ReconcileBreakRow) -> tuple[str, ...]:
     return tuple(sorted(kinds))
 
 
+#: The run results written through the run's `_finish`, the only path that
+#: writes a `reconcile_break` alert.
+_ALERTED_RESULTS = frozenset({"ok", "skipped_kill_switch"})
+
+
+def break_alert_cut(runs: Iterable[tuple[str | None, datetime]]) -> datetime | None:
+    """`reconcile_break_message`'s `opened_after` from the window's earlier runs,
+    each as (result status or None, finished_at): the latest `finished_at` of a
+    run whose result went through `_finish` (`ok`, `skipped_kill_switch`). A
+    halted, failed, stale or crashed run wrote no break alert, so a break it
+    opened is still new to the next run. None when no such run exists."""
+    return max((at for status, at in runs if status in _ALERTED_RESULTS), default=None)
+
+
 def true_up_command(book_id: str, break_id: str) -> str:
     """The `paper true-up` line for one break, its reason left for the owner."""
     return f'tradepartner paper true-up --book {book_id} --break {break_id} --reason "<why>"'
@@ -226,9 +241,11 @@ def reconcile_break_message(
     calls for one. It names every open break whose `opened` event is known after
     `opened_after` (the window's previous run's end; None names every open one)
     and every open break aged at `session`, each with its id, kinds, name, size,
-    age and true-up line. Pure over the window's break events."""
+    age and true-up line. A `reopened` event counts as an opening. Pure over the
+    window's break events."""
     rows = list(events)
-    opened_at = {e.break_id: e.known_at for e in rows if e.event == "opened"}
+    # the latest `opened` or `reopened` (a reversed true-up) of each break
+    opened_at = {e.break_id: e.known_at for e in rows if e.event in ("opened", "reopened")}
     named: list[str] = []
     for event in latest_open_breaks(rows):
         aged = is_aged(event, session, max_age_sessions)

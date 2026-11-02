@@ -242,7 +242,7 @@ from tradepartner.errors import (
     SystemFaultError,
 )
 from tradepartner.execution import drawdown, exits, marks, planning, switch
-from tradepartner.execution.alerts import Alerter, reconcile_break_message
+from tradepartner.execution.alerts import Alerter, break_alert_cut, reconcile_break_message
 from tradepartner.execution.buy_timing import execution_for
 from tradepartner.execution.collect import (
     Collected,
@@ -1505,20 +1505,17 @@ class _Run:
 
     def _break_alert(self) -> None:
         """The run's one `reconcile_break` alert (#2266 item 12, T284): every open
-        break opened since the window's previous run ended (its result's
-        `finished_at`, else its start) and every aged one; none when no break
-        calls for it."""
+        break opened since the window's last earlier run that alerted
+        (`alerts.break_alert_cut`) and every aged one; none when no break calls
+        for it."""
         with open_read_only(self.settings, retry=True) as conn:
             events = break_events_for(conn, self.window_id)
             earlier = [
-                r for r in runs_for(conn, self.window_id) if (r.run.run_id or 0) < self.run_id
+                (r.result.status, r.result.finished_at)
+                for r in runs_for(conn, self.window_id)
+                if (r.run.run_id or 0) < self.run_id and r.result is not None
             ]
-        before = max(earlier, key=lambda r: r.run.run_id or 0, default=None)
-        opened_after = (
-            None
-            if before is None
-            else (before.result.finished_at if before.result is not None else before.run.started_at)
-        )
+        opened_after = break_alert_cut(earlier)
         message = reconcile_break_message(
             events,
             book_id=self.window.book_id,

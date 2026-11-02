@@ -766,3 +766,43 @@ def test_a_reconcile_break_alert_is_deduped_per_run(conn: duckdb.DuckDBPyConnect
     assert alerter.write("reconcile_break", 8, _SESSION, "next run") != first
     with pytest.raises(ValueError, match="run"):
         alerter.write("reconcile_break", None, _SESSION, "no run")
+
+
+def test_a_break_is_aged_only_past_the_limit_not_at_it() -> None:
+    # first seen Thu 2026-10-01: 5 sessions old on Wed 10-07, 6 on Thu 10-08
+    event = _break_event("opened", 1)
+    assert not alerts.is_aged(event, date(2026, 10, 7), 5)
+    assert alerts.is_aged(event, date(2026, 10, 8), 5)
+    assert not alerts.is_aged(_break_event("trued_up", 2), date(2026, 12, 1), 5)
+
+
+def test_the_cut_skips_runs_that_wrote_no_break_alert() -> None:
+    # safety review of PR #2916: a break opened by a run that then halted is still
+    # new to the next run, so the cut is the last run ended through `_finish`
+    ok_at, halted_at = _NOW - timedelta(days=2), _NOW - timedelta(days=1)
+    runs = [("ok", ok_at), ("halted", halted_at), ("failed", _NOW), ("stale", _NOW)]
+    assert alerts.break_alert_cut(runs) == ok_at
+    assert alerts.break_alert_cut([("skipped_kill_switch", halted_at)]) == halted_at
+    assert alerts.break_alert_cut([("halted", halted_at)]) is None
+    opened_in_halted_run = _break_event("opened", 1, known_at=halted_at - timedelta(hours=1))
+    message = alerts.reconcile_break_message(
+        [opened_in_halted_run],
+        book_id="main",
+        session=_SESSION,
+        max_age_sessions=5,
+        opened_after=alerts.break_alert_cut(runs),
+    )
+    assert message is not None and "1:SEC_A:3" in message
+
+
+def test_a_reopened_break_is_named_again() -> None:
+    before = _NOW - timedelta(days=1)
+    rows = [
+        _break_event("opened", 1, known_at=before - timedelta(days=1)),
+        _break_event("trued_up", 2, known_at=before - timedelta(hours=2)),
+        _break_event("reopened", 3),
+    ]
+    message = alerts.reconcile_break_message(
+        rows, book_id="main", session=_SESSION, max_age_sessions=5, opened_after=before
+    )
+    assert message is not None and "1:SEC_A:3" in message

@@ -24,7 +24,8 @@ several restart events the latest restart wins. Under ADR 0017's 2026-10-26
 amendment a `reconcile_breaks` event `opened`, `observed` or `reopened` after the
 row with an `unattributed` part (`parts_json`, or the event's `cause`) is a
 restart event too, released by the first closing event of that break after it
-(`trued_up`, `auto_explained`, `resolved_by_broker`, `auto_accepted`): the span
+(`trued_up`, `auto_explained`, `resolved_by_broker`, `auto_accepted`), or by its
+window's closing stop after it when the break never closes: the span
 restarts at the session after that close, and is pending until it is written. A
 break whose every part is `corporate_action`, `broker_activity` or `data` never
 restarts the span. The span's instant lower bound
@@ -508,13 +509,20 @@ def _read_span(
         if event.known_at <= row.made_at:
             continue
         what = f"unattributed break {event.break_id} ({event.event} {event.known_at.isoformat()})"
-        if closing is None:
-            pending.append((event.known_at, what))
-            continue
-        candidate = next_session(_local_date(closing.known_at))
+        if closing is not None:
+            ended_at, how = closing.known_at, f"closed {closing.event}"
+        else:
+            # a window closed or abandoned after the event never trades again and
+            # its break never closes: the closing stop ends the restart instead
+            stop = closed.get(event.window_id)
+            if stop is None or stop <= event.known_at:
+                pending.append((event.known_at, what))
+                continue
+            ended_at, how = stop, "window closed"
+        candidate = next_session(_local_date(ended_at))
         if candidate > start:
             start = candidate
-            restart = f"{what}, closed {closing.event} {closing.known_at.isoformat()}"
+            restart = f"{what}, {how} {ended_at.isoformat()}"
     for window_id, at, what in _restart_events(conn, row.made_at, now):
         released = min(
             (

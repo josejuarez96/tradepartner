@@ -19,7 +19,7 @@ import json
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -1714,3 +1714,33 @@ def test_fills_lagging_followed_by_breaks_passes(
     e2 = _line(_run(settings), "E.2 reconciliation")
     assert e2.passed, e2.detail
     assert "1 pending_unresolved/fills_lagging row(s) and 1 breaks row(s)" in e2.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_a_break_event_known_after_now_is_not_read(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn, full_risk=True)
+    j.brk("opened", NOW + timedelta(hours=1), cause="unattributed")
+    j.brk("opened", NOW + timedelta(hours=2), first_seen=date(2026, 10, 5), break_id="1:B:1")
+    conn.close()
+    result = _run(settings)
+    assert result.span.start == D1 and result.passed, [(x.name, x.detail) for x in result.lines]
+
+
+@pytest.mark.usefixtures("health")
+def test_a_closed_window_ends_an_unattributed_breaks_pending_restart(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    # quant review of PR #2916: an abandoned window's break never closes; its
+    # closing stop releases the restart as it does a mismatch's
+    j = _clean(conn, full_risk=True)
+    j.brk("opened", _at(D2, 20), cause="unattributed")
+    conn.execute(
+        'INSERT INTO paper_window_stops (window_id, state, "at", reason, known_at, ingested_at) '
+        "VALUES (1, 'abandoned', ?, 'abandoned for the test', ?, ?)",
+        [_at(D3, 21), _at(D3, 21), _at(D3, 21)],
+    )
+    conn.close()
+    span = _run(settings).span
+    assert span.start == D4 and "window closed" in (span.restart or "")
