@@ -603,13 +603,33 @@ def daily_index_file(
     if not dest.is_file() or old != body:
         write_atomic(dest, body)
     stat = dest.stat()
+    fetch = {  # plan T347: the URL and UTC fetch time of these exact bytes
+        "url": str(response.url),
+        "fetched_at": datetime.now(UTC).isoformat(),
+        "sha256": hashlib.sha256(body).hexdigest(),
+    }
     write_atomic(
         sidecar,
         json.dumps(
-            {**cursor, "body_size": stat.st_size, "body_mtime_ns": stat.st_mtime_ns}
+            {**cursor, **fetch, "body_size": stat.st_size, "body_mtime_ns": stat.st_mtime_ns}
         ).encode(),
     )
     return dest
+
+
+def daily_index_fetch(path: Path, sha256: str) -> tuple[str | None, datetime | None]:
+    """The URL and UTC fetch time `daily_index_file` recorded for the cached daily
+    file at `path` whose SHA-256 is `sha256` (plan T347), or `(None, None)` for a
+    file cached before that, an unreadable record, or a record of other bytes."""
+    try:
+        record = json.loads(path.with_name(f"{path.name}.listing.json").read_text())
+        url, at = record["url"], datetime.fromisoformat(record["fetched_at"])
+        recorded = record["sha256"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, None
+    if not isinstance(url, str) or at.utcoffset() is None or recorded != sha256:
+        return None, None
+    return url, at.astimezone(UTC)
 
 
 def cached_daily_index_files(

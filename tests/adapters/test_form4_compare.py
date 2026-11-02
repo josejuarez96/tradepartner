@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import fields, replace
 from datetime import date
 from decimal import Decimal
@@ -163,3 +164,122 @@ def test_default_declaration_agrees_exactly_when_rows_agree_does() -> None:
     ]
     for bulk, xml in cases:
         assert (compare_rows(bulk, xml, decl()) == ()) == rows_agree(bulk, xml)
+
+
+# --- T353 (#2900): the recorded read-only baseline on #2706's 11 refused quarters ---------
+# Recorded 2026-11-02 by an offline replay (no SEC request, no fact write): the pre-run
+# store backup bak-20261031-0441 for the pending set, bak-20261102-1729 for the stored XML
+# rows, the cached index and bulk zips, and the 100 XMLs fetched for #2706. Per quarter:
+# (XML-routed pending accessions, sample accessions with a cached XML, stored-XML accessions
+# compared against the bulk zip, of those the multi-owner ones).
+BASELINE = {
+    "2016q1": (2692, 0, 1471, 120),
+    "2017q4": (2066, 19, 892, 43),
+    "2018q4": (1996, 0, 986, 71),
+    "2019q1": (1987, 19, 1078, 53),
+    "2019q3": (1836, 20, 934, 59),
+    "2019q4": (1922, 0, 941, 58),
+    "2020q1": (2262, 0, 1142, 70),
+    "2020q3": (2064, 17, 1009, 48),
+    "2021q3": (2332, 0, 788, 11),
+    "2022q1": (2245, 0, 1013, 22),
+    "2024q2": (2256, 17, 2141, 1135),
+}
+# The disagreeing stored-XML accessions, one recorded row difference per field:
+# (quarter, accession, filer_cik, line_no, field, bulk value, XML value).
+DEEMED = "deemed_execution_date"
+BASELINE_DISAGREEMENTS = [
+    ("2019q1", "0001491519-19-000001", "0001491519", 0, DEEMED, "2018-12-24", None),
+    ("2019q3", "0001763113-19-000007", "0001763113", 0, DEEMED, "2019-09-16", None),
+    ("2024q2", "0000895345-24-000172", "0001465837", 0, "is_director", True, False),
+    ("2024q2", "0000912282-24-000379", "0001390411", 0, "is_director", False, True),
+    ("2024q2", "0000912282-24-000379", "0001390411", 0, "is_officer", False, True),
+    ("2024q2", "0000950172-24-000192", "0001965769", 0, "is_other", True, False),
+    *(
+        ("2024q2", f"0001437749-24-{n}", "0001056823", 0, "is_ten_percent_owner", False, True)
+        for n in (
+            "010228", "010519", "010783", "011029", "011180", "011338",
+            "011481", "011602", "011739", "011866", "011987", "012146",
+        )
+    ),
+]  # fmt: skip
+BASELINE_ROW_COUNTS = {  # disagreeing rows per field over all 11 quarters, diagnosis only
+    "is_ten_percent_owner": 144, "is_director": 4, "is_other": 2, "is_officer": 2,
+    "deemed_execution_date": 4,
+}  # fmt: skip
+
+
+def _recorded(value: object, name: str) -> object:
+    return date.fromisoformat(value) if name == "deemed_execution_date" and value else value  # type: ignore[arg-type]
+
+
+def baseline_tally(quarters: tuple[str, ...]) -> RunTally:
+    """Replay the recorded stored-XML population of `quarters` through the real comparison."""
+    t = RunTally()
+    bad: dict[str, list[tuple[str, object, object]]] = {}
+    for q, acc, _cik, _line, name, bulk_v, xml_v in BASELINE_DISAGREEMENTS:
+        if q in quarters:
+            bad.setdefault(acc, []).append((name, _recorded(bulk_v, name), _recorded(xml_v, name)))
+    for acc, diffs in bad.items():
+        b = replace(row(), **{n: bv for n, bv, _ in diffs})  # type: ignore[arg-type]
+        x = replace(row(), **{n: xv for n, _, xv in diffs})  # type: ignore[arg-type]
+        found = compare_rows([b], [x], decl())
+        assert {d.field for d in found} == {n for n, _, _ in diffs}
+        t.add(acc, found)
+    for q in quarters:
+        recorded_bad = len({a for qq, a, *_ in BASELINE_DISAGREEMENTS if qq == q})
+        for i in range(BASELINE[q][2] - recorded_bad):
+            t.add(f"{q}-{i}", compare_rows([row()], [row()], decl()))
+    return t
+
+
+def test_recorded_baseline_numerator_and_denominator() -> None:
+    every = tuple(BASELINE)
+    total = baseline_tally(every)
+    assert (total.disagreeing, total.compared) == (17, 12_395)
+    assert total.by_field == Counter(
+        {"is_ten_percent_owner": 12, "is_director": 2, "is_officer": 1, "is_other": 1,
+         "deemed_execution_date": 2}
+    )  # fmt: skip
+    worst = baseline_tally(("2024q2",))
+    assert (worst.disagreeing, worst.compared) == (15, 2_141)
+    assert worst.share() == Decimal(15) / Decimal(2_141)  # 0.70%, the highest quarter
+    single_owner = sum(v[2] - v[3] for v in BASELINE.values())
+    assert single_owner == 12_395 - 1_690  # 2 of 10,705 single-owner accessions disagree
+    assert {q for q, *_ in BASELINE_DISAGREEMENTS if q != "2024q2"} == {"2019q1", "2019q3"}
+
+
+def test_recorded_baseline_against_candidate_thresholds() -> None:
+    every, worst = baseline_tally(tuple(BASELINE)), baseline_tally(("2024q2",))
+    assert every.outcome(Decimal("0.01")) is Outcome.BELOW
+    assert worst.outcome(Decimal("0.01")) is Outcome.BELOW  # 0.70% under 1%
+    assert worst.outcome(Decimal("0.005")) is Outcome.AT_OR_ABOVE  # a 0.5% line would fail it
+    assert baseline_tally(("2019q1",)).outcome(Decimal("0.01")) is Outcome.BELOW
+    assert every.outcome(None) is Outcome.REPORT_ONLY
+
+
+def test_recorded_baseline_adds_no_request_and_fits_the_budget() -> None:
+    from tradepartner.adapters.form4_route import RequestCounts, plan_requests
+
+    sample = EventsConfig().form4_bulk_order_sample
+    budget = EventsConfig().sec_forms_max_requests
+    fetched = {q: v[0] + sample for q, v in BASELINE.items()}  # today's XML fetches
+    assert sum(fetched.values()) == 23_878
+    # Rule 5 compares accessions the route already fetches: it adds no request. Each fetch is
+    # 1 request (primary document is XML) or 2 (a filing-index lookup first).
+    for q, n in fetched.items():
+        assert not plan_requests(RequestCounts(0, 0, n, 0), budget=budget).refused, q
+        assert not plan_requests(RequestCounts(0, 0, 2 * n, 0), budget=budget).refused, q
+    assert not plan_requests(RequestCounts(0, 0, 23_878, 0), budget=budget).refused
+    assert plan_requests(RequestCounts(0, 0, 2 * 23_878, 0), budget=budget).refused
+    assert (
+        budget - 2 * max(fetched.values()) == 34_576
+    )  # the busiest quarter, 2016q1, leaves this headroom
+
+
+def test_recorded_baseline_sample_population_has_no_disagreement() -> None:
+    sampled = sum(v[1] for v in BASELINE.values())
+    t = RunTally()
+    for i in range(sampled):
+        t.add(f"s{i}", compare_rows([row()], [row()], decl()))
+    assert (t.disagreeing, t.compared) == (0, 92)

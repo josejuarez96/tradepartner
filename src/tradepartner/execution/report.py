@@ -75,7 +75,12 @@ from tradepartner.calendar import (
     session_close,
 )
 from tradepartner.config import Cadence, RiskConfig, Settings
-from tradepartner.execution.ledger import Ledger, from_journal
+from tradepartner.execution.ledger import (
+    Ledger,
+    from_journal,
+    reversed_adjustment_id,
+    reversed_true_up_ids,
+)
 from tradepartner.execution.lock import resolve_book
 from tradepartner.execution.marks import UnreadableMarkError, equity_at
 from tradepartner.execution.plan import residue as residue_of
@@ -659,6 +664,7 @@ def _residue_term(
         for a in journal.adjustments
         if a.window_id == window_id and a.session <= t_next and a.known_at <= k_next
     ]
+    reversed_ids = reversed_true_up_ids(source_rows, t_next)
     for a in period_rows:
         if a.kind == "carried_residue":
             raise ValueError(f"{a.security_id} {t_i} to {t_next}: carried_residue inside period")
@@ -790,7 +796,16 @@ def _residue_term(
                 raise ValueError(f"{name} {t_i} to {t_next}: ledger replay: {exc}") from exc
         if mark_i.value is None or value_next is None:
             raise ValueError(f"{name} {t_i} to {t_next}: missing mark value")
-        if any(a.kind in {"auto_true_up", "owner_true_up"} for a in rows):
+        period_ids = {a.adjustment_id for a in rows}
+        if any(
+            (
+                a.kind in {"auto_true_up", "owner_true_up"}
+                and a.adjustment_id not in reversed_ids
+                and reversed_adjustment_id(a) is None
+            )
+            or ((target := reversed_adjustment_id(a)) is not None and target not in period_ids)
+            for a in rows
+        ):
             trued_up.append(name)
         ordinary_cash = math.fsum((a.cash or 0.0) for a in rows if a.kind != "dividend_cash")
         dividend_cash = 0.0

@@ -633,6 +633,9 @@ class EdgarFilingSource(FilingSource):
         # Plan T348: the ingest driver's Form 4 XML keeper, called with each fetched
         # body before it is parsed; `None` (the archive off) fetches as before.
         self.form4_xml_keeper: Callable[[str, edgar_raw.FetchedXml], object] | None = None
+        # Plan T347: the driver's daily index keeper, called with each cached daily
+        # file's body before it is parsed; `None` (the archive off) reads as before.
+        self.daily_index_keeper: Callable[[DailyIndexFile, Path, bytes], object] | None = None
         self.sec_forms_requests: dict[str, int] = defaultdict(
             int,
             total=0,
@@ -1333,7 +1336,11 @@ class EdgarFilingSource(FilingSource):
         path = edgar_raw.daily_index_file(
             day.year, quarter, file, settings=self._settings, client=self._client
         )
-        text = path.read_text(encoding="utf-8")
+        body = path.read_bytes()
+        if self.daily_index_keeper is not None:
+            self.daily_index_keeper(file, path, body)  # kept before it is parsed
+        # `read_text`'s universal newlines, as before the keeper
+        text = body.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         text = re.sub(
             r"\b(\d{4})(\d{2})(\d{2})(?=\s+edgar/data/)",
             r"\1-\2-\3",

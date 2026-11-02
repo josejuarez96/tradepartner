@@ -19,6 +19,7 @@ DuckDB anywhere else.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import shutil
@@ -1184,6 +1185,347 @@ def test_a_correction_inside_the_key_off_gap_is_dated_no_earlier_incrementally(
     assert theirs[1][3] == _night(date(2026, 3, 4))
     assert ours[1][3] == _night(date(2026, 3, 6))
     assert ours[1][3] >= theirs[1][3]
+
+
+# --- the raw archive (plan T347, #2714) -------------------------------------------
+
+LAMBDA = "0000000301"
+FIRST = f"{LAMBDA}-26-000001"  # a 10-K listed 03-02
+SECOND = f"{LAMBDA}-26-000002"  # a 10-Q listed 03-03, whose file SEC re-posts on 03-04
+REPOST = date(2026, 3, 3)
+
+
+@dataclass
+class _ArchiveCase:
+    sec: _Sec
+    settings: Settings
+    root: Path
+
+    def night(self, day: int, *, rebuild: bool = False) -> None:
+        """Ingest March `day`, 2026. On the 4th SEC re-posts the 3rd's file with
+        the 10-Q's corrected `filed_on`."""
+        self.sec.now = _night(date(2026, 3, day))
+        if day == 4:
+            self.sec.filing(SECOND).filed_on = date(2026, 3, 1)
+        _ingest(self.settings, self.sec, rebuild=rebuild)
+
+    def bodies(self) -> set[str]:
+        return {path.name for path in (self.root / "raw").rglob("*") if path.is_file()}
+
+    def runs(self) -> list[tuple[Any, ...]]:
+        return _rows(
+            self.settings,
+            "SELECT run_id, mode, started_at, message FROM ingestion_runs "
+            "WHERE source = 'edgar_index' ORDER BY rowid",
+        )
+
+    def manifests(self, runs: Sequence[tuple[Any, ...]]) -> list[dict[str, Any]]:
+        from tradepartner.adapters.daily_index import parse_index_manifest
+        from tradepartner.adapters.form4_archive import message_digest
+        from tradepartner.store.raw_archive import manifest_path
+
+        out = []
+        for run_id, _mode, _started, message in runs:
+            if (digest := message_digest(message)) is not None:
+                # read from disk: `hundred_nights` keeps `read_manifest` patched
+                body = manifest_path(self.root, digest).read_bytes()
+                assert _sha(body) == digest
+                manifest = parse_index_manifest(body)
+                assert manifest["writer"]["run_id"] == run_id
+                out.append(manifest)
+        return out
+
+
+def _archive_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **ingest: Any) -> _ArchiveCase:
+    """One issuer over March 2026 nights (Q1 open) with the raw archive on."""
+    from pydantic import SecretStr
+
+    from tradepartner import diskfloor
+
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _path: 10**15)
+    root = (tmp_path / "archive").resolve()
+    root.mkdir()
+    settings = _settings(tmp_path, "store", 2026)
+    settings = settings.model_copy(
+        update={
+            "tradepartner_raw_archive": SecretStr(str(root)),
+            "ingest": settings.ingest.model_copy(update=ingest),
+        }
+    )
+    accepted = {day: _eastern(date(2026, 3, day), 17) for day in (2, 3)}
+    filings = [
+        _Filing(
+            LAMBDA,
+            "Lambda Corp",
+            "10-K",
+            FIRST,
+            accepted[2],
+            date(2026, 3, 2),
+            date(2026, 3, 2),
+            ticker="LAM",
+            exchange="NYSE",
+            shares=100_000,
+        ),
+        _Filing(LAMBDA, "Lambda Corp", "10-Q", SECOND, accepted[3], REPOST, REPOST),
+    ]
+    sec = _Sec(
+        filings,
+        {LAMBDA: ("Lambda Corp", "LAM", "NYSE")},
+        fsn={"2026_01": _instant("2026-02-20T12:00:00-05:00")},
+        reposts={REPOST: _eastern(date(2026, 3, 4), 21)},
+    )
+    return _ArchiveCase(sec, settings, root)
+
+
+def _sha(body: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(body).hexdigest()
+
+
+def test_daily_bodies_are_kept_by_hash_and_rows_map_to_their_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reused and changed bodies, and the source/mode/file-date mapping: each
+    daily body read is kept once by hash, a re-posted file keeps both bodies, a
+    rebuild that re-reads them keeps none anew, and each stored row maps to
+    exactly one writer entry, a revision (its `known_at` the run's commit clock)
+    to its night's run. No ingest run reads the archive."""
+    from tradepartner.adapters.daily_index import find_index_entry, index_key
+    from tradepartner.adapters.form4_archive import ProvenanceError, row_digest
+    from tradepartner.store import raw_archive
+
+    case = _archive_case(tmp_path, monkeypatch)
+    first_body = case.sec.daily_body(REPOST)
+
+    def never(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("an ingest run read the raw archive")
+
+    with pytest.MonkeyPatch.context() as patch:
+        for reader in ("read_body", "read_manifest"):
+            patch.setattr(raw_archive, reader, never)
+        for day in (2, 3, 4, 5):
+            case.night(day, rebuild=day == 2)
+        kept = case.bodies()
+        case.night(5, rebuild=True)
+    assert case.bodies() == kept
+    assert {_sha(first_body), _sha(case.sec.daily_body(REPOST))} <= kept
+    assert _sha(first_body) != _sha(case.sec.daily_body(REPOST))
+    runs = case.runs()
+    manifests = case.manifests(runs)
+    entries = [entry for manifest in manifests for entry in manifest["entries"]]
+    assert {entry["raw_sha256"] for entry in entries} == kept
+    for entry in entries:
+        assert entry["url"] == "https://www.sec.gov/Archives/edgar/" + entry["path"]
+        assert entry["fetched_at"] is not None and entry["parsed"]
+    modes = {run_id: mode for run_id, mode, *_ in runs}
+    with duckdb.connect(case.settings.store.path, read_only=True) as conn:
+        conn.execute("SET TimeZone='UTC'")
+        cursor = conn.execute("SELECT * FROM filing_index ORDER BY known_at")
+        columns = [item[0] for item in cursor.description]
+        stored = [dict(zip(columns, values, strict=True)) for values in cursor.fetchall()]
+    writers = []
+    for row in stored:
+        found = []
+        for mode in ("rebuild_index", "session"):
+            with contextlib.suppress(ProvenanceError):
+                found.append(
+                    find_index_entry(
+                        manifests,
+                        mode=mode,
+                        listed_on=row["listed_on"],
+                        key=index_key(row),
+                        digest=row_digest(row),
+                    )
+                )
+        assert len(found) == 1, row
+        writer, entry = found[0]
+        writers.append((row["accession"], row["filed_on"], modes[writer], entry["file_date"]))
+    assert writers == [
+        (FIRST, date(2026, 3, 2), "rebuild_index", "2026-03-02"),
+        (SECOND, REPOST, "session", "2026-03-03"),
+        (SECOND, date(2026, 3, 1), "session", "2026-03-03"),
+    ]
+    assert stored[-1]["known_at"] == stored[-1]["ingested_at"] == _night(date(2026, 3, 4))
+
+
+def test_a_failed_daily_archive_write_writes_no_derived_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import raw_archive
+    from tradepartner.store.raw_archive_config import RawArchiveFloorError
+
+    case = _archive_case(tmp_path, monkeypatch)
+    case.night(2, rebuild=True)
+    before = _tables(case.settings.store.path)
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise RawArchiveFloorError("raw archive write refused")
+
+    monkeypatch.setattr(raw_archive, "archive_body", refuse)
+    case.sec.now = _night(date(2026, 3, 3))
+    source = _SimSource(case.settings, case.sec)
+    try:
+        result = ingest_session(
+            case.settings,
+            prices=_NoPrices(),
+            filings=source,
+            source="edgar",
+            clock=lambda: case.sec.now,
+        )
+    finally:
+        source.close()
+    assert not result.ok
+    assert "RawArchiveFloorError" in " ".join(run.message for run in result.runs)
+    assert _tables(case.settings.store.path) == before
+
+
+def test_a_small_message_cap_keeps_the_manifest_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The digest sits before any text `ingest.max_message_chars` can cut."""
+    from tradepartner.adapters.form4_archive import message_digest
+
+    case = _archive_case(tmp_path, monkeypatch, max_message_chars=200)
+    case.night(2, rebuild=True)
+    case.night(3)
+    runs = case.runs()
+    assert all(len(message) <= 200 for *_, message in runs)
+    written = [run for run in runs if message_digest(run[3]) is not None]
+    assert {run[1] for run in written} == {"rebuild_index", "session"}
+    assert len(case.manifests(written)) == len(written)
+
+
+def test_a_later_fetch_is_invisible_to_a_store_truncated_before_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No look-ahead: the runs and rows known by night 03-03 cite no file fetched
+    later (the 4th's, the re-posted body of the 3rd's) and hold no later row."""
+    case = _archive_case(tmp_path, monkeypatch)
+    for day in (2, 3, 4):
+        case.night(day, rebuild=day == 2)
+    cut = _night(date(2026, 3, 3))
+    early = [run for run in case.runs() if run[2] <= cut]
+    entries = [e for m in case.manifests(early) for e in m["entries"]]
+    assert entries
+    assert _sha(case.sec.daily_body(REPOST)) not in {e["raw_sha256"] for e in entries}
+    assert "daily-index/2026/QTR1/form.20260304.idx" not in {e["path"] for e in entries}
+    rows = _rows(
+        case.settings,
+        "SELECT filed_on FROM filing_index WHERE accession = ? AND known_at <= ?",
+        [SECOND, cut],
+    )
+    assert rows == [(REPOST,)]
+
+
+def test_quarterly_and_pending_quarterly_rows_are_left_out_of_every_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The snapshot exception: a settled quarter's `form.idx` row, and one still
+    pending from it, map to no daily entry. A daily row pending one night maps to
+    its own file's entry once stamped. A dry run
+    keeps nothing and names no digest."""
+    from tradepartner.adapters.daily_index import find_index_entry, index_key
+    from tradepartner.adapters.form4_archive import ProvenanceError, message_digest, row_digest
+
+    case = _archive_case(tmp_path, monkeypatch)
+    old, late, held = f"{LAMBDA}-25-000009", f"{LAMBDA}-25-000010", f"{LAMBDA}-26-000003"
+    stamp = _eastern(date(2026, 3, 3), 12)
+    extra = [
+        _Filing(
+            LAMBDA,
+            "Lambda Corp",
+            "10-Q",
+            old,
+            _eastern(date(2025, 11, 3), 17),
+            date(2025, 11, 3),
+            None,
+            appears=_eastern(date(2025, 11, 3), 22),
+        ),
+        _Filing(
+            LAMBDA,
+            "Lambda Corp",
+            "8-K",
+            late,
+            _eastern(date(2025, 12, 1), 17),
+            date(2025, 12, 1),
+            None,
+            appears=_eastern(date(2025, 12, 1), 22),
+            stamp_from=stamp,
+        ),
+        _Filing(
+            LAMBDA,
+            "Lambda Corp",
+            "8-K",
+            held,
+            _eastern(date(2026, 3, 2), 18),
+            date(2026, 3, 2),
+            date(2026, 3, 2),
+            stamp_from=stamp,
+        ),
+    ]
+    case.sec = _Sec(
+        [*case.sec.filings, *extra],
+        case.sec.issuers,
+        fsn=case.sec.fsn,
+        reposts=case.sec.reposts,
+    )
+    case.settings = _with(case.settings, index_first_year=2025)
+    case.sec.now = _night(date(2026, 3, 2))
+    source = _SimSource(case.settings, case.sec)
+    try:
+        dry = ingest_session(
+            case.settings,
+            prices=_NoPrices(),
+            filings=source,
+            source="edgar",
+            clock=lambda: case.sec.now,
+            rebuild_index=True,
+            dry_run=True,
+        )
+    finally:
+        source.close()
+    assert dry.ok and all(message_digest(run.message) is None for run in dry.runs)
+    assert case.bodies() == set() and not (case.root / "manifests").exists()
+    case.night(2, rebuild=True)
+    pending = _rows(case.settings, "SELECT accession FROM filing_index_pending ORDER BY 1")
+    assert pending == [(late,), (held,)]
+    case.night(3)
+    runs = case.runs()
+    assert "index_unattributed: 0" in runs[-1][3]
+    manifests = case.manifests(runs)
+    with duckdb.connect(case.settings.store.path, read_only=True) as conn:
+        conn.execute("SET TimeZone='UTC'")
+        cursor = conn.execute("SELECT * FROM filing_index")
+        columns = [item[0] for item in cursor.description]
+        stored = {
+            r["accession"]: r
+            for r in (dict(zip(columns, v, strict=True)) for v in cursor.fetchall())
+        }
+
+    def entry(accession: str) -> Mapping[str, Any]:
+        row = stored[accession]
+        return find_index_entry(
+            manifests,
+            mode="session",
+            listed_on=row["listed_on"],
+            key=index_key(row),
+            digest=row_digest(row),
+        )[1]
+
+    assert late not in stored
+    for accession in (old,):
+        for mode in ("session", "rebuild_index"):
+            row = stored[accession]
+            with pytest.raises(ProvenanceError):
+                find_index_entry(
+                    manifests,
+                    mode=mode,
+                    listed_on=row["listed_on"],
+                    key=index_key(row),
+                    digest=row_digest(row),
+                )
+    assert entry(held)["file_date"] == "2026-03-02"
 
 
 # --- the memory bound ----------------------------------------------------------
