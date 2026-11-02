@@ -242,7 +242,7 @@ from tradepartner.errors import (
     SystemFaultError,
 )
 from tradepartner.execution import drawdown, exits, marks, planning, switch
-from tradepartner.execution.alerts import Alerter
+from tradepartner.execution.alerts import Alerter, reconcile_break_message
 from tradepartner.execution.buy_timing import execution_for
 from tradepartner.execution.collect import (
     Collected,
@@ -325,6 +325,7 @@ from tradepartner.store.journal import (
     ReconciliationRow,
     adjustments_for,
     append,
+    break_events_for,
     decisions_for,
     fills_for,
     kill_switch_events_for,
@@ -1502,9 +1503,36 @@ class _Run:
         )
         return self._finish(SKIPPED_KILL_SWITCH)
 
+    def _break_alert(self) -> None:
+        """The run's one `reconcile_break` alert (#2266 item 12, T284): every open
+        break opened since the window's previous run ended (its result's
+        `finished_at`, else its start) and every aged one; none when no break
+        calls for it."""
+        with open_read_only(self.settings, retry=True) as conn:
+            events = break_events_for(conn, self.window_id)
+            earlier = [
+                r for r in runs_for(conn, self.window_id) if (r.run.run_id or 0) < self.run_id
+            ]
+        before = max(earlier, key=lambda r: r.run.run_id or 0, default=None)
+        opened_after = (
+            None
+            if before is None
+            else (before.result.finished_at if before.result is not None else before.run.started_at)
+        )
+        message = reconcile_break_message(
+            events,
+            book_id=self.window.book_id,
+            session=self.session,
+            max_age_sessions=self.frozen.break_max_age_sessions,
+            opened_after=opened_after,
+        )
+        if message is not None:
+            self._alert("reconcile_break", message)
+
     def _finish(self, status: str) -> RunOutcome:
         # A ticker-change note no batch alerted yet (#2185): the run's `skipped` alert.
         self.gate.alert_unsent(self.run)
+        self._break_alert()
         finished = self.gate.read_clock()
         notes = tuple(dict.fromkeys(self.notes))
         with self.connect() as conn:

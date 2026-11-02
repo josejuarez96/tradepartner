@@ -2845,3 +2845,71 @@ def test_the_report_due_floor_is_the_report_guards_floor() -> None:
     from tradepartner.execution import report as report_module
 
     assert ops._REPORT_MIN_REBALANCES == report_module._MIN_REBALANCE_SESSIONS
+
+
+# --- reconcile breaks on the owner's surfaces (#2266 item 12; T284) -------------------
+
+
+def _w_break(conn: duckdb.DuckDBPyConnection, window_id: int, event: str = "opened") -> None:
+    from tradepartner.store.journal import ReconcileBreakRow
+
+    at = datetime(2026, 9, 28, 21, 0, tzinfo=UTC)
+    append(
+        conn,
+        ReconcileBreakRow(
+            break_id=f"{window_id}:SEC_A:5",
+            window_id=window_id,
+            book_id="main",
+            event=event,
+            parts_json=json.dumps([{"kind": "quantity", "cause": "corporate_action"}]),
+            cause="corporate_action",
+            security_id="SEC_A",
+            symbol="AAA",
+            dollar_size=500.0,
+            material=True,
+            # 2026-09-28 through Wednesday 2026-10-07: 8 sessions, past the default 5
+            first_seen_session=date(2026, 9, 28),
+            reconciliation_id=5,
+            reason="checked in Alpaca" if event == "trued_up" else None,
+            **_w_stamp(at if event == "opened" else at + timedelta(hours=1)),
+        ),
+    )
+
+
+def test_an_aged_break_is_a_waiting_item_and_the_book_is_restricted_not_halted(
+    journal_settings: Settings,
+) -> None:
+    with open_for_write(journal_settings) as conn:
+        _w_hypothesis(conn)
+        window_id = _w_window(conn, "main")
+        _w_run(conn, window_id, _W_S_MINUS_1)
+        _w_break(conn, window_id)
+    items = _w_read(journal_settings)
+    (item,) = [i for i in items if i.kind == "reconcile_break"]
+    assert item.aged and item.book_id == "main"
+    assert item.command == (
+        f'tradepartner paper true-up --book main --break {window_id}:SEC_A:5 --reason "<why>"'
+    )
+    assert "kill_switch_engaged" not in {i.kind for i in items}
+    with open_read_only(journal_settings) as conn:
+        (summary,) = ops.book_summaries(conn, journal_settings, now=_W_NOW)
+        page = ops.page_data(conn, journal_settings, "main", now=_W_NOW)
+    assert not summary.switch_state.engaged
+    assert summary.restricted == ("AAA",) and summary.open_breaks == 1
+    (line,) = page.breaks
+    assert (line.state, line.age, line.restricted, line.name) == ("aged", 8, True, "AAA")
+    assert page.closed_breaks == 0
+
+
+def test_a_trued_up_break_is_no_item_and_counts_as_closed(journal_settings: Settings) -> None:
+    with open_for_write(journal_settings) as conn:
+        _w_hypothesis(conn)
+        window_id = _w_window(conn, "main")
+        _w_run(conn, window_id, _W_S_MINUS_1)
+        _w_break(conn, window_id)
+        _w_break(conn, window_id, "trued_up")
+    assert "reconcile_break" not in {i.kind for i in _w_read(journal_settings)}
+    with open_read_only(journal_settings) as conn:
+        (summary,) = ops.book_summaries(conn, journal_settings, now=_W_NOW)
+        page = ops.page_data(conn, journal_settings, "main", now=_W_NOW)
+    assert summary.restricted == () and page.breaks == () and page.closed_breaks == 1

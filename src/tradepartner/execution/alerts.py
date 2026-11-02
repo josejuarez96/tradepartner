@@ -37,6 +37,14 @@ Kinds (`ALERT_KINDS`, pinned to the spec's list) and who emits them:
 - `pending_unresolved`: the risk-gated wrapper's acknowledgement poll (T202b), when
   the run's one order is still unacknowledged at `paper.accept_wait_max_seconds`;
   the message names its `client_order_id`. Run-scoped.
+- `reconcile_break`: the tracking run (paper spec amendment 2026-10-26, #2266,
+  item 12; plan T284), once per run, naming every open break opened since the
+  window's previous run finished (so a break first seen by `paper reconcile`,
+  which alerts nothing, is named by the next run) and every aged one (older than
+  the frozen `risk.break_max_age_sessions`, so it repeats each run), with its id,
+  kinds, name, size, age and the `paper true-up` line (`reconcile_break_message`).
+  Run-scoped. `break_age` and `is_aged` are the one age rule the owner's queue
+  and the shakedown also read.
 - `locked`, `no_window`: the run's entry (T63), before any run row exists.
   No run id; one alert per (book, kind, session), `session` being the calendar
   session containing the instant, or the next one on a non-session day (the
@@ -81,11 +89,13 @@ context (certificate and hostname) before any credential is sent.
 
 from __future__ import annotations
 
+import json
 import re
 import smtplib
 import ssl
 import subprocess
-from collections.abc import Callable
+from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from email.message import EmailMessage
@@ -93,11 +103,12 @@ from typing import Any
 
 import duckdb
 
+from tradepartner.calendar import all_sessions
 from tradepartner.config import Settings, secret_values
 from tradepartner.store import journal
 from tradepartner.store.db import utc_now
-from tradepartner.store.journal import AlertDeliveryRow, AlertRow
-from tradepartner.store.schema import DEFAULT_BOOK_ID
+from tradepartner.store.journal import AlertDeliveryRow, AlertRow, ReconcileBreakRow
+from tradepartner.store.schema import DEFAULT_BOOK_ID, OPEN_BREAK_EVENTS
 
 __all__ = [
     "ALERT_KINDS",
@@ -107,6 +118,12 @@ __all__ = [
     "SESSION_SCOPED_KINDS",
     "Alerter",
     "Delivery",
+    "break_age",
+    "break_kinds",
+    "is_aged",
+    "latest_open_breaks",
+    "reconcile_break_message",
+    "true_up_command",
 ]
 
 #: Every alert kind, exactly the spec's req 11 list (pinned by a test).
@@ -130,6 +147,7 @@ ALERT_KINDS: tuple[str, ...] = (
     "missing_candidate_bar",
     "skipped",
     "pending_unresolved",
+    "reconcile_break",
 )
 #: Kinds with no run, deduped on (kind, session).
 SESSION_SCOPED_KINDS: tuple[str, ...] = ("locked", "no_window")
@@ -145,6 +163,92 @@ _MASK = "***"
 #: The SMTP submission port, used when `ALERT_SMTP_HOST` names none.
 _SUBMISSION_PORT = 587
 _MAX_PORT = 65535
+
+
+def break_age(first_seen_session: date, session: date) -> int:
+    """A break's age at `session` (#2266 item 4): the XNYS sessions from its
+    `first_seen_session` through `session`, both counted, so a break first seen
+    on S is 1 session old on S; 0 when `session` is before it."""
+    if session < first_seen_session:
+        return 0
+    sessions = all_sessions()
+    return bisect_right(sessions, session) - bisect_left(sessions, first_seen_session)
+
+
+def is_aged(event: ReconcileBreakRow, session: date, max_age_sessions: int) -> bool:
+    """Whether an open break is **aged** at `session` (#2266 item 5): older than
+    the frozen `risk.break_max_age_sessions`. A closed break is never aged."""
+    if event.event not in OPEN_BREAK_EVENTS:
+        return False
+    return break_age(event.first_seen_session, session) > max_age_sessions
+
+
+def latest_open_breaks(events: Iterable[ReconcileBreakRow]) -> list[ReconcileBreakRow]:
+    """Each open break's latest event, read in write order (`event_id`, then the
+    order given), listed in the write order of that latest event."""
+    rows = sorted(enumerate(events), key=lambda pair: (pair[1].event_id or 0, pair[0]))
+    latest: dict[str, ReconcileBreakRow] = {}
+    for _, event in rows:
+        latest.pop(event.break_id, None)
+        latest[event.break_id] = event
+    return [e for e in latest.values() if e.event in OPEN_BREAK_EVENTS]
+
+
+def break_kinds(event: ReconcileBreakRow) -> tuple[str, ...]:
+    """The sorted part kinds an event lists in `parts_json` (`unreadable` when the
+    JSON cannot be read: the break still shows)."""
+    try:
+        parts = json.loads(event.parts_json)
+        kinds = {str(p["kind"]) for p in parts}
+    except (json.JSONDecodeError, TypeError, KeyError):
+        return ("unreadable",)
+    return tuple(sorted(kinds))
+
+
+def true_up_command(book_id: str, break_id: str) -> str:
+    """The `paper true-up` line for one break, its reason left for the owner."""
+    return f'tradepartner paper true-up --book {book_id} --break {break_id} --reason "<why>"'
+
+
+def _size(event: ReconcileBreakRow) -> str:
+    return "unpriced" if event.dollar_size is None else f"${event.dollar_size:,.2f}"
+
+
+def reconcile_break_message(
+    events: Iterable[ReconcileBreakRow],
+    *,
+    book_id: str,
+    session: date,
+    max_age_sessions: int,
+    opened_after: datetime | None,
+) -> str | None:
+    """The run's `reconcile_break` message (#2266 item 12), or None when no break
+    calls for one. It names every open break whose `opened` event is known after
+    `opened_after` (the window's previous run's end; None names every open one)
+    and every open break aged at `session`, each with its id, kinds, name, size,
+    age and true-up line. Pure over the window's break events."""
+    rows = list(events)
+    opened_at = {e.break_id: e.known_at for e in rows if e.event == "opened"}
+    named: list[str] = []
+    for event in latest_open_breaks(rows):
+        aged = is_aged(event, session, max_age_sessions)
+        first = opened_at.get(event.break_id)
+        new = opened_after is None or first is None or first > opened_after
+        if not (aged or new):
+            continue
+        age = break_age(event.first_seen_session, session)
+        named.append(
+            f"{event.break_id} ({', '.join(break_kinds(event))}) on {event.name}, "
+            f"{_size(event)}, {age} session(s) old"
+            + (f", AGED past {max_age_sessions}" if aged else "")
+            + ("" if event.material else ", immaterial")
+            + f"; run: {true_up_command(book_id, event.break_id)}"
+        )
+    if not named:
+        return None
+    return f"{len(named)} reconciliation break(s) need you on {session.isoformat()}: " + " | ".join(
+        named
+    )
 
 
 @dataclass(frozen=True)
