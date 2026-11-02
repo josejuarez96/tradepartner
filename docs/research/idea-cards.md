@@ -6,34 +6,34 @@ Every idea enters as a card from a named source, written before any return is re
 
 ## Tracking table (pilot, 2026-11)
 
-Counts only, no minimum on any row. Source C's column is from its pass ([flow-calendar note](2026-11-02-flow-calendar-source-c.md), #2907); the orchestrator keeps the sum.
+Counts only, no minimum on any row. Source C's column is from its pass ([flow-calendar note](2026-11-02-flow-calendar-source-c.md), #2907); the orchestrator keeps the sum. The last column is after the [independent review](2026-11-02-pilot-card-review.md) (#2914), which changed three verdicts (IC-B3's and FC-6's first block to cost measurement (< $50M), IC-B4 to `rejected: question 1`) and confirmed eight; the first two columns are the authors' and are left as written.
 
-| Measure | Source B (#2908) | Source C (#2907) |
-|---|---|---|
-| Ideas reviewed (field × event pairs, or flows) | 33 | 17 flows |
-| Cards written | 5 | 6 |
-| One-line rejects | 28 | 11 |
-| `rejected` cards, by question | 2 (question 3) | 2 (question 3: FC-3, FC-4) |
-| `deferred` cards, by reason | 0 | 3 (power: FC-1, FC-2, FC-5) |
-| `blocked` cards, by capability | 3 (data field: later statement vintages; data field: deal filings and terms; data field: 8-K items) | 1 (FC-6: side short (paper); also cost measurement (borrow, smaller IPOs) and data field: lock-up terms) |
-| `admit` cards | 0 | 0 |
-| Admitted (`admit` + `blocked`) killable without a return read | 3 of 3 | 1 of 1 |
-| Forwarded to the strict tier | 0 (selection follows the review) | 0 (selection follows the review) |
-| Killed by a fast look | n/a (no fast look runs in the pilot before selection) | n/a |
-| Strict-tier verdicts, `TP-` claims written | 0, 0 | 0, 0 |
-| Agent-days spent | about 1 | about 1 |
+| Measure | Source B (#2908) | Source C (#2907) | After the independent review (#2914), both sources |
+|---|---|---|---|
+| Ideas reviewed (field × event pairs, or flows) | 33 | 17 flows | 50 (unchanged) |
+| Cards written | 5 | 6 | 11 (unchanged) |
+| One-line rejects | 28 | 11 | 39 (unchanged) |
+| `rejected` cards, by question | 2 (question 3) | 2 (question 3: FC-3, FC-4) | 5: question 3 (IC-B1, IC-B5, FC-3, FC-4); question 1 (IC-B4) |
+| `deferred` cards, by reason | 0 | 3 (power: FC-1, FC-2, FC-5) | 3: power (FC-1, FC-2, FC-5) |
+| `blocked` cards, by capability | 3 (data field: later statement vintages; data field: deal filings and terms; data field: 8-K items) | 1 (FC-6: side short (paper); also cost measurement (borrow, smaller IPOs) and data field: lock-up terms) | 3: IC-B2 (data field: later statement vintages; side short (paper)); IC-B3 (cost measurement (< $50M); data field: deal filings and offer terms); FC-6 (cost measurement (< $50M); side short (paper); cost measurement (borrow); data field: lock-up terms) |
+| `admit` cards | 0 | 0 | 0 |
+| Admitted (`admit` + `blocked`) killable without a return read | 3 of 3 | 1 of 1 | 3 of 3 |
+| Forwarded to the strict tier | 0 (selection follows the review) | 0 (selection follows the review) | 0 (selection is the next step, the owner's) |
+| Killed by a fast look | n/a (no fast look runs in the pilot before selection) | n/a | n/a |
+| Strict-tier verdicts, `TP-` claims written | 0, 0 | 0, 0 | 0, 0 |
+| Agent-days spent | about 1 | about 1 | about 1 (review) |
 
 ## Capability tally
 
-Admitted `blocked` cards per missing capability, by distinct mechanism. "Past a capability-free gate" counts cards whose mechanism has a fast look on open data, an `economic` read, or a graded claim at MIXED or better.
+Admitted `blocked` cards per missing capability, by distinct mechanism. "Past a capability-free gate" counts cards whose mechanism has a fast look on open data, an `economic` read, or a graded claim at MIXED or better. **After the independent review (#2914, [note](2026-11-02-pilot-card-review.md)):** IC-B4 left the tally (`rejected: question 1`); IC-B3 and FC-6 are now first blocked on cost measurement (< $50M), the only band where either has the events question 7 needs. Lines marked *(deferred cards)* count no admitted card; they say what a re-entry would need.
 
-- **data field: `statement_facts` later vintages** (parse-only): 1 admitted card (IC-B2), 1 distinct mechanism, 0 past a capability-free gate · build: M, about 2 to 3 agent-days (keep every vintage the ingest already parses and counts as `statement_restated`; a schema change and a look-ahead test) · abandoning: one mechanism (stealth revisions) that no other held field can test. IC-B2's trade also needs **side: short (paper)**.
-- **data field: deal filings and offer terms** (filing-index forms not held; offer terms not held): 1 admitted card (IC-B3), 1 distinct mechanism, 0 past a capability-free gate · build: the filing-index seed is already planned (T318 to T324; T324 is an owner step, S); offer terms are a new text parse, M to L, not planned · abandoning: the one risk premium in the batch (merger arbitrage), whose payoff is cash-plus rather than an anomaly. Also needs **cost measurement ($50 to 200M)** to reach power.
-- **data field: 8-K items (`filing_events`)** (code merged, 0 rows): 1 admitted card (IC-B4), 1 distinct mechanism, 0 past a capability-free gate · build: T164e's real-store run, owner, S (the same run candidate 1 waits on) · abandoning: the non-earnings negative-item timing card; the run is shared with candidate 1, so its marginal cost here is near zero. IC-B4 also needs **side: short (paper)** for the trade itself (ADR 0024 allows it; no short book exists).
-- **side: short (paper)** (self-imposed: ADR 0024 allows it, no short paper book exists): needed by 3 admitted cards (IC-B2, IC-B4, FC-6), 3 distinct mechanisms, 0 past a capability-free gate; IC-B2 and IC-B4 each wait on a data field first; FC-6 (lock-up expiry) needs it for its trade and also waits on the two lines below · build: a short paper book, size not estimated here · abandoning: the trade side of both cards; long-only could only avoid the names.
-- **cost measurement (short borrow on recent IPOs)**: 1 admitted card (FC-6), 1 distinct mechanism, 0 past a capability-free gate · build: M (paper charges no borrow; a borrow-rate source is needed) · abandoning: the lock-up expiry short, the one source C card that passes the power screen.
-- **data field: lock-up terms** (prospectus text, parse-only): 1 admitted card (FC-6), 1 distinct mechanism, 0 past a capability-free gate · build: M (a 424B4 text parse) · abandoning: as above; a day-180 default without the parse would misdate early releases.
-- **cost measurement ($50 to 200M)**: no card blocked on it alone. IC-B1 fails break-even at the lowest measured cost, so measuring the band would not admit it; IC-B3 needs the band for power. Source C: FC-6's smaller IPOs are below $200M (not blocked on it alone); FC-1 and FC-5 need it too but are `deferred: power`, so they are not counted.
+- **side: short (paper)** (self-imposed: ADR 0024 allows it, no short paper book exists): 2 admitted cards (IC-B2, FC-6), 2 distinct mechanisms, 0 past a capability-free gate · build: a short paper book, size not estimated · abandoning: the trade side of both; long-only can only avoid the names. Both cards also wait on other lines first.
+- **cost measurement (< $50M)** (self-imposed: no book trades the band): 2 admitted cards (IC-B3, FC-6), 2 distinct mechanisms, 0 past a capability-free gate (IC-B3's premium is a Tier 1 published result, Mitchell-Pulvino 2001, but no `claims.toml` entry grades it, so gate (ii) is not met until one does) · build: S to M, about 1 to 2 agent-days plus two weeks of a small paper book in the band (ADR 0023's fill count) · abandoning: the only risk-premium card and the lock-up card. 998 of 1,080 IPO-like expiries and 612 of 755 development-window delistings are in this band. The fill-cost note's context half-spread there (+116 bp a side) already exceeds both cards' gross (about 56 to 60 bp), so the measurement may reject both at question 3. *(Deferred cards)*: FC-1 (72 to 81% of names near rank #1,000 are under $50M) and FC-5 need the same line, with **cost measurement ($50 to 200M)**, on re-entry. That makes 4 distinct mechanisms, the most of any line, but it admits none on its own: IC-B3 also needs deal data and FC-6 a short.
+- **cost measurement (borrow on recent IPOs)**: 1 admitted card (FC-6), 1 mechanism, 0 past a gate · build: M (paper charges no borrow; `borrow_status` exists with 0 rows; a borrow-rate source is needed) · abandoning: as above.
+- **data field: lock-up terms** (prospectus text, parse-only): 1 admitted card (FC-6), 1 mechanism, 0 past a gate · build: M (a 424B4 text parse; the all-forms filing index is also absent from the store copy) · abandoning: exact dates for early releases. FC-6's rung 2-O volume check does not need it: first-bar date + 180 days is held.
+- **data field: `statement_facts` later vintages** (parse-only): 1 admitted card (IC-B2), 1 mechanism, 0 past a gate · build: M, about 2 to 3 agent-days (keep every vintage the ingest already parses and counts as `statement_restated`; a schema change and a look-ahead test) · abandoning: the one mechanism (stealth revisions) that no other held field can test. The card's 50 bp gross has no primary source.
+- *(Deferred cards)* **history: 2016-2019 with delisters, or pre-2016** (external, purchasable, ADR 0022; team probedelist is testing whether 2016-2019 can be recovered): FC-1, FC-2 and FC-5 are `deferred: power`, 3 distinct mechanisms; IC-B3 would also reach power in the measured bands with it. Four more June dates would bring FC-1 to about 48 effective events (ρ 0.1, Dimensional's 20 names a date; at most about 70), clearing the 36 needed at +2.0% but not the 144 needed at +1.0%. FC-2 (64 needed) and FC-5 (225) stay short with four more dates. - **data field: deal filings and offer terms** (not held): 1 admitted card (IC-B3), 1 mechanism · build: the T318 to T324 filing-index seed (T324 an owner step, S) plus an offer-terms text parse (M to L, not planned) · abandoning: the one risk premium in the batch.
+- *Removed by the review:* **data field: 8-K items (`filing_events`)**. IC-B4 is `rejected: question 1`, so T164e's run unblocks no pilot card; it still serves candidate 1.
 
 ## Vocabulary
 
@@ -90,7 +90,7 @@ verdict:             **deferred: power** (at most about 30 effective events agai
 frozen:              -
 looks:               k = campaign 0 from source C (no card read a return; source B's count is added at selection) + prior p (counted at selection from the ledger Items table, `trials`, `research_runs` and the desk reads since 2026-10-30); batch denominator 17 (source C); lower bound
 fast look:           none (pilot: no fast look before the selection)
-review:              -   ·   ledger: FC-1   ·   strict tier: -
+review:              (#2914) **confirmed `deferred: power`; cost line corrected; assumptions partly unconfirmed.** q1 supported: Chang-Hong-Liskovich (RFS 2015, regression discontinuity at the R1000/R2000 cut) find flow-driven price effects for deletions from the R2000 as well as additions; the +2% reversal is still only Dimensional's (2014-2023, VW against the R2000, **20 names per group per year**, so about 200 events; ungraded). q3: in the store, names ranked 900 to 1,100 on the rebuilt rank day are 0 to 3% in the ≥ $200M band, 19 to 28% in $50-200M and 72 to 81% < $50M; the 11× at arrival applies to almost no event, so on re-entry the card is `blocked: cost measurement (< $50M, $50–200M)`. q4: the rebuild from held close × cover shares puts rank #1,000 at $4.96B / $4.36B / $4.08B (2021-2023) against FTSE Russell's $5.2B / $4.6B / $4.2B, so it works within about 5%; but rank day was in May in 2021 (data as of 2021-05-07), so each year's rank day must be pinned, not taken from the v7.2 rule. q7: Dimensional's 20 a year at ρ 0.1 gives about 7 effective a date (so 2016-2019 would add about 28, not 40), which is worse than the card's 10. Confirmation would be slow: two dates a year from December 2026, so a forward exam takes years. q5 and q6 confirmed. Killable without a return read: yes. Held suffice: yes. [review note](2026-11-02-pilot-card-review.md)   ·   ledger: FC-1   ·   strict tier: -
 
 ### FC-2  Nasdaq-100 trackers must buy the names that the December reconstitution rule selects, and the list can be predicted from the November reference date
 source: C (2026-11-02)   ·   written: 2026-11-02   ·   by: agent (pilotc)
@@ -105,7 +105,7 @@ verdict:             **deferred: power** (about 14 effective events against 64 n
 frozen:              -
 looks:               k = campaign 0 from source C + prior p (counted at selection); batch denominator 17; lower bound
 fast look:           none
-review:              -   ·   ledger: FC-2   ·   strict tier: -
+review:              (#2914) **confirmed `deferred: power`; q1 and q3 unconfirmed.** No primary source measures the window from the reference date to the effective date. Academic work (Biktimirov & Xu 2019; a Brock thesis) finds a transitory, symmetric response around the effective date. Practitioners publish the predicted list each year (ORTEX), so the trade the card proposes is crowded, which weakens q1 to a story. The ≤ +1% is an assumption, not a figure. Arithmetic reproduces: 64 needed, about 14 effective. Killable without a return read: yes. Held suffice: yes. [review note](2026-11-02-pilot-card-review.md)   ·   ledger: FC-2   ·   strict tier: -
 
 ### FC-3  Balanced, pension and target-date funds sell equities at month end after stocks beat bonds, and the market dips the next day
 source: C (2026-11-02)   ·   written: 2026-11-02   ·   by: agent (pilotc)
@@ -120,7 +120,7 @@ verdict:             **rejected: question 3** (plausible 7 bp against a 17.6 bp 
 frozen:              -
 looks:               k = campaign 0 from source C + prior p (counted at selection); batch denominator 17; lower bound
 fast look:           none
-review:              -   ·   ledger: FC-3   ·   strict tier: -
+review:              (#2914) **confirmed `rejected: question 3`; two corrections.** (i) The paper's sample is **1997-2023** (60/40 futures simulation), which covers 2020-08 to 2023-12, so the development window **has been seen**. (ii) The bond series is **not held**: of SPY, AGG, BND, TLT, IEF, IEI, SHY, GOVT and LQD, only SPY is in `listings`. A practitioner rebuttal (L&G, 2025-10) reports no relation from 2020-01 to 2025-06 (ungraded). Arithmetic reproduces (7 bp against 17.6 bp). Read past the 2026-10-01 cut: the ETF check printed SPY's last bar date and count (2026-10-30, 2,730), a date read, no price. [review note](2026-11-02-pilot-card-review.md)   ·   ledger: FC-3   ·   strict tier: -
 
 ### FC-4  Institutions that must hold cash on the last business day sell equities a settlement cycle earlier, and prices recover before month end
 source: C (2026-11-02)   ·   written: 2026-11-02   ·   by: agent (pilotc)
@@ -135,7 +135,7 @@ verdict:             **rejected: question 3** (plausible 12 bp against 17.6 bp; 
 frozen:              -
 looks:               k = campaign 0 from source C + prior p (counted at selection); batch denominator 17; lower bound
 fast look:           none
-review:              -   ·   ledger: FC-4   ·   strict tier: -
+review:              (#2914) **confirmed `rejected: question 3`.** Etula et al. was checked against the full text (open copy): over 2003-2013 the cumulative excess return over T−8..T−4 was −31% and over T−3..T+3 +103%; the US samples are 1980-2013 and 1995-07..2013-12 (under T+3); there is no post-2013 or T+2 evidence. Arithmetic reproduces (about 12 bp against 17.6 bp). Note, not a card: shifting an existing book's rebalance away from T−4..T−2 costs nothing extra, but it is an execution-timing rule, not a strategy. [review note](2026-11-02-pilot-card-review.md)   ·   ledger: FC-4   ·   strict tier: -
 
 ### FC-5  Taxable holders sell prior-year losers before the last December session and cannot buy them back for 30 days; the losers recover in January
 source: C (2026-11-02)   ·   written: 2026-11-02   ·   by: agent (pilotc)
@@ -150,7 +150,7 @@ verdict:             **deferred: power** (and the cost below $200M is unmeasured
 frozen:              -
 looks:               k = campaign 0 from source C + prior p (counted at selection); batch denominator 17; lower bound
 fast look:           none
-review:              -   ·   ledger: FC-5   ·   strict tier: -
+review:              (#2914) **confirmed `deferred: power`; q3's gross has no primary source.** No post-2005 US figure for the January recovery of prior-year losers was found. The latest primary source is Haug & Hirschey (FAJ 2006, data to 2004): the small-cap January premium persists, but they weaken the tax-loss explanation (q1 partly a story). q5 addition: the momentum family's registered store trials read 2020-08..2023-12, including the Januaries of a loser-heavy construction, so those Januaries are not unseen. Arithmetic reproduces (225 needed, about 20 effective). Killable without a return read: yes. [review note](2026-11-02-pilot-card-review.md)   ·   ledger: FC-5   ·   strict tier: -
 
 ### FC-6  Pre-IPO holders become free to sell when the lock-up expires, about 180 days after the prospectus, and the price falls around that date
 source: C (2026-11-02)   ·   written: 2026-11-02   ·   by: agent (pilotc)
@@ -161,11 +161,11 @@ source: C (2026-11-02)   ·   written: 2026-11-02   ·   by: agent (pilotc)
 5 tried before:      no ledger item. Relatives in the CZ catalogue: `IndIPO`, `AgeIPO` (IPO long-run underperformance, a slower and different effect); B11 and the beyond-long-only notes (LS claims) on shorting cost. **Window seen:** the 2024 thesis result (2003-2022) covers 2020-08 to 2022-12, so a strict-tier store test on those months is not on unseen data. New: the contractual supply date
 6 capabilities:      side short (paper) self-imposed (ADR 0024 allows it; no book exists); short live `charter (ADR)`; bars daily held; order types market DAY held; cost measurement for the short side and borrow self-imposed (unmeasured); data field lock-up terms parse-only; history 2016+ held; held suffice for a first test: **yes** (the rung 2-O volume check below uses held bars and the filing index)
 7 kill decidable:    sd of a recent IPO's 3-session excess return assumed 8%; n = (8/0.6)² ≈ 180; raw expiries in 2020-08 to 2023-12 assumed about 500 (the 2020-2021 IPO wave), on many different dates (low clustering); **yes**
-verdict:             **blocked: side short (paper)**; cost measurement (borrow, small IPOs); data field (lock-up terms, parse-only)   ·   killable without a return read: **yes**. A rung 2-O check: on day 180 after each held 424B4 acceptance, volume should rise by about the published 40% against the prior 20 sessions; no rise means the day-180 rule (or early releases) does not date the flow, and the card dies before any return is read
+verdict:             **blocked: cost measurement (< $50M)** (review #2914; authors' verdict was `blocked: side short (paper)`), then side short (paper); cost measurement (borrow); data field (lock-up terms, parse-only)   ·   killable without a return read: **yes**. A rung 2-O check: on day 180 after each held 424B4 acceptance, volume should rise by about the published 40% against the prior 20 sessions; no rise means the day-180 rule (or early releases) does not date the flow, and the card dies before any return is read
 frozen:              -
 looks:               k = campaign 0 from source C + prior p (counted at selection); batch denominator 17; lower bound
 fast look:           none
-review:              -   ·   ledger: FC-6   ·   strict tier: -
+review:              (#2914) **changed: the first block is cost measurement (< $50M); in the measured band the card is `deferred: power`.** Store: 1,080 non-SPAC common first bars from 2020-02 to 2023-06 (an IPO proxy that includes other new listings; 2020 263, 2021 541, 2022 207, 2023 69; 574 distinct dates). At day 180 their 20-session dollar volume puts **26 at ≥ $200M, 56 at $50-200M and 998 under $50M**, so the ≥ $200M band holds 26 events against the 180 needed. In the < $50M band the fill-cost note's context half-spread alone is +116 bp a side against a 60 bp gross, which makes a question-3 fail likely once the band is measured. q1: Field & Hanka verified from the abstract (1,948 lock-ups; −1.5% over three days; +40% volume; larger with VC backing; the authors find "no complete explanation"). The card's persistence reason is costly borrow, which is exactly the cost we cannot measure; LS-6 (SUPPORTED: short legs about zero net of borrow) belongs in q5. q4 corrected: the all-forms filing index is **absent** from the store copy (no 424B4 stamps), and `borrow_status` has 0 rows. The rung 2-O volume check still runs on held data: first-bar date + 180 days, SIC 6770 excluded. Held suffice for the first (non-return) test: yes. Read past the 2026-10-01 cut: the first-bar date was a `min(session)` over every bar (re-run with the cut: the same 2,525 dates), no price. [review note](2026-11-02-pilot-card-review.md)   ·   ledger: FC-6   ·   strict tier: -
 
 ## Source B: own data (pass of 2026-11-02, #2908)
 
@@ -187,7 +187,7 @@ verdict:             rejected: question 3   ·   killable without a return read:
 frozen:              - (not selected)
 looks:               k = counted at selection = campaign 0 (no source-B card read a return) + prior p (since 2026-10-30; the spec's requirement 5 lists where); batch denominator 33; lower bound
 fast look:           - (none before selection, spec requirement 7 step 4)
-review:              pending   ·   ledger: L-B1   ·   strict tier: -
+review:              (#2914) confirmed rejected: q3. The floor argument holds: the measured ≥ $200M cost is the cheapest band, and G2-5's S3 ($30M to $500M: skipping day 1 leaves no significant alpha) speaks directly against this band. Counts reproduced (5,161 / 2,840 issuer-days, 973 / 706 issuers). Corrected: 46.7% of o/d purchase accessions (2018-11..2023-11) are accepted at or after 16:00, plus 12.7% before 09:30, not over 70%. [review note](2026-11-02-pilot-card-review.md)   ·   ledger: L-B1   ·   strict tier: -
 ```
 
 ### IC-B2  Stealth revisions: a later filing reports a prior period's fact at a different value, and the market is slow to notice
@@ -204,7 +204,7 @@ verdict:             blocked: data field (statement_facts later vintages)   ·  
 frozen:              - (not selected)
 looks:               k = counted at selection = campaign 0 + prior p (since 2026-10-30); batch denominator 33; lower bound
 fast look:           - (none before selection)
-review:              pending   ·   ledger: L-B2   ·   strict tier: -
+review:              (#2914) confirmed blocked: data field (later vintages); the q3 gross is UNCONFIRMED. q1 is only partly supported. Files-Swanson-Tse (TAR 2009) show that less prominent restatements get smaller reactions at disclosure (−1.5% low against −8.3% high) and fewer lawsuits; Choudhary-Merkley-Schipper (CAR 2021) show that immaterial corrections predict later errors. Neither shows slow incorporation after the revision, so the 50 bp drift has no primary source, and at 2.0x the margin sits on D9's line (below about 49 bp it is deferred: margin). The store reproduces: 253,797 restated against 2,134,064 keys, and one accession per key. q5 should add LS-6 (short legs about zero net of borrow). Read past the 2026-10-01 cut: the key and `comparative` counts first ran on all of `statement_facts` (5,975 rows past the cut); re-run with the cut, 0 duplicate keys, a count read, no price. [review note](2026-11-02-pilot-card-review.md)   ·   ledger: L-B2   ·   strict tier: -
 ```
 
 ### IC-B3  Cash-deal merger arbitrage: buy the target after the announcement, collect the spread at completion
@@ -217,11 +217,11 @@ source: B (2026-11-02)   ·   written: 2026-11-02   ·   by: agent (pilotb)
 5 tried before:      none (no ledger row, no exposure); nearby: C2 spin-offs (deferred: power), the parked index-addition trade (QI-19, a different flow); not a catalogue anomaly; the source C pass may hold a sibling card on deal-related index deletions (the reviewer merges by mechanism); new: a risk premium, not an anomaly
 6 capabilities:      data field deal filings not held; data field offer terms not held; liquidity band $50-200M self-imposed; cost measurement ($50-200M) self-imposed; side long held (stock deals' short-acquirer leg left out); held suffice for a first test: no
 7 kill decidable:    n_eff about 160 at 0.56% (the effect from the literature above; the sd, about 7%, from a separate illustrative mixture, about 90% close for +2 to 3% and about 10% break for -20%, whose own mean is lower; UNVERIFIED); >= $200M alone at most 45, deferred: power; with $50-200M at most 173, marginal yes
-verdict:             blocked: data field (deal filings and offer terms)   ·   killable without a return read: yes (the count of cash deals in band, 2019-2023, once the index is seeded: under about 160 is deferred: power)
+verdict:             **blocked: cost measurement (< $50M)** (review #2914), then data field (deal filings and offer terms) (the authors' verdict)   ·   killable without a return read: yes (the < $50M cost measurement against the 56 bp gross; then the count of cash deals once the index is seeded)
 frozen:              - (not selected)
 looks:               k = counted at selection = campaign 0 + prior p (since 2026-10-30); batch denominator 33; lower bound
 fast look:           - (none before selection)
-review:              pending   ·   ledger: L-B3   ·   strict tier: -
+review:              (#2914) first block changed to cost measurement (< $50M). In the development window (2020-08-31..2023-12-29) the store holds at most 34 (≥ $200M) + 109 ($50-200M) = 143 common delistings, all 25-NSE, every reason and deal type, against n_eff 160 (25 more have no bar before filing). The cash-deal subset is smaller still; the card's 173 counted 2019-2023. So the count passes only with the 612 under $50M, whose cost is unmeasured (same rule as FC-6). q1 supported (Tier 1): Mitchell-Pulvino (JF 2001, 4,750 mergers 1963-1998) find 4%/yr excess after their own transaction costs, with market correlation rising in downturns (the premium story). Spreads have been lower since 2002 (Jetley-Ji FAJ 2010). No clean post-2010 US cash-deal figure was found. The arithmetic reproduces and is conservative (MP's figure is already net of costs). The < $50M context half-spread (+116 bp a side) exceeds the 56 bp gross, so the measurement may reject it at q3. Paper simulation of a cash completion is UNVERIFIED. [review note](2026-11-02-pilot-card-review.md)   ·   ledger: L-B3   ·   strict tier: -
 ```
 
 ### IC-B4  Negative non-earnings 8-K items accepted when attention is low (Friday after 16:00, or before a holiday) are incorporated slowly
@@ -234,11 +234,11 @@ source: B (2026-11-02)   ·   written: 2026-11-02   ·   by: agent (pilotb)
 5 tried before:      candidate 1 (earnings-event family, #2892, Item 2.02, B9 again) reads the same table; this card leaves 2.02 out; C1 (late periodic filings) is a different timing mechanism; no ledger row; DellaVigna and Pollet is published, for earnings only; no window seen; new: non-earnings negative items and the attention split
 6 capabilities:      data field 8-K items (filing_events) not held (code merged, no rows); side short (paper) self-imposed; liquidity band >= $200M held; held suffice for a first test: no
 7 kill decidable:    n_eff about 180 at 0.45% (sd about 6% per 20-session event in >= $200M names, UNVERIFIED); the count waits on the rows; with about 300 names in band it is likely tens a year, so the count decides between yes and deferred: power
-verdict:             blocked: data field (8-K items, filing_events)   ·   killable without a return read: yes (the count; then a rung 2-O run: next-session abnormal volume after Friday-evening negative items against Monday to Thursday ones, volume levels only)
+verdict:             **rejected: question 1** (review #2914; authors' verdict was `blocked: data field (8-K items, filing_events)`)   ·   killable without a return read: yes (it fails on primary evidence)
 frozen:              - (not selected)
 looks:               k = counted at selection = campaign 0 + prior p (since 2026-10-30); batch denominator 33; lower bound
 fast look:           - (none before selection)
-review:              pending   ·   ledger: L-B4   ·   strict tier: -
+review:              (#2914) changed to rejected: q1. Segal & Segal (RAS 2016) test this mechanism on non-earnings 8-Ks (2005-2013). Managers do report negative news after hours and on Fridays, but the paper finds no evidence of investor inattention in the reaction. Michaely-Rubin-Vedrashko (JFE 2016) find the Friday effect is selection: Friday announcers get weaker reactions on any weekday. DellaVigna-Pollet is earnings-only. Both are read from abstracts. The card re-enters only if a primary source shows a delayed response for Friday-evening non-earnings items after the selection correction. Confirmed: filing_events has 0 rows. Power at about 300 names in the ≥ $200M band was likely short too. [review note](2026-11-02-pilot-card-review.md)   ·   ledger: L-B4   ·   strict tier: -
 ```
 
 ### IC-B5  Open-market purchases by 10% owners who are not officers or directors predict a 21-session drift
@@ -255,7 +255,7 @@ verdict:             rejected: question 3   ·   killable without a return read:
 frozen:              -
 looks:               k = counted at selection = campaign 0 + prior p (since 2026-10-30); batch denominator 33; lower bound
 fast look:           -
-review:              pending   ·   ledger: L-B5   ·   strict tier: -
+review:              (#2914) confirmed rejected. The ≤ 10 bp q3 bound has no primary source (Seyhun 1986 not retrieved). The card is dead on q7 anyway: 92 issuer-days on 26 issuers at ≥ $200M and 248 on 60 at $50-200M in 2020-2023, against n about 10,000. Counts reproduced (148 / 35, 496 / 92 for 2016-2023). [review note](2026-11-02-pilot-card-review.md)   ·   ledger: L-B5   ·   strict tier: -
 ```
 
 ### Source B one-line rejects (28)
