@@ -1,0 +1,76 @@
+{
+  "about": "T323b (#2629, #2703): a generated, synthetic 100-night EDGAR history. Every CIK, accession and value is made up. Times are US/Eastern; `case` names the plan line's case a row stands for.",
+  "first_year": 2025,
+  "seed_night": "2025-11-24",
+  "nights": 100,
+  "key_off": ["2025-12-30", "2026-01-07"],
+  "chain_edit": {
+    "night": "2026-02-16",
+    "entry": "0000000107->0000000108@0000000108-26-000001"
+  },
+  "issuers": {
+    "0000000101": ["Alpha Corp", "ALP", "NYSE"],
+    "0000000102": ["Beta Corp", "BET", "NASDAQ"],
+    "0000000103": ["Gamma Corp", "GAM", "NASDAQ"],
+    "0000000104": ["Delta Corp", "DEL", "NYSE"],
+    "0000000105": ["Epsilon Corp", "EPS", "NYSE"],
+    "0000000106": ["Phi Corp", "PHI", "NYSE"],
+    "0000000107": ["Gee Old Corp", "GEE", "NYSE"],
+    "0000000108": ["Gee New Corp", "GEE", "NYSE"],
+    "0000000109": ["Iota Corp", "IOT", "NASDAQ"],
+    "0000000110": ["Iota Finance LLC", "IOF", "NASDAQ"],
+    "0000000112": ["Lambda Corp", "LAM", "NASDAQ"]
+  },
+  "snapshot_from": {
+    "0000000103": "2026-02-13",
+    "0000000104": "2026-02-03",
+    "0000000108": "2026-02-12",
+    "0000000112": "2026-02-25"
+  },
+  "snapshot_until": {
+    "0000000106": "2026-01-20",
+    "0000000107": "2026-02-10"
+  },
+  "fsn": {
+    "2025_09": "2025-10-06T12:00:00-04:00",
+    "2026_01": "2026-02-20T12:00:00-05:00"
+  },
+  "reposts": {"2026-01-08": "2026-01-13T22:30:00-05:00"},
+  "regens": {
+    "2025Q4": ["2026-01-14T22:00:00-05:00", "2026-01-21T22:00:00-05:00"]
+  },
+  "failures": {
+    "0000000102-26-000002": ["2026-01-28T23:00:00-05:00", "2026-01-29T23:00:00-05:00"]
+  },
+  "filings": [
+    {"case": "settled history", "cik": "0000000101", "name": "Alpha Corp", "form": "10-K", "accession": "0000000101-25-000001", "accepted": "2025-03-03T17:00:00-05:00", "filed_on": "2025-03-03", "listed": "2025-03-03", "ticker": "ALP", "exchange": "NYSE", "shares": 1000000},
+    {"case": "settled history", "cik": "0000000101", "name": "Alpha Corp", "form": "10-Q", "accession": "0000000101-25-000002", "accepted": "2025-08-05T17:00:00-04:00", "filed_on": "2025-08-05", "listed": "2025-08-05", "ticker": "ALP", "exchange": "NYSE", "shares": 1010000},
+    {"case": "earlier non-issuer rows of a later new issuer", "cik": "0000000103", "name": "Gamma Corp", "form": "D", "accession": "0000000103-25-000001", "accepted": "2025-05-12T17:00:00-04:00", "filed_on": "2025-05-12", "listed": "2025-05-12"},
+    {"case": "settled history", "cik": "0000000106", "name": "Phi Corp", "form": "10-K", "accession": "0000000106-25-000001", "accepted": "2025-03-04T17:00:00-05:00", "filed_on": "2025-03-04", "listed": "2025-03-04", "ticker": "PHI", "exchange": "NYSE", "shares": 600000},
+    {"case": "settled history", "cik": "0000000107", "name": "Gee Old Corp", "form": "10-K", "accession": "0000000107-25-000001", "accepted": "2025-03-05T17:00:00-05:00", "filed_on": "2025-03-05", "listed": "2025-03-05", "ticker": "GEE", "exchange": "NYSE", "shares": 700000},
+    {"case": "settled history", "cik": "0000000105", "name": "Epsilon Corp", "form": "10-K", "accession": "0000000105-25-000001", "accepted": "2025-03-06T17:00:00-05:00", "filed_on": "2025-03-06", "listed": "2025-03-06", "ticker": "EPS", "exchange": "NYSE", "shares": 500000},
+    {"case": "settled history", "cik": "0000000109", "name": "Iota Corp", "form": "10-K", "accession": "0000000109-25-000001", "accepted": "2025-03-10T17:00:00-04:00", "filed_on": "2025-03-10", "listed": "2025-03-10", "also": ["0000000110"], "ticker": "IOT", "exchange": "NASDAQ", "shares": 900000},
+    {"case": "open-quarter history before the seed", "cik": "0000000102", "name": "Beta Corp", "form": "10-Q", "accession": "0000000102-25-000001", "accepted": "2025-11-10T17:00:00-05:00", "filed_on": "2025-11-10", "listed": "2025-11-10", "ticker": "BET", "exchange": "NASDAQ", "shares": 2000000},
+    {"case": "a correction found by a settled quarter's reconcile", "cik": "0000000106", "name": "Phi Corp", "form": "10-Q", "accession": "0000000106-25-000002", "accepted": "2025-11-12T17:00:00-05:00", "filed_on": "2025-11-12", "listed": "2025-11-12", "quarterly": [["2026-01-14T22:00:00-05:00", "2025-11-11"]], "ticker": "PHI", "exchange": "NYSE", "shares": 610000},
+    {"case": "a settled quarter's form.idx that predates a daily re-listing", "cik": "0000000101", "name": "Alpha Corp", "form": "8-K", "accession": "0000000101-25-000003", "accepted": "2025-12-03T17:00:00-05:00", "filed_on": "2025-12-03", "listed": "2025-12-03", "relist": [["2026-01-12", "2025-12-02"]]},
+    {"case": "a row pending, then stamped", "cik": "0000000102", "name": "Beta Corp", "form": "8-K", "accession": "0000000102-25-000002", "accepted": "2025-12-08T17:00:00-05:00", "filed_on": "2025-12-08", "listed": "2025-12-08", "stamp_from": "2025-12-11T12:00:00-05:00"},
+    {"case": "new issuers, one with earlier rows (its 2025Q2 Form D)", "cik": "0000000103", "name": "Gamma Corp", "form": "S-1", "accession": "0000000103-25-000002", "accepted": "2025-12-10T17:00:00-05:00", "filed_on": "2025-12-10", "listed": "2025-12-10"},
+    {"case": "a correction while the accession is pending", "cik": "0000000102", "name": "Beta Corp", "form": "8-K", "accession": "0000000102-25-000003", "accepted": "2025-12-15T17:00:00-05:00", "filed_on": "2025-12-15", "listed": "2025-12-15", "stamp_from": "2025-12-19T12:00:00-05:00", "relist": [["2025-12-17", "2025-12-12"]]},
+    {"case": "a 13D row filed by the filer", "cik": "0000950123", "name": "Big Holder LP", "form": "SC 13D", "accession": "0000950123-25-000001", "accepted": "2025-12-16T17:00:00-05:00", "filed_on": "2025-12-16", "listed": "2025-12-16"},
+    {"case": "a reconcile insert (only the settled quarter's form.idx lists it)", "cik": "0000000101", "name": "Alpha Corp", "form": "8-K", "accession": "0000000101-25-000004", "accepted": "2025-12-22T17:00:00-05:00", "filed_on": "2025-12-22", "listed": null, "appears": "2026-01-14T22:00:00-05:00"},
+    {"case": "a corrected filed_on daily re-listing while the open quarter's form.idx still carries the first date; a re-posted older daily file that carries the first date", "cik": "0000000102", "name": "Beta Corp", "form": "8-K", "accession": "0000000102-26-000001", "accepted": "2026-01-08T17:00:00-05:00", "filed_on": "2026-01-08", "listed": "2026-01-08", "relist": [["2026-01-09", "2026-01-06"]]},
+    {"case": "an FSN period with a co-registrant", "cik": "0000000109", "name": "Iota Corp", "form": "10-K", "accession": "0000000109-26-000001", "accepted": "2026-01-15T17:00:00-05:00", "filed_on": "2026-01-15", "listed": "2026-01-15", "also": ["0000000110"], "ticker": "IOT", "exchange": "NASDAQ", "shares": 950000, "fsn_period": "2026_01"},
+    {"case": "a correction that moves filed_on across a quarter end; a daily re-listing and a reconcile of one accession in one run", "cik": "0000000105", "name": "Epsilon Corp", "form": "8-K", "accession": "0000000105-26-000001", "accepted": "2026-01-09T17:00:00-05:00", "filed_on": "2026-01-09", "listed": "2026-01-09", "relist": [["2026-01-21", "2025-12-31"]]},
+    {"case": "a new issuer with a corrected accession in an unsettled quarter (non-issuer row first)", "cik": "0000000104", "name": "Delta Corp", "form": "D", "accession": "0000000104-26-000001", "accepted": "2026-01-20T17:00:00-05:00", "filed_on": "2026-01-20", "listed": "2026-01-20", "relist": [["2026-01-23", "2026-01-16"]]},
+    {"case": "an exchange's 25-NSE, also listed under its subject", "cik": "0000000105", "name": "Epsilon Corp", "form": "25-NSE", "accession": "0000876661-26-000001", "accepted": "2026-01-27T17:00:00-05:00", "filed_on": "2026-01-27", "listed": "2026-01-27", "also": ["0000876661"], "exchange": "NYSE"},
+    {"case": "a failure that passes on retry", "cik": "0000000102", "name": "Beta Corp", "form": "10-K", "accession": "0000000102-26-000002", "accepted": "2026-01-28T17:00:00-05:00", "filed_on": "2026-01-28", "listed": "2026-01-28", "ticker": "BET", "exchange": "NASDAQ", "shares": 2100000},
+    {"case": "new issuers: the corrected-accession issuer's 10-K", "cik": "0000000104", "name": "Delta Corp", "form": "10-K", "accession": "0000000104-26-000002", "accepted": "2026-02-02T17:00:00-05:00", "filed_on": "2026-02-02", "listed": "2026-02-02", "ticker": "DEL", "exchange": "NYSE", "shares": 400000},
+    {"case": "an exchange-only 25-NSE", "cik": "0000876661", "name": "New York Stock Exchange LLC", "form": "25-NSE", "accession": "0000876661-26-000002", "accepted": "2026-02-04T17:00:00-05:00", "filed_on": "2026-02-04", "listed": "2026-02-04"},
+    {"case": "master.chains: the predecessor's Form 25", "cik": "0000000107", "name": "Gee Old Corp", "form": "25", "accession": "0000000107-26-000001", "accepted": "2026-02-09T17:00:00-05:00", "filed_on": "2026-02-09", "listed": "2026-02-09", "exchange": "NYSE"},
+    {"case": "master.chains: the successor's 8-K12B", "cik": "0000000108", "name": "Gee New Corp", "form": "8-K12B", "accession": "0000000108-26-000001", "accepted": "2026-02-09T17:30:00-05:00", "filed_on": "2026-02-09", "listed": "2026-02-09"},
+    {"case": "companyfacts lagging longer than a week", "cik": "0000000101", "name": "Alpha Corp", "form": "10-Q", "accession": "0000000101-26-000001", "accepted": "2026-02-10T17:00:00-05:00", "filed_on": "2026-02-10", "listed": "2026-02-10", "ticker": "ALP", "exchange": "NYSE", "shares": 1020000, "facts_lag_days": 9},
+    {"case": "master.chains: the successor's first cover page", "cik": "0000000108", "name": "Gee New Corp", "form": "10-Q", "accession": "0000000108-26-000002", "accepted": "2026-02-11T17:00:00-05:00", "filed_on": "2026-02-11", "listed": "2026-02-11", "ticker": "GEE", "exchange": "NYSE", "shares": 700000},
+    {"case": "new issuers: the earlier-rows issuer's first cover page", "cik": "0000000103", "name": "Gamma Corp", "form": "10-Q", "accession": "0000000103-26-000001", "accepted": "2026-02-12T17:00:00-05:00", "filed_on": "2026-02-12", "listed": "2026-02-12", "ticker": "GAM", "exchange": "NASDAQ", "shares": 300000},
+    {"case": "new issuers: a plain one", "cik": "0000000112", "name": "Lambda Corp", "form": "10-K", "accession": "0000000112-26-000001", "accepted": "2026-02-24T17:00:00-05:00", "filed_on": "2026-02-24", "listed": "2026-02-24", "ticker": "LAM", "exchange": "NASDAQ", "shares": 800000}
+  ]
+}
