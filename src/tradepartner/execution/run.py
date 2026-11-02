@@ -243,6 +243,7 @@ from tradepartner.errors import (
 )
 from tradepartner.execution import drawdown, exits, marks, planning, switch
 from tradepartner.execution.alerts import Alerter
+from tradepartner.execution.buy_timing import execution_for
 from tradepartner.execution.collect import (
     Collected,
     Connect,
@@ -1984,7 +1985,8 @@ class _Run:
 
     def _unspent_cash(self, rebalances: Sequence[date]) -> None:
         """One `unspent_cash` alert, at most, for every rebalance in
-        `rebalances` reaching `executed` here whose cash exceeds the frozen
+        `rebalances` reaching `executed` here whose cash (less the book's
+        cash sleeve, c x equity from `paper.execution`) exceeds the frozen
         `risk.max_unspent_cash_fraction` of the broker's equity (module
         docstring): the cash is the broker's, read once with the equity for every
         rebalance in this call, so it is the cash after the run's collection
@@ -2007,7 +2009,14 @@ class _Run:
         bound = self.frozen.max_unspent_cash_fraction * account.equity
         # A short sale's proceeds sit in cash as collateral, not idle: leave the
         # shorts' market value out (None, a long-only adapter, is zero).
-        cash = max(account.cash - abs(account.short_market_value or 0.0), 0.0)
+        # The cash sleeve (c x equity, paper spec amendment 2026-11-01 item 3) is
+        # held on purpose, not unspent: it comes off too. c = 0 for a book outside
+        # `paper.execution`, so nothing changes there.
+        sleeve = execution_for(self.settings, self.window.book_id).cash_sleeve_fraction
+        cash = max(
+            account.cash - abs(account.short_market_value or 0.0) - sleeve * account.equity,
+            0.0,
+        )
         if cash <= bound:
             return
         named = "; ".join(

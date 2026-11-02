@@ -387,3 +387,53 @@ def test_read_raises_on_an_unreadable_frozen_json(tmp_path: Path) -> None:
     window_id = _seed(settings, frozen_json="{not json")
     with open_for_write(settings) as conn, pytest.raises(ValueError, match="frozen_json"):
         headroom.read(conn, _open_window(conn, window_id))
+
+
+# --- the cash sleeve (T370b, paper spec amendment 2026-11-01 item 3) -------------------
+
+
+def test_the_cash_row_reads_cash_less_the_sleeve() -> None:
+    # Cash 4,000 on equity 100,000 is 4%; a 3% sleeve leaves 1% against the 5% bound.
+    plain = _row(headroom.compute(_window(), _MARKS, (), _RISK), "cash")
+    sleeved = _row(headroom.compute(_window(), _MARKS, (), _RISK, sleeve_fraction=0.03), "cash")
+    assert plain.value == pytest.approx(0.04)
+    assert sleeved.value == pytest.approx(0.01)
+    assert sleeved.headroom_pp == pytest.approx(4.0)
+
+
+def test_a_sleeve_alone_does_not_fill_the_cash_row() -> None:
+    row = _row(headroom.compute(_window(), _MARKS, (), _RISK, sleeve_fraction=0.05), "cash")
+    assert row.value == 0.0
+    assert row.status == "within"
+
+
+def test_cash_above_the_sleeve_plus_the_bound_still_fills_the_row() -> None:
+    marks = (_mark("A", 90_000.0, cash=10_000.0),)
+    row = _row(headroom.compute(_window(), marks, (), _RISK, sleeve_fraction=0.03), "cash")
+    assert row.value == pytest.approx(0.07)
+    assert row.status == "over"
+
+
+def test_a_zero_sleeve_leaves_the_cash_row_unchanged() -> None:
+    zero = headroom.compute(_window(), _MARKS, (), _RISK, sleeve_fraction=0.0)
+    assert zero == headroom.compute(_window(), _MARKS, (), _RISK)
+
+
+def test_read_takes_c_from_the_windows_book(tmp_path: Path) -> None:
+    settings = _store(tmp_path)
+    window_id = _seed(settings)
+    with open_for_write(settings) as conn:
+        window = _open_window(conn, window_id)
+        base = _row(headroom.read(conn, window, settings), "cash").value
+        mapped = Settings(
+            _env_file=None,
+            store={"path": str(tmp_path / "h.duckdb")},
+            paper={"execution": {window.book_id: {"cash_sleeve_fraction": 0.01}}},
+        )
+        other = Settings(
+            _env_file=None,
+            store={"path": str(tmp_path / "h.duckdb")},
+            paper={"execution": {"zzz": {"cash_sleeve_fraction": 0.01}}},
+        )
+        assert _row(headroom.read(conn, window, mapped), "cash").value == pytest.approx(base - 0.01)
+        assert _row(headroom.read(conn, window, other), "cash").value == pytest.approx(base)

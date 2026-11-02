@@ -12,8 +12,9 @@ Four rows, each with the value, the window's frozen limit (never live
 `Settings`: the limit the run enforces), the headroom (limit - value, in
 percentage points) and what the limit does:
 
-- **Cash**: the ledger's cash less the held shorts' value, floored at 0 as
-  `run._unspent_cash` computes it, as a share of equity, against
+- **Cash**: the ledger's cash less the held shorts' value and less the book's
+  cash sleeve (c x equity, `paper.execution`; zero for a book outside the map),
+  floored at 0 as `run._unspent_cash` computes it, as a share of equity, against
   `risk.max_unspent_cash_fraction`. The alert reads the broker's cash; this row
   reads the ledger's.
 - **Gross exposure**: the sum of |value| over equity, against
@@ -45,7 +46,8 @@ import polars as pl
 
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.calendar import session_close
-from tradepartner.config import RiskConfig
+from tradepartner.config import RiskConfig, Settings, get_settings
+from tradepartner.execution.buy_timing import execution_for
 from tradepartner.execution.marks import equity_at
 from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.execution.switch import drawdown_armed, drawdown_peak
@@ -124,12 +126,14 @@ def compute(
     *,
     side: str = "long_only",
     tickers: Mapping[str, str] | None = None,
+    sleeve_fraction: float = 0.0,
 ) -> Headroom:
     """The Risk card over `marks` (only the latest session among them is read;
     none means before the first mark) and the window's `kill_switch_rows`, with
     the frozen `risk` limits (module docstring). Raises `UnreadableMarkError`
     when the session's rows cannot state equity, and `ValueError` when equity is
-    not positive or the drawdown peak is unusable."""
+    not positive or the drawdown peak is unusable. `sleeve_fraction` is the
+    book's c: the cash row reads cash less c x equity (default 0, unchanged)."""
     if window.window_id is None:
         raise ValueError("the window has no window_id")
     session = max((r.session for r in marks), default=None)
@@ -147,7 +151,7 @@ def compute(
     shorts = math.fsum(
         abs(r.value or 0.0) for r in held if r.position_side == _SHORT or (r.value or 0.0) < 0
     )
-    idle = max(cash - shorts, 0.0)
+    idle = max(cash - shorts - sleeve_fraction * equity, 0.0)
     gross = math.fsum(abs(v) for v in values.values())
     largest = min(values, key=lambda sid: (-abs(values[sid]), sid)) if values else None
     largest_weight = abs(values[largest]) / equity if largest is not None else 0.0
@@ -202,10 +206,16 @@ def _ticker(conn: duckdb.DuckDBPyConnection, security_id: str, session: date) ->
     return str(known["ticker"][-1]) if known.height else None
 
 
-def read(conn: duckdb.DuckDBPyConnection, window: PaperWindowRow) -> Headroom:
+def read(
+    conn: duckdb.DuckDBPyConnection,
+    window: PaperWindowRow,
+    settings: Settings | None = None,
+) -> Headroom:
     """The Risk card for `window` from the store (module docstring); writes
-    nothing. Raises `ValueError` for an unreadable `frozen_json` or hypothesis,
-    and `UnreadableMarkError` (a `ValueError`) for an unreadable mark."""
+    nothing. The cash row's sleeve is the window book's `paper.execution` c from
+    `settings` (loaded fresh when None). Raises `ValueError` for an unreadable
+    `frozen_json` or hypothesis, and `UnreadableMarkError` (a `ValueError`) for an
+    unreadable mark."""
     if window.window_id is None:
         raise ValueError("the window has no window_id")
     risk = frozen_risk(window)
@@ -214,7 +224,8 @@ def read(conn: duckdb.DuckDBPyConnection, window: PaperWindowRow) -> Headroom:
     session = marks[-1].session if marks else None
     last = [r for r in marks if r.session == session]
     kill_switch_rows = journal.kill_switch_events_for(conn, window.window_id)
-    card = compute(window, last, kill_switch_rows, risk, side=side)
+    sleeve = execution_for(settings or get_settings(), window.book_id).cash_sleeve_fraction
+    card = compute(window, last, kill_switch_rows, risk, side=side, sleeve_fraction=sleeve)
     if card.largest_security_id is None or card.session is None:
         return card
     return replace(card, largest_ticker=_ticker(conn, card.largest_security_id, card.session))
