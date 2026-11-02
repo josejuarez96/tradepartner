@@ -10,12 +10,12 @@ No production change, no schema change, no store write, no backtest, no strategy
 
 - Of 982 first common-stock exits from NASDAQ, NYSE and NYSE American in 2016-2018 (Form 25-NSE), **925 (94%) have no listing known at their Form 25**. Every one of them has a `securities` row.
 - **0 of 844 genuine-looking exits have a positive-volume bar.** The 57 names that do have bars all kept trading (transfers, reorganisations).
-- In a fresh Alpaca sample, **28 of 29 genuine exits drawn from that no-listing group return bars up to the Form 25** when the request carries `asof`. The 30th (INVT) has none.
+- In a fresh Alpaca sample of 30 Nasdaq exits from that no-listing group (tickers from the Form 25 exhibit; no NYSE name was sampled), **28 of 29 genuine exits return bars up to the Form 25** when the request carries `asof`. INVT has none; the 30th, AVGO, is a redomicile, not an exit.
 - A small part is our own ingestion (outcome C), and none of it is in 2016-2018. Across the whole store, 25 delisted common securities have a listing but no bars. 22 of them are old holders of a ticker that another company took later. Alpaca serves all 9 that were sampled under `asof`.
 
 **The fix is already built and the owner has already chosen it.** It is T184h, release `pre2019-listings-1597`: size S, owner-run. The code for T184 to T184g and T199 is merged. On 2026-10-31 the owner answered #2670 question 3 with (a): un-pause T184h after the T308 sitting ([#836](https://github.com/josejuarez96/tradepartner/issues/836)). It is **not "recoverable but too slow to matter"**. The release is one sitting: hours of EDGAR fetches, then an `asof` backfill. EODHD (about $20 a month) would not help. It sells bars, and bars are not what is missing. What is missing is a ticker and exchange known at the filing date, and a vendor's current ticker list cannot supply that (section 5).
 
-**Cards whose verdict would change: FC-1 only.** It would pass the power screen at the published +2% (8 June dates, at most about 80 effective events, against 36 needed). It would stay deferred at +1% (144 needed). FC-2, FC-5 and the source B cards do not change (section 1).
+**Cards whose verdict would change: FC-1 only.** It would no longer fail the power screen at the published +2% (an upper bound, not a measured count) (8 June dates, at most about 80 effective events, against 36 needed). It would stay deferred at +1% (144 needed). FC-2, FC-5 and the source B cards do not change (section 1).
 
 ## 1. Step 1: would a longer clean window change any card?
 
@@ -79,7 +79,7 @@ Scripts and outputs are in the session scratchpad (`probedelist/scripts/`: `fetc
 **Genuine exit or transfer.** A name counts as "continued" when its CIK files a 10-K or 10-Q, or a Form 4 names it as issuer, more than 180 days after the Form 25, or when it has a bar more than 30 days after it. This is a heuristic: it misses a redomicile under a new CIK, such as AVGO in the sample below. By that test, 81 of the 925 no-listing names continued and **844 look like genuine exits. 0 of the 844 have a bar.**
 
 **A ticker known at filing time, for the 925 no-listing names.** These are the two sources T184 reads.
-- 483 have the ticker in the Nasdaq Form 25 exhibit file name. 448 of them also have a 10-K or 10-Q filed in 2015 or later, before the Form 25.
+- 483 have the ticker in the Nasdaq Form 25 exhibit file name. 448 of them also have a 10-K or 10-Q filed in 2015 or later, before the Form 25. The other 35 (34 of them genuine exits) have a ticker only from the Form 25 itself, so it is known only at the exit: enough to end a span, not to place the name in a universe before it.
 - 323 more have only such a 10-K or 10-Q, so the ticker can come only from the XBRL instance file-name prefix. That route matched 10 of 10 spot-checked delisters on #1597 and 36 of 40 survivors.
 - 119 have neither: mostly 2016 exits whose last periodic filing predates 2015, and NYSE names. These stay out even after T184h unless its `filename_listings_since` reaches back further.
 - By exchange: NASDAQ 486, NYSE 381, NYSE American 58.
@@ -109,19 +109,19 @@ Two deterministic groups, through the repo's `alpaca_raw.daily_bars` and `get_se
 
 | Group | n | Bars without `asof` | Bars with `asof` | Note |
 |---|---|---|---|---|
-| Code 5: listing present, no bars stored (2019-2020) | 9 | 7 (3 with another company's tail: GCI, CZR, NTRP) | **9 of 9**, each ending at its last session | STI and GLIBA return nothing without `asof`. Alpaca has every one, so the miss is ours (outcome C) |
+| Code 5: listing present, no bars stored (2019-2020) | 9 | 7 (3 with another company's tail: GCI, CZR, NTRP) | **9 of 9** (8 end at their last session; MTCH's run past its Form 25 into the next company's prices) | STI and GLIBA return nothing without `asof`. Alpaca has every one, so the miss is ours (outcome C) |
 | No listing: Nasdaq genuine-looking exits, 10 per year 2016-2018, seed 2913, ticker from the Form 25 exhibit | 30 | 29 (NILE contaminated: Blue Nile's ticker returns a later holder's prices, last close 0.83 against 40.71) | 29 (INVT none; TW has one bar, because its exit is on Alpaca's first day) | 28 of the 29 real exits are recovered, so the miss is identity (outcome A). AVGO is a redomicile the "continued" heuristic missed |
 
 This matches #1311 (47 of 48 real exits under `asof`) and #1597 (51 of 51). Alpaca's coverage did not change between 2026-10-12 and today.
 
 ## 5. What it takes, and the vendor comparison
 
-**Minimum work.** Run **T184h** (owner, size S, already built), in the post-span data sitting beside T198, as its plan line allows. Afterwards, re-run this probe's funnel on the released store, read-only, as an XS check. Expected result: up to about 725 of the 844 genuine 2016-2018 exits gain a filing-time listing (the 119 with neither source stay out). Each gets bars through the existing `asof`-per-span backfill and a Form 25 end. #1597's sample gives roughly 90% or more of those with bars.
+**Minimum work.** Run **T184h** (owner, size S, already built), in the post-span data sitting beside T198, as its plan line allows. Afterwards, re-run this probe's funnel on the released store, read-only, as an XS check. Expected result: up to about 725 of the 844 genuine 2016-2018 exits gain a filing-time listing: about 691 known before the exit (a periodic filing's XBRL prefix) and 34 known only at the exit (the Form 25 exhibit alone). The 119 with neither source stay out. Each gets bars through the existing `asof`-per-span backfill and a Form 25 end. #1597's sample gives roughly 90% or more of those with bars.
 
 Not counted: T184h's own stop rules, the collision deny-list, and the step-6 retractions. The T198 sitting's `--fill-holes` run covers the 25-security residual described in section 3. FC-1 still needs its own no-return count of rebuilt migrants after that.
 
 **EODHD (about $20 a month, delisted EOD bars, all of them before 2018).** It does not close the gap:
-1. Bars are not missing. Alpaca serves 28 of 29 sampled exits.
+1. Bars are not missing. Alpaca serves 28 of 29 sampled genuine exits (Nasdaq only).
 2. A vendor's ticker for a delisted name is today's snapshot. Using it as a historical listing is look-ahead unless a filing confirms it, and that confirmation is T184's rule.
 3. ADR 0022 says no vendor in the store, and its revisit trigger is not met.
 
