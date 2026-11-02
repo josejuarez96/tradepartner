@@ -80,6 +80,7 @@ from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -1033,6 +1034,31 @@ def _validators_path(dest: Path) -> Path:
     """The sidecar beside a cached bulk zip holding its response validators
     and size (#2594); kept next to the file, never in the store."""
     return dest.with_name(f"{dest.name}.validators.json")
+
+
+def bulk_built_at(dest: Path) -> datetime | None:
+    """When the cached bulk archive at `dest` was built, as tz-aware UTC: its
+    sidecar's `Last-Modified` (#2594) while the sidecar's size and mtime bind
+    it to the file, else the file's mtime (written after SEC built it); `None`
+    with no file."""
+    try:
+        stat = dest.stat()
+    except OSError:
+        return None
+    try:
+        sidecar = json.loads(_validators_path(dest).read_text())
+        if (
+            isinstance(sidecar, dict)
+            and sidecar.get("size") == stat.st_size
+            and sidecar.get("mtime_ns") == stat.st_mtime_ns
+            and isinstance(sidecar.get("last_modified"), str)
+        ):
+            built = parsedate_to_datetime(sidecar["last_modified"])
+            if built.tzinfo is not None:
+                return built.astimezone(UTC)
+    except (OSError, ValueError, TypeError, RecursionError):
+        pass
+    return datetime.fromtimestamp(stat.st_mtime, UTC)
 
 
 def _conditional_headers(dest: Path, *, archive_kind: str = "zip") -> dict[str, str]:
