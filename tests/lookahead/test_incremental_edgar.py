@@ -51,6 +51,7 @@ from tradepartner.adapters.filings import (
     StatementFactRecord,
 )
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
+from tradepartner.calendar import all_sessions
 from tradepartner.config import Settings
 from tradepartner.ingest import IngestResult, ingest_session
 from tradepartner.store.db import open_for_write
@@ -224,9 +225,8 @@ class _Sec:
         return sorted(rows, key=lambda r: (r[0], r[2], r[4]))
 
     def daily_days(self, quarter: tuple[int, int]) -> list[date]:
-        return sorted(
-            d for d in self._by_day if _quarter(d) == quarter and self._posted(d) <= self.now
-        )
+        """Every session's file, an empty one too, once posted."""
+        return [d for d in all_sessions() if _quarter(d) == quarter and self._posted(d) <= self.now]
 
     def _posted(self, day: date) -> datetime:
         repost = self.reposts.get(day)
@@ -326,8 +326,8 @@ class _SimSource(EdgarFilingSource):
     """The real adapter over `_Sec`, with per-CIK payload answers simulated.
 
     The index path (`incremental_index`, `form.idx`, the walk, the stored
-    index binding and `_read_stamps`) is the adapter's own. Stamps come from
-    the scenario's submissions clock; companyfacts keep the adapter's
+    index binding, `_read_stamps` and the stamps cache) is the adapter's own.
+    The submissions payload comes from the scenario's clock; companyfacts keep the adapter's
     per-CIK cache file keyed by the latest cover-form accession, written only
     once the payload carries it; FSN cover shares appear with their period.
     """
@@ -337,26 +337,10 @@ class _SimSource(EdgarFilingSource):
         super().__init__(settings, client=client, clock=lambda: sec.now, **kwargs)
         self._sec = sec
 
-    # stamping
-    def _incremental_stamps(
-        self, rows: Mapping[str, Mapping[str, Any]]
-    ) -> dict[tuple[str, str], datetime | None]:
-        out: dict[tuple[str, str], datetime | None] = {}
-        for cik, accessions in rows.items():
-            records = self._sec.stamped(cik)
-            for accession in accessions:
-                record = records.get(accession)
-                out[cik, accession] = None if record is None else record.accepted_at
-        return out
-
-    def _load_stamps(self, cik: str) -> dict[str, SubmissionRecord]:
-        return self._sec.stamped(cik)
-
-    def _stamp_each(
-        self, kept: Mapping[str, Mapping[str, Any]]
-    ) -> Iterator[tuple[str, dict[str, SubmissionRecord]]]:
-        for cik in list(kept):
-            yield cik, self._sec.stamped(cik)
+    # stamping: the adapter's own stamps cache, unstampable rule and SGML-free
+    # path (`stamp_sgml_check` off) run; only the submissions payload is simulated.
+    def _fetch_submissions(self, cik: str, wanted: set[str]) -> Any:
+        return edgar_source_module._Submissions(self._sec.stamped(cik), [], self._sec.now)
 
     # payloads
     def companies_snapshot(self) -> list[CompanySnapshotEntry]:
@@ -683,7 +667,7 @@ def _ingest(settings: Settings, sec: _Sec, *, rebuild: bool) -> IngestResult:
 _RUN_COLUMNS = frozenset({"run_id"})
 
 
-def _tables(path: str) -> dict[str, list[tuple[Any, ...]]]:
+def _tables(path: str) -> dict[str, tuple[tuple[str, ...], list[tuple[Any, ...]]]]:
     """Every table but the run log, row for row, without run ids."""
     with duckdb.connect(path, read_only=True) as conn:
         conn.execute("SET TimeZone='UTC'")
@@ -694,9 +678,9 @@ def _tables(path: str) -> dict[str, list[tuple[Any, ...]]]:
             ).fetchall()
             if name not in ("ingestion_runs", "schema_version")
         ]
-        out: dict[str, list[tuple[Any, ...]]] = {}
+        out: dict[str, tuple[tuple[str, ...], list[tuple[Any, ...]]]] = {}
         for name in names:
-            columns = [
+            columns = tuple(
                 column
                 for (column,) in conn.execute(
                     "SELECT column_name FROM information_schema.columns "
@@ -704,20 +688,21 @@ def _tables(path: str) -> dict[str, list[tuple[Any, ...]]]:
                     [name],
                 ).fetchall()
                 if column not in _RUN_COLUMNS
-            ]
+            )
             select = ", ".join(f'"{c}"' for c in columns)
-            out[name] = sorted(conn.execute(f'SELECT {select} FROM "{name}"').fetchall(), key=repr)
+            rows = conn.execute(f'SELECT {select} FROM "{name}"').fetchall()
+            out[name] = columns, sorted(rows, key=repr)
         return out
 
 
 def _edgar_message(path: str) -> str:
-    """The night's EDGAR run message, without the index driver's own counts."""
+    """The night's EDGAR run message."""
     with duckdb.connect(path, read_only=True) as conn:
         row = conn.execute(
             "SELECT message FROM ingestion_runs WHERE source = 'edgar' ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
     assert row is not None
-    return str(row[0]).split("; index_", 1)[0]
+    return str(row[0])
 
 
 def _health(settings: Settings, at: datetime) -> list[str]:
@@ -738,24 +723,156 @@ def _health(settings: Settings, at: datetime) -> list[str]:
 
 # --- known divergences ---------------------------------------------------------
 
-#: `filing_index` accessions whose rows differ between the stores, with the issue
-#: that tracks each. Strict: each must still differ, so its fix removes the entry.
-KNOWN_INDEX_DIVERGENCES: dict[str, int] = {
-    # A correction seen while pending is dropped by the nightly (#2858).
-    "0000000102-25-000003": 2858,
-    # One run's daily re-listing and reconcile: the rebuild's chunk order keeps
-    # the quarterly listed_on, the nightly the daily one (#2859).
-    "0000000105-26-000001": 2859,
+
+def _utc(day: date, hour: int, minute: int) -> datetime:
+    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=UTC)
+
+
+#: What each table's divergence is pinned by: enough columns to name the row
+#: and every value a tracked issue lets differ.
+PINNED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "filing_index": ("cik", "accession", "filed_on", "listed_on", "list_position", "known_at"),
+    "edgar_index_files": ("path",),
 }
 
-#: Run-message clauses a touched-only nightly counts over tonight's CIKs (#2860).
-KNOWN_MESSAGE_CLAUSES: dict[str, int] = {"securities": 2860, "unstamped": 2860}
+#: Divergences found by this proof, each tracked by its issue: the rows only
+#: the incremental store holds and the rows only the rebuild store holds, in
+#: `PINNED_COLUMNS`. A night's difference passes only when every differing row
+#: is one of these; and each issue's rows must still occur (strict), so a fix
+#: has to remove its entry.
+KNOWN_DIVERGENCES: dict[
+    tuple[int, str], tuple[frozenset[tuple[Any, ...]], frozenset[tuple[Any, ...]]]
+] = {
+    # A filed_on correction seen while the accession is pending is dropped by the
+    # nightly; it arrives weeks later from the settled quarter's reconcile.
+    (2858, "filing_index"): (
+        frozenset(
+            {
+                (
+                    "0000000102",
+                    "0000000102-25-000003",
+                    date(2025, 12, 12),
+                    date(2026, 1, 1),
+                    0,
+                    _utc(date(2026, 1, 9), 4, 30),
+                ),
+            }
+        ),
+        frozenset(
+            {
+                (
+                    "0000000102",
+                    "0000000102-25-000003",
+                    date(2025, 12, 12),
+                    date(2025, 12, 17),
+                    0,
+                    _utc(date(2025, 12, 20), 4, 30),
+                ),
+            }
+        ),
+    ),
+    # After a key-off gap, the first key-on night no longer reads the daily files of
+    # a quarter that settled during the gap; the reconcile inserts the row instead.
+    (2864, "filing_index"): (
+        frozenset(
+            {
+                (
+                    "0000000101",
+                    "0000000101-25-000005",
+                    date(2025, 12, 30),
+                    date(2026, 1, 1),
+                    3,
+                    _utc(date(2025, 12, 30), 22, 0),
+                ),
+            }
+        ),
+        frozenset(
+            {
+                (
+                    "0000000101",
+                    "0000000101-25-000005",
+                    date(2025, 12, 30),
+                    date(2025, 12, 30),
+                    0,
+                    _utc(date(2025, 12, 30), 22, 0),
+                ),
+            }
+        ),
+    ),
+    # The same gap: the incremental store never records those daily files.
+    (2864, "edgar_index_files"): (
+        frozenset(),
+        frozenset(
+            {
+                ("daily-index/2025/QTR4/form.20251230.idx",),
+                ("daily-index/2025/QTR4/form.20251231.idx",),
+            }
+        ),
+    ),
+    # One night's daily re-listing and settled-quarter reconcile of one accession:
+    # the nightly keeps the daily listed_on, the rebuild's quarter chunk the quarterly.
+    (2859, "filing_index"): (
+        frozenset(
+            {
+                (
+                    "0000000105",
+                    "0000000105-26-000001",
+                    date(2025, 12, 31),
+                    date(2026, 1, 21),
+                    1,
+                    _utc(date(2026, 1, 22), 4, 30),
+                ),
+            }
+        ),
+        frozenset(
+            {
+                (
+                    "0000000105",
+                    "0000000105-26-000001",
+                    date(2025, 12, 31),
+                    date(2026, 1, 20),
+                    1,
+                    _utc(date(2026, 1, 22), 4, 30),
+                ),
+            }
+        ),
+    ),
+}
+
+#: Run-message clauses a touched-only nightly counts over tonight's CIKs (#2860):
+#: the securities count, and the unstamped filings count (its facts count must agree).
+MESSAGE_ISSUE = 2860
 
 
-def _clause(text: str) -> str:
-    """A run-message clause's name: `8 securities` -> `securities`."""
-    head = text.split(":", 1)[0].strip()
-    return head.split(" ", 1)[1] if head[:1].isdigit() else head.split(" ", 1)[0]
+def _message_clauses(message: str) -> dict[str, str]:
+    """The EDGAR message by clause name (`8 securities` -> `securities: 8`),
+    up to the index driver's own counts."""
+    out: dict[str, str] = {}
+    for clause in message.split("; index_", 1)[0].split("; "):
+        head, colon, rest = clause.partition(": ")
+        if not colon and head[:1].isdigit():
+            count, _, name = head.partition(" ")
+            out[name] = count
+        else:
+            out[head] = rest
+    return out
+
+
+def _message_diff(ours: str, theirs: str) -> tuple[bool, list[str]]:
+    """Whether #2860's clauses differ, and every other differing clause."""
+    left, right = _message_clauses(ours), _message_clauses(theirs)
+    known = False
+    odd = []
+    for name in sorted(left.keys() | right.keys()):
+        a, b = left.get(name), right.get(name)
+        if a == b:
+            continue
+        unstamped_facts_agree = bool(a and b and a.split(", ")[1:] == b.split(", ")[1:])
+        if name == "securities" or (name == "unstamped" and unstamped_facts_agree):
+            known = True
+        else:
+            odd.append(f"{name}: {a!r} != {b!r}")
+    return known, odd
 
 
 @dataclass
@@ -769,30 +886,65 @@ class _Run:
     known: set[int] = field(default_factory=set)
     touched: dict[date, frozenset[str]] = field(default_factory=dict)
     compared: int = 0
+    #: The incremental store's first key-on night after the gap: rows it first
+    #: writes then were written by the rebuild store on a gap night, so their
+    #: `ingested_at` may differ (the line's "different runs").
+    catch_up: datetime | None = None
+
+
+def _without(columns: tuple[str, ...], row: tuple[Any, ...], name: str) -> tuple[Any, ...]:
+    return tuple(v for c, v in zip(columns, row, strict=True) if c != name)
 
 
 def _compare(run: _Run, night: date, incremental: Settings, rebuild: Settings) -> None:
     """Record every difference the known list does not explain."""
     left, right = _tables(incremental.store.path), _tables(rebuild.store.path)
     for name in sorted(left.keys() | right.keys()):
-        ours, theirs = left.get(name, []), right.get(name, [])
+        columns, ours = left[name]
+        _, theirs = right[name]
         if ours == theirs:
             continue
         only_ours = [r for r in ours if r not in theirs]
         only_theirs = [r for r in theirs if r not in ours]
-        odd = only_ours + only_theirs
-        if name == "filing_index" and all(r[1] in KNOWN_INDEX_DIVERGENCES for r in odd):
-            run.known.update(KNOWN_INDEX_DIVERGENCES[r[1]] for r in odd)
+        if run.catch_up is not None and "ingested_at" in columns:
+            at = columns.index("ingested_at")
+
+            def key(row: tuple[Any, ...], columns: tuple[str, ...] = columns) -> tuple[Any, ...]:
+                return _without(columns, row, "ingested_at")
+
+            late = {key(r) for r in only_ours if r[at] == run.catch_up}
+            matched = late & {key(r) for r in only_theirs}
+            only_ours = [r for r in only_ours if not (r[at] == run.catch_up and key(r) in matched)]
+            only_theirs = [r for r in only_theirs if key(r) not in matched]
+        if not only_ours and not only_theirs:
             continue
+        pinned = PINNED_COLUMNS.get(name)
+        if pinned is not None:
+            index = [columns.index(c) for c in pinned]
+            ours_pins = {tuple(r[i] for i in index) for r in only_ours}
+            theirs_pins = {tuple(r[i] for i in index) for r in only_theirs}
+            keys = {
+                key
+                for key, (mine, other) in KNOWN_DIVERGENCES.items()
+                if key[1] == name and (ours_pins & mine or theirs_pins & other)
+            }
+            covered_ours = {pin for key in keys for pin in KNOWN_DIVERGENCES[key][0]}
+            covered_theirs = {pin for key in keys for pin in KNOWN_DIVERGENCES[key][1]}
+            if ours_pins <= covered_ours and theirs_pins <= covered_theirs:
+                run.known.update(issue for issue, _ in keys)
+                continue
         run.diffs.append(
             f"{night}: {name}\n  incremental only: {only_ours}\n  rebuild only: {only_theirs}"
         )
-    ours_message = _edgar_message(incremental.store.path).split("; ")
-    theirs_message = _edgar_message(rebuild.store.path).split("; ")
-    odd_clauses = {_clause(c) for c in set(ours_message) ^ set(theirs_message)}
-    if odd_clauses - KNOWN_MESSAGE_CLAUSES.keys():
-        run.diffs.append(f"{night}: edgar run message\n  {ours_message}\n  {theirs_message}")
-    run.known.update(KNOWN_MESSAGE_CLAUSES[c] for c in odd_clauses & KNOWN_MESSAGE_CLAUSES.keys())
+    ours_message = _edgar_message(incremental.store.path)
+    known, odd = _message_diff(ours_message, _edgar_message(rebuild.store.path))
+    if known:
+        run.known.add(MESSAGE_ISSUE)
+    if odd:
+        run.diffs.append(f"{night}: edgar run message: {odd}")
+    # T321's rotation check rebuilt a share of the untouched issuers and found no drift.
+    if "incremental_drift: 0" not in ours_message:
+        run.diffs.append(f"{night}: rotation drift: {ours_message.rsplit('; ', 1)[-1]}")
     ours_health, theirs_health = (
         _health(incremental, run.scenario.sec.now),
         _health(rebuild, run.scenario.sec.now),
@@ -844,9 +996,12 @@ def hundred_nights(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Run]:
             gap = scenario.key_off[0] <= night <= scenario.key_off[1]
             _ingest(_with(incremental, incremental_index=not gap), sec, rebuild=False)
             _ingest(rebuild, sec, rebuild=True)
-            if not gap:
-                run.compared += 1
-                _compare(run, night, incremental, rebuild)
+            if gap:
+                continue
+            if run.catch_up is None and night > scenario.key_off[1]:
+                run.catch_up = sec.now
+            run.compared += 1
+            _compare(run, night, incremental, rebuild)
         yield run
 
 
@@ -862,9 +1017,7 @@ def test_incremental_store_equals_rebuild_store_every_night(hundred_nights: _Run
     by its issue; each of those must still occur (strict)."""
     assert hundred_nights.compared == 100 - 1 - 9  # the seed night and the gap
     assert hundred_nights.diffs == []
-    assert hundred_nights.known == set(KNOWN_INDEX_DIVERGENCES.values()) | set(
-        KNOWN_MESSAGE_CLAUSES.values()
-    )
+    assert hundred_nights.known == {issue for issue, _ in KNOWN_DIVERGENCES} | {MESSAGE_ISSUE}
 
 
 def _index(settings: Settings, accession: str) -> list[tuple[Any, ...]]:
@@ -932,6 +1085,22 @@ def test_the_nights_reach_every_case_the_line_lists(hundred_nights: _Run) -> Non
     ]
     # A correction that moves filed_on across a quarter end.
     assert _index(store, "0000000105-26-000001")[-1][1] == date(2025, 12, 31)
+    # A filing listed inside the key-off gap in the open quarter: the first key-on
+    # night catches it up from its daily file, the same row on a later run.
+    gap_row = _index(store, "0000000102-26-000003")
+    assert [r[:4] for r in _index(run.incremental, "0000000102-26-000003")] == [
+        r[:4] for r in gap_row
+    ]
+    assert gap_row[0][4] == night(date(2026, 1, 5))
+    assert _index(run.incremental, "0000000102-26-000003")[0][4] == night(date(2026, 1, 8))
+    # A stamp that arrives only after its quarter settled: the adapter judged the
+    # accession unstampable at the settle, so it stays pending in both stores.
+    for settings in (store, run.incremental):
+        assert _index(settings, "0000000106-25-000003") == []
+        assert _rows(
+            settings,
+            "SELECT accession FROM filing_index_pending WHERE accession = '0000000106-25-000003'",
+        ) == [("0000000106-25-000003",)]
     # The 25-NSEs: the subject keeps a paired one; an exchange-only one stays the exchange's.
     assert [r[0] for r in _index(store, "0000876661-26-000001")] == ["0000000105"]
     assert [r[0] for r in _index(store, "0000876661-26-000002")] == ["0000876661"]
@@ -1187,7 +1356,7 @@ class _HistorySec(_Sec):
 
 
 def _memory_settings(root: Path, years: int) -> Settings:
-    return _settings(root, f"years-{years}", 2026 - years, verify_rotation_days=1000)
+    return _settings(root, f"years-{years}", 2026 - years)
 
 
 def _measure_night(root: str, years: int) -> None:
