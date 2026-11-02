@@ -802,22 +802,29 @@ def open_tranche(
     costs: BuyCosts,
     assets: Mapping[str, BorrowAsset],
     frozen: RiskConfig,
+    *,
+    ended: Collection[str] = (),
 ) -> OpenTranche:
     """Select the buys sent before the open (module docstring, `open_tranche`).
 
-    `buys` are the rebalance's open buy decisions with their remainders;
-    `budget` is the cash the tranche may spend (never negative, finite). Each
-    taken order is a notional buy for its remainder floored to the cent, so the
-    sum of `risk._buy_cash` over `taken` is at most `budget`. Pure: no sizing
-    scale, no write-off, nothing deferred.
+        `buys` are the rebalance's open buy decisions with their remainders;
+        `budget` is the cash the tranche may spend (never negative, finite). Each
+        taken order is a notional buy for its remainder floored to the cent, so the
+        sum of `risk._buy_cash` over `taken` is at most `budget`. Pure: no sizing
+        scale, no write-off, nothing deferred. `ended` is the names whose listing ended
+    at close(S-1) (`book.ended`): never taken, left for the after-sells phase to
+    skip, so they use none of the budget. A small-account buy planned whole-share
+    is left even if the name is fractionable now (conservative).
     """
     _finite(budget, "budget")
     room = Decimal(repr(float(budget)))
-    candidates: list[tuple[Decimal, str, int, BuyToSize, float]] = []
+    candidates: list[tuple[Decimal, str, int, BuyToSize, float, Decimal]] = []
     for index, buy in enumerate(buys):
         decision = buy.decision
         sid = decision.security_id
         if decision.side != _BUY or decision.position_side != LONG or buy.by_whole_shares:
+            continue
+        if sid in ended:
             continue
         asset = assets.get(sid)
         if asset is None or not (asset.tradable and asset.fractionable):
@@ -827,11 +834,11 @@ def open_tranche(
         if floored < Decimal(repr(frozen.min_order_notional)):
             continue
         price = _price(price_of, sid)
-        candidates.append((floored, sid, index, buy, price))
+        candidates.append((Decimal(repr(notional)), sid, index, buy, price, floored))
     candidates.sort(key=lambda c: (c[0], c[1], c[2]))
     taken: list[PhaseOrder] = []
     taken_at: set[int] = set()
-    for floored, sid, index, buy, price in candidates:
+    for _exact, sid, index, buy, price, floored in candidates:
         notional = float(floored)
         cash = risk._buy_cash(notional, None, price, False, frozen, costs)
         if cash > room:

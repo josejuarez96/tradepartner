@@ -1111,3 +1111,16 @@ def test_open_tranche_budget_bound_holds_for_random_remainders_and_prices() -> N
         assert len(out.taken) + len(out.left) == n
         remainders = [o.notional for o in out.taken]
         assert remainders == sorted(remainders)  # type: ignore[type-var]
+
+
+def test_open_tranche_leaves_an_ended_name_and_it_uses_no_budget() -> None:
+    buys = [_buy("A", 10.0), _buy("B", 50.0)]
+    names = {"A": TRADABLE, "B": TRADABLE}
+    out = open_tranche(buys, 50.0, _price, NO_COSTS, names, FROZEN, ended={"A"})
+    assert [o.security_id for o in out.taken] == ["B"]
+    assert [b.decision.security_id for b in out.left] == ["A"]
+
+
+def test_open_tranche_orders_by_exact_remainder_not_the_floored_cent() -> None:
+    out = _tranche([_buy("A", 10.009), _buy("B", 10.001)], 100.0)
+    assert [o.security_id for o in out.taken] == ["B", "A"]
