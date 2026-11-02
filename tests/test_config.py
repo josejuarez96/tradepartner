@@ -3752,7 +3752,6 @@ def test_opg_cutoff_below_two_refused() -> None:
     "entry",
     [
         {"buy_timing": "alternate"},
-        {"buy_timing": "alternate", "alternate_start": "2026-11-26"},
         {"buy_timing": "at_open", "alternate_start": "2026-11-23"},
         {"cash_sleeve_fraction": 0.11},
         {"cash_sleeve_fraction": -0.01},

@@ -82,3 +82,25 @@ def test_closing_auction_refused() -> None:
 def test_allowed_tif_with_opening_includes_opg() -> None:
     ex = BookExecution.model_construct(auction="opening")
     assert allowed_time_in_force(ex) == frozenset({"day", "opg"})
+
+
+def test_non_session_alternate_start_refused_by_execution_for() -> None:
+    s = Settings(
+        paper={  # type: ignore[arg-type]
+            "execution": {"daily": {"buy_timing": "alternate", "alternate_start": "2026-11-26"}}
+        }
+    )
+    with pytest.raises(ValueError, match="not an XNYS session"):
+        execution_for(s, "daily")
+
+
+def test_get_settings_with_alternate_from_env_does_not_recurse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tradepartner.config import get_settings
+
+    monkeypatch.setenv(
+        "PAPER__EXECUTION",
+        '{"daily": {"buy_timing": "alternate", "alternate_start": "2026-11-23"}}',
+    )
+    assert get_settings().paper.execution["daily"].buy_timing == "alternate"

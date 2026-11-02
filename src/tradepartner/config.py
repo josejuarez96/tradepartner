@@ -806,9 +806,10 @@ class BookExecution(BaseModel):
 
     `buy_timing`: `after_sells` (req 3 as written), `at_open` or `alternate` (V1 on
     even XNYS-session ordinals from `alternate_start`). `alternate_start` is required
-    with `alternate`, refused otherwise, and must be an XNYS session. `cash_sleeve_fraction`
-    is c in [0, 0.10]. `auction`: `none`, or `opening` (refused until T376 lands; `closing`
-    is not offered). A book absent from `PaperConfig.execution` behaves as the defaults.
+    with `alternate`, refused otherwise; `execution_for` checks it is an XNYS session.
+    `cash_sleeve_fraction` is c in [0, 0.10]. `auction`: `none`, or `opening` (refused
+    until T376 lands; `closing` is not offered).
+    A book absent from `PaperConfig.execution` behaves as the defaults.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
@@ -823,10 +824,8 @@ class BookExecution(BaseModel):
         if self.buy_timing == "alternate":
             if self.alternate_start is None:
                 raise ValueError("buy_timing 'alternate' requires alternate_start")
-            from tradepartner.calendar import is_session  # calendar imports config
-
-            if not is_session(self.alternate_start):
-                raise ValueError(f"alternate_start {self.alternate_start} is not an XNYS session")
+            # The XNYS-session check is `execution_for`'s: the calendar reads
+            # settings, so checking here would recurse at load time.
         elif self.alternate_start is not None:
             raise ValueError("alternate_start is only allowed with buy_timing 'alternate'")
         if self.auction == "opening":

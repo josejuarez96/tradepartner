@@ -7,26 +7,28 @@ these until T370.
 
 from __future__ import annotations
 
-import re
 from bisect import bisect_left
 from collections.abc import Sequence
 from datetime import date
 from typing import TYPE_CHECKING, Literal
 
-from tradepartner.config import BookExecution
+from tradepartner.calendar import is_session
+from tradepartner.config import _BOOK_TOKEN, BookExecution
 
 if TYPE_CHECKING:
     from tradepartner.config import Settings
 
-_BOOK_TOKEN = re.compile(r"^[A-Za-z0-9]+$")
-
 
 def execution_for(settings: Settings, book_id: str) -> BookExecution:
     """The book's `paper.execution` entry, or the defaults (`after_sells`, c = 0,
-    `none`) for a book absent from the map. Refuses a malformed book token."""
+    `none`) for a book absent from the map. Refuses a malformed book token and a non-session
+    `alternate_start`."""
     if _BOOK_TOKEN.fullmatch(book_id) is None:
         raise ValueError(f"book_id must match ^[A-Za-z0-9]+$, got {book_id!r}")
-    return settings.paper.execution.get(book_id, BookExecution())
+    ex = settings.paper.execution.get(book_id, BookExecution())
+    if ex.alternate_start is not None and not is_session(ex.alternate_start):
+        raise ValueError(f"alternate_start {ex.alternate_start} is not an XNYS session")
+    return ex
 
 
 def arm_for(
