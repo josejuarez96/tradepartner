@@ -15,7 +15,7 @@ Run the T349 comparison at its defaults (2-decimal price and shares, exact ident
 Two things the owner should know before enabling it, neither changed here:
 
 1. **Multi-owner accessions are the disagreement.** 15 of the 17 are 2024q2 multi-owner accessions (SEC bulk assigns the owner roles to the wrong owner; #2706). With #2711's route (multi-owner goes to XML before any bulk row is stored) their bulk side is never written, so a bulk-versus-XML comparison of them measures SEC's defect, not ours. If they stay in the denominator the numerator rises with every such accession. If the owner would rather have the share describe only the rows the bulk route would have stored, exclude multi-owner accessions from the comparison. At 1% either choice passes on this data.
-2. **Two single-owner `deemed_execution_date` disagreements** (2019q1 `0001491519-19-000001`, 2019q3 `0001763113-19-000007`) look like a row-association slip in the bulk set: the date sits on a different transaction than in the XML. This is the kind of order defect the sample exists to catch. It was already a failure under today's `rows_agree`, so it is not new, but it shows the 1% line will not hide order differences: they are counted like any other.
+2. **Two single-owner `deemed_execution_date` disagreements** (2019q1 `0001491519-19-000001`, 2019q3 `0001763113-19-000007`) look like a row-association slip in the bulk set: the date sits on a different transaction than in the XML. This is the kind of order defect the sample exists to catch. It was already a failure under today's `rows_agree`, so it is not new, but it shows why the order sample needs its own per-quarter refusal: the 1% share would count these as two among thousands.
 
 ## What ran
 
