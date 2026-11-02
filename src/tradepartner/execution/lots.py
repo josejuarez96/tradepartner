@@ -96,7 +96,13 @@ import polars as pl
 
 from tradepartner.adapters.broker import Asset
 from tradepartner.calendar import session_close
-from tradepartner.execution.ledger import TRUE_UP_KINDS, _split_ratio, true_up_quantity
+from tradepartner.execution.ledger import (
+    TRUE_UP_KINDS,
+    _split_ratio,
+    reversed_adjustment_id,
+    reversed_true_up_ids,
+    true_up_quantity,
+)
 from tradepartner.store.journal import AdjustmentRow, OrderedFill, OrderRow
 from tradepartner.store.schema import LONG
 
@@ -957,9 +963,18 @@ def _events(
                     partial(_Ledger.split, security_id=security_id, ratio=_split_ratio(ratio)),
                 )
             )
-    true_ups = [
+    try:
+        reversed_ids = reversed_true_up_ids(adjustments, through or date.max)
+    except ValueError as exc:
+        raise LotLedgerError(str(exc)) from exc
+    active_adjustments = [
         r
         for r in adjustments
+        if r.adjustment_id not in reversed_ids and reversed_adjustment_id(r) is None
+    ]
+    true_ups = [
+        r
+        for r in active_adjustments
         if r.kind in TRUE_UP_KINDS
         and r.quantity is not None
         and (through is None or r.session <= through)
@@ -984,7 +999,7 @@ def _events(
                 partial(_Ledger.trade, trade=trade),
             )
         )
-    window = [r for r in adjustments if through is None or r.session <= through]
+    window = [r for r in active_adjustments if through is None or r.session <= through]
     removals = _by_merger(window, _CORPORATE_ACTION_CASH, unique=False)
     receipts = _by_merger(window, _MERGER_RECEIPT, unique=True)
     cash_rows: dict[str, list[AdjustmentRow]] = {}
