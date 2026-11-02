@@ -8,6 +8,7 @@ broker-facing cases are T60b's and T60e's.
 from __future__ import annotations
 
 import math
+import random
 from collections.abc import Collection, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -26,11 +27,26 @@ from tradepartner.execution.phases import (
     PhaseOrder,
     PhaseOrders,
     buy_orders,
+    open_tranche,
     requests_for,
     sell_orders,
 )
-from tradepartner.execution.plan import BuyCosts, DecisionState, PriceOf, State, decision_state
-from tradepartner.execution.risk import OpenSell, Skips, check_phase, open_sold
+from tradepartner.execution.plan import (
+    BuyCosts,
+    DecisionState,
+    PriceOf,
+    Remainder,
+    State,
+    decision_state,
+)
+from tradepartner.execution.risk import (
+    BuyToSize,
+    OpenSell,
+    Skips,
+    check_phase,
+    open_sold,
+)
+from tradepartner.execution.risk import _buy_cash as risk_buy_cash
 from tradepartner.store.journal import (
     DecisionRow,
     FillRow,
@@ -1007,3 +1023,104 @@ def test_buys_refuse_a_sells_phase_of_another_session() -> None:
     sells = _sells([trim], {"SEC_5": 10.0})
     with pytest.raises(ValueError, match="sells phase of"):
         _buys(THREE[:1], 1000.0, sells=PhaseOrders(sells.orders, (), session=T0))
+
+
+# --- open_tranche (paper spec amendment 2026-11-01, item 2; T371a) ---------------
+
+
+def _buy(sid: str, notional: float, *, whole: bool = False, side: str = "buy", pos: str = "long"):
+    decision = replace(_d(1, side, sid=sid, target=notional, whole_share=whole), position_side=pos)
+    return BuyToSize(decision, Remainder(notional / PRICE, notional))
+
+
+def _tranche(buys, budget, *, costs=NO_COSTS, assets=None, price_of=_price):
+    names = {b.decision.security_id: TRADABLE for b in buys}
+    return open_tranche(buys, budget, price_of, costs, assets or names, FROZEN)
+
+
+def test_open_tranche_takes_ascending_remainder_and_skips_what_does_not_fit() -> None:
+    buys = [_buy("C", 50.0), _buy("A", 30.0), _buy("B", 30.0), _buy("D", 10.0)]
+    out = _tranche(buys, 75.0)
+    # D (10), then A and B (30 each, by id); C (50) no longer fits.
+    assert [o.security_id for o in out.taken] == ["D", "A", "B"]
+    assert [b.decision.security_id for b in out.left] == ["C"]
+    out = _tranche(buys, 45.0)
+    assert [o.security_id for o in out.taken] == ["D", "A"]
+    out = _tranche([_buy("A", 40.0), _buy("B", 50.0), _buy("C", 60.0)], 60.0)
+    assert [o.security_id for o in out.taken] == ["A"]
+    out = _tranche([_buy("A", 10.0), _buy("B", 50.0), _buy("C", 20.0)], 35.0)
+    assert [o.security_id for o in out.taken] == ["A", "C"]
+
+
+def test_open_tranche_orders_are_notional_buys_for_the_whole_remainder() -> None:
+    (order,) = _tranche([_buy("A", 12.345)], 100.0).taken
+    assert order.notional == 12.34 and order.quantity is None and not order.whole_share
+    assert order.side == "buy" and order.position_side == "long"
+
+
+def test_open_tranche_leaves_whole_share_cover_small_and_unfit_names() -> None:
+    buys = [
+        _buy("W", 50.0, whole=True),
+        _buy("V", 50.0, side="buy", pos="short"),
+        _buy("S", 0.5),
+        _buy("N", 50.0),
+        _buy("OK", 50.0),
+    ]
+    assets = {"W": TRADABLE, "V": TRADABLE, "S": TRADABLE, "N": WHOLE, "OK": TRADABLE}
+    out = _tranche(buys, 1000.0, assets=assets)
+    assert [o.security_id for o in out.taken] == ["OK"]
+    assert {b.decision.security_id for b in out.left} == {"W", "V", "S", "N"}
+    assets["OK"] = HALTED
+    assert _tranche(buys, 1000.0, assets=assets).taken == ()
+
+
+def test_open_tranche_cash_check_includes_costs_and_is_strict_in_decimal() -> None:
+    # 10 bps a side: a 100.00 buy costs 100.10.
+    assert _tranche([_buy("A", 100.0)], 100.0, costs=COSTS).taken == ()
+    assert len(_tranche([_buy("A", 100.0)], 100.1, costs=COSTS).taken) == 1
+    assert _tranche([_buy("A", 100.0)], 0.0).taken == ()
+
+
+def test_open_tranche_zero_budget_and_bad_inputs() -> None:
+    assert _tranche([_buy("A", 10.0)], 0.0).left[0].decision.security_id == "A"
+    with pytest.raises(ValueError):
+        _tranche([_buy("A", 10.0)], float("nan"))
+    with pytest.raises(ValueError):
+        _tranche([_buy("A", 10.0)], -1.0)
+
+
+def test_open_tranche_budget_bound_holds_for_random_remainders_and_prices() -> None:
+    rng = random.Random(371)
+    for _ in range(300):
+        n = rng.randint(1, 12)
+        buys = [_buy(f"S{i:02d}", round(rng.uniform(0.5, 400.0), 4)) for i in range(n)]
+        prices = {f"S{i:02d}": rng.uniform(1.0, 900.0) for i in range(n)}
+        budget = round(rng.uniform(0.0, 1500.0), 2)
+        costs = BuyCosts(
+            rng.uniform(0.0, 30.0), Commissions(rng.uniform(0, 0.01), rng.uniform(0, 0.5))
+        )
+        out = _tranche(buys, budget, costs=costs, price_of=prices.__getitem__)
+        spent = sum(
+            (
+                risk_buy_cash(o.notional, None, prices[o.security_id], False, FROZEN, costs)
+                for o in out.taken
+            ),
+            Decimal(0),
+        )
+        assert spent <= Decimal(repr(budget))
+        assert len(out.taken) + len(out.left) == n
+        remainders = [o.notional for o in out.taken]
+        assert remainders == sorted(remainders)  # type: ignore[type-var]
+
+
+def test_open_tranche_leaves_an_ended_name_and_it_uses_no_budget() -> None:
+    buys = [_buy("A", 10.0), _buy("B", 50.0)]
+    names = {"A": TRADABLE, "B": TRADABLE}
+    out = open_tranche(buys, 50.0, _price, NO_COSTS, names, FROZEN, ended={"A"})
+    assert [o.security_id for o in out.taken] == ["B"]
+    assert [b.decision.security_id for b in out.left] == ["A"]
+
+
+def test_open_tranche_orders_by_exact_remainder_not_the_floored_cent() -> None:
+    out = _tranche([_buy("A", 10.009), _buy("B", 10.001)], 100.0)
+    assert [o.security_id for o in out.taken] == ["B", "A"]
