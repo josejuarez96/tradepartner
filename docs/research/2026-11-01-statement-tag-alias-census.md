@@ -13,7 +13,7 @@
 
 ## The frozen lists, with coverage
 
-Coverage is the share of the 41,349 in-sample universe-months at which the name has a first-vintage row known at the month-end with `period_end` within 400 days of the session (the #660 health bound). Accession shares are over 243,151 priced-CIK accessions of `edgar.statement_forms` filed 2010-2026, with SIC 6770 removed.
+Coverage is the share of the 41,349 in-sample universe-months at which the name has a first-vintage row known at the month-end with `period_end` within 400 days of the session (the #660 health bound). Accession shares are over 243,151 priced-CIK accessions of `edgar.statement_forms` filed 2009-2026, with SIC 6770 removed.
 
 | Name | Frozen tags, in precedence order | Coverage, universe-months | Accessions carrying a tag |
 |---|---|---|---|
@@ -74,7 +74,7 @@ The gap is the share of the 41,349 member-months at which the name has no row by
 | `cash` | `Cash` | 2.37 % | above | stated gap |
 | `capex` | `PaymentsToAcquireProductiveAssets` | 14.20 % | above | stated gap |
 | `depreciation` | `DepreciationAndAmortization` | 18.19 % | above | **`depreciation_nonproduction`** |
-| `depreciation` | `Depreciation` | 12.71 % | above | stated gap |
+| `depreciation` | `Depreciation` | 23.10 % (against the frozen one-tag list) | above | stated gap |
 | `income_tax` | `CurrentIncomeTaxExpenseBenefit` | 0.21 % | **residue** | none |
 | `buybacks` | `PaymentsForRepurchaseOfEquity` | 2.94 % (lacks 2.02, differs 0.92) | above | **`buybacks_total`** |
 | `dividends_paid` | `PaymentsOfDividends` | 25.58 % (lacks 23.31, differs 2.27) | above | **`dividends_paid_total`** |
@@ -97,7 +97,7 @@ The gap is the share of the 41,349 member-months at which the name has no row by
 - **Discovery (top 20 over-represented concepts).** The lists show filer type, not missing tags. Current items and operating income: bank concepts (`Deposits`, `NoninterestExpense`, `InterestAndFeeIncomeLoansAndLeases`, which appear in about 40 % of none-accessions against 0 to 1 % of carrying ones). EPS and equity: partnership concepts (`PartnersCapital`, `LimitedPartnersCapitalAccount`, about 17 % against 0 %). Capex and PP&E: real-estate concepts. Income tax and the payout names: development-stage filers (`EarningsPerShareBasicAndDiluted`, warrant and issuance-cost concepts). For `interest_expense` and `ppe_net`, discovery surfaces the migration tags named above.
 - **Units.** Every candidate tag is overwhelmingly in `USD` (EPS in `USD/shares`). Foreign-currency entries are under 1 %, and are skipped and counted as `statement_non_usd` today. EPS also shows about 300 `pure` and 40 `shares` entries per tag, which are mis-unit filings and are skipped.
 - **Wrong kind.** The instant names have zero duration entries. The duration names have a few instant entries: under 0.02 % for most, but 1.6 % for `dividends_paid` (2,174 of 135,164 entries) and 2.4 % for `stock_issued` (3,760 of 157,326). These become rows with `period_days = 0`, which every flow reader already filters out. That is not material for a reader that filters on `period_days`, as the spec requires, so no parser amendment is proposed.
-- **Restatements** (priced CIKs, first vintage, a later different value). `net_income` 11.7 % of rows, EPS 11.7 %, `operating_income` 16.0 %, `book_equity` 17.0 %, `income_tax` 10.2 %, `cash` 9.2 %, `depreciation` (both tags) 8.7 %, the current items about 7.4 %, `capex` 5.7 %, and the financing names 2.7 to 5.0 %. **EPS restatements a split explains:** `eps_basic` 9,855 of 48,160 (20 %) and `eps_diluted` 8,961 of 47,457 (19 %). The rest are other restatements (discontinued operations, reclassification, errors). The read-time split rule in the spec handles the 20 %. The other 80 % are first-vintage differences like any name's.
+- **Restatements** (priced CIKs, first vintage, a later different value; counted as restating events per stored row, so one key restated twice counts twice). `net_income` 11.7 % of rows, EPS 11.7 %, `operating_income` 16.0 %, `book_equity` 17.0 %, `income_tax` 10.2 %, `cash` 9.2 %, `depreciation` (both tags) 8.7 %, the current items about 7.4 %, `capex` 5.7 %, and the financing names 2.7 to 5.0 %. **EPS restatements a split explains:** `eps_basic` 9,855 of 48,160 (20 %) and `eps_diluted` 8,961 of 47,457 (19 %). The rest are other restatements (discontinued operations, reclassification, errors). The read-time split rule in the spec handles the 20 %. The other 80 % are first-vintage differences like any name's.
 
 ## T368's time and disk budget
 
@@ -121,8 +121,9 @@ The times were measured on four parallel workers (one process each), so they are
 
 - The real store is at schema 41 and has no `filing_index` table yet. The stamps cache stands in for it: form and acceptance per accession, as the ingest read them before T323a.
 - Shares and equality are over companyfacts entries, which carry no dimensioned facts. A filer that tags EPS only per share class has none here, as in the store.
-- "SIC 6770" is the latest `classifications` row known at acceptance for any of the CIK's securities. A blank check that merged keeps 6770 until its SIC changes.
+- "SIC 6770" is the latest `classifications` row known at acceptance for any of the CIK's securities, or the earliest row when none is known yet (a later row standing in). A blank check that merged keeps 6770 until its SIC changes.
 - Gaps use simulated first-vintage rows from the production parser and the ingest's first-vintage rule, without the hold rule. The census drops 360 unstamped records, which would be held.
+- Coverage counts any row by the #660 bound, including the few wrong-kind (instant) rows of a flow name; this overstates `stock_issued` and `dividends_paid` coverage by at most their 1.6 to 2.4 % instant entries.
 - In-sample members are `universe_as_of` under default settings (about 1,009 a month). This is the top-1,000 universe, not every priced CIK.
 
 ## Candidate-alias list (written before the run)
