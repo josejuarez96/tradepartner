@@ -733,6 +733,28 @@ class _Prices(PriceSource):
         return [a for a in self.actions if a.security_id in security_ids]
 
 
+@pytest.fixture(autouse=True)
+def _store_under_tmp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Fail any DuckDB file opened outside pytest's temp root (T323).
+
+    A test whose settings fell back to the default store path would otherwise
+    open, or create, the owner's real store.
+    """
+    root = tmp_path_factory.getbasetemp().resolve()
+    connect = duckdb.connect
+
+    def guarded(database: Any = ":memory:", *args: Any, **kwargs: Any) -> Any:
+        name = str(database)
+        in_memory = name == "" or name.startswith(":memory:")
+        if not in_memory and not Path(name).resolve().is_relative_to(root):
+            raise AssertionError(f"test opened a store outside tmp_path: {name}")
+        return connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(duckdb, "connect", guarded)
+
+
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     return Settings(
@@ -1109,9 +1131,17 @@ def test_incremental_fingerprint_mismatch_fails_edgar_but_prices_run(
         )
     result = _run(enabled)
     assert [(run.source, run.status) for run in result.runs] == [("edgar", FAILED), ("alpaca", OK)]
+    assert "rules changed" in result.runs[0].message
     assert "--rebuild-index" in result.runs[0].message
     assert read("SELECT count(*) FROM filing_index") == [(0,)]
     assert build_fingerprint(enabled).hash != "obsolete"
+    # `--rebuild-index` writes an ok row with today's fingerprint and clears the gate.
+    short = enabled.model_copy(
+        update={"edgar": enabled.edgar.model_copy(update={"index_first_year": 2018})}
+    )
+    assert _run(short, source="edgar", rebuild_index=True).ok
+    cleared = _run(short)
+    assert [(run.source, run.status) for run in cleared.runs] == [("edgar", OK), ("alpaca", OK)]
 
 
 def test_partial_rebuild_keeps_incremental_gate_closed(
@@ -1614,6 +1644,42 @@ def test_incremental_rebuild_flags_take_full_path(
     monkeypatch.setattr(ingest_module, "_prepare_indexed_filings", limited)
     result = _run(configured, filings=_filings(), source="edgar", rebuild_statement_facts=True)
     assert result.ok, result.runs[0].message
+
+
+def test_index_key_off_run_never_touches_the_index_path(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    read: Callable[[str], list[tuple[Any, ...]]],
+) -> None:
+    """Unchanged paths: with `edgar.incremental_index` off, the nightly is today's."""
+    assert settings.edgar.incremental_index is False
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the key-off run must not reach the index driver")
+
+    for name in (
+        "_index_gate",
+        "_prepare_index",
+        "_prepare_indexed_filings",
+        "_write_indexed_filings",
+        "_write_index_state",
+    ):
+        monkeypatch.setattr(ingest_module, name, forbidden)
+    source = _filings()
+    monkeypatch.setattr(source, "incremental_index", forbidden)
+    result = _run(settings, filings=source)
+    assert [(run.source, run.status) for run in result.runs] == [("edgar", OK), ("alpaca", OK)]
+    assert "index_" not in result.runs[0].message
+    assert read("SELECT count(*) FROM ingestion_runs WHERE source = 'edgar_index'") == [(0,)]
+    assert read("SELECT count(*) FROM filing_index") == [(0,)]
+    assert read("SELECT count(*) FROM edgar_index_files") == [(0,)]
+
+
+def test_store_guard_refuses_the_default_store_path() -> None:
+    """A test whose settings fell back to the default path fails, never opens it."""
+    default = Settings(_env_file=None)
+    with pytest.raises(AssertionError, match="outside tmp_path"):
+        duckdb.connect(default.store.path, read_only=True)
 
 
 def test_edgar_backfill_since_keeps_full_master_history_with_index_key_on(
