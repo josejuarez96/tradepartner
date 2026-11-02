@@ -234,6 +234,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
 
@@ -1651,8 +1652,13 @@ def _index_state(
     *,
     candidate_accessions: frozenset[str] | None = None,
     candidate_ciks: frozenset[str] = frozenset(),
+    reread_prefix: str | None = None,
 ) -> Any:
-    """Read the four cursor tables and the issuer set on one store snapshot."""
+    """Read the four cursor tables and the issuer set on one store snapshot.
+
+    ``reread_prefix`` drops the stored daily cursors under that path, so a
+    ``--rebuild-index`` chunk reads every daily file of its quarter again under
+    today's rules; T318's insert writes nothing for a row already stored."""
     from tradepartner.adapters.filings import IncrementalIndexState, PendingIndexRow
 
     columns = (
@@ -1708,6 +1714,7 @@ def _index_state(
             "SELECT path, last_modified, size FROM edgar_index_files "
             "WHERE path LIKE 'daily-index/%'"
         ).fetchall()
+        if reread_prefix is None or not path.startswith(reread_prefix)
     }
     issuer_forms = sorted(set(settings.master.issuer_forms) - {"25", "25-NSE"})
     placeholders = ", ".join("?" for _ in issuer_forms)
@@ -1776,6 +1783,13 @@ def _prepare_index(
     with open_read_only(settings, retry=True) as conn:
         snapshot = index_snapshot_id(conn)
         writer_version = _writer_version(conn)
+    # A rebuild chunk re-reads its quarter's daily files: a rule change must
+    # reach the unsettled quarters too, not only the settled `form.idx` ones.
+    reread = (
+        None
+        if quarter_filter is None
+        else f"daily-index/{quarter_filter[0]}/QTR{quarter_filter[1]}/"
+    )
     daily: list[Any] = []
     quarterly: dict[tuple[int, int], tuple[str, date]] = {}
     settled_days: dict[tuple[int, int], date] = {}
@@ -1865,6 +1879,7 @@ def _prepare_index(
                     "SELECT path, last_modified, size FROM edgar_index_files "
                     "WHERE path LIKE 'daily-index/%'"
                 ).fetchall()
+                if reread is None or not path.startswith(reread)
             }
             known_issuers = {
                 cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
@@ -1916,6 +1931,7 @@ def _prepare_index(
             settled_days,
             candidate_accessions=candidate_accessions,
             candidate_ciks=candidate_ciks,
+            reread_prefix=reread,
         )
     proposal = source.incremental_index(state)
     read_files = list(quarterly_files)
@@ -2543,19 +2559,9 @@ def _write_indexed_filings(
         touched_ciks=batch.touched,
     )
     rotation_message = _rotation_report(conn, settings, batch, now)
-    touch_cursor = dict(batch.touch_cursor)
-    if hasattr(source, "filename_incomplete_ciks"):
-        touch_cursor["filename_incomplete"] = sorted(source.filename_incomplete_ciks)
-    if hasattr(source, "_failure_store"):
-        touch_cursor["failures"] = {
-            accession: [
-                accession[:10],
-                entry.get("kind") != "collision"
-                and int(entry.get("count", 0)) >= settings.edgar.max_filing_failures,
-                bool(entry.get("accepted", False)),
-            ]
-            for accession, entry in source._failure_store().items()
-        }
+    touch_cursor = _touch_after_build(
+        settings, source, batch.touch_cursor, recorded.filename_incomplete_ciks
+    )
     index_counts = (
         f"{index_counts}; index_stamp_changed: "
         f"{len(batch.proposal.stamp_changed_ciks)}; {rotation_message}"
@@ -2574,6 +2580,31 @@ def _write_indexed_filings(
     )
     _write_run(conn, index_run_id, now, clock(), index_run, MODE)
     return index_rows + derived_rows, f"{message}; {index_counts}"
+
+
+def _touch_after_build(
+    settings: Settings,
+    source: object,
+    touch_cursor: Mapping[str, Any],
+    recorded_incomplete: Collection[str],
+) -> dict[str, Any]:
+    """The run row's T320 cursor, with the filename and failure state the build left."""
+    out = dict(touch_cursor)
+    incomplete = set(recorded_incomplete)
+    incomplete.update(getattr(source, "filename_incomplete_ciks", ()))
+    out["filename_incomplete"] = sorted(incomplete)
+    failure_store = getattr(source, "_failure_store", None)
+    if callable(failure_store):
+        out["failures"] = {
+            accession: [
+                accession[:10],
+                entry.get("kind") != "collision"
+                and int(entry.get("count", 0)) >= settings.edgar.max_filing_failures,
+                bool(entry.get("accepted", False)),
+            ]
+            for accession, entry in failure_store().items()
+        }
+    return out
 
 
 def _rebuild_index_session(
@@ -2660,6 +2691,7 @@ def _rebuild_index_session(
 
     recorded = _Recorded(filings)
     final_snapshot: dict[str, str | int | None] = {}
+    seed_touch: dict[str, Any] = {}
 
     def prepare_final() -> None:
         source = _unwrap(recorded)
@@ -2670,6 +2702,16 @@ def _rebuild_index_session(
         if callable(bind):
             bind(cast(duckdb.DuckDBPyConnection, _IndexReadProxy(settings)))
         _prefetch(recorded, settings, dry_run=dry_run)
+        # The first nightly diffs T320's inputs against this row (FSN periods,
+        # the lag start, failures, filename-incomplete CIKs, the snapshot).
+        state = _index_touch_state(settings, source, now, None, {}, SimpleNamespace(listings=()))
+        seed_touch.update(
+            {
+                key: state[key]
+                for key in ("failures", "fsn_periods", "lag_start", "filename_incomplete")
+                if key in state
+            }
+        )
 
     def write_final(conn: duckdb.DuckDBPyConnection, run_id: str) -> tuple[int, str]:
         if (
@@ -2682,6 +2724,7 @@ def _rebuild_index_session(
         if callable(bind):
             bind(conn)
         added, message = _ingest_filings(conn, settings, recorded, clock, run_id)
+        touch = _touch_after_build(settings, source, seed_touch, recorded.filename_incomplete_ciks)
         index_run = SourceRun(
             "edgar_index",
             OK,
@@ -2689,6 +2732,8 @@ def _rebuild_index_session(
             _index_run_cursor(
                 settings,
                 f"{quarters[-1][0]}Q{quarters[-1][1]}" if quarters else last_partial or "",
+                _snapshot_values(list(recorded._ask("companies_snapshot"))),
+                touch,
             ),
             _index_run_message(settings, "index seed complete", 0),
         )

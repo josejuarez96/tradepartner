@@ -1286,11 +1286,18 @@ def test_rebuild_index_dry_run_writes_nothing(
     assert read("SELECT count(*) FROM edgar_index_files") == [(0,)]
 
 
+@pytest.mark.parametrize("raced_step", ["_prepare_index", "_prepare_indexed_filings"])
 def test_incremental_snapshot_change_refuses_before_index_write(
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
     read: Callable[[str], list[tuple[Any, ...]]],
+    raced_step: str,
 ) -> None:
+    """Another writer after the fetch snapshot fails EDGAR with nothing written.
+
+    The raced row is an `alpaca` run, so the fingerprint gate stays open and the
+    snapshot check (before the bind, and again under the lock) is what fires.
+    """
     configured = settings.model_copy(
         update={"edgar": settings.edgar.model_copy(update={"index_first_year": 2019})}
     )
@@ -1301,7 +1308,22 @@ def test_incremental_snapshot_change_refuses_before_index_write(
     enabled = configured.model_copy(
         update={"edgar": configured.edgar.model_copy(update={"incremental_index": True})}
     )
-    original = ingest_module._prepare_index
+    cik = "0000009999"
+    accepted = _at(2019, 6, 3)
+    source._incremental_rows = (
+        FilingRow(
+            cik,
+            f"{cik}-19-000001",
+            "10-K",
+            "New Corp",
+            date(2019, 6, 3),
+            accepted,
+            date(2019, 6, 3),
+            accepted,
+            NOW,
+        ),
+    )
+    original = getattr(ingest_module, raced_step)
 
     def raced(*args: Any, **kwargs: Any) -> Any:
         batch = original(*args, **kwargs)
@@ -1310,10 +1332,10 @@ def test_incremental_snapshot_change_refuses_before_index_write(
                 conn,
                 "ingestion_runs",
                 {
-                    "run_id": "other-index-writer",
+                    "run_id": "other-writer",
                     "started_at": NOW,
                     "finished_at": NOW,
-                    "source": "edgar_index",
+                    "source": "alpaca",
                     "status": "ok",
                     "mode": "session",
                     "rows_added": 0,
@@ -1323,12 +1345,15 @@ def test_incremental_snapshot_change_refuses_before_index_write(
             )
         return batch
 
-    monkeypatch.setattr(ingest_module, "_prepare_index", raced)
+    runs_before = read("SELECT count(*) FROM ingestion_runs")[0][0]
+    monkeypatch.setattr(ingest_module, raced_step, raced)
     result = _run(enabled, filings=source, source="edgar")
     assert result.runs[0].status == FAILED
-    assert "snapshot" in result.runs[0].message or "rules changed" in result.runs[0].message
+    assert "changed since the fetch snapshot" in result.runs[0].message
     assert read("SELECT count(*) FROM filing_index") == [(0,)]
     assert read("SELECT count(*) FROM edgar_index_files") == [(0,)]
+    # Only the raced row was added: the failed run writes no row of its own.
+    assert read("SELECT count(*) FROM ingestion_runs")[0][0] == runs_before + 1
 
 
 def test_daily_index_cursor_preserves_listed_modification_and_size() -> None:
@@ -1391,6 +1416,137 @@ def test_seed_records_daily_file_cursor_and_next_read_skips_it(
         assert conn.execute("SELECT path, size FROM edgar_index_files").fetchall() == [
             ("daily-index/2026/QTR1/form.20260102.idx", 1024)
         ]
+
+
+def _daily_quarter_source(
+    configured: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    run_at: datetime,
+    files: Mapping[str, Callable[[], tuple[UnstampedFiling, ...]]],
+    stamps: Mapping[tuple[str, str], datetime],
+) -> tuple[EdgarFilingSource, list[str]]:
+    """An EDGAR source over cached 2026 Q1 daily files (tmp cache, no network)."""
+    from tradepartner.adapters import edgar_raw
+
+    listing = {
+        "directory": {
+            "item": [
+                {
+                    "name": name,
+                    "last-modified": f"{name[9:11]}/{name[11:13]}/2026 10:00:00 PM",
+                    "size": "1 KB",
+                }
+                for name in files
+            ]
+        }
+    }
+    monkeypatch.setattr(edgar_raw, "daily_index_listing", lambda *_a, **_k: listing)
+    for name in files:
+        path = edgar_raw.daily_index_file_path(2026, 1, name, settings=configured)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"fixture {name}", encoding="utf-8")
+    source = EdgarFilingSource(configured, clock=lambda: run_at)
+    reads: list[str] = []
+
+    def rows(file: Any) -> tuple[UnstampedFiling, ...]:
+        reads.append(file.name)
+        return files[file.name]()
+
+    monkeypatch.setattr(source, "_incremental_daily_rows", rows)
+    monkeypatch.setattr(source, "_incremental_stamps", lambda _rows: dict(stamps))
+    return source, reads
+
+
+def test_rebuild_chunk_rereads_its_quarters_daily_files_under_todays_rules(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rule change reaches an unsettled quarter: the rebuild re-reads its daily
+    files although their cursors are stored, adds only the newly kept row, and
+    never rewrites a stored one."""
+    run_at = datetime(2026, 1, 10, tzinfo=UTC)
+    edgar = settings.edgar.model_copy(
+        update={"index_first_year": 2026, "cache_dir": str(tmp_path / "edgar-cache")}
+    )
+    configured = settings.model_copy(update={"edgar": edgar})
+    with open_for_write(configured) as conn:
+        init_schema(conn)
+    cik, other = "0000009999", "0000008888"
+    kept = UnstampedFiling(cik, "New Corp", "10-K", f"{cik}-26-000001", date(2026, 1, 2))
+    newly_kept = UnstampedFiling(
+        other, "Other Corp", "10-K", f"{other}-26-000001", date(2026, 1, 2)
+    )
+    rule = {"rows": (kept,)}
+    stamps = {
+        (cik, kept.accession): _at(2026, 1, 2),
+        (other, newly_kept.accession): _at(2026, 1, 2),
+    }
+    source, reads = _daily_quarter_source(
+        configured, monkeypatch, run_at, {"form.20260102.idx": lambda: rule["rows"]}, stamps
+    )
+    seed = ingest_module._prepare_index(configured, source, run_at, quarter_filter=(2026, 1))
+    with open_for_write(configured) as conn:
+        assert ingest_module._write_index_state(conn, seed, run_at, "seed")[0] == 1
+        first = conn.execute("SELECT * FROM filing_index").fetchall()
+    # Today's rules keep a row the seed's rules dropped (say, a form added to
+    # `events.sec_forms`); the nightly would never read this file again.
+    rule["rows"] = (kept, newly_kept)
+    reads.clear()
+    later = run_at + timedelta(days=1)
+    rebuilt = ingest_module._prepare_index(configured, source, later, quarter_filter=(2026, 1))
+    assert set(reads) == {"form.20260102.idx"}
+    assert [path for path, *_ in rebuilt.files] == ["daily-index/2026/QTR1/form.20260102.idx"]
+    with open_for_write(configured) as conn:
+        assert ingest_module._write_index_state(conn, rebuilt, later, "rebuild")[0] == 1
+        rows = conn.execute("SELECT * FROM filing_index ORDER BY cik").fetchall()
+        assert [row[0] for row in rows] == [other, cik]
+        assert [row for row in rows if row[0] == cik] == first
+    again = ingest_module._prepare_index(configured, source, later, quarter_filter=(2026, 1))
+    with open_for_write(configured) as conn:
+        assert ingest_module._write_index_state(conn, again, later, "rebuild-2")[0] == 0
+
+
+def test_rebuild_unsettled_quarter_over_a_stored_revision_writes_no_row(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2703: re-reading the first listing and its corrected re-listing from the
+    daily files adds nothing to a store that already holds both revisions."""
+    run_at = datetime(2026, 2, 15, tzinfo=UTC)
+    edgar = settings.edgar.model_copy(
+        update={"index_first_year": 2026, "cache_dir": str(tmp_path / "edgar-cache")}
+    )
+    configured = settings.model_copy(update={"edgar": edgar})
+    cik = "0000009999"
+    accession = f"{cik}-26-000001"
+    accepted = datetime(2026, 1, 13, 21, tzinfo=UTC)
+    first = ingest_module.stored_index.Listing(
+        cik, accession, "S-8", "New Corp", date(2026, 1, 13), accepted, date(2026, 1, 13), True, 0
+    )
+    corrected = replace(first, filed_on=date(2026, 1, 9), listed_on=date(2026, 1, 30))
+    with open_for_write(configured) as conn:
+        init_schema(conn)
+        ingest_module.stored_index.insert_listings(conn, [first], accepted + timedelta(hours=3))
+        ingest_module.stored_index.insert_listings(conn, [corrected], _at(2026, 1, 31))
+        before = conn.execute("SELECT * FROM filing_index ORDER BY known_at").fetchall()
+    assert len(before) == 2
+    source, reads = _daily_quarter_source(
+        configured,
+        monkeypatch,
+        run_at,
+        {
+            "form.20260113.idx": lambda: (
+                UnstampedFiling(cik, "New Corp", "S-8", accession, date(2026, 1, 13)),
+            ),
+            "form.20260130.idx": lambda: (
+                UnstampedFiling(cik, "New Corp", "S-8", accession, date(2026, 1, 9)),
+            ),
+        },
+        {(cik, accession): accepted},
+    )
+    batch = ingest_module._prepare_index(configured, source, run_at, quarter_filter=(2026, 1))
+    assert set(reads) == {"form.20260113.idx", "form.20260130.idx"}
+    with open_for_write(configured) as conn:
+        assert ingest_module._write_index_state(conn, batch, run_at, "rebuild")[0] == 0
+        assert conn.execute("SELECT * FROM filing_index ORDER BY known_at").fetchall() == before
 
 
 def test_incremental_rotation_reports_unchanged_issuers(
@@ -1467,6 +1623,117 @@ def test_per_name_edit_touches_only_named_cik_without_fingerprint_gate(
         "SELECT chunk_cursor FROM ingestion_runs WHERE source = 'edgar_index' ORDER BY rowid"
     )[-1][0]
     assert json.loads(cursor)["per_name"]["edgar.class_member_overrides"] == {ACME: "CommonClassA"}
+
+
+def test_seed_row_carries_touch_cursor_so_night_one_touches_incomplete_cik(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    read: Callable[[str], list[tuple[Any, ...]]],
+) -> None:
+    """T320's filename trigger survives the seed: a CIK whose filename answer was
+    partial in the seed's full build is touched on the first nightly."""
+    edgar = settings.edgar.model_copy(update={"index_first_year": 2018})
+    configured = settings.model_copy(update={"edgar": edgar})
+    with open_for_write(configured) as conn:
+        init_schema(conn)
+    source = _filings()
+    source.filename_incomplete_ciks = {DUAL}  # type: ignore[attr-defined]
+    assert _run(configured, filings=source, source="edgar", rebuild_index=True).ok
+    seed = json.loads(
+        read(
+            "SELECT chunk_cursor FROM ingestion_runs WHERE source = 'edgar_index' "
+            "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
+        )[0][0]
+    )
+    assert seed["touch"]["filename_incomplete"] == [DUAL]
+    assert seed["snapshot"] == {
+        cik: [list(pair) for pair in sorted(pairs)]
+        for cik, pairs in ingest_module._snapshot_values(source.companies_snapshot()).items()
+    }
+    assert seed["snapshot"]
+    del source.filename_incomplete_ciks  # type: ignore[attr-defined]
+    enabled = configured.model_copy(
+        update={"edgar": edgar.model_copy(update={"incremental_index": True})}
+    )
+    touched: list[frozenset[str]] = []
+    original = ingest_module._touched_for_index
+
+    def recording(*args: Any, **kwargs: Any) -> tuple[frozenset[str], frozenset[str]]:
+        selected = original(*args, **kwargs)
+        touched.append(selected[0])
+        return selected
+
+    monkeypatch.setattr(ingest_module, "_touched_for_index", recording)
+    result = _run(enabled, filings=source, source="edgar")
+    assert result.ok, result.runs[0].message
+    assert len(touched) == 1 and DUAL in touched[0]
+
+
+def test_touched_only_nightly_records_the_same_underived_set_as_a_full_run(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """T321's carry-forward in the driver: untouched CIKs are not marked underived."""
+    edgar = settings.edgar.model_copy(update={"index_first_year": 2018})
+    incremental = settings.model_copy(update={"edgar": edgar})
+    full = incremental.model_copy(
+        update={"store": incremental.store.model_copy(update={"path": str(tmp_path / "full.db")})}
+    )
+
+    def underived(configured: Settings) -> list[tuple[Any, ...]]:
+        with duckdb.connect(configured.store.path, read_only=True) as conn:
+            return conn.execute(
+                "SELECT table_name, security_id, ticker, exchange, valid_from, known_at "
+                "FROM master_underived WHERE run_id = (SELECT run_id FROM ingestion_runs "
+                "WHERE source = 'edgar' ORDER BY rowid DESC LIMIT 1) ORDER BY ALL"
+            ).fetchall()
+
+    for configured in (incremental, full):
+        with open_for_write(configured) as conn:
+            init_schema(conn)
+        assert _run(configured, filings=_filings(), source="edgar", rebuild_index=True).ok
+    enabled = incremental.model_copy(
+        update={"edgar": edgar.model_copy(update={"incremental_index": True})}
+    )
+    nightly = NOW + timedelta(days=1)
+    assert _run(enabled, filings=_filings(), source="edgar", now=nightly).ok
+    assert _run(full, filings=_filings(), source="edgar", now=nightly).ok
+    assert underived(enabled) == underived(full)
+
+
+def test_rebuild_index_resumes_after_the_last_partial_chunk(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resumed seed skips the quarters a same-fingerprint partial row covers."""
+    edgar = settings.edgar.model_copy(update={"index_first_year": 2018})
+    configured = settings.model_copy(update={"edgar": edgar})
+    with open_for_write(configured) as conn:
+        init_schema(conn)
+        insert_row(
+            conn,
+            "ingestion_runs",
+            {
+                "run_id": "stopped-seed",
+                "started_at": NOW,
+                "finished_at": NOW,
+                "source": "edgar_index",
+                "status": "partial",
+                "mode": "rebuild_index",
+                "rows_added": 0,
+                "chunk_cursor": "2018Q4",
+                "message": f"rule_fingerprint: {build_fingerprint(configured).hash}; files_read: 0",
+            },
+        )
+    quarters: list[tuple[int, int]] = []
+    original = ingest_module._prepare_index
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        quarters.append(kwargs["quarter_filter"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ingest_module, "_prepare_index", recording)
+    assert _run(configured, source="edgar", rebuild_index=True).ok
+    assert quarters[0] == (2019, 1)
+    assert all(quarter > (2018, 4) for quarter in quarters)
 
 
 def test_index_read_proxy_releases_store_before_next_fetch(
