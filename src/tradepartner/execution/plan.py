@@ -1652,8 +1652,8 @@ def decisions_from(
 
     placed = {key: i for key, i in intents.items() if decided[key].side is not None}
     sleeve = sleeve_fraction * equity if sleeve_fraction > 0 else 0.0
-    targets = _buy_targets(placed, ledger.free_cash(marks), price_of, costs, sleeve)
-    for key, target in targets.items():
+    buy_targets = _buy_targets(placed, ledger.free_cash(marks), price_of, costs, sleeve)
+    for key, target in buy_targets.items():
         decided[key] = replace(decided[key], target_notional=target)
 
     live_scale = settings.paper.live_capital_reference / equity

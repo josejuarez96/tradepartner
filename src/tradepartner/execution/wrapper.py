@@ -153,6 +153,10 @@ falling back to `settings.costs`. Each phase, in order:
    never `buying_power`. The declared stub (plan T60b, development-process.md
    "Plan shape" rule 4): if T48b finds paper `cash` lags same-session proceeds,
    its amendments change this one read (`_buys_cash`), a size-S issue here;
+   on a book in `paper.execution` that cash is less the sleeve c x E (E the
+   ledger equity at the reference prices of the buys phase's read, c the book's
+   `cash_sleeve_fraction`), floored at zero (paper spec amendment 2026-11-01
+   item 3, T370), and the batch ends with item 6's `paper_execution` line;
 5. every `OrderRequest` built and validated (`phases.requests_for`): a
    `ValueError` halts the phase before any request reaches the broker;
 6. `risk.check_phase` against that same cash, with the batch's decisions and
@@ -234,7 +238,7 @@ from tradepartner.adapters.broker import (
     canonical_symbol,
 )
 from tradepartner.backtest.costs import Commissions
-from tradepartner.calendar import previous_session, session_close
+from tradepartner.calendar import all_sessions, previous_session, session_close
 from tradepartner.config import (
     FROZEN_COSTS_KEYS,
     CostsConfig,
@@ -259,6 +263,7 @@ from tradepartner.errors import (
 from tradepartner.execution import breaks as break_rules
 from tradepartner.execution import phases, switch
 from tradepartner.execution.alerts import Alerter
+from tradepartner.execution.buy_timing import arm_for, execution_for
 from tradepartner.execution.collect import (
     Connect,
     PriceBand,
@@ -533,7 +538,8 @@ class BatchOutcome:
     order ids submitted, sells first; `skips` the phase-time skips journaled;
     `deferred` the buys the sizing deferred; `written_off` the buys written off
     at the phase's end. `cash` is the buys phase's cash (`account().cash` less
-    the reserve, at least 0) and `cash_left` that cash less the modelled cost
+    the reserve, at least 0, less the sleeve on a book in `paper.execution`,
+    T370) and `cash_left` that cash less the modelled cost
     of every buy submitted, after `risk.check_phase`'s skips (#518), for the
     run's `unspent_cash` test; both None when no buys phase read the cash."""
 
@@ -544,6 +550,89 @@ class BatchOutcome:
     written_off: tuple[int, ...] = ()
     cash: float | None = None
     cash_left: float | None = None
+
+
+#: Item 6's fallback on a V1 session until phase (i') is built (T371): the
+#: session keeps its arm and runs req 3's two phases, as V0 does.
+OPEN_TRANCHE_NOT_BUILT = "open_tranche_not_built"
+PAPER_EXECUTION = "paper_execution"
+_NA = "na"
+
+
+@dataclass
+class _Variant:
+    """Item 6's record of one batch of a book in `paper.execution` (paper spec
+    amendment 2026-11-01, T370): the arm from `buy_timing.arm_for`, the configured
+    timing and c, the sleeve c x E the buys phase kept (or c x the batch-start
+    ledger equity when no buys phase read the cash), `idle_cash` B from one
+    `account()` read after the sells' last submit (or at the batch start with no
+    sells phase), and `min_cash`, the lowest raw `account().cash` read in the
+    batch. Phase (i') is T371's, so its counts are 0 here."""
+
+    arm: str
+    timing: str
+    fraction: float
+    fallback: str
+    sleeve_cash: float | None = None
+    idle_cash: float | None = None
+    min_cash: float | None = None
+    open_buys: int = 0
+    open_notional: float = 0.0
+    open_unsent: int = 0
+    opg_after_cutoff: int = 0
+
+    def saw(self, cash: float) -> None:
+        """Count one raw `account().cash` reading toward `min_cash`."""
+        self.min_cash = cash if self.min_cash is None else min(self.min_cash, cash)
+
+    def line(self) -> str:
+        """The run-notes line; every number is `repr` of its float, so it parses
+        back exactly (`paper_execution_fields`), and an unread value is `na`."""
+
+        def number(value: float | None) -> str:
+            return _NA if value is None else repr(float(value))
+
+        return (
+            f"{PAPER_EXECUTION} arm={self.arm} timing={self.timing} "
+            f"sleeve_fraction={number(self.fraction)} sleeve_cash={number(self.sleeve_cash)} "
+            f"idle_cash={number(self.idle_cash)} min_cash={number(self.min_cash)} "
+            f"open_buys={self.open_buys} open_notional={number(self.open_notional)} "
+            f"open_unsent={self.open_unsent} fallback={self.fallback} "
+            f"opg_after_cutoff={self.opg_after_cutoff}"
+        )
+
+
+def paper_execution_fields(line: str) -> dict[str, str | int | float | None]:
+    """Parse item 6's line back: `arm`, `timing` and `fallback` as text; the counts
+    as `int`; the cash fields and `sleeve_fraction` as `float`, `na` as None. A line
+    that is not item 6's raises `ValueError`."""
+    head, _, rest = line.partition(" ")
+    if head != PAPER_EXECUTION:
+        raise ValueError(f"not a {PAPER_EXECUTION} line: {line!r}")
+    texts = {"arm", "timing", "fallback"}
+    counts = {"open_buys", "open_unsent", "opg_after_cutoff"}
+    numbers = {"sleeve_fraction", "sleeve_cash", "idle_cash", "min_cash", "open_notional"}
+    fields: dict[str, str | int | float | None] = {}
+    for part in rest.split(" "):
+        key, sep, value = part.partition("=")
+        if not sep or key in fields or key not in texts | counts | numbers:
+            raise ValueError(f"bad field {part!r} in {line!r}")
+        if key in texts:
+            fields[key] = value
+        elif key in counts:
+            fields[key] = int(value)
+        else:
+            fields[key] = None if value == _NA else float(value)
+    if set(fields) != texts | counts | numbers:
+        raise ValueError(f"missing fields in {line!r}")
+    return fields
+
+
+def _ledger_equity(book: _Book) -> float:
+    """Req 3 (c)'s equity: the book's ledger equity at its reference prices."""
+    ledger = book.ledger
+    marks = {sid: book.price_of(sid) for sid in (*ledger.positions, *ledger.short_holdings)}
+    return ledger.equity(marks)
 
 
 def _own_book_rows(
@@ -689,6 +778,9 @@ class RiskGatedBroker:
         self._recheck: bool = False
         self._killed: bool = False
         self._phase_incomplete: bool = False
+        #: Item 6's record of the batch in progress (reset by `execute`); None for a
+        #: book outside `paper.execution`.
+        self._variant: _Variant | None = None
 
     def __repr__(self) -> str:
         return f"RiskGatedBroker(broker={type(self._broker).__name__})"
@@ -808,8 +900,19 @@ class RiskGatedBroker:
         forced exits handed to this batch; each decision once. Every exception
         is a fault for the caller's halt path. A batch that skipped a name for one
         of the three per-name reasons writes one `skipped` alert naming each name
-        and its reason (T202)."""
-        outcome = self._trade(run, decisions, forced_exits, notes if notes is not None else [])
+        and its reason (T202).
+
+        On a book in `paper.execution` the batch appends item 6's `paper_execution`
+        line to `notes` however it ends, a fault included (paper spec amendment
+        2026-11-01, T370); on any other book it writes none."""
+        notes = notes if notes is not None else []
+        self._variant = None
+        try:
+            outcome = self._trade(run, decisions, forced_exits, notes)
+        finally:
+            if self._variant is not None:
+                notes.append(self._variant.line())
+            self._variant = None
         self._alert_skips(run, outcome.skips)
         return outcome
 
@@ -864,6 +967,7 @@ class RiskGatedBroker:
         # `missed` (ADR 0010 point 2), whichever decisions that phase held.
         rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
         book = self._read_book(run, rows)
+        self._variant = self._variant_for(run, book)
         self._check_break_cap(run, book)
         if any(d.side == _BUY for d in decisions) and not self._engaged(run, book.window):
             # The buys phase's reserve prices every open quantity buy: a name
@@ -884,7 +988,10 @@ class RiskGatedBroker:
         submitted: list[str] = []
         skips: tuple[Skip, ...] = ()
         counted = 0
-        if attempt_scope(rows, book.states, phase=_SELL).attempts:
+        has_sells = bool(attempt_scope(rows, book.states, phase=_SELL).attempts)
+        if self._variant is not None and not has_sells:
+            self._note_idle(run, rows, book)  # item 6: at the batch start, no sells phase
+        if has_sells:
             if self._engaged(run, book.window):
                 return BatchOutcome(_SKIPPED_KILL_SWITCH)
             assets = self._phase_assets(run, book, rows, _SELL)
@@ -941,6 +1048,8 @@ class RiskGatedBroker:
             skips, counted = (*skips, *refused), counted + len(refused)
             if self._killed:
                 return BatchOutcome(_SKIPPED_KILL_SWITCH, tuple(submitted), skips)
+            if self._variant is not None:
+                self._note_idle(run, rows)  # item 6: after the sells' last submit
             # After the kill-switch return, so a clock read can't change the halt path.
             if submitted:
                 self._phase_time(notes, "sells_submitted")
@@ -984,6 +1093,13 @@ class RiskGatedBroker:
         assets = self._phase_assets(run, book, rows, _BUY)
         account = self._broker.account()
         cash = self._buys_cash(account, book, run.session)
+        if self._variant is not None:
+            # Item 3: (ii) never spends below the sleeve c x E, E at this read.
+            self._variant.saw(account.cash)
+            sleeve = self._variant.fraction * _ledger_equity(book)
+            self._variant.sleeve_cash = sleeve
+            if sleeve > 0:
+                cash = float(max(Decimal(repr(cash)) - Decimal(repr(sleeve)), Decimal(0)))
         costs = book.costs
         kept, unsent = _drop_ambiguous(book, rows, _BUY, notes, self._unsent)
         built = phases.buy_orders(
@@ -1110,6 +1226,41 @@ class RiskGatedBroker:
             cash,
             left,
         )
+
+    def _variant_for(self, run: PaperRunRow, book: _Book) -> _Variant | None:
+        """Item 6's record for a book in `paper.execution`, else None. The arm is
+        `arm_for` over the calendar's session list; a V1 session runs req 3's two
+        phases until T371 and says so in `fallback`. The batch-start sleeve is c x
+        the ledger equity, kept unread (`na`) when a mark is missing: it is the
+        record only, and the buys phase sizes from its own read."""
+        book_id = book.window.book_id
+        if book_id not in self._settings.paper.execution:
+            return None
+        assert run.session is not None
+        execution = execution_for(self._settings, book_id)
+        arm = arm_for(execution, run.session, all_sessions())
+        variant = _Variant(
+            arm=arm,
+            timing=execution.buy_timing,
+            fraction=execution.cash_sleeve_fraction,
+            fallback=OPEN_TRANCHE_NOT_BUILT if arm == "V1" else "none",
+        )
+        try:
+            variant.sleeve_cash = variant.fraction * _ledger_equity(book)
+        except (KeyError, ValueError):
+            variant.sleeve_cash = None
+        return variant
+
+    def _note_idle(
+        self, run: PaperRunRow, rows: Sequence[DecisionRow], book: _Book | None = None
+    ) -> None:
+        """Item 6's `idle_cash`: B (`_buys_cash`, no sleeve) from one `account()`
+        read, counted toward `min_cash`; `book` is re-read when not given."""
+        assert self._variant is not None and run.session is not None
+        account = self._broker.account()
+        self._variant.saw(account.cash)
+        current = book if book is not None else self._read_book(run, rows)
+        self._variant.idle_cash = self._buys_cash(account, current, run.session)
 
     def _buys_cash(self, account: Account, book: _Book, session: date) -> float:
         """Cash available to buys: broker cash less the open-buy reserve,
