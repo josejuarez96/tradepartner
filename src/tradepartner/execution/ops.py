@@ -140,10 +140,16 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Cadence, Settings
 from tradepartner.execution import lock, performance, shakedown, waiting
+from tradepartner.execution.alerts import break_age, break_kinds, is_aged, latest_open_breaks
 from tradepartner.execution.marks import equity_at, signed_value
 from tradepartner.execution.plan import stop_session as stop_session_of_request
 from tradepartner.execution.reconcile import OVERDUE_DELISTING_CASH
-from tradepartner.execution.reconcile_run import allowed_of, frozen_risk, is_delisting_cash
+from tradepartner.execution.reconcile_run import (
+    allowed_of,
+    command_session,
+    frozen_risk,
+    is_delisting_cash,
+)
 from tradepartner.execution.switch import FAULTED_RUN_STATUSES, SwitchState, derive
 from tradepartner.execution.window import window_cadence
 from tradepartner.ingest import MODE as INGEST_MODE
@@ -166,6 +172,7 @@ from tradepartner.store.journal import (
     PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
+    ReconcileBreakRow,
     ReconciliationRow,
     RunWithResult,
     SignalRow,
@@ -300,6 +307,68 @@ class EdgarAge:
 
 
 @dataclass(frozen=True)
+class BreakLine:
+    """One open break for `paper status --book` (#2266 item 12): its id, part
+    kinds, name (broker symbol, else `security_id`), dollar size (None when
+    unpriced), first-seen session, age in sessions at the command's session,
+    cause, state (`open` or `aged`, past the frozen `risk.break_max_age_sessions`)
+    and whether it restricts the name (an open material break on a
+    `security_id`, `breaks.restricted_names`'s rule)."""
+
+    break_id: str
+    kinds: tuple[str, ...]
+    name: str
+    dollar_size: float | None
+    first_seen_session: date
+    age: int
+    cause: str | None
+    state: Literal["open", "aged"]
+    restricted: bool
+
+
+def break_lines(
+    events: Sequence[ReconcileBreakRow], *, session: date, max_age_sessions: int
+) -> tuple[tuple[BreakLine, ...], int]:
+    """The open breaks as `BreakLine`s, in write order of their latest event, and
+    the count of the window's closed breaks. Pure over the window's events."""
+    open_rows = latest_open_breaks(events)
+    open_ids = {e.break_id for e in open_rows}
+    closed = len({e.break_id for e in events} - open_ids)
+    lines = tuple(
+        BreakLine(
+            break_id=e.break_id,
+            kinds=break_kinds(e),
+            name=e.symbol or e.security_id or "?",
+            dollar_size=e.dollar_size,
+            first_seen_session=e.first_seen_session,
+            age=break_age(e.first_seen_session, session),
+            cause=e.cause,
+            state="aged" if is_aged(e, session, max_age_sessions) else "open",
+            restricted=e.material and e.security_id is not None,
+        )
+        for e in open_rows
+    )
+    return lines, closed
+
+
+def _window_breaks(
+    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, now: datetime
+) -> tuple[tuple[BreakLine, ...], int]:
+    """`break_lines` over the window's events known at `now`, aged at the command's
+    session under the window's frozen limit (`ValueError` on an unreadable
+    `frozen_json`)."""
+    assert window.window_id is not None
+    events = [e for e in journal.break_events_for(conn, window.window_id) if e.known_at <= now]
+    if not events:
+        return (), 0
+    return break_lines(
+        events,
+        session=command_session(now),
+        max_age_sessions=frozen_risk(window).break_max_age_sessions,
+    )
+
+
+@dataclass(frozen=True)
 class OpsData:
     """Everything the operations page and `paper status` (T67) show, computed
     once over a read-only connection."""
@@ -335,6 +404,11 @@ class OpsData:
     reconciliation: ReconciliationRow | None = None
     overdue_delisting: tuple[OverdueDelisting, ...] = field(default_factory=tuple)
     edgar_age: EdgarAge | None = None
+    #: The window's open breaks (#2266 item 12, T284) and how many have closed.
+    breaks: tuple[BreakLine, ...] = field(default_factory=tuple)
+    closed_breaks: int = 0
+    #: Why the breaks could not be read (an unreadable `frozen_json`), else None.
+    breaks_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -361,6 +435,11 @@ class BookSummary:
     #: no longer open or whose cadence cannot be read.
     next_rebalance_session: date | None
     last_run_message: str | None = None
+    #: The names an open material break restricts (#2266 item 7): the book still
+    #: trades every other name, so it is not halted (item 12).
+    restricted: tuple[str, ...] = ()
+    #: How many breaks are open in the window, material or not.
+    open_breaks: int = 0
 
 
 def rebalance_traded_today(row: BookSummary, *, now: datetime) -> date | None:
@@ -968,6 +1047,11 @@ def page_data(
     alerts, alerts_capped = _alerts_for_window(conn, window, limit=limit)
     reconciliation = _latest_reconciliation(conn, window_id)
     bounded_known_at = _bounded_known_at(conn, window_id)
+    breaks_error: str | None = None
+    try:
+        open_breaks, closed_breaks = _window_breaks(conn, window, now)
+    except ValueError as exc:
+        open_breaks, closed_breaks, breaks_error = (), 0, str(exc)
 
     as_of = _as_of(
         window,
@@ -1010,6 +1094,9 @@ def page_data(
         reconciliation=reconciliation,
         overdue_delisting=_overdue_delisting(conn, book, window_id),
         edgar_age=edgar_age(conn, settings, now),
+        breaks=open_breaks,
+        closed_breaks=closed_breaks,
+        breaks_error=breaks_error,
     )
 
 
@@ -1171,6 +1258,13 @@ def _summary(
             [latest_run.run.run_id],
         ).fetchone()
         last_run_has_orders = bool(order_exists[0]) if order_exists else False
+    events = [e for e in journal.break_events_for(conn, window_id) if e.known_at <= now]
+    open_rows = latest_open_breaks(events)
+    restricted = tuple(
+        sorted(
+            {e.symbol or e.security_id or "?" for e in open_rows if e.material and e.security_id}
+        )
+    )
     return BookSummary(
         book_id=book,
         window=window,
@@ -1184,6 +1278,8 @@ def _summary(
         last_run_has_orders=last_run_has_orders,
         next_rebalance_session=(_next_rebalance_session(conn, window, now) if is_open else None),
         last_run_message=latest_run.result.message if latest_run and latest_run.result else None,
+        restricted=restricted if is_open else (),
+        open_breaks=len(open_rows) if is_open else 0,
     )
 
 
@@ -1584,8 +1680,25 @@ def _waiting_book(
         report = _waiting_report(conn, window, now)
     except ValueError as exc:
         errors.append(str(exc))
+    breaks: waiting.BreakFacts | None = None
+    try:
+        events = [e for e in journal.break_events_for(conn, window.window_id) if e.known_at <= now]
+        if events:
+            breaks = waiting.BreakFacts(
+                events=tuple(events),
+                session=command_session(now),
+                max_age_sessions=frozen_risk(window).break_max_age_sessions,
+            )
+    except ValueError as exc:
+        errors.append(str(exc))
     return waiting.BookFacts(
-        book_id=book, switch=switch, lag=lag, run=run, report=report, errors=tuple(errors)
+        book_id=book,
+        switch=switch,
+        lag=lag,
+        run=run,
+        report=report,
+        breaks=breaks,
+        errors=tuple(dict.fromkeys(errors)),
     )
 
 

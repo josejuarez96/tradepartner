@@ -2029,6 +2029,9 @@ def _book_first_lines(
             state = "window closed"
         elif row.switch_state.run_in_progress:
             state = "run in progress"
+        elif row.restricted:
+            # #2266 item 12: a book with only breaks trades every other name
+            state = f"trading, restricted in {', '.join(row.restricted)} (not halted)"
         else:
             state = "trading"
         lines.append(f"{row.book_id}: {state}, {_plural(len(mine) + late, 'issue')}")
@@ -2057,6 +2060,10 @@ def _summary_lines(summaries: Sequence[ops.BookSummary], now: datetime) -> list[
             f"next rebalance {_fmt(row.next_rebalance_session)}"
             + ("" if row.next_rebalance_session is None else " (data day; trades the next session)")
         )
+        if row.open_breaks:
+            line += f"; open breaks {row.open_breaks}" + (
+                f" (restricted: {', '.join(row.restricted)})" if row.restricted else ""
+            )
         if traded is not None:
             result = "traded today" if row.last_run_has_orders else "ran today with no orders"
             line += f"; rebalance {traded} {result}"
@@ -2098,6 +2105,24 @@ def _for_book(book: str | None) -> str:
     return "" if book is None else f" for book {book!r}"
 
 
+def _break_lines(data: ops.OpsData) -> list[str]:
+    """`paper status --book`'s "Open breaks" block (#2266 item 12): one line per
+    open break, then the window's closed count; nothing when the window has none."""
+    if data.breaks_error is not None:
+        return [f"open breaks: could not be read ({data.breaks_error})"]
+    if not data.breaks and not data.closed_breaks:
+        return []
+    lines = [f"Open breaks ({len(data.breaks)}; {data.closed_breaks} closed in this window):"]
+    for b in data.breaks:
+        size = "unpriced" if b.dollar_size is None else f"{b.dollar_size:.2f}"
+        lines.append(
+            f"  {b.break_id} {'/'.join(b.kinds)} {b.name}: size {size}; first seen "
+            f"{b.first_seen_session}; age {b.age}; cause {b.cause or '-'}; {b.state}"
+            + ("; restricted" if b.restricted else "")
+        )
+    return lines
+
+
 def _status_lines(
     data: ops.OpsData,
     book: str | None = None,
@@ -2132,6 +2157,7 @@ def _status_lines(
         f"kill switch {switch_text} (causes: {causes})",
         "reconciliation "
         + ("n/a" if recon is None else f"{recon.reconciliation_id} {recon.status} at {recon.at}"),
+        *_break_lines(data),
         *paper_slippage.slippage_report_lines(fill_slippage),
         *(item.line for item in data.overdue_delisting),
         *_edgar_age_lines(data.edgar_age),

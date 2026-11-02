@@ -14,8 +14,11 @@ later session, or a blotter row known after `now`, moves nothing. The readers
 beneath (`ops.performance_data`, `ops.book_summaries`) read their header and
 next-rebalance facts at the same `now` (#2655).
 
-**The status line** is red for a halted book or a missed run, amber for any other
-item waiting on the owner, and "Everything is running normally" otherwise.
+**The status line** is red for a halted book, a missed run or an aged break,
+amber for any other item waiting on the owner (an open break among them), and
+"Everything is running normally" otherwise. A book whose only trouble is breaks
+is not halted (paper spec amendment 2026-10-26, #2266, item 12): its pill says
+"Restricted" while the kill switch is off.
 
 **Data status.** The records counted are the open quarantined filings on the
 latest EDGAR ingest row (`health.last_ingests`, the count `paper`'s health
@@ -83,6 +86,11 @@ _WORDS: Final[dict[str, tuple[str, str, str | None]]] = {
         "The kill switch is on: read the reason, fix what caused it, then resume.",
         None,
     ),
+    "reconcile_break": (
+        "A holding differs from Alpaca",
+        "Trading in that name is restricted; check it in Alpaca, then true it up.",
+        None,
+    ),
     "order_lagging": (
         "An order has not settled",
         "Check the order in Alpaca first; settle it here only if Alpaca no longer knows it.",
@@ -122,6 +130,7 @@ _WORDS: Final[dict[str, tuple[str, str, str | None]]] = {
 #: Most urgent first; `waiting.KIND_ORDER` with delisting cash after the lagging order.
 _URGENCY: Final[tuple[str, ...]] = (
     "kill_switch_engaged",
+    "reconcile_break",
     "order_lagging",
     "overdue_delisting",
     "missed_run",
@@ -136,13 +145,14 @@ _RED_KINDS: Final = frozenset({"kill_switch_engaged", "missed_run"})
 @dataclass(frozen=True)
 class NeedsYou:
     """One "Needs you" item: `action` is text to show (a command to copy or where
-    to look); nothing runs it."""
+    to look); nothing runs it. `aged` marks a break past its frozen age (red)."""
 
     book_id: str
     kind: str
     title: str
     sentence: str
     action: str
+    aged: bool = False
 
 
 @dataclass(frozen=True)
@@ -242,7 +252,18 @@ def _needs_you(
             title = f"{title}: {item.line}" if item.line else title
             step = waiting.shakedown_next_step(item.line)
             sentence = f"{step[:1].upper()}{step[1:]}."
-        out.append(NeedsYou(item.book_id, item.kind, f"{title} ({item.book_id})", sentence, action))
+        if item.aged:
+            title = f"{title}, for too long"
+        out.append(
+            NeedsYou(
+                item.book_id,
+                item.kind,
+                f"{title} ({item.book_id})",
+                sentence,
+                action,
+                aged=item.aged,
+            )
+        )
     for late in overdue:
         title, sentence, fallback = _WORDS["overdue_delisting"]
         out.append(
@@ -267,20 +288,27 @@ def _status(
     upcoming = [s.next_rebalance_session for s in summaries if s.next_rebalance_session]
     nxt = min(upcoming, default=None)
     halted = [s.book_id for s in summaries if s.is_open and s.switch_state.engaged]
-    if halted or any(n.kind in _RED_KINDS for n in needs):
+    if halted or any(n.kind in _RED_KINDS or n.aged for n in needs):
         if halted:
             text = f"{', '.join(halted)} is halted"
         elif any(n.kind == "kill_switch_engaged" for n in needs):
             text = "A book is halted"
-        else:
+        elif any(n.kind == "missed_run" for n in needs):
             text = "A daily run was missed"
+        else:
+            text = "A break has waited too long; trading is restricted, not halted"
         return StatusLine("red", text, clock, nxt)
     if unreadable:
         text = f"Some records could not be read ({', '.join(unreadable)}); trading is not affected"
         return StatusLine("amber", text, clock, nxt)
     if needs:
         word = "item needs" if len(needs) == 1 else "items need"
-        text = f"{len(needs)} {word} a look; trading is not affected"
+        effect = (
+            "trading is restricted in a name, the book is not halted"
+            if any(n.kind == "reconcile_break" for n in needs)
+            else "trading is not affected"
+        )
+        text = f"{len(needs)} {word} a look; {effect}"
         return StatusLine("amber", text, clock, nxt)
     return StatusLine("ok", "Everything is running normally", clock, nxt)
 
@@ -292,6 +320,8 @@ def _pill(summary: ops.BookSummary) -> str:
         return "Closed"
     if summary.last_run_session is None:
         return f"Starts {summary.window.first_rebalance_session:%A}"
+    if summary.restricted:
+        return "Restricted"
     return "Trading"
 
 

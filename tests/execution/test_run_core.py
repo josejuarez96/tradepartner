@@ -1248,6 +1248,86 @@ def test_a_run_on_a_breaks_reconciliation_restricts_the_name_and_ends_ok(
     assert env.broker_methods().count("submit") == 1
 
 
+def _break_alerts(env: Env) -> list[tuple[int | None, str]]:
+    return [
+        (r[0], r[1])
+        for r in env.query(
+            "SELECT run_id, message FROM alerts WHERE kind = 'reconcile_break' ORDER BY alert_id"
+        )
+    ]
+
+
+def test_a_break_opened_in_a_run_is_in_that_runs_one_reconcile_break_alert(
+    env: Env, exits_done: list[object]
+) -> None:
+    """#2266 item 12 (T284): the run reconciles twice and writes one alert, naming
+    the break's id, name, size, age and the true-up line."""
+    window = _marked(env)
+    _hold_spy(env, window)
+    env.fake.activities.append(CashActivity("open-credit", "MA", MON, "executed", 30.0, "SPY"))
+    env.fake._cash += Decimal(30)
+
+    outcome = env.run(_at(TUE))
+
+    assert outcome.status == "ok"
+    ((run_id, message),) = _break_alerts(env)
+    assert run_id == outcome.run_id
+    (break_id,) = env.query("SELECT DISTINCT break_id FROM reconcile_breaks")[0]
+    assert break_id in message and "$30.00" in message and "1 session(s) old" in message
+    assert f"tradepartner paper true-up --book main --break {break_id}" in message
+    assert "AGED" not in message
+
+
+def test_an_aged_break_is_in_the_runs_reconcile_break_alert(
+    env: Env, exits_done: list[object]
+) -> None:
+    """#2266 item 12 / acceptance "Resume and surfaces": a break older than the
+    frozen risk.break_max_age_sessions is named, marked aged, in that run's alert."""
+    from tradepartner.store.journal import ReconcileBreakRow
+
+    window = _marked(env)
+    _hold_spy(env, window)
+    env.fake.activities.append(CashActivity("open-credit", "MA", MON, "executed", 30.0, "SPY"))
+    env.fake._cash += Decimal(30)
+    first_seen = date(2019, 5, 1)  # the 10th session through Tuesday the 14th
+    env.append(
+        ReconcileBreakRow(
+            break_id=f"{window.window_id}:{SPY}:999",
+            window_id=window.window_id,  # type: ignore[arg-type]
+            book_id="main",
+            event="opened",
+            parts_json=json.dumps(
+                [
+                    {
+                        "kind": "name_cash",
+                        "cause": "broker_activity",
+                        "activity_ids": ["open-credit"],
+                        "cash_amount": 30.0,
+                    }
+                ]
+            ),
+            cause="broker_activity",
+            security_id=SPY,
+            symbol="SPY",
+            cash_amount=30.0,
+            dollar_size=30.0,
+            material=True,
+            first_seen_session=first_seen,
+            reconciliation_id=999,
+            known_at=_at(MON, 12),
+            ingested_at=_at(MON, 12),
+        )
+    )
+
+    outcome = env.run(_at(TUE))
+
+    assert outcome.status == "ok"
+    ((run_id, message),) = _break_alerts(env)
+    assert run_id == outcome.run_id
+    assert f"{window.window_id}:{SPY}:999" in message
+    assert "10 session(s) old, AGED past 5" in message
+
+
 def test_an_ok_run_reconciles_twice_and_ends_ok(env: Env, exits_done: list[object]) -> None:
     _marked(env)
     outcome = env.run(_at(TUE))

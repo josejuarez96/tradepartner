@@ -2826,6 +2826,7 @@ def _first_line(
     halt_item: bool = True,
     overdue: int = 0,
     engaged: bool = True,
+    restricted: tuple[str, ...] = (),
 ) -> str:
     """`_book_first_lines` for one book: `others` more waiting items, `overdue`
     delisting-cash items, and a kill-switch item only when `halt_item`."""
@@ -2836,10 +2837,41 @@ def _first_line(
         book_id="main",
         is_open=True,
         switch_state=SimpleNamespace(engaged=engaged, run_in_progress=False),
+        restricted=restricted,
     )
     return cli._book_first_lines(  # type: ignore[arg-type]
         [row], [*([item] if halt_item else []), *more], now, late
     )[0]
+
+
+def test_first_line_says_restricted_not_halted_for_a_book_with_only_breaks() -> None:
+    # #2266 item 12: a book with only breaks is restricted, never "halted"
+    now = datetime(2026, 11, 2, 13, tzinfo=UTC)
+    line = _first_line(None, now, halt_item=False, engaged=False, restricted=("AAPL",))
+    assert line == "main: trading, restricted in AAPL (not halted), 0 issues"
+    halted = _first_line(None, now, halt_item=False, engaged=True, restricted=("AAPL",))
+    assert halted.startswith("main: halted")
+
+
+def test_status_prints_an_open_breaks_block() -> None:
+    line = ops.BreakLine(
+        break_id="1:SEC1:7",
+        kinds=("quantity",),
+        name="AAPL",
+        dollar_size=1234.5,
+        first_seen_session=date(2026, 10, 26),
+        age=6,
+        cause="unattributed",
+        state="aged",
+        restricted=True,
+    )
+    data = ops.OpsData(breaks=(line,), closed_breaks=2)
+    assert cli._break_lines(data) == [
+        "Open breaks (1; 2 closed in this window):",
+        "  1:SEC1:7 quantity AAPL: size 1234.50; first seen 2026-10-26; age 6; "
+        "cause unattributed; aged; restricted",
+    ]
+    assert cli._break_lines(ops.OpsData()) == []
 
 
 def test_first_line_counts_an_overdue_delisting_as_an_issue() -> None:
@@ -2993,6 +3025,8 @@ def test_status_all_hides_phase_notes_but_keeps_other_run_notes() -> None:
         last_run_has_orders=False,
         next_rebalance_session=None,
         last_run_message="paper_phase started=1; check fill; paper_phase finished=2",
+        open_breaks=0,
+        restricted=(),
     )
     assert cli._summary_lines((row,), SESSION_CLOCK)[0].endswith("; check fill")
     row.last_run_message = "paper_phase started=1"
