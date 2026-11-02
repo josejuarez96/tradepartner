@@ -137,8 +137,8 @@ Each thesis also has a **sub-window cell** on the raw reading: entries from 2020
 - **Verdict:**
   - **PASS** if at least one thesis passes. Both theses are declared now, so the result names which one passed, and a pass sends only that thesis on to rung 3 (capacity) and rung 4.
   - **FAIL** if both theses fail a computable cell.
-  - **UNDERPOWERED** (decides nothing, retires nothing) if a thesis has fewer than **2,500 traded events** (section 4: the count at which a true net effect of +30 bp would reach t = 1 with a 1,500 bp sd on raw events, before clustering). Between 2,500 and 10,000, a kill is labelled `killed_low_power`: it rules out net effects well above the floor, not one at it. The registry flag stays what the runner computes, and the label goes in the ledger and the verdict comment.
-  - Two theses give two chances. That is declared, it counts as 2 configurations in the family's N, and the candidate counts once under the limit.
+  - **UNDERPOWERED** (decides nothing, retires nothing) if a thesis has fewer than **2,500 traded events** (deliberately lenient: section 4's 2,500 is *effective* events, about 10,000 traded; below 2,500 traded the SE is above about 60 bp and a kill says almost nothing). Between 2,500 and 10,000, a kill is labelled `killed_low_power`: it rules out net effects well above the floor, not one at it. The registry flag stays what the runner computes, and the label goes in the ledger and the verdict comment.
+  - Two theses give two chances. That is declared, it counts as 4 configurations in the family's N (two theses, each on two windows), and the candidate counts once under the limit.
 - **Reported only, never changing the verdict:**
   - net at 10.6 and 15 bp per side; borrow at 300 bp/yr;
   - the 20-session horizon (B9's), for comparison with the dead idea;
