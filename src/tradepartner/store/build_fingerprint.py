@@ -39,6 +39,7 @@ HASHED_SETTINGS_KEYS = (
     "edgar.statement_tags",
     "edgar.statement_forms",
     "edgar.statement_units",
+    "edgar.statement_fact_units",
     "edgar.filing_events_enabled",
     "edgar.event_forms",
     "edgar.title_fallback",
@@ -123,13 +124,23 @@ def _setting(settings: Settings, key: str) -> Any:
     return value
 
 
+# Keys that enter the hashed payload only when non-empty, so adding the key
+# leaves the hash at defaults byte-identical (#2826, as the statement cache key).
+_HASHED_WHEN_NON_EMPTY = frozenset({"edgar.statement_fact_units"})
+
+
 def build_fingerprint(settings: Settings) -> BuildFingerprint:
     """Hash global build rules and return per-name lists outside the hash."""
+    hashed = {
+        key: _setting(settings, key)
+        for key in HASHED_SETTINGS_KEYS
+        if key not in _HASHED_WHEN_NON_EMPTY or _setting(settings, key)
+    }
     payload = {
         "build_rules": BUILD_RULES_VERSION,
         "cache_versions": {name: getattr(edgar_source, name) for name in CACHE_VERSION_NAMES},
         "schema_version": schema.CURRENT_SCHEMA_VERSION,
-        "settings": {key: _setting(settings, key) for key in HASHED_SETTINGS_KEYS},
+        "settings": hashed,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     return BuildFingerprint(
