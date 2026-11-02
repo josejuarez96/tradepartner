@@ -718,3 +718,81 @@ def test_the_corpus_package_imports_nothing_from_tradepartner_research() -> None
         )
         assert research == [], f"{source.name} imports {research}"
         assert not any(name.startswith("tradepartner.store") for name in imported), source.name
+
+
+# --- a tombstoned miss refuses (plan T362, #2743) ---------------------------
+
+
+def _tombstone_raw(settings: Settings, *, delete: bool, restored: bool = False) -> list[str]:
+    """Index every cached raw file as migrated (`delete`: and remove it), as
+    `archive migrate-cache` leaves the cache; `restored` appends the restore lines."""
+    cache = Path(settings.edgar.cache_dir).resolve()
+    raw = departure_fetch.corpus_dir(settings) / "raw"
+    paths = sorted(p.relative_to(cache).as_posix() for p in raw.rglob("*") if p.is_file())
+    assert paths
+    lines = [{"path": p, "bytes": 1, "sha256": "0" * 64, "mtime_ns": 1, "run": "r"} for p in paths]
+    if restored:
+        lines += [{**line, "op": "restored"} for line in lines]
+    (cache / "_archived").mkdir(exist_ok=True)
+    (cache / "_archived" / "index.jsonl").write_text(
+        "".join(json.dumps(line) + "\n" for line in lines)
+    )
+    if delete:
+        for p in paths:
+            (cache / p).unlink()
+    return paths
+
+
+def test_a_tombstoned_miss_refuses_with_no_request_and_no_output_change(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    first = _run(settings, Router(_routes()), now=LATER)
+    before = first.corpus_path.read_bytes(), first.counts_path.read_bytes()
+    _tombstone_raw(settings, delete=True)
+
+    router = Router({})  # any request fails the test
+    with pytest.raises(departure_fetch.ArchivedCacheMissError) as caught:
+        _run(settings, router, now=LATER)
+
+    assert router.requests == []
+    assert (first.corpus_path.read_bytes(), first.counts_path.read_bytes()) == before
+    assert "archive restore --path corpus/departure-reason/raw" in str(caught.value)
+
+
+def test_a_restored_path_is_fetched_as_before(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _run(settings, Router(_routes()), now=LATER)
+    _tombstone_raw(settings, delete=True, restored=True)
+
+    router = Router(_routes())
+    _run(settings, router, now=LATER)
+
+    assert INDEX_URL in router.urls()
+
+
+def test_an_index_line_with_no_path_is_skipped_not_a_key_error(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _run(settings, Router(_routes()), now=LATER)
+    paths = _tombstone_raw(settings, delete=True)
+    cache = Path(settings.edgar.cache_dir).resolve()
+    with (cache / "_archived" / "index.jsonl").open("a") as f:
+        f.write(json.dumps({"op": "moved"}) + "\n" + json.dumps({"op": "restored"}) + "\n")
+
+    assert departure_fetch._tombstoned(cache) == frozenset(paths)
+
+
+def test_a_stale_index_is_still_refetched_when_its_file_is_present(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    routes = _routes()
+    routes[INDEX_URL] = (200, _index_without(KLX_AMENDMENT))
+    submissions = json.loads(_fixture("submissions_klx_CIK0001738827.json"))
+    for column in submissions["filings"]["recent"].values():
+        del column[0]
+    routes[KLX_SUBMISSIONS_URL] = (200, json.dumps(submissions).encode())
+    _run(settings, Router(routes), now=datetime(2026, 9, 24, 23, tzinfo=UTC))
+    _tombstone_raw(settings, delete=False)  # indexed, but every file is still here
+
+    rerun = Router(_routes())
+    second = _run(settings, rerun)
+
+    assert second.counts.amendment_attached == 1
+    assert KLX_SUBMISSIONS_URL in rerun.urls()

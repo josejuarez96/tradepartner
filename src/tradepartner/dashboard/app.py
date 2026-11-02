@@ -16,10 +16,10 @@ This module is deliberately split into two layers:
   write connection. Only errors raised while *opening* that connection
   are turned into a `StoreUnavailable`; an error raised by whatever the
   caller does with the yielded connection propagates unchanged.
-- `render_app` is the thin Streamlit layer: it opens exactly one
-  connection per render and, if the store is available, renders the
-  selected page *inside* that connection's `with` block, passing the
-  connection to the page so a page never has to open its own.
+- `render_app` is the thin Streamlit layer. Most pages render inside one
+  read-only connection. Data health probes availability, closes that
+  connection, then opens one read-only connection per query and closes it
+  before Python aggregation or drawing.
 
 Navigation is `st.navigation(position="top")` (Streamlit 1.64; an empty-string
 section header puts its pages first, and each other section is a drop-down):
@@ -27,10 +27,10 @@ Home (`home_page`), Research (`research_page`, T83c), Books (`book_page`) and a
 "Details" group holding "Data health" (`health_page`, T21), "Backtest" (T43),
 "Trial registry" (T44), "Operations" (`ops_page`, T69), "Trades", "Performance"
 (`performance_page`, T252) and "Override" (`override_page`, T69b). Each
-`st.Page` runs one closure that does the whole store flow below for its page, so
-the connection is still opened once per render and the selected page draws inside
-it. Home and Books take `(conn, settings)` (T274 routes them once; T275 and T276
-fill in the bodies without editing this module).
+`st.Page` runs one closure that does the store flow below for its page.
+Data health releases its probe before drawing; other pages draw inside the
+read connection. Home and Books take `(conn, settings)` (T274 routes them
+once; T275 and T276 fill in the bodies without editing this module).
 
 **Submit before render (ADR 0011 Decision 2, #273; T69b).** The override page
 is the dashboard's only write, and a DuckDB write connection cannot open
@@ -80,8 +80,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Any, cast
 
 import duckdb
+import polars as pl
 import streamlit as st
 
 from tradepartner.config import Settings, get_settings
@@ -304,8 +306,7 @@ def render_app(settings: Settings | None = None) -> None:
 
 
 def _render_page(settings: Settings, page_name: str, renderer: _PageRenderer) -> None:
-    """Run the store flow for the selected page: one read-only connection, closed
-    when the page has drawn; the unavailable panels replace the page."""
+    """Run the selected page, releasing Data health's probe before its reads."""
     if page_name == _OVERRIDE_PAGE:
         override_page.show_outcome(settings)
 
@@ -319,7 +320,100 @@ def _render_page(settings: Settings, page_name: str, renderer: _PageRenderer) ->
                 render_unreadable(settings, store.detail)
             return
 
-        renderer(store, settings)
+        if page_name != "Data health":
+            renderer(store, settings)
+            return
+
+    steps = _ReadSteps(settings)
+    try:
+        renderer(cast(duckdb.DuckDBPyConnection, steps), settings)
+    except StoreLockedError:
+        render_busy(settings)
+    except _ReadStepUnreadable as exc:
+        render_unreadable(settings, str(exc))
+    finally:
+        steps._close()
+
+
+class _ReadStepUnreadable(Exception):
+    """A Data health read failed while opening the store, before its query."""
+
+
+class _ReadSteps:
+    """DuckDB read cursor that releases the file after each fetched result.
+
+    Registered temporary views are replayed on each connection; the health
+    readers use them for their one-query joins. No connection spans Python
+    aggregation or Streamlit drawing.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._views: dict[str, Any] = {}
+        self._context: Any = None
+        self._conn: duckdb.DuckDBPyConnection | None = None
+
+    def register(self, name: str, value: Any) -> _ReadSteps:
+        self._views[name] = value
+        return self
+
+    def unregister(self, name: str) -> _ReadSteps:
+        self._views.pop(name)
+        return self
+
+    def execute(self, query: str, parameters: Any = None) -> _ReadSteps:
+        self._close()
+        context = open_read_only(self._settings)
+        try:
+            conn = context.__enter__()
+        except StoreLockedError:
+            raise
+        except duckdb.Error as exc:
+            raise _ReadStepUnreadable(str(exc)) from exc
+        self._context, self._conn = context, conn
+        try:
+            for name, value in self._views.items():
+                conn.register(name, value)
+            if parameters is None:
+                conn.execute(query)
+            else:
+                conn.execute(query, parameters)
+        except BaseException:
+            self._close()
+            raise
+        return self
+
+    @property
+    def description(self) -> Any:
+        assert self._conn is not None
+        return self._conn.description
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        assert self._conn is not None
+        try:
+            return self._conn.fetchall()
+        finally:
+            self._close()
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        assert self._conn is not None
+        try:
+            return self._conn.fetchone()
+        finally:
+            self._close()
+
+    def pl(self) -> pl.DataFrame:
+        assert self._conn is not None
+        try:
+            return self._conn.pl()
+        finally:
+            self._close()
+
+    def _close(self) -> None:
+        if self._context is not None:
+            self._context.__exit__(None, None, None)
+            self._context = None
+            self._conn = None
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import json
 import logging
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
+from decimal import Decimal
 from typing import Any, Protocol
 
 import pytest
@@ -17,8 +18,8 @@ from tradepartner.adapters.fake_broker import Expire, FakeBroker, PartialFill, R
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, LimitBreachError
+from tradepartner.execution import reconcile_run, switch
 from tradepartner.execution import resume as resume_module
-from tradepartner.execution import switch
 from tradepartner.execution.collect import collect
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.reconcile_run import reconcile_now
@@ -34,7 +35,9 @@ from tradepartner.store.journal import (
     PaperRunRow,
     PaperWindowRow,
     PositionDailyRow,
+    ReconciliationRow,
     append,
+    break_events_for,
     fill_cursors,
     fills_for,
     kill_switch_events_for,
@@ -113,6 +116,12 @@ def _open_window(settings: Settings, risk: RiskConfig) -> PaperWindowRow:
     )
     (window_id,) = _append(settings, row)
     return replace(row, window_id=window_id)
+
+
+@pytest.fixture(autouse=True)
+def _long_only_book(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These windows name no registered hypothesis; read each as `long_only`."""
+    monkeypatch.setattr(reconcile_run, "_signed_book", lambda conn, window: False)
 
 
 # --- helpers ------------------------------------------------------------------
@@ -594,17 +603,91 @@ def test_resume_is_refused_while_reconciliation_fails_and_the_switch_stays_engag
     fixed_clock: FixedClock,
 ) -> None:
     _engage(journal_settings, window, fixed_clock)
-    fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))
-    fake.simulate_fill("owner-1")  # a position the ledger lacks
+    fake._cash += Decimal(50)  # cash the ledger cannot place on any name: book-level
 
     outcome = _resume(journal_settings, fake, fixed_clock)
 
     assert outcome.status == REFUSED
-    assert any("broker_only_position" in r for r in outcome.reasons)
+    assert any("cash" in r for r in outcome.reasons)
     assert _engaged(journal_settings, window)
     with open_read_only(journal_settings) as conn:
         (row,) = reconciliations_for(conn, window.window_id)  # type: ignore[arg-type]
     assert row.status == "mismatch"
+
+
+def test_resume_releases_on_a_breaks_reconciliation(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """T282d, #2266 item 10: a `breaks` reconciliation is a release's base, as `ok`
+    is. The name it restricts stays restricted; the break stays open."""
+    _engage(journal_settings, window, fixed_clock)
+    fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))
+    fake.simulate_fill("owner-1")  # a position the ledger lacks: a name-level break
+    fake._cash += Decimal(PRICE)  # paid for by the owner, outside the ledger
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    assert not _engaged(journal_settings, window)
+    with open_read_only(journal_settings) as conn:
+        (row,) = reconciliations_for(conn, window.window_id)  # type: ignore[arg-type]
+        events = break_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert row.status == "breaks" and row.reconciliation_id == outcome.reconciliation_id
+    assert [(e.event, e.security_id) for e in events] == [("opened", SPY)]
+
+
+def test_resume_is_refused_while_the_break_cap_halts_the_book(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    fixed_clock: FixedClock,
+) -> None:
+    """`break_cap` is a book-level `mismatch`: the resume stays refused."""
+    capped = _open_window(journal_settings, FROZEN.model_copy(update={"max_open_breaks": 0}))
+    _engage(journal_settings, capped, fixed_clock)
+    fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))
+    fake.simulate_fill("owner-1")
+    fake._cash += Decimal(PRICE)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("break_cap" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, capped)
+
+
+def test_the_release_guard_refuses_a_breaks_row_with_no_base_cash(
+    journal_settings: Settings,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """`switch.release` reads `breaks` as reconciled only with its `broker_cash`
+    (T282b): a row from before that stated no base."""
+    _engage(journal_settings, window, fixed_clock)
+    (reconciliation_id,) = _append(
+        journal_settings,
+        ReconciliationRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            at=DAY1,
+            status="breaks",
+            broker_cash=None,
+            known_at=DAY1,
+            ingested_at=DAY1,
+        ),
+    )
+
+    with pytest.raises(switch.ReleaseRefused, match="breaks with a base cash"):
+        switch.release(
+            journal_settings,
+            fixed_clock,
+            window_id=window.window_id,  # type: ignore[arg-type]
+            resume_id=1,
+            reconciliation_id=reconciliation_id,  # type: ignore[arg-type]
+            peak_equity=100_000.0,
+            seen_event_id=0,
+        )
 
 
 def test_resume_is_refused_after_an_all_rejected_run_and_the_switch_stays_engaged(
@@ -1059,8 +1142,7 @@ def test_a_mismatch_found_with_nothing_engaged_engages_the_switch(
     window: PaperWindowRow,
     fixed_clock: FixedClock,
 ) -> None:
-    fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))
-    fake.simulate_fill("owner-1")
+    fake._cash += Decimal(50)
     assert not _engaged(journal_settings, window)
 
     assert _resume(journal_settings, fake, fixed_clock).status == REFUSED

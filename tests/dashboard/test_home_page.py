@@ -21,7 +21,7 @@ from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import Settings
 from tradepartner.dashboard import home_page
-from tradepartner.execution import home_view, ops
+from tradepartner.execution import book_activity, home_view, ops
 from tradepartner.execution.home_view import (
     BookCard,
     DataStatus,
@@ -121,7 +121,9 @@ def _app(
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Home")
     if view is not None:
         monkeypatch.setattr(home_view, "build", lambda conn, settings, now: view)
-    monkeypatch.setattr(ops, "performance_data", lambda conn, settings, book_id=None: _perf())
+    monkeypatch.setattr(
+        ops, "performance_data", lambda conn, settings, book_id=None, *, now: _perf()
+    )
     at = AppTest.from_file(_APP_PATH, default_timeout=30)
     at.run()
     assert not at.exception
@@ -136,7 +138,7 @@ def _text(at: AppTest) -> str:
         for child in getattr(node, "children", {}).values():
             if child.type == "metric":
                 parts.append(f"{child.label} {child.value}")
-            elif child.type in ("markdown", "caption", "subheader", "header", "code"):
+            elif child.type in ("markdown", "caption", "subheader", "header", "code", "warning"):
                 parts.append(str(child.value))
             elif child.type == "page_link":
                 parts.append(str(child.proto.label))
@@ -144,6 +146,27 @@ def _text(at: AppTest) -> str:
 
     walk(at.main)
     return "\n".join(parts)
+
+
+def test_version_37_store_shows_journal_outdated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    at = _app(monkeypatch, tmp_path, view=None)
+    path = tmp_path / "home.duckdb"
+    with open_for_write(Settings(_env_file=None, store={"path": str(path)})) as conn:
+        for column in ("n_assets_intersected", "assets_intersection_skipped"):
+            conn.execute(f"ALTER TABLE paper_plans DROP COLUMN {column}")
+        conn.execute("UPDATE schema_version SET version = 37")
+
+    def outdated(conn: object, settings: Settings, now: datetime) -> HomeView:
+        book_activity.today(conn, 1, _D2, now, limit=5)  # type: ignore[arg-type]
+        raise AssertionError("expected outdated journal")
+
+    monkeypatch.setattr(home_view, "build", outdated)
+    at.run(timeout=30)
+    assert not at.exception
+    assert "journal outdated" in _text(at).lower()
+    assert "paper plans require schema version" in _text(at)
 
 
 def _positions(at: AppTest, *needles: str) -> list[int]:
@@ -169,6 +192,16 @@ def test_quiet_page_says_nothing_needs_you_and_uses_no_orange(
     assert "Nothing needs you." in [m.value for m in at.markdown]
     assert not at.code
     assert "orange" not in _text(at)
+
+
+def test_home_page_shows_owner_note_and_omits_empty_run_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    card = replace(_QUIET.books[0], last_run_message="check fill")
+    at = _app(monkeypatch, tmp_path, replace(_QUIET, books=(card,)))
+    assert "Last run: check fill" in _text(at)
+    at = _app(monkeypatch, tmp_path, replace(_QUIET, books=(replace(card, last_run_message=None),)))
+    assert "Last run:" not in _text(at)
 
 
 def test_loud_page_shows_each_item_in_orange_with_its_command_as_copyable_text(

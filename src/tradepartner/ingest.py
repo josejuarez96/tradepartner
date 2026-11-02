@@ -206,21 +206,41 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hashlib
 import json
+import logging
 import re
+import resource
+import sys
 import time
 import traceback
 import uuid
 from bisect import bisect_left, bisect_right
-from collections import defaultdict
-from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence, Sized
+from collections import Counter, defaultdict
+from collections.abc import (
+    Callable,
+    Collection,
+    Container,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+    Sized,
+)
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from functools import partial
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from tradepartner.adapters.edgar_raw import FetchedXml
+    from tradepartner.adapters.edgar_source import EdgarFilingSource
 
 import duckdb
 import pyarrow as pa
@@ -233,7 +253,12 @@ from tradepartner.adapters.borrow import (
     parse_assets,
     snapshot_rows,
 )
-from tradepartner.adapters.edgar import StatementConflict, duration_class
+from tradepartner.adapters.edgar import (
+    SEC_FORMS_PARSER_VERSION,
+    Form4Transaction,
+    StatementConflict,
+    duration_class,
+)
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverPage,
@@ -244,7 +269,46 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    SecFormFiling,
     StatementFactRecord,
+)
+from tradepartner.adapters.form4_archive import (
+    BULK_SOURCE,
+    PROVENANCE_KEY,
+    XML_SOURCE,
+    RawInput,
+    build_manifest,
+    manifest_entry,
+    message_digest,
+    parse_manifest,
+    prior_xml_hashes,
+    quarter_message,
+    recheck_verdict,
+    rechecked_against,
+    zip_changed,
+)
+from tradepartner.adapters.form4_bulk_route import (
+    BULK_READER_VERSION,
+    BulkRouteResult,
+    Form4IndexRow,
+    RequestBudgetStopped,
+    insider_zip_fetch,
+    insider_zip_path,
+    load_bulk_quarters,
+    order_check_path,
+    request_budget,
+    run_form4_bulk_route,
+)
+from tradepartner.adapters.form4_route import (
+    Quarter,
+    QuarterState,
+    RequestCounts,
+    Route,
+    plan_requests,
+    quarter_of,
+    quarter_state,
+    route_accession,
+    rows_agree,
 )
 from tradepartner.adapters.openfigi import FigiType, parse_mapping
 from tradepartner.adapters.openfigi_raw import map_tickers
@@ -269,7 +333,10 @@ from tradepartner.calendar import (
     previous_session,
 )
 from tradepartner.config import Settings, clean_message
+from tradepartner.diskfloor import ingest_floor_refusal
 from tradepartner.gap import stale_listings_at
+from tradepartner.store import filing_index as stored_index
+from tradepartner.store import raw_archive
 from tradepartner.store.asof import ASSETS_SOURCE, _validate_t
 from tradepartner.store.classify import (
     ClassificationBuild,
@@ -291,6 +358,7 @@ from tradepartner.store.delistings import (
     build_delistings,
     listing_ends_as_of,
 )
+from tradepartner.store.filing_index import snapshot_id as index_snapshot_id
 from tradepartner.store.master import (
     ChainCandidate,
     MasterBuild,
@@ -298,10 +366,11 @@ from tradepartner.store.master import (
     build_master,
     chain_candidates,
     primary_security_id,
+    record_snapshot_sightings,
     securities_as_of,
     security_cik,
     session_of,
-    stored_snapshot_fetches,
+    stored_snapshot_history,
 )
 from tradepartner.store.master import (
     _held_ids as _master_held_ids,
@@ -317,10 +386,27 @@ from tradepartner.store.restamp_precheck import (
     read_instants,
     window_first_session,
 )
-from tradepartner.store.retraction import record_underived, split_kept, stored_underived
-from tradepartner.store.schema import init_schema
+from tradepartner.store.retraction import (
+    carry_forward_underived,
+    record_underived,
+    split_kept,
+    stored_underived,
+    underived_as_of,
+)
+from tradepartner.store.schema import atomic, init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT, member_links_title
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def show_ingest_progress() -> None:
+    """Print this module's progress messages (the Form 4 bulk route's, #2681) to stderr."""
+    if not _LOGGER.handlers:
+        _LOGGER.addHandler(logging.StreamHandler())
+    _LOGGER.setLevel(logging.INFO)
+    _LOGGER.propagate = False
+
 
 OK, STALE, FAILED, LOCKED = "ok", "stale", "failed", "locked"
 ACTIONS_FILLED = "filled"
@@ -531,6 +617,10 @@ class IngestResult:
 
 class _Stale(Exception):
     """The source is stale (spec req 10); its chunk is rolled back."""
+
+
+class _IndexConflict(Exception):
+    """The index snapshot changed between the fetch pass and writer lock."""
 
 
 class _DryRun(Exception):
@@ -754,6 +844,7 @@ def ingest_session(
     rebuild_statement_facts: bool = False,
     rebuild_filing_events: bool = False,
     rebuild_classifications: bool = False,
+    rebuild_index: bool = False,
     restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
     restamp_window_ok: WindowEarlierOk | None = None,
@@ -788,6 +879,15 @@ def ingest_session(
     written for it."""
     if restamp is not None and source != "edgar":
         raise ValueError("restamp needs the edgar source")
+    if rebuild_index and source != "edgar":
+        raise ValueError("rebuild_index needs the edgar source")
+    if rebuild_index and (
+        rebuild_statement_facts
+        or rebuild_filing_events
+        or rebuild_classifications
+        or restamp is not None
+    ):
+        raise ValueError("rebuild_index cannot be combined with other rebuild or restamp flags")
     if restamp_window_ok is not None and restamp is None:
         raise ValueError("restamp_window_ok needs restamp")
     if source not in ("all", *SOURCES, ASSETS_SOURCE):
@@ -816,28 +916,63 @@ def ingest_session(
         raise ValueError("rebuild_filing_events needs the edgar source")
     if rebuild_classifications and source == "alpaca":
         raise ValueError("rebuild_classifications needs the edgar source")
+    if rebuild_index:
+        return _rebuild_index_session(
+            settings, filings, clock=clock, dry_run=dry_run, prices=prices
+        )
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     cursor = expected_session(now, settings).isoformat()
     recorded = _Recorded(filings)
+    indexed = settings.edgar.incremental_index and not (
+        rebuild_index
+        or rebuild_statement_facts
+        or rebuild_filing_events
+        or rebuild_classifications
+        or restamp is not None
+    )
+    index_batches: dict[str, _IndexBatch] = {}
     work: dict[str, Callable[[duckdb.DuckDBPyConnection, str], tuple[int, str]]] = {
-        "edgar": lambda conn, run_id: _ingest_filings(
-            conn,
-            settings,
-            recorded,
-            clock,
-            run_id,
-            rebuild_statement_facts=rebuild_statement_facts,
-            rebuild_filing_events=rebuild_filing_events,
-            rebuild_classifications=rebuild_classifications,
-            restamp=restamp,
-            on_restamp=on_restamp,
-            restamp_window_ok=restamp_window_ok,
+        "edgar": lambda conn, run_id: (
+            _write_indexed_filings(
+                conn,
+                settings,
+                recorded,
+                index_batches["edgar"],
+                clock,
+                run_id,
+                rebuild_statement_facts=rebuild_statement_facts,
+                rebuild_filing_events=rebuild_filing_events,
+                rebuild_classifications=rebuild_classifications,
+                restamp=restamp,
+                on_restamp=on_restamp,
+                restamp_window_ok=restamp_window_ok,
+            )
+            if indexed
+            else _ingest_filings(
+                conn,
+                settings,
+                recorded,
+                clock,
+                run_id,
+                rebuild_statement_facts=rebuild_statement_facts,
+                rebuild_filing_events=rebuild_filing_events,
+                rebuild_classifications=rebuild_classifications,
+                restamp=restamp,
+                on_restamp=on_restamp,
+                restamp_window_ok=restamp_window_ok,
+            )
         ),
         "alpaca": lambda conn, _run_id: _write_prices(conn, fetched["alpaca"]),
     }
     fetched: dict[str, _PriceFetch] = {}
     prepare: dict[str, Callable[[], object] | None] = {
-        "edgar": lambda: _prefetch(recorded, settings, dry_run=dry_run),
+        "edgar": lambda: (
+            index_batches.update(
+                edgar=_prepare_indexed_filings(settings, recorded, clock, dry_run=dry_run)
+            )
+            if indexed
+            else _prefetch(recorded, settings, dry_run=dry_run)
+        ),
         "alpaca": lambda: fetched.update(alpaca=_fetch_prices(settings, prices, now, clock)),
     }
     # T11h: `record_failures` (the failure policy's after-commit hook), edgar
@@ -875,18 +1010,26 @@ def ingest_session(
 
     runs: list[SourceRun] = []
     for name in ("edgar", "alpaca") if source == "all" else (source,):
-        run = _run_source(
-            name,
-            work[name],
-            settings,
-            now,
-            clock,
-            cursor,
-            dry_run,
-            prepare=prepare[name],
-            after_commit=after_commit[name],
-            recover=recover_alpaca if name == "alpaca" else None,
-        )
+        try:
+            run = _run_source(
+                name,
+                work[name],
+                settings,
+                now,
+                clock,
+                cursor,
+                dry_run,
+                prepare=prepare[name],
+                after_commit=after_commit[name],
+                recover=recover_alpaca if name == "alpaca" else None,
+            )
+        finally:
+            if name == "edgar":
+                # #2822: the write step's reopened index handle ends with the
+                # chunk, so the alpaca chunk's read-only price read can open.
+                release = getattr(_unwrap(filings), "release_index", None)
+                if callable(release):
+                    release()
         runs.append(run)
         if run.status == LOCKED:  # the store, not the source: the next would wait out the same lock
             break
@@ -1009,6 +1152,11 @@ def ingest_actions_backfill(
     return IngestResult(tuple(runs))
 
 
+_FORM4_BACKFILL: ContextVar[bool] = ContextVar("form4_backfill", default=False)
+#: Set while a dry-run chunk's `work` runs, so the Form 4 recorder keeps nothing (T348).
+_DRY_RUN: ContextVar[bool] = ContextVar("dry_run", default=False)
+
+
 def _run_source(
     name: str,
     work: Callable[[duckdb.DuckDBPyConnection, str], tuple[int, str]],
@@ -1041,7 +1189,13 @@ def _run_source(
             prepare()
         with open_for_write(settings) as conn:
             init_schema(conn)
-            rows, message = work(conn, run_id)
+            token = _FORM4_BACKFILL.set(mode == "backfill" and name == "edgar")
+            dry_token = _DRY_RUN.set(dry_run)
+            try:
+                rows, message = work(conn, run_id)
+            finally:
+                _DRY_RUN.reset(dry_token)
+                _FORM4_BACKFILL.reset(token)
             if dry_run:
                 raise _DryRun(rows, message)
             run = outcome(success_status, rows, message)
@@ -1050,6 +1204,10 @@ def _run_source(
         return outcome(success_status, dry.rows, f"dry run: {dry}")
     except StoreLockedError as exc:
         return outcome(LOCKED, 0, str(exc))
+    except _IndexConflict as exc:
+        # The snapshot may have been replaced by another writer. Do not add a
+        # failure row that itself changes the version or masks the replacement.
+        return outcome(FAILED, 0, str(exc))
     except _Stale as exc:
         run = outcome(STALE, 0, str(exc))
         return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
@@ -1155,7 +1313,7 @@ def _with_frames(message: str, exc: BaseException, settings: Settings) -> str:
 _clean = clean_message
 
 
-def _write_run(
+def write_run(
     conn: duckdb.DuckDBPyConnection,
     run_id: str,
     started_at: datetime,
@@ -1163,6 +1321,7 @@ def _write_run(
     run: SourceRun,
     mode: str = MODE,
 ) -> None:
+    """Record one source run on the caller's store connection."""
     insert_row(
         conn,
         "ingestion_runs",
@@ -1178,6 +1337,9 @@ def _write_run(
             "message": run.message,
         },
     )
+
+
+_write_run: Callable[..., None] = write_run
 
 
 # --- the EDGAR chunk --------------------------------------------------------
@@ -1198,8 +1360,12 @@ class _Recorded(FilingSource):
         self._statement_filled: set[str] = set()  # #660: which CIKs, never the records
         self._events_asked: set[str] = set()  # #1358: which CIKs, never the records
         self.frozen = False
+        self.sec_subjects: frozenset[str] = frozenset()
+        self.sec_forms_subjects: frozenset[str] = frozenset()
         #: CIKs whose filename answer is partial (#1597, T184b), read at the fetch pass.
         self.filename_incomplete_ciks: set[str] = set()
+        self.limited_ciks: frozenset[str] | None = None
+        self.benchmark_tickers: frozenset[str] = frozenset()
 
     def _ask(self, method: str, *args: Any) -> Any:
         key = (method, *(tuple(a) if isinstance(a, list) else a for a in args))
@@ -1210,10 +1376,37 @@ class _Recorded(FilingSource):
         return self._answers[key]
 
     def filing_index(self, since: datetime | None = None) -> list[FilingIndexEntry]:
+        if self.limited_ciks is not None:
+            rows = [
+                entry
+                for cik in sorted(self.limited_ciks)
+                for entry in self.filing_index_for_cik(cik)
+                if since is None or entry.accepted_at >= since
+            ]
+            return sorted(rows, key=lambda e: (e.accepted_at, e.accession, e.cik))
         return list(self._ask("filing_index", since))
 
+    def filing_index_for_cik(self, cik: str) -> list[FilingIndexEntry]:
+        """Keep the source's bounded CIK query through the fetch-pass recorder."""
+        if callable(getattr(self._source, "filing_index_for_cik", None)):
+            return list(self._ask("filing_index_for_cik", cik))
+        return [entry for entry in self._ask("filing_index", None) if entry.cik == cik]
+
+    def filing_index_for_forms(self, forms: Collection[str]) -> list[FilingIndexEntry]:
+        """Keep cross-CIK form queries bounded and deterministic."""
+        if callable(getattr(self._source, "filing_index_for_forms", None)):
+            return list(self._ask("filing_index_for_forms", tuple(sorted(forms))))
+        return [entry for entry in self._ask("filing_index", None) if entry.form in forms]
+
     def companies_snapshot(self) -> list[CompanySnapshotEntry]:
-        return list(self._ask("companies_snapshot"))
+        rows = list(self._ask("companies_snapshot"))
+        if self.limited_ciks is not None:
+            rows = [
+                row
+                for row in rows
+                if row.cik in self.limited_ciks or row.ticker in self.benchmark_tickers
+            ]
+        return rows
 
     def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
         return list(self._ask("facts", cik, list(names)))
@@ -1225,7 +1418,12 @@ class _Recorded(FilingSource):
         return list(self._ask("cover_pages", cik))
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
-        return list(self._ask("delistings", since))
+        rows = list(self._ask("delistings", since))
+        return (
+            [row for row in rows if row.cik in self.limited_ciks]
+            if self.limited_ciks is not None
+            else rows
+        )
 
     def filename_listings(self, cik: str) -> list[FilenameListing]:
         """Record the CIK's filename evidence in the fetch pass, before the lock."""
@@ -1267,6 +1465,10 @@ class _Recorded(FilingSource):
             return records
         return self._source.filing_events(cik)
 
+    def sec_forms_13d(self, subjects: frozenset[str] | None = None) -> list[SecFormFiling]:
+        """Record the 13D discovery before the store write lock is acquired."""
+        return list(self._ask("sec_forms_13d", subjects))
+
 
 def _unwrap(filings: FilingSource) -> FilingSource:
     """The adapter under any number of `_Recorded` wrappers (T17's fetch
@@ -1307,7 +1509,8 @@ def _unjudged_ciks(filings: FilingSource) -> Unjudged:
 
 
 def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None:
-    """The fetch pass: every filing question, with no store connection open;
+    """The fetch pass: snapshot existing SEC subject CIKs, then ask every
+    filing question with no store connection open;
     then `check_failures()` (T11h), if the source under `recorded` has one,
     before the lock; then `recorded` answers only from what it holds.
 
@@ -1328,8 +1531,1475 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None
     later step can fail because an input was treated as absent), the gate
     still fails the run with the full list and names that error, so the
     error never hides the list."""
-    _fetch_and_gate(recorded, settings)
+    if settings.events.sec_forms_enabled and Path(settings.store.path).exists():
+        with open_read_only(settings, retry=True) as conn:
+            recorded.sec_subjects = frozenset(
+                cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+            )
+    try:
+        _fetch_and_gate(recorded, settings)
+    finally:
+        # A full repair's index handle (#2822): no store handle outlives the pass.
+        release = getattr(_unwrap(recorded), "release_index", None)
+        if callable(release):
+            release()
+    _check_source_failures(_unwrap(recorded), dry_run=dry_run)
+    recorded.frozen = True
+
+
+def _index_gate(settings: Settings) -> None:
+    """Refuse an incremental read until an ok seed matches today's build rules."""
+    if not Path(settings.store.path).exists():
+        raise ValueError("EDGAR index has no completed seed; run --rebuild-index")
+    with open_read_only(settings, retry=True) as conn:
+        _index_gate_conn(conn, settings)
+
+
+def _index_gate_conn(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    """The same fingerprint predicate, usable again under the writer lock."""
+    from tradepartner.store.build_fingerprint import build_fingerprint
+
+    if index_snapshot_id(conn) is None:
+        raise ValueError("EDGAR index has no completed seed; run --rebuild-index")
+    row = conn.execute(
+        "SELECT message, rowid FROM ingestion_runs WHERE source = 'edgar_index' "
+        "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
+    ).fetchone()
+    partial = conn.execute(
+        "SELECT max(rowid) FROM ingestion_runs WHERE source = 'edgar_index' "
+        "AND mode = 'rebuild_index' AND status = 'partial'"
+    ).fetchone()
+    fingerprint = build_fingerprint(settings).hash
+    if (
+        row is None
+        or f"rule_fingerprint: {fingerprint}" not in str(row[0])
+        or (partial is not None and partial[0] is not None and partial[0] > row[1])
+    ):
+        raise ValueError("EDGAR index rules changed or seed incomplete; run --rebuild-index")
+
+
+@dataclass(frozen=True)
+class _IndexBatch:
+    """A fetched index proposal and the store version it was based on."""
+
+    snapshot: str | None
+    writer_version: int | None
+    proposal: Any
+    files: tuple[tuple[str, datetime, int, str], ...]
+    issuer_ciks: frozenset[str] = frozenset()
+    touched: frozenset[str] = frozenset()
+    rotation: frozenset[str] = frozenset()
+    rotation_recorded: Any = None
+    snapshot_values: Mapping[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
+    touch_cursor: Mapping[str, Any] = field(default_factory=dict)
+    #: The writer's daily index recorder (plan T347); `None` with the archive off.
+    provenance: _IndexProvenance | None = None
+
+
+_DAILY_LINE = re.compile(rb"\b(\d{8})\s+edgar/data/(\d+)/([\d-]+)\.txt")
+
+
+def _daily_listed(body: bytes) -> frozenset[tuple[str, str, str]]:
+    """The (CIK without zeros, accession, YYYYMMDD filed date) a daily body lists."""
+    return frozenset(
+        (cik.decode(), accession.decode(), filed.decode())
+        for filed, cik, accession in _DAILY_LINE.findall(body)
+    )
+
+
+class _IndexProvenance:
+    """One `edgar_index` writer run's daily index retention and manifest (plan
+    T347; spec amendment #2714 item 1).
+
+    `keep` is the adapter's `daily_index_keeper`: it archives each daily file's
+    cached body by SHA-256 before it is parsed, so a refused archive write fails
+    the run before any derived row. A file whose body changes within the run is
+    refused (rerun). The archive is write-only here: nothing reads it back.
+    `finish`, under the writer's lock, enters every kept file and the
+    `filing_index` rows each wrote, archives the manifest and fixes its digest
+    before the run row cites it. A written row is entered under the daily file
+    its `listed_on` names only if that body lists it (CIK, accession, filed
+    date): a body kept this run, or, for a pending row stamped now, the cached
+    body whose hash the store recorded and the archive holds. Any other row
+    (a quarterly `form.idx` row, ADR 0028's snapshot exception, or a pending
+    row first listed there) is left out and counted `index_unattributed`, so a
+    re-derive refuses it. A dry run keeps and writes nothing and its message
+    names no digest."""
+
+    def __init__(self, settings: Settings, *, dry_run: bool) -> None:
+        self.settings = settings
+        self.dry_run = dry_run
+        self.kept: dict[str, RawInput] = {}
+        #: Each kept body's listed (CIK, accession, filed date), to check attribution.
+        self.listed: dict[str, frozenset[tuple[str, str, str]]] = {}
+        self.before: set[tuple[Any, ...]] = set()
+        self.digest: str | None = None
+        self.unattributed = 0
+
+    @classmethod
+    def start(cls, settings: Settings, *, dry_run: bool) -> _IndexProvenance | None:
+        """A recorder, or `None` with the archive off."""
+        return cls(settings, dry_run=dry_run) if raw_archive.archive_on(settings) else None
+
+    def keep(self, file: Any, path: Path, body: bytes) -> None:
+        """Archive one daily file's body before it is parsed."""
+        from tradepartner.adapters import edgar_raw
+        from tradepartner.adapters.daily_index import DAILY_PARSER_VERSION
+
+        sha256 = hashlib.sha256(body).hexdigest()
+        held = self.kept.get(file.path)
+        if held is not None:
+            if held.sha256 != sha256:
+                raise RuntimeError(f"daily index {file.name} changed while it was read; rerun")
+            return
+        if not self.dry_run:
+            raw_archive.archive_body(self.settings, body)
+        url, fetched_at = edgar_raw.daily_index_fetch(path, sha256)
+        self.kept[file.path] = RawInput(sha256, url, fetched_at, DAILY_PARSER_VERSION)
+        self.listed[file.path] = _daily_listed(body)
+
+    @staticmethod
+    def _rows(conn: duckdb.DuckDBPyConnection, listings: Sequence[Any]) -> list[dict[str, Any]]:
+        """The stored `filing_index` rows of the daily listings' accessions."""
+        import pyarrow as pa
+
+        keys = sorted({(r.cik, r.accession) for r in listings if r.is_daily})
+        if not keys:
+            return []
+        conn.register(
+            "_t347_keys", pa.Table.from_pylist([{"cik": c, "accession": a} for c, a in keys])
+        )
+        try:
+            cursor = conn.execute(
+                "SELECT f.* FROM filing_index f JOIN _t347_keys k "
+                "ON f.cik = k.cik AND f.accession = k.accession"
+            )
+            columns = [item[0] for item in cursor.description]
+            return [dict(zip(columns, values, strict=True)) for values in cursor.fetchall()]
+        finally:
+            conn.unregister("_t347_keys")
+
+    def mark(self, conn: duckdb.DuckDBPyConnection, listings: Sequence[Any]) -> None:
+        """Note the stored keys before the insert, so `finish` sees what it wrote."""
+        rows = self._rows(conn, listings)
+        self.before = {(r["cik"], r["accession"], r["known_at"]) for r in rows}
+
+    def _earlier(self, conn: duckdb.DuckDBPyConnection, path: str) -> RawInput | None:
+        """The body an earlier run read for `path`: its stored hash, if the local
+        cache still holds those bytes and the archive holds that hash (a stat,
+        never a read). Notes what it lists; `None` if any part is missing."""
+        from tradepartner.adapters import daily_index as di
+        from tradepartner.adapters import edgar_raw
+
+        stored = conn.execute("SELECT sha256 FROM edgar_index_files WHERE path = ?", [path])
+        found = stored.fetchone()
+        day = di.file_date(path.rsplit("/", 1)[-1])
+        cached = edgar_raw.daily_index_file_path(
+            day.year, (day.month - 1) // 3 + 1, path.rsplit("/", 1)[-1], settings=self.settings
+        )
+        if found is None or not cached.is_file():
+            return None
+        body = cached.read_bytes()
+        if hashlib.sha256(body).hexdigest() != found[0]:
+            return None
+        if not self.dry_run and not raw_archive.is_archived(self.settings, found[0]):
+            return None
+        self.listed[path] = _daily_listed(body)
+        url, fetched_at = edgar_raw.daily_index_fetch(cached, found[0])
+        return RawInput(found[0], url, fetched_at, di.DAILY_PARSER_VERSION)
+
+    def finish(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        listings: Sequence[Any],
+        files: Sequence[tuple[str, datetime, int, str]],
+        *,
+        run_id: str,
+        mode: str,
+    ) -> str:
+        """Write the run's manifest once and return its digest."""
+        from tradepartner.adapters import daily_index as di
+
+        recorded = {path: digest for path, _modified, _size, digest in files}
+        for path, raw in self.kept.items():
+            if recorded.get(path, raw.sha256) != raw.sha256:
+                raise RuntimeError(f"daily index {path} changed after it was kept; rerun")
+        daily = {(r.cik, r.accession, r.listed_on) for r in listings if r.is_daily}
+        by_path: dict[str, list[dict[str, Any]]] = {path: [] for path in self.kept}
+        earlier: dict[str, RawInput | None] = {}
+        self.unattributed = 0
+        for row in self._rows(conn, listings):
+            if (row["cik"], row["accession"], row["known_at"]) in self.before:
+                continue
+            if (row["cik"], row["accession"], row["listed_on"]) not in daily:
+                continue  # a quarterly form.idx row: the snapshot exception
+            path = di.daily_path(row["listed_on"])
+            if path not in self.kept and path not in earlier:
+                earlier[path] = self._earlier(conn, path)
+            listed = (str(int(row["cik"])), row["accession"], f"{row['filed_on']:%Y%m%d}")
+            if (path in self.kept or earlier[path] is not None) and listed in self.listed[path]:
+                by_path.setdefault(path, []).append(row)
+            else:
+                self.unattributed += 1
+        entries = []
+        for path, rows in sorted(by_path.items()):
+            source_raw = self.kept.get(path) or earlier[path]
+            assert source_raw is not None
+            entries.append(
+                di.index_entry(path=path, raw=source_raw, parsed=path in self.kept, rows=rows)
+            )
+        body = di.build_index_manifest(run_id=run_id, mode=mode, entries=entries)
+        if self.dry_run:
+            self.digest = None
+        else:
+            self.digest = raw_archive.archive_manifest(self.settings, body).sha256
+        return self.digest or ""
+
+
+def _index_quarters(first_year: int, now: datetime) -> tuple[tuple[int, int], ...]:
+    eastern = now.astimezone(ZoneInfo("America/New_York"))
+    return tuple(
+        (year, quarter)
+        for year in range(first_year, eastern.year + 1)
+        for quarter in range(1, 5)
+        if (year, quarter) <= (eastern.year, (eastern.month - 1) // 3 + 1)
+    )
+
+
+class _BufferedIndexCursor:
+    """Results copied out of a short store read before any source fetch runs."""
+
+    def __init__(self, rows: list[tuple[Any, ...]], description: Any) -> None:
+        self._rows = rows
+        self.description = description
+        self._position = 0
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        rows = self._rows[self._position :]
+        self._position = len(self._rows)
+        return rows
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        if self._position >= len(self._rows):
+            return None
+        row = self._rows[self._position]
+        self._position += 1
+        return row
+
+
+class _IndexReadProxy:
+    """The T323a reader's connection interface, one bounded read per query."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    def execute(self, sql: str, params: Sequence[object] | None = None) -> _BufferedIndexCursor:
+        with open_read_only(self._settings, retry=True) as conn:
+            cursor = conn.execute(sql, params or [])
+            return _BufferedIndexCursor(cursor.fetchall(), cursor.description)
+
+
+def _writer_version(conn: duckdb.DuckDBPyConnection) -> int | None:
+    """Last run row; any intervening writer deliberately forces a fresh fetch."""
+    row = conn.execute("SELECT max(rowid) FROM ingestion_runs").fetchone()
+    return None if row is None or row[0] is None else int(row[0])
+
+
+def _index_state(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    now: datetime,
+    daily: tuple[Any, ...],
+    quarterly: Mapping[tuple[int, int], tuple[str, date]],
+    settled_listed_on: Mapping[tuple[int, int], date],
+    *,
+    candidate_accessions: frozenset[str] | None = None,
+    candidate_ciks: frozenset[str] = frozenset(),
+    reread_prefix: str | None = None,
+) -> Any:
+    """Read the four cursor tables and the issuer set on one store snapshot.
+
+    ``reread_prefix`` drops the stored daily cursors under that path, so a
+    ``--rebuild-index`` chunk reads every daily file of its quarter again under
+    today's rules; T318's insert writes nothing for a row already stored."""
+    from tradepartner.adapters.filings import IncrementalIndexState, PendingIndexRow
+
+    columns = (
+        "cik, accession, form, company_name, filed_on, accepted_at, listed_on, "
+        "known_at, ingested_at, list_position"
+    )
+    if candidate_accessions is None:
+        raw_rows = conn.execute(
+            f"SELECT {columns} FROM filing_index WHERE known_at <= ?", [now]
+        ).fetchall()
+    else:
+        # The adapter needs the history of listed accessions and the rows of a
+        # new issuer's walk, not the store's entire 15M-row index.
+        raw_rows = []
+        accessions = sorted(candidate_accessions)
+        for start in range(0, len(accessions), 500):
+            chunk = accessions[start : start + 500]
+            marks = ", ".join("?" for _ in chunk)
+            raw_rows.extend(
+                conn.execute(
+                    f"SELECT {columns} FROM filing_index WHERE accession IN ({marks}) "
+                    "AND known_at <= ?",
+                    [*chunk, now],
+                ).fetchall()
+            )
+        for cik in sorted(candidate_ciks):
+            raw_rows.extend(
+                conn.execute(
+                    f"SELECT {columns} FROM filing_index WHERE cik = ? AND known_at <= ?",
+                    [cik, now],
+                ).fetchall()
+            )
+        raw_rows = list({(row[0], row[1], row[7]): row for row in raw_rows}.values())
+    rows = tuple(stored_index.FilingRow(*row) for row in raw_rows)
+    pending = tuple(
+        PendingIndexRow(*row)
+        for row in conn.execute(
+            "SELECT cik, accession, form, company_name, filed_on, listed_on, list_position "
+            "FROM filing_index_pending"
+        ).fetchall()
+    )
+    filers: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {}
+    for cik, first, last in conn.execute(
+        "SELECT cik, first_quarter, last_quarter FROM edgar_filers"
+    ).fetchall():
+        filers[cik] = ((int(first[:4]), int(first[-1])), (int(last[:4]), int(last[-1])))
+    cursors = {
+        path: (
+            last_modified.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S"),
+            str(size),
+        )
+        for path, last_modified, size in conn.execute(
+            "SELECT path, last_modified, size FROM edgar_index_files "
+            "WHERE path LIKE 'daily-index/%'"
+        ).fetchall()
+        if reread_prefix is None or not path.startswith(reread_prefix)
+    }
+    issuer_forms = sorted(set(settings.master.issuer_forms) - {"25", "25-NSE"})
+    placeholders = ", ".join("?" for _ in issuer_forms)
+    issuers = {
+        cik
+        for (cik,) in conn.execute(
+            f"SELECT DISTINCT cik FROM filing_index WHERE form IN ({placeholders}) "
+            "AND known_at <= ?",
+            [*issuer_forms, now],
+        ).fetchall()
+    }
+    issuers.update(cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall())
+    return IncrementalIndexState(
+        now,
+        rows,
+        frozenset(issuers),
+        pending,
+        filers,
+        daily,
+        cursors,
+        quarterly,
+        settled_listed_on,
+    )
+
+
+def _quarter_last_modified(path: Path) -> datetime:
+    """Read the validator bound to a cached quarterly file."""
+    from email.utils import parsedate_to_datetime
+
+    sidecar = path.with_name(f"{path.name}.validators.json")
+    payload = json.loads(sidecar.read_text())
+    stamp = parsedate_to_datetime(payload["last_modified"])
+    return ensure_tz_aware_utc(stamp, field_name="quarter Last-Modified")
+
+
+def _daily_cursor(file: Any) -> Any:
+    """Convert SEC's Eastern wall time and human-readable size for the cursor table."""
+    stamp = datetime.strptime(file.last_modified, "%m/%d/%Y %I:%M:%S %p").replace(
+        tzinfo=ZoneInfo("America/New_York")
+    )
+    size = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(B|KB|MB|GB)", file.size)
+    if size is None:
+        raise ValueError(f"daily index listing has invalid size for {file.name}")
+    multiplier = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}[size[2]]
+    return replace(
+        file,
+        last_modified=stamp.strftime("%Y-%m-%d %H:%M:%S"),
+        size=str(int(Decimal(size[1]) * multiplier)),
+    )
+
+
+def _prepare_index(
+    settings: Settings,
+    source: FilingSource,
+    now: datetime,
+    *,
+    quarter_filter: tuple[int, int] | None = None,
+    dry_run: bool = False,
+) -> _IndexBatch:
+    """Fetch index inputs outside the writer lock and propose rows. With the raw
+    archive on, each daily file is kept before it is parsed (plan T347)."""
+    provenance = _IndexProvenance.start(settings, dry_run=dry_run)
+    keeps = provenance is not None and hasattr(source, "daily_index_keeper")
+    previous = getattr(source, "daily_index_keeper", None)
+    if keeps:
+        cast(Any, source).daily_index_keeper = cast(_IndexProvenance, provenance).keep
+    try:
+        batch = _propose_index(settings, source, now, quarter_filter=quarter_filter)
+    finally:
+        if keeps:
+            cast(Any, source).daily_index_keeper = previous
+    return replace(batch, provenance=provenance)
+
+
+def _propose_index(
+    settings: Settings,
+    source: FilingSource,
+    now: datetime,
+    *,
+    quarter_filter: tuple[int, int] | None = None,
+) -> _IndexBatch:
+    """`_prepare_index`'s work: fetch the inputs and propose rows."""
+    from tradepartner.adapters import edgar_raw
+    from tradepartner.adapters.daily_index import daily_files_to_read, parse_daily_listing
+    from tradepartner.adapters.edgar import parse_filing_index
+    from tradepartner.adapters.edgar_source import EdgarFilingSource
+    from tradepartner.adapters.index_reconcile import quarterly_listed_on, select_quarters
+
+    with open_read_only(settings, retry=True) as conn:
+        snapshot = index_snapshot_id(conn)
+        writer_version = _writer_version(conn)
+    # A rebuild chunk re-reads its quarter's daily files: a rule change must
+    # reach the unsettled quarters too, not only the settled `form.idx` ones.
+    reread = (
+        None
+        if quarter_filter is None
+        else f"daily-index/{quarter_filter[0]}/QTR{quarter_filter[1]}/"
+    )
+    daily: list[Any] = []
+    quarterly: dict[tuple[int, int], tuple[str, date]] = {}
+    settled_days: dict[tuple[int, int], date] = {}
+    quarterly_files: list[tuple[str, datetime, int, str]] = []
+    if isinstance(source, EdgarFilingSource):
+        quarters = _index_quarters(settings.edgar.index_first_year, now)
+        with open_read_only(settings, retry=True) as conn:
+            last = conn.execute(
+                "SELECT finished_at FROM ingestion_runs WHERE source = 'edgar_index' "
+                "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+        for year, number in quarters:
+            if quarter_filter is not None and (year, number) > quarter_filter:
+                continue
+            if source._settled((year, number), now):
+                # #2864: a quarter that settled since the last ok index run (a
+                # key-off gap) still owes its daily files, which a nightly
+                # run would have read before the quarter settled.
+                if (
+                    quarter_filter is None
+                    and last is not None
+                    and not source._settled((year, number), last[0])
+                ):
+                    listing = edgar_raw.daily_index_listing(
+                        year, number, settings=settings, client=source._client
+                    )
+                    daily.extend(
+                        _daily_cursor(file) for file in parse_daily_listing(listing, year, number)
+                    )
+                if quarter_filter is not None and (year, number) != quarter_filter:
+                    continue  # the new-issuer walk uses this quarter's cached copy
+                path, changed = edgar_raw.cached_quarterly_index(
+                    year, number, settings=settings, client=source._client
+                )
+                modified = _quarter_last_modified(path)
+                listed = quarterly_listed_on(modified)
+                settled_days[(year, number)] = listed
+                if changed or quarter_filter is not None:
+                    body = gzip.decompress(path.read_bytes())
+                    quarterly[(year, number)] = body.decode("utf-8"), listed
+                    quarterly_files.append(
+                        (
+                            f"full-index/{year}/QTR{number}/form.idx",
+                            modified,
+                            len(body),
+                            hashlib.sha256(body).hexdigest(),
+                        )
+                    )
+            else:
+                listing = edgar_raw.daily_index_listing(
+                    year, number, settings=settings, client=source._client
+                )
+                daily.extend(
+                    _daily_cursor(file) for file in parse_daily_listing(listing, year, number)
+                )
+        if quarter_filter is None:
+            chosen = select_quarters(
+                now=now,
+                last_ok_run_at=None if last is None else last[0],
+                changed={Quarter(*q) for q in quarterly},
+                settle_days=settings.edgar.index_settle_days,
+                first_year=settings.edgar.index_first_year,
+                recent_quarters=settings.edgar.reconcile_recent_quarters,
+            )
+            for selected in chosen.quarters:
+                q = selected.year, selected.number
+                if q in quarterly:
+                    continue
+                path = Path(settings.edgar.cache_dir) / "index" / f"{q[0]}-QTR{q[1]}.idx.gz"
+                body = gzip.decompress(path.read_bytes())
+                modified = _quarter_last_modified(path)
+                listed = quarterly_listed_on(modified)
+                quarterly[q] = body.decode("utf-8"), listed
+                quarterly_files.append(
+                    (
+                        f"full-index/{q[0]}/QTR{q[1]}/form.idx",
+                        modified,
+                        len(body),
+                        hashlib.sha256(body).hexdigest(),
+                    )
+                )
+        # A new issuer's walk may read an older settled cache without a GET.
+        # Supply its listing date even when this run did not reconcile it.
+        for year, number in _index_quarters(settings.edgar.index_first_year, now):
+            quarter = (year, number)
+            if quarter in settled_days or not source._settled(quarter, now):
+                continue
+            path = Path(settings.edgar.cache_dir) / "index" / f"{year}-QTR{number}.idx.gz"
+            if path.is_file():
+                settled_days[quarter] = quarterly_listed_on(_quarter_last_modified(path))
+    candidate_accessions: frozenset[str] | None = None
+    candidate_ciks: frozenset[str] = frozenset()
+    if isinstance(source, EdgarFilingSource):
+        with open_read_only(settings, retry=True) as conn:
+            old_cursors = {
+                path: (
+                    modified.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S"),
+                    str(size),
+                )
+                for path, modified, size in conn.execute(
+                    "SELECT path, last_modified, size FROM edgar_index_files "
+                    "WHERE path LIKE 'daily-index/%'"
+                ).fetchall()
+                if reread is None or not path.startswith(reread)
+            }
+            known_issuers = {
+                cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+            }
+            listed_forms = sorted(set(settings.master.issuer_forms) - {"25", "25-NSE"})
+            marks = ", ".join("?" for _ in listed_forms)
+            known_issuers.update(
+                cik
+                for (cik,) in conn.execute(
+                    f"SELECT DISTINCT cik FROM filing_index WHERE form IN ({marks}) "
+                    "AND known_at <= ?",
+                    [*listed_forms, now],
+                ).fetchall()
+            )
+        candidates: set[str] = set()
+        possible_new: set[str] = set()
+        issuer_forms = set(settings.master.issuer_forms) | {"25", "25-NSE"}
+        for file in daily_files_to_read(tuple(daily), old_cursors):
+            for row in source._incremental_daily_rows(file):
+                candidates.add(row.accession)
+                if row.form in issuer_forms and row.cik not in known_issuers:
+                    possible_new.add(row.cik)
+        for text, _listed in quarterly.values():
+            for row in parse_filing_index(text, {}).unstamped:
+                candidates.add(row.accession)
+                if row.form in issuer_forms and row.cik not in known_issuers:
+                    possible_new.add(row.cik)
+        with open_read_only(settings, retry=True) as conn:
+            for year, number in quarterly:
+                first_day = date(year, number * 3 - 2, 1)
+                last_day = date(year + 1, 1, 1) if number == 4 else date(year, number * 3 + 1, 1)
+                candidates.update(
+                    accession
+                    for (accession,) in conn.execute(
+                        "SELECT DISTINCT accession FROM filing_index "
+                        "WHERE filed_on >= ? AND filed_on < ?",
+                        [first_day, last_day],
+                    ).fetchall()
+                )
+        candidate_accessions = frozenset(candidates)
+        candidate_ciks = frozenset(possible_new)
+    with open_read_only(settings, retry=True) as conn:
+        state = _index_state(
+            conn,
+            settings,
+            now,
+            tuple(daily),
+            quarterly,
+            settled_days,
+            candidate_accessions=candidate_accessions,
+            candidate_ciks=candidate_ciks,
+            reread_prefix=reread,
+        )
+    proposal = source.incremental_index(state)
+    read_files = list(quarterly_files)
+    daily_read = list(proposal.files_read)
+    if isinstance(source, EdgarFilingSource):
+        issuer_forms = set(settings.master.issuer_forms) | {"25", "25-NSE"}
+        new_issuers = {
+            row.cik
+            for row in proposal.rows
+            if row.cik not in state.issuer_ciks and row.form in issuer_forms
+        }
+        for cik in new_issuers:
+            first, last = proposal.filers[cik]
+            for file in state.daily_files:
+                day = date.fromisoformat(file.name.split(".")[1])
+                quarter = (day.year, (day.month - 1) // 3 + 1)
+                if first <= quarter <= last and file not in daily_read:
+                    daily_read.append(file)
+            for year, number in _index_quarters(settings.edgar.index_first_year, now):
+                quarter = (year, number)
+                if not first <= quarter <= last or quarter not in settled_days:
+                    continue
+                path = Path(settings.edgar.cache_dir) / "index" / f"{year}-QTR{number}.idx.gz"
+                body = gzip.decompress(path.read_bytes())
+                read_files.append(
+                    (
+                        f"full-index/{year}/QTR{number}/form.idx",
+                        _quarter_last_modified(path),
+                        len(body),
+                        hashlib.sha256(body).hexdigest(),
+                    )
+                )
+    for file in daily_read:
+        day = date.fromisoformat(file.name.split(".")[1])
+        path = edgar_raw.daily_index_file_path(
+            day.year, (day.month - 1) // 3 + 1, file.name, settings=settings
+        )
+        body = path.read_bytes()
+        modified = (
+            datetime.fromisoformat(file.last_modified)
+            .replace(tzinfo=ZoneInfo("America/New_York"))
+            .astimezone(UTC)
+        )
+        read_files.append((file.path, modified, int(file.size), hashlib.sha256(body).hexdigest()))
+    return _IndexBatch(
+        snapshot,
+        writer_version,
+        proposal,
+        tuple({item[0]: item for item in read_files}.values()),
+        state.issuer_ciks,
+    )
+
+
+def _write_index_state(
+    conn: duckdb.DuckDBPyConnection,
+    batch: _IndexBatch,
+    now: datetime,
+    run_id: str,
+    *,
+    mode: str = MODE,
+) -> tuple[int, str]:
+    """Commit T319's proposal and every file cursor with the caller's chunk. With
+    a recorder (plan T347), its manifest is written last, under `run_id` and
+    `mode`, before the caller writes the run row that cites it."""
+    if index_snapshot_id(conn) != batch.snapshot or _writer_version(conn) != batch.writer_version:
+        raise _IndexConflict("EDGAR index changed since the fetch snapshot; retry the run")
+    proposal = batch.proposal
+    if batch.provenance is not None:
+        batch.provenance.mark(conn, proposal.listings)
+    counts = _insert_index_listings(conn, proposal.listings, now)
+    desired = {(row.cik, row.accession): row for row in proposal.pending}
+    old_keys = set(conn.execute("SELECT cik, accession FROM filing_index_pending").fetchall())
+    for cik, accession in old_keys - desired.keys():
+        conn.execute(
+            "DELETE FROM filing_index_pending WHERE cik = ? AND accession = ?", [cik, accession]
+        )
+    for row in desired.values():
+        conn.execute(
+            "INSERT OR REPLACE INTO filing_index_pending "
+            "(cik, accession, form, company_name, filed_on, listed_on, list_position) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                row.cik,
+                row.accession,
+                row.form,
+                row.company_name,
+                row.filed_on,
+                row.listed_on,
+                row.list_position,
+            ],
+        )
+    for cik, (first, last) in proposal.filers.items():
+        conn.execute(
+            "INSERT OR REPLACE INTO edgar_filers (cik, first_quarter, last_quarter) "
+            "VALUES (?, ?, ?)",
+            [cik, f"{first[0]}Q{first[1]}", f"{last[0]}Q{last[1]}"],
+        )
+    for path, modified, size, digest in batch.files:
+        conn.execute(
+            "INSERT OR REPLACE INTO edgar_index_files "
+            "(path, last_modified, size, sha256, run_id) VALUES (?, ?, ?, ?, ?)",
+            [path, modified, size, digest, run_id],
+        )
+    numbers = dict(proposal.counts)
+    numbers.update(
+        index_added=counts.added,
+        index_revised=counts.revised,
+        index_refused=numbers.get("index_refused", 0) + counts.changed,
+        index_stale_listing=numbers.get("index_stale_listing", 0) + counts.stale,
+    )
+    if batch.provenance is not None:
+        batch.provenance.finish(conn, proposal.listings, batch.files, run_id=run_id, mode=mode)
+        numbers["index_unattributed"] = batch.provenance.unattributed
+    message = "; ".join(f"{key}: {value}" for key, value in sorted(numbers.items()))
+    return counts.added + counts.revised, message
+
+
+def _insert_index_listings(
+    conn: duckdb.DuckDBPyConnection,
+    listings: Sequence[stored_index.Listing],
+    now: datetime,
+) -> stored_index.InsertCounts:
+    """Bulk insert an all-new quarter; delegate every mixed/revision case to T318."""
+    import pyarrow as pa
+
+    keys = {(row.cik, row.accession) for row in listings}
+    if not listings or len(keys) != len(listings):
+        return stored_index.insert_listings(conn, list(listings), now)
+    if any(row.accepted_at > now or row.listed_on > now.date() for row in listings):
+        return stored_index.insert_listings(conn, list(listings), now)
+    table = pa.Table.from_pylist(
+        [
+            {
+                "cik": row.cik,
+                "accession": row.accession,
+                "form": row.form,
+                "company_name": row.company_name,
+                "filed_on": row.filed_on,
+                "accepted_at": row.accepted_at,
+                "listed_on": row.listed_on,
+                "list_position": row.list_position,
+            }
+            for row in listings
+        ]
+    )
+    conn.register("_t323_index_batch", table)
+    try:
+        existing = conn.execute(
+            "SELECT count(*) FROM _t323_index_batch b JOIN filing_index f "
+            "ON b.cik = f.cik AND b.accession = f.accession"
+        ).fetchone()
+        if existing is None or existing[0]:
+            return stored_index.insert_listings(conn, list(listings), now)
+        conn.execute(
+            "INSERT INTO filing_index "
+            "(cik, accession, form, company_name, filed_on, accepted_at, listed_on, "
+            "list_position, known_at, ingested_at, source, provenance) "
+            "SELECT cik, accession, form, company_name, filed_on, accepted_at, listed_on, "
+            "list_position, accepted_at, ?, 'edgar', 'filing' FROM _t323_index_batch",
+            [now],
+        )
+        return stored_index.InsertCounts(added=len(listings))
+    finally:
+        conn.unregister("_t323_index_batch")
+
+
+def _index_head(settings: Settings, provenance: _IndexProvenance | None) -> str:
+    """The rule fingerprint and, with a written manifest, `; provenance_sha256=<hex>`
+    (plan T347): the part of an index run message no cut may reach."""
+    from tradepartner.store.build_fingerprint import build_fingerprint
+
+    head = f"rule_fingerprint: {build_fingerprint(settings).hash}"
+    if provenance is not None and provenance.digest is not None:
+        head += f"; {PROVENANCE_KEY}={provenance.digest}"
+    if len(head) > settings.ingest.max_message_chars:
+        raise ValueError("EDGAR index run metadata exceeds ingest.max_message_chars")
+    return head
+
+
+def _index_run_message(
+    settings: Settings, counts: str, files: int, provenance: _IndexProvenance | None = None
+) -> str:
+    """Stable metadata at the front of the EDGAR index run row; the counts after
+    it may be cut at `ingest.max_message_chars`."""
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_bytes = rss if sys.platform == "darwin" else rss * 1024
+    message = (
+        f"{_index_head(settings, provenance)}; "
+        f"files_read: {files}; peak_rss_bytes: {rss_bytes}; {counts}"
+    )
+    return _clean(message, settings)
+
+
+def _index_run_cursor(
+    settings: Settings,
+    cursor: str,
+    snapshot_values: Mapping[str, frozenset[tuple[str, str]]] | None = None,
+    touch_cursor: Mapping[str, Any] | None = None,
+) -> str:
+    """Keep the unabridged per-name values on the run row, outside the message cap."""
+    from tradepartner.store.build_fingerprint import build_fingerprint
+
+    return json.dumps(
+        {
+            "cursor": cursor,
+            "per_name": build_fingerprint(settings).per_name,
+            "snapshot": {cik: sorted(values) for cik, values in (snapshot_values or {}).items()},
+            "touch": dict(touch_cursor or {}),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _per_name_entries(values: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Shape config values for T320's per-entry diff, retaining each named CIK."""
+    from tradepartner.store.touched import PerNameEntry
+
+    out: dict[str, dict[str, PerNameEntry]] = {}
+    for name, value in values.items():
+        entries: dict[str, PerNameEntry] = {}
+        items = value.items() if isinstance(value, dict) else enumerate(value)
+        for key, item in items:
+            raw = json.dumps(item, sort_keys=True, default=str)
+            label = str(key) if isinstance(value, dict) else str(item)
+            ciks = frozenset(re.findall(r"(?<!\d)\d{10}(?!\d)", f"{label} {raw}"))
+            entries[label] = PerNameEntry(raw, ciks)
+        out[name] = entries
+    return out
+
+
+def _snapshot_values(
+    entries: Sequence[CompanySnapshotEntry],
+) -> dict[str, frozenset[tuple[str, str]]]:
+    grouped: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    for entry in entries:
+        grouped[entry.cik].add((entry.ticker, entry.exchange))
+    return {cik: frozenset(values) for cik, values in grouped.items()}
+
+
+def _cache_completeness(
+    source: FilingSource, issuer_ciks: frozenset[str]
+) -> tuple[dict[str, bool], dict[str, bool]]:
+    """Check the same per-CIK cache keys T323a uses before choosing touched CIKs."""
+    from tradepartner.adapters import edgar_source
+
+    if not isinstance(source, edgar_source.EdgarFilingSource):
+        return {}, {}
+    facts: dict[str, bool] = {}
+    statements: dict[str, bool] = {}
+    forms = set(source._settings.edgar.cover_page_forms)
+    for cik in issuer_ciks:
+        latest = source._facts_cache_key(source._load_stamps(cik), forms)
+        if latest is None:
+            continue
+        path = source._cache / "facts" / f"v{edgar_source.PARSER_VERSION}" / f"{cik}.json"
+        facts[cik] = edgar_source._cached_latest(path, cik) == latest
+        if source._settings.edgar.statement_facts_enabled:
+            statements[cik] = edgar_source._cached_key(
+                source._statement_cache_path(cik), cik, edgar_source.STATEMENT_VERSION
+            ) == source._statement_key(latest)
+    return facts, statements
+
+
+def _index_touch_state(
+    settings: Settings,
+    source: FilingSource,
+    now: datetime,
+    previous_at: datetime | None,
+    previous: Mapping[str, Any],
+    proposal: Any,
+) -> dict[str, Any]:
+    """Read T320's cache and clock boundaries before limiting the build."""
+    from tradepartner.adapters import edgar_raw, edgar_source
+
+    if not isinstance(source, edgar_source.EdgarFilingSource):
+        return {}
+    failures = {
+        accession: [
+            accession[:10],
+            entry.get("kind") != "collision"
+            and int(entry.get("count", 0)) >= settings.edgar.max_filing_failures,
+            bool(entry.get("accepted", False)),
+        ]
+        for accession, entry in source._failure_store().items()
+    }
+    cached_periods = set(source._cached_fsn_periods())
+    listed_periods = set(edgar_raw.fsn_periods(settings=settings, client=source._client))
+    periods = sorted(cached_periods | listed_periods)
+    prior_periods = set(previous.get("fsn_periods", periods))
+    new_periods = set(periods) - prior_periods
+    new_accessions: set[str] = set()
+    for period in new_periods:
+        manifest = source._load_fsn_manifest(period)
+        if manifest is not None:
+            new_accessions.update(manifest.get("accessions_extracted", ()))
+    old_lag = previous.get("lag_start")
+    starts = [edgar_source._fsn_period_start(period) for period in periods]
+    lag_start = max(starts).isoformat() if starts else None
+    accession_ciks: dict[str, set[str]] = defaultdict(set)
+    for row in proposal.listings:
+        accession_ciks[row.accession].add(row.cik)
+    relevant = set(failures) | set(previous.get("failures", {})) | new_accessions
+    with open_read_only(settings, retry=True) as conn:
+        for accession in sorted(relevant):
+            accession_ciks[accession].update(
+                cik
+                for (cik,) in conn.execute(
+                    "SELECT DISTINCT cik FROM filing_index WHERE accession = ?", [accession]
+                ).fetchall()
+            )
+        settled: set[str] = set()
+        if previous_at is not None:
+            for year, number in _index_quarters(settings.edgar.index_first_year, now):
+                quarter = (year, number)
+                if source._settled(quarter, now) and not source._settled(quarter, previous_at):
+                    first = date(year, 3 * number - 2, 1)
+                    end = date(year + 1, 1, 1) if number == 4 else date(year, 3 * number + 1, 1)
+                    settled.update(
+                        cik
+                        for (cik,) in conn.execute(
+                            "SELECT DISTINCT cik FROM filing_index "
+                            "WHERE filed_on >= ? AND filed_on < ?",
+                            [first, end],
+                        ).fetchall()
+                    )
+        lag_ciks: set[str] = set()
+        if old_lag and lag_start and old_lag != lag_start:
+            lag_ciks.update(
+                cik
+                for (cik,) in conn.execute(
+                    "SELECT DISTINCT cik FROM filing_index WHERE accepted_at >= ? "
+                    "AND accepted_at < ?",
+                    [min(old_lag, lag_start), max(old_lag, lag_start)],
+                ).fetchall()
+            )
+        newly_known: set[str] = set()
+        if previous_at is not None:
+            newly_known.update(
+                cik
+                for (cik,) in conn.execute(
+                    "SELECT DISTINCT cik FROM filing_index WHERE accepted_at > ? "
+                    "AND accepted_at <= ?",
+                    [previous_at, now],
+                ).fetchall()
+            )
+        if new_periods and starts:
+            first_new = min(edgar_source._fsn_period_start(period) for period in new_periods)
+            settled.update(
+                cik
+                for (cik,) in conn.execute(
+                    "SELECT DISTINCT cik FROM filing_index WHERE accepted_at >= ?",
+                    [first_new],
+                ).fetchall()
+            )
+    unread = {
+        cik
+        for cik, count in source._unread_runs().items()
+        if count >= settings.edgar.stamp_sgml_fallback_runs
+    }
+    return {
+        "failures": failures,
+        "fsn_periods": periods,
+        "lag_start": lag_start,
+        "filename_incomplete": sorted(source.filename_incomplete_ciks),
+        "new_fsn_accessions": sorted(new_accessions),
+        "accession_ciks": {key: sorted(value) for key, value in accession_ciks.items()},
+        "settled_ciks": sorted(settled),
+        "lag_window_start_ciks": sorted(lag_ciks),
+        "unread_run_reached_ciks": sorted(unread),
+        "newly_known_ciks": sorted(newly_known),
+    }
+
+
+def _pending_snapshot_ciks(
+    settings: Settings,
+    now: datetime,
+    current: Mapping[str, frozenset[tuple[str, str]]],
+) -> frozenset[str]:
+    """Keep a first ticker sighting in the build until its second fetch confirms it."""
+    with open_read_only(settings, retry=True) as conn:
+        rows = conn.execute(
+            "WITH latest AS (SELECT cik, ticker, exchange, "
+            "row_number() OVER (PARTITION BY cik ORDER BY known_at DESC) AS rn "
+            "FROM snapshot_sightings WHERE known_at <= ?) "
+            "SELECT s.cik, s.ticker, s.exchange FROM latest s WHERE s.rn = 1 "
+            "AND NOT EXISTS (SELECT 1 FROM listings l JOIN securities sec "
+            "ON l.security_id = sec.security_id WHERE sec.cik = s.cik "
+            "AND l.ticker = s.ticker AND l.exchange = s.exchange AND l.known_at <= ?)",
+            [now, now],
+        ).fetchall()
+    return frozenset(
+        cik for cik, ticker, exchange in rows if (ticker, exchange) in current.get(cik, ())
+    )
+
+
+def _touched_for_index(
+    settings: Settings,
+    proposal: Any,
+    previous: Mapping[str, Any],
+    issuer_ciks: frozenset[str],
+    now: datetime,
+    *,
+    source: FilingSource,
+    previous_snapshot: Mapping[str, frozenset[tuple[str, str]]],
+    current_snapshot: Mapping[str, frozenset[tuple[str, str]]],
+    previous_touch: Mapping[str, Any] | None = None,
+    current_touch: Mapping[str, Any] | None = None,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """T320's explicit row and config triggers, then T321's rotation share."""
+    from tradepartner.store.build_fingerprint import build_fingerprint
+    from tradepartner.store.drift_check import rotation_share, session_night
+    from tradepartner.store.touched import FailureState, TouchedInputs, touched_ciks
+
+    per_name = build_fingerprint(settings).per_name
+    fact_complete, statement_complete = _cache_completeness(source, issuer_ciks)
+    chains = set()
+    for entry in settings.master.chains:
+        chains.update(re.findall(r"(?<!\d)\d{10}(?!\d)", entry))
+    before = previous_touch or {}
+    after = current_touch or {}
+
+    def failures(values: Mapping[str, Any]) -> dict[str, FailureState]:
+        return {
+            accession: FailureState(str(value[0]), bool(value[1]), bool(value[2]))
+            for accession, value in values.get("failures", {}).items()
+        }
+
+    inputs = TouchedInputs(
+        inserted_ciks=frozenset(row.cik for row in proposal.rows),
+        companyfacts_complete=fact_complete,
+        statement_complete=statement_complete,
+        previous_failures=failures(before),
+        current_failures=failures(after),
+        filename_incomplete_ciks=frozenset(before.get("filename_incomplete", ())),
+        new_fsn_accessions=frozenset(after.get("new_fsn_accessions", ())),
+        accession_ciks={
+            accession: frozenset(ciks)
+            for accession, ciks in after.get("accession_ciks", {}).items()
+        },
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        previous_per_name_lists=_per_name_entries(previous),
+        current_per_name_lists=_per_name_entries(per_name),
+        master_chains_ciks=frozenset(chains),
+        settled_ciks=frozenset(after.get("settled_ciks", ())),
+        lag_window_start_ciks=frozenset(after.get("lag_window_start_ciks", ())),
+        unread_run_reached_ciks=frozenset(after.get("unread_run_reached_ciks", ())),
+        newly_known_ciks=frozenset(after.get("newly_known_ciks", ())),
+        stamp_changed_ciks=proposal.stamp_changed_ciks,
+    )
+    touched = frozenset(touched_ciks(inputs))
+    rotation = frozenset(
+        rotation_share(
+            issuer_ciks - touched,
+            session_night(now.date()),
+            settings.edgar.verify_rotation_days,
+            "edgar_index",
+        )
+    )
+    return touched, rotation
+
+
+def _prepare_indexed_filings(
+    settings: Settings,
+    recorded: _Recorded,
+    clock: Callable[[], datetime],
+    *,
+    dry_run: bool,
+) -> _IndexBatch:
+    """Gate, fetch T319's index, then fetch the build from table plus proposals."""
+    _index_gate(settings)
     source = _unwrap(recorded)
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    batch = _prepare_index(settings, source, now, dry_run=dry_run)
+    with open_read_only(settings, retry=True) as conn:
+        old = conn.execute(
+            "SELECT chunk_cursor, finished_at FROM ingestion_runs WHERE source = 'edgar_index' "
+            "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+    previous: Mapping[str, Any] = {}
+    previous_touch: Mapping[str, Any] = {}
+    previous_at: datetime | None = None
+    previous_snapshot: Mapping[str, frozenset[tuple[str, str]]] = {}
+    if old is not None:
+        try:
+            prior = json.loads(old[0])
+            previous = prior.get("per_name", {})
+            previous_touch = prior.get("touch", {})
+            previous_at = old[1]
+            previous_snapshot = {
+                cik: frozenset(tuple(pair) for pair in pairs)
+                for cik, pairs in prior.get("snapshot", {}).items()
+            }
+        except (TypeError, ValueError, AttributeError):
+            previous = {}
+    touch_state = _index_touch_state(
+        settings, source, now, previous_at, previous_touch, batch.proposal
+    )
+    current_snapshot = _snapshot_values(list(recorded._ask("companies_snapshot")))
+    touched, rotation = _touched_for_index(
+        settings,
+        batch.proposal,
+        previous,
+        batch.issuer_ciks,
+        now,
+        source=source,
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        previous_touch=previous_touch,
+        current_touch=touch_state,
+    )
+    pending_snapshot = _pending_snapshot_ciks(settings, now, current_snapshot)
+    if pending_snapshot:
+        touched = touched | pending_snapshot
+        rotation = rotation - pending_snapshot
+    batch = replace(
+        batch,
+        touched=touched,
+        rotation=rotation,
+        snapshot_values=current_snapshot,
+        touch_cursor={
+            key: touch_state[key]
+            for key in ("failures", "fsn_periods", "lag_start", "filename_incomplete")
+            if key in touch_state
+        },
+    )
+    recorded.limited_ciks = touched
+    recorded.benchmark_tickers = frozenset(settings.benchmarks)
+    rotated = _Recorded(source) if rotation else None
+    if rotated is not None:
+        rotated.limited_ciks = rotation
+        rotated.benchmark_tickers = frozenset(settings.benchmarks)
+    bind = getattr(source, "use_index", None)
+    if callable(bind):
+        with open_read_only(settings, retry=True) as conn:
+            if (
+                index_snapshot_id(conn) != batch.snapshot
+                or _writer_version(conn) != batch.writer_version
+            ):
+                raise _IndexConflict("EDGAR index changed since the fetch snapshot; retry the run")
+        bind(
+            cast(duckdb.DuckDBPyConnection, _IndexReadProxy(settings)),
+            batch.proposal.listings,
+            touched_ciks=touched | rotation,
+        )
+        _prefetch(recorded, settings, dry_run=dry_run)
+        if rotated is not None:
+            _fetch_and_gate(rotated, settings)
+            rotated.frozen = True
+    else:
+        _prefetch(recorded, settings, dry_run=dry_run)
+        if rotated is not None:
+            _fetch_and_gate(rotated, settings)
+            rotated.frozen = True
+    return replace(batch, rotation_recorded=rotated)
+
+
+def _rotation_report(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    batch: _IndexBatch,
+    now: datetime,
+) -> str:
+    """Rebuild a rotating untouched share read-only and compare current rows."""
+    from tradepartner.store.drift_check import compare_rows, drift_message
+
+    if not batch.rotation or batch.rotation_recorded is None:
+        return "incremental_drift: 0"
+    earlier = tuple(
+        entry
+        for entry in stored_snapshot_history(conn, now)
+        if entry.cik in batch.rotation or entry.ticker in settings.benchmarks
+    )
+    master, delistings, classes, facts, _unmatched = _build_filings(
+        batch.rotation_recorded, settings, now, earlier_fetches=earlier
+    )
+    products: dict[str, Sequence[Row]] = {
+        "securities": master.securities,
+        "listings": master.listings,
+        "delistings": delistings.delistings,
+        "classifications": classes.classifications,
+        "facts": facts,
+    }
+    rebuilt: dict[str, dict[str, list[Row]]] = {}
+    stored: dict[str, dict[str, list[Row]]] = {}
+    for table, rows in products.items():
+        for row in rows:
+            cik = security_cik(row["security_id"])
+            if cik in batch.rotation:
+                rebuilt.setdefault(cik, {}).setdefault(table, []).append(row)
+        ciks = sorted(batch.rotation)
+        for start in range(0, len(ciks), 500):
+            chunk = ciks[start : start + 500]
+            marks = ", ".join("?" for _ in chunk)
+            cursor = conn.execute(
+                f"SELECT * FROM {table} WHERE substr(security_id, 1, 10) IN ({marks}) "
+                "AND known_at <= ?",
+                [*chunk, now],
+            )
+            columns = [item[0] for item in cursor.description]
+            for values in cursor.fetchall():
+                row = dict(zip(columns, values, strict=True))
+                cik = security_cik(row["security_id"])
+                stored.setdefault(cik, {}).setdefault(table, []).append(row)
+    keys = {name: fields[0] for name, fields in _TABLES.items() if name in products}
+    return drift_message(compare_rows(stored, rebuilt, keys=keys))
+
+
+def _write_indexed_filings(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    recorded: _Recorded,
+    batch: _IndexBatch,
+    clock: Callable[[], datetime],
+    run_id: str,
+    *,
+    rebuild_statement_facts: bool,
+    rebuild_filing_events: bool,
+    rebuild_classifications: bool,
+    restamp: Sequence[ManifestRow] | None,
+    on_restamp: Callable[[RestampResult], None] | None,
+    restamp_window_ok: WindowEarlierOk | None,
+) -> tuple[int, str]:
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    _index_gate_conn(conn, settings)
+    index_run_id = uuid.uuid4().hex
+    index_rows, index_counts = _write_index_state(conn, batch, now, index_run_id)
+    source = _unwrap(recorded)
+    bind = getattr(source, "use_index", None)
+    if callable(bind):
+        bind(conn, batch.proposal.listings, touched_ciks=batch.touched | batch.rotation)
+    derived_rows, message = _ingest_filings(
+        conn,
+        settings,
+        recorded,
+        clock,
+        run_id,
+        rebuild_statement_facts=rebuild_statement_facts,
+        rebuild_filing_events=rebuild_filing_events,
+        rebuild_classifications=rebuild_classifications,
+        restamp=restamp,
+        on_restamp=on_restamp,
+        restamp_window_ok=restamp_window_ok,
+        touched_ciks=batch.touched,
+    )
+    rotation_message = _rotation_report(conn, settings, batch, now)
+    touch_cursor = _touch_after_build(
+        settings, source, batch.touch_cursor, recorded.filename_incomplete_ciks
+    )
+    index_counts = (
+        f"{index_counts}; index_stamp_changed: "
+        f"{len(batch.proposal.stamp_changed_ciks)}; {rotation_message}"
+    )
+    index_run = SourceRun(
+        "edgar_index",
+        OK,
+        index_rows,
+        _index_run_cursor(
+            settings,
+            expected_session(now, settings).isoformat(),
+            batch.snapshot_values,
+            touch_cursor,
+        ),
+        _index_run_message(settings, index_counts, len(batch.files), batch.provenance),
+    )
+    _write_run(conn, index_run_id, now, clock(), index_run, MODE)
+    return index_rows + derived_rows, f"{message}; {index_counts}"
+
+
+def _touch_after_build(
+    settings: Settings,
+    source: object,
+    touch_cursor: Mapping[str, Any],
+    recorded_incomplete: Collection[str],
+) -> dict[str, Any]:
+    """The run row's T320 cursor, with the filename and failure state the build left."""
+    out = dict(touch_cursor)
+    incomplete = set(recorded_incomplete)
+    incomplete.update(getattr(source, "filename_incomplete_ciks", ()))
+    out["filename_incomplete"] = sorted(incomplete)
+    failure_store = getattr(source, "_failure_store", None)
+    if callable(failure_store):
+        out["failures"] = {
+            accession: [
+                accession[:10],
+                entry.get("kind") != "collision"
+                and int(entry.get("count", 0)) >= settings.edgar.max_filing_failures,
+                bool(entry.get("accepted", False)),
+            ]
+            for accession, entry in failure_store().items()
+        }
+    return out
+
+
+def _seed_floor_stop(settings: Settings, cursor: str, where: str) -> IngestResult | None:
+    """A FAILED result when the disk is under the ingest floor (or unreadable) at
+    a seed step, else `None` (#2857). Writes no row, so a rerun resumes."""
+    try:
+        refusal = ingest_floor_refusal(settings, lead="seed stopped")
+    except OSError as exc:
+        refusal = f"seed stopped: could not read free disk ({type(exc).__name__})"
+    if refusal is None:
+        return None
+    return IngestResult((SourceRun("edgar_index", FAILED, 0, cursor, f"{refusal} ({where})"),))
+
+
+def _rebuild_index_session(
+    settings: Settings,
+    filings: FilingSource,
+    *,
+    clock: Callable[[], datetime],
+    dry_run: bool,
+    prices: PriceSource,
+) -> IngestResult:
+    """Seed or repair the index in quarter chunks, then publish one ok gate row."""
+    from tradepartner.store.build_fingerprint import build_fingerprint
+
+    del prices  # the CLI permits rebuild only with --source edgar
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    fingerprint = build_fingerprint(settings).hash
+    quarters = _index_quarters(settings.edgar.index_first_year, now)
+    last_partial: str | None = None
+    if not dry_run and Path(settings.store.path).exists():
+        with open_read_only(settings, retry=True) as conn:
+            row = conn.execute(
+                "SELECT chunk_cursor, rowid, message FROM ingestion_runs "
+                "WHERE source = 'edgar_index' "
+                "AND mode = 'rebuild_index' AND status = 'partial' "
+                "ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+            done = conn.execute(
+                "SELECT max(rowid) FROM ingestion_runs WHERE source = 'edgar_index' "
+                "AND status = 'ok'"
+            ).fetchone()
+            if (
+                row is not None
+                and f"rule_fingerprint: {fingerprint}" in str(row[2])
+                and (done is None or done[0] is None or row[1] > done[0])
+            ):
+                last_partial = row[0]
+    if last_partial is not None:
+        quarters = tuple(q for q in quarters if f"{q[0]}Q{q[1]}" > last_partial)
+    for year, number in quarters:
+        batches: dict[str, _IndexBatch] = {}
+        cursor = f"{year}Q{number}"
+        # The seed writes about 2 GB over ~135 chunks: read the floor before each one
+        # (#2841). Stopping here writes no row (the disk is low) and leaves the
+        # earlier partial rows, so a rerun resumes at this quarter.
+        if not dry_run and (stop := _seed_floor_stop(settings, cursor, f"before {cursor}")):
+            return stop
+
+        def prepare_quarter(
+            target: dict[str, _IndexBatch] = batches,
+            quarter: tuple[int, int] = (year, number),
+        ) -> None:
+            target["current"] = _prepare_index(
+                settings,
+                filings,
+                ensure_tz_aware_utc(clock(), field_name="clock()"),
+                quarter_filter=quarter,
+                dry_run=dry_run,
+            )
+
+        def write_quarter(
+            conn: duckdb.DuckDBPyConnection,
+            run_id: str,
+            target: dict[str, _IndexBatch] = batches,
+        ) -> tuple[int, str]:
+            batch = target["current"]
+            chunk_now = ensure_tz_aware_utc(clock(), field_name="clock()")
+            added, counts = _write_index_state(conn, batch, chunk_now, run_id, mode="rebuild_index")
+            return (
+                added,
+                f"{_index_head(settings, batch.provenance)}; "
+                f"files_read: {len(batch.files)}; {counts}",
+            )
+
+        chunk = _run_source(
+            "edgar_index",
+            write_quarter,
+            settings,
+            ensure_tz_aware_utc(clock(), field_name="clock()"),
+            clock,
+            cursor,
+            dry_run,
+            mode="rebuild_index",
+            prepare=prepare_quarter,
+            success_status="partial",
+        )
+        if chunk.status != "partial":
+            return IngestResult((chunk,))
+
+    if not dry_run and (stop := _seed_floor_stop(settings, "", "before the final publish")):
+        return stop
+    recorded = _Recorded(filings)
+    final_snapshot: dict[str, str | int | None] = {}
+    seed_touch: dict[str, Any] = {}
+
+    def prepare_final() -> None:
+        source = _unwrap(recorded)
+        bind = getattr(source, "use_index", None)
+        with open_read_only(settings, retry=True) as conn:
+            final_snapshot["id"] = index_snapshot_id(conn)
+            final_snapshot["writer"] = _writer_version(conn)
+        if callable(bind):
+            bind(cast(duckdb.DuckDBPyConnection, _IndexReadProxy(settings)))
+        _prefetch(recorded, settings, dry_run=dry_run)
+        # The first nightly diffs T320's inputs against this row (FSN periods,
+        # the lag start, failures, filename-incomplete CIKs, the snapshot).
+        state = _index_touch_state(settings, source, now, None, {}, SimpleNamespace(listings=()))
+        seed_touch.update(
+            {
+                key: state[key]
+                for key in ("failures", "fsn_periods", "lag_start", "filename_incomplete")
+                if key in state
+            }
+        )
+
+    def write_final(conn: duckdb.DuckDBPyConnection, run_id: str) -> tuple[int, str]:
+        if (
+            index_snapshot_id(conn) != final_snapshot["id"]
+            or _writer_version(conn) != final_snapshot["writer"]
+        ):
+            raise _IndexConflict("EDGAR index changed since the fetch snapshot; retry the run")
+        source = _unwrap(recorded)
+        bind = getattr(source, "use_index", None)
+        if callable(bind):
+            bind(conn)
+        added, message = _ingest_filings(conn, settings, recorded, clock, run_id)
+        touch = _touch_after_build(settings, source, seed_touch, recorded.filename_incomplete_ciks)
+        index_run = SourceRun(
+            "edgar_index",
+            OK,
+            0,
+            _index_run_cursor(
+                settings,
+                f"{quarters[-1][0]}Q{quarters[-1][1]}" if quarters else last_partial or "",
+                _snapshot_values(list(recorded._ask("companies_snapshot"))),
+                touch,
+            ),
+            _index_run_message(settings, "index seed complete", 0),
+        )
+        _write_run(conn, uuid.uuid4().hex, now, clock(), index_run, "rebuild_index")
+        return added, message
+
+    try:
+        final = _run_source(
+            "edgar",
+            write_final,
+            settings,
+            ensure_tz_aware_utc(clock(), field_name="clock()"),
+            clock,
+            "rebuild_index",
+            dry_run,
+            mode="rebuild_index",
+            prepare=prepare_final,
+        )
+    finally:
+        release = getattr(_unwrap(filings), "release_index", None)
+        if callable(release):
+            release()
+    return IngestResult((final,))
+
+
+def _check_source_failures(source: object, *, dry_run: bool) -> None:
+    """T11h's failure check on `source` (`check_failures`, when it has one), before
+    the lock; on a failed non-dry check, `record_failed_check` first (see `_prefetch`)."""
     check_failures = getattr(source, "check_failures", None)
     if check_failures is not None:
         try:
@@ -1345,7 +3015,6 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None
                         f"{type(record_error).__name__}: {record_error}"
                     ) from record_error
             raise
-    recorded.frozen = True
 
 
 def _fetch_and_gate(recorded: _Recorded, settings: Settings) -> None:
@@ -1380,6 +3049,1031 @@ _EMPTY_COUNTS: tuple[tuple[str, str], ...] = (
 )
 
 
+@dataclass(frozen=True)
+class SecFormWrite:
+    """Per-accession ownership write counts for the ingestion run message."""
+
+    added: int = 0
+    changed: int = 0
+    not_yet_known: int = 0
+
+
+def _sec_form_rows(
+    filing: SecFormFiling, *, ingested_at: datetime, source: str
+) -> dict[str, list[Row]]:
+    """The `sec_filing_events` and `sec_form4_transactions` rows of one accession,
+    as `write_sec_form_accession` inserts them (and T348's manifest digests them)."""
+    common: Row = {
+        "accepted_at": filing.accepted_at,
+        "known_at": filing.accepted_at,
+        "ingested_at": ingested_at,
+        "source": source,
+        "provenance": "filing",
+    }
+    return {
+        "sec_filing_events": [
+            {
+                "accession": filing.accession,
+                "form": filing.form,
+                "filed_date": filing.filed_date,
+                "subject_cik": subject,
+                "filer_cik": filer,
+                **common,
+            }
+            for subject in filing.subject_ciks
+            for filer in filing.filer_ciks
+        ],
+        "sec_form4_transactions": [
+            {"accession": filing.accession, **asdict(transaction), **common}
+            for transaction in filing.transactions
+        ],
+    }
+
+
+def write_sec_form_accession(
+    conn: duckdb.DuckDBPyConnection,
+    filing: SecFormFiling,
+    *,
+    ingested_at: datetime,
+    source: str | None = None,
+    stored: set[str] | None = None,
+) -> SecFormWrite:
+    """Write one ownership accession atomically, refusing any differing re-read.
+
+    The caller fetches and parses before opening the store. This one-accession
+    seam is also the writer for T307d's selected Form 4 route. `stored`, when
+    given, is every accession with a row in either table (the caller read it in
+    this transaction): an accession outside it is inserted with no read of the
+    tables, and is added to it (#2624; the backfill's reads scanned both tables
+    once per accession).
+    """
+    ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
+    if filing.accepted_at > ingested_at:
+        return SecFormWrite(not_yet_known=1)
+    if source is None:
+        source = (
+            "sec_form4_xml"
+            if filing.form in ("4", "4/A")
+            else "sec_13d_xml"
+            if filing.form.startswith("SCHEDULE")
+            else "sec_13d_sgml"
+        )
+    wanted = _sec_form_rows(filing, ingested_at=ingested_at, source=source)
+    event_rows = wanted["sec_filing_events"]
+    transaction_rows = wanted["sec_form4_transactions"]
+    with atomic(conn):
+        existing: dict[str, list[Row]] = {table: [] for table in wanted}
+        for table in wanted if stored is None or filing.accession in stored else ():
+            if table == "sec_filing_events" and filing.form not in ("4", "4/A"):
+                if len(filing.subject_ciks) != 1:
+                    raise ValueError("write each 13D subject separately")
+                cursor = conn.execute(
+                    "SELECT * FROM sec_filing_events WHERE accession = ? AND subject_cik = ?",
+                    [filing.accession, filing.subject_ciks[0]],
+                )
+            else:
+                cursor = conn.execute(
+                    f"SELECT * FROM {table} WHERE accession = ?", [filing.accession]
+                )
+            columns = [column[0] for column in cursor.description]
+            existing[table] = [
+                dict(zip(columns, values, strict=True)) for values in cursor.fetchall()
+            ]
+        if any(existing.values()):
+
+            def comparable(rows: list[Row]) -> list[tuple[tuple[str, Any], ...]]:
+                return sorted(
+                    (
+                        tuple(
+                            sorted(
+                                (key, value) for key, value in row.items() if key != "ingested_at"
+                            )
+                        )
+                        for row in rows
+                    ),
+                    key=repr,
+                )
+
+            if all(
+                comparable(existing[table]) == comparable(rows) for table, rows in wanted.items()
+            ):
+                return SecFormWrite()
+            return SecFormWrite(changed=1)
+        for table, rows in wanted.items():
+            if not rows:
+                continue
+            columns = list(rows[0])
+            names = ", ".join(columns)
+            placeholders = ", ".join("?" for _ in columns)
+            conn.executemany(
+                f"INSERT INTO {table} ({names}) VALUES ({placeholders})",
+                [[row[column] for column in columns] for row in rows],
+            )
+        if stored is not None:
+            stored.add(filing.accession)
+    return SecFormWrite(added=len(event_rows) + len(transaction_rows))
+
+
+def _stored_xml_form4_transactions(
+    conn: duckdb.DuckDBPyConnection, accessions: set[str]
+) -> dict[str, tuple[Form4Transaction, ...]]:
+    """Read the stored XML accessions' transaction rows in one table pass."""
+    if not accessions:
+        return {}
+    columns = ", ".join(item.name for item in fields(Form4Transaction))
+    rows = conn.execute(
+        f"SELECT accession, {columns} FROM sec_form4_transactions "
+        "WHERE accession IN (SELECT UNNEST(?))",
+        [sorted(accessions)],
+    ).fetchall()
+    grouped: dict[str, list[Form4Transaction]] = defaultdict(list)
+    for accession, *values in rows:
+        grouped[accession].append(Form4Transaction(*values))
+    return {accession: tuple(items) for accession, items in grouped.items()}
+
+
+#: Parser versions a Form 4 manifest entry names (plan T348).
+_FORM4_XML_PARSER = f"sec_forms_parser={SEC_FORMS_PARSER_VERSION}"
+_FORM4_BULK_PARSER = f"bulk_reader={BULK_READER_VERSION}"
+
+
+def _write_outcome(tally: SecFormWrite) -> str:
+    if tally.added:
+        return "added"
+    if tally.changed:
+        return "changed_refused"
+    return "not_yet_known" if tally.not_yet_known else "unchanged"
+
+
+class _Form4Provenance:
+    """One Form 4 writer run's raw retention and provenance manifest (plan T348,
+    #2755; ADR 0028 rules 1 and 2; spec amendment #2714 items 1 and 5).
+
+    Exists only while the raw archive is on (`start` returns `None` when its
+    root is unset, and the Form 4 step then runs as before).
+    `keep_xml` archives each fetched XML body before it is parsed; `keep_zip`
+    archives each insider zip whose SHA-256 is new, before any derived write.
+    `finish` writes the run's one manifest (`form4_archive.build_manifest`) and
+    fixes its digest; the quarter rows and the enclosing `edgar` or `sec_forms`
+    writer row cite it, in the same transaction. Every archive error propagates,
+    so a refused write fails the source run and its rows roll back.
+
+    An accession fetched more than once in the run (an order sample, then the XML
+    route) keeps every body. The latest fetch is the one being parsed, so the
+    entry that writes or compares rows takes it; each earlier fetch is entered as
+    `not_written`, with no rows. Every hash is in the manifest, and a stored row
+    still matches exactly one entry (`find_entry`'s rule).
+
+    A recorder started inside a dry-run chunk (`dry_run`) writes nothing to the
+    archive, neither body nor manifest: it hashes what it would keep and reports
+    the count and bytes (`dry_run_clause`), and no run message names a digest."""
+
+    def __init__(
+        self, settings: Settings, run_id: str, writer: str, mode: str, *, dry_run: bool = False
+    ) -> None:
+        self.settings = settings
+        self.run_id = run_id
+        self.writer = writer
+        self.mode = mode
+        self.dry_run = dry_run
+        self.entries: list[dict[str, object]] = []
+        self.zips: dict[Quarter, RawInput] = {}
+        self.fetched: dict[str, list[RawInput]] = {}
+        #: A dry run's would-be archive writes: body hash to size, and the manifest's size.
+        self.would_keep: dict[str, int] = {}
+        self.would_manifest_bytes = 0
+        self.digest: str | None = None
+
+    @classmethod
+    def start(
+        cls, settings: Settings, *, run_id: str, writer: str, mode: str = "backfill"
+    ) -> _Form4Provenance | None:
+        """A recorder for writer run `run_id` (source `writer`, run mode `mode`), or
+        `None` with the archive off. Inside a dry-run chunk it keeps nothing."""
+        if not raw_archive.archive_on(settings):
+            return None
+        return cls(settings, run_id, writer, mode, dry_run=_DRY_RUN.get())
+
+    def _keep(self, body: bytes) -> str:
+        """Archive `body` (a dry run only notes it, if not held) and return its hash."""
+        if not self.dry_run:
+            return raw_archive.archive_body(self.settings, body).sha256
+        sha256 = hashlib.sha256(body).hexdigest()
+        if sha256 not in self.would_keep and not raw_archive.is_archived(self.settings, sha256):
+            self.would_keep[sha256] = len(body)
+        return sha256
+
+    def keep_xml(self, accession: str, fetched: FetchedXml) -> None:
+        """`EdgarFilingSource.form4_xml_keeper`: keep the body before it is parsed."""
+        sha256 = self._keep(fetched.body)
+        self.fetched.setdefault(accession, []).append(
+            RawInput(sha256, fetched.url, fetched.fetched_at, _FORM4_XML_PARSER)
+        )
+
+    def keep_zip(self, quarter: Quarter, digest: str) -> None:
+        """Keep the quarter's insider zip by hash unless that hash is held."""
+        if not raw_archive.is_archived(self.settings, digest):
+            kept = self._keep(insider_zip_path(self.settings, quarter).read_bytes())
+            if kept != digest:
+                raise RuntimeError(
+                    f"insider zip {quarter.year}q{quarter.number} changed while it was "
+                    f"kept ({kept} is not the checked {digest}); rerun"
+                )
+        url, fetched_at = insider_zip_fetch(self.settings, quarter, digest)
+        self.zips[quarter] = RawInput(digest, url, fetched_at, _FORM4_BULK_PARSER)
+
+    def xml_input(self, accession: str) -> RawInput:
+        """The kept XML of an accession about to be written or compared: its latest
+        fetch, the body just parsed."""
+        if not self.fetched.get(accession):
+            raise RuntimeError(f"Form 4 XML {accession} was not kept before parse")
+        return self.fetched[accession][-1]
+
+    def record(
+        self,
+        accession: str,
+        row_source: str,
+        quarter: Quarter | None,
+        outcome: str,
+        rows: Mapping[str, Sequence[Row]],
+    ) -> None:
+        """One input's entry; an XML input leaves the fetched set once recorded."""
+        if row_source == XML_SOURCE:
+            raw = self.xml_input(accession)
+            self.fetched[accession].pop()
+            if not self.fetched[accession]:
+                del self.fetched[accession]
+        elif quarter is None:
+            raise ValueError("a bulk entry names its quarter")
+        else:
+            raw = self.zips[quarter]
+        self.entries.append(
+            manifest_entry(
+                accession=accession,
+                row_source=row_source,
+                quarter=None if quarter is None else f"{quarter.year}q{quarter.number}",
+                raw=raw,
+                outcome=outcome,
+                rows=rows,
+            )
+        )
+
+    def finish(self) -> str:
+        """Write the run's manifest once and return its digest. A fetched XML that
+        wrote nothing (an order sample, a refused parse, an earlier fetch of an
+        accession fetched again) is entered as such. A dry run writes no manifest;
+        the digest is then the hash of the bytes it would write, cited nowhere."""
+        if self.digest is None:
+            for accession in sorted(self.fetched):
+                while accession in self.fetched:
+                    self.record(accession, XML_SOURCE, None, "not_written", {})
+            zips = [
+                {
+                    "quarter": f"{quarter.year}q{quarter.number}",
+                    "sha256": raw.sha256,
+                    "url": raw.url,
+                    "fetched_at": None if raw.fetched_at is None else raw.fetched_at.isoformat(),
+                    "parser_version": raw.parser_version,
+                }
+                for quarter, raw in sorted(self.zips.items())
+            ]
+            body = build_manifest(
+                run_id=self.run_id,
+                source=self.writer,
+                mode=self.mode,
+                entries=self.entries,
+                zips=zips,
+            )
+            if self.dry_run:
+                self.would_manifest_bytes = len(body)
+                self.digest = hashlib.sha256(body).hexdigest()
+            else:
+                self.digest = raw_archive.archive_manifest(self.settings, body).sha256
+        return self.digest
+
+    def dry_run_clause(self) -> str:
+        """What a dry run would have kept: new raw bodies, their bytes, and the manifest."""
+        self.finish()
+        return (
+            f"; raw_archive_would_keep_bodies: {len(self.would_keep)}, "
+            f"raw_archive_would_keep_bytes: {sum(self.would_keep.values())}, "
+            f"raw_archive_would_keep_manifest_bytes: {self.would_manifest_bytes}"
+        )
+
+
+def _provenance_clause(provenance: _Form4Provenance | None) -> str:
+    """`; provenance_sha256=<hex>` for a writer message, placed by the caller
+    before any text `ingest.max_message_chars` can cut; empty with the archive off.
+    A dry run names no digest (no manifest was written) and reports what it would keep."""
+    if provenance is None:
+        return ""
+    if provenance.dry_run:
+        return provenance.dry_run_clause()
+    return f"; {PROVENANCE_KEY}={provenance.finish()}"
+
+
+def _form4_manifests(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, counts: Counter[str]
+) -> list[dict[str, Any]]:
+    """Every Form 4 writer run's manifest that its run row names, newest writer
+    first: the source of the held XML hashes and of the accessions already
+    rechecked against a zip hash (#2714 item 5). Read only when a changed zip
+    has held XML to recheck. Only manifests are read, never a raw body; a missing
+    or offline one is counted and passed over, so its accessions compare by rows
+    alone and are rechecked once more."""
+    manifests: list[dict[str, Any]] = []
+    runs = conn.execute(
+        "SELECT message FROM ingestion_runs WHERE source IN ('edgar', 'sec_forms') "
+        "AND mode = 'backfill' ORDER BY started_at DESC, finished_at DESC NULLS LAST"
+    ).fetchall()
+    for (message,) in runs:
+        digest = message_digest(message)
+        if digest is None:
+            continue
+        try:
+            manifests.append(parse_manifest(raw_archive.read_manifest(settings, digest)))
+        except (raw_archive.RawArchiveMissingError, raw_archive.RawArchiveOfflineError):
+            counts["sec_forms_provenance_manifest_unread"] += 1
+    return manifests
+
+
+def _bulk_run_fields(message: str | None) -> dict[str, str]:
+    """The `key=value` fields of one `sec_insider_bulk` run message, split on `;`."""
+    return dict(part.strip().split("=", 1) for part in (message or "").split(";") if "=" in part)
+
+
+def _write_form4_bulk(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    source: EdgarFilingSource,
+    subjects: frozenset[str],
+    now: datetime,
+    *,
+    provenance: _Form4Provenance | None = None,
+) -> tuple[int, str]:
+    """Select the subject issuers' Form 4 index rows and run the bulk route.
+
+    The owner's CLI entry is ``ingest --source edgar --backfill --since DATE``.
+    The switch is off by default. Its run message gives the plan and progress.
+    With the raw archive on, `provenance` is the enclosing writer run's recorder
+    (plan T348): fetched XML is kept before parse and its manifest is written
+    before the quarter rows; a missing recorder is refused rather than letting a
+    fetch go unkept.
+    """
+    if provenance is None and raw_archive.archive_on(settings):
+        raise ValueError("the Form 4 step with the raw archive on needs its writer's provenance")
+    previous = getattr(source, "form4_xml_keeper", None)
+    source.form4_xml_keeper = None if provenance is None else provenance.keep_xml
+    try:
+        return _form4_bulk(conn, settings, source, subjects, now, provenance)
+    finally:
+        source.form4_xml_keeper = previous
+
+
+def _form4_bulk(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    source: EdgarFilingSource,
+    subjects: frozenset[str],
+    now: datetime,
+    provenance: _Form4Provenance | None,
+) -> tuple[int, str]:
+    """`_write_form4_bulk`'s work, with the XML keeper set."""
+    from tradepartner.adapters import edgar_raw
+
+    start = settings.events.sec_forms_backfill_start
+    latest = quarter_of(now.date())
+    quarters = [
+        (year, number)
+        for year in range(start.year, latest.year + 1)
+        for number in range(1, 5)
+        if (start.year, (start.month - 1) // 3 + 1)
+        <= (year, number)
+        <= (latest.year, latest.number)
+    ]
+    candidates: dict[str, list[Form4IndexRow]] = defaultdict(list)
+    for _quarter, row in source._rows(quarters, (latest.year, latest.number)):
+        if (
+            row.form in ("4", "4/A")
+            and row.form in settings.events.sec_forms
+            and row.cik in subjects
+            and row.filed_on >= start
+        ):
+            entry = (row.accession, row.cik, row.form, row.filed_on)
+            if entry not in candidates[row.accession]:
+                candidates[row.accession].append(entry)
+    if not candidates:
+        return 0, "Form 4 bulk: 0 selected, 0 requests, 0 remaining"
+    # One quarter's bulk set in memory at a time (#2624): the plan reads each
+    # quarter once and releases it; the route reads it again from the zip the
+    # plan validated, with no request. Keep all index rows of an accession in
+    # one quarter even when their filing dates disagree.
+    by_quarter: dict[Quarter, dict[str, list[Form4IndexRow]]] = defaultdict(dict)
+    accession_quarters: dict[str, Quarter] = {}
+    for accession, rows in candidates.items():
+        quarter = quarter_of(rows[0][3])
+        accession_quarters[accession] = quarter
+        by_quarter[quarter][accession] = rows
+    filing_quarters = set(by_quarter)
+    started = time.monotonic()
+    _LOGGER.info(
+        "Form 4 bulk planning: %d candidates across %d quarters",
+        len(candidates),
+        len(filing_quarters),
+    )
+    stored = {
+        accession: stored_source
+        for accession, stored_source in conn.execute(
+            "SELECT DISTINCT accession, source FROM sec_filing_events WHERE form IN ('4', '4/A')"
+        ).fetchall()
+    }
+    completed: dict[str, str] = {}
+    for cursor, message in conn.execute(
+        "SELECT chunk_cursor, message FROM ingestion_runs "
+        "WHERE source='sec_insider_bulk' AND status IN ('ok', 'partial') "
+        "ORDER BY finished_at NULLS FIRST, started_at, run_id"
+    ).fetchall():
+        parts = _bulk_run_fields(message)
+        # Older rows only recorded the loaded digest. New rows explicitly carry
+        # the last digest checked, including "none" when there was no prior check.
+        digest = parts.get("checked_sha256", parts.get("zip_sha256"))
+        if digest is None:
+            completed.pop(cursor, None)
+        else:
+            completed[cursor] = digest
+    load_counts: Counter[str] = Counter()
+    digests: dict[Quarter, str] = {}
+    unreadable: set[Quarter] = set()
+    published: set[Quarter] = set()
+    selected: dict[str, list[Form4IndexRow]] = {}
+    queued_by_quarter: dict[Quarter, list[Form4IndexRow]] = {}
+    skip: set[str] = set()
+    multi_owner_stored: Counter[Quarter] = Counter()
+    rechecks: dict[Quarter, list[Form4IndexRow]] = defaultdict(list)
+    stamp_work: list[Form4IndexRow] = []
+    cross_route_disagree = samples = xml_expected = 0
+    for quarter in sorted(filing_quarters):
+        loaded, quarter_digests, quarter_counts, bad = load_bulk_quarters(
+            {quarter}, settings=settings, client=source._client
+        )
+        load_counts.update(quarter_counts)
+        unreadable.update(bad)
+        digests.update(quarter_digests)
+        if provenance is not None:
+            for loaded_quarter, loaded_digest in quarter_digests.items():
+                provenance.keep_zip(loaded_quarter, loaded_digest)  # before any derived write
+        quarter_bulk = loaded.get(quarter)
+        if quarter_bulk is not None:
+            published.add(quarter)
+        chosen: list[str] = []
+        for accession, rows in by_quarter.get(quarter, {}).items():
+            bulk_record = (
+                quarter_bulk.accessions.get(accession) if quarter_bulk is not None else None
+            )
+            if bulk_record is not None:
+                if bulk_record.issuer_cik is not None and bulk_record.issuer_cik not in subjects:
+                    continue
+                # A Form 4 can also be indexed under a reporting owner's CIK. The
+                # published data set names the issuer; use that row, irrespective
+                # of index order, and never stamp from the owner's payload.
+                issuer_rows = [row for row in rows if row[1] == bulk_record.issuer_cik]
+                selected[accession] = issuer_rows or rows
+            else:
+                # For an unpublished or bulk-missing accession, the XML parser
+                # checks issuer identity; try each subject-index candidate.
+                selected[accession] = rows
+            chosen.append(accession)
+        queued_by_quarter[quarter] = [row for accession in chosen for row in selected[accession]]
+        # One read per quarter, freed with the quarter (#2681), not one per accession.
+        xml_saved = _stored_xml_form4_transactions(
+            conn,
+            {
+                accession
+                for accession in chosen
+                if stored.get(accession) == "sec_form4_xml"
+                and quarter_bulk is not None
+                and accession in quarter_bulk.accessions
+            },
+        )
+        for accession in chosen:
+            stored_source = stored.get(accession)
+            if stored_source == "sec_form4_xml":
+                accession_bulk = (
+                    quarter_bulk.accessions.get(accession) if quarter_bulk is not None else None
+                )
+                if (
+                    accession_bulk is not None
+                    and not accession_bulk.identity_bad
+                    and not accession_bulk.order_bad
+                ):
+                    xml_rows = xml_saved.get(accession, ())
+                    if not rows_agree(accession_bulk.transactions, xml_rows):
+                        cross_route_disagree += 1
+                # Rule 4 (#2714 item 5): a held XML accession makes no request, unless
+                # its quarter's zip hash changed from a recorded check (archive on):
+                # then it is rechecked once, outside the route.
+                if (
+                    provenance is not None
+                    and accession_bulk is not None
+                    and zip_changed(
+                        completed.get(f"{quarter.year}q{quarter.number}"), digests.get(quarter)
+                    )
+                ):
+                    rechecks[quarter].append(selected[accession][0])
+                    xml_expected += 1
+                skip.add(accession)
+            elif stored_source == "sec_insider_bulk":
+                stored_multi_owner = (
+                    settings.events.form4_multi_owner_xml
+                    and quarter_bulk is not None
+                    and (record := quarter_bulk.accessions.get(accession)) is not None
+                    and len(set(record.filer_ciks)) > 1
+                )
+                if stored_multi_owner:
+                    # #2720 releases stored bulk roles after the owner reviews them.
+                    multi_owner_stored[quarter] += 1
+                if stored_multi_owner or (
+                    digests.get(quarter) is not None
+                    and completed.get(f"{quarter.year}q{quarter.number}") == digests[quarter]
+                ):
+                    skip.add(accession)
+        pending = [row for row in queued_by_quarter[quarter] if row[0] not in skip]
+        state = quarter_state(quarter, downloaded=quarter_bulk is not None, run_date=now.date())
+        if quarter not in unreadable and state is not QuarterState.MISSING:
+            stamp_work.extend(pending)
+        if (
+            quarter_bulk is not None
+            and not order_check_path(settings, quarter, digests[quarter]).exists()
+        ):
+            eligible = sum(
+                1
+                for accession, cik, _form, _filed in pending
+                if accession in quarter_bulk.accessions
+                and quarter_bulk.accessions[accession].issuer_cik == cik
+                and not quarter_bulk.accessions[accession].identity_bad
+                and not quarter_bulk.accessions[accession].order_bad
+                and (
+                    not settings.events.form4_multi_owner_xml
+                    or len(set(quarter_bulk.accessions[accession].filer_ciks)) == 1
+                )
+                and len(quarter_bulk.accessions[accession].rows) >= 2
+            )
+            samples += min(settings.events.form4_bulk_order_sample, eligible)
+        if quarter not in unreadable and state is not QuarterState.MISSING:
+            for accession, _cik, form, filed in pending:
+                candidate = (
+                    quarter_bulk.accessions.get(accession) if quarter_bulk is not None else None
+                )
+                if (
+                    settings.events.form4_multi_owner_xml
+                    and candidate is not None
+                    and len(set(candidate.filer_ciks)) > 1
+                ) or route_accession(
+                    candidate,
+                    state=state,
+                    submissions_form=form,
+                    submissions_filing_date=filed,
+                    price_below=settings.events.form4_xml_price_below,
+                    zero_price_codes=settings.events.form4_zero_price_xml_codes,
+                ).route is Route.XML:
+                    xml_expected += 1
+        del loaded, quarter_bulk, xml_saved  # released before the next quarter is read
+        _LOGGER.info(
+            "Form 4 bulk planned %dq%d: %d accessions queued, %d skipped; %.1fs elapsed",
+            quarter.year,
+            quarter.number,
+            len(chosen),
+            sum(accession in skip for accession in chosen),
+            time.monotonic() - started,
+        )
+    # Rule 4: an accession already rechecked against its quarter's current zip hash
+    # (by an earlier run whose recheck elsewhere in the quarter failed) is not
+    # fetched again; only the failed ones are.
+    manifest_counts: Counter[str] = Counter()
+    manifests = _form4_manifests(conn, settings, manifest_counts) if rechecks else []
+    for quarter, due in list(rechecks.items()):
+        label = f"{quarter.year}q{quarter.number}"
+        done = rechecked_against(manifests, label, digests[quarter])
+        rechecks[quarter] = [row for row in due if row[0] not in done]
+        xml_expected -= len(due) - len(rechecks[quarter])
+        if not rechecks[quarter]:
+            del rechecks[quarter]
+    first_pages = {cik for _accession, cik, _form, _filed in stamp_work}
+    by_cik: dict[str, list[str]] = defaultdict(list)
+    for accession, cik, _form, _filed in stamp_work:
+        by_cik[cik].append(accession)
+    missing_stamps = 0
+    for cik, accessions in by_cik.items():
+        cached = source._load_stamps(cik)  # read once per issuer, not once per accession
+        missing_stamps += sum(accession not in cached for accession in accessions)
+    plan = plan_requests(
+        RequestCounts(
+            submissions_first_pages=len(first_pages),
+            anchor_headers=missing_stamps if settings.edgar.stamp_sgml_check else 0,
+            xml_fetches=xml_expected,
+            order_samples=samples,
+        ),
+        budget=settings.events.sec_forms_max_requests,
+        already_spent=source.requests,
+    )
+    if plan.refused:
+        return (
+            0,
+            f"Form 4 bulk: {len(selected)} selected; {plan.message()}; "
+            f"sec_forms_budget_refused: 1; "
+            f"sec_forms_bulk_multi_owner_stored: {sum(multi_owner_stored.values())}",
+        )
+
+    added = 0
+    quarter_added: Counter[Quarter] = Counter()
+    quarter_changed: Counter[Quarter] = Counter()
+    written_stored: set[str] = set()
+
+    held = {
+        accession
+        for table in ("sec_filing_events", "sec_form4_transactions")
+        for (accession,) in conn.execute(f"SELECT DISTINCT accession FROM {table}").fetchall()
+    }
+
+    def entered(
+        filing: SecFormFiling, row_source: str, quarter: Quarter, tally: SecFormWrite
+    ) -> None:
+        if provenance is not None:
+            rows = _sec_form_rows(filing, ingested_at=now, source=row_source)
+            outcome = _write_outcome(tally)
+            provenance.record(
+                filing.accession, row_source, quarter, outcome, rows if tally.added else {}
+            )
+
+    def write_xml(filing: SecFormFiling) -> SecFormWrite:
+        nonlocal added
+        if provenance is not None:
+            provenance.xml_input(filing.accession)  # kept before parse, or refused
+        tally = write_sec_form_accession(
+            conn, filing, ingested_at=now, source=XML_SOURCE, stored=held
+        )
+        if filing.accession in stored:
+            written_stored.add(filing.accession)
+        added += tally.added
+        quarter = quarter_of(filing.filed_date)
+        quarter_added[quarter] += tally.added
+        quarter_changed[quarter] += tally.changed
+        entered(filing, XML_SOURCE, accession_quarters.get(filing.accession, quarter), tally)
+        return tally
+
+    def write_bulk(filing: SecFormFiling, quarter: Quarter) -> SecFormWrite:
+        nonlocal added
+        tally = write_sec_form_accession(
+            conn, filing, ingested_at=now, source=BULK_SOURCE, stored=held
+        )
+        entered(filing, BULK_SOURCE, quarter, tally)
+        if filing.accession in stored:
+            written_stored.add(filing.accession)
+        added += tally.added
+        quarter_added[quarter] += tally.added
+        quarter_changed[quarter] += tally.changed
+        return tally
+
+    def stamp(cik: str, accession: str, filed: date) -> tuple[datetime, str, date] | None:
+        payload = source._fetch_submissions(cik, {accession}).records.get(accession)
+        checked = source._sec_stamped(cik, accession, filed)
+        if (
+            payload is None
+            or payload.filing_date is None
+            or checked is None
+            or checked.accepted_at is None
+        ):
+            return None
+        return checked.accepted_at, payload.form, payload.filing_date
+
+    def checked(quarter: Quarter) -> bool:
+        return order_check_path(settings, quarter, digests[quarter]).exists()
+
+    #: A dry run's passing order checks: the marker names it would write (#2757).
+    would_remember: list[str] = []
+
+    def remember(quarter: Quarter) -> None:
+        marker = order_check_path(settings, quarter, digests[quarter])
+        if _DRY_RUN.get():  # a dry run changes nothing on disk; it names the marker
+            would_remember.append(marker.name)
+            return
+        edgar_raw.write_atomic(marker, b"passed")
+
+    counts: Counter[str] = Counter(load_counts)
+    counts["sec_forms_bulk_multi_owner_stored"] = sum(multi_owner_stored.values())
+    remaining = 0
+    # Each quarter's own unwritten count, for its run row (#2728); they sum to `remaining`.
+    quarter_remaining: Counter[Quarter] = Counter()
+    checked_digests = completed.copy()
+    route_quarters = sorted(queued_by_quarter)
+    counts.update(manifest_counts)
+    recheck_wanted = {row[0] for rows in rechecks.values() for row in rows}
+    prior = prior_xml_hashes(manifests, recheck_wanted)
+    rechecked: set[str] = set()
+
+    def recheck(quarter: Quarter) -> BulkRouteResult | None:
+        """Recheck the quarter's held XML accessions after a zip change; a result
+        only on a budget stop, which then stands in for the route's. A failed
+        recheck counts in the quarter's `remaining`, so its row is `partial`."""
+        nonlocal remaining
+        if provenance is None:
+            return None
+        due = rechecks.get(quarter, [])
+        for position, (accession, cik, _form, filed) in enumerate(due):
+            try:
+                if source.requests >= settings.events.sec_forms_max_requests:
+                    raise RequestBudgetStopped
+                filing = source.sec_form4_accession(cik, accession, filed)
+            except RequestBudgetStopped:
+                pending = sum(row[0] not in skip for row in queued_by_quarter[quarter])
+                stop = Counter({"sec_forms_budget_stopped": 1})
+                return BulkRouteResult(stop, source.requests, len(due) - position + pending)
+            if filing is None:
+                counts["sec_forms_xml_recheck_failed"] += 1
+                quarter_remaining[quarter] += 1
+                remaining += 1
+                continue
+            verdict = recheck_verdict(prior.get(accession), provenance.xml_input(accession).sha256)
+            counts[f"sec_forms_xml_recheck_{verdict}"] += 1
+            if verdict == "same":
+                provenance.record(accession, XML_SOURCE, quarter, "recheck_same", {})
+            else:  # both bodies are kept; a differing row takes the changed-row refusal
+                tally = write_xml(filing)
+                if tally.changed:
+                    counts["sec_forms_changed"] += 1
+            rechecked.add(accession)
+        return None
+
+    for position, quarter in enumerate(route_quarters):
+        rows = queued_by_quarter[quarter]
+        quarter_bulk = None
+        # A quarter whose every accession is skipped is not read again.
+        needed = any(row[0] not in skip for row in rows)
+        if needed and quarter in published and quarter not in unreadable:
+            reread, reread_digests, _counts, bad = load_bulk_quarters(
+                {quarter}, settings=settings, client=source._client, revalidate=False
+            )
+            quarter_bulk = reread.get(quarter)
+            if (
+                quarter in bad
+                or quarter_bulk is None
+                or reread_digests.get(quarter) != digests[quarter]
+            ):
+                # The zip changed since the plan read it: fail closed for the quarter.
+                counts["sec_forms_bulk_unreadable"] += 1
+                unreadable.add(quarter)
+                quarter_bulk = None
+            del reread
+        stopped = recheck(quarter) if quarter in rechecks else None
+        result = stopped or run_form4_bulk_route(
+            rows,
+            quarters={quarter: quarter_bulk},
+            stamp=stamp,
+            xml=source.sec_form4_accession,
+            write=write_xml,
+            write_bulk=write_bulk,
+            now=now,
+            price_below=settings.events.form4_xml_price_below,
+            zero_price_codes=tuple(settings.events.form4_zero_price_xml_codes),
+            order_sample_size=settings.events.form4_bulk_order_sample,
+            multi_owner_xml=settings.events.form4_multi_owner_xml,
+            budget=settings.events.sec_forms_max_requests,
+            request_count=lambda: source.requests,
+            checked=checked,
+            remember_check=remember,
+            skip_accessions=frozenset(skip),
+            blocked_quarters=frozenset(unreadable),
+            source_counts_failures=True,
+            accession_quarters=accession_quarters,
+        )
+        del quarter_bulk  # released before the next quarter is read
+        counts.update(result.counts)
+        remaining += result.remaining
+        quarter_remaining[quarter] += result.remaining
+        # A failed stored accession must be compared again on the next run. New
+        # accession failures do not prevent the digest from advancing (#2688).
+        routed_stored = {row[0] for row in rows if row[0] not in skip and row[0] in stored}
+        if (
+            not result.counts.get("sec_forms_budget_stopped")
+            and not result.counts.get("sec_forms_bulk_order_mismatch")
+            and quarter not in unreadable
+            and routed_stored <= written_stored
+            and all(row[0] in rechecked for row in rechecks.get(quarter, ()))
+        ):
+            digest = digests.get(quarter)
+            if digest is not None:
+                checked_digests[f"{quarter.year}q{quarter.number}"] = digest
+        _LOGGER.info(
+            "Form 4 bulk routed %dq%d: %d queued, %d added, %d remaining, "
+            "%d requests; %.1fs elapsed",
+            quarter.year,
+            quarter.number,
+            len(rows),
+            quarter_added[quarter],
+            result.remaining,
+            source.requests,
+            time.monotonic() - started,
+        )
+        if result.counts.get("sec_forms_budget_stopped"):
+            for later in route_quarters[position + 1 :]:
+                unreached = len({row for row in queued_by_quarter[later] if row[0] not in skip})
+                unreached += len(rechecks.get(later, ()))
+                quarter_remaining[later] += unreached
+                remaining += unreached
+            break
+    if cross_route_disagree:
+        counts["sec_forms_bulk_xml_disagree"] = cross_route_disagree
+    # The manifest is written and its digest fixed before any run row cites it.
+    # A dry run's quarter rows (rolled back) name no digest: no manifest was written.
+    provenance_digest = None if provenance is None else provenance.finish()
+    if provenance is not None and provenance.dry_run:
+        provenance_digest = None
+    for quarter in sorted(filing_quarters):
+        label = f"{quarter.year}q{quarter.number}"
+        selected_count = len(queued_by_quarter.get(quarter, ()))
+        digest = digests.get(quarter, "none")
+        # `remaining` is this quarter's own count and sets its status; `run_remaining`
+        # is the whole run's (#2728). `_bulk_run_fields` reads the digests back.
+        # The digests lead in a pinned order (T348), so `checked_sha256` and
+        # `provenance_sha256` survive a short `ingest.max_message_chars` cut.
+        run_message = _clean(
+            quarter_message(
+                checked=checked_digests.get(label, "none"),
+                provenance=provenance_digest,
+                zip_sha256=digest,
+                rest=(
+                    f"quarter={label}; selected={selected_count}; "
+                    f"rows_added={quarter_added[quarter]}; "
+                    f"rows_changed={quarter_changed[quarter]}; "
+                    f"remaining={quarter_remaining[quarter]}; run_remaining={remaining}; "
+                    f"sec_forms_bulk_multi_owner_stored={multi_owner_stored[quarter]}"
+                ),
+            ),
+            settings,
+        )
+        complete = quarter_remaining[quarter] == 0 and quarter not in unreadable
+        _write_run(
+            conn,
+            uuid.uuid4().hex,
+            now,
+            now,
+            SourceRun(
+                "sec_insider_bulk",
+                "ok" if complete else "partial",
+                quarter_added[quarter],
+                label,
+                run_message,
+            ),
+            mode="backfill",
+        )
+    figures = ", ".join(f"{name}: {count}" for name, count in sorted(counts.items()))
+    would_write = "".join(f"; order_check_would_write: {name}" for name in would_remember)
+    return added, (
+        f"Form 4 bulk: {len(selected)} selected, {added} rows added, "
+        f"{source.requests} requests, {remaining} remaining; {plan.message()}; {figures}"
+        f"{would_write}"
+    )
+
+
+def _write_sec_forms(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    raw_source: FilingSource,
+    filings_13d: Callable[[], Sequence[SecFormFiling]],
+    subjects: frozenset[str],
+    now: datetime,
+    *,
+    form4: bool,
+    provenance: _Form4Provenance | None = None,
+) -> tuple[int, str]:
+    """The SEC ownership forms step: the Form 4 bulk backfill when `form4` is set
+    (an EDGAR backfill) and the 13D filings `filings_13d` returns, each written for
+    its subject CIKs in `subjects`. Returns the rows added and the run-message clause.
+    The EDGAR chunk and `ingest_sec_forms` (#2624) both write through it.
+    `provenance` is the writer run's Form 4 recorder (T348; `None` with the raw
+    archive off); its manifest is written here even when the step stops early."""
+    from tradepartner.adapters.edgar_source import EdgarFilingSource
+
+    sec_added = sec_changed = sec_future = 0
+    form4_message = ""
+    if (
+        form4
+        and isinstance(raw_source, EdgarFilingSource)
+        and any(form in settings.events.sec_forms for form in ("4", "4/A"))
+    ):
+        try:
+            with request_budget(
+                raw_source._client,
+                lambda: raw_source.requests,
+                settings.events.sec_forms_max_requests,
+            ):
+                form4_added, form4_message = _write_form4_bulk(
+                    conn, settings, raw_source, subjects, now, provenance=provenance
+                )
+        except RequestBudgetStopped:
+            form4_added = 0
+            form4_message = (
+                f"Form 4 bulk: {raw_source.requests} requests; sec_forms_budget_stopped: 1"
+            )
+        sec_added += form4_added
+    if provenance is not None:
+        provenance.finish()
+    for filing in filings_13d():
+        for subject in filing.subject_ciks:
+            if subject not in subjects:
+                continue
+            sec_write = write_sec_form_accession(
+                conn, replace(filing, subject_ciks=(subject,)), ingested_at=now
+            )
+            sec_added += sec_write.added
+            sec_changed += sec_write.changed
+            sec_future += sec_write.not_yet_known
+    source_counts = getattr(raw_source, "sec_forms_counts", {})
+    figures = {"added": sec_added, "changed": sec_changed, "not_yet_known": sec_future}
+    for name, count in source_counts.items():
+        figures[name] = figures.get(name, 0) + count
+    for name, count in getattr(raw_source, "sec_forms_requests", {}).items():
+        figures[f"requests_{name}"] = count
+    message = "; " + ", ".join(f"sec_forms_{name}: {count}" for name, count in figures.items())
+    if form4_message:
+        message += f"; {form4_message}"
+    return sec_added, message
+
+
+#: The run-row source of `ingest_sec_forms` (#2624); its quarters keep their
+#: own `sec_insider_bulk` rows, as in the EDGAR chunk.
+SEC_FORMS_SOURCE = "sec_forms"
+#: The run-row sources of the SEC forms backfill: they say nothing about when
+#: the bars or the master arrived, so freshness reads skip them (#2624).
+SEC_FORMS_BACKFILL_SOURCES = frozenset({SEC_FORMS_SOURCE, "sec_insider_bulk"})
+_SEC_13D_FORMS = frozenset({"SC 13D", "SC 13D/A", "SCHEDULE 13D", "SCHEDULE 13D/A"})
+
+
+def ingest_sec_forms(
+    settings: Settings,
+    filings: EdgarFilingSource,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+) -> IngestResult:
+    """The SEC ownership forms backfill alone (#2624, `ingest --source edgar
+    --sec-forms-only`): the EDGAR backfill's SEC forms step with no filing index
+    since 1993, master build, facts or events. It reads only the quarterly index
+    rows from `events.sec_forms_backfill_start` and writes the Form 4 and 13D rows
+    and run rows the EDGAR chunk's step writes (`_write_sec_forms`), for the
+    subject CIKs of the stored `securities`. A CIK the day's master build would
+    add is not a subject until a full EDGAR run stores it. One run row, source
+    `sec_forms`, mode `backfill`; no other table is written."""
+    if not settings.events.sec_forms_enabled:
+        raise ValueError("ingest_sec_forms needs events.sec_forms_enabled")
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    held: list[SecFormFiling] = []
+
+    def gate() -> None:
+        validation = getattr(filings, "validation_failures", None)
+        if validation is not None:
+            counted = {label: getattr(filings, name, 0) for name, label in _EMPTY_COUNTS}
+            validation.raise_if_any(settings, counted)
+
+    def prepare() -> None:
+        # The 13D fetches, with no store connection open, as `_prefetch` makes them.
+        with open_read_only(settings, retry=True) as conn:
+            subjects = frozenset(
+                cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+            )
+        if _SEC_13D_FORMS & frozenset(settings.events.sec_forms):
+            held.extend(filings.sec_forms_13d(subjects))
+        gate()
+        _check_source_failures(filings, dry_run=False)
+
+    def work(conn: duckdb.DuckDBPyConnection, run_id: str) -> tuple[int, str]:
+        subjects = frozenset(
+            cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+        )
+        provenance = _Form4Provenance.start(
+            settings, run_id=run_id, writer=SEC_FORMS_SOURCE, mode="backfill"
+        )
+        added, message = _write_sec_forms(
+            conn, settings, filings, lambda: held, subjects, now, form4=True, provenance=provenance
+        )
+        gate()  # a quarter index the Form 4 walk could not parse fails the run
+        # The manifest digest leads, before any text `max_message_chars` can cut (T348).
+        return added, f"{len(subjects)} subjects{_provenance_clause(provenance)}{message}"
+
+    run = _run_source(
+        SEC_FORMS_SOURCE,
+        work,
+        settings,
+        now,
+        clock,
+        f"since={settings.events.sec_forms_backfill_start.isoformat()}",
+        dry_run=False,
+        mode="backfill",
+        prepare=prepare,
+        after_commit=getattr(filings, "record_failures", None),
+    )
+    return IngestResult((run,))
+
+
 def _ingest_filings(
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
@@ -1393,6 +4087,7 @@ def _ingest_filings(
     restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
     restamp_window_ok: WindowEarlierOk | None = None,
+    touched_ciks: frozenset[str] | None = None,
 ) -> tuple[int, str]:
     """The EDGAR chunk: build the master, delistings, classifications and
     facts once more from the recorded answers, add what changes an as-of
@@ -1409,14 +4104,25 @@ def _ingest_filings(
     # recompute it (#564). A caller that hands an unfrozen source still
     # meets the input-validation gate before any row is written (#578).
     if not (isinstance(filings, _Recorded) and filings.frozen):
+        if settings.events.sec_forms_enabled:
+            recorded.sec_subjects = frozenset(
+                cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+            )
         _fetch_and_gate(recorded, settings)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
-    # Each run fetches only today's SEC ticker file: the stored snapshot rows
-    # are the earlier fetches, so a rename is judged against them (#2291).
-    earlier = stored_snapshot_fetches(conn, now)
+    # Each run fetches only today's SEC ticker file. Stored sightings include
+    # pending first observations, so a rename needs confirmation (#2295).
+    earlier = stored_snapshot_history(conn, now)
+    if touched_ciks is not None:
+        earlier = tuple(
+            entry
+            for entry in earlier
+            if entry.cik in touched_ciks or entry.ticker in settings.benchmarks
+        )
     master, delistings, classes, facts, unmatched = _build_filings(
         recorded, settings, now, earlier_fetches=earlier
     )
+    record_snapshot_sightings(conn, recorded.companies_snapshot(), now, master.listings)
     restamped = ""
     if restamp is not None:
         result = restamp_from_manifest(
@@ -1483,15 +4189,52 @@ def _ingest_filings(
         events = event_tally.message(_unwrap(filings))
     elif rebuild_filing_events:
         raise ValueError(_REBUILD_EVENTS_NEEDS_SWITCH)
+    sec_forms = ""
+    form4_provenance: _Form4Provenance | None = None
+    if settings.events.sec_forms_enabled:
+        form4 = _FORM4_BACKFILL.get()
+        if form4:
+            form4_provenance = _Form4Provenance.start(
+                settings, run_id=run_id, writer="edgar", mode="backfill"
+            )
+        subjects = frozenset(
+            cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+        )
+        prefetch_subjects = (
+            filings.sec_forms_subjects
+            if isinstance(filings, _Recorded) and filings.frozen
+            else recorded.sec_forms_subjects
+        )
+        sec_added, sec_forms = _write_sec_forms(
+            conn,
+            settings,
+            _unwrap(filings),
+            lambda: recorded.sec_forms_13d(prefetch_subjects),
+            subjects,
+            now,
+            form4=form4,
+            provenance=form4_provenance,
+        )
+        added += sec_added
     skip = _unjudged_ciks(recorded).ciks
     keep = frozenset(settings.master.keep_successors)  # owner-accepted (#922)
     derived = frozenset(row["security_id"] for row in master.securities)
-    found, _ = split_kept(stored_underived(conn, master, now, skip), keep, derived)
+    if touched_ciks is None:
+        found, _ = split_kept(stored_underived(conn, master, now, skip), keep, derived)
+    else:
+        all_ciks = frozenset(
+            cik for (cik,) in conn.execute("SELECT DISTINCT cik FROM securities").fetchall()
+        )
+        previous = underived_as_of(conn, now).iter_rows(named=True)
+        recomputed = stored_underived(conn, master, now, skip | (all_ciks - touched_ciks))
+        complete = carry_forward_underived(recomputed, previous, touched_ciks, skip)
+        found, _ = split_kept(complete, keep, derived)
     record_underived(conn, run_id, now, found)
     message = (
-        f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
+        f"{len(master.securities)} securities{_provenance_clause(form4_provenance)}; "
+        f"unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
-        f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}"
+        f"{statements}{events}{sec_forms}{rebuilt}{restamped}{_source_counts(filings)}"
         f"{_filename_counts(master, delistings, filings)}{chains}{candidates}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
@@ -1643,6 +4386,7 @@ def _source_counts(filings: FilingSource) -> str:
         ("facts_missing", "facts missing"),  # T11h: T11e's company-facts-404 leftover
         ("facts_bulk_empty", "empty bulk facts"),  # #566: `{}` companyfacts.zip members
         ("submissions_bulk_empty", "empty bulk submissions"),
+        ("bulk_not_modified", "bulk zips kept (304)"),  # #2594: conditional GET hits
         ("facts_api_empty", "empty API facts"),  # #576: per-CIK API 200 `{}`
         ("submissions_api_empty", "empty API submissions"),
         ("stamp_check_mismatched_ciks", "CIKs stamped from SGML"),  # #1494
@@ -1693,6 +4437,13 @@ def _build_filings(
     if fetch and settings.edgar.filing_events_enabled:  # #1358: full history, every run
         for cik in ciks:
             filings.filing_events(cik)
+    if fetch and settings.events.sec_forms_enabled:
+        subjects = getattr(filings, "sec_subjects", frozenset()) | frozenset(
+            row["cik"] for row in master.securities
+        )
+        if isinstance(filings, _Recorded):
+            filings.sec_forms_subjects = subjects
+        filings.sec_forms_13d(subjects)
     link = settings.edgar.class_member_link
     facts, unmatched = fact_rows(
         records,
@@ -1746,6 +4497,11 @@ RESTAMP_TABLES: tuple[str, ...] = (
     "facts",
     "delistings",
 )
+
+#: The tables the restamp moves by `(cik, accession)` instead of `security_id`
+#: (T318b, #2703): a `filing_index` row has no security, and an accession can
+#: have several revision rows that all move with it.
+RESTAMP_ACCESSION_TABLES: tuple[str, ...] = ("filing_index",)
 
 #: A manifest CIK as the store keeps it: ten digits, zero-padded.
 _MANIFEST_CIK = re.compile(r"\d{10}")
@@ -1869,7 +4625,9 @@ class RestampResult:
 
     def message(self) -> str:
         """The run message's restamp part."""
-        moved = ", ".join(f"{t} {self.moved.get(t, 0)}" for t in RESTAMP_TABLES)
+        moved = ", ".join(
+            f"{t} {self.moved.get(t, 0)}" for t in (*RESTAMP_TABLES, *RESTAMP_ACCESSION_TABLES)
+        )
         refused = ", ".join(f"{cik} ({why})" for cik, why in sorted(self.refused.items()))
         return (
             f"; restamp: {self.changes} changes, moved {moved}; "
@@ -1935,6 +4693,17 @@ def restamp_from_manifest(
     do. A moved row gets the new stamp as `known_at` (and as `filed_at`, a
     delisting's stamp) and `ingested_at` as its `ingested_at`; nothing else
     changes.
+
+    **`filing_index`** (T318b, #2703) has its own match path, on
+    `(cik, accession)` with `accepted_at` equal to the old stamp (EDGAR
+    `filing` rows only). It moves every revision of a matched accession: the
+    earliest row (`known_at = accepted_at`) takes the new stamp as both, later
+    rows take it as `accepted_at` and keep their `known_at`; every moved row
+    gets `ingested_at`. An accession whose new stamp is at or after one of
+    its revisions' `known_at`, or that two changes move to different new
+    stamps, is refused: its subject CIK (the filer's, or a Form 25's
+    subject) lands in `refused` naming the accession, and none of that CIK's
+    rows move. A Form 25's filer is not refused: its other accessions move.
 
     **Refused CIKs**, by the matched rows' security CIK (none of the CIK's
     rows move; listed in the result): a change moving a date a column was
@@ -2029,7 +4798,7 @@ def restamp_from_manifest(
                     flags[2],
                 )
             )
-    for temp in ("_restamp_cik", "_restamp_delisting", "_restamp_sids", "_restamp_refused"):
+    for temp in _RESTAMP_TEMPS:
         conn.execute(f"DROP TABLE IF EXISTS {temp}")
     conn.execute(
         "CREATE TEMP TABLE _restamp_cik (cik VARCHAR, old TIMESTAMPTZ, new TIMESTAMPTZ, "
@@ -2099,6 +4868,9 @@ def restamp_from_manifest(
             f"(SELECT 1 FROM {table} o WHERE {same_key} AND {target})"
         ).fetchall():
             refused.setdefault(cik, f"{table}: a row is already stored at the new stamp")
+    _stage_filing_index_changes(conn, moving, filed)
+    for cik, why in _filing_index_refusals(conn, filed).items():
+        refused.setdefault(cik, why)
     if refused:
         conn.executemany("INSERT INTO _restamp_refused VALUES (?)", [[c] for c in sorted(refused)])
     refused_ids = frozenset(
@@ -2123,7 +4895,8 @@ def restamp_from_manifest(
             f"m.new AS new {matched[table]}) u WHERE {table}.rowid = u.rid",
             [ingested_at],
         )
-    for temp in ("_restamp_cik", "_restamp_delisting", "_restamp_sids", "_restamp_refused"):
+    moved["filing_index"] = _move_filing_index(conn, ingested_at)
+    for temp in _RESTAMP_TEMPS:
         conn.execute(f"DROP TABLE {temp}")
     after = {t: _security_ids(conn, t) for t in RESTAMP_TABLES}
     if after != before:
@@ -2132,6 +4905,107 @@ def restamp_from_manifest(
     return RestampResult(
         moved=moved, refused=refused, changes=len(moving), refused_securities=refused_ids
     )
+
+
+#: The temp tables one restamp builds and drops.
+_RESTAMP_TEMPS = (
+    "_restamp_cik",
+    "_restamp_delisting",
+    "_restamp_sids",
+    "_restamp_refused",
+    "_restamp_accession",
+)
+
+#: The `filing_index` rows a change matches: its `(cik, accession)`, the old
+#: stamp as `accepted_at`, EDGAR `filing` provenance, a CIK not refused.
+_FILING_INDEX_MATCH = (
+    "FROM filing_index t JOIN _restamp_accession a ON a.cik = t.cik "
+    "AND a.accession = t.accession AND a.old = t.accepted_at "
+    "WHERE t.source = 'edgar' AND t.provenance = 'filing' "
+    "AND t.cik NOT IN (SELECT cik FROM _restamp_refused) "
+    "AND a.subject NOT IN (SELECT cik FROM _restamp_refused)"
+)
+
+
+def _stage_filing_index_changes(
+    conn: duckdb.DuckDBPyConnection,
+    moving: Sequence[ManifestRow],
+    filed: Mapping[str, DelistingFiling],
+) -> None:
+    """The moving changes as `_restamp_accession(cik, accession, old, new,
+    subject)`, the `(cik, accession)` match path of the `filing_index` rows
+    (T318b). `subject` is a Form 25's subject CIK (else the filer's): a refused
+    subject keeps the index row where its derived rows stay."""
+    conn.execute(
+        "CREATE TEMP TABLE _restamp_accession "
+        "(cik VARCHAR, accession VARCHAR, old TIMESTAMPTZ, new TIMESTAMPTZ, subject VARCHAR)"
+    )
+    rows = sorted(
+        {
+            (c.cik, c.accession, c.old_stamp, c.new_stamp, filed[c.accession].cik)
+            if c.accession in filed
+            else (c.cik, c.accession, c.old_stamp, c.new_stamp, c.cik)
+            for c in moving
+        }
+    )
+    if rows:
+        conn.executemany("INSERT INTO _restamp_accession VALUES (?, ?, ?, ?, ?)", rows)
+
+
+def _filing_index_refusals(
+    conn: duckdb.DuckDBPyConnection, filed: Mapping[str, DelistingFiling]
+) -> dict[str, str]:
+    """CIK -> why, for the accessions the `filing_index` rows cannot move: a
+    stored accession (matched on the old stamp) with a revision whose
+    `known_at` is at or before the new stamp, which would leave the revision
+    known before its own acceptance, or two changes giving it different new
+    stamps. The CIK named is the accession's subject (a Form 25's subject, else
+    the filer), so the accession's derived rows and its index rows never move
+    apart; a Form 25's filer keeps its other accessions moving (#2807)."""
+    why_by_accession: dict[tuple[str, str], str] = {}
+    for cik, accession in conn.execute(
+        "SELECT DISTINCT t.cik, t.accession "
+        "FROM filing_index t JOIN _restamp_accession a ON a.cik = t.cik "
+        "AND a.accession = t.accession AND a.old = t.accepted_at "
+        "WHERE t.known_at > t.accepted_at AND a.new >= t.known_at"
+    ).fetchall():
+        why_by_accession[(cik, accession)] = (
+            "the new acceptance is at or after a revision's known_at"
+        )
+    for cik, accession in conn.execute(
+        "SELECT DISTINCT a.cik, a.accession FROM _restamp_accession a "
+        "WHERE EXISTS (SELECT 1 FROM _restamp_accession b WHERE b.cik = a.cik "
+        "AND b.accession = a.accession AND b.old = a.old AND b.new <> a.new)"
+    ).fetchall():
+        why_by_accession.setdefault((cik, accession), "one accession, two new stamps")
+    named: dict[str, list[str]] = {}
+    for (cik, accession), why in sorted(why_by_accession.items()):
+        # A Form 25's subject is refused (its delisting stays with the index row);
+        # the filing exchange is not, so its other accessions still move (#2807).
+        target = filed[accession].cik if accession in filed else cik
+        named.setdefault(target, []).append(f"{accession} ({why})")
+    return {
+        cik: "filing_index: accession " + "; ".join(items) for cik, items in sorted(named.items())
+    }
+
+
+def _move_filing_index(conn: duckdb.DuckDBPyConnection, ingested_at: datetime) -> int:
+    """Move every revision of each matched, unrefused accession; the rows moved.
+    The earliest row (`known_at = accepted_at`) takes the new stamp as both;
+    a later row takes it as `accepted_at` and keeps its `known_at`."""
+    (count,) = conn.execute(f"SELECT count(DISTINCT t.rowid) {_FILING_INDEX_MATCH}").fetchone() or (
+        0,
+    )
+    if count:
+        conn.execute(
+            "UPDATE filing_index SET accepted_at = u.new, ingested_at = ?, "
+            "known_at = CASE WHEN filing_index.known_at = filing_index.accepted_at "
+            "THEN u.new ELSE filing_index.known_at END "
+            f"FROM (SELECT DISTINCT t.rowid AS rid, a.new AS new {_FILING_INDEX_MATCH}) u "
+            "WHERE filing_index.rowid = u.rid",
+            [ingested_at],
+        )
+    return int(count)
 
 
 #: Each restamped table's UNIQUE key without `known_at`: a moved row must not

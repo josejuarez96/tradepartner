@@ -99,6 +99,7 @@ from tradepartner.calendar import all_sessions, is_session, previous_session, se
 from tradepartner.config import PAPER_FAMILIES, Cadence, HypothesisFamily, RiskConfig, Settings
 from tradepartner.errors import StaleDataError, SystemFaultError, UniverseCollapseError
 from tradepartner.execution import breaks as break_rules
+from tradepartner.execution.buy_timing import execution_for
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.plan import (
     AssetFlags,
@@ -778,6 +779,8 @@ def _write(
             n_orders_below_min_at_live_capital=decided.n_orders_below_min_at_live_capital,
             known_at=now,
             ingested_at=now,
+            n_assets_intersected=plan.n_assets_intersected,
+            assets_intersection_skipped=plan.assets_intersection_skipped,
         ),
     )
     return tuple(rows)
@@ -885,6 +888,7 @@ def plan_rebalance(
             band=band,
             hold=None,
             restricted=restricted,
+            sleeve_fraction=execution_for(settings, window.book_id).cash_sleeve_fraction,
         )
         rows = _write(conn, journal, run.run_id, t_i, plan, decided, handle, now, window.book_id)
         _trial(lambda: _close_ok(conn, handle), "its result")

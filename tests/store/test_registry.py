@@ -27,6 +27,7 @@ import duckdb
 import pytest
 
 from tradepartner.config import Cadence, Settings
+from tradepartner.config_edgar import PRE_2826_STATEMENT_FACTS
 from tradepartner.store import journal, registry, schema
 from tradepartner.store.benchmarks import CHECK_ONLY_IDS
 from tradepartner.store.db import insert_row
@@ -1182,7 +1183,22 @@ def test_every_fact_table_is_classified_for_trial_vintage(
         # none is read by a reader a registered trial uses. `successor_chains`
         # (#821, T187) is inside the vintage: its rows move the chained reads a
         # trial sees.
-        excluded = {"rates", "borrow_status", "symbol_changes", "openfigi_types", "mergers"}
+        excluded = {
+            "rates",
+            "borrow_status",
+            "symbol_changes",
+            "openfigi_types",
+            "mergers",
+            "spinoff_allocations",
+            "sec_filing_events",
+            "sec_form4_transactions",
+            "snapshot_sightings",  # trials read listings, never raw SEC observations
+            "delisting_reasons",
+            "filing_index",
+            "filing_index_pending",
+            "edgar_filers",
+            "edgar_index_files",
+        }
         assert included.isdisjoint(excluded)
         # An included name must be a store table, and every store table must
         # be classified on one side. `symbol_changes` is the amendment's
@@ -2471,3 +2487,120 @@ def test_a_check_only_dividend_alone_moves_nothing_but_a_universe_dividend_does(
     )
     for flag in (False, True):
         assert registry.data_vintage(fixture_store, cutoff, spin_offs=flag) == _LATE_INGEST
+
+
+def test_spinoff_allocation_does_not_move_trial_vintage(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    cutoff = datetime(2020, 1, 1, tzinfo=UTC)
+    before = registry.data_vintage(fixture_store, cutoff, spin_offs=True)
+    stamp = datetime(2019, 1, 1, tzinfo=UTC)
+    fixture_store.execute(
+        "INSERT INTO spinoff_allocations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ["P", "C", date(2018, 12, 13), 0.3, stamp, stamp, "owner", "owner"],
+    )
+    assert registry.data_vintage(fixture_store, cutoff, spin_offs=True) == before
+
+
+def test_sec_ownership_rows_do_not_move_trial_vintage() -> None:
+    """Collecting research-only ownership events cannot stale a trial."""
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    stamp = datetime(2026, 10, 28, 21, tzinfo=UTC)
+    before = registry.data_vintage(conn, stamp)
+    conn.execute(
+        "INSERT INTO sec_filing_events VALUES ('accession', '4', ?, '2026-10-28', "
+        "'issuer', 'owner', ?, ?, 'edgar', 'filing')",
+        [stamp, stamp, stamp],
+    )
+    conn.execute(
+        "INSERT INTO sec_form4_transactions VALUES (" + ", ".join(["?"] * 23) + ")",
+        [
+            "accession",
+            "issuer",
+            "owner",
+            0,
+            False,
+            True,
+            False,
+            False,
+            date(2026, 10, 28),
+            None,
+            "P",
+            "A",
+            10,
+            2,
+            10,
+            "D",
+            "Common",
+            None,
+            stamp,
+            stamp,
+            stamp,
+            "edgar",
+            "filing",
+        ],
+    )
+    assert registry.data_vintage(conn, stamp) == before
+
+
+def _statement_row(
+    conn: duckdb.DuckDBPyConnection, fact_name: str, known: datetime, ingested: datetime
+) -> None:
+    insert_row(
+        conn,
+        "statement_facts",
+        {
+            "cik": "0000000099",
+            "fact_name": fact_name,
+            "xbrl_tag": f"us-gaap:{fact_name}",
+            "period_start": None,
+            "period_end": date(2019, 12, 31),
+            "period_days": 0,
+            "value": 1.0,
+            "unit": "USD",
+            "form": "10-K",
+            "filing_accession": "0000000099-20-000001",
+            "basis": "reported",
+            "comparative": False,
+            "known_at": known,
+            "ingested_at": ingested,
+            "source": "test",
+            "provenance": "filing",
+        },
+    )
+
+
+def test_a_new_statement_name_moves_no_trial_vintage_but_a_held_name_does(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#2826 (T366; owner answer 4): rows of a name outside
+    `PRE_2826_STATEMENT_FACTS` stale no trial at any cutoff, while
+    `store_max_ingested_at` still moves; a row of a held name still moves the
+    vintage from its `known_at` on."""
+    cutoffs = _fixture_cutoffs(fixture_store)
+    before = {cutoff: registry.data_vintage(fixture_store, cutoff) for cutoff in cutoffs}
+    for name in ("eps_diluted", "net_income", "some_future_name"):
+        assert name not in PRE_2826_STATEMENT_FACTS
+        _statement_row(fixture_store, name, _PIN_KNOWN, _LATE_INGEST)
+    assert registry.store_max_ingested_at(fixture_store) == _LATE_INGEST
+    for cutoff in cutoffs:
+        assert registry.data_vintage(fixture_store, cutoff) == before[cutoff], cutoff
+    _statement_row(fixture_store, "total_assets", _PIN_KNOWN, _LATE_INGEST)
+    for cutoff in cutoffs:
+        vintage = registry.data_vintage(fixture_store, cutoff)
+        if cutoff < _PIN_KNOWN:
+            assert vintage == before[cutoff], cutoff
+        else:
+            assert vintage == _LATE_INGEST, cutoff
+
+
+def test_every_held_statement_name_moves_the_trial_vintage(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    cutoff = datetime(2024, 6, 28, 20, 0, tzinfo=UTC)
+    known = datetime(2024, 6, 27, 20, 0, tzinfo=UTC)
+    for i, name in enumerate(PRE_2826_STATEMENT_FACTS):
+        ingested = datetime(2024, 6, 28, 1, i, tzinfo=UTC)
+        _statement_row(conn, name, known, ingested)
+        assert registry.data_vintage(conn, cutoff) == ingested, name

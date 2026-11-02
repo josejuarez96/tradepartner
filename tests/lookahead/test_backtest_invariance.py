@@ -764,7 +764,15 @@ def test_a_shares_fact_accepted_after_close_t_i_reaches_only_plans_after_t_i(
 #: every other table's rows are main's (without that table it is main's fb9b651c...).
 #: T248c (#1762) moved it only by hashing the new `mergers` table's name and its two fixture
 #: rows; with that table left out the hash is the previous pin, ed654fea...0fdd9.
-TEMPLATE_FINGERPRINT = "fb39b57878d6ca9613c3ad334b98dffdf8451c08b2dd4f38e98796cd3d2dcef1"
+#: T254 (#1976) adds a late owner-stamped `spinoff_allocations` fixture row, moving this pin.
+#: T306 (#2539) moved it only by hashing the two new, empty `sec_filing_events` and
+#: `sec_form4_transactions` tables' names; without them the hash is T254's 6b6cfd33...5fb35.
+#: #2295 (version 42) and T326 (#2682, version 43) moved it only by hashing the new, empty
+#: `snapshot_sightings` and `delisting_reasons` tables' names, and T318 (#2740, version 45)
+#: by hashing the empty `filing_index` table's name; without them the hash is
+#: T306's f3c2dc45...42ff1ec. #2813 (version 46) adds a nullable column to the empty
+#: `filing_index` table, which the hash does not see: the pin is unchanged.
+TEMPLATE_FINGERPRINT = "b1109eb77a1118dc11867dc4b00ffafb4c7fd54edb2217186bb94387b3c1eb42"
 
 
 def _bar_revisions(conn: duckdb.DuckDBPyConnection, sid: str, session: date) -> int:

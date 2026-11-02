@@ -108,15 +108,13 @@ earlier one unknown: reported, not written). Otherwise the row is
 cover page. `known_at` is always the fetch time. Only the earliest fetch
 writes a class's static span.
 
-**Snapshot renames** (#2291). The SEC's ticker file is current-only and each
-nightly run fetches it once, so `build_master` also takes the fetches the
-store's live EDGAR snapshot rows record (`stored_snapshot_fetches`, read at
-the run clock) and judges every distinct fetch in time order. A fetch
-repeating a class's latest snapshot ticker adds nothing. Another ticker on
-a class with no cover page known at the fetch is a ticker change: a
-`snapshot` row valid from the fetch session, known at the fetch, which ends
-the old line there as the as-of reads treat any ticker change; never a
-second span with the old start. A class with a cover page known at the
+**Snapshot renames** (#2291, #2295). The SEC's ticker file is current-only and each
+nightly run fetches it once. The store records every ticker sighting, including
+ones that derive no listing. `build_master` judges the stored history and the
+current fetch in time order. One new ticker sighting is pending; a second
+matching fetch confirms a `snapshot` row valid from the first sighting's
+session, known only at the second fetch. A return to the confirmed ticker
+clears the pending sighting. A class with a cover page known at the
 fetch, or a change on its latest span's own session, is reported in
 `unmatched_snapshot` instead (once per ticker and exchange). An exchange
 change alone writes nothing, in either mode (with `static_columns` off it
@@ -161,7 +159,7 @@ from collections import defaultdict
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 import polars as pl
@@ -922,6 +920,7 @@ class _Builder:
         """Attach snapshot entries (sorted by fetch time) using only what the
         cover pages showed by each entry's `fetched_at`, so a row's presence
         never depends on a filing accepted after its own `known_at`."""
+        pending: dict[str, tuple[str, str, date]] = {}
         for entry in entries:
             t = entry.fetched_at
             listed = [c for c in classes if c.pairs_at(t)]
@@ -934,15 +933,23 @@ class _Builder:
                 continue
             first_listing = cls.first_listing_at(t)
             if cls.snapshot_span is not None:
-                # A fetch repeating the class's latest snapshot ticker adds
-                # nothing. Another ticker on a class with no cover page known
-                # at the fetch is a rename from the fetch session (#2291);
-                # otherwise it is reported, never a second span.
+                # A new ticker needs two matching fetches (#2295). Its span
+                # starts at the first sighting but is known only at confirmation.
                 ticker, since = cls.snapshot_span
                 if entry.ticker == ticker:
+                    pending.pop(cls.security_id, None)
                     continue
                 if first_listing is None and session_of(t) > since:
-                    self._snapshot_listing(cls, entry, session_of(t), "snapshot")
+                    candidate = pending.get(cls.security_id)
+                    if (
+                        candidate is not None
+                        and candidate[:2] == (entry.ticker, entry.exchange)
+                        and session_of(t) > candidate[2]
+                    ):
+                        self._snapshot_listing(cls, entry, candidate[2], "snapshot")
+                        pending.pop(cls.security_id, None)
+                    else:
+                        pending[cls.security_id] = (entry.ticker, entry.exchange, session_of(t))
                 else:
                     self.unmatched.append(entry)
                 continue
@@ -1034,6 +1041,22 @@ def _first_per_line(entries: Iterable[CompanySnapshotEntry]) -> tuple[CompanySna
     for entry in entries:
         first.setdefault((entry.cik, entry.ticker, entry.exchange), entry)
     return tuple(first.values())
+
+
+def _filing_index_for_cik(source: FilingSource, cik: str) -> list[FilingIndexEntry]:
+    """Use a store-backed CIK query when the source offers one."""
+    reader = getattr(source, "filing_index_for_cik", None)
+    if callable(reader):
+        return cast(list[FilingIndexEntry], reader(cik))
+    return [entry for entry in source.filing_index() if entry.cik == cik]
+
+
+def _filing_index_for_forms(source: FilingSource, forms: Collection[str]) -> list[FilingIndexEntry]:
+    """Use a store-backed cross-CIK form query when offered."""
+    reader = getattr(source, "filing_index_for_forms", None)
+    if callable(reader):
+        return cast(list[FilingIndexEntry], reader(forms))
+    return [entry for entry in source.filing_index() if entry.form in forms]
 
 
 def build_master(
@@ -1175,7 +1198,11 @@ def build_chains(
     entries = parse_chains(settings.master.chains)
     if not entries:
         return ChainBuild((), ())
-    index = {(entry.cik, entry.accession): entry for entry in source.filing_index()}
+    index = {
+        (entry.cik, entry.accession): entry
+        for successor_cik in {security_cik(successor) for _, successor, _ in entries}
+        for entry in _filing_index_for_cik(source, successor_cik)
+    }
     securities = {row["security_id"]: row for row in master.securities}
     listings: dict[str, list[Row]] = defaultdict(list)
     for row in master.listings:
@@ -1291,7 +1318,7 @@ def chain_candidates(
     taken = {successor for _, successor, _ in entries}
     dismissed = set(settings.master.chains_dismissed)
     window = settings.master.chain_window_sessions
-    filers = {item.cik for item in source.filing_index() if item.form in SUCCESSOR_EVIDENCE_FORMS}
+    filers = {item.cik for item in _filing_index_for_forms(source, SUCCESSOR_EVIDENCE_FORMS)}
     if not filers:
         return ()
     listings: dict[str, list[Row]] = defaultdict(list)
@@ -1723,3 +1750,55 @@ def stored_snapshot_fetches(
             _STORED_FETCHES_SQL, [at]
         ).fetchall()
     )
+
+
+def stored_snapshot_history(
+    conn: duckdb.DuckDBPyConnection, at: datetime
+) -> tuple[CompanySnapshotEntry, ...]:
+    """Return observed SEC tickers, including first sightings awaiting confirmation."""
+    at = _validate_t(at)
+    listed = stored_snapshot_fetches(conn, at)
+    sightings = (
+        CompanySnapshotEntry(cik, "", ticker, exchange, fetched_at)
+        for cik, ticker, exchange, fetched_at in conn.execute(
+            "SELECT cik, ticker, exchange, known_at FROM snapshot_sightings "
+            "WHERE known_at <= ? ORDER BY known_at, cik, ticker",
+            [at],
+        ).fetchall()
+    )
+    distinct = {(e.cik, e.ticker, e.exchange, e.fetched_at): e for e in (*listed, *sightings)}
+    return tuple(sorted(distinct.values(), key=lambda e: (e.fetched_at, e.cik, e.ticker)))
+
+
+def record_snapshot_sightings(
+    conn: duckdb.DuckDBPyConnection,
+    entries: Sequence[CompanySnapshotEntry],
+    ingested_at: datetime,
+    current_listings: Sequence[dict[str, Any]] = (),
+) -> None:
+    """Persist changed tickers awaiting confirmation, not the full SEC file."""
+    ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
+    current: dict[str, dict[str, tuple[date, datetime, str]]] = defaultdict(dict)
+    for row in current_listings:
+        cik = security_cik(row["security_id"])
+        security_id = row["security_id"]
+        version = (row["valid_from"], row["known_at"], row["ticker"])
+        if security_id not in current[cik] or version[:2] > current[cik][security_id][:2]:
+            current[cik][security_id] = version
+    latest_sighting = dict(
+        conn.execute("SELECT cik, MAX(known_at) FROM snapshot_sightings GROUP BY cik").fetchall()
+    )
+    for entry in entries:
+        if entry.fetched_at > ingested_at:
+            raise ValueError("snapshot fetched_at is later than ingested_at")
+        matching = [
+            version for version in current.get(entry.cik, {}).values() if version[2] == entry.ticker
+        ]
+        if matching and latest_sighting.get(entry.cik, matching[0][1]) <= max(
+            version[1] for version in matching
+        ):
+            continue
+        conn.execute(
+            "INSERT INTO snapshot_sightings VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            [entry.cik, entry.ticker, entry.exchange, entry.fetched_at, ingested_at],
+        )

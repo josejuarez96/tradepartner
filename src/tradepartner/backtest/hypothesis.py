@@ -241,8 +241,10 @@ FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {
 #: label its signal ignores. `strategy.turnover_top_fraction` left it at T165c (#1358);
 #: `adjust.apply_spin_offs` entered at T211c and left at T211e (#1894);
 #: `strategy.hold_top_fraction` (T238, spec amendment #657) left it at T239, where the
-#: engine applies it. Empty until the next key that needs it.
-NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset()
+#: engine applies it. T328a's `backtest.delisting_failure_return` (#2670) is in it until
+#: the engine applies the policy (T328c).
+DELISTING_POLICY_KEY: Final = "backtest.delisting_failure_return"
+NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset({DELISTING_POLICY_KEY})
 
 
 #: The borrow-rate grid a `long_short` file must cover (spec amendment #1872, item 6):
@@ -253,8 +255,12 @@ BORROW_GRID_BPS: Final = (0.0, 30.0, 300.0)
 def long_short_refusal(params: Mapping[str, Any]) -> str | None:
     """Why a `long_short` file's frozen values `params` may not be registered, or None
     (backtest spec amendment #1872, items 1 and 6; T221). The message starts with the
-    refusal's name: `refused_portfolio`, `refused_borrow_rate`, or `refused_risk_free`.
-    A `long_only` set (the default, or a key absent) takes no branch here.
+    refusal's name: `refused_delisting_short`, `refused_portfolio`, `refused_borrow_rate`,
+    or `refused_risk_free`. A `long_only` set (the default, or a key absent) takes no
+    branch here.
+
+    `refused_delisting_short`: `backtest.delisting_failure_return` is not `none` (short
+    delisting P&L stays closed until ADR 0024 consequence 5; #2670, plan T328a).
 
     `refused_portfolio`: the family's weighting is `hold`, `strategy.rebalance_band` is
     non-zero, or `strategy.hold_top_fraction` is not its default (none is specified for
@@ -264,6 +270,13 @@ def long_short_refusal(params: Mapping[str, Any]) -> str | None:
     is not `store` (issue #2219)."""
     if params.get("portfolio.side", "long_only") != "long_short":
         return None
+    policy = params.get(DELISTING_POLICY_KEY, "none")
+    if policy != "none":
+        return (
+            f"refused_delisting_short: portfolio.side is 'long_short' with "
+            f"{DELISTING_POLICY_KEY} {policy!r}; short delisting P&L stays closed until "
+            "ADR 0024 consequence 5 defines its booking rule (#2670)"
+        )
     if params.get("metrics.risk_free_source", "constant") != "store":
         return (
             'refused_risk_free: a long_short file uses metrics.risk_free_source = "store" '
@@ -488,6 +501,7 @@ def frozen_params(parsed: HypothesisFile, settings: Settings) -> dict[str, Any]:
             frozen.POST_REGISTRATION_OWN_KEYS
             | frozen.POST_REGISTRATION_COST_KEYS
             | frozen.POST_REGISTRATION_ADJUST_KEYS
+            | frozen.POST_REGISTRATION_BACKTEST_KEYS
             | frozen.POST_REGISTRATION_PORTFOLIO_KEYS
         )
         if key not in parsed.file_params and key.partition(".")[0] not in inert

@@ -662,6 +662,7 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "master.chain_max_price_ratio",
             "adjust.apply_spin_offs",
             "strategy.hold_top_fraction",
+            "backtest.delisting_failure_return",
             "portfolio.",
             "costs.borrow",
         ),
@@ -1351,6 +1352,7 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "master.chain_max_price_ratio",
         "adjust.apply_spin_offs",
         "strategy.hold_top_fraction",
+        "backtest.delisting_failure_return",
         "portfolio.side",
         "portfolio.gross_exposure",
         "portfolio.net_exposure",
@@ -1391,7 +1393,8 @@ def test_a_screened_registration_runs_at_its_frozen_fraction(
     and T239 applies `strategy.hold_top_fraction` (#657), so `NOT_YET_APPLIED_KEYS` is
     empty and a registration at 0.20 loads at 0.20 (until T165c, quant-auditor on #1387
     had it refused)."""
-    assert frozenset() == hypothesis.NOT_YET_APPLIED_KEYS
+    # T328a (#2670): the delisting policy key waits for its engine task.
+    assert frozenset({"backtest.delisting_failure_return"}) == hypothesis.NOT_YET_APPLIED_KEYS
     _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
     assert loaded.strategy.turnover_top_fraction == 0.20
@@ -1733,6 +1736,7 @@ def test_h1s_unchanged_file_registered_before_the_terms_writes_nothing(
         *(k for k in hypothesis.frozen_keys() if k.startswith("portfolio.")),
         "adjust.apply_spin_offs",
         "strategy.hold_top_fraction",
+        "backtest.delisting_failure_return",
     }
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     stored = registry.register_hypothesis(
@@ -2292,3 +2296,79 @@ def test_a_file_may_name_the_borrow_keys(tmp_path: Path, settings: Settings) -> 
     params = hypothesis.frozen_params(hypothesis.parse_file(_copy(tmp_path, text)), settings)
     assert params["costs.borrow_bps_per_year"] == 30.0
     assert params["costs.borrow_sensitivity_bps"] == [0.0, 300.0]
+
+
+# --- T328a: the delisting failure-return policy (data-foundation amendment #2670) ------
+
+DELISTING_POLICY_KEY = "backtest.delisting_failure_return"
+
+
+def _delisting_policy_file(tmp_path: Path, slug: str, value: str) -> Path:
+    """The momentum fixture with `delisting_failure_return = <value>` in a `[backtest]`."""
+    text = FIXTURE.read_text()
+    assert "\n[backtest]\n" not in text
+    path = tmp_path / "hypotheses" / f"{slug}.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(
+        text.replace(
+            "\n```\n", f'\n[backtest]\ndelisting_failure_return = "{value}"\n```\n', 1
+        ).replace(f'slug = "{SLUG}"', f'slug = "{slug}"', 1)
+    )
+    return path
+
+
+def test_the_delisting_policy_is_post_registration_and_not_yet_applied() -> None:
+    assert DELISTING_POLICY_KEY in frozen.POST_REGISTRATION_BACKTEST_KEYS
+    assert DELISTING_POLICY_KEY in hypothesis.NOT_YET_APPLIED_KEYS
+    assert DELISTING_POLICY_KEY not in hypothesis.required_keys("momentum")
+
+
+@pytest.mark.parametrize("value", ["failure_v1", "severe_v1"])
+def test_a_nonzero_policy_registers_but_cannot_run_until_the_engine_applies_it(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings, value: str
+) -> None:
+    record = _register(conn, _delisting_policy_file(tmp_path, SLUG, value), settings)
+    assert record.params[DELISTING_POLICY_KEY] == value
+    with pytest.raises(HypothesisFileError, match=rf"{DELISTING_POLICY_KEY}.*cannot run"):
+        hypothesis.load_frozen(conn, SLUG, settings=settings)
+
+
+def test_the_none_policy_loads_as_the_last_close_exit(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _register(conn, _delisting_policy_file(tmp_path, SLUG, "none"), settings)
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
+    assert loaded.backtest.delisting_failure_return == "none"
+    assert loaded.backtest.delisting_exit == "last_close"
+
+
+def test_a_short_book_with_a_nonzero_policy_is_refused_by_name() -> None:
+    """Short delisting P&L stays closed until ADR 0024 consequence 5 (#2670)."""
+    params = {
+        "portfolio.side": "long_short",
+        "strategy.weighting": "equal",
+        "costs.borrow_bps_per_year": 30.0,
+        "costs.borrow_sensitivity_bps": [0.0, 300.0],
+        "metrics.risk_free_source": "store",
+    }
+    assert hypothesis.long_short_refusal({**params, DELISTING_POLICY_KEY: "none"}) is None
+    for value in ("failure_v1", "severe_v1"):
+        refusal = hypothesis.long_short_refusal({**params, DELISTING_POLICY_KEY: value})
+        assert refusal is not None
+        assert refusal.startswith("refused_delisting_short:")
+    long_only = {"portfolio.side": "long_only", DELISTING_POLICY_KEY: "severe_v1"}
+    assert hypothesis.long_short_refusal(long_only) is None
+
+
+def test_a_short_file_with_a_nonzero_policy_is_refused_before_any_write(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    path = _long_short_file(tmp_path)
+    path.write_text(
+        path.read_text().replace(
+            "\n```\n", '\n[backtest]\ndelisting_failure_return = "failure_v1"\n```\n', 1
+        )
+    )
+    with pytest.raises(HypothesisFileError, match="refused_delisting_short"):
+        _register(conn, path, settings)
+    assert _hypotheses(conn) == 0

@@ -364,6 +364,8 @@ PORTFOLIO_KEYS = (
     "portfolio.short_min_price",
     "portfolio.short_cover_weight",
 )
+#: T328a's delisting failure-return policy key (#2670), a table entry at version 45.
+DELISTING_POLICY_KEYS = ("backtest.delisting_failure_return",)
 #: T187's successor-chain keys (#821), table entries at version 31.
 CHAIN_KEYS = (
     "master.chains",
@@ -382,6 +384,7 @@ COMBINED_LATER_KEYS = (
     "adjust.apply_spin_offs",
     "strategy.hold_top_fraction",
     *PORTFOLIO_KEYS,
+    *DELISTING_POLICY_KEYS,
 )
 
 
@@ -428,6 +431,7 @@ LATER_KEYS = (
     "adjust.apply_spin_offs",
     "strategy.hold_top_fraction",
     *PORTFOLIO_KEYS,
+    *DELISTING_POLICY_KEYS,
 )
 
 
@@ -637,6 +641,7 @@ def test_b3_fingerprint_canonical_set_and_hash_are_pinned(
                     "adjust.apply_spin_offs",
                     "strategy.hold_top_fraction",
                     *PORTFOLIO_KEYS,
+                    *DELISTING_POLICY_KEYS,
                 ),
             )
         )
@@ -961,7 +966,7 @@ def test_cost_term_entries_are_last_and_pinned_by_value() -> None:
     (#1818) takes 29 and lands first; T187's four chain entries and T211c's
     spin-off key follow them."""
     assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:26], COST_ENTRIES)
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:-13], COST_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:-14], COST_ENTRIES)
 
 
 def test_post_registration_cost_keys_pinned_and_each_a_costs_table_key() -> None:
@@ -1095,7 +1100,7 @@ def test_the_chain_entries_are_pinned_and_move_no_fingerprint() -> None:
         assert table[key] == (default, version), key
     settings = _defaults_settings()
     keys = CHAIN_KEYS
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-13:-9], CHAIN_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-14:-10], CHAIN_ENTRIES)
     for family, params in (
         ("momentum", _new_params(settings)),
         ("combined", _combined_params(settings)),
@@ -1120,7 +1125,9 @@ APPLY_SPIN_OFFS_KEY = "adjust.apply_spin_offs"
 def test_apply_spin_offs_entry_is_pinned_by_value() -> None:
     """Appended at version 31 at its default; T238's buffer entry and T219's five
     `portfolio.*` entries follow it."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-9:-8], ((APPLY_SPIN_OFFS_KEY, False, 31),))
+    assert frozen.is_default(
+        frozen.FROZEN_KEY_DEFAULTS[-10:-9], ((APPLY_SPIN_OFFS_KEY, False, 31),)
+    )
 
 
 def test_post_registration_adjust_keys_pinned_and_each_an_adjust_table_key() -> None:
@@ -1205,7 +1212,7 @@ def test_a_file_naming_true_is_a_new_fingerprint(tmp_path: Path, settings: Setti
 def test_buffer_entry_is_pinned_by_value() -> None:
     """Appended after the spin-off key, at the schema version current when it landed;
     T219's five `portfolio.*` entries follow it."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-8:-7], ((BUFFER_KEY, 0.0, 34),))
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-9:-8], ((BUFFER_KEY, 0.0, 34),))
     assert BUFFER_KEY in hypothesis.frozen_keys()
 
 
@@ -1269,7 +1276,7 @@ PORTFOLIO_ENTRIES = (
 def test_portfolio_entries_are_pinned_by_value() -> None:
     """Appended after T238's buffer entry (T221's two borrow entries follow them), at the
     schema version current when they landed, in the spec item 1 order."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-7:-2], PORTFOLIO_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-8:-3], PORTFOLIO_ENTRIES)
     for key, _default, _version in PORTFOLIO_ENTRIES:
         assert key in hypothesis.frozen_keys()
 
@@ -1346,9 +1353,10 @@ BORROW_ENTRIES = (
 
 
 def test_borrow_entries_are_last_and_pinned_by_value() -> None:
-    """Appended after T219's `portfolio.*` entries, at the current schema version; both
-    are post-registration cost keys, the headline alone may only rise."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-2:], BORROW_ENTRIES)
+    """Appended after T219's `portfolio.*` entries, at the current schema version (T328a's
+    entry follows them); both are post-registration cost keys, the headline alone may
+    only rise."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-3:-1], BORROW_ENTRIES)
     for key, _default, _version in BORROW_ENTRIES:
         assert key in hypothesis.frozen_keys()
         assert key in frozen.POST_REGISTRATION_COST_KEYS
@@ -1390,3 +1398,110 @@ def test_a_non_default_borrow_key_moves_the_fingerprint_but_not_the_promotion_id
     assert promotion.promotion_identity(
         "momentum", moved, IN_SAMPLE_START
     ) == promotion.promotion_identity("momentum", params, IN_SAMPLE_START)
+
+
+# --- T328a: the delisting failure-return policy (data-foundation amendment #2670) ------
+
+DELISTING_POLICY_KEY = "backtest.delisting_failure_return"
+
+
+def test_delisting_policy_entry_is_last_and_pinned_by_value() -> None:
+    """Appended after T221's borrow entries at schema version 45, at `none`."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-1:], ((DELISTING_POLICY_KEY, "none", 45),))
+    assert DELISTING_POLICY_KEY in hypothesis.frozen_keys()
+
+
+def test_post_registration_backtest_keys_pinned_and_disjoint() -> None:
+    assert frozenset({DELISTING_POLICY_KEY}) == frozen.POST_REGISTRATION_BACKTEST_KEYS
+    for other in (
+        frozen.POST_REGISTRATION_OWN_KEYS,
+        frozen.POST_REGISTRATION_COST_KEYS,
+        frozen.POST_REGISTRATION_ADJUST_KEYS,
+        frozen.POST_REGISTRATION_PORTFOLIO_KEYS,
+        frozen.LAB_BASELINE_FROZEN_KEYS,
+    ):
+        assert not frozen.POST_REGISTRATION_BACKTEST_KEYS & other
+    assert DELISTING_POLICY_KEY in frozen._FINGERPRINT_KEYS
+    assert "backtest" not in frozen._FINGERPRINT_SECTIONS
+
+
+@pytest.mark.parametrize(
+    ("source", "family"),
+    [(FIXTURE, "momentum"), (PROF_FIXTURE, "profitability"), (COMBINED_FIXTURE, "combined")],
+)
+def test_delisting_policy_at_none_moves_no_canonical_set_or_fingerprint(
+    source: Path, family: str
+) -> None:
+    """A set stored with the key at `none` reads as one stored before it: same fingerprint,
+    same canonical set, and the key is left out of the canonical set."""
+    params = hypothesis.frozen_params(hypothesis.parse_file(source), _defaults_settings())
+    assert params[DELISTING_POLICY_KEY] == "none"
+    without = _before(params, DELISTING_POLICY_KEYS)
+    start = hypothesis.parse_file(source).in_sample_start
+    assert frozen.fingerprint(family, params, start) == frozen.fingerprint(family, without, start)
+    canonical = frozen.canonical_frozen_set(params, family)
+    assert canonical == frozen.canonical_frozen_set(without, family)
+    assert DELISTING_POLICY_KEY not in canonical
+
+
+def _with_delisting_policy(tmp_path: Path, value: str) -> Path:
+    """The momentum fixture with `delisting_failure_return = <value>` in a `[backtest]`."""
+    text = FIXTURE.read_text()
+    assert "\n[backtest]\n" not in text
+    text = text.replace("\n```\n", f'\n[backtest]\ndelisting_failure_return = "{value}"\n```\n', 1)
+    path = tmp_path / "hypotheses" / f"{FIXTURE.stem}.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def test_a_file_naming_none_is_the_twin(tmp_path: Path) -> None:
+    from tradepartner.store import registry
+
+    settings = _defaults_settings()
+    twin = _new_params(settings)
+    explicit = hypothesis.frozen_params(
+        hypothesis.parse_file(_with_delisting_policy(tmp_path, "none")), settings
+    )
+    assert explicit == twin
+    assert registry.params_sha256(explicit) == registry.params_sha256(twin)
+
+
+@pytest.mark.parametrize("value", ["failure_v1", "severe_v1"])
+def test_a_nonzero_policy_is_kept_and_moves_the_fingerprint(tmp_path: Path, value: str) -> None:
+    """Each grid row is its own hypothesis identity: kept in the canonical set and a new
+    fingerprint, so each registration is a counted trial."""
+    settings = _defaults_settings()
+    twin = _new_params(settings)
+    params = hypothesis.frozen_params(
+        hypothesis.parse_file(_with_delisting_policy(tmp_path, value)), settings
+    )
+    assert params[DELISTING_POLICY_KEY] == value
+    assert frozen.canonical_frozen_set(params, "momentum") == {
+        **frozen.canonical_frozen_set(twin, "momentum"),
+        DELISTING_POLICY_KEY: value,
+    }
+    assert frozen.fingerprint("momentum", params, IN_SAMPLE_START) != frozen.fingerprint(
+        "momentum", twin, IN_SAMPLE_START
+    )
+
+
+def test_the_three_grid_rows_have_three_fingerprints() -> None:
+    params = _new_params(_defaults_settings())
+    prints = {
+        frozen.fingerprint("momentum", {**params, DELISTING_POLICY_KEY: v}, IN_SAMPLE_START)
+        for v in ("none", "failure_v1", "severe_v1")
+    }
+    assert len(prints) == 3
+
+
+def test_live_settings_never_reach_a_registration(tmp_path: Path) -> None:
+    """A post-registration key: a file that leaves it out freezes `none`, whatever the
+    live `Settings` say."""
+    live = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        universe=_PINNED_UNIVERSE,
+        backtest={"delisting_failure_return": "severe_v1"},
+    )
+    params = hypothesis.frozen_params(hypothesis.parse_file(FIXTURE), live)
+    assert params[DELISTING_POLICY_KEY] == "none"

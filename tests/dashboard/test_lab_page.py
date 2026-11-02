@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, Mock
 import duckdb
 import pytest
 
-from tradepartner.backtest import sweep_report
+from tradepartner.backtest import holdout, sweep_report
 from tradepartner.backtest.results import NextTrialCost
 from tradepartner.config import Settings
 from tradepartner.dashboard import lab_page
@@ -19,6 +19,8 @@ from tradepartner.dashboard.lab_files import FileKind, GitState, LabFile, Regist
 from tradepartner.dashboard.lab_run import Busy, SlotRecord, SlotStatus, Taken
 from tradepartner.dashboard.lab_verdict import InFlight, LabVerdict, SweepVerdicts
 from tradepartner.store import lab_registry, registry
+
+_POLL_ENDED = "lab_poll_ended"
 
 
 def _file(
@@ -73,6 +75,54 @@ def test_run_callback_refuses_when_slot_busy_without_spawning(
     spawn.assert_not_called()
 
 
+def test_non_default_lab_slot_grace_seconds_reaches_take(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#2357: a configured lab_slot_grace_seconds is passed through to lab_run.take."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(tmp_path / "store.duckdb")},
+        ui={"lab_slot_grace_seconds": 12.5},
+    )
+    now = datetime.now(UTC)
+    captured: dict[str, object] = {}
+
+    def capture_take(slot_path: Path, *, in_flight, now, grace_seconds, start_time_of):
+        captured["grace_seconds"] = grace_seconds
+        captured["start_time_of"] = start_time_of
+        return Taken(slot_path, "token")
+
+    monkeypatch.setattr(lab_page.lab_run, "take", capture_take)
+    spawn = Mock()
+    monkeypatch.setattr(lab_page.lab_child, "spawn", spawn)
+    monkeypatch.setattr(lab_page.lab_run, "watch", Mock())
+    monkeypatch.setattr(
+        lab_page.lab_run,
+        "record",
+        Mock(
+            return_value=SimpleNamespace(
+                pid=7,
+                pid_start="pid-start",
+                kind="sweep_run",
+                slug="b10",
+                baseline=0,
+                started_at=now.isoformat(),
+                log_path="log",
+                exit_code=None,
+            )
+        ),
+    )
+    lab_page._start_run(settings, "b10", None, now, (), 0, Mock())
+    assert captured["grace_seconds"] == 12.5
+    # Verify start_time_of is a partial with the configured timeout
+    import functools
+
+    assert isinstance(captured["start_time_of"], functools.partial)
+    assert (
+        captured["start_time_of"].keywords["timeout_seconds"] == settings.ui.lab_ps_timeout_seconds
+    )
+
+
 def test_failed_spawn_abandons_slot_and_scrubs_message(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -84,6 +134,7 @@ def test_failed_spawn_abandons_slot_and_scrubs_message(
     monkeypatch.setattr(lab_page.lab_run, "take", Mock(return_value=taken))
     abandon = Mock(return_value=True)
     monkeypatch.setattr(lab_page.lab_run, "abandon", abandon)
+    monkeypatch.setattr(lab_page.lab_run, "watch", Mock())
     monkeypatch.setattr(
         lab_page.lab_child,
         "spawn",
@@ -108,6 +159,7 @@ def test_record_failure_after_spawn_keeps_slot_reserved(
     monkeypatch.setattr(lab_page.lab_run, "take", Mock(return_value=taken))
     abandon = Mock()
     monkeypatch.setattr(lab_page.lab_run, "abandon", abandon)
+    monkeypatch.setattr(lab_page.lab_run, "watch", Mock())
     monkeypatch.setattr(
         lab_page.lab_child,
         "spawn",
@@ -155,6 +207,144 @@ def test_changed_cost_quote_refuses_before_slot_or_spawn(
     start.assert_not_called()
 
 
+def test_hypothesis_window_uses_frozen_cadence_and_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hypothesis = SimpleNamespace(
+        hypothesis_id=8,
+        family="momentum",
+        in_sample_start=date(2018, 1, 1),
+        holdout_start=date(2020, 1, 1),
+        holdout_end=date(2020, 12, 31),
+    )
+    monkeypatch.setattr(lab_page.registry, "get_hypothesis", Mock(return_value=hypothesis))
+    monkeypatch.setattr(lab_page.registry, "is_sweep_variant", Mock(return_value=False))
+    monkeypatch.setattr(lab_page.lab_registry, "promotion_for", Mock(return_value=object()))
+    monkeypatch.setattr(lab_page.registry, "boundary_date", Mock(return_value=date(2019, 6, 30)))
+    monkeypatch.setattr(
+        lab_page,
+        "frozen_values",
+        Mock(
+            return_value={
+                "gap.count_share_threshold": 0.1,
+                "schedule.rebalance_cadence": "month_end",
+            }
+        ),
+    )
+    window = lab_page._hypothesis_window(Mock(), "h")
+    assert window == holdout.Window(date(2018, 1, 1), date(2019, 6, 28))
+
+
+def test_hypothesis_window_refuses_without_promotion(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        lab_page.registry,
+        "get_hypothesis",
+        Mock(return_value=SimpleNamespace(hypothesis_id=8, family="momentum")),
+    )
+    monkeypatch.setattr(lab_page.registry, "is_sweep_variant", Mock(return_value=False))
+    monkeypatch.setattr(lab_page.lab_registry, "promotion_for", Mock(return_value=None))
+    with pytest.raises(ValueError, match="promoted"):
+        lab_page._hypothesis_window(Mock(), "h")
+
+
+def test_hypothesis_click_rechecks_quiet_and_refuses_without_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tradepartner.dashboard.app as app
+
+    @contextmanager
+    def store(_settings: Settings):
+        yield Mock()
+
+    state: dict[str, object] = {}
+    monkeypatch.setattr(lab_page, "st", Mock(session_state=state))
+    monkeypatch.setattr(app, "open_store_connection", store)
+    window = holdout.Window(date(2018, 1, 1), date(2019, 6, 28))
+    monkeypatch.setattr(lab_page, "_hypothesis_window", Mock(return_value=window))
+    monkeypatch.setattr(lab_page, "_hypothesis_start_decision", Mock(return_value="wait"))
+    monkeypatch.setattr(
+        lab_page.registry, "get_hypothesis", Mock(return_value=SimpleNamespace(hypothesis_id=8))
+    )
+    monkeypatch.setattr(
+        lab_page, "frozen_values", Mock(return_value={"schedule.rebalance_cadence": "month_end"})
+    )
+    spawn = Mock()
+    monkeypatch.setattr(lab_page.lab_child, "spawn", spawn)
+    lab_page._on_hypothesis_run(Settings(_env_file=None), "h", window, 8, Mock(), Mock())
+    spawn.assert_not_called()
+    assert "wait" in str(state[lab_page._OUTCOME]).lower()
+
+
+@pytest.mark.parametrize("changed", ["registration", "window", "cost"])
+def test_hypothesis_click_refuses_changed_quote_before_spawn(
+    monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    import tradepartner.dashboard.app as app
+
+    @contextmanager
+    def store(_settings: Settings):
+        yield Mock()
+
+    state: dict[str, object] = {}
+    monkeypatch.setattr(lab_page, "st", Mock(session_state=state))
+    monkeypatch.setattr(app, "open_store_connection", store)
+    window = holdout.Window(date(2018, 1, 1), date(2019, 6, 28))
+    allowed = holdout.Window(date(2018, 1, 1), date(2019, 5, 31)) if changed == "window" else window
+    hypothesis = SimpleNamespace(
+        hypothesis_id=9 if changed == "registration" else 8, family="momentum"
+    )
+    monkeypatch.setattr(lab_page.registry, "get_hypothesis", Mock(return_value=hypothesis))
+    monkeypatch.setattr(lab_page, "_hypothesis_window", Mock(return_value=allowed))
+    monkeypatch.setattr(
+        lab_page, "frozen_values", Mock(return_value={"schedule.rebalance_cadence": "month_end"})
+    )
+    monkeypatch.setattr(lab_page, "_hypothesis_start_decision", Mock(return_value="start"))
+    monkeypatch.setattr(lab_page.lab_registry, "family_rules", Mock(return_value=None))
+    cost = NextTrialCost(1, 2, 0.1, 0.2, "excess_spy", False, 0.1)
+    raw = NextTrialCost(1, 2, 0.1, 0.2, "raw", False, 0.1)
+    next_cost = Mock(side_effect=(cost, raw))
+    monkeypatch.setattr(lab_page.results, "next_trial_cost", next_cost)
+    spawn = Mock()
+    monkeypatch.setattr(lab_page.lab_child, "spawn", spawn)
+    expected = (
+        NextTrialCost(2, 3, 0.2, 0.3, "excess_spy", False, 0.1) if changed == "cost" else cost
+    )
+    lab_page._on_hypothesis_run(Settings(_env_file=None), "h", window, 8, expected, raw)
+    assert "nothing ran" in str(state[lab_page._OUTCOME])
+    spawn.assert_not_called()
+    if changed == "cost":
+        assert next_cost.call_count == 2
+    else:
+        next_cost.assert_not_called()
+
+
+def test_status_poll_reruns_once_after_child_ends(monkeypatch: pytest.MonkeyPatch) -> None:
+    ui = Mock(session_state={})
+    monkeypatch.setattr(lab_page, "st", ui)
+    monkeypatch.setattr(
+        lab_page.lab_run, "status", Mock(return_value=SlotStatus("ended", None, ""))
+    )
+    lab_page._poll_status(Settings(_env_file=None))
+    lab_page._poll_status(Settings(_env_file=None))
+    ui.rerun.assert_called_once_with()
+
+
+def test_quick_run_after_a_finished_run_still_refreshes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run that ends before any poll saw it running still triggers the page refresh."""
+    ui = Mock(session_state={_POLL_ENDED: True})  # the previous run already refreshed
+    monkeypatch.setattr(lab_page, "st", ui)
+    monkeypatch.setattr(lab_page.lab_run, "take", Mock(return_value=Taken(Path("slot"), "t")))
+    monkeypatch.setattr(lab_page.lab_run, "watch", Mock())
+    monkeypatch.setattr(lab_page.lab_child, "spawn", Mock())
+    monkeypatch.setattr(lab_page.lab_run, "record", Mock())
+    lab_page._start_run(Settings(_env_file=None), "b10", None, datetime.now(UTC), (), 0, Mock())
+    monkeypatch.setattr(
+        lab_page.lab_run, "status", Mock(return_value=SlotStatus("ended", None, ""))
+    )
+    lab_page._poll_status(Settings(_env_file=None))
+    ui.rerun.assert_called_once_with()
+
+
 @pytest.mark.parametrize(
     ("file", "busy"),
     [
@@ -166,7 +356,7 @@ def test_changed_cost_quote_refuses_before_slot_or_spawn(
                 "h.md",
                 "h",
                 Path("/tmp/h.md"),
-                RegistryState.REGISTERED,
+                RegistryState.NOT_REGISTERED,
                 GitState.MERGED,
                 True,
             ),
@@ -312,6 +502,45 @@ def test_result_reading_orders_thresholds_result_rule_and_detail(
         "Owner decision",
     ):
         assert f"{term} ⓘ" in text
+
+
+def _reading_words(monkeypatch: pytest.MonkeyPatch, sweep: object, report: object) -> str:
+    events: list[str] = []
+    ui = MagicMock()
+    ui.write.side_effect = lambda value: events.append(str(value))
+    ui.caption.side_effect = lambda value: events.append(str(value))
+    ui.expander.side_effect = lambda label: (events.append(f"expander:{label}"), nullcontext())[1]
+    ui.selectbox.return_value = None
+    monkeypatch.setattr(lab_page, "st", ui)
+    monkeypatch.setattr(lab_page, "_safe_scrub", lambda text, _settings: text)
+    monkeypatch.setattr(lab_page.sweep_report, "sweep_report", Mock(return_value=report))
+    monkeypatch.setattr(lab_page.registry, "family_holdout_spends", Mock(return_value=[]))
+    monkeypatch.setattr(lab_page.registry, "development_boundary", Mock(return_value=None))
+    lab_page._result_reading(Mock(), Settings(_env_file=None), sweep)
+    return " ".join(events)
+
+
+def test_result_reading_suggests_retire_when_promote_and_retire_both_met(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec req 4: a sweep whose argmax meets retire_below promotes nothing."""
+    sweep, report = _reading_fixture()
+    report.verdicts.retire_below_met = True
+    words = _reading_words(monkeypatch, sweep, report)
+    assert "sweep retire" in words
+    assert "sweep promote" not in words
+
+
+def test_result_reading_complete_sweep_with_no_counted_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All variants failed terminally: complete, no winner, not 'wait for a decision'."""
+    sweep, report = _reading_fixture()
+    report.verdicts = None
+    report.rows[0].status = "terminal_failed"
+    words = _reading_words(monkeypatch, sweep, report)
+    assert "no variant completed successfully" in words
+    assert "until it is complete" not in words
 
 
 def test_incomplete_sweep_has_no_argmax_or_desk_decision(

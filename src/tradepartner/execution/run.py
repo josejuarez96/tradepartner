@@ -242,7 +242,8 @@ from tradepartner.errors import (
     SystemFaultError,
 )
 from tradepartner.execution import drawdown, exits, marks, planning, switch
-from tradepartner.execution.alerts import Alerter
+from tradepartner.execution.alerts import Alerter, break_alert_cut, reconcile_break_message
+from tradepartner.execution.buy_timing import execution_for
 from tradepartner.execution.collect import (
     Collected,
     Connect,
@@ -253,7 +254,7 @@ from tradepartner.execution.collect import (
     note_unjudged,
 )
 from tradepartner.execution.ledger import Ledger, from_journal
-from tradepartner.execution.lock import LockHeld, resolve_book, run_lock
+from tradepartner.execution.lock import LockHeld, resolve_book, run_lock, sandbox_store_refusal
 from tradepartner.execution.lots import LedgerAccount
 from tradepartner.execution.outcomes import write_outcomes_and_lots
 from tradepartner.execution.plan import (
@@ -264,7 +265,13 @@ from tradepartner.execution.plan import (
     residue,
     stop_session,
 )
-from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, Mismatch, Reconciliation
+from tradepartner.execution.reconcile import (
+    BREAKS,
+    FILLS_LAGGING,
+    MISMATCH,
+    Mismatch,
+    Reconciliation,
+)
 from tradepartner.execution.reconcile import OK as RECONCILED
 from tradepartner.execution.reconcile_run import (
     frozen_risk,
@@ -318,6 +325,7 @@ from tradepartner.store.journal import (
     ReconciliationRow,
     adjustments_for,
     append,
+    break_events_for,
     decisions_for,
     fills_for,
     kill_switch_events_for,
@@ -594,6 +602,17 @@ def window_journal_inputs(
 def _in_submit_window(context: StepContext) -> bool:
     """Whether the batch may start now; a note on the run when it may not."""
     now = context.gate.read_clock()
+    if (
+        context.window.book_id == "sandbox"
+        and sandbox_store_refusal(context.settings, context.window.book_id) is None
+    ):
+        if calendar.session_open(context.session) <= now <= calendar.session_close(context.session):
+            note = "sandbox: submit window skipped"
+            if note not in context.notes:
+                context.notes.append(note)
+            return True
+        context.notes.append("sandbox: outside market hours; nothing submitted")
+        return False
     start, end = submit_window(context.settings, context.session)
     if start <= now <= end:
         return True
@@ -649,6 +668,13 @@ class _ExitBook:
         return {k: v for k, v in self.ledger.positions.items() if k not in self.ambiguous}
 
 
+def _is_cash_base(row: ReconciliationRow) -> bool:
+    """Whether a reconciliation row states the ledger's cash: an `ok` row, or a
+    `breaks` row that carries its `broker_cash` (T282b), as the planning and
+    wrapper readers."""
+    return row.status == RECONCILED or (row.status == BREAKS and row.broker_cash is not None)
+
+
 def _exit_book(context: StepContext) -> _ExitBook:
     """Step 7's reads, every store fact as of close(S-1)."""
     session = context.session
@@ -664,7 +690,7 @@ def _exit_book(context: StepContext) -> _ExitBook:
         ok_rows = [
             r
             for r in reconciliations_for(conn, window_id)
-            if r.status == RECONCILED and r.at.astimezone(_NEW_YORK).date() <= session
+            if _is_cash_base(r) and r.at.astimezone(_NEW_YORK).date() <= session
         ]
         ledger = from_journal(
             fills_for(conn, window_id=window_id),
@@ -1477,9 +1503,33 @@ class _Run:
         )
         return self._finish(SKIPPED_KILL_SWITCH)
 
+    def _break_alert(self) -> None:
+        """The run's one `reconcile_break` alert (#2266 item 12, T284): every open
+        break opened since the window's last earlier run that alerted
+        (`alerts.break_alert_cut`) and every aged one; none when no break calls
+        for it."""
+        with open_read_only(self.settings, retry=True) as conn:
+            events = break_events_for(conn, self.window_id)
+            earlier = [
+                (r.result.status, r.result.finished_at)
+                for r in runs_for(conn, self.window_id)
+                if (r.run.run_id or 0) < self.run_id and r.result is not None
+            ]
+        opened_after = break_alert_cut(earlier)
+        message = reconcile_break_message(
+            events,
+            book_id=self.window.book_id,
+            session=self.session,
+            max_age_sessions=self.frozen.break_max_age_sessions,
+            opened_after=opened_after,
+        )
+        if message is not None:
+            self._alert("reconcile_break", message)
+
     def _finish(self, status: str) -> RunOutcome:
         # A ticker-change note no batch alerted yet (#2185): the run's `skipped` alert.
         self.gate.alert_unsent(self.run)
+        self._break_alert()
         finished = self.gate.read_clock()
         notes = tuple(dict.fromkeys(self.notes))
         with self.connect() as conn:
@@ -1960,7 +2010,8 @@ class _Run:
 
     def _unspent_cash(self, rebalances: Sequence[date]) -> None:
         """One `unspent_cash` alert, at most, for every rebalance in
-        `rebalances` reaching `executed` here whose cash exceeds the frozen
+        `rebalances` reaching `executed` here whose cash (less the book's
+        cash sleeve, c x equity from `paper.execution`) exceeds the frozen
         `risk.max_unspent_cash_fraction` of the broker's equity (module
         docstring): the cash is the broker's, read once with the equity for every
         rebalance in this call, so it is the cash after the run's collection
@@ -1983,7 +2034,14 @@ class _Run:
         bound = self.frozen.max_unspent_cash_fraction * account.equity
         # A short sale's proceeds sit in cash as collateral, not idle: leave the
         # shorts' market value out (None, a long-only adapter, is zero).
-        cash = max(account.cash - abs(account.short_market_value or 0.0), 0.0)
+        # The cash sleeve (c x equity, paper spec amendment 2026-11-01 item 3) is
+        # held on purpose, not unspent: it comes off too. c = 0 for a book outside
+        # `paper.execution`, so nothing changes there.
+        sleeve = execution_for(self.settings, self.window.book_id).cash_sleeve_fraction
+        cash = max(
+            account.cash - abs(account.short_market_value or 0.0) - sleeve * account.equity,
+            0.0,
+        )
         if cash <= bound:
             return
         named = "; ".join(
@@ -2024,9 +2082,7 @@ class _Run:
             fills = fills_for(conn, window_id=self.window_id)
             orders = orders_for(conn, window_id=self.window_id)
             adjustments = adjustments_for(conn, self.window_id)
-            ok_rows = [
-                r for r in reconciliations_for(conn, self.window_id) if r.status == RECONCILED
-            ]
+            ok_rows = [r for r in reconciliations_for(conn, self.window_id) if _is_cash_base(r)]
 
         def ledger(through: date) -> Ledger:
             stated = [r for r in ok_rows if r.at.astimezone(_NEW_YORK).date() <= through]
@@ -2072,7 +2128,11 @@ class _Run:
         ledger = self._ledger_for(actions)
         with open_read_only(self.settings, retry=True) as conn:
             sessions = self._mark_sessions(last_marked_session(conn, self.window_id))
-            held = {name for day in sessions for name in ledger(day).positions}
+            held = {
+                name
+                for day in sessions
+                for name in (*ledger(day).positions, *ledger(day).short_holdings)
+            }
             symbols = _mark_symbols(conn, self.session, sorted(held), self.settings, self.window_id)
         # Every name held on any marked session, not only those held at S
         # (#892 item 1, #1116): a name sold before S but held on a back-filled
@@ -2120,6 +2180,7 @@ class _Run:
                             value=mark.value,
                             cash=mark.cash,
                             tradable=mark.tradable,
+                            position_side=mark.position_side,
                             book_id=self.window.book_id,
                             known_at=stamp,
                             ingested_at=stamp,

@@ -1132,6 +1132,83 @@ def test_write_result_records_ok_with_a_verdict_from_the_interval(
     assert row == ("ok", verdict, '{"n_firms":40}', '{"x":1}', 1)
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["primary_value", "primary_ci_low", "primary_ci_high"])
+def test_a_non_finite_primary_is_not_computable_not_a_fail(
+    conn: duckdb.DuckDBPyConnection, opened: RunHandle, field: str, bad: float
+) -> None:
+    # #2617 (owner, 2026-10-30): a primary statistic or interval bound that
+    # could not be computed is no evidence. The run is still written `ok`
+    # (every run is logged) with the distinct verdict `not_computable`, never
+    # a quiet `fail` (a NaN compares false against any threshold).
+    assert _ok(conn, opened, **{field: bad}) == "ok"
+    row = conn.execute(
+        f"SELECT outcome, verdict, {field} FROM research_results WHERE run_id = ?",
+        [opened.run_id],
+    ).fetchone()
+    assert row is not None
+    # The primary is stored as given, not nulled (spec Data / interfaces).
+    assert row[:2] == ("ok", "not_computable") and repr(row[2]) == repr(bad)
+
+
+def test_a_non_finite_primary_is_not_computable_even_below_the_cluster_floor(
+    conn: duckdb.DuckDBPyConnection, opened: RunHandle
+) -> None:
+    # No statistic at all says more than "too few clusters" (#2617).
+    assert _ok(conn, opened, primary_ci_high=float("nan"), n_clusters=0) == "ok"
+    row = conn.execute(
+        "SELECT verdict FROM research_results WHERE run_id = ?", [opened.run_id]
+    ).fetchone()
+    assert row == ("not_computable",)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_secondary_or_exploratory_value_is_stored_as_null(
+    conn: duckdb.DuckDBPyConnection, opened: RunHandle, bad: float
+) -> None:
+    # #2610 (owner, 2026-10-29): a statistic the analysis cannot compute is
+    # written as JSON null, nested values included; the run stays `ok`.
+    outcome = _ok(
+        conn,
+        opened,
+        secondary={"n_firms": bad},
+        exploratory={"t": bad, "cells": [1.5, bad], "by": {"a": bad, "b": 2}},
+    )
+    assert outcome == "ok"
+    row = conn.execute(
+        "SELECT outcome, secondary_json, exploratory_json FROM research_results WHERE run_id = ?",
+        [opened.run_id],
+    ).fetchone()
+    assert row == (
+        "ok",
+        '{"n_firms":null}',
+        '{"by":{"a":null,"b":2},"cells":[1.5,null],"t":null}',
+    )
+
+
+def test_a_finite_result_serialises_as_canonical_json(
+    conn: duckdb.DuckDBPyConnection, opened: RunHandle
+) -> None:
+    secondary = {"n_firms": 40.25}
+    exploratory = {"z": [1, 2.5, True, None, "s"], "a": {"y": -0.0, "x": 1e-300}}
+    _ok(conn, opened, secondary=secondary, exploratory=exploratory)
+    row = conn.execute(
+        "SELECT secondary_json, exploratory_json FROM research_results WHERE run_id = ?",
+        [opened.run_id],
+    ).fetchone()
+    assert row == (
+        registry.canonical_params_json(secondary),
+        registry.canonical_params_json(exploratory),
+    )
+
+
+def test_params_hashing_still_refuses_nan() -> None:
+    with pytest.raises(ValueError, match="JSON compliant"):
+        registry.canonical_params_json({"x": float("nan")})
+    with pytest.raises(ValueError, match="JSON compliant"):
+        registry.params_sha256({"x": float("inf")})
+
+
 def test_no_threshold_is_n_a(
     conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
 ) -> None:

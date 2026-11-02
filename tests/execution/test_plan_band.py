@@ -272,7 +272,10 @@ def _journaled(env: Env) -> list[object]:
 
 #: `repr` of the rows `plan_rebalance` journals on `test_planning`'s fixture-store window
 #: (H1's shape: momentum, `equal`, band 0), on `main` at 3b261961 before T205.
-TODAY_PLAN_ROWS_SHA256 = "c7de08541a75bf139fa0949e0257c005e6e3b2ceb374ccd01a020cd7c7de7ac9"
+TODAY_PLAN_ROWS_SHA256 = "35c81321acfe6808b456822abfa9a27737cd338d6d97073744f1bc0bcf287a48"
+PRE_INTERSECTION_PLAN_ROWS_SHA256 = (
+    "c7de08541a75bf139fa0949e0257c005e6e3b2ceb374ccd01a020cd7c7de7ac9"
+)
 
 
 def test_band_zero_and_equal_plan_rows_are_todays_byte_for_byte(env: Env) -> None:
@@ -280,7 +283,15 @@ def test_band_zero_and_equal_plan_rows_are_todays_byte_for_byte(env: Env) -> Non
     today's `signals`, `decisions` and `paper_plans` rows."""
     outcome = env.plan()
     assert outcome.status == "planned"
-    assert _digest(_journaled(env)) == TODAY_PLAN_ROWS_SHA256
+    rows = _journaled(env)
+    assert _digest(rows) == TODAY_PLAN_ROWS_SHA256
+    old_shape = [
+        replace(row, n_assets_intersected=None, assets_intersection_skipped=None)
+        if isinstance(row, journal.PaperPlanRow)
+        else row
+        for row in rows
+    ]
+    assert _digest(old_shape) == PRE_INTERSECTION_PLAN_ROWS_SHA256
 
 
 def _with_strategy(monkeypatch: pytest.MonkeyPatch, **updates: Any) -> None:

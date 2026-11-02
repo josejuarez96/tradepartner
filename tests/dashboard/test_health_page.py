@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import re
 import tomllib
-from dataclasses import replace
+from dataclasses import fields, is_dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import duckdb
+import polars as pl
 import pytest
 from conftest import load_universe_fixtures
 from dashboard_nav import nav_calls_fixture  # noqa: F401
@@ -147,6 +148,51 @@ def test_view_carries_the_health_report(store_path: Path) -> None:
     assert view.threshold == settings.ingest.max_missing_share
 
 
+def test_short_reads_preserve_the_fixture_view(store_path: Path) -> None:
+    settings = _settings(store_path)
+    with _connect(store_path) as conn:
+        expected = health_page.load_health_view(conn, T, settings, WINDOW)
+    actual = health_page.load_health_view(
+        cast(duckdb.DuckDBPyConnection, app._ReadSteps(settings)), T, settings, WINDOW
+    )
+
+    def same(left: Any, right: Any) -> bool:
+        if isinstance(left, pl.DataFrame):
+            return left.equals(right)
+        if is_dataclass(left):
+            return all(same(getattr(left, f.name), getattr(right, f.name)) for f in fields(left))
+        if isinstance(left, tuple | list):
+            return len(left) == len(right) and all(
+                same(a, b) for a, b in zip(left, right, strict=True)
+            )
+        if isinstance(left, dict):
+            return left.keys() == right.keys() and all(same(left[k], right[k]) for k in left)
+        return bool(left == right)
+
+    assert same(actual, expected)
+
+
+def test_short_reads_release_store_before_python_aggregation(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    settings = _settings(store_path)
+    original = health._current_from
+    reached = False
+
+    def check_released(*args: Any, **kwargs: Any) -> Any:
+        nonlocal reached
+        reached = True
+        writer = duckdb.connect(str(store_path), read_only=False)
+        writer.close()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(health, "_current_from", check_released)
+    health_page.load_health_view(
+        cast(duckdb.DuckDBPyConnection, app._ReadSteps(settings)), T, settings, WINDOW
+    )
+    assert reached
+
+
 def test_series_has_every_session_in_the_window(store_path: Path) -> None:
     with _connect(store_path) as conn:
         view = health_page.load_health_view(conn, T, _settings(store_path), WINDOW)
@@ -230,6 +276,15 @@ def test_as_of_last_updated_and_staleness(store_path: Path) -> None:
     assert fresh.as_of is not None and fresh.as_of >= known[0]
     assert fresh.last_updated == FINISHED
     assert fresh.stale_sessions == 0
+    allocation_time = session_close(LAST) + timedelta(hours=1)
+    with duckdb.connect(str(store_path)) as conn:
+        conn.execute(
+            "INSERT INTO spinoff_allocations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ["P", "C", LAST, 0.3, allocation_time, allocation_time, "owner", "owner"],
+        )
+    with _connect(store_path) as conn:
+        after_allocation = health_page.load_health_view(conn, T, _settings(store_path), WINDOW)
+    assert after_allocation.as_of == fresh.as_of
     # 2020-07-01, 07-02, 07-06 and 07-07 have no bars (07-03 is a holiday).
     assert stale.stale_sessions == 4
 
@@ -365,7 +420,7 @@ def test_a_half_picked_window_keeps_the_rest_of_the_page(
     assert "Pick an end date" in text
 
 
-def test_page_reads_only_through_the_shells_connection(
+def test_page_opens_only_short_read_only_connections(
     monkeypatch: pytest.MonkeyPatch, store_path: Path
 ) -> None:
     opened: list[object] = []
@@ -379,7 +434,8 @@ def test_page_reads_only_through_the_shells_connection(
     monkeypatch.setattr(duckdb, "connect", _counting_connect)
     at.run()
     assert not at.exception
-    assert opened == [True]
+    assert len(opened) > 1
+    assert all(mode is True for mode in opened)
 
 
 # --- Statement facts (#660, T77c) -------------------------------------------
@@ -705,3 +761,19 @@ def test_render_leads_with_a_fine_verdict_on_a_current_store(
     monkeypatch: pytest.MonkeyPatch, store_path: Path
 ) -> None:
     assert "Data: checks pass" in _text(_app(monkeypatch, store_path))
+
+
+def test_a_sec_forms_backfill_run_is_not_last_updated(store_path: Path) -> None:
+    """#2624: a forms-only backfill's run rows never make the page look updated."""
+    later = FINISHED + timedelta(minutes=30)
+    for run_id, source in (("2624a", "sec_forms"), ("2624b", "sec_insider_bulk")):
+        _write(
+            store_path,
+            "INSERT INTO ingestion_runs VALUES (?, ?, ?, 'ok', ?, 'backfill', 0, 'x', 'x')",
+            [run_id, later, later, source],
+        )
+    with _connect(store_path) as conn:
+        view = health_page.load_health_view(
+            conn, later + timedelta(minutes=1), _settings(store_path), WINDOW
+        )
+    assert view.last_updated == FINISHED

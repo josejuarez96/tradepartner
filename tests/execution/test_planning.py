@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import functools
 import json
+import shutil
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -341,6 +342,44 @@ def test_a_plan_journals_signals_decisions_and_the_plan_row(env: Env) -> None:
         assert decided[sid].target_notional is not None
     journaled = journal.decisions_for(env.conn, env.window.window_id, rebalance_session=T_I)  # type: ignore[arg-type]
     assert [d.decision for d in journaled] == list(outcome.decisions)
+
+
+def _targets_under(env: Env, execution: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
+    """The plan's journaled (side, quantity, notional, target) per name with
+    `paper.execution` set to `execution`."""
+    env.settings = Settings(
+        _env_file=None,
+        store={"path": str(env.settings.store.path)},
+        paper={"live_capital_reference": LIVE_CAPITAL, "execution": execution},
+    )
+    return {
+        sid: (d.side, d.planned_quantity, d.planned_notional, d.target_notional)
+        for sid, d in _decisions(env.plan()).items()
+    }
+
+
+def test_a_mapped_book_with_a_sleeve_leaves_it_in_the_targets_and_others_are_unchanged(
+    fixture_store_path: Path, tmp_path: Path
+) -> None:
+    """#2869: c from `paper.execution[book]` reaches `decisions_from`; c = 0 and an
+    unmapped book keep today's targets and orders."""
+    results: dict[str, dict[str, tuple[Any, ...]]] = {}
+    for name, execution in {
+        "unmapped": {},
+        "other_book": {"daily": {"cash_sleeve_fraction": 0.1}},
+        "zero": {"main": {"cash_sleeve_fraction": 0.0}},
+        "sleeve": {"main": {"cash_sleeve_fraction": 0.1}},
+    }.items():
+        with open_env(fixture_store_path, tmp_path / name) as env:
+            results[name] = _targets_under(env, execution)
+    assert results["zero"] == results["unmapped"] == results["other_book"]
+    base, sleeve = results["unmapped"], results["sleeve"]
+    buys = [sid for sid, row in base.items() if row[0] == "buy"]
+    assert buys
+    for sid in buys:
+        assert sleeve[sid][3] < base[sid][3]
+    for sid in set(base) - set(buys):
+        assert sleeve[sid] == base[sid]
 
 
 def test_the_plan_trial_is_tracking_closed_ok_with_no_metrics(env: Env) -> None:
@@ -1359,6 +1398,11 @@ def _rows_digest(conn: duckdb.DuckDBPyConnection, table: str) -> tuple[int, str]
     cursor = conn.execute(f"SELECT * FROM {table} ORDER BY ALL")
     columns = [d[0] for d in cursor.description]
     rows = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+    if table == "paper_plans":
+        # This T165 pin predates T242; its two T241 columns were still NULL.
+        for row in rows:
+            row["n_assets_intersected"] = None
+            row["assets_intersection_skipped"] = None
     payload = json.dumps(rows, sort_keys=True, default=str)
     return len(rows), hashlib.sha256(payload.encode()).hexdigest()
 
@@ -1371,8 +1415,66 @@ def test_h1_paper_plan_rows_are_pinned(fixture_store_path: Path, tmp_path: Path)
         assert TURNOVER_KEY not in stored
         outcome = env.plan()
         assert outcome.status == "planned"
+        assert env.window.window_id is not None
+        assert [
+            (row.n_assets_intersected, row.assets_intersection_skipped)
+            for row in journal.plans_for(env.conn, env.window.window_id)
+        ] == [(0, False)]
         digests = {t: _rows_digest(env.conn, t) for t in ("signals", "decisions", "paper_plans")}
     assert digests == H1_PAPER_ROWS
+
+
+def test_reason_rows_do_not_change_execution_plan(fixture_store_path: Path, tmp_path: Path) -> None:
+    """Planning never reads a delisting's later classification."""
+    base_path = tmp_path / "base.duckdb"
+    reason_path = tmp_path / "reason.duckdb"
+    shutil.copyfile(fixture_store_path, base_path)
+    shutil.copyfile(fixture_store_path, reason_path)
+    with open_env(base_path, tmp_path) as env:
+        before = env.plan()
+        before_rows = {t: _rows_digest(env.conn, t) for t in ("signals", "decisions")}
+        before_plan = env.conn.execute(
+            "SELECT * EXCLUDE (store_max_ingested_at) FROM paper_plans ORDER BY ALL"
+        ).fetchall()
+        before_stamp = env.conn.execute("SELECT store_max_ingested_at FROM paper_plans").fetchone()
+    with open_env(reason_path, tmp_path) as env:
+        episode = env.conn.execute(
+            "SELECT security_id, form, class_title, exchange, filed_at FROM delistings LIMIT 1"
+        ).fetchone()
+        assert episode is not None
+        insert_row(
+            env.conn,
+            "delisting_reasons",
+            {
+                "security_id": episode[0],
+                "delisting_form": episode[1],
+                "delisting_class_title": episode[2],
+                "delisting_exchange": episode[3],
+                "delisting_filed_at": episode[4],
+                "reason": "bankruptcy",
+                "reason_evidence_form": "8-K",
+                "reason_evidence_accession": "0001-19-000001",
+                "reason_source": "eightk_item",
+                "reason_known_at": read_time(T_I),
+                "known_at": read_time(T_I),
+                "ingested_at": datetime(2026, 10, 31, tzinfo=UTC),
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        after = env.plan()
+        assert after == before
+        assert {t: _rows_digest(env.conn, t) for t in ("signals", "decisions")} == before_rows
+        assert (
+            env.conn.execute(
+                "SELECT * EXCLUDE (store_max_ingested_at) FROM paper_plans ORDER BY ALL"
+            ).fetchall()
+            == before_plan
+        )
+        assert (
+            env.conn.execute("SELECT store_max_ingested_at FROM paper_plans").fetchone()
+            != before_stamp
+        )
 
 
 def test_h1_paper_plan_reads_no_turnover(

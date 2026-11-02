@@ -271,15 +271,10 @@ def today(
     if book.capped:
         raise ValueError(f"session {session} has more than {limit} orders; raise limit")
     held_ids = _held_before(conn, window_id, session, as_of)
-    plans = [
+    plans = (
         p
-        for p in journal._select(
-            conn,
-            PaperPlanRow,
-            "t.rebalance_session = ? AND t.run_id IN "
-            "(SELECT run_id FROM paper_runs WHERE window_id = ?) AND t.known_at <= ?",
-            [session, window_id, as_of],
-            order="t.known_at DESC",
-        )
-    ]
-    return summarise(book.rows, tz, held_before=held_ids, plan=plans[0] if plans else None)
+        for p in journal.plans_for(conn, window_id)
+        if p.rebalance_session == session and p.known_at <= as_of
+    )
+    plan = max(plans, key=lambda p: p.known_at, default=None)
+    return summarise(book.rows, tz, held_before=held_ids, plan=plan)

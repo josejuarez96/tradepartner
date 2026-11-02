@@ -315,7 +315,7 @@ def _seed_tracking_window(
     assert found is not None
     first_run = int(found[0])
     for run_id, session in enumerate(
-        (TRACKING_START, date(2019, 8, 30), TRACKING_END), start=first_run
+        (TRACKING_START, date(2019, 8, 30), TRACKING_END, date(2019, 10, 31)), start=first_run
     ):
         conn.execute(
             "INSERT INTO paper_runs "
@@ -491,12 +491,14 @@ def test_report_refuses_a_bad_book_token_before_any_trial(
     [
         (datetime(2019, 7, 15, 12, tzinfo=UTC), "no rebalance yet"),
         (datetime(2019, 8, 1, 12, tzinfo=UTC), "one rebalance"),
+        # #2468: two sessions give one period return; the engine needs two.
+        (datetime(2019, 9, 10, 12, tzinfo=UTC), "two rebalances"),
     ],
 )
-def test_report_with_fewer_than_two_rebalances_writes_no_trial_and_no_report_row(
+def test_report_with_fewer_than_three_rebalances_writes_no_trial_and_no_report_row(
     fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime, case: str
 ) -> None:
-    """#1923: a book with fewer than two rebalances has nothing to compare; `report`
+    """#1923: a book with fewer than three rebalances has nothing to compare; `report`
     raises `NothingToCompareYet` and writes no trial (so no refused `in_sample`
     row, no failed tracking row) and no `paper_reports` row."""
     report_settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
@@ -524,4 +526,127 @@ def test_report_with_fewer_than_two_rebalances_writes_no_trial_and_no_report_row
         reports = conn.execute("SELECT count(*) FROM paper_reports").fetchone()
     assert trials is not None and trials[0] == before[0]
     assert in_sample is not None and in_sample[0] == 0
+    assert reports is not None and reports[0] == 0
+
+
+# --- #2448: the window ends at the last marked session -----------------------------
+
+
+def _drop_marks_after(conn: duckdb.DuckDBPyConnection, session: date) -> None:
+    conn.execute("DELETE FROM positions_daily WHERE session > ?", [session])
+
+
+def test_report_ends_at_the_last_marked_session_when_the_last_one_was_halted(
+    fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2448: the book was halted on the last completed session, so it has no mark
+    there. The window ends at the last rebalance session with marks, the trial
+    covers that window, and the result names the cap rather than failing."""
+    report_settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    with open_for_write(report_settings) as conn:
+        _seed_tracking_window(conn)
+        _drop_marks_after(conn, TRACKING_END)
+
+    import tradepartner.execution.report as report_module
+
+    monkeypatch.setattr(report_module, "utc_now", lambda: datetime(2019, 11, 4, 12, tzinfo=UTC))
+
+    outcome = report(report_settings, partial(open_read_only, report_settings))
+
+    assert outcome.paper_report.through_session == TRACKING_END
+    assert outcome.window_note is not None
+    assert "2019-10-31" in outcome.window_note and "2019-09-30" in outcome.window_note
+    with open_read_only(report_settings) as conn:
+        row = conn.execute(
+            "SELECT end_session FROM trials WHERE run_by = 'paper_report'"
+        ).fetchone()
+    assert row is not None and row[0] == TRACKING_END
+
+
+def test_report_with_no_marks_after_the_first_rebalance_writes_no_trial(
+    fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2448: capped to one rebalance there is nothing to compare; no trial row."""
+    report_settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    with open_for_write(report_settings) as conn:
+        _seed_tracking_window(conn)
+        _drop_marks_after(conn, TRACKING_START)
+        before = conn.execute("SELECT count(*) FROM trials").fetchone()
+    assert before is not None
+
+    import tradepartner.execution.report as report_module
+
+    monkeypatch.setattr(report_module, "utc_now", lambda: REPORT_NOW)
+
+    def no_run(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("no trial may run")
+
+    monkeypatch.setattr(report_module, "run_hypothesis", no_run)
+
+    with pytest.raises(report_module.NothingToCompareYet):
+        report(report_settings, partial(open_read_only, report_settings))
+    with open_read_only(report_settings) as conn:
+        trials = conn.execute("SELECT count(*) FROM trials").fetchone()
+    assert trials is not None and trials[0] == before[0]
+
+
+def test_report_with_an_unreadable_mark_refuses_before_any_trial(
+    fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2470: a mark row that exists but has no cash is found before the trial opens,
+    naming the session; it writes no trial and no `paper_reports` row."""
+    report_settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    with open_for_write(report_settings) as conn:
+        _seed_tracking_window(conn)
+        conn.execute(
+            "UPDATE positions_daily SET cash = NULL WHERE session = ?", [date(2019, 8, 30)]
+        )
+        before = conn.execute("SELECT count(*) FROM trials").fetchone()
+    assert before is not None
+
+    import tradepartner.execution.report as report_module
+
+    monkeypatch.setattr(report_module, "utc_now", lambda: REPORT_NOW)
+
+    def no_run(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("no trial may run")
+
+    monkeypatch.setattr(report_module, "run_hypothesis", no_run)
+
+    with pytest.raises(report_module.MarksMissing, match="2019-08-30"):
+        report(report_settings, partial(open_read_only, report_settings))
+    with open_read_only(report_settings) as conn:
+        trials = conn.execute("SELECT count(*) FROM trials").fetchone()
+        reports = conn.execute("SELECT count(*) FROM paper_reports").fetchone()
+    assert trials is not None and trials[0] == before[0]
+    assert reports is not None and reports[0] == 0
+
+
+def test_report_with_a_gap_in_the_marks_refuses_before_any_trial(
+    fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2448: a missing mark inside the window is found before the trial opens, naming
+    the session; it writes no trial and no `paper_reports` row."""
+    report_settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    with open_for_write(report_settings) as conn:
+        _seed_tracking_window(conn)
+        conn.execute("DELETE FROM positions_daily WHERE session = ?", [date(2019, 8, 30)])
+        before = conn.execute("SELECT count(*) FROM trials").fetchone()
+    assert before is not None
+
+    import tradepartner.execution.report as report_module
+
+    monkeypatch.setattr(report_module, "utc_now", lambda: REPORT_NOW)
+
+    def no_run(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("no trial may run")
+
+    monkeypatch.setattr(report_module, "run_hypothesis", no_run)
+
+    with pytest.raises(report_module.MarksMissing, match="2019-08-30"):
+        report(report_settings, partial(open_read_only, report_settings))
+    with open_read_only(report_settings) as conn:
+        trials = conn.execute("SELECT count(*) FROM trials").fetchone()
+        reports = conn.execute("SELECT count(*) FROM paper_reports").fetchone()
+    assert trials is not None and trials[0] == before[0]
     assert reports is not None and reports[0] == 0

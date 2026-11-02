@@ -113,6 +113,12 @@ class ExitAsset(Protocol):
         """Whether the broker trades the name in fractional shares."""
         ...
 
+    @property
+    def shortable(self) -> bool: ...
+
+    @property
+    def easy_to_borrow(self) -> bool: ...
+
 
 @dataclass(frozen=True)
 class ExitDecision:
@@ -133,6 +139,7 @@ class ExitDecision:
     whole_share: bool
     session: date
     skipped_reason: str | None = None
+    position_side: str = "long"
 
     def row(
         self,
@@ -154,11 +161,12 @@ class ExitDecision:
             run_id=run_id,
             rebalance_session=None,
             security_id=self.security_id,
-            side=_SELL,
+            side="buy" if self.position_side == "short" else _SELL,
             planned_quantity=self.planned_quantity,
             whole_share=self.whole_share,
             decision=_FORCED_EXIT,
             reason=self.reason,
+            position_side=self.position_side,
             book_id=book_id,
             known_at=known_at,
             ingested_at=ingested_at,
@@ -231,6 +239,8 @@ def _active(
     an open or in-flight plan decision of `pending_rebalance`."""
     names: set[str] = set()
     for decision in decisions:
+        if decision.position_side == "short" and forced_only:
+            continue
         state = _state(decision, states)
         if decision.decision != _FORCED_EXIT and (
             forced_only
@@ -347,15 +357,16 @@ def forced_exits(
     _check_session(session)
     holding = _held(held)
     previous = previous_session(session)
+    long_decisions = [d for d in decisions if d.position_side != "short"]
     blocked = _active(
-        decisions, states, pending_rebalance=pending_rebalance, forced_only=False
+        long_decisions, states, pending_rebalance=pending_rebalance, forced_only=False
     ) | _open_sell_names(open_sells)
-    receipts = _unspent_receipts(adjustments, decisions, states, session)
+    receipts = _unspent_receipts(adjustments, long_decisions, states, session)
     exits: list[ExitDecision] = []
     for security_id in sorted(holding):
         if security_id in blocked:
             continue
-        if _dust_blocked(security_id, holding[security_id], decisions, states):
+        if _dust_blocked(security_id, holding[security_id], long_decisions, states):
             continue
         if _ended(security_id, listings_at, previous):
             reason = DELISTED_REASON
@@ -375,6 +386,69 @@ def forced_exits(
             )
         )
     return exits
+
+
+def forced_covers(
+    short_held: Mapping[str, float],
+    listings_at: Mapping[str, date | None],
+    assets: Mapping[str, ExitAsset],
+    decisions: Sequence[DecisionRow],
+    states: Mapping[int, DecisionState],
+    marks: Mapping[str, float],
+    *,
+    equity: float,
+    short_cover_weight: float,
+    session: date,
+    pending_rebalance: date | None,
+    open_covers: Collection[str] = (),
+) -> list[ExitDecision]:
+    """Cover a delisted, unborrowable or overweight short at the run's mark.
+
+    `marks` and `equity` refer to the same close(S-1); the caller supplies the
+    window's frozen `portfolio.short_cover_weight`. No later bar is read here.
+    """
+    _check_session(session)
+    holding = _held(short_held)
+    if not math.isfinite(equity):
+        raise ValueError(f"equity is {equity!r}")
+    if not math.isfinite(short_cover_weight) or not 0 < short_cover_weight <= 1:
+        raise ValueError(f"short_cover_weight is {short_cover_weight!r}")
+    if isinstance(open_covers, str):
+        raise ValueError("open_covers must be a collection of names")
+    short_decisions = [d for d in decisions if d.position_side == "short"]
+    blocked = _active(
+        short_decisions, states, pending_rebalance=pending_rebalance, forced_only=False
+    ) | set(open_covers)
+    previous = previous_session(session)
+    covers: list[ExitDecision] = []
+    for name in sorted(holding):
+        if name in blocked or _dust_blocked(name, holding[name], short_decisions, states):
+            continue
+        asset = _asset(name, assets)
+        if _ended(name, listings_at, previous):
+            reason = "cover_delisted"
+        elif not asset.shortable or not asset.easy_to_borrow:
+            reason = "cover_not_borrowable"
+        elif equity <= 0:
+            reason = "cover_drift"
+        else:
+            if name not in marks or not math.isfinite(marks[name]) or marks[name] <= 0:
+                raise ValueError(f"no positive finite mark for short {name}")
+            if holding[name] * marks[name] / equity <= short_cover_weight:
+                continue
+            reason = "cover_drift"
+        covers.append(
+            ExitDecision(
+                name,
+                reason,
+                holding[name],
+                True,
+                session,
+                skipped_reason=None if asset.tradable else _UNTRADABLE,
+                position_side="short",
+            )
+        )
+    return covers
 
 
 def reattempt_exits(

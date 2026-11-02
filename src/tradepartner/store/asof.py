@@ -275,7 +275,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Final
+from typing import Any, Final, Literal, overload
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -1113,6 +1113,22 @@ def symbol_changes_as_of(
     ).pl()
 
 
+def spinoff_allocations_as_of(conn: duckdb.DuckDBPyConnection, t: datetime) -> pl.DataFrame:
+    """Latest owner-entered basis fraction per spin-off known at ``t``."""
+    t = _validate_t(t)
+    return conn.execute(
+        """SELECT * EXCLUDE (_rn) FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY parent_security_id, child_security_id, ex_date
+                ORDER BY known_at DESC
+            ) AS _rn
+            FROM spinoff_allocations WHERE known_at <= ?
+        ) WHERE _rn = 1
+        ORDER BY parent_security_id, child_security_id, ex_date""",
+        [t],
+    ).pl()
+
+
 def mergers_as_of(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -1436,6 +1452,131 @@ def filing_events_as_of(
         return conn.execute(sql, params).pl()
     finally:
         conn.unregister(_FILING_EVENT_SECURITIES_VIEW)
+
+
+def _require_sec_forms_read(settings: Settings | None) -> None:
+    """Keep ownership events outside existing research reads until enabled."""
+    if not (settings if settings is not None else get_settings()).events.sec_forms_read_enabled:
+        raise PermissionError("events.sec_forms_read_enabled is false")
+
+
+def sec_filing_events_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    forms: Sequence[str],
+    subject_cik: str | None = None,
+    *,
+    settings: Settings | None = None,
+) -> pl.DataFrame:
+    """Read ownership filings by subject CIK at their UTC acceptance instant.
+
+    Forms match verbatim. No filer is resolved into a security, and a filing
+    accepted after the session close is invisible at that close.
+    """
+    _require_sec_forms_read(settings)
+    t = _validate_t(t)
+    form_list = _string_list(forms, name="forms")
+    if form_list is None:
+        raise TypeError("forms must be a sequence of strings")
+    params: list[Any] = [t, form_list]
+    subject_filter = ""
+    if subject_cik is not None:
+        subject_filter = " AND subject_cik = ?"
+        params.append(subject_cik)
+    return conn.execute(
+        "SELECT * FROM sec_filing_events WHERE known_at <= ? "
+        f"AND list_contains(?::VARCHAR[], form){subject_filter} "
+        "ORDER BY known_at, accession, subject_cik, filer_cik",
+        params,
+    ).pl()
+
+
+def form4_date_plausibility_sql(min_transaction_date: date, after_acceptance_days: int) -> str:
+    """SQL predicate for a Form 4 transaction date that is possible, not merely recent.
+
+    The lower bound is a configured floor (before it the date is a typo). The upper
+    bound is deliberate: a transaction cannot happen after the filing that reports it
+    was accepted (New York day, plus the configured tolerance in days). A late filing,
+    dated years before acceptance but after the floor, is plausible and stays readable.
+    This pure expression is shared by as-of reads and health. It never uses the query
+    time or a later filing to judge a transaction date.
+    """
+    if after_acceptance_days < 0:
+        raise ValueError("after_acceptance_days must be >= 0")
+    accepted_day = "CAST(accepted_at AT TIME ZONE 'America/New_York' AS DATE)"
+    return (
+        f"transaction_date >= DATE '{min_transaction_date.isoformat()}' "
+        f"AND transaction_date <= {accepted_day} + INTERVAL '{int(after_acceptance_days)} days'"
+    )
+
+
+@overload
+def sec_form4_transactions_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    subject_cik: str | None = None,
+    *,
+    settings: Settings | None = None,
+    include_implausible: bool = False,
+    with_excluded_count: Literal[False] = False,
+) -> pl.DataFrame: ...
+
+
+@overload
+def sec_form4_transactions_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    subject_cik: str | None = None,
+    *,
+    settings: Settings | None = None,
+    include_implausible: bool = False,
+    with_excluded_count: Literal[True],
+) -> tuple[pl.DataFrame, int]: ...
+
+
+def sec_form4_transactions_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    subject_cik: str | None = None,
+    *,
+    settings: Settings | None = None,
+    include_implausible: bool = False,
+    with_excluded_count: bool = False,
+) -> pl.DataFrame | tuple[pl.DataFrame, int]:
+    """Read non-derivative Form 4 rows by issuer CIK at acceptance time.
+
+    Bulk share counts may be rounded to two decimal places. A 4/A has its own
+    accession and coexists with its original; a consumer must decide how to
+    treat amendments. Transaction and deemed execution dates are filer-entered
+    dates, not clocks. By default, exclude impossible dates: before
+    `events.form4_min_transaction_date` or after the filing's own New York acceptance day
+    plus `events.form4_after_acceptance_days`. The upper bound is deliberate (a trade
+    cannot postdate its own filing); late filings stay readable.
+    Request `with_excluded_count` for the count removed.
+    """
+    active_settings = settings if settings is not None else get_settings()
+    _require_sec_forms_read(active_settings)
+    t = _validate_t(t)
+    params: list[Any] = [t]
+    subject_filter = ""
+    if subject_cik is not None:
+        subject_filter = " AND issuer_cik = ?"
+        params.append(subject_cik)
+    predicate = form4_date_plausibility_sql(
+        active_settings.events.form4_min_transaction_date,
+        active_settings.events.form4_after_acceptance_days,
+    )
+    base = f"FROM sec_form4_transactions WHERE known_at <= ?{subject_filter}"
+    excluded = 0
+    if with_excluded_count and not include_implausible:
+        count_row = conn.execute(f"SELECT count(*) {base} AND NOT ({predicate})", params).fetchone()
+        excluded = int(count_row[0]) if count_row is not None else 0
+    plausible_filter = "" if include_implausible else f" AND ({predicate})"
+    rows = conn.execute(
+        f"SELECT * {base}{plausible_filter} ORDER BY known_at, accession, filer_cik, line_no",
+        params,
+    ).pl()
+    return (rows, excluded) if with_excluded_count else rows
 
 
 def _latest_assets_observation(conn: duckdb.DuckDBPyConnection, t: datetime) -> datetime | None:

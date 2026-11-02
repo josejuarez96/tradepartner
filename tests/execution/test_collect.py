@@ -105,6 +105,7 @@ def _order(
     symbol: str = "AAA",
     sells_in_flight: bool = False,
     acknowledge: bool = True,
+    book_id: str = "main",
 ) -> OrderRow:
     """A decision, its order row and `pending` event, the fake's submit, and
     (unless `acknowledge=False`) the `accepted` event: what the wrapper leaves."""
@@ -141,6 +142,7 @@ def _order(
         notional=notional,
         quantity=quantity,
         sells_in_flight_at_submit=sells_in_flight,
+        book_id=book_id,
         known_at=at,
         ingested_at=at,
     )
@@ -838,6 +840,53 @@ def test_a_rejection_observed_earlier_is_not_judged_again(
     # The still-open order of that run is collected again later: no new rejection.
     later = _collect(journal_settings, scripted_fake, fixed_clock, [orders[1]], frozen=frozen)
     assert later.rejections == ()
+
+
+def test_another_books_rejections_are_not_judged_in_this_books_collection(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2475: book B's collection judges B's rejections only; book A's rejected
+    run is A's to judge, never B's verdict (and never a RejectionCapError for B)."""
+    frozen = RiskConfig(max_rejections_per_run=0)
+    _, a_orders = _rejecting_run(
+        journal_settings, open_window, scripted_fake, fixed_clock, rejected=2
+    )
+    # A's rejections are journaled but no run collection has judged them yet (a
+    # submit-time rejection): the old account-wide read judged them in B's collection.
+    at = fixed_clock()
+    _append(
+        journal_settings,
+        *[
+            OrderEventRow(
+                client_order_id=o.client_order_id,
+                status="rejected",
+                known_at=at,
+                ingested_at=at,
+            )
+            for o in a_orders
+        ],
+    )
+    fixed_clock.advance(minutes=5)
+    (b_window_id,) = _append(
+        journal_settings, replace(open_window, window_id=None, book_id="bbbb", account_id="PB1")
+    )
+    b_window = replace(open_window, window_id=b_window_id, book_id="bbbb", account_id="PB1")
+    b_run = _run(journal_settings, b_window, fixed_clock())
+    b_order = _order(
+        journal_settings, scripted_fake, fixed_clock, b_run, "tp-bbbb-1", book_id="bbbb"
+    )
+    scripted_fake.simulate_fill(b_order.client_order_id)
+    collected = _collect(
+        journal_settings, scripted_fake, fixed_clock, [b_order], writer_id=b_run, frozen=frozen
+    )
+    assert collected.rejections == ()
+    # Greptile #2489: B's order is saved under B, so its collection reads it; without
+    # this the test passed while collection skipped B's order entirely.
+    assert _statuses(journal_settings, b_order.client_order_id)[-1] == "filled"
+    assert [f.fill.client_order_id for f in _fills(journal_settings)] == [b_order.client_order_id]
 
 
 def _event(client_order_id: str, status: str, minute: int = 0) -> OrderEventRow:

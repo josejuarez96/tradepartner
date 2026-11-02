@@ -251,6 +251,19 @@ def test_edgar_source_requires_the_quant_audit() -> None:
     }
 
 
+def test_review_prefixes_are_stems_so_a_config_split_stays_covered() -> None:
+    # config-split T309: a split module keeps the review its parent file had
+    both = {"quant-auditor", "safety-reviewer"}
+    for name in ("config_data", "config_edgar", "config_backtest", "config_base", "ingest_edgar"):
+        assert ready_pr.required_reviews([f"src/tradepartner/{name}.py"]) == both, name
+    for path in (
+        "src/tradepartner/health_rules.py",
+        "src/tradepartner/adapters/edgar_insider_bulk.py",
+    ):
+        assert ready_pr.required_reviews([path]) == {"quant-auditor"}, path
+    assert ready_pr.required_reviews(["src/tradepartner/cli_commands.py"]) == {"safety-reviewer"}
+
+
 def test_uv_lock_requires_the_safety_review() -> None:
     # dependency pins, like pyproject.toml (#382)
     assert ready_pr.required_reviews(["uv.lock"]) == {"safety-reviewer"}

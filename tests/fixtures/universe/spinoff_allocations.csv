@@ -1,0 +1,2 @@
+parent_security_id,child_security_id,ex_date,basis_allocation,known_at,ingested_at,source,provenance
+SEC_TICKCHANGE,SEC_SPLIT_PLAIN,2018-12-13,0.25,2018-12-20T21:00:00+00:00,2018-12-20T21:00:00+00:00,owner,owner

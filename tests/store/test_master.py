@@ -27,6 +27,7 @@ import pytest
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 
 from tradepartner.adapters.alpaca_prices import ListingResolver, registrant_evidence
+from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
@@ -37,6 +38,8 @@ from tradepartner.adapters.filings import (
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.config import Settings
+from tradepartner.ingest import _Recorded
+from tradepartner.store import filing_index as stored_index
 from tradepartner.store import schema
 from tradepartner.store.asof import listings_as_of
 from tradepartner.store.db import configure_connection, insert_row
@@ -48,6 +51,8 @@ from tradepartner.store.master import (
     MasterBuild,
     ShownSpan,
     Succession,
+    _filing_index_for_cik,
+    _filing_index_for_forms,
     _refuse_separator,
     build_chains,
     build_master,
@@ -61,6 +66,40 @@ from tradepartner.store.master import (
 )
 
 INGESTED_AT = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+
+
+def test_cross_cik_and_per_cik_index_queries_skip_full_materialization(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = Settings(_env_file=None, edgar={"cache_dir": str(tmp_path)})
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    rows = [
+        stored_index.Listing(
+            cik,
+            f"{cik}-26-{i:06d}",
+            form,
+            "Issuer",
+            date(2026, 9, 24),
+            INGESTED_AT - timedelta(days=1),
+            date(2026, 9, 24),
+            True,
+        )
+        for i, (cik, form) in enumerate(
+            ((ACME, "10-K"), (OLDCO, "10-K"), (OLDCO, "8-K12B")), start=1
+        )
+    ]
+    stored_index.insert_listings(conn, rows, INGESTED_AT)
+    source = EdgarFilingSource(settings, clock=lambda: INGESTED_AT)
+    source.use_index(conn, touched_ciks=frozenset({ACME}))
+    monkeypatch.setattr(source, "filing_index", lambda *_args: pytest.fail("full index"))
+    assert [row.cik for row in _filing_index_for_cik(source, ACME)] == [ACME]
+    assert [row.cik for row in _filing_index_for_forms(source, {"8-K12B"})] == [OLDCO]
+    recorded = _Recorded(source)
+    assert [row.cik for row in _filing_index_for_cik(recorded, ACME)] == [ACME]
+    assert [row.cik for row in _filing_index_for_forms(recorded, {"8-K12B"})] == [OLDCO]
+
+
 FETCHED_AT = datetime(2026, 9, 24, 14, 0, tzinfo=UTC)
 
 ACME = "0000000001"  # 10-K filer from 2005; a Form 4 names it as subject earlier
@@ -2290,9 +2329,10 @@ def test_chain_candidates_need_an_end_within_the_window() -> None:
 
 RENAMED = "0000000098"  # 10-K from 2010, never a cover page: snapshot-only
 F1 = datetime(2026, 10, 3, 18, 0, tzinfo=UTC)  # a Saturday fetch: session 10-05
-F2 = datetime(2026, 10, 25, 18, 47, tzinfo=UTC)  # a Sunday fetch: session 10-26
-F3 = datetime(2026, 10, 27, 23, 0, tzinfo=UTC)
-RENAME_AT = datetime(2026, 10, 28, 2, 0, tzinfo=UTC)
+F2 = datetime(2026, 10, 26, 18, 47, tzinfo=UTC)  # a Monday fetch: session 10-26
+F3 = datetime(2026, 10, 28, 23, 0, tzinfo=UTC)
+NEXT_FETCH = F2 + timedelta(days=1)  # Tuesday's consecutive nightly fetch
+RENAME_AT = datetime(2026, 10, 31, 2, 0, tzinfo=UTC)
 
 
 def _renamed_source(*snaps: CompanySnapshotEntry, covers: tuple[CoverPage, ...] = ()) -> Any:
@@ -2338,11 +2378,41 @@ class TestSnapshotRename:
     """#2291: each nightly run sees only the current SEC ticker file, so the
     build is handed the fetches the store's snapshot rows record."""
 
-    def test_a_later_ticker_is_a_dated_snapshot_row(self) -> None:
+    def test_one_new_ticker_fetch_writes_no_rename(self) -> None:
         build = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+
+    def test_two_consecutive_new_ticker_fetches_date_the_second(self) -> None:
+        build = _rename_build([_rn("RNB", NEXT_FETCH)], [_rn("RNA", F1), _rn("RNB", F2)])
         assert _renamed_rows(build) == [
             STATIC_ROW,
-            ("RNB", "OTC", "snapshot", date(2026, 10, 26), F2),
+            ("RNB", "OTC", "snapshot", date(2026, 10, 26), NEXT_FETCH),
+        ]
+
+    def test_two_fetches_in_one_session_do_not_confirm_a_rename(self) -> None:
+        later_same_session = F2 + timedelta(hours=2)
+        build = _rename_build([_rn("RNB", later_same_session)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+
+    def test_a_pending_ticker_must_keep_its_exchange(self) -> None:
+        build = _rename_build([_rn("RNB", NEXT_FETCH, "NYSE")], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+
+    def test_new_ticker_then_old_ticker_back_writes_no_rename(self) -> None:
+        build = _rename_build([_rn("RNA", NEXT_FETCH)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+
+    def test_confirmation_is_not_visible_before_second_fetch(self) -> None:
+        before = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)])
+        after = _rename_build([_rn("RNB", NEXT_FETCH)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(before) == [STATIC_ROW]
+        assert all(row[4] >= NEXT_FETCH for row in _renamed_rows(after)[1:])
+
+    def test_a_later_ticker_is_a_dated_snapshot_row(self) -> None:
+        build = _rename_build([_rn("RNB", NEXT_FETCH)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(build) == [
+            STATIC_ROW,
+            ("RNB", "OTC", "snapshot", date(2026, 10, 26), NEXT_FETCH),
         ]
         assert build.unmatched_snapshot == ()
 
@@ -2355,15 +2425,23 @@ class TestSnapshotRename:
     def test_the_same_history_derives_the_same_rows(self) -> None:
         once = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)])
         again = _rename_build([_rn("RNB", F3)], [_rn("RNA", F1), _rn("RNB", F2)])
-        assert _renamed_rows(again) == _renamed_rows(once)
+        assert _renamed_rows(once) == [STATIC_ROW]
+        assert _renamed_rows(again) == [
+            STATIC_ROW,
+            ("RNB", "OTC", "snapshot", date(2026, 10, 26), F3),
+        ]
         assert again.unmatched_snapshot == ()
 
     def test_a_rename_back_is_followed(self) -> None:
-        build = _rename_build([_rn("RNA", F3)], [_rn("RNA", F1), _rn("RNB", F2)])
+        back_confirmed = F3 + timedelta(days=1)
+        build = _rename_build(
+            [_rn("RNA", back_confirmed)],
+            [_rn("RNA", F1), _rn("RNB", F2), _rn("RNB", NEXT_FETCH), _rn("RNA", F3)],
+        )
         assert _renamed_rows(build) == [
             STATIC_ROW,
-            ("RNB", "OTC", "snapshot", date(2026, 10, 26), F2),
-            ("RNA", "OTC", "snapshot", date(2026, 10, 27), F3),
+            ("RNB", "OTC", "snapshot", date(2026, 10, 26), NEXT_FETCH),
+            ("RNA", "OTC", "snapshot", date(2026, 10, 28), back_confirmed),
         ]
 
     def test_a_class_with_a_cover_page_is_still_reported(self) -> None:
@@ -2373,11 +2451,15 @@ class TestSnapshotRename:
         assert "RNB" not in {row[0] for row in _renamed_rows(build)}
 
     def test_a_rename_on_the_spans_own_session_is_reported(self) -> None:
-        # F2 and a second fetch the same session: a row there would tie RNB's start.
-        same_session = F2 + timedelta(hours=2)
-        build = _rename_build([_rn("RNC", same_session)], [_rn("RNA", F1), _rn("RNB", F2)])
-        assert [e.ticker for e in build.unmatched_snapshot] == ["RNC"]
-        assert [row[0] for row in _renamed_rows(build)] == ["RNA", "RNB"]
+        # A second ticker on the span's own session cannot start another row.
+        same_session = F1 + timedelta(hours=2)
+        build = _rename_build(
+            [_rn("RNC", same_session)],
+            [_rn("RNA", F1)],
+            _settings(master={"static_columns": ["name"]}),
+        )
+        assert [row[0] for row in _renamed_rows(build)] == ["RNA"]
+        assert [entry.ticker for entry in build.unmatched_snapshot] == ["RNC"]
 
     def test_a_delisted_name_absent_from_the_fetch_gets_no_new_row(self) -> None:
         build = _rename_build([_snap(ACME, "ACME", "ACME", "NYSE", F2)], [_rn("RNA", F1)])
@@ -2419,7 +2501,6 @@ class TestStoredSnapshotFetches:
             fetches = stored_snapshot_fetches(conn, RENAME_AT)
         assert [(e.cik, e.ticker, e.exchange, e.fetched_at) for e in fetches] == [
             (RENAMED, "RNA", "OTC", F1),
-            (RENAMED, "RNB", "OTC", F2),
         ]
 
     def test_filing_rows_retracted_rows_and_benchmarks_are_not_fetches(self) -> None:

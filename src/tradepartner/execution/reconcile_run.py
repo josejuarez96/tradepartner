@@ -25,14 +25,29 @@ it decides and raises on a mismatch. A run's steps 4 and 8, `paper reconcile`,
     writes the closing events of breaks that closed. Each row is stamped with
     the same clock reading, so every adjustment is inside the reconciliation
     that re-bases the ledger's cash (`execution.ledger`: a row whose `known_at`
-    equals the base's is counted in it, never twice). Only an `ok` result books
-    `adjustments` rows; a `breaks` row books none (that comes in a later task,
-    T282b).
-5. On `mismatch` or `breaks` (or an open finding still unresolved), raise
-    `ReconciliationError` after the row and its events are committed, so the
-    caller engages the kill switch and no order is submitted: the run's halt
-    path (T60) for steps 4 and 8, `reconcile_command` for `paper reconcile`.
-    Halting on `breaks` is T281's temporary safety rule, which T282d removes.
+    equals the base's is counted in it, never twice). Only an `ok` or `breaks`
+    result books `adjustments` rows. **Auto-acceptance (T283a, item 6):** a name's
+    immaterial break (`_auto_accepts`: at or below both materiality bounds, the
+    sizes already auto-accepted on the name included, and never a finding, a
+    short, an `unknown_security` or a break once material or reopened) is written
+    `opened` (when new) and `auto_accepted` in this chunk, with `auto_true_up`
+    adjustments that adopt the broker's absolute quantity and cash. A
+    reconciliation every one of whose breaks is accepted, with no finding left
+    open, is `ok` and halts nothing. A deferred reconciliation (`mismatch`,
+    `pending_unresolved`, `fills_lagging`) books none: the immaterial break stays
+    `opened`, unrestricted, and the next `ok` or `breaks` reconciliation re-tests it.
+5. On `mismatch` (or a name-level difference, or a retained finding, beside a
+    lagging or unresolved order), raise `ReconciliationError`
+    after the row and its events are committed, so the caller engages the kill
+    switch and no order is submitted: the run's halt path (T60) for steps 4 and
+    8, `reconcile_command` for `paper reconcile`. A `breaks` result no longer
+    halts (T282d, paper spec amendment 2026-10-26, #2266, item 7): it restricts
+    its names and the rest of the book trades. The one exception is the
+    book-level `break_cap` (item 3): when the events of this reconciliation leave
+    more open material breaks than `risk.max_open_breaks`, or their sizes above
+    `risk.max_open_break_share` of the ledger equity (an `unknown_symbol` break
+    counts, though it restricts no name), the chunk is redone as a `mismatch`
+    carrying a `break_cap` mismatch, and the book halts.
     If the write fails on a `mismatch` or `breaks` result, a halt for a break,
     or while any break is open, the row rolls back with its events and
     `ReconciliationError` is raised too.
@@ -169,12 +184,18 @@ from tradepartner.adapters.broker import (
     Position,
     UnknownOrderError,
 )
+from tradepartner.backtest.frozen import frozen_values
 from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, LimitBreachError, ReconciliationError
 from tradepartner.execution import breaks as break_rules
 from tradepartner.execution import switch
-from tradepartner.execution.ledger import Ledger, from_journal
+from tradepartner.execution.ledger import (
+    Ledger,
+    from_journal,
+    reversed_adjustment_id,
+    reversed_true_up_ids,
+)
 from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.plan import current_listings
 from tradepartner.execution.reconcile import (
@@ -201,6 +222,7 @@ from tradepartner.store.asof import (
     live_actions_as_of,
     mergers_as_of,
     prices_as_of,
+    spinoff_allocations_as_of,
     symbol_changes_as_of,
 )
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
@@ -219,6 +241,7 @@ from tradepartner.store.journal import (
     ReconciliationRow,
     adjustments_for,
     append,
+    break_events_for,
     fills_for,
     non_terminal_orders,
     open_breaks,
@@ -228,6 +251,7 @@ from tradepartner.store.journal import (
     pending_orders,
     reconciliations_for,
 )
+from tradepartner.store.schema import AUTO_TRUE_UP_KIND
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
@@ -256,6 +280,22 @@ _BREAK_RISK_KEYS = (
     "break_cause_lookback_sessions",
 )
 _FAULT_TYPE = ReconciliationError.__name__
+
+
+class _BookHalt(Exception):
+    """Raised inside the write chunk when a reconciliation's events call for a
+    book-level halt (item 3's `break_cap`, or a restricted name in a `long_short`
+    book); the chunk rolls back and is redone as a `mismatch` of `kind`."""
+
+    def __init__(self, kind: str, detail: str) -> None:
+        super().__init__(detail)
+        self.kind = kind
+
+
+#: A restricted name in a `long_short` book (the owner's decision of 2026-10-28 on
+#: PR #2386, question 2, fallback): the plan cannot yet be built around a signed
+#: kept weight, so the book halts with this message instead.
+RESTRICTED_LONG_SHORT = "restricted_long_short"
 
 
 class NoWindowError(RuntimeError):
@@ -838,12 +878,14 @@ def _spinoffs(
 
 
 def _stock_dividends(
-    actions: pl.DataFrame, session: date, max_rate: float, max_lag_sessions: int
+    actions: pl.DataFrame, session: date, max_lag_sessions: int
 ) -> dict[str, tuple[date, date, float]]:
-    """`security_id`s with a stock dividend stored as a `SPLIT` action (#1627):
-    a ratio in `(1, max_rate]` — the same `alpaca.stock_dividend_max_rate` guard
-    `#1618` (T186-family) stores one by — each mapped to `(first_date, last_date,
-    ratio)`: the name's latest `ex_date <= session`, that ex-date advanced up to
+    """`security_id`s with a split of any kind stored as a `SPLIT` action (#1627,
+    widened by #2184): a stock dividend in `(1, alpaca.stock_dividend_max_rate]`,
+    a forward split above it, or a reverse split (ratio < 1), so any split that
+    can leave a fractional share is explained; only a ratio of 1 or less than or
+    equal to 0 is excluded. Each is mapped to `(first_date, last_date, ratio)`: the
+    name's latest `ex_date <= session`, that ex-date advanced up to
     `max_lag_sessions` XNYS sessions (the `alpaca.cash_in_lieu_max_lag_sessions`
     window Alpaca pays cash in lieu on, the payable date), clamped to `session`,
     and its ratio. A `CIL` cash-in-lieu activity is reconciled into a
@@ -852,8 +894,8 @@ def _stock_dividends(
     whole shares plus cash); otherwise it is `unexplained_activity`."""
     rows = actions.filter(
         (pl.col("action_type") == _SPLIT)
-        & (pl.col("ratio_or_amount") > 1)
-        & (pl.col("ratio_or_amount") <= max_rate)
+        & (pl.col("ratio_or_amount") > 0)
+        & (pl.col("ratio_or_amount") != 1)
         & (pl.col("ex_date") <= session)
     )
     latest: dict[str, tuple[date, float]] = {}
@@ -956,7 +998,6 @@ def _explanations(
     stock_dividends = _stock_dividends(
         actions,
         session,
-        settings.alpaca.stock_dividend_max_rate,
         settings.alpaca.cash_in_lieu_max_lag_sessions,
     )
     return Explanations(
@@ -1122,25 +1163,64 @@ def _seen_activities(
     ids every activity a reconciliation reads is treated as already inside the
     base, and the fallback date cutoff (None when a recorded set exists).
 
-    The window's already-booked activity ids (`adjustments.broker_activity_id`)
-    are always seen, so a fee is booked once by id. The base's recorded set (the
+    An activity's latest booking decides whether it is seen: a reversal removes
+    it, and a later explanation-linked booking restores it. The base's recorded set (the
     last `ok` or `breaks` reconciliation's `activities`) takes precedence; before the first
     `ok`, the window row's `activities_seen_json` (what `paper start` read); when
     both are null, the fallback cutoff is the window's New York start date, so a
     fee dated before the window opened is seen and a fee dated on it is bookable."""
-    booked = frozenset(
-        a.broker_activity_id for a in adjustments if a.broker_activity_id is not None
-    )
+    reversed_true_up_ids(adjustments, date.max)
+    latest: dict[str, bool] = {}
+    for adjustment in sorted(adjustments, key=lambda a: (a.known_at, a.adjustment_id or 0)):
+        try:
+            terms = json.loads(adjustment.explanation_json or "{}")
+        except (TypeError, ValueError):
+            terms = {}
+        terms = terms if isinstance(terms, dict) else {}
+        reversed_activity = terms.get("reversed_activity_id")
+        if reversed_adjustment_id(adjustment) is not None and isinstance(reversed_activity, str):
+            latest[reversed_activity] = False
+        rebooked = terms.get("rebooked_activity_id")
+        if isinstance(rebooked, str):
+            latest[rebooked] = True
+        if adjustment.broker_activity_id is not None:
+            latest[adjustment.broker_activity_id] = True
+    booked = frozenset(key for key, active in latest.items() if active)
+    reversed_ids = frozenset(key for key, active in latest.items() if not active)
     recorded = _recorded_activity_ids(base)
     if recorded is not None:
-        return booked | recorded, None
+        return booked | (recorded - reversed_ids), None
     if window.activities_seen_json is not None:
         try:
             ids = json.loads(window.activities_seen_json)
         except (ValueError, TypeError):
             ids = []
-        return booked | frozenset(str(i) for i in ids if isinstance(i, str)), None
+        return booked | (frozenset(str(i) for i in ids if isinstance(i, str)) - reversed_ids), None
     return booked, window.started_at.astimezone(_NEW_YORK).date()
+
+
+def _rebooked_after(adjustments: Sequence[AdjustmentRow]) -> dict[str, int]:
+    """Latest reversal row per activity whose unique column was used before."""
+    reversed_true_up_ids(adjustments, date.max)
+    latest: dict[str, int] = {}
+    for row in sorted(adjustments, key=lambda a: (a.known_at, a.adjustment_id or 0)):
+        try:
+            payload = json.loads(row.explanation_json or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        reversed_id = payload.get("reversed_activity_id")
+        if (
+            reversed_adjustment_id(row) is not None
+            and isinstance(reversed_id, str)
+            and row.adjustment_id is not None
+        ):
+            latest[reversed_id] = row.adjustment_id
+        booked = row.broker_activity_id or payload.get("rebooked_activity_id")
+        if isinstance(booked, str):
+            latest.pop(booked, None)
+    return latest
 
 
 def _merger_id_of(adjustment: AdjustmentRow) -> str | None:
@@ -1463,20 +1543,82 @@ def _open_orders(
     return orders, pending, sums
 
 
+def spinoff_receipt_terms(
+    conn: duckdb.DuckDBPyConnection,
+    cut: datetime,
+    actions: pl.DataFrame,
+    child: str,
+    parent: str,
+    through: date,
+) -> dict[str, object]:
+    """The `explanation_json` keys a `spinoff_receipt` of `child` carries (paper
+    spec amendment 2026-10-20, #1976, items 2 and 3): `parent_security_id`, the
+    spin-off's `ex_date` (the latest stored one on or before `through`, which
+    fixes the parent lots entitled to the child) and, only when one is stored
+    with `known_at <= cut` (close(S-1)), the owner-entered `basis_allocation`.
+    A fraction known later is not applied (no look-ahead), and the receipt is
+    never rewritten once journaled."""
+    terms: dict[str, object] = {"parent_security_id": parent}
+    ex_dates = [
+        row["ex_date"]
+        for row in actions.filter(
+            (pl.col("action_type") == _SPINOFF)
+            & (pl.col("security_id") == child)
+            & (pl.col("source_action_id") == parent)
+            & (pl.col("ex_date") <= through)
+        ).iter_rows(named=True)
+    ]
+    if not ex_dates:
+        return terms
+    ex_date = max(ex_dates)
+    return spinoff_terms_at(conn, cut, parent, child, ex_date)
+
+
+def spinoff_terms_at(
+    conn: duckdb.DuckDBPyConnection, cut: datetime, parent: str, child: str, ex_date: date
+) -> dict[str, object]:
+    """`spinoff_receipt_terms` for a known spin-off: the parent, `ex_date` and the
+    allocation stored with `known_at <= cut`, if any. `execution.window` writes
+    its residue receipt's terms through this too (#1976 item 2)."""
+    terms: dict[str, object] = {"parent_security_id": parent, "ex_date": ex_date.isoformat()}
+    stored = spinoff_allocations_as_of(conn, cut).filter(
+        (pl.col("parent_security_id") == parent)
+        & (pl.col("child_security_id") == child)
+        & (pl.col("ex_date") == ex_date)
+    )
+    if not stored.is_empty():
+        terms["basis_allocation"] = float(stored["basis_allocation"][0])
+    return terms
+
+
 def _explanation_json(
     text: str,
     reconciliation_id: int | None,
     merger_id: str | None = None,
     merger_terms: Mapping[str, object] | None = None,
+    spinoff_terms: Mapping[str, object] | None = None,
 ) -> str:
     """An adjustment's `explanation_json`: its text, the reconciliation that
-    journaled it and, for a merger's row, the merger id (#1762, T249)."""
+    journaled it and, for a merger's row, the merger id (#1762, T249) or, for a
+    spin-off receipt, its parent, ex-date and allocation (#1976, T255)."""
     payload: dict[str, object] = {"explanation": text, "reconciliation_id": reconciliation_id}
+    if spinoff_terms is not None:
+        payload.update(spinoff_terms)
     if merger_id is not None:
         payload["merger_id"] = merger_id
     if merger_terms is not None:
         payload.update(merger_terms)
     return json.dumps(payload, sort_keys=True, allow_nan=False)
+
+
+def _signed_book(conn: duckdb.DuckDBPyConnection, window: PaperWindowRow) -> bool:
+    """Whether the window's hypothesis freezes `portfolio.side = long_short`. A
+    hypothesis that cannot be read counts as signed (fail closed)."""
+    try:
+        hypothesis = registry.get_hypothesis_by_id(conn, window.hypothesis_id)
+    except registry.RegistryError:
+        return True
+    return str(frozen_values(hypothesis).get("portfolio.side", "long_only")) == "long_short"
 
 
 def _break_evidence(
@@ -1510,6 +1652,327 @@ def _break_evidence(
     return evidence
 
 
+#: Item 6: the kinds an immaterial break may be auto-accepted for: a quantity
+#: part and a cash part on a long name. Every other kind (a finding, a short, an
+#: `unknown_security`) is material whatever its size and waits for the owner.
+_AUTO_QUANTITY_KINDS = frozenset({"quantity", "ledger_only_position", "broker_only_position"})
+_AUTO_KINDS = _AUTO_QUANTITY_KINDS | {break_rules.NAME_CASH}
+
+
+@dataclass(frozen=True)
+class _AutoAccept:
+    """One name's auto-acceptance (item 6): the figures its `auto_true_up` rows
+    adopt, and the sizes the explanation names."""
+
+    size: float
+    prior: float
+    ledger_quantity: float
+    broker_quantity: float
+    quantity_part: bool
+    cash_parts: tuple[tuple[str, float], ...]
+    equity: float
+
+
+def _by_name(result: Reconciliation) -> dict[str, list[Mismatch]]:
+    """The name-level mismatches by break name (item 2)."""
+    by_name: dict[str, list[Mismatch]] = defaultdict(list)
+    for mismatch in result.mismatches:
+        if break_rules.is_name_level(mismatch.kind):
+            name = mismatch.security_id or mismatch.symbol
+            if name is None:
+                raise ValueError(f"name-level {mismatch.kind} has no name")
+            by_name[name].append(mismatch)
+    return by_name
+
+
+def _prior_auto_accepted(events: Iterable[ReconcileBreakRow], name: str) -> float:
+    """The sizes already booked by `auto_accepted` on `name` in the window
+    (item 5's cumulative bound). Only booked `auto_true_up` sizes count."""
+    return math.fsum(
+        e.dollar_size or 0.0 for e in events if e.event == "auto_accepted" and e.name == name
+    )
+
+
+def _judge(
+    kinds: Sequence[str],
+    *,
+    size: float | None,
+    prior: float,
+    equity: float,
+    frozen: RiskConfig,
+    previous: ReconcileBreakRow | None,
+    signed: bool,
+) -> bool:
+    """Whether a break is material (items 5 and 6). Material when `is_material`
+    says so, when a kind is outside `_AUTO_KINDS`, when the name is signed (a
+    short, or a broker quantity below zero), when the break was ever material
+    ("material from then on") and when the owner reopened it (item 9)."""
+    return (
+        (previous is not None and (previous.material or previous.event == "reopened"))
+        or signed
+        or any(kind not in _AUTO_KINDS for kind in kinds)
+        or break_rules.is_material(
+            kinds, size, prior_auto_accepted=prior, ledger_equity=equity, risk=frozen
+        )
+    )
+
+
+def _name_quantities(
+    name: str, items: Sequence[Mismatch], ledger: Ledger, positions: Mapping[str, Position]
+) -> tuple[float, float, bool]:
+    """(signed ledger quantity, broker quantity, whether the name is signed) of a
+    break on `name`, as the events record them. A short lives in
+    `short_holdings`, so the ledger figure is signed here."""
+    ledger_quantity = ledger.positions.get(name, 0.0) - ledger.short_holdings.get(name, 0.0)
+    symbol = items[0].symbol
+    broker_quantity = (
+        positions[symbol].quantity if symbol is not None and symbol in positions else 0.0
+    )
+    return (
+        ledger_quantity,
+        broker_quantity,
+        name in ledger.short_holdings or ledger_quantity < 0 or broker_quantity < 0,
+    )
+
+
+def _auto_accepts(
+    result: Reconciliation,
+    *,
+    ledger: Ledger,
+    positions: Mapping[str, Position],
+    prices: Mapping[str, float],
+    activities: Sequence[CashActivity],
+    frozen: RiskConfig,
+    previous: Mapping[str, ReconcileBreakRow],
+    events: Sequence[ReconcileBreakRow],
+) -> dict[str, _AutoAccept]:
+    """The names whose break item 6 accepts in this reconciliation's own chunk:
+    immaterial under `_judge` (the cumulative bound included, a deferred break
+    re-tested here), carrying only a quantity and cash part on a `security_id`.
+    Pure over its inputs; a ledger whose equity cannot be marked accepts none."""
+    try:
+        equity = ledger.equity(prices)
+    except (KeyError, ValueError):
+        return {}
+    by_id = {a.activity_id: a for a in activities}
+    accepted: dict[str, _AutoAccept] = {}
+    for name, items in _by_name(result).items():
+        if items[0].security_id is None:
+            continue
+        prior_row = previous.get(name)
+        kinds = [m.kind for m in items]
+        if prior_row is not None:
+            kinds += [
+                p["kind"]
+                for p in json.loads(prior_row.parts_json)
+                if p["kind"] in break_rules.FINDING_KINDS
+            ]
+        ledger_quantity, broker_quantity, signed = _name_quantities(name, items, ledger, positions)
+        ids = [activity_id for m in items for activity_id in m.activity_ids]
+        if any(activity_id not in by_id for activity_id in ids):
+            continue  # an activity the broker read no longer lists: wait for the owner
+        cash_parts = tuple(
+            (activity_id, by_id[activity_id].net_amount or 0.0) for activity_id in ids
+        )
+        cash = math.fsum(m.cash_amount or 0.0 for m in items)
+        size = break_rules.dollar_size(ledger_quantity, broker_quantity, prices.get(name), cash)
+        # Opposite cash activities must not net away: materiality is judged on
+        # the gross of each activity.
+        gross = math.fsum(abs(amount) for _, amount in cash_parts)
+        judged = None if size is None else size + max(0.0, gross - abs(cash))
+        prior = _prior_auto_accepted(events, name)
+        if judged is None or _judge(
+            kinds,
+            size=judged,
+            prior=prior,
+            equity=equity,
+            frozen=frozen,
+            previous=prior_row,
+            signed=signed,
+        ):
+            continue
+        accepted[name] = _AutoAccept(
+            size=judged,
+            prior=prior,
+            ledger_quantity=ledger_quantity,
+            broker_quantity=broker_quantity,
+            quantity_part=any(k in _AUTO_QUANTITY_KINDS for k in kinds),
+            cash_parts=cash_parts,
+            equity=equity,
+        )
+    return accepted
+
+
+def _auto_true_up_rows(
+    name: str,
+    accept: _AutoAccept,
+    *,
+    window: PaperWindowRow,
+    run_id: int | None,
+    session: date,
+    stamp: datetime,
+    break_id: str,
+    reconciliation_id: int,
+    frozen: RiskConfig,
+    rebooked_after: Mapping[str, int] | None = None,
+) -> list[AdjustmentRow]:
+    """Item 6's `auto_true_up` rows for `name`: one for the quantity part (its
+    `quantity` the delta, broker minus ledger, its `explanation_json` the broker's
+    absolute quantity) and one per cash activity (its `cash` and its id in
+    `broker_activity_id`). Each names the thresholds, the size and the cumulative
+    auto-accepted total. All carry the one chunk stamp and the command's session."""
+    terms: dict[str, object] = {
+        "break_id": break_id,
+        "reconciliation_id": reconciliation_id,
+        "size": accept.size,
+        "prior_auto_accepted": accept.prior,
+        "cumulative_auto_accepted": accept.prior + accept.size,
+        "break_materiality_usd": frozen.break_materiality_usd,
+        "break_materiality_bps": frozen.break_materiality_bps,
+        "ledger_equity": accept.equity,
+    }
+
+    def row(
+        text: str,
+        extra: Mapping[str, object],
+        *,
+        quantity: float | None = None,
+        cash: float | None = None,
+        activity_id: str | None = None,
+    ) -> AdjustmentRow:
+        return AdjustmentRow(
+            window_id=_window_id(window),
+            run_id=run_id,
+            session=session,
+            kind=AUTO_TRUE_UP_KIND,
+            security_id=name,
+            quantity=quantity,
+            cash=cash,
+            explanation_json=json.dumps(
+                {"explanation": text, **terms, **extra}, sort_keys=True, allow_nan=False
+            ),
+            book_id=window.book_id,
+            broker_activity_id=activity_id,
+            known_at=stamp,
+            ingested_at=stamp,
+        )
+
+    rows: list[AdjustmentRow] = []
+    if accept.quantity_part:
+        delta = float(Decimal(repr(accept.broker_quantity)) - Decimal(repr(accept.ledger_quantity)))
+        rows.append(
+            row(
+                "auto-accepted quantity break",
+                {
+                    "broker_quantity": accept.broker_quantity,
+                    "ledger_quantity": accept.ledger_quantity,
+                },
+                quantity=delta,
+            )
+        )
+    available_rebookings = dict(rebooked_after or {})
+    for activity_id, amount in accept.cash_parts:
+        prior_reversal = available_rebookings.pop(activity_id, None)
+        rows.append(
+            row(
+                "auto-accepted name cash break",
+                {
+                    "activity_id": activity_id,
+                    **(
+                        {
+                            "rebooked_activity_id": activity_id,
+                            "rebooked_after_adjustment_id": prior_reversal,
+                        }
+                        if prior_reversal is not None
+                        else {}
+                    ),
+                },
+                cash=amount,
+                activity_id=None if prior_reversal is not None else activity_id,
+            )
+        )
+    return rows
+
+
+def _finding_key(mismatch: Mismatch, positions: Mapping[str, Position]) -> str | None:
+    """A finding part's `finding_key` (#2266 item 4), or None for any other kind."""
+    if mismatch.kind == break_rules.UNKNOWN_SYMBOL and mismatch.symbol is not None:
+        return break_rules.unknown_symbol_key(mismatch.symbol, positions[mismatch.symbol].quantity)
+    if mismatch.kind == MERGER_CONFLICT:
+        # The conflict detail is made by _conflict_detail from the
+        # sorted deal ids. Parse that fixed format, never its wording.
+        match = re.search(r"merger ids (\[[^\]]*\]) for ", mismatch.detail)
+        if match is None:
+            raise ValueError("merger conflict has no deal ids")
+        ids = ast.literal_eval(match.group(1))
+        if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+            raise ValueError("merger conflict has invalid deal ids")
+        return break_rules.merger_conflict_key(ids)
+    if mismatch.kind == UNEXPLAINED_DIVIDEND_GROUP:
+        dates = re.findall(r"ex-date (\d{4}-\d{2}-\d{2})", mismatch.detail)
+        if not dates or mismatch.security_id is None:
+            raise ValueError("dividend finding has no name or ex-date")
+        return break_rules.dividend_group_key(
+            mismatch.security_id, (date.fromisoformat(day) for day in dates)
+        )
+    return None
+
+
+def acknowledged_keys(events: Iterable[ReconcileBreakRow]) -> frozenset[str]:
+    """The `finding_key`s an owner true-up acknowledged (#2266 item 9): the finding
+    parts of every break whose latest event is `trued_up`. The classifier does not
+    reopen a break while `compare` raises one of these keys again."""
+    latest: dict[str, ReconcileBreakRow] = {}
+    for event in sorted(events, key=lambda e: e.event_id or 0):
+        latest[event.break_id] = event
+    return frozenset(
+        part["finding_key"]
+        for event in latest.values()
+        if event.event == "trued_up"
+        for part in json.loads(event.parts_json)
+        if part["kind"] in break_rules.FINDING_KINDS and part.get("finding_key") is not None
+    )
+
+
+def _acknowledged(
+    mismatch: Mismatch,
+    acknowledged: frozenset[str],
+    positions: Mapping[str, Position],
+    open_names: Collection[str],
+) -> bool:
+    """Whether an owner true-up acknowledged this finding (#2266 item 9). Never
+    while a break is open on its name, so that break keeps its current figures and
+    can still be trued up; a key that cannot be read is not acknowledged (the
+    break-event write then fails closed on it, as before)."""
+    if not acknowledged or (mismatch.security_id or mismatch.symbol) in open_names:
+        return False
+    try:
+        return _finding_key(mismatch, positions) in acknowledged
+    except ValueError:
+        return False
+
+
+def _without_acknowledged(
+    result: Reconciliation,
+    acknowledged: frozenset[str],
+    positions: Mapping[str, Position],
+    account_cash: float,
+    open_names: Collection[str] = (),
+) -> Reconciliation:
+    """`result` less every finding mismatch whose key an owner true-up acknowledged
+    (#2266 item 9), its status re-derived in `compare`'s order. A `breaks` result
+    left with no residual is `ok`, its base the broker's cash."""
+    kept = tuple(
+        m for m in result.mismatches if not _acknowledged(m, acknowledged, positions, open_names)
+    )
+    if len(kept) == len(result.mismatches):
+        return result
+    result = replace(result, mismatches=kept)
+    if result.status == BREAKS and not kept:
+        return replace(result, status=OK, broker_cash=account_cash, adjustments=result.explained)
+    return result
+
+
 def _write_break_events(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -1526,17 +1989,17 @@ def _write_break_events(
     evidence: Mapping[str, list[break_rules.StoreEvidence]],
     own_trading: set[str],
     adjustment_ids: Sequence[int],
+    run_id: int | None = None,
+    accepted: Mapping[str, _AutoAccept] | None = None,
 ) -> None:
-    """Append one event per affected name after the reconciliation and adjustments."""
+    """Append one event per affected name after the reconciliation and adjustments.
+    A name in `accepted` (`_auto_accepts`) is written `opened` (when new) and
+    `auto_accepted`, with its `auto_true_up` rows, in this chunk (item 6)."""
+    accepted = accepted or {}
     window_id = _window_id(window)
     prior = {row.name: row for row in open_breaks(conn, window_id) if row.name is not None}
-    by_name: dict[str, list[Mismatch]] = defaultdict(list)
-    for mismatch in result.mismatches:
-        if break_rules.is_name_level(mismatch.kind):
-            name = mismatch.security_id or mismatch.symbol
-            if name is None:
-                raise ValueError(f"name-level {mismatch.kind} has no name")
-            by_name[name].append(mismatch)
+    by_name = _by_name(result)
+    all_events = break_events_for(conn, window_id)
     activity_by_id = {a.activity_id: a for a in activities}
     symbols = {v: k for k, v in explanations.symbols.items()}
     try:
@@ -1576,28 +2039,7 @@ def _write_break_events(
             old = next((p for p in old_parts if p["kind"] == mismatch.kind), None)
             if old is not None:
                 cause = old["cause"]
-            finding = None
-            if mismatch.kind == break_rules.UNKNOWN_SYMBOL and mismatch.symbol is not None:
-                finding = break_rules.unknown_symbol_key(
-                    mismatch.symbol, positions[mismatch.symbol].quantity
-                )
-            elif mismatch.kind == MERGER_CONFLICT:
-                # The conflict detail is made by _conflict_detail from the
-                # sorted deal ids. Parse that fixed format, never its wording.
-                match = re.search(r"merger ids (\[[^\]]*\]) for ", mismatch.detail)
-                if match is None:
-                    raise ValueError("merger conflict has no deal ids")
-                ids = ast.literal_eval(match.group(1))
-                if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
-                    raise ValueError("merger conflict has invalid deal ids")
-                finding = break_rules.merger_conflict_key(ids)
-            elif mismatch.kind == UNEXPLAINED_DIVIDEND_GROUP:
-                dates = re.findall(r"ex-date (\d{4}-\d{2}-\d{2})", mismatch.detail)
-                if not dates or mismatch.security_id is None:
-                    raise ValueError("dividend finding has no name or ex-date")
-                finding = break_rules.dividend_group_key(
-                    mismatch.security_id, (date.fromisoformat(day) for day in dates)
-                )
+            finding = _finding_key(mismatch, positions)
             parts.append(
                 break_rules.BreakPart(
                     kind=mismatch.kind,
@@ -1687,13 +2129,23 @@ def _write_break_events(
         cash = math.fsum(p.cash_amount or 0.0 for p in parts)
         price = explanations.reference_prices.get(name)
         size = break_rules.dollar_size(first.ledger_quantity, first.broker_quantity, price, cash)
-        material = break_rules.is_material(
-            (p.kind for p in parts),
-            size,
-            prior_auto_accepted=0.0,
-            ledger_equity=equity,
-            risk=frozen,
+        gross = math.fsum(
+            abs(activity_by_id[i].net_amount or 0.0) if i in activity_by_id else 0.0
+            for p in parts
+            for i in p.activity_ids
         )
+        judged = None if size is None else size + max(0.0, gross - abs(cash))
+        material = _judge(
+            [p.kind for p in parts],
+            size=judged,
+            prior=_prior_auto_accepted(all_events, name),
+            equity=equity,
+            frozen=frozen,
+            previous=previous,
+            signed=(first.ledger_quantity or 0.0) < 0 or (first.broker_quantity or 0.0) < 0,
+        )
+        if name in accepted and material:
+            raise ValueError(f"auto-accepted break on {name} is material at the write")
         if mismatches:
             security_id = mismatches[0].security_id
             symbol = mismatches[0].symbol
@@ -1702,33 +2154,66 @@ def _write_break_events(
             security_id = previous.security_id
             symbol = previous.symbol
         _, break_id = break_rules.identity(window_id, security_id, symbol, reconciliation_id)
-        append(
-            conn,
-            ReconcileBreakRow(
-                break_id=previous.break_id if previous is not None else break_id,
-                window_id=window_id,
-                book_id=window.book_id,
-                event="observed" if previous is not None else "opened",
-                parts_json=break_rules.parts_json(parts),
-                # The journal keeps the opening cause on every later event;
-                # each part carries its own cause in `parts_json` (item 14).
-                cause=previous.cause
-                if previous is not None and previous.cause is not None
-                else break_rules.break_cause(parts),
-                security_id=security_id,
-                symbol=symbol,
-                ledger_quantity=first.ledger_quantity,
-                broker_quantity=first.broker_quantity,
-                cash_amount=cash if any(p.cash_amount is not None for p in parts) else None,
-                reference_price=price,
-                dollar_size=size,
-                material=material,
-                first_seen_session=previous.first_seen_session if previous is not None else session,
+        if previous is not None:
+            break_id = previous.break_id
+        accept = accepted.get(name)
+        booked: list[int] = []
+        if accept is not None:
+            for adjustment_row in _auto_true_up_rows(
+                name,
+                accept,
+                window=window,
+                run_id=run_id,
+                session=session,
+                stamp=stamp,
+                break_id=break_id,
                 reconciliation_id=reconciliation_id,
-                known_at=stamp,
-                ingested_at=stamp,
-            ),
+                frozen=frozen,
+                rebooked_after=_rebooked_after(adjustments_for(conn, window_id)),
+            ):
+                booked_id = append(conn, adjustment_row)
+                if booked_id is None:
+                    raise RuntimeError("auto_true_up append returned no id")
+                booked.append(booked_id)
+        row = ReconcileBreakRow(
+            break_id=break_id,
+            window_id=window_id,
+            book_id=window.book_id,
+            event="observed" if previous is not None else "opened",
+            parts_json=break_rules.parts_json(parts),
+            # The journal keeps the opening cause on every later event;
+            # each part carries its own cause in `parts_json` (item 14).
+            cause=previous.cause
+            if previous is not None and previous.cause is not None
+            else break_rules.break_cause(parts),
+            security_id=security_id,
+            symbol=symbol,
+            ledger_quantity=first.ledger_quantity,
+            broker_quantity=first.broker_quantity,
+            cash_amount=cash if any(p.cash_amount is not None for p in parts) else None,
+            reference_price=price,
+            dollar_size=size,
+            material=material,
+            first_seen_session=previous.first_seen_session if previous is not None else session,
+            reconciliation_id=reconciliation_id,
+            known_at=stamp,
+            ingested_at=stamp,
         )
+        if accept is None or previous is None:
+            append(conn, row)
+        if accept is not None:
+            # Item 6: `opened` (only when new) and `auto_accepted` in one chunk.
+            append(
+                conn,
+                replace(
+                    row,
+                    event="auto_accepted",
+                    material=False,
+                    # The gross size, so offsetting cash counts toward the bound.
+                    dollar_size=accept.size,
+                    adjustment_ids_json=json.dumps(booked),
+                ),
+            )
 
 
 def reconcile_now(
@@ -1887,11 +2372,32 @@ def reconcile_now(
             ),
         )
 
+    with connect() as conn:
+        # Item 9: an acknowledged finding raised again with the same key is no
+        # break; a changed key (another quantity, merger id or ex-date) is.
+        result = _without_acknowledged(
+            result,
+            acknowledged_keys(e for e in break_events_for(conn, window_id) if e.known_at <= as_of),
+            positions,
+            float(account.cash),
+            {row.name for row in open_breaks(conn, window_id) if row.name is not None},
+        )
     names = {m.security_id for m in result.mismatches if m.security_id is not None} | set(
         ledger.positions
     )
     with connect() as conn:
         evidence = _break_evidence(conn, cut, settings, names)
+        receipts = {
+            a.security_id
+            for a in (*result.adjustments, *result.explained)
+            if a.kind == "spinoff_receipt" and a.security_id in explanations.spinoffs
+        }
+        receipt_terms = {
+            child: spinoff_receipt_terms(
+                conn, cut, actions, child, explanations.spinoffs[child][0], session
+            )
+            for child in sorted(c for c in receipts if c is not None)
+        }
         open_now = open_breaks(conn, window_id)
         retained_finding = any(
             any(part["kind"] in break_rules.FINDING_KINDS for part in json.loads(row.parts_json))
@@ -1899,14 +2405,37 @@ def reconcile_now(
         )
     if retained_finding and result.status == OK:
         # A one-shot finding stays open until the owner true-up; a clean broker
-        # read cannot release the temporary T281 whole-book halt.
+        # read does not close it.
         result = replace(result, status=BREAKS, broker_cash=None, adjustments=())
+    accepted: dict[str, _AutoAccept] = {}
+    if result.status == BREAKS:
+        # Item 6: an immaterial break is accepted in this reconciliation's own
+        # chunk. A reconciliation every one of whose breaks is accepted, with no
+        # finding left open, is `ok`: its base is the broker's raw cash, the
+        # accepted cash being inside it (the `auto_true_up` rows share its stamp).
+        with connect() as conn:
+            accepted = _auto_accepts(
+                result,
+                ledger=ledger,
+                positions=positions,
+                prices=explanations.reference_prices,
+                activities=activities,
+                frozen=frozen,
+                previous={row.name: row for row in open_now if row.name is not None},
+                events=break_events_for(conn, window_id),
+            )
+        if not retained_finding and set(_by_name(result)) <= set(accepted):
+            result = replace(
+                result, status=OK, broker_cash=float(account.cash), adjustments=result.explained
+            )
     if result.status == BREAKS:
         # A name cash break remains outside the ledger until an adjustment
         # books it. Preserve the raw account reading for the audit trail.
         result = replace(result, adjustments=result.explained)
         open_cash = math.fsum(
-            m.cash_amount or 0.0 for m in result.mismatches if m.kind == "name_cash"
+            m.cash_amount or 0.0
+            for m in result.mismatches
+            if m.kind == "name_cash" and (m.security_id or m.symbol) not in accepted
         )
         payload = json.loads(result.mismatches_json)
         raw_cash = float(account.cash)
@@ -1915,6 +2444,7 @@ def reconcile_now(
             activity_id
             for mismatch in result.mismatches
             if mismatch.kind == "name_cash"
+            and (mismatch.security_id or mismatch.symbol) not in accepted
             for activity_id in mismatch.activity_ids
         }
         payload["activities"] = [
@@ -1926,9 +2456,17 @@ def reconcile_now(
         result_payload = json.dumps(payload, sort_keys=True, allow_nan=False)
     else:
         result_payload = result.mismatches_json
-    halt_for_break = retained_finding or any(
-        break_rules.is_name_level(m.kind) for m in result.mismatches
+    # A `breaks` result restricts names and halts nothing (T282d), and neither
+    # does an `ok` one whose every break was auto-accepted. A name-level
+    # difference beside a pending or lagging order keeps T281's halt: nothing has
+    # released it.
+    halt_for_break = result.status not in (OK, BREAKS) and (
+        retained_finding or any(break_rules.is_name_level(m.kind) for m in result.mismatches)
     )
+    try:
+        cap_equity = ledger.equity(explanations.reference_prices)
+    except (KeyError, ValueError):
+        cap_equity = 0.0  # the cap fails closed without a valid ledger mark
     last_completed = max(
         (row.known_at for row in state.rows if row.status in (OK, BREAKS)),
         default=window.started_at,
@@ -1937,94 +2475,164 @@ def reconcile_now(
         fill.security_id for fill in state.fills if fill.fill.known_at > last_completed
     } | {order.security_id for order in orders}
 
-    with journal() as conn:
-        stamp = _read_clock(clock)
-        if stamp < now:
-            raise ClockError(f"clock went back from {now.isoformat()} to {stamp.isoformat()}")
-        reconciliation_id = append(
-            conn,
-            ReconciliationRow(
-                window_id=window_id,
-                run_id=run_id,
-                at=stamp,
-                status=result.status,
-                broker_cash=result.broker_cash,
-                mismatches_json=result_payload,
-                book_id=window.book_id,
-                known_at=stamp,
-                ingested_at=stamp,
-            ),
-        )
-        if reconciliation_id is None:
-            raise RuntimeError("reconciliation append returned no id")
-        activity_sessions = {a.activity_id: a.date for a in activities}
-        adjustment_ids: list[int] = []
-        for adjustment in result.adjustments:
-            # A row keyed by a broker activity (a booked `fee_cash`, a `cash_in_lieu`,
-            # a delisting's late cash) is stated on the activity's own date, not the
-            # reconciliation session, so the ledger applies it from the session it
-            # belongs to (#1583, T183; #411).
-            fee_date = (
-                activity_sessions.get(adjustment.broker_activity_id)
-                if adjustment.broker_activity_id is not None
-                else None
-            )
-            adjustment_id = append(
+    def commit(
+        res: Reconciliation,
+        payload: str,
+        *,
+        judge_cap: bool,
+        accept: Mapping[str, _AutoAccept],
+    ) -> int:
+        """Write the row, adjustments and break events of `res` in one chunk and
+        return the reconciliation id. With `judge_cap`, raise `_BookHalt` inside
+        the chunk (so it rolls back) when the open material breaks pass the cap."""
+        with journal() as conn:
+            stamp = _read_clock(clock)
+            if stamp < now:
+                raise ClockError(f"clock went back from {now.isoformat()} to {stamp.isoformat()}")
+            reconciliation_id = append(
                 conn,
-                AdjustmentRow(
+                ReconciliationRow(
                     window_id=window_id,
                     run_id=run_id,
-                    session=fee_date if fee_date is not None else session,
-                    kind=adjustment.kind,
-                    security_id=adjustment.security_id,
-                    quantity=adjustment.quantity,
-                    cash=adjustment.cash,
-                    explanation_json=_explanation_json(
-                        adjustment.explanation,
-                        reconciliation_id,
-                        adjustment.merger_id,
-                        adjustment.merger_terms,
-                    ),
+                    at=stamp,
+                    status=res.status,
+                    broker_cash=res.broker_cash,
+                    mismatches_json=payload,
                     book_id=window.book_id,
-                    broker_activity_id=adjustment.broker_activity_id,
                     known_at=stamp,
                     ingested_at=stamp,
                 ),
             )
-            if adjustment_id is not None:
-                adjustment_ids.append(adjustment_id)
-        try:
-            _write_break_events(
-                conn,
-                window=window,
-                reconciliation_id=reconciliation_id,
-                result=result,
-                session=session,
-                stamp=stamp,
-                frozen=frozen,
-                ledger=ledger,
-                positions=positions,
-                explanations=explanations,
-                activities=activities,
-                evidence=evidence,
-                own_trading=own_trading,
-                adjustment_ids=adjustment_ids,
-            )
-        except Exception as exc:
-            if result.status in (MISMATCH, BREAKS) or halt_for_break or open_now:
-                # The row rolls back with its events. The command catches this
-                # fault and engages the independent kill-switch write.
-                raise ReconciliationError(
-                    f"reconciliation of window {window_id}: "
-                    f"break events could not be written: {exc}"
-                ) from exc
-            raise
+            if reconciliation_id is None:
+                raise RuntimeError("reconciliation append returned no id")
+            activity_sessions = {a.activity_id: a.date for a in activities}
+            adjustment_ids: list[int] = []
+            rebooked_after = _rebooked_after(adjustments_for(conn, window_id))
+            for adjustment in res.adjustments:
+                # A row keyed by a broker activity (a booked `fee_cash`, a `cash_in_lieu`,
+                # a delisting's late cash) is stated on the activity's own date, not the
+                # reconciliation session, so the ledger applies it from the session it
+                # belongs to (#1583, T183; #411).
+                fee_date = (
+                    activity_sessions.get(adjustment.broker_activity_id)
+                    if adjustment.broker_activity_id is not None
+                    else None
+                )
+                prior_reversal = rebooked_after.get(adjustment.broker_activity_id or "")
+                explanation = json.loads(
+                    _explanation_json(
+                        adjustment.explanation,
+                        reconciliation_id,
+                        adjustment.merger_id,
+                        adjustment.merger_terms,
+                        receipt_terms.get(adjustment.security_id or "")
+                        if adjustment.kind == "spinoff_receipt"
+                        else None,
+                    )
+                )
+                if prior_reversal is not None:
+                    explanation["rebooked_activity_id"] = adjustment.broker_activity_id
+                    explanation["rebooked_after_adjustment_id"] = prior_reversal
+                adjustment_id = append(
+                    conn,
+                    AdjustmentRow(
+                        window_id=window_id,
+                        run_id=run_id,
+                        session=fee_date if fee_date is not None else session,
+                        kind=adjustment.kind,
+                        security_id=adjustment.security_id,
+                        quantity=adjustment.quantity,
+                        cash=adjustment.cash,
+                        explanation_json=json.dumps(explanation, sort_keys=True, allow_nan=False),
+                        book_id=window.book_id,
+                        broker_activity_id=None
+                        if prior_reversal is not None
+                        else adjustment.broker_activity_id,
+                        known_at=stamp,
+                        ingested_at=stamp,
+                    ),
+                )
+                if adjustment_id is not None:
+                    adjustment_ids.append(adjustment_id)
+                if prior_reversal is not None and adjustment.broker_activity_id is not None:
+                    rebooked_after.pop(adjustment.broker_activity_id, None)
+            try:
+                _write_break_events(
+                    conn,
+                    window=window,
+                    reconciliation_id=reconciliation_id,
+                    result=res,
+                    session=session,
+                    stamp=stamp,
+                    frozen=frozen,
+                    ledger=ledger,
+                    positions=positions,
+                    explanations=explanations,
+                    activities=activities,
+                    evidence=evidence,
+                    own_trading=own_trading,
+                    adjustment_ids=adjustment_ids,
+                    run_id=run_id,
+                    accepted=accept,
+                )
+            except Exception as exc:
+                if res.status in (MISMATCH, BREAKS) or halt_for_break or open_now or accept:
+                    # The row rolls back with its events. The command catches this
+                    # fault and engages the independent kill-switch write.
+                    raise ReconciliationError(
+                        f"reconciliation of window {window_id}: "
+                        f"break events could not be written: {exc}"
+                    ) from exc
+                raise
+            if judge_cap:
+                still_open = open_breaks(conn, window_id)
+                if break_rules.cap_exceeded(still_open, ledger_equity=cap_equity, risk=frozen):
+                    counted = sum(e.material for e in still_open)
+                    raise _BookHalt(
+                        "break_cap",
+                        f"window {window_id} has {counted} open material break(s), past "
+                        f"risk.max_open_breaks={frozen.max_open_breaks} or "
+                        f"risk.max_open_break_share={frozen.max_open_break_share} of the "
+                        "ledger equity",
+                    )
+                held = sorted(break_rules.restricted_names(still_open))
+                if held and _signed_book(conn, window):
+                    raise _BookHalt(
+                        RESTRICTED_LONG_SHORT,
+                        f"window {window_id} is a long_short book with restricted name(s) "
+                        f"{', '.join(held)}: the plan cannot yet be built around a signed "
+                        "kept weight, so the book halts until the owner trues the break up",
+                    )
+            return reconciliation_id
 
-    if result.status in (MISMATCH, BREAKS) or halt_for_break:
+    try:
+        reconciliation_id = commit(
+            result, result_payload, judge_cap=result.status != MISMATCH, accept=accepted
+        )
+    except _BookHalt as cap:
+        # Item 3: past the cap the book halts. The first chunk rolled back; redo it
+        # as the book-level `mismatch`, its events written as before.
+        result = replace(
+            result,
+            status=MISMATCH,
+            broker_cash=None,
+            adjustments=(),
+            mismatches=(*result.mismatches, Mismatch(cap.kind, str(cap))),
+        )
+        # A halted row books no adjustment (item 4), so no break is accepted in it.
+        reconciliation_id = commit(result, result.mismatches_json, judge_cap=False, accept={})
+
+    if result.status == MISMATCH or halt_for_break:
         kinds = ", ".join(sorted({m.kind for m in result.mismatches})) or "open finding"
+        # The book-level halts of this module say why, in the message the owner reads.
+        why = "".join(
+            f"; {m.detail}"
+            for m in result.mismatches
+            if m.kind in ("break_cap", RESTRICTED_LONG_SHORT)
+        )
         raise ReconciliationError(
             f"reconciliation {reconciliation_id} of window {window_id} on "
-            f"{session.isoformat()}: {kinds}"
+            f"{session.isoformat()}: {kinds}{why}"
         )
     return result
 
