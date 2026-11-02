@@ -997,6 +997,8 @@ class EdgarFilingSource(FilingSource):
         self._maybe_use_stored_index()
         cached = self._load_stamps(cik)
         if self._index_conn is None:
+            if self._statement_backfill:  # #2872: stamps come from `filing_index` alone
+                raise RuntimeError("statement_backfill needs the stored filing index bound")
             return cached
         first_rows = self._index_for_cik(cik, first=True)
         missing = {row.accession for row in first_rows if row.accession not in cached}
@@ -4283,7 +4285,7 @@ class EdgarFilingSource(FilingSource):
             self._statement_requested[cik] = key
             self._set_statement_parse_counts(cik, 0, 0, 0)
             return cached
-        if self._statement_backfill and self._absent_and_empty(cik, path, latest):
+        if self._statement_backfill and self._absent_and_empty(cik, path, stamps[latest]):
             # #2837: the zip lacks the CIK and its cached result for this
             # latest accession is already empty: written as that 404 was.
             if cik not in self._absent_carried:
@@ -4588,21 +4590,28 @@ class EdgarFilingSource(FilingSource):
         else:
             self._facts_bulk = False
 
-    def _absent_and_empty(self, cik: str, path: Path, latest: str) -> bool:
-        """#2837: whether the cached zip has no member for `cik` and its
-        statement cache file holds no record and no conflict under `latest`
-        (any tag digest): the cached result of the per-CIK API's 404 or
-        empty object. A file under another accession (a newer filing), or
-        an unparsed payload's (keyed by no accession), does not qualify."""
+    def _absent_and_empty(self, cik: str, path: Path, latest: SubmissionRecord) -> bool:
+        """#2837: whether the cached zip, built at or after `latest`'s
+        acceptance, has no member for `cik`, and its statement cache file
+        holds no record and no conflict under `latest` (any tag digest).
+        SEC then had no XBRL facts for the CIK through `latest`, so the empty
+        file is the per-CIK API's 404 or empty object, not a payload that
+        carried none of the old tags. A file under another accession (a
+        newer filing), or an unparsed payload's (keyed by no accession),
+        does not qualify; nor does a zip built before `latest` (its facts
+        may postdate the zip)."""
         self._decide_facts_bulk()
         if not isinstance(self._facts_bulk, tuple) or f"CIK{cik}.json" in self._facts_bulk[1]:
+            return False
+        built = edgar_raw.bulk_built_at(self._facts_bulk[0])
+        if built is None or latest.accepted_at is None or built < latest.accepted_at:
             return False
         try:
             data = json.loads(path.read_bytes())
             return bool(
                 data["version"] == STATEMENT_VERSION
                 and data["cik"] == cik
-                and str(data["key"]).partition("|")[0] == latest
+                and str(data["key"]).partition("|")[0] == latest.accession
                 and data["records"] == []
                 and data["conflicts"] == []
             )

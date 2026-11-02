@@ -16,8 +16,10 @@ unrouted URL; the autouse socket fixture backs it up.
 from __future__ import annotations
 
 import json
+import os
 import zipfile
 from datetime import UTC, date, datetime, timedelta
+from email.utils import format_datetime
 from pathlib import Path
 from typing import Any
 
@@ -337,3 +339,60 @@ def test_records_are_stamped_from_the_table_never_the_filed_date(
     records = _source(settings, EdgarRouter(), backfill=True).statement_facts(CIK)
     assert records and {r.accepted_at for r in records} == {K2022_AT}
     assert {r.filed for r in records} == {date(2023, 2, 24)}  # filed_on is never the clock
+
+
+def _zip_built(settings: Settings, at: datetime, *, sidecar: datetime | None, bound: bool) -> None:
+    """Date the cached zip: its mtime is `at`; a #2594 sidecar, when given,
+    says SEC last modified it at `sidecar`, bound to the file or not."""
+    path = Path(settings.edgar.cache_dir) / "bulk" / "companyfacts.zip"
+    os.utime(path, (at.timestamp(), at.timestamp()))
+    if sidecar is not None:
+        stat = path.stat()
+        body = {
+            "size": stat.st_size + (0 if bound else 1),
+            "mtime_ns": stat.st_mtime_ns,
+            "last_modified": format_datetime(sidecar, usegmt=True),
+        }
+        path.with_name(f"{path.name}.validators.json").write_text(json.dumps(body))
+
+
+@pytest.mark.parametrize(
+    ("mtime", "sidecar", "bound", "carried"),
+    [
+        pytest.param(K2022_AT - timedelta(days=1), None, True, False, id="mtime-before-latest"),
+        pytest.param(CLOCK, K2022_AT - timedelta(hours=1), True, False, id="built-before-latest"),
+        pytest.param(K2022_AT - timedelta(days=1), CLOCK, False, False, id="unbound-sidecar"),
+        pytest.param(CLOCK, K2022_AT + timedelta(days=1), True, True, id="built-after-latest"),
+        pytest.param(K2022_AT + timedelta(days=1), None, True, True, id="mtime-after-latest"),
+    ],
+)
+def test_a_zip_built_before_the_latest_filing_cannot_carry_forward(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mtime: datetime,
+    sidecar: datetime | None,
+    bound: bool,
+    carried: bool,
+) -> None:
+    """The zip vouches for "no XBRL facts" only through its build time: a
+    CIK whose latest filing it predates goes to the API (an empty file may
+    be a payload that matched none of the old tags)."""
+    settings = _absent_setup(tmp_path, monkeypatch)
+    _write_statement_cache(settings, f"{K2022}|0123456789abcdef", [])
+    _zip_built(settings, mtime, sidecar=sidecar, bound=bound)
+    router = EdgarRouter()
+    _api_404(router)
+    source = _source(settings, router, backfill=True)
+    assert source.statement_facts(CIK) == []
+    assert router.urls == ([] if carried else [API])
+    assert source.statement_absent_carried == int(carried)
+
+
+def test_backfill_refuses_stamps_without_the_stored_index(tmp_path: Path) -> None:
+    """Fail closed: with no index bound, the cache file's own stamps are never used."""
+    settings = _settings(tmp_path)
+    source = EdgarFilingSource(
+        settings, client=EdgarRouter().client(), reuse_cached=True, statement_backfill=True
+    )
+    with pytest.raises(RuntimeError, match="filing index"):
+        source._read_stamps(CIK)
