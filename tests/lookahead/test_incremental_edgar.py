@@ -743,34 +743,6 @@ PINNED_COLUMNS: dict[str, tuple[str, ...]] = {
 KNOWN_DIVERGENCES: dict[
     tuple[int, str], tuple[frozenset[tuple[Any, ...]], frozenset[tuple[Any, ...]]]
 ] = {
-    # A filed_on correction seen while the accession is pending is dropped by the
-    # nightly; it arrives weeks later from the settled quarter's reconcile.
-    (2858, "filing_index"): (
-        frozenset(
-            {
-                (
-                    "0000000102",
-                    "0000000102-25-000003",
-                    date(2025, 12, 12),
-                    date(2026, 1, 1),
-                    0,
-                    _utc(date(2026, 1, 9), 4, 30),
-                ),
-            }
-        ),
-        frozenset(
-            {
-                (
-                    "0000000102",
-                    "0000000102-25-000003",
-                    date(2025, 12, 12),
-                    date(2025, 12, 17),
-                    0,
-                    _utc(date(2025, 12, 20), 4, 30),
-                ),
-            }
-        ),
-    ),
     # After a key-off gap, the first key-on night no longer reads the daily files of
     # a quarter that settled during the gap; the reconcile inserts the row instead.
     (2864, "filing_index"): (

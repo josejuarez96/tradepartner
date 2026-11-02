@@ -1537,6 +1537,34 @@ class EdgarFilingSource(FilingSource):
                 index_quarter,
             )
         stamps = self._incremental_stamps(stamp_input)
+        # #2858: a pending row holds only its first listing, so a later listing of
+        # the accession (a filed_on correction) sits in a daily file the cursor has
+        # passed. When the stamp arrives, read the cached daily files after the
+        # first listing again, as a rebuild of the quarter would.
+        stamped_now = {
+            key: pending[key].listed_on
+            for key in pending
+            if stamps.get(key) is not None and key not in stored
+        }
+        if stamped_now:
+            earliest = min(stamped_now.values())
+            for file in sorted(state.daily_files, key=lambda f: f.name):
+                day = date.fromisoformat(file.name.split(".")[1])
+                if day < earliest or file in selected:
+                    continue
+                quarter = (day.year, (day.month - 1) // 3 + 1)
+                seen_late: set[tuple[str, str]] = set()
+                for row in read_daily(file):
+                    key = (row.cik, row.accession)
+                    if (
+                        key in seen_late
+                        or key not in stamped_now
+                        or day <= stamped_now[key]
+                        or (row.cik not in allowed_ciks and row.form not in kept_forms)
+                    ):
+                        continue
+                    seen_late.add(key)
+                    grouped[key].append((row, day, True, quarter))
         rows_out: list[FilingRow] = []
         source_daily: list[bool] = []
         changed_ciks: set[str] = set()
