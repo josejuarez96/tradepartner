@@ -1592,6 +1592,168 @@ class _IndexBatch:
     rotation_recorded: Any = None
     snapshot_values: Mapping[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
     touch_cursor: Mapping[str, Any] = field(default_factory=dict)
+    #: The writer's daily index recorder (plan T347); `None` with the archive off.
+    provenance: _IndexProvenance | None = None
+
+
+_DAILY_LINE = re.compile(rb"\b(\d{8})\s+edgar/data/(\d+)/([\d-]+)\.txt")
+
+
+def _daily_listed(body: bytes) -> frozenset[tuple[str, str, str]]:
+    """The (CIK without zeros, accession, YYYYMMDD filed date) a daily body lists."""
+    return frozenset(
+        (cik.decode(), accession.decode(), filed.decode())
+        for filed, cik, accession in _DAILY_LINE.findall(body)
+    )
+
+
+class _IndexProvenance:
+    """One `edgar_index` writer run's daily index retention and manifest (plan
+    T347; spec amendment #2714 item 1).
+
+    `keep` is the adapter's `daily_index_keeper`: it archives each daily file's
+    cached body by SHA-256 before it is parsed, so a refused archive write fails
+    the run before any derived row. A file whose body changes within the run is
+    refused (rerun). The archive is write-only here: nothing reads it back.
+    `finish`, under the writer's lock, enters every kept file and the
+    `filing_index` rows each wrote, archives the manifest and fixes its digest
+    before the run row cites it. A written row is entered under the daily file
+    its `listed_on` names only if that body lists it (CIK, accession, filed
+    date): a body kept this run, or, for a pending row stamped now, the cached
+    body whose hash the store recorded and the archive holds. Any other row
+    (a quarterly `form.idx` row, ADR 0028's snapshot exception, or a pending
+    row first listed there) is left out and counted `index_unattributed`, so a
+    re-derive refuses it. A dry run keeps and writes nothing and its message
+    names no digest."""
+
+    def __init__(self, settings: Settings, *, dry_run: bool) -> None:
+        self.settings = settings
+        self.dry_run = dry_run
+        self.kept: dict[str, RawInput] = {}
+        #: Each kept body's listed (CIK, accession, filed date), to check attribution.
+        self.listed: dict[str, frozenset[tuple[str, str, str]]] = {}
+        self.before: set[tuple[Any, ...]] = set()
+        self.digest: str | None = None
+        self.unattributed = 0
+
+    @classmethod
+    def start(cls, settings: Settings, *, dry_run: bool) -> _IndexProvenance | None:
+        """A recorder, or `None` with the archive off."""
+        return cls(settings, dry_run=dry_run) if raw_archive.archive_on(settings) else None
+
+    def keep(self, file: Any, path: Path, body: bytes) -> None:
+        """Archive one daily file's body before it is parsed."""
+        from tradepartner.adapters import edgar_raw
+        from tradepartner.adapters.daily_index import DAILY_PARSER_VERSION
+
+        sha256 = hashlib.sha256(body).hexdigest()
+        held = self.kept.get(file.path)
+        if held is not None:
+            if held.sha256 != sha256:
+                raise RuntimeError(f"daily index {file.name} changed while it was read; rerun")
+            return
+        if not self.dry_run:
+            raw_archive.archive_body(self.settings, body)
+        url, fetched_at = edgar_raw.daily_index_fetch(path, sha256)
+        self.kept[file.path] = RawInput(sha256, url, fetched_at, DAILY_PARSER_VERSION)
+        self.listed[file.path] = _daily_listed(body)
+
+    @staticmethod
+    def _rows(conn: duckdb.DuckDBPyConnection, listings: Sequence[Any]) -> list[dict[str, Any]]:
+        """The stored `filing_index` rows of the daily listings' accessions."""
+        import pyarrow as pa
+
+        keys = sorted({(r.cik, r.accession) for r in listings if r.is_daily})
+        if not keys:
+            return []
+        conn.register(
+            "_t347_keys", pa.Table.from_pylist([{"cik": c, "accession": a} for c, a in keys])
+        )
+        try:
+            cursor = conn.execute(
+                "SELECT f.* FROM filing_index f JOIN _t347_keys k "
+                "ON f.cik = k.cik AND f.accession = k.accession"
+            )
+            columns = [item[0] for item in cursor.description]
+            return [dict(zip(columns, values, strict=True)) for values in cursor.fetchall()]
+        finally:
+            conn.unregister("_t347_keys")
+
+    def mark(self, conn: duckdb.DuckDBPyConnection, listings: Sequence[Any]) -> None:
+        """Note the stored keys before the insert, so `finish` sees what it wrote."""
+        rows = self._rows(conn, listings)
+        self.before = {(r["cik"], r["accession"], r["known_at"]) for r in rows}
+
+    def _earlier(self, conn: duckdb.DuckDBPyConnection, path: str) -> RawInput | None:
+        """The body an earlier run read for `path`: its stored hash, if the local
+        cache still holds those bytes and the archive holds that hash (a stat,
+        never a read). Notes what it lists; `None` if any part is missing."""
+        from tradepartner.adapters import daily_index as di
+        from tradepartner.adapters import edgar_raw
+
+        stored = conn.execute("SELECT sha256 FROM edgar_index_files WHERE path = ?", [path])
+        found = stored.fetchone()
+        day = di.file_date(path.rsplit("/", 1)[-1])
+        cached = edgar_raw.daily_index_file_path(
+            day.year, (day.month - 1) // 3 + 1, path.rsplit("/", 1)[-1], settings=self.settings
+        )
+        if found is None or not cached.is_file():
+            return None
+        body = cached.read_bytes()
+        if hashlib.sha256(body).hexdigest() != found[0]:
+            return None
+        if not self.dry_run and not raw_archive.is_archived(self.settings, found[0]):
+            return None
+        self.listed[path] = _daily_listed(body)
+        url, fetched_at = edgar_raw.daily_index_fetch(cached, found[0])
+        return RawInput(found[0], url, fetched_at, di.DAILY_PARSER_VERSION)
+
+    def finish(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        listings: Sequence[Any],
+        files: Sequence[tuple[str, datetime, int, str]],
+        *,
+        run_id: str,
+        mode: str,
+    ) -> str:
+        """Write the run's manifest once and return its digest."""
+        from tradepartner.adapters import daily_index as di
+
+        recorded = {path: digest for path, _modified, _size, digest in files}
+        for path, raw in self.kept.items():
+            if recorded.get(path, raw.sha256) != raw.sha256:
+                raise RuntimeError(f"daily index {path} changed after it was kept; rerun")
+        daily = {(r.cik, r.accession, r.listed_on) for r in listings if r.is_daily}
+        by_path: dict[str, list[dict[str, Any]]] = {path: [] for path in self.kept}
+        earlier: dict[str, RawInput | None] = {}
+        self.unattributed = 0
+        for row in self._rows(conn, listings):
+            if (row["cik"], row["accession"], row["known_at"]) in self.before:
+                continue
+            if (row["cik"], row["accession"], row["listed_on"]) not in daily:
+                continue  # a quarterly form.idx row: the snapshot exception
+            path = di.daily_path(row["listed_on"])
+            if path not in self.kept and path not in earlier:
+                earlier[path] = self._earlier(conn, path)
+            listed = (str(int(row["cik"])), row["accession"], f"{row['filed_on']:%Y%m%d}")
+            if (path in self.kept or earlier[path] is not None) and listed in self.listed[path]:
+                by_path.setdefault(path, []).append(row)
+            else:
+                self.unattributed += 1
+        entries = []
+        for path, rows in sorted(by_path.items()):
+            source_raw = self.kept.get(path) or earlier[path]
+            assert source_raw is not None
+            entries.append(
+                di.index_entry(path=path, raw=source_raw, parsed=path in self.kept, rows=rows)
+            )
+        body = di.build_index_manifest(run_id=run_id, mode=mode, entries=entries)
+        if self.dry_run:
+            self.digest = None
+        else:
+            self.digest = raw_archive.archive_manifest(self.settings, body).sha256
+        return self.digest or ""
 
 
 def _index_quarters(first_year: int, now: datetime) -> tuple[tuple[int, int], ...]:
@@ -1773,8 +1935,31 @@ def _prepare_index(
     now: datetime,
     *,
     quarter_filter: tuple[int, int] | None = None,
+    dry_run: bool = False,
 ) -> _IndexBatch:
-    """Fetch index inputs outside the writer lock and propose rows."""
+    """Fetch index inputs outside the writer lock and propose rows. With the raw
+    archive on, each daily file is kept before it is parsed (plan T347)."""
+    provenance = _IndexProvenance.start(settings, dry_run=dry_run)
+    keeps = provenance is not None and hasattr(source, "daily_index_keeper")
+    previous = getattr(source, "daily_index_keeper", None)
+    if keeps:
+        cast(Any, source).daily_index_keeper = cast(_IndexProvenance, provenance).keep
+    try:
+        batch = _propose_index(settings, source, now, quarter_filter=quarter_filter)
+    finally:
+        if keeps:
+            cast(Any, source).daily_index_keeper = previous
+    return replace(batch, provenance=provenance)
+
+
+def _propose_index(
+    settings: Settings,
+    source: FilingSource,
+    now: datetime,
+    *,
+    quarter_filter: tuple[int, int] | None = None,
+) -> _IndexBatch:
+    """`_prepare_index`'s work: fetch the inputs and propose rows."""
     from tradepartner.adapters import edgar_raw
     from tradepartner.adapters.daily_index import daily_files_to_read, parse_daily_listing
     from tradepartner.adapters.edgar import parse_filing_index
@@ -2005,11 +2190,17 @@ def _write_index_state(
     batch: _IndexBatch,
     now: datetime,
     run_id: str,
+    *,
+    mode: str = MODE,
 ) -> tuple[int, str]:
-    """Commit T319's proposal and every file cursor with the caller's chunk."""
+    """Commit T319's proposal and every file cursor with the caller's chunk. With
+    a recorder (plan T347), its manifest is written last, under `run_id` and
+    `mode`, before the caller writes the run row that cites it."""
     if index_snapshot_id(conn) != batch.snapshot or _writer_version(conn) != batch.writer_version:
         raise _IndexConflict("EDGAR index changed since the fetch snapshot; retry the run")
     proposal = batch.proposal
+    if batch.provenance is not None:
+        batch.provenance.mark(conn, proposal.listings)
     counts = _insert_index_listings(conn, proposal.listings, now)
     desired = {(row.cik, row.accession): row for row in proposal.pending}
     old_keys = set(conn.execute("SELECT cik, accession FROM filing_index_pending").fetchall())
@@ -2051,6 +2242,9 @@ def _write_index_state(
         index_refused=numbers.get("index_refused", 0) + counts.changed,
         index_stale_listing=numbers.get("index_stale_listing", 0) + counts.stale,
     )
+    if batch.provenance is not None:
+        batch.provenance.finish(conn, proposal.listings, batch.files, run_id=run_id, mode=mode)
+        numbers["index_unattributed"] = batch.provenance.unattributed
     message = "; ".join(f"{key}: {value}" for key, value in sorted(numbers.items()))
     return counts.added + counts.revised, message
 
@@ -2104,20 +2298,31 @@ def _insert_index_listings(
         conn.unregister("_t323_index_batch")
 
 
-def _index_run_message(settings: Settings, counts: str, files: int) -> str:
-    """Stable metadata at the front of the EDGAR index run row."""
+def _index_head(settings: Settings, provenance: _IndexProvenance | None) -> str:
+    """The rule fingerprint and, with a written manifest, `; provenance_sha256=<hex>`
+    (plan T347): the part of an index run message no cut may reach."""
     from tradepartner.store.build_fingerprint import build_fingerprint
 
-    fingerprint = build_fingerprint(settings)
+    head = f"rule_fingerprint: {build_fingerprint(settings).hash}"
+    if provenance is not None and provenance.digest is not None:
+        head += f"; {PROVENANCE_KEY}={provenance.digest}"
+    if len(head) > settings.ingest.max_message_chars:
+        raise ValueError("EDGAR index run metadata exceeds ingest.max_message_chars")
+    return head
+
+
+def _index_run_message(
+    settings: Settings, counts: str, files: int, provenance: _IndexProvenance | None = None
+) -> str:
+    """Stable metadata at the front of the EDGAR index run row; the counts after
+    it may be cut at `ingest.max_message_chars`."""
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     rss_bytes = rss if sys.platform == "darwin" else rss * 1024
     message = (
-        f"rule_fingerprint: {fingerprint.hash}; "
+        f"{_index_head(settings, provenance)}; "
         f"files_read: {files}; peak_rss_bytes: {rss_bytes}; {counts}"
     )
-    if len(message) > settings.ingest.max_message_chars:
-        raise ValueError("EDGAR index run metadata exceeds ingest.max_message_chars")
-    return message
+    return _clean(message, settings)
 
 
 def _index_run_cursor(
@@ -2401,7 +2606,7 @@ def _prepare_indexed_filings(
     _index_gate(settings)
     source = _unwrap(recorded)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
-    batch = _prepare_index(settings, source, now)
+    batch = _prepare_index(settings, source, now, dry_run=dry_run)
     with open_read_only(settings, retry=True) as conn:
         old = conn.execute(
             "SELECT chunk_cursor, finished_at FROM ingestion_runs WHERE source = 'edgar_index' "
@@ -2591,7 +2796,7 @@ def _write_indexed_filings(
             batch.snapshot_values,
             touch_cursor,
         ),
-        _index_run_message(settings, index_counts, len(batch.files)),
+        _index_run_message(settings, index_counts, len(batch.files), batch.provenance),
     )
     _write_run(conn, index_run_id, now, clock(), index_run, MODE)
     return index_rows + derived_rows, f"{message}; {index_counts}"
@@ -2688,6 +2893,7 @@ def _rebuild_index_session(
                 filings,
                 ensure_tz_aware_utc(clock(), field_name="clock()"),
                 quarter_filter=quarter,
+                dry_run=dry_run,
             )
 
         def write_quarter(
@@ -2695,14 +2901,12 @@ def _rebuild_index_session(
             run_id: str,
             target: dict[str, _IndexBatch] = batches,
         ) -> tuple[int, str]:
-            from tradepartner.store.build_fingerprint import build_fingerprint
-
             batch = target["current"]
             chunk_now = ensure_tz_aware_utc(clock(), field_name="clock()")
-            added, counts = _write_index_state(conn, batch, chunk_now, run_id)
+            added, counts = _write_index_state(conn, batch, chunk_now, run_id, mode="rebuild_index")
             return (
                 added,
-                f"rule_fingerprint: {build_fingerprint(settings).hash}; "
+                f"{_index_head(settings, batch.provenance)}; "
                 f"files_read: {len(batch.files)}; {counts}",
             )
 

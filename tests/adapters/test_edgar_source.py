@@ -12,6 +12,7 @@ recorded submissions payload.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import io
 import json
 import shutil
@@ -451,6 +452,51 @@ def test_incremental_daily_parser_reads_t317_fixture(
     monkeypatch.setattr(edgar_raw, "daily_index_file", lambda *_a, **_k: path)
     rows = source._incremental_daily_rows(_incremental_file(date(2026, 4, 1)))
     assert rows and rows[0].filed_on == date(2026, 4, 1)
+
+
+def test_daily_keeper_gets_the_cached_body_before_it_is_parsed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Plan T347: the keeper sees the exact bytes the parser then reads, and a
+    keeper that refuses (a failed archive write) stops the parse."""
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    path = tmp_path / "form.20260401.idx"
+    path.write_bytes(gzip.decompress((FIXTURES / "daily_index/form.20260401.idx.gz").read_bytes()))
+    monkeypatch.setattr(edgar_raw, "daily_index_file", lambda *_a, **_k: path)
+    file = _incremental_file(date(2026, 4, 1))
+    kept: list[tuple[DailyIndexFile, Path, bytes]] = []
+    source.daily_index_keeper = lambda *args: kept.append(args)
+    assert source._incremental_daily_rows(file)
+    assert kept == [(file, path, path.read_bytes())]
+
+    def refuse(*_args: Any) -> None:
+        raise RuntimeError("archive write refused")
+
+    source.daily_index_keeper = refuse
+    parsed: list[str] = []
+    monkeypatch.setattr(
+        edgar_source_module, "parse_filing_index", lambda *a: parsed.append("x") or a
+    )
+    with pytest.raises(RuntimeError, match="refused"):
+        source._incremental_daily_rows(file)
+    assert parsed == []
+
+
+def test_daily_index_file_records_the_url_and_fetch_time_of_its_bytes(tmp_path: Path) -> None:
+    """Plan T347: the sidecar names the URL, UTC fetch time and hash of the bytes
+    fetched; another hash (a re-posted body, or an old sidecar) has none."""
+    settings = edgar_settings(tmp_path)
+    file = DailyIndexFile("daily-index/2026/QTR2/form.20260401.idx", "form.20260401.idx", "x", "1")
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, content=b"v1"))
+    )
+    before = datetime.now(UTC)
+    path = edgar_raw.daily_index_file(2026, 2, file, settings=settings, client=client)
+    url, fetched_at = edgar_raw.daily_index_fetch(path, hashlib.sha256(b"v1").hexdigest())
+    assert url == "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR2/form.20260401.idx"
+    assert fetched_at is not None and before <= fetched_at <= datetime.now(UTC)
+    assert fetched_at.utcoffset() == timedelta(0)
+    assert edgar_raw.daily_index_fetch(path, hashlib.sha256(b"v2").hexdigest()) == (None, None)
 
 
 def test_fixture_incremental_call_is_read_only() -> None:
