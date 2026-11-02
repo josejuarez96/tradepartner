@@ -166,6 +166,8 @@ class EdgarConfig(BaseModel):
     # T319b (#2629, #2659): every Saturday (US/Eastern) the nightly re-reads and
     # reconciles this many of the latest settled quarters, beside the HEAD-ETag test.
     reconcile_recent_quarters: int = Field(default=8, ge=1)
+    incremental_index: bool = False
+    verify_rotation_days: int = Field(default=28, ge=1)
     bulk_stamp_threshold_ciks: int = Field(default=500, gt=0)
     # #1382 guard: SEC's `submissions.zip` serves `acceptanceDateTime` moved by
     # New York's UTC offset (early for many CIKs, a look-ahead), so stamps never

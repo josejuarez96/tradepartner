@@ -139,5 +139,4 @@ def test_every_master_and_edgar_key_is_classified() -> None:
         "events.sec_forms_backfill_start",
         "events.form4_xml_price_below",
         "events.form4_zero_price_xml_codes",
-        "edgar.incremental_index",
     }
