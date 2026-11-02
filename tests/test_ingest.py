@@ -10714,9 +10714,10 @@ def test_statement_backfill_dry_run_writes_nothing(
 def test_statement_backfill_reads_stamps_from_the_index_with_no_submissions_zip(
     tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:
-    """The real adapter under `--bulk-from-cache`: stamps from `filing_index`,
-    facts from the cached `companyfacts.zip`, no request at all, no
-    `submissions.zip` read and no shares `facts` cache file written."""
+    """The real adapter under `--bulk-from-cache`, its FSN loaded and every
+    table accession in its stamps cache: stamps from `filing_index`, facts
+    from the cached `companyfacts.zip`, no request, no `submissions.zip`
+    read and no shares `facts` cache file written."""
     import zipfile
 
     from tradepartner.adapters import edgar_source
@@ -10785,3 +10786,35 @@ def test_statement_backfill_reads_stamps_from_the_index_with_no_submissions_zip(
     assert not facts_dir.exists() or not any(facts_dir.rglob("*.json"))
     assert ("net_income", FY18[1], 9, accession) in [r[:4] for r in _statement_rows(read)]
     assert (tmp_path / "cache" / "statement_facts" / f"v{edgar_source.STATEMENT_VERSION}").is_dir()
+
+
+def test_statement_backfill_refuses_a_per_name_edit_beside_the_addition(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """A per-name list is outside the hash, so T365a passes it; the final row
+    would store it and the next nightly would never touch its CIKs."""
+    _, added = _seeded_for_backfill(settings)
+    edited = added.model_copy(
+        update={"edgar": added.edgar.model_copy(update={"filename_listings_refused": [ACME]})}
+    )
+    before = read("SELECT count(*) FROM ingestion_runs")
+    result = _backfill(edited)
+    assert result.runs[0].status == FAILED
+    assert "per-name list changed" in result.runs[0].message
+    assert read("SELECT count(*) FROM ingestion_runs") == before
+
+
+def test_the_nightly_window_starts_at_the_last_index_read_not_the_backfill(
+    settings: Settings,
+) -> None:
+    """The backfill's ok row reads no index, so T320's window start stays at
+    the seed's finish while the per-name values come from the backfill row."""
+    _, added = _seeded_for_backfill(settings)
+    with open_for_write(added) as conn:
+        later = SourceRun("edgar_index", OK, 0, '{"per_name": "backfill"}', "done")
+        ingest_module.write_run(conn, "backfill-ok", NOW, NOW + timedelta(days=1), later,
+                                "statement_backfill")  # fmt: skip
+    with duckdb.connect(added.store.path, read_only=True) as conn:
+        cursor, previous_at = ingest_module._last_ok_index_row(conn)
+    assert cursor == '{"per_name": "backfill"}'
+    assert previous_at == NOW

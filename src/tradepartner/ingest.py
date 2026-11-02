@@ -2404,10 +2404,7 @@ def _prepare_indexed_filings(
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     batch = _prepare_index(settings, source, now)
     with open_read_only(settings, retry=True) as conn:
-        old = conn.execute(
-            "SELECT chunk_cursor, finished_at FROM ingestion_runs WHERE source = 'edgar_index' "
-            "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
-        ).fetchone()
+        old = _last_ok_index_row(conn)
     previous: Mapping[str, Any] = {}
     previous_touch: Mapping[str, Any] = {}
     previous_at: datetime | None = None
@@ -2484,6 +2481,20 @@ def _prepare_indexed_filings(
             _fetch_and_gate(rotated, settings)
             rotated.frozen = True
     return replace(batch, rotation_recorded=rotated)
+
+
+def _last_ok_index_row(conn: duckdb.DuckDBPyConnection) -> tuple[Any, Any] | None:
+    """The last `ok` `edgar_index` row's cursor, and the window start T320
+    diffs from: the finish of the last `ok` row that read the index. A
+    statement backfill's `ok` row (#2826) reads none, so it never moves the
+    start past quarters and acceptances no nightly has seen."""
+    return conn.execute(
+        "SELECT chunk_cursor, (SELECT finished_at FROM ingestion_runs "
+        "WHERE source = 'edgar_index' AND status = 'ok' AND mode <> ? "
+        "ORDER BY rowid DESC LIMIT 1) FROM ingestion_runs "
+        "WHERE source = 'edgar_index' AND status = 'ok' ORDER BY rowid DESC LIMIT 1",
+        [STATEMENT_BACKFILL],
+    ).fetchone()
 
 
 def _rotation_report(
@@ -2815,7 +2826,11 @@ def _statement_backfill_start(
 ) -> _BackfillStart:
     """T365a's additive check against the last `ok` `edgar_index` row, then the
     resume point from this digest's `partial` rows written after it."""
-    from tradepartner.store.build_fingerprint import additive_statement_change
+    from tradepartner.store.build_fingerprint import (
+        PER_NAME_KEYS,
+        additive_statement_change,
+        build_fingerprint,
+    )
 
     seed = "EDGAR index has no completed seed; run --rebuild-index"
     if index_snapshot_id(conn) is None:
@@ -2839,6 +2854,15 @@ def _statement_backfill_start(
     )
     if not change.ok:
         return _BackfillStart(change.refusal)
+    stored = cursor.get("per_name") or {}
+    current = build_fingerprint(settings).per_name
+    if any(stored.get(key) != current[key] for key in PER_NAME_KEYS):
+        # Outside the hash, so T365a lets it through; the final row would absorb
+        # it and the next nightly would never touch its CIKs.
+        return _BackfillStart(
+            "a per-name list changed since the last ok index row; "
+            "apply it in its own nightly, not with the backfill"
+        )
     digest = statement_tags_digest(settings)
     through: str | None = None
     for (chunk_cursor,) in conn.execute(
@@ -2850,7 +2874,7 @@ def _statement_backfill_start(
         if parsed is None or parsed.group(2) != digest:
             return _BackfillStart(
                 "statement_backfill rows exist under another tag digest; "
-                "run --rebuild-statement-facts"
+                "run --rebuild-statement-facts, then --rebuild-index"
             )
         through = max(through or "", parsed.group(1))
     return _BackfillStart(None, change.added, through, cursor)
@@ -2900,7 +2924,9 @@ def statement_backfill_session(
     each chunk. Stamps come from `filing_index` alone: no `submissions.zip`
     read, no items refresh, no `facts` read. The final `ok` row carries what
     a nightly `edgar_index` row carries, so the gate opens on it only. A dry
-    run rolls every chunk back and writes no row."""
+    run rolls every chunk back and writes no row (the statement cache files
+    the read fills stay). The CIKs are every stored non-benchmark security's,
+    delisted ones included, a superset of the current master's issuers."""
     if not settings.edgar.statement_facts_enabled:
         raise ValueError(_REBUILD_NEEDS_SWITCH)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
