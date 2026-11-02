@@ -296,6 +296,68 @@ def true_up_quantity(row: AdjustmentRow) -> float | None:
     return _finite(float(value), f"adjustment {row.adjustment_id} broker_quantity")
 
 
+def reversed_adjustment_id(row: AdjustmentRow) -> int | None:
+    """The original row named by an owner reversal, if this is one."""
+    if row.kind != OWNER_TRUE_UP_KIND:
+        return None
+    try:
+        payload = json.loads(row.explanation_json or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or "reversed_adjustment_id" not in payload:
+        return None
+    target = payload["reversed_adjustment_id"]
+    if isinstance(target, bool) or not isinstance(target, int):
+        raise ValueError(f"adjustment {row.adjustment_id} has invalid reversed_adjustment_id")
+    return target
+
+
+def reversed_true_up_ids(adjustments: Sequence[AdjustmentRow], through: date) -> set[int]:
+    """Validated owner bookings undone by reversals effective by `through`."""
+    eligible = [row for row in adjustments if row.session <= through]
+    by_id = {row.adjustment_id: row for row in eligible}
+    reversed_ids: set[int] = set()
+    for row in eligible:
+        target = reversed_adjustment_id(row)
+        if target is None:
+            continue
+        original = by_id.get(target)
+        try:
+            original_terms = json.loads(original.explanation_json or "{}") if original else {}
+            reverse_terms = json.loads(row.explanation_json or "{}")
+        except (TypeError, ValueError):
+            original_terms, reverse_terms = {}, {}
+        original_activity = (
+            original.broker_activity_id or original_terms.get("rebooked_activity_id")
+            if original is not None and isinstance(original_terms, dict)
+            else None
+        )
+        reversed_activity = (
+            reverse_terms.get("reversed_activity_id") if isinstance(reverse_terms, dict) else None
+        )
+        if (
+            original is None
+            or original.kind != OWNER_TRUE_UP_KIND
+            or reversed_adjustment_id(original) is not None
+            or original.security_id != row.security_id
+            or (original.session, original.known_at) >= (row.session, row.known_at)
+            or target in reversed_ids
+            or (original.quantity is None) != (row.quantity is None)
+            or (original.cash is None) != (row.cash is None)
+            or reversed_activity != original_activity
+            or (
+                original.quantity is not None
+                and _exact(original.quantity) != -_exact(row.quantity or 0)
+            )
+            or (original.cash is not None and _exact(original.cash) != -_exact(row.cash or 0))
+        ):
+            raise ValueError(
+                f"adjustment {row.adjustment_id} is not an opposite reversal of {target}"
+            )
+        reversed_ids.add(target)
+    return reversed_ids
+
+
 def _cash_base(
     reconciliation: ReconciliationRow | None, window_id: int, starting_cash: float, through: date
 ) -> tuple[float, datetime | None]:
@@ -386,6 +448,7 @@ def from_journal(
     # therefore replays the fill first (rank 0), then the true-up (rank 1), so
     # a fill the figure already holds is never counted twice (#2479).
     ordered: list[tuple[datetime, int, int, date, str, str, Fraction]] = []
+    reversed_ids = reversed_true_up_ids(adjustments, through)
     seen_fills: set[int] = set()
     fills_since_base = 0
     for fill in fills:
@@ -400,6 +463,8 @@ def from_journal(
         late = any(
             a.kind in TRUE_UP_KINDS
             and a.quantity is not None
+            and a.adjustment_id not in reversed_ids
+            and reversed_adjustment_id(a) is None
             and a.security_id == fill.security_id
             and a.session == stated_on
             and a.known_at < row.known_at
@@ -446,7 +511,13 @@ def from_journal(
             # a later ex-date still acts on it, so a split row that lands late
             # with an earlier ex-date (already in the broker's quantity) is
             # never applied on top.
-            absolute = true_up_quantity(adjustment)
+            if (
+                adjustment.adjustment_id in reversed_ids
+                or reversed_adjustment_id(adjustment) is not None
+            ):
+                absolute = None
+            else:
+                absolute = true_up_quantity(adjustment)
             if absolute is not None:
                 ordered.append(
                     (

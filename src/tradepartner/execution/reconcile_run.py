@@ -190,7 +190,12 @@ from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, LimitBreachError, ReconciliationError
 from tradepartner.execution import breaks as break_rules
 from tradepartner.execution import switch
-from tradepartner.execution.ledger import Ledger, from_journal
+from tradepartner.execution.ledger import (
+    Ledger,
+    from_journal,
+    reversed_adjustment_id,
+    reversed_true_up_ids,
+)
 from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.plan import current_listings
 from tradepartner.execution.reconcile import (
@@ -1158,25 +1163,64 @@ def _seen_activities(
     ids every activity a reconciliation reads is treated as already inside the
     base, and the fallback date cutoff (None when a recorded set exists).
 
-    The window's already-booked activity ids (`adjustments.broker_activity_id`)
-    are always seen, so a fee is booked once by id. The base's recorded set (the
+    An activity's latest booking decides whether it is seen: a reversal removes
+    it, and a later explanation-linked booking restores it. The base's recorded set (the
     last `ok` or `breaks` reconciliation's `activities`) takes precedence; before the first
     `ok`, the window row's `activities_seen_json` (what `paper start` read); when
     both are null, the fallback cutoff is the window's New York start date, so a
     fee dated before the window opened is seen and a fee dated on it is bookable."""
-    booked = frozenset(
-        a.broker_activity_id for a in adjustments if a.broker_activity_id is not None
-    )
+    reversed_true_up_ids(adjustments, date.max)
+    latest: dict[str, bool] = {}
+    for adjustment in sorted(adjustments, key=lambda a: (a.known_at, a.adjustment_id or 0)):
+        try:
+            terms = json.loads(adjustment.explanation_json or "{}")
+        except (TypeError, ValueError):
+            terms = {}
+        terms = terms if isinstance(terms, dict) else {}
+        reversed_activity = terms.get("reversed_activity_id")
+        if reversed_adjustment_id(adjustment) is not None and isinstance(reversed_activity, str):
+            latest[reversed_activity] = False
+        rebooked = terms.get("rebooked_activity_id")
+        if isinstance(rebooked, str):
+            latest[rebooked] = True
+        if adjustment.broker_activity_id is not None:
+            latest[adjustment.broker_activity_id] = True
+    booked = frozenset(key for key, active in latest.items() if active)
+    reversed_ids = frozenset(key for key, active in latest.items() if not active)
     recorded = _recorded_activity_ids(base)
     if recorded is not None:
-        return booked | recorded, None
+        return booked | (recorded - reversed_ids), None
     if window.activities_seen_json is not None:
         try:
             ids = json.loads(window.activities_seen_json)
         except (ValueError, TypeError):
             ids = []
-        return booked | frozenset(str(i) for i in ids if isinstance(i, str)), None
+        return booked | (frozenset(str(i) for i in ids if isinstance(i, str)) - reversed_ids), None
     return booked, window.started_at.astimezone(_NEW_YORK).date()
+
+
+def _rebooked_after(adjustments: Sequence[AdjustmentRow]) -> dict[str, int]:
+    """Latest reversal row per activity whose unique column was used before."""
+    reversed_true_up_ids(adjustments, date.max)
+    latest: dict[str, int] = {}
+    for row in sorted(adjustments, key=lambda a: (a.known_at, a.adjustment_id or 0)):
+        try:
+            payload = json.loads(row.explanation_json or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        reversed_id = payload.get("reversed_activity_id")
+        if (
+            reversed_adjustment_id(row) is not None
+            and isinstance(reversed_id, str)
+            and row.adjustment_id is not None
+        ):
+            latest[reversed_id] = row.adjustment_id
+        booked = row.broker_activity_id or payload.get("rebooked_activity_id")
+        if isinstance(booked, str):
+            latest.pop(booked, None)
+    return latest
 
 
 def _merger_id_of(adjustment: AdjustmentRow) -> str | None:
@@ -1770,6 +1814,7 @@ def _auto_true_up_rows(
     break_id: str,
     reconciliation_id: int,
     frozen: RiskConfig,
+    rebooked_after: Mapping[str, int] | None = None,
 ) -> list[AdjustmentRow]:
     """Item 6's `auto_true_up` rows for `name`: one for the quantity part (its
     `quantity` the delta, broker minus ledger, its `explanation_json` the broker's
@@ -1825,13 +1870,25 @@ def _auto_true_up_rows(
                 quantity=delta,
             )
         )
+    available_rebookings = dict(rebooked_after or {})
     for activity_id, amount in accept.cash_parts:
+        prior_reversal = available_rebookings.pop(activity_id, None)
         rows.append(
             row(
                 "auto-accepted name cash break",
-                {"activity_id": activity_id},
+                {
+                    "activity_id": activity_id,
+                    **(
+                        {
+                            "rebooked_activity_id": activity_id,
+                            "rebooked_after_adjustment_id": prior_reversal,
+                        }
+                        if prior_reversal is not None
+                        else {}
+                    ),
+                },
                 cash=amount,
-                activity_id=activity_id,
+                activity_id=None if prior_reversal is not None else activity_id,
             )
         )
     return rows
@@ -2112,6 +2169,7 @@ def _write_break_events(
                 break_id=break_id,
                 reconciliation_id=reconciliation_id,
                 frozen=frozen,
+                rebooked_after=_rebooked_after(adjustments_for(conn, window_id)),
             ):
                 booked_id = append(conn, adjustment_row)
                 if booked_id is None:
@@ -2449,6 +2507,7 @@ def reconcile_now(
                 raise RuntimeError("reconciliation append returned no id")
             activity_sessions = {a.activity_id: a.date for a in activities}
             adjustment_ids: list[int] = []
+            rebooked_after = _rebooked_after(adjustments_for(conn, window_id))
             for adjustment in res.adjustments:
                 # A row keyed by a broker activity (a booked `fee_cash`, a `cash_in_lieu`,
                 # a delisting's late cash) is stated on the activity's own date, not the
@@ -2459,6 +2518,21 @@ def reconcile_now(
                     if adjustment.broker_activity_id is not None
                     else None
                 )
+                prior_reversal = rebooked_after.get(adjustment.broker_activity_id or "")
+                explanation = json.loads(
+                    _explanation_json(
+                        adjustment.explanation,
+                        reconciliation_id,
+                        adjustment.merger_id,
+                        adjustment.merger_terms,
+                        receipt_terms.get(adjustment.security_id or "")
+                        if adjustment.kind == "spinoff_receipt"
+                        else None,
+                    )
+                )
+                if prior_reversal is not None:
+                    explanation["rebooked_activity_id"] = adjustment.broker_activity_id
+                    explanation["rebooked_after_adjustment_id"] = prior_reversal
                 adjustment_id = append(
                     conn,
                     AdjustmentRow(
@@ -2469,23 +2543,19 @@ def reconcile_now(
                         security_id=adjustment.security_id,
                         quantity=adjustment.quantity,
                         cash=adjustment.cash,
-                        explanation_json=_explanation_json(
-                            adjustment.explanation,
-                            reconciliation_id,
-                            adjustment.merger_id,
-                            adjustment.merger_terms,
-                            receipt_terms.get(adjustment.security_id or "")
-                            if adjustment.kind == "spinoff_receipt"
-                            else None,
-                        ),
+                        explanation_json=json.dumps(explanation, sort_keys=True, allow_nan=False),
                         book_id=window.book_id,
-                        broker_activity_id=adjustment.broker_activity_id,
+                        broker_activity_id=None
+                        if prior_reversal is not None
+                        else adjustment.broker_activity_id,
                         known_at=stamp,
                         ingested_at=stamp,
                     ),
                 )
                 if adjustment_id is not None:
                     adjustment_ids.append(adjustment_id)
+                if prior_reversal is not None and adjustment.broker_activity_id is not None:
+                    rebooked_after.pop(adjustment.broker_activity_id, None)
             try:
                 _write_break_events(
                     conn,

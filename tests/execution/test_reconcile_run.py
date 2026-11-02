@@ -14,6 +14,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Protocol
 
+import duckdb
 import polars as pl
 import pytest
 
@@ -55,6 +56,8 @@ from tradepartner.execution.reconcile_run import (
     reconcile_now,
 )
 from tradepartner.execution.risk import round_down
+from tradepartner.execution.true_up import _Reading, _rebooked_after
+from tradepartner.execution.true_up import _rows as _true_up_rows
 from tradepartner.store.asof import live_actions_as_of, prices_as_of
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
 from tradepartner.store.dividend_reviews import ReviewedGroup
@@ -66,10 +69,12 @@ from tradepartner.store.journal import (
     OrderRow,
     PaperRunRow,
     PaperWindowRow,
+    ReconcileBreakRow,
     ReconciliationRow,
     adjustments_for,
     append,
     break_events_for,
+    break_id_for,
     fills_for,
     kill_switch_events_for,
     orders_for,
@@ -85,6 +90,146 @@ class FixedClock(Protocol):
     def __call__(self) -> datetime: ...
 
     def advance(self, **delta: float) -> datetime: ...
+
+
+def test_reversed_activity_is_unseen_until_rebooked_and_column_stays_unique(
+    frozen_window: PaperWindowRow,
+) -> None:
+    stamp = datetime(2026, 10, 1, 20, tzinfo=UTC)
+    booked = AdjustmentRow(
+        adjustment_id=81,
+        window_id=frozen_window.window_id or 0,
+        session=S,
+        kind="owner_true_up",
+        cash=7,
+        security_id=SPY,
+        broker_activity_id="cash-1",
+        known_at=stamp,
+        ingested_at=stamp,
+    )
+    reversed_row = AdjustmentRow(
+        adjustment_id=82,
+        window_id=frozen_window.window_id or 0,
+        session=S,
+        kind="owner_true_up",
+        cash=-7,
+        security_id=SPY,
+        explanation_json=json.dumps(
+            {"reversed_adjustment_id": 81, "reversed_activity_id": "cash-1"}
+        ),
+        known_at=stamp + timedelta(seconds=1),
+        ingested_at=stamp + timedelta(seconds=1),
+    )
+    base = ReconciliationRow(
+        reconciliation_id=1,
+        window_id=frozen_window.window_id or 0,
+        at=stamp,
+        status="ok",
+        broker_cash=100_000,
+        mismatches_json=json.dumps({"activities": [{"activity_id": "cash-1"}]}),
+        known_at=stamp,
+        ingested_at=stamp,
+    )
+    assert (
+        "cash-1"
+        not in reconcile_run._seen_activities([booked, reversed_row], base, frozen_window)[0]
+    )
+    wrong_link = replace(
+        reversed_row,
+        explanation_json=json.dumps(
+            {"reversed_adjustment_id": 81, "reversed_activity_id": "other"}
+        ),
+    )
+    with pytest.raises(ValueError, match="opposite reversal"):
+        reconcile_run._seen_activities([booked, wrong_link], base, frozen_window)
+    fake_reverse = replace(
+        booked,
+        adjustment_id=83,
+        broker_activity_id=None,
+        explanation_json=json.dumps({"reversed_activity_id": "cash-1"}),
+        known_at=stamp + timedelta(seconds=2),
+        ingested_at=stamp + timedelta(seconds=2),
+    )
+    assert (
+        "cash-1" in reconcile_run._seen_activities([booked, fake_reverse], base, frozen_window)[0]
+    )
+    event = ReconcileBreakRow(
+        break_id="1:SEC_SPY:1",
+        window_id=frozen_window.window_id or 0,
+        book_id=frozen_window.book_id,
+        event="reopened",
+        parts_json=json.dumps([{"kind": "name_cash", "activity_ids": ["cash-1"]}]),
+        security_id=SPY,
+        symbol="SPY",
+        material=False,
+        first_seen_session=S,
+        known_at=stamp,
+        ingested_at=stamp,
+    )
+    rows = _true_up_rows(
+        frozen_window,
+        event,
+        _Reading(0, 0, (("cash-1", 7),)),
+        account_id="PA1",
+        reason="correct",
+        session=S,
+        stamp=stamp + timedelta(seconds=2),
+        rebooked_after=_rebooked_after([booked, reversed_row]),
+    )
+    assert len(rows) == 1
+    assert rows[0].broker_activity_id is None
+    assert json.loads(rows[0].explanation_json or "")["rebooked_activity_id"] == "cash-1"
+    assert json.loads(rows[0].explanation_json or "")["rebooked_after_adjustment_id"] == 82
+    assert (
+        "cash-1"
+        in reconcile_run._seen_activities([booked, reversed_row, rows[0]], base, frozen_window)[0]
+    )
+    auto = reconcile_run._AutoAccept(
+        size=7,
+        prior=0,
+        ledger_quantity=0,
+        broker_quantity=0,
+        quantity_part=False,
+        cash_parts=(("cash-1", 7),),
+        equity=100_000,
+    )
+    (auto_row,) = reconcile_run._auto_true_up_rows(
+        SPY,
+        auto,
+        window=frozen_window,
+        run_id=None,
+        session=S,
+        stamp=stamp + timedelta(seconds=2),
+        break_id=event.break_id,
+        reconciliation_id=2,
+        frozen=ROOMY,
+        rebooked_after=reconcile_run._rebooked_after([booked, reversed_row]),
+    )
+    assert auto_row.broker_activity_id is None
+    assert json.loads(auto_row.explanation_json or "")["rebooked_activity_id"] == "cash-1"
+    twice = replace(auto, cash_parts=(("cash-1", 7), ("cash-1", 7)))
+    duplicate_rows = reconcile_run._auto_true_up_rows(
+        SPY,
+        twice,
+        window=frozen_window,
+        run_id=None,
+        session=S,
+        stamp=stamp + timedelta(seconds=2),
+        break_id=event.break_id,
+        reconciliation_id=2,
+        frozen=ROOMY,
+        rebooked_after=reconcile_run._rebooked_after([booked, reversed_row]),
+    )
+    assert [row.broker_activity_id for row in duplicate_rows] == [None, "cash-1"]
+    assert reconcile_run._judge(
+        ["quantity"],
+        size=0,
+        prior=0,
+        equity=100_000,
+        frozen=ROOMY,
+        previous=event,
+        signed=False,
+    )
 
 
 #: A roomy cap, so a single quantity break on the fixture's $250 reference price is
@@ -5338,6 +5483,182 @@ def _credit(fake: BookedFake, activity_id: str, amount: float, day: date = S) ->
         CashActivity(activity_id, "MA", day, "executed", amount, "SPY"),
     ]
     fake.extra_cash += amount
+
+
+def _reversed_cash_booking(settings: Settings, window: PaperWindowRow) -> tuple[int, int]:
+    """Journal one owner cash booking and its opposite before reconciliation."""
+    booked_at = datetime(2026, 10, 1, 13, tzinfo=UTC)
+    (original_id,) = _append(
+        settings,
+        AdjustmentRow(
+            window_id=window.window_id or 0,
+            session=S,
+            kind="owner_true_up",
+            security_id=SPY,
+            cash=10,
+            broker_activity_id="rebook-credit",
+            known_at=booked_at,
+            ingested_at=booked_at,
+        ),
+    )
+    assert original_id is not None
+    reversed_at = booked_at + timedelta(minutes=1)
+    (reverse_id,) = _append(
+        settings,
+        AdjustmentRow(
+            window_id=window.window_id or 0,
+            session=S,
+            kind="owner_true_up",
+            security_id=SPY,
+            cash=-10,
+            explanation_json=json.dumps(
+                {"reversed_adjustment_id": original_id, "reversed_activity_id": "rebook-credit"}
+            ),
+            known_at=reversed_at,
+            ingested_at=reversed_at,
+        ),
+    )
+    assert reverse_id is not None
+    return original_id, reverse_id
+
+
+def test_reconcile_now_rebooks_reversed_activity_in_store(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _, reverse_id = _reversed_cash_booking(journal_settings, frozen_window)
+    _credit(fake, "rebook-credit", 10.0)
+
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+    rows = _adjustments(journal_settings, frozen_window)
+    assert len(rows) == 3
+    assert [row.broker_activity_id for row in rows] == ["rebook-credit", None, None]
+    terms = json.loads(rows[-1].explanation_json or "")
+    assert (terms["rebooked_activity_id"], terms["rebooked_after_adjustment_id"]) == (
+        "rebook-credit",
+        reverse_id,
+    )
+    assert _rows(journal_settings, frozen_window)[-1].broker_cash == pytest.approx(99_010)
+
+
+def test_activity_cannot_rebook_twice_without_another_reversal(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _reversed_cash_booking(journal_settings, frozen_window)
+    _credit(fake, "rebook-credit", 10.0)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+    fixed_clock.advance(minutes=5)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+    assert len(_adjustments(journal_settings, frozen_window)) == 3
+    assert len(_events(journal_settings, frozen_window)) == 2
+    assert reconcile_run._rebooked_after(_adjustments(journal_settings, frozen_window)) == {}
+    later = fixed_clock()
+    with pytest.raises(duckdb.ConstraintException):
+        _append(
+            journal_settings,
+            AdjustmentRow(
+                window_id=frozen_window.window_id or 0,
+                session=S,
+                kind="owner_true_up",
+                security_id=SPY,
+                cash=10,
+                broker_activity_id="rebook-credit",
+                known_at=later,
+                ingested_at=later,
+            ),
+        )
+    assert len(_adjustments(journal_settings, frozen_window)) == 3
+
+
+def test_reconcile_now_never_auto_accepts_an_owner_reopened_break(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    window_id = frozen_window.window_id or 0
+    opened_at = datetime(2026, 10, 1, 12, tzinfo=UTC)
+    (reconciliation_id,) = _append(
+        journal_settings,
+        ReconciliationRow(
+            window_id=window_id,
+            at=opened_at,
+            status="breaks",
+            broker_cash=99_000,
+            mismatches_json=json.dumps({"activities": []}),
+            known_at=opened_at,
+            ingested_at=opened_at,
+        ),
+    )
+    assert reconciliation_id is not None
+    break_id = break_id_for(window_id, SPY, reconciliation_id)
+    parts = break_rules.parts_json(
+        [
+            break_rules.BreakPart(
+                kind="name_cash",
+                cause="unattributed",
+                cash_amount=10,
+                activity_ids=("rebook-credit",),
+            )
+        ]
+    )
+    opened = ReconcileBreakRow(
+        break_id=break_id,
+        window_id=window_id,
+        book_id=frozen_window.book_id,
+        event="opened",
+        parts_json=parts,
+        security_id=SPY,
+        symbol="SPY",
+        material=False,
+        dollar_size=10,
+        cause="unattributed",
+        first_seen_session=S,
+        reconciliation_id=reconciliation_id,
+        known_at=opened_at,
+        ingested_at=opened_at,
+    )
+    _append(journal_settings, opened)
+    original_id, reverse_id = _reversed_cash_booking(journal_settings, frozen_window)
+    trued_at = datetime(2026, 10, 1, 13, tzinfo=UTC)
+    _append(
+        journal_settings,
+        replace(
+            opened,
+            event_id=None,
+            event="trued_up",
+            reconciliation_id=None,
+            reason="owner accepted",
+            adjustment_ids_json=json.dumps([original_id]),
+            known_at=trued_at,
+            ingested_at=trued_at,
+        ),
+        replace(
+            opened,
+            event_id=None,
+            event="reopened",
+            reconciliation_id=None,
+            reason="owner reversed",
+            adjustment_ids_json=json.dumps([reverse_id]),
+            known_at=trued_at + timedelta(minutes=1),
+            ingested_at=trued_at + timedelta(minutes=1),
+        ),
+    )
+    _credit(fake, "rebook-credit", 10.0)
+
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+    assert len(_adjustments(journal_settings, frozen_window)) == 2
+    events = _events(journal_settings, frozen_window)
+    assert [event.event for event in events] == ["opened", "trued_up", "reopened", "observed"]
+    assert events[-1].material is True
 
 
 def test_every_break_auto_accepted_is_ok_and_engages_nothing(
