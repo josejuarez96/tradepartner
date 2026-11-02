@@ -514,6 +514,7 @@ from tradepartner.ingest import (
     rates_seeded,
     read_manifest,
     show_ingest_progress,
+    statement_backfill_refusal,
 )
 from tradepartner.repair import (
     HeaderLookup,
@@ -2601,6 +2602,14 @@ def make_app(
             bool,
             typer.Option("--rebuild-index", help="seed or repair the EDGAR filing index"),
         ] = False,
+        statement_backfill: Annotated[
+            bool,
+            typer.Option(
+                "--statement-backfill",
+                help="fill statement_facts for added statement names only (#2826); "
+                "--source edgar --bulk-from-cache",
+            ),
+        ] = False,
         restamp_from: Annotated[
             Path | None,
             typer.Option(
@@ -2674,7 +2683,7 @@ def make_app(
                     backfill_, since is not None, actions_backfill, through is not None, dry_run,
                     fill_holes_, security is not None, bulk_from_cache, rebuild_statement_facts,
                     rebuild_filing_events, rebuild_classifications, rebuild_index,
-                    restamp_from is not None,
+                    statement_backfill, restamp_from is not None,
                     restamp_window_earlier_ok is not None, import_dir is not None,
                     sec_forms_only,
                 ),
@@ -2686,7 +2695,7 @@ def make_app(
                     backfill_, since is not None, actions_backfill, through is not None, dry_run,
                     fill_holes_, security is not None, bulk_from_cache, rebuild_statement_facts,
                     rebuild_filing_events, rebuild_classifications, rebuild_index,
-                    restamp_from is not None,
+                    statement_backfill, restamp_from is not None,
                     restamp_window_earlier_ok is not None, import_dir is not None,
                 )
             )
@@ -2726,6 +2735,7 @@ def make_app(
             ("--rebuild-filing-events", rebuild_filing_events),
             ("--rebuild-classifications", rebuild_classifications),
             ("--rebuild-index", rebuild_index),
+            ("--statement-backfill", statement_backfill),
         ):
             if given and (backfill_ or source in ("alpaca", "fred", ASSETS_SOURCE, "openfigi")):
                 raise _fail(f"{flag} is for a session ingest with the edgar source", USAGE_ERROR)
@@ -2739,6 +2749,20 @@ def make_app(
         ):
             raise _fail(
                 "--rebuild-index cannot be combined with other rebuild or restamp flags",
+                USAGE_ERROR,
+            )
+        if statement_backfill and (
+            source != "edgar"
+            or not bulk_from_cache
+            or rebuild_statement_facts
+            or rebuild_filing_events
+            or rebuild_classifications
+            or rebuild_index
+            or restamp_from is not None
+        ):
+            raise _fail(
+                "--statement-backfill needs --source edgar and --bulk-from-cache, "
+                "and no other rebuild or restamp flag",
                 USAGE_ERROR,
             )
         restamp: list[ManifestRow] | None = None
@@ -2830,6 +2854,14 @@ def make_app(
                     "Set them in .env (see .env.example).",
                     USAGE_ERROR,
                 )
+        if statement_backfill:
+            # #2826: before the migration, so a refused backfill writes nothing.
+            try:
+                backfill_refusal = statement_backfill_refusal(s)
+            except StoreLockedError as exc:
+                raise _fail(_scrubbed(f"refused: {exc}", s), 1) from None
+            if backfill_refusal is not None:
+                raise _fail(f"refused: {backfill_refusal}", 1)
         try:
             if dry_run:
                 if Path(s.store.path).is_file():
@@ -2904,6 +2936,7 @@ def make_app(
             client=edgar_client,
             clock=clock,
             reuse_cached=bulk_from_cache,
+            statement_backfill=statement_backfill,
             event_forms=s.edgar.event_forms,
             prefer_stored_index=restamp is not None or rebuild_classifications,
         )
@@ -2955,6 +2988,7 @@ def make_app(
                     rebuild_filing_events=rebuild_filing_events,
                     rebuild_classifications=rebuild_classifications,
                     rebuild_index=rebuild_index,
+                    statement_backfill=statement_backfill,
                     restamp=restamp,
                     on_restamp=restamped.append,
                     restamp_window_ok=window_ok,

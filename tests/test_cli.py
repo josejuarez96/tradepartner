@@ -2942,3 +2942,65 @@ def test_archive_commands_refuse_when_the_archive_is_off(arch: _ArchiveRig) -> N
         result = arch.run(*args)
         assert result.exit_code != 0
         assert "TRADEPARTNER_RAW_ARCHIVE" in result.output
+
+
+# --- ingest --statement-backfill (#2826, plan T365) --------------------------
+
+
+def test_ingest_statement_backfill_reaches_the_session_with_the_cached_zip(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    built = _SourceRecorder()
+    monkeypatch.setattr(cli, "EdgarFilingSource", built)
+    monkeypatch.setattr(cli, "statement_backfill_refusal", lambda _s: None)
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    args = ["ingest", "--source", "edgar", "--statement-backfill", "--bulk-from-cache"]
+    result = _invoke(secrets_set, args)
+    assert result.exit_code == 0, result.output
+    assert built.kwargs[0]["reuse_cached"] is True
+    assert built.kwargs[0]["statement_backfill"] is True  # the adapter's local-caches mode
+    assert session.calls[0]["statement_backfill"] is True
+    assert _invoke(secrets_set, ["ingest", "--source", "edgar"]).exit_code == 0
+    assert session.calls[1]["statement_backfill"] is False
+    assert built.kwargs[1]["statement_backfill"] is False
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--source", "edgar", "--statement-backfill"],  # no --bulk-from-cache
+        ["--statement-backfill", "--bulk-from-cache"],  # the default source is all
+        ["--source", "alpaca", "--statement-backfill", "--bulk-from-cache"],
+        ["--source", "edgar", "--statement-backfill", "--bulk-from-cache", "--rebuild-index"],
+        [
+            "--source", "edgar", "--statement-backfill", "--bulk-from-cache",
+            "--rebuild-statement-facts",
+        ],
+    ],
+)  # fmt: skip
+def test_ingest_statement_backfill_refuses_other_shapes(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings, args: list[str]
+) -> None:
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    result = _invoke(secrets_set, ["ingest", *args])
+    assert result.exit_code == 2, result.output
+    assert session.calls == []
+
+
+def test_ingest_statement_backfill_refusal_comes_before_the_migration(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    """A rule change or a migration since the last ok index row: refused
+    before `migrate` runs, so the store is not written."""
+    from tradepartner.store import migrate as store_migrate
+
+    monkeypatch.setattr(store_migrate, "migrate", lambda _: pytest.fail("migrated"))
+    monkeypatch.setattr(
+        cli, "statement_backfill_refusal", lambda _s: "rules changed; run --rebuild-index"
+    )
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    args = ["ingest", "--source", "edgar", "--statement-backfill", "--bulk-from-cache"]
+    result = _invoke(secrets_set, args)
+    assert result.exit_code == 1
+    assert "--rebuild-index" in result.output
+    assert session.calls == []
