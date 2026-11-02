@@ -1093,13 +1093,19 @@ def _buy_targets(
     cash_before: float,
     price_of: PriceOf,
     costs: BuyCosts,
+    sleeve: float = 0.0,
 ) -> dict[_Key, float]:
     """Each buy's target (`target_notional`'s formula, spec Definitions): its
     notional x min(1, spendable / the buys' sum), spendable after costs on cash
-    plus every plan sell's value at the reference price."""
+    plus every plan sell's value at the reference price, less `sleeve` (c x the
+    plan's ledger equity, paper spec amendment 2026-11-01 item 3) floored at zero,
+    so no target asks for the sleeve. A `sleeve` of 0 is today's formula."""
     proceeds = sum(
         i.notional for i in intents.values() if i.side == _SELL and i.position_side == LONG
     )
+    available = cash_before + proceeds
+    if sleeve > 0:
+        available = max(0.0, available - sleeve)
     buys = {
         sid: i.notional for sid, i in intents.items() if i.side == _BUY and i.position_side == LONG
     }
@@ -1108,7 +1114,7 @@ def _buy_targets(
     targets: dict[_Key, float] = {}
     for sid, notional in buys.items():
         spendable = buy_notional_after_costs(
-            cash_before + proceeds,
+            available,
             costs.per_side_bps,
             costs.commissions,
             price=_price(price_of, sid[0]),
@@ -1212,6 +1218,7 @@ def decisions_from(
     side: str = _LONG_ONLY,
     short_min_price: float | None = None,
     restricted: Collection[str] = frozenset(),
+    sleeve_fraction: float = 0.0,
 ) -> Decisions:
     """The decisions of rebalance T_i = `plan.session` on the run's session
     S = `ledger.through` (spec Definitions > Decision, reqs 7 step 6 and 9).
@@ -1284,6 +1291,13 @@ def decisions_from(
     `costs.buy_notional_after_costs` on `ledger.cash` plus every sell the plan
     made at the reference price (a forced exit's proceeds stay out).
 
+    `sleeve_fraction` is the book's `cash_sleeve_fraction` c (paper spec amendment
+    2026-11-01 item 3, T370; `execution.buy_timing.execution_for`), in [0, 1]: the long
+    buys' spendable is reduced by c x the plan's ledger equity at the plan's marks,
+    floored at zero, so the targets leave the sleeve in cash. Only the long buys'
+    targets read it: every sell, cover and skip is as with c = 0, and c = 0 is today's
+    plan byte for byte.
+
     `side` (the window's frozen `portfolio.side`, default `long_only`) and
     `short_min_price` (the frozen `portfolio.short_min_price`, required under
     `long_short`) make the book signed (paper spec item 14, plan T229). Under
@@ -1332,6 +1346,8 @@ def decisions_from(
         raise ValueError(f"the ledger is short {list(ledger.short_names)}")
     if side not in (_LONG_ONLY, _LONG_SHORT):
         raise ValueError(f"side {side!r} is neither {_LONG_ONLY!r} nor {_LONG_SHORT!r}")
+    if not (math.isfinite(sleeve_fraction) and 0.0 <= sleeve_fraction <= 1.0):
+        raise ValueError(f"sleeve_fraction {sleeve_fraction} is not in [0, 1]")
     signed = side == _LONG_SHORT
     held_short = {sid for sid, quantity in ledger.short_holdings.items() if quantity > 0}
     if signed:
@@ -1635,7 +1651,9 @@ def decisions_from(
         )
 
     placed = {key: i for key, i in intents.items() if decided[key].side is not None}
-    for key, target in _buy_targets(placed, ledger.free_cash(marks), price_of, costs).items():
+    sleeve = sleeve_fraction * equity if sleeve_fraction > 0 else 0.0
+    targets = _buy_targets(placed, ledger.free_cash(marks), price_of, costs, sleeve)
+    for key, target in targets.items():
         decided[key] = replace(decided[key], target_notional=target)
 
     live_scale = settings.paper.live_capital_reference / equity
