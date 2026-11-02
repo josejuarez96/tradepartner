@@ -16,7 +16,7 @@ Pending. This note is written before the runs so the question, the gate and the 
 
 ## Design
 
-Two sessions, one account (the flat `sandbox` account, PA32VP9UD, keys `ALPACA_SANDBOX_API_KEY` / `_SECRET`, paper host only, the probe README's rules and its $500 order cap):
+Two sessions, one account (the flat `sandbox` account (pinned by number inside the script), keys `ALPACA_SANDBOX_API_KEY` / `_SECRET`, paper host only, the probe README's rules and its $500 order cap):
 
 | Session | Gate orders (count toward the 10) | Extras, every session (cannot fill, open no position) |
 |---|---|---|
@@ -29,7 +29,7 @@ The extras are limit orders at 50% of the last price on a sixth name, so they ca
 
 ## Guards in the script
 
-Dry run unless `--submit`; the plan (every order body and the timed schedule) is printed before anything is sent; refuses unless the account number is PA32VP9UD, the account is flat with no open orders (buy session) or holds only one share of the probe names (sell session), the market is closed with next open today, and the broker-corrected ET time is inside 08:30-09:20; credentials only from the two sandbox variables, refused when equal to any paper-book key; trading host is `paper-api.alpaca.markets`, data host GET only; no notional, fractional or extended-hours field on any order; every order has a `sbx-batch6-` client order id; leftover open orders are cancelled at the end. Offline test: `uv run --project ~/Projects/tradepartner python ~/tradepartner-probes/sandbox/selftest_opg.py` (a fake broker, no network).
+Dry run unless `--submit`; the plan (every order body and the timed schedule) is printed before anything is sent; refuses unless the account number matches the pinned sandbox account, the account is flat with no open orders (buy session) or holds only one share of the probe names (sell session), the market is closed with next open today, and the broker-corrected ET time is inside 08:30-09:20; credentials only from the two sandbox variables, refused when equal to any paper-book key; trading host is `paper-api.alpaca.markets`, data host GET only; no notional, fractional or extended-hours field on any order; every order has a `sbx-batch6-` client order id; leftover open orders are cancelled at the end. Offline test: `uv run --project ~/Projects/tradepartner python ~/tradepartner-probes/sandbox/selftest_opg.py` (a fake broker, no network).
 
 ## Owner's run steps
 
@@ -37,7 +37,7 @@ Needs: the sandbox keys in the environment (the README's `env $(grep ...)` form 
 
 1. **Dry run (any time; sends nothing).** `cd ~/Projects/tradepartner && env $(grep -E '^ALPACA_SANDBOX_API_(KEY|SECRET)=' .env | xargs) uv run --project ~/Projects/tradepartner python ~/tradepartner-probes/sandbox/batch6_opg.py --session buy`. Read the printed PLAN. Check the five names are over $200M 20-day median dollar volume (the script checks it best effort and prints `UNVERIFIED` if the data feed refuses); change them with `--symbols A,B,C,D,E` if not.
 2. **Session 1, buy.** Before 08:30 ET confirm the sandbox account is flat in the Alpaca paper dashboard. Between 08:30 and 09:20 ET run the same command with `--submit` added. It sends the five buys, the extras, then holds until about 09:45 ET (cancels at 09:27:00 and 09:28:30, the late order at 09:28:45, the open at 09:30, polling to 09:45). Keep the terminal open. Save the printed summary and the jsonl path.
-3. **Session 2, sell.** On a later session morning, 08:30-09:20 ET: `... batch6_opg.py --session sell --submit`. It refuses unless the account holds one share of each probe name and nothing else.
+3. **Session 2, sell.** On a later session morning, 08:30-09:20 ET: `... batch6_opg.py --session sell --submit`. It refuses unless the account holds only one-share positions in the probe names, and sells those.
 4. **Check the end state.** The sandbox account is flat and has no open orders (dashboard). A failed buy session may leave fewer than five positions; the sell session sells what is held and counts the rest as unfilled buys.
 5. **Hand back** the two summaries (or the jsonl paths). The agent fills the Results below and applies the gate in the PR that records the result.
 
