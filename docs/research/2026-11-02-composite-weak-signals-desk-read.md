@@ -4,7 +4,7 @@
 
 ## Answer
 
-**Verdict: FAIL** (evidence grade for "an equal-weight composite of low-correlated slow accounting signals clears 0.10 %/month at t ≥ 1 in every post-2009 cell": **NOT SUPPORTED**, confidence medium).
+**Verdict: FAIL** (evidence grade for "an equal-weight composite of low-correlated slow accounting signals clears 0.10 %/month at t ≥ 1 in every post-2009 cell": **MIXED**, confidence medium: five of six cells clear the floors, but by the [handoff §6.1](2026-09-24-initial-research-handoff.md) definition costs consume the effect, since the composite sits below the #2828 cost floors in four of six cells).
 
 The rule is the [kill line frozen on #2888](https://github.com/josejuarez96/tradepartner/issues/2888#issuecomment-6583038848). It was posted at 2026-11-02 16:57:35 UTC, before any return was read. The script's single run started at 16:58:28 UTC.
 
@@ -93,7 +93,6 @@ That makes 80 signals. 73 of them have `LS` in all 432 months from 1990-01 to 20
 **For the verdict:**
 - The frozen rule is all-six, and one cell fails.
 - The edge is small against cost. The composite mean is below the #2828 L/S cost floor in four of six cells, including every screened cell (0.118 to 0.192 against 0.2436).
-  - Composite turnover is unknown, and with eight legs it is likely higher than for one signal.
   - A pass on the 0.10 floor would still not have been net alpha.
 - Two of the eight lose money after 2009, which is the decay the [ranking](2026-10-30-strategy-first-ranking.md) priors predict:
   - `PS` is negative in five of six cells.
