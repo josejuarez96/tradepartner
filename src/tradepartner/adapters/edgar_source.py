@@ -866,18 +866,48 @@ class EdgarFilingSource(FilingSource):
     def release_index(self) -> None:
         """End of the fetch pass: drop the repair's store handle (#2822).
 
-        The build then answers from the recorded pass, so the dry run's
-        read-only connection and other processes are not locked out. A later
-        index read raises instead of silently walking the quarterly files.
+        The handle is released so the dry run's read-only connection, the
+        price read and other processes are not locked out between the fetch
+        pass and the write. A later read on the raw source (the write step's
+        `chain_candidates`, the SEC forms writer) reopens the same store in
+        the writer's mode; a reopen that meets a read-only handle in this
+        process fails closed with `StoreLockedError`, never walking the
+        quarterly files instead.
         """
         if self._owned_index_conn is not None:
             self.close()
             self._index_released = True
 
+    def _open_index(self, path: Path) -> duckdb.DuckDBPyConnection:
+        """A configured read-write handle; a lock or a same-process mode
+        conflict is `StoreLockedError` with fixed text (no path, no PID)."""
+        try:
+            conn = duckdb.connect(str(path))
+        except duckdb.IOException as exc:
+            if _is_lock_error(exc):
+                raise StoreLockedError("store busy: the filing index is locked") from None
+            raise
+        except duckdb.ConnectionException:
+            raise StoreLockedError(
+                "store busy: the filing index is open in this process in another mode"
+            ) from None
+        try:
+            return configure_connection(conn, self._settings.store)
+        except BaseException:
+            conn.close()
+            raise
+
     def _maybe_use_stored_index(self) -> None:
         """Full repair and rebuild commands use a completed index seed."""
         if self._index_released:
-            raise RuntimeError("stored filing index read after the fetch pass released it")
+            # Reopen the index this run already checked and read; the seed
+            # check is not repeated, so the run cannot switch readers midway.
+            conn = self._open_index(Path(self._settings.store.path))
+            memo = self._filing_index_entries
+            self.use_index(conn)
+            self._filing_index_entries = memo  # same table, same clock
+            self._owned_index_conn = conn
+            return
         if self._index_checked or not self._prefer_stored_index:
             return
         self._index_checked = True
@@ -887,12 +917,7 @@ class EdgarFilingSource(FilingSource):
         # Keep the same connection mode as the later writer: DuckDB rejects
         # simultaneous read-only and read-write handles to one store. The
         # fetch pass releases it (`release_index`) before any other opens.
-        try:
-            conn = configure_connection(duckdb.connect(str(path)), self._settings.store)
-        except duckdb.IOException as exc:
-            if _is_lock_error(exc):
-                raise StoreLockedError("store busy: the filing index is locked") from None
-            raise
+        conn = self._open_index(path)
         try:
             seed = conn.execute(
                 "SELECT max(started_at) FROM ingestion_runs WHERE source = 'edgar_index' "
@@ -1236,12 +1261,14 @@ class EdgarFilingSource(FilingSource):
 
     def filing_index_for_cik(self, cik: str) -> list[FilingIndexEntry]:
         """Read one CIK's complete visible history from the table when bound."""
+        self._maybe_use_stored_index()
         if self._index_conn is None:
             return [entry for entry in self.filing_index() if entry.cik == cik]
         return self._issuer_entries(cik) if self._is_issuer_cik(cik) else []
 
     def filing_index_for_forms(self, forms: Collection[str]) -> list[FilingIndexEntry]:
         """Read selected forms across CIKs, including filer-only CIKs."""
+        self._maybe_use_stored_index()
         if self._index_conn is None:
             return [entry for entry in self.filing_index() if entry.form in forms]
         issuers = self._stored_issuer_ciks()
@@ -2400,6 +2427,7 @@ class EdgarFilingSource(FilingSource):
     # --- filing events (T164c, #1358) ----------------------------------------
 
     def _check_event_clock(self, cik: str, record: SubmissionRecord) -> None:
+        self._maybe_use_stored_index()
         if self._index_conn is not None:
             first_row = next(
                 (
@@ -4443,6 +4471,7 @@ class EdgarFilingSource(FilingSource):
         """Stamped CIKs whose facts cache, or (only while the switch is on,
         #660) statement cache, is not keyed by their latest cover-form
         accession: the bulk decision's count."""
+        self._maybe_use_stored_index()
         statements = self._settings.edgar.statement_facts_enabled
         cover_forms = set(self._settings.edgar.cover_page_forms)
         stale = 0

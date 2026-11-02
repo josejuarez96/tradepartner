@@ -3470,23 +3470,58 @@ def _seeded_store_settings(tmp_path: Path, clock: datetime) -> Settings:
     return settings
 
 
-def test_released_repair_index_frees_the_store_and_refuses_later_reads(
+def test_released_repair_index_frees_the_store_and_reopens_for_the_write(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """#2822 safety: after the fetch pass, a read-only open in this process
-    succeeds (the master-retract dry run), and no reader falls back to the
+    """#2822 safety: after the fetch pass a read-only open in this process
+    succeeds (the master-retract dry run, the price read); a raw-source read
+    meanwhile fails closed; the write step's raw reads (`chain_candidates`'
+    form query) reopen the same table beside the writer, never the
     quarterly walk."""
-    from tradepartner.store.db import open_read_only
+    from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only
+    from tradepartner.store.master import SUCCESSOR_EVIDENCE_FORMS, _filing_index_for_forms
 
     settings = _seeded_store_settings(tmp_path, CLOCK)
+    conn = duckdb.connect(settings.store.path)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                "0000320193-26-000150",
+                "8-K12B",
+                "Apple",
+                date(2026, 9, 24),
+                CLOCK - timedelta(days=1),
+                date(2026, 9, 24),
+                True,
+            ),
+            stored_index.Listing(
+                APPLE,
+                "0000320193-26-000151",
+                "10-K",
+                "Apple",
+                date(2026, 9, 24),
+                CLOCK - timedelta(days=1),
+                date(2026, 9, 24),
+                True,
+            ),
+        ],
+        CLOCK,
+    )
+    conn.close()
     source = EdgarFilingSource(settings, clock=lambda: CLOCK, prefer_stored_index=True)
     monkeypatch.setattr(source, "_rows", lambda *_args: pytest.fail("quarter walk"))
-    assert source.filing_index() == []
+    before = _filing_index_for_forms(source, SUCCESSOR_EVIDENCE_FORMS)
+    assert [entry.accession for entry in before] == ["0000320193-26-000150"]
     source.release_index()
-    with open_read_only(settings) as conn:
-        assert conn.execute("SELECT count(*) FROM ingestion_runs").fetchone() == (1,)
-    with pytest.raises(RuntimeError, match="released"):
-        source.delistings()
+    with open_read_only(settings) as read:
+        assert read.execute("SELECT count(*) FROM ingestion_runs").fetchone() == (1,)
+        with pytest.raises(StoreLockedError, match="store busy"):
+            source.delistings()
+    with open_for_write(settings):
+        assert _filing_index_for_forms(source, SUCCESSOR_EVIDENCE_FORMS) == before
+    source.close()
 
 
 def test_pending_settle_check_uses_first_known_filed_on_quarter(
