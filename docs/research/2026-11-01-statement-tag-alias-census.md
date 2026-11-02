@@ -219,7 +219,8 @@ def main(store: str, out: str) -> None:
         ).fetchall()
     }
     issuers = sorted(
-        r[0] for r in conn.execute("select distinct cik from securities where not benchmark").fetchall()
+        r[0]
+        for r in conn.execute("select distinct cik from securities where not benchmark").fetchall()
     )
     sid_cik = dict(conn.execute("select distinct security_id, cik from securities").fetchall())
     sic_hist: dict[str, list[tuple[float, int | None]]] = defaultdict(list)
@@ -346,8 +347,15 @@ DEFERRED = {
 }
 NAMES = {**NEW, **DEFERRED}
 INSTANT = {
-    "book_equity", "total_liabilities", "current_assets", "current_liabilities", "cash",
-    "long_term_debt", "inventory", "receivables", "ppe_net",
+    "book_equity",
+    "total_liabilities",
+    "current_assets",
+    "current_liabilities",
+    "cash",
+    "long_term_debt",
+    "inventory",
+    "receivables",
+    "ppe_net",
 }
 EPS = {"eps_basic", "eps_diluted"}
 NOT_ALIASED = {
@@ -370,15 +378,22 @@ NOT_ALIASED = {
     "dividends_paid": ["PaymentsOfDividends", "PaymentsOfDividendsMinorityInterest"],
     "stock_issued": ["ProceedsFromIssuanceOrSaleOfEquity", "ProceedsFromStockOptionsExercised"],
     "debt_issued": [
-        "ProceedsFromIssuanceOfLongTermDebt", "ProceedsFromShortTermDebt",
+        "ProceedsFromIssuanceOfLongTermDebt",
+        "ProceedsFromShortTermDebt",
         "ProceedsFromRepaymentsOfShortTermDebt",
     ],
     "debt_repaid": [
-        "RepaymentsOfLongTermDebt", "RepaymentsOfShortTermDebt",
+        "RepaymentsOfLongTermDebt",
+        "RepaymentsOfShortTermDebt",
         "ProceedsFromRepaymentsOfShortTermDebt",
     ],
-    "long_term_debt": [], "interest_expense": [], "rd_expense": [], "sga_expense": [],
-    "inventory": [], "receivables": [], "ppe_net": [],
+    "long_term_debt": [],
+    "interest_expense": [],
+    "rd_expense": [],
+    "sga_expense": [],
+    "inventory": [],
+    "receivables": [],
+    "ppe_net": [],
 }
 # Preferred-inclusive equity concepts: a differing value also counts as a gap.
 DIFFERS = {
@@ -387,30 +402,203 @@ DIFFERS = {
     ("stock_issued", "ProceedsFromIssuanceOrSaleOfEquity"),
 }
 ALIASES = {
-    "net_income": ["ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic", "NetIncomeLossAvailableToCommonStockholdersDiluted", "IncomeLossFromContinuingOperations", "IncomeLossAttributableToParent", "ComprehensiveIncomeNetOfTax", "NetIncomeLossAllocatedToLimitedPartners", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"],
-    "eps_basic": ["IncomeLossFromContinuingOperationsPerBasicShare", "IncomeLossFromContinuingOperationsPerBasicAndDilutedShare", "NetIncomeLossPerOutstandingLimitedPartnershipUnitBasicNetOfTax", "EarningsPerShareBasicDistributed", "EarningsPerShareDiluted"],
-    "eps_diluted": ["IncomeLossFromContinuingOperationsPerDilutedShare", "IncomeLossFromContinuingOperationsPerBasicAndDilutedShare", "NetIncomeLossPerOutstandingLimitedPartnershipUnitDilutedNetOfTax", "EarningsPerShareBasic"],
-    "operating_income": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments", "OperatingExpenses", "CostsAndExpenses", "BenefitsLossesAndExpenses"],
-    "book_equity": ["StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", "PartnersCapital", "PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest", "MembersEquity", "LimitedLiabilityCompanyLlcOrLimitedPartnershipLpMembersOrLimitedPartnersOwnershipInterest"],
-    "total_liabilities": ["LiabilitiesAndStockholdersEquity", "LiabilitiesNoncurrent", "LiabilitiesFairValueDisclosure"],
-    "current_assets": ["AssetsNoncurrent", "OtherAssetsCurrent", "CashAndCashEquivalentsAtCarryingValue"],
-    "current_liabilities": ["LiabilitiesNoncurrent", "OtherLiabilitiesCurrent", "AccountsPayableCurrent"],
-    "cash": ["CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "Cash", "CashAndDueFromBanks", "CashEquivalentsAtCarryingValue", "CashAndCashEquivalentsAtCarryingValueIncludingDiscontinuedOperations", "CashCashEquivalentsAndShortTermInvestments"],
-    "capex": ["PaymentsToAcquireProductiveAssets", "PaymentsToAcquireOtherPropertyPlantAndEquipment", "PaymentsForCapitalImprovements", "PaymentsToAcquireRealEstate", "PaymentsToDevelopRealEstateAssets", "PaymentsToAcquireAndDevelopRealEstate", "PaymentsToAcquireOilAndGasPropertyAndEquipment", "PaymentsToAcquireOilAndGasProperty", "PaymentsToAcquireMachineryAndEquipment"],
-    "depreciation": ["Depreciation", "DepreciationAmortizationAndAccretionNet", "AmortizationOfIntangibleAssets", "OtherDepreciationAndAmortization", "DepreciationNonproduction", "CostDepreciationAmortizationAndDepletion"],
-    "income_tax": ["CurrentIncomeTaxExpenseBenefit", "DeferredIncomeTaxExpenseBenefit", "IncomeTaxesPaid", "IncomeTaxesPaidNet", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"],
-    "buybacks": ["PaymentsForRepurchaseOfEquity", "PaymentsForRepurchaseOfPreferredStockAndPreferenceStock", "TreasuryStockValueAcquiredCostMethod", "StockRepurchasedDuringPeriodValue"],
-    "dividends_paid": ["PaymentsOfDividends", "PaymentsOfDividendsMinorityInterest", "PaymentsOfOrdinaryDividends", "PaymentsOfDividendsPreferredStockAndPreferenceStock", "DividendsCommonStockCash", "DividendsCommonStock", "DividendsCash", "DistributionMadeToLimitedPartnerCashDistributionsPaid"],
-    "stock_issued": ["ProceedsFromIssuanceOrSaleOfEquity", "ProceedsFromStockOptionsExercised", "ProceedsFromIssuanceOfInitialPublicOffering", "ProceedsFromIssuanceOfPreferredStockAndPreferenceStock", "ProceedsFromIssuanceOfSharesUnderIncentiveAndShareBasedCompensationPlans", "ProceedsFromIssuanceOfPrivatePlacement", "SaleOfStockConsiderationReceivedOnTransaction"],
-    "debt_issued": ["ProceedsFromIssuanceOfLongTermDebt", "ProceedsFromShortTermDebt", "ProceedsFromRepaymentsOfShortTermDebt", "ProceedsFromRepaymentsOfDebt", "ProceedsFromIssuanceOfSeniorLongTermDebt", "ProceedsFromConvertibleDebt", "ProceedsFromLinesOfCredit", "ProceedsFromLongTermLinesOfCredit", "ProceedsFromNotesPayable", "ProceedsFromRelatedPartyDebt", "ProceedsFromBankDebt", "ProceedsFromSecuredNotesPayable", "ProceedsFromIssuanceOfUnsecuredDebt", "ProceedsFromIssuanceOfSecuredDebt", "ProceedsFromIssuanceOfCommercialPaper", "ProceedsFromRepaymentsOfCommercialPaper"],
-    "debt_repaid": ["RepaymentsOfLongTermDebt", "RepaymentsOfShortTermDebt", "ProceedsFromRepaymentsOfShortTermDebt", "ProceedsFromRepaymentsOfDebt", "RepaymentsOfLinesOfCredit", "RepaymentsOfLongTermLinesOfCredit", "RepaymentsOfNotesPayable", "RepaymentsOfConvertibleDebt", "RepaymentsOfSeniorDebt", "RepaymentsOfRelatedPartyDebt", "RepaymentsOfSecuredDebt", "RepaymentsOfUnsecuredDebt", "RepaymentsOfBankDebt", "RepaymentsOfCommercialPaper", "RepaymentsOfLongTermCapitalLeaseObligations", "FinanceLeasePrincipalPayments"],
-    "long_term_debt": ["LongTermDebt", "LongTermDebtAndCapitalLeaseObligations", "LongTermNotesPayable", "SeniorLongTermNotes", "ConvertibleNotesPayable", "DebtInstrumentCarryingAmount", "LongTermDebtCurrent"],
-    "interest_expense": ["InterestExpenseDebt", "InterestExpenseNonoperating", "InterestAndDebtExpense", "InterestExpenseOperating", "InterestPaid", "InterestPaidNet", "InterestIncomeExpenseNonoperatingNet"],
-    "rd_expense": ["ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost", "ResearchAndDevelopmentExpenseSoftwareExcludingAcquiredInProcessCost", "ResearchAndDevelopmentInProcess"],
-    "sga_expense": ["GeneralAndAdministrativeExpense", "SellingAndMarketingExpense", "SellingExpense", "OperatingExpenses"],
-    "inventory": ["InventoryGross", "InventoryFinishedGoods", "InventoryFinishedGoodsNetOfReserves", "InventoryRawMaterialsNetOfReserves", "InventoryWorkInProcess"],
-    "receivables": ["ReceivablesNetCurrent", "AccountsNotesAndLoansReceivableNetCurrent", "AccountsReceivableGrossCurrent", "AccountsAndOtherReceivablesNetCurrent"],
-    "ppe_net": ["PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization", "PropertyPlantAndEquipmentGross", "RealEstateInvestmentPropertyNet", "PublicUtilitiesPropertyPlantAndEquipmentNet", "OilAndGasPropertySuccessfulEffortMethodNet", "OilAndGasPropertyFullCostMethodNet"],
+    "net_income": [
+        "ProfitLoss",
+        "NetIncomeLossAvailableToCommonStockholdersBasic",
+        "NetIncomeLossAvailableToCommonStockholdersDiluted",
+        "IncomeLossFromContinuingOperations",
+        "IncomeLossAttributableToParent",
+        "ComprehensiveIncomeNetOfTax",
+        "NetIncomeLossAllocatedToLimitedPartners",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+    ],
+    "eps_basic": [
+        "IncomeLossFromContinuingOperationsPerBasicShare",
+        "IncomeLossFromContinuingOperationsPerBasicAndDilutedShare",
+        "NetIncomeLossPerOutstandingLimitedPartnershipUnitBasicNetOfTax",
+        "EarningsPerShareBasicDistributed",
+        "EarningsPerShareDiluted",
+    ],
+    "eps_diluted": [
+        "IncomeLossFromContinuingOperationsPerDilutedShare",
+        "IncomeLossFromContinuingOperationsPerBasicAndDilutedShare",
+        "NetIncomeLossPerOutstandingLimitedPartnershipUnitDilutedNetOfTax",
+        "EarningsPerShareBasic",
+    ],
+    "operating_income": [
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+        "OperatingExpenses",
+        "CostsAndExpenses",
+        "BenefitsLossesAndExpenses",
+    ],
+    "book_equity": [
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+        "PartnersCapital",
+        "PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest",
+        "MembersEquity",
+        "LimitedLiabilityCompanyLlcOrLimitedPartnershipLpMembersOrLimitedPartnersOwnershipInterest",
+    ],
+    "total_liabilities": [
+        "LiabilitiesAndStockholdersEquity",
+        "LiabilitiesNoncurrent",
+        "LiabilitiesFairValueDisclosure",
+    ],
+    "current_assets": [
+        "AssetsNoncurrent",
+        "OtherAssetsCurrent",
+        "CashAndCashEquivalentsAtCarryingValue",
+    ],
+    "current_liabilities": [
+        "LiabilitiesNoncurrent",
+        "OtherLiabilitiesCurrent",
+        "AccountsPayableCurrent",
+    ],
+    "cash": [
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        "Cash",
+        "CashAndDueFromBanks",
+        "CashEquivalentsAtCarryingValue",
+        "CashAndCashEquivalentsAtCarryingValueIncludingDiscontinuedOperations",
+        "CashCashEquivalentsAndShortTermInvestments",
+    ],
+    "capex": [
+        "PaymentsToAcquireProductiveAssets",
+        "PaymentsToAcquireOtherPropertyPlantAndEquipment",
+        "PaymentsForCapitalImprovements",
+        "PaymentsToAcquireRealEstate",
+        "PaymentsToDevelopRealEstateAssets",
+        "PaymentsToAcquireAndDevelopRealEstate",
+        "PaymentsToAcquireOilAndGasPropertyAndEquipment",
+        "PaymentsToAcquireOilAndGasProperty",
+        "PaymentsToAcquireMachineryAndEquipment",
+    ],
+    "depreciation": [
+        "Depreciation",
+        "DepreciationAmortizationAndAccretionNet",
+        "AmortizationOfIntangibleAssets",
+        "OtherDepreciationAndAmortization",
+        "DepreciationNonproduction",
+        "CostDepreciationAmortizationAndDepletion",
+    ],
+    "income_tax": [
+        "CurrentIncomeTaxExpenseBenefit",
+        "DeferredIncomeTaxExpenseBenefit",
+        "IncomeTaxesPaid",
+        "IncomeTaxesPaidNet",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+    ],
+    "buybacks": [
+        "PaymentsForRepurchaseOfEquity",
+        "PaymentsForRepurchaseOfPreferredStockAndPreferenceStock",
+        "TreasuryStockValueAcquiredCostMethod",
+        "StockRepurchasedDuringPeriodValue",
+    ],
+    "dividends_paid": [
+        "PaymentsOfDividends",
+        "PaymentsOfDividendsMinorityInterest",
+        "PaymentsOfOrdinaryDividends",
+        "PaymentsOfDividendsPreferredStockAndPreferenceStock",
+        "DividendsCommonStockCash",
+        "DividendsCommonStock",
+        "DividendsCash",
+        "DistributionMadeToLimitedPartnerCashDistributionsPaid",
+    ],
+    "stock_issued": [
+        "ProceedsFromIssuanceOrSaleOfEquity",
+        "ProceedsFromStockOptionsExercised",
+        "ProceedsFromIssuanceOfInitialPublicOffering",
+        "ProceedsFromIssuanceOfPreferredStockAndPreferenceStock",
+        "ProceedsFromIssuanceOfSharesUnderIncentiveAndShareBasedCompensationPlans",
+        "ProceedsFromIssuanceOfPrivatePlacement",
+        "SaleOfStockConsiderationReceivedOnTransaction",
+    ],
+    "debt_issued": [
+        "ProceedsFromIssuanceOfLongTermDebt",
+        "ProceedsFromShortTermDebt",
+        "ProceedsFromRepaymentsOfShortTermDebt",
+        "ProceedsFromRepaymentsOfDebt",
+        "ProceedsFromIssuanceOfSeniorLongTermDebt",
+        "ProceedsFromConvertibleDebt",
+        "ProceedsFromLinesOfCredit",
+        "ProceedsFromLongTermLinesOfCredit",
+        "ProceedsFromNotesPayable",
+        "ProceedsFromRelatedPartyDebt",
+        "ProceedsFromBankDebt",
+        "ProceedsFromSecuredNotesPayable",
+        "ProceedsFromIssuanceOfUnsecuredDebt",
+        "ProceedsFromIssuanceOfSecuredDebt",
+        "ProceedsFromIssuanceOfCommercialPaper",
+        "ProceedsFromRepaymentsOfCommercialPaper",
+    ],
+    "debt_repaid": [
+        "RepaymentsOfLongTermDebt",
+        "RepaymentsOfShortTermDebt",
+        "ProceedsFromRepaymentsOfShortTermDebt",
+        "ProceedsFromRepaymentsOfDebt",
+        "RepaymentsOfLinesOfCredit",
+        "RepaymentsOfLongTermLinesOfCredit",
+        "RepaymentsOfNotesPayable",
+        "RepaymentsOfConvertibleDebt",
+        "RepaymentsOfSeniorDebt",
+        "RepaymentsOfRelatedPartyDebt",
+        "RepaymentsOfSecuredDebt",
+        "RepaymentsOfUnsecuredDebt",
+        "RepaymentsOfBankDebt",
+        "RepaymentsOfCommercialPaper",
+        "RepaymentsOfLongTermCapitalLeaseObligations",
+        "FinanceLeasePrincipalPayments",
+    ],
+    "long_term_debt": [
+        "LongTermDebt",
+        "LongTermDebtAndCapitalLeaseObligations",
+        "LongTermNotesPayable",
+        "SeniorLongTermNotes",
+        "ConvertibleNotesPayable",
+        "DebtInstrumentCarryingAmount",
+        "LongTermDebtCurrent",
+    ],
+    "interest_expense": [
+        "InterestExpenseDebt",
+        "InterestExpenseNonoperating",
+        "InterestAndDebtExpense",
+        "InterestExpenseOperating",
+        "InterestPaid",
+        "InterestPaidNet",
+        "InterestIncomeExpenseNonoperatingNet",
+    ],
+    "rd_expense": [
+        "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
+        "ResearchAndDevelopmentExpenseSoftwareExcludingAcquiredInProcessCost",
+        "ResearchAndDevelopmentInProcess",
+    ],
+    "sga_expense": [
+        "GeneralAndAdministrativeExpense",
+        "SellingAndMarketingExpense",
+        "SellingExpense",
+        "OperatingExpenses",
+    ],
+    "inventory": [
+        "InventoryGross",
+        "InventoryFinishedGoods",
+        "InventoryFinishedGoodsNetOfReserves",
+        "InventoryRawMaterialsNetOfReserves",
+        "InventoryWorkInProcess",
+    ],
+    "receivables": [
+        "ReceivablesNetCurrent",
+        "AccountsNotesAndLoansReceivableNetCurrent",
+        "AccountsReceivableGrossCurrent",
+        "AccountsAndOtherReceivablesNetCurrent",
+    ],
+    "ppe_net": [
+        "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
+        "PropertyPlantAndEquipmentGross",
+        "RealEstateInvestmentPropertyNet",
+        "PublicUtilitiesPropertyPlantAndEquipmentNet",
+        "OilAndGasPropertySuccessfulEffortMethodNet",
+        "OilAndGasPropertyFullCostMethodNet",
+    ],
 }
 NAME_ORDER = list(NAMES)
 BIT = {n: 1 << i for i, n in enumerate(NAME_ORDER)}
@@ -426,7 +614,10 @@ for _n, _tags in NAMES.items():
     VIRTUAL[_n] = (_tags, unit_of(_n))
     for _c in NOT_ALIASED[_n]:
         VIRTUAL[f"alt|{_n}|{_c}"] = ([_c], unit_of(_n))
-VIRTUAL["only|depreciation|DepreciationDepletionAndAmortization"] = (["DepreciationDepletionAndAmortization"], "USD")
+VIRTUAL["only|depreciation|DepreciationDepletionAndAmortization"] = (
+    ["DepreciationDepletionAndAmortization"],
+    "USD",
+)
 VIRTUAL["only|depreciation|DepreciationAndAmortization"] = (["DepreciationAndAmortization"], "USD")
 VIRTUAL["only|eps_basic|EarningsPerShareBasic"] = (["EarningsPerShareBasic"], "USD/shares")
 VIRTUAL["only|eps_diluted|EarningsPerShareDiluted"] = (["EarningsPerShareDiluted"], "USD/shares")
@@ -513,7 +704,9 @@ def first_vintage(records):
             elif r.value != v[1]:
                 restated[r.fact_name] += 1
                 if r.fact_name in EPS:
-                    restate_events.append((r.fact_name, v[0].timestamp(), v[1], acc.timestamp(), r.value))
+                    restate_events.append(
+                        (r.fact_name, v[0].timestamp(), v[1], acc.timestamp(), r.value)
+                    )
     return vint, restated, late, restate_events, unstamped
 
 
@@ -528,7 +721,11 @@ def _process(cik: str):
     assert _zip is not None
     res: dict = {"cik": cik}
     stamps = load_stamps(cik)
-    cover = [s for s in stamps.values() if s.accepted_at is not None and s.form.removesuffix("/A") in COVER]
+    cover = [
+        s
+        for s in stamps.values()
+        if s.accepted_at is not None and s.form.removesuffix("/A") in COVER
+    ]
     latest = max(cover, key=lambda s: (s.accepted_at, s.accession)).accession if cover else None
     res["has_cover"] = latest is not None
     member = f"CIK{cik}.json"
@@ -566,9 +763,9 @@ def _process(cik: str):
     new_names = set(NEW)
     new_recs = [r for r in (*prod_u.records, *prod_s.records) if r.fact_name in new_names]
     new_conf = [c for c in (*prod_u.conflicts, *prod_s.conflicts) if c.fact_name in new_names]
-    res["cache_bytes"] = sum(len(json.dumps(_statement_record_to_json(r))) + 2 for r in new_recs) + sum(
-        len(json.dumps(_statement_conflict_to_json(c))) + 2 for c in new_conf
-    )
+    res["cache_bytes"] = sum(
+        len(json.dumps(_statement_record_to_json(r))) + 2 for r in new_recs
+    ) + sum(len(json.dumps(_statement_conflict_to_json(c))) + 2 for c in new_conf)
     vint_prod, restated_prod, _, _, _ = first_vintage(new_recs)
     res["new_rows"] = Counter(k[0] for k in vint_prod)
     res["new_restated"] = restated_prod
@@ -671,9 +868,17 @@ def _process(cik: str):
         disc[(bucket, spac, mask)].update(concepts)
         disc_n[(bucket, spac, mask)] += 1
     res.update(
-        acc_total=acc_total, tag_carry=tag_carry, none_ct=none_ct, alias_none=alias_none,
-        disc=dict(disc), disc_n=disc_n, pair_eq=pair_eq, pair_ne=pair_ne,
-        wrong_kind=wrong_kind, kind_total=kind_total, sic_unknown=sic_unknown,
+        acc_total=acc_total,
+        tag_carry=tag_carry,
+        none_ct=none_ct,
+        alias_none=alias_none,
+        disc=dict(disc),
+        disc_n=disc_n,
+        pair_eq=pair_eq,
+        pair_ne=pair_ne,
+        wrong_kind=wrong_kind,
+        kind_total=kind_total,
+        sic_unknown=sic_unknown,
     )
     # first-vintage simulation of every virtual name (restatements, gap rows)
     vu = {k: [G + t for t in v[0]] for k, v in VIRTUAL.items() if v[1] == "USD"}
@@ -693,9 +898,7 @@ def _process(cik: str):
         for ex, ratio, _known in splits:
             if v_ts < ex <= r_ts:
                 factor *= ratio
-        explained = factor != 1.0 and (
-            abs(r_val * factor - v_val) <= max(0.01, 0.01 * abs(v_val))
-        )
+        explained = factor != 1.0 and (abs(r_val * factor - v_val) <= max(0.01, 0.01 * abs(v_val)))
         (split_ok if explained else split_other)[name] += 1
     res["eps_split_restated"] = split_ok
     res["eps_other_restated"] = split_other
@@ -708,9 +911,23 @@ def _process(cik: str):
 
 
 SUMMED = (
-    "acc_total", "tag_carry", "none_ct", "alias_none", "disc_n", "pair_eq", "pair_ne",
-    "wrong_kind", "kind_total", "units_seen", "v_restated", "v_rows", "eps_split_restated",
-    "eps_other_restated", "new_rows", "new_restated", "new_conflicts",
+    "acc_total",
+    "tag_carry",
+    "none_ct",
+    "alias_none",
+    "disc_n",
+    "pair_eq",
+    "pair_ne",
+    "wrong_kind",
+    "kind_total",
+    "units_seen",
+    "v_restated",
+    "v_rows",
+    "eps_split_restated",
+    "eps_other_restated",
+    "new_rows",
+    "new_restated",
+    "new_conflicts",
 )
 
 
@@ -769,7 +986,9 @@ import statistics
 import sys
 from collections import Counter, defaultdict
 
-sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))  # census.py beside this file
+sys.path.insert(
+    0, __import__("os").path.dirname(__import__("os").path.abspath(__file__))
+)  # census.py beside this file
 
 STORE_BYTES_PER_ROW = 76  # measured: statement_facts with its UNIQUE index, compact copy
 
@@ -784,10 +1003,24 @@ def main() -> None:
     years = list(range(2009, 2027))
     acc = agg["acc_total"]
     print("== run ==")
-    print("results", len(results), "errors", sum("error" in r for r in results), "wall", round(out["wall"]), "workers", out["workers"])
+    print(
+        "results",
+        len(results),
+        "errors",
+        sum("error" in r for r in results),
+        "wall",
+        round(out["wall"]),
+        "workers",
+        out["workers"],
+    )
     for r in [r for r in results if "error" in r][:10]:
         print("  error", r["cik"], r["error"])
-    print("sic_unknown accessions", agg.get("sic_unknown"), "unstamped records dropped", agg.get("v_unstamped"))
+    print(
+        "sic_unknown accessions",
+        agg.get("sic_unknown"),
+        "unstamped records dropped",
+        agg.get("v_unstamped"),
+    )
 
     print("\n== accessions per year (all, SIC 6770) ==")
     for y in years:
@@ -823,7 +1056,9 @@ def main() -> None:
         print(n.ljust(20), "; ".join(parts), f"; none {100 * none / tot_ex:.1f}%")
     print("accessions ex-6770", tot_ex, "all", tot_all)
 
-    print("\n== aliases among accessions carrying none (ex-6770, all years): count, share of none ==")
+    print(
+        "\n== aliases among accessions carrying none (ex-6770, all years): count, share of none =="
+    )
     an = agg["alias_none"]
     for n in NAMES:
         none = sum(agg["none_ct"][(n, y, False)] for y in years)
@@ -834,7 +1069,9 @@ def main() -> None:
                 parts.append(f"{a} {c} ({100 * c / none:.1f}%)")
         print(f"{n} [none={none}]:", "; ".join(parts) or "-")
 
-    print("\n== discovery: top 20 over-represented concepts among none vs carrying (ex-6770, all years) ==")
+    print(
+        "\n== discovery: top 20 over-represented concepts among none vs carrying (ex-6770, all years) =="
+    )
     from census import BIT  # noqa: PLC0415
 
     disc = agg["disc"]
@@ -857,7 +1094,10 @@ def main() -> None:
             pc = carry_c[concept] / carry_n if carry_n else 0
             scores.append((pn - pc, concept, pn, pc))
         scores.sort(reverse=True)
-        print(f"{n} [none {none_n}, carrying {carry_n}]:", "; ".join(f"{c} {100 * pn:.0f}/{100 * pc:.0f}" for _, c, pn, pc in scores[:20]))
+        print(
+            f"{n} [none {none_n}, carrying {carry_n}]:",
+            "; ".join(f"{c} {100 * pn:.0f}/{100 * pc:.0f}" for _, c, pn, pc in scores[:20]),
+        )
 
     print("\n== value equality, candidate vs other tag, same filing and period: equal / differ ==")
     eq, ne = agg["pair_eq"], agg["pair_ne"]
@@ -886,17 +1126,40 @@ def main() -> None:
     print("\n== restatements (priced CIKs, first-vintage simulation) ==")
     vr, vrows = agg["v_restated"], agg["v_rows"]
     for n in NAMES:
-        print(n, "rows", vrows[n], "restated", vr[n], f"{100 * vr[n] / vrows[n]:.2f}%" if vrows[n] else "")
+        print(
+            n,
+            "rows",
+            vrows[n],
+            "restated",
+            vr[n],
+            f"{100 * vr[n] / vrows[n]:.2f}%" if vrows[n] else "",
+        )
     for n in EPS:
-        print(n, "split-explained", agg["eps_split_restated"][n], "other", agg["eps_other_restated"][n])
+        print(
+            n,
+            "split-explained",
+            agg["eps_split_restated"][n],
+            "other",
+            agg["eps_other_restated"][n],
+        )
 
     print("\n== descriptions (taxonomy, from companyfacts) ==")
-    for t in ("DepreciationDepletionAndAmortization", "DepreciationAndAmortization", "Depreciation",
-              "EarningsPerShareBasic", "EarningsPerShareBasicAndDiluted", "EarningsPerShareDiluted",
-              "PaymentsOfDividends", "PaymentsOfDividendsMinorityInterest", "PaymentsOfDividendsCommonStock",
-              "ProceedsFromIssuanceOfDebt", "ProceedsFromIssuanceOfLongTermDebt", "RepaymentsOfDebt",
-              "RepaymentsOfLongTermDebt",
-              "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization"):
+    for t in (
+        "DepreciationDepletionAndAmortization",
+        "DepreciationAndAmortization",
+        "Depreciation",
+        "EarningsPerShareBasic",
+        "EarningsPerShareBasicAndDiluted",
+        "EarningsPerShareDiluted",
+        "PaymentsOfDividends",
+        "PaymentsOfDividendsMinorityInterest",
+        "PaymentsOfDividendsCommonStock",
+        "ProceedsFromIssuanceOfDebt",
+        "ProceedsFromIssuanceOfLongTermDebt",
+        "RepaymentsOfDebt",
+        "RepaymentsOfLongTermDebt",
+        "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
+    ):
         d = agg["descriptions"].get(t)
         print(t, "::", d)
 
@@ -931,26 +1194,34 @@ def main() -> None:
                         known = {(r[1], r[2]): r[3] for r in g.get(n, ()) if r[0] <= t}
                         if any(known.get((r[1], r[2])) != r[3] for r in fd if r[1] == latest):
                             gaps[(n, d, "differs")] += 1
-            for variant in ("only|depreciation|DepreciationDepletionAndAmortization", "only|depreciation|DepreciationAndAmortization",
-                            "only|eps_basic|EarningsPerShareBasic", "only|eps_diluted|EarningsPerShareDiluted"):
+            for variant in (
+                "only|depreciation|DepreciationDepletionAndAmortization",
+                "only|depreciation|DepreciationAndAmortization",
+                "only|eps_basic|EarningsPerShareBasic",
+                "only|eps_diluted|EarningsPerShareDiluted",
+            ):
                 if fresh(g.get(variant, ()), t, ff):
                     cov[variant] += 1
             # DA against the DDA-only list
-            if not fresh(g.get("only|depreciation|DepreciationDepletionAndAmortization", ()), t, ff) and fresh(
-                g.get("only|depreciation|DepreciationAndAmortization", ()), t, ff
-            ):
+            if not fresh(
+                g.get("only|depreciation|DepreciationDepletionAndAmortization", ()), t, ff
+            ) and fresh(g.get("only|depreciation|DepreciationAndAmortization", ()), t, ff):
                 gaps[("depreciation(DDA only)", "DepreciationAndAmortization", "lacks")] += 1
     print("coverage per name (share of member-months with a row by the #660 bound):")
     for n in list(NAMES) + [k for k in cov if k.startswith("only|")]:
         print(f"  {n} {cov[n]} {100 * cov[n] / denom:.1f}%")
     print("gaps:")
     for (n, d, kind), c in sorted(gaps.items()):
-        print(f"  {n} vs {d} [{kind}] {c} {100 * c / denom:.2f}% {'ABOVE' if c > denom * 0.005 else 'residue'}")
+        print(
+            f"  {n} vs {d} [{kind}] {c} {100 * c / denom:.2f}% {'ABOVE' if c > denom * 0.005 else 'residue'}"
+        )
     for n, ds in NOT_ALIASED.items():
         for d in ds:
             tot = gaps[(n, d, "lacks")] + gaps[(n, d, "differs")]
             if (n, d) in DIFFERS:
-                print(f"  {n} vs {d} [lacks+differs] {tot} {100 * tot / denom:.2f}% {'ABOVE' if tot > denom * 0.005 else 'residue'}")
+                print(
+                    f"  {n} vs {d} [lacks+differs] {tot} {100 * tot / denom:.2f}% {'ABOVE' if tot > denom * 0.005 else 'residue'}"
+                )
 
     # ---- T368 budget ----
     print("\n== T368 budget (every issuer CIK) ==")
@@ -958,7 +1229,9 @@ def main() -> None:
     in_zip = [r for r in iss if r.get("in_zip")]
     with_cover = [r for r in iss if r.get("has_cover")]
     absent_cover = [r for r in iss if r.get("has_cover") and not r.get("in_zip")]
-    trailing = [r for r in in_zip if r.get("has_cover") and not r.get("empty") and not r.get("holds_latest")]
+    trailing = [
+        r for r in in_zip if r.get("has_cover") and not r.get("empty") and not r.get("holds_latest")
+    ]
     empty_cover = [r for r in in_zip if r.get("has_cover") and r.get("empty")]
     parsed = [r for r in iss if "t_parse" in r]
     rows = Counter()
@@ -970,13 +1243,52 @@ def main() -> None:
     cache_bytes = sum(r["cache_bytes"] for r in parsed)
     t_load = [r["t_load"] for r in parsed]
     t_parse = [r["t_parse"] for r in parsed]
-    print("issuer CIKs", len(iss), "in zip", len(in_zip), "with a cover-form stamp", len(with_cover), "parsed", len(parsed))
-    print("API requests: absent from zip with a cover stamp", len(absent_cover), "; member trails latest stamp", len(trailing), "; empty member with cover stamp", len(empty_cover))
-    print("projected rows", total_rows, "store bytes", total_rows * STORE_BYTES_PER_ROW, "cache bytes", cache_bytes)
+    print(
+        "issuer CIKs",
+        len(iss),
+        "in zip",
+        len(in_zip),
+        "with a cover-form stamp",
+        len(with_cover),
+        "parsed",
+        len(parsed),
+    )
+    print(
+        "API requests: absent from zip with a cover stamp",
+        len(absent_cover),
+        "; member trails latest stamp",
+        len(trailing),
+        "; empty member with cover stamp",
+        len(empty_cover),
+    )
+    print(
+        "projected rows",
+        total_rows,
+        "store bytes",
+        total_rows * STORE_BYTES_PER_ROW,
+        "cache bytes",
+        cache_bytes,
+    )
     print("rows per name", dict(rows))
     print("restated per name (all issuers)", dict(restated))
-    print("member load s: total", round(sum(t_load)), "p50", round(statistics.median(t_load), 4), "max", round(max(t_load), 2))
-    print("parse s: total", round(sum(t_parse)), "p50", round(statistics.median(t_parse), 4), "p99", round(sorted(t_parse)[int(0.99 * len(t_parse))], 3), "max", round(max(t_parse), 2))
+    print(
+        "member load s: total",
+        round(sum(t_load)),
+        "p50",
+        round(statistics.median(t_load), 4),
+        "max",
+        round(max(t_load), 2),
+    )
+    print(
+        "parse s: total",
+        round(sum(t_parse)),
+        "p50",
+        round(statistics.median(t_parse), 4),
+        "p99",
+        round(sorted(t_parse)[int(0.99 * len(t_parse))], 3),
+        "max",
+        round(max(t_parse), 2),
+    )
     print("non_unit pairs", agg.get("non_unit", "n/a"))
     print("conflicts per new name", dict(agg.get("new_conflicts", {})))
 
