@@ -3147,8 +3147,9 @@ def restamp_from_manifest(
     rows take it as `accepted_at` and keep their `known_at`; every moved row
     gets `ingested_at`. An accession whose new stamp is at or after one of
     its revisions' `known_at`, or that two changes move to different new
-    stamps, is refused: its CIK (and a Form 25's subject CIK) lands in
-    `refused` naming the accession, and none of that CIK's rows move.
+    stamps, is refused: its subject CIK (the filer's, or a Form 25's
+    subject) lands in `refused` naming the accession, and none of that CIK's
+    rows move. A Form 25's filer is not refused: its other accessions move.
 
     **Refused CIKs**, by the matched rows' security CIK (none of the CIK's
     rows move; listed in the result): a change moving a date a column was
@@ -3404,8 +3405,9 @@ def _filing_index_refusals(
     stored accession (matched on the old stamp) with a revision whose
     `known_at` is at or before the new stamp, which would leave the revision
     known before its own acceptance, or two changes giving it different new
-    stamps. A Form 25's subject CIK is refused with the filer's, so the
-    accession's derived rows and its index rows never move apart."""
+    stamps. The CIK named is the accession's subject (a Form 25's subject, else
+    the filer), so the accession's derived rows and its index rows never move
+    apart; a Form 25's filer keeps its other accessions moving (#2807)."""
     why_by_accession: dict[tuple[str, str], str] = {}
     for cik, accession in conn.execute(
         "SELECT DISTINCT t.cik, t.accession "
@@ -3424,8 +3426,10 @@ def _filing_index_refusals(
         why_by_accession.setdefault((cik, accession), "one accession, two new stamps")
     named: dict[str, list[str]] = {}
     for (cik, accession), why in sorted(why_by_accession.items()):
-        for target in {cik, filed[accession].cik} if accession in filed else {cik}:
-            named.setdefault(target, []).append(f"{accession} ({why})")
+        # A Form 25's subject is refused (its delisting stays with the index row);
+        # the filing exchange is not, so its other accessions still move (#2807).
+        target = filed[accession].cik if accession in filed else cik
+        named.setdefault(target, []).append(f"{accession} ({why})")
     return {
         cik: "filing_index: accession " + "; ".join(items) for cik, items in sorted(named.items())
     }
