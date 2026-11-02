@@ -133,6 +133,7 @@ from tradepartner.calendar import (
     session_close,
 )
 from tradepartner.config import ENGINE_FAMILIES, Cadence, Settings, get_settings
+from tradepartner.config_edgar import PRE_2826_STATEMENT_FACTS
 from tradepartner.store.benchmarks import CHECK_ONLY_IDS
 from tradepartner.store.db import configure_connection, insert_row, utc_now
 from tradepartner.store.schema import (
@@ -558,6 +559,12 @@ _NOT_CHECK_ONLY: Final = (
 _TRIAL_TABLE_ROWS: Final[dict[str, str]] = {
     "corporate_actions": f" AND action_type IN ('split', 'dividend'){_NOT_CHECK_ONLY}",
     "prices_daily": _NOT_CHECK_ONLY,
+    # #2826 (T366; owner answer 4): a trial counts only the eight statement
+    # names held before the backfill, until a reader opts in, so a new name's
+    # rows stale no registered trial. A new row of a held name still does.
+    "statement_facts": " AND fact_name IN ("
+    + ", ".join(f"'{name}'" for name in PRE_2826_STATEMENT_FACTS)
+    + ")",
     # #821 (T187): a chain's retraction changes the reads from the stamp it
     # withdraws, since a moved chain reads absent before its new stamp
     # (`schema.successor_chains`), so it counts from `withdrawn_known_at`.
@@ -593,6 +600,9 @@ def data_vintage(
     the release-level vintages stay `False`. At `False` a `spinoff` row moves no
     vintage, so H1's and the TWIN's stored vintages and every pinned digest are
     unchanged.
+
+    `statement_facts` counts only `PRE_2826_STATEMENT_FACTS` (#2826, T366), so a
+    new statement name's rows stale no trial.
     """
     if cutoff.tzinfo is None:
         raise ValueError(f"cutoff must be timezone-aware, got {cutoff!r}")

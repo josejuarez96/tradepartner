@@ -184,6 +184,10 @@ class AlpacaConfig(BaseModel):
     )
 
     historical_feed: Literal["sip", "iex"] = "sip"
+    #: Paper spec amendment 2026-11-01 item 7 (T369): minutes before open(S) at which
+    #: an `opg` row stops being journaled. Alpaca refuses OPG from 09:28 ET, so 3 keeps
+    #: a margin; below 2 the margin is gone. Nothing reads it until T376.
+    opg_cutoff_minutes_before_open: int = Field(default=3, ge=2)
     actions_process_lag_days: int = Field(default=90, ge=0)
     actions_backfill_floor: date = date(2020, 6, 1)
     registrant_quiet_days: int = Field(default=180, ge=1)
@@ -797,6 +801,44 @@ _DEFAULT_MIN_REBALANCES: dict[Cadence, int] = {
 }
 
 
+class BookExecution(BaseModel):
+    """One book's buy-timing choices (paper spec amendment 2026-11-01 item 7, T369).
+
+    `buy_timing`: `after_sells` (req 3 as written), `at_open` or `alternate` (V1 on
+    even XNYS-session ordinals from `alternate_start`). `alternate_start` is required
+    with `alternate`, refused otherwise; `execution_for` checks it is an XNYS session.
+    `cash_sleeve_fraction` is c in [0, 0.10]. `auction`: `none`, or `opening` (refused
+    until T376 lands; `closing` is not offered).
+    A book absent from `PaperConfig.execution` behaves as the defaults.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+
+    buy_timing: Literal["after_sells", "at_open", "alternate"] = "after_sells"
+    alternate_start: date | None = None
+    cash_sleeve_fraction: float = Field(default=0.0, ge=0, le=0.10)
+    auction: Literal["none", "opening"] = "none"
+
+    @model_validator(mode="after")
+    def _validate_execution(self) -> BookExecution:
+        if self.buy_timing == "alternate":
+            if self.alternate_start is None:
+                raise ValueError("buy_timing 'alternate' requires alternate_start")
+            # The XNYS-session check is `execution_for`'s: the calendar reads
+            # settings, so checking here would recurse at load time.
+        elif self.alternate_start is not None:
+            raise ValueError("alternate_start is only allowed with buy_timing 'alternate'")
+        if self.auction == "opening":
+            raise ValueError(
+                "auction 'opening' is not built yet: it is refused until T376 lands "
+                "(paper spec amendment 2026-11-01 item 4)"
+            )
+        return self
+
+
+_BOOK_TOKEN = re.compile(r"^[A-Za-z0-9]+$")
+
+
 class PaperConfig(BaseModel):
     """Paper-window and tracking-run settings (spec reqs 3, 7, 8, 10, 14).
 
@@ -875,6 +917,17 @@ class PaperConfig(BaseModel):
     #: fill (a broker-side bad print, a unit error) is far outside. Read at run time,
     #: never frozen, so the open windows see it.
     max_fill_price_deviation: float = Field(default=0.25, gt=0, lt=1)
+    #: Per-book buy timing (paper spec amendment 2026-11-01 item 7, T369), keyed by
+    #: book token; run-time, not frozen. A book absent from the map behaves as today.
+    execution: dict[str, BookExecution] = Field(default_factory=dict)
+
+    @field_validator("execution")
+    @classmethod
+    def _validate_execution_keys(cls, value: dict[str, BookExecution]) -> dict[str, BookExecution]:
+        bad = sorted(k for k in value if _BOOK_TOKEN.fullmatch(k) is None)
+        if bad:
+            raise ValueError(f"paper.execution keys must be book tokens ^[A-Za-z0-9]+$, got {bad}")
+        return value
 
     @field_validator("min_rebalances")
     @classmethod

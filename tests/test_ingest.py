@@ -1736,6 +1736,51 @@ def test_rebuild_index_resumes_after_the_last_partial_chunk(
     assert all(quarter > (2018, 4) for quarter in quarters)
 
 
+def test_rebuild_index_stops_at_a_chunk_boundary_when_the_disk_floor_is_crossed(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2841: the floor is read before every quarter chunk; once crossed, the next
+    chunk is not fetched or written, no ok row lands and a rerun resumes."""
+    from tradepartner import diskfloor
+
+    edgar = settings.edgar.model_copy(update={"index_first_year": 2018})
+    ingest_cfg = settings.ingest.model_copy(update={"min_free_disk_gb": 5.0})
+    configured = settings.model_copy(update={"edgar": edgar, "ingest": ingest_cfg})
+    with open_for_write(configured) as conn:
+        init_schema(conn)
+    quarters: list[tuple[int, int]] = []
+    original = ingest_module._prepare_index
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        quarters.append(kwargs["quarter_filter"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ingest_module, "_prepare_index", recording)
+    allowed = 2  # chunks that see enough free disk
+    reads: list[int] = []
+
+    def free(_path: Path) -> int:
+        reads.append(1)
+        return 10**15 if len(reads) <= allowed else 10**9
+
+    monkeypatch.setattr(diskfloor, "free_bytes", free)
+    stopped = _run(configured, source="edgar", rebuild_index=True)
+    assert [run.status for run in stopped.runs] == [FAILED]
+    assert "min_free_disk_gb" in stopped.runs[0].message
+    assert quarters == [(2018, 1), (2018, 2)]
+    with duckdb.connect(configured.store.path, read_only=True) as conn:
+        rows = conn.execute(
+            "SELECT status, chunk_cursor FROM ingestion_runs WHERE source = 'edgar_index' "
+            "ORDER BY rowid"
+        ).fetchall()
+    assert rows == [("partial", "2018Q1"), ("partial", "2018Q2")]
+
+    quarters.clear()
+    monkeypatch.setattr(diskfloor, "free_bytes", lambda _path: 10**15)
+    assert _run(configured, source="edgar", rebuild_index=True).ok
+    assert quarters[0] == (2018, 3)
+
+
 def test_index_read_proxy_releases_store_before_next_fetch(
     settings: Settings,
 ) -> None:

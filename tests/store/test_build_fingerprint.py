@@ -9,7 +9,7 @@ import pytest
 
 from tradepartner.adapters import edgar_source
 from tradepartner.config import Settings
-from tradepartner.config_edgar import EdgarConfig, MasterConfig
+from tradepartner.config_edgar import PRE_2826_STATEMENT_FACTS, EdgarConfig, MasterConfig
 from tradepartner.store import build_fingerprint as module
 from tradepartner.store import schema
 
@@ -140,3 +140,128 @@ def test_every_master_and_edgar_key_is_classified() -> None:
         "events.form4_xml_price_below",
         "events.form4_zero_price_xml_codes",
     }
+
+
+# --- additive_statement_change (T365a, #2826) ---------------------------------
+
+
+def _with_edgar(settings: Settings, **update: Any) -> Settings:
+    return settings.model_copy(update={"edgar": settings.edgar.model_copy(update=update)})
+
+
+def _row(settings: Settings, *, payload: bool = True) -> dict[str, Any]:
+    fingerprint = module.build_fingerprint(settings)
+    per_name = dict(fingerprint.per_name)
+    if not payload:
+        per_name = {k: v for k, v in per_name.items() if k not in module.STORED_STATEMENT_KEYS}
+    return {"hash": fingerprint.hash, "per_name": per_name}
+
+
+def _pre_2826() -> Settings:
+    base = Settings(_env_file=None)
+    tags = {n: base.edgar.statement_tags[n] for n in PRE_2826_STATEMENT_FACTS}
+    return _with_edgar(base, statement_tags=tags, statement_fact_units={})
+
+
+def _added(settings: Settings) -> Settings:
+    tags = {**settings.edgar.statement_tags, "net_income": ["us-gaap:NetIncomeLoss"]}
+    units = {"eps_diluted": ["USD/shares"]}
+    tags["eps_diluted"] = ["us-gaap:EarningsPerShareDiluted"]
+    return _with_edgar(settings, statement_tags=tags, statement_fact_units=units)
+
+
+def test_the_run_row_payload_holds_both_statement_keys() -> None:
+    settings = Settings(_env_file=None)
+    per_name = module.build_fingerprint(settings).per_name
+    assert per_name["edgar.statement_tags"] == settings.edgar.statement_tags
+    assert per_name["edgar.statement_fact_units"] == settings.edgar.statement_fact_units
+
+
+def test_added_names_are_additive_against_a_row_with_the_payload() -> None:
+    row = _row(_pre_2826())
+    result = module.additive_statement_change(_added(_pre_2826()), row)
+    assert result.ok
+    assert result.added == ("net_income", "eps_diluted")
+
+
+def test_a_row_without_the_payload_reads_against_pre_2826_names() -> None:
+    row = _row(_pre_2826(), payload=False)
+    result = module.additive_statement_change(_added(_pre_2826()), row)
+    assert result.ok
+    assert result.added == ("net_income", "eps_diluted")
+
+
+def test_a_row_without_the_payload_refuses_when_the_base_is_not_the_eight() -> None:
+    wider = _added(_pre_2826())
+    assert not module.additive_statement_change(wider, _row(wider, payload=False)).ok
+
+
+def test_a_chained_addition_uses_the_stored_names_as_base() -> None:
+    first = _added(_pre_2826())
+    tags = {**first.edgar.statement_tags, "cash": ["us-gaap:CashAndCashEquivalentsAtCarryingValue"]}
+    second = _with_edgar(first, statement_tags=tags)
+    result = module.additive_statement_change(second, _row(first))
+    assert result.added == ("cash",)
+
+
+def test_no_change_is_ok_with_nothing_added() -> None:
+    settings = _pre_2826()
+    result = module.additive_statement_change(settings, _row(settings))
+    assert result.ok
+    assert result.added == ()
+
+
+def _refused(change: Settings, row: dict[str, Any]) -> bool:
+    return not module.additive_statement_change(change, row).ok
+
+
+def test_a_changed_list_unit_or_form_is_not_additive() -> None:
+    base = _pre_2826()
+    row = _row(base)
+    tags = {**base.edgar.statement_tags, "revenue": ["us-gaap:Revenues", "us-gaap:Other"]}
+    assert _refused(_with_edgar(base, statement_tags=tags), row)
+    assert _refused(_with_edgar(base, statement_fact_units={"revenue": ["EUR"]}), row)
+    assert _refused(_with_edgar(base, statement_forms=[*base.edgar.statement_forms, "8-K"]), row)
+    assert _refused(_with_edgar(base, statement_units=["USD", "EUR"]), row)
+
+
+def test_a_removed_base_name_is_not_additive() -> None:
+    base = _pre_2826()
+    tags = dict(base.edgar.statement_tags)
+    del tags["revenue"]
+    assert _refused(_with_edgar(base, statement_tags=tags), _row(base))
+
+
+def test_a_changed_unit_on_a_base_name_alongside_an_addition_is_not_additive() -> None:
+    base = _pre_2826()
+    row = _row(base)
+    changed = _added(base)
+    changed = _with_edgar(changed, statement_fact_units={"revenue": ["EUR"]})
+    assert _refused(changed, row)
+
+
+def test_any_other_hashed_key_is_not_additive() -> None:
+    base = _pre_2826()
+    row = _row(base)
+    for key in module.HASHED_SETTINGS_KEYS:
+        if key in module.STORED_STATEMENT_KEYS:
+            continue
+        assert _refused(_added(_changed(base, key)), row), key
+
+
+def test_statement_version_cache_versions_rules_and_schema_are_not_additive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _pre_2826()
+    row = _row(base)
+    change = _added(base)
+    for name in module.CACHE_VERSION_NAMES:
+        with monkeypatch.context() as patch:
+            patch.setattr(edgar_source, name, getattr(edgar_source, name) + 1)
+            assert _refused(change, row), name
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "BUILD_RULES_VERSION", module.BUILD_RULES_VERSION + 1)
+        assert _refused(change, row)
+    with monkeypatch.context() as patch:
+        patch.setattr(schema, "CURRENT_SCHEMA_VERSION", schema.CURRENT_SCHEMA_VERSION + 1)
+        assert _refused(change, row)
