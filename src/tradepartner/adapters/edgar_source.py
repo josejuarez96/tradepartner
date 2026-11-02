@@ -162,7 +162,8 @@ recorded once and is absent for both caches. The parsed cache
 `parse_statement_facts` yields with no stamps (unfiltered, unstamped) and
 the conflicts, keyed by the CIK's latest stamped cover-form accession (the
 accession a trailing payload reached, so the next run re-parses it) and a
-digest of `edgar.statement_tags` and `statement_units`. Every read stamps
+digest of `edgar.statement_tags`, `statement_units` and, when set,
+`statement_fact_units`. Every read stamps
 from `_load_stamps`: an accession with no record is emitted with
 `accepted_at = None`, form `""`; one whose form is outside
 `edgar.statement_forms` is dropped; one settled unstampable is dropped and
