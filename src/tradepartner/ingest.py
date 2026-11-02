@@ -948,18 +948,26 @@ def ingest_session(
 
     runs: list[SourceRun] = []
     for name in ("edgar", "alpaca") if source == "all" else (source,):
-        run = _run_source(
-            name,
-            work[name],
-            settings,
-            now,
-            clock,
-            cursor,
-            dry_run,
-            prepare=prepare[name],
-            after_commit=after_commit[name],
-            recover=recover_alpaca if name == "alpaca" else None,
-        )
+        try:
+            run = _run_source(
+                name,
+                work[name],
+                settings,
+                now,
+                clock,
+                cursor,
+                dry_run,
+                prepare=prepare[name],
+                after_commit=after_commit[name],
+                recover=recover_alpaca if name == "alpaca" else None,
+            )
+        finally:
+            if name == "edgar":
+                # #2822: the write step's reopened index handle ends with the
+                # chunk, so the alpaca chunk's read-only price read can open.
+                release = getattr(_unwrap(filings), "release_index", None)
+                if callable(release):
+                    release()
         runs.append(run)
         if run.status == LOCKED:  # the store, not the source: the next would wait out the same lock
             break

@@ -2363,6 +2363,46 @@ def test_prefetch_releases_the_source_index_after_the_fetch_pass(
     assert released == [True] and recorded.frozen
 
 
+def test_repair_index_handle_ends_with_the_edgar_chunk_so_prices_run(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2822 end to end: `ingest --source all --rebuild-classifications` with
+    the real EdgarFilingSource on a seeded index. The edgar chunk reads the
+    table (fetch pass and write step), then releases its read-write handle,
+    so the alpaca chunk's read-only price read runs in the same process."""
+    assert _run(settings).exit_code == 0  # a stored universe for the prices
+    with duckdb.connect(settings.store.path) as conn:
+        conn.execute(
+            "INSERT INTO ingestion_runs (run_id, source, started_at, status, mode) "
+            "VALUES ('seed', 'edgar_index', ?, 'ok', 'rebuild')",
+            [NOW + timedelta(minutes=1)],
+        )
+    real = settings.model_copy(
+        update={
+            "sec_edgar_user_agent": "TradePartner test-agent test@example.com",
+            "edgar": settings.edgar.model_copy(update={"cache_dir": str(tmp_path / "edgar")}),
+        }
+    )
+    later = NOW + timedelta(minutes=2)
+    source = EdgarFilingSource(real, clock=lambda: later, prefer_stored_index=True)
+    monkeypatch.setattr(source, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    monkeypatch.setattr(source, "companies_snapshot", lambda: [])
+    prices = _Prices()
+    result = ingest_session(
+        real,
+        prices=prices,
+        filings=source,
+        clock=lambda: later,
+        rebuild_classifications=True,
+    )
+    assert [(run.source, run.status) for run in result.runs] == [
+        ("edgar", OK),
+        ("alpaca", OK),
+    ], [run.message for run in result.runs]
+    assert any(call[0] == "bars" for call in prices.calls)
+    assert source._owned_index_conn is None  # nothing outlives the chunk
+
+
 def test_filename_evidence_is_fetched_before_freeze_only_when_enabled(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:

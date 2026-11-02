@@ -902,6 +902,9 @@ class EdgarFilingSource(FilingSource):
         if self._index_released:
             # Reopen the index this run already checked and read; the seed
             # check is not repeated, so the run cannot switch readers midway.
+            # The new handle reads committed rows only, never the writer's
+            # open transaction; a repair run writes no filing_index row, so
+            # it reads the rows the fetch pass read.
             conn = self._open_index(Path(self._settings.store.path))
             memo = self._filing_index_entries
             self.use_index(conn)
