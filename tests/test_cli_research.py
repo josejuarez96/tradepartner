@@ -15,10 +15,12 @@ a fixture hypothesis in family `momentum` with holdout `[2024-01-01,
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import signal
 from collections.abc import Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1313,3 +1315,126 @@ def test_no_forbidden_flag_or_subcommand_exists() -> None:
 def test_forbidden_invocations_fail_as_usage_errors(args: list[str]) -> None:
     assert _cli(*args).exit_code == 2
     assert _count("research_runs") == 0
+
+
+# --- exposure record, exposures (plan T357; amendment 2026-10-31, #2723) --------------
+
+READ_AT = datetime(2026, 10, 31, 20, 0, tzinfo=UTC)
+KILL_URL = "https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548103186"
+DESK_READ = "docs/research/2026-10-31-cash-profitability-long-only-desk-read.md"
+
+
+def _exposure_args(
+    tmp_path: Path, candidate: str = "#2689", read_at: str = "2026-10-31T20:00:00+00:00"
+) -> list[str]:
+    """A valid `store` launch in `momentum`; the probe's mtime is an hour before `read_at`."""
+    probe = tmp_path / f"probe-{candidate.strip('#')}.py"
+    probe.write_text("print('probe')\n", encoding="utf-8")
+    before = (READ_AT - timedelta(hours=1)).timestamp()
+    os.utime(probe, (before, before))
+    kill = tmp_path / "kill.md"
+    kill.write_text("kill line: fail if t < 2\n", encoding="utf-8")
+    return [
+        "exposure",
+        "record",
+        "--candidate",
+        candidate,
+        "--source",
+        "store",
+        "--family",
+        "momentum",
+        "--kill-line-url",
+        KILL_URL,
+        "--kill-line-file",
+        str(kill),
+        "--kill-line-posted-at",
+        "2026-10-31T19:29:02+00:00",
+        "--probe",
+        str(probe),
+        "--probe-sha256",
+        sha256(probe.read_bytes()).hexdigest(),
+        "--read-at",
+        read_at,
+        "--window-start",
+        "2020-08-31",
+        "--window-end",
+        "2023-12-29",
+        "--pin",
+        "store_max_ingested_at=2026-10-31T04:41:00+00:00",
+        "--configurations",
+        "1",
+        "--verdict",
+        "fail",
+        "--desk-read",
+        DESK_READ,
+    ]
+
+
+def test_exposure_record_round_trip(tmp_path: Path) -> None:
+    out = _cli(*_exposure_args(tmp_path))
+    assert out.exit_code == 0, out.output
+    exposure_id = _first_int(out, "exposure")
+    rows = _rows(
+        "SELECT exposure_id, candidate_ref, family, probe_verified FROM research_exposures"
+    )
+    assert rows == [(exposure_id, "#2689", "momentum", True)]
+    listed = _cli("exposures", "--include-synthetic")
+    assert listed.exit_code == 0, listed.output
+    assert "#2689" in listed.stdout and "momentum" in listed.stdout
+
+
+def test_exposure_record_twice_prints_the_same_id(tmp_path: Path) -> None:
+    first = _first_int(_cli(*_exposure_args(tmp_path)), "exposure")
+    second = _first_int(_cli(*_exposure_args(tmp_path)), "exposure")
+    assert first == second
+    assert _count("research_exposures") == 1
+
+
+def test_exposure_record_probe_hash_mismatch_exits_2_with_no_row(tmp_path: Path) -> None:
+    args = _exposure_args(tmp_path)
+    args[args.index("--probe-sha256") + 1] = "0" * 64
+    out = _cli(*args)
+    assert out.exit_code == 2, out.output
+    assert "refused" in out.output
+    assert _count("research_exposures") == 0
+
+
+def test_exposure_record_naive_read_at_exits_2_with_no_row(tmp_path: Path) -> None:
+    out = _cli(*_exposure_args(tmp_path, read_at="2026-10-31T20:00:00"))
+    assert out.exit_code == 2, out.output
+    assert "--read-at" in out.output
+    assert _count("research_exposures") == 0
+
+
+def test_exposure_record_naive_kill_line_time_and_bad_pin_exit_2(tmp_path: Path) -> None:
+    args = _exposure_args(tmp_path)
+    args[args.index("--kill-line-posted-at") + 1] = "2026-10-31T19:29:02"
+    assert _cli(*args).exit_code == 2
+    args = _exposure_args(tmp_path)
+    args[args.index("--pin") + 1] = "no-equals-sign"
+    assert _cli(*args).exit_code == 2
+    assert _count("research_exposures") == 0
+
+
+def test_exposures_candidates_since_lists_first_read_at(tmp_path: Path) -> None:
+    _cli(*_exposure_args(tmp_path, "#2689", "2026-10-31T20:00:00+00:00"))
+    _cli(*_exposure_args(tmp_path, "#2689", "2026-10-31T21:00:00+00:00"))
+    _cli(*_exposure_args(tmp_path, "#2701", "2026-10-29T20:00:00+00:00"))
+    out = _cli("exposures", "--candidates", "--since", "2026-10-30")
+    assert out.exit_code == 0, out.output
+    lines = [ln for ln in out.stdout.splitlines() if ln.startswith("#")]
+    assert len(lines) == 1, out.stdout
+    assert lines[0].startswith("#2689") and "2026-10-31T20:00:00+00:00" in lines[0]
+    assert _cli("exposures", "--candidates").exit_code == 2
+
+
+def test_exposure_has_no_edit_delete_or_withdraw_subcommand() -> None:
+    group = typer.main.get_command(cli.make_app()).commands["exposure"]  # type: ignore[attr-defined]
+    assert sorted(group.commands) == ["record"]
+
+
+def test_exposure_output_has_no_secret_shaped_string(tmp_path: Path) -> None:
+    args = _exposure_args(tmp_path)
+    args[args.index("--candidate") + 1] = f"cand-{ALPACA_KEY}"
+    out = _cli(*args)  # _cli asserts the scrub found nothing in the output
+    assert ALPACA_KEY not in out.output
