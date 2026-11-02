@@ -1998,9 +1998,12 @@ def _propose_index(
     if isinstance(source, EdgarFilingSource):
         quarters = _index_quarters(settings.edgar.index_first_year, now)
         with open_read_only(settings, retry=True) as conn:
+            # #2873: a statement backfill's `ok` row reads no index; its finish
+            # time is not the last time the quarters were looked at.
             last = conn.execute(
                 "SELECT finished_at FROM ingestion_runs WHERE source = 'edgar_index' "
-                "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
+                "AND status = 'ok' AND mode <> ? ORDER BY rowid DESC LIMIT 1",
+                [STATEMENT_BACKFILL],
             ).fetchone()
         for year, number in quarters:
             if quarter_filter is not None and (year, number) > quarter_filter:
@@ -3090,8 +3093,8 @@ def _statement_backfill_start(
         # Outside the hash, so T365a lets it through; the final row would absorb
         # it and the next nightly would never touch its CIKs.
         return _BackfillStart(
-            "a per-name list changed since the last ok index row; "
-            "apply it in its own nightly, not with the backfill"
+            "a per-name list changed since the last ok index row; revert it "
+            "before the nightly, run the backfill, then apply it in its own nightly"
         )
     digest = statement_tags_digest(settings)
     through: str | None = None
@@ -3192,7 +3195,13 @@ def statement_backfill_session(
         return IngestResult(
             (SourceRun("edgar_index", OK, 0, STATEMENT_BACKFILL, "no added statement names"),)
         )
+    from tradepartner.adapters.edgar_source import EdgarFilingSource
+
     source = _unwrap(filings)
+    if isinstance(source, EdgarFilingSource) and not source._statement_backfill:
+        # #2873: only the adapter's local-caches mode is guaranteed to make no
+        # request; any other EDGAR adapter would fetch.
+        raise ValueError("statement_backfill needs the EDGAR adapter in statement-backfill mode")
     remaining = [cik for cik in ciks if start.through is None or cik > start.through]
     size = settings.edgar.statement_backfill_chunk_ciks
     total = StatementCounts()
