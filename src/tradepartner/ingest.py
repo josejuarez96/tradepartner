@@ -4554,6 +4554,10 @@ def _chain_candidate_clause(candidates: Sequence[ChainCandidate]) -> str:
     return f"; chain_candidates: {len(candidates)}: {named}"
 
 
+#: How many conflicting CIKs the run message names (#2929); the count is whole.
+_FILENAME_CONFLICTS_SHOWN = 5
+
+
 def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource) -> str:
     """The #1597 verdict and Form 25 counts, omitted with the switch off."""
     if not master.filename_enabled:
@@ -4614,10 +4618,6 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
         more = len(conflicted) - _FILENAME_CONFLICTS_SHOWN
         text += f"; filename_conflict_ciks: {shown}" + (f" (+{more})" if more > 0 else "")
     return text
-
-
-#: How many conflicting CIKs the run message names (#2929); the count is whole.
-_FILENAME_CONFLICTS_SHOWN = 5
 
 
 def _held_ids(conn: duckdb.DuckDBPyConnection, ids: Sequence[str]) -> frozenset[str]:
