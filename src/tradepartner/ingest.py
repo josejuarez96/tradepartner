@@ -1507,7 +1507,8 @@ def _unwrap(filings: FilingSource) -> FilingSource:
 class Unjudged:
     """What a master check must not judge after a fetch pass (#859): the
     CIKs with a filing that failed or was quarantined this run, and how many
-    failures name no accession that maps to a CIK."""
+    failures name no accession that maps to a CIK. A CIK whose filename
+    fetch failed past the retries this run (#2932) is unjudged too."""
 
     ciks: frozenset[str]
     unmapped: int
@@ -1525,10 +1526,12 @@ def _unjudged_ciks(filings: FilingSource) -> Unjudged:
     pending: Mapping[str, Any] = getattr(source, "_pending_failures", {})
     accessions = set(pending) | set(getattr(source, "_quarantined_this_run", set()))
     unmapped = int(getattr(source, "_fsn_extraction_failures_this_run", 0))
+    # #2932: a CIK failed closed on a filename fetch has no answer to judge.
+    fetch_failed = set(getattr(source, "filename_fetch_failed_ciks", ()))
     if not accessions:
-        return Unjudged(frozenset(), unmapped)
+        return Unjudged(frozenset(fetch_failed), unmapped)
     by_accession = {entry.accession: entry.cik for entry in filings.filing_index(None)}
-    ciks = {by_accession[a] for a in accessions if a in by_accession}
+    ciks = {by_accession[a] for a in accessions if a in by_accession} | fetch_failed
     unmapped += sum(1 for a in accessions if a not in by_accession)
     return Unjudged(frozenset(ciks), unmapped)
 

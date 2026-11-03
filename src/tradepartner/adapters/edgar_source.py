@@ -761,7 +761,8 @@ class EdgarFilingSource(FilingSource):
         self.filename_incomplete_ciks: set[str] = set()
         # #2932: CIKs whose filename fetch failed past the retries (a 5xx, a
         # timeout, a connection error), each with its first error, in the
-        # order asked; and every CIK asked, `check_failures`' denominator.
+        # order asked; and every CIK that sent a filename fetch this run (a
+        # fully cached CIK sends none), `check_failures`' denominator.
         self.filename_fetch_failed_ciks: dict[str, str] = {}
         self._filename_ciks_asked: set[str] = set()
         # T11h: the failure policy.
@@ -3573,7 +3574,6 @@ class EdgarFilingSource(FilingSource):
         if not self._settings.edgar.filename_listings:
             return []
         _validate_cik(cik)
-        self._filename_ciks_asked.add(cik)
         self._ensure_fsn()
         edgar_settings = self._settings.edgar
         stamps = self._read_stamps(cik)
@@ -3607,6 +3607,12 @@ class EdgarFilingSource(FilingSource):
         if first_cover is not None and first_cover.accepted_at is not None:
             jobs.append((first_cover, False))
         jobs.extend((record, False) for record in form25s if self._own_form25(cik, record))
+        if any(
+            _filename_cache_hit(cache, record, read_document) is None
+            and not self._is_quarantined(record.accession)
+            for record, read_document in jobs
+        ):
+            self._filename_ciks_asked.add(cik)  # #2932: the share's denominator
         pool: ThreadPoolExecutor | None = None
         prefetched: dict[tuple[str, bool], Future[_FilenameExtract]] = {}
         listings: list[FilenameListing] = []
@@ -4285,8 +4291,9 @@ class EdgarFilingSource(FilingSource):
 
     def _check_filename_fetches(self, reasons: list[str]) -> None:
         """#2932: the run fails when more than
-        `edgar.filename_fetch_max_failed_share` of the CIKs `filename_listings`
-        was asked for failed their fetch past the retries (an outage, never
+        `edgar.filename_fetch_max_failed_share` of the CIKs that sent a
+        filename fetch this run (a fully cached CIK is not counted, so a
+        mostly cached build cannot dilute an outage) failed past the retries (an outage, never
         hidden as a few incomplete CIKs); the first CIKs are named."""
         failed = self.filename_fetch_failed_ciks
         asked = len(self._filename_ciks_asked)

@@ -6808,6 +6808,16 @@ def test_filename_counts_name_the_conflicting_ciks() -> None:
     assert "filename_conflict_ciks" not in text
 
 
+def test_a_filename_fetch_failed_cik_is_not_judged() -> None:
+    # #2932 (quant-auditor): a CIK failed closed on a filename fetch has no
+    # answer, so the master check and `master-retract` must not judge it.
+    from types import SimpleNamespace
+
+    source = SimpleNamespace(filename_fetch_failed_ciks={"0000320193": "HTTPStatusError: 503"})
+    unjudged = ingest_module._unjudged_ciks(source)  # type: ignore[arg-type]
+    assert unjudged.ciks == frozenset({"0000320193"})
+
+
 def test_filename_counts_name_the_fetch_failed_ciks() -> None:
     # #2932: a CIK whose filename fetch failed past the retries is failed
     # closed; the run message counts it and names the first few CIKs.

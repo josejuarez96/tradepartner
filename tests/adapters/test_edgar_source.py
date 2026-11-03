@@ -3758,6 +3758,18 @@ def test_filename_fetch_failures_past_the_share_fail_the_run(
         source.check_failures()
 
 
+def test_filename_fetch_share_counts_only_ciks_that_sent_a_fetch(tmp_path: Path) -> None:
+    """A fully cached CIK sends no filename request and is not in the share's
+    denominator, so a mostly cached build cannot dilute an outage."""
+    router = _fn_router()
+    warm = _fn_source(tmp_path, router)
+    warm.filename_listings(_FN_CIK)
+    assert warm._filename_ciks_asked == {_FN_CIK}
+    cached = _fn_source(tmp_path, router)
+    cached.filename_listings(_FN_CIK)
+    assert cached._filename_ciks_asked == set()
+
+
 def _done(result: Any = None, error: BaseException | None = None) -> Any:
     future: Any = edgar_source_module.Future()
     if error is None:
