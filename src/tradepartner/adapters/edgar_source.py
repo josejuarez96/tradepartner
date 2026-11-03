@@ -276,6 +276,7 @@ holds the full list whenever the check fails with them, dry run or not
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import enum
 import fcntl
 import gzip
@@ -285,11 +286,15 @@ import json
 import math
 import re
 import shutil
+import threading
 import zipfile
 import zlib
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Set as AbstractSet
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from functools import partial
@@ -606,6 +611,9 @@ class EdgarFilingSource(FilingSource):
         self._stamps_missing: dict[str, int] = {}
         self.statement_absent_carried = 0
         self._absent_carried: set[str] = set()
+        # #2932: the request hooks and the filename fetch counts also run on
+        # `filename_listings`' pool threads, so their increments take this lock.
+        self._count_lock = threading.Lock()
         self._client = client or httpx.Client(timeout=settings.edgar.request_timeout_seconds)
         hooks = self._client.event_hooks
         hooks["request"] = [*hooks.get("request", []), self._count]
@@ -656,6 +664,13 @@ class EdgarFilingSource(FilingSource):
         self.skipped_filers = 0
         self.unstamped_filings: list[UnstampedFiling] = []
         self._filing_index_entries: tuple[FilingIndexEntry, ...] | None = None
+        # #2920: `_filing_index_entries` grouped by CIK, keyed to the tuple it
+        # groups so a rebuilt index is never answered from an older one.
+        self._entries_by_cik: (
+            tuple[tuple[FilingIndexEntry, ...], dict[str, list[FilingIndexEntry]]] | None
+        ) = None
+        # #2920: the bound table's reads, made once per binding (`use_index`).
+        self._stored: _StoredReads = _StoredReads()
         self._index_conn: duckdb.DuckDBPyConnection | None = None
         self._owned_index_conn: duckdb.DuckDBPyConnection | None = None
         self._index_checked = False
@@ -744,6 +759,12 @@ class EdgarFilingSource(FilingSource):
         # delisting cache. A caller must not derive a "no other reading" verdict
         # (`single_reading`) for such a CIK until a complete run.
         self.filename_incomplete_ciks: set[str] = set()
+        # #2932: CIKs whose filename fetch failed past the retries (a 5xx, a
+        # timeout, a connection error), each with its first error, in the
+        # order asked; and every CIK that sent a filename fetch this run (a
+        # fully cached CIK sends none), `check_failures`' denominator.
+        self.filename_fetch_failed_ciks: dict[str, str] = {}
+        self._filename_ciks_asked: set[str] = set()
         # T11h: the failure policy.
         self.failed_filings = 0
         self.quarantined = 0
@@ -808,6 +829,10 @@ class EdgarFilingSource(FilingSource):
         self._fsn_extraction_failures_this_run = 0
 
     def _count(self, request: httpx.Request) -> None:
+        with self._count_lock:
+            self._count_locked(request)
+
+    def _count_locked(self, request: httpx.Request) -> None:
         self.requests += 1
         if not self._sec_forms_request_active:
             return
@@ -828,7 +853,8 @@ class EdgarFilingSource(FilingSource):
         if response.status_code == httpx.codes.NOT_MODIFIED and response.request.url.path.endswith(
             ".zip"
         ):
-            self.bulk_not_modified += 1
+            with self._count_lock:
+                self.bulk_not_modified += 1
 
     def _sec_header(self, cik: str, accession: str, size: int) -> str:
         key = (cik, accession, size)
@@ -876,6 +902,7 @@ class EdgarFilingSource(FilingSource):
         self._index_new_rows = tuple(new_rows)
         self._index_touched_ciks = touched_ciks
         self._filing_index_entries = None
+        self._stored = _StoredReads()
 
     def close(self) -> None:
         """Release a store connection opened for an explicit full repair."""
@@ -927,9 +954,10 @@ class EdgarFilingSource(FilingSource):
             # open transaction; a repair run writes no filing_index row, so
             # it reads the rows the fetch pass read.
             conn = self._open_index(Path(self._settings.store.path))
-            memo = self._filing_index_entries
+            memo, reads = self._filing_index_entries, self._stored
             self.use_index(conn)
-            self._filing_index_entries = memo  # same table, same clock
+            self._filing_index_entries, self._stored = memo, reads  # same table, same clock
+            reads.new_by_cik = None  # regrouped from this binding's (empty) new rows
             self._owned_index_conn = conn
             return
         if self._index_checked or not self._prefer_stored_index:
@@ -974,18 +1002,20 @@ class EdgarFilingSource(FilingSource):
     ) -> list[stored_index.FilingRow | stored_index.Listing]:
         if self._index_conn is None:
             return []
-        stored_rows = (
-            stored_index.first_known(self._index_conn, self._now(), cik=cik)
-            if first
-            else stored_index.by_cik(self._index_conn, cik, self._now())
-        )
         first_day = date(self._settings.edgar.index_first_year, 1, 1)
-        stored_rows = [row for row in stored_rows if row.listed_on >= first_day]
+        if first:
+            stored_rows = self._first_known_rows(cik)
+        else:
+            stored_rows = [
+                row
+                for row in stored_index.by_cik(self._index_conn, cik, self._now())
+                if row.listed_on >= first_day
+            ]
         by_key: dict[tuple[str, str], stored_index.FilingRow | stored_index.Listing] = {
             (row.cik, row.accession): row for row in stored_rows
         }
-        for row in self._index_new_rows:
-            if row.cik == cik and self._new_index_row_visible(row) and row.listed_on >= first_day:
+        for row in self._new_rows_of(cik):
+            if self._new_index_row_visible(row) and row.listed_on >= first_day:
                 key = (row.cik, row.accession)
                 if first:
                     by_key.setdefault(key, row)
@@ -994,6 +1024,51 @@ class EdgarFilingSource(FilingSource):
                 ):
                     by_key[key] = row
         return list(by_key.values())
+
+    def _first_known_rows(self, cik: str) -> list[stored_index.FilingRow]:
+        """One CIK's first-known table rows from `listed_on` >= the first year.
+
+        #2920: callers ask once per issuer CIK (~58k), and each `cik=` read
+        scans the whole table, so the first ask reads every issuer CIK (or,
+        when the binding names its touched CIKs, every touched issuer) in one
+        scan. A CIK outside that set is read alone, as before.
+        """
+        reads = self._stored
+        if cik not in reads.loaded:
+            touched = self._index_touched_ciks
+            if touched is not None and cik not in touched:
+                self._load_first_known({cik})
+            else:
+                issuers = self._stored_issuer_ciks()
+                wanted = issuers & touched if touched is not None else issuers
+                self._load_first_known((wanted | {cik}) - reads.loaded)
+        return reads.first_rows.get(cik, [])
+
+    def _load_first_known(self, ciks: AbstractSet[str]) -> None:
+        """Read `ciks`' first-known rows into this binding's reads, one scan."""
+        assert self._index_conn is not None
+        if not ciks:
+            return
+        if len(ciks) == 1:
+            (only,) = ciks
+            rows = stored_index.first_known(self._index_conn, self._now(), cik=only)
+        else:
+            rows = stored_index.first_known(self._index_conn, self._now(), ciks=ciks)
+        first_day = date(self._settings.edgar.index_first_year, 1, 1)
+        grouped = self._stored.first_rows
+        for row in rows:
+            if row.listed_on >= first_day:
+                grouped.setdefault(row.cik, []).append(row)
+        self._stored.loaded |= ciks
+
+    def _new_rows_of(self, cik: str) -> list[stored_index.FilingRow | stored_index.Listing]:
+        """This binding's uncommitted rows for `cik`, grouped once (#2920)."""
+        reads = self._stored
+        if reads.new_by_cik is None:
+            reads.new_by_cik = {}
+            for row in self._index_new_rows:
+                reads.new_by_cik.setdefault(row.cik, []).append(row)
+        return reads.new_by_cik.get(cik, [])
 
     def _read_stamps(self, cik: str) -> dict[str, SubmissionRecord]:
         """Use cache metadata but only the table's form and acceptance stamp."""
@@ -1035,14 +1110,19 @@ class EdgarFilingSource(FilingSource):
         times; unstamped rows go to `.unstamped_filings`, never the result."""
         if since is not None:
             since = ensure_tz_aware_utc(since, field_name="since")
+        entries = self._all_filing_index_entries()
+        if since is None:
+            return list(entries)
+        return [e for e in entries if e.accepted_at >= since]
+
+    def _all_filing_index_entries(self) -> tuple[FilingIndexEntry, ...]:
+        """The full issuer history, built once per index (#2920: read-only
+        callers take this tuple, never a copy of millions of entries)."""
         self._maybe_use_stored_index()
         if self._filing_index_entries is not None:
-            return [
-                e for e in self._filing_index_entries if since is None or e.accepted_at >= since
-            ]
+            return self._filing_index_entries
         if self._index_conn is not None:
-            stored_entries = self._stored_filing_index()
-            return [e for e in stored_entries if since is None or e.accepted_at >= since]
+            return self._stored_filing_index()
         self.unstamped_filings, self._open_quarters = [], {}
         start = (self._settings.edgar.index_first_year, 1)
         last = quarter_of(self._now())
@@ -1111,12 +1191,13 @@ class EdgarFilingSource(FilingSource):
         self._filing_index_ran = True
         self._filing_index_entries = tuple(entries)
         del entries
-        return [e for e in self._filing_index_entries if since is None or e.accepted_at >= since]
+        return self._filing_index_entries
 
-    def _stored_filing_index(self) -> list[FilingIndexEntry]:
+    def _stored_filing_index(self) -> tuple[FilingIndexEntry, ...]:
         """Full issuer history from the table under the quarterly walk's rules."""
         assert self._index_conn is not None
         issuers = self._stored_issuer_ciks()
+        self._load_first_known(issuers - self._stored.loaded)  # #2920: one scan
         entries = [entry for cik in sorted(issuers) for entry in self._issuer_entries(cik)]
         entries.sort(key=lambda entry: (entry.accepted_at, entry.accession, entry.cik))
         self.unstamped_filings = [
@@ -1126,10 +1207,17 @@ class EdgarFilingSource(FilingSource):
         ]
         self._filing_index_entries = tuple(entries)
         self._filing_index_ran = True
-        return entries
+        return self._filing_index_entries
 
-    def _stored_issuer_ciks(self) -> set[str]:
-        """Apply the quarterly walk's issuer and delisting-subject rule."""
+    def _stored_issuer_ciks(self) -> frozenset[str]:
+        """Apply the quarterly walk's issuer and delisting-subject rule, once
+        per binding (#2920)."""
+        assert self._index_conn is not None
+        if self._stored.issuers is None:
+            self._stored.issuers = frozenset(self._read_stored_issuer_ciks())
+        return self._stored.issuers
+
+    def _read_stored_issuer_ciks(self) -> set[str]:
         assert self._index_conn is not None
         issuer_forms = set(self._settings.master.issuer_forms) - _DELISTING_FORMS
         first_day = date(self._settings.edgar.index_first_year, 1, 1)
@@ -1166,33 +1254,59 @@ class EdgarFilingSource(FilingSource):
     def _pending_rows(
         self, forms: Collection[str] | None = None, *, cik: str | None = None
     ) -> list[UnstampedFiling]:
+        """Visible pending rows, read once per binding (#2920) and filtered here."""
         assert self._index_conn is not None
-        predicate = " AND cik = ?" if cik is not None else ""
-        params: list[date | str] = [
-            self._now().astimezone(_EASTERN).date(),
-            date(self._settings.edgar.index_first_year, 1, 1),
-        ]
-        if cik is not None:
-            params.append(cik)
-        rows = self._index_conn.execute(
-            "SELECT cik, company_name, form, accession, filed_on FROM filing_index_pending "
-            f"WHERE listed_on <= ? AND listed_on >= ?{predicate} "
-            "ORDER BY listed_on, list_position NULLS LAST, cik",
-            params,
-        ).fetchall()
+        if self._stored.pending is None:
+            rows = self._index_conn.execute(
+                "SELECT cik, company_name, form, accession, filed_on FROM filing_index_pending "
+                "WHERE listed_on <= ? AND listed_on >= ? "
+                "ORDER BY listed_on, list_position NULLS LAST, cik",
+                [
+                    self._now().astimezone(_EASTERN).date(),
+                    date(self._settings.edgar.index_first_year, 1, 1),
+                ],
+            ).fetchall()
+            self._stored.pending = tuple(
+                UnstampedFiling(row_cik, name, form, accession, filed_on)
+                for row_cik, name, form, accession, filed_on in rows
+            )
         return [
-            UnstampedFiling(cik, name, form, accession, filed_on)
-            for cik, name, form, accession, filed_on in rows
-            if forms is None or form in forms
+            row
+            for row in self._stored.pending
+            if (forms is None or row.form in forms) and (cik is None or row.cik == cik)
         ]
+
+    def _table_ciks_of(self, accession: str) -> frozenset[str]:
+        """The CIKs `accession_listing_order` lists for an exchange-form or
+        pending accession, every such accession read in one scan (#2920)."""
+        assert self._index_conn is not None
+        reads = self._stored
+        if reads.accession_ciks is None:
+            reads.accession_ciks = dict(
+                stored_index.ciks_by_accession(
+                    self._index_conn,
+                    self._now(),
+                    forms=_EXCHANGE_FORMS,
+                    accessions={row.accession for row in self._pending_rows(_EXCHANGE_FORMS)},
+                )
+            )
+        found = reads.accession_ciks.get(accession)
+        if found is None:  # e.g. only this run's uncommitted listing: read alone, once
+            found = frozenset(
+                row.cik
+                for row in stored_index.accession_listing_order(
+                    self._index_conn, accession, self._now()
+                )
+            )
+            reads.accession_ciks[accession] = found
+        return found
 
     def _pending_exchange_copy(self, row: UnstampedFiling) -> bool:
         if row.form not in _EXCHANGE_FORMS or not _filed_by(row):
             return False
         assert self._index_conn is not None
-        known = stored_index.accession_listing_order(self._index_conn, row.accession, self._now())
         pending = self._pending_rows(_EXCHANGE_FORMS)
-        ciks = {r.cik for r in known if r.accession == row.accession}
+        ciks = set(self._table_ciks_of(row.accession))
         ciks.update(r.cik for r in pending if r.accession == row.accession)
         return len(ciks) > 1
 
@@ -1200,12 +1314,7 @@ class EdgarFilingSource(FilingSource):
         if row.form not in _EXCHANGE_FORMS or not _filed_by(row):
             return False
         assert self._index_conn is not None
-        ciks = {
-            listed.cik
-            for listed in stored_index.accession_listing_order(
-                self._index_conn, row.accession, self._now()
-            )
-        }
+        ciks = set(self._table_ciks_of(row.accession))
         ciks.update(
             listed.cik
             for listed in self._index_new_rows
@@ -1214,6 +1323,11 @@ class EdgarFilingSource(FilingSource):
         return len(ciks) > 1
 
     def _is_issuer_cik(self, cik: str) -> bool:
+        # #2920: the per-binding issuer set holds every CIK this rule can
+        # accept (it reads any revision, this the first-known one), so a CIK
+        # outside it is answered without reading its rows.
+        if cik not in self._stored_issuer_ciks():
+            return False
         issuer_forms = set(self._settings.master.issuer_forms) - _DELISTING_FORMS
         return any(
             row.form in issuer_forms or (row.form in _DELISTING_FORMS and not _filed_by(row))
@@ -1294,14 +1408,22 @@ class EdgarFilingSource(FilingSource):
         """Read one CIK's complete visible history from the table when bound."""
         self._maybe_use_stored_index()
         if self._index_conn is None:
-            return [entry for entry in self.filing_index() if entry.cik == cik]
+            # #2920: grouped once per walked index, not a scan of it per CIK.
+            entries = self._all_filing_index_entries()
+            grouped = self._entries_by_cik
+            if grouped is None or grouped[0] is not entries:
+                by_cik: dict[str, list[FilingIndexEntry]] = {}
+                for entry in entries:
+                    by_cik.setdefault(entry.cik, []).append(entry)
+                grouped = self._entries_by_cik = (entries, by_cik)
+            return list(grouped[1].get(cik, ()))
         return self._issuer_entries(cik) if self._is_issuer_cik(cik) else []
 
     def filing_index_for_forms(self, forms: Collection[str]) -> list[FilingIndexEntry]:
         """Read selected forms across CIKs, including filer-only CIKs."""
         self._maybe_use_stored_index()
         if self._index_conn is None:
-            return [entry for entry in self.filing_index() if entry.form in forms]
+            return [entry for entry in self._all_filing_index_entries() if entry.form in forms]
         issuers = self._stored_issuer_ciks()
         return [
             FilingIndexEntry(row.cik, row.company_name, row.form, row.accession, row.accepted_at)
@@ -3463,97 +3585,139 @@ class EdgarFilingSource(FilingSource):
         fsn_cache = self._load_fsn_cache(cik)
         fsn_tags = self._fsn_recorded_symbol_only(cik)
         counts = _FilenameCounts()
-
-        listings: list[FilenameListing] = []
-        for record in stamps.values():
-            if record.accepted_at is None or record.form not in forms:
-                continue
-            if record.accepted_at < since or (
-                first_cover_at is not None and record.accepted_at >= first_cover_at
-            ):
-                continue
-            extract = self._filename_extract(cik, cache, record, read_document=True)
-            if extract is None:
-                continue
-            counts.read += 1
-            if extract.name is None:
-                counts.no_instance += 1
-                continue
-            title, exchange = _common_line(extract.pairs)
-            if exchange is None:
-                counts.no_exchange += 1
-            fsn_filing = fsn_cache.get(record.accession)
-            if fsn_filing is None:
-                counts.fsn_missing += 1
-            elif fsn_tags.get(record.accession) is None:
-                counts.fsn_no_symbol_only += 1
-            listings.append(
-                FilenameListing(
-                    cik=cik,
-                    accession=record.accession,
-                    form=record.form,
-                    accepted_at=record.accepted_at,
-                    valid_from=_session_of(record.accepted_at),
-                    ticker=extract.name,
-                    exchange=exchange,
-                    class_title=title,
-                    dei_symbol=_dei_symbol(
-                        extract.name, fsn_filing, fsn_tags.get(record.accession)
-                    ),
-                )
-            )
-
+        # #2932: the three passes' fetches, in the passes' order. The pool only
+        # prefetches them; each pass below still takes its extract, counts,
+        # caches and fails in this order, so the answer is the sequential one.
+        in_window = [
+            record
+            for record in stamps.values()
+            if record.accepted_at is not None
+            and record.form in forms
+            and record.accepted_at >= since
+            and (first_cover_at is None or record.accepted_at < first_cover_at)
+        ]
+        form25s = [
+            record
+            for record in stamps.values()
+            if record.accepted_at is not None
+            and record.form in _DELISTING_FORMS
+            and record.accepted_at >= since
+        ]
+        jobs = [(record, True) for record in in_window]
         if first_cover is not None and first_cover.accepted_at is not None:
-            extract = self._filename_extract(cik, cache, first_cover, read_document=False)
-            if extract is not None and extract.name is not None:
+            jobs.append((first_cover, False))
+        jobs.extend((record, False) for record in form25s if self._own_form25(cik, record))
+        if any(
+            _filename_cache_hit(cache, record, read_document) is None
+            and not self._is_quarantined(record.accession)
+            for record, read_document in jobs
+        ):
+            self._filename_ciks_asked.add(cik)  # #2932: the share's denominator
+        pool: ThreadPoolExecutor | None = None
+        prefetched: dict[tuple[str, bool], Future[_FilenameExtract]] = {}
+        listings: list[FilenameListing] = []
+        try:
+            pool, prefetched = self._prefetch_filename_extracts(cik, cache, jobs)
+            for record in in_window:
+                assert record.accepted_at is not None  # in_window holds stamped filings only
+                extract = self._filename_extract(
+                    cik, cache, record, read_document=True, prefetched=prefetched
+                )
+                if extract is None:
+                    continue
+                counts.read += 1
+                if extract.name is None:
+                    counts.no_instance += 1
+                    continue
+                title, exchange = _common_line(extract.pairs)
+                if exchange is None:
+                    counts.no_exchange += 1
+                fsn_filing = fsn_cache.get(record.accession)
+                if fsn_filing is None:
+                    counts.fsn_missing += 1
+                elif fsn_tags.get(record.accession) is None:
+                    counts.fsn_no_symbol_only += 1
                 listings.append(
                     FilenameListing(
                         cik=cik,
-                        accession=first_cover.accession,
-                        form=first_cover.form,
-                        accepted_at=first_cover.accepted_at,
-                        valid_from=_session_of(first_cover.accepted_at),
+                        accession=record.accession,
+                        form=record.form,
+                        accepted_at=record.accepted_at,
+                        valid_from=_session_of(record.accepted_at),
                         ticker=extract.name,
-                        exchange=None,
-                        class_title=None,
-                        dei_symbol=None,
+                        exchange=exchange,
+                        class_title=title,
+                        dei_symbol=_dei_symbol(
+                            extract.name, fsn_filing, fsn_tags.get(record.accession)
+                        ),
                     )
                 )
 
-        for record in stamps.values():
-            if (
-                record.accepted_at is None
-                or record.form not in _DELISTING_FORMS
-                or record.accepted_at < since
-            ):
-                continue
-            cached = self._load_delisting_cache(record.accession)
-            if cached is None:
-                counts.form25_uncached += 1
-                self.filename_incomplete_ciks.add(cik)
-                continue
-            if cached.cik != cik:
-                continue  # the exchange's copy of a 25-NSE: the subject company keeps it
-            extract = self._filename_extract(cik, cache, record, read_document=False)
-            if extract is None:
-                continue
-            if extract.name is None:
-                counts.form25_no_exhibit += 1
-                continue
-            counts.form25_read += 1
-            listings.append(
-                FilenameListing(
-                    cik=cik,
-                    accession=record.accession,
-                    form=cached.form,
-                    accepted_at=record.accepted_at,
-                    valid_from=_session_of(record.accepted_at),
-                    ticker=extract.name,
-                    exchange=cached.exchange,
-                    class_title=cached.class_title,
-                    dei_symbol=None,
+            if first_cover is not None and first_cover.accepted_at is not None:
+                extract = self._filename_extract(
+                    cik, cache, first_cover, read_document=False, prefetched=prefetched
                 )
+                if extract is not None and extract.name is not None:
+                    listings.append(
+                        FilenameListing(
+                            cik=cik,
+                            accession=first_cover.accession,
+                            form=first_cover.form,
+                            accepted_at=first_cover.accepted_at,
+                            valid_from=_session_of(first_cover.accepted_at),
+                            ticker=extract.name,
+                            exchange=None,
+                            class_title=None,
+                            dei_symbol=None,
+                        )
+                    )
+
+            for record in form25s:
+                assert record.accepted_at is not None  # form25s holds stamped filings only
+                cached = self._load_delisting_cache(record.accession)
+                if cached is None:
+                    counts.form25_uncached += 1
+                    self.filename_incomplete_ciks.add(cik)
+                    continue
+                if cached.cik != cik:
+                    continue  # the exchange's copy of a 25-NSE: the subject company keeps it
+                extract = self._filename_extract(
+                    cik, cache, record, read_document=False, prefetched=prefetched
+                )
+                if extract is None:
+                    continue
+                if extract.name is None:
+                    counts.form25_no_exhibit += 1
+                    continue
+                counts.form25_read += 1
+                listings.append(
+                    FilenameListing(
+                        cik=cik,
+                        accession=record.accession,
+                        form=cached.form,
+                        accepted_at=record.accepted_at,
+                        valid_from=_session_of(record.accepted_at),
+                        ticker=extract.name,
+                        exchange=cached.exchange,
+                        class_title=cached.class_title,
+                        dei_symbol=None,
+                    )
+                )
+        except (httpx.HTTPStatusError, httpx.TransportError) as error:
+            if isinstance(error, httpx.HTTPStatusError) and error.response.status_code < 500:
+                raise  # a 403/429 block given up on, or another refusal: as before
+            # #2932: a 5xx or a transport error past the retries fails this CIK
+            # closed (no answer, the failed filing uncached, asked again next
+            # run); `check_failures` fails the run past the share threshold.
+            self.filename_incomplete_ciks.add(cik)
+            self.filename_fetch_failed_ciks.setdefault(
+                cik, self._stored_message(f"{type(error).__name__}: {error}")
             )
+            return []
+        finally:
+            if pool is not None:
+                # A queued job is dropped unrun; its future is never asked again.
+                pool.shutdown(wait=True, cancel_futures=True)
 
         if cik not in self._filename_counted:
             self._filename_counted.add(cik)
@@ -3567,6 +3731,70 @@ class EdgarFilingSource(FilingSource):
             self.filename_fsn_missing += counts.fsn_missing
         listings.sort(key=lambda e: (e.accepted_at, e.accession, e.ticker))
         return listings
+
+    def _own_form25(self, cik: str, record: SubmissionRecord) -> bool:
+        """Whether `filename_listings`' Form 25 pass will ask for `record`: a
+        delisting-cache entry naming `cik` (the pass's own test). A cache path
+        that refuses the accession plans nothing; the pass raises as before."""
+        try:
+            cached = self._load_delisting_cache(record.accession)
+        except ValueError:
+            return False
+        return cached is not None and cached.cik == cik
+
+    def _prefetch_filename_extracts(
+        self,
+        cik: str,
+        cache: Mapping[str, _FilenameExtract],
+        jobs: Sequence[tuple[SubmissionRecord, bool]],
+    ) -> tuple[ThreadPoolExecutor | None, dict[tuple[str, bool], Future[_FilenameExtract]]]:
+        """Start `jobs`' fetches (#2932) on at most `edgar.filename_fetch_workers`
+        threads: only the ones `_filename_extract` would fetch (no cache hit,
+        not quarantined), each once. Every request still waits on
+        `edgar_raw`'s one process-wide limiter, with its retry policy and
+        `User-Agent`. Nothing here counts, caches or records a failure: the
+        caller's passes take each future in order through `_filename_extract`.
+        A pool of 1, or fewer than two fetches, starts no thread."""
+        workers = self._settings.edgar.filename_fetch_workers
+        if workers <= 1:
+            return None, {}
+        todo: dict[tuple[str, bool], tuple[SubmissionRecord, bool]] = {}
+        for record, read_document in jobs:
+            key = (record.accession, read_document)
+            if key in todo or _filename_cache_hit(cache, record, read_document) is not None:
+                continue
+            if self._is_quarantined(record.accession):
+                continue
+            todo[key] = (record, read_document)
+        if len(todo) < 2:
+            return None, {}
+        pool = ThreadPoolExecutor(
+            max_workers=min(workers, len(todo)), thread_name_prefix="edgar-filename"
+        )
+        # The caller's context per job (the retry observer is a ContextVar), and
+        # one future per job, set by its worker. `map` queues every job now;
+        # the boundary test refuses any `.submit` outside the broker wrapper.
+        futures: dict[tuple[str, bool], Future[_FilenameExtract]] = {key: Future() for key in todo}
+        contexts = {key: contextvars.copy_context() for key in todo}
+
+        def run(key: tuple[str, bool]) -> None:
+            future = futures[key]
+            if not future.set_running_or_notify_cancel():
+                return
+            record, read_document = todo[key]
+            try:
+                extract = self._fetch_filename_extract(cik, record, read_document, on_worker=True)
+            except BaseException as error:  # handed to the caller, raised in order there
+                future.set_exception(error)
+            else:
+                future.set_result(extract)
+
+        try:
+            pool.map(lambda key: contexts[key].run(run, key), list(todo))
+        except BaseException:
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+        return pool, futures
 
     def _first_cover_filing(
         self, cik: str, stamps: Mapping[str, SubmissionRecord]
@@ -3592,14 +3820,22 @@ class EdgarFilingSource(FilingSource):
         record: SubmissionRecord,
         *,
         read_document: bool,
+        prefetched: dict[tuple[str, bool], Future[_FilenameExtract]] | None = None,
     ) -> _FilenameExtract | None:
         """The cached extract of one accession, else fetched, cached and
         returned; `None` when the fetch failed (counted by `_guarded`, no
-        cache entry, asked again next run) or the accession is quarantined."""
-        cached = cache.get(record.accession)
-        if cached is not None and (
-            not read_document or cached.name is None or cached.document_read
-        ):
+        cache entry, asked again next run) or the accession is quarantined.
+
+        A `prefetched` future (#2932) stands in for the fetch, its result
+        or its raise taken here in order exactly as the inline fetch's,
+        except a rate-limit block's (`_prefetch_reusable`): a worker that
+        found the block set sent nothing, and a `403`/`429` may have been
+        raised at once because another thread was waiting the block out.
+        Then every other prefetch is let finish first (a wait in progress
+        ends, clearing the block on success), and this one is fetched here,
+        one request at a time as before, with the sequential wait-out."""
+        cached = _filename_cache_hit(cache, record, read_document)
+        if cached is not None:
             self._per_document_attempted.add(record.accession)  # #610 policy 1: a cache hit
             return cached
         if self._is_quarantined(record.accession):
@@ -3610,6 +3846,12 @@ class EdgarFilingSource(FilingSource):
         fetch: Callable[[], _FilenameExtract] = partial(
             self._fetch_filename_extract, cik, record, read_document
         )
+        future = prefetched.pop((record.accession, read_document), None) if prefetched else None
+        if future is not None:
+            if _prefetch_reusable(future):
+                fetch = future.result
+            else:
+                wait_futures(list(prefetched.values()) if prefetched else [])
         extract = self._guarded(record.accession, record.form.removesuffix("/A"), fetch)
         if extract is None:
             self.filename_incomplete_ciks.add(cik)
@@ -3619,18 +3861,28 @@ class EdgarFilingSource(FilingSource):
         return extract
 
     def _fetch_filename_extract(
-        self, cik: str, record: SubmissionRecord, read_document: bool
+        self, cik: str, record: SubmissionRecord, read_document: bool, *, on_worker: bool = False
     ) -> _FilenameExtract:
+        """One accession's extract from its `index.json` (and, for a 10-K
+        with an instance, its primary document's head). `on_worker` (#2932,
+        a pool thread): raise `_FetchDeferred` instead of sending while
+        SEC's rate-limit block is being waited out, so the pool is quiet
+        then as the sequential fetch is, and the caller asks it in order."""
+        if on_worker and edgar_raw.rate_limit_blocked():
+            raise _FetchDeferred(record.accession)
         names = edgar_raw.filing_index(
             cik, record.accession, settings=self._settings, client=self._client
         )
-        self.filename_index_fetches += 1
+        with self._count_lock:
+            self.filename_index_fetches += 1
         if record.form in _DELISTING_FORMS:
             return _FilenameExtract(form25_exhibit_ticker(names), (), True)
         prefix = instance_prefix(names)
         if prefix is None or not read_document:
             return _FilenameExtract(prefix, (), False)
         cap = self._settings.edgar.filename_document_max_bytes
+        if on_worker and edgar_raw.rate_limit_blocked():
+            raise _FetchDeferred(record.accession)
         # The root copy, never an `xsl.../` rendering of it (as `_fetch_cover_page`).
         document = re.sub(r"^xsl[^/]*/", "", record.primary_document)
         head = edgar_raw.filing_document_head(
@@ -3642,7 +3894,8 @@ class EdgarFilingSource(FilingSource):
             settings=self._settings,
             client=self._client,
         )
-        self.filename_document_fetches += 1
+        with self._count_lock:
+            self.filename_document_fetches += 1
         pairs = cover_12b_exchanges(head.decode("utf-8", "ignore"), max_bytes=cap)
         return _FilenameExtract(prefix, pairs, True)
 
@@ -3917,6 +4170,7 @@ class EdgarFilingSource(FilingSource):
         on a non-dry run by `record_failed_check`) holds them too, and
         accepting one stays the hand edit there."""
         reasons: list[str] = []
+        self._check_filename_fetches(reasons)
         self._check_fsn_group(reasons)
         self._check_per_document_group(reasons)
         self._check_cross_day_pairs(reasons)
@@ -4044,6 +4298,24 @@ class EdgarFilingSource(FilingSource):
         reason = self._threshold_reason("per-document", failures, denominator)
         if reason:
             reasons.append(reason)
+
+    def _check_filename_fetches(self, reasons: list[str]) -> None:
+        """#2932: the run fails when more than
+        `edgar.filename_fetch_max_failed_share` of the CIKs that sent a
+        filename fetch this run (a fully cached CIK is not counted, so a
+        mostly cached build cannot dilute an outage) failed past the retries (an outage, never
+        hidden as a few incomplete CIKs); the first CIKs are named."""
+        failed = self.filename_fetch_failed_ciks
+        asked = len(self._filename_ciks_asked)
+        share = self._settings.edgar.filename_fetch_max_failed_share
+        if not failed or len(failed) <= share * asked:
+            return
+        limit = self._settings.edgar.max_validation_listed
+        first = "; ".join(f"{cik} {message}" for cik, message in list(failed.items())[:limit])
+        reasons.append(
+            f"filename fetch incomplete: {len(failed)} of {asked} CIKs, over "
+            f"edgar.filename_fetch_max_failed_share {share:g}; first: {first}"
+        )
 
     def _check_cross_day_pairs(self, reasons: list[str]) -> None:
         """One (error class, base form) pair with at least
@@ -4847,6 +5119,39 @@ _HEADING_12B_BYTES = re.compile(rb"section\s*12\s*\(\s*b\s*\)", re.IGNORECASE)
 _TABLE_CLOSE_BYTES = re.compile(rb"</\s*table", re.IGNORECASE)
 
 
+def _filename_cache_hit(
+    cache: Mapping[str, _FilenameExtract], record: SubmissionRecord, read_document: bool
+) -> _FilenameExtract | None:
+    """`record`'s cached extract when it answers this ask: any entry when no
+    document is read, else one with no instance or with its document read."""
+    cached = cache.get(record.accession)
+    if cached is not None and (not read_document or cached.name is None or cached.document_read):
+        return cached
+    return None
+
+
+class _FetchDeferred(Exception):
+    """A pool worker's fetch not sent: SEC's rate-limit block was set (#2932)."""
+
+
+def _prefetch_reusable(future: Future[_FilenameExtract]) -> bool:
+    """Whether a prefetched fetch's outcome is the one a sequential ask would
+    get (#2932). Waits for the future. Every outcome is, but a cancelled or
+    deferred one (nothing sent) and a `403`/`429` raised by `edgar_raw`'s
+    rate-limit block: under concurrency a request can raise it at once
+    because another thread's wait set the shared block flag, where the
+    sequential fetch would have waited it out; those are asked again in
+    order."""
+    if future.cancelled():
+        return False
+    error = future.exception()
+    if isinstance(error, _FetchDeferred):
+        return False
+    return not (
+        isinstance(error, httpx.HTTPStatusError) and error.response.status_code in (403, 429)
+    )
+
+
 def _twelve_b_table_read(buffer: bytes) -> bool:
     """Whether `buffer` holds a Section 12(b) heading and a table closing
     after it: `cover_12b_exchanges` ends the block there, so no later byte
@@ -4900,6 +5205,19 @@ _CIK_PATTERN = re.compile(r"\d{10}")
 def _validate_cik(cik: str) -> None:
     if not isinstance(cik, str) or not _CIK_PATTERN.fullmatch(cik):
         raise ValueError(f"cik must be a 10-digit zero-padded string, got {cik!r}")
+
+
+@dataclass
+class _StoredReads:
+    """One binding's table reads (#2920): each is one scan, made on first use
+    and dropped by `use_index`, so a new or rebound index reads afresh."""
+
+    first_rows: dict[str, list[stored_index.FilingRow]] = field(default_factory=dict)
+    loaded: set[str] = field(default_factory=set)
+    issuers: frozenset[str] | None = None
+    pending: tuple[UnstampedFiling, ...] | None = None
+    accession_ciks: dict[str, frozenset[str]] | None = None
+    new_by_cik: dict[str, list[stored_index.FilingRow | stored_index.Listing]] | None = None
 
 
 def _filed_by(row: AccessionRow) -> bool:

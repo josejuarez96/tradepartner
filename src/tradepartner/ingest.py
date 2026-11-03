@@ -139,9 +139,12 @@ carry is derived from its own stored `revenue` and `cost_of_revenue`
 vintages at the filing's turn, unless the key is held or the filing's
 `GrossProfit` is on the source's `statement_conflict_keys`. Each CIK's rows
 go in one bulk insert, the frame's timestamps tz-checked once.
-`rebuild_statement_facts` first deletes every `statement_facts` row in the
-same transaction. The counts go into the run message as `statement_<name>:
-N` (`health.statement_counts`).
+`rebuild_statement_facts` replaces per CIK in the same transaction (#2956):
+a CIK's stored rows are deleted only once its read returned records, so a
+CIK whose read is empty (its statement cache missing) keeps its rows and,
+if it had any, is counted `rebuild_kept_empty_read` with its first CIKs
+listed; rows of a CIK the run does not ask stay too. The counts go into
+the run message as `statement_<name>: N` (`health.statement_counts`).
 
 **Filing events** (amendment 2026-10-09, #1358; plan T164e), only while
 `edgar.filing_events_enabled` is on (off, the default: no call, so no
@@ -154,9 +157,9 @@ insert per CIK, `known_at = accepted_at` (never the index's filing date). A
 form outside `edgar.event_forms` is never a row. A record accepted after the
 run's clock is skipped and counted `filing_events_not_yet_known`, never
 clamped and never fatal: `known_at = accepted_at` and `known_at <=
-ingested_at` cannot both hold for it. `rebuild_filing_events` first deletes
-every row in the same transaction and records the counts before and after.
-The counts go into the run message as `filing_events_<name>: N`
+ingested_at` cannot both hold for it. `rebuild_filing_events` replaces per
+CIK the same way (#2956), counted `rebuild_kept_empty_read`, and records
+the counts before and after. The counts go into the run message as `filing_events_<name>: N`
 (`health.filing_event_counts`), with the adapter's `unstamped`,
 `items_missing` and `clock_suspect` counts where the source exposes them.
 
@@ -395,7 +398,12 @@ from tradepartner.store.retraction import (
 )
 from tradepartner.store.schema import atomic, init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
-from tradepartner.universe import SHARES_FACT, member_links_title
+from tradepartner.universe import (
+    SHARES_FACT,
+    member_links_title,
+    on_list_ids,
+    on_universe_exchange,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1372,6 +1380,8 @@ class _Recorded(FilingSource):
     def __init__(self, source: FilingSource) -> None:
         self._source = source
         self._answers: dict[tuple[Any, ...], Any] = {}
+        #: #2927: the recorded full index, grouped by CIK, keyed to the answer it groups.
+        self._index_by_cik: tuple[Any, dict[str, list[FilingIndexEntry]]] | None = None
         self._statement_filled: set[str] = set()  # #660: which CIKs, never the records
         self._events_asked: set[str] = set()  # #1358: which CIKs, never the records
         self.frozen = False
@@ -1405,7 +1415,15 @@ class _Recorded(FilingSource):
         """Keep the source's bounded CIK query through the fetch-pass recorder."""
         if callable(getattr(self._source, "filing_index_for_cik", None)):
             return list(self._ask("filing_index_for_cik", cik))
-        return [entry for entry in self._ask("filing_index", None) if entry.cik == cik]
+        # #2927: the recorded full index grouped once, not a scan of it per CIK.
+        entries = self._ask("filing_index", None)
+        grouped = self._index_by_cik
+        if grouped is None or grouped[0] is not entries:
+            by_cik: dict[str, list[FilingIndexEntry]] = {}
+            for entry in entries:
+                by_cik.setdefault(entry.cik, []).append(entry)
+            grouped = self._index_by_cik = (entries, by_cik)
+        return list(grouped[1].get(cik, ()))
 
     def filing_index_for_forms(self, forms: Collection[str]) -> list[FilingIndexEntry]:
         """Keep cross-CIK form queries bounded and deterministic."""
@@ -1497,7 +1515,8 @@ def _unwrap(filings: FilingSource) -> FilingSource:
 class Unjudged:
     """What a master check must not judge after a fetch pass (#859): the
     CIKs with a filing that failed or was quarantined this run, and how many
-    failures name no accession that maps to a CIK."""
+    failures name no accession that maps to a CIK. A CIK whose filename
+    fetch failed past the retries this run (#2932) is unjudged too."""
 
     ciks: frozenset[str]
     unmapped: int
@@ -1515,10 +1534,12 @@ def _unjudged_ciks(filings: FilingSource) -> Unjudged:
     pending: Mapping[str, Any] = getattr(source, "_pending_failures", {})
     accessions = set(pending) | set(getattr(source, "_quarantined_this_run", set()))
     unmapped = int(getattr(source, "_fsn_extraction_failures_this_run", 0))
+    # #2932: a CIK failed closed on a filename fetch has no answer to judge.
+    fetch_failed = set(getattr(source, "filename_fetch_failed_ciks", ()))
     if not accessions:
-        return Unjudged(frozenset(), unmapped)
+        return Unjudged(frozenset(fetch_failed), unmapped)
     by_accession = {entry.accession: entry.cik for entry in filings.filing_index(None)}
-    ciks = {by_accession[a] for a in accessions if a in by_accession}
+    ciks = {by_accession[a] for a in accessions if a in by_accession} | fetch_failed
     unmapped += sum(1 for a in accessions if a not in by_accession)
     return Unjudged(frozenset(ciks), unmapped)
 
@@ -1998,9 +2019,12 @@ def _propose_index(
     if isinstance(source, EdgarFilingSource):
         quarters = _index_quarters(settings.edgar.index_first_year, now)
         with open_read_only(settings, retry=True) as conn:
+            # #2873: a statement backfill's `ok` row reads no index; its finish
+            # time is not the last time the quarters were looked at.
             last = conn.execute(
                 "SELECT finished_at FROM ingestion_runs WHERE source = 'edgar_index' "
-                "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
+                "AND status = 'ok' AND mode <> ? ORDER BY rowid DESC LIMIT 1",
+                [STATEMENT_BACKFILL],
             ).fetchone()
         for year, number in quarters:
             if quarter_filter is not None and (year, number) > quarter_filter:
@@ -3090,8 +3114,8 @@ def _statement_backfill_start(
         # Outside the hash, so T365a lets it through; the final row would absorb
         # it and the next nightly would never touch its CIKs.
         return _BackfillStart(
-            "a per-name list changed since the last ok index row; "
-            "apply it in its own nightly, not with the backfill"
+            "a per-name list changed since the last ok index row; revert it "
+            "before the nightly, run the backfill, then apply it in its own nightly"
         )
     digest = statement_tags_digest(settings)
     through: str | None = None
@@ -3192,7 +3216,13 @@ def statement_backfill_session(
         return IngestResult(
             (SourceRun("edgar_index", OK, 0, STATEMENT_BACKFILL, "no added statement names"),)
         )
+    from tradepartner.adapters.edgar_source import EdgarFilingSource
+
     source = _unwrap(filings)
+    if isinstance(source, EdgarFilingSource) and not source._statement_backfill:
+        # #2873: only the adapter's backfill mode reads local caches (it may
+        # still ask the per-CIK companyfacts API); any other mode would fetch more.
+        raise ValueError("statement_backfill needs the EDGAR adapter in statement-backfill mode")
     remaining = [cik for cik in ciks if start.through is None or cik > start.through]
     size = settings.edgar.statement_backfill_chunk_ciks
     total = StatementCounts()
@@ -4535,6 +4565,10 @@ def _chain_candidate_clause(candidates: Sequence[ChainCandidate]) -> str:
     return f"; chain_candidates: {len(candidates)}: {named}"
 
 
+#: How many conflicting CIKs the run message names (#2929); the count is whole.
+_FILENAME_CONFLICTS_SHOWN = 5
+
+
 def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource) -> str:
     """The #1597 verdict and Form 25 counts, omitted with the switch off."""
     if not master.filename_enabled:
@@ -4551,27 +4585,28 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
         "filename_no_exchange",
         "filename_class_unread",
         "filename_form25_rows",
+        "filename_conflicts",
     ):
         counts.setdefault(key, 0)
     # #1662: an exchange mismatch only — a Form 25 of a CIK with an earlier
     # `filing_name` row, none of that CIK's on the Form 25's exchange (a 12(b)
     # text read differently). One on a listed exchange that names another class
     # (a warrant) is no mismatch.
+    # #2927: the `filing_name` rows grouped once, by CIK and by security,
+    # so each Form 25 reads its own rows, not every listing row.
+    named_by_cik: dict[str, list[Row]] = defaultdict(list)
+    named_by_id: dict[str, list[Row]] = defaultdict(list)
+    for listing in master.listings:
+        if listing["provenance"] == "filing_name":
+            named_by_cik[security_cik(listing["security_id"])].append(listing)
+            named_by_id[listing["security_id"]].append(listing)
     counts["filename_form25_unmatched"] = sum(
         1
         for row in delistings.unmatched
-        if any(
-            security_cik(listing["security_id"]) == row.cik
-            and listing["provenance"] == "filing_name"
-            and listing["known_at"] <= row.accepted_at
-            for listing in master.listings
-        )
+        if any(listing["known_at"] <= row.accepted_at for listing in named_by_cik.get(row.cik, ()))
         and not any(
-            security_cik(listing["security_id"]) == row.cik
-            and listing["provenance"] == "filing_name"
-            and listing["known_at"] <= row.accepted_at
-            and listing["exchange"] == row.exchange
-            for listing in master.listings
+            listing["known_at"] <= row.accepted_at and listing["exchange"] == row.exchange
+            for listing in named_by_cik.get(row.cik, ())
         )
     )
     counts["filename_transfers_delisted"] = sum(
@@ -4579,17 +4614,29 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
         for row in delistings.delistings
         if row["filed_at"].year < 2019
         and any(
-            listing["security_id"] == row["security_id"]
-            and listing["exchange"] != row["exchange"]
-            and listing["known_at"] > row["filed_at"]
-            and listing["provenance"] == "filing_name"
-            for listing in master.listings
+            listing["exchange"] != row["exchange"] and listing["known_at"] > row["filed_at"]
+            for listing in named_by_id.get(row["security_id"], ())
         )
     )
     source = _unwrap(filings)
     for key in ("filename_index_fetches", "filename_document_fetches"):
         counts[key] = int(getattr(source, key, 0))
-    return "".join(f"; {key}: {value}" for key, value in sorted(counts.items()))
+    text = "".join(f"; {key}: {value}" for key, value in sorted(counts.items()))
+    # #2929: the first few CIKs a class conflict failed closed, to look up.
+    # #2932: CIKs whose filename fetch failed past the retries, failed closed.
+    fetch_failed = tuple(getattr(source, "filename_fetch_failed_ciks", ()))
+    if fetch_failed:
+        shown = ", ".join(fetch_failed[:_FILENAME_CONFLICTS_SHOWN])
+        more = len(fetch_failed) - _FILENAME_CONFLICTS_SHOWN
+        text += f"; filename fetch incomplete: {len(fetch_failed)} ({shown}" + (
+            f", +{more})" if more > 0 else ")"
+        )
+    conflicted = tuple(getattr(master, "filename_conflict_ciks", ()))
+    if conflicted:
+        shown = ", ".join(conflicted[:_FILENAME_CONFLICTS_SHOWN])
+        more = len(conflicted) - _FILENAME_CONFLICTS_SHOWN
+        text += f"; filename_conflict_ciks: {shown}" + (f" (+{more})" if more > 0 else "")
+    return text
 
 
 def _held_ids(conn: duckdb.DuckDBPyConnection, ids: Sequence[str]) -> frozenset[str]:
@@ -5402,6 +5449,7 @@ class StatementCounts:
     restated: int = 0
     derived: int = 0
     deleted: int | None = None
+    kept_empty_read: list[str] | None = None
 
     def add(self, other: StatementCounts) -> None:
         """Fold one CIK's counts into the run's."""
@@ -5427,7 +5475,10 @@ class StatementCounts:
             value = getattr(source, f"statement_{name}", None)
             if value is not None:
                 figures.append((name, int(value)))
-        return "; " + ", ".join(f"statement_{name}: {n}" for name, n in figures)
+        text = ", ".join(f"statement_{name}: {n}" for name, n in figures)
+        if self.kept_empty_read is not None:
+            text += ", " + _kept_figure("statement_", self.kept_empty_read)
+        return "; " + text
 
 
 def _statement_key(record: StatementFactRecord) -> StatementKey:
@@ -5626,18 +5677,26 @@ def _write_statement_facts(
     *,
     rebuild: bool,
 ) -> StatementCounts:
-    """The write phase (module docstring): with `rebuild`, delete every row
-    first; then per CIK, one `statement_facts` read, its stored keys, its new
-    rows, and one bulk insert, holding one CIK's records at a time."""
+    """The write phase (module docstring): per CIK, one `statement_facts`
+    read, its stored keys, its new rows, and one bulk insert, holding one
+    CIK's records at a time. With `rebuild`, a CIK whose read returned
+    records has its stored rows deleted first, in the same transaction
+    (#2956); a CIK whose read is empty (a missing cache) keeps its rows and,
+    if it had any, is counted `rebuild_kept_empty_read`."""
     total = StatementCounts()
     if rebuild:
-        deleted = conn.execute("DELETE FROM statement_facts").fetchone()
-        total.deleted = int(deleted[0]) if deleted else 0
+        total.deleted = 0
+        total.kept_empty_read = []
     conflicts = _ConflictIndex(_unwrap(filings))
     for cik in ciks:
         records = filings.statement_facts(cik)
         if not records:
+            if total.kept_empty_read is not None and _has_rows(conn, "statement_facts", cik):
+                total.kept_empty_read.append(cik)
             continue
+        if total.deleted is not None:
+            deleted = conn.execute("DELETE FROM statement_facts WHERE cik = ?", [cik]).fetchone()
+            total.deleted += int(deleted[0]) if deleted else 0
         rows, counts = statement_fact_rows(
             records, _stored_vintages(conn, cik), conflicts.keys(), ingested_at=ingested_at
         )
@@ -5645,6 +5704,26 @@ def _write_statement_facts(
             insert_statement_frame(conn, statement_frame(rows))
         total.add(counts)
     return total
+
+
+#: How many of a rebuild's kept CIKs its run message lists by number (#2956).
+_KEPT_CIKS_LISTED = 5
+
+
+def _has_rows(conn: duckdb.DuckDBPyConnection, table: str, cik: str) -> bool:
+    """Whether `table` (`statement_facts` or `filing_events`) stores a row for `cik`."""
+    return (
+        conn.execute(f"SELECT 1 FROM {table} WHERE cik = ? LIMIT 1", [cik]).fetchone() is not None
+    )
+
+
+def _kept_figure(prefix: str, kept: Sequence[str]) -> str:
+    """`"<prefix>rebuild_kept_empty_read: N"`, with the first CIKs in
+    parentheses when any is kept (#2956)."""
+    figure = f"{prefix}rebuild_kept_empty_read: {len(kept)}"
+    if kept:
+        figure += f" (first: {' '.join(kept[:_KEPT_CIKS_LISTED])})"
+    return figure
 
 
 def _stored_vintages(
@@ -5708,6 +5787,7 @@ class FilingEventCounts:
     not_yet_known: int = 0
     before: int | None = None
     after: int | None = None
+    kept_empty_read: list[str] | None = None
 
     def message(self, source: FilingSource) -> str:
         """`"; filing_events_added: N, ..."` for the run row
@@ -5720,7 +5800,10 @@ class FilingEventCounts:
             value = getattr(source, f"filing_events_{name}", None)
             if value is not None:
                 figures.append((name, int(value if isinstance(value, int) else len(value))))
-        return "; " + ", ".join(f"filing_events_{name}: {n}" for name, n in figures)
+        text = ", ".join(f"filing_events_{name}: {n}" for name, n in figures)
+        if self.kept_empty_read is not None:
+            text += ", " + _kept_figure("filing_events_", self.kept_empty_read)
+        return "; " + text
 
 
 def filing_event_rows(
@@ -5770,18 +5853,24 @@ def _write_filing_events(
     *,
     rebuild: bool,
 ) -> FilingEventCounts:
-    """The filing-events write (module docstring): with `rebuild`, delete
-    every row first and record the counts before and after; then per CIK,
-    one `filing_events` read, its stored accessions, its new rows, and one
-    bulk insert."""
+    """The filing-events write (module docstring): per CIK, one
+    `filing_events` read, its stored accessions, its new rows, and one bulk
+    insert. With `rebuild`, record the counts before and after, and delete a
+    CIK's stored rows only once its read returned records, in the same
+    transaction (#2956); a CIK whose read is empty keeps its rows and, if it
+    had any, is counted `rebuild_kept_empty_read`."""
     total = FilingEventCounts()
     if rebuild:
         total.before = _event_count(conn)
-        conn.execute("DELETE FROM filing_events")
+        total.kept_empty_read = []
     for cik in ciks:
         records = filings.filing_events(cik)
         if not records:
+            if total.kept_empty_read is not None and _has_rows(conn, "filing_events", cik):
+                total.kept_empty_read.append(cik)
             continue
+        if rebuild:
+            conn.execute("DELETE FROM filing_events WHERE cik = ?", [cik])
         stored = {
             accession
             for (accession,) in conn.execute(
@@ -6624,7 +6713,7 @@ def _counted(
     a benchmark, or a common name on one of `universe.exchanges` (OTC is not
     one, and the SIP feed has no OTC bars; #784)."""
     return sid in benchmarks or (
-        kinds.get(sid) == "common" and row["exchange"] in settings.universe.exchanges
+        kinds.get(sid) == "common" and on_universe_exchange(row, settings.universe.exchanges)
     )
 
 
@@ -6664,7 +6753,7 @@ def _fetched(
     `_counted`, so every counted name is fetched."""
     if sid in benchmarks:
         return True
-    if row["exchange"] not in settings.universe.exchanges:
+    if not on_universe_exchange(row, settings.universe.exchanges):
         return False
     known = types.get(sid)
     skipped = NOT_EQUITY - set(settings.universe.security_types)
@@ -6812,7 +6901,12 @@ def _price_names(
     security's current listing."""
     current: dict[str, Row] = {}
     earliest: dict[str, date] = {}
-    for row in listing_ends_as_of(conn, now, settings).iter_rows(named=True):
+    rows = list(listing_ends_as_of(conn, now, settings).iter_rows(named=True))
+    # A newer secondary-quote row (`NYSE_CHICAGO`, `NYSETX`) does not take a
+    # security off the list while a row on it is live (universe rule 2; #2937).
+    on_list = on_list_ids(rows, settings.universe.exchanges, session)
+    for listed_row in rows:
+        row = {**listed_row, "on_listed_exchange": listed_row["security_id"] in on_list}
         sid = row["security_id"]
         _first_listed(earliest, row, settings)
         held = current.get(sid)

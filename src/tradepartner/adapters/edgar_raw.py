@@ -257,6 +257,12 @@ class _RateLimitBlock:
 _RATE_LIMIT_BLOCK = _RateLimitBlock()
 
 
+def rate_limit_blocked() -> bool:
+    """Whether a rate-limit block's wait has not yet been followed by a
+    success (#2932: a fetch pool's worker sends nothing while it is)."""
+    return _RATE_LIMIT_BLOCK.is_set()
+
+
 def _backoff_seconds(
     attempt_index: int, settings: Settings, response: httpx.Response | None
 ) -> float:

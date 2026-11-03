@@ -179,9 +179,11 @@ from tradepartner.store.asof import _EXCHANGE_TZ, _latest_as_of, _validate_t
 from tradepartner.store.db import insert_row
 from tradepartner.store.filename_listings import (
     ClassTicker,
+    FilenameClassConflict,
     IndependentReading,
     confirm_filename_listings,
     is_filename_listing_refused,
+    normalize_ticker,
 )
 from tradepartner.store.journal import CLOSING_STOP_STATES
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -223,6 +225,9 @@ class MasterBuild:
     filename_counts: Mapping[str, int] = field(default_factory=dict)
     filename_form25_accessions: tuple[str, ...] = ()
     filename_enabled: bool = False
+    #: CIKs whose filename readings name one ticker for two classes (#2929):
+    #: each failed closed (no `filing_name` row), in build order.
+    filename_conflict_ciks: tuple[str, ...] = ()
     #: `successor_chains` rows `build_chains` derives for `master.chains`
     #: entries (#821), and the entries that derive none with their reason.
     chains: tuple[Chain, ...] = ()
@@ -643,6 +648,9 @@ class _Builder:
         self.static = set(settings.master.static_columns) >= _STATIC_LISTING_COLUMNS
         self.securities: list[Row] = []
         self.listings: list[Row] = []
+        # #2927: `listings` by `security_cik`, in `listings` order, so a
+        # per-CIK read is never a walk of every row the build has made.
+        self._listings_by_cik: dict[str, list[Row]] = defaultdict(list)
         self.unmatched: list[CompanySnapshotEntry] = []
         self.successions: list[Succession] = []
         self.class_titles: dict[tuple[str, str], ClassTitle] = {}  # first per (id, title)
@@ -676,16 +684,20 @@ class _Builder:
         source: str = _EDGAR,
         provenance: str = "filing",
     ) -> None:
-        self.listings.append(
-            {
-                "security_id": security_id,
-                "ticker": ticker,
-                "exchange": exchange,
-                "class_title": class_title,
-                "valid_from": valid_from,
-            }
-            | _row(known_at, self.ingested_at, source, provenance)
-        )
+        row = {
+            "security_id": security_id,
+            "ticker": ticker,
+            "exchange": exchange,
+            "class_title": class_title,
+            "valid_from": valid_from,
+        } | _row(known_at, self.ingested_at, source, provenance)
+        self.listings.append(row)
+        self._listings_by_cik[security_cik(security_id)].append(row)
+
+    def cik_listings(self, cik: str) -> Sequence[Row]:
+        """`[row for row in self.listings if security_cik(row["security_id"]) == cik]`,
+        without the walk (#2927)."""
+        return self._listings_by_cik.get(cik, ())
 
     def cover_pages(
         self,
@@ -1051,6 +1063,24 @@ def _filing_index_for_cik(source: FilingSource, cik: str) -> list[FilingIndexEnt
     return [entry for entry in source.filing_index() if entry.cik == cik]
 
 
+def _filing_index_by_cik(
+    source: FilingSource, ciks: Iterable[str]
+) -> dict[str, list[FilingIndexEntry]]:
+    """`_filing_index_for_cik` for each of `ciks`, keyed by CIK (#2927).
+
+    A source with no CIK query has its full index read once for all of
+    `ciks`, each CIK's entries in index order, never once per CIK."""
+    wanted = set(ciks)
+    reader = getattr(source, "filing_index_for_cik", None)
+    if callable(reader):
+        return {cik: cast(list[FilingIndexEntry], reader(cik)) for cik in sorted(wanted)}
+    grouped: dict[str, list[FilingIndexEntry]] = {cik: [] for cik in sorted(wanted)}
+    for entry in source.filing_index():
+        if entry.cik in wanted:
+            grouped[entry.cik].append(entry)
+    return grouped
+
+
 def _filing_index_for_forms(source: FilingSource, forms: Collection[str]) -> list[FilingIndexEntry]:
     """Use a store-backed cross-CIK form query when offered."""
     reader = getattr(source, "filing_index_for_forms", None)
@@ -1081,8 +1111,17 @@ def build_master(
     issuer_forms = set(settings.master.issuer_forms)
     first: dict[str, FilingIndexEntry] = {}
     marks: dict[str, dict[str, list[datetime]]] = defaultdict(lambda: defaultdict(list))
-    index = source.filing_index()  # full history, never `since` (spec req 3)
-    for entry in index:
+    # #2927: each CIK's filename-route forms, grouped in this one pass (a
+    # per-CIK filter of the ~15M-entry index was ~0.8 s x ~58k CIKs).
+    filename_forms = (
+        frozenset(settings.edgar.filename_listing_forms)
+        if settings.edgar.filename_listings
+        else frozenset()
+    )
+    filename_index: dict[str, list[FilingIndexEntry]] = defaultdict(list)
+    for entry in source.filing_index():  # full history, never `since` (spec req 3)
+        if entry.form in filename_forms:
+            filename_index[entry.cik].append(entry)
         if entry.form in _MARKER_FORMS:
             marks[entry.cik][entry.form].append(entry.accepted_at)
         if entry.form not in issuer_forms:
@@ -1117,6 +1156,7 @@ def build_master(
     builder = _Builder(settings, ingested_at)
     filename_counts: dict[str, int] = defaultdict(int)
     filename_form25_accessions: list[str] = []
+    filename_conflict_ciks: list[str] = []
     for cik in sorted(first):
         entry = first[cik]
         builder.security(primary_security_id(cik), cik, entry.company_name, entry.accepted_at)
@@ -1134,10 +1174,11 @@ def build_master(
                 pages,
                 source.filename_listings(cik),
                 cik in getattr(source, "filename_incomplete_ciks", ()),
-                [item for item in index if item.cik == cik],
+                filename_index.get(cik, ()),
                 delistings.get(cik, ()),
                 filename_form25_accessions,
                 filename_counts,
+                filename_conflict_ciks,
             )
     for entries in by_cik.values():  # snapshot names with no issuer filing
         builder.unmatched.extend(entries)
@@ -1167,6 +1208,7 @@ def build_master(
         filename_counts=dict(filename_counts),
         filename_form25_accessions=tuple(filename_form25_accessions),
         filename_enabled=settings.edgar.filename_listings,
+        filename_conflict_ciks=tuple(filename_conflict_ciks),
     )
 
 
@@ -1200,8 +1242,10 @@ def build_chains(
         return ChainBuild((), ())
     index = {
         (entry.cik, entry.accession): entry
-        for successor_cik in {security_cik(successor) for _, successor, _ in entries}
-        for entry in _filing_index_for_cik(source, successor_cik)
+        for found in _filing_index_by_cik(
+            source, {security_cik(successor) for _, successor, _ in entries}
+        ).values()
+        for entry in found
     }
     securities = {row["security_id"]: row for row in master.securities}
     listings: dict[str, list[Row]] = defaultdict(list)
@@ -1379,8 +1423,14 @@ def _filename_rows(
     delistings: Sequence[DelistingFiling],
     form25_accessions: list[str],
     counts: dict[str, int],
+    conflicts: list[str],
 ) -> None:
-    """Derive 10-K names first, then Form 25 names only as a last resort."""
+    """Derive 10-K names first, then Form 25 names only as a last resort.
+
+    Every ticker key is `normalize_ticker`'s (#2929: a Form 25 file name
+    spells `avy25`, the cover page `AVY25`). A CIK whose readings name one
+    ticker for two classes fails closed: no `filing_name` row, counted as
+    `filename_conflicts` and listed in `conflicts`; the build goes on."""
     settings = builder.settings
     for record in records:
         if record.accepted_at > builder.ingested_at:
@@ -1401,10 +1451,12 @@ def _filename_rows(
         ),
         None,
     )
-    class_by_ticker = {ticker: cls.security_id for cls in classes for ticker, _ in cls.pairs}
+    class_by_ticker = {
+        normalize_ticker(ticker): cls.security_id for cls in classes for ticker, _ in cls.pairs
+    }
     first_page_classes = {
-        (row["ticker"], row["exchange"]): row["security_id"]
-        for row in builder.listings
+        (normalize_ticker(row["ticker"]), row["exchange"]): row["security_id"]
+        for row in builder.cik_listings(cik)  # #2927: this CIK's rows, not every row
         if first_page is not None
         and row["known_at"] == first_page.accepted_at
         and security_cik(row["security_id"]) == cik  # #1662: no other CIK's same-second row
@@ -1416,7 +1468,8 @@ def _filename_rows(
                     ClassTicker(
                         item.ticker,
                         first_page_classes.get(
-                            (item.ticker, item.exchange), class_by_ticker.get(item.ticker, cik)
+                            (normalize_ticker(item.ticker), item.exchange),
+                            class_by_ticker.get(normalize_ticker(item.ticker), cik),
                         ),
                     )
                     for item in first_page.listings
@@ -1429,7 +1482,9 @@ def _filename_rows(
     form25 = [r for r in records if r.form in {"25", "25-NSE"}]
     form25_accessions.extend(r.accession for r in form25)
     form25_readings = [
-        IndependentReading((ClassTicker(r.ticker, class_by_ticker.get(r.ticker, cik)),))
+        IndependentReading(
+            (ClassTicker(r.ticker, class_by_ticker.get(normalize_ticker(r.ticker), cik)),)
+        )
         for r in form25
     ]
     forms = frozenset(settings.edgar.filename_listing_forms)
@@ -1452,16 +1507,21 @@ def _filename_rows(
     accessions = {r.accession for r in annual}
     counts["filename_no_instance"] += sum(item.accession not in accessions for item in annual_index)
     counts["filename_no_exchange"] += sum(r.exchange is None for r in annual)
-    accepted = confirm_filename_listings(
-        annual,
-        cover_readings=cover_readings,
-        form25_readings=form25_readings,
-        first_cover_accepted_at=first_at,
-        first_cover_prefix=first_prefix,
-        primary_class_id=cik,
-        refused=settings.edgar.filename_listings_refused,
-        forms=forms,
-    )
+    try:
+        accepted = confirm_filename_listings(
+            annual,
+            cover_readings=cover_readings,
+            form25_readings=form25_readings,
+            first_cover_accepted_at=first_at,
+            first_cover_prefix=first_prefix,
+            primary_class_id=cik,
+            refused=settings.edgar.filename_listings_refused,
+            forms=forms,
+        )
+    except FilenameClassConflict:
+        counts["filename_conflicts"] += 1
+        conflicts.append(cik)
+        return  # fail closed for this CIK: neither its 10-K nor its Form 25 names
     for result in accepted:
         record = result.filing
         counts[f"filename_{result.verdict}"] += 1
@@ -1473,7 +1533,7 @@ def _filename_rows(
             continue  # a partial answer proves no single reading (T184b)
         builder.listing(
             result.class_id or cik,
-            record.ticker.upper(),
+            normalize_ticker(record.ticker),
             record.exchange,
             None,
             session_of(record.accepted_at),
@@ -1481,9 +1541,9 @@ def _filename_rows(
             provenance="filing_name",
         )
     if first_page_classes:
-        read_classes = {
+        read_classes = {  # #2927: `first_page_classes` holds only `cik`'s ids
             row["security_id"]
-            for row in builder.listings
+            for row in builder.cik_listings(cik)
             if row["provenance"] == "filing_name" and row["known_at"] < first_at
         }
         counts["filename_class_unread"] += len(set(first_page_classes.values()) - read_classes)
@@ -1495,18 +1555,19 @@ def _filename_rows(
         filing = next((f for f in delistings if f.accession == record.accession), None)
         if filing is None:
             continue
-        sid = class_by_ticker.get(record.ticker, cik)
+        ticker = normalize_ticker(record.ticker)
+        sid = class_by_ticker.get(ticker, cik)
         if any(
             r["security_id"] == sid
-            and r["ticker"] == record.ticker.upper()
+            and normalize_ticker(r["ticker"]) == ticker
             and r["valid_from"] <= session_of(record.accepted_at)
             and r["known_at"] <= record.accepted_at
-            for r in builder.listings
+            for r in builder.cik_listings(security_cik(sid))  # #2927: `sid`'s CIK only
         ):
             continue
         builder.listing(
             sid,
-            record.ticker.upper(),
+            ticker,
             record.exchange,
             None,
             first_session(settings),

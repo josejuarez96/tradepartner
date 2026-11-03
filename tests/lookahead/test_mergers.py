@@ -5,6 +5,7 @@ a trial reads touches the table."""
 
 from __future__ import annotations
 
+import ast
 import re
 from datetime import timedelta
 from pathlib import Path
@@ -69,6 +70,40 @@ def test_mergers_are_truncation_invariant(fixture_store: duckdb.DuckDBPyConnecti
 )
 def test_nothing_a_trial_reads_names_the_mergers_table(path: Path) -> None:
     """No backtest module, `universe.py`, the signals (`backtest/signals*.py`) or
-    the survivorship gap reads `mergers`: the table's one reader is the paper
-    reconciliation (spec "Consumers")."""
-    assert re.search(r"\bmergers(_as_of)?\b", path.read_text()) is None
+    the survivorship gap reads `mergers` (spec "Consumers"), except the one read the
+    delisting failure-return amendment adds (#2670, plan T328b): the provider's
+    `merger_exits`, read only at the data cutoff under a non-`none` policy and
+    tested for look-ahead in `tests/backtest/test_store_provider.py`."""
+    text = path.read_text()
+    if path.relative_to(_SRC) in _T328B_READERS:
+        text = _without_merger_exits(text)
+    assert re.search(r"\bmergers(_as_of)?\b", text) is None
+
+
+#: The modules allowed to name `mergers`, each only inside `merger_exits` (T328b).
+_T328B_READERS = {Path("backtest/provider.py"), Path("backtest/store_provider.py")}
+
+
+def _without_merger_exits(text: str) -> str:
+    """`text` with the `merger_exits` method, the module docstring and the import list
+    left out, so a second reader of `mergers` in the module still fails the guard."""
+    tree = ast.parse(text)
+    lines = text.splitlines(keepends=True)
+    drop: set[int] = set()
+    doc = tree.body[0]
+    if isinstance(doc, ast.Expr) and isinstance(doc.value, ast.Constant):
+        drop.update(range(doc.lineno, (doc.end_lineno or doc.lineno) + 1))
+    for node in ast.walk(tree):
+        is_reader = isinstance(node, ast.FunctionDef) and node.name == "merger_exits"
+        is_import = isinstance(node, ast.ImportFrom) and node.module == "tradepartner.store.asof"
+        if is_reader or is_import:
+            drop.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+    return "".join(line for number, line in enumerate(lines, 1) if number not in drop)
+
+
+def test_the_guard_still_catches_a_second_mergers_reader() -> None:
+    """The T328b exemption covers `merger_exits` only."""
+    source = (_SRC / "backtest" / "store_provider.py").read_text()
+    assert re.search(r"\bmergers_as_of\b", _without_merger_exits(source)) is None
+    planted = source + "\n\ndef _sneak(conn):\n    return mergers_as_of(conn, None)\n"
+    assert re.search(r"\bmergers_as_of\b", _without_merger_exits(planted)) is not None

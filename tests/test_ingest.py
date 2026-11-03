@@ -115,7 +115,7 @@ from tradepartner.store.classify import build_classifications, classifications_a
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.filing_index import FilingRow
 from tradepartner.store.filing_index import by_cik as stored_index_by_cik
-from tradepartner.store.master import Chain, MasterBuild, build_chains, build_master
+from tradepartner.store.master import Chain, MasterBuild, build_chains, build_master, security_cik
 from tradepartner.store.retraction import retraction
 from tradepartner.store.schema import init_schema
 
@@ -6162,6 +6162,127 @@ def test_the_rebuild_needs_the_edgar_source(settings: Settings) -> None:
         _run(_events_on(settings), source="alpaca", rebuild_filing_events=True)
 
 
+# --- a rebuild replaces per CIK, never wiping a CIK whose read is empty (#2956) --
+
+_DUAL_F1 = f"{DUAL}-19-000101"
+_BOTH_STATEMENTS = (
+    *_components(F1, AT1),
+    _sf("revenue", 7, _DUAL_F1, AT1, cik=DUAL),
+    _sf("total_assets", 9, _DUAL_F1, AT1, cik=DUAL, period=(None, FY18[1])),
+)
+_DUAL_EVENT = FilingEvent(DUAL, _DUAL_F1, "8-K", "2.02", datetime(2019, 5, 2, 20, 5, tzinfo=UTC))
+
+
+def _all_statement_rows(read: Callable[[str], list[tuple[Any, ...]]]) -> list[tuple[Any, ...]]:
+    return read("SELECT * FROM statement_facts ORDER BY ALL")
+
+
+def _all_event_rows(read: Callable[[str], list[tuple[Any, ...]]]) -> list[tuple[Any, ...]]:
+    return read("SELECT * FROM filing_events ORDER BY ALL")
+
+
+def test_a_statement_rebuild_keeps_a_cik_whose_read_is_empty(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#2956: DUAL's statement cache is missing on the rebuild's day, so its read
+    is empty. Its stored rows stay, known_at and all, and it is counted; ACME,
+    which reads rows, is replaced."""
+    on = _switched(settings)
+    _edgar(on, _StatementSource(_BOTH_STATEMENTS))
+    dual_before = read(f"SELECT * FROM statement_facts WHERE cik = '{DUAL}' ORDER BY ALL")
+    assert len(dual_before) == 2
+    acme_only = [r for r in _BOTH_STATEMENTS if r.cik == ACME]
+    rebuilt = _edgar(on, _StatementSource(acme_only), rebuild_statement_facts=True)
+    counts = statement_counts(rebuilt.message)
+    acme_rows = read(f"SELECT count(*) FROM statement_facts WHERE cik = '{ACME}'")[0][0]
+    assert (counts["deleted"], counts["added"]) == (acme_rows, acme_rows)
+    assert counts["rebuild_kept_empty_read"] == 1
+    assert f"statement_rebuild_kept_empty_read: 1 (first: {DUAL})" in rebuilt.message
+    assert read(f"SELECT * FROM statement_facts WHERE cik = '{DUAL}' ORDER BY ALL") == dual_before
+
+
+def test_a_statement_rebuild_with_the_switch_off_refuses_and_keeps_every_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _switched(settings)
+    source = _StatementSource(_BOTH_STATEMENTS)
+    _edgar(on, source)
+    before = _all_statement_rows(read)
+    assert before
+    with pytest.raises(ValueError, match="statement_facts_enabled"):
+        _run(
+            _switched(settings, False), filings=source, source="edgar", rebuild_statement_facts=True
+        )
+    assert _all_statement_rows(read) == before
+
+
+def test_a_statement_rebuild_of_ciks_that_read_rows_writes_todays_rows(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """Pinned: when every CIK reads rows, the rebuild's rows are exactly a fresh
+    ingest's into an empty table (the old delete-all-then-insert), and
+    `deleted` is every stored row."""
+    on = _switched(settings)
+    _edgar(on, _StatementSource([_sf("revenue", 110, F2, AT2), *_BOTH_STATEMENTS[2:]]))
+    stored = read("SELECT count(*) FROM statement_facts")[0][0]
+    late = [_sf("revenue", 100, F1, AT1), _sf("revenue", 110, F2, AT2), *_BOTH_STATEMENTS]
+    rebuilt = _edgar(on, _StatementSource(late), rebuild_statement_facts=True)
+    counts = statement_counts(rebuilt.message)
+    assert counts["deleted"] == stored
+    assert counts["rebuild_kept_empty_read"] == 0
+    rows = _all_statement_rows(read)
+    with open_for_write(on) as conn:
+        conn.execute("DELETE FROM statement_facts")
+    fresh = _edgar(on, _StatementSource(late))
+    assert _all_statement_rows(read) == rows
+    fresh_counts = statement_counts(fresh.message)
+    for name in ("added", "held", "vintage_late", "restated", "derived"):
+        assert counts[name] == fresh_counts[name], name
+
+
+def test_an_events_rebuild_keeps_a_cik_whose_read_is_empty(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _events_on(settings)
+    _edgar(on, _EventSource((*EVENTS, _DUAL_EVENT)))
+    dual_before = read(f"SELECT * FROM filing_events WHERE cik = '{DUAL}'")
+    assert len(dual_before) == 1
+    rebuilt = _edgar(on, _EventSource(EVENTS), rebuild_filing_events=True)
+    counts = filing_event_counts(rebuilt.message)
+    assert (counts["before"], counts["added"], counts["after"]) == (4, 3, 4)
+    assert counts["rebuild_kept_empty_read"] == 1
+    assert f"filing_events_rebuild_kept_empty_read: 1 (first: {DUAL})" in rebuilt.message
+    assert read(f"SELECT * FROM filing_events WHERE cik = '{DUAL}'") == dual_before
+
+
+def test_an_events_rebuild_with_the_switch_off_refuses_and_keeps_every_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    source = _EventSource((*EVENTS, _DUAL_EVENT))
+    _edgar(_events_on(settings), source)
+    before = _all_event_rows(read)
+    assert len(before) == 4
+    with pytest.raises(ValueError, match="filing_events_enabled"):
+        _run(settings, filings=source, source="edgar", rebuild_filing_events=True)
+    assert _all_event_rows(read) == before
+
+
+def test_an_events_rebuild_of_ciks_that_read_rows_writes_todays_rows(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _events_on(settings)
+    _edgar(on, _EventSource((EVENTS[0], _DUAL_EVENT)))
+    rebuilt = _edgar(on, _EventSource((*EVENTS, _DUAL_EVENT)), rebuild_filing_events=True)
+    counts = filing_event_counts(rebuilt.message)
+    assert (counts["before"], counts["added"], counts["after"]) == (2, 4, 4)
+    assert counts["rebuild_kept_empty_read"] == 0
+    rows = _all_event_rows(read)
+    with open_for_write(on) as conn:
+        conn.execute("DELETE FROM filing_events")
+    _edgar(on, _EventSource((*EVENTS, _DUAL_EVENT)))
+    assert _all_event_rows(read) == rows
+
+
 # --- the store restamp from a stamps-repair manifest (#1382, T166b) ----------
 
 
@@ -6782,6 +6903,58 @@ def test_filename_form25_unmatched_counts_only_an_exchange_mismatch() -> None:
     )
     text = ingest_module._filename_counts(master, delistings, SimpleNamespace())  # type: ignore[arg-type]
     assert "filename_form25_unmatched: 1" in text
+
+
+def test_filename_counts_name_the_conflicting_ciks() -> None:
+    # #2929: a class conflict fails one CIK closed; the run message counts it
+    # and names the first few CIKs, so the owner can look them up.
+    from types import SimpleNamespace
+
+    ciks = tuple(f"{n:010d}" for n in range(1, 8))
+    master = SimpleNamespace(
+        filename_enabled=True,
+        filename_counts={"filename_conflicts": 7},
+        filename_conflict_ciks=ciks,
+        listings=[],
+    )
+    delistings = SimpleNamespace(unmatched=(), delistings=())
+    text = ingest_module._filename_counts(master, delistings, SimpleNamespace())  # type: ignore[arg-type]
+    assert "; filename_conflicts: 7" in text
+    assert text.endswith(f"; filename_conflict_ciks: {', '.join(ciks[:5])} (+2)")
+    quiet = SimpleNamespace(
+        filename_enabled=True, filename_counts={}, filename_conflict_ciks=(), listings=[]
+    )
+    text = ingest_module._filename_counts(quiet, delistings, SimpleNamespace())  # type: ignore[arg-type]
+    assert "; filename_conflicts: 0" in text
+    assert "filename_conflict_ciks" not in text
+
+
+def test_a_filename_fetch_failed_cik_is_not_judged() -> None:
+    # #2932 (quant-auditor): a CIK failed closed on a filename fetch has no
+    # answer, so the master check and `master-retract` must not judge it.
+    from types import SimpleNamespace
+
+    source = SimpleNamespace(filename_fetch_failed_ciks={"0000320193": "HTTPStatusError: 503"})
+    unjudged = ingest_module._unjudged_ciks(source)  # type: ignore[arg-type]
+    assert unjudged.ciks == frozenset({"0000320193"})
+
+
+def test_filename_counts_name_the_fetch_failed_ciks() -> None:
+    # #2932: a CIK whose filename fetch failed past the retries is failed
+    # closed; the run message counts it and names the first few CIKs.
+    from types import SimpleNamespace
+
+    ciks = {f"{n:010d}": "HTTPStatusError: 503" for n in range(1, 8)}
+    master = SimpleNamespace(
+        filename_enabled=True, filename_counts={}, filename_conflict_ciks=(), listings=[]
+    )
+    delistings = SimpleNamespace(unmatched=(), delistings=())
+    source = SimpleNamespace(filename_fetch_failed_ciks=ciks)
+    text = ingest_module._filename_counts(master, delistings, source)  # type: ignore[arg-type]
+    shown = ", ".join(list(ciks)[:5])
+    assert f"; filename fetch incomplete: 7 ({shown}, +2)" in text
+    clean = ingest_module._filename_counts(master, delistings, SimpleNamespace())  # type: ignore[arg-type]
+    assert "filename fetch incomplete" not in clean
 
 
 # --- the borrow-status snapshot (#1506, T171c; ADR 0021) --------------------
@@ -10929,6 +11102,7 @@ def test_statement_backfill_refuses_a_per_name_edit_beside_the_addition(
     result = _backfill(edited)
     assert result.runs[0].status == FAILED
     assert "per-name list changed" in result.runs[0].message
+    assert "revert it before the nightly" in result.runs[0].message
     assert read("SELECT count(*) FROM ingestion_runs") == before
 
 
@@ -10946,6 +11120,55 @@ def test_the_nightly_window_starts_at_the_last_index_read_not_the_backfill(
         cursor, previous_at = ingest_module._last_ok_index_row(conn)
     assert cursor == '{"per_name": "backfill"}'
     assert previous_at == NOW
+
+
+def test_the_nightly_index_read_ignores_the_backfills_finish_time(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2873: `_prepare_index` (the nightly's index step) hands `select_quarters`
+    the last index-reading ok row's finish, not a later statement backfill's."""
+    from tradepartner.adapters import edgar_raw, index_reconcile
+
+    run_at = datetime(2026, 1, 3, tzinfo=UTC)
+    edgar = settings.edgar.model_copy(
+        update={"index_first_year": 2026, "cache_dir": str(tmp_path / "edgar-cache")}
+    )
+    configured = settings.model_copy(update={"edgar": edgar})
+    with open_for_write(configured) as conn:
+        init_schema(conn)
+        for run_id, mode, finished in (
+            ("night", "session", run_at - timedelta(days=2)),
+            ("backfill", "statement_backfill", run_at - timedelta(days=1)),
+        ):
+            row = SourceRun("edgar_index", OK, 0, "{}", "done")
+            ingest_module.write_run(conn, run_id, finished, finished, row, mode)
+    seen: list[datetime | None] = []
+    real = index_reconcile.select_quarters
+
+    def spy(**kwargs: Any) -> Any:
+        seen.append(kwargs["last_ok_run_at"])
+        return real(**kwargs)
+
+    monkeypatch.setattr(index_reconcile, "select_quarters", spy)
+    monkeypatch.setattr(
+        edgar_raw, "daily_index_listing", lambda *_a, **_k: {"directory": {"item": []}}
+    )
+    source = EdgarFilingSource(configured, clock=lambda: run_at)
+    ingest_module._prepare_index(configured, source, run_at)
+    assert seen == [run_at - timedelta(days=2)]
+
+
+def test_statement_backfill_refuses_an_edgar_adapter_outside_its_mode(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#2873: a real adapter built without the statement-backfill mode could
+    fetch, so the session refuses it before any write."""
+    _, added = _seeded_for_backfill(settings)
+    before = read("SELECT count(*) FROM ingestion_runs")
+    adapter = EdgarFilingSource(added, clock=lambda: NOW, reuse_cached=True)
+    with pytest.raises(ValueError, match="statement-backfill mode"):
+        _backfill(added, adapter)
+    assert read("SELECT count(*) FROM ingestion_runs") == before
 
 
 def test_incremental_rotation_ignores_retracted_and_superseded_stored_rows(
@@ -11054,3 +11277,151 @@ def test_index_manifest_credits_a_stamped_pending_row_only_to_a_body_that_lists_
         False,
     )
     assert [row["key"][1] for row in entry["rows"]] == [listed.accession]
+
+
+# --- #2927: per-CIK reads of a full list group it once ----------------------
+
+
+class _CountingIndex(tuple[FilingIndexEntry, ...]):
+    """A full filing index, counting each pass over it."""
+
+    passes = 0
+
+    def __iter__(self) -> Iterator[FilingIndexEntry]:
+        type(self).passes += 1
+        return super().__iter__()
+
+
+class _NoCikQuery:
+    """A source with only a full index (no `filing_index_for_cik`)."""
+
+    def __init__(self, entries: Sequence[FilingIndexEntry]) -> None:
+        self.entries = entries
+
+    def filing_index(self, since: datetime | None = None) -> Sequence[FilingIndexEntry]:
+        return self.entries
+
+
+def _spread_index(ciks: int, per_cik: int) -> list[FilingIndexEntry]:
+    entries = [
+        FilingIndexEntry(
+            f"{c + 1:010d}",
+            f"Co {c}",
+            ("10-K", "8-K", "4")[(c + n) % 3],
+            f"{c + 1:010d}-{n:02d}-{c:06d}",
+            _at(2010, 1, 4) + timedelta(minutes=n * ciks + (c * 7919) % ciks),
+        )
+        for c in range(ciks)
+        for n in range(per_cik)
+    ]
+    return sorted(entries, key=lambda e: (e.accepted_at, e.accession, e.cik))
+
+
+def test_recorded_per_cik_fallback_groups_the_index_once_in_order() -> None:
+    """#2927: `_Recorded.filing_index_for_cik` over a source with no CIK query
+    scanned the whole recorded index per CIK. It now groups it once; each
+    CIK's answer is the old filter's, in order, and a caller's edit of one
+    answer never reaches the next."""
+    walked = _spread_index(ciks=2_000, per_cik=5)
+    _CountingIndex.passes = 0
+    recorded = _Recorded(_NoCikQuery(_CountingIndex(walked)))  # type: ignore[arg-type]
+    ciks = sorted({e.cik for e in walked})
+    for cik in ciks:
+        assert recorded.filing_index_for_cik(cik) == [e for e in walked if e.cik == cik]
+    assert recorded.filing_index_for_cik("0000999999") == []
+    recorded.filing_index_for_cik(ciks[0]).clear()
+    assert recorded.filing_index_for_cik(ciks[0]) == [e for e in walked if e.cik == ciks[0]]
+    assert _CountingIndex.passes == 1  # was one per CIK asked
+
+
+def _old_filename_form25_counts(master: Any, delistings: Any) -> tuple[int, int]:
+    """The #1662 counts as written before #2927 (a walk per Form 25)."""
+    unmatched = sum(
+        1
+        for row in delistings.unmatched
+        if any(
+            security_cik(listing["security_id"]) == row.cik
+            and listing["provenance"] == "filing_name"
+            and listing["known_at"] <= row.accepted_at
+            for listing in master.listings
+        )
+        and not any(
+            security_cik(listing["security_id"]) == row.cik
+            and listing["provenance"] == "filing_name"
+            and listing["known_at"] <= row.accepted_at
+            and listing["exchange"] == row.exchange
+            for listing in master.listings
+        )
+    )
+    transfers = sum(
+        1
+        for row in delistings.delistings
+        if row["filed_at"].year < 2019
+        and any(
+            listing["security_id"] == row["security_id"]
+            and listing["exchange"] != row["exchange"]
+            and listing["known_at"] > row["filed_at"]
+            and listing["provenance"] == "filing_name"
+            for listing in master.listings
+        )
+    )
+    return unmatched, transfers
+
+
+def test_filename_form25_counts_equal_the_walk_and_read_the_rows_once() -> None:
+    """#2927: the #1662 Form 25 counts group the `filing_name` rows once
+    (by CIK, by security) instead of walking every listing per Form 25,
+    with the counts the walk gave."""
+
+    class Rows(tuple[dict[str, Any], ...]):
+        passes = 0
+
+        def __iter__(self) -> Iterator[dict[str, Any]]:
+            type(self).passes += 1
+            return super().__iter__()
+
+    exchanges = ("NYSE", "NASDAQ", "NYSE_AMERICAN")
+    ciks = [f"{c + 1:010d}" for c in range(60)]
+    listings = [
+        {
+            "security_id": cik if n % 2 else f"{cik}:w",
+            "provenance": ("filing_name", "filing", "snapshot_static")[(c + n) % 3],
+            "known_at": _at(2015 + n, 3, 1),
+            "exchange": exchanges[(c * n) % 3],
+        }
+        for c, cik in enumerate(ciks)
+        for n in range(4)
+    ]
+    unmatched = tuple(
+        SimpleNamespace(
+            cik=cik,
+            accession=f"U-{c}",
+            accepted_at=_at(2016 + c % 4, 6, 1),
+            exchange=exchanges[c % 3],
+        )
+        for c, cik in enumerate(ciks)
+    )
+    delisted = tuple(
+        {
+            "security_id": cik if c % 2 else f"{cik}:w",
+            "exchange": exchanges[(c + 1) % 3],
+            "filed_at": _at(2014 + c % 6, 9, 1),
+        }
+        for c, cik in enumerate(ciks)
+    )
+    master = SimpleNamespace(
+        filename_enabled=True,
+        filename_counts={},
+        filename_form25_accessions=(),
+        listings=Rows(listings),
+    )
+    delistings = SimpleNamespace(unmatched=unmatched, delistings=delisted)
+    old_unmatched, old_transfers = _old_filename_form25_counts(
+        SimpleNamespace(listings=listings), delistings
+    )
+    assert old_unmatched and old_transfers  # the fixture exercises both counts
+    Rows.passes = 0
+    text = ingest_module._filename_counts(master, delistings, SimpleNamespace())  # type: ignore[arg-type]
+    assert f"; filename_form25_unmatched: {old_unmatched};" in f"{text};"
+    assert f"; filename_transfers_delisted: {old_transfers};" in f"{text};"
+    assert Rows.passes == 1  # was 2 per unmatched Form 25 plus 1 per pre-2019 delisting

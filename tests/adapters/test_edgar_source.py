@@ -14,13 +14,17 @@ from __future__ import annotations
 import gzip
 import hashlib
 import io
+import itertools
 import json
 import shutil
+import threading
+import time
 import zipfile
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 import httpx
@@ -46,6 +50,7 @@ from tradepartner.adapters.edgar_source import (
     FSN_VERSION,
     STAMPS_LAYOUT,
     EdgarFilingSource,
+    FilingFailuresError,
     SubmissionRecord,
     reduce_submissions,
 )
@@ -3475,6 +3480,358 @@ def test_filename_document_read_stops_at_the_configured_cap(tmp_path: Path) -> N
     assert source.filename_no_exchange >= 1
 
 
+# --- filing-name listings: the bounded fetch pool (#2932) -------------------
+
+
+def _fn_run(tmp_path: Path, router: EdgarRouter, workers: int) -> dict[str, Any]:
+    """One `filename_listings` run at `workers`: the answer, the cache file's
+    bytes and every count the run leaves, for a byte-for-byte comparison."""
+    source = _fn_source(tmp_path, router, filename_fetch_workers=workers)
+    listings = source.filename_listings(_FN_CIK)
+    cache_file = tmp_path / "cache" / "filename" / "v1" / f"{_FN_CIK}.json"
+    return {
+        "listings": listings,
+        "cache": cache_file.read_bytes(),
+        "counts": (
+            source.filename_10ks_read,
+            source.filename_no_instance,
+            source.filename_no_exchange,
+            source.filename_form25_read,
+            source.filename_form25_no_exhibit,
+            source.filename_form25_uncached,
+            source.filename_fsn_no_symbol_only,
+            source.filename_fsn_missing,
+            source.filename_index_fetches,
+            source.filename_document_fetches,
+            source.failed_filings,
+            source.requests,
+        ),
+        "incomplete": set(source.filename_incomplete_ciks),
+        "failures": dict(source._pending_failures),
+    }
+
+
+def test_filename_fetch_workers_defaults_to_four_and_refuses_zero() -> None:
+    assert Settings(_env_file=None).edgar.filename_fetch_workers == 4
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, edgar={"filename_fetch_workers": 0})
+
+
+@pytest.mark.parametrize("workers", [2, 4, 8])
+def test_filename_pool_answer_is_byte_identical_to_the_sequential_fetch(
+    tmp_path: Path, workers: int
+) -> None:
+    """The pool only prefetches: the answer (order included), the cache
+    file's bytes and every count equal the one-at-a-time run's."""
+    sequential = _fn_run(tmp_path / "one", _fn_router(), 1)
+    router = _fn_router()
+    pooled = _fn_run(tmp_path / "pool", router, workers)
+    assert pooled == sequential
+    assert [e.accession for e in pooled["listings"]] == [_FN_A, _FN_B, _FN_25_NASDAQ, _FN_COVER]
+    # The same requests, each asked once (the order across threads is free).
+    seq_router = _fn_router()
+    _fn_run(tmp_path / "again", seq_router, 1)
+    assert sorted(router.urls) == sorted(seq_router.urls)
+
+
+def test_filename_pool_of_one_is_todays_sequential_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`filename_fetch_workers = 1` starts no thread and asks in stamp order."""
+
+    def no_pool(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a pool of one starts no thread pool")
+
+    monkeypatch.setattr(edgar_source_module, "ThreadPoolExecutor", no_pool)
+    router = _fn_router()
+    _fn_run(tmp_path, router, 1)
+    asked = [u for u in router.urls if "/Archives/" in u]
+    assert asked == [
+        _fn_url(_FN_A, "index.json"),
+        _fn_url(_FN_A, "doc.htm"),
+        _fn_url(_FN_B, "index.json"),
+        _fn_url(_FN_B, "doc.htm"),
+        _fn_url(_FN_C, "index.json"),
+        _fn_url(_FN_COVER, "index.json"),
+        _fn_url(_FN_25_NASDAQ, "index.json"),
+        _fn_url(_FN_25_NYSE, "index.json"),
+    ]
+
+
+def test_filename_pool_runs_requests_concurrently(tmp_path: Path) -> None:
+    """At 4 workers more than one request is in flight at once (the point)."""
+    router = _fn_router()
+    lock = threading.Lock()
+    state = {"now": 0, "max": 0}
+
+    def slow(inner: Any) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            with lock:
+                state["now"] += 1
+                state["max"] = max(state["max"], state["now"])
+            time.sleep(0.05)
+            with lock:
+                state["now"] -= 1
+            return cast(httpx.Response, inner(request))
+
+        return handler
+
+    for accession in (_FN_A, _FN_B, _FN_C, _FN_COVER):
+        url = _fn_url(accession, "index.json")
+        router.add(url, slow(router._routes[url]))
+    _fn_run(tmp_path, router, 4)
+    assert state["max"] >= 2
+
+
+class _FakeClock:
+    """`edgar_raw`'s `time`: a fake clock that `sleep` moves on to the
+    sleeper's own wake time, so the limiter's spacing is measured without
+    waiting for it. Two threads sleeping at once overlap (the clock moves to
+    the later wake time, never the sum), as real sleeps do, so a limiter that
+    let two requests through on one stale stamp would show a short gap."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._now = 1000.0
+
+    def monotonic(self) -> float:
+        with self._lock:
+            return self._now
+
+    def sleep(self, seconds: float) -> None:
+        with self._lock:
+            wake = self._now + max(seconds, 0.0)
+        time.sleep(0.002)  # real: let another thread run while this one sleeps
+        with self._lock:
+            self._now = max(self._now, wake)
+
+
+class _StampingLock:
+    """The limiter's own lock, recording the request stamp it leaves inside
+    its critical section, so the stamps are the real limiter's."""
+
+    def __init__(self, limiter: Any) -> None:
+        self._lock = threading.Lock()
+        self._limiter = limiter
+        self.stamps: list[float] = []
+
+    def __enter__(self) -> None:
+        self._lock.acquire()
+
+    def __exit__(self, *_exc: object) -> None:
+        self.stamps.append(self._limiter._last_request_monotonic)
+        self._lock.release()
+
+
+def test_filename_pool_never_exceeds_requests_per_second(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Four threads share the one process-wide limiter: every request start
+    is at least `1 / requests_per_second` after the one before it."""
+    clock = _FakeClock()
+    monkeypatch.setattr(edgar_raw, "time", clock)
+    limiter = edgar_raw._RateLimiter()
+    stamping = _StampingLock(limiter)
+    limiter._lock = stamping  # type: ignore[assignment]
+    monkeypatch.setattr(edgar_raw, "_LIMITER", limiter)
+    router = _fn_router()
+
+    def slow(inner: Any) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            time.sleep(0.01)  # real latency, so the threads overlap
+            return cast(httpx.Response, inner(request))
+
+        return handler
+
+    for url in list(router._routes):
+        router.add(url, slow(router._routes[url]))
+    source = _fn_source(tmp_path, router, filename_fetch_workers=4, requests_per_second=9.0)
+    source.filename_listings(_FN_CIK)
+
+    archive_requests = [u for u in router.urls if "/Archives/" in u]
+    assert len(archive_requests) == 8
+    assert len(stamping.stamps) == len(router.urls)
+    gaps = [b - a for a, b in itertools.pairwise(stamping.stamps)]
+    assert min(gaps) >= 1 / 9.0 - 1e-9
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_filename_pool_one_failed_request_fails_closed_for_its_cik(
+    tmp_path: Path, workers: int
+) -> None:
+    """A 404 on one filing: counted, not cached, the CIK listed partial,
+    exactly as the sequential fetch does."""
+    router = _fn_router()
+    router.add(_fn_url(_FN_B, "doc.htm"), 404)
+    run = _fn_run(tmp_path, router, workers)
+    assert _FN_B not in {e.accession for e in run["listings"]}
+    assert run["incomplete"] == {_FN_CIK}
+    assert set(run["failures"]) == {_FN_B}
+    assert _FN_B not in json.loads(run["cache"])["records"]
+    reference = _fn_router()
+    reference.add(_fn_url(_FN_B, "doc.htm"), 404)
+    assert run == _fn_run(tmp_path / "seq", reference, 1)
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+@pytest.mark.parametrize("failure", ["500", "503", "timeout", "connect"])
+def test_filename_fetch_failing_past_retries_fails_its_cik_closed(
+    tmp_path: Path, workers: int, failure: str
+) -> None:
+    """#2932: a 5xx or transport error that survives the retries fails this
+    CIK closed: no answer, listed incomplete and fetch-failed with its error,
+    the failed filing uncached (the ones before it in stamp order cached as
+    the sequential run caches them), and no raise, so the run's other CIKs
+    go on. A healed rerun asks only what was not cached and answers fully."""
+    router = _fn_router()
+    url = _fn_url(_FN_C, "index.json")
+    if failure in ("500", "503"):
+        router.add(url, int(failure))
+    else:
+        error = httpx.ReadTimeout if failure == "timeout" else httpx.ConnectError
+
+        def broken(request: httpx.Request) -> httpx.Response:
+            raise error("down", request=request)
+
+        router.add(url, broken)
+    fast = {"retry_max_attempts": 2, "retry_backoff_seconds": 0.001}
+    source = _fn_source(tmp_path, router, filename_fetch_workers=workers, **fast)
+    assert source.filename_listings(_FN_CIK) == []
+    assert source.filename_incomplete_ciks == {_FN_CIK}
+    assert list(source.filename_fetch_failed_ciks) == [_FN_CIK]
+    assert source.failed_filings == 0  # not a per-filing failure: nothing quarantines
+    assert source.filename_10ks_read == 0  # a failed CIK's readings are not counted
+    stored = json.loads((tmp_path / "cache" / "filename" / "v1" / f"{_FN_CIK}.json").read_text())
+    assert set(stored["records"]) == {_FN_A, _FN_B}
+
+    healed_router = _fn_router()
+    healed = _fn_source(tmp_path, healed_router, filename_fetch_workers=workers, **fast)
+    clean = _fn_source(tmp_path / "clean", _fn_router(), filename_fetch_workers=1)
+    assert healed.filename_listings(_FN_CIK) == clean.filename_listings(_FN_CIK)
+    assert healed.filename_fetch_failed_ciks == {}
+    assert _fn_url(_FN_A, "index.json") not in healed_router.urls  # cached, not re-asked
+
+
+def test_filename_pool_sends_nothing_while_a_block_is_waited_out(tmp_path: Path) -> None:
+    """While SEC's rate-limit block is set, a pool worker sends nothing: each
+    fetch is deferred to the calling thread, which asks them one at a time in
+    stamp order (the first success clears the block), as the sequential
+    fetch does."""
+    edgar_raw._RATE_LIMIT_BLOCK.set()
+    try:
+        router = _fn_router()
+        listings = _fn_source(tmp_path, router, filename_fetch_workers=4).filename_listings(_FN_CIK)
+    finally:
+        edgar_raw._RATE_LIMIT_BLOCK.clear()
+    sequential = _fn_router()
+    assert listings == _fn_source(tmp_path / "seq", sequential).filename_listings(_FN_CIK)
+    assert router.urls == sequential.urls
+
+
+def test_filename_fetch_block_given_up_on_still_raises(tmp_path: Path) -> None:
+    """A `403` the block policy gives up on is not a CIK failure: it raises."""
+    router = _fn_router()
+    router.add(_fn_url(_FN_C, "index.json"), 403)
+    source = _fn_source(tmp_path, router, rate_limit_wait_seconds=0.001)
+    with pytest.raises(httpx.HTTPStatusError):
+        source.filename_listings(_FN_CIK)
+    edgar_raw._RATE_LIMIT_BLOCK.clear()
+
+
+@pytest.mark.parametrize(("asked", "fails"), [(50, False), (49, True)])
+def test_filename_fetch_failures_past_the_share_fail_the_run(
+    tmp_path: Path, asked: int, fails: bool
+) -> None:
+    """One failed CIK of 50 asked is the 2% default and passes; of 49 it is
+    over and `check_failures` fails the run, naming the CIK and its error."""
+    router = _fn_router()
+    router.add(_fn_url(_FN_C, "index.json"), 503)
+    source = _fn_source(tmp_path, router, retry_max_attempts=1)
+    source.filename_listings(_FN_CIK)
+    source._filename_ciks_asked |= {f"{n:010d}" for n in range(1, asked)}
+    if fails:
+        with pytest.raises(
+            FilingFailuresError, match=rf"filename fetch incomplete: 1 of 49.*{_FN_CIK}"
+        ):
+            source.check_failures()
+    else:
+        source.check_failures()
+
+
+def test_filename_fetch_share_counts_only_ciks_that_sent_a_fetch(tmp_path: Path) -> None:
+    """A fully cached CIK sends no filename request and is not in the share's
+    denominator, so a mostly cached build cannot dilute an outage."""
+    router = _fn_router()
+    warm = _fn_source(tmp_path, router)
+    warm.filename_listings(_FN_CIK)
+    assert warm._filename_ciks_asked == {_FN_CIK}
+    cached = _fn_source(tmp_path, router)
+    cached.filename_listings(_FN_CIK)
+    assert cached._filename_ciks_asked == set()
+
+
+def _done(result: Any = None, error: BaseException | None = None) -> Any:
+    future: Any = edgar_source_module.Future()
+    if error is None:
+        future.set_result(result)
+    else:
+        future.set_exception(error)
+    return future
+
+
+def _status_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", _fn_url(_FN_A, "index.json"))
+    return httpx.HTTPStatusError("x", request=request, response=httpx.Response(status))
+
+
+@pytest.mark.parametrize(
+    ("error", "reusable"),
+    [
+        (None, True),
+        (_status_error(404), True),
+        (_status_error(410), True),
+        (_status_error(500), True),
+        (_status_error(503), True),
+        (ValueError("malformed"), True),
+        (httpx.ConnectError("down"), True),
+        (_status_error(403), False),
+        (_status_error(429), False),
+    ],
+)
+def test_filename_prefetch_reuses_all_but_a_rate_limit_block(
+    error: BaseException | None, reusable: bool
+) -> None:
+    """A block's `403`/`429` depends on the other threads (the shared block
+    flag), so it is asked again in order; every other outcome is the one the
+    sequential fetch would get, and is taken as it is."""
+    assert edgar_source_module._prefetch_reusable(_done(error=error)) is reusable
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_filename_pool_a_block_waited_out_reads_as_the_sequential_fetch(
+    tmp_path: Path, workers: int
+) -> None:
+    """A `403` block on one filing, waited out (`rate_limit_wait_seconds`),
+    then served: the answer is the clean run's at either pool size."""
+    router = _fn_router()
+    url = _fn_url(_FN_C, "index.json")
+    served = router._routes[url]
+    calls = {"n": 0}
+
+    def blocked_once(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(403) if calls["n"] == 1 else cast(httpx.Response, served(request))
+
+    router.add(url, blocked_once)
+    source = _fn_source(
+        tmp_path, router, filename_fetch_workers=workers, rate_limit_wait_seconds=0.01
+    )
+    listings = source.filename_listings(_FN_CIK)
+    clean = _fn_source(tmp_path / "clean", _fn_router(), filename_fetch_workers=1)
+    assert listings == clean.filename_listings(_FN_CIK)
+    assert source.failed_filings == 0
+
+
 def test_a_cached_v5_cover_page_is_no_longer_served(settings: Settings) -> None:
     """T181 (#1541): the owner backed `cover_split_contexts` out in the same
     release and the caches go to version 6, so a per-document cover page
@@ -3615,3 +3972,244 @@ def test_pending_settle_check_uses_first_known_filed_on_quarter(
     assert source.delistings() == []
     cik_25, _, accession_25 = rows[1]
     assert accession_25 not in source._load_stamps(cik_25)
+
+
+# --- #2920: the per-CIK fallback groups the walked index once ---------------
+
+
+class _CountingEntries(tuple[FilingIndexEntry, ...]):
+    """The walked index, counting each full pass over it."""
+
+    passes = 0
+
+    def __iter__(self) -> Iterator[FilingIndexEntry]:
+        type(self).passes += 1
+        return super().__iter__()
+
+
+def _interleaved_index(ciks: int, per_cik: int) -> list[FilingIndexEntry]:
+    """`ciks * per_cik` entries in the walk's (accepted_at, accession, cik)
+    order, each CIK's rows spread across the whole list."""
+    start = datetime(2001, 1, 2, 14, 30, tzinfo=UTC)
+    entries = [
+        FilingIndexEntry(
+            f"{c + 1:010d}",
+            f"CO {c}",
+            ("10-K", "8-K", "10-Q")[(c + n) % 3],
+            f"{c + 1:010d}-{n // 100:02d}-{n:06d}",
+            start + timedelta(minutes=n * ciks + (c * 7919) % ciks),
+        )
+        for c in range(ciks)
+        for n in range(per_cik)
+    ]
+    return sorted(entries, key=lambda e: (e.accepted_at, e.accession, e.cik))
+
+
+def test_per_cik_fallback_equals_the_full_index_filter_in_order(settings: Settings) -> None:
+    """#2920: with no stored index, each CIK's rows are exactly the old
+    `[e for e in filing_index() if e.cik == cik]`, in the same order, an
+    unknown CIK has none, and a caller's edit never reaches the next read."""
+    source = _source(settings, EdgarRouter())
+    walked = _interleaved_index(ciks=60, per_cik=25)
+    source._filing_index_entries = tuple(walked)
+    for cik in sorted({e.cik for e in walked}):
+        assert source.filing_index_for_cik(cik) == [e for e in walked if e.cik == cik]
+    assert source.filing_index_for_cik("0000999999") == []
+    first = walked[0].cik
+    source.filing_index_for_cik(first).clear()
+    assert source.filing_index_for_cik(first) == [e for e in walked if e.cik == first]
+
+
+def test_per_cik_fallback_follows_a_rebuilt_index(settings: Settings) -> None:
+    """#2920: the grouping is of the entries the source holds now; a rebuilt
+    index (a new walk, `use_index`) is never answered from the old one."""
+    source = _source(settings, EdgarRouter())
+    walked = _interleaved_index(ciks=5, per_cik=4)
+    source._filing_index_entries = tuple(walked)
+    cik = walked[0].cik
+    assert len(source.filing_index_for_cik(cik)) == 4
+    kept = tuple(e for e in walked if e.cik != cik or e.form == "10-K")
+    source._filing_index_entries = kept
+    assert source.filing_index_for_cik(cik) == [e for e in kept if e.cik == cik]
+
+
+def test_per_cik_fallback_on_the_real_walk_equals_the_filter(settings: Settings) -> None:
+    """#2920: on the quarterly walk itself, every CIK's answer is the filter."""
+    source = _source(settings, _router())
+    entries = source.filing_index()
+    assert entries
+    for cik in {e.cik for e in entries}:
+        assert source.filing_index_for_cik(cik) == [e for e in entries if e.cik == cik]
+
+
+def test_per_cik_fallback_reads_the_whole_index_once_for_every_cik(settings: Settings) -> None:
+    """#2920 (T323a regression): `classify._evidence` asks once per issuer CIK.
+    With `edgar.incremental_index` off each ask copied and scanned the whole
+    multi-million-row index, about 1.2 s per CIK over ~58k CIKs. 200k entries
+    over 20k CIKs now take one pass, however many CIKs are asked."""
+    source = _source(settings, EdgarRouter())
+    walked = _interleaved_index(ciks=20_000, per_cik=10)
+    _CountingEntries.passes = 0
+    source._filing_index_entries = _CountingEntries(walked)
+    ciks = sorted({e.cik for e in walked})
+    answered = sum(len(source.filing_index_for_cik(cik)) for cik in ciks)
+    assert answered == len(walked)
+    assert _CountingEntries.passes == 1
+
+
+# --- #2920: the stored index is read once per binding, not once per CIK -----
+
+
+class _CountingConn:
+    """A store connection counting each query the source sends it."""
+
+    def __init__(self, conn: duckdb.DuckDBPyConnection) -> None:
+        self._conn = conn
+        self.queries = 0
+
+    def execute(self, sql: str, params: Any = None) -> Any:
+        self.queries += 1
+        return self._conn.execute(sql, params or [])
+
+
+_EXCHANGE = "0000000777"  # an exchange: files 25-NSEs listed under itself and the issuer
+
+
+def _stored_index_fixture(ciks: int) -> tuple[duckdb.DuckDBPyConnection, list[str]]:
+    """Issuers with 10-K/8-K/4 history, some delisted by the exchange's
+    shared 25-NSE (the exchange's copy), a revision, filer-only CIKs and
+    pending rows."""
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    names = [f"{9000 + c:010d}" for c in range(ciks)]
+    listings: list[stored_index.Listing] = []
+    for c, cik in enumerate(names):
+        for n, form in enumerate(("10-K", "8-K", "4") if c % 5 else ("SC 13D", "4")):
+            on = date(2026, 9, 1) + timedelta(days=(c + n) % 20)
+            listings.append(
+                stored_index.Listing(
+                    cik,
+                    f"{cik}-26-{n:06d}",
+                    form,
+                    f"Co {c}",
+                    on,
+                    datetime(2026, 9, 1, 14, tzinfo=UTC) + timedelta(minutes=(c * 37 + n) % 900),
+                    on,
+                    True,
+                    n,
+                )
+            )
+        if c % 7 == 3:
+            accession = f"{_EXCHANGE}-26-{c:06d}"
+            for position, listed in enumerate((_EXCHANGE, cik)):
+                listings.append(
+                    stored_index.Listing(
+                        listed,
+                        accession,
+                        "25-NSE",
+                        "Exchange" if listed == _EXCHANGE else f"Co {c}",
+                        date(2026, 9, 21),
+                        datetime(2026, 9, 21, 15, tzinfo=UTC),
+                        date(2026, 9, 21),
+                        True,
+                        position,
+                    )
+                )
+    stored_index.insert_listings(conn, listings, CLOCK - timedelta(days=2))
+    revised = [
+        replace(row, filed_on=row.filed_on + timedelta(days=1), listed_on=date(2026, 9, 23))
+        for row in listings[:: max(1, len(listings) // 10)]
+    ]
+    stored_index.insert_listings(conn, revised, CLOCK - timedelta(days=1))
+    conn.executemany(
+        "INSERT INTO filing_index_pending "
+        "(cik, accession, form, company_name, filed_on, listed_on) "
+        "VALUES (?, ?, ?, 'Issuer', ?, ?)",
+        [
+            (cik, f"{cik}-26-{900:06d}", "10-K", date(2026, 9, 24), date(2026, 9, 24))
+            for cik in names[1::9]
+        ],
+    )
+    return conn, [*names, _EXCHANGE]
+
+
+def _stored_answers(source: EdgarFilingSource, ciks: list[str]) -> list[Any]:
+    return [
+        (
+            cik,
+            source.filing_index_for_cik(cik),
+            source._index_for_cik(cik, first=True),
+            source._is_issuer_cik(cik),
+        )
+        for cik in ciks
+    ]
+
+
+def test_stored_reads_in_one_scan_equal_the_per_cik_reads(tmp_path: Path) -> None:
+    """#2920: the one-scan reads give every CIK exactly what reading it alone
+    gives (rows, order, issuer rule, the exchange's 25-NSE copy dropped), and
+    the full history equals the per-CIK answers."""
+    settings = edgar_settings(tmp_path)
+    conn, ciks = _stored_index_fixture(60)
+    fresh = stored_index.Listing(
+        ciks[2], f"{ciks[2]}-26-000500", "8-K", "Co 2", CLOCK.date(), CLOCK, CLOCK.date(), True
+    )
+    bulk = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    bulk.use_index(conn, [fresh])
+    alone = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    alone.use_index(conn, [fresh], touched_ciks=frozenset())  # every CIK read by itself
+    expected = _stored_answers(alone, ciks)
+    assert _stored_answers(bulk, ciks) == expected
+    assert any(not issuer for *_, issuer in expected) and any(e[1] for e in expected)
+    shared = [e for e in bulk.filing_index() if e.form == "25-NSE"]
+    assert shared and all(e.cik != _EXCHANGE for e in shared)
+    for accession in {e.accession for e in shared}:
+        assert bulk._table_ciks_of(accession) == {
+            row.cik for row in stored_index.accession_listing_order(conn, accession, CLOCK)
+        }
+    walked = bulk.filing_index()
+    for cik in ciks:
+        assert [e for e in walked if e.cik == cik] == alone.filing_index_for_cik(cik)
+    assert sorted(bulk.unstamped_filings, key=lambda r: r.accession) == sorted(
+        alone._pending_rows(), key=lambda r: r.accession
+    )
+
+
+def test_a_touched_binding_reads_its_touched_issuers_in_one_scan(tmp_path: Path) -> None:
+    """#2920: an incremental binding reads its touched issuers together and
+    any other CIK alone, never the whole table for a few CIKs."""
+    settings = edgar_settings(tmp_path)
+    conn, ciks = _stored_index_fixture(40)
+    counting = _CountingConn(conn)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    touched = frozenset(ciks[:10])
+    source.use_index(cast(duckdb.DuckDBPyConnection, counting), touched_ciks=touched)
+    for cik in sorted(touched):
+        source.filing_index_for_cik(cik)
+    after_touched = counting.queries
+    source.filing_index_for_cik(ciks[21])
+    assert source._stored.loaded >= touched & source._stored_issuer_ciks()
+    assert ciks[30] not in source._stored.loaded
+    assert counting.queries > after_touched  # the untouched CIK was read alone
+
+
+@pytest.mark.parametrize("ciks", [50, 500])
+def test_stored_per_cik_reads_take_a_fixed_number_of_queries(tmp_path: Path, ciks: int) -> None:
+    """#2920 (T323a): once T324 seeds the table, every `cik=` read is a scan
+    of ~15M rows, and `classify._evidence`, `_read_stamps` and the full
+    history asked one or more per CIK (~58k). The queries per run no longer
+    grow with the CIK count."""
+    settings = edgar_settings(tmp_path)
+    conn, names = _stored_index_fixture(ciks)
+    counting = _CountingConn(conn)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    source.use_index(cast(duckdb.DuckDBPyConnection, counting))
+    issuers = 0
+    for cik in names:
+        source.filing_index_for_cik(cik)
+        if source._is_issuer_cik(cik):  # a filer-only CIK is still read alone
+            issuers += 1
+            source._index_for_cik(cik, first=True)
+    source.filing_index()
+    assert issuers > ciks // 2
+    assert counting.queries <= 10, counting.queries  # was 337 (50 CIKs), 3,280 (500)

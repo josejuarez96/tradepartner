@@ -25,7 +25,13 @@ from polars.testing import assert_frame_equal
 from backtest.fake_provider import Call, FakeProvider
 from tradepartner import gap as gap_module
 from tradepartner.backtest import store_provider as store_provider_module
-from tradepartner.backtest.provider import STATEMENT_FACT_NAMES, DataProvider, GapReading
+from tradepartner.backtest.provider import (
+    DELISTING_REASON_COLUMNS,
+    MERGER_EXIT_COLUMNS,
+    STATEMENT_FACT_NAMES,
+    DataProvider,
+    GapReading,
+)
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import last_completed_session, session_close
 from tradepartner.config import Settings
@@ -47,6 +53,7 @@ from tradepartner.store.db import (
     open_for_write,
     open_read_only,
 )
+from tradepartner.store.delisting_reasons import delisting_reasons_as_of
 from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.universe import shares_as_of, universe_as_of
 
@@ -1236,3 +1243,383 @@ def _open_trial(settings: Settings, tmp_path: Path) -> registry.TrialHandle:
             run_by="test",
             settings=_settings(tmp_path / "real.duckdb"),
         )
+
+
+# --- the exit-evidence reads (T328b) ------------------------------------------------
+
+#: The run's data cutoff `c`: a row counts when `known_at <= c` (owner, 2026-10-31).
+EXIT_CUTOFF = datetime(2020, 6, 30, 20, tzinfo=UTC)
+JUST_AFTER_CUTOFF = EXIT_CUTOFF + timedelta(microseconds=1)
+EXIT_FILED = datetime(2020, 1, 2, 15, tzinfo=UTC)
+EFFECTIVE = date(2020, 6, 15)
+EXIT_IDS = ("S_AT", "S_LATE", "TGT", "TGT_LATE", "TGT_NOBAR", "TGT_CASH", "ACQ")
+
+
+def _delisting_row(sid: str, exchange: str) -> dict[str, Any]:
+    return {
+        "security_id": sid,
+        "form": "25",
+        "class_title": "Common Stock",
+        "exchange": exchange,
+        "filed_at": EXIT_FILED,
+        "effective_on": EXIT_FILED.date() + timedelta(days=10),
+        "known_at": EXIT_FILED,
+        "ingested_at": EXIT_FILED,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def _reason_row(sid: str, exchange: str, reason: str, known_at: datetime) -> dict[str, Any]:
+    return {
+        "security_id": sid,
+        "delisting_form": "25",
+        "delisting_class_title": "Common Stock",
+        "delisting_exchange": exchange,
+        "delisting_filed_at": EXIT_FILED,
+        "reason": reason,
+        "reason_evidence_form": "8-K",
+        "reason_evidence_accession": f"acc-{sid}",
+        "reason_source": "eightk_item",
+        "reason_known_at": known_at,
+        "known_at": known_at,
+        "ingested_at": known_at,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def _merger_row(
+    sid: str, action_id: str, known_at: datetime, *, acquirer: str | None = "ACQ", **terms: Any
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "security_id": sid,
+        "kind": "stock",
+        "acquirer_security_id": acquirer,
+        "acquiree_symbol": sid,
+        "acquiree_cusip": "",
+        "acquirer_symbol": acquirer or "",
+        "acquirer_cusip": "",
+        "share_ratio": 0.5,
+        "cash_per_share": None,
+        "effective_date": EFFECTIVE,
+        "process_date": EFFECTIVE,
+        "payable_date": None,
+        "source_action_id": action_id,
+        "known_at": known_at,
+        "ingested_at": known_at,
+        "source": "alpaca",
+        "provenance": "action",
+    }
+    return row | terms
+
+
+def _bar(sid: str, session: date, close: float, known_at: datetime) -> dict[str, Any]:
+    return {
+        "security_id": sid,
+        "session": session,
+        "open": close,
+        "high": close,
+        "low": close,
+        "close": close,
+        "volume": 1000,
+        "known_at": known_at,
+        "ingested_at": known_at,
+        "source": "alpaca",
+        "provenance": "bar",
+    }
+
+
+def _connect_to(settings: Settings) -> Any:
+    @contextmanager
+    def connect() -> Iterator[duckdb.DuckDBPyConnection]:
+        with open_read_only(settings) as conn:
+            yield conn
+
+    return connect
+
+
+@pytest.fixture
+def exit_store(tmp_path: Path) -> tuple[Settings, registry.TrialHandle]:
+    """A synthetic store of Form 25 episodes, reasons, mergers and acquirer bars around
+    `EXIT_CUTOFF`, with a real trial handle."""
+    path = tmp_path / "exits.duckdb"
+    settings = _settings(path)
+    day_before = EXIT_CUTOFF - timedelta(days=1)
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        for sid, exchange in (("S_AT", "NASDAQ"), ("S_LATE", "NYSE"), ("S_OTHER", "NYSE")):
+            insert_row(conn, "delistings", _delisting_row(sid, exchange))
+        insert_row(
+            conn, "delisting_reasons", _reason_row("S_AT", "NASDAQ", "bankruptcy", EXIT_CUTOFF)
+        )
+        insert_row(
+            conn,
+            "delisting_reasons",
+            _reason_row("S_LATE", "NYSE", "performance_failure", JUST_AFTER_CUTOFF),
+        )
+        insert_row(
+            conn,
+            "delisting_reasons",
+            _reason_row("S_OTHER", "NYSE", "merger_acquisition", day_before),
+        )
+        for row in (
+            _merger_row("TGT", "m-1", EXIT_CUTOFF),
+            _merger_row("TGT", "m-2", day_before, kind="stock_and_cash", cash_per_share=3.0),
+            _merger_row(
+                "TGT_LATE",
+                "m-3",
+                JUST_AFTER_CUTOFF,
+                kind="cash",
+                share_ratio=None,
+                cash_per_share=10.0,
+                acquirer=None,
+            ),
+            _merger_row("TGT_NOBAR", "m-4", day_before, acquirer="ACQ_NOBAR", share_ratio=1.0),
+            # Matched only by its acquirer (ACQ is in the ids): dropped.
+            _merger_row("OTHER", "m-5", day_before),
+            # Its earlier effective date widens the bars read to before ACQ_NOBAR's
+            # 2020-06-12 bar, so a fallback to that earlier close would show.
+            _merger_row(
+                "TGT_CASH",
+                "m-6",
+                day_before,
+                kind="cash",
+                share_ratio=None,
+                cash_per_share=12.0,
+                acquirer=None,
+                effective_date=date(2020, 6, 1),
+                process_date=date(2020, 6, 1),
+            ),
+        ):
+            insert_row(conn, "mergers", row)
+        bar_stamp = datetime(2020, 6, 15, 21, tzinfo=UTC)
+        insert_row(conn, "prices_daily", _bar("ACQ", EFFECTIVE, 100.0, bar_stamp))
+        # A revision of the effective-date bar known after the cutoff: not read.
+        insert_row(conn, "prices_daily", _bar("ACQ", EFFECTIVE, 101.0, JUST_AFTER_CUTOFF))
+        insert_row(
+            conn,
+            "prices_daily",
+            _bar("ACQ", date(2020, 6, 22), 51.0, datetime(2020, 6, 22, 21, tzinfo=UTC)),
+        )
+        # ACQ_NOBAR has a bar the session before the effective date, none on it.
+        insert_row(
+            conn,
+            "prices_daily",
+            _bar("ACQ_NOBAR", date(2020, 6, 12), 40.0, datetime(2020, 6, 12, 21, tzinfo=UTC)),
+        )
+        # A 2-for-1 split of the acquirer after the effective date, known by the cutoff.
+        insert_row(
+            conn,
+            "corporate_actions",
+            {
+                "security_id": "ACQ",
+                "action_type": "split",
+                "ex_date": date(2020, 6, 22),
+                "ratio_or_amount": 2.0,
+                "announced_at": None,
+                "known_at": datetime(2020, 6, 19, 21, tzinfo=UTC),
+                "ingested_at": datetime(2020, 6, 19, 21, tzinfo=UTC),
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+    finally:
+        conn.close()
+    return settings, _open_trial(settings, tmp_path)
+
+
+def _exit_provider(exit_store: tuple[Settings, registry.TrialHandle]) -> StoreProvider:
+    settings, handle = exit_store
+    return StoreProvider(_connect_to(settings), handle, settings)
+
+
+def test_the_exit_reads_keep_their_columns_and_the_protocol(
+    exit_store: tuple[Settings, registry.TrialHandle],
+) -> None:
+    with _exit_provider(exit_store) as provider:
+        assert isinstance(provider, DataProvider)
+        assert provider.delisting_reasons(EXIT_CUTOFF, EXIT_IDS).columns == list(
+            DELISTING_REASON_COLUMNS
+        )
+        assert provider.merger_exits(EXIT_CUTOFF, EXIT_IDS).columns == list(MERGER_EXIT_COLUMNS)
+        assert provider.merger_exits(EXIT_CUTOFF, []).is_empty()
+    assert isinstance(FakeProvider(pl.DataFrame(), {}, {}), DataProvider)
+
+
+def test_a_reason_counts_from_its_known_at_at_the_cutoff(
+    exit_store: tuple[Settings, registry.TrialHandle],
+) -> None:
+    """No look-ahead: a reason stamped one microsecond after `c` is absent at `c`, one
+    stamped at `c` present; the frame is the as-of read's, kept to the ids."""
+    settings, _ = exit_store
+    with _exit_provider(exit_store) as provider:
+        at_cutoff = provider.delisting_reasons(EXIT_CUTOFF, EXIT_IDS)
+        later = provider.delisting_reasons(JUST_AFTER_CUTOFF, EXIT_IDS)
+    assert at_cutoff["security_id"].to_list() == ["S_AT"]
+    assert at_cutoff["reason"].to_list() == ["bankruptcy"]
+    assert sorted(later["security_id"].to_list()) == ["S_AT", "S_LATE"]
+    with _connect_to(settings)() as conn:
+        direct = delisting_reasons_as_of(conn, EXIT_CUTOFF, list(EXIT_IDS))
+    assert_frame_equal(at_cutoff, direct.select(DELISTING_REASON_COLUMNS))
+
+
+def test_a_merger_counts_from_its_known_at_at_the_cutoff(
+    exit_store: tuple[Settings, registry.TrialHandle],
+) -> None:
+    with _exit_provider(exit_store) as provider:
+        at_cutoff = provider.merger_exits(EXIT_CUTOFF, EXIT_IDS)
+        later = provider.merger_exits(JUST_AFTER_CUTOFF, EXIT_IDS)
+    assert "TGT_LATE" not in at_cutoff["security_id"].to_list()
+    assert later.filter(pl.col("security_id") == "TGT_LATE")["cash_per_share"].to_list() == [10.0]
+
+
+def test_merger_exits_keep_acquirees_only_and_every_row_of_one(
+    exit_store: tuple[Settings, registry.TrialHandle],
+) -> None:
+    """OTHER's row matches only through its acquirer ACQ (in the ids) and is dropped; TGT's
+    two rows are both returned, the reader never picks one."""
+    with _exit_provider(exit_store) as provider:
+        frame = provider.merger_exits(EXIT_CUTOFF, EXIT_IDS)
+    assert frame.select("security_id", "source_action_id").rows() == [
+        ("TGT", "m-1"),
+        ("TGT", "m-2"),
+        ("TGT_CASH", "m-6"),
+        ("TGT_NOBAR", "m-4"),
+    ]
+
+
+def test_the_acquirer_close_is_the_raw_print_known_at_the_cutoff(
+    exit_store: tuple[Settings, registry.TrialHandle],
+) -> None:
+    """A 2-for-1 split after the effective date halves the adjusted close (50) but leaves
+    `acquirer_raw_close` at the raw 100; the bar's revision known after `c` is not read."""
+    settings, _ = exit_store
+    with _exit_provider(exit_store) as provider:
+        frame = provider.merger_exits(EXIT_CUTOFF, EXIT_IDS)
+    tgt = frame.filter(pl.col("security_id") == "TGT")
+    assert tgt["acquirer_raw_close"].to_list() == [100.0, 100.0]
+    with _connect_to(settings)() as conn:
+        adjusted = adjusted_prices_as_of(conn, EXIT_CUTOFF, ["ACQ"], settings=settings)
+    assert adjusted.filter(pl.col("session") == EFFECTIVE)["close"].to_list() == [50.0]
+
+
+def test_a_missing_effective_date_bar_gives_null(
+    exit_store: tuple[Settings, registry.TrialHandle],
+) -> None:
+    """ACQ_NOBAR has a bar the session before, none on the effective date: null, never the
+    earlier close. A cash deal with no acquirer is null too."""
+    with _exit_provider(exit_store) as provider:
+        frame = provider.merger_exits(EXIT_CUTOFF, EXIT_IDS)
+    closes = dict(frame.select("security_id", "acquirer_raw_close").iter_rows())
+    assert closes["TGT_NOBAR"] is None
+    assert closes["TGT_CASH"] is None
+
+
+def test_the_fake_answers_the_exit_reads_as_the_store(
+    exit_store: tuple[Settings, registry.TrialHandle],
+) -> None:
+    """The fake over the store's rows plus those stamped after the cutoff answers at `c`
+    as the store does, so engine tests on the fake see the same no-look-ahead cut. (The
+    fake takes `acquirer_raw_close` as given, so the late merger row is the only late one.)"""
+    with _exit_provider(exit_store) as provider:
+        all_reasons = provider.delisting_reasons(JUST_AFTER_CUTOFF, EXIT_IDS)
+        reasons = provider.delisting_reasons(EXIT_CUTOFF, EXIT_IDS)
+        mergers = provider.merger_exits(EXIT_CUTOFF, EXIT_IDS)
+        late = provider.merger_exits(JUST_AFTER_CUTOFF, EXIT_IDS).filter(
+            pl.col("known_at") > EXIT_CUTOFF
+        )
+    assert not late.is_empty()
+    all_mergers = pl.concat([mergers, late])
+    fake = FakeProvider(
+        pl.DataFrame(),
+        {},
+        {},
+        delisting_reason_rows=all_reasons,
+        merger_exit_rows=all_mergers,
+    )
+    assert_frame_equal(fake.delisting_reasons(EXIT_CUTOFF, EXIT_IDS), reasons)
+    assert_frame_equal(fake.merger_exits(EXIT_CUTOFF, EXIT_IDS), mergers)
+    assert [call.method for call in fake.calls] == ["delisting_reasons", "merger_exits"]
+
+
+def _fixture_store_file(path: Path, *, evidence: bool) -> Settings:
+    """The fixture universe in `path`; with `evidence`, plus reason rows for its delisted
+    names and a merger for a delisted one, else with no merger rows at all."""
+    settings = _settings(path)
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        load_universe_fixtures(conn, UNIVERSE_DIR)
+        if not evidence:
+            conn.execute("DELETE FROM mergers")
+            conn.execute("DELETE FROM delisting_reasons")
+        else:
+            for sid, exchange, reason, filed in (
+                (
+                    "SEC_WINDOW_DELIST",
+                    "NASDAQ",
+                    "bankruptcy",
+                    datetime(2019, 6, 28, 20, 30, tzinfo=UTC),
+                ),
+                (
+                    "SEC_CLEAN_MERGER",
+                    "NYSE",
+                    "merger_acquisition",
+                    datetime(2018, 7, 25, 20, 30, tzinfo=UTC),
+                ),
+            ):
+                stamp = filed
+                row = _reason_row(sid, exchange, reason, stamp + timedelta(hours=1))
+                insert_row(conn, "delisting_reasons", row | {"delisting_filed_at": stamp})
+            insert_row(
+                conn,
+                "mergers",
+                _merger_row(
+                    "SEC_WINDOW_DELIST",
+                    "m-fixture",
+                    datetime(2019, 6, 27, 21, tzinfo=UTC),
+                    acquirer="SEC_SPLIT_PLAIN",
+                    effective_date=date(2019, 6, 27),
+                    process_date=date(2019, 6, 27),
+                ),
+            )
+    finally:
+        conn.close()
+    return settings
+
+
+def test_the_other_reads_ignore_reason_and_merger_rows(tmp_path: Path) -> None:
+    """Signals, universe, `listing_ends` and execution planning reads are unchanged by
+    reason and merger rows."""
+    without = _fixture_store_file(tmp_path / "without.duckdb", evidence=False)
+    with_rows = _fixture_store_file(tmp_path / "with.duckdb", evidence=True)
+    ids = ["SEC_WINDOW_DELIST", "SEC_CLEAN_MERGER", "SEC_DIV_CANCELLED", "SEC_SPLIT_PLAIN"]
+    readings = []
+    for settings, sub in ((without, "a"), (with_rows, "b")):
+        (tmp_path / sub).mkdir()
+        handle = _open_trial(settings, tmp_path / sub)
+        with StoreProvider(_connect_to(settings), handle, settings) as provider:
+            reading = []
+            for t in (T_JAN, T_WINDOW_DELIST, T_AFTER_DELIST):
+                universe = provider.universe(t)
+                reading += [
+                    universe.members,
+                    universe.exclusions,
+                    provider.listing_ends(t, ids),
+                    provider.adjusted_prices(t, ids, True),
+                    provider.adjusted_prices(t, ids, False),
+                    provider.raw_prices(t, ids),
+                    provider.dropped_dividends(t, ids),
+                ]
+                reading.append(provider.survivorship_gap(t))
+                reading.append(provider.static_listing_count(t, ids))
+            readings.append(reading)
+    for before, after in zip(*readings, strict=True):
+        if isinstance(before, pl.DataFrame):
+            assert_frame_equal(before, after)
+        else:
+            assert before == after

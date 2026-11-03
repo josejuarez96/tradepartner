@@ -46,8 +46,9 @@ def test_every_listed_setting_changes_hash(key: str) -> None:
     )
 
 
-# Pinned from main (before #2826 added `edgar.statement_fact_units`).
-MAIN_DEFAULT_HASH = "753a81937c7bfaee20dcb1f7da7398bb128f4e3d9ef96e60434fc10b6699f342"
+# Pinned from main (before #2826 added `edgar.statement_fact_units`), then
+# re-pinned for #2929's `BUILD_RULES_VERSION` 3.
+MAIN_DEFAULT_HASH = "2f2faaf73b519d6a59a3714bbe34996a17ffa54262d639e457c0d10662b98415"
 
 
 def test_hash_at_defaults_equals_the_hex_pinned_from_main() -> None:

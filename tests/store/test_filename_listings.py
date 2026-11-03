@@ -7,6 +7,7 @@ import pytest
 from tradepartner.adapters.filings import FilenameListing
 from tradepartner.store.filename_listings import (
     ClassTicker,
+    FilenameClassConflict,
     IndependentReading,
     confirm_filename_listings,
     is_filename_listing_refused,
@@ -174,12 +175,23 @@ def test_rename_must_match_every_differing_independent_reading() -> None:
 
 
 def test_same_ticker_on_two_classes_fails_closed() -> None:
-    with pytest.raises(ValueError, match="conflicting class assignment for ABC"):
+    with pytest.raises(FilenameClassConflict, match="conflicting class assignment for ABC"):
         decide(
             filing("ABC", 2016),
             cover=(reading(("ABC", "class-a")),),
-            exhibits=(reading(("ABC", "class-b")),),
+            exhibits=(reading(("abc ", "class-b")),),
         )
+
+
+def test_ticker_case_is_no_conflict() -> None:
+    """#2929: `avy25` (a Form 25 file name) and `AVY25` (a cover page) on the
+    same class are one ticker, not a conflict."""
+    result = decide(
+        filing("AVY", 2016),
+        cover=(reading(("AVY", "common"), ("AVY25", "notes")),),
+        exhibits=(reading(("avy25", "notes")),),
+    )
+    assert len(result) == 1
 
 
 def test_first_cover_filing_alone_confirms_precover_fb() -> None:
