@@ -51,13 +51,26 @@ def test_matching_is_optional_causal_default_and_explicit_ex_post_is_hashed(
     tmp_path: Path,
 ) -> None:
     source = FIXTURE.read_text()
-    causal = _parse(tmp_path / "causal", source.replace('matching = "ex_post"\n', ""))
+    per_event = source.replace('facts_read = "window_end"', 'facts_read = "event_known_at"')
+    causal = _parse(tmp_path / "causal", per_event.replace('matching = "ex_post"\n', ""))
     assert causal.study is not None
-    assert "matching" not in causal.study
+    assert "matching" not in causal.study  # absent key means causal
+    with pytest.raises(ExperimentFileError, match=r"window_end.*requires study\.matching"):
+        _parse(tmp_path / "causal_window_end", source.replace('matching = "ex_post"\n', ""))
+    with pytest.raises(ExperimentFileError, match=r"window_end.*requires study\.matching"):
+        _parse(
+            tmp_path / "explicit_causal_window_end",
+            source.replace('matching = "ex_post"', 'matching = "causal"'),
+        )
     ex_post = _parse(tmp_path / "expost", source)
     assert ex_post.params_sha256 != causal.params_sha256
     with pytest.raises(ExperimentFileError, match=r"study\.matching"):
         _parse(tmp_path / "invalid", source.replace('matching = "ex_post"', 'matching = "other"'))
+    with pytest.raises(ExperimentFileError, match=r"study\.matching"):
+        _parse(
+            tmp_path / "old_name",
+            source.replace('matching = "ex_post"', 'matching = "entry_known"'),
+        )
 
 
 @pytest.mark.parametrize(
