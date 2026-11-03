@@ -3716,6 +3716,7 @@ class EdgarFilingSource(FilingSource):
             return []
         finally:
             if pool is not None:
+                # A queued job is dropped unrun; its future is never asked again.
                 pool.shutdown(wait=True, cancel_futures=True)
 
         if cik not in self._filename_counted:
@@ -3770,17 +3771,26 @@ class EdgarFilingSource(FilingSource):
         pool = ThreadPoolExecutor(
             max_workers=min(workers, len(todo)), thread_name_prefix="edgar-filename"
         )
+        # The caller's context per job (the retry observer is a ContextVar), and
+        # one future per job, set by its worker. `map` queues every job now;
+        # the boundary test refuses any `.submit` outside the broker wrapper.
+        futures: dict[tuple[str, bool], Future[_FilenameExtract]] = {key: Future() for key in todo}
+        contexts = {key: contextvars.copy_context() for key in todo}
+
+        def run(key: tuple[str, bool]) -> None:
+            future = futures[key]
+            if not future.set_running_or_notify_cancel():
+                return
+            record, read_document = todo[key]
+            try:
+                extract = self._fetch_filename_extract(cik, record, read_document, on_worker=True)
+            except BaseException as error:  # handed to the caller, raised in order there
+                future.set_exception(error)
+            else:
+                future.set_result(extract)
+
         try:
-            futures = {
-                key: pool.submit(
-                    contextvars.copy_context().run,
-                    partial(self._fetch_filename_extract, on_worker=True),
-                    cik,
-                    record,
-                    read_document,
-                )
-                for key, (record, read_document) in todo.items()
-            }
+            pool.map(lambda key: contexts[key].run(run, key), list(todo))
         except BaseException:
             pool.shutdown(wait=True, cancel_futures=True)
             raise
