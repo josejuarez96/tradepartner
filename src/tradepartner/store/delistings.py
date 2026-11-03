@@ -61,6 +61,11 @@ a filing ends only a listing already known at T.
   any title `_is_plain_title` refuses) never ends an untitled
   (`snapshot_static`) listing: that listing cannot show it is the class
   the filing names.
+- **Debt class** (#2937). A filing whose title names a debt class (a note,
+  debenture or bond, no common word: Verizon's "2.375% Notes due 2022") never
+  ends a common or untitled listing, only a listing of its own class: once the
+  notes' listing row is retracted, the filing would otherwise land on the
+  common row, the latest on the exchange.
 - **Form 25 close** (#1163). A listing that starts in a session after the
   filing session of a Form 25 that ended an earlier listing of the
   security on the same exchange (a cover page re-opened it: an acquired
@@ -110,6 +115,7 @@ from tradepartner.store.db import insert_row
 from tradepartner.store.master import (
     MasterBuild,
     _form25_classes,
+    _is_common,
     _is_plain_common,
     _norm_title,
 )
@@ -187,6 +193,17 @@ def _is_plain_title(title: str) -> bool:
         and _CLASS_DESIGNATION.search(norm) is None
         and _QUALIFIER_WORDS.isdisjoint(norm.split())
     )
+
+
+#: Words that make a Form 25's class a debt security ("2.375% Notes due 2022").
+_DEBT_WORDS = frozenset({"notes", "note", "debentures", "debenture", "bonds", "bond"})
+
+
+def _is_debt_title(title: str) -> bool:
+    """Whether a Form 25's `title` names a debt class: a note, debenture or
+    bond word in its head and no common-equity word (#2937)."""
+    norm = _norm_title(title)
+    return not _is_common(title) and not _DEBT_WORDS.isdisjoint(norm.split())
 
 
 #: Exchange tags that name no exchange: a cover page showing one is a move
@@ -393,7 +410,17 @@ def _ended_listing(
             target = max(retagged, key=lambda r: r["valid_from"])
     if target["class_title"] is None and not _is_plain_title(delisting["class_title"]):
         return None
+    if _spares(delisting, target):
+        return None
     return target
+
+
+def _spares(delisting: Row, listing: Row) -> bool:
+    """Whether `delisting` names a debt class and `listing` is a common or
+    untitled one: a notes filing never ends the common listing (#2937), whether
+    it lands on it directly or through a later row it would re-open."""
+    title = listing["class_title"]
+    return _is_debt_title(delisting["class_title"]) and (title is None or _is_common(title))
 
 
 def _reopened(
@@ -418,6 +445,7 @@ def _reopened(
                 for closed, filing in closers
                 if closed["exchange"] == row["exchange"]
                 and _filing_session(filing["filed_at"]) < row["valid_from"]
+                and not _spares(filing, row)
             ]
             if not before:
                 continue

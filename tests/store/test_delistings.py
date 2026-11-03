@@ -708,6 +708,52 @@ class TestOtherClassOnSnapshotListing:
         assert row["status"] == "delisted"
 
 
+class TestDebtFilingOnCommonListing:
+    """#2937: a Form 25 for a debt class (Verizon's 2.375% Notes due 2022,
+    filed 2020-06-15 on NYSE) never ends the common listing. Its own notes
+    listing row was retracted on 2026-10-13, which left the common row as the
+    latest on the exchange and ended VZ with bars still trading."""
+
+    def test_notes_filing_leaves_the_common_listing_listed(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        common = "Common Stock, par value $0.10"
+        insert_row(synthetic, "listings", _row("S", "VZ", "NYSE", date(2019, 8, 8), common))
+        insert_row(
+            synthetic,
+            "delistings",
+            _form_25("S", "NYSE", _ny(2020, 6, 15, 16, 43), "2.375% Notes due 2022"),
+        )
+        row = _status(listing_ends_as_of(synthetic, LATE, _settings()), "S", "NYSE")
+        assert (row["status"], row["end_session"]) == ("listed", None)
+
+    def test_notes_filing_does_not_reopen_close_a_later_common_row(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        """The notes row is ended by its filing; a common row of the same
+        security and exchange that starts after the filing is not closed by it."""
+        notes = "2.375% Notes due 2022"
+        insert_row(synthetic, "listings", _row("S", "VZ22A", "NYSE", date(2019, 10, 30), notes))
+        insert_row(
+            synthetic,
+            "listings",
+            _row("S", "VZ", "NYSE", date(2020, 7, 1), "Common Stock, par value $0.10"),
+        )
+        insert_row(synthetic, "delistings", _form_25("S", "NYSE", _ny(2020, 6, 15, 16, 43), notes))
+        df = listing_ends_as_of(synthetic, LATE, _settings())
+        by_ticker = {r["ticker"]: r["status"] for r in df.iter_rows(named=True)}
+        assert by_ticker == {"VZ22A": "delisted", "VZ": "listed"}
+
+    def test_notes_filing_still_ends_the_notes_listing(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        title = "2.375% Notes due 2022"
+        insert_row(synthetic, "listings", _row("S", "VZ22A", "NYSE", date(2019, 10, 30), title))
+        insert_row(synthetic, "delistings", _form_25("S", "NYSE", _ny(2020, 6, 15, 16, 43), title))
+        row = _status(listing_ends_as_of(synthetic, LATE, _settings()), "S", "NYSE")
+        assert row["status"] == "delisted"
+
+
 # ---------------------------------------------------------------- build / write
 
 CIK_DUAL = "0000000007"
