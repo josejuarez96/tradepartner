@@ -276,6 +276,7 @@ holds the full list whenever the check fails with them, dry run or not
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import enum
 import fcntl
 import gzip
@@ -285,11 +286,13 @@ import json
 import math
 import re
 import shutil
+import threading
 import zipfile
 import zlib
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -607,6 +610,9 @@ class EdgarFilingSource(FilingSource):
         self._stamps_missing: dict[str, int] = {}
         self.statement_absent_carried = 0
         self._absent_carried: set[str] = set()
+        # #2932: the request hooks and the filename fetch counts also run on
+        # `filename_listings`' pool threads, so their increments take this lock.
+        self._count_lock = threading.Lock()
         self._client = client or httpx.Client(timeout=settings.edgar.request_timeout_seconds)
         hooks = self._client.event_hooks
         hooks["request"] = [*hooks.get("request", []), self._count]
@@ -816,6 +822,10 @@ class EdgarFilingSource(FilingSource):
         self._fsn_extraction_failures_this_run = 0
 
     def _count(self, request: httpx.Request) -> None:
+        with self._count_lock:
+            self._count_locked(request)
+
+    def _count_locked(self, request: httpx.Request) -> None:
         self.requests += 1
         if not self._sec_forms_request_active:
             return
@@ -836,7 +846,8 @@ class EdgarFilingSource(FilingSource):
         if response.status_code == httpx.codes.NOT_MODIFIED and response.request.url.path.endswith(
             ".zip"
         ):
-            self.bulk_not_modified += 1
+            with self._count_lock:
+                self.bulk_not_modified += 1
 
     def _sec_header(self, cik: str, accession: str, size: int) -> str:
         key = (cik, accession, size)
@@ -3567,97 +3578,119 @@ class EdgarFilingSource(FilingSource):
         fsn_cache = self._load_fsn_cache(cik)
         fsn_tags = self._fsn_recorded_symbol_only(cik)
         counts = _FilenameCounts()
-
-        listings: list[FilenameListing] = []
-        for record in stamps.values():
-            if record.accepted_at is None or record.form not in forms:
-                continue
-            if record.accepted_at < since or (
-                first_cover_at is not None and record.accepted_at >= first_cover_at
-            ):
-                continue
-            extract = self._filename_extract(cik, cache, record, read_document=True)
-            if extract is None:
-                continue
-            counts.read += 1
-            if extract.name is None:
-                counts.no_instance += 1
-                continue
-            title, exchange = _common_line(extract.pairs)
-            if exchange is None:
-                counts.no_exchange += 1
-            fsn_filing = fsn_cache.get(record.accession)
-            if fsn_filing is None:
-                counts.fsn_missing += 1
-            elif fsn_tags.get(record.accession) is None:
-                counts.fsn_no_symbol_only += 1
-            listings.append(
-                FilenameListing(
-                    cik=cik,
-                    accession=record.accession,
-                    form=record.form,
-                    accepted_at=record.accepted_at,
-                    valid_from=_session_of(record.accepted_at),
-                    ticker=extract.name,
-                    exchange=exchange,
-                    class_title=title,
-                    dei_symbol=_dei_symbol(
-                        extract.name, fsn_filing, fsn_tags.get(record.accession)
-                    ),
-                )
-            )
-
+        # #2932: the three passes' fetches, in the passes' order. The pool only
+        # prefetches them; each pass below still takes its extract, counts,
+        # caches and fails in this order, so the answer is the sequential one.
+        in_window = [
+            record
+            for record in stamps.values()
+            if record.accepted_at is not None
+            and record.form in forms
+            and record.accepted_at >= since
+            and (first_cover_at is None or record.accepted_at < first_cover_at)
+        ]
+        form25s = [
+            record
+            for record in stamps.values()
+            if record.accepted_at is not None
+            and record.form in _DELISTING_FORMS
+            and record.accepted_at >= since
+        ]
+        jobs = [(record, True) for record in in_window]
         if first_cover is not None and first_cover.accepted_at is not None:
-            extract = self._filename_extract(cik, cache, first_cover, read_document=False)
-            if extract is not None and extract.name is not None:
+            jobs.append((first_cover, False))
+        jobs.extend((record, False) for record in form25s if self._own_form25(cik, record))
+        pool, prefetched = self._prefetch_filename_extracts(cik, cache, jobs)
+        listings: list[FilenameListing] = []
+        try:
+            for record in in_window:
+                assert record.accepted_at is not None  # in_window holds stamped filings only
+                extract = self._filename_extract(
+                    cik, cache, record, read_document=True, prefetched=prefetched
+                )
+                if extract is None:
+                    continue
+                counts.read += 1
+                if extract.name is None:
+                    counts.no_instance += 1
+                    continue
+                title, exchange = _common_line(extract.pairs)
+                if exchange is None:
+                    counts.no_exchange += 1
+                fsn_filing = fsn_cache.get(record.accession)
+                if fsn_filing is None:
+                    counts.fsn_missing += 1
+                elif fsn_tags.get(record.accession) is None:
+                    counts.fsn_no_symbol_only += 1
                 listings.append(
                     FilenameListing(
                         cik=cik,
-                        accession=first_cover.accession,
-                        form=first_cover.form,
-                        accepted_at=first_cover.accepted_at,
-                        valid_from=_session_of(first_cover.accepted_at),
+                        accession=record.accession,
+                        form=record.form,
+                        accepted_at=record.accepted_at,
+                        valid_from=_session_of(record.accepted_at),
                         ticker=extract.name,
-                        exchange=None,
-                        class_title=None,
-                        dei_symbol=None,
+                        exchange=exchange,
+                        class_title=title,
+                        dei_symbol=_dei_symbol(
+                            extract.name, fsn_filing, fsn_tags.get(record.accession)
+                        ),
                     )
                 )
 
-        for record in stamps.values():
-            if (
-                record.accepted_at is None
-                or record.form not in _DELISTING_FORMS
-                or record.accepted_at < since
-            ):
-                continue
-            cached = self._load_delisting_cache(record.accession)
-            if cached is None:
-                counts.form25_uncached += 1
-                self.filename_incomplete_ciks.add(cik)
-                continue
-            if cached.cik != cik:
-                continue  # the exchange's copy of a 25-NSE: the subject company keeps it
-            extract = self._filename_extract(cik, cache, record, read_document=False)
-            if extract is None:
-                continue
-            if extract.name is None:
-                counts.form25_no_exhibit += 1
-                continue
-            counts.form25_read += 1
-            listings.append(
-                FilenameListing(
-                    cik=cik,
-                    accession=record.accession,
-                    form=cached.form,
-                    accepted_at=record.accepted_at,
-                    valid_from=_session_of(record.accepted_at),
-                    ticker=extract.name,
-                    exchange=cached.exchange,
-                    class_title=cached.class_title,
-                    dei_symbol=None,
+            if first_cover is not None and first_cover.accepted_at is not None:
+                extract = self._filename_extract(
+                    cik, cache, first_cover, read_document=False, prefetched=prefetched
                 )
-            )
+                if extract is not None and extract.name is not None:
+                    listings.append(
+                        FilenameListing(
+                            cik=cik,
+                            accession=first_cover.accession,
+                            form=first_cover.form,
+                            accepted_at=first_cover.accepted_at,
+                            valid_from=_session_of(first_cover.accepted_at),
+                            ticker=extract.name,
+                            exchange=None,
+                            class_title=None,
+                            dei_symbol=None,
+                        )
+                    )
+
+            for record in form25s:
+                assert record.accepted_at is not None  # form25s holds stamped filings only
+                cached = self._load_delisting_cache(record.accession)
+                if cached is None:
+                    counts.form25_uncached += 1
+                    self.filename_incomplete_ciks.add(cik)
+                    continue
+                if cached.cik != cik:
+                    continue  # the exchange's copy of a 25-NSE: the subject company keeps it
+                extract = self._filename_extract(
+                    cik, cache, record, read_document=False, prefetched=prefetched
+                )
+                if extract is None:
+                    continue
+                if extract.name is None:
+                    counts.form25_no_exhibit += 1
+                    continue
+                counts.form25_read += 1
+                listings.append(
+                    FilenameListing(
+                        cik=cik,
+                        accession=record.accession,
+                        form=cached.form,
+                        accepted_at=record.accepted_at,
+                        valid_from=_session_of(record.accepted_at),
+                        ticker=extract.name,
+                        exchange=cached.exchange,
+                        class_title=cached.class_title,
+                        dei_symbol=None,
+                    )
+                )
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True, cancel_futures=True)
 
         if cik not in self._filename_counted:
             self._filename_counted.add(cik)
@@ -3671,6 +3704,57 @@ class EdgarFilingSource(FilingSource):
             self.filename_fsn_missing += counts.fsn_missing
         listings.sort(key=lambda e: (e.accepted_at, e.accession, e.ticker))
         return listings
+
+    def _own_form25(self, cik: str, record: SubmissionRecord) -> bool:
+        """Whether `filename_listings`' Form 25 pass will ask for `record`: a
+        delisting-cache entry naming `cik` (the pass's own test). A cache path
+        that refuses the accession plans nothing; the pass raises as before."""
+        try:
+            cached = self._load_delisting_cache(record.accession)
+        except ValueError:
+            return False
+        return cached is not None and cached.cik == cik
+
+    def _prefetch_filename_extracts(
+        self,
+        cik: str,
+        cache: Mapping[str, _FilenameExtract],
+        jobs: Sequence[tuple[SubmissionRecord, bool]],
+    ) -> tuple[ThreadPoolExecutor | None, dict[tuple[str, bool], Future[_FilenameExtract]]]:
+        """Start `jobs`' fetches (#2932) on at most `edgar.filename_fetch_workers`
+        threads: only the ones `_filename_extract` would fetch (no cache hit,
+        not quarantined), each once. Every request still waits on
+        `edgar_raw`'s one process-wide limiter, with its retry policy and
+        `User-Agent`. Nothing here counts, caches or records a failure: the
+        caller's passes take each future in order through `_filename_extract`.
+        A pool of 1, or fewer than two fetches, starts no thread."""
+        workers = self._settings.edgar.filename_fetch_workers
+        if workers <= 1:
+            return None, {}
+        todo: dict[tuple[str, bool], tuple[SubmissionRecord, bool]] = {}
+        for record, read_document in jobs:
+            key = (record.accession, read_document)
+            if key in todo or _filename_cache_hit(cache, record, read_document) is not None:
+                continue
+            if self._is_quarantined(record.accession):
+                continue
+            todo[key] = (record, read_document)
+        if len(todo) < 2:
+            return None, {}
+        pool = ThreadPoolExecutor(
+            max_workers=min(workers, len(todo)), thread_name_prefix="edgar-filename"
+        )
+        futures = {
+            key: pool.submit(
+                contextvars.copy_context().run,
+                self._fetch_filename_extract,
+                cik,
+                record,
+                read_document,
+            )
+            for key, (record, read_document) in todo.items()
+        }
+        return pool, futures
 
     def _first_cover_filing(
         self, cik: str, stamps: Mapping[str, SubmissionRecord]
@@ -3696,14 +3780,20 @@ class EdgarFilingSource(FilingSource):
         record: SubmissionRecord,
         *,
         read_document: bool,
+        prefetched: dict[tuple[str, bool], Future[_FilenameExtract]] | None = None,
     ) -> _FilenameExtract | None:
         """The cached extract of one accession, else fetched, cached and
         returned; `None` when the fetch failed (counted by `_guarded`, no
-        cache entry, asked again next run) or the accession is quarantined."""
-        cached = cache.get(record.accession)
-        if cached is not None and (
-            not read_document or cached.name is None or cached.document_read
-        ):
+        cache entry, asked again next run) or the accession is quarantined.
+
+        A `prefetched` future (#2932) stands in for the fetch, its result
+        or its raise taken here in order exactly as the inline fetch's,
+        except a rate-limit block's `403`/`429`: whether a request waits a
+        block out depends on what the other threads saw
+        (`edgar_raw._RATE_LIMIT_BLOCK`), so that one is fetched again here,
+        one request at a time as before, with the sequential wait-out."""
+        cached = _filename_cache_hit(cache, record, read_document)
+        if cached is not None:
             self._per_document_attempted.add(record.accession)  # #610 policy 1: a cache hit
             return cached
         if self._is_quarantined(record.accession):
@@ -3714,6 +3804,9 @@ class EdgarFilingSource(FilingSource):
         fetch: Callable[[], _FilenameExtract] = partial(
             self._fetch_filename_extract, cik, record, read_document
         )
+        future = prefetched.pop((record.accession, read_document), None) if prefetched else None
+        if future is not None and _prefetch_reusable(future):
+            fetch = future.result
         extract = self._guarded(record.accession, record.form.removesuffix("/A"), fetch)
         if extract is None:
             self.filename_incomplete_ciks.add(cik)
@@ -3728,7 +3821,8 @@ class EdgarFilingSource(FilingSource):
         names = edgar_raw.filing_index(
             cik, record.accession, settings=self._settings, client=self._client
         )
-        self.filename_index_fetches += 1
+        with self._count_lock:
+            self.filename_index_fetches += 1
         if record.form in _DELISTING_FORMS:
             return _FilenameExtract(form25_exhibit_ticker(names), (), True)
         prefix = instance_prefix(names)
@@ -3746,7 +3840,8 @@ class EdgarFilingSource(FilingSource):
             settings=self._settings,
             client=self._client,
         )
-        self.filename_document_fetches += 1
+        with self._count_lock:
+            self.filename_document_fetches += 1
         pairs = cover_12b_exchanges(head.decode("utf-8", "ignore"), max_bytes=cap)
         return _FilenameExtract(prefix, pairs, True)
 
@@ -4949,6 +5044,30 @@ class _FilenameCounts:
 
 _HEADING_12B_BYTES = re.compile(rb"section\s*12\s*\(\s*b\s*\)", re.IGNORECASE)
 _TABLE_CLOSE_BYTES = re.compile(rb"</\s*table", re.IGNORECASE)
+
+
+def _filename_cache_hit(
+    cache: Mapping[str, _FilenameExtract], record: SubmissionRecord, read_document: bool
+) -> _FilenameExtract | None:
+    """`record`'s cached extract when it answers this ask: any entry when no
+    document is read, else one with no instance or with its document read."""
+    cached = cache.get(record.accession)
+    if cached is not None and (not read_document or cached.name is None or cached.document_read):
+        return cached
+    return None
+
+
+def _prefetch_reusable(future: Future[_FilenameExtract]) -> bool:
+    """Whether a prefetched fetch's outcome is the one a sequential ask would
+    get (#2932). Waits for the future. Every outcome is, but a `403`/`429`
+    raised by `edgar_raw`'s rate-limit block: under concurrency a request
+    can raise it at once because another thread's wait set the shared block
+    flag, where the sequential fetch would have waited it out; that one is
+    asked again in order."""
+    error = future.exception()
+    return not (
+        isinstance(error, httpx.HTTPStatusError) and error.response.status_code in (403, 429)
+    )
 
 
 def _twelve_b_table_read(buffer: bytes) -> bool:

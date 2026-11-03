@@ -100,6 +100,7 @@ EXCLUDED_SETTINGS_KEYS = (
     "edgar.reconcile_recent_quarters",  # T319b: which quarters to re-read, not a build rule.
     "edgar.verify_rotation_days",  # Health sampling window, not a derivation rule.
     "edgar.statement_backfill_chunk_ciks",  # T365: chunk size, not a derivation rule.
+    "edgar.filename_fetch_workers",  # #2932: fetch concurrency, not a derivation rule.
 )
 
 CACHE_VERSION_NAMES = (
