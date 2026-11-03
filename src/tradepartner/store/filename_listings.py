@@ -4,9 +4,12 @@ A cover filing or Form 25 naming several classes is one set-valued reading:
 a prefix matches it when it names any member. This resolves the class-of-two
 case in the #1643 orchestrator comment of 2026-10-13. Readings from separate
 filings remain independent. The owner deny-list takes precedence over every
-other verdict, as #1605 records for the #1597 amendment.
+other verdict, as #1605 records for the #1597 amendment. After it, a
+co-registrant's copy of a combined filing and a prefix that is no symbol are
+refused (#2941) before any reading is compared.
 """
 
+import re
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,7 +23,17 @@ Verdict = Literal[
     "renamed",
     "refused_contradicted",
     "refused_owner",
+    "refused_coregistrant",
+    "refused_symbol",
 ]
+
+#: The shape of a US equity symbol a filename prefix must have to be one
+#: (#2941): one to five letters, then at most one class or series suffix of
+#: one or two letters after `.`, `-` or `/` (`BRK-B`, `HEI/A`). A prefix with
+#: a digit, an underscore or a longer run is filename residue
+#: (`ETR-12312019X10K`, `a10-k20199282019`) or a company abbreviation, never
+#: a ticker; every US-listed common symbol fits.
+FILENAME_SYMBOL = re.compile(r"[A-Z]{1,5}(?:[.\-/][A-Z]{1,2})?")
 
 
 @dataclass(frozen=True)
@@ -68,6 +81,11 @@ def normalize_ticker(value: str) -> str:
 _ticker = normalize_ticker
 
 
+def is_filename_symbol(ticker: str) -> bool:
+    """Whether a filename reading's ticker has a symbol's shape (#2941)."""
+    return FILENAME_SYMBOL.fullmatch(_ticker(ticker)) is not None
+
+
 def is_filename_listing_refused(cik: str, ticker: str, refused: Collection[str]) -> bool:
     """Apply the owner's CIK:TICKER deny-list to a 10-K or Form 25 name."""
     return f"{cik}:{_ticker(ticker)}" in refused
@@ -97,6 +115,12 @@ def confirm_filename_listings(
     caller fails that CIK closed (#2929).
     The result is sorted by acceptance and accession, independent of input
     order. A refused verdict has no class assignment because it writes no row.
+
+    #2941: after the owner deny-list, a co-registrant's copy of a combined
+    filing (`FilenameListing.coregistrant`: the prefix is the filer's ticker)
+    is `refused_coregistrant`, and a prefix outside `FILENAME_SYMBOL` is
+    `refused_symbol`. Neither is this CIK's later prefix for a rename. Both
+    read only the filing itself.
     """
     candidates = tuple(
         sorted(
@@ -129,13 +153,21 @@ def confirm_filename_listings(
             if previous != item.class_id:
                 raise FilenameClassConflict(ticker)
 
-    later_prefixes = tuple((filing.accepted_at, _ticker(filing.ticker)) for filing in candidates)
+    later_prefixes = tuple(
+        (filing.accepted_at, _ticker(filing.ticker))
+        for filing in candidates
+        if not filing.coregistrant and is_filename_symbol(filing.ticker)
+    )
     output: list[Confirmation] = []
     for filing in candidates:
         prefix = _ticker(filing.ticker)
         tag = _ticker(filing.dei_symbol) if filing.dei_symbol is not None else None
         if is_filename_listing_refused(filing.cik, prefix, refused):
             verdict: Verdict = "refused_owner"
+        elif filing.coregistrant:
+            verdict = "refused_coregistrant"
+        elif not is_filename_symbol(prefix):
+            verdict = "refused_symbol"
         elif tag is not None and tag != prefix:
             verdict = "refused_contradicted"
         elif tag == prefix:
