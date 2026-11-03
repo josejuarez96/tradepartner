@@ -14,8 +14,11 @@ from __future__ import annotations
 import gzip
 import hashlib
 import io
+import itertools
 import json
 import shutil
+import threading
+import time
 import zipfile
 from collections.abc import Iterator
 from dataclasses import replace
@@ -47,6 +50,7 @@ from tradepartner.adapters.edgar_source import (
     FSN_VERSION,
     STAMPS_LAYOUT,
     EdgarFilingSource,
+    FilingFailuresError,
     SubmissionRecord,
     reduce_submissions,
 )
@@ -3474,6 +3478,358 @@ def test_filename_document_read_stops_at_the_configured_cap(tmp_path: Path) -> N
     assert body.pulled <= 6  # ~1 KB chunks against a 5 KB cap, not 100,000
     assert listings[_FN_A].exchange is None  # the table was never reached: no exchange
     assert source.filename_no_exchange >= 1
+
+
+# --- filing-name listings: the bounded fetch pool (#2932) -------------------
+
+
+def _fn_run(tmp_path: Path, router: EdgarRouter, workers: int) -> dict[str, Any]:
+    """One `filename_listings` run at `workers`: the answer, the cache file's
+    bytes and every count the run leaves, for a byte-for-byte comparison."""
+    source = _fn_source(tmp_path, router, filename_fetch_workers=workers)
+    listings = source.filename_listings(_FN_CIK)
+    cache_file = tmp_path / "cache" / "filename" / "v1" / f"{_FN_CIK}.json"
+    return {
+        "listings": listings,
+        "cache": cache_file.read_bytes(),
+        "counts": (
+            source.filename_10ks_read,
+            source.filename_no_instance,
+            source.filename_no_exchange,
+            source.filename_form25_read,
+            source.filename_form25_no_exhibit,
+            source.filename_form25_uncached,
+            source.filename_fsn_no_symbol_only,
+            source.filename_fsn_missing,
+            source.filename_index_fetches,
+            source.filename_document_fetches,
+            source.failed_filings,
+            source.requests,
+        ),
+        "incomplete": set(source.filename_incomplete_ciks),
+        "failures": dict(source._pending_failures),
+    }
+
+
+def test_filename_fetch_workers_defaults_to_four_and_refuses_zero() -> None:
+    assert Settings(_env_file=None).edgar.filename_fetch_workers == 4
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, edgar={"filename_fetch_workers": 0})
+
+
+@pytest.mark.parametrize("workers", [2, 4, 8])
+def test_filename_pool_answer_is_byte_identical_to_the_sequential_fetch(
+    tmp_path: Path, workers: int
+) -> None:
+    """The pool only prefetches: the answer (order included), the cache
+    file's bytes and every count equal the one-at-a-time run's."""
+    sequential = _fn_run(tmp_path / "one", _fn_router(), 1)
+    router = _fn_router()
+    pooled = _fn_run(tmp_path / "pool", router, workers)
+    assert pooled == sequential
+    assert [e.accession for e in pooled["listings"]] == [_FN_A, _FN_B, _FN_25_NASDAQ, _FN_COVER]
+    # The same requests, each asked once (the order across threads is free).
+    seq_router = _fn_router()
+    _fn_run(tmp_path / "again", seq_router, 1)
+    assert sorted(router.urls) == sorted(seq_router.urls)
+
+
+def test_filename_pool_of_one_is_todays_sequential_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`filename_fetch_workers = 1` starts no thread and asks in stamp order."""
+
+    def no_pool(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a pool of one starts no thread pool")
+
+    monkeypatch.setattr(edgar_source_module, "ThreadPoolExecutor", no_pool)
+    router = _fn_router()
+    _fn_run(tmp_path, router, 1)
+    asked = [u for u in router.urls if "/Archives/" in u]
+    assert asked == [
+        _fn_url(_FN_A, "index.json"),
+        _fn_url(_FN_A, "doc.htm"),
+        _fn_url(_FN_B, "index.json"),
+        _fn_url(_FN_B, "doc.htm"),
+        _fn_url(_FN_C, "index.json"),
+        _fn_url(_FN_COVER, "index.json"),
+        _fn_url(_FN_25_NASDAQ, "index.json"),
+        _fn_url(_FN_25_NYSE, "index.json"),
+    ]
+
+
+def test_filename_pool_runs_requests_concurrently(tmp_path: Path) -> None:
+    """At 4 workers more than one request is in flight at once (the point)."""
+    router = _fn_router()
+    lock = threading.Lock()
+    state = {"now": 0, "max": 0}
+
+    def slow(inner: Any) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            with lock:
+                state["now"] += 1
+                state["max"] = max(state["max"], state["now"])
+            time.sleep(0.05)
+            with lock:
+                state["now"] -= 1
+            return cast(httpx.Response, inner(request))
+
+        return handler
+
+    for accession in (_FN_A, _FN_B, _FN_C, _FN_COVER):
+        url = _fn_url(accession, "index.json")
+        router.add(url, slow(router._routes[url]))
+    _fn_run(tmp_path, router, 4)
+    assert state["max"] >= 2
+
+
+class _FakeClock:
+    """`edgar_raw`'s `time`: a fake clock that `sleep` moves on to the
+    sleeper's own wake time, so the limiter's spacing is measured without
+    waiting for it. Two threads sleeping at once overlap (the clock moves to
+    the later wake time, never the sum), as real sleeps do, so a limiter that
+    let two requests through on one stale stamp would show a short gap."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._now = 1000.0
+
+    def monotonic(self) -> float:
+        with self._lock:
+            return self._now
+
+    def sleep(self, seconds: float) -> None:
+        with self._lock:
+            wake = self._now + max(seconds, 0.0)
+        time.sleep(0.002)  # real: let another thread run while this one sleeps
+        with self._lock:
+            self._now = max(self._now, wake)
+
+
+class _StampingLock:
+    """The limiter's own lock, recording the request stamp it leaves inside
+    its critical section, so the stamps are the real limiter's."""
+
+    def __init__(self, limiter: Any) -> None:
+        self._lock = threading.Lock()
+        self._limiter = limiter
+        self.stamps: list[float] = []
+
+    def __enter__(self) -> None:
+        self._lock.acquire()
+
+    def __exit__(self, *_exc: object) -> None:
+        self.stamps.append(self._limiter._last_request_monotonic)
+        self._lock.release()
+
+
+def test_filename_pool_never_exceeds_requests_per_second(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Four threads share the one process-wide limiter: every request start
+    is at least `1 / requests_per_second` after the one before it."""
+    clock = _FakeClock()
+    monkeypatch.setattr(edgar_raw, "time", clock)
+    limiter = edgar_raw._RateLimiter()
+    stamping = _StampingLock(limiter)
+    limiter._lock = stamping  # type: ignore[assignment]
+    monkeypatch.setattr(edgar_raw, "_LIMITER", limiter)
+    router = _fn_router()
+
+    def slow(inner: Any) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            time.sleep(0.01)  # real latency, so the threads overlap
+            return cast(httpx.Response, inner(request))
+
+        return handler
+
+    for url in list(router._routes):
+        router.add(url, slow(router._routes[url]))
+    source = _fn_source(tmp_path, router, filename_fetch_workers=4, requests_per_second=9.0)
+    source.filename_listings(_FN_CIK)
+
+    archive_requests = [u for u in router.urls if "/Archives/" in u]
+    assert len(archive_requests) == 8
+    assert len(stamping.stamps) == len(router.urls)
+    gaps = [b - a for a, b in itertools.pairwise(stamping.stamps)]
+    assert min(gaps) >= 1 / 9.0 - 1e-9
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_filename_pool_one_failed_request_fails_closed_for_its_cik(
+    tmp_path: Path, workers: int
+) -> None:
+    """A 404 on one filing: counted, not cached, the CIK listed partial,
+    exactly as the sequential fetch does."""
+    router = _fn_router()
+    router.add(_fn_url(_FN_B, "doc.htm"), 404)
+    run = _fn_run(tmp_path, router, workers)
+    assert _FN_B not in {e.accession for e in run["listings"]}
+    assert run["incomplete"] == {_FN_CIK}
+    assert set(run["failures"]) == {_FN_B}
+    assert _FN_B not in json.loads(run["cache"])["records"]
+    reference = _fn_router()
+    reference.add(_fn_url(_FN_B, "doc.htm"), 404)
+    assert run == _fn_run(tmp_path / "seq", reference, 1)
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+@pytest.mark.parametrize("failure", ["500", "503", "timeout", "connect"])
+def test_filename_fetch_failing_past_retries_fails_its_cik_closed(
+    tmp_path: Path, workers: int, failure: str
+) -> None:
+    """#2932: a 5xx or transport error that survives the retries fails this
+    CIK closed: no answer, listed incomplete and fetch-failed with its error,
+    the failed filing uncached (the ones before it in stamp order cached as
+    the sequential run caches them), and no raise, so the run's other CIKs
+    go on. A healed rerun asks only what was not cached and answers fully."""
+    router = _fn_router()
+    url = _fn_url(_FN_C, "index.json")
+    if failure in ("500", "503"):
+        router.add(url, int(failure))
+    else:
+        error = httpx.ReadTimeout if failure == "timeout" else httpx.ConnectError
+
+        def broken(request: httpx.Request) -> httpx.Response:
+            raise error("down", request=request)
+
+        router.add(url, broken)
+    fast = {"retry_max_attempts": 2, "retry_backoff_seconds": 0.001}
+    source = _fn_source(tmp_path, router, filename_fetch_workers=workers, **fast)
+    assert source.filename_listings(_FN_CIK) == []
+    assert source.filename_incomplete_ciks == {_FN_CIK}
+    assert list(source.filename_fetch_failed_ciks) == [_FN_CIK]
+    assert source.failed_filings == 0  # not a per-filing failure: nothing quarantines
+    assert source.filename_10ks_read == 0  # a failed CIK's readings are not counted
+    stored = json.loads((tmp_path / "cache" / "filename" / "v1" / f"{_FN_CIK}.json").read_text())
+    assert set(stored["records"]) == {_FN_A, _FN_B}
+
+    healed_router = _fn_router()
+    healed = _fn_source(tmp_path, healed_router, filename_fetch_workers=workers, **fast)
+    clean = _fn_source(tmp_path / "clean", _fn_router(), filename_fetch_workers=1)
+    assert healed.filename_listings(_FN_CIK) == clean.filename_listings(_FN_CIK)
+    assert healed.filename_fetch_failed_ciks == {}
+    assert _fn_url(_FN_A, "index.json") not in healed_router.urls  # cached, not re-asked
+
+
+def test_filename_pool_sends_nothing_while_a_block_is_waited_out(tmp_path: Path) -> None:
+    """While SEC's rate-limit block is set, a pool worker sends nothing: each
+    fetch is deferred to the calling thread, which asks them one at a time in
+    stamp order (the first success clears the block), as the sequential
+    fetch does."""
+    edgar_raw._RATE_LIMIT_BLOCK.set()
+    try:
+        router = _fn_router()
+        listings = _fn_source(tmp_path, router, filename_fetch_workers=4).filename_listings(_FN_CIK)
+    finally:
+        edgar_raw._RATE_LIMIT_BLOCK.clear()
+    sequential = _fn_router()
+    assert listings == _fn_source(tmp_path / "seq", sequential).filename_listings(_FN_CIK)
+    assert router.urls == sequential.urls
+
+
+def test_filename_fetch_block_given_up_on_still_raises(tmp_path: Path) -> None:
+    """A `403` the block policy gives up on is not a CIK failure: it raises."""
+    router = _fn_router()
+    router.add(_fn_url(_FN_C, "index.json"), 403)
+    source = _fn_source(tmp_path, router, rate_limit_wait_seconds=0.001)
+    with pytest.raises(httpx.HTTPStatusError):
+        source.filename_listings(_FN_CIK)
+    edgar_raw._RATE_LIMIT_BLOCK.clear()
+
+
+@pytest.mark.parametrize(("asked", "fails"), [(50, False), (49, True)])
+def test_filename_fetch_failures_past_the_share_fail_the_run(
+    tmp_path: Path, asked: int, fails: bool
+) -> None:
+    """One failed CIK of 50 asked is the 2% default and passes; of 49 it is
+    over and `check_failures` fails the run, naming the CIK and its error."""
+    router = _fn_router()
+    router.add(_fn_url(_FN_C, "index.json"), 503)
+    source = _fn_source(tmp_path, router, retry_max_attempts=1)
+    source.filename_listings(_FN_CIK)
+    source._filename_ciks_asked |= {f"{n:010d}" for n in range(1, asked)}
+    if fails:
+        with pytest.raises(
+            FilingFailuresError, match=rf"filename fetch incomplete: 1 of 49.*{_FN_CIK}"
+        ):
+            source.check_failures()
+    else:
+        source.check_failures()
+
+
+def test_filename_fetch_share_counts_only_ciks_that_sent_a_fetch(tmp_path: Path) -> None:
+    """A fully cached CIK sends no filename request and is not in the share's
+    denominator, so a mostly cached build cannot dilute an outage."""
+    router = _fn_router()
+    warm = _fn_source(tmp_path, router)
+    warm.filename_listings(_FN_CIK)
+    assert warm._filename_ciks_asked == {_FN_CIK}
+    cached = _fn_source(tmp_path, router)
+    cached.filename_listings(_FN_CIK)
+    assert cached._filename_ciks_asked == set()
+
+
+def _done(result: Any = None, error: BaseException | None = None) -> Any:
+    future: Any = edgar_source_module.Future()
+    if error is None:
+        future.set_result(result)
+    else:
+        future.set_exception(error)
+    return future
+
+
+def _status_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", _fn_url(_FN_A, "index.json"))
+    return httpx.HTTPStatusError("x", request=request, response=httpx.Response(status))
+
+
+@pytest.mark.parametrize(
+    ("error", "reusable"),
+    [
+        (None, True),
+        (_status_error(404), True),
+        (_status_error(410), True),
+        (_status_error(500), True),
+        (_status_error(503), True),
+        (ValueError("malformed"), True),
+        (httpx.ConnectError("down"), True),
+        (_status_error(403), False),
+        (_status_error(429), False),
+    ],
+)
+def test_filename_prefetch_reuses_all_but_a_rate_limit_block(
+    error: BaseException | None, reusable: bool
+) -> None:
+    """A block's `403`/`429` depends on the other threads (the shared block
+    flag), so it is asked again in order; every other outcome is the one the
+    sequential fetch would get, and is taken as it is."""
+    assert edgar_source_module._prefetch_reusable(_done(error=error)) is reusable
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_filename_pool_a_block_waited_out_reads_as_the_sequential_fetch(
+    tmp_path: Path, workers: int
+) -> None:
+    """A `403` block on one filing, waited out (`rate_limit_wait_seconds`),
+    then served: the answer is the clean run's at either pool size."""
+    router = _fn_router()
+    url = _fn_url(_FN_C, "index.json")
+    served = router._routes[url]
+    calls = {"n": 0}
+
+    def blocked_once(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(403) if calls["n"] == 1 else cast(httpx.Response, served(request))
+
+    router.add(url, blocked_once)
+    source = _fn_source(
+        tmp_path, router, filename_fetch_workers=workers, rate_limit_wait_seconds=0.01
+    )
+    listings = source.filename_listings(_FN_CIK)
+    clean = _fn_source(tmp_path / "clean", _fn_router(), filename_fetch_workers=1)
+    assert listings == clean.filename_listings(_FN_CIK)
+    assert source.failed_filings == 0
 
 
 def test_a_cached_v5_cover_page_is_no_longer_served(settings: Settings) -> None:

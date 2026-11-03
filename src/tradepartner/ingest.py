@@ -1507,7 +1507,8 @@ def _unwrap(filings: FilingSource) -> FilingSource:
 class Unjudged:
     """What a master check must not judge after a fetch pass (#859): the
     CIKs with a filing that failed or was quarantined this run, and how many
-    failures name no accession that maps to a CIK."""
+    failures name no accession that maps to a CIK. A CIK whose filename
+    fetch failed past the retries this run (#2932) is unjudged too."""
 
     ciks: frozenset[str]
     unmapped: int
@@ -1525,10 +1526,12 @@ def _unjudged_ciks(filings: FilingSource) -> Unjudged:
     pending: Mapping[str, Any] = getattr(source, "_pending_failures", {})
     accessions = set(pending) | set(getattr(source, "_quarantined_this_run", set()))
     unmapped = int(getattr(source, "_fsn_extraction_failures_this_run", 0))
+    # #2932: a CIK failed closed on a filename fetch has no answer to judge.
+    fetch_failed = set(getattr(source, "filename_fetch_failed_ciks", ()))
     if not accessions:
-        return Unjudged(frozenset(), unmapped)
+        return Unjudged(frozenset(fetch_failed), unmapped)
     by_accession = {entry.accession: entry.cik for entry in filings.filing_index(None)}
-    ciks = {by_accession[a] for a in accessions if a in by_accession}
+    ciks = {by_accession[a] for a in accessions if a in by_accession} | fetch_failed
     unmapped += sum(1 for a in accessions if a not in by_accession)
     return Unjudged(frozenset(ciks), unmapped)
 
@@ -4612,6 +4615,14 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
         counts[key] = int(getattr(source, key, 0))
     text = "".join(f"; {key}: {value}" for key, value in sorted(counts.items()))
     # #2929: the first few CIKs a class conflict failed closed, to look up.
+    # #2932: CIKs whose filename fetch failed past the retries, failed closed.
+    fetch_failed = tuple(getattr(source, "filename_fetch_failed_ciks", ()))
+    if fetch_failed:
+        shown = ", ".join(fetch_failed[:_FILENAME_CONFLICTS_SHOWN])
+        more = len(fetch_failed) - _FILENAME_CONFLICTS_SHOWN
+        text += f"; filename fetch incomplete: {len(fetch_failed)} ({shown}" + (
+            f", +{more})" if more > 0 else ")"
+        )
     conflicted = tuple(getattr(master, "filename_conflict_ciks", ()))
     if conflicted:
         shown = ", ".join(conflicted[:_FILENAME_CONFLICTS_SHOWN])

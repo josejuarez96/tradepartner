@@ -339,6 +339,16 @@ class EdgarConfig(BaseModel):
     # read stops at the table or here, whichever comes first (#1597), so a
     # filing whose table is never written costs one bounded read.
     filename_document_max_bytes: int = Field(default=4_000_000, gt=0)
+    # #2932: how many of one CIK's filing-name fetches are in flight at once.
+    # Every request still goes through `edgar_raw`'s one process-wide limiter,
+    # so the total stays at or under `requests_per_second`; the answer and the
+    # cache are the one-at-a-time fetch's (1 is that path, no thread started).
+    filename_fetch_workers: int = Field(default=4, ge=1, le=8)
+    # #2932: a CIK whose filing-name fetch still fails after the retries (a
+    # 5xx, a timeout, a connection error) gets no filename answer this run and
+    # nothing cached for the failed filing, and the run goes on; past this
+    # share of the CIKs asked, `check_failures` fails the run (an outage).
+    filename_fetch_max_failed_share: float = Field(default=0.02, ge=0, lt=1)
     # (CIK, ticker) spans whose `filing_name` rows the run derives no more
     # and `master-retract --release` withdraws: the amendment's rule for a
     # collision the Alpaca backfill counted. Default empty. A malformed
