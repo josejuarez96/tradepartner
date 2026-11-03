@@ -6,7 +6,7 @@ listing's first acceptance stamp is permanent; only ``filed_on`` may revise.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -33,7 +33,7 @@ class Listing:
     list_position: int | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)  # #2920: a run can hold every issuer's rows
 class FilingRow:
     """A stored index revision."""
 
@@ -129,18 +129,23 @@ def first_known(
     t: datetime,
     *,
     cik: str | None = None,
+    ciks: Collection[str] | None = None,
     form: str | None = None,
 ) -> list[FilingRow]:
     """First visible revision per accession, for immutable backfill cutoffs.
 
     Filters are pushed before ranking so a form or issuer read does not load
-    the full index into memory.
+    the full index into memory. ``ciks`` reads many CIKs in one scan (#2920),
+    each CIK's rows in the order a ``cik=`` read returns them.
     """
     predicates = ["known_at <= ?"]
     params: list[object] = [_utc(t)]
     if cik is not None:
         predicates.append("cik = ?")
         params.append(cik)
+    if ciks is not None:
+        predicates.append("cik IN (SELECT unnest(?::VARCHAR[]))")
+        params.append(sorted(ciks))
     if form is not None:
         predicates.append("form = ?")
         params.append(form)
@@ -172,6 +177,36 @@ def accession_listing_order(
         "ORDER BY listed_on, list_position NULLS LAST, cik"
     )
     return _rows(conn, sql, [_utc(t), accession])
+
+
+def ciks_by_accession(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    *,
+    forms: Collection[str],
+    accessions: Collection[str] = (),
+) -> dict[str, frozenset[str]]:
+    """Every CIK visible at ``t`` under each accession that has a row of one
+    of ``forms``, or is named in ``accessions``, in one scan (#2920).
+
+    For each such accession, the CIKs are those `accession_listing_order`
+    returns for it at ``t``.
+    """
+    form_list = sorted(forms)
+    placeholders = ", ".join("?" for _ in form_list) or "NULL"
+    cutoff = _utc(t)
+    sql = (
+        "SELECT DISTINCT accession, cik FROM filing_index WHERE known_at <= ? AND ("
+        "accession IN (SELECT accession FROM filing_index WHERE known_at <= ? "
+        f"AND form IN ({placeholders})) "
+        "OR accession IN (SELECT unnest(?::VARCHAR[])))"
+    )
+    found: dict[str, set[str]] = {}
+    for accession, cik in conn.execute(
+        sql, [cutoff, cutoff, *form_list, sorted(accessions)]
+    ).fetchall():
+        found.setdefault(accession, set()).add(cik)
+    return {accession: frozenset(ciks) for accession, ciks in found.items()}
 
 
 def snapshot_id(conn: duckdb.DuckDBPyConnection) -> str | None:
