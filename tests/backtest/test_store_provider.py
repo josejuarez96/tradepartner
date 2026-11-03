@@ -1380,6 +1380,8 @@ def exit_store(tmp_path: Path) -> tuple[Settings, registry.TrialHandle]:
             _merger_row("TGT_NOBAR", "m-4", day_before, acquirer="ACQ_NOBAR", share_ratio=1.0),
             # Matched only by its acquirer (ACQ is in the ids): dropped.
             _merger_row("OTHER", "m-5", day_before),
+            # Its earlier effective date widens the bars read to before ACQ_NOBAR's
+            # 2020-06-12 bar, so a fallback to that earlier close would show.
             _merger_row(
                 "TGT_CASH",
                 "m-6",
@@ -1388,6 +1390,8 @@ def exit_store(tmp_path: Path) -> tuple[Settings, registry.TrialHandle]:
                 share_ratio=None,
                 cash_per_share=12.0,
                 acquirer=None,
+                effective_date=date(2020, 6, 1),
+                process_date=date(2020, 6, 1),
             ),
         ):
             insert_row(conn, "mergers", row)
