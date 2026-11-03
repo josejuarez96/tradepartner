@@ -13,12 +13,14 @@ from typing import Any
 import pytest
 
 from tradepartner.adapters.broker import CashActivity, PositionIntent, Side
-from tradepartner.calendar import next_session
+from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.config import Settings
 from tradepartner.errors import ClockError
 from tradepartner.execution import reconcile_run, true_up
 from tradepartner.execution.reconcile import Explanations
+from tradepartner.execution.reconcile_run import _journal_state, _ledger, frozen_risk
 from tradepartner.execution.window import WindowCommandRefused
+from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     AdjustmentRow,
@@ -126,6 +128,81 @@ def test_reverse_reopens_and_rebooks_one_cash_activity(
     assert json.loads(rebooked.explanation_json or "")["rebooked_activity_id"] == "reverse-cash"
     fixed_clock.advance(seconds=1)
     assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "ok"
+
+
+def test_reverse_twice_refuses_not_open_without_writing(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    frozen_window: PaperWindowRow,  # noqa: F811
+    fixed_clock: FixedClock,
+) -> None:
+    opened = _open_quantity_and_cash_break(journal_settings, fake, frozen_window, fixed_clock)
+    _true_up(journal_settings, fake, fixed_clock, opened.break_id)
+    fixed_clock.advance(seconds=1)
+    _reverse(journal_settings, fake, fixed_clock, opened.break_id)
+    before = tuple(len(rows) for rows in _snapshot(journal_settings, frozen_window))
+
+    with pytest.raises(WindowCommandRefused) as refused:
+        _reverse(journal_settings, fake, fixed_clock, opened.break_id)
+
+    assert refused.value.reason == "not_open"
+    assert tuple(len(rows) for rows in _snapshot(journal_settings, frozen_window)) == before
+
+
+def test_reverse_quantity_restores_ledger_and_next_reconcile_reports_break(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    frozen_window: PaperWindowRow,  # noqa: F811
+    fixed_clock: FixedClock,
+) -> None:
+    def ledger_state() -> tuple[float, float]:
+        with open_read_only(journal_settings) as conn:
+            state = _journal_state(conn, frozen_window.window_id or 0, fixed_clock.now)
+            ledger = _ledger(
+                state,
+                live_actions_as_of(conn, session_close(previous_session(S))),
+                frozen_window,
+                S,
+                frozen_risk(frozen_window).reconcile_quantity_tolerance,
+            )
+        return ledger.positions[SPY], ledger.cash
+
+    opened = _open_quantity_and_cash_break(journal_settings, fake, frozen_window, fixed_clock)
+    before = ledger_state()
+    assert before == pytest.approx((10.0, 99_000.0))
+
+    first = _true_up(journal_settings, fake, fixed_clock, opened.break_id)
+    assert ledger_state() == pytest.approx((11.0, 99_030.0))
+    fixed_clock.advance(seconds=1)
+    reversed_result = _reverse(journal_settings, fake, fixed_clock, opened.break_id)
+
+    adjustments = {a.adjustment_id: a for a in _adjustments(journal_settings, frozen_window)}
+    assert len(first.adjustment_ids) == len(reversed_result.adjustment_ids) == 2
+    for source_id, reversal_id in zip(
+        first.adjustment_ids, reversed_result.adjustment_ids, strict=True
+    ):
+        source, reversal = adjustments[source_id], adjustments[reversal_id]
+        for field in ("quantity", "cash"):
+            value = getattr(source, field)
+            assert getattr(reversal, field) == (-value if value is not None else None)
+        # AdjustmentRow has no cost_basis field; reversal leaves the fill basis intact.
+        assert not hasattr(source, "cost_basis") and not hasattr(reversal, "cost_basis")
+        assert json.loads(reversal.explanation_json or "")["reversed_adjustment_id"] == source_id
+
+    reopened = _events(journal_settings, frozen_window)[-1]
+    assert reopened.event == "reopened"
+    assert reopened.event_id == reversed_result.event_id
+    assert json.loads(reopened.adjustment_ids_json or "") == list(reversed_result.adjustment_ids)
+    stamps = {reopened.known_at, reopened.ingested_at, reversed_result.known_at}
+    for reversal_id in reversed_result.adjustment_ids:
+        stamps.update((adjustments[reversal_id].known_at, adjustments[reversal_id].ingested_at))
+    assert len(stamps) == 1
+    assert reversed_result.known_at.tzinfo is not None
+    assert reversed_result.known_at.utcoffset() == timedelta(0)
+    assert ledger_state() == pytest.approx(before)
+
+    fixed_clock.advance(seconds=1)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
 
 
 def test_reverse_refuses_open_break_on_same_name_without_writing(

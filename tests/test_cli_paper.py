@@ -34,7 +34,7 @@ from tradepartner.adapters.broker import OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker, PartialFill, SetPosition, Vanish
 from tradepartner.cli_record import scrub_text
 from tradepartner.config import Settings
-from tradepartner.execution import ops, switch, window
+from tradepartner.execution import ops, switch, true_up, window
 from tradepartner.execution import report as paper_report
 from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
@@ -703,6 +703,38 @@ def test_true_up_reverse_requires_reason_and_excludes_break(
         cli.USAGE_ERROR,
     )
     assert factory.clocks == []
+
+
+@pytest.mark.usefixtures("started")
+def test_true_up_reverse_calls_reversal_and_prints_result(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    break_id = "1:SEC_SPY:1"
+    stamp = datetime(2026, 10, 1, 14, 1, tzinfo=UTC)
+    calls: list[tuple[str, str, str | None, Any, Any]] = []
+
+    def reverse(
+        settings: Settings,
+        connect: Any,
+        broker: Any,
+        used_clock: Any,
+        chosen_break: str,
+        reason: str,
+        *,
+        book_id: str | None = None,
+    ) -> true_up.TrueUpResult:
+        calls.append((chosen_break, reason, book_id, broker, used_clock))
+        assert isinstance(settings, Settings)
+        assert callable(connect)
+        return true_up.TrueUpResult(chosen_break, 23, (41, 42), stamp)
+
+    monkeypatch.setattr(cli.paper_true_up, "reverse", reverse)
+    out = _paper(clock, factory, "true-up", "--reverse", break_id, "--reason", LONG_REASON)
+
+    assert out.exit_code == 0, out.output
+    assert calls == [(break_id, LONG_REASON, "main", factory.fake, clock)]
+    assert "paper true-up: 1:SEC_SPY:1 reopened (event 23, adjustments 41, 42," in out.output
+    assert "at 2026-10-01 14:01:00+00:00)" in out.output
 
 
 def test_paper_start_before_a_gap_signoff_is_refused(

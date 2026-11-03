@@ -47,7 +47,8 @@ id, the reason, and the broker and ledger figures read:
 
 No LLM output reaches any of it (ADR 0008): the reason is journaled and never
 parsed. There is no `--all`, pattern, `--force` or `--size` flag, and nothing
-skips the broker read. The reversal (`--reverse`) is not built here.
+skips the broker read. `--reverse` writes opposite adjustments and reopens a
+trued-up break for the next reconciliation.
 """
 
 from __future__ import annotations
@@ -537,6 +538,7 @@ def reverse(
                     f"stamped {latest.isoformat()}"
                 )
         _check_account(window, broker.account().account_id)
+        # Confirm the broker's live state is readable before journaling the reversal.
         broker.positions()
         broker.cash_activities(window.started_at.astimezone(_NEW_YORK).date() - timedelta(days=1))
         stamp = _read_clock(clock)

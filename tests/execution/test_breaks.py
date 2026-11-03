@@ -320,6 +320,9 @@ def test_state_is_the_latest_event_in_write_order() -> None:
     ]
     assert list(breaks.open_breaks(events)) == ["7:C:1", "7:B:1"]
     assert breaks.open_breaks(events)["7:B:1"].event == "observed"
+    assert breaks.is_open("observed") and not breaks.is_open("resolved_by_broker")
+    with pytest.raises(ValueError, match="not a break event"):
+        breaks.is_open("deleted")
 
 
 def test_owner_reopened_is_restricted_and_counts_toward_cap_even_if_old_size_is_small() -> None:
@@ -331,9 +334,6 @@ def test_owner_reopened_is_restricted_and_counts_toward_cap_even_if_old_size_is_
     assert breaks.cap_exceeded(
         events, ledger_equity=100_000.0, risk=RISK.model_copy(update={"max_open_breaks": 0})
     )
-    assert breaks.is_open("observed") and not breaks.is_open("resolved_by_broker")
-    with pytest.raises(ValueError, match="not a break event"):
-        breaks.is_open("deleted")
 
 
 @pytest.mark.parametrize("kinds", [(), ("cash",), ("quantity", "account_id"), ("x",)])
