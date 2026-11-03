@@ -107,12 +107,14 @@ the `fills_lagging` state: any order lagging at step 3 or at step 4) and goes
 to `trade_step`; any other run goes to `exits_step`.
 
 **The submit window** gates both: a batch starts only while the clock is in
-[open(S) - `paper.submit_window_before_open_minutes`, open(S) +
-`paper.submit_window_after_open_minutes`]. Outside it nothing is journaled for
-the batch and nothing submitted, forced exits included: a pending rebalance
-stays pending for the next in-window run, an exit is made by that run. Under
-`fills_lagging` the same holds: no plan was made, and no forced exit is sized
-off a ledger that is missing a fill.
+the book's window, `submit_window` (for a book at `open`, [open(S) -
+`paper.submit_window_before_open_minutes`, open(S) +
+`paper.submit_window_after_open_minutes`]; for a `midsession` book, its mid-session
+window and, before a batch, its latest batch start: amendment 2026-11-03 item 1).
+Outside it nothing is journaled for the batch and nothing submitted, forced
+exits included: a pending rebalance stays pending for the next in-window run,
+an exit is made by that run. Under `fills_lagging` the same holds: no plan was
+made, and no forced exit is sized off a ledger that is missing a fill.
 
 **Step 7, forced exits** (T63e, `exits.reattempt_exits` and
 `exits.forced_exits`), read once inside the window and before this run
@@ -243,7 +245,12 @@ from tradepartner.errors import (
 )
 from tradepartner.execution import drawdown, exits, marks, planning, switch
 from tradepartner.execution.alerts import Alerter, break_alert_cut, reconcile_break_message
-from tradepartner.execution.buy_timing import execution_for
+from tradepartner.execution.buy_timing import (
+    execution_for,
+    is_midsession,
+    latest_batch_start,
+    submit_window_for,
+)
 from tradepartner.execution.collect import (
     Collected,
     Connect,
@@ -556,15 +563,14 @@ def stop_step(context: StepContext) -> BatchOutcome | None:
     return _execute(context, (), handed)
 
 
-def submit_window(settings: Settings, session: date) -> tuple[datetime, datetime]:
-    """[open(S) - `paper.submit_window_before_open_minutes`, open(S) +
-    `paper.submit_window_after_open_minutes`] (spec req 7 step 6)."""
-    opening = calendar.session_open(session)
-    paper = settings.paper
-    return (
-        opening - timedelta(minutes=paper.submit_window_before_open_minutes),
-        opening + timedelta(minutes=paper.submit_window_after_open_minutes),
-    )
+def submit_window(settings: Settings, session: date, book_id: str) -> tuple[datetime, datetime]:
+    """Book `book_id`'s submit window on `session` (spec req 7 step 6; amendment
+    2026-11-03 item 1): `buy_timing.submit_window_for` from the `calendar` module's open
+    of S. A book at `open` (or absent from `paper.execution`) gets [open(S) -
+    `paper.submit_window_before_open_minutes`, open(S) +
+    `paper.submit_window_after_open_minutes`]; a `midsession` book its mid-session
+    window. The sandbox branch is `_in_submit_window`'s, not this."""
+    return submit_window_for(settings, book_id, calendar.session_open(session))
 
 
 def window_journal_inputs(
@@ -602,9 +608,11 @@ def window_journal_inputs(
 def _in_submit_window(context: StepContext) -> bool:
     """Whether the batch may start now; a note on the run when it may not."""
     now = context.gate.read_clock()
+    book_id = context.window.book_id
     if (
-        context.window.book_id == "sandbox"
-        and sandbox_store_refusal(context.settings, context.window.book_id) is None
+        book_id == "sandbox"
+        and not is_midsession(context.settings, book_id)
+        and sandbox_store_refusal(context.settings, book_id) is None
     ):
         if calendar.session_open(context.session) <= now <= calendar.session_close(context.session):
             note = "sandbox: submit window skipped"
@@ -613,14 +621,26 @@ def _in_submit_window(context: StepContext) -> bool:
             return True
         context.notes.append("sandbox: outside market hours; nothing submitted")
         return False
-    start, end = submit_window(context.settings, context.session)
-    if start <= now <= end:
-        return True
-    context.notes.append(
-        f"outside the submit window [{start.isoformat()}, {end.isoformat()}] at "
-        f"{now.isoformat()}: nothing submitted"
-    )
-    return False
+    start, end = submit_window(context.settings, context.session, book_id)
+    if not start <= now <= end:
+        context.notes.append(
+            f"outside the submit window [{start.isoformat()}, {end.isoformat()}] at "
+            f"{now.isoformat()}: nothing submitted"
+        )
+        return False
+    # A `midsession` book's batch starts only by its latest start (amendment
+    # 2026-11-03 item 1), so the sells' wait and the buys fit inside the window; each
+    # submit is still tested against the full window by the wrapper.
+    latest = latest_batch_start(context.settings, book_id, calendar.session_open(context.session))
+    if latest is not None and now > latest:
+        note = (
+            f"after the latest batch start {latest.isoformat()} of the submit window "
+            f"[{start.isoformat()}, {end.isoformat()}] at {now.isoformat()}: nothing submitted"
+        )
+        if note not in context.notes:
+            context.notes.append(note)
+        return False
+    return True
 
 
 def _execute(

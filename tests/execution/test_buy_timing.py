@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
 
-from tradepartner.calendar import all_sessions
+from tradepartner.calendar import all_sessions, session_close, session_open
 from tradepartner.config import BookExecution, Settings
-from tradepartner.execution.buy_timing import allowed_time_in_force, arm_for, execution_for
+from tradepartner.execution.buy_timing import (
+    allowed_time_in_force,
+    arm_for,
+    execution_for,
+    latest_batch_start,
+    submit_window_for,
+)
 
 SESSIONS = all_sessions()
 
@@ -104,3 +110,89 @@ def test_get_settings_with_alternate_from_env_does_not_recurse(
         '{"daily": {"buy_timing": "alternate", "alternate_start": "2026-11-23"}}',
     )
     assert get_settings().paper.execution["daily"].buy_timing == "alternate"
+
+
+# --- the per-book submit window (paper spec amendment 2026-11-03 items 1 and 9, T377) ---
+
+_MID = {"daily": {"submit_at": "midsession"}}
+
+
+def _utc(y: int, m: int, d: int, hh: int, mm: int = 0) -> datetime:
+    return datetime(y, m, d, hh, mm, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    "entry", [None, {}, {"submit_at": "open"}], ids=["absent", "empty", "open"]
+)
+def test_a_book_absent_or_at_open_keeps_todays_window(entry: dict[str, object] | None) -> None:
+    paper: dict[str, object] = {"submit_window_before_open_minutes": 90}
+    if entry is not None:
+        paper["execution"] = {"daily": entry}
+    s = Settings(_env_file=None, paper=paper)  # type: ignore[arg-type]
+    opening = session_open(date(2026, 10, 30))
+    assert submit_window_for(s, "daily", opening) == (
+        opening - timedelta(minutes=90),
+        opening + timedelta(minutes=30),
+    )
+    assert latest_batch_start(s, "daily", opening) is None
+
+
+@pytest.mark.parametrize(
+    ("session", "start", "end"),
+    [
+        # Friday before the DST change: EDT, the open 13:30 UTC.
+        pytest.param(
+            date(2026, 10, 30), _utc(2026, 10, 30, 14, 30), _utc(2026, 10, 30, 15, 30), id="edt"
+        ),
+        # Monday after it: EST, the open 14:30 UTC; the window moves with the open.
+        pytest.param(
+            date(2026, 11, 2), _utc(2026, 11, 2, 15, 30), _utc(2026, 11, 2, 16, 30), id="est"
+        ),
+        # The early-close day after Thanksgiving: the open is 09:30 ET as on a full day.
+        pytest.param(
+            date(2026, 11, 27),
+            _utc(2026, 11, 27, 15, 30),
+            _utc(2026, 11, 27, 16, 30),
+            id="early-close",
+        ),
+    ],
+)
+def test_a_midsession_book_gets_open_plus_start_to_open_plus_start_plus_length(
+    session: date, start: datetime, end: datetime
+) -> None:
+    s = Settings(_env_file=None, paper={"execution": _MID})  # type: ignore[arg-type]
+    opening = session_open(session)
+    assert submit_window_for(s, "daily", opening) == (start, end)
+    # 10:30 to 11:30 ET, latest batch start 11:05 ET (end - 900 s - 10 min).
+    assert latest_batch_start(s, "daily", opening) == end - timedelta(minutes=25)
+    assert end < session_close(session) - timedelta(minutes=30)
+
+
+def test_the_window_reads_the_books_own_keys_and_the_sell_wait() -> None:
+    entry = {
+        "submit_at": "midsession",
+        "midsession_start_minutes_after_open": 90,
+        "midsession_window_minutes": 45,
+    }
+    s = Settings(_env_file=None, paper={"sell_wait_seconds": 600, "execution": {"daily": entry}})  # type: ignore[arg-type]
+    opening = session_open(date(2026, 10, 30))
+    start, end = submit_window_for(s, "daily", opening)
+    assert (start, end) == (opening + timedelta(minutes=90), opening + timedelta(minutes=135))
+    assert latest_batch_start(s, "daily", opening) == end - timedelta(minutes=20)
+    # A second book with no entry keeps today's window.
+    assert submit_window_for(s, "main", opening)[0] == opening - timedelta(minutes=90)
+
+
+def test_the_latest_start_interval_is_never_empty_at_the_floor() -> None:
+    """At the length floor (sell wait / 60 + 25) the latest start is 15 minutes in."""
+    entry = {"submit_at": "midsession", "midsession_window_minutes": 40}
+    s = Settings(_env_file=None, paper={"execution": {"daily": entry}})  # type: ignore[arg-type]
+    opening = session_open(date(2026, 10, 30))
+    start, _end = submit_window_for(s, "daily", opening)
+    latest = latest_batch_start(s, "daily", opening)
+    assert latest is not None and latest - start == timedelta(minutes=15)
+
+
+def test_a_naive_opening_is_refused() -> None:
+    with pytest.raises(ValueError, match="tz-aware"):
+        submit_window_for(Settings(_env_file=None), "main", datetime(2026, 10, 30, 13, 30))  # noqa: DTZ001

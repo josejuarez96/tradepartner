@@ -19,6 +19,7 @@ the submit window [12:00, 14:00] UTC.
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -33,10 +34,17 @@ from tradepartner.adapters.broker import Asset, OrderRequest
 from tradepartner.adapters.fake_broker import FakeBroker, PartialFill
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.calendar import next_session, previous_session, session_close, session_open
-from tradepartner.config import FROZEN_COSTS_KEYS, CostsConfig, RiskConfig, Settings
+from tradepartner.config import (
+    FROZEN_COSTS_KEYS,
+    BookExecution,
+    CostsConfig,
+    RiskConfig,
+    Settings,
+)
 from tradepartner.errors import LimitBreachError
 from tradepartner.execution import lock, switch
 from tradepartner.execution import run as run_module
+from tradepartner.execution import wrapper as wrapper_module
 from tradepartner.execution.run import RunOutcome, submit_window, tracking_run
 from tradepartner.execution.window import stop
 from tradepartner.execution.wrapper import BatchOutcome
@@ -375,7 +383,7 @@ def test_two_names_mapping_to_one_broker_symbol_halt_before_any_order(
 
 
 def test_the_submit_window_is_open_minus_before_to_open_plus_after(env: Env) -> None:
-    start, end = submit_window(env.settings, F_0)
+    start, end = submit_window(env.settings, F_0, "main")
     opening = session_open(F_0)
     assert (start, end) == (opening - timedelta(minutes=90), opening + timedelta(minutes=30))
     custom = Settings(
@@ -383,7 +391,7 @@ def test_the_submit_window_is_open_minus_before_to_open_plus_after(env: Env) -> 
         store={"path": env.settings.store.path},
         paper={"submit_window_before_open_minutes": 10, "submit_window_after_open_minutes": 5},
     )
-    assert submit_window(custom, F_0) == (
+    assert submit_window(custom, F_0, "main") == (
         opening - timedelta(minutes=10),
         opening + timedelta(minutes=5),
     )
@@ -517,7 +525,7 @@ def test_a_rebalance_run_that_leaves_the_window_in_its_exits_read_trades_on_the_
 
     def slow(context: run_module.StepContext, **kwargs: object) -> object:
         handed = original(context, **kwargs)  # type: ignore[arg-type]
-        _start, end = submit_window(env.settings, F_0)
+        _start, end = submit_window(env.settings, F_0, "main")
         env.clock.now = end + timedelta(seconds=1)
         return handed
 
@@ -542,7 +550,7 @@ def test_a_rebalance_run_that_leaves_the_window_in_its_exits_read_trades_on_the_
 
 
 def test_the_window_bounds_are_inclusive(env: Env, window: PaperWindowRow) -> None:
-    start, _end = submit_window(env.settings, F_0)
+    start, _end = submit_window(env.settings, F_0, "main")
     outcome = env.run(start)
     assert outcome.status == "ok"
     assert env.count("orders") == 3
@@ -1268,3 +1276,330 @@ def test_a_stop_run_with_an_ambiguous_held_residue_still_exits_the_other_names(
     assert exited == {"SEC_SPLIT_FUTURE": "window_stop", "SEC_TRANSFER": "window_stop"}
     assert message is not None and "DUALB -> DUALBX" in message
     assert "DUALB" in env.held()
+
+
+# --- the mid-session submit window (paper spec amendment 2026-11-03, T377) -----------
+#
+# May 2019 is EDT: the open is 13:30 UTC, so `main` at `midsession` with the default
+# keys has the window [14:30, 15:30] UTC (10:30 to 11:30 ET) and its latest batch start
+# 15:05 UTC (11:05 ET: the end less the 900 s sells' wait less 10 minutes).
+
+
+def midsession(env: Env, book: str = "main", **keys: Any) -> None:
+    """Put `book` in `paper.execution` at `submit_at = midsession`."""
+    entry = BookExecution(submit_at="midsession", **keys)
+    paper = env.settings.paper.model_copy(update={"execution": {book: entry}})
+    env.settings = env.settings.model_copy(update={"paper": paper})
+
+
+def test_submit_window_reads_the_books_entry(env: Env) -> None:
+    midsession(env)
+    assert submit_window(env.settings, F_0, "main") == (at(F_0, 14, 30), at(F_0, 15, 30))
+    opening = session_open(F_0)
+    assert submit_window(env.settings, F_0, "other") == (
+        opening - timedelta(minutes=90),
+        opening + timedelta(minutes=30),
+    )
+
+
+@pytest.mark.parametrize(
+    "now",
+    [
+        pytest.param(at(F_0, 12, 5), id="0805-et"),
+        pytest.param(at(F_0, 15, 31), id="after-1130-et"),
+    ],
+)
+def test_a_midsession_run_outside_its_window_submits_nothing(
+    env: Env, window: PaperWindowRow, now: datetime
+) -> None:
+    """A manual 08:05 ET run (today's window) and a run after 11:30 ET submit nothing,
+    note the window and leave the rebalance pending."""
+    midsession(env)
+    outcome = env.run(now)
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert outcome.kind == "rebalance"
+    assert env.count("orders") == 0
+    assert env.submits() == []
+    assert env.rebalance_events() == []
+    assert any(
+        "outside the submit window [2019-05-01T14:30:00+00:00, 2019-05-01T15:30:00+00:00]" in note
+        for note in outcome.notes
+    )
+
+
+def test_a_midsession_run_at_1035_et_trades_the_pending_rebalance(
+    env: Env, window: PaperWindowRow
+) -> None:
+    midsession(env)
+    early = env.run(at(F_0, 12, 5))
+    assert env.count("orders") == 0
+    later = env.run(at(F_0, 14, 35))
+    assert later.status == "ok", env.result(env.latest_run())
+    assert sorted(o[1] for o in env.orders()) == sorted(TARGETS)
+    assert env.rebalance_events() == [(T_0, "executed", None, later.run_id)]
+    assert early.run_id != later.run_id
+
+
+@pytest.mark.parametrize(
+    ("now", "trades"),
+    [
+        pytest.param(at(F_0, 15, 5), True, id="at-1105-et"),
+        pytest.param(at(F_0, 15, 6), False, id="at-1106-et"),
+    ],
+)
+def test_a_midsession_batch_starts_no_later_than_its_latest_start(
+    env: Env, window: PaperWindowRow, now: datetime, trades: bool
+) -> None:
+    """Item 1: inside the window but after end - sell wait - 10 min (11:05 ET), no
+    batch starts, the run notes it and the rebalance stays pending."""
+    midsession(env)
+    outcome = env.run(now)
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert (env.count("orders") == 3) is trades
+    noted = [n for n in outcome.notes if "latest batch start" in n]
+    if trades:
+        assert noted == []
+        return
+    assert env.submits() == [] and env.rebalance_events() == []
+    assert noted == [
+        "after the latest batch start 2019-05-01T15:05:00+00:00 of the submit window "
+        "[2019-05-01T14:30:00+00:00, 2019-05-01T15:30:00+00:00] at "
+        "2019-05-01T15:06:00+00:00: nothing submitted"
+    ]
+
+
+def test_a_midsession_row_unsent_at_the_windows_end_is_closed_not_received(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each submit is tested against the full window: the clock passing 11:30 ET after
+    the first buy closes the other two `cancelled`, `not_received`."""
+    midsession(env)
+    original = env.fake.submit
+
+    def advance_after_first(request: OrderRequest) -> Any:
+        placed = original(request)
+        env.clock.now = at(F_0, 15, 30) + timedelta(seconds=1)
+        return placed
+
+    monkeypatch.setattr(env.fake, "submit", advance_after_first)
+    outcome = env.run(at(F_0, 15, 0))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert len(env.submits()) == 1
+    unsent = env.query(
+        "SELECT count(*) FROM order_events WHERE status = 'cancelled' AND reason = 'not_received'"
+    )
+    assert unsent == [(2,)]
+
+
+def test_a_midsession_stop_run_follows_the_same_window(env: Env, window: PaperWindowRow) -> None:
+    """A `stop` run's exits on a mid-session book: nothing at 08:30 ET, sent at 10:35."""
+    bought(env)
+    midsession(env)
+    env.clock.now = at(F_0, 22, 0)
+    assert stop(env.settings, env.connect, env.fake, env.clock, "test").state == "requested"
+    sent_before = len(env.submits())
+
+    early = env.run(at(F_0_PLUS_1))
+    assert early.kind == "stop"
+    assert env.submits()[sent_before:] == []
+    assert any("outside the submit window" in n for n in early.notes)
+
+    later = env.run(at(F_0_PLUS_1, 14, 35))
+    assert later.kind == "stop"
+    assert sorted(r.symbol for r in env.submits()[sent_before:]) == ["DUALB", "SPFT", "TRNS"]
+
+
+def _sandbox(env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(env.settings).write_text("")
+    env.settings = env.settings.model_copy(
+        update={"paper": env.settings.paper.model_copy(update={"book_id": "sandbox"})}
+    )
+
+
+def test_a_sandbox_at_midsession_takes_the_midsession_window(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 5: with its own entry at `midsession` the sandbox branch is skipped, so a
+    14:00 ET run submits nothing and a 10:35 ET run trades."""
+    _sandbox(env, tmp_path, monkeypatch)
+    midsession(env, "sandbox")
+    env.open_window(tmp_path=tmp_path)
+    outcome = env.run(at(F_0, 18))
+    assert env.submits() == []
+    assert "sandbox: submit window skipped" not in outcome.notes
+    assert any("outside the submit window" in n for n in outcome.notes)
+    later = env.run(at(F_0_PLUS_1, 14, 35))
+    assert later.status == "ok", env.result(env.latest_run())
+    assert later.kind == "catch_up"
+    assert len(env.submits()) == 3
+
+
+# --- pinned comparison: a book absent from the map, or at `open`, trades as today ----
+
+#: The F_0 rebalance's journal on the fixture run at 08:30 ET as it was before T377
+#: (security_id, side, phase, notional, quantity, attempt, time_in_force, session).
+PINNED_ORDERS = [
+    ("SEC_DUAL_B", "buy", "buy", 33283.4, None, 1, "day", F_0),
+    ("SEC_SPLIT_FUTURE", "buy", "buy", 33283.4, None, 1, "day", F_0),
+    ("SEC_TRANSFER", "buy", "buy", 33283.4, None, 1, "day", F_0),
+]
+#: (security_id, side, decision, target_weight, planned_notional, whole_share).
+PINNED_DECISIONS = [
+    ("SEC_DUAL_B", "buy", "trade", 1 / 3, 33333.33333333333, False),
+    ("SEC_SPLIT_FUTURE", "buy", "trade", 1 / 3, 33333.33333333333, False),
+    ("SEC_TRANSFER", "buy", "trade", 1 / 3, 33333.33333333333, False),
+]
+
+
+@pytest.mark.parametrize("entry", [None, BookExecution()], ids=["absent", "open"])
+def test_an_open_or_absent_book_journals_todays_rows(
+    env: Env, window: PaperWindowRow, entry: BookExecution | None
+) -> None:
+    if entry is not None:
+        paper = env.settings.paper.model_copy(update={"execution": {"main": entry}})
+        env.settings = env.settings.model_copy(update={"paper": paper})
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    rows = env.query(
+        "SELECT security_id, side, phase, notional, quantity, attempt, time_in_force, session"
+        " FROM orders ORDER BY security_id"
+    )
+    assert rows == PINNED_ORDERS
+    decisions = env.query(
+        "SELECT security_id, side, decision, target_weight, planned_notional, whole_share"
+        " FROM decisions ORDER BY security_id"
+    )
+    assert decisions == PINNED_DECISIONS
+    assert not any("outside the submit window" in n for n in outcome.notes)
+
+
+# --- no look-ahead (item 4): nothing reads an intraday price -------------------------
+
+F_1 = date(2019, 6, 3)  # the next fill session; T_1 = 2019-05-31
+
+
+def _leak_session_s_facts(env: Env) -> None:
+    """A session-S (F_1) bar for every held and target name at a price far from
+    close(S-1), and a 2:1 split with `ex_date` S+1, all known at 10:00 ET on S, before
+    the 10:35 ET run."""
+    known = at(F_1, 14, 0)
+    names = [r[0] for r in env.query("SELECT DISTINCT security_id FROM prices_daily")]
+    with open_for_write(env.settings) as conn:
+        for sid in names:
+            insert_row(
+                conn,
+                "prices_daily",
+                {
+                    "security_id": sid,
+                    "session": F_1,
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "volume": 1000,
+                    "known_at": known,
+                    "ingested_at": known,
+                    "source": "alpaca",
+                    "provenance": "bar",
+                },
+            )
+        insert_row(
+            conn,
+            "corporate_actions",
+            {
+                "security_id": "SEC_DUAL_B",
+                "action_type": "split",
+                "ex_date": next_session(F_1),
+                "ratio_or_amount": 2.0,
+                "known_at": known,
+                "ingested_at": known,
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+
+
+def _midsession_rebalance(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, leak: bool
+) -> tuple[Any, ...]:
+    """The F_0 buys at the open, then `main` at `midsession` and the F_1 rebalance run
+    at 10:35 ET with an `exclude_name` override (a sell and a replacement buy): what it
+    journaled and sent, and every reference price the run read."""
+    window = env.open_window(tmp_path=tmp_path)
+    bought(env)
+    stamp = at(T_0, 22)
+    assert window.window_id is not None
+    env.append(
+        OverrideRow(
+            window_id=window.window_id,
+            made_at=stamp,
+            rebalance_session=date(2019, 5, 31),
+            security_id="SEC_TRANSFER",
+            kind="exclude_name",
+            reason="the owner's reason, long enough",
+            known_at=stamp,
+            ingested_at=stamp,
+        )
+    )
+    if leak:
+        _leak_session_s_facts(env)
+    midsession(env)
+    seen: list[dict[str, float]] = []
+    original = run_module.planning.reference_prices
+
+    def spy(*args: Any, **kwargs: Any) -> dict[str, float]:
+        prices = original(*args, **kwargs)
+        seen.append(dict(prices))
+        return prices
+
+    monkeypatch.setattr(run_module.planning, "reference_prices", spy)
+    monkeypatch.setattr(wrapper_module, "reference_prices", spy)
+    sent_before = len(env.submits())
+    outcome = env.run(at(F_1, 14, 35))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    decisions = env.query(
+        "SELECT rebalance_session, security_id, side, decision, target_weight, "
+        "drifted_weight, planned_notional, planned_quantity, target_notional, whole_share "
+        "FROM decisions WHERE run_id = ? ORDER BY decision_id",
+        [outcome.run_id],
+    )
+    orders = env.query(
+        "SELECT client_order_id, security_id, side, phase, notional, quantity, session "
+        "FROM orders WHERE run_id = ? ORDER BY client_order_id",
+        [outcome.run_id],
+    )
+    requests = [
+        (r.client_order_id, r.symbol, r.side, r.notional, r.quantity)
+        for r in env.submits()[sent_before:]
+    ]
+    return decisions, orders, seen, requests
+
+
+def test_session_s_facts_known_before_a_midsession_run_change_nothing(
+    fixture_store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 9's no-look-ahead line: a session-S bar for every held and target name and
+    an S+1 split, both known at 10:00 ET on S, leave a 10:35 ET run's decisions, target
+    notionals, reference prices and order requests exactly as on the store without
+    them. Every store read stays `as_of` close(S-1); nothing reads an intraday price."""
+    journals = []
+    for leak in (False, True):
+        path = tmp_path / f"store-{leak}.duckdb"
+        shutil.copyfile(fixture_store_path, path)
+        settings = Settings(
+            _env_file=None,
+            store={"path": str(path)},
+            alpaca={"quantity_decimals": 6, "client_order_id_max_length": 48},
+        )
+        (tmp_path / f"w-{leak}").mkdir()
+        with monkeypatch.context() as patch:
+            journals.append(
+                _midsession_rebalance(
+                    Env(settings, Clock(at(F_0))), tmp_path / f"w-{leak}", patch, leak=leak
+                )
+            )
+    clean, leaked = journals
+    decisions, orders, seen, requests = clean
+    assert {d[2] for d in decisions} >= {"sell", "buy"} and orders and seen and requests
+    assert leaked == clean

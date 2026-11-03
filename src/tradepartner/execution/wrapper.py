@@ -263,7 +263,12 @@ from tradepartner.errors import (
 from tradepartner.execution import breaks as break_rules
 from tradepartner.execution import phases, switch
 from tradepartner.execution.alerts import Alerter
-from tradepartner.execution.buy_timing import arm_for, execution_for
+from tradepartner.execution.buy_timing import (
+    arm_for,
+    execution_for,
+    is_midsession,
+    submit_window_for,
+)
 from tradepartner.execution.collect import (
     Connect,
     PriceBand,
@@ -574,6 +579,7 @@ class _Variant:
     timing: str
     fraction: float
     fallback: str
+    submit_at: str = "open"
     sleeve_cash: float | None = None
     idle_cash: float | None = None
     min_cash: float | None = None
@@ -595,7 +601,8 @@ class _Variant:
 
         return (
             f"{PAPER_EXECUTION} arm={self.arm} timing={self.timing} "
-            f"sleeve_fraction={number(self.fraction)} sleeve_cash={number(self.sleeve_cash)} "
+            f"submit_at={self.submit_at} sleeve_fraction={number(self.fraction)} "
+            f"sleeve_cash={number(self.sleeve_cash)} "
             f"idle_cash={number(self.idle_cash)} min_cash={number(self.min_cash)} "
             f"open_buys={self.open_buys} open_notional={number(self.open_notional)} "
             f"open_unsent={self.open_unsent} fallback={self.fallback} "
@@ -604,13 +611,14 @@ class _Variant:
 
 
 def paper_execution_fields(line: str) -> dict[str, str | int | float | None]:
-    """Parse item 6's line back: `arm`, `timing` and `fallback` as text; the counts
+    """Parse item 6's line back: `arm`, `timing`, `fallback` and `submit_at` (amendment
+    2026-11-03 item 4) as text; the counts
     as `int`; the cash fields and `sleeve_fraction` as `float`, `na` as None. A line
     that is not item 6's raises `ValueError`."""
     head, _, rest = line.partition(" ")
     if head != PAPER_EXECUTION:
         raise ValueError(f"not a {PAPER_EXECUTION} line: {line!r}")
-    texts = {"arm", "timing", "fallback"}
+    texts = {"arm", "timing", "fallback", "submit_at"}
     counts = {"open_buys", "open_unsent", "opg_after_cutoff"}
     numbers = {"sleeve_fraction", "sleeve_cash", "idle_cash", "min_cash", "open_notional"}
     fields: dict[str, str | int | float | None] = {}
@@ -1266,6 +1274,7 @@ class RiskGatedBroker:
             timing=execution.buy_timing,
             fraction=execution.cash_sleeve_fraction,
             fallback=OPEN_TRANCHE_NOT_BUILT if arm == "V1" else "none",
+            submit_at=execution.submit_at,
         )
         try:
             variant.sleeve_cash = variant.fraction * _ledger_equity(book)
@@ -1903,22 +1912,21 @@ class RiskGatedBroker:
         return submitted, refused
 
     def _in_submit_window(self, session: date, run: PaperRunRow) -> bool:
-        """Whether the clock reads inside [open(S) - `paper.submit_window_before_open_minutes`,
-        open(S) + `paper.submit_window_after_open_minutes`] (the interval of
-        `run.submit_window`)."""
-        paper = self._settings.paper
+        """Whether the clock reads inside the book's submit window (the interval of
+        `run.submit_window`: `buy_timing.submit_window_for` from `self._calendar`'s
+        open of S), tested before every submit. A sandbox book not at `midsession`
+        on a marked copy keeps [open(S), close(S)] (amendment 2026-11-03 item 5)."""
         opening = self._calendar.session_open(session)
         now = self.read_clock()
+        book_id = self._run_book(run)
         if (
-            self._run_book(run) == "sandbox"
+            book_id == "sandbox"
+            and not is_midsession(self._settings, book_id)
             and sandbox_store_refusal(self._settings, "sandbox") is None
         ):
             return opening <= now <= self._calendar.session_close(session)
-        return (
-            opening - timedelta(minutes=paper.submit_window_before_open_minutes)
-            <= now
-            <= opening + timedelta(minutes=paper.submit_window_after_open_minutes)
-        )
+        start, end = submit_window_for(self._settings, book_id, opening)
+        return start <= now <= end
 
     def _close_unsent(self, run: PaperRunRow, rows: Sequence[OrderRow]) -> None:
         """Close each journaled but never-sent order `cancelled`, reason

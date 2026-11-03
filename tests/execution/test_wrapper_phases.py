@@ -26,7 +26,7 @@ from tradepartner import calendar
 from tradepartner.adapters.broker import Asset, OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker, FillAt, Reject, Vanish
 from tradepartner.calendar import session_close, session_open
-from tradepartner.config import FROZEN_PAPER_KEYS, CostsConfig, RiskConfig, Settings
+from tradepartner.config import FROZEN_PAPER_KEYS, BookExecution, CostsConfig, RiskConfig, Settings
 from tradepartner.errors import (
     AcknowledgementTimeoutError,
     LimitBreachError,
@@ -1886,3 +1886,108 @@ def _window_fields() -> dict[str, Any]:
 def test_execute_needs_a_journaled_run(env: Env, alerter_conn: duckdb.DuckDBPyConnection) -> None:
     with pytest.raises(ValueError, match="journaled run"):
         _gate(env, alerter_conn).execute(replace(env.run, run_id=None), [], [])
+
+
+# --- the mid-session submit window (paper spec amendment 2026-11-03, T377) -----------
+
+
+def _midsession(env: Env) -> None:
+    """The env's book at `submit_at = midsession` (window open + 60 to open + 120)."""
+    entry = BookExecution(submit_at="midsession")
+    paper = env.settings.paper.model_copy(update={"execution": {env.window.book_id: entry}})
+    env.settings = env.settings.model_copy(update={"paper": paper})
+
+
+@pytest.mark.parametrize(
+    ("minutes", "sent"),
+    [
+        pytest.param(-5, False, id="before-the-open"),
+        pytest.param(31, False, id="in-todays-window-end-gap"),
+        pytest.param(59, False, id="before-1030-et"),
+        pytest.param(60, True, id="at-1030-et"),
+        pytest.param(120, True, id="at-1130-et"),
+        pytest.param(121, False, id="after-1130-et"),
+    ],
+)
+def test_a_midsession_book_submits_only_inside_its_window(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, minutes: int, sent: bool
+) -> None:
+    """The test before every submit reads the book's window from `submit_window_for`:
+    nothing goes out before 10:30 ET or after 11:30 ET; an unsent row is closed
+    `not_received`."""
+    _midsession(env)
+    env.clock.now = session_open(S) + timedelta(minutes=minutes)
+    buys = [_decision(env, A, "buy", notional=3000.0), _decision(env, B, "buy", notional=3000.0)]
+    outcome = _execute(_gate(env, alerter_conn), env, buys)
+    assert outcome.status == "ok"
+    assert (len(_submits(env.fake)) == 2) is sent
+    if not sent:
+        assert _submits(env.fake) == []
+        reasons = _query(
+            env.settings,
+            "SELECT e.reason FROM order_events e JOIN orders o USING (client_order_id) "
+            "WHERE o.run_id = ? AND e.status = 'cancelled'",
+            [env.run.run_id],
+        )
+        assert reasons == [("not_received",), ("not_received",)]
+
+
+def test_the_wrappers_window_reads_its_injected_calendars_open(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """`_in_submit_window` passes `self._calendar`'s open: a calendar whose open of S is
+    an hour later moves the mid-session window with it."""
+    _midsession(env)
+    late_open = session_open(S) + timedelta(hours=1)
+    late = SimpleNamespace(
+        **{name: getattr(calendar, name) for name in dir(calendar) if not name.startswith("_")}
+    )
+    late.session_open = lambda session: late_open if session == S else session_open(session)
+    gate = RiskGatedBroker(
+        env.fake,
+        env.clock,
+        FROZEN,
+        env.settings,
+        lambda: open_for_write(env.settings),
+        late,  # type: ignore[arg-type]
+        Alerter(env.settings, alerter_conn, env.clock),
+        sleep=lambda seconds: env.clock.advance(seconds=seconds),
+    )
+    env.clock.now = session_open(S) + timedelta(minutes=90)  # before the late open + 60
+    assert gate._in_submit_window(S, env.run) is False
+    env.clock.now = late_open + timedelta(minutes=60)
+    assert gate._in_submit_window(S, env.run) is True
+    env.clock.now = late_open + timedelta(minutes=121)
+    assert gate._in_submit_window(S, env.run) is False
+
+
+def test_the_paper_execution_line_carries_submit_at(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    _midsession(env)
+    env.clock.now = session_open(S) + timedelta(minutes=61)
+    notes: list[str] = []
+    buys = [_decision(env, A, "buy", notional=3000.0)]
+    outcome = _gate(env, alerter_conn).execute(env.run, buys, (), notes=notes)
+    assert outcome.status == "ok"
+    (line,) = [n for n in notes if n.startswith(f"{wrapper.PAPER_EXECUTION} ")]
+    fields = wrapper.paper_execution_fields(line)
+    assert (fields["submit_at"], fields["arm"], fields["timing"]) == (
+        "midsession",
+        "V0",
+        "after_sells",
+    )
+
+
+def test_an_open_books_window_is_unchanged(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """A book at `open` in the map keeps [open - 90, open + 30] before every submit."""
+    paper = env.settings.paper.model_copy(
+        update={"execution": {env.window.book_id: BookExecution()}}
+    )
+    env.settings = env.settings.model_copy(update={"paper": paper})
+    gate = _gate(env, alerter_conn)
+    for minutes, inside in ((-91, False), (-90, True), (30, True), (31, False), (60, False)):
+        env.clock.now = session_open(S) + timedelta(minutes=minutes)
+        assert gate._in_submit_window(S, env.run) is inside, minutes
