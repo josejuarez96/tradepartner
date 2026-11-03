@@ -80,7 +80,7 @@ t is the mean over its ordinary standard error (ddof 1), with no HAC.
 | Screen | 2016+ | 67/120 (55.8%) | −33.14% | above | pass / fail / pass |
 | Screen | 2020+ | 41/72 (56.9%) | −23.80% | above | pass / fail / pass |
 
-The 200% stress floors are VW 0.100 / 0.150 / 0.250 and screen 0.1667 / 0.2167 / 0.3833 (long / short / L/S). The worst 12 months in VW, −50.4%, falls inside 2020+ and so appears in all three VW windows; the screen's worst, −33.1%, falls in 2016–2019, so it appears in 2009+ and 2016+ but not in 2020+.
+The 200% stress floors are VW 0.100 / 0.150 / 0.250 and screen 0.1667 / 0.2167 / 0.3833 (long / short / L/S). The worst 12 months in VW, −50.4%, falls inside 2020+ and so appears in all three VW windows; the screen's worst, −33.1% (12 months to 2020-09), starts in 2019, so it appears in 2009+ and 2016+ but not in 2020+.
 
 ## Disconfirmation
 
