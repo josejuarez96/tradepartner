@@ -6162,6 +6162,127 @@ def test_the_rebuild_needs_the_edgar_source(settings: Settings) -> None:
         _run(_events_on(settings), source="alpaca", rebuild_filing_events=True)
 
 
+# --- a rebuild replaces per CIK, never wiping a CIK whose read is empty (#2956) --
+
+_DUAL_F1 = f"{DUAL}-19-000101"
+_BOTH_STATEMENTS = (
+    *_components(F1, AT1),
+    _sf("revenue", 7, _DUAL_F1, AT1, cik=DUAL),
+    _sf("total_assets", 9, _DUAL_F1, AT1, cik=DUAL, period=(None, FY18[1])),
+)
+_DUAL_EVENT = FilingEvent(DUAL, _DUAL_F1, "8-K", "2.02", datetime(2019, 5, 2, 20, 5, tzinfo=UTC))
+
+
+def _all_statement_rows(read: Callable[[str], list[tuple[Any, ...]]]) -> list[tuple[Any, ...]]:
+    return read("SELECT * FROM statement_facts ORDER BY ALL")
+
+
+def _all_event_rows(read: Callable[[str], list[tuple[Any, ...]]]) -> list[tuple[Any, ...]]:
+    return read("SELECT * FROM filing_events ORDER BY ALL")
+
+
+def test_a_statement_rebuild_keeps_a_cik_whose_read_is_empty(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#2956: DUAL's statement cache is missing on the rebuild's day, so its read
+    is empty. Its stored rows stay, known_at and all, and it is counted; ACME,
+    which reads rows, is replaced."""
+    on = _switched(settings)
+    _edgar(on, _StatementSource(_BOTH_STATEMENTS))
+    dual_before = read(f"SELECT * FROM statement_facts WHERE cik = '{DUAL}' ORDER BY ALL")
+    assert len(dual_before) == 2
+    acme_only = [r for r in _BOTH_STATEMENTS if r.cik == ACME]
+    rebuilt = _edgar(on, _StatementSource(acme_only), rebuild_statement_facts=True)
+    counts = statement_counts(rebuilt.message)
+    acme_rows = read(f"SELECT count(*) FROM statement_facts WHERE cik = '{ACME}'")[0][0]
+    assert (counts["deleted"], counts["added"]) == (acme_rows, acme_rows)
+    assert counts["rebuild_kept_empty_read"] == 1
+    assert f"statement_rebuild_kept_empty_read: 1 (first: {DUAL})" in rebuilt.message
+    assert read(f"SELECT * FROM statement_facts WHERE cik = '{DUAL}' ORDER BY ALL") == dual_before
+
+
+def test_a_statement_rebuild_with_the_switch_off_refuses_and_keeps_every_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _switched(settings)
+    source = _StatementSource(_BOTH_STATEMENTS)
+    _edgar(on, source)
+    before = _all_statement_rows(read)
+    assert before
+    with pytest.raises(ValueError, match="statement_facts_enabled"):
+        _run(
+            _switched(settings, False), filings=source, source="edgar", rebuild_statement_facts=True
+        )
+    assert _all_statement_rows(read) == before
+
+
+def test_a_statement_rebuild_of_ciks_that_read_rows_writes_todays_rows(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """Pinned: when every CIK reads rows, the rebuild's rows are exactly a fresh
+    ingest's into an empty table (the old delete-all-then-insert), and
+    `deleted` is every stored row."""
+    on = _switched(settings)
+    _edgar(on, _StatementSource([_sf("revenue", 110, F2, AT2), *_BOTH_STATEMENTS[2:]]))
+    stored = read("SELECT count(*) FROM statement_facts")[0][0]
+    late = [_sf("revenue", 100, F1, AT1), _sf("revenue", 110, F2, AT2), *_BOTH_STATEMENTS]
+    rebuilt = _edgar(on, _StatementSource(late), rebuild_statement_facts=True)
+    counts = statement_counts(rebuilt.message)
+    assert counts["deleted"] == stored
+    assert counts["rebuild_kept_empty_read"] == 0
+    rows = _all_statement_rows(read)
+    with open_for_write(on) as conn:
+        conn.execute("DELETE FROM statement_facts")
+    fresh = _edgar(on, _StatementSource(late))
+    assert _all_statement_rows(read) == rows
+    fresh_counts = statement_counts(fresh.message)
+    for name in ("added", "held", "vintage_late", "restated", "derived"):
+        assert counts[name] == fresh_counts[name], name
+
+
+def test_an_events_rebuild_keeps_a_cik_whose_read_is_empty(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _events_on(settings)
+    _edgar(on, _EventSource((*EVENTS, _DUAL_EVENT)))
+    dual_before = read(f"SELECT * FROM filing_events WHERE cik = '{DUAL}'")
+    assert len(dual_before) == 1
+    rebuilt = _edgar(on, _EventSource(EVENTS), rebuild_filing_events=True)
+    counts = filing_event_counts(rebuilt.message)
+    assert (counts["before"], counts["added"], counts["after"]) == (4, 3, 4)
+    assert counts["rebuild_kept_empty_read"] == 1
+    assert f"filing_events_rebuild_kept_empty_read: 1 (first: {DUAL})" in rebuilt.message
+    assert read(f"SELECT * FROM filing_events WHERE cik = '{DUAL}'") == dual_before
+
+
+def test_an_events_rebuild_with_the_switch_off_refuses_and_keeps_every_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    source = _EventSource((*EVENTS, _DUAL_EVENT))
+    _edgar(_events_on(settings), source)
+    before = _all_event_rows(read)
+    assert len(before) == 4
+    with pytest.raises(ValueError, match="filing_events_enabled"):
+        _run(settings, filings=source, source="edgar", rebuild_filing_events=True)
+    assert _all_event_rows(read) == before
+
+
+def test_an_events_rebuild_of_ciks_that_read_rows_writes_todays_rows(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _events_on(settings)
+    _edgar(on, _EventSource((EVENTS[0], _DUAL_EVENT)))
+    rebuilt = _edgar(on, _EventSource((*EVENTS, _DUAL_EVENT)), rebuild_filing_events=True)
+    counts = filing_event_counts(rebuilt.message)
+    assert (counts["before"], counts["added"], counts["after"]) == (2, 4, 4)
+    assert counts["rebuild_kept_empty_read"] == 0
+    rows = _all_event_rows(read)
+    with open_for_write(on) as conn:
+        conn.execute("DELETE FROM filing_events")
+    _edgar(on, _EventSource((*EVENTS, _DUAL_EVENT)))
+    assert _all_event_rows(read) == rows
+
+
 # --- the store restamp from a stamps-repair manifest (#1382, T166b) ----------
 
 
