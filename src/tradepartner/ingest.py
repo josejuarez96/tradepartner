@@ -395,7 +395,12 @@ from tradepartner.store.retraction import (
 )
 from tradepartner.store.schema import atomic, init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
-from tradepartner.universe import SHARES_FACT, member_links_title
+from tradepartner.universe import (
+    SHARES_FACT,
+    member_links_title,
+    on_list_ids,
+    on_universe_exchange,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -6663,7 +6668,7 @@ def _counted(
     a benchmark, or a common name on one of `universe.exchanges` (OTC is not
     one, and the SIP feed has no OTC bars; #784)."""
     return sid in benchmarks or (
-        kinds.get(sid) == "common" and row["exchange"] in settings.universe.exchanges
+        kinds.get(sid) == "common" and on_universe_exchange(row, settings.universe.exchanges)
     )
 
 
@@ -6703,7 +6708,7 @@ def _fetched(
     `_counted`, so every counted name is fetched."""
     if sid in benchmarks:
         return True
-    if row["exchange"] not in settings.universe.exchanges:
+    if not on_universe_exchange(row, settings.universe.exchanges):
         return False
     known = types.get(sid)
     skipped = NOT_EQUITY - set(settings.universe.security_types)
@@ -6851,7 +6856,12 @@ def _price_names(
     security's current listing."""
     current: dict[str, Row] = {}
     earliest: dict[str, date] = {}
-    for row in listing_ends_as_of(conn, now, settings).iter_rows(named=True):
+    rows = list(listing_ends_as_of(conn, now, settings).iter_rows(named=True))
+    # A newer secondary-quote row (`NYSE_CHICAGO`, `NYSETX`) does not take a
+    # security off the list while a row on it is live (universe rule 2; #2937).
+    on_list = on_list_ids(rows, settings.universe.exchanges, session)
+    for listed_row in rows:
+        row = {**listed_row, "on_listed_exchange": listed_row["security_id"] in on_list}
         sid = row["security_id"]
         _first_listed(earliest, row, settings)
         held = current.get(sid)

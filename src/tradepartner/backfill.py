@@ -192,6 +192,7 @@ from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing
 from tradepartner.store.master import first_session, securities_as_of
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
+from tradepartner.universe import on_list_ids
 
 BACKFILL = "backfill"
 #: `fill_holes`' run mode, and the status of a month it committed (never `ok`).
@@ -938,7 +939,11 @@ def _window_names(
     filed: set[str] = set()  # with a filing-based listing live in the window
     reference = None
     earliest: dict[str, date] = {}
-    rows = list(listing_ends_as_of(conn, t, settings).iter_rows(named=True))
+    listed_rows = list(listing_ends_as_of(conn, t, settings).iter_rows(named=True))
+    # A secondary-quote row (`NYSE_CHICAGO`, `NYSETX`) is on the list while its
+    # security has a row live on it (universe rule 2; #2937).
+    on_list = on_list_ids(listed_rows, settings.universe.exchanges, last)
+    rows = [{**row, "on_listed_exchange": row["security_id"] in on_list} for row in listed_rows]
     starts: dict[str, set[date]] = defaultdict(set)
     for row in rows:
         starts[row["security_id"]].add(row["valid_from"])

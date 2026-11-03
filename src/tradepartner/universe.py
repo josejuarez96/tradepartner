@@ -123,7 +123,7 @@ import math
 import re
 import statistics
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from functools import cache
@@ -295,7 +295,7 @@ _SECONDARY_VENUES = frozenset(
 )
 
 
-def _is_live(row: dict[str, Any], session: date) -> bool:
+def _is_live(row: Mapping[str, Any], session: date) -> bool:
     """Whether a listing row (with `status` and `end_session`) is live at `session`."""
     if row["status"] == LISTED:
         return True
@@ -343,6 +343,32 @@ def _current_listings(
     return {sid: {**row, "on_listed_exchange": sid in on_list} for sid, row in current.items()}
 
 
+def on_list_ids(
+    rows: Iterable[Mapping[str, Any]], exchanges: Collection[str], session: date
+) -> set[str]:
+    """The securities with a row at or before `session` that is live at it on
+    a venue in `exchanges` (rows with `status` and `end_session`, as
+    `listing_ends_as_of` gives): the securities a newer secondary-quote row
+    does not take off the list (T196; the bar fetch reads the same rule,
+    #2937)."""
+    return {
+        row["security_id"]
+        for row in rows
+        if row["valid_from"] <= session and row["exchange"] in exchanges and _is_live(row, session)
+    }
+
+
+def on_universe_exchange(row: Mapping[str, Any], exchanges: Collection[str]) -> bool:
+    """Whether a listing `row` counts as on `exchanges` for rule 2: its
+    exchange is on the list, or it is a secondary-quote venue
+    (`_SECONDARY_VENUES`) and the row carries `on_listed_exchange` (its
+    security has a live row on the list, `on_list_ids`). A row without that
+    key is judged by its exchange alone."""
+    if row["exchange"] in exchanges:
+        return True
+    return bool(row.get("on_listed_exchange")) and row["exchange"] in _SECONDARY_VENUES
+
+
 def _listing_reason(listing: dict[str, Any] | None, session: date, exchanges: list[str]) -> str:
     """Why a listing fails rule 2, or `""` if it passes."""
     if listing is None:
@@ -354,10 +380,8 @@ def _listing_reason(listing: dict[str, Any] | None, session: date, exchanges: li
         return "not_listed"
     if status not in (LISTED, TRANSFERRED):
         return f"status:{status}"
-    if listing["exchange"] not in exchanges:
+    if not on_universe_exchange(listing, exchanges):
         # A secondary quote on a real venue does not hide a live listing on the list.
-        if listing["on_listed_exchange"] and listing["exchange"] in _SECONDARY_VENUES:
-            return ""
         return f"exchange:{listing['exchange']}"
     return ""
 
