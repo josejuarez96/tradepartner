@@ -449,7 +449,7 @@ def ingest_openfigi(
         raise ValueError("OpenFIGI ingest is disabled")
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     session = last_completed_session(now)
-    first_bar = now.date() - relativedelta(months=settings.universe.min_history_months)
+    first_bar = session - relativedelta(months=settings.universe.min_history_months)
     prepared: list[tuple[str, str, str]] = []
     responses: list[tuple[list[Any], datetime, datetime]] = []
     class_symbols = settings.alpaca.class_symbols
@@ -845,6 +845,7 @@ def ingest_session(
     rebuild_filing_events: bool = False,
     rebuild_classifications: bool = False,
     rebuild_index: bool = False,
+    statement_backfill: bool = False,
     restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
     restamp_window_ok: WindowEarlierOk | None = None,
@@ -876,7 +877,21 @@ def ingest_session(
     Under `all` the snapshot runs **last**, after every other source has
     committed `ok`, and only while `borrow.enabled` is on and `assets` is
     given (the CLI always gives it): off, no request is made and nothing is
-    written for it."""
+    written for it.
+    `statement_backfill` (#2826, T365) runs only `statement_backfill_session`;
+    it needs the edgar source and no other rebuild or restamp flag."""
+    if statement_backfill:
+        if source != "edgar":
+            raise ValueError("statement_backfill needs the edgar source")
+        if (
+            rebuild_index
+            or rebuild_statement_facts
+            or rebuild_filing_events
+            or rebuild_classifications
+            or restamp is not None
+        ):
+            raise ValueError("statement_backfill cannot be combined with other rebuild flags")
+        return statement_backfill_session(settings, filings, clock=clock, dry_run=dry_run)
     if restamp is not None and source != "edgar":
         raise ValueError("restamp needs the edgar source")
     if rebuild_index and source != "edgar":
@@ -2608,10 +2623,7 @@ def _prepare_indexed_filings(
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     batch = _prepare_index(settings, source, now, dry_run=dry_run)
     with open_read_only(settings, retry=True) as conn:
-        old = conn.execute(
-            "SELECT chunk_cursor, finished_at FROM ingestion_runs WHERE source = 'edgar_index' "
-            "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
-        ).fetchone()
+        old = _last_ok_index_row(conn)
     previous: Mapping[str, Any] = {}
     previous_touch: Mapping[str, Any] = {}
     previous_at: datetime | None = None
@@ -2688,6 +2700,20 @@ def _prepare_indexed_filings(
             _fetch_and_gate(rotated, settings)
             rotated.frozen = True
     return replace(batch, rotation_recorded=rotated)
+
+
+def _last_ok_index_row(conn: duckdb.DuckDBPyConnection) -> tuple[Any, Any] | None:
+    """The last `ok` `edgar_index` row's cursor, and the window start T320
+    diffs from: the finish of the last `ok` row that read the index. A
+    statement backfill's `ok` row (#2826) reads none, so it never moves the
+    start past quarters and acceptances no nightly has seen."""
+    return conn.execute(
+        "SELECT chunk_cursor, (SELECT finished_at FROM ingestion_runs "
+        "WHERE source = 'edgar_index' AND status = 'ok' AND mode <> ? "
+        "ORDER BY rowid DESC LIMIT 1) FROM ingestion_runs "
+        "WHERE source = 'edgar_index' AND status = 'ok' ORDER BY rowid DESC LIMIT 1",
+        [STATEMENT_BACKFILL],
+    ).fetchone()
 
 
 def _rotation_report(
@@ -2994,6 +3020,265 @@ def _rebuild_index_session(
         release = getattr(_unwrap(filings), "release_index", None)
         if callable(release):
             release()
+    return IngestResult((final,))
+
+
+# --- The additive statement backfill (#2826, plan T365) ----------------------
+
+STATEMENT_BACKFILL = "statement_backfill"
+_BACKFILL_CURSOR = re.compile(r"^statement_backfill;through=(\d{10});tags=([0-9a-f]+)$")
+
+
+def statement_tags_digest(settings: Settings) -> str:
+    """The digest a backfill chunk's cursor names: `statement_tags` (with each
+    list's order, the precedence) and `statement_fact_units`."""
+    edgar = settings.edgar
+    encoded = json.dumps(
+        [edgar.statement_tags, edgar.statement_fact_units], sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode()).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class _BackfillStart:
+    """Where a backfill stands on one store read: the refusal, or the added
+    names, the last committed CIK under today's digest and the last `ok`
+    `edgar_index` row's cursor (its snapshot and touch values carry over)."""
+
+    refusal: str | None
+    added: tuple[str, ...] = ()
+    through: str | None = None
+    ok_cursor: Mapping[str, Any] = field(default_factory=dict)
+
+
+def _statement_backfill_start(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> _BackfillStart:
+    """T365a's additive check against the last `ok` `edgar_index` row, then the
+    resume point from this digest's `partial` rows written after it."""
+    from tradepartner.store.build_fingerprint import (
+        PER_NAME_KEYS,
+        additive_statement_change,
+        build_fingerprint,
+    )
+
+    seed = "EDGAR index has no completed seed; run --rebuild-index"
+    if index_snapshot_id(conn) is None:
+        return _BackfillStart(seed)
+    row = conn.execute(
+        "SELECT message, chunk_cursor, rowid FROM ingestion_runs WHERE source = 'edgar_index' "
+        "AND status = 'ok' ORDER BY rowid DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return _BackfillStart(seed)
+    found = re.search(r"rule_fingerprint: ([0-9a-f]+)", str(row[0]))
+    try:
+        cursor = json.loads(row[1])
+    except (TypeError, ValueError):
+        cursor = {}
+    if not isinstance(cursor, dict):
+        cursor = {}
+    change = additive_statement_change(
+        settings,
+        {"hash": found.group(1) if found else None, "per_name": cursor.get("per_name") or {}},
+    )
+    if not change.ok:
+        return _BackfillStart(change.refusal)
+    stored = cursor.get("per_name") or {}
+    current = build_fingerprint(settings).per_name
+    if any(stored.get(key) != current[key] for key in PER_NAME_KEYS):
+        # Outside the hash, so T365a lets it through; the final row would absorb
+        # it and the next nightly would never touch its CIKs.
+        return _BackfillStart(
+            "a per-name list changed since the last ok index row; "
+            "apply it in its own nightly, not with the backfill"
+        )
+    digest = statement_tags_digest(settings)
+    through: str | None = None
+    for (chunk_cursor,) in conn.execute(
+        "SELECT chunk_cursor FROM ingestion_runs WHERE source = 'edgar_index' AND mode = ? "
+        "AND status = 'partial' AND rowid > ? ORDER BY rowid",
+        [STATEMENT_BACKFILL, row[2]],
+    ).fetchall():
+        parsed = _BACKFILL_CURSOR.match(str(chunk_cursor))
+        if parsed is None or parsed.group(2) != digest:
+            return _BackfillStart(
+                "statement_backfill rows exist under another tag digest; "
+                "run --rebuild-statement-facts, then --rebuild-index"
+            )
+        through = max(through or "", parsed.group(1))
+    return _BackfillStart(None, change.added, through, cursor)
+
+
+def statement_backfill_refusal(settings: Settings) -> str | None:
+    """The backfill's refusal on a read-only store read, or `None`; the CLI
+    asks it before migrating, so a refused backfill writes nothing."""
+    if not Path(settings.store.path).is_file():
+        return "EDGAR index has no completed seed; run --rebuild-index"
+    with open_read_only(settings, retry=True) as conn:
+        return _statement_backfill_start(conn, settings).refusal
+
+
+def _bind_stored_stamps(source: object, conn: object, ciks: Collection[str]) -> None:
+    """Stamps from `filing_index` alone: bind the adapter's stored-index reader
+    (the adapter's statement-backfill mode refuses to read stamps without it)."""
+    bind = getattr(source, "use_index", None)
+    if callable(bind):  # a fixture source holds its own stamps
+        bind(conn, touched_ciks=frozenset(ciks))
+
+
+#: The adapter's statement-backfill counts (#2887), shown on the backfill's rows.
+_BACKFILL_SOURCE_COUNTS = ("stamps_missing", "absent_carried")
+
+
+def _backfill_counts(source: object) -> str:
+    return "".join(
+        f", statement_{name}: {int(value)}"
+        for name in _BACKFILL_SOURCE_COUNTS
+        if (value := getattr(source, f"statement_{name}", None)) is not None
+    )
+
+
+def statement_backfill_session(
+    settings: Settings,
+    filings: FilingSource,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+) -> IngestResult:
+    """`ingest --statement-backfill` (#2826, plan T365): fill `statement_facts`
+    for added statement names without a rebuild.
+
+    Before any write it refuses, naming `--rebuild-index`, unless the change
+    since the last `ok` `edgar_index` row only adds names (T365a), and naming
+    `--rebuild-statement-facts` when `partial` backfill rows of another tag
+    digest follow that row. It then runs the per-CIK statement write
+    (`_write_statement_facts`: insert-or-skip, never a delete) over every
+    issuer CIK in CIK order, `edgar.statement_backfill_chunk_ciks` at a time,
+    one transaction and one `partial` row per chunk, resuming after the last
+    committed CIK of this digest; `ingest.min_free_disk_gb` is read before
+    each chunk. The CLI builds the adapter in its statement-backfill mode
+    (#2887): stamps from `filing_index` alone (an accession with no cached
+    stamp is skipped and counted), FSN from the cached manifests, no
+    `submissions.zip` read, no items refresh, no `facts` read, and the
+    per-CIK companyfacts API only for a CIK the cached zip lacks or trails
+    (a cached empty result for the same latest filing is carried forward).
+    The final `ok` row carries what a nightly `edgar_index` row carries, so
+    the gate opens on it only. A dry
+    run rolls every chunk back and writes no row (the statement cache files
+    the read fills stay). The CIKs are every stored non-benchmark security's,
+    delisted ones included, a superset of the current master's issuers."""
+    if not settings.edgar.statement_facts_enabled:
+        raise ValueError(_REBUILD_NEEDS_SWITCH)
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    digest = statement_tags_digest(settings)
+
+    def refused(message: str) -> IngestResult:
+        return IngestResult((SourceRun("edgar_index", FAILED, 0, STATEMENT_BACKFILL, message),))
+
+    if not Path(settings.store.path).is_file():
+        return refused("EDGAR index has no completed seed; run --rebuild-index")
+    with open_read_only(settings, retry=True) as conn:
+        start = _statement_backfill_start(conn, settings)
+        ciks = [
+            cik
+            for (cik,) in conn.execute(
+                "SELECT DISTINCT cik FROM securities WHERE NOT benchmark ORDER BY cik"
+            ).fetchall()
+        ]
+    if start.refusal is not None:
+        return refused(start.refusal)
+    if not start.added:
+        return IngestResult(
+            (SourceRun("edgar_index", OK, 0, STATEMENT_BACKFILL, "no added statement names"),)
+        )
+    source = _unwrap(filings)
+    remaining = [cik for cik in ciks if start.through is None or cik > start.through]
+    size = settings.edgar.statement_backfill_chunk_ciks
+    total = StatementCounts()
+    through = start.through
+    for first in range(0, len(remaining), size):
+        chunk = remaining[first : first + size]
+        cursor = f"{STATEMENT_BACKFILL};through={chunk[-1]};tags={digest}"
+        if not dry_run and (refusal := ingest_floor_refusal(settings)) is not None:
+            return IngestResult(
+                (SourceRun("edgar_index", FAILED, 0, cursor, f"{refusal} (before {chunk[0]})"),)
+            )
+        recorded = _Recorded(filings)
+        tallies: list[StatementCounts] = []
+
+        def prepare(recorded: _Recorded = recorded, chunk: list[str] = chunk) -> None:
+            _bind_stored_stamps(source, _IndexReadProxy(settings), chunk)
+            for cik in chunk:
+                recorded.statement_facts(cik)
+            validation = getattr(source, "validation_failures", None)
+            if validation is not None:
+                counted = {label: getattr(source, name, 0) for name, label in _EMPTY_COUNTS}
+                validation.raise_if_any(settings, counted)
+            recorded.frozen = True
+
+        def write(
+            conn: duckdb.DuckDBPyConnection,
+            _run_id: str,
+            recorded: _Recorded = recorded,
+            chunk: list[str] = chunk,
+            tallies: list[StatementCounts] = tallies,
+            expected: str | None = start.through if dry_run else through,
+        ) -> tuple[int, str]:
+            again = _statement_backfill_start(conn, settings)
+            if again.refusal is not None or again.through != expected:
+                raise _IndexConflict("the store changed since the backfill read; retry the run")
+            _bind_stored_stamps(source, conn, chunk)
+            counts = _write_statement_facts(
+                conn, recorded, chunk, ensure_tz_aware_utc(clock(), field_name="clock()"),
+                rebuild=False,
+            )  # fmt: skip
+            tallies.append(counts)
+            message = f"{counts.message(source)}{_backfill_counts(source)}"
+            return counts.added, f"statement_backfill_ciks: {len(chunk)}{message}"
+
+        run = _run_source(
+            "edgar_index",
+            write,
+            settings,
+            ensure_tz_aware_utc(clock(), field_name="clock()"),
+            clock,
+            cursor,
+            dry_run,
+            mode=STATEMENT_BACKFILL,
+            prepare=prepare,
+            success_status="partial",
+        )
+        if run.status != "partial":
+            return IngestResult((run,))
+        total.add(tallies[-1])
+        through = chunk[-1]
+
+    def write_final(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+        again = _statement_backfill_start(conn, settings)
+        # A dry run's chunks were rolled back, so the store still ends at the start.
+        if again.refusal is not None or again.through != (start.through if dry_run else through):
+            raise _IndexConflict("the store changed since the backfill read; retry the run")
+        counts = (
+            f"statement backfill complete; added_names: {len(start.added)}"
+            f"{total.message(source)}{_backfill_counts(source)}"
+        )
+        return 0, _index_run_message(settings, counts, 0)
+
+    snapshot = {
+        cik: frozenset(tuple(pair) for pair in pairs)
+        for cik, pairs in (start.ok_cursor.get("snapshot") or {}).items()
+    }
+    final_cursor = _index_run_cursor(
+        settings,
+        f"{STATEMENT_BACKFILL};through={through or ''};tags={digest}",
+        snapshot,
+        start.ok_cursor.get("touch") or {},
+    )
+    final = _run_source(
+        "edgar_index", write_final, settings, now, clock, final_cursor, dry_run,
+        mode=STATEMENT_BACKFILL,
+    )  # fmt: skip
     return IngestResult((final,))
 
 
