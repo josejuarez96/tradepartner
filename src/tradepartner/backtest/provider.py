@@ -23,6 +23,11 @@ is raw on purpose: the screen moves volume and shares into `t`'s share units its
 The rates read (`rates`; backtest spec amendment 2026-10-11, #1498, plan T170b) serves the
 risk-free series: the engine reads it once, at the run's data cutoff, and only when the
 frozen `metrics.risk_free_source` is `store`.
+
+The two exit-evidence reads (`delisting_reasons`, `merger_exits`; spec amendment #2670,
+plan T328b) serve the delisting failure-return policy: the engine reads each once per
+run at the run's data cutoff `c`, and only under a `backtest.delisting_failure_return`
+other than `none`. A row counts when its `known_at <= c` (owner, 2026-10-31).
 """
 
 from __future__ import annotations
@@ -51,6 +56,35 @@ LATE_SPIN_OFF_COLUMNS: Final[tuple[str, ...]] = (
     "security_id",
     "ex_date",
     "ratio_or_amount",
+    "known_at",
+)
+
+
+#: `DataProvider.delisting_reasons`' columns, in order: the Form 25 episode key, the
+#: reason, its evidence source and the row's `known_at` (plan T328b).
+DELISTING_REASON_COLUMNS: Final[tuple[str, ...]] = (
+    "security_id",
+    "delisting_form",
+    "delisting_class_title",
+    "delisting_exchange",
+    "delisting_filed_at",
+    "reason",
+    "reason_source",
+    "known_at",
+)
+
+#: `DataProvider.merger_exits`' columns, in order: the acquiree in `security_id`, the
+#: deal's terms, the acquirer's raw close on `effective_date` and the row's `known_at`
+#: (plan T328b).
+MERGER_EXIT_COLUMNS: Final[tuple[str, ...]] = (
+    "security_id",
+    "source_action_id",
+    "kind",
+    "cash_per_share",
+    "share_ratio",
+    "effective_date",
+    "acquirer_security_id",
+    "acquirer_raw_close",
     "known_at",
 )
 
@@ -224,4 +258,22 @@ class DataProvider(Protocol):
         `observation_date`, `value`, `vintage_date`, `known_at`, sorted by observation
         date. Nothing known after `t` is in the frame, so a per-session filter on its
         `known_at` is the as-of read at that session's close."""
+        ...
+
+    def delisting_reasons(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        """`store.delisting_reasons.delisting_reasons_as_of(t, ids)` kept to
+        `DELISTING_REASON_COLUMNS`: the latest reason revision per Form 25 episode of
+        `ids`, for episodes and reasons known at `t` (`known_at <= t`). Read once per run
+        at the data cutoff, only under a delisting failure-return policy other than
+        `none` (plan T328b)."""
+        ...
+
+    def merger_exits(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        """`mergers_as_of(t, ids)` kept to rows whose **acquiree** (`security_id`) is in
+        `ids` (a row matched only by its acquirer is dropped; two rows for one acquiree
+        are both returned), with `acquirer_raw_close`: the acquirer's raw, unadjusted
+        traded close on `effective_date` from bars known at `t`, null when that bar is
+        absent (no earlier-close fallback) or the deal has no acquirer. Columns
+        `MERGER_EXIT_COLUMNS`. Read once per run at the data cutoff, only under a
+        delisting failure-return policy other than `none` (plan T328b)."""
         ...
