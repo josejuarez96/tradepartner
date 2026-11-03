@@ -49,7 +49,7 @@ Work in your team folder, on the branch under test. Use the placeholders below; 
    ```
    Note the printed window id and `account_id`: it must be the sandbox account's, not another book's.
    `--now` starts from the latest stored prior session close, so the first fill session is today. It requires a daily-cadence hypothesis, a marked temp store copy, and a prior-session bar already known to the store. It is refused on every real book.
-6. **Run the scenarios** during the XNYS session's market hours (normally 09:30–16:00 ET; the calendar handles early closes), each followed by `uv run tradepartner paper status --book sandbox`. Sandbox runs record `sandbox: submit window skipped` in their notes; all other order and risk checks still apply:
+6. **Run the scenarios** inside the sandbox window, [open − `paper.submit_window_before_open_minutes`, close] of the XNYS session (normally 08:00–16:00 ET with the default 90 minutes; the calendar handles early closes; paper spec amendment 2026-11-01 item 2), each followed by `uv run tradepartner paper status --book sandbox`. Sandbox runs record `sandbox: submit window skipped` in their notes; all other order and risk checks still apply:
 
    | Scenario | How | Expected |
    |---|---|---|
@@ -59,6 +59,7 @@ Work in your team folder, on the branch under test. Use the placeholders below; 
    | Reconcile | `paper reconcile --book sandbox` | status `ok`, broker cash and positions equal the ledger |
    | Kill and resume | `paper kill --book sandbox --reason test`, `paper run --book sandbox` (ends `skipped_kill_switch`), `paper resume --book sandbox --reason test` | no order sent while killed, resume reconciles first and clears the switch |
    | Report | `paper report --book sandbox` | ends at the last marked session, refuses before any trial |
+   | Pre-open open tranche (T371) | before the open, on a session whose rebalance sells a held name and buys others: `export PAPER__EXECUTION='{"sandbox": {"buy_timing": "at_open", "cash_sleeve_fraction": 0.05}}'`, then `paper run --book sandbox`; repeat on another session with `unset PAPER__EXECUTION` | ON: the notes' `paper_execution` line reads `arm=V1 ... fallback=none` with `open_buys` above 0 and `min_cash` not below 0; the (i′) buys' `orders` rows (phase `buy`, attempt 1, `sells_in_flight_at_submit` true) are journaled before the open and fill; `paper reconcile --book sandbox` is `ok`. A run started at or after the open notes `fallback=after_open` and sends no (i′) order. OFF: no `paper_execution` line, buys sent only after the sells as today |
 
    Compare each outcome with the Expected column and with the fix's own acceptance criteria; write the exact commands, outputs and verdicts in the PR.
 7. **Leave the account flat.** `paper stop --book sandbox --reason "..."` (request), `paper run --book sandbox` (the stop run), `paper stop --book sandbox --reason "..."` again (closed), or the dashboard close-all (owner). Check `paper status --book sandbox` shows no position.

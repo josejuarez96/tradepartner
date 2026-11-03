@@ -203,6 +203,25 @@ only when it sized and submitted; a switch read engaged before its first
 submit writes off no deferred buy). Every exception `execute` raises is a
 fault for the caller's halt path (`halt`); `execute` writes no result row:
 `BatchOutcome.status` is the run's to journal.
+
+**Phase (i'), the open tranche** (paper spec amendment 2026-11-01 item 2, T371).
+On a V1 session of a book in `paper.execution`, right after the sells' last
+submit and before the sells are polled, the batch takes one `account()` read
+and B, `_buys_cash` at that read (no sleeve, no proceeds of this run's sells).
+It runs only on a long-only window, with the clock before open(S) and at least
+one sell of the rebalance in flight; otherwise the session runs (i) and (ii)
+with item 6's `fallback` (`long_short`, `after_open` or `no_sells`). A cash
+reading below zero there, and at (ii)'s read on any book in the map with a
+long-only window, raises `SystemFaultError` naming `negative_cash`.
+`phases.open_tranche` picks whole long notional buys within B; the phase then
+runs steps 3 to 8 like any other (its `risk.check_phase` against B,
+independently of the selection), its rows journaled phase `buy` with
+`sells_in_flight_at_submit` true. Before every submit the clock must read
+before open(S): at the open the unsent rows are closed `not_received`, counted
+in `open_unsent`, and (ii) takes those names whole. Its sent orders are
+collected (no write-off context) before (ii) reads its facts, so a filled one
+is settled, an unfilled one re-attempted by (ii) and one still in flight left
+to collection with its cash in the reserve.
 """
 
 from __future__ import annotations
@@ -273,12 +292,20 @@ from tradepartner.execution.collect import (
 )
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.lock import sandbox_store_refusal
-from tradepartner.execution.plan import SHORT, BuyCosts, DecisionState, decision_state, residue
+from tradepartner.execution.plan import (
+    SHORT,
+    BuyCosts,
+    DecisionState,
+    State,
+    decision_state,
+    residue,
+)
 from tradepartner.execution.planning import current_listings, reference_prices
 from tradepartner.execution.reattempts import attempt_scope, write_offs
 from tradepartner.execution.reconcile_run import order_symbols
 from tradepartner.execution.reserve import open_buy_reserve
 from tradepartner.execution.risk import (
+    BuyToSize,
     OpenSell,
     Skip,
     Violations,
@@ -347,6 +374,7 @@ __all__ = [
     "Verdict",
     "classify",
     "last_ok_price_ingest",
+    "sandbox_window",
 ]
 
 #: The rejection allowlist, one frozen constant per `Broker` method (module
@@ -552,10 +580,16 @@ class BatchOutcome:
     cash_left: float | None = None
 
 
-#: Item 6's fallback on a V1 session until phase (i') is built (T371): the
-#: session keeps its arm and runs req 3's two phases, as V0 does.
-OPEN_TRANCHE_NOT_BUILT = "open_tranche_not_built"
+#: Item 6's `fallback` values: why a V1 session ran no phase (i') (T371). With
+#: `no_sells` the session keeps its arm (item 2); `after_open` and `long_short`
+#: run it as V0, and item 8 excludes it.
+NO_SELLS = "no_sells"
+AFTER_OPEN = "after_open"
+LONG_SHORT = "long_short"
+#: The fault named when a book in `paper.execution` reads cash below zero (item 2).
+NEGATIVE_CASH = "negative_cash"
 PAPER_EXECUTION = "paper_execution"
+_V1 = "V1"
 _NA = "na"
 
 
@@ -568,7 +602,10 @@ class _Variant:
     `account()` read after the sells' last submit when a buys phase follows and the
     switch reads clear (with no sells phase, the buys phase's own read; `na` on a
     batch with no buys phase or a killed one), and `min_cash`, the lowest raw
-    `account().cash` read in the batch. Phase (i') is T371's, so its counts are 0 here."""
+    `account().cash` read in the batch. On a V1 session the read after the sells is
+    phase (i')'s too (T371): `open_buys` and `open_notional` count its orders sent,
+    `open_unsent` its rows closed unsent at the open, and `fallback` says why a V1
+    session ran no (i')."""
 
     arm: str
     timing: str
@@ -707,6 +744,59 @@ class _Gated:
     left: tuple[phases.PhaseOrder, ...]
 
 
+@dataclass(frozen=True)
+class _Opened:
+    """What phase (i') did (`RiskGatedBroker._open_phase`): the ids it sent, its
+    skips, the cap-counted skips so far, its sent rows and their price band."""
+
+    submitted: tuple[str, ...] = ()
+    skips: tuple[Skip, ...] = ()
+    counted: int = 0
+    rows: tuple[OrderRow, ...] = ()
+    band: PriceBand | None = None
+
+
+def _frozen_side(window: PaperWindowRow) -> str | None:
+    """The window's frozen `portfolio.side` (absent means `long_only`, as `report`
+    reads it), or None when `frozen_json` is not a JSON object."""
+    try:
+        frozen = json.loads(window.frozen_json)
+    except ValueError:
+        return None
+    return str(frozen.get("portfolio.side", "long_only")) if isinstance(frozen, dict) else None
+
+
+def _long_only(window: PaperWindowRow) -> bool:
+    """Whether phase (i') may run: the window is long-only. Unparseable means not
+    (fail closed: no (i'))."""
+    return _frozen_side(window) == "long_only"
+
+
+def _halts_on_negative_cash(window: PaperWindowRow) -> bool:
+    """Whether item 2's `negative_cash` halt applies: every window but a
+    `long_short` one (fail closed: an unparseable window halts)."""
+    return _frozen_side(window) != "long_short"
+
+
+def _refuse_negative_cash(account: Account, where: str) -> None:
+    """Item 2: a book in `paper.execution` with a long-only window halts on an
+    `account().cash` below zero instead of flooring it (`SystemFaultError`)."""
+    if not account.cash >= 0:
+        raise SystemFaultError(
+            f"{NEGATIVE_CASH}: account cash {account.cash!r} is below zero at {where}'s read"
+        )
+
+
+def sandbox_window(
+    settings: Settings, opening: datetime, closing: datetime
+) -> tuple[datetime, datetime]:
+    """The sandbox book's submit window on its marked copy (paper spec amendment
+    2026-11-01 item 2): [open(S) - `paper.submit_window_before_open_minutes`,
+    close(S)], so a regression run can exercise phase (i') before the open."""
+    before = timedelta(minutes=settings.paper.submit_window_before_open_minutes)
+    return opening - before, closing
+
+
 def _log_held(run: PaperRunRow, held: Sequence[phases.HeldSell]) -> None:
     """One structured warning per sell the sells phase held (#719 item 2): a
     hold writes no order and no journal row, so this line is what explains a
@@ -782,6 +872,8 @@ class RiskGatedBroker:
         #: Item 6's record of the batch in progress (reset by `execute`); None for a
         #: book outside `paper.execution`.
         self._variant: _Variant | None = None
+        #: Phase (i')'s rows closed unsent at open(S) (`_submit_all`'s `before`).
+        self._cut_at_open = 0
 
     def __repr__(self) -> str:
         return f"RiskGatedBroker(broker={type(self._broker).__name__})"
@@ -990,8 +1082,12 @@ class RiskGatedBroker:
         skips: tuple[Skip, ...] = ()
         counted = 0
         has_sells = bool(attempt_scope(rows, book.states, phase=_SELL).attempts)
+        has_buys = any(d.side == _BUY for d in decisions)
         # Item 6: with no sells phase, B is (ii)'s own read, after its switch check.
         idle_at_buys = self._variant is not None and not has_sells
+        if self._variant is not None and self._variant.arm == _V1 and not has_sells:
+            # Item 2: no sell can be in flight, so (ii) runs at once, as today.
+            self._variant.fallback = NO_SELLS if _long_only(book.window) else LONG_SHORT
         if has_sells:
             if self._engaged(run, book.window):
                 return BatchOutcome(_SKIPPED_KILL_SWITCH)
@@ -1049,21 +1145,30 @@ class RiskGatedBroker:
             skips, counted = (*skips, *refused), counted + len(refused)
             if self._killed:
                 return BatchOutcome(_SKIPPED_KILL_SWITCH, tuple(submitted), skips)
-            if (
-                self._variant is not None
-                and any(d.side == _BUY for d in decisions)
-                and not self._engaged(run, book.window)
-            ):
-                # Item 6: B after the sells' last submit, only when a buys phase
-                # follows and the switch reads clear, so a read that only feeds the
-                # record never changes how a sells-only or killed batch ends.
-                self._note_idle(run, rows)
             # After the kill-switch return, so a clock read can't change the halt path.
             if submitted:
                 self._phase_time(notes, "sells_submitted")
-            if any(d.side == _BUY for d in decisions) and gated.to_submit:
+            opened = _Opened()
+            if self._variant is not None and has_buys and not self._engaged(run, book.window):
+                # Item 6: B after the sells' last submit, only when a buys phase
+                # follows and the switch reads clear, so a read that only feeds the
+                # record never changes how a sells-only or killed batch ends. On a
+                # V1 session the same read funds phase (i') (item 2, T371).
+                opened = self._open_phase(
+                    run, rows, rebalance, len(submitted), counted, len(decisions)
+                )
+                submitted = [*submitted, *opened.submitted]
+                skips, counted = (*skips, *opened.skips), opened.counted
+                if self._killed:
+                    return BatchOutcome(_SKIPPED_KILL_SWITCH, tuple(submitted), skips)
+            if has_buys and gated.to_submit:
                 self._await_sells(run, [row for row, _ in gated.to_submit], book, notes)
-        if not any(d.side == _BUY for d in decisions):
+            if opened.rows:
+                # (ii) reads its facts after this, so a filled (i') buy is settled,
+                # an unfilled one open for its re-attempt and a live one in flight.
+                assert opened.band is not None
+                self._collect(run, opened.rows, price_band=opened.band, notes=notes)
+        if not has_buys:
             return BatchOutcome(_OK, tuple(submitted), skips)
         bought = self._buys(
             run,
@@ -1112,10 +1217,13 @@ class RiskGatedBroker:
             return BatchOutcome(_SKIPPED_KILL_SWITCH, written_off=written)
         assets = self._phase_assets(run, book, rows, _BUY)
         account = self._broker.account()
+        if self._variant is not None:
+            self._variant.saw(account.cash)
+            if _halts_on_negative_cash(book.window):
+                _refuse_negative_cash(account, "phase (ii)")
         cash = self._buys_cash(account, book, run.session)
         if self._variant is not None:
             # Item 3: (ii) never spends below the sleeve c x E, E at this read.
-            self._variant.saw(account.cash)
             if idle_at_buys:
                 self._variant.idle_cash = cash
             sleeve = self._variant.fraction * _ledger_equity(book)
@@ -1251,8 +1359,8 @@ class RiskGatedBroker:
 
     def _variant_for(self, run: PaperRunRow, book: _Book) -> _Variant | None:
         """Item 6's record for a book in `paper.execution`, else None. The arm is
-        `arm_for` over the calendar's session list; a V1 session runs req 3's two
-        phases until T371 and says so in `fallback`. The batch-start sleeve is c x
+        `arm_for` over the calendar's session list; `fallback` starts `none` and
+        `_trade` sets it when a V1 session runs no phase (i'). The batch-start sleeve is c x
         the ledger equity, kept unread (`na`) when a mark is missing: it is the
         record only, and the buys phase sizes from its own read."""
         book_id = book.window.book_id
@@ -1265,7 +1373,7 @@ class RiskGatedBroker:
             arm=arm,
             timing=execution.buy_timing,
             fraction=execution.cash_sleeve_fraction,
-            fallback=OPEN_TRANCHE_NOT_BUILT if arm == "V1" else "none",
+            fallback="none",
         )
         try:
             variant.sleeve_cash = variant.fraction * _ledger_equity(book)
@@ -1273,14 +1381,124 @@ class RiskGatedBroker:
             variant.sleeve_cash = None
         return variant
 
-    def _note_idle(self, run: PaperRunRow, rows: Sequence[DecisionRow]) -> None:
-        """Item 6's `idle_cash` after the sells' last submit: B (`_buys_cash`, no
-        sleeve) from one `account()` read on a fresh book read, counted toward
-        `min_cash`."""
-        assert self._variant is not None and run.session is not None
+    def _open_phase(
+        self,
+        run: PaperRunRow,
+        rows: Sequence[DecisionRow],
+        rebalance: Sequence[date],
+        prior_orders: int,
+        prior_skips: int,
+        plan_decisions: int,
+    ) -> _Opened:
+        """Item 6's `idle_cash` after the sells' last submit and, on a V1 session,
+        phase (i') (module docstring): B (`_buys_cash`, no sleeve) from one
+        `account()` read on a fresh book read, counted toward `min_cash`. A V1
+        session runs (i') only on a long-only window, before open(S), with a sell
+        of the rebalance in flight; else `fallback` names why. Returns the ids
+        (i') sent, its skips, the cap-counted skips so far, its sent rows and the
+        price band to collect them by."""
+        variant = self._variant
+        assert variant is not None and run.session is not None
+        session = run.session
         account = self._broker.account()
-        self._variant.saw(account.cash)
-        self._variant.idle_cash = self._buys_cash(account, self._read_book(run, rows), run.session)
+        variant.saw(account.cash)
+        book = self._read_book(run, rows)
+        fallback = self._open_fallback(run, rows, book) if variant.arm == _V1 else None
+        runs = variant.arm == _V1 and fallback is None
+        if runs:
+            _refuse_negative_cash(account, "phase (i')")
+        budget = self._buys_cash(account, book, session)
+        variant.idle_cash = budget
+        if fallback is not None:
+            variant.fallback = fallback
+        if not runs:
+            return _Opened(counted=prior_skips)
+        assets = self._phase_assets(run, book, rows, _BUY)
+        # A name with a sell decision, one the symbol map leaves ambiguous or one
+        # under an open material break waits for (ii), which handles it as today,
+        # so (i') journals no skip of its own for them.
+        excluded = (
+            set(book.ambiguous)
+            | {d.security_id for d in rows if d.side != _BUY}
+            | break_rules.restricted_names(self._open_breaks(run))
+        )
+        tranche = phases.open_tranche(
+            [
+                BuyToSize(a.decision, a.remainder)
+                for a in attempt_scope(rows, book.states, phase=_BUY).attempts
+                if a.decision.security_id not in excluded
+            ],
+            budget,
+            book.price_of,
+            book.costs,
+            assets,
+            self._frozen,
+            ended=book.ended,
+        )
+        if not tranche.taken:
+            return _Opened(counted=prior_skips)
+        # `check_phase` re-checks the batch against B itself, whatever the selection.
+        gated = self._gate(
+            run,
+            book,
+            phases.PhaseOrders(tranche.taken, (), session=session),
+            assets,
+            Account(account.account_id, budget, budget, account.equity, account.as_of),
+            rebalance,
+            _BUY,
+            prior_orders,
+            prior_skips,
+            rows=rows,
+            in_flight=True,
+            plan_decisions=plan_decisions,
+        )
+        self._cut_at_open = 0
+        submitted, refused = self._submit_all(
+            run,
+            gated.to_submit,
+            gated.counted,
+            plan_decisions,
+            frozenset(book.ledger.positions),
+            book.last_ok_ingest,
+            window=book.window,
+            before=self._calendar.session_open(session),
+        )
+        sent = set(submitted)
+        sent_rows = tuple(row for row, _ in gated.to_submit if row.client_order_id in sent)
+        variant.open_buys = len(sent_rows)
+        variant.open_notional = float(
+            sum((Decimal(repr(float(r.notional or 0.0))) for r in sent_rows), Decimal(0))
+        )
+        variant.open_unsent = self._cut_at_open
+        return _Opened(
+            tuple(submitted),
+            (*gated.skips, *refused),
+            gated.counted + len(refused),
+            sent_rows,
+            self._price_band(run, book),
+        )
+
+    def _open_fallback(
+        self, run: PaperRunRow, rows: Sequence[DecisionRow], book: _Book
+    ) -> str | None:
+        """Why a V1 session runs no phase (i') (item 2), or None when it runs: a
+        `long_short` window, a clock at or after open(S), or no sell of the
+        rebalance in flight after the sells' last submit (held, skipped, refused or
+        filled sells are not in flight)."""
+        assert run.session is not None
+        if not _long_only(book.window):
+            return LONG_SHORT
+        if self.read_clock() >= self._calendar.session_open(run.session):
+            return AFTER_OPEN
+        in_flight = any(
+            d.side == _SELL
+            and d.decision != _FORCED_EXIT
+            and d.decision_id is not None
+            and d.decision_id in book.states
+            and book.states[d.decision_id].state == State.IN_FLIGHT
+            for d in rows
+        )
+        return None if in_flight else NO_SELLS
 
     def _buys_cash(self, account: Account, book: _Book, session: date) -> float:
         """Cash available to buys: broker cash less the open-buy reserve,
@@ -1833,6 +2051,7 @@ class RiskGatedBroker:
         *,
         window: PaperWindowRow,
         on_submit: Callable[[], None] | None = None,
+        before: datetime | None = None,
     ) -> tuple[list[str], list[Skip]]:
         """Submit each journaled request in order and await its acknowledgement;
         `submit`'s `Order` passes the shape check after the acknowledgement's
@@ -1845,7 +2064,12 @@ class RiskGatedBroker:
         `SkipCapError` before the next submit (after its `skipped` alert). On a sell,
         or a buy of a `held` name, it is a `ReconciliationError`: a held name the
         broker refuses means the ledger and the broker disagree. Returns the ids
-        submitted and the refusals' skips."""
+        submitted and the refusals' skips.
+
+        `before` (phase (i')'s open(S), item 2) is tested before every submit, after
+        the window: once the clock reads it, the unsent rows are closed
+        `not_received` and counted in `_cut_at_open`, and the phase is not marked
+        incomplete, since (ii) takes those names at their full remainder."""
         submitted: list[str] = []
         refused: list[Skip] = []
         for index, (row, request) in enumerate(pairs):
@@ -1869,6 +2093,10 @@ class RiskGatedBroker:
             # (#2178).
             if not self._in_submit_window(run.session, run):
                 self._phase_incomplete = True
+                self._close_unsent(run, [r for r, _ in pairs[index:]])
+                break
+            if before is not None and self.read_clock() >= before:
+                self._cut_at_open = len(pairs) - index
                 self._close_unsent(run, [r for r, _ in pairs[index:]])
                 break
             try:
@@ -1905,7 +2133,8 @@ class RiskGatedBroker:
     def _in_submit_window(self, session: date, run: PaperRunRow) -> bool:
         """Whether the clock reads inside [open(S) - `paper.submit_window_before_open_minutes`,
         open(S) + `paper.submit_window_after_open_minutes`] (the interval of
-        `run.submit_window`)."""
+        `run.submit_window`); for the sandbox book on its marked copy,
+        `sandbox_window` (item 2)."""
         paper = self._settings.paper
         opening = self._calendar.session_open(session)
         now = self.read_clock()
@@ -1913,7 +2142,10 @@ class RiskGatedBroker:
             self._run_book(run) == "sandbox"
             and sandbox_store_refusal(self._settings, "sandbox") is None
         ):
-            return opening <= now <= self._calendar.session_close(session)
+            start, end = sandbox_window(
+                self._settings, opening, self._calendar.session_close(session)
+            )
+            return start <= now <= end
         return (
             opening - timedelta(minutes=paper.submit_window_before_open_minutes)
             <= now

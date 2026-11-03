@@ -4,14 +4,17 @@ is invisible to the live store's checks; every other book is unaffected."""
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 
+from tradepartner.calendar import session_close, session_open
 from tradepartner.config import SANDBOX_BOOK_ID, Settings, paper_key_variable_names
 from tradepartner.execution import lock
 from tradepartner.execution.brokers import build_broker
 from tradepartner.execution.lock import lock_path, resolve_book, sandbox_store_refusal
+from tradepartner.execution.wrapper import sandbox_window
 
 
 def _copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, marker: bool = True) -> Settings:
@@ -175,3 +178,13 @@ def test_file_symlink_to_the_live_store_is_never_the_sandbox(
 def test_the_temp_root_is_fixed_not_tmpdir(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TMPDIR", "/")
     assert lock._temp_roots() == {Path("/tmp").resolve()}
+
+
+# --- the sandbox window before the open (paper spec amendment 2026-11-01 item 2, T371) ---
+
+
+def test_the_sandbox_window_opens_the_before_open_minutes_ahead_and_ends_at_the_close() -> None:
+    s = Settings(_env_file=None, paper={"submit_window_before_open_minutes": 45})
+    day = date(2026, 10, 1)
+    start, end = sandbox_window(s, session_open(day), session_close(day))
+    assert (start, end) == (session_open(day) - timedelta(minutes=45), session_close(day))

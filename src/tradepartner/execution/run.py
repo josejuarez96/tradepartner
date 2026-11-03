@@ -293,6 +293,7 @@ from tradepartner.execution.wrapper import (
     _refuse_reused_tickers,
     classify,
     last_ok_price_ingest,
+    sandbox_window,
 )
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
@@ -606,12 +607,22 @@ def _in_submit_window(context: StepContext) -> bool:
         context.window.book_id == "sandbox"
         and sandbox_store_refusal(context.settings, context.window.book_id) is None
     ):
-        if calendar.session_open(context.session) <= now <= calendar.session_close(context.session):
+        # [open(S) - the before-open minutes, close(S)] (paper spec amendment
+        # 2026-11-01 item 2), so a regression run can exercise phase (i').
+        start, end = sandbox_window(
+            context.settings,
+            calendar.session_open(context.session),
+            calendar.session_close(context.session),
+        )
+        if start <= now <= end:
             note = "sandbox: submit window skipped"
             if note not in context.notes:
                 context.notes.append(note)
             return True
-        context.notes.append("sandbox: outside market hours; nothing submitted")
+        context.notes.append(
+            f"sandbox: outside market hours (window [{start.isoformat()}, {end.isoformat()}]);"
+            " nothing submitted"
+        )
         return False
     start, end = submit_window(context.settings, context.session)
     if start <= now <= end:
