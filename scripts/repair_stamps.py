@@ -16,6 +16,14 @@ Two subcommands:
 - ``run``: the repair. Dry run by default: no request, no write, a JSON report
   of the counts and the SGML requests each step will make. ``--apply`` makes
   the requests and writes.
+- ``store-ciks`` (#2936): read-only; ``--store`` a store file, ``--out`` the
+  ``cik,accession`` CSV (``statement_facts`` and ``facts``) that ``run``'s
+  ``--store-ciks`` reads, for a release that covers every CIK the store holds.
+- ``audit-store`` (#2936): read-only; judges a seeded sample of the store's
+  ``known_at`` stamps against each filing's SGML ``ACCEPTANCE-DATETIME``
+  (`stamp_audit`). Dry run by default (the request count); ``--apply`` reads the
+  headers, prints the early/exact/late counts per table and exits 1 when any
+  stamp is early. Run it before and after a release as its closing sweep.
 - ``shift-unrepaired`` (#1382): ``--from`` an earlier release's unrepaired list;
   every listed record whose stamp is still the listed one moves later by New
   York's UTC offset (4 h EDT, 5 h EST), with no SGML request. It can only move
@@ -147,7 +155,7 @@ import shutil
 import sys
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -158,6 +166,7 @@ import httpx
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar import parse_filing_index, parse_sgml_header
 from tradepartner.adapters.edgar_source import PARSER_VERSION, STAMPS_LAYOUT
+from tradepartner.adapters.stamp_audit import StoredStamp, audit_stamps
 from tradepartner.adapters.stamp_repair import (
     MANIFEST_COLUMNS,
     CikClass,
@@ -1502,6 +1511,83 @@ def run_shift_unrepaired(args: argparse.Namespace, fetch: Fetch | None = None) -
     return report
 
 
+# --- the store: its CIKs and the stamp audit (#2936) -------------------------
+
+_STORE_PAIRS = {
+    "statement_facts": "select cik, filing_accession, known_at from statement_facts",
+    "facts": (
+        "select s.cik, f.filing_accession, f.known_at from facts f "
+        "join (select security_id, any_value(cik) cik from securities group by 1) s "
+        "using (security_id)"
+    ),
+}
+
+
+def _open_store(path: Path) -> Any:
+    import duckdb
+
+    return duckdb.connect(str(path), read_only=True)
+
+
+def export_store_ciks(store: Path, out: Path) -> int:
+    """Write ``cik,accession`` for every accession the store's facts carry."""
+    con = _open_store(store)
+    try:
+        pairs: set[Key] = set()
+        for query in _STORE_PAIRS.values():
+            sub = f"select distinct cik, filing_accession from ({query})"
+            pairs.update((_norm_cik(c), a) for c, a in con.execute(sub).fetchall())
+    finally:
+        con.close()
+    with out.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(("cik", "accession"))
+        writer.writerows(sorted(pairs))
+    return len(pairs)
+
+
+def audit_store(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
+    """The ``audit-store`` subcommand: a seeded sample of stored stamps judged
+    against SGML. Read-only; the request count is the sample's distinct
+    accessions, and only ``--apply`` makes them."""
+    import random
+
+    con = _open_store(args.store)
+    try:
+        stored: list[StoredStamp] = []
+        for table, query in _STORE_PAIRS.items():
+            rows = con.execute(
+                f"select distinct cik, filing_accession, known_at from ({query}) "
+                "order by filing_accession, cik, known_at"
+            ).fetchall()
+            sample = random.Random(f"{args.seed}:{table}").sample(rows, min(args.sample, len(rows)))
+            stored += [StoredStamp(table, _norm_cik(c), a, k) for c, a, k in sample]
+    finally:
+        con.close()
+    wanted = sorted({(s.cik, s.accession) for s in stored})
+    report: dict[str, Any] = {
+        "store": str(args.store),
+        "sample_per_table": args.sample,
+        "requests": len(wanted),
+        "apply": args.apply,
+    }
+    if not args.apply:
+        return report
+    reader = fetch or sgml_fetch()
+    accepted: dict[str, datetime] = {}
+    unread: list[str] = []
+    for cik, accession in wanted:
+        try:
+            accepted[accession] = reader(cik, accession)
+        except (ValueError, httpx.HTTPError):
+            unread.append(accession)
+    audits = audit_stamps(stored, accepted)
+    report["tables"] = {t: asdict(a) for t, a in sorted(audits.items())}
+    report["unread"] = len(unread)
+    report["look_ahead"] = any(a.look_ahead for a in audits.values())
+    return report
+
+
 def _date(text: str) -> date:
     return date.fromisoformat(text)
 
@@ -1541,6 +1627,17 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--window-earlier-ok", type=Path, default=None, metavar="PRECHECK_JSON")
     u.add_argument("--apply", action="store_true")
     u.add_argument("--resume", action="store_true")
+    sc = sub.add_parser("store-ciks", help="write the cik,accession CSV of a store (read-only)")
+    sc.add_argument("--store", type=Path, required=True)
+    sc.add_argument("--out", type=Path, required=True)
+    au = sub.add_parser(
+        "audit-store",
+        help="judge a sample of a store's known_at against SGML (dry run unless --apply)",
+    )
+    au.add_argument("--store", type=Path, required=True)
+    au.add_argument("--sample", type=int, default=300, help="accessions per table")
+    au.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    au.add_argument("--apply", action="store_true")
     sh = sub.add_parser(
         "shift-unrepaired",
         help="shift an unrepaired list later by the New York offset, no requests (#1382)",
@@ -1566,6 +1663,14 @@ def main(argv: Sequence[str] | None = None, *, fetch: Fetch | None = None) -> in
             n = export_bulk_written(args.cache_dir, args.out, day=args.day)
             print(json.dumps({"exported": n, "out": str(args.out)}))
             return 0
+        if args.command == "store-ciks":
+            n = export_store_ciks(args.store, args.out)
+            print(json.dumps({"pairs": n, "out": str(args.out)}))
+            return 0
+        if args.command == "audit-store":
+            audit = audit_store(args, fetch)
+            print(json.dumps(audit, indent=2, sort_keys=True))
+            return 1 if audit.get("look_ahead") else 0
         commands = {"restamp-unrepaired": run_unrepaired, "shift-unrepaired": run_shift_unrepaired}
         command = commands.get(args.command, run)
         print(json.dumps(command(args, fetch), indent=2, sort_keys=True))

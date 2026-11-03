@@ -48,6 +48,15 @@ Use this sequence to correct stored multi-owner roles (the Form 4 study that fir
 6. For **each** reviewed range manifest, run `uv run tradepartner repair-form4-multi-owner --manifest form4-multi-owner-2022q4.json --release NAME --expect-rows N --dry-run`, then repeat without `--dry-run` using that manifest's reviewed changed-row count. A rerun with `--expect-rows 0` must report zero.
 7. Close the release with `uv run tradepartner decision data-release close --name NAME --from SESSION --to SESSION`, using the touched transaction sessions.
 
+### Stamps still early after `restamp-1382a2` (#2936)
+
+`restamp-1382a2` repaired phase A only: the 2,057 CIKs that backed the universe on 2026-10-11. The stamps of every other CIK stayed as the bulk zip wrote them (an Eastern wall clock labelled UTC, #1382), and every later rebuild re-read them. On the 2026-11-02 store copy, CIKs with a bar in 2026 are early on under 1% of sampled filings and CIKs without one on about 62%, so the leftover is mostly the delisted and dead names. It reaches `facts`, `statement_facts`, `delistings` and `listings` (filing provenance), and about half of the early filings were accepted after 16:00 ET, which makes them visible at that day's close: a one-session look-ahead. Run phase B as its own named release, with the paper jobs stopped:
+
+1. `uv run python scripts/repair_stamps.py audit-store --store PATH --sample 300 --apply` on a copy: the before sweep. It exits 1 while any sampled stamp is early; keep the JSON.
+2. `uv run python scripts/repair_stamps.py store-ciks --store PATH --out store-ciks.csv` (read-only), then `uv run python scripts/repair_stamps.py run --phase rest --universe-ciks <phase A CIK list> --bulk-written <the frozen export> --classes <classes CSV, or an empty one with a `cik,class` header> --store-ciks store-ciks.csv --window-start <first session of the open window> --release restamp-1382b` is the dry run: read `requests_floor` and `requests_ceiling`. Expect an `--apply` above the 10k default `--max-requests`; raise it as an owner decision and see the run's other stops.
+3. `--apply` with the same flags, then `ingest --source edgar --restamp-from <manifest> --rebuild-statement-facts`, as in `restamp-1382a2`; the `shift-unrepaired` and `restamp-unrepaired` modes take the unrepaired list.
+4. The after sweep: step 1 again, which must exit 0.
+
 ### Bulk Form 4 title repair (#2708)
 
 The bulk parser reads title values from `NONDERIV_TRANS` only. It does not read `DERIV_TRANS`, `NONDERIV_HOLDING`, or `DERIV_HOLDING`. For the old CSV-wrapped title values, build and review a deterministic manifest from the cached quarter zips and the read-only store:
