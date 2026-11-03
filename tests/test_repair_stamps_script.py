@@ -12,9 +12,12 @@ import csv
 import gzip
 import importlib.util
 import io
+import itertools
 import json
 import os
 import sys
+import threading
+import time
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -23,9 +26,12 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
+from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar import parse_sgml_header
 from tradepartner.adapters.stamp_repair import MANIFEST_COLUMNS, shift_stamp
+from tradepartner.config import Settings
 
 _SPEC = importlib.util.spec_from_file_location(
     "repair_stamps", Path(__file__).resolve().parents[1] / "scripts" / "repair_stamps.py"
@@ -1460,3 +1466,342 @@ def test_shift_unrepaired_refuses_a_manifest_given_by_mistake(tmp_path: Path) ->
         text = f.read().replace("unrepaired", "shift")
     source.write_bytes(gzip.compress(text.encode()))
     assert shift_unrepaired(c, source) == 1
+
+
+# --- #2955: the SGML fetch pool ---------------------------------------------
+
+
+class SlowSec(HeaderSec):
+    """`HeaderSec` with a per-key delay (completion order differs from asking
+    order), a 404 key, transient 503 keys and an in-flight count."""
+
+    def __init__(self, truth: dict[tuple[str, str], datetime], *, delay: float = 0.002) -> None:
+        super().__init__(truth)
+        self.delay = delay
+        self.gone: set[tuple[str, str]] = set()
+        self.transient: set[tuple[str, str]] = set()
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, cik: str, accession: str) -> datetime:
+        key = (cik, accession)
+        with self._lock:
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            # Later keys of a step tend to finish first: the pool's completion
+            # order is not the asking order.
+            time.sleep(self.delay * (1 + (sum(map(ord, accession)) % 5)))
+            request = httpx.Request("GET", "https://www.sec.gov/x")
+            if key in self.transient:
+                self.transient.discard(key)  # heals: a resume reads it
+                raise httpx.HTTPStatusError(
+                    "503", request=request, response=httpx.Response(503, request=request)
+                )
+            if key in self.gone:
+                with self._lock:
+                    self.calls.append(key)
+                raise httpx.HTTPStatusError(
+                    "404", request=request, response=httpx.Response(404, request=request)
+                )
+            with self._lock:
+                return super().__call__(cik, accession)
+        finally:
+            with self._lock:
+                self.in_flight -= 1
+
+
+def _pool_case(root: Path) -> tuple[Cache, SlowSec]:
+    """`amended` (steps 3, 3b, 4, 4b and 5 read SGML), with a header that
+    does not parse and a 404."""
+    c, base = amended(root)
+    sec = SlowSec(base.truth)
+    sec.broken.add((UND, acc(UND, 1)))
+    sec.gone.add((LAT, acc(LAT, 1)))
+    return c, sec
+
+
+def _outputs(c: Cache) -> dict[str, bytes]:
+    """Every file the run wrote or changed under the cache."""
+    return {
+        k: v
+        for k, v in c.snapshot().items()
+        if not k.startswith(("stamps/v1.restamp-1382.bak", "index/"))  # backup; inputs
+    }
+
+
+def _pool_run(root: Path, workers: int, capsys: Any) -> tuple[dict[str, bytes], str, SlowSec]:
+    root.mkdir()
+    c, sec = _pool_case(root)
+    capsys.readouterr()
+    assert run(c, sec, *LATE_RANGE, "--apply", "--fetch-workers", str(workers)) == 0
+    return _outputs(c), capsys.readouterr().out.replace(str(root), "<root>"), sec
+
+
+def test_pool_output_equals_sequential_byte_for_byte(tmp_path: Path, capsys: Any) -> None:
+    seq_files, seq_report, seq_sec = _pool_run(tmp_path / "w1", 1, capsys)
+    journal = "stamps/v1.restamp-1382.manifest.requests.csv"
+    assert journal in seq_files and "stamps/v1.restamp-1382.manifest.csv" in seq_files
+    assert seq_sec.max_in_flight == 1
+    for workers in (2, 4, 8):
+        files, report, sec = _pool_run(tmp_path / f"w{workers}", workers, capsys)
+        assert files[journal] == seq_files[journal]  # the same lines in the same order
+        assert files == seq_files  # manifest, sidecars, stamps files
+        assert report == seq_report  # every count
+        assert sorted(sec.calls) == sorted(seq_sec.calls)
+        assert len(sec.calls) == len(set(sec.calls))
+
+
+def test_pool_ordering_is_deterministic(tmp_path: Path, capsys: Any) -> None:
+    runs = [_pool_run(tmp_path / f"r{i}", 4, capsys)[0] for i in range(3)]
+    assert runs[0] == runs[1] == runs[2]
+
+
+def test_pool_keeps_requests_in_flight(tmp_path: Path) -> None:
+    keys = [(f"{i:010d}", f"{i:010d}-24-000001") for i in range(1, 13)]
+    sec = SlowSec({k: utc(2024, 1, 2, 15) for k in keys}, delay=0.01)
+    journal = repair_stamps.Journal(None, sec, workers=4)
+    journal.prefetch(keys, "test")
+    assert sec.max_in_flight >= 2
+    assert sorted(sec.calls) == keys and journal.requests == 12
+
+
+def test_a_pool_of_one_is_the_sequential_path(tmp_path: Path, monkeypatch: Any) -> None:
+    def no_pool(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("a pool of 1 starts no thread")
+
+    monkeypatch.setattr(repair_stamps, "ThreadPoolExecutor", no_pool)
+    c, sec = _pool_case(tmp_path)
+    assert run(c, sec, *LATE_RANGE, "--apply", "--fetch-workers", "1") == 0
+    journal = c.dir / "stamps" / "v1.restamp-1382.manifest.requests.csv"
+    lines = list(csv.DictReader(journal.open(newline="")))
+    assert [(r["cik"], r["accession"]) for r in lines] == sec.calls  # asked in journal order
+
+
+@pytest.mark.parametrize("workers", ["0", "9", "x"])
+def test_fetch_workers_outside_1_to_8_is_refused(tmp_path: Path, workers: str) -> None:
+    c, sec = _pool_case(tmp_path)
+    with pytest.raises(SystemExit):
+        run(c, sec, "--apply", "--fetch-workers", workers)
+    assert sec.calls == []
+    with pytest.raises(ValueError, match="1 to 8"):
+        repair_stamps.Journal(None, sec, workers=9)
+
+
+def _journal_keys(path: Path) -> list[tuple[str, str]]:
+    with path.open(newline="") as f:
+        return [(r["cik"], r["accession"]) for r in csv.DictReader(f)]
+
+
+def test_resume_after_a_mid_pool_failure_repeats_no_key(tmp_path: Path, capsys: Any) -> None:
+    seq_files, _, _ = _pool_run(tmp_path / "seq", 1, capsys)
+    (tmp_path / "pool").mkdir()
+    c, sec = _pool_case(tmp_path / "pool")
+    j = "stamps/v1.restamp-1382.manifest.requests.csv"
+    asked = [line.decode().split(",") for line in seq_files[j].splitlines()[1:]]
+    failing = (asked[len(asked) // 2][0], asked[len(asked) // 2][1])
+    sec.transient.add(failing)
+    with pytest.raises(httpx.HTTPStatusError):
+        run(c, sec, *LATE_RANGE, "--apply", "--fetch-workers", "4")
+    journal = c.dir / "stamps" / "v1.restamp-1382.manifest.requests.csv"
+    before = journal.read_bytes()
+    journalled = _journal_keys(journal)
+    assert failing not in journalled  # a transient error is never journalled
+    assert sorted(journalled) == sorted(sec.calls)  # every answer that came is kept
+    assert not (c.dir / "stamps" / "v1.restamp-1382.manifest.csv").exists()
+    first = list(sec.calls)
+    assert run(c, sec, *LATE_RANGE, "--apply", "--resume", "--fetch-workers", "4") == 0
+    again = sec.calls[len(first) :]
+    assert not set(first) & set(again)
+    assert failing in again
+    assert len(sec.calls) == len(set(sec.calls))
+    assert journal.read_bytes().startswith(before)  # appended, never rewritten
+    after = _outputs(c)
+    assert sorted(after.pop(j).splitlines()) == sorted(seq_files[j].splitlines())
+    assert after == {k: v for k, v in seq_files.items() if k != j}
+
+
+def test_a_pool_stops_asking_after_a_failure(tmp_path: Path) -> None:
+    keys = [(f"{i:010d}", f"{i:010d}-24-000001") for i in range(1, 41)]
+    sec = SlowSec({k: utc(2024, 1, 2, 15) for k in keys}, delay=0.005)
+    sec.transient.add(keys[2])
+    journal = repair_stamps.Journal(tmp_path / "j.csv", sec, workers=4)
+    with pytest.raises(httpx.HTTPStatusError):
+        journal.prefetch(keys, "test")
+    assert keys[2] not in sec.calls
+    assert len(sec.calls) <= 2 + 2 * 4  # what was in flight, not the other 30-odd keys
+    assert sorted(_journal_keys(tmp_path / "j.csv")) == sorted(sec.calls)
+    assert journal.lines == len(sec.calls)
+
+
+def test_resume_reads_a_journal_in_todays_format(tmp_path: Path) -> None:
+    """A synthetic journal as the one-at-a-time run writes it (a stamp, an HTTP
+    404, a header error, a torn last line): the pool asks none of its answers
+    again, asks the torn key, and ends where an unbroken run ends."""
+    (tmp_path / "seq").mkdir()
+    ref, ref_sec = _pool_case(tmp_path / "seq")
+    assert run(ref, ref_sec, *LATE_RANGE, "--apply", "--fetch-workers", "1") == 0
+    ref_journal = (
+        (ref.dir / "stamps" / "v1.restamp-1382.manifest.requests.csv").read_bytes().decode()
+    )
+    head, *body = ref_journal.splitlines(keepends=True)
+    assert head == "cik,accession,sgml_stamp,error\r\n"
+    (tmp_path / "pool").mkdir()
+    c, sec = _pool_case(tmp_path / "pool")
+    sec.fail_after = 0
+    with pytest.raises(httpx.HTTPStatusError):
+        run(c, sec, *LATE_RANGE, "--apply", "--fetch-workers", "1")  # makes the backup
+    sec.fail_after = None
+    journal = c.dir / "stamps" / "v1.restamp-1382.manifest.requests.csv"
+    errors = [line for line in body if line.split(",")[2] == ""]
+    assert any(",HTTP 404" in line for line in errors)
+    assert any("ValueError" in line for line in errors)
+    stamped = [line for line in body if line not in errors]
+    kept_lines = [stamped[0], *errors]
+    torn_key = tuple(stamped[1].split(",")[:2])
+    synthetic = head + "".join(kept_lines) + stamped[1][:30]  # torn mid-write
+    journal.write_bytes(synthetic.encode())
+    kept = {tuple(line.split(",")[:2]) for line in kept_lines}
+    assert run(c, sec, *LATE_RANGE, "--apply", "--resume", "--fetch-workers", "4") == 0
+    assert not kept & set(sec.calls)
+    assert torn_key in sec.calls
+    assert len(sec.calls) == len(set(sec.calls)) == len(body) - len(kept_lines)
+    assert journal.read_bytes().startswith(synthetic.encode())
+    want = _outputs(ref)
+    got = _outputs(c)
+    j = "stamps/v1.restamp-1382.manifest.requests.csv"
+    want.pop(j), got.pop(j)
+    assert got == want
+
+
+def test_unrepaired_pool_equals_sequential(tmp_path: Path) -> None:
+    out: dict[int, dict[str, bytes]] = {}
+    for workers in (1, 4):
+        root = tmp_path / f"w{workers}"
+        root.mkdir()
+        c, base, source = unrepaired_case(root)
+        sec = SlowSec(base.truth)
+        sec.no_acceptance = base.no_acceptance
+        sec.broken = base.broken
+        assert run_unrepaired(c, sec, source, "--apply", "--fetch-workers", str(workers)) == 0
+        out[workers] = {
+            k: v
+            for k, v in c.snapshot().items()
+            if not k.startswith(("stamps/v1.restamp-1382a3.bak", "index/"))  # backup; inputs
+        }
+    assert out[4] == out[1]
+
+
+def test_the_pool_goes_through_the_one_rate_limiter(tmp_path: Path, monkeypatch: Any) -> None:
+    """The live fetch at 4 workers: every request waits on `edgar_raw._LIMITER`
+    at 1/``requests_per_second``, and no two requests start closer than that."""
+    settings = Settings(sec_edgar_user_agent=SecretStr("Test test@example.com"))
+    settings.edgar.requests_per_second = 20
+    keys = [(f"{i:010d}", f"{i:010d}-24-000001") for i in range(1, 13)]
+    truth = {k: utc(2024, 1, 2, 15) for k in keys}
+    starts: list[float] = []
+    waits: list[float] = []
+    real_wait = edgar_raw._LIMITER.wait
+
+    def wait(interval: float) -> None:
+        waits.append(interval)
+        real_wait(interval)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        starts.append(time.monotonic())
+        time.sleep(0.03)
+        _, _, _, _, cik, _, name = request.url.path.split("/")
+        accession = name.removesuffix(".txt")
+        return httpx.Response(
+            200,
+            text=header_for(f"{int(cik):010d}", accession, truth[(f"{int(cik):010d}", accession)]),
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handle))
+    monkeypatch.setattr(edgar_raw._LIMITER, "wait", wait)
+    monkeypatch.setattr(edgar_raw, "_default_client", lambda _timeout: client)
+    journal = repair_stamps.Journal(None, repair_stamps.sgml_fetch(settings), workers=4)
+    journal.prefetch(keys, "test")
+    assert {journal.get(*k) for k in keys} == {utc(2024, 1, 2, 15)}
+    assert waits == [1 / 20] * len(keys)
+    starts.sort()
+    gaps = [b - a for a, b in itertools.pairwise(starts)]
+    assert min(gaps) >= 1 / 20 - 0.005
+
+
+def test_a_rate_limit_block_in_the_pool_is_asked_again_in_turn(tmp_path: Path) -> None:
+    """A 403/429 a worker gets past the retries is not a stop: the key is asked
+    again on the calling thread, in its turn, as the one-at-a-time path would
+    after its wait-out, and the journal is that path's."""
+    keys = [(f"{i:010d}", f"{i:010d}-24-000001") for i in range(1, 13)]
+    blocked = {keys[3], keys[4]}
+    outputs: dict[int, bytes] = {}
+    for workers in (1, 4):
+        sec = SlowSec({k: utc(2024, 1, 2, 15) for k in keys})
+        first_try = set(blocked) if workers > 1 else set()
+
+        def fetch(
+            cik: str,
+            accession: str,
+            sec: SlowSec = sec,
+            first: set[tuple[str, str]] = first_try,
+        ) -> datetime:
+            if (cik, accession) in first:
+                first.discard((cik, accession))
+                request = httpx.Request("GET", "https://www.sec.gov/x")
+                raise httpx.HTTPStatusError(
+                    "429", request=request, response=httpx.Response(429, request=request)
+                )
+            return sec(cik, accession)
+
+        path = tmp_path / f"j{workers}.csv"
+        journal = repair_stamps.Journal(path, fetch, workers=workers)
+        journal.prefetch(keys, "test")
+        assert [journal.get(*k) for k in keys] == [utc(2024, 1, 2, 15)] * len(keys)
+        assert sorted(sec.calls) == keys and journal.requests == len(keys)
+        outputs[workers] = path.read_bytes()
+    assert outputs[4] == outputs[1]
+
+
+def test_a_key_blocked_before_the_wait_out_is_asked_after_it(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """SEC's block, with the real `edgar_raw` block flag: k1's request waits
+    the block out; k0, sent beside it, gets a 403 at once (the flag is set).
+    k0 comes first, so the calling thread reaches it while k1 still waits; it
+    must ask k0 only once k1 is done (the flag cleared), as one at a time."""
+    block = edgar_raw._RateLimitBlock()
+    monkeypatch.setattr(edgar_raw, "_RATE_LIMIT_BLOCK", block)
+    keys = [(f"{i:010d}", f"{i:010d}-24-000001") for i in range(1, 7)]
+    outputs: dict[int, bytes] = {}
+    for workers in (1, 2):
+        sec = SlowSec({k: utc(2024, 1, 2, 15) for k in keys}, delay=0)
+        k1_started = threading.Event()
+
+        def fetch(
+            cik: str, accession: str, sec: SlowSec = sec, started: Any = k1_started
+        ) -> datetime:
+            key = (cik, accession)
+            request = httpx.Request("GET", "https://www.sec.gov/x")
+            if key == keys[0]:
+                started.wait(1)
+                time.sleep(0.02)
+            if block.is_set():  # edgar_raw: a block status while set fails at once
+                raise httpx.HTTPStatusError(
+                    "403", request=request, response=httpx.Response(403, request=request)
+                )
+            if key == keys[1]:
+                block.set()  # waits the block out
+                started.set()
+                time.sleep(0.2)
+                block.clear()  # the retry succeeds
+            return sec(cik, accession)
+
+        path = tmp_path / f"j{workers}.csv"
+        journal = repair_stamps.Journal(path, fetch, workers=workers)
+        journal.prefetch(keys, "test")
+        assert [journal.get(*k) for k in keys] == [utc(2024, 1, 2, 15)] * len(keys)
+        assert sorted(sec.calls) == keys
+        outputs[workers] = path.read_bytes()
+    assert outputs[2] == outputs[1]
