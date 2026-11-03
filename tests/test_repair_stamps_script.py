@@ -1762,3 +1762,46 @@ def test_a_rate_limit_block_in_the_pool_is_asked_again_in_turn(tmp_path: Path) -
         assert sorted(sec.calls) == keys and journal.requests == len(keys)
         outputs[workers] = path.read_bytes()
     assert outputs[4] == outputs[1]
+
+
+def test_a_key_blocked_before_the_wait_out_is_asked_after_it(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """SEC's block, with the real `edgar_raw` block flag: k1's request waits
+    the block out; k0, sent beside it, gets a 403 at once (the flag is set).
+    k0 comes first, so the calling thread reaches it while k1 still waits; it
+    must ask k0 only once k1 is done (the flag cleared), as one at a time."""
+    block = edgar_raw._RateLimitBlock()
+    monkeypatch.setattr(edgar_raw, "_RATE_LIMIT_BLOCK", block)
+    keys = [(f"{i:010d}", f"{i:010d}-24-000001") for i in range(1, 7)]
+    outputs: dict[int, bytes] = {}
+    for workers in (1, 2):
+        sec = SlowSec({k: utc(2024, 1, 2, 15) for k in keys}, delay=0)
+        k1_started = threading.Event()
+
+        def fetch(
+            cik: str, accession: str, sec: SlowSec = sec, started: Any = k1_started
+        ) -> datetime:
+            key = (cik, accession)
+            request = httpx.Request("GET", "https://www.sec.gov/x")
+            if key == keys[0]:
+                started.wait(1)
+                time.sleep(0.02)
+            if block.is_set():  # edgar_raw: a block status while set fails at once
+                raise httpx.HTTPStatusError(
+                    "403", request=request, response=httpx.Response(403, request=request)
+                )
+            if key == keys[1]:
+                block.set()  # waits the block out
+                started.set()
+                time.sleep(0.2)
+                block.clear()  # the retry succeeds
+            return sec(cik, accession)
+
+        path = tmp_path / f"j{workers}.csv"
+        journal = repair_stamps.Journal(path, fetch, workers=workers)
+        journal.prefetch(keys, "test")
+        assert [journal.get(*k) for k in keys] == [utc(2024, 1, 2, 15)] * len(keys)
+        assert sorted(sec.calls) == keys
+        outputs[workers] = path.read_bytes()
+    assert outputs[2] == outputs[1]

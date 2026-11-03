@@ -692,7 +692,8 @@ class Journal:
         sends nothing while `edgar_raw.rate_limit_blocked` is set, and nothing
         once another fetch has failed; such a key, and one whose request ended
         in a 403/429 block, is asked here, in its turn, through `get` (the
-        sequential path, with its wait-out). The first failure in key order is
+        sequential path, with its wait-out), once no worker is sending and
+        with the workers held meanwhile. The first failure in key order is
         raised after every answer that did arrive is journalled, so
         ``--resume`` repeats none of them; keys after it are not asked."""
         if self.workers <= 1:
@@ -702,10 +703,18 @@ class Journal:
             return
         self.budget(todo, step)
         stop = threading.Event()
+        # `held`: the calling thread is asking a key itself; no worker sends
+        # until it is done. `gate` guards it and the count of sends in flight.
+        gate = threading.Condition()
+        in_flight = 0
+        held = False
 
         def work(key: Key) -> _Fetched:
-            if stop.is_set() or edgar_raw.rate_limit_blocked():
-                return _Fetched()
+            nonlocal in_flight
+            with gate:
+                if stop.is_set() or held or edgar_raw.rate_limit_blocked():
+                    return _Fetched()
+                in_flight += 1
             try:
                 return _Fetched(answer=self._ask(*key))
             except httpx.HTTPStatusError as exc:
@@ -716,6 +725,24 @@ class Journal:
             except BaseException as exc:  # handed to the calling thread
                 stop.set()
                 return _Fetched(error=exc)
+            finally:
+                with gate:
+                    in_flight -= 1
+                    gate.notify_all()
+
+        def ask_here(key: Key) -> None:
+            """`get` on this thread once no worker is sending (as #2933 does):
+            a worker waiting out a block ends first, and nothing else is
+            sent meanwhile, as on the one-at-a-time path."""
+            nonlocal held
+            with gate:
+                held = True
+                gate.wait_for(lambda: in_flight == 0)
+            try:
+                self.get(*key)
+            finally:
+                with gate:
+                    held = False
 
         failure: BaseException | None = None
         with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="sgml") as pool:
@@ -734,7 +761,7 @@ class Journal:
                         self._record(key, got.answer)
                     else:
                         try:
-                            self.get(*key)
+                            ask_here(key)
                         except BaseException as exc:
                             failure = exc
                             stop.set()
