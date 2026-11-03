@@ -25,6 +25,7 @@ from tradepartner.store.journal import (
     PaperWindowRow,
     ReconcileBreakRow,
     adjustments_for,
+    append,
     break_events_for,
 )
 
@@ -74,6 +75,164 @@ def _true_up(
     return true_up.true_up(
         settings, lambda: open_for_write(settings), broker, _ticking(clock), break_id, reason
     )
+
+
+def _reverse(
+    settings: Settings, broker: BookedFake, clock: FixedClock, break_id: str, reason: str = REASON
+) -> true_up.TrueUpResult:
+    return true_up.reverse(
+        settings, lambda: open_for_write(settings), broker, _ticking(clock), break_id, reason
+    )
+
+
+def test_reverse_reopens_and_rebooks_one_cash_activity(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    frozen_window: PaperWindowRow,  # noqa: F811
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.activities = [FUNDING, CashActivity("reverse-cash", "MA", S, "executed", 30.0, "SPY")]
+    fake.extra_cash = 30.0
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+    opened = _events(journal_settings, frozen_window)[-1]
+    first = _true_up(journal_settings, fake, fixed_clock, opened.break_id)
+    fixed_clock.advance(seconds=1)
+    reversed_result = _reverse(journal_settings, fake, fixed_clock, opened.break_id)
+    event = _events(journal_settings, frozen_window)[-1]
+    assert event.event == "reopened" and event.material
+    assert event.event_id == reversed_result.event_id
+    (row,) = [
+        a
+        for a in _adjustments(journal_settings, frozen_window)
+        if a.adjustment_id in reversed_result.adjustment_ids
+    ]
+    assert row.cash == -30.0 and row.broker_activity_id is None
+    assert (
+        json.loads(row.explanation_json or "")["reversed_adjustment_id"] == first.adjustment_ids[0]
+    )
+    assert json.loads(row.explanation_json or "")["reversed_activity_id"] == "reverse-cash"
+    assert row.known_at == row.ingested_at == event.known_at == event.ingested_at
+    assert row.session == S
+    fixed_clock.advance(seconds=1)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+    second = _true_up(journal_settings, fake, fixed_clock, opened.break_id)
+    (rebooked,) = [
+        a
+        for a in _adjustments(journal_settings, frozen_window)
+        if a.adjustment_id in second.adjustment_ids
+    ]
+    assert rebooked.broker_activity_id is None
+    assert json.loads(rebooked.explanation_json or "")["rebooked_activity_id"] == "reverse-cash"
+    fixed_clock.advance(seconds=1)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "ok"
+
+
+def test_reverse_refuses_open_break_on_same_name_without_writing(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    frozen_window: PaperWindowRow,  # noqa: F811
+    fixed_clock: FixedClock,
+) -> None:
+    opened = _open_quantity_and_cash_break(journal_settings, fake, frozen_window, fixed_clock)
+    _true_up(journal_settings, fake, fixed_clock, opened.break_id)
+    fake.extra_quantity = {"SPY": 2.0}
+    fixed_clock.advance(seconds=1)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+    before = _snapshot(journal_settings, frozen_window)
+    with pytest.raises(WindowCommandRefused) as refused:
+        _reverse(journal_settings, fake, fixed_clock, opened.break_id)
+    assert refused.value.reason == "open_break"
+    assert _snapshot(journal_settings, frozen_window) == before
+
+
+def test_reverse_uses_the_command_session_not_the_original_break_session(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    frozen_window: PaperWindowRow,  # noqa: F811
+    fixed_clock: FixedClock,
+) -> None:
+    opened = _open_quantity_and_cash_break(journal_settings, fake, frozen_window, fixed_clock)
+    _true_up(journal_settings, fake, fixed_clock, opened.break_id)
+    fixed_clock.advance(days=1)
+    result = _reverse(journal_settings, fake, fixed_clock, opened.break_id)
+    rows = [
+        a
+        for a in _adjustments(journal_settings, frozen_window)
+        if a.adjustment_id in result.adjustment_ids
+    ]
+    assert rows
+    assert {a.session for a in rows} == {next_session(S)}
+
+
+def test_reverse_requires_a_trued_up_break_and_reuses_no_write_gates(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    frozen_window: PaperWindowRow,  # noqa: F811
+    fixed_clock: FixedClock,
+) -> None:
+    from tradepartner.execution.lock import LockHeld, run_lock
+
+    opened = _open_quantity_and_cash_break(journal_settings, fake, frozen_window, fixed_clock)
+    before = _snapshot(journal_settings, frozen_window)
+    calls = len(fake.calls)
+    for reason in ("", "   "):
+        with pytest.raises(WindowCommandRefused) as refused:
+            _reverse(journal_settings, fake, fixed_clock, opened.break_id, reason)
+        assert refused.value.reason == "reason"
+    with pytest.raises(WindowCommandRefused) as refused:
+        _reverse(journal_settings, fake, fixed_clock, opened.break_id)
+    assert refused.value.reason == "not_open"
+    with run_lock(journal_settings, "main"), pytest.raises(LockHeld):
+        _reverse(journal_settings, fake, fixed_clock, opened.break_id)
+    assert _snapshot(journal_settings, frozen_window) == before
+    assert len(fake.calls) == calls
+
+    _true_up(journal_settings, fake, fixed_clock, opened.break_id)
+    fake._account_id = "PA-OTHER"
+    before = _snapshot(journal_settings, frozen_window)
+    with pytest.raises(WindowCommandRefused) as refused:
+        _reverse(journal_settings, fake, fixed_clock, opened.break_id)
+    assert refused.value.reason == "account_mismatch"
+    assert _snapshot(journal_settings, frozen_window) == before
+
+
+def test_reverse_without_window_refuses_before_broker_read(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    fixed_clock: FixedClock,
+) -> None:
+    with pytest.raises(WindowCommandRefused) as refused:
+        _reverse(journal_settings, fake, fixed_clock, "1:SEC_SPY:1")
+    assert refused.value.reason == "no_window"
+    assert not fake.calls
+
+
+def test_reverse_refuses_auto_accepted_break(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    frozen_window: PaperWindowRow,  # noqa: F811
+    fixed_clock: FixedClock,
+) -> None:
+    opened = _open_quantity_and_cash_break(journal_settings, fake, frozen_window, fixed_clock)
+    with open_for_write(journal_settings) as conn:
+        append(
+            conn,
+            replace(
+                opened,
+                event_id=None,
+                event="auto_accepted",
+                cause=None,
+                reconciliation_id=None,
+                known_at=fixed_clock.advance(seconds=1),
+                ingested_at=fixed_clock.now,
+            ),
+        )
+    before = _snapshot(journal_settings, frozen_window)
+    with pytest.raises(WindowCommandRefused) as refused:
+        _reverse(journal_settings, fake, fixed_clock, opened.break_id)
+    assert refused.value.reason == "not_open"
+    assert _snapshot(journal_settings, frozen_window) == before
 
 
 def _snapshot(settings: Settings, window: PaperWindowRow) -> tuple[Any, ...]:

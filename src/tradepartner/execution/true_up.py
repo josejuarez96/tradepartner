@@ -112,6 +112,7 @@ NOT_OPEN = "not_open"
 OPEN_ORDER = "open_order"
 SHORT_NAME = "short_name"
 MOVED = "moved"
+OPEN_BREAK = "open_break"
 #: The parts a true-up adopts a quantity for (item 2's quantity part).
 _QUANTITY_KINDS = frozenset(
     {
@@ -147,6 +148,21 @@ class _Reading:
 
 def _refuse(code: str, message: str) -> WindowCommandRefused:
     return WindowCommandRefused(code, message)
+
+
+def _require_reason(reason: str) -> str:
+    if reason is None or not reason.strip():
+        raise _refuse(REASON, "--reason is required and must be non-blank: say why")
+    return reason.strip()
+
+
+def _check_account(window: PaperWindowRow, account_id: str) -> None:
+    if account_id != window.account_id:
+        raise _refuse(
+            ACCOUNT_MISMATCH,
+            f"the broker's account {account_id!r} is not window "
+            f"{window.window_id}'s {window.account_id!r}",
+        )
 
 
 def _gate_journal(
@@ -405,21 +421,14 @@ def true_up(
     reading, a stamp not after the gate's reading, or a journal row stamped after
     either, and whatever the broker raises (nothing written). The only caller is
     the owner's CLI; no flag skips the broker read."""
-    if reason is None or not reason.strip():
-        raise _refuse(REASON, "--reason is required and must be non-blank: say why")
-    note = reason.strip()
+    note = _require_reason(reason)
     book = resolve_book(settings, book_id)
     with run_lock(settings, book):
         with connect() as conn:
             window, event = _gate_journal(conn, book, break_id)
         now = _read_clock(clock)
         account = broker.account()
-        if account.account_id != window.account_id:
-            raise _refuse(
-                ACCOUNT_MISMATCH,
-                f"the broker's account {account.account_id!r} is not window "
-                f"{window.window_id}'s {window.account_id!r}",
-            )
+        _check_account(window, account.account_id)
         positions = {symbol: p.quantity for symbol, p in broker.positions().items()}
         activities = broker.cash_activities(
             window.started_at.astimezone(_NEW_YORK).date() - timedelta(days=1)
@@ -485,4 +494,109 @@ def true_up(
             )
             if event_id is None:
                 raise RuntimeError("trued_up append returned no id")
+    return TrueUpResult(break_id, event_id, tuple(ids), stamp)
+
+
+def _reverse_target(
+    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, break_id: str
+) -> ReconcileBreakRow:
+    events = break_events_for(conn, _window_id(window))
+    latest = {e.break_id: e for e in events}.get(break_id)
+    if latest is None or latest.event != "trued_up":
+        raise _refuse(NOT_OPEN, f"break {break_id!r} is not trued_up in this window")
+    if any(e.name == latest.name for e in open_breaks(conn, _window_id(window))):
+        raise _refuse(OPEN_BREAK, f"another break is open on {latest.name}")
+    return latest
+
+
+def reverse(
+    settings: Settings,
+    connect: Connect,
+    broker: Broker,
+    clock: Callable[[], datetime],
+    break_id: str,
+    reason: str,
+    *,
+    book_id: str | None = None,
+) -> TrueUpResult:
+    """Reverse one trued-up break with opposite adjustments and a reopened event."""
+    note = _require_reason(reason)
+    book = resolve_book(settings, book_id)
+    with run_lock(settings, book):
+        with connect() as conn:
+            window = open_window(conn, book)
+            if window is None:
+                raise _refuse(NO_WINDOW, f"no paper window is open for book {book!r}")
+            target = _reverse_target(conn, window, break_id)
+        now = _read_clock(clock)
+        with connect() as conn:
+            latest = _latest_stamp(conn, _window_id(window))
+            if latest is not None and now < latest:
+                raise ClockError(
+                    f"the reversal clock {now.isoformat()} is before the journal row "
+                    f"stamped {latest.isoformat()}"
+                )
+        _check_account(window, broker.account().account_id)
+        broker.positions()
+        broker.cash_activities(window.started_at.astimezone(_NEW_YORK).date() - timedelta(days=1))
+        stamp = _read_clock(clock)
+        if stamp <= now:
+            raise ClockError(
+                f"the reversal stamp {stamp.isoformat()} is not after {now.isoformat()}"
+            )
+        session = command_session(now)
+        with connect() as conn:
+            again = _reverse_target(conn, window, break_id)
+            if again.event_id != target.event_id:
+                raise _refuse(MOVED, f"break {break_id} has a newer event")
+            latest = _latest_stamp(conn, _window_id(window))
+            if latest is not None and stamp <= latest:
+                raise ClockError(
+                    f"the reversal stamp {stamp.isoformat()} is not after the journal row "
+                    f"stamped {latest.isoformat()}"
+                )
+            source_ids = json.loads(target.adjustment_ids_json or "[]")
+            adjustments = {a.adjustment_id: a for a in adjustments_for(conn, _window_id(window))}
+            ids: list[int] = []
+            for source_id in source_ids:
+                source = adjustments[source_id]
+                source_terms = json.loads(source.explanation_json or "{}")
+                activity_id = source.broker_activity_id or source_terms.get("rebooked_activity_id")
+                terms = {
+                    "break_id": break_id,
+                    "reason": note,
+                    "reversed_adjustment_id": source_id,
+                    **({"reversed_activity_id": activity_id} if activity_id is not None else {}),
+                }
+                row = replace(
+                    source,
+                    adjustment_id=None,
+                    session=session,
+                    quantity=-source.quantity if source.quantity is not None else None,
+                    cash=-source.cash if source.cash is not None else None,
+                    broker_activity_id=None,
+                    explanation_json=json.dumps(terms, sort_keys=True),
+                    known_at=stamp,
+                    ingested_at=stamp,
+                )
+                adjustment_id = append(conn, row)
+                if adjustment_id is None:
+                    raise RuntimeError("reversing adjustment append returned no id")
+                ids.append(adjustment_id)
+            event_id = append(
+                conn,
+                replace(
+                    target,
+                    event_id=None,
+                    event="reopened",
+                    material=True,
+                    reconciliation_id=None,
+                    adjustment_ids_json=json.dumps(ids),
+                    reason=note,
+                    known_at=stamp,
+                    ingested_at=stamp,
+                ),
+            )
+            if event_id is None:
+                raise RuntimeError("reopened append returned no id")
     return TrueUpResult(break_id, event_id, tuple(ids), stamp)
