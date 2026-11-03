@@ -4612,6 +4612,14 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
         counts[key] = int(getattr(source, key, 0))
     text = "".join(f"; {key}: {value}" for key, value in sorted(counts.items()))
     # #2929: the first few CIKs a class conflict failed closed, to look up.
+    # #2932: CIKs whose filename fetch failed past the retries, failed closed.
+    fetch_failed = tuple(getattr(source, "filename_fetch_failed_ciks", ()))
+    if fetch_failed:
+        shown = ", ".join(fetch_failed[:_FILENAME_CONFLICTS_SHOWN])
+        more = len(fetch_failed) - _FILENAME_CONFLICTS_SHOWN
+        text += f"; filename fetch incomplete: {len(fetch_failed)} ({shown}" + (
+            f", +{more})" if more > 0 else ")"
+        )
     conflicted = tuple(getattr(master, "filename_conflict_ciks", ()))
     if conflicted:
         shown = ", ".join(conflicted[:_FILENAME_CONFLICTS_SHOWN])

@@ -293,6 +293,7 @@ from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -758,6 +759,11 @@ class EdgarFilingSource(FilingSource):
         # delisting cache. A caller must not derive a "no other reading" verdict
         # (`single_reading`) for such a CIK until a complete run.
         self.filename_incomplete_ciks: set[str] = set()
+        # #2932: CIKs whose filename fetch failed past the retries (a 5xx, a
+        # timeout, a connection error), each with its first error, in the
+        # order asked; and every CIK asked, `check_failures`' denominator.
+        self.filename_fetch_failed_ciks: dict[str, str] = {}
+        self._filename_ciks_asked: set[str] = set()
         # T11h: the failure policy.
         self.failed_filings = 0
         self.quarantined = 0
@@ -3567,6 +3573,7 @@ class EdgarFilingSource(FilingSource):
         if not self._settings.edgar.filename_listings:
             return []
         _validate_cik(cik)
+        self._filename_ciks_asked.add(cik)
         self._ensure_fsn()
         edgar_settings = self._settings.edgar
         stamps = self._read_stamps(cik)
@@ -3600,9 +3607,11 @@ class EdgarFilingSource(FilingSource):
         if first_cover is not None and first_cover.accepted_at is not None:
             jobs.append((first_cover, False))
         jobs.extend((record, False) for record in form25s if self._own_form25(cik, record))
-        pool, prefetched = self._prefetch_filename_extracts(cik, cache, jobs)
+        pool: ThreadPoolExecutor | None = None
+        prefetched: dict[tuple[str, bool], Future[_FilenameExtract]] = {}
         listings: list[FilenameListing] = []
         try:
+            pool, prefetched = self._prefetch_filename_extracts(cik, cache, jobs)
             for record in in_window:
                 assert record.accepted_at is not None  # in_window holds stamped filings only
                 extract = self._filename_extract(
@@ -3688,6 +3697,17 @@ class EdgarFilingSource(FilingSource):
                         dei_symbol=None,
                     )
                 )
+        except (httpx.HTTPStatusError, httpx.TransportError) as error:
+            if isinstance(error, httpx.HTTPStatusError) and error.response.status_code < 500:
+                raise  # a 403/429 block given up on, or another refusal: as before
+            # #2932: a 5xx or a transport error past the retries fails this CIK
+            # closed (no answer, the failed filing uncached, asked again next
+            # run); `check_failures` fails the run past the share threshold.
+            self.filename_incomplete_ciks.add(cik)
+            self.filename_fetch_failed_ciks.setdefault(
+                cik, self._stored_message(f"{type(error).__name__}: {error}")
+            )
+            return []
         finally:
             if pool is not None:
                 pool.shutdown(wait=True, cancel_futures=True)
@@ -3744,16 +3764,20 @@ class EdgarFilingSource(FilingSource):
         pool = ThreadPoolExecutor(
             max_workers=min(workers, len(todo)), thread_name_prefix="edgar-filename"
         )
-        futures = {
-            key: pool.submit(
-                contextvars.copy_context().run,
-                self._fetch_filename_extract,
-                cik,
-                record,
-                read_document,
-            )
-            for key, (record, read_document) in todo.items()
-        }
+        try:
+            futures = {
+                key: pool.submit(
+                    contextvars.copy_context().run,
+                    partial(self._fetch_filename_extract, on_worker=True),
+                    cik,
+                    record,
+                    read_document,
+                )
+                for key, (record, read_document) in todo.items()
+            }
+        except BaseException:
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
         return pool, futures
 
     def _first_cover_filing(
@@ -3788,9 +3812,11 @@ class EdgarFilingSource(FilingSource):
 
         A `prefetched` future (#2932) stands in for the fetch, its result
         or its raise taken here in order exactly as the inline fetch's,
-        except a rate-limit block's `403`/`429`: whether a request waits a
-        block out depends on what the other threads saw
-        (`edgar_raw._RATE_LIMIT_BLOCK`), so that one is fetched again here,
+        except a rate-limit block's (`_prefetch_reusable`): a worker that
+        found the block set sent nothing, and a `403`/`429` may have been
+        raised at once because another thread was waiting the block out.
+        Then every other prefetch is let finish first (a wait in progress
+        ends, clearing the block on success), and this one is fetched here,
         one request at a time as before, with the sequential wait-out."""
         cached = _filename_cache_hit(cache, record, read_document)
         if cached is not None:
@@ -3805,8 +3831,11 @@ class EdgarFilingSource(FilingSource):
             self._fetch_filename_extract, cik, record, read_document
         )
         future = prefetched.pop((record.accession, read_document), None) if prefetched else None
-        if future is not None and _prefetch_reusable(future):
-            fetch = future.result
+        if future is not None:
+            if _prefetch_reusable(future):
+                fetch = future.result
+            else:
+                wait_futures(list(prefetched.values()) if prefetched else [])
         extract = self._guarded(record.accession, record.form.removesuffix("/A"), fetch)
         if extract is None:
             self.filename_incomplete_ciks.add(cik)
@@ -3816,8 +3845,15 @@ class EdgarFilingSource(FilingSource):
         return extract
 
     def _fetch_filename_extract(
-        self, cik: str, record: SubmissionRecord, read_document: bool
+        self, cik: str, record: SubmissionRecord, read_document: bool, *, on_worker: bool = False
     ) -> _FilenameExtract:
+        """One accession's extract from its `index.json` (and, for a 10-K
+        with an instance, its primary document's head). `on_worker` (#2932,
+        a pool thread): raise `_FetchDeferred` instead of sending while
+        SEC's rate-limit block is being waited out, so the pool is quiet
+        then as the sequential fetch is, and the caller asks it in order."""
+        if on_worker and edgar_raw.rate_limit_blocked():
+            raise _FetchDeferred(record.accession)
         names = edgar_raw.filing_index(
             cik, record.accession, settings=self._settings, client=self._client
         )
@@ -3829,6 +3865,8 @@ class EdgarFilingSource(FilingSource):
         if prefix is None or not read_document:
             return _FilenameExtract(prefix, (), False)
         cap = self._settings.edgar.filename_document_max_bytes
+        if on_worker and edgar_raw.rate_limit_blocked():
+            raise _FetchDeferred(record.accession)
         # The root copy, never an `xsl.../` rendering of it (as `_fetch_cover_page`).
         document = re.sub(r"^xsl[^/]*/", "", record.primary_document)
         head = edgar_raw.filing_document_head(
@@ -4116,6 +4154,7 @@ class EdgarFilingSource(FilingSource):
         on a non-dry run by `record_failed_check`) holds them too, and
         accepting one stays the hand edit there."""
         reasons: list[str] = []
+        self._check_filename_fetches(reasons)
         self._check_fsn_group(reasons)
         self._check_per_document_group(reasons)
         self._check_cross_day_pairs(reasons)
@@ -4243,6 +4282,23 @@ class EdgarFilingSource(FilingSource):
         reason = self._threshold_reason("per-document", failures, denominator)
         if reason:
             reasons.append(reason)
+
+    def _check_filename_fetches(self, reasons: list[str]) -> None:
+        """#2932: the run fails when more than
+        `edgar.filename_fetch_max_failed_share` of the CIKs `filename_listings`
+        was asked for failed their fetch past the retries (an outage, never
+        hidden as a few incomplete CIKs); the first CIKs are named."""
+        failed = self.filename_fetch_failed_ciks
+        asked = len(self._filename_ciks_asked)
+        share = self._settings.edgar.filename_fetch_max_failed_share
+        if not failed or len(failed) <= share * asked:
+            return
+        limit = self._settings.edgar.max_validation_listed
+        first = "; ".join(f"{cik} {message}" for cik, message in list(failed.items())[:limit])
+        reasons.append(
+            f"filename fetch incomplete: {len(failed)} of {asked} CIKs, over "
+            f"edgar.filename_fetch_max_failed_share {share:g}; first: {first}"
+        )
 
     def _check_cross_day_pairs(self, reasons: list[str]) -> None:
         """One (error class, base form) pair with at least
@@ -5057,14 +5113,23 @@ def _filename_cache_hit(
     return None
 
 
+class _FetchDeferred(Exception):
+    """A pool worker's fetch not sent: SEC's rate-limit block was set (#2932)."""
+
+
 def _prefetch_reusable(future: Future[_FilenameExtract]) -> bool:
     """Whether a prefetched fetch's outcome is the one a sequential ask would
-    get (#2932). Waits for the future. Every outcome is, but a `403`/`429`
-    raised by `edgar_raw`'s rate-limit block: under concurrency a request
-    can raise it at once because another thread's wait set the shared block
-    flag, where the sequential fetch would have waited it out; that one is
-    asked again in order."""
+    get (#2932). Waits for the future. Every outcome is, but a cancelled or
+    deferred one (nothing sent) and a `403`/`429` raised by `edgar_raw`'s
+    rate-limit block: under concurrency a request can raise it at once
+    because another thread's wait set the shared block flag, where the
+    sequential fetch would have waited it out; those are asked again in
+    order."""
+    if future.cancelled():
+        return False
     error = future.exception()
+    if isinstance(error, _FetchDeferred):
+        return False
     return not (
         isinstance(error, httpx.HTTPStatusError) and error.response.status_code in (403, 429)
     )

@@ -6808,6 +6808,24 @@ def test_filename_counts_name_the_conflicting_ciks() -> None:
     assert "filename_conflict_ciks" not in text
 
 
+def test_filename_counts_name_the_fetch_failed_ciks() -> None:
+    # #2932: a CIK whose filename fetch failed past the retries is failed
+    # closed; the run message counts it and names the first few CIKs.
+    from types import SimpleNamespace
+
+    ciks = {f"{n:010d}": "HTTPStatusError: 503" for n in range(1, 8)}
+    master = SimpleNamespace(
+        filename_enabled=True, filename_counts={}, filename_conflict_ciks=(), listings=[]
+    )
+    delistings = SimpleNamespace(unmatched=(), delistings=())
+    source = SimpleNamespace(filename_fetch_failed_ciks=ciks)
+    text = ingest_module._filename_counts(master, delistings, source)  # type: ignore[arg-type]
+    shown = ", ".join(list(ciks)[:5])
+    assert f"; filename fetch incomplete: 7 ({shown}, +2)" in text
+    clean = ingest_module._filename_counts(master, delistings, SimpleNamespace())  # type: ignore[arg-type]
+    assert "filename fetch incomplete" not in clean
+
+
 # --- the borrow-status snapshot (#1506, T171c; ADR 0021) --------------------
 #
 # Payloads are constructed in Alpaca's raw shape (`id`, `class`,
