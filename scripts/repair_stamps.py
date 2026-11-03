@@ -66,6 +66,12 @@ its file, keeping its older records. Steps 1, 3 and 4 skip it (its class from
 
 **Steps.** SGML is read only through ``edgar_raw.filing_sgml_header``, at the
 configured throttle, and every answer is journalled before it is used.
+``--fetch-workers`` (#2955; default 4, 1 to 8) keeps that many requests in
+flight, on ``edgar_raw``'s one shared client and behind its one process-wide
+limiter, so the total stays at or under ``edgar.requests_per_second``. Each
+step's keys are asked on the pool first; the calling thread journals the
+answers in the step's order, so the journal, the manifest and the counts are
+those of ``--fetch-workers 1``, today's one-at-a-time path.
 
 1. Early-class CIKs: shift every record whose current stamp is identical to
    its ``--bulk-written`` stamp. No requests.
@@ -155,8 +161,10 @@ import json
 import re
 import shutil
 import sys
+import threading
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -196,7 +204,11 @@ DEFAULT_SEED = 1382
 BULK_WRITTEN_DAY = date(2026, 10, 1)
 _PROBES_PER_CIK = 2
 _GONE = (404, 410)
+_BLOCKED = (403, 429)  # SEC's rate-limit block (#2955: a worker hands it back)
 _JOURNAL_COLUMNS = ("cik", "accession", "sgml_stamp", "error")
+DEFAULT_FETCH_WORKERS = 4  # #2955: SGML requests in flight; 1 is one at a time
+MIN_FETCH_WORKERS = 1
+MAX_FETCH_WORKERS = 8
 
 Key = tuple[str, str]
 Fetch = Callable[[str, str], datetime]
@@ -585,12 +597,25 @@ def _rewritten_picks(inputs: Inputs, cik: str, step2: set[Key]) -> list[str]:
 
 class Journal:
     """SGML answers by ``(cik, accession)``, appended to a CSV as they come,
-    so a resumed run repeats no request."""
+    so a resumed run repeats no request.
 
-    def __init__(self, path: Path | None, fetch: Fetch, *, cap: int | None = None) -> None:
+    #2955: with ``workers`` above 1, `prefetch` asks a step's keys on a
+    bounded thread pool before the step reads them through `get`. Only the
+    calling thread appends to the journal, in the keys' order, and each line
+    is written before its answer is stored, so the journal, the manifest and
+    the counts are the one-at-a-time path's. ``workers`` 1 is that path."""
+
+    def __init__(
+        self, path: Path | None, fetch: Fetch, *, cap: int | None = None, workers: int = 1
+    ) -> None:
+        if not MIN_FETCH_WORKERS <= workers <= MAX_FETCH_WORKERS:
+            raise ValueError(
+                f"workers must be {MIN_FETCH_WORKERS} to {MAX_FETCH_WORKERS}, got {workers}"
+            )
         self._path = path
         self._fetch = fetch
         self.cap = cap
+        self.workers = workers
         self.answers: dict[Key, datetime | str] = {}
         self.requests = 0
         self.lines = 0  # every request of the release, resumed runs included
@@ -617,25 +642,22 @@ class Journal:
                 "written; resume with --resume under a higher cap"
             )
 
-    def get(self, cik: str, accession: str) -> datetime | str:
-        """The SGML acceptance stamp, or the error text when the header did not
-        give one; fetched once, ever."""
-        key = (cik, accession)
-        if key in self.answers:
-            return self.answers[key]
-        self.budget([key], "request")
-        self.requests += 1
-        self.lines += 1
-        answer: datetime | str
+    def _ask(self, cik: str, accession: str) -> datetime | str:
+        """One request: the stamp, or the error text of a header that gives
+        none (a 404/410, a header that does not parse or match). Any other
+        error (transient or blocked past the retries) raises."""
         try:
-            answer = self._fetch(cik, accession)
+            return self._fetch(cik, accession)
         except ValueError as exc:  # a header that does not parse or match
-            answer = f"{type(exc).__name__}: {exc}"
+            return f"{type(exc).__name__}: {exc}"
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code not in _GONE:
                 raise  # transient or blocked: stop; --resume picks up here
-            answer = f"HTTP {exc.response.status_code}"
-        self.answers[key] = answer
+            return f"HTTP {exc.response.status_code}"
+
+    def _record(self, key: Key, answer: datetime | str) -> None:
+        """Journal one answer, then keep it (calling thread only)."""
+        cik, accession = key
         if self._path is not None:
             new = not self._path.exists()
             with self._path.open("a", newline="") as f:
@@ -646,7 +668,116 @@ class Journal:
                     writer.writerow((cik, accession, answer.isoformat(), ""))
                 else:
                     writer.writerow((cik, accession, "", answer))
+        self.answers[key] = answer
+
+    def get(self, cik: str, accession: str) -> datetime | str:
+        """The SGML acceptance stamp, or the error text when the header did not
+        give one; fetched once, ever."""
+        key = (cik, accession)
+        if key in self.answers:
+            return self.answers[key]
+        self.budget([key], "request")
+        self.requests += 1
+        self.lines += 1
+        answer = self._ask(cik, accession)
+        self._record(key, answer)
         return answer
+
+    def prefetch(self, keys: Iterable[Key], step: str) -> None:
+        """Ask ``keys`` not yet answered on the pool, in their order (#2955).
+
+        ``keys`` must be the keys the step then reads through `get`, in that
+        order, so the journal lines come in the sequential order. The workers
+        only fetch; this thread journals each answer in key order. A worker
+        sends nothing while `edgar_raw.rate_limit_blocked` is set, and nothing
+        once another fetch has failed; such a key, and one whose request ended
+        in a 403/429 block, is asked here, in its turn, through `get` (the
+        sequential path, with its wait-out), once no worker is sending and
+        with the workers held meanwhile. The first failure in key order is
+        raised after every answer that did arrive is journalled, so
+        ``--resume`` repeats none of them; keys after it are not asked."""
+        if self.workers <= 1:
+            return
+        todo = list(dict.fromkeys(k for k in keys if k not in self.answers))
+        if len(todo) < 2:
+            return
+        self.budget(todo, step)
+        stop = threading.Event()
+        # `held`: the calling thread is asking a key itself; no worker sends
+        # until it is done. `gate` guards it and the count of sends in flight.
+        gate = threading.Condition()
+        in_flight = 0
+        held = False
+
+        def work(key: Key) -> _Fetched:
+            nonlocal in_flight
+            with gate:
+                if stop.is_set() or held or edgar_raw.rate_limit_blocked():
+                    return _Fetched()
+                in_flight += 1
+            try:
+                return _Fetched(answer=self._ask(*key))
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in _BLOCKED:
+                    return _Fetched()  # a rate-limit block: asked in turn through `get`
+                stop.set()
+                return _Fetched(error=exc)
+            except BaseException as exc:  # handed to the calling thread
+                stop.set()
+                return _Fetched(error=exc)
+            finally:
+                with gate:
+                    in_flight -= 1
+                    gate.notify_all()
+
+        def ask_here(key: Key) -> None:
+            """`get` on this thread once no worker is sending (as #2933 does):
+            a worker waiting out a block ends first, and nothing else is
+            sent meanwhile, as on the one-at-a-time path."""
+            nonlocal held
+            with gate:
+                held = True
+                gate.wait_for(lambda: in_flight == 0)
+            try:
+                self.get(*key)
+            finally:
+                with gate:
+                    held = False
+
+        failure: BaseException | None = None
+        with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="sgml") as pool:
+            try:
+                for key, got in zip(todo, pool.map(work, todo), strict=True):
+                    if failure is not None:  # stopped: keep what arrived, ask nothing
+                        if got.answer is not None:
+                            self.requests += 1
+                            self.lines += 1
+                            self._record(key, got.answer)
+                    elif got.error is not None:
+                        failure = got.error
+                    elif got.answer is not None:
+                        self.requests += 1
+                        self.lines += 1
+                        self._record(key, got.answer)
+                    else:
+                        try:
+                            ask_here(key)
+                        except BaseException as exc:
+                            failure = exc
+                            stop.set()
+            finally:
+                stop.set()  # an interrupt here: the queued jobs send nothing
+        if failure is not None:
+            raise failure
+
+
+@dataclass(frozen=True)
+class _Fetched:
+    """A pool job's result: an answer, an error to raise in order, or neither
+    (not sent: a rate-limit block or a stop; the calling thread asks it)."""
+
+    answer: datetime | str | None = None
+    error: BaseException | None = None
 
 
 def sgml_acceptance(text: str, accession: str) -> datetime:
@@ -734,6 +865,13 @@ def restamp_filing(
         rows[key] = row
 
 
+def _budgeted(journal: Journal, keys: Sequence[Key], step: str) -> Sequence[Key]:
+    """``keys`` after the step's cap check (`Journal.budget`), for `prefetch`:
+    the keys the step then reads through `get`, in that order."""
+    journal.budget(keys, step)
+    return keys
+
+
 def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
     """Steps 1 to 5 with requests through ``journal``. Raises `RepairStop`
     when the audit stop rule fires or a step does not fit under the cap."""
@@ -743,7 +881,7 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
     def restamp(cik: str, accession: str, why: str) -> None:
         restamp_filing(inputs.files, journal, rows, errors, (cik, accession), why)
 
-    journal.budget(plan.step2, "step 2")
+    journal.prefetch(_budgeted(journal, plan.step2, "step 2"), "step 2")
     for cik, accession in plan.step2:
         restamp(cik, accession, "step 2: provably early by filing date")
 
@@ -762,7 +900,8 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
                 probes.append((old, answer))
         return classify_cik(probes) if probes else "mixed"
 
-    journal.budget(((c, a) for c, p in plan.step3.items() for a in p), "step 3")
+    step3_keys = [(c, a) for c, p in plan.step3.items() for a in p]
+    journal.prefetch(_budgeted(journal, step3_keys, "step 3"), "step 3")
     step3_classes: dict[str, str] = {}
     for cik, picks in plan.step3.items():
         cls = probe(cik, picks, "step 3: class probe")
@@ -776,7 +915,8 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
         else:
             mixed_ciks.add(cik)
 
-    journal.budget(((c, a) for c, p in plan.rewritten_probes.items() for a in p), "step 3b")
+    step3b_keys = [(c, a) for c, p in plan.rewritten_probes.items() for a in p]
+    journal.prefetch(_budgeted(journal, step3b_keys, "step 3b"), "step 3b")
     rewritten_classes: dict[str, str] = {}
     for cik, picks in plan.rewritten_probes.items():
         rewritten_classes[cik] = probe(cik, picks, "step 3b: rewritten CIK probe")
@@ -799,12 +939,12 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
         return key not in errors and (row is None or row.method == "shift")
 
     step4_keys = [(c, a) for c, accs in sorted(step4.items()) for a in accs if needs_sgml((c, a))]
-    journal.budget(step4_keys, "step 4")
+    journal.prefetch(_budgeted(journal, step4_keys, "step 4"), "step 4")
     for cik, accession in step4_keys:
         restamp(cik, accession, "step 4: mixed or not bulk-written, filing by filing")
 
     step4b_keys = [k for k in late_api_keys(inputs, set()) if needs_sgml(k)]
-    journal.budget(step4b_keys, "step 4b")
+    journal.prefetch(_budgeted(journal, step4b_keys, "step 4b"), "step 4b")
     for cik, accession in step4b_keys:
         restamp(cik, accession, "step 4b: late API stamp")
 
@@ -813,7 +953,7 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
         if row.method == "shift" and accession in inputs.store.get(cik, ()):
             shifted[cik].append(accession)
     sample = audit_sample(shifted, seed=inputs.seed)
-    journal.budget(sample, "step 5 audit")
+    journal.prefetch(_budgeted(journal, sample, "step 5 audit"), "step 5 audit")
     mismatches: dict[str, int] = {}
     audit_errors = 0
     for cik, accession in sample:
@@ -837,7 +977,9 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
         for accession in sorted(inputs.store.get(cik, ()))
         if inputs.files[cik].stamps.get(accession) is not None
     ]
-    journal.budget(per_filing, "step 5 filing by filing")
+    journal.prefetch(
+        _budgeted(journal, per_filing, "step 5 filing by filing"), "step 5 filing by filing"
+    )
     for cik in decision.per_filing_ciks:
         early_ciks.discard(cik)
         mixed_ciks.add(cik)
@@ -1210,7 +1352,10 @@ def _make_backup(release: Release, args: argparse.Namespace) -> None:
 
 def _journal(release: Release, args: argparse.Namespace, fetch: Fetch | None) -> Journal:
     return Journal(
-        _sidecar(release.manifest, ".requests.csv"), fetch or sgml_fetch(), cap=args.max_requests
+        _sidecar(release.manifest, ".requests.csv"),
+        fetch or sgml_fetch(),
+        cap=args.max_requests,
+        workers=args.fetch_workers,
     )
 
 
@@ -1388,7 +1533,7 @@ def execute_unrepaired(plan: UnrepairedPlan, journal: Journal) -> Outcome:
     again with its reason."""
     rows: dict[Key, ManifestRow] = {}
     errors: dict[Key, str] = {}
-    journal.budget(plan.keys, "restamp-unrepaired")
+    journal.prefetch(_budgeted(journal, plan.keys, "restamp-unrepaired"), "restamp-unrepaired")
     for key in plan.keys:
         restamp_filing(plan.files, journal, rows, errors, key, "unrepaired list, filing by filing")
     unrepaired = [
@@ -1597,6 +1742,26 @@ def _date(text: str) -> date:
     return date.fromisoformat(text)
 
 
+def _workers(text: str) -> int:
+    n = int(text)
+    if not MIN_FETCH_WORKERS <= n <= MAX_FETCH_WORKERS:
+        raise argparse.ArgumentTypeError(
+            f"must be {MIN_FETCH_WORKERS} to {MAX_FETCH_WORKERS}, got {n}"
+        )
+    return n
+
+
+def _add_fetch_workers(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--fetch-workers",
+        type=_workers,
+        default=DEFAULT_FETCH_WORKERS,
+        help=f"SGML requests in flight ({MIN_FETCH_WORKERS} to {MAX_FETCH_WORKERS}; "
+        f"default {DEFAULT_FETCH_WORKERS}; 1 is one at a time), all behind the one "
+        "edgar.requests_per_second limiter (#2955)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The command line."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -1621,6 +1786,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--window-earlier-ok", type=Path, default=None, metavar="PRECHECK_JSON")
     r.add_argument("--apply", action="store_true")
     r.add_argument("--resume", action="store_true")
+    _add_fetch_workers(r)
     u = sub.add_parser(
         "restamp-unrepaired",
         help="re-stamp an unrepaired list from SGML, filing by filing (dry run unless --apply)",
@@ -1632,6 +1798,7 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--window-earlier-ok", type=Path, default=None, metavar="PRECHECK_JSON")
     u.add_argument("--apply", action="store_true")
     u.add_argument("--resume", action="store_true")
+    _add_fetch_workers(u)
     sc = sub.add_parser("store-ciks", help="write the cik,accession CSV of a store (read-only)")
     sc.add_argument("--store", type=Path, required=True)
     sc.add_argument("--out", type=Path, required=True)
