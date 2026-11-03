@@ -130,6 +130,8 @@ from tradepartner.backtest.portfolio import (
     target_weights,
 )
 from tradepartner.backtest.provider import (
+    DELISTING_REASON_COLUMNS,
+    MERGER_EXIT_COLUMNS,
     TURNOVER_BAR_COLUMNS,
     DataProvider,
     GapReading,
@@ -1577,6 +1579,19 @@ class _SharedReads:
         # the engine reads it once, at the cutoff, under `store` only (`_run_group`).
         return self._once(("rates", t, series), lambda: self._provider.rates(t, series))
 
+    def delisting_reasons(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        # Not a shared id read: made as asked, once per step for one `(t, ids)` (T328b).
+        return self._once(
+            ("delisting_reasons", t, tuple(ids)),
+            lambda: self._provider.delisting_reasons(t, ids),
+        )
+
+    def merger_exits(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        # Not a shared id read: made as asked, once per step for one `(t, ids)` (T328b).
+        return self._once(
+            ("merger_exits", t, tuple(ids)), lambda: self._provider.merger_exits(t, ids)
+        )
+
     def turnover_inputs(
         self, t: datetime, ids: Sequence[str], sessions_from: date
     ) -> TurnoverInputs:
@@ -1667,6 +1682,14 @@ class _Requests:
         # Not a keyed read: nothing is declared or read here; the empty frame has the
         # provider's columns (T170b, T170c).
         return pl.DataFrame(schema=_RATES_SCHEMA)
+
+    def delisting_reasons(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        # Not a signal read: nothing is declared or read here (T328b).
+        return pl.DataFrame(schema=list(DELISTING_REASON_COLUMNS))
+
+    def merger_exits(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        # Not a signal read: nothing is declared or read here (T328b).
+        return pl.DataFrame(schema=list(MERGER_EXIT_COLUMNS))
 
     def turnover_inputs(
         self, t: datetime, ids: Sequence[str], sessions_from: date
