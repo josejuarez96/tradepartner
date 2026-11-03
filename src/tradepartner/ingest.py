@@ -139,9 +139,12 @@ carry is derived from its own stored `revenue` and `cost_of_revenue`
 vintages at the filing's turn, unless the key is held or the filing's
 `GrossProfit` is on the source's `statement_conflict_keys`. Each CIK's rows
 go in one bulk insert, the frame's timestamps tz-checked once.
-`rebuild_statement_facts` first deletes every `statement_facts` row in the
-same transaction. The counts go into the run message as `statement_<name>:
-N` (`health.statement_counts`).
+`rebuild_statement_facts` replaces per CIK in the same transaction (#2956):
+a CIK's stored rows are deleted only once its read returned records, so a
+CIK whose read is empty (its statement cache missing) keeps its rows and,
+if it had any, is counted `rebuild_kept_empty_read` with its first CIKs
+listed; rows of a CIK the run does not ask stay too. The counts go into
+the run message as `statement_<name>: N` (`health.statement_counts`).
 
 **Filing events** (amendment 2026-10-09, #1358; plan T164e), only while
 `edgar.filing_events_enabled` is on (off, the default: no call, so no
@@ -154,9 +157,9 @@ insert per CIK, `known_at = accepted_at` (never the index's filing date). A
 form outside `edgar.event_forms` is never a row. A record accepted after the
 run's clock is skipped and counted `filing_events_not_yet_known`, never
 clamped and never fatal: `known_at = accepted_at` and `known_at <=
-ingested_at` cannot both hold for it. `rebuild_filing_events` first deletes
-every row in the same transaction and records the counts before and after.
-The counts go into the run message as `filing_events_<name>: N`
+ingested_at` cannot both hold for it. `rebuild_filing_events` replaces per
+CIK the same way (#2956), counted `rebuild_kept_empty_read`, and records
+the counts before and after. The counts go into the run message as `filing_events_<name>: N`
 (`health.filing_event_counts`), with the adapter's `unstamped`,
 `items_missing` and `clock_suspect` counts where the source exposes them.
 
@@ -5446,6 +5449,7 @@ class StatementCounts:
     restated: int = 0
     derived: int = 0
     deleted: int | None = None
+    kept_empty_read: list[str] | None = None
 
     def add(self, other: StatementCounts) -> None:
         """Fold one CIK's counts into the run's."""
@@ -5471,7 +5475,10 @@ class StatementCounts:
             value = getattr(source, f"statement_{name}", None)
             if value is not None:
                 figures.append((name, int(value)))
-        return "; " + ", ".join(f"statement_{name}: {n}" for name, n in figures)
+        text = ", ".join(f"statement_{name}: {n}" for name, n in figures)
+        if self.kept_empty_read is not None:
+            text += ", " + _kept_figure("statement_", self.kept_empty_read)
+        return "; " + text
 
 
 def _statement_key(record: StatementFactRecord) -> StatementKey:
@@ -5670,18 +5677,26 @@ def _write_statement_facts(
     *,
     rebuild: bool,
 ) -> StatementCounts:
-    """The write phase (module docstring): with `rebuild`, delete every row
-    first; then per CIK, one `statement_facts` read, its stored keys, its new
-    rows, and one bulk insert, holding one CIK's records at a time."""
+    """The write phase (module docstring): per CIK, one `statement_facts`
+    read, its stored keys, its new rows, and one bulk insert, holding one
+    CIK's records at a time. With `rebuild`, a CIK whose read returned
+    records has its stored rows deleted first, in the same transaction
+    (#2956); a CIK whose read is empty (a missing cache) keeps its rows and,
+    if it had any, is counted `rebuild_kept_empty_read`."""
     total = StatementCounts()
     if rebuild:
-        deleted = conn.execute("DELETE FROM statement_facts").fetchone()
-        total.deleted = int(deleted[0]) if deleted else 0
+        total.deleted = 0
+        total.kept_empty_read = []
     conflicts = _ConflictIndex(_unwrap(filings))
     for cik in ciks:
         records = filings.statement_facts(cik)
         if not records:
+            if total.kept_empty_read is not None and _has_rows(conn, "statement_facts", cik):
+                total.kept_empty_read.append(cik)
             continue
+        if total.deleted is not None:
+            deleted = conn.execute("DELETE FROM statement_facts WHERE cik = ?", [cik]).fetchone()
+            total.deleted += int(deleted[0]) if deleted else 0
         rows, counts = statement_fact_rows(
             records, _stored_vintages(conn, cik), conflicts.keys(), ingested_at=ingested_at
         )
@@ -5689,6 +5704,26 @@ def _write_statement_facts(
             insert_statement_frame(conn, statement_frame(rows))
         total.add(counts)
     return total
+
+
+#: How many of a rebuild's kept CIKs its run message lists by number (#2956).
+_KEPT_CIKS_LISTED = 5
+
+
+def _has_rows(conn: duckdb.DuckDBPyConnection, table: str, cik: str) -> bool:
+    """Whether `table` (`statement_facts` or `filing_events`) stores a row for `cik`."""
+    return (
+        conn.execute(f"SELECT 1 FROM {table} WHERE cik = ? LIMIT 1", [cik]).fetchone() is not None
+    )
+
+
+def _kept_figure(prefix: str, kept: Sequence[str]) -> str:
+    """`"<prefix>rebuild_kept_empty_read: N"`, with the first CIKs in
+    parentheses when any is kept (#2956)."""
+    figure = f"{prefix}rebuild_kept_empty_read: {len(kept)}"
+    if kept:
+        figure += f" (first: {' '.join(kept[:_KEPT_CIKS_LISTED])})"
+    return figure
 
 
 def _stored_vintages(
@@ -5752,6 +5787,7 @@ class FilingEventCounts:
     not_yet_known: int = 0
     before: int | None = None
     after: int | None = None
+    kept_empty_read: list[str] | None = None
 
     def message(self, source: FilingSource) -> str:
         """`"; filing_events_added: N, ..."` for the run row
@@ -5764,7 +5800,10 @@ class FilingEventCounts:
             value = getattr(source, f"filing_events_{name}", None)
             if value is not None:
                 figures.append((name, int(value if isinstance(value, int) else len(value))))
-        return "; " + ", ".join(f"filing_events_{name}: {n}" for name, n in figures)
+        text = ", ".join(f"filing_events_{name}: {n}" for name, n in figures)
+        if self.kept_empty_read is not None:
+            text += ", " + _kept_figure("filing_events_", self.kept_empty_read)
+        return "; " + text
 
 
 def filing_event_rows(
@@ -5814,18 +5853,24 @@ def _write_filing_events(
     *,
     rebuild: bool,
 ) -> FilingEventCounts:
-    """The filing-events write (module docstring): with `rebuild`, delete
-    every row first and record the counts before and after; then per CIK,
-    one `filing_events` read, its stored accessions, its new rows, and one
-    bulk insert."""
+    """The filing-events write (module docstring): per CIK, one
+    `filing_events` read, its stored accessions, its new rows, and one bulk
+    insert. With `rebuild`, record the counts before and after, and delete a
+    CIK's stored rows only once its read returned records, in the same
+    transaction (#2956); a CIK whose read is empty keeps its rows and, if it
+    had any, is counted `rebuild_kept_empty_read`."""
     total = FilingEventCounts()
     if rebuild:
         total.before = _event_count(conn)
-        conn.execute("DELETE FROM filing_events")
+        total.kept_empty_read = []
     for cik in ciks:
         records = filings.filing_events(cik)
         if not records:
+            if total.kept_empty_read is not None and _has_rows(conn, "filing_events", cik):
+                total.kept_empty_read.append(cik)
             continue
+        if rebuild:
+            conn.execute("DELETE FROM filing_events WHERE cik = ?", [cik])
         stored = {
             accession
             for (accession,) in conn.execute(
