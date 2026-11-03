@@ -80,7 +80,7 @@ t is the mean over its ordinary standard error (ddof 1), with no HAC.
 | Screen | 2016+ | 67/120 (55.8%) | −33.14% | above | pass / fail / pass |
 | Screen | 2020+ | 41/72 (56.9%) | −23.80% | above | pass / fail / pass |
 
-The 200% stress floors are VW 0.100 / 0.150 / 0.250 and screen 0.1667 / 0.2167 / 0.3833 (long / short / L/S). The worst 12 months in VW, −50.4%, falls inside 2020+ and so appears in all three VW windows; the same holds for the screen's −33.1% in 2009+ and 2016+.
+The 200% stress floors are VW 0.100 / 0.150 / 0.250 and screen 0.1667 / 0.2167 / 0.3833 (long / short / L/S). The worst 12 months in VW, −50.4%, falls inside 2020+ and so appears in all three VW windows; the screen's worst, −33.1%, falls in 2016–2019, so it appears in 2009+ and 2016+ but not in 2020+.
 
 ## Disconfirmation
 
@@ -93,7 +93,7 @@ The 200% stress floors are VW 0.100 / 0.150 / 0.250 and screen 0.1667 / 0.2167 /
 - The frozen rule needs both legs, and the short leg has no edge in any cell: t at most 0.36, negative in VW 2020+. The short leg is the half that carries borrow.
 - L/S t is under 1.0 in five of six cells, and the L/S path is volatile: the worst 12 months are −50% (VW) and −33% (screen).
 - The VW 2020+ cell, where value's rebound should show up, has an L/S of +0.09 with t 0.10. Its gain sits in the long leg, and the low-`cfp` decile outperformed the average.
-- `cfp` gives the same picture as XFIN in #2828: a long leg that may carry something, a short leg that is noise.
+- `cfp` is only partly like XFIN in #2828. There, the VW long leg carried something and the VW short leg was noise, while in the screen file the pattern reversed. Here the long-leg signal is in the screen file (VW long t only 0.53 to 1.03), and the short leg is noise in both.
 
 ## Caveats
 
@@ -130,7 +130,7 @@ A long-only `cfp` book would be a different candidate, with its own kill line wr
 ## Exploratory-cut ledger
 
 - **No extra return cuts.** Every figure above was named in the frozen comment, as a decision cell or as a reported-only line.
-- **Structure probe.** Before the freeze, one structure probe, `~/tradepartner-probes/cfp/structure.py`, selected `signalname`, `port` and `date` only, with no `ret`. A follow-up line read `SignalDoc.csv` metadata (Sign, category, sample years) for `cfp` and `BM`. Both outputs are in `structure.out`.
+- **Structure probe.** Before the freeze, one structure probe, `~/tradepartner-probes/cfp/structure.py`, selected `signalname`, `port` and `date` only, with no `ret`. A follow-up one-line command (not saved as a script) read `SignalDoc.csv` metadata (Sign, category, authors, sample years) for `cfp` and `BM` and appended it to `structure.out`. That part is not reproducible from `structure.py`; it involves no returns.
 - **Script.** `compute.py` was written after the freeze and run once on real data. There was no rerun and no edit after the run.
 
 ## UNVERIFIED
