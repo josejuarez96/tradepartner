@@ -329,6 +329,23 @@ def test_coregistrant_and_symbol_refusals_are_truncation_invariant() -> None:
                     coregistrant,
                 )
             )
+    # The subsidiary's own stand-alone 10-K before the combined years: a rule
+    # that read a later filing's co-registrancy would refuse it.
+    own_at = datetime(2015, 2, 24, 21, 0, tzinfo=UTC)
+    index.append(FilingIndexEntry(subsidiary, f"Co {subsidiary}", "10-K", "own-2015", own_at))
+    names.append(
+        FilenameListing(
+            subsidiary,
+            "own-2015",
+            "10-K",
+            own_at,
+            own_at.date(),
+            "amr",
+            "NYSE",
+            "Common Stock",
+            None,
+        )
+    )
     cover_at = datetime(2019, 2, 25, 21, 0, tzinfo=UTC)
     source = FixtureFilingSource(
         index=index,
@@ -349,6 +366,7 @@ def test_coregistrant_and_symbol_refusals_are_truncation_invariant() -> None:
 
     full = named(build_master(source, settings, ingested_at=ingested_at))
     assert full == [
+        (subsidiary, "AMR", own_at),
         (parent, "AAL", datetime(2016, 2, 24, 21, 0, tzinfo=UTC)),
         (parent, "AAL", datetime(2018, 2, 24, 21, 0, tzinfo=UTC)),
     ]

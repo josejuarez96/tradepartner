@@ -364,6 +364,26 @@ def test_filename_form25_row_takes_the_first_session_not_the_recorded_date() -> 
     assert [(r["ticker"], r["valid_from"]) for r in rows] == [("EXIT", first_session(settings))]
 
 
+def test_filename_form25_exhibit_name_that_is_no_symbol_writes_no_row() -> None:
+    """#2941: a Form 25 exhibit file name outside the symbol shape is
+    residue, not a ticker: no row, counted with the 10-K refusals."""
+    cik = "0000000991"
+    exit_at = _at(2018, 6, 1)
+    source = FixtureFilingSource(
+        index=[FilingIndexEntry(cik, "Exit", "S-1", "s1", exit_at)],
+        delistings=[DelistingFiling(cik, "25-NSE", "Common Stock", "NASDAQ", "exit", exit_at)],
+        filename_listings=[
+            FilenameListing(
+                cik, "exit", "25-NSE", exit_at, date(2018, 6, 1), "exit2018", "NASDAQ", None, None
+            )
+        ],
+    )
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    assert not [r for r in on.listings if r["provenance"] == "filing_name"]
+    assert on.filename_counts["filename_refused_symbol"] == 1
+    assert on.filename_counts.get("filename_form25_rows", 0) == 0
+
+
 def test_filename_form25_is_last_resort_and_makes_delisting_resolve() -> None:
     annual_cik, fallback_cik = "0000000997", "0000000996"
     annual_at, exit_at = _at(2016, 3, 1), _at(2018, 6, 1)
@@ -453,6 +473,7 @@ def test_filename_coregistrant_and_leftover_prefixes_write_no_row_and_are_counte
     message = _filename_counts(on, delistings, source)
     assert "filename_refused_coregistrant: 1" in message
     assert "filename_refused_symbol: 1" in message
+    assert "filename_entity_unknown: 0" in message  # the fixture source counts none
 
 
 def test_filename_confirmation_uses_first_cover_filing_only() -> None:

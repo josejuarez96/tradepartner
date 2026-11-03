@@ -183,6 +183,7 @@ from tradepartner.store.filename_listings import (
     IndependentReading,
     confirm_filename_listings,
     is_filename_listing_refused,
+    is_filename_symbol,
     normalize_ticker,
 )
 from tradepartner.store.journal import CLOSING_STOP_STATES
@@ -1554,6 +1555,9 @@ def _filename_rows(
             continue
         filing = next((f for f in delistings if f.accession == record.accession), None)
         if filing is None:
+            continue
+        if not is_filename_symbol(record.ticker):
+            counts["filename_refused_symbol"] += 1  # #2941: an exhibit name, not a symbol
             continue
         ticker = normalize_ticker(record.ticker)
         sid = class_by_ticker.get(ticker, cik)

@@ -3394,6 +3394,35 @@ def test_filename_ten_k_fsn_keys_to_another_cik_is_a_coregistrants(tmp_path: Pat
     assert missing.filename_fsn_missing == 1
 
 
+def test_filename_ten_k_whose_cover_cache_names_another_entity_is_a_coregistrants(
+    tmp_path: Path,
+) -> None:
+    """#2941: the per-document cover cache naming another entity marks the
+    copy too, with no FSN entry anywhere."""
+    source = _fn_source(tmp_path, _fn_router())
+    path = source._fsn_cache_path(_FN_CIK)
+    data = json.loads(path.read_text())
+    del data["records"][_FN_A]
+    path.write_text(json.dumps(data))
+    edgar_raw.write_atomic(
+        source._cover_cache_path(_FN_A),
+        json.dumps(
+            {
+                "version": edgar_source_module.COVER_VERSION,
+                "accession": _FN_A,
+                "cik": _FN_CIK,
+                "entity_cik": "0000006201",
+                "listings": [],
+                "facts": [],
+            }
+        ).encode(),
+    )
+    listings = {e.accession: e for e in source.filename_listings(_FN_CIK)}
+    assert listings[_FN_A].coregistrant
+    assert not listings[_FN_B].coregistrant
+    assert source.filename_fsn_missing == 0
+
+
 @pytest.mark.parametrize("broken", ["index_404", "index_malformed", "document_404"])
 def test_filename_failed_fetch_is_counted_cached_nowhere_and_asked_again(
     tmp_path: Path, broken: str
