@@ -410,11 +410,17 @@ def _ended_listing(
             target = max(retagged, key=lambda r: r["valid_from"])
     if target["class_title"] is None and not _is_plain_title(delisting["class_title"]):
         return None
-    if _is_debt_title(delisting["class_title"]) and (
-        target["class_title"] is None or _is_common(target["class_title"])
-    ):
-        return None  # a notes filing never ends the common listing (#2937)
+    if _spares(delisting, target):
+        return None
     return target
+
+
+def _spares(delisting: Row, listing: Row) -> bool:
+    """Whether `delisting` names a debt class and `listing` is a common or
+    untitled one: a notes filing never ends the common listing (#2937), whether
+    it lands on it directly or through a later row it would re-open."""
+    title = listing["class_title"]
+    return _is_debt_title(delisting["class_title"]) and (title is None or _is_common(title))
 
 
 def _reopened(
@@ -439,6 +445,7 @@ def _reopened(
                 for closed, filing in closers
                 if closed["exchange"] == row["exchange"]
                 and _filing_session(filing["filed_at"]) < row["valid_from"]
+                and not _spares(filing, row)
             ]
             if not before:
                 continue

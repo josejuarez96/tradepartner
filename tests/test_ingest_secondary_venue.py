@@ -44,6 +44,8 @@ CASES: dict[str, list[tuple[str, date, datetime]]] = {
     "ONLYCHI": [("NYSE_CHICAGO", *OLD)],
     "ARCA": [("NYSE_ARCA", *OLD), ("NYSE_CHICAGO", *NEW)],
     "PLAIN": [("NYSE", *OLD)],
+    # Its NYSE row is ended by a Form 25 filed in 2022, after the June 2021 window.
+    "LATEEND": [("NYSE", *OLD), ("NYSE_CHICAGO", *NEW)],
     # The list row is known only after T: at T the name has one Chicago row.
     "LATEOLD": [("NYSE", OLD[0], LATE_KNOWN), ("NYSE_CHICAGO", *NEW)],
 }
@@ -84,6 +86,38 @@ def _build(
                     **COMMON,
                 },
             )
+    insert_row(
+        conn,
+        "delistings",
+        {
+            "security_id": "LATEEND",
+            "form": "25",
+            "class_title": "Common Stock",
+            "exchange": "NYSE",
+            "filed_at": datetime(2022, 2, 3, 21, tzinfo=UTC),
+            "effective_on": date(2022, 2, 13),
+            "known_at": datetime(2022, 2, 3, 21, tzinfo=UTC),
+            **COMMON,
+        },
+    )
+    # A bar after the filing's effective date: the filing ends the NYSE line (no
+    # re-tag onto the Chicago row), and no bar of it falls before the Chicago row.
+    insert_row(
+        conn,
+        "prices_daily",
+        {
+            "security_id": "LATEEND",
+            "session": date(2022, 3, 1),
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.0,
+            "close": 10.0,
+            "volume": 1000,
+            "known_at": datetime(2022, 3, 1, 22, tzinfo=UTC),
+            **COMMON,
+            "provenance": "bar",
+        },
+    )
     # ENDED: a Form 25 for its NYSE class long before the Chicago row.
     insert_row(
         conn,
@@ -132,7 +166,8 @@ def test_a_backfill_window_fetches_such_a_name_too(conn: duckdb.DuckDBPyConnecti
     )
     assert set(ids) >= FETCHED
     assert set(listed) >= FETCHED
-    assert not REFUSED & set(ids)
+    # ENDED has no end session known, which the backfill reads as still live.
+    assert not (REFUSED - {"ENDED"}) & set(ids)
 
 
 def test_a_row_known_after_t_moves_nothing(conn: duckdb.DuckDBPyConnection) -> None:
@@ -142,3 +177,18 @@ def test_a_row_known_after_t_moves_nothing(conn: duckdb.DuckDBPyConnection) -> N
     assert "LATEOLD" not in _price_names(conn, NOW, SESSION, settings)[0]
     later = datetime(2021, 10, 1, 21, tzinfo=UTC)
     assert "LATEOLD" in _price_names(conn, later, date(2021, 9, 30), settings)[0]
+
+
+def test_a_backfill_month_before_the_delisting_still_fetches_the_name(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """The window is judged by its own sessions, not by today's status: LATEEND's
+    NYSE row is delisted only in 2022, so June 2021 is a month it was live on
+    the list and its newer Chicago row must not hide it."""
+    later = datetime(2022, 6, 1, 21, tzinfo=UTC)
+    window = (date(2021, 6, 1), date(2021, 6, 29))
+    ids, listed, *_ = _window_names(
+        conn, later, window, Settings(_env_file=None), ListingResolver([])
+    )
+    assert "LATEEND" in ids
+    assert "LATEEND" in listed

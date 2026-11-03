@@ -727,6 +727,23 @@ class TestDebtFilingOnCommonListing:
         row = _status(listing_ends_as_of(synthetic, LATE, _settings()), "S", "NYSE")
         assert (row["status"], row["end_session"]) == ("listed", None)
 
+    def test_notes_filing_does_not_reopen_close_a_later_common_row(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        """The notes row is ended by its filing; a common row of the same
+        security and exchange that starts after the filing is not closed by it."""
+        notes = "2.375% Notes due 2022"
+        insert_row(synthetic, "listings", _row("S", "VZ22A", "NYSE", date(2019, 10, 30), notes))
+        insert_row(
+            synthetic,
+            "listings",
+            _row("S", "VZ", "NYSE", date(2020, 7, 1), "Common Stock, par value $0.10"),
+        )
+        insert_row(synthetic, "delistings", _form_25("S", "NYSE", _ny(2020, 6, 15, 16, 43), notes))
+        df = listing_ends_as_of(synthetic, LATE, _settings())
+        by_ticker = {r["ticker"]: r["status"] for r in df.iter_rows(named=True)}
+        assert by_ticker == {"VZ22A": "delisted", "VZ": "listed"}
+
     def test_notes_filing_still_ends_the_notes_listing(
         self, synthetic: duckdb.DuckDBPyConnection
     ) -> None:

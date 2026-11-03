@@ -123,7 +123,7 @@ import math
 import re
 import statistics
 from collections import defaultdict
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from functools import cache
@@ -344,17 +344,24 @@ def _current_listings(
 
 
 def on_list_ids(
-    rows: Iterable[Mapping[str, Any]], exchanges: Collection[str], session: date
+    rows: Iterable[Mapping[str, Any]],
+    exchanges: Collection[str],
+    session: date,
+    *,
+    live: Callable[[Mapping[str, Any]], bool] | None = None,
 ) -> set[str]:
     """The securities with a row at or before `session` that is live at it on
     a venue in `exchanges` (rows with `status` and `end_session`, as
     `listing_ends_as_of` gives): the securities a newer secondary-quote row
     does not take off the list (T196; the bar fetch reads the same rule,
-    #2937)."""
+    #2937). `live` replaces the status test at `session` (a backfill window
+    judges a row by the window, not by today's status)."""
     return {
         row["security_id"]
         for row in rows
-        if row["valid_from"] <= session and row["exchange"] in exchanges and _is_live(row, session)
+        if row["valid_from"] <= session
+        and row["exchange"] in exchanges
+        and (live(row) if live is not None else _is_live(row, session))
     }
 
 
