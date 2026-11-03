@@ -1372,6 +1372,8 @@ class _Recorded(FilingSource):
     def __init__(self, source: FilingSource) -> None:
         self._source = source
         self._answers: dict[tuple[Any, ...], Any] = {}
+        #: #2927: the recorded full index, grouped by CIK, keyed to the answer it groups.
+        self._index_by_cik: tuple[Any, dict[str, list[FilingIndexEntry]]] | None = None
         self._statement_filled: set[str] = set()  # #660: which CIKs, never the records
         self._events_asked: set[str] = set()  # #1358: which CIKs, never the records
         self.frozen = False
@@ -1405,7 +1407,15 @@ class _Recorded(FilingSource):
         """Keep the source's bounded CIK query through the fetch-pass recorder."""
         if callable(getattr(self._source, "filing_index_for_cik", None)):
             return list(self._ask("filing_index_for_cik", cik))
-        return [entry for entry in self._ask("filing_index", None) if entry.cik == cik]
+        # #2927: the recorded full index grouped once, not a scan of it per CIK.
+        entries = self._ask("filing_index", None)
+        grouped = self._index_by_cik
+        if grouped is None or grouped[0] is not entries:
+            by_cik: dict[str, list[FilingIndexEntry]] = {}
+            for entry in entries:
+                by_cik.setdefault(entry.cik, []).append(entry)
+            grouped = self._index_by_cik = (entries, by_cik)
+        return list(grouped[1].get(cik, ()))
 
     def filing_index_for_forms(self, forms: Collection[str]) -> list[FilingIndexEntry]:
         """Keep cross-CIK form queries bounded and deterministic."""
@@ -4566,21 +4576,21 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
     # `filing_name` row, none of that CIK's on the Form 25's exchange (a 12(b)
     # text read differently). One on a listed exchange that names another class
     # (a warrant) is no mismatch.
+    # #2927: the `filing_name` rows grouped once, by CIK and by security,
+    # so each Form 25 reads its own rows, not every listing row.
+    named_by_cik: dict[str, list[Row]] = defaultdict(list)
+    named_by_id: dict[str, list[Row]] = defaultdict(list)
+    for listing in master.listings:
+        if listing["provenance"] == "filing_name":
+            named_by_cik[security_cik(listing["security_id"])].append(listing)
+            named_by_id[listing["security_id"]].append(listing)
     counts["filename_form25_unmatched"] = sum(
         1
         for row in delistings.unmatched
-        if any(
-            security_cik(listing["security_id"]) == row.cik
-            and listing["provenance"] == "filing_name"
-            and listing["known_at"] <= row.accepted_at
-            for listing in master.listings
-        )
+        if any(listing["known_at"] <= row.accepted_at for listing in named_by_cik.get(row.cik, ()))
         and not any(
-            security_cik(listing["security_id"]) == row.cik
-            and listing["provenance"] == "filing_name"
-            and listing["known_at"] <= row.accepted_at
-            and listing["exchange"] == row.exchange
-            for listing in master.listings
+            listing["known_at"] <= row.accepted_at and listing["exchange"] == row.exchange
+            for listing in named_by_cik.get(row.cik, ())
         )
     )
     counts["filename_transfers_delisted"] = sum(
@@ -4588,11 +4598,8 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
         for row in delistings.delistings
         if row["filed_at"].year < 2019
         and any(
-            listing["security_id"] == row["security_id"]
-            and listing["exchange"] != row["exchange"]
-            and listing["known_at"] > row["filed_at"]
-            and listing["provenance"] == "filing_name"
-            for listing in master.listings
+            listing["exchange"] != row["exchange"] and listing["known_at"] > row["filed_at"]
+            for listing in named_by_id.get(row["security_id"], ())
         )
     )
     source = _unwrap(filings)
