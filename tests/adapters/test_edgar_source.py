@@ -17,10 +17,11 @@ import io
 import json
 import shutil
 import zipfile
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 import httpx
@@ -3615,3 +3616,244 @@ def test_pending_settle_check_uses_first_known_filed_on_quarter(
     assert source.delistings() == []
     cik_25, _, accession_25 = rows[1]
     assert accession_25 not in source._load_stamps(cik_25)
+
+
+# --- #2920: the per-CIK fallback groups the walked index once ---------------
+
+
+class _CountingEntries(tuple[FilingIndexEntry, ...]):
+    """The walked index, counting each full pass over it."""
+
+    passes = 0
+
+    def __iter__(self) -> Iterator[FilingIndexEntry]:
+        type(self).passes += 1
+        return super().__iter__()
+
+
+def _interleaved_index(ciks: int, per_cik: int) -> list[FilingIndexEntry]:
+    """`ciks * per_cik` entries in the walk's (accepted_at, accession, cik)
+    order, each CIK's rows spread across the whole list."""
+    start = datetime(2001, 1, 2, 14, 30, tzinfo=UTC)
+    entries = [
+        FilingIndexEntry(
+            f"{c + 1:010d}",
+            f"CO {c}",
+            ("10-K", "8-K", "10-Q")[(c + n) % 3],
+            f"{c + 1:010d}-{n // 100:02d}-{n:06d}",
+            start + timedelta(minutes=n * ciks + (c * 7919) % ciks),
+        )
+        for c in range(ciks)
+        for n in range(per_cik)
+    ]
+    return sorted(entries, key=lambda e: (e.accepted_at, e.accession, e.cik))
+
+
+def test_per_cik_fallback_equals_the_full_index_filter_in_order(settings: Settings) -> None:
+    """#2920: with no stored index, each CIK's rows are exactly the old
+    `[e for e in filing_index() if e.cik == cik]`, in the same order, an
+    unknown CIK has none, and a caller's edit never reaches the next read."""
+    source = _source(settings, EdgarRouter())
+    walked = _interleaved_index(ciks=60, per_cik=25)
+    source._filing_index_entries = tuple(walked)
+    for cik in sorted({e.cik for e in walked}):
+        assert source.filing_index_for_cik(cik) == [e for e in walked if e.cik == cik]
+    assert source.filing_index_for_cik("0000999999") == []
+    first = walked[0].cik
+    source.filing_index_for_cik(first).clear()
+    assert source.filing_index_for_cik(first) == [e for e in walked if e.cik == first]
+
+
+def test_per_cik_fallback_follows_a_rebuilt_index(settings: Settings) -> None:
+    """#2920: the grouping is of the entries the source holds now; a rebuilt
+    index (a new walk, `use_index`) is never answered from the old one."""
+    source = _source(settings, EdgarRouter())
+    walked = _interleaved_index(ciks=5, per_cik=4)
+    source._filing_index_entries = tuple(walked)
+    cik = walked[0].cik
+    assert len(source.filing_index_for_cik(cik)) == 4
+    kept = tuple(e for e in walked if e.cik != cik or e.form == "10-K")
+    source._filing_index_entries = kept
+    assert source.filing_index_for_cik(cik) == [e for e in kept if e.cik == cik]
+
+
+def test_per_cik_fallback_on_the_real_walk_equals_the_filter(settings: Settings) -> None:
+    """#2920: on the quarterly walk itself, every CIK's answer is the filter."""
+    source = _source(settings, _router())
+    entries = source.filing_index()
+    assert entries
+    for cik in {e.cik for e in entries}:
+        assert source.filing_index_for_cik(cik) == [e for e in entries if e.cik == cik]
+
+
+def test_per_cik_fallback_reads_the_whole_index_once_for_every_cik(settings: Settings) -> None:
+    """#2920 (T323a regression): `classify._evidence` asks once per issuer CIK.
+    With `edgar.incremental_index` off each ask copied and scanned the whole
+    multi-million-row index, about 1.2 s per CIK over ~58k CIKs. 200k entries
+    over 20k CIKs now take one pass, however many CIKs are asked."""
+    source = _source(settings, EdgarRouter())
+    walked = _interleaved_index(ciks=20_000, per_cik=10)
+    _CountingEntries.passes = 0
+    source._filing_index_entries = _CountingEntries(walked)
+    ciks = sorted({e.cik for e in walked})
+    answered = sum(len(source.filing_index_for_cik(cik)) for cik in ciks)
+    assert answered == len(walked)
+    assert _CountingEntries.passes == 1
+
+
+# --- #2920: the stored index is read once per binding, not once per CIK -----
+
+
+class _CountingConn:
+    """A store connection counting each query the source sends it."""
+
+    def __init__(self, conn: duckdb.DuckDBPyConnection) -> None:
+        self._conn = conn
+        self.queries = 0
+
+    def execute(self, sql: str, params: Any = None) -> Any:
+        self.queries += 1
+        return self._conn.execute(sql, params or [])
+
+
+_EXCHANGE = "0000000777"  # an exchange: files 25-NSEs listed under itself and the issuer
+
+
+def _stored_index_fixture(ciks: int) -> tuple[duckdb.DuckDBPyConnection, list[str]]:
+    """Issuers with 10-K/8-K/4 history, some delisted by the exchange's
+    shared 25-NSE (the exchange's copy), a revision, filer-only CIKs and
+    pending rows."""
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    names = [f"{9000 + c:010d}" for c in range(ciks)]
+    listings: list[stored_index.Listing] = []
+    for c, cik in enumerate(names):
+        for n, form in enumerate(("10-K", "8-K", "4") if c % 5 else ("SC 13D", "4")):
+            on = date(2026, 9, 1) + timedelta(days=(c + n) % 20)
+            listings.append(
+                stored_index.Listing(
+                    cik,
+                    f"{cik}-26-{n:06d}",
+                    form,
+                    f"Co {c}",
+                    on,
+                    datetime(2026, 9, 1, 14, tzinfo=UTC) + timedelta(minutes=(c * 37 + n) % 900),
+                    on,
+                    True,
+                    n,
+                )
+            )
+        if c % 7 == 3:
+            accession = f"{_EXCHANGE}-26-{c:06d}"
+            for position, listed in enumerate((_EXCHANGE, cik)):
+                listings.append(
+                    stored_index.Listing(
+                        listed,
+                        accession,
+                        "25-NSE",
+                        "Exchange" if listed == _EXCHANGE else f"Co {c}",
+                        date(2026, 9, 21),
+                        datetime(2026, 9, 21, 15, tzinfo=UTC),
+                        date(2026, 9, 21),
+                        True,
+                        position,
+                    )
+                )
+    stored_index.insert_listings(conn, listings, CLOCK - timedelta(days=2))
+    revised = [
+        replace(row, filed_on=row.filed_on + timedelta(days=1), listed_on=date(2026, 9, 23))
+        for row in listings[:: max(1, len(listings) // 10)]
+    ]
+    stored_index.insert_listings(conn, revised, CLOCK - timedelta(days=1))
+    conn.executemany(
+        "INSERT INTO filing_index_pending "
+        "(cik, accession, form, company_name, filed_on, listed_on) "
+        "VALUES (?, ?, ?, 'Issuer', ?, ?)",
+        [
+            (cik, f"{cik}-26-{900:06d}", "10-K", date(2026, 9, 24), date(2026, 9, 24))
+            for cik in names[1::9]
+        ],
+    )
+    return conn, [*names, _EXCHANGE]
+
+
+def _stored_answers(source: EdgarFilingSource, ciks: list[str]) -> list[Any]:
+    return [
+        (
+            cik,
+            source.filing_index_for_cik(cik),
+            source._index_for_cik(cik, first=True),
+            source._is_issuer_cik(cik),
+        )
+        for cik in ciks
+    ]
+
+
+def test_stored_reads_in_one_scan_equal_the_per_cik_reads(tmp_path: Path) -> None:
+    """#2920: the one-scan reads give every CIK exactly what reading it alone
+    gives (rows, order, issuer rule, the exchange's 25-NSE copy dropped), and
+    the full history equals the per-CIK answers."""
+    settings = edgar_settings(tmp_path)
+    conn, ciks = _stored_index_fixture(60)
+    fresh = stored_index.Listing(
+        ciks[2], f"{ciks[2]}-26-000500", "8-K", "Co 2", CLOCK.date(), CLOCK, CLOCK.date(), True
+    )
+    bulk = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    bulk.use_index(conn, [fresh])
+    alone = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    alone.use_index(conn, [fresh], touched_ciks=frozenset())  # every CIK read by itself
+    expected = _stored_answers(alone, ciks)
+    assert _stored_answers(bulk, ciks) == expected
+    assert any(not issuer for *_, issuer in expected) and any(e[1] for e in expected)
+    shared = [e for e in bulk.filing_index() if e.form == "25-NSE"]
+    assert shared and all(e.cik != _EXCHANGE for e in shared)
+    for accession in {e.accession for e in shared}:
+        assert bulk._table_ciks_of(accession) == {
+            row.cik for row in stored_index.accession_listing_order(conn, accession, CLOCK)
+        }
+    walked = bulk.filing_index()
+    for cik in ciks:
+        assert [e for e in walked if e.cik == cik] == alone.filing_index_for_cik(cik)
+    assert sorted(bulk.unstamped_filings, key=lambda r: r.accession) == sorted(
+        alone._pending_rows(), key=lambda r: r.accession
+    )
+
+
+def test_a_touched_binding_reads_its_touched_issuers_in_one_scan(tmp_path: Path) -> None:
+    """#2920: an incremental binding reads its touched issuers together and
+    any other CIK alone, never the whole table for a few CIKs."""
+    settings = edgar_settings(tmp_path)
+    conn, ciks = _stored_index_fixture(40)
+    counting = _CountingConn(conn)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    touched = frozenset(ciks[:10])
+    source.use_index(cast(duckdb.DuckDBPyConnection, counting), touched_ciks=touched)
+    for cik in sorted(touched):
+        source.filing_index_for_cik(cik)
+    after_touched = counting.queries
+    source.filing_index_for_cik(ciks[21])
+    assert source._stored.loaded >= touched & source._stored_issuer_ciks()
+    assert ciks[30] not in source._stored.loaded
+    assert counting.queries > after_touched  # the untouched CIK was read alone
+
+
+@pytest.mark.parametrize("ciks", [50, 500])
+def test_stored_per_cik_reads_take_a_fixed_number_of_queries(tmp_path: Path, ciks: int) -> None:
+    """#2920 (T323a): once T324 seeds the table, every `cik=` read is a scan
+    of ~15M rows, and `classify._evidence`, `_read_stamps` and the full
+    history asked one or more per CIK (~58k). The queries per run no longer
+    grow with the CIK count."""
+    settings = edgar_settings(tmp_path)
+    conn, names = _stored_index_fixture(ciks)
+    counting = _CountingConn(conn)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    source.use_index(cast(duckdb.DuckDBPyConnection, counting))
+    issuers = 0
+    for cik in names:
+        source.filing_index_for_cik(cik)
+        if source._is_issuer_cik(cik):  # a filer-only CIK is still read alone
+            issuers += 1
+            source._index_for_cik(cik, first=True)
+    source.filing_index()
+    assert issuers > ciks // 2
+    assert counting.queries <= 10, counting.queries  # was 337 (50 CIKs), 3,280 (500)
