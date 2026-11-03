@@ -643,6 +643,9 @@ class _Builder:
         self.static = set(settings.master.static_columns) >= _STATIC_LISTING_COLUMNS
         self.securities: list[Row] = []
         self.listings: list[Row] = []
+        # #2927: `listings` by `security_cik`, in `listings` order, so a
+        # per-CIK read is never a walk of every row the build has made.
+        self._listings_by_cik: dict[str, list[Row]] = defaultdict(list)
         self.unmatched: list[CompanySnapshotEntry] = []
         self.successions: list[Succession] = []
         self.class_titles: dict[tuple[str, str], ClassTitle] = {}  # first per (id, title)
@@ -676,16 +679,20 @@ class _Builder:
         source: str = _EDGAR,
         provenance: str = "filing",
     ) -> None:
-        self.listings.append(
-            {
-                "security_id": security_id,
-                "ticker": ticker,
-                "exchange": exchange,
-                "class_title": class_title,
-                "valid_from": valid_from,
-            }
-            | _row(known_at, self.ingested_at, source, provenance)
-        )
+        row = {
+            "security_id": security_id,
+            "ticker": ticker,
+            "exchange": exchange,
+            "class_title": class_title,
+            "valid_from": valid_from,
+        } | _row(known_at, self.ingested_at, source, provenance)
+        self.listings.append(row)
+        self._listings_by_cik[security_cik(security_id)].append(row)
+
+    def cik_listings(self, cik: str) -> Sequence[Row]:
+        """`[row for row in self.listings if security_cik(row["security_id"]) == cik]`,
+        without the walk (#2927)."""
+        return self._listings_by_cik.get(cik, ())
 
     def cover_pages(
         self,
@@ -1051,6 +1058,24 @@ def _filing_index_for_cik(source: FilingSource, cik: str) -> list[FilingIndexEnt
     return [entry for entry in source.filing_index() if entry.cik == cik]
 
 
+def _filing_index_by_cik(
+    source: FilingSource, ciks: Iterable[str]
+) -> dict[str, list[FilingIndexEntry]]:
+    """`_filing_index_for_cik` for each of `ciks`, keyed by CIK (#2927).
+
+    A source with no CIK query has its full index read once for all of
+    `ciks`, each CIK's entries in index order, never once per CIK."""
+    wanted = set(ciks)
+    reader = getattr(source, "filing_index_for_cik", None)
+    if callable(reader):
+        return {cik: cast(list[FilingIndexEntry], reader(cik)) for cik in sorted(wanted)}
+    grouped: dict[str, list[FilingIndexEntry]] = {cik: [] for cik in sorted(wanted)}
+    for entry in source.filing_index():
+        if entry.cik in wanted:
+            grouped[entry.cik].append(entry)
+    return grouped
+
+
 def _filing_index_for_forms(source: FilingSource, forms: Collection[str]) -> list[FilingIndexEntry]:
     """Use a store-backed cross-CIK form query when offered."""
     reader = getattr(source, "filing_index_for_forms", None)
@@ -1081,8 +1106,17 @@ def build_master(
     issuer_forms = set(settings.master.issuer_forms)
     first: dict[str, FilingIndexEntry] = {}
     marks: dict[str, dict[str, list[datetime]]] = defaultdict(lambda: defaultdict(list))
-    index = source.filing_index()  # full history, never `since` (spec req 3)
-    for entry in index:
+    # #2927: each CIK's filename-route forms, grouped in this one pass (a
+    # per-CIK filter of the ~15M-entry index was ~0.8 s x ~58k CIKs).
+    filename_forms = (
+        frozenset(settings.edgar.filename_listing_forms)
+        if settings.edgar.filename_listings
+        else frozenset()
+    )
+    filename_index: dict[str, list[FilingIndexEntry]] = defaultdict(list)
+    for entry in source.filing_index():  # full history, never `since` (spec req 3)
+        if entry.form in filename_forms:
+            filename_index[entry.cik].append(entry)
         if entry.form in _MARKER_FORMS:
             marks[entry.cik][entry.form].append(entry.accepted_at)
         if entry.form not in issuer_forms:
@@ -1134,7 +1168,7 @@ def build_master(
                 pages,
                 source.filename_listings(cik),
                 cik in getattr(source, "filename_incomplete_ciks", ()),
-                [item for item in index if item.cik == cik],
+                filename_index.get(cik, ()),
                 delistings.get(cik, ()),
                 filename_form25_accessions,
                 filename_counts,
@@ -1200,8 +1234,10 @@ def build_chains(
         return ChainBuild((), ())
     index = {
         (entry.cik, entry.accession): entry
-        for successor_cik in {security_cik(successor) for _, successor, _ in entries}
-        for entry in _filing_index_for_cik(source, successor_cik)
+        for found in _filing_index_by_cik(
+            source, {security_cik(successor) for _, successor, _ in entries}
+        ).values()
+        for entry in found
     }
     securities = {row["security_id"]: row for row in master.securities}
     listings: dict[str, list[Row]] = defaultdict(list)
@@ -1404,7 +1440,7 @@ def _filename_rows(
     class_by_ticker = {ticker: cls.security_id for cls in classes for ticker, _ in cls.pairs}
     first_page_classes = {
         (row["ticker"], row["exchange"]): row["security_id"]
-        for row in builder.listings
+        for row in builder.cik_listings(cik)  # #2927: this CIK's rows, not every row
         if first_page is not None
         and row["known_at"] == first_page.accepted_at
         and security_cik(row["security_id"]) == cik  # #1662: no other CIK's same-second row
@@ -1481,9 +1517,9 @@ def _filename_rows(
             provenance="filing_name",
         )
     if first_page_classes:
-        read_classes = {
+        read_classes = {  # #2927: `first_page_classes` holds only `cik`'s ids
             row["security_id"]
-            for row in builder.listings
+            for row in builder.cik_listings(cik)
             if row["provenance"] == "filing_name" and row["known_at"] < first_at
         }
         counts["filename_class_unread"] += len(set(first_page_classes.values()) - read_classes)
@@ -1501,7 +1537,7 @@ def _filename_rows(
             and r["ticker"] == record.ticker.upper()
             and r["valid_from"] <= session_of(record.accepted_at)
             and r["known_at"] <= record.accepted_at
-            for r in builder.listings
+            for r in builder.cik_listings(security_cik(sid))  # #2927: `sid`'s CIK only
         ):
             continue
         builder.listing(

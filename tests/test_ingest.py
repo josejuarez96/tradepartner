@@ -115,7 +115,7 @@ from tradepartner.store.classify import build_classifications, classifications_a
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.filing_index import FilingRow
 from tradepartner.store.filing_index import by_cik as stored_index_by_cik
-from tradepartner.store.master import Chain, MasterBuild, build_chains, build_master
+from tradepartner.store.master import Chain, MasterBuild, build_chains, build_master, security_cik
 from tradepartner.store.retraction import retraction
 from tradepartner.store.schema import init_schema
 
@@ -11104,3 +11104,151 @@ def test_index_manifest_credits_a_stamped_pending_row_only_to_a_body_that_lists_
         False,
     )
     assert [row["key"][1] for row in entry["rows"]] == [listed.accession]
+
+
+# --- #2927: per-CIK reads of a full list group it once ----------------------
+
+
+class _CountingIndex(tuple[FilingIndexEntry, ...]):
+    """A full filing index, counting each pass over it."""
+
+    passes = 0
+
+    def __iter__(self) -> Iterator[FilingIndexEntry]:
+        type(self).passes += 1
+        return super().__iter__()
+
+
+class _NoCikQuery:
+    """A source with only a full index (no `filing_index_for_cik`)."""
+
+    def __init__(self, entries: Sequence[FilingIndexEntry]) -> None:
+        self.entries = entries
+
+    def filing_index(self, since: datetime | None = None) -> Sequence[FilingIndexEntry]:
+        return self.entries
+
+
+def _spread_index(ciks: int, per_cik: int) -> list[FilingIndexEntry]:
+    entries = [
+        FilingIndexEntry(
+            f"{c + 1:010d}",
+            f"Co {c}",
+            ("10-K", "8-K", "4")[(c + n) % 3],
+            f"{c + 1:010d}-{n:02d}-{c:06d}",
+            _at(2010, 1, 4) + timedelta(minutes=n * ciks + (c * 7919) % ciks),
+        )
+        for c in range(ciks)
+        for n in range(per_cik)
+    ]
+    return sorted(entries, key=lambda e: (e.accepted_at, e.accession, e.cik))
+
+
+def test_recorded_per_cik_fallback_groups_the_index_once_in_order() -> None:
+    """#2927: `_Recorded.filing_index_for_cik` over a source with no CIK query
+    scanned the whole recorded index per CIK. It now groups it once; each
+    CIK's answer is the old filter's, in order, and a caller's edit of one
+    answer never reaches the next."""
+    walked = _spread_index(ciks=2_000, per_cik=5)
+    _CountingIndex.passes = 0
+    recorded = _Recorded(_NoCikQuery(_CountingIndex(walked)))  # type: ignore[arg-type]
+    ciks = sorted({e.cik for e in walked})
+    for cik in ciks:
+        assert recorded.filing_index_for_cik(cik) == [e for e in walked if e.cik == cik]
+    assert recorded.filing_index_for_cik("0000999999") == []
+    recorded.filing_index_for_cik(ciks[0]).clear()
+    assert recorded.filing_index_for_cik(ciks[0]) == [e for e in walked if e.cik == ciks[0]]
+    assert _CountingIndex.passes == 1  # was one per CIK asked
+
+
+def _old_filename_form25_counts(master: Any, delistings: Any) -> tuple[int, int]:
+    """The #1662 counts as written before #2927 (a walk per Form 25)."""
+    unmatched = sum(
+        1
+        for row in delistings.unmatched
+        if any(
+            security_cik(listing["security_id"]) == row.cik
+            and listing["provenance"] == "filing_name"
+            and listing["known_at"] <= row.accepted_at
+            for listing in master.listings
+        )
+        and not any(
+            security_cik(listing["security_id"]) == row.cik
+            and listing["provenance"] == "filing_name"
+            and listing["known_at"] <= row.accepted_at
+            and listing["exchange"] == row.exchange
+            for listing in master.listings
+        )
+    )
+    transfers = sum(
+        1
+        for row in delistings.delistings
+        if row["filed_at"].year < 2019
+        and any(
+            listing["security_id"] == row["security_id"]
+            and listing["exchange"] != row["exchange"]
+            and listing["known_at"] > row["filed_at"]
+            and listing["provenance"] == "filing_name"
+            for listing in master.listings
+        )
+    )
+    return unmatched, transfers
+
+
+def test_filename_form25_counts_equal_the_walk_and_read_the_rows_once() -> None:
+    """#2927: the #1662 Form 25 counts group the `filing_name` rows once
+    (by CIK, by security) instead of walking every listing per Form 25,
+    with the counts the walk gave."""
+
+    class Rows(tuple[dict[str, Any], ...]):
+        passes = 0
+
+        def __iter__(self) -> Iterator[dict[str, Any]]:
+            type(self).passes += 1
+            return super().__iter__()
+
+    exchanges = ("NYSE", "NASDAQ", "NYSE_AMERICAN")
+    ciks = [f"{c + 1:010d}" for c in range(60)]
+    listings = [
+        {
+            "security_id": cik if n % 2 else f"{cik}:w",
+            "provenance": ("filing_name", "filing", "snapshot_static")[(c + n) % 3],
+            "known_at": _at(2015 + n, 3, 1),
+            "exchange": exchanges[(c * n) % 3],
+        }
+        for c, cik in enumerate(ciks)
+        for n in range(4)
+    ]
+    unmatched = tuple(
+        SimpleNamespace(
+            cik=cik,
+            accession=f"U-{c}",
+            accepted_at=_at(2016 + c % 4, 6, 1),
+            exchange=exchanges[c % 3],
+        )
+        for c, cik in enumerate(ciks)
+    )
+    delisted = tuple(
+        {
+            "security_id": cik if c % 2 else f"{cik}:w",
+            "exchange": exchanges[(c + 1) % 3],
+            "filed_at": _at(2014 + c % 6, 9, 1),
+        }
+        for c, cik in enumerate(ciks)
+    )
+    master = SimpleNamespace(
+        filename_enabled=True,
+        filename_counts={},
+        filename_form25_accessions=(),
+        listings=Rows(listings),
+    )
+    delistings = SimpleNamespace(unmatched=unmatched, delistings=delisted)
+    old_unmatched, old_transfers = _old_filename_form25_counts(
+        SimpleNamespace(listings=listings), delistings
+    )
+    assert old_unmatched and old_transfers  # the fixture exercises both counts
+    Rows.passes = 0
+    text = ingest_module._filename_counts(master, delistings, SimpleNamespace())  # type: ignore[arg-type]
+    assert f"; filename_form25_unmatched: {old_unmatched};" in f"{text};"
+    assert f"; filename_transfers_delisted: {old_transfers};" in f"{text};"
+    assert Rows.passes == 1  # was 2 per unmatched Form 25 plus 1 per pre-2019 delisting

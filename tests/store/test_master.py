@@ -51,6 +51,8 @@ from tradepartner.store.master import (
     MasterBuild,
     ShownSpan,
     Succession,
+    _Builder,
+    _filing_index_by_cik,
     _filing_index_for_cik,
     _filing_index_for_forms,
     _refuse_separator,
@@ -2522,3 +2524,172 @@ class TestStoredSnapshotFetches:
         assert "PRE" in {e.ticker for e in before}
         assert not {"SPY", "MTUM", "TCKA", "TCKB"} & set(tickers)  # config, filing
         assert {e.ticker for e in fetches} == {"ACME", "DUA", "STDY", "ERLA"}
+
+
+# --- #2927: per-CIK reads group the index and the build's rows once --------
+
+
+class _CountingEntries(tuple[FilingIndexEntry, ...]):
+    """A full filing index, counting each pass over it."""
+
+    passes = 0
+
+    def __iter__(self) -> Iterator[FilingIndexEntry]:
+        type(self).passes += 1
+        return super().__iter__()
+
+
+class _CountingIndexSource(FixtureFilingSource):
+    """A fixture source whose full index counts the passes made over it."""
+
+    def filing_index(self, since: datetime | None = None) -> list[FilingIndexEntry]:
+        return _CountingEntries(super().filing_index(since))  # type: ignore[return-value]
+
+
+def _filename_world(ciks: int) -> dict[str, Any]:
+    """`ciks` issuers, each with pre-2019 10-Ks read by filename, a 2019
+    cover page, and (every third) a second class and a Form 25 by filename,
+    the index in acceptance order so each CIK's rows are spread through it."""
+    index: list[FilingIndexEntry] = []
+    pages: list[CoverPage] = []
+    names: list[FilenameListing] = []
+    delisted: list[DelistingFiling] = []
+    for c in range(ciks):
+        cik = f"{5000 + c:010d}"
+        ticker = f"T{c}"
+        for year, form in ((2014, "8-K"), (2015, "10-K"), (2016, "10-K"), (2016, "10-Q")):
+            at = _at(year, 3, 2) + timedelta(minutes=c)
+            accession = f"{cik}-{year % 100:02d}-{form[-1]}{c:05d}"
+            index.append(FilingIndexEntry(cik, f"Co {c}", form, accession, at))
+            if form == "10-K":
+                day = at.date()
+                names.append(
+                    FilenameListing(
+                        cik, accession, "10-K", at, day, ticker, "NYSE", "Common Stock", ticker
+                    )
+                )
+        listed = [("Common Stock", ticker, "NYSE")]
+        if c % 3 == 0:
+            listed.append(("Warrants", f"{ticker}W", "NYSE"))
+            at = _at(2018, 6, 1) + timedelta(minutes=c)
+            accession = f"{cik}-18-25{c:05d}"
+            names.append(
+                FilenameListing(
+                    cik, accession, "25-NSE", at, date(2018, 6, 1), f"{ticker}W", "NYSE", None, None
+                )
+            )
+            delisted.append(DelistingFiling(cik, "25-NSE", "Warrants", "NYSE", accession, at))
+        pages.append(
+            CoverPage(
+                cik,
+                f"{cik}-19-cov{c:04d}",
+                _at(2019, 3, 1) + timedelta(minutes=c),
+                tuple(CoverListing(title, tick, exchange) for title, tick, exchange in listed),
+            )
+        )
+    index.sort(key=lambda e: (e.accepted_at, e.accession, e.cik))
+    return {
+        "index": index,
+        "cover_pages": pages,
+        "filename_listings": names,
+        "delistings": delisted,
+    }
+
+
+def _only(world: dict[str, Any], cik: str) -> dict[str, Any]:
+    return {key: [item for item in rows if item.cik == cik] for key, rows in world.items()}
+
+
+def test_filename_build_gives_each_cik_what_building_it_alone_gives() -> None:
+    """#2927: grouping the index and the build's rows per CIK changes no
+    CIK's rows: the whole build's rows for a CIK are, in order, the rows a
+    build of that CIK alone makes, and the filename counts add up."""
+    world = _filename_world(30)
+    settings = _settings(edgar={"filename_listings": True})
+    whole = build_master(FixtureFilingSource(**world), settings, ingested_at=INGESTED_AT)
+    named = [r for r in whole.listings if r["provenance"] == "filing_name"]
+    assert len({security_cik(r["security_id"]) for r in named}) == 30
+    totals: dict[str, int] = {}
+    for c in range(30):
+        cik = f"{5000 + c:010d}"
+        alone = build_master(
+            FixtureFilingSource(**_only(world, cik)), settings, ingested_at=INGESTED_AT
+        )
+        assert [r for r in whole.listings if security_cik(r["security_id"]) == cik] == list(
+            alone.listings
+        )
+        for key, value in alone.filename_counts.items():
+            totals[key] = totals.get(key, 0) + value
+    assert totals == whole.filename_counts
+    assert whole.filename_counts["filename_10ks_read"] == 60
+
+
+def test_builder_cik_listings_equal_the_filter_in_order() -> None:
+    """#2927: `_Builder.cik_listings` is the filter of every row by
+    `security_cik`, in row order, across interleaved CIKs and classes."""
+    builder = _Builder(_settings(), INGESTED_AT)
+    ids = ["0000000001", "0000000002:b", "0000000001:pfd", "0000000002", "0000000001@x"]
+    for n in range(40):
+        builder.listing(ids[n % 5], f"T{n}", "NYSE", None, date(2019, 1, 2), _at(2019, 1, 1))
+    for cik in ("0000000001", "0000000002", "0000000003"):
+        expected = [r for r in builder.listings if security_cik(r["security_id"]) == cik]
+        assert list(builder.cik_listings(cik)) == expected
+    assert builder.cik_listings("0000000003") == ()
+
+
+def test_filename_build_reads_the_full_index_once_however_many_ciks() -> None:
+    """#2927 (T184h): with `edgar.filename_listings` on, `build_master`
+    filtered the whole ~15M-entry index once per issuer CIK (~0.8 s x 58k,
+    ~13 h). The index is now read in one pass per build."""
+    _CountingEntries.passes = 0
+    source = _CountingIndexSource(**_filename_world(200))
+    build = build_master(
+        source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT
+    )
+    assert build.filename_counts["filename_10ks_read"] == 400
+    assert _CountingEntries.passes == 1  # was 201
+
+
+def test_filename_build_never_walks_every_row_per_cik(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#2927: `_filename_rows` walked all of `builder.listings` up to three
+    times per CIK (quadratic in the build). Only the build's own end reads
+    walk them now, however many CIKs."""
+
+    class Rows(list[dict[str, Any]]):
+        passes = 0
+
+        def __iter__(self) -> Iterator[dict[str, Any]]:
+            type(self).passes += 1
+            return super().__iter__()
+
+    init = _Builder.__init__
+
+    def counting_init(self: _Builder, settings: Settings, ingested_at: datetime) -> None:
+        init(self, settings, ingested_at)
+        self.listings = Rows()
+
+    monkeypatch.setattr(_Builder, "__init__", counting_init)
+    settings = _settings(edgar={"filename_listings": True})
+    for ciks in (20, 200):
+        Rows.passes = 0
+        build_master(
+            FixtureFilingSource(**_filename_world(ciks)), settings, ingested_at=INGESTED_AT
+        )
+        assert Rows.passes <= 2, (ciks, Rows.passes)
+
+
+def test_filing_index_by_cik_reads_a_full_index_once_in_order() -> None:
+    """#2927: a source with no CIK query (the `_filing_index_for_cik`
+    fallback, read per CIK by `classify._evidence` and `build_chains`) has
+    its full index read once for every CIK asked, each CIK's entries the
+    old per-CIK filter's, in order."""
+    world = _filename_world(50)
+    source = _CountingIndexSource(**world)
+    ciks = [*sorted({e.cik for e in world["index"]}), "0000999999"]
+    _CountingEntries.passes = 0
+    grouped = _filing_index_by_cik(source, ciks)
+    assert _CountingEntries.passes == 1
+    for cik in ciks:
+        assert grouped[cik] == [e for e in world["index"] if e.cik == cik]
+        assert grouped[cik] == _filing_index_for_cik(source, cik)
+    assert grouped["0000999999"] == []

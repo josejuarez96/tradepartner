@@ -194,8 +194,32 @@ def _is_plain_title(title: str) -> bool:
 _OFF_EXCHANGE = frozenset({"", "NONE", "OTC"})
 
 
-def _resolve(filing: DelistingFiling, master: MasterBuild) -> tuple[str, ...]:
+@dataclass(frozen=True)
+class _MasterRows:
+    """`master`'s securities by CIK and listings by security, each in
+    `master` order (listings with their position), grouped once per build
+    (#2927) so each filing reads its CIK's rows, not every row."""
+
+    securities_by_cik: dict[str, list[Row]]
+    listings_by_id: dict[str, list[tuple[int, Row]]]
+
+    @classmethod
+    def of(cls, master: MasterBuild) -> _MasterRows:
+        securities: dict[str, list[Row]] = defaultdict(list)
+        for row in master.securities:
+            securities[row["cik"]].append(row)
+        listings: dict[str, list[tuple[int, Row]]] = defaultdict(list)
+        for position, row in enumerate(master.listings):
+            listings[row["security_id"]].append((position, row))
+        return cls(dict(securities), dict(listings))
+
+
+def _resolve(
+    filing: DelistingFiling, master: MasterBuild, rows: _MasterRows | None = None
+) -> tuple[str, ...]:
     """The `security_id`s `filing` delists, or `()` if that is not certain."""
+    if rows is None:
+        rows = _MasterRows.of(master)
     # #820: never a successor known later. An original Form 25 after a
     # succession names the successor; an amendment amends the old class's.
     known = [s for s in master.successions if s.known_at <= filing.accepted_at]
@@ -205,16 +229,23 @@ def _resolve(filing: DelistingFiling, master: MasterBuild) -> tuple[str, ...]:
         excluded = {s.predecessor_id for s in known}
     candidates: set[str] = {
         row["security_id"]
-        for row in master.securities
-        if row["cik"] == filing.cik
-        and not row.get("benchmark", False)
+        for row in rows.securities_by_cik.get(filing.cik, ())
+        if not row.get("benchmark", False)
         and row["known_at"] <= filing.accepted_at
         and row["security_id"] not in excluded
     }
-    titles: dict[str, list[str | None]] = defaultdict(list)
-    for row in master.listings:
-        if row["security_id"] in candidates and row["exchange"] == filing.exchange:
-            titles[row["security_id"]].append(row["class_title"])
+    # Each candidate's titles on the filing's exchange, keyed in the order a
+    # walk of `master.listings` meets them (`_form25_classes` reads key order).
+    found: list[tuple[int, str, list[str | None]]] = []
+    for security_id in candidates:
+        hits = [
+            (position, row)
+            for position, row in rows.listings_by_id.get(security_id, ())
+            if row["exchange"] == filing.exchange
+        ]
+        if hits:
+            found.append((hits[0][0], security_id, [row["class_title"] for _, row in hits]))
+    titles = {security_id: named for _, security_id, named in sorted(found)}
     return _form25_classes(filing.class_title, titles)
 
 
@@ -230,6 +261,7 @@ def build_delistings(
     ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
     rows: list[Row] = []
     unmatched: list[DelistingFiling] = []
+    master_rows = _MasterRows.of(master)  # #2927: once per build, not once per filing
     for filing in sorted(filings, key=lambda f: (f.accepted_at, f.accession)):
         if filing.form not in DELISTING_FORMS:
             raise ValueError(f"not a delisting form: {filing.form!r} ({filing.accession})")
@@ -238,7 +270,7 @@ def build_delistings(
                 f"{filing.accession}: accepted_at {filing.accepted_at.isoformat()} is after "
                 f"ingested_at {ingested_at.isoformat()}"
             )
-        security_ids = _resolve(filing, master)
+        security_ids = _resolve(filing, master, master_rows)
         if not security_ids:
             unmatched.append(filing)
             continue
