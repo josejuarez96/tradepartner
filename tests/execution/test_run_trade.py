@@ -1409,6 +1409,28 @@ def test_a_midsession_stop_run_follows_the_same_window(env: Env, window: PaperWi
     assert sorted(r.symbol for r in env.submits()[sent_before:]) == ["DUALB", "SPFT", "TRNS"]
 
 
+def test_a_midsession_forced_exit_with_no_rebalance_due_follows_the_same_window(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Item 9: `exits_step`'s own batch (a Form 25 forced exit, no rebalance due) on a
+    mid-session book: nothing at 08:30 ET, sent at 10:35 ET."""
+    bought(env)
+    midsession(env)
+    delist(env, "SEC_DUAL_B", at(F_0, 19, 0))
+    sent_before = len(env.submits())
+
+    early = env.run(at(F_0_PLUS_1))
+    assert early.status == "ok", env.result(env.latest_run())
+    assert early.kind not in ("rebalance", "catch_up", "stop")
+    assert env.submits()[sent_before:] == []
+    assert any("outside the submit window" in n for n in early.notes)
+
+    later = env.run(at(F_0_PLUS_1, 14, 35))
+    assert later.status == "ok", env.result(env.latest_run())
+    sent = env.submits()[sent_before:]
+    assert [(r.symbol, r.side) for r in sent] == [("DUALB", "sell")]
+
+
 def _sandbox(env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
     lock.sandbox_marker(env.settings).write_text("")

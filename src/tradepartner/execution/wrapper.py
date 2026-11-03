@@ -1915,7 +1915,9 @@ class RiskGatedBroker:
         """Whether the clock reads inside the book's submit window (the interval of
         `run.submit_window`: `buy_timing.submit_window_for` from `self._calendar`'s
         open of S), tested before every submit. A sandbox book not at `midsession`
-        on a marked copy keeps [open(S), close(S)] (amendment 2026-11-03 item 5)."""
+        on a marked copy keeps [open(S), close(S)] (amendment 2026-11-03 item 5).
+        The book is `_run_book`'s, so a run whose book cannot be read falls back to
+        `main`'s window, never to the wider sandbox one."""
         opening = self._calendar.session_open(session)
         now = self.read_clock()
         book_id = self._run_book(run)
