@@ -204,6 +204,7 @@ DEFAULT_SEED = 1382
 BULK_WRITTEN_DAY = date(2026, 10, 1)
 _PROBES_PER_CIK = 2
 _GONE = (404, 410)
+_BLOCKED = (403, 429)  # SEC's rate-limit block (#2955: a worker hands it back)
 _JOURNAL_COLUMNS = ("cik", "accession", "sgml_stamp", "error")
 DEFAULT_FETCH_WORKERS = 4  # #2955: SGML requests in flight; 1 is one at a time
 MIN_FETCH_WORKERS = 1
@@ -689,8 +690,9 @@ class Journal:
         order, so the journal lines come in the sequential order. The workers
         only fetch; this thread journals each answer in key order. A worker
         sends nothing while `edgar_raw.rate_limit_blocked` is set, and nothing
-        once another fetch has failed; such a key is asked here, in its turn,
-        through `get` (the sequential path). The first failure in key order is
+        once another fetch has failed; such a key, and one whose request ended
+        in a 403/429 block, is asked here, in its turn, through `get` (the
+        sequential path, with its wait-out). The first failure in key order is
         raised after every answer that did arrive is journalled, so
         ``--resume`` repeats none of them; keys after it are not asked."""
         if self.workers <= 1:
@@ -706,6 +708,11 @@ class Journal:
                 return _Fetched()
             try:
                 return _Fetched(answer=self._ask(*key))
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in _BLOCKED:
+                    return _Fetched()  # a rate-limit block: asked in turn through `get`
+                stop.set()
+                return _Fetched(error=exc)
             except BaseException as exc:  # handed to the calling thread
                 stop.set()
                 return _Fetched(error=exc)

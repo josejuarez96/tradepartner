@@ -1728,3 +1728,37 @@ def test_the_pool_goes_through_the_one_rate_limiter(tmp_path: Path, monkeypatch:
     starts.sort()
     gaps = [b - a for a, b in itertools.pairwise(starts)]
     assert min(gaps) >= 1 / 20 - 0.005
+
+
+def test_a_rate_limit_block_in_the_pool_is_asked_again_in_turn(tmp_path: Path) -> None:
+    """A 403/429 a worker gets past the retries is not a stop: the key is asked
+    again on the calling thread, in its turn, as the one-at-a-time path would
+    after its wait-out, and the journal is that path's."""
+    keys = [(f"{i:010d}", f"{i:010d}-24-000001") for i in range(1, 13)]
+    blocked = {keys[3], keys[4]}
+    outputs: dict[int, bytes] = {}
+    for workers in (1, 4):
+        sec = SlowSec({k: utc(2024, 1, 2, 15) for k in keys})
+        first_try = set(blocked) if workers > 1 else set()
+
+        def fetch(
+            cik: str,
+            accession: str,
+            sec: SlowSec = sec,
+            first: set[tuple[str, str]] = first_try,
+        ) -> datetime:
+            if (cik, accession) in first:
+                first.discard((cik, accession))
+                request = httpx.Request("GET", "https://www.sec.gov/x")
+                raise httpx.HTTPStatusError(
+                    "429", request=request, response=httpx.Response(429, request=request)
+                )
+            return sec(cik, accession)
+
+        path = tmp_path / f"j{workers}.csv"
+        journal = repair_stamps.Journal(path, fetch, workers=workers)
+        journal.prefetch(keys, "test")
+        assert [journal.get(*k) for k in keys] == [utc(2024, 1, 2, 15)] * len(keys)
+        assert sorted(sec.calls) == keys and journal.requests == len(keys)
+        outputs[workers] = path.read_bytes()
+    assert outputs[4] == outputs[1]
