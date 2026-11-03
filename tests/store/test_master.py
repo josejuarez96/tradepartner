@@ -38,7 +38,7 @@ from tradepartner.adapters.filings import (
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.config import Settings
-from tradepartner.ingest import _Recorded
+from tradepartner.ingest import _filename_counts, _Recorded
 from tradepartner.store import filing_index as stored_index
 from tradepartner.store import schema
 from tradepartner.store.asof import listings_as_of
@@ -402,6 +402,57 @@ def test_filename_form25_is_last_resort_and_makes_delisting_resolve() -> None:
         (annual_cik, "ANN", annual_at),
     ]
     assert build_delistings(source.delistings(), on, ingested_at=INGESTED_AT).unmatched == ()
+
+
+def _combined_10k_source() -> FixtureFilingSource:
+    """#2941: AAL Group and American Airlines on one combined 10-K, read by
+    filename under both CIKs; FSN keys the filing to the parent, so the
+    subsidiary's reading is a co-registrant's. Plus one filename leftover."""
+    parent, subsidiary, leftover = "0000006201", "0000004515", "0000065984"
+    accepted = _at(2016, 2, 24)
+    shared = "0000006201-16-000014"
+
+    def reading(cik: str, accession: str, ticker: str, coregistrant: bool) -> FilenameListing:
+        return FilenameListing(
+            cik,
+            accession,
+            "10-K",
+            accepted,
+            date(2016, 2, 24),
+            ticker,
+            "NASDAQ",
+            "Common Stock",
+            None,
+            coregistrant,
+        )
+
+    return FixtureFilingSource(
+        index=[
+            FilingIndexEntry(parent, "AAL Group", "10-K", shared, accepted),
+            FilingIndexEntry(subsidiary, "American Airlines Inc", "10-K", shared, accepted),
+            FilingIndexEntry(leftover, "Entergy", "10-K", "0000065984-16-000001", accepted),
+        ],
+        filename_listings=[
+            reading(parent, shared, "aal", False),
+            reading(subsidiary, shared, "aal", True),
+            reading(leftover, "0000065984-16-000001", "etr-12312015x10k", False),
+        ],
+    )
+
+
+def test_filename_coregistrant_and_leftover_prefixes_write_no_row_and_are_counted() -> None:
+    source = _combined_10k_source()
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    rows = [r for r in on.listings if r["provenance"] == "filing_name"]
+    assert [(r["security_id"], r["ticker"]) for r in rows] == [("0000006201", "AAL")]
+    assert on.filename_counts["filename_refused_coregistrant"] == 1
+    assert on.filename_counts["filename_refused_symbol"] == 1
+    # Neither refusal is a missing instance: each 10-K was read.
+    assert on.filename_counts["filename_no_instance"] == 0
+    delistings = build_delistings(source.delistings(), on, ingested_at=INGESTED_AT)
+    message = _filename_counts(on, delistings, source)
+    assert "filename_refused_coregistrant: 1" in message
+    assert "filename_refused_symbol: 1" in message
 
 
 def test_filename_confirmation_uses_first_cover_filing_only() -> None:
@@ -2556,7 +2607,8 @@ def _filename_world(ciks: int) -> dict[str, Any]:
     delisted: list[DelistingFiling] = []
     for c in range(ciks):
         cik = f"{5000 + c:010d}"
-        ticker = f"T{c}"
+        # Letters only (#2941: a digit is no symbol): T, then c in base 26.
+        ticker = "T" + chr(65 + c // 26) + chr(65 + c % 26)
         for year, form in ((2014, "8-K"), (2015, "10-K"), (2016, "10-K"), (2016, "10-Q")):
             at = _at(year, 3, 2) + timedelta(minutes=c)
             accession = f"{cik}-{year % 100:02d}-{form[-1]}{c:05d}"

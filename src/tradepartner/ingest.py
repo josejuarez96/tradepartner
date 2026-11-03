@@ -4578,6 +4578,8 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
         "filename_renamed",
         "filename_refused_contradicted",
         "filename_refused_owner",
+        "filename_refused_coregistrant",
+        "filename_refused_symbol",
         "filename_no_instance",
         "filename_no_exchange",
         "filename_class_unread",
