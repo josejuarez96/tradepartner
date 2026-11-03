@@ -210,6 +210,32 @@ def test_backfill_skips_and_counts_an_index_accession_with_no_cached_stamp(
     assert router.urls == [] and source.requests == 0
 
 
+def test_backfill_hands_a_skipped_accessions_facts_on_unstamped_and_the_key_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A skipped accession (no cached stamp) whose facts are in the zip is
+    never given a run-time stamp: its record reaches the hold rule unstamped,
+    which holds the key rather than store the stamped carrier as first vintage."""
+    from tradepartner.ingest import statement_fact_rows
+
+    settings = _settings(tmp_path)
+    payload = _payload()
+    earlier = dict(payload["facts"]["us-gaap"]["Revenues"]["units"]["USD"][0])
+    carried = {**earlier, "val": 310, "accn": NEW, "filed": "2023-02-01"}
+    payload["facts"]["us-gaap"]["Revenues"]["units"]["USD"].append(carried)
+    _bulk_zip(settings, {f"CIK{CIK}.json": json.dumps(payload).encode()})
+    _fsn_periods_spy(monkeypatch)
+    router = EdgarRouter()
+    source = _source(settings, router, backfill=True, rows=((NEW, "10-K", NEW_AT),))
+    records = source.statement_facts(CIK)
+    assert {r.accession: r.accepted_at for r in records} == {K2022: K2022_AT, NEW: None}
+    assert source.statement_stamps_missing == 1
+    rows, counts = statement_fact_rows(records, {}, set(), ingested_at=CLOCK)
+    assert [r["filing_accession"] for r in rows] == []  # the key is held, not stored
+    assert counts.held == 1
+    assert router.urls == [] and source.requests == 0
+
+
 def test_backfill_never_sees_an_index_row_known_after_its_clock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

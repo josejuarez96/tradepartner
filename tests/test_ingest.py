@@ -10929,6 +10929,7 @@ def test_statement_backfill_refuses_a_per_name_edit_beside_the_addition(
     result = _backfill(edited)
     assert result.runs[0].status == FAILED
     assert "per-name list changed" in result.runs[0].message
+    assert "revert it before the nightly" in result.runs[0].message
     assert read("SELECT count(*) FROM ingestion_runs") == before
 
 
@@ -10946,6 +10947,55 @@ def test_the_nightly_window_starts_at_the_last_index_read_not_the_backfill(
         cursor, previous_at = ingest_module._last_ok_index_row(conn)
     assert cursor == '{"per_name": "backfill"}'
     assert previous_at == NOW
+
+
+def test_the_nightly_index_read_ignores_the_backfills_finish_time(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2873: `_prepare_index` (the nightly's index step) hands `select_quarters`
+    the last index-reading ok row's finish, not a later statement backfill's."""
+    from tradepartner.adapters import edgar_raw, index_reconcile
+
+    run_at = datetime(2026, 1, 3, tzinfo=UTC)
+    edgar = settings.edgar.model_copy(
+        update={"index_first_year": 2026, "cache_dir": str(tmp_path / "edgar-cache")}
+    )
+    configured = settings.model_copy(update={"edgar": edgar})
+    with open_for_write(configured) as conn:
+        init_schema(conn)
+        for run_id, mode, finished in (
+            ("night", "session", run_at - timedelta(days=2)),
+            ("backfill", "statement_backfill", run_at - timedelta(days=1)),
+        ):
+            row = SourceRun("edgar_index", OK, 0, "{}", "done")
+            ingest_module.write_run(conn, run_id, finished, finished, row, mode)
+    seen: list[datetime | None] = []
+    real = index_reconcile.select_quarters
+
+    def spy(**kwargs: Any) -> Any:
+        seen.append(kwargs["last_ok_run_at"])
+        return real(**kwargs)
+
+    monkeypatch.setattr(index_reconcile, "select_quarters", spy)
+    monkeypatch.setattr(
+        edgar_raw, "daily_index_listing", lambda *_a, **_k: {"directory": {"item": []}}
+    )
+    source = EdgarFilingSource(configured, clock=lambda: run_at)
+    ingest_module._prepare_index(configured, source, run_at)
+    assert seen == [run_at - timedelta(days=2)]
+
+
+def test_statement_backfill_refuses_an_edgar_adapter_outside_its_mode(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#2873: a real adapter built without the statement-backfill mode could
+    fetch, so the session refuses it before any write."""
+    _, added = _seeded_for_backfill(settings)
+    before = read("SELECT count(*) FROM ingestion_runs")
+    adapter = EdgarFilingSource(added, clock=lambda: NOW, reuse_cached=True)
+    with pytest.raises(ValueError, match="statement-backfill mode"):
+        _backfill(added, adapter)
+    assert read("SELECT count(*) FROM ingestion_runs") == before
 
 
 def test_incremental_rotation_ignores_retracted_and_superseded_stored_rows(
