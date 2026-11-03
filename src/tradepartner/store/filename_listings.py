@@ -48,8 +48,24 @@ class Confirmation:
     class_read: bool
 
 
-def _ticker(value: str) -> str:
+class FilenameClassConflict(ValueError):
+    """One security's readings assign a ticker to two class ids (#2929).
+
+    A per-CIK data verdict, not a store fault: the caller writes no
+    filename rows for that CIK and counts it, and every other CIK builds."""
+
+    def __init__(self, ticker: str) -> None:
+        super().__init__(f"conflicting class assignment for {ticker}")
+        self.ticker = ticker
+
+
+def normalize_ticker(value: str) -> str:
+    """The case- and whitespace-free spelling every filename reading is keyed
+    by: a Form 25 exhibit file name spells `avy25`, a cover page `AVY25`."""
     return value.strip().upper()
+
+
+_ticker = normalize_ticker
 
 
 def is_filename_listing_refused(cik: str, ticker: str, refused: Collection[str]) -> bool:
@@ -76,8 +92,9 @@ def confirm_filename_listings(
     filing's *instance prefix* is a later prefix, not an independent reading.
     The caller passes only the CIK's first cover-page filing as
     ``cover_readings``; later cover pages cannot contradict a pre-cover
-    prefix. A ticker assigned to two class ids fails closed because the rule
-    cannot choose which security receives the listing.
+    prefix. A ticker assigned to two class ids raises `FilenameClassConflict`
+    because the rule cannot choose which security receives the listing; the
+    caller fails that CIK closed (#2929).
     The result is sorted by acceptance and accession, independent of input
     order. A refused verdict has no class assignment because it writes no row.
     """
@@ -110,7 +127,7 @@ def confirm_filename_listings(
             ticker = _ticker(item.ticker)
             previous = class_by_ticker.setdefault(ticker, item.class_id)
             if previous != item.class_id:
-                raise ValueError(f"conflicting class assignment for {ticker}")
+                raise FilenameClassConflict(ticker)
 
     later_prefixes = tuple((filing.accepted_at, _ticker(filing.ticker)) for filing in candidates)
     output: list[Confirmation] = []

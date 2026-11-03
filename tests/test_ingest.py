@@ -6784,6 +6784,30 @@ def test_filename_form25_unmatched_counts_only_an_exchange_mismatch() -> None:
     assert "filename_form25_unmatched: 1" in text
 
 
+def test_filename_counts_name_the_conflicting_ciks() -> None:
+    # #2929: a class conflict fails one CIK closed; the run message counts it
+    # and names the first few CIKs, so the owner can look them up.
+    from types import SimpleNamespace
+
+    ciks = tuple(f"{n:010d}" for n in range(1, 8))
+    master = SimpleNamespace(
+        filename_enabled=True,
+        filename_counts={"filename_conflicts": 7},
+        filename_conflict_ciks=ciks,
+        listings=[],
+    )
+    delistings = SimpleNamespace(unmatched=(), delistings=())
+    text = ingest_module._filename_counts(master, delistings, SimpleNamespace())  # type: ignore[arg-type]
+    assert "; filename_conflicts: 7" in text
+    assert text.endswith(f"; filename_conflict_ciks: {', '.join(ciks[:5])} (+2)")
+    quiet = SimpleNamespace(
+        filename_enabled=True, filename_counts={}, filename_conflict_ciks=(), listings=[]
+    )
+    text = ingest_module._filename_counts(quiet, delistings, SimpleNamespace())  # type: ignore[arg-type]
+    assert "; filename_conflicts: 0" in text
+    assert "filename_conflict_ciks" not in text
+
+
 # --- the borrow-status snapshot (#1506, T171c; ADR 0021) --------------------
 #
 # Payloads are constructed in Alpaca's raw shape (`id`, `class`,
