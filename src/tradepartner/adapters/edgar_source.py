@@ -3633,9 +3633,10 @@ class EdgarFilingSource(FilingSource):
                 if exchange is None:
                     counts.no_exchange += 1
                 fsn_filing = fsn_cache.get(record.accession)
-                if fsn_filing is None:
+                coregistrant = self._coregistrant_copy(cik, record.accession, fsn_cache)
+                if fsn_filing is None and not coregistrant:
                     counts.fsn_missing += 1
-                elif fsn_tags.get(record.accession) is None:
+                elif fsn_filing is not None and fsn_tags.get(record.accession) is None:
                     counts.fsn_no_symbol_only += 1
                 listings.append(
                     FilenameListing(
@@ -3650,6 +3651,7 @@ class EdgarFilingSource(FilingSource):
                         dei_symbol=_dei_symbol(
                             extract.name, fsn_filing, fsn_tags.get(record.accession)
                         ),
+                        coregistrant=coregistrant,
                     )
                 )
 
@@ -3731,6 +3733,19 @@ class EdgarFilingSource(FilingSource):
             self.filename_fsn_missing += counts.fsn_missing
         listings.sort(key=lambda e: (e.accepted_at, e.accession, e.ticker))
         return listings
+
+    def _coregistrant_copy(
+        self, cik: str, accession: str, fsn_cache: Mapping[str, FsnFiling]
+    ) -> bool:
+        """Whether `accession` is a combined filing another CIK filed (#2941):
+        FSN keys it to another CIK and not to `cik`, or its per-document
+        cover cache names another entity, the two tests `_company_facts`
+        applies to a co-registrant's copy. Both read the filing's own
+        entity, known at its acceptance."""
+        if accession in self._fsn_extracted_accessions and accession not in fsn_cache:
+            return True
+        cover = self._load_cover_cache(accession)
+        return cover is not None and cover.entity_cik != cik
 
     def _own_form25(self, cik: str, record: SubmissionRecord) -> bool:
         """Whether `filename_listings`' Form 25 pass will ask for `record`: a

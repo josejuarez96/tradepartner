@@ -4581,6 +4581,8 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
         "filename_renamed",
         "filename_refused_contradicted",
         "filename_refused_owner",
+        "filename_refused_coregistrant",
+        "filename_refused_symbol",
         "filename_no_instance",
         "filename_no_exchange",
         "filename_class_unread",
@@ -4621,6 +4623,9 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
     source = _unwrap(filings)
     for key in ("filename_index_fetches", "filename_document_fetches"):
         counts[key] = int(getattr(source, key, 0))
+    # #2941: the read 10-Ks whose filer FSN never names (its period unloaded
+    # or failed, no cover cache): a co-registrant copy among them is not caught.
+    counts["filename_entity_unknown"] = int(getattr(source, "filename_fsn_missing", 0))
     text = "".join(f"; {key}: {value}" for key, value in sorted(counts.items()))
     # #2929: the first few CIKs a class conflict failed closed, to look up.
     # #2932: CIKs whose filename fetch failed past the retries, failed closed.

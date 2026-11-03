@@ -298,3 +298,79 @@ def test_nasdaq_delister_span_ends_before_successor_uses_ticker() -> None:
     resolver = ListingResolver(listings, evidence)
     assert resolver.resolve("NDEL", date(2018, 6, 8)) == case["cik"]
     assert resolver.resolve("NDEL", date(2019, 3, 4)) == successor_cik
+
+
+def test_coregistrant_and_symbol_refusals_are_truncation_invariant() -> None:
+    """#2941: whether a combined 10-K's prefix is the co-registrant's, or a
+    prefix is any symbol at all, is read from that filing alone, so a build
+    knowing only the filings up to t writes exactly the full build's
+    `filing_name` rows known by t: no later filing adds or removes one."""
+    parent, subsidiary = "0000006201", "0000004515"
+    years = (2016, 2017, 2018)
+    index: list[FilingIndexEntry] = []
+    names: list[FilenameListing] = []
+    for year in years:
+        at = datetime(year, 2, 24, 21, 0, tzinfo=UTC)
+        accession = f"0000006201-{year % 100}-000014"
+        for cik, coregistrant in ((parent, False), (subsidiary, True)):
+            index.append(FilingIndexEntry(cik, f"Co {cik}", "10-K", accession, at))
+            ticker = "aal" if year != 2017 else "aal-12312016x10k"
+            names.append(
+                FilenameListing(
+                    cik,
+                    accession,
+                    "10-K",
+                    at,
+                    at.date(),
+                    ticker,
+                    "NASDAQ",
+                    "Common Stock",
+                    None,
+                    coregistrant,
+                )
+            )
+    # The subsidiary's own stand-alone 10-K before the combined years: a rule
+    # that read a later filing's co-registrancy would refuse it.
+    own_at = datetime(2015, 2, 24, 21, 0, tzinfo=UTC)
+    index.append(FilingIndexEntry(subsidiary, f"Co {subsidiary}", "10-K", "own-2015", own_at))
+    names.append(
+        FilenameListing(
+            subsidiary,
+            "own-2015",
+            "10-K",
+            own_at,
+            own_at.date(),
+            "amr",
+            "NYSE",
+            "Common Stock",
+            None,
+        )
+    )
+    cover_at = datetime(2019, 2, 25, 21, 0, tzinfo=UTC)
+    source = FixtureFilingSource(
+        index=index,
+        cover_pages=[
+            CoverPage(parent, "cover", cover_at, (CoverListing("Common Stock", "AAL", "NASDAQ"),))
+        ],
+        filename_listings=names,
+    )
+    settings = Settings(_env_file=None, edgar={"filename_listings": True})
+    ingested_at = datetime(2020, 1, 1, tzinfo=UTC)
+
+    def named(build: Any) -> list[tuple[str, str, datetime]]:
+        return sorted(
+            (r["security_id"], r["ticker"], r["known_at"])
+            for r in build.listings
+            if r["provenance"] == "filing_name"
+        )
+
+    full = named(build_master(source, settings, ingested_at=ingested_at))
+    assert full == [
+        (subsidiary, "AMR", own_at),
+        (parent, "AAL", datetime(2016, 2, 24, 21, 0, tzinfo=UTC)),
+        (parent, "AAL", datetime(2018, 2, 24, 21, 0, tzinfo=UTC)),
+    ]
+    for t in source.known_ats():
+        for probe in (t - PROBE_EPSILON, t):
+            known = named(build_master(source.known_by(probe), settings, ingested_at=ingested_at))
+            assert known == [row for row in full if row[2] <= probe]

@@ -373,6 +373,12 @@ class FilenameListing:
     reading belongs to, `dei_symbol` the same filing's own
     `dei:TradingSymbol`, both `None` when the filing states neither; the
     confirmation rule (T184c) compares them against `ticker`.
+
+    `coregistrant` (#2941) is true when the filing is a combined one whose
+    instance is another CIK's: FSN keys the accession to that other filer and
+    not to `cik`, as `_company_facts` reads a co-registrant's copy. The
+    prefix is then the filer's ticker (AAL Group's `aal` on American
+    Airlines' copy), never `cik`'s, and the confirmation rule refuses it.
     """
 
     cik: str
@@ -384,6 +390,7 @@ class FilenameListing:
     exchange: str | None
     class_title: str | None
     dei_symbol: str | None
+    coregistrant: bool = False
 
     def __post_init__(self) -> None:
         _check_cik(self.cik)
@@ -392,6 +399,8 @@ class FilenameListing:
         _utc(self, "accepted_at")
         if not isinstance(self.valid_from, date) or isinstance(self.valid_from, datetime):
             raise TypeError(f"valid_from must be a date, got {self.valid_from!r}")
+        if not isinstance(self.coregistrant, bool):
+            raise TypeError(f"coregistrant must be a bool, got {self.coregistrant!r}")
 
 
 class FilingSource(abc.ABC):
