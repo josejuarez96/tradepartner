@@ -4,8 +4,9 @@ A fixture store holds rows stamped the #1382 way (an Eastern wall clock
 labelled UTC) for CIKs the repair never reached, and rows stamped right. The
 `audit-store` command of `scripts/repair_stamps.py` reads the store read-only,
 asks SGML for a seeded sample of accessions and must flag every early stamp,
-and exit 0 on a store with none. The sample is the class guard: a store that
-carries any early stamp can no longer pass it unnoticed.
+and exit 0 on a store with none. The sample is the class guard: a sampled
+early stamp, or a sweep that could not read its headers, fails it. (A sample bounds the early rate;
+it does not prove there is none.)
 """
 
 from __future__ import annotations
@@ -140,3 +141,28 @@ def test_the_store_ciks_export_lists_every_stored_accession(tmp_path: Path) -> N
     with out.open(newline="") as f:
         rows = {(r["cik"], r["accession"]) for r in csv.DictReader(f)}
     assert rows == {(cik, acc) for acc, (cik, _) in TRUTH.items()}
+
+
+def test_unreadable_headers_do_not_pass(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    store = _store(tmp_path / "unread.duckdb", {acc: t for acc, (_, t) in TRUTH.items()})
+
+    def broken(cik: str, accession: str) -> datetime:
+        raise ValueError("no header")
+
+    code = repair_stamps.main(
+        ["--cache-dir", str(tmp_path), "audit-store", "--store", str(store), "--apply"],
+        fetch=broken,
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert report["incomplete"] is True
+
+
+def test_null_accessions_are_skipped(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    store = _store(tmp_path / "null.duckdb", {acc: t for acc, (_, t) in TRUTH.items()})
+    con = duckdb.connect(str(store))
+    con.execute("insert into facts values ('0000000101-S', null, now())")
+    con.close()
+    code, report = _run(store, capsys, "--sample", "100", "--apply")
+    assert code == 0
+    assert report["look_ahead"] is False

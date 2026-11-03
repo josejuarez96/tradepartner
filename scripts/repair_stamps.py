@@ -23,7 +23,9 @@ Two subcommands:
   ``known_at`` stamps against each filing's SGML ``ACCEPTANCE-DATETIME``
   (`stamp_audit`). Dry run by default (the request count); ``--apply`` reads the
   headers, prints the early/exact/late counts per table and exits 1 when any
-  stamp is early. Run it before and after a release as its closing sweep.
+  sampled stamp is early or any header could not be read (a sample bounds the
+  early rate; it does not prove there is none). Run it before and after a
+  release as its closing sweep.
 - ``shift-unrepaired`` (#1382): ``--from`` an earlier release's unrepaired list;
   every listed record whose stamp is still the listed one moves later by New
   York's UTC offset (4 h EDT, 5 h EST), with no SGML request. It can only move
@@ -1514,11 +1516,12 @@ def run_shift_unrepaired(args: argparse.Namespace, fetch: Fetch | None = None) -
 # --- the store: its CIKs and the stamp audit (#2936) -------------------------
 
 _STORE_PAIRS = {
-    "statement_facts": "select cik, filing_accession, known_at from statement_facts",
+    "statement_facts": "select cik, filing_accession, known_at from statement_facts "
+    "where filing_accession is not null",
     "facts": (
         "select s.cik, f.filing_accession, f.known_at from facts f "
         "join (select security_id, any_value(cik) cik from securities group by 1) s "
-        "using (security_id)"
+        "using (security_id) where f.filing_accession is not null and s.cik is not null"
     ),
 }
 
@@ -1585,6 +1588,8 @@ def audit_store(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[st
     report["tables"] = {t: asdict(a) for t, a in sorted(audits.items())}
     report["unread"] = len(unread)
     report["look_ahead"] = any(a.look_ahead for a in audits.values())
+    # A sweep that read nothing, or lost reads, is not a pass.
+    report["incomplete"] = bool(unread) or not any(a.checked for a in audits.values())
     return report
 
 
@@ -1670,7 +1675,7 @@ def main(argv: Sequence[str] | None = None, *, fetch: Fetch | None = None) -> in
         if args.command == "audit-store":
             audit = audit_store(args, fetch)
             print(json.dumps(audit, indent=2, sort_keys=True))
-            return 1 if audit.get("look_ahead") else 0
+            return 1 if audit.get("look_ahead") or audit.get("incomplete") else 0
         commands = {"restamp-unrepaired": run_unrepaired, "shift-unrepaired": run_shift_unrepaired}
         command = commands.get(args.command, run)
         print(json.dumps(command(args, fetch), indent=2, sort_keys=True))

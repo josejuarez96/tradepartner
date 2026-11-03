@@ -52,10 +52,10 @@ Use this sequence to correct stored multi-owner roles (the Form 4 study that fir
 
 `restamp-1382a2` repaired phase A only: the 2,057 CIKs that backed the universe on 2026-10-11. The stamps of every other CIK stayed as the bulk zip wrote them (an Eastern wall clock labelled UTC, #1382), and every later rebuild re-read them. On the 2026-11-02 store copy, CIKs with a bar in 2026 are early on under 1% of sampled filings and CIKs without one on about 62%, so the leftover is mostly the delisted and dead names. It reaches `facts`, `statement_facts`, `delistings` and `listings` (filing provenance), and about half of the early filings were accepted after 16:00 ET, which makes them visible at that day's close: a one-session look-ahead. Run phase B as its own named release, with the paper jobs stopped:
 
-1. `uv run python scripts/repair_stamps.py audit-store --store PATH --sample 300 --apply` on a copy: the before sweep. It exits 1 while any sampled stamp is early; keep the JSON.
+1. `uv run python scripts/repair_stamps.py audit-store --store PATH --sample 300 --apply` on a copy: the before sweep. It exits 1 while any sampled stamp is early or a header could not be read; keep the JSON. It samples `facts` and `statement_facts` only (`delistings` and `listings` carry no accession; they move with the manifest, so check them by the CIK-level result), and a sample bounds the early rate rather than proving none.
 2. `uv run python scripts/repair_stamps.py store-ciks --store PATH --out store-ciks.csv` (read-only), then `uv run python scripts/repair_stamps.py run --phase rest --universe-ciks <phase A CIK list> --bulk-written <the frozen export> --classes <classes CSV, or an empty one with a `cik,class` header> --store-ciks store-ciks.csv --window-start <first session of the open window> --release restamp-1382b` is the dry run: read `requests_floor` and `requests_ceiling`. Expect an `--apply` above the 10k default `--max-requests`; raise it as an owner decision and see the run's other stops.
 3. `--apply` with the same flags, then `ingest --source edgar --restamp-from <manifest> --rebuild-statement-facts`, as in `restamp-1382a2`; the `shift-unrepaired` and `restamp-unrepaired` modes take the unrepaired list.
-4. The after sweep: step 1 again, which must exit 0.
+4. The after sweep: step 1 again, which must exit 0 (a larger `--sample` for a tighter bound).
 
 ### Bulk Form 4 title repair (#2708)
 
