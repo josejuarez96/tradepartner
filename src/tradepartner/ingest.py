@@ -4554,6 +4554,10 @@ def _chain_candidate_clause(candidates: Sequence[ChainCandidate]) -> str:
     return f"; chain_candidates: {len(candidates)}: {named}"
 
 
+#: How many conflicting CIKs the run message names (#2929); the count is whole.
+_FILENAME_CONFLICTS_SHOWN = 5
+
+
 def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource) -> str:
     """The #1597 verdict and Form 25 counts, omitted with the switch off."""
     if not master.filename_enabled:
@@ -4570,6 +4574,7 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
         "filename_no_exchange",
         "filename_class_unread",
         "filename_form25_rows",
+        "filename_conflicts",
     ):
         counts.setdefault(key, 0)
     # #1662: an exchange mismatch only — a Form 25 of a CIK with an earlier
@@ -4605,7 +4610,14 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
     source = _unwrap(filings)
     for key in ("filename_index_fetches", "filename_document_fetches"):
         counts[key] = int(getattr(source, key, 0))
-    return "".join(f"; {key}: {value}" for key, value in sorted(counts.items()))
+    text = "".join(f"; {key}: {value}" for key, value in sorted(counts.items()))
+    # #2929: the first few CIKs a class conflict failed closed, to look up.
+    conflicted = tuple(getattr(master, "filename_conflict_ciks", ()))
+    if conflicted:
+        shown = ", ".join(conflicted[:_FILENAME_CONFLICTS_SHOWN])
+        more = len(conflicted) - _FILENAME_CONFLICTS_SHOWN
+        text += f"; filename_conflict_ciks: {shown}" + (f" (+{more})" if more > 0 else "")
+    return text
 
 
 def _held_ids(conn: duckdb.DuckDBPyConnection, ids: Sequence[str]) -> frozenset[str]:

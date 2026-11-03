@@ -2693,3 +2693,151 @@ def test_filing_index_by_cik_reads_a_full_index_once_in_order() -> None:
         assert grouped[cik] == [e for e in world["index"] if e.cik == cik]
         assert grouped[cik] == _filing_index_for_cik(source, cik)
     assert grouped["0000999999"] == []
+
+
+def _avy_world(cik: str = "0000008818") -> dict[str, Any]:
+    """#2929: Avery Dennison's shape. A pre-cover 10-K, a 2019 cover page
+    naming the common and the `AVY25` notes, and a Nasdaq-style Form 25
+    whose exhibit file name spells the notes' ticker in lower case."""
+    annual_at, cover_at, exit_at = _at(2016, 3, 1), _at(2019, 2, 27), _at(2025, 2, 20)
+    exit_acc = f"{cik}-25-000151"
+    return {
+        "index": [FilingIndexEntry(cik, "Avery Dennison", "10-K", f"{cik}-16-1", annual_at)],
+        "cover_pages": [
+            CoverPage(
+                cik,
+                f"{cik}-19-1",
+                cover_at,
+                (
+                    CoverListing("Common Stock", "AVY", "NYSE"),
+                    CoverListing("1.25% Senior Notes due 2025", "AVY25", "NYSE"),
+                ),
+            )
+        ],
+        "filename_listings": [
+            FilenameListing(
+                cik, f"{cik}-16-1", "10-K", annual_at, annual_at.date(), "avy", "NYSE", None, None
+            ),
+            FilenameListing(
+                cik, exit_acc, "25-NSE", exit_at, exit_at.date(), "avy25", "NYSE", None, None
+            ),
+        ],
+        "delistings": [
+            DelistingFiling(cik, "25-NSE", "1.25% Senior Notes due 2025", "NYSE", exit_acc, exit_at)
+        ],
+    }
+
+
+def test_filename_lowercase_form25_ticker_maps_to_the_cover_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2929: the Form 25 file name's `avy25` is the cover page's `AVY25`, so
+    both readings name the notes class: no conflict, no abort."""
+    import tradepartner.store.master as master_module
+
+    seen: list[Any] = []
+    real = master_module.confirm_filename_listings
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(master_module, "confirm_filename_listings", spy)
+    cik = "0000008818"
+    build = build_master(
+        FixtureFilingSource(**_avy_world(cik)),
+        _settings(edgar={"filename_listings": True}),
+        ingested_at=INGESTED_AT,
+    )
+    notes = next(r["security_id"] for r in build.listings if r["ticker"] == "AVY25")
+    assert notes != cik  # the notes are a class of their own
+    (call,) = seen
+    (cover,) = call["cover_readings"]
+    (exhibit,) = call["form25_readings"]
+    assert {t.ticker.upper(): t.class_id for t in cover.tickers}["AVY25"] == notes
+    assert exhibit.tickers[0].class_id == notes
+    assert build.filename_counts.get("filename_conflicts", 0) == 0
+    assert build.filename_conflict_ciks == ()
+    # The Form 25 names the notes, already listed by the cover page: no row.
+    assert not [
+        r for r in build.listings if r["provenance"] == "filing_name" and r["security_id"] == notes
+    ]
+
+
+def _conflict_world(cik: str) -> dict[str, Any]:
+    """A true conflict: `ZZ` names class A on the first cover page and class
+    B on the latest, so a Form 25 for `ZZ` reads class B against the first
+    cover's class A."""
+    annual_at = _at(2016, 3, 1)
+    return {
+        "index": [FilingIndexEntry(cik, "Swapper", "10-K", f"{cik}-16-1", annual_at)],
+        "cover_pages": [
+            CoverPage(
+                cik,
+                f"{cik}-19-1",
+                _at(2019, 2, 1),
+                (
+                    CoverListing("Class A Common Stock", "ZZ", "NYSE"),
+                    CoverListing("Class B Common Stock", "ZB", "NYSE"),
+                ),
+            ),
+            CoverPage(
+                cik,
+                f"{cik}-22-1",
+                _at(2022, 2, 1),
+                (
+                    CoverListing("Class A Common Stock", "ZA", "NYSE"),
+                    CoverListing("Class B Common Stock", "ZZ", "NYSE"),
+                ),
+            ),
+        ],
+        "filename_listings": [
+            FilenameListing(
+                cik, f"{cik}-16-1", "10-K", annual_at, annual_at.date(), "ZZ", "NYSE", None, None
+            ),
+            FilenameListing(
+                cik,
+                f"{cik}-23-25",
+                "25-NSE",
+                _at(2023, 6, 1),
+                date(2023, 6, 1),
+                "zz",
+                "NYSE",
+                None,
+                None,
+            ),
+        ],
+        "delistings": [
+            DelistingFiling(
+                cik, "25-NSE", "Class B Common Stock", "NYSE", f"{cik}-23-25", _at(2023, 6, 1)
+            )
+        ],
+    }
+
+
+def test_filename_conflict_fails_closed_for_its_cik_only() -> None:
+    """#2929: a ticker read for two classes writes no filename row for that
+    CIK, is counted and named, and changes no other CIK's rows."""
+    bad = "0000004999"
+    world = _filename_world(6)
+    conflict = _conflict_world(bad)
+    mixed = {key: [*conflict.get(key, []), *rows] for key, rows in world.items()}
+    mixed["index"].sort(key=lambda e: (e.accepted_at, e.accession, e.cik))
+    settings = _settings(edgar={"filename_listings": True})
+    clean = build_master(FixtureFilingSource(**world), settings, ingested_at=INGESTED_AT)
+    build = build_master(FixtureFilingSource(**mixed), settings, ingested_at=INGESTED_AT)
+    assert build.filename_counts["filename_conflicts"] == 1
+    assert build.filename_conflict_ciks == (bad,)
+    assert not [
+        r
+        for r in build.listings
+        if r["provenance"] == "filing_name" and security_cik(r["security_id"]) == bad
+    ]
+    assert [r for r in build.listings if security_cik(r["security_id"]) != bad] == list(
+        clean.listings
+    )
+    assert clean.filename_counts.get("filename_conflicts", 0) == 0
+    alone = build_master(FixtureFilingSource(**conflict), settings, ingested_at=INGESTED_AT)
+    assert [r for r in build.listings if security_cik(r["security_id"]) == bad] == list(
+        alone.listings
+    )
