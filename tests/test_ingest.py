@@ -4809,6 +4809,23 @@ def test_same_value_accessions_redated_back_in_one_run_stamp_the_date_once() -> 
     assert ingest(_A, fourth + timedelta(hours=1), _A) == 0
 
 
+@pytest.mark.parametrize("stored_after", [timedelta(0), timedelta(hours=1)])
+def test_a_fact_revision_behind_a_stored_ingest_is_refused_as_back_dated(
+    stored_after: timedelta,
+) -> None:
+    """#2968: a revision of an accession is refused when the store holds an
+    ingest of it at or after the run's instant (an earlier run at that
+    instant, or a later one): stamped at the run it would not be the
+    accession's latest ingest, so the dropped date would stay served."""
+    conn = _store()
+    at = NOW + timedelta(days=1)
+    stored = at + stored_after
+    rows = [_redated(_A, stored), _redated(_B, stored)]
+    assert _add_rows(conn, "facts", rows, ingested_at=stored, current=False) == 2
+    with pytest.raises(ValueError, match="back-dated"):
+        _add_rows(conn, "facts", [_redated(_A, at)], ingested_at=at, current=False)
+
+
 def test_cover_page_duplicate_pair_does_not_abort_the_listings_write() -> None:
     """#687: `build_master` must never hand `_add_rows` two `listings` rows
     with the same (security_id, ticker, exchange, valid_from, known_at)

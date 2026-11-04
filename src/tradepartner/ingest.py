@@ -169,7 +169,9 @@ new stamp has the stored row's values, so the revision rule above skips it
 and the row stays at the old `known_at`. `restamp` (CLI `ingest --source
 edgar --restamp-from <manifest>`) moves those rows by UPDATE, never a delete
 and re-insert, in the EDGAR chunk's transaction before the day's rows are
-written: `restamp_from_manifest` has the matching rule, the refusals and the
+written, stamping the moves one microsecond before the run's instant so the
+day's rows are a later ingest of a moved accession (#2968):
+`restamp_from_manifest` has the matching rule, the refusals and the
 paper-window abort. `restamp_window_ok` (#1497, T166e; CLI
 `--restamp-window-earlier-ok <precheck.json>`) lets a late stamp inside an
 open window move earlier to its SGML header time, under T166f's rule and
@@ -4440,10 +4442,15 @@ def _ingest_filings(
     record_snapshot_sightings(conn, recorded.companies_snapshot(), now, master.listings)
     restamped = ""
     if restamp is not None:
+        # The moves are an ingest of their own, one tick before the day's
+        # rows: at `now` itself a moved fact accession would be part of this
+        # run's ingest (`facts_as_of`'s latest-ingest rule), so a revision of
+        # it at `now` could not leave it, and `_refiled` refuses it as
+        # back-dated (#2968).
         result = restamp_from_manifest(
             conn,
             restamp,
-            ingested_at=now,
+            ingested_at=now - _RESTAMP_TICK,
             delistings=recorded.delistings(),
             window_ok=restamp_window_ok,
         )
@@ -4979,6 +4986,11 @@ def _ny_date(instant: datetime) -> date:
 #: The rows a restamp may move in every table: EDGAR-sourced, `filing`
 #: provenance, never a row stamped at its own ingest (a revision or a
 #: retraction stamped at `ingested_at`).
+#: How far before the run's instant `_ingest_filings` stamps a restamp's
+#: moves (`ingested_at`), so the day's writes and revisions are a later
+#: ingest of every moved accession (#2968).
+_RESTAMP_TICK = timedelta(microseconds=1)
+
 _RESTAMPABLE = "t.source = 'edgar' AND t.provenance = 'filing' AND t.known_at <> t.ingested_at"
 
 
