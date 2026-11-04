@@ -468,10 +468,11 @@ def test_a_second_apply_retries_pending_moves_and_backups(rig: Rig) -> None:
         update={"edgar": rig.settings.edgar.model_copy(update={"cache_dir": str(rig.cache)})}
     )
     lines = archive_cmd.migrate_cache(settings, rig.icloud, apply=True)
+    assert len(rig.icloud.evicted) == 3
+    assert (rig.cache / "stamps/v1/0001.json").read_bytes() == b"stamp"
     assert "retried 3" in " ".join(lines)
     assert "now evicted 3" in " ".join(lines)
     assert "still pending 0" in " ".join(lines)
-    assert len(rig.icloud.evicted) == 3
     again = rig.run()
     assert again.retried == again.retry_evicted == again.retry_pending == 0
 
@@ -503,6 +504,70 @@ def test_a_retry_still_waiting_for_upload_stays_pending_and_is_counted(rig: Rig)
     rig.icloud.never_upload = False
     third = rig.run()
     assert (third.retried, third.retry_evicted, third.retry_pending) == (3, 3, 0)
+
+
+def test_missing_pending_body_is_reported_without_blocking_other_evictions(rig: Rig) -> None:
+    from tradepartner.store import archive_cmd
+
+    rig.icloud.never_upload = True
+    rig.run()
+    missing = body_path(rig.root, _sha(b"stamp"))
+    missing.unlink()
+    rig.put("stamps/v1/0001.json", b"updated-stamp")
+    rig.icloud.never_upload = False
+    settings = rig.settings.model_copy(
+        update={"edgar": rig.settings.edgar.model_copy(update={"cache_dir": str(rig.cache)})}
+    )
+    lines = archive_cmd.migrate_cache(settings, rig.icloud, apply=True)
+    assert missing not in rig.icloud.evicted
+    assert len(rig.icloud.evicted) == 3
+    assert body_path(rig.root, _sha(b"corpus-b")) in rig.icloud.evicted
+    assert (rig.cache / "stamps/v1/0001.json").read_bytes() == b"updated-stamp"
+    assert "retry missing: 1" in lines
+    assert "still pending 0" in " ".join(lines)
+    assert "unresolved retry files: 1" in lines
+    assert raw_archive_migrate.pending_evictions(rig.cache)
+    again = rig.run()
+    assert (again.retried, again.retry_missing) == (1, 1)
+
+
+def test_mismatched_pending_body_is_reported_and_never_evicted(rig: Rig) -> None:
+    from tradepartner.store import archive_cmd
+
+    rig.icloud.never_upload = True
+    rig.run()
+    corrupt = body_path(rig.root, _sha(b"dead-a"))
+    corrupt.write_bytes(b"corrupt")
+    rig.icloud.never_upload = False
+    settings = rig.settings.model_copy(
+        update={"edgar": rig.settings.edgar.model_copy(update={"cache_dir": str(rig.cache)})}
+    )
+    lines = archive_cmd.migrate_cache(settings, rig.icloud, apply=True)
+    assert corrupt not in rig.icloud.evicted
+    assert corrupt.read_bytes() == b"corrupt"
+    assert len(rig.icloud.evicted) == 2
+    assert "retry mismatched: 1" in lines
+    assert "still pending 0" in " ".join(lines)
+    assert "unresolved retry files: 1" in lines
+
+
+def test_retry_counts_distinct_paths_across_journals(rig: Rig) -> None:
+    from tradepartner.store import archive_cmd
+
+    rig.put("stamps/v1/0002.json", b"stamp-2")
+    rig.icloud.never_upload = True
+    rig.run(run_id="first")
+    rig.run(run_id="second")
+    rig.icloud.never_upload = False
+    settings = rig.settings.model_copy(
+        update={"edgar": rig.settings.edgar.model_copy(update={"cache_dir": str(rig.cache)})}
+    )
+    dry = archive_cmd.migrate_cache(settings, rig.icloud, apply=False)
+    assert "would retry 4" in " ".join(dry)
+    lines = archive_cmd.migrate_cache(settings, rig.icloud, apply=True)
+    assert len(rig.icloud.evicted) == 4
+    assert "retried 4" in " ".join(lines)
+    assert "now evicted 4" in " ".join(lines)
 
 
 def test_an_interrupted_run_retries_its_pending_uploads(

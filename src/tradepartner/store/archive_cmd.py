@@ -94,6 +94,10 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _pending_paths(cache_dir: Path) -> set[str]:
+    return {path for paths in migrate.pending_evictions(cache_dir).values() for path in paths}
+
+
 def _dry_run(settings: Settings, cache_dir: Path) -> list[str]:
     require_archive_root(settings)
     config, versions = migration_config(settings), current_versions()
@@ -142,10 +146,7 @@ def _dry_run(settings: Settings, cache_dir: Path) -> list[str]:
         )
         out.append(f"projected free after {phase.name}: {phase.free_bytes} bytes ({note})")
     out.append(f"floor: {plan.floor_bytes} bytes")
-    out.append(
-        f"pending_upload: would retry "
-        f"{sum(len(paths) for paths in migrate.pending_evictions(cache_dir).values())}"
-    )
+    out.append(f"unresolved: would retry {len(_pending_paths(cache_dir))}")
     if plan.backup_refused_at is not None:
         out.append(f"the backup copies stop at {plan.backup_refused_at} (below the floor)")
     return out
@@ -185,15 +186,24 @@ def migrate_cache(settings: Settings, icloud: ICloudItems, *, apply: bool) -> li
         f"{state} {result.backup_count(state)}"
         for state in ("evicted", "pending_upload", "backed_up", "changed")
     )
-    pending_total = sum(len(paths) for paths in migrate.pending_evictions(cache_dir).values())
-    return [
+    pending_total = len(_pending_paths(cache_dir))
+    lines = [
         f"migrate-cache applied: run {result.run_id or '-'}",
         f"moved files: {moved}",
         f"backup files: {backed}",
-        f"pending_upload (still local, not yet confirmed uploaded): {pending_total}",
+        f"unresolved retry files: {pending_total}",
         f"pending_upload retries: retried {result.retried}, "
         f"now evicted {result.retry_evicted}, still pending {result.retry_pending}",
     ]
+    for state, count in (
+        ("missing", result.retry_missing),
+        ("mismatched", result.retry_mismatched),
+        ("evict_failed", result.retry_evict_failed),
+        ("status_failed", result.retry_status_failed),
+    ):
+        if count:
+            lines.append(f"retry {state}: {count}")
+    return lines
 
 
 def restore(settings: Settings, icloud: ICloudItems, *, path: str, run: str | None) -> list[str]:

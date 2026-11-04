@@ -126,6 +126,10 @@ class MigrationResult:
     retried: int = 0
     retry_evicted: int = 0
     retry_pending: int = 0
+    retry_missing: int = 0
+    retry_mismatched: int = 0
+    retry_evict_failed: int = 0
+    retry_status_failed: int = 0
 
     def count(self, state: str) -> int:
         """How many moved-class paths ended in `state`."""
@@ -236,29 +240,55 @@ def _pending_in_journal(journal: Path, records: list[dict[str, Any]]) -> dict[Pa
     for record in records:
         if record["op"] in {"evicted", "bevicted", "retry_eviction"}:
             states.update(record["states"])
-    pending = {path: hashes[path] for path, state in states.items() if state == "pending_upload"}
+    unresolved = {"pending_upload", "missing", "mismatched", "evict_failed", "status_failed"}
+    pending = {path: hashes[path] for path, state in states.items() if state in unresolved}
     return {journal: pending} if pending else {}
 
 
-def _retry_pending(
-    settings: Settings, cache_dir: Path, icloud: ICloudItems
-) -> tuple[int, int, int]:
+@dataclass(frozen=True)
+class _RetryCounts:
+    retried: int = 0
+    evicted: int = 0
+    pending_upload: int = 0
+    missing: int = 0
+    mismatched: int = 0
+    evict_failed: int = 0
+    status_failed: int = 0
+
+
+def _retry_pending(settings: Settings, cache_dir: Path, icloud: ICloudItems) -> _RetryCounts:
     """Retry prior pending bodies through the normal bounded eviction path."""
     pending = pending_evictions(cache_dir)
     hashes = list(dict.fromkeys(sha for paths in pending.values() for sha in paths.values()))
     if not hashes:
-        return 0, 0, 0
-    report = evict_uploaded(settings, hashes, icloud)
-    evicted = set(report.evicted) | set(report.already_evicted)
-    cleared = 0
+        return _RetryCounts()
+    missing = {sha for sha in hashes if not is_archived(settings, sha)}
+    held = [sha for sha in hashes if sha not in missing]
+    report = evict_uploaded(settings, held, icloud) if held else None
+    outcomes = {sha: "missing" for sha in missing}
+    if report is not None:
+        for state, reported in (
+            ("evicted", (*report.evicted, *report.already_evicted)),
+            ("pending_upload", report.pending_upload),
+            ("mismatched", report.mismatched),
+            ("evict_failed", report.evict_failed),
+            ("status_failed", report.status_failed),
+        ):
+            outcomes.update({sha: state for sha in reported})
+    paths_seen: dict[str, str] = {}
     for journal, paths in pending.items():
-        states = {
-            path: "evicted" if sha in evicted else "pending_upload" for path, sha in paths.items()
-        }
-        cleared += sum(state == "evicted" for state in states.values())
+        states = {path: outcomes[sha] for path, sha in paths.items()}
+        paths_seen.update(states)
         _append(journal, {"op": "retry_eviction", "states": states})
-    total = sum(len(paths) for paths in pending.values())
-    return total, cleared, total - cleared
+    return _RetryCounts(
+        retried=len(paths_seen),
+        evicted=sum(state == "evicted" for state in paths_seen.values()),
+        pending_upload=sum(state == "pending_upload" for state in paths_seen.values()),
+        missing=sum(state == "missing" for state in paths_seen.values()),
+        mismatched=sum(state == "mismatched" for state in paths_seen.values()),
+        evict_failed=sum(state == "evict_failed" for state in paths_seen.values()),
+        status_failed=sum(state == "status_failed" for state in paths_seen.values()),
+    )
 
 
 def _settle(
@@ -316,7 +346,7 @@ def apply_migration(
         known_hashes=(),
         free_bytes=diskfloor.free_bytes(cache_dir),
     )
-    retried, retry_evicted, retry_pending = _retry_pending(settings, cache_dir, icloud)
+    retry = _retry_pending(settings, cache_dir, icloud)
     keep_dir = cache_dir / TOMBSTONE_DIR
     keep_dir.mkdir(exist_ok=True)
     journal = keep_dir / JOURNAL
@@ -378,9 +408,13 @@ def apply_migration(
         return MigrationResult(
             run_id=run,
             manifest_sha256="",
-            retried=retried,
-            retry_evicted=retry_evicted,
-            retry_pending=retry_pending,
+            retried=retry.retried,
+            retry_evicted=retry.evicted,
+            retry_pending=retry.pending_upload,
+            retry_missing=retry.missing,
+            retry_mismatched=retry.mismatched,
+            retry_evict_failed=retry.evict_failed,
+            retry_status_failed=retry.status_failed,
         )
 
     bstates = {p: r["state"] for p, r in bsettled.items()}
@@ -443,9 +477,13 @@ def apply_migration(
         manifest_sha256=manifest["digest"],
         states=states,
         backup_states=bstates,
-        retried=retried,
-        retry_evicted=retry_evicted,
-        retry_pending=retry_pending,
+        retried=retry.retried,
+        retry_evicted=retry.evicted,
+        retry_pending=retry.pending_upload,
+        retry_missing=retry.missing,
+        retry_mismatched=retry.mismatched,
+        retry_evict_failed=retry.evict_failed,
+        retry_status_failed=retry.status_failed,
     )
 
 
