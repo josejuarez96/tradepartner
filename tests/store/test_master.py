@@ -2914,3 +2914,25 @@ def test_filename_conflict_fails_closed_for_its_cik_only() -> None:
     assert [r for r in build.listings if security_cik(r["security_id"]) == bad] == list(
         alone.listings
     )
+
+
+def test_chain_candidates_ignore_a_predecessor_row_after_the_handover() -> None:
+    """#2939: a predecessor that keeps filing under the old ticker after the
+    successor's first listing row (ExxonMobil's 2026-08-03 co-filed 10-Q gave
+    the old CIK a NYSE row after the new CIK's 2026-07-07 row) is still the
+    pair's predecessor: its last row *at or before* the hand-over bounds the
+    gap, a row after it never hides the candidate."""
+    source = _combined_chain_source("chain_1to1")
+    settings = _settings()
+    master = build_master(source, settings, ingested_at=INGESTED_AT)
+    template = next(r for r in master.listings if r["security_id"] == "0001000010")
+    late = {
+        **template,
+        "valid_from": date(2020, 3, 2),
+        "known_at": datetime(2020, 3, 2, 21, 0, tzinfo=UTC),
+    }
+    master = replace(master, listings=(*master.listings, late))
+    candidates = chain_candidates(source, settings, master, delistings=_chain_delistings())
+    assert [(c.successor_id, c.predecessor_id, c.sessions) for c in candidates] == [
+        ("0001000011", "0001000010", 18)
+    ]

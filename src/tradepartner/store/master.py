@@ -1355,7 +1355,9 @@ def chain_candidates(
     `valid_from`) names a ticker and exchange another company's security last
     listed within `master.chain_window_sessions` sessions before it. The
     other security's last listed day is the greatest of its own listing rows'
-    `valid_from` under that pair and any Form 25 `effective_on` of
+    `valid_from` under that pair at or before the candidate's first row (a
+    later row, a predecessor still filing as a subsidiary, is ignored, #2939)
+    and any Form 25 `effective_on` of
     `delistings` on that exchange; the nearest such other security is named.
     Pure apart from reading `source`. The spin-off pair, with no successor
     filing, is never a candidate."""
@@ -1370,17 +1372,15 @@ def chain_candidates(
     for row in master.listings:
         listings[row["security_id"]].append(row)
     ends = _listing_ends(delistings)
-    # Every security's latest `valid_from` per (ticker, exchange), so a
+    # Every security's `valid_from` days per (ticker, exchange), so a
     # candidate's pair is looked up, not the whole universe scanned.
-    by_pair: dict[tuple[str, str], list[tuple[str, date]]] = defaultdict(list)
+    by_pair: dict[tuple[str, str], list[tuple[str, list[date]]]] = defaultdict(list)
     for security_id, rows in listings.items():
-        latest: dict[tuple[str, str], date] = {}
+        days: dict[tuple[str, str], list[date]] = defaultdict(list)
         for row in rows:
-            key = (row["ticker"], row["exchange"])
-            if row["valid_from"] > latest.get(key, date.min):
-                latest[key] = row["valid_from"]
-        for key, last in latest.items():
-            by_pair[key].append((security_id, last))
+            days[(row["ticker"], row["exchange"])].append(row["valid_from"])
+        for key, found in days.items():
+            by_pair[key].append((security_id, sorted(found)))
     by_cik: dict[str, set[str]] = defaultdict(set)
     for row in master.securities:
         by_cik[row["cik"]].add(row["security_id"])
@@ -1397,9 +1397,14 @@ def chain_candidates(
             continue
         ticker, exchange = first["ticker"], first["exchange"]
         best: ChainCandidate | None = None
-        for other_id, last in by_pair.get((ticker, exchange), ()):
+        for other_id, found in by_pair.get((ticker, exchange), ()):
             if security_cik(other_id) == cik:
                 continue
+            # The other security's last row at or before the candidate's
+            # first one: a row after it (a predecessor that keeps filing as a
+            # subsidiary, #2939) never hides the pair.
+            cut = bisect_right(found, first["valid_from"])
+            last = found[cut - 1] if cut else date.min
             end = max(last, ends.get((other_id, exchange), date.min))
             if end > first["valid_from"]:
                 continue
