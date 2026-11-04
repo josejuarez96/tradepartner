@@ -2953,8 +2953,8 @@ class AlpacaPriceSource(PriceSource):
         self._resolver = resolver
         # #2957: a reviewed duplicate dividend repair deleted is never stored
         # again; the list is the packaged one unless a test hands its own.
-        self._retracted: frozenset[tuple[str, str]] = frozenset(
-            (g.security_id, g.retract_source_action_id)
+        self._retracted: dict[tuple[str, str], tuple[date, float]] = dict(
+            ((g.security_id, g.retract_source_action_id), (g.ex_date, g.amount))
             for g in (reviewed if reviewed is not None else reviewed_groups())
             if g.verdict == DUPLICATE
         )
@@ -3329,6 +3329,14 @@ class AlpacaPriceSource(PriceSource):
         kept: list[CorporateAction] = []
         unrequested = 0
         reviewed_refused = 0
+        # A retract id is refused only beside its kept partner in this answer
+        # (same security, ex-date, amount, another id): if the feed drops the
+        # kept id, the dividend is not silently lost.
+        paid = {
+            (x.security_id, x.ex_date, x.ratio_or_amount, x.source_action_id)
+            for x in parsed.actions
+            if x.action_type is ActionType.DIVIDEND
+        }
         for a in parsed.actions:
             if a.action_type is ActionType.SPINOFF:
                 if a.security_id in ids or a.source_action_id in ids:
@@ -3342,7 +3350,13 @@ class AlpacaPriceSource(PriceSource):
             ):
                 if (
                     a.action_type is ActionType.DIVIDEND
-                    and (a.security_id, a.source_action_id) in self._retracted
+                    and self._retracted.get((a.security_id, a.source_action_id or ""))
+                    == (a.ex_date, a.ratio_or_amount)
+                    and any(
+                        k[:3] == (a.security_id, a.ex_date, a.ratio_or_amount)
+                        and k[3] != a.source_action_id
+                        for k in paid
+                    )
                 ):
                     reviewed_refused += 1  # #2957: reviewed as a duplicate, repair deleted it
                 else:

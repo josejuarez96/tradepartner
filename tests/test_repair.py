@@ -1688,3 +1688,22 @@ def test_an_unreviewed_or_distinct_pair_is_still_stored() -> None:
     assert [a.source_action_id for a in got] == ["a", "b"]
     assert source.last_actions_report is not None
     assert source.last_actions_report.reviewed_duplicates_refused == 0
+
+
+def test_a_retract_id_alone_in_the_feed_is_kept() -> None:
+    """If the feed drops the kept id, the payment is not silently lost."""
+    source = _alpaca_dup_source(LIST)
+    only_b = {
+        "cash_dividends": [
+            {
+                "symbol": "DUP",
+                "ex_date": EX.isoformat(),
+                "process_date": EX.isoformat(),
+                "rate": 0.5,
+                "id": "b",
+            }
+        ]
+    }
+    source._fetch_actions = lambda symbols, start, end: only_b
+    got = source.corporate_actions([DUP], date(2021, 6, 1), date(2021, 6, 30))
+    assert [a.source_action_id for a in got] == ["b"]
