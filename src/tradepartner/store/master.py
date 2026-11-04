@@ -1355,7 +1355,9 @@ def chain_candidates(
     `valid_from`) names a ticker and exchange another company's security last
     listed within `master.chain_window_sessions` sessions before it. The
     other security's last listed day is the greatest of its own listing rows'
-    `valid_from` under that pair and any Form 25 `effective_on` of
+    `valid_from` under that pair at or before the candidate's first row (a
+    later row, a predecessor still filing as a subsidiary, is ignored, #2939)
+    and any Form 25 `effective_on` of
     `delistings` on that exchange; the nearest such other security is named.
     Pure apart from reading `source`. The spin-off pair, with no successor
     filing, is never a candidate."""
