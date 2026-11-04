@@ -4983,14 +4983,14 @@ def _ny_date(instant: datetime) -> date:
     return instant.astimezone(_NEW_YORK).date()
 
 
-#: The rows a restamp may move in every table: EDGAR-sourced, `filing`
-#: provenance, never a row stamped at its own ingest (a revision or a
-#: retraction stamped at `ingested_at`).
 #: How far before the run's instant `_ingest_filings` stamps a restamp's
 #: moves (`ingested_at`), so the day's writes and revisions are a later
 #: ingest of every moved accession (#2968).
 _RESTAMP_TICK = timedelta(microseconds=1)
 
+#: The rows a restamp may move in every table: EDGAR-sourced, `filing`
+#: provenance, never a row stamped at its own ingest (a revision or a
+#: retraction stamped at `ingested_at`).
 _RESTAMPABLE = "t.source = 'edgar' AND t.provenance = 'filing' AND t.known_at <> t.ingested_at"
 
 
