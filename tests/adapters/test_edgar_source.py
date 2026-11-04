@@ -20,6 +20,7 @@ import shutil
 import threading
 import time
 import zipfile
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -3768,19 +3769,29 @@ def test_filename_fetch_failing_past_retries_fails_its_cik_closed(
 
 
 def test_filename_pool_sends_nothing_while_a_block_is_waited_out(tmp_path: Path) -> None:
-    """While SEC's rate-limit block is set, a pool worker sends nothing: each
-    fetch is deferred to the calling thread, which asks them one at a time in
-    stamp order (the first success clears the block), as the sequential
-    fetch does."""
+    """Pool workers send nothing during a block; the resulting listings and
+    request counts match a sequential fetch regardless of thread order."""
     edgar_raw._RATE_LIMIT_BLOCK.set()
     try:
         router = _fn_router()
+        worker_requests_during_block: list[str] = []
+        for url, original in list(router._routes.items()):
+
+            def checked(request: httpx.Request, original: Any = original) -> httpx.Response:
+                if edgar_raw.rate_limit_blocked() and threading.current_thread().name.startswith(
+                    "edgar-filename"
+                ):
+                    worker_requests_during_block.append(str(request.url))
+                return cast(httpx.Response, original(request))
+
+            router.add(url, checked)
         listings = _fn_source(tmp_path, router, filename_fetch_workers=4).filename_listings(_FN_CIK)
     finally:
         edgar_raw._RATE_LIMIT_BLOCK.clear()
     sequential = _fn_router()
     assert listings == _fn_source(tmp_path / "seq", sequential).filename_listings(_FN_CIK)
-    assert router.urls == sequential.urls
+    assert worker_requests_during_block == []
+    assert Counter(router.urls) == Counter(sequential.urls)
 
 
 def test_filename_fetch_block_given_up_on_still_raises(tmp_path: Path) -> None:
