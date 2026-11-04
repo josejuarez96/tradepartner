@@ -1634,3 +1634,57 @@ def test_the_dry_run_lists_no_chain_without_the_overlay(store: Settings) -> None
     """The store fixture has no successor_chains rows: no chain line."""
     result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
     assert result.chains == ()
+
+
+# --- #2957: a reviewed duplicate stays deleted through the next backfill ---
+
+
+def _alpaca_dup_source(reviewed: Any = None) -> Any:
+    """An Alpaca source whose feed again carries DUP's two ids on EX."""
+    from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, ListingResolver
+
+    payload = {
+        "cash_dividends": [
+            {
+                "symbol": "DUP",
+                "ex_date": EX.isoformat(),
+                "process_date": EX.isoformat(),
+                "rate": 0.5,
+                "id": action_id,
+            }
+            for action_id in ("a", "b")
+        ]
+    }
+    kwargs: dict[str, Any] = {} if reviewed is None else {"reviewed": reviewed}
+    return AlpacaPriceSource(
+        ListingResolver([_listing(DUP, "DUP", date(2020, 1, 2))]),
+        fetch_actions=lambda symbols, start, end: payload,
+        settings=Settings(_env_file=None),  # type: ignore[call-arg]
+        **kwargs,
+    )
+
+
+def test_a_reviewed_duplicate_stays_deleted_through_a_backfill(dividends: Settings) -> None:
+    from tradepartner.ingest import _add_actions
+
+    _retract(dividends, expect=1, release=REL)
+    assert (DUP, EX, "b") not in _actions(dividends)
+    source = _alpaca_dup_source(LIST)
+    window = (date(2021, 6, 1), date(2021, 6, 30))
+    again = source.corporate_actions([DUP], *window)
+    assert [a.source_action_id for a in again] == ["a"]
+    assert source.last_actions_report is not None
+    assert source.last_actions_report.reviewed_duplicates_refused == 1
+    assert "1 reviewed duplicate dividend(s) refused" in source.resolution_summary()
+    with open_for_write(dividends) as conn:
+        _add_actions(conn, again, window, ingested_at=RUN)
+    assert (DUP, EX, "b") not in _actions(dividends)
+    assert (DUP, EX, "a") in _actions(dividends)
+
+
+def test_an_unreviewed_or_distinct_pair_is_still_stored() -> None:
+    source = _alpaca_dup_source([_entry(DUP, "distinct")])
+    got = source.corporate_actions([DUP], date(2021, 6, 1), date(2021, 6, 30))
+    assert [a.source_action_id for a in got] == ["a", "b"]
+    assert source.last_actions_report is not None
+    assert source.last_actions_report.reviewed_duplicates_refused == 0
