@@ -456,6 +456,75 @@ def test_an_unconfirmed_backup_upload_stays_pending_and_counted(rig: Rig) -> Non
     )
 
 
+def test_a_second_apply_retries_pending_moves_and_backups(rig: Rig) -> None:
+    from tradepartner.store import archive_cmd
+
+    rig.icloud.never_upload = True
+    first = rig.run()
+    assert first.count("pending_upload") == 2
+    assert first.backup_count("pending_upload") == 1
+    rig.icloud.never_upload = False
+    settings = rig.settings.model_copy(
+        update={"edgar": rig.settings.edgar.model_copy(update={"cache_dir": str(rig.cache)})}
+    )
+    lines = archive_cmd.migrate_cache(settings, rig.icloud, apply=True)
+    assert "retried 3" in " ".join(lines)
+    assert "now evicted 3" in " ".join(lines)
+    assert "still pending 0" in " ".join(lines)
+    assert len(rig.icloud.evicted) == 3
+    again = rig.run()
+    assert again.retried == again.retry_evicted == again.retry_pending == 0
+
+
+def test_dry_run_counts_pending_retries_without_eviction(rig: Rig) -> None:
+    from tradepartner.store import archive_cmd
+
+    rig.icloud.never_upload = True
+    rig.run()
+    rig.icloud.never_upload = False
+    settings = rig.settings.model_copy(
+        update={"edgar": rig.settings.edgar.model_copy(update={"cache_dir": str(rig.cache)})}
+    )
+    before = sorted((rig.cache / "_archived").iterdir())
+    journal_bytes = {path: path.read_bytes() for path in before}
+    lines = archive_cmd.migrate_cache(settings, rig.icloud, apply=False)
+    assert "would retry 3" in " ".join(lines)
+    assert rig.icloud.evicted == set()
+    assert sorted((rig.cache / "_archived").iterdir()) == before
+    assert {path: path.read_bytes() for path in before} == journal_bytes
+
+
+def test_a_retry_still_waiting_for_upload_stays_pending_and_is_counted(rig: Rig) -> None:
+    rig.icloud.never_upload = True
+    rig.run()
+    second = rig.run()
+    assert (second.retried, second.retry_evicted, second.retry_pending) == (3, 0, 3)
+    assert rig.icloud.evicted == set()
+    rig.icloud.never_upload = False
+    third = rig.run()
+    assert (third.retried, third.retry_evicted, third.retry_pending) == (3, 3, 0)
+
+
+def test_an_interrupted_run_retries_its_pending_uploads(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.icloud.never_upload = True
+
+    def stop(name: str) -> None:
+        if name == "backup_evict":
+            raise Boom
+
+    monkeypatch.setattr(raw_archive_migrate, "_step", stop)
+    with pytest.raises(Boom):
+        rig.run()
+    monkeypatch.setattr(raw_archive_migrate, "_step", lambda _n: None)
+    rig.icloud.never_upload = False
+    result = rig.run()
+    assert (result.retried, result.retry_evicted, result.retry_pending) == (3, 3, 0)
+    assert result.count("evicted") == 2
+    assert result.backup_count("evicted") == 1
+
+
 @pytest.mark.parametrize(
     "step", ["backup_intent", "backup_copy", "backup_evict", "manifest", "evict"]
 )

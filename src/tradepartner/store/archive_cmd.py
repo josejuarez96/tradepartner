@@ -142,6 +142,10 @@ def _dry_run(settings: Settings, cache_dir: Path) -> list[str]:
         )
         out.append(f"projected free after {phase.name}: {phase.free_bytes} bytes ({note})")
     out.append(f"floor: {plan.floor_bytes} bytes")
+    out.append(
+        f"pending_upload: would retry "
+        f"{sum(len(paths) for paths in migrate.pending_evictions(cache_dir).values())}"
+    )
     if plan.backup_refused_at is not None:
         out.append(f"the backup copies stop at {plan.backup_refused_at} (below the floor)")
     return out
@@ -181,12 +185,14 @@ def migrate_cache(settings: Settings, icloud: ICloudItems, *, apply: bool) -> li
         f"{state} {result.backup_count(state)}"
         for state in ("evicted", "pending_upload", "backed_up", "changed")
     )
+    pending_total = sum(len(paths) for paths in migrate.pending_evictions(cache_dir).values())
     return [
         f"migrate-cache applied: run {result.run_id or '-'}",
         f"moved files: {moved}",
         f"backup files: {backed}",
-        f"pending_upload (still local, not yet confirmed uploaded): "
-        f"{result.count('pending_upload') + result.backup_count('pending_upload')}",
+        f"pending_upload (still local, not yet confirmed uploaded): {pending_total}",
+        f"pending_upload retries: retried {result.retried}, "
+        f"now evicted {result.retry_evicted}, still pending {result.retry_pending}",
     ]
 
 
