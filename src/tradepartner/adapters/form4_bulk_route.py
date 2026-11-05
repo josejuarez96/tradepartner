@@ -374,6 +374,7 @@ def run_form4_bulk_route(
     source_counts_failures: bool = False,
     accession_quarters: Mapping[str, Quarter] | None = None,
     rule5: Rule5 | None = None,
+    xml_accessions: frozenset[str] = frozenset(),
 ) -> BulkRouteResult:
     """Route selected Form 4 accessions, never substituting a bulk row after XML fails.
 
@@ -387,6 +388,8 @@ def run_form4_bulk_route(
     its refusal. With it set, a disagreement never blocks the quarter: the XML is stored
     (or, for a sampled accession later routed to bulk, its trusted row) and the driver
     writes the marker; the driver fails the run if the share reaches the threshold.
+    `xml_accessions` (accessions with a carried unresolved marker) always route to XML,
+    so a marked accession is never stored from bulk rows.
     """
     if budget <= 0:
         raise ValueError("budget must be positive")
@@ -458,10 +461,10 @@ def run_form4_bulk_route(
                     found = rule5.record(accession, sample_rows, parsed.transactions)
                     if enforcing and found:
                         sampled[accession] = parsed
-                if enforcing:  # a mismatch is counted and marked, never a refusal
-                    clean = clean and parsed is not None and accession not in sampled
-                    if parsed is None:
-                        counts["sec_forms_bulk_order_sample_unfetched"] += 1
+                if enforcing and parsed is not None:
+                    # a mismatch is counted and marked, never a refusal; a sample that
+                    # could not be fetched is no comparison and still refuses the quarter
+                    clean = clean and accession not in sampled
                     continue
                 if parsed is None or not rows_agree(sample_rows, parsed.transactions):
                     mismatch = True
@@ -494,7 +497,9 @@ def run_form4_bulk_route(
                 continue
             accession_bulk = bulk.accessions.get(accession) if bulk is not None else None
             decision = (
-                AccessionRoute(Route.XML, "sec_forms_bulk_multi_owner_xml")
+                AccessionRoute(Route.XML, "sec_forms_compare_marker_xml")
+                if accession in xml_accessions and accession_bulk is not None
+                else AccessionRoute(Route.XML, "sec_forms_bulk_multi_owner_xml")
                 if (
                     multi_owner_xml
                     and accession_bulk is not None

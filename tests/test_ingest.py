@@ -11657,3 +11657,42 @@ def test_form4_rule5_threshold_needs_the_raw_archive(
         ingest_module._write_form4_bulk(
             fixture_store, enabled, case.source, frozenset({case.issuer}), case.now
         )
+
+
+def test_form4_rule5_markers_survive_a_run_that_skips_the_form4_step(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later writer that does not run the Form 4 step (or has the threshold unset)
+    still copies the unresolved markers into its manifest."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    case.run(fixture_store, case.now)
+    unset = case.settings.model_copy(
+        update={"events": case.settings.events.model_copy(update={"form4_compare_threshold": None})}
+    )
+    provenance = ingest_module._Form4Provenance.start(unset, run_id="writer-2", writer="sec_forms")
+    ingest_module._write_sec_forms(
+        fixture_store, unset, case.source, lambda: [], frozenset(), case.now,
+        form4=False, provenance=provenance,
+    )  # fmt: skip
+    digest = provenance.finish()
+    from tradepartner.adapters.form4_archive import parse_manifest
+
+    manifest = parse_manifest((tmp_path / "archive" / "manifests" / digest).read_bytes())
+    assert [m["accession"] for m in _markers(manifest)] == [case.accession]
+
+
+def test_form4_rule5_unreadable_latest_manifest_fails_a_threshold_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    case.run(fixture_store, case.now)
+    for path in (tmp_path / "archive" / "manifests").iterdir():
+        path.unlink()
+    with pytest.raises(RuntimeError, match="unreadable"):
+        case.run(fixture_store, case.now + timedelta(days=1), "writer-2")

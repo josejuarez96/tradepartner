@@ -924,3 +924,55 @@ def test_markers_name_both_values_and_only_unresolved_ones_carry() -> None:
     manifest = {"entries": [marker, resolved, {"row_source": "sec_form4_xml"}]}
     assert unresolved_markers(manifest) == [marker]
     assert unresolved_markers(None) == []
+
+
+def test_an_unfetched_order_sample_still_refuses_the_quarter_when_enforcing(
+    tmp_path: Path,
+) -> None:
+    bulk = _bulk(tmp_path)
+    record = bulk.accessions[_SINGLE]
+    counts = run_form4_bulk_route(
+        [(_SINGLE, record.issuer_cik, "4", date(2026, 3, 31))],
+        quarters={Quarter(2026, 1): bulk},
+        stamp=lambda *_: _ACCEPTED,
+        xml=lambda *_: None,
+        write=lambda f: pytest.fail("written"),
+        write_bulk=lambda f, q: pytest.fail("written"),
+        now=_ACCEPTED,
+        price_below=1,
+        zero_price_codes=("P", "S"),
+        order_sample_size=1,
+        budget=10,
+        rule5=_rule5("0.5"),
+    ).counts
+    assert counts["sec_forms_bulk_order_mismatch"] == 1
+
+
+def test_a_marked_accession_is_never_stored_from_bulk_rows(tmp_path: Path) -> None:
+    rule5 = _rule5("0.5")
+    _counts, _xml, bulk_writes = _route_rule5(
+        tmp_path, rule5, _shares_off, sample=0, accessions=(_SINGLE,)
+    )
+    assert [w.accession for w in bulk_writes] == [_SINGLE]  # unmarked: plain bulk
+    bulk = _bulk(tmp_path)
+    written: list[SecFormFiling] = []
+    record = bulk.accessions[_SINGLE]
+    run_form4_bulk_route(
+        [(_SINGLE, record.issuer_cik, "4", date(2026, 3, 31))],
+        quarters={Quarter(2026, 1): bulk},
+        stamp=lambda *_: _ACCEPTED,
+        xml=lambda _c, a, _d: _shares_off(
+            SecFormFiling(a, "4", _ACCEPTED, date(2026, 3, 31), (record.issuer_cik,),
+                          record.filer_ciks, record.transactions)
+        ),
+        write=written.append,
+        write_bulk=lambda f, q: pytest.fail("a marked accession was stored from bulk"),
+        now=_ACCEPTED,
+        price_below=1,
+        zero_price_codes=("P", "S"),
+        order_sample_size=0,
+        budget=10,
+        rule5=rule5,
+        xml_accessions=frozenset({_SINGLE}),
+    )  # fmt: skip
+    assert [w.accession for w in written] == [_SINGLE] and _SINGLE in rule5.found

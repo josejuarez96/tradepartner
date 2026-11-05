@@ -3570,6 +3570,7 @@ class _Form4Provenance:
         self.digest: str | None = None
         #: Rule 5 review markers (T351): carried from the latest manifest or new this run.
         self.markers: list[dict[str, object]] = []
+        self.markers_carried = False
 
     @classmethod
     def start(
@@ -3752,6 +3753,30 @@ def _latest_form4_manifest(
     return None
 
 
+def _carry_markers(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    provenance: _Form4Provenance | None,
+    counts: Counter[str],
+) -> None:
+    """Copy the unresolved rule 5 markers of the latest committed manifest into this
+    writer's recorder, once, whatever the threshold or whether the Form 4 step runs, so
+    no newer manifest drops them. With the threshold set, an unreadable latest manifest
+    fails the run rather than let a marker-less manifest become the latest."""
+    if provenance is None or provenance.markers_carried:
+        return
+    provenance.markers_carried = True
+    before = counts["sec_forms_provenance_manifest_unread"]
+    provenance.markers = unresolved_markers(_latest_form4_manifest(conn, settings, counts))
+    if settings.events.form4_compare_threshold is not None and (
+        counts["sec_forms_provenance_manifest_unread"] > before
+    ):
+        raise RuntimeError(
+            "the latest Form 4 manifest is unreadable, so its review markers cannot be "
+            "copied forward; restore it before a run with events.form4_compare_threshold"
+        )
+
+
 def _bulk_run_fields(message: str | None) -> dict[str, str]:
     """The `key=value` fields of one `sec_insider_bulk` run message, split on `;`."""
     return dict(part.strip().split("=", 1) for part in (message or "").split(";") if "=" in part)
@@ -3803,13 +3828,12 @@ def _form4_bulk(
 
     rule5 = Rule5(declaration_from(settings.events))
     manifest_counts: Counter[str] = Counter()
-    if rule5.enforcing and provenance is not None:
-        # Rule 5 (#2714 item 6): copy forward the unresolved markers of the latest
-        # committed writer manifest, before any early return can drop them.
-        provenance.markers = unresolved_markers(
-            _latest_form4_manifest(conn, settings, manifest_counts)
-        )
-
+    _carry_markers(conn, settings, provenance, manifest_counts)  # before any early return
+    marked = frozenset(
+        str(m["accession"])
+        for m in (provenance.markers if provenance else [])
+        if m["status"] == "unresolved"
+    )
     start = settings.events.sec_forms_backfill_start
     latest = quarter_of(now.date())
     quarters = [
@@ -3994,17 +4018,22 @@ def _form4_bulk(
                     quarter_bulk.accessions.get(accession) if quarter_bulk is not None else None
                 )
                 if (
-                    settings.events.form4_multi_owner_xml
-                    and candidate is not None
-                    and len(set(candidate.filer_ciks)) > 1
-                ) or route_accession(
-                    candidate,
-                    state=state,
-                    submissions_form=form,
-                    submissions_filing_date=filed,
-                    price_below=settings.events.form4_xml_price_below,
-                    zero_price_codes=settings.events.form4_zero_price_xml_codes,
-                ).route is Route.XML:
+                    accession in marked
+                    or (
+                        settings.events.form4_multi_owner_xml
+                        and candidate is not None
+                        and len(set(candidate.filer_ciks)) > 1
+                    )
+                    or route_accession(
+                        candidate,
+                        state=state,
+                        submissions_form=form,
+                        submissions_filing_date=filed,
+                        price_below=settings.events.form4_xml_price_below,
+                        zero_price_codes=settings.events.form4_zero_price_xml_codes,
+                    ).route
+                    is Route.XML
+                ):
                     xml_expected += 1
         del loaded, quarter_bulk, xml_saved  # released before the next quarter is read
         _LOGGER.info(
@@ -4224,6 +4253,7 @@ def _form4_bulk(
             source_counts_failures=True,
             accession_quarters=accession_quarters,
             rule5=rule5,
+            xml_accessions=marked,
         )
         del quarter_bulk  # released before the next quarter is read
         counts.update(result.counts)
@@ -4360,6 +4390,7 @@ def _write_sec_forms(
 
     sec_added = sec_changed = sec_future = 0
     form4_message = ""
+    _carry_markers(conn, settings, provenance, Counter())
     if (
         form4
         and isinstance(raw_source, EdgarFilingSource)
