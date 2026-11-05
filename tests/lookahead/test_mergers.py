@@ -74,36 +74,120 @@ def test_nothing_a_trial_reads_names_the_mergers_table(path: Path) -> None:
     delisting failure-return amendment adds (#2670, plan T328b): the provider's
     `merger_exits`, read only at the data cutoff under a non-`none` policy and
     tested for look-ahead in `tests/backtest/test_store_provider.py`."""
-    text = path.read_text()
-    if path.relative_to(_SRC) in _T328B_READERS:
-        text = _without_merger_exits(text)
-    assert re.search(r"\bmergers(_as_of)?\b", text) is None
+    assert _mergers_reader_violations(path.read_text(), path.relative_to(_SRC)) == []
 
 
-#: The modules allowed to name `mergers`, each only inside `merger_exits` (T328b).
-_T328B_READERS = {Path("backtest/provider.py"), Path("backtest/store_provider.py")}
+#: The two class methods allowed to read mergers for exit evidence (T328b).
+_T328B_READERS = {
+    Path("backtest/provider.py"): "DataProvider",
+    Path("backtest/store_provider.py"): "StoreProvider",
+}
 
 
-def _without_merger_exits(text: str) -> str:
-    """`text` with the `merger_exits` method, the module docstring and the import list
-    left out, so a second reader of `mergers` in the module still fails the guard."""
-    tree = ast.parse(text)
-    lines = text.splitlines(keepends=True)
-    drop: set[int] = set()
-    doc = tree.body[0]
-    if isinstance(doc, ast.Expr) and isinstance(doc.value, ast.Constant):
-        drop.update(range(doc.lineno, (doc.end_lineno or doc.lineno) + 1))
-    for node in ast.walk(tree):
-        is_reader = isinstance(node, ast.FunctionDef) and node.name == "merger_exits"
-        is_import = isinstance(node, ast.ImportFrom) and node.module == "tradepartner.store.asof"
-        if is_reader or is_import:
-            drop.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
-    return "".join(line for number, line in enumerate(lines, 1) if number not in drop)
+def _mergers_reader_violations(source: str, path: Path) -> list[int]:
+    """Return lines that name the merger reader or read its table outside T328b."""
+    tree = ast.parse(source)
+    allowed_class = _T328B_READERS.get(path)
+    allowed_methods = {
+        id(method)
+        for cls in tree.body
+        if isinstance(cls, ast.ClassDef) and cls.name == allowed_class
+        for method in cls.body
+        if isinstance(method, ast.FunctionDef) and method.name == "merger_exits"
+    }
+    violations: list[int] = []
+
+    class ReaderVisitor(ast.NodeVisitor):
+        def visit_Module(self, node: ast.Module) -> None:
+            body = node.body
+            if path in _T328B_READERS and ast.get_docstring(node):
+                body = body[1:]
+            for statement in body:
+                self.visit(statement)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if id(node) not in allowed_methods:
+                self.generic_visit(node)
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            for alias in node.names:
+                if alias.name in {"mergers", "mergers_as_of"}:
+                    permitted = (
+                        path == Path("backtest/store_provider.py")
+                        and node.module == "tradepartner.store.asof"
+                        and alias.name == "mergers_as_of"
+                        and alias.asname is None
+                    )
+                    if not permitted:
+                        violations.append(node.lineno)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            if any("mergers" in alias.name.split(".") for alias in node.names):
+                violations.append(node.lineno)
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if node.id in {"mergers", "mergers_as_of"}:
+                violations.append(node.lineno)
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if node.attr in {"mergers", "mergers_as_of"}:
+                violations.append(node.lineno)
+            self.generic_visit(node)
+
+        def visit_Constant(self, node: ast.Constant) -> None:
+            if isinstance(node.value, str) and re.search(r"\bmergers(_as_of)?\b", node.value):
+                violations.append(node.lineno)
+
+    ReaderVisitor().visit(tree)
+    return violations
 
 
-def test_the_guard_still_catches_a_second_mergers_reader() -> None:
-    """The T328b exemption covers `merger_exits` only."""
-    source = (_SRC / "backtest" / "store_provider.py").read_text()
-    assert re.search(r"\bmergers_as_of\b", _without_merger_exits(source)) is None
-    planted = source + "\n\ndef _sneak(conn):\n    return mergers_as_of(conn, None)\n"
-    assert re.search(r"\bmergers_as_of\b", _without_merger_exits(planted)) is not None
+@pytest.mark.parametrize(
+    ("extra", "path"),
+    [
+        (
+            "from tradepartner.store.asof import mergers_as_of as _m\n"
+            "def sneak(conn):\n    return _m(conn, None)\n",
+            Path("backtest/store_provider.py"),
+        ),
+        (
+            "from tradepartner.store import asof as m\n"
+            "def sneak(conn):\n    return m.mergers_as_of(conn, None)\n",
+            Path("backtest/store_provider.py"),
+        ),
+        (
+            "import tradepartner.store.mergers as m\n"
+            "def sneak(conn):\n    return m.mergers_as_of(conn, None)\n",
+            Path("backtest/store_provider.py"),
+        ),
+        (
+            "class OtherProvider:\n"
+            "    def merger_exits(self, conn):\n"
+            "        return mergers_as_of(conn, None)\n",
+            Path("backtest/store_provider.py"),
+        ),
+        (
+            "def merger_exits(conn):\n    return mergers_as_of(conn, None)\n",
+            Path("backtest/provider.py"),
+        ),
+        (
+            "def sneak(conn):\n    return conn.sql('SELECT * FROM mergers')\n",
+            Path("backtest/store_provider.py"),
+        ),
+        (
+            "def sneak(conn):\n    return conn.sql('SELECT * FROM main.mergers')\n",
+            Path("backtest/store_provider.py"),
+        ),
+        (
+            "def sneak(conn):\n    return getattr(conn, 'mergers_as_of')\n",
+            Path("backtest/store_provider.py"),
+        ),
+    ],
+)
+def test_guard_catches_second_reader(extra: str, path: Path) -> None:
+    assert _mergers_reader_violations(extra, path)
+
+
+@pytest.mark.parametrize("path", sorted(_T328B_READERS))
+def test_guard_allows_real_provider_method(path: Path) -> None:
+    assert _mergers_reader_violations((_SRC / path).read_text(), path) == []
