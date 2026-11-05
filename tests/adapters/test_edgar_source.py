@@ -3899,26 +3899,27 @@ def test_filename_pool_a_block_waited_out_reads_as_the_sequential_fetch(
 
 
 def test_a_cached_v5_cover_page_is_no_longer_served(settings: Settings) -> None:
-    """T181 (#1541): the owner backed `cover_split_contexts` out in the same
-    release and the caches go to version 6, so a per-document cover page
-    cached under v5, parsed with the switch on, is never served: it is
-    fetched and parsed again."""
-    assert (FSN_VERSION, COVER_VERSION) == (6, 6)
+    """T181 (#1541), T198: the caches went to version 6 when the owner backed
+    `cover_split_contexts` out and to 7 when `rederive-1682` turned it back on,
+    so a per-document cover page cached under v5 (or v6) is never served: it
+    is fetched and parsed again."""
+    assert (FSN_VERSION, COVER_VERSION) == (7, 7)
     accession = "0000320193-24-000123"
-    old = Path(settings.edgar.cache_dir) / "cover" / "v5" / f"{accession}.json"
-    old.parent.mkdir(parents=True, exist_ok=True)
-    old.write_text(
-        json.dumps(
-            {
-                "version": 5,
-                "accession": accession,
-                "cik": "0000320193",
-                "entity_cik": "0000320193",
-                "listings": [],
-                "facts": [],
-            }
+    for stale in (5, 6):
+        old = Path(settings.edgar.cache_dir) / "cover" / f"v{stale}" / f"{accession}.json"
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_text(
+            json.dumps(
+                {
+                    "version": stale,
+                    "accession": accession,
+                    "cik": "0000320193",
+                    "entity_cik": "0000320193",
+                    "listings": [],
+                    "facts": [],
+                }
+            )
         )
-    )
     source = _source(settings, EdgarRouter())
     assert source._load_cover_cache(accession) is None
 

@@ -285,7 +285,9 @@ class EdgarConfig(BaseModel):
     # Flipped on by the release `cover-listings-1541` (T181) at cache version 4,
     # then backed out by the owner in the same release (2026-10-14, cache
     # version 6): its class identities wait on the security-master review (#1682).
-    cover_split_contexts: bool = False
+    # Flipped back on by the release `rederive-1682` (T198) with the cache
+    # version 7 bumps, after the review (T190, T192, T193).
+    cover_split_contexts: bool = True
     # #1169 (owner decision 2026-10-07, option 3): per CIK, the class member
     # (`CommonClass<letter>`) whose shares facts go to the CIK's one common
     # class although no title of that class names the letter. Owner-reviewed,
@@ -308,8 +310,8 @@ class EdgarConfig(BaseModel):
     # being a candidate for a total (WBD's old series), all as of each fact's
     # acceptance.
     # Off, every `facts` row is as before. The release `rederive-1682` (T198)
-    # flips it with the facts re-derive, never a nightly run before it.
-    class_member_link: bool = False
+    # flipped it with the facts re-derive.
+    class_member_link: bool = True
     # Rule 3's page count: one fiscal year of periodic cover pages.
     dead_class_filings: int = Field(default=4, ge=1)
     # Rule 2's nominal class: every other member of the filing at most this
