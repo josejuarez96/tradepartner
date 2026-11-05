@@ -49,6 +49,7 @@ from tradepartner.adapters.prices import (
 )
 from tradepartner.calendar import is_session, next_session, session_close
 from tradepartner.config import AlpacaConfig, Settings
+from tradepartner.store.dividend_reviews import ReviewedGroup, ReviewsError, parse_reviews
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "alpaca"
 
@@ -3015,6 +3016,69 @@ class _Recorded:
 
 def _settings(**alpaca: object) -> Settings:
     return Settings(_env_file=None, alpaca=alpaca)  # type: ignore[call-arg]
+
+
+def _reviewed_source(
+    rows: list[tuple[str, date, float]], reviewed: list[ReviewedGroup]
+) -> AlpacaPriceSource:
+    return AlpacaPriceSource(
+        ListingResolver([_listing("SEC_DUP", "DUP", date(2020, 1, 2))]),
+        fetch_actions=lambda symbols, start, end: {
+            "cash_dividends": [
+                {
+                    "symbol": "DUP",
+                    "ex_date": day.isoformat(),
+                    "process_date": day.isoformat(),
+                    "rate": amount,
+                    "id": action_id,
+                }
+                for action_id, day, amount in rows
+            ]
+        },
+        settings=_settings(),
+        reviewed=reviewed,
+    )
+
+
+def _review(action_id: str = "b", amount: float = 0.5) -> ReviewedGroup:
+    return ReviewedGroup(
+        "SEC_DUP", date(2021, 6, 15), amount, "duplicate", action_id, "DUP", "test"
+    )
+
+
+def test_two_retract_ids_do_not_count_as_kept_partners() -> None:
+    day = date(2021, 6, 15)
+    source = _reviewed_source([("b", day, 0.5), ("c", day, 0.5)], [_review("b"), _review("c")])
+    got = source.corporate_actions(["SEC_DUP"], day, day)
+    assert [action.source_action_id for action in got] == ["b", "c"]
+    assert source.last_actions_report is not None
+    assert source.last_actions_report.reviewed_duplicates_refused == 0
+
+
+def test_float_noise_is_a_different_exact_amount_key() -> None:
+    day = date(2021, 6, 15)
+    source = _reviewed_source([("a", day, 0.3), ("b", day, 0.1 + 0.2)], [_review("b", 0.3)])
+    got = source.corporate_actions(["SEC_DUP"], day, day)
+    assert [action.source_action_id for action in got] == ["a", "b"]
+
+
+@pytest.mark.parametrize("changed", [(date(2021, 6, 16), 0.5), (date(2021, 6, 15), 0.6)])
+def test_reissued_id_with_changed_payment_is_kept(changed: tuple[date, float]) -> None:
+    day = date(2021, 6, 15)
+    source = _reviewed_source([("a", day, 0.5), ("b", *changed)], [_review()])
+    got = source.corporate_actions(["SEC_DUP"], day, date(2021, 6, 16))
+    assert [action.source_action_id for action in got] == ["a", "b"]
+
+
+def test_malformed_reviews_fail_source_construction(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tradepartner.adapters.alpaca_prices as prices
+
+    def malformed() -> tuple[ReviewedGroup, ...]:
+        return parse_reviews("bad,header\n")
+
+    monkeypatch.setattr(prices, "reviewed_groups", malformed)
+    with pytest.raises(ReviewsError, match=r"dividend_reviews\.csv line 1"):
+        AlpacaPriceSource(ListingResolver([]), settings=_settings())
 
 
 class TestAlpacaPriceSource:

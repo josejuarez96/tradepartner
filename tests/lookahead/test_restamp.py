@@ -1249,3 +1249,88 @@ def test_a_moved_fact_accession_whose_date_set_changed_is_revised_at_the_run(
             [ACME, A_COVER[0]],
         ).fetchall()
     assert revisions == [(RESTAMP_RUN,)]
+
+
+# --- a stored revision of a moved fact accession (#2970) ---------------------
+
+REVISION_RUN = datetime(2019, 6, 30, 2, 0, tzinfo=UTC)
+
+
+def _only_second_date(source: FixtureFilingSource) -> FixtureFilingSource:
+    """The cache gives ACME's cover accession only its second date."""
+    source._facts = [
+        f for f in source._facts if not (f.cik == ACME and f.as_of_date == date(2019, 2, 15))
+    ]
+    return source
+
+
+_THIRD_RUN = REVISION_RUN + timedelta(hours=12)
+
+
+@pytest.mark.parametrize("case", ["drop", "add", "redate", "two_revisions"], ids=lambda c: str(c))
+def test_a_restamp_never_changes_a_read_at_or_after_a_stored_revision(
+    settings: Settings, case: str
+) -> None:
+    """#2970: an accession ingested more than once before a restamp (a date
+    dropped or added, a date set swapped without a revision row, two
+    revisions) and then restamped. The restamp moves the originals, never a
+    row stamped at its own ingest, so every read from the true stamp on must
+    keep serving what it served before the restamp."""
+    both = _source(acme_early=True, acme_second_date=True)
+    runs: list[tuple[datetime, FixtureFilingSource]]
+    if case == "drop":
+        runs = [(FIRST_RUN, both), (REVISION_RUN, _source(acme_early=True))]
+        final = _source(acme_early=False)
+    elif case == "add":
+        runs = [(FIRST_RUN, _source(acme_early=True)), (REVISION_RUN, both)]
+        final = _source(acme_early=False, acme_second_date=True)
+    elif case == "redate":
+        runs = [
+            (FIRST_RUN, _source(acme_early=True)),
+            (REVISION_RUN, _only_second_date(_source(acme_early=True, acme_second_date=True))),
+        ]
+        final = _only_second_date(_source(acme_early=False, acme_second_date=True))
+    else:
+        runs = [
+            (FIRST_RUN, both),
+            (REVISION_RUN, _source(acme_early=True)),
+            (_THIRD_RUN, both),
+        ]
+        final = _source(acme_early=False, acme_second_date=True)
+    for now, source in runs:
+        status, message, _ = _ingest(settings, source, now=now)
+        assert status == OK, message
+    store = _Store(settings.store.path)
+    tick = timedelta(microseconds=1)
+    probes = [
+        _early(A_COVER[1]),
+        A_COVER[1],
+        FIRST_RUN,
+        REVISION_RUN - tick,
+        REVISION_RUN,
+        REVISION_RUN + timedelta(hours=1),
+        _THIRD_RUN,
+        RESTAMP_RUN - tick,
+        RESTAMP_RUN,
+    ]
+
+    def served(t: datetime) -> list[date]:
+        with duckdb.connect(store.path, read_only=True) as conn:
+            conn.execute("SET TimeZone='UTC'")
+            rows = facts_as_of(conn, t, [ACME])
+            return sorted(rows.filter(rows["filing_accession"] == A_COVER[0])["as_of_date"])
+
+    before = {t: served(t) for t in probes}
+
+    status, message, (result,) = _ingest(settings, final, now=RESTAMP_RUN, restamp=_acme_manifest())
+
+    assert status == OK, message
+    assert result.refused == {}
+    after = {t: served(t) for t in probes}
+    # Only reads before the true stamp may change (the repair's purpose: the
+    # rows become known there, and nothing earlier becomes visible).
+    for t in probes:
+        if t >= A_COVER[1]:
+            assert after[t] == before[t], (case, t)
+        else:
+            assert after[t] == [], (case, t)

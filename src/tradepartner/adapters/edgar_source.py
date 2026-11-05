@@ -316,6 +316,7 @@ from tradepartner.adapters.edgar import (
     SEC_FORMS_PARSER_VERSION,
     CoverPageParse,
     FilingParties,
+    Form25Evidence,
     FsnFiling,
     FsnShare,
     SgmlNoAcceptanceError,
@@ -334,6 +335,7 @@ from tradepartner.adapters.edgar import (
     parse_delisting,
     parse_filing_index,
     parse_form4,
+    parse_form25_evidence,
     parse_fsn,
     parse_schedule_13d_xml,
     parse_sgml_13d_parties,
@@ -410,6 +412,9 @@ COVER_VERSION = 7
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
 DELISTING_VERSION = 1
+#: The per-document `parse_form25_evidence` cache (`delisting_evidence/v1/`, T327,
+#: #2670): the provision only, beside (never inside) the `DELISTING_VERSION` cache.
+FORM25_EVIDENCE_VERSION = 1
 #: The filename-listing extract cache (`filename/v1/<cik>.json`, T184b, #1597):
 #: names, prefix and 12(b) class/exchange pairs only, never a document.
 FILENAME_VERSION = 1
@@ -3508,6 +3513,90 @@ class EdgarFilingSource(FilingSource):
             path.unlink(missing_ok=True)  # the document is deleted after parsing
         self._save_delisting_cache(accession, parsed)
         return parsed
+
+    def form25_evidence(
+        self,
+        cik: str,
+        accession: str,
+        form: str,
+        primary_document: str,
+        accepted_at: datetime,
+    ) -> Form25Evidence | None:
+        """The reason evidence (Rule 12d2-2 provision) of one Form 25 or 25-NSE
+        (plan T327, #2670), known at `accepted_at`, or `None` when the document is
+        unreadable or missing (skipped and recorded as every per-document fetch
+        is). A cached parse makes no request. The notice exhibit's text is not
+        fetched here: `notice_text` stays `None` until a caller reads one."""
+        cached = self._load_form25_evidence_cache(accession, accepted_at)
+        if cached is not None:
+            self._per_document_attempted.add(accession)
+            return cached
+        if self._is_quarantined(accession):
+            self._quarantined_this_run.add(accession)
+            self.quarantined += 1
+            return None
+        return self._guarded(
+            accession,
+            form.removesuffix("/A"),
+            partial(
+                self._fetch_form25_evidence, cik, accession, form, primary_document, accepted_at
+            ),
+        )
+
+    def _fetch_form25_evidence(
+        self, cik: str, accession: str, form: str, primary_document: str, accepted_at: datetime
+    ) -> Form25Evidence:
+        root_document = re.sub(r"^xsl[^/]*/", "", primary_document)
+        path = edgar_raw.download_filing_file(
+            cik, accession, root_document, settings=self._settings, client=self._client
+        )
+        try:
+            text = path.read_text(encoding="utf-8")
+            parsed = parse_form25_evidence(
+                text, form=form, accession=accession, accepted_at=accepted_at
+            )
+        finally:
+            path.unlink(missing_ok=True)
+        data = {
+            "version": FORM25_EVIDENCE_VERSION,
+            "accession": accession,
+            "cik": parsed.cik,
+            "form": parsed.form,
+            "class_title": parsed.class_title,
+            "exchange": parsed.exchange,
+            "provision": parsed.provision,
+        }
+        edgar_raw.write_atomic(
+            self._form25_evidence_cache_path(accession), json.dumps(data).encode("utf-8")
+        )
+        return parsed
+
+    def _form25_evidence_cache_path(self, accession: str) -> Path:
+        edgar_raw.validate_accession(accession)
+        return (
+            self._cache / "delisting_evidence" / f"v{FORM25_EVIDENCE_VERSION}" / f"{accession}.json"
+        )
+
+    def _load_form25_evidence_cache(
+        self, accession: str, accepted_at: datetime
+    ) -> Form25Evidence | None:
+        path = self._form25_evidence_cache_path(accession)  # validates first, outside the try
+        try:
+            data = json.loads(path.read_bytes())
+            if data.get("version") != FORM25_EVIDENCE_VERSION or data.get("accession") != accession:
+                return None
+            provision = data.get("provision")
+            return Form25Evidence(
+                cik=str(data["cik"]),
+                form=str(data["form"]),
+                class_title=str(data["class_title"]),
+                exchange=str(data["exchange"]),
+                accession=accession,
+                accepted_at=accepted_at,  # the stamp is re-applied, as for `_CachedDelisting`
+                provision=str(provision) if provision else None,
+            )
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
 
     def _delisting_cache_path(self, accession: str) -> Path:
         edgar_raw.validate_accession(accession)

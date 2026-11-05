@@ -2935,7 +2935,8 @@ class AlpacaPriceSource(PriceSource):
     `last_actions_report` (unresolved rows and unsupported categories),
     for ingest to count or refuse. `fetch_bars` and
     `fetch_actions` default to `alpaca_raw` (network, owner's keys); tests
-    pass recorded payloads.
+    pass recorded payloads. Construction loads the packaged
+    `dividend_reviews.csv` and raises `ReviewsError` if it is malformed.
     """
 
     def __init__(
@@ -3329,13 +3330,14 @@ class AlpacaPriceSource(PriceSource):
         kept: list[CorporateAction] = []
         unrequested = 0
         reviewed_refused = 0
-        # A retract id is refused only beside its kept partner in this answer
-        # (same security, ex-date, amount, another id): if the feed drops the
-        # kept id, the dividend is not silently lost.
-        paid = {
-            (x.security_id, x.ex_date, x.ratio_or_amount, x.source_action_id)
+        # The reviewed key uses exact stored DOUBLE amounts, as in
+        # equal_amount_groups. Another retract id cannot stand in for a kept id.
+        kept_paid = {
+            (x.security_id, x.ex_date, x.ratio_or_amount)
             for x in parsed.actions
             if x.action_type is ActionType.DIVIDEND
+            and self._retracted.get((x.security_id, x.source_action_id or ""))
+            != (x.ex_date, x.ratio_or_amount)
         }
         for a in parsed.actions:
             if a.action_type is ActionType.SPINOFF:
@@ -3352,11 +3354,7 @@ class AlpacaPriceSource(PriceSource):
                     a.action_type is ActionType.DIVIDEND
                     and self._retracted.get((a.security_id, a.source_action_id or ""))
                     == (a.ex_date, a.ratio_or_amount)
-                    and any(
-                        k[:3] == (a.security_id, a.ex_date, a.ratio_or_amount)
-                        and k[3] != a.source_action_id
-                        for k in paid
-                    )
+                    and (a.security_id, a.ex_date, a.ratio_or_amount) in kept_paid
                 ):
                     reviewed_refused += 1  # #2957: reviewed as a duplicate, repair deleted it
                 else:

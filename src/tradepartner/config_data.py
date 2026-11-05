@@ -659,6 +659,9 @@ class EventsConfig(_ClosedConfig):
     # rounding (default none). Identity, owner, line number and every other field are exact
     # and take no tolerance. `form4_compare_threshold`: the share of XML-fetched accessions
     # that may disagree; unset (None) reports only and keeps the order-sample refusal.
+    # Once set (plan T351; needs the raw archive, which holds the review markers), the
+    # `form4_bulk_order_sample` accessions are compared like any XML-fetched accession and
+    # no longer block their quarter; the run fails when the share reaches the threshold.
     form4_compare_trusted: dict[str, Literal["xml", "bulk"]] = Field(default_factory=dict)
     form4_compare_decimals: int = Field(default=2, ge=0, le=8)
     form4_compare_tolerance: dict[str, Decimal] = Field(default_factory=dict)
