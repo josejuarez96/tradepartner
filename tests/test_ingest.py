@@ -3418,8 +3418,12 @@ def test_a_total_on_a_live_two_class_cik_stays_unmatched(settings: Settings) -> 
 
 def test_the_switch_off_changes_no_row(settings: Settings) -> None:
     # Off, each fixture's rows are pinned: the pre-T190d result (checked on
-    # the merge base), not this code compared with itself.
-    assert settings.edgar.class_member_link is False
+    # the merge base), not this code compared with itself. The default is on
+    # since T198, so the switch is turned off here.
+    assert settings.edgar.class_member_link is True
+    settings = settings.model_copy(
+        update={"edgar": settings.edgar.model_copy(update={"class_member_link": False})}
+    )
     acc = _BF_PAGE.accession
     bf = [_share("NonvotingCommonStock", 3.0, acc, NOW), _share("CommonClassA", 2.0, acc, NOW)]
     ibkr = [

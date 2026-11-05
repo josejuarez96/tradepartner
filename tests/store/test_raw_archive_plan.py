@@ -77,10 +77,11 @@ def _classes(plan: MigrationPlan) -> dict[str, MigrationClass]:
 _TODAY: dict[str, MigrationClass] = {
     "fsn/v4/2019q1/sub.tsv": MOVE,
     "fsn/v5/manifests/2019q1.json": MOVE,
-    "fsn/v6/manifests/2019q1.json": KEEP,
+    "fsn/v6/manifests/2019q1.json": MOVE,
+    "fsn/v7/manifests/2019q1.json": KEEP,
     "fsn/_extract/2019q1/num.txt": KEEP,
-    **{f"cover/v{n}/0000000000-19-000001.json": MOVE for n in range(1, 6)},
-    "cover/v6/0000000000-19-000001.json": KEEP,
+    **{f"cover/v{n}/0000000000-19-000001.json": MOVE for n in range(1, 7)},
+    "cover/v7/0000000000-19-000001.json": KEEP,
     "header/v1/320193/0000320193-19-000001.json": KEEP,
     "delisting/v1/0000000000-19-000001.json": KEEP,
     "filename/v1/320193.json": KEEP,
@@ -179,7 +180,7 @@ def test_stamps_stay_back_up_under_a_patched_parser_version(
         "fsn/v4x/a.json",
         "fsn/v/a.json",
         "fsn/v4",  # a file named v4, not a directory
-        "cover/v06/a.json",  # the number is the current one: not dead
+        "cover/v07/a.json",  # the number is the current one: not dead
         "header",
         "something_new/v1/a.json",
         "corpus/departure-reason/raw.bak/a.htm",
