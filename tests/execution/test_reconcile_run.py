@@ -5427,6 +5427,51 @@ def test_a_pending_duplicate_reconciles_on_one_payment(
     assert (adjustment.kind, adjustment.cash) == ("dividend_cash", pytest.approx(5.0))
 
 
+@pytest.mark.parametrize("kept_amount", [0.3, 0.1 + 0.2])
+def test_a_noisy_reviewed_retract_does_not_count_twice(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    monkeypatch: pytest.MonkeyPatch,
+    kept_amount: float,
+) -> None:
+    monkeypatch.setattr(reconcile_run, "reviewed_groups", lambda: [_listed(SPY, "duplicate", 0.3)])
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, kept_amount, CUT - timedelta(days=1), source_action_id="dup-a")
+    _dividend(
+        journal_settings,
+        SPY,
+        0.3000000000000001,
+        CUT - timedelta(days=1),
+        source_action_id="dup-b",
+    )
+    found = _explain_at_cut(journal_settings, open_window)
+    assert found.dividends == {}
+    assert SPY in found.dividend_findings
+
+
+def test_a_shifted_date_reviewed_retract_does_not_count_twice(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(reconcile_run, "reviewed_groups", lambda: [_listed(SPY, "duplicate", 0.3)])
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.3, CUT - timedelta(days=1), source_action_id="dup-a")
+    _dividend(
+        journal_settings,
+        SPY,
+        0.3,
+        CUT - timedelta(days=1),
+        ex_date=previous_session(S),
+        source_action_id="dup-b",
+    )
+    found = _explain_at_cut(journal_settings, open_window)
+    assert found.dividends == {}
+    assert SPY in found.dividend_findings
+
+
 def test_an_unlisted_pair_on_a_name_not_held_is_no_finding(
     journal_settings: Settings,
     fake: BookedFake,
