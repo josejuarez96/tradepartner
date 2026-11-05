@@ -87,6 +87,7 @@ from tradepartner.health import (
     delisted_names,
     figi_types,
     filing_event_counts,
+    form4_compare_from_message,
     health_report,
     health_verdict,
     incremental_edgar_counts,
@@ -4820,6 +4821,29 @@ def test_incremental_edgar_is_quiet_without_counts_or_with_zero(
     assert block.warnings == ()
     assert incremental_edgar_counts(None) == {}
     assert incremental_edgar_counts("statement_added: 3") == {}
+
+
+def test_form4_compare_reports_the_latest_writer_runs_counts(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """T351 (#2714): `health` carries the rule 5 numerator, denominator, threshold and
+    unresolved markers of the latest Form 4 writer message that names them."""
+    assert health_report(fixture_store, T_END, _settings()).form4_compare is None
+    message = (
+        "1 subjects; Form 4 bulk: 3 selected; form4_compare_disagree=2; "
+        "form4_compare_compared=8; form4_compare_threshold=0.30; form4_compare_markers=2; "
+        "sec_forms_added: 3"
+    )
+    _run(fixture_store, "r-f4", "sec_forms", "ok", T_END - timedelta(hours=2), message=message)
+    _run(fixture_store, "r-later", "edgar", "ok", T_END - timedelta(hours=1), message="nothing")
+    block = health_report(fixture_store, T_END, _settings()).form4_compare
+    assert block is not None
+    assert (block.disagreeing, block.compared, block.threshold, block.markers) == (2, 8, "0.30", 2)
+    assert block.share == 0.25
+    unset = "form4_compare_disagree=0; form4_compare_compared=0; form4_compare_threshold=unset;"
+    parsed = form4_compare_from_message(unset)
+    assert parsed is not None and parsed.share is None and parsed.threshold == "unset"
+    assert form4_compare_from_message(None) is None
 
 
 # --- filing_index revisions (#2629, #2703, T318b) ----------------------------
