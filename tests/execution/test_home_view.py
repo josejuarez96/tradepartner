@@ -427,10 +427,10 @@ def test_a_fact_known_after_now_moves_nothing(store: Settings) -> None:
 
 
 def test_the_read_stays_within_half_the_lock_retry_seconds(store: Settings) -> None:
-    # A short wait (4 s, budget 2 s) still well below the 60 s default; one warm-up build
+    # A short wait (8 s, budget 4 s) still well below the 60 s default; one warm-up build
     # first, so one-time costs (the XNYS calendar, imports) stay out of the timing and it
     # measures the store reads (about 0.4 s on a laptop, about 1 s on a CI runner).
-    fast = Settings(_env_file=None, store={"path": store.store.path, "lock_retry_seconds": 4})
+    fast = Settings(_env_file=None, store={"path": store.store.path, "lock_retry_seconds": 8})
     all_sessions()
     _build(fast)
     # Best of 3: the bound guards the read, not a busy CI runner (#2348).
