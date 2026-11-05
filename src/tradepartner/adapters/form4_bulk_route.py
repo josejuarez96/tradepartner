@@ -12,7 +12,7 @@ import json
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -20,13 +20,20 @@ from pathlib import Path
 import httpx
 
 from tradepartner.adapters import edgar_raw
-from tradepartner.adapters.edgar import SEC_FORMS_PARSER_VERSION
+from tradepartner.adapters.edgar import SEC_FORMS_PARSER_VERSION, Form4Transaction
 from tradepartner.adapters.edgar_insider_bulk import (
+    BulkAccession,
     InsiderBulk,
     InsiderBulkUnreadableError,
     read_insider_bulk,
 )
 from tradepartner.adapters.filings import SecFormFiling
+from tradepartner.adapters.form4_compare import (
+    Declaration,
+    Disagreement,
+    RunTally,
+    compare_rows,
+)
 from tradepartner.adapters.form4_owner_route import refusal as owner_refusal
 from tradepartner.adapters.form4_route import (
     IDENTITY_BAD,
@@ -44,6 +51,138 @@ from tradepartner.config import Settings
 
 Form4IndexRow = tuple[str, str, str, date]  # accession, issuer CIK, form, filing date
 BULK_READER_VERSION = 4  # Recheck order samples after multi-owner exclusion (#2711).
+
+
+#: The manifest entry kind of a rule 5 review marker (plan T351, #2714 item 6). It is
+#: not an XML or bulk row source, so `find_entry`, `prior_xml_hashes` and
+#: `rechecked_against` pass over it.
+MARKER_SOURCE = "form4_compare_marker"
+
+
+@dataclass
+class Rule5:
+    """The run's rule 5 comparison (plan T351): the declaration, the run's tally and the
+    latest disagreements of each compared accession. Shared by every quarter's route
+    call, so the share is over the whole run. An unset threshold reports only: the order
+    sample keeps its refusal and nothing is written differently."""
+
+    declaration: Declaration
+    tally: RunTally = field(default_factory=RunTally)
+    found: dict[str, tuple[Disagreement, ...]] = field(default_factory=dict)
+
+    @property
+    def enforcing(self) -> bool:
+        """Whether the threshold key is set."""
+        return self.declaration.threshold is not None
+
+    def record(
+        self,
+        accession: str,
+        bulk_rows: tuple[Form4Transaction, ...],
+        xml_rows: tuple[Form4Transaction, ...],
+    ) -> tuple[Disagreement, ...]:
+        """Compare one XML-fetched accession, count it once and keep its latest result."""
+        disagreements = compare_rows(bulk_rows, xml_rows, self.declaration)
+        self.tally.add(accession, disagreements)
+        if disagreements:
+            self.found[accession] = disagreements
+        else:
+            self.found.pop(accession, None)
+        return disagreements
+
+
+class Form4CompareThresholdError(RuntimeError):
+    """The share of disagreeing XML-fetched accessions reached the threshold: the source
+    run fails (plan T351, #2714 item 6)."""
+
+
+def comparable(record: BulkAccession | None, cik: str, multi_owner_xml: bool) -> bool:
+    """Whether an accession's bulk rows are a fair side of the rule 5 comparison: the bulk
+    set names this issuer, its identity and order checks passed, and (with multi-owner XML
+    routing on) it has one owner, since a multi-owner accession's bulk owner join is
+    SEC's known defect (#2706) and its rows never reach the store from bulk."""
+    return (
+        record is not None
+        and record.issuer_cik == cik
+        and not record.identity_bad
+        and not record.order_bad
+        and not (multi_owner_xml and len(set(record.filer_ciks)) > 1)
+    )
+
+
+def trusted_filing(
+    filing: SecFormFiling, bulk_rows: tuple[Form4Transaction, ...], decl: Declaration
+) -> SecFormFiling:
+    """The XML `filing` with each field the declaration trusts to the bulk set taken from
+    the bulk row of the same `(filer_cik, line_no)`. When the key sets differ (an ordering
+    or ownership difference) the rows are wholly the `line_no` rule's trusted source's.
+    The default declaration trusts the XML everywhere, so the filing comes back as is."""
+    bulk_by_key = {(r.filer_cik, r.line_no): r for r in bulk_rows}
+    xml_keys = {(r.filer_cik, r.line_no) for r in filing.transactions}
+    if xml_keys != bulk_by_key.keys() or len(xml_keys) != len(filing.transactions):
+        if decl.rules["line_no"].trusted == "bulk":
+            return replace(filing, transactions=bulk_rows)
+        return filing
+    names = [name for name, rule in decl.rules.items() if rule.trusted == "bulk"]
+    if not names:
+        return filing
+    rows = tuple(
+        replace(row, **{n: getattr(bulk_by_key[row.filer_cik, row.line_no], n) for n in names})
+        for row in filing.transactions
+    )
+    return replace(filing, transactions=rows)
+
+
+def marker_entries(
+    accession: str,
+    quarter: str | None,
+    zip_sha256: str | None,
+    disagreements: tuple[Disagreement, ...],
+) -> list[dict[str, object]]:
+    """Manifest entries for one compared accession: one unresolved marker per disagreeing
+    field (both values, the trusted choice, the checked bulk-zip SHA-256), or one
+    resolved marker when the sources now agree."""
+    base: dict[str, object] = {
+        "row_source": MARKER_SOURCE,
+        "accession": accession,
+        "quarter": quarter,
+        "zip_sha256": zip_sha256,
+    }
+    if not disagreements:
+        return [{**base, "status": "resolved"}]
+    return [
+        {
+            **base,
+            "status": "unresolved",
+            "field": d.field,
+            "row_key": None if d.row_key is None else list(d.row_key),
+            "bulk": None if d.bulk is None else str(d.bulk),
+            "xml": None if d.xml is None else str(d.xml),
+            "trusted": d.trusted,
+        }
+        for d in disagreements
+    ]
+
+
+def unresolved_markers(manifest: Mapping[str, object] | None) -> list[dict[str, object]]:
+    """The unresolved marker entries of one parsed manifest (none for `None`)."""
+    if manifest is None:
+        return []
+    entries = manifest.get("entries", ())
+    return [
+        dict(e)
+        for e in entries  # type: ignore[attr-defined]
+        if e.get("row_source") == MARKER_SOURCE and e.get("status") == "unresolved"
+    ]
+
+
+def offending(rule5: Rule5, limit: int = 20) -> str:
+    """The disagreeing accessions with their fields, for a refusal message."""
+    names = sorted(rule5.found)
+    shown = "; ".join(
+        f"{a}: {','.join(sorted({d.field for d in rule5.found[a]}))}" for a in names[:limit]
+    )
+    return shown + (f"; and {len(names) - limit} more" if len(names) > limit else "")
 
 
 class RequestBudgetStopped(Exception):
@@ -234,12 +373,20 @@ def run_form4_bulk_route(
     blocked_quarters: frozenset[Quarter] = frozenset(),
     source_counts_failures: bool = False,
     accession_quarters: Mapping[str, Quarter] | None = None,
+    rule5: Rule5 | None = None,
 ) -> BulkRouteResult:
     """Route selected Form 4 accessions, never substituting a bulk row after XML fails.
 
     A missing older quarter and an order mismatch stop bulk writes for that quarter.
     The acceptance stamp alone supplies `known_at`; the bulk filing date is only
     checked against the issuer submission record by `route_accession`.
+
+    `rule5` (plan T351, #2714 item 6) compares each XML-fetched accession with its bulk
+    rows (the order sample and the XML-routed filings, never a multi-owner accession's
+    bulk owner join). With its threshold unset it only counts and the order sample keeps
+    its refusal. With it set, a disagreement never blocks the quarter: the XML is stored
+    (or, for a sampled accession later routed to bulk, its trusted row) and the driver
+    writes the marker; the driver fails the run if the share reaches the threshold.
     """
     if budget <= 0:
         raise ValueError("budget must be positive")
@@ -258,6 +405,8 @@ def run_form4_bulk_route(
     counts: Counter[str] = Counter()
     requests = 0
     remaining = 0
+    enforcing = rule5 is not None and rule5.enforcing
+    sampled: dict[str, SecFormFiling] = {}  # sampled XML with a disagreement, for the write
 
     def spent() -> int:
         return request_count() if request_count is not None else requests
@@ -294,6 +443,7 @@ def run_form4_bulk_route(
             if not sample:
                 counts["sec_forms_bulk_order_unchecked"] += 1
             mismatch = False
+            clean = True
             for accession in sample:
                 if spent() >= budget:
                     return stopped(len(rows))
@@ -303,16 +453,24 @@ def run_form4_bulk_route(
                 except RequestBudgetStopped:
                     return stopped(len(rows))
                 requests += 1
-                if parsed is None or not rows_agree(
-                    bulk.accessions[accession].transactions, parsed.transactions
-                ):
+                sample_rows = bulk.accessions[accession].transactions
+                if rule5 is not None and parsed is not None:
+                    found = rule5.record(accession, sample_rows, parsed.transactions)
+                    if enforcing and found:
+                        sampled[accession] = parsed
+                if enforcing:  # a mismatch is counted and marked, never a refusal
+                    clean = clean and parsed is not None and accession not in sampled
+                    if parsed is None:
+                        counts["sec_forms_bulk_order_sample_unfetched"] += 1
+                    continue
+                if parsed is None or not rows_agree(sample_rows, parsed.transactions):
                     mismatch = True
                     break
             if mismatch:
                 counts["sec_forms_bulk_order_mismatch"] += 1
                 remaining += len(rows)
                 continue
-            if sample and remember_check is not None:
+            if sample and clean and remember_check is not None:
                 remember_check(quarter)
         for position, (accession, cik, form, filed) in enumerate(rows):
             if spent() >= budget:
@@ -382,7 +540,34 @@ def run_form4_bulk_route(
                     counts[reason] += 1
                     remaining += 1
                     continue
+                if (
+                    rule5 is not None
+                    and accession_bulk is not None
+                    and comparable(accession_bulk, cik, multi_owner_xml)
+                ):
+                    found = rule5.record(
+                        accession, accession_bulk.transactions, filing.transactions
+                    )
+                    if found and enforcing:
+                        filing = trusted_filing(
+                            filing, accession_bulk.transactions, rule5.declaration
+                        )
+                        counts["sec_forms_compare_trusted_row"] += 1
                 filing = replace(filing, form=submissions_form, filed_date=submissions_filed)
+            elif accession in sampled:
+                # The sample's XML disagreed below the threshold: store its trusted
+                # row (the XML, unless a field is declared bulk), not the bulk rows.
+                assert rule5 is not None and accession_bulk is not None
+                trusted = trusted_filing(
+                    sampled[accession], accession_bulk.transactions, rule5.declaration
+                )
+                filing = replace(
+                    trusted,
+                    form=submissions_form,
+                    accepted_at=accepted,
+                    filed_date=submissions_filed,
+                )
+                counts["sec_forms_compare_trusted_row"] += 1
             else:
                 assert accession_bulk is not None
                 assert accession_bulk.issuer_cik is not None
@@ -396,7 +581,7 @@ def run_form4_bulk_route(
                     accession_bulk.transactions,
                 )
                 counts["sec_forms_form4_row_skipped"] += accession_bulk.skipped
-            if decision.route is Route.BULK and write_bulk is not None:
+            if decision.route is Route.BULK and write_bulk is not None and accession not in sampled:
                 written = write_bulk(filing, quarter)
             else:
                 written = write(filing)

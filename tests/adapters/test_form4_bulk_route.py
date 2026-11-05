@@ -8,23 +8,29 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
 import pytest
 
 from tradepartner.adapters import edgar_raw
-from tradepartner.adapters.edgar_insider_bulk import read_insider_bulk
+from tradepartner.adapters.edgar_insider_bulk import InsiderBulk, read_insider_bulk
 from tradepartner.adapters.filings import SecFormFiling
 from tradepartner.adapters.form4_bulk_route import (
     RequestBudgetStopped,
+    Rule5,
     load_bulk_quarters,
+    marker_entries,
     order_check_path,
     request_budget,
     run_form4_bulk_route,
+    trusted_filing,
+    unresolved_markers,
 )
-from tradepartner.adapters.form4_route import Quarter
-from tradepartner.config import Settings
+from tradepartner.adapters.form4_compare import Outcome, declaration_from
+from tradepartner.adapters.form4_route import Quarter, order_sample
+from tradepartner.config import EventsConfig, Settings
 
 
 def test_second_bulk_read_missing_zip_fails_closed_without_download(
@@ -731,3 +737,190 @@ def test_a_4a_multi_owner_amendment_routes_to_xml_on_its_own(tmp_path: Path) -> 
     counts, written, remaining = _route_multi(tmp_path, lambda f: f, form="4/A")
     assert remaining == 0 and [w.form for w in written] == ["4/A"]
     assert counts["sec_forms_bulk_multi_owner_xml"] == 1
+
+
+# --- T351 (#2987): rule 5 comparison in the route ---------------------------------------
+
+_SINGLE = "0001577526-26-000036"
+
+
+def _rule5(threshold: str | None) -> Rule5:
+    events = EventsConfig(form4_compare_threshold=None if threshold is None else Decimal(threshold))
+    return Rule5(declaration_from(events))
+
+
+def _route_rule5(
+    tmp_path: Path,
+    rule5: Rule5,
+    mutate: Callable[[SecFormFiling], SecFormFiling],
+    *,
+    sample: int = 1,
+    accessions: tuple[str, ...] = (_SINGLE,),
+) -> tuple[Counter[str], list[SecFormFiling], list[SecFormFiling]]:
+    bulk = _bulk(tmp_path)
+    xml_writes: list[SecFormFiling] = []
+    bulk_writes: list[SecFormFiling] = []
+
+    def xml(_cik: str, accession: str, _day: date) -> SecFormFiling:
+        facts = bulk.accessions[accession]
+        return mutate(
+            SecFormFiling(
+                accession,
+                "4",
+                _ACCEPTED,
+                date(2026, 3, 31),
+                (facts.issuer_cik,),
+                facts.filer_ciks,
+                facts.transactions,
+            )
+        )
+
+    result = run_form4_bulk_route(
+        [(a, bulk.accessions[a].issuer_cik, "4", date(2026, 3, 31)) for a in accessions],
+        quarters={Quarter(2026, 1): bulk},
+        stamp=lambda *_: _ACCEPTED,
+        xml=xml,
+        write=xml_writes.append,
+        write_bulk=lambda filing, _quarter: bulk_writes.append(filing),
+        now=_ACCEPTED,
+        price_below=1,
+        zero_price_codes=("P", "S"),
+        order_sample_size=sample,
+        budget=20,
+        rule5=rule5,
+    )
+    return result.counts, xml_writes, bulk_writes
+
+
+def _shares_off(filing: SecFormFiling) -> SecFormFiling:
+    first = replace(filing.transactions[0], shares=filing.transactions[0].shares + 1)
+    return replace(filing, transactions=(first, *filing.transactions[1:]))
+
+
+def test_unset_threshold_counts_but_keeps_the_order_sample_refusal(tmp_path: Path) -> None:
+    rule5 = _rule5(None)
+    counts, xml_writes, bulk_writes = _route_rule5(tmp_path, rule5, _shares_off)
+    assert counts["sec_forms_bulk_order_mismatch"] == 1
+    assert xml_writes == [] and bulk_writes == []
+    assert (rule5.tally.disagreeing, rule5.tally.compared) == (1, 1)
+
+
+def test_one_sample_mismatch_below_threshold_does_not_block_the_quarter(tmp_path: Path) -> None:
+    rule5 = _rule5("0.5")
+    other = "0001493152-26-014171"
+    # Both accessions have two rows; the sample takes the first by SHA-256 order.
+    sampled = order_sample({_SINGLE: 2, other: 2}, 1)[0]
+    unsampled = other if sampled == _SINGLE else _SINGLE
+    counts, xml_writes, bulk_writes = _route_rule5(
+        tmp_path, rule5, _shares_off, accessions=(_SINGLE, other)
+    )
+    assert counts["sec_forms_bulk_order_mismatch"] == 0
+    assert [w.accession for w in xml_writes] == [sampled]  # its trusted XML row
+    assert [w.accession for w in bulk_writes] == [unsampled]
+    bulk_first = _bulk(tmp_path).accessions[sampled].transactions[0]
+    assert xml_writes[0].transactions[0].shares == bulk_first.shares + 1
+    assert counts["sec_forms_compare_trusted_row"] == 1
+    assert set(rule5.found) == {sampled}
+    assert (rule5.tally.disagreeing, rule5.tally.compared) == (1, 1)
+
+
+def test_zero_eligible_accessions_leave_the_comparison_unchecked(tmp_path: Path) -> None:
+    rule5 = _rule5("0.5")
+    counts, _xml, bulk_writes = _route_rule5(tmp_path, rule5, _shares_off, sample=0)
+    assert counts["sec_forms_bulk_order_unchecked"] == 1
+    assert rule5.tally.compared == 0
+    assert rule5.tally.outcome(rule5.declaration.threshold) is Outcome.UNCHECKED
+    assert [w.accession for w in bulk_writes] == [_SINGLE]
+
+
+def test_multi_owner_accession_is_not_compared_with_the_bulk_owner_join(tmp_path: Path) -> None:
+    """#2705 / #2711 roles: the bulk join mispins roles, the XML is right, and the
+    accession is stored from XML without counting SEC's defect as a disagreement."""
+    rule5 = _rule5("0.5")
+    first, second = _bulk(tmp_path).accessions[_MULTI].filer_ciks
+
+    def xml_roles(filing: SecFormFiling) -> SecFormFiling:
+        rows = tuple(
+            replace(t, is_director=t.filer_cik == first, is_officer=False,
+                    is_ten_percent_owner=t.filer_cik == second)
+            for t in filing.transactions
+        )  # fmt: skip
+        return replace(filing, transactions=rows)
+
+    _counts, xml_writes, bulk_writes = _route_rule5(
+        tmp_path, rule5, xml_roles, sample=0, accessions=(_MULTI,)
+    )
+    assert bulk_writes == [] and len(xml_writes) == 1
+    assert rule5.tally.compared == 0 and rule5.found == {}
+    stored = {
+        t.filer_cik: (t.is_director, t.is_ten_percent_owner) for t in xml_writes[0].transactions
+    }
+    assert stored == {first: (True, False), second: (False, True)}
+
+
+def test_xml_routed_single_owner_role_disagreement_is_counted_and_xml_stored(
+    tmp_path: Path,
+) -> None:
+    """A single-owner accession routed to XML (the 4/A header against the 4) whose bulk
+    role differs is one disagreement; the XML role is the trusted row."""
+    rule5 = _rule5("0.9")
+    bulk = _bulk(tmp_path)
+    record = bulk.accessions[_SINGLE]
+    flipped = tuple(replace(t, is_director=not t.is_director) for t in record.transactions)
+    patched = InsiderBulk(
+        {**bulk.accessions, _SINGLE: replace(record, transactions=flipped, document_type="4/A")}
+    )
+    written: list[SecFormFiling] = []
+    xml_filing = SecFormFiling(
+        _SINGLE,
+        "4",
+        _ACCEPTED,
+        date(2026, 3, 31),
+        (record.issuer_cik,),
+        record.filer_ciks,
+        record.transactions,
+    )
+    run_form4_bulk_route(
+        [(_SINGLE, record.issuer_cik, "4", date(2026, 3, 31))],
+        quarters={Quarter(2026, 1): patched},
+        stamp=lambda *_: _ACCEPTED,
+        xml=lambda *_: xml_filing,
+        write=written.append,
+        now=_ACCEPTED,
+        price_below=1,
+        zero_price_codes=("P", "S"),
+        order_sample_size=0,
+        budget=10,
+        rule5=rule5,
+    )  # fmt: skip
+    assert [d.field for d in rule5.found[_SINGLE]] == ["is_director", "is_director"]
+    assert written[0].transactions == record.transactions  # the XML rows, not the flipped bulk
+
+
+def test_a_field_declared_to_the_bulk_set_takes_its_value(tmp_path: Path) -> None:
+    bulk = _bulk(tmp_path).accessions[_SINGLE]
+    events = EventsConfig(form4_compare_trusted={"shares_owned_after": "bulk"})
+    xml_filing = SecFormFiling(
+        _SINGLE, "4", _ACCEPTED, date(2026, 3, 31), (bulk.issuer_cik,), bulk.filer_ciks,
+        tuple(replace(t, shares_owned_after=Decimal(1)) for t in bulk.transactions),
+    )  # fmt: skip
+    merged = trusted_filing(xml_filing, bulk.transactions, declaration_from(events))
+    assert [t.shares_owned_after for t in merged.transactions] == [
+        t.shares_owned_after for t in bulk.transactions
+    ]
+    assert trusted_filing(xml_filing, bulk.transactions, declaration_from(EventsConfig())) == (
+        xml_filing
+    )
+
+
+def test_markers_name_both_values_and_only_unresolved_ones_carry() -> None:
+    from tradepartner.adapters.form4_compare import Disagreement
+
+    d = Disagreement("shares", ("0000000002", 1), Decimal(5), Decimal(6), "xml")
+    (marker,) = marker_entries("a-1", "2026q1", "f" * 64, (d,))
+    assert marker["bulk"] == "5" and marker["xml"] == "6" and marker["trusted"] == "xml"
+    assert marker["row_key"] == ["0000000002", 1] and marker["zip_sha256"] == "f" * 64
+    (resolved,) = marker_entries("a-2", "2026q1", "f" * 64, ())
+    manifest = {"entries": [marker, resolved, {"row_source": "sec_form4_xml"}]}
+    assert unresolved_markers(manifest) == [marker]
+    assert unresolved_markers(None) == []

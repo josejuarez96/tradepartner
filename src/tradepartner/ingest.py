@@ -264,6 +264,7 @@ from tradepartner.adapters.edgar import (
     StatementConflict,
     duration_class,
 )
+from tradepartner.adapters.edgar_insider_bulk import InsiderBulk
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverPage,
@@ -295,15 +296,22 @@ from tradepartner.adapters.form4_archive import (
 from tradepartner.adapters.form4_bulk_route import (
     BULK_READER_VERSION,
     BulkRouteResult,
+    Form4CompareThresholdError,
     Form4IndexRow,
     RequestBudgetStopped,
+    Rule5,
+    comparable,
     insider_zip_fetch,
     insider_zip_path,
     load_bulk_quarters,
+    marker_entries,
+    offending,
     order_check_path,
     request_budget,
     run_form4_bulk_route,
+    unresolved_markers,
 )
+from tradepartner.adapters.form4_compare import Outcome, declaration_from
 from tradepartner.adapters.form4_route import (
     Quarter,
     QuarterState,
@@ -3560,6 +3568,8 @@ class _Form4Provenance:
         self.would_keep: dict[str, int] = {}
         self.would_manifest_bytes = 0
         self.digest: str | None = None
+        #: Rule 5 review markers (T351): carried from the latest manifest or new this run.
+        self.markers: list[dict[str, object]] = []
 
     @classmethod
     def start(
@@ -3598,6 +3608,12 @@ class _Form4Provenance:
                 )
         url, fetched_at = insider_zip_fetch(self.settings, quarter, digest)
         self.zips[quarter] = RawInput(digest, url, fetched_at, _FORM4_BULK_PARSER)
+
+    def set_markers(self, accessions: Collection[str], new: Sequence[dict[str, object]]) -> None:
+        """Replace the markers of `accessions` with `new` (a recheck's or a fresh
+        comparison's result); every other marker stays as carried."""
+        self.markers = [m for m in self.markers if m["accession"] not in accessions]
+        self.markers.extend(new)
 
     def xml_input(self, accession: str) -> RawInput:
         """The kept XML of an accession about to be written or compared: its latest
@@ -3658,7 +3674,7 @@ class _Form4Provenance:
                 run_id=self.run_id,
                 source=self.writer,
                 mode=self.mode,
-                entries=self.entries,
+                entries=[*self.entries, *self.markers],
                 zips=zips,
             )
             if self.dry_run:
@@ -3714,6 +3730,28 @@ def _form4_manifests(
     return manifests
 
 
+def _latest_form4_manifest(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, counts: Counter[str]
+) -> dict[str, Any] | None:
+    """The newest committed Form 4 writer run's manifest, and no older one (#2714
+    item 6): the markers an offline nightly run needs are copied forward into it, so
+    older manifests may be absent. A missing or offline one is counted."""
+    runs = conn.execute(
+        "SELECT message FROM ingestion_runs WHERE source IN ('edgar', 'sec_forms') "
+        "AND mode = 'backfill' ORDER BY started_at DESC, finished_at DESC NULLS LAST"
+    ).fetchall()
+    for (message,) in runs:
+        digest = message_digest(message)
+        if digest is None:
+            continue
+        try:
+            return parse_manifest(raw_archive.read_manifest(settings, digest))
+        except (raw_archive.RawArchiveMissingError, raw_archive.RawArchiveOfflineError):
+            counts["sec_forms_provenance_manifest_unread"] += 1
+            return None
+    return None
+
+
 def _bulk_run_fields(message: str | None) -> dict[str, str]:
     """The `key=value` fields of one `sec_insider_bulk` run message, split on `;`."""
     return dict(part.strip().split("=", 1) for part in (message or "").split(";") if "=" in part)
@@ -3739,6 +3777,11 @@ def _write_form4_bulk(
     """
     if provenance is None and raw_archive.archive_on(settings):
         raise ValueError("the Form 4 step with the raw archive on needs its writer's provenance")
+    if settings.events.form4_compare_threshold is not None and provenance is None:
+        raise ValueError(
+            "events.form4_compare_threshold needs the raw archive: its review markers "
+            "live in the writer's provenance manifest"
+        )
     previous = getattr(source, "form4_xml_keeper", None)
     source.form4_xml_keeper = None if provenance is None else provenance.keep_xml
     try:
@@ -3757,6 +3800,15 @@ def _form4_bulk(
 ) -> tuple[int, str]:
     """`_write_form4_bulk`'s work, with the XML keeper set."""
     from tradepartner.adapters import edgar_raw
+
+    rule5 = Rule5(declaration_from(settings.events))
+    manifest_counts: Counter[str] = Counter()
+    if rule5.enforcing and provenance is not None:
+        # Rule 5 (#2714 item 6): copy forward the unresolved markers of the latest
+        # committed writer manifest, before any early return can drop them.
+        provenance.markers = unresolved_markers(
+            _latest_form4_manifest(conn, settings, manifest_counts)
+        )
 
     start = settings.events.sec_forms_backfill_start
     latest = quarter_of(now.date())
@@ -3966,7 +4018,6 @@ def _form4_bulk(
     # Rule 4: an accession already rechecked against its quarter's current zip hash
     # (by an earlier run whose recheck elsewhere in the quarter failed) is not
     # fetched again; only the failed ones are.
-    manifest_counts: Counter[str] = Counter()
     manifests = _form4_manifests(conn, settings, manifest_counts) if rechecks else []
     for quarter, due in list(rechecks.items()):
         label = f"{quarter.year}q{quarter.number}"
@@ -4088,7 +4139,7 @@ def _form4_bulk(
     prior = prior_xml_hashes(manifests, recheck_wanted)
     rechecked: set[str] = set()
 
-    def recheck(quarter: Quarter) -> BulkRouteResult | None:
+    def recheck(quarter: Quarter, quarter_bulk: InsiderBulk | None) -> BulkRouteResult | None:
         """Recheck the quarter's held XML accessions after a zip change; a result
         only on a budget stop, which then stands in for the route's. A failed
         recheck counts in the quarter's `remaining`, so its row is `partial`."""
@@ -4110,6 +4161,15 @@ def _form4_bulk(
                 quarter_remaining[quarter] += 1
                 remaining += 1
                 continue
+            record = quarter_bulk.accessions.get(accession) if quarter_bulk is not None else None
+            if comparable(record, cik, settings.events.form4_multi_owner_xml):
+                assert record is not None
+                found = rule5.record(accession, record.transactions, filing.transactions)
+                if rule5.enforcing:  # a marker only: the held fact is never rewritten
+                    label = f"{quarter.year}q{quarter.number}"
+                    provenance.set_markers(
+                        {accession}, marker_entries(accession, label, digests.get(quarter), found)
+                    )
             verdict = recheck_verdict(prior.get(accession), provenance.xml_input(accession).sha256)
             counts[f"sec_forms_xml_recheck_{verdict}"] += 1
             if verdict == "same":
@@ -4124,8 +4184,9 @@ def _form4_bulk(
     for position, quarter in enumerate(route_quarters):
         rows = queued_by_quarter[quarter]
         quarter_bulk = None
-        # A quarter whose every accession is skipped is not read again.
-        needed = any(row[0] not in skip for row in rows)
+        # A quarter whose every accession is skipped is not read again, unless a changed
+        # zip rechecks held accessions: rule 5 compares them with the new zip's rows.
+        needed = any(row[0] not in skip for row in rows) or quarter in rechecks
         if needed and quarter in published and quarter not in unreadable:
             reread, reread_digests, _counts, bad = load_bulk_quarters(
                 {quarter}, settings=settings, client=source._client, revalidate=False
@@ -4141,7 +4202,7 @@ def _form4_bulk(
                 unreadable.add(quarter)
                 quarter_bulk = None
             del reread
-        stopped = recheck(quarter) if quarter in rechecks else None
+        stopped = recheck(quarter, quarter_bulk) if quarter in rechecks else None
         result = stopped or run_form4_bulk_route(
             rows,
             quarters={quarter: quarter_bulk},
@@ -4162,6 +4223,7 @@ def _form4_bulk(
             blocked_quarters=frozenset(unreadable),
             source_counts_failures=True,
             accession_quarters=accession_quarters,
+            rule5=rule5,
         )
         del quarter_bulk  # released before the next quarter is read
         counts.update(result.counts)
@@ -4200,6 +4262,23 @@ def _form4_bulk(
             break
     if cross_route_disagree:
         counts["sec_forms_bulk_xml_disagree"] = cross_route_disagree
+    if rule5.enforcing and provenance is not None:
+        # An accession compared this run (route or recheck) leaves its disagreements as
+        # unresolved markers, naming the quarter's checked zip; a recheck that agreed
+        # already left its resolved marker.
+        for accession, found in sorted(rule5.found.items()):
+            quarter = accession_quarters[accession]
+            label = f"{quarter.year}q{quarter.number}"
+            provenance.set_markers(
+                {accession}, marker_entries(accession, label, digests.get(quarter), found)
+            )
+    if rule5.tally.outcome(rule5.declaration.threshold) is Outcome.AT_OR_ABOVE and rule5.enforcing:
+        if provenance is not None:
+            provenance.finish()  # the manifest keeps the offending accessions' markers
+        raise Form4CompareThresholdError(
+            f"{rule5.tally.message(rule5.declaration.threshold)}; "
+            f"offending accessions: {offending(rule5)}"
+        )
     # The manifest is written and its digest fixed before any run row cites it.
     # A dry run's quarter rows (rolled back) name no digest: no manifest was written.
     provenance_digest = None if provenance is None else provenance.finish()
@@ -4245,10 +4324,18 @@ def _form4_bulk(
         )
     figures = ", ".join(f"{name}: {count}" for name, count in sorted(counts.items()))
     would_write = "".join(f"; order_check_would_write: {name}" for name in would_remember)
+    markers = len(
+        {
+            m["accession"]
+            for m in (provenance.markers if provenance else [])
+            if m["status"] == "unresolved"
+        }
+    )
+    compare = f"{rule5.tally.message(rule5.declaration.threshold)}; form4_compare_markers={markers}"
     return added, (
         f"Form 4 bulk: {len(selected)} selected, {added} rows added, "
-        f"{source.requests} requests, {remaining} remaining; {plan.message()}; {figures}"
-        f"{would_write}"
+        f"{source.requests} requests, {remaining} remaining; {plan.message()}; {compare}; "
+        f"{figures}{would_write}"
     )
 
 
