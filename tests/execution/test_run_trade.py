@@ -995,8 +995,9 @@ def test_a_limit_breaking_exclude_name_override_halts_the_phase(env: Env, tmp_pa
     """An `exclude_name` override's order goes through the same batch checks:
     with the frozen `risk.max_orders_per_run` at 3, F_0's three buys pass, and
     on F_1 the override's sell (TRNS, sold whole) and the three buys it frees
-    the cash for make four: the buys phase halts with `LimitBreachError`
-    before any of its submits, the rebalance `missed` with `limit_breach`."""
+    the cash for make four: the run halts with `LimitBreachError` before the
+    sells phase submits anything (#2973), the rebalance `missed` with
+    `limit_breach`."""
     window = env.open_window(
         frozen=FROZEN.model_copy(update={"max_orders_per_run": 3}), tmp_path=tmp_path
     )
@@ -1023,7 +1024,8 @@ def test_a_limit_breaking_exclude_name_override_halts_the_phase(env: Env, tmp_pa
     assert (status, fault) == ("halted", "LimitBreachError")
     assert message is not None and "max_orders_per_run" in message
     mine = [o for o in env.orders() if o[5] == halted]
-    assert [(o[1], o[2]) for o in mine] == [("SEC_TRANSFER", "sell")]  # no buy submitted
+    assert mine == []  # the total is checked before the first sell (#2973)
+    assert "4 orders (sells 1, planned buys 3) against the cap of 3" in message
     assert (t_1, "missed", "limit_breach", halted) in env.rebalance_events()
     assert env.query("SELECT source, fault_type, run_id FROM kill_switch") == [
         ("fault", "LimitBreachError", halted)
