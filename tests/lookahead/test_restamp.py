@@ -1256,18 +1256,25 @@ def test_a_moved_fact_accession_whose_date_set_changed_is_revised_at_the_run(
 REVISION_RUN = datetime(2019, 6, 30, 2, 0, tzinfo=UTC)
 
 
+@pytest.mark.parametrize(
+    ("first_second_date", "revised_second_date"),
+    [(True, False), (False, True)],
+    ids=["drop", "add"],
+)
 def test_a_restamp_never_changes_a_read_at_or_after_a_stored_revision(
-    settings: Settings,
+    settings: Settings, first_second_date: bool, revised_second_date: bool
 ) -> None:
     """#2970: an accession revised by an earlier run (dropping a date, stored
     at `known_at = ingested_at = T_r`) and then restamped. The restamp moves
     the originals, never the revision, so a read in `[T_r, run)` must keep
     serving the revision's date set, as before the restamp."""
     status, message, _ = _ingest(
-        settings, _source(acme_early=True, acme_second_date=True), now=FIRST_RUN
+        settings, _source(acme_early=True, acme_second_date=first_second_date), now=FIRST_RUN
     )
     assert status == OK, message
-    status, message, _ = _ingest(settings, _source(acme_early=True), now=REVISION_RUN)
+    status, message, _ = _ingest(
+        settings, _source(acme_early=True, acme_second_date=revised_second_date), now=REVISION_RUN
+    )
     assert status == OK, message
     store = _Store(settings.store.path)
     probes = [
@@ -1288,10 +1295,14 @@ def test_a_restamp_never_changes_a_read_at_or_after_a_stored_revision(
             return sorted(rows.filter(rows["filing_accession"] == A_COVER[0])["as_of_date"])
 
     before = {t: served(t) for t in probes}
-    assert before[REVISION_RUN] == [date(2019, 2, 15)]
+    expected = [ACME_SECOND_DATE, date(2019, 2, 15)] if revised_second_date else [date(2019, 2, 15)]
+    assert before[REVISION_RUN] == expected
 
     status, message, (result,) = _ingest(
-        settings, _source(acme_early=False), now=RESTAMP_RUN, restamp=_acme_manifest()
+        settings,
+        _source(acme_early=False, acme_second_date=revised_second_date),
+        now=RESTAMP_RUN,
+        restamp=_acme_manifest(),
     )
 
     assert status == OK, message
