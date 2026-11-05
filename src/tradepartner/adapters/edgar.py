@@ -1420,6 +1420,78 @@ def parse_delisting(
     )
 
 
+#: The 8-K items that can evidence why a listing ended (spec amendment 2026-10-30,
+#: #2670 req 1; plan T327): 1.03 bankruptcy or receivership, 2.01 completion of an
+#: acquisition, 3.01 notice of delisting. `filing_events` already stores every
+#: 8-K's `items` string verbatim (T164), so this is the whole item coverage the
+#: reason read needs; it is a read-side selection, not a second feed.
+REASON_8K_ITEMS: Final = ("1.03", "2.01", "3.01")
+
+
+def eightk_item_codes(items: str) -> frozenset[str]:
+    """The item codes of a verbatim `items` string (`"2.02,9.01"`), whitespace
+    dropped, so `2.01` never matches `12.01`. A blank string lists none."""
+    return frozenset(code.strip() for code in items.split(",") if code.strip())
+
+
+def normalise_rule_provision(raw: str) -> str | None:
+    """A Form 25's `ruleProvision` with spaces, `Rule` and the `17 CFR 240.`
+    prefix dropped (`17 CFR 240.12d2-2(a)(2)` -> `12d2-2(a)(2)`), as the
+    departure corpus normalises it; `None` when blank."""
+    compact = re.sub(r"\s+", "", raw)
+    compact = re.sub(r"(?i)rule", "", compact)
+    compact = re.sub(r"(?i)^(17CFR)?(240\.)?", "", compact)
+    return compact or None
+
+
+@dataclass(frozen=True)
+class Form25Evidence:
+    """What a Form 25 or 25-NSE says about why a class is removed, as its own
+    filing states it, known at the filing's `accepted_at` (plan T327): the
+    Rule 12d2-2 provision of the notification and, when a notice exhibit was
+    read, its text. Either may be absent; neither is guessed."""
+
+    cik: str
+    form: str
+    class_title: str
+    exchange: str
+    accession: str
+    accepted_at: datetime
+    provision: str | None
+    notice_text: str | None = None
+
+    def __post_init__(self) -> None:
+        ensure_tz_aware_utc(self.accepted_at, field_name="accepted_at")
+
+
+@_fail_closed
+def parse_form25_evidence(
+    xml_text: str,
+    *,
+    form: str,
+    accession: str,
+    accepted_at: datetime,
+    notice_text: str | None = None,
+) -> Form25Evidence:
+    """The reason evidence of a Form 25 or 25-NSE primary document: the same
+    issuer, class and exchange `parse_delisting` reads (so the evidence joins
+    its episode) plus the normalised `ruleProvision`. A blank provision is
+    `None`. `notice_text` is the exhibit text when the caller read one."""
+    parsed = parse_delisting(xml_text, form=form, accession=accession, accepted_at=accepted_at)
+    root = ET.fromstring(xml_text)
+    raw = root.findtext("ruleProvision") or ""
+    return Form25Evidence(
+        cik=parsed.cik,
+        form=parsed.form,
+        class_title=parsed.class_title,
+        exchange=parsed.exchange,
+        accession=accession,
+        accepted_at=parsed.accepted_at,
+        provision=normalise_rule_provision(raw),
+        notice_text=notice_text,
+    )
+
+
 # --- filing-name listings (T184, #1597, spec amendment 2026-10-12) -----------
 #
 # A security's name as its own filing spells it, for the years before any
