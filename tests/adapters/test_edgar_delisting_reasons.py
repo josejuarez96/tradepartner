@@ -365,3 +365,28 @@ def test_source_fetches_once_and_serves_the_provision_from_cache(
     assert first.provision == second.provision == "12d2-2(a)(3)"
     assert calls == ["primary_doc.xml"]  # the root copy, once
     assert second.accepted_at == FILED
+
+
+def test_deficiency_notice_stops_a_bare_withdrawal_reading_as_voluntary() -> None:
+    """A 3.01 notice then a 12d2-2(c) withdrawal is not voluntary; a 3.01 accepted
+    after the Form 25 flips the reason at its own acceptance, not before."""
+    notice_at = FILED + timedelta(days=2)
+    build = _build([_evidence("12d2-2(c)")], [_eightk("3.01", notice_at)])
+    assert [r["reason"] for r in build.rows] == ["voluntary_other", "unknown"]
+    assert build.rows[1]["known_at"] == notice_at
+    assert _latest(build, notice_at - timedelta(microseconds=1)) == (
+        "voluntary_other",
+        "form25_provision",
+    )
+    assert build.conflicts == ()
+    before = _build([_evidence("12d2-2(c)")], [_eightk("3.01", FILED - timedelta(days=5))])
+    assert before.rows == ()  # known from the first revision: unknown by absence
+
+
+def test_a_standing_conflict_is_reported_once() -> None:
+    eightk_at = FILED - timedelta(days=20)
+    build = _build(
+        [_evidence("12d2-2(c)")],
+        [_eightk("1.03", eightk_at), _eightk("3.01", FILED + timedelta(days=1), "a-9")],
+    )
+    assert len(build.conflicts) == 1

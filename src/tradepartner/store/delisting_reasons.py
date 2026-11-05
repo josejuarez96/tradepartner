@@ -217,6 +217,10 @@ class _Observation:
     accession: str
     classes: frozenset[str]
     needs_merger: bool = False
+    #: An Item 3.01 notice: it allows no class, but a voluntary reading on a bare
+    #: provision no longer stands beside it (a deficiency notice then a 12d2-2(c)
+    #: withdrawal is a distressed exit, not a voluntary one).
+    notice: bool = False
 
 
 def _form25_observations(episode: Episode, evidence: Form25Evidence) -> list[_Observation]:
@@ -241,7 +245,7 @@ def _form25_observations(episode: Episode, evidence: Form25Evidence) -> list[_Ob
 def _live(known: Sequence[_Observation]) -> list[_Observation]:
     """`known` less a 2.01 with no merger-allowing observation beside it."""
     corroborated = any(MERGER in o.classes for o in known if not o.needs_merger)
-    return [o for o in known if corroborated or not o.needs_merger]
+    return [o for o in known if not o.notice and (corroborated or not o.needs_merger)]
 
 
 def _resolve(
@@ -259,6 +263,8 @@ def _resolve(
         return UNKNOWN, None, ()
     (reason,) = common
     best = min(live, key=lambda o: (_SOURCE_RANK[o.source], -o.known_at.timestamp()))
+    if reason == VOLUNTARY and best.source == "form25_provision" and any(o.notice for o in known):
+        return UNKNOWN, None, ()
     return reason, best, ()
 
 
@@ -273,7 +279,7 @@ def _episode_rows(
     for known_at in sorted({o.known_at for o in observations}):
         known = [o for o in observations if o.known_at <= known_at]
         final, support, clash = _resolve(known)
-        if clash:
+        if clash and (not conflicts or conflicts[-1].evidence != clash):
             conflicts.append(ReasonConflict(episode.key, known_at, clash))
         if support is None:
             state = (UNKNOWN, "unknown", None)
@@ -352,7 +358,17 @@ def build_delisting_reasons(
                 if not windows.holds(item, episode.filed_at, eightk.accepted_at):
                     unmatched[item] += 1
                 elif item == "3.01":
-                    matched[item] += 1  # a bare notice: it narrows nothing
+                    matched[item] += 1  # a bare notice: it establishes no class
+                    observations.append(
+                        _Observation(
+                            eightk.accepted_at,
+                            "eightk_item",
+                            eightk.form,
+                            eightk.accession,
+                            frozenset(),
+                            notice=True,
+                        )
+                    )
                 else:
                     if item == "1.03":
                         matched[item] += 1
