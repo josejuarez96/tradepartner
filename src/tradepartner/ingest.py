@@ -5041,7 +5041,8 @@ def restamp_from_manifest(
     `ingested_at` move (`_RESTAMPABLE`); retractions and snapshot rows never
     do. A moved row gets the new stamp as `known_at` (and as `filed_at`, a
     delisting's stamp) and `ingested_at` as its `ingested_at`; nothing else
-    changes.
+    changes. A moved `facts` row with a later stored ingest of its accession (or a revision at
+    its own) keeps its `ingested_at` (#2970), so a restamp never changes a read after it.
 
     **`filing_index`** (T318b, #2703) has its own match path, on
     `(cik, accession)` with `accepted_at` equal to the old stamp (EDGAR
@@ -5239,9 +5240,28 @@ def restamp_from_manifest(
         if not count:
             continue
         stamps = "known_at = u.new" + (", filed_at = u.new" if table == "delistings" else "")
+        # A moved fact with a later ingest of its accession stored, or a revision
+        # (a row stamped at its own ingest, never moved) at its own, keeps its
+        # `ingested_at`: else `facts_as_of`'s latest-ingest rule would regroup
+        # the accession's ingests and change reads after the revision (#2970).
+        revised = (
+            ", (SELECT min(r.ingested_at) FROM facts r WHERE r.security_id = t.security_id "
+            "AND r.fact_name = t.fact_name AND r.class_member IS NOT DISTINCT FROM t.class_member "
+            "AND r.filing_accession IS NOT DISTINCT FROM t.filing_accession "
+            "AND (r.ingested_at > t.ingested_at OR (r.ingested_at = t.ingested_at "
+            "AND r.known_at = r.ingested_at))) AS revised"
+            if table == "facts"
+            else ""
+        )
+        new_ingest = (
+            "CASE WHEN u.revised IS NULL THEN ? ELSE facts.ingested_at END"
+            if table == "facts"
+            else "?"
+        )
         conn.execute(
-            f"UPDATE {table} SET {stamps}, ingested_at = ? FROM (SELECT DISTINCT t.rowid AS rid, "
-            f"m.new AS new {matched[table]}) u WHERE {table}.rowid = u.rid",
+            f"UPDATE {table} SET {stamps}, ingested_at = {new_ingest} "
+            f"FROM (SELECT DISTINCT t.rowid AS rid, m.new AS new{revised} "
+            f"{matched[table]}) u WHERE {table}.rowid = u.rid",
             [ingested_at],
         )
     moved["filing_index"] = _move_filing_index(conn, ingested_at)
