@@ -976,3 +976,60 @@ def test_a_marked_accession_is_never_stored_from_bulk_rows(tmp_path: Path) -> No
         xml_accessions=frozenset({_SINGLE}),
     )  # fmt: skip
     assert [w.accession for w in written] == [_SINGLE] and _SINGLE in rule5.found
+
+
+def test_a_tolerated_sample_pass_is_not_remembered(tmp_path: Path) -> None:
+    """A sample that passes only on a declared tolerance would be a weaker pass than
+    the unset key's, so it is not remembered (it is resampled)."""
+    rule5 = Rule5(declaration_from(EventsConfig(
+        form4_compare_threshold=Decimal("0.5"), form4_compare_tolerance={"shares": Decimal(1)},
+    )))  # fmt: skip
+    bulk = _bulk(tmp_path)
+    remembered: list[Quarter] = []
+    run_form4_bulk_route(
+        [(_SINGLE, bulk.accessions[_SINGLE].issuer_cik, "4", date(2026, 3, 31))],
+        quarters={Quarter(2026, 1): bulk},
+        stamp=lambda *_: _ACCEPTED,
+        xml=lambda _c, a, _d: _shares_off(
+            SecFormFiling(a, "4", _ACCEPTED, date(2026, 3, 31),
+                          (bulk.accessions[a].issuer_cik,), bulk.accessions[a].filer_ciks,
+                          bulk.accessions[a].transactions)
+        ),
+        write=lambda f: None,
+        write_bulk=lambda f, q: None,
+        now=_ACCEPTED,
+        price_below=1,
+        zero_price_codes=("P", "S"),
+        order_sample_size=1,
+        budget=10,
+        rule5=rule5,
+        remember_check=remembered.append,
+    )  # fmt: skip
+    assert rule5.tally.disagreeing == 0 and rule5.tally.compared == 1  # within tolerance
+    assert remembered == []
+
+
+def test_a_sampled_accession_gets_the_owner_refusal_before_it_is_stored(tmp_path: Path) -> None:
+    def extra_owner(filing: SecFormFiling) -> SecFormFiling:
+        return replace(_shares_off(filing), filer_ciks=(*filing.filer_ciks, "0000000999"))
+
+    counts, xml_writes, bulk_writes = _route_rule5(tmp_path, _rule5("0.9"), extra_owner)
+    assert counts["sec_forms_multi_owner_set_mismatch"] == 1
+    assert xml_writes == [] and bulk_writes == []
+
+
+def test_a_bulk_trusted_party_difference_never_aborts_the_run(tmp_path: Path) -> None:
+    bulk = _bulk(tmp_path).accessions[_SINGLE]
+    other = "0000000999"
+    xml_rows = tuple(replace(t, filer_cik=other) for t in bulk.transactions)
+    xml_filing = SecFormFiling(
+        _SINGLE, "4", _ACCEPTED, date(2026, 3, 31), (bulk.issuer_cik,), (other,), xml_rows
+    )
+    line_no_bulk = declaration_from(EventsConfig(form4_compare_trusted={"line_no": "bulk"}))
+    merged = trusted_filing(xml_filing, bulk.transactions, line_no_bulk)
+    assert merged is not None
+    assert set(merged.filer_ciks) == {t.filer_cik for t in bulk.transactions}
+    issuer_bulk = declaration_from(EventsConfig(form4_compare_trusted={"issuer_cik": "bulk"}))
+    changed_issuer = tuple(replace(t, issuer_cik="0000000998") for t in bulk.transactions)
+    same_keys = replace(xml_filing, filer_ciks=bulk.filer_ciks, transactions=bulk.transactions)
+    assert trusted_filing(same_keys, changed_issuer, issuer_bulk) is None

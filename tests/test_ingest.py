@@ -11528,8 +11528,11 @@ def test_form4_rule5_at_or_above_threshold_fails_the_run_naming_the_accession(
     from tradepartner.adapters.form4_bulk_route import Form4CompareThresholdError
 
     case = _rule5_case(settings, tmp_path, monkeypatch, "0.5")  # 1 of 2 is at the line
-    with pytest.raises(Form4CompareThresholdError, match=case.accession):
+    with pytest.raises(Form4CompareThresholdError, match=case.accession) as raised:
         case.run(fixture_store, case.now)
+    (digest_file,) = (tmp_path / "archive" / "manifests").iterdir()
+    assert f"provenance_sha256={digest_file.name}" in str(raised.value)
+    assert "form4_compare_markers=1" in str(raised.value)
     (manifest,) = _manifests(tmp_path / "archive")  # the offending accession is recorded
     assert [m["accession"] for m in _markers(manifest)] == [case.accession]
 
@@ -11684,7 +11687,23 @@ def test_form4_rule5_markers_survive_a_run_that_skips_the_form4_step(
     assert [m["accession"] for m in _markers(manifest)] == [case.accession]
 
 
-def test_form4_rule5_unreadable_latest_manifest_fails_a_threshold_run(
+@pytest.mark.parametrize("threshold", ["0.6", None])
+def test_form4_rule5_unreadable_latest_manifest_fails_the_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    threshold: str | None,
+) -> None:
+    case = _rule5_case(settings, tmp_path, monkeypatch, threshold)
+    case.run(fixture_store, case.now)
+    for path in (tmp_path / "archive" / "manifests").iterdir():
+        path.unlink()
+    with pytest.raises(RuntimeError, match="unreadable"):
+        case.run(fixture_store, case.now + timedelta(days=1), "writer-2")
+
+
+def test_form4_rule5_a_failed_runs_manifest_is_not_the_marker_chain_head(
     fixture_store: duckdb.DuckDBPyConnection,
     settings: Settings,
     tmp_path: Path,
@@ -11692,7 +11711,13 @@ def test_form4_rule5_unreadable_latest_manifest_fails_a_threshold_run(
 ) -> None:
     case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
     case.run(fixture_store, case.now)
-    for path in (tmp_path / "archive" / "manifests").iterdir():
-        path.unlink()
-    with pytest.raises(RuntimeError, match="unreadable"):
-        case.run(fixture_store, case.now + timedelta(days=1), "writer-2")
+    later = case.now + timedelta(days=1)
+    fixture_store.execute(
+        "INSERT INTO ingestion_runs (run_id, source, mode, status, started_at, finished_at, "
+        "rows_added, chunk_cursor, message) VALUES ('bad', 'sec_forms', 'backfill', 'failed', "
+        "?, ?, 0, 'x', ?)",
+        [later, later, "provenance_sha256=" + "0" * 64],
+    )
+    counts: Counter[str] = Counter()
+    assert ingest_module._latest_form4_manifest(fixture_store, case.settings, counts) is not None
+    assert counts["sec_forms_provenance_manifest_unread"] == 0

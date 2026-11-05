@@ -3739,7 +3739,8 @@ def _latest_form4_manifest(
     older manifests may be absent. A missing or offline one is counted."""
     runs = conn.execute(
         "SELECT message FROM ingestion_runs WHERE source IN ('edgar', 'sec_forms') "
-        "AND mode = 'backfill' ORDER BY started_at DESC, finished_at DESC NULLS LAST"
+        "AND mode = 'backfill' AND status <> 'failed' "
+        "ORDER BY started_at DESC, finished_at DESC NULLS LAST"
     ).fetchall()
     for (message,) in runs:
         digest = message_digest(message)
@@ -3761,19 +3762,18 @@ def _carry_markers(
 ) -> None:
     """Copy the unresolved rule 5 markers of the latest committed manifest into this
     writer's recorder, once, whatever the threshold or whether the Form 4 step runs, so
-    no newer manifest drops them. With the threshold set, an unreadable latest manifest
-    fails the run rather than let a marker-less manifest become the latest."""
+    no newer manifest drops them. An unreadable latest manifest fails the run, whatever
+    the threshold, rather than let a marker-less manifest become the latest (a failed
+    run's manifest is not a chain head: its rows rolled back)."""
     if provenance is None or provenance.markers_carried:
         return
     provenance.markers_carried = True
     before = counts["sec_forms_provenance_manifest_unread"]
     provenance.markers = unresolved_markers(_latest_form4_manifest(conn, settings, counts))
-    if settings.events.form4_compare_threshold is not None and (
-        counts["sec_forms_provenance_manifest_unread"] > before
-    ):
+    if counts["sec_forms_provenance_manifest_unread"] > before:
         raise RuntimeError(
             "the latest Form 4 manifest is unreadable, so its review markers cannot be "
-            "copied forward; restore it before a run with events.form4_compare_threshold"
+            "copied forward; restore it before this writer publishes a new manifest"
         )
 
 
@@ -4303,11 +4303,17 @@ def _form4_bulk(
                 {accession}, marker_entries(accession, label, digests.get(quarter), found)
             )
     if rule5.tally.outcome(rule5.declaration.threshold) is Outcome.AT_OR_ABOVE and rule5.enforcing:
+        link = ""
+        unresolved = 0
         if provenance is not None:
-            provenance.finish()  # the manifest keeps the offending accessions' markers
+            digest = provenance.finish()  # the manifest keeps the offending markers
+            unresolved = len(
+                {m["accession"] for m in provenance.markers if m["status"] == "unresolved"}
+            )
+            link = "" if provenance.dry_run else f"{PROVENANCE_KEY}={digest}; "
         raise Form4CompareThresholdError(
-            f"{rule5.tally.message(rule5.declaration.threshold)}; "
-            f"offending accessions: {offending(rule5)}"
+            f"{link}{rule5.tally.message(rule5.declaration.threshold)}; "
+            f"form4_compare_markers={unresolved}; offending accessions: {offending(rule5)}"
         )
     # The manifest is written and its digest fixed before any run row cites it.
     # A dry run's quarter rows (rolled back) name no digest: no manifest was written.

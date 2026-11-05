@@ -112,25 +112,33 @@ def comparable(record: BulkAccession | None, cik: str, multi_owner_xml: bool) ->
 
 def trusted_filing(
     filing: SecFormFiling, bulk_rows: tuple[Form4Transaction, ...], decl: Declaration
-) -> SecFormFiling:
+) -> SecFormFiling | None:
     """The XML `filing` with each field the declaration trusts to the bulk set taken from
     the bulk row of the same `(filer_cik, line_no)`. When the key sets differ (an ordering
-    or ownership difference) the rows are wholly the `line_no` rule's trusted source's.
-    The default declaration trusts the XML everywhere, so the filing comes back as is."""
+    or ownership difference) the rows are wholly the `line_no` rule's trusted source's,
+    and the filing's parties follow those rows. The default declaration trusts the XML
+    everywhere, so the filing comes back as is. `None` when the chosen rows cannot form a
+    consistent filing (a declaration trusting an identity field to the bulk set): the
+    caller refuses that one accession, never the run."""
     bulk_by_key = {(r.filer_cik, r.line_no): r for r in bulk_rows}
     xml_keys = {(r.filer_cik, r.line_no) for r in filing.transactions}
-    if xml_keys != bulk_by_key.keys() or len(xml_keys) != len(filing.transactions):
-        if decl.rules["line_no"].trusted == "bulk":
-            return replace(filing, transactions=bulk_rows)
-        return filing
-    names = [name for name, rule in decl.rules.items() if rule.trusted == "bulk"]
-    if not names:
-        return filing
-    rows = tuple(
-        replace(row, **{n: getattr(bulk_by_key[row.filer_cik, row.line_no], n) for n in names})
-        for row in filing.transactions
-    )
-    return replace(filing, transactions=rows)
+    try:
+        if xml_keys != bulk_by_key.keys() or len(xml_keys) != len(filing.transactions):
+            if decl.rules["line_no"].trusted != "bulk":
+                return filing
+            owners = tuple(dict.fromkeys(r.filer_cik for r in bulk_rows))
+            issuers = tuple(dict.fromkeys(r.issuer_cik for r in bulk_rows))
+            return replace(filing, transactions=bulk_rows, filer_ciks=owners, subject_ciks=issuers)
+        names = [name for name, rule in decl.rules.items() if rule.trusted == "bulk"]
+        if not names:
+            return filing
+        rows = tuple(
+            replace(row, **{n: getattr(bulk_by_key[row.filer_cik, row.line_no], n) for n in names})
+            for row in filing.transactions
+        )
+        return replace(filing, transactions=rows)
+    except ValueError:
+        return None
 
 
 def marker_entries(
@@ -447,6 +455,7 @@ def run_form4_bulk_route(
                 counts["sec_forms_bulk_order_unchecked"] += 1
             mismatch = False
             clean = True
+            strict = True  # also equal under rows_agree, the unset-key rule
             for accession in sample:
                 if spent() >= budget:
                     return stopped(len(rows))
@@ -465,6 +474,7 @@ def run_form4_bulk_route(
                     # a mismatch is counted and marked, never a refusal; a sample that
                     # could not be fetched is no comparison and still refuses the quarter
                     clean = clean and accession not in sampled
+                    strict = strict and rows_agree(sample_rows, parsed.transactions)
                     continue
                 if parsed is None or not rows_agree(sample_rows, parsed.transactions):
                     mismatch = True
@@ -473,7 +483,9 @@ def run_form4_bulk_route(
                 counts["sec_forms_bulk_order_mismatch"] += 1
                 remaining += len(rows)
                 continue
-            if sample and clean and remember_check is not None:
+            # A pass is remembered only if it would also pass with the key unset or its
+            # tolerances tightened (rows_agree), so a weaker pass is never reused.
+            if sample and clean and strict and remember_check is not None:
                 remember_check(quarter)
         for position, (accession, cik, form, filed) in enumerate(rows):
             if spent() >= budget:
@@ -554,18 +566,36 @@ def run_form4_bulk_route(
                         accession, accession_bulk.transactions, filing.transactions
                     )
                     if found and enforcing:
-                        filing = trusted_filing(
+                        trusted_xml = trusted_filing(
                             filing, accession_bulk.transactions, rule5.declaration
                         )
+                        if trusted_xml is None:
+                            counts["sec_forms_compare_trusted_refused"] += 1
+                            remaining += 1
+                            continue
+                        filing = trusted_xml
                         counts["sec_forms_compare_trusted_row"] += 1
                 filing = replace(filing, form=submissions_form, filed_date=submissions_filed)
             elif accession in sampled:
                 # The sample's XML disagreed below the threshold: store its trusted
                 # row (the XML, unless a field is declared bulk), not the bulk rows.
                 assert rule5 is not None and accession_bulk is not None
+                reason = (
+                    owner_refusal(sampled[accession], accession_bulk.filer_ciks)
+                    if multi_owner_xml
+                    else None
+                )
+                if reason is not None:  # as the XML route: no owner is guessed or duplicated
+                    counts[reason] += 1
+                    remaining += 1
+                    continue
                 trusted = trusted_filing(
                     sampled[accession], accession_bulk.transactions, rule5.declaration
                 )
+                if trusted is None:
+                    counts["sec_forms_compare_trusted_refused"] += 1
+                    remaining += 1
+                    continue
                 filing = replace(
                     trusted,
                     form=submissions_form,
