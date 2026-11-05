@@ -34,12 +34,11 @@ Only an `ok` trial has statistics; any other trial shows its state and
 message and no results.
 
 **Today's N split** (research-registry spec req 9; backtest spec req 8 as
-amended 2026-10-07, issue 901). Today's N is `results.family_n_split`'s total and the
-table shows its two parts beside it, backtest trials and research runs, with the
-stored `trial_results.n_research` beside the stored N. On a store a read-only
-connection opened before the research registry (no research tables, no
-`n_research` column) both research cells are blank and today's N is the
-backtest count.
+amended 2026-10-07, issue 901 and 2026-10-31, issue 2723). Today's N is
+`results.family_n_split`'s total and the table shows backtest trials, research
+runs and counted exposures beside it. The stored research and exposure parts
+sit beside the stored N. A read-only connection to a store before either
+migration shows a blank part and leaves it out of today's N.
 
 **Detail level and the spend cap** (strategy-lab spec req 12 and amendment 12 to the
 backtest spec's req 17; plan T112). A `full` trial shows its target weights at the
@@ -162,14 +161,15 @@ def annual_stored(
 class DsrRow:
     """One DSR basis: the stored statistics and today's recomputation.
     `today` is None when it cannot be recomputed; `today_error` says why. The N
-    split: `stored_n_research` (None on a row written before the research
-    registry), and today's `today_n_backtest` and `today_n_research` (None when
-    the store has no research registry, or the family read failed)."""
+    split: stored research and exposure counts (None before their migrations),
+    and today's backtest, research and exposure counts (None when the relevant
+    table is absent, or the family read failed)."""
 
     basis: Basis
     stored_basis: str | None
     stored_n: int | None
     stored_n_research: int | None
+    stored_n_exposure: int | None
     stored_v: float | None
     stored_sr_star: float | None
     stored_psr_zero: float | None
@@ -178,6 +178,7 @@ class DsrRow:
     today_error: str | None
     today_n_backtest: int | None = None
     today_n_research: int | None = None
+    today_n_exposure: int | None = None
 
 
 @dataclass(frozen=True)
@@ -266,6 +267,7 @@ def _dsr_rows(
                 stored_basis=result["dsr_basis"],
                 stored_n=result["n_trials"],
                 stored_n_research=result.get("n_research"),
+                stored_n_exposure=result.get("n_exposure"),
                 stored_v=v,
                 stored_sr_star=sr_star,
                 stored_psr_zero=psr_zero,
@@ -274,6 +276,7 @@ def _dsr_rows(
                 today_error=error,
                 today_n_backtest=split.trials if split else None,
                 today_n_research=split.research if split else None,
+                today_n_exposure=split.exposures if split else None,
             )
         )
     return tuple(out)
@@ -476,6 +479,7 @@ def _dsr_table(rows: Sequence[DsrRow]) -> pl.DataFrame:
                 "stored label": r.stored_basis,
                 "stored N": r.stored_n,
                 "stored N research": r.stored_n_research,
+                "stored N exposures": r.stored_n_exposure,
                 "stored V": r.stored_v,
                 "stored SR*": r.stored_sr_star,
                 "stored PSR(0)": r.stored_psr_zero,
@@ -483,6 +487,7 @@ def _dsr_table(rows: Sequence[DsrRow]) -> pl.DataFrame:
                 "today N": r.today.n_trials if r.today else None,
                 "today N backtest": r.today_n_backtest,
                 "today N research": r.today_n_research,
+                "today N exposures": r.today_n_exposure,
                 "today V": r.today.sharpe_variance if r.today else None,
                 "today SR*": r.today.sr_star if r.today else None,
                 "today label": r.today.dsr_basis if r.today else None,
@@ -495,9 +500,11 @@ def _dsr_table(rows: Sequence[DsrRow]) -> pl.DataFrame:
             for column in (
                 "stored N",
                 "stored N research",
+                "stored N exposures",
                 "today N",
                 "today N backtest",
                 "today N research",
+                "today N exposures",
             )
         },
     )
@@ -594,8 +601,9 @@ def _render_results(view: TrialView) -> None:
     st.caption(
         "Stored: N at run time (N and V as they were when the trial ran; they go stale). "
         "Today: recomputed with the family's current N and V. N is the family's backtest "
-        "trials plus its research runs' configurations (research-registry spec req 9; "
-        "blank research cells: the store has no research registry); V is the backtest "
+        "trials plus its research runs' and disclosed store exposures' configurations "
+        "(research-registry spec req 9; blank research or exposure cells: the store "
+        "has no corresponding table); V is the backtest "
         "trials' alone. V and SR* in annual units "
         "(rows stored in monthly units before the lab converted); DSR at the trial's own "
         "period."
