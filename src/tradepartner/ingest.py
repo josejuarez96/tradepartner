@@ -3754,6 +3754,24 @@ def _latest_form4_manifest(
     return None
 
 
+_MARKERS_FIELD = re.compile(r"\bform4_compare_markers=(\d+)")
+
+
+def _recorded_marker_count(conn: duckdb.DuckDBPyConnection) -> int:
+    """The unresolved markers the latest committed Form 4 writer run recorded in its
+    message (`form4_compare_markers=N`); 0 when that run (or none) carries no field."""
+    for (message,) in conn.execute(
+        "SELECT message FROM ingestion_runs WHERE source IN ('edgar', 'sec_forms') "
+        "AND mode = 'backfill' AND status <> 'failed' "
+        "ORDER BY started_at DESC, finished_at DESC NULLS LAST"
+    ).fetchall():
+        if message_digest(message) is None:
+            continue
+        found = _MARKERS_FIELD.search(message or "")
+        return int(found.group(1)) if found else 0
+    return 0
+
+
 def _carry_markers(
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
@@ -3762,15 +3780,17 @@ def _carry_markers(
 ) -> None:
     """Copy the unresolved rule 5 markers of the latest committed manifest into this
     writer's recorder, once, whatever the threshold or whether the Form 4 step runs, so
-    no newer manifest drops them. An unreadable latest manifest fails the run, whatever
-    the threshold, rather than let a marker-less manifest become the latest (a failed
+    no newer manifest drops them. An unreadable latest manifest (offline in iCloud, say)
+    fails the run, whatever the threshold, when that run's message recorded markers,
+    rather than let a marker-less manifest become the latest; if it recorded none (or no
+    field) nothing can be lost, so the run proceeds with the unread count (a failed
     run's manifest is not a chain head: its rows rolled back)."""
     if provenance is None or provenance.markers_carried:
         return
     provenance.markers_carried = True
     before = counts["sec_forms_provenance_manifest_unread"]
     provenance.markers = unresolved_markers(_latest_form4_manifest(conn, settings, counts))
-    if counts["sec_forms_provenance_manifest_unread"] > before:
+    if counts["sec_forms_provenance_manifest_unread"] > before and _recorded_marker_count(conn):
         raise RuntimeError(
             "the latest Form 4 manifest is unreadable, so its review markers cannot be "
             "copied forward; restore it before this writer publishes a new manifest"

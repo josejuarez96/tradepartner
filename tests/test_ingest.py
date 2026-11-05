@@ -11688,19 +11688,49 @@ def test_form4_rule5_markers_survive_a_run_that_skips_the_form4_step(
 
 
 @pytest.mark.parametrize("threshold", ["0.6", None])
-def test_form4_rule5_unreadable_latest_manifest_fails_the_run(
+def test_form4_rule5_unreadable_latest_manifest_with_markers_fails_the_run(
     fixture_store: duckdb.DuckDBPyConnection,
     settings: Settings,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     threshold: str | None,
 ) -> None:
-    case = _rule5_case(settings, tmp_path, monkeypatch, threshold)
+    """The prior run recorded markers (`form4_compare_markers=1`), so an unreadable
+    latest manifest could lose them: the run fails, with the threshold set or unset."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
     case.run(fixture_store, case.now)
+    fixture_store.execute(
+        "UPDATE ingestion_runs SET message = message || '; form4_compare_markers=2' "
+        "WHERE source = 'sec_forms'"
+    )
     for path in (tmp_path / "archive" / "manifests").iterdir():
         path.unlink()
+    case.settings = _rule5_settings(settings, tmp_path, threshold)
     with pytest.raises(RuntimeError, match="unreadable"):
         case.run(fixture_store, case.now + timedelta(days=1), "writer-2")
+
+
+def test_form4_rule5_unreadable_latest_manifest_without_markers_proceeds_and_counts(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prior run recorded none (an offline manifest on a normal night): nothing can
+    be lost, so the run succeeds and counts the unread manifest."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, None)
+    case.run(fixture_store, case.now)  # threshold unset: markers=0
+    for path in (tmp_path / "archive" / "manifests").iterdir():
+        path.unlink()
+    counts: Counter[str] = Counter()
+    provenance = ingest_module._Form4Provenance.start(
+        case.settings, run_id="writer-2", writer="sec_forms"
+    )
+    ingest_module._carry_markers(fixture_store, case.settings, provenance, counts)
+    assert counts["sec_forms_provenance_manifest_unread"] == 1
+    assert provenance is not None and provenance.markers == []
+    _added, message, _p = case.run(fixture_store, case.now + timedelta(days=1), "writer-3")
+    assert "sec_forms_provenance_manifest_unread: 1" in message
 
 
 def test_form4_rule5_a_failed_runs_manifest_is_not_the_marker_chain_head(
