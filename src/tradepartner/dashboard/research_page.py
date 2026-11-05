@@ -3,13 +3,13 @@
 A read-only dashboard page for the research registry, drawn inside the shell's
 single read-only connection (spec req 15): registrations with their block fields
 and the budgets used along each amendment chain, per hypothesis family the
-research run and configuration sums beside the family's backtest N, runs newest
+research run and counted exposure configurations beside the backtest N, runs newest
 first with every state req 15 names (outcome, verdict, confirmatory and its
 basis, provenance, split, holdout spent and repeat; synthetic hidden by default;
 failed, refused, abandoned and unfinished rows visible with their message),
-datasets with their sealed splits and periods and the spends against them, and
-the registry's decisions. A store before the migration shows "research registry
-not initialised" (from `ResearchNotInitialised`).
+exposures newest first with synthetic hidden by default, datasets with their
+sealed splits and periods and the spends against them, and the registry's
+decisions. A store before the exposure migration shows "exposures not initialised".
 
 Two layers, like the other pages: `load_research_view` reads everything through
 the connection it is given (the shell's single read-only connection) and needs
@@ -64,7 +64,23 @@ _FAMILIES_SCHEMA: Final[dict[str, pl.DataType]] = {
     "family": pl.Utf8(),
     "research runs": pl.Int64(),
     "research configurations": pl.Int64(),
+    "exposure configurations": pl.Int64(),
     "backtest N": pl.Int64(),
+}
+_EXPOSURES_SCHEMA: Final[dict[str, pl.DataType]] = {
+    "exposure": pl.Int64(),
+    "candidate": pl.Utf8(),
+    "source": pl.Utf8(),
+    "family": pl.Utf8(),
+    "verdict": pl.Utf8(),
+    "configurations": pl.Int64(),
+    "kill-line basis": pl.Utf8(),
+    "probe_verified": pl.Boolean(),
+    "overlaps_holdout": pl.Boolean(),
+    "post_boundary": pl.Boolean(),
+    "desk read": pl.Utf8(),
+    "read_at": _INSTANT,
+    "known_at": _INSTANT,
 }
 _RUNS_SCHEMA: Final[dict[str, pl.DataType]] = {
     "run": pl.Int64(),
@@ -148,6 +164,7 @@ class FamilySummary:
     family: str
     runs: int
     configurations: int
+    exposure_configurations: int | None
     backtest_n: int
 
 
@@ -193,6 +210,7 @@ class ResearchView:
     registrations: tuple[RegistrationRow, ...]
     families: tuple[FamilySummary, ...]
     runs: tuple[research.RunSummary, ...]
+    exposures: tuple[research.ExposureRecord, ...] | None
     datasets: tuple[DatasetRow, ...]
     decisions: tuple[DecisionRow, ...]
 
@@ -276,21 +294,26 @@ def _families(
     conn: duckdb.DuckDBPyConnection,
     registrations: Sequence[RegistrationRow],
     runs: Sequence[research.RunSummary],
+    exposures: Sequence[research.ExposureRecord] | None,
 ) -> tuple[FamilySummary, ...]:
-    """Per family named by a registration, its non-synthetic research run and
-    configuration sums beside the family's backtest N (req 6). The backtest N is
-    the backtest-trial part of `backtest.results.family_n_split`, the one N function
-    (never recomputed here; the research part is the sums beside it)."""
-    families = sorted({r.family for r in registrations if r.family is not None})
+    """Per family named by a registration or exposure, show research sums,
+    counted exposure configurations and the backtest-trial part of N. Both N
+    parts come from `backtest.results.family_n_split` (req 6, T358)."""
+    families = sorted(
+        {r.family for r in registrations if r.family is not None}
+        | {e.family for e in exposures or () if e.family is not None and not e.synthetic}
+    )
     out: list[FamilySummary] = []
     for family in families:
         counted = [run for run in runs if run.family == family and not run.synthetic]
+        split = family_n_split(conn, family)
         out.append(
             FamilySummary(
                 family=family,
                 runs=len(counted),
                 configurations=sum(run.n_configurations_declared for run in counted),
-                backtest_n=family_n_split(conn, family).trials,
+                exposure_configurations=split.exposures,
+                backtest_n=split.trials,
             )
         )
     return tuple(out)
@@ -371,17 +394,29 @@ def _decisions(conn: duckdb.DuckDBPyConnection) -> tuple[DecisionRow, ...]:
 
 
 def load_research_view(
-    conn: duckdb.DuckDBPyConnection, include_synthetic: bool = False
+    conn: duckdb.DuckDBPyConnection,
+    include_synthetic: bool = False,
+    include_synthetic_exposures: bool = False,
 ) -> ResearchView:
-    """Read the whole research view through `conn` (the shell's single
-    read-only connection); synthetic runs are hidden unless asked for."""
+    """Read the whole research view through the shell's read-only connection.
+
+    Synthetic runs and exposures are hidden unless separately asked for.
+    `exposures` is None when the store predates the exposure table.
+    """
     schema.require_research(conn)
     runs = tuple(research.list_runs(conn, include_synthetic=include_synthetic))
+    try:
+        exposures: tuple[research.ExposureRecord, ...] | None = tuple(
+            research.list_exposures(conn, include_synthetic=include_synthetic_exposures)
+        )
+    except research.ExposuresNotInitialised:
+        exposures = None
     registrations = _registrations(conn, _chain_usage(runs))
     return ResearchView(
         registrations=registrations,
-        families=_families(conn, registrations, runs),
+        families=_families(conn, registrations, runs, exposures),
         runs=runs,
+        exposures=exposures,
         datasets=_datasets(conn),
         decisions=_decisions(conn),
     )
@@ -466,6 +501,7 @@ def _families_table(rows: Sequence[FamilySummary]) -> pl.DataFrame:
                 "family": row.family,
                 "research runs": row.runs,
                 "research configurations": row.configurations,
+                "exposure configurations": row.exposure_configurations,
                 "backtest N": row.backtest_n,
             }
             for row in rows
@@ -498,6 +534,32 @@ def _runs_table(rows: Sequence[research.RunSummary]) -> pl.DataFrame:
             for row in rows
         ],
         schema=_RUNS_SCHEMA,
+    )
+
+
+def _exposures_table(rows: Sequence[research.ExposureRecord]) -> pl.DataFrame:
+    return pl.DataFrame(
+        [
+            {
+                "exposure": row.exposure_id,
+                "candidate": row.candidate_ref,
+                "source": row.source,
+                "family": row.family,
+                "verdict": row.verdict,
+                "configurations": row.n_configurations,
+                "kill-line basis": row.kill_line_basis,
+                "probe_verified": row.probe_verified,
+                "overlaps_holdout": row.overlaps_holdout,
+                "post_boundary": row.post_boundary,
+                "desk read": (
+                    f"https://github.com/josejuarez96/tradepartner/blob/main/{row.desk_read_path}"
+                ),
+                "read_at": row.read_at,
+                "known_at": row.known_at,
+            }
+            for row in rows
+        ],
+        schema=_EXPOSURES_SCHEMA,
     )
 
 
@@ -560,13 +622,19 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
         return
 
     show_synthetic = st.checkbox("Show synthetic runs", value=False, key="research_synthetic")
-    view = load_research_view(conn, include_synthetic=show_synthetic)
-    if not view.registrations and not view.datasets and not view.decisions:
+    show_synthetic_exposures = st.checkbox(
+        "Show synthetic exposures", value=False, key="research_synthetic_exposures"
+    )
+    view = load_research_view(
+        conn,
+        include_synthetic=show_synthetic,
+        include_synthetic_exposures=show_synthetic_exposures,
+    )
+    if not view.registrations and not view.datasets and not view.decisions and not view.exposures:
         st.info(
             "No research registrations yet. Run `tradepartner experiment register <file>` "
             "to record one."
         )
-        return
 
     st.subheader("Registrations")
     if view.registrations:
@@ -582,7 +650,7 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
     if view.families:
         st.caption(
             "Research runs and configurations over every slug naming the family, "
-            "beside the family's backtest N."
+            "with counted exposure configurations beside the family's backtest N."
         )
         st.dataframe(_families_table(view.families), hide_index=True)
     else:
@@ -594,6 +662,19 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
         st.dataframe(_runs_table(view.runs), hide_index=True)
     else:
         st.markdown("No runs.")
+
+    st.subheader("Exposures")
+    if view.exposures is None:
+        st.info("Exposures not initialised.")
+    elif view.exposures:
+        st.caption("Newest first. Synthetic exposures are hidden unless asked for.")
+        st.dataframe(
+            _exposures_table(view.exposures),
+            hide_index=True,
+            column_config={"desk read": st.column_config.LinkColumn("desk read")},
+        )
+    else:
+        st.markdown("No exposures.")
 
     st.subheader("Datasets")
     if view.datasets:

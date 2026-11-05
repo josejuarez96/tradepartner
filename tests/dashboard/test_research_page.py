@@ -518,6 +518,7 @@ def test_render_family_sums_beside_the_backtest_n(
         "family",
         "research runs",
         "research configurations",
+        "exposure configurations",
         "backtest N",
     ]
     row = families.iloc[0].to_dict()
@@ -529,6 +530,82 @@ def test_render_family_sums_beside_the_backtest_n(
         assert row["backtest N"] == family_n_split(conn, "momentum").trials == 1
     finally:
         conn.close()
+
+
+def test_render_exposures_and_family_configurations(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+) -> None:
+    store_path, _ = seeded_store
+    with duckdb.connect(str(store_path)) as conn:
+        for exposure_id, source, synthetic, configurations in (
+            (1, "store", False, 2),
+            (2, "open_data", False, 4),
+            (3, "store", True, 8),
+        ):
+            conn.execute(
+                "INSERT INTO research_exposures "
+                "(exposure_id, candidate_ref, source, family, kill_line_url, "
+                "kill_line_sha256, kill_line_posted_at, kill_line_basis, probe_sha256, "
+                "probe_verified, read_at, window_start, window_end, data_pin_json, "
+                "n_configurations, verdict, desk_read_path, overlaps_holdout, post_boundary, "
+                "synthetic, recorded_by, code_version, known_at) VALUES "
+                "(?, ?, ?, 'momentum', 'https://example.com', ?, now(), "
+                "'posted_before_read', ?, true, now(), DATE '2020-01-01', DATE '2020-03-31', "
+                "'{}', ?, 'fail', 'docs/research/read.md', ?, ?, ?, 'test', "
+                "'test', now())",
+                [
+                    exposure_id,
+                    f"candidate-{exposure_id}",
+                    source,
+                    "a" * 64,
+                    str(exposure_id) * 64,
+                    configurations,
+                    exposure_id == 2,
+                    exposure_id == 2,
+                    synthetic,
+                ],
+            )
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    exposures = _frame(at, "candidate")
+    assert list(exposures["candidate"]) == ["candidate-2", "candidate-1"]
+    for column in (
+        "source",
+        "family",
+        "verdict",
+        "kill-line basis",
+        "probe_verified",
+        "overlaps_holdout",
+        "post_boundary",
+        "desk read",
+    ):
+        assert column in exposures.columns
+    open_data = exposures.iloc[0]
+    assert bool(open_data["overlaps_holdout"]) is True
+    assert bool(open_data["post_boundary"]) is True
+    assert bool(open_data["probe_verified"]) is True
+    assert open_data["kill-line basis"] == "posted_before_read"
+    assert open_data["desk read"].endswith("/docs/research/read.md")
+    families = _frame(at, "backtest N")
+    assert families.iloc[0]["exposure configurations"] == 2
+    checkbox = next(box for box in at.checkbox if box.label == "Show synthetic exposures")
+    checkbox.check().run()
+    assert "candidate-3" in set(_frame(at, "candidate")["candidate"])
+
+
+def test_pre_exposure_store_renders_not_initialised(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+) -> None:
+    store_path, _ = seeded_store
+    with duckdb.connect(str(store_path)) as conn:
+        conn.execute("DROP TABLE research_exposures")
+        conn.execute("ALTER TABLE trial_results DROP COLUMN n_exposure")
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version VALUES (43, now())")
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    assert "exposures not initialised" in _text(at).lower()
+    assert _frame(at, "backtest N").iloc[0]["backtest N"] == 1
 
 
 def test_render_runs_newest_first_with_every_state_and_synthetic_hidden(
