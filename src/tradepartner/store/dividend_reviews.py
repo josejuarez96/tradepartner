@@ -133,13 +133,15 @@ def parse_reviews(text: str) -> tuple[ReviewedGroup, ...]:
     in file order. Raises `ReviewsError`, naming the line, on another header,
     a short or long row, a verdict outside `VERDICTS`, an `ex_date` that is
     not an XNYS session, a non-positive amount, a retract id on a row that
-    is not `duplicate` or none on one that is, or a key listed twice."""
+    is not `duplicate` or none on one that is, a key listed twice, or a
+    retract id assigned to two groups of one security."""
     reader = csv.reader(io.StringIO(text))
     header = next(reader, None)
     if header is None or tuple(header) != COLUMNS:
         raise ReviewsError(f"{_FILE} line 1: header {header!r} is not {list(COLUMNS)}")
     groups: list[ReviewedGroup] = []
     seen: dict[GroupKey, int] = {}
+    retracts: dict[tuple[str, str], tuple[GroupKey, int]] = {}
     for values in reader:
         line = reader.line_num
         if not values:
@@ -151,6 +153,15 @@ def parse_reviews(text: str) -> tuple[ReviewedGroup, ...]:
             raise ReviewsError(
                 f"{_FILE} line {line}: key {group.key} is listed again (line {first})"
             )
+        if group.verdict == DUPLICATE:
+            retract_key = (group.security_id, group.retract_source_action_id)
+            if (prior := retracts.get(retract_key)) is not None:
+                raise ReviewsError(
+                    f"{_FILE} line {line}: retract id {group.retract_source_action_id!r} "
+                    f"belongs to groups {prior[0][0]} {prior[0][1]} {prior[0][2]} "
+                    f"(line {prior[1]}) and {group.security_id} {group.ex_date} {group.amount}"
+                )
+            retracts[retract_key] = (group.key, line)
         seen[group.key] = line
         groups.append(group)
     return tuple(groups)

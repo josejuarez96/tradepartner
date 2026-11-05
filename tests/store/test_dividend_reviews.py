@@ -77,6 +77,12 @@ def test_the_loader_refuses_a_key_listed_twice_and_another_header() -> None:
         parse_reviews("")
 
 
+def test_the_loader_refuses_a_retract_id_in_two_groups() -> None:
+    second = "0000000001,2021-06-16,0.5,duplicate,id-b,AAA,second review"
+    with pytest.raises(ReviewsError, match=r"id-b.*2021-06-15.*2021-06-16"):
+        parse_reviews(_text(GOOD, second))
+
+
 def test_the_amount_is_the_stored_double_exactly() -> None:
     [group] = parse_reviews(_text(GOOD.replace("0.25", "0.1515334")))
     assert group.amount == 0.1515334

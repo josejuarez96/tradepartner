@@ -227,6 +227,7 @@ from tradepartner.store.asof import (
 )
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.dividend_reviews import (
+    DUPLICATE,
     ReviewedGroup,
     equal_amount_groups,
     reviewed_groups,
@@ -710,7 +711,9 @@ def _dividends(
     `duplicate` not yet repaired (`pending`) counts once (its retract id's row
     is skipped); a listed `distinct` or `unresolved` pair counts as stored; any
     other group (`violation`) is never summed and, on a held name, is a
-    finding, so the caller fails closed rather than guess one payment or two."""
+    finding, so the caller fails closed rather than guess one payment or two.
+    A live re-sent retract id with a key other than its reviewed key, beside
+    another live payment, is a finding."""
     window_start = session
     for _ in range(credit_sessions):
         window_start = previous_session(window_start)
@@ -742,6 +745,37 @@ def _dividends(
                 f"{len(group.identities)} live dividend records of {group.amount!r} with "
                 f"ex-date {group.ex_date} ({ids}) that the reviewed list does not explain"
             )
+    live_rows = list(rows.iter_rows(named=True))
+    by_day: dict[tuple[str, date], dict[str, tuple[str, date, float]]] = defaultdict(dict)
+    for row in live_rows:
+        key = (row["security_id"], row["ex_date"], float(row["ratio_or_amount"]))
+        by_day[(row["security_id"], row["ex_date"])][row["source_action_id"]] = key
+    retracts = {
+        (group.security_id, group.retract_source_action_id): group
+        for group in reviewed
+        if group.verdict == DUPLICATE
+    }
+    for row in live_rows:
+        reviewed_group = retracts.get((row["security_id"], row["source_action_id"]))
+        if reviewed_group is None:
+            continue
+        key = (row["security_id"], row["ex_date"], float(row["ratio_or_amount"]))
+        if key != reviewed_group.key:
+            partners = {
+                partner_key
+                for ex_date in (reviewed_group.ex_date, row["ex_date"])
+                for action_id, partner_key in by_day[(row["security_id"], ex_date)].items()
+                if action_id != reviewed_group.retract_source_action_id
+            }
+            if not partners:
+                continue
+            detail = (
+                f"reviewed retract id {reviewed_group.retract_source_action_id} has key "
+                f"{key!r} instead of {reviewed_group.key!r}, with another live payment"
+            )
+            unexplained[key] = detail
+            for partner_key in partners:
+                unexplained[partner_key] = detail
     dues: dict[str, list[tuple[date, float]]] = defaultdict(list)
     findings: dict[str, list[str]] = defaultdict(list)
     holdings: dict[date, Ledger] = {}
