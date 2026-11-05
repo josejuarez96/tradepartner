@@ -11751,3 +11751,32 @@ def test_form4_rule5_a_failed_runs_manifest_is_not_the_marker_chain_head(
     counts: Counter[str] = Counter()
     assert ingest_module._latest_form4_manifest(fixture_store, case.settings, counts) is not None
     assert counts["sec_forms_provenance_manifest_unread"] == 0
+
+
+def test_form4_rule5_marker_count_rides_with_the_digest_on_every_writer_message(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A writer that skips the Form 4 step still carries markers into its manifest, and
+    its message names them next to the digest, so a later unreadable manifest fails."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    case.run(fixture_store, case.now)
+    provenance = ingest_module._Form4Provenance.start(
+        case.settings, run_id="writer-2", writer="sec_forms"
+    )
+    ingest_module._write_sec_forms(
+        fixture_store, case.settings, case.source, lambda: [], frozenset(), case.now,
+        form4=False, provenance=provenance,
+    )  # fmt: skip
+    clause = ingest_module._provenance_clause(provenance)
+    assert clause.endswith("; form4_compare_markers=1")
+    ingest_module.write_run(
+        fixture_store, "writer-2", case.now + timedelta(days=1), case.now + timedelta(days=1),
+        SourceRun("sec_forms", "ok", 0, "since=x", f"0 subjects{clause}"), mode="backfill",
+    )  # fmt: skip
+    for path in (tmp_path / "archive" / "manifests").iterdir():
+        path.unlink()
+    with pytest.raises(RuntimeError, match="unreadable"):
+        case.run(fixture_store, case.now + timedelta(days=2), "writer-3")

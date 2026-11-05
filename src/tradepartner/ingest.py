@@ -3696,14 +3696,19 @@ class _Form4Provenance:
 
 
 def _provenance_clause(provenance: _Form4Provenance | None) -> str:
-    """`; provenance_sha256=<hex>` for a writer message, placed by the caller
-    before any text `ingest.max_message_chars` can cut; empty with the archive off.
+    """`; provenance_sha256=<hex>; form4_compare_markers=N` for a writer message, placed
+    by the caller before any text `ingest.max_message_chars` can cut; empty with the
+    archive off.
     A dry run names no digest (no manifest was written) and reports what it would keep."""
     if provenance is None:
         return ""
     if provenance.dry_run:
         return provenance.dry_run_clause()
-    return f"; {PROVENANCE_KEY}={provenance.finish()}"
+    digest = provenance.finish()
+    # The unresolved-marker count rides beside the digest so no later cut removes it:
+    # `_recorded_marker_count` reads it when the manifest itself is unreadable.
+    unresolved = len({m["accession"] for m in provenance.markers if m["status"] == "unresolved"})
+    return f"; {PROVENANCE_KEY}={digest}; form4_compare_markers={unresolved}"
 
 
 def _form4_manifests(
