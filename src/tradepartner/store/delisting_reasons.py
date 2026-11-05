@@ -104,7 +104,11 @@ _TEXT_PATTERNS: dict[str, re.Pattern[str]] = {
         r"market value of (publicly held|listed)",
         re.I,
     ),
-    VOLUNTARY: re.compile(r"voluntar|going private|deregist", re.I),
+    VOLUNTARY: re.compile(
+        r"voluntar(y|ily)\s+(withdraw|delist|remov)|(withdraw|delist|remov)\w*\s+\w*\s*voluntar|"
+        r"going private|deregist",
+        re.I,
+    ),
 }
 
 #: Evidence ranks when several pieces agree on the class: the issuer's 8-K item
@@ -262,7 +266,10 @@ def _resolve(
     if len(common) > 1:
         return UNKNOWN, None, ()
     (reason,) = common
-    best = min(live, key=lambda o: (_SOURCE_RANK[o.source], -o.known_at.timestamp()))
+    best = min(
+        live,
+        key=lambda o: (_SOURCE_RANK[o.source], -o.known_at.timestamp(), o.accession, o.form),
+    )
     if reason == VOLUNTARY and best.source == "form25_provision" and any(o.notice for o in known):
         return UNKNOWN, None, ()
     return reason, best, ()

@@ -390,3 +390,28 @@ def test_a_standing_conflict_is_reported_once() -> None:
         [_eightk("1.03", eightk_at), _eightk("3.01", FILED + timedelta(days=1), "a-9")],
     )
     assert len(build.conflicts) == 1
+
+
+def test_voluntary_chapter_11_petition_is_bankruptcy_not_voluntary() -> None:
+    """Greptile P1: "filed voluntary petitions under Chapter 11" is a bankruptcy."""
+    text = "The Company filed voluntary petitions for relief under Chapter 11 of the Code."
+    assert classify_notice_text(text) == {"bankruptcy"}
+    assert classify_notice_text("The issuer voluntarily withdraws the listing") == {
+        "voluntary_other"
+    }
+    build = _build([_evidence("12d2-2(a)(3)", text)], [])
+    assert [(r["reason"], r["reason_source"]) for r in build.rows] == [
+        ("bankruptcy", "form25_text")
+    ]
+
+
+def test_equal_rank_support_is_chosen_independent_of_input_order() -> None:
+    """Greptile P2: two 1.03 8-Ks accepted at the same instant."""
+    at = FILED - timedelta(days=5)
+    a = _eightk("1.03", at, "0000123456-24-000009")
+    b = EightK(CIK, "8-K/A", "0000123456-24-000001", "1.03", at)
+    first = _build([], [a, b]).rows[0]
+    second = _build([], [b, a]).rows[0]
+    assert first["reason_evidence_accession"] == second["reason_evidence_accession"]
+    assert first["reason_evidence_form"] == second["reason_evidence_form"]
+    assert first["reason_evidence_accession"] == "0000123456-24-000001"
