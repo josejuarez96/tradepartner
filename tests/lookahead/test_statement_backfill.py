@@ -317,7 +317,7 @@ def test_the_backfill_equals_rebuild_index_over_a_copy_of_the_store(
 # --- Resume ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("stop", range(len(ALL)))
+@pytest.mark.parametrize("stop", range(len(ALL) + 1))
 def test_a_backfill_interrupted_after_each_chunk_resumes_to_the_same_end_state(
     stop: int,
     pre_backfill: _Pre,
@@ -338,6 +338,13 @@ def test_a_backfill_interrupted_after_each_chunk_resumes_to_the_same_end_state(
 
     added = _added(_copy(pre_backfill, "resume", tmp_path), statement_backfill_chunk_ciks=1)
     monkeypatch.setattr(ingest_module, "_write_statement_facts", broken)
+    if stop == len(ALL):  # every chunk commits; the closing `ok` row fails
+        message = ingest_module._index_run_message
+
+        def closing(*args: Any, **kw: Any) -> Any:
+            raise RuntimeError("interrupted before the ok row")
+
+        monkeypatch.setattr(ingest_module, "_index_run_message", closing)
     failed, _ = _run(added, pre_backfill.world, pre_backfill.at, backfill=True)
     assert not failed.ok
     assert calls == [[cik] for cik in ALL[:stop]]
@@ -345,6 +352,8 @@ def test_a_backfill_interrupted_after_each_chunk_resumes_to_the_same_end_state(
         "AND status = 'partial' ORDER BY rowid"  # fmt: skip
     assert len(_rows(added, partial)) == stop
     monkeypatch.setattr(ingest_module, "_write_statement_facts", original)
+    if stop == len(ALL):
+        monkeypatch.setattr(ingest_module, "_index_run_message", message)
     resumed, _ = _run(added, pre_backfill.world, pre_backfill.at, backfill=True)
     assert resumed.ok, [(r.status, r.message) for r in resumed.runs]
     # The committed chunks are not written again: one `partial` row per CIK, once.
@@ -506,5 +515,5 @@ def test_a_nightly_after_the_backfill_extracts_the_new_names_for_its_cik_alone(
         (ALPHA, "operating_income", f"{ALPHA}-26-000003"),
     ]
     assert not set(before) - set(after)
-    assert ALPHA in source.payload_reads
+    assert source.payload_reads == [ALPHA]
     assert touched == [frozenset({ALPHA})]  # the night's one filing names one CIK
