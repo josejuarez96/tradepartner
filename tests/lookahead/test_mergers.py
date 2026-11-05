@@ -110,6 +110,9 @@ def _mergers_reader_violations(source: str, path: Path) -> list[int]:
                 self.generic_visit(node)
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            if "mergers" in (node.module or "").split("."):
+                violations.append(node.lineno)
+                return
             for alias in node.names:
                 if alias.name in {"mergers", "mergers_as_of"}:
                     permitted = (
@@ -158,6 +161,11 @@ def _mergers_reader_violations(source: str, path: Path) -> list[int]:
         (
             "import tradepartner.store.mergers as m\n"
             "def sneak(conn):\n    return m.mergers_as_of(conn, None)\n",
+            Path("backtest/store_provider.py"),
+        ),
+        (
+            "from tradepartner.store.mergers import read_all as r\n"
+            "def sneak(conn):\n    return r(conn)\n",
             Path("backtest/store_provider.py"),
         ),
         (
