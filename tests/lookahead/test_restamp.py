@@ -1249,3 +1249,58 @@ def test_a_moved_fact_accession_whose_date_set_changed_is_revised_at_the_run(
             [ACME, A_COVER[0]],
         ).fetchall()
     assert revisions == [(RESTAMP_RUN,)]
+
+
+# --- a stored revision of a moved fact accession (#2970) ---------------------
+
+REVISION_RUN = datetime(2019, 6, 30, 2, 0, tzinfo=UTC)
+
+
+def test_a_restamp_never_changes_a_read_at_or_after_a_stored_revision(
+    settings: Settings,
+) -> None:
+    """#2970: an accession revised by an earlier run (dropping a date, stored
+    at `known_at = ingested_at = T_r`) and then restamped. The restamp moves
+    the originals, never the revision, so a read in `[T_r, run)` must keep
+    serving the revision's date set, as before the restamp."""
+    status, message, _ = _ingest(
+        settings, _source(acme_early=True, acme_second_date=True), now=FIRST_RUN
+    )
+    assert status == OK, message
+    status, message, _ = _ingest(settings, _source(acme_early=True), now=REVISION_RUN)
+    assert status == OK, message
+    store = _Store(settings.store.path)
+    probes = [
+        _early(A_COVER[1]),
+        A_COVER[1],
+        FIRST_RUN,
+        REVISION_RUN - timedelta(microseconds=1),
+        REVISION_RUN,
+        REVISION_RUN + timedelta(hours=1),
+        RESTAMP_RUN - timedelta(microseconds=1),
+        RESTAMP_RUN,
+    ]
+
+    def served(t: datetime) -> list[date]:
+        with duckdb.connect(store.path, read_only=True) as conn:
+            conn.execute("SET TimeZone='UTC'")
+            rows = facts_as_of(conn, t, [ACME])
+            return sorted(rows.filter(rows["filing_accession"] == A_COVER[0])["as_of_date"])
+
+    before = {t: served(t) for t in probes}
+    assert before[REVISION_RUN] == [date(2019, 2, 15)]
+
+    status, message, (result,) = _ingest(
+        settings, _source(acme_early=False), now=RESTAMP_RUN, restamp=_acme_manifest()
+    )
+
+    assert status == OK, message
+    assert result.refused == {}
+    after = {t: served(t) for t in probes}
+    # Only reads before the true stamp may change (the repair's purpose): the
+    # rows become known there. Nothing at or after the revision may move.
+    for t in probes:
+        if t >= A_COVER[1]:
+            assert after[t] == before[t], t
+        else:
+            assert after[t] == []
