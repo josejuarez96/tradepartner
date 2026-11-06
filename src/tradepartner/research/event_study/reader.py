@@ -8,13 +8,17 @@ import polars as pl
 
 from tradepartner.calendar import is_session, previous_session, session_close
 from tradepartner.config import Settings
-from tradepartner.store.asof import adjusted_prices_as_of, facts_as_of, prices_as_of
+from tradepartner.store.asof import (
+    adjusted_prices_as_of,
+    facts_as_of,
+    packaged_dividend_reviews,
+    prices_as_of,
+)
 from tradepartner.store.benchmarks import (
     BenchmarkIdentityError,
     research_benchmark_security_ids,
 )
 from tradepartner.store.db import open_read_only
-from tradepartner.store.dividend_reviews import reviewed_groups
 
 
 class EventStudyReader:
@@ -73,7 +77,7 @@ class EventStudyReader:
                 settings=self.settings,
                 traded_only=True,
                 sessions_from=sessions_from,
-                dividend_reviews=reviewed_groups(),
+                dividend_reviews=packaged_dividend_reviews(),
             )
             raw = prices_as_of(
                 conn,

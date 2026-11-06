@@ -283,7 +283,11 @@ import polars as pl
 
 from tradepartner.calendar import all_sessions
 from tradepartner.config import Settings, get_settings, parse_accepted_jump
-from tradepartner.store.dividend_reviews import ReviewedGroup, equal_amount_groups
+from tradepartner.store.dividend_reviews import (
+    ReviewedGroup,
+    equal_amount_groups,
+    reviewed_groups,
+)
 from tradepartner.store.schema import RETRACTABLE_TABLES, has_retracted
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -2077,6 +2081,13 @@ def _sessions_registered(
         yield
     finally:
         conn.unregister(_SESSIONS_VIEW)
+
+
+def packaged_dividend_reviews() -> tuple[ReviewedGroup, ...]:
+    """The packaged reviewed list (`store.dividend_reviews.reviewed_groups`), the
+    `dividend_reviews` a total-return reader passes (#3015). A pure read of the
+    packaged file, exposed here so a reader allowed only the as-of API can gate on it."""
+    return reviewed_groups()
 
 
 def _dividend_gate(
