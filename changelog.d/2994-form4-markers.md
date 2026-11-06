@@ -1,0 +1,3 @@
+- Rule 5 markers (#2994): a marked accession that agrees on re-fetch is resolved; an uncompared re-fetch stays marked and counts; bulk-trusted fields refused while the threshold is set; compare keys excluded from the fingerprint.
+### Fixed
+- Form 4 rule 5: a marked accession re-fetched as XML and now agreeing gets a resolved marker (`sec_forms_compare_marker_resolved`); one with no fair comparison stays unresolved and counts `sec_forms_compare_marker_uncompared`; a field trusted to the bulk set is refused while `events.form4_compare_threshold` is set, since its row would be stored under the XML's provenance (#2994).
