@@ -2082,7 +2082,9 @@ class RiskGatedBroker:
         self, run: PaperRunRow, sells: Sequence[OrderRow], book: _Book, notes: list[str]
     ) -> None:
         """Poll this run's sells until each is terminal or
-        `paper.sell_wait_seconds` has passed since the open, then collect them."""
+        `paper.sell_wait_seconds` has passed since the open, then collect them.
+        Each round reads the open-orders list once; a sell not on it is read
+        with `get_order` and leaves the wait only if that read is terminal."""
         assert run.session is not None
         paper = self._settings.paper
         deadline = self._calendar.session_open(run.session) + timedelta(
@@ -2093,8 +2095,14 @@ class RiskGatedBroker:
         ]
         round_number = 0
         while waiting:
+            # One list read per round, not one read per open sell (#2614 item 1). A
+            # sell leaves the wait only when its own read says terminal, so a list
+            # that lags or leaves a sell out never ends the wait early (fail closed).
+            listed = {order.client_order_id for order in self._broker.open_orders()}
             waiting = [
-                c for c in waiting if self._broker.get_order(c).status not in TERMINAL_STATUSES
+                c
+                for c in waiting
+                if c in listed or self._broker.get_order(c).status not in TERMINAL_STATUSES
             ]
             now = self.read_clock()
             round_number += 1
