@@ -3837,8 +3837,8 @@ def _write_form4_bulk(
     )
     if settings.events.form4_compare_threshold is not None and bulk_trusted:
         # #2994: such a row would be stored as `sec_form4_xml` under the XML body's hash,
-        # which no re-derive from the kept XML reproduces; refused until provenance can
-        # name a mixed row.
+        # which no re-derive from the kept XML reproduces. `EventsConfig` refuses the pair
+        # at load; this backstops settings built without validation (`model_copy`).
         raise ValueError(
             f"events.form4_compare_trusted has fields trusted to the bulk set {bulk_trusted}; "
             "with events.form4_compare_threshold set their rows would be stored under the "
