@@ -125,6 +125,12 @@ here is this module's and is stated once:
   a rule changed in code without a `BUILD_RULES_VERSION` bump; a changed stamp
   is an owner repair release (spec amendment 2026-10-30). Report-only.
 
+- **Form 4 comparison** (`form4_compare`, T351, #2714): the disagreeing and compared
+  XML-fetched accessions, the threshold and the unresolved review markers of the latest
+  `edgar` or `sec_forms` run message that carries them
+  (`form4_compare_disagree=N; form4_compare_compared=N; form4_compare_threshold=...`);
+  `None` before one ran. Report-only here: the run fails at or above the threshold.
+
 - **Rates** (`rates`, #1498, T169e): per configured or stored series, the
   stored row count, latest observation, vintage and stamp, revised-key count,
   the longest missing XNYS-session span between observations, and the last
@@ -427,6 +433,7 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
+from decimal import Decimal
 from itertools import pairwise
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -1008,6 +1015,59 @@ def _incremental_edgar_report(conn: duckdb.DuckDBPyConnection, t: datetime) -> I
         counts=incremental_edgar_counts(message),
         drift_ciks=tuple(named.group(1).split()) if named else (),
     )
+
+
+_FORM4_COMPARE = re.compile(
+    r"\bform4_compare_disagree=(\d+); form4_compare_compared=(\d+); "
+    r"form4_compare_threshold=(\S+?);(?: form4_compare_markers=(\d+))?"
+)
+
+
+@dataclass(frozen=True)
+class Form4Compare:
+    """The Form 4 rule 5 comparison of the latest Form 4 writer run (T351, #2714): the
+    disagreeing and compared XML-fetched accessions, the configured share threshold
+    (`unset` reports only) and the unresolved review markers in its manifest. Report-only:
+    the run itself fails at or above the threshold. Nothing compared is `unchecked`."""
+
+    disagreeing: int = 0
+    compared: int = 0
+    threshold: str = "unset"
+    markers: int = 0
+
+    @property
+    def share(self) -> Decimal | None:
+        """Disagreeing over compared; `None` when nothing was compared."""
+        return Decimal(self.disagreeing) / Decimal(self.compared) if self.compared else None
+
+
+def form4_compare_from_message(message: str | None) -> Form4Compare | None:
+    """The rule 5 figures a Form 4 writer run's message carries, or `None` when it
+    names none (a run before T351)."""
+    found = _FORM4_COMPARE.search(message or "")
+    if found is None:
+        return None
+    return Form4Compare(
+        int(found.group(1)),
+        int(found.group(2)),
+        found.group(3),
+        int(found.group(4) or 0),
+    )
+
+
+def _form4_compare_report(conn: duckdb.DuckDBPyConnection, t: datetime) -> Form4Compare | None:
+    """The latest `edgar` or `sec_forms` run finished by `t` whose message carries the
+    figures; a later run without them neither clears nor shows."""
+    row = conn.execute(
+        """
+        SELECT message FROM ingestion_runs
+        WHERE source IN ('edgar', 'sec_forms') AND coalesce(finished_at, started_at) <= ?
+          AND message LIKE '%form4_compare_compared=%'
+        ORDER BY started_at DESC, run_id DESC LIMIT 1
+        """,
+        [t],
+    ).fetchone()
+    return form4_compare_from_message(None if row is None else row[0])
 
 
 _REFERENCE_MISSING_SCHEMA: dict[str, Any] = {
@@ -1932,6 +1992,8 @@ class HealthReport:
     coverage_reference: CoverageReference | None = None
     #: The incremental EDGAR ingest's warnings (#2629).
     incremental_edgar: IncrementalEdgar = field(default_factory=lambda: IncrementalEdgar({}))
+    #: The latest Form 4 writer run's rule 5 comparison (T351); `None` before one ran.
+    form4_compare: Form4Compare | None = None
 
     @property
     def failures(self) -> tuple[str, ...]:
@@ -2084,6 +2146,7 @@ def health_report(
         statement=_statement_facts_report(conn, t, settings, ingests),
         filing_events=_filing_events_report(conn, settings, ingests),
         incremental_edgar=_incremental_edgar_report(conn, t),
+        form4_compare=_form4_compare_report(conn, t),
         rates=_rates_report(conn, t, settings),
         borrow=_borrow_report(conn, t, session, settings),
         mergers=_mergers_report(conn, t, ingests),

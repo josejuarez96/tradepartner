@@ -6016,32 +6016,46 @@ def make_app(
 
     @paper_app.command("true-up")
     def paper_true_up_(
-        break_id: Annotated[
-            list[str],
-            typer.Option("--break", help="the open break's id, once", allow_from_autoenv=False),
-        ],
         reason: Annotated[str, _REASON_OPTION],
+        break_id: Annotated[
+            list[str] | None,
+            typer.Option("--break", help="the open break's id, once", allow_from_autoenv=False),
+        ] = None,
         book: Annotated[str | None, _BOOK_OPTION] = None,
+        reverse: Annotated[
+            list[str] | None,
+            typer.Option("--reverse", help="the trued-up break's id", allow_from_autoenv=False),
+        ] = None,
     ) -> None:
         """Adopt the broker's figures for one open reconciliation break, owner-only
         (paper spec amendment 2026-10-26 #2266, item 9)."""
-        if len(break_id) != 1:
-            raise _fail("--break is given exactly once", USAGE_ERROR)
-        if _blank_text(break_id[0]):
-            raise _fail("--break must be non-blank", USAGE_ERROR)
-        (chosen_break,) = break_id
+        if reverse is not None:
+            if break_id:
+                raise _fail("--reverse and --break are mutually exclusive", USAGE_ERROR)
+            if len(reverse) != 1:
+                raise _fail("--reverse is given exactly once", USAGE_ERROR)
+            if _blank_text(reverse[0]):
+                raise _fail("--reverse must be non-blank", USAGE_ERROR)
+            (chosen_break,) = reverse
+        else:
+            if break_id is None or len(break_id) != 1:
+                raise _fail("--break is given exactly once", USAGE_ERROR)
+            if _blank_text(break_id[0]):
+                raise _fail("--break must be non-blank", USAGE_ERROR)
+            (chosen_break,) = break_id
         chosen = _checked_book(book)
         s = paper_settings(reason)
         paper_schema_gate(s)
         bk = _resolve_book(s, chosen)
         result = _paper_call(
             s,
-            lambda: paper_true_up.true_up(
+            lambda: (paper_true_up.reverse if reverse is not None else paper_true_up.true_up)(
                 s, write_chunk(s), broker(s, clock, bk), clock, chosen_break, reason, book_id=bk
             ),
         )
+        action = "reopened" if reverse is not None else "trued up"
         _echo_scrubbed(
-            f"paper true-up: {result.break_id} trued up (event {result.event_id}, "
+            f"paper true-up: {result.break_id} {action} (event {result.event_id}, "
             f"adjustments {', '.join(str(i) for i in result.adjustment_ids) or 'none'}, "
             f"at {_fmt(result.known_at)})",
             s,

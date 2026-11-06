@@ -20,6 +20,7 @@ import shutil
 import threading
 import time
 import zipfile
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -3368,6 +3369,61 @@ def test_filename_ten_k_missing_from_fsn_is_counted_apart(tmp_path: Path) -> Non
     assert (source.filename_fsn_missing, source.filename_fsn_no_symbol_only) == (1, 0)
 
 
+def test_filename_ten_k_fsn_keys_to_another_cik_is_a_coregistrants(tmp_path: Path) -> None:
+    """#2941: a combined 10-K FSN extracted under another CIK (the filer
+    whose instance it is) is read as a co-registrant's copy; one FSN holds
+    under this CIK, or never extracted, is not."""
+    source = _fn_source(tmp_path, _fn_router())
+    path = source._fsn_cache_path(_FN_CIK)
+    data = json.loads(path.read_text())
+    del data["records"][_FN_A]  # FSN keys A to the parent, not to this CIK
+    path.write_text(json.dumps(data))
+    source._fsn_extracted_accessions = frozenset({_FN_A, _FN_B, _FN_COVER})
+    listings = {e.accession: e for e in source.filename_listings(_FN_CIK)}
+    assert listings[_FN_A].coregistrant
+    assert listings[_FN_A].dei_symbol is None
+    assert not listings[_FN_B].coregistrant  # FSN holds B under this CIK
+    assert not listings[_FN_25_NASDAQ].coregistrant
+    assert source.filename_fsn_missing == 0  # a co-registrant's copy is not missing
+
+    missing = _fn_source(tmp_path / "other", _fn_router())
+    path = missing._fsn_cache_path(_FN_CIK)
+    data = json.loads(path.read_text())
+    del data["records"][_FN_A]  # FSN never extracted A at all: no evidence either way
+    path.write_text(json.dumps(data))
+    assert not {e.accession: e for e in missing.filename_listings(_FN_CIK)}[_FN_A].coregistrant
+    assert missing.filename_fsn_missing == 1
+
+
+def test_filename_ten_k_whose_cover_cache_names_another_entity_is_a_coregistrants(
+    tmp_path: Path,
+) -> None:
+    """#2941: the per-document cover cache naming another entity marks the
+    copy too, with no FSN entry anywhere."""
+    source = _fn_source(tmp_path, _fn_router())
+    path = source._fsn_cache_path(_FN_CIK)
+    data = json.loads(path.read_text())
+    del data["records"][_FN_A]
+    path.write_text(json.dumps(data))
+    edgar_raw.write_atomic(
+        source._cover_cache_path(_FN_A),
+        json.dumps(
+            {
+                "version": edgar_source_module.COVER_VERSION,
+                "accession": _FN_A,
+                "cik": _FN_CIK,
+                "entity_cik": "0000006201",
+                "listings": [],
+                "facts": [],
+            }
+        ).encode(),
+    )
+    listings = {e.accession: e for e in source.filename_listings(_FN_CIK)}
+    assert listings[_FN_A].coregistrant
+    assert not listings[_FN_B].coregistrant
+    assert source.filename_fsn_missing == 0
+
+
 @pytest.mark.parametrize("broken", ["index_404", "index_malformed", "document_404"])
 def test_filename_failed_fetch_is_counted_cached_nowhere_and_asked_again(
     tmp_path: Path, broken: str
@@ -3713,19 +3769,29 @@ def test_filename_fetch_failing_past_retries_fails_its_cik_closed(
 
 
 def test_filename_pool_sends_nothing_while_a_block_is_waited_out(tmp_path: Path) -> None:
-    """While SEC's rate-limit block is set, a pool worker sends nothing: each
-    fetch is deferred to the calling thread, which asks them one at a time in
-    stamp order (the first success clears the block), as the sequential
-    fetch does."""
+    """Pool workers send nothing during a block; the resulting listings and
+    request counts match a sequential fetch regardless of thread order."""
     edgar_raw._RATE_LIMIT_BLOCK.set()
     try:
         router = _fn_router()
+        worker_requests_during_block: list[str] = []
+        for url, original in list(router._routes.items()):
+
+            def checked(request: httpx.Request, original: Any = original) -> httpx.Response:
+                if edgar_raw.rate_limit_blocked() and threading.current_thread().name.startswith(
+                    "edgar-filename"
+                ):
+                    worker_requests_during_block.append(str(request.url))
+                return cast(httpx.Response, original(request))
+
+            router.add(url, checked)
         listings = _fn_source(tmp_path, router, filename_fetch_workers=4).filename_listings(_FN_CIK)
     finally:
         edgar_raw._RATE_LIMIT_BLOCK.clear()
     sequential = _fn_router()
     assert listings == _fn_source(tmp_path / "seq", sequential).filename_listings(_FN_CIK)
-    assert router.urls == sequential.urls
+    assert worker_requests_during_block == []
+    assert Counter(router.urls) == Counter(sequential.urls)
 
 
 def test_filename_fetch_block_given_up_on_still_raises(tmp_path: Path) -> None:
@@ -3833,26 +3899,27 @@ def test_filename_pool_a_block_waited_out_reads_as_the_sequential_fetch(
 
 
 def test_a_cached_v5_cover_page_is_no_longer_served(settings: Settings) -> None:
-    """T181 (#1541): the owner backed `cover_split_contexts` out in the same
-    release and the caches go to version 6, so a per-document cover page
-    cached under v5, parsed with the switch on, is never served: it is
-    fetched and parsed again."""
-    assert (FSN_VERSION, COVER_VERSION) == (6, 6)
+    """T181 (#1541), T198: the caches went to version 6 when the owner backed
+    `cover_split_contexts` out and to 7 when `rederive-1682` turned it back on,
+    so a per-document cover page cached under v5 (or v6) is never served: it
+    is fetched and parsed again."""
+    assert (FSN_VERSION, COVER_VERSION) == (7, 7)
     accession = "0000320193-24-000123"
-    old = Path(settings.edgar.cache_dir) / "cover" / "v5" / f"{accession}.json"
-    old.parent.mkdir(parents=True, exist_ok=True)
-    old.write_text(
-        json.dumps(
-            {
-                "version": 5,
-                "accession": accession,
-                "cik": "0000320193",
-                "entity_cik": "0000320193",
-                "listings": [],
-                "facts": [],
-            }
+    for stale in (5, 6):
+        old = Path(settings.edgar.cache_dir) / "cover" / f"v{stale}" / f"{accession}.json"
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_text(
+            json.dumps(
+                {
+                    "version": stale,
+                    "accession": accession,
+                    "cik": "0000320193",
+                    "entity_cik": "0000320193",
+                    "listings": [],
+                    "facts": [],
+                }
+            )
         )
-    )
     source = _source(settings, EdgarRouter())
     assert source._load_cover_cache(accession) is None
 

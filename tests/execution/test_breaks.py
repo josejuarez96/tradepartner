@@ -325,6 +325,17 @@ def test_state_is_the_latest_event_in_write_order() -> None:
         breaks.is_open("deleted")
 
 
+def test_owner_reopened_is_restricted_and_counts_toward_cap_even_if_old_size_is_small() -> None:
+    opened = replace(_event(1, "7:A:1", "opened"), material=False, dollar_size=1.0)
+    trued = replace(_event(2, "7:A:1", "trued_up"), material=False, dollar_size=1.0)
+    reopened = replace(_event(3, "7:A:1", "reopened"), material=False, dollar_size=1.0)
+    events = [opened, trued, reopened]
+    assert breaks.restricted_names(events) == frozenset({"A"})
+    assert breaks.cap_exceeded(
+        events, ledger_equity=100_000.0, risk=RISK.model_copy(update={"max_open_breaks": 0})
+    )
+
+
 @pytest.mark.parametrize("kinds", [(), ("cash",), ("quantity", "account_id"), ("x",)])
 def test_materiality_refuses_book_level_or_no_kinds(kinds: tuple[str, ...]) -> None:
     """Items 2 and 3 (fail closed): a book-level, unknown or empty kind set is

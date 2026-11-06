@@ -20,6 +20,12 @@ revision, with none of rule 7's class or plausibility handling) and `split_rows`
 (`security_id`, `action_id`, `ex_date`, `ratio`, `cancelled`, `known_at`; the latest
 revision per `(security_id, action_id)` known at `t`, dropped when cancelled, so a
 re-dated split counts once).
+
+The exit-evidence reads (T328b) work over `delisting_reason_rows` (the
+`DELISTING_REASON_COLUMNS`; the latest revision per Form 25 episode known at `t`) and
+`merger_exit_rows` (the `MERGER_EXIT_COLUMNS`, `acquirer_raw_close` given by the test;
+the latest revision per `(security_id, source_action_id)` known at `t`, kept to the
+acquirees in `ids`).
 """
 
 from __future__ import annotations
@@ -32,6 +38,8 @@ from typing import Any
 import polars as pl
 
 from tradepartner.backtest.provider import (
+    DELISTING_REASON_COLUMNS,
+    MERGER_EXIT_COLUMNS,
     STATEMENT_FACT_NAMES,
     TURNOVER_BAR_COLUMNS,
     GapReading,
@@ -111,6 +119,33 @@ _RATE_SCHEMA: dict[str, Any] = {
     "known_at": pl.Datetime("us", "UTC"),
 }
 
+#: `delisting_reasons`' rows (T328b), in `DELISTING_REASON_COLUMNS` order.
+_DELISTING_REASON_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "delisting_form": pl.Utf8,
+    "delisting_class_title": pl.Utf8,
+    "delisting_exchange": pl.Utf8,
+    "delisting_filed_at": pl.Datetime("us", "UTC"),
+    "reason": pl.Utf8,
+    "reason_source": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+_REASON_KEY = list(DELISTING_REASON_COLUMNS[:5])
+#: `merger_exits`' rows (T328b), in `MERGER_EXIT_COLUMNS` order.
+_MERGER_EXIT_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "source_action_id": pl.Utf8,
+    "kind": pl.Utf8,
+    "cash_per_share": pl.Float64,
+    "share_ratio": pl.Float64,
+    "effective_date": pl.Date,
+    "acquirer_security_id": pl.Utf8,
+    "acquirer_raw_close": pl.Float64,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+assert tuple(_DELISTING_REASON_SCHEMA) == DELISTING_REASON_COLUMNS
+assert tuple(_MERGER_EXIT_SCHEMA) == MERGER_EXIT_COLUMNS
+
 
 @dataclass(frozen=True)
 class Call:
@@ -181,6 +216,12 @@ class FakeProvider:
     shares_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_SHARES_SCHEMA))
     split_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_SPLIT_SCHEMA))
     rate_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_RATE_SCHEMA))
+    delisting_reason_rows: pl.DataFrame = field(
+        default_factory=lambda: pl.DataFrame(schema=_DELISTING_REASON_SCHEMA)
+    )
+    merger_exit_rows: pl.DataFrame = field(
+        default_factory=lambda: pl.DataFrame(schema=_MERGER_EXIT_SCHEMA)
+    )
     chain_pairs: tuple[tuple[str, str], ...] = ()
     n_assets_intersected: int = 0
     assets_intersection_skipped: bool = False
@@ -339,6 +380,19 @@ class FakeProvider:
         t = self._record("rates", t, series=series)
         rows = _known(self.rate_rows, t).filter(pl.col("series") == series)
         return _latest(rows, ["series", "observation_date"])
+
+    def delisting_reasons(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        t = self._record("delisting_reasons", t, ids=ids)
+        rows = _for_ids(_known(self.delisting_reason_rows, t), ids)
+        return _latest(rows, _REASON_KEY).select(DELISTING_REASON_COLUMNS)
+
+    def merger_exits(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        t = self._record("merger_exits", t, ids=ids)
+        rows = _for_ids(_known(self.merger_exit_rows, t), ids)
+        latest = _latest(rows, ["security_id", "source_action_id"])
+        return latest.select(MERGER_EXIT_COLUMNS).sort(
+            "security_id", "effective_date", "source_action_id"
+        )
 
     def turnover_inputs(
         self, t: datetime, ids: Sequence[str], sessions_from: date

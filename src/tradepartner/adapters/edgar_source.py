@@ -316,6 +316,7 @@ from tradepartner.adapters.edgar import (
     SEC_FORMS_PARSER_VERSION,
     CoverPageParse,
     FilingParties,
+    Form25Evidence,
     FsnFiling,
     FsnShare,
     SgmlNoAcceptanceError,
@@ -334,6 +335,7 @@ from tradepartner.adapters.edgar import (
     parse_delisting,
     parse_filing_index,
     parse_form4,
+    parse_form25_evidence,
     parse_fsn,
     parse_schedule_13d_xml,
     parse_sgml_13d_parties,
@@ -392,7 +394,8 @@ STATEMENT_VERSION = 1
 #: 4: #1651/#1660 (`cover_split_contexts`, same release);
 #: 5: #1675 (split contexts keep each class's symbol; quotes stripped; same release);
 #: 6: `cover_split_contexts` backed out (owner, same release, pending #1682).
-FSN_VERSION = 6
+#: 7: `cover_split_contexts` back on, with `class_member_link` (release `rederive-1682`, T198).
+FSN_VERSION = 7
 #: Bumped when `parse_cover_page` changes and every per-document cover-page
 #: parse (T11d) must be re-fetched and re-parsed. Deleting `edgar.cache_dir`
 #: or bumping this switches a per-document accession back to its FSN row.
@@ -403,11 +406,15 @@ FSN_VERSION = 6
 #: 4: #1651/#1660 (`cover_split_contexts`, same release);
 #: 5: #1675 (split contexts keep each class's symbol; quotes stripped; same release);
 #: 6: `cover_split_contexts` backed out (owner, same release, pending #1682).
-COVER_VERSION = 6
+#: 7: `cover_split_contexts` back on, with `class_member_link` (release `rederive-1682`, T198).
+COVER_VERSION = 7
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
 DELISTING_VERSION = 1
+#: The per-document `parse_form25_evidence` cache (`delisting_evidence/v1/`, T327,
+#: #2670): the provision only, beside (never inside) the `DELISTING_VERSION` cache.
+FORM25_EVIDENCE_VERSION = 1
 #: The filename-listing extract cache (`filename/v1/<cik>.json`, T184b, #1597):
 #: names, prefix and 12(b) class/exchange pairs only, never a document.
 FILENAME_VERSION = 1
@@ -3507,6 +3514,90 @@ class EdgarFilingSource(FilingSource):
         self._save_delisting_cache(accession, parsed)
         return parsed
 
+    def form25_evidence(
+        self,
+        cik: str,
+        accession: str,
+        form: str,
+        primary_document: str,
+        accepted_at: datetime,
+    ) -> Form25Evidence | None:
+        """The reason evidence (Rule 12d2-2 provision) of one Form 25 or 25-NSE
+        (plan T327, #2670), known at `accepted_at`, or `None` when the document is
+        unreadable or missing (skipped and recorded as every per-document fetch
+        is). A cached parse makes no request. The notice exhibit's text is not
+        fetched here: `notice_text` stays `None` until a caller reads one."""
+        cached = self._load_form25_evidence_cache(accession, accepted_at)
+        if cached is not None:
+            self._per_document_attempted.add(accession)
+            return cached
+        if self._is_quarantined(accession):
+            self._quarantined_this_run.add(accession)
+            self.quarantined += 1
+            return None
+        return self._guarded(
+            accession,
+            form.removesuffix("/A"),
+            partial(
+                self._fetch_form25_evidence, cik, accession, form, primary_document, accepted_at
+            ),
+        )
+
+    def _fetch_form25_evidence(
+        self, cik: str, accession: str, form: str, primary_document: str, accepted_at: datetime
+    ) -> Form25Evidence:
+        root_document = re.sub(r"^xsl[^/]*/", "", primary_document)
+        path = edgar_raw.download_filing_file(
+            cik, accession, root_document, settings=self._settings, client=self._client
+        )
+        try:
+            text = path.read_text(encoding="utf-8")
+            parsed = parse_form25_evidence(
+                text, form=form, accession=accession, accepted_at=accepted_at
+            )
+        finally:
+            path.unlink(missing_ok=True)
+        data = {
+            "version": FORM25_EVIDENCE_VERSION,
+            "accession": accession,
+            "cik": parsed.cik,
+            "form": parsed.form,
+            "class_title": parsed.class_title,
+            "exchange": parsed.exchange,
+            "provision": parsed.provision,
+        }
+        edgar_raw.write_atomic(
+            self._form25_evidence_cache_path(accession), json.dumps(data).encode("utf-8")
+        )
+        return parsed
+
+    def _form25_evidence_cache_path(self, accession: str) -> Path:
+        edgar_raw.validate_accession(accession)
+        return (
+            self._cache / "delisting_evidence" / f"v{FORM25_EVIDENCE_VERSION}" / f"{accession}.json"
+        )
+
+    def _load_form25_evidence_cache(
+        self, accession: str, accepted_at: datetime
+    ) -> Form25Evidence | None:
+        path = self._form25_evidence_cache_path(accession)  # validates first, outside the try
+        try:
+            data = json.loads(path.read_bytes())
+            if data.get("version") != FORM25_EVIDENCE_VERSION or data.get("accession") != accession:
+                return None
+            provision = data.get("provision")
+            return Form25Evidence(
+                cik=str(data["cik"]),
+                form=str(data["form"]),
+                class_title=str(data["class_title"]),
+                exchange=str(data["exchange"]),
+                accession=accession,
+                accepted_at=accepted_at,  # the stamp is re-applied, as for `_CachedDelisting`
+                provision=str(provision) if provision else None,
+            )
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+
     def _delisting_cache_path(self, accession: str) -> Path:
         edgar_raw.validate_accession(accession)
         return self._cache / "delisting" / f"v{DELISTING_VERSION}" / f"{accession}.json"
@@ -3633,9 +3724,10 @@ class EdgarFilingSource(FilingSource):
                 if exchange is None:
                     counts.no_exchange += 1
                 fsn_filing = fsn_cache.get(record.accession)
-                if fsn_filing is None:
+                coregistrant = self._coregistrant_copy(cik, record.accession, fsn_cache)
+                if fsn_filing is None and not coregistrant:
                     counts.fsn_missing += 1
-                elif fsn_tags.get(record.accession) is None:
+                elif fsn_filing is not None and fsn_tags.get(record.accession) is None:
                     counts.fsn_no_symbol_only += 1
                 listings.append(
                     FilenameListing(
@@ -3650,6 +3742,7 @@ class EdgarFilingSource(FilingSource):
                         dei_symbol=_dei_symbol(
                             extract.name, fsn_filing, fsn_tags.get(record.accession)
                         ),
+                        coregistrant=coregistrant,
                     )
                 )
 
@@ -3731,6 +3824,19 @@ class EdgarFilingSource(FilingSource):
             self.filename_fsn_missing += counts.fsn_missing
         listings.sort(key=lambda e: (e.accepted_at, e.accession, e.ticker))
         return listings
+
+    def _coregistrant_copy(
+        self, cik: str, accession: str, fsn_cache: Mapping[str, FsnFiling]
+    ) -> bool:
+        """Whether `accession` is a combined filing another CIK filed (#2941):
+        FSN keys it to another CIK and not to `cik`, or its per-document
+        cover cache names another entity, the two tests `_company_facts`
+        applies to a co-registrant's copy. Both read the filing's own
+        entity, known at its acceptance."""
+        if accession in self._fsn_extracted_accessions and accession not in fsn_cache:
+            return True
+        cover = self._load_cover_cache(accession)
+        return cover is not None and cover.entity_cik != cik
 
     def _own_form25(self, cik: str, record: SubmissionRecord) -> bool:
         """Whether `filename_listings`' Form 25 pass will ask for `record`: a

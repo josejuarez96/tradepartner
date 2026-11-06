@@ -276,3 +276,40 @@ def test_comparison_writes_no_fact_and_hides_a_later_xml_fetch() -> None:
         asof.sec_form4_transactions_as_of(truncated, before, settings=settings)
     )
     assert not asof.sec_form4_transactions_as_of(full, fetch_at, settings=settings).is_empty()
+
+
+def test_a_trusted_row_stored_after_a_mismatch_is_invisible_before_its_fetch() -> None:
+    """T351 (#2714 item 6): the trusted row stored on a below-threshold disagreement takes
+    its acceptance stamp as `known_at`, so a store truncated before it holds nothing, and
+    after it the read returns the trusted (XML) value, not the bulk one."""
+    from dataclasses import replace
+    from decimal import Decimal
+
+    from tradepartner.adapters.edgar import Form4Transaction
+    from tradepartner.adapters.form4_bulk_route import trusted_filing
+    from tradepartner.adapters.form4_compare import declaration_from
+
+    fetch_at = datetime(2026, 3, 31, 21, tzinfo=UTC)
+    settings = Settings(_env_file=None, events=EventsConfig(sec_forms_read_enabled=True))
+    row = Form4Transaction(
+        "0000000001", "0000000002", 0, True, False, False, False, date(2026, 3, 30), None, "P", "A",
+        Decimal(10), Decimal("5.00"), Decimal(20), "D", "Common", None,
+    )  # fmt: skip
+    bulk_rows = (replace(row, shares=Decimal(11)),)  # the disagreeing bulk side
+    filing = SecFormFiling(
+        "0000000001-26-000001", "4", fetch_at, date(2026, 3, 31),
+        ("0000000001",), ("0000000002",), (row,),
+    )  # fmt: skip
+    trusted = trusted_filing(filing, bulk_rows, declaration_from(settings.events))
+    full = duckdb.connect(":memory:")
+    truncated = duckdb.connect(":memory:")
+    for conn in (full, truncated):
+        schema.init_schema(conn)
+    write_sec_form_accession(full, trusted, ingested_at=fetch_at, source="sec_form4_xml")
+    before = datetime(2026, 3, 31, 20, tzinfo=UTC)
+    assert asof.sec_form4_transactions_as_of(full, before, settings=settings).equals(
+        asof.sec_form4_transactions_as_of(truncated, before, settings=settings)
+    )
+    assert asof.sec_form4_transactions_as_of(full, before, settings=settings).is_empty()
+    after = asof.sec_form4_transactions_as_of(full, fetch_at, settings=settings)
+    assert [float(v) for v in after["shares"].to_list()] == [10.0]

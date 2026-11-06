@@ -67,6 +67,15 @@ the step's connection like every other method (backtest spec amendment
 (backtest spec amendment #1498, plan T170b): rows with `known_at <= t`, latest revision
 per observation date, unchanged.
 
+The exit-evidence reads (spec amendment #2670, plan T328b), each read once per run
+at the data cutoff and only under a delisting failure-return policy other than
+`none`: `delisting_reasons(t, ids)` is
+`store.delisting_reasons.delisting_reasons_as_of` kept to its
+`DELISTING_REASON_COLUMNS`; `merger_exits(t, ids)` is `store.asof.mergers_as_of`
+kept to rows whose acquiree is in `ids`, left-joined to the acquirer's raw
+`prices_as_of(traded_only=True)` bar on `effective_date` (null when that bar is
+absent: no earlier-close fallback, and a zero-volume bar is missing, as above).
+
 `turnover_inputs(t, ids, sessions_from)` (backtest spec amendment #1358,
 plan T165b) is three reads on the step's connection with the frozen
 `Settings`: `prices_as_of(traded_only=True)` kept to `[sessions_from,
@@ -95,6 +104,8 @@ import polars as pl
 
 from tradepartner import gap as gap_module
 from tradepartner.backtest.provider import (
+    DELISTING_REASON_COLUMNS,
+    MERGER_EXIT_COLUMNS,
     STATEMENT_FACT_NAMES,
     TURNOVER_BAR_COLUMNS,
     GapReading,
@@ -114,6 +125,7 @@ from tradepartner.store.asof import (
     listings_as_of,
     live_chains,
     marking_changed_ids_as_of,
+    mergers_as_of,
     prices_as_of,
     rates_as_of,
     statement_facts_as_of,
@@ -122,6 +134,7 @@ from tradepartner.store.asof import (
 from tradepartner.store.benchmarks import benchmark_security_ids
 from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.db import StoreLockedError
+from tradepartner.store.delisting_reasons import delisting_reasons_as_of
 from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.universe import Universe, _split_factors, shares_as_of, universe_as_of
 
@@ -394,6 +407,33 @@ class StoreProvider:
     def rates(self, t: datetime, series: str) -> pl.DataFrame:
         t = check_t(t)
         return rates_as_of(self._at(t), t, series)
+
+    def delisting_reasons(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        t, wanted = check_t(t), _ids(ids)
+        frame = delisting_reasons_as_of(self._at(t), t, wanted)
+        return frame.select(DELISTING_REASON_COLUMNS)
+
+    def merger_exits(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        t, wanted = check_t(t), _ids(ids)
+        conn = self._at(t)
+        # `mergers_as_of` also keeps rows matched only by their acquirer; drop them.
+        mergers = mergers_as_of(conn, t, wanted).filter(pl.col("security_id").is_in(wanted))
+        acquirers = sorted(set(mergers["acquirer_security_id"].drop_nulls().to_list()))
+        # Bound the acquirers' bars to the earliest effective date: only those dates join.
+        first = mergers["effective_date"].min()
+        sessions_from = first if isinstance(first, date) else None
+        closes = prices_as_of(
+            conn, t, acquirers, traded_only=True, sessions_from=sessions_from
+        ).select(
+            pl.col("security_id").alias("acquirer_security_id"),
+            pl.col("session").alias("effective_date"),
+            pl.col("close").alias("acquirer_raw_close"),
+        )
+        return (
+            mergers.join(closes, on=["acquirer_security_id", "effective_date"], how="left")
+            .select(MERGER_EXIT_COLUMNS)
+            .sort("security_id", "effective_date", "source_action_id")
+        )
 
     def turnover_inputs(
         self, t: datetime, ids: Sequence[str], sessions_from: date

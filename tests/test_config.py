@@ -330,14 +330,14 @@ def test_edgar_exchange_axis_listings_is_on_by_default_and_settable(
     assert Settings(_env_file=None).edgar.exchange_axis_listings is False
 
 
-def test_edgar_cover_split_contexts_is_off_by_default_and_settable(
+def test_edgar_cover_split_contexts_is_on_by_default_and_settable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#1651: backed out by the owner in the release `cover-listings-1541`
-    (T181, 2026-10-14, cache versions 6) pending #1682."""
-    assert Settings(_env_file=None).edgar.cover_split_contexts is False
-    monkeypatch.setenv("EDGAR__COVER_SPLIT_CONTEXTS", "true")
+    """#1651: backed out in `cover-listings-1541` (T181), back on in the
+    release `rederive-1682` (T198, cache versions 7)."""
     assert Settings(_env_file=None).edgar.cover_split_contexts is True
+    monkeypatch.setenv("EDGAR__COVER_SPLIT_CONTEXTS", "false")
+    assert Settings(_env_file=None).edgar.cover_split_contexts is False
 
 
 def test_edgar_filename_listings_are_off_by_default_and_settable(
@@ -522,14 +522,14 @@ def test_edgar_class_member_overrides_may_be_emptied() -> None:
     assert s.edgar.class_member_overrides == {}
 
 
-def test_edgar_class_member_link_is_off_with_four_dead_class_filings() -> None:
-    """T190d: the link stays off until the release `rederive-1682` (T198)."""
+def test_edgar_class_member_link_is_on_with_four_dead_class_filings() -> None:
+    """T190d: the link is on since the release `rederive-1682` (T198)."""
     edgar = Settings(_env_file=None).edgar
-    assert edgar.class_member_link is False
+    assert edgar.class_member_link is True
     assert edgar.dead_class_filings == 4
     assert edgar.lettered_member_max_minor_share == 0.001
-    on = Settings(_env_file=None, edgar={"class_member_link": True, "dead_class_filings": 2})
-    assert (on.edgar.class_member_link, on.edgar.dead_class_filings) == (True, 2)
+    off = Settings(_env_file=None, edgar={"class_member_link": False, "dead_class_filings": 2})
+    assert (off.edgar.class_member_link, off.edgar.dead_class_filings) == (False, 2)
 
 
 @pytest.mark.parametrize("count", [0, -1])

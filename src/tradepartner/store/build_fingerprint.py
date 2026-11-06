@@ -19,7 +19,7 @@ from tradepartner.store import schema
 
 # Bump when a builder changes its derivation from unchanged inputs. Cache and
 # schema versions below are read from their owners at call time, never copied.
-BUILD_RULES_VERSION = 3  # 3: #2929, filename-listing tickers keyed case-free
+BUILD_RULES_VERSION = 4  # 4: #2941, co-registrant and non-symbol filename prefixes refused
 
 HASHED_SETTINGS_KEYS = (
     "benchmarks",

@@ -3418,8 +3418,12 @@ def test_a_total_on_a_live_two_class_cik_stays_unmatched(settings: Settings) -> 
 
 def test_the_switch_off_changes_no_row(settings: Settings) -> None:
     # Off, each fixture's rows are pinned: the pre-T190d result (checked on
-    # the merge base), not this code compared with itself.
-    assert settings.edgar.class_member_link is False
+    # the merge base), not this code compared with itself. The default is on
+    # since T198, so the switch is turned off here.
+    assert settings.edgar.class_member_link is True
+    settings = settings.model_copy(
+        update={"edgar": settings.edgar.model_copy(update={"class_member_link": False})}
+    )
     acc = _BF_PAGE.accession
     bf = [_share("NonvotingCommonStock", 3.0, acc, NOW), _share("CommonClassA", 2.0, acc, NOW)]
     ibkr = [
@@ -4809,6 +4813,23 @@ def test_same_value_accessions_redated_back_in_one_run_stamp_the_date_once() -> 
     assert ingest(_A, fourth + timedelta(hours=1), _A) == 0
 
 
+@pytest.mark.parametrize("stored_after", [timedelta(0), timedelta(hours=1)])
+def test_a_fact_revision_behind_a_stored_ingest_is_refused_as_back_dated(
+    stored_after: timedelta,
+) -> None:
+    """#2968: a revision of an accession is refused when the store holds an
+    ingest of it at or after the run's instant (an earlier run at that
+    instant, or a later one): stamped at the run it would not be the
+    accession's latest ingest, so the dropped date would stay served."""
+    conn = _store()
+    at = NOW + timedelta(days=1)
+    stored = at + stored_after
+    rows = [_redated(_A, stored), _redated(_B, stored)]
+    assert _add_rows(conn, "facts", rows, ingested_at=stored, current=False) == 2
+    with pytest.raises(ValueError, match="back-dated"):
+        _add_rows(conn, "facts", [_redated(_A, at)], ingested_at=at, current=False)
+
+
 def test_cover_page_duplicate_pair_does_not_abort_the_listings_write() -> None:
     """#687: `build_master` must never hand `_add_rows` two `listings` rows
     with the same (security_id, ticker, exchange, valid_from, known_at)
@@ -6160,6 +6181,127 @@ def test_a_failed_rebuild_rolls_back_the_delete_with_the_chunk(
 def test_the_rebuild_needs_the_edgar_source(settings: Settings) -> None:
     with pytest.raises(ValueError, match="edgar source"):
         _run(_events_on(settings), source="alpaca", rebuild_filing_events=True)
+
+
+# --- a rebuild replaces per CIK, never wiping a CIK whose read is empty (#2956) --
+
+_DUAL_F1 = f"{DUAL}-19-000101"
+_BOTH_STATEMENTS = (
+    *_components(F1, AT1),
+    _sf("revenue", 7, _DUAL_F1, AT1, cik=DUAL),
+    _sf("total_assets", 9, _DUAL_F1, AT1, cik=DUAL, period=(None, FY18[1])),
+)
+_DUAL_EVENT = FilingEvent(DUAL, _DUAL_F1, "8-K", "2.02", datetime(2019, 5, 2, 20, 5, tzinfo=UTC))
+
+
+def _all_statement_rows(read: Callable[[str], list[tuple[Any, ...]]]) -> list[tuple[Any, ...]]:
+    return read("SELECT * FROM statement_facts ORDER BY ALL")
+
+
+def _all_event_rows(read: Callable[[str], list[tuple[Any, ...]]]) -> list[tuple[Any, ...]]:
+    return read("SELECT * FROM filing_events ORDER BY ALL")
+
+
+def test_a_statement_rebuild_keeps_a_cik_whose_read_is_empty(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#2956: DUAL's statement cache is missing on the rebuild's day, so its read
+    is empty. Its stored rows stay, known_at and all, and it is counted; ACME,
+    which reads rows, is replaced."""
+    on = _switched(settings)
+    _edgar(on, _StatementSource(_BOTH_STATEMENTS))
+    dual_before = read(f"SELECT * FROM statement_facts WHERE cik = '{DUAL}' ORDER BY ALL")
+    assert len(dual_before) == 2
+    acme_only = [r for r in _BOTH_STATEMENTS if r.cik == ACME]
+    rebuilt = _edgar(on, _StatementSource(acme_only), rebuild_statement_facts=True)
+    counts = statement_counts(rebuilt.message)
+    acme_rows = read(f"SELECT count(*) FROM statement_facts WHERE cik = '{ACME}'")[0][0]
+    assert (counts["deleted"], counts["added"]) == (acme_rows, acme_rows)
+    assert counts["rebuild_kept_empty_read"] == 1
+    assert f"statement_rebuild_kept_empty_read: 1 (first: {DUAL})" in rebuilt.message
+    assert read(f"SELECT * FROM statement_facts WHERE cik = '{DUAL}' ORDER BY ALL") == dual_before
+
+
+def test_a_statement_rebuild_with_the_switch_off_refuses_and_keeps_every_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _switched(settings)
+    source = _StatementSource(_BOTH_STATEMENTS)
+    _edgar(on, source)
+    before = _all_statement_rows(read)
+    assert before
+    with pytest.raises(ValueError, match="statement_facts_enabled"):
+        _run(
+            _switched(settings, False), filings=source, source="edgar", rebuild_statement_facts=True
+        )
+    assert _all_statement_rows(read) == before
+
+
+def test_a_statement_rebuild_of_ciks_that_read_rows_writes_todays_rows(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """Pinned: when every CIK reads rows, the rebuild's rows are exactly a fresh
+    ingest's into an empty table (the old delete-all-then-insert), and
+    `deleted` is every stored row."""
+    on = _switched(settings)
+    _edgar(on, _StatementSource([_sf("revenue", 110, F2, AT2), *_BOTH_STATEMENTS[2:]]))
+    stored = read("SELECT count(*) FROM statement_facts")[0][0]
+    late = [_sf("revenue", 100, F1, AT1), _sf("revenue", 110, F2, AT2), *_BOTH_STATEMENTS]
+    rebuilt = _edgar(on, _StatementSource(late), rebuild_statement_facts=True)
+    counts = statement_counts(rebuilt.message)
+    assert counts["deleted"] == stored
+    assert counts["rebuild_kept_empty_read"] == 0
+    rows = _all_statement_rows(read)
+    with open_for_write(on) as conn:
+        conn.execute("DELETE FROM statement_facts")
+    fresh = _edgar(on, _StatementSource(late))
+    assert _all_statement_rows(read) == rows
+    fresh_counts = statement_counts(fresh.message)
+    for name in ("added", "held", "vintage_late", "restated", "derived"):
+        assert counts[name] == fresh_counts[name], name
+
+
+def test_an_events_rebuild_keeps_a_cik_whose_read_is_empty(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _events_on(settings)
+    _edgar(on, _EventSource((*EVENTS, _DUAL_EVENT)))
+    dual_before = read(f"SELECT * FROM filing_events WHERE cik = '{DUAL}'")
+    assert len(dual_before) == 1
+    rebuilt = _edgar(on, _EventSource(EVENTS), rebuild_filing_events=True)
+    counts = filing_event_counts(rebuilt.message)
+    assert (counts["before"], counts["added"], counts["after"]) == (4, 3, 4)
+    assert counts["rebuild_kept_empty_read"] == 1
+    assert f"filing_events_rebuild_kept_empty_read: 1 (first: {DUAL})" in rebuilt.message
+    assert read(f"SELECT * FROM filing_events WHERE cik = '{DUAL}'") == dual_before
+
+
+def test_an_events_rebuild_with_the_switch_off_refuses_and_keeps_every_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    source = _EventSource((*EVENTS, _DUAL_EVENT))
+    _edgar(_events_on(settings), source)
+    before = _all_event_rows(read)
+    assert len(before) == 4
+    with pytest.raises(ValueError, match="filing_events_enabled"):
+        _run(settings, filings=source, source="edgar", rebuild_filing_events=True)
+    assert _all_event_rows(read) == before
+
+
+def test_an_events_rebuild_of_ciks_that_read_rows_writes_todays_rows(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _events_on(settings)
+    _edgar(on, _EventSource((EVENTS[0], _DUAL_EVENT)))
+    rebuilt = _edgar(on, _EventSource((*EVENTS, _DUAL_EVENT)), rebuild_filing_events=True)
+    counts = filing_event_counts(rebuilt.message)
+    assert (counts["before"], counts["added"], counts["after"]) == (2, 4, 4)
+    assert counts["rebuild_kept_empty_read"] == 0
+    rows = _all_event_rows(read)
+    with open_for_write(on) as conn:
+        conn.execute("DELETE FROM filing_events")
+    _edgar(on, _EventSource((*EVENTS, _DUAL_EVENT)))
+    assert _all_event_rows(read) == rows
 
 
 # --- the store restamp from a stamps-repair manifest (#1382, T166b) ----------
@@ -11304,3 +11446,341 @@ def test_filename_form25_counts_equal_the_walk_and_read_the_rows_once() -> None:
     assert f"; filename_form25_unmatched: {old_unmatched};" in f"{text};"
     assert f"; filename_transfers_delisted: {old_transfers};" in f"{text};"
     assert Rows.passes == 1  # was 2 per unmatched Form 25 plus 1 per pre-2019 delisting
+
+
+# --- T351 (#2987): Form 4 rule 5 comparison in the ingest driver -----------------------
+
+
+def _rule5_settings(settings: Settings, tmp_path: Path, threshold: str | None) -> Settings:
+    enabled = _archive_settings(settings, tmp_path)
+    update = {"form4_compare_threshold": None if threshold is None else Decimal(threshold)}
+    return enabled.model_copy(update={"events": enabled.events.model_copy(update=update)})
+
+
+def _disagreeing(case: _Form4Xml, accession: str, *, agree: bool = False) -> BulkAccession:
+    """A bulk record that routes to XML (a 4/A header against the submissions 4) and,
+    unless `agree`, holds a different share count than the XML."""
+    record = case.bulk_record(accession)
+    rows = record.transactions
+    if not agree:
+        rows = (replace(rows[0], shares=rows[0].shares + 1), *rows[1:])
+    return replace(record, document_type="4/A", transactions=rows)
+
+
+def _manifests(root: Path) -> list[dict[str, Any]]:
+    from tradepartner.adapters.form4_archive import parse_manifest
+
+    return [parse_manifest(p.read_bytes()) for p in sorted((root / "manifests").iterdir())]
+
+
+def _markers(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    return [e for e in manifest["entries"] if e["row_source"] == "form4_compare_marker"]
+
+
+_RULE5_OTHER = "0000320193-26-000124"
+
+
+def _rule5_case(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, threshold: str | None
+) -> _Form4Xml:
+    enabled = _rule5_settings(settings, tmp_path, threshold)
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123", extra=(_RULE5_OTHER,))
+    case.bulk = InsiderBulk(
+        {
+            case.accession: _disagreeing(case, case.accession),
+            _RULE5_OTHER: _disagreeing(case, _RULE5_OTHER, agree=True),
+        }
+    )
+    return case
+
+
+def test_form4_rule5_below_threshold_stores_the_xml_row_and_a_marker(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One disagreeing accession of two (0.5) is below a 0.6 threshold: the run stores
+    both XML rows, reports 1 of 2 in the existing message format and writes one
+    unresolved marker (both values, trusted choice, checked zip) in the manifest."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    added, message, _p = case.run(fixture_store, case.now)
+    assert added > 0
+    assert "form4_compare_disagree=1; form4_compare_compared=2; form4_compare_threshold=0.6" in (
+        message
+    )
+    assert "form4_compare_markers=1" in message
+    manifest = _manifests(tmp_path / "archive")[-1]
+    (marker,) = _markers(manifest)
+    zip_sha = hashlib.sha256(b"insider zip v1").hexdigest()
+    assert marker["status"] == "unresolved" and marker["accession"] == case.accession
+    assert marker["field"] == "shares" and marker["trusted"] == "xml"
+    assert marker["zip_sha256"] == zip_sha and marker["bulk"] != marker["xml"]
+    stored = fixture_store.execute(
+        "SELECT shares FROM sec_form4_transactions WHERE accession = ? ORDER BY line_no",
+        [case.accession],
+    ).fetchall()
+    assert Decimal(str(stored[0][0])) == case.parsed.transactions[0].shares  # the XML row
+
+
+def test_form4_rule5_at_or_above_threshold_fails_the_run_naming_the_accession(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tradepartner.adapters.form4_bulk_route import Form4CompareThresholdError
+
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.5")  # 1 of 2 is at the line
+    with pytest.raises(Form4CompareThresholdError, match=case.accession) as raised:
+        case.run(fixture_store, case.now)
+    (digest_file,) = (tmp_path / "archive" / "manifests").iterdir()
+    assert f"provenance_sha256={digest_file.name}" in str(raised.value)
+    assert "form4_compare_markers=1" in str(raised.value)
+    (manifest,) = _manifests(tmp_path / "archive")  # the offending accession is recorded
+    assert [m["accession"] for m in _markers(manifest)] == [case.accession]
+
+
+def test_form4_rule5_unset_threshold_reports_only(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _rule5_case(settings, tmp_path, monkeypatch, None)
+    _added, message, _p = case.run(fixture_store, case.now)
+    assert "form4_compare_disagree=1; form4_compare_compared=2; form4_compare_threshold=unset" in (
+        message
+    )
+    assert "form4_compare_markers=0" in message
+    assert all(_markers(m) == [] for m in _manifests(tmp_path / "archive"))
+
+
+def test_form4_rule5_zero_eligible_is_unchecked(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enabled = _rule5_settings(settings, tmp_path, "0.01")
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123")  # no bulk record
+    _added, message, _p = case.run(fixture_store, case.now)
+    assert "form4_compare_disagree=0; form4_compare_compared=0" in message
+
+
+def test_form4_rule5_marker_is_carried_without_a_request_or_rewrite(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unchanged zip keeps the marker with no request and no row rewritten; the
+    offline nightly reads only the latest manifest, so the older one may be absent."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    case.run(fixture_store, case.now)
+    rows = fixture_store.execute("SELECT * FROM sec_form4_transactions ORDER BY 1, 2, 3").fetchall()
+    case.fetches.clear()
+    case.run(fixture_store, case.now + timedelta(days=1), "writer-2")
+    assert case.fetches == []
+    first, second = _manifests(tmp_path / "archive")[:2]
+    assert len(_markers(first) + _markers(second)) == 2  # carried, not dropped
+    root = tmp_path / "archive" / "manifests"
+    older = [p for p in root.iterdir() if parse_manifest_run(p) == "writer-1"]
+    assert len(older) == 1
+    older[0].unlink()  # the offline nightly: only the latest manifest is local
+    case.run(fixture_store, case.now + timedelta(days=2), "writer-3")
+    assert case.fetches == []
+    latest = [m for m in _manifests(tmp_path / "archive") if m["writer"]["run_id"] == "writer-3"]
+    assert [m["accession"] for m in _markers(latest[0])] == [case.accession]
+    assert (
+        fixture_store.execute("SELECT * FROM sec_form4_transactions ORDER BY 1, 2, 3").fetchall()
+        == rows
+    )
+
+
+def parse_manifest_run(path: Path) -> str:
+    from tradepartner.adapters.form4_archive import parse_manifest
+
+    return str(parse_manifest(path.read_bytes())["writer"]["run_id"])
+
+
+@pytest.mark.parametrize("still_disagrees", [True, False])
+def test_form4_rule5_changed_zip_rechecks_the_marker(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    still_disagrees: bool,
+) -> None:
+    """A changed bulk zip refetches and recompares the marked accession: the new
+    manifest holds an updated marker (new zip, both values) or a resolved one, and the
+    held fact is never rewritten."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    case.run(fixture_store, case.now)
+    rows = fixture_store.execute("SELECT * FROM sec_form4_transactions ORDER BY 1, 2, 3").fetchall()
+    case.zip = b"insider zip v2"
+    case.bulk = InsiderBulk(
+        {
+            case.accession: _disagreeing(case, case.accession, agree=not still_disagrees),
+            _RULE5_OTHER: _disagreeing(case, _RULE5_OTHER, agree=True),
+        }
+    )
+    case.fetches.clear()
+    case.run(fixture_store, case.now + timedelta(days=1), "writer-2")
+    assert sorted(case.fetches) == sorted([case.accession, _RULE5_OTHER])
+    latest = next(
+        m for m in _manifests(tmp_path / "archive") if m["writer"]["run_id"] == "writer-2"
+    )
+    marks = _markers(latest)
+    if still_disagrees:
+        (mark,) = [m for m in marks if m["status"] == "unresolved"]
+        assert mark["accession"] == case.accession
+        assert mark["zip_sha256"] == hashlib.sha256(b"insider zip v2").hexdigest()
+    else:
+        assert {(m["accession"], m["status"]) for m in marks} == {
+            (case.accession, "resolved"),
+            (_RULE5_OTHER, "resolved"),
+        }
+    assert (
+        fixture_store.execute("SELECT * FROM sec_form4_transactions ORDER BY 1, 2, 3").fetchall()
+        == rows
+    )
+
+
+def test_form4_rule5_threshold_needs_the_raw_archive(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enabled = _archive_settings(settings, tmp_path, on=False)
+    enabled = enabled.model_copy(
+        update={
+            "events": enabled.events.model_copy(update={"form4_compare_threshold": Decimal("0.5")})
+        }
+    )
+    case = _Form4Xml(enabled, monkeypatch, accession="0000320193-26-000123")
+    with pytest.raises(ValueError, match="raw archive"):
+        ingest_module._write_form4_bulk(
+            fixture_store, enabled, case.source, frozenset({case.issuer}), case.now
+        )
+
+
+def test_form4_rule5_markers_survive_a_run_that_skips_the_form4_step(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later writer that does not run the Form 4 step (or has the threshold unset)
+    still copies the unresolved markers into its manifest."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    case.run(fixture_store, case.now)
+    unset = case.settings.model_copy(
+        update={"events": case.settings.events.model_copy(update={"form4_compare_threshold": None})}
+    )
+    provenance = ingest_module._Form4Provenance.start(unset, run_id="writer-2", writer="sec_forms")
+    ingest_module._write_sec_forms(
+        fixture_store, unset, case.source, lambda: [], frozenset(), case.now,
+        form4=False, provenance=provenance,
+    )  # fmt: skip
+    digest = provenance.finish()
+    from tradepartner.adapters.form4_archive import parse_manifest
+
+    manifest = parse_manifest((tmp_path / "archive" / "manifests" / digest).read_bytes())
+    assert [m["accession"] for m in _markers(manifest)] == [case.accession]
+
+
+@pytest.mark.parametrize("threshold", ["0.6", None])
+def test_form4_rule5_unreadable_latest_manifest_with_markers_fails_the_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    threshold: str | None,
+) -> None:
+    """The prior run recorded markers (`form4_compare_markers=1`), so an unreadable
+    latest manifest could lose them: the run fails, with the threshold set or unset."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    case.run(fixture_store, case.now)
+    fixture_store.execute(
+        "UPDATE ingestion_runs SET message = message || '; form4_compare_markers=2' "
+        "WHERE source = 'sec_forms'"
+    )
+    for path in (tmp_path / "archive" / "manifests").iterdir():
+        path.unlink()
+    case.settings = _rule5_settings(settings, tmp_path, threshold)
+    with pytest.raises(RuntimeError, match="unreadable"):
+        case.run(fixture_store, case.now + timedelta(days=1), "writer-2")
+
+
+def test_form4_rule5_unreadable_latest_manifest_without_markers_proceeds_and_counts(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prior run recorded none (an offline manifest on a normal night): nothing can
+    be lost, so the run succeeds and counts the unread manifest."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, None)
+    case.run(fixture_store, case.now)  # threshold unset: markers=0
+    for path in (tmp_path / "archive" / "manifests").iterdir():
+        path.unlink()
+    counts: Counter[str] = Counter()
+    provenance = ingest_module._Form4Provenance.start(
+        case.settings, run_id="writer-2", writer="sec_forms"
+    )
+    ingest_module._carry_markers(fixture_store, case.settings, provenance, counts)
+    assert counts["sec_forms_provenance_manifest_unread"] == 1
+    assert provenance is not None and provenance.markers == []
+    _added, message, _p = case.run(fixture_store, case.now + timedelta(days=1), "writer-3")
+    assert "sec_forms_provenance_manifest_unread: 1" in message
+
+
+def test_form4_rule5_a_failed_runs_manifest_is_not_the_marker_chain_head(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    case.run(fixture_store, case.now)
+    later = case.now + timedelta(days=1)
+    fixture_store.execute(
+        "INSERT INTO ingestion_runs (run_id, source, mode, status, started_at, finished_at, "
+        "rows_added, chunk_cursor, message) VALUES ('bad', 'sec_forms', 'backfill', 'failed', "
+        "?, ?, 0, 'x', ?)",
+        [later, later, "provenance_sha256=" + "0" * 64],
+    )
+    counts: Counter[str] = Counter()
+    assert ingest_module._latest_form4_manifest(fixture_store, case.settings, counts) is not None
+    assert counts["sec_forms_provenance_manifest_unread"] == 0
+
+
+def test_form4_rule5_marker_count_rides_with_the_digest_on_every_writer_message(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A writer that skips the Form 4 step still carries markers into its manifest, and
+    its message names them next to the digest, so a later unreadable manifest fails."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    case.run(fixture_store, case.now)
+    provenance = ingest_module._Form4Provenance.start(
+        case.settings, run_id="writer-2", writer="sec_forms"
+    )
+    ingest_module._write_sec_forms(
+        fixture_store, case.settings, case.source, lambda: [], frozenset(), case.now,
+        form4=False, provenance=provenance,
+    )  # fmt: skip
+    clause = ingest_module._provenance_clause(provenance)
+    assert clause.endswith("; form4_compare_markers=1")
+    ingest_module.write_run(
+        fixture_store, "writer-2", case.now + timedelta(days=1), case.now + timedelta(days=1),
+        SourceRun("sec_forms", "ok", 0, "since=x", f"0 subjects{clause}"), mode="backfill",
+    )  # fmt: skip
+    for path in (tmp_path / "archive" / "manifests").iterdir():
+        path.unlink()
+    with pytest.raises(RuntimeError, match="unreadable"):
+        case.run(fixture_store, case.now + timedelta(days=2), "writer-3")

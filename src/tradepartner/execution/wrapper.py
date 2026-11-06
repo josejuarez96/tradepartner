@@ -286,6 +286,7 @@ from tradepartner.execution.reserve import open_buy_reserve
 from tradepartner.execution.risk import (
     OpenSell,
     Skip,
+    Violation,
     Violations,
     _buy_cash,
     check_phase,
@@ -1026,6 +1027,8 @@ class RiskGatedBroker:
             )
             _log_held(run, sold.held)
             sold = replace(sold, skips=(*sold.skips, *unsent))
+            # Before the gate journals a sell: a breach leaves no order row (#2973).
+            self._check_run_total(run, rebalance, len(sold.orders), rows, book)
             nobody = Account(book.window.account_id, 0.0, 0.0, 0.0, self.read_clock())
             gated = self._gate(
                 run,
@@ -1093,6 +1096,37 @@ class RiskGatedBroker:
             bought.cash,
             bought.cash_left,
         )
+
+    def _check_run_total(
+        self,
+        run: PaperRunRow,
+        rebalance: Sequence[date],
+        sells: int,
+        rows: Sequence[DecisionRow],
+        book: _Book,
+    ) -> None:
+        """Refuse the run before its first sell when the built sell orders plus
+        the buys planned would pass `risk.max_orders_per_run` (#2973). The buys
+        are sized after the sells fill, so their count here is the plan's buy
+        attempts, an upper bound; the buys phase's own check stays the backstop.
+        Nothing is submitted: the same refusal path as the phase check."""
+        buys = len(attempt_scope(rows, book.states, phase=_BUY).attempts)
+        total, cap = sells + buys, self._frozen.max_orders_per_run
+        if total > cap:
+            self._refuse(
+                run,
+                Violations(
+                    (
+                        Violation(
+                            _LIMIT_BREACH,
+                            "max_orders_per_run",
+                            f"{total} orders (sells {sells}, planned buys {buys}) "
+                            f"against the cap of {cap}, before any sell was submitted",
+                        ),
+                    )
+                ),
+                rebalance,
+            )
 
     def _buys(
         self,

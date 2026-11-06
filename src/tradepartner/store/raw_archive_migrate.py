@@ -22,8 +22,8 @@ like the moves (`evicted`, `pending_upload`, or `backed_up` when eviction failed
 Below the floor `RawArchiveFloorError` stops the run with no partial file and a
 rerun resumes at that file. A file whose hash the archive already holds is only
 confirmed. The manifest lists every backup file with its hash, so each run is a
-complete snapshot. A run that moves nothing and meets no new backup hash changes
-nothing. No backup source is moved or unlinked.
+complete snapshot. A run that moves nothing and meets no new backup hash still
+retries earlier pending uploads. No backup source is moved or unlinked.
 
 **Refusals.** The archive root and the cache must share a filesystem; otherwise
 the run refuses before any change (`MigrationRefusedError`). The move phase never
@@ -116,12 +116,20 @@ class MigrationStoppedError(RuntimeError):
 class MigrationResult:
     """One `apply_migration` run. `states` maps each moved-class path to
     `evicted`, `pending_upload` (local and counted), `moved` (archived, eviction
-    failed), `duplicate`, `duplicate_kept` or `changed`."""
+    failed), `duplicate`, `duplicate_kept` or `changed`. Retry counts cover
+    pending paths from earlier journals, including backup-class paths."""
 
     run_id: str
     manifest_sha256: str
     states: dict[str, str] = field(default_factory=dict)
     backup_states: dict[str, str] = field(default_factory=dict)
+    retried: int = 0
+    retry_evicted: int = 0
+    retry_pending: int = 0
+    retry_missing: int = 0
+    retry_mismatched: int = 0
+    retry_evict_failed: int = 0
+    retry_status_failed: int = 0
 
     def count(self, state: str) -> int:
         """How many moved-class paths ended in `state`."""
@@ -208,6 +216,81 @@ def _listing(cache_dir: Path) -> Iterator[CacheFile]:
                 )
 
 
+def pending_evictions(cache_dir: Path) -> dict[Path, dict[str, str]]:
+    """Pending paths and body hashes from earlier migration journals."""
+    out: dict[Path, dict[str, str]] = {}
+    for journal in (cache_dir / TOMBSTONE_DIR).glob("journal-*.jsonl"):
+        records = _read_lines(journal)
+        out.update(_pending_in_journal(journal, records))
+    open_journal = cache_dir / TOMBSTONE_DIR / JOURNAL
+    if open_journal.exists():
+        out.update(_pending_in_journal(open_journal, _read_lines(open_journal)))
+    return out
+
+
+def _pending_in_journal(journal: Path, records: list[dict[str, Any]]) -> dict[Path, dict[str, str]]:
+    """The latest pending paths in one journal, including retry records."""
+    if not any(r["op"] in {"evicted", "bevicted"} for r in records):
+        return {}
+    hashes = {r["path"]: r["sha256"] for r in records if r["op"] == "intent"}
+    hashes.update(
+        {r["path"]: r["sha256"] for r in records if r["op"] == "bsettled" and r["sha256"]}
+    )
+    states: dict[str, str] = {}
+    for record in records:
+        if record["op"] in {"evicted", "bevicted", "retry_eviction"}:
+            states.update(record["states"])
+    unresolved = {"pending_upload", "missing", "mismatched", "evict_failed", "status_failed"}
+    pending = {path: hashes[path] for path, state in states.items() if state in unresolved}
+    return {journal: pending} if pending else {}
+
+
+@dataclass(frozen=True)
+class _RetryCounts:
+    retried: int = 0
+    evicted: int = 0
+    pending_upload: int = 0
+    missing: int = 0
+    mismatched: int = 0
+    evict_failed: int = 0
+    status_failed: int = 0
+
+
+def _retry_pending(settings: Settings, cache_dir: Path, icloud: ICloudItems) -> _RetryCounts:
+    """Retry prior pending bodies through the normal bounded eviction path."""
+    pending = pending_evictions(cache_dir)
+    hashes = list(dict.fromkeys(sha for paths in pending.values() for sha in paths.values()))
+    if not hashes:
+        return _RetryCounts()
+    missing = {sha for sha in hashes if not is_archived(settings, sha)}
+    held = [sha for sha in hashes if sha not in missing]
+    report = evict_uploaded(settings, held, icloud) if held else None
+    outcomes = {sha: "missing" for sha in missing}
+    if report is not None:
+        for state, reported in (
+            ("evicted", (*report.evicted, *report.already_evicted)),
+            ("pending_upload", report.pending_upload),
+            ("mismatched", report.mismatched),
+            ("evict_failed", report.evict_failed),
+            ("status_failed", report.status_failed),
+        ):
+            outcomes.update({sha: state for sha in reported})
+    paths_seen: dict[str, str] = {}
+    for journal, paths in pending.items():
+        states = {path: outcomes[sha] for path, sha in paths.items()}
+        paths_seen.update(states)
+        _append(journal, {"op": "retry_eviction", "states": states})
+    return _RetryCounts(
+        retried=len(paths_seen),
+        evicted=sum(state == "evicted" for state in paths_seen.values()),
+        pending_upload=sum(state == "pending_upload" for state in paths_seen.values()),
+        missing=sum(state == "missing" for state in paths_seen.values()),
+        mismatched=sum(state == "mismatched" for state in paths_seen.values()),
+        evict_failed=sum(state == "evict_failed" for state in paths_seen.values()),
+        status_failed=sum(state == "status_failed" for state in paths_seen.values()),
+    )
+
+
 def _settle(
     settings: Settings,
     cache_dir: Path,
@@ -263,6 +346,7 @@ def apply_migration(
         known_hashes=(),
         free_bytes=diskfloor.free_bytes(cache_dir),
     )
+    retry = _retry_pending(settings, cache_dir, icloud)
     keep_dir = cache_dir / TOMBSTONE_DIR
     keep_dir.mkdir(exist_ok=True)
     journal = keep_dir / JOURNAL
@@ -310,6 +394,9 @@ def apply_migration(
         _append(journal, {"op": "evicted", "states": states})
     elif intents:
         states = next(r for r in _read_lines(journal) if r["op"] == "evicted")["states"]
+    for record in _read_lines(journal):
+        if record["op"] == "retry_eviction":
+            states.update({p: state for p, state in record["states"].items() if p in states})
     _step("evict")
 
     bsettled = _backup_phase(settings, cache_dir, journal, backups)
@@ -318,7 +405,17 @@ def apply_migration(
         if any(r["op"] not in {"start", "bintent", "bsettled"} for r in _read_lines(journal)):
             raise MigrationStoppedError("the journal holds records but names no file")
         journal.unlink()
-        return MigrationResult(run_id=run, manifest_sha256="")
+        return MigrationResult(
+            run_id=run,
+            manifest_sha256="",
+            retried=retry.retried,
+            retry_evicted=retry.evicted,
+            retry_pending=retry.pending_upload,
+            retry_missing=retry.missing,
+            retry_mismatched=retry.mismatched,
+            retry_evict_failed=retry.evict_failed,
+            retry_status_failed=retry.status_failed,
+        )
 
     bstates = {p: r["state"] for p, r in bsettled.items()}
     bevicted = next((r for r in _read_lines(journal) if r["op"] == "bevicted"), None)
@@ -336,6 +433,9 @@ def apply_migration(
         _append(journal, {"op": "bevicted", "states": bstates})
     else:
         bstates = bevicted["states"]
+    for record in _read_lines(journal):
+        if record["op"] == "retry_eviction":
+            bstates.update({p: state for p, state in record["states"].items() if p in bstates})
     _step("backup_evict")
 
     records = _read_lines(journal)
@@ -373,7 +473,17 @@ def apply_migration(
     os.replace(journal, keep_dir / f"journal-{run}.jsonl")
     _fsync_dir(keep_dir)
     return MigrationResult(
-        run_id=run, manifest_sha256=manifest["digest"], states=states, backup_states=bstates
+        run_id=run,
+        manifest_sha256=manifest["digest"],
+        states=states,
+        backup_states=bstates,
+        retried=retry.retried,
+        retry_evicted=retry.evicted,
+        retry_pending=retry.pending_upload,
+        retry_missing=retry.missing,
+        retry_mismatched=retry.mismatched,
+        retry_evict_failed=retry.evict_failed,
+        retry_status_failed=retry.status_failed,
     )
 
 

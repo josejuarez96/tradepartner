@@ -372,6 +372,7 @@ from tradepartner.calendar import is_session, next_session, previous_session
 from tradepartner.config import AlpacaConfig, Settings, get_settings
 from tradepartner.store.classify import EQUITY, listing_kind
 from tradepartner.store.delistings import DELISTED
+from tradepartner.store.dividend_reviews import DUPLICATE, ReviewedGroup, reviewed_groups
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT
 
@@ -2279,6 +2280,10 @@ class ActionsParse:
     merger_conflict: tuple[str, ...] = ()
     merger_self: int = 0
     merger_unordered: tuple[str, ...] = ()
+    #: #2957: dividends on the reviewed-duplicate list (`store.dividend_reviews`,
+    #: the id `repair.retract_dividends` deleted), refused so a backfill never
+    #: re-inserts them; counted on the run message.
+    reviewed_duplicates_refused: int = 0
 
 
 #: Alpaca's merger categories and the `Merger.kind` of each (spec "Mergers").
@@ -2930,7 +2935,8 @@ class AlpacaPriceSource(PriceSource):
     `last_actions_report` (unresolved rows and unsupported categories),
     for ingest to count or refuse. `fetch_bars` and
     `fetch_actions` default to `alpaca_raw` (network, owner's keys); tests
-    pass recorded payloads.
+    pass recorded payloads. Construction loads the packaged
+    `dividend_reviews.csv` and raises `ReviewsError` if it is malformed.
     """
 
     def __init__(
@@ -2943,8 +2949,16 @@ class AlpacaPriceSource(PriceSource):
         fetch_mergers: FetchMergers | None = None,
         settings: Settings | None = None,
         fill_handovers: bool = False,
+        reviewed: Sequence[ReviewedGroup] | None = None,
     ) -> None:
         self._resolver = resolver
+        # #2957: a reviewed duplicate dividend repair deleted is never stored
+        # again; the list is the packaged one unless a test hands its own.
+        self._retracted: dict[tuple[str, str], tuple[date, float]] = dict(
+            ((g.security_id, g.retract_source_action_id), (g.ex_date, g.amount))
+            for g in (reviewed if reviewed is not None else reviewed_groups())
+            if g.verdict == DUPLICATE
+        )
         # #1314 rule 8 "Store holes": a `--fill-holes` source lands S's own
         # bars on its rule-8 windows (`ListingResolver.fill_resolve`).
         self._fill_handovers = fill_handovers
@@ -3195,6 +3209,11 @@ class AlpacaPriceSource(PriceSource):
                 line += (
                     f"; {self.last_actions_report.stock_ratio_cash} stock-ratio cash row(s) skipped"
                 )
+            if self.last_actions_report.reviewed_duplicates_refused:
+                line += (
+                    f"; {self.last_actions_report.reviewed_duplicates_refused} reviewed "
+                    "duplicate dividend(s) refused"
+                )
             if self.last_actions_report.stock_rows_unusable:
                 line += (
                     f"; {self.last_actions_report.stock_rows_unusable} "
@@ -3310,6 +3329,16 @@ class AlpacaPriceSource(PriceSource):
         # keeps it; one of neither is dropped and counted.
         kept: list[CorporateAction] = []
         unrequested = 0
+        reviewed_refused = 0
+        # The reviewed key uses exact stored DOUBLE amounts, as in
+        # equal_amount_groups. Another retract id cannot stand in for a kept id.
+        kept_paid = {
+            (x.security_id, x.ex_date, x.ratio_or_amount)
+            for x in parsed.actions
+            if x.action_type is ActionType.DIVIDEND
+            and self._retracted.get((x.security_id, x.source_action_id or ""))
+            != (x.ex_date, x.ratio_or_amount)
+        }
         for a in parsed.actions:
             if a.action_type is ActionType.SPINOFF:
                 if a.security_id in ids or a.source_action_id in ids:
@@ -3321,8 +3350,20 @@ class AlpacaPriceSource(PriceSource):
                 and a.action_type in (ActionType.SPLIT, ActionType.DIVIDEND)
                 and start <= a.ex_date <= end
             ):
-                kept.append(a)
-        self.last_actions_report = replace(parsed, spinoffs_unrequested=unrequested)
+                if (
+                    a.action_type is ActionType.DIVIDEND
+                    and self._retracted.get((a.security_id, a.source_action_id or ""))
+                    == (a.ex_date, a.ratio_or_amount)
+                    and (a.security_id, a.ex_date, a.ratio_or_amount) in kept_paid
+                ):
+                    reviewed_refused += 1  # #2957: reviewed as a duplicate, repair deleted it
+                else:
+                    kept.append(a)
+        self.last_actions_report = replace(
+            parsed,
+            spinoffs_unrequested=unrequested,
+            reviewed_duplicates_refused=reviewed_refused,
+        )
         return kept
 
     def symbol_changes(

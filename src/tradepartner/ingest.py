@@ -139,9 +139,12 @@ carry is derived from its own stored `revenue` and `cost_of_revenue`
 vintages at the filing's turn, unless the key is held or the filing's
 `GrossProfit` is on the source's `statement_conflict_keys`. Each CIK's rows
 go in one bulk insert, the frame's timestamps tz-checked once.
-`rebuild_statement_facts` first deletes every `statement_facts` row in the
-same transaction. The counts go into the run message as `statement_<name>:
-N` (`health.statement_counts`).
+`rebuild_statement_facts` replaces per CIK in the same transaction (#2956):
+a CIK's stored rows are deleted only once its read returned records, so a
+CIK whose read is empty (its statement cache missing) keeps its rows and,
+if it had any, is counted `rebuild_kept_empty_read` with its first CIKs
+listed; rows of a CIK the run does not ask stay too. The counts go into
+the run message as `statement_<name>: N` (`health.statement_counts`).
 
 **Filing events** (amendment 2026-10-09, #1358; plan T164e), only while
 `edgar.filing_events_enabled` is on (off, the default: no call, so no
@@ -154,9 +157,9 @@ insert per CIK, `known_at = accepted_at` (never the index's filing date). A
 form outside `edgar.event_forms` is never a row. A record accepted after the
 run's clock is skipped and counted `filing_events_not_yet_known`, never
 clamped and never fatal: `known_at = accepted_at` and `known_at <=
-ingested_at` cannot both hold for it. `rebuild_filing_events` first deletes
-every row in the same transaction and records the counts before and after.
-The counts go into the run message as `filing_events_<name>: N`
+ingested_at` cannot both hold for it. `rebuild_filing_events` replaces per
+CIK the same way (#2956), counted `rebuild_kept_empty_read`, and records
+the counts before and after. The counts go into the run message as `filing_events_<name>: N`
 (`health.filing_event_counts`), with the adapter's `unstamped`,
 `items_missing` and `clock_suspect` counts where the source exposes them.
 
@@ -166,7 +169,9 @@ new stamp has the stored row's values, so the revision rule above skips it
 and the row stays at the old `known_at`. `restamp` (CLI `ingest --source
 edgar --restamp-from <manifest>`) moves those rows by UPDATE, never a delete
 and re-insert, in the EDGAR chunk's transaction before the day's rows are
-written: `restamp_from_manifest` has the matching rule, the refusals and the
+written, stamping the moves one microsecond before the run's instant so the
+day's rows are a later ingest of a moved accession (#2968):
+`restamp_from_manifest` has the matching rule, the refusals and the
 paper-window abort. `restamp_window_ok` (#1497, T166e; CLI
 `--restamp-window-earlier-ok <precheck.json>`) lets a late stamp inside an
 open window move earlier to its SGML header time, under T166f's rule and
@@ -259,6 +264,7 @@ from tradepartner.adapters.edgar import (
     StatementConflict,
     duration_class,
 )
+from tradepartner.adapters.edgar_insider_bulk import InsiderBulk
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverPage,
@@ -290,15 +296,22 @@ from tradepartner.adapters.form4_archive import (
 from tradepartner.adapters.form4_bulk_route import (
     BULK_READER_VERSION,
     BulkRouteResult,
+    Form4CompareThresholdError,
     Form4IndexRow,
     RequestBudgetStopped,
+    Rule5,
+    comparable,
     insider_zip_fetch,
     insider_zip_path,
     load_bulk_quarters,
+    marker_entries,
+    offending,
     order_check_path,
     request_budget,
     run_form4_bulk_route,
+    unresolved_markers,
 )
+from tradepartner.adapters.form4_compare import Outcome, declaration_from
 from tradepartner.adapters.form4_route import (
     Quarter,
     QuarterState,
@@ -3555,6 +3568,9 @@ class _Form4Provenance:
         self.would_keep: dict[str, int] = {}
         self.would_manifest_bytes = 0
         self.digest: str | None = None
+        #: Rule 5 review markers (T351): carried from the latest manifest or new this run.
+        self.markers: list[dict[str, object]] = []
+        self.markers_carried = False
 
     @classmethod
     def start(
@@ -3593,6 +3609,12 @@ class _Form4Provenance:
                 )
         url, fetched_at = insider_zip_fetch(self.settings, quarter, digest)
         self.zips[quarter] = RawInput(digest, url, fetched_at, _FORM4_BULK_PARSER)
+
+    def set_markers(self, accessions: Collection[str], new: Sequence[dict[str, object]]) -> None:
+        """Replace the markers of `accessions` with `new` (a recheck's or a fresh
+        comparison's result); every other marker stays as carried."""
+        self.markers = [m for m in self.markers if m["accession"] not in accessions]
+        self.markers.extend(new)
 
     def xml_input(self, accession: str) -> RawInput:
         """The kept XML of an accession about to be written or compared: its latest
@@ -3653,7 +3675,7 @@ class _Form4Provenance:
                 run_id=self.run_id,
                 source=self.writer,
                 mode=self.mode,
-                entries=self.entries,
+                entries=[*self.entries, *self.markers],
                 zips=zips,
             )
             if self.dry_run:
@@ -3674,14 +3696,19 @@ class _Form4Provenance:
 
 
 def _provenance_clause(provenance: _Form4Provenance | None) -> str:
-    """`; provenance_sha256=<hex>` for a writer message, placed by the caller
-    before any text `ingest.max_message_chars` can cut; empty with the archive off.
+    """`; provenance_sha256=<hex>; form4_compare_markers=N` for a writer message, placed
+    by the caller before any text `ingest.max_message_chars` can cut; empty with the
+    archive off.
     A dry run names no digest (no manifest was written) and reports what it would keep."""
     if provenance is None:
         return ""
     if provenance.dry_run:
         return provenance.dry_run_clause()
-    return f"; {PROVENANCE_KEY}={provenance.finish()}"
+    digest = provenance.finish()
+    # The unresolved-marker count rides beside the digest so no later cut removes it:
+    # `_recorded_marker_count` reads it when the manifest itself is unreadable.
+    unresolved = len({m["accession"] for m in provenance.markers if m["status"] == "unresolved"})
+    return f"; {PROVENANCE_KEY}={digest}; form4_compare_markers={unresolved}"
 
 
 def _form4_manifests(
@@ -3709,6 +3736,72 @@ def _form4_manifests(
     return manifests
 
 
+def _latest_form4_manifest(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, counts: Counter[str]
+) -> dict[str, Any] | None:
+    """The newest committed Form 4 writer run's manifest, and no older one (#2714
+    item 6): the markers an offline nightly run needs are copied forward into it, so
+    older manifests may be absent. A missing or offline one is counted."""
+    runs = conn.execute(
+        "SELECT message FROM ingestion_runs WHERE source IN ('edgar', 'sec_forms') "
+        "AND mode = 'backfill' AND status <> 'failed' "
+        "ORDER BY started_at DESC, finished_at DESC NULLS LAST"
+    ).fetchall()
+    for (message,) in runs:
+        digest = message_digest(message)
+        if digest is None:
+            continue
+        try:
+            return parse_manifest(raw_archive.read_manifest(settings, digest))
+        except (raw_archive.RawArchiveMissingError, raw_archive.RawArchiveOfflineError):
+            counts["sec_forms_provenance_manifest_unread"] += 1
+            return None
+    return None
+
+
+_MARKERS_FIELD = re.compile(r"\bform4_compare_markers=(\d+)")
+
+
+def _recorded_marker_count(conn: duckdb.DuckDBPyConnection) -> int:
+    """The unresolved markers the latest committed Form 4 writer run recorded in its
+    message (`form4_compare_markers=N`); 0 when that run (or none) carries no field."""
+    for (message,) in conn.execute(
+        "SELECT message FROM ingestion_runs WHERE source IN ('edgar', 'sec_forms') "
+        "AND mode = 'backfill' AND status <> 'failed' "
+        "ORDER BY started_at DESC, finished_at DESC NULLS LAST"
+    ).fetchall():
+        if message_digest(message) is None:
+            continue
+        found = _MARKERS_FIELD.search(message or "")
+        return int(found.group(1)) if found else 0
+    return 0
+
+
+def _carry_markers(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    provenance: _Form4Provenance | None,
+    counts: Counter[str],
+) -> None:
+    """Copy the unresolved rule 5 markers of the latest committed manifest into this
+    writer's recorder, once, whatever the threshold or whether the Form 4 step runs, so
+    no newer manifest drops them. An unreadable latest manifest (offline in iCloud, say)
+    fails the run, whatever the threshold, when that run's message recorded markers,
+    rather than let a marker-less manifest become the latest; if it recorded none (or no
+    field) nothing can be lost, so the run proceeds with the unread count (a failed
+    run's manifest is not a chain head: its rows rolled back)."""
+    if provenance is None or provenance.markers_carried:
+        return
+    provenance.markers_carried = True
+    before = counts["sec_forms_provenance_manifest_unread"]
+    provenance.markers = unresolved_markers(_latest_form4_manifest(conn, settings, counts))
+    if counts["sec_forms_provenance_manifest_unread"] > before and _recorded_marker_count(conn):
+        raise RuntimeError(
+            "the latest Form 4 manifest is unreadable, so its review markers cannot be "
+            "copied forward; restore it before this writer publishes a new manifest"
+        )
+
+
 def _bulk_run_fields(message: str | None) -> dict[str, str]:
     """The `key=value` fields of one `sec_insider_bulk` run message, split on `;`."""
     return dict(part.strip().split("=", 1) for part in (message or "").split(";") if "=" in part)
@@ -3734,6 +3827,11 @@ def _write_form4_bulk(
     """
     if provenance is None and raw_archive.archive_on(settings):
         raise ValueError("the Form 4 step with the raw archive on needs its writer's provenance")
+    if settings.events.form4_compare_threshold is not None and provenance is None:
+        raise ValueError(
+            "events.form4_compare_threshold needs the raw archive: its review markers "
+            "live in the writer's provenance manifest"
+        )
     previous = getattr(source, "form4_xml_keeper", None)
     source.form4_xml_keeper = None if provenance is None else provenance.keep_xml
     try:
@@ -3753,6 +3851,14 @@ def _form4_bulk(
     """`_write_form4_bulk`'s work, with the XML keeper set."""
     from tradepartner.adapters import edgar_raw
 
+    rule5 = Rule5(declaration_from(settings.events))
+    manifest_counts: Counter[str] = Counter()
+    _carry_markers(conn, settings, provenance, manifest_counts)  # before any early return
+    marked = frozenset(
+        str(m["accession"])
+        for m in (provenance.markers if provenance else [])
+        if m["status"] == "unresolved"
+    )
     start = settings.events.sec_forms_backfill_start
     latest = quarter_of(now.date())
     quarters = [
@@ -3937,17 +4043,22 @@ def _form4_bulk(
                     quarter_bulk.accessions.get(accession) if quarter_bulk is not None else None
                 )
                 if (
-                    settings.events.form4_multi_owner_xml
-                    and candidate is not None
-                    and len(set(candidate.filer_ciks)) > 1
-                ) or route_accession(
-                    candidate,
-                    state=state,
-                    submissions_form=form,
-                    submissions_filing_date=filed,
-                    price_below=settings.events.form4_xml_price_below,
-                    zero_price_codes=settings.events.form4_zero_price_xml_codes,
-                ).route is Route.XML:
+                    accession in marked
+                    or (
+                        settings.events.form4_multi_owner_xml
+                        and candidate is not None
+                        and len(set(candidate.filer_ciks)) > 1
+                    )
+                    or route_accession(
+                        candidate,
+                        state=state,
+                        submissions_form=form,
+                        submissions_filing_date=filed,
+                        price_below=settings.events.form4_xml_price_below,
+                        zero_price_codes=settings.events.form4_zero_price_xml_codes,
+                    ).route
+                    is Route.XML
+                ):
                     xml_expected += 1
         del loaded, quarter_bulk, xml_saved  # released before the next quarter is read
         _LOGGER.info(
@@ -3961,7 +4072,6 @@ def _form4_bulk(
     # Rule 4: an accession already rechecked against its quarter's current zip hash
     # (by an earlier run whose recheck elsewhere in the quarter failed) is not
     # fetched again; only the failed ones are.
-    manifest_counts: Counter[str] = Counter()
     manifests = _form4_manifests(conn, settings, manifest_counts) if rechecks else []
     for quarter, due in list(rechecks.items()):
         label = f"{quarter.year}q{quarter.number}"
@@ -4083,7 +4193,7 @@ def _form4_bulk(
     prior = prior_xml_hashes(manifests, recheck_wanted)
     rechecked: set[str] = set()
 
-    def recheck(quarter: Quarter) -> BulkRouteResult | None:
+    def recheck(quarter: Quarter, quarter_bulk: InsiderBulk | None) -> BulkRouteResult | None:
         """Recheck the quarter's held XML accessions after a zip change; a result
         only on a budget stop, which then stands in for the route's. A failed
         recheck counts in the quarter's `remaining`, so its row is `partial`."""
@@ -4105,6 +4215,15 @@ def _form4_bulk(
                 quarter_remaining[quarter] += 1
                 remaining += 1
                 continue
+            record = quarter_bulk.accessions.get(accession) if quarter_bulk is not None else None
+            if comparable(record, cik, settings.events.form4_multi_owner_xml):
+                assert record is not None
+                found = rule5.record(accession, record.transactions, filing.transactions)
+                if rule5.enforcing:  # a marker only: the held fact is never rewritten
+                    label = f"{quarter.year}q{quarter.number}"
+                    provenance.set_markers(
+                        {accession}, marker_entries(accession, label, digests.get(quarter), found)
+                    )
             verdict = recheck_verdict(prior.get(accession), provenance.xml_input(accession).sha256)
             counts[f"sec_forms_xml_recheck_{verdict}"] += 1
             if verdict == "same":
@@ -4119,8 +4238,9 @@ def _form4_bulk(
     for position, quarter in enumerate(route_quarters):
         rows = queued_by_quarter[quarter]
         quarter_bulk = None
-        # A quarter whose every accession is skipped is not read again.
-        needed = any(row[0] not in skip for row in rows)
+        # A quarter whose every accession is skipped is not read again, unless a changed
+        # zip rechecks held accessions: rule 5 compares them with the new zip's rows.
+        needed = any(row[0] not in skip for row in rows) or quarter in rechecks
         if needed and quarter in published and quarter not in unreadable:
             reread, reread_digests, _counts, bad = load_bulk_quarters(
                 {quarter}, settings=settings, client=source._client, revalidate=False
@@ -4136,7 +4256,7 @@ def _form4_bulk(
                 unreadable.add(quarter)
                 quarter_bulk = None
             del reread
-        stopped = recheck(quarter) if quarter in rechecks else None
+        stopped = recheck(quarter, quarter_bulk) if quarter in rechecks else None
         result = stopped or run_form4_bulk_route(
             rows,
             quarters={quarter: quarter_bulk},
@@ -4157,6 +4277,8 @@ def _form4_bulk(
             blocked_quarters=frozenset(unreadable),
             source_counts_failures=True,
             accession_quarters=accession_quarters,
+            rule5=rule5,
+            xml_accessions=marked,
         )
         del quarter_bulk  # released before the next quarter is read
         counts.update(result.counts)
@@ -4195,6 +4317,29 @@ def _form4_bulk(
             break
     if cross_route_disagree:
         counts["sec_forms_bulk_xml_disagree"] = cross_route_disagree
+    if rule5.enforcing and provenance is not None:
+        # An accession compared this run (route or recheck) leaves its disagreements as
+        # unresolved markers, naming the quarter's checked zip; a recheck that agreed
+        # already left its resolved marker.
+        for accession, found in sorted(rule5.found.items()):
+            quarter = accession_quarters[accession]
+            label = f"{quarter.year}q{quarter.number}"
+            provenance.set_markers(
+                {accession}, marker_entries(accession, label, digests.get(quarter), found)
+            )
+    if rule5.tally.outcome(rule5.declaration.threshold) is Outcome.AT_OR_ABOVE and rule5.enforcing:
+        link = ""
+        unresolved = 0
+        if provenance is not None:
+            digest = provenance.finish()  # the manifest keeps the offending markers
+            unresolved = len(
+                {m["accession"] for m in provenance.markers if m["status"] == "unresolved"}
+            )
+            link = "" if provenance.dry_run else f"{PROVENANCE_KEY}={digest}; "
+        raise Form4CompareThresholdError(
+            f"{link}{rule5.tally.message(rule5.declaration.threshold)}; "
+            f"form4_compare_markers={unresolved}; offending accessions: {offending(rule5)}"
+        )
     # The manifest is written and its digest fixed before any run row cites it.
     # A dry run's quarter rows (rolled back) name no digest: no manifest was written.
     provenance_digest = None if provenance is None else provenance.finish()
@@ -4240,10 +4385,18 @@ def _form4_bulk(
         )
     figures = ", ".join(f"{name}: {count}" for name, count in sorted(counts.items()))
     would_write = "".join(f"; order_check_would_write: {name}" for name in would_remember)
+    markers = len(
+        {
+            m["accession"]
+            for m in (provenance.markers if provenance else [])
+            if m["status"] == "unresolved"
+        }
+    )
+    compare = f"{rule5.tally.message(rule5.declaration.threshold)}; form4_compare_markers={markers}"
     return added, (
         f"Form 4 bulk: {len(selected)} selected, {added} rows added, "
-        f"{source.requests} requests, {remaining} remaining; {plan.message()}; {figures}"
-        f"{would_write}"
+        f"{source.requests} requests, {remaining} remaining; {plan.message()}; {compare}; "
+        f"{figures}{would_write}"
     )
 
 
@@ -4268,6 +4421,7 @@ def _write_sec_forms(
 
     sec_added = sec_changed = sec_future = 0
     form4_message = ""
+    _carry_markers(conn, settings, provenance, Counter())
     if (
         form4
         and isinstance(raw_source, EdgarFilingSource)
@@ -4437,10 +4591,15 @@ def _ingest_filings(
     record_snapshot_sightings(conn, recorded.companies_snapshot(), now, master.listings)
     restamped = ""
     if restamp is not None:
+        # The moves are an ingest of their own, one tick before the day's
+        # rows: at `now` itself a moved fact accession would be part of this
+        # run's ingest (`facts_as_of`'s latest-ingest rule), so a revision of
+        # it at `now` could not leave it, and `_refiled` refuses it as
+        # back-dated (#2968).
         result = restamp_from_manifest(
             conn,
             restamp,
-            ingested_at=now,
+            ingested_at=now - _RESTAMP_TICK,
             delistings=recorded.delistings(),
             window_ok=restamp_window_ok,
         )
@@ -4578,6 +4737,8 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
         "filename_renamed",
         "filename_refused_contradicted",
         "filename_refused_owner",
+        "filename_refused_coregistrant",
+        "filename_refused_symbol",
         "filename_no_instance",
         "filename_no_exchange",
         "filename_class_unread",
@@ -4618,6 +4779,9 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
     source = _unwrap(filings)
     for key in ("filename_index_fetches", "filename_document_fetches"):
         counts[key] = int(getattr(source, key, 0))
+    # #2941: the read 10-Ks whose filer FSN never names (its period unloaded
+    # or failed, no cover cache): a co-registrant copy among them is not caught.
+    counts["filename_entity_unknown"] = int(getattr(source, "filename_fsn_missing", 0))
     text = "".join(f"; {key}: {value}" for key, value in sorted(counts.items()))
     # #2929: the first few CIKs a class conflict failed closed, to look up.
     # #2932: CIKs whose filename fetch failed past the retries, failed closed.
@@ -4968,6 +5132,11 @@ def _ny_date(instant: datetime) -> date:
     return instant.astimezone(_NEW_YORK).date()
 
 
+#: How far before the run's instant `_ingest_filings` stamps a restamp's
+#: moves (`ingested_at`), so the day's writes and revisions are a later
+#: ingest of every moved accession (#2968).
+_RESTAMP_TICK = timedelta(microseconds=1)
+
 #: The rows a restamp may move in every table: EDGAR-sourced, `filing`
 #: provenance, never a row stamped at its own ingest (a revision or a
 #: retraction stamped at `ingested_at`).
@@ -5021,7 +5190,8 @@ def restamp_from_manifest(
     `ingested_at` move (`_RESTAMPABLE`); retractions and snapshot rows never
     do. A moved row gets the new stamp as `known_at` (and as `filed_at`, a
     delisting's stamp) and `ingested_at` as its `ingested_at`; nothing else
-    changes.
+    changes. A moved `facts` row with a later stored ingest of its accession (or a revision at
+    its own) keeps its `ingested_at` (#2970), so a restamp never changes a read after it.
 
     **`filing_index`** (T318b, #2703) has its own match path, on
     `(cik, accession)` with `accepted_at` equal to the old stamp (EDGAR
@@ -5219,9 +5389,28 @@ def restamp_from_manifest(
         if not count:
             continue
         stamps = "known_at = u.new" + (", filed_at = u.new" if table == "delistings" else "")
+        # A moved fact with a later ingest of its accession stored, or a revision
+        # (a row stamped at its own ingest, never moved) at its own, keeps its
+        # `ingested_at`: else `facts_as_of`'s latest-ingest rule would regroup
+        # the accession's ingests and change reads after the revision (#2970).
+        revised = (
+            ", (SELECT min(r.ingested_at) FROM facts r WHERE r.security_id = t.security_id "
+            "AND r.fact_name = t.fact_name AND r.class_member IS NOT DISTINCT FROM t.class_member "
+            "AND r.filing_accession IS NOT DISTINCT FROM t.filing_accession "
+            "AND (r.ingested_at > t.ingested_at OR (r.ingested_at = t.ingested_at "
+            "AND r.known_at = r.ingested_at))) AS revised"
+            if table == "facts"
+            else ""
+        )
+        new_ingest = (
+            "CASE WHEN u.revised IS NULL THEN ? ELSE facts.ingested_at END"
+            if table == "facts"
+            else "?"
+        )
         conn.execute(
-            f"UPDATE {table} SET {stamps}, ingested_at = ? FROM (SELECT DISTINCT t.rowid AS rid, "
-            f"m.new AS new {matched[table]}) u WHERE {table}.rowid = u.rid",
+            f"UPDATE {table} SET {stamps}, ingested_at = {new_ingest} "
+            f"FROM (SELECT DISTINCT t.rowid AS rid, m.new AS new{revised} "
+            f"{matched[table]}) u WHERE {table}.rowid = u.rid",
             [ingested_at],
         )
     moved["filing_index"] = _move_filing_index(conn, ingested_at)
@@ -5446,6 +5635,7 @@ class StatementCounts:
     restated: int = 0
     derived: int = 0
     deleted: int | None = None
+    kept_empty_read: list[str] | None = None
 
     def add(self, other: StatementCounts) -> None:
         """Fold one CIK's counts into the run's."""
@@ -5471,7 +5661,10 @@ class StatementCounts:
             value = getattr(source, f"statement_{name}", None)
             if value is not None:
                 figures.append((name, int(value)))
-        return "; " + ", ".join(f"statement_{name}: {n}" for name, n in figures)
+        text = ", ".join(f"statement_{name}: {n}" for name, n in figures)
+        if self.kept_empty_read is not None:
+            text += ", " + _kept_figure("statement_", self.kept_empty_read)
+        return "; " + text
 
 
 def _statement_key(record: StatementFactRecord) -> StatementKey:
@@ -5670,18 +5863,26 @@ def _write_statement_facts(
     *,
     rebuild: bool,
 ) -> StatementCounts:
-    """The write phase (module docstring): with `rebuild`, delete every row
-    first; then per CIK, one `statement_facts` read, its stored keys, its new
-    rows, and one bulk insert, holding one CIK's records at a time."""
+    """The write phase (module docstring): per CIK, one `statement_facts`
+    read, its stored keys, its new rows, and one bulk insert, holding one
+    CIK's records at a time. With `rebuild`, a CIK whose read returned
+    records has its stored rows deleted first, in the same transaction
+    (#2956); a CIK whose read is empty (a missing cache) keeps its rows and,
+    if it had any, is counted `rebuild_kept_empty_read`."""
     total = StatementCounts()
     if rebuild:
-        deleted = conn.execute("DELETE FROM statement_facts").fetchone()
-        total.deleted = int(deleted[0]) if deleted else 0
+        total.deleted = 0
+        total.kept_empty_read = []
     conflicts = _ConflictIndex(_unwrap(filings))
     for cik in ciks:
         records = filings.statement_facts(cik)
         if not records:
+            if total.kept_empty_read is not None and _has_rows(conn, "statement_facts", cik):
+                total.kept_empty_read.append(cik)
             continue
+        if total.deleted is not None:
+            deleted = conn.execute("DELETE FROM statement_facts WHERE cik = ?", [cik]).fetchone()
+            total.deleted += int(deleted[0]) if deleted else 0
         rows, counts = statement_fact_rows(
             records, _stored_vintages(conn, cik), conflicts.keys(), ingested_at=ingested_at
         )
@@ -5689,6 +5890,26 @@ def _write_statement_facts(
             insert_statement_frame(conn, statement_frame(rows))
         total.add(counts)
     return total
+
+
+#: How many of a rebuild's kept CIKs its run message lists by number (#2956).
+_KEPT_CIKS_LISTED = 5
+
+
+def _has_rows(conn: duckdb.DuckDBPyConnection, table: str, cik: str) -> bool:
+    """Whether `table` (`statement_facts` or `filing_events`) stores a row for `cik`."""
+    return (
+        conn.execute(f"SELECT 1 FROM {table} WHERE cik = ? LIMIT 1", [cik]).fetchone() is not None
+    )
+
+
+def _kept_figure(prefix: str, kept: Sequence[str]) -> str:
+    """`"<prefix>rebuild_kept_empty_read: N"`, with the first CIKs in
+    parentheses when any is kept (#2956)."""
+    figure = f"{prefix}rebuild_kept_empty_read: {len(kept)}"
+    if kept:
+        figure += f" (first: {' '.join(kept[:_KEPT_CIKS_LISTED])})"
+    return figure
 
 
 def _stored_vintages(
@@ -5752,6 +5973,7 @@ class FilingEventCounts:
     not_yet_known: int = 0
     before: int | None = None
     after: int | None = None
+    kept_empty_read: list[str] | None = None
 
     def message(self, source: FilingSource) -> str:
         """`"; filing_events_added: N, ..."` for the run row
@@ -5764,7 +5986,10 @@ class FilingEventCounts:
             value = getattr(source, f"filing_events_{name}", None)
             if value is not None:
                 figures.append((name, int(value if isinstance(value, int) else len(value))))
-        return "; " + ", ".join(f"filing_events_{name}: {n}" for name, n in figures)
+        text = ", ".join(f"filing_events_{name}: {n}" for name, n in figures)
+        if self.kept_empty_read is not None:
+            text += ", " + _kept_figure("filing_events_", self.kept_empty_read)
+        return "; " + text
 
 
 def filing_event_rows(
@@ -5814,18 +6039,24 @@ def _write_filing_events(
     *,
     rebuild: bool,
 ) -> FilingEventCounts:
-    """The filing-events write (module docstring): with `rebuild`, delete
-    every row first and record the counts before and after; then per CIK,
-    one `filing_events` read, its stored accessions, its new rows, and one
-    bulk insert."""
+    """The filing-events write (module docstring): per CIK, one
+    `filing_events` read, its stored accessions, its new rows, and one bulk
+    insert. With `rebuild`, record the counts before and after, and delete a
+    CIK's stored rows only once its read returned records, in the same
+    transaction (#2956); a CIK whose read is empty keeps its rows and, if it
+    had any, is counted `rebuild_kept_empty_read`."""
     total = FilingEventCounts()
     if rebuild:
         total.before = _event_count(conn)
-        conn.execute("DELETE FROM filing_events")
+        total.kept_empty_read = []
     for cik in ciks:
         records = filings.filing_events(cik)
         if not records:
+            if total.kept_empty_read is not None and _has_rows(conn, "filing_events", cik):
+                total.kept_empty_read.append(cik)
             continue
+        if rebuild:
+            conn.execute("DELETE FROM filing_events WHERE cik = ?", [cik])
         stored = {
             accession
             for (accession,) in conn.execute(
