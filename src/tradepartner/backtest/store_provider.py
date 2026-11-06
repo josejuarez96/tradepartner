@@ -32,6 +32,16 @@ must be in that store and have no result row yet. T40
 passes a truncated data store as `connect` and the untruncated fixture
 store as `registry_connect`.
 
+**Duplicate dividends (#3015).** Every dividend-including `adjusted_prices` read and
+every `dropped_dividends` read passes the packaged reviewed list
+(`store.dividend_reviews.reviewed_groups`, read once at construction) as
+`dividend_reviews`, so a payment the vendor stored twice is never summed twice whether
+or not `health` ran first: a listed `duplicate` not yet repaired applies once, and an
+equal-amount group the list does not explain, on a name the read asks for, is left
+unapplied and reported by `dropped_dividends` as `unexplained_duplicate`, which the
+engine counts in the trial's `n_dropped_dividends` like any other dropped dividend
+(per record, so a held unexplained pair adds 2).
+
 **Frames** are the as-of functions' own frames, read with `traded_only=True`
 (#787): a zero-volume bar is missing, not a price, so it can be neither a
 fill, a mark nor a signal anchor. Two reads have no
@@ -140,6 +150,7 @@ from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.db import StoreLockedError
 from tradepartner.store.delisting_reasons import delisting_reasons_as_of
 from tradepartner.store.delistings import listing_ends_as_of
+from tradepartner.store.dividend_reviews import reviewed_groups
 from tradepartner.universe import Universe, _split_factors, shares_as_of, universe_as_of
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
@@ -225,6 +236,7 @@ class StoreProvider:
         self._connect = connect
         self.handle = handle
         self.settings = frozen_settings
+        self._dividend_reviews = reviewed_groups()
         stack, conn = self._open(registry_connect or connect)
         with stack:
             registry._check_open(conn, handle)
@@ -314,6 +326,7 @@ class StoreProvider:
             settings=self.settings,
             traded_only=True,
             sessions_from=sessions_from,
+            dividend_reviews=self._dividend_reviews if include_dividends else None,
         )
 
     def marking_changed_ids(
@@ -346,7 +359,9 @@ class StoreProvider:
 
     def dropped_dividends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
-        return dropped_dividends_as_of(self._at(t), t, wanted, settings=self.settings)
+        return dropped_dividends_as_of(
+            self._at(t), t, wanted, settings=self.settings, dividend_reviews=self._dividend_reviews
+        )
 
     def late_dividends(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, t_prev, wanted = check_t(t), check_t(t_prev, name="t_prev"), _ids(ids)
