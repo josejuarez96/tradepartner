@@ -430,9 +430,7 @@ class StoreProvider:
         # read the acquirer's close under the id the chains known at `t` map it to (#2949).
         chains = dict(live_chains(conn, t))
         mergers = mergers.with_columns(
-            pl.col("acquirer_security_id")
-            .replace(chains, return_dtype=pl.String)
-            .alias(_ACQUIRER_KEY)
+            pl.col("acquirer_security_id").replace(chains).alias(_ACQUIRER_KEY)
         )
         acquirers = sorted(set(mergers[_ACQUIRER_KEY].drop_nulls().to_list()))
         # Bound the acquirers' bars to the earliest effective date: only those dates join.
