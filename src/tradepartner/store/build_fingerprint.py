@@ -57,8 +57,6 @@ HASHED_SETTINGS_KEYS = (
     "events.sec_forms",
     "events.sec_forms_enabled",
     "events.sec_forms_backfill_start",
-    "events.form4_xml_price_below",
-    "events.form4_zero_price_xml_codes",
 )
 
 PER_NAME_KEYS = (
@@ -103,8 +101,11 @@ EXCLUDED_SETTINGS_KEYS = (
     "edgar.filename_fetch_workers",  # #2932: fetch concurrency, not a derivation rule.
     "edgar.filename_fetch_max_failed_share",  # #2932: a failure threshold.
     "edgar.filename_fetch_outage_ciks",  # #2934: a failure threshold.
-    # #2994: the Form 4 writer is not a builder this fingerprint guards, so its rule 5
-    # and multi-owner routing keys do not move the build hash.
+    # #2994, #3012: the Form 4 writer is not a builder this fingerprint guards (only
+    # `ingest._form4_bulk` reads these), so its routing, multi-owner and rule 5 keys
+    # change Form 4 rows but no index row, and do not move the build hash.
+    "events.form4_xml_price_below",
+    "events.form4_zero_price_xml_codes",
     "events.form4_multi_owner_xml",
     "events.form4_compare_trusted",
     "events.form4_compare_decimals",
