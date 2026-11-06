@@ -3586,7 +3586,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # (no `research_exposures` or `trial_results.n_exposure` until 44,
         # T355); version 46 every read but `journal.resume_invocations` (no
         # `book_id` until 47, #2490), which only the writing `switch.release`
-        # calls.
+        # and `collect` read.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:

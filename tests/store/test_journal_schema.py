@@ -2794,9 +2794,8 @@ def test_version_47_adds_a_null_resume_book_and_keeps_every_resume() -> None:
             "accept_rejections, known_at, ingested_at) VALUES (1, ?, 'old', FALSE, FALSE, ?, ?)",
             [at, at, at],
         )
-        conn.execute(
-            "DELETE FROM schema_version WHERE version = ?", [schema.CURRENT_SCHEMA_VERSION]
-        )
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version VALUES (46, TIMESTAMPTZ '2026-11-01 00:00:00+00')")
         [before] = conn.execute("SELECT max(version) FROM schema_version").fetchone()
         assert before == schema._PRE_RESUME_BOOK_VERSION == 46
         schema.init_schema(conn)
