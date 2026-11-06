@@ -113,7 +113,7 @@ from tradepartner.execution.plan import current_listings as current_listings
 from tradepartner.execution.reconcile_run import frozen_risk, order_symbols
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
-from tradepartner.store.asof import live_actions_as_of, prices_as_of
+from tradepartner.store.asof import chained_read_ids, live_actions_as_of, prices_as_of
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
     DecisionRow,
@@ -380,16 +380,35 @@ def reference_prices(
     by the split ratios with ex-date in (that bar's session, S] in
     `actions_as_of` (read at close(S-1)): (S-1, S] when the S-1 bar exists, and
     every later split too when the latest bar is older. A name with no such bar
-    raises `ValueError`."""
+    raises `ValueError`.
+
+    A held chained predecessor (#3051) is read where the store files it: a
+    chain known at close(S-1) keys its bars and splits to its one live
+    successor (#821, `store.asof.chained_read_ids`), so its price is the
+    successor's, keyed back to the predecessor's id. Only the price is read
+    through: which broker symbol an order goes under stays the symbol map's
+    call (`reconcile_run.order_symbols`, #3031). A predecessor of more than one
+    live chain raises `ValueError` naming them, never a guessed successor."""
     _check_session(session)
     if not names:
         return {}
     previous = previous_session(session)
-    bars = prices_as_of(conn, _cut(session), sorted(names)).filter(pl.col("session") <= previous)
-    latest = {
+    cut = _cut(session)
+    ids, forked = chained_read_ids(conn, cut, sorted(names))
+    if forked:
+        raise ValueError(
+            "; ".join(
+                f"{sid}: more than one live successor chain known at close(S-1) "
+                f"({', '.join(successors)}), so its price is not read"
+                for sid, successors in sorted(forked.items())
+            )
+        )
+    bars = prices_as_of(conn, cut, sorted(set(ids.values()))).filter(pl.col("session") <= previous)
+    filed = {
         row["security_id"]: (row["session"], float(row["close"]))
         for row in bars.sort("session").group_by("security_id").last().iter_rows(named=True)
     }
+    latest = {sid: filed[ids[sid]] for sid in sorted(names) if ids[sid] in filed}
     missing = sorted(set(names) - set(latest))
     if missing:
         raise ValueError(f"no bar on or before {previous} known at close(S-1) for {missing}")
@@ -398,7 +417,7 @@ def reference_prices(
         factor = 1.0
         for row in actions_as_of.iter_rows(named=True):
             if (
-                row["security_id"] == sid
+                row["security_id"] == ids[sid]
                 and row["action_type"] == _SPLIT
                 and bar_session < row["ex_date"] <= session
             ):

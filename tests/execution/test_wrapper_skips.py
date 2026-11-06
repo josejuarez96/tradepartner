@@ -831,22 +831,6 @@ SUCC = "SEC_DUAL_A_SUCC"
 SUCC_TICKER = "DUALN"
 
 
-@pytest.fixture
-def chained_prices(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The store's chained read (#821) keys A's bars to `SUCC`, so the order
-    path's reference-price read has no bar for the held predecessor (a separate
-    gap, filed from #3031). These cases test the symbol map only, so the read
-    prices A at `PRICE` and every other name as before."""
-    real = wrapper.reference_prices
-
-    def priced(conn: Any, session: Any, names: Any, actions: Any) -> dict[str, float]:
-        rest = sorted(set(names) - {A})
-        found = real(conn, session, rest, actions) if rest else {}
-        return {**found, **({A: PRICE} if A in names else {})}
-
-    monkeypatch.setattr(wrapper, "reference_prices", priced)
-
-
 def _chain(env: Env, *, recorded: bool, delisted: bool = False) -> None:
     """A 1:1 chain A -> `SUCC` (#821) known a minute before close(S-1), the
     successor trading as `DUALN` from S-1 and, when `delisted`, A's Form 25.
@@ -932,7 +916,7 @@ def _chain(env: Env, *, recorded: bool, delisted: bool = False) -> None:
 
 @pytest.mark.parametrize("decision", ["trade", "forced_exit"])
 def test_a_held_chained_predecessor_is_sold_under_its_successors_symbol(
-    env: Env, alerter_conn: duckdb.DuckDBPyConnection, decision: str, chained_prices: None
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, decision: str
 ) -> None:
     """#3031: hold A; a chain to `SUCC` (trading as `DUALN`) known at close(S-1);
     the broker re-booked the position under `DUALN` and the reconciliation on S
@@ -956,7 +940,7 @@ def test_a_held_chained_predecessor_is_sold_under_its_successors_symbol(
 
 
 def test_a_chained_predecessor_whose_successor_is_also_planned_is_skipped_not_guessed(
-    env: Env, alerter_conn: duckdb.DuckDBPyConnection, chained_prices: None
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
     """#3031 (fail closed): the reconciliation on S mapped A to `DUALN`, but the
     plan also buys `SUCC`, so two ids would claim one broker symbol and the map
@@ -982,7 +966,7 @@ def test_a_chained_predecessor_whose_successor_is_also_planned_is_skipped_not_gu
 
 
 def test_an_unrecorded_chain_keeps_the_predecessors_own_symbol(
-    env: Env, alerter_conn: duckdb.DuckDBPyConnection, chained_prices: None
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
     """#3031: the chain is known but the broker still holds `DUALA`, so the
     reconciliation recorded no mapping: the trim goes out under `DUALA`, the
