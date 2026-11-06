@@ -390,3 +390,64 @@ def test_position_truncation_invariance() -> None:
     assert filing_index.accession_listing_order(
         full, "0001", cutoff
     ) == filing_index.accession_listing_order(truncated, "0001", cutoff)
+
+
+def _shared_store(*, until: datetime | None = None) -> duckdb.DuckDBPyConnection:
+    """Several accessions shared by CIKs, with revisions, NULL positions and a
+    late copy; ``until`` keeps only the writes made by then (a truncated store)."""
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    writes: list[tuple[datetime, list[filing_index.Listing]]] = []
+    for number in range(6):
+        accession = f"000{number}"
+        batch = [
+            filing_index.Listing(
+                str(cik),
+                accession,
+                "25-NSE" if cik % 2 else "10-K",
+                "Issuer",
+                date(2026, 3, 31),
+                ACCEPTED + timedelta(hours=number),
+                date(2026, 4, 1 + cik % 2),
+                True,
+                None if (number + cik) % 4 == 0 else (7 * cik + number) % 11,
+            )
+            for cik in range(1, 2 + number % 4)
+        ]
+        writes.append((RUN, batch))
+    revised = replace(writes[2][1][0], filed_on=date(2026, 3, 30), listed_on=date(2026, 4, 3))
+    writes.append((RUN + timedelta(days=1), [revised]))
+    late = replace(writes[3][1][0], cik="9", accepted_at=RUN + timedelta(days=2))
+    writes.append((RUN + timedelta(days=2), [late]))
+    for at, batch in writes:
+        if until is None or at <= until:
+            filing_index.insert_listings(conn, batch, at)
+    return conn
+
+
+def test_bulk_listing_orders_equal_one_read_per_accession() -> None:
+    """#2921: one scan returns what `accession_listing_order` returns per
+    accession, at every cutoff (a row known later is absent), order included."""
+    conn = _shared_store()
+    accessions = [f"000{n}" for n in range(6)] + ["absent"]
+    for cutoff in (ACCEPTED, RUN, RUN + timedelta(days=1, hours=1), RUN + timedelta(days=3)):
+        bulk = filing_index.accession_listing_orders(conn, accessions, cutoff)
+        each = {
+            accession: rows
+            for accession in accessions
+            if (rows := filing_index.accession_listing_order(conn, accession, cutoff))
+        }
+        assert bulk == each
+    assert filing_index.accession_listing_orders(conn, [], RUN) == {}
+    assert len(bulk["0003"]) == len(each["0003"]) == 5  # the late copy is visible at the end
+
+
+def test_bulk_listing_orders_no_look_ahead() -> None:
+    """Rows written after the cutoff do not change the bulk read (truncation invariance)."""
+    accessions = [f"000{n}" for n in range(6)]
+    for cutoff in (RUN, RUN + timedelta(days=1, hours=1)):
+        full = filing_index.accession_listing_orders(_shared_store(), accessions, cutoff)
+        truncated = filing_index.accession_listing_orders(
+            _shared_store(until=cutoff), accessions, cutoff
+        )
+        assert full == truncated
