@@ -358,8 +358,10 @@ derived at `t`, as the data is read.
   reviewed list (`store.dividend_reviews`, read at the edge so tests inject
   one) by `equal_amount_groups`: a key with more than one identity that the
   list does not hold, or a listed key with another identity count than the
-  two reviewed (a third record; a lost leg; a duplicate whose ids changed),
-  fails, one row per identity with its `known_at`. `known_at` and the id
+  two reviewed (a third record; a lost leg; a duplicate whose ids changed;
+  a reviewed retract id re-sent under another key, a noisy amount or
+  another ex-date, beside another live payment, #2980), fails, one row per
+  identity with its `known_at`. `known_at` and the id
   are never part of the key, and the rule has no date bound. The
   `duplicate_dividends` block lists the accepted (`distinct`) and
   unresolved keys, never hidden, and the pending ones (a listed `duplicate`
