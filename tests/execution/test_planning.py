@@ -976,14 +976,26 @@ def _chain(env: Env, predecessor: str, successor: str, known_at: datetime) -> No
 def test_a_held_chained_predecessor_is_priced_through_its_successor(env: Env) -> None:
     """#3051: a chain known at close(S-1) files the predecessor's bars under its
     successor (#821); the reference price of the predecessor id is the
-    successor's latest bar, divided by the successor's splits in (bar, S]."""
+    successor's latest bar (a successor split before that bar is already in it)."""
     close = _copy_bar(env, "SEC_OLD", T_I)
     _chain(env, "SEC_OLD", "SEC_NEW", session_close(T_I) - timedelta(minutes=1))
-    splits = _splits(("SEC_NEW", F_I, 2.0))
+    splits = _splits(("SEC_NEW", T_I, 2.0))
 
     prices = planning.reference_prices(env.conn, F_I, {"SEC_OLD"}, splits)
 
-    assert prices == {"SEC_OLD": pytest.approx(close / 2.0)}
+    assert prices == {"SEC_OLD": pytest.approx(close)}
+
+
+def test_a_successor_split_after_the_bar_refuses_the_predecessors_price(env: Env) -> None:
+    """#3051 (fail closed): a successor split ex S is keyed to the successor, so
+    the ledger's quantity of the held predecessor never counts it (#3062); a
+    price on the split's basis would halve its value, so the name is refused."""
+    _copy_bar(env, "SEC_OLD", T_I)
+    _chain(env, "SEC_OLD", "SEC_NEW", session_close(T_I) - timedelta(minutes=1))
+    splits = _splits(("SEC_NEW", F_I, 2.0))
+
+    with pytest.raises(ValueError, match=r"SEC_OLD: its chain successor SEC_NEW's split"):
+        planning.reference_prices(env.conn, F_I, {"SEC_OLD"}, splits)
 
 
 def test_a_predecessor_and_its_successor_are_both_priced(env: Env) -> None:

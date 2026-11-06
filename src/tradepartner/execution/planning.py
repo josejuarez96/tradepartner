@@ -421,6 +421,16 @@ def reference_prices(
                 and row["action_type"] == _SPLIT
                 and bar_session < row["ex_date"] <= session
             ):
+                if ids[sid] != sid:
+                    # The chained read keys this split to the successor, so the
+                    # ledger's quantity of the predecessor never counts it
+                    # (#3062): a price on the split's basis would misstate the
+                    # held value, so the name is refused, not priced (#3051).
+                    raise ValueError(
+                        f"{sid}: its chain successor {ids[sid]}'s split ex "
+                        f"{row['ex_date'].isoformat()} is not counted by the ledger's "
+                        "quantity, so its price is not read"
+                    )
                 factor *= float(row["ratio_or_amount"])
         price = close / factor
         if not (math.isfinite(price) and price > 0):
