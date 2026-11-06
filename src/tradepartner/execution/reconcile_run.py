@@ -1253,7 +1253,11 @@ def _seen_activities(
     only from its own session on (`session <= through`), the same cut the ledger's
     `reversed_true_up_ids(adjustments, through)` applies, so a catch-up reconcile
     of a session before the reversal keeps both the true-up's cash and the seen
-    activity (#2961). The base's recorded set (the
+    activity (#2961). A booking (`broker_activity_id`) or rebook
+    (`rebooked_activity_id`) counts only from its own session on too, the
+    ledger's `adjustment.session > through` skip, so a reconcile stated before a
+    later true-up reads its activity as unseen, not as cash the ledger dropped
+    (#3014). The base's recorded set (the
     last `ok` or `breaks` reconciliation's `activities`) takes precedence; before the first
     `ok`, the window row's `activities_seen_json` (what `paper start` read); when
     both are null, the fallback cutoff is the window's New York start date, so a
@@ -1274,9 +1278,9 @@ def _seen_activities(
         ):
             latest[reversed_activity] = False
         rebooked = terms.get("rebooked_activity_id")
-        if isinstance(rebooked, str):
+        if isinstance(rebooked, str) and adjustment.session <= through:
             latest[rebooked] = True
-        if adjustment.broker_activity_id is not None:
+        if adjustment.broker_activity_id is not None and adjustment.session <= through:
             latest[adjustment.broker_activity_id] = True
     booked = frozenset(key for key, active in latest.items() if active)
     reversed_ids = frozenset(key for key, active in latest.items() if not active)
