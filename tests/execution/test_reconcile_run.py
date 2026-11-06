@@ -144,6 +144,26 @@ def test_reversed_activity_is_unseen_until_rebooked_and_column_stays_unique(
             [booked, later], base, frozen_window, next_session(S)
         )[0]
     )
+    # #3014: a booking or rebook stated at S+1 is seen from S+1 on only, the
+    # ledger's `adjustment.session > through` cut; through S it is unseen (no base).
+    booked_later = replace(booked, session=next_session(S))
+    assert "cash-1" not in reconcile_run._seen_activities([booked_later], None, frozen_window, S)[0]
+    assert (
+        "cash-1"
+        in reconcile_run._seen_activities([booked_later], None, frozen_window, next_session(S))[0]
+    )
+    rebook_later = replace(
+        booked,
+        adjustment_id=84,
+        session=next_session(S),
+        broker_activity_id=None,
+        explanation_json=json.dumps({"rebooked_activity_id": "cash-1"}),
+        known_at=stamp + timedelta(seconds=3),
+        ingested_at=stamp + timedelta(seconds=3),
+    )
+    trio = [booked, reversed_row, rebook_later]
+    assert "cash-1" not in reconcile_run._seen_activities(trio, base, frozen_window, S)[0]
+    assert "cash-1" in reconcile_run._seen_activities(trio, base, frozen_window, next_session(S))[0]
     wrong_link = replace(
         reversed_row,
         explanation_json=json.dumps(

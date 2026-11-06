@@ -283,6 +283,11 @@ import polars as pl
 
 from tradepartner.calendar import all_sessions
 from tradepartner.config import Settings, get_settings, parse_accepted_jump
+from tradepartner.store.dividend_reviews import (
+    ReviewedGroup,
+    equal_amount_groups,
+    reviewed_groups,
+)
 from tradepartner.store.schema import RETRACTABLE_TABLES, has_retracted
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -347,6 +352,28 @@ _CHAINS_VIEW = "_asof_chains"
 #: successors whose own bars must stay hidden until their chain is known under
 #: (#821, T187b): their id and the first session their own later listings allow.
 _PRE_LISTING_VIEW = "_asof_pre_listing"
+
+#: Name of the temporary view `_dividend_gate_registered` exposes a gated
+#: dividend read's classed rows under (#3015): `security_id`,
+#: `source_action_id`, `ex_date`, `ratio_or_amount` and `gate`.
+_DIVIDEND_GATE_VIEW = "_asof_dividend_gate"
+
+#: The `gate` of a listed `duplicate`'s retract id while both ids are live
+#: (`pending`): the row is left out, so the payment applies once (#3015).
+_GATE_SKIP: Final = "skip"
+
+#: `dropped_dividends_as_of`'s `reason` (and the `gate`) of every identity of
+#: an equal-amount group the reviewed list does not explain (`violation`):
+#: left unapplied, never summed, under a gated read (#3015).
+UNEXPLAINED_DUPLICATE: Final = "unexplained_duplicate"
+
+_DIVIDEND_GATE_SCHEMA: Final[dict[str, Any]] = {
+    "security_id": pl.Utf8,
+    "source_action_id": pl.Utf8,
+    "ex_date": pl.Date,
+    "ratio_or_amount": pl.Float64,
+    "gate": pl.Utf8,
+}
 
 #: The successor-chain master table (#821, T187). A store below schema 31 has
 #: no such table and no chain; `live_chains` returns nothing there.
@@ -1676,6 +1703,7 @@ def _adjusted_ctes(
     chained: bool = False,
     hide: str = "",
     spin_offs: bool = False,
+    gated: bool = False,
 ) -> str:
     """The CTEs `adjusted_prices_as_of` shares between its validation query
     (checks `event_factor` before anything calls `LN()` on it) and its main
@@ -1703,7 +1731,25 @@ def _adjusted_ctes(
     with no child close has `ratio_or_amount` NULL and `drop_reason`
     `no_child_close`. `spin_ratio` and `child_close` carry r and C for
     `_raise_on_invalid_factor`.
+
+    `gated=True` (#3015) LEFT JOINs each dividend to `_DIVIDEND_GATE_VIEW`
+    (run inside `_dividend_gate_registered`): a `skip` row is left out and an
+    `unexplained_duplicate` row gets that `drop_reason` first. `False` builds
+    the ungated SQL unchanged.
     """
+    if gated:
+        gate_column = "\n                g.gate,"
+        gate_join = f"""
+            LEFT JOIN {_DIVIDEND_GATE_VIEW} g
+                ON la.action_type = 'dividend'
+                AND g.security_id = la.security_id
+                AND g.source_action_id = la.source_action_id
+                AND g.ex_date = la.ex_date
+                AND g.ratio_or_amount = la.ratio_or_amount"""
+        gate_where = f"\n            WHERE g.gate IS DISTINCT FROM '{_GATE_SKIP}'"
+        gate_case = f"WHEN gate = '{UNEXPLAINED_DUPLICATE}' THEN '{UNEXPLAINED_DUPLICATE}'"
+    else:
+        gate_column, gate_join, gate_where, gate_case = "", "", "", ""
     if chained:
         extra_join = (
             f"LEFT JOIN {_CHAINS_VIEW} pchain ON pchain.predecessor_id = a.source_action_id"
@@ -1823,6 +1869,7 @@ def _adjusted_ctes(
                 CASE WHEN la.action_type = 'spinoff'
                     THEN la.parent_key ELSE la.security_id END AS security_id,
                 la.security_id AS child_id,
+                la.source_action_id,
                 la.ex_date,
                 la.action_type,
                 CASE WHEN la.action_type = 'spinoff'
@@ -1861,12 +1908,12 @@ def _adjusted_ctes(
                 la.security_id,
                 la.ex_date,
                 la.action_type,
-                la.ratio_or_amount,{extra_cols}
+                la.ratio_or_amount,{extra_cols}{gate_column}
                 pb.session AS prior_session,
                 pb.close AS prior_close
-            FROM {action_source} la
+            FROM {action_source} la{gate_join}
             ASOF LEFT JOIN latest_bars pb
-                ON pb.security_id = la.security_id AND pb.session < la.ex_date
+                ON pb.security_id = la.security_id AND pb.session < la.ex_date{gate_where}
         ),
         calendar_bounds AS (
             SELECT MIN(session) AS first_session, MAX(session) AS last_session
@@ -1900,6 +1947,7 @@ def _adjusted_ctes(
                 *,
                 CASE WHEN action_type IN ('dividend', 'spinoff') THEN
                     CASE
+                        {gate_case}
                         {no_child}
                         WHEN prior_session IS NULL THEN 'no_prior_bar'
                         WHEN gap_sessions IS NULL THEN 'outside_calendar_range'
@@ -1939,6 +1987,7 @@ def _adjusted_params(
     include_dividends: bool,
     include_spin_offs: bool = False,
     chains: LiveChains | None = None,
+    gated: bool = False,
 ) -> tuple[str, list[Any]]:
     """`_adjusted_ctes`' SQL and its bind parameters, in placeholder order:
     `t` and the bars filter (`latest_bars`), `t`, the actions filter and
@@ -1987,6 +2036,7 @@ def _adjusted_params(
             chained=chained,
             hide=hide,
             spin_offs=include_spin_offs,
+            gated=gated,
         ),
         params,
     )
@@ -2033,6 +2083,66 @@ def _sessions_registered(
         conn.unregister(_SESSIONS_VIEW)
 
 
+def packaged_dividend_reviews() -> tuple[ReviewedGroup, ...]:
+    """The packaged reviewed list (`store.dividend_reviews.reviewed_groups`), the
+    `dividend_reviews` a total-return reader passes (#3015). A pure read of the
+    packaged file, exposed here so a reader allowed only the as-of API can gate on it."""
+    return reviewed_groups()
+
+
+def _dividend_gate(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None,
+    reviewed: Sequence[ReviewedGroup],
+) -> pl.DataFrame:
+    """The gated dividend rows of `security_ids` at `t` (#3015), one per row:
+    `equal_amount_groups` over the `dividend` rows `live_actions_as_of(conn,
+    t, security_ids)` returns and `reviewed`, exactly as health's
+    `duplicate_dividends` classes them. A `pending` group's retract id is
+    `skip` (the payment applies once, as the paper reconciliation counts
+    it); every identity of a `violation` group is `unexplained_duplicate`.
+    `accepted`, `unresolved` and `repaired` keys apply as stored and are not
+    returned. Only rows known at `t` are read, so a second identity known
+    later cannot gate the first before then. `t` must already be validated;
+    call it before `_chains_registered` (it registers the chains itself)."""
+    groups = equal_amount_groups(live_actions_as_of(conn, t, security_ids), reviewed)
+    rows: list[tuple[str, str, date, float, str]] = []
+    for group in groups:
+        if group.group_class == "pending" and group.reviewed is not None:
+            retract = group.reviewed.retract_source_action_id
+            rows.append((group.security_id, retract, group.ex_date, group.amount, _GATE_SKIP))
+        elif group.group_class == "violation":
+            rows.extend(
+                (
+                    group.security_id,
+                    identity.source_action_id,
+                    group.ex_date,
+                    group.amount,
+                    UNEXPLAINED_DUPLICATE,
+                )
+                for identity in group.identities
+            )
+    return pl.DataFrame(rows, schema=_DIVIDEND_GATE_SCHEMA, orient="row")
+
+
+@contextmanager
+def _dividend_gate_registered(
+    conn: duckdb.DuckDBPyConnection, gate: pl.DataFrame | None
+) -> Iterator[bool]:
+    """Expose `gate` to SQL as `_DIVIDEND_GATE_VIEW` for the block, then drop
+    it. Yields whether the reads must build the gated SQL: an absent or
+    empty gate registers nothing, and the ungated SQL reads the same rows."""
+    if gate is None or gate.is_empty():
+        yield False
+        return
+    conn.register(_DIVIDEND_GATE_VIEW, gate)
+    try:
+        yield True
+    finally:
+        conn.unregister(_DIVIDEND_GATE_VIEW)
+
+
 def adjusted_prices_as_of(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -2043,6 +2153,7 @@ def adjusted_prices_as_of(
     settings: Settings | None = None,
     traded_only: bool = False,
     sessions_from: date | None = None,
+    dividend_reviews: Sequence[ReviewedGroup] | None = None,
 ) -> pl.DataFrame:
     """`prices_as_of(conn, t, security_ids)`, with `open`/`high`/`low`/
     `close` adjusted for every split known by `t` with `ex_date <= t`
@@ -2088,6 +2199,18 @@ def adjusted_prices_as_of(
     unbounded frame's rows at or after the bound, row for row. `None` (the
     default) bounds nothing. Raises `TypeError` for a `datetime`: the bound is
     a session date, not a read time.
+
+    `dividend_reviews` (#3015; only read with `include_dividends=True`)
+    gates the dividends on the reviewed list, the rule health's
+    `duplicate_dividends` and the paper reconciliation apply: per
+    `(security_id, ex_date, amount)` known at `t`, a listed `duplicate` not
+    yet repaired applies once, a listed `distinct` or `unresolved` pair as
+    stored, and every identity of a group the list does not explain
+    (`violation`) is left unapplied, never summed as one payment or two;
+    `dropped_dividends_as_of(..., dividend_reviews=...)` reports those as
+    `unexplained_duplicate`. Only the names read are classed, so one bad
+    group never refuses or skews another name. `None` (the default) applies
+    every live row, as before.
     """
     t = _validate_t(t)
     if include_spin_offs and not include_dividends:
@@ -2097,7 +2220,15 @@ def adjusted_prices_as_of(
         )
     if isinstance(sessions_from, datetime):
         raise TypeError(f"sessions_from must be a session date, not a datetime: {sessions_from!r}")
-    with _chains_registered(conn, t) as chains:
+    gate = (
+        _dividend_gate(conn, t, security_ids, dividend_reviews)
+        if include_dividends and dividend_reviews is not None
+        else None
+    )
+    with (
+        _chains_registered(conn, t) as chains,
+        _dividend_gate_registered(conn, gate) as gated,
+    ):
         common_ctes, params = _adjusted_params(
             t,
             security_ids,
@@ -2105,6 +2236,7 @@ def adjusted_prices_as_of(
             include_dividends=include_dividends,
             include_spin_offs=include_spin_offs,
             chains=chains,
+            gated=gated,
         )
         with _sessions_registered(conn, include_dividends=include_dividends):
             _raise_on_invalid_factor(conn, common_ctes, params, spin_offs=include_spin_offs)
@@ -2208,6 +2340,7 @@ def dropped_dividends_as_of(
     security_ids: Sequence[str] | None = None,
     *,
     settings: Settings | None = None,
+    dividend_reviews: Sequence[ReviewedGroup] | None = None,
 ) -> pl.DataFrame:
     """Dividends known by `t` with `ex_date <= t` that `adjusted_prices_as_of(
     ..., include_dividends=True)` leaves unapplied because it has no usable
@@ -2224,7 +2357,11 @@ def dropped_dividends_as_of(
       max_prior_close_gap_sessions` XNYS sessions before the ex-date;
     - `"implausible_amount"` (#841): the amount is at or above
       `settings.adjust.max_dividend_to_prior_close` times the prior close
-      (bad source data, e.g. a preferred issue price on the common).
+      (bad source data, e.g. a preferred issue price on the common);
+    - `"unexplained_duplicate"` (#3015, only with `dividend_reviews`): one
+      identity of an equal-amount group the reviewed list does not explain,
+      which `adjusted_prices_as_of(..., dividend_reviews=...)` leaves
+      unapplied; checked first, so it is the reason whatever the prior close.
 
     For `health` to count; `settings` defaults to `get_settings()`.
     Raises `ValueError` on the same invalid data `adjusted_prices_as_of`
@@ -2232,9 +2369,17 @@ def dropped_dividends_as_of(
     what is a drop and what is bad data.
     """
     t = _validate_t(t)
-    with _chains_registered(conn, t) as chains:
+    gate = (
+        None
+        if dividend_reviews is None
+        else _dividend_gate(conn, t, security_ids, dividend_reviews)
+    )
+    with (
+        _chains_registered(conn, t) as chains,
+        _dividend_gate_registered(conn, gate) as gated,
+    ):
         common_ctes, params = _adjusted_params(
-            t, security_ids, settings, include_dividends=True, chains=chains
+            t, security_ids, settings, include_dividends=True, chains=chains, gated=gated
         )
         sql = f"""
             WITH {common_ctes}
