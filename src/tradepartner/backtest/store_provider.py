@@ -39,7 +39,8 @@ every `dropped_dividends` read passes the packaged reviewed list
 or not `health` ran first: a listed `duplicate` not yet repaired applies once, and an
 equal-amount group the list does not explain, on a name the read asks for, is left
 unapplied and reported by `dropped_dividends` as `unexplained_duplicate`, which the
-engine counts in the trial's `n_dropped_dividends` like any other dropped dividend.
+engine counts in the trial's `n_dropped_dividends` like any other dropped dividend
+(per record, so a held unexplained pair adds 2).
 
 **Frames** are the as-of functions' own frames, read with `traded_only=True`
 (#787): a zero-volume bar is missing, not a price, so it can be neither a
