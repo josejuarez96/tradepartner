@@ -1518,6 +1518,54 @@ def test_a_missing_effective_date_bar_gives_null(
     assert closes["TGT_CASH"] is None
 
 
+#: The chain overlay's 0001000010 -> 0001000011 pair (#821): its chain is known from
+#: `_CHAIN_KNOWN_AT`; only the successor has a bar on `_CHAIN_EFFECTIVE`.
+_CHAIN_EFFECTIVE = date(2020, 2, 6)
+
+
+def test_a_chained_predecessor_acquirer_reads_its_successors_close(
+    tmp_path: Path,
+) -> None:
+    """#2949: a merger naming a predecessor as its acquirer reads the close through the
+    chain known at `t` (the bar `prices_as_of` re-keys to the successor), keeping the
+    stored `acquirer_security_id`; before the chain is known the close is null."""
+    from lookahead.harness import PROBE_EPSILON
+
+    path = tmp_path / "chain_exits.duckdb"
+    settings = _settings(path)
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        load_universe_fixtures(conn, UNIVERSE_DIR)
+        load_chain_overlay(conn)
+        insert_row(
+            conn,
+            "mergers",
+            _merger_row(
+                "TGT_CHAIN",
+                "m-chain",
+                datetime(2020, 2, 7, 20, tzinfo=UTC),
+                acquirer="0001000010",
+                effective_date=_CHAIN_EFFECTIVE,
+                process_date=_CHAIN_EFFECTIVE,
+            ),
+        )
+    finally:
+        conn.close()
+    handle = _open_trial(settings, tmp_path)
+    with StoreProvider(_connect_to(settings), handle, settings) as provider:
+        before = provider.merger_exits(_CHAIN_KNOWN_AT - PROBE_EPSILON, ["TGT_CHAIN"])
+        known = provider.merger_exits(_CHAIN_KNOWN_AT, ["TGT_CHAIN"])
+    assert before.select("acquirer_security_id", "acquirer_raw_close").rows() == [
+        ("0001000010", None)
+    ]
+    assert known.select("acquirer_security_id", "acquirer_raw_close").rows() == [
+        ("0001000010", 19.74)
+    ]
+    assert known.columns == list(MERGER_EXIT_COLUMNS)
+
+
 def test_the_fake_answers_the_exit_reads_as_the_store(
     exit_store: tuple[Settings, registry.TrialHandle],
 ) -> None:
