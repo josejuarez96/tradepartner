@@ -649,11 +649,13 @@ def removal_paid_on(
 
     A removal is a `corporate_action_cash` row that removes shares (`quantity`
     below zero) and takes positive cash, keyed by no activity: an ended
-    listing's or a cash merger's. Its payment is the executed `MA`, `REORG` or
-    `VOF` credits tagged to the name's broker symbol and not inside the base;
-    the date is the latest of theirs, and only when they sum to the row's cash
-    within `tolerance`. Any other row, no such credit, or credits that are not
-    the removal's cash give None (fail closed: the caller keeps its session)."""
+    listing's or a `cash` merger's. A stock or stock-and-cash merger's removal
+    is never one (its `merger_receipt` is stated on the reconcile's session).
+    Its payment is the executed `MA`, `REORG` or `VOF` credits tagged to the
+    name's broker symbol and not inside the base; the date is the latest of
+    theirs, and only when they sum to the row's cash within `tolerance`. Any
+    other row, no such credit, or credits that are not the removal's cash give
+    None (fail closed: the caller keeps its session)."""
     if (
         adjustment.kind != "corporate_action_cash"
         or adjustment.broker_activity_id is not None
@@ -662,7 +664,13 @@ def removal_paid_on(
         or adjustment.quantity >= 0
         or adjustment.cash is None
         or adjustment.cash <= 0
+        or (adjustment.merger_terms or {}).get("merger_kind", "cash") != "cash"
     ):
+        return None
+    merger = explanations.mergers.get(adjustment.security_id)
+    if merger is not None and merger.kind != "cash":
+        # A stock merger's receipt stays on the reconcile's session: moving its
+        # removal alone would leave a session holding neither name.
         return None
     symbol = explanations.symbols.get(adjustment.security_id)
     if symbol is None:
