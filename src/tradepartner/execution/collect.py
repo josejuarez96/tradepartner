@@ -86,8 +86,8 @@ path's read, `paper resume`'s settlement). In order:
    raises `SystemFaultError` naming
    `fill_price_outside_band` (a rejection verdict of the call is named in the message),
    so the caller halts. The journal and the broker agree on a bad fill, so no
-   reconciliation can see it. `paper resume` and the halt path's read pass no band:
-   the owner looks at a resume, and the halt has already happened.
+   reconciliation can see it. Resume and the halt path's read use the same band;
+   a newly journaled bad fill refuses release or is named in the halt notes.
 
 Every clock reading is checked (ADR 0007 point 4): an exception, a
 non-`datetime` or a naive value becomes `ClockError`, and so does a write
