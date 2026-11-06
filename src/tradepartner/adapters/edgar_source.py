@@ -311,7 +311,11 @@ from tradepartner.adapters.accession_rows import (
     first_per_accession,
     issuer_delistings,
 )
-from tradepartner.adapters.daily_index import DailyIndexFile, daily_files_to_read
+from tradepartner.adapters.daily_index import (
+    DailyIndexFile,
+    daily_files_to_read,
+    parse_daily_body,
+)
 from tradepartner.adapters.edgar import (
     SEC_FORMS_PARSER_VERSION,
     CoverPageParse,
@@ -1468,14 +1472,7 @@ class EdgarFilingSource(FilingSource):
         body = path.read_bytes()
         if self.daily_index_keeper is not None:
             self.daily_index_keeper(file, path, body)  # kept before it is parsed
-        # `read_text`'s universal newlines, as before the keeper
-        text = body.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-        text = re.sub(
-            r"\b(\d{4})(\d{2})(\d{2})(?=\s+edgar/data/)",
-            r"\1-\2-\3",
-            text,
-        )
-        return parse_filing_index(text, {}).unstamped
+        return parse_daily_body(body)  # shared with the raw re-derive (T352)
 
     def _incremental_stamps(
         self, rows: Mapping[str, Mapping[str, tuple[UnstampedFiling, tuple[int, int]]]]

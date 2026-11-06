@@ -2944,6 +2944,36 @@ def test_archive_commands_refuse_when_the_archive_is_off(arch: _ArchiveRig) -> N
         assert "TRADEPARTNER_RAW_ARCHIVE" in result.output
 
 
+# --- archive rederive (plan T352, #2714) ------------------------------------------
+
+
+def test_archive_rederive_dry_run_reports_and_a_refusal_exits_non_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lookahead.rederive_rig import ACC, WRONG_SHARES, Rig
+
+    rig = Rig(tmp_path, monkeypatch)
+    rig.form4_run(wrong=WRONG_SHARES)
+    before = rig.table()
+
+    def run(*args: str) -> Any:
+        return _invoke(rig.settings, ["archive", "rederive", *args], icloud=lambda _s: rig.icloud)
+
+    dry = run("--mode", "backfill", "--accession", ACC)
+    assert dry.exit_code == 0, dry.output
+    assert "raw re-derive (dry run), mode backfill" in dry.output
+    assert "corrections 1" in dry.output and "shares" in dry.output
+    assert str(rig.root) not in dry.output  # no archive path, no account
+    assert rig.table() == before
+
+    real = run("--mode", "backfill", "--accession", ACC, "--release", "nope", "--expect", "1")
+    assert real.exit_code == 1
+    assert "rederive refused" in real.output and "no release is open" in real.output
+    assert run("--mode", "backfill").exit_code == 1  # nothing named
+    assert run("--mode", "backfill", "--file-date", "2026-13-01").exit_code == 2
+    assert rig.table() == before
+
+
 # --- ingest --statement-backfill (#2826, plan T365) --------------------------
 
 
