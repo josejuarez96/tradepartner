@@ -19,6 +19,7 @@ from lookahead.rederive_rig import (
     ACCEPTED,
     BULK_ACC,
     DAILY,
+    FETCHED,
     FILE_DATE,
     LOW,
     NOW,
@@ -32,7 +33,7 @@ from lookahead.rederive_rig import (
 
 from tradepartner.adapters.form4_archive import BULK_SOURCE, XML_SOURCE
 from tradepartner.store import raw_archive
-from tradepartner.store.db import insert_row, open_for_write
+from tradepartner.store.db import StoreLockedError, insert_row, open_for_write
 from tradepartner.store.raw_archive import (
     RawArchiveIntegrityError,
     RawArchiveMissingError,
@@ -53,6 +54,11 @@ def _run(rig: Rig, **kw: object) -> object:
     kw.setdefault("mode", "backfill")
     kw.setdefault("accessions", [ACC])
     return rederive(rig.settings, rig.icloud, clock=lambda: NOW, **kw)  # type: ignore[arg-type]
+
+
+def _digest(rig: Rig, **kw: object) -> str:
+    """The dry run's correction digest, which a write must name."""
+    return _run(rig, **kw).digest  # type: ignore[attr-defined, no-any-return]
 
 
 # --- dry run: the match ------------------------------------------------------------
@@ -178,6 +184,47 @@ def test_an_input_fetched_after_its_run_finished_fails(rig: Rig) -> None:
     _refused(rig, "fetched after run run-1")
 
 
+def test_an_xml_entry_with_no_fetch_time_fails(rig: Rig) -> None:
+    rig.form4_run(fetched_at=None, wrong=WRONG_SHARES)
+    _refused(rig, "has no fetch time")
+
+
+def test_a_daily_entry_with_no_fetch_time_fails(rig: Rig) -> None:
+    rig.index_run(wrong_name="ACME CORP.", fetched_at=None)
+    with pytest.raises(RederiveRefused, match="has no fetch time"):
+        rederive(
+            rig.settings, rig.icloud, mode="session", file_dates=[FILE_DATE], clock=lambda: NOW
+        )
+    assert rig.icloud.downloads == []
+
+
+def test_a_bulk_entry_with_no_fetch_time_maps_through_its_listed_zip(rig: Rig) -> None:
+    # A zip cached before T348 carries no fetch record; the run's own zips list,
+    # which also has no fetch time, names its quarter and hash.
+    rig.form4_run(
+        row_source=BULK_SOURCE,
+        body=bulk_zip(),
+        writer="edgar",
+        fetched_at=None,
+        wrong=WRONG_SHARES,
+    )
+    result = _run(rig)
+    assert [c.new for c in result.corrections] == [{"shares": Decimal("10000")}]  # type: ignore[attr-defined]
+
+
+def test_a_bulk_entry_with_no_fetch_time_whose_zip_has_one_fails(rig: Rig) -> None:
+    zipped = bulk_zip()
+    sha = hashlib.sha256(zipped).hexdigest()
+    rig.form4_run(
+        row_source=BULK_SOURCE,
+        body=zipped,
+        writer="edgar",
+        fetched_at=None,
+        zips=[{"quarter": "2026q1", "sha256": sha, "fetched_at": FETCHED.isoformat()}],
+    )
+    _refused(rig, "has no fetch time")
+
+
 def test_a_selection_with_no_stored_row_fails(rig: Rig) -> None:
     rig.form4_run()
     _refused(rig, "no Form 4 XML or bulk row", accessions=["0000000001-26-000001"])
@@ -208,6 +255,75 @@ def test_every_named_body_is_requested_before_any_parse_and_one_offline_fails_al
     assert parsed == []
 
 
+def _spy_downloads(rig: Rig, monkeypatch: pytest.MonkeyPatch, then: object = None) -> list[bool]:
+    """Wrap `download_inputs`: record whether the store's write lock was free while
+    it ran, then run `then(rig)` (a change between the passes)."""
+    real = raw_archive.download_inputs
+    free: list[bool] = []
+
+    def spy(*args: object, **kw: object) -> object:
+        try:
+            with open_for_write(rig.settings):
+                free.append(True)
+        except StoreLockedError:
+            free.append(False)
+        out = real(*args, **kw)  # type: ignore[arg-type]
+        if callable(then):
+            then(rig)
+        return out
+
+    monkeypatch.setattr(raw_archive, "download_inputs", spy)
+    return free
+
+
+@pytest.mark.parametrize("write", [False, True])
+def test_the_download_holds_no_store_connection(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, write: bool
+) -> None:
+    rig.form4_run(wrong=WRONG_SHARES)
+    rig.open_release()
+    digest = _digest(rig)
+    free = _spy_downloads(rig, monkeypatch)
+    kw: dict[str, object] = {"release": REL, "expect": 1, "expect_digest": digest} if write else {}
+
+    result = _run(rig, **kw)
+
+    assert free == [True]  # one download, with the lock free
+    assert len(result.corrections) == 1  # type: ignore[attr-defined]
+
+
+def test_a_body_evicted_after_the_download_fails_under_the_lock(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.form4_run(wrong=WRONG_SHARES)
+    rig.open_release()
+    before, runs, digest = rig.table(), rig.runs(), _digest(rig)
+    _spy_downloads(rig, monkeypatch, then=lambda r: r.icloud.offline.add(r.body_path(XML)))
+
+    with pytest.raises(RawArchiveOfflineError, match="not local"):
+        _run(rig, release=REL, expect=1, expect_digest=digest)
+
+    assert rig.table() == before and rig.runs() == runs
+
+
+def test_inputs_that_change_after_the_download_fail_under_the_lock(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.form4_run(wrong=WRONG_SHARES)
+    rig.open_release()
+    before, digest = rig.table(), _digest(rig)
+
+    def swap(r: Rig) -> None:  # another writer run, of other bytes, now claims the rows
+        r.form4_run(run_id="run-2", body=XML + b"\n", wrong=WRONG_SHARES, store=False)
+        with open_for_write(r.settings) as conn:
+            conn.execute("DELETE FROM ingestion_runs WHERE run_id = 'run-1'")
+
+    _spy_downloads(rig, monkeypatch, then=swap)
+    with pytest.raises(RederiveRefused, match="changed since the download"):
+        _run(rig, release=REL, expect=1, expect_digest=digest)
+    assert rig.table() == before
+
+
 def test_a_missing_body_fails_before_any_request(rig: Rig) -> None:
     rig.form4_run()
     rig.body_path(XML).unlink()  # the test removes it; the code never unlinks
@@ -235,10 +351,10 @@ def test_the_floor_is_checked_before_the_run(rig: Rig) -> None:
 def test_the_floor_is_checked_again_during_the_run(rig: Rig) -> None:
     rig.form4_run(wrong=WRONG_SHARES)
     rig.open_release()
-    before = rig.table()
+    before, digest = rig.table(), _digest(rig)
     disk = rig.disk(PLENTY, LOW)  # the preflight passes, the first parse step does not
     with pytest.raises(RawArchiveFloorError):
-        _run(rig, release=REL, expect=1)
+        _run(rig, release=REL, expect=1, expect_digest=digest)
     assert disk.calls == 2
     assert rig.table() == before
 
@@ -252,7 +368,7 @@ def test_a_correction_keeps_known_at_and_writes_a_repair_run_inside_the_release(
     rig.form4_run(wrong=WRONG_SHARES)
     rig.open_release()
 
-    result = _run(rig, release=REL, expect=1)
+    result = _run(rig, release=REL, expect=1, expect_digest=_digest(rig))
 
     assert len(result.corrections) == 1  # type: ignore[attr-defined]
     row = next(r for r in rig.table() if r["line_no"] == 0)
@@ -269,17 +385,48 @@ def test_a_correction_keeps_known_at_and_writes_a_repair_run_inside_the_release(
     assert set(again.runs) == {"run-1", run[0]}  # type: ignore[attr-defined]
 
 
-def test_a_write_needs_the_open_release_and_the_dry_run_count(rig: Rig) -> None:
+def test_a_write_needs_the_open_release_and_the_dry_run_count_and_digest(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
     rig.form4_run(wrong=WRONG_SHARES)
-    before = rig.table()
+    before, digest = rig.table(), _digest(rig)
+    downloads = _spy_downloads(rig, monkeypatch)
     with pytest.raises(RederiveRefused, match="pass expect"):
         _run(rig, release=REL)
+    with pytest.raises(RederiveRefused, match="pass expect"):
+        _run(rig, release=REL, expect=1)  # the count alone is not enough
     with pytest.raises(RederiveRefused, match="no release is open"):
-        _run(rig, release=REL, expect=1)
+        _run(rig, release=REL, expect=1, expect_digest=digest)
+    assert downloads == []  # a closed release is refused before any download
     rig.open_release()
     with pytest.raises(RederiveRefused, match="--expect is 2"):
-        _run(rig, release=REL, expect=2)
+        _run(rig, release=REL, expect=2, expect_digest=digest)
+    with pytest.raises(RederiveRefused, match="digest"):
+        _run(rig, release=REL, expect=1, expect_digest="0" * 12)
     assert rig.table() == before
+
+
+def test_the_digest_names_which_rows_and_values_not_just_how_many(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def digest(name: str, **kw: object) -> str:
+        rig = Rig(tmp_path / name, monkeypatch)
+        rig.form4_run(**kw)  # type: ignore[arg-type]
+        result = _run(rig)
+        assert len(result.corrections) == 1  # type: ignore[attr-defined]
+        assert f"digest {result.digest}" in "\n".join(result.lines())  # type: ignore[attr-defined]
+        return result.digest  # type: ignore[attr-defined, no-any-return]
+
+    one = digest("one", wrong=WRONG_SHARES)
+    assert len(one) == 12 and digest("again", wrong=WRONG_SHARES) == one
+    assert digest("line", wrong=WRONG_SHARES, wrong_line=1) != one  # another row
+    assert digest("old", wrong={"shares": Decimal("998")}) != one  # another stored value
+
+
+def test_expect_digest_without_a_release_is_refused(rig: Rig) -> None:
+    rig.form4_run()
+    with pytest.raises(RederiveRefused, match="--expect-digest needs --release"):
+        _run(rig, expect_digest="0" * 12)
 
 
 def test_a_never_true_row_an_open_window_read_is_refused(rig: Rig) -> None:
@@ -291,7 +438,7 @@ def test_a_never_true_row_an_open_window_read_is_refused(rig: Rig) -> None:
     dry = _run(rig)
     assert len(dry.refused) == 1 and "open paper window" in dry.refused[0]  # type: ignore[attr-defined]
     with pytest.raises(RederiveRefused, match="open paper window"):
-        _run(rig, release=REL, expect=1)
+        _run(rig, release=REL, expect=1, expect_digest=dry.digest)  # type: ignore[attr-defined]
     assert rig.table() == before
 
 
