@@ -4736,6 +4736,47 @@ def make_app(
         for line in lines:
             _echo_scrubbed(line, s)
 
+    @archive_app.command("rederive")
+    def archive_rederive(
+        mode: Annotated[str, typer.Option("--mode", help="the writer runs' mode, e.g. backfill")],
+        accession: Annotated[
+            list[str] | None, typer.Option("--accession", help="a Form 4 accession (repeatable)")
+        ] = None,
+        file_date: Annotated[
+            list[str] | None,
+            typer.Option("--file-date", help="a daily index file date, YYYY-MM-DD (repeatable)"),
+        ] = None,
+        release: Annotated[
+            str | None,
+            typer.Option("--release", help="write inside this open data release (else a dry run)"),
+        ] = None,
+        expect: Annotated[
+            int | None, typer.Option("--expect", help="the dry run's correction count")
+        ] = None,
+    ) -> None:
+        """Re-parse the archived raw bodies behind the named rows and correct what a parser
+        mistake left wrong, keeping each row's known_at. A dry run unless `--release` (with
+        `--expect`). Reads only the raw archive, never SEC."""
+        s = settings()
+        try:
+            days = [date.fromisoformat(d) for d in file_date or ()]
+        except ValueError as exc:
+            raise _fail(f"rederive refused: --file-date {exc}", 2) from None
+        try:
+            lines = archive_cmd.rederive(
+                s,
+                icloud(s),
+                mode=mode,
+                accessions=accession or [],
+                file_dates=days,
+                release=release,
+                expect=expect,
+            )
+        except archive_cmd.REFUSALS as exc:
+            raise _fail(_scrubbed(f"rederive refused: {_describe(exc)}", s), 1) from None
+        for line in lines:
+            _echo_scrubbed(line, s)
+
     dataset_app = typer.Typer(no_args_is_help=True, help="Register research datasets.")
     app.add_typer(dataset_app, name="dataset")
 

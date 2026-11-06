@@ -351,6 +351,11 @@ class EdgarConfig(BaseModel):
     # nothing cached for the failed filing, and the run goes on; past this
     # share of the CIKs asked, `check_failures` fails the run (an outage).
     filename_fetch_max_failed_share: float = Field(default=0.02, ge=0, lt=1)
+    # #2934: this many CIKs in a row whose filing-name fetch failed past the
+    # retries (each CIK sent a fetch; a fully cached one is no evidence) is an
+    # SEC outage: the pass stops and fails the run there, instead of retrying
+    # every remaining CIK before `check_failures` fails it at the end.
+    filename_fetch_outage_ciks: int = Field(default=20, ge=1)
     # (CIK, ticker) spans whose `filing_name` rows the run derives no more
     # and `master-retract --release` withdraws: the amendment's rule for a
     # collision the Alpaca backfill counted. Default empty. A malformed

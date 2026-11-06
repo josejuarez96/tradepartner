@@ -927,6 +927,26 @@ def test_completed_index_seed_routes_full_rebuild_to_table(
         stale_repair.filing_index()
 
 
+def test_statement_backfill_row_does_not_freshen_index_seed(tmp_path: Path) -> None:
+    """#2924: a statement backfill's `ok` row reads no index, so it is not a seed."""
+    base = edgar_settings(tmp_path)
+    settings = base.model_copy(
+        update={"store": base.store.model_copy(update={"path": str(tmp_path / "store.duckdb")})}
+    )
+    conn = duckdb.connect(settings.store.path)
+    schema.init_schema(conn)
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, started_at, status, mode) VALUES "
+        "('seed', 'edgar_index', ?, 'ok', 'rebuild'), "
+        "('backfill', 'edgar_index', ?, 'ok', 'statement_backfill')",
+        [CLOCK - timedelta(days=1), CLOCK],
+    )
+    conn.close()
+    repair = EdgarFilingSource(settings, clock=lambda: CLOCK, prefer_stored_index=True)
+    with pytest.raises(RuntimeError, match="stored filing index is stale"):
+        repair.filing_index()
+
+
 def test_table_delisting_fetches_missing_stamp_metadata(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3834,6 +3854,64 @@ def test_filename_fetch_share_counts_only_ciks_that_sent_a_fetch(tmp_path: Path)
     cached = _fn_source(tmp_path, router)
     cached.filename_listings(_FN_CIK)
     assert cached._filename_ciks_asked == set()
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_filename_fetch_stops_after_consecutive_failed_ciks(tmp_path: Path, workers: int) -> None:
+    """#2934: in a full SEC outage the pass stops once
+    `edgar.filename_fetch_outage_ciks` CIKs in a row failed past the
+    retries, instead of retrying every remaining CIK; the raise fails the
+    run closed, naming the outage. Each call here is one more failed CIK."""
+    router = _fn_router()
+    router.add(_fn_url(_FN_C, "index.json"), 503)
+    source = _fn_source(
+        tmp_path,
+        router,
+        filename_fetch_workers=workers,
+        retry_max_attempts=1,
+        filename_fetch_outage_ciks=3,
+    )
+    assert source.filename_listings(_FN_CIK) == []
+    assert source.filename_listings(_FN_CIK) == []
+    with pytest.raises(
+        edgar_source_module.FilenameFetchOutageError,
+        match=r"3 CIKs in a row.*edgar\.filename_fetch_outage_ciks.*HTTPStatusError",
+    ):
+        source.filename_listings(_FN_CIK)
+    assert source.filename_incomplete_ciks == {_FN_CIK}
+    stored = json.loads((tmp_path / "cache" / "filename" / "v1" / f"{_FN_CIK}.json").read_text())
+    assert _FN_C not in stored["records"]  # the failed filing stays uncached
+
+
+def test_filename_fetch_outage_streak_resets_on_an_answer(tmp_path: Path) -> None:
+    """A CIK whose fetch answers ends the streak; a fully cached CIK sends
+    nothing and leaves it as it is (it is no evidence either way)."""
+    down = [True]
+    router = _fn_router()
+    url = _fn_url(_FN_C, "index.json")
+    healthy = router._routes[url]
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        if down[0]:
+            return httpx.Response(503, request=request)
+        return cast(httpx.Response, healthy(request))
+
+    router.add(url, flaky)
+    source = _fn_source(tmp_path, router, retry_max_attempts=1, filename_fetch_outage_ciks=2)
+    source.filename_listings(_FN_CIK)
+    assert source._filename_failed_streak == 1
+    down[0] = False
+    source.filename_listings(_FN_CIK)
+    assert source._filename_failed_streak == 0
+    source._filename_failed_streak = 1
+    source.filename_listings(_FN_CIK)  # fully cached now: nothing sent
+    assert source._filename_failed_streak == 1
+
+
+def test_filename_fetch_outage_ciks_defaults_and_refuses_zero() -> None:
+    assert Settings(_env_file=None).edgar.filename_fetch_outage_ciks == 20
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, edgar={"filename_fetch_outage_ciks": 0})
 
 
 def _done(result: Any = None, error: BaseException | None = None) -> Any:

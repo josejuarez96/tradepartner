@@ -102,6 +102,7 @@ EXCLUDED_SETTINGS_KEYS = (
     "edgar.statement_backfill_chunk_ciks",  # T365: chunk size, not a derivation rule.
     "edgar.filename_fetch_workers",  # #2932: fetch concurrency, not a derivation rule.
     "edgar.filename_fetch_max_failed_share",  # #2932: a failure threshold.
+    "edgar.filename_fetch_outage_ciks",  # #2934: a failure threshold.
     # #2994: the Form 4 writer is not a builder this fingerprint guards, so its rule 5
     # and multi-owner routing keys do not move the build hash.
     "events.form4_multi_owner_xml",
