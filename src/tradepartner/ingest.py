@@ -3832,6 +3832,18 @@ def _write_form4_bulk(
             "events.form4_compare_threshold needs the raw archive: its review markers "
             "live in the writer's provenance manifest"
         )
+    bulk_trusted = sorted(
+        name for name, src in settings.events.form4_compare_trusted.items() if src == "bulk"
+    )
+    if settings.events.form4_compare_threshold is not None and bulk_trusted:
+        # #2994: such a row would be stored as `sec_form4_xml` under the XML body's hash,
+        # which no re-derive from the kept XML reproduces; refused until provenance can
+        # name a mixed row.
+        raise ValueError(
+            f"events.form4_compare_trusted has fields trusted to the bulk set {bulk_trusted}; "
+            "with events.form4_compare_threshold set their rows would be stored under the "
+            "XML's provenance (#2994), so the Form 4 step refuses them"
+        )
     previous = getattr(source, "form4_xml_keeper", None)
     source.form4_xml_keeper = None if provenance is None else provenance.keep_xml
     try:
@@ -4327,6 +4339,17 @@ def _form4_bulk(
             provenance.set_markers(
                 {accession}, marker_entries(accession, label, digests.get(quarter), found)
             )
+        # A marked accession compared again this run that now agrees is resolved
+        # (#2994); one never compared again keeps its carried marker.
+        resolved = sorted((marked & rule5.compared) - rule5.found.keys())
+        for accession in resolved:
+            quarter = accession_quarters[accession]
+            label = f"{quarter.year}q{quarter.number}"
+            provenance.set_markers(
+                {accession}, marker_entries(accession, label, digests.get(quarter), ())
+            )
+        if resolved:
+            counts["sec_forms_compare_marker_resolved"] = len(resolved)
     if rule5.tally.outcome(rule5.declaration.threshold) is Outcome.AT_OR_ABOVE and rule5.enforcing:
         link = ""
         unresolved = 0
