@@ -4753,10 +4753,13 @@ def make_app(
         expect: Annotated[
             int | None, typer.Option("--expect", help="the dry run's correction count")
         ] = None,
+        expect_digest: Annotated[
+            str | None, typer.Option("--expect-digest", help="the dry run's correction digest")
+        ] = None,
     ) -> None:
         """Re-parse the archived raw bodies behind the named rows and correct what a parser
         mistake left wrong, keeping each row's known_at. A dry run unless `--release` (with
-        `--expect`). Reads only the raw archive, never SEC."""
+        `--expect` and `--expect-digest`). Reads only the raw archive, never SEC."""
         s = settings()
         try:
             days = [date.fromisoformat(d) for d in file_date or ()]
@@ -4771,6 +4774,7 @@ def make_app(
                 file_dates=days,
                 release=release,
                 expect=expect,
+                expect_digest=expect_digest,
             )
         except archive_cmd.REFUSALS as exc:
             raise _fail(_scrubbed(f"rederive refused: {_describe(exc)}", s), 1) from None
