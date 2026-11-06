@@ -809,6 +809,15 @@ class BookExecution(BaseModel):
     with `alternate`, refused otherwise; `execution_for` checks it is an XNYS session.
     `cash_sleeve_fraction` is c in [0, 0.10]. `auction`: `none`, or `opening` (refused
     until T376 lands; `closing` is not offered).
+    `submit_at` (paper spec amendment 2026-11-03 items 1, 2 and 4, T377): `open`
+    (today's window) or `midsession`, whose window is [open(S) +
+    `midsession_start_minutes_after_open`, that + `midsession_window_minutes`] from
+    the session's own open (`buy_timing.submit_window_for`). A `midsession` book has
+    no phase (i'), no V1 arm and no auction: it is refused with `buy_timing` other than
+    `after_sells`, `auction` other than `none` or c above 0, and its window must start
+    at least 30 minutes after the open and end at most 180 minutes after it (before
+    any close). The length floor reads `paper.sell_wait_seconds`, so
+    `PaperConfig` checks it. The window keys are read only on a `midsession` book.
     A book absent from `PaperConfig.execution` behaves as the defaults.
     """
 
@@ -818,9 +827,14 @@ class BookExecution(BaseModel):
     alternate_start: date | None = None
     cash_sleeve_fraction: float = Field(default=0.0, ge=0, le=0.10)
     auction: Literal["none", "opening"] = "none"
+    submit_at: Literal["open", "midsession"] = "open"
+    midsession_start_minutes_after_open: int = Field(default=60, ge=0)
+    midsession_window_minutes: int = Field(default=60, gt=0)
 
     @model_validator(mode="after")
     def _validate_execution(self) -> BookExecution:
+        if self.submit_at == "midsession":
+            self._validate_midsession()
         if self.buy_timing == "alternate":
             if self.alternate_start is None:
                 raise ValueError("buy_timing 'alternate' requires alternate_start")
@@ -834,6 +848,48 @@ class BookExecution(BaseModel):
                 "(paper spec amendment 2026-11-01 item 4)"
             )
         return self
+
+    def _validate_midsession(self) -> None:
+        """Item 4's arm and tranche refusals and item 2's window bounds (the length
+        floor is `PaperConfig`'s)."""
+        if self.buy_timing != "after_sells":
+            raise ValueError(
+                f"submit_at 'midsession' requires buy_timing 'after_sells', got "
+                f"{self.buy_timing!r} (a mid-session book has no V1 arm)"
+            )
+        if self.auction != "none":
+            raise ValueError(
+                f"submit_at 'midsession' requires auction 'none', got {self.auction!r}"
+            )
+        if self.cash_sleeve_fraction > 0:
+            raise ValueError(
+                "submit_at 'midsession' requires cash_sleeve_fraction 0 (the sleeve funds "
+                f"phase (i'), which a mid-session book has not), got {self.cash_sleeve_fraction}"
+            )
+        start = self.midsession_start_minutes_after_open
+        if start < MIDSESSION_MIN_START_MINUTES:
+            raise ValueError(
+                f"midsession_start_minutes_after_open ({start}) must be at least "
+                f"{MIDSESSION_MIN_START_MINUTES}: never inside the opening half hour"
+            )
+        end = start + self.midsession_window_minutes
+        if end > MIDSESSION_MAX_END_MINUTES:
+            raise ValueError(
+                f"midsession_start_minutes_after_open + midsession_window_minutes ({end}) "
+                f"must not exceed {MIDSESSION_MAX_END_MINUTES}: the window ends before any close"
+            )
+
+
+#: Paper spec amendment 2026-11-03 item 2: a mid-session window starts at least this
+#: long after the open, ends at most this long after it (12:30 ET, 30 minutes before
+#: the earliest scheduled close), and the latest batch start leaves this margin past
+#: the sells' wait (item 1). Spec bounds, not tuning knobs.
+MIDSESSION_MIN_START_MINUTES = 30
+MIDSESSION_MAX_END_MINUTES = 180
+MIDSESSION_LATEST_START_MARGIN_MINUTES = 10
+#: The length floor's slack over the sells' wait: the latest start falls at least
+#: this minus the margin (15 minutes) after the window opens.
+MIDSESSION_MIN_LENGTH_SLACK_MINUTES = 25
 
 
 _BOOK_TOKEN = re.compile(r"^[A-Za-z0-9]+$")
@@ -928,6 +984,21 @@ class PaperConfig(BaseModel):
         if bad:
             raise ValueError(f"paper.execution keys must be book tokens ^[A-Za-z0-9]+$, got {bad}")
         return value
+
+    @model_validator(mode="after")
+    def _validate_midsession_length(self) -> PaperConfig:
+        """Item 2: a `midsession` book's window is at least `sell_wait_seconds` / 60 +
+        25 minutes long, so its latest batch start is never before its window opens."""
+        floor = self.sell_wait_seconds / 60 + MIDSESSION_MIN_LENGTH_SLACK_MINUTES
+        for book, ex in sorted(self.execution.items()):
+            if ex.submit_at == "midsession" and ex.midsession_window_minutes < floor:
+                raise ValueError(
+                    f"paper.execution[{book!r}].midsession_window_minutes "
+                    f"({ex.midsession_window_minutes}) must be at least sell_wait_seconds / 60 "
+                    f"+ {MIDSESSION_MIN_LENGTH_SLACK_MINUTES} ({floor:g}), or no batch could "
+                    "start inside the window"
+                )
+        return self
 
     @field_validator("min_rebalances")
     @classmethod

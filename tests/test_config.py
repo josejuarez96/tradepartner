@@ -3782,3 +3782,94 @@ def test_paper_execution_valid_alternate_accepted() -> None:
         }
     )
     assert s.paper.execution["daily"].alternate_start == date(2026, 11, 23)
+
+
+# --- the mid-session submit window (paper spec amendment 2026-11-03 items 1, 2, 4, T377) ---
+
+
+def test_book_execution_submit_at_defaults() -> None:
+    ex = Settings(_env_file=None).paper.execution.get("daily")
+    assert ex is None
+    entry = Settings(
+        _env_file=None,
+        paper={"execution": {"daily": {}}},  # type: ignore[arg-type]
+    ).paper.execution["daily"]
+    assert entry.submit_at == "open"
+    assert entry.midsession_start_minutes_after_open == 60
+    assert entry.midsession_window_minutes == 60
+
+
+def test_a_midsession_entry_with_the_default_window_is_accepted() -> None:
+    s = Settings(_env_file=None, paper={"execution": {"daily": {"submit_at": "midsession"}}})  # type: ignore[arg-type]
+    assert s.paper.execution["daily"].submit_at == "midsession"
+
+
+@pytest.mark.parametrize(
+    ("entry", "match"),
+    [
+        pytest.param({"buy_timing": "at_open"}, "after_sells", id="at_open"),
+        pytest.param(
+            {"buy_timing": "alternate", "alternate_start": "2026-11-23"},
+            "after_sells",
+            id="alternate",
+        ),
+        pytest.param({"auction": "opening"}, "auction", id="auction"),
+        pytest.param({"cash_sleeve_fraction": 0.01}, "cash_sleeve_fraction", id="sleeve"),
+        pytest.param({"midsession_start_minutes_after_open": 29}, "30", id="start-under-30"),
+        pytest.param(
+            {"midsession_start_minutes_after_open": 121, "midsession_window_minutes": 60},
+            "180",
+            id="ends-after-180",
+        ),
+        pytest.param({"midsession_window_minutes": 39}, "sell_wait_seconds", id="short"),
+    ],
+)
+def test_a_midsession_entry_is_refused(entry: dict[str, object], match: str) -> None:
+    with pytest.raises(ValidationError, match=match):
+        Settings(
+            _env_file=None,
+            paper={"execution": {"daily": {"submit_at": "midsession", **entry}}},  # type: ignore[arg-type]
+        )
+
+
+def test_the_midsession_bounds_are_inclusive() -> None:
+    s = Settings(
+        _env_file=None,
+        paper={  # type: ignore[arg-type]
+            "execution": {
+                "daily": {
+                    "submit_at": "midsession",
+                    "midsession_start_minutes_after_open": 30,
+                    "midsession_window_minutes": 150,
+                },
+                "other": {"submit_at": "midsession", "midsession_window_minutes": 40},
+            }
+        },
+    )
+    assert s.paper.execution["other"].midsession_window_minutes == 40
+
+
+def test_the_window_length_floor_reads_the_sell_wait() -> None:
+    """Length >= `paper.sell_wait_seconds` / 60 + 25, on `PaperConfig`: with a 30-minute
+    sell wait a 54-minute window leaves no latest-start interval and is refused."""
+    entry = {"submit_at": "midsession", "midsession_window_minutes": 54}
+    with pytest.raises(ValidationError, match="sell_wait_seconds"):
+        Settings(_env_file=None, paper={"sell_wait_seconds": 1800, "execution": {"daily": entry}})  # type: ignore[arg-type]
+    ok = {**entry, "midsession_window_minutes": 55}
+    s = Settings(_env_file=None, paper={"sell_wait_seconds": 1800, "execution": {"daily": ok}})  # type: ignore[arg-type]
+    assert s.paper.execution["daily"].midsession_window_minutes == 55
+
+
+def test_an_open_book_ignores_the_midsession_keys_bounds() -> None:
+    """The window keys are read only by a `midsession` book; a book at `open` keeps
+    today's window whatever they hold, so they are not bounded there."""
+    s = Settings(
+        _env_file=None,
+        paper={"execution": {"main": {"midsession_window_minutes": 10}}},  # type: ignore[arg-type]
+    )
+    assert s.paper.execution["main"].submit_at == "open"
+
+
+def test_submit_at_closing_is_not_offered() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, paper={"execution": {"daily": {"submit_at": "close"}}})  # type: ignore[arg-type]
