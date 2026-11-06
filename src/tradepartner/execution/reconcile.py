@@ -641,6 +641,58 @@ def _place_cash_in_lieu(
     return None, proposal
 
 
+def removal_paid_on(
+    adjustment: ProposedAdjustment, explanations: Explanations, tolerance: float
+) -> date | None:
+    """The date the broker paid a cash removal (#2722, owner decision 2026-10-31),
+    or None when the activities do not evidence one.
+
+    A removal is a `corporate_action_cash` row that removes shares (`quantity`
+    below zero) and takes positive cash, keyed by no activity: an ended
+    listing's or a `cash` merger's. A stock or stock-and-cash merger's removal
+    is never one (its `merger_receipt` is stated on the reconcile's session).
+    Its payment is the executed `MA`, `REORG` or `VOF` credits tagged to the
+    name's broker symbol and not inside the base; the date is the latest of
+    theirs, and only when they sum to the row's cash within `tolerance`. Any
+    other row, no such credit, or credits that are not the removal's cash give
+    None (fail closed: the caller keeps its session)."""
+    if (
+        adjustment.kind != "corporate_action_cash"
+        or adjustment.broker_activity_id is not None
+        or adjustment.security_id is None
+        or adjustment.quantity is None
+        or adjustment.quantity >= 0
+        or adjustment.cash is None
+        or adjustment.cash <= 0
+        or (adjustment.merger_terms or {}).get("merger_kind", "cash") != "cash"
+    ):
+        return None
+    merger = explanations.mergers.get(adjustment.security_id)
+    if merger is not None and merger.kind != "cash":
+        # A stock merger's receipt stays on the reconcile's session: moving its
+        # removal alone would leave a session holding neither name.
+        return None
+    symbol = explanations.symbols.get(adjustment.security_id)
+    if symbol is None:
+        return None
+    credits = [
+        a
+        for a in explanations.activities
+        if a.symbol == symbol
+        and a.activity_type in _DELISTING_CASH_TYPES
+        and a.status == _EXECUTED
+        and a.net_amount is not None
+        and a.net_amount > 0
+        and not _inside_base(a, explanations)
+    ]
+    if not credits:
+        return None
+    paid = Decimal(str(math.fsum(a.net_amount or 0.0 for a in credits)))
+    if abs(paid - Decimal(str(adjustment.cash))) > Decimal(str(tolerance)):
+        return None
+    return max(a.date for a in credits)
+
+
 #: The `Allowed.reason` of a delisted holding whose cash did not arrive within
 #: its window (#411). It is recorded once, on the first completed reconciliation
 #: after the window, and never halts.

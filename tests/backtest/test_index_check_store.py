@@ -166,6 +166,23 @@ def test_a_planted_duplicate_dividend_is_dup_dividend(open_store: Settings) -> N
     assert "dividend=0.1" in flags
 
 
+def test_an_unexplained_duplicate_is_left_out_of_the_return(open_store: Settings) -> None:
+    """#3015: the index check's total-return frame is gated on the reviewed list, so an
+    unlisted equal-amount pair is never summed twice; it is dropped, and flagged so."""
+    known = datetime(2019, 7, 12, 20, tzinfo=UTC)
+    before = run(open_store, JULY, JULY)
+    with writer(open_store) as conn:
+        for source in ("div-a", "div-b"):
+            insert_row(
+                conn,
+                "corporate_actions",
+                action("SEC_DUAL_A", "dividend", date(2019, 7, 15), 0.1, source, known),
+            )
+    after = names(run(open_store, JULY, JULY), JULY)["DUALA"]
+    assert "dropped_dividend" in after.flags
+    assert after.row == names(before, JULY)["DUALA"].row
+
+
 def test_a_single_dividend_is_not_a_duplicate(open_store: Settings) -> None:
     with writer(open_store) as conn:
         insert_row(
