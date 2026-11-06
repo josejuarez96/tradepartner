@@ -5098,7 +5098,7 @@ def test_the_splice_bound_comes_from_config(
     spliced_store: duckdb.DuckDBPyConnection, splice_settings: Settings
 ) -> None:
     loose = splice_settings.model_copy(
-        update={"master": splice_settings.master.model_copy(update={"splice_max_price_ratio": 1.1})}
+        update={"health": splice_settings.health.model_copy(update={"splice_max_price_ratio": 1.1})}
     )
     found = health.spliced_series(spliced_store, _SPLICED_RUN, loose)
     assert found.frame["security_id"].to_list() == ["GPOR", "QUIET"]

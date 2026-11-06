@@ -68,7 +68,7 @@ here is this module's and is stated once:
 - **Spliced series** (`spliced_series`, #3056): each security's consecutive
   traded bars known at `t` (latest revision, volume above zero) with more
   than `master.transfer_window_sessions` XNYS sessions strictly between
-  them and a close ratio above `master.splice_max_price_ratio` or below
+  them and a close ratio above `health.splice_max_price_ratio` or below
   its inverse: another equity's prints chained onto the id at a ticker or
   chain hand-over (post-bankruptcy equity on the old company's series:
   GPOR, CBL, WW). One row per gap, raw ids (never re-keyed by a chain).
@@ -895,7 +895,7 @@ def spliced_series(
     `ValueError`."""
     t = _validate_t(t)
     window = settings.master.transfer_window_sessions
-    maximum = settings.master.splice_max_price_ratio
+    maximum = settings.health.splice_max_price_ratio
     sessions = pl.DataFrame(
         {"session": list(all_sessions())}, schema={"session": pl.Date}
     ).with_row_index("idx")
