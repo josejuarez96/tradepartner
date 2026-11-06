@@ -43,6 +43,7 @@ def test_a_later_fetch_is_never_an_earlier_rows_input(
         at=LATER,
     )
     rig.open_release()
+    dry = rederive(rig.settings, rig.icloud, mode="backfill", accessions=[ACC], clock=lambda: NOW)
 
     result = rederive(
         rig.settings,
@@ -51,6 +52,7 @@ def test_a_later_fetch_is_never_an_earlier_rows_input(
         accessions=[ACC],
         release="rederive-2714",
         expect=1,
+        expect_digest=dry.digest,
         clock=lambda: NOW,
     )
 

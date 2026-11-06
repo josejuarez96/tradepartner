@@ -131,7 +131,11 @@ as_of`:
   check never runs beside one), or named the merger's due: that one checks the
   due once. A reconciliation row's session is `command_session` of
   its `at`. When one acquiree has several open ids, the latest
-  `effective_date` (then id) is passed. The acquirers join the names mapped to
+  `effective_date` (then id) is passed. An acquirer that is a chained
+  predecessor in a chain known at close(S-1) is read as its successor (#821,
+  #3009): `prices_as_of` keys its bars under the successor, whose listing holds
+  its ticker, so its receipt and reference price are the successor's; a chain
+  known only later is not followed. The acquirers join the names mapped to
   broker symbols. Two ids for one acquiree and one `effective_date`
   (`merger_conflict`) are never passed: the first reconciliation that knows
   both, while either is open or has rows journaled, raises the pair in
@@ -220,6 +224,7 @@ from tradepartner.execution.symbols import broker_symbol
 from tradepartner.store import registry
 from tradepartner.store.asof import (
     live_actions_as_of,
+    live_chains,
     mergers_as_of,
     prices_as_of,
     spinoff_allocations_as_of,
@@ -1365,7 +1370,19 @@ def _mergers(
     explains nothing at S. `ledger` is the ledger stated through S."""
     cut = _cut(session)
     frame = mergers_as_of(conn, cut, sorted(names))
-    rows = [r for r in frame.iter_rows(named=True) if r["security_id"] in names]
+    # A chained predecessor acquirer is read as its successor (#3009): only the
+    # chains known at the cut, so a later chain explains nothing at S.
+    chains = dict(live_chains(conn, cut))
+    rows = [
+        {
+            **r,
+            "acquirer_security_id": chains.get(
+                r["acquirer_security_id"], r["acquirer_security_id"]
+            ),
+        }
+        for r in frame.iter_rows(named=True)
+        if r["security_id"] in names
+    ]
     acquirers = {
         str(r["acquirer_security_id"]) for r in rows if r["acquirer_security_id"] is not None
     }
