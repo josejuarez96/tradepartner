@@ -48,7 +48,9 @@ symbol to differ in its direction by up to its quantity (a notional order's at
 the buffered reference price) and cash by up to its notional (a quantity
 order's at quantity x reference price x (1 + `risk.whole_share_price_buffer`)).
 Allowances add up per symbol and for cash; each keeps the tolerance; every
-difference an allowance absorbs is listed under `allowed`.
+difference an allowance absorbs is listed under `allowed`. Each lagging order
+counts as one fill in the cash bound (`_cash_bound`, #2996), as a journaled
+fill does: the broker books an uncollected fill's cash to the cent too.
 
 **Explanations** (all read by the caller from rows known at close(S-1)):
 
@@ -731,7 +733,6 @@ def compare(
     cash_tol = frozen.reconcile_cash_tolerance
     cash_in_lieu_tolerance = frozen.cash_in_lieu_tolerance
     buffer = frozen.whole_share_price_buffer
-    cash_bound = _cash_bound(cash_tol, ledger.fills_since_base)
     exhaustive_dues = frozen.reconcile_dividend_exhaustive_dues
     max_states = frozen.reconcile_dividend_subset_states
     _validate(ledger, positions, account, explanations)
@@ -797,6 +798,12 @@ def compare(
             cash_band.widen(-sign * notional)
 
     mismatches += _order_mismatches(open_orders, lagging, order_id_prefix)
+    # A lagging order's fills are the broker's, each booked to the cent like a
+    # journaled one, so each lagging order counts as (at least) one fill in the
+    # bound (#2996): a bare `paper reconcile` after a stop run's sells fill, before
+    # any collector journals them, otherwise holds every uncollected fill's
+    # rounding to the zero-fill bound. A lagging result never re-bases.
+    cash_bound = _cash_bound(cash_tol, ledger.fills_since_base + len(lagging_ids))
 
     expected = dict(ledger.positions)
     # A short is signed negative here, so the broker's negative quantity compares

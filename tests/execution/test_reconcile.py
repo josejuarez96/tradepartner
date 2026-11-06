@@ -1173,6 +1173,62 @@ def test_a_lagging_sell_allows_more_cash_and_fewer_shares() -> None:
     assert sorted(_kinds(wrong_way)) == ["cash", "quantity"]
 
 
+def _lagging_sells(count: int) -> list[JournalOpenOrder]:
+    """`count` uncollected sells of 1 SEC_A share each, filled at 100."""
+    items = []
+    for n in range(1, count + 1):
+        row = _order_row(f"tp-20261007-SEC_A-sell-{n}", "SEC_A", "sell", quantity=1.0)
+        items.append(
+            JournalOpenOrder(
+                row,
+                pending=False,
+                journaled_quantity=0.0,
+                journaled_notional=0.0,
+                reading=_reading(row, OrderStatus.FILLED, filled=1.0, avg=100.0),
+            )
+        )
+    return items
+
+
+@pytest.mark.parametrize(
+    ("lagging", "fills", "excess", "status"),
+    [
+        (3, 0, 0.025, "fills_lagging"),  # 0.01 x (1 + 3/2), inclusive
+        (3, 0, 0.026, "mismatch"),
+        (0, 3, 0.025, "ok"),  # the same bound as three journaled fills
+        (3, 2, 0.035, "fills_lagging"),  # 0.01 x (1 + (2 + 3)/2)
+        (3, 2, 0.036, "mismatch"),
+        (1, 0, 1.0, "mismatch"),  # a real cash gap beside a lagging order still halts
+    ],
+)
+def test_each_lagging_order_counts_as_a_fill_in_the_cash_bound(
+    lagging: int, fills: int, excess: float, status: str
+) -> None:
+    """#2996: the broker books each uncollected sell's cash to the cent, so a
+    lagging order widens the cash bound by one fill, as a journaled fill does;
+    a bare `paper reconcile` before collection otherwise held every uncollected
+    fill's rounding to the zero-fill bound and halted the book on cash."""
+    held = 10.0
+    sold = float(lagging)
+    proceeds = 100.0 * lagging
+    if lagging:
+        result = _run(
+            _ledger(1_000.0, fills_since_base=fills, SEC_A=held),
+            _positions(AAA=held - sold),
+            round(1_000.0 + proceeds + excess, 6),
+            journal_open=_lagging_sells(lagging),
+        )
+    else:
+        result = _run(
+            _ledger(1_000.0, fills_since_base=fills, SEC_A=held),
+            _positions(AAA=held),
+            round(1_000.0 + excess, 6),
+        )
+
+    assert result.status == status
+    assert _kinds(result) == (["cash"] if status == "mismatch" else [])
+
+
 @pytest.mark.parametrize(
     ("filled", "avg"),
     [(5.0, None), (5.0, 0.0), (5.0, float("inf")), (float("inf"), 100.0), (50.0, 100.0)],
