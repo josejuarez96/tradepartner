@@ -3836,6 +3836,64 @@ def test_filename_fetch_share_counts_only_ciks_that_sent_a_fetch(tmp_path: Path)
     assert cached._filename_ciks_asked == set()
 
 
+@pytest.mark.parametrize("workers", [1, 4])
+def test_filename_fetch_stops_after_consecutive_failed_ciks(tmp_path: Path, workers: int) -> None:
+    """#2934: in a full SEC outage the pass stops once
+    `edgar.filename_fetch_outage_ciks` CIKs in a row failed past the
+    retries, instead of retrying every remaining CIK; the raise fails the
+    run closed, naming the outage. Each call here is one more failed CIK."""
+    router = _fn_router()
+    router.add(_fn_url(_FN_C, "index.json"), 503)
+    source = _fn_source(
+        tmp_path,
+        router,
+        filename_fetch_workers=workers,
+        retry_max_attempts=1,
+        filename_fetch_outage_ciks=3,
+    )
+    assert source.filename_listings(_FN_CIK) == []
+    assert source.filename_listings(_FN_CIK) == []
+    with pytest.raises(
+        edgar_source_module.FilenameFetchOutageError,
+        match=r"3 CIKs in a row.*edgar\.filename_fetch_outage_ciks.*HTTPStatusError",
+    ):
+        source.filename_listings(_FN_CIK)
+    assert source.filename_incomplete_ciks == {_FN_CIK}
+    stored = json.loads((tmp_path / "cache" / "filename" / "v1" / f"{_FN_CIK}.json").read_text())
+    assert _FN_C not in stored["records"]  # the failed filing stays uncached
+
+
+def test_filename_fetch_outage_streak_resets_on_an_answer(tmp_path: Path) -> None:
+    """A CIK whose fetch answers ends the streak; a fully cached CIK sends
+    nothing and leaves it as it is (it is no evidence either way)."""
+    down = [True]
+    router = _fn_router()
+    url = _fn_url(_FN_C, "index.json")
+    healthy = router._routes[url]
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        if down[0]:
+            return httpx.Response(503, request=request)
+        return cast(httpx.Response, healthy(request))
+
+    router.add(url, flaky)
+    source = _fn_source(tmp_path, router, retry_max_attempts=1, filename_fetch_outage_ciks=2)
+    source.filename_listings(_FN_CIK)
+    assert source._filename_failed_streak == 1
+    down[0] = False
+    source.filename_listings(_FN_CIK)
+    assert source._filename_failed_streak == 0
+    source._filename_failed_streak = 1
+    source.filename_listings(_FN_CIK)  # fully cached now: nothing sent
+    assert source._filename_failed_streak == 1
+
+
+def test_filename_fetch_outage_ciks_defaults_and_refuses_zero() -> None:
+    assert Settings(_env_file=None).edgar.filename_fetch_outage_ciks == 20
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, edgar={"filename_fetch_outage_ciks": 0})
+
+
 def _done(result: Any = None, error: BaseException | None = None) -> Any:
     future: Any = edgar_source_module.Future()
     if error is None:

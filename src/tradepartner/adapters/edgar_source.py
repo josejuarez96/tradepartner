@@ -453,6 +453,13 @@ Quarter = tuple[int, int]
 _T = TypeVar("_T")
 
 
+class FilenameFetchOutageError(RuntimeError):
+    """Raised by `filename_listings` (#2934) once
+    `edgar.filename_fetch_outage_ciks` CIKs in a row failed their
+    filing-name fetch past the retries: an SEC outage, so the pass stops
+    and the run fails closed rather than retrying every remaining CIK."""
+
+
 class FilingFailuresError(RuntimeError):
     """Raised by `check_failures()` (T11h) when the failure policy's
     thresholds are crossed; the chunk fails with no row written."""
@@ -772,6 +779,9 @@ class EdgarFilingSource(FilingSource):
         # fully cached CIK sends none), `check_failures`' denominator.
         self.filename_fetch_failed_ciks: dict[str, str] = {}
         self._filename_ciks_asked: set[str] = set()
+        # #2934: CIKs in a row (of those that sent a fetch) whose filename
+        # fetch failed past the retries; an answered fetch resets it.
+        self._filename_failed_streak = 0
         # T11h: the failure policy.
         self.failed_filings = 0
         self.quarantined = 0
@@ -3698,11 +3708,12 @@ class EdgarFilingSource(FilingSource):
         if first_cover is not None and first_cover.accepted_at is not None:
             jobs.append((first_cover, False))
         jobs.extend((record, False) for record in form25s if self._own_form25(cik, record))
-        if any(
+        asks = any(
             _filename_cache_hit(cache, record, read_document) is None
             and not self._is_quarantined(record.accession)
             for record, read_document in jobs
-        ):
+        )
+        if asks:
             self._filename_ciks_asked.add(cik)  # #2932: the share's denominator
         pool: ThreadPoolExecutor | None = None
         prefetched: dict[tuple[str, bool], Future[_FilenameExtract]] = {}
@@ -3803,15 +3814,24 @@ class EdgarFilingSource(FilingSource):
             # closed (no answer, the failed filing uncached, asked again next
             # run); `check_failures` fails the run past the share threshold.
             self.filename_incomplete_ciks.add(cik)
-            self.filename_fetch_failed_ciks.setdefault(
-                cik, self._stored_message(f"{type(error).__name__}: {error}")
-            )
+            message = self._stored_message(f"{type(error).__name__}: {error}")
+            self.filename_fetch_failed_ciks.setdefault(cik, message)
+            self._filename_failed_streak += 1
+            limit = edgar_settings.filename_fetch_outage_ciks
+            if self._filename_failed_streak >= limit:
+                raise FilenameFetchOutageError(
+                    f"filename fetch stopped: {limit} CIKs in a row failed past the retries "
+                    f"(edgar.filename_fetch_outage_ciks), an SEC outage; nothing failed is "
+                    f"cached, rerun once SEC answers; last: {cik} {message}"
+                ) from error
             return []
         finally:
             if pool is not None:
                 # A queued job is dropped unrun; its future is never asked again.
                 pool.shutdown(wait=True, cancel_futures=True)
 
+        if asks:
+            self._filename_failed_streak = 0  # #2934: SEC answered this CIK
         if cik not in self._filename_counted:
             self._filename_counted.add(cik)
             self.filename_10ks_read += counts.read
