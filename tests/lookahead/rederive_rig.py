@@ -190,6 +190,7 @@ class Rig:
         outcome: str = "added",
         accession: str = ACC,
         at: datetime = RUN_AT,
+        zips: list[dict[str, Any]] | None = None,
     ) -> str:
         """One writer run of `ACC`'s rows; returns its manifest digest."""
         sha = raw_archive.archive_body(self.settings, body).sha256
@@ -204,7 +205,8 @@ class Rig:
             outcome=outcome,
             rows={"sec_form4_transactions": listed if outcome == "added" else []},
         )
-        zips = [{"quarter": "2026q1", "sha256": sha}] if bulk else []
+        if zips is None:
+            zips = [{"quarter": "2026q1", "sha256": sha}] if bulk else []
         manifest = build_manifest(
             run_id=run_id, source=writer, mode=mode, entries=[entry], zips=zips
         )
@@ -221,7 +223,9 @@ class Rig:
                 write_run(conn, f"{run_id}-q", at, at, run, mode)
         return digest
 
-    def index_run(self, *, wrong_name: str = "ACME CORP", mode: str = "session") -> str:
+    def index_run(
+        self, *, wrong_name: str = "ACME CORP", mode: str = "session", position: int = 0
+    ) -> str:
         sha = raw_archive.archive_body(self.settings, DAILY).sha256
         row = {
             "cik": "0000012345",
@@ -231,7 +235,7 @@ class Rig:
             "filed_on": FILE_DATE,
             "accepted_at": ACCEPTED,
             "listed_on": FILE_DATE,
-            "list_position": 0,
+            "list_position": position,
             "known_at": ACCEPTED,
             "ingested_at": RUN_AT,
             "source": "edgar",

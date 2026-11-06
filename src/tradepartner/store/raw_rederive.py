@@ -95,7 +95,10 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 
 FORM4_TABLE = "sec_form4_transactions"
 _FORM4_FIELDS = tuple(f.name for f in fields(Form4Transaction))
-_INDEX_FIELDS = ("form", "company_name", "filed_on", "list_position")
+#: A daily row's parser-derived columns. `list_position` is not one: ingest keeps the
+#: first listing's position on a revision on purpose (`edgar_source`), so it is no
+#: parser mistake to correct.
+_INDEX_FIELDS = ("form", "company_name", "filed_on")
 _PARSERS = {
     XML_SOURCE: f"sec_forms_parser={SEC_FORMS_PARSER_VERSION}",
     BULK_SOURCE: f"bulk_reader={BULK_READER_VERSION}",
@@ -314,7 +317,10 @@ def _match(
             refused.append(f"  {table} {list(key)}: its entry's outcome is {entry.get('outcome')}")
             continue
         fetched, done = entry.get("fetched_at"), finished.get(run_id)
-        if fetched is not None and (done is None or datetime.fromisoformat(fetched) > done):
+        if done is None:
+            refused.append(f"  {table} {list(key)}: writer run {run_id} has no finish time")
+            continue
+        if fetched is not None and datetime.fromisoformat(fetched) > done:
             refused.append(f"  {table} {list(key)}: its input was fetched after run {run_id}")
             continue
         if row_source == BULK_SOURCE and not any(
@@ -333,10 +339,10 @@ def _parsed(
     """The re-parsed rows of `m`'s group, keyed as `m.key`."""
     sha = m.entry["raw_sha256"]
     if m.table == di.INDEX_TABLE:
-        return {
-            (r.cik, r.accession): {c: getattr(r, c) for c in _INDEX_FIELDS}
-            for r in di.parse_daily_body(body)
-        }
+        rows: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for r in di.parse_daily_body(body):  # the first listing wins, as in ingest
+            rows.setdefault((r.cik, r.accession), {c: getattr(r, c) for c in _INDEX_FIELDS})
+        return rows
     if m.row_source == XML_SOURCE:
         transactions = parse_form4(body.decode("utf-8")).transactions
     else:
@@ -513,6 +519,8 @@ def rederive(
     `release` it writes `expect` corrections or raises, writing nothing."""
     if not mode.strip():
         raise RederiveRefused("name the writer runs' mode")
+    if release is None and expect is not None:
+        raise RederiveRefused("--expect needs --release: a dry run writes nothing")
     if release is not None and expect is None:
         raise RederiveRefused("a re-derive writes only a dry run's count: pass expect")
     started = ensure_tz_aware_utc(clock(), field_name="clock()")

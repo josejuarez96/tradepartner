@@ -101,6 +101,34 @@ def test_a_daily_index_row_maps_by_its_file_date(rig: Rig) -> None:
     assert result.hashes == (hashlib.sha256(DAILY).hexdigest(),)
 
 
+def test_a_daily_row_keeps_its_first_listing_position(rig: Rig) -> None:
+    rig.index_run(position=5)  # a revision keeps the first listing's position
+    result = rederive(
+        rig.settings, rig.icloud, mode="session", file_dates=[FILE_DATE], clock=lambda: NOW
+    )
+    assert result.corrections == () and result.unchanged == 1
+
+
+def test_expect_without_a_release_is_refused(rig: Rig) -> None:
+    rig.form4_run()
+    with pytest.raises(RederiveRefused, match="--expect needs --release"):
+        _run(rig, expect=1)
+
+
+def test_a_known_inside_the_window_row_is_refused(rig: Rig) -> None:
+    rig.form4_run(wrong=WRONG_SHARES)
+    rig.open_paper_window(ACCEPTED - timedelta(days=60))  # opened before known_at
+    dry = _run(rig)
+    assert len(dry.refused) == 1 and "open paper window" in dry.refused[0]  # type: ignore[attr-defined]
+
+
+def test_a_bulk_entry_whose_zip_its_manifest_omits_is_refused(rig: Rig) -> None:
+    rig.form4_run(
+        row_source=BULK_SOURCE, body=bulk_zip(), writer="edgar", accession=BULK_ACC, zips=[]
+    )
+    _refused(rig, "lists no such quarter zip", accessions=[BULK_ACC])
+
+
 def _refused(rig: Rig, match: str, **kw: object) -> None:
     before = rig.table()
     with pytest.raises(RederiveRefused, match=match):
