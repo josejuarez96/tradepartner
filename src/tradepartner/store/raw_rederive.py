@@ -52,18 +52,28 @@ mode manifest of the rows it wrote, citing the same raw hashes, and records one
 `ingestion_runs` row (status `repaired`, never `ok`, so no nightly cursor reads
 it) naming that manifest. The release's close then stales the trials whose
 window it touched (`registry.close_data_release`).
+
+**Repeat repairs** (#3022). Each repair entry names the writer mode its rows were
+first written under (`writer_mode`) and, for each row, the run, key and digest of
+the entry it replaces (`replaces`). A repair entry matches only under its own
+writer mode, and an entry a later repair replaced never matches, so a repair that
+puts back a row's earlier value maps to that repair alone, not to it and the first
+writer. A repair entry with neither field (none was written before #3022) never
+matches, and whatever is still ambiguous is refused, never guessed.
 """
 
 from __future__ import annotations
 
 import hashlib
 import io
+import json
 import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
 from datetime import UTC, date, datetime
+from functools import partial
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -282,6 +292,21 @@ def _manifests(
     return manifests, finished
 
 
+def _key_text(table: str, key: Sequence[Any]) -> str:
+    return json.dumps([table, *key], default=str)
+
+
+def _replaced(manifests: Sequence[dict[str, Any]]) -> set[tuple[str, str]]:
+    """(run ID, table and key) of every row entry a later repair replaced."""
+    return {
+        (str(r.get("run_id")), _key_text(str(r.get("table")), r.get("key") or ()))
+        for manifest in manifests
+        if manifest["writer"].get("mode") == REPAIR
+        for entry in manifest["entries"]
+        for r in entry.get("replaces") or ()
+    }
+
+
 def _find(
     manifests: Sequence[dict[str, Any]],
     table: str,
@@ -291,18 +316,27 @@ def _find(
     row: Mapping[str, Any],
     mode: str,
 ) -> tuple[str, Mapping[str, Any]]:
-    """The one entry, in a manifest of `mode` or of a re-derive, that wrote `row`
-    as it is stored now: a corrected row's digest is the re-derive's, an untouched
-    row's its first writer's."""
+    """The one entry, in a manifest of `mode` or of a re-derive of `mode`'s rows,
+    that wrote `row` as it is stored now and that no later re-derive replaced: a
+    corrected row's digest is its last re-derive's, an untouched row's its first
+    writer's (#3022). Two such entries, or none, raise `ProvenanceError`."""
     digest = row_digest(row)
+    replaced = _replaced(manifests)
+    ident = _key_text(table, key)
+    writers = [m for m in manifests if m["writer"].get("mode") == mode]
+    # A repair manifest is searched only for its entries of this writer mode.
+    repairs = [
+        {**m, "entries": [e for e in m["entries"] if e.get("writer_mode") == mode]}
+        for m in manifests
+        if m["writer"].get("mode") == REPAIR
+    ]
     found: list[tuple[str, Mapping[str, Any]]] = []
-    errors: list[ProvenanceError] = []
-    for each in sorted({mode, REPAIR}, key=lambda m: m != mode):
-        try:
-            if table == FORM4_TABLE:
-                found.append(
-                    find_entry(
-                        manifests,
+    for each, searched in ((mode, writers), (REPAIR, repairs)):
+        for manifest in searched:  # one at a time, so matches across manifests all count
+            try:
+                if table == FORM4_TABLE:
+                    hit = find_entry(
+                        [manifest],
                         row_source=row_source,
                         mode=each,
                         accession=group,
@@ -310,20 +344,21 @@ def _find(
                         key=[*key],
                         digest=digest,
                     )
-                )
-            else:
-                found.append(
-                    di.find_index_entry(
-                        manifests, mode=each, listed_on=row["listed_on"], key=[*key], digest=digest
+                else:
+                    hit = di.find_index_entry(
+                        [manifest], mode=each, listed_on=row["listed_on"], key=[*key], digest=digest
                     )
-                )
-        except ProvenanceError as exc:
-            errors.append(exc)
+            except ProvenanceError as exc:
+                if str(exc).startswith("more than one"):
+                    raise
+                continue
+            if (hit[0], ident) not in replaced:
+                found.append(hit)
     if len(found) == 1:
         return found[0]
     if found:
         raise ProvenanceError(f"more than one manifest entry wrote {table} row {list(key)}")
-    raise errors[0]
+    raise ProvenanceError(f"no manifest entry wrote {table} row {list(key)} of {group}")
 
 
 def _match(
@@ -374,21 +409,25 @@ def _match(
 
 
 def _parsed(
-    settings: Settings, m: _Matched, body: bytes, bulks: dict[str, InsiderBulk]
+    settings: Settings,
+    m: _Matched,
+    load: Callable[[], bytes],
+    bulks: dict[str, InsiderBulk],
 ) -> dict[tuple[Any, ...], dict[str, Any]]:
-    """The re-parsed rows of `m`'s group, keyed as `m.key`."""
+    """The re-parsed rows of `m`'s group, keyed as `m.key`. A bulk zip is read and
+    parsed once for all its accessions (#3022): `load` runs only on a miss."""
     sha = m.entry["raw_sha256"]
     if m.table == di.INDEX_TABLE:
         rows: dict[tuple[Any, ...], dict[str, Any]] = {}
-        for r in di.parse_daily_body(body):  # the first listing wins, as in ingest
+        for r in di.parse_daily_body(load()):  # the first listing wins, as in ingest
             rows.setdefault((r.cik, r.accession), {c: getattr(r, c) for c in _INDEX_FIELDS})
         return rows
     if m.row_source == XML_SOURCE:
-        transactions = parse_form4(body.decode("utf-8")).transactions
+        transactions = parse_form4(load().decode("utf-8")).transactions
     else:
         if sha not in bulks:
             bulks[sha] = read_insider_bulk(
-                io.BytesIO(body), max_member_bytes=settings.events.form4_bulk_max_member_bytes
+                io.BytesIO(load()), max_member_bytes=settings.events.form4_bulk_max_member_bytes
             )
         record = bulks[sha].accessions.get(m.group)
         transactions = () if record is None else record.transactions
@@ -407,15 +446,25 @@ def _compare(
     for m in matched:
         groups[(m.row_source, m.entry["raw_sha256"], m.group)].append(m)
     bulks: dict[str, InsiderBulk] = {}
+    unparsed: dict[str, str] = {}
     corrections: list[Correction] = []
     unchanged = 0
     refused: list[str] = []
     for (row_source, sha, group), members in sorted(groups.items()):
         check_archive_write(settings, root, 0)  # the floor, during the run
-        body = raw_archive.read_body(settings, sha, icloud)
+        if sha in unparsed:  # a bulk zip that already failed for another accession
+            refused.append(f"  {row_source} {group}: body {sha} does not parse: {unparsed[sha]}")
+            continue
         try:
-            parsed = _parsed(settings, members[0], body, bulks)
+            parsed = _parsed(
+                settings,
+                members[0],
+                partial(raw_archive.read_body, settings, sha, icloud),
+                bulks,
+            )
         except (ValueError, UnicodeError) as exc:
+            if row_source == BULK_SOURCE:
+                unparsed[sha] = str(exc)
             refused.append(f"  {row_source} {group}: body {sha} does not parse: {exc}")
             continue
         columns = _INDEX_FIELDS if members[0].table == di.INDEX_TABLE else _FORM4_FIELDS
@@ -493,16 +542,23 @@ def _repair_manifest(
     written: Sequence[dict[str, Any]],
     *,
     index: bool,
+    mode: str,
 ) -> bytes:
     """The re-derive run's own manifest (mode `repair`): each corrected row's new
-    digest under the same raw hash its writer read, with today's parser."""
+    digest under the same raw hash its writer read, with today's parser, plus the
+    writer mode and, per row, the run, key and digest of the entry it replaces
+    (#3022)."""
     by_input: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     entries: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    replaces: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for c, row in zip(corrections, written, strict=True):
         m = c.matched
         ident = (m.row_source, m.group, m.entry["raw_sha256"])
         by_input[ident].append(row)
         entries[ident] = m.entry
+        replaces[ident].append(
+            {"run_id": m.run_id, "table": m.table, "key": list(m.key), "digest": row_digest(m.row)}
+        )
     out = []
     for ident, rows in sorted(by_input.items()):
         entry = entries[ident]
@@ -513,19 +569,26 @@ def _repair_manifest(
             None if fetched is None else datetime.fromisoformat(fetched),
             _PARSERS[ident[0]],
         )
+        made: dict[str, object]
         if index:
-            out.append(di.index_entry(path=entry["path"], raw=raw, parsed=True, rows=rows))
+            made = di.index_entry(path=entry["path"], raw=raw, parsed=True, rows=rows)
         else:
-            out.append(
-                manifest_entry(
-                    accession=ident[1],
-                    row_source=ident[0],
-                    quarter=entry.get("quarter"),
-                    raw=raw,
-                    outcome="added",
-                    rows={FORM4_TABLE: rows},
-                )
+            made = manifest_entry(
+                accession=ident[1],
+                row_source=ident[0],
+                quarter=entry.get("quarter"),
+                raw=raw,
+                outcome="added",
+                rows={FORM4_TABLE: rows},
             )
+        made["writer_mode"] = mode
+        made["replaces"] = json.loads(
+            json.dumps(
+                sorted(replaces[ident], key=lambda r: _key_text(r["table"], r["key"])),
+                default=str,
+            )
+        )
+        out.append(made)
     if index:
         return di.build_index_manifest(run_id=run_id, mode=REPAIR, entries=out)
     zips = {
@@ -591,8 +654,8 @@ def rederive(
     store lock (#3001). The second pass (under the write lock for a write) matches
     again and refuses if the inputs changed; a body evicted in between is refused
     by `read_body`, not downloaded."""
-    if not mode.strip():
-        raise RederiveRefused("name the writer runs' mode")
+    if not mode.strip() or mode == REPAIR:
+        raise RederiveRefused("name the writer runs' mode (not repair: a re-derive's own)")
     if release is None and (expect is not None or expect_digest is not None):
         flag = "--expect" if expect is not None else "--expect-digest"
         raise RederiveRefused(f"{flag} needs --release: a dry run writes nothing")
@@ -655,7 +718,7 @@ def rederive(
         written = _apply(conn, corrections, at)
         run_id = uuid.uuid4().hex
         digest = raw_archive.archive_manifest(
-            settings, _repair_manifest(run_id, corrections, written, index=index)
+            settings, _repair_manifest(run_id, corrections, written, index=index, mode=mode)
         ).sha256
         source = di.INDEX_WRITER if index else "edgar"
         message = (

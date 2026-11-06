@@ -1690,11 +1690,7 @@ class EdgarFilingSource(FilingSource):
                     ),
                     pending_row.listed_on,
                     True,
-                    # T318's pending table preserves listed_on, not the source
-                    # quarter. For daily files this is the index quarter. A
-                    # settled-quarter Last-Modified may put it later, which
-                    # delays an unstampable decision rather than dating it early.
-                    (pending_row.listed_on.year, (pending_row.listed_on.month - 1) // 3 + 1),
+                    (pending_row.filed_on.year, (pending_row.filed_on.month - 1) // 3 + 1),
                 ),
             )
         stamp_input: dict[str, dict[str, tuple[UnstampedFiling, tuple[int, int]]]] = {}
@@ -1703,10 +1699,16 @@ class EdgarFilingSource(FilingSource):
             listings.sort(key=lambda item: (item[1], not item[2]))
             if first_pending is not None:
                 listings.insert(0, first_pending)
-            row, _, _, index_quarter = listings[0]
+            row = listings[0][0]
+            # #3041: the unstampable decision settles by the first listing's
+            # filed_on quarter (T323a, as `sec_form_stamp` and the delisting
+            # path do), fresh or pending. Not the pending row's listed_on, which
+            # a settled form.idx's Last-Modified puts a quarter late, nor the
+            # source file's quarter, which T318's pending table does not keep:
+            # either would let a rebuild and an incremental store decide apart.
             stamp_input.setdefault(key[0], {})[key[1]] = (
                 row,
-                index_quarter,
+                (row.filed_on.year, (row.filed_on.month - 1) // 3 + 1),
             )
         stamps = self._incremental_stamps(stamp_input)
         # #2858: a pending row holds only its first listing, so a later listing of
