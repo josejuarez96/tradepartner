@@ -102,6 +102,7 @@ EXCLUDED_SETTINGS_KEYS = (
     "edgar.statement_backfill_chunk_ciks",  # T365: chunk size, not a derivation rule.
     "edgar.filename_fetch_workers",  # #2932: fetch concurrency, not a derivation rule.
     "edgar.filename_fetch_max_failed_share",  # #2932: a failure threshold.
+    "edgar.filename_fetch_outage_ciks",  # #2934: a failure threshold.
 )
 
 CACHE_VERSION_NAMES = (

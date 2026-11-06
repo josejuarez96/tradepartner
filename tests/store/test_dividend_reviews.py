@@ -249,3 +249,42 @@ def test_two_known_at_are_one_key_and_other_actions_are_ignored() -> None:
     splits = _live(("X", DAY, 2.0, "a", T1), ("X", DAY, 2.0, "b", T1), action_type="split")
     assert equal_amount_groups(splits, []) == ()
     assert equal_amount_groups(_live(("X", DAY, 0.25, "a", T1)).clear(), []) == ()
+
+
+def test_a_re_sent_retract_id_under_another_key_beside_a_payment_is_a_violation() -> None:
+    """#2980: the vendor re-sends a reviewed retract id with a noisy amount (or
+    another ex-date); ingest stores it on its own key, so the exact key no
+    longer joins the kept id. Beside another live payment on the reviewed or
+    the new ex-date it is one payment counted twice: both keys fail."""
+    later = date(2021, 6, 16)
+    live = _live(
+        ("NOISE", DAY, 0.25, "a", T1),  # kept id on the reviewed key
+        ("NOISE", DAY, 0.25 + 1e-12, "b", T2),  # retract id, noisy amount
+        ("MOVED", DAY, 0.25, "a", T1),  # kept id on the reviewed key
+        ("MOVED", later, 0.25, "b", T2),  # retract id, another ex-date
+        ("BOTH", later, 0.25, "a", T2),  # both re-sent on a new ex-date
+        ("BOTH", later, 0.25 + 1e-12, "b", T2),
+        ("ALONE", later, 0.25 + 1e-12, "b", T2),  # kept id gone: counted once
+    )
+    reviewed = [_listed(sid, "duplicate") for sid in ("NOISE", "MOVED", "BOTH", "ALONE")]
+    groups = equal_amount_groups(live, reviewed)
+    assert [
+        (
+            g.security_id,
+            g.ex_date,
+            g.amount,
+            g.group_class,
+            [i.source_action_id for i in g.identities],
+        )
+        for g in groups
+    ] == [
+        ("BOTH", later, 0.25, "violation", ["a"]),
+        ("BOTH", later, 0.25 + 1e-12, "violation", ["b"]),
+        ("MOVED", DAY, 0.25, "violation", ["a"]),
+        ("MOVED", later, 0.25, "violation", ["b"]),
+        ("NOISE", DAY, 0.25, "violation", ["a"]),
+        ("NOISE", DAY, 0.25 + 1e-12, "violation", ["b"]),
+    ]
+    # The re-sent key names the reviewed row it came from.
+    noisy = next(g for g in groups if g.security_id == "NOISE" and g.amount != 0.25)
+    assert noisy.reviewed == reviewed[0]
