@@ -1389,6 +1389,97 @@ def test_paper_phase_times_keep_broker_calls(
     assert notes == [stamped[0], "paper_phase sells_poll_rounds=2", *stamped[1:]]
 
 
+def _two_sells_and_a_buy(env: Env) -> list[DecisionRow]:
+    _hold(env, A, 10.0)
+    _hold(env, C, 10.0)
+    env.clock.now = session_open(S) + timedelta(minutes=1)
+    return [
+        _decision(env, A, "sell", notional=500.0),
+        _decision(env, C, "sell", notional=500.0),
+        _decision(env, B, "buy", notional=300.0),
+    ]
+
+
+def _execute_watching_the_sells_wait(
+    env: Env, gate: RiskGatedBroker, rows: list[DecisionRow], monkeypatch: pytest.MonkeyPatch
+) -> tuple[list[tuple[str, tuple[object, ...]]], list[str]]:
+    """Run `execute` with each sleep filling the oldest open sell, and return the
+    broker calls `_await_sells` made before the sells' collection began, with
+    the run's notes (#2614 item 1)."""
+    marks: dict[str, int] = {}
+    filled: set[str] = set()
+    await_sells, collect = gate._await_sells, gate._collect
+
+    def sleep(seconds: float) -> None:
+        env.clock.advance(seconds=seconds)
+        for request in _submits(env.fake):
+            coid = request.client_order_id
+            if request.side == Side.SELL and coid not in filled:
+                filled.add(coid)
+                env.fake.simulate_fill(coid)
+                return
+
+    def marked_await(*args: Any, **kwargs: Any) -> None:
+        marks["start"] = len(env.fake.calls)
+        await_sells(*args, **kwargs)
+
+    def marked_collect(*args: Any, **kwargs: Any) -> tuple[int, ...]:
+        marks.setdefault("collect", len(env.fake.calls))
+        return collect(*args, **kwargs)
+
+    gate._sleep = sleep
+    monkeypatch.setattr(gate, "_await_sells", marked_await)
+    monkeypatch.setattr(gate, "_collect", marked_collect)
+    notes: list[str] = []
+    gate.execute(env.run, rows, (), notes=notes)
+    calls = env.fake.calls[marks["start"] : marks["collect"]]
+    return [(c.method, c.args) for c in calls], notes
+
+
+def test_sells_wait_lists_open_orders_once_per_round(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2614 item 1: one `open_orders` read per round, and a sell's own
+    `get_order` only once it has left that list, to confirm it is terminal."""
+    rows = _two_sells_and_a_buy(env)
+    calls, notes = _execute_watching_the_sells_wait(
+        env, _gate(env, alerter_conn), rows, monkeypatch
+    )
+    sell_a, sell_c = (r.client_order_id for r in _submits(env.fake) if r.side == Side.SELL)
+    assert calls == [
+        ("open_orders", ()),
+        ("open_orders", ()),
+        ("get_order", (sell_a,)),
+        ("open_orders", ()),
+        ("get_order", (sell_c,)),
+    ]
+    assert "paper_phase sells_poll_rounds=3" in notes
+    assert [r.side for r in _submits(env.fake)] == [Side.SELL, Side.SELL, Side.BUY]
+
+
+def test_sells_wait_rereads_a_sell_the_open_list_leaves_out(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed: an open-orders read that omits still-open sells (a lagging
+    or partial list) never ends the wait; each sell's own read decides."""
+    rows = _two_sells_and_a_buy(env)
+    monkeypatch.setattr(env.fake, "open_orders", lambda: [])
+    calls, notes = _execute_watching_the_sells_wait(
+        env, _gate(env, alerter_conn), rows, monkeypatch
+    )
+    sell_a, sell_c = (r.client_order_id for r in _submits(env.fake) if r.side == Side.SELL)
+    assert calls == [
+        ("get_order", (sell_a,)),
+        ("get_order", (sell_c,)),
+        ("get_order", (sell_a,)),
+        ("get_order", (sell_c,)),
+        ("get_order", (sell_c,)),
+    ]
+    assert "paper_phase sells_poll_rounds=3" in notes
+    assert any(n.startswith("paper_phase sells_terminal=") for n in notes)
+    assert [r.side for r in _submits(env.fake)] == [Side.SELL, Side.SELL, Side.BUY]
+
+
 def test_sells_go_before_the_open_and_no_buy_before_the_sells_deadline(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
@@ -1416,8 +1507,8 @@ def test_a_sell_replaced_by_a_limit_order_after_its_acknowledgement_halts_the_ba
     env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#1293 (owner 2026-10-10): the sell is acknowledged as the market day
-    order, then every later `get_order` (`_await_sells`' status poll and the
-    collection after it) reads it as a limit order. The collection refuses it
+    order, then every later `get_order` (the collection after `_await_sells`)
+    reads it as a limit order. The collection refuses it
     with `refused_order_shape` before journaling anything, and the buy is
     never submitted."""
     _hold(env, A, 10.0)
@@ -1441,7 +1532,9 @@ def test_a_sell_replaced_by_a_limit_order_after_its_acknowledgement_halts_the_ba
     assert "get_order returned order " in str(raised.value)
     assert [r.side for r in _submits(env.fake)] == [Side.SELL]
     (coid,) = [c for c in reads if not c.startswith("fx-")]
-    assert reads[coid] >= 3  # the acknowledgement, the poll, the collection
+    # The acknowledgement and the collection; the still-open sell's poll reads the
+    # open-orders list, never its shape (#2614 item 1).
+    assert reads[coid] >= 2
     statuses = _query(
         env.settings, "SELECT status FROM order_events WHERE client_order_id = ?", [coid]
     )

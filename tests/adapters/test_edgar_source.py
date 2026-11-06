@@ -4403,6 +4403,59 @@ def test_a_touched_binding_reads_its_touched_issuers_in_one_scan(tmp_path: Path)
 
 
 @pytest.mark.parametrize("ciks", [50, 500])
+def test_stored_form_reads_order_shared_accessions_in_one_scan(
+    tmp_path: Path, ciks: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2921: `filing_index_for_forms` and the delisting read ordered each
+    accession shared by more than one CIK (every exchange 25-NSE pair) with
+    its own `accession_listing_order` scan. Now one scan per read, same rows."""
+    settings = edgar_settings(tmp_path)
+    conn, _names = _stored_index_fixture(ciks)
+    fresh = stored_index.Listing(
+        _EXCHANGE,
+        f"{_EXCHANGE}-26-000003",
+        "25-NSE",
+        "Exchange",
+        CLOCK.date(),
+        CLOCK,
+        CLOCK.date(),
+        True,
+        9,
+    )  # an uncommitted copy of a stored shared accession
+    forms = {"25-NSE", "10-K", "SC 13D"}
+
+    def answers(source: EdgarFilingSource) -> list[Any]:
+        return [
+            source.filing_index_for_forms(forms),
+            source._stored_form_rows(forms, first=False),
+            source._stored_form_rows({"25", "25-NSE"}, first=True),
+        ]
+
+    old = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    old.use_index(conn, [fresh])
+    with monkeypatch.context() as patched:  # the pre-#2921 read: one scan per accession
+        patched.setattr(
+            stored_index,
+            "accession_listing_orders",
+            lambda c, accessions, t: {
+                a: rows
+                for a in accessions
+                if (rows := stored_index.accession_listing_order(c, a, t))
+            },
+        )
+        expected = answers(old)
+    counting = _CountingConn(conn)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    source.use_index(cast(duckdb.DuckDBPyConnection, counting), [fresh])
+    assert answers(source) == expected
+    shared = {r.accession for r in expected[1] if r.form == "25-NSE"}
+    assert len(shared) >= ciks // 7
+    # 17 at either size: a form scan per form, one order scan per read. It was
+    # those plus one scan per shared accession per read (about ciks / 7 each).
+    assert counting.queries <= 20, counting.queries
+
+
+@pytest.mark.parametrize("ciks", [50, 500])
 def test_stored_per_cik_reads_take_a_fixed_number_of_queries(tmp_path: Path, ciks: int) -> None:
     """#2920 (T323a): once T324 seeds the table, every `cik=` read is a scan
     of ~15M rows, and `classify._evidence`, `_read_stamps` and the full
