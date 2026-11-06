@@ -1497,3 +1497,32 @@ def test_all_cil_stock_merger_rebuilds_due_for_later_payment(
         (-10.0, 0.0),
         (None, 125.19),
     ]
+
+
+def test_a_merger_paid_on_its_effective_session_is_stated_there_when_reconciled_later(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2722: the broker paid the due on S (its `MA` activity's date); the
+    reconcile that first sees it runs on S2. The removal is stated on S."""
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings)
+    _removed(fake, DUE)
+    fake.activities.append(
+        CashActivity(
+            activity_id="MA-MTUM-S",
+            activity_type="MA",
+            date=S,
+            status="executed",
+            net_amount=DUE,
+            symbol="MTUM",
+        )
+    )
+
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S2).status == OK
+
+    (row,) = _adjustments(journal_settings, open_window)
+    assert _merger_id(row) == M1 and row.cash == pytest.approx(DUE)
+    assert row.session == S
