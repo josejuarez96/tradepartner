@@ -30,6 +30,7 @@ from tradepartner.store.journal import (
     append,
     break_events_for,
 )
+from tradepartner.store.schema import AUTO_TRUE_UP_KIND, OWNER_TRUE_UP_KIND
 
 from .test_reconcile_run import (  # noqa: F401  (fixtures used by name)
     FUNDING,
@@ -812,3 +813,34 @@ def test_a_reconcile_stated_before_a_later_true_up_refuses_and_writes_nothing(
     assert (
         _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later).status == "ok"
     )
+
+
+@pytest.mark.parametrize(
+    ("kind", "explanation", "what"),
+    [
+        (AUTO_TRUE_UP_KIND, None, "a true-up"),
+        (OWNER_TRUE_UP_KIND, None, "a true-up"),
+        (OWNER_TRUE_UP_KIND, '{"reversed_adjustment_id": 1}', "a true-up reversal"),
+    ],
+)
+def test_every_true_up_kind_after_the_stated_session_refuses(
+    kind: str, explanation: str | None, what: str
+) -> None:
+    """#3018: an auto true-up, an owner true-up and its reversal each refuse a
+    ledger stated before their session; at or after it, nothing refuses, and
+    other adjustment kinds never do."""
+    stamp = datetime(2026, 10, 2, 15, tzinfo=UTC)
+    later = next_session(S)
+    row = AdjustmentRow(
+        adjustment_id=2,
+        window_id=1,
+        session=later,
+        kind=kind,
+        explanation_json=explanation,
+        known_at=stamp,
+        ingested_at=stamp,
+    )
+    with pytest.raises(reconcile_run.StatedBeforeTrueUp, match=f"^{what} is stated for {later}"):
+        reconcile_run._refuse_before_a_true_up([row], S)
+    reconcile_run._refuse_before_a_true_up([row], later)
+    reconcile_run._refuse_before_a_true_up([replace(row, kind="dividend")], S)

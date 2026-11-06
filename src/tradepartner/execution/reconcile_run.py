@@ -1345,10 +1345,12 @@ def _refuse_before_a_true_up(adjustments: Sequence[AdjustmentRow], through: date
     order, so this run's events would land after the true-up's `trued_up` or
     `reopened` one and reopen or close the owner's break from a session that
     cannot see it, and its row (stamped now) would become the cash base of the
-    true-up's session, which then halts on cash. `paper run` and `paper resume`
-    state `command_session(now)` or the run's own session, never before a
-    true-up stamped `command_session` earlier, so only a direct
-    earlier-session call (a catch-up reconcile) reaches this."""
+    true-up's session, which then halts on cash. `paper reconcile` and `paper
+    resume` state `command_session(now)` and `paper run` its own session, never
+    before a true-up stamped `command_session` earlier, so only a direct
+    earlier-session call (a catch-up reconcile), a clock gone back, or a `paper
+    run` still running after a later session's true-up reaches this; the run
+    halts on it (fails closed)."""
     later = [row for row in adjustments if row.kind in TRUE_UP_KINDS and row.session > through]
     if not later:
         return
