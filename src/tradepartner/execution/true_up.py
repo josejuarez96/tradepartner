@@ -314,7 +314,7 @@ def _read(
             f"the cash of {name}'s activities is {total:.2f}, not the break's "
             f"{event.cash_amount or 0.0:.2f}: run `paper reconcile` first",
         )
-    seen, seen_before = _seen_activities(state.adjustments, state.base(through), window)
+    seen, seen_before = _seen_activities(state.adjustments, state.base(through), window, through)
     added = _new_activities(
         activities, symbol=event.symbol, listed=set(ids), seen=seen, seen_before=seen_before
     )
