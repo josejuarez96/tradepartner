@@ -148,6 +148,9 @@ jobs:
     needs: scope
     if: needs.scope.outputs.tests-needed != 'no' && !(github.event.pull_request.draft == true && !contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: ubuntu-latest
+    # #2967: a hung shard fails here, not at GitHub's 6-h limit. Shards run ~10-22 min;
+    # pytest-timeout (pyproject) fails one stuck test first, naming it, at 20 min.
+    timeout-minutes: 45
     permissions:
       contents: read
     strategy:
