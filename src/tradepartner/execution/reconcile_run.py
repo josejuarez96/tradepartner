@@ -25,8 +25,11 @@ it decides and raises on a mismatch. A run's steps 4 and 8, `paper reconcile`,
     writes the closing events of breaks that closed. Each row is stamped with
     the same clock reading, so every adjustment is inside the reconciliation
     that re-bases the ledger's cash (`execution.ledger`: a row whose `known_at`
-    equals the base's is counted in it, never twice). Only an `ok` or `breaks`
-    result books `adjustments` rows. **Auto-acceptance (T283a, item 6):** a name's
+    equals the base's is counted in it, never twice). A row keyed by a broker
+    activity is stated on the activity's date, and a cash removal (an ended
+    listing's or a cash merger's) on the session the broker paid it, never
+    before the cash base (`_removal_session`, #2722); otherwise on S. Only an
+    `ok` or `breaks` result books `adjustments` rows. **Auto-acceptance (T283a, item 6):** a name's
     immaterial break (`_auto_accepts`: at or below both materiality bounds, the
     sizes already auto-accepted on the name included, and never a finding, a
     short, an `unknown_security` or a break once material or reopened) is written
@@ -217,10 +220,12 @@ from tradepartner.execution.reconcile import (
     JournalOpenOrder,
     Mismatch,
     OpenMerger,
+    ProposedAdjustment,
     Reconciliation,
     _cash_bound,
     compare,
     merger_due_detail,
+    removal_paid_on,
 )
 from tradepartner.execution.risk import order_shape_violation
 from tradepartner.execution.symbols import broker_symbol
@@ -1236,6 +1241,36 @@ def _recorded_activity_ids(base: ReconciliationRow | None) -> set[str] | None:
         for entry in entries
         if isinstance(entry, dict) and "activity_id" in entry
     }
+
+
+def _removal_session(
+    adjustment: ProposedAdjustment,
+    explanations: Explanations,
+    *,
+    session: date,
+    base: ReconciliationRow | None,
+    window: PaperWindowRow,
+    tolerance: float,
+) -> date:
+    """The session a cash removal is stated on (#2722, owner decision 2026-10-31):
+    the session the broker paid it (`reconcile.removal_paid_on`), not the
+    reconciliation's, so the mark of that session holds the cash, not the shares.
+
+    Fail closed to `session` when the payment is not evidenced, is not a session,
+    or is not before `session`. The paid session is never before the cash base's
+    New York date (the window's start before any base): a base whose broker cash
+    held the payment would count it twice. A merger's row is never before the
+    session before its `effective_date`, the earliest removal the merger reads
+    as its own."""
+    paid = removal_paid_on(adjustment, explanations, tolerance)
+    if paid is None or not is_session(paid) or paid >= session:
+        return session
+    floor = (base.at if base is not None else window.started_at).astimezone(_NEW_YORK).date()
+    merger = explanations.mergers.get(adjustment.security_id or "")
+    if merger is not None:
+        floor = max(floor, previous_session(merger.effective_date))
+    stated = max(paid, floor)
+    return stated if is_session(stated) and stated < session else session
 
 
 def _seen_activities(
@@ -2641,6 +2676,7 @@ def reconcile_now(
             if reconciliation_id is None:
                 raise RuntimeError("reconciliation append returned no id")
             activity_sessions = {a.activity_id: a.date for a in activities}
+            paid_base = state.base(through)
             adjustment_ids: list[int] = []
             rebooked_after = _rebooked_after(adjustments_for(conn, window_id))
             for adjustment in res.adjustments:
@@ -2648,10 +2684,18 @@ def reconcile_now(
                 # a delisting's late cash) is stated on the activity's own date, not the
                 # reconciliation session, so the ledger applies it from the session it
                 # belongs to (#1583, T183; #411).
+                # A cash removal is stated on the session the broker paid it (#2722).
                 fee_date = (
                     activity_sessions.get(adjustment.broker_activity_id)
                     if adjustment.broker_activity_id is not None
-                    else None
+                    else _removal_session(
+                        adjustment,
+                        explanations,
+                        session=session,
+                        base=paid_base,
+                        window=window,
+                        tolerance=frozen.reconcile_cash_tolerance,
+                    )
                 )
                 prior_reversal = rebooked_after.get(adjustment.broker_activity_id or "")
                 explanation = json.loads(
