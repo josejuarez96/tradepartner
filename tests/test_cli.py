@@ -2966,9 +2966,15 @@ def test_archive_rederive_dry_run_reports_and_a_refusal_exits_non_zero(
     assert str(rig.root) not in dry.output  # no archive path, no account
     assert rig.table() == before
 
-    real = run("--mode", "backfill", "--accession", ACC, "--release", "nope", "--expect", "1")
+    assert "digest " in dry.output
+    real = run(
+        "--mode", "backfill", "--accession", ACC, "--release", "nope", "--expect", "1",
+        "--expect-digest", "0" * 12,
+    )  # fmt: skip
     assert real.exit_code == 1
     assert "rederive refused" in real.output and "no release is open" in real.output
+    count_only = run("--mode", "backfill", "--accession", ACC, "--release", "x", "--expect", "1")
+    assert count_only.exit_code == 1 and "--expect-digest" in count_only.output
     assert run("--mode", "backfill").exit_code == 1  # nothing named
     assert run("--mode", "backfill", "--file-date", "2026-13-01").exit_code == 2
     assert rig.table() == before

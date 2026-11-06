@@ -158,6 +158,7 @@ class Rig:
         body: bytes,
         wrong: Mapping[str, Any] | None = None,
         accession: str = ACC,
+        wrong_line: int = 0,
     ) -> list[dict[str, Any]]:
         if row_source == XML_SOURCE:
             transactions = parse_form4(body.decode("utf-8")).transactions
@@ -171,7 +172,7 @@ class Rig:
             "provenance": "filing",
         }
         rows = [{"accession": accession, **asdict(t), **common} for t in transactions]
-        rows[0].update(wrong or {})
+        rows[wrong_line].update(wrong or {})
         return rows
 
     def form4_run(
@@ -185,16 +186,23 @@ class Rig:
         writer: str = "sec_forms",
         entry_source: str | None = None,
         entry_rows: list[dict[str, Any]] | None = None,
-        fetched_at: datetime = FETCHED,
+        fetched_at: datetime | None = FETCHED,
         store: bool = True,
         outcome: str = "added",
         accession: str = ACC,
         at: datetime = RUN_AT,
         zips: list[dict[str, Any]] | None = None,
+        wrong_line: int = 0,
     ) -> str:
         """One writer run of `ACC`'s rows; returns its manifest digest."""
         sha = raw_archive.archive_body(self.settings, body).sha256
-        rows = self.form4_rows(row_source=row_source, body=body, wrong=wrong, accession=accession)
+        rows = self.form4_rows(
+            row_source=row_source,
+            body=body,
+            wrong=wrong,
+            accession=accession,
+            wrong_line=wrong_line,
+        )
         bulk = row_source == BULK_SOURCE
         listed = entry_rows if entry_rows is not None else rows
         entry = manifest_entry(
@@ -224,7 +232,12 @@ class Rig:
         return digest
 
     def index_run(
-        self, *, wrong_name: str = "ACME CORP", mode: str = "session", position: int = 0
+        self,
+        *,
+        wrong_name: str = "ACME CORP",
+        mode: str = "session",
+        position: int = 0,
+        fetched_at: datetime | None = FETCHED,
     ) -> str:
         sha = raw_archive.archive_body(self.settings, DAILY).sha256
         row = {
@@ -241,7 +254,7 @@ class Rig:
             "source": "edgar",
             "provenance": "filing",
         }
-        raw = RawInput(sha, "https://www.sec.gov/d", FETCHED, di.DAILY_PARSER_VERSION)
+        raw = RawInput(sha, "https://www.sec.gov/d", fetched_at, di.DAILY_PARSER_VERSION)
         entry = di.index_entry(path=di.daily_path(FILE_DATE), raw=raw, parsed=True, rows=[row])
         manifest = di.build_index_manifest(run_id="idx-1", mode=mode, entries=[entry])
         with open_for_write(self.settings) as conn:
