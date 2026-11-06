@@ -790,6 +790,73 @@ def test_the_acquirer_joins_the_names_mapped_to_broker_symbols(
     assert found.mergers[MTUM].kind == "stock"
 
 
+#: A predecessor of `SPY` in a successor chain (#821): the store keys its bars under
+#: `SPY` once the chain is known (#3009).
+OLD_SPY = "SEC_OLDSPY"
+
+
+def _chain(settings: Settings, known_at: datetime) -> None:
+    """A live `successor_chains` row `OLD_SPY -> SPY` known from `known_at`."""
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "successor_chains",
+            {
+                "predecessor_id": OLD_SPY,
+                "successor_id": SPY,
+                "evidence_accession": "SYNTH-8K12B-1",
+                "evidence_form": "8-K12B",
+                "retracted": False,
+                "withdrawn_known_at": None,
+                "known_at": known_at,
+                "ingested_at": known_at,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+
+
+def test_a_chained_predecessor_acquirer_reads_through_the_chain_known_at_the_cut(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """#3009: a merger naming a chained predecessor as its acquirer is read as the
+    successor the chain known at close(S-1) maps it to, so the acquirer gets the
+    successor's symbol and reference price; with the chain known only after the cut
+    the stored id stays (no look-ahead)."""
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings, kind="stock", acquirer=OLD_SPY, share_ratio=0.25)
+    _chain(journal_settings, CUT + timedelta(microseconds=1))
+
+    before = _open(journal_settings, open_window, S)
+    assert before.mergers[MTUM].acquirer == OLD_SPY
+    assert OLD_SPY not in before.reference_prices
+
+    known = _open(journal_settings, open_window, S2)
+    assert known.mergers[MTUM].acquirer == SPY
+    assert known.symbols[SPY] == "SPY"
+    assert known.reference_prices[SPY] > 0
+
+
+def test_a_chained_predecessor_acquirer_receipt_reconciles_under_the_successor(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#3009: the `SPY` receipt of a merger naming `SPY`'s chained predecessor is
+    journaled under `SPY`, as for a merger naming `SPY` itself, not a quantity break."""
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings, kind="stock", acquirer=OLD_SPY, share_ratio=0.25)
+    _chain(journal_settings, KNOWN)
+    _removed(fake)
+    fake.extra_quantity["SPY"] = 2.0
+
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S).status == OK
+    removal, receipt = _adjustments(journal_settings, open_window)
+    assert (receipt.kind, receipt.security_id, receipt.quantity) == ("merger_receipt", SPY, 2.0)
+    assert _merger_id(removal) == _merger_id(receipt) == M1
+
+
 def test_a_stock_merger_without_a_receipt_halts_on_quantity(
     journal_settings: Settings,
     fake: BookedFake,

@@ -131,7 +131,11 @@ as_of`:
   check never runs beside one), or named the merger's due: that one checks the
   due once. A reconciliation row's session is `command_session` of
   its `at`. When one acquiree has several open ids, the latest
-  `effective_date` (then id) is passed. The acquirers join the names mapped to
+  `effective_date` (then id) is passed. An acquirer that is a chained
+  predecessor in a chain known at close(S-1) is read as its successor (#821,
+  #3009): `prices_as_of` keys its bars under the successor, whose listing holds
+  its ticker, so its receipt and reference price are the successor's; a chain
+  known only later is not followed. The acquirers join the names mapped to
   broker symbols. Two ids for one acquiree and one `effective_date`
   (`merger_conflict`) are never passed: the first reconciliation that knows
   both, while either is open or has rows journaled, raises the pair in
@@ -220,6 +224,7 @@ from tradepartner.execution.symbols import broker_symbol
 from tradepartner.store import registry
 from tradepartner.store.asof import (
     live_actions_as_of,
+    live_chains,
     mergers_as_of,
     prices_as_of,
     spinoff_allocations_as_of,
@@ -1004,7 +1009,9 @@ def _explanations(
     )
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))
-    seen_ids, seen_before = _seen_activities(state.adjustments, state.base(through), window)
+    seen_ids, seen_before = _seen_activities(
+        state.adjustments, state.base(through), window, through
+    )
     fresh_dividend_symbols = {
         activity.symbol
         for activity in broker_activities or ()
@@ -1191,14 +1198,21 @@ def _recorded_activity_ids(base: ReconciliationRow | None) -> set[str] | None:
 
 
 def _seen_activities(
-    adjustments: Sequence[AdjustmentRow], base: ReconciliationRow | None, window: PaperWindowRow
+    adjustments: Sequence[AdjustmentRow],
+    base: ReconciliationRow | None,
+    window: PaperWindowRow,
+    through: date,
 ) -> tuple[frozenset[str], date | None]:
     """The caller-applied seen-sets for the booked-`FEE` rule (#1583, T183): the
     ids every activity a reconciliation reads is treated as already inside the
     base, and the fallback date cutoff (None when a recorded set exists).
 
     An activity's latest booking decides whether it is seen: a reversal removes
-    it, and a later explanation-linked booking restores it. The base's recorded set (the
+    it, and a later explanation-linked booking restores it. A reversal removes it
+    only from its own session on (`session <= through`), the same cut the ledger's
+    `reversed_true_up_ids(adjustments, through)` applies, so a catch-up reconcile
+    of a session before the reversal keeps both the true-up's cash and the seen
+    activity (#2961). The base's recorded set (the
     last `ok` or `breaks` reconciliation's `activities`) takes precedence; before the first
     `ok`, the window row's `activities_seen_json` (what `paper start` read); when
     both are null, the fallback cutoff is the window's New York start date, so a
@@ -1212,7 +1226,11 @@ def _seen_activities(
             terms = {}
         terms = terms if isinstance(terms, dict) else {}
         reversed_activity = terms.get("reversed_activity_id")
-        if reversed_adjustment_id(adjustment) is not None and isinstance(reversed_activity, str):
+        if (
+            reversed_adjustment_id(adjustment) is not None
+            and isinstance(reversed_activity, str)
+            and adjustment.session <= through
+        ):
             latest[reversed_activity] = False
         rebooked = terms.get("rebooked_activity_id")
         if isinstance(rebooked, str):
@@ -1231,6 +1249,29 @@ def _seen_activities(
             ids = []
         return booked | (frozenset(str(i) for i in ids if isinstance(i, str)) - reversed_ids), None
     return booked, window.started_at.astimezone(_NEW_YORK).date()
+
+
+def _refuse_before_a_reversal(adjustments: Sequence[AdjustmentRow], through: date) -> None:
+    """Refuse a reconciliation stated through a session before a true-up
+    reversal's (#2961). The reversal takes effect from its own session, so the
+    ledger through `through` keeps the true-up; but break events are read in
+    write order, so this run's events would land after the `reopened` one and
+    close the owner's reopened break from a session that cannot see it, and its
+    `ok` row (stamped now) would become the cash base of the reversal's session.
+    Every caller states `command_session(now)` or the run's New York date, never
+    before a reversal stamped `command_session` earlier, so only a direct
+    earlier-session call reaches this."""
+    later = [
+        row.session
+        for row in adjustments
+        if reversed_adjustment_id(row) is not None and row.session > through
+    ]
+    if later:
+        day = max(later).isoformat()
+        raise ValueError(
+            f"a true-up reversal is stated for {day}, after {through.isoformat()}: "
+            f"reconcile {day} or later"
+        )
 
 
 def _rebooked_after(adjustments: Sequence[AdjustmentRow]) -> dict[str, int]:
@@ -1365,7 +1406,19 @@ def _mergers(
     explains nothing at S. `ledger` is the ledger stated through S."""
     cut = _cut(session)
     frame = mergers_as_of(conn, cut, sorted(names))
-    rows = [r for r in frame.iter_rows(named=True) if r["security_id"] in names]
+    # A chained predecessor acquirer is read as its successor (#3009): only the
+    # chains known at the cut, so a later chain explains nothing at S.
+    chains = dict(live_chains(conn, cut))
+    rows = [
+        {
+            **r,
+            "acquirer_security_id": chains.get(
+                r["acquirer_security_id"], r["acquirer_security_id"]
+            ),
+        }
+        for r in frame.iter_rows(named=True)
+        if r["security_id"] in names
+    ]
     acquirers = {
         str(r["acquirer_security_id"]) for r in rows if r["acquirer_security_id"] is not None
     }
@@ -2277,7 +2330,9 @@ def reconcile_now(
     Raises `ReconciliationError` on a mismatch after the row and its events
     commit, or on a failed break-event write after the chunk rolls back,
     `ClockError` for a bad clock reading or an `as_of` after it, `ValueError`
-    for a non-session `session`, a window without an id, or a naive `as_of`,
+    for a non-session `session`, a window without an id, a naive `as_of`, or a
+    ledger stated before a true-up reversal's session (before any broker read
+    or write, #2961),
     and whatever the broker raises (every allowlist this reaches is empty,
     req 4)."""
     window_id = _window_id(window)
@@ -2292,6 +2347,7 @@ def reconcile_now(
     tolerance = frozen.reconcile_quantity_tolerance
 
     with connect() as conn:
+        _refuse_before_a_reversal(adjustments_for(conn, window_id), through)
         orders, pending, sums = _open_orders(conn, window_id)
 
     positions: dict[str, Position] = broker.positions()
