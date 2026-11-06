@@ -2614,7 +2614,14 @@ def _listings(
     if delisted:
         current = current_listings(listings_as_of(conn, cut, sorted(delisted)), session)
         reused = _refuse_reused_tickers(
-            conn, cut, session, current, delisted, symbols, settings.alpaca.class_symbols
+            conn,
+            cut,
+            session,
+            current,
+            delisted,
+            symbols,
+            settings.alpaca.class_symbols,
+            mapped.chained,
         )
         for sid, note in reused.items():
             ambiguous[sid] = f"{ambiguous[sid]}; {note}" if sid in ambiguous else note
@@ -2629,6 +2636,7 @@ def _refuse_reused_tickers(
     delisted: frozenset[str],
     symbols: Mapping[str, str | None],
     class_symbols: Mapping[str, str] | None,
+    chained: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """For each `delisted` name, mark ambiguous when another security's current
     listing (as of close(S-1), across the whole universe) names the same
@@ -2639,7 +2647,9 @@ def _refuse_reused_tickers(
     An earlier owner of the same ticker (this name itself took it over from
     someone even older) is not a collision, and neither is a coincidental
     match with a security that has never been this name's own listing's
-    ticker since."""
+    ticker since. A held predecessor's chain successor (`chained`, #3031) is
+    no later issuer of the successor symbol the order map sends it under: that
+    listing is the one the reconciliation on S matched the position to."""
     if not delisted:
         return {}
     universe = current_listings(listings_as_of(conn, cut), session)
@@ -2653,11 +2663,14 @@ def _refuse_reused_tickers(
         if symbols.get(sid):
             tickers.add(canonical_symbol(str(symbols[sid])))
         own_valid_from = row["valid_from"]
+        successor = (chained or {}).get(sid)
+        sent = canonical_symbol(str(symbols[sid])) if symbols.get(sid) else None
         for ticker in sorted(tickers):
             reused_by = sorted(
                 other
                 for other, other_row in universe.items()
                 if other != sid
+                and not (other == successor and ticker == sent)
                 and (broker_symbol(other_row, class_symbols) or str(other_row["ticker"])) == ticker
                 and other_row["valid_from"] is not None
                 and (own_valid_from is None or other_row["valid_from"] > own_valid_from)
