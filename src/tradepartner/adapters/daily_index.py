@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any
 
+from tradepartner.adapters.edgar import UnstampedFiling, parse_filing_index
 from tradepartner.adapters.form4_archive import ProvenanceError, RawInput, row_digest
 
 DAILY_FORM_NAME = re.compile(r"form\.(\d{4})(\d{2})(\d{2})\.idx")
@@ -59,6 +60,18 @@ def parse_daily_listing(
         path = f"daily-index/{year}/QTR{quarter}/{name}"
         found[name] = DailyIndexFile(path, name, modified, size)
     return tuple(found[name] for name in sorted(found))
+
+
+_DAILY_FILED = re.compile(r"\b(\d{4})(\d{2})(\d{2})(?=\s+edgar/data/)")
+
+
+def parse_daily_body(body: bytes) -> tuple[UnstampedFiling, ...]:
+    """The rows of one daily `form.<yyyymmdd>.idx` body: UTF-8 with universal
+    newlines, its `YYYYMMDD` filed dates read as ISO dates, then
+    `parse_filing_index` with no acceptance times. The incremental reader and the
+    raw re-derive (T352) share it, so a re-parse reads a body as ingest did."""
+    text = body.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    return parse_filing_index(_DAILY_FILED.sub(r"\1-\2-\3", text), {}).unstamped
 
 
 def daily_files_to_read(
