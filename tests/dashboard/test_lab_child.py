@@ -94,6 +94,19 @@ def test_sweep_run_argv_is_exact(live: Settings) -> None:
     assert lab_child.sweep_run_argv("b10", None, live)[2:] == ["sweep", "run", "--", "b10"]
 
 
+def test_sweep_time_budget_is_positive_and_before_separator(live: Settings) -> None:
+    assert lab_child.sweep_run_argv("b10", None, live, time_budget_minutes=2.5)[2:] == [
+        "sweep",
+        "run",
+        "--time-budget-minutes=2.5",
+        "--",
+        "b10",
+    ]
+    for bad in (0, -1, float("nan"), float("inf"), True, "12"):
+        with pytest.raises(LabRefused):
+            lab_child.sweep_run_argv("b10", None, live, time_budget_minutes=bad)
+
+
 def test_backtest_argv_is_exact(live: Settings) -> None:
     argv = lab_child.backtest_argv("h1", date(2020, 1, 2), date(2021, 3, 4), "n", live)
     assert argv[2:] == [
@@ -200,6 +213,13 @@ def test_popen_call_shape(live: Settings, popen: _Popen, conn: duckdb.DuckDBPyCo
     assert kw["cwd"] == book_actions.PROJECT_ROOT
     assert spawned.pid == 4242 and spawned.log_path == lab_child.log_path(live)
     assert spawned.log_path.name == "live.duckdb.lab-run.log"
+
+
+def test_spawn_passes_sweep_time_budget(
+    live: Settings, popen: _Popen, conn: duckdb.DuckDBPyConnection
+) -> None:
+    lab_child.spawn(live, conn, LabKind.SWEEP_RUN, "b10", time_budget_minutes=12.5)
+    assert "--time-budget-minutes=12.5" in popen.calls[0][0]
 
 
 def test_spawn_returns_at_once_without_touching_a_child_that_never_exits(

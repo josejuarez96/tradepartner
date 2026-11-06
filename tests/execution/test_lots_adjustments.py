@@ -60,6 +60,7 @@ import pytest
 
 from tradepartner.calendar import session_close
 from tradepartner.execution import lots
+from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lots import LedgerAccount, LotLedgerError, rebuild
 from tradepartner.store import schema
 from tradepartner.store.asof import live_actions_as_of
@@ -201,6 +202,49 @@ SYMBOLS = {
 }
 
 
+def test_reversal_restores_lots_and_split_only_from_its_session() -> None:
+    book = Book()
+    book.trade("buy", 10, 10, D0303)
+    original = book.adjust(
+        "owner_true_up", D0305, "SEC_X", quantity=1, explanation={"broker_quantity": 21}
+    )
+    book.adjust(
+        "owner_true_up",
+        D0306,
+        "SEC_X",
+        quantity=-1,
+        explanation={"reversed_adjustment_id": original.adjustment_id},
+    )
+    actions = _splits(("SEC_X", D0304, 2))
+    before = book.run(D0305, actions)[0]
+    assert before == book.run(D0305, actions, adjustments=[original])[0]
+    after = book.run(D0306, actions)
+    baseline = book.run(D0306, actions, adjustments=[])
+    assert sum(lot.quantity for lot in before) == 21
+    assert after == baseline
+
+
+def test_malformed_reversal_is_a_lot_ledger_error() -> None:
+    book = Book()
+    book.trade("buy", 10, 10, D0303)
+    original = book.adjust(
+        "owner_true_up",
+        D0304,
+        "SEC_X",
+        quantity=2,
+        explanation={"broker_quantity": 12},
+    )
+    book.adjust(
+        "owner_true_up",
+        D0305,
+        "SEC_X",
+        quantity=-3,
+        explanation={"reversed_adjustment_id": original.adjustment_id},
+    )
+    with pytest.raises(LotLedgerError, match="opposite reversal"):
+        book.run(D0305)
+
+
 def _splits(*rows: tuple[str, date, float]) -> pl.DataFrame:
     """A frame shaped like `live_actions_as_of`, holding only split rows."""
     return pl.DataFrame(
@@ -334,6 +378,37 @@ def test_a_reverse_split_with_cash_in_lieu_disposes_of_the_fraction() -> None:
     assert sold.realised_pnl == pytest.approx(6.0)
     assert _basis_closed(1, disposals) == pytest.approx(70.0)
     assert flags == []
+
+
+def test_the_lot_ledger_and_the_positions_ledger_agree_on_a_reverse_split() -> None:
+    """#2184: 15 shares through a 1-for-10 reverse split are 1.5; the broker holds
+    1 whole share and pays cash in lieu for the 0.5. The lot ledger (the 1.5-share
+    lot less the 0.5 disposed) and the positions ledger both end at 1 share."""
+    book = Book()
+    book.trade("buy", 15, 10.0, D0303)
+    book.adjust("cash_in_lieu", D0307, "SEC_X", quantity=-0.5, cash=50.0)
+    actions = _splits(("SEC_X", D0307, 0.1))
+
+    lot_list, disposals, _ = book.run(D0312, actions)
+    positions = from_journal(
+        book.fills,
+        book.orders,
+        book.adjustments,
+        actions,
+        None,
+        100_000.0,
+        D0312,
+        window_id=1,
+        quantity_tolerance=1e-6,
+    ).positions
+
+    [lot] = lot_list
+    [cil] = disposals
+    assert lot.quantity - cil.quantity == pytest.approx(1.0)  # what stays open
+    assert float(positions["SEC_X"]) == pytest.approx(1.0)
+    assert cil.quantity == pytest.approx(0.5)
+    assert cil.proceeds == pytest.approx(50.0)
+    assert cil.realised_pnl == pytest.approx(0.0)  # basis 150 x (0.5 / 1.5) = 50
 
 
 def test_cash_in_lieu_leaves_whole_shares_so_nothing_is_stranded() -> None:
@@ -533,7 +608,8 @@ def test_a_spinoff_with_a_basis_allocation_moves_that_share_of_the_parents_basis
     [child] = _of("SEC_C", lot_list)
     assert parent.cost_basis == pytest.approx(800.0)
     assert parent.trade_date_local == D0303
-    assert (child.quantity, child.trade_date_local) == (5.0, D0307)
+    # Amendment #1976 item 3: the child carries the parent lot's acquisition date.
+    assert (child.quantity, child.trade_date_local) == (5.0, D0303)
     assert child.cost_basis == pytest.approx(200.0)
     by_lot = {d.lot_id: d for d in disposals}
     assert by_lot[child.lot_id].realised_pnl == pytest.approx(-160.0)
@@ -747,6 +823,197 @@ def test_a_negative_receipt_or_residue_raises_with_no_short_held(kind: str) -> N
 
     with pytest.raises(LotLedgerError, match="short lot"):
         book.run(D0310)
+
+
+# --- spin-off child carries the parent's holding period (T255, #1976 item 3) -------
+
+_P1 = date(2022, 1, 3)
+_P2 = date(2023, 6, 1)
+_EX = date(2023, 9, 15)  # the spin-off's ex-date; the entitlement is fixed at close(09-14)
+_GAP = date(2023, 9, 18)  # a session between the ex-date and the receipt
+_RECEIPT = date(2023, 9, 20)
+_SALE = date(2023, 9, 22)
+
+
+def _terms(allocation: float | None, ex_date: date | None = _EX) -> dict[str, Any]:
+    terms: dict[str, Any] = {**_RECONCILE_EXPLANATION, "parent_security_id": "SEC_P"}
+    if allocation is not None:
+        terms["basis_allocation"] = allocation
+    if ex_date is not None:
+        terms["ex_date"] = ex_date.isoformat()
+    return terms
+
+
+def _two_lot_parent() -> Book:
+    book = Book()
+    book.trade("buy", 100, 10.0, _P1, security_id="SEC_P")
+    book.trade("buy", 100, 14.0, _P2, security_id="SEC_P")
+    return book
+
+
+def test_the_child_carries_a_lot_per_parent_lot_with_the_allocation() -> None:
+    """The amendment's two-lot hand case, 1:1 spin-off, allocation 0.2:
+
+      2022-01-03 buy PAR 100 @ 10   parent lot 1: basis 1000
+      2023-06-01 buy PAR 100 @ 14   parent lot 2: basis 1400
+      receipt 100 + 100 KID         child lot 1: 100 sh, basis 1000 x 0.2 = 200, 2022-01-03
+                                    child lot 2: 100 sh, basis 1400 x 0.2 = 280, 2023-06-01
+                                    parent lots 800 and 1120; 800 + 1120 + 200 + 280 = 2400
+    A sale of 100 KID closes child lot 1 (FIFO by `trade_at`), held 628 days: long-term.
+    """
+    book = _two_lot_parent()
+    book.adjust("spinoff_receipt", _RECEIPT, "SEC_C", quantity=200.0, explanation=_terms(0.2))
+    book.trade("sell", 100, 5.0, _SALE, security_id="SEC_C")
+
+    lot_list, disposals, flags = book.run(_SALE)
+
+    parents, kids = _of("SEC_P", lot_list), _of("SEC_C", lot_list)
+    assert [(p.cost_basis, p.trade_date_local) for p in parents] == [(800.0, _P1), (1120.0, _P2)]
+    assert [(k.quantity, k.cost_basis, k.trade_date_local) for k in kids] == [
+        (100.0, pytest.approx(200.0), _P1),
+        (100.0, pytest.approx(280.0), _P2),
+    ]
+    assert kids[0].trade_at == _at(_P1)
+    assert sum(lot.cost_basis for lot in lot_list) == pytest.approx(2400.0)
+    [sale] = disposals
+    assert sale.lot_id == kids[0].lot_id
+    assert (sale.trade_date_local - kids[0].trade_date_local).days > 365  # long-term
+    assert (sale.trade_date_local - kids[1].trade_date_local).days <= 365  # the second: short
+    assert flags == []
+
+
+def test_the_child_without_an_allocation_has_the_same_lots_at_zero_basis() -> None:
+    book = _two_lot_parent()
+    book.adjust("spinoff_receipt", _RECEIPT, "SEC_C", quantity=200.0, explanation=_terms(None))
+
+    lot_list, _, _ = book.run(_RECEIPT)
+
+    assert [(k.quantity, k.cost_basis, k.trade_date_local) for k in _of("SEC_C", lot_list)] == [
+        (100.0, 0.0, _P1),
+        (100.0, 0.0, _P2),
+    ]
+    assert [p.cost_basis for p in _of("SEC_P", lot_list)] == [1000.0, 1400.0]
+
+
+def test_a_parent_bought_after_the_ex_date_gets_no_child_lot() -> None:
+    """The lot set is fixed at close(09-14): 50 PAR bought on 09-18, before the
+    receipt, is open when the receipt is journaled but earns no child share."""
+    book = Book()
+    book.trade("buy", 100, 10.0, _P1, security_id="SEC_P")
+    book.trade("buy", 50, 12.0, _GAP, security_id="SEC_P")
+    book.adjust("spinoff_receipt", _RECEIPT, "SEC_C", quantity=100.0, explanation=_terms(0.2))
+
+    lot_list, _, _ = book.run(_RECEIPT)
+
+    [kid] = _of("SEC_C", lot_list)
+    assert (kid.quantity, kid.trade_date_local) == (100.0, _P1)
+    assert kid.cost_basis == pytest.approx(200.0)
+    assert [p.cost_basis for p in _of("SEC_P", lot_list)] == [pytest.approx(800.0), 600.0]
+
+
+def test_a_parent_lot_half_sold_in_the_gap_keeps_its_full_child_quantity() -> None:
+    """100 PAR @ 10, 50 sold on 09-18: the child lot is still 100 shares and
+    only the open half's basis moves: 500 x 0.2 = 100; the parent keeps 400."""
+    book = Book()
+    book.trade("buy", 100, 10.0, _P1, security_id="SEC_P")
+    book.trade("sell", 50, 11.0, _GAP, security_id="SEC_P")
+    book.adjust("spinoff_receipt", _RECEIPT, "SEC_C", quantity=100.0, explanation=_terms(0.2))
+
+    lot_list, _, _ = book.run(_RECEIPT)
+
+    [kid] = _of("SEC_C", lot_list)
+    assert (kid.quantity, kid.trade_date_local) == (100.0, _P1)
+    assert kid.cost_basis == pytest.approx(100.0)
+    [open_parent] = [
+        lot
+        for lot in lots.open_lots(
+            book.fills,
+            book.orders,
+            {},
+            ACCOUNT,
+            adjustments=book.adjustments,
+            actions=_splits(),
+            through=_RECEIPT,
+            symbols=SYMBOLS,
+        )
+        if lot.security_id == "SEC_P"
+    ]
+    assert (open_parent.quantity, open_parent.basis) == (50.0, pytest.approx(400.0))
+
+
+def test_a_parent_lot_fully_sold_in_the_gap_gives_a_zero_basis_child_lot() -> None:
+    book = Book()
+    book.trade("buy", 100, 10.0, _P1, security_id="SEC_P")
+    book.trade("sell", 100, 11.0, _GAP, security_id="SEC_P")
+    book.adjust("spinoff_receipt", _RECEIPT, "SEC_C", quantity=100.0, explanation=_terms(0.2))
+
+    lot_list, _, _ = book.run(_RECEIPT)
+
+    [kid] = _of("SEC_C", lot_list)
+    assert (kid.quantity, kid.cost_basis, kid.trade_date_local) == (100.0, 0.0, _P1)
+
+
+def test_a_parent_with_no_lot_open_at_the_close_opens_one_zero_basis_child_lot() -> None:
+    """The parent is bought only after the ex-date: nothing is entitled, one
+    child lot opens on the receipt's session with basis 0 and nothing raises."""
+    book = Book()
+    book.trade("buy", 50, 12.0, _GAP, security_id="SEC_P")
+    book.adjust("spinoff_receipt", _RECEIPT, "SEC_C", quantity=25.0, explanation=_terms(0.2))
+
+    lot_list, _, _ = book.run(_RECEIPT)
+
+    [kid] = _of("SEC_C", lot_list)
+    assert (kid.quantity, kid.cost_basis, kid.trade_date_local) == (25.0, 0.0, _RECEIPT)
+    assert _of("SEC_P", lot_list)[0].cost_basis == 600.0
+
+
+def test_a_carried_child_lot_sorts_with_the_parents_era_in_fifo() -> None:
+    """A child lot carried to 2022-01-03 is sold before a KID lot the book
+    bought in 2022-06, though the carried one is created later."""
+    book = Book()
+    book.trade("buy", 100, 10.0, _P1, security_id="SEC_P")
+    bought = date(2022, 6, 1)
+    book.trade("buy", 10, 3.0, bought, security_id="SEC_C")
+    book.adjust("spinoff_receipt", _RECEIPT, "SEC_C", quantity=100.0, explanation=_terms(0.2))
+    book.trade("sell", 100, 5.0, _SALE, security_id="SEC_C")
+
+    lot_list, disposals, _ = book.run(_SALE)
+
+    carried = next(k for k in _of("SEC_C", lot_list) if k.trade_date_local == _P1)
+    own = next(k for k in _of("SEC_C", lot_list) if k.trade_date_local == bought)
+    assert [(d.lot_id, d.quantity) for d in disposals] == [(carried.lot_id, 100.0)]
+    assert own.quantity == 10.0
+
+
+def test_the_carried_child_lot_is_absent_before_the_receipts_session() -> None:
+    """`trade_at` is the parent's 2022-01-03 but the lot does not exist before
+    the receipt's session. Every reader of `lots.trade_at` sits behind the
+    rebuild: `_wash_sale_flags` (never a replacement), `_close_fifo` (the
+    held list), `outcomes._append_ledger` and `lots_reconcile` (both read the
+    rebuilt rows only) and `cli` (prints them)."""
+    book = _two_lot_parent()
+    book.adjust("spinoff_receipt", _RECEIPT, "SEC_C", quantity=200.0, explanation=_terms(0.2))
+
+    before, _, _ = book.run(_GAP)
+    at, _, _ = book.run(_RECEIPT)
+
+    assert _of("SEC_C", before) == []
+    assert [p.cost_basis for p in _of("SEC_P", before)] == [1000.0, 1400.0]
+    assert len(_of("SEC_C", at)) == 2
+
+
+def test_the_carried_child_lot_is_never_a_wash_sale_replacement() -> None:
+    """A parent loss sale inside the window of the carried lot's date: the
+    child lot, though dated with the parent's era, is no replacement."""
+    book = Book()
+    book.trade("buy", 100, 10.0, _P1, security_id="SEC_P")
+    book.adjust("spinoff_receipt", _RECEIPT, "SEC_C", quantity=100.0, explanation=_terms(0.2))
+    book.trade("sell", 100, 1.0, _SALE, security_id="SEC_P")
+    book.trade("sell", 100, 1.0, _SALE, security_id="SEC_C")
+
+    _, _, flags = book.run(_SALE)
+
+    assert flags == []
 
 
 def test_a_spinoff_whose_named_parent_is_held_short_raises() -> None:
@@ -1125,3 +1392,155 @@ def test_open_lots_drop_a_sold_lot_and_keep_the_rest_of_a_partial_one() -> None:
     assert [(h.lot_id, h.quantity, h.basis, h.position_side) for h in held] == [
         (2, 10.0, 550.0, "long")
     ]
+
+
+# --- true-ups (paper spec amendment 2026-10-26 #2266, items 6 and 9) -------------------
+
+
+@pytest.mark.parametrize("kind", ["auto_true_up", "owner_true_up"])
+def test_a_positive_true_up_opens_a_zero_basis_lot_that_is_never_a_replacement(kind: str) -> None:
+    """Hand values:
+
+      03-03 buy 10 @ 50                        lot 1: basis 500
+      03-04 true-up to 12.5 (delta +2.5)       lot 2: 2.5 shares, basis 0, dated 03-04
+      03-05 sell 12.5 @ 40                     lot 1: pnl -100; lot 2: pnl +100
+    Lot 2 was bought by nobody, so it is no wash-sale replacement for lot 1's loss.
+    """
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303)
+    book.adjust(kind, D0304, "SEC_X", quantity=2.5, explanation={"broker_quantity": 12.5})
+    book.trade("sell", 12.5, 40.0, D0305)
+
+    lot_list, disposals, flags = book.run(D0305)
+
+    assert [(lot.quantity, lot.cost_basis, lot.trade_date_local) for lot in lot_list] == [
+        (10.0, 500.0, D0303),
+        (2.5, 0.0, D0304),
+    ]
+    assert [(d.lot_id, d.quantity, d.proceeds, d.realised_pnl) for d in disposals] == [
+        (1, 10.0, 400.0, -100.0),
+        (2, 2.5, 100.0, 100.0),
+    ]
+    assert flags == []
+
+
+def test_a_negative_true_up_closes_lots_fifo_at_zero_proceeds() -> None:
+    """Hand values:
+
+      03-03 buy 4 @ 50                         lot 1: basis 200
+      03-04 buy 6 @ 60                         lot 2: basis 360
+      03-05 true-up to 7 (delta -3)            lot 1: 3 shares closed, proceeds 0, pnl -150
+    The cash, if any, is booked by its own row, so the disposal carries none.
+    """
+    book = Book()
+    book.trade("buy", 4, 50.0, D0303)
+    book.trade("buy", 6, 60.0, D0304)
+    book.adjust("auto_true_up", D0305, "SEC_X", quantity=-3.0, explanation={"broker_quantity": 7.0})
+
+    _, disposals, _ = book.run(D0305)
+
+    assert [(d.lot_id, d.quantity, d.proceeds, d.realised_pnl) for d in disposals] == [
+        (1, 3.0, 0.0, -150.0)
+    ]
+
+
+def test_a_true_up_is_judged_against_its_absolute_quantity_not_its_delta() -> None:
+    """A split with an earlier ex-date that lands after the true-up was written is
+    already in the broker's figure. Hand values:
+
+      03-03 buy 10 @ 50
+      03-04 true-up to 21 (written when the ledger held 10 and the broker 21: delta +11)
+      split 2:1, ex-date 03-04 (known late): lot 1 becomes 20 shares
+    The lots must total the absolute 21, so the true-up opens 1 share, not 11.
+    """
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303)
+    book.adjust(
+        "auto_true_up", D0304, "SEC_X", quantity=11.0, explanation={"broker_quantity": 21.0}
+    )
+
+    lot_list, _, _ = book.run(D0304, _splits(("SEC_X", D0304, 2.0)))
+
+    assert sum(lot.quantity for lot in lot_list) == 21.0
+    assert [lot.quantity for lot in lot_list] == [20.0, 1.0]
+
+
+def test_a_cash_only_true_up_has_no_lot_effect_and_a_quantity_one_needs_the_absolute() -> None:
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303)
+    book.adjust("auto_true_up", D0304, "SEC_X", cash=10.0)
+    lot_list, disposals, _ = book.run(D0304)
+    assert [lot.quantity for lot in lot_list] == [10.0] and disposals == []
+
+    book.adjust("auto_true_up", D0305, "SEC_X", quantity=1.0)
+    with pytest.raises(ValueError, match="broker_quantity"):
+        book.run(D0305)
+
+
+def test_a_true_up_on_an_open_short_lot_raises() -> None:
+    book = Book()
+    _short_open(book)
+    book.adjust("auto_true_up", D0305, "SEC_X", quantity=1.0, explanation={"broker_quantity": 1.0})
+    with pytest.raises(LotLedgerError):
+        book.run(D0305)
+
+
+def test_a_fill_journaled_after_a_true_up_on_its_session_is_not_overwritten() -> None:
+    """Safety/quant pass 1: the true-up states the name as of its broker read; a
+    fill stamped after it, on the same session, adds to it. Hand values:
+
+      03-03 buy 10 @ 50
+      03-04 true-up to 10.01 (stamped 03-04 close + 30 min)
+      03-04 buy 5 @ 40 journaled after the true-up -> 15.01 shares, nothing closed
+    """
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303)
+    book.adjust(
+        "auto_true_up", D0304, "SEC_X", quantity=0.01, explanation={"broker_quantity": 10.01}
+    )
+    book.trade("buy", 5, 40.0, D0304)
+    late = book.fills[-1]
+    book.fills[-1] = OrderedFill(
+        FillRow(**{**late.fill.__dict__, "known_at": session_close(D0304) + timedelta(hours=2)}),
+        late.side,
+        late.security_id,
+        late.symbol,
+        late.window_id,
+        late.run_id,
+    )
+
+    lot_list, disposals, _ = book.run(D0304)
+
+    assert disposals == []
+    assert sum(lot.quantity for lot in lot_list) == pytest.approx(15.01)
+
+
+def test_a_fill_between_two_true_ups_of_one_session_is_counted_once() -> None:
+    """Steps 4 and 8 both reconcile on one session: true-up to 10.01, a buy of 5,
+    then a second true-up to 15.01 (its broker read holds the buy). Ordered by
+    their stamps the lots total 15.01, not 20.01."""
+    book = Book()
+    book.trade("buy", 10, 50.0, D0303)
+    book.adjust(
+        "auto_true_up", D0304, "SEC_X", quantity=0.01, explanation={"broker_quantity": 10.01}
+    )
+    book.trade("buy", 5, 40.0, D0304)
+    late = book.fills[-1]
+    book.fills[-1] = OrderedFill(
+        FillRow(**{**late.fill.__dict__, "known_at": session_close(D0304) + timedelta(hours=1)}),
+        late.side,
+        late.security_id,
+        late.symbol,
+        late.window_id,
+        late.run_id,
+    )
+    second = book.adjust(
+        "auto_true_up", D0304, "SEC_X", quantity=0.0, explanation={"broker_quantity": 15.01}
+    )
+    book.adjustments[-1] = AdjustmentRow(
+        **{**second.__dict__, "known_at": session_close(D0304) + timedelta(hours=2)}
+    )
+
+    lot_list, _, _ = book.run(D0304)
+
+    assert sum(lot.quantity for lot in lot_list) == pytest.approx(15.01)

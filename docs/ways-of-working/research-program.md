@@ -43,7 +43,7 @@ Before anyone drafts an experiment file (or a hypothesis file) for an idea, the 
 
 - **(a) A causal timestamp exists in held data:** the event's `known_at` is in the store, so the signal could be acted on when it was known.
 - **(b) Event counts per year**, from a read-only count over the window, nothing after the development boundary and no returns.
-- **(c) Power:** the number of events n at which the *expected* t reaches 1.0 at a plausible effect (the literature's effect cut by the publication haircut, QI-2), that is n = (sd / effect)^2, and whether the store has that many readable events. Having fewer means the idea is `deferred`, because a kill would say nothing.
+- **(c) Power (cheap screen, not a power calculation):** the effective number of independent events n where expected t reaches 1.0 at a plausible effect (literature effect × QI-2 haircut), n = (sd / effect)^2. n is effective, not raw: divide raw count by same-date clustering factor, and by holding period / spacing when holds overlap (e.g., 60-session holds spaced 20 apart ≈ 1/3). State correction in ledger row. t = 1.0 is far below confirmation (kill lines and deflated Sharpe decide). Fewer events → `deferred`; a kill would say nothing.
 - **(d) Gross edge plausibly above round-trip cost:** the plausible effect exceeds 60 bp (30 bp per side, the figure C1, C1b and C2 use) unless rung 1's measured slippage says otherwise.
 - **(e) The design uses a matched benchmark, and one is available** (peers of the same size, form and date). Never SPY for small stocks: [C1](../experiments/c1-filing-delay.md) run 2 against SPY showed size and beta, not the signal, until [C1b](../experiments/c1b-filing-delay-matched.md) (run 3) matched peers.
 - **(f) Delisted names are covered for the window.** Count, read-only, how many of the issuers that left the market in the window have bars (or the event's outcome data); if most are missing, any kill is recorded as "killed on survivor data" and the owner decides whether it retires the idea. [C1](../experiments/c1-filing-delay.md) had bars for 4 of 1,301 issuers that stopped filing in 2017-2019 (CLAUDE.md rule 6).
@@ -61,6 +61,10 @@ When a hypothesis reaches a verdict (in-sample, holdout, or retirement): the res
 ### 7. Research → decision
 
 A claim that would change **the tool itself** (new data to ingest, a model's authority, the universe, a risk rule) goes to an ADR citing the claim ids, never straight into code. Waiting on the owner: research-only model benchmarking (ADR 0008, claims-pilot tension CP-X2); filing-text ingest; Form 4 ingest.
+
+### Registration defaults
+
+- **Liquidity floor (owner, 2026-10-30, [#836](https://github.com/josejuarez96/tradepartner/issues/836#issuecomment-6537997869), #2667):** every daily or weekly paper book's universe gets a floor of **$200M** on the median raw close x volume over the 20 sessions before `t` (as of `known_at` <= `t`), frozen per registration. "Daily or weekly" means cadence `daily` or `week_end`. It is a default for new registrations (it sets the default under [ADR 0023 D4](../decisions/0023-break-first-fast-books-paper-exam.md)'s universe rule), recorded in the registration, not in code; existing registrations are not changed retroactively. The universe config key that carries it does not exist yet and needs a plan task (open).
 
 ## Zones
 
@@ -98,3 +102,4 @@ The owner's line: research freedom in development, evidence discipline in valida
 | 2026-10-09 | Zones, the development boundary and forward exams, from the owner's decisions of 2026-10-08 | #1331, #1301 |
 | 2026-10-18 | Rewritten for length, meaning unchanged; the loop as a numbered list; the 10-08 track snapshot points at STATUS | #1752 |
 | 2026-10-27 | Stage 4a: the feasibility check before an experiment file; ledger gains `feasibility` and `decision` | #2409 |
+| 2026-10-30 | Registration defaults: the $200M dollar-volume floor for daily and weekly books | #2667 |

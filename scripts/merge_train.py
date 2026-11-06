@@ -39,6 +39,15 @@ import ready_pr
 RED_STEPS = ("Hygiene", "Fragments", "Lint", "Format", "Types", "Tests")
 #: A failed job shorter than this with no checked step is the infrastructure case.
 INCONCLUSIVE_SECONDS = 60
+#: Paths that are class A (CLAUDE.md rule 1): changes here merge freely on the train.
+CLASS_A_PREFIXES = (
+    "src/",
+    "tests/",
+    "docs/research/",
+    "docs/retros/",
+    "docs/runbooks/",
+    "changelog.d/",
+)
 #: Every train comment's first line starts with this.
 COMMENT_PREFIX = "merge-train:"
 OUTCOMES = (
@@ -240,6 +249,9 @@ def eligibility(
     if pr.unresolved_threads:
         plural = "" if pr.unresolved_threads == 1 else "s"
         return f"(j) {pr.unresolved_threads} unresolved review thread{plural}"
+    class_b = [p for p in diff_paths if not p.startswith(CLASS_A_PREFIXES)]
+    if class_b and "owner-ok" not in labels:
+        return f"(k) class B ({class_b[0]}): needs the owner-ok label (the owner's word)"
     return None
 
 

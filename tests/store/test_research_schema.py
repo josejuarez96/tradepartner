@@ -121,6 +121,8 @@ def _v11_journal_ddl() -> str:
 
 def _row(table: str, **overrides: Any) -> dict[str, Any]:
     """A minimal valid row for each research table (every NOT NULL column)."""
+    if table == "research_exposures":
+        return _exposure_row(**overrides)
     rows: dict[str, dict[str, Any]] = {
         "research_registrations": {
             "registration_id": 1,
@@ -305,7 +307,13 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
             continue
         later_columns = [
             column
-            for column in ("n_research", "sharpe_unit", *_TRIALS_V15, "development_boundary")
+            for column in (
+                "n_research",
+                "n_exposure",
+                "sharpe_unit",
+                *_TRIALS_V15,
+                "development_boundary",
+            )
             if column in _columns(c, table)
         ]
         exclude = f" EXCLUDE ({', '.join(later_columns)})" if later_columns else ""
@@ -317,7 +325,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ASSETS_INTERSECTION_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_LIST_POSITION_VERSION + 1
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -327,6 +335,7 @@ def test_research_table_names_are_the_spec_five() -> None:
         "research_runs",
         "research_results",
         "research_decisions",
+        "research_exposures",
     )
 
 
@@ -336,6 +345,127 @@ def test_research_table_names_disjoint_from_every_other_set() -> None:
     assert research & set(schema.REGISTRY_TABLE_NAMES) == set()
     assert research & set(schema.JOURNAL_TABLE_NAMES) == set()
     assert research & set(schema.MASTER_CHECK_TABLE_NAMES) == set()
+
+
+def _exposure_row(**overrides: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "exposure_id": 1,
+        "candidate_ref": "#2689",
+        "source": "store",
+        "family": "profitability",
+        "kill_line_url": "https://github.com/example/repo/issues/1#issuecomment-2",
+        "kill_line_sha256": "a" * 64,
+        "kill_line_posted_at": KNOWN,
+        "kill_line_basis": "posted_before_read",
+        "probe_path": "probe.py",
+        "probe_sha256": "b" * 64,
+        "probe_verified": True,
+        "read_at": KNOWN,
+        "window_start": date(2020, 1, 1),
+        "window_end": date(2023, 1, 1),
+        "data_pin_json": "{}",
+        "n_configurations": 1,
+        "verdict": "fail",
+        "desk_read_path": "docs/research/read.md",
+        "overlaps_holdout": False,
+        "post_boundary": False,
+        "synthetic": True,
+        "recorded_by": "owner",
+        "code_version": "abc",
+        "known_at": KNOWN,
+    }
+    return row | overrides
+
+
+def test_exposure_table_and_column_on_fresh_and_previous_store() -> None:
+    fresh = duckdb.connect(":memory:")
+    schema.init_schema(fresh)
+    assert "research_exposures" in _tables(fresh)
+    assert _columns(fresh, "trial_results")["n_exposure"] == ("INTEGER", False)
+    fresh.close()
+
+    old = duckdb.connect(":memory:")
+    schema.init_schema(old)
+    old.execute("DROP TABLE research_exposures")
+    old.execute("ALTER TABLE trial_results DROP COLUMN n_exposure")
+    old.execute(
+        "INSERT INTO trial_results (trial_id, finished_at, status) VALUES (1, ?, 'failed')", [KNOWN]
+    )
+    old.execute("UPDATE schema_version SET version = ?", [schema.CURRENT_SCHEMA_VERSION - 1])
+    before = _ddl(old)
+    schema.require_research(old)
+    schema.init_schema(old)
+    after = _ddl(old)
+    assert set(after) - set(before) == {"research_exposures"}
+    assert {
+        name: ddl
+        for name, ddl in after.items()
+        if name not in {"research_exposures", "trial_results", "schema_version"}
+    } == {
+        name: ddl for name, ddl in before.items() if name not in {"trial_results", "schema_version"}
+    }
+    assert old.execute("SELECT n_exposure FROM trial_results WHERE trial_id = 1").fetchone() == (
+        None,
+    )
+    assert _versions(old)[-1] == schema.CURRENT_SCHEMA_VERSION
+    old.close()
+
+
+def test_previous_version_still_serves_research_reads_read_only(tmp_path: Path) -> None:
+    path = tmp_path / "previous.duckdb"
+    with duckdb.connect(str(path)) as c:
+        schema.init_schema(c)
+        c.execute("DROP TABLE research_exposures")
+        c.execute("ALTER TABLE trial_results DROP COLUMN n_exposure")
+        c.execute("UPDATE schema_version SET version = ?", [schema.CURRENT_SCHEMA_VERSION - 1])
+    with duckdb.connect(str(path), read_only=True) as c:
+        schema.init_schema(c)
+        schema.require_research(c)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("source", "elsewhere"),
+        ("verdict", "maybe"),
+        ("kill_line_basis", "unknown"),
+        ("n_configurations", 0),
+        ("probe_verified", False),
+    ],
+)
+def test_exposure_checks_refuse_invalid_store_rows(field: str, bad: Any) -> None:
+    c = duckdb.connect(":memory:")
+    schema.init_schema(c)
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(c, "research_exposures", _exposure_row(**{field: bad}))
+    c.close()
+
+
+def test_exposure_nullable_probe_hash_and_unique_key() -> None:
+    c = duckdb.connect(":memory:")
+    schema.init_schema(c)
+    insert_row(
+        c,
+        "research_exposures",
+        _exposure_row(source="open_data", probe_sha256=None, probe_verified=False),
+    )
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(
+            c,
+            "research_exposures",
+            _exposure_row(
+                exposure_id=2, source="open_data", probe_sha256=None, probe_verified=False
+            ),
+        )
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(
+            c,
+            "research_exposures",
+            _exposure_row(
+                exposure_id=3, source="open_data", probe_sha256=None, probe_verified=True
+            ),
+        )
+    c.close()
 
 
 def test_the_look_ahead_harness_never_sees_a_research_table() -> None:
@@ -378,8 +508,8 @@ def test_the_enumerations_are_the_specs_sets() -> None:
         "refused_budget",
         "abandoned",
     )
-    assert schema.RESEARCH_VERDICTS == ("pass", "fail", "underpowered", "n/a")
-    assert schema.RESEARCH_DECISION_KINDS == ("holdout_spend", "budget_amend")
+    assert schema.RESEARCH_VERDICTS == ("pass", "fail", "underpowered", "n/a", "not_computable")
+    assert schema.RESEARCH_DECISION_KINDS == ("holdout_spend", "budget_amend", "verdict_relabel")
 
 
 def test_every_pre_version_12_ddl_blob_is_unchanged() -> None:
@@ -423,7 +553,8 @@ def test_every_research_table_has_known_at_timestamptz_not_null(
     # Not a fact table: no `ingested_at` or `source` (the registrations'
     # `provenance` is the treatment's, an enumeration, not ADR 0003's column).
     assert "ingested_at" not in columns
-    assert "source" not in columns
+    if table != "research_exposures":
+        assert "source" not in columns
 
 
 def test_the_spec_columns_exactly(conn: duckdb.DuckDBPyConnection) -> None:
@@ -728,7 +859,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
     ].replace(
         "red_flag BOOLEAN, gap_max_count_share DOUBLE, gap_max_size_share DOUBLE, ",
         "red_flag BOOLEAN, gap_max_count_share DOUBLE, gap_max_size_share DOUBLE, "
-        "n_research INTEGER, sharpe_unit VARCHAR, ",
+        "n_research INTEGER, n_exposure INTEGER, sharpe_unit VARCHAR, ",
     )
     assert all(f"{column} " in ddl_after["trials"] for column in _TRIALS_V15)
     assert ddl_after["trial_results"] != ddl_before["trial_results"]
@@ -741,8 +872,8 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
     # version 24 (#1506) `borrow_status`, version 28 (#1506, T172b)
     # `symbol_changes`, version 30 (#1713, T189c) `openfigi_types` and
     # version 31 (#821, T187) `successor_chains` and version 35 (#1762, T248c)
-    # `mergers` and version 37 (#2266, T280a) `reconcile_breaks`, all empty; nothing else
-    # gains a table.
+    # `mergers` and version 37 (#2266, T280a) `reconcile_breaks` and version 42
+    # (#2295) `snapshot_sightings`, all empty; nothing else gains a table.
     assert rows_after == {
         **rows_before,
         "filing_events": [],
@@ -752,7 +883,16 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         "openfigi_types": [],
         "successor_chains": [],
         "mergers": [],
+        "spinoff_allocations": [],
         "reconcile_breaks": [],
+        "sec_filing_events": [],
+        "sec_form4_transactions": [],
+        "snapshot_sightings": [],
+        "delisting_reasons": [],
+        "filing_index": [],
+        "filing_index_pending": [],
+        "edgar_filers": [],
+        "edgar_index_files": [],
     }
     # And the migrated store is shaped exactly as a fresh one.
     # (A fresh store gets version 18's and version 20's two kinds before the lab's
@@ -821,3 +961,219 @@ def test_a_read_only_open_of_a_version_15_store_passes(tmp_path: Path) -> None:
     with duckdb.connect(str(path), read_only=True) as c:
         schema.init_schema(c)
         schema.require_research(c)
+
+
+# --- version 41: the `not_computable` verdict (#2617) -------------------------------
+
+#: `research_decisions.kind`'s `CHECK` as version 40 left it.
+_V40_DECISION_KIND_CHECK = "CHECK (kind IN ('holdout_spend', 'budget_amend'))"
+#: `research_results.verdict`'s `CHECK` as version 40 left it.
+_V40_VERDICT_CHECK = "CHECK (verdict IS NULL OR verdict IN ('pass', 'fail', 'underpowered', 'n/a'))"
+
+
+def _version_40_store(path: Path) -> list[tuple[Any, ...]]:
+    """A store as version 40 left it: `research_results` with the four-verdict
+    `CHECK` and three rows, and no version-41 row. Returns the rows in order."""
+    with duckdb.connect(str(path)) as c:
+        schema.init_schema(c)
+        ddl = schema._CREATE_RESEARCH_RESULTS.replace(
+            schema._research_check("research_results", "verdict", nullable=True),
+            _V40_VERDICT_CHECK,
+            1,
+        )
+        assert ddl != schema._CREATE_RESEARCH_RESULTS
+        c.execute("DROP TABLE research_results")
+        c.execute(ddl)
+        decisions = schema._CREATE_RESEARCH_DECISIONS.replace(
+            schema._research_check("research_decisions", "kind"), _V40_DECISION_KIND_CHECK, 1
+        )
+        assert decisions != schema._CREATE_RESEARCH_DECISIONS
+        c.execute("DROP TABLE research_decisions")
+        c.execute(decisions)
+        with pytest.raises(duckdb.ConstraintException):
+            insert_row(c, "research_decisions", _row("research_decisions", kind="verdict_relabel"))
+        for run_id, outcome, verdict in ((3, "ok", "fail"), (1, "failed", None), (2, "ok", "n/a")):
+            insert_row(
+                c,
+                "research_results",
+                _row(
+                    "research_results",
+                    run_id=run_id,
+                    outcome=outcome,
+                    verdict=verdict,
+                    primary_ci_low=float("nan") if run_id == 3 else 0.5,
+                ),
+            )
+        with pytest.raises(duckdb.ConstraintException):
+            insert_row(
+                c,
+                "research_results",
+                _row("research_results", run_id=9, verdict="not_computable"),
+            )
+        c.execute("DELETE FROM schema_version")
+        c.execute(
+            "INSERT INTO schema_version VALUES (?, ?)",
+            [schema._PRE_NOT_COMPUTABLE_VERSION, KNOWN],
+        )
+        assert max(_versions(c)) == 40
+        return c.execute("SELECT * FROM research_results ORDER BY rowid").fetchall()
+
+
+def _same_rows(a: list[tuple[Any, ...]], b: list[tuple[Any, ...]]) -> bool:
+    """Row equality with NaN equal to itself."""
+    return repr(a) == repr(b)
+
+
+def test_the_migration_from_version_40_widens_the_verdict_check(tmp_path: Path) -> None:
+    path = tmp_path / "v40.duckdb"
+    rows = _version_40_store(path)
+    with duckdb.connect(str(path)) as c:
+        rebuilt = (
+            "research_results",
+            "research_decisions",
+            "filing_index",
+            "filing_index_pending",
+            "edgar_filers",
+            "edgar_index_files",
+        )
+        before = {name: sql for name, sql in _ddl(c).items() if name not in rebuilt}
+        schema.init_schema(c)
+        assert _versions(c) == list(range(40, schema.CURRENT_SCHEMA_VERSION + 1))
+        assert "'not_computable'" in schema._check_text(c, "research_results", "verdict")
+        # Every row kept, byte-identical, in insertion order, but run 3's verdict:
+        # its NaN interval bound relabels its `fail` (#2658); no other table moved.
+        relabelled = [(*r[:11], "not_computable", *r[12:]) if r[0] == 3 else r for r in rows]
+        assert _same_rows(
+            c.execute("SELECT * FROM research_results ORDER BY rowid").fetchall(), relabelled
+        )
+        assert {n: s for n, s in _ddl(c).items() if n not in rebuilt} == before
+        assert _ddl(c)["research_results"] == conn_ddl()
+        insert_row(
+            c, "research_results", _row("research_results", run_id=9, verdict="not_computable")
+        )
+        with pytest.raises(duckdb.ConstraintException):
+            insert_row(c, "research_results", _row("research_results", run_id=10, verdict="x"))
+        with pytest.raises(duckdb.ConstraintException):
+            insert_row(c, "research_results", _row("research_results", run_id=3))
+        # Idempotent: a second open changes nothing.
+        after = _ddl(c)
+        schema.init_schema(c)
+        assert _ddl(c) == after
+        assert _versions(c) == list(range(40, schema.CURRENT_SCHEMA_VERSION + 1))
+
+
+def conn_ddl() -> str:
+    """`research_results`'s stored DDL on a fresh store."""
+    with duckdb.connect(":memory:") as c:
+        schema.init_schema(c)
+        return _ddl(c)["research_results"]
+
+
+def test_a_read_only_open_of_a_version_40_store_serves_research_reads(tmp_path: Path) -> None:
+    path = tmp_path / "v40.duckdb"
+    rows = _version_40_store(path)
+    with duckdb.connect(str(path), read_only=True) as c:
+        schema.init_schema(c)
+        schema.require_research(c)
+        assert schema.stored_version(c) == 40
+        assert _same_rows(
+            c.execute("SELECT * FROM research_results ORDER BY rowid").fetchall(), rows
+        )
+
+
+def _relabels(c: duckdb.DuckDBPyConnection) -> list[tuple[Any, ...]]:
+    """The `verdict_relabel` decisions: (run id, registration id, values, made_by)."""
+    return c.execute(
+        "SELECT run_id, registration_id, values_json, made_by FROM research_decisions "
+        "WHERE kind = 'verdict_relabel' ORDER BY decision_id"
+    ).fetchall()
+
+
+def test_the_version_41_migration_relabels_every_non_finite_verdict(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#2658, #2660 (owner, 2026-10-30): a pre-v41 result of any verdict whose
+    stored primary value or interval bound is NaN or infinite becomes
+    `not_computable`, derived from the stored values only; a finite row is
+    untouched; each relabel is a `verdict_relabel` decision row and a log line."""
+    path = tmp_path / "v40.duckdb"
+    rows = _version_40_store(path)
+    assert [(r[0], r[11]) for r in rows] == [(3, "fail"), (1, None), (2, "n/a")]
+    with duckdb.connect(str(path)) as c:
+        configure_connection(c)  # UTC session, so both reads render `known_at` alike
+        insert_row(c, "research_decisions", _row("research_decisions", run_id=3))
+        for run_id, verdict, column, value in (
+            (4, "fail", "primary_ci_low", 0.5),  # finite: a genuine fail
+            (5, "pass", "primary_value", float("inf")),
+            (6, "underpowered", "primary_ci_high", float("-inf")),
+            (7, "n/a", "primary_ci_low", float("nan")),
+            (8, "pass", "primary_ci_low", 0.5),  # finite: a genuine pass
+        ):
+            c.execute(
+                f"INSERT INTO research_results (run_id, outcome, n_configurations, verdict, "
+                f"{column}, known_at) VALUES (?, 'ok', 1, ?, ?, ?)",
+                [run_id, verdict, value, KNOWN],
+            )
+        before = c.execute("SELECT * EXCLUDE (verdict) FROM research_results ORDER BY rowid")
+        kept = before.fetchall()
+        decisions = c.execute("SELECT * FROM research_decisions ORDER BY rowid").fetchall()
+        with caplog.at_level("WARNING", logger="tradepartner.store.schema"):
+            schema.init_schema(c)
+        verdicts = dict(c.execute("SELECT run_id, verdict FROM research_results").fetchall())
+        assert verdicts == {
+            3: "not_computable",
+            1: None,
+            2: "n/a",
+            4: "fail",
+            5: "not_computable",
+            6: "not_computable",
+            7: "not_computable",
+            8: "pass",
+        }
+        after = c.execute("SELECT * EXCLUDE (verdict) FROM research_results ORDER BY rowid")
+        assert _same_rows(after.fetchall(), kept)
+        assert (
+            "relabelled 4 research result(s) to not_computable: "
+            "[(3, 'fail'), (5, 'pass'), (6, 'underpowered'), (7, 'n/a')]"
+        ) in caplog.text
+        # The earlier decision is kept as it was; one decision row per relabel follows it.
+        stored = c.execute("SELECT * FROM research_decisions ORDER BY rowid").fetchall()
+        assert stored[: len(decisions)] == decisions
+        assert [r[0] for r in stored[len(decisions) :]] == [2, 3, 4, 5]
+        made_by = "schema-41 migration"
+        assert _relabels(c) == [
+            (
+                run_id,
+                None,
+                '{"new_verdict":"not_computable","old_verdict":"' + old + '","schema_version":41}',
+                made_by,
+            )
+            for run_id, old in ((3, "fail"), (5, "pass"), (6, "underpowered"), (7, "n/a"))
+        ]
+        # Idempotent: a second open relabels and records nothing more.
+        caplog.clear()
+        schema.init_schema(c)
+        assert "relabelled" not in caplog.text
+        assert len(_relabels(c)) == 4
+        assert dict(c.execute("SELECT run_id, verdict FROM research_results").fetchall()) == (
+            verdicts
+        )
+
+
+def test_the_version_41_migration_relabels_exactly_one_of_two_fails(tmp_path: Path) -> None:
+    """The coordinator's case (#2658): one non-finite `fail`, one finite `fail`."""
+    path = tmp_path / "v40.duckdb"
+    _version_40_store(path)
+    with duckdb.connect(str(path)) as c:
+        c.execute("DELETE FROM research_results WHERE run_id <> 3")
+        c.execute(
+            "INSERT INTO research_results (run_id, outcome, n_configurations, verdict, "
+            "primary_ci_low, known_at) VALUES (4, 'ok', 1, 'fail', 0.5, ?)",
+            [KNOWN],
+        )
+        schema.init_schema(c)
+        assert c.execute("SELECT run_id, verdict FROM research_results ORDER BY 1").fetchall() == [
+            (3, "not_computable"),
+            (4, "fail"),
+        ]
+        assert [r[0] for r in _relabels(c)] == [3]

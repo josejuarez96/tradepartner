@@ -52,10 +52,10 @@ import math
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 from zoneinfo import ZoneInfo
 
 import lxml.etree  # type: ignore[import-untyped]
@@ -347,7 +347,7 @@ def parse_submissions(
     return sorted(entries, key=lambda e: (e.accepted_at, e.accession))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)  # #2616: millions per run, so no per-row __dict__
 class UnstampedFiling:
     """An index row whose acceptance time is unknown: reported, not stamped."""
 
@@ -356,6 +356,9 @@ class UnstampedFiling:
     form: str
     accession: str
     filed_on: date
+    #: 0-based position among the data rows of its source index file (#2813);
+    #: not part of identity, so a row read twice de-duplicates.
+    list_position: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -388,18 +391,20 @@ def parse_filing_index(text: str, acceptance: Mapping[str, datetime]) -> FilingI
     an empty name (#358)."""
     entries: list[FilingIndexEntry] = []
     unstamped: list[UnstampedFiling] = []
+    position = -1
     for line in text.splitlines():
         match = _INDEX_ROW.match(line) or _INDEX_ROW_BLANK_NAME.match(line)
         if match is None:
             if "edgar/data/" in line:
                 raise ValueError(f"form.idx row does not parse: {line.strip()!r}")
             continue
+        position += 1
         cik, accession = _cik(match["cik"]), match["accession"]
         form, name = match["form"], match.groupdict().get("name") or ""
         accepted_at = acceptance.get(accession)
         if accepted_at is None:
             filed_on = date.fromisoformat(match["filed"])
-            unstamped.append(UnstampedFiling(cik, name, form, accession, filed_on))
+            unstamped.append(UnstampedFiling(cik, name, form, accession, filed_on, position))
         else:
             entries.append(FilingIndexEntry(cik, name, form, accession, accepted_at))
     entries.sort(key=lambda e: (e.accepted_at, e.accession, e.cik))
@@ -580,6 +585,7 @@ def parse_statement_facts(
     forms: Iterable[str],
     units: Sequence[str],
     acceptance: Mapping[str, SubmissionStamp],
+    fact_units: Mapping[str, Sequence[str]] | None = None,
 ) -> StatementFactsParse:
     """As-filed statement-fact entries from a companyfacts payload (spec
     amendment 2026-10-03, #660; plan T77). Pure: reported values only, no
@@ -596,7 +602,9 @@ def parse_statement_facts(
       (unknown until submissions names it), unfiltered, so the ingest's hold
       rule sees it; a record with `accepted_at = None` (settled unstampable)
       keeps its form and filter and is emitted unstamped too.
-    - **Units**: only `units` are read, first listed first; entries in any
+    - **Units**: only `units` are read, first listed first (a fact named in
+      `fact_units`, #2826, reads its own ordered list instead; `units` stays
+      the fallback for every other name); entries in any
       other unit are skipped; a filing that carries a fact only in unread
       units, under every tag it uses for it, counts once on `non_unit`.
     - **Malformed** entries (see `_statement_period`) are withheld and
@@ -613,7 +621,7 @@ def parse_statement_facts(
     does any malformed payload structure (a missing key)."""
     cik = _cik(payload["cik"])
     allowed_forms = frozenset(forms)
-    unit_rank = {unit: rank for rank, unit in enumerate(units)}
+    per_fact_units = {name: list(own) for name, own in (fact_units or {}).items()}
     facts: Mapping[str, Any] = payload["facts"]
     # key -> (tag rank, unit rank) -> values; the filing's `filed` per key.
     values: dict[_StatementKey, dict[tuple[int, int], set[float]]] = {}
@@ -623,6 +631,8 @@ def parse_statement_facts(
     unread: set[tuple[str, str]] = set()
     read: set[tuple[str, str]] = set()
     for fact_name, fallbacks in tags.items():
+        read_units = per_fact_units.get(fact_name, units)
+        unit_rank = {unit: rank for rank, unit in enumerate(read_units)}
         for tag_rank, tag in enumerate(fallbacks):
             taxonomy, _, local = tag.partition(":")
             concept = facts.get(taxonomy, {}).get(local)
@@ -681,7 +691,7 @@ def parse_statement_facts(
                 period_start=start,
                 period_end=end,
                 value=found[0],
-                unit=units[rank_of_unit],
+                unit=per_fact_units.get(fact_name, units)[rank_of_unit],
                 form="" if stamp is None else stamp.form,
                 accession=accession,
                 accepted_at=None if stamp is None else stamp.accepted_at,
@@ -807,6 +817,277 @@ def parse_sgml_header(text: str, cik: str | None = None) -> FilingHeader:
         sic=int(sic_match.group(1)) if sic_match else None,
         accepted_at=accepted_at,
     )
+
+
+# --- SEC ownership event forms (T305, #2435) ---------------------------------------
+#
+# Pure parsers for the 13D and Form 4 records of the `events.sec_forms` list. Nothing
+# here touches the store, the network or `master.issuer_forms`: the fetch layer and the
+# tables are T306/T307. The acceptance instant is never read from these payloads (it
+# comes from the submissions JSON), only identity and the filer-typed fields do. A
+# payload with no reliable identity raises `ValueError` (the caller counts
+# `sec_forms_identity_missing`); a Form 4 row with a missing or unparseable required
+# field is skipped and counted in the parse, never defaulted.
+
+#: Bump to make accessions whose identity was terminal (`sec_forms_identity_missing`) be
+#: retried: a different parser may read what this one could not. Separate from every
+#: cache version, so a cache bump never retries them and this bump never re-keys a cache.
+SEC_FORMS_PARSER_VERSION: Final[int] = 1
+
+
+@dataclass(frozen=True)
+class FilingParties:
+    """A 13D's target issuer(s) and reporting persons, as zero-padded CIKs in document
+    order, each once."""
+
+    subject_ciks: tuple[str, ...]
+    filer_ciks: tuple[str, ...]
+
+
+def _unique(ciks: Iterable[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(ciks))
+
+
+@_fail_closed
+def parse_sgml_13d_parties(text: str, accession: str) -> FilingParties:
+    """The `SUBJECT COMPANY` (target) and `FILED BY` (reporting persons) blocks of an
+    unstructured SC 13D or SC 13D/A SGML header. Only the text before `</SEC-HEADER>`
+    is read. Raises `ValueError` for a truncated header, one naming another accession,
+    or one lacking a CENTRAL INDEX KEY in either block."""
+    header, closed, _ = text.partition("</SEC-HEADER>")
+    if not closed:
+        raise ValueError("SGML header is truncated: no </SEC-HEADER>")
+    named = _SGML_ACCESSION.search(header)
+    if named is None or named.group(1) != accession:
+        raise ValueError(f"SGML header for {accession} names {named.group(1) if named else None}")
+    blocks: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in header.splitlines():
+        if line.startswith("<") or not line.strip():
+            continue
+        if not line.startswith((" ", "\t")):
+            title = line.strip()
+            current = title.rstrip(":") if title.endswith(":") else None
+            continue
+        match = _HEADER_FIELD.match(line)
+        if (
+            current in ("SUBJECT COMPANY", "FILED BY")
+            and match
+            and (match["key"] == "CENTRAL INDEX KEY" and match["value"])
+        ):
+            blocks.setdefault(current, []).append(_cik(match["value"]))
+    subjects, filers = (
+        _unique(blocks.get("SUBJECT COMPANY", ())),
+        _unique(blocks.get("FILED BY", ())),
+    )
+    if not subjects or not filers:
+        raise ValueError(f"{accession}: SGML header names no CENTRAL INDEX KEY for a party")
+    return FilingParties(subjects, filers)
+
+
+def _local(tag: object) -> str:
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def _xml_root(xml_text: str) -> ET.Element:
+    """Parse with stdlib expat (no external entities or DTD fetch; entity expansion is
+    bounded, expat >= 2.4) and drop namespaces, so one path reads either spelling."""
+    root = ET.fromstring(xml_text)
+    for element in root.iter():
+        element.tag = _local(element.tag)
+    return root
+
+
+def _child_text(element: ET.Element, path: str) -> str:
+    return (element.findtext(path) or "").strip()
+
+
+@_fail_closed
+def parse_schedule_13d_xml(xml_text: str) -> FilingParties:
+    """A structured `SCHEDULE 13D` (or `/A`): the target is the cover page's
+    `issuerCIK`, the filers its `reportingPersonCIK` entries. The submitting filer's
+    credentials are not a reporting person. Raises `ValueError` when either is
+    missing."""
+    root = _xml_root(xml_text)
+    subjects = [
+        _cik(c) for e in root.iterfind(".//issuerInfo/issuerCIK") if (c := (e.text or "").strip())
+    ]
+    filers = [
+        _cik(c)
+        for e in root.iterfind(".//reportingPersonInfo/reportingPersonCIK")
+        if (c := (e.text or "").strip())
+    ]
+    if not subjects:
+        raise ValueError("SCHEDULE 13D has no issuerCIK")
+    if not filers:
+        raise ValueError("SCHEDULE 13D has no reportingPersonCIK")
+    return FilingParties(_unique(subjects), _unique(filers))
+
+
+@dataclass(frozen=True)
+class Form4Transaction:
+    """One non-derivative Form 4 transaction for one reporting owner. `line_no` is the
+    zero-based position among the document's `nonDerivativeTransaction` elements only
+    (holdings never count; a skipped row still holds its position). Dates are the
+    filer-typed calendar dates, never a clock; `price` and `shares_owned_after` are
+    `None` when the XML gives none, never zero-filled."""
+
+    issuer_cik: str
+    filer_cik: str
+    line_no: int
+    is_director: bool
+    is_officer: bool
+    is_ten_percent_owner: bool
+    is_other: bool
+    transaction_date: date
+    deemed_execution_date: date | None
+    transaction_code: str
+    acquired_disposed: str
+    shares: Decimal
+    price: Decimal | None
+    shares_owned_after: Decimal | None
+    ownership_form: str
+    security_title: str
+    date_of_original_submission: date | None
+
+
+@dataclass(frozen=True)
+class Form4Parse:
+    """A Form 4 or 4/A: the issuer, every reporting owner, the rows read (one per owner
+    and transaction) and the count of transactions skipped for a missing or unparseable
+    required field (`sec_forms_form4_row_skipped`)."""
+
+    issuer_cik: str
+    filer_ciks: tuple[str, ...]
+    transactions: tuple[Form4Transaction, ...]
+    skipped: int
+
+
+_XML_DATE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})(?:Z|[+-]\d{2}:\d{2})?\s*$")
+_FLAG_TRUE = frozenset({"1", "true"})
+
+
+class _BadField(ValueError):
+    """A required Form 4 row field is missing or unparseable."""
+
+
+def _xml_date(text: str) -> date:
+    match = _XML_DATE.match(text)
+    if match is None:
+        raise _BadField(f"not a date: {text!r}")
+    try:
+        return date.fromisoformat(match.group(1))
+    except ValueError as e:
+        raise _BadField(f"invalid date: {text!r}") from e
+
+
+def _xml_decimal(text: str) -> Decimal:
+    value = Decimal(text.replace(",", "").strip())
+    if not value.is_finite():
+        raise _BadField(f"not a finite number: {text!r}")
+    return value
+
+
+def _flag(owner: ET.Element, name: str) -> bool:
+    return _child_text(owner, f"reportingOwnerRelationship/{name}").lower() in _FLAG_TRUE
+
+
+@_fail_closed
+def parse_form4(xml_text: str) -> Form4Parse:
+    """A Form 4 or 4/A `ownershipDocument`: every non-derivative transaction for every
+    reporting owner (a joint filing keeps one row per owner and transaction, with that
+    owner's relationship flags). Derivative (Table II) rows and `nonDerivativeHolding`
+    rows are not read. A transaction lacking a code, date, acquired/disposed flag,
+    share count or direct/indirect flag, or carrying a present-but-unparseable number
+    or date, is skipped and counted, and the filing's other rows stand. Raises
+    `ValueError` for no `issuerCik`, no reporting owner with an `rptOwnerCik`, or one
+    owner CIK listed twice (identity missing or ambiguous)."""
+    root = _xml_root(xml_text)
+    issuer = _child_text(root, "issuer/issuerCik")
+    if not issuer:
+        raise ValueError("Form 4 has no issuerCik")
+    issuer_cik = _cik(issuer)
+    owners: list[tuple[str, ET.Element]] = []
+    for owner in root.iterfind("reportingOwner"):
+        raw = _child_text(owner, "reportingOwnerId/rptOwnerCik")
+        if not raw:
+            raise ValueError("Form 4 reporting owner has no rptOwnerCik")
+        owners.append((_cik(raw), owner))
+    if len({cik for cik, _ in owners}) != len(owners):
+        # Two blocks for one owner would repeat (filer_cik, line_no) with possibly
+        # different relationship flags: the identity is ambiguous, so none is guessed.
+        raise ValueError("Form 4 lists a reporting owner CIK more than once")
+    if not owners:
+        raise ValueError("Form 4 has no reportingOwner")
+    original_text = _child_text(root, "dateOfOriginalSubmission")
+    try:
+        original = _xml_date(original_text) if original_text else None
+    except _BadField:
+        original = None
+
+    parsed: list[dict[str, Any] | None] = []
+    for element in root.iterfind("nonDerivativeTable/nonDerivativeTransaction"):
+        parsed.append(_form4_fields(element))
+    rows = tuple(
+        Form4Transaction(
+            issuer_cik=issuer_cik,
+            filer_cik=cik,
+            line_no=line_no,
+            is_director=_flag(owner, "isDirector"),
+            is_officer=_flag(owner, "isOfficer"),
+            is_ten_percent_owner=_flag(owner, "isTenPercentOwner"),
+            is_other=_flag(owner, "isOther"),
+            date_of_original_submission=original,
+            **fields,
+        )
+        for cik, owner in owners
+        for line_no, fields in enumerate(parsed)
+        if fields is not None
+    )
+    skipped = sum(1 for fields in parsed if fields is None)
+    ordered = tuple(
+        sorted(rows, key=lambda r: (r.line_no, [c for c, _ in owners].index(r.filer_cik)))
+    )
+    return Form4Parse(issuer_cik, _unique(c for c, _ in owners), ordered, skipped)
+
+
+def _form4_fields(element: ET.Element) -> dict[str, Any] | None:
+    """The owner-independent fields of one `nonDerivativeTransaction`, or `None` when a
+    required one is missing or unparseable (the row is skipped, never defaulted)."""
+
+    def value(path: str) -> str:
+        return _child_text(element, f"{path}/value")
+
+    try:
+        code = _child_text(element, "transactionCoding/transactionCode")
+        acquired = value("transactionAmounts/transactionAcquiredDisposedCode").upper()
+        ownership = value("ownershipNature/directOrIndirectOwnership").upper()
+        shares_text = value("transactionAmounts/transactionShares")
+        date_text = value("transactionDate")
+        if not code or acquired not in ("A", "D") or ownership not in ("D", "I"):
+            return None
+        if not shares_text or not date_text:
+            return None
+        price_text = value("transactionAmounts/transactionPricePerShare")
+        owned_text = value("postTransactionAmounts/sharesOwnedFollowingTransaction")
+        deemed_text = value("deemedExecutionDate")
+        try:
+            deemed = _xml_date(deemed_text) if deemed_text else None
+        except _BadField:
+            deemed = None  # optional: an invalid date is absent, as dateOfOriginalSubmission
+        return {
+            "transaction_date": _xml_date(date_text),
+            "deemed_execution_date": deemed,
+            "transaction_code": code,
+            "acquired_disposed": acquired,
+            "shares": _xml_decimal(shares_text),
+            "price": _xml_decimal(price_text) if price_text else None,
+            "shares_owned_after": _xml_decimal(owned_text) if owned_text else None,
+            "ownership_form": ownership,
+            "security_title": value("securityTitle"),
+        }
+    except (_BadField, InvalidOperation, ValueError):
+        return None
 
 
 # --- cover page (iXBRL) -----------------------------------------------------------
@@ -1136,6 +1417,78 @@ def parse_delisting(
         exchange=normalize_exchange(text("exchange/entityName")),
         accession=accession,
         accepted_at=accepted_at,
+    )
+
+
+#: The 8-K items that can evidence why a listing ended (spec amendment 2026-10-30,
+#: #2670 req 1; plan T327): 1.03 bankruptcy or receivership, 2.01 completion of an
+#: acquisition, 3.01 notice of delisting. `filing_events` already stores every
+#: 8-K's `items` string verbatim (T164), so this is the whole item coverage the
+#: reason read needs; it is a read-side selection, not a second feed.
+REASON_8K_ITEMS: Final = ("1.03", "2.01", "3.01")
+
+
+def eightk_item_codes(items: str) -> frozenset[str]:
+    """The item codes of a verbatim `items` string (`"2.02,9.01"`), whitespace
+    dropped, so `2.01` never matches `12.01`. A blank string lists none."""
+    return frozenset(code.strip() for code in items.split(",") if code.strip())
+
+
+def normalise_rule_provision(raw: str) -> str | None:
+    """A Form 25's `ruleProvision` with spaces, `Rule` and the `17 CFR 240.`
+    prefix dropped (`17 CFR 240.12d2-2(a)(2)` -> `12d2-2(a)(2)`), as the
+    departure corpus normalises it; `None` when blank."""
+    compact = re.sub(r"\s+", "", raw)
+    compact = re.sub(r"(?i)rule", "", compact)
+    compact = re.sub(r"(?i)^(17CFR)?(240\.)?", "", compact)
+    return compact or None
+
+
+@dataclass(frozen=True)
+class Form25Evidence:
+    """What a Form 25 or 25-NSE says about why a class is removed, as its own
+    filing states it, known at the filing's `accepted_at` (plan T327): the
+    Rule 12d2-2 provision of the notification and, when a notice exhibit was
+    read, its text. Either may be absent; neither is guessed."""
+
+    cik: str
+    form: str
+    class_title: str
+    exchange: str
+    accession: str
+    accepted_at: datetime
+    provision: str | None
+    notice_text: str | None = None
+
+    def __post_init__(self) -> None:
+        ensure_tz_aware_utc(self.accepted_at, field_name="accepted_at")
+
+
+@_fail_closed
+def parse_form25_evidence(
+    xml_text: str,
+    *,
+    form: str,
+    accession: str,
+    accepted_at: datetime,
+    notice_text: str | None = None,
+) -> Form25Evidence:
+    """The reason evidence of a Form 25 or 25-NSE primary document: the same
+    issuer, class and exchange `parse_delisting` reads (so the evidence joins
+    its episode) plus the normalised `ruleProvision`. A blank provision is
+    `None`. `notice_text` is the exhibit text when the caller read one."""
+    parsed = parse_delisting(xml_text, form=form, accession=accession, accepted_at=accepted_at)
+    root = ET.fromstring(xml_text)
+    raw = root.findtext("ruleProvision") or ""
+    return Form25Evidence(
+        cik=parsed.cik,
+        form=parsed.form,
+        class_title=parsed.class_title,
+        exchange=parsed.exchange,
+        accession=accession,
+        accepted_at=parsed.accepted_at,
+        provision=normalise_rule_provision(raw),
+        notice_text=notice_text,
     )
 
 

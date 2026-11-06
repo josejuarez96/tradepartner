@@ -1303,3 +1303,106 @@ def test_a_long_only_sweep_still_registers(
     result = register(ready, _copy(tmp_path, SWEEP_SOURCE), settings, registered_by="test")
     assert result.created
     assert len(result.variants) == 4
+
+
+def test_a_long_short_borrow_grid_registers_in_an_existing_family(
+    ready: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    path = _copy(
+        tmp_path,
+        SWEEP_SOURCE,
+        (
+            "per_side_bps = 15.0",
+            "per_side_bps = 15.0\nborrow_bps_per_year = 30.0\n"
+            "borrow_sensitivity_bps = [0.0, 300.0]",
+        ),
+        ("[gap]", '[portfolio]\nside = "long_short"\nnet_exposure = 0.0\n\n[gap]'),
+    )
+    result = register(ready, path, settings, registered_by="test")
+    assert result.created
+    assert len(result.variants) == 4
+    assert all(h.params["costs.borrow_sensitivity_bps"] == [0.0, 300.0] for h in result.hypotheses)
+    assert lab_registry.family_declared_count(ready, "momentum") == 4
+    assert results.family_n(ready, "momentum") == 1
+    for record in result.hypotheses:
+        _run_ok(ready, settings, tmp_path, record)
+    assert results.family_n(ready, "momentum") == 5
+
+
+def test_a_long_only_file_cannot_vary_borrow_sensitivity(
+    ready: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    path = _copy(
+        tmp_path,
+        SWEEP_SOURCE,
+        ("per_side_bps = 15.0", "per_side_bps = 15.0\nborrow_sensitivity_bps = [0.0, 300.0]"),
+    )
+    _refused(ready, path, settings, FamilyRuleError, "costs.borrow_sensitivity_bps")
+
+
+def test_each_registered_borrow_sensitivity_value_counts_in_family_n(
+    ready: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    for index, sensitivity in enumerate(("[0.0, 300.0]", "[0.0, 100.0, 300.0]"), 1):
+        path = _copy(
+            tmp_path,
+            SWEEP_SOURCE,
+            (
+                "per_side_bps = 15.0",
+                "per_side_bps = 15.0\nborrow_bps_per_year = 30.0\n"
+                f"borrow_sensitivity_bps = {sensitivity}",
+            ),
+            ("[gap]", '[portfolio]\nside = "long_short"\nnet_exposure = 0.0\n\n[gap]'),
+            ('"strategy.top_fraction" = [0.05, 0.20]', '"strategy.top_fraction" = [0.05]'),
+            (
+                '"schedule.rebalance_cadence" = ["month_end", "week_end"]',
+                '"schedule.rebalance_cadence" = ["month_end"]',
+            ),
+            slug=f"borrow-sweep-{index}",
+        )
+        registered = register(ready, path, settings, registered_by="test")
+        assert len(registered.hypotheses) == 1
+        _run_ok(ready, settings, tmp_path, registered.hypotheses[0])
+        assert results.family_n(ready, "momentum") == index + 1
+
+
+@pytest.mark.parametrize("rule_present", [False, True])
+def test_borrow_axis_agrees_across_the_three_family_rule_readers(
+    lab_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    rule_present: bool,
+) -> None:
+    twin = _twin(
+        lab_store,
+        settings,
+        tmp_path,
+        run=False,
+        rules_without=() if rule_present else ("costs.borrow_sensitivity_bps",),
+    )
+    rules = lab_registry.family_rules(lab_store, "momentum")
+    assert rules is not None
+    parsed = hypothesis.parse_file(_copy(tmp_path, TWIN_SOURCE))
+    sweep_file = sweep.parse_sweep_file(_copy(tmp_path, SWEEP_SOURCE), settings)
+    base = frozen.frozen_values(twin)
+    for side, expected in (("long_short", set()), ("long_only", {"costs.borrow_sensitivity_bps"})):
+        params = {
+            **base,
+            "portfolio.side": side,
+            "costs.borrow_sensitivity_bps": [0.0, 300.0],
+        }
+        record = dataclasses.replace(twin, params=params)
+        found = (
+            hypothesis._rule_differences(parsed, params, rules),
+            sweep._rule_differences(sweep_file, params, rules),
+            lab_registry._rule_differences(record, rules),
+        )
+        assert all(
+            {item.split(" ")[0] for item in differences} == expected for differences in found
+        )

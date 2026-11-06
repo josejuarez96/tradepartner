@@ -210,6 +210,29 @@ def _text(at: AppTest) -> str:
     return "\n".join(parts)
 
 
+def test_version_37_store_shows_journal_outdated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = _store(tmp_path / "v37.duckdb")
+    with open_for_write(Settings(_env_file=None, store={"path": str(path)})) as conn:
+        for column in ("n_assets_intersected", "assets_intersection_skipped"):
+            conn.execute(f"ALTER TABLE paper_plans DROP COLUMN {column}")
+        conn.execute("UPDATE schema_version SET version = 37")
+    at = _app(monkeypatch, path)
+
+    def outdated(
+        conn: object, settings: Settings, book: str, now: datetime, *, top_n: int = 5
+    ) -> book_view.BookView:
+        book_activity.today(conn, 1, _D2, now, limit=5)  # type: ignore[arg-type]
+        raise AssertionError("expected outdated journal")
+
+    monkeypatch.setattr(book_view, "build", outdated)
+    at.run(timeout=30)
+    assert not at.exception
+    assert "journal outdated" in _text(at).lower()
+    assert "paper plans require schema version" in _text(at)
+
+
 def test_header_shows_name_pill_sentence_value_and_returns(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

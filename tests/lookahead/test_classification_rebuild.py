@@ -17,12 +17,13 @@ T3 and so becomes a `fund`; a stale row an older rule set wrote sits at T1.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
 import pytest
 
+from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.filings import (
     CoverListing,
     CoverPage,
@@ -33,14 +34,61 @@ from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.config import Settings
 from tradepartner.ingest import OK, ingest_session
-from tradepartner.store.classify import classifications_as_of
+from tradepartner.store import filing_index as stored_index
+from tradepartner.store import schema
+from tradepartner.store.classify import build_classifications, classifications_as_of
 from tradepartner.store.db import insert_row, open_for_write
+from tradepartner.store.master import build_master
 
 CIK = "0000000077"
 T1 = datetime(2019, 3, 1, 21, 30, tzinfo=UTC)  # 10-K and cover page accepted
 T3 = datetime(2019, 9, 3, 20, 30, tzinfo=UTC)  # N-CSR accepted: a fund
 FIRST_RUN = datetime(2019, 10, 1, 2, 0, tzinfo=UTC)
 REBUILD_RUN = datetime(2019, 10, 8, 2, 0, tzinfo=UTC)
+
+
+def test_table_backed_master_and_classification_truncate_at_build_clock(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = stored_index.Listing(
+        CIK,
+        "0000000077-19-000001",
+        "10-K",
+        "Acme Co",
+        date(2019, 3, 1),
+        T1,
+        date(2019, 3, 1),
+        True,
+    )
+    future = stored_index.Listing(
+        CIK,
+        "0000000077-19-000002",
+        "N-CSR",
+        "Acme Co",
+        date(2019, 9, 3),
+        T3,
+        date(2019, 9, 3),
+        True,
+    )
+    at = T1 + timedelta(days=2)
+    results = []
+    for rows in ((first,), (first, future)):
+        conn = duckdb.connect(":memory:")
+        schema.init_schema(conn)
+        stored_index.insert_listings(conn, [rows[0]], at)
+        if len(rows) == 2:
+            stored_index.insert_listings(conn, [rows[1]], T3 + timedelta(days=1))
+        source = EdgarFilingSource(settings, clock=lambda: at)
+        source.use_index(conn)
+        monkeypatch.setattr(source, "companies_snapshot", lambda: [])
+        monkeypatch.setattr(source, "delistings", lambda *_args: [])
+        monkeypatch.setattr(source, "cover_pages", lambda *_args: [])
+        monkeypatch.setattr(source, "filing_headers", lambda *_args: [])
+        master = build_master(source, settings, ingested_at=at)
+        classes = build_classifications(source, master, settings, ingested_at=at)
+        results.append((master.securities, master.listings, classes.classifications))
+        conn.close()
+    assert results[0] == results[1]
 
 
 class _NoPrices(PriceSource):

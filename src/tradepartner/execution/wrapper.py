@@ -154,6 +154,10 @@ falling back to `settings.costs`. Each phase, in order:
    never `buying_power`. The declared stub (plan T60b, development-process.md
    "Plan shape" rule 4): if T48b finds paper `cash` lags same-session proceeds,
    its amendments change this one read (`_buys_cash`), a size-S issue here;
+   on a book in `paper.execution` that cash is less the sleeve c x E (E the
+   ledger equity at the reference prices of the buys phase's read, c the book's
+   `cash_sleeve_fraction`), floored at zero (paper spec amendment 2026-11-01
+   item 3, T370), and the batch ends with item 6's `paper_execution` line;
 5. every `OrderRequest` built and validated (`phases.requests_for`): a
    `ValueError` halts the phase before any request reaches the broker;
 6. `risk.check_phase` against that same cash, with the batch's decisions and
@@ -235,7 +239,7 @@ from tradepartner.adapters.broker import (
     canonical_symbol,
 )
 from tradepartner.backtest.costs import Commissions
-from tradepartner.calendar import previous_session, session_close
+from tradepartner.calendar import all_sessions, previous_session, session_close
 from tradepartner.config import (
     FROZEN_COSTS_KEYS,
     CostsConfig,
@@ -260,6 +264,7 @@ from tradepartner.errors import (
 from tradepartner.execution import breaks as break_rules
 from tradepartner.execution import phases, switch
 from tradepartner.execution.alerts import Alerter
+from tradepartner.execution.buy_timing import arm_for, execution_for
 from tradepartner.execution.collect import (
     Connect,
     PriceBand,
@@ -268,6 +273,7 @@ from tradepartner.execution.collect import (
     note_unjudged,
 )
 from tradepartner.execution.ledger import Ledger, from_journal
+from tradepartner.execution.lock import sandbox_store_refusal
 from tradepartner.execution.plan import SHORT, BuyCosts, DecisionState, decision_state, residue
 from tradepartner.execution.planning import current_listings, reference_prices
 from tradepartner.execution.reattempts import attempt_scope, write_offs
@@ -276,6 +282,7 @@ from tradepartner.execution.reserve import open_buy_reserve
 from tradepartner.execution.risk import (
     OpenSell,
     Skip,
+    Violation,
     Violations,
     _buy_cash,
     check_phase,
@@ -533,7 +540,8 @@ class BatchOutcome:
     order ids submitted, sells first; `skips` the phase-time skips journaled;
     `deferred` the buys the sizing deferred; `written_off` the buys written off
     at the phase's end. `cash` is the buys phase's cash (`account().cash` less
-    the reserve, at least 0) and `cash_left` that cash less the modelled cost
+    the reserve, at least 0, less the sleeve on a book in `paper.execution`,
+    T370) and `cash_left` that cash less the modelled cost
     of every buy submitted, after `risk.check_phase`'s skips (#518), for the
     run's `unspent_cash` test; both None when no buys phase read the cash."""
 
@@ -544,6 +552,102 @@ class BatchOutcome:
     written_off: tuple[int, ...] = ()
     cash: float | None = None
     cash_left: float | None = None
+
+
+#: Item 6's fallback on a V1 session until phase (i') is built (T371): the
+#: session keeps its arm and runs req 3's two phases, as V0 does.
+OPEN_TRANCHE_NOT_BUILT = "open_tranche_not_built"
+PAPER_EXECUTION = "paper_execution"
+_NA = "na"
+
+
+@dataclass
+class _Variant:
+    """Item 6's record of one batch of a book in `paper.execution` (paper spec
+    amendment 2026-11-01, T370): the arm from `buy_timing.arm_for`, the configured
+    timing and c, the sleeve c x E the buys phase kept (or c x the batch-start
+    ledger equity when no buys phase read the cash), `idle_cash` B from one
+    `account()` read after the sells' last submit when a buys phase follows and the
+    switch reads clear (with no sells phase, the buys phase's own read; `na` on a
+    batch with no buys phase or a killed one), and `min_cash`, the lowest raw
+    `account().cash` read in the batch. Phase (i') is T371's, so its counts are 0 here."""
+
+    arm: str
+    timing: str
+    fraction: float
+    fallback: str
+    sleeve_cash: float | None = None
+    idle_cash: float | None = None
+    min_cash: float | None = None
+    open_buys: int = 0
+    open_notional: float = 0.0
+    open_unsent: int = 0
+    opg_after_cutoff: int = 0
+
+    def saw(self, cash: float) -> None:
+        """Count one raw `account().cash` reading toward `min_cash`."""
+        self.min_cash = cash if self.min_cash is None else min(self.min_cash, cash)
+
+    def line(self) -> str:
+        """The run-notes line; every number is `repr` of its float, so it parses
+        back exactly (`paper_execution_fields`), and an unread value is `na`."""
+
+        def number(value: float | None) -> str:
+            return _NA if value is None else repr(float(value))
+
+        return (
+            f"{PAPER_EXECUTION} arm={self.arm} timing={self.timing} "
+            f"sleeve_fraction={number(self.fraction)} sleeve_cash={number(self.sleeve_cash)} "
+            f"idle_cash={number(self.idle_cash)} min_cash={number(self.min_cash)} "
+            f"open_buys={self.open_buys} open_notional={number(self.open_notional)} "
+            f"open_unsent={self.open_unsent} fallback={self.fallback} "
+            f"opg_after_cutoff={self.opg_after_cutoff}"
+        )
+
+
+def paper_execution_fields(line: str) -> dict[str, str | int | float | None]:
+    """Parse item 6's line back: `arm`, `timing` and `fallback` as text; the counts
+    as `int`; the cash fields and `sleeve_fraction` as `float`, `na` as None. A line
+    that is not item 6's raises `ValueError`."""
+    head, _, rest = line.partition(" ")
+    if head != PAPER_EXECUTION:
+        raise ValueError(f"not a {PAPER_EXECUTION} line: {line!r}")
+    texts = {"arm", "timing", "fallback"}
+    counts = {"open_buys", "open_unsent", "opg_after_cutoff"}
+    numbers = {"sleeve_fraction", "sleeve_cash", "idle_cash", "min_cash", "open_notional"}
+    fields: dict[str, str | int | float | None] = {}
+    for part in rest.split(" "):
+        key, sep, value = part.partition("=")
+        if not sep or key in fields or key not in texts | counts | numbers:
+            raise ValueError(f"bad field {part!r} in {line!r}")
+        if key in texts:
+            fields[key] = value
+        elif key in counts:
+            fields[key] = int(value)
+        else:
+            fields[key] = None if value == _NA else float(value)
+    if set(fields) != texts | counts | numbers:
+        raise ValueError(f"missing fields in {line!r}")
+    return fields
+
+
+def _ledger_equity(book: _Book) -> float:
+    """Req 3 (c)'s equity: the book's ledger equity at its reference prices."""
+    ledger = book.ledger
+    marks = {sid: book.price_of(sid) for sid in (*ledger.positions, *ledger.short_holdings)}
+    return ledger.equity(marks)
+
+
+def _own_book_rows(
+    conn: duckdb.DuckDBPyConnection, book_id: str
+) -> tuple[list[OrderRow], list[OrderEventRow], list[OrderedFill]]:
+    """Every order, event and live fill of book `book_id`, across all its windows
+    and sessions (a buy left open by an earlier window still counts), and none of
+    another book (its own account, #2475): what the open-buy reserve reads."""
+    orders = [o for o in orders_for(conn, window_id=None) if o.book_id == book_id]
+    ids = {o.client_order_id for o in orders}
+    events = [e for e in order_events_for(conn, window_id=None) if e.client_order_id in ids]
+    return orders, events, fills_for(conn, client_order_ids=ids)
 
 
 @dataclass(frozen=True)
@@ -677,6 +781,9 @@ class RiskGatedBroker:
         self._recheck: bool = False
         self._killed: bool = False
         self._phase_incomplete: bool = False
+        #: Item 6's record of the batch in progress (reset by `execute`); None for a
+        #: book outside `paper.execution`.
+        self._variant: _Variant | None = None
 
     def __repr__(self) -> str:
         return f"RiskGatedBroker(broker={type(self._broker).__name__})"
@@ -697,6 +804,22 @@ class RiskGatedBroker:
             )
         self._last = reading
         return reading
+
+    def _phase_time(
+        self,
+        notes: list[str],
+        phase: str,
+        stamp: datetime | None = None,
+        *,
+        count: int | None = None,
+    ) -> None:
+        """Add a UTC phase reading (or, with `count`, a count) to the run's existing
+        result notes (#2620)."""
+        if count is not None:
+            notes.append(f"paper_phase {phase}={count}")
+            return
+        at = self.read_clock() if stamp is None else stamp
+        notes.append(f"paper_phase {phase}={at.isoformat()}")
 
     def clock_precheck(self, session: date, last_ok_ingest: datetime | None) -> datetime:
         """The pre-check before a phase's first submit (module docstring); return
@@ -780,8 +903,19 @@ class RiskGatedBroker:
         forced exits handed to this batch; each decision once. Every exception
         is a fault for the caller's halt path. A batch that skipped a name for one
         of the three per-name reasons writes one `skipped` alert naming each name
-        and its reason (T202)."""
-        outcome = self._trade(run, decisions, forced_exits, notes if notes is not None else [])
+        and its reason (T202).
+
+        On a book in `paper.execution` the batch appends item 6's `paper_execution`
+        line to `notes` however it ends, a fault included (paper spec amendment
+        2026-11-01, T370); on any other book it writes none."""
+        notes = notes if notes is not None else []
+        self._variant = None
+        try:
+            outcome = self._trade(run, decisions, forced_exits, notes)
+        finally:
+            if self._variant is not None:
+                notes.append(self._variant.line())
+            self._variant = None
         self._alert_skips(run, outcome.skips)
         return outcome
 
@@ -836,6 +970,7 @@ class RiskGatedBroker:
         # `missed` (ADR 0010 point 2), whichever decisions that phase held.
         rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
         book = self._read_book(run, rows)
+        self._variant = self._variant_for(run, book)
         self._check_break_cap(run, book)
         if any(d.side == _BUY for d in decisions) and not self._engaged(run, book.window):
             # The buys phase's reserve prices every open quantity buy: a name
@@ -856,7 +991,10 @@ class RiskGatedBroker:
         submitted: list[str] = []
         skips: tuple[Skip, ...] = ()
         counted = 0
-        if attempt_scope(rows, book.states, phase=_SELL).attempts:
+        has_sells = bool(attempt_scope(rows, book.states, phase=_SELL).attempts)
+        # Item 6: with no sells phase, B is (ii)'s own read, after its switch check.
+        idle_at_buys = self._variant is not None and not has_sells
+        if has_sells:
             if self._engaged(run, book.window):
                 return BatchOutcome(_SKIPPED_KILL_SWITCH)
             assets = self._phase_assets(run, book, rows, _SELL)
@@ -882,6 +1020,8 @@ class RiskGatedBroker:
             )
             _log_held(run, sold.held)
             sold = replace(sold, skips=(*sold.skips, *unsent))
+            # Before the gate journals a sell: a breach leaves no order row (#2973).
+            self._check_run_total(run, rebalance, len(sold.orders), rows, book)
             nobody = Account(book.window.account_id, 0.0, 0.0, 0.0, self.read_clock())
             gated = self._gate(
                 run,
@@ -913,12 +1053,32 @@ class RiskGatedBroker:
             skips, counted = (*skips, *refused), counted + len(refused)
             if self._killed:
                 return BatchOutcome(_SKIPPED_KILL_SWITCH, tuple(submitted), skips)
+            if (
+                self._variant is not None
+                and any(d.side == _BUY for d in decisions)
+                and not self._engaged(run, book.window)
+            ):
+                # Item 6: B after the sells' last submit, only when a buys phase
+                # follows and the switch reads clear, so a read that only feeds the
+                # record never changes how a sells-only or killed batch ends.
+                self._note_idle(run, rows)
+            # After the kill-switch return, so a clock read can't change the halt path.
+            if submitted:
+                self._phase_time(notes, "sells_submitted")
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
                 self._await_sells(run, [row for row, _ in gated.to_submit], book, notes)
         if not any(d.side == _BUY for d in decisions):
             return BatchOutcome(_OK, tuple(submitted), skips)
         bought = self._buys(
-            run, rows, rebalance, sold, len(submitted), counted, len(decisions), notes
+            run,
+            rows,
+            rebalance,
+            sold,
+            len(submitted),
+            counted,
+            len(decisions),
+            notes,
+            idle_at_buys=idle_at_buys,
         )
         return BatchOutcome(
             bought.status,
@@ -930,6 +1090,37 @@ class RiskGatedBroker:
             bought.cash_left,
         )
 
+    def _check_run_total(
+        self,
+        run: PaperRunRow,
+        rebalance: Sequence[date],
+        sells: int,
+        rows: Sequence[DecisionRow],
+        book: _Book,
+    ) -> None:
+        """Refuse the run before its first sell when the built sell orders plus
+        the buys planned would pass `risk.max_orders_per_run` (#2973). The buys
+        are sized after the sells fill, so their count here is the plan's buy
+        attempts, an upper bound; the buys phase's own check stays the backstop.
+        Nothing is submitted: the same refusal path as the phase check."""
+        buys = len(attempt_scope(rows, book.states, phase=_BUY).attempts)
+        total, cap = sells + buys, self._frozen.max_orders_per_run
+        if total > cap:
+            self._refuse(
+                run,
+                Violations(
+                    (
+                        Violation(
+                            _LIMIT_BREACH,
+                            "max_orders_per_run",
+                            f"{total} orders (sells {sells}, planned buys {buys}) "
+                            f"against the cap of {cap}, before any sell was submitted",
+                        ),
+                    )
+                ),
+                rebalance,
+            )
+
     def _buys(
         self,
         run: PaperRunRow,
@@ -940,8 +1131,12 @@ class RiskGatedBroker:
         prior_skips: int,
         plan_decisions: int,
         notes: list[str],
+        *,
+        idle_at_buys: bool = False,
     ) -> BatchOutcome:
-        """The buys phase, read after the sells' collection (module docstring)."""
+        """The buys phase, read after the sells' collection (module docstring).
+        `idle_at_buys`: the batch had no sells phase, so this phase's cash read is
+        item 6's `idle_cash` too."""
         assert run.session is not None
         book = self._read_book(run, rows)
         scope = attempt_scope(rows, book.states, phase=_BUY)
@@ -953,6 +1148,15 @@ class RiskGatedBroker:
         assets = self._phase_assets(run, book, rows, _BUY)
         account = self._broker.account()
         cash = self._buys_cash(account, book, run.session)
+        if self._variant is not None:
+            # Item 3: (ii) never spends below the sleeve c x E, E at this read.
+            self._variant.saw(account.cash)
+            if idle_at_buys:
+                self._variant.idle_cash = cash
+            sleeve = self._variant.fraction * _ledger_equity(book)
+            self._variant.sleeve_cash = sleeve
+            if sleeve > 0:
+                cash = float(max(Decimal(repr(cash)) - Decimal(repr(sleeve)), Decimal(0)))
         costs = book.costs
         kept, unsent = _drop_ambiguous(book, rows, _BUY, notes, self._unsent)
         built = phases.buy_orders(
@@ -967,6 +1171,7 @@ class RiskGatedBroker:
             session=run.session,
             ended=book.ended,
         )
+        self._phase_time(notes, "buys_sized")
         built = replace(built, skips=(*built.skips, *unsent))
         # A buy adding to a held name the broker lacks is a disagreement, not a skip.
         _refuse_unknown_held(assets, book, buys=True)
@@ -1001,6 +1206,17 @@ class RiskGatedBroker:
             in_flight=not scope.last,
             plan_decisions=plan_decisions,
         )
+        first_buy: datetime | None = None
+        last_buy: datetime | None = None
+
+        def buy_submitted() -> None:
+            nonlocal first_buy, last_buy
+            stamp = self.read_clock()
+            if first_buy is None:
+                first_buy = stamp
+                self._phase_time(notes, "first_buy_submitted", stamp)
+            last_buy = stamp
+
         submitted, refused = self._submit_all(
             run,
             gated.to_submit,
@@ -1009,7 +1225,10 @@ class RiskGatedBroker:
             frozenset(book.ledger.positions),
             book.last_ok_ingest,
             window=book.window,
+            on_submit=buy_submitted,
         )
+        if last_buy is not None:
+            self._phase_time(notes, "last_buy_submitted", last_buy)
         refused_ids = {s.decision_id for s in refused}
         collected_written_off = self._collect(
             run,
@@ -1064,6 +1283,39 @@ class RiskGatedBroker:
             cash,
             left,
         )
+
+    def _variant_for(self, run: PaperRunRow, book: _Book) -> _Variant | None:
+        """Item 6's record for a book in `paper.execution`, else None. The arm is
+        `arm_for` over the calendar's session list; a V1 session runs req 3's two
+        phases until T371 and says so in `fallback`. The batch-start sleeve is c x
+        the ledger equity, kept unread (`na`) when a mark is missing: it is the
+        record only, and the buys phase sizes from its own read."""
+        book_id = book.window.book_id
+        if book_id not in self._settings.paper.execution:
+            return None
+        assert run.session is not None
+        execution = execution_for(self._settings, book_id)
+        arm = arm_for(execution, run.session, all_sessions())
+        variant = _Variant(
+            arm=arm,
+            timing=execution.buy_timing,
+            fraction=execution.cash_sleeve_fraction,
+            fallback=OPEN_TRANCHE_NOT_BUILT if arm == "V1" else "none",
+        )
+        try:
+            variant.sleeve_cash = variant.fraction * _ledger_equity(book)
+        except (KeyError, ValueError):
+            variant.sleeve_cash = None
+        return variant
+
+    def _note_idle(self, run: PaperRunRow, rows: Sequence[DecisionRow]) -> None:
+        """Item 6's `idle_cash` after the sells' last submit: B (`_buys_cash`, no
+        sleeve) from one `account()` read on a fresh book read, counted toward
+        `min_cash`."""
+        assert self._variant is not None and run.session is not None
+        account = self._broker.account()
+        self._variant.saw(account.cash)
+        self._variant.idle_cash = self._buys_cash(account, self._read_book(run, rows), run.session)
 
     def _buys_cash(self, account: Account, book: _Book, session: date) -> float:
         """Cash available to buys: broker cash less the open-buy reserve,
@@ -1451,9 +1703,7 @@ class RiskGatedBroker:
                 window_id=window_id,
                 quantity_tolerance=self._frozen.reconcile_quantity_tolerance,
             )
-            orders = orders_for(conn, window_id=None)
-            events = order_events_for(conn, window_id=None)
-            fills = fills_for(conn)
+            orders, events, fills = _own_book_rows(conn, window.book_id)
             journaled = decisions_for(conn, window_id)
             terminal = {e.client_order_id for e in events if e.status in TERMINAL_ORDER_STATUSES}
             # The batch's and the ledger's names are priced here: a missing
@@ -1617,6 +1867,7 @@ class RiskGatedBroker:
         last_ok_ingest: datetime | None = None,
         *,
         window: PaperWindowRow,
+        on_submit: Callable[[], None] | None = None,
     ) -> tuple[list[str], list[Skip]]:
         """Submit each journaled request in order and await its acknowledgement;
         `submit`'s `Order` passes the shape check after the acknowledgement's
@@ -1651,7 +1902,7 @@ class RiskGatedBroker:
             # (`store.writer_lock_retry_seconds`), the switch read's included, may
             # have run the clock past the window, and nothing is sent outside it
             # (#2178).
-            if not self._in_submit_window(run.session):
+            if not self._in_submit_window(run.session, run):
                 self._phase_incomplete = True
                 self._close_unsent(run, [r for r, _ in pairs[index:]])
                 break
@@ -1675,6 +1926,8 @@ class RiskGatedBroker:
                     ) from None
                 continue
             else:
+                if on_submit is not None:
+                    on_submit()
                 if not self._acknowledge(run, request.client_order_id):
                     self._recheck = True
                     self._set_aside.add(request.client_order_id)
@@ -1684,13 +1937,18 @@ class RiskGatedBroker:
             submitted.append(request.client_order_id)
         return submitted, refused
 
-    def _in_submit_window(self, session: date) -> bool:
+    def _in_submit_window(self, session: date, run: PaperRunRow) -> bool:
         """Whether the clock reads inside [open(S) - `paper.submit_window_before_open_minutes`,
         open(S) + `paper.submit_window_after_open_minutes`] (the interval of
         `run.submit_window`)."""
         paper = self._settings.paper
         opening = self._calendar.session_open(session)
         now = self.read_clock()
+        if (
+            self._run_book(run) == "sandbox"
+            and sandbox_store_refusal(self._settings, "sandbox") is None
+        ):
+            return opening <= now <= self._calendar.session_close(session)
         return (
             opening - timedelta(minutes=paper.submit_window_before_open_minutes)
             <= now
@@ -1834,15 +2092,22 @@ class RiskGatedBroker:
         waiting = [
             row.client_order_id for row in sells if row.client_order_id not in self._set_aside
         ]
+        round_number = 0
         while waiting:
             waiting = [
                 c for c in waiting if self._broker.get_order(c).status not in TERMINAL_STATUSES
             ]
             now = self.read_clock()
+            round_number += 1
             if not waiting or now >= deadline:
                 break
             self._sleep(min(paper.poll_interval_seconds, (deadline - now).total_seconds()))
+        self._phase_time(notes, "sells_poll_rounds", count=round_number)
+        if not waiting:
+            self._phase_time(notes, "sells_terminal")
+        self._phase_time(notes, "sell_collection_start")
         self._collect(run, sells, price_band=self._price_band(run, book), notes=notes)
+        self._phase_time(notes, "sell_collection_end")
 
     def _price_band(self, run: PaperRunRow, book: _Book) -> PriceBand:
         """The fill-price band (#1981) over the book's reference prices."""

@@ -48,6 +48,7 @@ from tradepartner.ingest import (
     manifest_release,
     read_manifest,
 )
+from tradepartner.store.asof import facts_as_of
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.restamp_precheck import compute_precheck, precheck_file_name
 
@@ -58,6 +59,9 @@ SPY_TRUST = "0000884394"
 
 FIRST_RUN = datetime(2019, 6, 29, 2, 0, tzinfo=UTC)
 RESTAMP_RUN = datetime(2019, 7, 2, 2, 0, tzinfo=UTC)
+# The moves' `ingested_at`: one tick before the run, so the run's own writes
+# are a later ingest of a moved accession (#2968).
+MOVED_AT = RESTAMP_RUN - timedelta(microseconds=1)
 
 
 def _true(year: int, month: int, day: int) -> datetime:
@@ -80,6 +84,9 @@ A_8K12B = (f"{ACME}-19-000050", _true(2019, 4, 29))
 # DUAL's.
 D_INDEX = (f"{DUAL}-18-000001", _true(2018, 3, 2))
 D_COVER = (f"{DUAL}-19-000001", _true(2019, 3, 4))
+# A second cover date of ACME's cover accession, which the repaired cache
+# no longer gives (#2968).
+ACME_SECOND_DATE = date(2019, 2, 1)
 # A statement fact accepted inside the paper window (never restamped).
 S_STATEMENT = (f"{DUAL}-19-000009", _true(2019, 6, 10))
 
@@ -92,6 +99,7 @@ def _source(
     statements: bool = False,
     relisted: bool = False,
     nse_at: datetime | None = None,
+    acme_second_date: bool = False,
 ) -> FixtureFilingSource:
     """The cache: ACME's stamps early or repaired, DUAL's early by default."""
 
@@ -139,6 +147,21 @@ def _source(
                 5_000_000,
                 A_COVER[0],
                 acme(A_COVER[1]),
+            ),
+            *(
+                [
+                    FactRecord(
+                        ACME,
+                        "EntityCommonStockSharesOutstanding",
+                        ACME_SECOND_DATE,
+                        "",
+                        5_000_000,
+                        A_COVER[0],
+                        acme(A_COVER[1]),
+                    )
+                ]
+                if acme_second_date
+                else []
             ),
             FactRecord(
                 DUAL,
@@ -311,7 +334,8 @@ def test_the_moved_rows_carry_the_new_stamp_and_none_keeps_the_old(
         assert early_store.known_ats(table, ACME) <= news, table
     assert result.moved["delistings"] == 1
     assert all(result.moved[t] >= 1 for t in RESTAMP_TABLES)
-    # The delisting's stamp is its filed_at too; its ingested_at is the restamp's clock.
+    # The delisting's stamp is its filed_at too; its ingested_at is the restamp's
+    # clock, one tick before the run's (#2968).
     ((filed_at, known_at, ingested_at),) = early_store.rows(
         "delistings",
         without=(
@@ -325,7 +349,7 @@ def test_the_moved_rows_carry_the_new_stamp_and_none_keeps_the_old(
         ),
     )
     assert filed_at == known_at == A_25NSE[1]
-    assert ingested_at == RESTAMP_RUN
+    assert ingested_at == MOVED_AT
 
 
 def test_the_form_25_nse_moves_by_the_exchange_files_cik_not_the_subjects(
@@ -979,3 +1003,334 @@ def test_an_s_minus_1_row_crossing_no_instant_still_applies(
     assert status == OK, message
     assert result.refused == {} and result.moved["delistings"] == 1
     assert store.known_ats("delistings", ACME) == {S1_TRUE}
+
+
+# --- filing_index: the (cik, accession) match path (T318b, #2703) -----------
+
+_FI_REVISION_AT = datetime(2019, 6, 1, 22, 0, tzinfo=UTC)
+
+
+def _fi_row(cik: str, accession: str, accepted_at: datetime, **changes: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "cik": cik,
+        "accession": accession,
+        "form": "8-K",
+        "company_name": "Acme Corp",
+        "filed_on": accepted_at.date(),
+        "accepted_at": accepted_at,
+        "listed_on": accepted_at.date(),
+        "known_at": accepted_at,
+        "ingested_at": FIRST_RUN,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+    return row | changes
+
+
+def _seed_filing_index(settings: Settings, rows: Sequence[dict[str, Any]]) -> None:
+    with open_for_write(settings) as conn:
+        for row in rows:
+            insert_row(conn, "filing_index", row)
+
+
+def _fi_revision(first: dict[str, Any], known_at: datetime) -> dict[str, Any]:
+    return first | {
+        "filed_on": first["filed_on"] + timedelta(days=1),
+        "listed_on": known_at.date(),
+        "known_at": known_at,
+        "ingested_at": known_at,
+    }
+
+
+def _fi_rows(store: _Store) -> list[tuple[Any, ...]]:
+    with duckdb.connect(store.path, read_only=True) as conn:
+        conn.execute("SET TimeZone='UTC'")
+        return conn.execute(
+            "SELECT cik, accession, accepted_at, known_at, ingested_at, filed_on "
+            "FROM filing_index ORDER BY cik, accession, known_at"
+        ).fetchall()
+
+
+def test_the_restamp_moves_every_revision_of_a_matched_accession(
+    settings: Settings, early_store: _Store
+) -> None:
+    index_first = _fi_row(ACME, A_INDEX[0], _early(A_INDEX[1]))
+    nse_first = _fi_row(EXCHANGE, A_25NSE[0], _early(A_25NSE[1]), form="25-NSE")
+    other = _fi_row(DUAL, f"{DUAL}-19-000099", datetime(2019, 3, 1, 16, 30, tzinfo=UTC))
+    _seed_filing_index(
+        settings,
+        [
+            index_first,
+            _fi_revision(index_first, _FI_REVISION_AT),
+            nse_first,
+            other,
+            _fi_revision(other, _FI_REVISION_AT),
+        ],
+    )
+    before_other = [r for r in _fi_rows(early_store) if r[0] == DUAL]
+
+    status, message, (result,) = _ingest(
+        settings, _source(acme_early=False), now=RESTAMP_RUN, restamp=_acme_manifest()
+    )
+
+    assert status == OK, message
+    assert result.refused == {}
+    assert result.moved["filing_index"] == 3
+    assert "filing_index 3" in result.message()
+    rows = {(r[0], r[1], r[3]): r for r in _fi_rows(early_store)}
+    new_index, new_nse = A_INDEX[1], A_25NSE[1]
+    # The earliest row's known_at and accepted_at take the new stamp; the
+    # revision takes the new accepted_at and keeps its known_at.
+    first = rows[(ACME, A_INDEX[0], new_index)]
+    revision = rows[(ACME, A_INDEX[0], _FI_REVISION_AT)]
+    assert first[2] == new_index and revision[2] == new_index
+    assert first[4] == revision[4] == MOVED_AT
+    assert revision[5] == index_first["filed_on"] + timedelta(days=1)
+    assert rows[(EXCHANGE, A_25NSE[0], new_nse)][2] == new_nse
+    # An accession outside the manifest does not move.
+    assert [r for r in _fi_rows(early_store) if r[0] == DUAL] == before_other
+    # The rows built from the accession moved too.
+    assert early_store.known_ats("facts", ACME) <= {t for _, t in (A_INDEX, A_COVER, A_25NSE)}
+    assert early_store.known_ats("facts", ACME)
+
+
+def test_the_store_still_passes_the_filing_index_checks_after_the_restamp(
+    settings: Settings, early_store: _Store
+) -> None:
+    from tradepartner import health
+
+    first = _fi_row(ACME, A_INDEX[0], _early(A_INDEX[1]))
+    _seed_filing_index(settings, [first, _fi_revision(first, _FI_REVISION_AT)])
+    _ingest(settings, _source(acme_early=False), now=RESTAMP_RUN, restamp=_acme_manifest())
+
+    with duckdb.connect(early_store.path, read_only=True) as conn:
+        conn.execute("SET TimeZone='UTC'")
+        checks = health.integrity_checks(conn, RESTAMP_RUN, settings)
+    failing = {c.rule for c in checks if not c.passed}
+    assert not {r for r in failing if r.startswith("filing_index_")}
+    assert "known_at_le_ingested_at" not in failing
+
+
+def test_an_accession_acceptance_at_or_after_a_revision_is_refused_and_named(
+    settings: Settings, early_store: _Store
+) -> None:
+    old = _early(A_COVER[1])
+    first = _fi_row(ACME, A_COVER[0], old)
+    # The revision is known before the repaired acceptance would be.
+    _seed_filing_index(settings, [first, _fi_revision(first, old + timedelta(hours=1))])
+    before = _fi_rows(early_store)
+    facts_before = early_store.known_ats("facts", ACME)
+
+    _, _, (result,) = _ingest(
+        settings, _source(acme_early=True), now=RESTAMP_RUN, restamp=_acme_manifest()
+    )
+
+    assert set(result.refused) == {ACME}
+    assert A_COVER[0] in result.refused[ACME] and "filing_index" in result.refused[ACME]
+    assert result.moved["filing_index"] == 0
+    assert _fi_rows(early_store) == before
+    assert early_store.known_ats("facts", ACME) == facts_before
+
+
+def test_a_revision_known_exactly_at_the_new_acceptance_is_refused(
+    settings: Settings, early_store: _Store
+) -> None:
+    old, new = _early(A_COVER[1]), A_COVER[1]
+    first = _fi_row(ACME, A_COVER[0], old)
+    _seed_filing_index(settings, [first, _fi_revision(first, new)])
+    _, _, (result,) = _ingest(
+        settings, _source(acme_early=True), now=RESTAMP_RUN, restamp=_acme_manifest()
+    )
+    assert set(result.refused) == {ACME}
+
+
+def test_a_rerun_of_the_same_manifest_moves_no_filing_index_row(
+    settings: Settings, early_store: _Store
+) -> None:
+    first = _fi_row(ACME, A_INDEX[0], _early(A_INDEX[1]))
+    _seed_filing_index(settings, [first, _fi_revision(first, _FI_REVISION_AT)])
+    _ingest(settings, _source(acme_early=False), now=RESTAMP_RUN, restamp=_acme_manifest())
+    once = _fi_rows(early_store)
+    _, _, (again,) = _ingest(
+        settings,
+        _source(acme_early=False),
+        now=RESTAMP_RUN + timedelta(days=1),
+        restamp=_acme_manifest(),
+    )
+    assert again.moved["filing_index"] == 0
+    assert _fi_rows(early_store) == once
+
+
+def test_a_refused_form_25_subject_keeps_the_filers_index_row_where_it_is(
+    settings: Settings, early_store: _Store
+) -> None:
+    """ACME is refused (a date-crossing change), so its delisting stays and the
+    exchange's 25-NSE index row must stay with it."""
+    old_nse = _early(A_25NSE[1])
+    nse_first = _fi_row(EXCHANGE, A_25NSE[0], old_nse, form="25-NSE")
+    _seed_filing_index(settings, [nse_first])
+    crossing = datetime(2019, 3, 5, 5, 30, tzinfo=UTC)
+    manifest = [
+        *_acme_manifest(),
+        ManifestRow(ACME, A_COVER[0] + "x", _early(A_COVER[1]), crossing, "sgml", "test"),
+    ]
+    _, _, (result,) = _ingest(settings, _source(acme_early=True), now=RESTAMP_RUN, restamp=manifest)
+    assert ACME in result.refused
+    exchange = next(r for r in _fi_rows(early_store) if r[0] == EXCHANGE)
+    assert exchange[2] == old_nse
+
+
+def test_a_refused_form_25_accession_does_not_freeze_the_filers_other_index_rows(
+    settings: Settings, early_store: _Store
+) -> None:
+    """#2807: the exchange files two accessions. One (ACME's 25-NSE) is refused
+    for a revision known at its new acceptance; it stays and is named. The
+    exchange's other accession still moves."""
+    old_nse, new_nse = _early(A_25NSE[1]), A_25NSE[1]
+    other_accession = f"{EXCHANGE}-19-000008"
+    old_other, new_other = _early(A_COVER[1]), A_COVER[1]
+    nse_first = _fi_row(EXCHANGE, A_25NSE[0], old_nse, form="25-NSE")
+    other_first = _fi_row(EXCHANGE, other_accession, old_other, form="25-NSE")
+    _seed_filing_index(settings, [nse_first, _fi_revision(nse_first, new_nse), other_first])
+    manifest = [
+        *_acme_manifest(),
+        ManifestRow(EXCHANGE, other_accession, old_other, new_other, "sgml", "test"),
+    ]
+
+    _, _, (result,) = _ingest(settings, _source(acme_early=True), now=RESTAMP_RUN, restamp=manifest)
+
+    assert EXCHANGE not in result.refused
+    assert A_25NSE[0] in result.refused[ACME]
+    rows = {(r[1], r[3]): r for r in _fi_rows(early_store) if r[0] == EXCHANGE}
+    assert rows[(A_25NSE[0], old_nse)][2] == old_nse  # the refused accession stays
+    assert rows[(other_accession, new_other)][2] == new_other  # the other one moves
+    assert result.moved["filing_index"] == 1
+
+
+# --- a moved fact accession whose cached date set also changed (#2968) ------
+
+
+def test_a_moved_fact_accession_whose_date_set_changed_is_revised_at_the_run(
+    settings: Settings,
+) -> None:
+    """#2968: the restamp moves an accession's facts and the repaired cache
+    no longer gives one of its dates, in one run. The run revises the
+    accession (not refused as back-dated); a read before the run still
+    serves both dates at the new stamp, a read from the run only the cache's
+    date, and the revision is known only from the run (no look-ahead)."""
+    status, message, _ = _ingest(
+        settings, _source(acme_early=True, acme_second_date=True), now=FIRST_RUN
+    )
+    assert status == OK, message
+    store = _Store(settings.store.path)
+
+    status, message, (result,) = _ingest(
+        settings, _source(acme_early=False), now=RESTAMP_RUN, restamp=_acme_manifest()
+    )
+
+    assert status == OK, message
+    assert result.refused == {}
+    tick = timedelta(microseconds=1)
+    with duckdb.connect(store.path, read_only=True) as conn:
+        conn.execute("SET TimeZone='UTC'")
+
+        def served(t: datetime) -> list[date]:
+            rows = facts_as_of(conn, t, [ACME])
+            return sorted(rows.filter(rows["filing_accession"] == A_COVER[0])["as_of_date"])
+
+        assert served(_early(A_COVER[1])) == []
+        assert served(A_COVER[1]) == [ACME_SECOND_DATE, date(2019, 2, 15)]
+        assert served(RESTAMP_RUN - tick) == [ACME_SECOND_DATE, date(2019, 2, 15)]
+        assert served(RESTAMP_RUN) == [date(2019, 2, 15)]
+        revisions = conn.execute(
+            "SELECT known_at FROM facts WHERE security_id IN "
+            "(SELECT security_id FROM securities WHERE cik = ?) "
+            "AND filing_accession = ? AND known_at = ingested_at",
+            [ACME, A_COVER[0]],
+        ).fetchall()
+    assert revisions == [(RESTAMP_RUN,)]
+
+
+# --- a stored revision of a moved fact accession (#2970) ---------------------
+
+REVISION_RUN = datetime(2019, 6, 30, 2, 0, tzinfo=UTC)
+
+
+def _only_second_date(source: FixtureFilingSource) -> FixtureFilingSource:
+    """The cache gives ACME's cover accession only its second date."""
+    source._facts = [
+        f for f in source._facts if not (f.cik == ACME and f.as_of_date == date(2019, 2, 15))
+    ]
+    return source
+
+
+_THIRD_RUN = REVISION_RUN + timedelta(hours=12)
+
+
+@pytest.mark.parametrize("case", ["drop", "add", "redate", "two_revisions"], ids=lambda c: str(c))
+def test_a_restamp_never_changes_a_read_at_or_after_a_stored_revision(
+    settings: Settings, case: str
+) -> None:
+    """#2970: an accession ingested more than once before a restamp (a date
+    dropped or added, a date set swapped without a revision row, two
+    revisions) and then restamped. The restamp moves the originals, never a
+    row stamped at its own ingest, so every read from the true stamp on must
+    keep serving what it served before the restamp."""
+    both = _source(acme_early=True, acme_second_date=True)
+    runs: list[tuple[datetime, FixtureFilingSource]]
+    if case == "drop":
+        runs = [(FIRST_RUN, both), (REVISION_RUN, _source(acme_early=True))]
+        final = _source(acme_early=False)
+    elif case == "add":
+        runs = [(FIRST_RUN, _source(acme_early=True)), (REVISION_RUN, both)]
+        final = _source(acme_early=False, acme_second_date=True)
+    elif case == "redate":
+        runs = [
+            (FIRST_RUN, _source(acme_early=True)),
+            (REVISION_RUN, _only_second_date(_source(acme_early=True, acme_second_date=True))),
+        ]
+        final = _only_second_date(_source(acme_early=False, acme_second_date=True))
+    else:
+        runs = [
+            (FIRST_RUN, both),
+            (REVISION_RUN, _source(acme_early=True)),
+            (_THIRD_RUN, both),
+        ]
+        final = _source(acme_early=False, acme_second_date=True)
+    for now, source in runs:
+        status, message, _ = _ingest(settings, source, now=now)
+        assert status == OK, message
+    store = _Store(settings.store.path)
+    tick = timedelta(microseconds=1)
+    probes = [
+        _early(A_COVER[1]),
+        A_COVER[1],
+        FIRST_RUN,
+        REVISION_RUN - tick,
+        REVISION_RUN,
+        REVISION_RUN + timedelta(hours=1),
+        _THIRD_RUN,
+        RESTAMP_RUN - tick,
+        RESTAMP_RUN,
+    ]
+
+    def served(t: datetime) -> list[date]:
+        with duckdb.connect(store.path, read_only=True) as conn:
+            conn.execute("SET TimeZone='UTC'")
+            rows = facts_as_of(conn, t, [ACME])
+            return sorted(rows.filter(rows["filing_accession"] == A_COVER[0])["as_of_date"])
+
+    before = {t: served(t) for t in probes}
+
+    status, message, (result,) = _ingest(settings, final, now=RESTAMP_RUN, restamp=_acme_manifest())
+
+    assert status == OK, message
+    assert result.refused == {}
+    after = {t: served(t) for t in probes}
+    # Only reads before the true stamp may change (the repair's purpose: the
+    # rows become known there, and nothing earlier becomes visible).
+    for t in probes:
+        if t >= A_COVER[1]:
+            assert after[t] == before[t], (case, t)
+        else:
+            assert after[t] == [], (case, t)

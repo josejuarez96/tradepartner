@@ -53,6 +53,7 @@ from tradepartner.calendar import all_sessions, next_session, previous_session, 
 from tradepartner.config import Cadence
 from tradepartner.errors import StaleDataError
 from tradepartner.execution.ledger import Ledger
+from tradepartner.execution.lots import SHORT
 from tradepartner.execution.switch import ENGAGED, FAULTED_RUN_STATUSES, RELEASED
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.journal import (
@@ -99,6 +100,7 @@ class Mark:
     #: `positions_daily` row does not store them.
     stale_close: date | None = None
     stale_gap: int = 0
+    position_side: str = "long"
 
 
 class UnreadableMarkError(ValueError):
@@ -107,6 +109,15 @@ class UnreadableMarkError(ValueError):
     row's, a held name with no value, or a non-finite number. A check that
     cannot read its input does not pass (#713 (ii)(a)), so callers refuse or
     fault on it, never skip."""
+
+
+def signed_value(row: PositionDailyRow) -> float | None:
+    """A mark row's value with the equity sign rule (paper spec #1872 item 10:
+    equity = cash + long value - short value): a short's unsigned value counts
+    negative whichever sign the writer stored. None when the row has no value."""
+    if row.value is None:
+        return None
+    return -abs(row.value) if row.position_side == SHORT else row.value
 
 
 def equity_at(rows: Sequence[PositionDailyRow], session: date) -> float:
@@ -144,7 +155,12 @@ def equity_at(rows: Sequence[PositionDailyRow], session: date) -> float:
             raise UnreadableMarkError(
                 f"the mark of {row.security_id} for {session.isoformat()} has value {row.value!r}"
             )
-        values.append(row.value)
+        if row.position_side == "short" and (row.quantity < 0 or row.value < 0):
+            raise UnreadableMarkError(
+                f"short mark of {row.security_id} for {session.isoformat()} has negative "
+                "quantity or value"
+            )
+        values.append(-row.value if row.position_side == "short" else row.value)
     equity = cash_value + math.fsum(values)
     if not math.isfinite(equity):
         raise UnreadableMarkError(f"equity marked for {session.isoformat()} is {equity!r}")
@@ -203,7 +219,9 @@ def _last_bars(
     a name sold before the last session (which the run's `assets` read never
     flags) still shows a bar after an ingest gap. It only decides whether a
     missing bar raises; it never prices a mark."""
-    held = sorted({name for book in books.values() for name in book.positions})
+    held = sorted(
+        {name for book in books.values() for name in (*book.positions, *book.short_holdings)}
+    )
     if not held:
         return {}
     last: dict[str, date] = {}
@@ -295,7 +313,7 @@ def marks_for(
     own: dict[date, dict[str, float]] = {}
     last_known: dict[date, dict[str, tuple[date, float]]] = {}
     for session in sessions:
-        held = sorted(books[session].positions)
+        held = sorted(set(books[session].positions) | set(books[session].short_holdings))
         if not held:
             continue
         prices = prices_as_of(conn, session_close(session), held)
@@ -316,7 +334,10 @@ def marks_for(
     marks: list[Mark] = []
     for session in sessions:
         book = books[session]
-        if not book.positions:
+        overlap = set(book.positions) & set(book.short_holdings)
+        if overlap:
+            raise ValueError(f"names held both long and short: {sorted(overlap)}")
+        if not book.positions and not book.short_holdings:
             marks.append(
                 Mark(
                     session=session,
@@ -329,7 +350,7 @@ def marks_for(
                 )
             )
             continue
-        for security_id in sorted(book.positions):
+        for security_id in sorted(set(book.positions) | set(book.short_holdings)):
             flag = tradable_flags.get(security_id)
             stale_close_session: date | None = None
             gap = 0
@@ -366,7 +387,8 @@ def marks_for(
                     f"bad close for held {security_id} at close({session}): {price!r}; "
                     "no mark written; remove the bad bar (repair-bars) and refill it"
                 )
-            quantity = book.positions[security_id]
+            short = security_id in book.short_holdings
+            quantity = book.short_holdings[security_id] if short else book.positions[security_id]
             marks.append(
                 Mark(
                     session=session,
@@ -378,6 +400,7 @@ def marks_for(
                     tradable=flag,
                     stale_close=stale_close_session,
                     stale_gap=gap,
+                    position_side="short" if short else "long",
                 )
             )
     return marks

@@ -20,7 +20,15 @@ after the first `kill_switch` row with `state = 'released'` of the same window
 that follows it (or that window's closing stop after it, since a closed window
 never trades again); until that row exists the span is **pending** (no sessions) and
 starts at the restart event itself, so E.2 and the rest still see it. With
-several restart events the latest restart wins. The span's instant lower bound
+several restart events the latest restart wins. Under ADR 0017's 2026-10-26
+amendment a `reconcile_breaks` event `opened`, `observed` or `reopened` after the
+row with an `unattributed` part (`parts_json`, or the event's `cause`) is a
+restart event too, released by the first closing event of that break after it
+(`trued_up`, `auto_explained`, `resolved_by_broker`, `auto_accepted`), or by its
+window's closing stop after it when the break never closes: the span
+restarts at the session after that close, and is pending until it is written. A
+break whose every part is `corporate_action`, `broker_activity` or `data` never
+restarts the span. The span's instant lower bound
 (`Span.start_at`) is New York midnight of its first session (or the earliest
 unreleased restart event while pending): every timestamped row (`reconciliations.at`,
 `kill_switch.at`, `alert_deliveries.at`, `paper_run_results.finished_at`) is in
@@ -49,9 +57,18 @@ and the day it closes may hold a run or not, so neither is required (ADR 0017:
    scheduler-invoked run submitted an order with a live fill (`fills_for`, which
    hides superseded rows). The span must hold at least N sessions and not be
    pending.
-2. **`E.2 reconciliation`**: no `mismatch` row in the span; each
-   `pending_unresolved` or `fills_lagging` row's next reconciliation of the same
-   book (by `at`, then id) exists and is `ok`.
+2. **`E.2 reconciliation`** (ADR 0017's 2026-10-26 amendment): no `mismatch`
+   row in the span; each `pending_unresolved` or `fills_lagging` row's next
+   reconciliation of the same book (by `at`, then id) exists and is `ok` or
+   `breaks` (a `breaks` row passes on its own); no break event in the span with an
+   `unattributed` part (one whose break is still open is `progress`: the span is
+   pending until its closing event); and no open break of an open window aged
+   past its frozen `risk.break_max_age_sessions` at the command's session
+   (`reconcile_run.command_session(now)`, `alerts.is_aged`), which is a problem.
+   An external break (every part `corporate_action`, `broker_activity` or `data`)
+   still open and younger than that passes. The line prints the counts, and the
+   external breaks opened in the span by cause with how each closed. A typed
+   true-up needs no `shakedown_note` (paper spec open question 45).
 3. **`E.3 orders`**: (duplicate) for every decision with an order in the span,
    its orders' live fills sum to at most `planned_quantity` plus the decision
    window's frozen `risk.reconcile_quantity_tolerance` (a decision with a
@@ -86,7 +103,8 @@ and the day it closes may hold a run or not, so neither is required (ADR 0017:
 
 **Progress or failing** (#2298). Each line also says, structurally, whether it
 fails only on what time or the drill clears (`ShakedownLine.state`): E.1's
-session and order-session counts and a pending span, E.4 with no drill yet, and
+session and order-session counts and a pending span, E.2's `unattributed` break
+still awaiting its closing event, E.4 with no drill yet, and
 E.6 on a channel with no delivery attempted in the span yet are `in_progress`;
 an E.6 channel whose attempts all failed, and any other shortfall, is `failing`. The owner's queue
 (`execution.waiting`) reads that, never the printed detail.
@@ -104,15 +122,25 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
-from tradepartner.calendar import last_completed_session, next_session, previous_session
+from tradepartner.calendar import (
+    last_completed_session,
+    next_session,
+    previous_session,
+    session_close,
+)
 from tradepartner.config import Settings
+from tradepartner.execution.alerts import break_age, is_aged, latest_open_breaks
 from tradepartner.execution.check import _chain_line, _frozen, _override_line
+from tradepartner.execution.plan import _split_factor
+from tradepartner.execution.reconcile_run import command_session, frozen_risk
 from tradepartner.execution.window import window_cadence
 from tradepartner.health import health_report
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
+from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import utc_now
-from tradepartner.store.journal import OrderRow, PaperWindowRow
+from tradepartner.store.journal import OrderRow, PaperWindowRow, ReconcileBreakRow
+from tradepartner.store.schema import CLOSING_BREAK_EVENTS, OPEN_BREAK_EVENTS
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _SCHEDULER = "scheduler"
@@ -122,6 +150,11 @@ _STALE = "stale"
 _HALTED = "halted"
 _MISMATCH = "mismatch"
 _LAGGING_STATUSES = ("pending_unresolved", "fills_lagging")
+#: A lagging row passes when the next reconciliation of its book is one of these
+#: (ADR 0017 E.2 as amended 2026-10-26: a `breaks` row passes on its own).
+_SETTLED_STATUSES = ("ok", "breaks")
+_BREAKS = "breaks"
+_UNATTRIBUTED = "unattributed"
 _ENGAGED = "engaged"
 _RELEASED = "released"
 _OWNER = "owner"
@@ -147,10 +180,11 @@ class ShakedownLine:
     thresholds it compared against and what it found, pass or fail.
 
     `progress` names the shortfalls that only more sessions or the kill-switch
-    drill clear (E.1's session and order-session counts and a pending span, E.4's
-    missing drill, E.6's channels nothing was sent on yet); `problems` names every
-    other shortfall of a line that sets `progress`. Only E.1, E.4 and E.6 set them
-    (#2298); any other failing line is `failing` by `state`."""
+    drill clear (E.1's session and order-session counts and a pending span, E.2's
+    unattributed break pending its closing event, E.4's missing drill, E.6's
+    channels nothing was sent on yet); `problems` names every other shortfall of a
+    line that sets `progress` (E.2's aged break among them). Only E.1, E.2, E.4 and
+    E.6 set them (#2298, T284); any other failing line is `failing` by `state`."""
 
     name: str
     passed: bool
@@ -380,6 +414,57 @@ def _live_fills(conn: duckdb.DuckDBPyConnection, now: datetime) -> dict[str, lis
     }
 
 
+def _break_events(conn: duckdb.DuckDBPyConnection, now: datetime) -> list[ReconcileBreakRow]:
+    """Every window's `reconcile_breaks` events known at `now`, in write order
+    (none on a store before the table, `journal.break_events_for`)."""
+    window_ids = [
+        int(r[0])
+        for r in conn.execute(
+            "SELECT window_id FROM paper_windows WHERE known_at <= ? ORDER BY window_id", [now]
+        ).fetchall()
+    ]
+    rows = [
+        e
+        for wid in window_ids
+        for e in store_journal.break_events_for(conn, wid)
+        if e.known_at <= now
+    ]
+    return sorted(rows, key=lambda e: e.event_id or 0)
+
+
+def _unattributed(event: ReconcileBreakRow) -> bool:
+    """Whether an event lists an `unattributed` part (its `parts_json`, or its own
+    `cause`). An unreadable `parts_json` counts as unattributed (fail closed)."""
+    if event.cause == _UNATTRIBUTED:
+        return True
+    try:
+        parts = json.loads(event.parts_json)
+        return any(p.get("cause") == _UNATTRIBUTED for p in parts)
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return True
+
+
+def _unattributed_restarts(
+    events: Sequence[ReconcileBreakRow],
+) -> list[tuple[ReconcileBreakRow, ReconcileBreakRow | None]]:
+    """Each open-kind event with an `unattributed` part, with the first closing
+    event of its break written after it (None while the break is still open)."""
+    out: list[tuple[ReconcileBreakRow, ReconcileBreakRow | None]] = []
+    for index, event in enumerate(events):
+        if event.event not in OPEN_BREAK_EVENTS or not _unattributed(event):
+            continue
+        closing = next(
+            (
+                e
+                for e in events[index + 1 :]
+                if e.break_id == event.break_id and e.event in CLOSING_BREAK_EVENTS
+            ),
+            None,
+        )
+        out.append((event, closing))
+    return out
+
+
 # --- the span -------------------------------------------------------------------
 
 
@@ -427,6 +512,24 @@ def _read_span(
     start = next_session(_local_date(row.made_at))
     restart: str | None = None
     pending: list[tuple[datetime, str]] = []
+    for event, closing in _unattributed_restarts(_break_events(conn, now)):
+        if event.known_at <= row.made_at:
+            continue
+        what = f"unattributed break {event.break_id} ({event.event} {event.known_at.isoformat()})"
+        if closing is not None:
+            ended_at, how = closing.known_at, f"closed {closing.event}"
+        else:
+            # a window closed or abandoned after the event never trades again and
+            # its break never closes: the closing stop ends the restart instead
+            stop = closed.get(event.window_id)
+            if stop is None or stop <= event.known_at:
+                pending.append((event.known_at, what))
+                continue
+            ended_at, how = stop, "window closed"
+        candidate = next_session(_local_date(ended_at))
+        if candidate > start:
+            start = candidate
+            restart = f"{what}, {how} {ended_at.isoformat()}"
     for window_id, at, what in _restart_events(conn, row.made_at, now):
         released = min(
             (
@@ -457,7 +560,11 @@ def _read_span(
             start=None,
             start_at=at,
             sessions=(),
-            restart=f"awaiting the released kill-switch row after {what}",
+            restart=(
+                f"awaiting the closing event of {what}"
+                if what.startswith("unattributed break")
+                else f"awaiting the released kill-switch row after {what}"
+            ),
         )
     last = last_completed_session(now)
     return Span(
@@ -679,7 +786,11 @@ def _sessions_line(
 
 
 def _reconciliation_line(
-    conn: duckdb.DuckDBPyConnection, span: Span, now: datetime
+    conn: duckdb.DuckDBPyConnection,
+    span: Span,
+    now: datetime,
+    windows: Sequence[PaperWindowRow] = (),
+    closed: dict[int, datetime] | None = None,
 ) -> ShakedownLine:
     rows = conn.execute(
         'SELECT reconciliation_id, book_id, "at", status FROM reconciliations '
@@ -687,35 +798,99 @@ def _reconciliation_line(
         [now, now],
     ).fetchall()
     failures: list[str] = []
+    progress: list[str] = []
     lagging = 0
+    breaks_rows = 0
     for index, (rid, book, at, status) in enumerate(rows):
         if at < span.start_at:
             continue
         if status == _MISMATCH:
             failures.append(f"mismatch reconciliation {rid} (book {book}, {at.isoformat()})")
+        elif status == _BREAKS:
+            breaks_rows += 1
         elif status in _LAGGING_STATUSES:
             lagging += 1
             following = next((r for r in rows[index + 1 :] if r[1] == book), None)
             if following is None:
                 failures.append(f"{status} reconciliation {rid} (book {book}) has no next one yet")
-            elif following[3] != _OK:
+            elif following[3] not in _SETTLED_STATUSES:
                 failures.append(
                     f"{status} reconciliation {rid} (book {book}) is followed by "
                     f"{following[3]} reconciliation {following[0]}"
                 )
-    detail = f"{lagging} pending_unresolved/fills_lagging row(s) in the span"
-    if failures:
-        detail += "; " + _named(failures)
+    events = _break_events(conn, now)
+    in_span = [e for e in events if e.known_at >= span.start_at]
+    unattributed: dict[str, tuple[ReconcileBreakRow, ReconcileBreakRow | None]] = {}
+    for event, closing in _unattributed_restarts(events):
+        if event.known_at < span.start_at:
+            continue
+        held = unattributed.get(event.break_id)
+        if held is None or held[1] is not None:  # a pending one wins: it is progress
+            unattributed[event.break_id] = (event, closing)
+    for event, closing in unattributed.values():
+        what = f"unattributed break {event.break_id} on {event.name} ({event.event})"
+        if closing is None:
+            progress.append(f"{what} pending its closing event")
+        else:
+            failures.append(f"{what}, closed {closing.event}")
+    session = command_session(now)
+    closed = closed or {}
+    by_window = {w.window_id: w for w in windows}
+    aged: list[str] = []
+    for event in latest_open_breaks(events):
+        window = by_window.get(event.window_id)
+        if window is None or event.window_id in closed:
+            continue
+        limit = frozen_risk(window).break_max_age_sessions
+        if is_aged(event, session, limit):
+            age = break_age(event.first_seen_session, session)
+            aged.append(
+                f"break {event.break_id} on {event.name} (book {event.book_id}) is "
+                f"{age} session(s) old at {session.isoformat()}, past {limit}"
+            )
+    failures.extend(aged)
+    problems = tuple(failures)
+    latest = {e.break_id: e for e in events}
+    external: dict[str, dict[str, int]] = {}
+    for event in in_span:
+        if event.event != "opened" or any(
+            _unattributed(e) for e in events if e.break_id == event.break_id
+        ):
+            continue
+        outcome = latest[event.break_id].event
+        how = outcome if outcome in CLOSING_BREAK_EVENTS else "still open"
+        by_how = external.setdefault(event.cause or "unknown", {})
+        by_how[how] = by_how.get(how, 0) + 1
+    words = (
+        "; ".join(
+            f"{cause} {sum(hows.values())} ("
+            + ", ".join(f"{how} {n}" for how, n in sorted(hows.items()))
+            + ")"
+            for cause, hows in sorted(external.items())
+        )
+        or "none"
+    )
+    detail = (
+        f"{lagging} pending_unresolved/fills_lagging row(s) and {breaks_rows} breaks row(s) "
+        f"in the span; external breaks opened in the span: {words}"
+    )
+    shortfalls = [*failures, *progress]
+    if shortfalls:
+        detail += "; " + _named(shortfalls)
     return ShakedownLine(
         name="E.2 reconciliation",
-        passed=not failures,
-        rows="reconciliations",
+        passed=not shortfalls,
+        rows="reconciliations, reconcile_breaks, paper_windows (frozen risk)",
         query=(
             "reconciliations at or after the span start: no status='mismatch'; each "
-            "pending_unresolved or fills_lagging row's next row of its book is 'ok'"
+            "pending_unresolved or fills_lagging row's next row of its book is 'ok' or "
+            "'breaks'; no break event in the span with an unattributed part; no open break "
+            "of an open window older than its frozen risk.break_max_age_sessions"
         ),
-        thresholds="mismatch rows = 0",
+        thresholds="mismatch rows = 0; unattributed break events = 0; aged open breaks = 0",
         detail=detail,
+        progress=tuple(progress),
+        problems=problems,
     )
 
 
@@ -768,21 +943,24 @@ def _sized_shares(orders: Sequence[OrderRow], known: dict[str, list[_KnownFill]]
 
 
 def _resized_orders(
+    conn: duckdb.DuckDBPyConnection,
     decision_id: int,
     orders: Sequence[OrderRow],
     known: dict[str, list[_KnownFill]],
     terminal_at: dict[str, datetime],
     limit: float,
     minimum: float,
+    whole_cover: bool = False,
 ) -> list[str]:
     """A notional decision's orders that its remainder could not have sized
     (`plan.remainder`, `plan.decision_state`), over both order kinds:
 
     - an order written while an earlier order of the decision had no terminal
       event yet (a decision is resized only once every order is terminal);
-    - any order written when the fill value of all the decision's orders
-      known before it exhausted the remainder or left less than the frozen trading minimum
-      (no remainder was left to size it from).
+    - any order written when fills known before it exhausted the remainder or
+      left less than the frozen trading minimum. A whole short cover uses the
+      latest order's unfilled shares, as `plan.remainder` does; the journal has
+      no reference price for a dollar minimum check on that share remainder.
     """
     failures: list[str] = []
     coids = [o.client_order_id for o in orders]
@@ -799,6 +977,39 @@ def _resized_orders(
                 f"order {order.client_order_id} written while order "
                 f"{', '.join(in_flight)} was in flight"
             )
+            continue
+        if whole_cover:
+            prior_orders = [o for o in orders if o.known_at < order.known_at]
+            if prior_orders:
+                latest = max(enumerate(prior_orders), key=lambda p: (p[1].known_at, p[0]))[1]
+                prior_fills = [
+                    f for f in known.get(latest.client_order_id, ()) if f.known_at < order.known_at
+                ]
+                prefix = (
+                    f"order {order.client_order_id} of decision {decision_id} "
+                    "sized with no remainder "
+                )
+                if latest.quantity is not None:
+                    filled = sum(f.quantity for f in prior_fills)
+                    actions = live_actions_as_of(
+                        conn, session_close(previous_session(order.session)), [order.security_id]
+                    )
+                    factor = _split_factor(
+                        actions, order.security_id, latest.session, order.session
+                    )
+                    remaining = (latest.quantity - filled) * factor
+                    if remaining < 1:
+                        failures.append(
+                            f"{prefix}({filled:g} of {latest.quantity:g} shares filled before it)"
+                        )
+                elif latest.notional is not None:
+                    filled_value = sum(f.quantity * f.price for f in prior_fills)
+                    remaining = latest.notional - filled_value
+                    if remaining <= 0 or remaining < minimum:
+                        failures.append(
+                            f"{prefix}({filled_value:.2f} of {latest.notional:.2f} "
+                            "filled before it)"
+                        )
             continue
         value = sum(
             f.quantity * f.price
@@ -921,7 +1132,16 @@ def _orders_line(
                 else float(planned_notional)
             )
             minimum = _frozen_tolerance(windows[run_window[run_id]], _MIN_ORDER_NOTIONAL)
-            failures += _resized_orders(decision_id, mine, known, terminal_at, limit, minimum)
+            failures += _resized_orders(
+                conn,
+                decision_id,
+                mine,
+                known,
+                terminal_at,
+                limit,
+                minimum,
+                whole_cover=whole_cover,
+            )
         else:
             got = sum(quantity.get(c, 0.0) for c in coids)
             if got > 0:
@@ -1172,7 +1392,7 @@ def shakedown(
             _sessions_line(
                 conn, span, at, windows, closed, runs, brackets, ordered, alerts, noted, known
             ),
-            _reconciliation_line(conn, span, at),
+            _reconciliation_line(conn, span, at, windows, closed),
             _orders_line(conn, span, at, by_id, known),
             _drill_line(span, at, windows, runs, switches, brackets, ordered),
             _journal_line(conn, span, at, windows, closed, known),

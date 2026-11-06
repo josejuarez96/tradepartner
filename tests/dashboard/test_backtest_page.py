@@ -755,6 +755,54 @@ def test_render_shows_the_n_split(
     assert "research runs" in _text(at)
 
 
+def test_render_shows_exposure_part_of_todays_n(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+) -> None:
+    store_path, seeded = seeded_store
+    with duckdb.connect(str(store_path)) as conn:
+        conn.execute(
+            "UPDATE trial_results SET n_exposure = 1 WHERE trial_id = ?", [seeded.detailed]
+        )
+        conn.execute(
+            "INSERT INTO research_exposures "
+            "(exposure_id, candidate_ref, source, family, kill_line_url, "
+            "kill_line_sha256, kill_line_posted_at, kill_line_basis, probe_sha256, "
+            "probe_verified, read_at, window_start, window_end, data_pin_json, "
+            "n_configurations, verdict, desk_read_path, overlaps_holdout, post_boundary, "
+            "synthetic, recorded_by, code_version, known_at) VALUES "
+            "(1, '#2689', 'store', 'momentum', 'https://example.com', ?, now(), "
+            "'posted_before_read', ?, true, now(), DATE '2020-01-01', DATE '2020-03-31', "
+            "'{}', 2, 'fail', 'docs/research/read.md', false, false, false, 'test', "
+            "'test', now())",
+            ["a" * 64, "b" * 64],
+        )
+    at = _pick(_app(monkeypatch, store_path), seeded.detailed)
+    assert not at.exception
+    dsr = next(df.value for df in at.dataframe if "stored DSR (N at run time)" in df.value.columns)
+    assert list(dsr["today N"]) == [5, 5]
+    assert list(dsr["today N backtest"]) == [3, 3]
+    assert list(dsr["today N research"]) == [0, 0]
+    assert list(dsr["today N exposures"]) == [2, 2]
+    assert list(dsr["stored N exposures"]) == [1, 1]
+
+
+def test_pre_exposure_store_shows_old_n_and_blank_exposure_part(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+) -> None:
+    store_path, seeded = seeded_store
+    with duckdb.connect(str(store_path)) as conn:
+        conn.execute("DROP TABLE research_exposures")
+        conn.execute("ALTER TABLE trial_results DROP COLUMN n_exposure")
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version VALUES (43, now())")
+    at = _pick(_app(monkeypatch, store_path), seeded.detailed)
+    assert not at.exception
+    dsr = next(df.value for df in at.dataframe if "stored DSR (N at run time)" in df.value.columns)
+    assert list(dsr["today N"]) == [3, 3]
+    assert dsr["today N exposures"].isna().all()
+    assert dsr["stored N exposures"].isna().all()
+
+
 def test_a_pre_migration_store_renders_with_n_research_blank(
     monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
 ) -> None:

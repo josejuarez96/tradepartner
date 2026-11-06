@@ -1,5 +1,6 @@
 """The filing-name confirmation decision of #1597."""
 
+from dataclasses import replace
 from datetime import UTC, date, datetime
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from tradepartner.adapters.filings import FilenameListing
 from tradepartner.store.filename_listings import (
     ClassTicker,
+    FilenameClassConflict,
     IndependentReading,
     confirm_filename_listings,
     is_filename_listing_refused,
@@ -174,12 +176,23 @@ def test_rename_must_match_every_differing_independent_reading() -> None:
 
 
 def test_same_ticker_on_two_classes_fails_closed() -> None:
-    with pytest.raises(ValueError, match="conflicting class assignment for ABC"):
+    with pytest.raises(FilenameClassConflict, match="conflicting class assignment for ABC"):
         decide(
             filing("ABC", 2016),
             cover=(reading(("ABC", "class-a")),),
-            exhibits=(reading(("ABC", "class-b")),),
+            exhibits=(reading(("abc ", "class-b")),),
         )
+
+
+def test_ticker_case_is_no_conflict() -> None:
+    """#2929: `avy25` (a Form 25 file name) and `AVY25` (a cover page) on the
+    same class are one ticker, not a conflict."""
+    result = decide(
+        filing("AVY", 2016),
+        cover=(reading(("AVY", "common"), ("AVY25", "notes")),),
+        exhibits=(reading(("avy25", "notes")),),
+    )
+    assert len(result) == 1
 
 
 def test_first_cover_filing_alone_confirms_precover_fb() -> None:
@@ -190,3 +203,37 @@ def test_first_cover_filing_alone_confirms_precover_fb() -> None:
         cover_prefix="FB",
     )
     assert [item.verdict for item in result] == ["confirmed", "confirmed"]
+
+
+def test_coregistrant_filing_gets_no_listing_and_names_no_later_prefix() -> None:
+    """#2941: a combined 10-K's prefix is its filer's ticker (AAL Group's
+    `aal`), never the co-registrant subsidiary's, whatever else agrees."""
+    shared = replace(filing("AAL", 2016, tag="AAL"), coregistrant=True)
+    result = decide(shared, cover=(reading(("AAL", "class-a")),))
+    assert [(item.verdict, item.class_id) for item in result] == [("refused_coregistrant", None)]
+    # A co-registrant's prefix is not this CIK's later prefix: it dates no rename.
+    renamed = decide(
+        filing("OLD", 2016),
+        replace(filing("NEW", 2017), coregistrant=True),
+        cover=(reading(("NEW", "class-a")),),
+    )
+    assert [item.verdict for item in renamed] == ["refused_contradicted", "refused_coregistrant"]
+
+
+def test_owner_refusal_precedes_coregistrant() -> None:
+    shared = replace(filing("ABC", 2016), coregistrant=True)
+    assert decide(shared, refused=("0000000001:ABC",))[0].verdict == "refused_owner"
+
+
+@pytest.mark.parametrize(
+    "prefix", ["ETR-12312019X10K", "a10-k20199282019", "conedison", "C27C", "AB_C", "BRK-BCD"]
+)
+def test_filename_leftover_that_is_no_symbol_is_refused(prefix: str) -> None:
+    """#2941: a prefix outside the symbol shape is filename residue, not a ticker."""
+    result = decide(filing(prefix, 2016, tag=prefix), cover=(reading((prefix, "class-a")),))
+    assert [(item.verdict, item.class_id) for item in result] == [("refused_symbol", None)]
+
+
+@pytest.mark.parametrize("prefix", ["F", "aal", "GOOGL", "BRK-B", "brk.b", "HEI/A"])
+def test_symbol_shaped_prefix_is_judged_as_before(prefix: str) -> None:
+    assert decide(filing(prefix, 2016), first_cover_at=None)[0].verdict == "single_reading"

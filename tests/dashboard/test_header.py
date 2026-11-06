@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import duckdb
@@ -115,6 +116,25 @@ def test_as_of_is_the_latest_known_at_at_or_before_t(conn: duckdb.DuckDBPyConnec
     assert earlier <= session_close(date(2019, 1, 2)) < everything <= T
 
 
+def test_owner_spinoff_allocation_does_not_move_as_of_but_a_bar_does(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    load_universe_fixtures(conn, UNIVERSE_DIR)
+    bar_close = session_close(date(2020, 6, 30))
+    allocation_time = bar_close + timedelta(hours=1)
+    assert header.store_freshness(conn, T).as_of == bar_close
+    conn.execute(
+        "INSERT INTO spinoff_allocations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ["P", "C", date(2020, 6, 30), 0.3, allocation_time, allocation_time, "owner", "owner"],
+    )
+    assert header.store_freshness(conn, T).as_of == bar_close
+    conn.execute(
+        "UPDATE prices_daily SET known_at = ?, ingested_at = ? WHERE known_at = ?",
+        [allocation_time + timedelta(minutes=1), allocation_time + timedelta(minutes=1), bar_close],
+    )
+    assert header.store_freshness(conn, T).as_of == allocation_time + timedelta(minutes=1)
+
+
 def test_last_updated_is_the_latest_ok_run_finished_by_t(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -165,3 +185,44 @@ def test_render_writes_one_caption() -> None:
 def test_a_store_without_the_tables_has_no_freshness() -> None:
     conn = duckdb.connect(":memory:")
     assert header.store_freshness(conn, T) == header.Freshness(None, None)
+
+
+def test_a_sec_forms_backfill_leaves_both_reads_on_the_bars(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#2624: a forms-only backfill writes ownership rows and its own run rows
+    after a failed nightly; neither may make the store look fresh."""
+    from tradepartner.adapters.edgar import Form4Transaction
+    from tradepartner.adapters.filings import SecFormFiling
+    from tradepartner.ingest import write_sec_form_accession
+
+    load_universe_fixtures(conn, UNIVERSE_DIR)
+    bars_run = datetime(2020, 6, 30, 21, tzinfo=UTC)
+    _run(conn, 1, "ok", bars_run)
+    _run(conn, 2, "failed", bars_run + timedelta(hours=1))  # the nightly failed
+    accepted = bars_run + timedelta(hours=1, minutes=30)
+    owner, issuer = "0000888888", "0000000001"
+    write_sec_form_accession(
+        conn,
+        SecFormFiling(
+            "0000000001-20-000123",
+            "4",
+            accepted,
+            date(2020, 6, 30),
+            (issuer,),
+            (owner,),
+            (
+                Form4Transaction(
+                    issuer, owner, 0, False, True, False, False, date(2020, 6, 29), None,
+                    "P", "A", Decimal("10"), Decimal("12.34"), Decimal("110"), "D", "Common", None,
+                ),
+            ),
+        ),
+        ingested_at=accepted,
+        source="sec_insider_bulk",
+    )  # fmt: skip
+    for run_id, source in ((3, "sec_forms"), (4, "sec_insider_bulk")):
+        _run_row(conn, run_id, "ok", accepted, source=source)
+    fresh = header.store_freshness(conn, T)
+    assert fresh.last_updated == bars_run
+    assert fresh.as_of == session_close(date(2020, 6, 30))

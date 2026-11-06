@@ -35,8 +35,8 @@ from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.calendar import next_session, previous_session, session_close, session_open
 from tradepartner.config import FROZEN_COSTS_KEYS, CostsConfig, RiskConfig, Settings
 from tradepartner.errors import LimitBreachError
+from tradepartner.execution import lock, switch
 from tradepartner.execution import run as run_module
-from tradepartner.execution import switch
 from tradepartner.execution.run import RunOutcome, submit_window, tracking_run
 from tradepartner.execution.window import stop
 from tradepartner.execution.wrapper import BatchOutcome
@@ -407,6 +407,88 @@ def test_a_fill_session_run_outside_the_window_plans_but_submits_nothing(
     assert "submit" not in [c.method for c in env.fake.calls]
     assert env.rebalance_events() == []  # still pending
     assert any("outside the submit window" in note for note in outcome.notes)
+
+
+def test_sandbox_submits_at_1400_et_on_a_marked_copy(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(env.settings).write_text("")
+    env.settings = env.settings.model_copy(
+        update={"paper": env.settings.paper.model_copy(update={"book_id": "sandbox"})}
+    )
+    env.open_window(tmp_path=tmp_path)
+    outcome = env.run(at(F_0, 18))
+    assert outcome.status == "ok"
+    assert len(env.submits()) == 3
+    assert "sandbox: submit window skipped" in outcome.notes
+
+
+def test_daily_at_1400_et_still_submits_nothing(env: Env, window: PaperWindowRow) -> None:
+    outcome = env.run(at(F_0, 18))
+    assert outcome.status == "ok"
+    assert env.submits() == []
+    assert any("outside the submit window" in note for note in outcome.notes)
+
+
+def test_sandbox_after_close_submits_nothing(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(env.settings).write_text("")
+    env.settings = env.settings.model_copy(
+        update={"paper": env.settings.paper.model_copy(update={"book_id": "sandbox"})}
+    )
+    env.open_window(tmp_path=tmp_path)
+    outcome = env.run(at(F_0, 21))
+    assert outcome.status == "ok"
+    assert env.submits() == []
+    assert any("outside market hours" in note for note in outcome.notes)
+
+
+def test_sandbox_preopen_waits_until_market_open_to_submit(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(env.settings).write_text("")
+    env.settings = env.settings.model_copy(
+        update={"paper": env.settings.paper.model_copy(update={"book_id": "sandbox"})}
+    )
+    env.open_window(tmp_path=tmp_path)
+    submitted_at: list[datetime] = []
+    original = env.fake.submit
+
+    def record_submit(request: OrderRequest) -> Any:
+        submitted_at.append(env.clock.now)
+        return original(request)
+
+    monkeypatch.setattr(env.fake, "submit", record_submit)
+    outcome = env.run(at(F_0, 13))
+    assert outcome.status == "ok"
+    assert submitted_at
+    assert all(session_open(F_0) <= stamp <= session_close(F_0) for stamp in submitted_at)
+
+
+def test_sandbox_wrapper_stops_when_clock_passes_close_mid_batch(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lock, "_temp_roots", lambda: {tmp_path.resolve()})
+    lock.sandbox_marker(env.settings).write_text("")
+    env.settings = env.settings.model_copy(
+        update={"paper": env.settings.paper.model_copy(update={"book_id": "sandbox"})}
+    )
+    env.open_window(tmp_path=tmp_path)
+    original = env.fake.submit
+
+    def advance_after_first(request: OrderRequest) -> Any:
+        placed = original(request)
+        env.clock.now = session_close(F_0) + timedelta(seconds=1)
+        return placed
+
+    monkeypatch.setattr(env.fake, "submit", advance_after_first)
+    outcome = env.run(session_close(F_0) - timedelta(seconds=1))
+    assert outcome.status == "ok"
+    assert len(env.submits()) == 1
 
 
 def test_a_later_in_window_run_trades_the_pending_rebalance(
@@ -913,8 +995,9 @@ def test_a_limit_breaking_exclude_name_override_halts_the_phase(env: Env, tmp_pa
     """An `exclude_name` override's order goes through the same batch checks:
     with the frozen `risk.max_orders_per_run` at 3, F_0's three buys pass, and
     on F_1 the override's sell (TRNS, sold whole) and the three buys it frees
-    the cash for make four: the buys phase halts with `LimitBreachError`
-    before any of its submits, the rebalance `missed` with `limit_breach`."""
+    the cash for make four: the run halts with `LimitBreachError` before the
+    sells phase submits anything (#2973), the rebalance `missed` with
+    `limit_breach`."""
     window = env.open_window(
         frozen=FROZEN.model_copy(update={"max_orders_per_run": 3}), tmp_path=tmp_path
     )
@@ -941,7 +1024,8 @@ def test_a_limit_breaking_exclude_name_override_halts_the_phase(env: Env, tmp_pa
     assert (status, fault) == ("halted", "LimitBreachError")
     assert message is not None and "max_orders_per_run" in message
     mine = [o for o in env.orders() if o[5] == halted]
-    assert [(o[1], o[2]) for o in mine] == [("SEC_TRANSFER", "sell")]  # no buy submitted
+    assert mine == []  # the total is checked before the first sell (#2973)
+    assert "4 orders (sells 1, planned buys 3) against the cap of 3" in message
     assert (t_1, "missed", "limit_breach", halted) in env.rebalance_events()
     assert env.query("SELECT source, fault_type, run_id FROM kill_switch") == [
         ("fault", "LimitBreachError", halted)

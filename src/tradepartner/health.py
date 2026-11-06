@@ -18,8 +18,9 @@ here is this module's and is stated once:
   `backfill`, `import`), per source
   (`ingest.SOURCES` first, then any other source in the table,
   alphabetically): the finish time and cursor of the last `ok` run,
-  and the status, start and message of the latest run of any status. A source
-  that never ran shows `None`s. A maintenance or repair mode (`retract`,
+  and the status, start and message of the latest run of any status (rows
+  sharing the latest start time are one run, summed up by `_latest_line`;
+  #2728). A source that never ran shows `None`s. A maintenance or repair mode (`retract`,
   `actions`, `holes`, `repair`, `action_retract`, or any mode added later) is
   not an ingest and is left out, so it never hides the latest ingest's status.
 - **Coverage** (`coverage`): the population of ingest's staleness check
@@ -85,6 +86,10 @@ here is this module's and is stated once:
   (`"<security_id>@<valid_from>"`), in that rule's row shape, so an accepted
   pair is listed, never silently hidden.
 - **Settings**: `universe.liquidity_rule_enabled` and `execution.fill_price`.
+- **Implausible Form 4 dates**: stored transactions known at `t` whose transaction
+  date is impossible: before `events.form4_min_transaction_date` or after the
+  filing's New York acceptance day plus `events.form4_after_acceptance_days`.
+  Report-only warning; source rows stay as filed.
 - **Statement facts** (`statement`, #660, T77c): `edgar.statement_facts_enabled`'s
   state; while it is on, `statement_coverage`'s share of `universe_as_of(T)`
   names whose issuer has a `revenue` and a `total_assets` row known at `t`
@@ -111,6 +116,20 @@ here is this module's and is stated once:
   warning while `items_missing` or `clock_suspect` is positive. Coverage is
   reported, not thresholded. `clock_suspect` is the clock detector's rule
   (a health finding, never a repair): a stamp that fits only a moved clock.
+
+- **Incremental EDGAR** (`incremental_edgar`, #2629, T321): `counts` is
+  `incremental_edgar_counts` of the latest `edgar` or `edgar_index` run
+  message that carries them
+  (`incremental_drift: N`, `index_stamp_changed: N`), with the CIKs the
+  drift check named; a warning while either is positive. A drifted CIK means
+  a rule changed in code without a `BUILD_RULES_VERSION` bump; a changed stamp
+  is an owner repair release (spec amendment 2026-10-30). Report-only.
+
+- **Form 4 comparison** (`form4_compare`, T351, #2714): the disagreeing and compared
+  XML-fetched accessions, the threshold and the unresolved review markers of the latest
+  `edgar` or `sec_forms` run message that carries them
+  (`form4_compare_disagree=N; form4_compare_compared=N; form4_compare_threshold=...`);
+  `None` before one ran. Report-only here: the run fails at or above the threshold.
 
 - **Rates** (`rates`, #1498, T169e): per configured or stored series, the
   stored row count, latest observation, vintage and stamp, revised-key count,
@@ -200,6 +219,33 @@ derived at `t`, as the data is read.
   `provenance_allowed` (the table's own set, `schema.TABLE_PROVENANCE_VALUES`)
   on every fact table. The schema's constraints already block these; the rules
   make a store written by other code, or a changed schema, show it.
+- The SEC ownership form rules (#2571, T307c), four per table on
+  `sec_filing_events` and `sec_form4_transactions`, over every stored row
+  whatever its `known_at`, and whether or not `events.sec_forms_enabled`
+  collects: `*_known_at_is_accepted_at` (`known_at` equals `accepted_at`),
+  `*_timestamps_aware` (both timestamp columns are `TIMESTAMPTZ`),
+  `*_unique` (no duplicate identity) and `*_identity_not_null`. The identity
+  is (`accession`, `subject_cik`, `filer_cik`) for `sec_filing_events` and
+  (`accession`, `filer_cik`, `line_no`) for `sec_form4_transactions`; the
+  `*_known_at_is_accepted_at` and `*_unique` frames carry it in full. A store
+  without a table passes that table's four rules.
+- The `filing_index` revision rules (#2629, #2703, T318b), over every stored
+  row whatever its `known_at`, per `(cik, accession)` ordered by `known_at`:
+  `filing_index_first_known_at_is_accepted_at` (the earliest row's `known_at`
+  equals its `accepted_at`), `filing_index_revision_known_at_after_accepted_at`
+  (every later row has `known_at > accepted_at`),
+  `filing_index_revision_listed_on_ordered` (a later row's `listed_on` is on or
+  after the row before it), `filing_index_revision_matches_first` (a later
+  row's form, company name and `accepted_at` equal the earliest row's),
+  `filing_index_revision_filed_on_changes` (a later row's `filed_on` differs
+  from the row before it) and `filing_index_timestamps_aware` (`known_at`,
+  `accepted_at` and `ingested_at` are `TIMESTAMPTZ`). The frames carry
+  (`cik`, `accession`, rows), except the last, which carries the columns. The
+  common `known_at <= ingested_at` rule covers the rest: the restamp sets
+  `ingested_at` on a moved row, except a moved fact with a later stored ingest
+  of the same fact (same security, name, class member and accession) or a
+  revision at its own ingest, which keeps its original `ingested_at` (#2985).
+  A store without the table passes all six; a clean store holding a revision passes them.
 - `bars_on_sessions`: every `prices_daily.session` is an XNYS session in the
   configured calendar range.
 - `no_duplicate_bars`: no two bars share `(security_id, session, known_at)`.
@@ -314,8 +360,10 @@ derived at `t`, as the data is read.
   reviewed list (`store.dividend_reviews`, read at the edge so tests inject
   one) by `equal_amount_groups`: a key with more than one identity that the
   list does not hold, or a listed key with another identity count than the
-  two reviewed (a third record; a lost leg; a duplicate whose ids changed),
-  fails, one row per identity with its `known_at`. `known_at` and the id
+  two reviewed (a third record; a lost leg; a duplicate whose ids changed;
+  a reviewed retract id re-sent under another key, a noisy amount or
+  another ex-date, beside another live payment, #2980), fails, one row per
+  identity with its `known_at`. `known_at` and the id
   are never part of the key, and the rule has no date bound. The
   `duplicate_dividends` block lists the accepted (`distinct`) and
   unresolved keys, never hidden, and the pending ones (a listed `duplicate`
@@ -387,8 +435,9 @@ import re
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
+from decimal import Decimal
 from itertools import pairwise
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -430,6 +479,7 @@ from tradepartner.store.asof import (
     _traded,
     _validate_t,
     borrow_status_as_of,
+    form4_date_plausibility_sql,
     listings_as_of,
     live_actions_as_of,
     mergers_as_of,
@@ -504,6 +554,22 @@ FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT = "filing_events_known_at_is_accepted_at"
 FILING_EVENTS_FORM_ALLOWED = "filing_events_form_allowed"
 FILING_EVENTS_ITEMS_NOT_NULL = "filing_events_items_not_null"
 FILING_EVENTS_UNIQUE = "filing_events_unique"
+FILING_INDEX_FIRST_KNOWN_AT_IS_ACCEPTED_AT = "filing_index_first_known_at_is_accepted_at"
+FILING_INDEX_REVISION_KNOWN_AT_AFTER_ACCEPTED_AT = (
+    "filing_index_revision_known_at_after_accepted_at"
+)
+FILING_INDEX_REVISION_LISTED_ON_ORDERED = "filing_index_revision_listed_on_ordered"
+FILING_INDEX_REVISION_MATCHES_FIRST = "filing_index_revision_matches_first"
+FILING_INDEX_REVISION_FILED_ON_CHANGES = "filing_index_revision_filed_on_changes"
+FILING_INDEX_TIMESTAMPS_AWARE = "filing_index_timestamps_aware"
+SEC_FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT = "sec_filing_events_known_at_is_accepted_at"
+SEC_FILING_EVENTS_TIMESTAMPS_AWARE = "sec_filing_events_timestamps_aware"
+SEC_FILING_EVENTS_UNIQUE = "sec_filing_events_unique"
+SEC_FILING_EVENTS_IDENTITY_NOT_NULL = "sec_filing_events_identity_not_null"
+SEC_FORM4_TRANSACTIONS_KNOWN_AT_IS_ACCEPTED_AT = "sec_form4_transactions_known_at_is_accepted_at"
+SEC_FORM4_TRANSACTIONS_TIMESTAMPS_AWARE = "sec_form4_transactions_timestamps_aware"
+SEC_FORM4_TRANSACTIONS_UNIQUE = "sec_form4_transactions_unique"
+SEC_FORM4_TRANSACTIONS_IDENTITY_NOT_NULL = "sec_form4_transactions_identity_not_null"
 #: The coverage check's rule (#1541): reported from the `coverage_reference`
 #: block, never from `INTEGRITY_RULES` (module docstring).
 COVERAGE_REFERENCE_NAMES = "coverage_reference_names"
@@ -567,6 +633,20 @@ INTEGRITY_RULES: tuple[str, ...] = (
     FILING_EVENTS_FORM_ALLOWED,
     FILING_EVENTS_ITEMS_NOT_NULL,
     FILING_EVENTS_UNIQUE,
+    FILING_INDEX_FIRST_KNOWN_AT_IS_ACCEPTED_AT,
+    FILING_INDEX_REVISION_KNOWN_AT_AFTER_ACCEPTED_AT,
+    FILING_INDEX_REVISION_LISTED_ON_ORDERED,
+    FILING_INDEX_REVISION_MATCHES_FIRST,
+    FILING_INDEX_REVISION_FILED_ON_CHANGES,
+    FILING_INDEX_TIMESTAMPS_AWARE,
+    SEC_FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
+    SEC_FILING_EVENTS_TIMESTAMPS_AWARE,
+    SEC_FILING_EVENTS_UNIQUE,
+    SEC_FILING_EVENTS_IDENTITY_NOT_NULL,
+    SEC_FORM4_TRANSACTIONS_KNOWN_AT_IS_ACCEPTED_AT,
+    SEC_FORM4_TRANSACTIONS_TIMESTAMPS_AWARE,
+    SEC_FORM4_TRANSACTIONS_UNIQUE,
+    SEC_FORM4_TRANSACTIONS_IDENTITY_NOT_NULL,
     SESSION_HOLES,
     RATE_KNOWN_AT,
     RATE_UNIQUE,
@@ -878,6 +958,120 @@ class FilingEvents:
             for name in ("items_missing", "clock_suspect")
             if self.counts.get(name, 0) > 0
         )
+
+
+#: `incremental_drift: <N>` and `index_stamp_changed: <N>` (the incremental
+#: EDGAR ingest's run-message figures, #2629), and the drift check's named
+#: CIKs, `incremental_drift_ciks: a b c` (`store.drift_check.drift_message`).
+_INCREMENTAL_COUNT = re.compile(r"\b(incremental_drift|index_stamp_changed): (\d+)\b")
+_INCREMENTAL_CIKS = re.compile(r"\bincremental_drift_ciks: ([0-9 ]+)")
+
+
+def incremental_edgar_counts(message: str | None) -> dict[str, int]:
+    """The `incremental_drift` and `index_stamp_changed` figures of an EDGAR
+    run's message (#2629), keyed by name. Empty when `message` is `None` or
+    names neither (a nightly before the incremental ingest)."""
+    if not message:
+        return {}
+    return {name: int(n) for name, n in _INCREMENTAL_COUNT.findall(message)}
+
+
+@dataclass(frozen=True, eq=False)
+class IncrementalEdgar:
+    """The incremental EDGAR ingest's two report-only warnings (#2629, T321;
+    module docstring). `counts` is `incremental_edgar_counts` of the latest
+    EDGAR run's message and `drift_ciks` the CIKs it names (up to ten)."""
+
+    counts: dict[str, int]
+    drift_ciks: tuple[str, ...] = ()
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        """`incremental_drift` (naming its CIKs) and `index_stamp_changed`,
+        each while its count in the latest run is positive."""
+        out: list[str] = []
+        drift = self.counts.get("incremental_drift", 0)
+        if drift > 0:
+            named = f" ({' '.join(self.drift_ciks)})" if self.drift_ciks else ""
+            out.append(f"incremental_drift: {drift}{named}")
+        changed = self.counts.get("index_stamp_changed", 0)
+        if changed > 0:
+            out.append(f"index_stamp_changed: {changed}")
+        return tuple(out)
+
+
+def _incremental_edgar_report(conn: duckdb.DuckDBPyConnection, t: datetime) -> IncrementalEdgar:
+    """The latest run of `edgar` or `edgar_index` finished by `t` whose
+    message carries either figure (the driver writes both on the
+    `edgar_index` row); a later run without them neither clears nor shows."""
+    row = conn.execute(
+        """
+        SELECT message FROM ingestion_runs
+        WHERE source IN ('edgar', 'edgar_index') AND coalesce(finished_at, started_at) <= ?
+          AND (message LIKE '%incremental_drift:%' OR message LIKE '%index_stamp_changed:%')
+        ORDER BY started_at DESC, run_id DESC LIMIT 1
+        """,
+        [t],
+    ).fetchone()
+    message = None if row is None else row[0]
+    named = _INCREMENTAL_CIKS.search(message or "")
+    return IncrementalEdgar(
+        counts=incremental_edgar_counts(message),
+        drift_ciks=tuple(named.group(1).split()) if named else (),
+    )
+
+
+_FORM4_COMPARE = re.compile(
+    r"\bform4_compare_disagree=(\d+); form4_compare_compared=(\d+); "
+    r"form4_compare_threshold=(\S+?);(?: form4_compare_markers=(\d+))?"
+)
+
+
+@dataclass(frozen=True)
+class Form4Compare:
+    """The Form 4 rule 5 comparison of the latest Form 4 writer run (T351, #2714): the
+    disagreeing and compared XML-fetched accessions, the configured share threshold
+    (`unset` reports only) and the unresolved review markers in its manifest. Report-only:
+    the run itself fails at or above the threshold. Nothing compared is `unchecked`."""
+
+    disagreeing: int = 0
+    compared: int = 0
+    threshold: str = "unset"
+    markers: int = 0
+
+    @property
+    def share(self) -> Decimal | None:
+        """Disagreeing over compared; `None` when nothing was compared."""
+        return Decimal(self.disagreeing) / Decimal(self.compared) if self.compared else None
+
+
+def form4_compare_from_message(message: str | None) -> Form4Compare | None:
+    """The rule 5 figures a Form 4 writer run's message carries, or `None` when it
+    names none (a run before T351)."""
+    found = _FORM4_COMPARE.search(message or "")
+    if found is None:
+        return None
+    return Form4Compare(
+        int(found.group(1)),
+        int(found.group(2)),
+        found.group(3),
+        int(found.group(4) or 0),
+    )
+
+
+def _form4_compare_report(conn: duckdb.DuckDBPyConnection, t: datetime) -> Form4Compare | None:
+    """The latest `edgar` or `sec_forms` run finished by `t` whose message carries the
+    figures; a later run without them neither clears nor shows."""
+    row = conn.execute(
+        """
+        SELECT message FROM ingestion_runs
+        WHERE source IN ('edgar', 'sec_forms') AND coalesce(finished_at, started_at) <= ?
+          AND message LIKE '%form4_compare_compared=%'
+        ORDER BY started_at DESC, run_id DESC LIMIT 1
+        """,
+        [t],
+    ).fetchone()
+    return form4_compare_from_message(None if row is None else row[0])
 
 
 _REFERENCE_MISSING_SCHEMA: dict[str, Any] = {
@@ -1794,11 +1988,16 @@ class HealthReport:
     mergers: MergersHealth
     figi_types: FigiTypes
     duplicate_dividends: DuplicateDividends
+    implausible_form4_dates: int
     filename_listings: FilenameListings
     successor_chains: SuccessorChains
     integrity: tuple[IntegrityCheck, ...]
     #: `None` when the block was not computed ("not computed", never a pass).
     coverage_reference: CoverageReference | None = None
+    #: The incremental EDGAR ingest's warnings (#2629).
+    incremental_edgar: IncrementalEdgar = field(default_factory=lambda: IncrementalEdgar({}))
+    #: The latest Form 4 writer run's rule 5 comparison (T351); `None` before one ran.
+    form4_compare: Form4Compare | None = None
 
     @property
     def failures(self) -> tuple[str, ...]:
@@ -1950,11 +2149,27 @@ def health_report(
         },
         statement=_statement_facts_report(conn, t, settings, ingests),
         filing_events=_filing_events_report(conn, settings, ingests),
+        incremental_edgar=_incremental_edgar_report(conn, t),
+        form4_compare=_form4_compare_report(conn, t),
         rates=_rates_report(conn, t, settings),
         borrow=_borrow_report(conn, t, session, settings),
         mergers=_mergers_report(conn, t, ingests),
         figi_types=_figi_types_report(conn, t, session, settings, current, classes),
         duplicate_dividends=dividends,
+        implausible_form4_dates=int(
+            (
+                conn.execute(
+                    "SELECT count(*) FROM sec_form4_transactions WHERE known_at <= ? AND NOT ("
+                    + form4_date_plausibility_sql(
+                        settings.events.form4_min_transaction_date,
+                        settings.events.form4_after_acceptance_days,
+                    )
+                    + ")",
+                    [t],
+                ).fetchone()
+                or (0,)
+            )[0]
+        ),
         filename_listings=_filename_listings(conn, t, listings),
         successor_chains=successor_chains(conn, t, settings, chain_candidates),
         integrity=_integrity_checks(conn, t, settings, listings, overlaps, dividends),
@@ -2721,19 +2936,36 @@ def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestSt
     for source in (*SOURCES, *extra):
         rows = by_source.get(source, [])
         ok_rows = [r for r in rows if r[1] == OK and r[3] is not None]
-        last_ok = max(ok_rows, key=lambda r: r[3], default=None)
+        last_ok = max(ok_rows, key=lambda r: (r[3], r[4] or ""), default=None)
         latest = rows[-1] if rows else None
+        status, message = (None, None) if latest is None else _latest_line(rows)
         out.append(
             IngestStatus(
                 source=source,
                 last_ok_finished_at=None if last_ok is None else last_ok[3],
                 last_ok_cursor=None if last_ok is None else last_ok[4],
-                latest_status=None if latest is None else latest[1],
+                latest_status=status,
                 latest_started_at=None if latest is None else latest[2],
-                latest_message=None if latest is None else latest[5],
+                latest_message=message,
             )
         )
     return tuple(out)
+
+
+def _latest_line(rows: list[tuple[Any, ...]]) -> tuple[str, str | None]:
+    """The latest run's status and message. One run can write several rows at one start
+    time (the Form 4 bulk backfill writes one per quarter, #2728): those are summed up in
+    cursor order, `ok` only when every row is, so no row is picked by its random run id."""
+    latest = rows[-1]
+    tied = sorted((r for r in rows if r[2] == latest[2]), key=lambda r: r[4] or "")
+    if len(tied) == 1:
+        return latest[1], latest[5]
+    not_ok = [r for r in tied if r[1] != OK]
+    status = OK if not not_ok else not_ok[0][1] if len({r[1] for r in not_ok}) == 1 else "mixed"
+    message = f"{len(tied)} rows ({tied[0][4]} to {tied[-1][4]}): {len(tied) - len(not_ok)} ok"
+    if not_ok:
+        message += "; not ok: " + ", ".join(f"{r[4]} {r[1]}" for r in not_ok)
+    return status, message
 
 
 def _current_from(listings: pl.DataFrame, session: date) -> dict[str, dict[str, Any]]:
@@ -3047,6 +3279,8 @@ def _integrity_checks(
         STATEMENT_DERIVED_MATCHES_COMPONENTS: _statement_derived_matches_components(conn),
         STATEMENT_BASIS_ALLOWED: _statement_basis_allowed(conn),
         **_filing_event_rules(conn, settings),
+        **_filing_index_rules(conn),
+        **_sec_form_rules(conn),
         SESSION_HOLES: _session_holes(conn, t, settings),
         **_rate_rules(conn),
         **_new_action_stamp_rules(conn),
@@ -3802,3 +4036,178 @@ def _filing_event_rules(
         FILING_EVENTS_ITEMS_NOT_NULL: keys("WHERE items IS NULL"),
         FILING_EVENTS_UNIQUE: keys("", "HAVING count(*) > 1"),
     }
+
+
+_FILING_INDEX_COLUMN_SCHEMA: dict[str, Any] = {"column": pl.Utf8, "rows": pl.Int64}
+_FILING_INDEX_STAMPS = ("known_at", "accepted_at", "ingested_at")
+
+#: Each revision rule's `WHERE` over `_FILING_INDEX_ROWS` (T318b): `n` is the
+#: row's place in its accession's `known_at` order, `first_*` the earliest row's
+#: values and `prev_*` the row before it.
+_FILING_INDEX_WHERE: dict[str, str] = {
+    FILING_INDEX_FIRST_KNOWN_AT_IS_ACCEPTED_AT: "n = 1 AND known_at IS DISTINCT FROM accepted_at",
+    FILING_INDEX_REVISION_KNOWN_AT_AFTER_ACCEPTED_AT: "n > 1 AND NOT (known_at > accepted_at)",
+    FILING_INDEX_REVISION_LISTED_ON_ORDERED: "n > 1 AND NOT (listed_on >= prev_listed_on)",
+    FILING_INDEX_REVISION_MATCHES_FIRST: (
+        "n > 1 AND (form IS DISTINCT FROM first_form "
+        "OR company_name IS DISTINCT FROM first_company_name "
+        "OR accepted_at IS DISTINCT FROM first_accepted_at)"
+    ),
+    FILING_INDEX_REVISION_FILED_ON_CHANGES: "n > 1 AND NOT (filed_on <> prev_filed_on)",
+}
+_FILING_INDEX_ROWS = """
+    WITH r AS (
+        SELECT cik, accession, form, company_name, filed_on, accepted_at, listed_on, known_at,
+            row_number() OVER w AS n,
+            lag(listed_on) OVER w AS prev_listed_on,
+            lag(filed_on) OVER w AS prev_filed_on,
+            first_value(form) OVER w AS first_form,
+            first_value(company_name) OVER w AS first_company_name,
+            first_value(accepted_at) OVER w AS first_accepted_at
+        FROM filing_index
+        WINDOW w AS (PARTITION BY cik, accession ORDER BY known_at, listed_on)
+    )
+"""
+
+
+def _filing_index_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
+    """The six `filing_index` revision rules (module docstring, #2703): offending
+    keys (`cik`, `accession`, rows) or, for the timestamp rule, the columns that
+    are not `TIMESTAMPTZ`. A store without the table passes all six."""
+    rules: dict[str, pl.DataFrame] = {}
+    present = "filing_index" in _present_tables(conn)
+    for rule, where in _FILING_INDEX_WHERE.items():
+        found = (
+            conn.execute(
+                f"{_FILING_INDEX_ROWS} SELECT cik, accession, count(*) FROM r WHERE {where} "
+                "GROUP BY cik, accession ORDER BY cik, accession"
+            ).fetchall()
+            if present
+            else []
+        )
+        rules[rule] = pl.DataFrame(
+            [{"cik": c, "accession": a, "rows": int(n)} for c, a, n in found],
+            schema=_EVENT_KEY_SCHEMA,
+        )
+    types = (
+        dict(
+            conn.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_name = 'filing_index' AND table_catalog = current_database() "
+                "AND table_schema = current_schema() AND column_name IN (?, ?, ?)",
+                list(_FILING_INDEX_STAMPS),
+            ).fetchall()
+        )
+        if present
+        else {}
+    )
+    rules[FILING_INDEX_TIMESTAMPS_AWARE] = pl.DataFrame(
+        [
+            {"column": column, "rows": 1}
+            for column in _FILING_INDEX_STAMPS
+            if present and types.get(column) != "TIMESTAMP WITH TIME ZONE"
+        ],
+        schema=_FILING_INDEX_COLUMN_SCHEMA,
+    )
+    return rules
+
+
+_SEC_FORM_IDENTITIES: dict[str, tuple[str, ...]] = {
+    "sec_filing_events": ("accession", "subject_cik", "filer_cik"),
+    "sec_form4_transactions": ("accession", "filer_cik", "line_no"),
+}
+_SEC_FORM_RULES: dict[str, tuple[str, str, str, str]] = {
+    "sec_filing_events": (
+        SEC_FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
+        SEC_FILING_EVENTS_TIMESTAMPS_AWARE,
+        SEC_FILING_EVENTS_UNIQUE,
+        SEC_FILING_EVENTS_IDENTITY_NOT_NULL,
+    ),
+    "sec_form4_transactions": (
+        SEC_FORM4_TRANSACTIONS_KNOWN_AT_IS_ACCEPTED_AT,
+        SEC_FORM4_TRANSACTIONS_TIMESTAMPS_AWARE,
+        SEC_FORM4_TRANSACTIONS_UNIQUE,
+        SEC_FORM4_TRANSACTIONS_IDENTITY_NOT_NULL,
+    ),
+}
+_SEC_FORM_KEY_SCHEMA: dict[str, Any] = {
+    "accession": pl.Utf8,
+    "subject_cik": pl.Utf8,
+    "filer_cik": pl.Utf8,
+    "line_no": pl.Int64,
+    "rows": pl.Int64,
+}
+_SEC_FORM_COLUMN_SCHEMA: dict[str, Any] = {
+    "column": pl.Utf8,
+    "rows": pl.Int64,
+}
+
+
+def _sec_form_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
+    """Check SEC ownership identity and acceptance stamps in the store."""
+    present = _present_tables(conn)
+    rules: dict[str, pl.DataFrame] = {}
+    for table, identity in _SEC_FORM_IDENTITIES.items():
+        key_schema = _SEC_FORM_KEY_SCHEMA
+        column_schema = _SEC_FORM_COLUMN_SCHEMA
+        (
+            known_at_rule,
+            timestamps_rule,
+            unique_rule,
+            identity_not_null_rule,
+        ) = _SEC_FORM_RULES[table]
+        if table not in present:
+            rules[known_at_rule] = pl.DataFrame(schema=key_schema)
+            rules[timestamps_rule] = pl.DataFrame(schema=column_schema)
+            rules[unique_rule] = pl.DataFrame(schema=key_schema)
+            rules[identity_not_null_rule] = pl.DataFrame(schema=column_schema)
+            continue
+
+        def keys(
+            where: str,
+            having: str = "",
+            table_name: str = table,
+            columns: tuple[str, ...] = identity,
+            schema: dict[str, Any] = key_schema,
+        ) -> pl.DataFrame:
+            select_cols = ", ".join(columns)
+            found = conn.execute(
+                f"SELECT {select_cols}, count(*) FROM {table_name} {where} "
+                f"GROUP BY {select_cols} {having} ORDER BY accession"
+            ).fetchall()
+            rows: list[dict[str, Any]] = []
+            for row in found:
+                d = {"rows": int(row[-1])}
+                for i, col in enumerate(columns):
+                    d[col] = row[i]
+                rows.append(d)
+            return pl.DataFrame(rows, schema=schema)
+
+        rules[known_at_rule] = keys("WHERE known_at IS DISTINCT FROM accepted_at")
+        rules[unique_rule] = keys("", "HAVING count(*) > 1")
+        null_counts = []
+        for column in identity:
+            count_row = conn.execute(
+                f"SELECT count(*) FROM {table} WHERE {column} IS NULL"
+            ).fetchone()
+            null_counts.append({"column": column, "rows": int(count_row[0]) if count_row else 0})
+        rules[identity_not_null_rule] = pl.DataFrame(
+            [row for row in null_counts if row["rows"]], schema=column_schema
+        )
+        types = conn.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name = ? AND table_catalog = current_database() "
+            "AND table_schema = current_schema() "
+            "AND column_name IN ('known_at', 'accepted_at')",
+            [table],
+        ).fetchall()
+        type_by_column = dict(types)
+        rules[timestamps_rule] = pl.DataFrame(
+            [
+                {"column": column, "rows": 1}
+                for column in ("known_at", "accepted_at")
+                if type_by_column.get(column) != "TIMESTAMP WITH TIME ZONE"
+            ],
+            schema=column_schema,
+        )
+    return rules

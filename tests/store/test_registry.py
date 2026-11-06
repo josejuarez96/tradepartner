@@ -27,6 +27,7 @@ import duckdb
 import pytest
 
 from tradepartner.config import Cadence, Settings
+from tradepartner.config_edgar import PRE_2826_STATEMENT_FACTS
 from tradepartner.store import journal, registry, schema
 from tradepartner.store.benchmarks import CHECK_ONLY_IDS
 from tradepartner.store.db import insert_row
@@ -1182,13 +1183,31 @@ def test_every_fact_table_is_classified_for_trial_vintage(
         # none is read by a reader a registered trial uses. `successor_chains`
         # (#821, T187) is inside the vintage: its rows move the chained reads a
         # trial sees.
-        excluded = {"rates", "borrow_status", "symbol_changes", "openfigi_types", "mergers"}
+        excluded = {
+            "rates",
+            "borrow_status",
+            "symbol_changes",
+            "openfigi_types",
+            "spinoff_allocations",
+            "sec_filing_events",
+            "sec_form4_transactions",
+            "snapshot_sightings",  # trials read listings, never raw SEC observations
+            "filing_index",
+            "filing_index_pending",
+            "edgar_filers",
+            "edgar_index_files",
+        }
+        # Conditional (#2670, T328d): the exit evidence a trial reads only under a
+        # frozen `backtest.delisting_failure_return` other than `none`.
+        conditional = set(registry._DELISTING_POLICY_TABLES)
+        assert conditional == {"delisting_reasons", "mergers"}
         assert included.isdisjoint(excluded)
+        assert conditional.isdisjoint(included | excluded)
         # An included name must be a store table, and every store table must
         # be classified on one side. `symbol_changes` is the amendment's
         # name before T172b creates its table, so it is excluded either way.
-        assert included <= facts
-        assert facts == included | (excluded & facts)
+        assert included | conditional <= facts
+        assert facts == included | conditional | (excluded & facts)
 
     assert_classified()
     with monkeypatch.context() as patch:
@@ -1437,6 +1456,167 @@ def test_a_spinoff_row_stales_only_a_trial_that_reads_spin_offs(
         "SELECT status, message FROM trial_results WHERE trial_id = ?",
         [reading.trial_id],
     ).fetchone() == ("failed", registry.STORE_CHANGED_MESSAGE)
+
+
+_POLICY_KEY = "backtest.delisting_failure_return"
+_POLICIES = ("none", "failure_v1", "severe_v1")
+
+
+def _exit_evidence(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    security_id: str,
+    *,
+    known_at: datetime,
+    ingested_at: datetime,
+) -> None:
+    """One `delisting_reasons` or `mergers` row (#2670, T328d): the exit evidence a
+    non-`none` delisting policy reads."""
+    if table == "delisting_reasons":
+        row: dict[str, Any] = {
+            "security_id": security_id,
+            "delisting_form": "25",
+            "delisting_class_title": "Common Stock",
+            "delisting_exchange": "NASDAQ",
+            "delisting_filed_at": known_at,
+            "reason": "bankruptcy",
+            "reason_evidence_form": "8-K",
+            "reason_evidence_accession": f"acc-{security_id}",
+            "reason_source": "eightk_item",
+            "reason_known_at": known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        }
+    else:
+        row = {
+            "security_id": security_id,
+            "kind": "cash",
+            "acquirer_security_id": None,
+            "acquiree_symbol": security_id,
+            "acquiree_cusip": "",
+            "acquirer_symbol": "",
+            "acquirer_cusip": "",
+            "share_ratio": None,
+            "cash_per_share": 10.0,
+            "effective_date": known_at.date(),
+            "process_date": known_at.date(),
+            "payable_date": None,
+            "source_action_id": f"t328d-{security_id}",
+            "source": "alpaca",
+            "provenance": "action",
+        }
+    insert_row(conn, table, row | {"known_at": known_at, "ingested_at": ingested_at})
+
+
+@pytest.mark.parametrize("table", ["delisting_reasons", "mergers"])
+def test_exit_evidence_moves_the_vintage_only_under_a_delisting_policy(
+    fixture_store: duckdb.DuckDBPyConnection, table: str
+) -> None:
+    """T328d (#2670): a backfilled reason or merger row with `known_at <= cutoff`
+    moves `data_vintage` under `failure_v1` and `severe_v1`, from its own `known_at`
+    on (no look-ahead: a microsecond before it, nothing moves), while at the default
+    `none` -- every release-level call and every 0% trial -- the vintage is
+    byte-identical at every cutoff, under either `spin_offs`."""
+    cutoffs = sorted(
+        {
+            *_fixture_cutoffs(fixture_store),
+            _PIN_KNOWN - timedelta(microseconds=1),
+            _PIN_KNOWN,
+            _PIN_KNOWN + timedelta(microseconds=1),
+        }
+    )
+    before = {
+        (cutoff, flag, policy): registry.data_vintage(
+            fixture_store, cutoff, spin_offs=flag, delisting_policy=policy
+        )
+        for cutoff in cutoffs
+        for flag in (False, True)
+        for policy in _POLICIES
+    }
+    for cutoff in cutoffs:  # no evidence yet: the gate alone moves nothing
+        for flag in (False, True):
+            assert before[cutoff, flag, "failure_v1"] == before[cutoff, flag, "none"], cutoff
+    _exit_evidence(fixture_store, table, "SEC_T328D", known_at=_PIN_KNOWN, ingested_at=_LATE_INGEST)
+    for cutoff in cutoffs:
+        for flag in (False, True):
+            assert (
+                registry.data_vintage(fixture_store, cutoff, spin_offs=flag)
+                == (before[cutoff, flag, "none"])
+            ), (cutoff, flag)
+            for policy in ("failure_v1", "severe_v1"):
+                reading = registry.data_vintage(
+                    fixture_store, cutoff, spin_offs=flag, delisting_policy=policy
+                )
+                expected = _LATE_INGEST if cutoff >= _PIN_KNOWN else before[cutoff, flag, policy]
+                assert reading == expected, (cutoff, flag, policy)
+
+
+@pytest.mark.parametrize("table", ["delisting_reasons", "mergers"])
+def test_exit_evidence_by_the_cutoff_stales_only_a_policy_trial(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path, table: str
+) -> None:
+    """T328d: `open_trial` reads the vintage under the trial's frozen
+    `backtest.delisting_failure_return` and `_store_changed` reads it back, so a
+    reason or merger row known by the cutoff and ingested after the open fails a
+    `failure_v1` trial and leaves a `none` one `ok`; one known after the cutoff
+    fails neither."""
+    _register(conn, settings, slug="h1")
+    _register(conn, settings, slug="h2", params=_params(**{_POLICY_KEY: "failure_v1"}))
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    plain = _open(conn, settings, tmp_path, slug="h1")
+    policy = _open(conn, settings, tmp_path, slug="h2")
+    assert policy.data_vintage == plain.data_vintage  # no evidence yet
+    _exit_evidence(
+        conn,
+        table,
+        "SEC_LATER",
+        known_at=_AFTER_CUTOFF,
+        ingested_at=_AFTER_CUTOFF + timedelta(hours=1),
+    )
+    assert not registry._store_changed(conn, policy, _T0)
+    _exit_evidence(conn, table, "SEC_BY_CUTOFF", known_at=_T0, ingested_at=_T0.replace(hour=14))
+    assert registry.write_result(conn, policy, registry.ResultStatistics(dsr=0.9)) == "failed"
+    assert registry.write_result(conn, plain, registry.ResultStatistics(dsr=0.9)) == "ok"
+    assert conn.execute(
+        "SELECT status, message FROM trial_results WHERE trial_id = ?",
+        [policy.trial_id],
+    ).fetchone() == ("failed", registry.STORE_CHANGED_MESSAGE)
+
+
+def test_the_backup_recheck_reads_the_trials_delisting_policy(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """T328d: `record_trial_state` reads the backup's vintage under the trial's
+    frozen policy, so a reason row on the backup known by the cutoff makes a
+    `failure_v1` trial's vintage differ while a `none` trial's still equals."""
+    _register(conn, settings, slug="h1")
+    _register(conn, settings, slug="h2", params=_params(**{_POLICY_KEY: "failure_v1"}))
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    plain = _open(conn, settings, tmp_path, slug="h1")
+    policy = _open(conn, settings, tmp_path, slug="h2")
+    backup = _connect(tmp_path / "backup.duckdb")
+    _price(backup, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    _exit_evidence(
+        backup, "delisting_reasons", "SEC_R", known_at=_T0, ingested_at=_T0.replace(hour=14)
+    )
+    for name, trial in (("rec-plain", plain), ("rec-policy", policy)):
+        registry.record_trial_state(
+            conn, backup, name=name, backup_path="b.duckdb", trial_id=trial.trial_id, reason="r"
+        )
+    equals = {r.name: r.values["vintage_equals_trial"] for r in registry.data_releases(conn)}
+    assert equals == {"rec-plain": True, "rec-policy": False}
+
+
+def test_three_delisting_policy_registrations_count_three_in_n(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """T328d: the three policy rows are three registrations, each a trial counted
+    in the family's N by the existing rule (no sweep change)."""
+    for slug, value in zip(("h-none", "h-fail", "h-severe"), _POLICIES, strict=True):
+        _register(conn, settings, slug=slug, params=_params(**{_POLICY_KEY: value}))
+        _ok_trial(conn, settings, tmp_path, 0.1, 0.01, slug=slug)
+    assert registry.count_counted_trials(conn, "momentum", None) == 3
+    assert registry.family_sharpes(conn, "momentum").n_trials == 3
 
 
 def test_a_split_and_a_bar_still_move_the_trial_vintage(
@@ -2471,3 +2651,120 @@ def test_a_check_only_dividend_alone_moves_nothing_but_a_universe_dividend_does(
     )
     for flag in (False, True):
         assert registry.data_vintage(fixture_store, cutoff, spin_offs=flag) == _LATE_INGEST
+
+
+def test_spinoff_allocation_does_not_move_trial_vintage(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    cutoff = datetime(2020, 1, 1, tzinfo=UTC)
+    before = registry.data_vintage(fixture_store, cutoff, spin_offs=True)
+    stamp = datetime(2019, 1, 1, tzinfo=UTC)
+    fixture_store.execute(
+        "INSERT INTO spinoff_allocations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ["P", "C", date(2018, 12, 13), 0.3, stamp, stamp, "owner", "owner"],
+    )
+    assert registry.data_vintage(fixture_store, cutoff, spin_offs=True) == before
+
+
+def test_sec_ownership_rows_do_not_move_trial_vintage() -> None:
+    """Collecting research-only ownership events cannot stale a trial."""
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    stamp = datetime(2026, 10, 28, 21, tzinfo=UTC)
+    before = registry.data_vintage(conn, stamp)
+    conn.execute(
+        "INSERT INTO sec_filing_events VALUES ('accession', '4', ?, '2026-10-28', "
+        "'issuer', 'owner', ?, ?, 'edgar', 'filing')",
+        [stamp, stamp, stamp],
+    )
+    conn.execute(
+        "INSERT INTO sec_form4_transactions VALUES (" + ", ".join(["?"] * 23) + ")",
+        [
+            "accession",
+            "issuer",
+            "owner",
+            0,
+            False,
+            True,
+            False,
+            False,
+            date(2026, 10, 28),
+            None,
+            "P",
+            "A",
+            10,
+            2,
+            10,
+            "D",
+            "Common",
+            None,
+            stamp,
+            stamp,
+            stamp,
+            "edgar",
+            "filing",
+        ],
+    )
+    assert registry.data_vintage(conn, stamp) == before
+
+
+def _statement_row(
+    conn: duckdb.DuckDBPyConnection, fact_name: str, known: datetime, ingested: datetime
+) -> None:
+    insert_row(
+        conn,
+        "statement_facts",
+        {
+            "cik": "0000000099",
+            "fact_name": fact_name,
+            "xbrl_tag": f"us-gaap:{fact_name}",
+            "period_start": None,
+            "period_end": date(2019, 12, 31),
+            "period_days": 0,
+            "value": 1.0,
+            "unit": "USD",
+            "form": "10-K",
+            "filing_accession": "0000000099-20-000001",
+            "basis": "reported",
+            "comparative": False,
+            "known_at": known,
+            "ingested_at": ingested,
+            "source": "test",
+            "provenance": "filing",
+        },
+    )
+
+
+def test_a_new_statement_name_moves_no_trial_vintage_but_a_held_name_does(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#2826 (T366; owner answer 4): rows of a name outside
+    `PRE_2826_STATEMENT_FACTS` stale no trial at any cutoff, while
+    `store_max_ingested_at` still moves; a row of a held name still moves the
+    vintage from its `known_at` on."""
+    cutoffs = _fixture_cutoffs(fixture_store)
+    before = {cutoff: registry.data_vintage(fixture_store, cutoff) for cutoff in cutoffs}
+    for name in ("eps_diluted", "net_income", "some_future_name"):
+        assert name not in PRE_2826_STATEMENT_FACTS
+        _statement_row(fixture_store, name, _PIN_KNOWN, _LATE_INGEST)
+    assert registry.store_max_ingested_at(fixture_store) == _LATE_INGEST
+    for cutoff in cutoffs:
+        assert registry.data_vintage(fixture_store, cutoff) == before[cutoff], cutoff
+    _statement_row(fixture_store, "total_assets", _PIN_KNOWN, _LATE_INGEST)
+    for cutoff in cutoffs:
+        vintage = registry.data_vintage(fixture_store, cutoff)
+        if cutoff < _PIN_KNOWN:
+            assert vintage == before[cutoff], cutoff
+        else:
+            assert vintage == _LATE_INGEST, cutoff
+
+
+def test_every_held_statement_name_moves_the_trial_vintage(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    cutoff = datetime(2024, 6, 28, 20, 0, tzinfo=UTC)
+    known = datetime(2024, 6, 27, 20, 0, tzinfo=UTC)
+    for i, name in enumerate(PRE_2826_STATEMENT_FACTS):
+        ingested = datetime(2024, 6, 28, 1, i, tzinfo=UTC)
+        _statement_row(conn, name, known, ingested)
+        assert registry.data_vintage(conn, cutoff) == ingested, name

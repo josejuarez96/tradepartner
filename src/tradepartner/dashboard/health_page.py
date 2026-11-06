@@ -22,8 +22,9 @@ on a refresh, whatever `coverage.check_enabled` says)); and the gap,
 delisted and missing-name tables. Read-only.
 
 Two layers, like the other pages: `load_health_view` reads everything
-through the connection it is given (the shell's single read-only
-connection) and needs no Streamlit; `render` draws it.
+through the connection it is given and needs no Streamlit; `render` draws it.
+The shell supplies a cursor that releases the read-only store connection
+after each query result has been fetched.
 
 **Per-session series.** For each session s in the chosen window, from rows
 known at `t`: the bars dated s (`rows`, revisions included), and the coverage
@@ -79,6 +80,7 @@ from tradepartner.health import (
     stale_gap_expected,
     stale_sessions,
 )
+from tradepartner.ingest import SEC_FORMS_BACKFILL_SOURCES
 from tradepartner.store.classify import COMMON, classifications_as_of
 from tradepartner.store.delistings import LISTED, TRANSFERRED, listing_ends_as_of
 from tradepartner.store.master import securities_as_of
@@ -185,7 +187,11 @@ def load_health_view(
     coverage-reference block is computed only when `with_coverage_reference` is true
     (the card's button), never on a plain refresh."""
     report = health_report(conn, t, settings, with_coverage_reference=with_coverage_reference)
-    finished = [i.last_ok_finished_at for i in report.ingests if i.last_ok_finished_at]
+    finished = [
+        i.last_ok_finished_at
+        for i in report.ingests
+        if i.last_ok_finished_at and i.source not in SEC_FORMS_BACKFILL_SOURCES
+    ]
     return HealthView(
         report=report,
         series=_series(
@@ -573,7 +579,7 @@ def _tables(report: HealthReport) -> None:
 
 
 def render(conn: duckdb.DuckDBPyConnection) -> None:
-    """Draw the data-health page from the shell's read-only connection."""
+    """Draw Data health through the shell's short read-only steps."""
     settings = get_settings()
     t = _now()
     head, controls = st.columns([3, 2])

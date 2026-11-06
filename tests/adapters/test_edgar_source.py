@@ -12,13 +12,22 @@ recorded submissions payload.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import io
+import itertools
 import json
+import shutil
+import threading
+import time
 import zipfile
+from collections import Counter
+from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import duckdb
 import httpx
 import pytest
 from edgar_transport import (
@@ -34,6 +43,7 @@ from edgar_transport import (
 
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters import edgar_source as edgar_source_module
+from tradepartner.adapters.daily_index import DailyIndexFile
 from tradepartner.adapters.edgar import FsnFiling, UnstampedFiling, acceptance_times
 from tradepartner.adapters.edgar_raw import EdgarCredentialsError
 from tradepartner.adapters.edgar_source import (
@@ -41,6 +51,7 @@ from tradepartner.adapters.edgar_source import (
     FSN_VERSION,
     STAMPS_LAYOUT,
     EdgarFilingSource,
+    FilingFailuresError,
     SubmissionRecord,
     reduce_submissions,
 )
@@ -49,9 +60,1819 @@ from tradepartner.adapters.filings import (
     CoverPage,
     DelistingFiling,
     FilingIndexEntry,
+    IncrementalIndexState,
+    SecFormFiling,
 )
+from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.config import Settings
+from tradepartner.ingest import write_sec_form_accession
+from tradepartner.store import filing_index as stored_index
+from tradepartner.store import schema
+from tradepartner.store.filing_index import FilingRow
 from tradepartner.store.master import build_master
+
+
+def _incremental_file(day: date) -> DailyIndexFile:
+    name = f"form.{day:%Y%m%d}.idx"
+    quarter = (day.month - 1) // 3 + 1
+    return DailyIndexFile(f"daily-index/{day.year}/QTR{quarter}/{name}", name, "1", "1")
+
+
+def _incremental_row(cik: str, accession: str, form: str, filed: date) -> UnstampedFiling:
+    return UnstampedFiling(cik, "Company", form, accession, filed)
+
+
+def _incremental_state(
+    *,
+    stored: tuple[FilingRow, ...] = (),
+    pending: tuple[object, ...] = (),
+    filers: dict[str, tuple[tuple[int, int], tuple[int, int]]] | None = None,
+    files: tuple[DailyIndexFile, ...] = (),
+    issuer_ciks: frozenset[str] = frozenset(),
+    cursors: dict[str, tuple[str, str]] | None = None,
+    quarterly: dict[tuple[int, int], tuple[str, date]] | None = None,
+    settled_dates: dict[tuple[int, int], date] | None = None,
+) -> IncrementalIndexState:
+    return IncrementalIndexState(
+        now=datetime(2026, 4, 3, tzinfo=UTC),
+        stored=stored,
+        issuer_ciks=issuer_ciks,
+        pending=pending,
+        filers=filers or {},
+        daily_files=files,
+        file_cursors=cursors or {},
+        quarterly=quarterly or {},
+        settled_listed_on=settled_dates or {},
+    )
+
+
+def test_incremental_pairing_uses_stored_and_new_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    accession = "0001354457-26-000001"
+    subject = _incremental_row(APPLE, accession, "25-NSE", date(2026, 4, 1))
+    exchange_cik = "0001354457"
+    exchange = _incremental_row(exchange_cik, accession, "25-NSE", date(2026, 4, 1))
+    file = _incremental_file(date(2026, 4, 1))
+    monkeypatch.setattr(source, "_incremental_daily_rows", lambda _file: (subject, exchange))
+    monkeypatch.setattr(
+        source,
+        "_incremental_stamps",
+        lambda _rows: {
+            (r.cik, accession): datetime(2026, 4, 1, tzinfo=UTC) for r in (subject, exchange)
+        },
+    )
+    result = source.incremental_index(_incremental_state(files=(file,)))
+    assert [(r.cik, r.accession) for r in result.rows] == [(APPLE, accession)]
+
+
+def test_incremental_writes_first_listing_position(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The parser numbers data rows; a duplicate keeps its first position (#2813)."""
+    from tradepartner.adapters.edgar import parse_filing_index
+
+    text = (
+        index_header()
+        + index_line("10-K", "Other", int(APPLE) + 1, "2026-04-01", "0000000001-26-000009")
+        + index_line("10-K", "Company", int(APPLE), "2026-04-01", "0000320193-26-000001")
+        + index_line("10-K", "Company", int(APPLE), "2026-04-01", "0000320193-26-000001")
+    )
+    parsed = parse_filing_index(text, {}).unstamped
+    assert [r.list_position for r in parsed] == [0, 1, 2]
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    file = _incremental_file(date(2026, 4, 1))
+    monkeypatch.setattr(source, "_incremental_daily_rows", lambda _file: parsed)
+    monkeypatch.setattr(
+        source,
+        "_incremental_stamps",
+        lambda rows: {
+            (name, acc): datetime(2026, 4, 1, tzinfo=UTC)
+            for name, by_accession in rows.items()
+            for acc in by_accession
+        },
+    )
+    result = source.incremental_index(
+        _incremental_state(files=(file,), issuer_ciks=frozenset({APPLE}))
+    )
+    assert {r.cik: r.list_position for r in result.listings}[APPLE] == 1
+    assert sum(r.cik == APPLE for r in result.listings) == 1
+
+
+def test_incremental_repost_and_cross_quarter_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    accession = "0000320193-26-000001"
+    accepted = datetime(2026, 4, 1, tzinfo=UTC)
+    stored = FilingRow(
+        APPLE,
+        accession,
+        "10-K",
+        "Company",
+        date(2026, 4, 1),
+        accepted,
+        date(2026, 4, 2),
+        accepted,
+        accepted,
+    )
+    old_file, new_file = (_incremental_file(date(2026, 4, day)) for day in (1, 3))
+    monkeypatch.setattr(
+        source,
+        "_incremental_daily_rows",
+        lambda file: (
+            _incremental_row(
+                APPLE,
+                accession,
+                "10-K",
+                date(2026, 3, 31) if file == new_file else date(2026, 4, 1),
+            ),
+        ),
+    )
+    monkeypatch.setattr(source, "_incremental_stamps", lambda _rows: {(APPLE, accession): accepted})
+    old = source.incremental_index(
+        _incremental_state(stored=(stored,), files=(old_file,), issuer_ciks=frozenset({APPLE}))
+    )
+    assert not old.rows
+    assert old.counts["index_stale_listing"] == 1
+    corrected_stored = replace(
+        stored, filed_on=date(2026, 3, 31), known_at=datetime(2026, 4, 2, tzinfo=UTC)
+    )
+    repost = source.incremental_index(
+        _incremental_state(
+            stored=(corrected_stored,), files=(old_file,), issuer_ciks=frozenset({APPLE})
+        )
+    )
+    assert not repost.rows  # the old 04-01 date cannot undo the stored 03-31 correction
+    assert repost.counts["index_stale_listing"] == 1
+    changed = source.incremental_index(
+        _incremental_state(stored=(stored,), files=(new_file,), issuer_ciks=frozenset({APPLE}))
+    )
+    assert len(changed.rows) == 1
+    assert changed.rows[0].filed_on == date(2026, 3, 31)
+    assert changed.rows[0].known_at == changed.rows[0].ingested_at
+    assert changed.listings[0].is_daily
+
+
+def test_incremental_new_issuer_walk_one_pass_for_two(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    walk_calls = 0
+    walk_method = source._incremental_walk
+
+    def count_walk(*args: Any, **kwargs: Any) -> Any:
+        nonlocal walk_calls
+        walk_calls += 1
+        return walk_method(*args, **kwargs)
+
+    monkeypatch.setattr(source, "_incremental_walk", count_walk)
+    ciks = (APPLE, "0000789019")
+    older = _incremental_file(date(2026, 3, 30))
+    newer = _incremental_file(date(2026, 4, 2))
+    old_rows = tuple(
+        _incremental_row(cik, f"{int(cik):010d}-26-000001", "3", date(2026, 3, 30)) for cik in ciks
+    )
+    new_rows = tuple(
+        _incremental_row(cik, f"{int(cik):010d}-26-000002", "10-K", date(2026, 4, 2))
+        for cik in ciks
+    )
+
+    def read(file: DailyIndexFile) -> tuple[UnstampedFiling, ...]:
+        return old_rows if file == older else new_rows
+
+    monkeypatch.setattr(source, "_incremental_daily_rows", read)
+    monkeypatch.setattr(
+        source,
+        "_incremental_stamps",
+        lambda rows: {
+            (cik, accession): datetime(2026, 3, 30, tzinfo=UTC)
+            for cik, by_accession in rows.items()
+            for accession in by_accession
+        },
+    )
+    state = _incremental_state(
+        files=(older, newer),
+        cursors={older.path: ("1", "1")},
+        filers={cik: ((2026, 1), (2026, 2)) for cik in ciks},
+    )
+    result = source.incremental_index(state)
+    assert {r.accession for r in result.rows} == {r.accession for r in old_rows + new_rows}
+    assert walk_calls == 1
+    assert result.files_read == (newer,)
+
+
+def test_incremental_settled_walk_uses_cache_and_preserves_first_listing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    monkeypatch.setattr(
+        edgar_raw, "filing_index_quarter", lambda *_a, **_k: pytest.fail("settled request")
+    )
+    cik = APPLE
+    accession = "0000320193-25-000001"
+    cache = Path(source._settings.edgar.cache_dir) / "index/2025-QTR4.idx.gz"
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(
+        gzip.compress(
+            (
+                index_header() + index_line("3", "Company", int(cik), "2025-12-30", accession)
+            ).encode()
+        )
+    )
+    file = _incremental_file(date(2026, 4, 2))
+    closed_file = _incremental_file(date(2026, 3, 31))
+    new_row = _incremental_row(cik, "0000320193-26-000002", "10-K", date(2026, 4, 2))
+    monkeypatch.setattr(
+        source, "_incremental_daily_rows", lambda chosen: (new_row,) if chosen == file else ()
+    )
+    monkeypatch.setattr(
+        source,
+        "_incremental_stamps",
+        lambda rows: {
+            (name, acc): datetime(2025, 12, 30, tzinfo=UTC)
+            for name, by_accession in rows.items()
+            for acc in by_accession
+        },
+    )
+    state = _incremental_state(
+        files=(closed_file, file),
+        cursors={closed_file.path: ("1", "1")},
+        filers={cik: ((2025, 4), (2026, 2))},
+        settled_dates={(2025, 4): date(2026, 1, 1), (2026, 1): date(2026, 4, 1)},
+    )
+    q1 = Path(source._settings.edgar.cache_dir) / "index/2026-QTR1.idx.gz"
+    q1.write_bytes(gzip.compress(index_header().encode()))
+    result = source.incremental_index(state)
+    assert {r.accession for r in result.rows} == {accession, new_row.accession}
+    assert not next(r for r in result.listings if r.accession == accession).is_daily
+
+
+def test_incremental_reconcile_counts_absent_and_corrects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    monkeypatch.setattr(source, "_settled", lambda *_args: True)
+    accession = "0000320193-26-000001"
+    missing = "0000320193-26-000002"
+    accepted = datetime(2026, 1, 10, tzinfo=UTC)
+    stored = tuple(
+        FilingRow(
+            APPLE,
+            a,
+            "10-K",
+            "Company",
+            date(2026, 1, 10),
+            accepted,
+            date(2026, 1, 10),
+            accepted,
+            accepted,
+        )
+        for a in (accession, missing)
+    )
+    text = index_header() + index_line("10-K", "Company", int(APPLE), "2026-01-09", accession)
+    monkeypatch.setattr(source, "_incremental_stamps", lambda _rows: {(APPLE, accession): accepted})
+    result = source.incremental_index(
+        _incremental_state(
+            stored=stored,
+            issuer_ciks=frozenset({APPLE}),
+            quarterly={(2026, 1): (text, date(2026, 4, 1))},
+        )
+    )
+    assert result.counts["index_reconcile_absent"] == 1
+    assert len(result.rows) == 1
+    assert result.rows[0].filed_on == date(2026, 1, 9)
+    assert not result.listings[0].is_daily
+
+
+def test_incremental_first_listing_and_same_run_form_refusal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    accession = "0000320193-26-000001"
+    first, second = (_incremental_file(date(2026, 4, day)) for day in (1, 2))
+    original = _incremental_row(APPLE, accession, "10-K", date(2026, 4, 1))
+    corrected = _incremental_row(APPLE, accession, "10-K", date(2026, 3, 31))
+    monkeypatch.setattr(
+        source,
+        "_incremental_daily_rows",
+        lambda file: (corrected,) if file == second else (original,),
+    )
+    monkeypatch.setattr(
+        source,
+        "_incremental_stamps",
+        lambda _rows: {(APPLE, accession): datetime(2026, 4, 1, tzinfo=UTC)},
+    )
+    state = _incremental_state(files=(second, first))
+    result = source.incremental_index(state)
+    assert [(r.filed_on, r.known_at) for r in result.rows] == [
+        (date(2026, 4, 1), datetime(2026, 4, 1, tzinfo=UTC)),
+        (date(2026, 3, 31), state.now),
+    ]
+    changed_form = _incremental_row(APPLE, accession, "S-3", date(2026, 3, 31))
+    monkeypatch.setattr(
+        source,
+        "_incremental_daily_rows",
+        lambda file: (changed_form,) if file == second else (original,),
+    )
+    refused = source.incremental_index(state)
+    assert len(refused.rows) == 1
+    assert refused.rows[0].filed_on == original.filed_on
+    assert refused.counts["index_refused"] == 1
+
+
+def test_incremental_valid_correction_survives_bad_name_and_latest_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    accession = "0000320193-26-000001"
+    accepted = datetime(2026, 4, 1, tzinfo=UTC)
+    first = FilingRow(
+        APPLE,
+        accession,
+        "10-K",
+        "Company",
+        date(2026, 4, 1),
+        accepted,
+        date(2026, 4, 1),
+        accepted,
+        accepted,
+    )
+    file1, file2 = (_incremental_file(date(2026, 4, day)) for day in (2, 3))
+    bad = replace(
+        _incremental_row(APPLE, accession, "10-K", date(2026, 3, 31)), company_name="Wrong"
+    )
+    good = _incremental_row(APPLE, accession, "10-K", date(2026, 3, 31))
+    monkeypatch.setattr(
+        source, "_incremental_daily_rows", lambda file: (bad,) if file == file1 else (good,)
+    )
+    monkeypatch.setattr(source, "_incremental_stamps", lambda _rows: {(APPLE, accession): accepted})
+    result = source.incremental_index(
+        _incremental_state(stored=(first,), files=(file1, file2), issuer_ciks=frozenset({APPLE}))
+    )
+    assert len(result.rows) == 1 and result.rows[0].filed_on == good.filed_on
+    assert result.counts["index_refused"] == 1
+    latest = replace(
+        first,
+        filed_on=good.filed_on,
+        listed_on=date(2026, 4, 2),
+        known_at=datetime(2026, 4, 2, tzinfo=UTC),
+    )
+    already = source.incremental_index(
+        _incremental_state(stored=(latest, first), files=(file2,), issuer_ciks=frozenset({APPLE}))
+    )
+    assert not already.rows
+
+
+def test_incremental_missing_unsettled_quarter_fails_closed(tmp_path: Path) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    file = _incremental_file(date(2026, 4, 2))
+    source._incremental_daily_rows = lambda _file: (
+        _incremental_row(APPLE, "0000320193-26-000002", "10-K", date(2026, 4, 2)),
+    )
+    with pytest.raises(ValueError, match="unsettled quarter"):
+        source.incremental_index(
+            _incremental_state(files=(file,), filers={APPLE: ((2026, 1), (2026, 2))})
+        )
+
+
+def test_incremental_ignores_unsettled_form_idx(tmp_path: Path) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    text = index_header() + index_line(
+        "10-K", "Company", int(APPLE), "2026-04-01", "0000320193-26-000001"
+    )
+    result = source.incremental_index(
+        _incremental_state(quarterly={(2026, 2): (text, date(2026, 4, 2))})
+    )
+    assert not result.rows
+
+
+def test_incremental_daily_parser_reads_t317_fixture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    fixture = FIXTURES / "daily_index/form.20260401.idx.gz"
+    path = tmp_path / "form.20260401.idx"
+    path.write_bytes(gzip.decompress(fixture.read_bytes()))
+    monkeypatch.setattr(edgar_raw, "daily_index_file", lambda *_a, **_k: path)
+    rows = source._incremental_daily_rows(_incremental_file(date(2026, 4, 1)))
+    assert rows and rows[0].filed_on == date(2026, 4, 1)
+
+
+def test_daily_keeper_gets_the_cached_body_before_it_is_parsed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Plan T347: the keeper sees the exact bytes the parser then reads, and a
+    keeper that refuses (a failed archive write) stops the parse."""
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    path = tmp_path / "form.20260401.idx"
+    path.write_bytes(gzip.decompress((FIXTURES / "daily_index/form.20260401.idx.gz").read_bytes()))
+    monkeypatch.setattr(edgar_raw, "daily_index_file", lambda *_a, **_k: path)
+    file = _incremental_file(date(2026, 4, 1))
+    kept: list[tuple[DailyIndexFile, Path, bytes]] = []
+    source.daily_index_keeper = lambda *args: kept.append(args)
+    assert source._incremental_daily_rows(file)
+    assert kept == [(file, path, path.read_bytes())]
+
+    def refuse(*_args: Any) -> None:
+        raise RuntimeError("archive write refused")
+
+    source.daily_index_keeper = refuse
+    parsed: list[str] = []
+    monkeypatch.setattr(
+        edgar_source_module, "parse_filing_index", lambda *a: parsed.append("x") or a
+    )
+    with pytest.raises(RuntimeError, match="refused"):
+        source._incremental_daily_rows(file)
+    assert parsed == []
+
+
+def test_daily_index_file_records_the_url_and_fetch_time_of_its_bytes(tmp_path: Path) -> None:
+    """Plan T347: the sidecar names the URL, UTC fetch time and hash of the bytes
+    fetched; another hash (a re-posted body, or an old sidecar) has none."""
+    settings = edgar_settings(tmp_path)
+    file = DailyIndexFile("daily-index/2026/QTR2/form.20260401.idx", "form.20260401.idx", "x", "1")
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, content=b"v1"))
+    )
+    before = datetime.now(UTC)
+    path = edgar_raw.daily_index_file(2026, 2, file, settings=settings, client=client)
+    url, fetched_at = edgar_raw.daily_index_fetch(path, hashlib.sha256(b"v1").hexdigest())
+    assert url == "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR2/form.20260401.idx"
+    assert fetched_at is not None and before <= fetched_at <= datetime.now(UTC)
+    assert fetched_at.utcoffset() == timedelta(0)
+    assert edgar_raw.daily_index_fetch(path, hashlib.sha256(b"v2").hexdigest()) == (None, None)
+
+
+def test_fixture_incremental_call_is_read_only() -> None:
+    accepted = datetime(2026, 4, 1, tzinfo=UTC)
+    row = FilingRow(
+        APPLE,
+        "0000320193-26-000001",
+        "10-K",
+        "Company",
+        date(2026, 3, 31),
+        accepted,
+        date(2026, 4, 1),
+        accepted,
+        accepted,
+    )
+    fixture = FixtureFilingSource(incremental_rows=(row,))
+    state = _incremental_state()
+    result = fixture.incremental_index(state)
+    assert result.rows == (row,)
+    assert result.listings[0].is_daily
+    assert fixture.incremental_index(state).rows == (row,)
+
+
+def test_stored_13d_filer_does_not_become_issuer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    cik = "0000222222"
+    accepted = datetime(2026, 4, 1, tzinfo=UTC)
+    stored = FilingRow(
+        cik,
+        "0000950123-26-000001",
+        "SC 13D",
+        "Company",
+        date(2026, 4, 1),
+        accepted,
+        date(2026, 4, 1),
+        accepted,
+        accepted,
+    )
+    earlier, current = (_incremental_file(date(2026, 4, day)) for day in (1, 2))
+    old_row = _incremental_row(cik, "0000222222-26-000002", "3", date(2026, 4, 1))
+    issuer_row = _incremental_row(cik, "0000222222-26-000003", "10-K", date(2026, 4, 2))
+    monkeypatch.setattr(
+        source,
+        "_incremental_daily_rows",
+        lambda file: (old_row,) if file == earlier else (issuer_row,),
+    )
+    monkeypatch.setattr(
+        source,
+        "_incremental_stamps",
+        lambda _rows: {(cik, old_row.accession): accepted, (cik, issuer_row.accession): accepted},
+    )
+    only_filer = _incremental_state(stored=(stored,), files=(earlier,))
+    assert not source.incremental_index(only_filer).rows
+    promoted = _incremental_state(
+        stored=(stored,), files=(earlier, current), filers={cik: ((2026, 2), (2026, 2))}
+    )
+    result = source.incremental_index(promoted)
+    assert {row.accession for row in result.rows} == {old_row.accession, issuer_row.accession}
+
+
+def test_incremental_pending_and_acceptance_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    file = _incremental_file(date(2026, 4, 1))
+    accession = "0000320193-26-000001"
+    row = _incremental_row(APPLE, accession, "10-K", date(2026, 3, 31))
+    monkeypatch.setattr(source, "_incremental_daily_rows", lambda _file: (row, row))
+    monkeypatch.setattr(source, "_incremental_stamps", lambda _rows: {})
+    result = source.incremental_index(_incremental_state(files=(file,)))
+    assert not result.rows
+    assert len(result.pending) == 1
+    assert result.pending[0].filed_on == date(2026, 3, 31)
+    changed_file = _incremental_file(date(2026, 4, 2))
+    changed_row = replace(row, filed_on=date(2026, 4, 1))
+    monkeypatch.setattr(source, "_incremental_daily_rows", lambda _file: (changed_row,))
+    changed = source.incremental_index(
+        _incremental_state(pending=result.pending, files=(changed_file,))
+    )
+    assert changed.pending == result.pending
+    assert changed.counts["index_pending_filed_on_changed"] == 1
+    assert not changed.rows
+    accepted = datetime(2026, 4, 1, 20, tzinfo=UTC)
+    monkeypatch.setattr(
+        source,
+        "_incremental_stamps",
+        lambda _rows: {(APPLE, accession): accepted},
+    )
+    later = source.incremental_index(_incremental_state(pending=result.pending))
+    assert len(later.rows) == 1
+    assert later.rows[0].known_at == later.rows[0].accepted_at == accepted
+    assert later.rows[0].known_at != datetime(2026, 3, 31, tzinfo=UTC)
+    assert not later.pending
+
+
+def test_incremental_keeps_exchange_only_and_filer_13d(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    file = _incremental_file(date(2026, 4, 1))
+    exchange = _incremental_row("0001354457", "0001354457-26-000001", "25-NSE", date(2026, 4, 1))
+    filer = _incremental_row("0000950123", "0000950123-26-000001", "SC 13D", date(2026, 4, 1))
+    monkeypatch.setattr(source, "_incremental_daily_rows", lambda _file: (exchange, filer))
+    monkeypatch.setattr(
+        source,
+        "_incremental_stamps",
+        lambda _rows: {
+            (row.cik, row.accession): datetime(2026, 4, 1, tzinfo=UTC) for row in (exchange, filer)
+        },
+    )
+    result = source.incremental_index(_incremental_state(files=(file,)))
+    assert {(row.cik, row.accession) for row in result.rows} == {
+        (exchange.cik, exchange.accession),
+        (filer.cik, filer.accession),
+    }
+
+
+def test_incremental_refuses_changed_stamp(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    accession = "0000320193-26-000001"
+    accepted = datetime(2026, 4, 1, 20, tzinfo=UTC)
+    stored = FilingRow(
+        APPLE,
+        accession,
+        "10-K",
+        "Company",
+        date(2026, 4, 1),
+        accepted,
+        date(2026, 4, 1),
+        accepted,
+        accepted,
+    )
+    file = _incremental_file(date(2026, 4, 2))
+    monkeypatch.setattr(
+        source,
+        "_incremental_daily_rows",
+        lambda _file: (_incremental_row(APPLE, accession, "10-K", date(2026, 4, 2)),),
+    )
+    monkeypatch.setattr(
+        source,
+        "_incremental_stamps",
+        lambda _rows: {(APPLE, accession): accepted + timedelta(hours=1)},
+    )
+    result = source.incremental_index(_incremental_state(stored=(stored,), files=(file,)))
+    assert not result.rows
+    assert result.stamp_changed_ciks == frozenset({APPLE})
+    assert result.counts["index_stamp_changed"] == 1
+
+
+def test_sec_form_stamp_uses_cache_and_refuses_unlisted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The issuer lookup must never date an accession absent from its submissions."""
+    accession = "0000320193-26-000123"
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    record = SubmissionRecord(
+        accession, "4", "form4.xml", False, CLOCK, filing_date=date(2026, 9, 24)
+    )
+    calls: list[str] = []
+
+    def fetched(cik: str, wanted: set[str]) -> edgar_source_module._Submissions:
+        calls.append(cik)
+        return edgar_source_module._Submissions({accession: record}, [], CLOCK)
+
+    monkeypatch.setattr(source, "_fetch_submissions", fetched)
+    monkeypatch.setattr(source, "_sgml_checked", lambda _cik, records: dict(records))
+    assert source.sec_form_stamp(APPLE, accession, date(2026, 9, 24)) == record
+    assert source.sec_form_stamp(APPLE, accession, date(2026, 9, 24)) == record
+    assert source.sec_form_stamp(APPLE, "0000320193-26-999999", date(2026, 9, 24)) is None
+    assert calls == [APPLE, APPLE]
+
+
+def test_stored_index_stamp_wins_over_stamps_cache(tmp_path: Path) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000123"
+    accepted = CLOCK - timedelta(days=1)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                accession,
+                "10-K",
+                "Apple",
+                date(2026, 9, 24),
+                accepted,
+                date(2026, 9, 24),
+                True,
+            )
+        ],
+        CLOCK,
+    )
+    source._save_stamps(
+        APPLE,
+        {
+            accession: SubmissionRecord(
+                accession, "10-Q", "document.htm", False, CLOCK - timedelta(days=2)
+            )
+        },
+    )
+    source.use_index(conn)
+    records = source._read_stamps(APPLE)
+    assert records[accession].accepted_at == accepted
+    assert records[accession].form == "10-K"
+
+
+def test_filing_index_reads_table_and_uncommitted_rows_without_quarter_walk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    stored = stored_index.Listing(
+        APPLE,
+        "0000320193-26-000123",
+        "10-K",
+        "Apple",
+        date(2026, 9, 23),
+        CLOCK - timedelta(days=2),
+        date(2026, 9, 23),
+        True,
+    )
+    fresh = stored_index.Listing(
+        APPLE,
+        "0000320193-26-000124",
+        "10-Q",
+        "Apple",
+        date(2026, 9, 24),
+        CLOCK - timedelta(days=1),
+        date(2026, 9, 24),
+        True,
+    )
+    stored_index.insert_listings(conn, [stored], CLOCK)
+    source.use_index(conn, [fresh])
+    monkeypatch.setattr(source, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    assert [entry.accession for entry in source.filing_index()] == [
+        stored.accession,
+        fresh.accession,
+    ]
+
+
+def test_table_index_matches_quarterly_walk_for_issuer_history(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    accepted = CLOCK - timedelta(days=1)
+    rows = [
+        UnstampedFiling(APPLE, "Apple", form, f"0000320193-26-{n:06d}", date(2026, 9, 24))
+        for n, form in ((1, "10-K"), (2, "8-K"))
+    ]
+    quarterly = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    monkeypatch.setattr(quarterly, "_rows", lambda *_args: iter(((2026, 3), row) for row in rows))
+    monkeypatch.setattr(
+        quarterly,
+        "_stamp_each",
+        lambda _kept: iter(
+            [
+                (
+                    APPLE,
+                    {
+                        row.accession: SubmissionRecord(
+                            row.accession, row.form, "document.htm", False, accepted
+                        )
+                        for row in rows
+                    },
+                )
+            ]
+        ),
+    )
+    expected = quarterly.filing_index()
+
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                row.cik,
+                row.accession,
+                row.form,
+                row.company_name,
+                row.filed_on,
+                accepted,
+                row.filed_on,
+                True,
+            )
+            for row in rows
+        ],
+        CLOCK,
+    )
+    table = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    table.use_index(conn)
+    monkeypatch.setattr(table, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    assert table.filing_index() == expected
+    assert table.filing_index_for_cik(APPLE) == expected
+    assert table.filing_index_for_forms({"8-K"}) == [e for e in expected if e.form == "8-K"]
+
+
+def test_table_index_matches_quarterly_issuer_and_exchange_copy_rules(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    accepted = CLOCK - timedelta(days=1)
+    exchange_accession = "0000000007-26-000002"
+    spec = [
+        (APPLE, "10-K", "0000320193-26-000001"),
+        ("0000000003", "SC 13D", "0000000003-26-000001"),
+        ("0000000004", "25", "0000000005-26-000001"),
+        ("0000000006", "25", "0000000006-26-000001"),
+        ("0000000007", "10-K", "0000000007-26-000001"),
+        ("0000000007", "25-NSE", exchange_accession),
+        ("0000000008", "25-NSE", exchange_accession),
+    ]
+    rows = [
+        UnstampedFiling(cik, "Issuer", form, accession, date(2026, 9, 24))
+        for cik, form, accession in spec
+    ]
+    quarterly = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    monkeypatch.setattr(quarterly, "_rows", lambda *_args: iter(((2026, 3), row) for row in rows))
+
+    def stamps(kept: Any) -> Any:
+        return iter(
+            [
+                (
+                    cik,
+                    {
+                        accession: SubmissionRecord(accession, row.form, "doc.xml", False, accepted)
+                        for accession, (row, _quarter) in by_accession.items()
+                    },
+                )
+                for cik, by_accession in kept.items()
+            ]
+        )
+
+    monkeypatch.setattr(quarterly, "_stamp_each", stamps)
+    expected = quarterly.filing_index()
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                row.cik,
+                row.accession,
+                row.form,
+                row.company_name,
+                row.filed_on,
+                accepted,
+                row.filed_on,
+                True,
+                0 if row.cik != "0000000008" else 1,
+            )
+            for row in rows
+        ],
+        CLOCK,
+    )
+    table = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    table.use_index(conn)
+    monkeypatch.setattr(table, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    assert table.filing_index() == expected
+    assert table.filing_index_for_cik("0000000003") == []
+    assert table.filing_index_for_cik("0000000006") == []
+    assert table.filing_index_for_forms({"25-NSE"}) == [
+        entry for entry in expected if entry.form == "25-NSE"
+    ]
+
+
+def test_completed_index_seed_routes_full_rebuild_to_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    base = edgar_settings(tmp_path)
+    settings = base.model_copy(
+        update={"store": base.store.model_copy(update={"path": str(tmp_path / "store.duckdb")})}
+    )
+    conn = duckdb.connect(settings.store.path)
+    schema.init_schema(conn)
+    accession = "0000320193-26-000123"
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                accession,
+                "10-K",
+                "Apple",
+                date(2026, 9, 24),
+                CLOCK - timedelta(days=1),
+                date(2026, 9, 24),
+                True,
+            )
+        ],
+        CLOCK,
+    )
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, started_at, status, mode) "
+        "VALUES ('seed', 'edgar_index', ?, 'ok', 'rebuild')",
+        [CLOCK],
+    )
+    conn.close()
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK, prefer_stored_index=True)
+    monkeypatch.setattr(source, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    assert [entry.accession for entry in source.filing_index()] == [accession]
+
+    nightly = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    monkeypatch.setattr(nightly, "_rows", lambda *_args: iter(()))
+    assert nightly.filing_index() == []  # key-off nightly still walks the quarterly files
+
+    stale_repair = EdgarFilingSource(
+        settings, clock=lambda: CLOCK + timedelta(days=1), prefer_stored_index=True
+    )
+    with pytest.raises(RuntimeError, match="stored filing index is stale"):
+        stale_repair.filing_index()
+
+
+def test_statement_backfill_row_does_not_freshen_index_seed(tmp_path: Path) -> None:
+    """#2924: a statement backfill's `ok` row reads no index, so it is not a seed."""
+    base = edgar_settings(tmp_path)
+    settings = base.model_copy(
+        update={"store": base.store.model_copy(update={"path": str(tmp_path / "store.duckdb")})}
+    )
+    conn = duckdb.connect(settings.store.path)
+    schema.init_schema(conn)
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, started_at, status, mode) VALUES "
+        "('seed', 'edgar_index', ?, 'ok', 'rebuild'), "
+        "('backfill', 'edgar_index', ?, 'ok', 'statement_backfill')",
+        [CLOCK - timedelta(days=1), CLOCK],
+    )
+    conn.close()
+    repair = EdgarFilingSource(settings, clock=lambda: CLOCK, prefer_stored_index=True)
+    with pytest.raises(RuntimeError, match="stored filing index is stale"):
+        repair.filing_index()
+
+
+def test_table_delisting_fetches_missing_stamp_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000128"
+    accepted = CLOCK - timedelta(days=1)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                accession,
+                "25",
+                "Apple",
+                date(2026, 9, 24),
+                accepted,
+                date(2026, 9, 24),
+                True,
+            )
+        ],
+        CLOCK,
+    )
+    source.use_index(conn)
+    record = SubmissionRecord(accession, "25", "form25.xml", False, accepted)
+    calls: list[set[str]] = []
+
+    def fetch(_cik: str, wanted: set[str]) -> edgar_source_module._Submissions:
+        calls.append(wanted)
+        return edgar_source_module._Submissions({accession: record}, [], CLOCK)
+
+    monkeypatch.setattr(source, "_fetch_submissions", fetch)
+    monkeypatch.setattr(source, "_sgml_checked", lambda _cik, records: dict(records))
+    monkeypatch.setattr(
+        source,
+        "_fetch_delisting",
+        lambda cik, acc, form, _document, at: DelistingFiling(cik, form, "Common", "NYSE", acc, at),
+    )
+    assert [filing.accession for filing in source.delistings()] == [accession]
+    assert calls == [{accession}]
+
+
+def test_table_filing_events_refresh_keeps_cache_only_records_and_stamp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000129"
+    accepted = CLOCK - timedelta(days=1)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                accession,
+                "8-K",
+                "Apple",
+                date(2026, 9, 24),
+                accepted,
+                date(2026, 9, 24),
+                True,
+            )
+        ],
+        CLOCK,
+    )
+    sentinel = "0000320193-26-000130"
+    cached_at = accepted - timedelta(hours=1)
+    source._save_stamps(
+        APPLE,
+        {
+            accession: SubmissionRecord(accession, "8-K", "document.htm", False, cached_at),
+            sentinel: SubmissionRecord(sentinel, "8-K", "", False, None),
+        },
+        items_refreshed=False,
+    )
+    source.use_index(conn)
+    monkeypatch.setattr(
+        source,
+        "_items_source",
+        lambda _cik, _wanted: (
+            {
+                accession: SubmissionRecord(
+                    accession, "8-K", "document.htm", False, cached_at, "1.01"
+                )
+            },
+            True,
+        ),
+    )
+    assert [event.accepted_at for event in source.filing_events(APPLE)] == [accepted]
+    cached = source._load_stamps(APPLE)
+    assert cached[accession].accepted_at == cached_at
+    assert cached[accession].items == "1.01"
+    assert cached[sentinel].accepted_at is None
+
+
+def test_pending_table_rows_remain_unstamped_and_counted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2026, 1, 1)}
+            )
+        }
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    rows = [
+        (APPLE, "10-K", "0000320193-26-000131"),
+        ("0000000004", "25", "0000000005-26-000132"),
+        ("0000000003", "SC 13D", "0000000003-26-000133"),
+    ]
+    conn.executemany(
+        "INSERT INTO filing_index_pending "
+        "(cik, accession, form, company_name, filed_on, listed_on) "
+        "VALUES (?, ?, ?, 'Issuer', ?, ?)",
+        [
+            (cik, accession, form, date(2026, 9, 24), date(2026, 9, 24))
+            for cik, form, accession in rows
+        ],
+    )
+    source.use_index(conn)
+    assert source.filing_index() == []
+    assert {row.accession for row in source.unstamped_filings} == {rows[0][2], rows[1][2]}
+    pending_13d = source._stored_13d_rows({"SC 13D"})
+    assert [row.accession for row in pending_13d] == [rows[2][2]]
+    # SEC has not published the acceptance yet: the submissions answer is empty.
+    monkeypatch.setattr(
+        source,
+        "_fetch_submissions",
+        lambda _cik, _wanted: edgar_source_module._Submissions({}, [], CLOCK, empty=True),
+    )
+    assert (
+        source._sec_stamped(pending_13d[0].cik, pending_13d[0].accession, pending_13d[0].filed_on)
+        is None
+    )
+    assert source.sec_forms_counts["unstamped"] == 1
+    monkeypatch.setattr(source, "_stamp_each", lambda kept: iter((cik, {}) for cik in kept))
+    assert source.delistings() == []
+    assert source.unstamped_delistings == 1
+
+
+def test_pending_form25_is_stamped_on_demand(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000000005-26-000137"
+    cik = "0000000004"
+    conn.execute(
+        "INSERT INTO filing_index_pending "
+        "(cik, accession, form, company_name, filed_on, listed_on) "
+        "VALUES (?, ?, '25', 'Issuer', ?, ?)",
+        [cik, accession, date(2026, 9, 24), date(2026, 9, 24)],
+    )
+    source.use_index(conn)
+    record = SubmissionRecord(accession, "25", "form25.xml", False, CLOCK - timedelta(days=1))
+    monkeypatch.setattr(
+        source,
+        "_fetch_submissions",
+        lambda _cik, _wanted: edgar_source_module._Submissions({accession: record}, [], CLOCK),
+    )
+    monkeypatch.setattr(source, "_sgml_checked", lambda _cik, records: dict(records))
+    monkeypatch.setattr(
+        source,
+        "_fetch_delisting",
+        lambda issuer, acc, form, _document, at: DelistingFiling(
+            issuer, form, "Common", "NYSE", acc, at
+        ),
+    )
+    assert [row.accession for row in source.delistings()] == [accession]
+    assert source.unstamped_delistings == 0
+
+
+def test_table_readers_honor_index_first_year(tmp_path: Path) -> None:
+    settings = edgar_settings(tmp_path, index_first_year=2026)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    old = stored_index.Listing(
+        APPLE,
+        "0000320193-25-000001",
+        "10-K",
+        "Apple",
+        date(2025, 9, 24),
+        CLOCK - timedelta(days=366),
+        date(2025, 9, 24),
+        False,
+    )
+    old_delisting = replace(old, accession="0000320193-25-000002", form="25")
+    current = replace(
+        old,
+        accession="0000320193-26-000001",
+        filed_on=date(2026, 9, 24),
+        accepted_at=CLOCK - timedelta(days=1),
+        listed_on=date(2026, 9, 24),
+    )
+    stored_index.insert_listings(conn, [old, old_delisting, current], CLOCK)
+    source.use_index(conn)
+    assert [row.accession for row in source.filing_index()] == [current.accession]
+    assert [row.accession for row in source.filing_index_for_cik(APPLE)] == [current.accession]
+    assert source.delistings() == []
+
+
+def test_uncommitted_revision_waits_for_its_known_at(tmp_path: Path) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    later = FilingRow(
+        APPLE,
+        "0000320193-26-000136",
+        "10-K",
+        "Apple",
+        date(2026, 9, 24),
+        CLOCK - timedelta(days=1),
+        date(2026, 9, 24),
+        CLOCK + timedelta(days=1),
+        CLOCK + timedelta(days=1),
+    )
+    source.use_index(conn, [later])
+    assert source.filing_index() == []
+    assert source.filing_index_for_cik(APPLE) == []
+
+
+def test_13d_cutoff_uses_first_known_date_and_counts_crossing(tmp_path: Path) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2026, 1, 1)}
+            )
+        }
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000123"
+    first = stored_index.Listing(
+        APPLE,
+        accession,
+        "SC 13D",
+        "Apple",
+        date(2025, 12, 31),
+        CLOCK - timedelta(days=3),
+        date(2026, 1, 2),
+        True,
+    )
+    corrected = replace(first, filed_on=date(2026, 1, 2), listed_on=date(2026, 1, 3))
+    stored_index.insert_listings(conn, [first], CLOCK - timedelta(days=2))
+    stored_index.insert_listings(conn, [corrected], CLOCK - timedelta(days=1))
+    source._save_stamps(
+        APPLE,
+        {
+            accession: SubmissionRecord(
+                accession, "SC 13D", "document.htm", False, first.accepted_at
+            )
+        },
+    )
+    source.use_index(conn)
+    assert source._stored_13d_rows({"SC 13D"}) == []
+    assert source.sec_forms_counts["sec_forms_cutoff_corrected"] == 1
+    assert source.sec_form_stamp(APPLE, accession, corrected.filed_on).filing_date == first.filed_on
+
+
+def test_stored_13d_first_row_keeps_sec_order_when_cik_order_differs(tmp_path: Path) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2026, 1, 1)}
+            )
+        }
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000000002-26-000001"
+    rows = [
+        stored_index.Listing(
+            cik,
+            accession,
+            "SC 13D",
+            "Issuer",
+            date(2026, 9, 24),
+            CLOCK - timedelta(days=1),
+            date(2026, 9, 24),
+            True,
+        )
+        for cik in ("0000000002", "0000000001")
+    ]
+    rows = [replace(row, list_position=position) for position, row in enumerate(rows)]
+    stored_index.insert_listings(conn, rows, CLOCK)
+    source.use_index(conn)
+    assert source._stored_13d_rows({"SC 13D"})[0].cik == "0000000002"
+
+
+def test_first_known_sec_filed_date_refuses_other_stored_date(tmp_path: Path) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000125"
+    first = stored_index.Listing(
+        APPLE,
+        accession,
+        "SC 13D",
+        "Apple",
+        date(2026, 9, 23),
+        CLOCK - timedelta(days=3),
+        date(2026, 9, 23),
+        True,
+    )
+    corrected = replace(first, filed_on=date(2026, 9, 24), listed_on=date(2026, 9, 24))
+    stored_index.insert_listings(conn, [first], CLOCK - timedelta(days=2))
+    stored_index.insert_listings(conn, [corrected], CLOCK - timedelta(days=1))
+    source._save_stamps(
+        APPLE,
+        {
+            accession: SubmissionRecord(
+                accession, "SC 13D", "document.htm", False, first.accepted_at
+            )
+        },
+    )
+    source.use_index(conn)
+    record = source.sec_form_stamp(APPLE, accession, corrected.filed_on)
+    assert record is not None and record.filing_date == first.filed_on
+    stored = SecFormFiling(
+        accession, first.form, first.accepted_at, corrected.filed_on, (APPLE,), (APPLE,)
+    )
+    derived = replace(stored, filed_date=record.filing_date)
+    assert write_sec_form_accession(conn, stored, ingested_at=CLOCK).added == 1
+    assert write_sec_form_accession(conn, derived, ingested_at=CLOCK).changed == 1
+
+
+def test_table_event_clock_uses_first_known_date_after_correction(tmp_path: Path) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK + timedelta(days=2))
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000135"
+    accepted = CLOCK
+    first = stored_index.Listing(
+        APPLE,
+        accession,
+        "8-K",
+        "Apple",
+        date(2026, 9, 24),
+        accepted,
+        date(2026, 9, 24),
+        True,
+    )
+    stored_index.insert_listings(conn, [first], CLOCK)
+    stored_index.insert_listings(
+        conn,
+        [replace(first, filed_on=date(2026, 9, 23), listed_on=date(2026, 9, 25))],
+        CLOCK + timedelta(days=1),
+    )
+    source.use_index(conn)
+    source._check_event_clock(
+        APPLE,
+        SubmissionRecord(
+            accession, "8-K", "document.htm", False, accepted, filing_date=date(2026, 9, 23)
+        ),
+    )
+    assert source.filing_events_clock_suspect == 0
+
+
+def test_delistings_reads_stored_index_without_quarter_walk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    accession = "0000320193-26-000123"
+    accepted = CLOCK - timedelta(days=1)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                accession,
+                "25",
+                "Apple",
+                date(2026, 9, 24),
+                accepted,
+                date(2026, 9, 24),
+                True,
+            )
+        ],
+        CLOCK,
+    )
+    source._save_stamps(
+        APPLE, {accession: SubmissionRecord(accession, "25", "form25.xml", False, accepted)}
+    )
+    source._save_delisting_cache(
+        accession, DelistingFiling(APPLE, "25", "Common", "NASDAQ", accession, accepted)
+    )
+    source.use_index(conn)
+    monkeypatch.setattr(source, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    assert [row.accession for row in source.delistings()] == [accession]
+
+
+def test_stored_delisting_uses_first_sec_row_across_cik_groups(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    first_cik, second_cik = "0000000002", "0000000001"
+    target = "0000000002-26-000001"
+    rows = [
+        stored_index.Listing(
+            second_cik,
+            "0000000001-26-000000",
+            "25",
+            "Other",
+            date(2026, 9, 23),
+            CLOCK - timedelta(days=2),
+            date(2026, 9, 23),
+            True,
+        ),
+        *[
+            stored_index.Listing(
+                cik,
+                target,
+                "25",
+                "Issuer",
+                date(2026, 9, 24),
+                CLOCK - timedelta(days=1),
+                date(2026, 9, 24),
+                True,
+            )
+            for cik in (first_cik, second_cik)
+        ],
+    ]
+    rows[-2:] = [replace(row, list_position=position) for position, row in enumerate(rows[-2:])]
+    stored_index.insert_listings(conn, rows, CLOCK)
+    for cik in {row.cik for row in rows}:
+        source._save_stamps(
+            cik,
+            {
+                row.accession: SubmissionRecord(
+                    row.accession, row.form, "form25.xml", False, row.accepted_at
+                )
+                for row in rows
+                if row.cik == cik
+            },
+        )
+    source.use_index(conn)
+    monkeypatch.setattr(
+        source,
+        "_fetch_delisting",
+        lambda cik, accession, form, _document, accepted: DelistingFiling(
+            cik, form, "Common", "NYSE", accession, accepted
+        ),
+    )
+    filings = source.delistings()
+    assert next(filing.cik for filing in filings if filing.accession == target) == first_cik
+
+
+def test_stale_fact_count_opens_only_touched_cik_stamps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    other = "0000000002"
+    rows = [
+        stored_index.Listing(
+            cik,
+            f"{i:010d}-26-000001",
+            "10-K",
+            "Issuer",
+            date(2026, 9, 24),
+            CLOCK - timedelta(days=1),
+            date(2026, 9, 24),
+            True,
+        )
+        for i, cik in ((320193, APPLE), (2, other))
+    ]
+    stored_index.insert_listings(conn, rows, CLOCK)
+    for row in rows:
+        source._save_stamps(
+            row.cik,
+            {
+                row.accession: SubmissionRecord(
+                    row.accession, row.form, "document.htm", False, row.accepted_at
+                )
+            },
+        )
+    source.use_index(conn, touched_ciks=frozenset({APPLE}))
+    load = source._load_stamps
+    monkeypatch.setattr(
+        source,
+        "_load_stamps",
+        lambda cik: load(cik) if cik == APPLE else pytest.fail("untouched stamps loaded"),
+    )
+    assert source._stale_fact_caches() == 1
+
+
+def test_sec_13d_discovery_reads_filer_index_and_document_subject(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2009, 1, 1)}
+            )
+        }
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000950123-09-012345"
+    row = UnstampedFiling("0000222222", "Activist", "SC 13D", accession, date(2009, 5, 11))
+    other = UnstampedFiling(
+        "0000222222", "Activist", "SC 13DX", "0000950123-09-012346", date(2009, 5, 11)
+    )
+    monkeypatch.setattr(
+        source, "_rows", lambda *_args: iter([((2009, 2), row), ((2009, 2), other)])
+    )
+    stamp = SubmissionRecord(accession, "SC 13D", "", False, CLOCK, filing_date=row.filed_on)
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: stamp)
+    monkeypatch.setattr(
+        edgar_raw,
+        "filing_sgml_header",
+        lambda *_args, **_kwargs: (
+            FIXTURES / "sec_forms/sgml_header_sc13d_unstructured.txt"
+        ).read_text(),
+    )
+    filings = source.sec_forms_13d()
+    assert len(filings) == 1
+    assert filings[0].subject_ciks == ("0000111111",)
+    assert filings[0].filer_ciks == ("0000222222", "0000333333")
+
+
+def test_sec_form4_accession_fetches_one_recorded_xml(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000320193-26-000123"
+    stamp = SubmissionRecord(
+        accession, "4", "form4.xml", False, CLOCK, filing_date=date(2026, 9, 24)
+    )
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: stamp)
+    fetched: list[str] = []
+
+    def xml(*_args: object, **_kwargs: object) -> str:
+        fetched.append(accession)
+        return (FIXTURES / "sec_forms/form4_purchase_gift_indirect.xml").read_text()
+
+    monkeypatch.setattr(edgar_raw, "filing_xml", xml)
+    filing = source.sec_form4_accession("0000777777", accession, date(2026, 9, 24))
+    assert filing is not None and filing.transactions
+    assert fetched == [accession]
+
+
+def test_fetch_filing_xml_returns_the_exact_bytes_url_and_utc_fetch_time(
+    tmp_path: Path,
+) -> None:
+    """T348: the kept body is the response's bytes, not re-encoded text."""
+    body = (FIXTURES / "sec_forms/form4_purchase_gift_indirect.xml").read_bytes() + b"\r\n"
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, content=body)
+
+    before = datetime.now(UTC)
+    fetched = edgar_raw.fetch_filing_xml(
+        "320193",
+        "0000320193-26-000123",
+        "form4.xml",
+        settings=edgar_settings(tmp_path),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert fetched.body == body
+    assert fetched.text == body.decode()
+    assert (
+        fetched.url
+        == seen[0]
+        == ("https://www.sec.gov/Archives/edgar/data/320193/000032019326000123/form4.xml")
+    )
+    assert fetched.fetched_at.tzinfo is UTC and fetched.fetched_at >= before
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        edgar_raw.fetch_filing_xml("320193", "0000320193-26-000123", "form4.htm")
+
+
+def _form4_source(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[EdgarFilingSource, str]:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000320193-26-000123"
+    stamp = SubmissionRecord(
+        accession, "4", "form4.xml", False, CLOCK, filing_date=date(2026, 9, 24)
+    )
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: stamp)
+    return source, accession
+
+
+def test_sec_form4_keeper_gets_the_raw_body_before_it_is_parsed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#2714 item 1: with a keeper set, the fetched bytes reach it before the parse;
+    with none set, the fetch is today's `filing_xml` call."""
+    source, accession = _form4_source(monkeypatch, tmp_path)
+    body = (FIXTURES / "sec_forms/form4_purchase_gift_indirect.xml").read_bytes()
+    order: list[str] = []
+    fetched = edgar_raw.FetchedXml("https://www.sec.gov/x/form4.xml", body, body.decode(), CLOCK)
+    monkeypatch.setattr(edgar_raw, "fetch_filing_xml", lambda *_a, **_k: fetched)
+    monkeypatch.setattr(
+        edgar_raw, "filing_xml", lambda *_a, **_k: pytest.fail("a kept fetch used filing_xml")
+    )
+    real_parse = edgar_source_module.parse_form4
+
+    def parse(text: str) -> Any:
+        order.append("parse")
+        return real_parse(text)
+
+    monkeypatch.setattr(edgar_source_module, "parse_form4", parse)
+    source.form4_xml_keeper = lambda got, item: order.append(f"keep {got} {len(item.body)}")
+    filing = source.sec_form4_accession("0000777777", accession, date(2026, 9, 24))
+    assert filing is not None and filing.transactions
+    assert order == [f"keep {accession} {len(body)}", "parse"]
+
+
+def test_sec_form4_failed_keep_raises_and_parses_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A refused archive write fails the run: it is never a skipped filing."""
+    source, accession = _form4_source(monkeypatch, tmp_path)
+    body = (FIXTURES / "sec_forms/form4_purchase_gift_indirect.xml").read_bytes()
+    fetched = edgar_raw.FetchedXml("https://www.sec.gov/x/form4.xml", body, body.decode(), CLOCK)
+    monkeypatch.setattr(edgar_raw, "fetch_filing_xml", lambda *_a, **_k: fetched)
+    monkeypatch.setattr(
+        edgar_source_module, "parse_form4", lambda _t: pytest.fail("parsed before keeping")
+    )
+
+    def refuse(_accession: str, _fetched: edgar_raw.FetchedXml) -> None:
+        raise RuntimeError("archive write refused: below the floor")
+
+    source.form4_xml_keeper = refuse
+    with pytest.raises(RuntimeError, match="below the floor"):
+        source.sec_form4_accession("0000777777", accession, date(2026, 9, 24))
+    assert not source.sec_forms_counts.get("fetch_failed")
+
+
+def test_sec_forms_disabled_never_discovers_or_fetches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    monkeypatch.setattr(
+        source, "_rows", lambda *_args: pytest.fail("disabled discovery fetched index")
+    )
+    monkeypatch.setattr(
+        source, "_sec_stamped", lambda *_args: pytest.fail("disabled XML fetched stamp")
+    )
+    assert source.sec_forms_13d() == []
+    assert source.sec_form4_accession(APPLE, "0000320193-26-000123", date(2026, 9, 24)) is None
+
+
+def test_sec_form_exclusions_count_each_accession_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000320193-26-000123"
+    filed = date(2026, 9, 24)
+    monkeypatch.setattr(source, "sec_form_stamp", lambda *_args: None)
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_forms_counts["unstamped"] == 1
+    future = SubmissionRecord(
+        accession, "4", "form4.xml", False, CLOCK + timedelta(hours=1), filing_date=filed
+    )
+    monkeypatch.setattr(source, "sec_form_stamp", lambda *_args: future)
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_forms_counts["not_yet_known"] == 1
+
+
+def test_sec_schedule13d_uses_root_xml_and_caches_parties(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000950123-24-000001"
+    row = UnstampedFiling(
+        "0000444444", "Reporting person", "SCHEDULE 13D", accession, date(2024, 12, 3)
+    )
+    stamp = SubmissionRecord(
+        accession, row.form, "xslS13D/primary.xml", False, CLOCK, filing_date=row.filed_on
+    )
+    monkeypatch.setattr(source, "_rows", lambda *_args: iter([((2024, 4), row)]))
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: stamp)
+    filenames: list[str] = []
+
+    def xml(_cik: str, _accession: str, filename: str, **_kwargs: object) -> str:
+        filenames.append(filename)
+        return (FIXTURES / "sec_forms/schedule13d_structured.xml").read_text()
+
+    monkeypatch.setattr(edgar_raw, "filing_xml", xml)
+    filings = source.sec_forms_13d()
+    assert filings[0].subject_ciks == ("0000555555",)
+    assert filings[0].filer_ciks == ("0000444444", "0000666666")
+    assert filenames == ["primary.xml"]
+    assert source.sec_forms_13d() == filings
+    assert filenames == ["primary.xml"]
+
+
+def test_sec_form4_missing_xml_retries_without_identity_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000320193-26-000123"
+    stamp = SubmissionRecord(accession, "4", "doc.htm", False, CLOCK, filing_date=date(2026, 9, 24))
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: stamp)
+    monkeypatch.setattr(edgar_raw, "filing_index", lambda *_args, **_kwargs: [])
+    assert source.sec_form4_accession(APPLE, accession, date(2026, 9, 24)) is None
+    assert source.sec_forms_counts["fetch_failed"] == 1
+    assert not source._sec_identity_missing(accession)
+
+
+def test_sec_form_clock_suspect_and_missing_identity_are_excluded_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000320193-26-000123"
+    filed = date(2026, 9, 23)
+    suspect = SubmissionRecord(accession, "4", "form4.xml", False, CLOCK, filing_date=filed)
+    monkeypatch.setattr(source, "sec_form_stamp", lambda *_args: suspect)
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_forms_counts["clock_suspect"] == 1
+
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: suspect)
+    monkeypatch.setattr(
+        edgar_raw,
+        "filing_xml",
+        lambda *_args, **_kwargs: (
+            FIXTURES / "sec_forms/form4_purchase_gift_indirect.xml"
+        ).read_text(),
+    )
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_forms_counts["issuer_mismatch"] == 1
+    assert not source._sec_identity_missing(accession)
+    monkeypatch.setattr(
+        edgar_raw,
+        "filing_xml",
+        lambda *_args, **_kwargs: (FIXTURES / "sec_forms/schedule13d_structured.xml").read_text(),
+    )
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_form4_accession(APPLE, accession, filed) is None
+    assert source.sec_forms_counts["identity_missing"] == 1
+
+
+def test_sec_13d_truncated_header_retries_larger_cap_then_keeps_failure_retryable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2009, 1, 1)}
+            )
+        }
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    accession = "0000950123-09-012345"
+    row = UnstampedFiling("0000222222", "Activist", "SC 13D", accession, date(2009, 5, 11))
+    stamp = SubmissionRecord(accession, row.form, "", False, CLOCK, filing_date=row.filed_on)
+    monkeypatch.setattr(source, "_rows", lambda *_args: iter([((2009, 2), row)]))
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_args: stamp)
+    recorded = (FIXTURES / "sec_forms/sgml_header_sc13d_unstructured.txt").read_text()
+    sizes: list[int] = []
+
+    def header(_cik: str, _accession: str, *, header_bytes: int, **_kwargs: object) -> str:
+        sizes.append(header_bytes)
+        return recorded[:100] if len(sizes) == 1 else recorded
+
+    monkeypatch.setattr(edgar_raw, "filing_sgml_header", header)
+    assert source.sec_forms_13d()[0].subject_ciks == ("0000111111",)
+    assert sizes == [settings.edgar.header_bytes, settings.edgar.stamp_header_bytes]
+
+    source2 = EdgarFilingSource(
+        settings.model_copy(
+            update={
+                "edgar": settings.edgar.model_copy(update={"cache_dir": str(tmp_path / "second")})
+            }
+        ),
+        clock=lambda: CLOCK,
+    )
+    monkeypatch.setattr(source2, "_rows", lambda *_args: iter([((2009, 2), row)]))
+    monkeypatch.setattr(source2, "_sec_stamped", lambda *_args: stamp)
+    monkeypatch.setattr(edgar_raw, "filing_sgml_header", lambda *_args, **_kwargs: recorded[:100])
+    assert source2.sec_forms_13d() == []
+    assert source2.sec_forms_counts["fetch_failed"] == 1
+    assert not source2._sec_identity_missing(accession)
+
+
+def test_sec_13d_filters_recorded_subject_before_stamp_and_reuses_header(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2009, 1, 1)}
+            )
+        }
+    )
+    accession = "0000950123-09-012345"
+    row = UnstampedFiling("0000222222", "Activist", "SC 13D", accession, date(2009, 5, 11))
+    header = (FIXTURES / "sec_forms/sgml_header_sc13d_unstructured.txt").read_text()
+    requests: list[httpx.Request] = []
+
+    def response(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(206, text=header)
+
+    source = EdgarFilingSource(
+        settings, client=httpx.Client(transport=httpx.MockTransport(response)), clock=lambda: CLOCK
+    )
+    monkeypatch.setattr(source, "_rows", lambda *_: iter([((2009, 2), row)]))
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_: pytest.fail("non-subject stamped"))
+    assert source.sec_forms_13d(frozenset({"0000999999"})) == []
+    assert len(requests) == 1
+    assert source.sec_forms_requests["headers"] == 1
+    assert source.sec_forms_requests["submissions"] == 0
+    assert source.sec_forms_13d(frozenset({"0000999999"})) == []
+    assert len(requests) == 1
+    stamp = SubmissionRecord(accession, row.form, "", False, CLOCK, filing_date=row.filed_on)
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_: stamp)
+    assert source.sec_forms_13d(frozenset({"0000111111"}))[0].subject_ciks == ("0000111111",)
+    assert len(requests) == 1
+
+
+def test_sec_13d_backfill_start_skips_old_index_row_before_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={"events": settings.events.model_copy(update={"sec_forms_enabled": True})}
+    )
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    row = UnstampedFiling(
+        "0000222222", "Activist", "SC 13D", "0000950123-09-012345", date(2009, 5, 11)
+    )
+    monkeypatch.setattr(source, "_rows", lambda *_: iter([((2009, 2), row)]))
+    monkeypatch.setattr(source, "_sec_stamped", lambda *_: pytest.fail("old filing stamped"))
+    assert source.sec_forms_13d(frozenset({"0000111111"})) == []
+    assert source.sec_forms_requests["total"] == 0
+
+
+def test_sec_13d_request_counter_includes_retry_backoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = edgar_settings(tmp_path, retry_backoff_seconds=0.001)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2009, 1, 1)}
+            )
+        }
+    )
+    accession = "0000950123-09-012345"
+    row = UnstampedFiling("0000222222", "Activist", "SC 13D", accession, date(2009, 5, 11))
+    header = (FIXTURES / "sec_forms/sgml_header_sc13d_unstructured.txt").read_text()
+    attempts = 0
+
+    def response(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503) if attempts == 1 else httpx.Response(206, text=header)
+
+    source = EdgarFilingSource(
+        settings, client=httpx.Client(transport=httpx.MockTransport(response)), clock=lambda: CLOCK
+    )
+    monkeypatch.setattr(source, "_rows", lambda *_: iter([((2009, 2), row)]))
+    assert source.sec_forms_13d(frozenset({"0000999999"})) == []
+    assert source.sec_forms_requests["total"] == 2
+    assert source.sec_forms_requests["headers"] == 2
+    assert source.sec_forms_requests["retries_backoffs"] == 1
+    source._sec_forms_request_active = True
+    source._count(httpx.Request("GET", "https://data.sec.gov/submissions/CIK0000222222.json"))
+    source._count(
+        httpx.Request("GET", "https://data.sec.gov/submissions/CIK0000222222-submissions-001.json")
+    )
+    source._sec_forms_request_active = False
+    assert source.sec_forms_requests["submissions"] == 1
+    assert source.sec_forms_requests["submissions_pages"] == 1
+    for n in range(9):
+        source._sec_header("0000222222", f"0000950123-09-{n:06d}", settings.edgar.header_bytes)
+    assert len(source._sec_header_text) == 8
+
 
 CLOCK = datetime(2026, 9, 25, tzinfo=UTC)
 APPLE, ALPHABET, KLX = "0000320193", "0001652044", "0001738827"
@@ -233,6 +2054,146 @@ def _cached_quarters(settings: Settings) -> set[str]:
     }
 
 
+def test_filing_index_scans_once_per_source_and_returns_independent_lists(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(settings, _router())
+    original_rows = source._rows
+    walks = 0
+
+    def counted_rows(*args: Any, **kwargs: Any) -> Any:
+        nonlocal walks
+        walks += 1
+        return original_rows(*args, **kwargs)
+
+    monkeypatch.setattr(source, "_rows", counted_rows)
+    first = source.filing_index()
+    unstamped = list(source.unstamped_filings)
+    assert walks == 2
+
+    second = source.filing_index()
+    assert second == first and second is not first
+    assert walks == 2
+    assert source.unstamped_filings == unstamped
+    second.clear()
+    assert source.filing_index() == first
+
+    since = datetime(2024, 2, 1, tzinfo=UTC)
+    assert source.filing_index(since) == [e for e in first if e.accepted_at >= since]
+    assert walks == 2
+    assert source.unstamped_filings == unstamped
+
+    since_first = _source(edgar_settings(Path(settings.edgar.cache_dir) / "since"), _router())
+    assert since_first.filing_index(since) == [e for e in first if e.accepted_at >= since]
+    assert since_first.filing_index() == first
+
+    other = _source(settings, _router())
+    other_rows = other._rows
+    other_walks = 0
+
+    def counted_other(*args: Any, **kwargs: Any) -> Any:
+        nonlocal other_walks
+        other_walks += 1
+        return other_rows(*args, **kwargs)
+
+    monkeypatch.setattr(other, "_rows", counted_other)
+    assert other.filing_index() == first
+    assert other_walks == 2
+
+
+# --- #2616: memory over a long history ---------------------------------------
+
+_MANY_CIKS = 30
+
+
+def _synthetic_history(settings: Settings) -> list[FilingIndexEntry]:
+    """Cache a 2024 Q1 to 2026 Q3 index of `_MANY_CIKS` issuers, three filings
+    each a quarter, and every one already stamped, so `filing_index` reads
+    the cache only. Returns the entries it must give, sorted as it sorts."""
+    cache = Path(settings.edgar.cache_dir)
+    quarters = [(y, q) for y in (2024, 2025, 2026) for q in (1, 2, 3, 4) if (y, q) <= (2026, 3)]
+    stamps: dict[str, dict[str, list[object]]] = {}
+    expected: list[FilingIndexEntry] = []
+    for year, qtr in quarters:
+        lines = []
+        for n in range(1, _MANY_CIKS + 1):
+            cik = f"{n:010d}"
+            for k, form in enumerate(("10-Q", "8-K", "4")):
+                accession = f"{n:010d}-{year % 100:02d}-{qtr * 10 + k:06d}"
+                filed = date(year, qtr * 3 - 2, 10 + k)
+                lines.append(index_line(form, f"Issuer {n} Inc", n, filed.isoformat(), accession))
+                at = datetime(filed.year, filed.month, filed.day, 15, tzinfo=UTC)
+                stamps.setdefault(cik, {})[accession] = [form, "d.htm", False, at.isoformat(), ""]
+                expected.append(FilingIndexEntry(cik, f"Issuer {n} Inc", form, accession, at))
+        path = cache / "index" / f"{year}-QTR{qtr}.idx.gz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(gzip.compress(_synthetic(*lines).encode("utf-8"), mtime=0))
+    for cik, records in stamps.items():
+        path = cache / "stamps" / "v1" / f"{cik}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "layout": STAMPS_LAYOUT,
+            "cik": cik,
+            "items_refreshed": True,
+            "records": records,
+        }
+        path.write_text(json.dumps(payload))
+    return sorted(expected, key=lambda e: (e.accepted_at, e.accession, e.cik))
+
+
+class _TrackedStamps(dict[str, SubmissionRecord]):
+    """A loaded stamps dict that `weakref.finalize` can watch."""
+
+
+def test_filing_index_holds_one_ciks_stamps_at_a_time_not_every_ciks(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2616: every issuer's full-history stamps were loaded at once, beside
+    every kept row, so the peak grew with the history (13 GB on the real
+    cache). With nothing to stamp, a CIK's stamps are read, used and dropped
+    before the next CIK's are read."""
+    import weakref
+
+    expected = _synthetic_history(settings)
+    router = EdgarRouter()
+    source = _source(settings, router)
+    original = source._load_stamps
+    alive = most = 0
+
+    def dropped() -> None:
+        nonlocal alive
+        alive -= 1
+
+    def tracked(cik: str) -> dict[str, SubmissionRecord]:
+        nonlocal alive, most
+        loaded = _TrackedStamps(original(cik))
+        weakref.finalize(loaded, dropped)
+        alive += 1
+        most = max(most, alive)
+        return loaded
+
+    monkeypatch.setattr(source, "_load_stamps", tracked)
+    assert source.filing_index() == expected
+    assert router.urls == []
+    assert most <= 2  # the CIK being read, and the one just used
+
+
+def test_filing_index_entries_share_one_string_per_cik_name_and_form(
+    settings: Settings,
+) -> None:
+    """#2616: each index row carried its own copy of its CIK, company name and
+    form; the kept entries now share one string object per distinct value,
+    so what the source keeps for its lifetime is one accession and one
+    stamp per filing."""
+    expected = _synthetic_history(settings)
+    entries = _source(settings, EdgarRouter()).filing_index()
+    assert entries == expected
+    for field in ("cik", "company_name", "form"):
+        values = {getattr(e, field) for e in entries}
+        assert len({id(getattr(e, field)) for e in entries}) == len(values), field
+
+
 def test_a_quarter_is_cached_only_once_settled_and_the_open_quarter_may_404(
     settings: Settings,
 ) -> None:
@@ -250,7 +2211,7 @@ def test_a_404_for_a_closed_quarter_raises(settings: Settings) -> None:
         _source(settings, _router(overrides={(2025, 2): 404})).filing_index()
 
 
-def test_a_second_call_fetches_only_the_unsettled_quarter_and_restamps_nothing(
+def test_a_new_instance_fetches_the_unsettled_quarter_but_a_second_call_does_not(
     settings: Settings,
 ) -> None:
     first = _source(settings, _router()).filing_index()
@@ -265,10 +2226,10 @@ def test_a_second_call_fetches_only_the_unsettled_quarter_and_restamps_nothing(
         "CIK0000320193.json",
         "CIK0000320193-submissions-001.json",
     ]
-    # The same instance reuses its memoised submissions: only the open quarter.
+    # The same instance keeps the full index, including the open quarter.
     before = len(again_router.urls)
     assert source.filing_index() == first
-    assert again_router.urls[before:] == again_router.index_urls()[-1:]
+    assert again_router.urls[before:] == []
 
 
 def test_an_accession_missing_after_its_quarter_settled_is_cached_as_unstampable(
@@ -413,6 +2374,40 @@ def test_an_empty_bulk_submissions_member_falls_back_to_the_api(tmp_path: Path) 
         _submission_urls(router)
     )
     assert [u.accession for u in source.unstamped_filings] == [MISSING]
+
+
+def test_a_kept_bulk_submissions_zip_is_counted(tmp_path: Path) -> None:
+    """#2594: a second run whose conditional `GET` of `submissions.zip` gets a
+    `304` keeps the cached zip, stamps the same, and counts the kept zip on
+    `.bulk_not_modified` (in the run message), so a zip that never changes shows."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as bulk:
+        bulk.write(FIXTURES / SUBMISSIONS[APPLE][0], f"CIK{APPLE}.json")
+    body = buffer.getvalue()
+    settings = edgar_settings(
+        tmp_path / "cache", bulk_stamp_threshold_ciks=1, bulk_stamps_enabled=True
+    )
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("If-None-Match") == '"v1"':
+            return httpx.Response(304)
+        return httpx.Response(200, content=body, headers={"ETag": '"v1"'})
+
+    first_router = _router()
+    first_router.add(BULK_URL, serve)
+    first = _source(settings, first_router)
+    entries = first.filing_index()
+    assert first.bulk_not_modified == 0
+    # Every per-CIK cache gone, the bulk zip and its sidecar kept: the next run
+    # asks for `submissions.zip` again, conditionally.
+    for path in (tmp_path / "cache").iterdir():
+        if path.name != "bulk":
+            shutil.rmtree(path) if path.is_dir() else path.unlink()
+    second_router = _router()
+    second_router.add(BULK_URL, serve)
+    second = _source(settings, second_router)
+    assert second.filing_index() == entries
+    assert second_router.urls.count(BULK_URL) == 1 and second.bulk_not_modified == 1
 
 
 # --- the companies snapshot and provenance ---------------------------------------
@@ -624,6 +2619,17 @@ def test_the_stamps_cache_round_trips_items_under_the_new_layout(settings: Setti
     loaded = _source(settings, _router())._load_stamps(APPLE)
     assert loaded[APPLE_202].items == "2.02,9.01"
     assert loaded[APPLE_202].accepted_at == _recorded_acceptance()[APPLE_202]
+
+
+def test_stamps_memo_sees_another_sources_rewrite(settings: Settings) -> None:
+    _source(settings, _router()).filing_index()
+    first = _source(settings, _router())
+    assert first._load_stamps(APPLE)[APPLE_202].items == "2.02,9.01"
+    second = _source(settings, _router())
+    changed = second._load_stamps(APPLE)
+    changed[APPLE_202] = replace(changed[APPLE_202], items="rewritten")
+    second._save_stamps(APPLE, changed)
+    assert first._load_stamps(APPLE)[APPLE_202].items == "rewritten"
 
 
 def test_an_old_layout_cache_is_read_as_it_is_with_no_request(settings: Settings) -> None:
@@ -1383,6 +3389,61 @@ def test_filename_ten_k_missing_from_fsn_is_counted_apart(tmp_path: Path) -> Non
     assert (source.filename_fsn_missing, source.filename_fsn_no_symbol_only) == (1, 0)
 
 
+def test_filename_ten_k_fsn_keys_to_another_cik_is_a_coregistrants(tmp_path: Path) -> None:
+    """#2941: a combined 10-K FSN extracted under another CIK (the filer
+    whose instance it is) is read as a co-registrant's copy; one FSN holds
+    under this CIK, or never extracted, is not."""
+    source = _fn_source(tmp_path, _fn_router())
+    path = source._fsn_cache_path(_FN_CIK)
+    data = json.loads(path.read_text())
+    del data["records"][_FN_A]  # FSN keys A to the parent, not to this CIK
+    path.write_text(json.dumps(data))
+    source._fsn_extracted_accessions = frozenset({_FN_A, _FN_B, _FN_COVER})
+    listings = {e.accession: e for e in source.filename_listings(_FN_CIK)}
+    assert listings[_FN_A].coregistrant
+    assert listings[_FN_A].dei_symbol is None
+    assert not listings[_FN_B].coregistrant  # FSN holds B under this CIK
+    assert not listings[_FN_25_NASDAQ].coregistrant
+    assert source.filename_fsn_missing == 0  # a co-registrant's copy is not missing
+
+    missing = _fn_source(tmp_path / "other", _fn_router())
+    path = missing._fsn_cache_path(_FN_CIK)
+    data = json.loads(path.read_text())
+    del data["records"][_FN_A]  # FSN never extracted A at all: no evidence either way
+    path.write_text(json.dumps(data))
+    assert not {e.accession: e for e in missing.filename_listings(_FN_CIK)}[_FN_A].coregistrant
+    assert missing.filename_fsn_missing == 1
+
+
+def test_filename_ten_k_whose_cover_cache_names_another_entity_is_a_coregistrants(
+    tmp_path: Path,
+) -> None:
+    """#2941: the per-document cover cache naming another entity marks the
+    copy too, with no FSN entry anywhere."""
+    source = _fn_source(tmp_path, _fn_router())
+    path = source._fsn_cache_path(_FN_CIK)
+    data = json.loads(path.read_text())
+    del data["records"][_FN_A]
+    path.write_text(json.dumps(data))
+    edgar_raw.write_atomic(
+        source._cover_cache_path(_FN_A),
+        json.dumps(
+            {
+                "version": edgar_source_module.COVER_VERSION,
+                "accession": _FN_A,
+                "cik": _FN_CIK,
+                "entity_cik": "0000006201",
+                "listings": [],
+                "facts": [],
+            }
+        ).encode(),
+    )
+    listings = {e.accession: e for e in source.filename_listings(_FN_CIK)}
+    assert listings[_FN_A].coregistrant
+    assert not listings[_FN_B].coregistrant
+    assert source.filename_fsn_missing == 0
+
+
 @pytest.mark.parametrize("broken", ["index_404", "index_malformed", "document_404"])
 def test_filename_failed_fetch_is_counted_cached_nowhere_and_asked_again(
     tmp_path: Path, broken: str
@@ -1495,26 +3556,805 @@ def test_filename_document_read_stops_at_the_configured_cap(tmp_path: Path) -> N
     assert source.filename_no_exchange >= 1
 
 
-def test_a_cached_v5_cover_page_is_no_longer_served(settings: Settings) -> None:
-    """T181 (#1541): the owner backed `cover_split_contexts` out in the same
-    release and the caches go to version 6, so a per-document cover page
-    cached under v5, parsed with the switch on, is never served: it is
-    fetched and parsed again."""
-    assert (FSN_VERSION, COVER_VERSION) == (6, 6)
-    accession = "0000320193-24-000123"
-    old = Path(settings.edgar.cache_dir) / "cover" / "v5" / f"{accession}.json"
-    old.parent.mkdir(parents=True, exist_ok=True)
-    old.write_text(
-        json.dumps(
-            {
-                "version": 5,
-                "accession": accession,
-                "cik": "0000320193",
-                "entity_cik": "0000320193",
-                "listings": [],
-                "facts": [],
-            }
-        )
+# --- filing-name listings: the bounded fetch pool (#2932) -------------------
+
+
+def _fn_run(tmp_path: Path, router: EdgarRouter, workers: int) -> dict[str, Any]:
+    """One `filename_listings` run at `workers`: the answer, the cache file's
+    bytes and every count the run leaves, for a byte-for-byte comparison."""
+    source = _fn_source(tmp_path, router, filename_fetch_workers=workers)
+    listings = source.filename_listings(_FN_CIK)
+    cache_file = tmp_path / "cache" / "filename" / "v1" / f"{_FN_CIK}.json"
+    return {
+        "listings": listings,
+        "cache": cache_file.read_bytes(),
+        "counts": (
+            source.filename_10ks_read,
+            source.filename_no_instance,
+            source.filename_no_exchange,
+            source.filename_form25_read,
+            source.filename_form25_no_exhibit,
+            source.filename_form25_uncached,
+            source.filename_fsn_no_symbol_only,
+            source.filename_fsn_missing,
+            source.filename_index_fetches,
+            source.filename_document_fetches,
+            source.failed_filings,
+            source.requests,
+        ),
+        "incomplete": set(source.filename_incomplete_ciks),
+        "failures": dict(source._pending_failures),
+    }
+
+
+def test_filename_fetch_workers_defaults_to_four_and_refuses_zero() -> None:
+    assert Settings(_env_file=None).edgar.filename_fetch_workers == 4
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, edgar={"filename_fetch_workers": 0})
+
+
+@pytest.mark.parametrize("workers", [2, 4, 8])
+def test_filename_pool_answer_is_byte_identical_to_the_sequential_fetch(
+    tmp_path: Path, workers: int
+) -> None:
+    """The pool only prefetches: the answer (order included), the cache
+    file's bytes and every count equal the one-at-a-time run's."""
+    sequential = _fn_run(tmp_path / "one", _fn_router(), 1)
+    router = _fn_router()
+    pooled = _fn_run(tmp_path / "pool", router, workers)
+    assert pooled == sequential
+    assert [e.accession for e in pooled["listings"]] == [_FN_A, _FN_B, _FN_25_NASDAQ, _FN_COVER]
+    # The same requests, each asked once (the order across threads is free).
+    seq_router = _fn_router()
+    _fn_run(tmp_path / "again", seq_router, 1)
+    assert sorted(router.urls) == sorted(seq_router.urls)
+
+
+def test_filename_pool_of_one_is_todays_sequential_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`filename_fetch_workers = 1` starts no thread and asks in stamp order."""
+
+    def no_pool(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a pool of one starts no thread pool")
+
+    monkeypatch.setattr(edgar_source_module, "ThreadPoolExecutor", no_pool)
+    router = _fn_router()
+    _fn_run(tmp_path, router, 1)
+    asked = [u for u in router.urls if "/Archives/" in u]
+    assert asked == [
+        _fn_url(_FN_A, "index.json"),
+        _fn_url(_FN_A, "doc.htm"),
+        _fn_url(_FN_B, "index.json"),
+        _fn_url(_FN_B, "doc.htm"),
+        _fn_url(_FN_C, "index.json"),
+        _fn_url(_FN_COVER, "index.json"),
+        _fn_url(_FN_25_NASDAQ, "index.json"),
+        _fn_url(_FN_25_NYSE, "index.json"),
+    ]
+
+
+def test_filename_pool_runs_requests_concurrently(tmp_path: Path) -> None:
+    """At 4 workers more than one request is in flight at once (the point)."""
+    router = _fn_router()
+    lock = threading.Lock()
+    state = {"now": 0, "max": 0}
+
+    def slow(inner: Any) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            with lock:
+                state["now"] += 1
+                state["max"] = max(state["max"], state["now"])
+            time.sleep(0.05)
+            with lock:
+                state["now"] -= 1
+            return cast(httpx.Response, inner(request))
+
+        return handler
+
+    for accession in (_FN_A, _FN_B, _FN_C, _FN_COVER):
+        url = _fn_url(accession, "index.json")
+        router.add(url, slow(router._routes[url]))
+    _fn_run(tmp_path, router, 4)
+    assert state["max"] >= 2
+
+
+class _FakeClock:
+    """`edgar_raw`'s `time`: a fake clock that `sleep` moves on to the
+    sleeper's own wake time, so the limiter's spacing is measured without
+    waiting for it. Two threads sleeping at once overlap (the clock moves to
+    the later wake time, never the sum), as real sleeps do, so a limiter that
+    let two requests through on one stale stamp would show a short gap."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._now = 1000.0
+
+    def monotonic(self) -> float:
+        with self._lock:
+            return self._now
+
+    def sleep(self, seconds: float) -> None:
+        with self._lock:
+            wake = self._now + max(seconds, 0.0)
+        time.sleep(0.002)  # real: let another thread run while this one sleeps
+        with self._lock:
+            self._now = max(self._now, wake)
+
+
+class _StampingLock:
+    """The limiter's own lock, recording the request stamp it leaves inside
+    its critical section, so the stamps are the real limiter's."""
+
+    def __init__(self, limiter: Any) -> None:
+        self._lock = threading.Lock()
+        self._limiter = limiter
+        self.stamps: list[float] = []
+
+    def __enter__(self) -> None:
+        self._lock.acquire()
+
+    def __exit__(self, *_exc: object) -> None:
+        self.stamps.append(self._limiter._last_request_monotonic)
+        self._lock.release()
+
+
+def test_filename_pool_never_exceeds_requests_per_second(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Four threads share the one process-wide limiter: every request start
+    is at least `1 / requests_per_second` after the one before it."""
+    clock = _FakeClock()
+    monkeypatch.setattr(edgar_raw, "time", clock)
+    limiter = edgar_raw._RateLimiter()
+    stamping = _StampingLock(limiter)
+    limiter._lock = stamping  # type: ignore[assignment]
+    monkeypatch.setattr(edgar_raw, "_LIMITER", limiter)
+    router = _fn_router()
+
+    def slow(inner: Any) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            time.sleep(0.01)  # real latency, so the threads overlap
+            return cast(httpx.Response, inner(request))
+
+        return handler
+
+    for url in list(router._routes):
+        router.add(url, slow(router._routes[url]))
+    source = _fn_source(tmp_path, router, filename_fetch_workers=4, requests_per_second=9.0)
+    source.filename_listings(_FN_CIK)
+
+    archive_requests = [u for u in router.urls if "/Archives/" in u]
+    assert len(archive_requests) == 8
+    assert len(stamping.stamps) == len(router.urls)
+    gaps = [b - a for a, b in itertools.pairwise(stamping.stamps)]
+    assert min(gaps) >= 1 / 9.0 - 1e-9
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_filename_pool_one_failed_request_fails_closed_for_its_cik(
+    tmp_path: Path, workers: int
+) -> None:
+    """A 404 on one filing: counted, not cached, the CIK listed partial,
+    exactly as the sequential fetch does."""
+    router = _fn_router()
+    router.add(_fn_url(_FN_B, "doc.htm"), 404)
+    run = _fn_run(tmp_path, router, workers)
+    assert _FN_B not in {e.accession for e in run["listings"]}
+    assert run["incomplete"] == {_FN_CIK}
+    assert set(run["failures"]) == {_FN_B}
+    assert _FN_B not in json.loads(run["cache"])["records"]
+    reference = _fn_router()
+    reference.add(_fn_url(_FN_B, "doc.htm"), 404)
+    assert run == _fn_run(tmp_path / "seq", reference, 1)
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+@pytest.mark.parametrize("failure", ["500", "503", "timeout", "connect"])
+def test_filename_fetch_failing_past_retries_fails_its_cik_closed(
+    tmp_path: Path, workers: int, failure: str
+) -> None:
+    """#2932: a 5xx or transport error that survives the retries fails this
+    CIK closed: no answer, listed incomplete and fetch-failed with its error,
+    the failed filing uncached (the ones before it in stamp order cached as
+    the sequential run caches them), and no raise, so the run's other CIKs
+    go on. A healed rerun asks only what was not cached and answers fully."""
+    router = _fn_router()
+    url = _fn_url(_FN_C, "index.json")
+    if failure in ("500", "503"):
+        router.add(url, int(failure))
+    else:
+        error = httpx.ReadTimeout if failure == "timeout" else httpx.ConnectError
+
+        def broken(request: httpx.Request) -> httpx.Response:
+            raise error("down", request=request)
+
+        router.add(url, broken)
+    fast = {"retry_max_attempts": 2, "retry_backoff_seconds": 0.001}
+    source = _fn_source(tmp_path, router, filename_fetch_workers=workers, **fast)
+    assert source.filename_listings(_FN_CIK) == []
+    assert source.filename_incomplete_ciks == {_FN_CIK}
+    assert list(source.filename_fetch_failed_ciks) == [_FN_CIK]
+    assert source.failed_filings == 0  # not a per-filing failure: nothing quarantines
+    assert source.filename_10ks_read == 0  # a failed CIK's readings are not counted
+    stored = json.loads((tmp_path / "cache" / "filename" / "v1" / f"{_FN_CIK}.json").read_text())
+    assert set(stored["records"]) == {_FN_A, _FN_B}
+
+    healed_router = _fn_router()
+    healed = _fn_source(tmp_path, healed_router, filename_fetch_workers=workers, **fast)
+    clean = _fn_source(tmp_path / "clean", _fn_router(), filename_fetch_workers=1)
+    assert healed.filename_listings(_FN_CIK) == clean.filename_listings(_FN_CIK)
+    assert healed.filename_fetch_failed_ciks == {}
+    assert _fn_url(_FN_A, "index.json") not in healed_router.urls  # cached, not re-asked
+
+
+def test_filename_pool_sends_nothing_while_a_block_is_waited_out(tmp_path: Path) -> None:
+    """Pool workers send nothing during a block; the resulting listings and
+    request counts match a sequential fetch regardless of thread order."""
+    edgar_raw._RATE_LIMIT_BLOCK.set()
+    try:
+        router = _fn_router()
+        worker_requests_during_block: list[str] = []
+        for url, original in list(router._routes.items()):
+
+            def checked(request: httpx.Request, original: Any = original) -> httpx.Response:
+                if edgar_raw.rate_limit_blocked() and threading.current_thread().name.startswith(
+                    "edgar-filename"
+                ):
+                    worker_requests_during_block.append(str(request.url))
+                return cast(httpx.Response, original(request))
+
+            router.add(url, checked)
+        listings = _fn_source(tmp_path, router, filename_fetch_workers=4).filename_listings(_FN_CIK)
+    finally:
+        edgar_raw._RATE_LIMIT_BLOCK.clear()
+    sequential = _fn_router()
+    assert listings == _fn_source(tmp_path / "seq", sequential).filename_listings(_FN_CIK)
+    assert worker_requests_during_block == []
+    assert Counter(router.urls) == Counter(sequential.urls)
+
+
+def test_filename_fetch_block_given_up_on_still_raises(tmp_path: Path) -> None:
+    """A `403` the block policy gives up on is not a CIK failure: it raises."""
+    router = _fn_router()
+    router.add(_fn_url(_FN_C, "index.json"), 403)
+    source = _fn_source(tmp_path, router, rate_limit_wait_seconds=0.001)
+    with pytest.raises(httpx.HTTPStatusError):
+        source.filename_listings(_FN_CIK)
+    edgar_raw._RATE_LIMIT_BLOCK.clear()
+
+
+@pytest.mark.parametrize(("asked", "fails"), [(50, False), (49, True)])
+def test_filename_fetch_failures_past_the_share_fail_the_run(
+    tmp_path: Path, asked: int, fails: bool
+) -> None:
+    """One failed CIK of 50 asked is the 2% default and passes; of 49 it is
+    over and `check_failures` fails the run, naming the CIK and its error."""
+    router = _fn_router()
+    router.add(_fn_url(_FN_C, "index.json"), 503)
+    source = _fn_source(tmp_path, router, retry_max_attempts=1)
+    source.filename_listings(_FN_CIK)
+    source._filename_ciks_asked |= {f"{n:010d}" for n in range(1, asked)}
+    if fails:
+        with pytest.raises(
+            FilingFailuresError, match=rf"filename fetch incomplete: 1 of 49.*{_FN_CIK}"
+        ):
+            source.check_failures()
+    else:
+        source.check_failures()
+
+
+def test_filename_fetch_share_counts_only_ciks_that_sent_a_fetch(tmp_path: Path) -> None:
+    """A fully cached CIK sends no filename request and is not in the share's
+    denominator, so a mostly cached build cannot dilute an outage."""
+    router = _fn_router()
+    warm = _fn_source(tmp_path, router)
+    warm.filename_listings(_FN_CIK)
+    assert warm._filename_ciks_asked == {_FN_CIK}
+    cached = _fn_source(tmp_path, router)
+    cached.filename_listings(_FN_CIK)
+    assert cached._filename_ciks_asked == set()
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_filename_fetch_stops_after_consecutive_failed_ciks(tmp_path: Path, workers: int) -> None:
+    """#2934: in a full SEC outage the pass stops once
+    `edgar.filename_fetch_outage_ciks` CIKs in a row failed past the
+    retries, instead of retrying every remaining CIK; the raise fails the
+    run closed, naming the outage. Each call here is one more failed CIK."""
+    router = _fn_router()
+    router.add(_fn_url(_FN_C, "index.json"), 503)
+    source = _fn_source(
+        tmp_path,
+        router,
+        filename_fetch_workers=workers,
+        retry_max_attempts=1,
+        filename_fetch_outage_ciks=3,
     )
+    assert source.filename_listings(_FN_CIK) == []
+    assert source.filename_listings(_FN_CIK) == []
+    with pytest.raises(
+        edgar_source_module.FilenameFetchOutageError,
+        match=r"3 CIKs in a row.*edgar\.filename_fetch_outage_ciks.*HTTPStatusError",
+    ):
+        source.filename_listings(_FN_CIK)
+    assert source.filename_incomplete_ciks == {_FN_CIK}
+    stored = json.loads((tmp_path / "cache" / "filename" / "v1" / f"{_FN_CIK}.json").read_text())
+    assert _FN_C not in stored["records"]  # the failed filing stays uncached
+
+
+def test_filename_fetch_outage_streak_resets_on_an_answer(tmp_path: Path) -> None:
+    """A CIK whose fetch answers ends the streak; a fully cached CIK sends
+    nothing and leaves it as it is (it is no evidence either way)."""
+    down = [True]
+    router = _fn_router()
+    url = _fn_url(_FN_C, "index.json")
+    healthy = router._routes[url]
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        if down[0]:
+            return httpx.Response(503, request=request)
+        return cast(httpx.Response, healthy(request))
+
+    router.add(url, flaky)
+    source = _fn_source(tmp_path, router, retry_max_attempts=1, filename_fetch_outage_ciks=2)
+    source.filename_listings(_FN_CIK)
+    assert source._filename_failed_streak == 1
+    down[0] = False
+    source.filename_listings(_FN_CIK)
+    assert source._filename_failed_streak == 0
+    source._filename_failed_streak = 1
+    source.filename_listings(_FN_CIK)  # fully cached now: nothing sent
+    assert source._filename_failed_streak == 1
+
+
+def test_filename_fetch_outage_ciks_defaults_and_refuses_zero() -> None:
+    assert Settings(_env_file=None).edgar.filename_fetch_outage_ciks == 20
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, edgar={"filename_fetch_outage_ciks": 0})
+
+
+def _done(result: Any = None, error: BaseException | None = None) -> Any:
+    future: Any = edgar_source_module.Future()
+    if error is None:
+        future.set_result(result)
+    else:
+        future.set_exception(error)
+    return future
+
+
+def _status_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", _fn_url(_FN_A, "index.json"))
+    return httpx.HTTPStatusError("x", request=request, response=httpx.Response(status))
+
+
+@pytest.mark.parametrize(
+    ("error", "reusable"),
+    [
+        (None, True),
+        (_status_error(404), True),
+        (_status_error(410), True),
+        (_status_error(500), True),
+        (_status_error(503), True),
+        (ValueError("malformed"), True),
+        (httpx.ConnectError("down"), True),
+        (_status_error(403), False),
+        (_status_error(429), False),
+    ],
+)
+def test_filename_prefetch_reuses_all_but_a_rate_limit_block(
+    error: BaseException | None, reusable: bool
+) -> None:
+    """A block's `403`/`429` depends on the other threads (the shared block
+    flag), so it is asked again in order; every other outcome is the one the
+    sequential fetch would get, and is taken as it is."""
+    assert edgar_source_module._prefetch_reusable(_done(error=error)) is reusable
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_filename_pool_a_block_waited_out_reads_as_the_sequential_fetch(
+    tmp_path: Path, workers: int
+) -> None:
+    """A `403` block on one filing, waited out (`rate_limit_wait_seconds`),
+    then served: the answer is the clean run's at either pool size."""
+    router = _fn_router()
+    url = _fn_url(_FN_C, "index.json")
+    served = router._routes[url]
+    calls = {"n": 0}
+
+    def blocked_once(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(403) if calls["n"] == 1 else cast(httpx.Response, served(request))
+
+    router.add(url, blocked_once)
+    source = _fn_source(
+        tmp_path, router, filename_fetch_workers=workers, rate_limit_wait_seconds=0.01
+    )
+    listings = source.filename_listings(_FN_CIK)
+    clean = _fn_source(tmp_path / "clean", _fn_router(), filename_fetch_workers=1)
+    assert listings == clean.filename_listings(_FN_CIK)
+    assert source.failed_filings == 0
+
+
+def test_a_cached_v5_cover_page_is_no_longer_served(settings: Settings) -> None:
+    """T181 (#1541), T198: the caches went to version 6 when the owner backed
+    `cover_split_contexts` out and to 7 when `rederive-1682` turned it back on,
+    so a per-document cover page cached under v5 (or v6) is never served: it
+    is fetched and parsed again."""
+    assert (FSN_VERSION, COVER_VERSION) == (7, 7)
+    accession = "0000320193-24-000123"
+    for stale in (5, 6):
+        old = Path(settings.edgar.cache_dir) / "cover" / f"v{stale}" / f"{accession}.json"
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_text(
+            json.dumps(
+                {
+                    "version": stale,
+                    "accession": accession,
+                    "cik": "0000320193",
+                    "entity_cik": "0000320193",
+                    "listings": [],
+                    "facts": [],
+                }
+            )
+        )
     source = _source(settings, EdgarRouter())
     assert source._load_cover_cache(accession) is None
+
+
+def _seeded_store_settings(tmp_path: Path, clock: datetime) -> Settings:
+    base = edgar_settings(tmp_path)
+    settings = base.model_copy(
+        update={"store": base.store.model_copy(update={"path": str(tmp_path / "store.duckdb")})}
+    )
+    conn = duckdb.connect(settings.store.path)
+    schema.init_schema(conn)
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, started_at, status, mode) "
+        "VALUES ('seed', 'edgar_index', ?, 'ok', 'rebuild')",
+        [clock],
+    )
+    conn.close()
+    return settings
+
+
+def test_released_repair_index_frees_the_store_and_reopens_for_the_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#2822 safety: after the fetch pass a read-only open in this process
+    succeeds (the master-retract dry run, the price read); a raw-source read
+    meanwhile fails closed; the write step's raw reads (`chain_candidates`'
+    form query) reopen the same table beside the writer, never the
+    quarterly walk."""
+    from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only
+    from tradepartner.store.master import SUCCESSOR_EVIDENCE_FORMS, _filing_index_for_forms
+
+    settings = _seeded_store_settings(tmp_path, CLOCK)
+    conn = duckdb.connect(settings.store.path)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                "0000320193-26-000150",
+                "8-K12B",
+                "Apple",
+                date(2026, 9, 24),
+                CLOCK - timedelta(days=1),
+                date(2026, 9, 24),
+                True,
+            ),
+            stored_index.Listing(
+                APPLE,
+                "0000320193-26-000151",
+                "10-K",
+                "Apple",
+                date(2026, 9, 24),
+                CLOCK - timedelta(days=1),
+                date(2026, 9, 24),
+                True,
+            ),
+        ],
+        CLOCK,
+    )
+    conn.close()
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK, prefer_stored_index=True)
+    monkeypatch.setattr(source, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    before = _filing_index_for_forms(source, SUCCESSOR_EVIDENCE_FORMS)
+    assert [entry.accession for entry in before] == ["0000320193-26-000150"]
+    source.release_index()
+    with open_read_only(settings) as read:
+        assert read.execute("SELECT count(*) FROM ingestion_runs").fetchone() == (1,)
+        with pytest.raises(StoreLockedError, match="store busy"):
+            source.delistings()
+    with open_for_write(settings):
+        assert _filing_index_for_forms(source, SUCCESSOR_EVIDENCE_FORMS) == before
+    source.close()
+
+
+def test_pending_settle_check_uses_first_known_filed_on_quarter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Quant S1 (#2822): a filing of Apr 1 first listed by a quarterly file
+    dated Mar 31 settles with Q2, not Q1, so a lagging submissions answer
+    on Apr 5 writes no unstampable marker for the 13D or the Form 25."""
+    settings = edgar_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "events": settings.events.model_copy(
+                update={"sec_forms_enabled": True, "sec_forms_backfill_start": date(2026, 1, 1)}
+            )
+        }
+    )
+    clock = datetime(2026, 4, 5, 16, tzinfo=UTC)
+    source = EdgarFilingSource(settings, clock=lambda: clock)
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    rows = [
+        ("0000000003", "SC 13D", "0000000003-26-000140"),
+        ("0000000004", "25", "0000000005-26-000141"),
+    ]
+    conn.executemany(
+        "INSERT INTO filing_index_pending "
+        "(cik, accession, form, company_name, filed_on, listed_on) "
+        "VALUES (?, ?, ?, 'Issuer', ?, ?)",
+        [
+            (cik, accession, form, date(2026, 4, 1), date(2026, 3, 31))
+            for cik, form, accession in rows
+        ],
+    )
+    source.use_index(conn)
+    other = SubmissionRecord("0000000009-26-000001", "8-K", "x.htm", False, clock)
+    monkeypatch.setattr(
+        source,
+        "_fetch_submissions",
+        lambda _cik, _wanted: edgar_source_module._Submissions({other.accession: other}, [], clock),
+    )
+    monkeypatch.setattr(source, "_sgml_checked", lambda _cik, records: dict(records))
+    cik_13d, _, accession_13d = rows[0]
+    assert source.sec_form_stamp(cik_13d, accession_13d, date(2026, 4, 1)) is None
+    assert accession_13d not in source._load_stamps(cik_13d)
+    assert source.delistings() == []
+    cik_25, _, accession_25 = rows[1]
+    assert accession_25 not in source._load_stamps(cik_25)
+
+
+# --- #2920: the per-CIK fallback groups the walked index once ---------------
+
+
+class _CountingEntries(tuple[FilingIndexEntry, ...]):
+    """The walked index, counting each full pass over it."""
+
+    passes = 0
+
+    def __iter__(self) -> Iterator[FilingIndexEntry]:
+        type(self).passes += 1
+        return super().__iter__()
+
+
+def _interleaved_index(ciks: int, per_cik: int) -> list[FilingIndexEntry]:
+    """`ciks * per_cik` entries in the walk's (accepted_at, accession, cik)
+    order, each CIK's rows spread across the whole list."""
+    start = datetime(2001, 1, 2, 14, 30, tzinfo=UTC)
+    entries = [
+        FilingIndexEntry(
+            f"{c + 1:010d}",
+            f"CO {c}",
+            ("10-K", "8-K", "10-Q")[(c + n) % 3],
+            f"{c + 1:010d}-{n // 100:02d}-{n:06d}",
+            start + timedelta(minutes=n * ciks + (c * 7919) % ciks),
+        )
+        for c in range(ciks)
+        for n in range(per_cik)
+    ]
+    return sorted(entries, key=lambda e: (e.accepted_at, e.accession, e.cik))
+
+
+def test_per_cik_fallback_equals_the_full_index_filter_in_order(settings: Settings) -> None:
+    """#2920: with no stored index, each CIK's rows are exactly the old
+    `[e for e in filing_index() if e.cik == cik]`, in the same order, an
+    unknown CIK has none, and a caller's edit never reaches the next read."""
+    source = _source(settings, EdgarRouter())
+    walked = _interleaved_index(ciks=60, per_cik=25)
+    source._filing_index_entries = tuple(walked)
+    for cik in sorted({e.cik for e in walked}):
+        assert source.filing_index_for_cik(cik) == [e for e in walked if e.cik == cik]
+    assert source.filing_index_for_cik("0000999999") == []
+    first = walked[0].cik
+    source.filing_index_for_cik(first).clear()
+    assert source.filing_index_for_cik(first) == [e for e in walked if e.cik == first]
+
+
+def test_per_cik_fallback_follows_a_rebuilt_index(settings: Settings) -> None:
+    """#2920: the grouping is of the entries the source holds now; a rebuilt
+    index (a new walk, `use_index`) is never answered from the old one."""
+    source = _source(settings, EdgarRouter())
+    walked = _interleaved_index(ciks=5, per_cik=4)
+    source._filing_index_entries = tuple(walked)
+    cik = walked[0].cik
+    assert len(source.filing_index_for_cik(cik)) == 4
+    kept = tuple(e for e in walked if e.cik != cik or e.form == "10-K")
+    source._filing_index_entries = kept
+    assert source.filing_index_for_cik(cik) == [e for e in kept if e.cik == cik]
+
+
+def test_per_cik_fallback_on_the_real_walk_equals_the_filter(settings: Settings) -> None:
+    """#2920: on the quarterly walk itself, every CIK's answer is the filter."""
+    source = _source(settings, _router())
+    entries = source.filing_index()
+    assert entries
+    for cik in {e.cik for e in entries}:
+        assert source.filing_index_for_cik(cik) == [e for e in entries if e.cik == cik]
+
+
+def test_per_cik_fallback_reads_the_whole_index_once_for_every_cik(settings: Settings) -> None:
+    """#2920 (T323a regression): `classify._evidence` asks once per issuer CIK.
+    With `edgar.incremental_index` off each ask copied and scanned the whole
+    multi-million-row index, about 1.2 s per CIK over ~58k CIKs. 200k entries
+    over 20k CIKs now take one pass, however many CIKs are asked."""
+    source = _source(settings, EdgarRouter())
+    walked = _interleaved_index(ciks=20_000, per_cik=10)
+    _CountingEntries.passes = 0
+    source._filing_index_entries = _CountingEntries(walked)
+    ciks = sorted({e.cik for e in walked})
+    answered = sum(len(source.filing_index_for_cik(cik)) for cik in ciks)
+    assert answered == len(walked)
+    assert _CountingEntries.passes == 1
+
+
+# --- #2920: the stored index is read once per binding, not once per CIK -----
+
+
+class _CountingConn:
+    """A store connection counting each query the source sends it."""
+
+    def __init__(self, conn: duckdb.DuckDBPyConnection) -> None:
+        self._conn = conn
+        self.queries = 0
+
+    def execute(self, sql: str, params: Any = None) -> Any:
+        self.queries += 1
+        return self._conn.execute(sql, params or [])
+
+
+_EXCHANGE = "0000000777"  # an exchange: files 25-NSEs listed under itself and the issuer
+
+
+def _stored_index_fixture(ciks: int) -> tuple[duckdb.DuckDBPyConnection, list[str]]:
+    """Issuers with 10-K/8-K/4 history, some delisted by the exchange's
+    shared 25-NSE (the exchange's copy), a revision, filer-only CIKs and
+    pending rows."""
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    names = [f"{9000 + c:010d}" for c in range(ciks)]
+    listings: list[stored_index.Listing] = []
+    for c, cik in enumerate(names):
+        for n, form in enumerate(("10-K", "8-K", "4") if c % 5 else ("SC 13D", "4")):
+            on = date(2026, 9, 1) + timedelta(days=(c + n) % 20)
+            listings.append(
+                stored_index.Listing(
+                    cik,
+                    f"{cik}-26-{n:06d}",
+                    form,
+                    f"Co {c}",
+                    on,
+                    datetime(2026, 9, 1, 14, tzinfo=UTC) + timedelta(minutes=(c * 37 + n) % 900),
+                    on,
+                    True,
+                    n,
+                )
+            )
+        if c % 7 == 3:
+            accession = f"{_EXCHANGE}-26-{c:06d}"
+            for position, listed in enumerate((_EXCHANGE, cik)):
+                listings.append(
+                    stored_index.Listing(
+                        listed,
+                        accession,
+                        "25-NSE",
+                        "Exchange" if listed == _EXCHANGE else f"Co {c}",
+                        date(2026, 9, 21),
+                        datetime(2026, 9, 21, 15, tzinfo=UTC),
+                        date(2026, 9, 21),
+                        True,
+                        position,
+                    )
+                )
+    stored_index.insert_listings(conn, listings, CLOCK - timedelta(days=2))
+    revised = [
+        replace(row, filed_on=row.filed_on + timedelta(days=1), listed_on=date(2026, 9, 23))
+        for row in listings[:: max(1, len(listings) // 10)]
+    ]
+    stored_index.insert_listings(conn, revised, CLOCK - timedelta(days=1))
+    conn.executemany(
+        "INSERT INTO filing_index_pending "
+        "(cik, accession, form, company_name, filed_on, listed_on) "
+        "VALUES (?, ?, ?, 'Issuer', ?, ?)",
+        [
+            (cik, f"{cik}-26-{900:06d}", "10-K", date(2026, 9, 24), date(2026, 9, 24))
+            for cik in names[1::9]
+        ],
+    )
+    return conn, [*names, _EXCHANGE]
+
+
+def _stored_answers(source: EdgarFilingSource, ciks: list[str]) -> list[Any]:
+    return [
+        (
+            cik,
+            source.filing_index_for_cik(cik),
+            source._index_for_cik(cik, first=True),
+            source._is_issuer_cik(cik),
+        )
+        for cik in ciks
+    ]
+
+
+def test_stored_reads_in_one_scan_equal_the_per_cik_reads(tmp_path: Path) -> None:
+    """#2920: the one-scan reads give every CIK exactly what reading it alone
+    gives (rows, order, issuer rule, the exchange's 25-NSE copy dropped), and
+    the full history equals the per-CIK answers."""
+    settings = edgar_settings(tmp_path)
+    conn, ciks = _stored_index_fixture(60)
+    fresh = stored_index.Listing(
+        ciks[2], f"{ciks[2]}-26-000500", "8-K", "Co 2", CLOCK.date(), CLOCK, CLOCK.date(), True
+    )
+    bulk = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    bulk.use_index(conn, [fresh])
+    alone = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    alone.use_index(conn, [fresh], touched_ciks=frozenset())  # every CIK read by itself
+    expected = _stored_answers(alone, ciks)
+    assert _stored_answers(bulk, ciks) == expected
+    assert any(not issuer for *_, issuer in expected) and any(e[1] for e in expected)
+    shared = [e for e in bulk.filing_index() if e.form == "25-NSE"]
+    assert shared and all(e.cik != _EXCHANGE for e in shared)
+    for accession in {e.accession for e in shared}:
+        assert bulk._table_ciks_of(accession) == {
+            row.cik for row in stored_index.accession_listing_order(conn, accession, CLOCK)
+        }
+    walked = bulk.filing_index()
+    for cik in ciks:
+        assert [e for e in walked if e.cik == cik] == alone.filing_index_for_cik(cik)
+    assert sorted(bulk.unstamped_filings, key=lambda r: r.accession) == sorted(
+        alone._pending_rows(), key=lambda r: r.accession
+    )
+
+
+def test_a_touched_binding_reads_its_touched_issuers_in_one_scan(tmp_path: Path) -> None:
+    """#2920: an incremental binding reads its touched issuers together and
+    any other CIK alone, never the whole table for a few CIKs."""
+    settings = edgar_settings(tmp_path)
+    conn, ciks = _stored_index_fixture(40)
+    counting = _CountingConn(conn)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    touched = frozenset(ciks[:10])
+    source.use_index(cast(duckdb.DuckDBPyConnection, counting), touched_ciks=touched)
+    for cik in sorted(touched):
+        source.filing_index_for_cik(cik)
+    after_touched = counting.queries
+    source.filing_index_for_cik(ciks[21])
+    assert source._stored.loaded >= touched & source._stored_issuer_ciks()
+    assert ciks[30] not in source._stored.loaded
+    assert counting.queries > after_touched  # the untouched CIK was read alone
+
+
+@pytest.mark.parametrize("ciks", [50, 500])
+def test_stored_per_cik_reads_take_a_fixed_number_of_queries(tmp_path: Path, ciks: int) -> None:
+    """#2920 (T323a): once T324 seeds the table, every `cik=` read is a scan
+    of ~15M rows, and `classify._evidence`, `_read_stamps` and the full
+    history asked one or more per CIK (~58k). The queries per run no longer
+    grow with the CIK count."""
+    settings = edgar_settings(tmp_path)
+    conn, names = _stored_index_fixture(ciks)
+    counting = _CountingConn(conn)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    source.use_index(cast(duckdb.DuckDBPyConnection, counting))
+    issuers = 0
+    for cik in names:
+        source.filing_index_for_cik(cik)
+        if source._is_issuer_cik(cik):  # a filer-only CIK is still read alone
+            issuers += 1
+            source._index_for_cik(cik, first=True)
+    source.filing_index()
+    assert issuers > ciks // 2
+    assert counting.queries <= 10, counting.queries  # was 337 (50 CIKs), 3,280 (500)

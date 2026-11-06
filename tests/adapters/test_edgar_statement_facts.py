@@ -385,6 +385,114 @@ def test_configured_units_are_read_in_order() -> None:
     assert row.unit == "EUR"
 
 
+# --- per-name units (#2826) ----------------------------------------------------
+
+EPS_TAGS = {
+    **TAGS,
+    "eps_basic": ["us-gaap:EarningsPerShareBasic", "us-gaap:EarningsPerShareBasicAndDiluted"],
+}
+
+
+def _eps_payload(unit: str = "USD/shares") -> dict[str, Any]:
+    data = payload({"EarningsPerShareBasic": [entry(K2020, FY2020, 1.25)]}, unit=unit)
+    data["facts"]["us-gaap"]["Revenues"] = {"units": {"USD": [entry(K2020, FY2020, 300)]}}
+    return data
+
+
+def test_a_name_mapped_to_per_share_units_reads_its_entry() -> None:
+    result = parse_statement_facts(
+        _eps_payload(), EPS_TAGS, FORMS, UNITS, ACCEPTANCE, {"eps_basic": ["USD/shares"]}
+    )
+    rows = {r.fact_name: r for r in result.records}
+    assert (rows["eps_basic"].value, rows["eps_basic"].unit) == (1.25, "USD/shares")
+    assert rows["revenue"].unit == "USD"
+    assert result.non_unit == 0
+
+
+def test_an_unmapped_name_skips_a_per_share_entry_and_counts_non_usd() -> None:
+    result = parse_statement_facts(_eps_payload(), EPS_TAGS, FORMS, UNITS, ACCEPTANCE)
+    assert [r.fact_name for r in result.records] == ["revenue"]
+    assert result.non_unit == 1
+
+
+def test_mapping_one_name_leaves_the_other_names_on_statement_units() -> None:
+    data = payload({"Revenues": [entry(K2020, FY2020, 300)]}, unit="USD/shares")
+    result = parse_statement_facts(
+        data, EPS_TAGS, FORMS, UNITS, ACCEPTANCE, {"eps_basic": ["USD/shares"]}
+    )
+    assert result.records == ()
+    assert result.non_unit == 1
+
+
+def test_precedence_is_tags_first_then_units_within_a_names_list() -> None:
+    tags = {
+        "eps_basic": ["us-gaap:EarningsPerShareBasic", "us-gaap:EarningsPerShareBasicAndDiluted"]
+    }
+    data = payload({"EarningsPerShareBasic": [entry(K2020, FY2020, 1.0)]}, unit="USD")
+    data["facts"]["us-gaap"]["EarningsPerShareBasic"]["units"]["USD/shares"] = [
+        entry(K2020, FY2020, 2.0)
+    ]
+    data["facts"]["us-gaap"]["EarningsPerShareBasicAndDiluted"] = {
+        "units": {"USD/shares": [entry(K2020, FY2020, 3.0)]}
+    }
+    units = {"eps_basic": ["USD/shares", "USD"]}
+    (row,) = parse_statement_facts(data, tags, FORMS, UNITS, ACCEPTANCE, units).records
+    assert (row.xbrl_tag, row.unit, row.value) == (
+        "us-gaap:EarningsPerShareBasic",
+        "USD/shares",
+        2.0,
+    )
+    # the tag outranks the unit: the first tag's lower-ranked unit beats a later tag's first unit
+    only_usd = payload({"EarningsPerShareBasic": [entry(K2020, FY2020, 1.0)]}, unit="USD")
+    only_usd["facts"]["us-gaap"]["EarningsPerShareBasicAndDiluted"] = {
+        "units": {"USD/shares": [entry(K2020, FY2020, 3.0)]}
+    }
+    (row,) = parse_statement_facts(only_usd, tags, FORMS, UNITS, ACCEPTANCE, units).records
+    assert (row.xbrl_tag, row.unit, row.value) == ("us-gaap:EarningsPerShareBasic", "USD", 1.0)
+
+
+def test_an_empty_map_leaves_the_existing_names_output_unchanged() -> None:
+    data = payload(
+        {
+            "Revenues": [
+                entry(K2020, FY2020, 300),
+                entry(K2020, FY2020, 301),  # a conflict
+                entry(K2020, FY2019, 200),
+            ],
+            "Assets": [entry(K2020, "2020-12-31", 900)],
+        }
+    )
+    data["facts"]["us-gaap"]["GrossProfit"] = {"units": {"EUR": [entry(K2020, FY2020, 5)]}}
+    base = parse_statement_facts(data, TAGS, FORMS, UNITS, ACCEPTANCE)
+    assert parse_statement_facts(data, TAGS, FORMS, UNITS, ACCEPTANCE, {}) == base
+    explicit = {name: list(UNITS) for name in TAGS}
+    assert parse_statement_facts(data, TAGS, FORMS, UNITS, ACCEPTANCE, explicit) == base
+    assert base.non_unit == 1 and len(base.conflicts) == 1
+
+
+def test_statement_cache_key_is_unchanged_with_an_empty_map(tmp_path: Path) -> None:
+    import hashlib
+
+    settings = _settings(tmp_path)
+    source = _adapter(settings, EdgarRouter())
+    edgar = settings.edgar
+    old = hashlib.sha256(json.dumps([edgar.statement_tags, edgar.statement_units]).encode())
+    assert source._statement_key(K2022) == f"{K2022}|{old.hexdigest()[:16]}"
+
+
+def test_statement_cache_key_changes_with_a_non_empty_map(tmp_path: Path) -> None:
+    plain = _adapter(_settings(tmp_path), EdgarRouter())
+    mapped = _adapter(
+        _settings(
+            tmp_path,
+            statement_tags={**TAGS, "eps_basic": ["us-gaap:EarningsPerShareBasic"]},
+            statement_fact_units={"eps_basic": ["USD/shares"]},
+        ),
+        EdgarRouter(),
+    )
+    assert plain._statement_key(K2022) != mapped._statement_key(K2022)
+
+
 # --- 10-K/A vintage ------------------------------------------------------------
 
 

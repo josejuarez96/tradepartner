@@ -23,8 +23,12 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    IncrementalIndexResult,
+    IncrementalIndexState,
+    SecFormFiling,
     StatementFactRecord,
 )
+from tradepartner.store.filing_index import FilingRow
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: Sort key floor for a `StatementFactRecord.accepted_at` of `None` (an
@@ -48,9 +52,12 @@ class FixtureFilingSource(FilingSource):
         delistings: Iterable[DelistingFiling] = (),
         statement_facts: Iterable[StatementFactRecord] = (),
         filing_events: Iterable[FilingEvent] = (),
+        sec_forms_13d: Iterable[SecFormFiling] = (),
         filename_listings: Iterable[FilenameListing] = (),
+        incremental_rows: Iterable[FilingRow] = (),
     ) -> None:
         self._index = sorted(index, key=lambda e: (e.accepted_at, e.accession, e.cik))
+        self._incremental_rows = tuple(incremental_rows)
         self._snapshot = sorted(snapshot, key=lambda e: (e.fetched_at, e.cik, e.ticker))
         self._facts = sorted(facts, key=lambda e: (e.accepted_at, e.accession, e.fact_name))
         self._headers = sorted(headers, key=lambda e: (e.accepted_at, e.accession))
@@ -59,6 +66,7 @@ class FixtureFilingSource(FilingSource):
         self._filing_events = sorted(
             filing_events, key=lambda e: (e.accepted_at, e.accession, e.cik)
         )
+        self._sec_forms_13d = sorted(sec_forms_13d, key=lambda e: (e.accepted_at, e.accession))
         self._filename_listings = sorted(
             filename_listings, key=lambda e: (e.accepted_at, e.accession, e.ticker)
         )
@@ -108,7 +116,9 @@ class FixtureFilingSource(FilingSource):
             cover_pages=[e for e in self._cover_pages if e.accepted_at <= t],
             delistings=[e for e in self._delistings if e.accepted_at <= t],
             filing_events=[e for e in self._filing_events if e.accepted_at <= t],
+            sec_forms_13d=[e for e in self._sec_forms_13d if e.accepted_at <= t],
             filename_listings=[e for e in self._filename_listings if e.accepted_at <= t],
+            incremental_rows=[e for e in self._incremental_rows if e.known_at <= t],
         )
 
     def known_ats(self) -> list[datetime]:
@@ -120,11 +130,31 @@ class FixtureFilingSource(FilingSource):
         stamps |= {e.accepted_at for e in self._cover_pages}
         stamps |= {e.accepted_at for e in self._delistings}
         stamps |= {e.accepted_at for e in self._filing_events}
+        stamps |= {e.accepted_at for e in self._sec_forms_13d}
         stamps |= {e.accepted_at for e in self._filename_listings}
         return sorted(stamps)
 
     def filing_index(self, since: datetime | None = None) -> list[FilingIndexEntry]:
         return [e for e in self._index if since is None or e.accepted_at >= since]
+
+    def incremental_index(self, state: IncrementalIndexState) -> IncrementalIndexResult:
+        """Propose only fixture rows visible by this run, without changing state."""
+        now = ensure_tz_aware_utc(state.now, field_name="state.now")
+        stored = {(r.cik, r.accession, r.known_at) for r in state.stored}
+        rows = tuple(
+            r
+            for r in self._incremental_rows
+            if r.known_at <= now and (r.cik, r.accession, r.known_at) not in stored
+        )
+        return IncrementalIndexResult(
+            rows,
+            state.pending,
+            state.filers,
+            (),
+            {"index_added": len(rows)},
+            frozenset(),
+            tuple(True for _ in rows),
+        )
 
     def companies_snapshot(self) -> list[CompanySnapshotEntry]:
         return list(self._snapshot)
@@ -146,6 +176,13 @@ class FixtureFilingSource(FilingSource):
 
     def filing_events(self, cik: str) -> list[FilingEvent]:
         return [e for e in self._filing_events if e.cik == cik]
+
+    def sec_forms_13d(self, subjects: frozenset[str] | None = None) -> list[SecFormFiling]:
+        return [
+            filing
+            for filing in self._sec_forms_13d
+            if subjects is None or any(cik in subjects for cik in filing.subject_ciks)
+        ]
 
     def filename_listings(self, cik: str) -> list[FilenameListing]:
         return [e for e in self._filename_listings if e.cik == cik]

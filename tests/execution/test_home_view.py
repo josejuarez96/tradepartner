@@ -22,7 +22,7 @@ from tradepartner.dashboard import research_page
 from tradepartner.execution import home_view, ops
 from tradepartner.execution.waiting import KIND_ORDER, WaitingItem
 from tradepartner.store import schema
-from tradepartner.store.db import open_for_write, open_read_only
+from tradepartner.store.db import open_for_write, open_read_only, utc_now
 from tradepartner.store.journal import (
     PaperReportRow,
     PaperRunResultRow,
@@ -82,6 +82,7 @@ def test_items_come_out_most_urgent_first() -> None:
     kinds = [n.kind for n in home_view._needs_you(items, (late,))]
     assert kinds == [
         "kill_switch_engaged",
+        "reconcile_break",
         "order_lagging",
         "overdue_delisting",
         "missed_run",
@@ -122,12 +123,39 @@ def _summary(book: str = "main", *, engaged: bool = False, **over: Any) -> Any:
         "last_run_session": date(2026, 10, 2),
         "last_run_status": "ok",
         "window": SimpleNamespace(first_rebalance_session=date(2026, 9, 30)),
+        "restricted": (),
     }
     return SimpleNamespace(**{**fields, **over})
 
 
-def _need(kind: str) -> home_view.NeedsYou:
-    return home_view.NeedsYou("main", kind, "t", "s.", "a")
+def _need(kind: str, *, aged: bool = False) -> home_view.NeedsYou:
+    return home_view.NeedsYou("main", kind, "t", "s.", "a", aged=aged)
+
+
+def test_an_open_break_is_amber_and_says_the_book_is_not_halted() -> None:
+    # #2266 item 12: a book with only breaks is restricted, not halted
+    line = home_view._status(Settings(_env_file=None), (_summary(),), (_need("reconcile_break"),))
+    assert line.level == "amber"
+    assert "restricted" in line.text and "not halted" in line.text
+
+
+def test_an_aged_break_turns_the_status_line_red_without_calling_the_book_halted() -> None:
+    needs = (_need("reconcile_break", aged=True),)
+    line = home_view._status(Settings(_env_file=None), (_summary(),), needs)
+    assert line.level == "red" and "halted" not in line.text.replace("not halted", "")
+
+
+def test_an_aged_break_item_carries_aged_and_the_true_up_command() -> None:
+    item = WaitingItem(
+        book_id="daily",
+        kind="reconcile_break",
+        since=date(2026, 10, 1),
+        detail="RAW DETAIL",
+        command='tradepartner paper true-up --book daily --break 1:S:2 --reason "<why>"',
+        aged=True,
+    )
+    (out,) = home_view._needs_you((item,), ())
+    assert out.aged and out.action == item.command and "too long" in out.title
 
 
 def test_the_status_line_is_normal_with_nothing_waiting() -> None:
@@ -163,6 +191,9 @@ def test_the_pill() -> None:
     assert home_view._pill(_summary()) == "Trading"
     assert home_view._pill(_summary(last_run_session=None)) == "Starts Wednesday"
     assert home_view._pill(_summary(engaged=True)) == "Halted"
+    # #2266 item 12: restricted, not halted, while the switch is off
+    assert home_view._pill(_summary(restricted=("AAPL",))) == "Restricted"
+    assert home_view._pill(_summary(engaged=True, restricted=("AAPL",))) == "Halted"
     assert home_view._pill(_summary(is_open=False)) == "Closed"
 
 
@@ -282,7 +313,7 @@ def test_strategy_sentence_uses_the_blurb_then_the_registry_title(
     blurbs = tmp_path / "b.toml"
     blurbs.write_text('[blurbs]\n"h1-momentum-12-1" = "Holds last year\'s winners."\n')
     with open_read_only(store) as conn:
-        (main,) = (s for s in ops.book_summaries(conn, store) if s.book_id == "main")
+        (main,) = (s for s in ops.book_summaries(conn, store, now=utc_now()) if s.book_id == "main")
         assert home_view.strategy_sentence(conn, main, blurbs) == "Holds last year's winners."
         blurbs.write_text('[blurbs]\n"another-slug" = "Not this one."\n')
         assert home_view.strategy_sentence(conn, main, blurbs) == "Registry title"
@@ -323,6 +354,29 @@ def test_build_cards_status_and_needs_on_a_seeded_store(store: Settings) -> None
     assert view.status.level == "red" and "h is halted" in view.status.text
     assert next(n.kind for n in view.needs_you) == "kill_switch_engaged"
     assert view.research == home_view.ResearchStrip("Nothing new yet", None, None, "research")
+
+
+def test_home_card_keeps_only_owner_notes_from_the_latest_run(store: Settings) -> None:
+    raw = "paper_phase started=1; check fill; paper_phase finished=2"
+    with open_for_write(store) as conn:
+        conn.execute(
+            "UPDATE paper_run_results SET message = ? WHERE run_id = "
+            "(SELECT max(r.run_id) FROM paper_runs r JOIN paper_windows w "
+            "ON w.window_id = r.window_id WHERE w.book_id = 'main')",
+            [raw],
+        )
+    main = next(card for card in _build(store).books if card.book_id == "main")
+    assert main.last_run_message == "check fill"
+    with open_read_only(store) as conn:
+        assert conn.execute(
+            "SELECT s.message FROM paper_run_results s JOIN paper_runs r USING (run_id) "
+            "JOIN paper_windows w USING (window_id) WHERE w.book_id = 'main' "
+            "ORDER BY r.run_id DESC LIMIT 1"
+        ).fetchone() == (raw,)
+    with open_for_write(store) as conn:
+        conn.execute("UPDATE paper_run_results SET message = 'paper_phase only=1'")
+    main = next(card for card in _build(store).books if card.book_id == "main")
+    assert main.last_run_message is None
 
 
 def test_a_book_with_only_a_normal_run_shows_everything_running_normally(
@@ -373,10 +427,10 @@ def test_a_fact_known_after_now_moves_nothing(store: Settings) -> None:
 
 
 def test_the_read_stays_within_half_the_lock_retry_seconds(store: Settings) -> None:
-    # A short wait (4 s, budget 2 s) still well below the 60 s default; one warm-up build
+    # A short wait (8 s, budget 4 s) still well below the 60 s default; one warm-up build
     # first, so one-time costs (the XNYS calendar, imports) stay out of the timing and it
     # measures the store reads (about 0.4 s on a laptop, about 1 s on a CI runner).
-    fast = Settings(_env_file=None, store={"path": store.store.path, "lock_retry_seconds": 4})
+    fast = Settings(_env_file=None, store={"path": store.store.path, "lock_retry_seconds": 8})
     all_sessions()
     _build(fast)
     # Best of 3: the bound guards the read, not a busy CI runner (#2348).
@@ -427,6 +481,23 @@ def _data(
 def test_data_is_up_to_date_through_the_last_session(monkeypatch: pytest.MonkeyPatch) -> None:
     out = _data(monkeypatch, message="ok", gaps=0, summaries=(_summary(),))
     assert out.text == "Data is up to date through 2026-10-02" and out.records == 0
+
+
+def test_owner_allocation_does_not_advance_home_data_date(
+    monkeypatch: pytest.MonkeyPatch, store: Settings
+) -> None:
+    monday = datetime(2026, 10, 5, 22, tzinfo=UTC)
+    allocation_time = monday - timedelta(minutes=30)
+    with open_for_write(store) as conn:
+        conn.execute(
+            "INSERT INTO spinoff_allocations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ["P", "C", date(2026, 10, 5), 0.3, allocation_time, allocation_time, "owner", "owner"],
+        )
+    monkeypatch.setattr(health, "last_ingests", lambda _c, _t: ())
+    monkeypatch.setattr(health, "bar_gaps", lambda _c, _t: SimpleNamespace(names_with_gaps=0))
+    with open_read_only(store) as conn:
+        out = home_view._data_status(conn, (), monday)
+    assert out.text == "Data is up to date through 2026-10-02"
 
 
 def test_open_quarantined_filings_and_bar_holes_need_tidying_not_affecting_trading(

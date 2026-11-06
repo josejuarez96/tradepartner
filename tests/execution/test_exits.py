@@ -54,6 +54,8 @@ class Flags:
 
     tradable: bool = True
     fractionable: bool = True
+    shortable: bool = True
+    easy_to_borrow: bool = True
 
 
 def _assets(*names: str, **overrides: Flags) -> dict[str, Flags]:
@@ -138,6 +140,126 @@ def _forced(
         session=S,
         pending_rebalance=PENDING,
     )
+
+
+def test_short_cover_reasons_on_hand_journal() -> None:
+    from tradepartner.execution.exits import forced_covers
+
+    covers = forced_covers(
+        {"DELIST": 2.0, "DRIFT": 4.0, "BORROW": 3.0},
+        {"DELIST": PREVIOUS},
+        _assets(BORROW=Flags(easy_to_borrow=False), DELIST=Flags(), DRIFT=Flags()),
+        (),
+        {},
+        {"DELIST": 10.0, "DRIFT": 30.0, "BORROW": 10.0},
+        equity=1000.0,
+        short_cover_weight=0.10,
+        session=S,
+        pending_rebalance=PENDING,
+    )
+    assert [(c.security_id, c.reason, c.planned_quantity) for c in covers] == [
+        ("BORROW", "cover_not_borrowable", 3.0),
+        ("DELIST", "cover_delisted", 2.0),
+        ("DRIFT", "cover_drift", 4.0),
+    ]
+    assert all(
+        c.row(run_id=1, known_at=NOW, ingested_at=NOW, book_id="main").side == "buy" for c in covers
+    )
+    assert all(
+        c.row(run_id=1, known_at=NOW, ingested_at=NOW, book_id="main").position_side == "short"
+        for c in covers
+    )
+
+
+def test_short_cover_uses_config_threshold_and_blocks_open_decision() -> None:
+    from tradepartner.execution.exits import forced_covers
+
+    open_exit = replace(_decision(1, "BLOCK"), side="buy", position_side="short")
+    args = (
+        {"EDGE": 5.0, "BLOCK": 5.0},
+        {},
+        _assets("EDGE", "BLOCK"),
+        (open_exit,),
+        {1: OPEN},
+        {"EDGE": 20.0, "BLOCK": 30.0},
+    )
+    covers = forced_covers(
+        *args, equity=1000.0, short_cover_weight=0.09, session=S, pending_rebalance=PENDING
+    )
+    assert [c.security_id for c in covers] == ["EDGE"]
+    assert (
+        forced_covers(
+            *args, equity=1000.0, short_cover_weight=0.10, session=S, pending_rebalance=PENDING
+        )
+        == []
+    )
+
+
+def test_short_cover_respects_in_flight_cover_and_long_decisions() -> None:
+    from tradepartner.execution.exits import forced_covers
+
+    long_exit = _decision(1, "SAME")
+    covers = forced_covers(
+        {"SAME": 3.0, "OPEN": 3.0},
+        {"SAME": PREVIOUS, "OPEN": PREVIOUS},
+        _assets("SAME", "OPEN"),
+        (long_exit,),
+        {1: OPEN},
+        {},
+        equity=1000.0,
+        short_cover_weight=0.1,
+        session=S,
+        pending_rebalance=PENDING,
+        open_covers={"OPEN"},
+    )
+    assert [(c.security_id, c.reason) for c in covers] == [("SAME", "cover_delisted")]
+
+
+def test_delisted_short_without_mark_is_covered_and_untradable_is_closed() -> None:
+    from tradepartner.execution.exits import forced_covers
+
+    covers = forced_covers(
+        {"ENDED": 3.0, "HARD": 2.0},
+        {"ENDED": PREVIOUS},
+        _assets(ENDED=Flags(tradable=False), HARD=Flags(easy_to_borrow=False)),
+        (),
+        {},
+        {},
+        equity=1000.0,
+        short_cover_weight=0.1,
+        session=S,
+        pending_rebalance=PENDING,
+    )
+    assert [(c.reason, c.skipped_reason) for c in covers] == [
+        ("cover_delisted", "untradable"),
+        ("cover_not_borrowable", None),
+    ]
+
+
+def test_short_decision_does_not_block_long_forced_exit() -> None:
+    short = replace(_decision(1, "AAA"), side="buy", position_side="short")
+    exits = _forced(
+        {"AAA": 2.0}, listings_at={"AAA": PREVIOUS}, decisions=(short,), states={1: OPEN}
+    )
+    assert [(e.security_id, e.reason) for e in exits] == [("AAA", "delisted")]
+
+
+def test_nonpositive_equity_forces_every_short_to_cover() -> None:
+    from tradepartner.execution.exits import forced_covers
+
+    covers = forced_covers(
+        {"AAA": 2.0},
+        {},
+        _assets("AAA"),
+        (),
+        {},
+        {"AAA": 5.0},
+        equity=0.0,
+        short_cover_weight=0.10,
+        session=S,
+        pending_rebalance=None,
+    )
+    assert [(c.security_id, c.reason) for c in covers] == [("AAA", "cover_drift")]
 
 
 # --- forced_exits ------------------------------------------------------------------

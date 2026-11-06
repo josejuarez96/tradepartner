@@ -7,7 +7,7 @@ console script installed beside it (the CLI module is never named or imported
 here), list form, no shell. Three argv shapes exist, every option in
 `--name=value` form and the positional after `--`:
 
-* `sweep run [--note=<n>] -- <slug>`
+* `sweep run [--time-budget-minutes=<n>] [--note=<n>] -- <slug>`
 * `backtest --start=<d> --end=<d> [--note=<n>] -- <slug>`
 * `sweep register -- <absolute path>`
 
@@ -37,6 +37,7 @@ project root as its working directory. Waiting on the child and the slot are
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import stat
@@ -127,9 +128,27 @@ def _base() -> list[str]:
     return [sys.executable, str(_entry_point())]
 
 
-def sweep_run_argv(slug: str, note: str | None, settings: Settings) -> list[str]:
-    """`sweep run [--note=<n>] -- <slug>`."""
-    return [*_base(), "sweep", "run", *_note_option(note, settings), "--", check_slug(slug)]
+def sweep_run_argv(
+    slug: str, note: str | None, settings: Settings, *, time_budget_minutes: float | None = None
+) -> list[str]:
+    """`sweep run [--time-budget-minutes=<n>] [--note=<n>] -- <slug>`."""
+    if time_budget_minutes is not None and (
+        isinstance(time_budget_minutes, bool)
+        or not isinstance(time_budget_minutes, (int, float))
+        or not math.isfinite(time_budget_minutes)
+        or time_budget_minutes <= 0
+    ):
+        raise LabRefused("The time budget must be a positive number of minutes.")
+    budget = [] if time_budget_minutes is None else [f"--time-budget-minutes={time_budget_minutes}"]
+    return [
+        *_base(),
+        "sweep",
+        "run",
+        *budget,
+        *_note_option(note, settings),
+        "--",
+        check_slug(slug),
+    ]
 
 
 def backtest_argv(
@@ -287,13 +306,16 @@ def spawn(
     note: str | None = None,
     start: date | None = None,
     end: date | None = None,
+    time_budget_minutes: float | None = None,
 ) -> Spawned:
     """Start one `sweep run` or `backtest` child and return at once (module
     docstring). `conn` is the caller's short read-only connection, used only to
     find `slug`. `LabRefused` when any check fails, before anything starts."""
     if kind is LabKind.SWEEP_RUN:
-        argv = sweep_run_argv(slug, note, settings)
+        argv = sweep_run_argv(slug, note, settings, time_budget_minutes=time_budget_minutes)
     else:
+        if time_budget_minutes is not None:
+            raise LabRefused("A time budget applies only to a sweep run.")
         if start is None or end is None:
             raise LabRefused("A backtest needs a first and a last session.")
         argv = backtest_argv(slug, start, end, note, settings)

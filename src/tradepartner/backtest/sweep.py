@@ -799,6 +799,8 @@ def _rule_differences(
     defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
     for key, rule in sorted(rules.fixed_params.items()):
         value = params.get(key)
+        if frozen.borrow_axis_allows(key, params):
+            continue
         if key in frozen.HIGHER_ALLOWED_COST_KEYS:
             if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
                 continue
@@ -821,6 +823,8 @@ def _rule_differences(
             differences.append(compared(key, rule, value))
     for key, value in sorted(family_rule_params(params).items()):
         if key in rules.fixed_params:
+            continue
+        if frozen.borrow_axis_allows(key, params):
             continue
         # A frozen key that landed after the rules were written, at its behaviour-
         # preserving default, is the rules' behaviour; any other value is not.

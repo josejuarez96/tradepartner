@@ -57,13 +57,21 @@ journal. Nothing here reads a clock or the store.
   **cash in lieu** rounds the name's exact holding down to whole shares and
   disposes of the fraction FIFO at the journaled cash; **`corporate_action_cash`**
   closes the name's lots FIFO as one sale at its cash; a **spin-off receipt**
-  opens a zero-basis lot on its session (or, when `explanation_json` names
-  `parent_security_id` and `basis_allocation`, moves that share of the parent's
-  basis to it); a **carried residue** opens a zero-basis lot on its session; a
+  naming no parent opens a zero-basis lot on its session; naming `parent_security_id`
+  it opens one child lot per parent lot open at the close before its `ex_date`,
+  dated as that lot (IRC 1223(1)) and taking `basis_allocation` (zero when absent)
+  of the basis still open on it; a **carried residue** opens a zero-basis lot on its session; a
   **stock merger** (a `corporate_action_cash` and a `merger_receipt` naming one
   `merger_id`) re-keys the target's lots to the acquirer at the ratio of the two
-  quantities, carrying basis and date, with no disposal. A residue or a
-  spin-off child is never a wash-sale replacement. Any corporate action on an
+  quantities, carrying basis and date, with no disposal. A **true-up** (an
+  `auto_true_up` or `owner_true_up` row with a quantity, paper spec amendment
+  2026-10-26 #2266, item 9) states the name at the broker's absolute quantity
+  its `explanation_json` carries: a shortfall of lots opens one zero-basis lot
+  on the row's session, an excess closes lots first in, first out at zero
+  proceeds (cash is booked by its own rows). The lots are compared with the
+  absolute figure, not the row's delta, so a split the true-up suppressed
+  never leaves the lots and the positions ledger apart. A residue, a true-up
+  lot or a spin-off child is never a wash-sale replacement. Any corporate action on an
   open short lot raises (short lots are Phase 6).
 
 Amounts are computed in `Fraction` from each float's `repr`, so FIFO residues
@@ -88,7 +96,13 @@ import polars as pl
 
 from tradepartner.adapters.broker import Asset
 from tradepartner.calendar import session_close
-from tradepartner.execution.ledger import _split_ratio
+from tradepartner.execution.ledger import (
+    TRUE_UP_KINDS,
+    _split_ratio,
+    reversed_adjustment_id,
+    reversed_true_up_ids,
+    true_up_quantity,
+)
 from tradepartner.store.journal import AdjustmentRow, OrderedFill, OrderRow
 from tradepartner.store.schema import LONG
 
@@ -108,6 +122,9 @@ _RANK_SPLIT = 0
 _RANK_CASH_IN_LIEU = 1
 _RANK_FILL = 2
 _RANK_ADJUSTMENT = _RANK_FILL + 1
+# A true-up states its name after every other row of its session, and a fill
+# journaled after it (the broker's figure did not hold it) comes after the true-up.
+_RANK_TRUE_UP = _RANK_ADJUSTMENT + 1
 
 _SPLIT = "split"
 _CASH_IN_LIEU = "cash_in_lieu"
@@ -122,6 +139,11 @@ _MERGER_KEY = "merger_id"
 #: `corporate_action_cash` row that is part of the proceeds of the ended-listing
 #: removal row before it.
 _DELISTING_KEY = "delisting_cash"
+#: The `explanation_json` key of a spin-off receipt's ex-date (ISO), the day
+#: whose previous close fixes the parent lots entitled to the child.
+_EX_DATE_KEY = "ex_date"
+#: Sorts a parent snapshot before every other event of its ex-date.
+_RANK_SNAPSHOT = -1
 
 
 class LotLedgerError(ValueError):
@@ -210,6 +232,7 @@ class _Trade:
     client_order_id: str
     book_id: str  # the order's book (ADR 0015 seam 1, plan T133)
     position_side: str = LONG  # the order's `position_side` (T232)
+    known_at: datetime | None = None  # when its latest fill was journaled
 
 
 @dataclass
@@ -288,6 +311,9 @@ class _Ledger:
         self.longs: dict[str, list[_OpenLot]] = {}
         self.shorts: dict[str, list[_OpenLot]] = {}
         self.no_replacement: set[int] = set()  # lots no purchase made (never a replacement)
+        #: The parent's open lots at the close before a spin-off's ex-date,
+        #: keyed by (parent, ex_date): each lot with its quantity then.
+        self.parent_snapshots: dict[tuple[str, date], list[tuple[_OpenLot, Fraction]]] = {}
 
     # -- lots and disposals ------------------------------------------------------
 
@@ -616,26 +642,48 @@ class _Ledger:
                 book_id=None,
             )
 
+    def snapshot_parent(self, parent: str, ex_date: date) -> None:
+        """Record the parent's open long lots and their quantities as they stand
+        before any event of `ex_date`, which is the close of the session before
+        it. A spin-off's entitlement is fixed there (IRC 1223(1), paper spec
+        amendment #1976 item 3), whatever is bought or sold before the receipt."""
+        key = (parent, ex_date)
+        if key not in self.parent_snapshots:
+            self.parent_snapshots[key] = [
+                (lot, lot.quantity) for lot in self.longs.get(parent, []) if lot.quantity > _ZERO
+            ]
+
     def spinoff(self, row: AdjustmentRow) -> None:
-        """A spin-off child: one zero-basis lot on the session, unless the row
-        names the parent and the fraction of its basis that moves to the child."""
+        """A spin-off child. A row naming no parent opens one zero-basis lot on
+        its session. A row naming the parent opens one child lot per parent lot
+        open at the close before the ex-date, carrying that lot's acquisition
+        instant and `basis_allocation` (zero when absent) times the basis still
+        open on it; a parent with no such lot opens one zero-basis lot on the
+        session (paper spec amendment #1976 item 3)."""
         child = _security(row)
         self.refuse_short(child, row.kind)
         _require_long_delta(row, negative=False)
-        moved = _ZERO
         terms = _explanation(row)
         parent, allocation = terms.get("parent_security_id"), terms.get("basis_allocation")
-        if parent is not None and allocation is not None:
-            if not isinstance(parent, str):
-                raise LotLedgerError(f"spin-off {_describe(row)} names parent {parent!r}")
-            self.refuse_short(parent, row.kind)
-            fraction = _allocation(allocation, row)
-            for lot in self.longs.get(parent, []):
-                share = lot.basis * fraction
-                lot.basis -= share
-                lot.reported_basis -= share
-                moved += share
-        self._receipt(row, child, moved)
+        if parent is None:
+            self._receipt(row, child, _ZERO)
+            return
+        if not isinstance(parent, str):
+            raise LotLedgerError(f"spin-off {_describe(row)} names parent {parent!r}")
+        self.refuse_short(parent, row.kind)
+        fraction = _ZERO if allocation is None else _allocation(allocation, row)
+        entitled = self.parent_snapshots.get((parent, _spinoff_ex_date(row)), [])
+        total = sum((quantity for _, quantity in entitled), _ZERO)
+        if total == _ZERO:
+            self._receipt(row, child, _ZERO)
+            return
+        received = _exact(row.quantity)
+        for lot, quantity in entitled:
+            moved = lot.basis * fraction
+            lot.basis -= moved
+            lot.reported_basis -= moved
+            self._receipt(row, child, moved, received * quantity / total, trade_at=lot.trade_at)
+        self.longs[child].sort(key=lambda held: (held.trade_at, held.lot_id))
 
     def residue(self, row: AdjustmentRow) -> None:
         """A residue carried into the window: a zero-basis lot on its session."""
@@ -644,12 +692,55 @@ class _Ledger:
         _require_long_delta(row, negative=False)
         self._receipt(row, security, _ZERO)
 
-    def _receipt(self, row: AdjustmentRow, security: str, basis: Fraction) -> None:
+    def true_up(self, row: AdjustmentRow) -> None:
+        """A true-up states the name at the broker's absolute quantity (item 9):
+        open a zero-basis lot for a shortfall, or close lots FIFO at zero
+        proceeds for an excess. A true-up on a name with an open short lot
+        raises (short lots are Phase 6)."""
+        absolute = true_up_quantity(row)
+        if absolute is None:
+            return  # a cash part or an acknowledged finding (no security_id): no lot effect
+        security = _security(row)
+        self.refuse_short(security, row.kind)
+        held = self.longs.get(security, [])
+        gap = _exact(absolute) - sum((lot.quantity for lot in held), _ZERO)
+        if gap > _ZERO:
+            lot = self.open_lot(
+                security,
+                self.symbol_of(security),
+                _session_at(row),
+                gap,
+                _ZERO,
+                fill_id=None,
+                client_order_id=_placeholder(row),
+                book_id=row.book_id,
+            )
+            self.no_replacement.add(lot.lot_id)
+        elif gap < _ZERO:
+            closed = _close_fifo(held, -gap, _describe(row))
+            self.dispose(
+                closed,
+                lambda sold: _ZERO,
+                trade_at=_session_at(row),
+                fill_id=None,
+                client_order_id=_placeholder(row),
+                book_id=None,
+            )
+
+    def _receipt(
+        self,
+        row: AdjustmentRow,
+        security: str,
+        basis: Fraction,
+        quantity: Fraction | None = None,
+        *,
+        trade_at: datetime | None = None,
+    ) -> None:
         lot = self.open_lot(
             security,
             self.symbol_of(security),
-            _session_at(row),
-            _exact(row.quantity),
+            _session_at(row) if trade_at is None else trade_at,
+            _exact(row.quantity) if quantity is None else quantity,
             basis,
             fill_id=None,
             client_order_id=_placeholder(row),
@@ -724,6 +815,21 @@ def _allocation(value: object, row: AdjustmentRow) -> Fraction:
     if not _ZERO <= fraction <= 1:
         raise LotLedgerError(f"spin-off {_describe(row)} has basis_allocation {value!r}")
     return fraction
+
+
+def _spinoff_ex_date(row: AdjustmentRow) -> date:
+    """The ex-date a spin-off receipt names in its `explanation_json` (`ex_date`,
+    ISO), else the receipt's own session; never later than the session."""
+    value = _explanation(row).get(_EX_DATE_KEY)
+    if value is None:
+        return row.session
+    if not isinstance(value, str):
+        raise LotLedgerError(f"spin-off {_describe(row)} has ex_date {value!r}")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        raise LotLedgerError(f"spin-off {_describe(row)} has ex_date {value!r}") from None
+    return min(parsed, row.session)
 
 
 def _merger_id(row: AdjustmentRow) -> str | None:
@@ -857,19 +963,43 @@ def _events(
                     partial(_Ledger.split, security_id=security_id, ratio=_split_ratio(ratio)),
                 )
             )
-    for trade in _trades(fills, orders):
+    try:
+        reversed_ids = reversed_true_up_ids(adjustments, through or date.max)
+    except ValueError as exc:
+        raise LotLedgerError(str(exc)) from exc
+    active_adjustments = [
+        r
+        for r in adjustments
+        if r.adjustment_id not in reversed_ids and reversed_adjustment_id(r) is None
+    ]
+    true_ups = [
+        r
+        for r in active_adjustments
+        if r.kind in TRUE_UP_KINDS
+        and r.quantity is not None
+        and (through is None or r.session <= through)
+    ]
+    for trade in _trades(fills, orders, true_ups):
+        day = trade.trade_at.astimezone(_EXCHANGE_TZ).date()
+        after_true_up = trade.known_at is not None and any(
+            r.security_id == trade.security_id and r.session == day and r.known_at < trade.known_at
+            for r in true_ups
+        )
         events.append(
             (
                 (
-                    trade.trade_at.astimezone(_EXCHANGE_TZ).date(),
-                    _RANK_FILL,
-                    trade.trade_at,
+                    day,
+                    _RANK_TRUE_UP if after_true_up else _RANK_FILL,
+                    trade.known_at if after_true_up else trade.trade_at,
+                    # A fill stamped at a true-up's own instant is inside its
+                    # figure: it replays first, whatever the ids (#2479).
+                    0,
                     trade.order_key,
                 ),
                 partial(_Ledger.trade, trade=trade),
             )
         )
-    window = [r for r in adjustments if through is None or r.session <= through]
+    window = [r for r in active_adjustments if through is None or r.session <= through]
     removals = _by_merger(window, _CORPORATE_ACTION_CASH, unique=False)
     receipts = _by_merger(window, _MERGER_RECEIPT, unique=True)
     cash_rows: dict[str, list[AdjustmentRow]] = {}
@@ -906,6 +1036,20 @@ def _events(
                 continue
             cash_rows.setdefault(merger_id, []).append(row)
     late = _late_delisting_cash(window)
+    snapped: set[tuple[str, date]] = set()
+    for row in window:
+        parent = (
+            _explanation(row).get("parent_security_id") if row.kind == _SPINOFF_RECEIPT else None
+        )
+        if isinstance(parent, str) and (parent, _spinoff_ex_date(row)) not in snapped:
+            ex_date = _spinoff_ex_date(row)
+            snapped.add((parent, ex_date))
+            events.append(
+                (
+                    (ex_date, _RANK_SNAPSHOT, parent),
+                    partial(_Ledger.snapshot_parent, parent=parent, ex_date=ex_date),
+                )
+            )
     for row in window:
         if _is_late_delisting_cash(row):
             continue  # included with its removal's proceeds
@@ -913,8 +1057,19 @@ def _events(
             row, removals, receipts, cash_rows, band_cash, late.get(id(row), ())
         )
         if action is not None:
-            rank = _RANK_CASH_IN_LIEU if row.kind == _CASH_IN_LIEU else _RANK_ADJUSTMENT
-            events.append(((row.session, rank, *_adjustment_key(row)), action))
+            if row.kind in TRUE_UP_KINDS:
+                # In the order the positions ledger replays them: by the stamp.
+                key: tuple[object, ...] = (
+                    row.session,
+                    _RANK_TRUE_UP,
+                    row.known_at,
+                    1,
+                    row.adjustment_id or 0,
+                )
+            else:
+                rank = _RANK_CASH_IN_LIEU if row.kind == _CASH_IN_LIEU else _RANK_ADJUSTMENT
+                key = (row.session, rank, *_adjustment_key(row))
+            events.append((key, action))
     return events
 
 
@@ -1019,12 +1174,21 @@ def _adjustment_event(
         return partial(_Ledger.spinoff, row=row)
     if row.kind == _CARRIED_RESIDUE:
         return partial(_Ledger.residue, row=row)
+    if row.kind in TRUE_UP_KINDS:
+        return partial(_Ledger.true_up, row=row)
     return None
 
 
-def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_Trade]:
+def _trades(
+    fills: Sequence[OrderedFill],
+    orders: Sequence[OrderRow],
+    true_ups: Sequence[AdjustmentRow] = (),
+) -> list[_Trade]:
     """One `_Trade` per fill, or per order when any of its fills is implied,
-    in trade order."""
+    in trade order. An implied order's fills merge only within the span between
+    two true-ups of its name and session: a true-up holds the fills stamped
+    before it, so a fill caught up by it and a residual added after it are
+    separate trades, each replayed on its own side of the true-up (#2479)."""
     known = {order.client_order_id: order for order in orders}
     by_order: dict[str, list[OrderedFill]] = {}
     for item in fills:
@@ -1046,7 +1210,28 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
             raise LotLedgerError(f"fill {row.fill_id} has a naive filled_at")
         by_order.setdefault(row.client_order_id, []).append(item)
     trades: list[_Trade] = []
-    for group in by_order.values():
+
+    def _span(item: OrderedFill) -> tuple[date, int]:
+        day = item.fill.filled_at.astimezone(_EXCHANGE_TZ).date()
+        earlier = sum(
+            1
+            for r in true_ups
+            if r.security_id == item.security_id
+            and r.session == day
+            and r.known_at < item.fill.known_at
+        )
+        return day, earlier
+
+    spans: list[list[OrderedFill]] = []
+    for whole in by_order.values():
+        if any(item.fill.price_implied for item in whole):
+            split: dict[tuple[date, int], list[OrderedFill]] = {}
+            for item in whole:
+                split.setdefault(_span(item), []).append(item)
+            spans.extend(split.values())
+        else:
+            spans.append(whole)
+    for group in spans:
         parts = [(item, _dec(item.fill.quantity), _dec(item.fill.price)) for item in group]
         if any(item.fill.price_implied for item in group):
             first = min(group, key=lambda item: (item.fill.filled_at, _fill_key(item)))
@@ -1063,6 +1248,7 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
                     client_order_id=first.fill.client_order_id,
                     book_id=known[first.fill.client_order_id].book_id,
                     position_side=known[first.fill.client_order_id].position_side,
+                    known_at=max(item.fill.known_at for item in group),
                 )
             )
             continue
@@ -1079,6 +1265,7 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
                 client_order_id=item.fill.client_order_id,
                 book_id=known[item.fill.client_order_id].book_id,
                 position_side=known[item.fill.client_order_id].position_side,
+                known_at=item.fill.known_at,
             )
             for item, quantity, price in parts
         )

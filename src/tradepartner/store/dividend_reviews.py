@@ -133,13 +133,15 @@ def parse_reviews(text: str) -> tuple[ReviewedGroup, ...]:
     in file order. Raises `ReviewsError`, naming the line, on another header,
     a short or long row, a verdict outside `VERDICTS`, an `ex_date` that is
     not an XNYS session, a non-positive amount, a retract id on a row that
-    is not `duplicate` or none on one that is, or a key listed twice."""
+    is not `duplicate` or none on one that is, a key listed twice, or a
+    retract id assigned to two groups of one security."""
     reader = csv.reader(io.StringIO(text))
     header = next(reader, None)
     if header is None or tuple(header) != COLUMNS:
         raise ReviewsError(f"{_FILE} line 1: header {header!r} is not {list(COLUMNS)}")
     groups: list[ReviewedGroup] = []
     seen: dict[GroupKey, int] = {}
+    retracts: dict[tuple[str, str], tuple[GroupKey, int]] = {}
     for values in reader:
         line = reader.line_num
         if not values:
@@ -151,6 +153,15 @@ def parse_reviews(text: str) -> tuple[ReviewedGroup, ...]:
             raise ReviewsError(
                 f"{_FILE} line {line}: key {group.key} is listed again (line {first})"
             )
+        if group.verdict == DUPLICATE:
+            retract_key = (group.security_id, group.retract_source_action_id)
+            if (prior := retracts.get(retract_key)) is not None:
+                raise ReviewsError(
+                    f"{_FILE} line {line}: retract id {group.retract_source_action_id!r} "
+                    f"belongs to groups {prior[0][0]} {prior[0][1]} {prior[0][2]} "
+                    f"(line {prior[1]}) and {group.security_id} {group.ex_date} {group.amount}"
+                )
+            retracts[retract_key] = (group.key, line)
         seen[group.key] = line
         groups.append(group)
     return tuple(groups)
@@ -223,6 +234,13 @@ def equal_amount_groups(
       whose one identity is the retract id: `violation` (the vendor
       reissued a record, or the kept one is gone), never pending or
       repaired.
+    - a listed `duplicate` whose retract id is live under another key (the
+      vendor re-sent it with a noisy amount or another ex-date, #2980)
+      beside another live identity on the reviewed or the new ex-date:
+      that key and every key of those identities are `violation`, the
+      re-sent key carrying the reviewed row (one payment stored twice, as
+      `execution.reconcile_run` finds it); a re-sent retract id alone on
+      its ex-dates (the kept id gone) is one payment, not returned.
 
     A key with one identity that is not listed, and a listed key with none
     (a store that never held it), are not returned. Sorted by key."""
@@ -235,13 +253,17 @@ def equal_amount_groups(
         key: GroupKey = (str(sid), ex_date, float(amount))
         identities[key][str(action_id)] = known_at
     listed: dict[GroupKey, ReviewedGroup] = {group.key: group for group in reviewed}
+    re_sent = _re_sent_retracts(identities, listed.values())
     out: list[EqualAmountGroup] = []
     for key in sorted(identities.keys() | listed.keys()):
         found = identities.get(key, {})
         group = listed.get(key)
         count = len(found)
         group_class: GroupClass
-        if group is None:
+        if key in re_sent and count:
+            group_class = "violation"  # #2980: one payment, a retract id re-sent beside it
+            group = group if group is not None else re_sent[key]
+        elif group is None:
             if count <= 1:
                 continue
             group_class = "violation"
@@ -268,3 +290,37 @@ def equal_amount_groups(
             )
         )
     return tuple(out)
+
+
+def _re_sent_retracts(
+    identities: dict[GroupKey, dict[str, datetime]], reviewed: Iterable[ReviewedGroup]
+) -> dict[GroupKey, ReviewedGroup]:
+    """#2980: the keys `equal_amount_groups` fails because a listed
+    `duplicate`'s retract id is live under a key other than its reviewed one
+    beside another live identity of the security on the reviewed or the new
+    ex-date: the re-sent key and every such partner's key, each mapped to
+    the reviewed row. Keys compare exactly, never with a tolerance."""
+    by_day: dict[tuple[str, date], list[tuple[str, GroupKey]]] = defaultdict(list)
+    where: dict[tuple[str, str], GroupKey] = {}
+    for key, found in identities.items():
+        for action_id in found:
+            by_day[(key[0], key[1])].append((action_id, key))
+            where[(key[0], action_id)] = key
+    out: dict[GroupKey, ReviewedGroup] = {}
+    for group in reviewed:
+        if group.verdict != DUPLICATE:
+            continue
+        retract = group.retract_source_action_id
+        moved = where.get((group.security_id, retract))
+        if moved is None or moved == group.key:
+            continue
+        partners = {
+            partner_key
+            for ex_date in (group.ex_date, moved[1])
+            for action_id, partner_key in by_day.get((group.security_id, ex_date), ())
+            if action_id != retract
+        }
+        if partners:
+            for flagged in (moved, *partners):
+                out.setdefault(flagged, group)
+    return out

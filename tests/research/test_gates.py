@@ -10,6 +10,7 @@ from tradepartner.calendar import previous_session, session_close
 from tradepartner.research.gates import (
     BudgetDecision,
     ConfirmatoryDecision,
+    Direction,
     Flags,
     HoldoutDecision,
     PriorSpend,
@@ -571,6 +572,30 @@ def test_locked_agreement_run_still_needs_predates_or_sealed_split() -> None:
 
 
 # --- compute_verdict (req 8) ----------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("threshold", [0.0, None])
+@pytest.mark.parametrize("which", ["value", "ci_low", "ci_high"])
+@pytest.mark.parametrize("direction", ["greater", "less"])
+def test_a_non_finite_primary_is_not_computable(
+    bad: float, threshold: float | None, which: str, direction: Direction
+) -> None:
+    # #2617: a NaN bound compares false against any threshold, which made
+    # `direction = greater` a quiet `fail`; it is no evidence instead.
+    bounds = {"value": 0.5, "ci_low": 0.1, "ci_high": 0.9} | {which: bad}
+    assert (
+        compute_verdict(
+            n_clusters=5,
+            min_clusters=30,
+            direction=direction,
+            threshold=threshold,
+            ci_low=bounds["ci_low"],
+            ci_high=bounds["ci_high"],
+            value=bounds["value"],
+        )
+        == "not_computable"
+    )
 
 
 def test_underpowered_beats_an_interval_that_would_otherwise_pass() -> None:

@@ -14,7 +14,9 @@ synthetic stores state their own rows.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -32,11 +34,12 @@ from tradepartner.store.delistings import (
     DelistingBuild,
     build_delistings,
     delistings_as_of,
+    delistings_with_reasons_as_of,
     derive_listing_ends,
     listing_ends_as_of,
     write_delistings,
 )
-from tradepartner.store.master import MasterBuild
+from tradepartner.store.master import MasterBuild, _form25_classes
 
 INGESTED_AT = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
 LATE = datetime(2021, 1, 4, 21, 0, tzinfo=UTC)  # after every fixture event
@@ -203,6 +206,16 @@ def _delisting(sid: str, exchange: str, filed_at: datetime) -> dict[str, Any]:
         "source": "edgar",
         "provenance": "filing",
     }
+
+
+def test_delisting_without_reason_reads_unknown(synthetic: duckdb.DuckDBPyConnection) -> None:
+    filed_at = _at(2020, 1, 2)
+    insert_row(synthetic, "delistings", _delisting("S", "NASDAQ", filed_at))
+    assert delistings_with_reasons_as_of(synthetic, filed_at - timedelta(microseconds=1)).is_empty()
+    rows = delistings_with_reasons_as_of(synthetic, filed_at)
+    assert rows.select("security_id", "reason", "reason_source").rows() == [
+        ("S", "unknown", "unknown")
+    ]
 
 
 def _bar(sid: str, session: date) -> dict[str, Any]:
@@ -692,6 +705,52 @@ class TestOtherClassOnSnapshotListing:
         insert_row(synthetic, "listings", _row("S:class-b", "XB", "NYSE", date(2019, 1, 2), title))
         insert_row(synthetic, "delistings", _form_25("S:class-b", "NYSE", _at(2019, 6, 3), title))
         row = _status(listing_ends_as_of(synthetic, LATE, _settings()), "S:class-b", "NYSE")
+        assert row["status"] == "delisted"
+
+
+class TestDebtFilingOnCommonListing:
+    """#2937: a Form 25 for a debt class (Verizon's 2.375% Notes due 2022,
+    filed 2020-06-15 on NYSE) never ends the common listing. Its own notes
+    listing row was retracted on 2026-10-13, which left the common row as the
+    latest on the exchange and ended VZ with bars still trading."""
+
+    def test_notes_filing_leaves_the_common_listing_listed(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        common = "Common Stock, par value $0.10"
+        insert_row(synthetic, "listings", _row("S", "VZ", "NYSE", date(2019, 8, 8), common))
+        insert_row(
+            synthetic,
+            "delistings",
+            _form_25("S", "NYSE", _ny(2020, 6, 15, 16, 43), "2.375% Notes due 2022"),
+        )
+        row = _status(listing_ends_as_of(synthetic, LATE, _settings()), "S", "NYSE")
+        assert (row["status"], row["end_session"]) == ("listed", None)
+
+    def test_notes_filing_does_not_reopen_close_a_later_common_row(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        """The notes row is ended by its filing; a common row of the same
+        security and exchange that starts after the filing is not closed by it."""
+        notes = "2.375% Notes due 2022"
+        insert_row(synthetic, "listings", _row("S", "VZ22A", "NYSE", date(2019, 10, 30), notes))
+        insert_row(
+            synthetic,
+            "listings",
+            _row("S", "VZ", "NYSE", date(2020, 7, 1), "Common Stock, par value $0.10"),
+        )
+        insert_row(synthetic, "delistings", _form_25("S", "NYSE", _ny(2020, 6, 15, 16, 43), notes))
+        df = listing_ends_as_of(synthetic, LATE, _settings())
+        by_ticker = {r["ticker"]: r["status"] for r in df.iter_rows(named=True)}
+        assert by_ticker == {"VZ22A": "delisted", "VZ": "listed"}
+
+    def test_notes_filing_still_ends_the_notes_listing(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        title = "2.375% Notes due 2022"
+        insert_row(synthetic, "listings", _row("S", "VZ22A", "NYSE", date(2019, 10, 30), title))
+        insert_row(synthetic, "delistings", _form_25("S", "NYSE", _ny(2020, 6, 15, 16, 43), title))
+        row = _status(listing_ends_as_of(synthetic, LATE, _settings()), "S", "NYSE")
         assert row["status"] == "delisted"
 
 
@@ -1240,3 +1299,111 @@ def test_derive_listing_ends_skips_amendment_after_counted_form_25() -> None:
         (date(2019, 8, 9), "delisted", date(2019, 12, 2), "25"),
         (date(2019, 12, 16), "listed", None, None),
     ]
+
+
+# --- #2927: each filing reads its CIK's rows, grouped once per build --------
+
+
+def _old_resolve(filing: DelistingFiling, master: MasterBuild) -> tuple[str, ...]:
+    """`_resolve` as written before #2927: a walk of every security and
+    listing per filing."""
+    known = [s for s in master.successions if s.known_at <= filing.accepted_at]
+    if filing.form.endswith("/A"):
+        excluded = {s.security_id for s in known}
+    else:
+        excluded = {s.predecessor_id for s in known}
+    candidates = {
+        row["security_id"]
+        for row in master.securities
+        if row["cik"] == filing.cik
+        and not row.get("benchmark", False)
+        and row["known_at"] <= filing.accepted_at
+        and row["security_id"] not in excluded
+    }
+    titles: dict[str, list[str | None]] = defaultdict(list)
+    for row in master.listings:
+        if row["security_id"] in candidates and row["exchange"] == filing.exchange:
+            titles[row["security_id"]].append(row["class_title"])
+    return _form25_classes(filing.class_title, titles)
+
+
+class _Counted(tuple[dict[str, Any], ...]):
+    passes = 0
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        type(self).passes += 1
+        return super().__iter__()
+
+
+def _wide_master(ciks: int) -> MasterBuild:
+    """`ciks` issuers with a common, a class B, a warrant and a preferred,
+    titled and untitled, on two exchanges, rows interleaved across CIKs."""
+    classes = (
+        ("", "Class A Common Stock, par value $0.01"),
+        (":b", "Class B Common Stock"),
+        (":warrants", "Warrants"),
+        (":pfd", "6% Preferred Stock"),
+    )
+    securities: list[dict[str, Any]] = []
+    listings: list[dict[str, Any]] = []
+    for n, (suffix, title) in enumerate(classes):
+        for c in range(ciks):
+            cik = f"{7000 + c:010d}"
+            if (c + n) % 4 == 3:
+                continue  # not every issuer has every class
+            sid = f"{cik}{suffix}"
+            securities.append(_sec(sid, cik) | {"known_at": _at(2014 + n, 1, 5)})
+            for exchange in ("NYSE", "NASDAQ")[: 1 + (c % 2)]:
+                listings.append(
+                    _listing(sid, f"T{c}{n}", exchange, date(2015, 1, 6), _at(2015, 1, 5))
+                    | {"class_title": None if (c * n) % 5 == 4 else title}
+                )
+    listings.reverse()  # a later class's rows first: key order follows the walk
+    return MasterBuild(
+        securities=_Counted(securities),
+        listings=_Counted(listings),
+        unmatched_snapshot=(),
+        missing_benchmarks=(),
+    )
+
+
+def test_build_resolves_each_filing_as_the_full_walk_did_reading_rows_once() -> None:
+    """#2927: `_resolve` walked every security and listing of the master per
+    Form 25 (tens of thousands of filings over the whole master). The rows
+    are now grouped once per build, and every filing resolves to the classes,
+    in the order, the walk gave."""
+    master = _wide_master(80)
+    titles = (
+        "Common Stock",
+        "Class A Common Stock",
+        "Class A Common Stock and Class B Common Stock",
+        "Warrants",
+        "6% Preferred Stock, $25 liquidation preference",
+        "Units, Class A Common Stock and Warrants",
+    )
+    filings = [
+        _filing(f"{7000 + c:010d}", title, exchange, _at(2015 + k % 4, 3, 5 + k))
+        for c in range(80)
+        for k, title in enumerate(titles)
+        for exchange in ("NYSE", "NASDAQ")
+        if (c + k) % 3
+    ]
+    filings = [replace(f, accession=f"{f.accession}-{n}") for n, f in enumerate(filings)]
+    _Counted.passes = 0
+    build = build_delistings(filings, master, ingested_at=INGESTED_AT)
+    assert _Counted.passes == 2  # one walk of the securities, one of the listings
+    ordered = sorted(filings, key=lambda f: (f.accepted_at, f.accession))
+    expected = {f.accession: _old_resolve(f, master) for f in ordered}
+    assert [
+        (row["security_id"], row["filed_at"], row["exchange"], row["class_title"])
+        for row in build.delistings
+    ] == [
+        (sid, f.accepted_at, f.exchange, f.class_title)
+        for f in ordered
+        for sid in expected[f.accession]
+    ]
+    assert [f.accession for f in build.unmatched] == [
+        f.accession for f in ordered if not expected[f.accession]
+    ]
+    assert any(len(ids) > 1 for ids in expected.values())
+    assert any(len(ids) == 1 for ids in expected.values())

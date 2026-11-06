@@ -27,6 +27,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import polars as pl
@@ -49,6 +50,7 @@ from tradepartner.store.asof import (
     price_jumps_as_of,
     prices_as_of,
     rates_as_of,
+    spinoff_allocations_as_of,
     statement_facts_as_of,
     symbol_changes_as_of,
 )
@@ -2337,3 +2339,64 @@ def test_spinoff_row_moves_only_the_flagged_read_and_only_the_parents_pre_ex_ses
         ).select((pl.col(col) / pl.col(f"{col}_d")).alias("r"))["r"]
         assert all(abs(r - factor) < 1e-9 for r in ratios)
     assert child != parent
+
+
+def test_owner_spinoff_allocation_command_stamps_now_and_refuses_bad_fractions(
+    tmp_path: Path,
+) -> None:
+    from typer.testing import CliRunner
+
+    from tradepartner import cli
+
+    store = tmp_path / "spinoff.duckdb"
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(store), "lock_retry_seconds": 0},
+        edgar={"cache_dir": str(tmp_path / "edgar-cache")},
+    )
+    with duckdb.connect(str(store)) as conn:
+        schema.init_schema(conn)
+        conn.execute(
+            "INSERT INTO corporate_actions VALUES "
+            "(?, 'spinoff', ?, 0.25, NULL, ?, FALSE, ?, ?, 'fixture', 'action')",
+            [
+                "C",
+                date(2020, 1, 2),
+                "P",
+                datetime(2020, 1, 3, tzinfo=UTC),
+                datetime(2020, 1, 3, tzinfo=UTC),
+            ],
+        )
+    first = datetime(2020, 1, 8, 17, tzinfo=UTC)
+    args = [
+        "spinoff-allocation",
+        "--parent",
+        "P",
+        "--child",
+        "C",
+        "--ex-date",
+        "2020-01-02",
+        "--fraction",
+        "0.25",
+    ]
+
+    def run(at: datetime, argv: list[str]) -> Any:
+        return CliRunner().invoke(cli.make_app(settings=lambda: settings, clock=lambda: at), argv)
+
+    result = run(first, args)
+    assert result.exit_code == 0, result.output
+    with duckdb.connect(str(store)) as conn:
+        assert conn.execute("SELECT known_at, ingested_at FROM spinoff_allocations").fetchall() == [
+            (first, first)
+        ]
+    second = first + timedelta(days=3)
+    assert run(second, [*args[:-1], "0.35"]).exit_code == 0
+    assert run(second, [*args[:2], "UNKNOWN", *args[3:]]).exit_code != 0
+    for bad in ("-0.01", "1.01", "nan", "oops"):
+        result = run(second, [*args[:-1], bad])
+        assert result.exit_code != 0
+    result = run(second, [*args, "--known-at", "2019-01-01T00:00:00+00:00"])
+    assert result.exit_code != 0
+    with duckdb.connect(str(store)) as conn:
+        assert conn.execute("SELECT count(*) FROM spinoff_allocations").fetchone() == (2,)
+        assert spinoff_allocations_as_of(conn, second)["basis_allocation"].to_list() == [0.35]

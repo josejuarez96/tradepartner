@@ -777,6 +777,8 @@ def _rule_differences(record: HypothesisRecord, rules: FamilyRules) -> tuple[str
     defaults = {key: default for key, default, _version in FROZEN_KEY_DEFAULTS}
     for key, rule in sorted(rules.fixed_params.items()):
         value = values.get(key)
+        if _frozen.borrow_axis_allows(key, values):
+            continue
         if key in _frozen.HIGHER_ALLOWED_COST_KEYS:
             if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
                 continue
@@ -796,6 +798,7 @@ def _rule_differences(record: HypothesisRecord, rules: FamilyRules) -> tuple[str
         for key in values
         if key not in rules.fixed_params
         and key.startswith(FORBIDDEN_AXIS_PREFIXES)
+        and not _frozen.borrow_axis_allows(key, values)
         and not (key in defaults and _frozen._cost_key_allows(key, values[key], defaults[key]))
     )
     return tuple(differences)

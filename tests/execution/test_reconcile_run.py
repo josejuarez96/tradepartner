@@ -14,6 +14,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Protocol
 
+import duckdb
 import polars as pl
 import pytest
 
@@ -30,7 +31,8 @@ from tradepartner.adapters.fake_broker import FakeBroker, PartialFill
 from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, ReconciliationError
-from tradepartner.execution import reconcile_run, switch
+from tradepartner.execution import book_view, reconcile_run, switch
+from tradepartner.execution import breaks as break_rules
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.reconcile import (
@@ -54,6 +56,8 @@ from tradepartner.execution.reconcile_run import (
     reconcile_now,
 )
 from tradepartner.execution.risk import round_down
+from tradepartner.execution.true_up import _Reading, _rebooked_after
+from tradepartner.execution.true_up import _rows as _true_up_rows
 from tradepartner.store.asof import live_actions_as_of, prices_as_of
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
 from tradepartner.store.dividend_reviews import ReviewedGroup
@@ -65,10 +69,12 @@ from tradepartner.store.journal import (
     OrderRow,
     PaperRunRow,
     PaperWindowRow,
+    ReconcileBreakRow,
     ReconciliationRow,
     adjustments_for,
     append,
     break_events_for,
+    break_id_for,
     fills_for,
     kill_switch_events_for,
     orders_for,
@@ -86,7 +92,150 @@ class FixedClock(Protocol):
     def advance(self, **delta: float) -> datetime: ...
 
 
+def test_reversed_activity_is_unseen_until_rebooked_and_column_stays_unique(
+    frozen_window: PaperWindowRow,
+) -> None:
+    stamp = datetime(2026, 10, 1, 20, tzinfo=UTC)
+    booked = AdjustmentRow(
+        adjustment_id=81,
+        window_id=frozen_window.window_id or 0,
+        session=S,
+        kind="owner_true_up",
+        cash=7,
+        security_id=SPY,
+        broker_activity_id="cash-1",
+        known_at=stamp,
+        ingested_at=stamp,
+    )
+    reversed_row = AdjustmentRow(
+        adjustment_id=82,
+        window_id=frozen_window.window_id or 0,
+        session=S,
+        kind="owner_true_up",
+        cash=-7,
+        security_id=SPY,
+        explanation_json=json.dumps(
+            {"reversed_adjustment_id": 81, "reversed_activity_id": "cash-1"}
+        ),
+        known_at=stamp + timedelta(seconds=1),
+        ingested_at=stamp + timedelta(seconds=1),
+    )
+    base = ReconciliationRow(
+        reconciliation_id=1,
+        window_id=frozen_window.window_id or 0,
+        at=stamp,
+        status="ok",
+        broker_cash=100_000,
+        mismatches_json=json.dumps({"activities": [{"activity_id": "cash-1"}]}),
+        known_at=stamp,
+        ingested_at=stamp,
+    )
+    assert (
+        "cash-1"
+        not in reconcile_run._seen_activities([booked, reversed_row], base, frozen_window)[0]
+    )
+    wrong_link = replace(
+        reversed_row,
+        explanation_json=json.dumps(
+            {"reversed_adjustment_id": 81, "reversed_activity_id": "other"}
+        ),
+    )
+    with pytest.raises(ValueError, match="opposite reversal"):
+        reconcile_run._seen_activities([booked, wrong_link], base, frozen_window)
+    fake_reverse = replace(
+        booked,
+        adjustment_id=83,
+        broker_activity_id=None,
+        explanation_json=json.dumps({"reversed_activity_id": "cash-1"}),
+        known_at=stamp + timedelta(seconds=2),
+        ingested_at=stamp + timedelta(seconds=2),
+    )
+    assert (
+        "cash-1" in reconcile_run._seen_activities([booked, fake_reverse], base, frozen_window)[0]
+    )
+    event = ReconcileBreakRow(
+        break_id="1:SEC_SPY:1",
+        window_id=frozen_window.window_id or 0,
+        book_id=frozen_window.book_id,
+        event="reopened",
+        parts_json=json.dumps([{"kind": "name_cash", "activity_ids": ["cash-1"]}]),
+        security_id=SPY,
+        symbol="SPY",
+        material=False,
+        first_seen_session=S,
+        known_at=stamp,
+        ingested_at=stamp,
+    )
+    rows = _true_up_rows(
+        frozen_window,
+        event,
+        _Reading(0, 0, (("cash-1", 7),)),
+        account_id="PA1",
+        reason="correct",
+        session=S,
+        stamp=stamp + timedelta(seconds=2),
+        rebooked_after=_rebooked_after([booked, reversed_row]),
+    )
+    assert len(rows) == 1
+    assert rows[0].broker_activity_id is None
+    assert json.loads(rows[0].explanation_json or "")["rebooked_activity_id"] == "cash-1"
+    assert json.loads(rows[0].explanation_json or "")["rebooked_after_adjustment_id"] == 82
+    assert (
+        "cash-1"
+        in reconcile_run._seen_activities([booked, reversed_row, rows[0]], base, frozen_window)[0]
+    )
+    auto = reconcile_run._AutoAccept(
+        size=7,
+        prior=0,
+        ledger_quantity=0,
+        broker_quantity=0,
+        quantity_part=False,
+        cash_parts=(("cash-1", 7),),
+        equity=100_000,
+    )
+    (auto_row,) = reconcile_run._auto_true_up_rows(
+        SPY,
+        auto,
+        window=frozen_window,
+        run_id=None,
+        session=S,
+        stamp=stamp + timedelta(seconds=2),
+        break_id=event.break_id,
+        reconciliation_id=2,
+        frozen=ROOMY,
+        rebooked_after=reconcile_run._rebooked_after([booked, reversed_row]),
+    )
+    assert auto_row.broker_activity_id is None
+    assert json.loads(auto_row.explanation_json or "")["rebooked_activity_id"] == "cash-1"
+    twice = replace(auto, cash_parts=(("cash-1", 7), ("cash-1", 7)))
+    duplicate_rows = reconcile_run._auto_true_up_rows(
+        SPY,
+        twice,
+        window=frozen_window,
+        run_id=None,
+        session=S,
+        stamp=stamp + timedelta(seconds=2),
+        break_id=event.break_id,
+        reconciliation_id=2,
+        frozen=ROOMY,
+        rebooked_after=reconcile_run._rebooked_after([booked, reversed_row]),
+    )
+    assert [row.broker_activity_id for row in duplicate_rows] == [None, "cash-1"]
+    assert reconcile_run._judge(
+        ["quantity"],
+        size=0,
+        prior=0,
+        equity=100_000,
+        frozen=ROOMY,
+        previous=event,
+        signed=False,
+    )
+
+
+#: A roomy cap, so a single quantity break on the fixture's $250 reference price is
+#: not a `break_cap` here; the cap has its own tests below with explicit values.
 FROZEN = RiskConfig()
+ROOMY = FROZEN.model_copy(update={"max_open_break_share": 0.5})
 S = date(2026, 10, 1)  # the conftest clock's session
 CUT = session_close(date(2026, 9, 30))  # close(S-1)
 BOUGHT_AT = datetime(2026, 9, 29, 15, 0, tzinfo=UTC)  # before every ex-date tested
@@ -240,6 +389,29 @@ def _spinoff(
         ingested_at=known_at,
         source="alpaca",
         provenance="action",
+    )
+
+
+def _allocation(
+    settings: Settings,
+    parent: str,
+    child: str,
+    fraction: float,
+    known_at: datetime,
+    ex_date: date = S,
+) -> None:
+    """An owner-entered `spinoff_allocations` row (T254), stamped `known_at`."""
+    _fact(
+        settings,
+        "spinoff_allocations",
+        parent_security_id=parent,
+        child_security_id=child,
+        ex_date=ex_date,
+        basis_allocation=fraction,
+        known_at=known_at,
+        ingested_at=known_at,
+        source="owner",
+        provenance="owner",
     )
 
 
@@ -517,6 +689,7 @@ def _reconcile(
     run_id: int | None = None,
     as_of: datetime | None = None,
     session: date = S,
+    frozen: RiskConfig = ROOMY,
 ) -> Any:
     return reconcile_now(
         settings,
@@ -527,9 +700,19 @@ def _reconcile(
         clock,
         lambda: open_for_write(settings),
         run_id,
-        frozen=FROZEN,
+        frozen=frozen,
         as_of=clock() if as_of is None else as_of,
     )
+
+
+_REAL_SIGNED_BOOK = reconcile_run._signed_book  # before the autouse patch below
+
+
+@pytest.fixture(autouse=True)
+def _long_only_book(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These windows name no registered hypothesis; read each as `long_only`. The
+    `long_short` refusal has its own tests, which patch it the other way."""
+    monkeypatch.setattr(reconcile_run, "_signed_book", lambda conn, window: False)
 
 
 def _rows(settings: Settings, window: PaperWindowRow) -> list[ReconciliationRow]:
@@ -542,7 +725,7 @@ def _adjustments(settings: Settings, window: PaperWindowRow) -> list[AdjustmentR
         return adjustments_for(conn, window.window_id)  # type: ignore[arg-type]
 
 
-def test_named_cash_break_is_written_before_the_temporary_halt(
+def test_named_cash_break_is_written_and_halts_nothing(
     journal_settings: Settings,
     fake: BookedFake,
     frozen_window: PaperWindowRow,
@@ -553,10 +736,7 @@ def test_named_cash_break_is_written_before_the_temporary_halt(
     fake.extra_cash = 30.0
     submits_before = sum(call.method == "submit" for call in fake.calls)
 
-    with pytest.raises(ReconciliationError):
-        reconcile_command(
-            journal_settings, lambda: open_for_write(journal_settings), fake, fixed_clock
-        )
+    reconcile_command(journal_settings, lambda: open_for_write(journal_settings), fake, fixed_clock)
 
     (row,) = _rows(journal_settings, frozen_window)
     with open_read_only(journal_settings) as conn:
@@ -566,11 +746,10 @@ def test_named_cash_break_is_written_before_the_temporary_halt(
     assert [(event.event, event.security_id, event.cash_amount) for event in events] == [
         ("opened", SPY, 30.0)
     ]
-    assert switch_events[-1].state == "engaged"
+    assert switch_events == []  # a `breaks` row engages no switch (#2266 item 7)
     assert sum(call.method == "submit" for call in fake.calls) == submits_before
 
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, frozen_window, fixed_clock)
+    _reconcile(journal_settings, fake, frozen_window, fixed_clock)
     with open_read_only(journal_settings) as conn:
         events = break_events_for(conn, frozen_window.window_id or 0)
     assert [event.event for event in events] == ["opened", "observed"]
@@ -589,8 +768,7 @@ def test_name_cash_break_is_excluded_from_two_bases_and_remains_unseen(
     for expected, session in (("opened", S), ("observed", next_session(S))):
         if session != S:
             fixed_clock.now = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)
-        with pytest.raises(ReconciliationError):
-            _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=session)
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=session)
         row = _rows(journal_settings, frozen_window)[-1]
         payload = json.loads(row.mismatches_json or "")
         assert row.status == "breaks"
@@ -671,8 +849,7 @@ def test_a_mixed_name_cash_part_takes_the_least_attributed_cause(
     ]
     fake.extra_cash = 30.0 * len(types)
 
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later)
+    _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later)
 
     with open_read_only(journal_settings) as conn:
         opened = break_events_for(conn, frozen_window.window_id or 0)[0]
@@ -707,8 +884,7 @@ def test_a_short_quantity_break_records_the_signed_ledger_short(
         hours=20
     )
 
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, flip_fake, open_window, fixed_clock, session=flipped)
+    _reconcile(journal_settings, flip_fake, open_window, fixed_clock, session=flipped)
 
     event = _last_event(journal_settings, open_window)
     assert (event.ledger_quantity, event.broker_quantity) == (-10.0, -11.0)
@@ -726,12 +902,153 @@ def test_a_changed_unknown_symbol_quantity_keeps_the_earlier_finding(
     _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
     for quantity in (4.0, 5.0):
         fake.extra_quantity = {MTUM_WI: quantity}
-        with pytest.raises(ReconciliationError, match="unknown_symbol"):
-            _reconcile(journal_settings, fake, open_window, fixed_clock)
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
 
     parts = json.loads(_last_event(journal_settings, open_window).parts_json)
     keys = [p["finding_key"] for p in parts if p["kind"] == "unknown_symbol"]
     assert len(keys) == 2 and len(set(keys)) == 2
+
+
+def _kinds(settings: Settings, window: PaperWindowRow) -> list[str]:
+    (row,) = _rows(settings, window)
+    return sorted(m["kind"] for m in json.loads(row.mismatches_json or "")["mismatches"])
+
+
+def test_a_break_reconciliation_halts_nothing(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """T282d, #2266 item 7: a name-level residual is a `breaks` row, one `opened`
+    event, no raise and no `kill_switch` row."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 10.0
+
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == "breaks"
+
+    assert _kinds(journal_settings, open_window) == ["quantity"]
+    with open_read_only(journal_settings) as conn:
+        assert [e.event for e in break_events_for(conn, open_window.window_id or 0)] == ["opened"]
+        assert kill_switch_events_for(conn, open_window.window_id or 0) == []
+
+
+def test_breaks_past_the_cap_halt_as_a_book_level_break_cap(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Q3 of PR #2386: `break_cap` is a reconciliation `Mismatch`. The row is the
+    book-level `mismatch`, written once; the break events are still recorded."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 10.0
+    cap = ROOMY.model_copy(update={"max_open_breaks": 0})
+
+    with pytest.raises(ReconciliationError, match="break_cap"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, frozen=cap)
+
+    (row,) = _rows(journal_settings, open_window)
+    assert row.status == "mismatch" and row.broker_cash is None
+    assert _kinds(journal_settings, open_window) == ["break_cap", "quantity"]
+    with open_read_only(journal_settings) as conn:
+        assert [e.event for e in break_events_for(conn, open_window.window_id or 0)] == ["opened"]
+
+
+def test_one_break_above_the_equity_share_halts_as_break_cap(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Spec item 16: one break above `risk.max_open_break_share` of the equity halts."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 10.0  # $2,500 at the fixture price, over 2% of $100,000
+
+    with pytest.raises(ReconciliationError, match="break_cap"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, frozen=FROZEN)
+
+    assert _kinds(journal_settings, open_window) == ["break_cap", "quantity"]
+
+
+def test_an_unknown_symbol_break_halts_nothing_but_counts_toward_the_cap(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Q4 of PR #2386, option A: no `security_id`, so no name is restricted and the
+    book keeps trading; the break still counts, and at the cap the book halts."""
+    fake.extra_quantity = {"SPYX": 5.0}
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == "breaks"
+    with open_read_only(journal_settings) as conn:
+        events = break_events_for(conn, open_window.window_id or 0)
+        assert [(e.event, e.security_id, e.symbol, e.material) for e in events] == [
+            ("opened", None, "SPYX", True)
+        ]
+        assert break_rules.restricted_names(events) == frozenset()
+        assert kill_switch_events_for(conn, open_window.window_id or 0) == []
+
+    cap = ROOMY.model_copy(update={"max_open_breaks": 0})
+    with pytest.raises(ReconciliationError, match="break_cap"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, frozen=cap)
+    assert _rows(journal_settings, open_window)[-1].status == "mismatch"
+
+
+def test_a_restricted_name_in_a_long_short_book_halts_with_a_clear_message(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q2 of PR #2386, fallback: `kept_effective_weights` is long-only, so a signed
+    book with a restricted name is refused instead of mis-planned (issue filed)."""
+    monkeypatch.setattr(reconcile_run, "_signed_book", lambda conn, window: True)
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 10.0
+
+    with pytest.raises(ReconciliationError, match="long_short book with restricted name"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert "restricted_long_short" in _kinds(journal_settings, open_window)
+
+
+def test_an_unknown_symbol_in_a_long_short_book_restricts_no_name_so_it_trades(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(reconcile_run, "_signed_book", lambda conn, window: True)
+    fake.extra_quantity = {"SPYX": 5.0}
+
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == "breaks"
+
+
+def test_the_book_view_reads_a_breaks_row_as_a_match_except_its_breaks(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Item 10: a `breaks` row is "Matches Alpaca except N open breaks", never the
+    "Does not match Alpaca" a `mismatch` shows; it is no checked match either."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 10.0
+    _reconcile(journal_settings, fake, frozen_window, fixed_clock)
+    (row,) = _rows(journal_settings, frozen_window)
+
+    view = book_view._reconciliation(frozen_window, [row], fixed_clock() + timedelta(hours=1))
+
+    assert row.status == "breaks"
+    assert "Matches Alpaca as of" in view.text and "except 1 open break." in view.text
+    assert "Does not match" not in view.text
+    assert view.matches is False
 
 
 def test_a_part_with_a_new_cause_is_observed_under_the_opening_cause(
@@ -760,14 +1077,11 @@ def test_a_part_with_a_new_cause_is_observed_under_the_opening_cause(
         CashActivity("c0", "DIVNRA", later, "executed", 30.0, "SPY"),
     ]
     fake.extra_cash = 30.0
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later)
+    _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later)
 
     fake.extra_quantity = {"SPY": -1.0}
-    with pytest.raises(ReconciliationError) as caught:
-        _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later)
+    _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later)
 
-    assert "could not be written" not in str(caught.value)
     event = _last_event(journal_settings, frozen_window)
     assert event.event == "observed" and event.cause == "corporate_action"
     assert "unattributed" in event.parts_json
@@ -784,8 +1098,7 @@ def test_a_failed_closing_event_write_engages_the_switch(
     closing event cannot be written: `ReconciliationError`, switch engaged."""
     _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
     fake.extra_quantity = {"SPY": -1.0}
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, frozen_window, fixed_clock)
+    _reconcile(journal_settings, fake, frozen_window, fixed_clock)
     fake.extra_quantity = {}
 
     def fail_events(*_args: object, **_kwargs: object) -> None:
@@ -859,12 +1172,12 @@ def test_pending_order_with_a_name_break_still_raises_after_journaling(
     assert [event.event for event in events] == ["opened"]
 
 
-@pytest.mark.parametrize("write_fails", [False, True])
-def test_due_rebalance_with_a_break_never_reaches_submit(
+def test_due_rebalance_whose_break_cannot_be_written_never_reaches_submit(
     journal_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
-    write_fails: bool,
 ) -> None:
+    """A `breaks` result no longer halts, but one whose events cannot be recorded
+    still does: the run fails closed before any order."""
     from execution import test_run_core as run_fixture
 
     clock = run_fixture.Clock(run_fixture._at(run_fixture.F_0))
@@ -891,12 +1204,11 @@ def test_due_rebalance_with_a_break_never_reaches_submit(
         )
     )
     broker.extra_quantity["SPY"] = 2.0
-    if write_fails:
 
-        def fail_events(*_args: object, **_kwargs: object) -> None:
-            raise RuntimeError("event writer failed")
+    def fail_events(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("event writer failed")
 
-        monkeypatch.setattr(reconcile_run, "_write_break_events", fail_events)
+    monkeypatch.setattr(reconcile_run, "_write_break_events", fail_events)
 
     with pytest.raises(ReconciliationError):
         env.run(run_fixture._at(run_fixture.F_0))
@@ -905,8 +1217,7 @@ def test_due_rebalance_with_a_break_never_reaches_submit(
     assert "submit" not in env.broker_methods()
     assert env.query("SELECT kind FROM paper_runs") == [("rebalance",)]
     assert env.query("SELECT status FROM paper_run_results") == [("halted",)]
-    rows = env.query("SELECT status FROM reconciliations")
-    assert rows == ([] if write_fails else [("breaks",)])
+    assert env.query("SELECT status FROM reconciliations") == []
 
 
 def test_two_store_copies_write_identical_break_events(
@@ -922,8 +1233,7 @@ def test_two_store_copies_write_identical_break_events(
     fake.extra_quantity["SPY"] = 10.0
 
     for settings in (journal_settings, copy_settings):
-        with pytest.raises(ReconciliationError):
-            _reconcile(settings, fake, open_window, fixed_clock)
+        _reconcile(settings, fake, open_window, fixed_clock)
 
     events = []
     for settings in (journal_settings, copy_settings):
@@ -941,8 +1251,7 @@ def test_next_session_merger_explains_an_open_quantity_break(
 ) -> None:
     _hold(journal_settings, fake, open_window, {(MTUM, "MTUM"): 10.0})
     fake.extra_quantity["MTUM"] = -10.0
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
     assert _rows(journal_settings, open_window)[-1].status == "breaks"
 
     known = datetime(2026, 10, 1, 19, 0, tzinfo=UTC)
@@ -989,8 +1298,7 @@ def test_merger_closure_cites_only_its_own_adjustment(
 ) -> None:
     _hold(journal_settings, fake, open_window, {(MTUM, "MTUM"): 10.0, (SPY, "SPY"): 10.0})
     fake.extra_quantity["MTUM"] = -10.0
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
     known = datetime(2026, 10, 1, 19, 0, tzinfo=UTC)
     _fact(
         journal_settings,
@@ -1055,8 +1363,7 @@ def test_observed_break_retains_finding_parts_and_structured_keys(
         )
 
     monkeypatch.setattr(reconcile_run, "_explanations", with_findings)
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
     with open_read_only(journal_settings) as conn:
         opened = break_events_for(conn, open_window.window_id or 0)[-1]
     keys = {part["kind"]: part["finding_key"] for part in json.loads(opened.parts_json)}
@@ -1066,11 +1373,9 @@ def test_observed_break_retains_finding_parts_and_structured_keys(
     )
 
     finding["active"] = False
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
     fake.extra_quantity["SPY"] = 0.0
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
     assert _rows(journal_settings, open_window)[-1].status == "breaks"
     with open_read_only(journal_settings) as conn:
         events = break_events_for(conn, open_window.window_id or 0)
@@ -1107,8 +1412,7 @@ def test_dividend_due_beside_a_break_books_once_after_the_break_clears(
     fake.extra_cash = 5.0
     fake.extra_quantity["SPY"] = 1.0
 
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
     assert _rows(journal_settings, open_window)[-1].status == "breaks"
 
     fake.extra_quantity["SPY"] = 0.0
@@ -1141,15 +1445,13 @@ def test_retained_finding_keeps_a_cash_base_and_books_a_separate_dividend(
         return offered
 
     monkeypatch.setattr(reconcile_run, "_explanations", with_finding)
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
     finding["active"] = False
     _dividend(journal_settings, MTUM, 0.5, CUT - timedelta(days=1))
     fake.activities = [CashActivity("div-mtum", "DIV", S, "executed", 5.0, "MTUM")]
     fake.extra_cash = 5.0
     fixed_clock.advance(minutes=5)
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
     row = _rows(journal_settings, open_window)[-1]
     assert row.status == "breaks"
     assert row.broker_cash == pytest.approx(100_000.0 - 20 * PRICE + 5.0)
@@ -1171,8 +1473,7 @@ def test_explained_name_closes_while_another_name_still_breaks(
 ) -> None:
     _hold(journal_settings, fake, open_window, {(MTUM, "MTUM"): 10.0, (SPY, "SPY"): 10.0})
     fake.extra_quantity.update({"MTUM": -10.0, "SPY": 1.0})
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
     known = datetime(2026, 10, 1, 19, 0, tzinfo=UTC)
     _fact(
         journal_settings,
@@ -1197,8 +1498,7 @@ def test_explained_name_closes_while_another_name_still_breaks(
     )
     fake.extra_cash = 200.0
     fixed_clock.now = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, open_window, fixed_clock, session=next_session(S))
+    _reconcile(journal_settings, fake, open_window, fixed_clock, session=next_session(S))
     with open_read_only(journal_settings) as conn:
         events = break_events_for(conn, open_window.window_id or 0)
     assert [(event.security_id, event.event) for event in events[-2:]] == [
@@ -1218,8 +1518,7 @@ def test_book_fault_keeps_an_open_break_observed_until_safe_closure(
 ) -> None:
     _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
     fake.extra_quantity["SPY"] = -10.0
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == "breaks"
     fake.extra_quantity["SPY"] = 0.0
     fake.extra_cash = 10.0
     with pytest.raises(ReconciliationError):
@@ -1250,8 +1549,7 @@ def test_old_name_residual_opens_a_break_without_rewriting_its_row(
     before = _rows(journal_settings, open_window)[0]
     fake.extra_quantity["SPY"] = 1.0
 
-    with pytest.raises(ReconciliationError):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
 
     rows = _rows(journal_settings, open_window)
     assert rows[0] == before
@@ -1408,6 +1706,88 @@ def test_a_broker_booked_spinoff_child_journals_a_spinoff_receipt(
     )
 
 
+def _receipt_terms(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    *,
+    allocations: Sequence[tuple[float, datetime]],
+) -> dict[str, Any]:
+    """Reconcile the 4.0 `MTUM` child of 10 `SPY` on S2 and return the receipt's
+    parsed `explanation_json`."""
+    fake.activities = [FUNDING]
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _spinoff(journal_settings, MTUM, SPY, 0.4, STAMP, ex_date=EX)
+    for fraction, known_at in allocations:
+        _allocation(journal_settings, SPY, MTUM, fraction, known_at, ex_date=EX)
+    fake.extra_quantity = {"MTUM": 4.0}
+    fixed_clock.advance(days=1)
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+
+    assert result.status == OK
+    (adjustment,) = _adjustments(journal_settings, open_window)
+    assert adjustment.kind == "spinoff_receipt"
+    assert adjustment.explanation_json is not None
+    terms: dict[str, Any] = json.loads(adjustment.explanation_json)
+    return terms
+
+
+def test_a_spinoff_receipt_is_journaled_with_its_parent_and_a_stored_allocation(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """T255 (#1976 item 2): the receipt names the parent, the ex-date and the
+    fraction stored at close(S2-1); a later Form 8937 revision is not read."""
+    terms = _receipt_terms(
+        journal_settings,
+        fake,
+        open_window,
+        fixed_clock,
+        allocations=[(0.15, STAMP - timedelta(days=1)), (0.2, STAMP)],
+    )
+
+    assert terms["parent_security_id"] == SPY
+    assert terms["ex_date"] == EX.isoformat()
+    assert terms["basis_allocation"] == 0.2
+    assert terms["explanation"] == f"spin-off child of {SPY}"
+
+
+def test_a_spinoff_receipt_without_a_stored_allocation_names_the_parent_alone(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    terms = _receipt_terms(journal_settings, fake, open_window, fixed_clock, allocations=[])
+
+    assert terms["parent_security_id"] == SPY
+    assert "basis_allocation" not in terms
+
+
+def test_an_allocation_known_after_the_cutoff_is_not_applied(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """No look-ahead: a fraction stamped a minute after close(S2-1) is invisible
+    to the receipt journaled on S2; the receipt keeps zero basis."""
+    terms = _receipt_terms(
+        journal_settings,
+        fake,
+        open_window,
+        fixed_clock,
+        allocations=[(0.2, STAMP + timedelta(minutes=1))],
+    )
+
+    assert terms["parent_security_id"] == SPY
+    assert "basis_allocation" not in terms
+
+
 def test_a_wrong_spinoff_ratio_still_halts(
     journal_settings: Settings,
     fake: BookedFake,
@@ -1422,8 +1802,7 @@ def test_a_wrong_spinoff_ratio_still_halts(
     fake.extra_quantity = {"MTUM": 4.0}
     fixed_clock.advance(days=1)
 
-    with pytest.raises(ReconciliationError, match="broker_only_position"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+    _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
 
     assert _adjustments(journal_settings, open_window) == []
 
@@ -1441,8 +1820,7 @@ def test_a_spinoff_child_of_a_parent_not_held_still_halts(
     fake.extra_quantity = {"MTUM": 4.0}
     fixed_clock.advance(days=1)
 
-    with pytest.raises(ReconciliationError, match="broker_only_position"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+    _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
 
     assert _adjustments(journal_settings, open_window) == []
 
@@ -1467,8 +1845,7 @@ def test_a_spinoff_of_a_parent_moved_since_the_ex_date_still_halts(
     fake.extra_quantity = {"MTUM": 4.0}
     fixed_clock.advance(days=1)
 
-    with pytest.raises(ReconciliationError, match="broker_only_position"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+    _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
 
     assert _adjustments(journal_settings, open_window) == []
 
@@ -1487,8 +1864,7 @@ def test_a_spinoff_known_only_after_the_cutoff_still_halts(
     fake.extra_quantity = {"MTUM": 4.0}
     fixed_clock.advance(days=1)
 
-    with pytest.raises(ReconciliationError, match="broker_only_position"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+    _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
 
     assert _adjustments(journal_settings, open_window) == []
 
@@ -1661,8 +2037,7 @@ def test_a_when_issued_child_known_only_after_the_cutoff_still_halts(
     fake.extra_quantity = {MTUM_WI: 4.0}
     fixed_clock.advance(days=1)
 
-    with pytest.raises(ReconciliationError, match="unknown_symbol"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+    _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
 
     assert _adjustments(journal_settings, open_window) == []
 
@@ -1680,8 +2055,7 @@ def test_a_when_issued_child_of_a_parent_not_held_still_halts(
     fake.extra_quantity = {MTUM_WI: 4.0}
     fixed_clock.advance(days=1)
 
-    with pytest.raises(ReconciliationError, match="unknown_symbol"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+    _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
 
     assert _adjustments(journal_settings, open_window) == []
 
@@ -1701,8 +2075,7 @@ def test_a_when_issued_child_at_a_wrong_ratio_still_halts(
     fake.extra_quantity = {MTUM_WI: 4.0}
     fixed_clock.advance(days=1)
 
-    with pytest.raises(ReconciliationError, match="broker_only_position"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
+    _reconcile(journal_settings, fake, open_window, fixed_clock, session=S2)
 
     assert _adjustments(journal_settings, open_window) == []
 
@@ -1792,8 +2165,7 @@ def test_a_broker_symbol_with_no_stored_change_is_a_mismatch(
     _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
     fake.extra_quantity = {"SPY": -10.0, "SPYX": 10.0}
 
-    with pytest.raises(ReconciliationError, match="unknown_symbol"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == "breaks"
 
     (row,) = _rows(journal_settings, open_window)
     listed = json.loads(row.mismatches_json or "")
@@ -1829,8 +2201,7 @@ def test_a_symbol_change_known_only_after_close_s_minus_1_is_not_applied(
     assert found.symbols == {SPY: "SPY"}
     assert found.symbol_changes == {}
 
-    with pytest.raises(ReconciliationError, match="unknown_symbol"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == "breaks"
     (row,) = _rows(journal_settings, open_window)
     assert json.loads(row.mismatches_json or "")["symbol_changes"] == []
 
@@ -1847,8 +2218,7 @@ def test_a_quantity_mismatch_under_the_new_symbol_is_a_mismatch(
     _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1))
     fake.extra_quantity = {"SPY": -10.0, "SPYX": 9.0}
 
-    with pytest.raises(ReconciliationError, match="quantity"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
 
     (row,) = _rows(journal_settings, open_window)
     listed = json.loads(row.mismatches_json or "")
@@ -1873,8 +2243,7 @@ def test_a_ticker_change_is_not_recorded_when_the_broker_holds_both_symbols(
     _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1))
     fake.extra_quantity = {"SPYX": 10.0}  # the broker holds the old 10 and a new 10
 
-    with pytest.raises(ReconciliationError, match="unknown_symbol"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
 
     (row,) = _rows(journal_settings, open_window)
     listed = json.loads(row.mismatches_json or "")
@@ -1895,8 +2264,7 @@ def test_two_candidate_ticker_changes_for_a_name_are_a_mismatch(
     _symbol_change(journal_settings, SPY, "SPY", "SPYZ", CUT - timedelta(minutes=1), "r2")
     fake.extra_quantity = {"SPY": -10.0, "SPYX": 10.0}
 
-    with pytest.raises(ReconciliationError, match="unknown_symbol"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock).status == "breaks"
 
     (row,) = _rows(journal_settings, open_window)
     listed = json.loads(row.mismatches_json or "")
@@ -2054,8 +2422,7 @@ def test_a_split_known_only_after_close_of_the_previous_session_is_a_mismatch(
     _split(journal_settings, SPY, 2.0, CUT + timedelta(minutes=1))
     fake.extra_quantity["SPY"] = 10.0
 
-    with pytest.raises(ReconciliationError, match="quantity"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
 
     row = _rows(journal_settings, open_window)[-1]
     assert _rows(journal_settings, open_window)[0].status == OK
@@ -2229,6 +2596,24 @@ def test_late_dividend_cash_without_an_eligible_due_halts(
     amount = 5.02 if case == "wrong_amount" else 5.0
     fake.activities = [CashActivity("div-pay", "DIV", pay_date, "executed", amount, symbol)]
     fake.extra_cash = amount
+    if case in ("expired", "wrong_amount"):
+        # A held name's unexplained dividend cash is a name cash break (#2266 item 1).
+        # $5 is immaterial by default and would be auto-accepted (item 6), so the
+        # threshold is 0 here: this test is about the attribution, not the size.
+        always_material = FROZEN.model_copy(update={"break_materiality_usd": 0.0})
+        assert (
+            _reconcile(
+                journal_settings,
+                fake,
+                open_window,
+                fixed_clock,
+                session=pay_date,
+                frozen=always_material,
+            ).status
+            == "breaks"
+        )
+        return
+    # No symbol maps to a held name: still the book-level `cash`.
     with pytest.raises(ReconciliationError, match="cash"):
         _reconcile(journal_settings, fake, open_window, fixed_clock, session=pay_date)
 
@@ -2530,8 +2915,7 @@ def test_dividend_credit_window_excludes_its_exact_far_edge(
     )
     fake.activities = [CashActivity("edge", "DIV", outside, "executed", 5.0, "SPY")]
     fake.extra_cash = 5.0
-    with pytest.raises(ReconciliationError, match="cash"):
-        _reconcile(journal_settings, fake, open_window, fixed_clock, session=outside)
+    _reconcile(journal_settings, fake, open_window, fixed_clock, session=outside)
 
 
 def test_netting_discards_a_cash_rounding_residue(
@@ -2856,7 +3240,7 @@ def test_the_lagging_input_is_read_and_a_pending_order_is_not(
 def frozen_window(journal_settings: Settings) -> PaperWindowRow:
     """An open window whose `frozen_json` holds the risk section as `paper start`
     writes it (dotted keys, the registry's canonical form)."""
-    frozen = {f"risk.{k}": v for k, v in FROZEN.model_dump(mode="json").items()}
+    frozen = {f"risk.{k}": v for k, v in ROOMY.model_dump(mode="json").items()}
     frozen["paper.tracking_k"] = 20
     started = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
     row = PaperWindowRow(
@@ -3149,26 +3533,121 @@ def test_no_adapter_is_imported() -> None:
     assert "fake_broker" not in source and "alpaca_broker" not in source
 
 
-def test_stock_dividends_picks_only_in_band_splits_before_the_session() -> None:
-    """#1627: `_stock_dividends` seats a `CIL` beside a held stock dividend, so it
-    must read a stock-only band: a `split` with `1 < ratio <= stock_dividend_max_rate`
-    whose ex-date is at or before the session, and never a 2:1 split, a reverse
-    split, a non-split row, or a split whose ex-date has not passed. The result is
-    `(ex_date, last_acceptable_CIL_date, ratio)`; a zero lag keeps the window on
-    the ex-date."""
+def test_stock_dividends_picks_any_split_before_the_session() -> None:
+    """#2184: `_stock_dividends` seats a `CIL` beside any held split that can leave
+    a fractional share, so it reads every `split` row whose ex-date is at or before
+    the session: an in-band stock dividend, a forward split above
+    `stock_dividend_max_rate` and a reverse split (ratio < 1) alike, and never a
+    non-split row, a ratio of 1 (or less than 0), or a split whose ex-date has not
+    passed. The result is `(ex_date, last_acceptable_CIL_date, ratio)`; a zero lag
+    keeps the window on the ex-date."""
     actions = pl.DataFrame(
         {
-            "security_id": ["A", "B", "C", "D", "E", "F"],
-            "action_type": ["split", "split", "split", "split", "dividend", "split"],
-            "ex_date": [S, S, S, S, S, S + timedelta(days=1)],
-            "ratio_or_amount": [1.005, 2.0, 1.20, 0.5, 1.1, 1.10],
+            "security_id": ["A", "B", "C", "D", "E", "F", "G", "H"],
+            "action_type": ["split"] * 4 + ["dividend"] + ["split"] * 3,
+            "ex_date": [S, S, S, S, S, S + timedelta(days=1), S, S],
+            "ratio_or_amount": [1.005, 2.0, 1.20, 0.1, 1.1, 1.10, 1.0, -2.0],
         }
     )
 
-    assert reconcile_run._stock_dividends(actions, S, 1.25, 0) == {
+    assert reconcile_run._stock_dividends(actions, S, 0) == {
         "A": (S, S, 1.005),
+        "B": (S, S, 2.0),
         "C": (S, S, 1.20),
+        "D": (S, S, 0.1),
     }
+
+
+def _fractional_split_case(
+    settings: Settings,
+    fake: BookedFake,
+    window: PaperWindowRow,
+    ratio: float,
+    held: float,
+    broker_whole: float,
+    pay: bool = True,
+) -> float:
+    """Hold `held` SPY, store a split of `ratio` at S, and make the fake broker
+    credit `broker_whole` shares plus (when `pay`) a `CIL` of the fraction at the
+    post-ex price (the pre-ex close / ratio). Returns the expected cash."""
+    reference = _reference(settings, SPY)
+    _hold(settings, fake, window, {(SPY, "SPY"): held})
+    _split(settings, SPY, ratio, CUT - timedelta(hours=1))
+    fraction = held * ratio - broker_whole
+    expected = fraction * (reference / ratio)
+    fake.extra_quantity = {"SPY": broker_whole - held}
+    if pay:
+        fake.extra_cash = expected
+        fake.activities = [_CIL_ACTIVITY("act-cil", expected)]
+    return expected
+
+
+@pytest.mark.parametrize(("ratio", "whole"), [(1.5, 22.0), (0.1, 1.0)])
+def test_cash_in_lieu_of_a_forward_or_reverse_split_reconciles_ok(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    ratio: float,
+    whole: float,
+) -> None:
+    """#2184 probes: 15 shares through a 3-for-2 (22.5 -> 22 + 0.5) and a 1-for-10
+    reverse split (1.5 -> 1 + 0.5) reconcile `ok` with one `cash_in_lieu` row."""
+    _fractional_split_case(journal_settings, fake, open_window, ratio, 15.0, whole)
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert [
+        (a.kind, a.broker_activity_id) for a in _adjustments(journal_settings, open_window)
+    ] == [("cash_in_lieu", "act-cil")]
+
+
+def test_a_whole_reverse_split_result_reconciles_without_a_cash_in_lieu(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2184: 20 shares at 1-for-10 are 2 whole shares; no `CIL`, no adjustment."""
+    _fractional_split_case(journal_settings, fake, open_window, 0.1, 20.0, 2.0, pay=False)
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_a_reverse_split_cash_in_lieu_beyond_the_tolerance_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2184: the amount check is unchanged for a reverse split: 85% of the
+    expected cash is off beyond `risk.cash_in_lieu_tolerance` and halts."""
+    expected = _fractional_split_case(journal_settings, fake, open_window, 0.1, 15.0, 1.0)
+    fake.extra_cash = expected * 0.85
+    fake.activities = [_CIL_ACTIVITY("act-cil", expected * 0.85)]
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+
+def test_a_cash_in_lieu_on_a_name_with_no_split_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2184: widening the ratio guard adds no split-less name: a `CIL` for a held
+    name with no split stays `unexplained_activity`."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 15.0})
+    fake.extra_cash = 50.0
+    fake.activities = [_CIL_ACTIVITY("act-cil", 50.0)]
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
 
 
 # --- review follow-ups: the cash base, dedupe, the reference cut, failures ----
@@ -4948,6 +5427,51 @@ def test_a_pending_duplicate_reconciles_on_one_payment(
     assert (adjustment.kind, adjustment.cash) == ("dividend_cash", pytest.approx(5.0))
 
 
+@pytest.mark.parametrize("kept_amount", [0.3, 0.1 + 0.2])
+def test_a_noisy_reviewed_retract_does_not_count_twice(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    monkeypatch: pytest.MonkeyPatch,
+    kept_amount: float,
+) -> None:
+    monkeypatch.setattr(reconcile_run, "reviewed_groups", lambda: [_listed(SPY, "duplicate", 0.3)])
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, kept_amount, CUT - timedelta(days=1), source_action_id="dup-a")
+    _dividend(
+        journal_settings,
+        SPY,
+        0.3000000000000001,
+        CUT - timedelta(days=1),
+        source_action_id="dup-b",
+    )
+    found = _explain_at_cut(journal_settings, open_window)
+    assert found.dividends == {}
+    assert SPY in found.dividend_findings
+
+
+def test_a_shifted_date_reviewed_retract_does_not_count_twice(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(reconcile_run, "reviewed_groups", lambda: [_listed(SPY, "duplicate", 0.3)])
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.3, CUT - timedelta(days=1), source_action_id="dup-a")
+    _dividend(
+        journal_settings,
+        SPY,
+        0.3,
+        CUT - timedelta(days=1),
+        ex_date=previous_session(S),
+        source_action_id="dup-b",
+    )
+    found = _explain_at_cut(journal_settings, open_window)
+    assert found.dividends == {}
+    assert SPY in found.dividend_findings
+
+
 def test_an_unlisted_pair_on_a_name_not_held_is_no_finding(
     journal_settings: Settings,
     fake: BookedFake,
@@ -4960,3 +5484,568 @@ def test_an_unlisted_pair_on_a_name_not_held_is_no_finding(
     found = _explain_at_cut(journal_settings, open_window)
     assert found.dividends == {}
     assert found.dividend_findings == {}
+
+
+def test_signed_book_fails_closed_and_reads_a_registered_long_only_hypothesis(
+    journal_settings: Settings, frozen_window: PaperWindowRow
+) -> None:
+    from execution.test_run_core import registered_hypothesis
+
+    known = replace(frozen_window, hypothesis_id=registered_hypothesis(journal_settings))
+    with open_for_write(journal_settings) as conn:
+        assert _REAL_SIGNED_BOOK(conn, known) is False
+        # No such hypothesis: unreadable reads as signed, so the book halts.
+        assert _REAL_SIGNED_BOOK(conn, replace(frozen_window, hypothesis_id=9_999)) is True
+
+
+def test_signed_book_reads_a_long_short_hypothesis_as_signed(
+    journal_settings: Settings, frozen_window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unsafe direction: a hypothesis freezing `portfolio.side = long_short` reads
+    True (the key and value `headroom._side` reads), so its restricted names halt."""
+    from execution.test_run_core import registered_hypothesis
+
+    known = replace(frozen_window, hypothesis_id=registered_hypothesis(journal_settings))
+    monkeypatch.setattr(
+        reconcile_run, "frozen_values", lambda _hypothesis: {"portfolio.side": "long_short"}
+    )
+    with open_for_write(journal_settings) as conn:
+        assert _REAL_SIGNED_BOOK(conn, known) is True
+
+
+# --- auto-acceptance and true-up semantics (T283a; #2266 items 5, 6, 8, 9) -----------
+
+
+def _events(settings: Settings, window: PaperWindowRow) -> list[Any]:
+    with open_read_only(settings) as conn:
+        return break_events_for(conn, window.window_id or 0)
+
+
+def _credit(fake: BookedFake, activity_id: str, amount: float, day: date = S) -> None:
+    """A not-due `MA` credit tagged to SPY: a name cash break of `amount`."""
+    fake.activities = [
+        *fake.activities,
+        CashActivity(activity_id, "MA", day, "executed", amount, "SPY"),
+    ]
+    fake.extra_cash += amount
+
+
+def _reversed_cash_booking(settings: Settings, window: PaperWindowRow) -> tuple[int, int]:
+    """Journal one owner cash booking and its opposite before reconciliation."""
+    booked_at = datetime(2026, 10, 1, 13, tzinfo=UTC)
+    (original_id,) = _append(
+        settings,
+        AdjustmentRow(
+            window_id=window.window_id or 0,
+            session=S,
+            kind="owner_true_up",
+            security_id=SPY,
+            cash=10,
+            broker_activity_id="rebook-credit",
+            known_at=booked_at,
+            ingested_at=booked_at,
+        ),
+    )
+    assert original_id is not None
+    reversed_at = booked_at + timedelta(minutes=1)
+    (reverse_id,) = _append(
+        settings,
+        AdjustmentRow(
+            window_id=window.window_id or 0,
+            session=S,
+            kind="owner_true_up",
+            security_id=SPY,
+            cash=-10,
+            explanation_json=json.dumps(
+                {"reversed_adjustment_id": original_id, "reversed_activity_id": "rebook-credit"}
+            ),
+            known_at=reversed_at,
+            ingested_at=reversed_at,
+        ),
+    )
+    assert reverse_id is not None
+    return original_id, reverse_id
+
+
+def test_reconcile_now_rebooks_reversed_activity_in_store(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _, reverse_id = _reversed_cash_booking(journal_settings, frozen_window)
+    _credit(fake, "rebook-credit", 10.0)
+
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+    rows = _adjustments(journal_settings, frozen_window)
+    assert len(rows) == 3
+    assert [row.broker_activity_id for row in rows] == ["rebook-credit", None, None]
+    terms = json.loads(rows[-1].explanation_json or "")
+    assert (terms["rebooked_activity_id"], terms["rebooked_after_adjustment_id"]) == (
+        "rebook-credit",
+        reverse_id,
+    )
+    assert _rows(journal_settings, frozen_window)[-1].broker_cash == pytest.approx(99_010)
+
+
+def test_activity_cannot_rebook_twice_without_another_reversal(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _reversed_cash_booking(journal_settings, frozen_window)
+    _credit(fake, "rebook-credit", 10.0)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+    fixed_clock.advance(minutes=5)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+    assert len(_adjustments(journal_settings, frozen_window)) == 3
+    assert len(_events(journal_settings, frozen_window)) == 2
+    assert reconcile_run._rebooked_after(_adjustments(journal_settings, frozen_window)) == {}
+    later = fixed_clock()
+    with pytest.raises(duckdb.ConstraintException):
+        _append(
+            journal_settings,
+            AdjustmentRow(
+                window_id=frozen_window.window_id or 0,
+                session=S,
+                kind="owner_true_up",
+                security_id=SPY,
+                cash=10,
+                broker_activity_id="rebook-credit",
+                known_at=later,
+                ingested_at=later,
+            ),
+        )
+    assert len(_adjustments(journal_settings, frozen_window)) == 3
+
+
+def test_reconcile_now_never_auto_accepts_an_owner_reopened_break(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    window_id = frozen_window.window_id or 0
+    opened_at = datetime(2026, 10, 1, 12, tzinfo=UTC)
+    (reconciliation_id,) = _append(
+        journal_settings,
+        ReconciliationRow(
+            window_id=window_id,
+            at=opened_at,
+            status="breaks",
+            broker_cash=99_000,
+            mismatches_json=json.dumps({"activities": []}),
+            known_at=opened_at,
+            ingested_at=opened_at,
+        ),
+    )
+    assert reconciliation_id is not None
+    break_id = break_id_for(window_id, SPY, reconciliation_id)
+    parts = break_rules.parts_json(
+        [
+            break_rules.BreakPart(
+                kind="name_cash",
+                cause="unattributed",
+                cash_amount=10,
+                activity_ids=("rebook-credit",),
+            )
+        ]
+    )
+    opened = ReconcileBreakRow(
+        break_id=break_id,
+        window_id=window_id,
+        book_id=frozen_window.book_id,
+        event="opened",
+        parts_json=parts,
+        security_id=SPY,
+        symbol="SPY",
+        material=False,
+        dollar_size=10,
+        cause="unattributed",
+        first_seen_session=S,
+        reconciliation_id=reconciliation_id,
+        known_at=opened_at,
+        ingested_at=opened_at,
+    )
+    _append(journal_settings, opened)
+    original_id, reverse_id = _reversed_cash_booking(journal_settings, frozen_window)
+    trued_at = datetime(2026, 10, 1, 13, tzinfo=UTC)
+    _append(
+        journal_settings,
+        replace(
+            opened,
+            event_id=None,
+            event="trued_up",
+            reconciliation_id=None,
+            reason="owner accepted",
+            adjustment_ids_json=json.dumps([original_id]),
+            known_at=trued_at,
+            ingested_at=trued_at,
+        ),
+        replace(
+            opened,
+            event_id=None,
+            event="reopened",
+            reconciliation_id=None,
+            reason="owner reversed",
+            adjustment_ids_json=json.dumps([reverse_id]),
+            known_at=trued_at + timedelta(minutes=1),
+            ingested_at=trued_at + timedelta(minutes=1),
+        ),
+    )
+    _credit(fake, "rebook-credit", 10.0)
+
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+    assert len(_adjustments(journal_settings, frozen_window)) == 2
+    events = _events(journal_settings, frozen_window)
+    assert [event.event for event in events] == ["opened", "trued_up", "reopened", "observed"]
+    assert events[-1].material is True
+
+
+def test_every_break_auto_accepted_is_ok_and_engages_nothing(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Item 16 Auto-acceptance: $10 on a $100,000 book writes `opened`, `auto_accepted`
+    and one `auto_true_up`, with no restriction; the row is `ok` (T282d's rule for
+    `breaks` never applies) and the command raises nothing and engages no switch."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _credit(fake, "tiny-credit", 10.0)
+
+    result = _command(journal_settings, fake, fixed_clock)
+
+    assert result.status == OK
+    (row,) = _rows(journal_settings, frozen_window)
+    assert row.status == OK and row.broker_cash == pytest.approx(100_010.0 - 10 * PRICE)
+    events = _events(journal_settings, frozen_window)
+    assert [(e.event, e.material, e.dollar_size) for e in events] == [
+        ("opened", False, 10.0),
+        ("auto_accepted", False, 10.0),
+    ]
+    assert events[0].break_id == events[1].break_id
+    (true_up,) = [
+        a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
+    ]
+    assert (true_up.security_id, true_up.cash, true_up.quantity) == (SPY, 10.0, None)
+    assert true_up.broker_activity_id == "tiny-credit"
+    assert json.loads(events[1].adjustment_ids_json or "") == [true_up.adjustment_id]
+    terms = json.loads(true_up.explanation_json or "")
+    assert (terms["size"], terms["prior_auto_accepted"], terms["cumulative_auto_accepted"]) == (
+        10.0,
+        0.0,
+        10.0,
+    )
+    assert terms["break_materiality_usd"] == FROZEN.break_materiality_usd
+    with open_read_only(journal_settings) as conn:
+        assert kill_switch_events_for(conn, frozen_window.window_id or 0) == []
+        assert (
+            break_rules.restricted_names(break_events_for(conn, frozen_window.window_id or 0))
+            == frozenset()
+        )
+
+    # The next reconciliation sees the activity as booked and the ledger as the broker.
+    fixed_clock.advance(minutes=5)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+    assert len(_events(journal_settings, frozen_window)) == 2
+
+
+def test_a_quantity_break_is_adopted_at_the_brokers_absolute_quantity(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 0.04  # about $10 at the fixture reference price
+
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+
+    (true_up,) = [
+        a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
+    ]
+    assert (true_up.security_id, true_up.cash, true_up.broker_activity_id) == (SPY, None, None)
+    assert true_up.quantity == pytest.approx(0.04)
+    terms = json.loads(true_up.explanation_json or "")
+    assert (terms["broker_quantity"], terms["ledger_quantity"]) == (10.04, 10.0)
+    with open_read_only(journal_settings) as conn:
+        state = _journal_state(conn, frozen_window.window_id or 0, fixed_clock())
+        ledger = _ledger(
+            state,
+            live_actions_as_of(conn, CUT),
+            frozen_window,
+            S,
+            FROZEN.reconcile_quantity_tolerance,
+        )
+    assert ledger.positions[SPY] == 10.04
+    fixed_clock.advance(minutes=5)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+
+
+def test_a_late_split_with_an_earlier_ex_date_does_not_change_an_adopted_quantity(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Item 9: a true-up sets the figure. A split row that lands later with an earlier
+    `ex_date` is already in the broker's quantity and is never applied on top; a split
+    with a later `ex_date` still is."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 0.04
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+    later = next_session(S)
+    stamp = session_close(S) + timedelta(hours=2)
+    for ex_date, ratio in ((S - timedelta(days=1), 2.0), (later, 3.0)):
+        _fact(
+            journal_settings,
+            "corporate_actions",
+            security_id=SPY,
+            action_type="split",
+            ex_date=ex_date,
+            ratio_or_amount=ratio,
+            known_at=stamp,
+            ingested_at=stamp,
+            source="alpaca",
+            provenance="action",
+        )
+
+    def quantity(through: date) -> float:
+        with open_read_only(journal_settings) as conn:
+            state = _journal_state(conn, frozen_window.window_id or 0, session_close(through))
+            actions = live_actions_as_of(conn, session_close(through))
+            return _ledger(
+                state, actions, frozen_window, through, FROZEN.reconcile_quantity_tolerance
+            ).positions[SPY]
+
+    assert quantity(S) == pytest.approx(10.04)  # the earlier split is not applied on top
+    assert quantity(later) == pytest.approx(10.04 * 3.0)  # the later one is
+
+
+def test_a_break_still_open_keeps_breaks_while_another_is_accepted(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """T283a's pinned pair: a material break keeps the `breaks` status (and, since
+    T282d, restricts its name and engages nothing); a small one beside it is accepted
+    and its cash stays inside the base, the open one's outside it."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0, (MTUM, "MTUM"): 10.0})
+    _credit(fake, "tiny-credit", 10.0)
+    fake.activities = [
+        *fake.activities,
+        CashActivity("big-credit", "MA", S, "executed", 30.0, "MTUM"),
+    ]
+    fake.extra_cash += 30.0
+
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+
+    (row,) = _rows(journal_settings, frozen_window)
+    payload = json.loads(row.mismatches_json or "")
+    assert row.broker_cash == pytest.approx(100_040.0 - 20 * PRICE - 30.0)
+    assert payload["raw_broker_cash"] == pytest.approx(100_040.0 - 20 * PRICE)
+    ids = {a["activity_id"] for a in payload["activities"]}
+    assert "tiny-credit" in ids and "big-credit" not in ids
+    assert [
+        (e.security_id, e.event, e.material) for e in _events(journal_settings, frozen_window)
+    ] == [
+        (MTUM, "opened", True),
+        (SPY, "opened", False),
+        (SPY, "auto_accepted", False),
+    ]
+    assert [a.broker_activity_id for a in _adjustments(journal_settings, frozen_window)] == [
+        "tiny-credit"
+    ]
+
+
+def test_the_third_ten_dollars_on_one_name_is_material_under_the_cumulative_bound(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Item 5: prior plus this one, so a leak of a few dollars a session cannot be
+    accepted forever. $10, then $10 (cumulative $20) are accepted; the third makes
+    $30 against the $25 bound and is opened material, with no adjustment."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    day = S
+    statuses = []
+    for n in range(3):
+        if n:
+            day = next_session(day)
+            fixed_clock.now = session_close(day) + timedelta(hours=2)
+        _credit(fake, f"leak-{n}", 10.0, day)
+        statuses.append(
+            _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=day).status
+        )
+
+    assert statuses == [OK, OK, "breaks"]
+    events = _events(journal_settings, frozen_window)
+    assert [e.event for e in events] == ["opened", "auto_accepted"] * 2 + ["opened"]
+    assert events[-1].material is True
+    booked = [a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"]
+    assert [a.broker_activity_id for a in booked] == ["leak-0", "leak-1"]
+    assert json.loads(booked[1].explanation_json or "")["cumulative_auto_accepted"] == 20.0
+
+
+def _lag(settings: Settings, fake: BookedFake, run_id: int, clock: FixedClock) -> None:
+    """Leave one acknowledged order partly filled at the broker and unfilled in the
+    journal: the next reconciliation is `fills_lagging`."""
+    _order(
+        settings,
+        run_id,
+        "tp-lag",
+        MTUM,
+        "MTUM",
+        5.0,
+        events=("pending", "accepted"),
+        fill=False,
+        at=clock() - timedelta(minutes=30),
+    )
+    fake.submit(OrderRequest("tp-lag", "MTUM", Side.BUY, quantity=5.0))
+    fake.apply("tp-lag", PartialFill(2.0, PRICE))
+
+
+def test_a_deferred_small_break_is_accepted_by_the_next_eligible_reconciliation(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Item 6: beside a lagging fill the immaterial break is written `opened`, books no
+    adjustment and restricts nothing (the lag keeps T281's halt on the run). The next
+    `ok` reconciliation re-tests it and writes `auto_accepted` with its `auto_true_up`."""
+    run_id = _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _lag(journal_settings, fake, run_id, fixed_clock)
+    _credit(fake, "deferred", 10.0)
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock)
+
+    assert _rows(journal_settings, frozen_window)[-1].status == FILLS_LAGGING
+    assert [(e.event, e.material) for e in _events(journal_settings, frozen_window)] == [
+        ("opened", False)
+    ]
+    assert [
+        a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
+    ] == []
+    with open_read_only(journal_settings) as conn:
+        events = break_events_for(conn, frozen_window.window_id or 0)
+        assert break_rules.restricted_names(events) == frozenset()
+
+    # The lag clears: the fill is journaled, the order terminal at the broker.
+    fixed_clock.advance(minutes=5)
+    _journal_fill(journal_settings, "tp-lag", 2.0, at=fixed_clock(), accept=False)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+
+    events = _events(journal_settings, frozen_window)
+    assert [e.event for e in events] == ["opened", "auto_accepted"]
+    assert events[0].break_id == events[1].break_id
+    assert [
+        a.broker_activity_id
+        for a in _adjustments(journal_settings, frozen_window)
+        if a.kind == "auto_true_up"
+    ] == ["deferred"]
+
+
+def test_a_deferred_small_break_that_grows_past_materiality_stays_open_and_material(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """PR #2267 pass 6: re-tested at the eligible reconciliation, the break is $40: it is
+    `observed` material, restricts its name and books no automatic adjustment."""
+    run_id = _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _lag(journal_settings, fake, run_id, fixed_clock)
+    _credit(fake, "deferred", 10.0)
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock)
+    fixed_clock.advance(minutes=5)
+    _journal_fill(journal_settings, "tp-lag", 2.0, at=fixed_clock(), accept=False)
+    _credit(fake, "grown", 30.0)
+
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+
+    events = _events(journal_settings, frozen_window)
+    assert [(e.event, e.material, e.dollar_size) for e in events] == [
+        ("opened", False, 10.0),
+        ("observed", True, 40.0),
+    ]
+    assert [
+        a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
+    ] == []
+    with open_read_only(journal_settings) as conn:
+        assert break_rules.restricted_names(
+            break_events_for(conn, frozen_window.window_id or 0)
+        ) == {SPY}
+
+    # And once material, a break that shrinks is not auto-accepted ("material from then on").
+    fake.activities = [a for a in fake.activities if a.activity_id != "grown"]
+    fake.extra_cash -= 30.0
+    fixed_clock.advance(minutes=5)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+    assert [
+        a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
+    ] == []
+
+
+def test_opposite_cash_activities_do_not_net_into_an_immaterial_break(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Safety pass 1: +$30 and -$30 on one name net to $0 but are $60 of activity:
+    the break is judged on the gross and stays open, restricted, unadjusted."""
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    _credit(fake, "plus", 30.0)
+    _credit(fake, "minus", -30.0)
+
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
+
+    assert [(e.event, e.material) for e in _events(journal_settings, frozen_window)] == [
+        ("opened", True)
+    ]
+    assert [
+        a for a in _adjustments(journal_settings, frozen_window) if a.kind == "auto_true_up"
+    ] == []
+
+
+def test_a_fill_journaled_after_a_true_up_is_not_overwritten_by_it(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Quant/safety pass 1: the true-up is the broker's figure at its read; a fill
+    journaled later on the same session adds to it."""
+    run_id = _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity["SPY"] = 0.04
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == OK
+    fixed_clock.advance(minutes=5)
+    _order(
+        journal_settings,
+        run_id,
+        "tp-after",
+        SPY,
+        "SPY",
+        5.0,
+        at=fixed_clock(),
+    )
+    with open_read_only(journal_settings) as conn:
+        state = _journal_state(conn, frozen_window.window_id or 0, fixed_clock())
+        ledger = _ledger(
+            state,
+            live_actions_as_of(conn, CUT),
+            frozen_window,
+            S,
+            FROZEN.reconcile_quantity_tolerance,
+        )
+    assert ledger.positions[SPY] == pytest.approx(15.04)

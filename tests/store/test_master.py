@@ -27,6 +27,7 @@ import pytest
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 
 from tradepartner.adapters.alpaca_prices import ListingResolver, registrant_evidence
+from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
@@ -37,6 +38,8 @@ from tradepartner.adapters.filings import (
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.config import Settings
+from tradepartner.ingest import _filename_counts, _Recorded
+from tradepartner.store import filing_index as stored_index
 from tradepartner.store import schema
 from tradepartner.store.asof import listings_as_of
 from tradepartner.store.db import configure_connection, insert_row
@@ -48,6 +51,10 @@ from tradepartner.store.master import (
     MasterBuild,
     ShownSpan,
     Succession,
+    _Builder,
+    _filing_index_by_cik,
+    _filing_index_for_cik,
+    _filing_index_for_forms,
     _refuse_separator,
     build_chains,
     build_master,
@@ -61,6 +68,40 @@ from tradepartner.store.master import (
 )
 
 INGESTED_AT = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+
+
+def test_cross_cik_and_per_cik_index_queries_skip_full_materialization(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = Settings(_env_file=None, edgar={"cache_dir": str(tmp_path)})
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    rows = [
+        stored_index.Listing(
+            cik,
+            f"{cik}-26-{i:06d}",
+            form,
+            "Issuer",
+            date(2026, 9, 24),
+            INGESTED_AT - timedelta(days=1),
+            date(2026, 9, 24),
+            True,
+        )
+        for i, (cik, form) in enumerate(
+            ((ACME, "10-K"), (OLDCO, "10-K"), (OLDCO, "8-K12B")), start=1
+        )
+    ]
+    stored_index.insert_listings(conn, rows, INGESTED_AT)
+    source = EdgarFilingSource(settings, clock=lambda: INGESTED_AT)
+    source.use_index(conn, touched_ciks=frozenset({ACME}))
+    monkeypatch.setattr(source, "filing_index", lambda *_args: pytest.fail("full index"))
+    assert [row.cik for row in _filing_index_for_cik(source, ACME)] == [ACME]
+    assert [row.cik for row in _filing_index_for_forms(source, {"8-K12B"})] == [OLDCO]
+    recorded = _Recorded(source)
+    assert [row.cik for row in _filing_index_for_cik(recorded, ACME)] == [ACME]
+    assert [row.cik for row in _filing_index_for_forms(recorded, {"8-K12B"})] == [OLDCO]
+
+
 FETCHED_AT = datetime(2026, 9, 24, 14, 0, tzinfo=UTC)
 
 ACME = "0000000001"  # 10-K filer from 2005; a Form 4 names it as subject earlier
@@ -323,6 +364,26 @@ def test_filename_form25_row_takes_the_first_session_not_the_recorded_date() -> 
     assert [(r["ticker"], r["valid_from"]) for r in rows] == [("EXIT", first_session(settings))]
 
 
+def test_filename_form25_exhibit_name_that_is_no_symbol_writes_no_row() -> None:
+    """#2941: a Form 25 exhibit file name outside the symbol shape is
+    residue, not a ticker: no row, counted with the 10-K refusals."""
+    cik = "0000000991"
+    exit_at = _at(2018, 6, 1)
+    source = FixtureFilingSource(
+        index=[FilingIndexEntry(cik, "Exit", "S-1", "s1", exit_at)],
+        delistings=[DelistingFiling(cik, "25-NSE", "Common Stock", "NASDAQ", "exit", exit_at)],
+        filename_listings=[
+            FilenameListing(
+                cik, "exit", "25-NSE", exit_at, date(2018, 6, 1), "exit2018", "NASDAQ", None, None
+            )
+        ],
+    )
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    assert not [r for r in on.listings if r["provenance"] == "filing_name"]
+    assert on.filename_counts["filename_refused_symbol"] == 1
+    assert on.filename_counts.get("filename_form25_rows", 0) == 0
+
+
 def test_filename_form25_is_last_resort_and_makes_delisting_resolve() -> None:
     annual_cik, fallback_cik = "0000000997", "0000000996"
     annual_at, exit_at = _at(2016, 3, 1), _at(2018, 6, 1)
@@ -361,6 +422,58 @@ def test_filename_form25_is_last_resort_and_makes_delisting_resolve() -> None:
         (annual_cik, "ANN", annual_at),
     ]
     assert build_delistings(source.delistings(), on, ingested_at=INGESTED_AT).unmatched == ()
+
+
+def _combined_10k_source() -> FixtureFilingSource:
+    """#2941: AAL Group and American Airlines on one combined 10-K, read by
+    filename under both CIKs; FSN keys the filing to the parent, so the
+    subsidiary's reading is a co-registrant's. Plus one filename leftover."""
+    parent, subsidiary, leftover = "0000006201", "0000004515", "0000065984"
+    accepted = _at(2016, 2, 24)
+    shared = "0000006201-16-000014"
+
+    def reading(cik: str, accession: str, ticker: str, coregistrant: bool) -> FilenameListing:
+        return FilenameListing(
+            cik,
+            accession,
+            "10-K",
+            accepted,
+            date(2016, 2, 24),
+            ticker,
+            "NASDAQ",
+            "Common Stock",
+            None,
+            coregistrant,
+        )
+
+    return FixtureFilingSource(
+        index=[
+            FilingIndexEntry(parent, "AAL Group", "10-K", shared, accepted),
+            FilingIndexEntry(subsidiary, "American Airlines Inc", "10-K", shared, accepted),
+            FilingIndexEntry(leftover, "Entergy", "10-K", "0000065984-16-000001", accepted),
+        ],
+        filename_listings=[
+            reading(parent, shared, "aal", False),
+            reading(subsidiary, shared, "aal", True),
+            reading(leftover, "0000065984-16-000001", "etr-12312015x10k", False),
+        ],
+    )
+
+
+def test_filename_coregistrant_and_leftover_prefixes_write_no_row_and_are_counted() -> None:
+    source = _combined_10k_source()
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    rows = [r for r in on.listings if r["provenance"] == "filing_name"]
+    assert [(r["security_id"], r["ticker"]) for r in rows] == [("0000006201", "AAL")]
+    assert on.filename_counts["filename_refused_coregistrant"] == 1
+    assert on.filename_counts["filename_refused_symbol"] == 1
+    # Neither refusal is a missing instance: each 10-K was read.
+    assert on.filename_counts["filename_no_instance"] == 0
+    delistings = build_delistings(source.delistings(), on, ingested_at=INGESTED_AT)
+    message = _filename_counts(on, delistings, source)
+    assert "filename_refused_coregistrant: 1" in message
+    assert "filename_refused_symbol: 1" in message
+    assert "filename_entity_unknown: 0" in message  # the fixture source counts none
 
 
 def test_filename_confirmation_uses_first_cover_filing_only() -> None:
@@ -2290,9 +2403,10 @@ def test_chain_candidates_need_an_end_within_the_window() -> None:
 
 RENAMED = "0000000098"  # 10-K from 2010, never a cover page: snapshot-only
 F1 = datetime(2026, 10, 3, 18, 0, tzinfo=UTC)  # a Saturday fetch: session 10-05
-F2 = datetime(2026, 10, 25, 18, 47, tzinfo=UTC)  # a Sunday fetch: session 10-26
-F3 = datetime(2026, 10, 27, 23, 0, tzinfo=UTC)
-RENAME_AT = datetime(2026, 10, 28, 2, 0, tzinfo=UTC)
+F2 = datetime(2026, 10, 26, 18, 47, tzinfo=UTC)  # a Monday fetch: session 10-26
+F3 = datetime(2026, 10, 28, 23, 0, tzinfo=UTC)
+NEXT_FETCH = F2 + timedelta(days=1)  # Tuesday's consecutive nightly fetch
+RENAME_AT = datetime(2026, 10, 31, 2, 0, tzinfo=UTC)
 
 
 def _renamed_source(*snaps: CompanySnapshotEntry, covers: tuple[CoverPage, ...] = ()) -> Any:
@@ -2338,11 +2452,41 @@ class TestSnapshotRename:
     """#2291: each nightly run sees only the current SEC ticker file, so the
     build is handed the fetches the store's snapshot rows record."""
 
-    def test_a_later_ticker_is_a_dated_snapshot_row(self) -> None:
+    def test_one_new_ticker_fetch_writes_no_rename(self) -> None:
         build = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+
+    def test_two_consecutive_new_ticker_fetches_date_the_second(self) -> None:
+        build = _rename_build([_rn("RNB", NEXT_FETCH)], [_rn("RNA", F1), _rn("RNB", F2)])
         assert _renamed_rows(build) == [
             STATIC_ROW,
-            ("RNB", "OTC", "snapshot", date(2026, 10, 26), F2),
+            ("RNB", "OTC", "snapshot", date(2026, 10, 26), NEXT_FETCH),
+        ]
+
+    def test_two_fetches_in_one_session_do_not_confirm_a_rename(self) -> None:
+        later_same_session = F2 + timedelta(hours=2)
+        build = _rename_build([_rn("RNB", later_same_session)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+
+    def test_a_pending_ticker_must_keep_its_exchange(self) -> None:
+        build = _rename_build([_rn("RNB", NEXT_FETCH, "NYSE")], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+
+    def test_new_ticker_then_old_ticker_back_writes_no_rename(self) -> None:
+        build = _rename_build([_rn("RNA", NEXT_FETCH)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(build) == [STATIC_ROW]
+
+    def test_confirmation_is_not_visible_before_second_fetch(self) -> None:
+        before = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)])
+        after = _rename_build([_rn("RNB", NEXT_FETCH)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(before) == [STATIC_ROW]
+        assert all(row[4] >= NEXT_FETCH for row in _renamed_rows(after)[1:])
+
+    def test_a_later_ticker_is_a_dated_snapshot_row(self) -> None:
+        build = _rename_build([_rn("RNB", NEXT_FETCH)], [_rn("RNA", F1), _rn("RNB", F2)])
+        assert _renamed_rows(build) == [
+            STATIC_ROW,
+            ("RNB", "OTC", "snapshot", date(2026, 10, 26), NEXT_FETCH),
         ]
         assert build.unmatched_snapshot == ()
 
@@ -2355,15 +2499,23 @@ class TestSnapshotRename:
     def test_the_same_history_derives_the_same_rows(self) -> None:
         once = _rename_build([_rn("RNB", F2)], [_rn("RNA", F1)])
         again = _rename_build([_rn("RNB", F3)], [_rn("RNA", F1), _rn("RNB", F2)])
-        assert _renamed_rows(again) == _renamed_rows(once)
+        assert _renamed_rows(once) == [STATIC_ROW]
+        assert _renamed_rows(again) == [
+            STATIC_ROW,
+            ("RNB", "OTC", "snapshot", date(2026, 10, 26), F3),
+        ]
         assert again.unmatched_snapshot == ()
 
     def test_a_rename_back_is_followed(self) -> None:
-        build = _rename_build([_rn("RNA", F3)], [_rn("RNA", F1), _rn("RNB", F2)])
+        back_confirmed = F3 + timedelta(days=1)
+        build = _rename_build(
+            [_rn("RNA", back_confirmed)],
+            [_rn("RNA", F1), _rn("RNB", F2), _rn("RNB", NEXT_FETCH), _rn("RNA", F3)],
+        )
         assert _renamed_rows(build) == [
             STATIC_ROW,
-            ("RNB", "OTC", "snapshot", date(2026, 10, 26), F2),
-            ("RNA", "OTC", "snapshot", date(2026, 10, 27), F3),
+            ("RNB", "OTC", "snapshot", date(2026, 10, 26), NEXT_FETCH),
+            ("RNA", "OTC", "snapshot", date(2026, 10, 28), back_confirmed),
         ]
 
     def test_a_class_with_a_cover_page_is_still_reported(self) -> None:
@@ -2373,11 +2525,15 @@ class TestSnapshotRename:
         assert "RNB" not in {row[0] for row in _renamed_rows(build)}
 
     def test_a_rename_on_the_spans_own_session_is_reported(self) -> None:
-        # F2 and a second fetch the same session: a row there would tie RNB's start.
-        same_session = F2 + timedelta(hours=2)
-        build = _rename_build([_rn("RNC", same_session)], [_rn("RNA", F1), _rn("RNB", F2)])
-        assert [e.ticker for e in build.unmatched_snapshot] == ["RNC"]
-        assert [row[0] for row in _renamed_rows(build)] == ["RNA", "RNB"]
+        # A second ticker on the span's own session cannot start another row.
+        same_session = F1 + timedelta(hours=2)
+        build = _rename_build(
+            [_rn("RNC", same_session)],
+            [_rn("RNA", F1)],
+            _settings(master={"static_columns": ["name"]}),
+        )
+        assert [row[0] for row in _renamed_rows(build)] == ["RNA"]
+        assert [entry.ticker for entry in build.unmatched_snapshot] == ["RNC"]
 
     def test_a_delisted_name_absent_from_the_fetch_gets_no_new_row(self) -> None:
         build = _rename_build([_snap(ACME, "ACME", "ACME", "NYSE", F2)], [_rn("RNA", F1)])
@@ -2419,7 +2575,6 @@ class TestStoredSnapshotFetches:
             fetches = stored_snapshot_fetches(conn, RENAME_AT)
         assert [(e.cik, e.ticker, e.exchange, e.fetched_at) for e in fetches] == [
             (RENAMED, "RNA", "OTC", F1),
-            (RENAMED, "RNB", "OTC", F2),
         ]
 
     def test_filing_rows_retracted_rows_and_benchmarks_are_not_fetches(self) -> None:
@@ -2441,3 +2596,343 @@ class TestStoredSnapshotFetches:
         assert "PRE" in {e.ticker for e in before}
         assert not {"SPY", "MTUM", "TCKA", "TCKB"} & set(tickers)  # config, filing
         assert {e.ticker for e in fetches} == {"ACME", "DUA", "STDY", "ERLA"}
+
+
+# --- #2927: per-CIK reads group the index and the build's rows once --------
+
+
+class _CountingEntries(tuple[FilingIndexEntry, ...]):
+    """A full filing index, counting each pass over it."""
+
+    passes = 0
+
+    def __iter__(self) -> Iterator[FilingIndexEntry]:
+        type(self).passes += 1
+        return super().__iter__()
+
+
+class _CountingIndexSource(FixtureFilingSource):
+    """A fixture source whose full index counts the passes made over it."""
+
+    def filing_index(self, since: datetime | None = None) -> list[FilingIndexEntry]:
+        return _CountingEntries(super().filing_index(since))  # type: ignore[return-value]
+
+
+def _filename_world(ciks: int) -> dict[str, Any]:
+    """`ciks` issuers, each with pre-2019 10-Ks read by filename, a 2019
+    cover page, and (every third) a second class and a Form 25 by filename,
+    the index in acceptance order so each CIK's rows are spread through it."""
+    index: list[FilingIndexEntry] = []
+    pages: list[CoverPage] = []
+    names: list[FilenameListing] = []
+    delisted: list[DelistingFiling] = []
+    for c in range(ciks):
+        cik = f"{5000 + c:010d}"
+        # Letters only (#2941: a digit is no symbol): T, then c in base 26.
+        ticker = "T" + chr(65 + c // 26) + chr(65 + c % 26)
+        for year, form in ((2014, "8-K"), (2015, "10-K"), (2016, "10-K"), (2016, "10-Q")):
+            at = _at(year, 3, 2) + timedelta(minutes=c)
+            accession = f"{cik}-{year % 100:02d}-{form[-1]}{c:05d}"
+            index.append(FilingIndexEntry(cik, f"Co {c}", form, accession, at))
+            if form == "10-K":
+                day = at.date()
+                names.append(
+                    FilenameListing(
+                        cik, accession, "10-K", at, day, ticker, "NYSE", "Common Stock", ticker
+                    )
+                )
+        listed = [("Common Stock", ticker, "NYSE")]
+        if c % 3 == 0:
+            listed.append(("Warrants", f"{ticker}W", "NYSE"))
+            at = _at(2018, 6, 1) + timedelta(minutes=c)
+            accession = f"{cik}-18-25{c:05d}"
+            names.append(
+                FilenameListing(
+                    cik, accession, "25-NSE", at, date(2018, 6, 1), f"{ticker}W", "NYSE", None, None
+                )
+            )
+            delisted.append(DelistingFiling(cik, "25-NSE", "Warrants", "NYSE", accession, at))
+        pages.append(
+            CoverPage(
+                cik,
+                f"{cik}-19-cov{c:04d}",
+                _at(2019, 3, 1) + timedelta(minutes=c),
+                tuple(CoverListing(title, tick, exchange) for title, tick, exchange in listed),
+            )
+        )
+    index.sort(key=lambda e: (e.accepted_at, e.accession, e.cik))
+    return {
+        "index": index,
+        "cover_pages": pages,
+        "filename_listings": names,
+        "delistings": delisted,
+    }
+
+
+def _only(world: dict[str, Any], cik: str) -> dict[str, Any]:
+    return {key: [item for item in rows if item.cik == cik] for key, rows in world.items()}
+
+
+def test_filename_build_gives_each_cik_what_building_it_alone_gives() -> None:
+    """#2927: grouping the index and the build's rows per CIK changes no
+    CIK's rows: the whole build's rows for a CIK are, in order, the rows a
+    build of that CIK alone makes, and the filename counts add up."""
+    world = _filename_world(30)
+    settings = _settings(edgar={"filename_listings": True})
+    whole = build_master(FixtureFilingSource(**world), settings, ingested_at=INGESTED_AT)
+    named = [r for r in whole.listings if r["provenance"] == "filing_name"]
+    assert len({security_cik(r["security_id"]) for r in named}) == 30
+    totals: dict[str, int] = {}
+    for c in range(30):
+        cik = f"{5000 + c:010d}"
+        alone = build_master(
+            FixtureFilingSource(**_only(world, cik)), settings, ingested_at=INGESTED_AT
+        )
+        assert [r for r in whole.listings if security_cik(r["security_id"]) == cik] == list(
+            alone.listings
+        )
+        for key, value in alone.filename_counts.items():
+            totals[key] = totals.get(key, 0) + value
+    assert totals == whole.filename_counts
+    assert whole.filename_counts["filename_10ks_read"] == 60
+
+
+def test_builder_cik_listings_equal_the_filter_in_order() -> None:
+    """#2927: `_Builder.cik_listings` is the filter of every row by
+    `security_cik`, in row order, across interleaved CIKs and classes."""
+    builder = _Builder(_settings(), INGESTED_AT)
+    ids = ["0000000001", "0000000002:b", "0000000001:pfd", "0000000002", "0000000001@x"]
+    for n in range(40):
+        builder.listing(ids[n % 5], f"T{n}", "NYSE", None, date(2019, 1, 2), _at(2019, 1, 1))
+    for cik in ("0000000001", "0000000002", "0000000003"):
+        expected = [r for r in builder.listings if security_cik(r["security_id"]) == cik]
+        assert list(builder.cik_listings(cik)) == expected
+    assert builder.cik_listings("0000000003") == ()
+
+
+def test_filename_build_reads_the_full_index_once_however_many_ciks() -> None:
+    """#2927 (T184h): with `edgar.filename_listings` on, `build_master`
+    filtered the whole ~15M-entry index once per issuer CIK (~0.8 s x 58k,
+    ~13 h). The index is now read in one pass per build."""
+    _CountingEntries.passes = 0
+    source = _CountingIndexSource(**_filename_world(200))
+    build = build_master(
+        source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT
+    )
+    assert build.filename_counts["filename_10ks_read"] == 400
+    assert _CountingEntries.passes == 1  # was 201
+
+
+def test_filename_build_never_walks_every_row_per_cik(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#2927: `_filename_rows` walked all of `builder.listings` up to three
+    times per CIK (quadratic in the build). Only the build's own end reads
+    walk them now, however many CIKs."""
+
+    class Rows(list[dict[str, Any]]):
+        passes = 0
+
+        def __iter__(self) -> Iterator[dict[str, Any]]:
+            type(self).passes += 1
+            return super().__iter__()
+
+    init = _Builder.__init__
+
+    def counting_init(self: _Builder, settings: Settings, ingested_at: datetime) -> None:
+        init(self, settings, ingested_at)
+        self.listings = Rows()
+
+    monkeypatch.setattr(_Builder, "__init__", counting_init)
+    settings = _settings(edgar={"filename_listings": True})
+    for ciks in (20, 200):
+        Rows.passes = 0
+        build_master(
+            FixtureFilingSource(**_filename_world(ciks)), settings, ingested_at=INGESTED_AT
+        )
+        assert Rows.passes <= 2, (ciks, Rows.passes)
+
+
+def test_filing_index_by_cik_reads_a_full_index_once_in_order() -> None:
+    """#2927: a source with no CIK query (the `_filing_index_for_cik`
+    fallback, read per CIK by `classify._evidence` and `build_chains`) has
+    its full index read once for every CIK asked, each CIK's entries the
+    old per-CIK filter's, in order."""
+    world = _filename_world(50)
+    source = _CountingIndexSource(**world)
+    ciks = [*sorted({e.cik for e in world["index"]}), "0000999999"]
+    _CountingEntries.passes = 0
+    grouped = _filing_index_by_cik(source, ciks)
+    assert _CountingEntries.passes == 1
+    for cik in ciks:
+        assert grouped[cik] == [e for e in world["index"] if e.cik == cik]
+        assert grouped[cik] == _filing_index_for_cik(source, cik)
+    assert grouped["0000999999"] == []
+
+
+def _avy_world(cik: str = "0000008818") -> dict[str, Any]:
+    """#2929: Avery Dennison's shape. A pre-cover 10-K, a 2019 cover page
+    naming the common and the `AVY25` notes, and a Nasdaq-style Form 25
+    whose exhibit file name spells the notes' ticker in lower case."""
+    annual_at, cover_at, exit_at = _at(2016, 3, 1), _at(2019, 2, 27), _at(2025, 2, 20)
+    exit_acc = f"{cik}-25-000151"
+    return {
+        "index": [FilingIndexEntry(cik, "Avery Dennison", "10-K", f"{cik}-16-1", annual_at)],
+        "cover_pages": [
+            CoverPage(
+                cik,
+                f"{cik}-19-1",
+                cover_at,
+                (
+                    CoverListing("Common Stock", "AVY", "NYSE"),
+                    CoverListing("1.25% Senior Notes due 2025", "AVY25", "NYSE"),
+                ),
+            )
+        ],
+        "filename_listings": [
+            FilenameListing(
+                cik, f"{cik}-16-1", "10-K", annual_at, annual_at.date(), "avy", "NYSE", None, None
+            ),
+            FilenameListing(
+                cik, exit_acc, "25-NSE", exit_at, exit_at.date(), "avy25", "NYSE", None, None
+            ),
+        ],
+        "delistings": [
+            DelistingFiling(cik, "25-NSE", "1.25% Senior Notes due 2025", "NYSE", exit_acc, exit_at)
+        ],
+    }
+
+
+def test_filename_lowercase_form25_ticker_maps_to_the_cover_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2929: the Form 25 file name's `avy25` is the cover page's `AVY25`, so
+    both readings name the notes class: no conflict, no abort."""
+    import tradepartner.store.master as master_module
+
+    seen: list[Any] = []
+    real = master_module.confirm_filename_listings
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(master_module, "confirm_filename_listings", spy)
+    cik = "0000008818"
+    build = build_master(
+        FixtureFilingSource(**_avy_world(cik)),
+        _settings(edgar={"filename_listings": True}),
+        ingested_at=INGESTED_AT,
+    )
+    notes = next(r["security_id"] for r in build.listings if r["ticker"] == "AVY25")
+    assert notes != cik  # the notes are a class of their own
+    (call,) = seen
+    (cover,) = call["cover_readings"]
+    (exhibit,) = call["form25_readings"]
+    assert {t.ticker.upper(): t.class_id for t in cover.tickers}["AVY25"] == notes
+    assert exhibit.tickers[0].class_id == notes
+    assert build.filename_counts.get("filename_conflicts", 0) == 0
+    assert build.filename_conflict_ciks == ()
+    # The Form 25 names the notes, already listed by the cover page: no row.
+    assert not [
+        r for r in build.listings if r["provenance"] == "filing_name" and r["security_id"] == notes
+    ]
+
+
+def _conflict_world(cik: str) -> dict[str, Any]:
+    """A true conflict: `ZZ` names class A on the first cover page and class
+    B on the latest, so a Form 25 for `ZZ` reads class B against the first
+    cover's class A."""
+    annual_at = _at(2016, 3, 1)
+    return {
+        "index": [FilingIndexEntry(cik, "Swapper", "10-K", f"{cik}-16-1", annual_at)],
+        "cover_pages": [
+            CoverPage(
+                cik,
+                f"{cik}-19-1",
+                _at(2019, 2, 1),
+                (
+                    CoverListing("Class A Common Stock", "ZZ", "NYSE"),
+                    CoverListing("Class B Common Stock", "ZB", "NYSE"),
+                ),
+            ),
+            CoverPage(
+                cik,
+                f"{cik}-22-1",
+                _at(2022, 2, 1),
+                (
+                    CoverListing("Class A Common Stock", "ZA", "NYSE"),
+                    CoverListing("Class B Common Stock", "ZZ", "NYSE"),
+                ),
+            ),
+        ],
+        "filename_listings": [
+            FilenameListing(
+                cik, f"{cik}-16-1", "10-K", annual_at, annual_at.date(), "ZZ", "NYSE", None, None
+            ),
+            FilenameListing(
+                cik,
+                f"{cik}-23-25",
+                "25-NSE",
+                _at(2023, 6, 1),
+                date(2023, 6, 1),
+                "zz",
+                "NYSE",
+                None,
+                None,
+            ),
+        ],
+        "delistings": [
+            DelistingFiling(
+                cik, "25-NSE", "Class B Common Stock", "NYSE", f"{cik}-23-25", _at(2023, 6, 1)
+            )
+        ],
+    }
+
+
+def test_filename_conflict_fails_closed_for_its_cik_only() -> None:
+    """#2929: a ticker read for two classes writes no filename row for that
+    CIK, is counted and named, and changes no other CIK's rows."""
+    bad = "0000004999"
+    world = _filename_world(6)
+    conflict = _conflict_world(bad)
+    mixed = {key: [*conflict.get(key, []), *rows] for key, rows in world.items()}
+    mixed["index"].sort(key=lambda e: (e.accepted_at, e.accession, e.cik))
+    settings = _settings(edgar={"filename_listings": True})
+    clean = build_master(FixtureFilingSource(**world), settings, ingested_at=INGESTED_AT)
+    build = build_master(FixtureFilingSource(**mixed), settings, ingested_at=INGESTED_AT)
+    assert build.filename_counts["filename_conflicts"] == 1
+    assert build.filename_conflict_ciks == (bad,)
+    assert not [
+        r
+        for r in build.listings
+        if r["provenance"] == "filing_name" and security_cik(r["security_id"]) == bad
+    ]
+    assert [r for r in build.listings if security_cik(r["security_id"]) != bad] == list(
+        clean.listings
+    )
+    assert clean.filename_counts.get("filename_conflicts", 0) == 0
+    alone = build_master(FixtureFilingSource(**conflict), settings, ingested_at=INGESTED_AT)
+    assert [r for r in build.listings if security_cik(r["security_id"]) == bad] == list(
+        alone.listings
+    )
+
+
+def test_chain_candidates_ignore_a_predecessor_row_after_the_handover() -> None:
+    """#2939: a predecessor that keeps filing under the old ticker after the
+    successor's first listing row (ExxonMobil's 2026-08-03 co-filed 10-Q gave
+    the old CIK a NYSE row after the new CIK's 2026-07-07 row) is still the
+    pair's predecessor: its last row *at or before* the hand-over bounds the
+    gap, a row after it never hides the candidate."""
+    source = _combined_chain_source("chain_1to1")
+    settings = _settings()
+    master = build_master(source, settings, ingested_at=INGESTED_AT)
+    template = next(r for r in master.listings if r["security_id"] == "0001000010")
+    late = {
+        **template,
+        "valid_from": date(2020, 3, 2),
+        "known_at": datetime(2020, 3, 2, 21, 0, tzinfo=UTC),
+    }
+    master = replace(master, listings=(*master.listings, late))
+    candidates = chain_candidates(source, settings, master, delistings=_chain_delistings())
+    assert [(c.successor_id, c.predecessor_id, c.sessions) for c in candidates] == [
+        ("0001000011", "0001000010", 18)
+    ]

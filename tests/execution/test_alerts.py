@@ -57,6 +57,7 @@ SPEC_KINDS = (
     "missing_candidate_bar",  # #1997, 2026-10-20 (paper spec amendment, req 11)
     "skipped",  # T202, 2026-10-18 (paper spec amendment items 2 and 11, ADR 0023 D2)
     "pending_unresolved",  # T202b, 2026-10-18 (paper spec amendment items 4 and 11)
+    "reconcile_break",  # T284, 2026-10-26 (paper spec amendment #2266, items 4 and 12)
 )
 
 
@@ -689,3 +690,119 @@ def test_run_failed_may_have_no_run_and_then_dedupes_per_book_and_session(
     for kind in ("halted", "stale_data", "kill_switch", "drawdown"):
         with pytest.raises(ValueError, match="run"):
             alerter.write(kind, None, _SESSION, "m")
+
+
+# --- reconcile_break (paper spec #2266 item 12; T284) --------------------------------
+
+
+def _break_event(
+    event: str,
+    event_id: int,
+    *,
+    break_id: str = "1:SEC_A:3",
+    first_seen: date = date(2026, 10, 1),
+    known_at: datetime = _NOW,
+) -> Any:
+    from tradepartner.store.journal import ReconcileBreakRow
+
+    return ReconcileBreakRow(
+        event_id=event_id,
+        break_id=break_id,
+        window_id=1,
+        book_id="main",
+        event=event,
+        parts_json='[{"kind": "quantity", "cause": "corporate_action"}]',
+        cause="corporate_action",
+        security_id="SEC_A",
+        symbol="AAA",
+        dollar_size=40.0,
+        material=True,
+        first_seen_session=first_seen,
+        reconciliation_id=3,
+        known_at=known_at,
+        ingested_at=known_at,
+    )
+
+
+def test_break_age_counts_sessions_through_s_both_ends() -> None:
+    thursday = date(2026, 10, 1)
+    assert alerts.break_age(thursday, thursday) == 1
+    assert alerts.break_age(thursday, date(2026, 10, 5)) == 3  # Thu, Fri, Mon
+    assert alerts.break_age(thursday, date(2026, 9, 30)) == 0
+
+
+def test_the_message_names_new_and_aged_breaks_and_skips_old_young_and_closed_ones() -> None:
+    before = _NOW - timedelta(days=1)
+    new = _break_event("opened", 1, break_id="1:NEW:1")
+    old_young = _break_event("opened", 2, break_id="1:OLD:1", known_at=before - timedelta(hours=1))
+    aged = _break_event(
+        "observed", 3, break_id="1:AGED:1", first_seen=date(2026, 9, 1), known_at=before
+    )
+    closed = _break_event("opened", 4, break_id="1:SHUT:1")
+    shut = _break_event("trued_up", 5, break_id="1:SHUT:1")
+    message = alerts.reconcile_break_message(
+        [new, old_young, aged, closed, shut],
+        book_id="main",
+        session=_SESSION,
+        max_age_sessions=5,
+        opened_after=before,
+    )
+    assert message is not None
+    assert "1:NEW:1" in message and "1:AGED:1" in message and "AGED past 5" in message
+    assert "1:OLD:1" not in message and "1:SHUT:1" not in message
+    assert 'tradepartner paper true-up --book main --break 1:NEW:1 --reason "<why>"' in message
+    assert (
+        alerts.reconcile_break_message(
+            [old_young], book_id="main", session=_SESSION, max_age_sessions=5, opened_after=before
+        )
+        is None
+    )
+
+
+def test_a_reconcile_break_alert_is_deduped_per_run(conn: duckdb.DuckDBPyConnection) -> None:
+    alerter = _alerter(conn, _settings())
+    first = alerter.write("reconcile_break", 7, _SESSION, "one")
+    assert alerter.write("reconcile_break", 7, _SESSION, "two") == first
+    assert alerter.write("reconcile_break", 8, _SESSION, "next run") != first
+    with pytest.raises(ValueError, match="run"):
+        alerter.write("reconcile_break", None, _SESSION, "no run")
+
+
+def test_a_break_is_aged_only_past_the_limit_not_at_it() -> None:
+    # first seen Thu 2026-10-01: 5 sessions old on Wed 10-07, 6 on Thu 10-08
+    event = _break_event("opened", 1)
+    assert not alerts.is_aged(event, date(2026, 10, 7), 5)
+    assert alerts.is_aged(event, date(2026, 10, 8), 5)
+    assert not alerts.is_aged(_break_event("trued_up", 2), date(2026, 12, 1), 5)
+
+
+def test_the_cut_skips_runs_that_wrote_no_break_alert() -> None:
+    # safety review of PR #2916: a break opened by a run that then halted is still
+    # new to the next run, so the cut is the last run ended through `_finish`
+    ok_at, halted_at = _NOW - timedelta(days=2), _NOW - timedelta(days=1)
+    runs = [("ok", ok_at), ("halted", halted_at), ("failed", _NOW), ("stale", _NOW)]
+    assert alerts.break_alert_cut(runs) == ok_at
+    assert alerts.break_alert_cut([("skipped_kill_switch", halted_at)]) == halted_at
+    assert alerts.break_alert_cut([("halted", halted_at)]) is None
+    opened_in_halted_run = _break_event("opened", 1, known_at=halted_at - timedelta(hours=1))
+    message = alerts.reconcile_break_message(
+        [opened_in_halted_run],
+        book_id="main",
+        session=_SESSION,
+        max_age_sessions=5,
+        opened_after=alerts.break_alert_cut(runs),
+    )
+    assert message is not None and "1:SEC_A:3" in message
+
+
+def test_a_reopened_break_is_named_again() -> None:
+    before = _NOW - timedelta(days=1)
+    rows = [
+        _break_event("opened", 1, known_at=before - timedelta(days=1)),
+        _break_event("trued_up", 2, known_at=before - timedelta(hours=2)),
+        _break_event("reopened", 3),
+    ]
+    message = alerts.reconcile_break_message(
+        rows, book_id="main", session=_SESSION, max_age_sessions=5, opened_after=before
+    )
+    assert message is not None and "1:SEC_A:3" in message

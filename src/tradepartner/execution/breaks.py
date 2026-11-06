@@ -354,7 +354,7 @@ def restricted_names(events: Iterable[ReconcileBreakRow]) -> frozenset[str]:
     return frozenset(
         e.security_id
         for e in open_breaks(events).values()
-        if e.material and e.security_id is not None
+        if (e.material or e.event == "reopened") and e.security_id is not None
     )
 
 
@@ -363,7 +363,9 @@ def cap_exceeded(
 ) -> bool:
     """Item 5's `break_cap` over the window's break events: whether the open
     material breaks (immaterial and closed ones do not count) pass the cap."""
-    sizes = [e.dollar_size for e in open_breaks(events).values() if e.material]
+    sizes = [
+        e.dollar_size for e in open_breaks(events).values() if e.material or e.event == "reopened"
+    ]
     return over_cap(sizes, ledger_equity=ledger_equity, risk=risk)
 
 
@@ -380,14 +382,14 @@ def require_under_cap(
     at `marks`. An equity that cannot be read (a held name with no mark, a bad mark)
     is over the cap while any break is open: it fails closed."""
     events = list(events)
-    if not any(e.material for e in open_breaks(events).values()):
+    if not any(e.material or e.event == "reopened" for e in open_breaks(events).values()):
         return
     try:
         equity = ledger.equity(marks)
     except (KeyError, ValueError):
         equity = math.nan
     if cap_exceeded(events, ledger_equity=equity, risk=risk):
-        count = sum(e.material for e in open_breaks(events).values())
+        count = sum(e.material or e.event == "reopened" for e in open_breaks(events).values())
         raise ReconciliationError(
             f"break_cap: window {window_id} has {count} open material break(s), past "
             f"risk.max_open_breaks={risk.max_open_breaks} or "

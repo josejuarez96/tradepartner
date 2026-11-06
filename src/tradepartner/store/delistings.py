@@ -61,6 +61,11 @@ a filing ends only a listing already known at T.
   any title `_is_plain_title` refuses) never ends an untitled
   (`snapshot_static`) listing: that listing cannot show it is the class
   the filing names.
+- **Debt class** (#2937). A filing whose title names a debt class (a note,
+  debenture or bond, no common word: Verizon's "2.375% Notes due 2022") never
+  ends a common or untitled listing, only a listing of its own class: once the
+  notes' listing row is retracted, the filing would otherwise land on the
+  common row, the latest on the exchange.
 - **Form 25 close** (#1163). A listing that starts in a session after the
   filing session of a Form 25 that ended an earlier listing of the
   security on the same exchange (a cover page re-opened it: an acquired
@@ -110,6 +115,7 @@ from tradepartner.store.db import insert_row
 from tradepartner.store.master import (
     MasterBuild,
     _form25_classes,
+    _is_common,
     _is_plain_common,
     _norm_title,
 )
@@ -189,13 +195,48 @@ def _is_plain_title(title: str) -> bool:
     )
 
 
+#: Words that make a Form 25's class a debt security ("2.375% Notes due 2022").
+_DEBT_WORDS = frozenset({"notes", "note", "debentures", "debenture", "bonds", "bond"})
+
+
+def _is_debt_title(title: str) -> bool:
+    """Whether a Form 25's `title` names a debt class: a note, debenture or
+    bond word in its head and no common-equity word (#2937)."""
+    norm = _norm_title(title)
+    return not _is_common(title) and not _DEBT_WORDS.isdisjoint(norm.split())
+
+
 #: Exchange tags that name no exchange: a cover page showing one is a move
 #: off the exchange, never a re-tag of the listing a Form 25 ends.
 _OFF_EXCHANGE = frozenset({"", "NONE", "OTC"})
 
 
-def _resolve(filing: DelistingFiling, master: MasterBuild) -> tuple[str, ...]:
+@dataclass(frozen=True)
+class _MasterRows:
+    """`master`'s securities by CIK and listings by security, each in
+    `master` order (listings with their position), grouped once per build
+    (#2927) so each filing reads its CIK's rows, not every row."""
+
+    securities_by_cik: dict[str, list[Row]]
+    listings_by_id: dict[str, list[tuple[int, Row]]]
+
+    @classmethod
+    def of(cls, master: MasterBuild) -> _MasterRows:
+        securities: dict[str, list[Row]] = defaultdict(list)
+        for row in master.securities:
+            securities[row["cik"]].append(row)
+        listings: dict[str, list[tuple[int, Row]]] = defaultdict(list)
+        for position, row in enumerate(master.listings):
+            listings[row["security_id"]].append((position, row))
+        return cls(dict(securities), dict(listings))
+
+
+def _resolve(
+    filing: DelistingFiling, master: MasterBuild, rows: _MasterRows | None = None
+) -> tuple[str, ...]:
     """The `security_id`s `filing` delists, or `()` if that is not certain."""
+    if rows is None:
+        rows = _MasterRows.of(master)
     # #820: never a successor known later. An original Form 25 after a
     # succession names the successor; an amendment amends the old class's.
     known = [s for s in master.successions if s.known_at <= filing.accepted_at]
@@ -205,16 +246,23 @@ def _resolve(filing: DelistingFiling, master: MasterBuild) -> tuple[str, ...]:
         excluded = {s.predecessor_id for s in known}
     candidates: set[str] = {
         row["security_id"]
-        for row in master.securities
-        if row["cik"] == filing.cik
-        and not row.get("benchmark", False)
+        for row in rows.securities_by_cik.get(filing.cik, ())
+        if not row.get("benchmark", False)
         and row["known_at"] <= filing.accepted_at
         and row["security_id"] not in excluded
     }
-    titles: dict[str, list[str | None]] = defaultdict(list)
-    for row in master.listings:
-        if row["security_id"] in candidates and row["exchange"] == filing.exchange:
-            titles[row["security_id"]].append(row["class_title"])
+    # Each candidate's titles on the filing's exchange, keyed in the order a
+    # walk of `master.listings` meets them (`_form25_classes` reads key order).
+    found: list[tuple[int, str, list[str | None]]] = []
+    for security_id in candidates:
+        hits = [
+            (position, row)
+            for position, row in rows.listings_by_id.get(security_id, ())
+            if row["exchange"] == filing.exchange
+        ]
+        if hits:
+            found.append((hits[0][0], security_id, [row["class_title"] for _, row in hits]))
+    titles = {security_id: named for _, security_id, named in sorted(found)}
     return _form25_classes(filing.class_title, titles)
 
 
@@ -230,6 +278,7 @@ def build_delistings(
     ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
     rows: list[Row] = []
     unmatched: list[DelistingFiling] = []
+    master_rows = _MasterRows.of(master)  # #2927: once per build, not once per filing
     for filing in sorted(filings, key=lambda f: (f.accepted_at, f.accession)):
         if filing.form not in DELISTING_FORMS:
             raise ValueError(f"not a delisting form: {filing.form!r} ({filing.accession})")
@@ -238,7 +287,7 @@ def build_delistings(
                 f"{filing.accession}: accepted_at {filing.accepted_at.isoformat()} is after "
                 f"ingested_at {ingested_at.isoformat()}"
             )
-        security_ids = _resolve(filing, master)
+        security_ids = _resolve(filing, master, master_rows)
         if not security_ids:
             unmatched.append(filing)
             continue
@@ -278,6 +327,45 @@ def delistings_as_of(
     """`delistings` rows known by `t`, latest revision per `(security_id,
     form, class_title, exchange, filed_at)`, sorted by that key."""
     return _latest_as_of(conn, "delistings", _DELISTING_KEY, _validate_t(t), security_ids)
+
+
+def delistings_with_reasons_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None = None,
+) -> pl.DataFrame:
+    """Return known Form 25 episodes with their latest reason, or `unknown`."""
+    from tradepartner.store.delisting_reasons import delisting_reasons_as_of
+
+    t = _validate_t(t)
+    episodes = delistings_as_of(conn, t, security_ids)
+    reasons = delisting_reasons_as_of(conn, t, security_ids).select(
+        "security_id",
+        "delisting_form",
+        "delisting_class_title",
+        "delisting_exchange",
+        "delisting_filed_at",
+        "reason",
+        "reason_source",
+        "reason_evidence_form",
+        "reason_evidence_accession",
+        "reason_known_at",
+    )
+    return episodes.join(
+        reasons,
+        left_on=_DELISTING_KEY,
+        right_on=(
+            "security_id",
+            "delisting_form",
+            "delisting_class_title",
+            "delisting_exchange",
+            "delisting_filed_at",
+        ),
+        how="left",
+    ).with_columns(
+        pl.col("reason").fill_null("unknown"),
+        pl.col("reason_source").fill_null("unknown"),
+    )
 
 
 @cache
@@ -322,7 +410,17 @@ def _ended_listing(
             target = max(retagged, key=lambda r: r["valid_from"])
     if target["class_title"] is None and not _is_plain_title(delisting["class_title"]):
         return None
+    if _spares(delisting, target):
+        return None
     return target
+
+
+def _spares(delisting: Row, listing: Row) -> bool:
+    """Whether `delisting` names a debt class and `listing` is a common or
+    untitled one: a notes filing never ends the common listing (#2937), whether
+    it lands on it directly or through a later row it would re-open."""
+    title = listing["class_title"]
+    return _is_debt_title(delisting["class_title"]) and (title is None or _is_common(title))
 
 
 def _reopened(
@@ -347,6 +445,7 @@ def _reopened(
                 for closed, filing in closers
                 if closed["exchange"] == row["exchange"]
                 and _filing_session(filing["filed_at"]) < row["valid_from"]
+                and not _spares(filing, row)
             ]
             if not before:
                 continue
