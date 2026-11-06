@@ -2490,3 +2490,42 @@ def test_resume_for_a_book_with_no_window_is_no_window_beside_main(
     assert outcome.status == NO_WINDOW
     assert fake.calls == ()
     assert _count(journal_settings, "resume_invocations") == 0
+
+
+def test_two_books_resuming_at_once_both_release(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3030: book b's whole resume runs between main's `resume_invocations` row
+    and main's release (run locks are per book). Each release checks only its own
+    book's latest resume, so neither refuses the other."""
+    b_window = replace(window, window_id=None, book_id="b", account_id="PB1")
+    (b_id,) = _append(journal_settings, b_window)
+    b_window = replace(b_window, window_id=b_id)
+    _engage(journal_settings, window, fixed_clock)
+    _engage(journal_settings, b_window, fixed_clock)
+    b_fake = SkewedFake(
+        clock=fixed_clock, price_of=lambda _s: PRICE, auto_fill=False, account_id="PB1"
+    )
+    real_release = switch.release
+    b_outcomes: list[Any] = []
+
+    def interleaved(*args: Any, **kwargs: Any) -> int:
+        if not b_outcomes:
+            b_outcomes.append(None)
+            b_outcomes[0] = _resume(journal_settings, b_fake, fixed_clock, book_id="b")
+        return real_release(*args, **kwargs)
+
+    monkeypatch.setattr(resume_module.switch, "release", interleaved)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    (b_outcome,) = b_outcomes
+    assert b_outcome.status == RELEASED, b_outcome.reasons
+    assert outcome.status == RELEASED, outcome.reasons
+    assert b_outcome.resume_id > outcome.resume_id
+    assert not _engaged(journal_settings, window)
+    assert not _engaged(journal_settings, b_window)

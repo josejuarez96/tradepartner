@@ -594,7 +594,7 @@ def _resume_and_reconciliation(
     return _resume(settings, resume_at), _reconciliation(settings, status, window_id, reconciled_at)
 
 
-def _resume(settings: Settings, minutes: int = 200) -> int:
+def _resume(settings: Settings, minutes: int = 200, book_id: str | None = None) -> int:
     with open_for_write(settings) as conn:
         resume_id = append(
             conn,
@@ -603,6 +603,7 @@ def _resume(settings: Settings, minutes: int = 200) -> int:
                 reason="checked",
                 accept_broker_fills=False,
                 accept_rejections=False,
+                book_id=book_id,
                 **_stamp(minutes),
             ),
         )
@@ -750,6 +751,40 @@ def test_release_refuses_an_older_resume(store: Settings) -> None:
     reconciliation_id = _reconciliation(store, minutes=62)
     with pytest.raises(ReleaseRefused, match="latest resume"):
         _release(store, old_resume, reconciliation_id)
+
+
+def test_another_book_s_later_resume_does_not_refuse_the_release(store: Settings) -> None:
+    """#3030: run locks are per book, so book b's resume can journal its row
+    between main's resume and main's release; main's release still goes."""
+    _engaged(store)
+    main_resume = _resume(store, 60, book_id="main")
+    _resume(store, 61, book_id="b")
+    reconciliation_id = _reconciliation(store, minutes=62)
+    _release(store, main_resume, reconciliation_id)
+    assert [r.state for r in _rows(store)] == ["engaged", "released"]
+
+
+@pytest.mark.parametrize("later_book", [None, "main"])
+def test_a_later_resume_of_the_book_or_of_no_book_refuses_the_release(
+    store: Settings, later_book: str | None
+) -> None:
+    """A row without a book (written before schema 47) counts for every book."""
+    _engaged(store)
+    old_resume = _resume(store, 60, book_id="main")
+    _resume(store, 61, book_id=later_book)
+    reconciliation_id = _reconciliation(store, minutes=62)
+    with pytest.raises(ReleaseRefused, match="latest resume"):
+        _release(store, old_resume, reconciliation_id)
+    assert [r.state for r in _rows(store)] == ["engaged"]
+
+
+def test_another_book_s_resume_cannot_release_the_window(store: Settings) -> None:
+    _engaged(store)
+    b_resume = _resume(store, 60, book_id="b")
+    reconciliation_id = _reconciliation(store, minutes=62)
+    with pytest.raises(ReleaseRefused, match="book 'b'"):
+        _release(store, b_resume, reconciliation_id)
+    assert [r.state for r in _rows(store)] == ["engaged"]
 
 
 def test_release_refuses_a_resume_that_already_released(store: Settings) -> None:
