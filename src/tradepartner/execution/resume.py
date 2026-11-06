@@ -8,7 +8,7 @@ The only way the kill switch is released. In the req 5 order:
    book the outcome is `no_window`: no broker call, no write. Another book's
    window, switch and lock are never read or touched (B.5).
 2. Journal the `resume_invocations` row first, so a refused resume is still
-   on record and its fill cursor has a writer id.
+   on record and its fill cursor has a writer id and a book (#2490).
 3. Close every unfinished run of the window `crashed`.
 4. Settle every `pending` order of the window (req 4). `get_order` found: an
    `accepted` event with the broker's order id, which acknowledges it, and
@@ -292,6 +292,7 @@ def _window_id(window: PaperWindowRow) -> int:
 def _start(
     connect: Connect,
     window_id: int,
+    book: str,
     now: datetime,
     reason: str,
     accept_broker_fills: bool,
@@ -309,6 +310,7 @@ def _start(
                 reason=reason,
                 accept_broker_fills=accept_broker_fills,
                 accept_rejections=accept_rejections,
+                book_id=book,
                 known_at=now,
                 ingested_at=now,
             ),
@@ -598,6 +600,7 @@ def resume(
         resume_id, seen, crashed, pending = _start(
             connect,
             window_id,
+            book,
             now,
             reason,
             accept_broker_fills,

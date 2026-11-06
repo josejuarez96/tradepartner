@@ -402,6 +402,9 @@ class ResumeInvocationRow:
     reason: str
     accept_broker_fills: bool
     accept_rejections: bool
+    #: The book the resume ran for (#2490, schema 47); None on a row written
+    #: before 47, whose book is unknown.
+    book_id: str | None = None
     known_at: datetime
     ingested_at: datetime
 
