@@ -1014,7 +1014,9 @@ def _explanations(
     )
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))
-    seen_ids, seen_before = _seen_activities(state.adjustments, state.base(through), window)
+    seen_ids, seen_before = _seen_activities(
+        state.adjustments, state.base(through), window, through
+    )
     fresh_dividend_symbols = {
         activity.symbol
         for activity in broker_activities or ()
@@ -1231,14 +1233,21 @@ def _removal_session(
 
 
 def _seen_activities(
-    adjustments: Sequence[AdjustmentRow], base: ReconciliationRow | None, window: PaperWindowRow
+    adjustments: Sequence[AdjustmentRow],
+    base: ReconciliationRow | None,
+    window: PaperWindowRow,
+    through: date,
 ) -> tuple[frozenset[str], date | None]:
     """The caller-applied seen-sets for the booked-`FEE` rule (#1583, T183): the
     ids every activity a reconciliation reads is treated as already inside the
     base, and the fallback date cutoff (None when a recorded set exists).
 
     An activity's latest booking decides whether it is seen: a reversal removes
-    it, and a later explanation-linked booking restores it. The base's recorded set (the
+    it, and a later explanation-linked booking restores it. A reversal removes it
+    only from its own session on (`session <= through`), the same cut the ledger's
+    `reversed_true_up_ids(adjustments, through)` applies, so a catch-up reconcile
+    of a session before the reversal keeps both the true-up's cash and the seen
+    activity (#2961). The base's recorded set (the
     last `ok` or `breaks` reconciliation's `activities`) takes precedence; before the first
     `ok`, the window row's `activities_seen_json` (what `paper start` read); when
     both are null, the fallback cutoff is the window's New York start date, so a
@@ -1252,7 +1261,11 @@ def _seen_activities(
             terms = {}
         terms = terms if isinstance(terms, dict) else {}
         reversed_activity = terms.get("reversed_activity_id")
-        if reversed_adjustment_id(adjustment) is not None and isinstance(reversed_activity, str):
+        if (
+            reversed_adjustment_id(adjustment) is not None
+            and isinstance(reversed_activity, str)
+            and adjustment.session <= through
+        ):
             latest[reversed_activity] = False
         rebooked = terms.get("rebooked_activity_id")
         if isinstance(rebooked, str):
@@ -1271,6 +1284,29 @@ def _seen_activities(
             ids = []
         return booked | (frozenset(str(i) for i in ids if isinstance(i, str)) - reversed_ids), None
     return booked, window.started_at.astimezone(_NEW_YORK).date()
+
+
+def _refuse_before_a_reversal(adjustments: Sequence[AdjustmentRow], through: date) -> None:
+    """Refuse a reconciliation stated through a session before a true-up
+    reversal's (#2961). The reversal takes effect from its own session, so the
+    ledger through `through` keeps the true-up; but break events are read in
+    write order, so this run's events would land after the `reopened` one and
+    close the owner's reopened break from a session that cannot see it, and its
+    `ok` row (stamped now) would become the cash base of the reversal's session.
+    Every caller states `command_session(now)` or the run's New York date, never
+    before a reversal stamped `command_session` earlier, so only a direct
+    earlier-session call reaches this."""
+    later = [
+        row.session
+        for row in adjustments
+        if reversed_adjustment_id(row) is not None and row.session > through
+    ]
+    if later:
+        day = max(later).isoformat()
+        raise ValueError(
+            f"a true-up reversal is stated for {day}, after {through.isoformat()}: "
+            f"reconcile {day} or later"
+        )
 
 
 def _rebooked_after(adjustments: Sequence[AdjustmentRow]) -> dict[str, int]:
@@ -2329,7 +2365,9 @@ def reconcile_now(
     Raises `ReconciliationError` on a mismatch after the row and its events
     commit, or on a failed break-event write after the chunk rolls back,
     `ClockError` for a bad clock reading or an `as_of` after it, `ValueError`
-    for a non-session `session`, a window without an id, or a naive `as_of`,
+    for a non-session `session`, a window without an id, a naive `as_of`, or a
+    ledger stated before a true-up reversal's session (before any broker read
+    or write, #2961),
     and whatever the broker raises (every allowlist this reaches is empty,
     req 4)."""
     window_id = _window_id(window)
@@ -2344,6 +2382,7 @@ def reconcile_now(
     tolerance = frozen.reconcile_quantity_tolerance
 
     with connect() as conn:
+        _refuse_before_a_reversal(adjustments_for(conn, window_id), through)
         orders, pending, sums = _open_orders(conn, window_id)
 
     positions: dict[str, Position] = broker.positions()
