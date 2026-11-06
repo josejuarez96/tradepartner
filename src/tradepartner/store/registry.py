@@ -133,6 +133,7 @@ from tradepartner.calendar import (
     session_close,
 )
 from tradepartner.config import ENGINE_FAMILIES, Cadence, Settings, get_settings
+from tradepartner.config_backtest import DelistingFailureReturn
 from tradepartner.config_edgar import PRE_2826_STATEMENT_FACTS
 from tradepartner.store.benchmarks import CHECK_ONLY_IDS
 from tradepartner.store.db import configure_connection, insert_row, utc_now
@@ -183,6 +184,10 @@ CADENCE_KEY: Final = "schedule.rebalance_cadence"
 #: The opt-in frozen key whose `true` value makes a trial's data vintage count
 #: the stored `spinoff` rows it reads (backtest spec amendment #1894, item 6; T211d).
 SPIN_OFFS_KEY: Final = "adjust.apply_spin_offs"
+
+#: The frozen key whose value other than `none` makes a trial's data vintage count the
+#: stored `delisting_reasons` and `mergers` rows its exits read (#2670, plan T328d).
+DELISTING_POLICY_KEY: Final = "backtest.delisting_failure_return"
 
 #: The metric row each trial's annualisation reads (strategy-lab spec req 8).
 PERIODS_PER_YEAR_METRIC: Final = "periods_per_year"
@@ -517,7 +522,9 @@ def code_tree_sha256(repo_dir: Path | None = None) -> str | None:
 # registered trial reads. `openfigi_types` (#1713, T189c) joins them: a
 # check-only table whose one reader is the `health` types block.
 # `mergers` (#1762, T248c) joins them: its one reader is the paper
-# reconciliation, so a merger backfill stales no trial.
+# reconciliation, so a merger backfill stales no trial -- unless the trial's
+# frozen `backtest.delisting_failure_return` is not `none` (#2670, T328d), when
+# it and `delisting_reasons` count (`_DELISTING_POLICY_TABLES`).
 # `tests/store/test_registry.py` pins that this list
 # and the exclusions together cover every fact table.
 _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
@@ -541,6 +548,13 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
     # Owner-entered Form 8937 fractions change paper lots, not trial inputs.
     # spinoff_allocations deliberately remains outside this explicit list.
 )
+
+#: The conditional trial tables (#2670, plan T328d): the exit evidence a trial reads
+#: only under a frozen `backtest.delisting_failure_return` other than `none` (T328b's
+#: `delisting_reasons` and `merger_exits` reads), so they count toward its vintage
+#: then and only then, the same gate as `spin_offs`. At `none` a row of either moves
+#: no vintage, so every stored vintage and pinned digest is unchanged.
+_DELISTING_POLICY_TABLES: Final[tuple[str, ...]] = ("delisting_reasons", "mergers")
 
 #: The rows of a check-only security (`store.benchmarks.CHECK_ONLY_IDS`: RSP, stored for
 #: the index check alone; backtest spec amendment #1598, item 3, question 37) are left
@@ -573,7 +587,11 @@ _TRIAL_TABLE_ROWS: Final[dict[str, str]] = {
 
 
 def data_vintage(
-    conn: duckdb.DuckDBPyConnection, cutoff: datetime, *, spin_offs: bool = False
+    conn: duckdb.DuckDBPyConnection,
+    cutoff: datetime,
+    *,
+    spin_offs: bool = False,
+    delisting_policy: DelistingFailureReturn = "none",
 ) -> datetime | None:
     """The data vintage at `cutoff` (strategy-lab spec, Definitions "Vintage"): the
     latest of the `ingested_at` over trial-readable fact rows with `known_at <=
@@ -603,6 +621,12 @@ def data_vintage(
 
     `statement_facts` counts only `PRE_2826_STATEMENT_FACTS` (#2826, T366), so a
     new statement name's rows stale no trial.
+
+    `delisting_policy` (#2670, plan T328d) other than `none` adds the
+    `delisting_reasons` and `mergers` rows with `known_at <= cutoff`
+    (`_DELISTING_POLICY_TABLES`), the exit evidence such a trial reads; a caller
+    that has a trial passes its frozen `backtest.delisting_failure_return`, while the
+    release-level vintages stay `none`. At `none` neither table moves a vintage.
     """
     if cutoff.tzinfo is None:
         raise ValueError(f"cutoff must be timezone-aware, got {cutoff!r}")
@@ -614,8 +638,11 @@ def data_vintage(
                 f" AND action_type IN ('split', 'dividend', 'spinoff'){_NOT_CHECK_ONLY}"
             ),
         }
+    candidates = _TRIAL_FACT_TABLES
+    if delisting_policy != "none":
+        candidates = (*candidates, *_DELISTING_POLICY_TABLES)
     present = set(_present_fact_tables(conn))
-    tables = [table for table in _TRIAL_FACT_TABLES if table in present]
+    tables = [table for table in candidates if table in present]
     facts: datetime | None = None
     if tables:
         union = " UNION ALL ".join(
@@ -981,9 +1008,16 @@ def open_trial(
         raise RealStoreRefused("a synthetic trial is refused on the real store")
     version, dirty = code_version(repo_dir)
     max_ingested = store_max_ingested_at(conn)
-    spin_offs = bool(frozen_values(hypothesis)[SPIN_OFFS_KEY])
+    gates = vintage_gates(hypothesis)
     vintage = (
-        data_vintage(conn, data_cutoff, spin_offs=spin_offs) if data_cutoff is not None else None
+        data_vintage(
+            conn,
+            data_cutoff,
+            spin_offs=gates.spin_offs,
+            delisting_policy=gates.delisting_policy,
+        )
+        if data_cutoff is not None
+        else None
     )
     boundary = development_boundary(conn)
     trial_id = max(
@@ -1076,11 +1110,43 @@ def write_result(
     return "ok"
 
 
-def _registered_spin_offs(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> bool:
-    """The hypothesis's frozen `adjust.apply_spin_offs` (backtest spec amendment
-    #1894, item 6; T211d), through `frozen_values`: the flag a trial of it reads
-    its data vintage under, so a `spinoff` row stales it only when `True`."""
-    return bool(frozen_values(get_hypothesis_by_id(conn, hypothesis_id))[SPIN_OFFS_KEY])
+@dataclass(frozen=True)
+class VintageGates:
+    """The frozen values a trial's data vintage is read under: `adjust.apply_spin_offs`
+    (backtest spec amendment #1894, item 6; T211d) and
+    `backtest.delisting_failure_return` (#2670, plan T328d)."""
+
+    spin_offs: bool = False
+    delisting_policy: DelistingFailureReturn = "none"
+
+
+def vintage_gates(hypothesis: HypothesisRecord) -> VintageGates:
+    """The registration's frozen vintage gates, through `frozen_values` (a key absent
+    from an older registration reads its table default: `False` and `none`)."""
+    values = frozen_values(hypothesis)
+    return VintageGates(
+        spin_offs=bool(values[SPIN_OFFS_KEY]),
+        delisting_policy=values.get(DELISTING_POLICY_KEY, "none"),
+    )
+
+
+def registered_data_vintage(
+    conn: duckdb.DuckDBPyConnection,
+    cutoff: datetime,
+    hypothesis_id: int,
+    *,
+    store: duckdb.DuckDBPyConnection | None = None,
+) -> datetime | None:
+    """`data_vintage` at `cutoff` under hypothesis `hypothesis_id`'s frozen gates
+    (`vintage_gates`), read on `store` (default `conn`; the backup re-check reads a
+    backup while the hypothesis lives on `conn`)."""
+    gates = vintage_gates(get_hypothesis_by_id(conn, hypothesis_id))
+    return data_vintage(
+        store if store is not None else conn,
+        cutoff,
+        spin_offs=gates.spin_offs,
+        delisting_policy=gates.delisting_policy,
+    )
 
 
 def _store_changed(conn: duckdb.DuckDBPyConnection, handle: TrialHandle, cutoff: datetime) -> bool:
@@ -1094,10 +1160,7 @@ def _store_changed(conn: duckdb.DuckDBPyConnection, handle: TrialHandle, cutoff:
     stricter one: the store's latest `ingested_at` at open and write."""
     if handle.data_vintage is None:
         return store_max_ingested_at(conn) != handle.store_max_ingested_at
-    return (
-        data_vintage(conn, cutoff, spin_offs=_registered_spin_offs(conn, handle.hypothesis_id))
-        != handle.data_vintage
-    )
+    return registered_data_vintage(conn, cutoff, handle.hypothesis_id) != handle.data_vintage
 
 
 def _insert_result(
@@ -1909,7 +1972,7 @@ def record_trial_state(
     cutoff, trial_vintage, trial_max, start, end, started_at, hypothesis_id = row
     if cutoff is None:
         raise ReleaseRefused(f"trial {trial_id} has no data_cutoff (a refused window)")
-    vintage = data_vintage(backup, cutoff, spin_offs=_registered_spin_offs(conn, hypothesis_id))
+    vintage = registered_data_vintage(conn, cutoff, hypothesis_id, store=backup)
     now = utc_now()
     values = {
         "name": name,

@@ -1,6 +1,7 @@
-"""What `tradepartner archive migrate-cache` and `archive restore` do (plan T362,
-#2743), kept out of `cli.py` so the CLI names no raw-archive module (the look-ahead
-boundary scan, `tests/lookahead/test_raw_archive_boundary.py`).
+"""What `tradepartner archive migrate-cache`, `archive restore` (plan T362, #2743)
+and `archive rederive` (plan T352, #2714) do, kept out of `cli.py` so the CLI names
+no raw-archive module (the look-ahead boundary scan,
+`tests/lookahead/test_raw_archive_boundary.py`).
 
 `migrate_cache` is a dry run unless `apply` is set: it lists `edgar.cache_dir`,
 hashes the move and backup classes, asks the archive which hashes it holds and
@@ -17,14 +18,16 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 from tradepartner import diskfloor
 from tradepartner.config import Settings
 from tradepartner.store import raw_archive_migrate as migrate
+from tradepartner.store import raw_rederive
 from tradepartner.store.db import StoreLockedError, open_read_only
 from tradepartner.store.raw_archive import (
     ICloudItems,
@@ -52,12 +55,13 @@ from tradepartner.store.raw_archive_plan import (
 
 IcloudFactory = Callable[[Settings], ICloudItems]
 
-#: Every refusal the two commands turn into a plain message and a non-zero exit.
+#: Every refusal the commands turn into a plain message and a non-zero exit.
 REFUSALS: tuple[type[BaseException], ...] = (
     migrate.MigrationRefusedError,
     migrate.MigrationStoppedError,
     migrate.RestoreRefusedError,
     MigrationPlanRefusedError,
+    raw_rederive.RederiveRefused,
     RawArchiveICloudError,
     RawArchiveIntegrityError,
     RawArchiveMissingError,
@@ -214,3 +218,26 @@ def restore(settings: Settings, icloud: ICloudItems, *, path: str, run: str | No
     if not result.restored:
         return [f"nothing left to restore under {path!r}; every archived file is already back"]
     return [f"restored {len(result.restored)} file(s) under {path!r}; the archive keeps its copies"]
+
+
+def rederive(
+    settings: Settings,
+    icloud: ICloudItems,
+    *,
+    mode: str,
+    accessions: Sequence[str],
+    file_dates: Sequence[date],
+    release: str | None,
+    expect: int | None,
+) -> list[str]:
+    """`raw_rederive.rederive`'s report lines: a dry run without `release`."""
+    result = raw_rederive.rederive(
+        settings,
+        icloud,
+        mode=mode,
+        accessions=accessions,
+        file_dates=file_dates,
+        release=release,
+        expect=expect,
+    )
+    return result.lines()

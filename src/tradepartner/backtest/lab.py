@@ -621,8 +621,8 @@ def _close_variant(
     """Write the variant's outcome and its `sweep_trials` row in one write chunk.
     A variant that entered the engine fails `store changed during run` when the
     data vintage at its cutoff moved since the open, read under the variant's
-    frozen `adjust.apply_spin_offs` (backtest spec amendment #1894, item 6; T211d),
-    whatever its own outcome
+    frozen `adjust.apply_spin_offs` (backtest spec amendment #1894, item 6; T211d)
+    and `backtest.delisting_failure_return` (#2670, T328d), whatever its own outcome
     (req 2: every open variant of the group; its own error would otherwise count
     toward terminal failure on data that changed under it); else its result rows,
     or its own failure. A write that raises is closed `failed` in a chunk of its
@@ -631,14 +631,18 @@ def _close_variant(
     nor moves the terminal-failure count) and the next plain run reruns it."""
     try:
         with open_for_write(store) as conn:
-            spin_offs = (
-                entry.frozen_settings.adjust.apply_spin_offs
-                if entry.frozen_settings is not None
-                else False
-            )
+            frozen = entry.frozen_settings
             changed = (
                 entry.ran
-                and registry.data_vintage(conn, entry.cutoff, spin_offs=spin_offs) != entry.vintage
+                and registry.data_vintage(
+                    conn,
+                    entry.cutoff,
+                    spin_offs=frozen.adjust.apply_spin_offs if frozen is not None else False,
+                    delisting_policy=(
+                        frozen.backtest.delisting_failure_return if frozen is not None else "none"
+                    ),
+                )
+                != entry.vintage
             )
             if changed:
                 entry.status, entry.message = "failed", STORE_CHANGED_MESSAGE

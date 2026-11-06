@@ -74,7 +74,11 @@ at the data cutoff and only under a delisting failure-return policy other than
 `DELISTING_REASON_COLUMNS`; `merger_exits(t, ids)` is `store.asof.mergers_as_of`
 kept to rows whose acquiree is in `ids`, left-joined to the acquirer's raw
 `prices_as_of(traded_only=True)` bar on `effective_date` (null when that bar is
-absent: no earlier-close fallback, and a zero-volume bar is missing, as above).
+absent: no earlier-close fallback, and a zero-volume bar is missing, as above). An
+acquirer that is a chained predecessor in a chain known at `t` is read under its
+successor's id, where `prices_as_of` keys its bars (#821, #2949);
+`acquirer_security_id` stays the stored id, and a chain known only after `t` is not
+followed.
 
 `turnover_inputs(t, ids, sessions_from)` (backtest spec amendment #1358,
 plan T165b) is three reads on the step's connection with the frozen
@@ -142,6 +146,10 @@ Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 
 _ACTION_KEY: Final = ("security_id", "action_type", "ex_date")
 _LATE_COLUMNS: Final = ("security_id", "ex_date", "ratio_or_amount", "known_at")
+
+#: `merger_exits`' join key: the acquirer's id mapped through the chains known at `t`.
+_ACQUIRER_KEY: Final = "_acquirer_key"
+
 #: `late_spin_offs`'s frame while it is read: the child in `security_id` (the action's
 #: own key), the parent re-keyed, so the two children of one parent on one ex-date stay
 #: two rows and a late second one is not swallowed by the first.
@@ -418,19 +426,25 @@ class StoreProvider:
         conn = self._at(t)
         # `mergers_as_of` also keeps rows matched only by their acquirer; drop them.
         mergers = mergers_as_of(conn, t, wanted).filter(pl.col("security_id").is_in(wanted))
-        acquirers = sorted(set(mergers["acquirer_security_id"].drop_nulls().to_list()))
+        # `prices_as_of` keys a chained predecessor's bars under its successor (#821), so
+        # read the acquirer's close under the id the chains known at `t` map it to (#2949).
+        chains = dict(live_chains(conn, t))
+        mergers = mergers.with_columns(
+            pl.col("acquirer_security_id").replace(chains).alias(_ACQUIRER_KEY)
+        )
+        acquirers = sorted(set(mergers[_ACQUIRER_KEY].drop_nulls().to_list()))
         # Bound the acquirers' bars to the earliest effective date: only those dates join.
         first = mergers["effective_date"].min()
         sessions_from = first if isinstance(first, date) else None
         closes = prices_as_of(
             conn, t, acquirers, traded_only=True, sessions_from=sessions_from
         ).select(
-            pl.col("security_id").alias("acquirer_security_id"),
+            pl.col("security_id").alias(_ACQUIRER_KEY),
             pl.col("session").alias("effective_date"),
             pl.col("close").alias("acquirer_raw_close"),
         )
         return (
-            mergers.join(closes, on=["acquirer_security_id", "effective_date"], how="left")
+            mergers.join(closes, on=[_ACQUIRER_KEY, "effective_date"], how="left")
             .select(MERGER_EXIT_COLUMNS)
             .sort("security_id", "effective_date", "source_action_id")
         )
