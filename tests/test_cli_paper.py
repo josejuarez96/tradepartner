@@ -2984,6 +2984,23 @@ def test_paper_reconcile_accepts_a_breaks_row_as_a_cash_base_status(
     assert f"paper reconcile: {status}" in out.output
 
 
+def test_paper_reconcile_on_fills_lagging_names_the_collector(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    """#2996: a `fills_lagging` reconcile (fills the journal has not collected)
+    halts nothing; it still exits non-zero and says `paper resume` or the next
+    `paper run` collects them."""
+    from tradepartner.execution import reconcile_run
+    from tradepartner.execution.reconcile import FILLS_LAGGING, Reconciliation
+
+    result = Reconciliation(FILLS_LAGGING, None, (), ("tp-main-sell-1",), (), ())
+    monkeypatch.setattr(reconcile_run, "reconcile_command", lambda *_a, **_k: result)
+    out = _paper(clock, factory, "reconcile")
+    assert out.exit_code == 1, out.output  # CRASH_EXIT_CODE, as before #2996
+    assert "paper reconcile: fills_lagging" in out.output
+    assert "`paper resume` (or the next `paper run`) collects them" in out.output
+
+
 def test_book_sandbox_on_a_store_outside_temp_is_refused_before_any_broker(
     clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: Any
 ) -> None:
