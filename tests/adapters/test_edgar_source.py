@@ -2272,22 +2272,14 @@ def _late_router(*, stamped: bool) -> EdgarRouter:
     return router
 
 
-@pytest.mark.parametrize("first_retry_days", [0, None])
 def test_a_stamp_that_arrives_inside_the_retry_window_after_settle_is_kept(
-    tmp_path: Path, first_retry_days: int | None
+    tmp_path: Path,
 ) -> None:
     """#2865: a fetch after the quarter settled that lacks the accession does
     not end the asking while `edgar.unstampable_retry_days` runs, so a stamp
-    SEC serves later is kept at its acceptance. With `first_retry_days=0` the
-    first run caches the accession as unstampable, as before the fix: such an
-    entry is asked again too while the window runs."""
+    SEC serves later is kept at its acceptance."""
     cache = tmp_path / "cache"
-    first_settings = (
-        edgar_settings(cache)
-        if first_retry_days is None
-        else edgar_settings(cache, unstampable_retry_days=first_retry_days)
-    )
-    first = _source(first_settings, _late_router(stamped=False), clock=_Q3_SETTLED)
+    first = _source(edgar_settings(cache), _late_router(stamped=False), clock=_Q3_SETTLED)
     assert MISSING not in {e.accession for e in first.filing_index()}
     assert [u.accession for u in first.unstamped_filings] == [MISSING]
     router = _late_router(stamped=True)

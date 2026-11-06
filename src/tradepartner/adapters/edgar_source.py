@@ -59,7 +59,7 @@ only, never an `accepted_at`. A row still unstamped is excluded and reported on
 `.unstamped_filings`; it is cached as unstampable (and not re-fetched) only
 when a per-CIK fetch made `edgar.unstampable_retry_days` or more after its
 quarter settled still lacked it (#2865: SEC can serve a stamp after the
-settle; an entry an older run cached earlier than that is asked again).
+settle).
 With `edgar.stamp_sgml_check` on (default, #1494: from 2026-10 the per-CIK
 API has served `acceptanceDateTime` moved late by New York's UTC offset), a
 CIK's new per-CIK stamps are cached only once the newest one matches its SGML
@@ -1910,17 +1910,9 @@ class EdgarFilingSource(FilingSource):
         from `kept`; the CIKs are listed before the first is read."""
         stamps: dict[str, dict[str, SubmissionRecord]] = {}
         pending: dict[str, set[str]] = {}
-        now = self._now()
         for cik in list(kept):
             loaded = self._load_stamps(cik)
-            # #2865: an entry cached as unstampable before its retry window ran
-            # out (an older rule cached it at the settle) is asked again.
-            wanted = {
-                a
-                for a, (_, quarter) in kept[cik].items()
-                if a not in loaded
-                or (loaded[a].accepted_at is None and not self._unstampable(quarter, now))
-            }
+            wanted = {a for a in kept[cik] if a not in loaded}
             if wanted:
                 stamps[cik], pending[cik] = loaded, wanted
             else:
@@ -1931,7 +1923,7 @@ class EdgarFilingSource(FilingSource):
         if edgar.bulk_stamps_enabled and len(pending) > edgar.bulk_stamp_threshold_ciks:
             unparsed = self._stamp_bulk(pending, stamps)  # #1382: off by default
         for cik, wanted in pending.items():
-            wanted -= {a for a, r in stamps[cik].items() if r.accepted_at is not None}
+            wanted -= stamps[cik].keys()
             if not wanted or cik in unparsed:
                 continue  # #578: a recorded bad zip member is never topped up per CIK
             submissions = self._fetch_submissions(cik, wanted)
@@ -1940,9 +1932,7 @@ class EdgarFilingSource(FilingSource):
                 if submissions.empty:
                     break  # #576: an empty answer proves nothing unstampable
                 row, quarter = kept[cik][accession]
-                if accession not in stamps[cik] and self._unstampable(
-                    quarter, submissions.fetched_at
-                ):
+                if self._unstampable(quarter, submissions.fetched_at):
                     new[accession] = SubmissionRecord(accession, row.form, "", False, None)
             new = self._sgml_checked(cik, new)
             if new:
@@ -2264,19 +2254,12 @@ class EdgarFilingSource(FilingSource):
                 accepted_at=first_row.accepted_at,
                 filing_date=filed_date,
             )
-        quarter = (filed_date.year, (filed_date.month - 1) // 3 + 1)
-        cached = stamps.get(accession)
-        if cached is None or (
-            cached.accepted_at is None and not self._unstampable(quarter, self._now())
-        ):
+        if accession not in stamps:
             submissions = self._fetch_submissions(issuer_cik, {accession})
             found = submissions.records.get(accession)
             if found is None:
-                if (
-                    cached is None
-                    and not submissions.empty
-                    and self._unstampable(quarter, submissions.fetched_at)
-                ):
+                quarter = (filed_date.year, (filed_date.month - 1) // 3 + 1)
+                if not submissions.empty and self._unstampable(quarter, submissions.fetched_at):
                     stamps[accession] = SubmissionRecord(accession, "", "", False, None)
                     self._save_stamps(issuer_cik, stamps)
                 return None
