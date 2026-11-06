@@ -81,7 +81,10 @@ as_of`:
   only the one not delisted keeps it; when that does not settle it, neither
   does, and a held one becomes compare's `unknown_security`. A held name whose
   ticker changed in the store at close(S-1) maps to the broker's one new
-  symbol (#1761), recorded on the row's `symbol_changes`.
+  symbol (#1761), recorded on the row's `symbol_changes`. A held chained
+  predecessor (#821) in a chain known at close(S-1) maps to its successor's
+  broker symbol when the broker holds that and not its own, and the successor
+  is no journal name (#3024); a chain known only later maps nothing.
 - `ended`: journal names whose current listing is `delisted` at close(S-1)
   (`store.delistings.listing_ends_as_of`; a transfer is not an end).
 - `dividends`: per held name, the cash due from `dividend` actions with an
@@ -511,6 +514,7 @@ def _symbols(
     changes: Mapping[str, Sequence[tuple[str, str]]],
     *,
     when_issued: Collection[str] = frozenset(),
+    chains: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, tuple[str, str]], dict[str, str]]:
     """`security_id` to broker symbol, one name per symbol, the ticker changes
     applied to it (module docstring), and the names a ticker change leaves
@@ -532,11 +536,20 @@ def _symbols(
     the broker does not hold, while it holds `X.WI`, maps to `X.WI`: the broker
     can book a new child under its when-issued symbol before it trades
     regular-way. Any other `.WI` symbol stays unmapped. Only reconcile passes
-    `when_issued`; the order path never maps a name to a `.WI` symbol."""
+    `when_issued`; the order path never maps a name to a `.WI` symbol.
+
+    `chains` maps a chained predecessor to its successor (#821), only the chains
+    known at close(S-1) (#3024). A held predecessor with no ticker change in
+    force maps to its successor's broker symbol when the successor's current
+    listing is not delisted, the broker holds that symbol and not the
+    predecessor's own, and the successor is not itself among `names` (two ids
+    cannot share one position, so neither is guessed). Otherwise it keeps its
+    own symbol and a difference stays a break. Only reconcile passes `chains`."""
+    wanted = set(names)
     claims: dict[str, list[str]] = defaultdict(list)
     applied: dict[str, tuple[str, str]] = {}
     ambiguous: dict[str, str] = {}
-    for name in sorted(set(names)):
+    for name in sorted(wanted):
         listing = current.get(name)
         symbol = (
             broker_symbol(listing, class_symbols)
@@ -554,6 +567,10 @@ def _symbols(
             ambiguous[name] = (
                 f"{name}: ticker change {symbol} -> {'/'.join(candidates)} known at "
                 "close(S-1) is not on the broker's positions"
+            )
+        else:
+            symbol = _chained_symbol(
+                name, symbol, wanted, current, broker_symbols, class_symbols, chains
             )
         if (
             name in when_issued
@@ -595,6 +612,27 @@ def _symbols(
                 name, f"{name}: ticker change {old} -> {new} known at close(S-1) was not kept"
             )
     return symbols, kept, ambiguous
+
+
+def _chained_symbol(
+    name: str,
+    symbol: str,
+    names: Collection[str],
+    current: Mapping[str, Mapping[str, Any]],
+    broker_symbols: Collection[str],
+    class_symbols: Mapping[str, str] | None,
+    chains: Mapping[str, str] | None,
+) -> str:
+    """`name`'s symbol read through its chain (#3024, `_symbols`' docstring):
+    the successor's broker symbol when every condition holds, else `symbol`."""
+    successor = (chains or {}).get(name)
+    if successor is None or successor in names or symbol in broker_symbols:
+        return symbol
+    listing = current.get(successor)
+    if listing is None or listing["status"] == DELISTED:
+        return symbol
+    chained = broker_symbol(listing, class_symbols)
+    return chained if chained is not None and chained in broker_symbols else symbol
 
 
 @dataclass(frozen=True)
@@ -1006,6 +1044,9 @@ def _explanations(
         settings.alpaca.class_symbols,
         _symbol_change_candidates(conn, cut, mapped),
         when_issued=frozenset(spinoffs),
+        # A held chained predecessor reads its successor's symbol (#3024): only
+        # the chains known at the cut, so a later chain maps nothing at S.
+        chains=dict(live_chains(conn, cut)),
     )
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))
