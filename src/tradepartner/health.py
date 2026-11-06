@@ -242,10 +242,10 @@ derived at `t`, as the data is read.
   `accepted_at` and `ingested_at` are `TIMESTAMPTZ`). The frames carry
   (`cik`, `accession`, rows), except the last, which carries the columns. The
   common `known_at <= ingested_at` rule covers the rest: the restamp sets
-  `ingested_at` on a moved row, except a moved fact whose accession has a later
-  stored ingest or a revision at its own ingest, which keeps its original
-  `ingested_at` (#2985). A store without the table passes all
-  six; a clean store holding a revision passes them.
+  `ingested_at` on a moved row, except a moved fact with a later stored ingest
+  of the same fact (same security, name, class member and accession) or a
+  revision at its own ingest, which keeps its original `ingested_at` (#2985).
+  A store without the table passes all six; a clean store holding a revision passes them.
 - `bars_on_sessions`: every `prices_daily.session` is an XNYS session in the
   configured calendar range.
 - `no_duplicate_bars`: no two bars share `(security_id, session, known_at)`.
