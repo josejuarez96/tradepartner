@@ -777,6 +777,117 @@ def test_a_row_after_the_cutoff_inserted_mid_group_fails_nothing(
     assert outcome.n_ok == 4
 
 
+#: The sweep `_policy_sweep` registers: the fixture sweep with its fixed block at
+#: `backtest.delisting_failure_return = "failure_v1"` (#2670, T328d; the key is not a
+#: sweepable axis, so a whole sweep carries it).
+POLICY_SLUG = "fixture-sweep-policy"
+
+
+def _policy_sweep(path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register `POLICY_SLUG` on the store at `path`. Two refusals are lifted, as the
+    guard under test reads only the frozen value: `load_frozen` refuses
+    `backtest.delisting_failure_return` off `none` until T328c wires the engine
+    (`NOT_YET_APPLIED_KEYS`; the engine, ignoring the policy today, runs a
+    `failure_v1` variant as last-close), and the key is a family rule the fixture
+    family fixes at `none` (`_rule_differences`)."""
+    real_differences = sweep._rule_differences
+
+    def differences(*args: Any, **kwargs: Any) -> list[str]:
+        found = real_differences(*args, **kwargs)
+        return [d for d in found if not d.startswith("backtest.delisting_failure_return")]
+
+    monkeypatch.setattr(hypothesis, "NOT_YET_APPLIED_KEYS", frozenset())
+    monkeypatch.setattr(sweep, "_rule_differences", differences)
+    text = _copy_file(path.parent / "files", SWEEP_SOURCE, EDITS_SMALL).read_text()
+    text = text.replace(f'slug = "{SLUG}"', f'slug = "{POLICY_SLUG}"', 1).replace(
+        "[grid]\n", '[backtest]\ndelisting_failure_return = "failure_v1"\n\n[grid]\n', 1
+    )
+    source = path.parent / "files" / f"{POLICY_SLUG}.md"
+    source.write_text(text)
+    with open_for_write(Settings()) as conn:
+        sweep.register(conn, source, Settings(_env_file=None), registered_by="test")
+
+
+def _insert_exit_evidence(path: Path, table: str, known_at: datetime, security_id: str) -> None:
+    """One `delisting_reasons` or `mergers` row known at `known_at`, ingested now, of
+    `security_id`, which no variant reads: it moves the data vintage at a cutoff at or after
+    `known_at` only under a delisting policy other than `none`."""
+    common = {"security_id": security_id, "known_at": known_at, "ingested_at": utc_now()}
+    rows: dict[str, dict[str, Any]] = {
+        "delisting_reasons": {
+            "delisting_form": "25",
+            "delisting_class_title": "Common Stock",
+            "delisting_exchange": "NYSE",
+            "delisting_filed_at": known_at,
+            "reason": "performance_failure",
+            "reason_evidence_form": "8-K",
+            "reason_evidence_accession": "acc-lab-test",
+            "reason_source": "eightk_item",
+            "reason_known_at": known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+        "mergers": {
+            "kind": "cash",
+            "acquirer_security_id": None,
+            "acquiree_symbol": "LABT",
+            "acquiree_cusip": "",
+            "acquirer_symbol": "",
+            "acquirer_cusip": "",
+            "share_ratio": None,
+            "cash_per_share": 10.0,
+            "effective_date": known_at.date(),
+            "process_date": known_at.date(),
+            "payable_date": None,
+            "source_action_id": "lab-test",
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    }
+    with open_for_write(Settings(_env_file=None, store={"path": str(path)})) as conn:
+        insert_row(conn, table, rows[table] | common)
+
+
+@pytest.mark.parametrize("table", ["delisting_reasons", "mergers"])
+@pytest.mark.parametrize(
+    ("known_at", "in_window"), [(_close(IN_WINDOW), True), (_close(date(2020, 7, 1)), False)]
+)
+def test_exit_evidence_mid_group_fails_only_a_policy_variant_known_by_its_cutoff(
+    store: Path,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+    table: str,
+    known_at: datetime,
+    in_window: bool,
+) -> None:
+    """#2670, T328d: a `delisting_reasons` or `mergers` row known by the cutoff,
+    ingested mid-group, fails that group of a `failure_v1` sweep `store changed`,
+    while the same insertion leaves the `none` fixture sweep `ok`; a row known after
+    the cutoff fails neither."""
+    _policy_sweep(store, monkeypatch)
+    real = lab._PausingProvider.listing_ends
+    inserted: list[bool] = []
+    runs: list[str] = []
+
+    def inserting(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if not inserted:
+            inserted.append(True)
+            self.end_step()
+            _insert_exit_evidence(store, table, known_at, f"SEC_LAB_TEST_{len(runs)}")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(lab._PausingProvider, "listing_ends", inserting)
+    for slug, fails in ((SLUG, False), (POLICY_SLUG, in_window)):
+        inserted.clear()
+        runs.append(slug)
+        outcome = lab.run_sweep(slug, clock=clock)
+        status = {t.variant_index: (t.status, t.message) for t in outcome.trials}
+        first_group, second_group = list(_by_group(outcome).values())
+        expected = ("failed", registry.STORE_CHANGED_MESSAGE) if fails else ("ok", None)
+        assert {status[i] for i in first_group} == {expected}, slug
+        assert {status[i] for i in second_group} == {("ok", None)}, slug
+
+
 def test_a_one_group_budget_stops_at_the_group_boundary(
     store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:

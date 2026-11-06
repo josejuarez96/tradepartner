@@ -20,14 +20,21 @@ one entry (`form4_archive.find_entry`, `daily_index.find_index_entry`), never by
 an `ingested_at` window, so a zero-width quarter `sec_insider_bulk` run row is
 no second match. An entry fetched after its run finished, or a bulk entry whose
 zip its manifest does not list for that quarter, is refused: a later fetch is
-never an earlier run's input.
+never an earlier run's input. An entry with no fetch time is refused too (#3001),
+except a bulk entry whose listed zip has none either (a zip cached before T348's
+fetch record): its quarter and hash in the run's own zips list are the binding.
+An XML entry always has one, and a daily file cached before T347 has nothing else
+to bind it.
 
 **Inputs.** Every hash the matched entries name (Form 4 XML bodies, archived
 insider bulk zips, daily index bodies) goes to `raw_archive.download_inputs` at
 once, which checks the disk floor, requests and waits for every body and
-re-hashes each before any parse. The floor is checked again before each body is
-read (`check_archive_write` with no bytes), so a disk that fills mid-run stops
-it before a write.
+re-hashes each before any parse. The match runs first on a read-only connection
+that is closed before the download, so the bounded iCloud wait holds no store
+lock; the second pass matches again and refuses if the hashes changed, and a body
+evicted in between is refused by `read_body`, not downloaded (#3001). The floor
+is checked again before each body is read (`check_archive_write` with no bytes),
+so a disk that fills mid-run stops it before a write.
 
 **Compare.** A stored row whose parser-derived columns differ from the re-parse
 is a correction. The bound: a stored row the re-parse no longer produces, or a
@@ -35,7 +42,8 @@ Form 4 row it would add, is refused (a delete or a new fact is not a re-derive).
 
 **Write** (only with a release; the #1682 item 7 rules for never-true rows):
 only inside the open data release named (`repair.release_refusal`), only the
-dry run's count (`expect`), and only rows no open paper window read: with a
+dry run's count and digest (`expect`, `expect_digest`: the rows, `known_at`s and
+old and new values, #3001), and only rows no open paper window read: with a
 window open, a row whose `known_at` is at or before a read instant, or on or
 after the window's first session, is refused (`delete_master_rows`' rule).
 Each correction updates the derived columns in place with `ingested_at` the
@@ -48,6 +56,7 @@ window it touched (`registry.close_data_release`).
 
 from __future__ import annotations
 
+import hashlib
 import io
 import time
 import uuid
@@ -153,6 +162,25 @@ class RederiveResult:
     corrections: tuple[Correction, ...]
     refused: tuple[str, ...]
 
+    @property
+    def digest(self) -> str:
+        """12 hex characters of SHA-256 over the sorted corrections (table, key,
+        `known_at`, old and new values): what a write's `expect_digest` must match,
+        so a write changes exactly the rows and values its dry run listed."""
+        lines = sorted(
+            "|".join(
+                [
+                    c.table,
+                    *map(str, c.key),
+                    c.known_at.isoformat(),
+                    canonical_row({f"old_{k}": v for k, v in c.old.items()}),
+                    canonical_row({f"new_{k}": v for k, v in c.new.items()}),
+                ]
+            )
+            for c in self.corrections
+        )
+        return hashlib.sha256("\n".join(lines).encode()).hexdigest()[:12]
+
     def sessions(self) -> tuple[date, date] | None:
         """The New York dates of the earliest and latest corrected `known_at`."""
         days = sorted(c.known_at.astimezone(_NEW_YORK).date() for c in self.corrections)
@@ -165,8 +193,8 @@ class RederiveResult:
             f"raw re-derive ({head}), mode {self.mode}: {self.rows} stored rows, "
             f"writer runs {', '.join(self.runs) or 'none'}",
             f"inputs: {len(self.hashes)} archived bodies requested and hash-checked",
-            f"unchanged {self.unchanged}, corrections {len(self.corrections)}"
-            + (f" (known {span[0]}..{span[1]})" if span else ""),
+            f"unchanged {self.unchanged}, corrections {len(self.corrections)}, "
+            f"digest {self.digest}" + (f" (known {span[0]}..{span[1]})" if span else ""),
             *(c.label() for c in self.corrections),
             f"refused {len(self.refused)}",
             *self.refused,
@@ -323,11 +351,23 @@ def _match(
         if fetched is not None and datetime.fromisoformat(fetched) > done:
             refused.append(f"  {table} {list(key)}: its input was fetched after run {run_id}")
             continue
-        if row_source == BULK_SOURCE and not any(
-            z.get("quarter") == entry.get("quarter") and z.get("sha256") == entry["raw_sha256"]
+        zips = [
+            z
             for z in by_run[run_id].get("zips", ())
-        ):
+            if z.get("quarter") == entry.get("quarter") and z.get("sha256") == entry["raw_sha256"]
+        ]
+        if row_source == BULK_SOURCE and not zips:
             refused.append(f"  {table} {list(key)}: run {run_id} lists no such quarter zip")
+            continue
+        # A null fetch time passes only on a bulk entry whose zip, as the run's own
+        # zips list names it, has none either: a zip cached before T348 (#3001).
+        if fetched is None and (
+            row_source != BULK_SOURCE or any(z.get("fetched_at") is not None for z in zips)
+        ):
+            refused.append(
+                f"  {table} {list(key)}: its input has no fetch time, so it cannot be shown "
+                f"to be run {run_id}'s"
+            )
             continue
         matched.append(_Matched(table, row_source, group, key, row, run_id, entry))
     return matched, refused
@@ -500,6 +540,32 @@ def _repair_manifest(
     )
 
 
+def _matched(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    *,
+    mode: str,
+    accessions: Sequence[str],
+    file_dates: Sequence[date],
+) -> tuple[list[tuple[str, str, str, tuple[Any, ...], dict[str, Any]]], bool, list[_Matched]]:
+    """The selection, whether it is the daily index, and each row's one matched
+    entry; raises `RederiveRefused` on any match failure."""
+    selected = _selected(conn, accessions, file_dates)
+    index = selected[0][0] == di.INDEX_TABLE
+    manifests, finished = _manifests(conn, settings, index=index, mode=mode)
+    matched, refused = _match(selected, manifests, finished, mode)
+    if refused:
+        raise RederiveRefused(
+            f"{len(refused)} of {len(selected)} stored rows map to no single archived "
+            "manifest entry; nothing was read or written:\n" + "\n".join(refused)
+        )
+    return selected, index, matched
+
+
+def _hashes(matched: Sequence[_Matched]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(m.entry["raw_sha256"] for m in matched))
+
+
 def rederive(
     settings: Settings,
     icloud: raw_archive.ICloudItems,
@@ -509,36 +575,52 @@ def rederive(
     file_dates: Sequence[date] = (),
     release: str | None = None,
     expect: int | None = None,
+    expect_digest: str | None = None,
     clock: Callable[[], datetime] = utc_now,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> RederiveResult:
     """Re-derive the selected rows from their archived bodies (module docstring).
-    Without `release` a dry run on a read-only connection: it raises
-    `RederiveRefused` on any match failure and lists the other refusals. With
-    `release` it writes `expect` corrections or raises, writing nothing."""
+    Without `release` a dry run, read-only throughout: it raises `RederiveRefused`
+    on any match failure and lists the other refusals. With `release` it writes
+    the dry run's `expect` corrections, whose digest is `expect_digest`, or raises,
+    writing nothing.
+
+    Both first match on a read-only connection and close it, then download every
+    input with no store connection open, so a bounded iCloud wait never holds the
+    store lock (#3001). The second pass (under the write lock for a write) matches
+    again and refuses if the inputs changed; a body evicted in between is refused
+    by `read_body`, not downloaded."""
     if not mode.strip():
         raise RederiveRefused("name the writer runs' mode")
-    if release is None and expect is not None:
-        raise RederiveRefused("--expect needs --release: a dry run writes nothing")
-    if release is not None and expect is None:
-        raise RederiveRefused("a re-derive writes only a dry run's count: pass expect")
+    if release is None and (expect is not None or expect_digest is not None):
+        flag = "--expect" if expect is not None else "--expect-digest"
+        raise RederiveRefused(f"{flag} needs --release: a dry run writes nothing")
+    if release is not None and (expect is None or expect_digest is None):
+        raise RederiveRefused(
+            "a re-derive writes only a dry run's corrections: pass --expect and --expect-digest"
+        )
     started = ensure_tz_aware_utc(clock(), field_name="clock()")
+    with open_read_only(settings) as conn:
+        if release is not None and (why := release_refusal(conn, release)):
+            raise RederiveRefused(f"{why}; nothing written")
+        downloaded = _hashes(
+            _matched(conn, settings, mode=mode, accessions=accessions, file_dates=file_dates)[2]
+        )
+    raw_archive.download_inputs(settings, downloaded, icloud, clock=monotonic, sleep=sleep)
     opened = open_read_only(settings) if release is None else open_for_write(settings)
     with opened as conn:
         if release is not None and (why := release_refusal(conn, release)):
             raise RederiveRefused(f"{why}; nothing written")
-        selected = _selected(conn, accessions, file_dates)
-        index = selected[0][0] == di.INDEX_TABLE
-        manifests, finished = _manifests(conn, settings, index=index, mode=mode)
-        matched, refused = _match(selected, manifests, finished, mode)
-        if refused:
+        selected, index, matched = _matched(
+            conn, settings, mode=mode, accessions=accessions, file_dates=file_dates
+        )
+        hashes = _hashes(matched)
+        if hashes != downloaded:
             raise RederiveRefused(
-                f"{len(refused)} of {len(selected)} stored rows map to no single archived "
-                "manifest entry; nothing was read or written:\n" + "\n".join(refused)
+                "the matched inputs changed since the download (another run wrote meanwhile); "
+                "nothing written; rerun the dry run"
             )
-        hashes = tuple(dict.fromkeys(m.entry["raw_sha256"] for m in matched))
-        raw_archive.download_inputs(settings, hashes, icloud, clock=monotonic, sleep=sleep)
         corrections, unchanged, refused = _compare(settings, matched, icloud)
         refused += _window_refusals(conn, corrections)
         result = RederiveResult(
@@ -561,6 +643,11 @@ def rederive(
             raise RederiveRefused(
                 f"found {len(corrections)} corrections where the dry run's --expect is {expect}; "
                 "nothing written"
+            )
+        if result.digest != expect_digest:
+            raise RederiveRefused(
+                f"found corrections with digest {result.digest} where the dry run's "
+                f"--expect-digest is {expect_digest}; nothing written"
             )
         if not corrections:
             return result
