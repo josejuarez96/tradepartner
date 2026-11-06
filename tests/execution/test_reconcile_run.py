@@ -132,7 +132,17 @@ def test_reversed_activity_is_unseen_until_rebooked_and_column_stays_unique(
     )
     assert (
         "cash-1"
-        not in reconcile_run._seen_activities([booked, reversed_row], base, frozen_window)[0]
+        not in reconcile_run._seen_activities([booked, reversed_row], base, frozen_window, S)[0]
+    )
+    # #2961: a reversal stated at S+1 un-sees the activity from S+1 on only, the
+    # ledger's `reversed_true_up_ids(.., through)` cut; through S it stays seen.
+    later = replace(reversed_row, session=next_session(S))
+    assert "cash-1" in reconcile_run._seen_activities([booked, later], base, frozen_window, S)[0]
+    assert (
+        "cash-1"
+        not in reconcile_run._seen_activities(
+            [booked, later], base, frozen_window, next_session(S)
+        )[0]
     )
     wrong_link = replace(
         reversed_row,
@@ -141,7 +151,7 @@ def test_reversed_activity_is_unseen_until_rebooked_and_column_stays_unique(
         ),
     )
     with pytest.raises(ValueError, match="opposite reversal"):
-        reconcile_run._seen_activities([booked, wrong_link], base, frozen_window)
+        reconcile_run._seen_activities([booked, wrong_link], base, frozen_window, S)
     fake_reverse = replace(
         booked,
         adjustment_id=83,
@@ -151,7 +161,8 @@ def test_reversed_activity_is_unseen_until_rebooked_and_column_stays_unique(
         ingested_at=stamp + timedelta(seconds=2),
     )
     assert (
-        "cash-1" in reconcile_run._seen_activities([booked, fake_reverse], base, frozen_window)[0]
+        "cash-1"
+        in reconcile_run._seen_activities([booked, fake_reverse], base, frozen_window, S)[0]
     )
     event = ReconcileBreakRow(
         break_id="1:SEC_SPY:1",
@@ -182,7 +193,9 @@ def test_reversed_activity_is_unseen_until_rebooked_and_column_stays_unique(
     assert json.loads(rows[0].explanation_json or "")["rebooked_after_adjustment_id"] == 82
     assert (
         "cash-1"
-        in reconcile_run._seen_activities([booked, reversed_row, rows[0]], base, frozen_window)[0]
+        in reconcile_run._seen_activities([booked, reversed_row, rows[0]], base, frozen_window, S)[
+            0
+        ]
     )
     auto = reconcile_run._AutoAccept(
         size=7,
