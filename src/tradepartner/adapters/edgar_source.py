@@ -62,7 +62,9 @@ so after a bulk pass the CIKs still unstamped get the per-CIK fetch. The
 items refresh (above) reads the zip under `reuse_cached` but writes `items`
 only, never an `accepted_at`. A row still unstamped is excluded and reported on
 `.unstamped_filings`; it is cached as unstampable (and not re-fetched) only
-when its quarter had settled before the per-CIK fetch that lacked it.
+when a per-CIK fetch made `edgar.unstampable_retry_days` or more after its
+quarter settled still lacked it (#2865: SEC can serve a stamp after the
+settle).
 With `edgar.stamp_sgml_check` on (default, #1494: from 2026-10 the per-CIK
 API has served `acceptanceDateTime` moved late by New York's UTC offset), a
 CIK's new per-CIK stamps are cached only once the newest one matches its SGML
@@ -1887,6 +1889,14 @@ class EdgarFilingSource(FilingSource):
         end = datetime(year + qtr // 4, qtr % 4 * 3 + 1, 1, tzinfo=_EASTERN)
         return at >= end + timedelta(days=self._settings.edgar.index_settle_days)
 
+    def _unstampable(self, quarter: Quarter, at: datetime) -> bool:
+        """#2865: whether a fetch at `at` that lacks an accession of `quarter`
+        settles it as unstampable: `edgar.unstampable_retry_days` past the
+        quarter's settle (`_settled`). Before that the accession stays unstamped
+        and is asked again, since SEC can serve a stamp after the settle."""
+        retry = timedelta(days=self._settings.edgar.unstampable_retry_days)
+        return self._settled(quarter, at - retry)
+
     # --- stamping -----------------------------------------------------------
 
     def _stamp(
@@ -1929,7 +1939,7 @@ class EdgarFilingSource(FilingSource):
                 if submissions.empty:
                     break  # #576: an empty answer proves nothing unstampable
                 row, quarter = kept[cik][accession]
-                if self._settled(quarter, submissions.fetched_at):
+                if self._unstampable(quarter, submissions.fetched_at):
                     new[accession] = SubmissionRecord(accession, row.form, "", False, None)
             new = self._sgml_checked(cik, new)
             if new:
@@ -2256,7 +2266,7 @@ class EdgarFilingSource(FilingSource):
             found = submissions.records.get(accession)
             if found is None:
                 quarter = (filed_date.year, (filed_date.month - 1) // 3 + 1)
-                if not submissions.empty and self._settled(quarter, submissions.fetched_at):
+                if not submissions.empty and self._unstampable(quarter, submissions.fetched_at):
                     stamps[accession] = SubmissionRecord(accession, "", "", False, None)
                     self._save_stamps(issuer_cik, stamps)
                 return None

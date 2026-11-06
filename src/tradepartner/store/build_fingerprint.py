@@ -90,6 +90,7 @@ EXCLUDED_SETTINGS_KEYS = (
     "edgar.bulk_stamp_threshold_ciks",
     "edgar.bulk_stamps_enabled",
     "edgar.stamp_sgml_check",
+    "edgar.unstampable_retry_days",  # #2865: when to stop re-asking a stamp, as above.
     "edgar.stamp_sgml_fallback_runs",
     "edgar.stamp_header_bytes",
     "edgar.max_filing_failures",
