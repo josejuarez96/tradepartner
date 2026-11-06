@@ -978,9 +978,11 @@ class EdgarFilingSource(FilingSource):
         # fetch pass releases it (`release_index`) before any other opens.
         conn = self._open_index(path)
         try:
+            # #2924: a statement backfill's `ok` row reads no index, so it
+            # is not a seed and must not make a stale index look fresh.
             seed = conn.execute(
                 "SELECT max(started_at) FROM ingestion_runs WHERE source = 'edgar_index' "
-                "AND status = 'ok'"
+                "AND status = 'ok' AND mode <> 'statement_backfill'"
             ).fetchone()
             if seed is None or seed[0] is None:
                 conn.close()
