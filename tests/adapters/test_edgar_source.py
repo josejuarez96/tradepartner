@@ -3593,6 +3593,7 @@ def test_filename_fetch_workers_defaults_to_four_and_refuses_zero() -> None:
         Settings(_env_file=None, edgar={"filename_fetch_workers": 0})
 
 
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("workers", [2, 4, 8])
 def test_filename_pool_answer_is_byte_identical_to_the_sequential_fetch(
     tmp_path: Path, workers: int
@@ -3608,6 +3609,19 @@ def test_filename_pool_answer_is_byte_identical_to_the_sequential_fetch(
     seq_router = _fn_router()
     _fn_run(tmp_path / "again", seq_router, 1)
     assert sorted(router.urls) == sorted(seq_router.urls)
+
+
+@pytest.mark.timeout(60)
+def test_filename_pool_finishes_after_a_leaked_limiter_stamp(tmp_path: Path) -> None:
+    """#3039: the CI hang. Another test's fake clock left the process-wide
+    limiter's stamp far ahead of the real `time.monotonic()`; the pool's
+    first request slept the whole gap under the limiter lock and every
+    worker queued behind it. Each wait is now at most one interval."""
+    edgar_raw._LIMITER._last_request_monotonic = time.monotonic() + 100_000.0
+    started = time.monotonic()
+    result = _fn_run(tmp_path, _fn_router(), 2)
+    assert time.monotonic() - started < 30.0
+    assert [e.accession for e in result["listings"]] == [_FN_A, _FN_B, _FN_25_NASDAQ, _FN_COVER]
 
 
 def test_filename_pool_of_one_is_todays_sequential_path(
