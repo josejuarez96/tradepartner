@@ -5531,7 +5531,8 @@ def make_app(
         )
         _echo_scrubbed(f"paper reconcile: {result.status}; {result.mismatches_json}", s)
         if result.status == RECONCILE_FILLS_LAGGING:
-            # #2996: deferred, nothing halted; a collector journals the fills first.
+            # #2996: the lag itself halts nothing (a break beside it still does);
+            # a collector journals the fills, then reconciles.
             typer.echo(
                 "paper reconcile: the broker filled orders the journal has not collected "
                 "yet; `paper resume` (or the next `paper run`) collects them and reconciles",
