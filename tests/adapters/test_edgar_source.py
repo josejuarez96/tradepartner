@@ -927,6 +927,26 @@ def test_completed_index_seed_routes_full_rebuild_to_table(
         stale_repair.filing_index()
 
 
+def test_statement_backfill_row_does_not_freshen_index_seed(tmp_path: Path) -> None:
+    """#2924: a statement backfill's `ok` row reads no index, so it is not a seed."""
+    base = edgar_settings(tmp_path)
+    settings = base.model_copy(
+        update={"store": base.store.model_copy(update={"path": str(tmp_path / "store.duckdb")})}
+    )
+    conn = duckdb.connect(settings.store.path)
+    schema.init_schema(conn)
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, started_at, status, mode) VALUES "
+        "('seed', 'edgar_index', ?, 'ok', 'rebuild'), "
+        "('backfill', 'edgar_index', ?, 'ok', 'statement_backfill')",
+        [CLOCK - timedelta(days=1), CLOCK],
+    )
+    conn.close()
+    repair = EdgarFilingSource(settings, clock=lambda: CLOCK, prefer_stored_index=True)
+    with pytest.raises(RuntimeError, match="stored filing index is stale"):
+        repair.filing_index()
+
+
 def test_table_delisting_fetches_missing_stamp_metadata(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
