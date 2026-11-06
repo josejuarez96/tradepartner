@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -143,7 +144,23 @@ def test_every_master_and_edgar_key_is_classified() -> None:
         "events.sec_forms_backfill_start",
         "events.form4_xml_price_below",
         "events.form4_zero_price_xml_codes",
+        "events.form4_multi_owner_xml",
+        "events.form4_compare_trusted",
+        "events.form4_compare_decimals",
+        "events.form4_compare_tolerance",
+        "events.form4_compare_threshold",
     }
+
+
+def test_form4_compare_keys_do_not_move_the_build_hash() -> None:
+    """#2994: the rule 5 keys are classified as excluded, so setting them leaves the
+    incremental EDGAR build's hash (and so its cache) as it was."""
+    base = Settings(_env_file=None)
+    events = base.events.model_copy(
+        update={"form4_compare_threshold": Decimal("0.5"), "form4_multi_owner_xml": False}
+    )
+    changed = base.model_copy(update={"events": events})
+    assert module.build_fingerprint(changed).hash == module.build_fingerprint(base).hash
 
 
 # --- additive_statement_change (T365a, #2826) ---------------------------------

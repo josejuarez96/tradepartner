@@ -688,3 +688,16 @@ class EventsConfig(_ClosedConfig):
         if any(not v.is_finite() or v < 0 for v in value.values()):
             raise ValueError("form4_compare_tolerance must be finite and not negative")
         return value
+
+    @model_validator(mode="after")
+    def _check_compare_bulk_trust(self) -> EventsConfig:
+        # #2994: with the threshold set a bulk-trusted field's row would be stored as
+        # `sec_form4_xml` under the XML body's hash, which no re-derive reproduces.
+        bulk = sorted(n for n, src in self.form4_compare_trusted.items() if src == "bulk")
+        if self.form4_compare_threshold is not None and bulk:
+            raise ValueError(
+                f"form4_compare_trusted has fields trusted to the bulk set {bulk}; with "
+                "form4_compare_threshold set their rows would be stored under the XML's "
+                "provenance (#2994)"
+            )
+        return self

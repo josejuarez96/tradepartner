@@ -3737,6 +3737,18 @@ def test_events_form4_compare_keys_refuse_nonsense() -> None:
             Settings(_env_file=None, events=bad)
 
 
+def test_events_form4_compare_threshold_refuses_a_field_trusted_to_bulk() -> None:
+    """#2994: under the threshold a bulk-trusted field would be stored under the XML's
+    provenance, so the pair is refused at load; either key alone still loads."""
+    with pytest.raises(ValueError, match="trusted to the bulk set"):
+        Settings(
+            _env_file=None,
+            events={"form4_compare_threshold": 0.5, "form4_compare_trusted": {"shares": "bulk"}},
+        )
+    Settings(_env_file=None, events={"form4_compare_trusted": {"shares": "bulk"}})
+    Settings(_env_file=None, events={"form4_compare_threshold": 0.5})
+
+
 def test_paper_execution_defaults_and_opg_cutoff() -> None:
     s = _settings()
     assert s.paper.execution == {}

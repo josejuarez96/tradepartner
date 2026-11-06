@@ -69,6 +69,9 @@ class Rule5:
     declaration: Declaration
     tally: RunTally = field(default_factory=RunTally)
     found: dict[str, tuple[Disagreement, ...]] = field(default_factory=dict)
+    #: Every accession compared this run, agreeing or not (#2994: a marked accession
+    #: compared again and agreeing gets a resolved marker).
+    compared: set[str] = field(default_factory=set)
 
     @property
     def enforcing(self) -> bool:
@@ -84,6 +87,7 @@ class Rule5:
         """Compare one XML-fetched accession, count it once and keep its latest result."""
         disagreements = compare_rows(bulk_rows, xml_rows, self.declaration)
         self.tally.add(accession, disagreements)
+        self.compared.add(accession)
         if disagreements:
             self.found[accession] = disagreements
         else:
@@ -397,7 +401,8 @@ def run_form4_bulk_route(
     (or, for a sampled accession later routed to bulk, its trusted row) and the driver
     writes the marker; the driver fails the run if the share reaches the threshold.
     `xml_accessions` (accessions with a carried unresolved marker) always route to XML,
-    so a marked accession is never stored from bulk rows.
+    so a marked accession is never stored from bulk rows; one whose bulk record is no
+    longer a fair comparison side is counted `sec_forms_compare_marker_uncompared`.
     """
     if budget <= 0:
         raise ValueError("budget must be positive")
@@ -575,6 +580,9 @@ def run_form4_bulk_route(
                             continue
                         filing = trusted_xml
                         counts["sec_forms_compare_trusted_row"] += 1
+                elif accession in xml_accessions:
+                    # #2994: stored from XML but no fair comparison, so its marker stays
+                    counts["sec_forms_compare_marker_uncompared"] += 1
                 filing = replace(filing, form=submissions_form, filed_date=submissions_filed)
             elif accession in sampled:
                 # The sample's XML disagreed below the threshold: store its trusted

@@ -1398,13 +1398,14 @@ class EdgarFilingSource(FilingSource):
         counts: dict[str, int] = {}
         for row in by_key.values():
             counts[row.accession] = counts.get(row.accession, 0) + 1
+        # #2921: every shared accession's listing order in one scan.
+        shared = [accession for accession, count in counts.items() if count > 1]
         order_rows = {
             (row.cik, row.accession): row
-            for accession, count in counts.items()
-            if count > 1
-            for row in stored_index.accession_listing_order(
-                self._index_conn, accession, self._now()
-            )
+            for listed in stored_index.accession_listing_orders(
+                self._index_conn, shared, self._now()
+            ).values()
+            for row in listed
         }
 
         def listing_key(
