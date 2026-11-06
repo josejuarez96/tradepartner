@@ -58,6 +58,7 @@ from tradepartner.store.asof import (
 from tradepartner.store.benchmarks import BenchmarkIdentityError, benchmark_security_ids
 from tradepartner.store.db import open_read_only
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
+from tradepartner.store.dividend_reviews import reviewed_groups
 from tradepartner.store.lab_registry import family_rules
 from tradepartner.store.lab_schema import is_lab_initialised
 from tradepartner.store.registry import data_vintage, development_boundary
@@ -423,7 +424,11 @@ def _month(
             through=spec.session,
             check_only=True,
         )
+        # Gated on the reviewed list (#3015): an unexplained equal-amount pair is left
+        # out of the return and listed by the dropped read, so it flags `dropped_dividend`.
+        reviews = reviewed_groups()
         frame_args: dict[str, Any] = {
+            "dividend_reviews": reviews,
             "include_dividends": True,
             "include_spin_offs": settings.adjust.apply_spin_offs,
             "settings": settings,
@@ -464,7 +469,9 @@ def _month(
             end[sid] = bars[max(upto)] if upto else entry[sid]
         ends = listing_ends_as_of(conn, spec.t, settings, member_ids)
         actions = live_actions_as_of(conn, spec.t)
-        dropped = dropped_dividends_as_of(conn, spec.t, member_ids, settings=settings)
+        dropped = dropped_dividends_as_of(
+            conn, spec.t, member_ids, settings=settings, dividend_reviews=reviews
+        )
     returns: dict[str, float] = {}
     no_entry: dict[str, bool] = {}
     try:
