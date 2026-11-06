@@ -1955,6 +1955,114 @@ def test_a_spinoff_of_a_chain_not_yet_known_keeps_the_stored_parent(
     assert found.spinoffs == {}
 
 
+# --- a held chained predecessor (#3024) ---------------------------------------
+
+#: The successor's ticker in the #3024 cases: the chain's hand-over renamed it.
+SUCC_SYMBOL = "SPYN"
+
+
+def _held_chained_predecessor(
+    settings: Settings, fake: BookedFake, window: PaperWindowRow, chain_known_at: datetime
+) -> None:
+    """The book holds ten `SPY` shares; the store then learns a 1:1 chain `SPY` ->
+    `SUCC` (#821, known at `chain_known_at`) whose successor trades as `SPYN` from
+    S-1, and the predecessor's Form 25. The broker re-books the position under
+    `SPYN`. The account's funding deposit is the day before the window start."""
+    fake.activities = [FUNDING]
+    _hold(settings, fake, window, {(SPY, "SPY"): 10.0})
+    known = CUT - timedelta(minutes=1)
+    _fact(
+        settings,
+        "securities",
+        security_id=SUCC,
+        cik="CIK0009000001",
+        name="SPY Successor Inc",
+        benchmark=False,
+        known_at=known,
+        ingested_at=known,
+        source="edgar",
+        provenance="filing",
+    )
+    _fact(
+        settings,
+        "listings",
+        security_id=SUCC,
+        ticker=SUCC_SYMBOL,
+        exchange="NYSE",
+        class_title="Common Stock",
+        valid_from=previous_session(S),
+        known_at=known,
+        ingested_at=known,
+        source="edgar",
+        provenance="filing",
+    )
+    _delisting(settings, SPY, CUT - timedelta(days=5))
+    _chain(settings, SPY, SUCC, chain_known_at)
+    fake.extra_quantity = {"SPY": -10.0, SUCC_SYMBOL: 10.0}
+
+
+def _held_explanations(settings: Settings, window: PaperWindowRow) -> Explanations:
+    with open_read_only(settings) as conn:
+        return explanations_as_of(
+            conn,
+            window,
+            S,
+            as_of=STAMP,
+            settings=settings,
+            broker_symbols=(SUCC_SYMBOL,),
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+
+
+def test_a_held_chained_predecessor_reconciles_under_the_successors_symbol(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#3024: a book holding a predecessor whose chain is known at close(S-1) maps
+    it to the successor's broker symbol, so the broker's `SPYN` position is the
+    book's `SPY` holding and the reconciliation is `ok`, with nothing journaled;
+    before the fix it was a `broker_only_position` beside a missing `SPY`."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
+
+    assert _held_explanations(journal_settings, open_window).symbols[SPY] == SUCC_SYMBOL
+    row = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert row.status == "ok"
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_a_held_predecessor_whose_chain_is_known_after_the_cut_is_not_remapped(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """No look-ahead (#3024): with the chain known only after close(S-1), the held
+    `SPY` keeps its own symbol and the broker's `SPYN` maps to `SUCC`, so the
+    position stays a break, never re-keyed ahead of the chain."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT + timedelta(microseconds=1))
+
+    found = _held_explanations(journal_settings, open_window)
+
+    assert found.symbols[SPY] == "SPY"
+    assert found.symbols[SUCC] == SUCC_SYMBOL
+
+
+def test_a_held_predecessor_is_not_remapped_when_the_successor_is_journaled(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """Fail closed (#3024): when the journal also names the successor, the two ids
+    cannot share one broker position, so the predecessor keeps its own symbol and
+    the successor keeps `SPYN`; the quantities are never summed by a guess."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
+    run_id = _run(journal_settings, open_window)
+    _order(journal_settings, run_id, "tp-succ-1", SUCC, SUCC_SYMBOL, 1.0)
+
+    found = _held_explanations(journal_settings, open_window)
+
+    assert found.symbols[SPY] == "SPY"
+    assert found.symbols[SUCC] == SUCC_SYMBOL
+
+
 # --- a when-issued spin-off child at the broker (#2112) ------------------------
 
 #: The broker form of a when-issued child (Alpaca's `spin_offs.new_symbol`).
