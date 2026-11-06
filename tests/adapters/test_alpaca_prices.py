@@ -489,10 +489,12 @@ def _ended(
     status: str = "delisted",
     valid_from: date = date(1994, 1, 3),
     end_session: date | None = None,
+    delisting_filed_at: datetime | None = None,
 ) -> dict[str, object]:
     """A `listing_ends_as_of` row: the listing (from `valid_from`) ended by a
     Form 25, its last bar before the security's next row `end_session`."""
-    return {
+    filed = {} if delisting_filed_at is None else {"delisting_filed_at": delisting_filed_at}
+    return filed | {
         "security_id": security_id,
         "ticker": ticker,
         "class_title": class_title,
@@ -510,9 +512,15 @@ def _evidence(
     facts: list[dict[str, object]],
     ends: list[dict[str, object]] | None = None,
     as_of: date = RUN_DAY,
+    filed_bars: dict[tuple[str, date], date] | None = None,
 ) -> RegistrantEvidence:
     return registrant_evidence(
-        facts, ends or [], as_of=as_of, quiet_after_days=180, transfer_window_sessions=5
+        facts,
+        ends or [],
+        as_of=as_of,
+        quiet_after_days=180,
+        transfer_window_sessions=5,
+        filed_bars=filed_bars,
     )
 
 
@@ -1226,6 +1234,61 @@ class TestOwnDelisting:
                 ],
             ),
         )
+
+    WW = "0000105319"
+
+    def _ww(self, last_bar: date | None) -> ListingResolver:
+        # #3056: WW's old common last printed 2025-05-15, its 25-NSE was
+        # filed 2025-07-03 (effective 07-13); the new equity printed under
+        # WW from 07-07 and lists under its own id from 08-11.
+        filed = datetime(2025, 7, 3, 16, 29, tzinfo=UTC)
+        listed = date(2019, 8, 7)
+        return ListingResolver(
+            [
+                _listing(self.WW, "WW", listed, "Common Stock"),
+                _listing(f"{self.WW}@2025-08-11", "WW", date(2025, 8, 11), "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        self.WW,
+                        "WW",
+                        "Common Stock",
+                        date(2025, 7, 13),
+                        valid_from=listed,
+                        end_session=date(2025, 7, 11),
+                        delisting_filed_at=filed,
+                    )
+                ],
+                filed_bars={} if last_bar is None else {(self.WW, date(2025, 7, 3)): last_bar},
+            ),
+        )
+
+    def test_a_line_stopped_before_its_form_25_was_filed_ends_after_its_last_bar(self) -> None:
+        resolver = self._ww(date(2025, 5, 15))
+        assert resolver.resolve("WW", date(2025, 5, 15)) == self.WW
+        assert resolver.resolve("WW", date(2025, 5, 16)) is None
+        assert resolver.resolve("WW", date(2025, 7, 7)) is None
+        assert resolver.resolve("WW", date(2025, 8, 11)) == f"{self.WW}@2025-08-11"
+        assert resolver.report.ended_spans == 1
+
+    @pytest.mark.parametrize("last_bar", [None, date(2025, 6, 26), date(2025, 7, 2)])
+    def test_a_line_trading_within_the_window_of_its_filing_keeps_the_effective_day(
+        self, last_bar: date | None
+    ) -> None:
+        # Five sessions strictly between 06-26 and 07-07 (07-03 is a session,
+        # 07-04 a holiday): within the window, so no stop; no bar evidence
+        # keeps the effective-day cut as before.
+        resolver = self._ww(last_bar)
+        assert resolver.resolve("WW", date(2025, 7, 11)) == self.WW
+        assert resolver.resolve("WW", date(2025, 7, 14)) is None
+
+    def test_the_stopped_before_filing_cut_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: every session through the last bar keeps its owner.
+        stopped, plain = self._ww(date(2025, 5, 15)), self._ww(None)
+        for day in (date(2019, 8, 7), date(2023, 3, 1), date(2025, 5, 14), date(2025, 5, 15)):
+            assert stopped.resolve("WW", day) == plain.resolve("WW", day) == self.WW
 
     def test_a_line_that_traded_past_its_form_25_never_stopped_at_it(self) -> None:
         # #943 root cause: a bar on or after the delisting's effective day

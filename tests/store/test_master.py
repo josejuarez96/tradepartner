@@ -1622,6 +1622,77 @@ class TestNewEquityAfterForm25:
             (cik, "NYSE", date(2023, 5, 1)),
         ]
 
+    def _gpor(self, *, registered: datetime) -> FixtureFilingSource:
+        # GPOR (#3056): 25-NSE on NASDAQ 2021-02-02 (effective 2021-02-12),
+        # 8-A12B 2021-05-17 at emergence, the next cover page 2021-08-09
+        # lists the new equity on NYSE only.
+        cik = self.CIK
+        return FixtureFilingSource(
+            index=[
+                _filing(cik, "Gpor Co", "10-K", _at(2018, 3, 1)),
+                _filing(cik, "Gpor Co", "8-A12B", registered),
+            ],
+            cover_pages=[
+                _cover(cik, _at(2019, 8, 2), ("Common stock", "GPR", "NASDAQ")),
+                _cover(cik, _at(2021, 8, 9), ("Common Stock, $0.0001 par value", "GPR", "NYSE")),
+            ],
+            delistings=[
+                DelistingFiling(
+                    cik,
+                    "25-NSE",
+                    "Common Stock",
+                    "NASDAQ",
+                    "25-gpr",
+                    _at(2021, 2, 2),
+                    date(2021, 2, 12),
+                )
+            ],
+        )
+
+    def test_new_equity_on_another_exchange_is_a_new_security(self) -> None:
+        # #3056: an 8-A12B accepted after the old shares' delisting took
+        # effect registers new equity, whichever exchange lists it.
+        cik = self.CIK
+        build = build_master(
+            self._gpor(registered=_at(2021, 5, 17)), _settings(), ingested_at=INGESTED_AT
+        )
+        successor = f"{cik}@2021-08-09"
+        assert build.successions == (Succession(cik, successor, _at(2021, 8, 9)),)
+        assert [(r["security_id"], r["exchange"], r["valid_from"]) for r in build.listings] == [
+            (cik, "NASDAQ", date(2019, 8, 2)),
+            (successor, "NYSE", date(2021, 8, 9)),
+        ]
+
+    def test_a_registration_before_the_delisting_took_effect_is_a_transfer(self) -> None:
+        # The same shape with the 8-A12B before the effective day is an
+        # exchange transfer (CTO's shape): one security.
+        cik = self.CIK
+        build = build_master(
+            self._gpor(registered=_at(2021, 2, 4)), _settings(), ingested_at=INGESTED_AT
+        )
+        assert build.successions == ()
+        assert {r["security_id"] for r in build.listings} == {cik}
+
+    def test_the_cross_exchange_successor_is_known_only_from_its_cover_page(self) -> None:
+        source = self._gpor(registered=_at(2021, 5, 17))
+        settings = _settings()
+        full = _new_store()
+        write_master(full, build_master(source, settings, ingested_at=INGESTED_AT))
+        probes = sorted(
+            {k + d for k in source.known_ats() for d in (-PROBE_EPSILON, PROBE_EPSILON)}
+        )
+        for t in probes:
+            partial = _new_store()
+            write_master(
+                partial, build_master(source.known_by(t), settings, ingested_at=INGESTED_AT)
+            )
+            for read in (securities_as_of, listings_as_of):
+                assert read(full, t).equals(read(partial, t)), f"{read.__name__} T={t!r}"
+            partial.close()
+        before = securities_as_of(full, _at(2021, 8, 9) - PROBE_EPSILON)
+        assert f"{self.CIK}@2021-08-09" not in _ids(before)
+        full.close()
+
     def test_a_late_amendment_never_delists_the_successor(self) -> None:
         # quant-auditor pass 2 on #826: a 25-NSE/A amending the old class's
         # Form 25, filed after the successor is known, amends the old class.

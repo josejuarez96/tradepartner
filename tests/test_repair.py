@@ -1707,3 +1707,91 @@ def test_a_retract_id_alone_in_the_feed_is_kept() -> None:
     source._fetch_actions = lambda symbols, start, end: only_b
     got = source.corporate_actions([DUP], date(2021, 6, 1), date(2021, 6, 30))
     assert [a.source_action_id for a in got] == ["b"]
+
+
+WW_OLD, WW_NEW = "0000105319", "0000105319@2025-08-11"
+WW_FILED = datetime(2025, 7, 3, 16, 29, tzinfo=UTC)
+
+
+@pytest.fixture
+def ww(settings: Settings) -> Settings:
+    """#3056, the owner's store's facts: WW's old common lists WW from
+    2019-08-07 and last prints 2025-05-15 (it trades OTC as WGHTQ after
+    that); the 25-NSE for the cancelled shares is filed 2025-07-03,
+    effective 07-13. The new equity prints under WW from 07-07 and those
+    prints sat on the old id; its own id lists WW from 2025-08-11."""
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        for row in (
+            _listing(WW_OLD, "WW", date(2019, 8, 7)),
+            _listing(WW_NEW, "WW", date(2025, 8, 11)),
+        ):
+            insert_row(conn, "listings", row)
+        insert_row(
+            conn,
+            "delistings",
+            {
+                "security_id": WW_OLD,
+                "form": "25-NSE",
+                "class_title": "Common Stock",
+                "exchange": "NYSE",
+                "filed_at": WW_FILED,
+                "effective_on": date(2025, 7, 13),
+                "known_at": WW_FILED,
+                "ingested_at": RUN,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        for sid, session, close in (
+            (WW_OLD, date(2025, 5, 14), 0.28),
+            (WW_OLD, date(2025, 5, 15), 0.25),
+            (WW_OLD, date(2025, 7, 7), 40.0),
+            (WW_OLD, date(2025, 7, 11), 39.05),
+            (WW_NEW, date(2025, 8, 11), 33.54),
+        ):
+            insert_row(conn, "prices_daily", _bar(sid, session, close=close))
+    return settings
+
+
+def test_new_equity_prints_before_the_old_form_25_takes_effect_leave_the_old_id(
+    ww: Settings,
+) -> None:
+    # #3056: the old line stopped 05-15, more than the window before its
+    # Form 25 was filed, so its span ends 05-16 and the 40.00 prints are
+    # no one's (the successor's own row starts 08-11): the dry run lists them.
+    result = repair_resolution(ww, clock=lambda: RUN, dry_run=True)
+    assert sorted(result.found.bars) == [(WW_OLD, date(2025, 7, 7)), (WW_OLD, date(2025, 7, 11))]
+    with duckdb.connect(ww.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, RUN, ww)
+    assert resolver.resolve("WW", date(2025, 5, 15)) == WW_OLD
+    assert resolver.resolve("WW", date(2025, 7, 7)) is None
+    assert resolver.resolve("WW", date(2025, 8, 11)) == WW_NEW
+
+
+def test_a_line_trading_up_to_its_form_25_keeps_the_effective_day_cut(ww: Settings) -> None:
+    # A merger's shape: bars until the day before the filing, so the cut
+    # stays on the effective day and nothing moves.
+    with open_for_write(ww) as conn:
+        insert_row(conn, "prices_daily", _bar(WW_OLD, date(2025, 7, 2), close=0.3))
+    with duckdb.connect(ww.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, RUN, ww)
+    assert resolver.resolve("WW", date(2025, 7, 11)) == WW_OLD
+    assert resolver.resolve("WW", date(2025, 7, 14)) is None
+
+
+def test_the_stopped_before_filing_cut_reads_only_what_was_known(ww: Settings) -> None:
+    # No look-ahead (#3056): before the Form 25 is known nothing is cut;
+    # `filed_bars` reads only bars known at `at`, so a late-arriving bar
+    # (known after `at`) never decides an earlier run's cut.
+    late = datetime(2025, 7, 20, 21, tzinfo=UTC)
+    with open_for_write(ww) as conn:
+        insert_row(conn, "prices_daily", _bar(WW_OLD, date(2025, 7, 2), close=0.3, known=late))
+    with duckdb.connect(ww.store.path, read_only=True) as conn:
+        before = store_resolver(conn, WW_FILED - timedelta(seconds=1), ww)
+        assert before.holds(WW_OLD, date(2025, 6, 2))
+        at = datetime(2025, 7, 10, 21, tzinfo=UTC)
+        assert repair.filed_bars(conn, at) == {(WW_OLD, date(2025, 7, 3)): date(2025, 5, 15)}
+        assert repair.filed_bars(conn, RUN) == {(WW_OLD, date(2025, 7, 3)): date(2025, 7, 2)}
+        assert not store_resolver(conn, at, ww).holds(WW_OLD, date(2025, 7, 7))
+        assert store_resolver(conn, RUN, ww).holds(WW_OLD, date(2025, 7, 7))

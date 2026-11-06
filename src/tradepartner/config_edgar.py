@@ -475,6 +475,13 @@ class MasterConfig(_ClosedConfig):
     #: `chain_price_break` (#821): the ratio or its inverse. 1.15, so a break
     #: over 15% either way.
     chain_max_price_ratio: float = Field(default=1.15, gt=0)
+    #: The close ratio across a bar gap of more than `transfer_window_sessions`
+    #: sessions on one security above which `health` lists it in
+    #: `spliced_series` (#3056): the ratio or its inverse. A post-bankruptcy
+    #: equity spliced onto the old company's id jumps ~100x across the months
+    #: it was off the exchange (GPOR 527x, CBL 335x, WW 160x); 5, so a
+    #: five-fold move across a gap is reviewed.
+    splice_max_price_ratio: float = Field(default=5.0, gt=1)
 
     @field_validator("keep_successors")
     @classmethod
