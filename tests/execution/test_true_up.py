@@ -205,6 +205,53 @@ def test_reverse_quantity_restores_ledger_and_next_reconcile_reports_break(
     assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
 
 
+def test_a_reconcile_stated_before_a_reversal_refuses_and_writes_nothing(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    frozen_window: PaperWindowRow,  # noqa: F811
+    fixed_clock: FixedClock,
+) -> None:
+    """#2961: a true-up at S reversed at S+1. A catch-up reconcile of S used to
+    attribute the `MA` again beside the kept true-up and halt on book-level cash.
+    Its events would also land after `reopened` and close the owner's reopened
+    break from a session that cannot see it. So it refuses before any write. The
+    funding `JNLC` dated before the window start stays in the base throughout,
+    and reconciling S+1 reopens the break on the figures it opened with."""
+    opened = _open_quantity_and_cash_break(journal_settings, fake, frozen_window, fixed_clock)
+    assert FUNDING in fake.activities and FUNDING.date < frozen_window.started_at.date()
+    _true_up(journal_settings, fake, fixed_clock, opened.break_id)
+    fixed_clock.advance(seconds=1)
+    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "ok"
+    later = next_session(S)
+    fixed_clock.now = datetime(later.year, later.month, later.day, 15, tzinfo=UTC)
+    reversed_result = _reverse(journal_settings, fake, fixed_clock, opened.break_id)
+    reversals = [
+        a
+        for a in _adjustments(journal_settings, frozen_window)
+        if a.adjustment_id in reversed_result.adjustment_ids
+    ]
+    assert {a.session for a in reversals} == {later}
+    assert {(a.quantity, a.cash) for a in reversals} == {(-1.0, None), (None, -30.0)}
+    before = _snapshot(journal_settings, frozen_window)
+
+    fixed_clock.advance(seconds=1)
+    with pytest.raises(ValueError, match="true-up reversal is stated for 2026-10-02"):
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock)
+    assert _snapshot(journal_settings, frozen_window) == before
+    assert _events(journal_settings, frozen_window)[-1].event == "reopened"
+
+    fixed_clock.advance(seconds=1)
+    result = _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later)
+    assert result.status == "breaks"
+    observed = _events(journal_settings, frozen_window)[-1]
+    assert observed.break_id == opened.break_id and observed.event == "observed"
+    assert (observed.ledger_quantity, observed.broker_quantity, observed.cash_amount) == (
+        opened.ledger_quantity,
+        opened.broker_quantity,
+        opened.cash_amount,
+    )
+
+
 def test_reverse_refuses_open_break_on_same_name_without_writing(
     journal_settings: Settings,
     fake: BookedFake,  # noqa: F811
