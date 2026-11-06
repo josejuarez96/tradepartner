@@ -590,7 +590,12 @@ def test_render_exposures_and_family_configurations(
     assert families.iloc[0]["exposure configurations"] == 2
     checkbox = next(box for box in at.checkbox if box.label == "Show synthetic exposures")
     checkbox.check().run()
-    assert "candidate-3" in set(_frame(at, "candidate")["candidate"])
+    shown = _frame(at, "candidate").set_index("candidate")
+    assert "candidate-3" in shown.index
+    assert [bool(shown.loc[c, "synthetic"]) for c in ("candidate-1", "candidate-3")] == [
+        False,
+        True,
+    ]
 
 
 def test_pre_exposure_store_renders_not_initialised(
