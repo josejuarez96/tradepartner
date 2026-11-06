@@ -2324,6 +2324,12 @@ def test_b_s_resume_releases_b_alone_under_its_own_lock(
         (reconciliation,) = reconciliations_for(conn, b_id)
         assert reconciliations_for(conn, window.window_id) == []  # type: ignore[arg-type]
     assert reconciliation.book_id == "b"
+    with open_read_only(journal_settings) as conn:
+        # #2490: the invocation names its book, so its fill cursor is b's alone.
+        (invocation,) = resume_invocations(conn)
+        (cursor,) = fill_cursors(conn)
+    assert invocation.book_id == "b"
+    assert (cursor.writer_kind, cursor.writer_id) == ("resume", invocation.resume_id)
 
 
 def test_resume_for_a_book_with_no_window_is_no_window_beside_main(

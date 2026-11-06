@@ -616,7 +616,12 @@ registry; #83 took version 2 first, so the registry is version 3):
   `filing_index_pending`, a row's 0-based position within its SEC index file,
   so readers order an accession's rows by `(listed_on, list_position)` and
   never by rowid. Existing rows keep NULL until the next rebuild.
-- **A later DDL change goes to version 47**, with its own migration and a
+- **Version 47** (#2490): nullable `resume_invocations.book_id`, the book a
+  `paper resume` ran for, so its `fill_cursors` row is that book's alone and
+  another book's resume never moves this book's `fills(since)`. Rows written
+  before 47 keep NULL (no known book): a book's collection drops their
+  cursors, which only moves its read earlier.
+- **A later DDL change goes to version 48**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -949,9 +954,10 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 45 (T318, #2740): additive EDGAR filing-index fact and cursor tables.
 #: - 46 (#2813): nullable `list_position` on `filing_index` and
 #:   `filing_index_pending`.
-#: - A later DDL change goes to version 47, with its own migration and a
+#: - 47 (#2490): nullable `resume_invocations.book_id`.
+#: - A later DDL change goes to version 48, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 46
+CURRENT_SCHEMA_VERSION = 47
 
 #: The last version without `delisting_reasons` (T326, version 43): the
 #: `snapshot_sightings` version (#2665). A named constant, not
@@ -971,6 +977,10 @@ _PRE_FILING_INDEX_VERSION = 44
 #: The last version without `list_position` on the filing-index tables (#2813,
 #: version 46): the filing-index version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
 _PRE_LIST_POSITION_VERSION = 45
+
+#: The last version without `resume_invocations.book_id` (#2490, version 47):
+#: the `list_position` version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
+_PRE_RESUME_BOOK_VERSION = 46
 
 #: Last version without the owner-entered Form 8937 allocation table.
 _PRE_SPINOFF_ALLOCATIONS_VERSION = 38
@@ -2748,6 +2758,7 @@ CREATE TABLE IF NOT EXISTS resume_invocations (
     reason VARCHAR NOT NULL,
     accept_broker_fills BOOLEAN NOT NULL,
     accept_rejections BOOLEAN NOT NULL,
+    book_id VARCHAR,
     {_JOURNAL_TIMESTAMPS}
 )
 """
@@ -3528,6 +3539,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_RESEARCH_EXPOSURES_VERSION,
         _PRE_FILING_INDEX_VERSION,
         _PRE_LIST_POSITION_VERSION,
+        _PRE_RESUME_BOOK_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3572,7 +3584,9 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # #2617); version 41 every read (only the writing SEC ticker ingest
         # names `snapshot_sightings`, #2295); version 43 every existing read
         # (no `research_exposures` or `trial_results.n_exposure` until 44,
-        # T355).
+        # T355); version 46 every read but `journal.resume_invocations` (no
+        # `book_id` until 47, #2490), which only the writing `switch.release`
+        # calls.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3957,6 +3971,17 @@ def _migrate_list_position(conn: duckdb.DuckDBPyConnection) -> None:
     """Add the nullable `list_position` to the filing-index tables (version 46)."""
     for table in ("filing_index", "filing_index_pending"):
         _add_nullable_int_columns(conn, table, ("list_position",))
+
+
+def _migrate_resume_book(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add the nullable `resume_invocations.book_id` (version 47, #2490), NULL on
+    every existing row. Runs inside `init_schema`'s transaction, after its DDL
+    pass (a pre-journal store gets the column from the DDL)."""
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info('resume_invocations')").fetchall()
+    }
+    if "book_id" not in existing:
+        conn.execute("ALTER TABLE resume_invocations ADD COLUMN book_id VARCHAR")
 
 
 def _migrate_n_exposure(conn: duckdb.DuckDBPyConnection) -> None:
@@ -4822,6 +4847,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_RESEARCH_EXPOSURES_VERSION,
         _PRE_FILING_INDEX_VERSION,
         _PRE_LIST_POSITION_VERSION,
+        _PRE_RESUME_BOOK_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4883,6 +4909,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _migrate_n_research(conn)
         _migrate_n_exposure(conn)
         _migrate_list_position(conn)
+        _migrate_resume_book(conn)
         _migrate_profitability_rebalance_counts(conn)
         _migrate_assets_intersection(conn)
         _relax_no_history_count(conn)
