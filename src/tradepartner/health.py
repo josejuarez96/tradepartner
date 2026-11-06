@@ -241,9 +241,11 @@ derived at `t`, as the data is read.
   from the row before it) and `filing_index_timestamps_aware` (`known_at`,
   `accepted_at` and `ingested_at` are `TIMESTAMPTZ`). The frames carry
   (`cik`, `accession`, rows), except the last, which carries the columns. The
-  common `known_at <= ingested_at` rule covers the rest, as the restamp sets
-  `ingested_at` on every row it moves. A store without the table passes all
-  six; a clean store holding a revision passes them.
+  common `known_at <= ingested_at` rule covers the rest: the restamp sets
+  `ingested_at` on a moved row, except a moved fact with a later stored ingest
+  of the same fact (same security, name, class member and accession) or a
+  revision at its own ingest, which keeps its original `ingested_at` (#2985).
+  A store without the table passes all six; a clean store holding a revision passes them.
 - `bars_on_sessions`: every `prices_daily.session` is an XNYS session in the
   configured calendar range.
 - `no_duplicate_bars`: no two bars share `(security_id, session, known_at)`.
@@ -358,8 +360,10 @@ derived at `t`, as the data is read.
   reviewed list (`store.dividend_reviews`, read at the edge so tests inject
   one) by `equal_amount_groups`: a key with more than one identity that the
   list does not hold, or a listed key with another identity count than the
-  two reviewed (a third record; a lost leg; a duplicate whose ids changed),
-  fails, one row per identity with its `known_at`. `known_at` and the id
+  two reviewed (a third record; a lost leg; a duplicate whose ids changed;
+  a reviewed retract id re-sent under another key, a noisy amount or
+  another ex-date, beside another live payment, #2980), fails, one row per
+  identity with its `known_at`. `known_at` and the id
   are never part of the key, and the rule has no date bound. The
   `duplicate_dividends` block lists the accepted (`distinct`) and
   unresolved keys, never hidden, and the pending ones (a listed `duplicate`

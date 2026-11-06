@@ -3323,6 +3323,27 @@ def test_a_repaired_duplicate_is_neither_shown_nor_failed(
     assert report.duplicate_dividends.groups == ()
 
 
+def test_a_re_sent_retract_id_with_a_noisy_amount_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#2980: dd-b, deleted by the release, comes back with a noisy amount;
+    its exact key misses the reviewed one, but beside the kept dd-a it is one
+    payment stored twice, so the rule fails on both ids."""
+    later = DIV_KNOWN + timedelta(days=2)
+    _cash(fixture_store, "dd-a")
+    _cash(fixture_store, "dd-b", known=later, amount=0.37 + 1e-12)
+    failed, violations, report = _dividend_check(fixture_store, [_review("duplicate")])
+    assert failed == {DUPLICATE_DIVIDENDS}
+    assert not report.ok
+    assert violations.select("amount", "source_action_id", "verdict").to_dicts() == [
+        {"amount": 0.37, "source_action_id": "dd-a", "verdict": "duplicate"},
+        {"amount": 0.37 + 1e-12, "source_action_id": "dd-b", "verdict": "duplicate"},
+    ]
+    # Before the re-send is known the store is the repaired one: it passes.
+    early = health_report(fixture_store, DIV_KNOWN, _settings(), reviewed=[_review("duplicate")])
+    assert DUPLICATE_DIVIDENDS not in early.failures
+
+
 def test_the_fixture_store_passes_under_the_packaged_list(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
