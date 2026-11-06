@@ -7,10 +7,12 @@ fakes the disk and iCloud, and never fetches: the parse reads only archived bodi
 from __future__ import annotations
 
 import hashlib
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pytest
@@ -32,8 +34,8 @@ from lookahead.rederive_rig import (
 )
 
 from tradepartner.adapters.form4_archive import BULK_SOURCE, XML_SOURCE
-from tradepartner.store import raw_archive
-from tradepartner.store.db import StoreLockedError, insert_row, open_for_write
+from tradepartner.store import raw_archive, raw_rederive
+from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.raw_archive import (
     RawArchiveIntegrityError,
     RawArchiveMissingError,
@@ -255,25 +257,38 @@ def test_every_named_body_is_requested_before_any_parse_and_one_offline_fails_al
     assert parsed == []
 
 
-def _spy_downloads(rig: Rig, monkeypatch: pytest.MonkeyPatch, then: object = None) -> list[bool]:
-    """Wrap `download_inputs`: record whether the store's write lock was free while
-    it ran, then run `then(rig)` (a change between the passes)."""
+def _spy_downloads(rig: Rig, monkeypatch: pytest.MonkeyPatch, then: object = None) -> list[int]:
+    """Wrap `download_inputs`: record how many store connections the re-derive held
+    open while it ran (an in-process DuckDB write connection would not block a second
+    one, so the lock itself is not probed), then run `then(rig)`, a change between
+    the passes."""
     real = raw_archive.download_inputs
-    free: list[bool] = []
+    held: list[int] = []
+    open_now = [0]
+
+    def counted(opener: Callable[..., Any]) -> Callable[..., Any]:
+        @contextmanager
+        def wrapper(*args: object, **kw: object) -> Iterator[object]:
+            with opener(*args, **kw) as conn:
+                open_now[0] += 1
+                try:
+                    yield conn
+                finally:
+                    open_now[0] -= 1
+
+        return wrapper
 
     def spy(*args: object, **kw: object) -> object:
-        try:
-            with open_for_write(rig.settings):
-                free.append(True)
-        except StoreLockedError:
-            free.append(False)
+        held.append(open_now[0])
         out = real(*args, **kw)  # type: ignore[arg-type]
         if callable(then):
             then(rig)
         return out
 
+    monkeypatch.setattr(raw_rederive, "open_for_write", counted(raw_rederive.open_for_write))
+    monkeypatch.setattr(raw_rederive, "open_read_only", counted(raw_rederive.open_read_only))
     monkeypatch.setattr(raw_archive, "download_inputs", spy)
-    return free
+    return held
 
 
 @pytest.mark.parametrize("write", [False, True])
@@ -283,12 +298,12 @@ def test_the_download_holds_no_store_connection(
     rig.form4_run(wrong=WRONG_SHARES)
     rig.open_release()
     digest = _digest(rig)
-    free = _spy_downloads(rig, monkeypatch)
+    held = _spy_downloads(rig, monkeypatch)
     kw: dict[str, object] = {"release": REL, "expect": 1, "expect_digest": digest} if write else {}
 
     result = _run(rig, **kw)
 
-    assert free == [True]  # one download, with the lock free
+    assert held == [0]  # one download, no store connection open
     assert len(result.corrections) == 1  # type: ignore[attr-defined]
 
 
@@ -391,9 +406,9 @@ def test_a_write_needs_the_open_release_and_the_dry_run_count_and_digest(
     rig.form4_run(wrong=WRONG_SHARES)
     before, digest = rig.table(), _digest(rig)
     downloads = _spy_downloads(rig, monkeypatch)
-    with pytest.raises(RederiveRefused, match="pass expect"):
+    with pytest.raises(RederiveRefused, match="pass --expect"):
         _run(rig, release=REL)
-    with pytest.raises(RederiveRefused, match="pass expect"):
+    with pytest.raises(RederiveRefused, match="pass --expect"):
         _run(rig, release=REL, expect=1)  # the count alone is not enough
     with pytest.raises(RederiveRefused, match="no release is open"):
         _run(rig, release=REL, expect=1, expect_digest=digest)
@@ -410,6 +425,7 @@ def test_the_digest_names_which_rows_and_values_not_just_how_many(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def digest(name: str, **kw: object) -> str:
+        (tmp_path / name).mkdir()
         rig = Rig(tmp_path / name, monkeypatch)
         rig.form4_run(**kw)  # type: ignore[arg-type]
         result = _run(rig)

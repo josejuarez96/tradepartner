@@ -229,6 +229,7 @@ def rederive(
     file_dates: Sequence[date],
     release: str | None,
     expect: int | None,
+    expect_digest: str | None,
 ) -> list[str]:
     """`raw_rederive.rederive`'s report lines: a dry run without `release`."""
     result = raw_rederive.rederive(
@@ -239,5 +240,6 @@ def rederive(
         file_dates=file_dates,
         release=release,
         expect=expect,
+        expect_digest=expect_digest,
     )
     return result.lines()
