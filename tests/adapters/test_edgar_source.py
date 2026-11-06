@@ -600,6 +600,38 @@ def test_incremental_pending_and_acceptance_time(
     assert not later.pending
 
 
+def test_incremental_unstampable_quarter_is_the_first_filed_on_quarter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#3041: the quarter that decides an unstampable accession is its first
+    listing's filed_on quarter (T323a), fresh or pending, never the quarter of
+    a pending row's listed_on, which a settled form.idx's Last-Modified puts a
+    quarter late. A rebuild and an incremental store then decide alike."""
+    from tradepartner.adapters.filings import PendingIndexRow
+
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    # Pending from 2025 Q4's form.idx, listed at its Last-Modified in 2026 Q1.
+    late = PendingIndexRow(
+        APPLE, "0000320193-25-000009", "8-K", "Company", date(2025, 12, 23), date(2026, 1, 12)
+    )
+    # A fresh first listing in a 2026 Q2 daily file, filed in Q1.
+    file = _incremental_file(date(2026, 4, 1))
+    fresh = _incremental_row(APPLE, "0000320193-26-000009", "10-K", date(2026, 3, 31))
+    monkeypatch.setattr(source, "_incremental_daily_rows", lambda _file: (fresh,))
+    asked: dict[str, tuple[int, int]] = {}
+
+    def stamps(
+        rows: dict[str, dict[str, tuple[UnstampedFiling, tuple[int, int]]]],
+    ) -> dict[tuple[str, str], datetime | None]:
+        asked.update({a: q for by_cik in rows.values() for a, (_, q) in by_cik.items()})
+        return {}
+
+    monkeypatch.setattr(source, "_incremental_stamps", stamps)
+    result = source.incremental_index(_incremental_state(pending=(late,), files=(file,)))
+    assert asked == {late.accession: (2025, 4), fresh.accession: (2026, 1)}
+    assert {r.accession for r in result.pending} == {late.accession, fresh.accession}
+
+
 def test_incremental_keeps_exchange_only_and_filer_13d(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2244,6 +2276,70 @@ def test_an_accession_missing_after_its_quarter_settled_is_cached_as_unstampable
     again.filing_index()
     assert [u.accession for u in again.unstamped_filings] == [MISSING]
     assert _submission_urls(router) == []
+
+
+#: 2026 Q3 ends 2026-10-01 ET and settles three days later, 2026-10-04 ET.
+_Q3_SETTLED = datetime(2026, 10, 10, tzinfo=UTC)
+_MISSING_AT = datetime(2026, 9, 24, 20, tzinfo=UTC)
+
+
+def _late_router(*, stamped: bool) -> EdgarRouter:
+    """`_router` through 2026 Q4 (still open, 404); with `stamped`, Apple's
+    submissions list `MISSING` with its acceptance, as SEC serves it late."""
+    router = _router(last=(2026, 4), overrides={(2026, 4): 404})
+    if stamped:
+        payload = load(SUBMISSIONS[APPLE][0])
+        recent = payload["filings"]["recent"]
+        for column, values in recent.items():
+            values.insert(0, values[0])
+            if column == "accessionNumber":
+                values[0] = MISSING
+            elif column == "form":
+                values[0] = "8-K"
+            elif column == "acceptanceDateTime":
+                values[0] = _MISSING_AT.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            elif column == "filingDate":
+                values[0] = "2026-09-24"
+        router.add(f"{SUBMISSIONS_URL}CIK{APPLE}.json", payload)
+    return router
+
+
+def test_a_stamp_that_arrives_inside_the_retry_window_after_settle_is_kept(
+    tmp_path: Path,
+) -> None:
+    """#2865: a fetch after the quarter settled that lacks the accession does
+    not end the asking while `edgar.unstampable_retry_days` runs, so a stamp
+    SEC serves later is kept at its acceptance."""
+    cache = tmp_path / "cache"
+    first = _source(edgar_settings(cache), _late_router(stamped=False), clock=_Q3_SETTLED)
+    assert MISSING not in {e.accession for e in first.filing_index()}
+    assert [u.accession for u in first.unstamped_filings] == [MISSING]
+    router = _late_router(stamped=True)
+    later = _source(edgar_settings(cache), router, clock=_Q3_SETTLED + timedelta(days=10))
+    entries = {e.accession: e for e in later.filing_index()}
+    assert f"CIK{APPLE}.json" in _submission_urls(router)
+    assert entries[MISSING].accepted_at == _MISSING_AT
+    assert later.unstamped_filings == []
+
+
+def test_an_accession_still_missing_past_the_retry_window_is_cached_unstampable(
+    tmp_path: Path,
+) -> None:
+    """#2865: once a fetch made `edgar.unstampable_retry_days` after the settle
+    still lacks the accession, it is cached as unstampable and never asked again."""
+    settings = edgar_settings(tmp_path / "cache")
+    window = timedelta(days=settings.edgar.unstampable_retry_days)
+    settle = datetime(2026, 10, 4, tzinfo=edgar_source_module._EASTERN)
+    inside = _source(settings, _late_router(stamped=False), clock=settle + window - timedelta(1))
+    inside.filing_index()
+    past = _source(settings, _late_router(stamped=False), clock=settle + window)
+    past.filing_index()
+    assert [u.accession for u in past.unstamped_filings] == [MISSING]
+    router = _late_router(stamped=True)
+    again = _source(settings, router, clock=settle + window + timedelta(days=1))
+    assert MISSING not in {e.accession for e in again.filing_index()}
+    assert [u.accession for u in again.unstamped_filings] == [MISSING]
+    assert f"CIK{APPLE}.json" not in _submission_urls(router)
 
 
 def test_a_truncated_cache_file_is_not_served(settings: Settings) -> None:
