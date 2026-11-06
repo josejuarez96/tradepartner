@@ -198,6 +198,7 @@ from tradepartner.errors import ClockError, LimitBreachError, ReconciliationErro
 from tradepartner.execution import breaks as break_rules
 from tradepartner.execution import switch
 from tradepartner.execution.ledger import (
+    TRUE_UP_KINDS,
     Ledger,
     from_journal,
     reversed_adjustment_id,
@@ -1292,27 +1293,36 @@ def _seen_activities(
     return booked, window.started_at.astimezone(_NEW_YORK).date()
 
 
-def _refuse_before_a_reversal(adjustments: Sequence[AdjustmentRow], through: date) -> None:
-    """Refuse a reconciliation stated through a session before a true-up
-    reversal's (#2961). The reversal takes effect from its own session, so the
-    ledger through `through` keeps the true-up; but break events are read in
-    write order, so this run's events would land after the `reopened` one and
-    close the owner's reopened break from a session that cannot see it, and its
-    `ok` row (stamped now) would become the cash base of the reversal's session.
-    Every caller states `command_session(now)` or the run's New York date, never
-    before a reversal stamped `command_session` earlier, so only a direct
-    earlier-session call reaches this."""
-    later = [
-        row.session
-        for row in adjustments
-        if reversed_adjustment_id(row) is not None and row.session > through
-    ]
-    if later:
-        day = max(later).isoformat()
-        raise ValueError(
-            f"a true-up reversal is stated for {day}, after {through.isoformat()}: "
-            f"reconcile {day} or later"
-        )
+class StatedBeforeTrueUp(ValueError):
+    """A reconciliation stated through a session before a true-up's (#2961,
+    #3018), refused before any broker read or journal write."""
+
+
+def _refuse_before_a_true_up(adjustments: Sequence[AdjustmentRow], through: date) -> None:
+    """Refuse a reconciliation stated through a session before any true-up's
+    (#2961 for a reversal, #3018 for a booking): an owner true-up, its
+    reversal, or an auto true-up. Each takes effect from its own session, so the
+    ledger through `through` leaves it out; but break events are read in write
+    order, so this run's events would land after the true-up's `trued_up` or
+    `reopened` one and reopen or close the owner's break from a session that
+    cannot see it, and its row (stamped now) would become the cash base of the
+    true-up's session, which then halts on cash. `paper run` and `paper resume`
+    state `command_session(now)` or the run's own session, never before a
+    true-up stamped `command_session` earlier, so only a direct
+    earlier-session call (a catch-up reconcile) reaches this."""
+    later = [row for row in adjustments if row.kind in TRUE_UP_KINDS and row.session > through]
+    if not later:
+        return
+    day = max(row.session for row in later)
+    what = (
+        "a true-up reversal"
+        if any(reversed_adjustment_id(row) is not None for row in later if row.session == day)
+        else "a true-up"
+    )
+    raise StatedBeforeTrueUp(
+        f"{what} is stated for {day.isoformat()}, after {through.isoformat()}: "
+        f"reconcile {day.isoformat()} or later"
+    )
 
 
 def _rebooked_after(adjustments: Sequence[AdjustmentRow]) -> dict[str, int]:
@@ -2372,8 +2382,8 @@ def reconcile_now(
     commit, or on a failed break-event write after the chunk rolls back,
     `ClockError` for a bad clock reading or an `as_of` after it, `ValueError`
     for a non-session `session`, a window without an id, a naive `as_of`, or a
-    ledger stated before a true-up reversal's session (before any broker read
-    or write, #2961),
+    ledger stated before a true-up's or its reversal's session
+    (`StatedBeforeTrueUp`, before any broker read or write, #2961, #3018),
     and whatever the broker raises (every allowlist this reaches is empty,
     req 4)."""
     window_id = _window_id(window)
@@ -2388,7 +2398,7 @@ def reconcile_now(
     tolerance = frozen.reconcile_quantity_tolerance
 
     with connect() as conn:
-        _refuse_before_a_reversal(adjustments_for(conn, window_id), through)
+        _refuse_before_a_true_up(adjustments_for(conn, window_id), through)
         orders, pending, sums = _open_orders(conn, window_id)
 
     positions: dict[str, Position] = broker.positions()

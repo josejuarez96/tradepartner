@@ -40,7 +40,9 @@ The only way the kill switch is released. In the req 5 order:
      residual fill and its terminal event; one the broker still holds open
      refuses, since it may yet fill.
 6. `reconcile_now` (T61) for the clock's session, its journal cut (`as_of`)
-   a clock reading taken after every row steps 1 to 5 wrote. A mismatch refuses (the
+   a clock reading taken after every row steps 1 to 5 wrote. A ledger stated
+   before a true-up's session (only a clock gone back) refuses with the reason
+   and engages nothing (#3018). A mismatch refuses (the
    mismatch row is written, the switch stays engaged, and is engaged with
    source `fault` if nothing had engaged it). Any other status but `ok` or
    `breaks` refuses too: `switch.release` takes only those, so a lag inside
@@ -143,6 +145,7 @@ from tradepartner.execution.collect import (
 from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.reconcile import BREAKS, OK
 from tradepartner.execution.reconcile_run import (
+    StatedBeforeTrueUp,
     command_session,
     frozen_risk,
     reconcile_now,
@@ -662,6 +665,11 @@ def resume(
                 frozen=frozen,
                 as_of=as_of,
             )
+        except StatedBeforeTrueUp as exc:
+            # A ledger stated before a true-up's session (#3018): refused before
+            # any broker read or write, so nothing is a fault to engage on. Only
+            # a clock that went back past a true-up reaches it here.
+            return outcome(REFUSED, f"reconciliation refused: {exc}")
         except ReconciliationError as exc:
             # A fault found here engages the switch when nothing has (a resume
             # with no engagement to release), as `paper reconcile` does.
