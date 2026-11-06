@@ -163,6 +163,10 @@ class EdgarConfig(BaseModel):
     # `submissions.zip` instead of per-CIK submissions.
     index_first_year: int = Field(default=1993, ge=1993)
     index_settle_days: int = Field(default=3, ge=0)
+    # #2865: an accession a fetch after its quarter settled still lacks is asked
+    # again on every run until a fetch this many days past the settle lacks it
+    # too; only then is it cached as unstampable and no longer fetched.
+    unstampable_retry_days: int = Field(default=30, ge=0)
     # T319b (#2629, #2659): every Saturday (US/Eastern) the nightly re-reads and
     # reconciles this many of the latest settled quarters, beside the HEAD-ETag test.
     reconcile_recent_quarters: int = Field(default=8, ge=1)
