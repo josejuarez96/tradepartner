@@ -326,6 +326,7 @@ from tradepartner.adapters.form4_route import (
 from tradepartner.adapters.openfigi import FigiType, parse_mapping
 from tradepartner.adapters.openfigi_raw import map_tickers
 from tradepartner.adapters.prices import (
+    ActionType,
     Bar,
     CorporateAction,
     Merger,
@@ -1170,6 +1171,125 @@ def ingest_actions_backfill(
             now,
             clock,
             f"actions;since={since};through={last}",
+            dry_run,
+            mode=ACTIONS_MODE,
+            prepare=prepare,
+            success_status=ACTIONS_FILLED,
+        )
+
+    runs: list[SourceRun] = []
+    for first, last in month_windows(since, through):
+        run = run_month(first, last)
+        runs.append(run)
+        if run.status != ACTIONS_FILLED:
+            break
+    return IngestResult(tuple(runs))
+
+
+def ingest_spinoff_backfill(
+    settings: Settings,
+    *,
+    since: date,
+    through: date | None = None,
+    release: str | None = None,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+    fetch: Callable[[list[str], date, date], Mapping[str, Any]] | None = None,
+) -> IngestResult:
+    """Ask Alpaca for `spin_offs` per symbol, by calendar month (#3058).
+
+    The symbol-less scan (`ingest_actions_backfill`) finds nothing before
+    `alpaca.actions_backfill_floor` (the 2026-10-11 corpact probe), but the
+    per-symbol request does (#101: GE -> WAB on 2019-02-25), and the bar
+    backfill that asked per symbol for 2016 to 2020 ran before `spin_offs`
+    was read (#1506). So each month asks the request the bar backfill makes
+    (`backfill._window_names`: every security a bar of the month could land
+    on) for the `spin_off` type alone, through `AlpacaPriceSource`
+    (resolution, the child's `.WI` root, the kept-if-parent-or-child rule),
+    and writes the spin-offs by `_add_actions`' rules (the #1712 floor, the
+    revision rule; a row first seen is stamped at its own `known_at`, a
+    replacement at the run). It asks for no split or dividend, so no other
+    row is touched.
+
+    `through` defaults to the day before the floor. A real run writes only
+    inside the open data release `release` (it adds history before every
+    registered trial's cutoff, so it moves the data vintage): checked before
+    the first month and again under each month's write lock. A dry run
+    fetches and reports each month while rolling its writes and run row back.
+    Each month is an independent chunk in mode `actions` (status `filled`),
+    which the ordinary backfill cursor ignores; a month that does not fill
+    stops the run."""
+    from alpaca.data.enums import CorporateActionsType
+
+    from tradepartner.adapters import alpaca_raw
+    from tradepartner.adapters.alpaca_prices import AlpacaPriceSource
+    from tradepartner.backfill import _window_names, month_windows
+    from tradepartner.repair import release_refusal, store_resolver
+
+    if isinstance(since, datetime) or not isinstance(since, date):
+        raise TypeError("since must be a date")
+    floor = settings.alpaca.actions_backfill_floor
+    through = through or floor - timedelta(days=1)
+    if isinstance(through, datetime) or not isinstance(through, date) or through < since:
+        raise ValueError("through must be a date on or after since")
+    if not dry_run and (release is None or not release.strip()):
+        raise ValueError("a spin-off backfill writes only inside a named data release")
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    if not dry_run:
+        assert release is not None
+        with _read(settings) as conn:
+            if (why := release_refusal(conn, release)) is not None:
+                raise ValueError(f"{why}; nothing written")
+    ask = fetch or partial(
+        alpaca_raw.corporate_actions, types=[CorporateActionsType.SPIN_OFF], settings=settings
+    )
+
+    def run_month(first: date, last: date) -> SourceRun:
+        prepared: dict[str, Any] = {}
+
+        def prepare() -> None:
+            with _read(settings) as conn:
+                resolver = store_resolver(conn, now, settings)
+                ids = _window_names(conn, now, (first, last), settings, resolver)[0]
+            source = AlpacaPriceSource(resolver, fetch_actions=ask, settings=settings)
+            prepared["actions"] = [
+                a
+                for a in source.corporate_actions(ids, first, last)
+                if a.action_type is ActionType.SPINOFF
+            ]
+            prepared["report"] = source.last_actions_report
+            prepared["asked"] = len(ids)
+
+        def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+            if not dry_run and release is not None and (why := release_refusal(conn, release)):
+                raise ValueError(f"{why}; nothing written")
+            actions = prepared["actions"]
+            report = prepared["report"]
+            stamp = ensure_tz_aware_utc(clock(), field_name="clock()")
+            counts: dict[str, int] = {}
+            added = _add_actions(conn, actions, (first, last), ingested_at=stamp, stats=counts)
+            if report is not None:
+                counts["actions_unresolved"] = len(report.unresolved)
+                counts["actions_self_spinoff"] = report.self_spinoff
+                counts["actions_spinoff_revisions"] = report.spinoff_revisions
+                counts["actions_spinoff_unordered"] = len(report.spinoff_unordered)
+                counts["spinoffs_unrequested"] = report.spinoffs_unrequested
+                if report.malformed_categories:
+                    raise ValueError(f"malformed {', '.join(report.malformed_categories)}")
+            message = "; ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+            return (
+                added,
+                f"{first}..{last}: {len(actions)} spin-off action(s) of "
+                f"{prepared['asked']} securities asked; {message}",
+            )
+
+        return _run_source(
+            "alpaca",
+            write,
+            settings,
+            now,
+            clock,
+            f"spinoffs;since={since};through={last}",
             dry_run,
             mode=ACTIONS_MODE,
             prepare=prepare,

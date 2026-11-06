@@ -253,8 +253,11 @@ def corporate_actions(
     end: date,
     *,
     settings: Settings | None = None,
+    types: Sequence[CorporateActionsType] | None = None,
 ) -> Any:
-    """Raw corporate-actions payload (splits, dividends, ...) for `symbols`.
+    """Raw corporate-actions payload (splits, dividends, ...) for `symbols`,
+    of every type, or only `types` when given (#3058: the spin-off backfill
+    asks for `spin_off` alone).
 
     `CorporateActionsRequest.limit` defaults to `1000` **as a total cap
     across every page**, not a per-page size: `alpaca-py`'s `_get_marketdata`
@@ -280,7 +283,13 @@ def corporate_actions(
         _drop_actions_seen_in_earlier_batches(
             [
                 client.get_corporate_actions(
-                    CorporateActionsRequest(symbols=batch, start=start, end=end, limit=None)
+                    CorporateActionsRequest(
+                        symbols=batch,
+                        types=None if types is None else list(types),
+                        start=start,
+                        end=end,
+                        limit=None,
+                    )
                 )
                 for batch in _symbol_batches(symbols, settings)
             ]
