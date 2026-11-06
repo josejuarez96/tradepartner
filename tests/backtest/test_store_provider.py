@@ -55,6 +55,7 @@ from tradepartner.store.db import (
 )
 from tradepartner.store.delisting_reasons import delisting_reasons_as_of
 from tradepartner.store.delistings import listing_ends_as_of
+from tradepartner.store.dividend_reviews import reviewed_groups
 from tradepartner.universe import shares_as_of, universe_as_of
 
 UNIVERSE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
@@ -457,6 +458,30 @@ def test_dropped_dividends_equal_the_as_of_read(store: Store) -> None:
     with store.direct() as conn:
         want = dropped_dividends_as_of(conn, T_MAR, ids, settings=store.settings)
     assert got.equals(want)
+
+
+@pytest.mark.parametrize("include_dividends", [False, True])
+def test_dividend_reads_pass_the_reviewed_list(
+    store: Store, monkeypatch: pytest.MonkeyPatch, include_dividends: bool
+) -> None:
+    """#3015: every dividend-including read is gated on the packaged reviewed list, so a
+    duplicate payment is not summed whether or not `health` ran first; a splits-only
+    read passes nothing (it reads no dividend)."""
+    seen = _spy_on_adjusted(monkeypatch)
+    dropped_calls: list[dict[str, Any]] = []
+
+    def spy_dropped(*args: Any, **kwargs: Any) -> pl.DataFrame:
+        dropped_calls.append(kwargs)
+        return dropped_dividends_as_of(*args, **kwargs)
+
+    monkeypatch.setattr(store_provider_module, "dropped_dividends_as_of", spy_dropped)
+    ids = ["SEC_DIV_REVISED", "SEC_SPY"]
+    with store.provider() as provider:
+        provider.adjusted_prices(T_MAR, ids, include_dividends)
+        provider.dropped_dividends(T_MAR, ids)
+    want = reviewed_groups()
+    assert [call.get("dividend_reviews") for call in seen] == [want if include_dividends else None]
+    assert [call.get("dividend_reviews") for call in dropped_calls] == [want]
 
 
 def test_late_dividends(store: Store) -> None:
