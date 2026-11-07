@@ -1266,7 +1266,17 @@ def ingest_spinoff_backfill(
             actions = prepared["actions"]
             report = prepared["report"]
             stamp = ensure_tz_aware_utc(clock(), field_name="clock()")
-            counts: dict[str, int] = {}
+            # A live split of a spin-off's parent on its ex-date is a spin-off
+            # stored as a split that the reviewed list does not name (#3058,
+            # quant-auditor): with spin-offs on, a trial would apply both. A dry
+            # run names them; a real run writes nothing for the month.
+            collisions = _split_spinoff_collisions(conn, actions)
+            if collisions and not dry_run:
+                raise ValueError(
+                    f"{len(collisions)} live split row(s) on a spin-off's parent and ex-date, "
+                    f"not on store/spinoff_splits.csv: {', '.join(collisions)}; review them first"
+                )
+            counts: dict[str, int] = {"split_spinoff_collisions": len(collisions)}
             added = _add_actions(conn, actions, (first, last), ingested_at=stamp, stats=counts)
             if report is not None:
                 counts["actions_unresolved"] = len(report.unresolved)
@@ -1277,10 +1287,11 @@ def ingest_spinoff_backfill(
                 if report.malformed_categories:
                     raise ValueError(f"malformed {', '.join(report.malformed_categories)}")
             message = "; ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+            named = f"; collisions: {', '.join(collisions)}" if collisions else ""
             return (
                 added,
                 f"{first}..{last}: {len(actions)} spin-off action(s) of "
-                f"{prepared['asked']} securities asked; {message}",
+                f"{prepared['asked']} securities asked; {message}{named}",
             )
 
         return _run_source(
@@ -1303,6 +1314,29 @@ def ingest_spinoff_backfill(
         if run.status != ACTIONS_FILLED:
             break
     return IngestResult(tuple(runs))
+
+
+def _split_spinoff_collisions(
+    conn: duckdb.DuckDBPyConnection, actions: Sequence[CorporateAction]
+) -> list[str]:
+    """`"parent ex_date ratio"` of every live stored `split` (latest revision,
+    not cancelled) of a spin-off's parent on the spin-off's ex-date (#3058)."""
+    keys = sorted(
+        {(a.source_action_id, a.ex_date) for a in actions if a.source_action_id is not None}
+    )
+    if not keys:
+        return []
+    found = conn.execute(
+        "SELECT security_id, ex_date, ratio_or_amount FROM ("
+        "  SELECT *, row_number() OVER (PARTITION BY security_id, source_action_id, "
+        "    CASE WHEN source_action_id = '' THEN ex_date END ORDER BY known_at DESC) AS rn "
+        "  FROM corporate_actions WHERE action_type = 'split' "
+        "    AND list_contains(?, security_id)) "
+        "WHERE rn = 1 AND NOT cancelled ORDER BY security_id, ex_date",
+        [sorted({parent for parent, _ in keys})],
+    ).fetchall()
+    wanted = set(keys)
+    return [f"{sid} {ex} {ratio!r}" for sid, ex, ratio in found if (sid, ex) in wanted]
 
 
 _FORM4_BACKFILL: ContextVar[bool] = ContextVar("form4_backfill", default=False)

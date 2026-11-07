@@ -210,3 +210,46 @@ def test_the_spinoff_backfill_command(store: Settings, monkeypatch: pytest.Monke
     missing = runner.invoke(unkeyed, [*base, "--dry-run"])
     assert missing.exit_code == cli.USAGE_ERROR
     assert "ALPACA_API_KEY" in missing.output
+
+
+def test_a_live_split_on_the_spin_offs_parent_and_day_stops_a_real_run(store: Settings) -> None:
+    """A spin-off stored as a split that the reviewed list does not name: a
+    dry run names it, a real run writes nothing for the month (#3058)."""
+    from tradepartner.store.db import insert_row
+
+    with duckdb.connect(store.store.path, read_only=True) as conn:
+        [(spy,)] = conn.execute(
+            "SELECT DISTINCT security_id FROM listings WHERE ticker = 'SPY'"
+        ).fetchall()
+    stamp = session_close(previous_session(EX))
+    with open_for_write(store) as conn:
+        insert_row(
+            conn,
+            "corporate_actions",
+            {
+                "security_id": spy,
+                "action_type": "split",
+                "ex_date": EX,
+                "ratio_or_amount": 1.25,
+                "announced_at": None,
+                "source_action_id": "unlisted-echo",
+                "cancelled": False,
+                "known_at": stamp,
+                "ingested_at": stamp,
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+    dry = ingest_spinoff_backfill(
+        store, since=JUNE[0], through=JUNE[1], clock=lambda: NOW, dry_run=True, fetch=_payload
+    )
+    assert dry.runs[0].status == ACTIONS_FILLED
+    assert "split_spinoff_collisions=1" in dry.runs[0].message
+    assert f"collisions: {spy} {EX} 1.25" in dry.runs[0].message
+    _open(store)
+    real = ingest_spinoff_backfill(
+        store, since=JUNE[0], through=JUNE[1], release=REL, clock=lambda: NOW, fetch=_payload
+    )
+    assert real.runs[0].status != ACTIONS_FILLED
+    assert "not on store/spinoff_splits.csv" in real.runs[0].message
+    assert _actions(store, "spinoff") == []
