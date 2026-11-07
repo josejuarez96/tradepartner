@@ -11,7 +11,9 @@ path's read, `paper resume`'s settlement). In order:
    call: only `paper resume` settles `pending` orders, through `get_order` in
    its own code. An order the journal already holds terminal is skipped.
 2. **Read the broker**: `fills(since)` once, account-wide, with `since` =
-   min(the latest `collected_through` across every `fill_cursors` row, the
+   min(the latest `collected_through` across the writer's book's `fill_cursors`
+   rows (#2475, #2490: a run's book is its window's, a resume's its
+   `resume_invocations` row's; a cursor of no known book is dropped), the
    earliest `known_at` of the `pending` event of any non-terminal own order)
    - `paper.fill_read_overlap_seconds`, inclusive at equal timestamps
    (`Broker.fills` returns `filled_at >= since`); `None` (everything) when
@@ -86,8 +88,8 @@ path's read, `paper resume`'s settlement). In order:
    raises `SystemFaultError` naming
    `fill_price_outside_band` (a rejection verdict of the call is named in the message),
    so the caller halts. The journal and the broker agree on a bad fill, so no
-   reconciliation can see it. `paper resume` and the halt path's read pass no band:
-   the owner looks at a resume, and the halt has already happened.
+   reconciliation can see it. Resume and the halt path's read use the same band;
+   a newly journaled bad fill refuses release or is named in the halt notes.
 
 Every clock reading is checked (ADR 0007 point 4): an exception, a
 non-`datetime` or a naive value becomes `ClockError`, and so does a write
@@ -168,6 +170,7 @@ Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 
 WRITER_KINDS = ("run", "resume")
 _RUN = WRITER_KINDS[0]
+_RESUME = WRITER_KINDS[1]
 _PENDING = "pending"
 _REJECTED = "rejected"
 #: The reasons of a `rejected` event that is an allowlisted per-name refusal on
@@ -337,10 +340,11 @@ def collect(
         raise ValueError(f"orders passed more than once: {repeated}")
 
     with connect() as conn:
-        # The writer's own book only (#2475): another book's open buy and run
-        # cursor belong to its own account, so they must not move this read's
-        # `since`. A run names its book through its window; a resume through
-        # its orders; neither: read account-wide as before.
+        # The writer's own book only (#2475, #2490): another book's open buy and
+        # cursors belong to its own account, so they must not move this read's
+        # `since`. A run names its book through its window, a resume through
+        # its `resume_invocations` row, else through its orders; none: read
+        # account-wide as before.
         books = _writer_books(conn, writer_kind, writer_id, orders)
         cursors = _book_cursors(conn, books)
         open_since = _earliest_open_pending(conn, books)
@@ -540,35 +544,50 @@ def _runs_to_judge(
 def _writer_books(
     conn: duckdb.DuckDBPyConnection, writer_kind: str, writer_id: int, orders: Sequence[OrderRow]
 ) -> set[str] | None:
-    """The books this collection reads: the run's own book, else the orders'
-    books, else None (every book)."""
+    """The books this collection reads: the run's own book (its window's), or
+    the resume's own book (its `resume_invocations` row, #2490), else the
+    orders' books, else None (every book)."""
     if writer_kind == _RUN:
         row = conn.execute(
             "SELECT w.book_id FROM paper_runs r JOIN paper_windows w ON w.window_id = r.window_id "
             "WHERE r.run_id = ?",
             [writer_id],
         ).fetchone()
-        if row is not None:
-            return {str(row[0])}
+    else:
+        row = conn.execute(
+            "SELECT book_id FROM resume_invocations WHERE resume_id = ?", [writer_id]
+        ).fetchone()
+    if row is not None and row[0] is not None:
+        return {str(row[0])}
     return {o.book_id for o in orders} or None
 
 
 def _book_cursors(conn: duckdb.DuckDBPyConnection, books: set[str] | None) -> list[FillCursorRow]:
-    """Every cursor except another book's run cursor (#2475). A run cursor is
-    the book of its run's window; a resume cursor names no book and stays. Only
-    ever drops cursors, so `since` and `last_run` only move earlier (reads more, never hides
-    a fill)."""
+    """The cursors of `books` only (#2475, #2490): a run cursor is the book of
+    its run's window, a resume cursor the book on its `resume_invocations` row.
+    A cursor whose book is unknown (a resume journaled before schema 47, or a
+    writer with no row) belongs to no book and is dropped too. Only ever drops
+    cursors, so `since` and `last_run` only move earlier (reads more, never
+    hides a fill); with `books` None (no book known) every cursor stays."""
     cursors = fill_cursors(conn)
     if books is None:
         return cursors
-    book_of_run = {
-        int(run_id): str(book_id)
+    book_of = {
+        (_RUN, int(run_id)): str(book_id)
         for run_id, book_id in conn.execute(
             "SELECT r.run_id, w.book_id FROM paper_runs r "
             "JOIN paper_windows w ON w.window_id = r.window_id"
         ).fetchall()
     }
-    return [c for c in cursors if c.writer_kind != _RUN or book_of_run.get(c.writer_id) in books]
+    book_of.update(
+        {
+            (_RESUME, int(resume_id)): str(book_id)
+            for resume_id, book_id in conn.execute(
+                "SELECT resume_id, book_id FROM resume_invocations WHERE book_id IS NOT NULL"
+            ).fetchall()
+        }
+    )
+    return [c for c in cursors if book_of.get((c.writer_kind, c.writer_id)) in books]
 
 
 def _open_ids(conn: duckdb.DuckDBPyConnection, books: set[str] | None) -> set[str]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -49,8 +50,9 @@ def test_every_listed_setting_changes_hash(key: str) -> None:
 # Pinned from main (before #2826 added `edgar.statement_fact_units`), then
 # re-pinned for #2929's `BUILD_RULES_VERSION` 3, then #2941's 4, then T198's
 # flip of `edgar.cover_split_contexts` and `edgar.class_member_link` with
-# `FSN_VERSION` and `COVER_VERSION` 7.
-MAIN_DEFAULT_HASH = "da136ce753e445c2f92f4c2985958d7e221df0624fa74cf15fb10a2682785df1"
+# `FSN_VERSION` and `COVER_VERSION` 7, then #2490's `CURRENT_SCHEMA_VERSION` 47
+# (`resume_invocations.book_id`; at 46 the hash is still da136ce7...785df1).
+MAIN_DEFAULT_HASH = "a611910c04ebc0fe82a46907084bb418a8906d913d638e6b4bdfaeec4841dd56"
 
 
 def test_hash_at_defaults_equals_the_hex_pinned_from_main() -> None:
@@ -143,7 +145,23 @@ def test_every_master_and_edgar_key_is_classified() -> None:
         "events.sec_forms_backfill_start",
         "events.form4_xml_price_below",
         "events.form4_zero_price_xml_codes",
+        "events.form4_multi_owner_xml",
+        "events.form4_compare_trusted",
+        "events.form4_compare_decimals",
+        "events.form4_compare_tolerance",
+        "events.form4_compare_threshold",
     }
+
+
+def test_form4_compare_keys_do_not_move_the_build_hash() -> None:
+    """#2994: the rule 5 keys are classified as excluded, so setting them leaves the
+    incremental EDGAR build's hash (and so its cache) as it was."""
+    base = Settings(_env_file=None)
+    events = base.events.model_copy(
+        update={"form4_compare_threshold": Decimal("0.5"), "form4_multi_owner_xml": False}
+    )
+    changed = base.model_copy(update={"events": events})
+    assert module.build_fingerprint(changed).hash == module.build_fingerprint(base).hash
 
 
 # --- additive_statement_change (T365a, #2826) ---------------------------------

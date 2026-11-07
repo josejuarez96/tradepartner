@@ -179,6 +179,26 @@ def accession_listing_order(
     return _rows(conn, sql, [_utc(t), accession])
 
 
+def accession_listing_orders(
+    conn: duckdb.DuckDBPyConnection, accessions: Collection[str], t: datetime
+) -> dict[str, list[FilingRow]]:
+    """`accession_listing_order` for every accession in ``accessions``, in one
+    scan (#2921). An accession with no visible row is absent from the result."""
+    if not accessions:
+        return {}
+    sql = (
+        "WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY accession, cik "
+        "ORDER BY known_at ASC) AS rn FROM filing_index WHERE known_at <= ? "
+        "AND accession IN (SELECT unnest(?::VARCHAR[]))) "
+        f"SELECT {_SELECT} FROM ranked WHERE rn = 1 "
+        "ORDER BY accession, listed_on, list_position NULLS LAST, cik"
+    )
+    found: dict[str, list[FilingRow]] = {}
+    for row in _rows(conn, sql, [_utc(t), sorted(accessions)]):
+        found.setdefault(row.accession, []).append(row)
+    return found
+
+
 def ciks_by_accession(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,

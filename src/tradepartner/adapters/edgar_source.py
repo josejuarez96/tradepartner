@@ -57,7 +57,9 @@ so after a bulk pass the CIKs still unstamped get the per-CIK fetch. The
 items refresh (above) reads the zip under `reuse_cached` but writes `items`
 only, never an `accepted_at`. A row still unstamped is excluded and reported on
 `.unstamped_filings`; it is cached as unstampable (and not re-fetched) only
-when its quarter had settled before the per-CIK fetch that lacked it.
+when a per-CIK fetch made `edgar.unstampable_retry_days` or more after its
+quarter settled still lacked it (#2865: SEC can serve a stamp after the
+settle).
 With `edgar.stamp_sgml_check` on (default, #1494: from 2026-10 the per-CIK
 API has served `acceptanceDateTime` moved late by New York's UTC offset), a
 CIK's new per-CIK stamps are cached only once the newest one matches its SGML
@@ -1398,13 +1400,14 @@ class EdgarFilingSource(FilingSource):
         counts: dict[str, int] = {}
         for row in by_key.values():
             counts[row.accession] = counts.get(row.accession, 0) + 1
+        # #2921: every shared accession's listing order in one scan.
+        shared = [accession for accession, count in counts.items() if count > 1]
         order_rows = {
             (row.cik, row.accession): row
-            for accession, count in counts.items()
-            if count > 1
-            for row in stored_index.accession_listing_order(
-                self._index_conn, accession, self._now()
-            )
+            for listed in stored_index.accession_listing_orders(
+                self._index_conn, shared, self._now()
+            ).values()
+            for row in listed
         }
 
         def listing_key(
@@ -1687,11 +1690,7 @@ class EdgarFilingSource(FilingSource):
                     ),
                     pending_row.listed_on,
                     True,
-                    # T318's pending table preserves listed_on, not the source
-                    # quarter. For daily files this is the index quarter. A
-                    # settled-quarter Last-Modified may put it later, which
-                    # delays an unstampable decision rather than dating it early.
-                    (pending_row.listed_on.year, (pending_row.listed_on.month - 1) // 3 + 1),
+                    (pending_row.filed_on.year, (pending_row.filed_on.month - 1) // 3 + 1),
                 ),
             )
         stamp_input: dict[str, dict[str, tuple[UnstampedFiling, tuple[int, int]]]] = {}
@@ -1700,10 +1699,16 @@ class EdgarFilingSource(FilingSource):
             listings.sort(key=lambda item: (item[1], not item[2]))
             if first_pending is not None:
                 listings.insert(0, first_pending)
-            row, _, _, index_quarter = listings[0]
+            row = listings[0][0]
+            # #3041: the unstampable decision settles by the first listing's
+            # filed_on quarter (T323a, as `sec_form_stamp` and the delisting
+            # path do), fresh or pending. Not the pending row's listed_on, which
+            # a settled form.idx's Last-Modified puts a quarter late, nor the
+            # source file's quarter, which T318's pending table does not keep:
+            # either would let a rebuild and an incremental store decide apart.
             stamp_input.setdefault(key[0], {})[key[1]] = (
                 row,
-                index_quarter,
+                (row.filed_on.year, (row.filed_on.month - 1) // 3 + 1),
             )
         stamps = self._incremental_stamps(stamp_input)
         # #2858: a pending row holds only its first listing, so a later listing of
@@ -1880,6 +1885,14 @@ class EdgarFilingSource(FilingSource):
         end = datetime(year + qtr // 4, qtr % 4 * 3 + 1, 1, tzinfo=_EASTERN)
         return at >= end + timedelta(days=self._settings.edgar.index_settle_days)
 
+    def _unstampable(self, quarter: Quarter, at: datetime) -> bool:
+        """#2865: whether a fetch at `at` that lacks an accession of `quarter`
+        settles it as unstampable: `edgar.unstampable_retry_days` past the
+        quarter's settle (`_settled`). Before that the accession stays unstamped
+        and is asked again, since SEC can serve a stamp after the settle."""
+        retry = timedelta(days=self._settings.edgar.unstampable_retry_days)
+        return self._settled(quarter, at - retry)
+
     # --- stamping -----------------------------------------------------------
 
     def _stamp(
@@ -1922,7 +1935,7 @@ class EdgarFilingSource(FilingSource):
                 if submissions.empty:
                     break  # #576: an empty answer proves nothing unstampable
                 row, quarter = kept[cik][accession]
-                if self._settled(quarter, submissions.fetched_at):
+                if self._unstampable(quarter, submissions.fetched_at):
                     new[accession] = SubmissionRecord(accession, row.form, "", False, None)
             new = self._sgml_checked(cik, new)
             if new:
@@ -2249,7 +2262,7 @@ class EdgarFilingSource(FilingSource):
             found = submissions.records.get(accession)
             if found is None:
                 quarter = (filed_date.year, (filed_date.month - 1) // 3 + 1)
-                if not submissions.empty and self._settled(quarter, submissions.fetched_at):
+                if not submissions.empty and self._unstampable(quarter, submissions.fetched_at):
                     stamps[accession] = SubmissionRecord(accession, "", "", False, None)
                     self._save_stamps(issuer_cik, stamps)
                 return None

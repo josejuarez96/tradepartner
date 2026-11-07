@@ -44,7 +44,8 @@ def _v11_journal_ddl() -> str:
     version-14 `signals.reason` widening undone (`_V13_SIGNALS_CHECK`) and the
     version-17 ADR 0015 seam columns and `position_side` checks stripped (#1153,
     T127; #1258, T132), and the version-25 booked-`FEE` columns and `fee_cash`
-    kind undone (#1583, T183)."""
+    kind undone (#1583, T183), and the version-47 `resume_invocations.book_id`
+    stripped (#2490)."""
     blob = "".join(schema._JOURNAL_TABLE_DDL).replace(
         schema._SIGNALS_REASON_CHECK, _V13_SIGNALS_CHECK, 1
     )
@@ -62,6 +63,8 @@ def _v11_journal_ddl() -> str:
         "    parent_order_id VARCHAR,\n",
         "    broker_activity_id VARCHAR UNIQUE,\n",
         "    activities_seen_json VARCHAR,\n",
+        # version 47 (#2490): `resume_invocations.book_id`
+        "    book_id VARCHAR,\n",
     ):
         blob = blob.replace(column, "")
     # version 25 widened `adjustments.kind` with `fee_cash`; restore the v11 set
@@ -325,7 +328,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_LIST_POSITION_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESUME_BOOK_VERSION + 1
 
 
 def test_research_table_names_are_the_spec_five() -> None:

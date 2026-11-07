@@ -2452,9 +2452,14 @@ def _mark_symbols(
 
     A later issuer's asset cannot supply the former issuer's mark flag. Both
     the listing ticker and the mapped symbol matter after a ticker change.
-    Every listing and ending is read as known at close(S-1).
+    Every listing and ending is read as known at close(S-1). A held
+    predecessor's chain successor (#3031) is no later issuer of the successor
+    symbol the map sends it under.
     """
-    symbols, _ambiguous = _current_symbols(conn, session, names, settings, window_id)
+    if not names:
+        return {}
+    mapped = order_symbols(conn, session, names, settings, window_id)
+    symbols = {sid: symbol for sid, symbol in mapped.symbols.items() if symbol is not None}
     if not symbols:
         return symbols
     cut = calendar.session_close(previous_session(session))
@@ -2477,10 +2482,12 @@ def _mark_symbols(
         if own_listing_symbol is not None:
             own_tickers.add(own_listing_symbol)
         own_start = own["valid_from"]
+        successor = mapped.chained.get(sid)
         if any(
             other_sid != sid
             and (other_symbol := broker_symbol(row, settings.alpaca.class_symbols)) is not None
             and other_symbol in own_tickers
+            and not (other_sid == successor and other_symbol == symbols[sid])
             and row["valid_from"] is not None
             and (own_start is None or row["valid_from"] > own_start)
             for other_sid, row in listings.items()

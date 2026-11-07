@@ -243,6 +243,7 @@ def test_edgar_filing_source_defaults() -> None:
     s = _settings()
     assert s.edgar.index_first_year == 1993
     assert s.edgar.index_settle_days == 3
+    assert s.edgar.unstampable_retry_days == 30
     assert s.edgar.reconcile_recent_quarters == 8
     assert s.edgar.bulk_stamp_threshold_ciks == 500
     assert s.edgar.bulk_stamps_enabled is False
@@ -675,6 +676,7 @@ def test_edgar_failure_policy_defaults() -> None:
     [
         ("index_first_year", 1992),
         ("index_settle_days", -1),
+        ("unstampable_retry_days", -1),
         ("reconcile_recent_quarters", 0),
         ("bulk_stamp_threshold_ciks", 0),
         ("fsn_first_year", 2008),
@@ -3735,6 +3737,18 @@ def test_events_form4_compare_keys_refuse_nonsense() -> None:
     ):
         with pytest.raises(ValueError):
             Settings(_env_file=None, events=bad)
+
+
+def test_events_form4_compare_threshold_refuses_a_field_trusted_to_bulk() -> None:
+    """#2994: under the threshold a bulk-trusted field would be stored under the XML's
+    provenance, so the pair is refused at load; either key alone still loads."""
+    with pytest.raises(ValueError, match="trusted to the bulk set"):
+        Settings(
+            _env_file=None,
+            events={"form4_compare_threshold": 0.5, "form4_compare_trusted": {"shares": "bulk"}},
+        )
+    Settings(_env_file=None, events={"form4_compare_trusted": {"shares": "bulk"}})
+    Settings(_env_file=None, events={"form4_compare_threshold": 0.5})
 
 
 def test_paper_execution_defaults_and_opg_cutoff() -> None:

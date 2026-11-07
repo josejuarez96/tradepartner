@@ -8,7 +8,12 @@ import polars as pl
 
 from tradepartner.calendar import is_session, previous_session, session_close
 from tradepartner.config import Settings
-from tradepartner.store.asof import adjusted_prices_as_of, facts_as_of, prices_as_of
+from tradepartner.store.asof import (
+    adjusted_prices_as_of,
+    facts_as_of,
+    packaged_dividend_reviews,
+    prices_as_of,
+)
 from tradepartner.store.benchmarks import (
     BenchmarkIdentityError,
     research_benchmark_security_ids,
@@ -57,7 +62,11 @@ class EventStudyReader:
     def bars(
         self, security_ids: list[str], *, sessions_from: date
     ) -> tuple[pl.DataFrame, pl.DataFrame]:
-        """Return dividend-adjusted and raw traded bars at the window-end cut."""
+        """Return dividend-adjusted and raw traded bars at the window-end cut.
+
+        The dividends are gated on the packaged reviewed list (#3015): a duplicate
+        not yet repaired applies once, and an unexplained equal-amount group is left
+        unapplied, never summed twice."""
         t = self._record(self.cutoff)
         with open_read_only(self.settings) as conn:
             adjusted = adjusted_prices_as_of(
@@ -68,6 +77,7 @@ class EventStudyReader:
                 settings=self.settings,
                 traded_only=True,
                 sessions_from=sessions_from,
+                dividend_reviews=packaged_dividend_reviews(),
             )
             raw = prices_as_of(
                 conn,

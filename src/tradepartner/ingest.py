@@ -1880,27 +1880,15 @@ def _index_state(
         ).fetchall()
     else:
         # The adapter needs the history of listed accessions and the rows of a
-        # new issuer's walk, not the store's entire 15M-row index.
-        raw_rows = []
-        accessions = sorted(candidate_accessions)
-        for start in range(0, len(accessions), 500):
-            chunk = accessions[start : start + 500]
-            marks = ", ".join("?" for _ in chunk)
-            raw_rows.extend(
-                conn.execute(
-                    f"SELECT {columns} FROM filing_index WHERE accession IN ({marks}) "
-                    "AND known_at <= ?",
-                    [*chunk, now],
-                ).fetchall()
-            )
-        for cik in sorted(candidate_ciks):
-            raw_rows.extend(
-                conn.execute(
-                    f"SELECT {columns} FROM filing_index WHERE cik = ? AND known_at <= ?",
-                    [cik, now],
-                ).fetchall()
-            )
-        raw_rows = list({(row[0], row[1], row[7]): row for row in raw_rows}.values())
+        # new issuer's walk, not the store's entire 15M-row index. #2921: one
+        # scan for both sets, not one per 500-accession chunk and per CIK.
+        # The table is unique on (cik, accession, known_at), so no row repeats.
+        raw_rows = conn.execute(
+            f"SELECT {columns} FROM filing_index WHERE known_at <= ? AND ("
+            "accession IN (SELECT unnest(?::VARCHAR[])) "
+            "OR cik IN (SELECT unnest(?::VARCHAR[])))",
+            [now, sorted(candidate_accessions), sorted(candidate_ciks)],
+        ).fetchall()
     rows = tuple(stored_index.FilingRow(*row) for row in raw_rows)
     pending = tuple(
         PendingIndexRow(*row)
@@ -2192,13 +2180,19 @@ def _propose_index(
             for row in proposal.rows
             if row.cik not in state.issuer_ciks and row.form in issuer_forms
         }
+        # #2921: each file's quarter parsed once and membership a set lookup,
+        # not a list scan per new issuer and file.
+        file_quarters = []
+        for file in state.daily_files:
+            day = date.fromisoformat(file.name.split(".")[1])
+            file_quarters.append((file, (day.year, (day.month - 1) // 3 + 1)))
+        already_read = set(daily_read)
         for cik in new_issuers:
             first, last = proposal.filers[cik]
-            for file in state.daily_files:
-                day = date.fromisoformat(file.name.split(".")[1])
-                quarter = (day.year, (day.month - 1) // 3 + 1)
-                if first <= quarter <= last and file not in daily_read:
+            for file, quarter in file_quarters:
+                if first <= quarter <= last and file not in already_read:
                     daily_read.append(file)
+                    already_read.add(file)
             for year, number in _index_quarters(settings.edgar.index_first_year, now):
                 quarter = (year, number)
                 if not first <= quarter <= last or quarter not in settled_days:
@@ -2445,6 +2439,23 @@ def _cache_completeness(
     return facts, statements
 
 
+def _stored_ciks_of(
+    conn: duckdb.DuckDBPyConnection, accessions: Collection[str]
+) -> dict[str, set[str]]:
+    """Every CIK any stored revision lists under each of ``accessions``, read in
+    one scan (#2921), not one per accession. Each accession is a key, with an
+    empty set when no row has it."""
+    found: dict[str, set[str]] = {accession: set() for accession in accessions}
+    if found:
+        for accession, cik in conn.execute(
+            "SELECT DISTINCT accession, cik FROM filing_index "
+            "WHERE accession IN (SELECT unnest(?::VARCHAR[]))",
+            [sorted(found)],
+        ).fetchall():
+            found[accession].add(cik)
+    return found
+
+
 def _index_touch_state(
     settings: Settings,
     source: FilingSource,
@@ -2485,13 +2496,8 @@ def _index_touch_state(
         accession_ciks[row.accession].add(row.cik)
     relevant = set(failures) | set(previous.get("failures", {})) | new_accessions
     with open_read_only(settings, retry=True) as conn:
-        for accession in sorted(relevant):
-            accession_ciks[accession].update(
-                cik
-                for (cik,) in conn.execute(
-                    "SELECT DISTINCT cik FROM filing_index WHERE accession = ?", [accession]
-                ).fetchall()
-            )
+        for accession, ciks in _stored_ciks_of(conn, relevant).items():
+            accession_ciks[accession].update(ciks)
         settled: set[str] = set()
         if previous_at is not None:
             for year, number in _index_quarters(settings.edgar.index_first_year, now):
@@ -3832,6 +3838,18 @@ def _write_form4_bulk(
             "events.form4_compare_threshold needs the raw archive: its review markers "
             "live in the writer's provenance manifest"
         )
+    bulk_trusted = sorted(
+        name for name, src in settings.events.form4_compare_trusted.items() if src == "bulk"
+    )
+    if settings.events.form4_compare_threshold is not None and bulk_trusted:
+        # #2994: such a row would be stored as `sec_form4_xml` under the XML body's hash,
+        # which no re-derive from the kept XML reproduces. `EventsConfig` refuses the pair
+        # at load; this backstops settings built without validation (`model_copy`).
+        raise ValueError(
+            f"events.form4_compare_trusted has fields trusted to the bulk set {bulk_trusted}; "
+            "with events.form4_compare_threshold set their rows would be stored under the "
+            "XML's provenance (#2994), so the Form 4 step refuses them"
+        )
     previous = getattr(source, "form4_xml_keeper", None)
     source.form4_xml_keeper = None if provenance is None else provenance.keep_xml
     try:
@@ -4327,6 +4345,17 @@ def _form4_bulk(
             provenance.set_markers(
                 {accession}, marker_entries(accession, label, digests.get(quarter), found)
             )
+        # A marked accession compared again this run that now agrees is resolved
+        # (#2994); one never compared again keeps its carried marker.
+        resolved = sorted((marked & rule5.compared) - rule5.found.keys())
+        for accession in resolved:
+            quarter = accession_quarters[accession]
+            label = f"{quarter.year}q{quarter.number}"
+            provenance.set_markers(
+                {accession}, marker_entries(accession, label, digests.get(quarter), ())
+            )
+        if resolved:
+            counts["sec_forms_compare_marker_resolved"] = len(resolved)
     if rule5.tally.outcome(rule5.declaration.threshold) is Outcome.AT_OR_ABOVE and rule5.enforcing:
         link = ""
         unresolved = 0

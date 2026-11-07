@@ -11784,3 +11784,112 @@ def test_form4_rule5_marker_count_rides_with_the_digest_on_every_writer_message(
         path.unlink()
     with pytest.raises(RuntimeError, match="unreadable"):
         case.run(fixture_store, case.now + timedelta(days=2), "writer-3")
+
+
+# --- #2994: a marked accession re-fetched as XML ------------------------------------
+
+
+def _marked_unstored(
+    case: _Form4Xml, conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 1: the disagreeing accession is in the order sample (two bulk rows), so its
+    XML is fetched, compared and marked, but the route's stamp has no submissions
+    filing date, so it is never stored."""
+    record = _disagreeing(case, case.accession)
+    sampled = replace(record, rows=(object(), object()))  # type: ignore[arg-type]
+    case.bulk = InsiderBulk(
+        {case.accession: sampled, _RULE5_OTHER: _disagreeing(case, _RULE5_OTHER, agree=True)}
+    )
+    fetch = case.source._fetch_submissions
+
+    def undated(*args: Any) -> Any:
+        records = dict(fetch(*args).records)
+        if case.accession in records:
+            records[case.accession] = replace(records[case.accession], filing_date=None)
+        return SimpleNamespace(records=records)
+
+    monkeypatch.setattr(case.source, "_fetch_submissions", undated)
+    _added, message, _p = case.run(conn, case.now)
+    monkeypatch.setattr(case.source, "_fetch_submissions", fetch)
+    assert "form4_compare_markers=1" in message
+    held = conn.execute(
+        "SELECT count(*) FROM sec_form4_transactions WHERE accession = ?", [case.accession]
+    ).fetchone()
+    assert held is not None and held[0] == 0  # marked, never stored
+
+
+@pytest.mark.parametrize("still_disagrees", [True, False])
+def test_form4_rule5_marked_accession_refetched_as_xml_updates_its_marker(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    still_disagrees: bool,
+) -> None:
+    """Run 1 marks a sampled accession it cannot store (no stamp). Run 2 routes it to XML
+    as a marked accession and compares it again: agreeing sources leave a resolved
+    marker and no unresolved count; a disagreement stays unresolved."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    _marked_unstored(case, fixture_store, monkeypatch)
+    case.bulk = InsiderBulk(
+        {
+            case.accession: _disagreeing(case, case.accession, agree=not still_disagrees),
+            _RULE5_OTHER: _disagreeing(case, _RULE5_OTHER, agree=True),
+        }
+    )
+    from tradepartner.adapters.form4_bulk_route import Form4CompareThresholdError
+
+    later = case.now + timedelta(days=1)
+    if still_disagrees:  # the run's only comparison disagrees: 1 of 1 fails the run
+        with pytest.raises(Form4CompareThresholdError, match="form4_compare_markers=1"):
+            case.run(fixture_store, later, "writer-2")
+    else:
+        _added, message, _p = case.run(fixture_store, later, "writer-2")
+        assert "form4_compare_markers=0" in message
+        assert "sec_forms_compare_marker_resolved: 1" in message
+    latest = next(
+        m for m in _manifests(tmp_path / "archive") if m["writer"]["run_id"] == "writer-2"
+    )
+    statuses = {m["status"] for m in _markers(latest) if m["accession"] == case.accession}
+    assert statuses == ({"unresolved"} if still_disagrees else {"resolved"})
+
+
+def test_form4_rule5_marked_accession_refetched_uncompared_stays_marked_and_counts(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A marked accession whose bulk record is no longer a fair comparison side (here
+    its identity check now fails) is stored from XML but not compared: the marker stays
+    unresolved and the run counts it."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    _marked_unstored(case, fixture_store, monkeypatch)
+    case.bulk = InsiderBulk(
+        {
+            case.accession: replace(_disagreeing(case, case.accession), identity_bad=True),
+            _RULE5_OTHER: _disagreeing(case, _RULE5_OTHER, agree=True),
+        }
+    )
+    _added, message, _p = case.run(fixture_store, case.now + timedelta(days=1), "writer-2")
+    assert "form4_compare_markers=1" in message
+    assert "sec_forms_compare_marker_uncompared: 1" in message
+
+
+def test_form4_rule5_threshold_refuses_a_field_trusted_to_bulk(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A field trusted to the bulk set would be stored as `sec_form4_xml` under the XML
+    body's hash, a row no re-derive from the kept XML reproduces: with the threshold
+    set (the only case the declaration changes a stored row) the writer refuses it."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    events = case.settings.events.model_copy(update={"form4_compare_trusted": {"shares": "bulk"}})
+    case.settings = case.settings.model_copy(update={"events": events})
+    with pytest.raises(ValueError, match="trusted to the bulk set"):
+        case.run(fixture_store, case.now)
+    assert not (tmp_path / "archive" / "manifests").exists() or not any(
+        (tmp_path / "archive" / "manifests").iterdir()
+    )

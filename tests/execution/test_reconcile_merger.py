@@ -34,8 +34,10 @@ from tradepartner.execution.reconcile import (
     Explanations,
     JournalOpenOrder,
     OpenMerger,
+    ProposedAdjustment,
     Reconciliation,
     compare,
+    removal_paid_on,
 )
 from tradepartner.execution.reconcile_run import explanations_as_of, reconcile_now
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
@@ -1497,3 +1499,98 @@ def test_all_cil_stock_merger_rebuilds_due_for_later_payment(
         (-10.0, 0.0),
         (None, 125.19),
     ]
+
+
+def test_a_merger_paid_on_its_effective_session_is_stated_there_when_reconciled_later(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2722: the broker paid the due on S (its `MA` activity's date); the
+    reconcile that first sees it runs on S2. The removal is stated on S."""
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings)
+    _removed(fake, DUE)
+    fake.activities.append(
+        CashActivity(
+            activity_id="MA-MTUM-S",
+            activity_type="MA",
+            date=S,
+            status="executed",
+            net_amount=DUE,
+            symbol="MTUM",
+        )
+    )
+
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S2).status == OK
+
+    (row,) = _adjustments(journal_settings, open_window)
+    assert _merger_id(row) == M1 and row.cash == pytest.approx(DUE)
+    assert row.session == S
+
+
+def test_a_merger_payment_dated_before_the_session_before_its_effective_date_is_floored(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2722: the removal is never stated before `previous_session(effective_date)`,
+    the earliest removal the merger reads as its own. Effective S3, a credit
+    dated S, reconciled on S4: stated on S2."""
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings, effective=S3, payable=S3)
+    _removed(fake, DUE)
+    fake.activities.append(
+        CashActivity(
+            activity_id="MA-MTUM-early",
+            activity_type="MA",
+            date=S,
+            status="executed",
+            net_amount=DUE,
+            symbol="MTUM",
+        )
+    )
+
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S4).status == OK
+
+    (row,) = _adjustments(journal_settings, open_window)
+    assert _merger_id(row) == M1
+    assert row.session == S2
+
+
+@pytest.mark.parametrize("kind", ["stock", "stock_and_cash"])
+def test_a_stock_merger_removal_is_never_restated_to_the_paid_session(kind: str) -> None:
+    """#2722, fail closed: a stock or stock-and-cash merger's `merger_receipt` stays
+    on the reconcile's session, so its removal is not moved alone (a session
+    would hold neither name)."""
+    credit = CashActivity(
+        activity_id="MA-MTUM-S",
+        activity_type="MA",
+        date=S,
+        status="executed",
+        net_amount=DUE,
+        symbol="MTUM",
+    )
+    explanations = Explanations(
+        symbols={MTUM: "MTUM", SPY: "SPY"},
+        activities=(credit,),
+        mergers={MTUM: _merger_open(kind=kind, acquirer=SPY, share_ratio=0.5)},
+    )
+    removal = ProposedAdjustment(
+        "corporate_action_cash",
+        MTUM,
+        -HELD,
+        DUE,
+        "merger",
+        merger_id=M1,
+        merger_terms={"merger_kind": kind},
+    )
+    assert removal_paid_on(removal, explanations, 0.01) is None
+    # The same row as a cash merger's is restated: only the kind stops it.
+    cash = Explanations(
+        symbols={MTUM: "MTUM"}, activities=(credit,), mergers={MTUM: _merger_open()}
+    )
+    plain = replace(removal, merger_terms={"merger_kind": "cash"})
+    assert removal_paid_on(plain, cash, 0.01) == S

@@ -25,8 +25,11 @@ it decides and raises on a mismatch. A run's steps 4 and 8, `paper reconcile`,
     writes the closing events of breaks that closed. Each row is stamped with
     the same clock reading, so every adjustment is inside the reconciliation
     that re-bases the ledger's cash (`execution.ledger`: a row whose `known_at`
-    equals the base's is counted in it, never twice). Only an `ok` or `breaks`
-    result books `adjustments` rows. **Auto-acceptance (T283a, item 6):** a name's
+    equals the base's is counted in it, never twice). A row keyed by a broker
+    activity is stated on the activity's date, and a cash removal (an ended
+    listing's or a cash merger's) on the session the broker paid it, never
+    before the cash base (`_removal_session`, #2722); otherwise on S. Only an
+    `ok` or `breaks` result books `adjustments` rows. **Auto-acceptance (T283a, item 6):** a name's
     immaterial break (`_auto_accepts`: at or below both materiality bounds, the
     sizes already auto-accepted on the name included, and never a finding, a
     short, an `unknown_security` or a break once material or reopened) is written
@@ -81,13 +84,20 @@ as_of`:
   only the one not delisted keeps it; when that does not settle it, neither
   does, and a held one becomes compare's `unknown_security`. A held name whose
   ticker changed in the store at close(S-1) maps to the broker's one new
-  symbol (#1761), recorded on the row's `symbol_changes`.
+  symbol (#1761), recorded on the row's `symbol_changes`. A held chained
+  predecessor (#821) in a chain known at close(S-1) maps to its successor's
+  broker symbol when the broker holds that and not its own, and the successor
+  is no journal name (#3024); a chain known only later maps nothing, and so
+  does a predecessor with two live successors. The mapping is recorded on the
+  row's `symbol_changes`, and the order path follows it only then (#3031).
 - `ended`: journal names whose current listing is `delisted` at close(S-1)
   (`store.delistings.listing_ends_as_of`; a transfer is not an end).
 - `dividends`: per held name, the cash due from `dividend` actions with an
   ex-date in the frozen `risk.reconcile_dividend_credit_sessions` window ending
-  at S. Journaled dividend cash nets oldest ex-date first, reading one further
-  window back so a just-expired due cannot consume a newer credit. An
+  at S (a held predecessor `symbols` maps through its chain owes its
+  successor's dividends, #3031). Journaled dividend cash nets oldest ex-date
+  first, reading one further window back so a just-expired due cannot
+  consume a newer credit. An
   equal-amount group (one security, ex-date and amount under several live
   ids, #1613) is read through the reviewed list
   (`store.dividend_reviews`): a listed `duplicate` not yet repaired counts
@@ -195,6 +205,7 @@ from tradepartner.errors import ClockError, LimitBreachError, ReconciliationErro
 from tradepartner.execution import breaks as break_rules
 from tradepartner.execution import switch
 from tradepartner.execution.ledger import (
+    TRUE_UP_KINDS,
     Ledger,
     from_journal,
     reversed_adjustment_id,
@@ -214,10 +225,12 @@ from tradepartner.execution.reconcile import (
     JournalOpenOrder,
     Mismatch,
     OpenMerger,
+    ProposedAdjustment,
     Reconciliation,
     _cash_bound,
     compare,
     merger_due_detail,
+    removal_paid_on,
 )
 from tradepartner.execution.risk import order_shape_violation
 from tradepartner.execution.symbols import broker_symbol
@@ -511,10 +524,12 @@ def _symbols(
     changes: Mapping[str, Sequence[tuple[str, str]]],
     *,
     when_issued: Collection[str] = frozenset(),
-) -> tuple[dict[str, str], dict[str, tuple[str, str]], dict[str, str]]:
+    chains: Mapping[str, str] | None = None,
+) -> tuple[dict[str, str], dict[str, tuple[str, str]], dict[str, str], dict[str, str]]:
     """`security_id` to broker symbol, one name per symbol, the ticker changes
-    applied to it (module docstring), and the names a ticker change leaves
-    ambiguous: the one symbol map reconcile and the order path share (#2185).
+    applied to it (module docstring), the names a ticker change leaves
+    ambiguous, and each held predecessor the map read through its chain, with
+    its successor: the one symbol map reconcile and the order path share (#2185).
     A listing's ticker is read in its broker form (`broker_symbol`, #1729), so a
     `GEF.B` position matches the `GEF-B` listing. A held name whose stored
     change (at close(S-1)) puts it under a new symbol the broker holds maps to
@@ -532,11 +547,24 @@ def _symbols(
     the broker does not hold, while it holds `X.WI`, maps to `X.WI`: the broker
     can book a new child under its when-issued symbol before it trades
     regular-way. Any other `.WI` symbol stays unmapped. Only reconcile passes
-    `when_issued`; the order path never maps a name to a `.WI` symbol."""
+    `when_issued`; the order path never maps a name to a `.WI` symbol.
+
+    `chains` maps a chained predecessor to its successor (#821), only the chains
+    known at close(S-1) (#3024). A held predecessor with no ticker change in
+    force maps to its successor's broker symbol when the successor's current
+    listing is not delisted, the broker holds that symbol and not the
+    predecessor's own, and the successor is not itself among `names` (two ids
+    cannot share one position, so neither is guessed). Otherwise it keeps its
+    own symbol and a difference stays a break. A chain it follows is an applied
+    change `(own symbol, successor's symbol)` like a ticker change, so reconcile
+    records it on the row and the order path (`order_symbols`, #3031) follows it
+    only when the reconciliation on S recorded that same change."""
+    wanted = set(names)
     claims: dict[str, list[str]] = defaultdict(list)
     applied: dict[str, tuple[str, str]] = {}
     ambiguous: dict[str, str] = {}
-    for name in sorted(set(names)):
+    chained: dict[str, str] = {}
+    for name in sorted(wanted):
         listing = current.get(name)
         symbol = (
             broker_symbol(listing, class_symbols)
@@ -555,6 +583,14 @@ def _symbols(
                 f"{name}: ticker change {symbol} -> {'/'.join(candidates)} known at "
                 "close(S-1) is not on the broker's positions"
             )
+        else:
+            followed = _chained_symbol(
+                name, symbol, wanted, current, broker_symbols, class_symbols, chains
+            )
+            if followed != symbol:
+                applied[name] = (symbol, followed)
+                chained[name] = (chains or {})[name]
+                symbol = followed
         if (
             name in when_issued
             and symbol not in broker_symbols
@@ -594,7 +630,61 @@ def _symbols(
             ambiguous.setdefault(
                 name, f"{name}: ticker change {old} -> {new} known at close(S-1) was not kept"
             )
-    return symbols, kept, ambiguous
+    return symbols, kept, ambiguous, {n: s for n, s in chained.items() if n in kept}
+
+
+def _chained_dividends(actions: pl.DataFrame, chained: Mapping[str, str]) -> pl.DataFrame:
+    """`actions` with each `dividend` row of a chained successor keyed to the
+    held predecessor `_symbols` mapped to it (#3031): the store's chained read
+    (#821) keys both histories' dividends to the successor, while the ledger
+    holds the predecessor and the broker credits them under the successor's
+    symbol, now the predecessor's. Only a mapped chain re-keys (the successor is
+    then no journal name), and no other action type moves. Unchanged when
+    `chained` is empty."""
+    if not chained:
+        return actions
+    back = {successor: predecessor for predecessor, successor in chained.items()}
+    return actions.with_columns(
+        pl.when(pl.col("action_type") == _DIVIDEND)
+        .then(pl.col("security_id").replace(back))
+        .otherwise(pl.col("security_id"))
+        .alias("security_id")
+    )
+
+
+def _one_successor_chains(
+    conn: duckdb.DuckDBPyConnection, cut: datetime
+) -> tuple[dict[str, str], frozenset[str]]:
+    """The live chains known at `cut` (#821, `live_chains`) as predecessor to
+    successor, keeping only a predecessor with one live successor, and the
+    predecessors with more than one (#3031): which successor holds the position
+    is never guessed, so those map nothing."""
+    successors: dict[str, set[str]] = defaultdict(set)
+    for predecessor, successor in live_chains(conn, cut):
+        successors[predecessor].add(successor)
+    single = {p: next(iter(s)) for p, s in successors.items() if len(s) == 1}
+    return single, frozenset(p for p, s in successors.items() if len(s) > 1)
+
+
+def _chained_symbol(
+    name: str,
+    symbol: str,
+    names: Collection[str],
+    current: Mapping[str, Mapping[str, Any]],
+    broker_symbols: Collection[str],
+    class_symbols: Mapping[str, str] | None,
+    chains: Mapping[str, str] | None,
+) -> str:
+    """`name`'s symbol read through its chain (#3024, `_symbols`' docstring):
+    the successor's broker symbol when every condition holds, else `symbol`."""
+    successor = (chains or {}).get(name)
+    if successor is None or successor in names or symbol in broker_symbols:
+        return symbol
+    listing = current.get(successor)
+    if listing is None or listing["status"] == DELISTED:
+        return symbol
+    chained = broker_symbol(listing, class_symbols)
+    return chained if chained is not None and chained in broker_symbols else symbol
 
 
 @dataclass(frozen=True)
@@ -604,10 +694,14 @@ class OrderSymbols:
     a ticker change applied as reconcile applied it; `ambiguous` holds each
     name the map dropped, with a note naming the ticker change, which the
     order path handles per name and never sends under the old symbol. A name
-    with no listing known at close(S-1) is in neither."""
+    with no listing known at close(S-1) is in neither. `chained` holds each
+    held predecessor sent under its chain successor's symbol (#3031), with the
+    successor, so a delisted predecessor's reused-ticker guard does not read
+    its own successor as a later issuer."""
 
     symbols: dict[str, str | None]
     ambiguous: dict[str, str]
+    chained: dict[str, str] = field(default_factory=dict)
 
 
 def _recorded_changes(
@@ -648,21 +742,34 @@ def order_symbols(
     (#2185): `_symbols` over each name's listing current at S and the stored
     `symbol_changes`, both known at close(S-1), with a change applied to a name
     only when the window's reconciliation on S applied that same change, so
-    reconcile and the order path agree on one map. Read-only."""
+    reconcile and the order path agree on one map. Read-only.
+
+    A held chained predecessor (#3031) follows its chain known at close(S-1)
+    the same way: under its successor's symbol only when the reconciliation on
+    S recorded that change (it did so only when the broker held that symbol and
+    not the predecessor's own, and the successor was no journal name). It is
+    ambiguous, never sent, when that reconciliation recorded a change for it
+    this map does not apply (the successor is itself among `names`, say), or
+    when its predecessor has more than one live successor."""
     wanted = sorted(set(names))
     if not wanted:
         return OrderSymbols({}, {})
     cut = _cut(session)
-    current = current_listings(listing_ends_as_of(conn, cut, settings, wanted), session)
+    successors = [s for _, s in live_chains(conn, cut)]
+    current = current_listings(
+        listing_ends_as_of(conn, cut, settings, sorted(set(wanted) | set(successors))), session
+    )
     class_symbols = settings.alpaca.class_symbols
     recorded = _recorded_changes(conn, window_id, session)
-    mapped, applied, ambiguous = _symbols(
+    chains, forked = _one_successor_chains(conn, cut)
+    mapped, applied, ambiguous, chained = _symbols(
         wanted,
         {},
         current,
         {new for _, new in recorded.values()},
         class_symbols,
         _symbol_change_candidates(conn, cut, wanted),
+        chains=chains,
     )
     for name, change in applied.items():
         if recorded.get(name) != change:
@@ -671,12 +778,28 @@ def order_symbols(
                 f"{name}: ticker change {change[0]} -> {change[1]} was not applied by "
                 "the reconciliation on this session",
             )
+    for name in wanted:
+        if name in recorded and applied.get(name) != recorded[name]:
+            old, new = recorded[name]
+            ambiguous.setdefault(
+                name,
+                f"{name}: the reconciliation on this session mapped {old} -> {new}, "
+                "which the order map cannot apply",
+            )
+        if name in forked:
+            ambiguous.setdefault(
+                name, f"{name}: more than one live successor chain known at close(S-1)"
+            )
     symbols: dict[str, str | None] = {}
     for name in wanted:
         if name in ambiguous or name not in current:
             continue
         symbols[name] = mapped.get(name, broker_symbol(current[name], class_symbols))
-    return OrderSymbols(symbols, {n: ambiguous[n] for n in wanted if n in ambiguous})
+    return OrderSymbols(
+        symbols,
+        {n: ambiguous[n] for n in wanted if n in ambiguous},
+        {n: s for n, s in chained.items() if n in symbols},
+    )
 
 
 def _reference_prices(
@@ -998,7 +1121,7 @@ def _explanations(
     # spin-off children (#2112), each of which may map to its when-issued
     # broker symbol.
     mapped = names | acquirers | set(spinoffs)
-    symbols, symbol_changes, _ambiguous = _symbols(
+    symbols, symbol_changes, _ambiguous, chained = _symbols(
         mapped,
         order_symbols,
         current,
@@ -1006,6 +1129,10 @@ def _explanations(
         settings.alpaca.class_symbols,
         _symbol_change_candidates(conn, cut, mapped),
         when_issued=frozenset(spinoffs),
+        # A held chained predecessor reads its successor's symbol (#3024): only
+        # the chains known at the cut, so a later chain maps nothing at S, and
+        # only a predecessor with one live successor (#3031).
+        chains=_one_successor_chains(conn, cut)[0],
     )
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))
@@ -1026,7 +1153,7 @@ def _explanations(
     }
     dividends, dividend_dues, findings = _dividends(
         state,
-        actions,
+        _chained_dividends(actions, chained),
         window,
         session,
         tolerance,
@@ -1197,6 +1324,36 @@ def _recorded_activity_ids(base: ReconciliationRow | None) -> set[str] | None:
     }
 
 
+def _removal_session(
+    adjustment: ProposedAdjustment,
+    explanations: Explanations,
+    *,
+    session: date,
+    base: ReconciliationRow | None,
+    window: PaperWindowRow,
+    tolerance: float,
+) -> date:
+    """The session a cash removal is stated on (#2722, owner decision 2026-10-31):
+    the session the broker paid it (`reconcile.removal_paid_on`), not the
+    reconciliation's, so the mark of that session holds the cash, not the shares.
+
+    Fail closed to `session` when the payment is not evidenced, is not a session,
+    or is not before `session`. The paid session is never before the cash base's
+    New York date (the window's start before any base): a base whose broker cash
+    held the payment would count it twice. A merger's row is never before the
+    session before its `effective_date`, the earliest removal the merger reads
+    as its own."""
+    paid = removal_paid_on(adjustment, explanations, tolerance)
+    if paid is None or not is_session(paid) or paid >= session:
+        return session
+    floor = (base.at if base is not None else window.started_at).astimezone(_NEW_YORK).date()
+    merger = explanations.mergers.get(adjustment.security_id or "")
+    if merger is not None:
+        floor = max(floor, previous_session(merger.effective_date))
+    stated = max(paid, floor)
+    return stated if is_session(stated) and stated < session else session
+
+
 def _seen_activities(
     adjustments: Sequence[AdjustmentRow],
     base: ReconciliationRow | None,
@@ -1212,7 +1369,11 @@ def _seen_activities(
     only from its own session on (`session <= through`), the same cut the ledger's
     `reversed_true_up_ids(adjustments, through)` applies, so a catch-up reconcile
     of a session before the reversal keeps both the true-up's cash and the seen
-    activity (#2961). The base's recorded set (the
+    activity (#2961). A booking (`broker_activity_id`) or rebook
+    (`rebooked_activity_id`) counts only from its own session on too, the
+    ledger's `adjustment.session > through` skip, so a reconcile stated before a
+    later true-up reads its activity as unseen, not as cash the ledger dropped
+    (#3014). The base's recorded set (the
     last `ok` or `breaks` reconciliation's `activities`) takes precedence; before the first
     `ok`, the window row's `activities_seen_json` (what `paper start` read); when
     both are null, the fallback cutoff is the window's New York start date, so a
@@ -1233,9 +1394,9 @@ def _seen_activities(
         ):
             latest[reversed_activity] = False
         rebooked = terms.get("rebooked_activity_id")
-        if isinstance(rebooked, str):
+        if isinstance(rebooked, str) and adjustment.session <= through:
             latest[rebooked] = True
-        if adjustment.broker_activity_id is not None:
+        if adjustment.broker_activity_id is not None and adjustment.session <= through:
             latest[adjustment.broker_activity_id] = True
     booked = frozenset(key for key, active in latest.items() if active)
     reversed_ids = frozenset(key for key, active in latest.items() if not active)
@@ -1251,27 +1412,38 @@ def _seen_activities(
     return booked, window.started_at.astimezone(_NEW_YORK).date()
 
 
-def _refuse_before_a_reversal(adjustments: Sequence[AdjustmentRow], through: date) -> None:
-    """Refuse a reconciliation stated through a session before a true-up
-    reversal's (#2961). The reversal takes effect from its own session, so the
-    ledger through `through` keeps the true-up; but break events are read in
-    write order, so this run's events would land after the `reopened` one and
-    close the owner's reopened break from a session that cannot see it, and its
-    `ok` row (stamped now) would become the cash base of the reversal's session.
-    Every caller states `command_session(now)` or the run's New York date, never
-    before a reversal stamped `command_session` earlier, so only a direct
-    earlier-session call reaches this."""
-    later = [
-        row.session
-        for row in adjustments
-        if reversed_adjustment_id(row) is not None and row.session > through
-    ]
-    if later:
-        day = max(later).isoformat()
-        raise ValueError(
-            f"a true-up reversal is stated for {day}, after {through.isoformat()}: "
-            f"reconcile {day} or later"
-        )
+class StatedBeforeTrueUp(ValueError):
+    """A reconciliation stated through a session before a true-up's (#2961,
+    #3018), refused before any broker read or journal write."""
+
+
+def _refuse_before_a_true_up(adjustments: Sequence[AdjustmentRow], through: date) -> None:
+    """Refuse a reconciliation stated through a session before any true-up's
+    (#2961 for a reversal, #3018 for a booking): an owner true-up, its
+    reversal, or an auto true-up. Each takes effect from its own session, so the
+    ledger through `through` leaves it out; but break events are read in write
+    order, so this run's events would land after the true-up's `trued_up` or
+    `reopened` one and reopen or close the owner's break from a session that
+    cannot see it, and its row (stamped now) would become the cash base of the
+    true-up's session, which then halts on cash. `paper reconcile` and `paper
+    resume` state `command_session(now)` and `paper run` its own session, never
+    before a true-up stamped `command_session` earlier, so only a direct
+    earlier-session call (a catch-up reconcile), a clock gone back, or a `paper
+    run` still running after a later session's true-up reaches this; the run
+    halts on it (fails closed)."""
+    later = [row for row in adjustments if row.kind in TRUE_UP_KINDS and row.session > through]
+    if not later:
+        return
+    day = max(row.session for row in later)
+    what = (
+        "a true-up reversal"
+        if any(reversed_adjustment_id(row) is not None for row in later if row.session == day)
+        else "a true-up"
+    )
+    raise StatedBeforeTrueUp(
+        f"{what} is stated for {day.isoformat()}, after {through.isoformat()}: "
+        f"reconcile {day.isoformat()} or later"
+    )
 
 
 def _rebooked_after(adjustments: Sequence[AdjustmentRow]) -> dict[str, int]:
@@ -2331,8 +2503,8 @@ def reconcile_now(
     commit, or on a failed break-event write after the chunk rolls back,
     `ClockError` for a bad clock reading or an `as_of` after it, `ValueError`
     for a non-session `session`, a window without an id, a naive `as_of`, or a
-    ledger stated before a true-up reversal's session (before any broker read
-    or write, #2961),
+    ledger stated before a true-up's or its reversal's session
+    (`StatedBeforeTrueUp`, before any broker read or write, #2961, #3018),
     and whatever the broker raises (every allowlist this reaches is empty,
     req 4)."""
     window_id = _window_id(window)
@@ -2347,7 +2519,7 @@ def reconcile_now(
     tolerance = frozen.reconcile_quantity_tolerance
 
     with connect() as conn:
-        _refuse_before_a_reversal(adjustments_for(conn, window_id), through)
+        _refuse_before_a_true_up(adjustments_for(conn, window_id), through)
         orders, pending, sums = _open_orders(conn, window_id)
 
     positions: dict[str, Position] = broker.positions()
@@ -2596,6 +2768,7 @@ def reconcile_now(
             if reconciliation_id is None:
                 raise RuntimeError("reconciliation append returned no id")
             activity_sessions = {a.activity_id: a.date for a in activities}
+            paid_base = state.base(through)
             adjustment_ids: list[int] = []
             rebooked_after = _rebooked_after(adjustments_for(conn, window_id))
             for adjustment in res.adjustments:
@@ -2603,10 +2776,18 @@ def reconcile_now(
                 # a delisting's late cash) is stated on the activity's own date, not the
                 # reconciliation session, so the ledger applies it from the session it
                 # belongs to (#1583, T183; #411).
+                # A cash removal is stated on the session the broker paid it (#2722).
                 fee_date = (
                     activity_sessions.get(adjustment.broker_activity_id)
                     if adjustment.broker_activity_id is not None
-                    else None
+                    else _removal_session(
+                        adjustment,
+                        explanations,
+                        session=session,
+                        base=paid_base,
+                        window=window,
+                        tolerance=frozen.reconcile_cash_tolerance,
+                    )
                 )
                 prior_reversal = rebooked_after.get(adjustment.broker_activity_id or "")
                 explanation = json.loads(
