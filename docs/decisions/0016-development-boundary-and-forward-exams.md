@@ -92,48 +92,54 @@ The [strategy-lab spec](../specs/strategy-lab.md)'s open question 4 keeps the 0.
 **Decision 1: the block.** From 2026-11-06, no hypothesis is named in the owner's live choice ([ADR 0023](0023-break-first-fast-books-paper-exam.md) D6, the Phase 6 live ADR T163, [ADR 0017](0017-fast-paper-and-machine-readiness-gate.md) part F) unless its family's exam of record has **passed a returns-judging exam**: the forward return exam of decision 2, or a historical exam that a later amendment qualifies under decision 3.
 - **What does not qualify**, alone or together: the in-sample screen, the kill ladder's rungs, promotion and ADR 0005's tracking check.
 - **What stays allowed:** `sweep promote` to a paper book (that is how the exam runs), paper books, tracking windows and the shakedown.
-- **Until T381 is merged, no exam can pass,** so no hypothesis can be chosen for live money.
+- **Until T381 and T381a are merged, no exam can pass,** so no hypothesis can be chosen for live money.
+- **Enforced in code, not only in text.** T163b's live switch refuses (`exam_not_passed`) to name a book whose hypothesis has no `passed` verdict from T381's exam (the paper-trading plan's T163b line, amended in this PR).
 - **H1 is covered too, and so is every `momentum` book.** Momentum's holdout is spent without a return rule, and a spent family has no forward exam of record (ADR 0023). H1 therefore cannot qualify under this record (open question 8).
-- **Labels.** Until a book's exam passes, every report of its tracking result says **"machine pass, edge unjudged"**, never "exam passed". This covers `paper status`, `lab status` (T381) and every `TP-` claim (checked at review). An exam's own verdict is reported as "forward return exam passed", "failed", "failed (futility)" or "failed (void)".
+- **Labels.** Until a book's exam passes, every report of its tracking result says **"machine pass, edge unjudged"**, never "exam passed". This covers `paper status`, `lab status` (T381a) and every `TP-` claim (checked at review). An exam's own verdict is reported as "forward return exam passed", "failed", "failed (futility)" or "failed (void)".
+- **What this changes in the roadmap and the charter, said plainly.** The [roadmap](../roadmap.md)'s Phase 6 entry gate reads "the machine, not a strategy's months of tracking, is what is gated". Decision 1 adds a strategy gate beside the machine gate. Since a live book needs a strategy, Phase 6's first live order now waits for a passed exam, and that is at least 12 months of paper. The roadmap row carries a dated note saying so (this PR). The [charter](../charter.md)'s line that beating a benchmark is "never a phase-exit criterion" is untouched: no phase's exit criteria change. What changes is which strategy may carry live money, which serves the charter's first objective, "disciplined, evidence-based decisions". Choosing a strategy on gates that pass noise more than half the time across a programme is not an evidence-based decision. The owner's word on this PR is his word on that roadmap change. The other route, a live machine test with an unjudged strategy, is open question 8.
 
 **Decision 2: the forward return exam.** It is pre-registered and runs over a fixed horizon of 12 months. It applies to a book that is an exam of record under ADR 0023: a forward, unspent holdout (point 4), frozen parameters, and at least `paper.min_rebalances` and `paper.min_exam_fills`.
-- **The kill line is frozen first.** Before the window's first session, the kill line below, with its four values and the benchmark, is posted on the finalist's issue. T381 then freezes the same values into the window at `paper start`. Nothing in the line is chosen after a return of the window is seen.
+- **The kill line is frozen first.** Before the window's first session, the kill line is posted on the finalist's issue. It carries the values below, the benchmark, and the finalist's in-sample monthly net excess skewness. T381a then freezes the same values into the window at `paper start`. Nothing in the line is chosen after a return of the window is seen.
 - **The series.** The exam reads H = 12 monthly net excess returns:
   - month m is the book's return from one month-end to the next, net of every fill, fee and dividend the journal books, minus the total return of the benchmark the finalist's file froze over the same dates (SPY under ADR 0005, unless the file names another);
   - the first month starts at the first month-end on or after the window's first rebalance session, and the stub before it is reported but not tested;
   - months with a missed rebalance or an override stay in the series.
-- **The pass rule.** Both legs must pass, each one-sided at α = 0.01:
-  - (i) the t-statistic of the 12 returns' mean (sample standard deviation, 11 degrees of freedom) is at least t₀.₉₉,₁₁ = **2.718**;
-  - (ii) the intercept of the OLS regression of the same 12 returns on the benchmark's monthly return over the T-bill rate ([ADR 0020](0020-fred-risk-free-rate.md)) has a t-statistic of at least t₀.₉₉,₁₀ = **2.764**. This leg stops a book whose only edge is more market beta than its benchmark in a rising year.
+- **The pass rule.** Both legs must pass, each one-sided at a nominal α = 0.0025:
+  - (i) the t-statistic of the 12 returns' mean (sample standard deviation, 11 degrees of freedom) is at least t₀.₉₉₇₅,₁₁ = **3.497**;
+  - (ii) the intercept of the OLS regression of the same 12 returns on the benchmark's monthly return over the T-bill rate ([ADR 0020](0020-fred-risk-free-rate.md)) has a t-statistic of at least t₀.₉₉₇₅,₁₀ = **3.581**. This leg stops a book whose only edge is more market beta than its benchmark in a rising year.
   - If both legs pass, the exam is passed. Otherwise it is failed.
-- **The futility kill.** At month 6, if the sum of the first six returns is below 0, the exam is failed (futility). The rule can only stop a pass, so it cannot raise the false-pass rate. It shortens the exam for losers: in the scratch run below it ended a noise exam at month 6 in 54.1% of runs at H1-like costs. Its cost to power is negligible (true IR 0.5: 2.20% with or without it).
+- **Why the nominal α is 0.25%, not 1%.** The t-test is anti-conservative when returns are negatively skewed. In the sizing run below, a nominal 1% test passed a zero-mean skew −0.85 null **2.68%** of the time at 12 months. At 0.25% the same null passes **1.10%**.
+- **The skew guard.** `paper start` refuses an exam window (`exam_skew_out_of_range`) when the finalist's in-sample monthly net excess skewness is below −0.85, the most negative skew at which the rate below is stated. Such a finalist cannot take this exam, so it cannot reach the live choice.
+- **The futility kill.** At month 6, if the sum of the first six returns is below 0, the exam is failed (futility). The rule can only stop a pass, so it cannot raise the false-pass rate. In the sizing run it ended a noise exam at month 6 in 54.20% of runs at a 1.1%/yr drag. It cost a true IR of 2 nothing (13.49% with or without it).
 - **A void exam is a failed exam.** A window that ends before month 12, or that has not met ADR 0023's minimums by month 12, is failed (void).
 - **One exam per family, no retry** (points 3 and 8 (b)). A changed strategy is a new hypothesis whose trials count (strategy-lab req 4), and its exam counts too.
-- **The programme budget (alpha-spending).** At α = 1% per exam, the family-wise false-pass rate stays under 5% for four exams (the arithmetic below). Every exam window started under this rule freezes its α. `paper start` refuses a new exam window when the sum of the α values already frozen, plus the new window's α, is at least `paper.exam_familywise_max` (0.05). Every started exam counts, whatever its outcome. So after four exams at 1% (4% spent), a fifth fits only at an α below 1%. The config validator refuses `paper.exam_alpha` above 0.01, so that smaller α is set by a new dated amendment of this record, never by a looser one.
+- **The programme budget: four exams.** `paper start` refuses a fifth exam window under this rule (`exam_budget_spent`, `paper.exam_max_count` = 4). Every started exam counts, whatever its outcome. A fifth exam needs a new dated amendment with a smaller per-exam rate.
+- **The values are pinned.** The config validator refuses an `exam_alpha` above 0.0025, a horizon other than 12, a futility month other than 6, a `paper.exam_max_count` above 4 and a skew guard below −0.85. So the exam can be made stricter in config, never looser.
 
-**Why α = 1%: the arithmetic for four ideas.**
-- **Fresh data breaks the selection link.** A noise finalist's 12 exam months come after its frozen kill line. They also come after every in-sample window (which ends 2023-12-29) and every rung-2 window (which ends 2025-12). So they are independent of every selection that brought the finalist to the exam, and P(pass | noise finalist) ≤ α, whatever the screen did. A cost drag makes a noise book's true mean negative, which only lowers the rate.
-- **The scratch check.** The run used seed 3125, 200,000 replicates and Audit B's noise model (Student-t df 5, 8%/yr tracking error). The script was not committed. Leg (i) alone passed noise 0.84% of the time at zero cost, 0.55% at 1.1%/yr and 0.38% at 2.2%/yr. The two legs together pass no more often than either leg alone.
-- **Worst case for four ideas.** If all four finalists are noise and each takes the exam, the rate is 1 − (1 − 0.01)⁴ = **3.94%**. The union bound gives at most 4 × 0.01 = 4%, whatever the dependence between the exams. Both are under 5%.
-- **Counted from the start of four ideas, as Audit B counts its 57%.** At H1-like costs the rate is 1 − (1 − 0.190 × 0.01)⁴ = **0.76%** (against about 57% today). At zero cost it is 1 − (1 − 0.327 × 0.01)⁴ = **1.30%**.
-- **Why not α = 5%.** It fails the worst case, 1 − 0.95⁴ = 18.5%. The largest α that keeps four worst-case exams under 5% is 1 − 0.95^¼ = 1.27%, so 1% is the round value below it.
+**The arithmetic: why the rate is under 5% for four ideas.**
+- **Fresh data breaks the selection link.** A noise finalist's 12 exam months come after its frozen kill line. They also come after every in-sample window (which ends 2023-12-29) and every rung-2 window (which ends 2025-12). So they are independent of every selection that brought the finalist to the exam, and its pass rate is the test's rate under the null, whatever the screen did. A cost drag makes a noise book's true mean negative, which only lowers the rate.
+- **The sizing run.** The script is `exam_sizing.py` (sha256 `e202f68217a8e7c64c87951758094a17c22ef05494ea7d11c7a66e2b4cc4b7ef`). It used seed 3125, 300,000 replicates per cell, Audit B's noise model (Student-t df 5, 8%/yr tracking error) and skew-normal nulls. The script and its full output are posted on PR #3129. Leg (i) alone at H = 12 and 0.25% passed the nulls as follows: 0.17% at zero cost, 0.13% at 1.1%/yr, 0.07% at 2.2%/yr, **1.10%** at skew −0.85 and 1.25% at skew −0.96. The two legs together pass no more often than leg (i) alone.
+- **Worst case for four ideas, inside the skew guard.** If all four finalists are noise with skew −0.85 and each takes the exam, the rate is 1 − (1 − 0.0110)⁴ = **4.33%**. The union bound gives at most 4 × 1.10% = 4.40%, whatever the dependence between the exams. Both are under 5%. For symmetric noise, it is 1 − (1 − 0.0017)⁴ = 0.68%.
+- **Counted from the start of four ideas, as Audit B counts its 57%.** At H1-like costs, path A's 19.0% gives 1 − (1 − 0.190 × 0.0110)⁴ = **0.83%** (against about 57% today). At zero cost, 32.7% gives 1 − (1 − 0.327 × 0.0110)⁴ = **1.43%**.
+- **Why not a nominal 1%.** At skew −0.85 it gives 2.68% per exam, and 1 − (1 − 0.0268)⁴ = 10.3% for four.
 
-**Power, said plainly.** The same scratch run measured how often leg (i) passes a real edge:
+**Power, said plainly.** The same run measured how often leg (i) at 0.25% passes a real edge (cost 1.1%/yr):
 
-| True IR (cost 1.1%/yr) | 6 months | **12 months** | 24 months |
-|---|---|---|---|
-| 0.5 | 1.46% | **2.20%** | 3.35% |
-| 1.0 | 3.23% | **6.58%** | 13.37% |
-| 2.0 | 11.33% | **29.32%** | 59.56% |
+| True IR | 6 months | **12 months** | 18 months | 24 months |
+|---|---|---|---|---|
+| 0.5 | 0.36% | **0.55%** | 0.73% | 0.95% |
+| 1.0 | 0.86% | **1.98%** | 3.49% | 5.26% |
+| 2.0 | 3.49% | **13.41%** | 26.21% | 39.33% |
 
 - **What the exam is.** It bounds false passes. It is not a discovery tool: a real IR-0.5 edge almost always fails it, as H1's own file already says of every window this project can afford (a +1 pp/yr excess "would need about 280 years of data to reach t ≈ 2").
 - **Why accept that.** The live account is $100 and the objective is learning (ADR 0005). A gate that passes a noise idea more than half the time across a programme is worse than one that rarely passes a weak real one.
-- **Why 12 months.** It is the cheapest horizon at which a strong edge (IR 2) passes more often than about one time in ten. The futility kill ends about half of the noise exams at month 6. At 24 months, IR 0.5 still passes only 3.35% of the time, for a year more per finalist.
+- **Why 12 months.** It is the shortest horizon in the table at which a strong edge (IR 2) has a real chance to pass (13.41%). At 6 months it is 3.49%, which is close to the 1.10% at which a skewed null passes, so a pass at 6 months would say almost nothing. A longer horizon keeps the rate under 5% too and buys power: IR 2 passes 26.21% at 18 months and 39.33% at 24, for 6 or 12 more months per finalist. That choice is the owner's (open question 10). The futility kill ends about half of the noise exams at month 6 whatever the horizon.
+- **Assumptions behind the rate.** The returns are independent month to month. Their skew is no lower than −0.85, a bound the skew guard checks on the in-sample series, whose own sampling error is real. Paper fills cannot make a zero-gross book positive in expectation. A book that breaks one of these assumptions is outside the stated rate, and the sizing run states nothing about it.
 
 **Decision 3: point 8 is not this gate, and #3128's overlap is disclosed.** A point-8 historical exam, if built, is not a returns-judging exam under decision 1 until a new amendment gives it:
 - a pre-registered return rule;
 - a false-pass rate stated conditional on the overlap below;
-- a place in the same programme budget as the forward exams.
+- a place in the same four-exam programme budget as the forward exams.
 
 The rest of point 8 stands. The reasons:
 - **The window overlaps rung 2's (#3128, Audit B finding 4).** "The #3100 window (2009-01..2025-12) contains all 40 store in-sample months and 24 of the 33 historical-exam months." `scripts/b3_overlap.py` (400k null signals, seed 3092), given a null rung-2 pass:
@@ -144,30 +150,32 @@ The rest of point 8 stands. The reasons:
   | P(exam-window mean > 0) | 65% | 70% | 77% |
 
   "An independent check would give 50%." So for a rung-2-sourced idea, the rung-4 store run and a point-8 exam partly re-confirm rung-2 false positives: 65% to 89% instead of 50%. "The end-to-end effect is small today (≈ 5.8% per 20-read programme, because rung 2 is strict)."
-- **The overlap moves a nominal test's false-pass rate above 5% for four exams.** This approximation is ours, not the report's. If the null's median is shifted so that P(mean > 0) is 65%, 70% or 77%, a nominal one-sided 1% test passes noise about 2.6%, 3.6% or 5.6% of the time. Across four exams that is about 10.0%, 13.6% or 20.7%. No point-8 rate can therefore be stated under 5% from Audit B's numbers without a per-finalist conditional-null calibration (#3128's fix: exclude or down-weight the 24 overlapping months, or test against the conditional null). Excluding them would leave 9 months (2026-01 to 2026-09), and those are "not virgin" either (point 8, contamination), which cannot be sized at all.
+- **The overlap moves a nominal test's false-pass rate above 5% for four exams.** This approximation is ours, not the report's, and it assumes a normal null whose median is shifted. If the shift makes P(mean > 0) equal 65%, 70% or 77%, a nominal one-sided 1% test passes noise about 2.6%, 3.6% or 5.6% of the time. Across four exams that is about 10.0%, 13.6% or 20.7%. No point-8 rate can therefore be stated under 5% from Audit B's numbers without a per-finalist conditional-null calibration (#3128's fix: exclude or down-weight the 24 overlapping months, or test against the conditional null). Excluding them would leave 9 months (2026-01 to 2026-09), and those are "not virgin" either (point 8, contamination), which cannot be sized at all.
 - **It is not cheaper.** It needs point 8's seven code consequences (one of them on the order path), a return rule it does not have and that calibration. It also does not shorten the road to live money: point 8's finalist "still opens a paper book", and open question 4 recommends no shortening. Idea-pipeline candidates forgo it anyway (that spec's D10).
-- **The forward exam has none of this.** Its months start after `paper start` (2026-11 at the earliest), after every rung-2 and in-sample window. The only build it needs is T381, in the [paper-trading plan](../plans/paper-trading.md).
+- **The forward exam has none of this.** Its months start after `paper start` (2026-11 at the earliest), after every rung-2 and in-sample window. The only build it needs is T381 and T381a, in the [paper-trading plan](../plans/paper-trading.md).
 - **Rung 4's share of the overlap is unchanged here.** Its fix (a rung-4 report prints the conditional null pass rate) stays on #3128.
 
 **Open questions (the owner's; a recommendation beside each).**
 
-8. **H1 and a $100 machine test before any exam passes.** Decision 1 leaves H1, and every `momentum` book, with no route to the live choice. Recommend keeping the block. If the owner wants live fills on the machine before an exam passes, he amends this record in T163 and names the book "machine test, edge unjudged". It is not left implied.
-9. **Should fast books get a looser α, given their 1.6% screen rate?** Recommend no. Use one rule and one budget, so that no book type earns a cheaper exam by being labelled fast.
+8. **H1 and a $100 machine test before any exam passes.** Decision 1 leaves H1, and every `momentum` book, with no route to the live choice. It also delays Phase 6's first live order by at least 12 months. Recommend keeping the block. If the owner wants live fills on the machine before an exam passes, he amends this record in T163 and names the book "machine test, edge unjudged". It is not left implied.
+9. **Should fast books get a looser rate, given their 1.6% screen rate?** Recommend no. Use one rule and one budget, so that no book type earns a cheaper exam by being labelled fast.
+10. **A longer horizon for more power?** Recommend 12 months now, the cheapest horizon that is not near-useless. Move to 18 or 24 only by a new amendment before the first exam's kill line is posted, never during an exam.
 
 **Consequences of this amendment.**
 - **Good:**
   - the 0.5 floor's stated premise becomes true;
-  - a noise idea reaches the live choice at most about 4% of the time across four exams, against about 57% today;
+  - a noise idea reaches the live choice at most about 4.4% of the time across four exams (inside the skew guard), against about 57% today;
   - the exam reads only months that did not exist when its line was frozen;
-  - the build is one pure function, four frozen keys, a refusal and two labels.
+  - the build is one pure function, pinned keys, three refusals and two labels.
 - **Bad / accepted:**
-  - every live candidate now waits at least 12 months of paper (6 months for a futility kill);
-  - a real IR-0.5 edge passes about 2% of the time, so the likely outcome for a year or more is that nothing is chosen;
+  - every live candidate now waits at least 12 months of paper (6 months for a futility kill), and so does Phase 6's first live order;
+  - a real IR-0.5 edge passes about 0.55% of the time and an IR-2 edge 13.41%, so the likely outcome for a year or more is that nothing is chosen;
   - H1 cannot be chosen at all under this record (open question 8);
-  - after four exams the budget is spent until a smaller α is decided.
-- **Reversibility:** cheap before any exam starts. After one starts, its frozen line and its count in the budget stand.
+  - a strongly negatively skewed finalist cannot take the exam;
+  - after four exams the budget is spent until a new amendment.
+- **Reversibility:** cheap before any exam starts. After one starts, its frozen line and its place in the budget stand.
 - **Revisit if:**
   - a fifth exam is wanted;
-  - a sequential rule (SPRT or alpha-spending) is calibrated with Audit B's `paths.py` and shown to keep the same family-wise rate with more power;
+  - a sequential rule (SPRT or alpha-spending) is calibrated with Audit B's `paths.py` and the skewed nulls, and shown to keep the same family-wise rate with more power;
   - longer history (#1303 items 4 and 5) gives point 8 virgin months;
   - the live account's size grows past the charter's $100.
