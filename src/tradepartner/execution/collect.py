@@ -787,6 +787,13 @@ def _back_fill_write_offs(
     return tuple(written)
 
 
+def is_fill_band_fault(reason: str | None) -> bool:
+    """Whether a kill-switch `reason` names a `fill_price_outside_band` fault
+    anywhere in it: a collection's own message starts with the token, a run's
+    halt headline puts its fault type first (`SystemFaultError: ...`, #3028)."""
+    return reason is not None and f"{_FILL_BAND_FAULT}:" in reason
+
+
 def fill_band_violations(fills: Iterable[OrderedFill], band: PriceBand) -> tuple[str, ...]:
     """One message per fill whose price is outside `reference x (1 +- deviation)`
     (#1981).
