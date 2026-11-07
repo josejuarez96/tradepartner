@@ -904,6 +904,7 @@ class ListingResolver:
             )
             for change in symbol_changes
         ]
+        alias_changes = list(changes)
         options: dict[str, Any] = {
             "rename_lead_days": rename_lead_days,
             "accepted_relistings": accepted_relistings,
@@ -933,6 +934,18 @@ class ListingResolver:
             refused += len(late)
         if refused:
             self.report = replace(self.report, symbol_changes_refused=refused)
+        # #3054: every stored change (refused ones too: the alias has its own
+        # guards) as an action alias, per security in process-date order.
+        self._alias_changes: dict[str, list[tuple[date, str, str]]] = defaultdict(list)
+        self._alias_by_old: dict[str, set[str]] = defaultdict(set)
+        for security_id, day, before, after in alias_changes:
+            old_symbol, new_symbol = alpaca_symbol(before), alpaca_symbol(after)
+            if old_symbol is None or new_symbol is None or old_symbol == new_symbol:
+                continue  # an unsendable symbol, or a CUSIP-only change
+            self._alias_changes[security_id].append((day, old_symbol, new_symbol))
+            self._alias_by_old[old_symbol].add(security_id)
+        for listed in self._alias_changes.values():
+            listed.sort()
 
     def _build(
         self,
@@ -1710,6 +1723,69 @@ class ListingResolver:
             return None
         return owner
 
+    def action_alias(self, ticker: str, session: date) -> str | None:
+        """The security whose pre-rename symbol `ticker` was on `session`, for
+        a corporate action only (#3054), or `None`.
+
+        Actions are asked without `asof` and an action row carries the symbol
+        of its day, so a security whose only ticker evidence before a rename
+        is the new ticker back-dated never gets its old symbol's actions. A
+        stored name change `old -> new` on P of security X gives X the rows
+        of `old` on a session before P when: P is X's first stored change
+        after the session and `old` its old symbol; X is held for actions on
+        the session (`resolve_action` or its first-span lead) under the new
+        symbol of one of its changes after the session (the back-dated
+        ticker); no security resolves or leads `ticker` that session; and
+        exactly one security qualifies. The identity is the master's at the
+        run, as for a first-span lead; an action's timing is unchanged."""
+        if self.resolve(ticker, session) is not None:
+            return None
+        if self.lead(ticker, session, actions=True) is not None:
+            return None
+        owners = {
+            security_id
+            for security_id in self._alias_by_old.get(ticker, ())
+            if self._alias_of(security_id, session) == ticker
+        }
+        return owners.pop() if len(owners) == 1 else None
+
+    def _alias_of(self, security_id: str, session: date) -> str | None:
+        changes = self._alias_changes.get(security_id, ())
+        later = [change for change in changes if change[0] > session]
+        if not later:
+            return None
+        if not any(self._held_under(security_id, new, session) for _, _, new in later):
+            return None
+        return later[0][1]
+
+    def _held_under(self, security_id: str, symbol: str, session: date) -> bool:
+        """True if `security_id` holds `symbol` for actions on `session`."""
+        if any(
+            same_alpaca_symbol(span.ticker, symbol)
+            and span.covers(session)
+            and self._assigned(span)
+            and self.resolve_action(span.ticker, session) == security_id
+            for span in self._by_security.get(security_id, [])
+        ):
+            return True
+        first = self._first_lead_of.get(security_id)
+        return (
+            first is not None
+            and same_alpaca_symbol(first.ticker, symbol)
+            and first.start <= session < first.end
+            and self.lead(first.ticker, session, actions=True) == security_id
+        )
+
+    def alias_symbols(self, security_id: str, start: date, end: date) -> list[str]:
+        """The old symbols `action_alias` may answer for `security_id` on a
+        session in `[start, end]` (#3054): those of its stored changes after
+        `start`, in process-date order; `[]` without any."""
+        out: list[str] = []
+        for day, old_symbol, _ in self._alias_changes.get(security_id, ()):
+            if day > start and old_symbol not in out:
+                out.append(old_symbol)
+        return out
+
     def _renamed_into(self, span: TickerSpan) -> bool:
         """True if `span`'s security traded under another ticker before it."""
         return any(
@@ -2284,6 +2360,10 @@ class ActionsParse:
     #: the id `repair.retract_dividends` deleted), refused so a backfill never
     #: re-inserts them; counted on the run message.
     reviewed_duplicates_refused: int = 0
+    #: #3054: name changes whose old symbol the master never lists, stored
+    #: under the security holding the new symbol the session before the change
+    #: (the master back-dates the new ticker).
+    symbol_change_backdated: int = 0
 
 
 #: Alpaca's merger categories and the `Merger.kind` of each (spec "Mergers").
@@ -2521,7 +2601,7 @@ def parse_corporate_actions(
     unresolved: list[tuple[str, date]] = []
     unsupported: list[str] = []
     symbol_changes: list[SymbolChange] = []
-    self_spinoff = reused = conflict = 0
+    self_spinoff = reused = conflict = backdated = 0
     # (child, parent) -> known_at -> record: each distinct distribution of a
     # spin-off identity (#1673); a stamp with two differing rows is unordered.
     spins: dict[tuple[str, str], dict[datetime, CorporateAction]] = defaultdict(dict)
@@ -2691,6 +2771,28 @@ def parse_corporate_actions(
                             old_holders.append(found)
                         day = next_session(day)
                     if not old_holders:
+                        # #3054: the master back-dates the new ticker (a
+                        # snapshot row or first-span lead) and never lists
+                        # the old one: the security holding the new symbol
+                        # the session before the change is the renamed one.
+                        if new_holder is not None and new_holder == holder(
+                            new, previous_session(process_date)
+                        ):
+                            backdated += 1
+                            symbol_changes.append(
+                                SymbolChange(
+                                    security_id=new_holder,
+                                    old_symbol=old,
+                                    new_symbol=new,
+                                    old_cusip=row["old_cusip"],
+                                    new_cusip=row["new_cusip"],
+                                    process_date=process_date,
+                                    known_at=announcement_date_known_at(process_date),
+                                    source=_ACTIONS_SOURCE,
+                                    source_action_id=row.get("id") or "",
+                                )
+                            )
+                            continue
                         unresolved.append((old, process_date))
                         continue
                     if new_holder is not None:
@@ -2795,6 +2897,7 @@ def parse_corporate_actions(
         merger_conflict=merged["conflict"],
         merger_self=merged["self"],
         merger_unordered=merged["unordered"],
+        symbol_change_backdated=backdated,
     )
 
 
@@ -3260,9 +3363,20 @@ class AlpacaPriceSource(PriceSource):
                 line += (
                     f"; {self.last_actions_report.symbol_change_conflict} symbol change conflict(s)"
                 )
+            if self.last_actions_report.symbol_change_backdated:
+                line += (
+                    f"; {self.last_actions_report.symbol_change_backdated} symbol change(s) "
+                    "of a back-dated ticker stored under its new symbol's holder"
+                )
         if symbols := self.symbol_summary():
             line += f"; {symbols}"
         return line
+
+    def _action_lead(self, ticker: str, session: date) -> str | None:
+        """A corporate action's lead (#974: a first-span lead, never a rename
+        lead), else the pre-rename alias of a stored name change (#3054)."""
+        found = self._resolver.lead(ticker, session, actions=True)
+        return found if found is not None else self._resolver.action_alias(ticker, session)
 
     def corporate_actions(
         self, security_ids: Sequence[str], start: date, end: date
@@ -3271,6 +3385,14 @@ class AlpacaPriceSource(PriceSource):
         check_request(security_ids, start, end)
         symbols_from = previous_session(start)  # an action resolves on the session before it
         ids, symbols = self._plan(security_ids, start, end, symbols_from=symbols_from)
+        # #3054: an action row carries the symbol of its day, so a renamed
+        # security's pre-rename symbol (a stored name change) is asked too.
+        aliases = {
+            symbol
+            for security_id in ids
+            for symbol in self._resolver.alias_symbols(security_id, symbols_from, end)
+        }
+        symbols = sorted({*symbols, *aliases})
         if not symbols:
             return []
         # Alpaca's window is on process_date, which trails the ex-date.
@@ -3280,7 +3402,7 @@ class AlpacaPriceSource(PriceSource):
             for category, rows in fetched.items()
             if category not in ("name_changes", "spin_offs", *_MERGER_CATEGORIES)
         }
-        lead = functools.partial(self._resolver.lead, actions=True)  # #974: no rename lead
+        lead = self._action_lead  # #974: no rename lead; #3054: the old symbol's alias
         parsed = parse_corporate_actions(
             payload,
             self._resolver.resolve_action,  # #1696: no action on a renamer's old ticker
