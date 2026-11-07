@@ -1601,12 +1601,220 @@ def test_an_operations_file_of_a_variant_already_named_is_refused(ops: Any) -> N
 
 def test_an_operations_file_of_a_non_variant_or_registered_slug_is_refused(ops: Any) -> None:
     v2 = ops.variants[1]
-    _ops_refused(ops, ops.file(OPS_SLUG, 0.25), "h1", "not a sweep variant")
+    # h1 is a pre-lab parent since T382 (#3118 item 2); a plain registration is neither
+    plain = ops.direct(ops.file("plain", 0.25))
+    _ops_refused(ops, ops.file(OPS_SLUG, 0.25), plain.slug, "not a sweep variant")
     _ops_refused(ops, ops.file("h1", 0.25), v2.slug, "already registered")
     with pytest.raises(ValueError, match="reason"):
         hypothesis.register_operations_book(
             ops.conn, ops.file(OPS_SLUG, 0.25), v2.slug, " ", registered_by="owner"
         )
+
+
+# --- T382: an operations file differing in fill price and base cost (#3118 item 2) ----
+
+
+def _open_file(ops: Any, slug: str, top_fraction: float, cost: float = 60.0) -> Path:
+    """`ops.file` at `execution.fill_price = open` and `cost` bp per side."""
+    path = ops.file(slug, top_fraction, cost)
+    text = path.read_text()
+    marker = "[gap]\ncount_share_threshold = 0.05\n"
+    assert marker in text
+    path.write_text(text.replace(marker, marker + '\n[execution]\nfill_price = "open"\n', 1))
+    return path
+
+
+_OPEN_KEYS = {
+    "costs.per_side_bps": {"parent": 15.0, "file": 60.0},
+    "execution.fill_price": {"parent": "close", "file": "open"},
+}
+
+
+def test_an_open_basis_operations_file_of_a_variant_registers_with_its_differences(
+    ops: Any,
+) -> None:
+    from tradepartner.backtest import results
+
+    sweep, v2 = ops.sweep_row, ops.variants[1]
+    n_before = results.family_n(ops.conn, "momentum")
+    v_before = registry.family_sharpes(ops.conn, "momentum").variance("excess_spy")
+    trials_before = _ops_counts(ops.conn)["trials"]
+
+    outcome = _ops_register(ops, _open_file(ops, OPS_SLUG, 0.25), v2.slug)
+
+    record = outcome.registered
+    assert frozen.frozen_values(record)["execution.fill_price"] == "open"
+    assert outcome.values["sweep_id"] == sweep.sweep_id
+    assert outcome.values["variant_index"] == 2
+    assert outcome.values["variant_hypothesis_id"] == v2.hypothesis_id
+    assert outcome.values["parent_fingerprint"] == _fingerprint(v2)
+    assert outcome.values["differing_keys"] == _OPEN_KEYS
+    # its own fingerprint, written once, not the variant's
+    (stored,) = ops.conn.execute(  # type: ignore[misc]
+        "SELECT fingerprint FROM hypothesis_fingerprints WHERE hypothesis_id = ?",
+        [record.hypothesis_id],
+    ).fetchone()
+    assert stored == _fingerprint(record) != _fingerprint(v2)
+    assert lab_registry.promotion_for(ops.conn, record.hypothesis_id) is None
+    assert results.family_n(ops.conn, "momentum") == n_before
+    assert registry.family_sharpes(ops.conn, "momentum").variance("excess_spy") == v_before
+    assert _ops_counts(ops.conn)["trials"] == trials_before
+
+
+def test_an_open_basis_operations_file_of_h1_registers_as_a_pre_lab_parent(ops: Any) -> None:
+    from backtest.test_promotion import CODE
+    from tradepartner.backtest import results, sweep_report
+
+    h1 = registry.get_hypothesis(ops.conn, "h1")
+    (h1_trial,) = ops.conn.execute(  # type: ignore[misc]
+        "SELECT trial_id FROM trials WHERE hypothesis_id = ?", [h1.hypothesis_id]
+    ).fetchone()
+    n_before = results.family_n(ops.conn, "momentum")
+    v_before = registry.family_sharpes(ops.conn, "momentum").variance("excess_spy")
+    trials_before = _ops_counts(ops.conn)["trials"]
+    outcome = _ops_register(ops, _open_file(ops, "h1-open", 0.5), "h1")
+    assert _ops_counts(ops.conn)["trials"] == trials_before
+    assert registry.family_sharpes(ops.conn, "momentum").variance("excess_spy") == v_before
+    values = outcome.values
+    assert outcome.variant == h1
+    assert (values["sweep_id"], values["sweep_slug"], values["variant_index"]) == (None,) * 3
+    assert values["variant_hypothesis_id"] == h1.hypothesis_id
+    assert values["variant_slug"] == "h1"
+    assert values["variant_trial_id"] == h1_trial
+    assert values["variant_trial_current"] is True
+    assert values["sharpe_annual_excess_spy"] == pytest.approx(0.3)
+    assert values["dsr_excess"] is not None
+    assert values["family_n"] == n_before == results.family_n(ops.conn, "momentum")
+    assert values["parent_fingerprint"] == _fingerprint(h1)
+    assert values["differing_keys"] == _OPEN_KEYS
+    status = sweep_report.lab_status(ops.conn, ops.settings, code_vintage=CODE)
+    (line,) = status.operations_books
+    assert (line.slug, line.sweep_slug, line.variant_index) == ("h1-open", None, None)
+    rendered = sweep_report.format_lab_status(status)
+    assert "operations book of h1 (pre-lab), not promoted" in rendered
+
+
+def test_a_pre_lab_parent_without_a_counted_ok_trial_is_refused(ops: Any) -> None:
+    ops.conn.execute(
+        "UPDATE trial_results SET status = 'failed' WHERE trial_id IN "
+        "(SELECT trial_id FROM trials WHERE hypothesis_id = "
+        "(SELECT hypothesis_id FROM hypotheses WHERE slug = 'h1'))"
+    )
+    _ops_refused(ops, _open_file(ops, "h1-open", 0.5), "h1", "no counted ok trial")
+
+
+@pytest.mark.parametrize(
+    ("edit", "named"),
+    [
+        (("top_fraction = 0.25", "top_fraction = 0.35"), r"strategy\.top_fraction"),
+        (("count_share_threshold = 0.05", "count_share_threshold = 0.04"), r"gap\."),
+        (("commission_per_order = 0.0", "commission_per_order = 1.0"), r"commission_per_order"),
+        (("per_side_bps = 60.0", "per_side_bps = 10.0"), r"costs\.per_side_bps \(lower"),
+    ],
+)
+def test_an_operations_file_differing_in_any_other_key_or_a_lower_cost_is_refused_by_name(
+    ops: Any, edit: tuple[str, str], named: str
+) -> None:
+    path = _open_file(ops, OPS_SLUG, 0.25)
+    text = path.read_text()
+    assert edit[0] in text
+    path.write_text(text.replace(edit[0], edit[1], 1))
+    _ops_refused(ops, path, ops.variants[1].slug, named)
+
+
+def test_the_fill_price_exemption_is_an_operations_files_only(ops: Any) -> None:
+    """A promoted file at `open` in a `close` family is still refused, and the family
+    rule names `execution.fill_price` for anything but an operations file."""
+    path = _open_file(ops, "h-open-promoted", 0.25, cost=15.0)
+    parsed = hypothesis.parse_file(path)
+    params = hypothesis.frozen_params(parsed, ops.settings)
+    rules = lab_registry.family_rules(ops.conn, "momentum")
+    assert rules is not None
+    assert "execution.fill_price" in hypothesis._rule_differences(parsed, params, rules)
+    assert hypothesis._rule_differences(parsed, params, rules, operations=True) == []
+    before = _ops_counts(ops.conn)
+    with pytest.raises(LabRegistrationError, match="fingerprint differs from variant"):
+        hypothesis.register(
+            ops.conn,
+            path,
+            registered_by="owner",
+            settings=ops.settings,
+            promotion_of=ops.variants[1].hypothesis_id,
+        )
+    assert _ops_counts(ops.conn) == before
+
+
+def test_an_open_basis_file_registers_beside_a_no_difference_one_once_per_difference_set(
+    ops: Any,
+) -> None:
+    v2 = ops.variants[1]
+    _ops_register(ops, ops.file(OPS_SLUG, 0.25), v2.slug)  # today's operations file
+    opened = _ops_register(ops, _open_file(ops, "ops-open", 0.25), v2.slug)
+    assert opened.values["differing_keys"] == _OPEN_KEYS
+    # the same differences: its fingerprint is the first file's, registered once
+    _ops_refused(
+        ops, _open_file(ops, "ops-open-2", 0.25), v2.slug, "fingerprint is already registered"
+    )
+    _ops_refused(ops, ops.file("ops-same-2", 0.25), v2.slug, "already named by decision")
+    # a re-measured figure is a new difference set: one more file
+    later = _ops_register(ops, _open_file(ops, "ops-open-65", 0.25, cost=65.0), v2.slug)
+    assert later.values["differing_keys"]["costs.per_side_bps"] == {"parent": 15.0, "file": 65.0}
+
+
+def test_an_existing_row_without_differing_keys_reads_as_the_empty_set(ops: Any) -> None:
+    """`momentum-daily-shakedown`'s row predates `differing_keys`: it names its parent
+    under `variant_hypothesis_id` with no differences."""
+    v2 = ops.variants[1]
+    registry.record_decision(
+        ops.conn,
+        kind="operations_book",
+        reason="stand-in for the shakedown's row",
+        values={"variant_hypothesis_id": v2.hypothesis_id},
+    )
+    _ops_refused(ops, ops.file(OPS_SLUG, 0.25), v2.slug, "already named by decision")
+    outcome = _ops_register(ops, _open_file(ops, "ops-open", 0.25), v2.slug)
+    assert outcome.values["variant_hypothesis_id"] == v2.hypothesis_id
+
+
+def test_a_promoted_parent_still_refuses_a_no_difference_file_but_not_an_open_one(
+    ops: Any,
+) -> None:
+    v1 = ops.variants[0]
+    registry.record_decision(
+        ops.conn,
+        kind="operations_book",
+        reason="stand-in",
+        values={"variant_hypothesis_id": v1.hypothesis_id},
+    )
+    ops.conn.execute(
+        "UPDATE owner_decisions SET kind = 'promotion' WHERE decision_id = "
+        "(SELECT MAX(decision_id) FROM owner_decisions)"
+    )
+    _ops_refused(ops, ops.file(OPS_SLUG, 0.15), v1.slug, "already named by decision")
+    assert (
+        _ops_register(ops, _open_file(ops, "ops-open", 0.15), v1.slug).values["differing_keys"]
+        == _OPEN_KEYS
+    )
+
+
+def test_the_forward_holdout_refusal_holds_for_an_open_basis_file_of_either_parent(
+    ops: Any,
+) -> None:
+    from backtest.test_promotion import HOLDOUT
+
+    ops.conn.execute(
+        "UPDATE hypotheses SET registered_at = ? WHERE family = 'momentum'",
+        [datetime(HOLDOUT[0].year, 1, 2, 12, tzinfo=UTC)],
+    )
+    _ops_refused(ops, _open_file(ops, OPS_SLUG, 0.25), ops.variants[1].slug, "is forward")
+    _ops_refused(ops, _open_file(ops, "h1-open", 0.5), "h1", "is forward")
+
+
+def test_a_parent_that_is_neither_a_variant_nor_pre_lab_is_refused(ops: Any) -> None:
+    other = ops.direct(ops.file("not-a-parent", 0.4))
+    _ops_refused(
+        ops, _open_file(ops, OPS_SLUG, 0.4), other.slug, "not a sweep variant or a pre-lab"
+    )
 
 
 # --- ADR 0006 amendment 2026-10-11 (#1540), property 9: family rules unchanged -----
