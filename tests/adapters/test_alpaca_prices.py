@@ -3170,11 +3170,13 @@ class TestAlpacaPriceSource:
         def fetch(symbols: list[str], start: date, end: date) -> dict[str, object]:
             return {
                 **recorded.actions(symbols, start, end),
+                # #3058: not on AAPL's 2020-08-31 split ex-date, where the
+                # split row would be the spin-off's echo and refused.
                 "spin_offs": [
                     _spinoff(
                         source_symbol="AAPL",
                         new_symbol="MSFT",
-                        ex_date="2020-08-31",
+                        ex_date="2020-08-28",
                         process_date="2020-09-04",
                     )
                 ],
@@ -3190,7 +3192,7 @@ class TestAlpacaPriceSource:
             ("SEC_AAPL", "dividend", date(2020, 8, 7)),
             ("SEC_AAPL", "split", date(2020, 8, 31)),
             ("SEC_MSFT", "dividend", date(2020, 8, 19)),
-            ("SEC_MSFT", "spinoff", date(2020, 8, 31)),
+            ("SEC_MSFT", "spinoff", date(2020, 8, 28)),
         ]
         assert source.last_actions_report is not None
         assert any(a.action_type is ActionType.SPINOFF for a in source.last_actions_report.actions)
@@ -3337,7 +3339,9 @@ class TestAlpacaPriceSource:
 
     def test_spinoffs_leave_split_and_dividend_output_identical(self) -> None:
         # #1664 ruling (a): the split and dividend output is byte-identical
-        # with a spin-off in the payload, whatever ids the spin-off carries.
+        # with a spin-off in the payload, whatever ids the spin-off carries,
+        # except (#3058) a split of the parent on the spin-off's own ex-date,
+        # its echo, so the spin-off here is dated off AAPL's split day.
         def run(with_spinoff: bool) -> tuple[list[CorporateAction], list[CorporateAction]]:
             recorded = _Recorded()
 
@@ -3348,7 +3352,7 @@ class TestAlpacaPriceSource:
                         _spinoff(
                             source_symbol="AAPL",
                             new_symbol="MSFT",
-                            ex_date="2020-08-31",
+                            ex_date="2020-08-28",
                             process_date="2020-09-04",
                         )
                     ]

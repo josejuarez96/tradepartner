@@ -172,6 +172,33 @@ def test_rate_limiter_spaces_two_calls_at_least_the_configured_interval_apart(
     assert sleeps == [pytest.approx(0.5)]
 
 
+def test_rate_limiter_never_sleeps_past_one_interval_for_a_stamp_ahead_of_the_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3039: a stamp ahead of `time.monotonic()` (a clock another caller
+    patched, or one that stepped back) waits one full interval, never the
+    gap to the stamp: on CI a leaked fake stamp of ~1000 s against a fresh
+    VM's uptime hung a fetch-pool test for 20 minutes under the lock."""
+    now = [100.0]
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(edgar_raw.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(edgar_raw.time, "sleep", fake_sleep)
+    limiter = edgar_raw._RateLimiter()
+    limiter._last_request_monotonic = 10_000.0
+
+    limiter.wait(0.5)
+    limiter.wait(0.5)
+
+    # The first wait is one full interval (fail closed: never shorter); the
+    # second paces off the first's own stamp, as before.
+    assert sleeps == [pytest.approx(0.5), pytest.approx(0.5)]
+
+
 # --- retry / backoff -------------------------------------------------------
 
 

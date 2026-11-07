@@ -600,6 +600,38 @@ def test_incremental_pending_and_acceptance_time(
     assert not later.pending
 
 
+def test_incremental_unstampable_quarter_is_the_first_filed_on_quarter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#3041: the quarter that decides an unstampable accession is its first
+    listing's filed_on quarter (T323a), fresh or pending, never the quarter of
+    a pending row's listed_on, which a settled form.idx's Last-Modified puts a
+    quarter late. A rebuild and an incremental store then decide alike."""
+    from tradepartner.adapters.filings import PendingIndexRow
+
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    # Pending from 2025 Q4's form.idx, listed at its Last-Modified in 2026 Q1.
+    late = PendingIndexRow(
+        APPLE, "0000320193-25-000009", "8-K", "Company", date(2025, 12, 23), date(2026, 1, 12)
+    )
+    # A fresh first listing in a 2026 Q2 daily file, filed in Q1.
+    file = _incremental_file(date(2026, 4, 1))
+    fresh = _incremental_row(APPLE, "0000320193-26-000009", "10-K", date(2026, 3, 31))
+    monkeypatch.setattr(source, "_incremental_daily_rows", lambda _file: (fresh,))
+    asked: dict[str, tuple[int, int]] = {}
+
+    def stamps(
+        rows: dict[str, dict[str, tuple[UnstampedFiling, tuple[int, int]]]],
+    ) -> dict[tuple[str, str], datetime | None]:
+        asked.update({a: q for by_cik in rows.values() for a, (_, q) in by_cik.items()})
+        return {}
+
+    monkeypatch.setattr(source, "_incremental_stamps", stamps)
+    result = source.incremental_index(_incremental_state(pending=(late,), files=(file,)))
+    assert asked == {late.accession: (2025, 4), fresh.accession: (2026, 1)}
+    assert {r.accession for r in result.pending} == {late.accession, fresh.accession}
+
+
 def test_incremental_keeps_exchange_only_and_filer_13d(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3657,6 +3689,7 @@ def test_filename_fetch_workers_defaults_to_four_and_refuses_zero() -> None:
         Settings(_env_file=None, edgar={"filename_fetch_workers": 0})
 
 
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("workers", [2, 4, 8])
 def test_filename_pool_answer_is_byte_identical_to_the_sequential_fetch(
     tmp_path: Path, workers: int
@@ -3672,6 +3705,44 @@ def test_filename_pool_answer_is_byte_identical_to_the_sequential_fetch(
     seq_router = _fn_router()
     _fn_run(tmp_path / "again", seq_router, 1)
     assert sorted(router.urls) == sorted(seq_router.urls)
+
+
+@pytest.mark.timeout(60)
+def test_filename_pool_finishes_after_a_leaked_limiter_stamp(tmp_path: Path) -> None:
+    """#3039: the CI hang. Another test's fake clock left the process-wide
+    limiter's stamp far ahead of the real `time.monotonic()`; the pool's
+    first request slept the whole gap under the limiter lock and every
+    worker queued behind it. Each wait is now at most one interval."""
+    edgar_raw._LIMITER._last_request_monotonic = time.monotonic() + 100_000.0
+    started = time.monotonic()
+    result = _fn_run(tmp_path, _fn_router(), 2)
+    assert time.monotonic() - started < 30.0
+    assert [e.accession for e in result["listings"]] == [_FN_A, _FN_B, _FN_25_NASDAQ, _FN_COVER]
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("workers", [2, 4])
+def test_filename_pool_job_started_after_its_turn_still_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workers: int
+) -> None:
+    """#3039: the second CI hang. The caller takes each prefetched future in
+    order, removing it from the dict it was handed; a job a worker picked up
+    only after its turn came found no future, died in the pool unseen, and
+    the caller waited on that future forever. Here every job starts late, so
+    every turn comes first: the answer is still the sequential one."""
+    real_pool = edgar_source_module.ThreadPoolExecutor
+
+    class LateStart(real_pool):  # type: ignore[misc, valid-type]
+        def map(self, fn: Any, *iterables: Any, **kwargs: Any) -> Any:
+            def late(*args: Any) -> Any:
+                time.sleep(0.2)  # the caller reaches its turn first
+                return fn(*args)
+
+            return super().map(late, *iterables, **kwargs)
+
+    sequential = _fn_run(tmp_path / "one", _fn_router(), 1)
+    monkeypatch.setattr(edgar_source_module, "ThreadPoolExecutor", LateStart)
+    assert _fn_run(tmp_path / "pool", _fn_router(), workers) == sequential
 
 
 def test_filename_pool_of_one_is_todays_sequential_path(

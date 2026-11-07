@@ -271,7 +271,7 @@ multiplies `open`/`high`/`low`/`close` by that factor directly in SQL.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -478,6 +478,29 @@ def live_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[tuple[str
         [t],
     ).fetchall()
     return tuple((str(predecessor), str(successor)) for predecessor, successor in rows)
+
+
+def chained_read_ids(
+    conn: duckdb.DuckDBPyConnection, t: datetime, security_ids: Iterable[str]
+) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
+    """Where the chain-aware reads at `t` file each of `security_ids` (#821,
+    #3051): a predecessor of exactly one live chain known at `t` is read under
+    its successor, every other id under itself. The second map holds each
+    predecessor of more than one live chain at `t` with its successors, sorted:
+    which one holds the predecessor's position is never guessed, so a caller
+    fails closed on it. A chain known only after `t` maps nothing, so a read
+    keyed through this map never looks ahead of `t`."""
+    successors: dict[str, set[str]] = {}
+    for predecessor, successor in live_chains(conn, t):
+        successors.setdefault(predecessor, set()).add(successor)
+    ids: dict[str, str] = {}
+    forked: dict[str, tuple[str, ...]] = {}
+    for sid in security_ids:
+        found = successors.get(sid, set())
+        if len(found) > 1:
+            forked[sid] = tuple(sorted(found))
+        ids[sid] = next(iter(found)) if len(found) == 1 else sid
+    return ids, forked
 
 
 @dataclass(frozen=True)

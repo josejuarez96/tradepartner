@@ -24,7 +24,12 @@ kept once per source instance. Acceptance times are cached per CIK,
 one reduced record per accession, under a directory named by
 `PARSER_VERSION`, so a parser fix re-stamps. A cache file that does not
 decode (truncated, older version) is ignored and re-fetched. Every write
-goes through a temp file and `os.replace`.
+goes through a temp file and `os.replace`. The per-CIK facts and statement
+caches each get a key sidecar `<cik>.json.key` (#3032) holding the file's
+`version`, `cik` and `key` and the size, mtime and inode it was written
+with, so the nightly completeness probe reads the key without parsing the
+payload; a sidecar that does not match the file on disk is ignored and the
+file is parsed in full (fail-closed: a truncated file never reads as keyed).
 
 **Stamps layout and `items` (T164c, #1358).** A stamps record carries the
 payload's 8-K `items` string as a fifth element under `STAMPS_LAYOUT`, a
@@ -286,6 +291,7 @@ import hashlib
 import itertools
 import json
 import math
+import os
 import re
 import shutil
 import threading
@@ -1690,11 +1696,7 @@ class EdgarFilingSource(FilingSource):
                     ),
                     pending_row.listed_on,
                     True,
-                    # T318's pending table preserves listed_on, not the source
-                    # quarter. For daily files this is the index quarter. A
-                    # settled-quarter Last-Modified may put it later, which
-                    # delays an unstampable decision rather than dating it early.
-                    (pending_row.listed_on.year, (pending_row.listed_on.month - 1) // 3 + 1),
+                    (pending_row.filed_on.year, (pending_row.filed_on.month - 1) // 3 + 1),
                 ),
             )
         stamp_input: dict[str, dict[str, tuple[UnstampedFiling, tuple[int, int]]]] = {}
@@ -1703,10 +1705,16 @@ class EdgarFilingSource(FilingSource):
             listings.sort(key=lambda item: (item[1], not item[2]))
             if first_pending is not None:
                 listings.insert(0, first_pending)
-            row, _, _, index_quarter = listings[0]
+            row = listings[0][0]
+            # #3041: the unstampable decision settles by the first listing's
+            # filed_on quarter (T323a, as `sec_form_stamp` and the delisting
+            # path do), fresh or pending. Not the pending row's listed_on, which
+            # a settled form.idx's Last-Modified puts a quarter late, nor the
+            # source file's quarter, which T318's pending table does not keep:
+            # either would let a rebuild and an incremental store decide apart.
             stamp_input.setdefault(key[0], {})[key[1]] = (
                 row,
-                index_quarter,
+                (row.filed_on.year, (row.filed_on.month - 1) // 3 + 1),
             )
         stamps = self._incremental_stamps(stamp_input)
         # #2858: a pending row holds only its first listing, so a later listing of
@@ -3907,30 +3915,41 @@ class EdgarFilingSource(FilingSource):
         pool = ThreadPoolExecutor(
             max_workers=min(workers, len(todo)), thread_name_prefix="edgar-filename"
         )
-        # The caller's context per job (the retry observer is a ContextVar), and
-        # one future per job, set by its worker. `map` queues every job now;
+        # One future per job, set by its worker, and the caller's context per
+        # job (the retry observer is a ContextVar). `map` queues every job now;
         # the boundary test refuses any `.submit` outside the broker wrapper.
+        # Each job carries its own future, context and record (#3039): the
+        # caller takes futures out of its copy of the dict in order, often
+        # before a worker has picked the job up, so a job must never look its
+        # future up there (a miss died unseen in the pool and the caller
+        # waited on that future forever).
         futures: dict[tuple[str, bool], Future[_FilenameExtract]] = {key: Future() for key in todo}
-        contexts = {key: contextvars.copy_context() for key in todo}
+        work = [
+            (futures[key], contextvars.copy_context(), record, read_document)
+            for key, (record, read_document) in todo.items()
+        ]
 
-        def run(key: tuple[str, bool]) -> None:
-            future = futures[key]
+        def run(
+            job: tuple[Future[_FilenameExtract], contextvars.Context, SubmissionRecord, bool],
+        ) -> None:
+            future, context, record, read_document = job
             if not future.set_running_or_notify_cancel():
                 return
-            record, read_document = todo[key]
             try:
-                extract = self._fetch_filename_extract(cik, record, read_document, on_worker=True)
+                extract = context.run(
+                    self._fetch_filename_extract, cik, record, read_document, on_worker=True
+                )
             except BaseException as error:  # handed to the caller, raised in order there
                 future.set_exception(error)
             else:
                 future.set_result(extract)
 
         try:
-            pool.map(lambda key: contexts[key].run(run, key), list(todo))
+            pool.map(run, work)
         except BaseException:
             pool.shutdown(wait=True, cancel_futures=True)
             raise
-        return pool, futures
+        return pool, dict(futures)
 
     def _first_cover_filing(
         self, cik: str, stamps: Mapping[str, SubmissionRecord]
@@ -4764,7 +4783,7 @@ class EdgarFilingSource(FilingSource):
             "records": [_statement_record_to_json(r) for r in entries.records],
             "conflicts": [_statement_conflict_to_json(c) for c in entries.conflicts],
         }
-        edgar_raw.write_atomic(self._statement_cache_path(cik), json.dumps(data).encode("utf-8"))
+        _write_keyed_cache(self._statement_cache_path(cik), data)
         self._statement_filled[cik] = key
         self._statement_requested[cik] = self._statement_key(latest)
         return entries
@@ -4928,7 +4947,7 @@ class EdgarFilingSource(FilingSource):
             if complete:  # else the payload trails the latest filing: fetch again next run
                 rows = [[n, a, d.isoformat(), v] for n, a, d, v in cached]
                 data = {"version": PARSER_VERSION, "cik": cik, "key": key, "facts": rows}
-                edgar_raw.write_atomic(path, json.dumps(data).encode("utf-8"))
+                _write_keyed_cache(path, data)
         fsn_cache = self._load_fsn_cache(cik)
         # (accession, name, capped date) -> [(value, dated after acceptance)]
         kept: dict[tuple[str, str, date], list[tuple[float, bool]]] = {}
@@ -5379,18 +5398,38 @@ def _cached_latest(path: Path, cik: str) -> str | None:
     """The latest cover-form accession a facts cache file was keyed by, or
     None when there is no usable cache (the bulk decision's staleness probe,
     which cannot know the names a later `facts` call will ask for)."""
-    try:
-        data = json.loads(path.read_bytes())
-        if data["version"] != PARSER_VERSION or data["cik"] != cik:
-            return None
-        return str(data["key"]).split("|", 1)[0]
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
+    key = _cached_key(path, cik, PARSER_VERSION)
+    return None if key is None else key.split("|", 1)[0]
 
 
 def _cached_key(path: Path, cik: str, version: int) -> str | None:
     """The key a per-CIK cache file was written under, or None when there is
-    no usable file (absent, truncated, another version or CIK)."""
+    no usable file (absent, truncated, another version or CIK).
+
+    #3032: read from the file's key sidecar (`_key_sidecar_path`) when the
+    sidecar still describes the file on disk (same size, mtime and inode),
+    else from a full parse (`_parse_cache_key`), which then writes the
+    sidecar so the next run skips the parse. Fail-closed: a sidecar that is
+    absent, unreadable, for another version or CIK, or describing another
+    file (a truncated, rewritten or restored one) is ignored."""
+    try:
+        before = path.stat()
+    except OSError:
+        return None
+    sidecar = _read_key_sidecar(path, cik, version, before)
+    if sidecar is not None:
+        return sidecar
+    key = _parse_cache_key(path, cik, version)
+    if key is not None:
+        with contextlib.suppress(OSError):
+            if _stat_identity(path.stat()) == _stat_identity(before):  # unchanged mid-parse
+                _write_key_sidecar(path, cik, version, key, before)
+    return key
+
+
+def _parse_cache_key(path: Path, cik: str, version: int) -> str | None:
+    """`_cached_key` by a full parse of the cache file: the reference answer
+    a key sidecar must agree with."""
     try:
         data = json.loads(path.read_bytes())
         if data["version"] != version or data["cik"] != cik:
@@ -5398,6 +5437,59 @@ def _cached_key(path: Path, cik: str, version: int) -> str | None:
         return str(data["key"])
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def _key_sidecar_path(path: Path) -> Path:
+    """`<cik>.json.key` beside the cache file `<cik>.json` (#3032)."""
+    return path.with_name(f"{path.name}.key")
+
+
+def _stat_identity(st: os.stat_result) -> tuple[int, int, int]:
+    """What a key sidecar pins of its cache file: size, mtime (ns) and inode.
+    `write_atomic` replaces the file, so every rewrite changes the inode."""
+    return (st.st_size, st.st_mtime_ns, st.st_ino)
+
+
+def _read_key_sidecar(path: Path, cik: str, version: int, st: os.stat_result) -> str | None:
+    """The key `path`'s sidecar records, or None unless the sidecar is
+    well formed, names `version` and `cik`, and pins exactly `st`."""
+    try:
+        data = json.loads(_key_sidecar_path(path).read_bytes())
+        if (
+            data["version"] != version
+            or data["cik"] != cik
+            or [data["size"], data["mtime_ns"], data["ino"]] != list(_stat_identity(st))
+            or not isinstance(data["key"], str)
+        ):
+            return None
+        return data["key"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _write_key_sidecar(path: Path, cik: str, version: int, key: str, st: os.stat_result) -> None:
+    """Record `key` for the cache file `path` as `st` describes it."""
+    size, mtime_ns, ino = _stat_identity(st)
+    data = {
+        "version": version,
+        "cik": cik,
+        "key": key,
+        "size": size,
+        "mtime_ns": mtime_ns,
+        "ino": ino,
+    }
+    edgar_raw.write_atomic(_key_sidecar_path(path), json.dumps(data).encode("utf-8"))
+
+
+def _write_keyed_cache(path: Path, data: Mapping[str, Any]) -> None:
+    """Write a per-CIK cache file (`version`, `cik`, `key`, ...) and then its
+    key sidecar (#3032). A crash between the two leaves the old sidecar,
+    which pins the old file, so the next read falls back to a full parse."""
+    body = json.dumps(data).encode("utf-8")
+    edgar_raw.write_atomic(path, body)
+    st = path.stat()
+    if st.st_size == len(body):  # else another writer replaced it: no sidecar
+        _write_key_sidecar(path, str(data["cik"]), int(data["version"]), str(data["key"]), st)
 
 
 def _carries_a_tag(payload: Mapping[str, Any], tags: Mapping[str, Sequence[str]]) -> bool:

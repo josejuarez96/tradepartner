@@ -370,9 +370,11 @@ from tradepartner.adapters.prices import (
 )
 from tradepartner.calendar import is_session, next_session, previous_session
 from tradepartner.config import AlpacaConfig, Settings, get_settings
+from tradepartner.store import spinoff_splits as spinoff_split_list
 from tradepartner.store.classify import EQUITY, listing_kind
 from tradepartner.store.delistings import DELISTED
 from tradepartner.store.dividend_reviews import DUPLICATE, ReviewedGroup, reviewed_groups
+from tradepartner.store.spinoff_splits import SpinoffSplit
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT
 
@@ -2412,6 +2414,20 @@ class ActionsParse:
     #: #3054: splits and dividends kept under a pre-rename symbol
     #: (`ListingResolver.action_alias`), each "SECURITY type ex-date under SYMBOL".
     aliased: tuple[str, ...] = ()
+    #: #3058: `(parent security, ex_date)` of every `spin_offs` row read whose
+    #: parent resolved, its child resolved or not: the days a split row of
+    #: that parent is the spin-off's echo, not a split.
+    spinoff_parents: tuple[tuple[str, date], ...] = ()
+    #: #3058: split rows refused as the echo of their security's spin-off on
+    #: the same ex-date (`AlpacaPriceSource.corporate_actions`), each named
+    #: "security_id ex_date ratio" on the run message for review: a real split
+    #: refused this way leaves an unexplained price jump (`price_jumps`), never
+    #: a silent one.
+    spinoff_echo_splits_refused: tuple[str, ...] = ()
+    #: #3058: split rows on the reviewed spin-off list (`store.spinoff_splits`,
+    #: the identity `repair.retract_spinoff_splits` deleted), refused so a
+    #: backfill never re-inserts them.
+    reviewed_spinoff_splits_refused: int = 0
 
 
 #: Alpaca's merger categories and the `Merger.kind` of each (spec "Mergers").
@@ -2640,6 +2656,8 @@ def parse_corporate_actions(
     A `spin_offs` row's child is resolved under `regular_way_symbol(new_symbol)`
     on its ex-date, so a when-issued `MSGR.WI` is the master's `MSGR` (#2112);
     with no such listing that session it is unresolved under Alpaca's symbol.
+    The resolved parent and ex-date of every `spin_offs` row read, its child
+    resolved or not, are returned in `spinoff_parents` (#3058).
 
     Several `spin_offs` rows of one identity (child, parent) are revisions
     of one record (#1673; spec "Spin-offs": a second distribution from the
@@ -2661,6 +2679,7 @@ def parse_corporate_actions(
     # (child, parent) -> known_at -> record: each distinct distribution of a
     # spin-off identity (#1673); a stamp with two differing rows is unordered.
     spins: dict[tuple[str, str], dict[datetime, CorporateAction]] = defaultdict(dict)
+    spin_parents: set[tuple[str, date]] = set()  # #3058: (parent, ex_date)
     unordered: dict[tuple[str, str], str] = {}
     reused_symbols: list[str] = []
 
@@ -2792,6 +2811,8 @@ def parse_corporate_actions(
                     child = holder(regular_way_symbol(row["new_symbol"]), ex_date)
                     if parent is None:
                         unresolved.append((row["source_symbol"], ex_date))
+                    else:
+                        spin_parents.add((parent, ex_date))
                     if child is None:
                         unresolved.append((row["new_symbol"], ex_date))
                     if parent is None or child is None:
@@ -2952,6 +2973,7 @@ def parse_corporate_actions(
         tuple(stock_refused),
         spinoff_revisions=spinoff_revisions,
         spinoff_unordered=tuple(sorted(unordered.values())),
+        spinoff_parents=tuple(sorted(spin_parents)),
         mergers=merged["mergers"],
         merger_rows_refused=merged["refused"],
         merger_conflict=merged["conflict"],
@@ -3099,7 +3121,8 @@ class AlpacaPriceSource(PriceSource):
     for ingest to count or refuse. `fetch_bars` and
     `fetch_actions` default to `alpaca_raw` (network, owner's keys); tests
     pass recorded payloads. Construction loads the packaged
-    `dividend_reviews.csv` and raises `ReviewsError` if it is malformed.
+    `dividend_reviews.csv` and `spinoff_splits.csv` and raises `ReviewsError`
+    or `SpinoffSplitsError` if one is malformed.
     """
 
     def __init__(
@@ -3113,8 +3136,15 @@ class AlpacaPriceSource(PriceSource):
         settings: Settings | None = None,
         fill_handovers: bool = False,
         reviewed: Sequence[ReviewedGroup] | None = None,
+        spinoff_splits: Sequence[SpinoffSplit] | None = None,
     ) -> None:
         self._resolver = resolver
+        # #3058: a split row reviewed as a spin-off (the repair deleted it) is
+        # never stored again; the packaged list unless a test hands its own.
+        listed = spinoff_split_list.spinoff_splits() if spinoff_splits is None else spinoff_splits
+        self._spinoff_splits: dict[tuple[str, str], tuple[date, float]] = {
+            row.identity: (row.ex_date, row.ratio) for row in listed
+        }
         # #2957: a reviewed duplicate dividend repair deleted is never stored
         # again; the list is the packaged one unless a test hands its own.
         self._retracted: dict[tuple[str, str], tuple[date, float]] = dict(
@@ -3379,6 +3409,16 @@ class AlpacaPriceSource(PriceSource):
                     f"; {self.last_actions_report.reviewed_duplicates_refused} reviewed "
                     "duplicate dividend(s) refused"
                 )
+            if echoes := self.last_actions_report.spinoff_echo_splits_refused:
+                line += (
+                    f"; {len(echoes)} split row(s) refused as the parent's same-day "
+                    f"spin-off: {', '.join(echoes)}"
+                )
+            if self.last_actions_report.reviewed_spinoff_splits_refused:
+                line += (
+                    f"; {self.last_actions_report.reviewed_spinoff_splits_refused} reviewed "
+                    "spin-off split row(s) refused"
+                )
             if self.last_actions_report.stock_rows_unusable:
                 line += (
                     f"; {self.last_actions_report.stock_rows_unusable} "
@@ -3513,6 +3553,7 @@ class AlpacaPriceSource(PriceSource):
                         )
                     ),
                     unresolved=parsed.unresolved + spins.unresolved,
+                    spinoff_parents=spins.spinoff_parents,
                     self_spinoff=spins.self_spinoff,
                     spinoff_revisions=spins.spinoff_revisions,
                     spinoff_unordered=spins.spinoff_unordered,
@@ -3524,6 +3565,12 @@ class AlpacaPriceSource(PriceSource):
         kept: list[CorporateAction] = []
         unrequested = 0
         reviewed_refused = 0
+        # #3058: a spin-off is not a split. A split row of a security on the
+        # ex-date of its own spin-off in this answer is that spin-off's echo;
+        # a reviewed identity with its reviewed values is one judged so.
+        spin_parents = set(parsed.spinoff_parents)
+        echo_refused: list[str] = []
+        reviewed_spin_refused = 0
         # The reviewed key uses exact stored DOUBLE amounts, as in
         # equal_amount_groups. Another retract id cannot stand in for a kept id.
         kept_paid = {
@@ -3551,6 +3598,14 @@ class AlpacaPriceSource(PriceSource):
                     and (a.security_id, a.ex_date, a.ratio_or_amount) in kept_paid
                 ):
                     reviewed_refused += 1  # #2957: reviewed as a duplicate, repair deleted it
+                elif a.action_type is ActionType.SPLIT and (a.security_id, a.ex_date) in (
+                    spin_parents
+                ):
+                    echo_refused.append(f"{a.security_id} {a.ex_date} {a.ratio_or_amount!r}")
+                elif a.action_type is ActionType.SPLIT and self._spinoff_splits.get(
+                    (a.security_id, a.source_action_id or "")
+                ) == (a.ex_date, a.ratio_or_amount):
+                    reviewed_spin_refused += 1
                 else:
                     kept.append(a)
         aliased = tuple(
@@ -3565,6 +3620,8 @@ class AlpacaPriceSource(PriceSource):
             spinoffs_unrequested=unrequested,
             reviewed_duplicates_refused=reviewed_refused,
             aliased=aliased,
+            spinoff_echo_splits_refused=tuple(echo_refused),
+            reviewed_spinoff_splits_refused=reviewed_spin_refused,
         )
         return kept
 
