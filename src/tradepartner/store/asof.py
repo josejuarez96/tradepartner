@@ -499,8 +499,9 @@ def refused_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[Refuse
     - its hand-over day (the successor's first listing row under the
       predecessor's last ticker and exchange, else the successor's first
       listing row) comes more than `master.chain_window_sessions` sessions
-      after the predecessor's last bar, the bound `build_chains`'s
-      candidates obey (#821).
+      after the predecessor's end (its last bar or its latest Form 25's
+      `effective_on`, whichever is later), the bound `chain_candidates`
+      obeys (#821).
 
     No evidence passes: a predecessor with no reason row (absence reads as
     `unknown`, as XOM's Form 25 does), no bar or a successor with no listing
@@ -553,24 +554,36 @@ def _refused(
     t = _validate_t(t)
     predecessors = sorted({predecessor for predecessor, _ in pairs})
     reasons: dict[str, str] = {}
-    if _has_table(conn, "delistings") and _has_table(conn, "delisting_reasons"):
+    # The predecessor's end: its last bar or its latest Form 25's effective day,
+    # whichever is later (as `store.master.chain_candidates`), so sparse bars
+    # never make a reorganisation's hand-over look far.
+    ends: dict[str, date] = {}
+    latest: dict[str, datetime] = {}
+    if _has_table(conn, "delistings"):
         episodes = delistings_as_of(conn, t, predecessors)
-        latest: dict[str, datetime] = {}
-        for security_id, filed_at in episodes.select("security_id", "filed_at").iter_rows():
+        for security_id, filed_at, effective_on in episodes.select(
+            "security_id", "filed_at", "effective_on"
+        ).iter_rows():
             latest[security_id] = max(filed_at, latest.get(security_id, filed_at))
+            if effective_on is not None:
+                ends[security_id] = max(effective_on, ends.get(security_id, effective_on))
+    if _has_table(conn, "delistings") and _has_table(conn, "delisting_reasons"):
         found = delisting_reasons_as_of(conn, t, predecessors)
         for security_id, filed_at, reason in found.select(
             "security_id", "delisting_filed_at", "reason"
         ).iter_rows():
-            if latest.get(security_id) == filed_at:
+            # Two episodes filed at the same latest time (two exchanges): any
+            # refusing reason among them refuses, never the sort order.
+            if latest.get(security_id) == filed_at and reasons.get(security_id) not in (
+                CHAIN_REFUSING_REASONS
+            ):
                 reasons[security_id] = reason
-    last_bars = dict(
-        conn.execute(
-            "SELECT security_id, MAX(session) FROM prices_daily "
-            "WHERE known_at <= ? AND security_id IN (SELECT unnest(?)) GROUP BY security_id",
-            [t, predecessors],
-        ).fetchall()
-    )
+    for security_id, session in conn.execute(
+        "SELECT security_id, MAX(session) FROM prices_daily "
+        "WHERE known_at <= ? AND security_id IN (SELECT unnest(?)) GROUP BY security_id",
+        [t, predecessors],
+    ).fetchall():
+        ends[security_id] = max(session, ends.get(security_id, session))
     hand_overs = _hand_overs(conn, t, pairs, first_row=True)
     window: int | None = None
     refused: list[RefusedChain] = []
@@ -579,7 +592,7 @@ def _refused(
         if reason in CHAIN_REFUSING_REASONS:
             refused.append(RefusedChain(predecessor, successor, f"predecessor_reason:{reason}"))
             continue
-        last, hand_over = last_bars.get(predecessor), hand_overs.get(successor)
+        last, hand_over = ends.get(predecessor), hand_overs.get(successor)
         if last is None or hand_over is None or hand_over <= last:
             continue
         days = all_sessions()
@@ -741,7 +754,9 @@ def _chain_parent(alias: str = "t") -> str:
 
 
 @contextmanager
-def _chains_registered(conn: duckdb.DuckDBPyConnection, t: datetime) -> Iterator[LiveChains]:
+def _chains_registered(
+    conn: duckdb.DuckDBPyConnection, t: datetime, *, stored: bool = False
+) -> Iterator[LiveChains]:
     """Expose the live chains known at `t` to SQL as `_CHAINS_VIEW` (its
     `predecessor_id`, `successor_id` and `handover`) and the chained
     successors whose own bars stay hidden *and* have no live chain at `t` as
@@ -750,8 +765,9 @@ def _chains_registered(conn: duckdb.DuckDBPyConnection, t: datetime) -> Iterator
     registered and the reads build their pre-#821 SQL. `live_chains` is read
     once here, and the hand-over day is derived from the listings known at `t`
     (the successor's first listing row under the predecessor's ticker and
-    exchange)."""
-    chains = _live_chains_at(conn, t)
+    exchange). With `stored`, every stored chain (`stored_chains`, refused
+    ones included, #3097) is applied: the ingest's resolver reads that view."""
+    chains = _live_chains_at(conn, t, stored=stored)
     pre_listing = _pre_listing_at(conn, t, chains)
     if not chains.pairs and not pre_listing:
         yield _NO_CHAINS
@@ -808,12 +824,14 @@ def _pre_listing_at(
     return {str(successor): valid_from for successor, valid_from in first}
 
 
-def _live_chains_at(conn: duckdb.DuckDBPyConnection, t: datetime) -> LiveChains:
+def _live_chains_at(
+    conn: duckdb.DuckDBPyConnection, t: datetime, *, stored: bool = False
+) -> LiveChains:
     """`live_chains(t)` with each successor's hand-over day, read from the
     listings known at `t`: the predecessor's last listing row's ticker and
     exchange matched by the successor's earliest such row (as
     `store.master.build_chains`)."""
-    pairs = live_chains(conn, t)
+    pairs = stored_chains(conn, t) if stored else live_chains(conn, t)
     if not pairs:
         return _NO_CHAINS
     return LiveChains(dict(pairs), _hand_overs(conn, t, pairs))
@@ -1384,6 +1402,8 @@ def facts_as_of(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
     security_ids: Sequence[str] | None = None,
+    *,
+    every_stored_chain: bool = False,
 ) -> pl.DataFrame:
     """`facts` rows known by `t`: one per `(security_id, fact_name,
     as_of_date, class_member)`, the latest revision as of `t` (spec
@@ -1407,10 +1427,12 @@ def facts_as_of(
     later one only while no fact of the successor's own is known at `t` (the
     cut-off is that fact's `known_at`, not its date), so a subsidiary that
     keeps filing a nominal count is cut off by the successor's first own fact.
+    `every_stored_chain` applies the stored chains `refused_chains` refuses too
+    (#3097), for the ingest's resolver, whose rule 9 reads `stored_chains`.
     """
     t = _validate_t(t)
     partition = ", ".join(_FACT_KEY)
-    with _chains_registered(conn, t) as chains:
+    with _chains_registered(conn, t, stored=every_stored_chain) as chains:
         if chains:
             assert chains is not None
             params: list[Any] = [t]

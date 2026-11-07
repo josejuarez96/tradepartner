@@ -86,8 +86,10 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     ("costs.spread_bps", 0.0, 29),
     ("costs.impact_coeff", 0.0, 29),
     ("costs.adv_sessions", 20, 29),
-    # T187: the successor-chain keys (#821), ingest and health only; at their defaults no
-    # stored canonical set or fingerprint moves.
+    # T187: the successor-chain keys (#821), ingest and health, except
+    # `master.chain_window_sessions`, which the chain-aware reads also use to refuse a
+    # chain (#3097; `StoreProvider` refuses a run whose frozen value is not the live
+    # one); at their defaults no stored canonical set or fingerprint moves.
     ("master.chains", [], 31),
     ("master.chains_dismissed", [], 31),
     ("master.chain_window_sessions", 65, 31),

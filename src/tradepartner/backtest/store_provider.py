@@ -234,6 +234,17 @@ class StoreProvider:
                 f"ones ({frozen_settings.calendar!r}); tradepartner.calendar reads the live "
                 "ones, so this run would not use its frozen calendar"
             )
+        # #3097: the chain-aware store reads refuse a chain handed over beyond
+        # `master.chain_window_sessions`, read live (`store.asof.refused_chains`),
+        # so a run whose frozen window differs is refused like the calendar.
+        live_window = get_settings().master.chain_window_sessions
+        if frozen_settings.master.chain_window_sessions != live_window:
+            raise ValueError(
+                f"the live master.chain_window_sessions ({live_window}) differs from the "
+                f"trial's frozen one ({frozen_settings.master.chain_window_sessions}); the "
+                "chain-aware store reads use the live one, so this run would not use its "
+                "frozen chain window"
+            )
         self._connect = connect
         self.handle = handle
         self.settings = frozen_settings

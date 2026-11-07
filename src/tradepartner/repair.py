@@ -150,7 +150,7 @@ def store_resolver(
     its predecessor's span end and its first listing row."""
     at = ensure_tz_aware_utc(at, field_name="at")
     evidence = registrant_evidence(
-        facts_as_of(conn, at).iter_rows(named=True),
+        facts_as_of(conn, at, every_stored_chain=True).iter_rows(named=True),
         listing_ends_as_of(conn, at, settings).iter_rows(named=True),
         as_of=at.date(),
         quiet_after_days=settings.alpaca.registrant_quiet_days,
