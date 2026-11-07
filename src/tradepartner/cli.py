@@ -408,7 +408,6 @@ script over the real ones.
 from __future__ import annotations
 
 import dataclasses
-import gzip
 import json
 import re
 import subprocess
@@ -2450,20 +2449,6 @@ def _index_check_lines(report: idx.IndexCheckReport, code_version: str) -> list[
                 who = f"{n.row.ticker} ({n.row.security_id})"
                 lines.append(f"    {who}  c {_pct(n.row.contribution)}{r}{flags}")
     return lines
-
-
-def _assets_list(path: Path) -> list[dict[str, Any]]:
-    """The raw asset list in an Alpaca `GET /v2/assets` file: the recorder's
-    gzip JSON object (its `assets` key) or a plain JSON list."""
-    raw = path.read_bytes()
-    if raw[:2] == b"\x1f\x8b":
-        raw = gzip.decompress(raw)
-    document = json.loads(raw)
-    if isinstance(document, dict):
-        document = document.get("assets")
-    if not isinstance(document, list) or not all(isinstance(a, dict) for a in document):
-        raise ValueError("not an assets list")
-    return document
 
 
 def _census_sec_forms(
@@ -4841,7 +4826,7 @@ def make_app(
         listed = None
         if assets is not None:
             try:
-                listed = _assets_list(assets)
+                listed = bank_filers.read_assets_file(assets)
             except (OSError, ValueError) as exc:
                 raise _fail(f"--assets {assets}: {exc}", 1) from None
         filers = bank_filers.load_bank_filers()

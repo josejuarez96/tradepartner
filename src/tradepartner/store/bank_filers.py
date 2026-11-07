@@ -35,13 +35,16 @@ be free of look-ahead but would still keep every 2023 read without the bank.
 from __future__ import annotations
 
 import csv
+import gzip
 import io
+import json
 import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from importlib import resources
-from typing import Final
+from pathlib import Path
+from typing import Any, Final
 
 import duckdb
 
@@ -330,3 +333,18 @@ def candidates(
             continue
         found[symbol] = Candidate(symbol, name, exchange, str(asset.get("status") or ""))
     return tuple(found[s] for s in sorted(found))
+
+
+def read_assets_file(path: Path) -> list[dict[str, Any]]:
+    """The raw asset list in an Alpaca `GET /v2/assets` file: the recorder's
+    gzip JSON object (its `assets` key) or a plain JSON list. Raises
+    `ValueError` when the file holds neither."""
+    raw = path.read_bytes()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    document = json.loads(raw)
+    if isinstance(document, dict):
+        document = document.get("assets")
+    if not isinstance(document, list) or not all(isinstance(a, dict) for a in document):
+        raise ValueError("not an assets list")
+    return document
