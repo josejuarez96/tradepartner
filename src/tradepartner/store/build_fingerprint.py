@@ -19,7 +19,9 @@ from tradepartner.store import schema
 
 # Bump when a builder changes its derivation from unchanged inputs. Cache and
 # schema versions below are read from their owners at call time, never copied.
-BUILD_RULES_VERSION = 6  # 6: #3084, issuer HTML Form 25s and unit/comma class titles; 5: #3056
+# 7: #3076, issuer_class tags and rule 8 waits for a SIC or periodic report;
+# 6: #3084, issuer HTML Form 25s and unit/comma class titles; 5: #3056
+BUILD_RULES_VERSION = 7
 
 HASHED_SETTINGS_KEYS = (
     "benchmarks",
