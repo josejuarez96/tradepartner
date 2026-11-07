@@ -27,6 +27,7 @@ from tradepartner import gap as gap_module
 from tradepartner.backtest import store_provider as store_provider_module
 from tradepartner.backtest.provider import (
     DELISTING_REASON_COLUMNS,
+    LATE_SPLIT_COLUMNS,
     MERGER_EXIT_COLUMNS,
     STATEMENT_FACT_NAMES,
     DataProvider,
@@ -546,6 +547,94 @@ def test_unvalued_spin_offs_select_by_the_parent(store: Store) -> None:
     assert got.columns == ["security_id", "child", "ex_date", "reason"]
     assert got.equals(want.rename({"parent": "security_id"}))
     assert child_alone.is_empty()
+
+
+def test_late_splits_report_a_re_date_and_a_split_first_known_late(store: Store) -> None:
+    """#3096 on the fixture's splits. `SEC_SPLIT_REDATED` (2:1 ex 2019-06-10, known
+    06-07) is re-dated to 06-17 at 2019-06-12 21:00: a window opening at close(06-11)
+    undoes the 06-10 factor (0.5) and leaves 06-17, after that session, to the frame.
+    `SEC_SPLIT_REDATED_NOID`'s 2:1 ex 2019-10-14 is first known 10-18 22:00: late (2.0)
+    in the window after close(10-18), while the cancelled 10-21 row is past that
+    session. An on-time split and a window that sees no change report nothing."""
+    with store.provider() as provider:
+        redated = provider.late_splits(
+            session_close(date(2019, 6, 11)),
+            session_close(date(2019, 6, 14)),
+            ["SEC_SPLIT_REDATED"],
+        )
+        quiet = provider.late_splits(
+            session_close(date(2019, 6, 13)),
+            session_close(date(2019, 6, 14)),
+            ["SEC_SPLIT_REDATED"],
+        )
+        first_late = provider.late_splits(
+            session_close(date(2019, 10, 18)),
+            session_close(date(2019, 10, 21)),
+            ["SEC_SPLIT_REDATED_NOID", "SEC_SPLIT_REDATED"],
+        )
+        on_time = provider.late_splits(
+            session_close(date(2018, 12, 12)),
+            session_close(date(2018, 12, 14)),
+            ["SEC_SPLIT_PLAIN"],
+        )
+        not_asked = provider.late_splits(
+            session_close(date(2019, 6, 11)), session_close(date(2019, 6, 14)), ["SEC_SPLIT_PLAIN"]
+        )
+    assert redated.columns == list(LATE_SPLIT_COLUMNS)
+    assert redated.rows() == [("SEC_SPLIT_REDATED", date(2019, 6, 10), 0.5)]
+    assert first_late.rows() == [("SEC_SPLIT_REDATED_NOID", date(2019, 10, 14), 2.0)]
+    assert quiet.is_empty() and on_time.is_empty() and not_asked.is_empty()
+
+
+@pytest.mark.parametrize("on_both", [False, True])
+def test_late_splits_move_no_factor_when_a_chain_is_first_known_in_the_window(
+    tmp_path: Path, on_both: bool
+) -> None:
+    """#3096 on the chain overlay (0001000010 -> 0001000011, known 2020-02-07): a 2:1
+    split ex 2020-01-10, known in time on the predecessor (and, `on_both`, stored again
+    on the successor with no source id, one identity after the re-key), is the same
+    split at `t_prev` (before the chain) and at `t` (after it), so nothing is late. The
+    successor's own row wins a shared identity on both sides, never a 1/r."""
+    path = tmp_path / "chain_splits.duckdb"
+    settings = _settings(path)
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        load_universe_fixtures(conn, UNIVERSE_DIR)
+        load_chain_overlay(conn)
+        known = datetime(2020, 1, 9, 21, 30, tzinfo=UTC)
+        for sid in ["0001000010", "0001000011"] if on_both else ["0001000010"]:
+            insert_row(
+                conn,
+                "corporate_actions",
+                {
+                    "security_id": sid,
+                    "action_type": "split",
+                    "ex_date": date(2020, 1, 10),
+                    "ratio_or_amount": 2.0,
+                    "announced_at": None,
+                    "source_action_id": "",
+                    "cancelled": False,
+                    "known_at": known,
+                    "ingested_at": known,
+                    "source": "alpaca",
+                    "provenance": "action",
+                },
+            )
+    finally:
+        conn.close()
+    handle = _open_trial(settings, tmp_path)
+    with StoreProvider(_connect_to(settings), handle, settings) as provider:
+        late = provider.late_splits(
+            session_close(date(2020, 1, 31)), session_close(date(2020, 2, 28)), ["0001000011"]
+        )
+    assert late.is_empty()
+
+
+def test_late_splits_refuse_a_window_that_does_not_move_forward(store: Store) -> None:
+    with store.provider() as provider, pytest.raises(ValueError, match="not before"):
+        provider.late_splits(T_MAR, T_FEB, ["SEC_SPLIT_REDATED"])
 
 
 def test_late_spin_offs_are_keyed_by_parent_and_the_window(store: Store) -> None:

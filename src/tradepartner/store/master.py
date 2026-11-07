@@ -587,6 +587,75 @@ def _named_common_titles(title: str) -> tuple[str, ...]:
     return tuple(names)
 
 
+#: A listing title's tail naming the units (or SAIL securities) a class also
+#: trades inside: "Class A common stock included as part of the units" is a
+#: SPAC's common class, the shares themselves (#3084).
+_UNIT_COMPONENT = re.compile(
+    r"[\s,]*\b(?:included|includes)\s+(?:as\s+(?:a\s+)?part\s+of|in)\s+"
+    r"(?:the\s+|each\s+)?(?:units?\b|sail\S*\s+securities\b).*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+#: `_NOT_COMMON_WORDS` at a word start ("Community Bancorp" names no unit),
+#: plus the words of other classes that describe themselves against common
+#: stock ("Preference Shares, convertible into Common Stock", "Subscription
+#: Receipts, each exchangeable for one common share", EDGAR's "Depository").
+#: Read by `_form25_title` only; `_NOT_COMMON_WORDS` is unchanged.
+_OTHER_CLASS_WORD = re.compile(
+    r"\b(?:"
+    + "|".join(
+        (
+            *_NOT_COMMON_WORDS,
+            "preference",
+            "depository",
+            "exchangeable",
+            "convertible",
+            "receipt",
+            "subscription",
+            "option",
+            "bond",
+            "trust",
+            "interest",
+        )
+    )
+    + ")",
+    re.IGNORECASE,
+)
+#: A title that is a company name or par value, then a class name:
+#: "HD Supply Holdings, Inc. common stock, par value ...", "ShockWave Medical
+#: Inc., common stock ...", "$.01 Par Value, Common Stock". The head holds at
+#: most one comma and ends in a legal suffix or a par value; `rest` starts
+#: with the class name itself.
+_NAME_THEN_CLASS = re.compile(
+    r"\A(?P<head>[^,]*?(?:,[^,]*?)?\b(?:inc|incorporated|corp|corporation|co|company|"
+    r"ltd|limited|llc|plc|holdings|group|bancorp|par\s+value|no\s+par)\.?)\s*,?\s+"
+    r"(?P<rest>(?:(?:class|series)\s+[a-z0-9]{1,2}\s+)?(?:common|ordinary|capital\s+stock)"
+    r"\b.*)\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _form25_title(title: str) -> str:
+    """`title` as Form 25 class matching reads it (#3084), never as a
+    class's identity (`_norm_title`, which names ids, is unchanged):
+
+    - a unit-component tail is dropped ("Class A common stock included as
+      part of the units" reads "Class A common stock");
+    - a title naming no other class (`_OTHER_CLASS_WORD`) whose head before
+      the first comma names no common equity reads from its class name only
+      when the head is a company name or a par value (`_NAME_THEN_CLASS`).
+      A description after a comma ("Shares, convertible into Common Stock")
+      is never read as the class.
+
+    Anything else is returned as it is."""
+    cut = _UNIT_COMPONENT.sub("", title)
+    if _is_common(cut) or _OTHER_CLASS_WORD.search(cut):
+        return cut
+    match = _NAME_THEN_CLASS.match(cut.strip())
+    return match.group("rest") if match else cut
+
+
 def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) -> tuple[K, ...]:
     """The keys of `classes` (each class listed on the Form 25's exchange,
     with its titles there; `None` is an untitled row) that a Form 25
@@ -606,7 +675,27 @@ def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) 
        exact title match gives, never a guessed class); failing that, for a
        plain-common title naming at most one class, the one class whose
        titles are all plain common.
-    Anything else is `()`: never a guess."""
+    Anything else is `()`: never a guess.
+
+    4. Only when 1-3 resolve nothing, 1-3 again with every title, the
+       filing's and the classes', read through `_form25_title` (#3084), so
+       a filing resolved today keeps exactly its classes."""
+    found = _form25_classes_read(title, classes)
+    if found:
+        return found
+    return _form25_classes_read(
+        _form25_title(title),
+        {
+            key: [None if t is None else _form25_title(t) for t in titles]
+            for key, titles in classes.items()
+        },
+    )
+
+
+def _form25_classes_read[K](
+    title: str, classes: Mapping[K, Collection[str | None]]
+) -> tuple[K, ...]:
+    """`_form25_classes`' rules 1-3 over the titles as given."""
 
     def by_title(name: str) -> list[K]:
         return [
