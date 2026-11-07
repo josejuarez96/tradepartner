@@ -2200,6 +2200,66 @@ def test_paper_defaults() -> None:
     assert p.max_universe_drop_fraction == pytest.approx(0.5)
 
 
+def test_paper_exam_keys_default_to_the_pinned_values() -> None:
+    """ADR 0016 amendment 2026-11-07 (#3143, T381): the group-sequential exam's five keys."""
+    p = _settings().paper
+    assert p.exam_looks_months == [12, 24, 36]
+    assert p.exam_bounds == [4.762, 3.367, 2.750]
+    assert p.exam_futility_months == 6
+    assert p.exam_max_count == 4
+    assert p.exam_min_insample_skew == -0.85
+    # T381a freezes them into exam windows only; they are not req 14's keys.
+    assert not {
+        "exam_looks_months",
+        "exam_bounds",
+        "exam_futility_months",
+        "exam_max_count",
+        "exam_min_insample_skew",
+    } & set(FROZEN_PAPER_KEYS)
+
+
+@pytest.mark.parametrize(
+    ("override", "names"),
+    [
+        ({"exam_looks_months": [12, 24]}, "exam_looks_months"),
+        ({"exam_looks_months": [12, 24, 48]}, "exam_looks_months"),
+        ({"exam_looks_months": [6, 12, 24, 36]}, "exam_looks_months"),
+        ({"exam_looks_months": [24, 12, 36]}, "exam_looks_months"),
+        ({"exam_bounds": [4.761, 3.367, 2.750]}, "exam_bounds at month 12"),
+        ({"exam_bounds": [4.762, 3.366, 2.750]}, "exam_bounds at month 24"),
+        ({"exam_bounds": [4.762, 3.367, 2.749]}, "exam_bounds at month 36"),
+        ({"exam_bounds": [4.762, 3.367]}, "one bound per look"),
+        ({"exam_bounds": [4.762, 3.367, 2.750, 2.0]}, "one bound per look"),
+        ({"exam_futility_months": 5}, "exam_futility_months"),
+        ({"exam_futility_months": 12}, "exam_futility_months"),
+        ({"exam_max_count": 5}, "exam_max_count"),
+        ({"exam_min_insample_skew": -0.851}, "exam_min_insample_skew"),
+        ({"exam_min_insample_skew": -1.0}, "exam_min_insample_skew"),
+    ],
+)
+def test_paper_exam_keys_refuse_a_looser_exam(override: dict[str, object], names: str) -> None:
+    """The exam can be made stricter in config, never looser (ADR 0016, #3143)."""
+    with pytest.raises(ValidationError, match=names):
+        Settings(_env_file=None, paper=override)
+
+
+def test_paper_exam_keys_accept_a_stricter_exam() -> None:
+    """Higher bounds, a smaller budget and a higher skew guard are all stricter."""
+    stricter = {
+        "exam_bounds": [5.0, 3.367, 3.0],
+        "exam_max_count": 2,
+        "exam_min_insample_skew": -0.5,
+    }
+    p = Settings(_env_file=None, paper=stricter).paper
+    assert p.exam_bounds == [5.0, 3.367, 3.0]
+    assert p.exam_max_count == 2
+    assert p.exam_min_insample_skew == -0.5
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, paper={"exam_max_count": -1})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, paper={"exam_bounds": [float("inf"), 3.367, 2.750]})
+
+
 def test_paper_tracking_rule_residual_accepted_and_others_rejected() -> None:
     assert Settings(_env_file=None, paper={"tracking_rule": "raw"}).paper.tracking_rule == "raw"
     assert Settings(_env_file=None, paper={"tracking_rule": "residual"}).paper.tracking_rule == (
