@@ -50,9 +50,11 @@ def test_every_listed_setting_changes_hash(key: str) -> None:
 # Pinned from main (before #2826 added `edgar.statement_fact_units`), then
 # re-pinned for #2929's `BUILD_RULES_VERSION` 3, then #2941's 4, then T198's
 # flip of `edgar.cover_split_contexts` and `edgar.class_member_link` with
-# `FSN_VERSION` and `COVER_VERSION` 7, then #3012's move of the two Form 4
-# routing keys out of the hash (before T324 seeds the real store).
-MAIN_DEFAULT_HASH = "25787f107f02307835b8dac650b438acfd749a7ee59771c08e50d6a35f64545a"
+# `FSN_VERSION` and `COVER_VERSION` 7, then #2490's `CURRENT_SCHEMA_VERSION` 47
+# (`resume_invocations.book_id`; at 46 the hash is still da136ce7...785df1), then
+# #3012's move of the two Form 4 routing keys out of the hash (before T324 seeds
+# the real store).
+MAIN_DEFAULT_HASH = "2ec557a1c26b0424c22e3fef1df989904cd10bb0eba38853287974661f01a3d2"
 
 
 def test_hash_at_defaults_equals_the_hex_pinned_from_main() -> None:
