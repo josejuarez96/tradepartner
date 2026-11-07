@@ -470,15 +470,20 @@ def test_high_water_mark_is_the_maximum_of_runs_parent_and_today_with_the_v_floo
     assert mark(lab_store, "momentum", n_trials_today=50, sharpe_variance_annual_today=0.0001) == (
         pytest.approx(today)
     )
+    # An undefined V (fewer than two pairs) is the window's null variance instead,
+    # 12 / 40 monthly periods, above the stored floor (#3127).
+    rules = lab_registry.family_rules(lab_store, "momentum")
+    assert rules is not None
+    assert lab_registry.family_v_floor(rules) == pytest.approx(12 / 40)
     assert mark(lab_store, "momentum", n_trials_today=50, sharpe_variance_annual_today=None) == (
-        pytest.approx(today)
+        pytest.approx(expected_max_sharpe(50, 12 / 40))
     )
     # Above the floor, today's V is used as given.
     assert mark(lab_store, "momentum", n_trials_today=50, sharpe_variance_annual_today=1.0) == (
         pytest.approx(expected_max_sharpe(50, 1.0))
     )
     # The parent's seed wins over a small today.
-    assert mark(lab_store, "momentum", n_trials_today=2, sharpe_variance_annual_today=None) == 0.25
+    assert mark(lab_store, "momentum", n_trials_today=2, sharpe_variance_annual_today=0.01) == 0.25
     assert mark(lab_store, "momentum", n_trials_today=0, sharpe_variance_annual_today=None) == 0.25
     # Every sweep_runs row of every sweep in the family; open rows and other families ignored.
     first = _sweep(lab_store, settings, "a")
@@ -851,8 +856,14 @@ def _public_functions() -> set[str]:
     }
 
 
+#: Public functions of a `FamilyRules` row that take no connection (#3127).
+_PURE = frozenset({"family_v_floor", "floored_variance"})
+
+
 def test_every_public_function_is_covered_by_the_not_initialised_case() -> None:
-    assert set(_CALLS) == _public_functions()
+    assert set(_CALLS) | _PURE == _public_functions()
+    for name in _PURE:
+        assert "conn" not in inspect.signature(getattr(lab_registry, name)).parameters
 
 
 @pytest.mark.parametrize("name", sorted(_CALLS))
