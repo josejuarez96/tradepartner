@@ -2802,6 +2802,127 @@ class TestFirstSpanLead:
         assert resolver.report.first_span_refused == 0
 
 
+class TestClassFirstSpanLead:
+    """#3080 (#3053 item 8): a class id (`<cik>:<class>`) gets its own
+    `securities` row only when a cover page first names its class, so its
+    first session is its first span's start and the #974 lead had an empty
+    window. A class that is its company's only equity id leads from its
+    company's first session. A BLNK-shaped case: Blink Charging's bare CIK
+    files from 2008, lists on NASDAQ 2018-02-14, and its first cover page
+    (2021-08-13) names `BLNK` (Common Stock, the class id) and `BLNKW`
+    (warrants, the bare id)."""
+
+    CIK = "0001429764"
+    CLASS = "0001429764:common-stock"
+    COMPANY_FIRST = date(2008, 3, 18)
+    COVER = date(2021, 8, 13)
+    DAYS: ClassVar[list[date]] = [
+        date(2018, 6, 1),
+        date(2019, 6, 3),
+        date(2021, 8, 12),
+        date(2021, 8, 13),
+        date(2021, 8, 16),
+    ]
+    OTHER = "0000000099"
+
+    def _listings(self, *extra: dict[str, object]) -> list[dict[str, object]]:
+        return [
+            _listing(self.CIK, "BLNKW", self.COVER, "Common Stock Purchase Warrants"),
+            _listing(self.CLASS, "BLNK", self.COVER, "Common Stock"),
+            *extra,
+        ]
+
+    def _sessions(self, **extra: date) -> dict[str, date]:
+        return {self.CIK: self.COMPANY_FIRST, self.CLASS: self.COVER, **extra}
+
+    def _resolver(
+        self, *extra: dict[str, object], sessions: Mapping[str, date] | None = None
+    ) -> ListingResolver:
+        return ListingResolver(
+            self._listings(*extra),
+            first_sessions=self._sessions() if sessions is None else sessions,
+        )
+
+    def _payload(self) -> dict[str, Any]:
+        return {
+            "feed": "sip",
+            "bars": {"BLNK": [_row(d, 10.0 + i) for i, d in enumerate(self.DAYS)]},
+        }
+
+    def test_the_only_equity_class_leads_from_its_companys_first_session(self) -> None:
+        resolver = self._resolver()
+        lead = resolver.first_span_lead(self.CLASS)
+        assert lead is not None
+        assert (lead.ticker, lead.start, lead.end) == ("BLNK", self.COMPANY_FIRST, self.COVER)
+        parsed = parse_bars(self._payload(), resolver.resolve, resolver.lead)
+        assert [(b.security_id, b.session) for b in parsed.bars] == [
+            (self.CLASS, d) for d in self.DAYS
+        ]
+        for bar in parsed.bars:
+            assert bar.known_at == bar_known_at(bar.session)  # no record stamped early
+        assert resolver.report.first_span_leads == 1
+        # The warrants' bare id holds no equity span: it leads nothing.
+        assert resolver.first_span_lead(self.CIK) is None
+
+    def test_no_lead_before_the_companys_first_session(self) -> None:
+        resolver = self._resolver()
+        assert resolver.lead("BLNK", date(2008, 3, 17)) is None
+        assert resolver.lead("BLNK", self.COMPANY_FIRST) == self.CLASS
+
+    def test_a_company_row_unknown_at_the_run_gives_no_lead(self) -> None:
+        # No look-ahead: `first_sessions` holds only the rows known at the
+        # run (`repair.first_sessions`); without the company's row the class
+        # keeps its own first session, which equals its span start.
+        resolver = self._resolver(sessions={self.CLASS: self.COVER})
+        assert resolver.first_span_lead(self.CLASS) is None
+        assert resolver.lead("BLNK", date(2019, 6, 3)) is None
+
+    def test_an_own_earlier_first_session_still_wins(self) -> None:
+        own = date(2005, 1, 3)
+        resolver = self._resolver(sessions=self._sessions(**{self.CLASS: own}))
+        lead = resolver.first_span_lead(self.CLASS)
+        assert lead is not None and lead.start == own
+
+    def test_the_lead_never_changes_what_resolve_says(self) -> None:
+        with_lead = self._resolver()
+        without = self._resolver(sessions={self.CLASS: self.COVER})
+        sessions = [date(y, m, 3) for y in range(2007, 2023) for m in (1, 4, 7, 10)]
+        for ticker in ("BLNK", "BLNKW"):
+            for session in [*sessions, *self.DAYS]:
+                assert with_lead.resolve(ticker, session) == without.resolve(ticker, session)
+
+    def test_a_company_with_another_equity_id_gets_no_company_lead(self) -> None:
+        # The bare id traded under an earlier ticker (a rename across two
+        # ids of one company): leading the class id back would copy the
+        # renamed history onto a second id. Fail closed: own rule only.
+        resolver = self._resolver(_listing(self.CIK, "CCGI", date(2019, 8, 1), "Common Stock"))
+        assert resolver.first_span_lead(self.CLASS) is None
+        assert resolver.lead("BLNK", date(2019, 6, 3)) is None
+
+    def test_a_sibling_class_blocks_the_company_lead(self) -> None:
+        sibling = f"{self.CIK}:class-b-common-stock"
+        resolver = self._resolver(_listing(sibling, "BLNKB", self.COVER, "Class B Common Stock"))
+        assert resolver.first_span_lead(self.CLASS) is None
+
+    def test_a_repair_successor_of_the_company_blocks_the_company_lead(self) -> None:
+        successor = f"{self.CIK}@2023-01-03"
+        resolver = self._resolver(_listing(successor, "BLNK2", date(2023, 1, 3), "Common Stock"))
+        assert resolver.first_span_lead(self.CLASS) is None
+
+    def test_another_companys_unrelated_id_never_blocks(self) -> None:
+        resolver = self._resolver(_listing(self.OTHER, "OTHR", date(2015, 1, 2), "Common Stock"))
+        lead = resolver.first_span_lead(self.CLASS)
+        assert lead is not None and lead.start == self.COMPANY_FIRST
+
+    def test_a_reused_ticker_still_refuses_the_whole_lead(self) -> None:
+        resolver = self._resolver(
+            _listing(self.OTHER, "BLNK", date(2012, 1, 3), "Common Stock"),
+            _listing(self.OTHER, "OTHR", date(2014, 1, 2), "Common Stock"),
+        )
+        assert resolver.first_span_lead(self.CLASS) is None
+        assert resolver.report.first_span_refused == 1
+
+
 class TestSuccessorDuplicate:
     """#874: a repair successor (`<cik>@<date>`, #826) whose row duplicates
     its predecessor's (same ticker, same `valid_from`) holds the ticker;
