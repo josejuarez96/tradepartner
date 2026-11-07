@@ -74,7 +74,10 @@ reported once, under the first rule it fails:
    included. An out-of-line fact is
    *explained*, and accepted as the new baseline, when an event known at
    `t` lies between its baseline's `as_of_date` and its own (#1682, T190):
-   a `spinoff` action whose child is this security.
+   a `spinoff` action whose child is this security. A fact dated before a
+   split's `ex_date` but accepted on or after it, whose value is closer to
+   the split-moved count than to the unmoved one, is read as already split
+   (#3055, `universe.shares_split_dating`): rule 8 never splits it twice.
 8. `size`: companies (one `cik`) with a class that passed rules 1-7,
    ranked by market cap; the top `universe.top_n_by_cap` kept, and each of
    their classes that passed rules 1-7 admitted. A class's cap is its
@@ -128,6 +131,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from functools import cache
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import duckdb
 import polars as pl
@@ -211,6 +215,20 @@ SHARES_OUTLIER_SCHEMA: dict[str, Any] = {
 }
 #: `SharesPick.fallbacks` and `Universe.shares_fallbacks`: the rejected latest
 #: fact (`as_of_date`, `value`, `ratio`) and the accepted one used instead.
+#: `shares_cap_jumps`' columns (#3055).
+SHARES_CAP_JUMP_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "as_of_date": pl.Date,
+    "value": pl.Float64,
+    "close_session": pl.Date,
+    "close": pl.Float64,
+    "cap": pl.Float64,
+    "prev_as_of": pl.Date,
+    "prev_cap": pl.Float64,
+    "next_as_of": pl.Date,
+    "next_cap": pl.Float64,
+}
+
 SHARES_FALLBACK_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "as_of_date": pl.Date,
@@ -560,6 +578,10 @@ def _first_bar_sessions(
     return {str(sid): session for sid, session in rows}
 
 
+#: The acceptance day of a shares fact is its New York calendar day (#3055).
+_NEW_YORK = ZoneInfo("America/New_York")
+
+
 def shares_as_of(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -609,6 +631,15 @@ def shares_as_of(
     pre-trading registration counts no longer out-rank every later true fact,
     without moving a normal pre-listing fact at a historical `t`.
 
+    Split dating (#3055, `universe.shares_split_dating`): before the ratio
+    test, a fact with a baseline, accepted (its New York day) on or after the
+    `ex_date` of splits known at `t` dated after its `as_of_date`, whose log
+    ratio over the split-moved baseline is closer to the product of those
+    splits than to 0, already carries them (SHW's 2021-03-31 count filed after
+    its 2021-04-01 split): its value is divided by that product, so rule 8's
+    move gives back the filed count. A first fact, a fact accepted before the
+    ex-date and a pre-split count stay as filed.
+
     The latest date decides: ambiguous, its own value when accepted, else
     the last accepted fact. Only facts, splits, spin-offs, listings and
     securities known at `t` are read, never a later filing.
@@ -629,6 +660,12 @@ def shares_as_of(
             spinoffs[action["security_id"]].append(action["ex_date"])
     titles = _class_titles(conn, t, sorted(rows))
     first_bars = _first_bar_sessions(conn, t, sorted(rows))
+    accepted_on: dict[str, dict[date, date]] = defaultdict(dict)
+    for sid, sid_rows in rows.items():
+        for row in sid_rows:
+            day = row["known_at"].astimezone(_NEW_YORK).date()
+            held = accepted_on[sid].get(row["as_of_date"])
+            accepted_on[sid][row["as_of_date"]] = day if held is None else max(held, day)
 
     def explained(sid: str, after: date, through: date) -> bool:
         """A spin-off known at `t` with `sid` as its child, its `ex_date` in
@@ -649,6 +686,26 @@ def shares_as_of(
                 moved *= ratio
         change = value / moved if moved > 0 else float("inf")
         return None if 1 / cfg.max_shares_ratio <= change <= cfg.max_shares_ratio else change
+
+    def split_dated(sid: str, earlier: tuple[date, float], as_of: date, value: float) -> float:
+        """`value` read as already split (#3055): divided by the product of the
+        splits known at `t` with `as_of < ex_date <=` the fact's acceptance day
+        (New York), when its log ratio over `earlier` (split-moved to `as_of`) is
+        closer to that product's than to 0. Otherwise `value` unchanged."""
+        accepted = accepted_on[sid].get(as_of)
+        if accepted is None:
+            return value
+        straddling: float = 1
+        moved = earlier[1]
+        for ex_date, ratio in splits.get(sid, []):
+            if as_of < ex_date <= accepted:
+                straddling *= ratio
+            elif earlier[0] < ex_date <= as_of:
+                moved *= ratio
+        if straddling == 1 or not (straddling > 0 and math.isfinite(straddling)) or moved <= 0:
+            return value
+        change = math.log(value / moved)
+        return value / straddling if abs(change - math.log(straddling)) < abs(change) else value
 
     def seed_dates(sid: str, picks: dict[date, float | None], first_bar: date | None) -> set[date]:
         """The dates of the pre-trading seeds to skip (T190b): every share
@@ -711,6 +768,8 @@ def shares_as_of(
             if base is None:
                 base, latest_ok = (as_of, value), True
                 continue
+            if cfg.shares_split_dating:
+                value = split_dated(sid, base, as_of, value)
             change = in_line(sid, base, as_of, value)
             owner_ok = (sid, as_of) in accepted_list
             reanchored = False
@@ -763,6 +822,101 @@ def shares_as_of(
         ),
         fallbacks=pl.DataFrame(fallbacks, schema=SHARES_FALLBACK_SCHEMA).sort("security_id"),
     )
+
+
+def shares_cap_jumps(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
+) -> pl.DataFrame:
+    """The shares cap-jump review list at `t` (#3055), `SHARES_CAP_JUMP_SCHEMA`.
+
+    Per security, rule 7's per-date picks (`_date_picks`: an ambiguous date and
+    a value that is not a positive share count are left out) of the
+    `shares_outstanding` facts known at `t`, each with its implied cap: the
+    value times the raw close of the last traded bar known at `t` on or before
+    its `as_of_date`, at most `health.shares_cap_close_days` before it (else no
+    cap, and the fact is skipped). A split moves the count and the close
+    together, so the cap does not move with it; a mis-dated, halved or
+    mis-scaled count does. The walk keeps a baseline, the first fact: a fact
+    whose cap over the baseline's is within `health.shares_cap_jump_ratio`
+    (either way) becomes the baseline. One out of line is listed when the next
+    fact is out of line with it too (a value out of line with its neighbours:
+    WFC's A -> B -> A) or there is none (the latest, until one confirms the
+    level); when the next fact is in line with it, the level changed (a stock
+    merger) and it becomes the baseline unlisted. Report only; only facts,
+    bars and titles known at `t` are read.
+    """
+    t = _validate_t(t)
+    limit = math.log(settings.health.shares_cap_jump_ratio)
+    max_days = settings.health.shares_cap_close_days
+    rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in facts_as_of(conn, t, None).iter_rows(named=True):
+        if row["fact_name"] == SHARES_FACT:
+            rows[row["security_id"]].append(row)
+    titles = _class_titles(conn, t, sorted(rows))
+    picks = [
+        (sid, as_of, value)
+        for sid in sorted(rows)
+        for as_of, value in _date_picks(rows[sid], titles.get(sid, [])).items()
+        if value is not None and value > 0 and math.isfinite(value)
+    ]
+    empty = pl.DataFrame(schema=SHARES_CAP_JUMP_SCHEMA)
+    if not picks:
+        return empty
+    frame = pl.DataFrame(
+        picks,
+        schema={"security_id": pl.Utf8, "as_of_date": pl.Date, "value": pl.Float64},
+        orient="row",
+    )
+    conn.register("_cap_picks", frame.to_arrow())
+    try:
+        closes = conn.execute(
+            "WITH bars AS ("
+            "  SELECT security_id, session, close FROM ("
+            "    SELECT security_id, session, close, volume, row_number() OVER ("
+            "      PARTITION BY security_id, session ORDER BY known_at DESC"
+            "    ) AS _rn FROM prices_daily WHERE known_at <= ?"
+            "      AND security_id IN (SELECT DISTINCT security_id FROM _cap_picks)"
+            "  ) WHERE _rn = 1 AND volume > 0"
+            ") SELECT p.security_id, p.as_of_date, p.value, b.session AS close_session, b.close"
+            " FROM _cap_picks p ASOF LEFT JOIN bars b"
+            "   ON p.security_id = b.security_id AND p.as_of_date >= b.session",
+            [t],
+        ).fetchall()
+    finally:
+        conn.unregister("_cap_picks")
+    capped: dict[str, list[tuple[date, float, float, date, float]]] = defaultdict(list)
+    for sid, as_of, value, session, close in closes:
+        if session is None or close is None or not close > 0:
+            continue
+        if (as_of - session).days > max_days:
+            continue
+        capped[sid].append((as_of, value * close, value, session, close))
+    out: list[dict[str, Any]] = []
+    for sid in sorted(capped):
+        series = sorted(capped[sid])
+        prev = series[0]
+        for i, (as_of, cap, value, session, close) in enumerate(series[1:], start=1):
+            nxt = series[i + 1] if i + 1 < len(series) else None
+            if abs(math.log(cap / prev[1])) <= limit or (
+                nxt is not None and abs(math.log(nxt[1] / cap)) <= limit
+            ):
+                prev = series[i]  # in line, or a level the next fact confirms
+                continue
+            out.append(
+                {
+                    "security_id": sid,
+                    "as_of_date": as_of,
+                    "value": value,
+                    "close_session": session,
+                    "close": close,
+                    "cap": cap,
+                    "prev_as_of": prev[0],
+                    "prev_cap": prev[1],
+                    "next_as_of": nxt[0] if nxt else None,
+                    "next_cap": nxt[1] if nxt else None,
+                }
+            )
+    return pl.DataFrame(out, schema=SHARES_CAP_JUMP_SCHEMA) if out else empty
 
 
 def latest_shares_as_of(
