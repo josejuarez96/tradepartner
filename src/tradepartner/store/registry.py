@@ -2215,15 +2215,23 @@ def _counted_pairs(
     digests = _outcome_digests(conn, [int(row[0]) for row in counted])
     latest: dict[tuple[str, date, datetime | None], tuple[int, float]] = {}
     series: set[tuple[object, ...]] = set()
+    # Many trials share a parameter set or a start: read each once (#3138's 10k-trial
+    # timing tests).
+    sets: dict[str, tuple[str, Cadence, float]] = {}
+    firsts: dict[tuple[date, Cadence], date] = {}
     for trial_id, params_json, start, cutoff, vintage, code, dirty in counted:
-        params = json.loads(params_json)
-        cadence = frozen_values(_Stored(params, family))[CADENCE_KEY]
-        pair = (
-            _canonical_set_hash(params, family),
-            _first_rebalance_on_or_after(start, cadence),
-            cutoff,
-        )
-        latest[pair] = (trial_id, float(params[BASE_COST_KEY]))
+        if params_json not in sets:
+            params = json.loads(params_json)
+            sets[params_json] = (
+                _canonical_set_hash(params, family),
+                frozen_values(_Stored(params, family))[CADENCE_KEY],
+                float(params[BASE_COST_KEY]),
+            )
+        set_hash, cadence, base = sets[params_json]
+        if (start, cadence) not in firsts:
+            firsts[start, cadence] = _first_rebalance_on_or_after(start, cadence)
+        pair = (set_hash, firsts[start, cadence], cutoff)
+        latest[pair] = (trial_id, base)
         digest = digests.get(int(trial_id))
         known = vintage is not None and code is not None and dirty is False and digest
         stamps = (vintage, code, digest) if known else (trial_id,)
