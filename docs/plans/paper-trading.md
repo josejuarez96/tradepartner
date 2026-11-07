@@ -413,6 +413,7 @@ The journal tables are additive: the fact and registry tables are never touched.
   - `execution/run.py`: T204, T282c, T285, T370b, T371 (parked), T377 and T377b. T377b also edits `every_book_run`.
   - `tests/execution/test_run_core.py`: T282c, T377b.
   - `tests/test_cli_paper.py`: T266a2, T282c, T283c2, T288, T316a, T316b and T377b.
+  - `backtest/sweep_report.py` and `tests/backtest/test_sweep_report.py`: T329.
   - `docs/runbooks/owner-guide.md`: none.
 - **Smallest change:** no new order shape, no config key, no schema version.
 
