@@ -507,7 +507,14 @@ def ingest_openfigi(
                     # `BF/B`.
                     undotted = class_symbols.get(ticker, ticker).replace(".", "/")
                     prepared.append((sid, ticker, undotted))
-        responses.extend(mapping([job[2] for job in prepared], settings.openfigi, clock=clock))
+        responses.extend(
+            mapping(
+                [job[2] for job in prepared],
+                settings.openfigi,
+                api_key=settings.openfigi_api_key,
+                clock=clock,
+            )
+        )
 
     def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
         count = unmapped = errors = 0
