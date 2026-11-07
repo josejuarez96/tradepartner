@@ -177,10 +177,10 @@ jobs:
       # xdist: one worker per core with work stealing; each test gets its own tmp_path
       # (#581). The header prints the collected count; durations re-measure shard weights.
       # tests/dashboard is ignored only on the scope's explicit `no` (#3221); the bucketing
-      # then packs the remaining files across all shards. The Book page's kill action test
-      # (no AppTest; it guards the `paper kill` path) is named explicitly, so it always runs.
+      # then packs the remaining files across all shards. The Book page's kill-action test
+      # (it guards the `paper kill` path) lives in tests/execution, so it always runs.
       - name: Tests (this shard)
-        run: uv run pytest -n auto --dist worksteal --durations=0 --durations-min=1.0 ${{ needs.scope.outputs.dashboard-tests == 'no' && '--ignore=tests/dashboard tests tests/dashboard/test_book_actions.py' || '' }}
+        run: uv run pytest -n auto --dist worksteal --durations=0 --durations-min=1.0 ${{ needs.scope.outputs.dashboard-tests == 'no' && '--ignore=tests/dashboard' || '' }}
 
   # Required check name every piece of merge tooling reads literally: the `protect-main`
   # ruleset, scripts/ready_pr.py's `checks_state`, and scripts/merge_train.py's

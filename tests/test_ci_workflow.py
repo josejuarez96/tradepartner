@@ -228,15 +228,15 @@ def test_a_pr_missing_the_dashboard_ignores_tests_dashboard_and_every_push_runs_
     shard = text[text.index("\n  pytest-shard:\n") : text.index("\n  checks:\n")]
     assert (
         "run: uv run pytest -n auto --dist worksteal --durations=0 --durations-min=1.0 "
-        "${{ needs.scope.outputs.dashboard-tests == 'no' && "
-        "'--ignore=tests/dashboard tests tests/dashboard/test_book_actions.py' || '' }}"
+        "${{ needs.scope.outputs.dashboard-tests == 'no' && '--ignore=tests/dashboard' || '' }}"
     ) in shard
     assert text.count("--ignore=") == 1
 
 
 def test_the_kill_action_test_still_gates_every_pr() -> None:
     """Safety review of #3221: the Book page's "Stop this book now" test guards the
-    `paper kill` path and uses no AppTest, so it is named past the ignore on every PR."""
-    kept = CI.parents[2] / "tests" / "dashboard" / "test_book_actions.py"
-    assert kept.is_file()
-    assert "AppTest" not in kept.read_text()
+    `paper kill` path, so it lives outside the tests/dashboard the PR shards ignore."""
+    tests = CI.parents[2] / "tests"
+    kept = tests / "execution" / "test_book_actions.py"
+    assert "from tradepartner.dashboard import book_actions" in kept.read_text()
+    assert not (tests / "dashboard" / "test_book_actions.py").exists()
