@@ -66,8 +66,8 @@ known at one instant:
 **Issuer class** (#3076, #3053 item 6, decision a). Each row also carries
 `issuer_class`, one tag read from the same instant's evidence, first match
 wins, independent of `security_type` (a BDC stays `fund` or `common`, an MLP
-`unit` or `common`; universe rule 1 reads the tag through
-`universe.exclude_issuer_classes`):
+`unit` or `common`; universe rule 1 is to read the tag through a
+per-hypothesis parameter, #3076 PR 2):
 
 - `spac`: the latest header SIC is 6770.
 - `bdc`: the issuer has elected business-development-company status (an

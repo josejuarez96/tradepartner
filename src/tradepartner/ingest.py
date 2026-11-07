@@ -1088,12 +1088,19 @@ def ingest_actions_backfill(
     clock: Callable[[], datetime] = utc_now,
     dry_run: bool = False,
     scan: Callable[[Sequence[Any], date, date], Mapping[str, Any]] | None = None,
+    name_changes_only: bool = False,
 ) -> IngestResult:
     """Scan spin-offs and name changes by process-date month, without symbols.
 
     Each month is an independent source chunk in mode ``actions``. A dry run
     fetches and reports each month while rolling its fact writes and run row
     back. The ordinary backfill resume cursor ignores this mode and status.
+
+    With `name_changes_only` (#3054) only name changes are asked, from
+    `alpaca.name_change_backfill_floor`: the stored changes are what lets a
+    renamed security's pre-rename symbol carry its splits and dividends
+    (`ListingResolver.action_alias`), and the spin-off and merger floor
+    (`alpaca.actions_backfill_floor`) stays where it is.
     """
     from alpaca.data.enums import CorporateActionsType
 
@@ -1104,10 +1111,14 @@ def ingest_actions_backfill(
 
     if isinstance(since, datetime) or not isinstance(since, date):
         raise TypeError("since must be a date")
-    if since < settings.alpaca.actions_backfill_floor:
+    floor = (
+        settings.alpaca.name_change_backfill_floor
+        if name_changes_only
+        else settings.alpaca.actions_backfill_floor
+    )
+    if since < floor:
         raise ValueError(
-            f"actions backfill starts at {settings.alpaca.actions_backfill_floor}; "
-            "earlier symbol-less coverage is unknown"
+            f"actions backfill starts at {floor}; earlier symbol-less coverage is unknown"
         )
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     through = through or now.astimezone(_NEW_YORK).date()
@@ -1115,11 +1126,15 @@ def ingest_actions_backfill(
         raise ValueError("through must be a date on or after since")
     fetch = scan or partial(alpaca_raw.corporate_actions_scan, settings=settings)
     types = (
-        CorporateActionsType.SPIN_OFF,
-        CorporateActionsType.NAME_CHANGE,
-        CorporateActionsType.CASH_MERGER,
-        CorporateActionsType.STOCK_MERGER,
-        CorporateActionsType.STOCK_AND_CASH_MERGER,
+        (CorporateActionsType.NAME_CHANGE,)
+        if name_changes_only
+        else (
+            CorporateActionsType.SPIN_OFF,
+            CorporateActionsType.NAME_CHANGE,
+            CorporateActionsType.CASH_MERGER,
+            CorporateActionsType.STOCK_MERGER,
+            CorporateActionsType.STOCK_AND_CASH_MERGER,
+        )
     )
 
     def run_month(first: date, last: date) -> SourceRun:
@@ -1137,6 +1152,7 @@ def ingest_actions_backfill(
                 process_end=last,
                 lag_days=settings.alpaca.actions_process_lag_days,
                 stock_rules=settings.alpaca,
+                backdated=resolver.backdated,  # #3054
             )
 
         def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
@@ -1156,6 +1172,7 @@ def ingest_actions_backfill(
             counts["actions_spinoff_revisions"] = parsed.spinoff_revisions
             counts["actions_spinoff_unordered"] = len(parsed.spinoff_unordered)
             counts["symbol_change_reused"] = parsed.symbol_change_reused
+            counts["symbol_change_backdated"] = parsed.symbol_change_backdated
             counts["symbol_change_conflict"] = parsed.symbol_change_conflict
             message = "; ".join(f"{key}={value}" for key, value in sorted(counts.items()))
             return (
