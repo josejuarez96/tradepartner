@@ -62,7 +62,8 @@ path's read, `paper resume`'s settlement). In order:
      the broker's (a feed ahead of `get_order`, or a fill re-issued under a
      new id); reconciliation sees either, an `excess` reading as a
      `bad_reading` mismatch naming the order (#3152). A non-finite
-     `filled_quantity` never journals a terminal event (#3162);
+     `filled_quantity` or `filled_avg_price` never journals a terminal event
+     (#3162, #3169);
    - the rejection verdicts (below);
    - one `fill_cursors` row for this invocation, whatever it found. Its
      `collected_through` is the latest `filled_at` seen, never earlier than
@@ -718,8 +719,12 @@ def _journal_terminals(
         gap = (reading.filled_quantity or 0.0) - quantity
         lagging, excess = gap > tolerance, -gap > tolerance
         # A non-finite reading (NaN gaps compare false) never journals a
-        # terminal event; reconciliation names it `bad_reading` (#3162).
-        finite = reading.filled_quantity is None or math.isfinite(reading.filled_quantity)
+        # terminal event; reconciliation names it `bad_reading` (#3162, and
+        # #3169 for the average price).
+        finite = all(
+            value is None or math.isfinite(value)
+            for value in (reading.filled_quantity, reading.filled_avg_price)
+        )
         terminal = reading.status in TERMINAL_STATUSES and finite and not (lagging or excess)
         if terminal:
             append(
