@@ -9,9 +9,11 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import duckdb
@@ -482,3 +484,92 @@ def test_a_reparse_that_adds_a_row_is_refused(rig: Rig) -> None:
 
 def raw_archive_conn(rig: Rig) -> AbstractContextManager[duckdb.DuckDBPyConnection]:
     return open_for_write(rig.settings)
+
+
+# --- repeat repairs (#3022) ---------------------------------------------------------
+
+
+def _wrong_parser(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Today's parser, made to read line 0's shares as 999 again: a later parser
+    change that restores a row's earlier value."""
+    real = raw_rederive.parse_form4
+
+    def parse(text: str) -> object:
+        parsed = real(text)
+        return SimpleNamespace(
+            transactions=tuple(
+                replace(t, shares=WRONG_SHARES["shares"]) if t.line_no == 0 else t
+                for t in parsed.transactions
+            )
+        )
+
+    monkeypatch.setattr(raw_rederive, "parse_form4", parse)
+
+
+def _write(rig: Rig) -> object:
+    dry = _run(rig)
+    n = len(dry.corrections)  # type: ignore[attr-defined]
+    return _run(rig, release=REL, expect=n, expect_digest=dry.digest)  # type: ignore[attr-defined]
+
+
+def test_a_repair_that_restores_an_earlier_value_can_be_repaired_again(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.form4_run(wrong=WRONG_SHARES)
+    rig.open_release()
+    _write(rig)  # 999 -> 10000
+    with monkeypatch.context() as patched:
+        _wrong_parser(patched)
+        (back,) = _write(rig).corrections  # type: ignore[attr-defined]
+        assert back.new == WRONG_SHARES  # 10000 -> 999: the writer's digest again
+
+    # The writer's entry was replaced by the first repair, so the row maps to the
+    # second repair alone, not to "more than one manifest entry".
+    dry = _run(rig)
+    (fix,) = dry.corrections  # type: ignore[attr-defined]
+    assert fix.new == {"shares": Decimal("10000")}
+    assert fix.matched.run_id == rig.runs()[-1][0]
+    _write(rig)  # 999 -> 10000 again: the first repair's digest again
+    again = _run(rig)
+    assert again.corrections == () and again.unchanged == 2  # type: ignore[attr-defined]
+
+
+def test_a_row_its_replaced_entry_alone_explains_is_refused(rig: Rig) -> None:
+    rig.form4_run(wrong=WRONG_SHARES)
+    rig.open_release()
+    _write(rig)
+    with raw_archive_conn(rig) as conn:  # an unrecorded write puts the old value back
+        conn.execute("UPDATE sec_form4_transactions SET shares = 999 WHERE line_no = 0")
+    _refused(rig, "no manifest entry wrote")
+
+
+def test_a_repaired_row_maps_only_under_its_writer_mode(rig: Rig) -> None:
+    rig.form4_run(wrong=WRONG_SHARES)  # mode backfill
+    rig.open_release()
+    _write(rig)
+    # Under another mode neither row maps: the repaired one no more than the other.
+    _refused(rig, "2 of 2 stored rows map to no single", mode="session")
+
+
+def test_each_bulk_zip_is_read_and_parsed_once(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    zipped = bulk_zip()
+    rig.form4_run(row_source=BULK_SOURCE, body=zipped, writer="edgar", wrong=WRONG_SHARES)
+    rig.form4_run(
+        run_id="run-2", row_source=BULK_SOURCE, body=zipped, writer="edgar", accession=BULK_ACC
+    )
+    reads: list[str] = []
+    real = raw_archive.read_body
+
+    def counted(settings: object, sha: str, icloud: object) -> bytes:
+        reads.append(sha)
+        return real(settings, sha, icloud)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(raw_archive, "read_body", counted)
+    result = _run(rig, accessions=[ACC, BULK_ACC])
+    assert reads == [hashlib.sha256(zipped).hexdigest()]
+    assert len(result.corrections) == 1  # type: ignore[attr-defined]
+
+
+def test_the_repair_mode_is_no_writer_mode(rig: Rig) -> None:
+    rig.form4_run()
+    _refused(rig, "not repair", mode="repair")
