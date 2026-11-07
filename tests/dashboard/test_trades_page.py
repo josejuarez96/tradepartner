@@ -9,7 +9,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from dashboard_nav import nav_calls_fixture  # noqa: F401
+from dashboard_nav import app_test, nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import Settings
@@ -78,9 +78,9 @@ def _data(*rows: blotter.BlotterRow) -> blotter.SessionBlotter:
 def _app(monkeypatch: pytest.MonkeyPatch, path: Path) -> AppTest:
     monkeypatch.setenv("STORE__PATH", str(path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(path.parent / "missing.env"))
-    at = AppTest.from_file(_APP).run()
+    at = app_test(_APP).run()
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Trades")
-    at.run(timeout=30)
+    at.run()
     return at
 
 
@@ -117,7 +117,7 @@ def test_default_book_and_newest_session_and_kpis(
     assert "last updated" in " ".join(c.value for c in at.caption)
 
     selector = next(box for box in at.selectbox if box.key == trades_page.BOOK_KEY)
-    selector.set_value("alpha").run(timeout=30)
+    selector.set_value("alpha").run()
     assert not at.exception
     assert calls[-1][0] != calls[0][0]
 
@@ -142,7 +142,7 @@ def test_older_session_changes_rows_and_missing_slippage_is_text(
     )
     at = _app(monkeypatch, path)
     selector = next(box for box in at.selectbox if box.key == trades_page.SESSION_KEY)
-    selector.set_value(_OLD).run(timeout=30)
+    selector.set_value(_OLD).run()
     assert not at.exception
     table = at.dataframe[0].value
     assert list(table.columns) == [

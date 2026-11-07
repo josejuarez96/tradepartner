@@ -20,7 +20,7 @@ import duckdb
 import polars as pl
 import pytest
 from conftest import load_universe_fixtures
-from dashboard_nav import nav_calls_fixture  # noqa: F401
+from dashboard_nav import app_test, nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner import health
@@ -89,7 +89,7 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path, now: datetime = T) -
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     monkeypatch.setattr(health_page, "_now", lambda: now)
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Data health")
-    at = AppTest.from_file(_APP_PATH, default_timeout=60)
+    at = app_test(_APP_PATH)
     at.run()
     return at
 
