@@ -563,7 +563,7 @@ def _mergers_card(report: HealthReport) -> None:
 
 
 def _delisting_reasons_card(report: HealthReport) -> None:
-    """The delisting-reason block (plan T329, #3215): its text lines, then the
+    """The delisting-reason block (plan T329, issue 3215): its text lines, then the
     unknown, conflicted and missing-consideration lists. Report only."""
     block = report.delisting_reasons
     if block is None:
