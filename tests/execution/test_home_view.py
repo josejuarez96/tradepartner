@@ -128,21 +128,57 @@ def _summary(book: str = "main", *, engaged: bool = False, **over: Any) -> Any:
     return SimpleNamespace(**{**fields, **over})
 
 
-def _need(kind: str, *, aged: bool = False) -> home_view.NeedsYou:
-    return home_view.NeedsYou("main", kind, "t", "s.", "a", aged=aged)
+def _need(kind: str, *, aged: bool = False, restricts: bool = False) -> home_view.NeedsYou:
+    return home_view.NeedsYou("main", kind, "t", "s.", "a", aged=aged, restricts=restricts)
 
 
 def test_an_open_break_is_amber_and_says_the_book_is_not_halted() -> None:
     # #2266 item 12: a book with only breaks is restricted, not halted
-    line = home_view._status(Settings(_env_file=None), (_summary(),), (_need("reconcile_break"),))
+    needs = (_need("reconcile_break", restricts=True),)
+    line = home_view._status(Settings(_env_file=None), (_summary(),), needs)
     assert line.level == "amber"
     assert "restricted" in line.text and "not halted" in line.text
 
 
 def test_an_aged_break_turns_the_status_line_red_without_calling_the_book_halted() -> None:
-    needs = (_need("reconcile_break", aged=True),)
+    needs = (_need("reconcile_break", aged=True, restricts=True),)
     line = home_view._status(Settings(_env_file=None), (_summary(),), needs)
     assert line.level == "red" and "halted" not in line.text.replace("not halted", "")
+
+
+@pytest.mark.parametrize("aged", [False, True])
+def test_a_break_that_restricts_nothing_never_says_trading_is_restricted(aged: bool) -> None:
+    # #3189 exec-4: an `unknown_symbol` break has no security, so it restricts no
+    # name; Home says so, as `paper status` does ("not restricted")
+    item = WaitingItem(
+        book_id="main",
+        kind="reconcile_break",
+        since=date(2026, 10, 1),
+        detail="RAW DETAIL",
+        command='tradepartner paper true-up --book main --break 1:ZZZ:2 --reason "<why>"',
+        aged=aged,
+        restricts=False,
+    )
+    needs = home_view._needs_you((item,), ())
+    (out,) = needs
+    assert not out.restricts and out.sentence.startswith("Nothing is restricted")
+    line = home_view._status(Settings(_env_file=None), (_summary(),), needs)
+    assert line.level == ("red" if aged else "amber")
+    assert "restricted" not in line.text
+    assert ("not halted" if aged else "trading is not affected") in line.text
+
+
+def test_a_break_that_restricts_its_name_says_so_on_the_item() -> None:
+    item = WaitingItem(
+        book_id="main",
+        kind="reconcile_break",
+        since=date(2026, 10, 1),
+        detail="RAW DETAIL",
+        command="tradepartner x",
+        restricts=True,
+    )
+    (out,) = home_view._needs_you((item,), ())
+    assert out.restricts and out.sentence.startswith("Trading in that name is restricted")
 
 
 def test_an_aged_break_item_carries_aged_and_the_true_up_command() -> None:
