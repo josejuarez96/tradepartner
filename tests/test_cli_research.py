@@ -1473,9 +1473,21 @@ def test_exposure_record_bad_value_is_echoed_scrubbed(tmp_path: Path, flag: str)
         ("corpus fetch departure-reason --since 2020-01-01 --cik", BAD),
         ("action-retract --security S --action-id A --reason r --expect-known-at", BAD),
         ("archive rederive --mode backfill --file-date", BAD),
+        ("hypothesis register", BAD),
+        ("sweep register", BAD),
+        ("experiment register", BAD),
+        ("research frame build departure-reason --as-of 2020-01-01T00:00:00+00:00 --corpus", BAD),
     ],
 )
 def test_cli_bad_value_is_echoed_scrubbed(command: str, bad: str) -> None:
     out = _cli(*command.split(), bad)  # _cli asserts the scrub finds no secret in the output
     assert out.exit_code == 2, out.output
     assert "<scrubbed>" in out.output, out.output
+
+
+def test_config_that_is_not_an_object_is_echoed_scrubbed(ready: int, tmp_path: Path) -> None:
+    config = tmp_path / f"{BAD}.json"
+    config.write_text("[]", encoding="utf-8")
+    out = _open(ready, config)  # _cli asserts the scrub finds no secret in the output
+    assert out.exit_code == 2, out.output
+    assert "must be a JSON object" in out.output and "<scrubbed>" in out.output

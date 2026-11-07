@@ -1147,7 +1147,7 @@ def _print_session_holes(report: HealthReport) -> None:
         )
 
 
-def _export(conn: duckdb.DuckDBPyConnection, out_dir: Path) -> list[str]:
+def _export(conn: duckdb.DuckDBPyConnection, out_dir: Path, settings: Settings) -> list[str]:
     tables = [
         row[0]
         for row in conn.execute(
@@ -1156,11 +1156,11 @@ def _export(conn: duckdb.DuckDBPyConnection, out_dir: Path) -> list[str]:
         ).fetchall()
     ]
     if out_dir.exists() and not out_dir.is_dir():
-        raise _fail(f"{out_dir} exists and is not a directory", 1)
+        raise _fail(_scrubbed(f"{out_dir} exists and is not a directory", settings), 1)
     targets = {table: out_dir / f"{table}.parquet" for table in tables}
     clash = sorted(str(p) for p in targets.values() if p.exists() or p.is_symlink())
     if clash:
-        raise _fail(f"refusing to overwrite: {', '.join(clash)}", 1)
+        raise _fail(_scrubbed(f"refusing to overwrite: {', '.join(clash)}", settings), 1)
     out_dir.mkdir(parents=True, exist_ok=True)
     for table, path in targets.items():
         name = table.replace('"', '""')
@@ -1522,7 +1522,7 @@ def _read_config(path: Path, settings: Settings) -> dict[str, Any]:
         message = f"--config {path}: not a readable JSON file ({exc})"
         raise _fail(_scrubbed(message, settings), USAGE_ERROR) from None
     if not isinstance(config, dict):
-        raise _fail(f"--config {path}: must be a JSON object", USAGE_ERROR)
+        raise _fail(_scrubbed(f"--config {path}: must be a JSON object", settings), USAGE_ERROR)
     return config
 
 
@@ -4041,7 +4041,7 @@ def make_app(
             raise missing
         try:
             with open_read_only(s) as conn:
-                tables = _export(conn, out_dir)
+                tables = _export(conn, out_dir, s)
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
         typer.echo(f"exported {len(tables)} tables to {out_dir}")
@@ -4148,7 +4148,7 @@ def make_app(
         if reason is not None and not reason.strip():
             raise _fail("--reason must not be blank", USAGE_ERROR)
         if not file.is_file():
-            raise _fail(f"no hypothesis file at {file}", USAGE_ERROR)
+            raise _input_fail(f"no hypothesis file at {file}", settings)
         decision_id: int | None = None
         try:
             with open_for_write(s) as conn:
@@ -4490,7 +4490,7 @@ def make_app(
         """Register a sweep file: its sweep row, one hypothesis per variant."""
         s = settings()
         if not file.is_file():
-            raise _fail(f"no sweep file at {file}", USAGE_ERROR)
+            raise _input_fail(f"no sweep file at {file}", settings)
         if (missing := _store_missing(s)) is not None:
             raise missing
         try:
@@ -4628,7 +4628,7 @@ def make_app(
         if not reason.strip():
             raise _fail("--reason must not be blank", USAGE_ERROR)
         if not file.is_file():
-            raise _fail(f"no hypothesis file at {file}", USAGE_ERROR)
+            raise _input_fail(f"no hypothesis file at {file}", settings)
         if (missing := _store_missing(s)) is not None:
             raise missing
         try:
@@ -4706,7 +4706,7 @@ def make_app(
         """Register an experiment file and print its registration and hashes."""
         s = settings()
         if not file.is_file():
-            raise _fail(f"no experiment file at {file}", USAGE_ERROR)
+            raise _input_fail(f"no experiment file at {file}", settings)
         try:
             parsed = parse_experiment_file(file, _experiments_dir(s), settings=s)
             with open_for_write(s) as conn:
@@ -5374,7 +5374,7 @@ def make_app(
         if t > ensure_tz_aware_utc(clock(), field_name="clock()"):
             raise _fail(f"--as-of {t.isoformat()} is in the future", USAGE_ERROR)
         if not corpus.is_file():
-            raise _fail(f"no corpus file at {corpus}", USAGE_ERROR)
+            raise _input_fail(f"no corpus file at {corpus}", settings)
         if (missing := _store_missing(s)) is not None:
             raise missing
         try:
@@ -5466,7 +5466,7 @@ def make_app(
                         "random draw"
                     )
             elif lock or extend is not None:
-                raise _fail(f"no gold session at {path} to lock or extend", USAGE_ERROR)
+                raise _input_fail(f"no gold session at {path} to lock or extend", settings)
             else:
                 if frame is None or seed is None or exclude is None or seeds is None:
                     raise _fail(
