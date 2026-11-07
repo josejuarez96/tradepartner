@@ -211,6 +211,11 @@ def parse_accepted_same_day_pair(entry: str) -> tuple[str, date]:
     return _parse_id_at_day(entry, "accepted same-day pair")
 
 
+#: `classifications.issuer_class` tags (`store.classify.ISSUER_CLASSES`, #3076).
+IssuerClass = Literal["spac", "bdc", "mlp", "foreign"]
+_DEFAULT_EXCLUDED_ISSUER_CLASSES: tuple[IssuerClass, ...] = ("bdc", "foreign", "mlp")
+
+
 class UniverseConfig(_ClosedConfig):
     """ADR 0006 universe-construction thresholds, rules 1-8, in order."""
 
@@ -219,6 +224,16 @@ class UniverseConfig(_ClosedConfig):
     # Rule 3, a per-hypothesis choice; default none (ADR 0006 amendment 2026-10-11,
     # #1540). Frozen in each registration (guard a); shape-checked below.
     exclude_sic_ranges: tuple[tuple[int, int], ...] = ()
+    # Rule 1's issuer classes (#3076, #3053 item 6): a security whose latest
+    # classification's `issuer_class` (`store.classify`, "Issuer class") is listed fails
+    # rule 1 whatever its `security_type`. A per-hypothesis choice: BDCs, MLPs and
+    # foreign filers are out of the default common-stock universe. The frozen-key table
+    # default is `[]` (`backtest/frozen.py`), the rule before #3076, so a registration
+    # stored without the key runs as it always did; a new registration freezes this
+    # live value. Stored sorted and without duplicates, so one set hashes one way.
+    exclude_issuer_classes: list[IssuerClass] = Field(
+        default_factory=lambda: list(_DEFAULT_EXCLUDED_ISSUER_CLASSES)
+    )
     min_price: float = 5
     # On since T3 (#84): historical bars come from the consolidated SIP feed, so the
     # 20-session median dollar volume is a real liquidity measure (IEX-only volume,
@@ -277,6 +292,11 @@ class UniverseConfig(_ClosedConfig):
         for entry in value:
             parse_accepted_same_day_pair(entry)
         return value
+
+    @field_validator("exclude_issuer_classes")
+    @classmethod
+    def _sorted_issuer_classes(cls, value: list[IssuerClass]) -> list[IssuerClass]:
+        return sorted(set(value))
 
     @field_validator("exclude_sic_ranges")
     @classmethod
