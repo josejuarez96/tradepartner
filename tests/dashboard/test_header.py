@@ -9,6 +9,7 @@ from pathlib import Path
 import duckdb
 import pytest
 from conftest import load_universe_fixtures
+from dashboard_nav import APPTEST_TIMEOUT_S
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.calendar import session_close
@@ -176,7 +177,7 @@ def test_render_writes_one_caption() -> None:
     at = AppTest.from_string(
         "from tradepartner.dashboard import header\n"
         "header.render_freshness(header.Freshness(None, None))\n",
-        default_timeout=30,
+        default_timeout=APPTEST_TIMEOUT_S,
     )
     at.run()
     assert [c.value for c in at.caption] == ["as of never · last updated never"]
