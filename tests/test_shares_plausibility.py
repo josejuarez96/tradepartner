@@ -1000,9 +1000,10 @@ def test_the_re_anchor_adds_no_frozen_universe_key(monkeypatch: pytest.MonkeyPat
     for name in list(os.environ):
         if name.upper().startswith("UNIVERSE__"):
             monkeypatch.delenv(name)
-    # `universe.rank_by` (T212) and `universe.shares_split_dating` (#3055) landed after this
-    # pin: the re-anchor adds none of its own.
-    later = {"universe.rank_by", "universe.shares_split_dating"}
+    # `universe.rank_by` (T212), `universe.shares_split_dating` (#3055) and
+    # `universe.exclude_issuer_classes` (#3076) landed after this pin: the re-anchor adds
+    # none of its own.
+    later = {"universe.rank_by", "universe.shares_split_dating", "universe.exclude_issuer_classes"}
     keys = [k for k in frozen_keys() if k.startswith("universe.") and k not in later]
     assert keys == list(UNIVERSE_FROZEN)
     params = frozen_params_of(
