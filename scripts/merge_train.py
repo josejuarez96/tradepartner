@@ -50,8 +50,8 @@ CLASS_A_PREFIXES = (
 )
 #: Files under a class-A prefix that are class B anyway: the family registry
 #: (`FAMILIES`, `FAMILY_PARENTS`), whose root-or-child call for a new family is the
-#: owner's (strategy-lab spec open question 11; #3126). CLAUDE.md rule 1 is amended
-#: to match by the owner.
+#: owner's (strategy-lab spec open question 11; #3126). CLAUDE.md rule 1 is to be
+#: amended by the owner to match.
 CLASS_B_PATHS = ("src/tradepartner/config_backtest.py",)
 #: Every train comment's first line starts with this.
 COMMENT_PREFIX = "merge-train:"
