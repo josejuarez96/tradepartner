@@ -90,9 +90,10 @@ def test_the_amount_is_the_stored_double_exactly() -> None:
 
 
 def test_the_committed_list_pins_its_counts() -> None:
-    """195 groups (183 at the amendment, 10 by #1666, 2 by #1720): a later edit is deliberate."""
+    """195 groups (183 at the amendment, 10 by #1666, 2 by #1720): a later edit is
+    deliberate. #3054 settled STX 2021-05-11 as a duplicate (was unresolved)."""
     groups = reviewed_groups()
-    assert Counter(g.verdict for g in groups) == {"duplicate": 180, "distinct": 12, "unresolved": 3}
+    assert Counter(g.verdict for g in groups) == {"duplicate": 181, "distinct": 12, "unresolved": 2}
     assert all(g.evidence for g in groups)
     assert min(g.ex_date for g in groups) == date(2019, 6, 27)
     assert max(g.ex_date for g in groups) == date(2026, 10, 15)
@@ -109,7 +110,7 @@ def test_the_committed_list_pins_its_counts() -> None:
         ("F", date(2025, 2, 18), 0.15, "distinct"),
         ("CHRD", date(2023, 11, 13), 1.25, "distinct"),
         ("MKTW", date(2025, 8, 15), 0.2, "distinct"),
-        ("STX", date(2021, 5, 11), 0.67, "unresolved"),
+        ("STX", date(2021, 5, 11), 0.67, "duplicate"),
     ],
 )
 def test_the_issues_named_cases_read_as_listed(
@@ -119,6 +120,16 @@ def test_the_issues_named_cases_read_as_listed(
         g for g in reviewed_groups() if (g.ticker, g.ex_date, g.amount) == (ticker, ex_date, amount)
     ]
     assert group.verdict == verdict
+
+
+def test_stx_2021_05_11_retracts_the_greater_of_its_two_ids() -> None:
+    """#3054: an independent dividend history has one $0.67 STX entitlement on
+    2021-05-11 (the 2026-11-03 store measurement, #3053 item 5), so the pair
+    is one payment stored twice; the greater id goes."""
+    [group] = [g for g in reviewed_groups() if g.key == ("0001137789", date(2021, 5, 11), 0.67)]
+    assert group.verdict == "duplicate"
+    assert group.retract_source_action_id == "d08ea098-e6bd-4775-9bb6-abda5545428d"
+    assert group.retract_source_action_id > "41b127bb-bd78-4967-9996-e4f2158e86c3"
 
 
 def test_the_listing_gap_groups_are_unresolved() -> None:
@@ -144,7 +155,7 @@ def test_every_retract_id_is_the_greater_of_its_groups_two_ids() -> None:
         for g in export
     }
     duplicates = [g for g in reviewed_groups() if g.verdict == "duplicate"]
-    assert len(duplicates) == 180
+    assert len(duplicates) == 181
     for group in duplicates:
         pair = ids.get(group.key)
         if pair is None:
