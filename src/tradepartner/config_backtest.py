@@ -235,7 +235,9 @@ class PortfolioConfig(_ClosedConfig):
 # * `benchmark`: an additive comparison benchmark (`backtest/results.py`); SPY and MTUM
 #   stay mandatory for every family (charter, ADR 0005). `None` adds none.
 # * `signal_inputs`: the store fact tables the family's signal reads (the universe, the
-#   benchmarks and the return series every family reads are not signal inputs). A root
+#   benchmarks and the return series every family reads are not signal inputs, so the
+#   split and dividend adjustment `adjusted_prices` reads from `corporate_actions` is
+#   part of `prices_daily` here, not a `corporate_actions` input). A root
 #   family's first `family_rules` row is refused while these overlap the inputs of
 #   another family with a registered hypothesis, unless an owner `family_root` decision
 #   approves it, and that family's N then counts the overlapping families' trials

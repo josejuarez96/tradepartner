@@ -371,6 +371,57 @@ def test_an_approval_not_naming_every_overlapping_family_is_refused(
         lab.rules("profitability", twin)
 
 
+def _exposure(conn: duckdb.DuckDBPyConnection, family: str, known_at: datetime) -> None:
+    """A `research_exposures` row of `family` (an experiment-only family's N source)."""
+    insert_row(
+        conn,
+        "research_exposures",
+        {
+            "exposure_id": 1,
+            "candidate_ref": "c2",
+            "source": "store",
+            "family": family,
+            "kill_line_url": "https://example.invalid/kill",
+            "kill_line_sha256": "k" * 64,
+            "kill_line_posted_at": known_at,
+            "kill_line_basis": "posted_before_read",
+            "probe_path": "p.py",
+            "probe_sha256": "p" * 64,
+            "probe_verified": True,
+            "read_at": known_at,
+            "window_start": date(2020, 1, 1),
+            "window_end": date(2023, 12, 31),
+            "data_pin_json": "{}",
+            "n_configurations": 3,
+            "verdict": "fail",
+            "desk_read_path": "docs/x.md",
+            "audit_url": None,
+            "overlaps_holdout": False,
+            "holdout_reason": None,
+            "post_boundary": False,
+            "synthetic": False,
+            "recorded_by": "test",
+            "code_version": "abc",
+            "code_dirty": False,
+            "note": None,
+            "known_at": known_at,
+        },
+    )
+
+
+def test_an_experiment_only_familys_research_rows_count_as_existing(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`spinoff` has N from research exposures but no hypotheses: a new root reading
+    `corporate_actions` overlaps it, from the instant the exposure is known."""
+    _overlapping(monkeypatch, ("corporate_actions",))
+    known = utc_now()
+    _exposure(lab.conn, "spinoff", known)
+    refusal = lab_registry.root_family_refusal
+    assert refusal(lab.conn, "profitability", as_of=known - timedelta(seconds=1)) is None
+    assert "spinoff" in str(refusal(lab.conn, "profitability", as_of=utc_now()))
+
+
 def test_a_child_family_is_not_checked(lab: Lab, monkeypatch: pytest.MonkeyPatch) -> None:
     _overlapping(monkeypatch, ("prices_daily",))
     twin = lab.twin("profitability")
