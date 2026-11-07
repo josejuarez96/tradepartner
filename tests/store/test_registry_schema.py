@@ -248,7 +248,7 @@ def test_registry_table_names_disjoint_from_fact_table_names() -> None:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FAMILY_ROOT_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESUME_BOOK_VERSION + 1
 
 
 def test_fresh_init_creates_every_table_at_version_26() -> None:
@@ -740,7 +740,6 @@ def test_migrating_a_version_17_store_keeps_every_row(tmp_path: Path, lab: bool)
                 *lab_schema.RELEASE_DECISION_KINDS,
                 *lab_schema.SHAKEDOWN_DECISION_KINDS,
                 *lab_schema.OPERATIONS_DECISION_KINDS,
-                *lab_schema.FAMILY_ROOT_DECISION_KINDS,
             )
         )
         assert _kind_check(conn) == check_before.replace("'))));", f"', {added}))));")

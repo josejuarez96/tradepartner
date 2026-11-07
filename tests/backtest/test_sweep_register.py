@@ -40,7 +40,6 @@ from tradepartner.backtest.sweep import (
     FingerprintRegisteredError,
     NewFamilyError,
     NoFamilyRulesError,
-    RootFamilyOverlapError,
     SweepFileError,
     SweepRegistration,
     register,
@@ -858,39 +857,6 @@ def test_a_root_family_on_an_empty_lab_store_registers(
     assert result.created
     rules = lab_registry.family_rules(lab_store, "profitability")
     assert rules is not None and rules.parent_family is None
-
-
-def test_a_root_reading_an_existing_familys_inputs_is_refused_before_any_row(
-    ready: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """#3126: a new root family whose signal inputs overlap `momentum`'s (a stand-in
-    spec reading `prices_daily`) is refused with no owner `family_root` decision, and
-    registers once one names `momentum`; its N then counts momentum's trials."""
-    from tradepartner import config_backtest
-
-    spec = config_backtest.FAMILIES["profitability"]
-    monkeypatch.setitem(
-        config_backtest.FAMILIES,
-        "profitability",
-        dataclasses.replace(spec, signal_inputs=("prices_daily",)),
-    )
-    _practise_before_the_twins_exam(ready)
-    path = _profitability_sweep(tmp_path)
-    _refused(ready, path, settings, RootFamilyOverlapError, r"overlap family 'momentum'")
-    registry.record_decision(
-        ready,
-        kind="family_root",
-        reason="approved root on momentum's inputs",
-        values={"family": "profitability", "overlapping_families": ["momentum"]},
-    )
-    assert register(ready, path, settings, registered_by="test").created
-    assert lab_registry.linked_families(ready, "profitability") == ("momentum",)
-    assert results.family_n_split(ready, "profitability").linked == results.family_n(
-        ready, "momentum"
-    )
 
 
 def test_a_new_familys_holdout_overlapping_an_existing_familys_is_refused(

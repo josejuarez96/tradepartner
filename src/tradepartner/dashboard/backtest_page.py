@@ -179,7 +179,6 @@ class DsrRow:
     today_n_backtest: int | None = None
     today_n_research: int | None = None
     today_n_exposure: int | None = None
-    today_n_linked: int | None = None
 
 
 @dataclass(frozen=True)
@@ -278,7 +277,6 @@ def _dsr_rows(
                 today_n_backtest=split.trials if split else None,
                 today_n_research=split.research if split else None,
                 today_n_exposure=split.exposures if split else None,
-                today_n_linked=split.linked if split else None,
             )
         )
     return tuple(out)
@@ -490,7 +488,6 @@ def _dsr_table(rows: Sequence[DsrRow]) -> pl.DataFrame:
                 "today N backtest": r.today_n_backtest,
                 "today N research": r.today_n_research,
                 "today N exposures": r.today_n_exposure,
-                "today N linked": r.today_n_linked,
                 "today V": r.today.sharpe_variance if r.today else None,
                 "today SR*": r.today.sr_star if r.today else None,
                 "today label": r.today.dsr_basis if r.today else None,

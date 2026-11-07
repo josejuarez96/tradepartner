@@ -47,9 +47,8 @@ In order:
 4. **Close the run**: the counts, the seconds, `n_trials_at_end`
    (`results.family_n`, the one N function), `sr_star_annual_at_end`
    (`expected_max_sharpe` at that N over the family's excess-basis
-   `family_sharpes` variance floored at `lab_registry.family_v_floor`, the larger
-   of the family rules' `min_sharpe_variance_annual` and the window's null variance,
-   #3127), and `completed` from `lab_queries.sweep_state`.
+   `family_sharpes` variance floored at the family rules'
+   `min_sharpe_variance_annual`), and `completed` from `lab_queries.sweep_state`.
 
 **Quiet intervals** (spec, Definitions). The runner holds no connection
 between groups. Inside an interval it opens no trial, holds no connection and
@@ -713,7 +712,7 @@ def _close_run(
         n_trials = family_n(conn, sweep.family)
         variance = registry.family_sharpes(conn, sweep.family).variance("excess_spy")
         rules = lab_registry.family_rules(conn, sweep.family)
-        floor = lab_registry.family_v_floor(rules, store) if rules is not None else 0.0
+        floor = rules.min_sharpe_variance_annual if rules is not None else 0.0
         floored = max(variance if variance is not None else 0.0, floor)
         sr_star = expected_max_sharpe(n_trials, floored) if n_trials >= 1 else 0.0
         lab_registry.close_sweep_run(

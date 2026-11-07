@@ -100,25 +100,16 @@ SHAKEDOWN_DECISION_KINDS: tuple[str, ...] = ("shakedown_span", "shakedown_note")
 #: not, and `apply_lab_schema` widens with it too.
 OPERATIONS_DECISION_KINDS: tuple[str, ...] = ("operations_book",)
 
-#: `owner_decisions.kind` values schema version 48 adds (#3126; strategy-lab spec,
-#: amendment 2026-11-06): the owner's `family_root` approval of a root family whose
-#: signal inputs overlap another family's. As with version 22,
-#: `schema._migrate_family_root_kind` widens every store with it, lab or not, and
-#: `apply_lab_schema` widens with it too.
-FAMILY_ROOT_DECISION_KINDS: tuple[str, ...] = ("family_root",)
-
 #: `owner_decisions.kind` values the lab adds (spec, Data / interfaces), then the
 #: two version 18 adds (`RELEASE_DECISION_KINDS`), the two version 20 adds
-#: (`SHAKEDOWN_DECISION_KINDS`), the one version 22 adds
-#: (`OPERATIONS_DECISION_KINDS`) and the one version 48 adds
-#: (`FAMILY_ROOT_DECISION_KINDS`).
+#: (`SHAKEDOWN_DECISION_KINDS`) and the one version 22 adds
+#: (`OPERATIONS_DECISION_KINDS`).
 LAB_DECISION_KINDS: tuple[str, ...] = (
     "promotion",
     "sweep_retired",
     *RELEASE_DECISION_KINDS,
     *SHAKEDOWN_DECISION_KINDS,
     *OPERATIONS_DECISION_KINDS,
-    *FAMILY_ROOT_DECISION_KINDS,
 )
 
 

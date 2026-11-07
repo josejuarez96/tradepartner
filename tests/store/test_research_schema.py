@@ -328,7 +328,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FAMILY_ROOT_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESUME_BOOK_VERSION + 1
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -910,7 +910,6 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
             *lab_schema.RELEASE_DECISION_KINDS,
             *lab_schema.SHAKEDOWN_DECISION_KINDS,
             *lab_schema.OPERATIONS_DECISION_KINDS,
-            *lab_schema.FAMILY_ROOT_DECISION_KINDS,
         )
     )
     fresh_ddl["owner_decisions"] = fresh_ddl["owner_decisions"].replace(

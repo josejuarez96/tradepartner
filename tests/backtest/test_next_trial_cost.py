@@ -207,10 +207,7 @@ def test_sr_star_now_equals_what_the_real_sweep_close_stores_at_todays_n(
         [run_id],
     ).fetchall()
     cost = results.next_trial_cost(
-        lab_store,
-        "momentum",
-        basis="excess_spy",
-        floor=lab_registry.family_v_floor(rules, settings),
+        lab_store, "momentum", basis="excess_spy", floor=rules.min_sharpe_variance_annual
     )
     assert n_end == cost.n_now == 3
     assert cost.floored is True

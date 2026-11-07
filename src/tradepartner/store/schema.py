@@ -621,17 +621,7 @@ registry; #83 took version 2 first, so the registry is version 3):
   another book's resume never moves this book's `fills(since)`. Rows written
   before 47 keep NULL (no known book): a book's collection drops their
   cursors, which only moves its read earlier.
-- **Version 48** (#3126; strategy-lab spec, amendment 2026-11-06): the
-  `family_root` decision kind. `owner_decisions.kind` gains `family_root`
-  (`lab_schema.FAMILY_ROOT_DECISION_KINDS`, the new tail of
-  `LAB_DECISION_KINDS`), the `CHECK` rebuilt by `lab_schema.widen_enum` as
-  version 22 rebuilt it (every row kept in insertion order, byte-identical,
-  every kind kept). `_migrate_family_root_kind` runs on every fresh or
-  migrating writable store, never on one already at 48; it is idempotent. No
-  other table changes. A read-only connection accepts a version-47 store:
-  every read works (a `family_root` row cannot exist there, so
-  `lab_registry.family_root_approval` reads None).
-- **A later DDL change goes to version 49**, with its own migration and a
+- **A later DDL change goes to version 48**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -965,12 +955,9 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 46 (#2813): nullable `list_position` on `filing_index` and
 #:   `filing_index_pending`.
 #: - 47 (#2490): nullable `resume_invocations.book_id`.
-#: - 48 (#3126): `owner_decisions.kind` widened with `family_root`, every row
-#:   kept (`_migrate_family_root_kind`, on every store; module docstring,
-#:   "Schema versions").
-#: - A later DDL change goes to version 49, with its own migration and a
+#: - A later DDL change goes to version 48, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 48
+CURRENT_SCHEMA_VERSION = 47
 
 #: The last version without `delisting_reasons` (T326, version 43): the
 #: `snapshot_sightings` version (#2665). A named constant, not
@@ -994,10 +981,6 @@ _PRE_LIST_POSITION_VERSION = 45
 #: The last version without `resume_invocations.book_id` (#2490, version 47):
 #: the `list_position` version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
 _PRE_RESUME_BOOK_VERSION = 46
-
-#: The last version without the `family_root` decision kind (#3126, version 48):
-#: the `resume_invocations.book_id` version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
-_PRE_FAMILY_ROOT_VERSION = 47
 
 #: Last version without the owner-entered Form 8937 allocation table.
 _PRE_SPINOFF_ALLOCATIONS_VERSION = 38
@@ -3557,7 +3540,6 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_FILING_INDEX_VERSION,
         _PRE_LIST_POSITION_VERSION,
         _PRE_RESUME_BOOK_VERSION,
-        _PRE_FAMILY_ROOT_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3604,8 +3586,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # (no `research_exposures` or `trial_results.n_exposure` until 44,
         # T355); version 46 every read but `journal.resume_invocations` (no
         # `book_id` until 47, #2490), which only the writing `switch.release`
-        # and `collect` read; version 47 every read (no `family_root` decision
-        # can exist there, #3126).
+        # and `collect` read.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -4387,20 +4368,6 @@ def _migrate_operations_kinds(conn: duckdb.DuckDBPyConnection) -> None:
     forget_column_types(conn)
 
 
-def _migrate_family_root_kind(conn: duckdb.DuckDBPyConnection) -> None:
-    """Version 48 (module docstring, "Schema versions"): widen
-    `owner_decisions.kind` with `lab_schema.FAMILY_ROOT_DECISION_KINDS` by
-    `lab_schema.widen_enum`, as version 22 did (a no-op once present; every row kept
-    in insertion order, byte-identical). Idempotent; runs on a fresh or migrating
-    writable store (never one already at 48), inside `init_schema`'s transaction,
-    after `_migrate_operations_kinds`. `lab_schema` imports this module, so it is
-    imported here, at call time."""
-    from tradepartner.store import lab_schema
-
-    lab_schema.widen_enum(conn, "owner_decisions", "kind", lab_schema.FAMILY_ROOT_DECISION_KINDS)
-    forget_column_types(conn)
-
-
 def _migrate_fee_activities(conn: duckdb.DuckDBPyConnection) -> None:
     """Version 25 (module docstring, "Schema versions"): the ledger's booked
     `FEE` activities (#1583, T183). Rebuild `adjustments` with its version-25
@@ -4881,7 +4848,6 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_FILING_INDEX_VERSION,
         _PRE_LIST_POSITION_VERSION,
         _PRE_RESUME_BOOK_VERSION,
-        _PRE_FAMILY_ROOT_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4966,8 +4932,6 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_shakedown_kinds(conn)
         if max_version is None or max_version <= _PRE_OPERATIONS_BOOK_VERSION:
             _migrate_operations_kinds(conn)
-        if max_version is None or max_version <= _PRE_FAMILY_ROOT_VERSION:
-            _migrate_family_root_kind(conn)
         if max_version is None or max_version <= _PRE_FEE_ACTIVITIES_VERSION:
             _migrate_fee_activities(conn)
         if max_version is None or max_version <= _PRE_CASH_IN_LIEU_VERSION:

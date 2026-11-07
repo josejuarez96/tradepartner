@@ -431,12 +431,7 @@ class LabConfig(BaseModel):
     `axis_lattice` is a step
     per continuous sweepable key (an integer axis needs none) and its keys must be a
     subset of `sweepable_keys`. `promotion_min_dsr_excess` and `min_sharpe_variance_annual`
-    are the promotion floor and the stored V floor (spec open question 4);
-    `v_floor_null_sharpe_annual` is the annual Sharpe at which the window V floor (the
-    null variance of an annual Sharpe over the family window's monthly periods,
-    `lab_registry.family_v_floor`; spec amendment 2026-11-06, #3127) is evaluated: 0 is
-    the null, and a larger value only raises the floor, so no value of it loosens a
-    family below its window's null variance; `max_variants_per_sweep`
+    are the promotion floor and the V floor (spec open question 4); `max_variants_per_sweep`
     bounds one sweep (open question 5); `max_family_holdout_spends` and
     `max_family_promotions` are copied into `family_rules` at a family's first
     registration (open question 10). `sweep_time_budget_minutes` and the
@@ -456,7 +451,6 @@ class LabConfig(BaseModel):
     max_family_promotions: int = Field(default=2, gt=0)
     promotion_min_dsr_excess: float = Field(default=0.5, ge=0)
     min_sharpe_variance_annual: float = Field(default=0.04, ge=0)
-    v_floor_null_sharpe_annual: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     max_failures_per_variant: int = Field(default=2, ge=0)
     max_family_holdout_spends: int = Field(default=3, gt=0)
     sweep_time_budget_minutes: float = Field(default=480.0, gt=0)

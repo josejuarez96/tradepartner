@@ -708,7 +708,7 @@ def test_v_shrink_a_first_clustered_sweep_faces_the_variance_floor(
     rules = lab_registry.family_rules(lab.conn, "momentum")
     assert rules is not None
     assert verdicts.sr_star_high_water_annual == pytest.approx(
-        expected_max_sharpe(2, lab_registry.family_v_floor(rules, settings))
+        expected_max_sharpe(2, rules.min_sharpe_variance_annual)
     )
     assert verdicts.sr_star_high_water_annual > 0
     # Against the unfloored SR* (about 0) the argmax would have cleared 0.5.
