@@ -930,6 +930,14 @@ class PaperConfig(BaseModel):
     #: --accept-fill-band` releases once the owner has checked the print. Read at run
     #: time, never frozen, so the open windows see it.
     max_fill_price_deviation: float = Field(default=0.5, gt=0, lt=1)
+    #: `paper report`'s cumulative economic-fidelity line (#3180), report only: the
+    #: window's cumulative paper return against the tracking trial's reads
+    #: `consistent` when the gap is at most `fidelity_max_gap_bps` (default 100 bp),
+    #: else `divergent`, and `too few periods` below `fidelity_min_periods` compared
+    #: periods (default 6). No check, gate or exit code reads them; run-time, never
+    #: frozen, so neither enters a window's `frozen_json` nor a trial's frozen set.
+    fidelity_max_gap_bps: float = Field(default=100.0, gt=0)
+    fidelity_min_periods: int = Field(default=6, ge=1)
     #: Per-book buy timing (paper spec amendment 2026-11-01 item 7, T369), keyed by
     #: book token; run-time, not frozen. A book absent from the map behaves as today.
     execution: dict[str, BookExecution] = Field(default_factory=dict)
