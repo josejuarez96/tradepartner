@@ -190,6 +190,18 @@ def test_class_a_only_pr_is_eligible_without_owner_ok() -> None:
     assert _eligible(paths=class_a_paths) is None
 
 
+def test_a_family_registry_change_is_class_b_although_under_src(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3126: `config_backtest.py` holds FAMILIES and FAMILY_PARENTS, the owner's
+    root-or-child call, so it needs the owner-ok label like any class-B file."""
+    monkeypatch.setattr(mt.ready_pr, "required_reviews", lambda _paths: ())
+    paths = ("src/tradepartner/config_backtest.py", "changelog.d/12-thing.md")
+    refusal = _eligible(_pr(fragment_texts=(FRAGMENT,)), paths=paths)
+    assert refusal is not None and "class B (src/tradepartner/config_backtest.py)" in refusal
+    assert _eligible(_pr(labels=("owner-ok",), fragment_texts=(FRAGMENT,)), paths=paths) is None
+
+
 # --- AC3: order --------------------------------------------------------------------------
 
 
