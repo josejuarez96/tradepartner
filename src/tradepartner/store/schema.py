@@ -621,7 +621,13 @@ registry; #83 took version 2 first, so the registry is version 3):
   another book's resume never moves this book's `fills(since)`. Rows written
   before 47 keep NULL (no known book): a book's collection drops their
   cursors, which only moves its read earlier.
-- **A later DDL change goes to version 48**, with its own migration and a
+- **Version 48** (#3076, #3053 item 6): nullable `classifications.issuer_class`,
+  the issuer's class (`spac`, `bdc`, `mlp`, `foreign` or NULL) read from the
+  filing evidence known at the row's `known_at` (`store.classify`, "Issuer
+  class"). Added by `ALTER` after the version-26 rebuild, so the pinned
+  version-4 DDL is unchanged; rows written before 48 keep NULL until
+  `ingest --source edgar --rebuild-classifications` re-derives them.
+- **A later DDL change goes to version 49**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -955,9 +961,10 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 46 (#2813): nullable `list_position` on `filing_index` and
 #:   `filing_index_pending`.
 #: - 47 (#2490): nullable `resume_invocations.book_id`.
-#: - A later DDL change goes to version 48, with its own migration and a
+#: - 48 (#3076): nullable `classifications.issuer_class`.
+#: - A later DDL change goes to version 49, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 47
+CURRENT_SCHEMA_VERSION = 48
 
 #: The last version without `delisting_reasons` (T326, version 43): the
 #: `snapshot_sightings` version (#2665). A named constant, not
@@ -981,6 +988,10 @@ _PRE_LIST_POSITION_VERSION = 45
 #: The last version without `resume_invocations.book_id` (#2490, version 47):
 #: the `list_position` version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
 _PRE_RESUME_BOOK_VERSION = 46
+
+#: The last version without `classifications.issuer_class` (#3076, version 48):
+#: the `resume_invocations.book_id` version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
+_PRE_ISSUER_CLASS_VERSION = 47
 
 #: Last version without the owner-entered Form 8937 allocation table.
 _PRE_SPINOFF_ALLOCATIONS_VERSION = 38
@@ -2763,9 +2774,11 @@ CREATE TABLE IF NOT EXISTS resume_invocations (
 )
 """
 
-# One row per resume given `--accept-rejections` (#472), written once its
-# rejection-cap verdicts are judged and before its reconciliation and release:
-# a JSON list of the verdicts the flag accepted, `[]` when there was none. It is
+# One row per resume given `--accept-rejections` (#472) or accepting a fill-band
+# fault with `--accept-fill-band` (#3130), written once its verdicts are judged and
+# before its reconciliation and release: a JSON list of the rejection-cap verdicts
+# the flag accepted (`[]` when there was none) and of the band faults accepted
+# (entries with `"kind": "fill_band"`). It is
 # not a release: that is the `kill_switch` `released` row citing the resume_id.
 _CREATE_RESUME_ACCEPTANCES = f"""
 CREATE TABLE IF NOT EXISTS resume_acceptances (
@@ -3540,6 +3553,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_FILING_INDEX_VERSION,
         _PRE_LIST_POSITION_VERSION,
         _PRE_RESUME_BOOK_VERSION,
+        _PRE_ISSUER_CLASS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3586,7 +3600,9 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # (no `research_exposures` or `trial_results.n_exposure` until 44,
         # T355); version 46 every read but `journal.resume_invocations` (no
         # `book_id` until 47, #2490), which only the writing `switch.release`
-        # and `collect` read.
+        # and `collect` read; version 47 every read (`classifications_as_of`
+        # returns no `issuer_class` column there, which readers take as no tag,
+        # #3076).
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3982,6 +3998,16 @@ def _migrate_resume_book(conn: duckdb.DuckDBPyConnection) -> None:
     }
     if "book_id" not in existing:
         conn.execute("ALTER TABLE resume_invocations ADD COLUMN book_id VARCHAR")
+
+
+def _migrate_issuer_class(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add the nullable `classifications.issuer_class` (version 48, #3076), NULL
+    on every existing row. Runs inside `init_schema`'s transaction after
+    `_migrate_filing_name` (whose version-26 rebuild keeps the pinned shape), so
+    a fresh store gets the column here too. Idempotent."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info('classifications')").fetchall()}
+    if "issuer_class" not in existing:
+        conn.execute("ALTER TABLE classifications ADD COLUMN issuer_class VARCHAR")
 
 
 def _migrate_n_exposure(conn: duckdb.DuckDBPyConnection) -> None:
@@ -4848,6 +4874,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_FILING_INDEX_VERSION,
         _PRE_LIST_POSITION_VERSION,
         _PRE_RESUME_BOOK_VERSION,
+        _PRE_ISSUER_CLASS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4910,6 +4937,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _migrate_n_exposure(conn)
         _migrate_list_position(conn)
         _migrate_resume_book(conn)
+        _migrate_issuer_class(conn)
         _migrate_profitability_rebalance_counts(conn)
         _migrate_assets_intersection(conn)
         _relax_no_history_count(conn)

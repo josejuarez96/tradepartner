@@ -918,12 +918,18 @@ class PaperConfig(BaseModel):
     status_slippage_sessions: int = Field(default=20, gt=0)
     #: The fill-price sanity band (#1981): a fill journaled by a run whose price is
     #: further than this fraction from the order's reference price (the close of S-1,
-    #: split-adjusted) halts the run with a `fill_price_outside_band` fault. 0.25 is
-    #: conservative: an overnight gap past a quarter of the prior close is rare for a
-    #: liquid US equity, so a normal opening gap never trips it, while a 100x or 0.01x
-    #: fill (a broker-side bad print, a unit error) is far outside. Read at run time,
-    #: never frozen, so the open windows see it.
-    max_fill_price_deviation: float = Field(default=0.25, gt=0, lt=1)
+    #: split-adjusted) halts the run with a `fill_price_outside_band` fault. 0.5
+    #: (#3130): real overnight gaps of 25% or more occur at about 8.6e-4 per
+    #: name-session (Audit C; INTC 10-30 at -29.3%), so 0.25 halted the books about
+    #: once in eight daily sessions, while a 100x, 0.01x or 10x fill (a broker-side bad
+    #: print, a unit error) is still far outside. The band is linear, [0.5x, 1.5x]:
+    #: a real gap past it still halts (Audit C's extract: one +51.6% takeover gap in
+    #: 7,165 name-sessions, about one halt in 35 daily sessions). A late split read
+    #: unadjusted (#2089): a 2:1 fill sits at 0.5x, on the edge; 3:2 at 0.67x passes;
+    #: a missed 1:2 reverse split at 2x halts. After a halt, `paper resume
+    #: --accept-fill-band` releases once the owner has checked the print. Read at run
+    #: time, never frozen, so the open windows see it.
+    max_fill_price_deviation: float = Field(default=0.5, gt=0, lt=1)
     #: Per-book buy timing (paper spec amendment 2026-11-01 item 7, T369), keyed by
     #: book token; run-time, not frozen. A book absent from the map behaves as today.
     execution: dict[str, BookExecution] = Field(default_factory=dict)

@@ -248,7 +248,7 @@ def test_registry_table_names_disjoint_from_fact_table_names() -> None:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESUME_BOOK_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ISSUER_CLASS_VERSION + 1
 
 
 def test_fresh_init_creates_every_table_at_version_26() -> None:
@@ -352,8 +352,13 @@ def test_migration_leaves_other_fact_tables_byte_identical(tmp_path: Path, versi
     for table in _UNTOUCHED_TABLES:
         if table in _ROWS_ONLY_TABLES:
             # `classifications` is rebuilt for `filing_name` (#1597, T184d):
-            # its DDL changes, every row is byte-identical.
-            assert after[table][3:] == before[table][3:], table
+            # its DDL changes, every row is byte-identical but for version
+            # 48's appended NULL `issuer_class` (#3076).
+            rows = after[table][3]
+            if table == "classifications":
+                assert {row[-1] for row in rows} == {None}, table
+                rows = [row[:-1] for row in rows]
+            assert rows == before[table][3], table
         else:
             assert after[table] == before[table], table
 

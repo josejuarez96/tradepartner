@@ -29,6 +29,13 @@ The only way the kill switch is released. In the req 5 order:
    session's view: a halt read whose band engagement write failed leaves its
    run unfinished, which step 3 closes `crashed` (#3027). Broker-status residual
    fills keep req 8's explicit acceptance path.
+   - **`accept_fill_band`** (`--accept-fill-band`, #3130) is the owner's word that
+     he has checked the print: a prior band fault (an engagement since the window's
+     last release, or a rejudged fill) no longer refuses, and each one accepted is
+     journaled in this resume's `resume_acceptances` row (`"kind": "fill_band"`)
+     before anything that could release. A bad fill this invocation itself first
+     journals still refuses, so the owner always sees a print before accepting it.
+     Every other check below still applies. Only the CLI flag sets it.
    - A rejection-cap verdict refuses the release: one from the collection
      (an all-rejected or over-cap submitting run whose rejection this resume
      journaled; #374, T58's handoff), or one on a run the release would clear
@@ -232,6 +239,8 @@ class ResumeOutcome:
     reconciliation_id: int | None = None
     released_event_id: int | None = None
     accepted_rejections: tuple[str, ...] = ()
+    #: The band faults `--accept-fill-band` accepted (#3130), as journaled.
+    accepted_fill_band: tuple[str, ...] = ()
     fill_prices: tuple[tuple[str, float], ...] = ()
     fill_warnings: tuple[str, ...] = ()
 
@@ -531,6 +540,15 @@ def _band_view_violations(
     return list(fill_band_violations(group, band))
 
 
+def _band_fault_seen(violation: str, reasons: Sequence[str]) -> bool:
+    """Whether a band `violation` (`fill_band_violations`' message, which starts with
+    the order's `client_order_id` and a space and a parenthesis) is named by one of the
+    engagement `reasons`, so an output has shown it to the owner (#3130). The id is
+    matched with its `" ("`, since `tp-...-1` is a prefix of `tp-...-12`."""
+    order = violation.split(" ", 1)[0]
+    return any(f"{order} (" in reason for reason in reasons)
+
+
 def _rejudged_band_violations(
     conn: duckdb.DuckDBPyConnection,
     window: PaperWindowRow,
@@ -591,11 +609,13 @@ def _accept(
     accepted: Sequence[RejectionBreach],
     clock: Callable[[], datetime],
     stamps: _MonotonicStamps,
+    band_accepted: Sequence[str] = (),
 ) -> None:
-    """Journal the verdicts `--accept-rejections` accepted (`[]` for none) before
-    anything that could lead to a release."""
+    """Journal the verdicts `--accept-rejections` accepted (`[]` for none) and the
+    fill-band faults `--accept-fill-band` accepted (#3130, entries with `"kind":
+    "fill_band"`), one row per resume, before anything that could lead to a release."""
     stamp = stamps.next(clock, "resume_acceptances")
-    verdicts = [
+    verdicts: list[dict[str, object]] = [
         {
             "run_id": b.run_id,
             "rejected": b.rejected,
@@ -605,6 +625,7 @@ def _accept(
         }
         for b in accepted
     ]
+    verdicts += [{"kind": "fill_band", "message": message} for message in band_accepted]
     with connect() as conn:
         append(
             conn,
@@ -642,6 +663,7 @@ def resume(
     accept_broker_fills: bool,
     *,
     accept_rejections: bool,
+    accept_fill_band: bool = False,
     book_id: str | None = None,
 ) -> ResumeOutcome:
     """`paper resume --reason` (module docstring). `accept_rejections` is the
@@ -659,6 +681,8 @@ def resume(
         raise ValueError("paper resume needs a non-blank --reason")
     if not isinstance(accept_rejections, bool):
         raise TypeError(f"accept_rejections must be a bool, got {type(accept_rejections).__name__}")
+    if not isinstance(accept_fill_band, bool):
+        raise TypeError(f"accept_fill_band must be a bool, got {type(accept_fill_band).__name__}")
     book = resolve_book(settings, book_id)
     with run_lock(settings, book):
         with connect() as conn:
@@ -740,6 +764,7 @@ def resume(
             )
 
         accepted: tuple[RejectionBreach, ...] = ()
+        accepted_band: tuple[str, ...] = ()
         fill_warnings: list[str] = []
 
         def outcome(
@@ -758,6 +783,7 @@ def resume(
                 reconciliation_id=reconciliation_id,
                 released_event_id=released_event_id,
                 accepted_rejections=tuple(b.message for b in accepted),
+                accepted_fill_band=accepted_band,
                 fill_prices=fill_prices,
                 fill_warnings=tuple(fill_warnings),
             )
@@ -791,21 +817,45 @@ def resume(
         note_unjudged(collected, fill_warnings)
         with connect() as conn:
             events = kill_switch_events_for(conn, window_id)
+            # Since the window's last release (#3130): a band fault before it was
+            # released only through `accept_fill_band`, so it is never judged again.
+            last_release = max(
+                (e.event_id or 0 for e in events if e.state == switch.RELEASED), default=0
+            )
             prior_band_faults = [
-                event.reason for event in events if is_fill_band_fault(event.reason)
+                event.reason
+                for event in events
+                if event.reason is not None
+                and (event.event_id or 0) > last_release
+                and is_fill_band_fault(event.reason)
             ]
-        if prior_band_faults:
-            return outcome(REFUSED, f"prior {prior_band_faults[-1]}; abandon this window")
+        if prior_band_faults and not accept_fill_band:
+            return outcome(
+                REFUSED,
+                f"prior {prior_band_faults[-1]}; check the print, then resume with "
+                "--accept-fill-band, or abandon this window",
+            )
         with connect() as conn:
             prior_violations = _rejudged_band_violations(conn, window, events, resume_id, settings)
-        if prior_violations:
+        # A rejudged fill (#3027) is accepted only once a band engagement since the
+        # last release names its order, i.e. once an output has shown it to the owner;
+        # until then it refuses (and engages, naming it) even with the flag.
+        unseen = [v for v in prior_violations if not _band_fault_seen(v, prior_band_faults)]
+        if prior_violations and (not accept_fill_band or unseen):
             return refuse_bad_fill("fill_price_outside_band: " + "; ".join(prior_violations))
+        band_accepted = [
+            *prior_band_faults,
+            *("fill_price_outside_band: " + v for v in prior_violations),
+        ]
         faulted = _faulted_run_breaches(connect, window, frozen)
         if accept_rejections:
             # Only the verdicts on runs the release would clear (#451's refusal).
             # A collection verdict on such a run is the same run's verdict.
             accepted = faulted
-            _accept(connect, resume_id, accepted, clock, stamps)
+            _accept(connect, resume_id, accepted, clock, stamps, band_accepted)
+        elif band_accepted:
+            _accept(connect, resume_id, (), clock, stamps, band_accepted)
+        accepted_band = tuple(band_accepted)
         cleared = {b.run_id for b in accepted}
         reasons = [b.message for b in collected.rejections if b.run_id not in cleared]
         judged = {b.run_id for b in collected.rejections}
