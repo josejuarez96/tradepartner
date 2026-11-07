@@ -50,8 +50,8 @@ def test_every_listed_setting_changes_hash(key: str) -> None:
 # Pinned from main (before #2826 added `edgar.statement_fact_units`), then
 # re-pinned for #2929's `BUILD_RULES_VERSION` 3, then #2941's 4, then T198's
 # flip of `edgar.cover_split_contexts` and `edgar.class_member_link` with
-# `FSN_VERSION` and `COVER_VERSION` 7.
-MAIN_DEFAULT_HASH = "da136ce753e445c2f92f4c2985958d7e221df0624fa74cf15fb10a2682785df1"
+# `FSN_VERSION` and `COVER_VERSION` 7, then #3056's `BUILD_RULES_VERSION` 5.
+MAIN_DEFAULT_HASH = "a3abc2519fdb0bab9176fa02700e0f548a50529fd88afaa94ddd1d0a207da072"
 
 
 def test_hash_at_defaults_equals_the_hex_pinned_from_main() -> None:
