@@ -76,10 +76,26 @@ with `registry.family_registered_on`; ADR 0016 point 4) and no `promotion` or
 decision are one transaction. It is not a promotion: `lab_registry.promotion_for` stays
 None, so `holdout.decide` refuses any spend by it (req 5(b)); it writes no trial, so N
 and V are unchanged.
+
+**Differences from the parent** (paper spec amendment 2026-11-07 #3118 item 2; T382).
+The parent is a sweep variant or a registered pre-lab hypothesis (H1); a pre-lab parent's
+latest `ok`, non-synthetic, in-sample trial stands for the variant's counted trial, and
+the decision's `sweep_id`, `sweep_slug` and `variant_index` are null. The file may differ
+from its parent in `OPERATIONS_DIFFERING_KEYS` only: `execution.fill_price`, exempt from
+the family rule for an operations file only (`_rule_differences(operations=True)`), and
+`costs.per_side_bps`, which may only rise; any other difference is refused by name
+(`operations_differences`). Its fingerprint recomputed at the parent's values of those
+two keys must equal the parent's (the `sweep_variants` row, or the pre-lab hypothesis's
+`hypothesis_fingerprints` row); its own fingerprint is the one written, at most once.
+The decision's values add `parent_fingerprint` and `differing_keys` (each key with the
+parent's and the file's value). A parent is "already named" only by an `operations_book`
+row with the same `differing_keys` (a row without them reads as the empty set), or by a
+`promotion` row when the file has no differences.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import tomllib
 from collections.abc import Mapping
@@ -111,6 +127,12 @@ from tradepartner.store.schema import atomic
 #: The `owner_decisions.kind` an operations file's registration appends
 #: (`lab_schema.OPERATIONS_DECISION_KINDS`, schema version 22).
 OPERATIONS_BOOK_KIND: Final = "operations_book"
+
+#: The keys an operations file may differ from its parent in (paper spec amendment
+#: 2026-11-07 #3118 item 2): the fill price, exempt from the family rule for an
+#: operations file only, and the base cost, which may only rise.
+FILL_PRICE_KEY: Final = "execution.fill_price"
+OPERATIONS_DIFFERING_KEYS: Final = (FILL_PRICE_KEY, registry.BASE_COST_KEY)
 
 #: The variant states (`sweep_report.VariantRow.status`) whose shown trial is an `ok`
 #: in-sample trial counted in N: current (`counted`) or from an earlier vintage
@@ -540,11 +562,17 @@ def _slug_registrations(
 
 
 def _rule_differences(
-    parsed: HypothesisFile, params: Mapping[str, Any], rules: lab_registry.FamilyRules
+    parsed: HypothesisFile,
+    params: Mapping[str, Any],
+    rules: lab_registry.FamilyRules,
+    *,
+    operations: bool = False,
 ) -> list[str]:
     """The family rules `parsed` (frozen set `params`) breaks, by name: the window, and
     every forbidden-prefix value (`costs.per_side_bps` may only rise; a frozen key the
-    rules lack is accepted at its `FROZEN_KEY_DEFAULTS` default)."""
+    rules lack is accepted at its `FROZEN_KEY_DEFAULTS` default). `operations` (an
+    operations file, never a promoted file, a sweep or a variant) exempts
+    `execution.fill_price` from the family rule (#3118 item 2)."""
     differences = [
         name
         for name, ours, theirs in (
@@ -557,7 +585,7 @@ def _rule_differences(
     defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
     for key, rule in sorted(rules.fixed_params.items()):
         value = params.get(key)
-        if frozen.borrow_axis_allows(key, params):
+        if frozen.borrow_axis_allows(key, params) or (operations and key == FILL_PRICE_KEY):
             continue
         if key in frozen.HIGHER_ALLOWED_COST_KEYS:
             if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
@@ -578,6 +606,7 @@ def _rule_differences(
         for key, value in params.items()
         if key.startswith(FORBIDDEN_AXIS_PREFIXES)
         and key not in rules.fixed_params
+        and not (operations and key == FILL_PRICE_KEY)
         and not frozen.borrow_axis_allows(key, params)
         and not (key in defaults and frozen._cost_key_allows(key, value, defaults[key]))
     )
@@ -639,6 +668,101 @@ def frozen_set_differences(
     )
 
 
+@dataclass(frozen=True)
+class OperationsParent:
+    """An operations file's parent (#3118 item 2): a sweep variant (`variant` True),
+    or a registered pre-lab hypothesis such as H1, with its stored fingerprint (the
+    `sweep_variants` row's, or the pre-lab hypothesis's `hypothesis_fingerprints` row)."""
+
+    record: registry.HypothesisRecord
+    fingerprint: str
+    variant: bool
+
+
+def operations_parent(
+    conn: duckdb.DuckDBPyConnection, path: Path, parent_id: int
+) -> OperationsParent:
+    """`parent_id` as an operations file's parent; `LabRegistrationError` when it is
+    neither a sweep variant nor a pre-lab hypothesis with a fingerprint."""
+    record = registry.get_hypothesis_by_id(conn, parent_id)
+    row = conn.execute(
+        "SELECT fingerprint FROM sweep_variants WHERE hypothesis_id = ?", [parent_id]
+    ).fetchone()
+    if row is not None:
+        return OperationsParent(record, str(row[0]), variant=True)
+    if lab_registry.is_pre_lab(conn, parent_id):
+        found = conn.execute(
+            "SELECT fingerprint FROM hypothesis_fingerprints WHERE hypothesis_id = ?",
+            [parent_id],
+        ).fetchone()
+        if found is not None:
+            return OperationsParent(record, str(found[0]), variant=False)
+    raise LabRegistrationError(
+        f"{path}: {record.slug} is not a sweep variant or a pre-lab hypothesis; an "
+        "operations file runs one of those"
+    )
+
+
+def operations_differences(
+    parsed: HypothesisFile, params: Mapping[str, Any], parent: registry.HypothesisRecord
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """An operations file against its parent (#3118 item 2): the refused differences,
+    by name (any key but `OPERATIONS_DIFFERING_KEYS`, in or out of the fingerprint, and
+    a `costs.per_side_bps` lower than the parent's), and the allowed ones, each key
+    with the parent's and the file's value (empty for today's operations file)."""
+    theirs = frozen.frozen_values(parent)
+    at_parent = {**params, **{key: theirs[key] for key in OPERATIONS_DIFFERING_KEYS}}
+    refused = frozen_set_differences(parsed, at_parent, parent)
+    differing = {
+        key: {"parent": theirs[key], "file": params[key]}
+        for key in OPERATIONS_DIFFERING_KEYS
+        if not frozen.is_default(params[key], theirs[key])
+    }
+    cost = differing.get(registry.BASE_COST_KEY)
+    if cost is not None and float(cost["file"]) < float(cost["parent"]):
+        refused.append(
+            f"{registry.BASE_COST_KEY} (lower than the parent's {cost['parent']}; it may only rise)"
+        )
+    return refused, differing
+
+
+def _operations_fingerprint_refusal(
+    conn: duckdb.DuckDBPyConnection,
+    path: Path,
+    parsed: HypothesisFile,
+    params: Mapping[str, Any],
+    fingerprint: str,
+    parent: OperationsParent,
+) -> dict[str, dict[str, Any]]:
+    """An operations file's frozen-set and fingerprint checks against `parent`; its
+    allowed differences. The file's fingerprint, recomputed at the parent's values of
+    the two keys, must equal the parent's; a differing file's own fingerprint is
+    registered at most once."""
+    kind = "variant" if parent.variant else "pre-lab hypothesis"
+    refused, differing = operations_differences(parsed, params, parent.record)
+    if refused:
+        raise LabRegistrationError(
+            f"{path}: its frozen set differs from {kind} {parent.record.slug}'s "
+            f"({'; '.join(refused)}); an operations file is its parent's frozen set but "
+            f"for {' and '.join(OPERATIONS_DIFFERING_KEYS)}"
+        )
+    theirs = frozen.frozen_values(parent.record)
+    at_parent = {**params, **{key: theirs[key] for key in OPERATIONS_DIFFERING_KEYS}}
+    if frozen.fingerprint(parsed.family, at_parent, parsed.in_sample_start) != (parent.fingerprint):
+        raise LabRegistrationError(
+            f"{path}: its fingerprint at {kind} {parent.record.slug}'s fill price and base "
+            "cost differs from that parent's"
+        )
+    if differing:
+        holder = lab_registry.fingerprint_registered(conn, fingerprint)
+        if holder is not None:
+            raise LabRegistrationError(
+                f"{path}: its fingerprint is already registered (hypothesis "
+                f"{holder.hypothesis_id}, {holder.slug})"
+            )
+    return differing
+
+
 def _lab_refusal(
     conn: duckdb.DuckDBPyConnection,
     path: Path,
@@ -659,25 +783,18 @@ def _lab_refusal(
             "(`hypothesis register --operations-book-of`); write it as a one-value sweep "
             "(docs/templates/sweep.md), run it and promote it"
         )
-    role = "promotes" if promotion_of is not None else "runs as an operations book"
-    name = "promotion_of" if promotion_of is not None else "operations_of"
-    row = conn.execute(
-        "SELECT fingerprint FROM sweep_variants WHERE hypothesis_id = ?", [variant_id]
-    ).fetchone()
-    if row is None:
-        raise LabRegistrationError(f"{path}: {name} {variant_id} is not a sweep variant")
-    if row[0] != fingerprint:
-        raise LabRegistrationError(
-            f"{path}: its fingerprint differs from variant {variant_id}'s, which it {role}"
-        )
     if operations_of is not None:
-        variant = registry.get_hypothesis_by_id(conn, operations_of)
-        differences = frozen_set_differences(parsed, params, variant)
-        if differences:
+        parent = operations_parent(conn, path, operations_of)
+        _operations_fingerprint_refusal(conn, path, parsed, params, fingerprint, parent)
+    else:
+        row = conn.execute(
+            "SELECT fingerprint FROM sweep_variants WHERE hypothesis_id = ?", [variant_id]
+        ).fetchone()
+        if row is None:
+            raise LabRegistrationError(f"{path}: promotion_of {variant_id} is not a sweep variant")
+        if row[0] != fingerprint:
             raise LabRegistrationError(
-                f"{path}: its frozen set differs from variant {variant.slug}'s "
-                f"({'; '.join(differences)}); an operations file is the variant's frozen "
-                "set exactly"
+                f"{path}: its fingerprint differs from variant {variant_id}'s, which it promotes"
             )
     rules = lab_registry.family_rules(conn, parsed.family)
     if rules is None:
@@ -685,7 +802,7 @@ def _lab_refusal(
             f"{path}: family {parsed.family!r} has no family rules; a new family's first "
             "registration is a sweep (`sweep register`)"
         )
-    broken = _rule_differences(parsed, params, rules)
+    broken = _rule_differences(parsed, params, rules, operations=operations_of is not None)
     if broken:
         raise LabRegistrationError(
             f"{path}: differs from family {parsed.family!r}'s rules: {', '.join(broken)}"
@@ -695,22 +812,122 @@ def _lab_refusal(
         raise LabRegistrationError(f"{path}: {reason}")
 
 
-def _variant_named(conn: duckdb.DuckDBPyConnection, variant_id: int) -> int | None:
-    """The first `promotion` or `operations_book` decision whose values name
-    `variant_id` as `variant_hypothesis_id`, or None."""
-    row = conn.execute(
-        "SELECT decision_id FROM owner_decisions WHERE kind IN ('promotion', ?) AND "
-        "TRY_CAST(json_extract_string(values_json, '$.variant_hypothesis_id') AS BIGINT) = ? "
-        "ORDER BY decision_id LIMIT 1",
-        [OPERATIONS_BOOK_KIND, variant_id],
-    ).fetchone()
-    return None if row is None else int(row[0])
+def _parent_named(
+    conn: duckdb.DuckDBPyConnection, parent_id: int, differing: Mapping[str, Any]
+) -> int | None:
+    """The first decision that already names `parent_id` (as `variant_hypothesis_id`)
+    for a file with these differences, or None (#3118 item 2): an `operations_book`
+    row with the same `differing_keys` (a row without them reads as the empty set), or
+    a `promotion` row when the file has no differences."""
+    rows = conn.execute(
+        "SELECT decision_id, kind, values_json FROM owner_decisions WHERE kind IN "
+        "('promotion', ?) AND TRY_CAST(json_extract_string(values_json, "
+        "'$.variant_hypothesis_id') AS BIGINT) = ? ORDER BY decision_id",
+        [OPERATIONS_BOOK_KIND, parent_id],
+    ).fetchall()
+    for decision_id, kind, values_json in rows:
+        if kind == "promotion":
+            if not differing:
+                return int(decision_id)
+            continue
+        theirs = json.loads(values_json).get("differing_keys") or {}
+        if theirs == dict(differing):
+            return int(decision_id)
+    return None
+
+
+@dataclass(frozen=True)
+class _ParentStanding:
+    """The parent's counted trial and statistics for the decision's values."""
+
+    sweep_id: int | None
+    sweep_slug: str | None
+    variant_index: int | None
+    trial_id: int
+    current: bool
+    stats: dict[str, float | None]
+
+
+def _parent_standing(
+    conn: duckdb.DuckDBPyConnection,
+    path: Path,
+    parent: OperationsParent,
+    code_vintage: str | None,
+) -> _ParentStanding:
+    """A variant's counted trial (`sweep_report.variant_standing`), or a pre-lab
+    parent's latest `ok` in-sample trial (`sweep_report.pre_lab_standing`), current or
+    stale; `LabRegistrationError` with none, or with a metric missing."""
+    # `sweep_report` reads `results`, which imports this module: imported at call time.
+    from tradepartner.backtest import sweep_report
+
+    slug = parent.record.slug
+    kind = "variant" if parent.variant else "pre-lab hypothesis"
+    try:
+        if parent.variant:
+            standing = sweep_report.variant_standing(
+                conn, parent.record.hypothesis_id, code_vintage=code_vintage
+            )
+            row = None if standing is None else standing.row
+            trial_id = None if row is None else row.trial_id
+            if (
+                standing is not None
+                and row is not None
+                and trial_id is not None
+                and row.status in _OPERATIONS_TRIAL_STATES
+            ):
+                return _ParentStanding(
+                    standing.sweep_id,
+                    standing.sweep_slug,
+                    row.variant_index,
+                    trial_id,
+                    row.status == "counted",
+                    {
+                        "excess_cagr_spy": row.excess_cagr_spy,
+                        "sharpe_annual_excess_spy": row.sharpe_annual_excess_spy,
+                        "dsr_excess": row.dsr_excess,
+                        "cost_drag": row.cost_drag,
+                        "turnover_annual": row.turnover_annual,
+                        "max_drawdown": row.max_drawdown,
+                    },
+                )
+            state = "not a sweep variant" if standing is None else standing.row.status
+        else:
+            pre = sweep_report.pre_lab_standing(
+                conn, parent.record.hypothesis_id, code_vintage=code_vintage
+            )
+            if pre is not None:
+                return _ParentStanding(
+                    None,
+                    None,
+                    None,
+                    pre.trial_id,
+                    pre.current,
+                    {
+                        "excess_cagr_spy": pre.excess_cagr_spy,
+                        "sharpe_annual_excess_spy": pre.sharpe_annual_excess_spy,
+                        "dsr_excess": pre.dsr_excess,
+                        "cost_drag": pre.cost_drag,
+                        "turnover_annual": pre.turnover_annual,
+                        "max_drawdown": pre.max_drawdown,
+                    },
+                )
+            state = "unrun"
+    except ValueError as exc:  # a shown trial without a finite base-level metric
+        raise LabRegistrationError(f"{path}: {kind} {slug}: {exc}") from exc
+    # Counted means counted in N: the current `ok` trial, or a stale one (an `ok`
+    # trial from an earlier code or data vintage, which N still counts). A rerun to
+    # make it current would add trials to N for nothing; the decision records which.
+    raise LabRegistrationError(
+        f"{path}: {kind} {slug} has no counted ok trial ({state}); run it first"
+        + (" (`sweep run`)" if parent.variant else " (`backtest`)")
+    )
 
 
 def _operations_refusal(
     conn: duckdb.DuckDBPyConnection,
     path: Path,
-    variant_id: int,
+    parsed: HypothesisFile,
+    parent_id: int,
     code_vintage: str | None,
     params: Mapping[str, Any],
 ) -> None:
@@ -718,35 +935,17 @@ def _operations_refusal(
     file's checks: `refused_placebo` (a file whose frozen `strategy.placebo` is not
     `none` is a fake signal and gets no paper book; a delayed file is not refused, the
     paper planner honours the delay, and a standalone `register` of a placebo file is
-    allowed, that is how a rung-5 run gets its `trials` row), the variant's counted
+    allowed, that is how a rung-5 run gets its `trials` row), the parent's counted
     `ok` trial, its family in `PAPER_FAMILIES`, a family holdout that is not forward,
-    and no decision naming the variant."""
+    and no decision naming the parent for the same differences."""
     if params.get("strategy.placebo", "none") != "none":
         raise LabRegistrationError(
             f"{path}: refused_placebo: strategy.placebo is {params['strategy.placebo']!r}; "
             "a placebo is a fake signal and gets no operations book (ADR 0023)"
         )
-    # `sweep_report` reads `results`, which imports this module: imported at call time.
-    from tradepartner.backtest import sweep_report
-
-    variant = registry.get_hypothesis_by_id(conn, variant_id)
-    try:
-        standing = sweep_report.variant_standing(conn, variant_id, code_vintage=code_vintage)
-    except ValueError as exc:  # a shown trial without a finite base-level metric
-        raise LabRegistrationError(f"{path}: variant {variant.slug}: {exc}") from exc
-    # Counted means counted in N: the current `ok` trial, or a stale one (an `ok`
-    # trial from an earlier code or data vintage, which N still counts). A rerun to
-    # make it current would add trials to N for nothing; the decision records which.
-    if (
-        standing is None
-        or standing.row.status not in _OPERATIONS_TRIAL_STATES
-        or standing.row.trial_id is None
-    ):
-        state = "not a sweep variant" if standing is None else standing.row.status
-        raise LabRegistrationError(
-            f"{path}: variant {variant.slug} has no counted ok trial ({state}); run its "
-            "sweep (`sweep run`) first"
-        )
+    parent = operations_parent(conn, path, parent_id)
+    variant = parent.record
+    _parent_standing(conn, path, parent, code_vintage)
     if variant.family not in PAPER_FAMILIES:
         raise LabRegistrationError(
             f"{path}: family {variant.family!r} is not in PAPER_FAMILIES {PAPER_FAMILIES}; "
@@ -760,11 +959,13 @@ def _operations_refusal(
             f"registration day {registered_on}); its exam is the promoted hypothesis's "
             "paper book alone (ADR 0016 point 4)"
         )
-    named = _variant_named(conn, variant_id)
+    _, differing = operations_differences(parsed, params, variant)
+    named = _parent_named(conn, parent_id, differing)
     if named is not None:
         raise LabRegistrationError(
-            f"{path}: variant {variant.slug} is already named by decision {named} (a "
-            "promotion or an operations book); one standalone registration per variant"
+            f"{path}: {variant.slug} is already named by decision {named} (a promotion or "
+            "an operations book) for these differences; one standalone registration per "
+            "parent and difference set"
         )
 
 
@@ -850,7 +1051,7 @@ def register(
     if is_lab_initialised(conn):
         _lab_refusal(conn, path, parsed, params, fingerprint, promotion_of, operations_of)
         if operations_of is not None:
-            _operations_refusal(conn, path, operations_of, code_vintage, params)
+            _operations_refusal(conn, path, parsed, operations_of, code_vintage, params)
     record = registry.register_hypothesis(
         conn,
         slug=parsed.slug,
@@ -936,8 +1137,8 @@ def register_operations_book(
     Raises `LabNotInitialised` on a store without the lab tables, `ValueError` for a
     blank reason, `UnknownHypothesis` for an unknown variant slug and
     `LabRegistrationError` for every refusal; nothing is written on any of them."""
-    # `sweep_report` reads `results`, which imports this module: imported at call time.
-    from tradepartner.backtest import results, sweep_report
+    # `results` imports this module: imported at call time.
+    from tradepartner.backtest import results
 
     require_lab(conn)
     if not reason.strip():
@@ -952,33 +1153,26 @@ def register_operations_book(
             operations_of=variant.hypothesis_id,
             code_vintage=code_vintage,
         )
-        standing = sweep_report.variant_standing(
-            conn, variant.hypothesis_id, code_vintage=code_vintage
-        )
-        if standing is None:  # `_operations_refusal` refused a non-variant already
-            raise LabRegistrationError(f"{path}: {variant_slug} is not a sweep variant")
-        (fingerprint,) = conn.execute(  # type: ignore[misc]
-            "SELECT fingerprint FROM sweep_variants WHERE hypothesis_id = ?",
-            [variant.hypothesis_id],
-        ).fetchone()
-        lab_registry.write_fingerprint(conn, record.hypothesis_id, str(fingerprint))
-        row = standing.row
+        parent = operations_parent(conn, path, variant.hypothesis_id)
+        standing = _parent_standing(conn, path, parent, code_vintage)
+        parsed = parse_file(path)
+        params = frozen.frozen_values(record)
+        _, differing = operations_differences(parsed, params, variant)
+        own = frozen.fingerprint(record.family, params, record.in_sample_start)
+        lab_registry.write_fingerprint(conn, record.hypothesis_id, own)
         values: dict[str, Any] = {
             "sweep_id": standing.sweep_id,
             "sweep_slug": standing.sweep_slug,
             "variant_hypothesis_id": variant.hypothesis_id,
             "variant_slug": variant.slug,
-            "variant_index": row.variant_index,
+            "variant_index": standing.variant_index,
             "operations_hypothesis_id": record.hypothesis_id,
-            "variant_trial_id": row.trial_id,
-            "variant_trial_current": row.status == "counted",
+            "variant_trial_id": standing.trial_id,
+            "variant_trial_current": standing.current,
             "family_n": results.family_n(conn, variant.family),
-            "excess_cagr_spy": row.excess_cagr_spy,
-            "sharpe_annual_excess_spy": row.sharpe_annual_excess_spy,
-            "dsr_excess": row.dsr_excess,
-            "cost_drag": row.cost_drag,
-            "turnover_annual": row.turnover_annual,
-            "max_drawdown": row.max_drawdown,
+            **standing.stats,
+            "parent_fingerprint": parent.fingerprint,
+            "differing_keys": differing,
         }
         decision_id = registry.record_decision(
             conn,

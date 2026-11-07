@@ -4079,8 +4079,10 @@ def make_app(
             str | None,
             typer.Option(
                 "--operations-book-of",
-                help="register as an operations file of this sweep variant's slug "
-                "(a paper book's machine test, never a promotion); needs --reason",
+                help="register as an operations file of this sweep variant's or "
+                "pre-lab hypothesis's slug (a paper book's road, never a promotion); it "
+                "may differ only in execution.fill_price and a higher "
+                "costs.per_side_bps; needs --reason",
             ),
         ] = None,
         reason: Annotated[
