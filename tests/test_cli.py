@@ -1308,14 +1308,23 @@ def _chain_store(settings: Settings) -> None:
 
 
 def test_health_prints_the_successor_chains_block_and_the_price_break_warning(
-    tmp_path: Path, fixture_store_path: Path
+    tmp_path: Path, fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#1922: every live chain is listed with its hand-over day and close
     ratio (hand-computed 19.33/15.41 = 1.25, 19.65/20.52 = 0.96,
     19.27/19.87 = 0.97), the latest EDGAR run's candidates sit beside it, and
-    the one break is a `warning: chain_price_break` line, never a failure."""
+    the one break is a `warning: chain_price_break` line, never a failure.
+    The three fixture chains are reviewed (#3142), so `chain_not_reviewed`
+    stays clean and only the display is under test."""
     settings = _settings(tmp_path, store=fixture_store_path)
     _chain_store(settings)
+    with duckdb.connect(str(settings.store.path), read_only=True) as conn:
+        chains = conn.execute(
+            "SELECT c.predecessor_id, c.successor_id, "
+            "(SELECT min(l.valid_from) FROM listings l WHERE l.security_id = c.successor_id) "
+            "FROM successor_chains c"
+        ).fetchall()
+    monkeypatch.setattr(health, "reviewed_chains", lambda: frozenset(chains))
     _run_row(
         settings,
         "r1",
