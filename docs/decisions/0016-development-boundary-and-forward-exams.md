@@ -255,19 +255,21 @@ The paper-net IR at which the exam passes half the time falls from 3.50 (written
 
 ## Amendment 2026-11-07 (#3146): the four-exam budget is counted in the store and in a git-tracked ledger
 
-*The orchestrator's fail-closed decision on #3146 (a sub-issue of #3125; the owner delegated it), recorded for the owner's word on this class-B PR. It replaces the budget bullet of the 2026-11-06 amendment's decision 2 and the budget lines of that amendment's consequences. The group-sequential exam, the skew guard, one exam per family and `paper.exam_max_count` = 4 stand. **No exam has started** (origin/main `1e8eeeea`: `src/` counts no exams; the registered families, `momentum` and `profitability`, have historical holdouts only; the two files with forward holdouts, B9 and the B4 sweep, are unregistered). So nothing is unwound and the ledger starts empty.*
+*The orchestrator's fail-closed decision on #3146 (a sub-issue of #3125; the owner delegated it), recorded for the owner's word on this class-B PR. It replaces the budget bullet of the 2026-11-06 amendment's decision 2 and the budget lines of that amendment's consequences. The group-sequential exam, the skew guard, one exam per family and `paper.exam_max_count` = 4 stand. **No exam has started**, as far as git shows (origin/main `1e8eeeea`): `src/` counts no exams; the committed files of the registered families, `momentum` and `profitability`, have historical holdouts only; and the two files with forward holdouts, B9 and the B4 sweep, are unregistered. Whether the store has an exam window is a fact about the store, not about git. It is checked by the read-only query in [rule 6](#rule-6-the-store-check-before-this-lands) before this PR lands. So nothing is unwound and the ledger starts empty.*
 
 **Why.** The family-vet review (2026-11-06/07, read-only, origin/main `1e8eeeea`; `~/tradepartner-probes/family-vet/review.md` on the owner's machine, sha256 `647d2fa3f3ef208b4ee18b052c1485aabd54aa4d3407de6562060a4d0816097a`), Q3: "Today it is not enforced at all. `paper.exam_max_count` and `exam_budget_spent` exist only in ADR 0016 l.116 and plan line T381a. Nothing in `src/` counts exams." Once built, it is "relabel-able in at least five ways": by amendment ("ADR 0016 l.116, l.175 and l.178 make a fifth exam an amendment away"), by window class, by timing ("A window started before T381a counts as unexamined"), by store ("a store-only count [is] as durable as the store") and by exam kind (point 8). Each rule below closes one of them.
 
 **Rule 1: what counts.** The budget counts **every exam window ever started**, whatever its outcome and whenever it started:
-- an exam window is a `paper_windows` row whose hypothesis's holdout is forward (`_forward()`, ADR 0016 point 4) when the window starts. The class is decided once, at start, from the stored holdout and the family's first registration day, and never re-read later. A later spend of that holdout (open question 2) does not take the window out of the count;
+- an exam window is a `paper_windows` row whose hypothesis's holdout is forward (`_forward()`, ADR 0016 point 4) when the window starts. The class is decided once, at start, from the stored holdout and the family's first registration day. T381a stores it as the frozen key `exam_class` (`exam` or `tracking`) in the window's `frozen_json`, and the count reads that key, never `_forward()` again. A later spend of that holdout (open question 2) or a later-imported older registration does not move the window;
+- a window with no `exam_class` key (started before T381a) is classed by re-running `_forward()` on today's store. That re-derivation can flip if an older registration of the family is imported later. If it flips, rule 4's ledger match fails, and the start is refused (fail-closed);
+- a forward holdout that is already spent when its window starts still gives an exam window and counts. Like a pre-T381a window, it is recorded as `unexamined` (rule 3), because a spent holdout is not an unspent exam of record (ADR 0023) and cannot pass;
 - `passed`, `failed`, `failed_futility` and `failed_void` windows all count, and so does a running one;
-- a window started before T381a is built counts. It froze no exam line, so it can never pass; it is reported as "exam window, unexamined, counted" (this replaces "a window started before T381a counts as unexamined" in plan line T381a);
+- a window started before T381a is built counts. It froze no exam line, so it can never pass. It is reported as "exam window, unexamined, counted" (this replaces "a window started before T381a counts as unexamined" in plan line T381a), and it is recorded by the backfill entry of rule 3;
 - the four are a **programme** budget across all families, and never reset.
 
 **Rule 2: a relabelled window counts.** A window, run or verdict counts toward the budget **unless it can never be read as edge evidence**, whatever it is called (a "shakedown", an "operations book", a "machine test", or a kind named in a new ADR). This is checked in three places, all mechanical except the last:
-- **(a) The class comes from dates, not from names.** Rule 1's test reads only the stored holdout and the family's first registration day, so a file name, a label or a book id cannot move a window out of the count. A holdout that starts on or before its family's first registration day can never be an exam on unseen data, because its months existed when the family was registered. Moving a book there makes it a tracking window, which decision 1 already bars from the live choice. Operations files and the shakedown cannot reach a forward holdout today (`hypothesis.py`'s forward-holdout refusal for operations files), and T381a's test keeps that true.
-- **(b) The live switch reads a pass only through the ledger.** T163b's `exam_not_passed` refusal accepts only a `passed` verdict whose window has a ledger entry (rule 3) marked `passed`. A result outside the ledger, whatever it is called, cannot name a book for live money, so it can never be read as edge evidence by the code that matters. The same holds for "forward return exam passed" in `paper status` and `lab status`: they print it only for a ledger entry marked `passed`.
+- **(a) The class comes from dates, not from names.** Rule 1's test reads only the stored holdout and the family's first registration day, so a file name, a label or a book id cannot move a window out of the count. A holdout that starts on or before its family's first registration day can never be an exam on unseen data, because its months existed when the family was registered. Moving a book there makes it a tracking window, which decision 1 already bars from the live choice. Operations files and the shakedown cannot reach a forward holdout today (`hypothesis.py`'s forward-holdout refusal for operations files). T381a re-runs that refusal's test, `test_hypothesis.py`'s operations-file forward-holdout case, unchanged.
+- **(b) The live switch reads a pass only through the ledger.** T163b's `exam_not_passed` refusal accepts only a `passed` verdict whose window has a ledger entry (rule 3) marked `passed`. A result outside the ledger, whatever it is called, cannot name a book for live money, so it can never be read as edge evidence by the code that matters. The same holds for "forward return exam passed" in `paper status` and `lab status`: they print it only for a ledger entry marked `passed`. While T381's verdict is `passed` but the entry still says `running`, they print "forward return exam passed by T381, not yet recorded in the ledger", and the live switch still refuses.
 - **(c) A new kind of exam is an amendment that names its slots.** Any ADR, spec or plan amendment that creates a route by which a result can be named in the live choice (decision 1), including a point-8 historical exam (decision 3), states in its own text that each start of that route takes a ledger entry and a budget slot, and names the count after it. The class-B review checks this: spec-critic on every `docs/decisions`, `docs/specs` and `docs/plans` PR, and the owner's word. This is the one judgment-based part. Rules (a) and (b) mean that skipping it gives a route that cannot reach the live switch.
 
 **Rule 3: the exam ledger.** [`docs/research/exam-ledger.toml`](../research/exam-ledger.toml) is git-tracked and append-only, with one `[[exam]]` entry per exam start. It holds the budget too, so a store rebuild, restore or copy cannot reset the count:
@@ -279,9 +281,9 @@ The paper-net IR at which the exam passes half the time falls from 3.50 (written
   - `book_id`;
   - `window_id`: the store's `paper_windows.window_id`, 0 while `pending`;
   - `start_date`: the window's first rebalance session, `T_0`;
-  - `kill_line`: the URL of the kill line comment posted on the finalist's issue;
+  - `kill_line`: the URL of the kill line comment posted on the finalist's issue, or `"none"` for an `unexamined` entry only;
   - `campaign_k`: the k its kill line states under the idea-pipeline multiplicity rule, or −1 when the line states none;
-  - `outcome`: one of `pending`, `running`, `passed`, `failed`, `failed_futility`, `failed_void` or `not_started`;
+  - `outcome`: one of `pending`, `running`, `passed`, `failed`, `failed_futility`, `failed_void`, `unexamined` or `not_started`;
   - `outcome_on`: the date the outcome was last set, or the start date while `pending` or `running`.
 - **The order of work for one exam.** The ledger leads the store, so it cannot lag the store:
   1. The kill line is posted on the issue (decision 2).
@@ -289,27 +291,43 @@ The paper-net IR at which the exam passes half the time falls from 3.50 (written
   3. `paper start` runs from a checkout that has that entry.
   4. A class-B PR sets `window_id` and `outcome = "running"`.
   5. A class-B PR sets the terminal outcome when T381's verdict is final.
+- **The backfill entry for an unexamined window.** An exam window that froze no exam line is recorded by one class-B PR. This covers a window started before T381a and a forward holdout spent at start (rule 1). The PR appends the entry with its real `window_id`, `kill_line = "none"` and the terminal outcome `unexamined`, which counts toward the budget. Until that PR lands, every later exam start is refused `exam_ledger_mismatch` (fail-closed).
 - **Append-only means:**
   - an entry is never removed or reordered, and no field other than `window_id`, `outcome` and `outcome_on` changes;
   - `window_id` changes once, from 0 to the store's id;
-  - `outcome` moves only forward: `pending` → `running` or `not_started`, then `running` → a terminal state, and a terminal state never changes;
+  - `outcome` moves only forward: `pending` → `running` or `not_started`, then `running` → a terminal state, and a terminal state never changes. `unexamined` is terminal from the moment it is appended;
+  - the top-level `budget` changes only together with `budget_adr`, under rule 5;
   - `not_started` is allowed only for an entry whose `paper start` never succeeded (its `window_id` is 0). Such an entry stays in the file, and it does not count toward the budget because it read no exam month.
-- **The file is class B whatever its path.** `docs/research/` is class A by default (git-workflow rule 7). The ledger is an exception: every change to it lands only on the owner's word, never in an orchestrator train. The merge-train classifier gains this exception in a follow-up (#3147). Until that lands, the orchestrator treats the file as class B by this rule.
+- **The file is class B whatever its path.** `docs/research/` is class A by default (git-workflow rule 7). The ledger is an exception: every change to it lands only on the owner's word, never in an orchestrator train. The merge-train classifier gains this exception in #3147. Until that lands, the orchestrator treats the file as class B by this rule.
+- **Append-only is checked by code, on every PR.** T381b's pure `check_append_only(old, new)` compares the ledger on `origin/main` with the PR's copy. It refuses a removed or reordered entry, a change to any field but the three, a second `window_id` change, and a backward or illegal outcome move. `scripts/ready_pr.py` runs it on any PR that touches the file (#3147, class B). T381a depends on #3147, so no exam can start before this check exists.
 - **The budget lives in the file too.** The ledger's top-level `budget` (4 today) and `budget_adr` (the link to the rule that sets it) are the programme budget of record.
 
-**Rule 4: what T381a refuses (fail-closed).** At `paper start` of an exam window (rule 1), before any broker call or write, T381a loads the ledger from the checkout and checks it against the store:
-- **`exam_ledger_invalid`** refuses a start when the file is missing, does not parse, has a non-contiguous `seq`, a repeated non-zero `window_id`, an unknown `outcome`, or a `pending` entry with a non-zero `window_id`.
+**Rule 4: what T381a refuses (fail-closed).** At `paper start` of an exam window (rule 1), before any broker call or write, T381a loads the ledger and checks it against the store. The file is found at `docs/research/exam-ledger.toml` under the repository root of the running code (the checkout the `tradepartner` package is installed from in editable mode), never under the working directory. A missing file is refused as invalid.
+- **`exam_ledger_invalid`** refuses a start when one copy of the file breaks any rule-3 invariant:
+  - the file is missing or does not parse;
+  - a field is missing, ill-typed or unknown;
+  - `seq` is not contiguous from 1;
+  - a non-zero `window_id` is repeated;
+  - an `outcome` is unknown;
+  - a `pending` or `not_started` entry has a non-zero `window_id`;
+  - a `running`, terminal or `unexamined` entry has `window_id = 0`;
+  - `kill_line` is `"none"` on an entry that is not `unexamined`, or is not a URL;
+  - `campaign_k` is below −1;
+  - `budget` is not an integer of at least 1, or `budget_adr` is empty.
+- **`exam_ledger_unreviewed`** refuses a start when the ledger read differs from the committed copy on the last fetched `origin/main` (`git show origin/main:docs/research/exam-ledger.toml`), or when git cannot be read. So a local, unreviewed `pending` entry cannot open an exam, and neither can a checkout whose ledger lags `origin/main`.
 - **`exam_ledger_mismatch`** refuses a start when the store and the ledger disagree:
-  - the store's exam windows (rule 1, in `started_at` order) must match, one to one and in order, the entries whose outcome is not `pending` or `not_started`, on `window_id`, `hypothesis_fingerprint`, `book_id` and `start_date`;
+  - the store's exam windows (rule 1, in `started_at` order) must match, one to one and in order, the entries whose outcome is not `pending` or `not_started` (`unexamined` included), on `window_id`, `hypothesis_fingerprint`, `book_id` and `start_date`;
   - exactly one `pending` entry must exist, and it must name this start's hypothesis fingerprint, book and `T_0`;
   - `paper.exam_max_count` must not be above the ledger's `budget`.
-- **`exam_budget_spent`** refuses a start when the count reaches the budget. The count is every entry that is not `not_started`, this start's `pending` entry included. A start is refused when the count is above `min(paper.exam_max_count, budget)`. So with four exams counted, a fifth `pending` entry is refused.
+- **`exam_budget_spent`**: the count is every entry that is not `not_started`, this start's `pending` entry included. A start is refused when the count is above `min(paper.exam_max_count, budget)`. So the fourth exam starts, and with four counted a fifth `pending` entry is refused.
 - A tracking window (rule 1's test false) reads no ledger and is never refused by it.
 
 **Rule 5: a fifth exam needs two changes, both on the owner's word:**
 - **(i) A class-B amendment of this ADR that names the count.** It states the new budget, lists the ledger entries already spent by `seq`, and gives the smaller per-exam rate that keeps the family-wise rate (decision 2, as amended 2026-11-07).
 - **(ii) A config change.** This means a new pinned maximum for `paper.exam_max_count` in the config validator (T381), plus the ledger's `budget` and `budget_adr` updated to name that amendment. The ledger change is class B (rule 3).
 - **Neither works alone.** Rule 4's `exam_ledger_mismatch` refuses a config whose `paper.exam_max_count` is above the ledger's `budget`. A higher `budget` with the validator's pin at 4 is still refused at 4.
+
+<a id="rule-6-the-store-check-before-this-lands"></a>**Rule 6: the store check before this lands.** Before the owner's merge, the orchestrator runs one read-only query on the real store (`duckdb.connect(..., read_only=True)`, under a minute, outside the ingest windows): the `paper_windows` rows whose hypothesis's `holdout_start` is after its family's `MIN(registered_at)`. He posts the count and the time on #3146. It must be 0 for the ledger to land empty. If it is not 0, each such window gets a backfill `unexamined` entry in this PR before merge.
 
 **Display (diagnostic only).** `lab status` prints **"campaign k <k>"** beside each family's N. The value is the family's latest ledger entry's `campaign_k`, or "campaign k not recorded" when the family has no entry or its entry says −1. `paper status` prints "exam budget <count> of <budget> (ledger), <S> exam windows in the store". No refusal, gate or verdict reads campaign k; it is shown so that a reader sees how many looks lie behind a family's finalist (the review, Q2 point 1: "campaign k is a draft").
 
@@ -322,7 +340,8 @@ The paper-net IR at which the exam passes half the time falls from 3.50 (written
   - each exam start gets the owner's word on a named entry before the window opens.
 - **Bad / accepted:**
   - every exam start now needs a class-B PR before `paper start`, and two more afterwards;
-  - a `paper start` from a checkout whose ledger lags `origin/main` is refused;
+  - exam starts happen one at a time, a class-B PR round-trip apart, because only one `pending` entry may exist;
+  - a `paper start` from a checkout whose ledger differs from the last fetched `origin/main` (ahead or behind) is refused;
   - rule 2(c) is still a review judgment, and rule 2(b) is its backstop;
-  - until #3147 lands, the class-B status of the ledger is a written rule, not code.
+  - until #3147 lands, the class-B status of the ledger and its append-only check are written rules, not code. T381a depends on #3147, so no exam starts in that gap.
 - **Reversibility:** cheap before the first `pending` entry. After it, the entry and its slot stand.
