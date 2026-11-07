@@ -228,8 +228,9 @@ def next_trial_cost(
 ) -> NextTrialCost:
     """The SR\\* `family` has now and the SR\\* `added` more counted trials would give.
     N is `family_n` (the one N function); V is `family_sharpes(conn, family).variance(basis)`
-    at today's trials, floored at `floor` when `floor` is above zero exactly as
-    `lab.run_sweep`'s close floors it (a None V is the floor). Unfloored, a None V (fewer
+    at today's trials; a None V (fewer than two pairs) is `floor` when `floor` is above
+    zero, exactly as `lab.run_sweep`'s close replaces it (a defined V is never floored,
+    #3127). Unfloored, a None V (fewer
     than two pairs) gives 0 for both and `note` says so. `expected_max_sharpe` is never
     called with fewer than one trial (a family with no counted trial has SR\\* 0 now).
     Read-only."""
@@ -245,12 +246,12 @@ def next_trial_cost(
         note = "V is unknown (fewer than two pairs) and no floor applies: SR* is 0"
         used: float | None = None
     else:
-        used = max(variance if variance is not None else 0.0, floor)
+        used = variance if variance is not None else floor
 
     def at(n: int) -> float:
         return expected_max_sharpe(n, used) if used is not None and n >= 1 else 0.0
 
-    floored = floor > 0 and (variance is None or variance < floor)
+    floored = floor > 0 and variance is None
     return NextTrialCost(
         n_now=n_now,
         n_next=n_next,

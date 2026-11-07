@@ -448,10 +448,12 @@ class TestResultRow:
 
 
 class TestTrialCount:
-    """N counts `ok`, non-synthetic, in-sample trials of the family, this one included;
-    V is over the latest trial per (parameter hash, window) pair (spec req 8)."""
+    """N counts the distinct return series among `ok`, non-synthetic, in-sample trials
+    of the family, this one included: an identical rerun (same pair, data vintage and
+    code tree) is not a second series (#3127); V is over the latest trial per
+    (parameter hash, window) pair (spec req 8)."""
 
-    def test_rerun_raises_n_and_keeps_one_pair(
+    def test_an_identical_rerun_keeps_n_and_one_pair(
         self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
     ) -> None:
         settings = _settings(tmp_path)
@@ -459,7 +461,7 @@ class TestTrialCount:
         _trial(conn, settings, tmp_path)
         handle, _, _ = _trial(conn, settings, tmp_path)
         row = _result_row(conn, handle.trial_id)
-        assert row["n_trials"] == 2
+        assert row["n_trials"] == 1
         assert row["dsr_basis"] == "psr"
         assert row["sharpe_variance"] is None
 
@@ -513,7 +515,7 @@ class TestTrialCount:
         assert _result_row(conn, other.trial_id)["n_trials"] == 1
         after, _, _ = _trial(conn, settings, tmp_path)
         row = _result_row(conn, after.trial_id)
-        assert row["n_trials"] == 2
+        assert row["n_trials"] == 1  # an identical rerun of the first trial (#3127)
         assert row["dsr_basis"] == "psr"
 
     def test_first_run_of_an_empty_family_when_uncounted(
@@ -568,8 +570,9 @@ class TestFamilyN:
             stored.append(_result_row(conn, handle.trial_id)["n_trials"])
             if counts:
                 assert stored[-1] == family_n(conn, "momentum")
-        assert stored == [1, 2, 2, 2, 3]
-        assert family_n(conn, "momentum") == 3
+        # The last run is an identical rerun of the first: not a new series (#3127).
+        assert stored == [1, 2, 2, 2, 2]
+        assert family_n(conn, "momentum") == 2
         assert family_n(conn, "momentum") == registry.family_sharpes(conn, "momentum").n_trials
 
     def test_family_n_counts_a_pending_trial_once(
@@ -578,11 +581,22 @@ class TestFamilyN:
         settings = _settings(tmp_path)
         _register(conn, settings)
         _trial(conn, settings, tmp_path)
+        # The first trial's code tree differs, so the pending rerun is a new series.
+        conn.execute("UPDATE trials SET code_tree_sha256 = 'x' WHERE trial_id = 1")
         pending = _open(conn, settings, tmp_path)
         assert family_n(conn, "momentum") == 1
         assert family_n(conn, "momentum", pending=pending) == 2
         write_results(conn, pending, _run(settings, pending), settings)
         assert family_n(conn, "momentum") == 2 == _result_row(conn, pending.trial_id)["n_trials"]
+
+    def test_an_identical_pending_rerun_adds_nothing(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        _trial(conn, settings, tmp_path)
+        pending = _open(conn, settings, tmp_path)
+        assert family_n(conn, "momentum", pending=pending) == 1
 
 
 # --- research runs in N (research-registry spec req 9; T83b) ---------------------------

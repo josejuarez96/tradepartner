@@ -48,6 +48,10 @@ CLASS_A_PREFIXES = (
     "docs/runbooks/",
     "changelog.d/",
 )
+#: Files under a class-A prefix that are class B anyway: the family registry
+#: (`FAMILIES`, `FAMILY_PARENTS`), whose root-or-child call for a new family is the
+#: owner's (strategy-lab spec open question 11; #3126).
+CLASS_B_PATHS = ("src/tradepartner/config_backtest.py",)
 #: Every train comment's first line starts with this.
 COMMENT_PREFIX = "merge-train:"
 OUTCOMES = (
@@ -249,7 +253,7 @@ def eligibility(
     if pr.unresolved_threads:
         plural = "" if pr.unresolved_threads == 1 else "s"
         return f"(j) {pr.unresolved_threads} unresolved review thread{plural}"
-    class_b = [p for p in diff_paths if not p.startswith(CLASS_A_PREFIXES)]
+    class_b = [p for p in diff_paths if not p.startswith(CLASS_A_PREFIXES) or p in CLASS_B_PATHS]
     if class_b and "owner-ok" not in labels:
         return f"(k) class B ({class_b[0]}): needs the owner-ok label (the owner's word)"
     return None

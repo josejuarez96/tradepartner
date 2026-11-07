@@ -26,9 +26,9 @@ loosens a registered family or sweep (spec req 1, Definitions > Family rules).
 
 **SR\\* values.** `close_sweep_run` stores the `n_trials_at_end` and
 `sr_star_annual_at_end` its caller computed (the runner, T107, from
-`results.family_n` and `family_sharpes` with V floored at the family rules'
-`min_sharpe_variance_annual`); `family_sr_star_high_water_mark` takes today's
-N and annual V the same way, as arguments, and floors V itself. This module
+`results.family_n` and `family_sharpes`, a V undefined with fewer than two pairs replaced by
+`family_v_floor`, #3127); `family_sr_star_high_water_mark` takes today's
+N and annual V the same way, as arguments, and applies that floor itself. This module
 computes no annual V.
 """
 
@@ -39,7 +39,7 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final
@@ -50,6 +50,7 @@ import tradepartner.backtest.frozen as _frozen
 from tradepartner.backtest.frozen import FROZEN_KEY_DEFAULTS, frozen_values, is_default
 from tradepartner.backtest.holdout import Frozen, default_in_sample_window
 from tradepartner.backtest.metrics import expected_max_sharpe
+from tradepartner.backtest.schedule import MONTHS_PER_YEAR, rebalance_sessions
 from tradepartner.config import FORBIDDEN_AXIS_PREFIXES, Settings, get_settings
 from tradepartner.store.db import insert_row, utc_now
 from tradepartner.store.lab_schema import require_lab
@@ -625,6 +626,20 @@ def first_session(conn: duckdb.DuckDBPyConnection) -> date | None:
     return session if isinstance(session, date) else None
 
 
+def family_v_floor(rules: FamilyRules) -> float:
+    """The V that stands in for an undefined V (fewer than two distinct return series;
+    strategy-lab spec, amendment 2026-11-06, #3127): the larger of the stored
+    `min_sharpe_variance_annual` and the null variance of an annual Sharpe over the
+    family window, ppy / T with ppy = 12 and T the window's XNYS month-end periods
+    (40 for momentum's 2020-08-31 .. 2023-12-29, so 0.30). A defined V is never
+    floored: it already carries the family's correlation."""
+    sessions = rebalance_sessions(
+        rules.in_sample_start, rules.holdout_start - timedelta(days=1), "month_end"
+    )
+    periods = max(len(sessions) - 1, 1)
+    return max(rules.min_sharpe_variance_annual, MONTHS_PER_YEAR / periods)
+
+
 def family_sr_star_high_water_mark(
     conn: duckdb.DuckDBPyConnection,
     family: str,
@@ -635,8 +650,8 @@ def family_sr_star_high_water_mark(
     """The family's SR\\*_annual high-water mark (spec, Definitions): the maximum
     of every `sweep_runs.sr_star_annual_at_end` of every sweep in the family,
     the parent's mark seeded into the rules (`sr_star_seed_annual`), and today's
-    value, `expected_max_sharpe(n_trials_today, V)` with V floored at the rules'
-    `min_sharpe_variance_annual` (a None V, fewer than two pairs, is the floor).
+    value, `expected_max_sharpe(n_trials_today, V)` with a None V (fewer than two
+    pairs) replaced by `family_v_floor(rules)`; a defined V is used as it is (#3127).
     Today's value is 0 with no counted trial. Refuses a family with no rules
     and a non-finite V."""
     require_lab(conn)
@@ -645,7 +660,11 @@ def family_sr_star_high_water_mark(
         raise LabRegistryError(f"family {family!r} has no family rules")
     if sharpe_variance_annual_today is not None and not math.isfinite(sharpe_variance_annual_today):
         raise LabRegistryError(f"today's annual V is not finite: {sharpe_variance_annual_today}")
-    variance = max(sharpe_variance_annual_today or 0.0, rules.min_sharpe_variance_annual)
+    variance = (
+        sharpe_variance_annual_today
+        if sharpe_variance_annual_today is not None
+        else family_v_floor(rules)
+    )
     marks = [expected_max_sharpe(n_trials_today, variance) if n_trials_today >= 1 else 0.0]
     if rules.sr_star_seed_annual is not None:
         marks.append(rules.sr_star_seed_annual)

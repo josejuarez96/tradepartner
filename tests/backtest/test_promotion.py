@@ -688,32 +688,27 @@ def test_v_shrink_a_clustered_sweep_is_judged_at_an_earlier_sweeps_mark(lab: Lab
     _judged_at(lab, clustered, earlier_mark)
 
 
-def test_v_shrink_a_first_clustered_sweep_faces_the_variance_floor(
+def test_v_shrink_a_first_clustered_sweep_uses_its_own_defined_v(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     """No twin trial: the family's only counted trials are the sweep's two, with
-    near-identical Sharpes (V ~ 0). SR\\* at the floored V is positive with N = 2."""
+    near-identical Sharpes (V ~ 0). Since #3127 a defined V is never floored (it already
+    carries the correlation; the spec amendment 2026-11-06 replaces the clustered-grid
+    floor), so the mark is SR\\* at that V, about 0, not at the floor."""
     root = tmp_path / "files"
     root.mkdir()
     lab = Lab(lab_store, settings, root)
     lab.twin()
-    sweep, variants = lab.sweep([0.15, 0.25])
+    _, variants = lab.sweep([0.15, 0.25])
     lab.trial(variants[0], 0.1)
     lab.trial(variants[1], 0.0999)
     report = lab.report()
-    assert report.sharpe_variance_annual_excess is not None
-    assert report.sharpe_variance_annual_excess < 1e-6
+    v = report.sharpe_variance_annual_excess
+    assert v is not None and v < 1e-6
     verdicts = report.verdicts
     assert verdicts is not None
-    rules = lab_registry.family_rules(lab.conn, "momentum")
-    assert rules is not None
-    assert verdicts.sr_star_high_water_annual == pytest.approx(
-        expected_max_sharpe(2, rules.min_sharpe_variance_annual)
-    )
-    assert verdicts.sr_star_high_water_annual > 0
-    # Against the unfloored SR* (about 0) the argmax would have cleared 0.5.
-    assert report.rows[0].dsr_excess is not None and report.rows[0].dsr_excess >= 0.5
-    _refused(lab, lab.promoted_file(sweep, variants[0]), "below promote_at_least")
+    assert verdicts.sr_star_high_water_annual == pytest.approx(expected_max_sharpe(2, v))
+    assert verdicts.sr_star_high_water_annual < 0.01
 
 
 def test_v_shrink_a_broad_sweep_stopped_short_still_set_the_mark(lab: Lab) -> None:

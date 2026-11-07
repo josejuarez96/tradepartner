@@ -2153,26 +2153,10 @@ def family_sharpes(
     pair's latest trial lacks a finite base-level period Sharpe or a positive
     `periods_per_year`.
     """
-    if pending is not None:
-        _check_trial_row(conn, pending)
-    counted = conn.execute(
-        f"SELECT t.trial_id, h.params_json, t.start_session, t.data_cutoff {_COUNTED_FROM} "
-        "ORDER BY t.trial_id",
-        [family, pending.trial_id if pending is not None else None],
-    ).fetchall()
-    latest: dict[tuple[str, date, datetime | None], tuple[int, float]] = {}
-    for trial_id, params_json, start, cutoff in counted:
-        params = json.loads(params_json)
-        cadence = frozen_values(_Stored(params, family))[CADENCE_KEY]
-        pair = (
-            _canonical_set_hash(params, family),
-            _first_rebalance_on_or_after(start, cadence),
-            cutoff,
-        )
-        latest[pair] = (trial_id, float(params[BASE_COST_KEY]))
+    n_series, latest = _counted_pairs(conn, family, pending)
     chosen = sorted(latest.values())
     return FamilySharpes(
-        n_trials=len(counted),
+        n_trials=n_series,
         raw=_annual_sharpes(conn, chosen, "raw"),
         excess_spy=_annual_sharpes(conn, chosen, "excess_spy"),
     )
@@ -2188,18 +2172,47 @@ _COUNTED_FROM: Final = (
 )
 
 
+def _counted_pairs(
+    conn: duckdb.DuckDBPyConnection, family: str, pending: TrialHandle | None
+) -> tuple[int, dict[tuple[str, date, datetime | None], tuple[int, float]]]:
+    """The number of distinct return series among the counted trials and, per
+    distinct (canonical frozen set, first rebalance, data cutoff) pair, its latest
+    trial id and base cost (V's pairs). A trial is the same series as an earlier one
+    only when it is an identical rerun: same pair, same `data_vintage` and same
+    `code_tree_sha256` (#3127). A rerun on new data or new code, or one missing either
+    stamp, is a new series (fail-closed)."""
+    if pending is not None:
+        _check_trial_row(conn, pending)
+    counted = conn.execute(
+        "SELECT t.trial_id, h.params_json, t.start_session, t.data_cutoff, "
+        f"t.data_vintage, t.code_tree_sha256 {_COUNTED_FROM} ORDER BY t.trial_id",
+        [family, pending.trial_id if pending is not None else None],
+    ).fetchall()
+    latest: dict[tuple[str, date, datetime | None], tuple[int, float]] = {}
+    series: set[tuple[object, ...]] = set()
+    for trial_id, params_json, start, cutoff, vintage, code in counted:
+        params = json.loads(params_json)
+        cadence = frozen_values(_Stored(params, family))[CADENCE_KEY]
+        pair = (
+            _canonical_set_hash(params, family),
+            _first_rebalance_on_or_after(start, cadence),
+            cutoff,
+        )
+        latest[pair] = (trial_id, float(params[BASE_COST_KEY]))
+        stamps = (vintage, code) if vintage is not None and code is not None else (trial_id,)
+        series.add((*pair, *stamps))
+    return len(series), latest
+
+
 def count_counted_trials(
     conn: duckdb.DuckDBPyConnection, family: str, pending: TrialHandle | None = None
 ) -> int:
-    """How many trials `family_sharpes` counts (same rows, same `pending` rule). The
-    DSR's N is `backtest.results.family_n`, which calls this; nothing else should."""
-    if pending is not None:
-        _check_trial_row(conn, pending)
-    row = conn.execute(
-        f"SELECT COUNT(*) {_COUNTED_FROM}",
-        [family, pending.trial_id if pending is not None else None],
-    ).fetchone()
-    return int(row[0]) if row is not None else 0
+    """N's backtest part: the distinct return series among the trials
+    `family_sharpes` counts (same rows, same `pending` rule), so an identical rerun
+    (same pair, data vintage and code tree) is not a second trial (strategy-lab spec,
+    amendment 2026-11-06, #3127). The DSR's N is
+    `backtest.results.family_n`, which calls this; nothing else should."""
+    return _counted_pairs(conn, family, pending)[0]
 
 
 @dataclass(frozen=True)
