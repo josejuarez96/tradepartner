@@ -213,7 +213,7 @@ The record of looks before rung 4 (rules L1 to L5 of the [strategy-discovery rep
 
 **L3. Disclosure at rung 4.** A sweep or hypothesis file for an idea with ledger rows states, in its prior-evidence disclosure, the ledger's looks for that mechanism and its batch's denominator. Promotion still uses the DSR at the family's high-water mark, unchanged.
 
-**L4. Rung 2 window (adopted 2026-10-19).** A new item's rung-2 public read uses open data **ending 2019-12**, before every family's `in_sample_start` (2020-08-31), so rung 4 is a test on months the screen never saw. Cost: post-2020 decay is not seen until rung 4. B9 and IRRX read 2010-2024 and are not re-read.
+**L4. Rung 2 window (adopted 2026-10-19).** A new item's rung-2 public read uses open data **ending 2019-12**, before every family's `in_sample_start` (2020-08-31), so rung 4 is a test on months the screen never saw. Cost: post-2020 decay is not seen until rung 4. B9 and IRRX read 2010-2024 and are not re-read. *(Replaced for rung 2 on 2026-11-06, #3092: the window is 2009-01 to 2025-12 under [ADR 0023's amendment](../decisions/0023-break-first-fast-books-paper-exam.md#amendment-2026-11-06-3092-a-calibrated-rung-2); past kills are re-scored in #3098.)*
 
 **L5. Close the loop.** A ladder verdict is recorded as a `TP-` claim (research-program section 6). Done 2026-10-19 for B3 (TP-5) and B9 (TP-6); IRRX's rung 2 is IL-2; the beyond-long-only claims are LS-1 to LS-20.
 
