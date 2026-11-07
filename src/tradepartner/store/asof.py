@@ -492,8 +492,9 @@ def refused_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[Refuse
     """The stored chains known at `t` that `live_chains(t)` leaves out (#3097),
     sorted by successor. A chain is refused, from rows known at `t` only, when
 
-    - its predecessor's latest Form 25 episode (`delistings`, greatest
-      `filed_at`) has a latest reason revision in `CHAIN_REFUSING_REASONS`
+    - its predecessor's latest equity-class Form 25 episode (`delistings`,
+      greatest `filed_at`; a debt class's episode is ignored) has a
+      latest reason revision in `CHAIN_REFUSING_REASONS`
       (Audit A s10b: a bankrupt equity chained to the post-reorganisation
       one); or
     - its hand-over day (the successor's first listing row under the
@@ -549,7 +550,7 @@ def _refused(
     """`refused_chains` over `pairs` (the stored chains at `t`)."""
     # Local imports: both modules import this one.
     from tradepartner.store.delisting_reasons import delisting_reasons_as_of
-    from tradepartner.store.delistings import delistings_as_of
+    from tradepartner.store.delistings import _is_debt_title, delistings_as_of
 
     t = _validate_t(t)
     predecessors = sorted({predecessor for predecessor, _ in pairs})
@@ -561,17 +562,23 @@ def _refused(
     latest: dict[str, datetime] = {}
     if _has_table(conn, "delistings"):
         episodes = delistings_as_of(conn, t, predecessors)
-        for security_id, filed_at, effective_on in episodes.select(
-            "security_id", "filed_at", "effective_on"
+        for security_id, title, filed_at, effective_on in episodes.select(
+            "security_id", "class_title", "filed_at", "effective_on"
         ).iter_rows():
+            # A debt class's Form 25 (notes, #2937) says nothing about the equity
+            # the chain carries: it neither hides an equity reason nor moves the end.
+            if _is_debt_title(title):
+                continue
             latest[security_id] = max(filed_at, latest.get(security_id, filed_at))
             if effective_on is not None:
                 ends[security_id] = max(effective_on, ends.get(security_id, effective_on))
     if _has_table(conn, "delistings") and _has_table(conn, "delisting_reasons"):
         found = delisting_reasons_as_of(conn, t, predecessors)
-        for security_id, filed_at, reason in found.select(
-            "security_id", "delisting_filed_at", "reason"
+        for security_id, title, filed_at, reason in found.select(
+            "security_id", "delisting_class_title", "delisting_filed_at", "reason"
         ).iter_rows():
+            if _is_debt_title(title):
+                continue
             # Two episodes filed at the same latest time (two exchanges): any
             # refusing reason among them refuses, never the sort order.
             if latest.get(security_id) == filed_at and reasons.get(security_id) not in (

@@ -380,3 +380,54 @@ def test_the_resolver_facts_follow_every_stored_chain(conn: duckdb.DuckDBPyConne
     _reason(conn, "bankruptcy")
     assert facts_as_of(conn, T)["security_id"].to_list() == [OLD]
     assert facts_as_of(conn, T, every_stored_chain=True)["security_id"].to_list() == [NEW]
+
+
+def test_a_later_notes_form25_neither_hides_the_reason_nor_moves_the_end(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """A debt class's Form 25 filed after the equity's (notes, no reason row, effective
+    months later) is ignored: the equity's bankruptcy reason still refuses the chain, and
+    without it the notes' effective day never stretches the predecessor's end."""
+    notes = datetime(2023, 3, 20, 21, tzinfo=UTC)
+    insert_row(
+        conn,
+        "delistings",
+        {
+            "security_id": OLD,
+            "form": "25",
+            "class_title": "5.25% Senior Notes due 2030",
+            "exchange": "NYSE",
+            "filed_at": notes,
+            "effective_on": date(2023, 12, 29),
+        }
+        | _fact(notes),
+    )
+    _reason(conn, "bankruptcy")
+    assert [r.why for r in refused_chains(conn, T)] == ["predecessor_reason:bankruptcy"]
+
+
+def test_a_notes_form25_does_not_stretch_the_window() -> None:
+    t = session_close(date(2023, 8, 31))
+    conn = _store(
+        successor_from=date(2023, 8, 1),
+        successor_known=datetime(2023, 7, 28, tzinfo=UTC),
+        chain_known=datetime(2023, 8, 2, 21, tzinfo=UTC),
+    )
+    try:
+        notes = datetime(2023, 7, 20, 21, tzinfo=UTC)
+        insert_row(
+            conn,
+            "delistings",
+            {
+                "security_id": OLD,
+                "form": "25",
+                "class_title": "5.25% Senior Notes due 2030",
+                "exchange": "NYSE",
+                "filed_at": notes,
+                "effective_on": date(2023, 7, 31),
+            }
+            | _fact(notes),
+        )
+        assert [r.why for r in refused_chains(conn, t)] == ["hand_over_window:97"]
+    finally:
+        conn.close()
