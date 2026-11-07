@@ -852,9 +852,10 @@ def resume(
             # Only the verdicts on runs the release would clear (#451's refusal).
             # A collection verdict on such a run is the same run's verdict.
             accepted = faulted
-        if accept_rejections or band_accepted:
             _accept(connect, resume_id, accepted, clock, stamps, band_accepted)
-            accepted_band = tuple(band_accepted)
+        elif band_accepted:
+            _accept(connect, resume_id, (), clock, stamps, band_accepted)
+        accepted_band = tuple(band_accepted)
         cleared = {b.run_id for b in accepted}
         reasons = [b.message for b in collected.rejections if b.run_id not in cleared]
         judged = {b.run_id for b in collected.rejections}
