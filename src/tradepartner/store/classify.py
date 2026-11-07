@@ -52,8 +52,41 @@ known at one instant:
    in `W`, `U`, `R` (Nasdaq fifth-letter codes) or `Y` (ADR). A class
    letter (`BRK.B`) is no suffix. This is ADR 0006's documented pre-2019
    heuristic.
-8. `common_default`: the issuer's latest status form is domestic: `common`.
+8. `common_default`: the issuer's latest status form is domestic: `common`,
+   once its filings name a SIC or it has filed a periodic report (`10-K`,
+   `10-KT`, `10-K405`, `10-KSB`, `10-Q`, `10-QSB`). Before either, the class is
+   `unclassifiable` by `no_sic_or_periodic` (#3076, #3053 item 6, decision b):
+   the SEC gives a blank check SIC 6770 only after its first S-1, so a shell
+   whose S-1 header names no SIC is never a stock before rule 5 sees it. The
+   same wait applies to a `title_common` row (rule 6). An issuer filing
+   10-Ks whose headers never name a SIC (a royalty trust) is `common` from its
+   first periodic report, as before.
 9. `no_rule_matched`: `unclassifiable`.
+
+**Issuer class** (#3076, #3053 item 6, decision a). Each row also carries
+`issuer_class`, one tag read from the same instant's evidence, first match
+wins, independent of `security_type` (a BDC stays `fund` or `common`, an MLP
+`unit` or `common`; universe rule 1 reads the tag through
+`universe.exclude_issuer_classes`):
+
+- `spac`: the latest header SIC is 6770.
+- `bdc`: the issuer has elected business-development-company status (an
+  `N-54A` or `N-6F`, until an `N-54C` withdraws it), or has filed an `N-2`
+  while its latest status form is domestic and it has never filed a
+  closed-end fund's report (`N-CSR`, `N-CSRS`, `N-PORT`, `NPORT-P`): a BDC
+  reports on 10-K and 10-Q (elections before EDGAR are not on it).
+- `mlp`: a publicly traded partnership: the issuer's latest filing-index name
+  (the name at that filing) ends in `L.P.`, `LP` or `Limited Partnership`, or
+  the class's latest cover-page title names partnership units ("Common
+  Units", "limited partner interests"). SIC alone never tags: 1311, 4922 and
+  6798 hold corporations and REITs too. Commodity pools organised as LPs are
+  tagged too (they are no common stock either).
+- `foreign`: the issuer's latest status form is foreign (rule 4's test).
+- else `None`.
+
+A tag changes only with evidence: a name, title, form or SIC known at the
+row's `known_at`, never a later one (the conversion of an LP to a
+corporation clears `mlp` at the first filing under the new name).
 
 Status forms decide domestic vs foreign: `10-K`, `10-KT`, `10-Q`, `S-1`
 are domestic; `20-F`, `40-F`, `F-1`, `6-K` foreign; the latest known wins,
@@ -65,7 +98,7 @@ filed, they stay.
 **Timing.** The type is recomputed at the security's `known_at` and at
 every later instant some evidence for it became known (a filing's
 acceptance, a listing row's `known_at`); a row is written only when
-(`security_type`, `rule`, `sic`) changes. So each row's `known_at` is the
+(`security_type`, `rule`, `sic`, `issuer_class`) changes. So each row's `known_at` is the
 instant its classification first became knowable, never earlier than any
 evidence it used, and nothing is back-dated. Evidence accepted before the
 security's own `known_at` is applied at that `known_at`. `sic` is the
@@ -114,6 +147,26 @@ F6_FORMS = frozenset({"F-6", "F-6EF"})
 DOMESTIC_FORMS = frozenset({"10-K", "10-KT", "10-K405", "10-KSB", "10-Q", "10-QSB", "S-1"})
 FOREIGN_FORMS = frozenset({"20-F", "40-F", "F-1", "6-K"})
 _STATUS_FORMS = DOMESTIC_FORMS | FOREIGN_FORMS
+#: Periodic reports: after one, a domestic class with no header SIC is `common`.
+PERIODIC_FORMS = frozenset({"10-K", "10-KT", "10-K405", "10-KSB", "10-Q", "10-QSB"})
+#: A BDC election (N-54A, or the N-6F notice of intent) and its withdrawal.
+BDC_ELECTION_FORMS = frozenset({"N-54A", "N-6F"})
+BDC_WITHDRAWAL_FORMS = frozenset({"N-54C"})
+#: A closed-end fund's own reports: an N-2 filer with one is no BDC.
+CLOSED_END_REPORT_FORMS = frozenset({"N-CSR", "N-CSRS", "N-PORT", "NPORT-P"})
+N2_FORM = "N-2"
+
+#: The `issuer_class` tags (module docstring, "Issuer class").
+ISSUER_CLASSES = ("spac", "bdc", "mlp", "foreign")
+#: A partnership's filing-index name: ends in L.P., LP, L P or Limited Partnership,
+#: before any `/XX/` state suffix EDGAR appends.
+_PARTNERSHIP_NAME = re.compile(
+    r"(?:\bL\.?\s?P\.?|\bLIMITED PARTNERSHIP)\s*(?:/[A-Z ]+/?)?\s*$", re.IGNORECASE
+)
+#: A cover-page title naming partnership units.
+_PARTNERSHIP_TITLE = re.compile(
+    r"\b(?:common|subordinated|class [a-z]) units?\b|\blimited partner(?:ship)? interests?\b"
+)
 
 #: Title words, checked in order before the common-equity words.
 _TITLE_TYPES: tuple[tuple[str, str], ...] = (
@@ -154,6 +207,20 @@ class _Evidence:
 
     forms: tuple[tuple[datetime, str], ...]
     sics: tuple[tuple[datetime, int], ...]
+    #: (instant, the name is a partnership's) per filing-index entry, in form order.
+    names: tuple[tuple[datetime, bool], ...] = ()
+
+
+def is_partnership_name(name: str) -> bool:
+    """True when a filing-index company name is a partnership's (`L.P.`, `LP`,
+    `Limited Partnership`, before an EDGAR `/XX/` suffix)."""
+    return _PARTNERSHIP_NAME.search(name.strip()) is not None
+
+
+def is_partnership_title(title: str | None) -> bool:
+    """True when a cover-page title names partnership units ("Common Units
+    representing limited partner interests")."""
+    return title is not None and _PARTNERSHIP_TITLE.search(_whole(title)) is not None
 
 
 def _base_form(form: str) -> str:
@@ -354,6 +421,11 @@ class _State:
     f6: bool = False
     domestic: bool | None = None  # the latest status form's side; `None` before any
     sic: int | None = None
+    periodic: bool = False  # a `PERIODIC_FORMS` report has been filed
+    bdc_election: bool = False  # an N-54A or N-6F not withdrawn by a later N-54C
+    n2: bool = False
+    closed_end: bool = False  # a `CLOSED_END_REPORT_FORMS` report has been filed
+    partnership_name: bool = False  # the latest filing-index name is a partnership's
 
 
 _NO_STATE = _State()
@@ -381,14 +453,14 @@ def _timeline(evidence: _Evidence) -> _Timeline:
     """One ordered pass over a CIK's evidence. Within one instant forms and
     SICs apply in `_evidence`'s (instant, accession) order, so the latest
     status form and SIC there are the last in that order."""
-    forms, sics = evidence.forms, evidence.sics
+    forms, sics, names = evidence.forms, evidence.sics, evidence.names
     instants = sorted({k for k, _ in forms} | {k for k, _ in sics})
     stamps: list[datetime] = []
     states: list[_State] = []
-    fund = f6 = False
+    fund = f6 = periodic = bdc_election = n2 = closed_end = partnership = False
     domestic: bool | None = None
     sic: int | None = None
-    i = j = 0
+    i = j = n = 0
     for t in instants:
         while i < len(forms) and forms[i][0] <= t:
             form = forms[i][1]
@@ -396,11 +468,21 @@ def _timeline(evidence: _Evidence) -> _Timeline:
             f6 = f6 or form in F6_FORMS
             if form in _STATUS_FORMS:
                 domestic = form in DOMESTIC_FORMS
+            periodic = periodic or form in PERIODIC_FORMS
+            if form in BDC_ELECTION_FORMS:
+                bdc_election = True
+            elif form in BDC_WITHDRAWAL_FORMS:
+                bdc_election = False
+            n2 = n2 or form == N2_FORM
+            closed_end = closed_end or form in CLOSED_END_REPORT_FORMS
             i += 1
         while j < len(sics) and sics[j][0] <= t:
             sic = sics[j][1]
             j += 1
-        state = _State(fund, f6, domestic, sic)
+        while n < len(names) and names[n][0] <= t:
+            partnership = names[n][1]
+            n += 1
+        state = _State(fund, f6, domestic, sic, periodic, bdc_election, n2, closed_end, partnership)
         if not states or state != states[-1]:
             stamps.append(t)
             states.append(state)
@@ -437,8 +519,11 @@ def _classify(
         return "foreign", "foreign_form", sic, "filing"
     if sic == SPAC_SIC:
         return "spac", "sic_6770", sic, "filing"
+    waiting = sic is None and not state.periodic  # rule 8's wait (#3076)
     if titled is not None:
         security_type, rule = _title_type(titled["class_title"], title_fallback)
+        if security_type == COMMON and waiting:
+            return UNCLASSIFIABLE, "no_sic_or_periodic", sic, "filing"
         return security_type, rule, sic, "filing"
     if known is not None:
         suffix_type = ticker_suffix_type(known["ticker"])
@@ -454,8 +539,27 @@ def _classify(
                 listing_provenance if listing_provenance == "filing_name" else "snapshot_static",
             )
     if state.domestic and not (title_fallback and sibling_common):
+        if waiting:
+            return UNCLASSIFIABLE, "no_sic_or_periodic", sic, "filing"
         return COMMON, "common_default", sic, "filing"
     return UNCLASSIFIABLE, "no_rule_matched", sic, "filing"
+
+
+def issuer_class(state: _State, titled: Row | None) -> str | None:
+    """The `issuer_class` tag from the issuer's `state` and the class's latest
+    titled listing row, both known at one instant (module docstring, "Issuer
+    class"): `spac`, `bdc`, `mlp`, `foreign` or `None`, first match wins."""
+    if state.sic == SPAC_SIC:
+        return "spac"
+    if state.bdc_election or (state.n2 and state.domestic is True and not state.closed_end):
+        return "bdc"
+    if state.partnership_name or (
+        titled is not None and is_partnership_title(titled["class_title"])
+    ):
+        return "mlp"
+    if state.domestic is False:
+        return "foreign"
+    return None
 
 
 def _listing_timeline(
@@ -485,18 +589,27 @@ def _evidence(
     source: FilingSource, ciks: Iterable[str], settings: Settings
 ) -> dict[str, _Evidence]:
     wanted = set(ciks)
-    forms: dict[str, list[tuple[datetime, str, str]]] = defaultdict(list)
+    forms: dict[str, list[tuple[datetime, str, str, bool]]] = defaultdict(list)
     for cik, entries in _filing_index_by_cik(source, wanted).items():  # #2927: one read
         for entry in entries:
-            forms[cik].append((entry.accepted_at, entry.accession, _base_form(entry.form)))
+            forms[cik].append(
+                (
+                    entry.accepted_at,
+                    entry.accession,
+                    _base_form(entry.form),
+                    is_partnership_name(entry.company_name),
+                )
+            )
     out: dict[str, _Evidence] = {}
     for cik in wanted:
         headers = source.filing_headers(cik, settings.edgar.header_forms)
         # A header without a SIC never erases a known one (a SPAC stays a SPAC).
         sics = sorted((h.accepted_at, h.accession, h.sic) for h in headers if h.sic is not None)
+        ordered = sorted(forms[cik])
         out[cik] = _Evidence(
-            forms=tuple((stamp, form) for stamp, _, form in sorted(forms[cik])),
+            forms=tuple((stamp, form) for stamp, _, form, _ in ordered),
             sics=tuple((stamp, sic) for stamp, _, sic in sics),
+            names=tuple((stamp, partnership) for stamp, _, _, partnership in ordered),
         )
     return out
 
@@ -585,12 +698,13 @@ def build_classifications(
                     changes |= {stamp for stamp in timelines_by_security[other][0] if stamp > start}
                     if sibling_known[other] > start:
                         changes.add(sibling_known[other])
-        previous: tuple[str, str, int | None] | None = None
+        previous: tuple[str, str, int | None, str | None] | None = None
         for t in sorted({start} | changes):
             i = bisect_right(listing_stamps, t)
             titled, known = listing_states[i - 1] if i else (None, None)
+            state = issuer.at(t)
             security_type, rule, sic, provenance = _classify(
-                issuer.at(t),
+                state,
                 titled,
                 known,
                 benchmark,
@@ -600,15 +714,17 @@ def build_classifications(
                 and benchmark is None
                 and sibling_common(security, t),
             )
-            if (security_type, rule, sic) == previous:
+            tag = None if benchmark is not None else issuer_class(state, titled)
+            if (security_type, rule, sic, tag) == previous:
                 continue
-            previous = (security_type, rule, sic)
+            previous = (security_type, rule, sic, tag)
             rows.append(
                 {
                     "security_id": security_id,
                     "sic": sic,
                     "security_type": security_type,
                     "rule": rule,
+                    "issuer_class": tag,
                     "known_at": t,
                     "ingested_at": ingested_at,
                     "source": security["source"] if benchmark is not None else _EDGAR,
