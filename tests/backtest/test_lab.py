@@ -35,6 +35,7 @@ import shutil
 import subprocess
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,7 @@ import duckdb
 import pytest
 from conftest import load_universe_fixtures, mark_pre_lab
 
-from tradepartner.backtest import engine, frozen, hypothesis, lab, sweep
+from tradepartner.backtest import engine, frozen, hypothesis, lab, sweep, sweep_report
 from tradepartner.backtest.holdout import Flags
 from tradepartner.backtest.results import family_n
 from tradepartner.backtest.run import run_hypothesis
@@ -1286,3 +1287,99 @@ def test_a_sweep_whose_fixed_block_sets_a_delay_tags_every_variant_row(
 
         assert notes(shocked) == [("signal_delay=1",)] * 2
         assert notes(plain) == [(None,)] * 4
+
+
+# --- delisting exit coverage (plan T329, #2670) ----------------------------------------
+
+
+def test_every_variant_gets_its_exit_coverage_from_one_read_per_group_and_the_grid_shows_it(
+    store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under `none`, each run variant's base level gets the three coverage counts at its
+    last rebalance session, from one `delisting_reasons` read per read group at the
+    group's cutoff, and the sweep report's grid row shows the unknown count and share.
+    The shrunk window books no delisting exit, so the engine's results are given one
+    (SEC_TRANSFER's Form 25, decided at the 2019-03-29 read); its bankruptcy reason is
+    known after that read but by every cutoff."""
+    filed_at = datetime(2018, 10, 23, 20, 30, tzinfo=UTC)
+    known_at = _close(date(2019, 4, 15))
+    with open_for_write(Settings(_env_file=None, store={"path": str(store)})) as conn:
+        insert_row(
+            conn,
+            "delisting_reasons",
+            {
+                "security_id": "SEC_TRANSFER",
+                "delisting_form": "25",
+                "delisting_class_title": "Common Stock",
+                "delisting_exchange": "NYSE",
+                "delisting_filed_at": filed_at,
+                "reason": "bankruptcy",
+                "reason_evidence_form": "8-K",
+                "reason_evidence_accession": "acc-lab-coverage",
+                "reason_source": "eightk_item",
+                "reason_known_at": known_at,
+                "known_at": known_at,
+                "ingested_at": utc_now(),
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    booked = engine.DelistingExit(
+        security_id="SEC_TRANSFER",
+        read_time=_close(date(2019, 3, 29)),
+        end_session=date(2018, 10, 31),
+        exchange="NYSE",
+        delisting_form="25",
+        delisting_filed_at=filed_at,
+    )
+    real_run_many = engine.run_many
+
+    def run_many(*args: Any, **kwargs: Any) -> engine.RunManyResults:
+        results = real_run_many(*args, **kwargs)
+        for levels in results.values():
+            for level, result in levels.items():
+                levels[level] = replace(result, delisting_exits=(booked,))
+        return results
+
+    real = lab._PausingProvider.delisting_reasons
+    reads: list[tuple[datetime, list[str]]] = []
+
+    def spy(self: Any, t: datetime, ids: Any) -> Any:
+        reads.append((t, list(ids)))
+        return real(self, t, ids)
+
+    monkeypatch.setattr(engine, "run_many", run_many)
+    monkeypatch.setattr(lab._PausingProvider, "delisting_reasons", spy)
+    outcome = lab.run_sweep(SLUG, clock=clock)
+
+    assert {t.status for t in outcome.trials} == {"ok"}
+    assert sorted(t for t, _ in reads) == sorted(
+        _close(session) for session in LAST_SESSION.values()
+    )
+    assert all(ids == ["SEC_TRANSFER"] for _, ids in reads)
+    with _read(store) as conn:
+        rows = conn.execute(
+            "SELECT trial_id, session, name, value FROM trial_rebalance_counts "
+            "WHERE name LIKE 'n_exit_coverage%'"
+        ).fetchall()
+        last = dict(
+            conn.execute(
+                "SELECT trial_id, max(session) FROM trial_rebalances GROUP BY trial_id"
+            ).fetchall()
+        )
+        report = sweep_report.sweep_report(conn, SLUG)
+    by_trial: dict[int, dict[str, int]] = {}
+    for trial_id, session, name, value in rows:
+        assert session == last[trial_id]
+        by_trial.setdefault(trial_id, {})[name] = value
+    expected = {
+        "n_exit_coverage_exits": 1,
+        "n_exit_coverage_unknown": 0,
+        "n_exit_coverage_after_read": 1,
+    }
+    ran = {t.trial_id for t in outcome.trials}
+    assert {k: v for k, v in by_trial.items() if k in ran} == dict.fromkeys(ran, expected)
+    assert [(r.exit_coverage_unknown, r.exit_coverage_exits) for r in report.rows] == [
+        (0, 1)
+    ] * len(report.rows)
+    assert {r.exit_coverage_unknown_share for r in report.rows} == {0.0}

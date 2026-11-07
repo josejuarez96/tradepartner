@@ -5180,3 +5180,273 @@ def test_the_health_report_carries_the_spliced_block(
     report = health.health_report(spliced_store, _SPLICED_RUN, splice_settings)
     assert report.spliced.count == 1
     assert report.ok or "spliced_series" not in report.failures
+
+
+# --- Delisting reasons (plan T329, #2670) -----------------------------------------
+
+_REASON_RULE = "delisting_reasons_known_at_from_acceptance"
+_MERGER_FILED = datetime(2018, 7, 25, 20, 30, tzinfo=UTC)
+_TRANSFER_FILED = datetime(2018, 10, 23, 20, 30, tzinfo=UTC)
+
+
+def _reason_row(
+    security_id: str,
+    filed_at: datetime,
+    reason: str,
+    known_at: datetime,
+    *,
+    source: str = "eightk_item",
+    accession: str | None = "acc-reason",
+    class_title: str = "Common Stock",
+) -> dict[str, Any]:
+    return {
+        "security_id": security_id,
+        "delisting_form": "25",
+        "delisting_class_title": class_title,
+        "delisting_exchange": "NYSE",
+        "delisting_filed_at": filed_at,
+        "reason": reason,
+        "reason_evidence_form": "8-K" if source == "eightk_item" else "25",
+        "reason_evidence_accession": accession,
+        "reason_source": source,
+        "reason_known_at": known_at,
+        "known_at": known_at,
+        "ingested_at": known_at,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def _eightk(cik: str, accession: str, items: str, accepted_at: datetime) -> dict[str, Any]:
+    return {
+        "cik": cik,
+        "accession": accession,
+        "form": "8-K",
+        "items": items,
+        "accepted_at": accepted_at,
+        "known_at": accepted_at,
+        "ingested_at": accepted_at,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def test_the_delisting_reason_rule_is_an_integrity_rule_and_the_fixture_block_is_empty(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    assert _REASON_RULE in INTEGRITY_RULES
+    report = health_report(fixture_store, T_END, settings)
+    assert report.ok, report.failures
+    block = report.delisting_reasons
+    assert block is not None
+    assert block.by_reason_source == {}
+    assert block.unknown.height == 8  # every fixture episode has no reason row
+    assert block.conflicted.is_empty() and block.missing_consideration.is_empty()
+    assert block.unmatched_items == {"1.03": 0, "2.01": 0, "3.01": 0}
+    assert block.lines()[0] == "delisting reasons: none"
+
+
+def test_reasons_are_counted_by_reason_and_source_with_unknown_and_conflicted_episodes(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    merger_known = datetime(2018, 7, 26, 20, 0, tzinfo=UTC)
+    transfer_known = datetime(2018, 10, 24, 20, 0, tzinfo=UTC)
+    for row in (
+        _reason_row(
+            "SEC_CLEAN_MERGER",
+            _MERGER_FILED,
+            "merger_acquisition",
+            merger_known,
+            source="form25_text",
+            accession="acc-25-merger",
+        ),
+        _reason_row("SEC_TRANSFER", _TRANSFER_FILED, "bankruptcy", transfer_known),
+        # A second class of the same Form 25 key: the engine reads both, a conflict.
+        _reason_row(
+            "SEC_TRANSFER", _TRANSFER_FILED, "voluntary_other", transfer_known, class_title="B"
+        ),
+        _reason_row(
+            "SEC_BOUNDARY_DELIST",
+            datetime(2018, 10, 1, 20, 30, tzinfo=UTC),
+            "unknown",
+            transfer_known,
+            source="unknown",
+            accession=None,
+        ),
+        # Known after T: invisible.
+        _reason_row(
+            "SEC_REUSE_1",
+            datetime(2018, 12, 26, 20, 30, tzinfo=UTC),
+            "bankruptcy",
+            T_END + timedelta(days=1),
+        ),
+    ):
+        insert_row(fixture_store, "delisting_reasons", row)
+
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+
+    assert block is not None
+    # The second class row has no `delistings` episode, so the reason read drops it.
+    assert block.by_reason_source == {
+        ("merger_acquisition", "form25_text"): 1,
+        ("bankruptcy", "eightk_item"): 1,
+        ("unknown", "unknown"): 1,
+    }
+    assert set(block.unknown["security_id"]) == {
+        "SEC_25NSE",
+        "SEC_BOUNDARY_DELIST",
+        "SEC_DUAL_PFD",
+        "SEC_REUSE_1",
+        "SEC_TRUNC_DELIST",
+        "SEC_WINDOW_DELIST",
+    }
+    assert block.conflicted.is_empty()
+    # The merger has its cash row in the window: consideration is not missing.
+    assert block.missing_consideration.is_empty()
+    assert "merger_acquisition/form25_text 1" in block.lines()[0]
+
+
+def test_two_reasons_for_one_engine_key_are_conflicted(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """Two episodes of one security sharing form, exchange and acceptance (two class
+    titles) both answer the ended listing: the engine reads `unknown`."""
+    filed = datetime(2018, 9, 24, 20, 30, tzinfo=UTC)
+    known = datetime(2018, 9, 25, 20, 0, tzinfo=UTC)
+    fixture_store.execute(
+        "INSERT INTO delistings SELECT * REPLACE ('Common Stock' AS class_title) "
+        "FROM delistings WHERE security_id = 'SEC_DUAL_PFD'"
+    )
+    for title, reason in (("6% Preferred Stock", "bankruptcy"), ("Common Stock", "unknown")):
+        insert_row(
+            fixture_store,
+            "delisting_reasons",
+            _reason_row("SEC_DUAL_PFD", filed, reason, known, class_title=title)
+            | (
+                {"reason_source": "unknown", "reason_evidence_accession": None}
+                if reason == "unknown"
+                else {}
+            ),
+        )
+    block = health.delisting_reasons_report(
+        fixture_store, T_END, health.listing_ends_as_of(fixture_store, T_END, settings)
+    )
+    [row] = block.conflicted.to_dicts()
+    assert (row["security_id"], row["reasons"]) == ("SEC_DUAL_PFD", ["bankruptcy", "unknown"])
+
+
+def test_missing_merger_consideration_is_listed(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A `merger_acquisition` reason with no acquiree `mergers` row in the window is
+    listed; one whose cash row is in it is not, nor one on a transferred listing (never
+    an exit)."""
+    known = datetime(2018, 10, 24, 20, 0, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row("SEC_TRANSFER", _TRANSFER_FILED, "merger_acquisition", known),
+    )
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row(
+            "SEC_TRUNC_DELIST",
+            datetime(2018, 6, 14, 20, 30, tzinfo=UTC),
+            "merger_acquisition",
+            datetime(2018, 6, 15, 20, 0, tzinfo=UTC),
+        ),
+    )
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row(
+            "SEC_CLEAN_MERGER",
+            _MERGER_FILED,
+            "merger_acquisition",
+            datetime(2018, 7, 26, 20, 0, tzinfo=UTC),
+        ),
+    )
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+    assert block is not None
+    [row] = block.missing_consideration.to_dicts()
+    assert (row["security_id"], row["detail"]) == (
+        "SEC_TRUNC_DELIST",
+        "0 merger rows in the window",
+    )
+
+
+def test_reason_8k_items_outside_every_window_or_uncorroborated_are_unmatched(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row(
+            "SEC_TRANSFER", _TRANSFER_FILED, "bankruptcy", datetime(2018, 10, 24, 20, tzinfo=UTC)
+        ),
+    )
+    for row in (
+        # In the 1.03 window of SEC_TRANSFER's Form 25: matched.
+        _eightk("CIK0001000007", "acc-1", "1.03", datetime(2018, 10, 1, 20, tzinfo=UTC)),
+        # Two years before: outside every window.
+        _eightk("CIK0001000007", "acc-2", "1.03,3.01", datetime(2016, 10, 1, 20, tzinfo=UTC)),
+        # A 2.01 beside a bankruptcy reason: uncorroborated.
+        _eightk("CIK0001000007", "acc-3", "2.01", datetime(2018, 10, 20, 20, tzinfo=UTC)),
+        # A 2.01 beside the clean merger (no reason row): uncorroborated too.
+        _eightk("CIK0001000003", "acc-4", "2.01", datetime(2018, 7, 20, 20, tzinfo=UTC)),
+    ):
+        insert_row(fixture_store, "filing_events", row)
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+    assert block is not None
+    assert block.unmatched_items == {"1.03": 1, "2.01": 2, "3.01": 1}
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row(
+            "SEC_CLEAN_MERGER",
+            _MERGER_FILED,
+            "merger_acquisition",
+            datetime(2018, 7, 26, 20, tzinfo=UTC),
+        ),
+    )
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+    assert block is not None
+    assert block.unmatched_items == {"1.03": 1, "2.01": 1, "3.01": 1}
+
+
+@pytest.mark.parametrize(
+    ("source", "known_at", "fails"),
+    [
+        ("eightk_item", datetime(2018, 10, 1, 20, tzinfo=UTC), False),
+        ("eightk_item", datetime(2018, 10, 1, 19, tzinfo=UTC), True),
+        ("form25_provision", _TRANSFER_FILED, False),
+        ("form25_provision", datetime(2018, 10, 23, 20, tzinfo=UTC), True),
+    ],
+)
+def test_a_reason_stamped_before_its_supporting_acceptance_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    source: str,
+    known_at: datetime,
+    fails: bool,
+) -> None:
+    """An `eightk_item` reason known before its 8-K's acceptance, or a `form25_*` one
+    before the Form 25's, fails `--check`."""
+    accepted = datetime(2018, 10, 1, 20, tzinfo=UTC)
+    insert_row(fixture_store, "filing_events", _eightk("CIK0001000007", "acc-8k", "1.03", accepted))
+    accession = "acc-8k" if source == "eightk_item" else "acc-25"
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row(
+            "SEC_TRANSFER",
+            _TRANSFER_FILED,
+            "bankruptcy",
+            known_at,
+            source=source,
+            accession=accession,
+        ),
+    )
+    report = health_report(fixture_store, T_END, settings)
+    assert (_REASON_RULE in _failed(report.integrity)) == fails

@@ -669,6 +669,18 @@ def _residue_term(
         if a.window_id == window_id and a.session <= t_next and a.known_at <= k_next
     ]
     reversed_ids = reversed_true_up_ids(source_rows, t_next)
+    # A true-up and its reversal both inside the period cancel: neither moves quantity.
+    period_row_ids = {a.adjustment_id for a in period_rows if a.adjustment_id is not None}
+    cancelled_ids: set[int] = set()
+    for a in period_rows:
+        target = reversed_adjustment_id(a)
+        if (
+            a.adjustment_id is not None
+            and target is not None
+            and target in reversed_ids
+            and target in period_row_ids
+        ):
+            cancelled_ids.update((a.adjustment_id, target))
     for a in period_rows:
         if a.kind == "carried_residue":
             raise ValueError(f"{a.security_id} {t_i} to {t_next}: carried_residue inside period")
@@ -722,7 +734,7 @@ def _residue_term(
             )
             if not late and had_residue:
                 raise ValueError(f"{name} {t_i} to {t_next}: corporate_action_cash on unheld name")
-        if a.quantity:
+        if a.quantity and a.adjustment_id not in cancelled_ids:
             quantity_names.add(name)
         if a.kind not in {"merger_receipt", "spinoff_receipt"}:
             continue
@@ -754,7 +766,11 @@ def _residue_term(
         mark_next = marks_next.get(name)
         if mark_next is not None and mark_next.position_side == "short":
             raise ValueError(f"{name} {t_i} to {t_next}: short residue")
-        if mark_next is None and not has_fill and not any(a.quantity for a in rows):
+        if (
+            mark_next is None
+            and not has_fill
+            and not any(a.quantity and a.adjustment_id not in cancelled_ids for a in rows)
+        ):
             raise ValueError(f"{name} {t_i} to {t_next}: unexplained missing mark")
         if mark_i.tradable is not True or (
             mark_next is not None and mark_next.tradable is not True

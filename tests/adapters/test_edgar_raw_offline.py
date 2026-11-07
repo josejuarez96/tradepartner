@@ -15,6 +15,7 @@ import io
 import json
 import os
 import random
+import threading
 import zipfile
 import zlib
 from collections.abc import Callable, Iterator
@@ -1149,6 +1150,148 @@ def test_a_429_that_outlasts_the_block_wait_fails_without_a_second_wait(
         pytest.approx(2.0),
         pytest.approx(600.0),
     ]
+
+
+# --- the block's cooldown holds every send (#3205) ----------------------
+
+
+def _waiting_out_a_block(
+    monkeypatch: pytest.MonkeyPatch, during_wait: Callable[[], None]
+) -> list[float]:
+    """Fake clock: `time.sleep` records each sleep and, inside the one
+    `edgar.rate_limit_wait_seconds` wait (600 s), runs `during_wait`, the
+    other workers acting while the first request waits the block out."""
+    slept: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        if seconds == pytest.approx(600.0):
+            during_wait()
+
+    monkeypatch.setattr(edgar_raw.time, "sleep", fake_sleep)
+    return slept
+
+
+def test_a_block_one_worker_waits_out_stops_every_other_workers_next_send(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#3205: while one request waits a `403` out, every other worker's next
+    send, through each send loop (`_get`, the streamed `GET`, the bounded
+    document `GET`, the document head), fails as a block (a `403`) and sends nothing; the
+    waiting request's own retry is still sent, and sends resume after it."""
+    settings = _settings(rate_limit_wait_seconds=600.0, cache_dir=tmp_path)
+    others_sent: list[str] = []
+    others = _mock_client(
+        lambda request: others_sent.append(str(request.url)) or httpx.Response(200, json={})
+    )
+    refused: list[int] = []
+
+    def send_from(name: str) -> None:
+        sends: dict[str, Callable[[], object]] = {
+            "get": lambda: edgar_raw.company_tickers(settings=settings, client=others),
+            "stream": lambda: edgar_raw._stream_to_with_headers(
+                "https://www.sec.gov/x.zip", tmp_path / "x.zip", settings=settings, client=others
+            ),
+            "bounded": lambda: edgar_raw._bounded_get(
+                "https://www.sec.gov/x.htm", max_bytes=100, settings=settings, client=others
+            ),
+            "head": lambda: edgar_raw.filing_document_head(
+                "320193",
+                "0000320193-24-000123",
+                "a.htm",
+                max_bytes=100,
+                settings=settings,
+                client=others,
+            ),
+        }
+        try:
+            sends[name]()
+        except httpx.HTTPStatusError as error:
+            refused.append(error.response.status_code)
+
+    def other_workers() -> None:
+        workers = [
+            threading.Thread(target=send_from, args=(name,))
+            for name in ("get", "stream", "bounded", "head")
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(5)
+
+    slept = _waiting_out_a_block(monkeypatch, other_workers)
+    handler, served = _status_sequence_handler([403, 200])
+
+    assert edgar_raw.company_tickers(settings=settings, client=_mock_client(handler)) == {
+        "status": 200
+    }
+
+    assert served == [403, 200]  # the waiting request's retry is sent
+    assert others_sent == [] and refused == [403, 403, 403, 403]
+    assert [s for s in slept if s > 0.5] == [pytest.approx(600.0)]
+    assert not edgar_raw.rate_limit_blocked()
+    assert edgar_raw.company_tickers(settings=settings, client=others) == {}
+    assert len(others_sent) == 1
+
+
+def test_a_success_during_the_blocks_wait_does_not_clear_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3205: a response sent before the block and answered during its wait
+    (here a `200`, and a `304`'s direct clear) leaves the block set: the
+    next send is still refused, and only the wait's end lets sends go."""
+    settings = _settings(rate_limit_wait_seconds=600.0)
+    others_sent: list[str] = []
+    others = _mock_client(
+        lambda request: others_sent.append(str(request.url)) or httpx.Response(200, json={})
+    )
+    seen: dict[str, object] = {}
+
+    def in_flight_success() -> None:
+        request = httpx.Request("GET", "https://www.sec.gov/y")
+        policy = edgar_raw._RetryPolicy(settings)
+        seen["retried"] = policy.retry_after_response(httpx.Response(200, request=request))
+        edgar_raw._RATE_LIMIT_BLOCK.clear()  # a 304's own clear (bulk / quarterly paths)
+        seen["blocked"] = edgar_raw.rate_limit_blocked()
+        try:
+            edgar_raw.company_tickers(settings=settings, client=others)
+        except httpx.HTTPStatusError as error:
+            seen["refused"] = error.response.status_code
+
+    _waiting_out_a_block(monkeypatch, in_flight_success)
+    handler, served = _status_sequence_handler([403, 200])
+
+    assert edgar_raw.company_tickers(settings=settings, client=_mock_client(handler)) == {
+        "status": 200
+    }
+
+    assert seen == {"retried": False, "blocked": True, "refused": 403}
+    assert others_sent == [] and served == [403, 200]
+    assert not edgar_raw.rate_limit_blocked()
+
+
+def test_a_block_that_outlasts_its_wait_ends_the_cooldown_but_stays_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3205 keeps #761's behaviour: a second `403` after the wait fails, the
+    cooldown is over (the next request is sent, not refused) and its `403`
+    fails at once without another wait; its success clears the block."""
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([403, 403, 403, 200])
+    settings = _settings(rate_limit_wait_seconds=600.0)
+    client = _mock_client(handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.company_tickers(settings=settings, client=client)
+    assert edgar_raw.rate_limit_blocked()
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.company_tickers(settings=settings, client=client)
+    assert edgar_raw.company_tickers(settings=settings, client=client) == {"status": 200}
+
+    assert served == [403, 403, 403, 200]
+    assert [s for s in slept if s > 0.5] == [pytest.approx(600.0)]
+    assert not edgar_raw.rate_limit_blocked()
 
 
 def test_valid_zip_bytes_is_byte_identical_across_separate_calls() -> None:
