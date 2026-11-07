@@ -101,6 +101,7 @@ def test_a_real_run_writes_only_inside_the_open_release(settings: Settings) -> N
     refused = _refetch(settings, prices)
     assert [r.status for r in refused.runs] == [FAILED]
     assert "no open data release" in refused.runs[0].message
+    assert prices.calls == []  # refused before any fetch
     assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(0,)]
     _open_release(settings)
     result = _refetch(settings, prices)
@@ -198,3 +199,20 @@ def test_name_changes_only_needs_the_actions_backfill(settings: Settings) -> Non
     done = CliRunner().invoke(app, ["ingest", "--source", "alpaca", "--name-changes-only"])
     assert done.exit_code != 0
     assert "--name-changes-only needs --actions-backfill" in done.output
+
+
+def test_spin_offs_are_left_to_their_own_path(settings: Settings) -> None:
+    prices = _committed(settings)
+    prices.actions.append(
+        CorporateAction(
+            ACME,
+            ActionType.SPINOFF,
+            EX,
+            0.5,
+            action_first_seen_known_at(EX),
+            "alpaca",
+            source_action_id="0000000099",
+        )
+    )
+    result = _refetch(settings, prices, dry_run=True)
+    assert result.added == (("dividend", 1),)

@@ -18,11 +18,25 @@ AUB = "0000883948"
 RENAME = date(2019, 5, 20)  # UBSH -> AUB
 KNOWN = session_close(date(2020, 7, 1))  # the change scanned long after it happened
 SNAPSHOT = datetime(2019, 1, 2, 21, tzinfo=UTC)
+FIRST_FILING = datetime(2010, 3, 1, 21, tzinfo=UTC)
 
 
 def _store(settings: Settings) -> None:
     with open_for_write(settings) as conn:
         init_schema(conn)
+        insert_row(  # the first filing: the alias's floor (`repair.first_sessions`)
+            conn,
+            "securities",
+            {
+                "security_id": AUB,
+                "cik": AUB,
+                "name": "Atlantic Union Bankshares",
+                "known_at": FIRST_FILING,
+                "ingested_at": SNAPSHOT,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
         insert_row(
             conn,
             "listings",

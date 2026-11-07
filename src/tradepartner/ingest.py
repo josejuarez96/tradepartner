@@ -1150,6 +1150,7 @@ def ingest_actions_backfill(
                 process_end=last,
                 lag_days=settings.alpaca.actions_process_lag_days,
                 stock_rules=settings.alpaca,
+                backdated=resolver.backdated,  # #3054
             )
 
         def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:

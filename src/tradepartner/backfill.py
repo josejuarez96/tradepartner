@@ -1368,10 +1368,15 @@ def _refetch_month(
 
     def prepare() -> None:
         with _read(settings) as conn:
+            # Refused before any fetch; checked again under the write lock.
+            if not dry_run and (why := release_refusal(conn, release)) is not None:
+                raise RefetchRefused(why)
             resolver = store_resolver(conn, started, settings)
             ids = _window_names(conn, started, window, settings, resolver)[0]
         wanted = sorted(set(ids) & only) if only is not None else sorted(ids)
-        actions = prices.corporate_actions(wanted, *window) if wanted else []
+        fetched = prices.corporate_actions(wanted, *window) if wanted else []
+        # Splits and dividends only: spin-offs keep their own path (#3053 item 2).
+        actions = [a for a in fetched if a.action_type in (ActionType.SPLIT, ActionType.DIVIDEND)]
         with _read(settings) as conn:
             plan = _replay_plan(conn, actions, window)
         prepared["actions"], prepared["covered"] = _replay_actions(prices, actions, window, plan)

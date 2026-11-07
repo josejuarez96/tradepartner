@@ -34,12 +34,16 @@ def _settings() -> Settings:
     return Settings(_env_file=None)  # type: ignore[call-arg]
 
 
-def _listing(security_id: str, ticker: str, valid_from: date) -> dict[str, object]:
+def _listing(
+    security_id: str, ticker: str, valid_from: date, provenance: str = "snapshot_static"
+) -> dict[str, object]:
+    """A listing row; by default today's ticker dated back (`snapshot_static`)."""
     return {
         "security_id": security_id,
         "ticker": ticker,
         "valid_from": valid_from,
         "class_title": None,
+        "provenance": provenance,
     }
 
 
@@ -78,7 +82,7 @@ class TestActionAlias:
 
     def test_never_while_another_security_resolves_the_old_symbol(self) -> None:
         resolver = ListingResolver(
-            [_listing(AUB, "AUB", START), _listing(OTHER, "UBSH", date(2017, 1, 3))],
+            [_listing(AUB, "AUB", START), _listing(OTHER, "UBSH", date(2017, 1, 3), "filing")],
             symbol_changes=[_change(AUB, "UBSH", "AUB", RENAME)],
         )
         assert resolver.action_alias("UBSH", date(2016, 6, 1)) == AUB
@@ -88,7 +92,7 @@ class TestActionAlias:
         # The master shows AUB under a third ticker before 2018: that span is
         # the evidence there, not the change.
         resolver = ListingResolver(
-            [_listing(AUB, "THIRD", START), _listing(AUB, "AUB", date(2018, 1, 2))],
+            [_listing(AUB, "THIRD", START, "filing"), _listing(AUB, "AUB", date(2018, 1, 2))],
             symbol_changes=[_change(AUB, "UBSH", "AUB", RENAME)],
         )
         assert resolver.action_alias("UBSH", date(2017, 6, 1)) is None
@@ -124,6 +128,41 @@ class TestActionAlias:
         assert resolver.alias_symbols(AUB, date(2019, 5, 1), date(2019, 5, 31)) == ["UBSH"]
         assert resolver.alias_symbols(AUB, date(2019, 6, 1), date(2019, 6, 30)) == []
 
+    def test_never_where_the_new_ticker_is_filing_backed(self) -> None:
+        # A cover page names AUB on that session: AUB is the ticker of its day,
+        # so the old symbol's rows there are someone else's.
+        resolver = ListingResolver(
+            [_listing(AUB, "AUB", START, "filing")],
+            symbol_changes=[_change(AUB, "UBSH", "AUB", RENAME)],
+        )
+        assert resolver.action_alias("UBSH", date(2016, 2, 9)) is None
+        assert not resolver.backdated(AUB, "AUB", date(2016, 2, 9))
+
+    def test_never_before_the_securitys_first_session(self) -> None:
+        resolver = ListingResolver(
+            [_listing(AUB, "AUB", START)],
+            symbol_changes=[_change(AUB, "UBSH", "AUB", RENAME)],
+            first_sessions={AUB: date(2017, 3, 1)},
+        )
+        assert resolver.action_alias("UBSH", date(2016, 6, 1)) is None
+        assert resolver.action_alias("UBSH", date(2017, 3, 1)) == AUB
+        unknown = ListingResolver(
+            [_listing(AUB, "AUB", START)],
+            symbol_changes=[_change(AUB, "UBSH", "AUB", RENAME)],
+            first_sessions={OTHER: START},
+        )
+        assert unknown.action_alias("UBSH", date(2017, 6, 1)) is None  # no floor known
+
+    def test_two_securities_with_one_old_symbol_get_nothing(self) -> None:
+        resolver = ListingResolver(
+            [_listing(AUB, "AUB", START), _listing(OTHER, "OTH", START)],
+            symbol_changes=[
+                _change(AUB, "UBSH", "AUB", RENAME),
+                _change(OTHER, "UBSH", "OTH", RENAME),
+            ],
+        )
+        assert resolver.action_alias("UBSH", date(2016, 6, 1)) is None
+
     def test_holds_for_actions_counts_an_aliased_session(self) -> None:
         # repair's misattribution check must keep what the alias assigns.
         assert _backdated().holds(AUB, date(2016, 2, 8), actions=True)
@@ -152,6 +191,9 @@ class TestSourceAsksTheOldSymbol:
         ]
         # The timing rule is the one every Alpaca action has: no earlier.
         assert actions[0].known_at == action_first_seen_known_at(date(2016, 2, 10))
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.aliased == (f"{AUB} dividend 2016-02-10 under UBSH",)
+        assert "1 action(s) under a pre-rename symbol" in source.resolution_summary()
         later = source.corporate_actions([AUB], date(2019, 6, 1), date(2019, 6, 30))
         assert later == []
 
@@ -182,7 +224,9 @@ class TestNameChangeOfABackdatedTicker:
 
     def test_it_is_stored_under_the_new_symbols_holder(self) -> None:
         resolver = ListingResolver([_listing(AUB, "AUB", START)])
-        parsed = parse_corporate_actions({"name_changes": [self.ROW]}, resolver.resolve)
+        parsed = parse_corporate_actions(
+            {"name_changes": [self.ROW]}, resolver.resolve, backdated=resolver.backdated
+        )
         [change] = parsed.symbol_changes
         assert (change.security_id, change.old_symbol, change.new_symbol) == (AUB, "UBSH", "AUB")
         assert parsed.symbol_change_backdated == 1
@@ -190,7 +234,25 @@ class TestNameChangeOfABackdatedTicker:
 
     def test_a_new_ticker_first_listed_on_the_change_day_stays_unresolved(self) -> None:
         resolver = ListingResolver([_listing(AUB, "AUB", RENAME)])
-        parsed = parse_corporate_actions({"name_changes": [self.ROW]}, resolver.resolve)
+        parsed = parse_corporate_actions(
+            {"name_changes": [self.ROW]}, resolver.resolve, backdated=resolver.backdated
+        )
         assert parsed.symbol_changes == ()
         assert parsed.unresolved == (("UBSH", RENAME),)
         assert parsed.symbol_change_backdated == 0
+
+    def test_a_filing_backed_new_ticker_stays_unresolved(self) -> None:
+        # A cover page (or a stale row) under AUB on the day before is the
+        # ticker of its day, not today's dated back: no attribution.
+        resolver = ListingResolver([_listing(AUB, "AUB", START, "filing")])
+        parsed = parse_corporate_actions(
+            {"name_changes": [self.ROW]}, resolver.resolve, backdated=resolver.backdated
+        )
+        assert parsed.symbol_changes == ()
+        assert parsed.symbol_change_backdated == 0
+
+    def test_without_the_backdated_check_it_stays_unresolved(self) -> None:
+        resolver = ListingResolver([_listing(AUB, "AUB", START)])
+        parsed = parse_corporate_actions({"name_changes": [self.ROW]}, resolver.resolve)
+        assert parsed.symbol_changes == ()
+        assert parsed.unresolved == (("UBSH", RENAME),)

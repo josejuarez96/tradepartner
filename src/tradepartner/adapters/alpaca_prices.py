@@ -850,6 +850,8 @@ _DISPUTED = "disputed"
 #: (#1597, `store.schema`), the rows whose spans only the backfill's
 #: collision and dispute counts judge.
 _FILING_NAME = "filing_name"
+#: A listing row taken from today's snapshot and dated back (`store.master`).
+_SNAPSHOT_STATIC = "snapshot_static"
 
 
 class ListingResolver:
@@ -934,6 +936,18 @@ class ListingResolver:
             refused += len(late)
         if refused:
             self.report = replace(self.report, symbol_changes_refused=refused)
+        # #3054: each security's listing rows (day, ticker, provenance), for
+        # `backdated`, and its first session, the alias's lower bound.
+        self._listing_rows: dict[str, list[tuple[date, str, str | None]]] = defaultdict(list)
+        for row in listings:
+            provenance = row.get("provenance")
+            written = None if provenance is None else str(provenance)
+            self._listing_rows[str(row["security_id"])].append(
+                (row["valid_from"], str(row["ticker"]), written)
+            )
+        for listed_rows in self._listing_rows.values():
+            listed_rows.sort(key=lambda item: item[0])
+        self._alias_floor = dict(first_sessions) if first_sessions is not None else None
         # #3054: every stored change (refused ones too: the alias has its own
         # guards) as an action alias, per security in process-date order.
         self._alias_changes: dict[str, list[tuple[date, str, str]]] = defaultdict(list)
@@ -1750,13 +1764,44 @@ class ListingResolver:
         return owners.pop() if len(owners) == 1 else None
 
     def _alias_of(self, security_id: str, session: date) -> str | None:
+        if self._alias_floor is not None:
+            floor = self._alias_floor.get(security_id)
+            if floor is None or session < floor:
+                return None  # before the security's first filing: not its symbol yet
         changes = self._alias_changes.get(security_id, ())
         later = [change for change in changes if change[0] > session]
         if not later:
             return None
-        if not any(self._held_under(security_id, new, session) for _, _, new in later):
+        if not any(
+            self._held_under(security_id, new, session)
+            and self.backdated(security_id, new, session)
+            for _, _, new in later
+        ):
             return None
         return later[0][1]
+
+    def backdated(self, security_id: str, ticker: str, session: date) -> bool:
+        """True if the master's only evidence that `security_id` traded as
+        `ticker` on `session` is back-dated (#3054): its first-span lead
+        covers the session under `ticker`, or its latest listing row on or
+        before the session is a `snapshot_static` row under `ticker` (today's
+        ticker dated back). A filing-backed row is the ticker of its day."""
+        first = self._first_lead_of.get(security_id)
+        if (
+            first is not None
+            and same_alpaca_symbol(first.ticker, ticker)
+            and first.start <= session < first.end
+        ):
+            return True
+        rows = [item for item in self._listing_rows.get(security_id, ()) if item[0] <= session]
+        if not rows:
+            return False
+        latest = max(item[0] for item in rows)
+        today = [item for item in rows if item[0] == latest]
+        return all(
+            same_alpaca_symbol(listed, ticker) and provenance == _SNAPSHOT_STATIC
+            for _, listed, provenance in today
+        )
 
     def _held_under(self, security_id: str, symbol: str, session: date) -> bool:
         """True if `security_id` holds `symbol` for actions on `session`."""
@@ -2364,6 +2409,9 @@ class ActionsParse:
     #: under the security holding the new symbol the session before the change
     #: (the master back-dates the new ticker).
     symbol_change_backdated: int = 0
+    #: #3054: splits and dividends kept under a pre-rename symbol
+    #: (`ListingResolver.action_alias`), each "SECURITY type ex-date under SYMBOL".
+    aliased: tuple[str, ...] = ()
 
 
 #: Alpaca's merger categories and the `Merger.kind` of each (spec "Mergers").
@@ -2559,6 +2607,7 @@ def parse_corporate_actions(
     process_end: date | None = None,
     lag_days: int = 90,
     stock_rules: AlpacaConfig | None = None,
+    backdated: Callable[[str, str, date], bool] | None = None,
 ) -> ActionsParse:
     """Splits, dividends, spin-offs and name changes from an actions
     payload, on the first-seen proxy, resolved on the last session before
@@ -2581,6 +2630,13 @@ def parse_corporate_actions(
     `stock_dividend_echo_tolerance` with `1 < amount < max`) is skipped
     and counted in `stock_ratio_cash`.
 
+    A `name_changes` row whose old symbol resolves to no one in the lag
+    window is stored under the new symbol's holder on the session before the
+    change only with `backdated` (`ListingResolver.backdated`, #3054) true
+    for that holder, symbol and session (the master dates today's ticker
+    back and never lists the old one); counted in `symbol_change_backdated`.
+    Without `backdated` such a row stays unresolved.
+
     A `spin_offs` row's child is resolved under `regular_way_symbol(new_symbol)`
     on its ex-date, so a when-issued `MSGR.WI` is the master's `MSGR` (#2112);
     with no such listing that session it is unresolved under Alpaca's symbol.
@@ -2601,7 +2657,7 @@ def parse_corporate_actions(
     unresolved: list[tuple[str, date]] = []
     unsupported: list[str] = []
     symbol_changes: list[SymbolChange] = []
-    self_spinoff = reused = conflict = backdated = 0
+    self_spinoff = reused = conflict = backdated_changes = 0
     # (child, parent) -> known_at -> record: each distinct distribution of a
     # spin-off identity (#1673); a stamp with two differing rows is unordered.
     spins: dict[tuple[str, str], dict[datetime, CorporateAction]] = defaultdict(dict)
@@ -2775,10 +2831,14 @@ def parse_corporate_actions(
                         # snapshot row or first-span lead) and never lists
                         # the old one: the security holding the new symbol
                         # the session before the change is the renamed one.
-                        if new_holder is not None and new_holder == holder(
-                            new, previous_session(process_date)
+                        before = previous_session(process_date)
+                        if (
+                            backdated is not None
+                            and new_holder is not None
+                            and new_holder == holder(new, before)
+                            and backdated(new_holder, new, before)
                         ):
-                            backdated += 1
+                            backdated_changes += 1
                             symbol_changes.append(
                                 SymbolChange(
                                     security_id=new_holder,
@@ -2897,7 +2957,7 @@ def parse_corporate_actions(
         merger_conflict=merged["conflict"],
         merger_self=merged["self"],
         merger_unordered=merged["unordered"],
-        symbol_change_backdated=backdated,
+        symbol_change_backdated=backdated_changes,
     )
 
 
@@ -3091,6 +3151,8 @@ class AlpacaPriceSource(PriceSource):
         self.last_filename_collisions: tuple[str, ...] = ()
         self.last_asof_fallbacks: tuple[str, ...] = ()
         self.last_asof_refused: tuple[str, ...] = ()  # #1696: no fallback after a renamer
+        #: #3054: (security, session) -> the pre-rename symbol an alias answered.
+        self._alias_hits: dict[tuple[str, date], str] = {}
 
     def _plan(
         self, security_ids: Sequence[str], start: date, end: date, *, symbols_from: date
@@ -3363,6 +3425,10 @@ class AlpacaPriceSource(PriceSource):
                 line += (
                     f"; {self.last_actions_report.symbol_change_conflict} symbol change conflict(s)"
                 )
+            if aliased := self.last_actions_report.aliased:
+                line += (
+                    f"; {len(aliased)} action(s) under a pre-rename symbol: {', '.join(aliased)}"
+                )
             if self.last_actions_report.symbol_change_backdated:
                 line += (
                     f"; {self.last_actions_report.symbol_change_backdated} symbol change(s) "
@@ -3376,12 +3442,18 @@ class AlpacaPriceSource(PriceSource):
         """A corporate action's lead (#974: a first-span lead, never a rename
         lead), else the pre-rename alias of a stored name change (#3054)."""
         found = self._resolver.lead(ticker, session, actions=True)
-        return found if found is not None else self._resolver.action_alias(ticker, session)
+        if found is not None:
+            return found
+        aliased = self._resolver.action_alias(ticker, session)
+        if aliased is not None:
+            self._alias_hits[(aliased, session)] = ticker
+        return aliased
 
     def corporate_actions(
         self, security_ids: Sequence[str], start: date, end: date
     ) -> list[CorporateAction]:
         self.last_actions_report = None
+        self._alias_hits = {}
         check_request(security_ids, start, end)
         symbols_from = previous_session(start)  # an action resolves on the session before it
         ids, symbols = self._plan(security_ids, start, end, symbols_from=symbols_from)
@@ -3481,10 +3553,18 @@ class AlpacaPriceSource(PriceSource):
                     reviewed_refused += 1  # #2957: reviewed as a duplicate, repair deleted it
                 else:
                     kept.append(a)
+        aliased = tuple(
+            f"{a.security_id} {a.action_type.value} {a.ex_date.isoformat()} under "
+            f"{self._alias_hits[(a.security_id, previous_session(a.ex_date))]}"
+            for a in kept
+            if a.action_type in (ActionType.SPLIT, ActionType.DIVIDEND)
+            and (a.security_id, previous_session(a.ex_date)) in self._alias_hits
+        )
         self.last_actions_report = replace(
             parsed,
             spinoffs_unrequested=unrequested,
             reviewed_duplicates_refused=reviewed_refused,
+            aliased=aliased,
         )
         return kept
 
@@ -3505,6 +3585,7 @@ class AlpacaPriceSource(PriceSource):
                 process_start=start,
                 process_end=end,
                 lag_days=self._lag.days,
+                backdated=self._resolver.backdated,  # #3054
             )
         except (ValueError, TypeError, AttributeError):
             # #1506: a malformed name-change response (a bad row, a non-dict
