@@ -33,6 +33,7 @@ explicitly, e.g. for an alternate environment or a test fixture.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Callable
@@ -845,6 +846,18 @@ class BookExecution(BaseModel):
 
 _BOOK_TOKEN = re.compile(r"^[A-Za-z0-9]+$")
 
+# The forward return exam's pinned values (ADR 0016 amendment 2026-11-07, #3143, the
+# group-sequential exam; T381). The validator refuses looks other than these, a bound
+# below its pinned value at its look, another futility month, a count above the
+# four-exam budget and a skew guard below -0.85: the exam can be made stricter in
+# config, never looser. The bounds are the calibrated O'Brien-Fleming scale
+# c x sqrt(36 / L), c = 2.74903, rounded up to three decimals.
+PINNED_EXAM_LOOKS_MONTHS: tuple[int, ...] = (12, 24, 36)
+PINNED_EXAM_BOUNDS: tuple[float, ...] = (4.762, 3.367, 2.750)
+PINNED_EXAM_FUTILITY_MONTHS = 6
+PINNED_EXAM_MAX_COUNT = 4
+PINNED_EXAM_MIN_INSAMPLE_SKEW = -0.85
+
 
 class PaperConfig(BaseModel):
     """Paper-window and tracking-run settings (spec reqs 3, 7, 8, 10, 14).
@@ -933,6 +946,53 @@ class PaperConfig(BaseModel):
     #: Per-book buy timing (paper spec amendment 2026-11-01 item 7, T369), keyed by
     #: book token; run-time, not frozen. A book absent from the map behaves as today.
     execution: dict[str, BookExecution] = Field(default_factory=dict)
+    #: The forward return exam's five keys (ADR 0016 amendment 2026-11-07, #3143;
+    #: T381): the looks in months, each look's t bound (both legs use the same one),
+    #: the futility month, the four-exam budget and the in-sample skew guard. Pinned
+    #: by `_validate_exam_keys`; T381a freezes them into an exam window at
+    #: `paper start`.
+    exam_looks_months: list[int] = Field(default_factory=lambda: list(PINNED_EXAM_LOOKS_MONTHS))
+    exam_bounds: list[float] = Field(default_factory=lambda: list(PINNED_EXAM_BOUNDS))
+    exam_futility_months: int = PINNED_EXAM_FUTILITY_MONTHS
+    exam_max_count: int = Field(default=PINNED_EXAM_MAX_COUNT, ge=0)
+    exam_min_insample_skew: float = PINNED_EXAM_MIN_INSAMPLE_SKEW
+
+    @model_validator(mode="after")
+    def _validate_exam_keys(self) -> PaperConfig:
+        if tuple(self.exam_looks_months) != PINNED_EXAM_LOOKS_MONTHS:
+            raise ValueError(
+                f"paper.exam_looks_months must be {list(PINNED_EXAM_LOOKS_MONTHS)} "
+                f"(ADR 0016, #3143), got {self.exam_looks_months}"
+            )
+        if len(self.exam_bounds) != len(PINNED_EXAM_BOUNDS):
+            raise ValueError(
+                f"paper.exam_bounds must have one bound per look "
+                f"({len(PINNED_EXAM_BOUNDS)}), got {self.exam_bounds}"
+            )
+        for look, bound, pinned in zip(
+            PINNED_EXAM_LOOKS_MONTHS, self.exam_bounds, PINNED_EXAM_BOUNDS, strict=True
+        ):
+            if not math.isfinite(bound) or bound < pinned:
+                raise ValueError(
+                    f"paper.exam_bounds at month {look} must be at least {pinned} "
+                    f"(ADR 0016, #3143), got {bound}"
+                )
+        if self.exam_futility_months != PINNED_EXAM_FUTILITY_MONTHS:
+            raise ValueError(
+                f"paper.exam_futility_months must be {PINNED_EXAM_FUTILITY_MONTHS} "
+                f"(ADR 0016, #3143), got {self.exam_futility_months}"
+            )
+        if self.exam_max_count > PINNED_EXAM_MAX_COUNT:
+            raise ValueError(
+                f"paper.exam_max_count must not be above {PINNED_EXAM_MAX_COUNT} "
+                f"(ADR 0016, the four-exam budget), got {self.exam_max_count}"
+            )
+        if self.exam_min_insample_skew < PINNED_EXAM_MIN_INSAMPLE_SKEW:
+            raise ValueError(
+                f"paper.exam_min_insample_skew must not be below "
+                f"{PINNED_EXAM_MIN_INSAMPLE_SKEW} (ADR 0016), got {self.exam_min_insample_skew}"
+            )
+        return self
 
     @field_validator("execution")
     @classmethod
