@@ -464,6 +464,7 @@ from tradepartner.backfill import (
     backfill_benchmark,
     fill_holes,
     refetch_actions,
+    span_settings,
 )
 from tradepartner.backtest import index_check as ic
 from tradepartner.backtest import index_check_store as idx
@@ -3398,8 +3399,16 @@ def make_app(
         dry_run: Annotated[
             bool, typer.Option(help="fetch and count, then roll every write back")
         ] = False,
+        span: Annotated[
+            bool,
+            typer.Option(
+                help="one request over the whole range for the --security ids, asking "
+                "every process date up to today (#3074)"
+            ),
+        ] = False,
     ) -> None:
-        """Ask Alpaca again for the splits and dividends of committed months (#3054)."""
+        """Ask Alpaca again for the splits and dividends of committed months (#3054),
+        or, with --span, of named securities over the whole range at once (#3074)."""
         start = _parse_day("--since", since)
         last = _parse_day("--through", through)
         assert start is not None and last is not None
@@ -3412,6 +3421,11 @@ def make_app(
             )
         parts = {part.strip() for item in security or () for part in item.split(",")}
         named = sorted(parts - {""}) or None
+        if span and named is None:
+            raise _fail(
+                "a span needs --security: it asks the whole history in one request",
+                USAGE_ERROR,
+            )
         s = settings()
         if (missing_store := _store_missing(s)) is not None:
             raise missing_store
@@ -3421,7 +3435,11 @@ def make_app(
                 "Set them in .env (see .env.example).",
                 USAGE_ERROR,
             )
-        prices = price_source(s) if price_source else StorePriceSource(s, clock=clock)
+        # #3074: a span asks every process date up to today, so a record Alpaca
+        # processed long after its ex-date is in the answer.
+        today = clock().astimezone(_NEW_YORK).date()
+        asked = span_settings(s, through=last, today=today) if span else s
+        prices = price_source(asked) if price_source else StorePriceSource(asked, clock=clock)
         try:
             result = refetch_actions(
                 s,
@@ -3432,11 +3450,14 @@ def make_app(
                 clock=clock,
                 dry_run=dry_run,
                 securities=named,
+                span=span,
             )
         except ValueError as exc:
             raise _fail(f"refused: {exc}", USAGE_ERROR) from None
         for run in result.runs:
             typer.echo(f"{run.status} {run.chunk_cursor}: {run.message}")
+        for line in result.rows:
+            typer.echo(f"  {'would write' if result.dry_run else 'wrote'} {line}")
         typer.echo(result.summary())
         raise typer.Exit(0 if result.ok else 1)
 
