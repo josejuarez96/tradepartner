@@ -1,6 +1,6 @@
 # 0016. One development boundary, frozen in the store; exams for frozen finalists only; forward exams judged by the paper book
 
-**Status:** Accepted (2026-10-08, by the owner's merge of PR #1320; header set by #1331; the open questions below are his, and nothing here pre-empts them)  ·  **Date:** 2026-10-08  ·  **Amended:** 2026-10-28 (#2444, the owner's decision of that date: point 8, a new family's frozen finalist may take one historical exam on the post-boundary months; points 1 to 7 stand); 2026-11-06 (#3125, #3128, the orchestrator's fail-closed decision for the owner's word: no live choice until a returns-judging exam passes, the forward return exam, point 8 not qualified until a return rule; see the amendment at the end)  ·  **Issue:** #1319  ·  **Plan:** the history-and-identity amendment to the [data-foundation plan](../plans/data-foundation.md) (#1319, its second PR) holds the code tasks  ·  **Related:** #1301 (the owner's discussion of 2026-10-08 and his research-governance brief, comment 6065810154), #1303 (the decision record of 2026-10-08, its newest comment: the data-architecture evaluation accepted as direction), #1292 (B4, parked), [strategy-lab spec](../specs/strategy-lab.md) (family rules, req 1, req 5), [backtest spec](../specs/backtest.md) (holdout, trial registry, `owner_decisions`), [research-registry spec](../specs/research-registry.md) (sealed periods, the same shape for research runs), [ADR 0005](0005-objective-benchmark-stop-criteria.md) (the paper tracking check, `paper.min_rebalances`), [ADR 0009](0009-price-vendor.md) (history from 2016-01-04), [ADR 0014](0014-strategies-as-registered-objects.md) (families and lineage), [ADR 0015](0015-expansion-seams.md) (the book id)
+**Status:** Accepted (2026-10-08, by the owner's merge of PR #1320; header set by #1331; the open questions below are his, and nothing here pre-empts them)  ·  **Date:** 2026-10-08  ·  **Amended:** 2026-10-28 (#2444, the owner's decision of that date: point 8, a new family's frozen finalist may take one historical exam on the post-boundary months; points 1 to 7 stand); 2026-11-06 (#3125, #3128, the orchestrator's fail-closed decision for the owner's word: no live choice until a returns-judging exam passes, the forward return exam, point 8 not qualified until a return rule; see the amendment of that date); 2026-11-07 (#3143, the orchestrator's decision for the owner's word: the forward return exam becomes group-sequential at 12/24/36 months, total size 1.25%; see the amendment at the end)  ·  **Issue:** #1319  ·  **Plan:** the history-and-identity amendment to the [data-foundation plan](../plans/data-foundation.md) (#1319, its second PR) holds the code tasks  ·  **Related:** #1301 (the owner's discussion of 2026-10-08 and his research-governance brief, comment 6065810154), #1303 (the decision record of 2026-10-08, its newest comment: the data-architecture evaluation accepted as direction), #1292 (B4, parked), [strategy-lab spec](../specs/strategy-lab.md) (family rules, req 1, req 5), [backtest spec](../specs/backtest.md) (holdout, trial registry, `owner_decisions`), [research-registry spec](../specs/research-registry.md) (sealed periods, the same shape for research runs), [ADR 0005](0005-objective-benchmark-stop-criteria.md) (the paper tracking check, `paper.min_rebalances`), [ADR 0009](0009-price-vendor.md) (history from 2016-01-04), [ADR 0014](0014-strategies-as-registered-objects.md) (families and lineage), [ADR 0015](0015-expansion-seams.md) (the book id)
 
 ## Context
 
@@ -98,7 +98,7 @@ The [strategy-lab spec](../specs/strategy-lab.md)'s open question 4 keeps the 0.
 - **Labels.** Until a book's exam passes, every report of its tracking result says **"machine pass, edge unjudged"**, never "exam passed". This covers `paper status`, `lab status` (T381a) and every `TP-` claim (checked at review). An exam's own verdict is reported as "forward return exam passed", "failed", "failed (futility)" or "failed (void)".
 - **What this changes in the roadmap and the charter, said plainly.** The [roadmap](../roadmap.md)'s Phase 6 entry gate reads "the machine, not a strategy's months of tracking, is what is gated". Decision 1 adds a strategy gate beside the machine gate. Since a live book needs a strategy, Phase 6's first live order now waits for a passed exam, and that is at least 12 months of paper. The roadmap row carries a dated note saying so (this PR). The [charter](../charter.md)'s line that beating a benchmark is "never a phase-exit criterion" is untouched: no phase's exit criteria change. What changes is which strategy may carry live money, which serves the charter's first objective, "disciplined, evidence-based decisions". Choosing a strategy on gates that pass noise more than half the time across a programme is not an evidence-based decision. The owner's word on this PR is his word on that roadmap change. The other route, a live machine test with an unjudged strategy, is open question 8.
 
-**Decision 2: the forward return exam.** It is pre-registered and runs over a fixed horizon of 12 months. It applies to a book that is an exam of record under ADR 0023: a forward, unspent holdout (point 4), frozen parameters, and at least `paper.min_rebalances` and `paper.min_exam_fills`.
+**Decision 2: the forward return exam.** *(Amended 2026-11-07, #3143: the horizon, the pass rule, the futility and void rules and the pinned values below are replaced by the [group-sequential exam](#amendment-2026-11-07-3143-the-forward-return-exam-becomes-group-sequential); the rest of this decision stands.)* It is pre-registered and runs over a fixed horizon of 12 months. It applies to a book that is an exam of record under ADR 0023: a forward, unspent holdout (point 4), frozen parameters, and at least `paper.min_rebalances` and `paper.min_exam_fills`.
 - **The kill line is frozen first.** Before the window's first session, the kill line is posted on the finalist's issue. It carries the values below, the benchmark, and the finalist's in-sample monthly net excess skewness. T381a then freezes the same values into the window at `paper start`. Nothing in the line is chosen after a return of the window is seen.
 - **The series.** The exam reads H = 12 monthly net excess returns:
   - month m is the book's return from one month-end to the next, net of every fill, fee and dividend the journal books, minus the total return of the benchmark the finalist's file froze over the same dates (SPY under ADR 0005, unless the file names another);
@@ -159,7 +159,7 @@ The rest of point 8 stands. The reasons:
 
 8. **H1 and a $100 machine test before any exam passes.** Decision 1 leaves H1, and every `momentum` book, with no route to the live choice. It also delays Phase 6's first live order by at least 12 months. Recommend keeping the block. If the owner wants live fills on the machine before an exam passes, he amends this record in T163 and names the book "machine test, edge unjudged". It is not left implied.
 9. **Should fast books get a looser rate, given their 1.6% screen rate?** Recommend no. Use one rule and one budget, so that no book type earns a cheaper exam by being labelled fast.
-10. **A longer horizon for more power?** Recommend 12 months now, the cheapest horizon that is not near-useless. Move to 18 or 24 only by a new amendment before the first exam's kill line is posted, never during an exam.
+10. **A longer horizon for more power?** Recommend 12 months now, the cheapest horizon that is not near-useless. Move to 18 or 24 only by a new amendment before the first exam's kill line is posted, never during an exam. *(Answered 2026-11-07, #3143: [group-sequential looks at 12, 24 and 36 months](#amendment-2026-11-07-3143-the-forward-return-exam-becomes-group-sequential), before any kill line was posted.)*
 
 **Consequences of this amendment.**
 - **Good:**
@@ -176,6 +176,77 @@ The rest of point 8 stands. The reasons:
 - **Reversibility:** cheap before any exam starts. After one starts, its frozen line and its place in the budget stand.
 - **Revisit if:**
   - a fifth exam is wanted;
-  - a sequential rule (SPRT or alpha-spending) is calibrated with Audit B's `paths.py` and the skewed nulls, and shown to keep the same family-wise rate with more power;
+  - a sequential rule (SPRT or alpha-spending) is calibrated with Audit B's `paths.py` and the skewed nulls, and shown to keep the same family-wise rate with more power *(taken up 2026-11-07, #3143, at a worst-case 4.9% for four exams rather than the same rate: [the group-sequential exam](#amendment-2026-11-07-3143-the-forward-return-exam-becomes-group-sequential))*;
   - longer history (#1303 items 4 and 5) gives point 8 virgin months;
   - the live account's size grows past the charter's $100.
+
+## Amendment 2026-11-07 (#3143): the forward return exam becomes group-sequential
+
+*The orchestrator's decision on #3143, recorded for the owner's word on this class-B PR (proposals A and B of the strictness check, adopted together; B is recorded in [ADR 0023's amendment of this date](0023-break-first-fast-books-paper-exam.md#amendment-2026-11-07-3143-rung-1-prices-cost-at-the-exams-paper-basis)). It replaces decision 2's horizon, pass rule, futility rule, void rule and pinned values. Decision 1, decision 3, the series definition, the skew guard, one exam per family and the four-exam budget stand. **This is allowed now by open question 10 of the 2026-11-06 amendment: no exam's kill line has been posted.** On 2026-11-07, T381 and T381a have no PR, so no exam window can have started, and an issue search for exam kill lines found only rung kill lines.*
+
+**Why.** The strictness check (2026-11-06/07, read-only, simulated; rules read from origin/main `9354ac7e`, which includes #3100 and #3129; the report is `~/tradepartner-probes/strictness/report.md` on the owner's machine, sha256 `635df286168e6e3cd52b20763750f457d50cd340188069cc9ec1b5e77b27c771`) ran a slow monthly long-only book and an event book through the ladder, promotion and the exam as written, with TP's own gate code. Its findings, quoted:
+- End to end, a real edge of net IR 0.5 at the frozen backtest cost reaches a live order in **1.45%** (slow) and **0.18%** (event) of four-exam programmes ("Every idea real at the stated IR"). "In 98.5% (slow) and 99.8% (event) of programmes, the four exams are spent with no pass."
+- "The 12-month exam at 0.25% per leg needs a paper-net IR of about 3.5 to pass half the time" (written rule: **3.50**, 3.55 at skew −0.3). "A net IR of 3.5 against SPY is about 3-5 times what the best long-only managers sustain."
+- "#3129's power table is optimistic. Its IR is gross IR before a 1.1%/yr drag … At the real 60 bp paper cost, a net IR 0.5 slow book passes 0.29%, not 0.55%."
+- "The size budget is not fully spent. At the skew −0.85 null, the full written rule (both legs plus futility) passes 0.76% per exam, against #3129's leg-(i)-only 1.10%. Four noise finalists then pass 3.0%, so about 2 pp of the 5% budget is unused."
+- "No exam design that keeps four ideas under 5% can confirm an IR 0.5 edge within 3 years."
+
+**The group-sequential exam (design D4 of the report).**
+- **Looks.** The exam reads the monthly net excess series of decision 2 at three looks, after **12, 24 and 36** months.
+- **The pass rule at a look.** At look L, both legs are computed on months 1 to L, as decision 2 defines them: (i) the t-statistic of the mean (sample standard deviation, L − 1 degrees of freedom), and (ii) the t-statistic of the OLS intercept on the benchmark's monthly return over the T-bill rate. The exam passes at the first look where **both** legs reach that look's bound. Both legs use the same bound; the calibration applied the same per-look value to both legs.
+- **The bounds (O'Brien-Fleming shape, c × √(36 / L)).** t ≥ **4.76 / 3.37 / 2.75** at 12 / 24 / 36 months. The calibrated values in the output are 4.761, 3.367 and 2.749, and those are the pinned values.
+- **Total size 1.25%, calibrated to the skew −0.85 null.** The bound scale was found by bisection on 400,000 zero-mean skew-normal nulls at skew −0.85 (the worst case the skew guard admits), 8%/yr tracking error, with both futility rules applied (calibration seed 20261107). "Calibrated variants … were checked again on fat-tailed skew −0.85 nulls, where every one came in at or below its size." On the 200,000-replicate evaluation draw, the design passed **1.252%** of skew-normal −0.85 nulls, **0.986%** of fat-tailed skew −0.85 nulls and **0.343%** of symmetric fat-tailed nulls (`exam_grid.txt`, D4 row).
+- **Futility.** At month 6, if the sum of months 1 to 6 is below 0, the exam is failed (futility), as before. At the 12- and 24-month looks, if the exam has not passed and the sum of months 1 to L is below 0, it is failed (futility). Otherwise it continues to the next look. A futility stop can only stop a pass, so it cannot raise the false-pass rate.
+- **Void.** A look can pass only if ADR 0023's minimums (`paper.min_rebalances`, `paper.min_exam_fills`) are met by that look. A window that ends before month 36 without a pass or a futility stop, or that has not met the minimums by month 36, is failed (void).
+- **The kill line** posted before the window's first session carries the three looks, the three bounds, the futility rules, the benchmark and the finalist's in-sample skew. T381a freezes the same values at `paper start`.
+- **The values are pinned.** The config validator refuses looks other than 12, 24 and 36, a bound below 4.761, 3.367 or 2.749 at its look, a futility month other than 6, a `paper.exam_max_count` above 4 and a skew guard below −0.85. So the exam can be made stricter in config, never looser. `paper.exam_alpha` and `paper.exam_horizon_months` are replaced by `paper.exam_looks_months` and `paper.exam_bounds` (T381).
+- **The labels are unchanged**, with one addition: an exam that is running reports its next look ("forward return exam running, next look at month 24").
+
+**The arithmetic: four exams.**
+- **Worst case, inside the skew guard.** Four noise finalists at skew −0.85 give 1 − (1 − 0.0125)⁴ = **4.9%**. The union bound gives at most 4 × 1.25% = 5.0%, whatever the dependence between the exams. The written rule gave 3.0% (the report's run) and 4.33% (#3129, leg (i) only). The design spends the budget the written rule left unused; it does not raise it.
+- **Fresh data still breaks the selection link** (decision 2's arithmetic): every exam month comes after the frozen kill line and after every in-sample and rung-2 window.
+
+**Before and after, quoted from the report.** "Exam" is the per-finalist pass rate at net IR 0.5 / 0.75; "programme" is P(a live order) over four exams with every idea real at IR 0.5; costs are paper costs per side.
+
+| | Worst-case false-pass (four exams) | Slow: exam at IR 0.5 / 0.75 (60 bp) | Event: exam at IR 0.5 / 0.75 (60 bp) | Slow: programme at IR 0.5, 60 bp / 24 bp | Time to a pass |
+|---|---:|---:|---:|---:|---|
+| As written (12 months, 0.25% per leg) | 3.0% (the report's run); 4.3% (#3129, leg i) | 0.29 / 0.56% | 0.04 / 0.10% | 1.45% / 2.9% | 12 months (6 on futility) |
+| Group-sequential (A) | 4.9% | 0.84 / 2.43% | 0.03 / 0.11% | 3.2% / 12.1% | "a strong edge can still pass at 12; median exam 18 months; a pass needs up to 36" |
+
+The paper-net IR at which the exam passes half the time falls from 3.50 (written) to 1.60 (D4, skew 0; 1.63 at skew −0.3; `exam_grid.txt`).
+
+**Programme pass rates, with B's 24 bp paper cost (A + B), quoted from the report's combinations table:**
+
+| | Slow programme at IR 0.5 / 0.75 / 1.0 | Event programme at IR 0.5 / 1.0 | False pass |
+|---|---:|---:|---|
+| **A + B** (24 bp paper cost, sequential 1.25%) | **12.1% / 25.5% / 45.8%** | 8.6% / 38.3% | worst case 4.9% |
+| Today | 1.45% / 2.70% / 4.08% | 0.18% / 0.90% | — |
+
+- **A alone does not help the event book at 60 bp.** At 60 bp "a net IR 0.5 event book has a paper-net IR of −0.58", and the sequential exam passes it 0.03%, against 0.04% as written. Its gain needs B's cost work: with A at 24 bp it passes 2.17%.
+- **The time cost, said plainly.** "Given a pass, the median time to the first live order rises from about 22 to about 42-46 months. This is the honest price of power." In the programme output, the median given a pass is 24.0 / 22.5 / 19.5 months today (slow, 60 bp, IR 0.5 / 0.75 / 1.0) and 46.5 / 43.5 / 40.5 months under A + B. The floor stays about 15 months: an edge strong enough to pass at the 12-month look still can.
+- **An exam slot is held longer.** A running exam occupies one of the four slots for up to 36 months. The budget counts started exams, as before.
+
+**Reproduce.** From the report ("Reproduce" section), in team worktree `strict1` with `PYTHONPATH=~/tradepartner-probes/auditB/scripts:~/tradepartner-probes/strictness/scripts`: `python -I scripts/exam_grid.py 200000 20261107 out/exam_grid.json` (calibration seed 20261107) and `python -I scripts/programme.py out/screen_main.json out/exam_grid.json out/programme.json` (4,000 programmes per cell). The files are pinned by sha256 and the key output lines are posted on PR #3143's thread:
+- `scripts/exam.py` `ebceab12ca5075d454d1fb69cf3297d8d91cf348f3d274662b9281ddccb56139`
+- `scripts/exam_grid.py` `230c986f14f4666e674c435fe431495932ac9d11d948b760ed97b7e0ee041ac2`
+- `scripts/programme.py` `1be18d54e82cdb8b60f6f950bfca7afda0c4a19899078378e75f8fb6b9f42b6c`
+- `scripts/screen.py` `ebcacc2e70948cc91e43e21f13898bfcc37603920e4037ea48e17992f9b101a2`
+- `out/exam_grid.json` `26d56fa6f59fcdfb44a6cfe829271d2bd5899d1cfa6e5a344a489875b6868bdc`
+- `out/exam_grid.txt` `64909dddce51af71b2c9bb7fd8c728e4244d1ad2b365a79ac84e44800e0f5393`
+- `out/programme.json` `2f9e1077901a971a614559329d46340d554e1726da80fc980f73b60e0b9903c7`
+- `out/programme.txt` `54f0742a60951b4d588dc94e8f5195fa7e1d63dc4018a6a0f81062f885230ae5`
+- `out/screen_main.json` `64439b7807544009a1f01378cf3f9f14dd149797b74002ffff2e2e4c6322d0fa`
+
+**Limits, quoted.** "Returns are simulated. Tracking error, turnover, skew, delay loss and the rung-2 link are assumptions." "The 60 bp is #3118's pooled figure. The validation calls it fragile (48 bp without the top 5 names)." "The programme model is stylised: one idea every 1.5 months, 2 slots, fixed lags. Pass probabilities are insensitive to these because the budget binds; times are not." Not modelled: rung 3, rung 5's top-names-removed test, researcher forking, and β ≠ 1 outside the report's conjunction table (where, at β 0.8, D4 passes 2.97% with both legs against 6.13% with leg (ii) only).
+
+**Open questions (the owner's; not decided here).**
+
+11. **Proposal C: credit the screen, per-exam size 2.5%.** Design D6: sequential bounds 4.07 / 2.88 / 2.35 (output: 4.071 / 2.879 / 2.351), "justified by assuming the screen passes no more than 50% of noise ideas (measured: 0.24% slow, 2.7% event; 19% in Audit B's worst rule-keeping path)". False pass: "9.4% if all four finalists are noise; **≤ 4.8%** from the start at a ≤ 50% screen; 0.03-0.3% at the measured rates". Slow exam at IR 0.5 / 0.75 (60 bp): 1.96 / 4.96%; event: 0.10 / 0.37%. Slow programme at IR 0.5, 60 bp / 24 bp: 7.8% / 22.1%. With B (C + B): slow programme 22.1% / 41.1% / 65.6% at IR 0.5 / 0.75 / 1.0, event 18.5% / 54.5% at IR 0.5 / 1.0. The report: "C is a policy choice for the owner. It trades the worst-case guarantee for a from-the-start bound." No recommendation is made here.
+12. **Open question 8 (a $100 machine test, edge unjudged), with the report's numbers.** "The one lever that brings the first live order to about 3 months. It does it by not judging edge before $100 goes live; the exam still judges any scale-up. It changes no false-pass rate of the edge claim." Open question 8 stays open; this amendment decides nothing about it.
+
+**Open question 10 of the 2026-11-06 amendment is answered** by this amendment: the horizon is now the three looks.
+
+**Consequences.**
+- **Good:** a real IR-0.5 slow edge reaches a live order in about 12.1% of programmes with B, against 1.45% today; a strong edge can still pass at 12 months; the worst-case false-pass rate stays at or under the 5% budget.
+- **Bad / accepted:** the median time to the first live order, given a pass, rises from about 22 to about 42-46 months; an exam slot can be held for 36 months; the event book gains nothing until paper cost falls; T381 and T381a change before they are built.
+- **Reversibility:** cheap until the first exam's kill line is posted. After that, the posted line and its slot stand.
