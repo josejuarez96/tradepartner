@@ -486,6 +486,190 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Research report on paper fill costs: decomposition of the 10-20 daily-book fills, verdict on the 15 bp cost model and open-fill cost tiers (#2165).
 - Test: hand-computed long/short parity cases for the backtest engine (#2166).
 - A long_short trial writes seven reported-only metric rows (gross and net exposure, borrow_paid_annual, excess_cagr_rf), its borrow-sensitivity books get metric rows kept out of V, N and DSR, the backtest page shows exposure, the proxy's limits and labels the borrow lines, and the bt oracle gains a long/short case (#2198)
+- Paper resume checks fill prices against the configured band, keeps the kill switch engaged on a bad fill, and shows collected prices; any halt read finding a bad fill engages the switch, including a stale-data halt, and later resumes refuse (#2007, #2666).
+- Forced short covers and short mark accounting, with paper status and report figures for short books.
+- `tradepartner action-retract`: withdraw (or reinstate) one stored corporate action as a `cancelled` revision known at the clock, never back-dated; ingest no longer revives an owner's withdrawal the source still serves (#2092, T262).
+- B10's sweep file excludes utilities so it registers under the momentum family rules (#2109).
+- Paper status and the Operations page warn when the EDGAR master has not refreshed for ingest.edgar_max_age_sessions sessions (default 3, 1 to 20); paper keeps trading (#2197)
+- Pure book performance summary: range slices rebased with SPY, best/worst day, maximum drawdown and the N of M line (#2239).
+- `execution.book_holdings`: per-name value, FIFO lot cost basis, gain since bought and change today, with a summary (count, cash, up/down, top-N rankings); read-only (#2170, T272)
+- Today's activity summary: sells and buys grouped with Eastern time ranges, dollars, full exits, new names, failed-order sentences and a one-line digest (T271).
+- The Home page's view model (`execution/home_view.py`): one read pass returning the status line, the items that need the owner, a card per book, data status and the research strip; `ui.next_run_time_et` and `ui.holdings_rows` config keys; `docs/ui/book_blurbs.toml` with one plain sentence per registered hypothesis (#2251).
+- Dashboard top navigation (Home, Research, Books, Details drop-down) replacing the sidebar radio, with placeholder Home and Books pages and the book, benchmark and needs_you chart roles (T274, #2256).
+- execution/book_view.py: the Book page view model, one read-only pass cut to what the journal knew at now (T279, #2170).
+- Book page (dashboard): header with status pill and strategy sentence, range chart against SPY, best/worst day, drawdown, Today and holdings, with a link to the book's trades.
+- Home page (T275, #2170): draws the Home view model in the approved order, quiet when nothing needs the owner and loud (orange, one copyable action each) when something does.
+- ADR 0025 (reconcile by breaks, name restriction, owner true-up) and the paper spec amendment of 2026-10-26 (#2266), with ADR 0017 part E amended so an external break no longer restarts the shakedown span.
+- The Book page's kill action (`dashboard/book_actions.py`, not yet wired to the page): runs `paper kill` as a child process on the live store only, exit 0 is engaged and any other code is NOT engaged, past `ui.kill_wait_seconds` it is NOT confirmed; config keys `ui.max_reason_chars` (500), `ui.kill_wait_seconds` (default writer wait plus margin, a shorter set value refused) and `ui.kill_wait_margin_seconds` (30).
+- The Book page's safety card (reconciliation with Alpaca, the kill switch line, the limits in plain words) with a "Stop this book now" dialog that runs `paper kill` on the live store and reports engaged / NOT engaged / NOT confirmed from the exit code alone, and the "Is it doing what the backtest said?" card (shakedown progress, the latest tracking report, the desk command to run another).
+- Five ordered implementation tasks for reconciliation breaks, owner true-up, and the amended paper shakedown.
+- Schema version 37: the `reconcile_breaks` journal table, with one open break per window and name held by `journal.append`, and the `breaks`, `auto_true_up`, `owner_true_up` and `skip_restricted` values (ADR 0025, T280a).
+- Plan task ids like `T266a1` are recognised by claim, status, graph, readiness, fragments, ready_pr and doc_check (#2282).
+- `execution.breaks`: pure classification of reconciliation breaks, and the frozen `risk.break_*`, `risk.max_open_breaks` and `risk.max_open_break_share` keys at the #2266 defaults (ADR 0025, T280b).
+- A failing shakedown line now shows every day as a waiting item (paper status --all, Operations page, Home's Needs you), and paper status --all prints the span's progress (#2298).
+- Plan T289 to T299: the Lab page, register and run a sweep from the dashboard as the desk's own command, watch it, and read its verdict against the pre-registered thresholds (paper-trading plan, #2304).
+- Small-account buys that become fractionable match their planned notional to the minimum order; whole-share buys worth less than the minimum record skip_below_minimum instead of staying deferred (#2308).
+- Paper reconciliation attributes cash on journaled names, records deterministic break events, and engages the kill switch on break-event write failure (#2312).
+- The Lab's one Run slot: an O_EXCL slot file with PID-reuse check, stale takeover, exit-code waiter, scrubbed status and release (T298)
+- The Lab's file listing and sweep preview: registry and git state per sweep or hypothesis file, and what registering a sweep would do, read-only (T289)
+- The Lab's child process helper (dashboard/lab_child.py): exact argv for sweep run, backtest and sweep register, a never-waited spawn with a 0600 log, the live-store refusal and a secret-scrubbed log tail.
+- Lab: the verdict of a run and the runs in flight are read from the registry, never the exit code (T291)
+- ready_pr's review gate covers the dashboard's child-process modules (book_actions, lab_)
+- Add results.next_trial_cost, the SR* a run would add to a family (ADR 0018 amendment B).
+- The charter's Interface line names the dashboard's child-process writes
+- Gate dashboard Book page changes on safety-reviewer (#2337).
+- Research report: five strategy candidates aimed at small size and exact filing times, with kill-ladder rungs 1-3 and an equal-weight benchmark reading (#2338).
+- Lab log tails redact only secret byte ranges, preserving literal NUL bytes as cleaned spaces (#2341).
+- team.py's task-reference pattern has word boundaries, so a typo like T266a12 or xT241 is not read as a task (#2343).
+- Sweep family-rule refusal messages show both values and identify omitted keys' current defaults (#2345).
+- docs/experiments/c1-filing-delay.md: pre-registered C1 filing-delay test (early long primary, late short second configuration)
+- fix Interface line contradiction about dashboard writes (#2350).
+- document task id format with optional letter and digit (#2351).
+- test: assert exact safety-reviewer set for book_page.py (#2352).
+- A root hypothesis family `filing_delay` (experiment-only: no signal, refused by the engine, sweeps, hypothesis files and paper) so the C1 filing-delay experiment registers with `family = "filing_delay"` and its configurations count in its own N, not B4's (#2353).
+- Refit the CI pytest shard weight table in tests/conftest.py from three recent green main runs; predicted slowest shard drops from 13.8 to 9.5 minutes of pytest time (#2368).
+- docs/experiments/c1b-filing-delay-matched.md: pre-registered size-matched redo of C1 (causal terciles, spreads against matched peers, 2015-2023)
+- Restricted names and the break cap behind the existing halt (T282a, ADR 0025)
+- The dashboard shows a fixed bottom bar (Home, Research, Books) on phone-width screens; the top nav stays on desktop.
+- ensure every static invariant test file exists (#2387)
+- ADR 0026: phone access through Tailscale Serve to a read-only phone instance of the dashboard; ADR 0011 point 3 amended (#2389).
+- A root hypothesis family spinoff (experiment-only: no signal, refused by the engine, sweeps, hypothesis files and paper) so the C2 spin-off-children experiment registers with family = spinoff and its configurations count in its own N (#2399).
+- docs/experiments/c2-spinoff-children.md: C2 spin-off-children design (matched-peer spreads, power gate); no run.
+- Paper breaks now carry a safe cash base, retain open activity ids for later attribution, and keep positive name cash breaks out of buy sizing (#2402, T282b).
+- Lab Register waits on the CLI's sweep registration, checks the merged file and live store at click time, and keeps Run logs untouched (#2404, T293).
+- Research report on sources for pre-2016 daily US equity prices, cost and point-in-time fit (#2407)
+- Research: a required feasibility check before any experiment file, a Gate 0 note on the external discovery report, and feasibility and decision fields in the ladder ledger with C1 and C2 as first entries (#2409)
+- add TP-8 claim for C1 filing delay result (#2411)
+- add delisted-coverage item to feasibility check (#2412)
+- ADR 0022 amendment and C1c pre-registration: delisted-inclusive check of C1b on Sharadar bars, side dataset outside the store, family N 6 (#2417)
+- 2026-10-11 Sharadar overlap-test report and claims TP-SH-1 to TP-SH-3, with a dated note on why it stalled (#2420)
+- Add a Lab page for registering and running a sweep, showing trial cost and the registry verdict (#2423).
+- add C1 filing-delay results record and update TP-8 citation (#2427)
+- The Lab shows a sweep's pre-registered thresholds, each variant's result and the rule's verdict (#2441).
+- The Lab runs a promoted hypothesis inside the allowed window, takes an optional sweep time budget and refreshes the run status on its own (#2449).
+- Early low-disk warning in health and a free-disk floor checked once before ingest starts (exit 1, /fail heartbeat for the scheduled shape)
+- docs: ADR 0027, an emergency stop that does not need the store (Proposed)
+- Remaining breaks cash-base readers (run.py exit book and run ledger, CLI reconcile guard) accept a breaks row with broker_cash; the T281 halt still submits no order (#2456, T282c).
+- Two-book isolation test for a failing in-window run (#2459); it found #2475 (open_buy_reserve is store-wide), pinned as a strict xfail.
+- CLI test that a stale or missing ingest turns the paper-run heartbeat red with zero submits (#2460).
+- A `breaks` reconciliation restricts its names and halts nothing; `break_cap` and a restricted name in a long_short book (#2465) still halt; `paper stop` refuses `open_breaks` while a material break remains.
+- An event-study reader that pulls events and prices from the store at an explicit known_at cut, with a synthetic fixture store (#2464).
+- Data health uses short read-only connections for each query (#2472).
+- Pure event-study maths with overlap-calibrated primary interval and kill-line t, required costs/borrow/z, fixed-seed null calibration (#2473).
+- Auto-acceptance of immaterial reconciliation breaks and true-up ledger/lot semantics (T283a, #2266 items 5-6, 8-9)
+- ingest --census-sec-forms: read-only full filing-index census of the six ownership forms (per year, requests, bytes, hours at the EDGAR rate limit); opens no store (#2435)
+- SEC ownership form parsers (13D SGML header and XML, Form 4/4A) and events.sec_forms config keys, off by default
+- Add closed [study] parser validation, C1b parse-only fixture, and optional experiment template block (#2487).
+- Sandbox paper book for regression runs against the real Alpaca paper API on a temp copy of the store; the live store refuses it
+- Added version 39 spin-off basis allocation records, owner entry, as-of reads, and late Form 8937 fixtures.
+- docs/plans/config-split.md: R0 and R1 of the architecture review as T309 to T315, with corrections and five open questions (#2512)
+- Pure reader of one DERA insider quarter zip, its raw fetch and the five Form 4 bulk-route config keys (no store, no route rules yet).
+- tests/test_config_golden.py and tests/fixtures/config_golden/: goldens for the Settings dump, schema, frozen keys, family hashes, env names, importable names and the .env.example load; CONFIG_GOLDEN_UPDATE=1 rewrites them
+- Research report 2026-10-28 strategy-frontier-verified, backlog item I1 and ledger rows, claims FV-1 to FV-3 and TP-FV-1 to TP-FV-4 (#2525).
+- Pure Form 4 bulk route rules in adapters/form4_route.py (T305c, #2498).
+- Schema version 40: SEC ownership tables (sec_filing_events, sec_form4_transactions) and gated point-in-time reads sec_filing_events_as_of / sec_form4_transactions_as_of (T306, #2539).
+- Event-study driver with entry-time size buckets, matched peers, delisted holds, kill lines and artifacts (#2560)
+- SEC ownership 13D discovery and Form 4 per-accession XML fetch use checked acceptance stamps; writes refuse changed re-reads and keep filer identities out of the security master.
+- Store migration through ingest, backfill and paper write commands takes a verified pre-migration copy first; other writers and dry runs refuse an older store (#2565, #2160).
+- SEC ownership forms --check rules for acceptance stamps, timezone-aware columns, unique identities and required identity fields.
+- Route selected Form 4 accessions through insider bulk or XML using acceptance stamps and the shared SEC limiter.
+- `tradepartner experiment study --run <id>` runs the registered event-study runner and records its result; `experiment open` takes a [study] file's configurations (#2573)
+- Sandbox paper --now starts from the prior stored close; marked-copy sandbox runs submit during market hours.
+- INT-01 integration tests exercise fake-broker ingest, paper runs, journal readers, corporate actions, and a strict xfail for the missing short mark (#2601).
+- Tests for recovery after a stale-ingest refusal and for status/ops/waiting monitoring after one book's run fails (#2602).
+- Research note on paper fill cost per side against the arrival price and the mechanism of the buy delay (#2608), with claim TP-FC-1.
+- Added pending-order recovery tests for stale ingest and book isolation, asserting unique client order IDs, exact broker submit counts, and no same-session duplicates.
+- `paper_phase` notes in each paper run's result message: UTC times for each phase and the sell-poll round count; broker calls unchanged (#2620).
+- `ingest --source edgar --sec-forms-only`: the SEC ownership forms backfill without the full EDGAR pass; the Form 4 bulk step holds one quarter at a time (#2624)
+- Docs: rung-1 cost rule, $200M liquidity-floor registration default and strategy-search limit recorded.
+- Data foundation: specified separate as-of delisting reason rows, a precise deciding-read timing question, conditional reason/merger trial vintages, and a frozen failure-return grid that stresses unknown exits (#2670).
+- Specified the gated XBRL inputs and coverage checks for cash-based operating profitability; deferred the historical membership decision to the owner (#2670).
+- Research: timestamped candidate-3 insider-purchase kill line, frozen registration, evidence, feasibility and disconfirmation review (#2673).
+- Research: cash-based operating profitability fails the declared CZ desk read; T330/T331 must not be built for this signal, pending the owner's strike-or-park decision (#2675, #2677).
+- Plan tasks T332 to T341 for the registered Form 4 insider-purchase event study (#2679).
+- Separate delisting reason fact table and as-of read with evidence timestamp checks (#2682).
+- Desk read for candidate 5, cash-profitability long-only vs SPY: FAIL under the kill line frozen on #2689 (#2689).
+- Paper plan rows record the engine liquidity intersection count and skip flag at each rebalance (#2690).
+- Manifest-driven Form 4 bulk role repair and read-only manifest builder, with release and stale-row guards (#2697).
+- ADR 0028 (proposed): one ingest standard, raw-first and re-derivable, adopted source by source (#2712).
+- ADR 0028 first-step spec and one-PR plan tasks T345-T352 for raw retention, skip, comparison, multi-owner routing, and re-derive (#2714).
+- Incremental EDGAR pure parts: carry_forward_underived, store.drift_check (rotation share and row comparison), two health warnings
+- Pure settled-quarter reconcile for the incremental EDGAR ingest, with filed_on revisions and the quarter selector; `edgar.reconcile_recent_quarters` (default 8).
+- Plan and spec amendment (#2743): T360 to T362 move dead cache versions and the departure corpus's raw responses into the raw archive by hash (about 1.4 GB), back up the stamps, and keep every nightly-read cache local, insider zips included.
+- Research note on iCloud upload, eviction and download status for the ADR 0028 raw archive (T354)
+- Raw archive helper (`store/raw_archive.py`, T346): content-addressed raw bodies and manifests, bounded iCloud upload/download waits (`raw_archive.*` wait keys), and a reader-boundary source scan (#2751)
+- Form 4 raw retention (T348, #2755): with `TRADEPARTNER_RAW_ARCHIVE` set, fetched Form 4 XML and each new insider bulk zip are archived by SHA-256 before parsing; the `edgar`/`sec_forms` writer run archives one provenance manifest (row key, raw hash, URL, UTC fetch time, parser version, written rows' key and pinned digest) and its message and quarter rows gain `provenance_sha256`; a changed bulk zip rechecks held XML accessions once (rule 4).
+- Research exposures schema: append-only launch records, constrained provenance and verdict fields, unique launch key, and nullable N exposure column (#2761).
+- Existing-cache migration runner for the move class (journal, resume, duplicate rule, eviction, manifest, tombstone index); backup copies and restore are later slices.
+- Incremental EDGAR daily index read, new-issuer history walk, pending stamp retry and filed-on revisions (#2768)
+- Existing-cache migration runner, backup class: stamps are copied, never moved, into the raw archive (T361b).
+- Existing-cache restore: copies archived files back to their original path and mtime, hash-checked, never over a local file
+- tradepartner archive migrate-cache [--apply] and archive restore --path [--run]; corpus fetch departure-reason refuses, naming the restore command, when it needs a file the migration moved; runbook uses migrate-cache instead of rm -rf.
+- The paper spin-off receipt names its parent, ex-date and any stored basis allocation, and the lot ledger opens one child lot per parent lot with that lot's acquisition date (IRC 1223(1)).
+- Form 4 per-field source comparison declaration (events.form4_compare_* keys) and pure adapters/form4_compare.py (#2714).
+- health --check gains six filing_index revision rules; the stamps-repair restamp moves every revision of a matched accession by (cik, accession) and refuses one whose new acceptance is at or after a revision's known_at
+- Pure form4_owner_route check; bulk route refuses ambiguous multi-owner XML attribution (sec_forms_multi_owner_ambiguous / _set_mismatch) before any write (#2711).
+- `tradepartner paper true-up --break <id> --reason`: the owner adopts the broker's figures for one open reconciliation break (fresh broker read, no-write refusals, one write chunk of `owner_true_up` rows and a `trued_up` event); an acknowledged finding is not reopened while its key is unchanged (#2266 item 9)
+- Frozen backtest key `backtest.delisting_failure_return` with versioned delisting failure-return policies (`none`, `failure_v1`, `severe_v1`); a nonzero policy is refused on a short book and cannot run until the engine applies it (#2790).
+- Desk-read exposure records: `store.research.record_exposure` and its readers, and N's third part `n_exposure` (research-registry amendment 2026-10-31, #2723; T356).
+- Schema 46: nullable list_position on filing_index and filing_index_pending, written by T319's incremental read; filing_index.accession_listing_order.
+- Incremental EDGAR ingest behind `edgar.incremental_index`, and `ingest --source edgar --rebuild-index` to seed or repair the filing index one quarter per chunk (T323, #2824).
+- Net external financing (XFIN) rung-2 desk read: FAIL under the kill line frozen on #2828; backlog tally 6 of 6
+- edgar.statement_fact_units: a per-name unit list for statement facts (empty by default, hash and cache keys unchanged while empty), and PRE_2826_STATEMENT_FACTS (#2826).
+- Statement tag-alias census for the #2826 names (T363): frozen tag lists, residue and labelled names in the spec, and T368's time and disk budget.
+- Strategy-search retro page: six results, what they rule out, three options and a recommendation (#2835).
+- Trial data vintage counts only the eight pre-#2826 statement_facts names, so a backfill of new names stales no trial; source scan keeps readers on named held constants (#2826).
+- Fingerprint check that accepts a pure addition of statement names, and stores statement_tags/statement_fact_units on edgar_index run rows (#2826).
+- Incremental EDGAR equality and memory proof over a simulated SEC (T323b, #2846).
+- paper.execution per-book buy timing config, alpaca.opg_cutoff_minutes_before_open, and execution/buy_timing.py (arm_for, execution_for, allowed_time_in_force)
+- Research note with the protocol for the OPG paper probe (T374); the run and gate come after the owner's sandbox sessions.
+- Pure open-tranche selection: long notional buys in ascending remainder within a Decimal cash budget (paper spec amendment 2026-11-01, item 2).
+- `tradepartner ingest --source edgar --statement-backfill --bulk-from-cache`: an additive, resumable statement_facts backfill for added statement names, with `edgar.statement_backfill_chunk_ciks` (#2826, T365)
+- The cash sleeve: on a book in paper.execution, the buys phase's cash and the plan's buy targets leave cash_sleeve_fraction x equity uninvested, and each batch writes a paper_execution line to the run notes (paper spec amendment 2026-11-01 items 3 and 6, #2842).
+- The cash sleeve no longer counts as unspent cash in the unspent_cash alert or the Risk card's cash row (T370b).
+- Research note 2026-11-02-buy-wait-cost-replay: what sending buys before the open would have saved, replayed on paper fills (#2884)
+- Composite of weak slow signals rung-2 desk read: FAIL under the kill line frozen on #2888; second-limit tally 1 of 4
+- Design note for an earnings-announcement event family on 8-K Item 2.02 acceptance times: B9/C1 differences, point-in-time query, DRAFT kill line, feasibility count plan and build list (#2892)
+- docs/specs/idea-pipeline.md: the idea-pipeline spec (idea cards, the first-pass filter, the stages of evidence, two speeds joined by a multiplicity rule, the capability tally with cost comparisons, the sealed confirmation set, the pilot and its stop rule) (#2896)
+- Reversed owner true-ups replay as undone bookings, restore suppressed splits, and permit activity rebooking by explanation link
+- tradepartner exposure record (exit 2 on a refusal, nothing written) and tradepartner exposures [--family --candidate --include-synthetic --candidates --since]; no edit, delete or withdraw command (#2723)
+- Form 4 comparison baseline note and recorded fixture test (T353, #2900); no code change.
+- Daily index raw retention: each daily form.idx body is archived by SHA-256 before parse, with one provenance manifest per edgar_index writer run (T347, #2714).
+- Idea cards file (docs/research/idea-cards.md) with header and source C cards FC-1 to FC-6, the flow-calendar note, and their ladder ledger and batch rows (#2907)
+- docs/research/idea-cards.md (header and source B cards) and the 2026-11-02 data-edge census note (#2908)
+- reconcile_break alert, 'Open breaks' block in paper status --book, restricted names on Home and Book, and ADR 0017's amended E.2 in paper shakedown (#2912)
+- Research note: delisting coverage attribution, 2016-2018 (docs/research/2026-11-02-delisting-coverage-attribution.md) (#2913)
+- Independent review of the idea-pipeline pilot's 11 cards: findings on each card in idea-cards.md, a post-review tracking column and tally, and the review note docs/research/2026-11-02-pilot-card-review.md (#2914)
+- Research note docs/research/2026-11-02-cost-by-liquidity-band.md: quoted and effective spreads, touch depth and per-side cost at $50/$500/$5,000 by liquidity band, and the blocked cards' cost lines under D9 (#2919)
+- Paper true-up can reverse a trued-up break, restore its adjustments, and reopen it as material.
+- `edgar.filename_fetch_workers` (default 4, 1 to 8): `filename_listings` prefetches one CIK's filing-name index and document requests on that many threads, all behind `edgar_raw`'s one process-wide limiter; results are taken in stamp order, so the answer, the cache file and the counts equal the sequential fetch's (#2932).
+- `edgar.filename_fetch_max_failed_share` (default 0.02): a filename fetch that still fails after the retries (a 5xx, a timeout, a connection error) fails that CIK closed (no answer, the failed filing uncached, asked again next run, counted as `filename fetch incomplete` in the run message) instead of aborting the run; `check_failures` fails the run past that share of the CIKs asked (#2932).
+- edgar.filename_fetch_outage_ciks (default 20): the filename fetch pass stops, failing the run closed, once that many CIKs in a row fail past the retries (#2934).
+- repair_stamps.py audit-store and store-ciks, and the stamp audit judge, to size and close the stamps still early after restamp-1382a2 (#2936).
+- Fixed: the bar fetch (daily ingest and backfill windows) keeps a live name whose newest listing row is a secondary venue, as universe rule 2 does; a debt-titled Form 25 never ends a common listing (#2937).
+- Backtest provider reads `delisting_reasons` and `merger_exits`: exit evidence known at the run's data cutoff, the acquirer's raw close on the merger's effective date (T328b, #2944).
+- Research: cash-flow value (CZ `cfp`) desk read, FAIL at its frozen kill line; second-limit tally 2 of 4 (#2946).
+- Paper spec amendment 2026-11-03: a per-book mid-session submit window, with daily at 10:30-11:30 ET and cost read against the arrival mid (#2950).
+- EDGAR: edgar.cover_split_contexts and edgar.class_member_link default on; FSN_VERSION and COVER_VERSION 7 (T198 release code; the release steps run in the owner's sitting).
+- Delisting reason evidence builder: Form 25 provision/text and issuer 8-K items 1.03/2.01/3.01 write separate point-in-time reason revisions; conflicts reported, ambiguity stays unknown (T327, #2670).
+- Look-ahead proof of the additive statement backfill: equality with --rebuild-index, resume after each chunk, truncation invariance, restatement, tag precedence, 10-K/A and the nightly (tests only).
+- Show disclosed exposures and their configuration count on dashboard pages.
+- Form 4 rule 5 comparison in the ingest driver: with events.form4_compare_threshold set, a below-threshold mismatch stores the trusted row and an unresolved marker in the writer manifest, markers carry forward and recheck on a changed zip, and a share at or above the threshold fails the run; unset keeps the order-sample refusal. Health reports the counts.
+- `tradepartner archive rederive`: a bounded re-derive from the raw archive. Each row maps to one writer manifest entry, every input is hash-checked before parse, the disk floor is checked before and during, parser mistakes are corrected in place inside an open data release with known_at kept, and rows an open paper window read are refused (dry run by default; `--release` and `--expect` to write; T352, #2998)
+- Trial data vintage gated on the frozen delisting policy: a backfilled reason or merger row known by the cutoff stales a non-none trial, trips the lab store-change guard and makes is_current false (#3002).
+- tradepartner refetch-actions (dry-runnable, under a data release) and ingest --actions-backfill --name-changes-only
+- Rule 7 reads a post-split share count dated before its split's ex-date as already split, under `universe.shares_split_dating` (default off, frozen off), and `health` lists shares facts whose implied cap jumps against their neighbours (`health.shares_cap_jump_ratio`) (#3055).
+- `health` lists `spliced_series`: a close jump above `health.splice_max_price_ratio` across a bar gap on one id (#3056).
+- `repair-spinoff-splits` deletes the reviewed spin-off split rows under a data release, and `spinoff-backfill` asks Alpaca's per-symbol spin_offs for the months before the actions floor (#3058).
+- `tradepartner refetch-actions --span --security ...`: one request over the whole range for the named securities, with the process-date window reaching today (`backfill.span_settings`). The dry run lists every row it would write (#3074).
+- `classifications.issuer_class` (schema 48): spac, bdc, mlp or foreign, from point-in-time filing evidence (#3076)
+- `universe.exclude_issuer_classes`: rule 1 excludes BDCs, MLPs and foreign filers by `issuer_class` by default; `[]` is the old rule and every registration stored before it reads `[]` (#3076)
+- tradepartner close-gap: flags stored benchmark closes more than index_check.max_close_gap (0.5%) from official closes (SPY Alpaca SIP close differs up to 2.9% in March 2020; open/high/low match; vendor close definition, not feed/adjustment)
+- `tradepartner store bank-filers [--assets FILE]`: a read-only census of exchange-listed banks that file with their regulator instead of EDGAR (First Republic, Signature), from a reviewed list with source URLs, plus bank-level leads from an Alpaca assets file (#3078)
+- Claim TP-10 and a backlog note and ladder-ledger row retiring published slow accounting signals, single or combined, long leg, as a candidate source (#3092 step-3 KILL: arm 3 net long-leg t 0.53 VW / −0.02 screen, 2000-2019).
+- paper resume --accept-fill-band: after the owner checks a fill_price_outside_band print, resume releases past it and journals the accepted fault in resume_acceptances; the resume that first collects a bad fill still refuses (#3130)
+- A reviewed successor-chain allowlist and a fail-closed health check that names every unlisted row (#3142).
+- `paper cost --book <b> [--window <id>] [--through S]`: the measured per-side cost against the session's bar open, per order, weighted by notional, stops left out, rounded to 5 bp (#3118 item 3).
 
 ### Changed
 - `insert_row` now binds the UTC-normalized value for `TIMESTAMPTZ` columns (one canonical stored form) instead of the caller's original tzinfo, and `ensure_tz_aware_utc` re-raises the `OverflowError` from `.astimezone(UTC)` near `datetime.min`/`datetime.max` as `ValueError` naming the field (#43).
@@ -726,6 +910,96 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Docs: scheduling.md alert table complete (all ALERT_KINDS); data-releases.md rewritten for the store-backed release commands; new window-restart.md and key-rotation.md runbooks (#2205).
 - Operations page: stale badge explained; Reconciliation card lists dividends, ticker changes and unexplained items instead of raw JSON (#2206).
 - ADR 0018 gains a dated amendment: a kill on a locked store waits up to store.writer_lock_retry_seconds, then exits 3 with NOT engaged, not 5/409 (#2226).
+- metrics.risk_free_source now defaults to store (T170d, #2011); the risk-free keys never enter a canonical frozen set or fingerprint, so H1, B3 and the TWIN keep their pins.
+- Schema version 38: `trial_rebalances` and `paper_plans` gain `n_assets_intersected` and `assets_intersection_skipped` (NULL on existing rows), and the engine copies the read universe's intersection record onto every rebalance row (plan T241, #2076).
+- B10's control comparison, base-level DSR reading and operations-file paper-book route are explicit in the sweep file; the registered parameter block stays unchanged.
+- Long/short sweep files with a 0/30/300 bp borrow grid now register in existing families; long-only family rules remain fixed (#2140).
+- store.asof: document which spin-off row live_actions_as_of keeps after the #2127 parent re-key (#2147)
+- Paper plan amendment 2026-10-26 (#2170): Home and Book screens for the owner as T270 to T279 (view models, shell, Home, Book, safety card with the kill button, phone layout); Streamlit recommended, owner's call.
+- Plan and spec: owner's 2026-10-26 corporate-event cash rules planned as T267, T268 and T269, built after the shakedown span (#2183 #2184 #2185)
+- Paper status, waiting list and ops badge explain kill-switch causes in words; CLI failed: lines add what happened and the log to read (#2203).
+- require store risk-free series for long_short hypotheses (#2219)
+- CI: a PR refresh that merges only markdown docs from main into a fully tested head no longer re-runs the pytest shards; any other path, a missing green run or any doubt runs the full suite (#2279).
+- Process: a build PR names its plan task in its fragment (`task: Tn (PR #n)`) and never ticks a plan line; `fragments.py fold` ticks and collapses the line, `team.py` counts a merged fragment as done, `ready_pr.py` enforces both (#2280)
+- move three Lab hardcoded values to config (issue #2357) (#2357)
+- Merge train eligibility (j) ignores unresolved review threads opened by the Greptile app; builders fix serious findings and file the rest as backlog issues (#2358).
+- ready_pr now always runs a STATIC_INVARIANT_TESTS set (boundary, literal, import, flag-by-name, no-write, dashboard store, reason/alert-kind tests) before the push; a failure stops with NOT READY (#2367)
+- The orchestrator builds merge trains and runs merge_train.py merge on a green batch without the owner's word (owner, 2026-10-27); class-B PRs ride only with his word for that PR, hold-labelled PRs never.
+- sweep family-rule refusal: drop a check that a forbidden axis is not a grid key, which parsing already guarantees (#2375)
+- merge_train: a PR labeled hold is ineligible, reason (c) on hold (#2377)
+- execution.breaks: the break cause order is public as CAUSE_ORDER (#2378)
+- update docstrings in reconcile_run.py and test_reconcile_merger.py (#2391)
+- clarify spin-off ranking tie-break in live_actions_as_of (#2392)
+- fix three wording issues in pre-2016 price history report (#2426)
+- Specify separate point-in-time SC 13D and Form 4 event records with a Form 4 field contract, and a post-span owner migration gate (build held until the span ends) (#2435).
+- SEC ownership forms (Form 4) backfilled on the real store from 2016-01-01 (T308; evidence #2435)
+- rewrite Power bullet in feasibility check (#2438)
+- Research-registry spec: 2026-10-28 amendment specifying a reusable event-study runner for registered experiments; plan tasks T300 to T304 (#2440).
+- ADR 0016 amended (owner decision 2026-10-28): a new family's single frozen finalist may take one historical exam on the post-boundary months; contamination, mitigations, code consequences and open questions recorded.
+- Phase 4 exit criteria in the roadmap gain safety-regression and owner-usability items beside the shakedown, plus post-exit weekly scorecard monitoring
+- Data-foundation spec: Form 4 backfill route amended to the SEC insider bulk data sets with submissions acceptance times, XML for the current quarter and accessions priced under $1, one 9 req/s queue and a request budget (#2498).
+- Spec: the owner's 2026-10-28 answers to the #2498 open questions are recorded and the amendment's nits are fixed.
+- ready_pr review prefixes widen from file names to stems (config, ingest, health, cli, adapters/edgar)
+- Config: shared section base classes now live in config_base.py; imports from tradepartner.config are unchanged.
+- Plan: lifted the ADR 0017 span hold from the SEC ownership-forms tasks T306 to T308, T307c and T307d (#2535, owner).
+- Moved CalendarConfig, StoreConfig, IngestConfig and RatesConfig to config_data.py with no behaviour change
+- Moved EdgarConfig, MasterConfig and their helpers to config_edgar.py (no behaviour change)
+- Config: UniverseConfig, HealthConfig, BorrowConfig, IndexCheckConfig, OpenfigiConfig, AdjustConfig, GapConfig, CoverageConfig and EventsConfig now live in config_data.py (no behaviour change)
+- Config: the backtest sections, FamilySpec and FAMILIES now live in config_backtest.py (no behaviour change)
+- paper spec: the paper report's residue term is specified from the book's journal (positions_daily value change plus the name's adjustment cash, scaled to the residue), replacing the market-close re-valuation and split factor; plan tasks T316a and T316b (#2576)
+- Data-foundation spec: a bulk Form 4 row's zip SHA-256 is recorded on its ingestion run, not in provenance (#2579, #2572).
+- Paper tracking residue uses marked journal value and cash; flags untradable names and refuses unsupported flows.
+- Paper residue reporting values merger and spin-off receipts, held-through fills, late credits and true-ups from point-in-time journal rows (#2589).
+- `health --check`: the SEC ownership form violation frames now list the full filing identity; rule names come from module constants (#2590).
+- Data-foundation plan: tasks T317 to T325 build the 2026-10-30 incremental EDGAR amendment (#2629).
+- Data-foundation spec: amendment 2026-10-30 (#2629) makes the nightly EDGAR ingest incremental (persisted filing_index table, daily-index cursor, per-CIK rebuilds, reconcile, rebuild flag), targeting 20 min and 1.5 GB peak.
+- Quant auditor blocks missing BUILD_RULES_VERSION bumps and notes cache-version rebuilds.
+- Document the borrow, SEC ownership, and spin-off allocation exclusions in the dashboard header freshness reads. (#2646)
+- Plan: T317 probe answers written into T319, T319b and T323; T325 struck; daily-index fixtures recorded (#2659).
+- Plan: T330 and T331 marked not building after CBOperProf failed its desk read (#2677).
+- B7 Form 4 insider study: T342 counts-only recount recorded FAIL ($200M: 47 < 400 events, zero treated delisters); B7 backlog and ladder-ledger rows record the study INSUFFICIENT under its own feasibility gate and B7 retired, family N not charged (owner, 2026-10-31); claim TP-9 added; the recount script is committed byte for byte in a fenced appendix (docs/research/2026-11-form4-insider-feasibility-recount.md and -appendix.md).
+- Data-foundation plan and spec: filing_index stores filed_on corrections as revision rows, T318 split into T318 and T318b (#2703).
+- Manifest-gated repair for CSV-quoted SEC bulk Form 4 titles; fixed-parser and release checks, tests, runbook
+- Form 4 bulk backfill trusts XML for multi-owner filings, with a default-on config switch and fresh order-check markers (#2711).
+- Form 4: recheck stored bulk multi-owner accessions against SEC XML and repair only confirmed role flags (#2720)
+- Research-registry spec amendment 2026-10-31 (#2723): a research_exposures record per desk-read launch (kill-line link, probe SHA-256, window, data pin, verdict); store-source records join a family's N; plan tasks T355 to T359.
+- Health CLI prints and counts incremental EDGAR warnings in the verdict and --check tally (#2725).
+- Per-quarter `sec_insider_bulk` run rows record `quarter=`, that quarter's own `remaining=` (status `ok` at 0) and the run-wide `run_remaining=`; health's latest line sums rows that share one start time instead of an arbitrary one (#2728).
+- Hypothesis backlog: the summary table and item sections now match the ladder ledger, the search tally and the dated desk reads (I1 and issuance retired 2026-10-30, B7 registered study next at T342, B1 run, B10 rung 1 read and open for the owner, B5/B6/B8 paused) (#2729).
+- Research plan: struck T332-T341 and T344 after the frozen $200M event floor and delister gate failed; family N remains uncharged (#2736).
+- EDGAR filing-index storage preserves first-known dates and records later SEC filed-on corrections as point-in-time revisions.
+- Incremental EDGAR raw requests use the shared limiter, cache daily files locally, retain changed quarterly snapshots, and select only new or re-posted listed files.
+- Config: `TRADEPARTNER_RAW_ARCHIVE` names the local raw archive (ADR 0028), held in `.env` only and redacted like a secret; `raw_archive.min_free_disk_gb` (default 10) refuses an archive write that would leave less free space, counting the file (#2744).
+- Form 4 transaction dates stay as filed; as-of readers exclude only impossible dates (before `events.form4_min_transaction_date`, default 2000-01-01, or after the filing's acceptance day plus `events.form4_after_acceptance_days`, default 0), expose the excluded count, and health warns on them; late filings stay readable (#2754).
+- `sec_insider_bulk` quarter messages now lead with `checked_sha256`, then `provenance_sha256` (archive on), then `zip_sha256`, and are cut by `ingest.max_message_chars` like other run messages (T348).
+- Existing-cache migration planner (`store/raw_archive_plan.py`, pure) and the `raw_archive.migrate_extra_paths` key (empty by default, validated; refuses `bulk/submissions.zip` while `edgar.bulk_stamps_enabled` is on) (#2758).
+- Plan: T361 split into T361a/b/c after sizing at ~1,000 lines (#2770).
+- Master, classification, delisting, 13D and stamp readers read the stored filing index when bound; a 13D correction crossing the backfill cutoff is counted `sec_forms_cutoff_corrected` and changes no derived row (#2782).
+- Data-foundation plan: T328 is split into T328a/b/c with a written provider contract for T329, and records the owner's 2026-10-31 answer that the data cutoff alone decides delisting-reason timing (#2794).
+- Reconciliation explains a CIL for any split of a held name, reverse splits and forward splits above alpaca.stock_dividend_max_rate included (#2184)
+- Plan: T283c (owner true-up reversal, #2804) split from T283b; T283b's line narrowed to the command
+- Data-foundation spec and plan: amendment 2026-11-01 (#2826) adds more as-filed statement names (accounting signals and net external financing), a tag-alias census, per-name units, an additive statement backfill and a vintage rule (tasks T363 to T368).
+- Hypothesis backlog records the second search limit (4 candidates or 2026-12-15) after the 6-of-6 retro (#2835).
+- Regression test that the incremental EDGAR rotation drift check ignores retracted and superseded stored rows (#2840)
+- Paper-trading spec amendment 2026-11-01 (#2842): phase (i') sends long buys before the open from cash already held, a per-book cash sleeve, an opening-auction (OPG) option built only if paper fills OPG, one run-notes variant line, and a crossover measurement on the daily book with its success line frozen; plan tasks T369 to T376; ADR 0006 and ADR 0010 pointers.
+- Paper run: the sells' wait reads the broker's open-orders list once per poll round, and a sell leaves the wait only when its own read is terminal, so the buys go out sooner after the last sell fills (#2614 item 1).
+- `repair_stamps.py run` and `restamp-unrepaired` ask SGML headers on a bounded pool (`--fetch-workers`, default 4, 1 to 8) behind the one EDGAR limiter; the journal, manifests and counts are those of the one-at-a-time path (#2955)
+- CI fails a stuck test after 20 min with its stacks dumped, and a shard after 45 min, instead of hanging to the 6-h limit (#2967)
+- health.py docstring corrected: restamp no longer sets ingested_at on every moved fact (#2995)
+- EDGAR ingest's nightly cache-completeness probe reads each per-CIK facts/statement cache key from a `<cik>.json.key` sidecar pinned to the file's size, mtime and inode, falling back to a full parse (and healing the sidecar) whenever it is absent or does not match (#3032).
+- Specs: the unstampable rule waits `edgar.unstampable_retry_days` past the quarter's settle before an accession is cached unstampable (#3036, follows #2865).
+- ADR 0023 rung 2 is the calibrated test (the leg the book trades decides): the long leg's t over 2009-01 to 2025-12 averaged across the two pinned Chen-Zimmermann files must be ≥ 2.22 (FDR 10%), replacing the both-legs, three-window rule (#3092, #3099)
+- docs/runbooks/data-sitting.md: 17 ordered steps for the 11-09 sitting with per-release counts, disk precheck, legacy release import, exposure backfill and gap sign-off replay (#3114)
+- Paper spec amendment 2026-11-07: paper books restarted after 2026-11-09 run operations files at fill_price=open with a cost measured from their own fills (60 bp per side, an owner-overridable data call); closing-auction orders rejected; plan T382-T386 added and T378 held (#3118)
+- hypothesis-backlog: B10 marked retired with its N bookkeeping (run 6 re-ran the retired sweep, N 13 to 15) and a ladder-ledger row; B1 marked retired by its rule; claims TP-11 and TP-12 added (#3119, #3117).
+- ADR 0016 amendment 2026-11-06: the owner's live choice needs a passed forward return exam (12 monthly net excess returns, two one-sided t legs at a nominal 0.25%, month-6 futility kill, skew guard -0.85, four-exam budget; worst-case false pass 4.33% for four exams); the point-8 historical exam does not qualify until a return rule sized for #3128's rung-2 overlap; plan tasks T381 and T381a, T163b refuses a book without a passed exam
+- paper.max_fill_price_deviation defaults to 0.5 (was 0.25): real overnight gaps of 25% or more halted the books about once in eight daily sessions; 100x, 0.01x and 10x prints still halt (#3130)
+- Forward return exam is group-sequential (looks at 12/24/36 months, O'Brien-Fleming bounds 4.76/3.37/2.75, size 1.25%), rung 1 prices cost at the paper exam's basis, and paper cost work aims at ≤ 24 bp per side; T381/T381a amended (#3143)
+- ADR 0016: the exam budget counts every forward-holdout window ever started (failed_void and pre-T381a included), is mirrored in the new empty docs/research/exam-ledger.toml, and a fifth exam needs a class-B amendment plus a config change (#3146).
+- `hypothesis register --operations-book-of` accepts a pre-lab parent (H1) and a file differing only in `execution.fill_price` and a higher `costs.per_side_bps`; `lab status` lists a pre-lab parent's book (#3118 item 2).
+- Plan T385 step 2 now names `hypothesis register <registered file>`, which prints a registration's stored frozen set without writing, in place of the nonexistent `hypothesis show` (#3163).
+- `paper run` (all books) runs `month_end` books before `week_end` and `daily` ones, ties by token (#2886)
+- docs/runbooks/data-sitting.md step 16 runs `tradepartner exposure record` for candidate 5's two launches instead of waiting on the unmerged #3116 backfill tool; the kill-line copy is in docs/research/2026-10-31-candidate-5-kill-line.md (#3176).
 
 ### Fixed
 - `adjusted_prices_as_of(include_dividends=True)` no longer sizes a dividend against a prior close more than `adjust.max_prior_close_gap_sessions` XNYS sessions before its ex-date (default 5); such a dividend is left unapplied instead of mis-sized or failing the query, and the new `dropped_dividends_as_of` lists it (`stale_prior_bar`, `no_prior_bar` or `outside_calendar_range`) for health; `calendar.all_sessions` added (#72).
@@ -1003,6 +1277,164 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - paper resume, reconcile and abandon refuse a broker on another account before writing any broker-derived row (#2187)
 - The lot ledger's current set is scoped by book, so two books no longer overwrite each other's set; paper lots-reconcile reads the configured paper.book_id's set (#2190).
 - Paper settle includes fills timestamped by the broker before our pending stamp, bounded by the window start (#2216).
+- Keep small-account whole-share buys below the order minimum open; skip long non-fractionable buys below one share in buy_orders while preserving off and short behavior (#1848 part 1)
+- Paper reconcile: a spin-off child named `X.WI` is stored under `X` and allowed while the broker holds it when-issued, and a fill across the parent's spin-off ex-date is judged on one side of the price band (#2112).
+- `store.asof.live_actions_as_of` now re-keys a `spinoff` row's parent (`source_action_id`, a security id) along a live successor chain like its `security_id`, so `reconcile_run._spinoffs` (and #2123's fill band) finds the held parent under the successor's id (#2127)
+- Merger cash after a band removal is one disposal; a whole-share stock-and-cash receipt journals no CIL; later merger cash first completes the owed boot before counting as cash in lieu (#2164)
+- Paper outcomes, check and stop readiness use position intent: a short open earns position return and a cover earns realised P&L (#2174).
+- The ingest catch-up-bound message now names the plain `ingest --source alpaca` run that must follow `--backfill` for paper to stop halting stale_data; the scheduling runbook row says the same (#2181).
+- paper run: an owner kill landing mid-phase stops the phase's remaining orders and the run is journaled skipped_kill_switch, not ok (#2182).
+- Paper reconciliation matches each open dividend due separately, allowing one of several dividends on a name to post while ambiguous credits still halt (#2183).
+- Cash dividends credited within the frozen ex-date window are netted against journaled credits oldest first, so a later pay-date credit can reconcile without halting (#2183).
+- Backfill eligible new listings after an EDGAR failure without delaying daily prices; failed gap requests retry, missing bars expire, and delisted names' actions are fetched (#2196).
+- Paper kill reads the window read-only and reports busy-store waits for each book.
+- A paper submit window closing mid-buys leaves deferred buys open for the next run instead of writing them off as unfunded (#2233).
+- `paper kill --all` exits with `no_window` on a missing store without creating files.
+- Today's activity dates fill ranges that cross Eastern days and identifies new names only by nonempty security ID (#2248).
+- EDGAR data age shows a line when no ok EDGAR ingest run exists, instead of nothing (#2254).
+- An `OSError` reading the live `.env` now gives `KillRefused` before `paper kill` starts, instead of a raw dashboard traceback.
+- An ok reconciliation with a widened cash bound is shown as matching within the reconciliation's tolerance, because the observed cash difference is not stored on the row.
+- Paper: after a ticker change the order path sends a held name under the new symbol reconcile mapped, not the old ticker; a name the change leaves ambiguous is skipped (or its forced exit kept open) per name with a run note, never sent under the old symbol (#2185).
+- Paper order runs keep a delisted name's exit open when a later issuer reused its ticker, including after a rename, without halting other names (#2286).
+- A halted paper run sends its owed ticker-change lines in the skipped alert (#2289).
+- `paper shakedown` E.3 no longer fails every trim that fills above its reference price: orders by share count are judged in shares against what they were sized to (#2290).
+- The nightly EDGAR ingest no longer writes a second same-start listing when the SEC renames a security with no cover page; the rename is a snapshot row from the fetch session (#2291).
+- E.3 checks both order kinds for no remainder and reports each offending order once; shakedown's timestamped reads stop at `now` (#2293, #2302).
+- A one-fetch SEC ticker anomaly no longer creates a snapshot rename; the second matching fetch confirms it without look-ahead (#2295).
+- A kill-switch drill that wrote orders now makes E.4 failing and names the run, so it reaches the owner's queue (#2301).
+- Paper marks no longer use a later issuer's tradable flag for a delisted name whose ticker was reused (#2306).
+- E.3 whole short cover retries use unfilled shares after a price-up partial fill (#2307).
+- Paper shakedown E.3 catches orders after a full fill when the frozen minimum is zero (#2332).
+- Read-budget timing tests assert the fastest of three timed reads against the same bound, ending CI flakes on busy runners (#2348)
+- Experiment-only family research runs crossing the development boundary are refused, while windows ending before it still open (#2362).
+- register_hypothesis refuses an experiment-only (not engine-ready) family such as filing_delay (#2363)
+- reconcile_run module docstring now describes the breaks status: break events, no adjustments, and the halt (#2364)
+- make parked/hold label checks case-insensitive (#2393)
+- A stale failed check run on a PR head no longer blocks ready_pr or merge train after a later run of the same name succeeds; latest failures and pending runs still block (#2394).
+- use live settings for register wait bound (#2424)
+- require different run_id for cross-name CI excusal (#2425)
+- `merge_train.py build` could batch a class-B PR without the owner's word; check (k) now requires the `owner-ok` label (#2443).
+- paper report no longer raises UnreadableMarkError or leaves a tracking trial when the last session was halted (#2448)
+- anchor OpenFIGI history window to last completed NY session (#2450)
+- `paper report` now says nothing to compare yet at exactly two rebalance sessions instead of closing a failed tracking trial (#2468).
+- paper report: an unreadable mark (no cash, non-finite value) now raises MarksMissing before the tracking trial opens, writing nothing (#2470).
+- Data health no longer holds one store read connection across Python aggregation and page drawing (#2472).
+- A failing book no longer throttles or shifts the fill reads of the other books: the open-buy reserve and fill collection read their own book only; resume cursors stay account-wide (#2490) (#2475)
+- A `paper resume` fill cursor is its own book's: `resume_invocations` gains a nullable `book_id` (schema 47) and a book's collection reads only its own run and resume cursors, dropping a pre-47 resume cursor of unknown book (#2490).
+- Census form-type parsing: multi-word forms no longer lost and company names no longer become form columns (#2491).
+- Sandbox guard follows a file symlink to the marked copy (and never treats a symlink to the live store as sandbox); runbook stop needs --reason with request, run, close, and abandon refuses open orders and does not flatten (#2500)
+- Study parser refuses min_volume_bars above volume_lookback and beta_min_bars above beta_lookback, and checks study.z against the interval side primary.inference declares (one-sided 1.645, two-sided 1.96 at 95%) (#2501)
+- event_study summarise no longer KeyErrors when the primary cost is off the grid or collides fractional bps keys; generate.py pins the probe SHA-256
+- census_quarter validates filing dates and counts malformed wanted rows; _census_sec_forms treats open-quarter 404 as empty; _xml_date raises _BadField for invalid optional dates; test uses real form.idx header; census docstring updated
+- The Lab page refreshes when a run finishes before a poll saw it running, suggests `sweep retire` instead of `sweep promote` when the retire rule is met, and says "no variant completed successfully" for a finished sweep with no winner; the `UiConfig` docstring now describes the three new Lab keys.
+- The Book page undercounted open breaks, the merger tests no longer asserted cash halts, and the book-B collect test was vacuous (#2505)
+- Skip spinoff_allocations when computing header, Data health, and Home freshness; keep real bars authoritative.
+- An invalid optional Form 4 deemedExecutionDate no longer skips the row; research benchmark resolution has no check_only switch; census offset fallback no longer reads SCHEDULE 13D/A as SCHEDULE 13D
+- Event-study benchmark lookup no longer fails for historical windows (identity read by symbol, bars still cut at window end)
+- The DERA insider bulk reader fails a quarter closed on a non-UTF-8 byte or an oversized table member, and events.form4_bulk_order_sample / sec_forms_max_requests have upper bounds (#2528)
+- Form 4 rounding pinned to one shared mode (#2542); bulk invalid optional deemedExecutionDate keeps the row (#2532)
+- The paper run lock (per-book and shared .paper.lock) is taken on the fully resolved store path, so a symlink and its target can no longer both hold the same book (#2557).
+- positions value in paper status and the Operations page is long minus short, via marks.signed_value (#2561, #2547).
+- paper report no longer fails with 'no close for <name>' on a held delisted name whose forced exit closed untradable: the residue term uses the mark paper run already wrote, and the report lists the name (#2570)
+- paper report: a dividend credit journaled after close(T_{i+1}) but inside the T_{i+1} mark is no longer added back as uncredited (#2581)
+- Cache the full stamped EDGAR filing index per source run; later calls preserve since filtering without re-reading or re-stamping (#2593).
+- The nightly EDGAR ingest no longer re-downloads the 1.4 GB companyfacts.zip (or submissions.zip) when SEC has not changed it: a conditional GET keeps the cached copy on a 304 (#2594).
+- Count 13D requests and retry waits; start each 13D scan at the configured backfill date, filter cached subject identities before stamp paging, and reuse SGML headers.
+- A non-finite value in a research result's secondary or exploratory metrics is stored as JSON null instead of failing write_result (#2610)
+- Cover missing study configurations at `experiment open`, a t-driven C1b kill line, and the run-3 digest's provenance (#2611).
+- EDGAR filing index no longer holds every issuer's full stamps beside every index row; its full-history peak falls from about 16 GB to about 4 GB (#2616).
+- Research results: a NaN or infinite primary statistic or interval bound is recorded with the verdict `not_computable`, not `fail`; schema version 41 (#2617).
+- Scrub study paths in stored and printed failures and derive golden counts before comparing persisted secondary JSON.
+- Guard failed study close against a second SIGINT, restore the prior handler, and cover the close with a regression test.
+- Shared event, traded, and early-exit counts with a two-horizon regression test (#2628).
+- Paper status, Operations, and Home omit paper_phase notes; a pure parser reads their stored values for timing analysis.
+- Keep Form 4 accession rows together, fail missing or changed bulk zips closed, report budget remainder, reject census with forms-only, and refresh stamps after another source writes.
+- Hash builder settings, cache and schema versions, and BUILD_RULES_VERSION; pin exclusions and per-name lists with tests.
+- Incremental EDGAR rebuild selection includes changed source state, incomplete caches, failure retries, FSN co-registrants, list edits and clock crossings, with stamp-changed CIKs excluded.
+- `paper status` reads staleness, EDGAR age and the next rebalance at the command's clock instead of the wall clock (#2655).
+- Forms-only Form 4 reruns avoid per-accession transaction scans and log quarter planning and routing progress (#2681).
+- Forms-only Form 4 reruns reuse stored bulk accessions after partial runs with an unchanged zip digest, avoiding redundant SEC stamp requests (#2685).
+- Form 4 bulk reruns retry failed stored accessions after a zip changes and do not skip stored rows for quarters without a zip digest (#2688).
+- Decode joined SEC reporting-owner roles, fail unknown roles to XML, and compare Form 4 security titles with normalized whitespace (#2691).
+- Book activity reads plans through the schema-guarded journal reader, so Book and Home show Journal outdated instead of a DuckDB binder traceback on read-only version-37 stores (#2695).
+- paper spec item 3 and plan note said two rebalances for the report-due floor; dated correction added (#2698)
+- Form 4 bulk reader reads a security title the SEC wrote in CSV quoting (`"Common Stock (""Shares"")"`) as the XML's plain text; order-check markers re-key at bulk reader version 3 (#2706)
+- paper: a cash removal (ended listing or cash merger) is booked on the session the broker paid it, so that session's mark holds the cash, not the delisted shares (#2722).
+- Form 4 bulk: a quarter SEC publishes only under `/files/datastandardsinnovation/` (2026q2 onward) was a 404 and counted as `sec_forms_bulk_quarter_missing`; the zip and HEAD now try both paths (#2728).
+- An ingest dry run no longer writes the Form 4 bulk order-check marker; its message names the marker a real run would write (#2757)
+- archive restore: a folder restore after a partial restore skips restored paths and says so when nothing is left; a tombstone line with no path is skipped
+- Restamp refuses filing_index per accession: the Form 25 subject is named, the filing exchange's other accessions still move (#2807)
+- Retry eviction of pending iCloud uploads on every cache migration apply. (#2814)
+- --rebuild-index now stops at a chunk boundary, resumable, when free disk drops below ingest.min_free_disk_gb mid-seed (#2841)
+- rebuild-index disk floor: mid-seed wording, disk read error as FAILED row, floor check before the final publish (#2857)
+- Incremental EDGAR no longer drops a filed_on correction seen while the accession is pending: the stamp night re-reads the later daily listings and writes the same revision as a rebuild (#2858).
+- test_a_precheck_that_does_not_fit_is_refused[bad3] no longer fails on the DST fall-back day (#2861)
+- Incremental EDGAR: after a key-off gap, the first key-on run reads the daily files of a quarter that settled meanwhile, so the row keeps the daily listed_on and list_position and the files are recorded (#2864)
+- EDGAR: a stamp SEC serves after its quarter settled is no longer lost; the unstampable decision waits `edgar.unstampable_retry_days` (default 30) past the settle (#2865)
+- Plan targets now leave the book's cash sleeve c x equity (paper.execution).
+- EDGAR adapter: a statement-backfill mode (`statement_backfill=True`) in which statement facts read only local caches: FSN from cached manifests, a missing stamp skipped and counted, and a zip-absent CIK's cached empty result carried forward with no request (#2872, #2837)
+- The nightly index step no longer passes a statement backfill's finish time to quarter selection; the backfill session refuses an EDGAR adapter outside statement-backfill mode; the per-name refusal says to revert before the nightly (#2873)
+- Book page and Ops Risk card cash rows read cash less the book's cash sleeve (#2879)
+- The EDGAR ingest no longer hangs for hours: per-CIK filing-index reads are grouped once per run on the walked index and read in one scan per binding on the stored index (#2920).
+- The incremental EDGAR index read scans filing_index once per read, not once per 500-accession chunk, new-issuer CIK, relevant accession or shared accession (#2921).
+- EDGAR repair: a statement backfill's ok run row no longer makes a stale stored filing index look fresh (#2924).
+- The security-master build with filename listings on no longer scans the whole filing index once per issuer CIK (about 13 h per run); per-CIK and per-Form 25 reads of the build's own rows are grouped once too (#2927).
+- Filename listings: a lowercase Form 25 file-name ticker no longer aborts the EDGAR build on a false class conflict; a true conflict writes no filename rows for that CIK and is counted in the run message (#2929).
+- A chain candidate ignores predecessor listing rows after the successor's first row, so a reorganisation like ExxonMobil's is named on the ingest run row (#2939).
+- Filename listings no longer give a combined 10-K's ticker to co-registrant CIKs (FSN keys the filing to another filer: `filename_refused_coregistrant`) or keep filename leftovers like `ETR-12312019X10K` (`filename_refused_symbol`) (#2941)
+- Merger exits: an acquirer that is a chained predecessor at the cutoff now reads its close under the successor the chain known at the cut maps it to, instead of a null that fell back to the last close (#2949).
+- Hardened the merger reader guard against aliased imports, attribute access, and unrelated merger_exits methods.
+- A statement-facts or filing-events rebuild no longer deletes a company's history when its read comes back empty (missing statement cache); it replaces per CIK and counts the CIKs it kept (#2956).
+- A duplicate dividend retracted by repair is no longer re-inserted by a later actions backfill; the source refuses it and counts it in the run message (#2957).
+- A reconcile stated through a session before a true-up reversal refuses before any broker read or write instead of halting on a book-level cash mismatch; the seen set un-sees a reversed activity only from the reversal's session on (#2961)
+- Assert filename pool requests independent of thread scheduling while preserving block safety.
+- Keep reviewed retract dividends when no kept identity is present in the fetch; match exact reviewed payment keys.
+- A restamp run whose moved fact accession also needs a revision no longer fails as back-dated: the moves are stamped one microsecond before the run, so the run's writes are a later ingest of the accession (#2968).
+- A restamp no longer makes `facts_as_of` serve a pre-revision date set again between a stored revision and the restamp run (#2970).
+- A run whose sells plus planned buys exceed risk.max_orders_per_run now refuses before the first sell instead of halting after the sells went out (#2973).
+- Give the real-timed Home view read test more CI headroom while preserving its half-of-lock-retry budget assertion (#2978).
+- Reject retract IDs assigned to multiple reviewed dividend groups.
+- Flag re-sent reviewed retract payments with changed amounts or ex-dates during reconciliation to prevent double counting.
+- health `duplicate_dividends` now fails when a reviewed duplicate's retract id comes back with a noisy amount or another ex-date beside the kept payment, instead of hiding it as repaired (#2980)
+- Form 4 rule 5: a marked accession re-fetched as XML and now agreeing gets a resolved marker (`sec_forms_compare_marker_resolved`); one with no fair comparison stays unresolved and counts `sec_forms_compare_marker_uncompared`; a field trusted to the bulk set is refused while `events.form4_compare_threshold` is set, since its row would be stored under the XML's provenance (#2994).
+- paper reconcile: a bare reconcile after a pre-open stop run's sells fill, before any collector journals them, no longer halts the book on cash: each lagging order counts as one fill in the cash bound, and the command names `paper resume` / the next `paper run` as the collector (#2996)
+- Research page: the exposures table has a synthetic column when synthetic exposures are shown (#2997)
+- `archive rederive` refuses an entry with no fetch time unless it is a bulk entry whose listed zip has none, downloads its inputs with no store connection open and re-matches under the write lock, and a write needs the dry run's `--expect-digest` beside `--expect` (#3001).
+- Reconcile reads a stock merger's chained-predecessor acquirer as the successor the chain known at close(S-1) maps it to, so its receipt and reference price match instead of breaking (#3009).
+- The EDGAR build fingerprint no longer hashes `events.form4_xml_price_below` or `events.form4_zero_price_xml_codes`: only the Form 4 writer reads them, as with the other Form 4 keys (#3012).
+- A reconcile stated through a session before a later owner true-up reads the booked activity as unseen, matching the ledger through that session, instead of halting on a cash mismatch (#3014)
+- Backtest total-return reads no longer sum a duplicate dividend twice when health has not run: the store provider gates every dividend-including read on the reviewed list, applying a pending duplicate once and leaving an unexplained equal-amount group unapplied, reported as `unexplained_duplicate` (#3015)
+- A reconcile stated through a session before a later true-up (owner, reversal or auto) now refuses before any broker read or write, instead of writing break events after `trued_up` and halting the next session on cash; `paper resume` reports it as a refusal (#3018)
+- `archive rederive`: a repair that puts back a row's earlier value can be re-derived again (the replaced entry no longer matches), a repaired row maps only under its original writer mode, and each bulk zip is read and parsed once (#3022)
+- Reconcile: a book holding a chained predecessor (#821) whose successor trades under a new ticker reconciles under the successor's broker symbol, through the chains known at close(S-1) only; with the successor also journaled, or the broker holding both symbols, nothing is guessed and the break stands (#3024).
+- Paper performance card: SPY total return no longer sums a duplicate vendor dividend twice; an unexplained equal-amount pair in the window shows as a benchmark error naming it (#3026).
+- `paper resume` refuses a run's band halt whose reason starts with its fault type, and rejudges the fills of every run the release would clear against the run session's band, so a halt read whose band engagement write failed no longer lets a plain resume release (#3027, #3028).
+- `switch.release` requires the latest resume of the window's book, not of the whole store, and refuses another book's resume, so two books' overlapping `paper resume`s both release (#3030).
+- Paper: a held chained predecessor's sell goes out under its successor's broker symbol once the reconciliation on S recorded the mapping, instead of its old ticker; an ambiguous mapping skips the name; a successor dividend credited under the new symbol is explained on the held predecessor (#3031).
+- EDGAR filename fetch pool: a job a worker picked up only after the caller had taken its future out of the shared dict died unseen, and the caller waited on that future forever; each job now carries its own future, context and record (#3039)
+- EDGAR rate limiter: a stamp ahead of the clock (a stepped-back or faked clock) now waits one interval instead of sleeping the whole gap under the lock (#3039)
+- EDGAR incremental: a pending filing_index row's unstampable decision is no longer delayed a quarter by a settled form.idx's Last-Modified listed_on; it settles by the first filed_on quarter (#3041)
+- Paper runs: a held chained predecessor (#821) no longer crashes marks or reference prices once its chain is known; it reads its one live successor's bars point-in-time, and the run's forced exit of it is no longer refused as a reused ticker by its own successor (#3051).
+- Splits and dividends filed under a renamed security's pre-rename symbol are now asked and stored (up to 307 dividends and 61 splits recoverable per the 2026-11-03 measurement); STX 2021-05-11 duplicate dividend classified for retraction
+- Post-bankruptcy equity listed on another exchange after a 25-NSE is its own security, and an old line that stopped before its Form 25 no longer takes its successor's first prints (#3056).
+- A name change whose new ticker no cover page starts now adds a back-dated snapshot listing row (master derivation, evidence-gated) and `repair-rename-listings` backfills it under a release (#3057)
+- Ingest refuses an Alpaca split row that is a spin-off: one on the ex-date of its parent's own spin-off in the same answer, or one of the 33 reviewed in store/spinoff_splits.csv (#3058).
+- A blank check whose first S-1 names no SIC is no longer `common` before SIC 6770 shows: a domestic class waits for a header SIC or a periodic report (#3076)
+- A company's only share class no longer starts its price history at the cover page that first named the class: the first-span lead reaches the company's first filing (BLNK from 2018, not 2021-08) (#3080).
+- Bio-Rad class B's 2019-08 to 2024-02 listing `BIOb` now resolves to Alpaca `BIO.B` (`alpaca.class_symbols`), so `--fill-holes` can fetch its bars (#3082).
+- Issuer-filed HTML Form 25s, and SPAC unit-component or comma-headed class titles, now produce delistings rows instead of being skipped (#3084)
+- Backtest: a split first known after its ex-date, or re-dated or cancelled by the vendor, no longer books the raw price jump as return: the first step that knows it re-bases the held position (shares x ratio on the ex-date) and counts `n_late_splits`; when a fill or exit already traded on the unrepaired value the trial is refused (#3096).
+- Form 25 script/style stripping is linear on unclosed tags, and oversized HTML notices are refused from downloads and cache (#3106).
+- A traded rebalance left with small open remainders (a notional-cap leftover or a fractional sell, never written off because a sell was in flight at submit) lapsed as missed and the tracking check skipped it; it is now journaled executed at its lapse (#3141)
+- lab: `sweep register` and `registry.register_hypothesis` refuse a family whose holdout starts on or before the development boundary, so no exam covers practised months (#3151).
+- paper: an excess order reading is a `bad_reading` reconciliation mismatch naming the order, instead of being reported to nothing (#3152).
+- openfigi: the `.env` `OPENFIGI_API_KEY` is now used (read through `Settings`, redacted like every secret); before, only a shell export reached the client (#3153).
+- lab: a family's registration day is the New York date, not the UTC date, so a registration after 19:00/20:00 ET keeps forward tracking (#3154).
+- Reconcile: a NaN or infinite broker `filled_quantity` is now a `bad_reading` mismatch instead of passing as not lagging, and collect journals no terminal event for it (#3162).
+- Reconcile: a NaN or infinite broker `filled_avg_price` is now a `bad_reading` mismatch even when every share is journaled, and collect journals no terminal event for it (#3169).
+
+### Removed
+- tests/test_config_golden.py and tests/fixtures/config_golden/ (R1 scaffolding, and CONFIG_GOLDEN_UPDATE with it)
 
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.
