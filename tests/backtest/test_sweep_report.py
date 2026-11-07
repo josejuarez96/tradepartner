@@ -864,8 +864,9 @@ def test_report_over_ten_thousand_trials_reads_trial_metrics_a_fixed_number_of_t
     _sweep_record, records = _complete_sweep(store, settings)
     ids = [twin.hypothesis_id] + [r.hypothesis_id for r in records]
     (start,) = conn.execute("SELECT MAX(trial_id) + 1 FROM trials").fetchone()  # type: ignore[misc]
-    # 10,000 more current `ok` trials spread over the twin and the four variants: every
-    # one counts in N, and the newest of each variant becomes its counted trial.
+    # 10,000 more current `ok` trials spread over the twin and the four variants: their
+    # Sharpes vary, so they are distinct series, and the newest of each variant becomes
+    # its counted trial.
     conn.execute(
         "INSERT INTO trials (trial_id, hypothesis_id, kind, started_at, start_session, "
         "end_session, data_cutoff, code_version, code_dirty, synthetic, holdout_repeat, "
@@ -912,12 +913,15 @@ def test_report_over_ten_thousand_trials_reads_trial_metrics_a_fixed_number_of_t
     )
     elapsed = time.perf_counter() - began
 
-    assert report.family_n == results.family_n(conn, "momentum") >= 10_000
+    # The 10,000 share pairs, vintage and code, but their Sharpes vary by i % 97, so
+    # each (hypothesis, i % 97) outcome is its own series: 5 x 97 plus the first 5 (#3127).
+    assert report.family_n == results.family_n(conn, "momentum") == 490
     assert report.complete
-    # `family_sharpes`' one query per basis, plus the report's one read of the counted
-    # trials' base-level metrics: independent of the 10,000 trials.
+    # `family_sharpes`' one query per basis, the report's one read of the counted
+    # trials' base-level metrics, and one outcome-digest read per N count (`family_n`
+    # and `family_sharpes`, #3127): independent of the 10,000 trials.
     metric_reads = [s for s in recording.statements if "trial_metrics" in s]
-    assert len(metric_reads) == 3
+    assert len(metric_reads) == 5
     assert elapsed < REPORT_SECONDS_LIMIT
 
 
