@@ -1345,7 +1345,11 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "trial_metrics",
             "trial_results",
         }
-        assert _all_rows(conn, tables_before) == rows_before
+        rows_after = _all_rows(conn, tables_before)
+        # Version 48 (#3076) appends a NULL `issuer_class` to every classification.
+        assert {row[-1] for row in rows_after["classifications"]} == {None}  # type: ignore[index]
+        rows_after["classifications"] = [row[:-1] for row in rows_after["classifications"]]  # type: ignore[index]
+        assert rows_after == rows_before
         assert _versions(conn) == list(range(25, schema.CURRENT_SCHEMA_VERSION + 1))
         schema.init_schema(conn)
         assert _versions(conn) == list(range(25, schema.CURRENT_SCHEMA_VERSION + 1))
@@ -1383,7 +1387,8 @@ def test_a_version_25_store_refuses_filing_name_and_a_migrated_one_accepts_it() 
             conn.execute(f"INSERT INTO classifications VALUES ({classification})")
         schema.init_schema(conn)
         conn.execute(f"INSERT INTO listings VALUES ({listing}, FALSE)")
-        conn.execute(f"INSERT INTO classifications VALUES ({classification})")
+        # Version 48 (#3076) appends the nullable `issuer_class`.
+        conn.execute(f"INSERT INTO classifications VALUES ({classification}, NULL)")
         assert conn.execute(
             "SELECT security_id, ticker, provenance FROM listings WHERE provenance = 'filing_name'"
         ).fetchall() == [("S2", "ABC-WS", "filing_name")]
@@ -1397,7 +1402,7 @@ def test_a_version_25_store_refuses_filing_name_and_a_migrated_one_accepts_it() 
     try:
         schema.init_schema(fresh)
         fresh.execute(f"INSERT INTO listings VALUES ({listing}, FALSE)")
-        fresh.execute(f"INSERT INTO classifications VALUES ({classification})")
+        fresh.execute(f"INSERT INTO classifications VALUES ({classification}, NULL)")
         assert fresh.execute("SELECT count(*) FROM listings").fetchone() == (1,)
         assert fresh.execute("SELECT count(*) FROM classifications").fetchone() == (1,)
     finally:
@@ -2394,7 +2399,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESUME_BOOK_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ISSUER_CLASS_VERSION + 1
 
 
 def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
@@ -2413,9 +2418,9 @@ def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
         schema.init_schema(conn)
         assert "snapshot_sightings" in _shape(conn)
         assert max(_versions(conn)) == schema.CURRENT_SCHEMA_VERSION
-        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47]
+        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47, 48]
         schema.init_schema(conn)
-        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47]
+        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47, 48]
     finally:
         conn.close()
 
