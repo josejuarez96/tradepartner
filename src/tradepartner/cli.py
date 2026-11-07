@@ -2032,6 +2032,11 @@ def _cost_lines(
         f"  {part('buys', pool.buy)}; {part('sells', pool.sell)}; {part('pooled', pool.overall)}",
         f"  left out: {cost.stop_run} orders of stop runs, {cost.after_stop} on or after "
         f"the stop ({stop})",
+        f"  split at arrival (open->arrival + arrival->fill = total, orders with an "
+        f"arrival price): {paper_slippage.split_part('buys', pool.buy_split)}; "
+        f"{paper_slippage.split_part('sells', pool.sell_split)}; "
+        f"{paper_slippage.split_part('pooled', pool.overall_split)}; "
+        f"no arrival price {pool.no_arrival}",
         f"  counted apart: no bar {pool.no_bar}, off session {pool.off_session}, "
         f"pending {pool.pending}",
         f"  {part('on sessions a month-end book also traded (in the pool)', cost.month_end)}",
