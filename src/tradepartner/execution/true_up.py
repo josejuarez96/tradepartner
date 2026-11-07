@@ -48,7 +48,9 @@ id, the reason, and the broker and ledger figures read:
 No LLM output reaches any of it (ADR 0008): the reason is journaled and never
 parsed. There is no `--all`, pattern, `--force` or `--size` flag, and nothing
 skips the broker read. `--reverse` writes opposite adjustments and reopens a
-trued-up break for the next reconciliation.
+trued-up break for the next reconciliation. It refuses (`replay`, nothing
+written) when its rows would leave the window's recorded fills unable to replay
+into a lot ledger, such as a later sale of the trued-up shares (#3189).
 """
 
 from __future__ import annotations
@@ -69,6 +71,7 @@ from tradepartner.config import Settings
 from tradepartner.errors import ClockError
 from tradepartner.execution import breaks as break_rules
 from tradepartner.execution.lock import resolve_book, run_lock
+from tradepartner.execution.lots import LedgerAccount, LotLedgerError, rebuild
 from tradepartner.execution.reconcile_run import (
     _NEW_YORK,
     _cut,
@@ -114,6 +117,10 @@ OPEN_ORDER = "open_order"
 SHORT_NAME = "short_name"
 MOVED = "moved"
 OPEN_BREAK = "open_break"
+REPLAY = "replay"
+#: The lot ledger's account columns for `_check_replay`'s dry run; only whether
+#: the replay raises is read, so the columns never reach a row.
+_LOT_ACCOUNT = LedgerAccount(account_id="book", account_type="paper", owner="self")
 #: The parts a true-up adopts a quantity for (item 2's quantity part).
 _QUANTITY_KINDS = frozenset(
     {
@@ -498,6 +505,55 @@ def true_up(
     return TrueUpResult(break_id, event_id, tuple(ids), stamp)
 
 
+def _check_replay(
+    conn: duckdb.DuckDBPyConnection,
+    window: PaperWindowRow,
+    session: date,
+    adjustments: Sequence[AdjustmentRow],
+    reversal: Sequence[AdjustmentRow],
+    break_id: str,
+) -> None:
+    """Refuse (`replay`) a reversal under which the window's recorded fills no
+    longer replay into a lot ledger (#3189 exec-3): a sale of the trued-up
+    shares, say, would then sell more than the ledger holds, and every later
+    rebuild would raise `LotLedgerError`. The dry run is `lots.rebuild` over the
+    window's live fills and every adjustment through the command's session (as a
+    run's rebuild reads them), with and without the reversal's
+    rows; a ledger that already fails without them is not the reversal's doing
+    and does not block it (the run alerts that error on its own)."""
+    window_id = _window_id(window)
+    fills = fills_for(conn, window_id=window_id)
+    orders = orders_for(conn, window_id=window_id)
+    actions = live_actions_as_of(conn, _cut(session))
+    symbols = {o.security_id: o.symbol for o in orders}
+
+    def replay(rows: Sequence[AdjustmentRow]) -> None:
+        rebuild(
+            fills,
+            orders,
+            {},
+            _LOT_ACCOUNT,
+            adjustments=rows,
+            actions=actions,
+            through=session,
+            symbols=symbols,
+        )
+
+    try:
+        replay(adjustments)
+    except LotLedgerError:
+        return
+    try:
+        replay([*adjustments, *reversal])
+    except LotLedgerError as exc:
+        raise _refuse(
+            REPLAY,
+            f"reversing break {break_id} would leave the recorded trades unable to replay "
+            f"({exc}): a later fill relies on the trued-up figure, so the reversal is not "
+            "written",
+        ) from exc
+
+
 def _reverse_target(
     conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, break_id: str
 ) -> ReconcileBreakRow:
@@ -559,7 +615,7 @@ def reverse(
                 )
             source_ids = json.loads(target.adjustment_ids_json or "[]")
             adjustments = {a.adjustment_id: a for a in adjustments_for(conn, _window_id(window))}
-            ids: list[int] = []
+            rows: list[AdjustmentRow] = []
             for source_id in source_ids:
                 source = adjustments[source_id]
                 source_terms = json.loads(source.explanation_json or "{}")
@@ -581,6 +637,10 @@ def reverse(
                     known_at=stamp,
                     ingested_at=stamp,
                 )
+                rows.append(row)
+            _check_replay(conn, window, session, list(adjustments.values()), rows, break_id)
+            ids: list[int] = []
+            for row in rows:
                 adjustment_id = append(conn, row)
                 if adjustment_id is None:
                     raise RuntimeError("reversing adjustment append returned no id")

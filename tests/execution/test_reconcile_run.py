@@ -593,8 +593,8 @@ def _hold(
     return run_id
 
 
-def _sell_spy(settings: Settings, run_id: int, at: datetime) -> None:
-    """Journal a filled sale of the ten SPY shares held by `_hold`."""
+def _sell_spy(settings: Settings, run_id: int, at: datetime, quantity: float = 10.0) -> None:
+    """Journal a filled sale of `quantity` SPY shares (the ten `_hold` holds)."""
     (decision_id,) = _append(
         settings,
         DecisionRow(
@@ -602,7 +602,7 @@ def _sell_spy(settings: Settings, run_id: int, at: datetime) -> None:
             rebalance_session=at.date(),
             security_id=SPY,
             side="sell",
-            planned_quantity=10.0,
+            planned_quantity=quantity,
             whole_share=False,
             decision="trade",
             known_at=at,
@@ -623,7 +623,7 @@ def _sell_spy(settings: Settings, run_id: int, at: datetime) -> None:
             security_id=SPY,
             symbol="SPY",
             side="sell",
-            quantity=10.0,
+            quantity=quantity,
             sells_in_flight_at_submit=False,
             known_at=at,
             ingested_at=at,
@@ -635,7 +635,7 @@ def _sell_spy(settings: Settings, run_id: int, at: datetime) -> None:
         FillRow(
             client_order_id=coid,
             filled_at=at,
-            quantity=10.0,
+            quantity=quantity,
             price=PRICE,
             price_implied=False,
             broker_fill_id=f"fill-{coid}",

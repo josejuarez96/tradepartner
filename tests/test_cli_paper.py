@@ -2543,6 +2543,58 @@ def test_report_passes_the_book_and_prints_the_same_lines(
     assert "(residue trued up: 0001739445)" in trued_up_out.output
 
 
+def test_report_prints_the_fidelity_line_after_the_unchanged_period_lines(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    """#3180: the report-only cumulative line and its excluded periods follow the
+    period rows; the head and period lines are byte-identical to the format above."""
+    t0, t1 = date(2026, 10, 30), date(2026, 11, 30)
+    period = paper_report.PeriodRow(
+        rebalance_session=t0,
+        next_session=t1,
+        raw=0.001,
+        dividend_term=0.0,
+        fill_timing_term=-0.0005,
+        residual=0.0005,
+        residue_term=0.0,
+        modelled_cost=0.002,
+        missed=True,
+        override=False,
+        skip_names=(),
+        excluded=True,
+        passed=True,
+        paper_return=0.011,
+        trial_return=0.010,
+    )
+    comparison = paper_report.PeriodComparison(
+        tracking_rule="raw", tracking_k=2.0, periods=(period,), passed=True, failing_period=None
+    )
+    canned = paper_report.Report(
+        comparison=comparison,
+        targets=paper_report.TargetComparison(rows=()),
+        paper_report=journal.PaperReportRow(
+            window_id=1,
+            trial_id=7,
+            through_session=t1,
+            run_at=SESSION_CLOCK,
+            known_at=SESSION_CLOCK,
+            ingested_at=SESSION_CLOCK,
+        ),
+        fidelity=paper_report.economic_fidelity(comparison, max_gap_bps=100.0, min_periods=6),
+    )
+    monkeypatch.setattr(paper_report, "report", lambda *_a, **_k: canned)
+    out = _paper(clock, factory, "report")
+    assert out.exit_code == 0, out.output
+    assert out.output == (
+        "paper report: trial 7 through 2026-11-30; rule raw, k 2; passed\n"
+        "  2026-10-30: raw 0.001000 dividend 0.000000 fill -0.000500 residual 0.000500 "
+        "residue 0.000000 cost 0.002000 excluded missed pass\n"
+        "  fidelity (report only): cumulative paper 0.011000 trial 0.010000 gap +10.0 bp "
+        "over 1 period(s); too few periods (max 100 bp, min 6 periods)\n"
+        "  fidelity excluded periods, kept in the cumulative: 2026-10-30 (missed)\n"
+    )
+
+
 def test_short_report_prints_dividends_and_headline_fee(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:
