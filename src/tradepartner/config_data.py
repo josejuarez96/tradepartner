@@ -366,6 +366,8 @@ class IndexCheckConfig(_ClosedConfig):
     worst_months: int = Field(default=10, ge=1)
     names_per_month: int = Field(default=5, ge=1)
     extreme_name_return: float = Field(default=0.60, gt=0.0)
+    # #3077: `close-gap` flags a stored close this far (a fraction) from the official one.
+    max_close_gap: float = Field(default=0.005, gt=0.0)
 
     @model_validator(mode="after")
     def _validate_window(self) -> IndexCheckConfig:
