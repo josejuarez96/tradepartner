@@ -884,21 +884,21 @@ def shares_cap_jumps(
         ).fetchall()
     finally:
         conn.unregister("_cap_picks")
-    capped: dict[str, list[tuple[date, float, date, float, float]]] = defaultdict(list)
+    capped: dict[str, list[tuple[date, float, float, date, float]]] = defaultdict(list)
     for sid, as_of, value, session, close in closes:
         if session is None or close is None or not close > 0:
             continue
         if (as_of - session).days > max_days:
             continue
-        capped[sid].append((as_of, value, session, close, value * close))
+        capped[sid].append((as_of, value * close, value, session, close))
     out: list[dict[str, Any]] = []
     for sid in sorted(capped):
         series = sorted(capped[sid])
         prev = series[0]
-        for i, (as_of, value, session, close, cap) in enumerate(series[1:], start=1):
+        for i, (as_of, cap, value, session, close) in enumerate(series[1:], start=1):
             nxt = series[i + 1] if i + 1 < len(series) else None
-            if abs(math.log(cap / prev[4])) <= limit or (
-                nxt is not None and abs(math.log(nxt[4] / cap)) <= limit
+            if abs(math.log(cap / prev[1])) <= limit or (
+                nxt is not None and abs(math.log(nxt[1] / cap)) <= limit
             ):
                 prev = series[i]  # in line, or a level the next fact confirms
                 continue
@@ -911,9 +911,9 @@ def shares_cap_jumps(
                     "close": close,
                     "cap": cap,
                     "prev_as_of": prev[0],
-                    "prev_cap": prev[4],
+                    "prev_cap": prev[1],
                     "next_as_of": nxt[0] if nxt else None,
-                    "next_cap": nxt[4] if nxt else None,
+                    "next_cap": nxt[1] if nxt else None,
                 }
             )
     return pl.DataFrame(out, schema=SHARES_CAP_JUMP_SCHEMA) if out else empty
