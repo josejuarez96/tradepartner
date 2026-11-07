@@ -59,6 +59,11 @@ TASK_LINE_RE = re.compile(
 )
 TITLE_TASK_RE = re.compile(r"^(T\d+[a-z]?\d?)\s*[:(]")
 DEPENDS_RE = re.compile(r"Depends on:\s*([^·]+)")
+# A plan line's own park note, as the plans write it: `*Parked 2026-10-16 (owner, #1726):*`
+# or `**Parked 2026-11-03**`. Capital P and a date straight after: a lower-case "parked"
+# names another task's park ("T195 parked by the owner on 2026-10-16") and does not count.
+# An un-park note is the same with "Un-parked" or "Unparked" (#3182).
+PARK_NOTE_RE = re.compile(r"\b(?P<kind>Parked|Un-?parked)\s+(?P<date>\d{4}-\d{2}-\d{2})\b")
 TASK_ID_SORT_RE = re.compile(r"^T(\d+)([a-z]*\d?)$")
 FILES_SEGMENT_RE = re.compile(r"Files:\s*(?P<seg>[^·]*)")
 FILE_TOKEN_RE = re.compile(r"`([^`]+)`")
@@ -196,10 +201,28 @@ def task_brief(task: Task, tasks: Sequence[Task]) -> str:
     return "\n".join(out)
 
 
+def park_note(task: Task) -> str | None:
+    """The park note that holds a task, or None when it is not parked (#3182).
+
+    A task is parked when its plan line carries a dated ``Parked YYYY-MM-DD`` note and no
+    ``Un-parked YYYY-MM-DD`` note dated after it (on the same date, the later note on the
+    line wins). Returns the holding note's text, e.g. ``"Parked 2026-10-16"``.
+    """
+    notes = [
+        (m.group("date"), m.start(), m.group("kind") == "Parked", m.group(0))
+        for m in PARK_NOTE_RE.finditer(task.line)
+    ]
+    if not notes:
+        return None
+    _, _, parked, text = max(notes)
+    return text if parked else None
+
+
 def is_ready(task: Task, by_id: dict[str, Task]) -> bool:
-    """A task is ready when it is not done and every dependency is done: ticked in the
-    plan, or (from a ref) its code PR merged there (`load_tasks`, #1130)."""
-    if task.done:
+    """A task is ready when it is not done, not parked (`park_note`) and every dependency
+    is done: ticked in the plan, or (from a ref) its code PR merged there (`load_tasks`,
+    #1130)."""
+    if task.done or park_note(task) is not None:
         return False
     return all(dep in by_id and by_id[dep].done for dep in task.depends_on)
 
@@ -958,6 +981,12 @@ def _check_task_claimable(
         raise SystemExit(
             f"{task.id} is already ticked in {task.plan}, or its PR is merged, on the merged plan"
         )
+    note = park_note(task)
+    if note is not None:
+        raise SystemExit(
+            f"{task.id} is parked ({note}) on its line in {task.plan}:{task.lineno}. Not "
+            "claimable until a dated `Un-parked YYYY-MM-DD` note on that line un-parks it."
+        )
     if task.owner and not owner_task:
         raise SystemExit(
             f"{task.id} needs the owner's keys (.env). Claim it only from the window Jose is "
@@ -1190,7 +1219,13 @@ def cmd_status(gh: GitHub, root: Path, *, ref: str | None = None) -> int:
         for p in parked:
             print(f"  #{p.number} {p.branch} {p.title[:60]}")
     by_id = {x.id: x for x in tasks}
-    blocked_ids = [t.id for t in tasks if not t.done and not is_ready(t, by_id)]
+    parked_tasks = [(t.id, held) for t in tasks if not t.done and (held := park_note(t))]
+    parked_cell = ", ".join(f"{tid} ({held_by})" for tid, held_by in parked_tasks)
+    print(f"\nPARKED PLAN TASKS: {parked_cell or 'none'}")
+    parked_ids = {tid for tid, _ in parked_tasks}
+    blocked_ids = [
+        t.id for t in tasks if not t.done and t.id not in parked_ids and not is_ready(t, by_id)
+    ]
     print(f"\nBLOCKED PLAN TASKS: {', '.join(blocked_ids) or 'none'}")
     return 0
 
