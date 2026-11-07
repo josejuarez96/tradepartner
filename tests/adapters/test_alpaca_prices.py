@@ -2877,6 +2877,13 @@ class TestClassFirstSpanLead:
         assert resolver.first_span_lead(self.CLASS) is None
         assert resolver.lead("BLNK", date(2019, 6, 3)) is None
 
+    def test_a_class_with_no_own_first_session_gets_no_lead(self) -> None:
+        # quant-auditor on #3090: its `securities` rows retracted or unknown
+        # at the run while its listings still stand: no lead, as before.
+        resolver = self._resolver(sessions={self.CIK: self.COMPANY_FIRST})
+        assert resolver.first_span_lead(self.CLASS) is None
+        assert resolver.lead("BLNK", date(2019, 6, 3)) is None
+
     def test_an_own_earlier_first_session_still_wins(self) -> None:
         own = date(2005, 1, 3)
         resolver = self._resolver(sessions=self._sessions(**{self.CLASS: own}))

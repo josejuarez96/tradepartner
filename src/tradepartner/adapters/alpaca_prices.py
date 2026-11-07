@@ -2038,12 +2038,11 @@ def _lead_floor(
     floor is never later knowledge."""
     own = first_sessions.get(security_id)
     company = _company(security_id)
-    if company == security_id or company not in company_first:
-        return own
+    if own is None or company == security_id or company not in company_first:
+        return own  # no own row known at the run: no lead, as before #3080
     if security_id not in equity_ids or equity_of.get(_issuer(security_id), 0) != 1:
         return own  # not equity itself, or another equity id of the issuer
-    floor = company_first[company]
-    return floor if own is None or floor < own else own
+    return min(own, company_first[company])
 
 
 def _issuer(security_id: str) -> str:
