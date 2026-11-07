@@ -48,6 +48,9 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   month through the same `StorePriceSource`. It needs the Alpaca keys, prints
   one line per month and exits like `ingest`; a refused symbol or identity is
   a usage error (2), with nothing fetched.
+- `tradepartner close-gap --reference FILE [--symbol SPY]` (#3077) compares a benchmark's
+  stored daily closes with owner-supplied official closes (`session,close` CSV) and exits 1
+  on any session off by more than `index_check.max_close_gap`; read-only.
 - `tradepartner index-check [--start YYYY-MM] [--end YYYY-MM] [--out PATH]` runs
   `backtest.index_check_store.run_index_check` (backtest spec
   amendment #1598, plan T245): the whole universe, equal and cap weight, against RSP
@@ -132,6 +135,13 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   paper window read. Refused without a release name; a dry run lists the rows
   found and refused (exit 1 on any refused), a real run deletes only a
   manifest with none refused, inside the open release named.
+- `tradepartner repair-rename-listings --release <name> [--dry-run |
+  --expect-rows N]` runs `repair.repair_rename_listings` (#3057): it adds the
+  new-ticker `snapshot` listing row each stored `symbol_changes` revision
+  implies where no cover page started the ticker by the change's session
+  (PKI -> RVTY, CHK -> EXE), exactly the rows the EDGAR master derives. The
+  dry run lists the rows and the refused changes with reasons; a real run
+  writes only that count, inside the open data release named.
 - `tradepartner dashboard` runs the Streamlit shell (`dashboard/app.py`) bound to
   localhost with usage telemetry off (ADR 0011), and exits with Streamlit's code.
 - `tradepartner export OUT_DIR` writes every table in the store to
@@ -457,6 +467,7 @@ from tradepartner.backfill import (
     backfill_benchmark,
     fill_holes,
     refetch_actions,
+    span_settings,
 )
 from tradepartner.backtest import index_check as ic
 from tradepartner.backtest import index_check_store as idx
@@ -472,6 +483,7 @@ from tradepartner.backtest.hypothesis import (
 from tradepartner.backtest.metrics import METRIC_KEYS
 from tradepartner.backtest.run import RunOutcome, run_hypothesis
 from tradepartner.cli_record import _configured_secrets, scrub_text
+from tradepartner.close_gap import close_gaps
 from tradepartner.config import Settings, clean_message, get_settings
 from tradepartner.corpus import departure_fetch
 from tradepartner.diskfloor import ingest_floor_refusal, low_disk_warning
@@ -539,6 +551,7 @@ from tradepartner.repair import (
     delete_bars,
     delete_master_rows,
     read_master_manifest,
+    repair_rename_listings,
     repair_resolution,
     retract_dividends,
     retract_spinoff_splits,
@@ -620,7 +633,7 @@ from tradepartner.store import (
 )
 from tradepartner.store import backup as store_backup_module
 from tradepartner.store import migrate as store_migrate
-from tradepartner.store.asof import ASSETS_SOURCE
+from tradepartner.store.asof import ASSETS_SOURCE, prices_as_of
 from tradepartner.store.db import (
     StoreLockedError,
     open_for_write,
@@ -3390,8 +3403,16 @@ def make_app(
         dry_run: Annotated[
             bool, typer.Option(help="fetch and count, then roll every write back")
         ] = False,
+        span: Annotated[
+            bool,
+            typer.Option(
+                help="one request over the whole range for the --security ids, asking "
+                "every process date up to today (#3074)"
+            ),
+        ] = False,
     ) -> None:
-        """Ask Alpaca again for the splits and dividends of committed months (#3054)."""
+        """Ask Alpaca again for the splits and dividends of committed months (#3054),
+        or, with --span, of named securities over the whole range at once (#3074)."""
         start = _parse_day("--since", since)
         last = _parse_day("--through", through)
         assert start is not None and last is not None
@@ -3404,6 +3425,11 @@ def make_app(
             )
         parts = {part.strip() for item in security or () for part in item.split(",")}
         named = sorted(parts - {""}) or None
+        if span and named is None:
+            raise _fail(
+                "a span needs --security: it asks the whole history in one request",
+                USAGE_ERROR,
+            )
         s = settings()
         if (missing_store := _store_missing(s)) is not None:
             raise missing_store
@@ -3413,7 +3439,11 @@ def make_app(
                 "Set them in .env (see .env.example).",
                 USAGE_ERROR,
             )
-        prices = price_source(s) if price_source else StorePriceSource(s, clock=clock)
+        # #3074: a span asks every process date up to today, so a record Alpaca
+        # processed long after its ex-date is in the answer.
+        today = clock().astimezone(_NEW_YORK).date()
+        asked = span_settings(s, through=last, today=today) if span else s
+        prices = price_source(asked) if price_source else StorePriceSource(asked, clock=clock)
         try:
             result = refetch_actions(
                 s,
@@ -3424,11 +3454,14 @@ def make_app(
                 clock=clock,
                 dry_run=dry_run,
                 securities=named,
+                span=span,
             )
         except ValueError as exc:
             raise _fail(f"refused: {exc}", USAGE_ERROR) from None
         for run in result.runs:
             typer.echo(f"{run.status} {run.chunk_cursor}: {run.message}")
+        for line in result.rows:
+            typer.echo(f"  {'would write' if result.dry_run else 'wrote'} {line}")
         typer.echo(result.summary())
         raise typer.Exit(0 if result.ok else 1)
 
@@ -3521,6 +3554,42 @@ def make_app(
             raise _fail(f"refused: {exc}", USAGE_ERROR) from None
         _print_result(result)
         raise typer.Exit(result.exit_code)
+
+    @app.command("repair-rename-listings")
+    def repair_rename_listings_cmd(
+        release: Annotated[str, typer.Option(help="the open data release (checked on a real run)")],
+        dry_run: Annotated[bool, typer.Option(help="list the rows and change nothing")] = False,
+        expect_rows: Annotated[
+            int | None, typer.Option(help="the dry run's row count (required to write)")
+        ] = None,
+    ) -> None:
+        """Add the new-ticker listing rows the stored name changes imply (#3057)."""
+        if not dry_run:
+            if expect_rows is None:
+                raise _fail(
+                    "run --dry-run first, then pass its count as --expect-rows", USAGE_ERROR
+                )
+            if _blank_text(release):
+                raise _fail(
+                    "a repair writes only inside a data release: pass --release <name>",
+                    USAGE_ERROR,
+                )
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            result = repair_rename_listings(
+                s, clock=clock, dry_run=dry_run, expect=expect_rows, release=release
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RepairRefused as exc:
+            raise _fail(f"repair refused: {exc}", 1) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+        typer.echo(result.summary())
+        for line in result.lines():
+            typer.echo(line)
 
     @app.command("spinoff-allocation")
     def spinoff_allocation(
@@ -6460,6 +6529,43 @@ def make_app(
             payload["header"]["code_version"] = version
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    @app.command("close-gap")
+    def close_gap_(
+        reference: Annotated[
+            Path, typer.Option(help="CSV of the official closes: columns session,close")
+        ],
+        symbol: Annotated[str, typer.Option(help="benchmark symbol (BENCH:<symbol>)")] = "SPY",
+    ) -> None:
+        """Stored daily closes against official closes for a benchmark (#3077).
+
+        Read-only. Prints every session off by more than `index_check.max_close_gap`
+        (a missing stored bar counts) and exits 1 if there is one."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            official = pl.read_csv(reference, schema_overrides={"session": pl.Date}).select(
+                "session", pl.col("close").cast(pl.Float64)
+            )
+            with open_read_only(s) as conn:
+                stored = prices_as_of(conn, clock(), [f"BENCH:{symbol}"], traded_only=True)
+            gaps = close_gaps(stored, official, s.index_check.max_close_gap)
+        except (ValueError, OSError, pl.exceptions.PolarsError) as exc:
+            raise _fail(_scrubbed(f"close-gap failed: {exc}", s), USAGE_ERROR) from None
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        typer.echo(
+            f"close-gap {symbol}: {gaps.height} of {official.height} official sessions "
+            f"off by more than {s.index_check.max_close_gap:.2%} (nothing written)"
+        )
+        for row in gaps.iter_rows(named=True):
+            gap = "no stored bar" if row["gap"] is None else f"{row['gap']:+.2%}"
+            typer.echo(
+                f"{row['session']}  stored {row['stored']}  official {row['official']}  {gap}"
+            )
+        if gaps.height:
+            raise typer.Exit(1)
 
     return app
 
