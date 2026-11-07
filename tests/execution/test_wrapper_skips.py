@@ -862,6 +862,30 @@ def _chain(env: Env, *, recorded: bool, delisted: bool = False) -> None:
                 **common,
             },
         )
+        # The successor trades from S-1 at A's last close: a chain whose successor has
+        # no bar yet is pending, never live (#3108).
+        (last,) = conn.execute(
+            "SELECT close FROM prices_daily WHERE security_id = ? AND session <= ? "
+            "ORDER BY session DESC, known_at DESC LIMIT 1",
+            [A, PREV],
+        ).fetchall()
+        insert_row(
+            conn,
+            "prices_daily",
+            {
+                "security_id": SUCC,
+                "session": PREV,
+                "open": last[0],
+                "high": last[0],
+                "low": last[0],
+                "close": last[0],
+                "volume": 1000,
+                "known_at": known,
+                "ingested_at": known,
+                "source": "alpaca",
+                "provenance": "bar",
+            },
+        )
         insert_row(
             conn,
             "successor_chains",

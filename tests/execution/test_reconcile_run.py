@@ -2017,8 +2017,24 @@ def _held_chained_predecessor(
         provenance="filing",
     )
     _delisting(settings, SPY, CUT - timedelta(days=5))
+    # The successor trades from its hand-over at the predecessor's last close: a chain
+    # whose successor has no bar yet is pending, never live (#3108).
+    _successor_bar(settings, SPY, SUCC, previous_session(S), known)
     _chain(settings, SPY, SUCC, chain_known_at)
     fake.extra_quantity = {"SPY": -10.0, SUCC_SYMBOL: 10.0}
+
+
+def _successor_bar(
+    settings: Settings, predecessor: str, successor: str, session: date, known_at: datetime
+) -> None:
+    """`successor`'s bar on `session` at `predecessor`'s last close on or before it."""
+    with open_read_only(settings) as conn:
+        row = conn.execute(
+            "SELECT close FROM prices_daily WHERE security_id = ? AND session <= ? "
+            "ORDER BY session DESC, known_at DESC LIMIT 1",
+            [predecessor, session],
+        ).fetchone()
+    _bar_at(settings, successor, session, 100.0 if row is None else float(row[0]), known_at)
 
 
 def _held_explanations(settings: Settings, window: PaperWindowRow) -> Explanations:
@@ -2135,9 +2151,13 @@ def test_a_predecessor_with_two_live_successors_maps_nothing_and_is_not_sent(
     """#3031 (fail closed): two live chains from `SPY` leave which successor holds
     the position unknown. Reconcile follows neither (the break stands) and the
     order map leaves `SPY` out with a note; nothing is guessed. The second successor
-    has no bar or listing known at the cut, so the chain checks (#3097, #3108) leave it
-    live; MTUM, a real series, would be refused on its hand-over close."""
+    has no listing known at the cut and trades at SPY's close, so the chain checks
+    (#3097, #3108) leave it live; MTUM, a real series, would be refused on its hand-over
+    close."""
     _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
+    _successor_bar(
+        journal_settings, SPY, "SEC_SUCC2", previous_session(S), CUT - timedelta(minutes=1)
+    )
     _chain(journal_settings, SPY, "SEC_SUCC2", CUT - timedelta(minutes=1))
 
     found = _held_explanations(journal_settings, open_window)

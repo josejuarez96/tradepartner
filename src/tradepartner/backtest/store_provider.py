@@ -238,7 +238,7 @@ class StoreProvider:
         # `master.chain_window_sessions`, read live (`store.asof.refused_chains`),
         # so a run whose frozen window differs is refused like the calendar.
         # #3108: likewise `master.chain_max_price_ratio`, the hand-over close bound,
-        # and `master.transfer_window_sessions`, the span it is judged over.
+        # and `master.transfer_window_sessions`, the span its bound grows over.
         live_master = get_settings().master
         for key in ("chain_window_sessions", "chain_max_price_ratio", "transfer_window_sessions"):
             live, frozen = getattr(live_master, key), getattr(frozen_settings.master, key)

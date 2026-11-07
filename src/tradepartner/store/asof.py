@@ -271,6 +271,7 @@ multiplies `open`/`high`/`low`/`close` by that factor directly in SQL.
 
 from __future__ import annotations
 
+import math
 from bisect import bisect_right
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -484,8 +485,9 @@ def live_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[tuple[str
     pairs = stored_chains(conn, t)
     if not pairs:
         return ()
-    refused = {(r.predecessor_id, r.successor_id) for r in _refused(conn, t, pairs)}
-    return tuple(pair for pair in pairs if pair not in refused)
+    refused, pending = _judged(conn, t, pairs)
+    out = {(r.predecessor_id, r.successor_id) for r in refused} | set(pending)
+    return tuple(pair for pair in pairs if pair not in out)
 
 
 def refused_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[RefusedChain, ...]:
@@ -508,8 +510,11 @@ def refused_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[Refuse
       last, restated ex any split or spin-off between them known at `t`, is
       outside `[1 / r, r]`, `r = master.chain_max_price_ratio` (the bound
       health's `chain_price_break` warns on; Audit A s10b with no reason
-      row: x25), the two bars being at most `master.transfer_window_sessions`
-      sessions apart.
+      row: x25); beyond `master.transfer_window_sessions` sessions between
+      the two bars the bound grows with the gap (`_price_bound`).
+
+    A chain whose successor has no traded bar known at `t` is **pending**:
+    `live_chains` leaves it out too, but it is not refused (`_judged`).
 
     No evidence passes: a predecessor with no reason row (absence reads as
     `unknown`, as XOM's Form 25 does), no bar, a successor with no listing
@@ -518,7 +523,7 @@ def refused_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[Refuse
 
     `t` must be tz-aware (a bare date raises `TypeError`)."""
     pairs = stored_chains(conn, t)
-    return _refused(conn, t, pairs) if pairs else ()
+    return _judged(conn, t, pairs)[0] if pairs else ()
 
 
 def stored_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[tuple[str, str], ...]:
@@ -551,10 +556,15 @@ def stored_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[tuple[s
     return tuple((str(predecessor), str(successor)) for predecessor, successor in rows)
 
 
-def _refused(
+def _judged(
     conn: duckdb.DuckDBPyConnection, t: datetime, pairs: Sequence[tuple[str, str]]
-) -> tuple[RefusedChain, ...]:
-    """`refused_chains` over `pairs` (the stored chains at `t`)."""
+) -> tuple[tuple[RefusedChain, ...], tuple[tuple[str, str], ...]]:
+    """`refused_chains` over `pairs` (the stored chains at `t`), and the
+    **pending** pairs (#3108): a chain not refused whose successor has no own
+    traded bar on or after its hand-over day known at `t`. A pending chain is
+    neither live nor refused: it renames nothing until the successor's first bar
+    is known and its hand-over close can be judged, since a rename cannot be
+    undone at a later step."""
     # Local imports: both modules import this one.
     from tradepartner.store.delisting_reasons import delisting_reasons_as_of
     from tradepartner.store.delistings import _is_debt_title, delistings_as_of
@@ -616,21 +626,36 @@ def _refused(
         if gap > window:
             refused.append(RefusedChain(predecessor, successor, f"hand_over_window:{gap}"))
             continue
-    price_ratio: float | None = None
-    span: int | None = None
+    pending: list[tuple[str, str]] = []
+    master: Any = None
     for predecessor, successor in pairs:
         if any(r.successor_id == successor for r in refused):
             continue
-        if span is None:
-            span = get_settings().master.transfer_window_sessions
-        ratio = _hand_over_ratio(conn, t, predecessor, successor, hand_overs.get(successor), span)
-        if ratio is None:
+        close = _hand_over_close(conn, t, predecessor, successor, hand_overs.get(successor))
+        if close is None:
             continue
-        if price_ratio is None:
-            price_ratio = get_settings().master.chain_max_price_ratio
-        if not 1.0 / price_ratio <= ratio <= price_ratio:
+        if close == "pending":
+            pending.append((predecessor, successor))
+            continue
+        ratio, gap = close
+        if master is None:
+            master = get_settings().master
+        bound = _price_bound(master.chain_max_price_ratio, master.transfer_window_sessions, gap)
+        if not 1.0 / bound <= ratio <= bound:
             refused.append(RefusedChain(predecessor, successor, f"hand_over_price:{ratio:.4g}"))
-    return tuple(sorted(refused, key=lambda r: (r.successor_id, r.predecessor_id)))
+    ordered = tuple(sorted(refused, key=lambda r: (r.successor_id, r.predecessor_id)))
+    return ordered, tuple(pending)
+
+
+def _price_bound(ratio: float, span: int, gap: int) -> float:
+    """The hand-over close bound over `gap` sessions (#3108): `ratio` for a gap
+    of at most `span` sessions (`master.transfer_window_sessions`, a hand-over's
+    own span), growing as `ratio ** ceil(gap / span)` beyond it, so a month's
+    drift over an unfilled rule-9 hole (x1.25 over 21 sessions: bound ~x2.0)
+    passes while a x25 splice never does."""
+    if span <= 0:
+        return float(ratio) ** max(1, gap)
+    return float(ratio) ** max(1, math.ceil(gap / span))
 
 
 def _raw_traded_closes(
@@ -656,40 +681,42 @@ def _raw_traded_closes(
     return [(str(sid), session, float(close)) for sid, session, close in rows]
 
 
-def _hand_over_ratio(
+def _hand_over_close(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
     predecessor: str,
     successor: str,
     hand_over: date | None,
-    span: int,
-) -> float | None:
+) -> tuple[float, int] | Literal["pending"] | None:
     """The successor's first close over the predecessor's last, one share for
-    one share (#3108), from rows known at `t`: the successor's first own traded
-    bar on or after its hand-over day, the predecessor's last own traded bar on
-    or before that session, and the predecessor's close restated ex every split
-    (divided by its ratio) and spin-off (less ratio x the child's close that
-    session) of either id with an ex date after the predecessor's bar and on or
-    before the successor's. `None` (not judged) when either bar is missing, the
-    two are more than `span` sessions apart (`master.transfer_window_sessions`:
-    over a longer gap the ratio measures drift or an unfilled rule-9 hole, not
-    the hand-over), the restated close is not positive, or a spin-off's child
-    has no close."""
+    one share, and the sessions between the two bars (#3108), from rows known
+    at `t`: the successor's first own traded bar on or after its hand-over day,
+    the predecessor's last own traded bar on or before that session, and the
+    predecessor's close restated ex every split (divided by its ratio; one
+    split stored on both ids counts once) and spin-off (less ratio x the
+    child's close on the ex date) of either id whose latest revision has an ex
+    date after the predecessor's bar and on or before the successor's. An action
+    that cannot be restated (a split ratio not positive and finite, a child with
+    no close) is left out, so the raw ratio is judged; a restated close not
+    positive reads as an infinite ratio. `"pending"` when the successor has no
+    such bar yet; `None` (not judged) when there is no hand-over day or no
+    predecessor bar."""
     if hand_over is None:
         return None
     closes = _raw_traded_closes(conn, t, [predecessor, successor])
     later = [(s, c) for sid, s, c in closes if sid == successor and s >= hand_over]
     if not later:
-        return None
+        return "pending"
     first_session, first_close = later[0]
     earlier = [(s, c) for sid, s, c in closes if sid == predecessor and s <= first_session]
     if not earlier:
         return None
     last_session, last_close = earlier[-1]
     days = all_sessions()
-    if bisect_right(days, first_session) - bisect_right(days, last_session) > span:
-        return None
+    gap = bisect_right(days, first_session) - bisect_right(days, last_session)
     if last_session < first_session:
+        # The latest revision of each action first, then the ex-date window:
+        # filtering first would let an older revision stand in for a re-dated one.
         actions = conn.execute(
             f"""
             SELECT security_id, action_type, ratio_or_amount, source_action_id, ex_date
@@ -699,30 +726,48 @@ def _hand_over_ratio(
                 ) AS _rn
                 FROM corporate_actions
                 WHERE known_at <= ?
-                  AND ex_date > ? AND ex_date <= ?
-                  AND ((action_type = 'split' AND security_id IN (?, ?))
-                       OR (action_type = 'spinoff' AND source_action_id IN (?, ?)))
+                  AND (security_id IN (?, ?) OR source_action_id IN (?, ?))
             )
             WHERE _rn = 1 AND NOT cancelled
+              AND ex_date > ? AND ex_date <= ?
+              AND ((action_type = 'split' AND security_id IN (?, ?))
+                   OR (action_type = 'spinoff' AND source_action_id IN (?, ?)))
             ORDER BY ex_date, action_type
             """,
-            [t, last_session, first_session, predecessor, successor, predecessor, successor],
+            [
+                t,
+                predecessor,
+                successor,
+                predecessor,
+                successor,
+                last_session,
+                first_session,
+                predecessor,
+                successor,
+                predecessor,
+                successor,
+            ],
         ).fetchall()
         children = sorted({str(row[0]) for row in actions if row[1] == "spinoff"})
         child_closes = {
             (sid, session): close for sid, session, close in _raw_traded_closes(conn, t, children)
         }
+        splits: set[tuple[date, float]] = set()
         for security_id, action_type, ratio, _, ex_date in actions:
+            if ratio is None or not math.isfinite(float(ratio)) or float(ratio) <= 0:
+                continue
             if action_type == "split":
+                if (ex_date, float(ratio)) in splits:
+                    continue
+                splits.add((ex_date, float(ratio)))
                 last_close /= float(ratio)
             else:
                 child = child_closes.get((str(security_id), ex_date))
-                if child is None:
-                    return None
-                last_close -= float(ratio) * child
+                if child is not None:
+                    last_close -= float(ratio) * child
     if last_close <= 0:
-        return None
-    return first_close / last_close
+        return math.inf, gap
+    return first_close / last_close, gap
 
 
 def _hand_overs(

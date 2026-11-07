@@ -1307,6 +1307,29 @@ def chain(env: Env, security_id: str, successor: str, ticker: str, known_at: dat
             **stamp,
         },
     )
+    # The successor trades from its hand-over at the predecessor's last close: a chain
+    # whose successor has no bar yet is pending, never live (#3108).
+    (last,) = env.query(
+        "SELECT close FROM prices_daily WHERE security_id = ? AND session <= ? "
+        "ORDER BY session DESC, known_at DESC LIMIT 1",
+        [security_id, known_at.date()],
+    )
+    env.insert(
+        "prices_daily",
+        {
+            "security_id": successor,
+            "session": known_at.date(),
+            "open": last[0],
+            "high": last[0],
+            "low": last[0],
+            "close": last[0],
+            "volume": 1000,
+            "known_at": known_at,
+            "ingested_at": known_at,
+            "source": "alpaca",
+            "provenance": "bar",
+        },
+    )
     env.insert(
         "successor_chains",
         {

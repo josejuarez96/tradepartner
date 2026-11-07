@@ -559,29 +559,80 @@ def test_a_rename_with_a_same_day_spin_off_passes() -> None:
         conn.close()
 
 
-def test_a_successor_with_no_bar_known_at_t_is_not_judged() -> None:
-    """No evidence passes: while NEW's first bar is not yet known (stamped 03-10, after
-    the chain's 03-02) there is no ratio to judge; from its stamp the x25 is refused."""
+def test_a_chain_before_the_successors_first_bar_is_pending() -> None:
+    """While NEW's first bar is not yet known (stamped 03-10, after the chain's 03-02)
+    the chain is pending: not live (a rename could not be undone once the x25 is seen),
+    not refused. From the bar's stamp the x25 is refused."""
     conn = _price_store(25.0)
     try:
         late = datetime(2023, 3, 10, 21, tzinfo=UTC)
         conn.execute("DELETE FROM prices_daily WHERE security_id = ?", [NEW])
         _bar(conn, NEW, date(2023, 3, 1), 25.0, known=late)
-        assert live_chains(conn, late - PROBE_EPSILON) == ((OLD, NEW),)
-        assert live_chains(conn, late) == ()
+        before = late - PROBE_EPSILON
+        assert stored_chains(conn, before) == ((OLD, NEW),)
+        assert live_chains(conn, before) == ()
+        assert refused_chains(conn, before) == ()
+        assert chained_read_ids(conn, before, [OLD]) == ({OLD: OLD}, {})
+        assert [r.why for r in refused_chains(conn, late)] == ["hand_over_price:25"]
     finally:
         conn.close()
 
 
-def test_a_close_judged_across_a_long_gap_is_not_a_hand_over() -> None:
-    """OLD's last bar 02-28, NEW's first 03-31 (22 sessions, beyond
-    `master.transfer_window_sessions`, 5): the x25 measures the gap, not the hand-over,
-    so the price check does not judge it (the overlay's acquirer pair, #3006, has a 21
-    session gap); within the span it is judged."""
-    conn = _price_store(25.0)
+@pytest.mark.parametrize(("close", "live"), [(25.0, False), (1.25, True)])
+def test_the_bound_grows_over_a_long_gap(close: float, live: bool) -> None:
+    """OLD's last bar 02-28, NEW's first 03-29 (21 sessions, beyond
+    `master.transfer_window_sessions`, 5): the bound is 1.15 ** ceil(21 / 5), about 2.0,
+    so the overlay acquirer pair's x1.25 drift (#3006) passes and a x25 splice is
+    refused."""
+    conn = _price_store(close)
     try:
         conn.execute("DELETE FROM prices_daily WHERE security_id = ?", [NEW])
-        _bar(conn, NEW, date(2023, 3, 31), 25.0)
+        _bar(conn, NEW, date(2023, 3, 29), close)
+        assert (live_chains(conn, T) == ((OLD, NEW),)) is live
+    finally:
+        conn.close()
+
+
+def test_a_re_dated_split_is_judged_by_its_latest_revision() -> None:
+    """A split stored ex 03-01 and re-dated ex 03-20 (same source id) is outside the
+    hand-over: its latest revision is judged, so NEW's 0.51 is a x0.51 break."""
+    conn = _price_store(0.51)
+    try:
+        known = datetime(2023, 2, 20, tzinfo=UTC)
+        for ex_date, stamp in (
+            (date(2023, 3, 1), known),
+            (date(2023, 3, 20), known.replace(day=21)),
+        ):
+            insert_row(
+                conn,
+                "corporate_actions",
+                {
+                    "security_id": NEW,
+                    "action_type": "split",
+                    "ex_date": ex_date,
+                    "ratio_or_amount": 2.0,
+                    "source_action_id": "alpaca-split-1",
+                    "announced_at": None,
+                    "cancelled": False,
+                    "known_at": stamp,
+                    "ingested_at": stamp,
+                    "source": "alpaca",
+                    "provenance": "action",
+                },
+            )
+        assert [r.why for r in refused_chains(conn, T)] == ["hand_over_price:0.51"]
+    finally:
+        conn.close()
+
+
+def test_an_unusable_split_is_left_out_and_a_double_split_counts_once() -> None:
+    conn = _price_store(0.51)
+    try:
+        known = datetime(2023, 2, 20, tzinfo=UTC)
+        _action(conn, OLD, "split", date(2023, 3, 1), 0.0, known)
+        assert [r.why for r in refused_chains(conn, T)] == ["hand_over_price:0.51"]
+        _action(conn, OLD, "split", date(2023, 3, 1), 2.0, known.replace(day=21))
+        _action(conn, NEW, "split", date(2023, 3, 1), 2.0, known)
         assert live_chains(conn, T) == ((OLD, NEW),)
     finally:
         conn.close()

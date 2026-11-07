@@ -51,7 +51,7 @@ def _fact(known_at: datetime) -> dict[str, Any]:
     }
 
 
-def _build(path: Path, *, bankruptcy: bool, new_close: float) -> None:
+def _build(path: Path, *, bankruptcy: bool, new_close: float, chain_known: datetime) -> None:
     conn = duckdb.connect(str(path))
     try:
         configure_connection(conn)
@@ -148,7 +148,7 @@ def _build(path: Path, *, bankruptcy: bool, new_close: float) -> None:
                 "retracted": False,
                 "withdrawn_known_at": None,
             }
-            | _fact(datetime(2023, 3, 2, 21, tzinfo=UTC)),
+            | _fact(chain_known),
         )
     finally:
         conn.close()
@@ -160,9 +160,10 @@ def _run(
     *,
     bankruptcy: bool,
     new_close: float = 25.0,
+    chain_known: datetime = datetime(2023, 3, 2, 21, tzinfo=UTC),
 ) -> Any:
     path = tmp_path / "store.duckdb"
-    _build(path, bankruptcy=bankruptcy, new_close=new_close)
+    _build(path, bankruptcy=bankruptcy, new_close=new_close, chain_known=chain_known)
     settings = Settings(
         _env_file=None,
         store={"path": str(path)},
@@ -259,3 +260,28 @@ def test_the_control_rename_at_a_continuous_close_still_renames(
     assert sum(row.counts.get("n_chained_positions", 0) for row in result.rebalances) == 1
     assert sum(row.counts.get("n_refused_chains", 0) for row in result.rebalances) == 0
     assert sum(row.n_delisting_exits for row in result.rebalances) == 0
+
+
+#: One session before the hand-over: the 02-28 read sees the chain but not NEW's first
+#: bar (quant-auditor on #3122).
+EARLY_CHAIN = datetime(2023, 2, 27, 21, tzinfo=UTC)
+
+
+def test_a_chain_known_before_the_first_bar_renames_nothing_until_it_is_judged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The chain is pending at the 02-28 read, so OLD is not renamed; at 03-31 NEW's x25
+    is seen, the chain is refused and OLD exits at 1.0."""
+    result = _run(tmp_path, monkeypatch, bankruptcy=False, chain_known=EARLY_CHAIN)
+    assert sum(row.counts.get("n_chained_positions", 0) for row in result.rebalances) == 0
+    assert sum(row.counts.get("n_refused_chains", 0) for row in result.rebalances) == 1
+    final = [r for r in result.equity if r.series == engine.STRATEGY_SERIES][-1].equity
+    assert final / CAPITAL - 1 == pytest.approx(-0.4758, abs=2e-3)
+
+
+def test_an_early_chain_at_a_continuous_close_still_renames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _run(tmp_path, monkeypatch, bankruptcy=False, new_close=1.02, chain_known=EARLY_CHAIN)
+    assert sum(row.counts.get("n_chained_positions", 0) for row in result.rebalances) == 1
+    assert sum(row.counts.get("n_refused_chains", 0) for row in result.rebalances) == 0
