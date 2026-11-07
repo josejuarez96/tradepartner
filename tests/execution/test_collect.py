@@ -38,6 +38,7 @@ from tradepartner.store.journal import (
     PaperWindowRow,
     RebalanceEventRow,
     ReconciliationRow,
+    ResumeInvocationRow,
     append,
     decisions_for,
     fill_cursors,
@@ -438,6 +439,111 @@ def test_with_no_open_order_the_read_starts_at_the_latest_cursor(
     collected = _collect(journal_settings, scripted_fake, fixed_clock, [], writer_id=run_id)
     overlap = timedelta(seconds=journal_settings.paper.fill_read_overlap_seconds)
     assert collected.since == through - overlap
+
+
+def _resume(settings: Settings, at: datetime, book_id: str | None) -> int:
+    (resume_id,) = _append(
+        settings,
+        ResumeInvocationRow(
+            at=at,
+            reason="test",
+            accept_broker_fills=False,
+            accept_rejections=False,
+            book_id=book_id,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    assert resume_id is not None
+    return resume_id
+
+
+def _cursor(kind: str, writer_id: int, through: datetime, at: datetime) -> FillCursorRow:
+    return FillCursorRow(
+        writer_kind=kind,
+        writer_id=writer_id,
+        collected_through=through,
+        known_at=at,
+        ingested_at=at,
+    )
+
+
+def test_another_books_resume_cursor_never_moves_this_books_read_later(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2490: book B's resume cursor is B's; book main's run reads from main's own
+    (earlier) cursor, so B's resume cannot hide a main fill."""
+    run_id = _run(journal_settings, open_window, fixed_clock())
+    now = fixed_clock()
+    b_resume = _resume(journal_settings, now, "bbbb")
+    _append(
+        journal_settings,
+        _cursor("run", run_id, now - timedelta(hours=5), now),
+        _cursor("resume", b_resume, now, now),
+    )
+    collected = _collect(journal_settings, scripted_fake, fixed_clock, [], writer_id=run_id)
+    overlap = timedelta(seconds=journal_settings.paper.fill_read_overlap_seconds)
+    assert collected.since == now - timedelta(hours=5) - overlap
+    assert collected.collected_through == now - timedelta(hours=5)
+
+
+def test_a_resume_with_no_open_order_reads_only_its_own_books_cursors(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2490: a resume names its book on its `resume_invocations` row, so with no
+    open order it still reads its own book's cursors only, not account-wide."""
+    run_id = _run(journal_settings, open_window, fixed_clock())
+    now = fixed_clock()
+    b_resume = _resume(journal_settings, now, "bbbb")
+    main_resume = _resume(journal_settings, now, "main")
+    _append(
+        journal_settings,
+        _cursor("run", run_id, now - timedelta(hours=5), now),
+        _cursor("resume", b_resume, now, now),
+    )
+    collected = _collect(
+        journal_settings,
+        scripted_fake,
+        fixed_clock,
+        [],
+        writer_kind="resume",
+        writer_id=main_resume,
+    )
+    overlap = timedelta(seconds=journal_settings.paper.fill_read_overlap_seconds)
+    assert collected.since == now - timedelta(hours=5) - overlap
+    # Its own cursor counts for its own book's next read.
+    fixed_clock.advance(minutes=1)
+    again = _collect(journal_settings, scripted_fake, fixed_clock, [], writer_id=run_id)
+    assert again.since == now - timedelta(hours=5) - overlap
+
+
+def test_a_resume_cursor_with_no_book_is_dropped_from_a_books_read(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2490: a resume journaled before its book was recorded (schema 46), or a
+    cursor with no `resume_invocations` row, belongs to no known book: a book's
+    read drops it (fail closed: an earlier `since` reads more, never hides a fill)."""
+    run_id = _run(journal_settings, open_window, fixed_clock())
+    now = fixed_clock()
+    legacy = _resume(journal_settings, now, None)
+    _append(
+        journal_settings,
+        _cursor("run", run_id, now - timedelta(hours=5), now),
+        _cursor("resume", legacy, now, now),
+        _cursor("resume", 999, now, now),
+    )
+    collected = _collect(journal_settings, scripted_fake, fixed_clock, [], writer_id=run_id)
+    overlap = timedelta(seconds=journal_settings.paper.fill_read_overlap_seconds)
+    assert collected.since == now - timedelta(hours=5) - overlap
 
 
 def test_three_fills_one_ulp_short_complete_the_order(

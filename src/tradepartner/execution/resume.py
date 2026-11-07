@@ -8,7 +8,7 @@ The only way the kill switch is released. In the req 5 order:
    book the outcome is `no_window`: no broker call, no write. Another book's
    window, switch and lock are never read or touched (B.5).
 2. Journal the `resume_invocations` row first, so a refused resume is still
-   on record and its fill cursor has a writer id.
+   on record and its fill cursor has a writer id and a book (#2490).
 3. Close every unfinished run of the window `crashed`.
 4. Settle every `pending` order of the window (req 4). `get_order` found: an
    `accepted` event with the broker's order id, which acknowledges it, and
@@ -21,9 +21,14 @@ The only way the kill switch is released. In the req 5 order:
    The collection judges newly journaled broker-feed fills against the
    configured band around the close(S-1) reference, with only facts known by
    that close. An out-of-band fill refuses this invocation. A successful fault
-   engagement blocks later release; if that write fails, later resumes rejudge
-   the fill using this invocation's reference view. Broker-status residual fills
-   keep req 8's explicit acceptance path.
+   engagement blocks later release: any `kill_switch` reason naming
+   `fill_price_outside_band:`, a run's halt headline (`SystemFaultError: ...`)
+   among them (#3028). If that write fails, later resumes rejudge the fill
+   using this invocation's reference view. The same goes for the fills of every
+   run the release would clear (`switch.faulted_runs`), judged with the run
+   session's view: a halt read whose band engagement write failed leaves its
+   run unfinished, which step 3 closes `crashed` (#3027). Broker-status residual
+   fills keep req 8's explicit acceptance path.
    - A rejection-cap verdict refuses the release: one from the collection
      (an all-rejected or over-cap submitting run whose rejection this resume
      journaled; #374, T58's handoff), or one on a run the release would clear
@@ -46,7 +51,9 @@ The only way the kill switch is released. In the req 5 order:
      residual fill and its terminal event; one the broker still holds open
      refuses, since it may yet fill.
 6. `reconcile_now` (T61) for the clock's session, its journal cut (`as_of`)
-   a clock reading taken after every row steps 1 to 5 wrote. A mismatch refuses (the
+   a clock reading taken after every row steps 1 to 5 wrote. A ledger stated
+   before a true-up's session (only a clock gone back) refuses with the reason
+   and engages nothing (#3018). A mismatch refuses (the
    mismatch row is written, the switch stays engaged, and is engaged with
    source `fault` if nothing had engaged it). Any other status but `ok` or
    `breaks` refuses too: `switch.release` takes only those, so a lag inside
@@ -132,7 +139,9 @@ import math
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import date, datetime
+
+import duckdb
 
 from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Order, UnknownOrderError
 from tradepartner.calendar import previous_session, session_close
@@ -140,12 +149,14 @@ from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, ReconciliationError, SystemFaultError
 from tradepartner.execution import drawdown, marks, switch
 from tradepartner.execution.collect import (
+    WRITER_KINDS,
     Connect,
     OrderReading,
     PriceBand,
     RejectionBreach,
     collect,
     fill_band_violations,
+    is_fill_band_fault,
     lag_verdict,
     note_unjudged,
     rejection_breaches,
@@ -154,6 +165,7 @@ from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.planning import reference_prices
 from tradepartner.execution.reconcile import BREAKS, OK
 from tradepartner.execution.reconcile_run import (
+    StatedBeforeTrueUp,
     command_session,
     frozen_risk,
     reconcile_now,
@@ -163,6 +175,7 @@ from tradepartner.execution.window import ACCOUNT_MISMATCH
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.journal import (
     FillRow,
+    KillSwitchRow,
     OrderedFill,
     OrderEventRow,
     OrderRow,
@@ -196,6 +209,7 @@ ACKNOWLEDGED = "acknowledged"
 _logger = logging.getLogger(__name__)
 
 _WRITER = "resume"
+_RUN = WRITER_KINDS[0]
 _CRASHED = "crashed"
 _ACCEPTED = "accepted"
 _CANCELLED = "cancelled"
@@ -292,6 +306,7 @@ def _window_id(window: PaperWindowRow) -> int:
 def _start(
     connect: Connect,
     window_id: int,
+    book: str,
     now: datetime,
     reason: str,
     accept_broker_fills: bool,
@@ -309,6 +324,7 @@ def _start(
                 reason=reason,
                 accept_broker_fills=accept_broker_fills,
                 accept_rejections=accept_rejections,
+                book_id=book,
                 known_at=now,
                 ingested_at=now,
             ),
@@ -493,6 +509,82 @@ def _faulted_run_breaches(
     )
 
 
+def _band_view_violations(
+    conn: duckdb.DuckDBPyConnection,
+    group: Sequence[OrderedFill],
+    session: date,
+    settings: Settings,
+) -> list[str]:
+    """The band verdicts on `group` with the close(S-1) view of `session`: only
+    the facts and prices known by that close, as the collection that journaled
+    the fills judged them. An unpriced name stays unjudged, as in a collection."""
+    actions = live_actions_as_of(conn, session_close(previous_session(session)))
+    prices: dict[str, float] = {}
+    for name in sorted({item.security_id for item in group}):
+        with suppress(ValueError):
+            prices.update(reference_prices(conn, session, [name], actions))
+
+    def price_of(name: str) -> float:
+        return prices[name]
+
+    band = PriceBand(price_of, actions, session, settings.paper.max_fill_price_deviation)
+    return list(fill_band_violations(group, band))
+
+
+def _rejudged_band_violations(
+    conn: duckdb.DuckDBPyConnection,
+    window: PaperWindowRow,
+    events: Sequence[KillSwitchRow],
+    resume_id: int,
+    settings: Settings,
+) -> list[str]:
+    """Band verdicts on broker-feed fills a release would put behind it whose band
+    engagement may never have been written: those of earlier resume invocations
+    since the last release (each with its own close(S-1) view), and those every
+    run the release would clear journaled (`switch.faulted_runs`; each with its
+    run session's view). A halt read that finds a bad fill and then fails to write
+    its `engaged` row exits with the run unfinished; this resume closed it
+    `crashed`, so its fills are judged here (#3027). Resume ids order the earlier
+    invocations even when the wall clock steps back."""
+    window_id = _window_id(window)
+    released_resume_id = max(
+        (event.resume_id or 0 for event in events if event.state == switch.RELEASED),
+        default=0,
+    )
+    earlier = {
+        row.resume_id: row
+        for row in resume_invocations(conn)
+        if row.resume_id is not None and released_resume_id < row.resume_id < resume_id
+    }
+    runs = runs_for(conn, window_id)
+    faulted = set(
+        switch.faulted_runs(
+            window, events, [r.run for r in runs], [r.result for r in runs if r.result is not None]
+        )
+    )
+    run_sessions = {
+        r.run.run_id: r.run.session or command_session(r.run.started_at)
+        for r in runs
+        if r.run.run_id in faulted
+    }
+    views: list[tuple[datetime, date]] = []
+    for cursor in fill_cursors(conn):
+        if cursor.writer_kind == _WRITER and cursor.writer_id in earlier:
+            views.append((cursor.known_at, command_session(earlier[cursor.writer_id].at)))
+        elif cursor.writer_kind == _RUN and cursor.writer_id in run_sessions:
+            views.append((cursor.known_at, run_sessions[cursor.writer_id]))
+    fills_by_stamp: dict[datetime, list[OrderedFill]] = {}
+    for item in fills_for(conn, window_id=window_id):
+        if item.fill.source == "broker_feed":
+            fills_by_stamp.setdefault(item.fill.known_at, []).append(item)
+    violations: list[str] = []
+    for stamp, session in views:
+        group = fills_by_stamp.get(stamp, [])
+        if group:
+            violations.extend(_band_view_violations(conn, group, session, settings))
+    return violations
+
+
 def _accept(
     connect: Connect,
     resume_id: int,
@@ -598,6 +690,7 @@ def resume(
         resume_id, seen, crashed, pending = _start(
             connect,
             window_id,
+            book,
             now,
             reason,
             accept_broker_fills,
@@ -699,62 +792,12 @@ def resume(
         with connect() as conn:
             events = kill_switch_events_for(conn, window_id)
             prior_band_faults = [
-                event.reason
-                for event in events
-                if event.reason and event.reason.startswith("fill_price_outside_band:")
+                event.reason for event in events if is_fill_band_fault(event.reason)
             ]
         if prior_band_faults:
             return outcome(REFUSED, f"prior {prior_band_faults[-1]}; abandon this window")
-        # A prior refusal can have journaled its fill before the fault
-        # engagement write failed. Rejudge fills from earlier resume
-        # invocations since the last release, using each invocation's own
-        # close(S-1) view, before this invocation can release the switch.
-        # Resume IDs preserve that order even when the wall clock steps back.
         with connect() as conn:
-            released_resume_id = max(
-                (event.resume_id or 0 for event in events if event.state == "released"),
-                default=0,
-            )
-            earlier = {
-                row.resume_id: row
-                for row in resume_invocations(conn)
-                if row.resume_id is not None and released_resume_id < row.resume_id < resume_id
-            }
-            prior_cursors = [
-                cursor
-                for cursor in fill_cursors(conn)
-                if cursor.writer_kind == _WRITER and cursor.writer_id in earlier
-            ]
-            fills_by_stamp: dict[datetime, list[OrderedFill]] = {}
-            for item in fills_for(conn, window_id=window_id):
-                if item.fill.source == "broker_feed":
-                    fills_by_stamp.setdefault(item.fill.known_at, []).append(item)
-            prior_violations: list[str] = []
-            for cursor in prior_cursors:
-                group = fills_by_stamp.get(cursor.known_at, [])
-                if not group:
-                    continue
-                prior_session = command_session(earlier[cursor.writer_id].at)
-                prior_actions = live_actions_as_of(
-                    conn, session_close(previous_session(prior_session))
-                )
-                prior_prices: dict[str, float] = {}
-                for name in sorted({item.security_id for item in group}):
-                    with suppress(ValueError):
-                        prior_prices.update(
-                            reference_prices(conn, prior_session, [name], prior_actions)
-                        )
-
-                def prior_price_of(name: str, prices: dict[str, float] = prior_prices) -> float:
-                    return prices[name]
-
-                prior_band = PriceBand(
-                    prior_price_of,
-                    prior_actions,
-                    prior_session,
-                    settings.paper.max_fill_price_deviation,
-                )
-                prior_violations.extend(fill_band_violations(group, prior_band))
+            prior_violations = _rejudged_band_violations(conn, window, events, resume_id, settings)
         if prior_violations:
             return refuse_bad_fill("fill_price_outside_band: " + "; ".join(prior_violations))
         faulted = _faulted_run_breaches(connect, window, frozen)
@@ -800,6 +843,11 @@ def resume(
                 frozen=frozen,
                 as_of=as_of,
             )
+        except StatedBeforeTrueUp as exc:
+            # A ledger stated before a true-up's session (#3018): refused before
+            # any broker read or write, so nothing is a fault to engage on. Only
+            # a clock that went back past a true-up reaches it here.
+            return outcome(REFUSED, f"reconciliation refused: {exc}")
         except ReconciliationError as exc:
             # A fault found here engages the switch when nothing has (a resume
             # with no engagement to release), as `paper reconcile` does.
