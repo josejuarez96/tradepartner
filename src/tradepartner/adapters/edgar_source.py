@@ -325,6 +325,7 @@ from tradepartner.adapters.daily_index import (
     parse_daily_body,
 )
 from tradepartner.adapters.edgar import (
+    HTML_DELISTING_FORMS,
     SEC_FORMS_PARSER_VERSION,
     CoverPageParse,
     FilingParties,
@@ -345,6 +346,7 @@ from tradepartner.adapters.edgar import (
     parse_company_tickers,
     parse_cover_page,
     parse_delisting,
+    parse_delisting_html,
     parse_filing_index,
     parse_form4,
     parse_form25_evidence,
@@ -424,6 +426,12 @@ COVER_VERSION = 7
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
 DELISTING_VERSION = 1
+#: The issuer HTML Form 25s `parse_delisting_html` read and found no class or
+#: exchange in (`delisting_html_unread/v1/`, #3084): bump when that parser reads
+#: more, so they are fetched again. A successful read goes to the
+#: `DELISTING_VERSION` cache like an XML one, so only a `DELISTING_VERSION`
+#: bump re-reads those (a parser change that alters successful readings needs it).
+DELISTING_HTML_VERSION = 1
 #: The per-document `parse_form25_evidence` cache (`delisting_evidence/v1/`, T327,
 #: #2670): the provision only, beside (never inside) the `DELISTING_VERSION` cache.
 FORM25_EVIDENCE_VERSION = 1
@@ -731,6 +739,8 @@ class EdgarFilingSource(FilingSource):
         # T11f: Form 25/25-NSE primary documents skipped pre-fetch (not XML).
         self.pre_xml_delistings = 0
         self.unstamped_delistings = 0
+        # #3084: issuer HTML Form 25s read (now or before) with no class or exchange.
+        self.unread_html_delistings = 0
         # T11e: the `companyfacts.zip` path and member names once downloaded,
         # False once the per-CIK API was chosen, None until decided.
         self._facts_bulk: tuple[Path, frozenset[str]] | bool | None = None
@@ -3397,16 +3407,21 @@ class EdgarFilingSource(FilingSource):
         """Every Form 25, 25/A, 25-NSE and 25-NSE/A over full history
         (`since` filters the result, never the scan), de-duplicated by
         accession as `filing_index` de-duplicates its own rows (the
-        exchange's own copy of a 25-NSE dropped). A 25 or 25-NSE whose
-        `primaryDocument` is not an `.xml` file is not downloaded: counted
-        on `.pre_xml_delistings` (`parse_delisting` reads XML only, and the
-        index runs from 1993, long before EDGAR's XML forms). A cached
-        parse, or a quarantined accession (T11h), makes no request."""
+        exchange's own copy of a 25-NSE dropped). An issuer's own Form 25
+        or 25/A filed as HTML, under one CIK, is read by
+        `parse_delisting_html` (#3084; most issuer notices since 2019 are
+        HTML, not XML); one naming no class or exchange is counted on
+        `.unread_html_delistings` and not fetched again. Any other
+        `primaryDocument` that is not an `.xml` file is not downloaded:
+        counted on `.pre_xml_delistings` (`parse_delisting` reads XML only,
+        and the index runs from 1993, long before EDGAR's XML forms). A
+        cached parse, or a quarantined accession (T11h), makes no request."""
         if since is not None:
             since = ensure_tz_aware_utc(since, field_name="since")
         self._maybe_use_stored_index()
         self.pre_xml_delistings = 0
         self.unstamped_delistings = 0
+        self.unread_html_delistings = 0
         start = (self._settings.edgar.index_first_year, 1)
         last = quarter_of(self._now())
         quarters = [(y, q) for y in range(start[0], last[0] + 1) for q in range(1, 5)]
@@ -3503,15 +3518,21 @@ class EdgarFilingSource(FilingSource):
                     )
                 )
                 continue
-            if not record.primary_document.lower().endswith(".xml"):
+            html_form = _is_html_document(record.primary_document) and (
+                record.form in HTML_DELISTING_FORMS and len(options) == 1
+            )
+            if not record.primary_document.lower().endswith(".xml") and not html_form:
                 self.pre_xml_delistings += 1
+                continue
+            if html_form and self._unread_html_delisting(accession):
+                self.unread_html_delistings += 1  # #3084: read before, no class or exchange
                 continue
             if self._is_quarantined(accession):
                 self._quarantined_this_run.add(accession)
                 self.quarantined += 1
                 continue
-            delisting_fetch: Callable[[], DelistingFiling] = partial(
-                self._fetch_delisting,
+            delisting_fetch: Callable[[], DelistingFiling | None] = partial(
+                self._fetch_html_delisting if html_form else self._fetch_delisting,
                 cik,
                 accession,
                 record.form,
@@ -3541,6 +3562,61 @@ class EdgarFilingSource(FilingSource):
             path.unlink(missing_ok=True)  # the document is deleted after parsing
         self._save_delisting_cache(accession, parsed)
         return parsed
+
+    def _fetch_html_delisting(
+        self, cik: str, accession: str, form: str, primary_document: str, accepted_at: datetime
+    ) -> DelistingFiling | None:
+        """An issuer's HTML Form 25 (#3084), read by `parse_delisting_html`
+        under the one CIK the index lists it for. A document whose layout
+        names no class or no single exchange is not a malformed filing (a
+        third of the sampled issuers leave the exchange line blank): it is
+        recorded nowhere as a failure, which would trip the run's failure
+        share, but kept in `delisting_html_unread/` and counted on
+        `.unread_html_delistings`, so it is never fetched again under this
+        `DELISTING_HTML_VERSION`. A 404 or 410 still goes to the failure policy."""
+        path = edgar_raw.download_filing_file(
+            cik, accession, primary_document, settings=self._settings, client=self._client
+        )
+        try:
+            text = path.read_bytes().decode("utf-8", errors="replace")
+        finally:
+            path.unlink(missing_ok=True)  # the document is deleted after parsing
+        try:
+            parsed = parse_delisting_html(
+                text, cik=cik, form=form, accession=accession, accepted_at=accepted_at
+            )
+        except ValueError as why:
+            data = {"version": DELISTING_HTML_VERSION, "accession": accession, "reason": str(why)}
+            edgar_raw.write_atomic(
+                self._unread_html_path(accession), json.dumps(data).encode("utf-8")
+            )
+            self.unread_html_delistings += 1
+            return None
+        self._save_delisting_cache(accession, parsed)
+        return parsed
+
+    def _unread_html_path(self, accession: str) -> Path:
+        edgar_raw.validate_accession(accession)
+        return (
+            self._cache
+            / "delisting_html_unread"
+            / f"v{DELISTING_HTML_VERSION}"
+            / f"{accession}.json"
+        )
+
+    def _unread_html_delisting(self, accession: str) -> bool:
+        """Whether `accession`'s HTML Form 25 was read under this
+        `DELISTING_HTML_VERSION` and named no class or exchange."""
+        path = self._unread_html_path(accession)  # validates first, outside the try
+        try:
+            data = json.loads(path.read_bytes())
+        except (OSError, ValueError):
+            return False
+        return (
+            isinstance(data, dict)
+            and data.get("version") == DELISTING_HTML_VERSION
+            and data.get("accession") == accession
+        )
 
     def form25_evidence(
         self,
@@ -5373,6 +5449,12 @@ class _StoredReads:
     pending: tuple[UnstampedFiling, ...] | None = None
     accession_ciks: dict[str, frozenset[str]] | None = None
     new_by_cik: dict[str, list[stored_index.FilingRow | stored_index.Listing]] | None = None
+
+
+def _is_html_document(name: str) -> bool:
+    """Whether a `primaryDocument` is an HTML file (`form25.htm`), the
+    document an issuer's own Form 25 is filed as (#3084)."""
+    return name.lower().endswith((".htm", ".html"))
 
 
 def _filed_by(row: AccessionRow) -> bool:
