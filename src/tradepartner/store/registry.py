@@ -2190,26 +2190,10 @@ def family_sharpes(
     pair's latest trial lacks a finite base-level period Sharpe or a positive
     `periods_per_year`.
     """
-    if pending is not None:
-        _check_trial_row(conn, pending)
-    counted = conn.execute(
-        f"SELECT t.trial_id, h.params_json, t.start_session, t.data_cutoff {_COUNTED_FROM} "
-        "ORDER BY t.trial_id",
-        [family, pending.trial_id if pending is not None else None],
-    ).fetchall()
-    latest: dict[tuple[str, date, datetime | None], tuple[int, float]] = {}
-    for trial_id, params_json, start, cutoff in counted:
-        params = json.loads(params_json)
-        cadence = frozen_values(_Stored(params, family))[CADENCE_KEY]
-        pair = (
-            _canonical_set_hash(params, family),
-            _first_rebalance_on_or_after(start, cadence),
-            cutoff,
-        )
-        latest[pair] = (trial_id, float(params[BASE_COST_KEY]))
+    n_series, latest = _counted_pairs(conn, family, pending)
     chosen = sorted(latest.values())
     return FamilySharpes(
-        n_trials=len(counted),
+        n_trials=n_series,
         raw=_annual_sharpes(conn, chosen, "raw"),
         excess_spy=_annual_sharpes(conn, chosen, "excess_spy"),
     )
@@ -2225,18 +2209,81 @@ _COUNTED_FROM: Final = (
 )
 
 
+def _counted_pairs(
+    conn: duckdb.DuckDBPyConnection, family: str, pending: TrialHandle | None
+) -> tuple[int, dict[tuple[str, date, datetime | None], tuple[int, float]]]:
+    """The number of distinct return series among the counted trials and, per
+    distinct (canonical frozen set, first rebalance, data cutoff) pair, its latest
+    trial id and base cost (V's pairs). A trial is the same series as an earlier one
+    only when it is an identical rerun: same pair, same `data_vintage`, same clean
+    `code_tree_sha256` and the same stored base-level outcome (`_outcome_digests`), so
+    a rerun whose returns moved where the vintage cannot see (a repair's deletions, an
+    imported release row) is still a new series (#3127). A rerun on new data or new
+    code, a dirty or unknown code tree, or a missing stamp or outcome is a new series
+    (fail-closed)."""
+    if pending is not None:
+        _check_trial_row(conn, pending)
+    counted = conn.execute(
+        "SELECT t.trial_id, h.params_json, t.start_session, t.data_cutoff, "
+        f"t.data_vintage, t.code_tree_sha256, t.code_dirty {_COUNTED_FROM} "
+        "ORDER BY t.trial_id",
+        [family, pending.trial_id if pending is not None else None],
+    ).fetchall()
+    digests = _outcome_digests(conn, [int(row[0]) for row in counted])
+    latest: dict[tuple[str, date, datetime | None], tuple[int, float]] = {}
+    series: set[tuple[object, ...]] = set()
+    # Many trials share a parameter set or a start: read each once (#3138's 10k-trial
+    # timing tests).
+    sets: dict[str, tuple[str, Cadence, float]] = {}
+    firsts: dict[tuple[date, Cadence], date] = {}
+    for trial_id, params_json, start, cutoff, vintage, code, dirty in counted:
+        if params_json not in sets:
+            params = json.loads(params_json)
+            sets[params_json] = (
+                _canonical_set_hash(params, family),
+                frozen_values(_Stored(params, family))[CADENCE_KEY],
+                float(params[BASE_COST_KEY]),
+            )
+        set_hash, cadence, base = sets[params_json]
+        if (start, cadence) not in firsts:
+            firsts[start, cadence] = _first_rebalance_on_or_after(start, cadence)
+        pair = (set_hash, firsts[start, cadence], cutoff)
+        latest[pair] = (trial_id, base)
+        digest = digests.get(int(trial_id))
+        known = vintage is not None and code is not None and dirty is False and digest
+        stamps = (vintage, code, digest) if known else (trial_id,)
+        series.add((*pair, *stamps))
+    return len(series), latest
+
+
+#: The stored base-level `strategy` metrics an identical rerun must reproduce.
+_OUTCOME_METRICS: Final = ("n_periods", "sharpe_period", "sharpe_period_excess_spy")
+
+
+def _outcome_digests(conn: duckdb.DuckDBPyConnection, trial_ids: Sequence[int]) -> dict[int, str]:
+    """Each trial's base-level `strategy` outcome (`_OUTCOME_METRICS`, exact values) as
+    one string, in one query; a trial with none of those rows is absent."""
+    if not trial_ids:
+        return {}
+    rows = conn.execute(
+        "SELECT trial_id, string_agg(metric || '=' || CAST(value AS VARCHAR), ';' "
+        "ORDER BY metric) FROM trial_metrics WHERE trial_id IN (SELECT UNNEST($ids::BIGINT[])) "
+        "AND series = 'strategy' AND cost_level_kind = 'base' "
+        "AND metric IN (SELECT UNNEST($metrics::VARCHAR[])) GROUP BY trial_id",
+        {"ids": list(trial_ids), "metrics": list(_OUTCOME_METRICS)},
+    ).fetchall()
+    return {int(trial_id): str(digest) for trial_id, digest in rows if digest is not None}
+
+
 def count_counted_trials(
     conn: duckdb.DuckDBPyConnection, family: str, pending: TrialHandle | None = None
 ) -> int:
-    """How many trials `family_sharpes` counts (same rows, same `pending` rule). The
-    DSR's N is `backtest.results.family_n`, which calls this; nothing else should."""
-    if pending is not None:
-        _check_trial_row(conn, pending)
-    row = conn.execute(
-        f"SELECT COUNT(*) {_COUNTED_FROM}",
-        [family, pending.trial_id if pending is not None else None],
-    ).fetchone()
-    return int(row[0]) if row is not None else 0
+    """N's backtest part: the distinct return series among the trials
+    `family_sharpes` counts (same rows, same `pending` rule), so an identical rerun
+    (same pair, data vintage and code tree) is not a second trial (strategy-lab spec,
+    amendment 2026-11-06, #3127). The DSR's N is
+    `backtest.results.family_n`, which calls this; nothing else should."""
+    return _counted_pairs(conn, family, pending)[0]
 
 
 @dataclass(frozen=True)
