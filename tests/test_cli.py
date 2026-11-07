@@ -993,6 +993,26 @@ def test_health_prints_the_report_and_check_passes_on_the_fixture_store(
     assert checked.exit_code == 0, checked.output
 
 
+def test_health_prints_the_delisting_reasons_and_mergers_blocks(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#3215: the report-only delisting-reasons block (T329) and the mergers
+    block (T248e) reach `health`'s output, not only the integrity list."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    plain = _invoke(settings, ["health"], clock=lambda: T_END)
+    assert plain.exit_code == 0, plain.output
+    with open_for_write(settings) as conn:
+        report = health.health_report(conn, T_END, settings)
+    assert report.delisting_reasons is not None
+    for line in report.delisting_reasons.lines():
+        assert line in plain.output, line
+    assert "unknown episodes: 8; conflicted: 0" in plain.output
+    assert "mergers: cash 1, stock 1, stock_and_cash 0" in plain.output
+    assert "  merger conflicts: 0" in plain.output
+    assert "  acquirees with a bar after their effective date: 1" in plain.output
+    assert "    SEC_DIV_CANCELLED effective 2020-02-14:" in plain.output
+
+
 def test_health_prints_the_figi_types_block_and_fails_only_with_the_threshold(
     tmp_path: Path, fixture_store_path: Path
 ) -> None:

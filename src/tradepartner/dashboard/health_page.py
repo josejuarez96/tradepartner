@@ -14,8 +14,9 @@ T171e: the switch, rows, the latest observation, the shortable and ETB
 counts at it, the last run and the stale and switch warnings), the mergers
 block (issue 1762, T248e: rows by kind, the latest `known_at`, the last
 run's counts, and the report-only conflict and bar-after-effective-date
-lists), the coverage
-check against the named
+lists), the delisting-reason block (plan T329, issue 3215: counts by
+reason and source, the unmatched 8-K items and the unknown, conflicted and
+missing-consideration lists, report only), the coverage check against the named
 reference (issue 1541, T180: "not computed" until the viewer presses its
 button, since it costs one universe read per sample session; never computed
 on a refresh, whatever `coverage.check_enabled` says)); and the gap,
@@ -561,6 +562,26 @@ def _mergers_card(report: HealthReport) -> None:
             st.dataframe(mergers.after_effective, hide_index=True)
 
 
+def _delisting_reasons_card(report: HealthReport) -> None:
+    """The delisting-reason block (plan T329, #3215): its text lines, then the
+    unknown, conflicted and missing-consideration lists. Report only."""
+    block = report.delisting_reasons
+    if block is None:
+        return
+    with st.container(border=True):
+        st.subheader("Delisting reasons")
+        for line in block.lines():
+            st.markdown(line.strip())
+        for label, frame in (
+            ("Unknown episodes", block.unknown),
+            ("Conflicted episodes", block.conflicted),
+            ("Missing merger consideration", block.missing_consideration),
+        ):
+            if frame.height:
+                st.caption(f"{label} ({frame.height})")
+                st.dataframe(frame, hide_index=True)
+
+
 def _tables(report: HealthReport) -> None:
     st.subheader("Gap report")
     st.dataframe(report.gaps.rows, hide_index=True)
@@ -608,6 +629,7 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
         _rates_card(view.report)
         _borrow_card(view.report)
         _mergers_card(view.report)
+        _delisting_reasons_card(view.report)
         _coverage_card(
             view.report,
             settings.coverage.check_enabled,

@@ -355,6 +355,23 @@ def test_render_shows_every_metric(monkeypatch: pytest.MonkeyPatch, store_path: 
     assert tuple(report.gaps.rows.columns) in frames
 
 
+def test_render_shows_the_delisting_reasons_card(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    """#3215: the report-only delisting-reasons block (T329) gets its own card."""
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Delisting reasons" in text
+    with _connect(store_path) as conn:
+        block = health_report(conn, T, _settings(store_path)).delisting_reasons
+    assert block is not None
+    for line in block.lines():
+        assert line.strip() in text, line
+    frames = {tuple(df.value.columns) for df in at.dataframe}
+    assert block.unknown.is_empty() or tuple(block.unknown.columns) in frames
+
+
 def test_render_marks_a_stale_store(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> None:
     later = session_close(date(2020, 7, 7)) + timedelta(hours=3)
     at = _app(monkeypatch, store_path, now=later)
