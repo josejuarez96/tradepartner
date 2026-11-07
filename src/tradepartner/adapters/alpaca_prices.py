@@ -617,7 +617,13 @@ class RegistrantEvidence:
     (#847) Each such listing's last bar before its security's next row,
     keyed `(security_id, valid_from, ticker)`, and how many sessions
     without a bar before that next row mean the line had stopped trading
-    (`master.transfer_window_sessions`; `None`: never judged)."""
+    (`master.transfer_window_sessions`; `None`: never judged). (#3056)
+    Each such listing's Form 25 filing day (New York), keyed like
+    `last_bars`, and per `(security_id, filing day)` the security's last
+    traded bar on or before that day (`filed_bars`, from bars known at the
+    run): a line with no bar for more than the window before its Form 25
+    was filed had stopped trading there, and its span ends the session
+    after that bar instead of on the effective day."""
 
     last_filed: Mapping[str, date]
     share_counts: Mapping[str, frozenset[tuple[date, float]]]
@@ -629,6 +635,30 @@ class RegistrantEvidence:
     )
     last_bars: Mapping[tuple[str, date, str], date] = field(default_factory=dict)
     stop_after_sessions: int | None = None
+    filed_on: Mapping[tuple[str, date, str], date] = field(default_factory=dict)
+    filed_bars: Mapping[tuple[str, date], date] = field(default_factory=dict)
+
+    def stopped_at(self, security_id: str, valid_from: date, ticker: str) -> date | None:
+        """The session after the last bar of the delisted listing
+        `(security_id, valid_from, ticker)` when its line had stopped
+        trading before its Form 25 was filed (#3056): more than
+        `stop_after_sessions` sessions lie strictly between that bar and the
+        session after the filing day (the filing day counted when a session),
+        so no bar sat within the window before the filing. Post-bankruptcy
+        equity first printing under the old ticker before the old Form 25
+        takes effect (WW, 2025-07-07, effective 07-13; the old line's last
+        print 05-15) is then no one's (rule 7). `None` without a filing
+        day, a bar or a window, or when the line traded within the window."""
+        filed = self.filed_on.get((security_id, valid_from, ticker))
+        if filed is None or self.stop_after_sessions is None:
+            return None
+        last_bar = self.filed_bars.get((security_id, filed))
+        if last_bar is None or last_bar < valid_from:
+            return None
+        window = self.stop_after_sessions
+        if _sessions_between(last_bar, next_session(filed), window + 1) <= window:
+            return None
+        return next_session(last_bar)
 
     def stopped_before(
         self, security_id: str, valid_from: date, ticker: str, row: date, effective: date
@@ -683,6 +713,7 @@ def registrant_evidence(
     quiet_after_days: int,
     transfer_window_sessions: int,
     class_symbols: Mapping[str, str] | None = None,
+    filed_bars: Mapping[tuple[str, date], date] | None = None,
 ) -> RegistrantEvidence:
     """`RegistrantEvidence` from `facts` rows (`shares_outstanding` only;
     the UTC day of `known_at` is the filing day) and `listing_ends` rows
@@ -692,7 +723,9 @@ def registrant_evidence(
     day after the Form 25's acceptance (`delisting_filed_at`, when given),
     with the listing's `valid_from` and ticker; a transfer is not
     leaving), with each such listing's `end_session` as its last bar and
-    `transfer_window_sessions` as the stop window (#847)."""
+    `transfer_window_sessions` as the stop window (#847); `filed_bars`
+    (#3056, `repair.filed_bars`) maps `(security_id, Form 25 New York
+    filing day)` to the security's last traded bar on or before it."""
     last: dict[str, date] = {}
     counts: dict[str, set[tuple[date, float]]] = defaultdict(set)
     for row in facts:
@@ -705,6 +738,7 @@ def registrant_evidence(
     delisted: dict[str, set[date]] = defaultdict(set)
     ended: dict[str, set[tuple[date, str, date]]] = defaultdict(set)
     last_bars: dict[tuple[str, date, str], date] = {}
+    filed_on: dict[tuple[str, date, str], date] = {}
     for row in listing_ends:
         if (
             row["status"] != DELISTED
@@ -725,6 +759,11 @@ def registrant_evidence(
             ended[str(row["security_id"])].add((row["valid_from"], keyed, day))
             if row["end_session"] is not None:
                 last_bars[(str(row["security_id"]), row["valid_from"], keyed)] = row["end_session"]
+            if accepted is not None:
+                filed_at = ensure_tz_aware_utc(accepted, field_name="delisting_filed_at")
+                filed_on[(str(row["security_id"]), row["valid_from"], keyed)] = filed_at.astimezone(
+                    _NEW_YORK
+                ).date()
     return RegistrantEvidence(
         last_filed=last,
         share_counts={company: frozenset(rows) for company, rows in counts.items()},
@@ -734,6 +773,8 @@ def registrant_evidence(
         delisted_listings={sid: tuple(sorted(rows)) for sid, rows in ended.items()},
         last_bars=last_bars,
         stop_after_sessions=transfer_window_sessions,
+        filed_on=filed_on,
+        filed_bars=dict(filed_bars or {}),
     )
 
 
@@ -1014,6 +1055,13 @@ class ListingResolver:
         # superseded (started before it), never a later one.
         self._vacated: dict[str, list[TickerSpan]] = defaultdict(list)
         cut: set[TickerSpan] = set()  # spans ended at their own delisting
+        # #3056: per ticker, `(successor id, row day)` of every repair
+        # successor's row (`<cik>@<date>`), for rule 7's stopped-before-filing cut.
+        self._successor_rows: dict[str, list[tuple[str, date]]] = defaultdict(list)
+        for sid, rows_of in by_security.items():
+            if _SUCCESSOR_ID.fullmatch(sid):
+                for row_of in rows_of:
+                    self._successor_rows[row_of.ticker].append((sid, row_of.day))
         placeholder_spans: set[TickerSpan] = set()
         placeholder = same_day_listings = same_day_typos = kept_spans = unreadable = 0
         stopped_spans = accepted_spans = 0
@@ -1646,8 +1694,24 @@ class ListingResolver:
                 return False
             return True
 
+        def stopped_day(valid_from: date, listed: str, day: date) -> date:
+            # #3056: a line that stopped before its Form 25 was filed ends
+            # the session after its last bar, never before the span starts,
+            # but only when a successor of its company lists the ticker
+            # later (the prints after the gap are the new equity's): a
+            # halted line's own last prints stay on it.
+            stop = evidence.stopped_at(security_id, valid_from, listed)
+            if stop is None or not any(
+                later > stop and _succeeds(other, security_id)
+                for other, later in self._successor_rows.get(ticker, ())
+            ):
+                return day
+            return max(min(day, stop), next_session(start))
+
         inside = [
-            (day, ends(valid_from, listed, day), valid_from < last)
+            (stopped_day(valid_from, listed, day), True, valid_from < last)
+            if ends(valid_from, listed, day)
+            else (day, False, valid_from < last)
             for valid_from, listed, day in evidence.delisted_listings.get(security_id, ())
             if (listed == ticker or (valid_from, listed) in aliases)
             and start <= valid_from

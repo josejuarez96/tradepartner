@@ -930,6 +930,14 @@ def _print_report(report: HealthReport) -> None:
             f"  {row['security_id']} {row['ticker']} {row['exchange']} from {row['valid_from']} "
             f"(form {row['delisting_form']} effective {row['delisting_effective_on']})"
         )
+    spliced = report.spliced
+    echo(f"spliced series (a jump across a bar gap): {spliced.count}")
+    for row in spliced.frame.iter_rows(named=True):
+        echo(
+            f"  {row['security_id']} {row['prev_session']} {row['prev_close']} -> "
+            f"{row['session']} {row['close']} (x{row['ratio']:.2f}, "
+            f"{row['gap_sessions']} sessions without a bar)"
+        )
     jumps = report.price_jumps
     shown = "" if jumps.before is None else f" before {jumps.before.isoformat()}"
     echo(f"price jumps{shown}: {jumps.pending.height} to review, {jumps.frame.height} in all")

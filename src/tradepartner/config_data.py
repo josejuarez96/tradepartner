@@ -307,6 +307,13 @@ class HealthConfig(_ClosedConfig):
     # well above `ingest.min_free_disk_gb` and `paper.min_free_disk_gb` so there is time
     # to act. 0 turns the warning off.
     warn_free_disk_gb: float = Field(default=15.0, ge=0)
+    # #3056: the close ratio across a bar gap of more than
+    # `master.transfer_window_sessions` sessions on one security above which
+    # `health` lists it in `spliced_series` (the ratio or its inverse). A
+    # post-bankruptcy equity spliced onto the old company's id jumps ~100x
+    # across the months it was off the exchange (GPOR, CBL, WW); 5, so a
+    # five-fold move across a gap is reviewed. Report-only, never frozen.
+    splice_max_price_ratio: float = Field(default=5.0, gt=1, allow_inf_nan=False)
 
 
 class BorrowConfig(_ClosedConfig):
