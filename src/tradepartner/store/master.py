@@ -68,6 +68,13 @@ and no return spans the gap. A Form 15 (15-12B or 15-12G) within
 it: the old class was exchanged in a reorganisation or merger, so the
 8-A12B registers the same holders' shares (WSC's merger, #834; every
 reorganisation above filed one, no bankruptcy did). `MasterBuild.successions` records each pair.
+New equity listed only on **another exchange** than the Form 25's
+(#3056, GPOR: 25-NSE on NASDAQ, 8-A12B at emergence three months after
+it took effect, the next cover page on NYSE) is a successor too when the
+8-A12B was accepted from the session after the delisting took effect,
+with the same Form 15 veto. An exchange transfer registers its new
+exchange before the old listing ends, so its earlier 8-A12B never
+qualifies and the page still settles it as a transfer (CTO).
 The id has no `<cik>:` prefix on purpose: the price resolver treats it as
 its own company, so its listing takes the ticker from the old holder,
 which has left by then. Limit: an 8-A12B for another class (new notes) in
@@ -346,6 +353,9 @@ class _Stop:
     effective_on: date  # the day the delisting took effect
     reorg_start: date  # sessions of an 8-K12B or Form 15 that belong to it
     reorg_end: date
+    form: str = (
+        ""  # the Form 25's form (#3056: only an exchange's 25-NSE ends new equity elsewhere)
+    )
 
 
 #: Acceptances per marker form (`_MARKER_FORMS`) of one CIK.
@@ -373,6 +383,24 @@ def _deregistered(stop: _Stop, until: datetime, marks: _Marks, *, windowed: bool
     )
 
 
+def _new_equity_elsewhere(stop: _Stop, until: datetime, marks: _Marks) -> bool:
+    """True when shares a cover page accepted at `until` lists only on
+    another exchange than `stop`'s are new equity, not a transfer (#3056,
+    GPOR): an 8-A12B accepted from the session after the delisting took
+    effect (`stop.effective_after`) to `until`, no Form 15 in the
+    reorganisation window, and the stop an exchange's `25-NSE` (a strike:
+    GPOR's), never an issuer's own `25` (a voluntary withdrawal, how an
+    exchange transfer is filed), so an issuer's later 8-A12B (its own new
+    listing, a note registration) after a transfer never splits it."""
+    if not stop.form.startswith("25-NSE"):
+        return False
+    return any(
+        stop.effective_after <= session_of(at) and at <= until
+        for form in _NEW_REGISTRATION_FORMS
+        for at in marks.get(form, ())
+    ) and not _deregistered(stop, until, marks)
+
+
 def _new_equity(stop: _Stop, until: datetime, marks: _Marks) -> bool:
     """True when the shares listed again after `stop` (evidence accepted at
     `until`) are new equity: an 8-A12B from `stop.window_start` to `until`
@@ -381,6 +409,26 @@ def _new_equity(stop: _Stop, until: datetime, marks: _Marks) -> bool:
 
 
 _Pairs = frozenset[tuple[str, str]]
+
+
+def _moved_new_equity(
+    cls: _Class, item: CoverListing, page: CoverPage, marks: _Marks
+) -> tuple[str, _Stop] | None:
+    """`(exchange, stop)` of `cls`'s pending Form 25 on another exchange
+    when `item` lists new equity in its place (#3056): the page shows none
+    of the class's tickers on that exchange, `item` is on another one, the
+    page is from the session after the delisting took effect, and
+    `_new_equity_elsewhere` holds. `None` otherwise (a transfer)."""
+    valid_from = session_of(page.accepted_at)
+    for exchange, stop in sorted(cls.ended.items()):
+        if exchange == item.exchange or valid_from < stop.effective_after:
+            continue
+        tickers = {ticker for ticker, ex in cls.pairs if ex == exchange}
+        if any(i.exchange == exchange and i.ticker in tickers for i in page.listings):
+            continue  # the class is relisted on its own exchange: that item decides
+        if _new_equity_elsewhere(stop, page.accepted_at, marks):
+            return exchange, stop
+    return None
 
 
 @dataclass
@@ -624,6 +672,7 @@ def _stop(filing: DelistingFiling, settings: Settings, since: datetime | None) -
         effective,
         reorg_start,
         reorg_end,
+        filing.form,
     )
 
 
@@ -741,7 +790,19 @@ class _Builder:
                     cls = self._new_class(first, item, classes, known_at)
                 relisted = False
                 stop = cls.ended.get(item.exchange)
-                if stop is not None and (cls.security_id, item.exchange) not in starts:
+                elsewhere = (
+                    _moved_new_equity(cls, item, page, marks)
+                    if stop is None and (cls.security_id, item.exchange) not in starts
+                    else None
+                )
+                if elsewhere is not None:  # new equity listed on another exchange (#3056)
+                    relisted = True
+                    old_exchange, old_stop = elsewhere
+                    del cls.ended[old_exchange]
+                    start = max(valid_from, old_stop.after, old_stop.effective_after)
+                    cls = self._successor(first, cls, start, classes, known_at)
+                    starts[(cls.security_id, item.exchange)] = start
+                elif stop is not None and (cls.security_id, item.exchange) not in starts:
                     new_equity = _new_equity(stop, page.accepted_at, marks)
                     # Before the delisting takes effect the old shares still
                     # trade, so the page relists only new equity (whose row
