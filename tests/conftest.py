@@ -453,6 +453,7 @@ def _reset_edgar_rate_limit_block() -> None:
     """Start every test with `edgar_raw`'s process-wide block cleared (#761)
     and its limiter's stamp forgotten (#3039: a test that fakes
     `time.monotonic` leaves a stamp from its own clock behind)."""
+    edgar_raw._RATE_LIMIT_BLOCK._waits_running = 0
     edgar_raw._RATE_LIMIT_BLOCK.clear()
     edgar_raw._LIMITER._last_request_monotonic = None
 
